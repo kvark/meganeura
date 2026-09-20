@@ -129,7 +129,11 @@ pub(super) fn tile_module(
             );
         }
         if dispatch.gemv_rmsnorm.is_some() {
-            return crate::codegen::generate_module_gemv_rmsnorm(shape, dispatch.weight_format);
+            return crate::codegen::generate_module_gemv_rmsnorm(
+                group,
+                shape,
+                dispatch.weight_format,
+            );
         }
         return crate::codegen::generate_module_gemv(group, dispatch.weight_format, shape);
     }
@@ -174,7 +178,7 @@ pub(super) fn tile_module(
     }
 }
 
-fn tile_variant(dispatch: &Dispatch, tile: MatmulTile) -> Variant {
+pub(super) fn tile_variant(dispatch: &Dispatch, tile: MatmulTile) -> Variant {
     let entry = &dispatch.shader;
     if let MatmulTile::Gemv(shape) = tile {
         if dispatch.gemv_int_dot {
@@ -1440,7 +1444,10 @@ fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize)
         // contiguous rows of B rather than forward `[K, N]` columns.
         let b = if matches!(
             class.shader,
-            ShaderEntry::MatMulBT | ShaderEntry::FusedMatMulBTAdd | ShaderEntry::MatMulGemvBT
+            ShaderEntry::MatMulBT
+                | ShaderEntry::FusedMatMulBTAdd
+                | ShaderEntry::MatMulGemvBT
+                | ShaderEntry::MatMulGemvBTAdd
         ) {
             col * k + inner
         } else {
@@ -1543,6 +1550,7 @@ mod tests {
         let shape = crate::codegen::GemvShape {
             threads: 64,
             reduction: crate::codegen::GemvReduction::Subgroup,
+            bt_rows: 1,
         };
         let dispatch = Dispatch {
             shader: ShaderEntry::MatMulGemv,

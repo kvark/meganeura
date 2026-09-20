@@ -2,7 +2,7 @@
 //!
 //! The search space is deliberately small: scalar and native-f32 cooperative
 //! tiles for unpacked dense matmuls, shape-specialized scalar convolutions,
-//! workgroup width and cross-lane reduction for the K-split GEMV family, and
+//! workgroup geometry and cross-lane reduction for the K-split GEMV family, and
 //! cached-attention split/combine sequences. Precision remains unchanged.
 //! Measurements use synthetic, private scratch, not a live training step.
 //! Explicit split-K probes measure complete sequences without installing them.
@@ -172,6 +172,7 @@ pub(crate) fn gemv_group(entry: &ShaderEntry) -> Option<crate::codegen::ShaderGr
         ShaderEntry::MatMulGemv => Some(ShaderGroup::MatMulGemv),
         ShaderEntry::MatMulGemvAdd => Some(ShaderGroup::MatMulGemvAdd),
         ShaderEntry::MatMulGemvBT => Some(ShaderGroup::MatMulGemvBT),
+        ShaderEntry::MatMulGemvBTAdd => Some(ShaderGroup::MatMulGemvBTAdd),
         _ => None,
     }
 }
@@ -193,10 +194,9 @@ pub enum MatmulTile {
     },
     /// A K-split GEMV at one workgroup width and cross-lane reduction.
     ///
-    /// Unlike the tiled entries this changes neither the shader entry, the
-    /// workgroup count, nor the buffer layout — only how the threads inside a
-    /// workgroup divide K and recombine. Like scalar tiles, it also applies
-    /// to reduced-storage weights without changing the decoder.
+    /// Keeps the shader entry and buffer layout. Width and reduction apply
+    /// to every storage format; contiguous row grouping also changes the
+    /// workgroup count for transposed-B kernels.
     Gemv(crate::codegen::GemvShape),
 }
 
@@ -250,10 +250,8 @@ impl MatmulTile {
 
     pub(crate) fn apply(self, dispatch: &mut Dispatch, class: &TuneClass) {
         if let Self::Gemv(shape) = self {
-            // Width and reduction live inside the workgroup, so the entry,
-            // the workgroup count and every binding stay exactly as the
-            // compiler emitted them.
             dispatch.gemv_shape = Some(shape);
+            dispatch.workgroups = self.workgroups(class);
             return;
         }
         dispatch.shader = self.shader(&class.shader);
@@ -302,10 +300,7 @@ impl MatmulTile {
 
     fn workgroups(self, class: &TuneClass) -> [u32; 3] {
         let tile = match self {
-            // One workgroup per output vec4 (or per row, transposed), set by
-            // N alone. Changing the threads per workgroup does not change how
-            // many there are.
-            Self::Gemv(_) => return class.gemv_workgroups(),
+            Self::Gemv(shape) => return class.gemv_workgroups(shape),
             Self::Tile32 => 32,
             Self::Tile64 => 64,
             Self::SpecializedConv { tile_size, .. } => tile_size,
@@ -326,7 +321,9 @@ impl MatmulTile {
 
     pub(crate) fn buffer_sizes(self, class: &TuneClass) -> Option<Vec<usize>> {
         if let Self::Gemv(shape) = self {
-            if gemv_group(&class.shader).is_none() || !matches!(shape.threads, 32 | 64 | 128 | 256)
+            if gemv_group(&class.shader).is_none()
+                || !matches!(shape.threads, 32 | 64 | 128 | 256)
+                || !matches!(shape.bt_rows, 1 | 2 | 4)
             {
                 return None;
             }
@@ -398,6 +395,7 @@ impl TuneClass {
                 | ShaderEntry::FusedMatMulATAdd
                 | ShaderEntry::FusedMatMulBTAdd
                 | ShaderEntry::MatMulGemvAdd
+                | ShaderEntry::MatMulGemvBTAdd
         );
         if !matches!(
             dispatch.shader,
@@ -410,6 +408,7 @@ impl TuneClass {
                 | ShaderEntry::MatMulGemv
                 | ShaderEntry::MatMulGemvAdd
                 | ShaderEntry::MatMulGemvBT
+                | ShaderEntry::MatMulGemvBTAdd
                 | ShaderEntry::Conv2dGemm
                 | ShaderEntry::Conv2dGemmSmall
                 | ShaderEntry::Conv2dGradInputGemm
@@ -539,6 +538,7 @@ impl TuneClass {
                 | ShaderEntry::FusedMatMulATAdd
                 | ShaderEntry::FusedMatMulBTAdd
                 | ShaderEntry::MatMulGemvAdd
+                | ShaderEntry::MatMulGemvBTAdd
         )
     }
 
@@ -596,11 +596,13 @@ impl TuneClass {
         Some(sizes)
     }
 
-    /// Workgroups a K-split GEMV dispatches: one per output vec4, or one per
-    /// output row for the transposed form. Independent of the thread count.
-    pub(crate) fn gemv_workgroups(&self) -> [u32; 3] {
-        if self.shader == ShaderEntry::MatMulGemvBT {
-            [self.n, 1, 1]
+    /// Workgroups per output vec4, or per group of transposed B rows.
+    pub(crate) fn gemv_workgroups(&self, shape: crate::codegen::GemvShape) -> [u32; 3] {
+        if matches!(
+            self.shader,
+            ShaderEntry::MatMulGemvBT | ShaderEntry::MatMulGemvBTAdd
+        ) {
+            crate::compile::row_gemv_workgroups(self.n.div_ceil(shape.bt_rows))
         } else {
             [self.n / 4, 1, 1]
         }
@@ -615,16 +617,25 @@ impl TuneClass {
         config: Option<&CoopConfig>,
     ) -> Vec<MatmulTile> {
         if let MatmulTile::Gemv(shape) = initial {
-            // Both axes, widest first: wide workgroups hide DRAM latency at
-            // M=1, and the subgroup reduction removes barriers in proportion
-            // to the wave width. Which trade wins is exactly what a device
-            // disagrees with another device about, so measure the cross
-            // product rather than guessing a rule.
             use crate::codegen::{GemvReduction, GemvShape};
             let mut out = Vec::new();
-            for reduction in [GemvReduction::Subgroup, GemvReduction::Tree] {
-                for threads in [256, 128, 64, 32] {
-                    out.push(MatmulTile::Gemv(GemvShape { threads, reduction }));
+            let rows: &[u32] = if matches!(
+                self.shader,
+                ShaderEntry::MatMulGemvBT | ShaderEntry::MatMulGemvBTAdd
+            ) {
+                &GemvShape::BT_ROWS
+            } else {
+                &[1]
+            };
+            for &bt_rows in rows {
+                for reduction in [GemvReduction::Subgroup, GemvReduction::Tree] {
+                    for threads in [256, 128, 64, 32] {
+                        out.push(MatmulTile::Gemv(GemvShape {
+                            threads,
+                            reduction,
+                            bt_rows,
+                        }));
+                    }
                 }
             }
             return out
@@ -1203,7 +1214,11 @@ mod tests {
             seen.push(initial);
             for threads in GemvShape::WIDTHS {
                 for reduction in [GemvReduction::Tree, GemvReduction::Subgroup] {
-                    let shape = GemvShape { threads, reduction };
+                    let shape = GemvShape {
+                        threads,
+                        reduction,
+                        bt_rows: 1,
+                    };
                     assert!(
                         seen.contains(&MatmulTile::Gemv(shape)),
                         "{dtype:?}: missing {shape:?} from {seen:?}"
@@ -1269,6 +1284,7 @@ mod tests {
             MatmulTile::Gemv(GemvShape {
                 threads: 64,
                 reduction: GemvReduction::Subgroup,
+                bt_rows: 1,
             })
             .fits(&class),
             "64-wide subgroup fused Q4_0 GEMV must fit the class scratch"
@@ -1331,6 +1347,23 @@ mod tests {
         MatmulTile::Tile64.apply(&mut d, &class);
         assert_eq!(d.workgroups, [2, 1, 1]);
         assert!(!d.use_small_tiles);
+        d.shader = ShaderEntry::MatMulGemvBT;
+        d.params = vec![1, 262_145, 4, 0];
+        d.workgroups = crate::compile::row_gemv_workgroups(262_145);
+        let class = TuneClass::from_dispatch(&d, None).unwrap();
+        for bt_rows in crate::codegen::GemvShape::BT_ROWS {
+            let shape = crate::codegen::GemvShape {
+                threads: 64,
+                reduction: crate::codegen::GemvReduction::Subgroup,
+                bt_rows,
+            };
+            MatmulTile::Gemv(shape).apply(&mut d, &class);
+            assert_eq!(
+                d.workgroups,
+                crate::compile::row_gemv_workgroups(262_145u32.div_ceil(bt_rows))
+            );
+            assert_eq!(TuneClass::from_dispatch(&d, None), Some(class.clone()));
+        }
     }
 
     #[test]

@@ -1218,22 +1218,16 @@ impl Variant {
             Variant::CoopPrologue(ref e, ref kinds) => {
                 format!("{e:?}:cooperative-prologue:{kinds:?}")
             }
-            Variant::GemvRmsNorm(ref e, format, shape) => format!(
-                "{e:?}:rmsnorm-{format:?}-{}t-{:?}",
-                shape.threads, shape.reduction
-            ),
-            Variant::GemvIntDot(ref e, format, shape) => format!(
-                "{e:?}:gemv-intdot-{format:?}-{}t-{:?}",
-                shape.threads, shape.reduction
-            ),
-            Variant::GemvRmsNormIntDot(ref e, format, shape) => format!(
-                "{e:?}:gemv-rmsnorm-intdot-{format:?}-{}t-{:?}",
-                shape.threads, shape.reduction
-            ),
-            Variant::Gemv(ref e, format, shape) => format!(
-                "{e:?}:gemv-{format:?}-{}t-{:?}",
-                shape.threads, shape.reduction
-            ),
+            Variant::GemvRmsNorm(ref e, format, shape) => {
+                format!("{e:?}:rmsnorm-{format:?}-{shape:?}")
+            }
+            Variant::GemvIntDot(ref e, format, shape) => {
+                format!("{e:?}:gemv-intdot-{format:?}-{shape:?}")
+            }
+            Variant::GemvRmsNormIntDot(ref e, format, shape) => {
+                format!("{e:?}:gemv-rmsnorm-intdot-{format:?}-{shape:?}")
+            }
+            Variant::Gemv(ref e, format, shape) => format!("{e:?}:gemv-{format:?}-{shape:?}"),
             Variant::Weight(ref e, format) => format!("{e:?}:weight-{format:?}"),
             Variant::WeightSmall(ref e, format) => format!("{e:?}:weight-{format:?}-small-tile"),
             Variant::Coop(ref e) => format!("{e:?}:cooperative"),
@@ -1627,106 +1621,32 @@ impl Pipelines {
             }
         }
 
-        // Compile the RmsNorm-fused GEMV when any dispatch asks for it. The
-        // module is derived from the plain GEMV, so it needs no ShaderGroup
-        // of its own; it is a variant of `MatMulGemv`, resolved by
-        // `get_pipeline` the same way a weight format is. Int-dot GEMVs
-        // have their own fused form, compiled below.
-        let mut fused_keys = std::collections::HashSet::new();
-        for fused in plan
-            .dispatches
-            .iter()
-            .filter(|d| d.gemv_rmsnorm.is_some() && !d.gemv_int_dot)
-        {
-            let shape = fused
-                .gemv_shape
-                .unwrap_or_else(|| crate::codegen::GemvShape::initial(ShaderGroup::MatMulGemv));
-            let key = Variant::GemvRmsNorm(fused.shader.clone(), fused.weight_format, shape);
-            if !fused_keys.insert(key.clone()) {
-                continue;
-            }
-            let sm = crate::codegen::generate_module_gemv_rmsnorm(shape, fused.weight_format);
-            let shader = create_gen_shader(gpu, sm, wgsl_dump_dir);
-            let layout = <MatMulRmsNormData as blade_graphics::ShaderData>::layout();
-            let pipeline = create_profiled_pipeline(
-                gpu,
-                key.label(),
-                &layout,
-                shader.at(fused.shader.entry_point()),
-            );
-            map.insert(key, pipeline);
-        }
-
-        // Compile the int-dot GEMV for any dispatch that asked for it.
-        // Unlike a shape, this is not something measurement can turn on, so
-        // it is always present when the plan says so. The packed-dot
-        // intrinsic follows the device's `shader_integer_dot_product`
-        // capability; the scalar expansion is the exact fallback.
+        // Initial plans and tuning use the same GEMV variants and generators.
+        // Fusion and activation quantization must survive a measured shape.
         let knobs = matmul_knobs;
         for dispatch in &plan.dispatches {
-            if !dispatch.gemv_int_dot {
+            if !dispatch.gemv_int_dot
+                && dispatch.gemv_rmsnorm.is_none()
+                && dispatch.gemv_shape.is_none()
+            {
                 continue;
             }
-            let fused = dispatch.gemv_rmsnorm.is_some();
-            let shape = dispatch.gemv_shape.unwrap_or_else(|| {
-                crate::codegen::GemvShape::initial(dispatch.shader.shader_group())
-            });
-            let key = if fused {
-                Variant::GemvRmsNormIntDot(dispatch.shader.clone(), dispatch.weight_format, shape)
-            } else {
-                Variant::GemvIntDot(dispatch.shader.clone(), dispatch.weight_format, shape)
+            let Some(group) = crate::tune::gemv_group(&dispatch.shader) else {
+                continue;
             };
+            let shape = dispatch
+                .gemv_shape
+                .unwrap_or_else(|| crate::codegen::GemvShape::initial(group));
+            let tile = crate::tune::MatmulTile::Gemv(shape);
+            let key = tuning::tile_variant(dispatch, tile);
             if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(key.clone()) {
-                let sm = crate::codegen::generate_module_gemv_int_dot(
-                    dispatch.shader.shader_group(),
-                    dispatch.weight_format,
-                    shape,
-                    knobs.integer_dot,
-                    fused,
-                );
+                let sm = tuning::tile_module(dispatch, tile, knobs);
                 let shader = create_gen_shader(gpu, sm, wgsl_dump_dir);
-                let layout = if fused {
+                let layout = if dispatch.gemv_rmsnorm.is_some() {
                     <MatMulRmsNormData as blade_graphics::ShaderData>::layout()
                 } else {
                     shader_data_layout(&dispatch.shader)
                 };
-                slot.insert(create_profiled_pipeline(
-                    gpu,
-                    key.label(),
-                    &layout,
-                    shader.at(dispatch.shader.entry_point()),
-                ));
-            }
-        }
-
-        // Compile any GEMV shape a plan already carries. Tuning inserts its
-        // own pipelines as it measures, so this is for a plan that arrives
-        // with a shape on it — deserialized, or rebuilt after a swap. Without
-        // it the dispatch would quietly fall back to the group's initial
-        // shape, which is correct but silently discards the measurement.
-        for dispatch in &plan.dispatches {
-            // Its shaped pipeline was compiled above and ordinary GEMV is an
-            // invalid fallback because it changes the activation arithmetic.
-            if dispatch.gemv_int_dot {
-                continue;
-            }
-            let Some(shape) = dispatch.gemv_shape else {
-                continue;
-            };
-            // The RmsNorm-fused form has its own module and its own binding
-            // layout, and is not shaped. Tuning never sets a shape on one;
-            // this keeps a hand-built plan from producing a pipeline whose
-            // bindings do not match the dispatch.
-            let Some(group) = crate::tune::gemv_group(&dispatch.shader)
-                .filter(|_| dispatch.gemv_rmsnorm.is_none())
-            else {
-                continue;
-            };
-            let key = Variant::Gemv(dispatch.shader.clone(), dispatch.weight_format, shape);
-            if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(key.clone()) {
-                let sm = crate::codegen::generate_module_gemv(group, dispatch.weight_format, shape);
-                let shader = create_gen_shader(gpu, sm, wgsl_dump_dir);
-                let layout = shader_data_layout(&dispatch.shader);
                 slot.insert(create_profiled_pipeline(
                     gpu,
                     key.label(),
@@ -1999,21 +1919,15 @@ impl Pipelines {
                 Variant::Epilogue(entry.clone(), epilogue)
             }];
         }
-        // The int-dot GEMV computes something no other variant here does,
-        // so it is the whole list and a miss is a panic — as for epilogue
-        // fusion. Falling through to the ordinary GEMV would put the
-        // activation back in f32 and change the session's arithmetic on the
-        // strength of a missing pipeline.
-        if dispatch.gemv_int_dot {
+        // An ordinary GEMV cannot replace normalization or quantized activations.
+        if dispatch.gemv_int_dot || dispatch.gemv_rmsnorm.is_some() {
             let shape = dispatch
                 .gemv_shape
                 .unwrap_or_else(|| crate::codegen::GemvShape::initial(entry.shader_group()));
-            let format = dispatch.weight_format;
-            return vec![if dispatch.gemv_rmsnorm.is_some() {
-                Variant::GemvRmsNormIntDot(entry.clone(), format, shape)
-            } else {
-                Variant::GemvIntDot(entry.clone(), format, shape)
-            }];
+            return vec![tuning::tile_variant(
+                dispatch,
+                crate::tune::MatmulTile::Gemv(shape),
+            )];
         }
         let mut out = Vec::new();
         if let Some(ref kernel) = dispatch.reduction {
@@ -2024,21 +1938,6 @@ impl Pipelines {
         }
         if let Some(dim) = Self::attention_head_dim(dispatch) {
             out.push(Variant::Attention(entry.clone(), dim));
-        }
-        // A measured shape outranks the group's initial one, and the RmsNorm
-        // fusion outranks both: folding the norm in removes a whole dispatch,
-        // which no reduction choice can make up for. Shapes are only measured
-        // for the unfused forms, so the two never compete for the same
-        // dispatch — the ordering just makes that explicit.
-        if dispatch.gemv_rmsnorm.is_some() {
-            let shape = dispatch
-                .gemv_shape
-                .unwrap_or_else(|| crate::codegen::GemvShape::initial(entry.shader_group()));
-            return vec![Variant::GemvRmsNorm(
-                entry.clone(),
-                dispatch.weight_format,
-                shape,
-            )];
         }
         if let Some(shape) = dispatch.gemv_shape {
             out.push(Variant::Gemv(entry.clone(), dispatch.weight_format, shape));
@@ -2346,6 +2245,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::FusedMatMulAdd
         | ShaderEntry::FusedMatMulATAdd
         | ShaderEntry::FusedMatMulBTAdd
+        | ShaderEntry::MatMulGemvBTAdd
         | ShaderEntry::MatMulGemvAdd => FusedMatMulAddData::layout(),
         ShaderEntry::Relu
         | ShaderEntry::Sigmoid
@@ -5570,6 +5470,18 @@ impl Session {
                 for (derived_buf, sources, transform) in derived {
                     let sources = sources.as_slice();
                     match transform {
+                        crate::graph::ParamTransform::VerticalConcat => {
+                            let ty = &self.plan.param_types[&derived_buf];
+                            let bytes = match ty.dtype {
+                                crate::graph::DType::F32 => bytemuck::cast_slice(data).to_vec(),
+                                crate::graph::DType::F16 => data
+                                    .iter()
+                                    .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+                                    .collect(),
+                                _ => unreachable!("row concatenation requires dense weights"),
+                            };
+                            self.copy_parameter_rows(derived_buf, name, &bytes, sources);
+                        }
                         crate::graph::ParamTransform::HorizontalConcat => {
                             let total_cols: usize = sources.iter().map(|s| s.1).sum();
                             let derived_fmt = self
@@ -5737,8 +5649,8 @@ impl Session {
     /// the values. The byte count is validated against the logical tensor
     /// size before anything is copied to the device.
     ///
-    /// HorizontalConcat derived parameters (the SwiGLU `gate+up` fusion)
-    /// are restaged in packed space. There is no K-quant encoder here, and
+    /// Derived gate/up concatenations are restaged in their storage format.
+    /// There is no K-quant encoder here, and
     /// Q4/Q6_K packed blobs are not a byte-append of their sources.
     pub fn set_parameter_packed(&mut self, name: &str, data: &[u8]) {
         self.wait();
@@ -5768,17 +5680,77 @@ impl Session {
                 .derived_params
                 .iter()
                 .filter(|entry| {
-                    matches!(entry.2, crate::graph::ParamTransform::HorizontalConcat)
-                        && entry.1.iter().any(|s| s.0 == name)
+                    matches!(
+                        entry.2,
+                        crate::graph::ParamTransform::HorizontalConcat
+                            | crate::graph::ParamTransform::VerticalConcat
+                    ) && entry.1.iter().any(|s| s.0 == name)
                 })
-                .map(|entry| (entry.0, entry.1.clone()))
+                .cloned()
                 .collect();
-            for (derived_buf, sources) in derived {
-                self.restage_packed_concat(derived_buf, name, data, &sources);
+            for (derived_buf, sources, transform) in derived {
+                match transform {
+                    crate::graph::ParamTransform::HorizontalConcat => {
+                        self.restage_packed_concat(derived_buf, name, data, &sources);
+                    }
+                    crate::graph::ParamTransform::VerticalConcat => {
+                        self.copy_parameter_rows(derived_buf, name, data, &sources);
+                    }
+                    _ => unreachable!(),
+                }
             }
             return;
         }
         panic!("unknown parameter: {name}");
+    }
+
+    fn copy_parameter_rows(
+        &self,
+        derived_buf: BufferRef,
+        name: &str,
+        data: &[u8],
+        sources: &[(String, usize)],
+    ) {
+        let ty = &self.plan.param_types[&derived_buf];
+        assert!(matches!(
+            ty.dtype,
+            crate::graph::DType::F32 | crate::graph::DType::F16
+        ));
+        assert_eq!(ty.shape.len(), 2);
+        assert_eq!(ty.shape[0], sources.iter().map(|s| s.1).sum::<usize>());
+        let row_bytes = ty.shape[1]
+            * if ty.dtype == crate::graph::DType::F16 {
+                2
+            } else {
+                4
+            };
+        let host_visible = self.logical_host_visible(derived_buf);
+        let mut offset = 0usize;
+        for &(ref source, rows) in sources {
+            let bytes = rows * row_bytes;
+            if source == name {
+                assert_eq!(data.len(), bytes);
+                if host_visible || (offset.is_multiple_of(4) && bytes.is_multiple_of(4)) {
+                    self.write_raw_buffer_at(
+                        self.buffers[derived_buf.0 as usize].at(offset as u64),
+                        data,
+                        host_visible,
+                    );
+                } else {
+                    // Odd f16 row ranges need a word-aligned transfer. Preserve
+                    // the current device image, including checkpoint/shared
+                    // updates, instead of keeping a stale host-side copy.
+                    let capacity = self.plan.buffers[derived_buf.0 as usize];
+                    assert!(capacity.is_multiple_of(4));
+                    let mut image = vec![0.0f32; capacity / 4];
+                    self.read_buffer(derived_buf, &mut image);
+                    let image: &mut [u8] = bytemuck::cast_slice_mut(&mut image);
+                    image[offset..offset + bytes].copy_from_slice(data);
+                    self.upload_buffer(derived_buf, image);
+                }
+            }
+            offset += bytes;
+        }
     }
 
     fn restage_packed_concat(
@@ -7409,6 +7381,11 @@ impl Session {
         // A GEMV with its RmsNorm folded in takes the norm's weight vector
         // as an extra binding and carries eps in the params' spare slot.
         if let Some(ref rn) = dispatch.gemv_rmsnorm {
+            let (n, k) = if dispatch.shader == ShaderEntry::MatMulGemvBT {
+                (dispatch.params[1], dispatch.params[2])
+            } else {
+                (dispatch.params[2], dispatch.params[1])
+            };
             pc.bind(
                 0,
                 &MatMulRmsNormData {
@@ -7418,8 +7395,8 @@ impl Session {
                     matrix_c: buf(dispatch.output_buffer),
                     params: MatMulRmsNormParams {
                         m: dispatch.params[0],
-                        n: dispatch.params[2],
-                        k: dispatch.params[1],
+                        n,
+                        k,
                         eps_bits: rn.eps_bits,
                     },
                 },
@@ -7634,7 +7611,9 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::FusedMatMulATAdd | ShaderEntry::FusedMatMulBTAdd => {
+            ShaderEntry::FusedMatMulATAdd
+            | ShaderEntry::FusedMatMulBTAdd
+            | ShaderEntry::MatMulGemvBTAdd => {
                 // params layout: [m, n, k, 0] (same as AT/BT, no swizzle)
                 pc.bind(
                     0,
