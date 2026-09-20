@@ -14,7 +14,7 @@ use egglog::{
     extract::{CostModel, Extractor},
 };
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ops::Range,
 };
 
@@ -318,6 +318,8 @@ fn segment_candidates(
         if cost.forbidden != 0 {
             continue;
         }
+        let mut branches = Vec::new();
+        let mut families = BTreeMap::<String, Vec<Edge>>::new();
         for (value, edge) in edges(&mut egraph, &terms, term)? {
             let branching = *choices.entry(value).or_insert_with(|| {
                 extractor
@@ -328,8 +330,22 @@ fn segment_candidates(
             if !branching {
                 continue;
             }
+            families
+                .entry(edge.head.clone())
+                .or_default()
+                .push(edge.clone());
+            branches.push(edge);
+        }
+        // Visit whole-constructor alternatives before their individual sites.
+        // Otherwise a small bound explores many nearly identical partial
+        // unfusions and can miss the fully unfused family entirely.
+        let exclusions = families
+            .into_values()
+            .filter(|edges| edges.len() > 1)
+            .chain(branches.into_iter().map(|edge| vec![edge]));
+        for excluded in exclusions {
             let mut next = forbidden.clone();
-            next.push(edge);
+            next.extend(excluded);
             next.sort_unstable();
             next.dedup();
             if visited.contains(&next) {
@@ -482,6 +498,16 @@ mod tests {
             .collect();
         assert_eq!(forms, [0, 1, 2].into_iter().collect());
         assert_eq!(space.candidates.len(), 4);
+        let bounded = candidates(&graph, 2).unwrap();
+        assert!(bounded.truncated);
+        assert_eq!(
+            bounded
+                .candidates
+                .iter()
+                .map(|c| c.expression.matches("FusedMatMulAdd").count())
+                .collect::<Vec<_>>(),
+            [2, 0],
+        );
 
         // Search only the second pair. External inputs keep their identities,
         // and the first independent pair is not rewritten as a side effect.
