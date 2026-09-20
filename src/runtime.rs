@@ -1079,6 +1079,7 @@ fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
 /// arm rather than a map, a struct field, and four parallel match chains.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Variant {
+    SplitMatmul(ShaderEntry, crate::codegen::ScalarMatmulShape, u32),
     SpecializedConv(ShaderEntry, Vec<u32>, u32),
     ScalarMatmul(
         ShaderEntry,
@@ -1176,6 +1177,7 @@ impl Variant {
         match *self {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
             Variant::Attention(ref e, _)
+            | Variant::SplitMatmul(ref e, _, _)
             | Variant::SpecializedConv(ref e, _, _)
             | Variant::ScalarMatmul(ref e, _, _)
             | Variant::Epilogue(ref e, _)
@@ -1198,6 +1200,9 @@ impl Variant {
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
+            Variant::SplitMatmul(ref e, shape, splits) => {
+                format!("{e:?}:split-{splits}-{shape:?}")
+            }
             Variant::ScalarMatmul(ref e, format, shape) => {
                 format!("{e:?}:scalar-{format:?}-{shape:?}")
             }
@@ -1304,7 +1309,9 @@ impl Pipelines {
         let mut attention_entries: HashSet<(ShaderEntry, u32)> = HashSet::new();
 
         for dispatch in &plan.dispatches {
-            if dispatch.conv_k_tile().is_some() {
+            if dispatch.conv_k_tile().is_some()
+                || matches!(dispatch.kernel, crate::compile::Kernel::SplitMatmul { .. })
+            {
                 continue;
             }
             let group = dispatch.shader.shader_group();
@@ -1853,6 +1860,24 @@ impl Pipelines {
             dump_dir: wgsl_dump_dir.map(str::to_string),
         };
         for dispatch in &plan.dispatches {
+            if let crate::compile::Kernel::SplitMatmul { shape, splits } = dispatch.kernel {
+                let key = Variant::SplitMatmul(dispatch.shader.clone(), shape, splits);
+                if !pipelines.map.contains_key(&key) {
+                    pipelines
+                        .insert_tuning_pipeline(
+                            gpu,
+                            key,
+                            crate::codegen::generate_split_matmul(
+                                dispatch.shader.shader_group(),
+                                shape,
+                                splits,
+                            ),
+                            shader_data_layout(&dispatch.shader),
+                        )
+                        .expect("split-K matrix pipeline");
+                }
+                continue;
+            }
             if dispatch.conv_k_tile().is_some() || dispatch.scalar_matmul().is_some() {
                 let tile = crate::tune::MatmulTile::selected(dispatch, None)
                     .expect("scalar specialization");
@@ -1880,6 +1905,9 @@ impl Pipelines {
     /// variants have no unfused fallback: that would change the computation.
     fn candidates(dispatch: &Dispatch) -> Vec<Variant> {
         let entry = &dispatch.shader;
+        if let crate::compile::Kernel::SplitMatmul { shape, splits } = dispatch.kernel {
+            return vec![Variant::SplitMatmul(entry.clone(), shape, splits)];
+        }
         if let Some(shape) = dispatch.scalar_matmul() {
             return vec![Variant::ScalarMatmul(
                 entry.clone(),
@@ -2482,7 +2510,10 @@ pub(crate) fn select_variants(
         // iOS and future 8×8 f32 advertisers need the same veto.
         let apple_f32_coop = !config.use_f16_input && config.tile_size == 8;
         for dispatch in &mut plan.dispatches {
-            if dispatch.conv_k_tile().is_some() || dispatch.scalar_matmul().is_some() {
+            if dispatch.conv_k_tile().is_some()
+                || dispatch.scalar_matmul().is_some()
+                || matches!(dispatch.kernel, crate::compile::Kernel::SplitMatmul { .. })
+            {
                 continue;
             }
             // Autodiff marks derivative work as requiring f32 operands. A
@@ -2685,6 +2716,7 @@ pub(crate) fn select_variants(
             if dispatch.use_coop()
                 || dispatch.use_small_tiles()
                 || dispatch.scalar_matmul().is_some()
+                || matches!(dispatch.kernel, crate::compile::Kernel::SplitMatmul { .. })
                 || dispatch.weight_format.uses_reduced_storage()
             {
                 continue;

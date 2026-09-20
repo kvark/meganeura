@@ -58,7 +58,7 @@ impl Pipelines {
         self.insert_tuning_pipeline(gpu, key, module, layout)
     }
 
-    fn insert_tuning_pipeline(
+    pub(super) fn insert_tuning_pipeline(
         &mut self,
         gpu: &Gpu,
         key: Variant,

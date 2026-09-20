@@ -94,3 +94,19 @@ Before production integration:
   of independently measured kernel times.
 
 No whole-model timing improvement or automatic production search is claimed.
+
+## Split-K as a structural candidate
+
+`egglog_search 50 720 960 forward split` also crosses 32/64 output tiles with
+1/2/4/8 K partitions, before final scheduling and allocation. Only the plain
+matrix product currently supports partitioning. Its candidate includes SumRows
+and the original add, so a fused one-dispatch form competes with complete
+multi-dispatch forms, not with a partial kernel time. The implementation reuses
+the scalar generator and reduction; it does not duplicate a matmul shader.
+
+This is motivated by a validated Nsight Systems capture of the actual SmolVLA
+action-expert workload: PyTorch uses many split-K GEMMs and combine kernels.
+The prototype changes neither the benchmark protocol nor production defaults.
+The source branch includes an opt-in broad test of normal/AT/BT products,
+uneven K partitions, ragged output edges and rejection without plan mutation.
+It passes on both RTX 5070 and B570 against full independent f64 products.

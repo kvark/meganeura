@@ -1,5 +1,5 @@
 //! Small-region experiment: retain egglog alternatives through kernel tuning.
-//! Usage: egglog_search [M K N] [reverse]
+//! Usage: egglog_search [M K N] [reverse|forward] [split]
 use meganeura::{Graph, Session, SessionConfig, optimize::search};
 use std::time::Instant;
 
@@ -75,15 +75,21 @@ fn main() {
                     .sum::<f64>()
         })
         .collect();
-    let mut gpu = None;
+    let split_search = args.get(4).is_some_and(|s| s == "split");
+    let tiles: &[u32] = if split_search { &[32, 64] } else { &[64] };
+    let splits: &[u32] = if split_search { &[1, 2, 4, 8] } else { &[1] };
+    let gpu = std::sync::Arc::new(meganeura::runtime::init_gpu_context().unwrap());
     let mut trials = Vec::new();
     for candidate in candidates {
-        for (k_stage, interleave_columns) in [8, 16, 32]
-            .into_iter()
-            .flat_map(|k| [false, true].map(|i| (k, i)))
-        {
+        for (tile_size, splits, k_stage, interleave_columns) in tiles.iter().flat_map(|&tile| {
+            splits.iter().flat_map(move |&splits| {
+                [8, 16, 32]
+                    .into_iter()
+                    .flat_map(move |k| [false, true].map(move |i| (tile, splits, k, i)))
+            })
+        }) {
             let mut cfg = SessionConfig::inference_from_env();
-            cfg.gpu = gpu.clone();
+            cfg.gpu = Some(gpu.clone());
             cfg.optimize.mode = meganeura::OptimizeMode::Off;
             cfg.options.fuse_dispatches = false;
             cfg.options.knobs.matmul_k_stage = k_stage;
@@ -91,9 +97,45 @@ fn main() {
             cfg.runtime.coop = meganeura::CoopPolicy::NativeF32;
             cfg.tune = false;
             let start = Instant::now();
-            let mut session = meganeura::build(&candidate.graph, cfg).0;
+            let mut session = if split_search {
+                use meganeura::compile::{self, Kernel, ShaderEntry};
+                let mut plan = compile::compile_with(&candidate.graph, &cfg.options);
+                let shape = meganeura::codegen::ScalarMatmulShape {
+                    tile_size,
+                    k_stage,
+                    interleave_columns,
+                };
+                if splits > 1 {
+                    let Some(index) = plan
+                        .dispatches
+                        .iter()
+                        .position(|d| d.shader == ShaderEntry::MatMul)
+                    else {
+                        continue;
+                    };
+                    if plan
+                        .split_matmul(index, shape, splits, 64 * 1024 * 1024)
+                        .is_err()
+                    {
+                        continue;
+                    }
+                } else {
+                    for d in &mut plan.dispatches {
+                        if matches!(d.shader, ShaderEntry::MatMul | ShaderEntry::FusedMatMulAdd) {
+                            d.kernel = Kernel::ScalarMatmul(shape);
+                            d.workgroups = [
+                                (n as u32).div_ceil(tile_size),
+                                (m as u32).div_ceil(tile_size),
+                                1,
+                            ];
+                        }
+                    }
+                }
+                Session::with_context_opts(plan, gpu.clone(), cfg.runtime)
+            } else {
+                meganeura::build(&candidate.graph, cfg).0
+            };
             let build_ms = start.elapsed().as_secs_f64() * 1000.0;
-            gpu = Some(session.context());
             session.set_input("a", &a);
             session.set_input("c", &c);
             session.set_parameter("b", &b);
@@ -101,6 +143,7 @@ fn main() {
             let row = serde_json::json!({
                 "expression": candidate.expression,
                 "k_stage": k_stage, "interleave_columns": interleave_columns,
+                "tile_size": tile_size, "splits": splits,
                 "build_ms": build_ms,
                 "dispatches": session.plan().dispatches.len(),
                 "max_abs_error": error,
@@ -135,7 +178,7 @@ fn main() {
         "{}",
         serde_json::json!({
             "shape": [m,k,n], "extraction_ms": extraction_ms,
-            "device": gpu.unwrap().device_information().device_name,
+            "device": gpu.device_information().device_name,
             "candidates": rows,
         })
     );

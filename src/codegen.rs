@@ -1896,6 +1896,59 @@ fn substitute(source: &str, old: &str, new: &str) -> String {
     source.replace(old, new)
 }
 
+/// Split the canonical scalar matrix kernel's K tiles without copying its body.
+/// A following SumRows combines `[split, M*N]` partials. No epilogue runs here.
+pub(crate) fn generate_split_matmul(
+    group: ShaderGroup,
+    shape: ScalarMatmulShape,
+    splits: u32,
+) -> ShaderModule {
+    assert!(matches!(
+        group,
+        ShaderGroup::MatMul | ShaderGroup::MatMulAT | ShaderGroup::MatMulBT
+    ));
+    assert!(splits >= 2);
+    let mut source = generate_matmul_with_epilogue(
+        group,
+        None,
+        MatMulOptions {
+            format: WeightFormat::F32,
+            tile: if shape.tile_size == 32 {
+                MatMulTile::Small
+            } else {
+                MatMulTile::Large
+            },
+            knobs: MatmulKnobs {
+                k_stage: shape.k_stage,
+                interleave_columns: shape.interleave_columns,
+                integer_dot: false,
+            },
+        },
+    )
+    .source;
+    source = substitute(&source, "wgid.y + wgid.z * params._pad", "wgid.y");
+    source = substitute(
+        &source,
+        "var t = 0u;",
+        &format!(
+            "let tiles = (params.k + {last}u) / {stage}u;\n\
+         let start_tile = (tiles / {splits}u) * wgid.z + min(wgid.z, tiles % {splits}u);\n\
+         let end_tile = (tiles / {splits}u) * (wgid.z + 1u) + min(wgid.z + 1u, tiles % {splits}u);\n\
+         let end_k = min(end_tile * {stage}u, params.k);\n\
+         var t = start_tile * {stage}u;",
+            last = shape.k_stage - 1,
+            stage = shape.k_stage,
+        ),
+    );
+    source = substitute(&source, "if t >= params.k", "if t >= end_k");
+    source = substitute(
+        &source,
+        "let idx = row * params.n + col;",
+        "let idx = wgid.z * params.m * params.n + row * params.n + col;",
+    );
+    ShaderModule::new(&source)
+}
+
 /// The K-split GEMV with the RmsNorm of its input folded in:
 /// `C[1, N] = (rmsnorm(A) * norm_w) × B[K, N]`.
 ///
