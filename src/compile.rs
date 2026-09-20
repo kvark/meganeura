@@ -3509,6 +3509,12 @@ impl<'a> Compiler<'a> {
             Op::Exp => {
                 self.emit_generated_unary(Pw::Exp(0), node, out_buf);
             }
+            Op::Sin => {
+                self.emit_generated_unary(Pw::Sin(0), node, out_buf);
+            }
+            Op::Cos => {
+                self.emit_generated_unary(Pw::Cos(0), node, out_buf);
+            }
             Op::Softplus { beta } => {
                 let input = self.get_buffer(node.inputs[0]);
                 let len = node.ty.num_elements() as u32;
@@ -6139,6 +6145,52 @@ impl<'a> Compiler<'a> {
 mod tests {
     use super::*;
     use crate::graph::Graph;
+
+    #[test]
+    fn trigonometric_forward_and_backward_compile_to_valid_shaders() {
+        let mut graph = Graph::new();
+        let x = graph.parameter("x", &[513]);
+        let sine = graph.sin(x);
+        let cosine = graph.cos(x);
+        let sum = graph.add(sine, cosine);
+        let loss = graph.sum_all(sum);
+        graph.set_outputs(vec![loss, sine, cosine]);
+        let differentiated = crate::autodiff::differentiate(&graph);
+        assert_eq!(differentiated.outputs().len(), 4);
+        assert_eq!(
+            differentiated
+                .node(*differentiated.outputs().last().unwrap())
+                .ty
+                .shape,
+            [513]
+        );
+        for graph in [&graph, &differentiated] {
+            let plan = compile(graph);
+            let mut saw_sine = false;
+            let mut saw_cosine = false;
+            for dispatch in &plan.dispatches {
+                if let Some(dag) = dispatch.pointwise() {
+                    saw_sine |= dag.ops.iter().any(|op| matches!(op, Pw::Sin(_)));
+                    saw_cosine |= dag.ops.iter().any(|op| matches!(op, Pw::Cos(_)));
+                    let shader =
+                        crate::schedule::lower(&crate::schedule::KernelTemplate::Pointwise {
+                            dag: dag.clone(),
+                            grid: crate::schedule::GridShape::default(),
+                        });
+                    let module = naga::front::wgsl::parse_str(&shader.source).unwrap();
+                    naga::valid::Validator::new(
+                        // Blade assigns resource bindings when creating a pipeline.
+                        naga::valid::ValidationFlags::all()
+                            ^ naga::valid::ValidationFlags::BINDINGS,
+                        naga::valid::Capabilities::all(),
+                    )
+                    .validate(&module)
+                    .unwrap();
+                }
+            }
+            assert!(saw_sine && saw_cosine);
+        }
+    }
 
     #[test]
     fn test_compile_simple() {

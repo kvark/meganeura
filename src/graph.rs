@@ -243,6 +243,8 @@ pub enum Op {
     Relu,
     Sigmoid,
     Tanh,
+    Sin,
+    Cos,
     Neg,
     Abs,
     Log,
@@ -1488,6 +1490,18 @@ impl Graph {
     pub fn tanh(&mut self, x: NodeId) -> NodeId {
         let ty = self.node(x).ty.clone();
         self.add_node(Op::Tanh, vec![x], ty)
+    }
+
+    /// Elementwise sine, with inputs in radians.
+    pub fn sin(&mut self, x: NodeId) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::Sin, vec![x], ty)
+    }
+
+    /// Elementwise cosine, with inputs in radians.
+    pub fn cos(&mut self, x: NodeId) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::Cos, vec![x], ty)
     }
 
     pub fn neg(&mut self, x: NodeId) -> NodeId {

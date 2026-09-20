@@ -64,6 +64,8 @@ pub enum Pw {
     Silu(u16),
     /// `tanh(v)`.
     Tanh(u16),
+    Sin(u16),
+    Cos(u16),
 }
 
 impl Pw {
@@ -173,6 +175,12 @@ impl PointwiseDAG {
                 Pw::Tanh(a) => {
                     let _ = write!(out, "tanh(v{})", a);
                 }
+                Pw::Sin(a) => {
+                    let _ = write!(out, "sin(v{})", a);
+                }
+                Pw::Cos(a) => {
+                    let _ = write!(out, "cos(v{})", a);
+                }
             }
             out.push_str(";\n");
         }
@@ -264,6 +272,8 @@ impl PointwiseDAG {
                 Pw::Sigmoid(a) => Pw::Sigmoid(self_remap[a as usize]),
                 Pw::Silu(a) => Pw::Silu(self_remap[a as usize]),
                 Pw::Tanh(a) => Pw::Tanh(self_remap[a as usize]),
+                Pw::Sin(a) => Pw::Sin(self_remap[a as usize]),
+                Pw::Cos(a) => Pw::Cos(self_remap[a as usize]),
             };
             self_remap.push(ops.len() as u16);
             ops.push(remapped);

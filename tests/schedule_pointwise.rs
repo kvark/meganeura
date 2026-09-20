@@ -100,6 +100,53 @@ fn exp_parity() {
 }
 
 #[test]
+fn trigonometric_forward_and_gradient_match_cpu() {
+    const LEN: usize = 513;
+    let input = (0..LEN)
+        .map(|i| ((i * 19 % 257) as f32 - 128.0) * 0.25)
+        .collect::<Vec<_>>();
+    let weights = (0..LEN)
+        .map(|i| ((i * 13 % 47) as f32 - 23.0) * 0.03)
+        .collect::<Vec<_>>();
+    let mut graph = Graph::new();
+    let x = graph.parameter("x", &[LEN]);
+    let sine = graph.sin(x);
+    let cosine = graph.cos(x);
+    let sum = graph.add(sine, cosine);
+    let weight = graph.input("weight", &[LEN]);
+    let weighted = graph.mul(sum, weight);
+    let loss = graph.sum_all(weighted);
+    graph.set_outputs(vec![loss, sine, cosine]);
+    let mut session = meganeura::build_session(&graph);
+    session.set_parameter("x", &input);
+    session.set_input("weight", &weights);
+    session.step();
+    session.wait();
+    let mut sine = vec![0.0; LEN];
+    let mut cosine = vec![0.0; LEN];
+    let mut gradient = vec![0.0; LEN];
+    session.read_output_by_index(1, &mut sine);
+    session.read_output_by_index(2, &mut cosine);
+    session.read_param_grad("x", &mut gradient);
+    for i in 0..LEN {
+        for (name, actual, expected) in [
+            ("sin", sine[i], input[i].sin()),
+            ("cos", cosine[i], input[i].cos()),
+            (
+                "gradient",
+                gradient[i],
+                weights[i] * (input[i].cos() - input[i].sin()),
+            ),
+        ] {
+            assert!(
+                (actual - expected).abs() <= 2.0e-6 + expected.abs() * 2.0e-6,
+                "{name}[{i}]: {actual} != {expected}"
+            );
+        }
+    }
+}
+
+#[test]
 fn exp_matches_cpu_forward_and_gradient() {
     const LEN: usize = 513;
     let input = (0..LEN)

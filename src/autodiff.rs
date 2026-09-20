@@ -205,6 +205,17 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_x = graph.mul(grad_output, dy);
                 accumulate_grad(&mut graph, &mut grads, node.inputs[0], grad_x);
             }
+            Op::Sin | Op::Cos => {
+                let x = node.inputs[0];
+                let derivative = if matches!(node.op, Op::Sin) {
+                    graph.cos(x)
+                } else {
+                    let sine = graph.sin(x);
+                    graph.neg(sine)
+                };
+                let grad_x = graph.mul(grad_output, derivative);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
             Op::Tanh => {
                 // dL/dx = dL/dy * (1 - y^2)
                 let y = node.id;
@@ -1358,6 +1369,31 @@ fn broadcast_scalar(graph: &mut Graph, scalar: NodeId, target_shape: &[usize]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trigonometric_derivatives_use_the_input_and_opposite_function() {
+        for sine in [true, false] {
+            let mut graph = Graph::new();
+            let x = graph.parameter("x", &[7]);
+            let y = if sine { graph.sin(x) } else { graph.cos(x) };
+            let loss = graph.sum_all(y);
+            graph.set_outputs(vec![loss]);
+            let diff = differentiate(&graph);
+            let gradient = diff.node(*diff.outputs().last().unwrap());
+            assert!(matches!(gradient.op, Op::Mul));
+            let derivative = diff.node(gradient.inputs[1]);
+            let trig = if sine {
+                assert!(matches!(derivative.op, Op::Cos));
+                derivative
+            } else {
+                assert!(matches!(derivative.op, Op::Neg));
+                let trig = diff.node(derivative.inputs[0]);
+                assert!(matches!(trig.op, Op::Sin));
+                trig
+            };
+            assert_eq!(trig.inputs, [x]);
+        }
+    }
 
     #[test]
     fn test_simple_autodiff() {
