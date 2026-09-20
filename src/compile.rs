@@ -1074,6 +1074,10 @@ pub enum Kernel {
         shape: crate::codegen::ScalarMatmulShape,
         splits: u32,
     },
+    /// Independent 16-row query tiles, requiring a fixed 32-lane subgroup.
+    CooperativeAttention {
+        query_tiles: u32,
+    },
     SpecializedConv {
         k_tile: u32,
     },
@@ -2768,7 +2772,7 @@ impl<'a> Compiler<'a> {
         {
             return (
                 ShaderEntry::FlashAttentionCoop,
-                [q_seq.div_ceil(32), num_heads, 1],
+                [q_seq.div_ceil(16), num_heads, 1],
             );
         }
         // EPT (elements per thread) must match forward codegen.

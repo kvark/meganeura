@@ -1094,6 +1094,7 @@ enum Variant {
     /// containing different attention widths run every dispatch through
     /// whichever width happened to be encountered last.
     Attention(ShaderEntry, u32),
+    CooperativeAttention(ShaderEntry, u32, u32),
     /// Epilogue-fused matmuls, keyed by their actual DAG. The cooperative form
     /// uses workgroup memory to expose accumulator lanes to the epilogue.
     Epilogue(ShaderEntry, EpiloguePipelineKey),
@@ -1173,6 +1174,7 @@ impl Variant {
         match *self {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
             Variant::Attention(ref e, _)
+            | Variant::CooperativeAttention(ref e, _, _)
             | Variant::SplitMatmul(ref e, _, _)
             | Variant::SpecializedConv(ref e, _, _)
             | Variant::ScalarMatmul(ref e, _, _)
@@ -1208,6 +1210,9 @@ impl Variant {
             Variant::Reduction(hash) => format!("generated-reduction:{hash:016x}"),
             Variant::Pointwise(hash) => format!("generated-pointwise:{hash:016x}"),
             Variant::Attention(ref e, head_dim) => format!("{e:?}:head-dim-{head_dim}"),
+            Variant::CooperativeAttention(ref e, head_dim, query_tiles) => {
+                format!("{e:?}:head-dim-{head_dim}:query-tiles-{query_tiles}")
+            }
             Variant::Epilogue(ref e, ref key) => epilogue_profile_key(e, key, false),
             Variant::CoopEpilogue(ref e, ref key) => epilogue_profile_key(e, key, true),
             Variant::CoopPrologue(ref e, ref kinds) => {
@@ -1437,6 +1442,15 @@ impl Pipelines {
                     prologue,
                 )
             }
+            Variant::CooperativeAttention(_, hd, query_tiles) => {
+                if gpu.capabilities().fixed_compute_subgroup_size != Some(32)
+                    || !crate::codegen::cooperative_attention_tile_is_legal(hd, query_tiles)
+                    || group != ShaderGroup::FlashAttentionCoop
+                {
+                    return Err("unsupported independent-query cooperative layout".into());
+                }
+                crate::codegen::generate_flash_attention_coop_tiled_module(hd, query_tiles)
+            }
             Variant::Attention(_, hd) => match group {
                 ShaderGroup::FlashAttention => {
                     crate::codegen::generate_flash_attention_module(hd, knobs.flash_ept_cap)
@@ -1562,6 +1576,9 @@ impl Pipelines {
             return Variant::Pointwise(dag.hash_key());
         }
         if let Some(dim) = Self::attention_head_dim(dispatch) {
+            if let crate::compile::Kernel::CooperativeAttention { query_tiles } = dispatch.kernel {
+                return Variant::CooperativeAttention(entry, dim, query_tiles);
+            }
             return Variant::Attention(entry, dim);
         }
         if let Some(shape) = dispatch.gemv_shape() {

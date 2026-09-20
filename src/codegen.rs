@@ -3783,10 +3783,26 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
 ///     each thread reads its row's BKV scores and runs softmax
 ///     locally.
 ///
-/// Caller dispatch must use workgroups = `[ceil(q_seq/32), num_heads, 1]`.
-/// This experiment requires exactly 32 lanes per subgroup.
+/// Caller dispatch must use workgroups = `[ceil(q_seq/16), num_heads, 1]`.
 /// `head_dim` must be a multiple of 16.
 pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
+    generate_flash_attention_coop_tiled_module(head_dim, 0)
+}
+
+/// Independent-query candidates use at most Vulkan's minimum 16 KiB shared
+/// memory guarantee, without needing a device-specific capacity assumption.
+pub fn cooperative_attention_tile_is_legal(head_dim: u32, query_tiles: u32) -> bool {
+    (16..=128).contains(&head_dim)
+        && head_dim.is_multiple_of(16)
+        && matches!(query_tiles, 1 | 2 | 4)
+        && 16 * query_tiles * head_dim * 2 + head_dim * 16 * 4 + 16 * query_tiles * 16 * 4
+            <= 16 * 1024
+}
+
+/// Zero query tiles preserves the original layout. Otherwise each 32-lane
+/// subgroup handles 16 independent queries. The caller must verify a fixed
+/// subgroup size and dispatch `ceil(q_seq / (16 * query_tiles))` workgroups.
+pub fn generate_flash_attention_coop_tiled_module(head_dim: u32, query_tiles: u32) -> ShaderModule {
     use std::fmt::Write;
     assert!(
         head_dim >= 16 && head_dim.is_multiple_of(16),
@@ -3794,10 +3810,15 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     );
     let hd = head_dim;
     let hd_tiles = hd / 16;
-    let bq: u32 = 32;
+    assert!(matches!(query_tiles, 0 | 1 | 2 | 4));
+    let bq: u32 = 16 * query_tiles.max(1);
     let bkv: u32 = 16;
-    let wg_size: u32 = 64;
-    let chunks_per_row: u32 = 2;
+    let wg_size: u32 = if query_tiles == 0 {
+        64
+    } else {
+        32 * query_tiles
+    };
+    let chunks_per_row: u32 = if query_tiles == 0 { 4 } else { 2 };
     let chunk_hd: u32 = hd / chunks_per_row;
 
     let mut src = String::new();
@@ -3837,8 +3858,14 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     src.push_str("    let scale = inverseSqrt(f32(head_dim));\n\n");
 
     // Per-thread (row, chunk) — index hoisted to top.
-    let _ = writeln!(src, "    let row = sg * 16u + lane / {chunks_per_row}u;");
-    let _ = writeln!(src, "    let chunk = lane % {chunks_per_row}u;");
+    if query_tiles == 0 {
+        let _ = writeln!(src, "    let row = lid.x / {chunks_per_row}u;");
+        let _ = writeln!(src, "    let chunk = lid.x % {chunks_per_row}u;");
+    } else {
+        let _ = writeln!(src, "    let row = sg * 16u + lane / {chunks_per_row}u;");
+        let _ = writeln!(src, "    let chunk = lane % {chunks_per_row}u;");
+    }
+    let query_offset = if query_tiles == 0 { "0u" } else { "sg * 16u" };
     let _ = writeln!(src, "    let d_off = chunk * {chunk_hd}u;");
     src.push_str("    let qpos = pos_base + row;\n");
     src.push_str("    let q_valid = qpos < q_seq && head < num_heads;\n\n");
@@ -3919,7 +3946,7 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     );
     let _ = writeln!(
         src,
-        "            let a = coopLoadT<coop_mat16x16<f16,A>>(&shared_q[sg * 16u * {hd}u + ht * 16u], {hd}u);"
+        "            let a = coopLoadT<coop_mat16x16<f16,A>>(&shared_q[({query_offset}) * {hd}u + ht * 16u], {hd}u);"
     );
     let _ = writeln!(
         src,
@@ -3929,7 +3956,7 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     src.push_str("        }\n");
     let _ = writeln!(
         src,
-        "        coopStoreT(score_acc, &shared_score[sg * 16u * {bkv}u], {bkv}u);"
+        "        coopStoreT(score_acc, &shared_score[({query_offset}) * {bkv}u], {bkv}u);"
     );
     src.push_str("        workgroupBarrier();\n\n");
 

@@ -1,7 +1,7 @@
 # Cooperative attention layout study
 
 Source-only experiment, 20 September 2026. No change to the submitted paper's
-benchmark cohort or production defaults. See `egglog-measured.md` for model,
+benchmark cohort or production defaults. See `egglog_search.md` for model,
 CPU-reference, machine, and resource-limit details.
 
 The workload is Inferena's deterministic Whisper-tiny encoder (3000 mel frames),
@@ -64,10 +64,10 @@ estimate with a blanket cooperative preference.
 
 Check out the indicated source revision, using a separate target directory for
 each worktree. Generate `whisper-cpu.f32` with `bench/egglog_reference.py` as
-described in `egglog-measured.md`, then build and run:
+described in `egglog_search.md`, then build and run:
 
 ```sh
-CARGO_BUILD_JOBS=1 cargo build --release --example egglog_model_search
+CARGO_BUILD_JOBS=1 cargo build --release --features models --example egglog_model_search
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json \
   target/release/examples/egglog_model_search \
   Whisper-tiny /path/to/whisper-cpu.f32 fast baseline --static

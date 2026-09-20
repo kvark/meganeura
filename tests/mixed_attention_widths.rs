@@ -86,7 +86,7 @@ fn mixed_head_dims_match_independent_sessions() {
 #[test]
 #[ignore = "cooperative attention source experiment; run on a GPU"]
 fn cooperative_attention_matches_full_reference_with_masks_and_tails() {
-    use meganeura::{Mode, SessionConfig, compile};
+    use meganeura::{codegen, compile};
     let gpu = std::sync::Arc::new(meganeura::runtime::init_gpu_context().unwrap());
     for (q_len, kv_len, hd, causal, window) in [
         (33, 49, 16, false, 0),
@@ -134,7 +134,14 @@ fn cooperative_attention_matches_full_reference_with_masks_and_tails() {
                 }
             }
         }
-        for cooperative in [false, true] {
+        for (cooperative, query_tiles) in [(false, 0), (true, 0), (true, 1), (true, 2), (true, 4)] {
+            if query_tiles > 0
+                && (gpu.capabilities().fixed_compute_subgroup_size != Some(32)
+                    || gpu.capabilities().cooperative_matrix.f16_tile != 16
+                    || !codegen::cooperative_attention_tile_is_legal(hd as u32, query_tiles))
+            {
+                continue;
+            }
             let mut graph = Graph::new();
             let qn = graph.input("q", &[q_len, heads * hd]);
             let kn = graph.input("k", &[kv_len, kv_heads * hd]);
@@ -156,18 +163,26 @@ fn cooperative_attention_matches_full_reference_with_masks_and_tails() {
             };
             graph.set_outputs(vec![output]);
             let advertised = gpu.capabilities().cooperative_matrix;
-            let (mut session, _) = meganeura::build(
+            let mut plan = compile::compile_with_caps(
                 &graph,
-                SessionConfig {
-                    mode: Mode::Inference,
-                    gpu: Some(gpu.clone()),
-                    options: compile::CompileOptions {
-                        flash_forward_coop: cooperative,
-                        ..Default::default()
-                    },
+                &compile::CompileOptions {
+                    flash_forward_coop: cooperative,
                     ..Default::default()
                 },
+                codegen::CoopCaps {
+                    f16_tile: advertised.f16_tile,
+                    f32_tile: advertised.f32_tile,
+                },
             );
+            if query_tiles > 0 {
+                for d in &mut plan.dispatches {
+                    if d.shader == compile::ShaderEntry::FlashAttentionCoop {
+                        d.kernel = compile::Kernel::CooperativeAttention { query_tiles };
+                        d.workgroups[0] = d.params[0].div_ceil(16 * query_tiles);
+                    }
+                }
+            }
+            let mut session = meganeura::Session::with_context(plan, gpu.clone());
             assert_eq!(
                 session
                     .plan()
@@ -191,7 +206,7 @@ fn cooperative_attention_matches_full_reference_with_masks_and_tails() {
             let relative = (error / norm.max(1e-24)).sqrt();
             assert!(
                 actual.iter().all(|v| v.is_finite()) && relative < 0.002,
-                "Q={q_len}, KV={kv_len}, HD={hd}, causal={causal}, window={window}, cooperative={cooperative}: relL2={relative}"
+                "Q={q_len}, KV={kv_len}, HD={hd}, causal={causal}, window={window}, cooperative={cooperative}, query_tiles={query_tiles}: relL2={relative}"
             );
         }
     }
