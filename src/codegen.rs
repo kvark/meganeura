@@ -179,53 +179,8 @@ fn parse_source(source: &str) -> Result<Module, naga::front::wgsl::ParseError> {
     naga::front::wgsl::parse_str(source)
 }
 
-/// Generate WGSL declarations and body for a fused epilogue chain.
-///
-/// Returns (declarations, body) where declarations are `var<storage>`
-/// lines for extra buffers, and body is a sequence of WGSL statements
-/// that transform `val` (the matmul result for one output element).
-pub fn epilogue_to_wgsl(epilogue: &[crate::compile::EpilogueOp]) -> (String, String) {
-    use crate::compile::EpilogueOp;
-    let mut decls = Vec::new();
-    let mut body = Vec::new();
-    let mut declared = std::collections::HashSet::new();
-
-    for op in epilogue {
-        #[allow(clippy::pattern_type_mismatch)]
-        match op {
-            EpilogueOp::Add(buf_idx) => {
-                let name = format!("epi_buf_{}", buf_idx);
-                if declared.insert(*buf_idx) {
-                    decls.push(format!("var<storage> {}: array<f32>;", name));
-                }
-                body.push(format!("val = val + {}[idx];", name));
-            }
-            EpilogueOp::BiasAdd(buf_idx) => {
-                let name = format!("epi_buf_{}", buf_idx);
-                if declared.insert(*buf_idx) {
-                    decls.push(format!("var<storage> {}: array<f32>;", name));
-                }
-                body.push(format!("val = val + {}[col];", name));
-            }
-            EpilogueOp::Relu => {
-                body.push("val = max(val, 0.0);".to_string());
-            }
-            EpilogueOp::Silu => {
-                body.push("val = val / (1.0 + exp(-val));".to_string());
-            }
-            EpilogueOp::Sigmoid => {
-                body.push("val = 1.0 / (1.0 + exp(-val));".to_string());
-            }
-            EpilogueOp::Neg => {
-                body.push("val = -val;".to_string());
-            }
-        }
-    }
-    (decls.join("\n"), body.join("\n                "))
-}
-
-/// Generate WGSL for a [`crate::compile::MatMulEpilogue`] — the PointwiseDAG-based
-/// replacement for `epilogue_to_wgsl`. Returns (declarations, body).
+/// Generate WGSL for a [`crate::compile::MatMulEpilogue`].
+/// Returns (declarations, body).
 ///
 /// The DAG's `LoadInput(0)` maps to `val` (the matmul accumulator).
 /// `LoadInput(1+)` maps to `epi_buf_{n}` indexed by either `idx`
@@ -318,14 +273,6 @@ pub fn matmul_prologue_to_wgsl(
     (decls.join("\n"), cache_decls.join("\n"), cache_init, expr)
 }
 
-/// Where the fused epilogue statements come from.
-pub enum EpilogueSource<'a> {
-    /// PointwiseDAG epilogue — what the compiler emits today.
-    Dag(&'a crate::compile::MatMulEpilogue),
-    /// Flat op chain, kept for plans cached before the DAG migration.
-    Ops(&'a [crate::compile::EpilogueOp]),
-}
-
 /// Tuning knobs for the register-tiled scalar matmul codegen.
 ///
 /// Defaults are what the plain kernel ships with: 32-row K staging and
@@ -388,7 +335,7 @@ pub struct MatMulOptions {
 /// `$STORE_BODY` hook serves every weight format.
 pub fn generate_matmul_with_epilogue(
     group: ShaderGroup,
-    epilogue: EpilogueSource<'_>,
+    epilogue: Option<&crate::compile::MatMulEpilogue>,
     options: MatMulOptions,
 ) -> ShaderModule {
     // Store-side fusion compiles through this generator rather than
@@ -401,10 +348,7 @@ pub fn generate_matmul_with_epilogue(
              run along the parameter's first dimension, which is N here, not K"
         );
     }
-    let (epi_decl, epi_body) = match epilogue {
-        EpilogueSource::Dag(dag) => matmul_epilogue_to_wgsl(dag),
-        EpilogueSource::Ops(ops) => epilogue_to_wgsl(ops),
-    };
+    let (epi_decl, epi_body) = epilogue.map(matmul_epilogue_to_wgsl).unwrap_or_default();
     let MatMulOptions { tile, .. } = options;
     let (a_idx, b_idx, fused_decl, fused_expr) = match group {
         ShaderGroup::MatMul => (MATMUL_A_FWD, MATMUL_B_FWD, "", ""),
@@ -7449,7 +7393,7 @@ mod tests {
         };
         let sm = generate_matmul_with_epilogue(
             ShaderGroup::MatMul,
-            EpilogueSource::Dag(&epi),
+            Some(&epi),
             MatMulOptions {
                 format: WeightFormat::Q4,
                 ..Default::default()
@@ -7476,10 +7420,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "does not support block-quantized")]
     fn quantized_bt_epilogue_is_refused() {
-        let relu = [crate::compile::EpilogueOp::Relu];
         let _ = generate_matmul_with_epilogue(
             ShaderGroup::MatMulBTAdd,
-            EpilogueSource::Ops(&relu),
+            None,
             MatMulOptions {
                 format: WeightFormat::Q4K,
                 ..Default::default()
@@ -7696,20 +7639,26 @@ mod tests {
             ShaderGroup::MatMulAT,
             ShaderGroup::MatMulBT,
         ] {
-            let relu = [crate::compile::EpilogueOp::Relu];
+            let relu = crate::compile::MatMulEpilogue {
+                dag: crate::schedule::PointwiseDAG {
+                    n_inputs: 1,
+                    ops: vec![
+                        crate::schedule::Pw::LoadInput(0),
+                        crate::schedule::Pw::Relu(0),
+                    ],
+                    output: 1,
+                },
+                inputs: Vec::new(),
+            };
             let small = generate_matmul_with_epilogue(
                 group,
-                EpilogueSource::Ops(&relu),
+                Some(&relu),
                 MatMulOptions {
                     tile: MatMulTile::Small,
                     ..Default::default()
                 },
             );
-            let large = generate_matmul_with_epilogue(
-                group,
-                EpilogueSource::Ops(&relu),
-                MatMulOptions::default(),
-            );
+            let large = generate_matmul_with_epilogue(group, Some(&relu), MatMulOptions::default());
             assert_ne!(
                 small.source, large.source,
                 "{group:?}: small and large epilogue shaders must differ"

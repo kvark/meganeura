@@ -130,24 +130,33 @@ impl TuneAttention {
 }
 
 fn plain(d: &Dispatch) -> bool {
-    !d.use_coop
-        && !d.use_small_tiles
-        && !d.use_coop_compensated
-        && d.weight_format == crate::compile::WeightFormat::F32
-        && d.horizontal_batch < 2
-        && d.matmul_prologue.is_none()
-        && d.matmul_epilogue.is_none()
-        && d.epilogue.is_empty()
-        && d.epilogue_buffers.is_empty()
-        && d.extra_outputs.is_empty()
-        && d.pointwise.is_none()
-        && d.reduction.is_none()
-        && d.conv_k_tile.is_none()
-        && d.scalar_matmul.is_none()
-        && d.gemv_shape.is_none()
-        && d.gemv_rmsnorm.is_none()
-        && !d.gemv_int_dot
-        && d.scalar_fallback.is_none()
+    matches!(*d, Dispatch {
+        shader: _,
+        workgroups: _,
+        input_buffers: _,
+        output_buffer: _,
+        extra_outputs: ref outputs,
+        params: _,
+        use_coop: false,
+        use_coop_compensated: false,
+        horizontal_batch: 0 | 1,
+        use_small_tiles: false,
+        scalar_matmul: None,
+        conv_k_tile: None,
+        gemv_int_dot: false,
+        gemv_shape: None,
+        requires_full_precision: _,
+        fusion_barrier: _,
+        matmul_epilogue: None,
+        gemv_rmsnorm: None,
+        matmul_prologue: None,
+        label: _,
+        origin: _,
+        scalar_fallback: None,
+        pointwise: None,
+        reduction: None,
+        weight_format: crate::compile::WeightFormat::F32,
+    } if outputs.is_empty())
 }
 
 fn collect(session: &super::Session) -> Vec<Class> {
@@ -215,11 +224,10 @@ fn collect(session: &super::Session) -> Vec<Class> {
             .iter()
             .map(|b| session.alias.map[b.0 as usize])
             .collect();
-        if physical
-            .iter()
-            .enumerate()
-            .any(|(i, p)| physical[..i].contains(p))
-        {
+        let mut unique = physical.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.len() != physical.len() {
             continue;
         }
         for (i, &p) in physical.iter().enumerate() {

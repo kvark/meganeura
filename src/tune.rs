@@ -444,8 +444,6 @@ impl TuneClass {
             || dispatch.horizontal_batch >= 2
             || dispatch.matmul_prologue.is_some()
             || dispatch.matmul_epilogue.is_some()
-            || !dispatch.epilogue.is_empty()
-            || !dispatch.epilogue_buffers.is_empty()
             || !dispatch.extra_outputs.is_empty()
             || dispatch.pointwise.is_some()
             || dispatch.reduction.is_some()
