@@ -303,6 +303,7 @@ impl TuningKnobs {
                 })
                 .unwrap_or(d.matmul_k_stage),
             matmul_interleave_columns: INTERLEAVE_COLUMNS.bool_or(false),
+            ..d
         }
     }
 }

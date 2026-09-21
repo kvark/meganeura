@@ -104,6 +104,9 @@ impl WeightFormat {
 pub struct TuningKnobs {
     /// Elements-per-thread cap for flash-attention forward codegen.
     pub flash_ept_cap: u32,
+    /// Interleave head dimensions across the lanes processing one query.
+    #[serde(default)]
+    pub flash_interleave: bool,
     /// EPT cap for the flash dQ backward kernel.
     pub flash_grad_q_ept_cap: u32,
     /// EPT cap for the fused flash dK/dV backward kernel.
@@ -127,6 +130,7 @@ impl Default for TuningKnobs {
         let fwd = if apple { 16 } else { 32 };
         Self {
             flash_ept_cap: fwd,
+            flash_interleave: false,
             flash_grad_q_ept_cap: fwd,
             flash_grad_kv_ept_cap: if apple { 8 } else { 32 },
             matmul_k_stage: 32,

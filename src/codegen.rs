@@ -632,6 +632,7 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
             generate_flash_attention_module(
                 64,
                 crate::compile::TuningKnobs::default().flash_ept_cap,
+                false,
             )
         }
         ShaderGroup::FlashAttentionCoop => generate_flash_attention_coop_module(64),
@@ -725,7 +726,7 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         ShaderGroup::CachedAttention => {
             ShaderModule::new(include_str!("shaders/cached_attention.wgsl"))
         }
-        ShaderGroup::CachedQueryAttention => generate_flash_attention(64, 8, true),
+        ShaderGroup::CachedQueryAttention => generate_flash_attention(64, 8, false, true),
         ShaderGroup::CachedBlockAttention => generate_module_block_attention(),
         ShaderGroup::ChunkedRelativeAttention => {
             ShaderModule::new(include_str!("shaders/chunked_relative_attention.wgsl"))
@@ -3454,11 +3455,20 @@ mod coop_caps_tests {
 
 pub const CACHED_ATTENTION_QUERIES: u32 = 32; // 256 threads / (64 dimensions / 8 elements)
 
-pub fn generate_flash_attention_module(head_dim: u32, ept_cap: u32) -> ShaderModule {
-    generate_flash_attention(head_dim, ept_cap, false)
+pub fn generate_flash_attention_module(
+    head_dim: u32,
+    ept_cap: u32,
+    interleave: bool,
+) -> ShaderModule {
+    generate_flash_attention(head_dim, ept_cap, interleave, false)
 }
 
-fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> ShaderModule {
+fn generate_flash_attention(
+    head_dim: u32,
+    ept_cap: u32,
+    interleave: bool,
+    cached: bool,
+) -> ShaderModule {
     use std::fmt::Write;
     assert!(
         head_dim.is_power_of_two() && head_dim >= 2,
@@ -3469,6 +3479,7 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     // which honors MEGANEURA_FLASH_EPT_CAP overrides.
     let ept: u32 = hd.min(ept_cap);
     let tpq = hd / ept; // threads per query
+    let d_stride = if interleave { tpq } else { 1 };
     let bq: u32 = (256 / tpq).max(1);
     if cached {
         assert_eq!(bq, CACHED_ATTENTION_QUERIES);
@@ -3556,7 +3567,11 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     );
     let _ = writeln!(src, "    let qi = lid.x / {tpq}u;"); // query within tile
     let _ = writeln!(src, "    let lane = lid.x % {tpq}u;"); // lane within query group
-    let _ = writeln!(src, "    let d_base = lane * {ept}u;"); // first head_dim element for this thread
+    let _ = writeln!(
+        src,
+        "    let d_base = lane * {}u;",
+        if interleave { 1 } else { ept }
+    );
     let _ = writeln!(src, "    let pos = wgid.x * {bq}u + qi;"); // global query position
     src.push_str("    let head = wgid.y;\n");
     src.push_str("    let q_seq = params.q_seq;\n");
@@ -3606,7 +3621,11 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     src.push_str("    if valid {\n");
     src.push_str("        let q_base = pos * (num_heads * head_dim) + head * head_dim;\n");
     for e in 0..ept {
-        let _ = writeln!(src, "        q{e} = src_a[q_base + d_base + {e}u];");
+        let _ = writeln!(
+            src,
+            "        q{e} = src_a[q_base + d_base + {}u];",
+            e * d_stride
+        );
     }
     src.push_str("    }\n\n");
 
@@ -3665,7 +3684,8 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     for e in 0..ept {
         let _ = writeln!(
             src,
-            "            pdot += q{e} * shared_k[i * {hd}u + d_base + {e}u];"
+            "            pdot += q{e} * shared_k[i * {hd}u + d_base + {}u];",
+            e * d_stride
         );
     }
     let _ = writeln!(
@@ -3691,7 +3711,8 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     for e in 0..ept {
         let _ = writeln!(
             src,
-            "                out{e} = out{e} * correction + weight * shared_v[i * {hd}u + d_base + {e}u];"
+            "                out{e} = out{e} * correction + weight * shared_v[i * {hd}u + d_base + {}u];",
+            e * d_stride
         );
     }
     src.push_str("                max_score = new_max;\n");
@@ -3712,7 +3733,11 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     let _ = writeln!(src, "        let dot_base = qi * {tpq}u;");
     src.push_str("        var pdot2 = 0.0;\n");
     for e in 0..ept {
-        let _ = writeln!(src, "        pdot2 += q{e} * shared_k[d_base + {e}u];");
+        let _ = writeln!(
+            src,
+            "        pdot2 += q{e} * shared_k[d_base + {}u];",
+            e * d_stride
+        );
     }
     src.push_str("        wg_dot[dot_base + lane] = pdot2;\n");
     src.push_str("        tree_reduce_grouped(lid.x);\n");
@@ -3727,7 +3752,8 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     for e in 0..ept {
         let _ = writeln!(
             src,
-            "            out{e} = out{e} * correction + weight * bias[v_base2 + d_base + {e}u];"
+            "            out{e} = out{e} * correction + weight * bias[v_base2 + d_base + {}u];",
+            e * d_stride
         );
     }
     src.push_str("            max_score = new_max;\n");
@@ -3742,7 +3768,8 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     for e in 0..ept {
         let _ = writeln!(
             src,
-            "        dst[q_base + d_base + {e}u] = out{e} / safe_sum;"
+            "        dst[q_base + d_base + {}u] = out{e} / safe_sum;",
+            e * d_stride
         );
     }
 
@@ -6434,24 +6461,19 @@ mod tests {
 
     #[test]
     fn test_flash_attention_wgsl() {
-        // BQ=4 for hd=64, BQ=8 for hd=32, BQ=2 for hd=128
-        let _ = generate_flash_attention_module(
-            64,
-            crate::compile::TuningKnobs::default().flash_ept_cap,
-        );
-        let _ = generate_flash_attention_module(
-            32,
-            crate::compile::TuningKnobs::default().flash_ept_cap,
-        );
-        let _ = generate_flash_attention_module(
-            128,
-            crate::compile::TuningKnobs::default().flash_ept_cap,
-        );
-        // hd=256 should fall back to BQ=1 (regular attention)
-        let _ = generate_flash_attention_module(
-            256,
-            crate::compile::TuningKnobs::default().flash_ept_cap,
-        );
+        for hd in [32, 64, 128, 256] {
+            for ept in [8, 16, 32] {
+                for interleave in [false, true] {
+                    let sm = generate_flash_attention_module(hd, ept, interleave);
+                    naga::valid::Validator::new(
+                        naga::valid::ValidationFlags::all(),
+                        naga::valid::Capabilities::empty(),
+                    )
+                    .validate(&sm.module)
+                    .unwrap();
+                }
+            }
+        }
     }
 
     #[test]

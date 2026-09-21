@@ -245,17 +245,21 @@ fn implementations(
             .iter()
             .any(|n| matches!(n.op, crate::graph::Op::CachedBlockAttention { .. }))
     });
-    let mut attention = vec![(0, 0)];
+    let mut attention = vec![(0, 0, false)];
     if seeds.iter().any(|seed| {
         seed.plan
             .dispatches
             .iter()
             .any(|d| d.shader == compile::ShaderEntry::FlashAttention)
     }) {
-        attention.extend([(0, 16), (0, 8), (0, 32)]);
+        attention.extend(
+            [16, 8, 32]
+                .into_iter()
+                .flat_map(|ept| [false, true].map(|interleave| (0, ept, interleave))),
+        );
     }
     if cached_attention {
-        attention.extend([1, 2, 4, 8, 16].map(|splits| (splits, 0)));
+        attention.extend([1, 2, 4, 8, 16].map(|splits| (splits, 0, false)));
     }
     // Preserve unsplit products, and test reduction parallelism as a complete
     // two-dispatch implementation. No architecture or model chooses the winner.
@@ -286,7 +290,7 @@ fn implementations(
                     })
                 })
         });
-    let mut current = ((0, 0), (0, 32), 1);
+    let mut current = ((0, 0, false), (0, 32), 1);
     let mut seed_index = seeds.len();
     std::iter::from_fn(move || {
         loop {
@@ -296,7 +300,8 @@ fn implementations(
             }
             let seed = seeds.get(seed_index)?;
             seed_index += 1;
-            let ((splits, flash_ept), (matrix_splits, tile_size), chunks) = current;
+            let ((splits, flash_ept, flash_interleave), (matrix_splits, tile_size), chunks) =
+                current;
             let mut plan = if splits == 0 && flash_ept == 0 {
                 seed.plan.clone()
             } else {
@@ -306,6 +311,7 @@ fn implementations(
                 }
                 if flash_ept != 0 {
                     options.knobs.flash_ept_cap = flash_ept;
+                    options.knobs.flash_interleave = flash_interleave;
                 }
                 let plan = compile::compile_with_caps(&seed.graph, &options, caps);
                 if plan == seed.plan {
@@ -335,7 +341,7 @@ fn implementations(
             }
             return Some(measure::Program {
                 description: format!(
-                    "{}, attention_splits={splits}, flash_ept={flash_ept}, matrix_splits={matrix_splits}, matrix_tile={tile_size}, submission_chunks={chunks}",
+                    "{}, attention_splits={splits}, flash_ept={flash_ept}, flash_interleave={flash_interleave}, matrix_splits={matrix_splits}, matrix_tile={tile_size}, submission_chunks={chunks}",
                     seed.description
                 ),
                 plan,

@@ -1440,9 +1440,11 @@ impl Pipelines {
                 )
             }
             Variant::Attention(_, hd) => match group {
-                ShaderGroup::FlashAttention => {
-                    crate::codegen::generate_flash_attention_module(hd, knobs.flash_ept_cap)
-                }
+                ShaderGroup::FlashAttention => crate::codegen::generate_flash_attention_module(
+                    hd,
+                    knobs.flash_ept_cap,
+                    knobs.flash_interleave,
+                ),
                 ShaderGroup::FlashAttentionCoop => {
                     crate::codegen::generate_flash_attention_coop_module(hd)
                 }
