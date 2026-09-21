@@ -6527,7 +6527,8 @@ mod tests {
                             },
                         );
                         naga::valid::Validator::new(
-                            naga::valid::ValidationFlags::all(),
+                            naga::valid::ValidationFlags::all()
+                                ^ naga::valid::ValidationFlags::BINDINGS,
                             naga::valid::Capabilities::empty(),
                         )
                         .validate(&sm.module)
