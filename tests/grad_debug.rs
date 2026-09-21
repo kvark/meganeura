@@ -166,10 +166,10 @@ fn grad_rmsnorm_matmul_ce_large() {
 /// Test causal attention backward with large inputs
 #[test]
 fn grad_causal_attn_large() {
-    let seq = 4;
+    let seq = 17;
     let num_heads: u32 = 1;
     let num_kv_heads: u32 = 1;
-    let head_dim: u32 = 64;
+    let head_dim: u32 = 512;
     let d = (num_heads * head_dim) as usize;
     let scale = 1.0f32;
 
@@ -181,6 +181,9 @@ fn grad_causal_attn_large() {
         let out = g.causal_attention(q, k, v, num_heads, num_kv_heads, head_dim);
         let loss = g.mean_all(out);
         g.set_outputs(vec![loss]);
+        for node in g.nodes_mut() {
+            node.requires_full_precision = true;
+        }
         g
     };
 
@@ -200,16 +203,18 @@ fn grad_causal_attn_large() {
         ("v".to_string(), v_data),
     ];
 
-    check_grad(
-        "CausalAttn(scale=1.0)",
-        make_graph,
-        make_graph,
-        &params,
-        &[],
-        &[],
-        "q",
-        &[0, 8, 32, 63, 128, 200, 255],
-    );
+    for name in ["q", "k", "v"] {
+        check_grad(
+            "CausalAttn(scale=1.0)",
+            make_graph,
+            make_graph,
+            &params,
+            &[],
+            &[],
+            name,
+            &[d, d + 32, d + 255, d + 256, d + 511, seq * d - 1],
+        );
+    }
 }
 
 /// Test RMSNorm → QKV projections → attention → residual → mean (like SmolLM2 layer)
