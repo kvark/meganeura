@@ -244,7 +244,7 @@ fn segment_candidates(
             return Err("region contains an unsupported operator arity".into());
         }
     }
-    let (mut program, externals) = super::segment_program(graph, &segment, config.pack_swiglu);
+    let (mut program, externals) = super::segment_program(graph, &segment);
     let root_name = if roots.len() == 1 {
         format!("$n{}", roots[0])
     } else {
@@ -259,7 +259,7 @@ fn segment_candidates(
         ));
         "$outputs".into()
     };
-    let mut egraph = egglog::EGraph::default();
+    let mut egraph = super::rule_graph(config.pack_swiglu);
     egraph
         .parse_and_run_program(None, &program)
         .map_err(|e| e.to_string())?;

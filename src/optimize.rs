@@ -517,7 +517,10 @@ pub fn dump_egglog_program(graph: &Graph) -> String {
         ids,
         shifts: vec![0],
     };
-    segment_program(graph, &seg, true).0
+    let mut program = String::new();
+    egglog_prelude(&mut program, true);
+    program.push_str(&segment_program(graph, &seg).0);
+    program
 }
 
 // ---------------------------------------------------------------------------
@@ -702,6 +705,22 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
     // a fixpoint; the fourth is margin for future rules.
 }
 
+fn rule_graph(pack_swiglu: bool) -> egglog::EGraph {
+    static RULES: [std::sync::OnceLock<egglog::EGraph>; 2] =
+        [const { std::sync::OnceLock::new() }; 2];
+    RULES[usize::from(pack_swiglu)]
+        .get_or_init(|| {
+            let mut program = String::new();
+            egglog_prelude(&mut program, pack_swiglu);
+            let mut egraph = egglog::EGraph::default();
+            egraph
+                .parse_and_run_program(None, &program)
+                .expect("valid built-in rewrite rules");
+            egraph
+        })
+        .clone()
+}
+
 /// Returns the named egglog constructor for ops that rewrite rules
 /// match on, or `None` for generically-encoded ops.
 fn named_constructor(op: &Op) -> Option<&'static str> {
@@ -769,7 +788,7 @@ fn node_to_egglog_expr(node: &Node) -> String {
 /// opaque `Leaf` terms, segment nodes are encoded in id order. Returns
 /// the program and the external node ids (needed to size their e-classes
 /// for traffic-aware extraction).
-fn segment_program(g: &Graph, seg: &Segment, pack_swiglu: bool) -> (String, Vec<usize>) {
+fn segment_program(g: &Graph, seg: &Segment) -> (String, Vec<usize>) {
     let idset: HashSet<usize> = seg.ids.iter().copied().collect();
     let mut externals: Vec<usize> = Vec::new();
     let mut seen = HashSet::new();
@@ -788,7 +807,6 @@ fn segment_program(g: &Graph, seg: &Segment, pack_swiglu: bool) -> (String, Vec<
     externals.sort_unstable();
 
     let mut prog = String::new();
-    egglog_prelude(&mut prog, pack_swiglu);
     for &e in &externals {
         prog.push_str(&format!("(let $n{} (Leaf {}))\n", e, e));
     }
@@ -920,11 +938,12 @@ fn process_segment(
     config: OptimizeConfig,
 ) {
     let egglog_start = Instant::now();
-    let (program, externals) = segment_program(g, seg, config.pack_swiglu);
+    let (program, externals) = segment_program(g, seg);
     if report.egglog_program.is_empty() {
-        report.egglog_program.clone_from(&program);
+        egglog_prelude(&mut report.egglog_program, config.pack_swiglu);
+        report.egglog_program.push_str(&program);
     }
-    let mut egraph = egglog::EGraph::default();
+    let mut egraph = rule_graph(config.pack_swiglu);
     if let Err(e) = egraph.parse_and_run_program(None, &program) {
         log::warn!(
             "egglog failed on segment of {} nodes: {} — leaving it unoptimized",
