@@ -5063,10 +5063,10 @@ pub struct AutoTuneResult {
 pub fn auto_tune(gpu: &blade_graphics::Context, _head_dim: u32) -> AutoTuneResult {
     let cm = gpu.capabilities().cooperative_matrix;
     let square = |shapes: &[[u32; 3]]| {
-        shapes
-            .iter()
-            .find(|s| s[0] == s[1] && s[1] == s[2])
-            .map_or(0, |s| s[0])
+        [8, 16]
+            .into_iter()
+            .find(|&tile| shapes.contains(&[tile; 3]))
+            .unwrap_or(0)
     };
     AutoTuneResult {
         coop_caps: crate::codegen::CoopCaps {
