@@ -3667,22 +3667,30 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     src.push_str("        }\n");
     src.push_str("        tree_reduce_bkv_grouped(lid.x);\n\n");
 
-    let mut rescale = String::new();
-    let mut accumulate = String::new();
+    // Online softmax + V accumulation for BKV positions
+    let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
+    src.push_str("            let kv_pos = t + i;\n");
+    src.push_str("            if valid && kv_pos >= my_kv_start && kv_pos < my_kv_len {\n");
+    let _ = writeln!(
+        src,
+        "                let score = wg_scores[grp_base + i * {tpq}u] * scale;"
+    );
+    src.push_str("                let new_max = max(max_score, score);\n");
+    src.push_str("                let correction = exp(max_score - new_max);\n");
+    src.push_str("                let weight = exp(score - new_max);\n");
+    src.push_str("                sum_exp = sum_exp * correction + weight;\n");
+    src.push_str("                let v_base = kv_pos * kv_dim + kv_head_off;\n");
+    // Accumulate EPT V elements in registers
     for e in 0..ept {
-        let _ = writeln!(rescale, "out{e} *= correction;");
         let _ = writeln!(
-            accumulate,
-            "out{e} += weight * bias[v_base + d_base + {e}u];"
+            src,
+            "                out{e} = out{e} * correction + weight * bias[v_base + d_base + {e}u];"
         );
     }
-    src.push_str(
-        &include_str!("shaders/flash_softmax_tile.wgsl")
-            .replace("$BKV_U", &format!("{bkv}u"))
-            .replace("$TPQ_U", &format!("{tpq}u"))
-            .replace("$RESCALE_OUTPUT", &rescale)
-            .replace("$ACCUMULATE_OUTPUT", &accumulate),
-    );
+    src.push_str("                max_score = new_max;\n");
+    src.push_str("            }\n");
+    src.push_str("        }\n");
+    src.push_str("        workgroupBarrier();\n");
     src.push_str("    }\n\n");
 
     // --- Tail: remaining KV positions one at a time ---
