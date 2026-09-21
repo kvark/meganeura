@@ -162,7 +162,7 @@ impl egglog::extract::CostModel<u64> for FusionCostModel {
             let read = args
                 .iter()
                 .zip(&func.schema().input)
-                .filter(|(_, sort)| sort.name() == "Op")
+                .filter(|&(_, sort)| sort.name() == "Op")
                 .filter_map(|(value, _)| sizes.get(value))
                 .fold(0u64, |total, bytes| total.saturating_add(*bytes));
             return read.saturating_add(out_bytes);

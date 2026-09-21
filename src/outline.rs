@@ -84,13 +84,16 @@ fn node_signature(graph: &Graph, id: usize) -> u64 {
 /// names. Constant payloads are compared bitwise, without formatting potentially
 /// large tensors. The Debug-string comparison covers other operator attributes.
 fn ops_equivalent(a: &Op, b: &Op) -> bool {
-    match (a, b) {
-        (&Op::Parameter { .. }, &Op::Parameter { .. }) => true,
-        (&Op::Input { .. }, &Op::Input { .. }) => true,
-        (&Op::Constant { data: ref a }, &Op::Constant { data: ref b }) => {
-            bytemuck::cast_slice::<f32, u8>(a) == bytemuck::cast_slice::<f32, u8>(b)
-        }
-        (ref a, ref b) => format!("{:?}", a) == format!("{:?}", b),
+    match *a {
+        Op::Parameter { .. } => matches!(*b, Op::Parameter { .. }),
+        Op::Input { .. } => matches!(*b, Op::Input { .. }),
+        Op::Constant { ref data } => match *b {
+            Op::Constant { data: ref other } => {
+                bytemuck::cast_slice::<f32, u8>(data) == bytemuck::cast_slice::<f32, u8>(other)
+            }
+            _ => false,
+        },
+        _ => format!("{:?}", a) == format!("{:?}", b),
     }
 }
 
