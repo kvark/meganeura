@@ -212,6 +212,7 @@ pub fn build_measured(
         seeds,
         caps,
         gpu.capabilities().max_compute_shared_memory_size,
+        options.max_plan_bytes,
     );
     measure::select(
         programs,
@@ -242,6 +243,7 @@ fn implementations(
     seeds: Vec<Seed>,
     caps: crate::codegen::CoopCaps,
     shared_memory_bytes: u32,
+    max_partial_bytes: usize,
 ) -> impl Iterator<Item = measure::Program> {
     let cached_attention = seeds.iter().any(|p| {
         p.graph
@@ -290,13 +292,37 @@ fn implementations(
     let chunks = [1, 2, 4, 8, 16, 32, 64];
     // Explore kernel layouts across logical forms before multiplying them by
     // submission choices. Lower only the next candidate.
-    let mut choices = chunks.into_iter().flat_map(move |chunks| {
-        attention
-            .clone()
-            .into_iter()
-            .map(move |attention| (attention, chunks))
-    });
-    let mut current = ((0, None), 1);
+    let matrices = [
+        (0, 32),
+        (8, 64),
+        (4, 64),
+        (2, 64),
+        (8, 32),
+        (4, 32),
+        (2, 32),
+    ];
+    let single_axis: Vec<_> = matrices
+        .into_iter()
+        .map(|matrix| ((0, None), matrix, 1))
+        .chain(
+            attention
+                .iter()
+                .copied()
+                .skip(1)
+                .map(|attention| (attention, (0, 32), 1)),
+        )
+        .collect();
+    let mut choices = single_axis
+        .into_iter()
+        .chain(chunks.into_iter().flat_map(move |chunks| {
+            attention.clone().into_iter().flat_map(move |attention| {
+                matrices.into_iter().filter_map(move |matrix| {
+                    (chunks != 1 || (attention != (0, None) && matrix.0 != 0))
+                        .then_some((attention, matrix, chunks))
+                })
+            })
+        }));
+    let mut current = ((0, None), (0, 32), 1);
     let mut seed_index = seeds.len();
     std::iter::from_fn(move || {
         loop {
@@ -306,8 +332,8 @@ fn implementations(
             }
             let seed = seeds.get(seed_index)?;
             seed_index += 1;
-            let ((splits, flash), chunks) = current;
-            let plan = if splits == 0 && flash.is_none() {
+            let ((splits, flash), (matrix_splits, tile_size), chunks) = current;
+            let mut plan = if splits == 0 && flash.is_none() {
                 seed.plan.clone()
             } else {
                 let mut options = seed.options.clone();
@@ -331,9 +357,29 @@ fn implementations(
                 }
                 plan
             };
+            if matrix_splits != 0 {
+                let shape = crate::codegen::ScalarMatmulShape {
+                    tile_size,
+                    k_stage: seed.options.knobs.matmul_k_stage,
+                    interleave_columns: seed.options.knobs.matmul_interleave_columns,
+                };
+                let original_buffers = plan.buffers.len();
+                let mut remaining = max_partial_bytes;
+                for index in (0..plan.dispatches.len()).rev() {
+                    if plan
+                        .split_matmul(index, shape, matrix_splits, remaining)
+                        .is_ok()
+                    {
+                        remaining -= plan.buffers.last().unwrap();
+                    }
+                }
+                if plan.buffers.len() == original_buffers {
+                    continue;
+                }
+            }
             return Some(measure::Program {
                 description: format!(
-                    "{}, attention_splits={splits}, flash={flash:?}, submission_chunks={chunks}",
+                    "{}, attention_splits={splits}, flash={flash:?}, matrix_splits={matrix_splits}, matrix_tile={tile_size}, submission_chunks={chunks}",
                     seed.description
                 ),
                 plan,

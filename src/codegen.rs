@@ -391,7 +391,12 @@ pub(crate) fn generate_split_matmul(
     assert!(splits >= 2);
     assert!(matches!(
         group,
-        ShaderGroup::MatMul | ShaderGroup::MatMulAT | ShaderGroup::MatMulBT
+        ShaderGroup::MatMul
+            | ShaderGroup::MatMulAT
+            | ShaderGroup::MatMulBT
+            | ShaderGroup::MatMulAdd
+            | ShaderGroup::MatMulATAdd
+            | ShaderGroup::MatMulBTAdd
     ));
     generate_partitioned_matmul(
         group,
@@ -454,6 +459,11 @@ fn generate_partitioned_matmul(
             " + src[idx]",
         ),
         _ => panic!("epilogue fusion not supported for {:?}", group),
+    };
+    let fused_expr = if splits > 1 && !fused_expr.is_empty() {
+        " + select(0.0, src[idx - split_id * params.m * params.n], split_id == 0u)"
+    } else {
+        fused_expr
     };
     let (a_row, a_col, b_row, b_col) = epilogue_stage_maps(group, tile);
     matmul_vars_tiled(

@@ -2,7 +2,7 @@ use super::{BufferRef, Dispatch, ExecutionPlan, ShaderEntry};
 use crate::tune::{MatmulTile, TuneClass, TuneError};
 
 impl ExecutionPlan {
-    /// Lower one plain matrix product to partials + SumRows before allocation.
+    /// Lower one matrix product (with optional addition) to partials + SumRows.
     /// This is a candidate, not a selection: qualify and time the entire sequence.
     pub(crate) fn split_matmul(
         &mut self,
@@ -23,10 +23,15 @@ impl ExecutionPlan {
                 c.weight_format == super::WeightFormat::F32
                     && matches!(
                         c.shader,
-                        ShaderEntry::MatMul | ShaderEntry::MatMulAT | ShaderEntry::MatMulBT
+                        ShaderEntry::MatMul
+                            | ShaderEntry::MatMulAT
+                            | ShaderEntry::MatMulBT
+                            | ShaderEntry::FusedMatMulAdd
+                            | ShaderEntry::FusedMatMulATAdd
+                            | ShaderEntry::FusedMatMulBTAdd
                     )
             })
-            .ok_or(TuneError("split-K requires a plain scalar matrix product"))?;
+            .ok_or(TuneError("split-K requires a scalar matrix product"))?;
         let mut bindings = dispatch.input_buffers.clone();
         bindings.push(dispatch.output_buffer);
         let mut unique = bindings.clone();
