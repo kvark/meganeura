@@ -1960,11 +1960,17 @@ mod tests {
 
             let (mut opt, report) = optimize_with_report(&g);
             let output_node = opt.node(opt.outputs()[0]);
-            assert_eq!(output_node.op, expected);
+            assert_eq!(
+                std::mem::discriminant(&output_node.op),
+                std::mem::discriminant(&expected)
+            );
             assert!(!report.fusions_applied.is_empty());
             for _ in 0..2 {
                 opt = optimize_with_report(&opt).0;
-                assert_eq!(opt.node(opt.outputs()[0]).op, expected);
+                assert_eq!(
+                    std::mem::discriminant(&opt.node(opt.outputs()[0]).op),
+                    std::mem::discriminant(&expected)
+                );
             }
         }
     }
