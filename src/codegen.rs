@@ -3503,7 +3503,7 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
 
     // Shared memory:
     //   shared_k: K tile [BKV, hd] loaded once, reused by BQ groups
-    //   wg_scores: [BQ][BKV][TPQ] partial dot products for grouped reduction
+    //   wg_scores: [BKV][BQ][TPQ] keeps neighboring threads contiguous
     //   wg_dot: [BQ][TPQ] tail reduction
     let _ = writeln!(src, "var<workgroup> shared_k: array<f32, {}>;\n", bkv * hd);
     let _ = writeln!(
@@ -3517,7 +3517,7 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     src.push_str("fn tree_reduce_bkv_grouped(tid: u32) {\n");
     let _ = writeln!(src, "    let qi = tid / {tpq}u;");
     let _ = writeln!(src, "    let local = tid % {tpq}u;");
-    let _ = writeln!(src, "    let base = qi * {}u;", bkv * tpq);
+    let _ = writeln!(src, "    let base = qi * {tpq}u;");
     let mut stride = tpq / 2;
     while stride > 0 {
         src.push_str("    workgroupBarrier();\n");
@@ -3525,7 +3525,7 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
         let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
         let _ = writeln!(
             src,
-            "            wg_scores[base + i * {tpq}u + local] += wg_scores[base + i * {tpq}u + local + {stride}u];"
+            "            wg_scores[i * {wg_size}u + base + local] += wg_scores[i * {wg_size}u + base + local + {stride}u];"
         );
         src.push_str("        }\n    }\n");
         stride /= 2;
@@ -3650,7 +3650,7 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     src.push_str("        workgroupBarrier();\n\n");
 
     // Each thread computes partial dot product (EPT elements) for BKV positions
-    let _ = writeln!(src, "        let grp_base = qi * {}u;", bkv * tpq);
+    let _ = writeln!(src, "        let grp_base = qi * {tpq}u;");
     let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
     // Compute partial dot product across EPT elements
     src.push_str("            var pdot = 0.0;\n");
@@ -3662,7 +3662,7 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     }
     let _ = writeln!(
         src,
-        "            wg_scores[grp_base + i * {tpq}u + lane] = pdot;"
+        "            wg_scores[i * {wg_size}u + grp_base + lane] = pdot;"
     );
     src.push_str("        }\n");
     src.push_str("        tree_reduce_bkv_grouped(lid.x);\n\n");
@@ -3673,7 +3673,7 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     src.push_str("            if valid && kv_pos >= my_kv_start && kv_pos < my_kv_len {\n");
     let _ = writeln!(
         src,
-        "                let score = wg_scores[grp_base + i * {tpq}u] * scale;"
+        "                let score = wg_scores[i * {wg_size}u + grp_base] * scale;"
     );
     src.push_str("                let new_max = max(max_score, score);\n");
     src.push_str("                let correction = exp(max_score - new_max);\n");
