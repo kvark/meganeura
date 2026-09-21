@@ -104,9 +104,9 @@ impl WeightFormat {
 pub struct TuningKnobs {
     /// Elements-per-thread cap for flash-attention forward codegen.
     pub flash_ept_cap: u32,
-    /// Interleave head dimensions across the lanes processing one query.
+    /// Forward attention workgroup, shared tile and lane layout.
     #[serde(default)]
-    pub flash_interleave: bool,
+    pub flash: crate::codegen::FlashAttentionShape,
     /// EPT cap for the flash dQ backward kernel.
     pub flash_grad_q_ept_cap: u32,
     /// EPT cap for the fused flash dK/dV backward kernel.
@@ -130,7 +130,7 @@ impl Default for TuningKnobs {
         let fwd = if apple { 16 } else { 32 };
         Self {
             flash_ept_cap: fwd,
-            flash_interleave: false,
+            flash: crate::codegen::FlashAttentionShape::default(),
             flash_grad_q_ept_cap: fwd,
             flash_grad_kv_ept_cap: if apple { 8 } else { 32 },
             matmul_k_stage: 32,
@@ -2843,7 +2843,7 @@ impl<'a> Compiler<'a> {
         // EPT (elements per thread) must match forward codegen.
         let ept = head_dim.min(self.options.knobs.flash_ept_cap);
         let tpq = head_dim / ept; // threads per query
-        let bq = (128 / tpq).max(1);
+        let bq = (self.options.knobs.flash.threads / tpq).max(1);
         if bq >= 2 && q_seq >= bq {
             (
                 ShaderEntry::FlashAttention,
@@ -7181,7 +7181,7 @@ mod tests {
         // Dispatch and the corresponding codegen path must agree on
         // EPT/TPQ/BQ. Forward and backward may use different caps.
         let graph = Graph::new();
-        let compiler = Compiler::new_with_options(
+        let mut compiler = Compiler::new_with_options(
             &graph,
             CompileOptions::default(),
             crate::codegen::CoopCaps::default(),
@@ -7191,7 +7191,6 @@ mod tests {
             let hd: u32 = 1 << hd_log2;
             let fwd_ept = hd.min(TuningKnobs::default().flash_ept_cap);
             let fwd_tpq = hd / fwd_ept;
-            let fwd_bq: u32 = (256 / fwd_tpq).max(1);
             let grad_q_ept = hd.min(TuningKnobs::default().flash_grad_q_ept_cap);
             let grad_q_tpq = hd / grad_q_ept;
             let grad_q_bq: u32 = (256 / grad_q_tpq).max(1);
@@ -7199,15 +7198,19 @@ mod tests {
             let grad_kv_tpq = hd / grad_kv_ept;
             let grad_kv_bq: u32 = (256 / grad_kv_tpq).max(1);
 
-            let (fwd_entry, fwd_wg) = compiler.attention_dispatch(256, hd, 1);
+            for threads in [128, 256] {
+                compiler.options.knobs.flash.threads = threads;
+                let fwd_bq = (threads / fwd_tpq).max(1);
+                let (fwd_entry, fwd_wg) = compiler.attention_dispatch(256, hd, 1);
+                if fwd_bq >= 2 {
+                    assert_eq!(fwd_entry, ShaderEntry::FlashAttention);
+                    assert_eq!(fwd_wg[0], 256u32.div_ceil(fwd_bq));
+                }
+            }
             let (grad_q_entry, grad_q_wg) =
                 Compiler::attention_dispatch_bwd(256, hd, 1, grad_q_ept);
             let (grad_kv_entry, grad_kv_wg) =
                 Compiler::attention_dispatch_bwd(256, hd, 1, grad_kv_ept);
-            if fwd_bq >= 2 {
-                assert_eq!(fwd_entry, ShaderEntry::FlashAttention);
-                assert_eq!(fwd_wg[0], 256u32.div_ceil(fwd_bq));
-            }
             if grad_q_bq >= 2 {
                 assert_eq!(grad_q_entry, ShaderEntry::FlashAttention);
                 assert_eq!(grad_q_wg[0], 256u32.div_ceil(grad_q_bq));

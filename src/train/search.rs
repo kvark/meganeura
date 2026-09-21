@@ -208,7 +208,11 @@ pub fn build_measured(
         }
     }
     let preparation_time = start.elapsed();
-    let programs = implementations(seeds, caps, options.max_plan_bytes);
+    let programs = implementations(
+        seeds,
+        caps,
+        gpu.capabilities().max_compute_shared_memory_size,
+    );
     measure::select(
         programs,
         gpu,
@@ -237,7 +241,7 @@ struct Seed {
 fn implementations(
     seeds: Vec<Seed>,
     caps: crate::codegen::CoopCaps,
-    max_partial_bytes: usize,
+    shared_memory_bytes: u32,
 ) -> impl Iterator<Item = measure::Program> {
     let cached_attention = seeds.iter().any(|p| {
         p.graph
@@ -245,52 +249,54 @@ fn implementations(
             .iter()
             .any(|n| matches!(n.op, crate::graph::Op::CachedBlockAttention { .. }))
     });
-    let mut attention = vec![(0, 0, false)];
-    if seeds.iter().any(|seed| {
-        seed.plan
-            .dispatches
-            .iter()
-            .any(|d| d.shader == compile::ShaderEntry::FlashAttention)
-    }) {
-        attention.extend(
-            [16, 8, 32]
-                .into_iter()
-                .flat_map(|ept| [false, true].map(|interleave| (0, ept, interleave))),
-        );
+    let heads: Vec<_> = seeds
+        .iter()
+        .flat_map(|seed| &seed.plan.dispatches)
+        .filter(|d| {
+            matches!(
+                d.shader,
+                compile::ShaderEntry::FlashAttention
+                    | compile::ShaderEntry::MultiHeadAttn
+                    | compile::ShaderEntry::FlashAttentionCoop
+            )
+        })
+        .map(|d| d.params[3])
+        .collect();
+    let mut attention = vec![(0, None)];
+    if !heads.is_empty() {
+        for ept in [32, 16, 8] {
+            for threads in [256, 128] {
+                for keys in [8, 16] {
+                    for interleave in [false, true] {
+                        let shape = crate::codegen::FlashAttentionShape {
+                            threads,
+                            keys,
+                            interleave,
+                        };
+                        if heads
+                            .iter()
+                            .all(|&hd| shape.shared_bytes(hd) <= u64::from(shared_memory_bytes))
+                        {
+                            attention.push((0, Some((ept, shape))));
+                        }
+                    }
+                }
+            }
+        }
     }
     if cached_attention {
-        attention.extend([1, 2, 4, 8, 16].map(|splits| (splits, 0, false)));
+        attention.extend([1, 2, 4, 8, 16].map(|splits| (splits, None)));
     }
-    // Preserve unsplit products, and test reduction parallelism as a complete
-    // two-dispatch implementation. No architecture or model chooses the winner.
-    let matrices = [
-        (0, 32),
-        (4, 32),
-        (2, 32),
-        (8, 32),
-        (4, 64),
-        (2, 64),
-        (8, 64),
-    ];
     let chunks = [1, 2, 4, 8, 16, 32, 64];
-    // Interleave settings across logical forms, starting near ordinary lowering.
-    // Lower only the next candidate; do not allocate a Cartesian product of plans.
-    let mut choices =
-        (0..attention.len() + matrices.len() + chunks.len() - 2).flat_map(move |rank| {
-            attention
-                .clone()
-                .into_iter()
-                .enumerate()
-                .flat_map(move |(a, attention)| {
-                    (0..matrices.len()).filter_map(move |m| {
-                        let c = rank.checked_sub(a + m)?;
-                        chunks
-                            .get(c)
-                            .map(|&chunks| (attention, matrices[m], chunks))
-                    })
-                })
-        });
-    let mut current = ((0, 0, false), (0, 32), 1);
+    // Explore kernel layouts across logical forms before multiplying them by
+    // submission choices. Lower only the next candidate.
+    let mut choices = chunks.into_iter().flat_map(move |chunks| {
+        attention
+            .clone()
+            .into_iter()
+            .map(move |attention| (attention, chunks))
+    });
+    let mut current = ((0, None), 1);
     let mut seed_index = seeds.len();
     std::iter::from_fn(move || {
         loop {
@@ -300,48 +306,34 @@ fn implementations(
             }
             let seed = seeds.get(seed_index)?;
             seed_index += 1;
-            let ((splits, flash_ept, flash_interleave), (matrix_splits, tile_size), chunks) =
-                current;
-            let mut plan = if splits == 0 && flash_ept == 0 {
+            let ((splits, flash), chunks) = current;
+            let plan = if splits == 0 && flash.is_none() {
                 seed.plan.clone()
             } else {
                 let mut options = seed.options.clone();
                 if splits != 0 {
                     options.cached_attention_splits = Some(splits);
                 }
-                if flash_ept != 0 {
-                    options.knobs.flash_ept_cap = flash_ept;
-                    options.knobs.flash_interleave = flash_interleave;
+                if let Some((ept, shape)) = flash {
+                    options.knobs.flash_ept_cap = ept;
+                    options.knobs.flash = shape;
+                    options.flash_forward_coop = false;
                 }
                 let plan = compile::compile_with_caps(&seed.graph, &options, caps);
-                if plan == seed.plan {
+                if plan == seed.plan
+                    || (flash.is_some()
+                        && !plan
+                            .dispatches
+                            .iter()
+                            .any(|d| d.shader == compile::ShaderEntry::FlashAttention))
+                {
                     continue;
                 }
                 plan
             };
-            if matrix_splits != 0 {
-                let shape = crate::codegen::ScalarMatmulShape {
-                    tile_size,
-                    k_stage: seed.options.knobs.matmul_k_stage,
-                    interleave_columns: seed.options.knobs.matmul_interleave_columns,
-                };
-                let original_buffers = plan.buffers.len();
-                let mut remaining = max_partial_bytes;
-                for index in (0..plan.dispatches.len()).rev() {
-                    if plan
-                        .split_matmul(index, shape, matrix_splits, remaining)
-                        .is_ok()
-                    {
-                        remaining -= plan.buffers.last().unwrap();
-                    }
-                }
-                if plan.buffers.len() == original_buffers {
-                    continue;
-                }
-            }
             return Some(measure::Program {
                 description: format!(
-                    "{}, attention_splits={splits}, flash_ept={flash_ept}, flash_interleave={flash_interleave}, matrix_splits={matrix_splits}, matrix_tile={tile_size}, submission_chunks={chunks}",
+                    "{}, attention_splits={splits}, flash={flash:?}, submission_chunks={chunks}",
                     seed.description
                 ),
                 plan,

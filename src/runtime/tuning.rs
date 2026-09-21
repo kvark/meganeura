@@ -14,9 +14,7 @@ use std::{
 /// Qualified private-scratch comparisons within one graph search, on one device
 /// and under one numerical/timing policy. Never persisted or shared globally.
 #[derive(Default)]
-pub(crate) struct KernelMemo(
-    HashMap<(u32, bool, TuneClass, Vec<MatmulTile>), KernelProgress>,
-);
+pub(crate) struct KernelMemo(HashMap<(u32, bool, TuneClass, Vec<MatmulTile>), KernelProgress>);
 
 #[derive(Clone, Copy)]
 struct KernelProgress {
@@ -1664,12 +1662,17 @@ mod tests {
         // Attention layout does not change any matrix kernel or scratch input.
         let mut other = plan.clone();
         other.knobs.flash_ept_cap = 16;
-        other.knobs.flash_interleave = true;
+        other.knobs.flash.interleave = true;
         let complete = Session::with_context_opts(
             other,
             gpu,
-            crate::SessionOptions { coop: crate::CoopPolicy::Disabled, ..Default::default() },
-        ).tune_with_memo(options, Some(&mut memo)).unwrap();
+            crate::SessionOptions {
+                coop: crate::CoopPolicy::Disabled,
+                ..Default::default()
+            },
+        )
+        .tune_with_memo(options, Some(&mut memo))
+        .unwrap();
         assert_eq!(complete.reused_classes.len(), 1);
         assert!(complete.outcomes.is_empty());
     }

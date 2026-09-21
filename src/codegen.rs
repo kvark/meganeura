@@ -9,6 +9,35 @@
 
 use naga::Module;
 
+/// Forward attention staging and lane layout, independent of the EPT cap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct FlashAttentionShape {
+    pub threads: u32,
+    pub keys: u32,
+    pub interleave: bool,
+}
+
+impl Default for FlashAttentionShape {
+    fn default() -> Self {
+        Self {
+            threads: 256,
+            keys: 8,
+            interleave: false,
+        }
+    }
+}
+
+impl FlashAttentionShape {
+    pub(crate) fn shared_bytes(self, head_dim: u32) -> u64 {
+        let (keys, threads, head_dim) = (
+            u64::from(self.keys),
+            u64::from(self.threads),
+            u64::from(head_dim),
+        );
+        4 * (2 * keys * head_dim + keys * threads + threads)
+    }
+}
+
 /// How a K-split GEMV combines the per-lane partial sums.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum GemvReduction {
@@ -632,7 +661,7 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
             generate_flash_attention_module(
                 64,
                 crate::compile::TuningKnobs::default().flash_ept_cap,
-                false,
+                FlashAttentionShape::default(),
             )
         }
         ShaderGroup::FlashAttentionCoop => generate_flash_attention_coop_module(64),
@@ -726,7 +755,9 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         ShaderGroup::CachedAttention => {
             ShaderModule::new(include_str!("shaders/cached_attention.wgsl"))
         }
-        ShaderGroup::CachedQueryAttention => generate_flash_attention(64, 8, false, true),
+        ShaderGroup::CachedQueryAttention => {
+            generate_flash_attention(64, 8, FlashAttentionShape::default(), true)
+        }
         ShaderGroup::CachedBlockAttention => generate_module_block_attention(),
         ShaderGroup::ChunkedRelativeAttention => {
             ShaderModule::new(include_str!("shaders/chunked_relative_attention.wgsl"))
@@ -3458,18 +3489,19 @@ pub const CACHED_ATTENTION_QUERIES: u32 = 32; // 256 threads / (64 dimensions / 
 pub fn generate_flash_attention_module(
     head_dim: u32,
     ept_cap: u32,
-    interleave: bool,
+    shape: FlashAttentionShape,
 ) -> ShaderModule {
-    generate_flash_attention(head_dim, ept_cap, interleave, false)
+    generate_flash_attention(head_dim, ept_cap, shape, false)
 }
 
 fn generate_flash_attention(
     head_dim: u32,
     ept_cap: u32,
-    interleave: bool,
+    shape: FlashAttentionShape,
     cached: bool,
 ) -> ShaderModule {
     use std::fmt::Write;
+    assert!(matches!(shape.threads, 128 | 256) && matches!(shape.keys, 8 | 16));
     assert!(
         head_dim.is_power_of_two() && head_dim >= 2,
         "attention head_dim must be a power of 2 ≥ 2, got {head_dim}"
@@ -3479,8 +3511,8 @@ fn generate_flash_attention(
     // which honors MEGANEURA_FLASH_EPT_CAP overrides.
     let ept: u32 = hd.min(ept_cap);
     let tpq = hd / ept; // threads per query
-    let d_stride = if interleave { tpq } else { 1 };
-    let bq: u32 = (if cached { 256 } else { 128 } / tpq).max(1);
+    let d_stride = if shape.interleave { tpq } else { 1 };
+    let bq: u32 = (shape.threads / tpq).max(1);
     if cached {
         assert_eq!(bq, CACHED_ATTENTION_QUERIES);
     }
@@ -3489,7 +3521,7 @@ fn generate_flash_attention(
         return generate_attention_module(head_dim);
     }
     let wg_size = bq * tpq;
-    let bkv: u32 = if cached { 8 } else { 16 };
+    let bkv: u32 = shape.keys;
     let mut src = String::new();
 
     // Params struct (matches AttentionParams: 8 u32 = 32 bytes)
@@ -3570,7 +3602,7 @@ fn generate_flash_attention(
     let _ = writeln!(
         src,
         "    let d_base = lane * {}u;",
-        if interleave { 1 } else { ept }
+        if shape.interleave { 1 } else { ept }
     );
     let _ = writeln!(src, "    let pos = wgid.x * {bq}u + qi;"); // global query position
     src.push_str("    let head = wgid.y;\n");
@@ -3724,7 +3756,10 @@ fn generate_flash_attention(
     // --- Tail: remaining KV positions one at a time ---
     src.push_str("    for (; t < max_kv_len; t++) {\n");
     // Load single K position into shared_k
-    let _ = writeln!(src, "        for (var d = lid.x; d < {hd}u; d += {wg_size}u) {{");
+    let _ = writeln!(
+        src,
+        "        for (var d = lid.x; d < {hd}u; d += {wg_size}u) {{"
+    );
     src.push_str("            shared_k[d] = src_b[t * kv_dim + kv_head_off + d];\n");
     src.push_str("        }\n");
     src.push_str("        workgroupBarrier();\n\n");
@@ -6464,13 +6499,23 @@ mod tests {
         for hd in [32, 64, 128, 256] {
             for ept in [8, 16, 32] {
                 for interleave in [false, true] {
-                    let sm = generate_flash_attention_module(hd, ept, interleave);
-                    naga::valid::Validator::new(
-                        naga::valid::ValidationFlags::all(),
-                        naga::valid::Capabilities::empty(),
-                    )
-                    .validate(&sm.module)
-                    .unwrap();
+                    for (threads, keys) in [(256, 8), (128, 16)] {
+                        let sm = generate_flash_attention_module(
+                            hd,
+                            ept,
+                            FlashAttentionShape {
+                                threads,
+                                keys,
+                                interleave,
+                            },
+                        );
+                        naga::valid::Validator::new(
+                            naga::valid::ValidationFlags::all(),
+                            naga::valid::Capabilities::empty(),
+                        )
+                        .validate(&sm.module)
+                        .unwrap();
+                    }
                 }
             }
         }

@@ -68,13 +68,11 @@ struct Excluding {
 }
 
 impl CostModel<Cost> for Excluding {
-    fn base_value_cost(
-        &self,
-        _: &egglog::EGraph,
-        _: &egglog::ArcSort,
-        _: Value,
-    ) -> Cost {
-        Cost { forbidden: 0, estimate: 0 }
+    fn base_value_cost(&self, _: &egglog::EGraph, _: &egglog::ArcSort, _: Value) -> Cost {
+        Cost {
+            forbidden: 0,
+            estimate: 0,
+        }
     }
 
     fn fold(&self, _: &str, children: &[Cost], head: Cost) -> Cost {
