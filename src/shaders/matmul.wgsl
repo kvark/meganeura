@@ -84,7 +84,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let row = tile_row + ty * $TM_U + i;
             let col = tile_col + $OUTPUT_COLUMN;
             if row < params.m && col < params.n {
-                    let idx = ($C_INDEX) + split_id * params.m * params.n;
+                let idx = ($C_INDEX) + split_id * params.m * params.n;
                 $STORE_BODY
             }
         }

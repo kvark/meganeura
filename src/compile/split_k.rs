@@ -57,7 +57,7 @@ impl ExecutionPlan {
             .m
             .checked_mul(class.n)
             .ok_or(TuneError("matrix size overflow"))?;
-        if columns.div_ceil(32) > 65535 {
+        if columns.div_ceil(256) > 65535 {
             return Err(TuneError("split-K reduction exceeds dispatch limits"));
         }
         let bytes = columns
