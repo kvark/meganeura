@@ -3480,7 +3480,7 @@ fn generate_flash_attention(
     let ept: u32 = hd.min(ept_cap);
     let tpq = hd / ept; // threads per query
     let d_stride = if interleave { tpq } else { 1 };
-    let bq: u32 = (256 / tpq).max(1);
+    let bq: u32 = (if cached { 256 } else { 128 } / tpq).max(1);
     if cached {
         assert_eq!(bq, CACHED_ATTENTION_QUERIES);
     }

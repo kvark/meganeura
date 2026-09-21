@@ -2843,7 +2843,7 @@ impl<'a> Compiler<'a> {
         // EPT (elements per thread) must match forward codegen.
         let ept = head_dim.min(self.options.knobs.flash_ept_cap);
         let tpq = head_dim / ept; // threads per query
-        let bq = (256 / tpq).max(1);
+        let bq = (128 / tpq).max(1);
         if bq >= 2 && q_seq >= bq {
             (
                 ShaderEntry::FlashAttention,
