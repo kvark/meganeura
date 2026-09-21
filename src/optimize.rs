@@ -167,9 +167,7 @@ impl egglog::extract::CostModel<u64> for FusionCostModel {
                 .fold(0u64, |total, bytes| total.saturating_add(*bytes));
             return read.saturating_add(out_bytes);
         }
-        // Unknown output e-class (a rewrite-created tensor that no graph
-        // node binds, e.g. the packed matmul inside SwiGLUPacked): fall
-        // back to constants that keep fused ops preferred.
+        // Unbound outputs use a structural fallback, with fused ops preferred.
         match name {
             "FusedMatMulAdd" | "FusedMatMulATAdd" | "FusedMatMulBTAdd" | "SwiGLUPacked"
             | "GeGLUPacked" | "SwiGLUPackedBT" | "GeGLUPackedBT" => 9,
@@ -819,9 +817,8 @@ fn segment_program(g: &Graph, seg: &Segment) -> (String, Vec<usize>) {
 /// Map every node binding (`$n{id}`) to its e-class value and record the
 /// tensor's size in bytes — the lookup table for traffic-aware
 /// extraction. Nodes sharing an e-class denote the same tensor, so the
-/// insert is idempotent; rewrite-created terms (e.g. FusedMatMulAdd)
-/// join the e-class of the expression they replaced and need no entry
-/// of their own.
+/// insert is idempotent. Unfusing an existing matrix addition also creates a
+/// new intermediate of the same output shape; it must not get a token cost.
 fn eclass_sizes(
     graph: &Graph,
     egraph: &egglog::EGraph,
@@ -835,6 +832,25 @@ fn eclass_sizes(
         }
         let var = format!("$n{}", node.id);
         if let Some(value) = egraph.lookup_function(&var, &[]) {
+            sizes.insert(value, node.ty.size_bytes() as u64);
+        }
+        let product = match node.op {
+            Op::FusedMatMulAdd => "MatMul",
+            Op::FusedMatMulATAdd => "MatMulAT",
+            Op::FusedMatMulBTAdd => "MatMulBT",
+            _ => continue,
+        };
+        let inputs = node.inputs[..2]
+            .iter()
+            .map(|id| {
+                let name = format!("$n{id}");
+                egraph.get_function(&name)?;
+                egraph.lookup_function(&name, &[])
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(inputs) = inputs
+            && let Some(value) = egraph.lookup_function(product, &inputs)
+        {
             sizes.insert(value, node.ty.size_bytes() as u64);
         }
     }
@@ -1929,22 +1945,28 @@ mod tests {
     /// E-graph discovers MatMul+Add → FusedMatMulAdd.
     #[test]
     fn test_egglog_discovers_matmul_add_fusion() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 8]);
-        let w = g.parameter("w", &[8, 4]);
-        let b = g.input("bias", &[4, 4]);
-        let mm = g.matmul(x, w);
-        let out = g.add(mm, b);
-        g.set_outputs(vec![out]);
+        for orientation in 0..3 {
+            let mut g = Graph::new();
+            let x = g.input("x", &if orientation == 1 { [8, 4] } else { [4, 8] });
+            let w = g.parameter("w", &if orientation == 2 { [4, 8] } else { [8, 4] });
+            let b = g.input("bias", &[4, 4]);
+            let (mm, expected) = match orientation {
+                0 => (g.matmul(x, w), Op::FusedMatMulAdd),
+                1 => (g.matmul_at(x, w), Op::FusedMatMulATAdd),
+                _ => (g.matmul_bt(x, w), Op::FusedMatMulBTAdd),
+            };
+            let out = g.add(mm, b);
+            g.set_outputs(vec![out]);
 
-        let (opt, report) = optimize_with_report(&g);
-        let output_node = opt.node(opt.outputs()[0]);
-        assert!(
-            matches!(output_node.op, Op::FusedMatMulAdd),
-            "expected FusedMatMulAdd, got {:?}",
-            output_node.op
-        );
-        assert!(!report.fusions_applied.is_empty());
+            let (mut opt, report) = optimize_with_report(&g);
+            let output_node = opt.node(opt.outputs()[0]);
+            assert_eq!(output_node.op, expected);
+            assert!(!report.fusions_applied.is_empty());
+            for _ in 0..2 {
+                opt = optimize_with_report(&opt).0;
+                assert_eq!(opt.node(opt.outputs()[0]).op, expected);
+            }
+        }
     }
 
     #[test]
