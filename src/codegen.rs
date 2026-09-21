@@ -3535,11 +3535,6 @@ fn generate_flash_attention(
     let ept: u32 = hd.min(ept_cap);
     let tpq = hd / ept; // threads per query
     let d_stride = if shape.interleave { tpq } else { 1 };
-    let shared_dimension = if shape.interleave {
-        "d".to_owned()
-    } else {
-        format!("(d % {ept}u) * {tpq}u + d / {ept}u")
-    };
     let bq: u32 = (shape.threads / tpq).max(1);
     if cached {
         assert_eq!(bq, CACHED_ATTENTION_QUERIES);
@@ -3710,20 +3705,29 @@ fn generate_flash_attention(
     let loads_per_thread = k_tile_size.div_ceil(wg_size);
     for l in 0..loads_per_thread {
         let offset = l * wg_size;
-        let _ = writeln!(src, "        if lid.x + {offset}u < {k_tile_size}u {{");
-        let _ = writeln!(src, "            let ki = (lid.x + {offset}u) / {hd}u;");
-        let _ = writeln!(src, "            let d = (lid.x + {offset}u) % {hd}u;");
-        let _ = writeln!(
-            src,
-            "            let shared_index = ki * {hd}u + {shared_dimension};"
-        );
-        src.push_str(
-            "            shared_k[shared_index] = src_b[(t + ki) * kv_dim + kv_head_off + d];\n",
-        );
-        src.push_str(
-            "            shared_v[shared_index] = bias[(t + ki) * kv_dim + kv_head_off + d];\n",
-        );
-        src.push_str("        }\n");
+        if offset == 0 {
+            let _ = writeln!(src, "        if lid.x < {k_tile_size}u {{");
+            let _ = writeln!(src, "            let ki = lid.x / {hd}u;");
+            src.push_str(
+                "            shared_k[lid.x] = src_b[(t + ki) * kv_dim + kv_head_off + (lid.x % head_dim)];\n",
+            );
+            src.push_str(
+                "            shared_v[lid.x] = bias[(t + ki) * kv_dim + kv_head_off + (lid.x % head_dim)];\n",
+            );
+            src.push_str("        }\n");
+        } else {
+            let _ = writeln!(src, "        if lid.x + {offset}u < {k_tile_size}u {{");
+            let _ = writeln!(src, "            let ki2 = (lid.x + {offset}u) / {hd}u;");
+            let _ = writeln!(
+                src,
+                "            shared_k[lid.x + {offset}u] = src_b[(t + ki2) * kv_dim + kv_head_off + ((lid.x + {offset}u) % head_dim)];"
+            );
+            let _ = writeln!(
+                src,
+                "            shared_v[lid.x + {offset}u] = bias[(t + ki2) * kv_dim + kv_head_off + ((lid.x + {offset}u) % head_dim)];"
+            );
+            src.push_str("        }\n");
+        }
     }
     src.push_str("        workgroupBarrier();\n\n");
 
@@ -3735,8 +3739,8 @@ fn generate_flash_attention(
     for e in 0..ept {
         let _ = writeln!(
             src,
-            "            pdot += q{e} * shared_k[i * {hd}u + lane + {}u];",
-            e * tpq
+            "            pdot += q{e} * shared_k[i * {hd}u + d_base + {}u];",
+            e * d_stride
         );
     }
     let _ = writeln!(
@@ -3762,8 +3766,8 @@ fn generate_flash_attention(
     for e in 0..ept {
         let _ = writeln!(
             src,
-            "                out{e} = out{e} * correction + weight * shared_v[i * {hd}u + lane + {}u];",
-            e * tpq
+            "                out{e} = out{e} * correction + weight * shared_v[i * {hd}u + d_base + {}u];",
+            e * d_stride
         );
     }
     src.push_str("                max_score = new_max;\n");
@@ -3779,10 +3783,7 @@ fn generate_flash_attention(
         src,
         "        for (var d = lid.x; d < {hd}u; d += {wg_size}u) {{"
     );
-    let _ = writeln!(
-        src,
-        "            shared_k[{shared_dimension}] = src_b[t * kv_dim + kv_head_off + d];"
-    );
+    src.push_str("            shared_k[d] = src_b[t * kv_dim + kv_head_off + d];\n");
     src.push_str("        }\n");
     src.push_str("        workgroupBarrier();\n\n");
 
@@ -3792,8 +3793,8 @@ fn generate_flash_attention(
     for e in 0..ept {
         let _ = writeln!(
             src,
-            "        pdot2 += q{e} * shared_k[lane + {}u];",
-            e * tpq
+            "        pdot2 += q{e} * shared_k[d_base + {}u];",
+            e * d_stride
         );
     }
     src.push_str("        wg_dot[dot_base + lane] = pdot2;\n");
