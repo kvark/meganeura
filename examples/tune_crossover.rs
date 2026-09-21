@@ -330,7 +330,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let gpu = Arc::new(meganeura::init_gpu_context_with(gpu_options.clone())?);
     let info = gpu.device_information();
     eprintln!("device: {} ({})", info.device_name, info.driver_info);
-    let caps = &gpu.capabilities().cooperative_matrix;
+    let caps = meganeura::runtime::auto_tune(&gpu, 0).coop_caps;
     let policy = if caps.f32_tile > 0 {
         CoopPolicy::Auto
     } else {

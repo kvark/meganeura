@@ -212,7 +212,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let nvidia_before = command("nvidia-smi", &[]).ok();
     let gpu = Arc::new(meganeura::init_gpu_context()?);
     let device = gpu.device_information();
-    let caps = &gpu.capabilities().cooperative_matrix;
+    let caps = meganeura::runtime::auto_tune(&gpu, 0).coop_caps;
     let policy = if caps.f32_tile > 0 {
         CoopPolicy::Auto
     } else {

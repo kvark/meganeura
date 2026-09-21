@@ -276,7 +276,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ..Default::default()
     })?);
     let info = gpu.device_information();
-    let caps = &gpu.capabilities().cooperative_matrix;
+    let caps = meganeura::runtime::auto_tune(&gpu, 0).coop_caps;
     let mut cases = profile_cases();
     cases.rotate_left(seed - 1);
     let mut document = json!({"schema_version": 1, "protocol": protocol, "status": "running",
