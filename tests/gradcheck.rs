@@ -336,6 +336,69 @@ fn tanh_mid_chain() {
 }
 
 #[test]
+fn gelu_forms_match_forward_derivative() {
+    let values = [
+        -8.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.75, -0.25, 0.0, 0.125, 0.5, 0.75, 1.0, 1.5, 3.0, 6.0,
+    ];
+    let up: Vec<f32> = (0..values.len()).map(|i| i as f32 * 0.2 - 1.1).collect();
+    let gelu = |x: f64| 0.5 * x * (1.0 + (0.7978845608 * (x + 0.044715 * x.powi(3))).tanh());
+    for mode in [
+        meganeura::OptimizeMode::Off,
+        meganeura::OptimizeMode::EgglogOutlined,
+    ] {
+        for form in 0..3 {
+            let mut g = Graph::new();
+            let x = g.parameter("x", &[2, 8]);
+            let u = g.parameter("up", &[2, 8]);
+            let output = match form {
+                0 => {
+                    let activated = g.gelu(x);
+                    g.mul(activated, u)
+                }
+                1 => g.geglu(x, u),
+                _ => {
+                    let gate = g.reshape(x, &[16]);
+                    let up = g.reshape(u, &[16]);
+                    let packed = g.concat(gate, up, 2, 8, 8, 1);
+                    let packed = g.reshape(packed, &[2, 16]);
+                    g.geglu_concat(packed)
+                }
+            };
+            let sum = g.sum_all(output);
+            let loss = g.scale(sum, -0.7);
+            g.set_outputs(vec![loss]);
+            let mut config = meganeura::SessionConfig::from_env();
+            config.optimize.mode = mode;
+            let mut session = meganeura::build(&g, config).0;
+            session.set_parameter("x", &values);
+            session.set_parameter("up", &up);
+            session.step();
+            session.wait();
+            let mut dx = [0.0; 16];
+            let mut du = [0.0; 16];
+            session.read_param_grad("x", &mut dx);
+            session.read_param_grad("up", &mut du);
+            for i in 0..values.len() {
+                let x = f64::from(values[i]);
+                let derivative = (gelu(x + 1e-4) - gelu(x - 1e-4)) / 2e-4;
+                let expected_x = -0.7 * f64::from(up[i]) * derivative;
+                let expected_up = -0.7 * gelu(x);
+                assert!(
+                    (f64::from(dx[i]) - expected_x).abs() < 3e-6,
+                    "{mode:?} form {form}, x={x}: {} vs {expected_x}",
+                    dx[i]
+                );
+                assert!(
+                    (f64::from(du[i]) - expected_up).abs() < 3e-6,
+                    "{mode:?} form {form}, up[{i}]: {} vs {expected_up}",
+                    du[i]
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn neg_mid_chain() {
     check_activation_mid_chain(|g, z| g.neg(z), 0.7);
 }
