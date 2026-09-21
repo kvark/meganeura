@@ -266,10 +266,11 @@ fn implementations(
         .collect();
     let mut attention = vec![(0, None)];
     if !heads.is_empty() {
-        for ept in [32, 16, 8] {
-            for threads in [256, 128] {
-                for keys in [8, 16, 4] {
-                    for interleave in [false, true] {
+        let mut layouts = Vec::new();
+        for (e, ept) in [32, 16, 8].into_iter().enumerate() {
+            for (t, threads) in [256, 128].into_iter().enumerate() {
+                for (k, keys) in [8, 16, 4].into_iter().enumerate() {
+                    for (l, interleave) in [false, true].into_iter().enumerate() {
                         let shape = crate::codegen::FlashAttentionShape {
                             threads,
                             keys,
@@ -279,19 +280,21 @@ fn implementations(
                             .iter()
                             .all(|&hd| shape.shared_bytes(hd) <= u64::from(shared_memory_bytes))
                         {
-                            attention.push((0, Some((ept, shape))));
+                            layouts.push((e + t + k + l, (0, Some((ept, shape)))));
                         }
                     }
                 }
             }
         }
+        layouts.sort_by_key(|&(rank, _)| rank);
+        attention.extend(layouts.into_iter().map(|(_, layout)| layout));
     }
     if cached_attention {
         attention.extend([1, 2, 4, 8, 16].map(|splits| (splits, None)));
     }
     let chunks = [1, 2, 4, 8, 16, 32, 64];
-    // Explore kernel layouts across logical forms before multiplying them by
-    // submission choices. Lower only the next candidate.
+    // Cover each physical axis before its Cartesian product. Logical forms
+    // remain interleaved, and only the next candidate is lowered.
     let matrices = [
         (0, 32),
         (8, 64),
@@ -301,24 +304,30 @@ fn implementations(
         (4, 32),
         (2, 32),
     ];
-    let single_axis: Vec<_> = matrices
-        .into_iter()
-        .map(|matrix| ((0, None), matrix, 1))
-        .chain(
-            attention
-                .iter()
-                .copied()
-                .skip(1)
-                .map(|attention| (attention, (0, 32), 1)),
-        )
+    let axis_len = matrices.len().max(attention.len()).max(chunks.len());
+    let single_axis: Vec<_> = (0..axis_len)
+        .flat_map(|i| {
+            [
+                matrices
+                    .get(i)
+                    .copied()
+                    .map(|matrix| ((0, None), matrix, 1)),
+                attention.get(i + 1).copied().map(|a| (a, (0, 32), 1)),
+                chunks.get(i + 1).copied().map(|c| ((0, None), (0, 32), c)),
+            ]
+            .into_iter()
+            .flatten()
+        })
         .collect();
     let mut choices = single_axis
         .into_iter()
         .chain(chunks.into_iter().flat_map(move |chunks| {
             attention.clone().into_iter().flat_map(move |attention| {
                 matrices.into_iter().filter_map(move |matrix| {
-                    (chunks != 1 || (attention != (0, None) && matrix.0 != 0))
-                        .then_some((attention, matrix, chunks))
+                    let axes = usize::from(chunks != 1)
+                        + usize::from(attention != (0, None))
+                        + usize::from(matrix.0 != 0);
+                    (axes >= 2).then_some((attention, matrix, chunks))
                 })
             })
         }));
