@@ -1,7 +1,9 @@
-\begin{tabular}{llrl}
+\begin{tabular}{llll}
 \toprule
-Device & Meganeura path & Qualified conditions & PyTorch GPU \\
+Device & Meganeura & PyTorch GPU & Blocking stage \\
 \midrule
-Intel RPL-U & Vulkan & 10/10 & Unavailable \\
+Intel RPL-U & Vulkan: 10/10 & No usable GPU path & XPU device unavailable \\
+Ryzen 9600X iGPU & Vulkan: 10/10 & No usable GPU path & ROCm crash / incorrect output \\
+MI300X (earlier attempt) & No validated Vulkan run & Strict 135M ran & Vulkan driver support \\
 \bottomrule
 \end{tabular}

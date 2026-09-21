@@ -1,53 +1,74 @@
 # Meganeura P3HPC artifacts
 
-## Camera-ready cohort
+## Current paper evidence
 
-The v9 archives contain eight complete 30-pair device campaigns and a complete
-12-pair H100 extension. The September 20 presentation separates 222 GPU-reference
-pairs from 30 RPL-U qualification processes. CPU-reference timings are not
-reported; the original records remain intact for numerical/provenance checks.
-Inferena fa5a04e1 and Meganeura 428fc2d2 are the measured revisions.
-[RESULTS.md](../RESULTS.md) records scope, findings and interpretation;
-[cohort.sha256](cohort.sha256) identifies the nine original archives.
+The September 21 v10 cohort contains 193 valid GPU pairs, a PyTorch/HIP
+failure on Radeon 780M, a manual interrupt on RX 7900 XT, and 20 passing
+graphics-only qualification conditions. Inferena `06f2f800` and Meganeura
+`dbb43648` are the current measured revisions. No failed condition is
+replaced with a retry or an older timing.
 
-From the repository root, with Python 3.11+:
+Eight earlier v9 archives, at Inferena `fa5a04e1` and Meganeura `428fc2d2`,
+support the version comparison and H100 135M/360M/1.7B size series.
+They remain separate from current tables and aggregates. The existing
+`paper-p3hpc-2026` tag identifies that earlier engine, not the current one.
+[RESULTS.md](../RESULTS.md) records findings and scope;
+[cohort.sha256](cohort.sha256) identifies both archive sets.
 
-    python3 paper/p3hpc/artifact/cohort.py "$HOME/Downloads/p3hpc" \
-      --check paper/p3hpc/tables --output target/p3hpc-final-data
+From the repository root, with standard-library Python 3.11+:
 
-The audit checks source/checkpoint identity, raw/joined agreement, 20-sample
-medians, cross-engine numerical gates, fixed per-tensor/whole-gradient
-replay bounds, native search/precision policies, compiled reference/replay
-receipts and all three-process gradient reports. Nine LaTeX table/figure
-fragments and a 74-row GPU-reference condition CSV are regenerated without a
-GPU/network. A separate qualification table lists RPL-U's ten passing
-workload/precision conditions without CPU-versus-GPU timing ratios.
+```sh
+python3 paper/p3hpc/artifact/cohort.py "$HOME/Downloads/p3hpc" \
+  --previous "$HOME/Downloads/p3hpc-v4" \
+  --check paper/p3hpc/tables --output target/p3hpc-20260921
+```
 
-The supplementary ZIP is self-contained for this audit. Its records.jsonl.xz
-is a lossless compression of every original JSON value, including raw/joined
-records and full replay statistics. Pass it instead of the archive directory:
+The audit checks source/checkpoint identity, full raw/joined agreement,
+sample medians, cross-engine numerical gates, replay bounds, construction
+budgets, full native qualification receipts, and replication. It reads one
+JSON file at a time because detailed native search reports total several
+GiB. No GPU or network is used. Nine LaTeX fragments and a 70-row current
+GPU-condition CSV are regenerated; CPU-oracle timings are excluded.
 
-    python cohort.py records.jsonl.xz --check tables --output regenerated
+The ratio table includes partial conditions with their actual counts.
+Aggregates require three pairs in all five workloads: six strict platforms
+and five accelerated platforms. Earlier rows, failure details and search
+summaries are exported separately.
 
-To produce that compact representation from the original archives:
+## Self-contained supplementary replay
 
-    python3 paper/p3hpc/artifact/cohort.py "$HOME/Downloads/p3hpc" \
-      --bundle /absolute/path/to/records.jsonl.xz
+From the extracted supplement:
 
-The stream contains an archive-digest header followed by nine JSON maps in
-the analyzer's declared device order. Standard-library lzma supplies XZ
-decompression; no executable/model/cache/trace data is stored. Original
-runner text logs are omitted, not measurement fields. The checker cannot
-reconstruct tensor elements that the runners never retained.
+```sh
+python cohort.py records.jsonl.xz --check tables --output regenerated
+```
 
-The separately labeled H100 search pilot has its original v7 analyzer and
-does not enter primary tables/aggregates. The MI300X report likewise is not
-a timing cell. No public hosting choice is required to replay the supplied
-supplement; a persistent DOI would still help discovery.
+The compressed stream preserves every original JSON value from the nine
+current and eight selected earlier archives. It is not a new measurement
+format or an engine cache. To generate it from the originals:
 
-The publication PDF, LaTeX source ZIP and supplementary ZIP stay outside Git.
-The annotated paper-p3hpc-2026 tag preserves the measured engine. No GPU benchmark was run
-during the paper update.
+```sh
+python3 paper/p3hpc/artifact/cohort.py "$HOME/Downloads/p3hpc" \
+  --previous "$HOME/Downloads/p3hpc-v4" --bundle /absolute/path/to/records.jsonl.xz
+```
+
+The first line contains `format: p3hpc-json-files-v2` and the archive digest
+map. Each archive then has a filename line, one `[path, JSON value]` line
+per original JSON file, and a `null` terminator. Archives follow
+`cohort.sha256` order. Standard-library lzma supplies XZ decompression.
+The checker reads these as data and never executes archive contents.
+The original archive hashes identify provenance; the supplement's
+`MANIFEST.sha256` protects the packaged stream itself.
+
+The two supplied AMD logs and their final runner logs are included
+separately. Ordinary text logs, executables, weights, caches, and traces
+are omitted. Full replay/native qualification reports do not contain all
+tensor elements; the checker cannot reconstruct elements never retained.
+
+The separate H100 search pilot retains its own analyzer and never enters
+current aggregates. The original MI300X report is not a timing result.
+The PDF and both ZIP files remain outside Git. No benchmark was launched
+during this update.
 
 ## Original-submission artifact (legacy)
 

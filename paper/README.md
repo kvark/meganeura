@@ -42,11 +42,13 @@ for venue requirements and the [current evidence guide](p3hpc/RESULTS.md)
 for the final common-revision cohort.
 
 Replay the camera-ready evidence without a GPU, from the repository root
-with the nine supplied campaign archives in one directory (Python 3.11+):
+with the nine current archives and the separately retained earlier cohort
+(Python 3.11+):
 
 ```sh
 python3 paper/p3hpc/artifact/cohort.py "$HOME/Downloads/p3hpc" \
-  --check paper/p3hpc/tables --output target/p3hpc-final-data
+  --previous "$HOME/Downloads/p3hpc-v4" \
+  --check paper/p3hpc/tables --output target/p3hpc-20260921
 ```
 
 The original-submission evidence used by the companion report has a separate

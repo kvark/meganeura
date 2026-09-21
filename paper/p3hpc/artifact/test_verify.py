@@ -13,6 +13,7 @@ import unittest
 from unittest.mock import patch
 
 import verify
+import cohort
 
 
 PAPER = Path(__file__).resolve().parents[2]
@@ -21,6 +22,24 @@ CELL = RESULTS / "nvidia/paper-v1-strict/SmolLM2-135M_summary.json"
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_current_cohort_keeps_partial_and_cpu_runs_out_of_aggregates(self):
+        campaigns = {device: {"args": {"backend": backend, "eager": backend == "cpu"}}
+                     for device, backend in (("full", "cuda"), ("partial", "rocm"), ("oracle", "cpu"))}
+        rows = {device: {("strict", model, cohort.primary_condition(c)): {"replicates": 3}
+                        for model in cohort.MODELS} for device, c in campaigns.items()}
+        rows["partial"]["strict", "SmolLM2-135M", "default-graph1"]["replicates"] = 2
+        self.assertEqual(cohort.complete_devices(campaigns, rows, "strict"), ["full"])
+        self.assertEqual(cohort.complete_devices(campaigns, rows, "accelerated"), [])
+
+    def test_streamed_records_preserve_raw_summary_identity(self):
+        record = {"framework": "pytorch", "status": "ok", "timings": {"inference_ms": 1.0}}
+        records = cohort.read_records(iter((("raw.json", copy.deepcopy(record)),
+                                           ("summary.json", [copy.deepcopy(record)]))), False)
+        self.assertEqual(records["raw.json"], records["summary.json"][0])
+        record["timings"]["inference_ms"] = 2.0
+        changed = cohort.read_records(iter((("raw.json", record),)), False)
+        self.assertNotEqual(records["raw.json"]["source_digest"], changed["raw.json"]["source_digest"])
+
     def test_frozen_inventory_and_gates(self):
         with patch.object(verify, "ROOT", PAPER), patch.object(verify, "RESULTS", RESULTS):
             self.assertEqual(verify.audit_results()["summaries"], 50)
