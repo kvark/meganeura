@@ -68,6 +68,8 @@ pub struct BuildSearchReport {
 /// The runner executes one step before each read-only `qualify` call. Check every
 /// observable output, gradient and persistent update against your numerical
 /// contract. Qualification runs before/after kernel tuning and after measurement;
+/// locally valid kernel choices that fail the whole-program check are rolled back
+/// and reported. The restored program must pass the same check before competing;
 /// a failing challenger is discarded, a failing incumbent aborts construction.
 /// Written inputs, parameters and constants are reset before each step, outside
 /// timing. The returned session retains its initialized persistent state; outputs
