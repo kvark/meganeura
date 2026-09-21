@@ -74,10 +74,10 @@ impl ExecutionPlan {
         producer.label = format!("{} split-K {splits}", dispatch.label);
         let reduction = Dispatch {
             shader: ShaderEntry::SumRows,
-            workgroups: [columns.div_ceil(32), 1, 1],
+            workgroups: [columns.div_ceil(256), 1, 1],
             input_buffers: vec![partial],
             output_buffer: dispatch.output_buffer,
-            params: vec![splits, columns, 0, 0],
+            params: vec![splits, columns, 1, 0],
             requires_full_precision: dispatch.requires_full_precision,
             fusion_barrier: dispatch.fusion_barrier,
             label: format!("{} split-K reduction", dispatch.label),

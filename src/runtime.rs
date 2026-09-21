@@ -7413,7 +7413,7 @@ impl Session {
                 );
             }
             ShaderEntry::SumRows => {
-                // params[0] = m (rows), params[1] = n (cols)
+                // Rows, columns, and optional serial-row layout.
                 pc.bind(
                     0,
                     &UnaryData {
@@ -7422,7 +7422,7 @@ impl Session {
                         params: UnaryParams {
                             len: dispatch.params[0],   // m
                             _pad0: dispatch.params[1], // n
-                            _pad1: 0,
+                            _pad1: dispatch.params.get(2).copied().unwrap_or(0),
                             _pad2: 0,
                         },
                     },
