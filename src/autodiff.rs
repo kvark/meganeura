@@ -517,21 +517,9 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_up = graph.mul(grad_output, gelu_g);
                 accumulate_grad(&mut graph, &mut grads, up, grad_up);
                 let dgelu_in = graph.mul(grad_output, up);
-                let x = gate;
-                let x_shape = &forward.nodes()[x as usize].ty.shape;
-                let n = x_shape.iter().product();
-                let k_const = graph.constant(vec![1.702; n], x_shape);
-                let kx = graph.mul(k_const, x);
-                let sig_kx = graph.sigmoid(kx);
-                let ones = graph.constant(vec![1.0; n], x_shape);
-                let neg_sig = graph.neg(sig_kx);
-                let one_minus_sig = graph.add(ones, neg_sig);
-                let inner = graph.mul(kx, one_minus_sig);
-                let ones2 = graph.constant(vec![1.0; n], x_shape);
-                let bracket = graph.add(ones2, inner);
-                let dgelu = graph.mul(sig_kx, bracket);
+                let dgelu = gelu_derivative(&mut graph, gate);
                 let grad_gate = graph.mul(dgelu_in, dgelu);
-                accumulate_grad(&mut graph, &mut grads, x, grad_gate);
+                accumulate_grad(&mut graph, &mut grads, gate, grad_gate);
             }
             Op::GeGLUConcat => {
                 let input = node.inputs[0];
@@ -695,21 +683,8 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::GlobalAvgPoolGrad { .. }
             | Op::CrossEntropyLogitsGrad => {}
             Op::Gelu => {
-                // gelu(x) ≈ x * sigmoid(1.702 * x) (sigmoid approximation)
-                // gelu'(x) ≈ sigmoid(1.702x) * (1 + 1.702*x*(1 - sigmoid(1.702x)))
                 let x = node.inputs[0];
-                let x_shape = &forward.nodes()[x as usize].ty.shape;
-                let n = x_shape.iter().product();
-                let k_const = graph.constant(vec![1.702; n], x_shape);
-                let kx = graph.mul(k_const, x);
-                let sig_kx = graph.sigmoid(kx);
-                let ones = graph.constant(vec![1.0; n], x_shape);
-                let neg_sig = graph.neg(sig_kx);
-                let one_minus_sig = graph.add(ones, neg_sig);
-                let inner = graph.mul(kx, one_minus_sig);
-                let ones2 = graph.constant(vec![1.0; n], x_shape);
-                let bracket = graph.add(ones2, inner);
-                let dgelu = graph.mul(sig_kx, bracket);
+                let dgelu = gelu_derivative(&mut graph, x);
                 let grad_x = graph.mul(grad_output, dgelu);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
@@ -1321,6 +1296,30 @@ impl Graph {
         let ty = target_ty.clone();
         self.add_raw_node(Op::SumRows, vec![x], ty)
     }
+}
+
+fn gelu_derivative(graph: &mut Graph, x: NodeId) -> NodeId {
+    // Differentiate the tanh approximation used by Gelu and GeGLUConcat.
+    let shape = graph.node(x).ty.shape.clone();
+    let one = graph.constant(vec![1.0; shape.iter().product()], &shape);
+    let square = graph.mul(x, x);
+    let cubic = graph.mul(square, x);
+    let cubic_term = graph.scale(cubic, 0.044715);
+    let inner = graph.add(x, cubic_term);
+    let inner = graph.scale(inner, 0.797_884_6);
+    let tanh = graph.tanh(inner);
+    let tanh_square = graph.mul(tanh, tanh);
+    let neg_tanh_square = graph.neg(tanh_square);
+    let sech_square = graph.add(one, neg_tanh_square);
+    let slope = graph.scale(square, 0.134145);
+    let slope = graph.add(one, slope);
+    let slope = graph.scale(slope, 0.797_884_6);
+    let half_x = graph.scale(x, 0.5);
+    let correction = graph.mul(half_x, sech_square);
+    let correction = graph.mul(correction, slope);
+    let base = graph.add(one, tanh);
+    let base = graph.scale(base, 0.5);
+    graph.add(base, correction)
 }
 
 fn accumulate_grad(

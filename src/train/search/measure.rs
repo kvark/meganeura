@@ -33,9 +33,6 @@ pub struct BuildSearchTrial {
     pub snapshot_bytes: usize,
     pub qualification_time: Duration,
     pub kernel_tuning: Option<TuneReport>,
-    /// Private kernel choices rejected by the whole-program check and rolled back.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kernel_tuning_rejection: Option<String>,
     pub outcome: TuneOutcome<(), usize>,
 }
 
@@ -132,7 +129,6 @@ pub(super) fn select(
             snapshot_bytes: 0,
             qualification_time: Duration::ZERO,
             kernel_tuning: None,
-            kernel_tuning_rejection: None,
             outcome: TuneOutcome::new((), program.plan.dispatches.len(), report.selected, index),
         };
         trial.outcome.phase_times = None;
@@ -158,7 +154,6 @@ pub(super) fn select(
                 trial.state_copy_time += copy_start.elapsed();
                 trial.snapshot_bytes = state.bytes();
                 validate(&mut candidate, &state, &mut trial, &mut qualify)?;
-                let untuned = candidate.plan().dispatches.clone();
                 let mut policy = options.tuning.clone();
                 policy.max_time = policy
                     .max_time
@@ -168,12 +163,7 @@ pub(super) fn select(
                         .tune_with_memo(policy, Some(&mut kernels))
                         .map_err(|error| error.to_string())?,
                 );
-                if let Err(error) = validate(&mut candidate, &state, &mut trial, &mut qualify) {
-                    log::warn!("program {index} kernel tuning rejected: {error}");
-                    trial.kernel_tuning_rejection = Some(error);
-                    candidate.restore_tuning(untuned)?;
-                    validate(&mut candidate, &state, &mut trial, &mut qualify)?;
-                }
+                validate(&mut candidate, &state, &mut trial, &mut qualify)?;
                 trial.outcome.qualified = true;
                 if let Some((ref mut baseline, ref baseline_state)) = incumbent {
                     for _ in 0..options.warmup_runs {
@@ -331,9 +321,8 @@ mod tests {
             params: vec![2, 0.25f32.to_bits(), 0, 0],
             ..Default::default()
         });
-        for failure in ["none", "tuning", "restoration", "incumbent"] {
+        for invalidate in [false, true] {
             let initialized = std::cell::Cell::new(0);
-            let mut checked = 0;
             let programs = ["baseline", "candidate"].map(|name| {
                 let mut plan = plan.clone();
                 plan.dispatches[0].label = name.into();
@@ -366,14 +355,7 @@ mod tests {
                     Ok(())
                 },
                 |s| {
-                    checked += 1;
-                    if checked == 2 && matches!(failure, "tuning" | "restoration") {
-                        return Err("injected post-tuning qualification failure".into());
-                    }
-                    if checked == 3 && failure == "restoration" {
-                        return Err("injected restored-program qualification failure".into());
-                    }
-                    if failure == "incumbent"
+                    if invalidate
                         && initialized.get() == 2
                         && s.plan().dispatches.iter().any(|d| d.label == "baseline")
                     {
@@ -387,27 +369,16 @@ mod tests {
                     Ok(())
                 },
             );
-            if failure == "incumbent" {
+            if invalidate {
                 assert!(
                     result
                         .err()
                         .unwrap()
                         .contains("incumbent failed repeated qualification")
                 );
-            } else if failure == "restoration" {
-                assert!(
-                    result
-                        .err()
-                        .unwrap()
-                        .contains("restored-program qualification failure")
-                );
             } else {
                 let (mut selected, report) = result.unwrap();
                 assert!(report.trials.iter().all(|t| t.outcome.qualified));
-                assert_eq!(
-                    report.trials[0].kernel_tuning_rejection.is_some(),
-                    failure == "tuning"
-                );
                 assert_eq!(selected.read_params(&["w"])[0], [3.0, 5.0]);
                 selected.step();
                 selected.wait();

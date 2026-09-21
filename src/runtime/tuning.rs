@@ -337,20 +337,6 @@ fn collect_classes(
 }
 
 impl Session {
-    /// Restore this session's dispatches saved immediately before kernel tuning.
-    pub(crate) fn restore_tuning(&mut self, dispatches: Vec<Dispatch>) -> Result<(), String> {
-        self.wait();
-        for (before, after) in dispatches.iter().zip(&self.plan.dispatches) {
-            if before != after {
-                self.pipelines
-                    .prepare(&self.gpu, before, self.coop_config.as_ref())?;
-            }
-        }
-        self.plan.dispatches = dispatches;
-        self.pipelines.select(&self.plan.dispatches);
-        Ok(())
-    }
-
     /// Exchange eligible kernel choices without exchanging tensor state.
     ///
     /// This supports controlled crossover experiments, not automatic confirmation,
@@ -2012,7 +1998,6 @@ mod tests {
             values
         };
         let class = collect_classes(&b.plan, &b.alias, None).0.remove(0);
-        let untuned = b.plan.dispatches.clone();
         let alternative = if convolution {
             MatmulTile::SpecializedConv {
                 tile_size: 32,
@@ -2063,15 +2048,6 @@ mod tests {
             initial_parameters,
             "optimizer must make a real update"
         );
-        let before_b = state(&b);
-        b.restore_tuning(untuned).unwrap();
-        assert_eq!(b.dispatch_pipeline_keys(), a_keys);
-        assert_eq!(state(&b), before_b);
-        for s in [&mut b, &mut b_control] {
-            s.step();
-            s.wait();
-        }
-        assert_eq!(state(&b), state(&b_control));
         let before = state(&a);
         b.plan.knobs.flash_ept_cap += 1;
         assert!(a.swap_tuning_with(&mut b).is_err());
