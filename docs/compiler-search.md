@@ -193,20 +193,21 @@ these are elapsed-time experiments, not a claim about sampled CPU hotspots.
 
 ## Next cohort gate
 
-Do not start a distributed cohort merely by merging this PR. Inferena at
-`fa5a04e1` still calls ordinary `build` and then `tune_with`, before model inputs
-and weights are initialized. A pin update alone would miss joint structural
-search. Its `hub` feature and direct `Dispatch.use_coop` field access also need
-the current API spellings.
+Inferena now initializes representative inputs and weights before
+`build_measured`, checks full outputs and canonical parameter gradients, and
+retains search coverage, skipped regions, actual limits and selected-plan
+receipts. It pins merged Meganeura `dbb4364`. Its
+[acceptance note](https://github.com/kvark/inferena/blob/06f2f800a4a57254d25b3331f1876631305a15ab/EXPERIMENT.md#local-acceptance-evidence)
+records all ten B570 model/precision pairs, NVIDIA qualification and the RMSNorm
+fix checks. Rejected alternatives do not weaken the selected program's gate.
 
-First adapt the runner to initialized, qualified `build_measured` sessions;
-retain graph/plan coverage and skipped-region receipts, explicit total budgets,
-and peak-memory bounds for two candidate sessions. Then run all five models in
-both contracts on the local NVIDIA and Intel devices, check outputs/gradients,
-and compare held-out latency and preparation costs before freezing one pin.
-The previous GGUF check still has a small NVIDIA regression, variable Intel
-decode timing and higher preparation cost; these CPU improvements do not
-establish a GPU speedup or resolve calibration stability.
+The [merged GGUF check](../bench/gguf_latency.md#merged-revision-checkpoint-2026-09-21)
+remains close to llama.cpp but does not establish parity: NVIDIA is 4-7% slower;
+Intel prefill is faster and decode about 2.5% slower. Construction remains
+costly. B570's rectangular cooperative tiles are not supported by the pinned
+Blade/WGSL path, even though llama.cpp uses them. These are engineering limits,
+not setup failures. Decide whether to address them before another costly cohort;
+local qualification is not a certificate for untested devices or future runs.
 
 Platforms without a usable PyTorch GPU path belong in the separate
 [qualification workflow](../paper/p3hpc/QUALIFICATION.md), never a CPU/GPU speed

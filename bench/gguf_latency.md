@@ -68,6 +68,48 @@ For separate captures, use `MEGANEURA_GPU_TIMING=1` or llama.cpp's
 `GGML_VK_PERF_LOGGER=1`. Instrumentation changes execution; wall time minus
 summed pass intervals is not a measurement of barrier cost.
 
+## Merged-revision checkpoint, 2026-09-21
+
+Meganeura `dbb43648b31237409075bbd3fa077ce06ee510bc` against the same pinned
+llama.cpp and GGUF above. Three fresh processes per engine and GPU, reversing
+the second pair; same physical cores, drivers, precision and readback scope as
+the earlier checkpoint. The source-only branch
+`experiment/merged-search-2026-09-21` preserves this report, without binaries or
+raw samples. This is not a new publication cohort.
+
+Milliseconds, median of three process medians:
+
+| GPU / phase | Meganeura | llama.cpp |
+| --- | ---: | ---: |
+| RTX 5070 prefill | 7.364 | 7.082 |
+| RTX 5070 decode/token | 1.456 | 1.366 |
+| Arc B570 prefill | 14.070 | 15.578 |
+| Arc B570 decode/token | 3.531 | 3.446 |
+
+NVIDIA remains 4.0% slower on prefill and 6.5% on decode. Intel prefill takes
+9.7% less time; decode takes 2.5% more. Decode process medians span
+1.452-1.509 / 1.341-1.382 ms on NVIDIA and 3.522-3.547 / 3.446-3.447 ms on
+Intel (Meganeura / llama.cpp). This does not establish across-the-board parity.
+
+All twelve full-logit sets are finite and retain all 33 independent CPU-reference
+token choices. Maximum per-row relative L2 is 1.11e-5 / 1.77e-4 for Meganeura
+and 0.01121 / 0.01314 for llama.cpp (NVIDIA / Intel). Some alternative plans
+still exceed the stricter internal output/cache gate and are discarded; no
+rejected plan is selected. Intel reaches the search deadline. Stateful regions
+still exclude logical alternatives, as described below.
+
+Reported preparation is 37.51 / 64.18 seconds for Meganeura and 0.221 / 0.466
+seconds for llama.cpp. These are not identical preparation policies or full
+cold-start times: Meganeura includes calibration and reference priming, while
+llama.cpp does not search; both exclude subsequent warmups and any work deferred
+to them. Preparation cost remains an open issue.
+
+B570 advertises 8x16x16 f16-input/f32-accumulate cooperative tiles. The pinned
+Blade probe and WGSL kernel path accept square 8x8x8 or 16x16x16 shapes only,
+so Meganeura runs scalar kernels here. llama.cpp reports `KHR_coopmat` on Intel
+and `NV_coopmat2` on NVIDIA. Rectangular-tile support is a concrete stack
+opportunity, not a driver-installation problem or proof of a future speedup.
+
 ## Calibrated-construction checkpoint, 2026-09-20
 
 Exact `789bcb60e82d8a2993a440acb500bf53b797cbeb` versus
