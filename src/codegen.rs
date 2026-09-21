@@ -3561,26 +3561,12 @@ fn generate_flash_attention(
     src.push_str("    workgroupBarrier();\n}\n\n");
 
     // Main kernel
-    src.push_str("fn query_sum(value: f32) -> f32 {\n    var total = value;\n");
-    stride = tpq / 2;
-    while stride > 0 {
-        let _ = writeln!(src, "    total += subgroupShuffleXor(total, {stride}u);");
-        stride /= 2;
-    }
-    src.push_str("    return total;\n}\n\n");
     let _ = writeln!(src, "@compute @workgroup_size({wg_size})");
     src.push_str(
-        "fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(subgroup_id) group_id: u32, @builtin(subgroup_invocation_id) group_lane: u32, @builtin(subgroup_size) group_width: u32, @builtin(num_subgroups) group_count: u32) {\n",
+        "fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n",
     );
-    let _ = writeln!(
-        src,
-        "    let use_shuffle = group_width >= {tpq}u && group_width * group_count == {wg_size}u;"
-    );
-    src.push_str(
-        "    let logical_id = select(lid.x, group_id * group_width + group_lane, use_shuffle);\n",
-    );
-    let _ = writeln!(src, "    let qi = logical_id / {tpq}u;");
-    let _ = writeln!(src, "    let lane = logical_id % {tpq}u;");
+    let _ = writeln!(src, "    let qi = lid.x / {tpq}u;"); // query within tile
+    let _ = writeln!(src, "    let lane = lid.x % {tpq}u;"); // lane within query group
     let _ = writeln!(
         src,
         "    let d_base = lane * {}u;",
@@ -3692,7 +3678,6 @@ fn generate_flash_attention(
 
     // Each thread computes partial dot product (EPT elements) for BKV positions
     let _ = writeln!(src, "        let grp_base = qi * {tpq}u;");
-    let _ = writeln!(src, "        var local_scores: array<f32, {bkv}>;");
     let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
     // Compute partial dot product across EPT elements
     src.push_str("            var pdot = 0.0;\n");
@@ -3703,14 +3688,12 @@ fn generate_flash_attention(
             e * d_stride
         );
     }
-    src.push_str("            if use_shuffle {\n                local_scores[i] = query_sum(pdot);\n            } else {\n");
     let _ = writeln!(
         src,
-        "                wg_scores[i * {wg_size}u + grp_base + lane] = pdot;"
+        "            wg_scores[i * {wg_size}u + grp_base + lane] = pdot;"
     );
-    src.push_str("            }\n");
     src.push_str("        }\n");
-    src.push_str("        if !use_shuffle { tree_reduce_bkv_grouped(lid.x); }\n\n");
+    src.push_str("        tree_reduce_bkv_grouped(lid.x);\n\n");
 
     // Online softmax + V accumulation for BKV positions
     let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
@@ -3718,7 +3701,7 @@ fn generate_flash_attention(
     src.push_str("            if valid && kv_pos >= my_kv_start && kv_pos < my_kv_len {\n");
     let _ = writeln!(
         src,
-        "                var score = local_scores[i];\n                if !use_shuffle {{ score = wg_scores[i * {wg_size}u + grp_base]; }}\n                score *= scale;"
+        "                let score = wg_scores[i * {wg_size}u + grp_base] * scale;"
     );
     src.push_str("                let new_max = max(max_score, score);\n");
     src.push_str("                let correction = exp(max_score - new_max);\n");
@@ -3756,11 +3739,9 @@ fn generate_flash_attention(
             e * d_stride
         );
     }
-    src.push_str("        if use_shuffle {\n            pdot2 = query_sum(pdot2);\n        } else {\n            wg_dot[dot_base + lane] = pdot2;\n            tree_reduce_grouped(lid.x);\n");
-    let _ = writeln!(
-        src,
-        "            pdot2 = wg_dot[qi * {tpq}u];\n        }}\n        let score = pdot2 * scale;\n"
-    );
+    src.push_str("        wg_dot[dot_base + lane] = pdot2;\n");
+    src.push_str("        tree_reduce_grouped(lid.x);\n");
+    let _ = writeln!(src, "        let score = wg_dot[qi * {tpq}u] * scale;\n");
 
     src.push_str("        if valid && t >= my_kv_start && t < my_kv_len {\n");
     src.push_str("            let new_max = max(max_score, score);\n");
@@ -6281,7 +6262,7 @@ mod tests {
             ),
             (
                 ShaderGroup::FlashAttention,
-                naga::valid::Capabilities::SUBGROUP,
+                naga::valid::Capabilities::empty(),
             ),
             (
                 ShaderGroup::FlashAttentionCoop,
@@ -6486,7 +6467,7 @@ mod tests {
                     let sm = generate_flash_attention_module(hd, ept, interleave);
                     naga::valid::Validator::new(
                         naga::valid::ValidationFlags::all(),
-                        naga::valid::Capabilities::SUBGROUP,
+                        naga::valid::Capabilities::empty(),
                     )
                     .validate(&sm.module)
                     .unwrap();
@@ -6670,7 +6651,7 @@ mod tests {
             (ShaderGroup::RoPEGrad, empty),
             (ShaderGroup::LayerNorm, empty),
             (ShaderGroup::MultiHeadAttn, empty),
-            (ShaderGroup::FlashAttention, naga::valid::Capabilities::SUBGROUP),
+            (ShaderGroup::FlashAttention, empty),
             (ShaderGroup::FlashAttentionCoop, coop),
             (ShaderGroup::MultiHeadAttnGradQ, empty),
             (ShaderGroup::FlashGradQ, empty),
