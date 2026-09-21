@@ -3489,7 +3489,7 @@ fn generate_flash_attention(
         return generate_attention_module(head_dim);
     }
     let wg_size = bq * tpq;
-    let bkv: u32 = 8;
+    let bkv: u32 = if cached { 8 } else { 16 };
     let mut src = String::new();
 
     // Params struct (matches AttentionParams: 8 u32 = 32 bytes)
