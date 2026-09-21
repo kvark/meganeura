@@ -3695,30 +3695,23 @@ fn generate_flash_attention(
     src.push_str("        }\n");
     src.push_str("        tree_reduce_bkv_grouped(lid.x);\n\n");
 
-    // Online softmax + V accumulation for BKV positions
-    let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
-    src.push_str("            let kv_pos = t + i;\n");
-    src.push_str("            if valid && kv_pos >= my_kv_start && kv_pos < my_kv_len {\n");
-    let _ = writeln!(
-        src,
-        "                let score = wg_scores[i * {wg_size}u + grp_base] * scale;"
-    );
-    src.push_str("                let new_max = max(max_score, score);\n");
-    src.push_str("                let correction = exp(max_score - new_max);\n");
-    src.push_str("                let weight = exp(score - new_max);\n");
-    src.push_str("                sum_exp = sum_exp * correction + weight;\n");
-    // Accumulate EPT V elements in registers
+    let mut rescale = String::new();
+    let mut accumulate = String::new();
     for e in 0..ept {
+        let _ = writeln!(rescale, "out{e} *= correction;");
         let _ = writeln!(
-            src,
-            "                out{e} = out{e} * correction + weight * shared_v[i * {hd}u + d_base + {}u];",
+            accumulate,
+            "out{e} += weight * shared_v[i * {hd}u + d_base + {}u];",
             e * d_stride
         );
     }
-    src.push_str("                max_score = new_max;\n");
-    src.push_str("            }\n");
-    src.push_str("        }\n");
-    src.push_str("        workgroupBarrier();\n");
+    src.push_str(
+        &include_str!("shaders/flash_softmax_tile.wgsl")
+            .replace("$BKV_U", &format!("{bkv}u"))
+            .replace("$WG_SIZE_U", &format!("{wg_size}u"))
+            .replace("$RESCALE_OUTPUT", &rescale)
+            .replace("$ACCUMULATE_OUTPUT", &accumulate),
+    );
     src.push_str("    }\n\n");
 
     // --- Tail: remaining KV positions one at a time ---
