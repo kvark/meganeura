@@ -15,7 +15,7 @@ use std::{
 /// and under one numerical/timing policy. Never persisted or shared globally.
 #[derive(Default)]
 pub(crate) struct KernelMemo(
-    HashMap<(crate::compile::TuningKnobs, TuneClass, Vec<MatmulTile>), KernelProgress>,
+    HashMap<(u32, bool, TuneClass, Vec<MatmulTile>), KernelProgress>,
 );
 
 #[derive(Clone, Copy)]
@@ -478,7 +478,8 @@ impl Session {
             }
             report.visited_classes += 1;
             let memo_key = (
-                self.plan.knobs,
+                self.plan.knobs.matmul_k_stage,
+                self.plan.knobs.matmul_interleave_columns,
                 class.key.clone(),
                 std::iter::once(class.initial)
                     .chain(class.challengers.iter().copied())
@@ -1660,7 +1661,15 @@ mod tests {
                 .all(|&x| x == 17.0 / 32.0)
         );
         assert_eq!(session.read_params(&["w"])[0], [0.125; 17 * 65]);
-        let complete = create().tune_with_memo(options, Some(&mut memo)).unwrap();
+        // Attention layout does not change any matrix kernel or scratch input.
+        let mut other = plan.clone();
+        other.knobs.flash_ept_cap = 16;
+        other.knobs.flash_interleave = true;
+        let complete = Session::with_context_opts(
+            other,
+            gpu,
+            crate::SessionOptions { coop: crate::CoopPolicy::Disabled, ..Default::default() },
+        ).tune_with_memo(options, Some(&mut memo)).unwrap();
         assert_eq!(complete.reused_classes.len(), 1);
         assert!(complete.outcomes.is_empty());
     }
