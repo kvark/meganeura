@@ -5,6 +5,27 @@
 
 use meganeura::{CompileOptions, Graph, Mode, NodeId, Session, SessionConfig};
 
+// A declared hardware run can bind its adapter without making these numerical
+// tests specific to one developer's GPU. No NVML; Vulkan budget is an estimate.
+fn check_declared_device(session: &Session) {
+    let Ok(name) = std::env::var("MEGANEURA_TEST_DEVICE_NAME") else {
+        return;
+    };
+    let driver = std::env::var("MEGANEURA_TEST_DRIVER").expect("declared driver required");
+    let device = session.device_information();
+    assert_eq!(device.device_name, name);
+    assert_eq!(device.driver_info, driver);
+    assert!(!device.is_software_emulated);
+    let memory = session
+        .device_memory_stats()
+        .expect("Vulkan budget required");
+    assert!(memory.budget_bytes.saturating_sub(memory.usage_bytes) >= 2 * 1024 * 1024 * 1024);
+    eprintln!(
+        "declared_test_device: name={name:?} driver={driver:?} usage={} budget={}",
+        memory.usage_bytes, memory.budget_bytes
+    );
+}
+
 fn inference(g: &Graph, opts: CompileOptions) -> Session {
     meganeura::build(
         g,
@@ -118,6 +139,7 @@ fn trigonometric_forward_and_gradient_match_cpu() {
     let loss = graph.sum_all(weighted);
     graph.set_outputs(vec![loss, sine, cosine]);
     let mut session = meganeura::build_session(&graph);
+    check_declared_device(&session);
     session.set_parameter("x", &input);
     session.set_input("weight", &weights);
     session.step();
@@ -128,6 +150,7 @@ fn trigonometric_forward_and_gradient_match_cpu() {
     session.read_output_by_index(1, &mut sine);
     session.read_output_by_index(2, &mut cosine);
     session.read_param_grad("x", &mut gradient);
+    check_declared_device(&session);
     for i in 0..LEN {
         for (name, actual, expected) in [
             ("sin", sine[i], input[i].sin()),
@@ -155,6 +178,7 @@ fn erf_gelu_forward_and_gradient_match_gaussian_integral() {
     let loss = graph.sum_all(y);
     graph.set_outputs(vec![loss, y]);
     let mut session = meganeura::build_session(&graph);
+    check_declared_device(&session);
     session.set_parameter("x", &input);
     session.step();
     session.wait();
@@ -162,6 +186,7 @@ fn erf_gelu_forward_and_gradient_match_gaussian_integral() {
     let mut gradient = output.clone();
     session.read_output_by_index(1, &mut output);
     session.read_param_grad("x", &mut gradient);
+    check_declared_device(&session);
     for (i, &x) in input.iter().enumerate() {
         // Simpson integration is independent of the shader's erf polynomial.
         let x = f64::from(x);
@@ -210,11 +235,13 @@ fn abs_and_split_gradient_broadcasts_match_cpu() {
     let loss = graph.mean_all(sum);
     graph.set_outputs(vec![loss]);
     let mut session = meganeura::build_session(&graph);
+    check_declared_device(&session);
     session.set_parameter("x", &input);
     session.step();
     session.wait();
     let mut gradient = vec![0.0; LEN];
     session.read_param_grad("x", &mut gradient);
+    check_declared_device(&session);
     for i in 0..LEN {
         // Preserve the existing Abs derivative convention at zero.
         let sign = if input[i] > 0.0 { 1.0 } else { -1.0 };
