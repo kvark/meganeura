@@ -109,6 +109,11 @@ budget allocation, not a monotonic-performance guarantee: an exhausted total
 budget or a change in execution state can still defeat that expectation.
 Held-out inference and minimal-shape measurements must check the selected plan;
 training improvements do not compensate for inference regressions.
+The next-cohort policy is not yet released: B570 qualification exposed a
+post-tuning full-gradient rejection on the first StableDiffusion training
+program. Private kernel checks are not a whole-model guarantee. Preserving
+the pre-tuning implementation and revalidating it is needed before that
+policy can be qualified across platforms.
 
 This is a bounded first implementation, not exhaustive graph scheduling. Small
 graphs are searched together. Larger pure graphs can expose all operators with

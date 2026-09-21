@@ -5,12 +5,20 @@ graphics-only qualification, and the earlier H100 size study separate.
 The replacement RX 7900 XT archive is complete; it supersedes the accidentally
 interrupted upload. No old and new replicates are spliced together.
 
-The next collection is **v11**, at Inferena `c8adf75741ffa2fd078e22c63e0aa94f1f23d90c`:
+The **v11 candidate**, Inferena `c8adf75741ffa2fd078e22c63e0aa94f1f23d90c`,
+is on hold, not a released common-cohort revision:
 kernel tuning uses the remaining shared session deadline, and both engines
 warm each phase for at least five calls and two seconds. Numerical gates,
 checkpoints, engine pins and reference compilation/replay settings are unchanged.
 Local acceptance runs are separate from this paper's v10 evidence. Do not change
 the measured methodology or tables to v11 until that cohort is collected.
+
+Local 5070 qualification passed all ten conditions. B570 passed strict SmolLM2
+and SmolVLA, then rejected post-tuning StableDiffusion training gradients.
+The first program has no qualified incumbent to return when its kernel changes
+fail the full-model check. A native rollback fix must be merged and pinned,
+then qualified, before collection. Keep the failed record; do not relax the
+numerical gate or retry it into the published cohort.
 
 ## Identity and health
 
