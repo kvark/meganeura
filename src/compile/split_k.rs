@@ -225,7 +225,9 @@ mod tests {
         let gpu = std::sync::Arc::new(
             crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap(),
         );
-        for transpose in 0..3 {
+        for case in 0..6 {
+            let transpose = case % 3;
+            let add = case >= 3;
             let (m, k, n) = (7, 67, 11);
             let mut graph = Graph::new();
             let a = graph.input("a", &if transpose == 1 { [k, m] } else { [m, k] });
@@ -234,6 +236,12 @@ mod tests {
                 0 => graph.matmul(a, b),
                 1 => graph.matmul_at(a, b),
                 _ => graph.matmul_bt(a, b),
+            };
+            let y = if add {
+                let c = graph.input("c", &[m, n]);
+                graph.add(y, c)
+            } else {
+                y
             };
             graph.set_outputs(vec![y]);
             let a: Vec<_> = (0..m * k).map(|i| (i as f32 * 0.21).sin()).collect();
@@ -255,11 +263,12 @@ mod tests {
                             };
                             f64::from(a[ai]) * f64::from(b[bi])
                         })
-                        .sum();
+                        .sum::<f64>()
+                        + if add { 0.125 } else { 0.0 };
                 }
             }
             for (tile_size, k_stage, splits) in [(32, 8, 3), (64, 16, 4), (32, 32, 2)] {
-                let mut plan = super::super::compile(&graph);
+                let mut plan = super::super::compile(&crate::optimize::optimize(&graph));
                 let shape = crate::codegen::ScalarMatmulShape {
                     tile_size,
                     k_stage,
@@ -280,6 +289,9 @@ mod tests {
                 );
                 session.set_input("a", &a);
                 session.set_parameter("b", &b);
+                if add {
+                    session.set_input("c", &vec![0.125; m * n]);
+                }
                 session.step();
                 session.wait();
                 for (actual, expected) in session.read_output(m * n).into_iter().zip(&reference) {
