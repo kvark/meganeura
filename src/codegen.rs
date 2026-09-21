@@ -3556,7 +3556,7 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     );
     let _ = writeln!(src, "    let qi = lid.x / {tpq}u;"); // query within tile
     let _ = writeln!(src, "    let lane = lid.x % {tpq}u;"); // lane within query group
-    src.push_str("    let d_base = lane;\n");
+    let _ = writeln!(src, "    let d_base = lane * {ept}u;"); // first head_dim element for this thread
     let _ = writeln!(src, "    let pos = wgid.x * {bq}u + qi;"); // global query position
     src.push_str("    let head = wgid.y;\n");
     src.push_str("    let q_seq = params.q_seq;\n");
@@ -3606,7 +3606,7 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     src.push_str("    if valid {\n");
     src.push_str("        let q_base = pos * (num_heads * head_dim) + head * head_dim;\n");
     for e in 0..ept {
-        let _ = writeln!(src, "        q{e} = src_a[q_base + d_base + {e}u * {tpq}u];");
+        let _ = writeln!(src, "        q{e} = src_a[q_base + d_base + {e}u];");
     }
     src.push_str("    }\n\n");
 
@@ -3665,7 +3665,7 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     for e in 0..ept {
         let _ = writeln!(
             src,
-            "            pdot += q{e} * shared_k[i * {hd}u + d_base + {e}u * {tpq}u];"
+            "            pdot += q{e} * shared_k[i * {hd}u + d_base + {e}u];"
         );
     }
     let _ = writeln!(
@@ -3691,7 +3691,7 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     for e in 0..ept {
         let _ = writeln!(
             src,
-            "                out{e} = out{e} * correction + weight * shared_v[i * {hd}u + d_base + {e}u * {tpq}u];"
+            "                out{e} = out{e} * correction + weight * shared_v[i * {hd}u + d_base + {e}u];"
         );
     }
     src.push_str("                max_score = new_max;\n");
@@ -3712,7 +3712,7 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     let _ = writeln!(src, "        let dot_base = qi * {tpq}u;");
     src.push_str("        var pdot2 = 0.0;\n");
     for e in 0..ept {
-        let _ = writeln!(src, "        pdot2 += q{e} * shared_k[d_base + {e}u * {tpq}u];");
+        let _ = writeln!(src, "        pdot2 += q{e} * shared_k[d_base + {e}u];");
     }
     src.push_str("        wg_dot[dot_base + lane] = pdot2;\n");
     src.push_str("        tree_reduce_grouped(lid.x);\n");
@@ -3727,7 +3727,7 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     for e in 0..ept {
         let _ = writeln!(
             src,
-            "            out{e} = out{e} * correction + weight * bias[v_base2 + d_base + {e}u * {tpq}u];"
+            "            out{e} = out{e} * correction + weight * bias[v_base2 + d_base + {e}u];"
         );
     }
     src.push_str("            max_score = new_max;\n");
@@ -3742,7 +3742,7 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     for e in 0..ept {
         let _ = writeln!(
             src,
-            "        dst[q_base + d_base + {e}u * {tpq}u] = out{e} / safe_sum;"
+            "        dst[q_base + d_base + {e}u] = out{e} / safe_sum;"
         );
     }
 
