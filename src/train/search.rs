@@ -295,15 +295,19 @@ fn implementations(
     let chunks = [1, 2, 4, 8, 16, 32, 64];
     // Cover each physical axis before its Cartesian product. Logical forms
     // remain interleaved, and only the next candidate is lowered.
-    let matrices = [
-        (0, 32),
-        (8, 64),
-        (4, 64),
-        (2, 64),
-        (8, 32),
-        (4, 32),
-        (2, 32),
-    ];
+    let mut matrix_layouts = Vec::new();
+    for (s, splits) in [8, 4, 2].into_iter().enumerate() {
+        for (t, tile) in [64, 32].into_iter().enumerate() {
+            for (k, stage) in [32, 8, 16].into_iter().enumerate() {
+                matrix_layouts.push((s + t + k, (splits, tile, stage)));
+            }
+        }
+    }
+    matrix_layouts.sort_by_key(|&(rank, _)| rank);
+    let default_matrix = (0, 32, 32);
+    let matrices: Vec<_> = std::iter::once(default_matrix)
+        .chain(matrix_layouts.into_iter().map(|(_, layout)| layout))
+        .collect();
     let axis_len = matrices.len().max(attention.len()).max(chunks.len());
     let single_axis: Vec<_> = (0..axis_len)
         .flat_map(|i| {
@@ -312,8 +316,14 @@ fn implementations(
                     .get(i)
                     .copied()
                     .map(|matrix| ((0, None), matrix, 1)),
-                attention.get(i + 1).copied().map(|a| (a, (0, 32), 1)),
-                chunks.get(i + 1).copied().map(|c| ((0, None), (0, 32), c)),
+                attention
+                    .get(i + 1)
+                    .copied()
+                    .map(|a| (a, default_matrix, 1)),
+                chunks
+                    .get(i + 1)
+                    .copied()
+                    .map(|c| ((0, None), default_matrix, c)),
             ]
             .into_iter()
             .flatten()
@@ -322,8 +332,9 @@ fn implementations(
     let mut choices = single_axis
         .into_iter()
         .chain(chunks.into_iter().flat_map(move |chunks| {
+            let matrices = matrices.clone();
             attention.clone().into_iter().flat_map(move |attention| {
-                matrices.into_iter().filter_map(move |matrix| {
+                matrices.clone().into_iter().filter_map(move |matrix| {
                     let axes = usize::from(chunks != 1)
                         + usize::from(attention != (0, None))
                         + usize::from(matrix.0 != 0);
@@ -331,7 +342,7 @@ fn implementations(
                 })
             })
         }));
-    let mut current = ((0, None), (0, 32), 1);
+    let mut current = ((0, None), default_matrix, 1);
     let mut seed_index = seeds.len();
     std::iter::from_fn(move || {
         loop {
@@ -341,7 +352,7 @@ fn implementations(
             }
             let seed = seeds.get(seed_index)?;
             seed_index += 1;
-            let ((splits, flash), (matrix_splits, tile_size), chunks) = current;
+            let ((splits, flash), (matrix_splits, tile_size, k_stage), chunks) = current;
             let mut plan = if splits == 0 && flash.is_none() {
                 seed.plan.clone()
             } else {
@@ -369,7 +380,7 @@ fn implementations(
             if matrix_splits != 0 {
                 let shape = crate::codegen::ScalarMatmulShape {
                     tile_size,
-                    k_stage: seed.options.knobs.matmul_k_stage,
+                    k_stage,
                     interleave_columns: seed.options.knobs.matmul_interleave_columns,
                 };
                 let original_buffers = plan.buffers.len();
@@ -388,7 +399,7 @@ fn implementations(
             }
             return Some(measure::Program {
                 description: format!(
-                    "{}, attention_splits={splits}, flash={flash:?}, matrix_splits={matrix_splits}, matrix_tile={tile_size}, submission_chunks={chunks}",
+                    "{}, attention_splits={splits}, flash={flash:?}, matrix_splits={matrix_splits}, matrix_tile={tile_size}, matrix_k_stage={k_stage}, submission_chunks={chunks}",
                     seed.description
                 ),
                 plan,
