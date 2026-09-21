@@ -4913,7 +4913,7 @@ pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule
 
     // Shared K/V staging with BKV tiling: amortize barrier cost by loading
     // BKV KV positions worth of K and V at once, then looping in-register.
-    let bkv: u32 = 8;
+    let bkv: u32 = if tpq == 1 { 8 } else { 1 };
     let _ = writeln!(src, "var<workgroup> shared_k: array<f32, {}>;", bkv * hd);
     let _ = writeln!(src, "var<workgroup> shared_v: array<f32, {}>;\n", bkv * hd);
 
@@ -5104,9 +5104,12 @@ pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule
         // Tail: remaining KV positions one at a time
         src.push_str("    for (; t < max_kv_len; t++) {\n");
         src.push_str("        let k_base = t * kv_dim + kv_head_off;\n");
-        let _ = writeln!(src, "        if lid.x < {hd}u {{");
-        src.push_str("            shared_k[lid.x] = src_b[k_base + lid.x];\n");
-        src.push_str("            shared_v[lid.x] = bias[k_base + lid.x];\n");
+        let _ = writeln!(
+            src,
+            "        for (var d = lid.x; d < {hd}u; d += {wg_size}u) {{"
+        );
+        src.push_str("            shared_k[d] = src_b[k_base + d];\n");
+        src.push_str("            shared_v[d] = bias[k_base + d];\n");
         src.push_str("        }\n");
         src.push_str("        workgroupBarrier();\n");
         src.push_str("        var sp2 = 0.0;\n");
@@ -5130,9 +5133,12 @@ pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule
         // TPQ>1 path: single KV position per iteration with cross-lane reduction.
         src.push_str("    for (var t = min_kv_start; t < max_kv_len; t++) {\n");
         src.push_str("        let k_base = t * kv_dim + kv_head_off;\n");
-        let _ = writeln!(src, "        if lid.x < {hd}u {{");
-        src.push_str("            shared_k[lid.x] = src_b[k_base + lid.x];\n");
-        src.push_str("            shared_v[lid.x] = bias[k_base + lid.x];\n");
+        let _ = writeln!(
+            src,
+            "        for (var d = lid.x; d < {hd}u; d += {wg_size}u) {{"
+        );
+        src.push_str("            shared_k[d] = src_b[k_base + d];\n");
+        src.push_str("            shared_v[d] = bias[k_base + d];\n");
         src.push_str("        }\n");
         src.push_str("        workgroupBarrier();\n\n");
 
@@ -5322,10 +5328,13 @@ pub fn generate_flash_grad_kv_module(head_dim: u32, ept_cap: u32) -> ShaderModul
         }
     } else {
         // TPQ>1: cooperative staging into shared memory (needs barriers).
-        let _ = writeln!(src, "            if lid.x < {hd}u {{");
-        src.push_str("                shared_q[lid.x] = src_a[q_base + lid.x];\n");
-        src.push_str("                shared_do[lid.x] = d_out[q_base + lid.x];\n");
-        src.push_str("                shared_o[lid.x] = fwd_dst[q_base + lid.x];\n");
+        let _ = writeln!(
+            src,
+            "            for (var d = lid.x; d < {hd}u; d += {wg_size}u) {{"
+        );
+        src.push_str("                shared_q[d] = src_a[q_base + d];\n");
+        src.push_str("                shared_do[d] = d_out[q_base + d];\n");
+        src.push_str("                shared_o[d] = fwd_dst[q_base + d];\n");
         src.push_str("            }\n");
         src.push_str("            workgroupBarrier();\n\n");
 
