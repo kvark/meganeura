@@ -6,30 +6,33 @@ not a performance competitor. Do not publish CPU/GPU timing ratios or include
 these runs in GPU performance, preparation-time or portability-score aggregates.
 
 The existing collector already supports this; no new harness is needed.
-Commands below use Inferena's `experiment/p3hpc-cuda-graphs` branch. Its current
-engine pin is the submitted cohort's `428fc2d2`, **not PR #200**. A run now is
-bring-up evidence at that pin. Repeat qualification at the next frozen pin
-before describing it as coverage of the new engine.
+The September 25 qualification uses Inferena `7b8fcb72` and Meganeura
+`0dbfcc00`, tagged `paper-p3hpc-2026-final` in both repositories. All three devices below pass all ten
+workload/precision conditions at those pins. Repeat qualification after an
+engine update before claiming coverage of the new revision.
 
-## AMD Mendocino on rubik
+## Ryzen 5 9600X integrated Radeon on rubik
+
+The recorded native adapter is `AMD Ryzen 5 9600X 6-Core Processor
+(RADV RAPHAEL_MENDOCINO)`, device ID 5056. The shared driver name is not a
+reason to label this processor's integrated GPU as a separate Mendocino APU.
 
 From the Inferena checkout, with Rust, uv and a working RADV Vulkan driver:
 
 ```sh
-git switch experiment/p3hpc-cuda-graphs
-git pull --ff-only
+git fetch origin tag paper-p3hpc-2026-final
+git switch --detach paper-p3hpc-2026-final
 bash scripts/setup.sh cpu .venv-p3hpc-cpu
 cargo run --release --locked -p inferena-meganeura -- --list-devices
 .venv-p3hpc-cpu/bin/python scripts/p3hpc.py \
-  --backend cpu --gpu MENDOCINO --qualify-only --eager
-cp ../inferena-results/latest.tgz ../inferena-results/rubik-mendocino-qualification.tgz
+  --backend cpu --gpu 'AMD Ryzen 5 9600X' --qualify-only --eager
+cp ../inferena-results/latest.tgz ../inferena-results/rubik-9600x-qualification.tgz
 ```
 
 Reuse `.venv-p3hpc-cpu` if already installed; setup refuses to overwrite it.
 The device list must show the intended hardware as available and not software
-emulated. `--gpu MENDOCINO` matches a RADV name containing that substring
-(including `RAPHAEL_MENDOCINO`). If the list uses a different name, use that
-exact name instead. If more than one matches, stop and disambiguate; do not
+emulated. The GPU filter matches the recorded adapter name. If the list uses
+a different name, use that exact name instead. If more than one matches, stop and disambiguate; do not
 drop the filter. The collector selects its device ID and checks the executed
 device in every result. It refuses software-renderer or ambiguous matches.
 
@@ -57,9 +60,25 @@ Use the same CPU environment and replace the collection command with:
 cp ../inferena-results/latest.tgz ../inferena-results/intel-rpl-u-qualification.tgz
 ```
 
-The submitted archives already establish ten passing workload/precision
-conditions, each in three processes, on RPL-U. The paper retains this evidence
-in the qualification table and no longer reports the CPU-reference timings.
+The current archives establish ten passing workload/precision conditions,
+one process each, on RPL-U, Radeon 780M, and the Ryzen iGPU. These are qualification runs,
+not three-replicate timing campaigns. The paper reports no CPU-reference timings.
+
+## Radeon 780M
+
+The compiled ROCm campaign failed on its first strict SmolLM2-135M condition
+with an unspecified HIP launch failure. Separate qualification passed:
+
+```sh
+.venv-p3hpc-cpu/bin/python scripts/p3hpc.py \
+  --backend cpu --gpu 'AMD Radeon 780M' --qualify-only --eager
+cp ../inferena-results/latest.tgz ../inferena-results/amd-780m-qualification.tgz
+```
+
+The supplied run used the ROCm wheel with `--backend cpu`, which is also valid.
+Its architecture/copy overrides are recorded, but do not configure Vulkan or
+the CPU oracle. This establishes the tested native path, not a claim that every
+possible PyTorch GPU configuration must fail.
 
 ## Evidence and archive lifetime
 
@@ -67,8 +86,10 @@ Require `campaign.json` to finish with `status: complete`, `args.collect: false`
 the intended `native_device`, and ten valid qualification runs. Preserve the
 archive, driver/hardware identity and exact source pin. A CPU-only wheel alone
 does not prove that a GPU PyTorch path is unavailable: retain the GPU-backend
-probe failure or vendor support evidence separately. Mendocino is still pending,
-not a passing or unavailable platform inferred merely from this command.
+probe failure or vendor support evidence separately. The Ryzen qualification
+uses a ROCm wheel but explicitly executes the reference on CPU. Its successful
+run does not contradict the separately reported ROCm GPU bring-up failures.
+Any separate Mendocino machine would need its own qualification evidence.
 
 Each attempt creates a new timestamped directory. `latest.tgz` is atomically
 replaced on **completion or failure**, so copy it before another attempt or
