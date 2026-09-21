@@ -239,17 +239,24 @@ fn implementations(
     caps: crate::codegen::CoopCaps,
     max_partial_bytes: usize,
 ) -> impl Iterator<Item = measure::Program> {
-    let attention = seeds.iter().any(|p| {
+    let cached_attention = seeds.iter().any(|p| {
         p.graph
             .nodes()
             .iter()
             .any(|n| matches!(n.op, crate::graph::Op::CachedBlockAttention { .. }))
     });
-    let splits: &[u32] = if attention {
-        &[0, 1, 2, 4, 8, 16]
-    } else {
-        &[0]
-    };
+    let mut attention = vec![(0, 0)];
+    if seeds.iter().any(|seed| {
+        seed.plan
+            .dispatches
+            .iter()
+            .any(|d| d.shader == compile::ShaderEntry::FlashAttention)
+    }) {
+        attention.extend([(0, 16), (0, 8), (0, 32)]);
+    }
+    if cached_attention {
+        attention.extend([1, 2, 4, 8, 16].map(|splits| (splits, 0)));
+    }
     // Preserve unsplit products, and test reduction parallelism as a complete
     // two-dispatch implementation. No architecture or model chooses the winner.
     let matrices = [
@@ -264,17 +271,22 @@ fn implementations(
     let chunks = [1, 2, 4, 8, 16, 32, 64];
     // Interleave settings across logical forms, starting near ordinary lowering.
     // Lower only the next candidate; do not allocate a Cartesian product of plans.
-    let mut choices = (0..splits.len() + matrices.len() + chunks.len() - 2).flat_map(move |rank| {
-        (0..splits.len()).flat_map(move |a| {
-            (0..matrices.len()).filter_map(move |m| {
-                let c = rank.checked_sub(a + m)?;
-                chunks
-                    .get(c)
-                    .map(|&chunks| (splits[a], matrices[m], chunks))
-            })
-        })
-    });
-    let mut current = (0, (0, 32), 1);
+    let mut choices =
+        (0..attention.len() + matrices.len() + chunks.len() - 2).flat_map(move |rank| {
+            attention
+                .clone()
+                .into_iter()
+                .enumerate()
+                .flat_map(move |(a, attention)| {
+                    (0..matrices.len()).filter_map(move |m| {
+                        let c = rank.checked_sub(a + m)?;
+                        chunks
+                            .get(c)
+                            .map(|&chunks| (attention, matrices[m], chunks))
+                    })
+                })
+        });
+    let mut current = ((0, 0), (0, 32), 1);
     let mut seed_index = seeds.len();
     std::iter::from_fn(move || {
         loop {
@@ -284,14 +296,17 @@ fn implementations(
             }
             let seed = seeds.get(seed_index)?;
             seed_index += 1;
-            let (splits, (matrix_splits, tile_size), chunks) = current;
-            let mut plan = if splits == 0 {
+            let ((splits, flash_ept), (matrix_splits, tile_size), chunks) = current;
+            let mut plan = if splits == 0 && flash_ept == 0 {
                 seed.plan.clone()
             } else {
-                let options = compile::CompileOptions {
-                    cached_attention_splits: Some(splits),
-                    ..seed.options.clone()
-                };
+                let mut options = seed.options.clone();
+                if splits != 0 {
+                    options.cached_attention_splits = Some(splits);
+                }
+                if flash_ept != 0 {
+                    options.knobs.flash_ept_cap = flash_ept;
+                }
                 let plan = compile::compile_with_caps(&seed.graph, &options, caps);
                 if plan == seed.plan {
                     continue;
@@ -320,7 +335,7 @@ fn implementations(
             }
             return Some(measure::Program {
                 description: format!(
-                    "{}, attention_splits={splits}, matrix_splits={matrix_splits}, matrix_tile={tile_size}, submission_chunks={chunks}",
+                    "{}, attention_splits={splits}, flash_ept={flash_ept}, matrix_splits={matrix_splits}, matrix_tile={tile_size}, submission_chunks={chunks}",
                     seed.description
                 ),
                 plan,
