@@ -1,0 +1,70 @@
+\RequirePackage{xcolor}
+\RequirePackage{tagging}
+
+\definecolor{colsample}{gray}{0.45}
+\definecolor{colexpl}{rgb}{0.4, 0.6, 0.8}
+
+\newcounter{artifactCounter}
+\newcounter{artpartCounter}
+\newcounter{artevalCounter}
+
+\newcommand{\newartifact}{%
+    \stepcounter{artifactCounter}%
+    \subsection{Computational Artifact $A_{\theartifactCounter}$}%
+}
+
+\newcommand{\artrel}{%
+    \subsection*{Relation To Contributions}%
+}
+
+\newcommand{\artexp}{%
+    \subsection*{Expected Results}%
+}
+
+\newcommand{\arttime}{%
+    \subsection*{Expected Reproduction Time (in Minutes)}%
+}
+
+\newcommand{\artin}{%
+    \subsection*{Artifact Setup (incl. Inputs)}
+}
+
+\newcommand{\artinpart}[1]{%
+\subsubsection*{#1}}
+
+\newcommand{\artcomp}{%
+    \subsection*{Artifact Execution}
+}
+
+\newcommand{\artout}{%
+    \subsection*{Artifact Analysis (incl. Outputs)}
+}
+
+
+\newcommand{\apppart}[1]{%
+\vspace{2ex}
+\begin{center}\begin{large}\textbf{#1}\end{large}\end{center}\par
+%\vspace{2mm} % Adjust vertical space as needed
+}
+
+\newcommand{\appendixAE}{%
+\setcounter{subsection}{0}%
+\apppart{Artifact Evaluation (AE)}%
+}
+
+\newcommand{\appendixAD}{%
+\apppart{Artifact Description (AD)}%
+}
+
+
+\newcommand{\arteval}[1]{%
+    \setcounter{artifactCounter}{#1}
+    \subsection{Computational Artifact $A_{#1}$}%
+}
+
+
+\newcommand{\artexpl}[1]
+{\tagged{explanation}{{\color{colexpl}#1}}}
+
+\newcommand{\artsampl}[1]
+{\tagged{example}{{\color{colsample}#1}}}

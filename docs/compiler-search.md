@@ -1,9 +1,8 @@
 # Compiler search: direction and alternatives
 
-Architecture discussion for PR #200, updated with the PR #206 review on
-2026-09-22.
-The submitted P3HPC results use their recorded revisions and are unaffected by
-this design work.
+Architecture discussion for PRs #200 and #206, with evidence from the
+September 25 P3HPC cohort. The [P3HPC results](../paper/p3hpc/RESULTS.md) are
+pinned to their measured revisions; they do not qualify later engine changes.
 
 ## Decision
 
@@ -99,6 +98,25 @@ dispatches still use those probes before whole-plan comparison. Attention
 splits and convolution weight splits use the existing compiler, with no
 session-buffer patching. There is no reusable command recording or separate
 live structural tuner.
+
+The collection harness gives private probes the remaining shared session
+deadline, not an independent two-second slice. The shorter slices repeatedly
+interrupted expensive qualification on B570 SmolLM2 and left later, repeated
+matrix classes untuned. Completing the ordinary candidate's kernel search
+first recovered a faster incumbent without adding another optimizer. This is
+budget allocation, not a monotonic-performance guarantee: an exhausted total
+budget or a change in execution state can still defeat that expectation.
+Held-out inference and minimal-shape measurements must check the selected plan;
+training improvements do not compensate for inference regressions.
+
+The September 25 v14 cohort pins Inferena `7b8fcb72` and Meganeura `0dbfcc00`,
+both tagged `paper-p3hpc-2026-final`. It uses matched uniform synthetic
+parameters, sixteen graph/schedule forms, up to 64 programs, a shared soft
+60-second session deadline and 250 ms comparison warmup. The
+[evidence audit](../paper/p3hpc/RESULTS.md) records the six main GPU campaigns,
+larger-model runs, three graphics-only qualifications and retained failures.
+Repeat backend qualification after an engine update before claiming coverage
+of the new revision.
 
 This is a bounded first implementation, not exhaustive graph scheduling. Small
 graphs are searched together. Larger pure graphs can expose all operators with
