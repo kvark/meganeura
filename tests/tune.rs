@@ -550,7 +550,7 @@ fn tune_native_cooperative_f32() {
     // advertising f32 tiles, separately from the portable qualification tests.
     let gpu = std::sync::Arc::new(meganeura::init_gpu_context().unwrap());
     assert!(
-        gpu.capabilities().cooperative_matrix.f32_tile > 0,
+        meganeura::runtime::auto_tune(&gpu, 0).coop_caps.f32_tile > 0,
         "native f32 matrix hardware required; this test cannot qualify a scalar fallback"
     );
     for shader in [

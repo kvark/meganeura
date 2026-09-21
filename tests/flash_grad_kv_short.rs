@@ -104,7 +104,11 @@ fn short_cross_self_and_window_attention_gradients_match_scalar() {
     let gpu = Arc::new(
         meganeura::init_gpu_context_with(meganeura::GpuOptions::from_env()).expect("GPU context"),
     );
-    let has_coop = gpu.capabilities().cooperative_matrix.f16_tile == 16;
+    let has_coop = gpu
+        .capabilities()
+        .cooperative_matrix
+        .f16
+        .contains(&[16, 16, 16]);
 
     for (label, q_seq, kv_seq, window) in [
         ("cross", 50, 16, 0),
