@@ -3724,8 +3724,8 @@ fn generate_flash_attention(
     // --- Tail: remaining KV positions one at a time ---
     src.push_str("    for (; t < max_kv_len; t++) {\n");
     // Load single K position into shared_k
-    let _ = writeln!(src, "        if lid.x < {hd}u {{");
-    src.push_str("            shared_k[lid.x] = src_b[t * kv_dim + kv_head_off + lid.x];\n");
+    let _ = writeln!(src, "        for (var d = lid.x; d < {hd}u; d += {wg_size}u) {{");
+    src.push_str("            shared_k[d] = src_b[t * kv_dim + kv_head_off + d];\n");
     src.push_str("        }\n");
     src.push_str("        workgroupBarrier();\n\n");
 
