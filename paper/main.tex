@@ -387,10 +387,10 @@ search: fused kernels must be rediscovered from clouds of primitives, which
 is precisely the regime where global techniques such as equality saturation
 become load-bearing. Monolithic high-level ops at the other end duplicate
 kernel work per model family and starve the rewriter of reusable structure.
-The mid-level choice keeps \system{}'s profitable rewrites local and
-shallow --- one reason greedy rewriting suffices in
-Section~\ref{sec:ablation} --- at the cost of a larger node vocabulary and
-a per-node autodiff rule to maintain.
+The mid-level choice keeps many profitable rewrites local and shallow,
+at the cost of a larger node vocabulary and a per-node autodiff rule to
+maintain. The current optimizer retains alternative expressions in an
+e-graph so that a local rewrite need not settle the implementation choice.
 
 Training first optimizes and topologically sorts the forward graph, then
 applies reverse-mode automatic differentiation. Multiple derivative paths are
@@ -404,7 +404,7 @@ while still allowing a native f32 cooperative path where a device exposes
 one. This policy was added after the Whisper workload showed that forward
 agreement alone did not bound training error (Section~\ref{sec:precision}).
 
-\subsection{Graph rewriting}
+\subsection{E-graph optimization and measured construction}
 
 \system{} recognizes algebraic and implementation-level forms such as
 $x\,\sigma(x)\rightarrow\mathrm{SiLU}(x)$, decomposed
@@ -412,13 +412,30 @@ SiLU-gating $\rightarrow$ SwiGLU, matrix-product plus residual, and packed
 projection forms. A tensor-traffic cost estimates bytes read and written by an
 extracted graph.
 
-The compiler supports deterministic greedy rewriting and several
-equality-saturation modes built with egglog~\cite{zhang2023egglog}. The latter
-include fixed windows, repeated-region outlining, and whole-graph saturation.
+The production optimizer uses bounded equality saturation through
+egglog~\cite{zhang2023egglog}. An e-graph groups equivalent expressions
+without immediately discarding all but one. Large graphs use repeated-region
+outlining and bounded residual windows; fixed-window and whole-graph modes
+remain diagnostic alternatives. There is no separate production greedy
+rewriter. Ordinary construction extracts one graph using estimated tensor
+traffic. Calibrated construction uses the same rules and extractor to retain
+several forms for measurement.
+
+Each retained forward form is lowered independently, and differentiated
+separately for training. Private sessions receive representative weights
+and inputs. Legal kernel choices are tuned before complete programs compete
+on fresh recording, submission, and execution time. Candidates must pass
+full-output and gradient checks as well as the paired timing guard.
+The search also considers dispatch fusion and submission chunking; it does
+not mutate an allocated session's graph to install a different structure.
+
 Equality saturation is established prior art~\cite{willsey2021egg,
-yang2021tensat}; our contribution is the measured result that it is not the
-right production default for the current rewrite space. Section
-\ref{sec:ablation} compares the modes.
+yang2021tensat}. Here it supplies one transformation system for both ordinary
+and measured construction. Extraction and measurement are bounded, not
+globally optimal: a wider search can still return a slower program if its
+budget is spread too thinly or timings change with machine state.
+The measurements in Section~\ref{sec:ablation} describe the earlier,
+narrower optimizer, not this construction-time search.
 
 \subsection{Kernel archetypes and specialization}
 
@@ -1125,10 +1142,11 @@ and its memory budget remain future work.
 \section{Ablations and Gap Analysis}
 \label{sec:ablation}
 
-\subsection{Greedy rewriting versus equality saturation}
+\subsection{Earlier graph-rewrite ablation}
 
-The current rewrite set is small and mostly locally profitable. In CPU-only
-ablation runs, greedy rewriting reaches essentially the same active node
+Before calibrated construction, the rewrite set was small and mostly
+locally profitable. In those CPU-only ablation runs, greedy rewriting
+reached essentially the same active node
 counts as windowed or outlined egglog. Representative SmolLM inference
 optimization took 0.089\,ms with greedy rewriting, 32.6\,ms with windowed
 egglog, and 2.94\,ms with repeated-region outlining. Whole-graph saturation
@@ -1136,14 +1154,15 @@ took 56.2\,ms for inference and 7.43\,s for the differentiated graph.
 End-to-end GPU time for the e-graph modes was within run-to-run variation of
 greedy.
 
-This is a negative result for a strong ``e-graphs make \system{} fast'' claim.
-The rewrite rules provide small benefits, but equality saturation has no
-demonstrated runtime advantage over their deterministic fixed point. We
-therefore use greedy rewriting as the production default and retain egglog as
-research infrastructure for future non-local alternatives. This complements
-TENSAT and Glenside~\cite{yang2021tensat,smith2021glenside}: equality
-saturation becomes compelling when the representation and rewrite set create
-meaningful global choices, not merely because a graph is a tensor graph.
+Those results did not show a runtime advantage from changing the rewrite
+engine alone. They motivated the earlier greedy default, which has since
+been removed. The current e-graph path keeps structural alternatives until
+their kernel implementations can be measured, rather than extracting one
+graph and comparing node counts. The historical timings above do not
+measure that policy or establish its performance. As in TENSAT and
+Glenside~\cite{yang2021tensat,smith2021glenside}, the useful question is which
+implementation choices the representation makes available, not whether the
+compiler uses an e-graph by itself.
 
 \subsection{Cooperative matrices and epilogues}
 
@@ -1329,8 +1348,10 @@ provide reusable equality-saturation and fixpoint-reasoning infrastructure
 \cite{willsey2021egg,zhang2023egglog}. TENSAT applies equality saturation and
 global extraction to tensor graphs~\cite{yang2021tensat}, while Glenside uses
 access patterns for low-level tensor rewriting~\cite{smith2021glenside}.
-\system{} contributes neither a new e-graph data structure nor a pure tensor IR;
-its useful result here is the production ablation against greedy rewriting.
+\system{} contributes neither a new e-graph data structure nor a pure tensor IR.
+It combines bounded extraction with qualified measurements of complete
+implementations in the deployment runtime. The earlier rewrite ablation
+records why changing the rewrite engine alone was insufficient.
 
 \paragraph{Performance portability.}
 Pennycook et al.\ argue that portability must be measured over an explicit
@@ -1441,8 +1462,8 @@ several conversion/runtime boundaries into one inspectable compiler and
 artifact. The experience identifies the boundaries that currently scale:
 precision policy must propagate through autodiff, pipeline geometry and
 epilogues must be selected together, static execution can hide graph capture
-from the application, greedy rewriting is more practical than equality
-saturation for the present local rule set, and generated WGSL is more
+from the application, graph alternatives need to compete with their kernel
+implementations rather than only an estimated cost, and generated WGSL is more
 maintainable than direct Naga-IR authoring. The result is therefore both a
 usable implementation and a map of the remaining work required for portable
 training and inference to become routine.

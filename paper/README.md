@@ -12,6 +12,10 @@ python3 mktables.py   # regenerates tables/*.tex, the ratio figure, and facts
 ```
 
 Both revisions are preserved under the public tag `paper-arxiv-1`.
+The compiler description follows the current e-graph implementation. Historical
+greedy/equality-saturation ablations remain explicitly labeled; changing that
+description does not update the frozen tables or turn them into measurements of
+calibrated construction.
 `dinovision-section.tex` is the frozen fragment from
 `kvark/dinovision/experiments`; update it from there, not in place.
 
@@ -40,6 +44,11 @@ The P3HPC paper has been accepted. See the
 [official submission page](https://p3hpc.org/workshop/2026/submissions/)
 for venue requirements and the [current evidence guide](p3hpc/RESULTS.md)
 for the final common-revision cohort.
+
+The next collection uses Inferena protocol v11: private kernel tuning shares
+the session deadline, and both engines warm each phase for at least five calls
+and two seconds. Until those results arrive, the P3HPC tables and measured
+methodology continue to describe v10. Do not relabel the old records as v11.
 
 Replay the camera-ready evidence without a GPU, from the repository root
 with the nine current archives and the separately retained earlier cohort

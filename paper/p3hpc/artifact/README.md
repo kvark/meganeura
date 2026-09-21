@@ -2,11 +2,18 @@
 
 ## Current paper evidence
 
-The September 21 v10 cohort contains 193 valid GPU pairs, a PyTorch/HIP
-failure on Radeon 780M, a manual interrupt on RX 7900 XT, and 20 passing
+The September 21 v10 cohort contains 205 valid GPU pairs, a PyTorch/HIP
+failure on Radeon 780M, a complete replacement RX 7900 XT campaign, and 20 passing
 graphics-only qualification conditions. Inferena `06f2f800` and Meganeura
-`dbb43648` are the current measured revisions. No failed condition is
-replaced with a retry or an older timing.
+`dbb43648` are the current measured revisions. The complete 7900 XT archive
+replaces the accidental Ctrl-C campaign as a whole; its replicates are not
+spliced with earlier results. The 780M failure remains.
+
+The next collection uses v11, with a shared native search deadline and a
+two-second minimum workload warmup on both engines. This auditor and its
+pinned hashes still describe v10. Earlier supplementary ZIPs must be
+regenerated after the AMD replacement; they are not updated by changing these
+sources and tables.
 
 Eight earlier v9 archives, at Inferena `fa5a04e1` and Meganeura `428fc2d2`,
 support the version comparison and H100 135M/360M/1.7B size series.
@@ -31,8 +38,8 @@ GiB. No GPU or network is used. Nine LaTeX fragments and a 70-row current
 GPU-condition CSV are regenerated; CPU-oracle timings are excluded.
 
 The ratio table includes partial conditions with their actual counts.
-Aggregates require three pairs in all five workloads: six strict platforms
-and five accelerated platforms. Earlier rows, failure details and search
+Aggregates require three pairs in all five workloads: seven strict platforms
+and six accelerated platforms. Earlier rows, failure details and search
 summaries are exported separately.
 
 ## Self-contained supplementary replay
@@ -60,15 +67,16 @@ The checker reads these as data and never executes archive contents.
 The original archive hashes identify provenance; the supplement's
 `MANIFEST.sha256` protects the packaged stream itself.
 
-The two supplied AMD logs and their final runner logs are included
-separately. Ordinary text logs, executables, weights, caches, and traces
+The supplied 780M failure log and its final runner log are included
+separately. The obsolete 7900 XT interrupt is not a failure in the selected
+campaign. Ordinary text logs, executables, weights, caches, and traces
 are omitted. Full replay/native qualification reports do not contain all
 tensor elements; the checker cannot reconstruct elements never retained.
 
 The separate H100 search pilot retains its own analyzer and never enters
 current aggregates. The original MI300X report is not a timing result.
-The PDF and both ZIP files remain outside Git. No benchmark was launched
-during this update.
+The PDF and both ZIP files remain outside Git. Local v11 acceptance runs
+do not enter the v10 paper tables or supplementary record stream.
 
 ## Original-submission artifact (legacy)
 

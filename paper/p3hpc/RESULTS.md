@@ -2,8 +2,15 @@
 
 The current paper uses the v10 collection. It keeps partial campaigns,
 graphics-only qualification, and the earlier H100 size study separate.
-No benchmark, retry, protocol change, or outlier removal was performed
-during this paper update.
+The replacement RX 7900 XT archive is complete; it supersedes the accidentally
+interrupted upload. No old and new replicates are spliced together.
+
+The next collection is **v11**, at Inferena `c8adf75741ffa2fd078e22c63e0aa94f1f23d90c`:
+kernel tuning uses the remaining shared session deadline, and both engines
+warm each phase for at least five calls and two seconds. Numerical gates,
+checkpoints, engine pins and reference compilation/replay settings are unchanged.
+Local acceptance runs are separate from this paper's v10 evidence. Do not change
+the measured methodology or tables to v11 until that cohort is collected.
 
 ## Identity and health
 
@@ -28,23 +35,20 @@ the earlier engine, `428fc2d2`; it was not moved.
 | RTX 5070, Linux | 30 / 30 | Complete |
 | H100 80GB, Linux | 30 / 30 | Complete |
 | RTX 3050, Windows | 30 / 30 | Complete |
-| RX 7900 XT | 18 / 30 | Interrupted during r2 accelerated ResNet |
+| RX 7900 XT | 30 / 30 | Complete |
 | Radeon 780M | 25 / 30 | PyTorch/HIP failure during r3 accelerated SmolLM2 |
 | Arc B570 | 30 / 30 | Complete |
 | Apple M3 | 30 / 30 | Complete |
 
-Total: **193 valid pairs, one failed pair, one interrupted pair, and 15
-unreached pairs**. The 780M has all 15 strict pairs. The 7900 XT has two
-strict replicates per workload; accelerated ResNet and Whisper have one,
-and its other accelerated conditions have two. All five accelerated 780M
+Total: **205 valid pairs, one failed pair, and four unreached pairs**.
+The 780M has all 15 strict pairs. All five accelerated 780M
 conditions have two valid pairs.
 
 The 780M log reports an unspecified HIP launch failure during training
 preparation, after compilation completed in 67.584 seconds. Meganeura's
 record for that failed pair is successful, but it is not a paired timing.
-The 7900 XT log records Ctrl-C/KeyboardInterrupt. Its runner stops after
-announcing PyTorch, with a still-running compilation receipt and no result
-JSON. That does not establish a compiler timeout or framework crash.
+The replacement 7900 XT campaign has no failed condition. Its original
+Ctrl-C log is not a framework crash and no longer describes the selected data.
 
 | Graphics-only qualification | Native identity | Passed conditions |
 |---|---|---:|
@@ -66,13 +70,13 @@ Vulkan qualification, not the diagnosis of those earlier GPU failures.
 Every completed pair passes the offline audit: raw/joined identity, source
 and checkpoint identity, timing medians, outer numerical gates, full replay
 statistics, and native construction/qualification receipts. Maxima across
-193 GPU and 20 CPU-oracle pairs are 0.6281% sampled-output L2, 0.07954% loss,
+205 GPU and 20 CPU-oracle pairs are 0.6281% sampled-output L2, 0.07954% loss,
 2.7218% total-gradient-norm error, and 3.0470% parameter-norm-vector L2.
 Every pair individually meets the 5% gradient limits.
 
-The five complete GPU campaigns' stored replication reports match the
+The six complete GPU campaigns' stored replication reports match the
 recomputed values. The auditor also recomputes the three-process rule for
-strict 780M, whose interrupted campaign has no final report. Incomplete
+strict 780M, whose failed campaign has no final report. Incomplete
 groups are never described as having completed that rule.
 
 ## Performance and the comparison with the earlier cohort
@@ -84,18 +88,18 @@ to have three valid process pairs for that device and arithmetic contract.
 
 | Contract / phase | Median ratio | Nominal native wins | Platform count |
 |---|---:|---:|---:|
-| Strict inference | 1.988 | 5 / 30 | 6 |
-| Strict minimal shape | 1.575 | 10 / 30 | 6 |
-| Strict F+L+B | 2.294 | 2 / 30 | 6 |
-| Accelerated inference | 2.746 | 1 / 25 | 5 |
-| Accelerated minimal shape | 1.746 | 4 / 25 | 5 |
-| Accelerated F+L+B | 3.263 | 0 / 25 | 5 |
+| Strict inference | 1.851 | 9 / 35 | 7 |
+| Strict minimal shape | 1.286 | 13 / 35 | 7 |
+| Strict F+L+B | 2.154 | 5 / 35 | 7 |
+| Accelerated inference | 2.322 | 5 / 30 | 6 |
+| Accelerated minimal shape | 1.544 | 8 / 30 | 6 |
+| Accelerated F+L+B | 3.051 | 3 / 30 | 6 |
 
-Strict includes 780M but excludes 7900 XT. Accelerated excludes both AMD
-devices. Different platform populations prevent using these aggregate
+Strict includes all seven GPU-reference platforms. Accelerated excludes the
+partial 780M sweep. Different platform populations prevent using these aggregate
 differences as a precision ablation. Strict Pennycook workload means are
-0.47/0.93 inference, 0.58/0.91 minimal, and 0.38/0.99 training
-(Meganeura/PyTorch), over the same six systems for every workload.
+0.51/0.92 inference, 0.62/0.79 minimal, and 0.41/0.97 training
+(Meganeura/PyTorch), over the same seven systems for every workload.
 
 For the version comparison, the earlier v9 data use Inferena `fa5a04e1`
 and Meganeura `428fc2d2`. Both cohorts already enable native tuning,
@@ -108,12 +112,12 @@ Using exactly the current aggregate's devices and workloads on both sides:
 
 | Contract / phase | Earlier ratio | Current ratio |
 |---|---:|---:|
-| Strict inference | 1.938 | 1.988 |
-| Strict minimal | 1.510 | 1.575 |
-| Strict training | 2.580 | 2.294 |
-| Accelerated inference | 2.623 | 2.746 |
-| Accelerated minimal | 1.751 | 1.746 |
-| Accelerated training | 3.513 | 3.263 |
+| Strict inference | 1.830 | 1.851 |
+| Strict minimal | 1.284 | 1.286 |
+| Strict training | 2.467 | 2.154 |
+| Accelerated inference | 2.462 | 2.322 |
+| Accelerated minimal | 1.615 | 1.544 |
+| Accelerated training | 3.079 | 3.051 |
 
 Useful native changes include 1.59x faster strict one-token SmolLM2 and
 1.46x faster diffusion training on RTX 5070, and 1.99x faster minimal
@@ -121,9 +125,8 @@ SmolVLA on B570. Regressions include H100 strict SmolLM2/SmolVLA minimal
 forwards taking 1.75x/2.62x as long, and B570 strict ResNet training taking
 1.29x as long. The corresponding PyTorch medians change by less than 1%.
 
-The partial 7900 XT data remain encouraging: strict SmolLM2 and SmolVLA
+The complete 7900 XT data remain encouraging: strict SmolLM2 and SmolVLA
 minimal ratios are 0.19 and 0.22, with SmolVLA training at 0.61.
-They are not a substitute for its missing third replicate.
 
 M3 strict diffusion inference spans 6.384–36.048 ms across process medians;
 RTX 5070 strict minimal SmolVLA spans 1.116–2.029 ms. All observations remain
@@ -140,16 +143,16 @@ class cap and 1 GiB scratch. Plans/snapshots are bounded separately by 75%
 of reported available memory. Large graphs explore one verified repeated
 region; this is not exhaustive graph scheduling.
 
-The 193 completed GPU pairs contain 541 sessions and 8,832 program trials.
-83 sessions select a non-ordinary graph; 167 report unfinished program
-search, and 234 report bounded/truncated alternative extraction. The longest
-session search is 66.121 seconds. 117 sessions report no suitable bounded
+The 205 completed GPU pairs contain 574 sessions and 9,462 program trials.
+88 sessions select a non-ordinary graph; 171 report unfinished program
+search, and 246 report bounded/truncated alternative extraction. The longest
+session search is 66.121 seconds. 123 sessions report no suitable bounded
 repeated region and retain the ordinary graph while exploring physical choices.
 
-Private probes visit 122,352 / 171,875 kernel-class instances across programs.
-Outcomes include 12,082 FasterCandidate, 76,238 KeepBaseline, 1,240 InvalidOutput,
-and 2,566 TimeBudget entries. Whole-program qualification rejects another
-86 trials. Rejected challengers cannot win. Repeated/reused comparisons are
+Private probes visit 132,616 / 183,671 kernel-class instances across programs.
+Outcomes include 13,098 FasterCandidate, 81,114 KeepBaseline, 1,481 InvalidOutput,
+and 2,639 TimeBudget entries. Whole-program qualification rejects another
+108 trials. Rejected challengers cannot win. Repeated/reused comparisons are
 not distinct algorithms, and replacement counts are not graph-level speedups.
 
 M3 uses 2,443 cooperative dispatch instances in strict mode. No measured
@@ -159,14 +162,14 @@ path supports only square shapes; it records zero cooperative dispatches
 in both contracts. Its poor matrix performance is not evidence that the
 hardware lacks matrix acceleration.
 
-Across 30 fully replicated strict groups, native preparation medians span
-19.378–188.445 seconds (median 105.325), versus 1.876–84.175 PyTorch
-(median 31.239). H100 totals 47.34 minutes native preparation versus 14.12
+Across 35 fully replicated strict groups, native preparation medians span
+13.759–188.445 seconds (median 92.294), versus 1.876–84.175 PyTorch
+(median 30.327). H100 totals 47.34 minutes native preparation versus 14.12
 minutes default compilation. Native search is not generally cheaper here.
 
-Across completed GPU pairs, private kernel search totals 95.43 minutes,
-candidate initialization 57.40, and full-program qualification callbacks
-64.35. Trial elapsed time includes these components and must not be added
+Across completed GPU pairs, private kernel search totals 98.42 minutes,
+candidate initialization 59.80, and full-program qualification callbacks
+67.21. Trial elapsed time includes these components and must not be added
 to them as a separate partition. The broader construction boundary also
 prevents treating an old/new `compile_s` ratio as shader-compiler slowdown.
 
@@ -217,5 +220,7 @@ python cohort.py records.jsonl.xz --check tables --output regenerated
 The audit regenerates nine LaTeX fragments and a 70-row current GPU-condition
 CSV, plus separately labeled earlier conditions, failures, and search summaries.
 No CPU-reference timings appear in that CSV. Raw artifacts and publication
-binaries remain outside Git. The two supplied AMD logs and their final runner
-logs are included in the supplement, not just summarized in the prose.
+binaries remain outside Git. The selected 780M failure log and its final runner
+log belong in the supplement. The obsolete 7900 XT interrupt log does not
+describe the replacement archive. Existing PDF/ZIP packages still need
+regeneration; they do not change when this source tree is edited.

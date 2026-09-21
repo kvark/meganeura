@@ -100,6 +100,16 @@ splits and convolution weight splits use the existing compiler, with no
 session-buffer patching. There is no reusable command recording or separate
 live structural tuner.
 
+The collection harness gives private probes the remaining shared session
+deadline, not an independent two-second slice. The shorter slices repeatedly
+interrupted expensive qualification on B570 SmolLM2 and left later, repeated
+matrix classes untuned. Completing the ordinary candidate's kernel search
+first recovered a faster incumbent without adding another optimizer. This is
+budget allocation, not a monotonic-performance guarantee: an exhausted total
+budget or a change in execution state can still defeat that expectation.
+Held-out inference and minimal-shape measurements must check the selected plan;
+training improvements do not compensate for inference regressions.
+
 This is a bounded first implementation, not exhaustive graph scheduling. Small
 graphs are searched together. Larger pure graphs can expose all operators with
 rewrite rules, with other operators as opaque cut edges, within the same node

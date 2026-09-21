@@ -42,13 +42,14 @@ Graphics application programming interfaces (APIs) already reach most
 consumer graphics processing units (GPUs). Can they also support a useful
 machine-learning runtime? Meganeura is a compact native compiler and runtime
 that lowers tensor graphs and automatic differentiation to Vulkan and Metal.
-Its compilation step measures alternative graph and kernel implementations.
+Its compilation step retains graph alternatives in an e-graph and measures
+their kernel implementations.
 We compare five workloads with compiled PyTorch at one source revision,
 using CUDA, HIP, and XPU graph replay where available.
-The seven-platform collection retains 193 numerically valid process pairs;
-two AMD campaigns stop early. Across six fully replicated strict
+The seven-platform collection retains 205 numerically valid process pairs;
+the Radeon 780M campaign stops early. Across seven fully replicated strict
 32-bit floating-point configurations, median inference and training times
-are $1.99\times$ and $2.29\times$ PyTorch's.
+are $1.85\times$ and $2.15\times$ PyTorch's.
 Broader search improves some workloads but adds preparation cost and does
 not prevent regressions. Two further integrated GPUs pass all ten
 qualification conditions through Vulkan without a usable PyTorch GPU path.
@@ -190,15 +191,19 @@ tuned before complete programs are compared.}
 \system{} executes a typed static tensor graph (Figure~\ref{fig:pipeline}).
 Native builders and importers for Open Neural Network Exchange (ONNX)
 and Neural Network Exchange Format (NNEF) construct the graph.
-Egglog retains equivalent expressions using bounded equality saturation
-\cite{zhang2023egglog}. Large graphs are divided into smaller regions;
-repeated regions reuse the same optimization work. Training adds reverse-mode
+Egglog retains equivalent expressions in an e-graph using bounded equality
+saturation \cite{zhang2023egglog}. It adds alternatives to equivalence classes
+instead of committing to the first profitable local rewrite. Large graphs
+are divided into smaller regions; repeated regions reuse the same optimization
+work. Training adds reverse-mode
 differentiation and, when requested by the application, a stochastic
 gradient descent (SGD) or Adam update.
 The benchmark measures forward, loss, and backward only.
 The ordinary builder extracts one graph by estimated tensor traffic.
 Measured construction keeps several forms until their implementations
-have been timed. Both paths use the same rewrite rules and lowering code.
+have been timed. Both paths use the same e-graph rules, extractor, and lowering
+code; there is no separate greedy optimizer. Estimated tensor traffic orders
+exploration, but does not decide the measured winner.
 
 Code generation uses a small set of reusable kernel families:
 pointwise expressions, reductions, general matrix multiplication (GEMM), convolutions and
@@ -221,10 +226,11 @@ private sessions. It checks candidates against ordinary untuned execution,
 tunes their legal kernels, then compares complete programs with fresh command
 recording and submission. It keeps the current winner unless a candidate
 passes the numerical checks and the paired timing noise guard.
-Graph forms therefore compete with their tuned implementations, rather than
-being discarded before tuning begins.
+Graph forms therefore compete after kernel search, rather than being
+discarded before tuning begins. Finite budgets can leave that search
+incomplete; retaining equivalent expressions does not guarantee faster code.
 
-The benchmark allows four graph forms and 64 programs per session, with a
+The measured v10 protocol allows four graph forms and 64 programs per session, with a
 60-second total search deadline. Each program gets up to two seconds of
 private kernel search and 1\,GiB of scratch space, without a class-count cap.
 The two active plans and state snapshots are bounded by 75\% of reported
@@ -357,7 +363,7 @@ Strict runs require both gradient errors below 5\%.
 The frozen accelerated replication rule requires each error below 10\%
 and the median of three process errors below 5\%, accommodating permitted
 nondeterminism without accepting an unbounded outlier.
-All 193 completed GPU pairs and 20 CPU-oracle qualification pairs
+All 205 completed GPU pairs and 20 CPU-oracle qualification pairs
 individually stay below 5\%. The largest parameter-norm-vector error
 is 3.05\%, sampled-output error 0.628\%, and scalar-loss error 0.0795\%.
 The offline audit also recomputes the three-process gradient rule wherever
@@ -397,12 +403,12 @@ contain all tensor elements for independent offline revalidation.
 \end{table*}
 
 Table~\ref{tab:devices} lists seven GPU-reference configurations.
-RTX~5070, H100, RTX~3050, Arc~B570, and Apple~M3 complete all 30 pairs.
+RTX~5070, H100, RTX~3050, RX~7900~XT, Arc~B570, and Apple~M3
+complete all 30 pairs.
 Radeon~780M retains 25 valid pairs before a PyTorch/HIP launch failure
 in the third accelerated SmolLM2 training preparation. Its strict sweep
-is complete. RX~7900~XT retains 18 pairs before a manual interrupt in
-the second accelerated ResNet run; the log does not establish a framework
-crash or timeout. Neither campaign was retried.
+is complete. The selected RX~7900~XT archive is a complete campaign,
+replacing an accidentally interrupted collection; their records are not mixed.
 RPL-U and the Ryzen~9600X integrated Radeon appear only in
 Table~\ref{tab:qualification}.
 RTX~3050 runs natively on Windows with driver 591.86;
@@ -410,8 +416,8 @@ the other Vulkan campaigns run on Linux, and M3 uses macOS.
 RTX~5070 and B570 share the same host and are measured sequentially,
 not concurrently. B570 uses a secondary PCIe~3.0 $\times$1 link;
 the study does not normalize interconnect bandwidth across platforms.
-The current total is 193 valid GPU pairs out of 210 planned. One further
-pair fails and one is interrupted; 15 are not reached. The two graphics-only
+The current total is 205 valid GPU pairs out of 210 planned. One further
+pair fails and four are not reached. The two graphics-only
 GPUs each pass ten qualification conditions against eager CPU PyTorch,
 one process per condition. Their timings are not reported.
 
@@ -451,7 +457,7 @@ GPUs pass five workloads in both arithmetic contracts, using a CPU oracle.}
 \centering
 \resizebox{\textwidth}{!}{\input{tables/smollm2}}
 \caption{Strict SmolLM2-135M wall times on the seven GPU-reference systems.
-Bars are medians of three process medians, except RX~7900~XT ($n=2$).
+Bars are medians of three process medians.
 Whiskers show the observed process range, not confidence intervals.
 All native sessions enable tuning;
 all references compile, with replay on CUDA/HIP/XPU.
@@ -462,19 +468,18 @@ workloads, not additive phases or CPU/GPU partitions.}
 
 \subsection{Performance under bounded preparation}
 
-Across the six fully replicated strict configurations, median ratios are
-1.99 for inference, 1.58 for minimal shapes, and 2.29 for training.
-Meganeura is nominally faster in 5/30, 10/30, and 2/30 comparisons.
-The accelerated aggregate covers five configurations, excluding both
-partial AMD sweeps: ratios are 2.75, 1.75, and 3.26, with 1/25, 4/25,
-and 0/25 nominal wins. Different platform sets make these aggregates
+Across the seven fully replicated strict configurations, median ratios are
+1.85 for inference, 1.29 for minimal shapes, and 2.15 for training.
+Meganeura is nominally faster in 9/35, 13/35, and 5/35 comparisons.
+The accelerated aggregate covers six configurations, excluding the
+partial 780M sweep: ratios are 2.32, 1.54, and 3.05, with 5/30, 8/30,
+and 3/30 nominal wins. Different platform sets make these aggregates
 unsuitable for measuring the effect of arithmetic precision.
 
 The Radeons remain Meganeura's strongest platforms. On 780M, strict
 SmolLM2 and SmolVLA beat PyTorch in all three phases; Whisper inference
-is also faster. The partial RX~7900~XT data show SmolLM2 and SmolVLA
+is also faster. RX~7900~XT shows SmolLM2 and SmolVLA
 minimal-shape ratios of 0.19 and 0.22, and SmolVLA training at 0.61.
-These two-process observations are useful, but not a completed sweep.
 Arc~B570's reference wins every phase: strict inference ratios span
 2.20--4.58 and training 3.23--5.53. M3 wins diffusion inference (0.47)
 and four strict minimal shapes, but none of the training comparisons.
@@ -498,8 +503,8 @@ $1.46\times$ faster. B570's minimal SmolVLA is $1.99\times$ faster.
 But strict H100 SmolLM2 and SmolVLA minimal forwards take $1.75\times$
 and $2.62\times$ as long, and B570 ResNet training takes $1.29\times$
 as long. The corresponding PyTorch medians change by less than 1\%.
-Over the same six strict platforms, the training ratio improves from
-2.58 to 2.29, while inference changes from 1.94 to 1.99.
+Over the same seven strict platforms, the training ratio improves from
+2.47 to 2.15, while inference changes from 1.83 to 1.85.
 These are version-to-version observations, not a search-off/on ablation.
 
 Some process ranges are wide. M3 strict diffusion inference spans
@@ -519,20 +524,20 @@ machine state or the selected implementation caused that variation.
 \input{tables/search}
 \end{table*}
 
-Table~\ref{tab:search} counts search work in the 193 completed GPU pairs,
-including partial campaigns. Their 541 sessions try 8,832 programs.
-In 83 sessions the selected graph differs from ordinary extraction.
-Another 167 sessions report unfinished program search; the longest takes
+Table~\ref{tab:search} counts search work in the 205 completed GPU pairs,
+including the partial campaign. Their 574 sessions try 9,462 programs.
+In 88 sessions the selected graph differs from ordinary extraction.
+Another 171 sessions report unfinished program search; the longest takes
 66.12\,s against the soft 60-second deadline.
-Extraction separately reports truncation in 234 sessions. In 117 sessions
+Extraction separately reports truncation in 246 sessions. In 123 sessions
 the large graph has no suitable repeated region, so search keeps its
 ordinary graph and explores physical implementations only.
 This is bounded search, not exhaustive optimization.
 
-Across program trials, private probes visit 122,352 of 171,875 eligible
+Across program trials, private probes visit 132,616 of 183,671 eligible
 kernel-class instances. Repeated classes and reused comparisons mean
-these counts are not distinct algorithms. There are 12,082 accepted
-kernel replacements, 1,240 kernel-output rejections, and 86 whole-program
+these counts are not distinct algorithms. There are 13,098 accepted
+kernel replacements, 1,481 kernel-output rejections, and 108 whole-program
 output rejections. Rejected candidates cannot replace the checked winner.
 An accepted local change is not proof of an end-to-end speedup over another
 compiler revision or under a later machine state.
@@ -597,7 +602,7 @@ law or a production LLM serving/training benchmark.
 \subsection{Conditional performance portability}
 
 \begin{table}[t]
-\caption{Strict scores over six fully replicated GPU configurations.}
+\caption{Strict scores over seven fully replicated GPU configurations.}
 \label{tab:pp}
 \centering
 \small
@@ -616,14 +621,14 @@ P_{i,a,q}=\begin{cases}
 \end{cases}
 \end{equation}
 Best means the faster valid result of these two engines under the declared
-policies. Table~\ref{tab:pp} uses the same six GPU-reference systems for
+policies. Table~\ref{tab:pp} uses the same seven GPU-reference systems for
 every workload and phase. Its final row is the arithmetic mean of the five
 workload scores, not a new harmonic aggregate over applications.
-Meganeura/PyTorch means are 0.47/0.93 for inference, 0.58/0.91 for minimal
-shapes, and 0.38/0.99 for training.
+Meganeura/PyTorch means are 0.51/0.92 for inference, 0.62/0.79 for minimal
+shapes, and 0.41/0.97 for training.
 
-The set excludes the incomplete RX~7900~XT sweep, both CPU-oracle
-qualifications, the earlier H100 size study, and MI300X. It is a performance
+The set excludes both CPU-oracle qualifications, the earlier H100 size
+study, and MI300X. It is a performance
 score on shared, fully replicated configurations, not universal support.
 If support is required across every attempted GPU, both stacks have a
 known hole and hence a zero score: PyTorch on RPL-U, Meganeura on MI300X.
@@ -753,9 +758,11 @@ log run visits only five of 71 eligible training classes before its
 2.005\,s soft deadline. The small-output family is never visited:
 priority is estimated arithmetic volume, not measured execution time.
 Selected shape-specialized convolution variants are present elsewhere.
-The current compiler explores more graph and kernel choices, but each
-program still has only two seconds for private probes. Visiting the
-expensive classes early remains important. Small-output,
+The v10 policy explores more graph and kernel choices, but each program
+has only two seconds for private probes. A larger domain can then reduce
+coverage of later kernel classes. The incumbent protects earlier measured
+choices, not the previous revision's fully tuned performance. Budget allocation
+matters as much as retaining equivalent graph forms. Small-output,
 long-reduction kernels also need more parallel decompositions;
 past split-reduction candidates failed numerical qualification, so they
 remain research targets rather than ready optimizations.
@@ -845,19 +852,19 @@ complete application time to first answer.
 \input{tables/preparation}
 \end{table*}
 
-Table~\ref{tab:preparation} sums the 193 completed process pairs, with
+Table~\ref{tab:preparation} sums the 205 completed process pairs, with
 partial campaign counts shown explicitly. H100 spends 47.34 minutes in
 native preparation versus 14.12 in default PyTorch compilation.
-Across the six fully replicated strict configurations, process-median
-preparation spans 19.38--188.45\,s native and 1.88--84.18\,s PyTorch.
-The medians over these 30 workload/device groups are 105.33 and 31.24\,s.
+Across the seven fully replicated strict configurations, process-median
+preparation spans 13.76--188.45\,s native and 1.88--84.18\,s PyTorch.
+The medians over these 35 workload/device groups are 92.29 and 30.33\,s.
 Completed reference compilations remain below the 120-second deadline.
 
 The wider native search is expensive. Strict ResNet preparation takes
 66.73 versus 13.15\,s on RTX~5070 and 125.53 versus 6.00\,s on M3.
-Across completed GPU pairs, private kernel search accounts for 95.43
-cumulative minutes, candidate initialization for 57.40, and full-program
-qualification callbacks for 64.35. Much of this work is allocation,
+Across completed GPU pairs, private kernel search accounts for 98.42
+cumulative minutes, candidate initialization for 59.80, and full-program
+qualification callbacks for 67.21. Much of this work is allocation,
 transfer, and checking, not shader translation. A smaller shader compiler
 does not make repeated whole-model construction cheap.
 These costs are measured, not inferred from the nominal deadline.
@@ -935,8 +942,7 @@ for that pair is successful, but no paired timing is admitted. Earlier
 accelerated pairs passed, so this is intermittent availability, not a
 claim that the device can never execute the workload.
 The ROCm-specific overrides and failures are a concrete portability cost;
-the Vulkan path does not need those overrides. The RX~7900~XT interrupt
-has insufficient evidence for the same attribution. Windows, meanwhile,
+the Vulkan path does not need those overrides. Windows, meanwhile,
 completes all 30 pairs through Vulkan and compiled, replayed CUDA.
 Earlier max-autotune findings are separate from these current records.
 \footnote{\href{https://github.com/kvark/inferena/blob/06f2f800a4a57254d25b3331f1876631305a15ab/EXPERIMENT.md}{Inferena protocol and bring-up notes, revision \code{06f2f800}}.}
@@ -1067,8 +1073,8 @@ All primary references compile; CUDA/HIP/XPU use qualified replay, while
 MPS has no equivalent public whole-phase API. XPU's recorded embedding
 and math-attention accommodations are not an unmodified stock execution path.
 The CPU-oracle qualifications and earlier H100/MI300X studies remain
-separate. Strict aggregates cover six complete configurations;
-accelerated aggregates cover five. Partial AMD observations are shown
+separate. Strict aggregates cover seven complete configurations;
+accelerated aggregates cover six. Partial 780M observations are shown
 with their actual counts. Excluding them from aggregates changes the
 platform population, so results must be read with the availability table.
 
@@ -1107,7 +1113,7 @@ Strict f32 constrains permissions, not operation order or bitwise identity.
 Cross-engine sampled outputs and gradient norms can miss localized or sign
 errors. Full-element replay qualification checks PyTorch against itself;
 it does not turn the cross-engine gate into an elementwise gradient
-comparison. All 193 completed GPU pairs and 20 qualification pairs
+comparison. All 205 completed GPU pairs and 20 qualification pairs
 individually pass the 5\% gradient bound. Groups with three pairs also
 pass the replicated rule; partial groups have not completed it.
 Replay's fixed tensor maximum/RMS
@@ -1156,12 +1162,12 @@ measured capability of the present system.
 Graphics APIs provide a useful ML deployment path. Meganeura executes
 inference and backward workloads on consumer GPUs and H100, including
 Windows, and qualifies two integrated GPUs without a usable PyTorch GPU
-path. The current collection retains 193 valid GPU pairs and reports its
-two interrupted campaigns rather than hiding them.
+path. The current collection retains 205 valid GPU pairs and reports
+the 780M failure alongside its completed conditions.
 
-PyTorch still leads most timing comparisons. Across six fully replicated
-strict configurations, median inference and training times are $1.99\times$
-and $2.29\times$ PyTorch's. Broader graph and kernel search improves several
+PyTorch still leads most timing comparisons. Across seven fully replicated
+strict configurations, median inference and training times are $1.85\times$
+and $2.15\times$ PyTorch's. Broader graph and kernel search improves several
 workloads, but also exposes regressions and substantial preparation cost.
 The earlier 1.7B study extends the evidence to larger models; it does not
 establish the new optimizer's scaling.
@@ -1197,7 +1203,7 @@ The public \href{https://github.com/kvark/meganeura/tree/dbb43648b31237409075bbd
 current measured revisions \code{dbb43648} and \code{06f2f800}.
 The \href{https://github.com/kvark/inferena/tree/06f2f800a4a57254d25b3331f1876631305a15ab}{frozen Inferena workflow}
 contains the collection instructions. Nine current archives hold seven
-measurement campaigns, two incomplete, and two CPU-oracle qualifications.
+measurement campaigns, one incomplete, and two CPU-oracle qualifications.
 Eight earlier archives support the version comparison and H100 size study;
 their records remain separate. Meganeura's existing tag
 \code{paper-p3hpc-2026} identifies that earlier engine, not the current one.
@@ -1205,8 +1211,8 @@ The supplementary ZIP contains every JSON
 record from these archives, losslessly recompressed as
 \path{records.jsonl.xz}: manifests, raw and joined records, all timing
 samples, output samples, parameter norms, search and full replay reports.
-Original archive SHA-256 digests identify provenance. The two supplied
-AMD failure/interrupt logs and the final runner logs are included separately;
+Original archive SHA-256 digests identify provenance. The supplied
+780M failure log and its final runner log are included separately;
 ordinary runner logs, weights, executables, caches and trace binaries are
 omitted. The earlier H100 pilot and MI300X report are also included.
 Measurement artifacts remain outside Git.
