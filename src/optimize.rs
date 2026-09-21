@@ -103,19 +103,13 @@ impl Default for OptimizeConfig {
 }
 
 // ---------------------------------------------------------------------------
-// HBM-traffic-aware cost model for e-graph extraction.
-//
-// Per-e-class tensor sizes are built after saturation by evaluating each
-// graph node's binding; the cost of an e-node is then the HBM traffic it
-// causes: bytes read (inputs) + bytes written (output). A fusion wins by
-// exactly the intermediate traffic it eliminates — FusedMatMulAdd(a,b,d)
-// saves the write and re-read of the matmul's result tensor — with no
-// hand-tuned constants, and unprofitable rewrites (future: Winograd vs
-// implicit GEMM, layout conversions, rematerialization) can lose on real
-// numbers.
+// Logical tensor traffic for e-graph extraction: input bytes plus output
+// bytes, not measured HBM transactions. This tree estimate ignores cache
+// reuse, shared subexpressions, arithmetic and occupancy. It orders bounded
+// exploration; measured construction compares the lowered implementations.
 // ---------------------------------------------------------------------------
 
-/// Cost model that prefers the expression with the least HBM traffic.
+/// Cost model that prefers the expression with the least logical tensor traffic.
 #[derive(Default, Debug, Clone)]
 pub struct FusionCostModel {
     /// e-class value → tensor size in bytes.
