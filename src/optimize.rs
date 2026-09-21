@@ -160,12 +160,17 @@ impl egglog::extract::CostModel<u64> for FusionCostModel {
         let Some(sizes) = self.sizes.as_ref() else {
             return 1;
         };
-        // row.vals = [args.., output]. Args missing from the map are
-        // non-tensor primitives (the node-id ints) and read no HBM.
+        // Values are sort-local: an integer node id can have the same raw
+        // value as an unrelated tensor e-class. Only Op arguments read tensors.
         if let Some((out, args)) = row.vals.split_last()
             && let Some(&out_bytes) = sizes.get(out)
         {
-            let read: u64 = args.iter().filter_map(|v| sizes.get(v)).sum();
+            let read = args
+                .iter()
+                .zip(&func.schema().input)
+                .filter(|(_, sort)| sort.name() == "Op")
+                .filter_map(|(value, _)| sizes.get(value))
+                .fold(0u64, |total, bytes| total.saturating_add(*bytes));
             return read.saturating_add(out_bytes);
         }
         // Unknown output e-class (a rewrite-created tensor that no graph
@@ -1580,6 +1585,27 @@ mod tests {
     #[test]
     fn outlined_egglog_is_the_production_default() {
         assert_eq!(OptimizeConfig::default().mode, OptimizeMode::EgglogOutlined);
+    }
+
+    #[test]
+    fn tensor_traffic_does_not_charge_integer_node_ids() {
+        let mut egraph = egglog::EGraph::default();
+        egraph
+            .parse_and_run_program(
+                None,
+                "(datatype Op (Leaf i64) (Op1 i64 Op))
+                 (let a (Leaf 0)) (let b (Op1 1 a))",
+            )
+            .unwrap();
+        let a = egraph.lookup_function("a", &[]).unwrap();
+        let b = egraph.lookup_function("b", &[]).unwrap();
+        assert_eq!(b, egraph.base_to_value(1i64));
+        let cost = FusionCostModel::with_sizes(HashMap::from([(a, 1024), (b, 2048)]));
+        let extractor = Extractor::compute_costs_from_rootsorts(None, &egraph, cost);
+        let (bytes, _) = extractor
+            .extract_best(&egraph, &mut TermDag::default(), b)
+            .unwrap();
+        assert_eq!(bytes, 1024 + 2048);
     }
 
     #[test]
