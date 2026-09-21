@@ -28,6 +28,19 @@ impl Default for FlashAttentionShape {
 }
 
 impl FlashAttentionShape {
+    pub(crate) fn fit_shared_memory(&mut self, head_dim: u32, bytes: u32) {
+        if bytes == 0 {
+            return;
+        }
+        while self.keys > 1 && self.shared_bytes(head_dim) > u64::from(bytes) {
+            self.keys /= 2;
+        }
+        assert!(
+            self.shared_bytes(head_dim) <= u64::from(bytes),
+            "attention staging exceeds device shared memory"
+        );
+    }
+
     pub(crate) fn shared_bytes(self, head_dim: u32) -> u64 {
         let (keys, threads, head_dim) = (
             u64::from(self.keys),
@@ -3501,7 +3514,7 @@ fn generate_flash_attention(
     cached: bool,
 ) -> ShaderModule {
     use std::fmt::Write;
-    assert!(matches!(shape.threads, 128 | 256) && matches!(shape.keys, 8 | 16));
+    assert!(matches!(shape.threads, 128 | 256) && shape.keys.is_power_of_two() && shape.keys <= 16);
     assert!(
         head_dim.is_power_of_two() && head_dim >= 2,
         "attention head_dim must be a power of 2 ≥ 2, got {head_dim}"
@@ -6496,10 +6509,14 @@ mod tests {
 
     #[test]
     fn test_flash_attention_wgsl() {
+        let mut shape = FlashAttentionShape::default();
+        shape.fit_shared_memory(1024, 32768);
+        assert_eq!(shape.keys, 2);
+        assert!(shape.shared_bytes(1024) <= 32768);
         for hd in [32, 64, 128, 256] {
             for ept in [8, 16, 32] {
                 for interleave in [false, true] {
-                    for (threads, keys) in [(256, 8), (128, 16)] {
+                    for (threads, keys) in [(256, 8), (128, 16), (256, 2), (128, 4)] {
                         let sm = generate_flash_attention_module(
                             hd,
                             ept,

@@ -266,7 +266,7 @@ fn implementations(
     if !heads.is_empty() {
         for ept in [32, 16, 8] {
             for threads in [256, 128] {
-                for keys in [8, 16] {
+                for keys in [8, 16, 4] {
                     for interleave in [false, true] {
                         let shape = crate::codegen::FlashAttentionShape {
                             threads,

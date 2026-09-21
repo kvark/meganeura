@@ -3163,6 +3163,17 @@ impl Session {
             !opts.debug,
             opts.coop == CoopPolicy::AllowF16,
         );
+        if let Some(head_dim) = plan
+            .dispatches
+            .iter()
+            .filter(|dispatch| dispatch.shader == ShaderEntry::FlashAttention)
+            .map(|dispatch| dispatch.params[3])
+            .max()
+        {
+            plan.knobs
+                .flash
+                .fit_shared_memory(head_dim, gpu.capabilities().max_compute_shared_memory_size);
+        }
 
         // Reorder dispatches by dependency level so parallel branches (e.g. Q/K/V
         // projections) cluster together, then partition into barrier groups.

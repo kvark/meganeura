@@ -186,7 +186,7 @@ registry! {
     FLASH_THREADS: "MEGANEURA_FLASH_THREADS", U32, Tuning,
         "Forward attention workgroup width: 128 or 256.";
     FLASH_KEYS: "MEGANEURA_FLASH_KEYS", U32, Tuning,
-        "Forward attention shared key/value tile: 8 or 16.";
+        "Forward attention shared key/value tile: power of two up to 16, capped by device shared memory.";
     FLASH_INTERLEAVE: "MEGANEURA_FLASH_INTERLEAVE", Bool, Tuning,
         "Interleave head dimensions across forward attention lanes.";
     FLASH_GRAD_Q_EPT_CAP: "MEGANEURA_FLASH_GRAD_Q_EPT_CAP", U32, Tuning,
@@ -297,7 +297,7 @@ impl TuningKnobs {
                     .unwrap_or(d.flash.threads),
                 keys: FLASH_KEYS
                     .u32_value()
-                    .filter(|v| matches!(v, 8 | 16))
+                    .filter(|v| v.is_power_of_two() && *v <= 16)
                     .unwrap_or(d.flash.keys),
                 interleave: FLASH_INTERLEAVE.bool_or(d.flash.interleave),
             },
