@@ -3506,6 +3506,7 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     //   wg_scores: [BKV][BQ][TPQ] keeps neighboring threads contiguous
     //   wg_dot: [BQ][TPQ] tail reduction
     let _ = writeln!(src, "var<workgroup> shared_k: array<f32, {}>;\n", bkv * hd);
+    let _ = writeln!(src, "var<workgroup> shared_v: array<f32, {}>;\n", bkv * hd);
     let _ = writeln!(
         src,
         "var<workgroup> wg_scores: array<f32, {}>;\n",
@@ -3636,6 +3637,9 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
             src.push_str(
                 "            shared_k[lid.x] = src_b[(t + ki) * kv_dim + kv_head_off + (lid.x % head_dim)];\n",
             );
+            src.push_str(
+                "            shared_v[lid.x] = bias[(t + ki) * kv_dim + kv_head_off + (lid.x % head_dim)];\n",
+            );
             src.push_str("        }\n");
         } else {
             let _ = writeln!(src, "        if lid.x + {offset}u < {k_tile_size}u {{");
@@ -3643,6 +3647,10 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
             let _ = writeln!(
                 src,
                 "            shared_k[lid.x + {offset}u] = src_b[(t + ki2) * kv_dim + kv_head_off + ((lid.x + {offset}u) % head_dim)];"
+            );
+            let _ = writeln!(
+                src,
+                "            shared_v[lid.x + {offset}u] = bias[(t + ki2) * kv_dim + kv_head_off + ((lid.x + {offset}u) % head_dim)];"
             );
             src.push_str("        }\n");
         }
@@ -3679,12 +3687,11 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     src.push_str("                let correction = exp(max_score - new_max);\n");
     src.push_str("                let weight = exp(score - new_max);\n");
     src.push_str("                sum_exp = sum_exp * correction + weight;\n");
-    src.push_str("                let v_base = kv_pos * kv_dim + kv_head_off;\n");
     // Accumulate EPT V elements in registers
     for e in 0..ept {
         let _ = writeln!(
             src,
-            "                out{e} = out{e} * correction + weight * bias[v_base + d_base + {e}u];"
+            "                out{e} = out{e} * correction + weight * shared_v[i * {hd}u + d_base + {e}u];"
         );
     }
     src.push_str("                max_score = new_max;\n");
