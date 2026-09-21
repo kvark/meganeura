@@ -16,6 +16,7 @@
 // FUSED_ADD_DECL/STORE_BODY (addend/epilogue), B_* (weight format).
 
 $ENABLE_F16
+const SPLITS: u32 = $SPLITS_U;
 struct Params {
     m: u32,
     n: u32,
@@ -36,15 +37,20 @@ $B_DEQUANT_FN
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let tx = lid.x;
     let ty = lid.y;
-    let tile_row = ($TILE_ROW) * $BM_U;
+    let tile_row = select(($TILE_ROW), wgid.y, SPLITS > 1u) * $BM_U;
     let tile_col = wgid.x * $BM_U;
     let tid = ty * 16u + tx;
 
     $ACC_DECL
 
-    var t = 0u;
+    let split_id = select(0u, wgid.z, SPLITS > 1u);
+    let tiles = (params.k + $K_TILE_U - 1u) / $K_TILE_U;
+    let first_tile = (tiles / SPLITS) * split_id + min(split_id, tiles % SPLITS);
+    let end_tile = (tiles / SPLITS) * (split_id + 1u) + min(split_id + 1u, tiles % SPLITS);
+    let end_k = min(end_tile * $K_TILE_U, params.k);
+    var t = first_tile * $K_TILE_U;
     loop {
-        if t >= params.k { break; }
+        if t >= end_k { break; }
 
         // Stage A with a padded shared-memory stride.
         for (var e = 0u; e < $STAGE_EPT_U; e++) {
@@ -78,7 +84,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let row = tile_row + ty * $TM_U + i;
             let col = tile_col + $OUTPUT_COLUMN;
             if row < params.m && col < params.n {
-                let idx = $C_INDEX;
+                    let idx = ($C_INDEX) + split_id * params.m * params.n;
                 $STORE_BODY
             }
         }

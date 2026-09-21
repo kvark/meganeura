@@ -208,7 +208,7 @@ pub fn build_measured(
         }
     }
     let preparation_time = start.elapsed();
-    let programs = implementations(seeds, caps);
+    let programs = implementations(seeds, caps, options.max_plan_bytes);
     measure::select(
         programs,
         gpu,
@@ -237,6 +237,7 @@ struct Seed {
 fn implementations(
     seeds: Vec<Seed>,
     caps: crate::codegen::CoopCaps,
+    max_partial_bytes: usize,
 ) -> impl Iterator<Item = measure::Program> {
     let attention = seeds.iter().any(|p| {
         p.graph
@@ -249,16 +250,31 @@ fn implementations(
     } else {
         &[0]
     };
+    // Preserve unsplit products, and test reduction parallelism as a complete
+    // two-dispatch implementation. No architecture or model chooses the winner.
+    let matrices = [
+        (0, 32),
+        (4, 32),
+        (2, 32),
+        (8, 32),
+        (4, 64),
+        (2, 64),
+        (8, 64),
+    ];
     let chunks = [1, 2, 4, 8, 16, 32, 64];
     // Interleave settings across logical forms, starting near ordinary lowering.
     // Lower only the next candidate; do not allocate a Cartesian product of plans.
-    let mut choices = (0..splits.len() + chunks.len() - 1).flat_map(move |rank| {
-        (0..splits.len()).filter_map(move |a| {
-            let c = rank.checked_sub(a)?;
-            chunks.get(c).map(|&chunks| (splits[a], chunks))
+    let mut choices = (0..splits.len() + matrices.len() + chunks.len() - 2).flat_map(move |rank| {
+        (0..splits.len()).flat_map(move |a| {
+            (0..matrices.len()).filter_map(move |m| {
+                let c = rank.checked_sub(a + m)?;
+                chunks
+                    .get(c)
+                    .map(|&chunks| (splits[a], matrices[m], chunks))
+            })
         })
     });
-    let mut current = (0, 1);
+    let mut current = (0, (0, 32), 1);
     let mut seed_index = seeds.len();
     std::iter::from_fn(move || {
         loop {
@@ -268,8 +284,8 @@ fn implementations(
             }
             let seed = seeds.get(seed_index)?;
             seed_index += 1;
-            let (splits, chunks) = current;
-            let plan = if splits == 0 {
+            let (splits, (matrix_splits, tile_size), chunks) = current;
+            let mut plan = if splits == 0 {
                 seed.plan.clone()
             } else {
                 let options = compile::CompileOptions {
@@ -282,9 +298,29 @@ fn implementations(
                 }
                 plan
             };
+            if matrix_splits != 0 {
+                let shape = crate::codegen::ScalarMatmulShape {
+                    tile_size,
+                    k_stage: seed.options.knobs.matmul_k_stage,
+                    interleave_columns: seed.options.knobs.matmul_interleave_columns,
+                };
+                let original_buffers = plan.buffers.len();
+                let mut remaining = max_partial_bytes;
+                for index in (0..plan.dispatches.len()).rev() {
+                    if plan
+                        .split_matmul(index, shape, matrix_splits, remaining)
+                        .is_ok()
+                    {
+                        remaining -= plan.buffers.last().unwrap();
+                    }
+                }
+                if plan.buffers.len() == original_buffers {
+                    continue;
+                }
+            }
             return Some(measure::Program {
                 description: format!(
-                    "{}, attention_splits={splits}, submission_chunks={chunks}",
+                    "{}, attention_splits={splits}, matrix_splits={matrix_splits}, matrix_tile={tile_size}, submission_chunks={chunks}",
                     seed.description
                 ),
                 plan,

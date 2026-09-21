@@ -1074,6 +1074,10 @@ pub enum Kernel {
     Default,
     SmallTile,
     ScalarMatmul(crate::codegen::ScalarMatmulShape),
+    SplitMatmul {
+        shape: crate::codegen::ScalarMatmulShape,
+        splits: u32,
+    },
     SpecializedConv {
         k_tile: u32,
     },

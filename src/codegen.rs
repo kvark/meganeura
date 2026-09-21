@@ -338,6 +338,45 @@ pub fn generate_matmul_with_epilogue(
     epilogue: Option<&crate::compile::MatMulEpilogue>,
     options: MatMulOptions,
 ) -> ShaderModule {
+    generate_partitioned_matmul(group, epilogue, options, 1)
+}
+
+pub(crate) fn generate_split_matmul(
+    group: ShaderGroup,
+    shape: ScalarMatmulShape,
+    splits: u32,
+) -> ShaderModule {
+    assert!(splits >= 2);
+    assert!(matches!(
+        group,
+        ShaderGroup::MatMul | ShaderGroup::MatMulAT | ShaderGroup::MatMulBT
+    ));
+    generate_partitioned_matmul(
+        group,
+        None,
+        MatMulOptions {
+            tile: if shape.tile_size == 32 {
+                MatMulTile::Small
+            } else {
+                MatMulTile::Large
+            },
+            knobs: MatmulKnobs {
+                k_stage: shape.k_stage,
+                interleave_columns: shape.interleave_columns,
+                integer_dot: false,
+            },
+            ..Default::default()
+        },
+        splits,
+    )
+}
+
+fn generate_partitioned_matmul(
+    group: ShaderGroup,
+    epilogue: Option<&crate::compile::MatMulEpilogue>,
+    options: MatMulOptions,
+    splits: u32,
+) -> ShaderModule {
     // Store-side fusion compiles through this generator rather than
     // `generate_module_weighted`, which already refuses quantized BT.
     if matches!(group, ShaderGroup::MatMulBT | ShaderGroup::MatMulBTAdd)
@@ -391,6 +430,7 @@ pub fn generate_matmul_with_epilogue(
         &epi_decl,
         &epi_body,
         options,
+        splits,
     )
 }
 
@@ -1198,6 +1238,7 @@ fn matmul_vars_full(
             tile: MatMulTile::Large,
             knobs,
         },
+        1,
     )
 }
 
@@ -1226,6 +1267,7 @@ fn matmul_vars_tiled(
     epilogue_decl: &str,
     epilogue_body: &str,
     options: MatMulOptions,
+    splits: u32,
 ) -> ShaderModule {
     let MatMulIndexing {
         a_idx,
@@ -1382,6 +1424,7 @@ fn matmul_vars_tiled(
             ("$B_INDEX", b_idx),
             ("$TILE_ROW", tile_row),
             ("$C_INDEX", c_idx),
+            ("$SPLITS_U", &format!("{splits}u")),
             ("$A_ROW", a_row),
             ("$A_COL", a_col),
             ("$B_ROW", b_row),
@@ -1538,6 +1581,7 @@ fn matmul_small_vars(
             tile: MatMulTile::Small,
             knobs,
         },
+        1,
     )
 }
 
@@ -1772,6 +1816,7 @@ fn gen_block_matmul(group: ShaderGroup, tile: MatMulTile) -> ShaderModule {
             tile,
             ..Default::default()
         },
+        1,
     )
 }
 

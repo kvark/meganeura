@@ -1079,6 +1079,7 @@ fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
 /// implementation once; preparation builds exactly the selected pipeline.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Variant {
+    SplitMatmul(ShaderEntry, crate::codegen::ScalarMatmulShape, u32),
     SpecializedConv(ShaderEntry, Vec<u32>, u32),
     ScalarMatmul(
         ShaderEntry,
@@ -1174,6 +1175,7 @@ impl Variant {
         match *self {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
             Variant::Attention(ref e, _)
+            | Variant::SplitMatmul(ref e, _, _)
             | Variant::SpecializedConv(ref e, _, _)
             | Variant::ScalarMatmul(ref e, _, _)
             | Variant::Epilogue(ref e, _)
@@ -1196,6 +1198,9 @@ impl Variant {
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
+            Variant::SplitMatmul(ref e, shape, splits) => {
+                format!("{e:?}:split-k-{splits}-{shape:?}")
+            }
             Variant::ScalarMatmul(ref e, format, shape) => {
                 format!("{e:?}:scalar-{format:?}-{shape:?}")
             }
@@ -1359,6 +1364,9 @@ impl Pipelines {
                 crate::tune::MatmulTile::Scalar(shape),
                 matmul_knobs,
             ),
+            Variant::SplitMatmul(_, shape, splits) => {
+                crate::codegen::generate_split_matmul(group, shape, splits)
+            }
             Variant::SpecializedConv(..) => {
                 let tile = crate::tune::MatmulTile::selected(dispatch, None)
                     .expect("specialized convolution");
@@ -1516,6 +1524,9 @@ impl Pipelines {
     /// which unrelated pipelines happen to have been compiled.
     fn key(dispatch: &Dispatch) -> Variant {
         let entry = dispatch.shader.clone();
+        if let crate::compile::Kernel::SplitMatmul { shape, splits } = dispatch.kernel {
+            return Variant::SplitMatmul(entry, shape, splits);
+        }
         if let Some(shape) = dispatch.scalar_matmul() {
             return Variant::ScalarMatmul(entry, dispatch.weight_format, shape);
         }
@@ -2113,7 +2124,10 @@ pub(crate) fn select_variants(
         // iOS and future 8×8 f32 advertisers need the same veto.
         let apple_f32_coop = !config.use_f16_input && config.tile_size == 8;
         for dispatch in &mut plan.dispatches {
-            if dispatch.conv_k_tile().is_some() || dispatch.scalar_matmul().is_some() {
+            if dispatch.conv_k_tile().is_some()
+                || dispatch.scalar_matmul().is_some()
+                || matches!(dispatch.kernel, crate::compile::Kernel::SplitMatmul { .. })
+            {
                 continue;
             }
             // Autodiff marks derivative work as requiring f32 operands. A
@@ -2316,6 +2330,7 @@ pub(crate) fn select_variants(
             if dispatch.use_coop()
                 || dispatch.use_small_tiles()
                 || dispatch.scalar_matmul().is_some()
+                || matches!(dispatch.kernel, crate::compile::Kernel::SplitMatmul { .. })
                 || dispatch.weight_format.uses_reduced_storage()
             {
                 continue;
