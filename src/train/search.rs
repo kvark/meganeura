@@ -414,8 +414,23 @@ fn implementations(
         .collect();
     let order = physical_program_order(seeds.len(), baseline, &cover, &tail);
     let mut cursor = 0;
+    let mut split_plans = Vec::new();
+    let mut queued_splits = false;
     std::iter::from_fn(move || {
         loop {
+            if let Some(plan) = split_plans.pop() {
+                return Some(plan);
+            }
+            if !queued_splits && cursor > 0 {
+                queued_splits = true;
+                // After the ordinary incumbent. Popped in reverse, so 4 splits
+                // is measured before 8.
+                split_plans = low_occupancy_weight_splits(seeds.first(), max_partial_bytes);
+                split_plans.reverse();
+                if let Some(plan) = split_plans.pop() {
+                    return Some(plan);
+                }
+            }
             if cursor == order.len() {
                 return None;
             }
@@ -477,6 +492,63 @@ fn implementations(
             });
         }
     })
+}
+
+/// Weight-gradient split-K for convolutions that launch only a few dozen
+/// workgroups. Measured whole-step, not installed unless it wins.
+fn low_occupancy_weight_splits(
+    seed: Option<&Seed>,
+    max_partial_bytes: usize,
+) -> Vec<measure::Program> {
+    let Some(seed) = seed else {
+        return Vec::new();
+    };
+    let mut programs = Vec::new();
+    for splits in [4u32, 8] {
+        let mut plan = seed.plan.clone();
+        let selections: Vec<(usize, u32)> = plan
+            .dispatches
+            .iter()
+            .enumerate()
+            .filter_map(|(index, dispatch)| {
+                let weight = matches!(
+                    dispatch.shader,
+                    compile::ShaderEntry::Conv2dGradWeightGemm
+                        | compile::ShaderEntry::Conv2dGradWeightGemmSmall
+                        | compile::ShaderEntry::Conv2dGradWeightGemm16
+                );
+                let groups = dispatch.workgroups[0].saturating_mul(dispatch.workgroups[1]);
+                let k = dispatch
+                    .params
+                    .first()
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_mul(dispatch.params.get(9).copied().unwrap_or(0))
+                    .saturating_mul(dispatch.params.get(10).copied().unwrap_or(0));
+                (weight
+                    && (1..48).contains(&groups)
+                    && matches!(dispatch.conv_k_tile(), None | Some(16))
+                    && splits <= k.div_ceil(16))
+                .then_some((index, splits))
+            })
+            .collect();
+        if selections.is_empty()
+            || plan
+                .split_conv_weight_gradients(&selections, max_partial_bytes)
+                .is_err()
+        {
+            continue;
+        }
+        programs.push(measure::Program {
+            description: format!(
+                "{}, conv_dw_splits={splits}, workgroups<48",
+                seed.description
+            ),
+            plan,
+            submission_chunks: 1,
+        });
+    }
+    programs
 }
 
 #[cfg(test)]

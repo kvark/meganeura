@@ -62,10 +62,13 @@ impl Pipelines {
                     entry,
                     ShaderEntry::Conv2dGemm
                         | ShaderEntry::Conv2dGemmSmall
+                        | ShaderEntry::Conv2dGemm16
                         | ShaderEntry::Conv2dGradInputGemm
                         | ShaderEntry::Conv2dGradInputGemmSmall
+                        | ShaderEntry::Conv2dGradInputGemm16
                         | ShaderEntry::Conv2dGradWeightGemm
                         | ShaderEntry::Conv2dGradWeightGemmSmall
+                        | ShaderEntry::Conv2dGradWeightGemm16
                 )
             });
             if convolution && !used.contains(key) {
@@ -158,7 +161,10 @@ pub(super) fn tile_module(
             MatmulTile::Tile32 => {
                 crate::codegen::generate_module_small(entry.shader_group(), knobs)
             }
-            MatmulTile::Tile64 => crate::codegen::generate_module(entry.shader_group(), knobs),
+            // Tile16's shader entry already names the 16-wide conv group.
+            MatmulTile::Tile16 | MatmulTile::Tile64 => {
+                crate::codegen::generate_module(entry.shader_group(), knobs)
+            }
             MatmulTile::CooperativeF32 { .. } => crate::codegen::generate_module_coop(
                 entry.shader_group(),
                 &tile.coop_config().expect("cooperative candidate"),

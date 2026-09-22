@@ -180,6 +180,7 @@ pub(crate) fn gemv_group(entry: &ShaderEntry) -> Option<crate::codegen::ShaderGr
 /// Implementations with identical bindings and logical extents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MatmulTile {
+    Tile16,
     Tile32,
     Tile64,
     Scalar(crate::codegen::ScalarMatmulShape),
@@ -201,6 +202,67 @@ pub enum MatmulTile {
     Gemv(crate::codegen::GemvShape),
 }
 
+fn conv_launched_tile(shader: &ShaderEntry) -> Option<u32> {
+    match *shader {
+        ShaderEntry::Conv2dGemm16
+        | ShaderEntry::Conv2dGradInputGemm16
+        | ShaderEntry::Conv2dGradWeightGemm16
+        | ShaderEntry::Conv2dGradWeightGemmSplit16 => Some(16),
+        ShaderEntry::Conv2dGemmSmall
+        | ShaderEntry::Conv2dGradInputGemmSmall
+        | ShaderEntry::Conv2dGradWeightGemmSmall
+        | ShaderEntry::Conv2dGradWeightGemmSplitSmall => Some(32),
+        ShaderEntry::Conv2dGemm
+        | ShaderEntry::Conv2dGradInputGemm
+        | ShaderEntry::Conv2dGradWeightGemm
+        | ShaderEntry::Conv2dGradWeightGemmSplit => Some(64),
+        _ => None,
+    }
+}
+
+fn conv_tile_entry(entry: &ShaderEntry, tile: u32) -> Option<ShaderEntry> {
+    let split = matches!(
+        *entry,
+        ShaderEntry::Conv2dGradWeightGemmSplit
+            | ShaderEntry::Conv2dGradWeightGemmSplitSmall
+            | ShaderEntry::Conv2dGradWeightGemmSplit16
+    );
+    enum Family {
+        Basic,
+        Input,
+        Weight,
+    }
+    let family = match *entry {
+        ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGemmSmall | ShaderEntry::Conv2dGemm16 => {
+            Family::Basic
+        }
+        ShaderEntry::Conv2dGradInputGemm
+        | ShaderEntry::Conv2dGradInputGemmSmall
+        | ShaderEntry::Conv2dGradInputGemm16 => Family::Input,
+        ShaderEntry::Conv2dGradWeightGemm
+        | ShaderEntry::Conv2dGradWeightGemmSmall
+        | ShaderEntry::Conv2dGradWeightGemm16
+        | ShaderEntry::Conv2dGradWeightGemmSplit
+        | ShaderEntry::Conv2dGradWeightGemmSplitSmall
+        | ShaderEntry::Conv2dGradWeightGemmSplit16 => Family::Weight,
+        _ => return None,
+    };
+    Some(match (family, split, tile) {
+        (Family::Basic, _, 16) => ShaderEntry::Conv2dGemm16,
+        (Family::Basic, _, 32) => ShaderEntry::Conv2dGemmSmall,
+        (Family::Basic, _, _) => ShaderEntry::Conv2dGemm,
+        (Family::Input, _, 16) => ShaderEntry::Conv2dGradInputGemm16,
+        (Family::Input, _, 32) => ShaderEntry::Conv2dGradInputGemmSmall,
+        (Family::Input, _, _) => ShaderEntry::Conv2dGradInputGemm,
+        (Family::Weight, false, 16) => ShaderEntry::Conv2dGradWeightGemm16,
+        (Family::Weight, false, 32) => ShaderEntry::Conv2dGradWeightGemmSmall,
+        (Family::Weight, false, _) => ShaderEntry::Conv2dGradWeightGemm,
+        (Family::Weight, true, 16) => ShaderEntry::Conv2dGradWeightGemmSplit16,
+        (Family::Weight, true, 32) => ShaderEntry::Conv2dGradWeightGemmSplitSmall,
+        (Family::Weight, true, _) => ShaderEntry::Conv2dGradWeightGemmSplit,
+    })
+}
+
 impl MatmulTile {
     pub(crate) fn native_cooperative(config: Option<&CoopConfig>) -> Option<Self> {
         let config = config?;
@@ -214,17 +276,25 @@ impl MatmulTile {
 
     pub(crate) fn selected(dispatch: &Dispatch, config: Option<&CoopConfig>) -> Option<Self> {
         use crate::compile::Kernel;
-        let small = dispatch.use_small_tiles()
-            || matches!(
-                dispatch.shader,
-                ShaderEntry::Conv2dGemmSmall
-                    | ShaderEntry::Conv2dGradInputGemmSmall
-                    | ShaderEntry::Conv2dGradWeightGemmSmall
-            );
+        let small = dispatch.use_small_tiles();
         if let Some(group) = gemv_group(&dispatch.shader) {
             match dispatch.kernel {
                 Kernel::Default => Some(Self::Gemv(crate::codegen::GemvShape::initial(group))),
                 Kernel::Gemv { shape, .. } => Some(Self::Gemv(shape)),
+                _ => None,
+            }
+        } else if let Some(launched) = conv_launched_tile(&dispatch.shader) {
+            match dispatch.kernel {
+                Kernel::Default | Kernel::SmallTile => Some(match launched {
+                    16 => Self::Tile16,
+                    32 => Self::Tile32,
+                    _ => Self::Tile64,
+                }),
+                Kernel::SpecializedConv { k_tile } => Some(Self::SpecializedConv {
+                    tile_size: launched,
+                    k_tile,
+                }),
+                Kernel::Cooperative => Self::native_cooperative(config),
                 _ => None,
             }
         } else {
@@ -269,6 +339,7 @@ impl MatmulTile {
         }
         dispatch.shader = self.shader(&dispatch.shader);
         dispatch.kernel = match self {
+            Self::Tile16 => crate::compile::Kernel::Default,
             Self::Tile32
                 if !matches!(
                     dispatch.shader,
@@ -290,38 +361,20 @@ impl MatmulTile {
     }
 
     pub(crate) fn shader(self, entry: &ShaderEntry) -> ShaderEntry {
-        let small = matches!(
-            self,
-            Self::Tile32 | Self::SpecializedConv { tile_size: 32, .. }
-        );
-        match (entry, small) {
-            (&ShaderEntry::Conv2dGemm | &ShaderEntry::Conv2dGemmSmall, true) => {
-                ShaderEntry::Conv2dGemmSmall
-            }
-            (&ShaderEntry::Conv2dGemm | &ShaderEntry::Conv2dGemmSmall, false) => {
-                ShaderEntry::Conv2dGemm
-            }
-            (&ShaderEntry::Conv2dGradInputGemm | &ShaderEntry::Conv2dGradInputGemmSmall, true) => {
-                ShaderEntry::Conv2dGradInputGemmSmall
-            }
-            (&ShaderEntry::Conv2dGradInputGemm | &ShaderEntry::Conv2dGradInputGemmSmall, false) => {
-                ShaderEntry::Conv2dGradInputGemm
-            }
-            (
-                &ShaderEntry::Conv2dGradWeightGemm | &ShaderEntry::Conv2dGradWeightGemmSmall,
-                true,
-            ) => ShaderEntry::Conv2dGradWeightGemmSmall,
-            (
-                &ShaderEntry::Conv2dGradWeightGemm | &ShaderEntry::Conv2dGradWeightGemmSmall,
-                false,
-            ) => ShaderEntry::Conv2dGradWeightGemm,
-            _ => entry.clone(),
-        }
+        let tile = match self {
+            Self::Tile16 | Self::SpecializedConv { tile_size: 16, .. } => 16,
+            Self::Tile32 | Self::SpecializedConv { tile_size: 32, .. } => 32,
+            Self::Tile64 | Self::SpecializedConv { tile_size: 64, .. } => 64,
+            Self::SpecializedConv { tile_size, .. } => tile_size,
+            _ => return entry.clone(),
+        };
+        conv_tile_entry(entry, tile).unwrap_or_else(|| entry.clone())
     }
 
     fn workgroups(self, class: &TuneClass) -> [u32; 3] {
         let tile = match self {
             Self::Gemv(shape) => return class.gemv_workgroups(shape),
+            Self::Tile16 => 16,
             Self::Tile32 => 32,
             Self::Tile64 => 64,
             Self::Scalar(shape) => shape.tile_size,
@@ -372,7 +425,9 @@ impl MatmulTile {
             return Some(sizes);
         }
         if let Self::SpecializedConv { tile_size, k_tile } = self {
-            if class.conv2d.is_none() || !matches!(tile_size, 32 | 64) || !matches!(k_tile, 16 | 32)
+            if class.conv2d.is_none()
+                || !matches!(tile_size, 16 | 32 | 64)
+                || !matches!(k_tile, 16 | 32)
             {
                 return None;
             }
@@ -443,10 +498,13 @@ impl TuneClass {
                 | ShaderEntry::MatMulGemvBTAdd
                 | ShaderEntry::Conv2dGemm
                 | ShaderEntry::Conv2dGemmSmall
+                | ShaderEntry::Conv2dGemm16
                 | ShaderEntry::Conv2dGradInputGemm
                 | ShaderEntry::Conv2dGradInputGemmSmall
+                | ShaderEntry::Conv2dGradInputGemm16
                 | ShaderEntry::Conv2dGradWeightGemm
                 | ShaderEntry::Conv2dGradWeightGemmSmall
+                | ShaderEntry::Conv2dGradWeightGemm16
         ) || dispatch.use_coop_compensated()
             || (dispatch.use_coop() && dispatch.weight_format.uses_reduced_storage())
             || dispatch.horizontal_batch >= 2
@@ -460,9 +518,13 @@ impl TuneClass {
             return None;
         }
         let shader = match dispatch.shader {
-            ShaderEntry::Conv2dGemmSmall => ShaderEntry::Conv2dGemm,
-            ShaderEntry::Conv2dGradInputGemmSmall => ShaderEntry::Conv2dGradInputGemm,
-            ShaderEntry::Conv2dGradWeightGemmSmall => ShaderEntry::Conv2dGradWeightGemm,
+            ShaderEntry::Conv2dGemmSmall | ShaderEntry::Conv2dGemm16 => ShaderEntry::Conv2dGemm,
+            ShaderEntry::Conv2dGradInputGemmSmall | ShaderEntry::Conv2dGradInputGemm16 => {
+                ShaderEntry::Conv2dGradInputGemm
+            }
+            ShaderEntry::Conv2dGradWeightGemmSmall | ShaderEntry::Conv2dGradWeightGemm16 => {
+                ShaderEntry::Conv2dGradWeightGemm
+            }
             _ => dispatch.shader.clone(),
         };
         let conv2d = if matches!(
@@ -672,42 +734,24 @@ impl TuneClass {
                 .collect();
         }
         if self.conv2d.is_some() {
-            let small = matches!(
-                initial,
-                MatmulTile::Tile32 | MatmulTile::SpecializedConv { tile_size: 32, .. }
-            );
-            let (tile, other) = if small { (32, 64) } else { (64, 32) };
-            return [
-                MatmulTile::SpecializedConv {
-                    tile_size: tile,
-                    k_tile: 16,
-                },
-                MatmulTile::SpecializedConv {
-                    tile_size: tile,
-                    k_tile: 32,
-                },
-                if small {
-                    MatmulTile::Tile64
-                } else {
-                    MatmulTile::Tile32
-                },
-                if small {
-                    MatmulTile::Tile32
-                } else {
-                    MatmulTile::Tile64
-                },
-                MatmulTile::SpecializedConv {
-                    tile_size: other,
-                    k_tile: 16,
-                },
-                MatmulTile::SpecializedConv {
-                    tile_size: other,
-                    k_tile: 32,
-                },
-            ]
-            .into_iter()
-            .filter(|&tile| tile != initial && tile.fits(self))
-            .collect();
+            let mut out = Vec::new();
+            for tile in [16u32, 32, 64] {
+                out.push(match tile {
+                    16 => MatmulTile::Tile16,
+                    32 => MatmulTile::Tile32,
+                    _ => MatmulTile::Tile64,
+                });
+                for k_tile in [16, 32] {
+                    out.push(MatmulTile::SpecializedConv {
+                        tile_size: tile,
+                        k_tile,
+                    });
+                }
+            }
+            return out
+                .into_iter()
+                .filter(|&tile| tile != initial && tile.fits(self))
+                .collect();
         }
         let mut candidates: Vec<_> = [
             Some(MatmulTile::Tile64),
@@ -1527,7 +1571,9 @@ mod tests {
                 }
             );
             let candidates = class.challengers(MatmulTile::Tile64, Some(&native_config(16)));
-            assert_eq!(candidates.len(), 5);
+            // 16/32/64 tiles, each with the plain kernel and two K stages,
+            // minus the 64-wide incumbent.
+            assert_eq!(candidates.len(), 8);
             for candidate in candidates {
                 candidate.apply(&mut d, &class);
                 assert_eq!(MatmulTile::selected(&d, None), Some(candidate));

@@ -122,7 +122,7 @@ impl ExecutionPlan {
             let mut class = TuneClass::from_dispatch(dispatch, None)
                 .filter(|class| {
                     class.shader == ShaderEntry::Conv2dGradWeightGemm
-                        && dispatch.conv_k_tile().is_none()
+                        && matches!(dispatch.conv_k_tile(), None | Some(16))
                 })
                 .ok_or(TuneError(
                     "split-K requires an unmodified legal scalar weight gradient",
@@ -178,10 +178,15 @@ impl ExecutionPlan {
                 .ok_or(TuneError("split-K buffer index overflow"))?;
             let partial = BufferRef(buffer_index);
             let mut producer = dispatch.clone();
-            producer.shader = if tile == MatmulTile::Tile32 {
-                ShaderEntry::Conv2dGradWeightGemmSplitSmall
-            } else {
-                ShaderEntry::Conv2dGradWeightGemmSplit
+            let width = match tile {
+                MatmulTile::Tile16 | MatmulTile::SpecializedConv { tile_size: 16, .. } => 16,
+                MatmulTile::Tile32 | MatmulTile::SpecializedConv { tile_size: 32, .. } => 32,
+                _ => 64,
+            };
+            producer.shader = match width {
+                16 => ShaderEntry::Conv2dGradWeightGemmSplit16,
+                32 => ShaderEntry::Conv2dGradWeightGemmSplitSmall,
+                _ => ShaderEntry::Conv2dGradWeightGemmSplit,
             };
             producer.workgroups[2] = splits;
             producer.output_buffer = partial;
@@ -314,7 +319,9 @@ mod tests {
             .position(|d| {
                 matches!(
                     d.shader,
-                    ShaderEntry::Conv2dGradWeightGemm | ShaderEntry::Conv2dGradWeightGemmSmall
+                    ShaderEntry::Conv2dGradWeightGemm
+                        | ShaderEntry::Conv2dGradWeightGemmSmall
+                        | ShaderEntry::Conv2dGradWeightGemm16
                 )
             })
             .unwrap();

@@ -15,7 +15,12 @@ fn main() {
     // time on RTX 5080).
     let gpu = meganeura::init_gpu_context_with(meganeura::GpuOptions::from_env()).expect("gpu");
     let result = meganeura::runtime::auto_tune(&gpu, 64);
-    eprintln!("coop_matrix_available={}", result.coop_caps.is_supported());
+    eprintln!(
+        "coop_matrix_available={} f32_tile={} f16_tile={}",
+        result.coop_caps.is_supported(),
+        result.coop_caps.f32_tile,
+        result.coop_caps.f16_tile
+    );
     drop(gpu);
 
     let batch = 1u32;
@@ -56,12 +61,48 @@ fn main() {
         sess.wait();
     }
 
+    let mut samples = Vec::new();
+    for _ in 0..10 {
+        let start = std::time::Instant::now();
+        sess.step();
+        sess.wait();
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    samples.sort_by(f64::total_cmp);
+    eprintln!(
+        "unprofiled step median {:.3} ms (min {:.3}, max {:.3})",
+        samples[samples.len() / 2],
+        samples[0],
+        samples[samples.len() - 1]
+    );
+
     sess.set_profiling(true);
     sess.step();
     sess.wait();
-    sess.step();
-    sess.wait();
-    sess.step();
-    sess.wait();
+    let timings = sess.gpu_timings();
+    let dispatches = &sess.plan().dispatches;
+    let mut ranked: Vec<_> = timings
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (_, dur))| {
+            dispatches
+                .get(i)
+                .map(|d| (dur.as_secs_f64() * 1000.0, i, d))
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+    eprintln!(
+        "profiled passes {} / dispatches {}",
+        timings.len(),
+        dispatches.len()
+    );
+    for (ms, index, dispatch) in ranked.iter().take(30) {
+        eprintln!(
+            "  {ms:7.3} ms  #{index:<3} {:?} wg={:?} params={:?}",
+            dispatch.shader,
+            dispatch.workgroups,
+            &dispatch.params[..dispatch.params.len().min(12)]
+        );
+    }
     sess.dump_gpu_timings();
 }

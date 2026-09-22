@@ -76,14 +76,13 @@ profiler = ["dep:tracing-subscriber"]
 
 [dependencies]
 # Calibrated GPU pass timestamps resolved after the completion fence.
-blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "915e013374de9eccc7a58e6f54abcc7c004948b7" }
+blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "fbb4f28c4869e81ae15de58925945b423b9c1ac5" }
 blade-macros = "0.3"
 # `default-features = false` drops egglog's `bin` stack (clap, mimalloc,
 # env_logger, chrono, graphviz); library builds use the shared rewrite engine.
 egglog = { version = "2.0", default-features = false }
 bytemuck = { version = "1", features = ["derive"] }
-# Match Blade's Naga major: generated modules cross the public API boundary.
-naga = { version = "30", default-features = false, features = ["wgsl-in", "wgsl-out", "spv-out"] }
+naga = { git = "https://github.com/gfx-rs/wgpu", rev = "323acfb729a00c3030e362faa27252afe6368792", version = "30", default-features = false, features = ["wgsl-in", "wgsl-out", "spv-out"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ron = "0.8"
