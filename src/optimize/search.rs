@@ -299,6 +299,7 @@ fn segment_candidates(
         .ok_or("region instances have ambiguous external edges")?;
     let empty = Arc::<[Edge]>::from([]);
     let mut pending = VecDeque::from([empty.clone()]);
+    let mut schedules = VecDeque::new();
     let mut visited = HashSet::from([empty]);
     let mut expressions = HashSet::new();
     let mut terms = TermDag::default();
@@ -307,7 +308,14 @@ fn segment_candidates(
     let attempts = limit.saturating_mul(segment.ids.len());
     let mut bounded = false;
     for _ in 0..attempts {
-        let Some(forbidden) = pending.pop_front() else {
+        // Alternate structural and schedule coverage. Otherwise a region with
+        // many fusion sites can fill the frontier with one identical tile.
+        let next = if !result.is_empty() && result.len() % 2 == 0 {
+            schedules.pop_front().or_else(|| pending.pop_front())
+        } else {
+            pending.pop_front().or_else(|| schedules.pop_front())
+        };
+        let Some(forbidden) = next else {
             break;
         };
         let extractor = Extractor::compute_costs_from_rootsorts(
@@ -326,6 +334,7 @@ fn segment_candidates(
         }
         let mut branches = Vec::new();
         let mut sites = Vec::new();
+        let mut schedule = Vec::new();
         let mut families = BTreeMap::<String, Vec<Edge>>::new();
         for (value, edge) in edges(&egraph, &terms, term)? {
             let branching = *choices.entry(value).or_insert_with(|| {
@@ -338,6 +347,9 @@ fn segment_candidates(
                 continue;
             }
             if let Some(logical) = super::matrix_family(&edge.head) {
+                if edge.head != logical {
+                    schedule.push(edge.clone());
+                }
                 let family: Vec<_> = std::iter::once(logical)
                     .chain(
                         super::matrix_constructors()
@@ -369,8 +381,10 @@ fn segment_candidates(
             .into_values()
             .filter(|edges| edges.len() > 1)
             .chain(sites)
-            .chain(branches.into_iter().map(|edge| vec![edge]));
-        for excluded in exclusions {
+            .chain(branches.into_iter().map(|edge| vec![edge]))
+            .map(|edges| (false, edges))
+            .chain((!schedule.is_empty()).then_some((true, schedule)));
+        for (is_schedule, excluded) in exclusions {
             let mut next = forbidden.to_vec();
             next.extend(excluded);
             next.sort_unstable();
@@ -383,7 +397,11 @@ fn segment_candidates(
             } else {
                 let next = Arc::<[Edge]>::from(next);
                 visited.insert(next.clone());
-                pending.push_back(next);
+                if is_schedule {
+                    schedules.push_back(next);
+                } else {
+                    pending.push_back(next);
+                }
             }
         }
         if !expressions.insert(term) {
@@ -425,7 +443,7 @@ fn segment_candidates(
     }
     Ok(SearchSpace {
         candidates: result,
-        truncated: bounded || !pending.is_empty(),
+        truncated: bounded || !pending.is_empty() || !schedules.is_empty(),
     })
 }
 
@@ -502,6 +520,67 @@ mod tests {
                 .iter()
                 .all(|node| node.matmul_impl.is_none())
         );
+        for candidate in &space.candidates {
+            let mut graph = candidate.graph.deep_clone();
+            let loss = graph.mean_all(graph.outputs()[0]);
+            graph.set_outputs(vec![loss]);
+            let differentiated = crate::autodiff::differentiate(&graph);
+            assert!(
+                differentiated
+                    .nodes()
+                    .iter()
+                    .filter(|n| { matches!(n.op, Op::MatMul | Op::MatMulAT | Op::MatMulBT) })
+                    .all(|n| n.matmul_impl.is_some()),
+                "a scheduled contraction lost its derivative schedule"
+            );
+        }
+
+        // Packing must retain a schedule for the hidden wide projection,
+        // including transposed weights and the unpackable-input fallback.
+        for transposed in [false, true] {
+            for packed in [false, true] {
+                for geglu in [false, true] {
+                    let mut graph = Graph::new();
+                    let h = graph.input("h", &[17, 64]);
+                    let dims = if transposed { [96, 64] } else { [64, 96] };
+                    let mut projection = |name| {
+                        let w = if packed {
+                            graph.parameter(name, &dims)
+                        } else {
+                            graph.input(name, &dims)
+                        };
+                        if transposed {
+                            graph.matmul_bt(h, w)
+                        } else {
+                            graph.matmul(h, w)
+                        }
+                    };
+                    let gate = projection("gate");
+                    let up = projection("up");
+                    let y = if geglu {
+                        graph.geglu(gate, up)
+                    } else {
+                        graph.swiglu(gate, up)
+                    };
+                    graph.set_outputs(vec![y]);
+                    let space = candidates(&graph, Default::default(), 4).unwrap();
+                    let first = &space.candidates[0].graph;
+                    assert_eq!(!first.derived_params.is_empty(), packed);
+                    let products: Vec<_> = first
+                        .nodes()
+                        .iter()
+                        .filter(|n| matches!(n.op, Op::MatMul | Op::MatMulBT))
+                        .collect();
+                    assert_eq!(products.len(), if packed { 1 } else { 2 });
+                    assert!(products.iter().all(|n| n.matmul_impl.is_some()));
+                    assert!(
+                        products
+                            .iter()
+                            .all(|n| matches!(n.op, Op::MatMulBT) == transposed)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -651,6 +730,16 @@ mod tests {
         assert_ne!(
             bounded.candidates[0].expression,
             bounded.candidates[1].expression
+        );
+        let bounded = candidates(&graph, Default::default(), 4).unwrap();
+        let layouts: std::collections::HashSet<_> = bounded
+            .candidates
+            .iter()
+            .flat_map(|candidate| candidate.graph.nodes().iter().filter_map(|n| n.matmul_impl))
+            .collect();
+        assert!(
+            layouts.len() >= 2,
+            "fusion choices crowded out schedule coverage"
         );
 
         // Search only the second pair. External inputs keep their identities,

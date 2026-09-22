@@ -18,8 +18,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
             node.requires_full_precision,
         );
         graph.nodes_mut()[id as usize].name = node.name.clone();
-        // The forward implementation was chosen by measured extraction.
-        // Gradient matmuls are new nodes and stay on the untiled path.
+        // Keep the implementation of a measured candidate.
         graph.nodes_mut()[id as usize].matmul_impl = node.matmul_impl;
     }
     graph.derived_params = forward.derived_params.clone();
@@ -48,6 +47,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
             Some(&g) => g,
             None => continue, // no gradient flows to this node
         };
+        let gradient_start = graph.nodes().len();
 
         // ───────────────────────────────────────────────────────────────
         // CONTRACT for every backward arm below:
@@ -1265,6 +1265,17 @@ pub fn differentiate(forward: &Graph) -> Graph {
                     x_ty,
                 );
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
+        }
+        // A measured training candidate carries its contraction schedule to
+        // the corresponding derivatives. Lowering checks the new dimensions.
+        // This is coupled coverage, not independent backward optimization;
+        // ordinary unscheduled graphs and their kernel probes are unchanged.
+        if let Some(spec) = node.matmul_impl {
+            for gradient in &mut graph.nodes_mut()[gradient_start..] {
+                if matches!(gradient.op, Op::MatMul | Op::MatMulAT | Op::MatMulBT) {
+                    gradient.matmul_impl = Some(spec);
+                }
             }
         }
     }
