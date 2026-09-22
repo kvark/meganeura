@@ -67,9 +67,7 @@ fn node_signature(graph: &Graph, id: usize) -> u64 {
         Op::Constant { ref data } => {
             "C".hash(&mut h);
             data.len().hash(&mut h);
-            for v in data {
-                v.to_bits().hash(&mut h);
-            }
+            h.write(bytemuck::cast_slice(data));
         }
         // Debug formatting includes op params (num_heads, eps, strides…)
         // so structurally different ops hash differently.
@@ -83,14 +81,19 @@ fn node_signature(graph: &Graph, id: usize) -> u64 {
 }
 
 /// Ops are equivalent across instances if equal up to parameter/input
-/// names. The Debug-string comparison covers everything else, including
-/// constants (their data is part of the Debug output, so instances must
-/// share exact constant values).
+/// names. Constant payloads are compared bitwise, without formatting potentially
+/// large tensors. The Debug-string comparison covers other operator attributes.
 fn ops_equivalent(a: &Op, b: &Op) -> bool {
-    match (a, b) {
-        (&Op::Parameter { .. }, &Op::Parameter { .. }) => true,
-        (&Op::Input { .. }, &Op::Input { .. }) => true,
-        (ref a, ref b) => format!("{:?}", a) == format!("{:?}", b),
+    match *a {
+        Op::Parameter { .. } => matches!(*b, Op::Parameter { .. }),
+        Op::Input { .. } => matches!(*b, Op::Input { .. }),
+        Op::Constant { ref data } => match *b {
+            Op::Constant { data: ref other } => {
+                bytemuck::cast_slice::<f32, u8>(data) == bytemuck::cast_slice::<f32, u8>(other)
+            }
+            _ => false,
+        },
+        _ => format!("{:?}", a) == format!("{:?}", b),
     }
 }
 
@@ -371,6 +374,27 @@ mod tests {
 
     #[test]
     fn verify_rejects_cross_wired_instances() {
+        for a in [
+            0.0f32,
+            -0.0,
+            f32::from_bits(0x7fc00001),
+            f32::from_bits(0x7fc00002),
+        ] {
+            for b in [
+                0.0f32,
+                -0.0,
+                f32::from_bits(0x7fc00001),
+                f32::from_bits(0x7fc00002),
+            ] {
+                assert_eq!(
+                    ops_equivalent(
+                        &Op::Constant { data: vec![a] },
+                        &Op::Constant { data: vec![b] }
+                    ),
+                    a.to_bits() == b.to_bits(),
+                );
+            }
+        }
         // Properly chained instances: mm1 reads r0, the exact one-period
         // shift of mm0's input edge.
         let mut g = Graph::new();

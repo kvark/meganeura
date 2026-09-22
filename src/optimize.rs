@@ -103,19 +103,13 @@ impl Default for OptimizeConfig {
 }
 
 // ---------------------------------------------------------------------------
-// HBM-traffic-aware cost model for e-graph extraction.
-//
-// Per-e-class tensor sizes are built after saturation by evaluating each
-// graph node's binding; the cost of an e-node is then the HBM traffic it
-// causes: bytes read (inputs) + bytes written (output). A fusion wins by
-// exactly the intermediate traffic it eliminates — FusedMatMulAdd(a,b,d)
-// saves the write and re-read of the matmul's result tensor — with no
-// hand-tuned constants, and unprofitable rewrites (future: Winograd vs
-// implicit GEMM, layout conversions, rematerialization) can lose on real
-// numbers.
+// Logical tensor traffic for e-graph extraction: input bytes plus output
+// bytes, not measured HBM transactions. This tree estimate ignores cache
+// reuse, shared subexpressions, arithmetic and occupancy. It orders bounded
+// exploration; measured construction compares the lowered implementations.
 // ---------------------------------------------------------------------------
 
-/// Cost model that prefers the expression with the least HBM traffic.
+/// Cost model that prefers the expression with the least logical tensor traffic.
 #[derive(Default, Debug, Clone)]
 pub struct FusionCostModel {
     /// e-class value → tensor size in bytes.
@@ -160,17 +154,20 @@ impl egglog::extract::CostModel<u64> for FusionCostModel {
         let Some(sizes) = self.sizes.as_ref() else {
             return 1;
         };
-        // row.vals = [args.., output]. Args missing from the map are
-        // non-tensor primitives (the node-id ints) and read no HBM.
+        // Values are sort-local: an integer node id can have the same raw
+        // value as an unrelated tensor e-class. Only Op arguments read tensors.
         if let Some((out, args)) = row.vals.split_last()
             && let Some(&out_bytes) = sizes.get(out)
         {
-            let read: u64 = args.iter().filter_map(|v| sizes.get(v)).sum();
+            let read = args
+                .iter()
+                .zip(&func.schema().input)
+                .filter(|&(_, sort)| sort.name() == "Op")
+                .filter_map(|(value, _)| sizes.get(value))
+                .fold(0u64, |total, bytes| total.saturating_add(*bytes));
             return read.saturating_add(out_bytes);
         }
-        // Unknown output e-class (a rewrite-created tensor that no graph
-        // node binds, e.g. the packed matmul inside SwiGLUPacked): fall
-        // back to constants that keep fused ops preferred.
+        // Unbound outputs use a structural fallback, with fused ops preferred.
         match name {
             "FusedMatMulAdd" | "FusedMatMulATAdd" | "FusedMatMulBTAdd" | "SwiGLUPacked"
             | "GeGLUPacked" | "SwiGLUPackedBT" | "GeGLUPackedBT" => 9,
@@ -512,7 +509,10 @@ pub fn dump_egglog_program(graph: &Graph) -> String {
         ids,
         shifts: vec![0],
     };
-    segment_program(graph, &seg, true).0
+    let mut program = String::new();
+    egglog_prelude(&mut program, true);
+    program.push_str(&segment_program(graph, &seg).0);
+    program
 }
 
 // ---------------------------------------------------------------------------
@@ -697,6 +697,28 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
     // a fixpoint; the fourth is margin for future rules.
 }
 
+fn rule_graph(pack_swiglu: bool) -> egglog::EGraph {
+    // Egglog clones share a mutable table-notification list. Searches on
+    // different threads must not clone the same initialized database.
+    thread_local! {
+        static RULES: [std::cell::OnceCell<egglog::EGraph>; 2] =
+            const { [const { std::cell::OnceCell::new() }; 2] };
+    }
+    RULES.with(|rules| {
+        rules[usize::from(pack_swiglu)]
+            .get_or_init(|| {
+                let mut program = String::new();
+                egglog_prelude(&mut program, pack_swiglu);
+                let mut egraph = egglog::EGraph::default();
+                egraph
+                    .parse_and_run_program(None, &program)
+                    .expect("valid built-in rewrite rules");
+                egraph
+            })
+            .clone()
+    })
+}
+
 /// Returns the named egglog constructor for ops that rewrite rules
 /// match on, or `None` for generically-encoded ops.
 fn named_constructor(op: &Op) -> Option<&'static str> {
@@ -764,7 +786,7 @@ fn node_to_egglog_expr(node: &Node) -> String {
 /// opaque `Leaf` terms, segment nodes are encoded in id order. Returns
 /// the program and the external node ids (needed to size their e-classes
 /// for traffic-aware extraction).
-fn segment_program(g: &Graph, seg: &Segment, pack_swiglu: bool) -> (String, Vec<usize>) {
+fn segment_program(g: &Graph, seg: &Segment) -> (String, Vec<usize>) {
     let idset: HashSet<usize> = seg.ids.iter().copied().collect();
     let mut externals: Vec<usize> = Vec::new();
     let mut seen = HashSet::new();
@@ -783,7 +805,6 @@ fn segment_program(g: &Graph, seg: &Segment, pack_swiglu: bool) -> (String, Vec<
     externals.sort_unstable();
 
     let mut prog = String::new();
-    egglog_prelude(&mut prog, pack_swiglu);
     for &e in &externals {
         prog.push_str(&format!("(let $n{} (Leaf {}))\n", e, e));
     }
@@ -802,9 +823,8 @@ fn segment_program(g: &Graph, seg: &Segment, pack_swiglu: bool) -> (String, Vec<
 /// Map every node binding (`$n{id}`) to its e-class value and record the
 /// tensor's size in bytes — the lookup table for traffic-aware
 /// extraction. Nodes sharing an e-class denote the same tensor, so the
-/// insert is idempotent; rewrite-created terms (e.g. FusedMatMulAdd)
-/// join the e-class of the expression they replaced and need no entry
-/// of their own.
+/// insert is idempotent. Unfusing an existing matrix addition also creates a
+/// new intermediate of the same output shape; it must not get a token cost.
 fn eclass_sizes(
     graph: &Graph,
     egraph: &egglog::EGraph,
@@ -818,6 +838,25 @@ fn eclass_sizes(
         }
         let var = format!("$n{}", node.id);
         if let Some(value) = egraph.lookup_function(&var, &[]) {
+            sizes.insert(value, node.ty.size_bytes() as u64);
+        }
+        let product = match node.op {
+            Op::FusedMatMulAdd => "MatMul",
+            Op::FusedMatMulATAdd => "MatMulAT",
+            Op::FusedMatMulBTAdd => "MatMulBT",
+            _ => continue,
+        };
+        let inputs = node.inputs[..2]
+            .iter()
+            .map(|id| {
+                let name = format!("$n{id}");
+                egraph.get_function(&name)?;
+                egraph.lookup_function(&name, &[])
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(inputs) = inputs
+            && let Some(value) = egraph.lookup_function(product, &inputs)
+        {
             sizes.insert(value, node.ty.size_bytes() as u64);
         }
     }
@@ -915,11 +954,12 @@ fn process_segment(
     config: OptimizeConfig,
 ) {
     let egglog_start = Instant::now();
-    let (program, externals) = segment_program(g, seg, config.pack_swiglu);
+    let (program, externals) = segment_program(g, seg);
     if report.egglog_program.is_empty() {
-        report.egglog_program.clone_from(&program);
+        egglog_prelude(&mut report.egglog_program, config.pack_swiglu);
+        report.egglog_program.push_str(&program);
     }
-    let mut egraph = egglog::EGraph::default();
+    let mut egraph = rule_graph(config.pack_swiglu);
     if let Err(e) = egraph.parse_and_run_program(None, &program) {
         log::warn!(
             "egglog failed on segment of {} nodes: {} — leaving it unoptimized",
@@ -1583,6 +1623,27 @@ mod tests {
     }
 
     #[test]
+    fn tensor_traffic_does_not_charge_integer_node_ids() {
+        let mut egraph = egglog::EGraph::default();
+        egraph
+            .parse_and_run_program(
+                None,
+                "(datatype Op (Leaf i64) (Op1 i64 Op))
+                 (let a (Leaf 0)) (let b (Op1 1 a))",
+            )
+            .unwrap();
+        let a = egraph.lookup_function("a", &[]).unwrap();
+        let b = egraph.lookup_function("b", &[]).unwrap();
+        assert_eq!(b, egraph.base_to_value(1i64));
+        let cost = FusionCostModel::with_sizes(HashMap::from([(a, 1024), (b, 2048)]));
+        let extractor = Extractor::compute_costs_from_rootsorts(None, &egraph, cost);
+        let (bytes, _) = extractor
+            .extract_best(&egraph, &mut TermDag::default(), b)
+            .unwrap();
+        assert_eq!(bytes, 1024 + 2048);
+    }
+
+    #[test]
     fn test_no_fusion_cooperative_matrix() {
         let mut g = Graph::new();
         let x = g.input("x", &[4, 784]);
@@ -1890,22 +1951,34 @@ mod tests {
     /// E-graph discovers MatMul+Add → FusedMatMulAdd.
     #[test]
     fn test_egglog_discovers_matmul_add_fusion() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 8]);
-        let w = g.parameter("w", &[8, 4]);
-        let b = g.input("bias", &[4, 4]);
-        let mm = g.matmul(x, w);
-        let out = g.add(mm, b);
-        g.set_outputs(vec![out]);
+        for orientation in 0..3 {
+            let mut g = Graph::new();
+            let x = g.input("x", &if orientation == 1 { [8, 4] } else { [4, 8] });
+            let w = g.parameter("w", &if orientation == 2 { [4, 8] } else { [8, 4] });
+            let b = g.input("bias", &[4, 4]);
+            let (mm, expected) = match orientation {
+                0 => (g.matmul(x, w), Op::FusedMatMulAdd),
+                1 => (g.matmul_at(x, w), Op::FusedMatMulATAdd),
+                _ => (g.matmul_bt(x, w), Op::FusedMatMulBTAdd),
+            };
+            let out = g.add(mm, b);
+            g.set_outputs(vec![out]);
 
-        let (opt, report) = optimize_with_report(&g);
-        let output_node = opt.node(opt.outputs()[0]);
-        assert!(
-            matches!(output_node.op, Op::FusedMatMulAdd),
-            "expected FusedMatMulAdd, got {:?}",
-            output_node.op
-        );
-        assert!(!report.fusions_applied.is_empty());
+            let (mut opt, report) = optimize_with_report(&g);
+            let output_node = opt.node(opt.outputs()[0]);
+            assert_eq!(
+                std::mem::discriminant(&output_node.op),
+                std::mem::discriminant(&expected)
+            );
+            assert!(!report.fusions_applied.is_empty());
+            for _ in 0..2 {
+                opt = optimize_with_report(&opt).0;
+                assert_eq!(
+                    std::mem::discriminant(&opt.node(opt.outputs()[0]).op),
+                    std::mem::discriminant(&expected)
+                );
+            }
+        }
     }
 
     #[test]
