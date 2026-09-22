@@ -2821,6 +2821,7 @@ impl<'a> Compiler<'a> {
         q_seq: u32,
         head_dim: u32,
         num_heads: u32,
+        requires_full_precision: bool,
     ) -> (ShaderEntry, [u32; 3]) {
         // Pick the coop-matrix flash forward when the GPU has the
         // 16x16 f16 cooperative_matrix path (NVIDIA, RDNA3, Xe-HPG)
@@ -2830,6 +2831,7 @@ impl<'a> Compiler<'a> {
         // escape hatch).
         let coop_disabled = !self.options.flash_forward_coop;
         if !coop_disabled
+            && !requires_full_precision
             && self.coop_caps.supports_16x16_f16()
             && head_dim >= 16
             && head_dim.is_multiple_of(16)
@@ -4407,7 +4409,8 @@ impl<'a> Compiler<'a> {
                 let v = self.get_buffer(node.inputs[2]);
                 let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
-                let (shader, workgroups) = self.attention_dispatch(seq, head_dim, num_heads);
+                let (shader, workgroups) =
+                    self.attention_dispatch(seq, head_dim, num_heads, node.requires_full_precision);
                 self.plan.dispatches.push(Dispatch {
                     shader,
                     workgroups,
@@ -4433,7 +4436,8 @@ impl<'a> Compiler<'a> {
                 let v = self.get_buffer(node.inputs[2]);
                 let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
-                let (shader, workgroups) = self.attention_dispatch(seq, head_dim, num_heads);
+                let (shader, workgroups) =
+                    self.attention_dispatch(seq, head_dim, num_heads, node.requires_full_precision);
                 self.plan.dispatches.push(Dispatch {
                     shader,
                     workgroups,
@@ -5394,7 +5398,8 @@ impl<'a> Compiler<'a> {
                 let v = self.get_buffer(node.inputs[2]);
                 let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
-                let (shader, workgroups) = self.attention_dispatch(seq, head_dim, num_heads);
+                let (shader, workgroups) =
+                    self.attention_dispatch(seq, head_dim, num_heads, node.requires_full_precision);
                 self.plan.dispatches.push(Dispatch {
                     shader,
                     workgroups,
@@ -5419,7 +5424,12 @@ impl<'a> Compiler<'a> {
                 let q_seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let kv_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
-                let (shader, workgroups) = self.attention_dispatch(q_seq, head_dim, num_heads);
+                let (shader, workgroups) = self.attention_dispatch(
+                    q_seq,
+                    head_dim,
+                    num_heads,
+                    node.requires_full_precision,
+                );
                 self.plan.dispatches.push(Dispatch {
                     shader,
                     workgroups,
@@ -5444,7 +5454,12 @@ impl<'a> Compiler<'a> {
                 let q_seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let kv_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
-                let (shader, workgroups) = self.attention_dispatch(q_seq, head_dim, num_heads);
+                let (shader, workgroups) = self.attention_dispatch(
+                    q_seq,
+                    head_dim,
+                    num_heads,
+                    node.requires_full_precision,
+                );
                 self.plan.dispatches.push(Dispatch {
                     shader,
                     workgroups,
@@ -7201,7 +7216,7 @@ mod tests {
             for threads in [128, 256] {
                 compiler.options.knobs.flash.threads = threads;
                 let fwd_bq = (threads / fwd_tpq).max(1);
-                let (fwd_entry, fwd_wg) = compiler.attention_dispatch(256, hd, 1);
+                let (fwd_entry, fwd_wg) = compiler.attention_dispatch(256, hd, 1, false);
                 if fwd_bq >= 2 {
                     assert_eq!(fwd_entry, ShaderEntry::FlashAttention);
                     assert_eq!(fwd_wg[0], 256u32.div_ceil(fwd_bq));
@@ -7260,6 +7275,19 @@ mod tests {
             .collect();
         assert!(experimental_entries.contains(&ShaderEntry::FlashGradQCoop));
         assert!(experimental_entries.contains(&ShaderEntry::FlashGradKVCoop));
+
+        g.nodes_mut()[attention].requires_full_precision = true;
+        let full = compile_with_caps_policy(&g, &CompileOptions::default(), f16_only, false);
+        assert!(
+            full.dispatches
+                .iter()
+                .any(|d| d.shader == ShaderEntry::FlashAttention)
+        );
+        assert!(
+            full.dispatches
+                .iter()
+                .all(|d| d.shader != ShaderEntry::FlashAttentionCoop)
+        );
 
         let scalar = compile_with_caps_policy(
             &differentiated,

@@ -1,6 +1,5 @@
 /// Gradient debugging: test individual components with large weights
-use meganeura::{Graph, compile::BufferRef};
-use std::collections::HashMap;
+use meganeura::Graph;
 
 fn name_seed(name: &str) -> f32 {
     let mut h: u32 = 0;
@@ -35,25 +34,19 @@ fn check_grad(
     train_sess.wait();
     let train_loss = train_sess.read_loss();
 
-    let plan = train_sess.plan().clone();
-    let param_bufs: HashMap<String, BufferRef> = plan.param_buffers.iter().cloned().collect();
-    let grad_map: HashMap<BufferRef, BufferRef> = plan.param_grad_pairs.iter().cloned().collect();
-    let buf = param_bufs[check_param];
-    let grad_buf = grad_map[&buf];
-    let n = plan.buffers[grad_buf.0 as usize] / 4;
-    let mut grad = vec![0.0f32; n];
-    train_sess.read_buffer(grad_buf, &mut grad);
-
-    // Finite differences
-    let g_infer = build_infer();
-    let mut infer_sess =
-        meganeura::build(&g_infer, meganeura::SessionConfig::inference_from_env()).0;
     let orig_data = params_init
         .iter()
         .find(|(name, _)| name == check_param)
         .unwrap()
         .1
         .clone();
+    let mut grad = vec![0.0f32; orig_data.len()];
+    train_sess.read_param_grad(check_param, &mut grad);
+
+    // Finite differences
+    let g_infer = build_infer();
+    let mut infer_sess =
+        meganeura::build(&g_infer, meganeura::SessionConfig::inference_from_env()).0;
 
     // The f32 loss carries ~1e-7 of absolute noise, so a central difference
     // has an error floor of roughly noise/(2·eps) regardless of how correct
@@ -197,24 +190,76 @@ fn grad_causal_attn_large() {
         .map(|i| (i as f32 * 0.017 + 2.0).sin() * scale)
         .collect();
 
-    let params = vec![
-        ("q".to_string(), q_data),
-        ("k".to_string(), k_data),
-        ("v".to_string(), v_data),
-    ];
-
-    for name in ["q", "k", "v"] {
-        check_grad(
-            "CausalAttn(scale=1.0)",
-            make_graph,
-            make_graph,
-            &params,
-            &[],
-            &[],
-            name,
-            &[d, d + 32, d + 255, d + 256, d + 511, seq * d - 1],
-        );
+    let mut session = meganeura::build(&make_graph(), meganeura::SessionConfig::from_env()).0;
+    for (name, data) in [("q", &q_data), ("k", &k_data), ("v", &v_data)] {
+        session.set_parameter(name, data);
     }
+    session.step();
+    session.wait();
+
+    // Differentiate the f64 softmax reference directly. Finite differences of
+    // a single f32 mean lose the small gradients at the last causal row.
+    let scale = 1.0 / (d as f64).sqrt();
+    let norm = 1.0 / (seq * d) as f64;
+    let mut expected = [
+        vec![0.0f64; seq * d],
+        vec![0.0; seq * d],
+        vec![0.0; seq * d],
+    ];
+    let mut expected_loss = 0.0;
+    for query in 0..seq {
+        let mut probabilities: Vec<f64> = (0..=query)
+            .map(|key| {
+                (0..d)
+                    .map(|i| f64::from(q_data[query * d + i]) * f64::from(k_data[key * d + i]))
+                    .sum::<f64>()
+                    * scale
+            })
+            .collect();
+        let max = probabilities
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        for value in &mut probabilities {
+            *value = (*value - max).exp();
+        }
+        let sum: f64 = probabilities.iter().sum();
+        for value in &mut probabilities {
+            *value /= sum;
+        }
+        let values: Vec<f64> = (0..=query)
+            .map(|key| {
+                v_data[key * d..(key + 1) * d]
+                    .iter()
+                    .map(|&v| f64::from(v))
+                    .sum::<f64>()
+                    * norm
+            })
+            .collect();
+        let mean: f64 = probabilities.iter().zip(&values).map(|(p, v)| p * v).sum();
+        expected_loss += mean;
+        for (key, &p) in probabilities.iter().enumerate() {
+            let derivative = p * (values[key] - mean) * scale;
+            for i in 0..d {
+                expected[0][query * d + i] += derivative * f64::from(k_data[key * d + i]);
+                expected[1][key * d + i] += derivative * f64::from(q_data[query * d + i]);
+                expected[2][key * d + i] += p * norm;
+            }
+        }
+    }
+    let actual_loss = f64::from(session.read_loss());
+    eprintln!("causal loss: actual={actual_loss:e}, expected={expected_loss:e}");
+    for (name, reference) in ["q", "k", "v"].into_iter().zip(expected) {
+        let mut actual = vec![0.0; seq * d];
+        session.read_param_grad(name, &mut actual);
+        for (index, (&actual, expected)) in actual.iter().zip(reference).enumerate() {
+            assert!(
+                (f64::from(actual) - expected).abs() < 1e-9 + 1e-4 * expected.abs(),
+                "{name}[{index}]: actual={actual:e}, expected={expected:e}"
+            );
+        }
+    }
+    assert!((actual_loss - expected_loss).abs() < 1e-7);
 }
 
 /// Test RMSNorm → QKV projections → attention → residual → mean (like SmolLM2 layer)
