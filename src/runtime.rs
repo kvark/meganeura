@@ -1079,6 +1079,7 @@ fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
 /// implementation once; preparation builds exactly the selected pipeline.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Variant {
+    SplitMatmul(ShaderEntry, crate::codegen::ScalarMatmulShape, u32),
     SpecializedConv(ShaderEntry, Vec<u32>, u32),
     ScalarMatmul(
         ShaderEntry,
@@ -1174,6 +1175,7 @@ impl Variant {
         match *self {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
             Variant::Attention(ref e, _)
+            | Variant::SplitMatmul(ref e, _, _)
             | Variant::SpecializedConv(ref e, _, _)
             | Variant::ScalarMatmul(ref e, _, _)
             | Variant::Epilogue(ref e, _)
@@ -1196,6 +1198,9 @@ impl Variant {
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
+            Variant::SplitMatmul(ref e, shape, splits) => {
+                format!("{e:?}:split-k-{splits}-{shape:?}")
+            }
             Variant::ScalarMatmul(ref e, format, shape) => {
                 format!("{e:?}:scalar-{format:?}-{shape:?}")
             }
@@ -1359,6 +1364,9 @@ impl Pipelines {
                 crate::tune::MatmulTile::Scalar(shape),
                 matmul_knobs,
             ),
+            Variant::SplitMatmul(_, shape, splits) => {
+                crate::codegen::generate_split_matmul(group, shape, splits, dispatch.weight_format)
+            }
             Variant::SpecializedConv(..) => {
                 let tile = crate::tune::MatmulTile::selected(dispatch, None)
                     .expect("specialized convolution");
@@ -1432,9 +1440,11 @@ impl Pipelines {
                 )
             }
             Variant::Attention(_, hd) => match group {
-                ShaderGroup::FlashAttention => {
-                    crate::codegen::generate_flash_attention_module(hd, knobs.flash_ept_cap)
-                }
+                ShaderGroup::FlashAttention => crate::codegen::generate_flash_attention_module(
+                    hd,
+                    knobs.flash_ept_cap,
+                    knobs.flash,
+                ),
                 ShaderGroup::FlashAttentionCoop => {
                     crate::codegen::generate_flash_attention_coop_module(hd)
                 }
@@ -1516,6 +1526,9 @@ impl Pipelines {
     /// which unrelated pipelines happen to have been compiled.
     fn key(dispatch: &Dispatch) -> Variant {
         let entry = dispatch.shader.clone();
+        if let crate::compile::Kernel::SplitMatmul { shape, splits } = dispatch.kernel {
+            return Variant::SplitMatmul(entry, shape, splits);
+        }
         if let Some(shape) = dispatch.scalar_matmul() {
             return Variant::ScalarMatmul(entry, dispatch.weight_format, shape);
         }
@@ -2113,7 +2126,10 @@ pub(crate) fn select_variants(
         // iOS and future 8×8 f32 advertisers need the same veto.
         let apple_f32_coop = !config.use_f16_input && config.tile_size == 8;
         for dispatch in &mut plan.dispatches {
-            if dispatch.conv_k_tile().is_some() || dispatch.scalar_matmul().is_some() {
+            if dispatch.conv_k_tile().is_some()
+                || dispatch.scalar_matmul().is_some()
+                || matches!(dispatch.kernel, crate::compile::Kernel::SplitMatmul { .. })
+            {
                 continue;
             }
             // Autodiff marks derivative work as requiring f32 operands. A
@@ -2316,6 +2332,7 @@ pub(crate) fn select_variants(
             if dispatch.use_coop()
                 || dispatch.use_small_tiles()
                 || dispatch.scalar_matmul().is_some()
+                || matches!(dispatch.kernel, crate::compile::Kernel::SplitMatmul { .. })
                 || dispatch.weight_format.uses_reduced_storage()
             {
                 continue;
@@ -2886,7 +2903,7 @@ impl Session {
     /// Prefers native f32 for training correctness. The faster f16-input path
     /// remains opt-in because rounding compounds across deep training graphs.
     fn select_coop_config(
-        caps: &blade_graphics::CooperativeMatrix,
+        caps: &crate::codegen::CoopCaps,
         policy: CoopPolicy,
     ) -> Option<crate::codegen::CoopConfig> {
         use crate::codegen::CoopConfig;
@@ -3106,7 +3123,7 @@ impl Session {
             buffers = plan.buffers.len()
         )
         .entered();
-        let coop_caps = gpu.capabilities().cooperative_matrix;
+        let coop_caps = auto_tune(&gpu, 0).coop_caps;
         let coop_config = {
             let _span = tracing::info_span!("coop_probe").entered();
             Self::select_coop_config(&coop_caps, opts.coop)
@@ -3146,6 +3163,17 @@ impl Session {
             !opts.debug,
             opts.coop == CoopPolicy::AllowF16,
         );
+        if let Some(head_dim) = plan
+            .dispatches
+            .iter()
+            .filter(|dispatch| dispatch.shader == ShaderEntry::FlashAttention)
+            .map(|dispatch| dispatch.params[3])
+            .max()
+        {
+            plan.knobs
+                .flash
+                .fit_shared_memory(head_dim, gpu.capabilities().max_compute_shared_memory_size);
+        }
 
         // Reorder dispatches by dependency level so parallel branches (e.g. Q/K/V
         // projections) cluster together, then partition into barrier groups.
@@ -5034,10 +5062,16 @@ pub struct AutoTuneResult {
 /// or the pipeline layer takes it as a parameter.
 pub fn auto_tune(gpu: &blade_graphics::Context, _head_dim: u32) -> AutoTuneResult {
     let cm = gpu.capabilities().cooperative_matrix;
+    let square = |shapes: &[[u32; 3]]| {
+        [8, 16]
+            .into_iter()
+            .find(|&tile| shapes.contains(&[tile; 3]))
+            .unwrap_or(0)
+    };
     AutoTuneResult {
         coop_caps: crate::codegen::CoopCaps {
-            f16_tile: cm.f16_tile,
-            f32_tile: cm.f32_tile,
+            f16_tile: square(&cm.f16_f32_shapes),
+            f32_tile: square(&cm.f32_shapes),
         },
     }
 }
@@ -7398,7 +7432,7 @@ impl Session {
                 );
             }
             ShaderEntry::SumRows => {
-                // params[0] = m (rows), params[1] = n (cols)
+                // Rows, columns, and optional serial-row layout.
                 pc.bind(
                     0,
                     &UnaryData {
@@ -7407,7 +7441,7 @@ impl Session {
                         params: UnaryParams {
                             len: dispatch.params[0],   // m
                             _pad0: dispatch.params[1], // n
-                            _pad1: 0,
+                            _pad1: dispatch.params.get(2).copied().unwrap_or(0),
                             _pad2: 0,
                         },
                     },

@@ -175,6 +175,9 @@ an uninitialized model. See [compiler search](docs/compiler-search.md).
 | `MEGANEURA_REUSE_UPLOAD` | Reuse one staging buffer across `set_parameter` uploads instead of restaging per parameter. |
 | `MEGANEURA_TUNE` | Opt-in bounded matmul, convolution and GEMV search at build (`SessionConfig { tune: true }`), using private scratch. Scalar tiles and GEMV shapes also support reduced-storage weights. |
 | `MEGANEURA_FLASH_EPT_CAP=<n>` | Flash forward elements-per-thread cap (power of two ≥ 2). |
+| `MEGANEURA_FLASH_THREADS=<n>` | Flash forward workgroup width: 128 or 256. |
+| `MEGANEURA_FLASH_KEYS=<n>` | Flash forward shared key/value tile: power of two up to 16, capped by device shared memory. |
+| `MEGANEURA_FLASH_INTERLEAVE` | Interleave head dimensions across forward attention lanes. |
 | `MEGANEURA_FLASH_GRAD_Q_EPT_CAP=<n>` | EPT cap for flash dQ backward. |
 | `MEGANEURA_FLASH_GRAD_KV_EPT_CAP=<n>` | EPT cap for fused flash dK/dV backward. |
 | `MEGANEURA_FLASH_BWD_EPT_CAP=<n>` | Shared fallback cap for both flash backward kernels. |

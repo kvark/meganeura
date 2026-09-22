@@ -222,7 +222,7 @@ fn run_split(
         },
     );
     let cooperative = policy != CoopPolicy::Disabled;
-    let half_inputs = cooperative && gpu.capabilities().cooperative_matrix.f32_tile == 0;
+    let half_inputs = cooperative && meganeura::runtime::auto_tune(gpu, 0).coop_caps.f32_tile == 0;
     if cooperative {
         assert!(
             session
@@ -830,7 +830,7 @@ fn generated_conv_derivatives_match_oracle_without_assuming_same_padding() {
 
 fn cooperative_policy(gpu: &blade_graphics::Context) -> CoopPolicy {
     assert!(gpu.capabilities().cooperative_matrix.is_supported());
-    if gpu.capabilities().cooperative_matrix.f32_tile > 0 {
+    if meganeura::runtime::auto_tune(gpu, 0).coop_caps.f32_tile > 0 {
         CoopPolicy::Auto
     } else {
         // Exactly representable bounded operands isolate indexing on f16-only
@@ -864,7 +864,12 @@ fn generated_conv_indexing_matches_full_oracle_at_reciprocal_boundaries() {
             false,
         );
         // The native tile-8 policy deliberately keeps forward convolution scalar.
-        if gpu.capabilities().cooperative_matrix.f32_tile != 8 {
+        if !gpu
+            .capabilities()
+            .cooperative_matrix
+            .f32_shapes
+            .contains(&[8, 8, 8])
+        {
             assert!(
                 session
                     .plan()

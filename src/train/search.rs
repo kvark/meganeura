@@ -208,7 +208,12 @@ pub fn build_measured(
         }
     }
     let preparation_time = start.elapsed();
-    let programs = implementations(seeds, caps);
+    let programs = implementations(
+        seeds,
+        caps,
+        gpu.capabilities().max_compute_shared_memory_size,
+        options.max_plan_bytes,
+    );
     measure::select(
         programs,
         gpu,
@@ -234,57 +239,237 @@ struct Seed {
     description: String,
 }
 
+type AxisChoice = (
+    (u32, Option<(u32, crate::codegen::FlashAttentionShape)>),
+    (u32, u32, u32),
+    usize,
+);
+
+fn ranked_matrix_layouts() -> Vec<(u32, u32, u32)> {
+    let mut layouts = Vec::new();
+    for (split_rank, splits) in [8, 4, 2].into_iter().enumerate() {
+        for (tile_rank, tile) in [64, 32].into_iter().enumerate() {
+            for (stage_rank, stage) in [32, 8, 16].into_iter().enumerate() {
+                layouts.push((split_rank + tile_rank + stage_rank, (splits, tile, stage)));
+            }
+        }
+    }
+    layouts.sort_by_key(|&(rank, _)| rank);
+    std::iter::once((0, 32, 32))
+        .chain(layouts.into_iter().map(|(_, layout)| layout))
+        .collect()
+}
+
+fn early_physical_cover(
+    matrices: &[(u32, u32, u32)],
+    chunks: &[usize],
+    attention: &[(u32, Option<(u32, crate::codegen::FlashAttentionShape)>)],
+) -> Vec<AxisChoice> {
+    let default_matrix = (0, 32, 32);
+    let mut cover = Vec::new();
+    if let Some(&chunk) = chunks.get(1) {
+        cover.push(((0, None), default_matrix, chunk));
+    }
+    for matrix in matrices
+        .iter()
+        .copied()
+        .filter(|matrix| *matrix != default_matrix)
+        .take(3)
+    {
+        cover.push(((0, None), matrix, 1));
+        if let Some(&chunk) = chunks.get(1) {
+            cover.push(((0, None), matrix, chunk));
+        }
+    }
+    if let Some(&choice) = attention.get(1) {
+        cover.push((choice, default_matrix, 1));
+        if let Some(&chunk) = chunks.get(1) {
+            cover.push((choice, default_matrix, chunk));
+        }
+    }
+    cover
+}
+
+/// Baseline on every logical form, then the early physical cover on the ordinary
+/// graph, then that cover on the other forms, then the remaining schedules.
+fn physical_program_order(
+    n_seeds: usize,
+    baseline: AxisChoice,
+    cover: &[AxisChoice],
+    tail: &[AxisChoice],
+) -> Vec<(usize, AxisChoice)> {
+    let mut order = Vec::new();
+    for seed in 0..n_seeds {
+        order.push((seed, baseline));
+    }
+    for &choice in cover {
+        order.push((0, choice));
+    }
+    for &choice in cover {
+        for seed in 1..n_seeds {
+            order.push((seed, choice));
+        }
+    }
+    for &choice in tail {
+        for seed in 0..n_seeds {
+            order.push((seed, choice));
+        }
+    }
+    order
+}
+
 fn implementations(
     seeds: Vec<Seed>,
     caps: crate::codegen::CoopCaps,
+    shared_memory_bytes: u32,
+    max_partial_bytes: usize,
 ) -> impl Iterator<Item = measure::Program> {
-    let attention = seeds.iter().any(|p| {
+    let cached_attention = seeds.iter().any(|p| {
         p.graph
             .nodes()
             .iter()
             .any(|n| matches!(n.op, crate::graph::Op::CachedBlockAttention { .. }))
     });
-    let splits: &[u32] = if attention {
-        &[0, 1, 2, 4, 8, 16]
-    } else {
-        &[0]
-    };
+    let heads: Vec<_> = seeds
+        .iter()
+        .flat_map(|seed| &seed.plan.dispatches)
+        .filter(|d| d.shader.is_attention())
+        .map(|d| d.params[3])
+        .collect();
+    let mut attention = vec![(0, None)];
+    if !heads.is_empty() {
+        let mut layouts = Vec::new();
+        for (e, ept) in [32, 16, 8].into_iter().enumerate() {
+            for (t, threads) in [256, 128].into_iter().enumerate() {
+                for (k, keys) in [8, 16, 4].into_iter().enumerate() {
+                    for (l, interleave) in [false, true].into_iter().enumerate() {
+                        let shape = crate::codegen::FlashAttentionShape {
+                            threads,
+                            keys,
+                            interleave,
+                        };
+                        if heads
+                            .iter()
+                            .all(|&hd| shape.shared_bytes(hd) <= u64::from(shared_memory_bytes))
+                        {
+                            layouts.push((e + t + k + l, (0, Some((ept, shape)))));
+                        }
+                    }
+                }
+            }
+        }
+        layouts.sort_by_key(|&(rank, _)| rank);
+        attention.extend(layouts.into_iter().map(|(_, layout)| layout));
+    }
+    if cached_attention {
+        attention.extend([1, 2, 4, 8, 16].map(|splits| (splits, None)));
+    }
     let chunks = [1, 2, 4, 8, 16, 32, 64];
-    // Interleave settings across logical forms, starting near ordinary lowering.
-    // Lower only the next candidate; do not allocate a Cartesian product of plans.
-    let mut choices = (0..splits.len() + chunks.len() - 1).flat_map(move |rank| {
-        (0..splits.len()).filter_map(move |a| {
-            let c = rank.checked_sub(a)?;
-            chunks.get(c).map(|&chunks| (splits[a], chunks))
-        })
+    let matrices = ranked_matrix_layouts();
+    let default_matrix = (0, 32, 32);
+    let baseline = ((0, None), default_matrix, 1);
+    // The first alternative on each axis, then those axes crossed, on the
+    // ordinary graph before other seeds repeat them. Walking every seed through
+    // the whole single-axis list used up the program budget first, so split-K
+    // and submission chunking were measured separately and never together.
+    let cover = early_physical_cover(&matrices, &chunks, &attention);
+    let axis_len = matrices.len().max(attention.len()).max(chunks.len());
+    let single_axis = (0..axis_len).flat_map(|i| {
+        [
+            matrices
+                .get(i)
+                .copied()
+                .map(|matrix| ((0, None), matrix, 1)),
+            attention
+                .get(i + 1)
+                .copied()
+                .map(|choice| (choice, default_matrix, 1)),
+            chunks
+                .get(i + 1)
+                .copied()
+                .map(|chunk| ((0, None), default_matrix, chunk)),
+        ]
+        .into_iter()
+        .flatten()
     });
-    let mut current = (0, 1);
-    let mut seed_index = seeds.len();
+    let product = chunks.into_iter().flat_map(|chunk| {
+        let matrices = matrices.clone();
+        attention
+            .clone()
+            .into_iter()
+            .flat_map(move |attention_choice| {
+                matrices.clone().into_iter().filter_map(move |matrix| {
+                    let axes = usize::from(chunk != 1)
+                        + usize::from(attention_choice != (0, None))
+                        + usize::from(matrix.0 != 0);
+                    (axes >= 2).then_some((attention_choice, matrix, chunk))
+                })
+            })
+    });
+    let mut seen = vec![baseline];
+    seen.extend(cover.iter().copied());
+    let tail: Vec<_> = single_axis
+        .chain(product)
+        .filter(|choice| !seen.contains(choice))
+        .collect();
+    let order = physical_program_order(seeds.len(), baseline, &cover, &tail);
+    let mut cursor = 0;
     std::iter::from_fn(move || {
         loop {
-            if seed_index == seeds.len() {
-                current = choices.next()?;
-                seed_index = 0;
+            if cursor == order.len() {
+                return None;
             }
+            let (seed_index, current) = order[cursor];
+            cursor += 1;
             let seed = seeds.get(seed_index)?;
-            seed_index += 1;
-            let (splits, chunks) = current;
-            let plan = if splits == 0 {
+            let ((splits, flash), (matrix_splits, tile_size, k_stage), chunks) = current;
+            let mut plan = if splits == 0 && flash.is_none() {
                 seed.plan.clone()
             } else {
-                let options = compile::CompileOptions {
-                    cached_attention_splits: Some(splits),
-                    ..seed.options.clone()
-                };
+                let mut options = seed.options.clone();
+                if splits != 0 {
+                    options.cached_attention_splits = Some(splits);
+                }
+                if let Some((ept, shape)) = flash {
+                    options.knobs.flash_ept_cap = ept;
+                    options.knobs.flash = shape;
+                    options.flash_forward_coop = false;
+                }
                 let plan = compile::compile_with_caps(&seed.graph, &options, caps);
-                if plan == seed.plan {
+                if plan == seed.plan
+                    || (flash.is_some()
+                        && !plan
+                            .dispatches
+                            .iter()
+                            .any(|d| d.shader == compile::ShaderEntry::FlashAttention))
+                {
                     continue;
                 }
                 plan
             };
+            if matrix_splits != 0 {
+                let shape = crate::codegen::ScalarMatmulShape {
+                    tile_size,
+                    k_stage,
+                    interleave_columns: seed.options.knobs.matmul_interleave_columns,
+                };
+                let original_buffers = plan.buffers.len();
+                let mut remaining = max_partial_bytes;
+                for index in (0..plan.dispatches.len()).rev() {
+                    if plan
+                        .split_matmul(index, shape, matrix_splits, remaining)
+                        .is_ok()
+                    {
+                        remaining -= plan.buffers.last().unwrap();
+                    }
+                }
+                if plan.buffers.len() == original_buffers {
+                    continue;
+                }
+            }
             return Some(measure::Program {
                 description: format!(
-                    "{}, attention_splits={splits}, submission_chunks={chunks}",
+                    "{}, attention_splits={splits}, flash={flash:?}, matrix_splits={matrix_splits}, matrix_tile={tile_size}, matrix_k_stage={k_stage}, submission_chunks={chunks}",
                     seed.description
                 ),
                 plan,
@@ -297,6 +482,33 @@ fn implementations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_k_meets_submission_chunks_on_the_ordinary_graph_first() {
+        let matrices = ranked_matrix_layouts();
+        let chunks = [1, 2, 4, 8, 16, 32, 64];
+        let baseline = ((0, None), (0, 32, 32), 1);
+        let cover = early_physical_cover(&matrices, &chunks, &[]);
+        let order = physical_program_order(8, baseline, &cover, &[(baseline.0, (8, 64, 16), 1)]);
+        let crossed = order
+            .iter()
+            .position(|&(seed, choice)| seed == 0 && choice == ((0, None), (8, 64, 32), 2))
+            .expect("split-K crossed with two submission chunks");
+        assert!(crossed < 16, "crossed plan landed at program {crossed}");
+        assert_eq!(
+            order[..8]
+                .iter()
+                .map(|&(seed, choice)| (seed, choice == baseline))
+                .collect::<Vec<_>>(),
+            (0..8).map(|seed| (seed, true)).collect::<Vec<_>>()
+        );
+        let cover_end = 8 + cover.len();
+        assert!(
+            order[8..cover_end].iter().all(|&(seed, _)| seed == 0),
+            "other graphs wait until the ordinary graph has seen the cover"
+        );
+        assert_eq!(order[cover_end].0, 1);
+    }
 
     #[test]
     fn measured_build_keeps_graph_choices_and_training_state() {

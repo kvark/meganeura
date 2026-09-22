@@ -344,6 +344,7 @@ fn main() {
         let sm = meganeura::codegen::generate_flash_attention_module(
             64,
             meganeura::TuningKnobs::from_env().flash_ept_cap,
+            meganeura::TuningKnobs::from_env().flash,
         );
         analyze(
             "flash_attention_hd64",
