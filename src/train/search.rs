@@ -78,8 +78,10 @@ pub struct BuildSearchReport {
 /// from the original forward graph (one bounded region, repeated where verified).
 /// They are not greedily optimized again. Each training form is differentiated
 /// separately, so parameter transformations and gradients stay consistent.
-/// Complete plans explore dispatch fusion and cached-attention splits before
-/// allocation, plus submission chunk counts. Each plan is kernel-tuned before
+/// NN tile and split-K choices are egglog equalities. Lowering emits the
+/// extracted schedule and locks it. Complete plans still vary dispatch fusion,
+/// cached-attention splits, low-occupancy convolution weight-gradient splits,
+/// and submission chunk counts. Unlocked dispatches are kernel-tuned before
 /// comparison. This bounded search does not promise a global optimum.
 ///
 /// `options.tuning` replaces `cfg.tune`. Build-plan caching is not yet supported:
@@ -199,7 +201,10 @@ pub fn build_measured(
             let plan = compile::compile_with_caps(&graph, &options, caps);
             if !seeds.iter().any(|seed| seed.plan == plan) {
                 seeds.push(Seed {
-                    description: format!("graph={index}, dispatch_fusion={fusion}"),
+                    description: format!(
+                        "graph={index}, dispatch_fusion={fusion}, {}",
+                        matrix_schedule(&plan)
+                    ),
                     plan,
                     graph: graph.clone(),
                     options,
@@ -241,50 +246,43 @@ struct Seed {
 
 type AxisChoice = (
     (u32, Option<(u32, crate::codegen::FlashAttentionShape)>),
-    (u32, u32, u32),
     usize,
 );
 
-fn ranked_matrix_layouts() -> Vec<(u32, u32, u32)> {
-    let mut layouts = Vec::new();
-    for (split_rank, splits) in [8, 4, 2].into_iter().enumerate() {
-        for (tile_rank, tile) in [64, 32].into_iter().enumerate() {
-            for (stage_rank, stage) in [32, 8, 16].into_iter().enumerate() {
-                layouts.push((split_rank + tile_rank + stage_rank, (splits, tile, stage)));
-            }
-        }
+fn matrix_schedule(plan: &ExecutionPlan) -> String {
+    let parts: Vec<_> = plan
+        .dispatches
+        .iter()
+        .filter(|dispatch| {
+            dispatch.shader.is_matmul()
+                || matches!(dispatch.kernel, compile::Kernel::SplitMatmul { .. })
+        })
+        .map(|dispatch| {
+            format!(
+                "{:?} {:?} wg={:?} locked={}",
+                dispatch.shader, dispatch.kernel, dispatch.workgroups, dispatch.schedule_locked
+            )
+        })
+        .collect();
+    if parts.is_empty() {
+        "schedule=none".to_string()
+    } else {
+        parts.join("; ")
     }
-    layouts.sort_by_key(|&(rank, _)| rank);
-    std::iter::once((0, 32, 32))
-        .chain(layouts.into_iter().map(|(_, layout)| layout))
-        .collect()
 }
 
 fn early_physical_cover(
-    matrices: &[(u32, u32, u32)],
     chunks: &[usize],
     attention: &[(u32, Option<(u32, crate::codegen::FlashAttentionShape)>)],
 ) -> Vec<AxisChoice> {
-    let default_matrix = (0, 32, 32);
     let mut cover = Vec::new();
     if let Some(&chunk) = chunks.get(1) {
-        cover.push(((0, None), default_matrix, chunk));
-    }
-    for matrix in matrices
-        .iter()
-        .copied()
-        .filter(|matrix| *matrix != default_matrix)
-        .take(3)
-    {
-        cover.push(((0, None), matrix, 1));
-        if let Some(&chunk) = chunks.get(1) {
-            cover.push(((0, None), matrix, chunk));
-        }
+        cover.push(((0, None), chunk));
     }
     if let Some(&choice) = attention.get(1) {
-        cover.push((choice, default_matrix, 1));
+        cover.push((choice, 1));
         if let Some(&chunk) = chunks.get(1) {
-            cover.push((choice, default_matrix, chunk));
+            cover.push((choice, chunk));
         }
     }
     cover
@@ -365,45 +363,26 @@ fn implementations(
         attention.extend([1, 2, 4, 8, 16].map(|splits| (splits, None)));
     }
     let chunks = [1, 2, 4, 8, 16, 32, 64];
-    let matrices = ranked_matrix_layouts();
-    let default_matrix = (0, 32, 32);
-    let baseline = ((0, None), default_matrix, 1);
+    let baseline = ((0, None), 1usize);
     // The first alternative on each axis, then those axes crossed, on the
-    // ordinary graph before other seeds repeat them. Walking every seed through
-    // the whole single-axis list used up the program budget first, so split-K
-    // and submission chunking were measured separately and never together.
-    let cover = early_physical_cover(&matrices, &chunks, &attention);
-    let axis_len = matrices.len().max(attention.len()).max(chunks.len());
+    // ordinary graph before other seeds repeat them.
+    let cover = early_physical_cover(&chunks, &attention);
+    let axis_len = attention.len().max(chunks.len());
     let single_axis = (0..axis_len).flat_map(|i| {
         [
-            matrices
-                .get(i)
-                .copied()
-                .map(|matrix| ((0, None), matrix, 1)),
-            attention
-                .get(i + 1)
-                .copied()
-                .map(|choice| (choice, default_matrix, 1)),
-            chunks
-                .get(i + 1)
-                .copied()
-                .map(|chunk| ((0, None), default_matrix, chunk)),
+            attention.get(i + 1).copied().map(|choice| (choice, 1)),
+            chunks.get(i + 1).copied().map(|chunk| ((0, None), chunk)),
         ]
         .into_iter()
         .flatten()
     });
     let product = chunks.into_iter().flat_map(|chunk| {
-        let matrices = matrices.clone();
         attention
             .clone()
             .into_iter()
-            .flat_map(move |attention_choice| {
-                matrices.clone().into_iter().filter_map(move |matrix| {
-                    let axes = usize::from(chunk != 1)
-                        + usize::from(attention_choice != (0, None))
-                        + usize::from(matrix.0 != 0);
-                    (axes >= 2).then_some((attention_choice, matrix, chunk))
-                })
+            .filter_map(move |attention_choice| {
+                let axes = usize::from(chunk != 1) + usize::from(attention_choice != (0, None));
+                (axes >= 2).then_some((attention_choice, chunk))
             })
     });
     let mut seen = vec![baseline];
@@ -437,8 +416,8 @@ fn implementations(
             let (seed_index, current) = order[cursor];
             cursor += 1;
             let seed = seeds.get(seed_index)?;
-            let ((splits, flash), (matrix_splits, tile_size, k_stage), chunks) = current;
-            let mut plan = if splits == 0 && flash.is_none() {
+            let ((splits, flash), chunks) = current;
+            let plan = if splits == 0 && flash.is_none() {
                 seed.plan.clone()
             } else {
                 let mut options = seed.options.clone();
@@ -462,29 +441,9 @@ fn implementations(
                 }
                 plan
             };
-            if matrix_splits != 0 {
-                let shape = crate::codegen::ScalarMatmulShape {
-                    tile_size,
-                    k_stage,
-                    interleave_columns: seed.options.knobs.matmul_interleave_columns,
-                };
-                let original_buffers = plan.buffers.len();
-                let mut remaining = max_partial_bytes;
-                for index in (0..plan.dispatches.len()).rev() {
-                    if plan
-                        .split_matmul(index, shape, matrix_splits, remaining)
-                        .is_ok()
-                    {
-                        remaining -= plan.buffers.last().unwrap();
-                    }
-                }
-                if plan.buffers.len() == original_buffers {
-                    continue;
-                }
-            }
             return Some(measure::Program {
                 description: format!(
-                    "{}, attention_splits={splits}, flash={flash:?}, matrix_splits={matrix_splits}, matrix_tile={tile_size}, matrix_k_stage={k_stage}, submission_chunks={chunks}",
+                    "{}, attention_splits={splits}, flash={flash:?}, submission_chunks={chunks}",
                     seed.description
                 ),
                 plan,
@@ -556,17 +515,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn split_k_meets_submission_chunks_on_the_ordinary_graph_first() {
-        let matrices = ranked_matrix_layouts();
+    fn submission_chunks_lead_the_physical_cover() {
         let chunks = [1, 2, 4, 8, 16, 32, 64];
-        let baseline = ((0, None), (0, 32, 32), 1);
-        let cover = early_physical_cover(&matrices, &chunks, &[]);
-        let order = physical_program_order(8, baseline, &cover, &[(baseline.0, (8, 64, 16), 1)]);
-        let crossed = order
+        let baseline = ((0, None), 1usize);
+        let cover = early_physical_cover(&chunks, &[]);
+        assert_eq!(cover, vec![((0, None), 2)]);
+        let order = physical_program_order(8, baseline, &cover, &[((0, None), 4)]);
+        let chunk = order
             .iter()
-            .position(|&(seed, choice)| seed == 0 && choice == ((0, None), (8, 64, 32), 2))
-            .expect("split-K crossed with two submission chunks");
-        assert!(crossed < 16, "crossed plan landed at program {crossed}");
+            .position(|&(seed, choice)| seed == 0 && choice == ((0, None), 2))
+            .expect("two submission chunks on the ordinary graph");
+        assert!(chunk < 16, "chunk plan landed at program {chunk}");
         assert_eq!(
             order[..8]
                 .iter()
@@ -645,7 +604,8 @@ mod tests {
             )
             .unwrap();
             assert!(report.graphs.len() >= 3);
-            assert!(!report.extraction_truncated);
+            // Four tile schedules plus the unfused form do not fit in max_graphs.
+            assert!(report.extraction_truncated);
             assert!(report.trials.len() <= 24);
             assert!(report.skipped_regions.is_empty());
             assert!(report.trials.len() > report.graphs.len());

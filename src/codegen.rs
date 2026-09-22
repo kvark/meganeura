@@ -333,6 +333,8 @@ pub struct MatmulKnobs {
     /// the device reports `shader_integer_dot_product`; the exact scalar
     /// expansion is the fallback.
     pub integer_dot: bool,
+    /// Straight-line K loop instead of a counted loop.
+    pub unroll_k: bool,
 }
 
 impl Default for MatmulKnobs {
@@ -341,6 +343,7 @@ impl Default for MatmulKnobs {
             k_stage: 32,
             interleave_columns: false,
             integer_dot: false,
+            unroll_k: true,
         }
     }
 }
@@ -348,7 +351,11 @@ impl Default for MatmulKnobs {
 /// Measured scalar layout for plain F32/F16 weights, with F32 accumulation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ScalarMatmulShape {
+    /// Rows of C covered by one workgroup.
     pub tile_size: u32,
+    /// Columns of C covered by one workgroup. Zero means a square block.
+    #[serde(default)]
+    pub tile_n: u32,
     pub k_stage: u32,
     pub interleave_columns: bool,
 }
@@ -360,12 +367,31 @@ impl ScalarMatmulShape {
     }
 
     /// Columns of C covered by one workgroup.
-    ///
-    /// The scalar skeleton's block is square, so this matches [`Self::rows`].
-    /// A rectangular block would return its N extent here and the shader
-    /// template's `$BN_U` would follow.
     pub fn cols(self) -> u32 {
-        self.tile_size
+        if self.tile_n == 0 {
+            self.tile_size
+        } else {
+            self.tile_n
+        }
+    }
+
+    /// The staged tiles have to be an integer number of 256-thread passes,
+    /// and each thread's register tile is BM/16 by BN/16.
+    pub fn legal(self) -> bool {
+        let (bm, bn, k) = (self.rows(), self.cols(), self.k_stage);
+        matches!(k, 8 | 16 | 32)
+            && matches!(bm, 16 | 32 | 64)
+            && matches!(bn, 16 | 32 | 64)
+            && bm * k % 256 == 0
+            && bn * k % 256 == 0
+    }
+
+    pub fn geometry(self) -> MatMulTile {
+        match (self.rows(), self.cols()) {
+            (64, 64) => MatMulTile::Large,
+            (32, 32) => MatMulTile::Small,
+            (bm, bn) => MatMulTile::Rect { bm, bn },
+        }
     }
 }
 
@@ -404,6 +430,7 @@ pub(crate) fn generate_split_matmul(
     shape: ScalarMatmulShape,
     splits: u32,
     format: WeightFormat,
+    knobs: MatmulKnobs,
 ) -> ShaderModule {
     assert!(splits >= 2);
     assert!(group.is_matmul());
@@ -413,15 +440,11 @@ pub(crate) fn generate_split_matmul(
         None,
         MatMulOptions {
             format,
-            tile: if shape.tile_size == 32 {
-                MatMulTile::Small
-            } else {
-                MatMulTile::Large
-            },
+            tile: shape.geometry(),
             knobs: MatmulKnobs {
                 k_stage: shape.k_stage,
                 interleave_columns: shape.interleave_columns,
-                integer_dot: false,
+                ..knobs
             },
         },
         splits,
@@ -445,7 +468,6 @@ fn generate_partitioned_matmul(
         );
     }
     let (epi_decl, epi_body) = epilogue.map(matmul_epilogue_to_wgsl).unwrap_or_default();
-    let MatMulOptions { tile, .. } = options;
     let (a_idx, b_idx, fused_decl, fused_expr) = match group {
         ShaderGroup::MatMul => (MATMUL_A_FWD, MATMUL_B_FWD, "", ""),
         ShaderGroup::MatMulAdd => (
@@ -475,7 +497,7 @@ fn generate_partitioned_matmul(
     } else {
         fused_expr
     };
-    let (a_row, a_col, b_row, b_col) = epilogue_stage_maps(group, tile);
+    let (a_row, a_col, b_row, b_col) = epilogue_stage_maps(group);
     matmul_vars_tiled(
         MatMulIndexing {
             a_idx,
@@ -496,36 +518,22 @@ fn generate_partitioned_matmul(
     )
 }
 
-/// Thread-to-element staging maps for one tile size.
-///
-/// Both skeletons walk the same flat thread index over shared tiles, but
-/// the tiles are BM wide, so the row/col split differs between the 64×64
-/// and 32×32 geometries. Pairing a 64-wide map with a 32-wide tile reads
-/// the wrong elements into shared memory, so the maps travel with the
-/// tile rather than with the shader group.
+/// Thread-to-element staging maps. The widths are `$BM_U`, `$BN_U` and
+/// `$K_TILE_U`, so one mapping covers every scalar matmul tile.
 fn epilogue_stage_maps(
     group: ShaderGroup,
-    tile: MatMulTile,
 ) -> (&'static str, &'static str, &'static str, &'static str) {
     let a_transposed = matches!(group, ShaderGroup::MatMulAT | ShaderGroup::MatMulATAdd);
     let b_transposed = matches!(group, ShaderGroup::MatMulBT | ShaderGroup::MatMulBTAdd);
-    let (a_row, a_col) = match (a_transposed, tile) {
-        (false, MatMulTile::Large) => (A_ROW_FWD, A_COL_FWD),
-        (false, MatMulTile::Small) => (A_ROW_FWD_S, A_COL_FWD_S),
-        (true, MatMulTile::Large) => (A_ROW_AT, A_COL_AT),
-        (true, MatMulTile::Small) => (A_ROW_AT_S, A_COL_AT_S),
-        (_, MatMulTile::Occupancy) => {
-            panic!("conv occupancy tile is not a matmul epilogue geometry")
-        }
+    let (a_row, a_col) = if a_transposed {
+        (A_ROW_AT, A_COL_AT)
+    } else {
+        (A_ROW_FWD, A_COL_FWD)
     };
-    let (b_row, b_col) = match (b_transposed, tile) {
-        (false, MatMulTile::Large) => (B_ROW_FWD, B_COL_FWD),
-        (false, MatMulTile::Small) => (B_ROW_FWD_S, B_COL_FWD_S),
-        (true, MatMulTile::Large) => (B_ROW_BT, B_COL_BT),
-        (true, MatMulTile::Small) => (B_ROW_BT_S, B_COL_BT_S),
-        (_, MatMulTile::Occupancy) => {
-            panic!("conv occupancy tile is not a matmul epilogue geometry")
-        }
+    let (b_row, b_col) = if b_transposed {
+        (B_ROW_BT, B_COL_BT)
+    } else {
+        (B_ROW_FWD, B_COL_FWD)
     };
     (a_row, a_col, b_row, b_col)
 }
@@ -1032,22 +1040,12 @@ const MATMUL_B_BT: &str = "b_col * params.k + b_row"; // B^T[k,n] = B[n*K+k]
 /// output tile width for A[K,M] and B[K,N].
 const A_ROW_FWD: &str = "flat / $K_TILE_U"; // M varies slowly (good for [M,K])
 const A_COL_FWD: &str = "flat % $K_TILE_U"; // K varies fast (coalesced in [M,K])
-const A_ROW_AT: &str = "flat % 64u"; // M varies fast (coalesced in [K,M])
-const A_COL_AT: &str = "flat / 64u"; // K varies slowly
-const B_ROW_FWD: &str = "flat / 64u"; // K varies slowly (good for [K,N])
-const B_COL_FWD: &str = "flat % 64u"; // N varies fast (coalesced in [K,N])
+const A_ROW_AT: &str = "flat % $BM_U"; // M varies fast (coalesced in [K,M])
+const A_COL_AT: &str = "flat / $BM_U"; // K varies slowly
+const B_ROW_FWD: &str = "flat / $BN_U"; // K varies slowly (good for [K,N])
+const B_COL_FWD: &str = "flat % $BN_U"; // N varies fast (coalesced in [K,N])
 const B_ROW_BT: &str = "flat % $K_TILE_U"; // K varies fast (coalesced in [N,K])
 const B_COL_BT: &str = "flat / $K_TILE_U"; // N varies slowly
-
-// Small-tile (32×32) load mappings use the same K extent.
-const A_ROW_FWD_S: &str = A_ROW_FWD; // M slow, K fast
-const A_COL_FWD_S: &str = A_COL_FWD;
-const A_ROW_AT_S: &str = "flat % 32u"; // M fast (coalesced for [K,M])
-const A_COL_AT_S: &str = "flat / 32u";
-const B_ROW_FWD_S: &str = "flat / 32u"; // K slow
-const B_COL_FWD_S: &str = "flat % 32u"; // N fast
-const B_ROW_BT_S: &str = B_ROW_BT; // K fast (coalesced for [N,K])
-const B_COL_BT_S: &str = B_COL_BT;
 
 fn matmul_vars(
     a_idx: &str,
@@ -1111,6 +1109,8 @@ pub enum MatMulTile {
     /// BM=BN=16, TM=TN=1 — one output per thread when 32-wide tiles still
     /// leave the device idle.
     Occupancy,
+    /// Short-M or other non-square block. `bm` and `bn` are multiples of 16.
+    Rect { bm: u32, bn: u32 },
 }
 
 impl MatMulTile {
@@ -1119,21 +1119,35 @@ impl MatMulTile {
             MatMulTile::Large => 64,
             MatMulTile::Small => 32,
             MatMulTile::Occupancy => 16,
+            MatMulTile::Rect { bm, .. } => bm,
         }
     }
     fn bn(self) -> u32 {
-        self.bm()
-    }
-    fn tm(self) -> u32 {
         match self {
-            MatMulTile::Large => 4,
-            MatMulTile::Small => 2,
-            MatMulTile::Occupancy => 1,
+            MatMulTile::Large => 64,
+            MatMulTile::Small => 32,
+            MatMulTile::Occupancy => 16,
+            MatMulTile::Rect { bn, .. } => bn,
         }
     }
-    fn tn(self) -> u32 {
-        self.tm()
+    fn tm(self) -> u32 {
+        self.bm() / 16
     }
+    fn tn(self) -> u32 {
+        self.bn() / 16
+    }
+}
+
+/// One straight-line copy of the register tile per K step. Each step is its
+/// own block so the `let` accumulators can be repeated.
+fn unroll_k_math(compute_body: &str, k_tile: u32) -> String {
+    let mut out = String::new();
+    for kk in 0..k_tile {
+        out.push_str("{\n");
+        out.push_str(&compute_body.replace("kk", &format!("{kk}u")));
+        out.push_str("}\n");
+    }
+    out
 }
 
 /// Generate the unrolled `(acc_decl, compute_body, acc_array)` sections of
@@ -1147,8 +1161,10 @@ fn tiled_matmul_body(
         tile.tm(),
         tile.tn(),
         k_tile + 1,
-        tile.bm() + 1,
+        tile.bn() + 1,
         interleave_columns,
+        "shared_a",
+        "shared_b",
     )
 }
 
@@ -1218,7 +1234,8 @@ fn conv_gemm_tiled(
     // column is never stored or read.
     let a_stride = k_tile + 1;
     let b_stride = bm + 1;
-    let (acc_decl, compute_body, acc_array) = tiled_gemm_body(tm, tm, a_stride, b_stride, false);
+    let (acc_decl, compute_body, acc_array) =
+        tiled_gemm_body(tm, tm, a_stride, b_stride, false, "shared_a", "shared_b");
     let (declaration, divisor) = if let Some(values) = params {
         assert_eq!(values.len(), 16, "Conv2dParams layout");
         let arguments = values.iter().map(|v| format!("{v}u")).collect::<Vec<_>>();
@@ -1303,6 +1320,8 @@ fn tiled_gemm_body(
     a_stride: u32,
     b_stride: u32,
     interleave_columns: bool,
+    a_smem: &str,
+    b_smem: &str,
 ) -> (String, String, String) {
     use std::fmt::Write;
 
@@ -1318,7 +1337,7 @@ fn tiled_gemm_body(
     for i in 0..tm {
         let _ = writeln!(
             body,
-            "            let a{i} = shared_a[(ty * {tm}u + {i}u) * {a_stride}u + kk];"
+            "            let a{i} = {a_smem}[(ty * {tm}u + {i}u) * {a_stride}u + kk];"
         );
     }
     for j in 0..tn {
@@ -1329,7 +1348,7 @@ fn tiled_gemm_body(
         };
         let _ = writeln!(
             body,
-            "            let b{j} = shared_b[kk * {b_stride}u + {column}];"
+            "            let b{j} = {b_smem}[kk * {b_stride}u + {column}];"
         );
     }
     for i in 0..tm {
@@ -1526,7 +1545,7 @@ fn matmul_vars_tiled(
         )
     } else {
         "\
-        for (var e = 0u; e < $STAGE_EPT_U; e++) {\n\
+        for (var e = 0u; e < $B_STAGE_EPT_U; e++) {\n\
             let flat = tid + e * 256u;\n\
             let row_local = $B_ROW;\n\
             let col_local = $B_COL;\n\
@@ -1547,12 +1566,47 @@ fn matmul_vars_tiled(
         _ => 32,
     };
     assert!(
+        bm * k_tile % 256 == 0 && bn * k_tile % 256 == 0,
+        "matmul stage {bm}x{k_tile} and {bn}x{k_tile} must cover whole warps"
+    );
+    assert!(
         matches!(knobs.k_stage, 8 | 16 | 32),
         "unsupported scalar matmul K stage: {}",
         knobs.k_stage
     );
     let interleave_columns = !b_mode.is_quantized() && knobs.interleave_columns;
     let (acc_decl, compute_body, acc_array) = tiled_matmul_body(tile, k_tile, interleave_columns);
+    let shared_decl = "var<workgroup> shared_a: array<f32, $SHARED_A_SIZE>;\n\
+         var<workgroup> shared_b: array<f32, $SHARED_B_SIZE>;"
+        .to_string();
+    let k_math = if knobs.unroll_k {
+        unroll_k_math(&compute_body, k_tile)
+    } else {
+        "for (var kk = 0u; kk < $K_TILE_U; kk++) {\n            \
+             $COMPUTE_BODY\n        \
+         }"
+        .to_string()
+    };
+    let k_loop = format!(
+        "var t = first_tile * $K_TILE_U;\n    \
+         loop {{\n        \
+             if t >= end_k {{ break; }}\n        \
+             for (var e = 0u; e < $A_STAGE_EPT_U; e++) {{\n            \
+                 let flat = tid + e * 256u;\n            \
+                 let row_local = $A_ROW;\n            \
+                 let col_local = $A_COL;\n            \
+                 let a_row = tile_row + row_local;\n            \
+                 let a_col = t + col_local;\n            \
+                 let in_bounds = (a_row < params.m) && (a_col < params.k);\n            \
+                 shared_a[row_local * $A_STRIDE_U + col_local] = select(0.0, matrix_a[$A_INDEX], in_bounds);\n        \
+             }}\n        \
+             $B_STAGE_BODY\n        \
+             workgroupBarrier();\n        \
+             {k_math}\n        \
+             workgroupBarrier();\n        \
+             t += $K_TILE_U;\n    \
+         }}"
+    );
     let output_column = if interleave_columns {
         "tx + j * 16u".to_string()
     } else {
@@ -1561,8 +1615,10 @@ fn matmul_vars_tiled(
     let src = preprocess(
         src,
         &[
-            // Stage body is expanded first so the $VAR tokens it embeds
-            // ($B_LOAD_EXPR, $B_ROW, $BM_U, ...) still get substituted.
+            // The loop is inserted first so the stage tokens it embeds are
+            // still substituted by the entries below.
+            ("$SHARED_DECL", &shared_decl),
+            ("$K_LOOP", &k_loop),
             ("$B_STAGE_BODY", &b_stage_body),
             ("$ENABLE_F16", enable_f16),
             ("$B_STORAGE_TYPE", b_storage),
@@ -1587,9 +1643,10 @@ fn matmul_vars_tiled(
             ("$B_STRIDE_U", &format!("{}u", bn + 1)),
             ("$A_STRIDE_U", &format!("{}u", k_tile + 1)),
             ("$K_TILE_U", &format!("{k_tile}u")),
-            ("$STAGE_EPT_U", &format!("{}u", bm * k_tile / 256)),
+            ("$A_STAGE_EPT_U", &format!("{}u", bm * k_tile / 256)),
+            ("$B_STAGE_EPT_U", &format!("{}u", bn * k_tile / 256)),
             ("$SHARED_A_SIZE", &(bm * (k_tile + 1)).to_string()),
-            ("$SHARED_B_SIZE", &(k_tile * (bm + 1)).to_string()),
+            ("$SHARED_B_SIZE", &(k_tile * (bn + 1)).to_string()),
             ("$ACC_DECL", &acc_decl),
             ("$COMPUTE_BODY", &compute_body),
             ("$ACC_ARRAY", &acc_array),
@@ -1739,10 +1796,10 @@ fn gen_matmul_small(knobs: MatmulKnobs) -> ShaderModule {
     matmul_small_vars(
         MATMUL_A_FWD,
         MATMUL_B_FWD,
-        A_ROW_FWD_S,
-        A_COL_FWD_S,
-        B_ROW_FWD_S,
-        B_COL_FWD_S,
+        A_ROW_FWD,
+        A_COL_FWD,
+        B_ROW_FWD,
+        B_COL_FWD,
         "",
         "",
         knobs,
@@ -1752,10 +1809,10 @@ fn gen_matmul_small_add(knobs: MatmulKnobs) -> ShaderModule {
     matmul_small_vars(
         MATMUL_A_FWD,
         MATMUL_B_FWD,
-        A_ROW_FWD_S,
-        A_COL_FWD_S,
-        B_ROW_FWD_S,
-        B_COL_FWD_S,
+        A_ROW_FWD,
+        A_COL_FWD,
+        B_ROW_FWD,
+        B_COL_FWD,
         "var<storage> src: array<f32>;",
         " + src[idx]",
         knobs,
@@ -1765,10 +1822,10 @@ fn gen_matmul_small_at(knobs: MatmulKnobs) -> ShaderModule {
     matmul_small_vars(
         MATMUL_A_AT,
         MATMUL_B_FWD,
-        A_ROW_AT_S,
-        A_COL_AT_S,
-        B_ROW_FWD_S,
-        B_COL_FWD_S,
+        A_ROW_AT,
+        A_COL_AT,
+        B_ROW_FWD,
+        B_COL_FWD,
         "",
         "",
         knobs,
@@ -1778,10 +1835,10 @@ fn gen_matmul_small_bt(knobs: MatmulKnobs) -> ShaderModule {
     matmul_small_vars(
         MATMUL_A_FWD,
         MATMUL_B_BT,
-        A_ROW_FWD_S,
-        A_COL_FWD_S,
-        B_ROW_BT_S,
-        B_COL_BT_S,
+        A_ROW_FWD,
+        A_COL_FWD,
+        B_ROW_BT,
+        B_COL_BT,
         "",
         "",
         knobs,
@@ -1945,7 +2002,7 @@ fn gen_block_matmul(group: ShaderGroup, tile: MatMulTile) -> ShaderModule {
         ),
         _ => unreachable!(),
     };
-    let (a_row, a_col, b_row, b_col) = epilogue_stage_maps(ordinary, tile);
+    let (a_row, a_col, b_row, b_col) = epilogue_stage_maps(ordinary);
     matmul_vars_tiled(
         MatMulIndexing {
             a_idx,

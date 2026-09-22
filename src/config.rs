@@ -197,6 +197,8 @@ registry! {
         "Shared fallback EPT cap for both flash backward kernels.";
     MATMUL_K_STAGE: "MEGANEURA_MATMUL_K_STAGE", U32, Tuning,
         "K staging depth of the scalar tiled matmul: 8 | 16 | 32 (default 32).";
+    MATMUL_PIPELINE: "MEGANEURA_MATMUL_PIPELINE", Bool, Tuning,
+        "Unroll the scalar matmul K loop (default on). Set to 0 for the counted loop.";
     INTERLEAVE_COLUMNS: "MEGANEURA_INTERLEAVE_COLUMNS", Bool, Tuning,
         "Stagger scalar-matmul B loads across columns (16 lanes apart) instead of \
          tying a thread to consecutive columns.";
@@ -320,6 +322,7 @@ impl TuningKnobs {
                 })
                 .unwrap_or(d.matmul_k_stage),
             matmul_interleave_columns: INTERLEAVE_COLUMNS.bool_or(false),
+            unroll_k: MATMUL_PIPELINE.bool_or(true),
         }
     }
 }

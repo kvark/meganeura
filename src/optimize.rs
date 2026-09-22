@@ -151,6 +151,11 @@ impl egglog::extract::CostModel<u64> for FusionCostModel {
         if name == "Leaf" {
             return 0;
         }
+        // Tile variants are equal implementations. Their cost is a placeholder
+        // so extraction can enumerate them; measured search decides.
+        if scheduled_matmul(name).is_some() {
+            return 1;
+        }
         let Some(sizes) = self.sizes.as_ref() else {
             return 1;
         };
@@ -625,6 +630,17 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
   (FusedMatMulAdd Op Op Op)
   (FusedMatMulATAdd Op Op Op)
   (FusedMatMulBTAdd Op Op Op)
+  ; Concrete matrix implementations. Same tensor as MatMul / FusedMatMulAdd.
+  ; Names encode tile_m, tile_n, k stage, and split count so extraction can
+  ; forbid one variant without forbidding the others.
+  (M6464k32 Op Op)
+  (M3232k32 Op Op)
+  (M6432k32 Op Op)
+  (M6464k8s8 Op Op)
+  (MA6464k32 Op Op Op)
+  (MA3232k32 Op Op Op)
+  (MA6432k32 Op Op Op)
+  (MA6464k8s8 Op Op Op)
   (Add Op Op)
   (Mul Op Op)
   (Relu Op)
@@ -1203,6 +1219,30 @@ impl Stamper<'_> {
             }
             _ => {}
         }
+        if let Some(spec) = scheduled_matmul(name) {
+            let fused = name.starts_with("MA");
+            let (op, ty) = if fused {
+                (Op::FusedMatMulAdd, self.g.node(inputs[2]).ty.clone())
+            } else {
+                let a = self.g.node(inputs[0]).ty.shape.clone();
+                let b = self.g.node(inputs[1]).ty.shape.clone();
+                if a.len() != 2 || b.len() != 2 {
+                    return Err(format!("{name} needs rank-2 operands"));
+                }
+                (Op::MatMul, TensorType::f32(vec![a[0], b[1]]))
+            };
+            let id = self.place(op, inputs.clone(), ty, target);
+            self.g.nodes_mut()[id as usize].matmul_impl = Some(spec);
+            self.index.insert(
+                (
+                    static_constructor(name)?,
+                    inputs,
+                    self.requires_full_precision,
+                ),
+                id,
+            );
+            return Ok(id);
+        }
         let shape = |id: NodeId| self.g.node(id).ty.shape.clone();
         let ty_of = |id: NodeId| self.g.node(id).ty.clone();
         let rank2 = |id: NodeId| {
@@ -1338,7 +1378,7 @@ impl Stamper<'_> {
         ty: TensorType,
         target: Option<NodeId>,
     ) -> NodeId {
-        match target {
+        let id = match target {
             Some(id) => {
                 let node = &mut self.g.nodes_mut()[id as usize];
                 node.op = op;
@@ -1350,12 +1390,43 @@ impl Stamper<'_> {
                 self.g
                     .add_raw_node_with_precision(op, inputs, ty, self.requires_full_precision)
             }
-        }
+        };
+        self.g.nodes_mut()[id as usize].matmul_impl = None;
+        id
     }
 }
 
 fn named_constructor_exists(name: &str) -> bool {
     static_constructor(name).is_ok()
+}
+
+/// Tile equalities used only by measured extraction. Ordinary `optimize`
+/// does not run these rules, so a normal build still lowers the logical op.
+pub(crate) const TILE_EQUALITY_RULES: &str = "\
+(rewrite (MatMul ?a ?b) (M6464k32 ?a ?b))
+(rewrite (MatMul ?a ?b) (M3232k32 ?a ?b))
+(rewrite (MatMul ?a ?b) (M6432k32 ?a ?b))
+(rewrite (MatMul ?a ?b) (M6464k8s8 ?a ?b))
+(rewrite (FusedMatMulAdd ?a ?b ?d) (MA6464k32 ?a ?b ?d))
+(rewrite (FusedMatMulAdd ?a ?b ?d) (MA3232k32 ?a ?b ?d))
+(rewrite (FusedMatMulAdd ?a ?b ?d) (MA6432k32 ?a ?b ?d))
+(rewrite (FusedMatMulAdd ?a ?b ?d) (MA6464k8s8 ?a ?b ?d))
+";
+
+pub(crate) fn scheduled_matmul(name: &str) -> Option<crate::graph::MatmulImpl> {
+    let spec = |tile_m, tile_n, k_stage, splits| crate::graph::MatmulImpl {
+        tile_m,
+        tile_n,
+        k_stage,
+        splits,
+    };
+    Some(match name {
+        "M6464k32" | "MA6464k32" => spec(64, 64, 32, 1),
+        "M3232k32" | "MA3232k32" => spec(32, 32, 32, 1),
+        "M6432k32" | "MA6432k32" => spec(64, 32, 32, 1),
+        "M6464k8s8" | "MA6464k8s8" => spec(64, 64, 8, 8),
+        _ => return None,
+    })
 }
 
 /// Interns a constructor name to the `'static` string used as the
@@ -1382,6 +1453,14 @@ fn static_constructor(name: &str) -> Result<&'static str, String> {
         "GeGLU" => "GeGLU",
         "GeGLUPacked" => "GeGLUPacked",
         "GeGLUPackedBT" => "GeGLUPackedBT",
+        "M6464k32" => "M6464k32",
+        "M3232k32" => "M3232k32",
+        "M6432k32" => "M6432k32",
+        "M6464k8s8" => "M6464k8s8",
+        "MA6464k32" => "MA6464k32",
+        "MA3232k32" => "MA3232k32",
+        "MA6432k32" => "MA6432k32",
+        "MA6464k8s8" => "MA6464k8s8",
         other => return Err(format!("unknown constructor {}", other)),
     })
 }

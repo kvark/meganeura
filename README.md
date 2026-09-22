@@ -182,6 +182,7 @@ an uninitialized model. See [compiler search](docs/compiler-search.md).
 | `MEGANEURA_FLASH_GRAD_KV_EPT_CAP=<n>` | EPT cap for fused flash dK/dV backward. |
 | `MEGANEURA_FLASH_BWD_EPT_CAP=<n>` | Shared fallback cap for both flash backward kernels. |
 | `MEGANEURA_MATMUL_K_STAGE=<n>` | Scalar tiled matmul K staging depth: 8 \| 16 \| 32 (default 32). |
+| `MEGANEURA_MATMUL_PIPELINE=0` | Use a counted K loop in scalar matmul. The default unrolls that loop. |
 | `MEGANEURA_INTERLEAVE_COLUMNS` | Stagger scalar-matmul B loads across columns (16 lanes apart) instead of through consecutive ones. |
 | `MEGANEURA_DEVICE_ID=0x744c` | Adapter selection by numeric device id. |
 | `MEGANEURA_GPU_TIMING` | Enable hardware timestamp pools (set before context creation). |

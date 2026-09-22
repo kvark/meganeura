@@ -377,7 +377,13 @@ impl MatmulTile {
             Self::Tile16 => 16,
             Self::Tile32 => 32,
             Self::Tile64 => 64,
-            Self::Scalar(shape) => shape.tile_size,
+            Self::Scalar(shape) => {
+                return [
+                    class.n.div_ceil(shape.cols()),
+                    class.m.div_ceil(shape.rows()),
+                    class.batch_dispatches(),
+                ];
+            }
             Self::SpecializedConv { tile_size, .. } => tile_size,
             Self::CooperativeF32 { tile_size } => {
                 let tile = 2 * tile_size;
@@ -399,8 +405,7 @@ impl MatmulTile {
             if class.conv2d.is_some()
                 || gemv_group(&class.shader).is_some()
                 || class.weight_format.is_quantized()
-                || !matches!(shape.tile_size, 32 | 64)
-                || !matches!(shape.k_stage, 8 | 16 | 32)
+                || !shape.legal()
             {
                 return None;
             }
@@ -514,6 +519,7 @@ impl TuneClass {
             || dispatch.pointwise().is_some()
             || dispatch.reduction().is_some()
             || dispatch.input_buffers.len() != if addend { 3 } else { 2 }
+            || dispatch.schedule_locked
         {
             return None;
         }
@@ -769,6 +775,7 @@ impl TuneClass {
                     for tile_size in [64, 32] {
                         candidates.push(MatmulTile::Scalar(crate::codegen::ScalarMatmulShape {
                             tile_size,
+                            tile_n: 0,
                             k_stage,
                             interleave_columns,
                         }));

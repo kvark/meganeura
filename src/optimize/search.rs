@@ -268,6 +268,9 @@ fn segment_candidates(
     };
     let mut egraph = super::rule_graph(config.pack_swiglu);
     egraph
+        .parse_and_run_program(None, super::TILE_EQUALITY_RULES)
+        .map_err(|e| e.to_string())?;
+    egraph
         .parse_and_run_program(None, &program)
         .map_err(|e| e.to_string())?;
     let sort = egraph.get_sort_by_name("Op").unwrap().clone();
@@ -406,6 +409,69 @@ mod tests {
     use super::candidates;
     use crate::{Graph, graph::Op};
 
+    fn has_fused_tile(candidate: &super::Candidate) -> bool {
+        candidate
+            .graph
+            .nodes()
+            .iter()
+            .any(|node| matches!(node.op, Op::FusedMatMulAdd) && node.matmul_impl.is_some())
+    }
+
+    fn has_unfused_tile(candidate: &super::Candidate) -> bool {
+        candidate.graph.nodes().iter().any(|node| {
+            matches!(node.op, Op::Add)
+                && node.inputs.iter().any(|&id| {
+                    let child = candidate.graph.node(id);
+                    matches!(child.op, Op::MatMul) && child.matmul_impl.is_some()
+                })
+        })
+    }
+
+    #[test]
+    fn tile_equalities_reach_a_locked_kernel_without_changing_optimize() {
+        let mut graph = Graph::new();
+        let a = graph.input("a", &[50, 64]);
+        let b = graph.parameter("b", &[64, 96]);
+        let y = graph.matmul(a, b);
+        graph.set_outputs(vec![y]);
+        let space = candidates(&graph, Default::default(), 4).unwrap();
+        let impls: Vec<_> = space
+            .candidates
+            .iter()
+            .filter_map(|candidate| {
+                candidate
+                    .graph
+                    .nodes()
+                    .iter()
+                    .find_map(|node| node.matmul_impl)
+            })
+            .collect();
+        assert!(impls.len() >= 2, "{impls:?}");
+        assert!(
+            impls
+                .iter()
+                .any(|spec| spec.tile_n == 32 && spec.splits == 1)
+        );
+        assert!(impls.iter().any(|spec| spec.splits == 8));
+        for candidate in &space.candidates {
+            let plan = crate::compile::compile(&candidate.graph);
+            assert!(
+                plan.dispatches
+                    .iter()
+                    .any(|dispatch| dispatch.schedule_locked),
+                "unlocked plan for {}",
+                candidate.expression
+            );
+        }
+        let optimized = crate::optimize::optimize(&graph);
+        assert!(
+            optimized
+                .nodes()
+                .iter()
+                .all(|node| node.matmul_impl.is_none())
+        );
+    }
+
     #[test]
     #[ignore = "CPU search timing, run separately from correctness tests"]
     #[cfg(feature = "models")]
@@ -453,7 +519,6 @@ mod tests {
         let out = graph.add(product, c);
         graph.set_outputs(vec![out]);
         let space = candidates(&graph, Default::default(), 8).unwrap();
-        assert!(!space.truncated);
         let choices = space.candidates;
         assert!(
             choices
@@ -481,7 +546,6 @@ mod tests {
         }));
         graph.set_outputs(vec![product, out]);
         let space = candidates(&graph, Default::default(), 8).unwrap();
-        assert!(!space.truncated);
         assert!(
             space
                 .candidates
@@ -503,18 +567,15 @@ mod tests {
         let out = graph.neg(add);
         graph.set_outputs(vec![out]);
         let space = candidates(&graph, Default::default(), 8).unwrap();
-        assert!(!space.truncated);
+        assert!(space.candidates.iter().any(has_fused_tile));
         assert!(
+            space.candidates.iter().any(has_unfused_tile),
+            "unfused tile was crowded out: {:?}",
             space
                 .candidates
                 .iter()
-                .any(|c| c.expression.starts_with("(Neg (FusedMatMulAdd"))
-        );
-        assert!(
-            space
-                .candidates
-                .iter()
-                .any(|c| c.expression.starts_with("(Neg (Add (MatMul"))
+                .map(|c| c.expression.clone())
+                .collect::<Vec<_>>()
         );
         assert!(candidates(&graph, Default::default(), 1).unwrap().truncated);
 
@@ -526,23 +587,24 @@ mod tests {
         let out = graph.mul(add, add2);
         graph.set_outputs(vec![out]);
         let space = candidates(&graph, Default::default(), 16).unwrap();
-        assert!(!space.truncated);
-        let forms: std::collections::HashSet<_> = space
+        assert!(space.truncated);
+        assert!(space.candidates.len() > 4);
+        let tiles: std::collections::HashSet<_> = space
             .candidates
             .iter()
-            .map(|candidate| candidate.expression.matches("FusedMatMulAdd").count())
+            .flat_map(|candidate| candidate.graph.nodes().iter().filter_map(|n| n.matmul_impl))
             .collect();
-        assert_eq!(forms, [0, 1, 2].into_iter().collect());
-        assert_eq!(space.candidates.len(), 4);
+        assert!(
+            tiles.len() >= 2,
+            "tile equalities did not survive extraction: {tiles:?}"
+        );
         let bounded = candidates(&graph, Default::default(), 2).unwrap();
         assert!(bounded.truncated);
-        assert_eq!(
-            bounded
-                .candidates
-                .iter()
-                .map(|c| c.expression.matches("FusedMatMulAdd").count())
-                .collect::<Vec<_>>(),
-            [2, 0],
+        assert_eq!(bounded.candidates.len(), 2);
+        assert!(bounded.candidates.iter().all(has_fused_tile));
+        assert_ne!(
+            bounded.candidates[0].expression,
+            bounded.candidates[1].expression
         );
 
         // Search only the second pair. External inputs keep their identities,
@@ -554,13 +616,21 @@ mod tests {
             8,
         )
         .unwrap();
-        assert_eq!(region.candidates.len(), 2);
-        assert!(
-            region
-                .candidates
+        assert!(region.candidates.len() >= 2);
+        assert!(region.candidates.iter().all(|candidate| {
+            let untouched = candidate
+                .graph
+                .nodes()
                 .iter()
-                .all(|c| c.expression.matches("FusedMatMulAdd").count() <= 1)
-        );
+                .find(|node| matches!(&node.op, Op::Parameter { name } if name == "b"))
+                .unwrap()
+                .id;
+            candidate.graph.nodes().iter().any(|node| {
+                matches!(node.op, Op::MatMul)
+                    && node.matmul_impl.is_none()
+                    && node.inputs.contains(&untouched)
+            })
+        }));
         assert!(super::region_candidates(&graph, 0..0, Default::default(), 8).is_err());
 
         let mut graph = Graph::new();
@@ -574,14 +644,14 @@ mod tests {
         graph.set_outputs(vec![h]);
         let region = crate::outline::detect_repeated_regions(&graph)[0];
         let space = super::repeated_candidates(&graph, region, Default::default(), 8).unwrap();
-        assert!(!space.truncated);
-        assert_eq!(space.candidates.len(), 2);
+        assert!(space.truncated);
+        assert!(space.candidates.len() >= 2);
         assert!(space.candidates.iter().any(|candidate| {
             candidate
                 .graph
                 .nodes()
                 .iter()
-                .filter(|node| matches!(node.op, Op::FusedMatMulAdd))
+                .filter(|node| matches!(node.op, Op::FusedMatMulAdd) && node.matmul_impl.is_some())
                 .count()
                 == region.count
         }));

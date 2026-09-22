@@ -1345,6 +1345,7 @@ impl Pipelines {
             k_stage: knobs.matmul_k_stage,
             interleave_columns: knobs.matmul_interleave_columns,
             integer_dot: gpu.capabilities().shader_integer_dot_product,
+            unroll_k: knobs.unroll_k,
         };
         let group = dispatch.shader.shader_group();
         let mut layout = shader_data_layout(&dispatch.shader);
@@ -1365,9 +1366,13 @@ impl Pipelines {
                 crate::tune::MatmulTile::Scalar(shape),
                 matmul_knobs,
             ),
-            Variant::SplitMatmul(_, shape, splits) => {
-                crate::codegen::generate_split_matmul(group, shape, splits, dispatch.weight_format)
-            }
+            Variant::SplitMatmul(_, shape, splits) => crate::codegen::generate_split_matmul(
+                group,
+                shape,
+                splits,
+                dispatch.weight_format,
+                matmul_knobs,
+            ),
             Variant::SpecializedConv(..) => {
                 let tile = crate::tune::MatmulTile::selected(dispatch, None)
                     .expect("specialized convolution");
