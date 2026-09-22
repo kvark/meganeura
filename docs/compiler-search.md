@@ -89,7 +89,8 @@ An invalid challenger is discarded; an invalid incumbent aborts the search.
 An initializer may share compatible immutable weights from the idle incumbent.
 
 Implemented choices include fused/unfused graph forms, dispatch fusion,
-cached-attention splits and fresh submission chunk counts. Existing
+dense matrix partitions, forward-attention layouts, cached-attention splits
+and fresh submission chunk counts. Existing
 layout-preserving kernel choices are tuned before
 whole-plan comparison; completed comparisons can be reused within that build.
 Attention splits use the existing compiler, with no session-buffer patching.
@@ -100,9 +101,9 @@ graphs are searched together; large graphs currently explore one verified
 repeated region. Stateful or mixed-precision regions remain opaque. Physical
 settings are currently applied uniformly to eligible operations within a plan,
 not independently to every site. The report must be read with those limits.
-There is no persistent measured-plan cache yet. Dense split-K and alternate row
-reductions remain prototypes on the experiment branch, not additions to this
-refactoring. The broader alternatives below
+There is no persistent measured-plan cache yet. Rectangular cooperative kernels
+remain experiments. The [September 21 investigation](gpu-gap-2026-09.md) records
+the current search limits, costing fixes and measured kernel changes. The broader alternatives below
 remain research directions, not additional dependencies or hidden search paths.
 
 ## Refactor checkpoint
@@ -191,7 +192,7 @@ samples. Differentiation and graph-copy costs need separate attribution before
 changing egglog again. Linux sampling was unavailable (`perf_event_paranoid=4`);
 these are elapsed-time experiments, not a claim about sampled CPU hotspots.
 
-## Next cohort gate
+## September 20 integration gate (historical)
 
 Do not start a distributed cohort merely by merging this PR. Inferena at
 `fa5a04e1` still calls ordinary `build` and then `tune_with`, before model inputs
