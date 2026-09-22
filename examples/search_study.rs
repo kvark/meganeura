@@ -8,10 +8,12 @@
 //! `one-graph+tuner` extracts one graph, then runs the private
 //! kernel tuner. `egraph` keeps tile and split-K equalities and times whole
 //! steps. Both use the same inputs, device, and profiled-median readout.
+//! Private probes use the same default policy. The measured arm has a larger
+//! total budget; preparation times are reported, not held equal.
 use std::time::{Duration, Instant};
 
 use meganeura::{
-    CoopPolicy, Graph, Session, SessionConfig, TuneOptions,
+    CoopPolicy, Graph, Session, SessionConfig,
     train::{BuildSearchOptions, Mode, build, build_measured},
 };
 
@@ -142,16 +144,16 @@ fn main() {
         let label = format!("{m}x{n}x{k}{}", if fuse { "+add" } else { "" });
 
         let started = Instant::now();
-        let (mut greedy, _) = build(&graph, base_config(true));
-        load(&mut greedy, fuse, &a, &b, &d);
-        greedy.step();
-        greedy.wait();
-        check(&greedy, &expected).unwrap_or_else(|error| panic!("{label} greedy {error}"));
-        let greedy_us = profile(&mut greedy);
+        let (mut single, _) = build(&graph, base_config(true));
+        load(&mut single, fuse, &a, &b, &d);
+        single.step();
+        single.wait();
+        check(&single, &expected).unwrap_or_else(|error| panic!("{label} one-graph {error}"));
+        let single_us = profile(&mut single);
         println!(
-            "one-graph+tuner {label} gpu_us {greedy_us:.2} setup_s {:.1} plan {}",
+            "one-graph+tuner {label} gpu_us {single_us:.2} setup_s {:.1} plan {}",
             started.elapsed().as_secs_f64(),
-            describe(&greedy)
+            describe(&single)
         );
 
         let started = Instant::now();
@@ -163,13 +165,6 @@ fn main() {
                 max_programs: 24,
                 max_time: Duration::from_secs(40),
                 warmup_runs: 1,
-                tuning: TuneOptions {
-                    max_time: Duration::from_secs(2),
-                    sample_pairs: 4,
-                    warmup_runs: 1,
-                    dispatches_per_sample: 4,
-                    ..TuneOptions::default()
-                },
                 ..BuildSearchOptions::default()
             },
             |session, _| {

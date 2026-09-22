@@ -1,6 +1,6 @@
 # Unreleased
 
-- Search NN matrix tiles, K staging, unrolling and split-K as e-graph alternatives,
+- Search matrix tiles, K staging, unrolling and split-K as e-graph alternatives,
   preserving logical fusion choices and qualifying complete implementations.
 - Use one egglog rewrite engine and calibrated whole-program search instead of live attention/submission retuning.
 - Broadcast scalar gradients directly and eliminate single-row RoPE at static position zero.
@@ -12,9 +12,8 @@
   that each session's pipeline layer owns; every module it compiles (the
   standard, coop, weighted, epilogue-fused and scheduled forms, plus the
   tuner's candidates) is written there, each file naming the shader and a
-  content hash. The matmul knobs (`MEGANEURA_MATMUL_K_STAGE`,
-  `MEGANEURA_INTERLEAVE_COLUMNS`) ride `TuningKnobs` into the plan the
-  same way the flash caps do. The profiler state is armed once — by
+  content hash. Matmul schedules are now measured e-graph alternatives,
+  not environment switches. The profiler state is armed once — by
   `init` or by GPU-context initialization — instead of being lazily
   conjured on first use, and `default_gpu_context` returns a fresh
   context per call rather than a hidden process-global first-device
@@ -23,12 +22,9 @@
   reads `MEGANEURA_*` variables, and its product is configuration — it no
   longer modifies the process environment. The one boolean decoding rule
   is a pure function under test, so the config tests don't flip env vars.
-  The six stragglers that still read the environment inline are typed
-  options now: `MEGANEURA_OPTIMIZER` neighbors `GREEDY_PACK_SWIGLU`
-  (`OptimizeConfig::pack_swiglu`), `MATMUL_K_STAGE` and
-  `MEGANEURA_INTERLEAVE_COLUMNS` ride `TuningKnobs` into the matmul
-  codegen, and `MEGANEURA_DEVICE_PARAMETERS` / `MEGANEURA_REUSE_UPLOAD`
-  are `SessionOptions` fields. All are registered and documented in the
+  `MEGANEURA_OPTIMIZER` configures graph rewriting;
+  `MEGANEURA_DEVICE_PARAMETERS` / `MEGANEURA_REUSE_UPLOAD` are
+  `SessionOptions` fields. Current controls are registered and documented in the
   README; an unknown `MEGANEURA_*` name warns instead of panicking.
 - First-party model configs drop their prefixed names — `SmolLM2Config`,
   `SmolVLAConfig`, `SmolVLM2Config`, `SDUNetConfig` and `WhisperConfig`
