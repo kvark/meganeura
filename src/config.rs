@@ -195,13 +195,7 @@ registry! {
         "EPT cap for the fused flash dK/dV backward kernel.";
     FLASH_BWD_EPT_CAP: "MEGANEURA_FLASH_BWD_EPT_CAP", U32, Tuning,
         "Shared fallback EPT cap for both flash backward kernels.";
-    MATMUL_K_STAGE: "MEGANEURA_MATMUL_K_STAGE", U32, Tuning,
-        "K staging depth of the scalar tiled matmul: 8 | 16 | 32 (default 32).";
-    MATMUL_PIPELINE: "MEGANEURA_MATMUL_PIPELINE", Bool, Tuning,
-        "Unroll the scalar matmul K loop (default on). Set to 0 for the counted loop.";
-    INTERLEAVE_COLUMNS: "MEGANEURA_INTERLEAVE_COLUMNS", Bool, Tuning,
-        "Stagger scalar-matmul B loads across columns (16 lanes apart) instead of \
-         tying a thread to consecutive columns.";
+
 
     // --- Resource / mode selection ---
     DEVICE_ID: "MEGANEURA_DEVICE_ID", Text, Selection,
@@ -311,18 +305,9 @@ impl TuningKnobs {
                 .or(bwd)
                 .or(fwd)
                 .unwrap_or(d.flash_grad_kv_ept_cap),
-            matmul_k_stage: MATMUL_K_STAGE
-                .u32_value()
-                .filter(|v| {
-                    let ok = matches!(v, 8 | 16 | 32);
-                    if !ok {
-                        log::warn!("MEGANEURA_MATMUL_K_STAGE must be 8, 16 or 32; ignoring");
-                    }
-                    ok
-                })
-                .unwrap_or(d.matmul_k_stage),
-            matmul_interleave_columns: INTERLEAVE_COLUMNS.bool_or(false),
-            unroll_k: MATMUL_PIPELINE.bool_or(true),
+            matmul_k_stage: d.matmul_k_stage,
+            matmul_interleave_columns: false,
+            unroll_k: true,
         }
     }
 }

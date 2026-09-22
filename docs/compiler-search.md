@@ -89,7 +89,7 @@ An invalid challenger is discarded; an invalid incumbent aborts the search.
 An initializer may share compatible immutable weights from the idle incumbent.
 
 Implemented choices include fused and unfused graph forms, the NN matmul
-tile and split-K equalities lowered by the ordinary compiler, dispatch fusion,
+tile, K-stage, and split-K equalities lowered by the ordinary compiler, dispatch fusion,
 forward-attention layouts, cached-attention splits, low-occupancy convolution
 weight-gradient splits, and fresh submission chunk counts. An extracted matmul
 schedule is locked, so a later kernel probe cannot replace its tile. Unlocked
