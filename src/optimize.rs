@@ -151,11 +151,6 @@ impl egglog::extract::CostModel<u64> for FusionCostModel {
         if name == "Leaf" {
             return 0;
         }
-        // Tile variants are equal implementations. Their cost is a placeholder
-        // so extraction can enumerate them; measured search decides.
-        if scheduled_matmul(name).is_some() {
-            return 1;
-        }
         let Some(sizes) = self.sizes.as_ref() else {
             return 1;
         };
@@ -173,7 +168,7 @@ impl egglog::extract::CostModel<u64> for FusionCostModel {
             return read.saturating_add(out_bytes);
         }
         // Unbound outputs use a structural fallback, with fused ops preferred.
-        match name {
+        match matrix_family(name).unwrap_or(name) {
             "FusedMatMulAdd" | "FusedMatMulATAdd" | "FusedMatMulBTAdd" | "SwiGLUPacked"
             | "GeGLUPacked" | "SwiGLUPackedBT" | "GeGLUPackedBT" => 9,
             _ => 10,
@@ -630,21 +625,6 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
   (FusedMatMulAdd Op Op Op)
   (FusedMatMulATAdd Op Op Op)
   (FusedMatMulBTAdd Op Op Op)
-  ; Concrete matrix implementations. Same tensor as MatMul / FusedMatMulAdd.
-  ; Names encode tile_m, tile_n, k stage, and split count so extraction can
-  ; forbid one variant without forbidding the others.
-  (M6464k32 Op Op)
-  (M6464k16 Op Op)
-  (M3232k32 Op Op)
-  (M3232k16 Op Op)
-  (M6432k32 Op Op)
-  (M6464k8s8 Op Op)
-  (MA6464k32 Op Op Op)
-  (MA6464k16 Op Op Op)
-  (MA3232k32 Op Op Op)
-  (MA3232k16 Op Op Op)
-  (MA6432k32 Op Op Op)
-  (MA6464k8s8 Op Op Op)
   (Add Op Op)
   (Mul Op Op)
   (Relu Op)
@@ -717,18 +697,21 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
     // a fixpoint; the fourth is margin for future rules.
 }
 
-fn rule_graph(pack_swiglu: bool) -> egglog::EGraph {
+fn rule_graph(pack_swiglu: bool, tiles: bool) -> egglog::EGraph {
     // Egglog clones share a mutable table-notification list. Searches on
     // different threads must not clone the same initialized database.
     thread_local! {
-        static RULES: [std::cell::OnceCell<egglog::EGraph>; 2] =
-            const { [const { std::cell::OnceCell::new() }; 2] };
+        static RULES: [std::cell::OnceCell<egglog::EGraph>; 4] =
+            const { [const { std::cell::OnceCell::new() }; 4] };
     }
     RULES.with(|rules| {
-        rules[usize::from(pack_swiglu)]
+        rules[usize::from(pack_swiglu) + 2 * usize::from(tiles)]
             .get_or_init(|| {
                 let mut program = String::new();
                 egglog_prelude(&mut program, pack_swiglu);
+                if tiles {
+                    program.push_str(&tile_equality_rules());
+                }
                 let mut egraph = egglog::EGraph::default();
                 egraph
                     .parse_and_run_program(None, &program)
@@ -979,7 +962,7 @@ fn process_segment(
         egglog_prelude(&mut report.egglog_program, config.pack_swiglu);
         report.egglog_program.push_str(&program);
     }
-    let mut egraph = rule_graph(config.pack_swiglu);
+    let mut egraph = rule_graph(config.pack_swiglu, false);
     if let Err(e) = egraph.parse_and_run_program(None, &program) {
         log::warn!(
             "egglog failed on segment of {} nodes: {} — leaving it unoptimized",
@@ -1223,30 +1206,6 @@ impl Stamper<'_> {
             }
             _ => {}
         }
-        if let Some(spec) = scheduled_matmul(name) {
-            let fused = name.starts_with("MA");
-            let (op, ty) = if fused {
-                (Op::FusedMatMulAdd, self.g.node(inputs[2]).ty.clone())
-            } else {
-                let a = self.g.node(inputs[0]).ty.shape.clone();
-                let b = self.g.node(inputs[1]).ty.shape.clone();
-                if a.len() != 2 || b.len() != 2 {
-                    return Err(format!("{name} needs rank-2 operands"));
-                }
-                (Op::MatMul, TensorType::f32(vec![a[0], b[1]]))
-            };
-            let id = self.place(op, inputs.clone(), ty, target);
-            self.g.nodes_mut()[id as usize].matmul_impl = Some(spec);
-            self.index.insert(
-                (
-                    static_constructor(name)?,
-                    inputs,
-                    self.requires_full_precision,
-                ),
-                id,
-            );
-            return Ok(id);
-        }
         let shape = |id: NodeId| self.g.node(id).ty.shape.clone();
         let ty_of = |id: NodeId| self.g.node(id).ty.clone();
         let rank2 = |id: NodeId| {
@@ -1257,7 +1216,7 @@ impl Stamper<'_> {
                 Err(format!("{} needs rank-2 operands, got {:?}", name, s))
             }
         };
-        let (op, ty, label) = match name {
+        let (op, ty, label) = match matrix_family(name).unwrap_or(name) {
             "MatMul" => {
                 let (a, b) = (rank2(inputs[0])?, rank2(inputs[1])?);
                 (Op::MatMul, TensorType::f32(vec![a[0], b[1]]), None)
@@ -1303,6 +1262,7 @@ impl Stamper<'_> {
             other => return Err(format!("unknown constructor {}", other)),
         };
         let id = self.place(op, inputs.clone(), ty, target);
+        self.g.nodes_mut()[id as usize].matmul_impl = scheduled_matmul(name);
         self.index.insert(
             (
                 static_constructor(name)?,
@@ -1404,44 +1364,108 @@ fn named_constructor_exists(name: &str) -> bool {
     static_constructor(name).is_ok()
 }
 
-/// Tile equalities used only by measured extraction. Ordinary `optimize`
-/// does not run these rules, so a normal build still lowers the logical op.
-pub(crate) const TILE_EQUALITY_RULES: &str = "\
-(rewrite (MatMul ?a ?b) (M6464k32 ?a ?b))
-(rewrite (MatMul ?a ?b) (M6464k16 ?a ?b))
-(rewrite (MatMul ?a ?b) (M3232k32 ?a ?b))
-(rewrite (MatMul ?a ?b) (M3232k16 ?a ?b))
-(rewrite (MatMul ?a ?b) (M6432k32 ?a ?b))
-(rewrite (MatMul ?a ?b) (M6464k8s8 ?a ?b))
-(rewrite (FusedMatMulAdd ?a ?b ?d) (MA6464k32 ?a ?b ?d))
-(rewrite (FusedMatMulAdd ?a ?b ?d) (MA6464k16 ?a ?b ?d))
-(rewrite (FusedMatMulAdd ?a ?b ?d) (MA3232k32 ?a ?b ?d))
-(rewrite (FusedMatMulAdd ?a ?b ?d) (MA3232k16 ?a ?b ?d))
-(rewrite (FusedMatMulAdd ?a ?b ?d) (MA6432k32 ?a ?b ?d))
-(rewrite (FusedMatMulAdd ?a ?b ?d) (MA6464k8s8 ?a ?b ?d))
-";
-
-pub(crate) fn scheduled_matmul(name: &str) -> Option<crate::graph::MatmulImpl> {
-    let spec = |tile_m, tile_n, k_stage, splits| crate::graph::MatmulImpl {
-        tile_m,
-        tile_n,
-        k_stage,
+const fn matrix_impl(
+    tile_m: u32,
+    tile_n: u32,
+    k_stage: u32,
+    splits: u32,
+    unroll_k: bool,
+) -> crate::graph::MatmulImpl {
+    crate::graph::MatmulImpl {
+        shape: crate::codegen::ScalarMatmulShape {
+            tile_size: tile_m,
+            tile_n: if tile_m == tile_n { 0 } else { tile_n },
+            k_stage,
+            interleave_columns: false,
+            unroll_k,
+        },
         splits,
-    };
-    Some(match name {
-        "M6464k32" | "MA6464k32" => spec(64, 64, 32, 1),
-        "M6464k16" | "MA6464k16" => spec(64, 64, 16, 1),
-        "M3232k32" | "MA3232k32" => spec(32, 32, 32, 1),
-        "M3232k16" | "MA3232k16" => spec(32, 32, 16, 1),
-        "M6432k32" | "MA6432k32" => spec(64, 32, 32, 1),
-        "M6464k8s8" | "MA6464k8s8" => spec(64, 64, 8, 8),
-        _ => return None,
-    })
+    }
+}
+
+// One catalog supplies declarations, equalities, reconstruction and exclusions.
+const MATRIX_IMPLEMENTATIONS: &[(&str, crate::graph::MatmulImpl)] = &[
+    // Ordinary construction already probes single-pass scalar tiles. Cover
+    // split/unsplit and shallow/deep staging before smaller layout variations.
+    ("64x64k32s8", matrix_impl(64, 64, 32, 8, true)),
+    ("64x64k32", matrix_impl(64, 64, 32, 1, true)),
+    ("64x64k8s8", matrix_impl(64, 64, 8, 8, true)),
+    ("32x32k32", matrix_impl(32, 32, 32, 1, true)),
+    ("64x32k32", matrix_impl(64, 32, 32, 1, true)),
+    ("64x64k16", matrix_impl(64, 64, 16, 1, true)),
+    ("32x32k16", matrix_impl(32, 32, 16, 1, true)),
+    ("64x64loop", matrix_impl(64, 64, 32, 1, false)),
+    ("32x32loop", matrix_impl(32, 32, 32, 1, false)),
+    ("64x64k16s8", matrix_impl(64, 64, 16, 8, true)),
+];
+
+fn matrix_constructors() -> &'static [(String, &'static str, crate::graph::MatmulImpl)] {
+    static NAMES: std::sync::LazyLock<Vec<(String, &'static str, crate::graph::MatmulImpl)>> =
+        std::sync::LazyLock::new(|| {
+            MATRIX_IMPLEMENTATIONS
+                .iter()
+                .flat_map(|&(layout, spec)| {
+                    [
+                        "MatMul",
+                        "MatMulAT",
+                        "MatMulBT",
+                        "FusedMatMulAdd",
+                        "FusedMatMulATAdd",
+                        "FusedMatMulBTAdd",
+                    ]
+                    .map(|logical| (format!("{logical}__{layout}"), logical, spec))
+                })
+                .collect()
+        });
+    &NAMES
+}
+
+fn scheduled_matmul(name: &str) -> Option<crate::graph::MatmulImpl> {
+    let (_, layout) = name.split_once("__")?;
+    MATRIX_IMPLEMENTATIONS
+        .iter()
+        .find_map(|&(candidate, spec)| (candidate == layout).then_some(spec))
+}
+
+fn matrix_family(name: &str) -> Option<&'static str> {
+    Some(
+        match name.split_once("__").map_or(name, |(logical, _)| logical) {
+            "MatMul" => "MatMul",
+            "MatMulAT" => "MatMulAT",
+            "MatMulBT" => "MatMulBT",
+            "FusedMatMulAdd" => "FusedMatMulAdd",
+            "FusedMatMulATAdd" => "FusedMatMulATAdd",
+            "FusedMatMulBTAdd" => "FusedMatMulBTAdd",
+            _ => return None,
+        },
+    )
+}
+
+fn tile_equality_rules() -> String {
+    use std::fmt::Write;
+    let mut program = String::new();
+    for (name, logical, _) in matrix_constructors() {
+        let (sorts, args) = if logical.ends_with("Add") {
+            ("Op Op Op", "?a ?b ?d")
+        } else {
+            ("Op Op", "?a ?b")
+        };
+        let _ = writeln!(
+            program,
+            "(constructor {name} ({sorts}) Op)\n(rewrite ({logical} {args}) ({name} {args}))"
+        );
+    }
+    program
 }
 
 /// Interns a constructor name to the `'static` string used as the
 /// structural-index key.
 fn static_constructor(name: &str) -> Result<&'static str, String> {
+    if name.contains("__")
+        && let Some((found, _, _)) = matrix_constructors().iter().find(|entry| entry.0 == name)
+    {
+        return Ok(found.as_str());
+    }
     Ok(match name {
         "MatMul" => "MatMul",
         "MatMulAT" => "MatMulAT",
@@ -1463,18 +1487,6 @@ fn static_constructor(name: &str) -> Result<&'static str, String> {
         "GeGLU" => "GeGLU",
         "GeGLUPacked" => "GeGLUPacked",
         "GeGLUPackedBT" => "GeGLUPackedBT",
-        "M6464k32" => "M6464k32",
-        "M6464k16" => "M6464k16",
-        "M3232k32" => "M3232k32",
-        "M3232k16" => "M3232k16",
-        "M6432k32" => "M6432k32",
-        "M6464k8s8" => "M6464k8s8",
-        "MA6464k32" => "MA6464k32",
-        "MA6464k16" => "MA6464k16",
-        "MA3232k32" => "MA3232k32",
-        "MA3232k16" => "MA3232k16",
-        "MA6432k32" => "MA6432k32",
-        "MA6464k8s8" => "MA6464k8s8",
         other => return Err(format!("unknown constructor {}", other)),
     })
 }
@@ -1734,6 +1746,31 @@ mod tests {
             .extract_best(&egraph, &mut TermDag::default(), b)
             .unwrap();
         assert_eq!(bytes, 1024 + 2048);
+
+        let mut egraph = rule_graph(true, true);
+        egraph
+            .parse_and_run_program(
+                None,
+                "(let a (Leaf 0)) (let b (Leaf 1)) (let c (MatMul a b)) (run 4)",
+            )
+            .unwrap();
+        let a = egraph.lookup_function("a", &[]).unwrap();
+        let b = egraph.lookup_function("b", &[]).unwrap();
+        let c = egraph.lookup_function("c", &[]).unwrap();
+        let costs = FusionCostModel::with_sizes(HashMap::from([(a, 512), (b, 1024), (c, 256)]));
+        let extractor = Extractor::compute_costs_from_rootsorts(None, &egraph, costs);
+        for (cost, _) in extractor.extract_variants(
+            &egraph,
+            &mut TermDag::default(),
+            c,
+            MATRIX_IMPLEMENTATIONS.len() + 1,
+        ) {
+            assert_eq!(
+                cost,
+                512 + 1024 + 256,
+                "a tile must not get cheaper tensor bytes"
+            );
+        }
     }
 
     #[test]

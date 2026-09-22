@@ -778,6 +778,7 @@ impl TuneClass {
                             tile_n: 0,
                             k_stage,
                             interleave_columns,
+                            unroll_k: false,
                         }));
                     }
                 }

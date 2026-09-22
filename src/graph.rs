@@ -814,9 +814,7 @@ pub enum Op {
 /// as the same tensor; measured search is what picks one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct MatmulImpl {
-    pub tile_m: u32,
-    pub tile_n: u32,
-    pub k_stage: u32,
+    pub shape: crate::codegen::ScalarMatmulShape,
     /// `1` is a single kernel. Larger values are split-K.
     pub splits: u32,
 }

@@ -11,7 +11,7 @@ impl ExecutionPlan {
         splits: u32,
         max_partial_bytes: usize,
     ) -> Result<(), TuneError> {
-        if !matches!(shape.tile_size, 32 | 64) || !matches!(shape.k_stage, 8 | 16 | 32) {
+        if !shape.legal() {
             return Err(TuneError("unsupported split-K tile"));
         }
         let dispatch = self
@@ -267,13 +267,18 @@ mod tests {
                         + if add { 0.125 } else { 0.0 };
                 }
             }
-            for (tile_size, k_stage, splits) in [(32, 8, 3), (64, 16, 4), (32, 32, 2)] {
+            for (tile_size, tile_n, k_stage, splits, unroll_k) in [
+                (32, 0, 8, 3, false),
+                (64, 32, 16, 4, true),
+                (32, 64, 32, 2, true),
+            ] {
                 let mut plan = super::super::compile(&crate::optimize::optimize(&graph));
                 let shape = crate::codegen::ScalarMatmulShape {
                     tile_size,
-                    tile_n: 0,
+                    tile_n,
                     k_stage,
                     interleave_columns: true,
+                    unroll_k,
                 };
                 let before = serde_json::to_value(&plan).unwrap();
                 assert!(plan.split_matmul(0, shape, splits, 0).is_err());

@@ -116,14 +116,6 @@ pub struct TuningKnobs {
     /// Stagger scalar-matmul B loads across columns instead of routing a
     /// thread through consecutive ones.
     pub matmul_interleave_columns: bool,
-    /// Straight-line K loop in the scalar matmul. A missing cached plan
-    /// keeps the unrolled loop.
-    #[serde(default = "unroll_k_by_default")]
-    pub unroll_k: bool,
-}
-
-fn unroll_k_by_default() -> bool {
-    true
 }
 
 impl Default for TuningKnobs {
@@ -144,7 +136,6 @@ impl Default for TuningKnobs {
             flash_grad_kv_ept_cap: if apple { 8 } else { 32 },
             matmul_k_stage: 32,
             matmul_interleave_columns: false,
-            unroll_k: true,
         }
     }
 }
@@ -2747,19 +2738,6 @@ fn matmul_workgroups(m: u32, n: u32, tile: u32) -> [u32; 3] {
     matmul_workgroups_rect(m, n, tile, tile)
 }
 
-fn scalar_shape_for(spec: crate::graph::MatmulImpl) -> crate::codegen::ScalarMatmulShape {
-    crate::codegen::ScalarMatmulShape {
-        tile_size: spec.tile_m,
-        tile_n: if spec.tile_n == spec.tile_m {
-            0
-        } else {
-            spec.tile_n
-        },
-        k_stage: spec.k_stage,
-        interleave_columns: false,
-    }
-}
-
 fn matmul_workgroups_rect(m: u32, n: u32, row_tile: u32, col_tile: u32) -> [u32; 3] {
     let columns = n.div_ceil(col_tile);
     assert!(
@@ -3301,50 +3279,6 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// Lower an extracted NN schedule. One-row GEMV stays on its own kernel;
-    /// this runs only for the tiled product. A failed split-K keeps the
-    /// single kernel at the same tile and K stage, still locked.
-    fn emit_scheduled_nn(
-        &mut self,
-        spec: crate::graph::MatmulImpl,
-        shader: ShaderEntry,
-        input_buffers: Vec<BufferRef>,
-        output_buffer: BufferRef,
-        m: u32,
-        k: u32,
-        n: u32,
-        weight_format: WeightFormat,
-    ) {
-        let shape = scalar_shape_for(spec);
-        assert!(
-            shape.legal(),
-            "extracted matmul schedule {}x{} k={} splits={} is not a legal scalar tile",
-            spec.tile_m,
-            spec.tile_n,
-            spec.k_stage,
-            spec.splits
-        );
-        self.plan.dispatches.push(Dispatch {
-            shader,
-            workgroups: matmul_workgroups_rect(m, n, shape.rows(), shape.cols()),
-            input_buffers,
-            output_buffer,
-            params: vec![m, k, n, 0],
-            weight_format,
-            kernel: Kernel::ScalarMatmul(shape),
-            ..Default::default()
-        });
-        let index = self.plan.dispatches.len() - 1;
-        // The splitter classifies the dispatch and refuses a locked one.
-        // Lock the producer that is left after a successful split.
-        if spec.splits >= 2 {
-            let _ = self
-                .plan
-                .split_matmul(index, shape, spec.splits, usize::MAX);
-        }
-        self.plan.dispatches[index].schedule_locked = true;
-    }
-
     fn compile_node(&mut self, node: &Node) {
         let out_buf = self.get_buffer(node.id);
         let dispatch_start = self.plan.dispatches.len();
@@ -3411,17 +3345,6 @@ impl<'a> Compiler<'a> {
                         kernel: self.options.gemv_kernel(ShaderGroup::MatMulGemv, wf),
                         ..Default::default()
                     });
-                } else if let Some(spec) = node.matmul_impl.filter(|_| !wf.is_quantized()) {
-                    self.emit_scheduled_nn(
-                        spec,
-                        ShaderEntry::MatMul,
-                        vec![a, b],
-                        out_buf,
-                        m,
-                        k,
-                        n,
-                        wf,
-                    );
                 } else {
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::MatMul,
@@ -3613,17 +3536,6 @@ impl<'a> Compiler<'a> {
                         kernel: self.options.gemv_kernel(ShaderGroup::MatMulGemvAdd, wf),
                         ..Default::default()
                     });
-                } else if let Some(spec) = node.matmul_impl.filter(|_| !wf.is_quantized()) {
-                    self.emit_scheduled_nn(
-                        spec,
-                        ShaderEntry::FusedMatMulAdd,
-                        vec![a, b, d],
-                        out_buf,
-                        m,
-                        k,
-                        n,
-                        wf,
-                    );
                 } else {
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::FusedMatMulAdd,
@@ -6030,6 +5942,38 @@ impl<'a> Compiler<'a> {
             }
         }
 
+        // Apply the extracted layout to the ordinary binding contract. GEMV
+        // and packed weights retain their own implementations.
+        if let Some(spec) = node.matmul_impl
+            && self.plan.dispatches.len() == dispatch_start + 1
+            && self.plan.dispatches[dispatch_start].shader.is_matmul()
+            && !self.plan.dispatches[dispatch_start]
+                .weight_format
+                .is_quantized()
+        {
+            let shape = spec.shape;
+            assert!(
+                shape.legal() && spec.splits > 0,
+                "illegal extracted matmul: {spec:?}"
+            );
+            let dispatch = &mut self.plan.dispatches[dispatch_start];
+            dispatch.kernel = Kernel::ScalarMatmul(shape);
+            dispatch.workgroups = matmul_workgroups_rect(
+                node.ty.shape[0] as u32,
+                node.ty.shape[1] as u32,
+                shape.rows(),
+                shape.cols(),
+            );
+            // If splitting is illegal (e.g. short K), retain this single-pass
+            // layout. Plan deduplication and the report see the actual lowering.
+            if spec.splits >= 2 {
+                let _ = self
+                    .plan
+                    .split_matmul(dispatch_start, shape, spec.splits, usize::MAX);
+            }
+            self.plan.dispatches[dispatch_start].schedule_locked = true;
+        }
+
         // A single graph node can lower to multiple dispatches (for example,
         // row-parallel normalization gradients). Preserve the node's numeric
         // policy on every emitted dispatch so runtime kernel selection cannot
@@ -6387,36 +6331,44 @@ mod tests {
         let y = g.matmul(a, b);
         g.set_outputs(vec![y]);
         g.nodes_mut()[y as usize].matmul_impl = Some(MatmulImpl {
-            tile_m: 64,
-            tile_n: 32,
-            k_stage: 32,
+            shape: crate::codegen::ScalarMatmulShape {
+                tile_size: 64,
+                tile_n: 32,
+                k_stage: 32,
+                interleave_columns: false,
+                unroll_k: true,
+            },
             splits: 1,
         });
         let plan = compile(&g);
         let dispatch = &plan.dispatches[0];
         assert!(dispatch.schedule_locked);
-        match &dispatch.kernel {
+        match dispatch.kernel {
             Kernel::ScalarMatmul(shape) => {
                 assert_eq!((shape.rows(), shape.cols(), shape.k_stage), (64, 32, 32));
             }
-            other => panic!("expected scalar 64x32, got {other:?}"),
+            ref other => panic!("expected scalar 64x32, got {other:?}"),
         }
         assert_eq!(dispatch.workgroups, [960u32.div_ceil(32), 1, 1]);
 
         g.nodes_mut()[y as usize].matmul_impl = Some(MatmulImpl {
-            tile_m: 64,
-            tile_n: 64,
-            k_stage: 8,
+            shape: crate::codegen::ScalarMatmulShape {
+                tile_size: 64,
+                tile_n: 0,
+                k_stage: 8,
+                interleave_columns: false,
+                unroll_k: true,
+            },
             splits: 8,
         });
         let plan = compile(&g);
         assert!(plan.dispatches[0].schedule_locked);
-        match &plan.dispatches[0].kernel {
+        match plan.dispatches[0].kernel {
             Kernel::SplitMatmul { splits, shape } => {
-                assert_eq!(*splits, 8);
+                assert_eq!(splits, 8);
                 assert_eq!((shape.rows(), shape.cols(), shape.k_stage), (64, 64, 8));
             }
-            other => panic!("expected split-K, got {other:?}"),
+            ref other => panic!("expected split-K, got {other:?}"),
         }
         assert_eq!(plan.dispatches[0].workgroups[2], 8);
         assert_eq!(plan.dispatches[1].shader, ShaderEntry::SumRows);
@@ -6429,9 +6381,13 @@ mod tests {
         let y = tiny.matmul(a, b);
         tiny.set_outputs(vec![y]);
         tiny.nodes_mut()[y as usize].matmul_impl = Some(MatmulImpl {
-            tile_m: 64,
-            tile_n: 64,
-            k_stage: 8,
+            shape: crate::codegen::ScalarMatmulShape {
+                tile_size: 64,
+                tile_n: 0,
+                k_stage: 8,
+                interleave_columns: false,
+                unroll_k: true,
+            },
             splits: 8,
         });
         let plan = compile(&tiny);

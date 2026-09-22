@@ -201,10 +201,7 @@ pub fn build_measured(
             let plan = compile::compile_with_caps(&graph, &options, caps);
             if !seeds.iter().any(|seed| seed.plan == plan) {
                 seeds.push(Seed {
-                    description: format!(
-                        "graph={index}, dispatch_fusion={fusion}, {}",
-                        matrix_schedule(&plan)
-                    ),
+                    description: format!("graph={index}, dispatch_fusion={fusion}"),
                     plan,
                     graph: graph.clone(),
                     options,
@@ -248,28 +245,6 @@ type AxisChoice = (
     (u32, Option<(u32, crate::codegen::FlashAttentionShape)>),
     usize,
 );
-
-fn matrix_schedule(plan: &ExecutionPlan) -> String {
-    let parts: Vec<_> = plan
-        .dispatches
-        .iter()
-        .filter(|dispatch| {
-            dispatch.shader.is_matmul()
-                || matches!(dispatch.kernel, compile::Kernel::SplitMatmul { .. })
-        })
-        .map(|dispatch| {
-            format!(
-                "{:?} {:?} wg={:?} locked={}",
-                dispatch.shader, dispatch.kernel, dispatch.workgroups, dispatch.schedule_locked
-            )
-        })
-        .collect();
-    if parts.is_empty() {
-        "schedule=none".to_string()
-    } else {
-        parts.join("; ")
-    }
-}
 
 fn early_physical_cover(
     chunks: &[usize],
