@@ -29,8 +29,7 @@ var<storage> matrix_b: $B_STORAGE_TYPE;
 var<storage, read_write> matrix_c: array<f32>;
 $FUSED_ADD_DECL
 var<uniform> params: Params;
-var<workgroup> shared_a: array<f32, $SHARED_A_SIZE>;
-var<workgroup> shared_b: array<f32, $SHARED_B_SIZE>;
+$SHARED_DECL
 $B_DEQUANT_FN
 
 @compute @workgroup_size(16, 16)
@@ -48,34 +47,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let first_tile = (tiles / SPLITS) * split_id + min(split_id, tiles % SPLITS);
     let end_tile = (tiles / SPLITS) * (split_id + 1u) + min(split_id + 1u, tiles % SPLITS);
     let end_k = min(end_tile * $K_TILE_U, params.k);
-    var t = first_tile * $K_TILE_U;
-    loop {
-        if t >= end_k { break; }
-
-        // Stage A with a padded shared-memory stride.
-        for (var e = 0u; e < $STAGE_EPT_U; e++) {
-            let flat = tid + e * 256u;
-            let row_local = $A_ROW;
-            let col_local = $A_COL;
-            let a_row = tile_row + row_local;
-            let a_col = t + col_local;
-            let in_bounds = (a_row < params.m) && (a_col < params.k);
-            shared_a[row_local * $A_STRIDE_U + col_local] = select(0.0, matrix_a[$A_INDEX], in_bounds);
-        }
-
-        // Load B tile into shared_b[KTILE×BN]. Default: one element per
-        // iteration. Q4 large-tile replaces this with pack8 staging.
-        $B_STAGE_BODY
-
-        workgroupBarrier();
-
-        for (var kk = 0u; kk < $K_TILE_U; kk++) {
-            $COMPUTE_BODY
-        }
-
-        workgroupBarrier();
-        t += $K_TILE_U;
-    }
+    $K_LOOP
 
     // Store results with bounds check and optional fused epilogue
     let s = $ACC_ARRAY;

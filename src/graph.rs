@@ -810,12 +810,26 @@ pub enum Op {
     PrefixLast,
 }
 
+/// Implementation chosen for a matrix op. Equality saturation treats these
+/// as the same tensor; measured search is what picks one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct MatmulImpl {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub k_stage: u32,
+    /// `1` is a single kernel. Larger values are split-K.
+    pub splits: u32,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Node {
     pub id: NodeId,
     pub op: Op,
     pub inputs: Vec<NodeId>,
     pub ty: TensorType,
+    /// Set when egglog extracted a concrete matrix implementation.
+    #[serde(default)]
+    pub matmul_impl: Option<MatmulImpl>,
     /// Prevent reduced-precision kernel promotion for numerically sensitive
     /// work derived by autodiff. Forward tensors remain logically f32 too;
     /// this flag only constrains optional runtime accelerations such as
@@ -1077,6 +1091,7 @@ impl Graph {
             ty,
             requires_full_precision,
             name: None,
+            matmul_impl: None,
         });
         id
     }

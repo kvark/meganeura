@@ -88,19 +88,22 @@ Configure runtime optimizers and external/shared writable bindings afterward.
 An invalid challenger is discarded; an invalid incumbent aborts the search.
 An initializer may share compatible immutable weights from the idle incumbent.
 
-Implemented choices include fused/unfused graph forms, dispatch fusion,
-dense matrix partitions, forward-attention layouts, cached-attention splits
-and fresh submission chunk counts. Existing
-layout-preserving kernel choices are tuned before
-whole-plan comparison; completed comparisons can be reused within that build.
-Attention splits use the existing compiler, with no session-buffer patching.
-There is no reusable command recording or separate live structural tuner.
+Implemented choices include fused and unfused graph forms, the NN matmul
+tile and split-K equalities lowered by the ordinary compiler, dispatch fusion,
+forward-attention layouts, cached-attention splits, low-occupancy convolution
+weight-gradient splits, and fresh submission chunk counts. An extracted matmul
+schedule is locked, so a later kernel probe cannot replace its tile. Unlocked
+dispatches still use those probes before whole-plan comparison. Attention
+splits and convolution weight splits use the existing compiler, with no
+session-buffer patching. There is no reusable command recording or separate
+live structural tuner.
 
 This is a bounded first implementation, not exhaustive graph scheduling. Small
 graphs are searched together; large graphs currently explore one verified
-repeated region. Stateful or mixed-precision regions remain opaque. Physical
-settings are currently applied uniformly to eligible operations within a plan,
-not independently to every site. The report must be read with those limits.
+repeated region. Stateful or mixed-precision regions remain opaque. Attention
+layouts and submission chunks are still uniform across a plan. A matmul tile
+is whatever enode extraction kept for that site. The report must be read with
+those limits.
 There is no persistent measured-plan cache yet. Rectangular cooperative kernels
 remain experiments. The [September 21 investigation](gpu-gap-2026-09.md) records
 the current search limits, costing fixes and measured kernel changes. The broader alternatives below

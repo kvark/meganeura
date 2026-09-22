@@ -271,6 +271,7 @@ mod tests {
                 let mut plan = super::super::compile(&crate::optimize::optimize(&graph));
                 let shape = crate::codegen::ScalarMatmulShape {
                     tile_size,
+                    tile_n: 0,
                     k_stage,
                     interleave_columns: true,
                 };

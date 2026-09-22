@@ -93,11 +93,7 @@ pub(super) fn tile_module(
             None,
             crate::codegen::MatMulOptions {
                 format: dispatch.weight_format,
-                tile: match shape.tile_size {
-                    32 => crate::codegen::MatMulTile::Small,
-                    64 => crate::codegen::MatMulTile::Large,
-                    _ => unreachable!("unsupported scalar tile"),
-                },
+                tile: shape.geometry(),
                 knobs: crate::codegen::MatmulKnobs {
                     k_stage: shape.k_stage,
                     interleave_columns: shape.interleave_columns,
@@ -296,6 +292,7 @@ fn collect_classes(
                         } else {
                             64
                         },
+                        tile_n: 0,
                         k_stage: plan.knobs.matmul_k_stage,
                         interleave_columns: plan.knobs.matmul_interleave_columns,
                     }))
@@ -1891,6 +1888,7 @@ mod tests {
             for &index in &class.members {
                 MatmulTile::Scalar(crate::codegen::ScalarMatmulShape {
                     tile_size: 32,
+                    tile_n: 0,
                     k_stage: 8,
                     interleave_columns: true,
                 })
@@ -2024,6 +2022,7 @@ mod tests {
         } else {
             MatmulTile::Scalar(crate::codegen::ScalarMatmulShape {
                 tile_size: 64,
+                tile_n: 0,
                 k_stage: 8,
                 interleave_columns: true,
             })
@@ -2487,6 +2486,7 @@ mod tests {
                     for interleave_columns in [false, true] {
                         tiles.push(MatmulTile::Scalar(crate::codegen::ScalarMatmulShape {
                             tile_size,
+                            tile_n: 0,
                             k_stage,
                             interleave_columns,
                         }));
