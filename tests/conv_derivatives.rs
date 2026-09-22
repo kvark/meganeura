@@ -146,7 +146,7 @@ fn plan(s: Shape, tile: u32, splits: u32) -> (ExecutionPlan, Option<BufferRef>) 
     let mut forced = 0;
     for d in &mut plan.dispatches {
         match d.shader {
-            ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGemmSmall => {
+            ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGemmSmall | ShaderEntry::Conv2dGemm16 => {
                 d.shader = if tile == 32 {
                     ShaderEntry::Conv2dGemmSmall
                 } else {
@@ -156,7 +156,9 @@ fn plan(s: Shape, tile: u32, splits: u32) -> (ExecutionPlan, Option<BufferRef>) 
                 d.workgroups = [(oh * ow).div_ceil(tile), s.co.div_ceil(tile), s.batch];
                 forced += 1;
             }
-            ShaderEntry::Conv2dGradInputGemm | ShaderEntry::Conv2dGradInputGemmSmall => {
+            ShaderEntry::Conv2dGradInputGemm
+            | ShaderEntry::Conv2dGradInputGemmSmall
+            | ShaderEntry::Conv2dGradInputGemm16 => {
                 d.shader = if tile == 32 {
                     ShaderEntry::Conv2dGradInputGemmSmall
                 } else {
@@ -165,7 +167,9 @@ fn plan(s: Shape, tile: u32, splits: u32) -> (ExecutionPlan, Option<BufferRef>) 
                 d.workgroups = [(s.h * s.w).div_ceil(tile), s.ci.div_ceil(tile), s.batch];
                 forced += 1;
             }
-            ShaderEntry::Conv2dGradWeightGemm | ShaderEntry::Conv2dGradWeightGemmSmall => {
+            ShaderEntry::Conv2dGradWeightGemm
+            | ShaderEntry::Conv2dGradWeightGemmSmall
+            | ShaderEntry::Conv2dGradWeightGemm16 => {
                 d.shader = if tile == 32 {
                     ShaderEntry::Conv2dGradWeightGemmSmall
                 } else {
@@ -294,7 +298,7 @@ fn run_split(
                 })
                 .unwrap();
             assert_eq!(report.eligible_classes, 3, "{s:?}: {report:?}");
-            assert_eq!(report.outcomes.len(), 15, "{s:?}: {report:?}");
+            assert_eq!(report.outcomes.len(), 24, "{s:?}: {report:?}");
             assert!(
                 report.outcomes.iter().all(|o| o.qualified
                     && o.class.conv2d.is_some()
@@ -352,6 +356,7 @@ fn run_split(
                     d.shader,
                     ShaderEntry::Conv2dGemm
                         | ShaderEntry::Conv2dGemmSmall
+                        | ShaderEntry::Conv2dGemm16
                         | ShaderEntry::Conv2dGemmCoopGen(..)
                 )
             })

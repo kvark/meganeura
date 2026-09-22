@@ -353,17 +353,22 @@ pub enum ShaderEntry {
     AddPerChannel,
     Conv2dGemm,
     Conv2dGemmSmall,
+    /// 16×16 register tile for convolutions whose 32-wide grid is still tiny.
+    Conv2dGemm16,
     /// Generated conv2d forward coop kernel specialized for (kernel_h, kernel_w, stride).
     Conv2dGemmCoopGen(u32, u32, u32),
     Conv2dGradInputGemm,
     Conv2dGradInputGemmSmall,
+    Conv2dGradInputGemm16,
     /// Generated conv2d grad_input coop kernel specialized for (kernel_h, kernel_w, stride).
     Conv2dGradInputGemmCoopGen(u32, u32, u32),
     Conv2dGradWeightGemm,
     Conv2dGradWeightGemmSmall,
+    Conv2dGradWeightGemm16,
     /// Split reduction tiles into `[split, Co, Ci*Kh*Kw]` partials for SumRows.
     Conv2dGradWeightGemmSplit,
     Conv2dGradWeightGemmSplitSmall,
+    Conv2dGradWeightGemmSplit16,
     CacheWrite,
     CacheWritePrefix,
     CachedAttention,
@@ -447,14 +452,18 @@ impl ShaderEntry {
             ShaderEntry::Conv2dDw
             | ShaderEntry::Conv2dGemm
             | ShaderEntry::Conv2dGemmSmall
+            | ShaderEntry::Conv2dGemm16
             | ShaderEntry::Conv2dGemmCoopGen(..)
             | ShaderEntry::Conv2dGradInputGemm
             | ShaderEntry::Conv2dGradInputGemmSmall
+            | ShaderEntry::Conv2dGradInputGemm16
             | ShaderEntry::Conv2dGradInputGemmCoopGen(..)
             | ShaderEntry::Conv2dGradWeightGemm
             | ShaderEntry::Conv2dGradWeightGemmSmall
+            | ShaderEntry::Conv2dGradWeightGemm16
             | ShaderEntry::Conv2dGradWeightGemmSplit
             | ShaderEntry::Conv2dGradWeightGemmSplitSmall
+            | ShaderEntry::Conv2dGradWeightGemmSplit16
             | ShaderEntry::Upsample2x
             | ShaderEntry::Upsample2xGrad
             | ShaderEntry::MaxPool2d
@@ -641,15 +650,19 @@ impl ShaderEntry {
             ShaderEntry::Conv2dGemm => ShaderGroup::Conv2dGemm,
             ShaderEntry::Conv2dGemmCoopGen(..) => ShaderGroup::Conv2dGemmCoop,
             ShaderEntry::Conv2dGemmSmall => ShaderGroup::Conv2dGemmSmall,
+            ShaderEntry::Conv2dGemm16 => ShaderGroup::Conv2dGemm16,
             ShaderEntry::Conv2dGradInputGemm => ShaderGroup::Conv2dGradInputGemm,
             ShaderEntry::Conv2dGradInputGemmSmall => ShaderGroup::Conv2dGradInputGemmSmall,
+            ShaderEntry::Conv2dGradInputGemm16 => ShaderGroup::Conv2dGradInputGemm16,
             ShaderEntry::Conv2dGradInputGemmCoopGen(..) => ShaderGroup::Conv2dGradInputGemmCoop,
             ShaderEntry::Conv2dGradWeightGemm => ShaderGroup::Conv2dGradWeightGemm,
             ShaderEntry::Conv2dGradWeightGemmSmall => ShaderGroup::Conv2dGradWeightGemmSmall,
+            ShaderEntry::Conv2dGradWeightGemm16 => ShaderGroup::Conv2dGradWeightGemm16,
             ShaderEntry::Conv2dGradWeightGemmSplit => ShaderGroup::Conv2dGradWeightGemmSplit,
             ShaderEntry::Conv2dGradWeightGemmSplitSmall => {
                 ShaderGroup::Conv2dGradWeightGemmSplitSmall
             }
+            ShaderEntry::Conv2dGradWeightGemmSplit16 => ShaderGroup::Conv2dGradWeightGemmSplit16,
             ShaderEntry::CacheWrite => ShaderGroup::CacheWrite,
             ShaderEntry::CacheWritePrefix => ShaderGroup::CacheWritePrefix,
             ShaderEntry::CachedAttention => ShaderGroup::CachedAttention,
@@ -761,14 +774,18 @@ impl ShaderEntry {
             ShaderEntry::AddPerChannel => "main",
             ShaderEntry::Conv2dGemm
             | ShaderEntry::Conv2dGemmSmall
+            | ShaderEntry::Conv2dGemm16
             | ShaderEntry::Conv2dGemmCoopGen(..) => "main",
             ShaderEntry::Conv2dGradInputGemm
             | ShaderEntry::Conv2dGradInputGemmSmall
+            | ShaderEntry::Conv2dGradInputGemm16
             | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => "main",
             ShaderEntry::Conv2dGradWeightGemm
             | ShaderEntry::Conv2dGradWeightGemmSmall
+            | ShaderEntry::Conv2dGradWeightGemm16
             | ShaderEntry::Conv2dGradWeightGemmSplit
-            | ShaderEntry::Conv2dGradWeightGemmSplitSmall => "main",
+            | ShaderEntry::Conv2dGradWeightGemmSplitSmall
+            | ShaderEntry::Conv2dGradWeightGemmSplit16 => "main",
             ShaderEntry::CacheWrite => "main",
             ShaderEntry::CacheWritePrefix => "main",
             ShaderEntry::CachedAttention => "main",
@@ -2727,6 +2744,73 @@ fn matmul_workgroups(m: u32, n: u32, tile: u32) -> [u32; 3] {
     let height = rows.div_ceil(depth);
     debug_assert!(height <= MAX_COMPUTE_WORKGROUPS_PER_DIMENSION);
     [columns, height, depth]
+}
+
+/// Largest of 64/32/16 whose launch grid has at least 64 workgroups.
+///
+/// A 64-wide tile with only a few workgroups leaves most of the GPU idle.
+/// Native f32 cooperative kernels are selected on that same 64-wide entry
+/// once its grid reaches 16 workgroups, so devices that have one keep it.
+/// The 16-wide tile is the tail: one accumulator per thread, used when the
+/// wider launches would sit almost empty.
+fn conv_register_tile(rows: u32, cols: u32, batch: u32, f32_coop: bool) -> u32 {
+    let batch = batch.max(1);
+    let groups = |tile: u32| rows.div_ceil(tile) * cols.div_ceil(tile) * batch;
+    if f32_coop && groups(64) >= 16 {
+        return 64;
+    }
+    for tile in [64u32, 32, 16] {
+        if groups(tile) >= 64 {
+            return tile;
+        }
+    }
+    16
+}
+
+#[cfg(test)]
+mod conv_tile {
+    use super::conv_register_tile;
+
+    #[test]
+    fn keeps_a_wide_grid_on_the_64_tile() {
+        // 256 x 3136 is 4 * 49 workgroups at tile 64.
+        assert_eq!(conv_register_tile(256, 3136, 1, false), 64);
+    }
+
+    #[test]
+    fn narrows_a_7x7_weight_gradient_to_16() {
+        // Co=64, Ci*k=147: tile 64 is 3 workgroups, tile 32 is 10, tile 16 is 40.
+        assert_eq!(conv_register_tile(64, 147, 1, false), 16);
+    }
+
+    #[test]
+    fn keeps_64_when_native_f32_coop_can_use_the_grid() {
+        assert_eq!(conv_register_tile(256, 196, 1, true), 64);
+        assert_eq!(conv_register_tile(64, 147, 1, true), 16);
+    }
+}
+
+/// Scalar convolution with geometry baked into the pipeline.
+///
+/// The uniform software divisor stays available as a measured alternative.
+/// This kernel uses the same exact reciprocal, with the multipliers as
+/// constants, and the K stage the uniform shader already uses.
+fn exact_conv_kernel() -> Kernel {
+    Kernel::SpecializedConv { k_tile: 16 }
+}
+
+fn conv_gemm_entry(kind: u8, tile: u32) -> ShaderEntry {
+    match (kind, tile) {
+        (0, 16) => ShaderEntry::Conv2dGemm16,
+        (0, 32) => ShaderEntry::Conv2dGemmSmall,
+        (0, _) => ShaderEntry::Conv2dGemm,
+        (1, 16) => ShaderEntry::Conv2dGradInputGemm16,
+        (1, 32) => ShaderEntry::Conv2dGradInputGemmSmall,
+        (1, _) => ShaderEntry::Conv2dGradInputGemm,
+        (2, 16) => ShaderEntry::Conv2dGradWeightGemm16,
+        (2, 32) => ShaderEntry::Conv2dGradWeightGemmSmall,
+        _ => ShaderEntry::Conv2dGradWeightGemm,
+    }
 }
 
 struct Compiler<'a> {
@@ -4804,18 +4888,16 @@ impl<'a> Compiler<'a> {
                 // and handles kernel 1×1 as a degenerate im2col.
                 {
                     // Use implicit GEMM: output = weight @ im2col(input)^T
-                    // M=Co, N=oH*oW, K=Ci*kH*kW, batched in z dimension
-                    // Use small (32×32) tiles when workgroup count per batch is low.
+                    // M=Co, N=oH*oW, K=Ci*kH*kW, batched in z dimension.
                     let spatial = out_h * out_w;
-                    let wgs_64 = spatial.div_ceil(64) * out_channels.div_ceil(64);
-                    let use_small = wgs_64 < 16;
-                    let tile = if use_small { 32 } else { 64 };
+                    let tile = conv_register_tile(
+                        out_channels,
+                        spatial,
+                        batch,
+                        self.coop_caps.f32_tile > 0,
+                    );
                     self.plan.dispatches.push(Dispatch {
-                        shader: if use_small {
-                            ShaderEntry::Conv2dGemmSmall
-                        } else {
-                            ShaderEntry::Conv2dGemm
-                        },
+                        shader: conv_gemm_entry(0, tile),
                         workgroups: [spatial.div_ceil(tile), out_channels.div_ceil(tile), batch],
                         input_buffers: vec![input, kernel],
                         output_buffer: out_buf,
@@ -4834,6 +4916,7 @@ impl<'a> Compiler<'a> {
                             out_w,
                             padding_w,
                         ],
+                        kernel: exact_conv_kernel(),
 
                         ..Default::default()
                     });
@@ -5022,15 +5105,14 @@ impl<'a> Compiler<'a> {
                     // M=Ci, N=H*W, K=Co*kH*kW, batched in z dimension.
                     {
                         let spatial = in_h * in_w;
-                        let wgs_64 = spatial.div_ceil(64) * in_channels.div_ceil(64);
-                        let use_small = wgs_64 < 16;
-                        let tile = if use_small { 32 } else { 64 };
+                        let tile = conv_register_tile(
+                            in_channels,
+                            spatial,
+                            batch,
+                            self.coop_caps.f32_tile > 0,
+                        );
                         self.plan.dispatches.push(Dispatch {
-                            shader: if use_small {
-                                ShaderEntry::Conv2dGradInputGemmSmall
-                            } else {
-                                ShaderEntry::Conv2dGradInputGemm
-                            },
+                            shader: conv_gemm_entry(1, tile),
                             workgroups: [spatial.div_ceil(tile), in_channels.div_ceil(tile), batch],
                             input_buffers: vec![grad_out, kernel],
                             output_buffer: out_buf,
@@ -5049,6 +5131,7 @@ impl<'a> Compiler<'a> {
                                 out_w,
                                 padding_w,
                             ],
+                            kernel: exact_conv_kernel(),
 
                             ..Default::default()
                         });
@@ -5081,15 +5164,10 @@ impl<'a> Compiler<'a> {
                     // Use GEMM formulation: grad_weight[Co, Ci*kH*kW] = grad_out_flat[Co, N*oH*oW] @ im2col(input)[N*oH*oW, Ci*kH*kW]
                     let n_total = in_channels * kernel_h * kernel_w; // Ci*kH*kW
                     let m_total = out_channels; // Co
-                    let wgs_64 = n_total.div_ceil(64) * m_total.div_ceil(64);
-                    let use_small = wgs_64 < 16;
-                    let tile = if use_small { 32 } else { 64 };
+                    // Batch is folded into K, so it does not add workgroups.
+                    let tile = conv_register_tile(m_total, n_total, 1, self.coop_caps.f32_tile > 0);
                     self.plan.dispatches.push(Dispatch {
-                        shader: if use_small {
-                            ShaderEntry::Conv2dGradWeightGemmSmall
-                        } else {
-                            ShaderEntry::Conv2dGradWeightGemm
-                        },
+                        shader: conv_gemm_entry(2, tile),
                         workgroups: [n_total.div_ceil(tile), m_total.div_ceil(tile), 1],
                         input_buffers: vec![grad_out, input],
                         output_buffer: out_buf,
@@ -5108,6 +5186,7 @@ impl<'a> Compiler<'a> {
                             out_w,
                             padding_w,
                         ],
+                        kernel: exact_conv_kernel(),
 
                         ..Default::default()
                     });

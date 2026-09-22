@@ -14,8 +14,8 @@ var<storage> grad_out: array<f32>;           // [N, Co, oH, oW]
 var<storage> src: array<f32>;                // input [N, Ci, H, W]
 var<storage, read_write> dst: array<f32>;    // grad_kernel [Co, Ci, kH, kW]
 $PARAMS_DECL
-var<workgroup> shared_a: array<f32, $SHARED_SIZE>;   // A tile: [BM, K]
-var<workgroup> shared_b: array<f32, $SHARED_SIZE>;   // B tile: [K, BM]
+var<workgroup> shared_a: array<f32, $SHARED_A_SIZE>;   // A tile: [BM, K], padded stride
+var<workgroup> shared_b: array<f32, $SHARED_B_SIZE>;   // B tile: [K, BM], padded stride
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>$COUNTS) {
@@ -54,7 +54,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
                 let rem = k_idx - n * go_spatial;
                 val = grad_out[(n * params.out_channels + co) * go_spatial + rem];
             }
-            shared_a[row_local * $KTILE_U + col_local] = val;
+            shared_a[row_local * $A_STRIDE_U + col_local] = val;
         }
 
         // Load B tile: im2col(input)[N*oH*oW, Ci*kH*kW].
@@ -86,7 +86,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
                     val = src[((n * params.in_channels + ci) * params.in_h + u32(ih)) * params.in_w + u32(iw)];
                 }
             }
-            shared_b[row_local * $BM_U + col_local] = val;
+            shared_b[row_local * $B_STRIDE_U + col_local] = val;
         }
 
         workgroupBarrier();

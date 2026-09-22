@@ -775,6 +775,7 @@ impl From<&Dispatch> for Conv2dParams {
         let column_width = match dispatch.shader {
             ShaderEntry::Conv2dGradInputGemm
             | ShaderEntry::Conv2dGradInputGemmSmall
+            | ShaderEntry::Conv2dGradInputGemm16
             | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => p[3],
             _ => p[10],
         };
@@ -1944,14 +1945,18 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::AddPerChannel => AddPerChannelData::layout(),
         ShaderEntry::Conv2dGemm
         | ShaderEntry::Conv2dGemmSmall
+        | ShaderEntry::Conv2dGemm16
         | ShaderEntry::Conv2dGemmCoopGen(..) => Conv2dData::layout(),
         ShaderEntry::Conv2dGradInputGemm
         | ShaderEntry::Conv2dGradInputGemmSmall
+        | ShaderEntry::Conv2dGradInputGemm16
         | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => Conv2dGradInputData::layout(),
         ShaderEntry::Conv2dGradWeightGemm
         | ShaderEntry::Conv2dGradWeightGemmSmall
+        | ShaderEntry::Conv2dGradWeightGemm16
         | ShaderEntry::Conv2dGradWeightGemmSplit
-        | ShaderEntry::Conv2dGradWeightGemmSplitSmall => Conv2dGradWeightData::layout(),
+        | ShaderEntry::Conv2dGradWeightGemmSplitSmall
+        | ShaderEntry::Conv2dGradWeightGemmSplit16 => Conv2dGradWeightData::layout(),
         ShaderEntry::RoPEDynamic | ShaderEntry::RoPEPositions => RoPEDynamicData::layout(),
         ShaderEntry::RoPEDynamicFactors => RoPEDynamicFactorsData::layout(),
         ShaderEntry::CacheWrite => CacheWriteData::layout(),
@@ -2126,7 +2131,9 @@ pub(crate) fn select_variants(
         // iOS and future 8×8 f32 advertisers need the same veto.
         let apple_f32_coop = !config.use_f16_input && config.tile_size == 8;
         for dispatch in &mut plan.dispatches {
-            if dispatch.conv_k_tile().is_some()
+            // K=16 is the compiled exact-indexing kernel. Cooperative
+            // promotion may replace it. Any other measured K stage stays.
+            if matches!(dispatch.conv_k_tile(), Some(k_tile) if k_tile != 16)
                 || dispatch.scalar_matmul().is_some()
                 || matches!(dispatch.kernel, crate::compile::Kernel::SplitMatmul { .. })
             {
@@ -8042,6 +8049,7 @@ impl Session {
             }
             ShaderEntry::Conv2dGemm
             | ShaderEntry::Conv2dGemmSmall
+            | ShaderEntry::Conv2dGemm16
             | ShaderEntry::Conv2dGemmCoopGen(..) => {
                 pc.bind(
                     0,
@@ -8055,6 +8063,7 @@ impl Session {
             }
             ShaderEntry::Conv2dGradInputGemm
             | ShaderEntry::Conv2dGradInputGemmSmall
+            | ShaderEntry::Conv2dGradInputGemm16
             | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => {
                 pc.bind(
                     0,
@@ -8068,8 +8077,10 @@ impl Session {
             }
             ShaderEntry::Conv2dGradWeightGemm
             | ShaderEntry::Conv2dGradWeightGemmSmall
+            | ShaderEntry::Conv2dGradWeightGemm16
             | ShaderEntry::Conv2dGradWeightGemmSplit
-            | ShaderEntry::Conv2dGradWeightGemmSplitSmall => {
+            | ShaderEntry::Conv2dGradWeightGemmSplitSmall
+            | ShaderEntry::Conv2dGradWeightGemmSplit16 => {
                 pc.bind(
                     0,
                     &Conv2dGradWeightData {

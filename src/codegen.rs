@@ -514,12 +514,18 @@ fn epilogue_stage_maps(
         (false, MatMulTile::Small) => (A_ROW_FWD_S, A_COL_FWD_S),
         (true, MatMulTile::Large) => (A_ROW_AT, A_COL_AT),
         (true, MatMulTile::Small) => (A_ROW_AT_S, A_COL_AT_S),
+        (_, MatMulTile::Occupancy) => {
+            panic!("conv occupancy tile is not a matmul epilogue geometry")
+        }
     };
     let (b_row, b_col) = match (b_transposed, tile) {
         (false, MatMulTile::Large) => (B_ROW_FWD, B_COL_FWD),
         (false, MatMulTile::Small) => (B_ROW_FWD_S, B_COL_FWD_S),
         (true, MatMulTile::Large) => (B_ROW_BT, B_COL_BT),
         (true, MatMulTile::Small) => (B_ROW_BT_S, B_COL_BT_S),
+        (_, MatMulTile::Occupancy) => {
+            panic!("conv occupancy tile is not a matmul epilogue geometry")
+        }
     };
     (a_row, a_col, b_row, b_col)
 }
@@ -614,9 +620,11 @@ pub enum ShaderGroup {
     AddPerChannel,
     Conv2dGemm,
     Conv2dGemmSmall,
+    Conv2dGemm16,
     Conv2dGemmCoop,
     Conv2dGradInputGemm,
     Conv2dGradInputGemmSmall,
+    Conv2dGradInputGemm16,
     Conv2dGradInputGemmCoop,
     GroupNormSilu,
     WinogradInputTransform,
@@ -625,8 +633,10 @@ pub enum ShaderGroup {
     WinogradWeightTransform,
     Conv2dGradWeightGemm,
     Conv2dGradWeightGemmSmall,
+    Conv2dGradWeightGemm16,
     Conv2dGradWeightGemmSplit,
     Conv2dGradWeightGemmSplitSmall,
+    Conv2dGradWeightGemmSplit16,
     CacheWrite,
     CacheWritePrefix,
     CachedAttention,
@@ -761,8 +771,10 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         }
         ShaderGroup::Conv2dGemm
         | ShaderGroup::Conv2dGemmSmall
+        | ShaderGroup::Conv2dGemm16
         | ShaderGroup::Conv2dGradInputGemm
-        | ShaderGroup::Conv2dGradInputGemmSmall => generate_conv_module(group, 16, None),
+        | ShaderGroup::Conv2dGradInputGemmSmall
+        | ShaderGroup::Conv2dGradInputGemm16 => generate_conv_module(group, 16, None),
         ShaderGroup::Conv2dGemmCoop | ShaderGroup::Conv2dGradInputGemmCoop => {
             panic!(
                 "conv coop kernels are generated per (kernel, stride) via generate_conv2d_coop_module"
@@ -789,11 +801,17 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         ShaderGroup::Conv2dGradWeightGemmSmall => {
             conv_grad_weight_tiled(MatMulTile::Small, false, 16, None)
         }
+        ShaderGroup::Conv2dGradWeightGemm16 => {
+            conv_grad_weight_tiled(MatMulTile::Occupancy, false, 16, None)
+        }
         ShaderGroup::Conv2dGradWeightGemmSplit => {
             conv_grad_weight_tiled(MatMulTile::Large, true, 16, None)
         }
         ShaderGroup::Conv2dGradWeightGemmSplitSmall => {
             conv_grad_weight_tiled(MatMulTile::Small, true, 16, None)
+        }
+        ShaderGroup::Conv2dGradWeightGemmSplit16 => {
+            conv_grad_weight_tiled(MatMulTile::Occupancy, true, 16, None)
         }
         ShaderGroup::CacheWrite => ShaderModule::new(include_str!("shaders/cache_write.wgsl")),
         ShaderGroup::CacheWritePrefix => {
@@ -1090,6 +1108,9 @@ pub enum MatMulTile {
     Large,
     /// BM=BN=32, TM=TN=2 — 4× more workgroups for low-occupancy shapes.
     Small,
+    /// BM=BN=16, TM=TN=1 — one output per thread when 32-wide tiles still
+    /// leave the device idle.
+    Occupancy,
 }
 
 impl MatMulTile {
@@ -1097,6 +1118,7 @@ impl MatMulTile {
         match self {
             MatMulTile::Large => 64,
             MatMulTile::Small => 32,
+            MatMulTile::Occupancy => 16,
         }
     }
     fn bn(self) -> u32 {
@@ -1106,6 +1128,7 @@ impl MatMulTile {
         match self {
             MatMulTile::Large => 4,
             MatMulTile::Small => 2,
+            MatMulTile::Occupancy => 1,
         }
     }
     fn tn(self) -> u32 {
@@ -1140,6 +1163,10 @@ pub(crate) fn generate_conv_module(
         ShaderGroup::Conv2dGemmSmall => {
             (include_str!("shaders/conv2d_gemm.wgsl"), MatMulTile::Small)
         }
+        ShaderGroup::Conv2dGemm16 => (
+            include_str!("shaders/conv2d_gemm.wgsl"),
+            MatMulTile::Occupancy,
+        ),
         ShaderGroup::Conv2dGradInputGemm => (
             include_str!("shaders/conv2d_grad_input_gemm.wgsl"),
             MatMulTile::Large,
@@ -1148,11 +1175,27 @@ pub(crate) fn generate_conv_module(
             include_str!("shaders/conv2d_grad_input_gemm.wgsl"),
             MatMulTile::Small,
         ),
+        ShaderGroup::Conv2dGradInputGemm16 => (
+            include_str!("shaders/conv2d_grad_input_gemm.wgsl"),
+            MatMulTile::Occupancy,
+        ),
         ShaderGroup::Conv2dGradWeightGemm => {
             return conv_grad_weight_tiled(MatMulTile::Large, false, k_tile, params);
         }
         ShaderGroup::Conv2dGradWeightGemmSmall => {
             return conv_grad_weight_tiled(MatMulTile::Small, false, k_tile, params);
+        }
+        ShaderGroup::Conv2dGradWeightGemm16 => {
+            return conv_grad_weight_tiled(MatMulTile::Occupancy, false, k_tile, params);
+        }
+        ShaderGroup::Conv2dGradWeightGemmSplit => {
+            return conv_grad_weight_tiled(MatMulTile::Large, true, k_tile, params);
+        }
+        ShaderGroup::Conv2dGradWeightGemmSplitSmall => {
+            return conv_grad_weight_tiled(MatMulTile::Small, true, k_tile, params);
+        }
+        ShaderGroup::Conv2dGradWeightGemmSplit16 => {
+            return conv_grad_weight_tiled(MatMulTile::Occupancy, true, k_tile, params);
         }
         _ => panic!("not an ordinary scalar convolution: {group:?}"),
     };
@@ -1170,13 +1213,21 @@ fn conv_gemm_tiled(
     assert!(matches!(k_tile, 16 | 32));
     let bm = tile.bm();
     let tm = tile.tm();
-    let (acc_decl, compute_body, acc_array) = tiled_gemm_body(tm, tm, k_tile, bm, false);
+    // Pad shared-memory strides by one so a wave that spans two rows does not
+    // hit the same bank, matching the scalar matmul skeleton. The padding
+    // column is never stored or read.
+    let a_stride = k_tile + 1;
+    let b_stride = bm + 1;
+    let (acc_decl, compute_body, acc_array) = tiled_gemm_body(tm, tm, a_stride, b_stride, false);
     let (declaration, divisor) = if let Some(values) = params {
         assert_eq!(values.len(), 16, "Conv2dParams layout");
         let arguments = values.iter().map(|v| format!("{v}u")).collect::<Vec<_>>();
         (
             format!("const params = Params({});", arguments.join(", ")),
-            "fn divide_exact(value: u32, divisor: u32, multiplier: u32) -> u32 { return value / divisor; }",
+            // Same exact reciprocal as the uniform shader. The multipliers are
+            // constants here, so the sequence can fold. WGSL `/` is a separate
+            // candidate and is not used for this kernel.
+            crate::divisor::SHADER,
         )
     } else {
         (
@@ -1193,8 +1244,11 @@ fn conv_gemm_tiled(
             ("$BM_U", &format!("{bm}u")),
             ("$TM_U", &format!("{tm}u")),
             ("$KTILE_U", &format!("{k_tile}u")),
+            ("$A_STRIDE_U", &format!("{a_stride}u")),
+            ("$B_STRIDE_U", &format!("{b_stride}u")),
             ("$STAGE_EPT_U", &format!("{}u", bm * k_tile / 256)),
-            ("$SHARED_SIZE", &(bm * k_tile).to_string()),
+            ("$SHARED_A_SIZE", &(bm * a_stride).to_string()),
+            ("$SHARED_B_SIZE", &(k_tile * b_stride).to_string()),
             ("$ACC_DECL", &acc_decl),
             ("$COMPUTE_BODY", &compute_body),
             ("$ACC_ARRAY", &acc_array),
@@ -6420,11 +6474,19 @@ mod tests {
                 naga::valid::Capabilities::empty(),
             ),
             (
+                ShaderGroup::Conv2dGradWeightGemm16,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
                 ShaderGroup::Conv2dGradWeightGemmSplit,
                 naga::valid::Capabilities::empty(),
             ),
             (
                 ShaderGroup::Conv2dGradWeightGemmSplitSmall,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
+                ShaderGroup::Conv2dGradWeightGemmSplit16,
                 naga::valid::Capabilities::empty(),
             ),
             (ShaderGroup::RmsNormGrad, naga::valid::Capabilities::empty()),
@@ -6792,8 +6854,10 @@ mod tests {
             (ShaderGroup::SumRows, empty),
             (ShaderGroup::Conv2dGradWeightGemm, empty),
             (ShaderGroup::Conv2dGradWeightGemmSmall, empty),
+            (ShaderGroup::Conv2dGradWeightGemm16, empty),
             (ShaderGroup::Conv2dGradWeightGemmSplit, empty),
             (ShaderGroup::Conv2dGradWeightGemmSplitSmall, empty),
+            (ShaderGroup::Conv2dGradWeightGemmSplit16, empty),
             (ShaderGroup::RmsNormGrad, empty),
             (ShaderGroup::RmsNormGradWRowPar, empty),
             (ShaderGroup::ScatterAdd, empty),
@@ -7023,16 +7087,20 @@ mod tests {
                 ShaderEntry::AddPerChannel => vec!["src", "bias", "dst", "params"],
                 ShaderEntry::Conv2dGemm
                 | ShaderEntry::Conv2dGemmSmall
+                | ShaderEntry::Conv2dGemm16
                 | ShaderEntry::Conv2dGemmCoopGen(..) => vec!["src", "weight", "dst", "params"],
                 ShaderEntry::Conv2dGradInputGemm
                 | ShaderEntry::Conv2dGradInputGemmSmall
+                | ShaderEntry::Conv2dGradInputGemm16
                 | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => {
                     vec!["grad_out", "weight", "dst", "params"]
                 }
                 ShaderEntry::Conv2dGradWeightGemm
                 | ShaderEntry::Conv2dGradWeightGemmSmall
+                | ShaderEntry::Conv2dGradWeightGemm16
                 | ShaderEntry::Conv2dGradWeightGemmSplit
-                | ShaderEntry::Conv2dGradWeightGemmSplitSmall => {
+                | ShaderEntry::Conv2dGradWeightGemmSplitSmall
+                | ShaderEntry::Conv2dGradWeightGemmSplit16 => {
                     vec!["grad_out", "src", "dst", "params"]
                 }
                 ShaderEntry::RoPEDynamic | ShaderEntry::RoPEPositions => {
@@ -7148,12 +7216,16 @@ mod tests {
             ShaderEntry::AddPerChannel,
             ShaderEntry::Conv2dGemm,
             ShaderEntry::Conv2dGemmSmall,
+            ShaderEntry::Conv2dGemm16,
             ShaderEntry::Conv2dGradInputGemm,
             ShaderEntry::Conv2dGradInputGemmSmall,
+            ShaderEntry::Conv2dGradInputGemm16,
             ShaderEntry::Conv2dGradWeightGemm,
             ShaderEntry::Conv2dGradWeightGemmSmall,
+            ShaderEntry::Conv2dGradWeightGemm16,
             ShaderEntry::Conv2dGradWeightGemmSplit,
             ShaderEntry::Conv2dGradWeightGemmSplitSmall,
+            ShaderEntry::Conv2dGradWeightGemmSplit16,
             ShaderEntry::WinogradInputTransform,
             ShaderEntry::WinogradOutputTransform,
             ShaderEntry::WinogradBatchedMatMul,
