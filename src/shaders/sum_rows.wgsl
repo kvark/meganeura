@@ -1,7 +1,7 @@
 struct Params {
     m: u32,
     n: u32,
-    _pad0: u32,
+    serial_rows: u32,
     _pad1: u32,
 }
 
@@ -18,6 +18,19 @@ fn sum_rows(
     @builtin(workgroup_id) wgid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
+    // Short reductions can give each thread a whole column. The plan selects
+    // this layout and its 256-column grid as a measured implementation choice.
+    if params.serial_rows != 0u {
+        let col = wgid.x * 256u + lid.y * 32u + lid.x;
+        if col < params.n {
+            var acc = 0.0;
+            for (var row = 0u; row < params.m; row += 1u) {
+                acc += src[row * params.n + col];
+            }
+            dst[col] = acc;
+        }
+        return;
+    }
     let col = wgid.x * 32u + lid.x;
     var acc = 0.0;
     if col < params.n {

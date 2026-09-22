@@ -169,7 +169,7 @@ pub fn run(
     let monitor = gpu_monitor::Monitor::start();
     let gpu = Arc::new(meganeura::init_gpu_context()?);
     let info = gpu.device_information();
-    let caps = &gpu.capabilities().cooperative_matrix;
+    let caps = meganeura::runtime::auto_tune(&gpu, 0).coop_caps;
     let mut document = json!({"schema_version": 1, "protocol": protocol, "status": "running",
         "metadata": {"revision": command("git", &["rev-parse", "HEAD"])?, "tracked_source_clean": true,
             "cargo_lock_sha256": sha256(&Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"))?,

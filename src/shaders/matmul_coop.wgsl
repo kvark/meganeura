@@ -1,6 +1,7 @@
-// Cooperative matrix matmul: 2×2 tile grid ($OUTPUT_TILE×$OUTPUT_TILE output per WG)
-// Dispatch: [ceil(m/$OUTPUT_TILE), ceil(n/$OUTPUT_TILE), 1], WG=64
-// Parameterized by tile size ($TILE_SIZE) and element type ($ELEM_TYPE).
+// Cooperative matrix matmul: 2×2 tile grid ($OUTPUT_M×$OUTPUT_N output per WG)
+// Dispatch: [ceil(m/$OUTPUT_M), ceil(n/$OUTPUT_N), 1], WG=64
+// One template for every tile. $TILE_M, $TILE_N and $TILE_K are the C rows,
+// C columns and shared K of one hardware tile. Square tiles set them equal.
 // - 16×16 f16 path: RDNA3/Volta+ (VK_KHR_cooperative_matrix)
 // -  8×8 f32 path:  Apple Silicon (simdgroup_matrix)
 
@@ -31,21 +32,21 @@ $PROLOGUE_CACHE_DECL
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(subgroup_id) sg: u32) {
-    let tile_row = wgid.x * $OUTPUT_TILE_U;
-    let tile_col = wgid.y * $OUTPUT_TILE_U;
+    let tile_row = wgid.x * $OUTPUT_M_U;
+    let tile_col = wgid.y * $OUTPUT_N_U;
     let m = params.m;
     let n = params.n;
     let k = params.k;
 
     // C offsets for the 4 output tiles
     let c00 = tile_row * n + tile_col;
-    let c01 = tile_row * n + (tile_col + $TILE_SIZE_U);
-    let c10 = (tile_row + $TILE_SIZE_U) * n + tile_col;
-    let c11 = (tile_row + $TILE_SIZE_U) * n + (tile_col + $TILE_SIZE_U);
+    let c01 = tile_row * n + (tile_col + $TILE_N_U);
+    let c10 = (tile_row + $TILE_M_U) * n + tile_col;
+    let c11 = (tile_row + $TILE_M_U) * n + (tile_col + $TILE_N_U);
 
     // Validity flags for secondary tiles
-    let n1_valid = (tile_col + $TILE_SIZE_U) < n;
-    let m1_valid = (tile_row + $TILE_SIZE_U) < m;
+    let n1_valid = (tile_col + $TILE_N_U) < n;
+    let m1_valid = (tile_row + $TILE_M_U) < m;
 
     // Initialize accumulators
     $ACC_INIT
@@ -78,10 +79,10 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         // Cooperative matrix multiply-add: C += A × B
         // shared_b{0,1} hold A-matrix row tiles; shared_a{0,1} hold B-matrix column tiles.
         // Load A data into role-A (left operand), B data into role-B (right operand).
-        let a0 = coopLoadT<$COOP_AB>(&shared_b0[0], $TILE_SIZE_U);
-        let a1 = coopLoadT<$COOP_AB>(&shared_b1[0], $TILE_SIZE_U);
-        let b0 = coopLoadT<$COOP_BA>(&shared_a0[0], $TILE_SIZE_U);
-        let b1 = coopLoadT<$COOP_BA>(&shared_a1[0], $TILE_SIZE_U);
+        let a0 = coopLoadT<$COOP_AB>(&shared_b0[0], $TILE_K_U);
+        let a1 = coopLoadT<$COOP_AB>(&shared_b1[0], $TILE_K_U);
+        let b0 = coopLoadT<$COOP_BA>(&shared_a0[0], $TILE_N_U);
+        let b1 = coopLoadT<$COOP_BA>(&shared_a1[0], $TILE_N_U);
         acc00 = coopMultiplyAdd(a0, b0, acc00);
         acc01 = coopMultiplyAdd(a0, b1, acc01);
         acc10 = coopMultiplyAdd(a1, b0, acc10);
@@ -89,7 +90,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         $COMPENSATED_MMA
 
         workgroupBarrier();
-        t += $TILE_SIZE_U;
+        t += $TILE_K_U;
     }
 
     $RESULT_STORE

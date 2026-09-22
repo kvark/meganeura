@@ -9,6 +9,48 @@
 
 use naga::Module;
 
+/// Forward attention staging and lane layout, independent of the EPT cap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct FlashAttentionShape {
+    pub threads: u32,
+    pub keys: u32,
+    pub interleave: bool,
+}
+
+impl Default for FlashAttentionShape {
+    fn default() -> Self {
+        Self {
+            threads: 256,
+            keys: 8,
+            interleave: false,
+        }
+    }
+}
+
+impl FlashAttentionShape {
+    pub(crate) fn fit_shared_memory(&mut self, head_dim: u32, bytes: u32) {
+        if bytes == 0 {
+            return;
+        }
+        while self.keys > 1 && self.shared_bytes(head_dim) > u64::from(bytes) {
+            self.keys /= 2;
+        }
+        assert!(
+            self.shared_bytes(head_dim) <= u64::from(bytes),
+            "attention staging exceeds device shared memory"
+        );
+    }
+
+    pub(crate) fn shared_bytes(self, head_dim: u32) -> u64 {
+        let (keys, threads, head_dim) = (
+            u64::from(self.keys),
+            u64::from(self.threads),
+            u64::from(head_dim),
+        );
+        4 * (2 * keys * head_dim + keys * threads + threads)
+    }
+}
+
 /// How a K-split GEMV combines the per-lane partial sums.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum GemvReduction {
@@ -311,6 +353,22 @@ pub struct ScalarMatmulShape {
     pub interleave_columns: bool,
 }
 
+impl ScalarMatmulShape {
+    /// Rows of C covered by one workgroup.
+    pub fn rows(self) -> u32 {
+        self.tile_size
+    }
+
+    /// Columns of C covered by one workgroup.
+    ///
+    /// The scalar skeleton's block is square, so this matches [`Self::rows`].
+    /// A rectangular block would return its N extent here and the shader
+    /// template's `$BN_U` would follow.
+    pub fn cols(self) -> u32 {
+        self.tile_size
+    }
+}
+
 /// How to specialize the matmul the epilogue is fused into.
 ///
 /// [`Default`] is the plain f32 64×64 kernel, so a caller that only wants
@@ -337,6 +395,44 @@ pub fn generate_matmul_with_epilogue(
     group: ShaderGroup,
     epilogue: Option<&crate::compile::MatMulEpilogue>,
     options: MatMulOptions,
+) -> ShaderModule {
+    generate_partitioned_matmul(group, epilogue, options, 1)
+}
+
+pub(crate) fn generate_split_matmul(
+    group: ShaderGroup,
+    shape: ScalarMatmulShape,
+    splits: u32,
+    format: WeightFormat,
+) -> ShaderModule {
+    assert!(splits >= 2);
+    assert!(group.is_matmul());
+    assert!(matches!(format, WeightFormat::F32 | WeightFormat::F16));
+    generate_partitioned_matmul(
+        group,
+        None,
+        MatMulOptions {
+            format,
+            tile: if shape.tile_size == 32 {
+                MatMulTile::Small
+            } else {
+                MatMulTile::Large
+            },
+            knobs: MatmulKnobs {
+                k_stage: shape.k_stage,
+                interleave_columns: shape.interleave_columns,
+                integer_dot: false,
+            },
+        },
+        splits,
+    )
+}
+
+fn generate_partitioned_matmul(
+    group: ShaderGroup,
+    epilogue: Option<&crate::compile::MatMulEpilogue>,
+    options: MatMulOptions,
+    splits: u32,
 ) -> ShaderModule {
     // Store-side fusion compiles through this generator rather than
     // `generate_module_weighted`, which already refuses quantized BT.
@@ -374,6 +470,11 @@ pub fn generate_matmul_with_epilogue(
         ),
         _ => panic!("epilogue fusion not supported for {:?}", group),
     };
+    let fused_expr = if splits > 1 && !fused_expr.is_empty() {
+        " + select(0.0, src[idx - split_id * params.m * params.n], split_id == 0u)"
+    } else {
+        fused_expr
+    };
     let (a_row, a_col, b_row, b_col) = epilogue_stage_maps(group, tile);
     matmul_vars_tiled(
         MatMulIndexing {
@@ -391,6 +492,7 @@ pub fn generate_matmul_with_epilogue(
         &epi_decl,
         &epi_body,
         options,
+        splits,
     )
 }
 
@@ -544,6 +646,20 @@ pub enum ShaderGroup {
     GradAccum,
 }
 
+impl ShaderGroup {
+    pub const fn is_matmul(&self) -> bool {
+        matches!(
+            self,
+            Self::MatMul
+                | Self::MatMulAdd
+                | Self::MatMulAT
+                | Self::MatMulBT
+                | Self::MatMulATAdd
+                | Self::MatMulBTAdd
+        )
+    }
+}
+
 /// Generate a `naga::Module` for a shader group.
 pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
     match group {
@@ -592,6 +708,7 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
             generate_flash_attention_module(
                 64,
                 crate::compile::TuningKnobs::default().flash_ept_cap,
+                FlashAttentionShape::default(),
             )
         }
         ShaderGroup::FlashAttentionCoop => generate_flash_attention_coop_module(64),
@@ -685,7 +802,9 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         ShaderGroup::CachedAttention => {
             ShaderModule::new(include_str!("shaders/cached_attention.wgsl"))
         }
-        ShaderGroup::CachedQueryAttention => generate_flash_attention(64, 8, true),
+        ShaderGroup::CachedQueryAttention => {
+            generate_flash_attention(64, 8, FlashAttentionShape::default(), true)
+        }
         ShaderGroup::CachedBlockAttention => generate_module_block_attention(),
         ShaderGroup::ChunkedRelativeAttention => {
             ShaderModule::new(include_str!("shaders/chunked_relative_attention.wgsl"))
@@ -980,22 +1099,34 @@ impl MatMulTile {
             MatMulTile::Small => 32,
         }
     }
+    fn bn(self) -> u32 {
+        self.bm()
+    }
     fn tm(self) -> u32 {
         match self {
             MatMulTile::Large => 4,
             MatMulTile::Small => 2,
         }
     }
+    fn tn(self) -> u32 {
+        self.tm()
+    }
 }
 
 /// Generate the unrolled `(acc_decl, compute_body, acc_array)` sections of
-/// the tiled-matmul skeleton for a TM×TM register tile.
+/// the tiled-matmul skeleton for a TM×TN register tile.
 fn tiled_matmul_body(
     tile: MatMulTile,
     k_tile: u32,
     interleave_columns: bool,
 ) -> (String, String, String) {
-    tiled_gemm_body(tile.tm(), k_tile + 1, tile.bm() + 1, interleave_columns)
+    tiled_gemm_body(
+        tile.tm(),
+        tile.tn(),
+        k_tile + 1,
+        tile.bm() + 1,
+        interleave_columns,
+    )
 }
 
 /// Generate an ordinary scalar convolution with a measured K-tile candidate.
@@ -1039,7 +1170,7 @@ fn conv_gemm_tiled(
     assert!(matches!(k_tile, 16 | 32));
     let bm = tile.bm();
     let tm = tile.tm();
-    let (acc_decl, compute_body, acc_array) = tiled_gemm_body(tm, k_tile, bm, false);
+    let (acc_decl, compute_body, acc_array) = tiled_gemm_body(tm, tm, k_tile, bm, false);
     let (declaration, divisor) = if let Some(values) = params {
         assert_eq!(values.len(), 16, "Conv2dParams layout");
         let arguments = values.iter().map(|v| format!("{v}u")).collect::<Vec<_>>();
@@ -1114,6 +1245,7 @@ fn conv_grad_weight_tiled(
 /// parameterized by register tile size and shared-memory strides.
 fn tiled_gemm_body(
     tm: u32,
+    tn: u32,
     a_stride: u32,
     b_stride: u32,
     interleave_columns: bool,
@@ -1122,7 +1254,7 @@ fn tiled_gemm_body(
 
     let mut acc_decl = String::new();
     for i in 0..tm {
-        for j in 0..tm {
+        for j in 0..tn {
             let _ = write!(acc_decl, "var s{i}_{j} = 0.0; ");
         }
         acc_decl.push_str("\n    ");
@@ -1135,11 +1267,11 @@ fn tiled_gemm_body(
             "            let a{i} = shared_a[(ty * {tm}u + {i}u) * {a_stride}u + kk];"
         );
     }
-    for j in 0..tm {
+    for j in 0..tn {
         let column = if interleave_columns {
             format!("tx + {j}u * 16u")
         } else {
-            format!("tx * {tm}u + {j}u")
+            format!("tx * {tn}u + {j}u")
         };
         let _ = writeln!(
             body,
@@ -1148,16 +1280,16 @@ fn tiled_gemm_body(
     }
     for i in 0..tm {
         body.push_str("            ");
-        for j in 0..tm {
+        for j in 0..tn {
             let _ = write!(body, "s{i}_{j} += a{i} * b{j}; ");
         }
         body.push('\n');
     }
 
-    let mut acc_array = format!("array<array<f32, {tm}>, {tm}>(\n");
+    let mut acc_array = format!("array<array<f32, {tn}>, {tm}>(\n");
     for i in 0..tm {
-        let cols: Vec<String> = (0..tm).map(|j| format!("s{i}_{j}")).collect();
-        let _ = writeln!(acc_array, "        array<f32, {tm}>({}),", cols.join(", "));
+        let cols: Vec<String> = (0..tn).map(|j| format!("s{i}_{j}")).collect();
+        let _ = writeln!(acc_array, "        array<f32, {tn}>({}),", cols.join(", "));
     }
     acc_array.push_str("    )");
 
@@ -1198,6 +1330,7 @@ fn matmul_vars_full(
             tile: MatMulTile::Large,
             knobs,
         },
+        1,
     )
 }
 
@@ -1226,6 +1359,7 @@ fn matmul_vars_tiled(
     epilogue_decl: &str,
     epilogue_body: &str,
     options: MatMulOptions,
+    splits: u32,
 ) -> ShaderModule {
     let MatMulIndexing {
         a_idx,
@@ -1326,8 +1460,8 @@ fn matmul_vars_tiled(
     let b_stage_body = if let Some(pack8) = pack8 {
         format!(
             "\
-        let n_local = tid % $BM_U;\n\
-        let k_base = (tid / $BM_U) * 8u;\n\
+        let n_local = tid % $BN_U;\n\
+        let k_base = (tid / $BN_U) * 8u;\n\
         let b_col = tile_col + n_local;\n\
         let unpacked = {pack8}(t + k_base, b_col);\n\
         for (var i = 0u; i < 8u; i++) {{\n\
@@ -1350,7 +1484,9 @@ fn matmul_vars_tiled(
         .to_string()
     };
     let bm = tile.bm();
+    let bn = tile.bn();
     let tm = tile.tm();
+    let tn = tile.tn();
     // Block decoders have fixed layouts; plain F32/F16 share the same skeleton.
     let k_tile = match b_mode {
         WeightFormat::F32 | WeightFormat::F16 => knobs.k_stage,
@@ -1366,7 +1502,7 @@ fn matmul_vars_tiled(
     let output_column = if interleave_columns {
         "tx + j * 16u".to_string()
     } else {
-        format!("tx * {tm}u + j")
+        format!("tx * {tn}u + j")
     };
     let src = preprocess(
         src,
@@ -1382,6 +1518,7 @@ fn matmul_vars_tiled(
             ("$B_INDEX", b_idx),
             ("$TILE_ROW", tile_row),
             ("$C_INDEX", c_idx),
+            ("$SPLITS_U", &format!("{splits}u")),
             ("$A_ROW", a_row),
             ("$A_COL", a_col),
             ("$B_ROW", b_row),
@@ -1390,8 +1527,10 @@ fn matmul_vars_tiled(
             ("$STORE_BODY", &store_body),
             ("$OUTPUT_COLUMN", &output_column),
             ("$BM_U", &format!("{bm}u")),
+            ("$BN_U", &format!("{bn}u")),
             ("$TM_U", &format!("{tm}u")),
-            ("$B_STRIDE_U", &format!("{}u", bm + 1)),
+            ("$TN_U", &format!("{tn}u")),
+            ("$B_STRIDE_U", &format!("{}u", bn + 1)),
             ("$A_STRIDE_U", &format!("{}u", k_tile + 1)),
             ("$K_TILE_U", &format!("{k_tile}u")),
             ("$STAGE_EPT_U", &format!("{}u", bm * k_tile / 256)),
@@ -1538,6 +1677,7 @@ fn matmul_small_vars(
             tile: MatMulTile::Small,
             knobs,
         },
+        1,
     )
 }
 
@@ -1772,6 +1912,7 @@ fn gen_block_matmul(group: ShaderGroup, tile: MatMulTile) -> ShaderModule {
             tile,
             ..Default::default()
         },
+        1,
     )
 }
 
@@ -2509,9 +2650,11 @@ fn gen_matmul_coop_wgsl_full(
         }
     };
     let ab_type = if config.use_f16_input { "f16" } else { "f32" };
-    let coop_ab = format!("coop_mat{}x{}<{},A>", tile, tile, ab_type);
-    let coop_ba = format!("coop_mat{}x{}<{},B>", tile, tile, ab_type);
-    let coop_c = format!("coop_mat{}x{}<f32,C>", tile, tile);
+    // `coop_mat{columns}x{rows}`. Square tiles pass the same extent three times.
+    let (tile_m, tile_n, tile_k) = (tile, tile, tile);
+    let coop_ab = format!("coop_mat{tile_k}x{tile_m}<{ab_type},A>");
+    let coop_ba = format!("coop_mat{tile_n}x{tile_k}<{ab_type},B>");
+    let coop_c = format!("coop_mat{tile_n}x{tile_m}<f32,C>");
 
     let (prologue_decl, prologue_cache_decl, prologue_cache_init, a_transform) = match prologue {
         Some(p) => matmul_prologue_to_wgsl(p, output_tile),
@@ -3040,8 +3183,11 @@ fn gen_matmul_coop_wgsl_full(
             ("$ENABLE_F16", enable_f16),
             ("$ELEM_TYPE", elem_type),
             ("$SHARED_SIZE", &shared_size_s),
-            ("$OUTPUT_TILE_U", &output_tile_u),
-            ("$TILE_SIZE_U", &tile_size_u),
+            ("$OUTPUT_M_U", &output_tile_u),
+            ("$OUTPUT_N_U", &output_tile_u),
+            ("$TILE_M_U", &tile_size_u),
+            ("$TILE_N_U", &tile_size_u),
+            ("$TILE_K_U", &tile_size_u),
             ("$COOP_AB", &coop_ab),
             ("$COOP_BA", &coop_ba),
             ("$A_STORAGE", a_storage),
@@ -3409,12 +3555,22 @@ mod coop_caps_tests {
 
 pub const CACHED_ATTENTION_QUERIES: u32 = 32; // 256 threads / (64 dimensions / 8 elements)
 
-pub fn generate_flash_attention_module(head_dim: u32, ept_cap: u32) -> ShaderModule {
-    generate_flash_attention(head_dim, ept_cap, false)
+pub fn generate_flash_attention_module(
+    head_dim: u32,
+    ept_cap: u32,
+    shape: FlashAttentionShape,
+) -> ShaderModule {
+    generate_flash_attention(head_dim, ept_cap, shape, false)
 }
 
-fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> ShaderModule {
+fn generate_flash_attention(
+    head_dim: u32,
+    ept_cap: u32,
+    shape: FlashAttentionShape,
+    cached: bool,
+) -> ShaderModule {
     use std::fmt::Write;
+    assert!(matches!(shape.threads, 128 | 256) && shape.keys.is_power_of_two() && shape.keys <= 16);
     assert!(
         head_dim.is_power_of_two() && head_dim >= 2,
         "attention head_dim must be a power of 2 ≥ 2, got {head_dim}"
@@ -3424,7 +3580,8 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     // which honors MEGANEURA_FLASH_EPT_CAP overrides.
     let ept: u32 = hd.min(ept_cap);
     let tpq = hd / ept; // threads per query
-    let bq: u32 = (256 / tpq).max(1);
+    let d_stride = if shape.interleave { tpq } else { 1 };
+    let bq: u32 = (shape.threads / tpq).max(1);
     if cached {
         assert_eq!(bq, CACHED_ATTENTION_QUERIES);
     }
@@ -3433,7 +3590,7 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
         return generate_attention_module(head_dim);
     }
     let wg_size = bq * tpq;
-    let bkv: u32 = 8;
+    let bkv: u32 = shape.keys;
     let mut src = String::new();
 
     // Params struct (matches AttentionParams: 8 u32 = 32 bytes)
@@ -3458,9 +3615,10 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
 
     // Shared memory:
     //   shared_k: K tile [BKV, hd] loaded once, reused by BQ groups
-    //   wg_scores: [BQ][BKV][TPQ] partial dot products for grouped reduction
+    //   wg_scores: [BKV][BQ][TPQ] keeps neighboring threads contiguous
     //   wg_dot: [BQ][TPQ] tail reduction
     let _ = writeln!(src, "var<workgroup> shared_k: array<f32, {}>;\n", bkv * hd);
+    let _ = writeln!(src, "var<workgroup> shared_v: array<f32, {}>;\n", bkv * hd);
     let _ = writeln!(
         src,
         "var<workgroup> wg_scores: array<f32, {}>;\n",
@@ -3472,7 +3630,7 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     src.push_str("fn tree_reduce_bkv_grouped(tid: u32) {\n");
     let _ = writeln!(src, "    let qi = tid / {tpq}u;");
     let _ = writeln!(src, "    let local = tid % {tpq}u;");
-    let _ = writeln!(src, "    let base = qi * {}u;", bkv * tpq);
+    let _ = writeln!(src, "    let base = qi * {tpq}u;");
     let mut stride = tpq / 2;
     while stride > 0 {
         src.push_str("    workgroupBarrier();\n");
@@ -3480,7 +3638,7 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
         let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
         let _ = writeln!(
             src,
-            "            wg_scores[base + i * {tpq}u + local] += wg_scores[base + i * {tpq}u + local + {stride}u];"
+            "            wg_scores[i * {wg_size}u + base + local] += wg_scores[i * {wg_size}u + base + local + {stride}u];"
         );
         src.push_str("        }\n    }\n");
         stride /= 2;
@@ -3510,7 +3668,11 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     );
     let _ = writeln!(src, "    let qi = lid.x / {tpq}u;"); // query within tile
     let _ = writeln!(src, "    let lane = lid.x % {tpq}u;"); // lane within query group
-    let _ = writeln!(src, "    let d_base = lane * {ept}u;"); // first head_dim element for this thread
+    let _ = writeln!(
+        src,
+        "    let d_base = lane * {}u;",
+        if shape.interleave { 1 } else { ept }
+    );
     let _ = writeln!(src, "    let pos = wgid.x * {bq}u + qi;"); // global query position
     src.push_str("    let head = wgid.y;\n");
     src.push_str("    let q_seq = params.q_seq;\n");
@@ -3560,7 +3722,11 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     src.push_str("    if valid {\n");
     src.push_str("        let q_base = pos * (num_heads * head_dim) + head * head_dim;\n");
     for e in 0..ept {
-        let _ = writeln!(src, "        q{e} = src_a[q_base + d_base + {e}u];");
+        let _ = writeln!(
+            src,
+            "        q{e} = src_a[q_base + d_base + {}u];",
+            e * d_stride
+        );
     }
     src.push_str("    }\n\n");
 
@@ -3591,6 +3757,9 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
             src.push_str(
                 "            shared_k[lid.x] = src_b[(t + ki) * kv_dim + kv_head_off + (lid.x % head_dim)];\n",
             );
+            src.push_str(
+                "            shared_v[lid.x] = bias[(t + ki) * kv_dim + kv_head_off + (lid.x % head_dim)];\n",
+            );
             src.push_str("        }\n");
         } else {
             let _ = writeln!(src, "        if lid.x + {offset}u < {k_tile_size}u {{");
@@ -3599,25 +3768,30 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
                 src,
                 "            shared_k[lid.x + {offset}u] = src_b[(t + ki2) * kv_dim + kv_head_off + ((lid.x + {offset}u) % head_dim)];"
             );
+            let _ = writeln!(
+                src,
+                "            shared_v[lid.x + {offset}u] = bias[(t + ki2) * kv_dim + kv_head_off + ((lid.x + {offset}u) % head_dim)];"
+            );
             src.push_str("        }\n");
         }
     }
     src.push_str("        workgroupBarrier();\n\n");
 
     // Each thread computes partial dot product (EPT elements) for BKV positions
-    let _ = writeln!(src, "        let grp_base = qi * {}u;", bkv * tpq);
+    let _ = writeln!(src, "        let grp_base = qi * {tpq}u;");
     let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
     // Compute partial dot product across EPT elements
     src.push_str("            var pdot = 0.0;\n");
     for e in 0..ept {
         let _ = writeln!(
             src,
-            "            pdot += q{e} * shared_k[i * {hd}u + d_base + {e}u];"
+            "            pdot += q{e} * shared_k[i * {hd}u + d_base + {}u];",
+            e * d_stride
         );
     }
     let _ = writeln!(
         src,
-        "            wg_scores[grp_base + i * {tpq}u + lane] = pdot;"
+        "            wg_scores[i * {wg_size}u + grp_base + lane] = pdot;"
     );
     src.push_str("        }\n");
     src.push_str("        tree_reduce_bkv_grouped(lid.x);\n\n");
@@ -3628,18 +3802,18 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     src.push_str("            if valid && kv_pos >= my_kv_start && kv_pos < my_kv_len {\n");
     let _ = writeln!(
         src,
-        "                let score = wg_scores[grp_base + i * {tpq}u] * scale;"
+        "                let score = wg_scores[i * {wg_size}u + grp_base] * scale;"
     );
     src.push_str("                let new_max = max(max_score, score);\n");
     src.push_str("                let correction = exp(max_score - new_max);\n");
     src.push_str("                let weight = exp(score - new_max);\n");
     src.push_str("                sum_exp = sum_exp * correction + weight;\n");
-    src.push_str("                let v_base = kv_pos * kv_dim + kv_head_off;\n");
     // Accumulate EPT V elements in registers
     for e in 0..ept {
         let _ = writeln!(
             src,
-            "                out{e} = out{e} * correction + weight * bias[v_base + d_base + {e}u];"
+            "                out{e} = out{e} * correction + weight * shared_v[i * {hd}u + d_base + {}u];",
+            e * d_stride
         );
     }
     src.push_str("                max_score = new_max;\n");
@@ -3651,8 +3825,11 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     // --- Tail: remaining KV positions one at a time ---
     src.push_str("    for (; t < max_kv_len; t++) {\n");
     // Load single K position into shared_k
-    let _ = writeln!(src, "        if lid.x < {hd}u {{");
-    src.push_str("            shared_k[lid.x] = src_b[t * kv_dim + kv_head_off + lid.x];\n");
+    let _ = writeln!(
+        src,
+        "        for (var d = lid.x; d < {hd}u; d += {wg_size}u) {{"
+    );
+    src.push_str("            shared_k[d] = src_b[t * kv_dim + kv_head_off + d];\n");
     src.push_str("        }\n");
     src.push_str("        workgroupBarrier();\n\n");
 
@@ -3660,7 +3837,11 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     let _ = writeln!(src, "        let dot_base = qi * {tpq}u;");
     src.push_str("        var pdot2 = 0.0;\n");
     for e in 0..ept {
-        let _ = writeln!(src, "        pdot2 += q{e} * shared_k[d_base + {e}u];");
+        let _ = writeln!(
+            src,
+            "        pdot2 += q{e} * shared_k[d_base + {}u];",
+            e * d_stride
+        );
     }
     src.push_str("        wg_dot[dot_base + lane] = pdot2;\n");
     src.push_str("        tree_reduce_grouped(lid.x);\n");
@@ -3675,7 +3856,8 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     for e in 0..ept {
         let _ = writeln!(
             src,
-            "            out{e} = out{e} * correction + weight * bias[v_base2 + d_base + {e}u];"
+            "            out{e} = out{e} * correction + weight * bias[v_base2 + d_base + {}u];",
+            e * d_stride
         );
     }
     src.push_str("            max_score = new_max;\n");
@@ -3690,7 +3872,8 @@ fn generate_flash_attention(head_dim: u32, ept_cap: u32, cached: bool) -> Shader
     for e in 0..ept {
         let _ = writeln!(
             src,
-            "        dst[q_base + d_base + {e}u] = out{e} / safe_sum;"
+            "        dst[q_base + d_base + {}u] = out{e} / safe_sum;",
+            e * d_stride
         );
     }
 
@@ -4786,7 +4969,7 @@ pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule
 
     // Shared K/V staging with BKV tiling: amortize barrier cost by loading
     // BKV KV positions worth of K and V at once, then looping in-register.
-    let bkv: u32 = 8;
+    let bkv: u32 = if tpq == 1 { 8 } else { 1 };
     let _ = writeln!(src, "var<workgroup> shared_k: array<f32, {}>;", bkv * hd);
     let _ = writeln!(src, "var<workgroup> shared_v: array<f32, {}>;\n", bkv * hd);
 
@@ -4977,9 +5160,12 @@ pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule
         // Tail: remaining KV positions one at a time
         src.push_str("    for (; t < max_kv_len; t++) {\n");
         src.push_str("        let k_base = t * kv_dim + kv_head_off;\n");
-        let _ = writeln!(src, "        if lid.x < {hd}u {{");
-        src.push_str("            shared_k[lid.x] = src_b[k_base + lid.x];\n");
-        src.push_str("            shared_v[lid.x] = bias[k_base + lid.x];\n");
+        let _ = writeln!(
+            src,
+            "        for (var d = lid.x; d < {hd}u; d += {wg_size}u) {{"
+        );
+        src.push_str("            shared_k[d] = src_b[k_base + d];\n");
+        src.push_str("            shared_v[d] = bias[k_base + d];\n");
         src.push_str("        }\n");
         src.push_str("        workgroupBarrier();\n");
         src.push_str("        var sp2 = 0.0;\n");
@@ -5003,9 +5189,12 @@ pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule
         // TPQ>1 path: single KV position per iteration with cross-lane reduction.
         src.push_str("    for (var t = min_kv_start; t < max_kv_len; t++) {\n");
         src.push_str("        let k_base = t * kv_dim + kv_head_off;\n");
-        let _ = writeln!(src, "        if lid.x < {hd}u {{");
-        src.push_str("            shared_k[lid.x] = src_b[k_base + lid.x];\n");
-        src.push_str("            shared_v[lid.x] = bias[k_base + lid.x];\n");
+        let _ = writeln!(
+            src,
+            "        for (var d = lid.x; d < {hd}u; d += {wg_size}u) {{"
+        );
+        src.push_str("            shared_k[d] = src_b[k_base + d];\n");
+        src.push_str("            shared_v[d] = bias[k_base + d];\n");
         src.push_str("        }\n");
         src.push_str("        workgroupBarrier();\n\n");
 
@@ -5195,10 +5384,13 @@ pub fn generate_flash_grad_kv_module(head_dim: u32, ept_cap: u32) -> ShaderModul
         }
     } else {
         // TPQ>1: cooperative staging into shared memory (needs barriers).
-        let _ = writeln!(src, "            if lid.x < {hd}u {{");
-        src.push_str("                shared_q[lid.x] = src_a[q_base + lid.x];\n");
-        src.push_str("                shared_do[lid.x] = d_out[q_base + lid.x];\n");
-        src.push_str("                shared_o[lid.x] = fwd_dst[q_base + lid.x];\n");
+        let _ = writeln!(
+            src,
+            "            for (var d = lid.x; d < {hd}u; d += {wg_size}u) {{"
+        );
+        src.push_str("                shared_q[d] = src_a[q_base + d];\n");
+        src.push_str("                shared_do[d] = d_out[q_base + d];\n");
+        src.push_str("                shared_o[d] = fwd_dst[q_base + d];\n");
         src.push_str("            }\n");
         src.push_str("            workgroupBarrier();\n\n");
 
@@ -6382,24 +6574,34 @@ mod tests {
 
     #[test]
     fn test_flash_attention_wgsl() {
-        // BQ=4 for hd=64, BQ=8 for hd=32, BQ=2 for hd=128
-        let _ = generate_flash_attention_module(
-            64,
-            crate::compile::TuningKnobs::default().flash_ept_cap,
-        );
-        let _ = generate_flash_attention_module(
-            32,
-            crate::compile::TuningKnobs::default().flash_ept_cap,
-        );
-        let _ = generate_flash_attention_module(
-            128,
-            crate::compile::TuningKnobs::default().flash_ept_cap,
-        );
-        // hd=256 should fall back to BQ=1 (regular attention)
-        let _ = generate_flash_attention_module(
-            256,
-            crate::compile::TuningKnobs::default().flash_ept_cap,
-        );
+        let mut shape = FlashAttentionShape::default();
+        shape.fit_shared_memory(1024, 32768);
+        assert_eq!(shape.keys, 2);
+        assert!(shape.shared_bytes(1024) <= 32768);
+        for hd in [32, 64, 128, 256] {
+            for ept in [8, 16, 32] {
+                for interleave in [false, true] {
+                    for (threads, keys) in [(256, 8), (128, 16), (256, 2), (128, 4)] {
+                        let sm = generate_flash_attention_module(
+                            hd,
+                            ept,
+                            FlashAttentionShape {
+                                threads,
+                                keys,
+                                interleave,
+                            },
+                        );
+                        naga::valid::Validator::new(
+                            naga::valid::ValidationFlags::all()
+                                ^ naga::valid::ValidationFlags::BINDINGS,
+                            naga::valid::Capabilities::empty(),
+                        )
+                        .validate(&sm.module)
+                        .unwrap();
+                    }
+                }
+            }
+        }
     }
 
     #[test]

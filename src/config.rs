@@ -183,6 +183,12 @@ registry! {
         "Run bounded scalar-f32 matmul tile searches on private scratch at build; never executes the live graph.";
     FLASH_EPT_CAP: "MEGANEURA_FLASH_EPT_CAP", U32, Tuning,
         "Elements-per-thread cap for flash-attention forward codegen (power of two ≥ 2).";
+    FLASH_THREADS: "MEGANEURA_FLASH_THREADS", U32, Tuning,
+        "Forward attention workgroup width: 128 or 256.";
+    FLASH_KEYS: "MEGANEURA_FLASH_KEYS", U32, Tuning,
+        "Forward attention shared key/value tile: power of two up to 16, capped by device shared memory.";
+    FLASH_INTERLEAVE: "MEGANEURA_FLASH_INTERLEAVE", Bool, Tuning,
+        "Interleave head dimensions across forward attention lanes.";
     FLASH_GRAD_Q_EPT_CAP: "MEGANEURA_FLASH_GRAD_Q_EPT_CAP", U32, Tuning,
         "EPT cap for the flash dQ backward kernel.";
     FLASH_GRAD_KV_EPT_CAP: "MEGANEURA_FLASH_GRAD_KV_EPT_CAP", U32, Tuning,
@@ -284,6 +290,17 @@ impl TuningKnobs {
         let fwd = cap(&FLASH_EPT_CAP);
         Self {
             flash_ept_cap: fwd.unwrap_or(d.flash_ept_cap),
+            flash: crate::codegen::FlashAttentionShape {
+                threads: FLASH_THREADS
+                    .u32_value()
+                    .filter(|v| matches!(v, 128 | 256))
+                    .unwrap_or(d.flash.threads),
+                keys: FLASH_KEYS
+                    .u32_value()
+                    .filter(|v| v.is_power_of_two() && *v <= 16)
+                    .unwrap_or(d.flash.keys),
+                interleave: FLASH_INTERLEAVE.bool_or(d.flash.interleave),
+            },
             flash_grad_q_ept_cap: cap(&FLASH_GRAD_Q_EPT_CAP)
                 .or(bwd)
                 .or(fwd)

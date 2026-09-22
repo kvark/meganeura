@@ -2,6 +2,94 @@ use super::{BufferRef, Dispatch, ExecutionPlan, ShaderEntry};
 use crate::tune::{MatmulTile, TuneClass, TuneError};
 
 impl ExecutionPlan {
+    /// Lower one matrix product (with optional addition) to partials + SumRows.
+    /// This is a candidate, not a selection: qualify and time the entire sequence.
+    pub(crate) fn split_matmul(
+        &mut self,
+        index: usize,
+        shape: crate::codegen::ScalarMatmulShape,
+        splits: u32,
+        max_partial_bytes: usize,
+    ) -> Result<(), TuneError> {
+        if !matches!(shape.tile_size, 32 | 64) || !matches!(shape.k_stage, 8 | 16 | 32) {
+            return Err(TuneError("unsupported split-K tile"));
+        }
+        let dispatch = self
+            .dispatches
+            .get(index)
+            .ok_or(TuneError("missing matrix dispatch"))?;
+        let mut class = TuneClass::from_dispatch(dispatch, None)
+            .filter(|c| {
+                c.shader.is_matmul()
+                    && matches!(
+                        c.weight_format,
+                        super::WeightFormat::F32 | super::WeightFormat::F16
+                    )
+            })
+            .ok_or(TuneError("split-K requires a scalar matrix product"))?;
+        let mut bindings = dispatch.input_buffers.clone();
+        bindings.push(dispatch.output_buffer);
+        let mut unique = bindings.clone();
+        unique.sort_unstable_by_key(|b| b.0);
+        unique.dedup();
+        if unique.len() != bindings.len() {
+            return Err(TuneError("split-K requires distinct bindings"));
+        }
+        class.binding_bytes = bindings
+            .iter()
+            .map(|b| self.buffers.get(b.0 as usize).copied())
+            .collect::<Option<Vec<_>>>()
+            .ok_or(TuneError("invalid matrix binding"))?;
+        if !MatmulTile::Scalar(shape).fits(&class)
+            || !(2..=0xFFFF).contains(&splits)
+            || splits > class.k.div_ceil(shape.k_stage)
+            || class.k.checked_add(shape.k_stage - 1).is_none()
+            || class.m.div_ceil(shape.rows()) > 0xFFFF
+        {
+            return Err(TuneError("illegal split-K dimensions or binding capacity"));
+        }
+        let columns = class
+            .m
+            .checked_mul(class.n)
+            .ok_or(TuneError("matrix size overflow"))?;
+        if columns.div_ceil(256) > 0xFFFF {
+            return Err(TuneError("split-K reduction exceeds dispatch limits"));
+        }
+        let bytes = columns
+            .checked_mul(splits)
+            .and_then(|n| (n as usize).checked_mul(4))
+            .filter(|&bytes| bytes <= max_partial_bytes)
+            .ok_or(TuneError("split-K scratch budget"))?;
+        let partial = BufferRef(
+            u32::try_from(self.buffers.len()).map_err(|_| TuneError("too many buffers"))?,
+        );
+        let mut producer = dispatch.clone();
+        producer.kernel = super::Kernel::SplitMatmul { shape, splits };
+        producer.output_buffer = partial;
+        producer.workgroups = [
+            class.n.div_ceil(shape.cols()),
+            class.m.div_ceil(shape.rows()),
+            splits,
+        ];
+        producer.label = format!("{} split-K {splits}", dispatch.label);
+        let reduction = Dispatch {
+            shader: ShaderEntry::SumRows,
+            workgroups: [columns.div_ceil(256), 1, 1],
+            input_buffers: vec![partial],
+            output_buffer: dispatch.output_buffer,
+            params: vec![splits, columns, 1, 0],
+            requires_full_precision: dispatch.requires_full_precision,
+            fusion_barrier: dispatch.fusion_barrier,
+            label: format!("{} split-K reduction", dispatch.label),
+            origin: dispatch.origin.clone(),
+            ..Default::default()
+        };
+        self.buffers.push(bytes);
+        self.dispatches
+            .splice(index..index + 1, [producer, reduction]);
+        Ok(())
+    }
+
     /// Experimentally lower selected scalar convolution weight gradients to
     /// partials followed by the existing SumRows reduction, before allocating a session.
     ///
@@ -125,6 +213,92 @@ impl ExecutionPlan {
 mod tests {
     use super::*;
     use crate::Graph;
+
+    #[test]
+    #[ignore = "GPU dense split-K candidate qualification on an idle device"]
+    fn dense_split_candidates_preserve_transposition_and_ragged_edges() {
+        let gpu = std::sync::Arc::new(
+            crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap(),
+        );
+        for case in 0..6 {
+            let transpose = case % 3;
+            let add = case >= 3;
+            let (m, k, n) = (7, 67, 11);
+            let mut graph = Graph::new();
+            let a = graph.input("a", &if transpose == 1 { [k, m] } else { [m, k] });
+            let b = graph.parameter("b", &if transpose == 2 { [n, k] } else { [k, n] });
+            let y = match transpose {
+                0 => graph.matmul(a, b),
+                1 => graph.matmul_at(a, b),
+                _ => graph.matmul_bt(a, b),
+            };
+            let y = if add {
+                let c = graph.input("c", &[m, n]);
+                graph.add(y, c)
+            } else {
+                y
+            };
+            graph.set_outputs(vec![y]);
+            let a: Vec<_> = (0..m * k).map(|i| (i as f32 * 0.21).sin()).collect();
+            let b: Vec<_> = (0..k * n).map(|i| (i as f32 * 0.13).cos()).collect();
+            let mut reference = vec![0.0_f64; m * n];
+            for row in 0..m {
+                for col in 0..n {
+                    reference[row * n + col] = (0..k)
+                        .map(|j| {
+                            let ai = if transpose == 1 {
+                                j * m + row
+                            } else {
+                                row * k + j
+                            };
+                            let bi = if transpose == 2 {
+                                col * k + j
+                            } else {
+                                j * n + col
+                            };
+                            f64::from(a[ai]) * f64::from(b[bi])
+                        })
+                        .sum::<f64>()
+                        + if add { 0.125 } else { 0.0 };
+                }
+            }
+            for (tile_size, k_stage, splits) in [(32, 8, 3), (64, 16, 4), (32, 32, 2)] {
+                let mut plan = super::super::compile(&crate::optimize::optimize(&graph));
+                let shape = crate::codegen::ScalarMatmulShape {
+                    tile_size,
+                    k_stage,
+                    interleave_columns: true,
+                };
+                let before = serde_json::to_value(&plan).unwrap();
+                assert!(plan.split_matmul(0, shape, splits, 0).is_err());
+                assert_eq!(before, serde_json::to_value(&plan).unwrap());
+                plan.split_matmul(0, shape, splits, 1024 * 1024).unwrap();
+                assert!(TuneClass::from_dispatch(&plan.dispatches[0], None).is_none());
+                let mut session = crate::Session::with_context_opts(
+                    plan,
+                    gpu.clone(),
+                    crate::SessionOptions {
+                        coop: crate::CoopPolicy::Disabled,
+                        ..Default::default()
+                    },
+                );
+                session.set_input("a", &a);
+                session.set_parameter("b", &b);
+                if add {
+                    session.set_input("c", &vec![0.125; m * n]);
+                }
+                session.step();
+                session.wait();
+                for (actual, expected) in session.read_output(m * n).into_iter().zip(&reference) {
+                    assert!(
+                        actual.is_finite()
+                            && (f64::from(actual) - expected).abs() < 2e-5 + 2e-4 * expected.abs(),
+                        "{actual} != {expected}"
+                    );
+                }
+            }
+        }
+    }
 
     fn plan() -> (ExecutionPlan, usize) {
         let mut graph = Graph::new();
