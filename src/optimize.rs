@@ -1391,15 +1391,17 @@ const fn matrix_impl(
 
 // One catalog supplies declarations, equalities, reconstruction and exclusions.
 const MATRIX_IMPLEMENTATIONS: &[(&str, crate::graph::MatmulImpl)] = &[
-    // Ordinary construction already probes single-pass scalar tiles. Cover
-    // split tile widths and K staging before smaller layout variations.
+    // Ordinary construction already probes single-pass scalar tiles. Retain
+    // counted split-K kernels as well as the unrolled alternatives.
+    ("64x64k8s8loop", matrix_impl(64, 64, 8, 8, false)),
     ("64x64k32s8", matrix_impl(64, 64, 32, 8, true)),
-    ("32x32k32s8", matrix_impl(32, 32, 32, 8, true)),
+    ("32x32k32s8loop", matrix_impl(32, 32, 32, 8, false)),
     ("64x64k8s8", matrix_impl(64, 64, 8, 8, true)),
     ("64x64k32", matrix_impl(64, 64, 32, 1, true)),
     ("32x32k32", matrix_impl(32, 32, 32, 1, true)),
     ("64x32k32", matrix_impl(64, 32, 32, 1, true)),
     ("64x64k16", matrix_impl(64, 64, 16, 1, true)),
+    ("32x32k32s8", matrix_impl(32, 32, 32, 8, true)),
     ("32x32k16", matrix_impl(32, 32, 16, 1, true)),
     ("64x64loop", matrix_impl(64, 64, 32, 1, false)),
     ("32x32loop", matrix_impl(32, 32, 32, 1, false)),
