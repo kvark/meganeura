@@ -1376,8 +1376,8 @@ const fn matrix_impl(
     k_stage: u32,
     splits: u32,
     unroll_k: bool,
-) -> crate::graph::MatmulImpl {
-    crate::graph::MatmulImpl {
+) -> Option<crate::graph::MatmulImpl> {
+    Some(crate::graph::MatmulImpl {
         shape: crate::codegen::ScalarMatmulShape {
             tile_size: tile_m,
             tile_n: if tile_m == tile_n { 0 } else { tile_n },
@@ -1386,15 +1386,18 @@ const fn matrix_impl(
             unroll_k,
         },
         splits,
-    }
+    })
 }
 
 // One catalog supplies declarations, equalities, reconstruction and exclusions.
-const MATRIX_IMPLEMENTATIONS: &[(&str, crate::graph::MatmulImpl)] = &[
+const MATRIX_IMPLEMENTATIONS: &[(&str, Option<crate::graph::MatmulImpl>)] = &[
     // Ordinary construction already probes single-pass scalar tiles. Retain
     // counted split-K kernels as well as the unrolled alternatives.
     ("64x64k8s8loop", matrix_impl(64, 64, 8, 8, false)),
     ("64x64k32s8", matrix_impl(64, 64, 32, 8, true)),
+    // Keep private kernel probes available on every logical form, not just
+    // the ordinary graph. This also retains its native cooperative choices.
+    ("auto", None),
     ("32x32k32s8loop", matrix_impl(32, 32, 32, 8, false)),
     ("64x64k8s8", matrix_impl(64, 64, 8, 8, true)),
     ("64x64k32", matrix_impl(64, 64, 32, 1, true)),
@@ -1437,7 +1440,7 @@ fn scheduled_matmul(name: &str) -> Option<crate::graph::MatmulImpl> {
     let (_, layout) = name.split_once("__")?;
     MATRIX_IMPLEMENTATIONS
         .iter()
-        .find_map(|&(candidate, spec)| (candidate == layout).then_some(spec))
+        .find_map(|&(candidate, spec)| (candidate == layout).then_some(spec).flatten())
 }
 
 fn matrix_family(name: &str) -> Option<&'static str> {

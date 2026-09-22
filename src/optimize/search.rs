@@ -38,7 +38,7 @@ struct Edge {
 struct Cost {
     forbidden: usize,
     estimate: u64,
-    // Prefer a concrete schedule only when the logical estimates tie.
+    // Prefer implementation alternatives only when logical estimates tie.
     unscheduled: usize,
 }
 
@@ -486,20 +486,18 @@ mod tests {
     use super::candidates;
     use crate::{Graph, graph::Op};
 
-    fn has_fused_tile(candidate: &super::Candidate) -> bool {
-        candidate
-            .graph
-            .nodes()
-            .iter()
-            .any(|node| matches!(node.op, Op::FusedMatMulAdd) && node.matmul_impl.is_some())
+    fn has_fused_schedule(candidate: &super::Candidate, scheduled: bool) -> bool {
+        candidate.graph.nodes().iter().any(|node| {
+            matches!(node.op, Op::FusedMatMulAdd) && node.matmul_impl.is_some() == scheduled
+        })
     }
 
-    fn has_unfused_tile(candidate: &super::Candidate) -> bool {
+    fn has_unfused_schedule(candidate: &super::Candidate, scheduled: bool) -> bool {
         candidate.graph.nodes().iter().any(|node| {
             matches!(node.op, Op::Add)
                 && node.inputs.iter().any(|&id| {
                     let child = candidate.graph.node(id);
-                    matches!(child.op, Op::MatMul) && child.matmul_impl.is_some()
+                    matches!(child.op, Op::MatMul) && child.matmul_impl.is_some() == scheduled
                 })
         })
     }
@@ -737,16 +735,21 @@ mod tests {
         let out = graph.neg(add);
         graph.set_outputs(vec![out]);
         let space = candidates(&graph, Default::default(), 8).unwrap();
-        assert!(space.candidates.iter().any(has_fused_tile));
-        assert!(
-            space.candidates.iter().any(has_unfused_tile),
-            "unfused tile was crowded out: {:?}",
-            space
-                .candidates
-                .iter()
-                .map(|c| c.expression.clone())
-                .collect::<Vec<_>>()
-        );
+        for scheduled in [false, true] {
+            assert!(
+                space
+                    .candidates
+                    .iter()
+                    .any(|c| has_fused_schedule(c, scheduled))
+            );
+            assert!(
+                space
+                    .candidates
+                    .iter()
+                    .any(|c| has_unfused_schedule(c, scheduled)),
+                "unfused schedule {scheduled} was crowded out"
+            );
+        }
         assert!(candidates(&graph, Default::default(), 1).unwrap().truncated);
 
         let d = graph.input("d", &[3, 7]);
@@ -771,8 +774,18 @@ mod tests {
         let bounded = candidates(&graph, Default::default(), 2).unwrap();
         assert!(bounded.truncated);
         assert_eq!(bounded.candidates.len(), 2);
-        assert!(bounded.candidates.iter().any(has_fused_tile));
-        assert!(bounded.candidates.iter().any(has_unfused_tile));
+        assert!(
+            bounded
+                .candidates
+                .iter()
+                .any(|c| has_fused_schedule(c, true))
+        );
+        assert!(
+            bounded
+                .candidates
+                .iter()
+                .any(|c| has_unfused_schedule(c, true))
+        );
         assert_ne!(
             bounded.candidates[0].expression,
             bounded.candidates[1].expression
