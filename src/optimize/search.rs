@@ -38,6 +38,8 @@ struct Edge {
 struct Cost {
     forbidden: usize,
     estimate: u64,
+    // Prefer a concrete schedule only when the logical estimates tie.
+    unscheduled: usize,
 }
 
 impl egglog::extract::Cost for Cost {
@@ -45,18 +47,21 @@ impl egglog::extract::Cost for Cost {
         Self {
             forbidden: 0,
             estimate: 0,
+            unscheduled: 0,
         }
     }
     fn unit() -> Self {
         Self {
             forbidden: 0,
             estimate: 1,
+            unscheduled: 0,
         }
     }
     fn combine(self, other: &Self) -> Self {
         Self {
             forbidden: self.forbidden.saturating_add(other.forbidden),
             estimate: self.estimate.saturating_add(other.estimate),
+            unscheduled: self.unscheduled.saturating_add(other.unscheduled),
         }
     }
 }
@@ -72,6 +77,7 @@ impl CostModel<Cost> for Excluding {
         Cost {
             forbidden: 0,
             estimate: 0,
+            unscheduled: 0,
         }
     }
 
@@ -98,7 +104,8 @@ impl CostModel<Cost> for Excluding {
                     })
                     .is_ok(),
             ),
-            estimate: self.costs.enode_cost(egraph, func, row).max(1),
+            estimate: self.costs.enode_cost(egraph, func, row),
+            unscheduled: usize::from(super::matrix_family(func.name()) == Some(func.name())),
         }
     }
 }
@@ -266,10 +273,7 @@ fn segment_candidates(
         ));
         "$outputs".into()
     };
-    let mut egraph = super::rule_graph(config.pack_swiglu);
-    egraph
-        .parse_and_run_program(None, super::TILE_EQUALITY_RULES)
-        .map_err(|e| e.to_string())?;
+    let mut egraph = super::rule_graph(config.pack_swiglu, true);
     egraph
         .parse_and_run_program(None, &program)
         .map_err(|e| e.to_string())?;
@@ -321,6 +325,7 @@ fn segment_candidates(
             continue;
         }
         let mut branches = Vec::new();
+        let mut sites = Vec::new();
         let mut families = BTreeMap::<String, Vec<Edge>>::new();
         for (value, edge) in edges(&egraph, &terms, term)? {
             let branching = *choices.entry(value).or_insert_with(|| {
@@ -332,18 +337,38 @@ fn segment_candidates(
             if !branching {
                 continue;
             }
-            families
-                .entry(edge.head.clone())
-                .or_default()
-                .push(edge.clone());
+            if let Some(logical) = super::matrix_family(&edge.head) {
+                let family: Vec<_> = std::iter::once(logical)
+                    .chain(
+                        super::matrix_constructors()
+                            .iter()
+                            .filter(|entry| entry.1 == logical)
+                            .map(|entry| entry.0.as_str()),
+                    )
+                    .map(|name| Edge {
+                        head: name.into(),
+                        inputs: edge.inputs.clone(),
+                    })
+                    .collect();
+                families
+                    .entry(logical.into())
+                    .or_default()
+                    .extend(family.clone());
+                sites.push(family);
+            } else {
+                families
+                    .entry(edge.head.clone())
+                    .or_default()
+                    .push(edge.clone());
+            }
             branches.push(edge);
         }
-        // Visit whole-constructor alternatives before their individual sites.
-        // Otherwise a small bound explores many nearly identical partial
-        // unfusions and can miss the fully unfused family entirely.
+        // Exclude whole logical families before individual schedules. Adding
+        // more tile sizes must not push the unfused form out of a small frontier.
         let exclusions = families
             .into_values()
             .filter(|edges| edges.len() > 1)
+            .chain(sites)
             .chain(branches.into_iter().map(|edge| vec![edge]));
         for excluded in exclusions {
             let mut next = forbidden.to_vec();
@@ -450,9 +475,9 @@ mod tests {
         assert!(
             impls
                 .iter()
-                .any(|spec| spec.tile_n == 32 && spec.splits == 1)
+                .any(|spec| spec.shape.cols() == 32 && spec.splits == 1)
         );
-        assert!(impls.iter().any(|spec| spec.k_stage == 16));
+        assert!(impls.iter().any(|spec| spec.shape.k_stage == 16));
         assert!(impls.iter().any(|spec| spec.splits == 8));
         for candidate in &space.candidates {
             let scheduled = candidate
@@ -500,18 +525,31 @@ mod tests {
             };
             graph.set_outputs(vec![output]);
             let region = crate::outline::detect_repeated_regions(&graph)[0];
-            for sample in 0..6 {
-                let start = std::time::Instant::now();
-                let space =
-                    super::repeated_candidates(&graph, region, Default::default(), 4).unwrap();
-                println!(
-                    "{model} sample={sample} region_nodes={} candidates={} truncated={} ms={:.3}",
-                    region.period,
-                    space.candidates.len(),
-                    space.truncated,
-                    start.elapsed().as_secs_f64() * 1000.0
-                );
-                assert!(!space.candidates.is_empty());
+            for extraction_cost in [
+                crate::optimize::ExtractionCost::TensorTraffic,
+                crate::optimize::ExtractionCost::AstSize,
+            ] {
+                for sample in 0..6 {
+                    let start = std::time::Instant::now();
+                    let space = super::repeated_candidates(
+                        &graph,
+                        region,
+                        crate::OptimizeConfig {
+                            extraction_cost,
+                            ..Default::default()
+                        },
+                        4,
+                    )
+                    .unwrap();
+                    println!(
+                        "{model} cost={extraction_cost:?} sample={sample} region_nodes={} candidates={} truncated={} ms={:.3}",
+                        region.period,
+                        space.candidates.len(),
+                        space.truncated,
+                        start.elapsed().as_secs_f64() * 1000.0
+                    );
+                    assert!(!space.candidates.is_empty());
+                }
             }
         }
     }
@@ -608,7 +646,8 @@ mod tests {
         let bounded = candidates(&graph, Default::default(), 2).unwrap();
         assert!(bounded.truncated);
         assert_eq!(bounded.candidates.len(), 2);
-        assert!(bounded.candidates.iter().all(has_fused_tile));
+        assert!(bounded.candidates.iter().any(has_fused_tile));
+        assert!(bounded.candidates.iter().any(has_unfused_tile));
         assert_ne!(
             bounded.candidates[0].expression,
             bounded.candidates[1].expression

@@ -5,13 +5,15 @@
 //!   cargo run --release --example search_study
 //! ```
 //!
-//! `greedy+tuner` extracts one graph by tensor traffic, then runs the private
+//! `one-graph+tuner` extracts one graph, then runs the private
 //! kernel tuner. `egraph` keeps tile and split-K equalities and times whole
 //! steps. Both use the same inputs, device, and profiled-median readout.
 use std::time::{Duration, Instant};
 
-use meganeura::train::{BuildSearchOptions, Mode, build, build_measured};
-use meganeura::{CoopPolicy, Graph, OptimizeConfig, Session, SessionConfig, TuneOptions};
+use meganeura::{
+    CoopPolicy, Graph, Session, SessionConfig, TuneOptions,
+    train::{BuildSearchOptions, Mode, build, build_measured},
+};
 
 fn shapes() -> Vec<(usize, usize, usize, bool)> {
     vec![
@@ -37,16 +39,16 @@ fn reference(
     a: &[f32],
     b: &[f32],
     d: &[f32],
-) -> Vec<f32> {
+) -> Vec<f64> {
     let mut out = vec![0.0; m * n];
     for row in 0..m {
         for col in 0..n {
-            let mut acc = 0.0f32;
+            let mut acc = 0.0f64;
             for t in 0..k {
-                acc += a[row * k + t] * b[t * n + col];
+                acc += f64::from(a[row * k + t]) * f64::from(b[t * n + col]);
             }
             if fuse {
-                acc += d[row * n + col];
+                acc += f64::from(d[row * n + col]);
             }
             out[row * n + col] = acc;
         }
@@ -77,17 +79,14 @@ fn load(session: &mut Session, fuse: bool, a: &[f32], b: &[f32], d: &[f32]) {
     }
 }
 
-fn check(session: &Session, expected: &[f32]) -> Result<(), String> {
+fn check(session: &Session, expected: &[f64]) -> Result<(), String> {
     let got = session.read_output(expected.len());
-    let mut max_abs = 0.0f32;
     for (got, expected) in got.iter().zip(expected) {
-        max_abs = max_abs.max((got - expected).abs());
+        if !got.is_finite() || (f64::from(*got) - expected).abs() > 2e-5 + 2e-4 * expected.abs() {
+            return Err(format!("{got} != {expected}"));
+        }
     }
-    if max_abs > 1e-3 {
-        Err(format!("max_abs {max_abs:.3e}"))
-    } else {
-        Ok(())
-    }
+    Ok(())
 }
 
 fn profile(session: &mut Session) -> f64 {
@@ -130,7 +129,6 @@ fn describe(session: &Session) -> String {
 fn base_config(tune: bool) -> SessionConfig<'static> {
     let mut cfg = SessionConfig::inference_from_env();
     cfg.mode = Mode::Inference;
-    cfg.optimize = OptimizeConfig::default();
     cfg.runtime.coop = CoopPolicy::Disabled;
     cfg.tune = tune;
     cfg
@@ -151,7 +149,7 @@ fn main() {
         check(&greedy, &expected).unwrap_or_else(|error| panic!("{label} greedy {error}"));
         let greedy_us = profile(&mut greedy);
         println!(
-            "greedy+tuner {label} gpu_us {greedy_us:.2} setup_s {:.1} plan {}",
+            "one-graph+tuner {label} gpu_us {greedy_us:.2} setup_s {:.1} plan {}",
             started.elapsed().as_secs_f64(),
             describe(&greedy)
         );
@@ -161,8 +159,8 @@ fn main() {
             &graph,
             base_config(false),
             BuildSearchOptions {
-                max_graphs: 8,
-                max_programs: 12,
+                max_graphs: 16,
+                max_programs: 24,
                 max_time: Duration::from_secs(40),
                 warmup_runs: 1,
                 tuning: TuneOptions {
@@ -181,6 +179,10 @@ fn main() {
             |session| check(session, &expected),
         )
         .unwrap_or_else(|error| panic!("{label} egraph {error}"));
+        assert!(
+            report.trials.iter().all(|trial| trial.outcome.qualified),
+            "a candidate failed qualification"
+        );
         let measured_us = profile(&mut measured);
         println!(
             "egraph {label} gpu_us {measured_us:.2} setup_s {:.1} selected {} trials {} plan {}",

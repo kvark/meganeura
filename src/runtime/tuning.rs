@@ -97,6 +97,7 @@ pub(super) fn tile_module(
                 knobs: crate::codegen::MatmulKnobs {
                     k_stage: shape.k_stage,
                     interleave_columns: shape.interleave_columns,
+                    unroll_k: shape.unroll_k,
                     ..knobs
                 },
             },
@@ -295,6 +296,7 @@ fn collect_classes(
                         tile_n: 0,
                         k_stage: plan.knobs.matmul_k_stage,
                         interleave_columns: plan.knobs.matmul_interleave_columns,
+                        unroll_k: false,
                     }))
                 }
                 _ => None,
@@ -1891,6 +1893,7 @@ mod tests {
                     tile_n: 0,
                     k_stage: 8,
                     interleave_columns: true,
+                    unroll_k: false,
                 })
                 .apply(&mut right.dispatches[index], &class.key);
             }
@@ -2025,6 +2028,7 @@ mod tests {
                 tile_n: 0,
                 k_stage: 8,
                 interleave_columns: true,
+                unroll_k: false,
             })
         };
         b.pipelines
@@ -2489,6 +2493,7 @@ mod tests {
                             tile_n: 0,
                             k_stage,
                             interleave_columns,
+                            unroll_k: false,
                         }));
                     }
                 }

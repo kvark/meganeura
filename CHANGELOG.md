@@ -1,6 +1,7 @@
 # Unreleased
 
-- NN matmul K stage and column interleave are no longer environment switches. Measured extraction treats K stage 32, 16, and 8, including split-K 8, as equal schedules. The scalar K loop stays unrolled.
+- Search NN matrix tiles, K staging, unrolling and split-K as e-graph alternatives,
+  preserving logical fusion choices and qualifying complete implementations.
 - Use one egglog rewrite engine and calibrated whole-program search instead of live attention/submission retuning.
 - Broadcast scalar gradients directly and eliminate single-row RoPE at static position zero.
 - Fix split-attention partial indexing and clear empty splits when reusing a KV cache.

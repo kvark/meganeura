@@ -343,7 +343,7 @@ impl Default for MatmulKnobs {
             k_stage: 32,
             interleave_columns: false,
             integer_dot: false,
-            unroll_k: true,
+            unroll_k: false,
         }
     }
 }
@@ -358,6 +358,9 @@ pub struct ScalarMatmulShape {
     pub tile_n: u32,
     pub k_stage: u32,
     pub interleave_columns: bool,
+    /// Emit a straight-line K stage. The counted loop remains an alternative.
+    #[serde(default)]
+    pub unroll_k: bool,
 }
 
 impl ScalarMatmulShape {
@@ -444,6 +447,7 @@ pub(crate) fn generate_split_matmul(
             knobs: MatmulKnobs {
                 k_stage: shape.k_stage,
                 interleave_columns: shape.interleave_columns,
+                unroll_k: shape.unroll_k,
                 ..knobs
             },
         },
@@ -1163,8 +1167,6 @@ fn tiled_matmul_body(
         k_tile + 1,
         tile.bn() + 1,
         interleave_columns,
-        "shared_a",
-        "shared_b",
     )
 }
 
@@ -1234,8 +1236,7 @@ fn conv_gemm_tiled(
     // column is never stored or read.
     let a_stride = k_tile + 1;
     let b_stride = bm + 1;
-    let (acc_decl, compute_body, acc_array) =
-        tiled_gemm_body(tm, tm, a_stride, b_stride, false, "shared_a", "shared_b");
+    let (acc_decl, compute_body, acc_array) = tiled_gemm_body(tm, tm, a_stride, b_stride, false);
     let (declaration, divisor) = if let Some(values) = params {
         assert_eq!(values.len(), 16, "Conv2dParams layout");
         let arguments = values.iter().map(|v| format!("{v}u")).collect::<Vec<_>>();
@@ -1320,8 +1321,6 @@ fn tiled_gemm_body(
     a_stride: u32,
     b_stride: u32,
     interleave_columns: bool,
-    a_smem: &str,
-    b_smem: &str,
 ) -> (String, String, String) {
     use std::fmt::Write;
 
@@ -1337,7 +1336,7 @@ fn tiled_gemm_body(
     for i in 0..tm {
         let _ = writeln!(
             body,
-            "            let a{i} = {a_smem}[(ty * {tm}u + {i}u) * {a_stride}u + kk];"
+            "            let a{i} = shared_a[(ty * {tm}u + {i}u) * {a_stride}u + kk];"
         );
     }
     for j in 0..tn {
@@ -1348,7 +1347,7 @@ fn tiled_gemm_body(
         };
         let _ = writeln!(
             body,
-            "            let b{j} = {b_smem}[kk * {b_stride}u + {column}];"
+            "            let b{j} = shared_b[kk * {b_stride}u + {column}];"
         );
     }
     for i in 0..tm {
@@ -1576,37 +1575,11 @@ fn matmul_vars_tiled(
     );
     let interleave_columns = !b_mode.is_quantized() && knobs.interleave_columns;
     let (acc_decl, compute_body, acc_array) = tiled_matmul_body(tile, k_tile, interleave_columns);
-    let shared_decl = "var<workgroup> shared_a: array<f32, $SHARED_A_SIZE>;\n\
-         var<workgroup> shared_b: array<f32, $SHARED_B_SIZE>;"
-        .to_string();
     let k_math = if knobs.unroll_k {
         unroll_k_math(&compute_body, k_tile)
     } else {
-        "for (var kk = 0u; kk < $K_TILE_U; kk++) {\n            \
-             $COMPUTE_BODY\n        \
-         }"
-        .to_string()
+        compute_body
     };
-    let k_loop = format!(
-        "var t = first_tile * $K_TILE_U;\n    \
-         loop {{\n        \
-             if t >= end_k {{ break; }}\n        \
-             for (var e = 0u; e < $A_STAGE_EPT_U; e++) {{\n            \
-                 let flat = tid + e * 256u;\n            \
-                 let row_local = $A_ROW;\n            \
-                 let col_local = $A_COL;\n            \
-                 let a_row = tile_row + row_local;\n            \
-                 let a_col = t + col_local;\n            \
-                 let in_bounds = (a_row < params.m) && (a_col < params.k);\n            \
-                 shared_a[row_local * $A_STRIDE_U + col_local] = select(0.0, matrix_a[$A_INDEX], in_bounds);\n        \
-             }}\n        \
-             $B_STAGE_BODY\n        \
-             workgroupBarrier();\n        \
-             {k_math}\n        \
-             workgroupBarrier();\n        \
-             t += $K_TILE_U;\n    \
-         }}"
-    );
     let output_column = if interleave_columns {
         "tx + j * 16u".to_string()
     } else {
@@ -1615,10 +1588,11 @@ fn matmul_vars_tiled(
     let src = preprocess(
         src,
         &[
-            // The loop is inserted first so the stage tokens it embeds are
-            // still substituted by the entries below.
-            ("$SHARED_DECL", &shared_decl),
-            ("$K_LOOP", &k_loop),
+            ("$COMPUTE_BODY", &k_math),
+            (
+                "$K_UNROLL_U",
+                &format!("{}u", if knobs.unroll_k { k_tile } else { 1 }),
+            ),
             ("$B_STAGE_BODY", &b_stage_body),
             ("$ENABLE_F16", enable_f16),
             ("$B_STORAGE_TYPE", b_storage),
@@ -1648,7 +1622,6 @@ fn matmul_vars_tiled(
             ("$SHARED_A_SIZE", &(bm * (k_tile + 1)).to_string()),
             ("$SHARED_B_SIZE", &(k_tile * (bn + 1)).to_string()),
             ("$ACC_DECL", &acc_decl),
-            ("$COMPUTE_BODY", &compute_body),
             ("$ACC_ARRAY", &acc_array),
         ],
     );

@@ -1045,16 +1045,18 @@ struct MultiHeadAttnGradKVData {
 struct EpiloguePipelineKey(
     crate::compile::MatMulEpilogue,
     crate::compile::WeightFormat,
-    crate::codegen::MatMulTile,
+    Option<crate::tune::MatmulTile>,
 );
 
 fn epilogue_pipeline_key(dispatch: &Dispatch) -> Option<EpiloguePipelineKey> {
     let format = dispatch.weight_format;
-    let tile = epilogue_tile(dispatch);
-    dispatch
-        .matmul_epilogue
-        .as_ref()
-        .map(|epilogue| EpiloguePipelineKey(epilogue.clone(), format, tile))
+    dispatch.matmul_epilogue.as_ref().map(|epilogue| {
+        EpiloguePipelineKey(
+            epilogue.clone(),
+            format,
+            crate::tune::MatmulTile::selected(dispatch, None),
+        )
+    })
 }
 
 /// Tile geometry the epilogue shader must be generated for.
@@ -1065,7 +1067,9 @@ fn epilogue_pipeline_key(dispatch: &Dispatch) -> Option<EpiloguePipelineKey> {
 /// check keeps the result correct, but three quarters of the workgroups
 /// do nothing.
 fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
-    if dispatch.use_small_tiles() {
+    if let Some(shape) = dispatch.scalar_matmul() {
+        shape.geometry()
+    } else if dispatch.use_small_tiles() {
         crate::codegen::MatMulTile::Small
     } else {
         crate::codegen::MatMulTile::Large
@@ -1080,7 +1084,12 @@ fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
 /// implementation once; preparation builds exactly the selected pipeline.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Variant {
-    SplitMatmul(ShaderEntry, crate::codegen::ScalarMatmulShape, u32),
+    SplitMatmul(
+        ShaderEntry,
+        crate::compile::WeightFormat,
+        crate::codegen::ScalarMatmulShape,
+        u32,
+    ),
     SpecializedConv(ShaderEntry, Vec<u32>, u32),
     ScalarMatmul(
         ShaderEntry,
@@ -1176,7 +1185,7 @@ impl Variant {
         match *self {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
             Variant::Attention(ref e, _)
-            | Variant::SplitMatmul(ref e, _, _)
+            | Variant::SplitMatmul(ref e, _, _, _)
             | Variant::SpecializedConv(ref e, _, _)
             | Variant::ScalarMatmul(ref e, _, _)
             | Variant::Epilogue(ref e, _)
@@ -1199,8 +1208,8 @@ impl Variant {
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
-            Variant::SplitMatmul(ref e, shape, splits) => {
-                format!("{e:?}:split-k-{splits}-{shape:?}")
+            Variant::SplitMatmul(ref e, format, shape, splits) => {
+                format!("{e:?}:split-k-{format:?}-{splits}-{shape:?}")
             }
             Variant::ScalarMatmul(ref e, format, shape) => {
                 format!("{e:?}:scalar-{format:?}-{shape:?}")
@@ -1341,12 +1350,17 @@ impl Pipelines {
             return Ok(());
         }
         let knobs = self.knobs;
-        let matmul_knobs = crate::codegen::MatmulKnobs {
+        let mut matmul_knobs = crate::codegen::MatmulKnobs {
             k_stage: knobs.matmul_k_stage,
             interleave_columns: knobs.matmul_interleave_columns,
             integer_dot: gpu.capabilities().shader_integer_dot_product,
-            unroll_k: knobs.unroll_k,
+            unroll_k: false,
         };
+        if let Some(shape) = dispatch.scalar_matmul() {
+            matmul_knobs.k_stage = shape.k_stage;
+            matmul_knobs.interleave_columns = shape.interleave_columns;
+            matmul_knobs.unroll_k = shape.unroll_k;
+        }
         let group = dispatch.shader.shader_group();
         let mut layout = shader_data_layout(&dispatch.shader);
         let mut entry_point = dispatch.shader.entry_point();
@@ -1366,7 +1380,7 @@ impl Pipelines {
                 crate::tune::MatmulTile::Scalar(shape),
                 matmul_knobs,
             ),
-            Variant::SplitMatmul(_, shape, splits) => crate::codegen::generate_split_matmul(
+            Variant::SplitMatmul(_, _, shape, splits) => crate::codegen::generate_split_matmul(
                 group,
                 shape,
                 splits,
@@ -1533,10 +1547,7 @@ impl Pipelines {
     fn key(dispatch: &Dispatch) -> Variant {
         let entry = dispatch.shader.clone();
         if let crate::compile::Kernel::SplitMatmul { shape, splits } = dispatch.kernel {
-            return Variant::SplitMatmul(entry, shape, splits);
-        }
-        if let Some(shape) = dispatch.scalar_matmul() {
-            return Variant::ScalarMatmul(entry, dispatch.weight_format, shape);
+            return Variant::SplitMatmul(entry, dispatch.weight_format, shape, splits);
         }
         if let Some(k_tile) = dispatch.conv_k_tile() {
             return Variant::SpecializedConv(entry, dispatch.params.clone(), k_tile);
@@ -1550,6 +1561,9 @@ impl Pipelines {
             } else {
                 Variant::Epilogue(entry, epilogue)
             };
+        }
+        if let Some(shape) = dispatch.scalar_matmul() {
+            return Variant::ScalarMatmul(entry, dispatch.weight_format, shape);
         }
         if dispatch.gemv_int_dot() || dispatch.gemv_rmsnorm.is_some() {
             let shape = dispatch
@@ -4266,6 +4280,37 @@ mod variant_tests {
             epilogue_pipeline_key(&large),
             "32×32 and 64×64 epilogue pipelines must not share a key"
         );
+        let mut keys = std::collections::HashSet::new();
+        for tile_n in [32, 64] {
+            for k_stage in [8, 16, 32] {
+                for interleave_columns in [false, true] {
+                    let shape = crate::codegen::ScalarMatmulShape {
+                        tile_size: 64,
+                        tile_n,
+                        k_stage,
+                        interleave_columns,
+                        unroll_k: true,
+                    };
+                    let dispatch = Dispatch {
+                        kernel: crate::compile::Kernel::ScalarMatmul(shape),
+                        ..large.clone()
+                    };
+                    assert!(matches!(Pipelines::key(&dispatch), Variant::Epilogue(..)));
+                    assert_eq!(epilogue_tile(&dispatch), shape.geometry());
+                    assert!(keys.insert(Pipelines::key(&dispatch)), "{shape:?}");
+                    let split = Dispatch {
+                        kernel: crate::compile::Kernel::SplitMatmul { shape, splits: 4 },
+                        matmul_epilogue: None,
+                        ..dispatch
+                    };
+                    let half = Dispatch {
+                        weight_format: crate::compile::WeightFormat::F16,
+                        ..split.clone()
+                    };
+                    assert_ne!(Pipelines::key(&split), Pipelines::key(&half));
+                }
+            }
+        }
     }
 
     /// An epilogue dispatch resolves to its epilogue pipeline and never
@@ -4384,6 +4429,60 @@ mod variant_tests {
             crate::codegen::MatMulTile::Small,
             "the epilogue shader must be generated for the demoted tile"
         );
+
+        let gpu = std::sync::Arc::new(crate::init_gpu_context().unwrap());
+        let (m, k, n) = (35, 67, 69);
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.21).sin()).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.13).cos()).collect();
+        let expected: Vec<f64> = (0..m * n)
+            .map(|i| {
+                (0..k)
+                    .map(|j| f64::from(a[i / n * k + j]) * f64::from(b[j * n + i % n]))
+                    .sum::<f64>()
+                    .max(0.0)
+            })
+            .collect();
+        for (tile_size, tile_n, k_stage, unroll_k) in
+            [(64, 32, 8, true), (32, 64, 16, false), (16, 64, 32, true)]
+        {
+            let mut graph = crate::Graph::new();
+            let x = graph.input("x", &[m, k]);
+            let w = graph.parameter("w", &[k, n]);
+            let product = graph.matmul(x, w);
+            graph.nodes_mut()[product as usize].matmul_impl = Some(crate::graph::MatmulImpl {
+                shape: crate::codegen::ScalarMatmulShape {
+                    tile_size,
+                    tile_n,
+                    k_stage,
+                    interleave_columns: true,
+                    unroll_k,
+                },
+                splits: 1,
+            });
+            let y = graph.relu(product);
+            graph.set_outputs(vec![y]);
+            let plan = crate::compile::compile(&graph);
+            assert_eq!(plan.dispatches.len(), 1);
+            let mut session = crate::Session::with_context_opts(
+                plan,
+                gpu.clone(),
+                crate::SessionOptions {
+                    coop: crate::CoopPolicy::Disabled,
+                    ..Default::default()
+                },
+            );
+            session.set_input("x", &a);
+            session.set_parameter("w", &b);
+            session.step();
+            session.wait();
+            for (actual, expected) in session.read_output(m * n).into_iter().zip(&expected) {
+                assert!(
+                    actual.is_finite()
+                        && (f64::from(actual) - expected).abs() < 2e-5 + 2e-4 * expected.abs(),
+                    "{actual} != {expected}"
+                );
+            }
+        }
     }
 
     #[test]

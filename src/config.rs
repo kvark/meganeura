@@ -307,7 +307,6 @@ impl TuningKnobs {
                 .unwrap_or(d.flash_grad_kv_ept_cap),
             matmul_k_stage: d.matmul_k_stage,
             matmul_interleave_columns: false,
-            unroll_k: true,
         }
     }
 }
