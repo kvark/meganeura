@@ -130,9 +130,10 @@ impl Default for TuningKnobs {
     /// Pure per-platform defaults. Apple Silicon benefits from the extra
     /// parallelism of smaller EPT; 32 keeps register count below the
     /// spilling cliff on Ampere/Blackwell. `MEGANEURA_FLASH_*_EPT_CAP`
-    /// and `MEGANEURA_MATMUL_*` overrides are applied only by
-    /// [`TuningKnobs::from_env`] (in `crate::config`) — the library
-    /// itself never reads the environment.
+    /// overrides are applied only by [`TuningKnobs::from_env`] (in
+    /// `crate::config`) — the library itself never reads the environment.
+    /// Matmul K stage and column interleave stay at these defaults. Measured
+    /// extraction chooses other schedules; they are not environment switches.
     fn default() -> Self {
         let apple = cfg!(all(target_vendor = "apple", target_arch = "aarch64"));
         let fwd = if apple { 16 } else { 32 };

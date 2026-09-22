@@ -634,11 +634,15 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
   ; Names encode tile_m, tile_n, k stage, and split count so extraction can
   ; forbid one variant without forbidding the others.
   (M6464k32 Op Op)
+  (M6464k16 Op Op)
   (M3232k32 Op Op)
+  (M3232k16 Op Op)
   (M6432k32 Op Op)
   (M6464k8s8 Op Op)
   (MA6464k32 Op Op Op)
+  (MA6464k16 Op Op Op)
   (MA3232k32 Op Op Op)
+  (MA3232k16 Op Op Op)
   (MA6432k32 Op Op Op)
   (MA6464k8s8 Op Op Op)
   (Add Op Op)
@@ -1404,11 +1408,15 @@ fn named_constructor_exists(name: &str) -> bool {
 /// does not run these rules, so a normal build still lowers the logical op.
 pub(crate) const TILE_EQUALITY_RULES: &str = "\
 (rewrite (MatMul ?a ?b) (M6464k32 ?a ?b))
+(rewrite (MatMul ?a ?b) (M6464k16 ?a ?b))
 (rewrite (MatMul ?a ?b) (M3232k32 ?a ?b))
+(rewrite (MatMul ?a ?b) (M3232k16 ?a ?b))
 (rewrite (MatMul ?a ?b) (M6432k32 ?a ?b))
 (rewrite (MatMul ?a ?b) (M6464k8s8 ?a ?b))
 (rewrite (FusedMatMulAdd ?a ?b ?d) (MA6464k32 ?a ?b ?d))
+(rewrite (FusedMatMulAdd ?a ?b ?d) (MA6464k16 ?a ?b ?d))
 (rewrite (FusedMatMulAdd ?a ?b ?d) (MA3232k32 ?a ?b ?d))
+(rewrite (FusedMatMulAdd ?a ?b ?d) (MA3232k16 ?a ?b ?d))
 (rewrite (FusedMatMulAdd ?a ?b ?d) (MA6432k32 ?a ?b ?d))
 (rewrite (FusedMatMulAdd ?a ?b ?d) (MA6464k8s8 ?a ?b ?d))
 ";
@@ -1422,7 +1430,9 @@ pub(crate) fn scheduled_matmul(name: &str) -> Option<crate::graph::MatmulImpl> {
     };
     Some(match name {
         "M6464k32" | "MA6464k32" => spec(64, 64, 32, 1),
+        "M6464k16" | "MA6464k16" => spec(64, 64, 16, 1),
         "M3232k32" | "MA3232k32" => spec(32, 32, 32, 1),
+        "M3232k16" | "MA3232k16" => spec(32, 32, 16, 1),
         "M6432k32" | "MA6432k32" => spec(64, 32, 32, 1),
         "M6464k8s8" | "MA6464k8s8" => spec(64, 64, 8, 8),
         _ => return None,
@@ -1454,11 +1464,15 @@ fn static_constructor(name: &str) -> Result<&'static str, String> {
         "GeGLUPacked" => "GeGLUPacked",
         "GeGLUPackedBT" => "GeGLUPackedBT",
         "M6464k32" => "M6464k32",
+        "M6464k16" => "M6464k16",
         "M3232k32" => "M3232k32",
+        "M3232k16" => "M3232k16",
         "M6432k32" => "M6432k32",
         "M6464k8s8" => "M6464k8s8",
         "MA6464k32" => "MA6464k32",
+        "MA6464k16" => "MA6464k16",
         "MA3232k32" => "MA3232k32",
+        "MA3232k16" => "MA3232k16",
         "MA6432k32" => "MA6432k32",
         "MA6464k8s8" => "MA6464k8s8",
         other => return Err(format!("unknown constructor {}", other)),

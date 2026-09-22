@@ -434,7 +434,7 @@ mod tests {
         let b = graph.parameter("b", &[64, 96]);
         let y = graph.matmul(a, b);
         graph.set_outputs(vec![y]);
-        let space = candidates(&graph, Default::default(), 4).unwrap();
+        let space = candidates(&graph, Default::default(), 8).unwrap();
         let impls: Vec<_> = space
             .candidates
             .iter()
@@ -452,14 +452,21 @@ mod tests {
                 .iter()
                 .any(|spec| spec.tile_n == 32 && spec.splits == 1)
         );
+        assert!(impls.iter().any(|spec| spec.k_stage == 16));
         assert!(impls.iter().any(|spec| spec.splits == 8));
         for candidate in &space.candidates {
+            let scheduled = candidate
+                .graph
+                .nodes()
+                .iter()
+                .any(|node| node.matmul_impl.is_some());
             let plan = crate::compile::compile(&candidate.graph);
-            assert!(
+            assert_eq!(
                 plan.dispatches
                     .iter()
                     .any(|dispatch| dispatch.schedule_locked),
-                "unlocked plan for {}",
+                scheduled,
+                "lock mismatch for {}",
                 candidate.expression
             );
         }
