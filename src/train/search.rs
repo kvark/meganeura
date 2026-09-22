@@ -19,6 +19,9 @@ pub struct BuildSearchOptions {
     pub tuning: TuneOptions,
     /// Whole-program warmup pairs, independent of private kernel warmup.
     pub warmup_runs: u32,
+    /// Minimum paired warmup duration. A fixed step count alone can leave
+    /// short workloads in a different operating state from sustained execution.
+    pub warmup_time: Duration,
     /// Soft total deadline, including construction, initialization and validation.
     /// In-flight driver work and caller validation cannot be preempted.
     pub max_time: Duration,
@@ -35,6 +38,7 @@ impl Default for BuildSearchOptions {
             max_graphs: 16,
             tuning: TuneOptions::default(),
             warmup_runs: 2,
+            warmup_time: Duration::from_millis(250),
             max_time: Duration::from_secs(30),
             max_programs: 64,
             max_plan_bytes: 512 << 20,
@@ -550,6 +554,7 @@ mod tests {
                         ..Default::default()
                     },
                     warmup_runs: 1,
+                    warmup_time: Duration::from_millis(1),
                     max_time: Duration::from_secs(60),
                     max_programs: 24,
                     max_plan_bytes: 4 << 20,

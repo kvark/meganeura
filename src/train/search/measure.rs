@@ -166,12 +166,17 @@ pub(super) fn select(
                 validate(&mut candidate, &state, &mut trial, &mut qualify)?;
                 trial.outcome.qualified = true;
                 if let Some((ref mut baseline, ref baseline_state)) = incumbent {
-                    for _ in 0..options.warmup_runs {
+                    let warmup_start = Instant::now();
+                    let mut warmed = 0;
+                    while warmed < options.warmup_runs
+                        || warmup_start.elapsed() < options.warmup_time
+                    {
                         if start.elapsed() >= options.max_time {
                             break;
                         }
                         run(baseline, baseline_state, &mut trial.state_copy_time)?;
                         run(&mut candidate, &state, &mut trial.state_copy_time)?;
+                        warmed += 1;
                     }
                     let mut failure = None;
                     (trial.outcome.baseline_ms, trial.outcome.candidate_ms) =
@@ -343,6 +348,7 @@ mod tests {
                         ..Default::default()
                     },
                     warmup_runs: 2,
+                    warmup_time: Duration::from_millis(1),
                     max_time: Duration::from_secs(30),
                     max_programs: 2,
                     max_plan_bytes: 1 << 20,
@@ -473,6 +479,7 @@ mod tests {
                         ..Default::default()
                     },
                     warmup_runs: 2,
+                    warmup_time: Duration::from_millis(1),
                     max_time: Duration::from_secs(60),
                     max_programs: 7,
                     max_plan_bytes: 1 << 20,
