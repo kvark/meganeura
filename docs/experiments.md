@@ -16,6 +16,10 @@ separate research artifact; rerunning a revision reproduces the procedure, not
 the original timing noise. Record the environment and failure counts with the
 conclusion. Adopt production changes independently of experiment scaffolding.
 
+For the later NVIDIA/Intel attention, matrix and e-graph investigation, see
+[GPU gap, September 21](gpu-gap-2026-09.md). Reproducers remain on its experiment
+branch; the proposed production changes contain no raw sweep or trace archives.
+
 ## Compiler stages — September 10
 
 Source: `experiment/compiler-stages-2026-09-10` in
