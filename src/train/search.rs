@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone, Serialize)]
 pub struct BuildSearchOptions {
-    /// Bound on logical forms, including ordinary extraction.
+    /// Bound on graph/implementation forms, including ordinary extraction.
     pub max_graphs: usize,
     /// Per-program kernel tuning and paired whole-step decision policy.
     pub tuning: TuneOptions,
@@ -32,7 +32,7 @@ pub struct BuildSearchOptions {
 impl Default for BuildSearchOptions {
     fn default() -> Self {
         Self {
-            max_graphs: 4,
+            max_graphs: 8,
             tuning: TuneOptions::default(),
             warmup_runs: 2,
             max_time: Duration::from_secs(30),
@@ -78,7 +78,7 @@ pub struct BuildSearchReport {
 /// from the original forward graph (one bounded region, repeated where verified).
 /// They are not greedily optimized again. Each training form is differentiated
 /// separately, so parameter transformations and gradients stay consistent.
-/// NN tile and split-K choices are egglog equalities. Lowering emits the
+/// Matrix tile and split-K choices are egglog equalities. Lowering emits the
 /// extracted schedule and locks it. Complete plans still vary dispatch fusion,
 /// cached-attention splits, low-occupancy convolution weight-gradient splits,
 /// and submission chunk counts. Unlocked dispatches are kernel-tuned before

@@ -1187,7 +1187,7 @@ impl Stamper<'_> {
         inputs: Vec<NodeId>,
         target: Option<NodeId>,
     ) -> Result<NodeId, String> {
-        match name {
+        match matrix_family(name).unwrap_or(name) {
             "SwiGLUPacked" | "SwiGLUPackedBT" => {
                 return self.build_glu_packed(
                     &inputs,
@@ -1289,8 +1289,13 @@ impl Stamper<'_> {
         packed_key: &'static str,
     ) -> Result<NodeId, String> {
         let (h, wg, wu) = (inputs[0], inputs[1], inputs[2]);
-        let transposed = packed_key.ends_with("BT");
+        let logical = matrix_family(packed_key).unwrap_or(packed_key);
+        let transposed = logical.ends_with("BT");
         let matmul = if transposed { "MatMulBT" } else { "MatMul" };
+        let scheduled = packed_key.split_once("__").map_or_else(
+            || matmul.to_owned(),
+            |(_, layout)| format!("{matmul}__{layout}"),
+        );
         let unpacked = match concat_op {
             Op::SwiGLUConcat => "SwiGLU",
             Op::GeGLUConcat => "GeGLU",
@@ -1299,10 +1304,11 @@ impl Stamper<'_> {
         let Some(wide_mm) =
             pack_glu_matmul(self.g, h, wg, wu, transposed, self.requires_full_precision)
         else {
-            let gate = self.lookup_or_build(matmul, vec![h, wg])?;
-            let up = self.lookup_or_build(matmul, vec![h, wu])?;
+            let gate = self.lookup_or_build(&scheduled, vec![h, wg])?;
+            let up = self.lookup_or_build(&scheduled, vec![h, wu])?;
             return self.build_named(unpacked, vec![gate, up], target);
         };
+        self.g.nodes_mut()[wide_mm as usize].matmul_impl = scheduled_matmul(packed_key);
         let shape = &self.g.node(wide_mm).ty.shape;
         let (m, out_features) = (shape[0], shape[1] / 2);
         let id = self.place(
@@ -1386,10 +1392,11 @@ const fn matrix_impl(
 // One catalog supplies declarations, equalities, reconstruction and exclusions.
 const MATRIX_IMPLEMENTATIONS: &[(&str, crate::graph::MatmulImpl)] = &[
     // Ordinary construction already probes single-pass scalar tiles. Cover
-    // split/unsplit and shallow/deep staging before smaller layout variations.
+    // split tile widths and K staging before smaller layout variations.
     ("64x64k32s8", matrix_impl(64, 64, 32, 8, true)),
-    ("64x64k32", matrix_impl(64, 64, 32, 1, true)),
+    ("32x32k32s8", matrix_impl(32, 32, 32, 8, true)),
     ("64x64k8s8", matrix_impl(64, 64, 8, 8, true)),
+    ("64x64k32", matrix_impl(64, 64, 32, 1, true)),
     ("32x32k32", matrix_impl(32, 32, 32, 1, true)),
     ("64x32k32", matrix_impl(64, 32, 32, 1, true)),
     ("64x64k16", matrix_impl(64, 64, 16, 1, true)),
@@ -1399,12 +1406,12 @@ const MATRIX_IMPLEMENTATIONS: &[(&str, crate::graph::MatmulImpl)] = &[
     ("64x64k16s8", matrix_impl(64, 64, 16, 8, true)),
 ];
 
-fn matrix_constructors() -> &'static [(String, &'static str, crate::graph::MatmulImpl)] {
-    static NAMES: std::sync::LazyLock<Vec<(String, &'static str, crate::graph::MatmulImpl)>> =
+fn matrix_constructors() -> &'static [(String, &'static str)] {
+    static NAMES: std::sync::LazyLock<Vec<(String, &'static str)>> =
         std::sync::LazyLock::new(|| {
             MATRIX_IMPLEMENTATIONS
                 .iter()
-                .flat_map(|&(layout, spec)| {
+                .flat_map(|&(layout, _)| {
                     [
                         "MatMul",
                         "MatMulAT",
@@ -1412,8 +1419,12 @@ fn matrix_constructors() -> &'static [(String, &'static str, crate::graph::Matmu
                         "FusedMatMulAdd",
                         "FusedMatMulATAdd",
                         "FusedMatMulBTAdd",
+                        "SwiGLUPacked",
+                        "SwiGLUPackedBT",
+                        "GeGLUPacked",
+                        "GeGLUPackedBT",
                     ]
-                    .map(|logical| (format!("{logical}__{layout}"), logical, spec))
+                    .map(|logical| (format!("{logical}__{layout}"), logical))
                 })
                 .collect()
         });
@@ -1436,6 +1447,10 @@ fn matrix_family(name: &str) -> Option<&'static str> {
             "FusedMatMulAdd" => "FusedMatMulAdd",
             "FusedMatMulATAdd" => "FusedMatMulATAdd",
             "FusedMatMulBTAdd" => "FusedMatMulBTAdd",
+            "SwiGLUPacked" => "SwiGLUPacked",
+            "SwiGLUPackedBT" => "SwiGLUPackedBT",
+            "GeGLUPacked" => "GeGLUPacked",
+            "GeGLUPackedBT" => "GeGLUPackedBT",
             _ => return None,
         },
     )
@@ -1444,8 +1459,8 @@ fn matrix_family(name: &str) -> Option<&'static str> {
 fn tile_equality_rules() -> String {
     use std::fmt::Write;
     let mut program = String::new();
-    for (name, logical, _) in matrix_constructors() {
-        let (sorts, args) = if logical.ends_with("Add") {
+    for &(ref name, logical) in matrix_constructors() {
+        let (sorts, args) = if logical.ends_with("Add") || logical.contains("Packed") {
             ("Op Op Op", "?a ?b ?d")
         } else {
             ("Op Op", "?a ?b")
@@ -1462,9 +1477,9 @@ fn tile_equality_rules() -> String {
 /// structural-index key.
 fn static_constructor(name: &str) -> Result<&'static str, String> {
     if name.contains("__")
-        && let Some((found, _, _)) = matrix_constructors().iter().find(|entry| entry.0 == name)
+        && let Some(entry) = matrix_constructors().iter().find(|entry| entry.0 == name)
     {
-        return Ok(found.as_str());
+        return Ok(entry.0.as_str());
     }
     Ok(match name {
         "MatMul" => "MatMul",
