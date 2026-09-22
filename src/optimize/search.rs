@@ -477,7 +477,7 @@ mod tests {
         let b = graph.parameter("b", &[64, 96]);
         let y = graph.matmul(a, b);
         graph.set_outputs(vec![y]);
-        let space = candidates(&graph, Default::default(), 8).unwrap();
+        let space = candidates(&graph, Default::default(), 24).unwrap();
         let impls: Vec<_> = space
             .candidates
             .iter()
@@ -495,8 +495,18 @@ mod tests {
                 .iter()
                 .any(|spec| spec.shape.cols() == 32 && spec.splits == 1)
         );
-        assert!(impls.iter().any(|spec| spec.shape.k_stage == 16));
+        assert!(
+            impls.iter().any(|spec| spec.shape.k_stage == 16),
+            "{impls:?}"
+        );
         assert!(impls.iter().any(|spec| spec.splits == 8));
+        for unroll in [false, true] {
+            assert!(
+                impls
+                    .iter()
+                    .any(|spec| spec.splits == 8 && spec.shape.unroll_k == unroll)
+            );
+        }
         for candidate in &space.candidates {
             let scheduled = candidate
                 .graph
@@ -522,6 +532,12 @@ mod tests {
         );
         for candidate in &space.candidates {
             let mut graph = candidate.graph.deep_clone();
+            let expected = graph
+                .nodes()
+                .iter()
+                .find(|n| matches!(n.op, Op::MatMul))
+                .unwrap()
+                .matmul_impl;
             let loss = graph.mean_all(graph.outputs()[0]);
             graph.set_outputs(vec![loss]);
             let differentiated = crate::autodiff::differentiate(&graph);
@@ -530,7 +546,7 @@ mod tests {
                     .nodes()
                     .iter()
                     .filter(|n| { matches!(n.op, Op::MatMul | Op::MatMulAT | Op::MatMulBT) })
-                    .all(|n| n.matmul_impl.is_some()),
+                    .all(|n| n.matmul_impl == expected),
                 "a scheduled contraction lost its derivative schedule"
             );
         }
