@@ -164,7 +164,41 @@ pub(crate) fn candidates(
     config: super::OptimizeConfig,
     limit: usize,
 ) -> Result<SearchSpace, String> {
-    region_candidates(graph, 0..graph.nodes().len(), config, limit)
+    let cutoff = config.saturation_cutoff.min(super::SATURATION_CUTOFF);
+    if graph.nodes().len() <= cutoff {
+        return region_candidates(graph, 0..graph.nodes().len(), config, limit);
+    }
+    // Parameters and opaque operators need not consume the saturation bound.
+    // Extract the rewritable operators together, including independent
+    // projections that outlining otherwise leaves outside the repeated body.
+    // Do not use sparse regions across mutations: effects need ordered cut edges.
+    let ids: Vec<_> = graph
+        .nodes()
+        .iter()
+        .filter(|node| super::named_constructor(&node.op).is_some())
+        .map(|node| node.id as usize)
+        .collect();
+    if limit == 0
+        || ids.is_empty()
+        || ids.len() > cutoff
+        || graph.nodes().iter().any(|node| {
+            matches!(
+                node.op,
+                Op::CacheWrite | Op::CacheWritePrefix | Op::ScatterAdd { .. }
+            )
+        })
+    {
+        return Err("rewritable operators exceed a bounded pure region".into());
+    }
+    segment_candidates(
+        graph,
+        Segment {
+            ids,
+            shifts: vec![0],
+        },
+        config,
+        limit,
+    )
 }
 
 /// Explore a contiguous region without changing the surrounding graph. Its
@@ -626,19 +660,15 @@ mod tests {
             ] {
                 for sample in 0..6 {
                     let start = std::time::Instant::now();
-                    let space = super::repeated_candidates(
-                        &graph,
-                        region,
-                        crate::OptimizeConfig {
-                            extraction_cost,
-                            ..Default::default()
-                        },
-                        4,
-                    )
-                    .unwrap();
+                    let config = crate::OptimizeConfig {
+                        extraction_cost,
+                        ..Default::default()
+                    };
+                    let space = super::candidates(&graph, config, 4)
+                        .or_else(|_| super::repeated_candidates(&graph, region, config, 4))
+                        .unwrap();
                     println!(
-                        "{model} cost={extraction_cost:?} sample={sample} region_nodes={} candidates={} truncated={} ms={:.3}",
-                        region.period,
+                        "{model} cost={extraction_cost:?} sample={sample} candidates={} truncated={} ms={:.3}",
                         space.candidates.len(),
                         space.truncated,
                         start.elapsed().as_secs_f64() * 1000.0
@@ -806,6 +836,32 @@ mod tests {
                 .count()
                 == region.count
         }));
+        let context = graph.input("context", &[16, 8]);
+        let weight = graph.parameter("context_weight", &[8, 8]);
+        let projection = graph.matmul(context, weight);
+        graph.set_outputs(vec![h, projection]);
+        let sparse = candidates(
+            &graph,
+            crate::OptimizeConfig {
+                saturation_cutoff: 32,
+                ..Default::default()
+            },
+            4,
+        )
+        .unwrap();
+        let scheduled = &sparse.candidates[0].graph;
+        let independent = scheduled.outputs()[1];
+        assert!(
+            scheduled.node(independent).matmul_impl.is_some(),
+            "independent projections must not be opaque merely because the model is large"
+        );
+        assert!(
+            scheduled
+                .nodes()
+                .iter()
+                .filter(|node| matches!(node.op, Op::MatMul | Op::FusedMatMulAdd))
+                .all(|node| node.matmul_impl.is_some())
+        );
         graph.nodes_mut()[region.start + region.period + 2].requires_full_precision = true;
         assert!(super::repeated_candidates(&graph, region, Default::default(), 8).is_err());
     }

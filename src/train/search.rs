@@ -128,13 +128,15 @@ pub fn build_measured(
     {
         let source = forward_graph.toposort();
         let limit = options.max_graphs - 1;
-        let spaces = if source.nodes().len()
-            <= cfg
-                .optimize
-                .saturation_cutoff
-                .min(optimize::SATURATION_CUTOFF)
+        let space = optimize::search::candidates(&source, cfg.optimize, limit);
+        let spaces = if space.is_ok()
+            || source.nodes().len()
+                <= cfg
+                    .optimize
+                    .saturation_cutoff
+                    .min(optimize::SATURATION_CUTOFF)
         {
-            vec![optimize::search::candidates(&source, cfg.optimize, limit)]
+            vec![space]
         } else {
             // Reuse outlining, not model names or a second pattern matcher.
             let regions = crate::outline::detect_repeated_regions(&source);
