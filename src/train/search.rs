@@ -32,7 +32,7 @@ pub struct BuildSearchOptions {
 impl Default for BuildSearchOptions {
     fn default() -> Self {
         Self {
-            max_graphs: 8,
+            max_graphs: 16,
             tuning: TuneOptions::default(),
             warmup_runs: 2,
             max_time: Duration::from_secs(30),
