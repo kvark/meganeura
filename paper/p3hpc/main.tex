@@ -77,16 +77,16 @@ execution queue with a tensor runtime. This is especially useful in games
 and interactive applications: ML need not introduce a second GPU stack.
 We measure what this choice gains in hardware coverage and costs in speed.
 
-We study \system{}, a compact native compiler and runtime that lowers a
-typed tensor graph and its differentiated training graph to specialized
-compute kernels. Blade supplies the Vulkan/Metal abstraction
-\cite{malyshau2026barriers}. Model construction, graph transformations,
-automatic differentiation, checkpoint semantics, and the runtime interface
-remain common across devices; deployed applications require neither Python
-nor a vendor ML runtime. Training and inference use the same compiler.
-Compilation can measure alternatives before choosing a graph and its
-kernels. This search is optional in the library and enabled in every
-benchmark run.
+\system{} is a small native compiler and runtime. It lowers a typed tensor
+graph, and the training graph that automatic differentiation builds from
+it, to specialized compute kernels. Blade is the Vulkan and Metal layer
+\cite{malyshau2026barriers}. Construction, differentiation, checkpoints,
+and the runtime interface are shared across devices, so a deployed
+application does not need Python or a vendor machine-learning runtime.
+Training and inference use the same compiler. Compilation can time
+alternative graphs and kernels before it commits to a plan. That search
+is off unless the caller requests it, and every benchmark in this paper
+requests it.
 
 The evaluation compares \system{} with PyTorch
 \cite{paszke2019pytorch} at one source commit across CUDA, ROCm, XPU, MPS,
@@ -1141,6 +1141,22 @@ weights and compilation work, prioritize expensive kernels, and make choices
 that survive longer timing windows. B570 also needs support for rectangular
 cooperative tiles. More search alone is not the answer.
 
+A development check after this cohort was frozen, on an RTX~5070 and not
+part of Table~\ref{tab:performance}, compares two ways of choosing a
+single f32 product. Extracting one graph and then running the kernel
+tuner keeps a 32-wide tile and takes 31.3 and 25.2\,$\mu$s on
+$50\times960\times720$ and $50\times720\times960$. Letting the e-graph
+treat tile, K stage, and split-K as the same tensor, then timing the
+whole step, selects eight-way split-K and takes 19.1\,$\mu$s on both.
+The wide $50\times4096\times720$ product stays at 50\,$\mu$s either
+way. The preceding compiler, which enumerated split-K directly instead
+of as an equality, already reached 19--21\,$\mu$s on the shorter
+products and 45.3\,$\mu$s on the wide one. The gain over one-graph
+tuning is the split-K kernel. Moving that choice into egglog did not
+improve on the explicit list. The next cohort should not assume that a
+larger e-graph is faster; it should check whether the schedule that won
+is actually installed.
+
 Beyond GPU optimization, neural accelerators would need a backend for their
 operator, layout, and precision constraints. Unsupported operations could
 stay on the GPU, but the placement decision must include transfers,
@@ -1159,24 +1175,26 @@ measured capability of the present system.
 
 \section{Conclusion}
 
-Graphics APIs provide a useful ML deployment path. Meganeura executes
-inference and backward workloads on consumer GPUs and H100, including
-Windows, and qualifies two integrated GPUs without a usable PyTorch GPU
-path. The current collection retains 205 valid GPU pairs and reports
-the 780M failure alongside its completed conditions.
+Graphics APIs are a practical way to deploy these models. \system{} runs
+inference and backward passes on consumer GPUs and on H100, including
+under Windows, and it qualifies two integrated GPUs that have no usable
+PyTorch GPU path in this study. The collection kept 205 valid GPU pairs
+and reports the 780M failure beside the runs that finished.
 
-PyTorch still leads most timing comparisons. Across seven fully replicated
-strict configurations, median inference and training times are $1.85\times$
-and $2.15\times$ PyTorch's. Broader graph and kernel search improves several
-workloads, but also exposes regressions and substantial preparation cost.
-The earlier 1.7B study extends the evidence to larger models; it does not
-establish the new optimizer's scaling.
+PyTorch is still ahead in most of the timing table. On the seven strict
+configurations with a full set of replicates, median inference and
+training are $1.85\times$ and $2.15\times$ PyTorch. Searching more graphs
+and kernels helps some workloads. It also causes regressions, and the
+preparation cost is large. The earlier 1.7B study shows that larger
+models run; it used a different optimizer and does not measure this
+search at that size.
 
-Combining graph compilation and measured choice in one small runtime is
-promising. The next step is to make those choices cheaper and more reliable,
-while closing concrete kernel and driver gaps. Hardware availability belongs
-in that assessment just as much as speed: Vulkan reaches devices that the
-tested PyTorch stack does not, while MI300X shows where our own path stops.
+Keeping graph compilation and measured choice in one small runtime is
+still worth doing. The next step is to make the winning schedule the one
+that actually gets installed, at a cost we can afford, and to close
+specific kernel and driver gaps. Coverage belongs in that picture with
+speed. Vulkan reaches devices this PyTorch stack does not, and MI300X is
+where our own Vulkan path currently stops.
 
 \section*{Acknowledgments}
 

@@ -1164,6 +1164,65 @@ Glenside~\cite{yang2021tensat,smith2021glenside}, the useful question is which
 implementation choices the representation makes available, not whether the
 compiler uses an e-graph by itself.
 
+\subsection{Tile equalities against one-graph tuning}
+
+The runs above changed the rewrite engine and then compared node counts
+and end-to-end time. They did not give the e-graph a tile or a split to
+choose. A later check asks that question directly. One policy extracts a
+single graph by estimated tensor traffic and then runs the private kernel
+tuner. The other keeps matmul tile, K-stage, and split-K variants as
+equal expressions and times the whole step, locking the schedule that
+extraction produced so the tuner cannot replace it.
+
+Both policies ran in one process on an RTX~5070 on 22~September 2026,
+strict f32, cooperative matrices disabled, clocks unlocked. Each built
+the same four products, checked them against a CPU reference to
+$10^{-3}$ absolute error, and took the median of eight profiled GPU
+samples after a short burst. This is one run per policy, not a
+multi-process cohort, and it is not part of the frozen tables.
+The compiler is development revision \code{81b46bc} plus the K-stage
+equalities measured here, on branch
+\code{perf/nvidia-inference-2026-09-22}.
+
+\begin{table}[t]
+\caption{Profiled GPU time for one f32 product. One-graph tuning extracts
+once, then searches square tiles and K stages. Measured equalities may
+also select split-K.}
+\label{tab:tile-study}
+\centering
+\small
+\begin{tabular}{lrr}
+\toprule
+Product & One graph + tuner & Measured equalities \\
+\midrule
+$50\times4096\times720$ & 50.2\,$\mu$s & 50.1\,$\mu$s \\
+$50\times960\times720$ & 31.3\,$\mu$s & 19.1\,$\mu$s \\
+$50\times720\times960$ & 25.2\,$\mu$s & 19.1\,$\mu$s \\
+$50\times960\times720$ + add & 31.7\,$\mu$s & 19.0\,$\mu$s \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+On the three shorter products the measured policy is 1.3--1.7$\times$
+faster (Table~\ref{tab:tile-study}). It selects split-K with eight
+partials, a $64\times64$ tile, and K stage 8, including when the add is
+fused into the product. The wide product ties: both policies keep the
+unrolled $64\times64$ kernel. Split-K was extracted and lost the noise
+gate.
+
+The same products on the preceding main revision \code{da30316} already
+show the same kind of gap, without tile equalities and without the
+unrolled K loop. One-graph tuning took 57.8, 31.7, 25.2, and
+31.8\,$\mu$s. That revision's explicit split-K list selected eight-way
+split-K and took 45.3, 19.5, 19.0, and 21.2\,$\mu$s. The speedup over
+one-graph tuning is the split-K schedule. Representing that schedule as
+an egglog equality did not beat the explicit list, and on the wide
+product the noise gate dropped a schedule the list had kept.
+
+The result argues for searching split-K. It does not, by itself, argue
+for egglog. An enumerated list of the same kernels produced the win, and
+the wide GEMM shows the equality search can miss it.
+
 \subsection{Cooperative matrices and epilogues}
 
 Two lessons about cooperative-matrix promotion came at measured cost. The
