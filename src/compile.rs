@@ -7276,7 +7276,7 @@ mod tests {
         assert!(experimental_entries.contains(&ShaderEntry::FlashGradQCoop));
         assert!(experimental_entries.contains(&ShaderEntry::FlashGradKVCoop));
 
-        g.nodes_mut()[attention].requires_full_precision = true;
+        g.nodes_mut()[attention as usize].requires_full_precision = true;
         let full = compile_with_caps_policy(&g, &CompileOptions::default(), f16_only, false);
         assert!(
             full.dispatches
