@@ -147,6 +147,10 @@ driver permissions; do not change system policy inside the experiment.
 same physical CPU for both arms and run it separately from GPU work.
 `egglog_template.rs` compares rebuilding and cloning initialized rule databases;
 `optimizer_idempotence.rs` checks repeated fused-matmul extraction.
+`egglog_parallel.rs` reproduces egglog 2.0's shared table-notification state
+between concurrent clones. The default run fails; `--independent` initializes
+one template per worker and passes 800 searches. Production caches are per
+thread for this reason, not one process-wide rule database.
 `qualification_cost.rs` is an unshipped CPU reduction experiment that preserves
 finite checks and maximum errors; it does not change the harness contract.
 

@@ -698,19 +698,25 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
 }
 
 fn rule_graph(pack_swiglu: bool) -> egglog::EGraph {
-    static RULES: [std::sync::OnceLock<egglog::EGraph>; 2] =
-        [const { std::sync::OnceLock::new() }; 2];
-    RULES[usize::from(pack_swiglu)]
-        .get_or_init(|| {
-            let mut program = String::new();
-            egglog_prelude(&mut program, pack_swiglu);
-            let mut egraph = egglog::EGraph::default();
-            egraph
-                .parse_and_run_program(None, &program)
-                .expect("valid built-in rewrite rules");
-            egraph
-        })
-        .clone()
+    // Egglog clones share a mutable table-notification list. Searches on
+    // different threads must not clone the same initialized database.
+    thread_local! {
+        static RULES: [std::cell::OnceCell<egglog::EGraph>; 2] =
+            const { [const { std::cell::OnceCell::new() }; 2] };
+    }
+    RULES.with(|rules| {
+        rules[usize::from(pack_swiglu)]
+            .get_or_init(|| {
+                let mut program = String::new();
+                egglog_prelude(&mut program, pack_swiglu);
+                let mut egraph = egglog::EGraph::default();
+                egraph
+                    .parse_and_run_program(None, &program)
+                    .expect("valid built-in rewrite rules");
+                egraph
+            })
+            .clone()
+    })
 }
 
 /// Returns the named egglog constructor for ops that rewrite rules
