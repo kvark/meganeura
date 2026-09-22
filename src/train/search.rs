@@ -265,8 +265,8 @@ fn early_physical_cover(
     cover
 }
 
-/// Baseline on every logical form, then the early physical cover on the ordinary
-/// graph, then that cover on the other forms, then the remaining schedules.
+/// Diagonal coverage of graph rank × physical rank. Neither a larger graph
+/// frontier nor more physical variants should starve the other under a budget.
 fn physical_program_order(
     n_seeds: usize,
     baseline: AxisChoice,
@@ -274,20 +274,16 @@ fn physical_program_order(
     tail: &[AxisChoice],
 ) -> Vec<(usize, AxisChoice)> {
     let mut order = Vec::new();
-    for seed in 0..n_seeds {
-        order.push((seed, baseline));
-    }
-    for &choice in cover {
-        order.push((0, choice));
-    }
-    for &choice in cover {
-        for seed in 1..n_seeds {
-            order.push((seed, choice));
-        }
-    }
-    for &choice in tail {
-        for seed in 0..n_seeds {
-            order.push((seed, choice));
+    let choices: Vec<_> = std::iter::once(baseline)
+        .chain(cover.iter().copied())
+        .chain(tail.iter().copied())
+        .collect();
+    for rank in 0..n_seeds + choices.len() - 1 {
+        for (physical, &choice) in choices.iter().take(rank + 1).enumerate() {
+            let seed = rank - physical;
+            if seed < n_seeds {
+                order.push((seed, choice));
+            }
         }
     }
     order
@@ -341,8 +337,7 @@ fn implementations(
     }
     let chunks = [1, 2, 4, 8, 16, 32, 64];
     let baseline = ((0, None), 1usize);
-    // The first alternative on each axis, then those axes crossed, on the
-    // ordinary graph before other seeds repeat them.
+    // Rank the first alternative on each axis and their interaction early.
     let cover = early_physical_cover(&chunks, &attention);
     let axis_len = attention.len().max(chunks.len());
     let single_axis = (0..axis_len).flat_map(|i| {
@@ -502,20 +497,21 @@ mod tests {
             .iter()
             .position(|&(seed, choice)| seed == 0 && choice == ((0, None), 2))
             .expect("two submission chunks on the ordinary graph");
-        assert!(chunk < 16, "chunk plan landed at program {chunk}");
-        assert_eq!(
-            order[..8]
-                .iter()
-                .map(|&(seed, choice)| (seed, choice == baseline))
-                .collect::<Vec<_>>(),
-            (0..8).map(|seed| (seed, true)).collect::<Vec<_>>()
-        );
-        let cover_end = 8 + cover.len();
-        assert!(
-            order[8..cover_end].iter().all(|&(seed, _)| seed == 0),
-            "other graphs wait until the ordinary graph has seen the cover"
-        );
-        assert_eq!(order[cover_end].0, 1);
+        assert!(chunk <= 2, "chunk plan landed at program {chunk}");
+        assert!(order[..6].contains(&(2, baseline)));
+        assert!(order[..6].contains(&(1, ((0, None), 2))));
+        assert!(order[..6].contains(&(0, ((0, None), 4))));
+        for seed in 0..8 {
+            for choice in [baseline, ((0, None), 2), ((0, None), 4)] {
+                assert_eq!(
+                    order
+                        .iter()
+                        .filter(|&&entry| entry == (seed, choice))
+                        .count(),
+                    1
+                );
+            }
+        }
     }
 
     #[test]
