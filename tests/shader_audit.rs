@@ -836,3 +836,38 @@ fn max_pool_gradient_routes_to_argmax() {
         }
     }
 }
+
+/// BCE's backward divided by p(1 - p), which is exactly zero once a
+/// sigmoid saturates in f32, while the forward clamps p and stays finite.
+/// The denominator is floored the way PyTorch floors it.
+#[test]
+fn bce_gradient_is_finite_for_saturated_predictions() {
+    let mut graph = Graph::new();
+    let x = graph.parameter("x", &[4]);
+    let p = graph.sigmoid(x);
+    let t = graph.input("t", &[4]);
+    let loss = graph.bce_loss(p, t);
+    graph.set_outputs(vec![loss]);
+    let mut session = meganeura::build(&graph, meganeura::SessionConfig::from_env()).0;
+    let xs = [30.0f32, -30.0, 0.3, -1.2];
+    let ts = [0.0f32, 1.0, 1.0, 0.0];
+    session.set_parameter("x", &xs);
+    session.set_input("t", &ts);
+    session.set_learning_rate(0.0);
+    session.step();
+    session.wait();
+    assert!(session.read_loss().is_finite());
+    let mut grad = [0.0f32; 4];
+    session.read_param_grad("x", &mut grad);
+    assert!(grad.iter().all(|g| g.is_finite()), "gradient {grad:?}");
+    // Unsaturated entries keep the exact sigmoid-BCE gradient (p - t) / N.
+    for i in 2..4 {
+        let p = 1.0 / (1.0 + (-xs[i]).exp());
+        let want = (p - ts[i]) / 4.0;
+        assert!(
+            (grad[i] - want).abs() < 1e-5,
+            "grad[{i}] = {}, want {want}",
+            grad[i]
+        );
+    }
+}
