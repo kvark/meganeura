@@ -465,12 +465,11 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // manifested at batch>1; my softmax_mid_chain test missed
                 // it because mean(softmax) is the constant 1/K (gradient
                 // identically zero). SumInner reduces axis 1 (the right
-                // one); matmul with ones[1, features] broadcasts the
-                // [batch, 1] sums back to [batch, features].
+                // one); BroadcastInner repeats the [batch, 1] sums back
+                // across [batch, features].
                 let grad_s_mul_s = graph.mul(grad_output, s);
                 let row_sum_b1 = graph.sum_inner(grad_s_mul_s);
-                let ones_1f = graph.constant(vec![1.0; features], &[1, features]);
-                let row_sum_broadcast = graph.matmul(row_sum_b1, ones_1f);
+                let row_sum_broadcast = graph.broadcast_inner(row_sum_b1, features);
                 let correction = graph.mul(s, row_sum_broadcast);
                 let neg_correction = graph.neg(correction);
                 let grad_x = graph.add(grad_s_mul_s, neg_correction);
@@ -485,8 +484,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
 
                 let s = graph.softmax(x);
                 let sum_b1 = graph.sum_inner(grad_output);
-                let ones_1f = graph.constant(vec![1.0; features], &[1, features]);
-                let sum_broadcast = graph.matmul(sum_b1, ones_1f);
+                let sum_broadcast = graph.broadcast_inner(sum_b1, features);
                 let correction = graph.mul(s, sum_broadcast);
                 let neg_correction = graph.neg(correction);
                 let grad_x = graph.add(grad_output, neg_correction);
