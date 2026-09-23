@@ -392,12 +392,8 @@ pub enum ShaderEntry {
     WinogradOutputTransform,
     WinogradBatchedMatMul,
     WinogradWeightTransform,
-    /// Zero a 1-element scalar accumulator buffer (gradient-clip pre-pass).
-    GradClipZero,
-    /// Sum-of-squares of a gradient buffer, added to a shared 1-element
-    /// scalar buffer. One workgroup of 256 threads per dispatch tree-reduces
-    /// in shared memory; the runtime barriers parameter dispatches. Pair with
-    /// `GradClipZero` (pre-pass) and `GradClipScale` (post-pass).
+    /// Squared-gradient partial sums, one slot per workgroup, then a
+    /// single-workgroup total of those partials. Pair with `GradClipScale`.
     GradClipNormSq,
     /// In-place scale a gradient buffer by `min(1, max_norm / norm)`,
     /// where `norm = sqrt(acc[0])` from the accumulator
@@ -499,7 +495,6 @@ impl ShaderEntry {
 
             ShaderEntry::SgdUpdate
             | ShaderEntry::AdamUpdate
-            | ShaderEntry::GradClipZero
             | ShaderEntry::GradClipNormSq
             | ShaderEntry::GradClipScale
             | ShaderEntry::AdaptiveGradClip
@@ -683,7 +678,6 @@ impl ShaderEntry {
             ShaderEntry::WinogradOutputTransform => ShaderGroup::WinogradOutputTransform,
             ShaderEntry::WinogradBatchedMatMul => ShaderGroup::WinogradBatchedMatMul,
             ShaderEntry::WinogradWeightTransform => ShaderGroup::WinogradWeightTransform,
-            ShaderEntry::GradClipZero => ShaderGroup::GradClipZero,
             ShaderEntry::GradClipNormSq => ShaderGroup::GradClipNormSq,
             ShaderEntry::GradClipScale => ShaderGroup::GradClipScale,
             ShaderEntry::AdaptiveGradClip => ShaderGroup::AdaptiveGradClip,
@@ -807,8 +801,7 @@ impl ShaderEntry {
             | ShaderEntry::WinogradOutputTransform
             | ShaderEntry::WinogradBatchedMatMul
             | ShaderEntry::WinogradWeightTransform => "main",
-            ShaderEntry::GradClipZero
-            | ShaderEntry::GradClipNormSq
+            ShaderEntry::GradClipNormSq
             | ShaderEntry::GradClipScale
             | ShaderEntry::AdaptiveGradClip
             | ShaderEntry::GradAccum => "main",

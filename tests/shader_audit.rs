@@ -361,3 +361,63 @@ fn global_avg_pool_matches_reference() {
         }
     }
 }
+
+/// Global clipping measures the norm with many workgroups per gradient. With
+/// SGD the step is exactly `-lr * g * min(1, max_norm / ||g||)`, so the
+/// update reveals the norm the GPU computed across every workgroup.
+#[test]
+fn global_grad_clip_measures_large_gradients() {
+    let sizes = [300_001usize, 5, 70_000];
+    let mut graph = Graph::new();
+    let mut terms = Vec::new();
+    for (i, &n) in sizes.iter().enumerate() {
+        let p = graph.parameter(&format!("p{i}"), &[n]);
+        let t = graph.input(&format!("t{i}"), &[n]);
+        let product = graph.mul(p, t);
+        terms.push(graph.sum_all(product));
+    }
+    let loss = terms
+        .into_iter()
+        .reduce(|a, b| graph.add(a, b))
+        .expect("at least one term");
+    graph.set_outputs(vec![loss]);
+
+    // d(loss)/d(p_i) = t_i exactly.
+    let targets: Vec<Vec<f32>> = sizes
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| values(n, 0.37 + i as f32 * 0.1, 0.3))
+        .collect();
+    let norm = targets
+        .iter()
+        .flatten()
+        .map(|&v| (v as f64).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let max_norm = (norm * 0.25) as f32;
+    let lr = 0.5f32;
+
+    let mut session = meganeura::build(&graph, meganeura::SessionConfig::from_env()).0;
+    for (i, &n) in sizes.iter().enumerate() {
+        session.set_parameter(&format!("p{i}"), &vec![0.0; n]);
+        session.set_input(&format!("t{i}"), &targets[i]);
+    }
+    session.set_grad_clip_norm(max_norm);
+    session.set_learning_rate(lr);
+    session.step();
+    session.wait();
+
+    let scale = max_norm as f64 / norm;
+    for (i, &n) in sizes.iter().enumerate() {
+        let mut after = vec![0.0; n];
+        session.read_param(&format!("p{i}"), &mut after);
+        for j in [0, n / 2, n - 1] {
+            let want = -(lr as f64) * targets[i][j] as f64 * scale;
+            assert!(
+                (after[j] as f64 - want).abs() <= 1e-4 * want.abs().max(1e-3),
+                "p{i}[{j}]: got {}, want {want}",
+                after[j]
+            );
+        }
+    }
+}
