@@ -5359,27 +5359,26 @@ pub fn generate_flash_grad_kv_module(head_dim: u32, ept_cap: u32) -> ShaderModul
     src.push_str("var<storage> src_b: array<f32>;\n"); // K
     src.push_str("var<storage> bias: array<f32>;\n"); // V
     src.push_str("var<storage> lse: array<f32>;\n");
-    src.push_str("var<storage> fwd_dst: array<f32>;\n"); // O
+    // D[pos, head] = dot(dO, O), reduced once before this dispatch.
+    src.push_str("var<storage> fwd_dst: array<f32>;\n");
     src.push_str("var<storage, read_write> dst: array<f32>;\n"); // dK
     src.push_str("var<storage, read_write> dst2: array<f32>;\n"); // dV
     src.push_str("var<uniform> params: Params;\n\n");
 
-    // Shared Q/dO/O staging: only needed when TPQ > 1 (multiple threads
+    // Shared Q/dO staging: only needed when TPQ > 1 (multiple threads
     // per KV position need coordinated access). When TPQ == 1, each thread
-    // loads Q/dO/O directly from global memory — all threads read the same
+    // loads Q/dO directly from global memory — all threads read the same
     // addresses, hitting L2 cache, and no barriers are needed.
     if tpq > 1 {
         let _ = writeln!(src, "var<workgroup> shared_q: array<f32, {hd}>;");
-        let _ = writeln!(src, "var<workgroup> shared_do: array<f32, {hd}>;");
-        let _ = writeln!(src, "var<workgroup> shared_o: array<f32, {hd}>;\n");
+        let _ = writeln!(src, "var<workgroup> shared_do: array<f32, {hd}>;\n");
     }
 
     // Shared memory only needed when TPQ > 1 (cross-lane reductions)
     if tpq > 1 {
         let _ = writeln!(src, "var<workgroup> wg_score: array<f32, {}>;", bkv * tpq);
-        let _ = writeln!(src, "var<workgroup> wg_rs: array<f32, {}>;", bkv * tpq);
         let _ = writeln!(src, "var<workgroup> wg_dp: array<f32, {}>;\n", bkv * tpq);
-        src.push_str("fn reduce_triple(tid: u32) {\n");
+        src.push_str("fn reduce_pair(tid: u32) {\n");
         let _ = writeln!(src, "    let local = tid % {tpq}u;");
         let _ = writeln!(src, "    let base = (tid / {tpq}u) * {tpq}u;");
         let mut stride = tpq / 2;
@@ -5387,7 +5386,7 @@ pub fn generate_flash_grad_kv_module(head_dim: u32, ept_cap: u32) -> ShaderModul
             src.push_str("    workgroupBarrier();\n");
             let _ = writeln!(
                 src,
-                "    if local < {stride}u {{ wg_score[base + local] += wg_score[base + local + {stride}u]; wg_rs[base + local] += wg_rs[base + local + {stride}u]; wg_dp[base + local] += wg_dp[base + local + {stride}u]; }}"
+                "    if local < {stride}u {{ wg_score[base + local] += wg_score[base + local + {stride}u]; wg_dp[base + local] += wg_dp[base + local + {stride}u]; }}"
             );
             stride /= 2;
         }
@@ -5456,13 +5455,12 @@ pub fn generate_flash_grad_kv_module(head_dim: u32, ept_cap: u32) -> ShaderModul
     src.push_str("            let q_base = pos * q_dim + head * head_dim;\n\n");
 
     if tpq == 1 {
-        // TPQ=1: each thread handles the full head_dim. Load Q/dO/O directly
+        // TPQ=1: each thread handles the full head_dim. Load Q/dO directly
         // from global memory — all threads read the same addresses, hitting L2.
         // This eliminates ALL barriers in the inner loop.
         for e in 0..ept {
             let _ = writeln!(src, "            let q{e} = src_a[q_base + {e}u];");
             let _ = writeln!(src, "            let do{e} = d_out[q_base + {e}u];");
-            let _ = writeln!(src, "            let o{e} = fwd_dst[q_base + {e}u];");
         }
     } else {
         // TPQ>1: cooperative staging into shared memory (needs barriers).
@@ -5472,41 +5470,35 @@ pub fn generate_flash_grad_kv_module(head_dim: u32, ept_cap: u32) -> ShaderModul
         );
         src.push_str("                shared_q[d] = src_a[q_base + d];\n");
         src.push_str("                shared_do[d] = d_out[q_base + d];\n");
-        src.push_str("                shared_o[d] = fwd_dst[q_base + d];\n");
         src.push_str("            }\n");
         src.push_str("            workgroupBarrier();\n\n");
 
         for e in 0..ept {
             let _ = writeln!(src, "            let q{e} = shared_q[d_base + {e}u];");
             let _ = writeln!(src, "            let do{e} = shared_do[d_base + {e}u];");
-            let _ = writeln!(src, "            let o{e} = shared_o[d_base + {e}u];");
         }
     }
     src.push_str("            var score_part = 0.0;\n");
-    src.push_str("            var rs_part = 0.0;\n");
     src.push_str("            var dp_part = 0.0;\n");
     for e in 0..ept {
         let _ = writeln!(src, "            score_part += q{e} * k{e};");
-        let _ = writeln!(src, "            rs_part += do{e} * o{e};");
         let _ = writeln!(src, "            dp_part += do{e} * v{e};");
     }
+    src.push_str("            let row_sum = fwd_dst[pos * num_heads + head];\n");
     if tpq > 1 {
         let _ = writeln!(
             src,
             "            wg_score[ki * {tpq}u + lane] = score_part;"
         );
-        let _ = writeln!(src, "            wg_rs[ki * {tpq}u + lane] = rs_part;");
         let _ = writeln!(src, "            wg_dp[ki * {tpq}u + lane] = dp_part;");
-        src.push_str("            reduce_triple(lid.x);\n");
+        src.push_str("            reduce_pair(lid.x);\n");
         let _ = writeln!(
             src,
             "            let score = wg_score[ki * {tpq}u] * scale;"
         );
-        let _ = writeln!(src, "            let row_sum = wg_rs[ki * {tpq}u];");
         let _ = writeln!(src, "            let dp_t = wg_dp[ki * {tpq}u];\n");
     } else {
         src.push_str("            let score = score_part * scale;\n");
-        src.push_str("            let row_sum = rs_part;\n");
         src.push_str("            let dp_t = dp_part;\n");
     }
     src.push_str("            if valid && pos >= start_pos && pos < end_pos {\n");

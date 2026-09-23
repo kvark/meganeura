@@ -3219,6 +3219,48 @@ impl<'a> Compiler<'a> {
         });
     }
 
+    /// D[row] = dot(d_out[row], o[row]) over `head_dim`-wide rows, for the
+    /// attention dK/dV kernels.
+    fn emit_attention_row_dot(
+        &mut self,
+        d_out: BufferRef,
+        o: BufferRef,
+        rows: u32,
+        head_dim: u32,
+    ) -> BufferRef {
+        use crate::schedule::ReduceOp;
+
+        const WORKGROUP_SIZE: u32 = 256;
+        let lanes = head_dim.next_power_of_two().clamp(2, WORKGROUP_SIZE);
+        let row_dot = self.alloc_buffer(rows as usize * 4);
+        self.plan.dispatches.push(Dispatch {
+            shader: ShaderEntry::Relu, // sentinel; routing is via `reduction`
+            workgroups: [rows.div_ceil(WORKGROUP_SIZE / lanes), 1, 1],
+            input_buffers: vec![d_out, o],
+            output_buffer: row_dot,
+            extra_outputs: vec![],
+            params: vec![rows, head_dim, 1.0_f32.to_bits(), 0],
+            kernel: Kernel::Reduction(ReductionKernel {
+                op: ReduceOp::Sum,
+                prologue: PointwiseDAG {
+                    n_inputs: 2,
+                    ops: vec![Pw::LoadInput(0), Pw::LoadInput(1), Pw::Mul(0, 1)],
+                    output: 2,
+                },
+                extra_prologues: vec![],
+                epilogue: None,
+                n_per_elem: 2,
+                n_per_row: 0,
+                workgroup_size: WORKGROUP_SIZE,
+                rows_per_workgroup: WORKGROUP_SIZE / lanes,
+                gather_elem: Vec::new(),
+                input_row_repeats: Vec::new(),
+            }),
+            ..Default::default()
+        });
+        row_dot
+    }
+
     fn emit_broadcast_inner(&mut self, input: BufferRef, output: BufferRef, rows: u32, inner: u32) {
         let total = rows
             .checked_mul(inner)
@@ -5976,18 +6018,25 @@ impl<'a> Compiler<'a> {
                     };
                     (s, grad_kv_wgs)
                 };
-                {
-                    self.plan.dispatches.push(Dispatch {
-                        shader,
-                        workgroups,
-                        input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![dv_buf],
-                        params: attention_params,
+                // The scalar and flash dK/dV kernels need dot(dO, O) for
+                // every query row. Reduce it once here; recomputing it in
+                // every KV workgroup read O and spent a third of the inner
+                // loop's products on it. The cooperative kernel keeps O.
+                let row_source = if shader == ShaderEntry::FlashGradKVCoop {
+                    fwd_o
+                } else {
+                    self.emit_attention_row_dot(d_out, fwd_o, q_seq * num_heads, head_dim)
+                };
+                self.plan.dispatches.push(Dispatch {
+                    shader,
+                    workgroups,
+                    input_buffers: vec![d_out, q, k, v, lse_buf, row_source],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![dv_buf],
+                    params: attention_params,
 
-                        ..Default::default()
-                    });
-                }
+                    ..Default::default()
+                });
             }
 
             Op::MultiHeadAttnGradV { fwd_node, .. } => {

@@ -620,3 +620,74 @@ fn adaptive_grad_clip_measures_large_parameters() {
         }
     }
 }
+
+/// The flash dK/dV kernels read the per-row dot(dO, O) from a buffer
+/// reduced once, in both their register (one thread per KV row) and shared
+/// memory (several threads per row) forms, with GQA and a causal mask.
+#[test]
+fn flash_attention_backward_uses_precomputed_row_dots() {
+    use meganeura::compile::ShaderEntry;
+    // (seq, heads, kv_heads, head_dim, causal): 64-wide heads split each KV
+    // row across two threads; 32-wide heads give each row one thread.
+    for (seq, heads, kv_heads, head_dim, causal) in [
+        (130usize, 4u32, 2u32, 64u32, false),
+        (130, 2, 2, 64, true),
+        (260, 2, 1, 32, true),
+    ] {
+        let q_width = heads as usize * head_dim as usize;
+        let kv_width = kv_heads as usize * head_dim as usize;
+        let mut graph = Graph::new();
+        let q = graph.parameter("q", &[seq, q_width]);
+        let k = graph.parameter("k", &[seq, kv_width]);
+        let v = graph.parameter("v", &[seq, kv_width]);
+        let attention = if causal {
+            graph.causal_attention(q, k, v, heads, kv_heads, head_dim)
+        } else {
+            graph.multi_head_attn(q, k, v, heads, kv_heads, head_dim, false)
+        };
+        let weights = graph.input("weights", &[seq, q_width]);
+        let weighted = graph.mul(attention, weights);
+        let loss = graph.sum_all(weighted);
+        graph.set_outputs(vec![loss]);
+
+        let parameters = [
+            ("q", values(seq * q_width, 0.017, 0.3)),
+            ("k", values(seq * kv_width, 0.019, 0.7)),
+            ("v", values(seq * kv_width, 0.023, 1.1)),
+        ];
+        let inputs = [("weights", values(seq * q_width, 0.013, 1.7))];
+        let mut training = meganeura::build(&graph, meganeura::SessionConfig::from_env()).0;
+        assert!(
+            training
+                .plan()
+                .dispatches
+                .iter()
+                .any(|d| d.shader == ShaderEntry::FlashGradKV),
+            "seq={seq} head_dim={head_dim} did not reach the flash dK/dV kernel"
+        );
+        for (name, data) in &parameters {
+            training.set_parameter(name, data);
+        }
+        training.set_input("weights", &inputs[0].1);
+        training.set_learning_rate(0.0);
+        training.step();
+        training.wait();
+
+        let mut inference =
+            meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
+        for (name, data) in &parameters {
+            let mut gradient = vec![0.0; data.len()];
+            training.read_param_grad(name, &mut gradient);
+            let width = data.len() / seq;
+            for index in [0, width + 3, (seq / 2) * width + width - 1, data.len() - 1] {
+                let numerical =
+                    finite_difference(&mut inference, &parameters, &inputs, name, index, 1e-2);
+                assert_close(
+                    &format!("seq={seq} hd={head_dim} causal={causal} {name}[{index}]"),
+                    gradient[index],
+                    numerical,
+                );
+            }
+        }
+    }
+}
