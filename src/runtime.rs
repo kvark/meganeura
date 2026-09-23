@@ -464,6 +464,8 @@ struct GradClipScaleParams {
 struct AdaptiveGradClipData {
     param: blade_graphics::BufferPiece,
     grad: blade_graphics::BufferPiece,
+    partials: blade_graphics::BufferPiece,
+    scales: blade_graphics::BufferPiece,
     params: AdaptiveGradClipParams,
 }
 
@@ -473,6 +475,10 @@ struct AdaptiveGradClipParams {
     len: u32,
     clip: f32,
     pmin: f32,
+    slot: u32,
+    slots: u32,
+    index: u32,
+    mode: u32,
     _pad0: u32,
 }
 
@@ -2762,9 +2768,13 @@ pub struct Session {
     /// dispatch, consumed by GradClipScale. `None` when the plan has no
     /// trainable parameters.
     grad_clip_acc: Option<blade_graphics::Buffer>,
-    /// One f32 per global-clip workgroup (see [`grad_clip_workgroups`]),
-    /// summed into `grad_clip_acc`. `None` without trainable parameters.
+    /// Two f32 per clip workgroup (see [`grad_clip_workgroups`]): global
+    /// clipping uses the first half as squared partial sums for
+    /// `grad_clip_acc`, adaptive clipping stores (param², grad²) pairs.
+    /// `None` without trainable parameters.
     grad_clip_partials: Option<blade_graphics::Buffer>,
+    /// One adaptive-clip scale per parameter.
+    agc_scales: Option<blade_graphics::Buffer>,
     /// Persistent per-parameter gradient accumulators (parallel to
     /// `plan.param_grad_pairs`). When `grad_accum_scale` is `Some`, each
     /// `step()` adds `grad * scale` into these instead of letting the
@@ -3576,7 +3586,18 @@ impl Session {
             Some(create_optimizer_buffer(
                 &gpu,
                 "grad_clip_partials",
-                slots * 4,
+                slots * 8,
+                optimizer_device,
+                &mut optimizer_device_bufs,
+            ))
+        } else {
+            None
+        };
+        let agc_scales = if !plan.param_grad_pairs.is_empty() {
+            Some(create_optimizer_buffer(
+                &gpu,
+                "agc_scales",
+                plan.param_grad_pairs.len() as u64 * 4,
                 optimizer_device,
                 &mut optimizer_device_bufs,
             ))
@@ -3648,6 +3669,7 @@ impl Session {
             grad_clip_tick: 0,
             grad_clip_acc,
             grad_clip_partials,
+            agc_scales,
             grad_accum_bufs: Vec::new(),
             grad_accum_scale: None,
             lr_multipliers: Vec::new(),
@@ -6881,31 +6903,58 @@ impl Session {
         if do_clip_now {
             let accumulating = self.grad_accum_scale.is_some();
             if let Some((clip, pmin)) = self.pending_agc {
+                // Three passes, as for global clipping: per-workgroup norm
+                // pairs, one scale per parameter, then the scaling itself.
                 let pipeline = self.pipelines.scalar(ShaderEntry::AdaptiveGradClip);
-                let mut pass = self.encoder.compute("adaptive_grad_clip");
-                for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
-                    let len = Self::optimizer_len(&self.plan, param_buf);
-                    let mut pc = pass.with(pipeline);
-                    pc.bind(
-                        0,
-                        &AdaptiveGradClipData {
-                            param: self.buffers[param_buf.0 as usize].at(0),
-                            grad: Self::grad_source(
-                                &self.buffers,
-                                &self.grad_accum_bufs,
-                                accumulating,
-                                idx,
-                                grad_buf,
-                            ),
-                            params: AdaptiveGradClipParams {
-                                len,
-                                clip,
-                                pmin,
-                                _pad0: 0,
+                let partials = self
+                    .grad_clip_partials
+                    .as_ref()
+                    .expect("grad_clip_partials allocated when param_grad_pairs nonempty");
+                let scales = self
+                    .agc_scales
+                    .as_ref()
+                    .expect("agc_scales allocated when param_grad_pairs nonempty");
+                for (mode, label) in [(0u32, "agc_norms"), (1, "agc_factor"), (2, "agc_apply")] {
+                    let mut pass = self.encoder.compute(label);
+                    let mut slot = 0u32;
+                    for (idx, &(param_buf, grad_buf)) in
+                        self.plan.param_grad_pairs.iter().enumerate()
+                    {
+                        let len = Self::optimizer_len(&self.plan, param_buf);
+                        let slots = grad_clip_workgroups(len);
+                        let mut pc = pass.with(pipeline);
+                        pc.bind(
+                            0,
+                            &AdaptiveGradClipData {
+                                param: self.buffers[param_buf.0 as usize].at(0),
+                                grad: Self::grad_source(
+                                    &self.buffers,
+                                    &self.grad_accum_bufs,
+                                    accumulating,
+                                    idx,
+                                    grad_buf,
+                                ),
+                                partials: partials.at(0),
+                                scales: scales.at(0),
+                                params: AdaptiveGradClipParams {
+                                    len,
+                                    clip,
+                                    pmin,
+                                    slot,
+                                    slots,
+                                    index: idx as u32,
+                                    mode,
+                                    _pad0: 0,
+                                },
                             },
-                        },
-                    );
-                    pc.dispatch([1, 1, 1]);
+                        );
+                        pc.dispatch(match mode {
+                            0 => [slots, 1, 1],
+                            1 => [1, 1, 1],
+                            _ => [len.div_ceil(256), 1, 1],
+                        });
+                        slot += slots;
+                    }
                 }
             } else {
                 // GPU-side gradient clipping in three passes (all in the
@@ -8982,12 +9031,14 @@ impl Session {
                 .param_grad_pairs
                 .iter()
                 .map(|&(param, _)| {
-                    grad_clip_workgroups(Self::optimizer_len(&self.plan, param)) as usize * 4
+                    grad_clip_workgroups(Self::optimizer_len(&self.plan, param)) as usize * 8
                 })
                 .sum()
         } else {
             0
         };
+        let clip_partial_bytes = clip_partial_bytes
+            + usize::from(self.agc_scales.is_some()) * self.plan.param_grad_pairs.len() * 4;
         let clip_bytes = usize::from(self.grad_clip_acc.is_some()) * 4 + clip_partial_bytes;
         let optimizer_aux_bytes = clip_bytes
             + self
@@ -9078,6 +9129,9 @@ impl Drop for Session {
             self.gpu.destroy_buffer(buffer);
         }
         if let Some(buffer) = self.grad_clip_partials {
+            self.gpu.destroy_buffer(buffer);
+        }
+        if let Some(buffer) = self.agc_scales {
             self.gpu.destroy_buffer(buffer);
         }
         if let Some(ref accumulator) = self.adam_grouped_grad_norm {
