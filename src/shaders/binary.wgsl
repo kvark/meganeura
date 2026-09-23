@@ -51,5 +51,5 @@ fn geglu(@builtin(global_invocation_id) gid: vec3<u32>) {
     let up = src_b[i];
     let x3 = gate * gate * gate;
     let inner = 0.7978845608 * (gate + 0.044715 * x3);
-    dst[i] = 0.5 * gate * (1.0 + tanh(inner)) * up;
+    dst[i] = gate / (1.0 + exp(-2.0 * inner)) * up;
 }

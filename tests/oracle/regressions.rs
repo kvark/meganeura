@@ -62,3 +62,43 @@ fn reduction_after_matmul_is_not_fused_as_a_unary_epilogue() {
         .unwrap()
         .assert_passed("inference");
 }
+
+/// Tanh-form GELU computed `1 + tanh(u)`, which rounds to exactly zero
+/// once `tanh(u)` reaches −1 in f32 (x below about −5): the value and the
+/// derivative flushed to zero there. The kernels now use the identical
+/// `x · sigmoid(2u)`. Inputs lie only in the tail, so no larger value hides
+/// the error behind the tolerance floor.
+#[test]
+fn gelu_negative_tail_is_not_flushed_to_zero() {
+    let values: Vec<f32> = (0..24).map(|i| -9.0 + i as f32 * 0.25).collect();
+    let mut g = Graph::new();
+    let x = g.input("x", &[4, 6]);
+    let gate = g.input("gate", &[4, 6]);
+    let cat = g.input("cat", &[4, 12]);
+    let a = g.gelu(x);
+    let b = g.geglu(x, gate);
+    let c = g.geglu_concat(cat);
+    g.set_outputs(vec![a, b, c]);
+    let mut cat_values = values.clone();
+    cat_values.extend(vec![1.0f32; 24]);
+    let mut feeds = Feeds::new();
+    feeds.set("x", &values).set("gate", &[1.0; 24]);
+    feeds.set("cat", &cat_values);
+    gpu::check_inference(&g, &feeds, &gpu::Options::default())
+        .unwrap()
+        .assert_passed("forward");
+
+    let mut g = Graph::new();
+    let x = g.parameter("x", &[4, 6]);
+    let y = g.gelu(x);
+    let loss = gradients::weighted_loss(&mut g, y, 5, 1.0);
+    g.set_outputs(vec![loss]);
+    let mut feeds = Feeds::new();
+    feeds.set("x", &values);
+    gradients::check(&g, &feeds, &gradients::Options::default())
+        .unwrap()
+        .assert_passed("autodiff");
+    gpu::check_training(&g, &feeds, &gpu::Options::default())
+        .unwrap()
+        .assert_passed("training");
+}

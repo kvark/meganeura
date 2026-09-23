@@ -2675,27 +2675,24 @@ fn unary_shader_to_pointwise(shader: &ShaderEntry) -> Option<PointwiseDAG> {
         ShaderEntry::Recip => Pw::Recip(0),
         ShaderEntry::Silu => Pw::Silu(0),
         ShaderEntry::Gelu => {
-            // Tanh-approx GELU, bit-matching unary.wgsl's `gelu` entry:
-            // 0.5 * x * (1 + tanh(0.7978845608 * (x + 0.044715 * x³)))
+            // Tanh-approx GELU as unary.wgsl's `gelu` entry spells it:
+            // 0.5·x·(1 + tanh(u)) = x·sigmoid(2u), u = √(2/π)·(x + 0.044715·x³).
+            // The sigmoid form does not cancel to zero for negative x.
             return Some(PointwiseDAG {
                 n_inputs: 1,
                 ops: vec![
-                    Pw::LoadInput(0),           // v0 = x
-                    Pw::Mul(0, 0),              // v1 = x²
-                    Pw::Mul(1, 0),              // v2 = x³
-                    Pw::const_f32(0.044715),    // v3
-                    Pw::Mul(2, 3),              // v4 = 0.044715·x³
-                    Pw::Add(0, 4),              // v5 = x + 0.044715·x³
-                    Pw::const_f32(0.797_884_6), // v6 = sqrt(2/π)
-                    Pw::Mul(5, 6),              // v7 = inner
-                    Pw::Tanh(7),                // v8
-                    Pw::const_f32(1.0),         // v9
-                    Pw::Add(8, 9),              // v10 = 1 + tanh
-                    Pw::const_f32(0.5),         // v11
-                    Pw::Mul(0, 11),             // v12 = 0.5·x
-                    Pw::Mul(12, 10),            // v13 = gelu
+                    Pw::LoadInput(0),                 // v0 = x
+                    Pw::Mul(0, 0),                    // v1 = x²
+                    Pw::Mul(1, 0),                    // v2 = x³
+                    Pw::const_f32(0.044715),          // v3
+                    Pw::Mul(2, 3),                    // v4 = 0.044715·x³
+                    Pw::Add(0, 4),                    // v5 = x + 0.044715·x³
+                    Pw::const_f32(2.0 * 0.797_884_6), // v6 = 2·√(2/π)
+                    Pw::Mul(5, 6),                    // v7 = 2u
+                    Pw::Sigmoid(7),                   // v8
+                    Pw::Mul(0, 8),                    // v9 = gelu
                 ],
-                output: 13,
+                output: 9,
             });
         }
         _ => return None,
@@ -4621,7 +4618,7 @@ impl<'a> Compiler<'a> {
                         input_buffers: vec![input, offset_buf, factors],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
-                        params: vec![seq, dim, theta.to_bits(), 0, head_dim, 0, 0, 0],
+                        params: vec![seq, dim, theta.to_bits(), pos_offset, head_dim, 0, 0, 0],
 
                         ..Default::default()
                     });
@@ -4634,7 +4631,7 @@ impl<'a> Compiler<'a> {
                         input_buffers: vec![input, offset_buf],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
-                        params: vec![seq, dim, theta.to_bits(), 0, head_dim, 0, 0, 0],
+                        params: vec![seq, dim, theta.to_bits(), pos_offset, head_dim, 0, 0, 0],
 
                         ..Default::default()
                     });
@@ -5763,23 +5760,20 @@ impl<'a> Compiler<'a> {
                 let shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let rows = shape[0] as u32;
                 let cols = shape[1] as u32;
-                if self.options.use_schedule_reduction {
-                    self.emit_layernorm_schedule(x, w, bias, out_buf, rows, cols, eps);
-                } else {
-                    // One workgroup per row — threads inside cooperate on the
-                    // mean/variance reduction. Matches the hand-written
-                    // shader's workgroup-cooperative layout.
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::LayerNorm,
-                        workgroups: [rows, 1, 1],
-                        input_buffers: vec![x, w, bias],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![rows, cols, eps.to_bits(), 0],
+                // One workgroup per row. The generated reduction template
+                // performs a single reduction per row, which forces the
+                // cancelling E[x²] − E[x]² variance; the hand-written
+                // kernel takes the mean first, then the squared deviations.
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::LayerNorm,
+                    workgroups: [rows, 1, 1],
+                    input_buffers: vec![x, w, bias],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![rows, cols, eps.to_bits(), 0],
 
-                        ..Default::default()
-                    });
-                }
+                    ..Default::default()
+                });
             }
 
             Op::FullAttention {
@@ -6399,92 +6393,6 @@ impl<'a> Compiler<'a> {
     ///   epilogue: (x - mean) * rsqrt(var + eps) * weight[col] + bias[col]
     ///   where mean = r0/cols, var = r1/cols - mean².
     #[allow(clippy::too_many_arguments)]
-    fn emit_layernorm_schedule(
-        &mut self,
-        x: BufferRef,
-        w: BufferRef,
-        bias: BufferRef,
-        out_buf: BufferRef,
-        rows: u32,
-        cols: u32,
-        eps: f32,
-    ) {
-        use crate::schedule::{PointwiseDAG, Pw, ReduceOp, ReductionEpilogue, ReductionKernel};
-
-        const WG: u32 = 256;
-
-        let sum_x = PointwiseDAG {
-            n_inputs: 1,
-            ops: vec![Pw::LoadInput(0)],
-            output: 0,
-        };
-        let sum_x2 = PointwiseDAG {
-            n_inputs: 1,
-            ops: vec![Pw::LoadInput(0), Pw::Mul(0, 0)],
-            output: 1,
-        };
-
-        // Epilogue inputs (canonical layout):
-        //   0 = x[row, col]   (per-elem)
-        //   1 = weight[col]   (per-col)
-        //   2 = bias[col]     (per-col)
-        //   3 = sum(x)        (reduced 0)
-        //   4 = sum(x*x)      (reduced 1)
-        let inv_cols = Pw::const_f32(1.0 / cols as f32);
-        let eps_c = Pw::const_f32(eps);
-        let epilogue_dag = PointwiseDAG {
-            n_inputs: 5,
-            ops: vec![
-                Pw::LoadInput(0), // v0 = x
-                Pw::LoadInput(1), // v1 = weight
-                Pw::LoadInput(2), // v2 = bias
-                Pw::LoadInput(3), // v3 = sum(x)
-                Pw::LoadInput(4), // v4 = sum(x*x)
-                inv_cols,         // v5 = 1/cols
-                eps_c,            // v6 = eps
-                Pw::Mul(3, 5),    // v7 = mean
-                Pw::Mul(4, 5),    // v8 = E[x²]
-                Pw::Mul(7, 7),    // v9 = mean²
-                Pw::Sub(8, 9),    // v10 = var
-                Pw::Add(10, 6),   // v11 = var + eps
-                Pw::Rsqrt(11),    // v12 = rsqrt(var + eps)
-                Pw::Sub(0, 7),    // v13 = x - mean
-                Pw::Mul(13, 12),  // v14 = normalized
-                Pw::Mul(14, 1),   // v15 = * weight
-                Pw::Add(15, 2),   // v16 = + bias
-            ],
-            output: 16,
-        };
-
-        let kernel = ReductionKernel {
-            op: ReduceOp::Sum,
-            prologue: sum_x,
-            extra_prologues: vec![sum_x2],
-            epilogue: Some(ReductionEpilogue {
-                dag: epilogue_dag,
-                n_per_col_inputs: 2,
-            }),
-            n_per_elem: 1,
-            n_per_row: 0,
-            workgroup_size: WG,
-            rows_per_workgroup: 1,
-            gather_elem: Vec::new(),
-            input_row_repeats: Vec::new(),
-        };
-
-        self.plan.dispatches.push(Dispatch {
-            shader: ShaderEntry::LayerNorm, // sentinel for layout family
-            workgroups: [rows, 1, 1],
-            input_buffers: vec![x, w, bias],
-            output_buffer: out_buf,
-            extra_outputs: vec![],
-            params: vec![rows, cols, eps.to_bits(), 0],
-
-            kernel: Kernel::Reduction(kernel),
-            ..Default::default()
-        });
-    }
-
     /// Emit RmsNorm as a single schedule-template reduction:
     ///   prologue: v*v (sum-of-squares)
     ///   op: Sum
@@ -7243,12 +7151,15 @@ mod tests {
         g.set_outputs(vec![loss]);
 
         let plan = compile(&g);
-        assert_eq!(plan.dispatches.len(), 1);
+        // One partial per row, then their sum into the scalar loss.
+        assert_eq!(plan.dispatches.len(), 2);
         assert_eq!(plan.dispatches[0].shader, ShaderEntry::CrossEntropyLoss);
         assert_eq!(plan.dispatches[0].workgroups, [4, 1, 1]);
         assert_eq!(plan.dispatches[0].params[0], 4);
         assert_eq!(plan.dispatches[0].params[1], 10);
         assert_eq!(plan.dispatches[0].params[2], 0);
+        assert_eq!(plan.dispatches[1].shader, ShaderEntry::SumAll);
+        assert_eq!(plan.loss_buffer, Some(plan.dispatches[1].output_buffer));
     }
 
     #[test]

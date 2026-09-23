@@ -68,7 +68,9 @@ fn tanh_(@builtin(global_invocation_id) gid: vec3<u32>) {
     dst[i] = tanh(src[i]);
 }
 
-// gelu approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+// gelu approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))),
+// spelled x * sigmoid(2 * inner): 1 + tanh(u) = 2 * sigmoid(2u) exactly, and
+// the sigmoid form does not cancel to zero for negative x.
 @compute @workgroup_size(256)
 fn gelu(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -76,5 +78,5 @@ fn gelu(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x = src[i];
     let x3 = x * x * x;
     let inner = 0.7978845608 * (x + 0.044715 * x3);
-    dst[i] = 0.5 * x * (1.0 + tanh(inner));
+    dst[i] = x / (1.0 + exp(-2.0 * inner));
 }

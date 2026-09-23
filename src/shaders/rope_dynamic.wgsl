@@ -5,7 +5,8 @@ struct Params {
     seq: u32,
     dim: u32,
     theta_bits: u32,
-    _pad: u32,
+    // Static offset added to the dynamic one (zero from the builders).
+    pos_offset: u32,
     head_dim: u32,
     _pad0: u32,
     _pad1: u32,
@@ -25,7 +26,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if i >= total { return; }
 
     let row = i / half_dim;
-    let pos = row + pos_offset_buf[0];
+    let pos = row + params.pos_offset + pos_offset_buf[0];
     let pair_in_row = i % half_dim;
     let theta = bitcast<f32>(params.theta_bits);
 
@@ -98,7 +99,7 @@ fn with_factors(@builtin(global_invocation_id) gid: vec3<u32>) {
     if i >= total { return; }
 
     let row = i / half_dim;
-    let pos = row + pos_offset_buf[0];
+    let pos = row + params.pos_offset + pos_offset_buf[0];
     let pair_in_row = i % half_dim;
     let theta = bitcast<f32>(params.theta_bits);
 

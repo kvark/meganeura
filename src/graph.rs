@@ -466,7 +466,7 @@ pub enum Op {
 
     // --- Vision / VLA ops ---
 
-    // GELU activation: x * 0.5 * (1 + erf(x / sqrt(2)))
+    // GELU activation, tanh form: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
     Gelu,
 
     // Standard Layer Normalization: (x - mean) / sqrt(var + eps) * weight + bias
@@ -539,8 +539,8 @@ pub enum Op {
         eps: f32,
     },
 
-    // LayerNorm backward: grad_w and grad_bias (combined shader output [2*cols])
-    // inputs: [dy, x, w] → [2 * cols]  (first cols = grad_w, last cols = grad_b)
+    // LayerNorm backward: grad_w = Σ_rows dy · x̂. inputs: [dy, x, w] → [cols].
+    // The bias gradient is a separate SumRows of dy.
     LayerNormGradWB {
         eps: f32,
     },
