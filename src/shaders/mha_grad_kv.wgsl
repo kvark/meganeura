@@ -4,6 +4,9 @@
 // recomputed Q·K score. Saves one dispatch + one score recomputation
 // per attention layer compared to separate GradK + GradV.
 //
+// `fwd_dst` holds D[pos, head] = dot(dO, O) for every query row, reduced once
+// before this dispatch instead of again for every KV position.
+//
 // Dispatch: [kv_seq, num_kv_heads, 1], WG=64. Lane `tid` owns dimensions
 // `tid + 64 * c` for c < MAX_CHUNKS, so heads up to 256 wide are covered.
 // Dimensions past head_dim are zero-padded and must not touch storage.
@@ -25,31 +28,30 @@ var<storage> src_a: array<f32>;   // Q
 var<storage> src_b: array<f32>;   // K
 var<storage> bias: array<f32>;    // V
 var<storage> lse: array<f32>;     // LSE from forward
-var<storage> fwd_dst: array<f32>; // O from forward
+var<storage> fwd_dst: array<f32>; // D = rowsum(dO * O), [q_seq, num_heads]
 var<storage, read_write> dst: array<f32>;  // dK
 var<storage, read_write> dst2: array<f32>; // dV
 var<uniform> params: Params;
 var<workgroup> wg_a: array<f32, 64>;
-var<workgroup> wg_b: array<f32, 64>;
 var<workgroup> wg_c: array<f32, 64>;
 
 const LANES: u32 = 64u;
 const MAX_CHUNKS: u32 = 4u;
 
-// Fused triple tree_reduce: Q·K, dO·O, dO·V in one pass.
-fn triple_tree_reduce(tid: u32) {
+// Fused dual tree_reduce: Q·K and dO·V in one pass.
+fn dual_tree_reduce(tid: u32) {
     workgroupBarrier();
-    if tid < 32u { wg_a[tid] += wg_a[tid + 32u]; wg_b[tid] += wg_b[tid + 32u]; wg_c[tid] += wg_c[tid + 32u]; }
+    if tid < 32u { wg_a[tid] += wg_a[tid + 32u]; wg_c[tid] += wg_c[tid + 32u]; }
     workgroupBarrier();
-    if tid < 16u { wg_a[tid] += wg_a[tid + 16u]; wg_b[tid] += wg_b[tid + 16u]; wg_c[tid] += wg_c[tid + 16u]; }
+    if tid < 16u { wg_a[tid] += wg_a[tid + 16u]; wg_c[tid] += wg_c[tid + 16u]; }
     workgroupBarrier();
-    if tid < 8u { wg_a[tid] += wg_a[tid + 8u]; wg_b[tid] += wg_b[tid + 8u]; wg_c[tid] += wg_c[tid + 8u]; }
+    if tid < 8u { wg_a[tid] += wg_a[tid + 8u]; wg_c[tid] += wg_c[tid + 8u]; }
     workgroupBarrier();
-    if tid < 4u { wg_a[tid] += wg_a[tid + 4u]; wg_b[tid] += wg_b[tid + 4u]; wg_c[tid] += wg_c[tid + 4u]; }
+    if tid < 4u { wg_a[tid] += wg_a[tid + 4u]; wg_c[tid] += wg_c[tid + 4u]; }
     workgroupBarrier();
-    if tid < 2u { wg_a[tid] += wg_a[tid + 2u]; wg_b[tid] += wg_b[tid + 2u]; wg_c[tid] += wg_c[tid + 2u]; }
+    if tid < 2u { wg_a[tid] += wg_a[tid + 2u]; wg_c[tid] += wg_c[tid + 2u]; }
     workgroupBarrier();
-    if tid < 1u { wg_a[tid] += wg_a[tid + 1u]; wg_b[tid] += wg_b[tid + 1u]; wg_c[tid] += wg_c[tid + 1u]; }
+    if tid < 1u { wg_a[tid] += wg_a[tid + 1u]; wg_c[tid] += wg_c[tid + 1u]; }
     workgroupBarrier();
 }
 
@@ -99,7 +101,6 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             var q_val: array<f32, MAX_CHUNKS>;
             var do_val: array<f32, MAX_CHUNKS>;
             var qk = 0.0;
-            var doo = 0.0;
             var dov = 0.0;
             for (var c = 0u; c < MAX_CHUNKS; c++) {
                 let dim = tid + c * LANES;
@@ -109,20 +110,18 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
                     q_val[c] = src_a[q_base + dim];
                     do_val[c] = d_out[q_base + dim];
                     qk += q_val[c] * k_val[c];
-                    doo += do_val[c] * fwd_dst[q_base + dim];
                     dov += do_val[c] * v_val[c];
                 }
             }
 
-            // Fused triple reduction: Q·K, dO·O, dO·V
+            // Fused dual reduction: Q·K, dO·V
             wg_a[tid] = qk;
-            wg_b[tid] = doo;
             wg_c[tid] = dov;
-            triple_tree_reduce(tid);
+            dual_tree_reduce(tid);
             let score = wg_a[0] * scale;
-            let row_sum = wg_b[0];
+            let row_sum = fwd_dst[pos * num_heads + head];
             let dp_t = wg_c[0];
-            // The next head/query iteration reuses all three arrays.
+            // The next head/query iteration reuses both arrays.
             // Ensure every lane has captured their reduced values first.
             workgroupBarrier();
 
