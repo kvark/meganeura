@@ -1305,6 +1305,7 @@ impl ExecutionPlan {
         if options.fuse_dispatches {
             fuse_epilogues(&mut self);
             if options.use_schedule_pointwise {
+                fold_uniform_constants(&mut self);
                 fuse_pointwise_chains(&mut self);
             }
             if options.use_schedule_reduction {
@@ -1596,6 +1597,72 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
     }
 }
 
+/// The sentinel entry whose data layout binds a pointwise DAG of `arity`.
+fn pointwise_sentinel(arity: usize) -> ShaderEntry {
+    match arity {
+        1 => ShaderEntry::Relu,
+        2 => ShaderEntry::Add,
+        3 => ShaderEntry::SwiGLUGradGate, // dummy for TernaryData layout
+        _ => unreachable!("pointwise arity {arity} has no binding layout"),
+    }
+}
+
+/// Replace pointwise reads of uniform constant tensors with literals.
+///
+/// Autodiff seeds ReLU masks with `zeros[n]` and mean gradients with
+/// `scale[n]`. Read from memory, each costs a full tensor pass from a pinned
+/// host-visible allocation and takes one of the three input slots a fused
+/// chain may use. As literals they cost nothing, so more chains fuse.
+/// The constants themselves stay in the plan so `read_node` still sees them.
+fn fold_uniform_constants(plan: &mut ExecutionPlan) {
+    use crate::schedule::Pw;
+    use std::collections::HashMap;
+
+    let uniform: HashMap<BufferRef, u32> = plan
+        .constant_buffers
+        .iter()
+        .filter_map(|&(buffer, ref data)| {
+            let bits = data.first()?.to_bits();
+            data.iter()
+                .all(|value| value.to_bits() == bits)
+                .then_some((buffer, bits))
+        })
+        .collect();
+    if uniform.is_empty() {
+        return;
+    }
+
+    for dispatch in &mut plan.dispatches {
+        let Some(dag) = dispatch.pointwise() else {
+            continue;
+        };
+        let mut dag = dag.clone();
+        let mut inputs = dispatch.input_buffers.clone();
+        // Walk backwards so earlier slot indices stay valid. Keep one input:
+        // pointwise dispatches bind at least one stream.
+        for slot in (0..inputs.len()).rev() {
+            if inputs.len() == 1 {
+                break;
+            }
+            let Some(&bits) = uniform.get(&inputs[slot]) else {
+                continue;
+            };
+            let literal = PointwiseDAG {
+                n_inputs: 0,
+                ops: vec![Pw::Const(bits)],
+                output: 0,
+            };
+            dag = dag.fuse_input(slot as u8, &literal);
+            inputs.remove(slot);
+        }
+        if inputs.len() != dispatch.input_buffers.len() {
+            dispatch.shader = pointwise_sentinel(inputs.len());
+            dispatch.input_buffers = inputs;
+            dispatch.kernel = Kernel::Pointwise(dag);
+        }
+    }
+}
+
 /// Post-compile pass: merge sequential single-use pointwise dispatches into
 /// a single deeper-DAG dispatch, eliminating the intermediate buffer and
 /// the barrier between them. Only runs when
@@ -1737,13 +1804,7 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
             // Update the sentinel `shader` so the (legacy) pipeline
             // lookup still resolves — actual binding/pipeline come from
             // the `pointwise` DAG's arity.
-            let new_arity = consumer_d.input_buffers.len();
-            consumer_d.shader = match new_arity {
-                1 => ShaderEntry::Relu,
-                2 => ShaderEntry::Add,
-                3 => ShaderEntry::SwiGLUGradGate, // dummy for TernaryData layout
-                _ => unreachable!("arity capped at 3 by candidate-selection guard"),
-            };
+            consumer_d.shader = pointwise_sentinel(consumer_d.input_buffers.len());
 
             // Drop the producer dispatch.
             plan.dispatches.remove(pi);
@@ -7360,6 +7421,35 @@ mod tests {
         assert_eq!(plan.dispatches[0].shader, ShaderEntry::MatMul);
         assert_eq!(plan.dispatches[1].shader, ShaderEntry::BiasAdd);
         assert_eq!(plan.dispatches[2].shader, ShaderEntry::Relu);
+    }
+
+    #[test]
+    fn relu_gradient_reads_no_constant_tensors() {
+        // Autodiff compares against a zeros tensor and scales by a
+        // mean-gradient tensor. Both must become literals, which leaves room
+        // to fold the mask into the gradient product.
+        let mut g = Graph::new();
+        let x = g.parameter("x", &[1000]);
+        let y = g.relu(x);
+        let loss = g.mean_all(y);
+        g.set_outputs(vec![loss]);
+        let diff = crate::autodiff::differentiate(&g);
+        let plan = compile(&diff);
+        let constants: std::collections::HashSet<_> =
+            plan.constant_buffers.iter().map(|entry| entry.0).collect();
+        for dispatch in plan.dispatches.iter().filter(|d| d.pointwise().is_some()) {
+            assert!(
+                dispatch.input_buffers.iter().all(|b| !constants.contains(b)),
+                "{} still reads a constant tensor",
+                dispatch.label
+            );
+        }
+        assert!(
+            plan.dispatches
+                .iter()
+                .all(|d| d.shader != ShaderEntry::Greater),
+            "the ReLU mask was not fused into its consumer"
+        );
     }
 
     #[test]
