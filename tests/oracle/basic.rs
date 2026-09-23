@@ -6,7 +6,7 @@ use meganeura::reference::{Feeds, Rng, gpu};
 use meganeura::{Graph, NodeId};
 
 /// Build a graph with `build`, fill its inputs, adjust them with `fix`, and
-/// compare every output with the reference.
+/// compare every output with the reference under every lowering.
 fn case(what: &str, build: impl FnOnce(&mut Graph) -> Vec<NodeId>, fix: impl FnOnce(&mut Feeds)) {
     let mut g = Graph::new();
     let outputs = build(&mut g);
@@ -14,9 +14,11 @@ fn case(what: &str, build: impl FnOnce(&mut Graph) -> Vec<NodeId>, fix: impl FnO
     let mut feeds = Feeds::new();
     fix(&mut feeds);
     feeds.fill_random(&g, what.len() as u64, 1.0);
-    let report = gpu::check_inference(&g, &feeds, &gpu::Options::default())
-        .unwrap_or_else(|e| panic!("{what}: {e}"));
-    report.assert_passed(what);
+    for (lowering, options) in gpu::Options::lowerings() {
+        let report =
+            gpu::check_inference(&g, &feeds, &options).unwrap_or_else(|e| panic!("{what}: {e}"));
+        report.assert_passed(&format!("{what} ({lowering})"));
+    }
 }
 
 fn positive(feeds: &mut Feeds, name: &str, n: usize, seed: u64) {
@@ -572,5 +574,72 @@ fn views_and_copies() {
             vec![m, g.relu(s), t]
         },
         |_| {},
+    );
+}
+
+/// Decode-sized products (M = 1) at model shapes, with the K-split GEMV's
+/// reduction tails and column tails: plain, with a fused addend, and with
+/// a transposed weight up to a vocabulary-sized output.
+#[test]
+fn decode_gemv_shapes() {
+    for (k, n) in [
+        (64, 64),
+        (576, 576),
+        (576, 1536),
+        (1536, 576),
+        (720, 2048),
+        (128, 300),
+        (128, 257),
+        (128, 1),
+        (100, 256),
+        (511, 256),
+        (513, 256),
+    ] {
+        case(
+            &format!("gemv k={k} n={n}"),
+            |g| {
+                let a = g.input("a", &[1, k]);
+                let b = g.parameter("b", &[k, n]);
+                let d = g.input("d", &[1, n]);
+                let p = g.matmul(a, b);
+                let q = g.matmul(a, b);
+                vec![p, g.add(q, d)]
+            },
+            |_| {},
+        );
+    }
+    for (k, n) in [
+        (576, 49152),
+        (4, 262_145),
+        (576, 576),
+        (2048, 720),
+        (577, 128),
+    ] {
+        case(
+            &format!("gemv_bt k={k} n={n}"),
+            |g| {
+                let a = g.input("a", &[1, k]);
+                let b = g.parameter("b", &[n, k]);
+                vec![g.matmul_bt(a, b)]
+            },
+            |_| {},
+        );
+    }
+}
+
+/// Clamp is inclusive at both bounds, and huge bounds leave small values
+/// exact (a relu-based spelling cancels them).
+#[test]
+fn clamp_bounds() {
+    let values = [-3.0f32, -1.0, -0.5, 0.0, 2.0, 4.0, -123.5, 456.25, 1e-7];
+    case(
+        "clamp bounds",
+        |g| {
+            let x = g.input("x", &[values.len()]);
+            vec![g.clamp(x, -1.0, 2.0), g.clamp(x, -1e10, 1e10)]
+        },
+        |f| {
+            f.set("x", &values);
+        },
     );
 }

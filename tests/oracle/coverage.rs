@@ -151,6 +151,7 @@ const SUITE: &[&str] = &[
     include_str!("attention.rs"),
     include_str!("autodiff.rs"),
     include_str!("basic.rs"),
+    include_str!("blocks.rs"),
     include_str!("fuzz.rs"),
     include_str!("losses.rs"),
     include_str!("norm.rs"),
