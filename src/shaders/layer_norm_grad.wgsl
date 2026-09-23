@@ -18,63 +18,96 @@ var<storage, read_write> dst: array<f32>;
 var<uniform> params: Params;
 var<workgroup> wg_data: array<f32, 256>;
 
-// grad_weight[j] = sum_i(dy[i,j] * normed[i,j]). Each workgroup writes one
-// row of products, dst[row * cols + j]; a SumRows dispatch reduces the rows
-// unless there is only one. The bias gradient is a plain SumRows of dy.
+// grad_weight[j] = sum_i(dy[i,j] * normed[i,j]). Each workgroup handles
+// `_pad` consecutive rows (a power of two, at most 32); every row of the
+// block gets 256 / block lanes, so all rows' mean and rstd take one tree
+// each. It then writes dst[block * cols + j] = sum over its rows of
+// dy * normed. A SumRows dispatch reduces the blocks unless there is only
+// one. The bias gradient is a plain SumRows of dy.
 //
-// Dispatch: [rows, 1, 1], workgroup_size(256)
+// Dispatch: [ceil(rows / block), 1, 1], workgroup_size(256)
+const MAX_BLOCK: u32 = 32u;
+var<workgroup> row_mean: array<f32, MAX_BLOCK>;
+var<workgroup> row_rstd: array<f32, MAX_BLOCK>;
+
 @compute @workgroup_size(256)
 fn layer_norm_grad_wb(
     @builtin(workgroup_id) wgid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-    let row = wgid.x;
     let tid = lid.x;
     let cols = params.n;
     let eps = bitcast<f32>(params.k);
+    let block = clamp(params._pad, 1u, MAX_BLOCK);
+    let row_begin = wgid.x * block;
+    let row_end = min(row_begin + block, params.m);
+
+    // Lanes [slot * lanes, (slot + 1) * lanes) reduce row `row_begin + slot`.
+    let lanes = 256u / block;
+    let slot = tid / lanes;
+    let lane = tid % lanes;
+    let row = row_begin + slot;
+    let live = row < row_end;
     let offset = row * cols;
 
     // Cooperative mean: grid-stride sum
     var s = 0.0;
-    var j = tid;
-    loop {
-        if j >= cols { break; }
-        s += src_b[offset + j];
-        j += 256u;
+    if live {
+        var j = lane;
+        loop {
+            if j >= cols { break; }
+            s += src_b[offset + j];
+            j += lanes;
+        }
     }
     wg_data[tid] = s;
     workgroupBarrier();
+    // A fixed eight-step tree; steps wider than a row's lane group idle.
     for (var stride = 128u; stride > 0u; stride >>= 1u) {
-        if tid < stride { wg_data[tid] += wg_data[tid + stride]; }
+        if stride < lanes && lane < stride { wg_data[tid] += wg_data[tid + stride]; }
         workgroupBarrier();
     }
-    let mean = wg_data[0] / f32(cols);
+    let mean = wg_data[tid - lane] / f32(cols);
     workgroupBarrier();
 
     // Cooperative variance
     var v = 0.0;
-    j = tid;
-    loop {
-        if j >= cols { break; }
-        let diff = src_b[offset + j] - mean;
-        v += diff * diff;
-        j += 256u;
+    if live {
+        var j = lane;
+        loop {
+            if j >= cols { break; }
+            let diff = src_b[offset + j] - mean;
+            v += diff * diff;
+            j += lanes;
+        }
     }
     wg_data[tid] = v;
     workgroupBarrier();
+    // A fixed eight-step tree; steps wider than a row's lane group idle.
     for (var stride = 128u; stride > 0u; stride >>= 1u) {
-        if tid < stride { wg_data[tid] += wg_data[tid + stride]; }
+        if stride < lanes && lane < stride { wg_data[tid] += wg_data[tid + stride]; }
         workgroupBarrier();
     }
-    let rstd = inverseSqrt(wg_data[0] / f32(cols) + eps);
+    if lane == 0u && live {
+        row_mean[slot] = mean;
+        row_rstd[slot] = inverseSqrt(wg_data[tid] / f32(cols) + eps);
+    }
+    workgroupBarrier();
 
-    // Write partial grad_w and grad_bias for this row
-    let out_base = row * cols;
-    j = tid;
+    var j = tid;
     loop {
         if j >= cols { break; }
-        let normed = (src_b[offset + j] - mean) * rstd;
-        dst[out_base + j] = src_a[offset + j] * normed;
+        var acc = 0.0;
+        // A constant bound keeps `k` a plain unrolled index: lavapipe's
+        // threaded JIT crashes on a shared-array index that follows a
+        // runtime loop bound.
+        for (var k = 0u; k < MAX_BLOCK; k++) {
+            let r = row_begin + k;
+            if r >= row_end { break; }
+            let index = r * cols + j;
+            acc += src_a[index] * (src_b[index] - row_mean[k]) * row_rstd[k];
+        }
+        dst[wgid.x * cols + j] = acc;
         j += 256u;
     }
 }

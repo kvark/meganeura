@@ -935,6 +935,19 @@ pub fn group_norm_chunks(batch: u32, channels: u32, spatial: u32, num_groups: u3
     chunks
 }
 
+/// Rows each workgroup folds into one partial row of a norm weight gradient.
+///
+/// Folding rows shrinks the `[blocks, cols]` partial buffer that SumRows
+/// reads back, at the cost of workgroups. Blocks only grow once there would
+/// still be at least 1024 workgroups, enough to occupy any current GPU, so
+/// short inputs keep one row per workgroup. The kernels split their 256
+/// lanes evenly across a block's rows, so a block is a power of two up to 32.
+fn norm_weight_grad_rows_per_workgroup(rows: u32) -> u32 {
+    const MIN_WORKGROUPS: u32 = 1024;
+    let block = (rows / MIN_WORKGROUPS).clamp(1, 32);
+    1 << block.ilog2()
+}
+
 /// Pack independent same-A matmuls that share a barrier group into one
 /// dispatch (`workgroups[2] = N`, `horizontal_batch = N`).
 pub fn fuse_horizontal_matmuls(
@@ -6112,21 +6125,23 @@ impl<'a> Compiler<'a> {
                 let rows = x_shape[0] as u32;
                 let cols = x_shape[1] as u32;
                 if rows >= 4 {
-                    // Two-pass row-parallel approach for better GPU occupancy:
-                    // Pass 1: one WG per row computes partial[row,col] = dy*x*rsqrt
-                    // Pass 2: SumRows reduces partial → grad_w[col]
-                    let temp_buf = self.alloc_buffer((rows as usize) * (cols as usize) * 4);
+                    // Two passes for better GPU occupancy: row blocks write
+                    // partial[block, col] = sum(dy * x * rsqrt), then SumRows
+                    // reduces the blocks.
+                    let block = norm_weight_grad_rows_per_workgroup(rows);
+                    let blocks = rows.div_ceil(block);
+                    let temp_buf = self.alloc_buffer((blocks as usize) * (cols as usize) * 4);
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::RmsNormGradWRowPar,
-                        workgroups: [rows, 1, 1],
+                        workgroups: [blocks, 1, 1],
                         input_buffers: vec![dy, x, w],
                         output_buffer: temp_buf,
                         extra_outputs: vec![],
-                        params: vec![rows, cols, eps.to_bits(), 0],
+                        params: vec![rows, cols, eps.to_bits(), block],
 
                         ..Default::default()
                     });
-                    self.push_sum_rows(rows, cols, temp_buf, out_buf);
+                    self.push_sum_rows(blocks, cols, temp_buf, out_buf);
                 } else {
                     // Small row count: single-pass is fine
                     self.plan.dispatches.push(Dispatch {
@@ -6177,33 +6192,27 @@ impl<'a> Compiler<'a> {
                 let x_shape = &self.graph.node(node.inputs[1]).ty.shape;
                 let rows = x_shape[0] as u32;
                 let cols = x_shape[1] as u32;
-                // The kernel writes one row of products per workgroup, so only
-                // a single row can go straight to the `[cols]` output.
-                if rows > 1 {
-                    // Row-parallel: each WG handles one row, SumRows reduces.
-                    let temp_buf = self.alloc_buffer((rows as usize) * (cols as usize) * 4);
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::LayerNormGradWB,
-                        workgroups: [rows, 1, 1],
-                        input_buffers: vec![dy, x, w],
-                        output_buffer: temp_buf,
-                        extra_outputs: vec![],
-                        params: vec![rows, cols, eps.to_bits(), 0],
-
-                        ..Default::default()
-                    });
-                    self.push_sum_rows(rows, cols, temp_buf, out_buf);
+                // Every workgroup writes one row of block sums, so the
+                // `[cols]` output can only take them directly from one block.
+                let block = norm_weight_grad_rows_per_workgroup(rows);
+                let blocks = rows.div_ceil(block);
+                let partial = if blocks > 1 {
+                    self.alloc_buffer((blocks as usize) * (cols as usize) * 4)
                 } else {
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::LayerNormGradWB,
-                        workgroups: [rows, 1, 1],
-                        input_buffers: vec![dy, x, w],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![rows, cols, eps.to_bits(), 0],
+                    out_buf
+                };
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::LayerNormGradWB,
+                    workgroups: [blocks, 1, 1],
+                    input_buffers: vec![dy, x, w],
+                    output_buffer: partial,
+                    extra_outputs: vec![],
+                    params: vec![rows, cols, eps.to_bits(), block],
 
-                        ..Default::default()
-                    });
+                    ..Default::default()
+                });
+                if blocks > 1 {
+                    self.push_sum_rows(blocks, cols, partial, out_buf);
                 }
             }
 

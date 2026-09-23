@@ -691,3 +691,68 @@ fn flash_attention_backward_uses_precomputed_row_dots() {
         }
     }
 }
+
+/// Norm weight gradients fold several rows into each partial once there
+/// are enough rows; the last block may be short.
+#[test]
+fn norm_weight_gradients_fold_row_blocks() {
+    for rows in [5001usize, 4097] {
+        let cols = 96usize;
+        let eps = 1e-5f32;
+        let xs = values(rows * cols, 0.37, 0.2);
+        let ts = values(rows * cols, 0.11, 0.9);
+        let w0: Vec<f32> = values(cols, 0.9, 0.4).iter().map(|v| 1.0 + v).collect();
+        for layer in [false, true] {
+            let mut graph = Graph::new();
+            let x = graph.input("x", &[rows, cols]);
+            let w = graph.parameter("w", &[cols]);
+            let y = if layer {
+                let b = graph.parameter("b", &[cols]);
+                graph.layer_norm(x, w, b, eps)
+            } else {
+                graph.rms_norm(x, w, eps)
+            };
+            let t = graph.input("t", &[rows, cols]);
+            let weighted = graph.mul(y, t);
+            let loss = graph.sum_all(weighted);
+            graph.set_outputs(vec![loss]);
+            let mut session = meganeura::build(&graph, meganeura::SessionConfig::from_env()).0;
+            session.set_parameter("w", &w0);
+            if layer {
+                session.set_parameter("b", &vec![0.0; cols]);
+            }
+            session.set_input("x", &xs);
+            session.set_input("t", &ts);
+            session.set_learning_rate(0.0);
+            session.step();
+            session.wait();
+            let mut got = vec![0.0; cols];
+            session.read_param_grad("w", &mut got);
+
+            let mut want = vec![0.0f64; cols];
+            for r in 0..rows {
+                let row = &xs[r * cols..(r + 1) * cols];
+                let (shift, scale) = if layer {
+                    let mean = row.iter().map(|&v| v as f64).sum::<f64>() / cols as f64;
+                    let var =
+                        row.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / cols as f64;
+                    (mean, 1.0 / (var + eps as f64).sqrt())
+                } else {
+                    let ms = row.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / cols as f64;
+                    (0.0, 1.0 / (ms + eps as f64).sqrt())
+                };
+                for c in 0..cols {
+                    want[c] += ts[r * cols + c] as f64 * (row[c] as f64 - shift) * scale;
+                }
+            }
+            for c in 0..cols {
+                assert!(
+                    (got[c] as f64 - want[c]).abs() <= 1e-3 * want[c].abs().max(1.0),
+                    "rows={rows} layer={layer} w[{c}]: got {}, want {}",
+                    got[c],
+                    want[c]
+                );
+            }
+        }
+    }
+}
