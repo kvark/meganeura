@@ -1155,3 +1155,118 @@ fn group_norm_silu_fusion() {
     }
     failures.assert_none();
 }
+
+/// Training at 64×64 and larger reductions: kernel gradients summed over
+/// 4096 positions, a 3×3 → 3×3 → residual → 1×1 chain (whose 1×1 input
+/// gradient once had its workgroup axes swapped at this size), GroupNorm
+/// over 4096 positions, the FiLM broadcast `e[C,1] · ones[1,4096]`, and a
+/// mean over 40960 elements. Every gradient element is compared.
+#[test]
+fn large_spatial_training() {
+    let options = gpu::Options::default();
+    let mut failures = Failures::default();
+    let res = 64u32;
+    let mut graphs: Vec<(&str, Graph)> = Vec::new();
+
+    let mut g = Graph::new();
+    let x = g.input("x", &[(2 * res * res) as usize]);
+    let k = g.parameter("k", &[2 * 2 * 9]);
+    let y = g.conv2d(x, k, 1, 2, res, res, 2, 3, 3, 1, 1);
+    let loss = gradients::weighted_loss(&mut g, y, 1300, 0.9);
+    g.set_outputs(vec![loss]);
+    graphs.push(("conv3x3 64x64", g));
+
+    let mut g = Graph::new();
+    let x = g.input("x", &[(3 * res * res) as usize]);
+    let w0 = g.parameter("w0", &[4 * 3 * 9]);
+    let a = g.conv2d(x, w0, 1, 3, res, res, 4, 3, 3, 1, 1);
+    let w1 = g.parameter("w1", &[4 * 4 * 9]);
+    let b = g.conv2d(a, w1, 1, 4, res, res, 4, 3, 3, 1, 1);
+    let sum = g.add(a, b);
+    let w2 = g.parameter("w2", &[2 * 4]);
+    let pred = g.conv2d(sum, w2, 1, 4, res, res, 2, 1, 1, 1, 0);
+    let loss = gradients::weighted_loss(&mut g, pred, 1301, 0.7);
+    g.set_outputs(vec![loss]);
+    graphs.push(("conv residual + 1x1 64x64", g));
+
+    let mut g = Graph::new();
+    let spatial = res * res;
+    let x = g.input("x", &[(4 * spatial) as usize]);
+    let w = g.parameter("w", &[(4 * spatial) as usize]);
+    let xw = g.mul(x, w);
+    let gw = g.parameter("gn_w", &[4]);
+    let gb = g.parameter("gn_b", &[4]);
+    let y = g.group_norm(xw, gw, gb, 1, 4, spatial, 2, 1e-5);
+    let loss = gradients::weighted_loss(&mut g, y, 1302, 1.7);
+    g.set_outputs(vec![loss]);
+    graphs.push(("group_norm 4096", g));
+
+    let mut g = Graph::new();
+    let e = g.parameter("e", &[8, 1]);
+    let ones = g.constant(vec![1.0; 4096], &[1, 4096]);
+    let plane = g.matmul(e, ones);
+    let loss = gradients::weighted_loss(&mut g, plane, 1303, 0.9);
+    g.set_outputs(vec![loss]);
+    graphs.push(("film e[8,1] x ones[1,4096]", g));
+
+    let mut g = Graph::new();
+    let n = 40960;
+    let x = g.input("x", &[n]);
+    let w = g.parameter("w", &[n]);
+    let pred = g.mul(x, w);
+    let target = g.input("target", &[n]);
+    let loss = g.mse_loss(pred, target);
+    g.set_outputs(vec![loss]);
+    graphs.push(("mse 40960", g));
+
+    for (i, (label, g)) in graphs.iter().enumerate() {
+        let mut feeds = Feeds::new();
+        feeds.fill_random(g, 1310 + i as u64, 1.0);
+        let report = gpu::check_training(g, &feeds, &options).unwrap();
+        failures.report(label, &report);
+    }
+    failures.assert_none();
+}
+
+/// Inference at the super-resolution model's scale: a 64→64 3×3 convolution
+/// at 96×96 (Winograd), GroupNorm + SiLU over 64 channels at 128×128 with
+/// 16 groups (fused, chunked), and a 3×1 convolution over a flat 129×1 image.
+#[test]
+fn super_resolution_scale() {
+    let options = gpu::Options::default();
+    let mut failures = Failures::default();
+    let mut graphs: Vec<(&str, Graph)> = Vec::new();
+
+    // 48² Winograd tiles × 64 channels still exceed one dispatch dimension.
+    let (c, conv_hw, hw) = (64u32, 96u32, 128u32);
+    let mut g = Graph::new();
+    let x = g.input("x", &[(c * conv_hw * conv_hw) as usize]);
+    let k = g.parameter("k", &[(c * c * 9) as usize]);
+    let y = g.conv2d(x, k, 1, c, conv_hw, conv_hw, c, 3, 3, 1, 1);
+    g.set_outputs(vec![y]);
+    graphs.push(("winograd 64x64 at 96x96", g));
+
+    let mut g = Graph::new();
+    let x = g.input("x", &[(c * hw * hw) as usize]);
+    let w = g.parameter("w", &[c as usize]);
+    let b = g.parameter("b", &[c as usize]);
+    let y = g.group_norm(x, w, b, 1, c, hw * hw, 16, 1e-5);
+    let y = g.silu(y);
+    g.set_outputs(vec![y]);
+    graphs.push(("group_norm_silu 64ch 128x128", g));
+
+    let mut g = Graph::new();
+    let x = g.input("x", &[3 * 129]);
+    let k = g.parameter("k", &[5 * 3 * 3]);
+    let y = g.conv2d_hw(x, k, 1, 3, 129, 1, 5, 3, 1, 1, 1, 0);
+    g.set_outputs(vec![y]);
+    graphs.push(("conv3x1 over 129x1", g));
+
+    for (i, (label, g)) in graphs.iter().enumerate() {
+        let mut feeds = Feeds::new();
+        feeds.fill_random(g, 1400 + i as u64, 1.0);
+        let report = gpu::check_inference(g, &feeds, &options).unwrap();
+        failures.report(label, &report);
+    }
+    failures.assert_none();
+}

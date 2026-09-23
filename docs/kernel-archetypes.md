@@ -4,7 +4,7 @@ Instead of carrying hundreds of hand-written GPU shaders, meganeura generates sp
 
 ## Pointwise
 
-Arbitrary elementwise DAGs (`PointwiseDAG`) fused into a single dispatch. The e-graph optimizer chains ops like `relu -> neg -> silu` and collapses them automatically. Covers every unary op (including the tanh-approx Gelu) and the binary arithmetic set; `unary.wgsl` / `binary.wgsl` remain only as the `use_schedule_pointwise = false` parity oracles for tests.
+Arbitrary elementwise DAGs (`PointwiseDAG`) fused into a single dispatch. The e-graph optimizer chains ops like `relu -> neg -> silu` and collapses them automatically. Covers every unary op (including the tanh-approx Gelu) and the binary arithmetic set; `unary.wgsl` / `binary.wgsl` remain as the `use_schedule_pointwise = false` lowering, which the `oracle` suite checks against the f64 reference alongside the default.
 
 Each DAG node is an arithmetic op or activation; the schedule template walks the DAG and emits inline WGSL for the fused body. One thread per element, one dispatch for the entire chain.
 

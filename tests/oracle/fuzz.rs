@@ -168,13 +168,13 @@ fn random_inference_graphs() {
         g.set_outputs(outputs);
         let mut feeds = Feeds::new();
         feeds.fill_random(&g, seed, 1.0);
-        let options = gpu::Options {
-            tolerance: chain_tolerance(),
-            ..Default::default()
-        };
+        // Seeds rotate through the lowerings, so each sees many graphs.
+        let lowerings = gpu::Options::lowerings();
+        let (lowering, mut options) = lowerings[seed as usize % lowerings.len()].clone();
+        options.tolerance = chain_tolerance();
         let report = gpu::check_inference(&g, &feeds, &options).unwrap();
         if !report.passed() {
-            failures.push(format!("seed {seed}:\n{g}{report}"));
+            failures.push(format!("seed {seed} ({lowering}):\n{g}{report}"));
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -186,7 +186,14 @@ fn random_training_graphs() {
     for seed in seeds(25) {
         let (mut g, last) = Builder::build(1000 + seed, 7);
         let loss = gradients::weighted_loss(&mut g, last, seed, 0.5);
-        g.set_outputs(vec![loss]);
+        // Also return an intermediate that the backward pass consumes: it
+        // must survive the forward rewrites and keep its value.
+        let mid = NodeId::try_from(g.nodes().len() / 3).unwrap();
+        let mut outputs = vec![loss];
+        if g.node(mid).ty.shape.len() == 2 {
+            outputs.push(mid);
+        }
+        g.set_outputs(outputs);
         let mut feeds = Feeds::new();
         feeds.fill_random(&g, seed, 1.0);
         let cpu = gradients::check(&g, &feeds, &gradients::Options::default()).unwrap();
@@ -194,13 +201,12 @@ fn random_training_graphs() {
             failures.push(format!("seed {seed} autodiff:\n{g}{cpu}"));
             continue;
         }
-        let options = gpu::Options {
-            tolerance: chain_tolerance(),
-            ..Default::default()
-        };
+        let lowerings = gpu::Options::lowerings();
+        let (lowering, mut options) = lowerings[seed as usize % lowerings.len()].clone();
+        options.tolerance = chain_tolerance();
         let report = gpu::check_training(&g, &feeds, &options).unwrap();
         if !report.passed() {
-            failures.push(format!("seed {seed} training:\n{g}{report}"));
+            failures.push(format!("seed {seed} training ({lowering}):\n{g}{report}"));
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));

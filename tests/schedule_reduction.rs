@@ -1,12 +1,7 @@
-//! Parity tests for the `fuse_reduction_chains` pass: a graph's output
-//! must match within f32 round-off whether the reduction runs unfused
-//! (separate mul / embedding / sum_inner dispatches) or fused into a
-//! single reduction kernel (pointwise prologue + gather streams).
-//!
-//! This is the end-to-end gate for the gather-fusion path: it exercises
-//! the reduction gather codegen (schedule.rs) and the dynamic runtime
-//! binding (runtime.rs) that only fire for fused reductions with
-//! n_per_elem > 1 and/or gather streams.
+//! Contracts of the `fuse_reduction_chains` pass beyond numerical accuracy:
+//! gathers actually fold into their reductions, and a fused reduction is
+//! bit-identical to its explicit expansion. Accuracy against the f64
+//! reference, under every lowering, is the `oracle` suite's job.
 
 use meganeura::compile::{ShaderEntry, compile_with};
 use meganeura::{CompileOptions, Graph, Mode, NodeId, Session, SessionConfig};
@@ -61,39 +56,6 @@ fn run(build: &dyn Fn(&mut Graph) -> BuildResult, n_out: usize, fuse: bool) -> V
     session.step();
     session.wait();
     session.read_output(n_out)
-}
-
-fn assert_parity(build: impl Fn(&mut Graph) -> BuildResult, n_out: usize) {
-    let unfused = run(&build, n_out, false);
-    let fused = run(&build, n_out, true);
-    assert_eq!(unfused.len(), fused.len());
-    for (i, (a, b)) in unfused.iter().zip(fused.iter()).enumerate() {
-        assert!(
-            (a - b).abs() <= a.abs().max(b.abs()) * 1e-6 + 1e-7,
-            "reduction-fusion parity mismatch at [{i}]: unfused={a}, fused={b}",
-        );
-    }
-}
-
-/// Phase 1: `sum_inner(mul(a, b))` — fold a pointwise (binary) producer
-/// into the reduction prologue. n_per_elem 1→2 (no gather) exercises the
-/// dynamic binding path.
-#[test]
-fn sum_inner_of_mul_parity() {
-    let m = 6usize;
-    let n = 64usize;
-    assert_parity(
-        |g| {
-            let a = g.input("a", &[m, n]);
-            let b = g.input("b", &[m, n]);
-            let prod = g.mul(a, b);
-            let y = g.sum_inner(prod); // [m, 1]
-            let a_data: Vec<f32> = (0..m * n).map(|i| (i as f32) * 0.13 - 2.0).collect();
-            let b_data: Vec<f32> = (0..m * n).map(|i| (i as f32) * -0.07 + 1.0).collect();
-            (y, vec![("a", a_data), ("b", b_data)], vec![])
-        },
-        m,
-    );
 }
 
 /// Narrow rows use one lane per row and preserve the scalar column-order sum
@@ -351,31 +313,6 @@ fn broadcast_inner_forward_and_gradient_match_explicit_repetition() {
             expected_gradient.to_bits(),
             "gradient mismatch at row {row}",
         );
-    }
-}
-
-#[test]
-fn global_avg_pool_gradient_keeps_spatial_normalization() {
-    const BATCH: usize = 2;
-    const CHANNELS: usize = 3;
-    const SPATIAL: usize = 5;
-
-    let mut graph = Graph::new();
-    let input = graph.parameter("input", &[BATCH * CHANNELS * SPATIAL]);
-    let pooled = graph.global_avg_pool(input, BATCH as u32, CHANNELS as u32, SPATIAL as u32);
-    let loss = graph.sum_all(pooled);
-    graph.set_outputs(vec![loss]);
-
-    let mut session = meganeura::build_session(&graph);
-    let input_data = [1.0; BATCH * CHANNELS * SPATIAL];
-    session.set_parameter("input", &input_data);
-    session.step();
-    session.wait();
-
-    let mut gradient = vec![0.0; BATCH * CHANNELS * SPATIAL];
-    session.read_param_grad("input", &mut gradient);
-    for value in gradient {
-        assert!((value - (SPATIAL as f32).recip()).abs() <= 1.0e-7);
     }
 }
 
@@ -703,35 +640,6 @@ fn pairwise_vector_rejection_matches_explicit_forward_and_gradients() {
     }
 }
 
-/// Phase 2: `sum_inner(mul(embedding(idx, table), basis))` — the SH colour
-/// path. Folds the gather (Embedding) into the reduction as a gather
-/// stream. Exercises the full gather codegen + dynamic binding.
-#[test]
-fn sum_inner_of_gather_times_basis_parity() {
-    let vocab = 4usize;
-    let m = 6usize; // outer (P*L)
-    let n = 64usize; // inner (K) = table hidden
-    assert_parity(
-        |g| {
-            let idx = g.input_u32("idx", &[m]);
-            let table = g.input("table", &[vocab, n]);
-            let basis = g.input("basis", &[m, n]);
-            let gathered = g.embedding(idx, table); // [m, n]
-            let prod = g.mul(gathered, basis); // [m, n]
-            let y = g.sum_inner(prod); // [m, 1]
-            let table_data: Vec<f32> = (0..vocab * n).map(|i| (i as f32) * 0.21 - 1.0).collect();
-            let basis_data: Vec<f32> = (0..m * n).map(|i| (i as f32) * 0.05 + 0.3).collect();
-            let idx_data: Vec<u32> = (0..m).map(|i| (i * 3 % vocab) as u32).collect();
-            (
-                y,
-                vec![("table", table_data), ("basis", basis_data)],
-                vec![("idx", idx_data)],
-            )
-        },
-        m,
-    );
-}
-
 /// White-box: the two-gather graph must actually COLLAPSE — one reduction
 /// dispatch with two gather streams, and zero Embedding / standalone-mul
 /// dispatches left. Guards against the parity tests passing on a silent
@@ -828,161 +736,6 @@ fn shared_gather_and_offset_fold_into_each_reduction() {
     assert!(!plan.dispatches.iter().any(|dispatch| {
         dispatch.shader == ShaderEntry::Add && dispatch.params[0] == (m * n) as u32
     }));
-}
-
-#[test]
-fn shared_gather_and_offset_reduction_parity() {
-    let vocab = 5usize;
-    let m = 6usize;
-    let n = 64usize;
-    assert_parity(
-        |graph| {
-            let indices = graph.input_u32("indices", &[m]);
-            let table = graph.input("table", &[vocab, n]);
-            let offset = graph.input("offset", &[m, n]);
-            let factors_a = graph.input("factors_a", &[m, n]);
-            let factors_b = graph.input("factors_b", &[m, n]);
-            let gathered = graph.embedding(indices, table);
-            let relative = graph.add(gathered, offset);
-            let terms_a = graph.mul(relative, factors_a);
-            let reduced_a = graph.sum_inner(terms_a);
-            let terms_b = graph.mul(relative, factors_b);
-            let reduced_b = graph.sum_inner(terms_b);
-            let output = graph.add(reduced_a, reduced_b);
-            let table_data = (0..vocab * n)
-                .map(|index| index as f32 * 0.021 - 1.0)
-                .collect();
-            let offset_data = (0..m * n)
-                .map(|index| index as f32 * -0.013 + 0.5)
-                .collect();
-            let factors_a_data = (0..m * n).map(|index| index as f32 * 0.005 + 0.3).collect();
-            let factors_b_data = (0..m * n)
-                .map(|index| index as f32 * -0.007 + 0.7)
-                .collect();
-            let indices_data = (0..m).map(|row| (row * 3 % vocab) as u32).collect();
-            (
-                output,
-                vec![
-                    ("table", table_data),
-                    ("offset", offset_data),
-                    ("factors_a", factors_a_data),
-                    ("factors_b", factors_b_data),
-                ],
-                vec![("indices", indices_data)],
-            )
-        },
-        m,
-    );
-}
-
-#[test]
-fn shared_gather_reductions_accumulate_the_table_gradient() {
-    let vocab = 5usize;
-    let m = 6usize;
-    let n = 64usize;
-    let mut graph = Graph::new();
-    let indices = graph.input_u32("indices", &[m]);
-    let table = graph.parameter("table", &[vocab, n]);
-    let offset = graph.input("offset", &[m, n]);
-    let factors_a = graph.input("factors_a", &[m, n]);
-    let factors_b = graph.input("factors_b", &[m, n]);
-    let gathered = graph.embedding(indices, table);
-    let relative = graph.add(gathered, offset);
-    let terms_a = graph.mul(relative, factors_a);
-    let reduced_a = graph.sum_inner(terms_a);
-    let terms_b = graph.mul(relative, factors_b);
-    let reduced_b = graph.sum_inner(terms_b);
-    let rows = graph.add(reduced_a, reduced_b);
-    let loss = graph.sum_all(rows);
-    graph.set_outputs(vec![loss]);
-
-    let indices_data = (0..m)
-        .map(|row| (row * 3 % vocab) as u32)
-        .collect::<Vec<_>>();
-    let factors_a_data = (0..m * n)
-        .map(|index| index as f32 * 0.005 + 0.3)
-        .collect::<Vec<_>>();
-    let factors_b_data = (0..m * n)
-        .map(|index| index as f32 * -0.007 + 0.7)
-        .collect::<Vec<_>>();
-    let mut session = meganeura::build_session(&graph);
-    session.set_parameter("table", &vec![0.0; vocab * n]);
-    session.set_input("offset", &vec![0.0; m * n]);
-    session.set_input("factors_a", &factors_a_data);
-    session.set_input("factors_b", &factors_b_data);
-    session.set_input_u32("indices", &indices_data);
-    session.set_learning_rate(0.0);
-    session.step();
-    session.wait();
-
-    let mut actual = vec![0.0; vocab * n];
-    session.read_param_grad("table", &mut actual);
-    let mut expected = vec![0.0; vocab * n];
-    for row in 0..m {
-        let table_row = indices_data[row] as usize;
-        for column in 0..n {
-            expected[table_row * n + column] +=
-                factors_a_data[row * n + column] + factors_b_data[row * n + column];
-        }
-    }
-    for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
-        assert!(
-            (actual - expected).abs() <= expected.abs() * 1.0e-6 + 1.0e-6,
-            "table gradient mismatch at {index}: {actual} != {expected}"
-        );
-    }
-}
-
-/// Two gather streams (both operands gathered) — closest to the real SH
-/// case where both coeff and per-step basis are indexed loads.
-#[test]
-fn sum_inner_of_two_gathers_parity() {
-    let vocab = 5usize;
-    let m = 6usize;
-    let n = 64usize;
-    assert_parity(
-        |g| {
-            let idx_a = g.input_u32("idx_a", &[m]);
-            let idx_b = g.input_u32("idx_b", &[m]);
-            let ta = g.input("ta", &[vocab, n]);
-            let tb = g.input("tb", &[vocab, n]);
-            let ga = g.embedding(idx_a, ta);
-            let gb = g.embedding(idx_b, tb);
-            let prod = g.mul(ga, gb);
-            let y = g.sum_inner(prod);
-            let ta_data: Vec<f32> = (0..vocab * n).map(|i| (i as f32) * 0.11 - 0.5).collect();
-            let tb_data: Vec<f32> = (0..vocab * n).map(|i| (i as f32) * -0.09 + 0.7).collect();
-            let ia: Vec<u32> = (0..m).map(|i| (i % vocab) as u32).collect();
-            let ib: Vec<u32> = (0..m).map(|i| ((i * 2 + 1) % vocab) as u32).collect();
-            (
-                y,
-                vec![("ta", ta_data), ("tb", tb_data)],
-                vec![("idx_a", ia), ("idx_b", ib)],
-            )
-        },
-        m,
-    );
-}
-
-/// LayerNorm forward: the two-accumulator archetype (sum + sum-of-squares
-/// in one pass) must match the hand-written layer_norm.wgsl shader.
-#[test]
-fn layer_norm_archetype_parity() {
-    assert_parity(
-        |g| {
-            let x = g.input("x", &[5, 96]);
-            let w = g.input("w", &[96]);
-            let b = g.input("b", &[96]);
-            let y = g.layer_norm(x, w, b, 1e-5);
-            let x_data: Vec<f32> = (0..5 * 96)
-                .map(|i| ((i * 37 % 101) as f32) * 0.11 - 4.7)
-                .collect();
-            let w_data: Vec<f32> = (0..96).map(|i| 0.5 + ((i % 7) as f32) * 0.2).collect();
-            let b_data: Vec<f32> = (0..96).map(|i| ((i % 5) as f32) * 0.3 - 0.6).collect();
-            (y, vec![("x", x_data), ("w", w_data), ("b", b_data)], vec![])
-        },
-        5 * 96,
-    );
 }
 
 #[test]

@@ -7,8 +7,8 @@ diagnostic tools on a failing application. A test per symptom is not the goal.
 # CPU compiler/graph checks; no GPU required.
 cargo test --lib
 
-# Broad GPU coverage: forward/backward, optimizer/checkpoint state, cache,
-# model training, vision operators, named reads and nonfinite attribution.
+# Broad GPU coverage: optimizer/checkpoint state, cache, model training,
+# quantized weights, named reads and nonfinite attribution.
 cargo test --test smoke -- --test-threads=1
 
 # Every op, derivative and compiler transform against the f64 reference.
@@ -70,6 +70,20 @@ inputs and carries these scales through every linear op in the graph. Element
 `i` passes when `|got − want| ≤ rtol · (sᵢ + floor · max s)`, with
 `rtol = 2e-4` by default. A wrong index, mask or missing term errs by the
 size of the value itself, several orders of magnitude above this.
+
+Every case runs under each alternative lowering as well as the default:
+the hand-written pointwise and reduction shaders instead of the generated
+ones, and no dispatch fusion (`gpu::Options::lowerings`). Training checks
+compare every user output and every parameter gradient, including a
+parameter's slice of a packed parameter the optimizer replaced it with.
+
+The rest of the suite covers what a reference cannot: optimizer and
+checkpoint state, caches, tuning and profiling, loaders, parity with
+external models, dispatch geometry at extreme sizes, plan shape (fusion
+happened, a pack formed), bit-exactness between fused and expanded forms,
+packed quantized formats, and cooperative-matrix paths on hardware that has
+them. A numerical check of an op belongs in `oracle`, not in a new focused
+test.
 
 Adding an op means giving it reference semantics (the compiler insists),
 adding its shapes to its family's sweep, and adding a mid-graph gradient case
