@@ -3236,6 +3236,55 @@ impl<'a> Compiler<'a> {
         });
     }
 
+    /// Sum or mean of a whole tensor into `output[0]`.
+    ///
+    /// One workgroup streams up to 32K elements; beyond that, up to 256
+    /// workgroups write partial sums of grid-strided slices and one more
+    /// finishes them (and divides, for a mean), so a large loss is not
+    /// limited to a single workgroup.
+    fn emit_reduce_all(
+        &mut self,
+        shader: ShaderEntry,
+        input: BufferRef,
+        output: BufferRef,
+        len: u32,
+    ) {
+        const PER_WORKGROUP: u32 = 16 * 1024;
+        let groups = (len / PER_WORKGROUP).clamp(1, 256);
+        if groups == 1 {
+            self.plan.dispatches.push(Dispatch {
+                shader,
+                workgroups: [1, 1, 1],
+                input_buffers: vec![input],
+                output_buffer: output,
+                extra_outputs: vec![],
+                params: vec![len, 0, 0, 0],
+
+                ..Default::default()
+            });
+            return;
+        }
+        let partials = self.alloc_buffer(groups as usize * 4);
+        self.plan.dispatches.push(Dispatch {
+            shader: shader.clone(),
+            workgroups: [groups, 1, 1],
+            input_buffers: vec![input],
+            output_buffer: partials,
+            extra_outputs: vec![],
+            params: vec![len, 0, 0, 0],
+            ..Default::default()
+        });
+        self.plan.dispatches.push(Dispatch {
+            shader,
+            workgroups: [1, 1, 1],
+            input_buffers: vec![partials],
+            output_buffer: output,
+            extra_outputs: vec![],
+            params: vec![groups, len, 0, 0],
+            ..Default::default()
+        });
+    }
+
     /// D[row] = dot(d_out[row], o[row]) over `head_dim`-wide rows, for the
     /// attention dK/dV kernels.
     fn emit_attention_row_dot(
@@ -3968,31 +4017,13 @@ impl<'a> Compiler<'a> {
             Op::SumAll => {
                 let input = self.get_buffer(node.inputs[0]);
                 let len = self.graph.node(node.inputs[0]).ty.num_elements() as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::SumAll,
-                    workgroups: [1, 1, 1],
-                    input_buffers: vec![input],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![len, 0, 0, 0],
-
-                    ..Default::default()
-                });
+                self.emit_reduce_all(ShaderEntry::SumAll, input, out_buf, len);
             }
 
             Op::MeanAll => {
                 let input = self.get_buffer(node.inputs[0]);
                 let len = self.graph.node(node.inputs[0]).ty.num_elements() as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MeanAll,
-                    workgroups: [1, 1, 1],
-                    input_buffers: vec![input],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![len, 0, 0, 0],
-
-                    ..Default::default()
-                });
+                self.emit_reduce_all(ShaderEntry::MeanAll, input, out_buf, len);
             }
 
             Op::SumRows => {

@@ -1,6 +1,8 @@
 struct Params {
     len: u32,
-    _pad0: u32,
+    // Mean divisor; zero means `len`. Set when this dispatch finishes a mean
+    // over partial sums, whose count is not the mean's element count.
+    divisor: u32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -10,62 +12,59 @@ var<storage, read_write> dst: array<f32>;
 var<uniform> params: Params;
 var<workgroup> wg_data: array<f32, 256>;
 
-@compute @workgroup_size(256)
-fn sum_all(@builtin(local_invocation_id) lid: vec3<u32>) {
-    let tid = lid.x;
-    // Strided accumulation
+// Sum of a grid-strided slice of `src`. A single workgroup covers the whole
+// input; with several, each covers its share and the caller finishes the
+// partial sums with a second, single-workgroup dispatch.
+fn slice_sum(tid: u32, group: u32, groups: u32) -> f32 {
     var acc = 0.0;
-    var idx = tid;
+    var idx = group * 256u + tid;
+    let stride = groups * 256u;
     loop {
         if idx >= params.len { break; }
         acc += src[idx];
-        idx += 256u;
+        idx += stride;
     }
     wg_data[tid] = acc;
     workgroupBarrier();
 
     // Tree reduction
-    var stride = 128u;
+    var half = 128u;
     loop {
-        if stride == 0u { break; }
-        if tid < stride {
-            wg_data[tid] += wg_data[tid + stride];
+        if half == 0u { break; }
+        if tid < half {
+            wg_data[tid] += wg_data[tid + half];
         }
         workgroupBarrier();
-        stride >>= 1u;
+        half >>= 1u;
     }
+    return wg_data[0];
+}
 
-    if tid == 0u {
-        dst[0] = wg_data[0];
+@compute @workgroup_size(256)
+fn sum_all(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wgid: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let total = slice_sum(lid.x, wgid.x, groups.x);
+    if lid.x == 0u {
+        dst[wgid.x] = total;
     }
 }
 
 @compute @workgroup_size(256)
-fn mean_all(@builtin(local_invocation_id) lid: vec3<u32>) {
-    let tid = lid.x;
-    // Strided accumulation
-    var acc = 0.0;
-    var idx = tid;
-    loop {
-        if idx >= params.len { break; }
-        acc += src[idx];
-        idx += 256u;
-    }
-    wg_data[tid] = acc;
-    workgroupBarrier();
-
-    // Tree reduction
-    var stride = 128u;
-    loop {
-        if stride == 0u { break; }
-        if tid < stride {
-            wg_data[tid] += wg_data[tid + stride];
+fn mean_all(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wgid: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let total = slice_sum(lid.x, wgid.x, groups.x);
+    if lid.x == 0u {
+        if groups.x == 1u {
+            dst[0] = total / f32(select(params.len, params.divisor, params.divisor != 0u));
+        } else {
+            // A partial sum; the finishing dispatch divides.
+            dst[wgid.x] = total;
         }
-        workgroupBarrier();
-        stride >>= 1u;
-    }
-
-    if tid == 0u {
-        dst[0] = wg_data[0] / f32(params.len);
     }
 }
