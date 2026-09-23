@@ -2934,6 +2934,7 @@ struct Compiler<'a> {
     /// pre-allocates the dV buffer here. When GradV is later compiled
     /// for the same fwd_node, it reuses this buffer and skips dispatching.
     fused_grad_kv_dv: HashMap<NodeId, BufferRef>,
+    attention_row_dots: HashMap<(BufferRef, BufferRef, u32, u32), BufferRef>,
     /// GroupNorm backward statistics per (input node, eps bits), computed
     /// once for the input and weight/bias gradients.
     group_norm_grad_stats: HashMap<(NodeId, u32), BufferRef>,
@@ -2973,6 +2974,7 @@ impl<'a> Compiler<'a> {
             coop_caps,
             allow_reduced_precision_attention_backward,
             fused_grad_kv_dv: HashMap::new(),
+            attention_row_dots: HashMap::new(),
             group_norm_grad_stats: HashMap::new(),
         }
     }
@@ -3286,7 +3288,8 @@ impl<'a> Compiler<'a> {
     }
 
     /// D[row] = dot(d_out[row], o[row]) over `head_dim`-wide rows, for the
-    /// attention dK/dV kernels.
+    /// attention backward kernels. Sharing D keeps dQ and dK/dV ready at the
+    /// same dependency level, preserving overlap and projection-gradient batching.
     fn emit_attention_row_dot(
         &mut self,
         d_out: BufferRef,
@@ -3296,6 +3299,10 @@ impl<'a> Compiler<'a> {
     ) -> BufferRef {
         use crate::schedule::ReduceOp;
 
+        let key = (d_out, o, rows, head_dim);
+        if let Some(&row_dot) = self.attention_row_dots.get(&key) {
+            return row_dot;
+        }
         const WORKGROUP_SIZE: u32 = 256;
         let lanes = head_dim.next_power_of_two().clamp(2, WORKGROUP_SIZE);
         let row_dot = self.alloc_buffer(rows as usize * 4);
@@ -3324,6 +3331,7 @@ impl<'a> Compiler<'a> {
             }),
             ..Default::default()
         });
+        self.attention_row_dots.insert(key, row_dot);
         row_dot
     }
 
@@ -5979,10 +5987,15 @@ impl<'a> Compiler<'a> {
                     };
                     (mapped, wgs)
                 };
+                let row_source = if grad_q_shader == ShaderEntry::FlashGradQCoop {
+                    fwd_o
+                } else {
+                    self.emit_attention_row_dot(d_out, fwd_o, q_seq * num_heads, head_dim)
+                };
                 self.plan.dispatches.push(Dispatch {
                     shader: grad_q_shader,
                     workgroups: grad_q_wgs,
-                    input_buffers: vec![d_out, q, k, v, lse_buf, fwd_o],
+                    input_buffers: vec![d_out, q, k, v, lse_buf, row_source],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![

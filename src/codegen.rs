@@ -5049,7 +5049,7 @@ pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule
     src.push_str("var<storage> src_b: array<f32>;\n"); // K
     src.push_str("var<storage> bias: array<f32>;\n"); // V
     src.push_str("var<storage> lse: array<f32>;\n");
-    src.push_str("var<storage> fwd_dst: array<f32>;\n"); // O
+    src.push_str("var<storage> fwd_dst: array<f32>;\n"); // D = rowsum(dO * O)
     src.push_str("var<storage, read_write> dst: array<f32>;\n"); // dQ
     src.push_str("var<uniform> params: Params;\n\n");
 
@@ -5063,25 +5063,8 @@ pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule
     if tpq > 1 {
         // wg_score[qi*tpq + lane] partial Q·K
         // wg_dp   [qi*tpq + lane] partial dO·V
-        // wg_rs   [qi*tpq + lane] partial dO·O for row_sum
         let _ = writeln!(src, "var<workgroup> wg_score: array<f32, {}>;", bq * tpq);
         let _ = writeln!(src, "var<workgroup> wg_dp: array<f32, {}>;", bq * tpq);
-        let _ = writeln!(src, "var<workgroup> wg_rs: array<f32, {}>;\n", bq * tpq);
-
-        // Grouped tree_reduce for wg_rs
-        src.push_str("fn reduce_rs(tid: u32) {\n");
-        let _ = writeln!(src, "    let local = tid % {tpq}u;");
-        let _ = writeln!(src, "    let base = (tid / {tpq}u) * {tpq}u;");
-        let mut stride = tpq / 2;
-        while stride > 0 {
-            src.push_str("    workgroupBarrier();\n");
-            let _ = writeln!(
-                src,
-                "    if local < {stride}u {{ wg_rs[base + local] += wg_rs[base + local + {stride}u]; }}"
-            );
-            stride /= 2;
-        }
-        src.push_str("    workgroupBarrier();\n}\n\n");
 
         // Grouped tree_reduce for wg_score and wg_dp simultaneously
         src.push_str("fn reduce_score_dp(tid: u32) {\n");
@@ -5135,23 +5118,11 @@ pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule
     src.push_str("        log_sum = lse[lse_idx + 1u];\n");
     src.push_str("    }\n\n");
 
-    // row_sum = sum(dO * O) — partial across EPT elements, then reduce across TPQ (if needed)
-    src.push_str("    var row_sum_part = 0.0;\n");
+    // D = rowsum(dO * O) is shared with the dK/dV kernel.
+    src.push_str("    var row_sum = 0.0;\n");
     src.push_str("    if valid {\n");
-    for e in 0..ept {
-        let _ = writeln!(
-            src,
-            "        row_sum_part += do{e} * fwd_dst[q_base + d_base + {e}u];"
-        );
-    }
-    src.push_str("    }\n");
-    if tpq > 1 {
-        let _ = writeln!(src, "    wg_rs[qi * {tpq}u + lane] = row_sum_part;");
-        src.push_str("    reduce_rs(lid.x);\n");
-        let _ = writeln!(src, "    let row_sum = wg_rs[qi * {tpq}u];\n");
-    } else {
-        src.push_str("    let row_sum = row_sum_part;\n\n");
-    }
+    src.push_str("        row_sum = fwd_dst[pos * num_heads + head];\n");
+    src.push_str("    }\n\n");
 
     // Per-position KV range
     src.push_str(

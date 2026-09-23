@@ -621,9 +621,8 @@ fn adaptive_grad_clip_measures_large_parameters() {
     }
 }
 
-/// The flash dK/dV kernels read the per-row dot(dO, O) from a buffer
-/// reduced once, in both their register (one thread per KV row) and shared
-/// memory (several threads per row) forms, with GQA and a causal mask.
+/// Flash dQ and dK/dV share one per-row dot(dO, O) reduction, including the
+/// register and shared-memory KV variants, GQA and causal masking.
 #[test]
 fn flash_attention_backward_uses_precomputed_row_dots() {
     use meganeura::compile::ShaderEntry;
@@ -657,13 +656,18 @@ fn flash_attention_backward_uses_precomputed_row_dots() {
         ];
         let inputs = [("weights", values(seq * q_width, 0.013, 1.7))];
         let mut training = meganeura::build(&graph, meganeura::SessionConfig::from_env()).0;
-        assert!(
-            training
-                .plan()
-                .dispatches
-                .iter()
-                .any(|d| d.shader == ShaderEntry::FlashGradKV),
-            "seq={seq} head_dim={head_dim} did not reach the flash dK/dV kernel"
+        let dispatches = &training.plan().dispatches;
+        let query = dispatches
+            .iter()
+            .find(|d| d.shader == ShaderEntry::FlashGradQ)
+            .unwrap();
+        let kv = dispatches
+            .iter()
+            .find(|d| d.shader == ShaderEntry::FlashGradKV)
+            .unwrap();
+        assert_eq!(
+            query.input_buffers[5], kv.input_buffers[5],
+            "dQ and dK/dV must share the row reduction"
         );
         for (name, data) in &parameters {
             training.set_parameter(name, data);

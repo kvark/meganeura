@@ -20,7 +20,7 @@ var<storage> src_a: array<f32>;   // Q
 var<storage> src_b: array<f32>;   // K
 var<storage> bias: array<f32>;    // V
 var<storage> lse: array<f32>;     // LSE from forward (max_score, log_sum only)
-var<storage> fwd_dst: array<f32>; // O from forward
+var<storage> fwd_dst: array<f32>; // D = rowsum(dO * O), [q_seq, num_heads]
 var<storage, read_write> dst: array<f32>;  // dQ
 var<uniform> params: Params;
 var<workgroup> wg_a: array<f32, 64>;
@@ -47,22 +47,6 @@ fn dual_tree_reduce(tid: u32) {
     workgroupBarrier();
 }
 
-fn tree_reduce_a(tid: u32) {
-    workgroupBarrier();
-    if tid < 32u { wg_a[tid] += wg_a[tid + 32u]; }
-    workgroupBarrier();
-    if tid < 16u { wg_a[tid] += wg_a[tid + 16u]; }
-    workgroupBarrier();
-    if tid < 8u { wg_a[tid] += wg_a[tid + 8u]; }
-    workgroupBarrier();
-    if tid < 4u { wg_a[tid] += wg_a[tid + 4u]; }
-    workgroupBarrier();
-    if tid < 2u { wg_a[tid] += wg_a[tid + 2u]; }
-    workgroupBarrier();
-    if tid < 1u { wg_a[tid] += wg_a[tid + 1u]; }
-    workgroupBarrier();
-}
-
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let pos = wgid.x;
@@ -84,7 +68,6 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let q_base = pos * (num_heads * head_dim) + head * head_dim;
     var q_val: array<f32, MAX_CHUNKS>;
     var do_val: array<f32, MAX_CHUNKS>;
-    var row_part = 0.0;
     for (var c = 0u; c < MAX_CHUNKS; c++) {
         let dim = tid + c * LANES;
         q_val[c] = 0.0;
@@ -92,20 +75,13 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         if dim < head_dim {
             q_val[c] = src_a[q_base + dim];
             do_val[c] = d_out[q_base + dim];
-            row_part += do_val[c] * fwd_dst[q_base + dim];
         }
     }
     let lse_idx = (pos * num_heads + head) * 2u;
     let max_s = lse[lse_idx];
     let log_sum = lse[lse_idx + 1u];
 
-    // Pre-compute row_sum = sum_d(dO[d] * O[d])
-    wg_a[tid] = row_part;
-    tree_reduce_a(tid);
-    let row_sum = wg_a[0];
-    // Every lane must capture the reduced value before wg_a is reused for
-    // the first Q·K reduction below.
-    workgroupBarrier();
+    let row_sum = fwd_dst[pos * num_heads + head];
 
     var my_dq: array<f32, MAX_CHUNKS>;
     for (var c = 0u; c < MAX_CHUNKS; c++) {
