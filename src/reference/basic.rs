@@ -44,6 +44,28 @@ pub(super) fn gelu_derivative(x: f64) -> f64 {
     s + 2.0 * x * s * (1.0 - s) * GELU_C * (1.0 + 3.0 * 0.044715 * x * x)
 }
 
+/// `f'(x)` of a smooth elementwise op, for propagating error scales.
+pub(super) fn derivative(op: &Op, x: f64) -> Option<f64> {
+    Some(match *op {
+        Op::Sigmoid => sigmoid(x) * (1.0 - sigmoid(x)),
+        Op::Tanh => 1.0 - x.tanh().powi(2),
+        Op::Silu => silu_derivative(x),
+        Op::Gelu => gelu_derivative(x),
+        Op::Exp => x.exp(),
+        Op::Log => 1.0 / x,
+        Op::Recip => -1.0 / (x * x),
+        Op::Softplus { beta } => sigmoid(f64::from(beta) * x),
+        Op::Clamp { min, max } => {
+            if x > f64::from(min) && x < f64::from(max) {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        _ => return None,
+    })
+}
+
 /// `C = op(A) · op(B)` with explicit strides: `a(m, k)` and `b(k, n)`.
 fn contract(
     m: usize,
@@ -207,7 +229,7 @@ fn row_broadcast(
     f: impl Fn(f64, f64) -> f64,
 ) -> Result<Vec<f64>, Error> {
     let n = b.len();
-    if n == 0 || a.len() % n != 0 {
+    if n == 0 || !a.len().is_multiple_of(n) {
         return Err(invalid(node, "broadcast operand does not tile the input"));
     }
     Ok(a.data
@@ -285,7 +307,7 @@ fn glu_concat_grad(
 /// `(batch, channels, spatial)` of a flat NCHW tensor.
 fn nchw(node: &Node, t: &Tensor, channels: u32, spatial: usize) -> Result<usize, Error> {
     let plane = channels as usize * spatial;
-    if plane == 0 || t.len() % plane != 0 {
+    if plane == 0 || !t.len().is_multiple_of(plane) {
         return Err(invalid(node, "input is not a whole number of NCHW images"));
     }
     Ok(t.len() / plane)

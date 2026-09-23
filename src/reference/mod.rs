@@ -428,8 +428,9 @@ pub fn magnitudes(
 /// softmax over one column is exactly zero, yet each term that cancelled
 /// was of order one. For ops that are linear in each input (and for 1-Lipschitz
 /// selections such as `Relu`) the scale is therefore the op applied to its
-/// inputs' scales, or [`magnitudes`] if that is larger. Other ops restart
-/// from [`magnitudes`].
+/// inputs' scales, or [`magnitudes`] if that is larger. Smooth elementwise
+/// ops carry `|f'(x)|` times their input's scale, to first order. Other ops
+/// restart from [`magnitudes`].
 pub fn error_scales(graph: &Graph, values: &[Tensor]) -> Result<Vec<Vec<f64>>, Error> {
     let mut scales: Vec<Vec<f64>> = Vec::with_capacity(values.len());
     for node in graph.nodes() {
@@ -446,6 +447,14 @@ pub fn error_scales(graph: &Graph, values: &[Tensor]) -> Result<Vec<Vec<f64>>, E
             let propagated = eval_node(graph, node, &refs, &Feeds::default())?;
             for (s, p) in scale.iter_mut().zip(&propagated.data) {
                 *s = s.max(p.abs());
+            }
+        } else if node.inputs.len() == 1 && basic::derivative(&node.op, 0.0).is_some() {
+            // First order: an input error δ becomes |f'(x)|·δ.
+            let x = &values[node.inputs[0] as usize];
+            let input_scale = &scales[node.inputs[0] as usize];
+            for (i, s) in scale.iter_mut().enumerate() {
+                let slope = basic::derivative(&node.op, x.data[i]).unwrap_or(0.0);
+                *s = s.max(slope.abs() * input_scale[i]);
             }
         }
         scales.push(scale);

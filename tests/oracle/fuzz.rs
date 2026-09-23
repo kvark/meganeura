@@ -71,7 +71,7 @@ impl Builder {
         let x = self.pick();
         let s = self.shape(x);
         let (m, n) = (s[0], s[1]);
-        let y = match self.rng.below(16) {
+        let y = match self.rng.below(18) {
             0 => self.g.relu(x),
             1 => self.g.sigmoid(x),
             2 => self.g.tanh(x),
@@ -104,6 +104,15 @@ impl Builder {
             }
             13 => self.g.transpose(x),
             14 => self.g.softmax(x),
+            15 => {
+                let w = self.with_shape(&[n]);
+                self.g.rms_norm(x, w, 1e-5)
+            }
+            16 => {
+                let w = self.with_shape(&[n]);
+                let b = self.with_shape(&[n]);
+                self.g.layer_norm(x, w, b, 1e-5)
+            }
             _ => {
                 let sum = self.g.sum_inner(x);
                 self.g.broadcast_inner(sum, n)

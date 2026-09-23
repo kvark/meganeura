@@ -7061,6 +7061,7 @@ mod tests {
                 ShaderEntry::GroupNormApply => {
                     vec!["src", "src_b", "bias", "dst", "partials", "params"]
                 }
+                ShaderEntry::GroupNormStats => vec!["src", "dst", "params"],
                 ShaderEntry::GroupNormGradInput
                 | ShaderEntry::GroupNormGradWeightBias
                 | ShaderEntry::GroupNormGradStats => {
@@ -7195,6 +7196,7 @@ mod tests {
             ShaderEntry::BceLoss,
             ShaderEntry::GroupNorm,
             ShaderEntry::GroupNormSilu,
+            ShaderEntry::GroupNormStats,
             ShaderEntry::GroupNormApply,
             ShaderEntry::GroupNormGradInput,
             ShaderEntry::GroupNormGradWeightBias,
