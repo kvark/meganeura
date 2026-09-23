@@ -978,6 +978,16 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // Backward applies the inverse rotation (transpose of rotation matrix):
                 // grad_x0 = grad_y0 * cos + grad_y1 * sin
                 // grad_x1 = -grad_y0 * sin + grad_y1 * cos
+                //
+                // RoPEGrad knows only the static offset. A dynamic offset
+                // or per-pair frequency factors (decode-time forms) would be
+                // silently dropped, giving the wrong rotation.
+                assert_eq!(
+                    node.inputs.len(),
+                    1,
+                    "autodiff does not support RoPE with a dynamic offset or frequency \
+                     factors; use a static pos_offset in training graphs"
+                );
                 let x = node.inputs[0];
                 let grad_x = graph.rope_grad(grad_output, theta, pos_offset, head_dim);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
@@ -1325,27 +1335,28 @@ impl Graph {
 }
 
 fn gelu_derivative(graph: &mut Graph, x: NodeId) -> NodeId {
-    // Differentiate the tanh approximation used by Gelu and GeGLUConcat.
+    // Differentiate the tanh approximation used by Gelu and GeGLUConcat,
+    // x·s with s = sigmoid(2u), u = √(2/π)·(x + 0.044715·x³):
+    //   d/dx = s + 2·x·s·(1 − s)·u'.
+    // This is 0.5·(1 + tanh u) + 0.5·x·sech²u·u' without the cancellation
+    // of 1 + tanh u, which flushes the derivative to zero for negative x.
     let shape = graph.node(x).ty.shape.clone();
     let one = graph.constant(vec![1.0; shape.iter().product()], &shape);
     let square = graph.mul(x, x);
     let cubic = graph.mul(square, x);
     let cubic_term = graph.scale(cubic, 0.044715);
     let inner = graph.add(x, cubic_term);
-    let inner = graph.scale(inner, 0.797_884_6);
-    let tanh = graph.tanh(inner);
-    let tanh_square = graph.mul(tanh, tanh);
-    let neg_tanh_square = graph.neg(tanh_square);
-    let sech_square = graph.add(one, neg_tanh_square);
+    let twice_inner = graph.scale(inner, 2.0 * 0.797_884_6);
+    let s = graph.sigmoid(twice_inner);
+    let neg_s = graph.neg(s);
+    let one_minus_s = graph.add(one, neg_s);
     let slope = graph.scale(square, 0.134145);
     let slope = graph.add(one, slope);
-    let slope = graph.scale(slope, 0.797_884_6);
-    let half_x = graph.scale(x, 0.5);
-    let correction = graph.mul(half_x, sech_square);
+    let slope = graph.scale(slope, 2.0 * 0.797_884_6);
+    let correction = graph.mul(x, s);
+    let correction = graph.mul(correction, one_minus_s);
     let correction = graph.mul(correction, slope);
-    let base = graph.add(one, tanh);
-    let base = graph.scale(base, 0.5);
-    graph.add(base, correction)
+    graph.add(s, correction)
 }
 
 fn accumulate_grad(

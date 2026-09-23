@@ -9,9 +9,10 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
-// Version 12 binds the shared row dot, not the forward output, for scalar
-// and flash query gradients.
-const CACHE_FORMAT_VERSION: u32 = 12;
+// Version 13 reduces loss partials into a scalar, lowers LayerNorm to the
+// two-pass kernel, carries RoPE's static offset into the dynamic kernels, and
+// changes which dispatches fusion may merge.
+const CACHE_FORMAT_VERSION: u32 = 13;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]

@@ -52,20 +52,21 @@ fn swiglu_concat_grad(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // GeGLUConcat: same layout as SwiGLUConcat, gelu(gate) * up.
+// The tanh form 0.5 * x * (1 + tanh(u)) is evaluated as x * sigmoid(2u),
+// which is exact algebra but does not cancel to zero for negative x.
 fn gelu_tanh(x: f32) -> f32 {
     let x3 = x * x * x;
     let inner = 0.7978845608 * (x + 0.044715 * x3);
-    return 0.5 * x * (1.0 + tanh(inner));
+    return x / (1.0 + exp(-2.0 * inner));
 }
 
 fn dgelu_tanh(x: f32) -> f32 {
     let x2 = x * x;
     let x3 = x2 * x;
     let inner = 0.7978845608 * (x + 0.044715 * x3);
-    let t = tanh(inner);
-    let sech2 = 1.0 - t * t;
+    let s = 1.0 / (1.0 + exp(-2.0 * inner));
     let dinner = 0.7978845608 * (1.0 + 0.134145 * x2);
-    return 0.5 * (1.0 + t) + 0.5 * x * sech2 * dinner;
+    return s + 2.0 * x * s * (1.0 - s) * dinner;
 }
 
 @compute @workgroup_size(256)

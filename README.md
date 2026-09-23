@@ -162,6 +162,7 @@ an uninitialized model. See [compiler search](docs/compiler-search.md).
 | `MEGANEURA_FLASH_BWD_COOP` | Enable the experimental reduced-precision flash backward. |
 | `MEGANEURA_NO_ALIAS` | Disable buffer lifetime aliasing (every value gets its own allocation). |
 | `MEGANEURA_NO_DEVICE_LOCAL` | Keep all buffers host-visible. |
+| `MEGANEURA_POISON` | Fill non-parameter buffers with NaN at session build, so reads of memory nothing wrote show up. |
 | `MEGANEURA_SERIAL_DISPATCH` | One compute pass per dispatch — serial execution for bisection. |
 | `MEGANEURA_NO_WINOGRAD` | Skip the Conv2d-to-Winograd rewrite; its selection heuristic weighs channel counts only, so this measures which side of it a workload belongs on. |
 | `MEGANEURA_PIN_BUFS=3,25-40` | Force-pin logical buffers to bisect aliasing corruption. |

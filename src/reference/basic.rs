@@ -31,15 +31,17 @@ fn silu_derivative(x: f64) -> f64 {
 
 const GELU_C: f64 = 0.797_884_560_802_865_4; // sqrt(2/pi)
 
-/// The tanh form of GELU. This is the definition every Meganeura kernel and
-/// derivative implements, not an approximation of an erf reference.
+/// The tanh form of GELU, `0.5·x·(1 + tanh u)` with
+/// `u = √(2/π)·(x + 0.044715·x³)`. This is the definition every Meganeura
+/// kernel and derivative implements, not an approximation of an erf
+/// reference. `1 + tanh u = 2·sigmoid(2u)` keeps the negative tail exact.
 pub(super) fn gelu(x: f64) -> f64 {
-    0.5 * x * (1.0 + (GELU_C * (x + 0.044715 * x * x * x)).tanh())
+    x * sigmoid(2.0 * GELU_C * (x + 0.044715 * x * x * x))
 }
 
 pub(super) fn gelu_derivative(x: f64) -> f64 {
-    let t = (GELU_C * (x + 0.044715 * x * x * x)).tanh();
-    0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * GELU_C * (1.0 + 3.0 * 0.044715 * x * x)
+    let s = sigmoid(2.0 * GELU_C * (x + 0.044715 * x * x * x));
+    s + 2.0 * x * s * (1.0 - s) * GELU_C * (1.0 + 3.0 * 0.044715 * x * x)
 }
 
 /// `C = op(A) · op(B)` with explicit strides: `a(m, k)` and `b(k, n)`.

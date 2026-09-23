@@ -18,15 +18,24 @@ const WG_SIZE: u32 = 128u;
 // one-thread-per-row kernel that ran ~24x off the card's memory
 // bandwidth (Whisper profile: 180us per 1500x384 norm).
 //
-// Each thread accumulates partial sum and sum-of-squares for its
-// stride, then a tree reduction collapses them across the workgroup.
-// E[x²] - E[x]² is the cheaper variance form. For typical transformer
-// activations the precision loss vs Welford is negligible — values
-// are roughly zero-mean and well-bounded.
-var<workgroup> partial_sum: array<f32, WG_SIZE>;
-var<workgroup> partial_sumsq: array<f32, WG_SIZE>;
+// Two reductions: the mean, then the mean squared deviation from it. The
+// one-pass E[x²] − E[x]² cancels catastrophically for rows whose mean is
+// large next to their spread and can go negative, making rsqrt NaN. The
+// row is small next to the cache, so the second read is cheap.
+var<workgroup> partial: array<f32, WG_SIZE>;
 var<workgroup> wg_mean: f32;
 var<workgroup> wg_rstd: f32;
+
+fn reduce_partial(tid: u32) {
+    var stride = WG_SIZE / 2u;
+    while stride > 0u {
+        if tid < stride {
+            partial[tid] += partial[tid + stride];
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+}
 
 @compute @workgroup_size(128)
 fn main(
@@ -40,44 +49,33 @@ fn main(
     let eps = bitcast<f32>(params.eps_bits);
     let tid = lid.x;
 
-    // Phase 1: accumulate partial sum and sum-of-squares over the
-    // thread's strided slice. Each thread processes ceil(cols/WG_SIZE)
-    // elements, so for cols=384 (Whisper) that's 3 elements/thread.
     var s = 0.0;
+    for (var j = tid; j < cols; j = j + WG_SIZE) {
+        s += src[offset + j];
+    }
+    partial[tid] = s;
+    workgroupBarrier();
+    reduce_partial(tid);
+    if tid == 0u {
+        wg_mean = partial[0] / f32(cols);
+    }
+    workgroupBarrier();
+    let mean = wg_mean;
+
     var ss = 0.0;
     for (var j = tid; j < cols; j = j + WG_SIZE) {
-        let v = src[offset + j];
-        s += v;
-        ss += v * v;
+        let d = src[offset + j] - mean;
+        ss += d * d;
     }
-    partial_sum[tid] = s;
-    partial_sumsq[tid] = ss;
+    partial[tid] = ss;
     workgroupBarrier();
-
-    // Phase 2: tree reduction. Halve the active range each step until
-    // thread 0 holds the full row sum.
-    var stride = WG_SIZE / 2u;
-    while stride > 0u {
-        if tid < stride {
-            partial_sum[tid] += partial_sum[tid + stride];
-            partial_sumsq[tid] += partial_sumsq[tid + stride];
-        }
-        workgroupBarrier();
-        stride = stride / 2u;
-    }
-
+    reduce_partial(tid);
     if tid == 0u {
-        let mean = partial_sum[0] / f32(cols);
-        let var_ = partial_sumsq[0] / f32(cols) - mean * mean;
-        wg_mean = mean;
-        wg_rstd = inverseSqrt(var_ + eps);
+        wg_rstd = inverseSqrt(partial[0] / f32(cols) + eps);
     }
     workgroupBarrier();
-
-    let mean = wg_mean;
     let rstd = wg_rstd;
 
-    // Phase 3: normalize and apply affine, same striding pattern.
     for (var j = tid; j < cols; j = j + WG_SIZE) {
         let normed = (src[offset + j] - mean) * rstd;
         dst[offset + j] = normed * src_b[j] + bias[j];
