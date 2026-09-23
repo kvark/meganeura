@@ -666,24 +666,15 @@ struct GroupNormParams {
 }
 
 // group_norm_grad: var src_a (grad_out), src_b (input), bias (weight), dst, params
+// GroupNorm backward: every entry point of the module binds the same set.
+// grad_stats reads src_b and writes dst; the gradients read the statistics.
 #[derive(blade_macros::ShaderData)]
-struct GroupNormGradInputData {
+struct GroupNormGradData {
     src_a: blade_graphics::BufferPiece,
     src_b: blade_graphics::BufferPiece,
     bias: blade_graphics::BufferPiece,
     dst: blade_graphics::BufferPiece,
-    params: GroupNormParams,
-}
-
-// group_norm_grad_weight_bias: var src_a (grad_out), src_b (input), bias (dummy), dst, params
-// The bias field is unused by the grad_weight_bias entry point but exists
-// in the shared GroupNormGrad module (used by grad_input). We bind a dummy buffer.
-#[derive(blade_macros::ShaderData)]
-struct GroupNormGradWeightBiasData {
-    src_a: blade_graphics::BufferPiece,
-    src_b: blade_graphics::BufferPiece,
-    bias: blade_graphics::BufferPiece,
-    dst: blade_graphics::BufferPiece,
+    stats: blade_graphics::BufferPiece,
     params: GroupNormParams,
 }
 
@@ -1947,8 +1938,9 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::RmsNormRsqrt => UnaryData::layout(),
         ShaderEntry::GroupNorm | ShaderEntry::GroupNormSilu => GroupNormData::layout(),
         ShaderEntry::GroupNormApply => GroupNormApplyData::layout(),
-        ShaderEntry::GroupNormGradInput => GroupNormGradInputData::layout(),
-        ShaderEntry::GroupNormGradWeightBias => GroupNormGradWeightBiasData::layout(),
+        ShaderEntry::GroupNormGradInput
+        | ShaderEntry::GroupNormGradWeightBias
+        | ShaderEntry::GroupNormGradStats => GroupNormGradData::layout(),
         ShaderEntry::Concat => BinaryData::layout(),
         ShaderEntry::SplitA | ShaderEntry::SplitB => UnaryData::layout(),
         ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => UnaryData::layout(),
@@ -8030,37 +8022,27 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::GroupNormGradInput => {
+            ShaderEntry::GroupNormGradInput
+            | ShaderEntry::GroupNormGradWeightBias
+            | ShaderEntry::GroupNormGradStats => {
                 let p = &dispatch.params;
+                let inputs = &dispatch.input_buffers;
+                // Unused bindings of an entry point take a buffer it reads.
+                let (src_a, src_b, bias, stats) = match dispatch.shader {
+                    ShaderEntry::GroupNormGradInput => (inputs[0], inputs[1], inputs[2], inputs[3]),
+                    ShaderEntry::GroupNormGradWeightBias => {
+                        (inputs[0], inputs[1], inputs[1], inputs[2])
+                    }
+                    _ => (inputs[0], inputs[0], inputs[0], inputs[0]),
+                };
                 pc.bind(
                     0,
-                    &GroupNormGradInputData {
-                        src_a: buf(dispatch.input_buffers[0]),
-                        src_b: buf(dispatch.input_buffers[1]),
-                        bias: buf(dispatch.input_buffers[2]),
+                    &GroupNormGradData {
+                        src_a: buf(src_a),
+                        src_b: buf(src_b),
+                        bias: buf(bias),
                         dst: buf(dispatch.output_buffer),
-                        params: GroupNormParams {
-                            batch: p[0],
-                            channels: p[1],
-                            spatial: p[2],
-                            num_groups: p[3],
-                            eps_bits: p[4],
-                            chunks: 1,
-                            apply_silu: 0,
-                            _pad2: 0,
-                        },
-                    },
-                );
-            }
-            ShaderEntry::GroupNormGradWeightBias => {
-                let p = &dispatch.params;
-                pc.bind(
-                    0,
-                    &GroupNormGradWeightBiasData {
-                        src_a: buf(dispatch.input_buffers[0]),
-                        src_b: buf(dispatch.input_buffers[1]),
-                        bias: buf(dispatch.input_buffers[1]), // dummy, unused by this entry point
-                        dst: buf(dispatch.output_buffer),
+                        stats: buf(stats),
                         params: GroupNormParams {
                             batch: p[0],
                             channels: p[1],

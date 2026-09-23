@@ -182,6 +182,14 @@ fn layer_norm_weight_gradient_sums_short_batches() {
 /// negative. The forward pass uses a stable form, so the two disagreed.
 #[test]
 fn group_norm_backward_is_stable_for_large_means() {
+    // Also with a frozen input, where only the weight and bias gradients
+    // ask for the shared statistics.
+    for train_input in [true, false] {
+        check_group_norm_backward(train_input);
+    }
+}
+
+fn check_group_norm_backward(train_input: bool) {
     let (batch, channels, spatial, groups) = (2usize, 4usize, 64usize, 2usize);
     let eps = 1e-5f32;
     let n = batch * channels * spatial;
@@ -194,7 +202,11 @@ fn group_norm_backward_is_stable_for_large_means() {
     let target = values(n, 0.23, 0.9);
 
     let mut graph = Graph::new();
-    let xs = graph.parameter("x", &[n]);
+    let xs = if train_input {
+        graph.parameter("x", &[n])
+    } else {
+        graph.input("x", &[n])
+    };
     let ws = graph.parameter("w", &[channels]);
     let bs = graph.parameter("b", &[channels]);
     let y = graph.group_norm(
@@ -213,7 +225,11 @@ fn group_norm_backward_is_stable_for_large_means() {
     graph.set_outputs(vec![loss]);
 
     let mut session = meganeura::build(&graph, meganeura::SessionConfig::from_env()).0;
-    session.set_parameter("x", &x);
+    if train_input {
+        session.set_parameter("x", &x);
+    } else {
+        session.set_input("x", &x);
+    }
     session.set_parameter("w", &w);
     session.set_parameter("b", &b);
     session.set_input("target", &target);
@@ -223,7 +239,9 @@ fn group_norm_backward_is_stable_for_large_means() {
     let mut dx = vec![0.0; n];
     let mut dw = vec![0.0; channels];
     let mut db = vec![0.0; channels];
-    session.read_param_grad("x", &mut dx);
+    if train_input {
+        session.read_param_grad("x", &mut dx);
+    }
     session.read_param_grad("w", &mut dw);
     session.read_param_grad("b", &mut db);
 
@@ -273,7 +291,9 @@ fn group_norm_backward_is_stable_for_large_means() {
             );
         }
     };
-    check("dx", &dx, &want_dx);
+    if train_input {
+        check("dx", &dx, &want_dx);
+    }
     check("dw", &dw, &want_dw);
     check("db", &db, &want_db);
 }
