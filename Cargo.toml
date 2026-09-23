@@ -21,6 +21,10 @@ required-features = ["gguf"]
 [[test]]
 name = "regression"
 
+[[test]]
+name = "oracle"
+path = "tests/oracle/main.rs"
+
 # These tests change process-global environment variables.
 [[test]]
 name = "device_local"

@@ -44,6 +44,7 @@ pub mod optimize;
 #[doc(hidden)]
 pub mod outline;
 pub mod profiler;
+pub mod reference;
 pub mod runtime;
 #[doc(hidden)]
 pub mod schedule;

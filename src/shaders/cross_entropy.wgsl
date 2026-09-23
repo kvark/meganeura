@@ -107,13 +107,8 @@ fn main(
         workgroupBarrier();
     }
 
-    // Thread 0 atomically accumulates the batch loss
+    // One partial per batch row; the compiler sums them into the loss.
     if tid == 0u {
-        // Use atomicAdd for loss accumulation across batch items.
-        // Since WGSL doesn't have atomicAdd for f32 storage, we accumulate
-        // via a simple store-add pattern (only one WG writes per batch item).
-        // We initialize loss_out[0] = 0 before dispatch and accumulate here.
-        // This is safe because each workgroup handles a different batch item.
         loss_out[b] = wg_buf[0] * inv_batch;
     }
 }
