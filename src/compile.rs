@@ -5938,7 +5938,9 @@ impl<'a> Compiler<'a> {
                 let x_shape = &self.graph.node(node.inputs[1]).ty.shape;
                 let rows = x_shape[0] as u32;
                 let cols = x_shape[1] as u32;
-                if rows >= 4 {
+                // The kernel writes one row of products per workgroup, so only
+                // a single row can go straight to the `[cols]` output.
+                if rows > 1 {
                     // Row-parallel: each WG handles one row, SumRows reduces.
                     let temp_buf = self.alloc_buffer((rows as usize) * (cols as usize) * 4);
                     self.plan.dispatches.push(Dispatch {

@@ -105,3 +105,74 @@ fn attention_backward_covers_heads_wider_than_64() {
         }
     }
 }
+
+/// Checks every parameter gradient of `loss(graph)` against finite differences.
+fn check_parameter_gradients(
+    label: &str,
+    graph: &Graph,
+    parameters: &[(&str, Vec<f32>)],
+    inputs: &[(&str, Vec<f32>)],
+    step: f32,
+) {
+    let mut training = meganeura::build(graph, meganeura::SessionConfig::from_env()).0;
+    for (name, data) in parameters {
+        training.set_parameter(name, data);
+    }
+    for (name, data) in inputs {
+        training.set_input(name, data);
+    }
+    training.set_learning_rate(0.0);
+    training.step();
+    training.wait();
+
+    let mut inference = meganeura::build(graph, meganeura::SessionConfig::inference_from_env()).0;
+    for (name, data) in parameters {
+        let mut gradient = vec![0.0; data.len()];
+        training.read_param_grad(name, &mut gradient);
+        for (index, &analytical) in gradient.iter().enumerate() {
+            let numerical =
+                finite_difference(&mut inference, parameters, inputs, name, index, step);
+            assert_close(&format!("{label} {name}[{index}]"), analytical, numerical);
+        }
+    }
+}
+
+/// With fewer than four rows the weight gradient skipped the row reduction
+/// and wrote each row's partial product past the end of the `[cols]` output.
+#[test]
+fn layer_norm_weight_gradient_sums_short_batches() {
+    for rows in [1usize, 2, 3, 5] {
+        let cols = 6;
+        let mut graph = Graph::new();
+        let x = graph.parameter("x", &[rows, cols]);
+        let w = graph.parameter("w", &[cols]);
+        let b = graph.parameter("b", &[cols]);
+        let y = graph.layer_norm(x, w, b, 1e-5);
+        let target = graph.input("target", &[rows, cols]);
+        let weighted = graph.mul(y, target);
+        let loss = graph.sum_all(weighted);
+        graph.set_outputs(vec![loss]);
+        let parameters = [
+            (
+                "x",
+                values(rows * cols, 0.7, 0.1)
+                    .iter()
+                    .map(|v| v * 10.0)
+                    .collect(),
+            ),
+            (
+                "w",
+                values(cols, 0.9, 0.4).iter().map(|v| 1.0 + v).collect(),
+            ),
+            ("b", values(cols, 0.5, 0.2)),
+        ];
+        let inputs = [(
+            "target",
+            values(rows * cols, 0.37, 0.9)
+                .iter()
+                .map(|v| v * 5.0)
+                .collect(),
+        )];
+        check_parameter_gradients(&format!("rows={rows}"), &graph, &parameters, &inputs, 1e-2);
+    }
+}
