@@ -420,6 +420,67 @@ pub fn magnitudes(
     Ok(output.data.iter().map(|v| v.abs()).collect())
 }
 
+/// Per-element error scales for every node of `graph`, given the values
+/// [`evaluate`] produced.
+///
+/// Rounding errors made upstream travel through linear ops unchanged in
+/// size, however much the values themselves cancel: the gradient of a
+/// softmax over one column is exactly zero, yet each term that cancelled
+/// was of order one. For ops that are linear in each input (and for 1-Lipschitz
+/// selections such as `Relu`) the scale is therefore the op applied to its
+/// inputs' scales, or [`magnitudes`] if that is larger. Other ops restart
+/// from [`magnitudes`].
+pub fn error_scales(graph: &Graph, values: &[Tensor]) -> Result<Vec<Vec<f64>>, Error> {
+    let mut scales: Vec<Vec<f64>> = Vec::with_capacity(values.len());
+    for node in graph.nodes() {
+        let inputs: Vec<&Tensor> = node.inputs.iter().map(|&i| &values[i as usize]).collect();
+        let out = &values[node.id as usize];
+        let mut scale = magnitudes(graph, node, &inputs, out)?;
+        if propagates_scale(&node.op) {
+            let input_scales: Vec<Tensor> = node
+                .inputs
+                .iter()
+                .map(|&i| Tensor::new(values[i as usize].shape.clone(), scales[i as usize].clone()))
+                .collect();
+            let refs: Vec<&Tensor> = input_scales.iter().collect();
+            let propagated = eval_node(graph, node, &refs, &Feeds::default())?;
+            for (s, p) in scale.iter_mut().zip(&propagated.data) {
+                *s = s.max(p.abs());
+            }
+        }
+        scales.push(scale);
+    }
+    Ok(scales)
+}
+
+/// Ops through which an input's error scale bounds the output's.
+fn propagates_scale(op: &Op) -> bool {
+    is_multilinear(op)
+        || matches!(
+            *op,
+            Op::Mul
+                | Op::Neg
+                | Op::Scale { .. }
+                | Op::Relu
+                | Op::Abs
+                | Op::Transpose
+                | Op::Identity
+                | Op::Materialize
+                | Op::StopGradient
+                | Op::BroadcastInner { .. }
+                | Op::BiasMul
+                | Op::MulPerChannel { .. }
+                | Op::ShiftInner { .. }
+                | Op::Concat { .. }
+                | Op::SplitA { .. }
+                | Op::SplitB { .. }
+                | Op::Upsample2x { .. }
+                | Op::GlobalAvgPoolGrad { .. }
+                | Op::Embedding
+                | Op::PrefixLast
+        )
+}
+
 /// Ops whose outputs are sums of products of their inputs, so that the op
 /// applied to absolute inputs bounds the size of every summed term.
 fn is_multilinear(op: &Op) -> bool {

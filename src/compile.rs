@@ -1317,6 +1317,31 @@ impl ExecutionPlan {
         }
     }
 
+    /// Buffers whose contents are observed outside the dispatch that writes
+    /// them: graph outputs, the loss, parameters and their gradients,
+    /// derived parameters, inputs, constants, attention LSE side outputs,
+    /// and every dispatch's extra outputs. A fusion pass may elide the write
+    /// of an intermediate only when it is not one of these.
+    pub(crate) fn externally_visible_buffers(&self) -> std::collections::HashSet<BufferRef> {
+        let mut visible: std::collections::HashSet<BufferRef> =
+            self.output_buffers.iter().copied().collect();
+        visible.extend(self.loss_buffer);
+        visible.extend(self.param_buffers.iter().map(|entry| entry.1));
+        visible.extend(
+            self.param_grad_pairs
+                .iter()
+                .flat_map(|&(param, grad)| [param, grad]),
+        );
+        visible.extend(self.derived_params.iter().map(|entry| entry.0));
+        visible.extend(self.input_buffers.iter().map(|entry| entry.1));
+        visible.extend(self.constant_buffers.iter().map(|entry| entry.0));
+        visible.extend(self.lse_buffers.iter().map(|entry| entry.1));
+        for dispatch in &self.dispatches {
+            visible.extend(dispatch.extra_outputs.iter().copied());
+        }
+        visible
+    }
+
     fn finish(mut self, options: &CompileOptions) -> Self {
         if options.fuse_dispatches {
             fuse_epilogues(&mut self);
@@ -1470,18 +1495,7 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
     use crate::schedule::Pw;
     use std::collections::{HashMap, HashSet};
 
-    let mut protected: HashSet<BufferRef> = HashSet::new();
-    protected.extend(plan.output_buffers.iter().copied());
-    if let Some(buffer) = plan.loss_buffer {
-        protected.insert(buffer);
-    }
-    protected.extend(plan.param_buffers.iter().map(|entry| entry.1));
-    protected.extend(plan.input_buffers.iter().map(|entry| entry.1));
-    protected.extend(plan.constant_buffers.iter().map(|entry| entry.0));
-    protected.extend(plan.lse_buffers.iter().map(|entry| entry.1));
-    for dispatch in &plan.dispatches {
-        protected.extend(dispatch.extra_outputs.iter().copied());
-    }
+    let protected: HashSet<BufferRef> = plan.externally_visible_buffers();
 
     loop {
         let mut producer = HashMap::new();
@@ -1697,23 +1711,7 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
 
     // Buffers we must not eliminate. Anything here is preserved even if it
     // looks single-use from the dispatch list alone.
-    let mut protected: HashSet<BufferRef> = HashSet::new();
-    protected.extend(plan.output_buffers.iter().copied());
-    if let Some(b) = plan.loss_buffer {
-        protected.insert(b);
-    }
-    for entry in &plan.param_buffers {
-        protected.insert(entry.1);
-    }
-    for entry in &plan.input_buffers {
-        protected.insert(entry.1);
-    }
-    for entry in &plan.constant_buffers {
-        protected.insert(entry.0);
-    }
-    for entry in &plan.lse_buffers {
-        protected.insert(entry.1);
-    }
+    let mut protected: HashSet<BufferRef> = plan.externally_visible_buffers();
 
     // Iterate until no more fusions apply.
     loop {
@@ -1958,31 +1956,8 @@ fn shared_embedding_consumers_are_foldable(
 fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
     use std::collections::{HashMap, HashSet};
 
-    let protected = |plan: &ExecutionPlan| -> HashSet<BufferRef> {
-        let mut p: HashSet<BufferRef> = HashSet::new();
-        p.extend(plan.output_buffers.iter().copied());
-        if let Some(b) = plan.loss_buffer {
-            p.insert(b);
-        }
-        for e in &plan.param_buffers {
-            p.insert(e.1);
-        }
-        for e in &plan.input_buffers {
-            p.insert(e.1);
-        }
-        for e in &plan.constant_buffers {
-            p.insert(e.0);
-        }
-        for e in &plan.lse_buffers {
-            p.insert(e.1);
-        }
-        for d in &plan.dispatches {
-            for b in &d.extra_outputs {
-                p.insert(*b);
-            }
-        }
-        p
-    };
+    let protected =
+        |plan: &ExecutionPlan| -> HashSet<BufferRef> { plan.externally_visible_buffers() };
 
     // Helper: producer map + read counts for the current plan.
     let scan = |plan: &ExecutionPlan| -> (HashMap<BufferRef, usize>, HashMap<BufferRef, usize>) {
@@ -2273,17 +2248,7 @@ pub fn fuse_rmsnorm_into_gemv(plan: &mut ExecutionPlan) {
             readers.entry(*buf).or_default().push(i);
         }
     }
-    let mut external: std::collections::HashSet<BufferRef> = Default::default();
-    external.extend(plan.output_buffers.iter().copied());
-    if let Some(b) = plan.loss_buffer {
-        external.insert(b);
-    }
-    for entry in &plan.param_buffers {
-        external.insert(entry.1);
-    }
-    for entry in &plan.input_buffers {
-        external.insert(entry.1);
-    }
+    let external = plan.externally_visible_buffers();
 
     let mut drop_norm: Vec<usize> = Vec::new();
     let mut rewrite: Vec<(usize, BufferRef, BufferRef, u32)> = Vec::new();
@@ -2370,19 +2335,7 @@ pub fn fuse_rmsnorm_into_add(plan: &mut ExecutionPlan) {
             readers.entry(*buf).or_default().push(i);
         }
     }
-    let mut external: std::collections::HashSet<BufferRef> = Default::default();
-    for b in plan.output_buffers.iter().copied() {
-        external.insert(b);
-    }
-    if let Some(b) = plan.loss_buffer {
-        external.insert(b);
-    }
-    for entry in &plan.param_buffers {
-        external.insert(entry.1);
-    }
-    for entry in &plan.input_buffers {
-        external.insert(entry.1);
-    }
+    let external = plan.externally_visible_buffers();
 
     let mut drop_dispatches: Vec<usize> = Vec::new();
     let mut rewrite: Vec<(usize, usize, BufferRef)> = Vec::new();
@@ -2468,17 +2421,7 @@ pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
     }
 
     // Collect protected buffers (graph outputs, params, etc.)
-    let mut external: std::collections::HashSet<BufferRef> = Default::default();
-    external.extend(plan.output_buffers.iter().copied());
-    if let Some(b) = plan.loss_buffer {
-        external.insert(b);
-    }
-    for entry in &plan.param_buffers {
-        external.insert(entry.1);
-    }
-    for entry in &plan.input_buffers {
-        external.insert(entry.1);
-    }
+    let external = plan.externally_visible_buffers();
 
     let mut to_fuse: Vec<(usize, usize)> = Vec::new(); // (norm_idx, matmul_idx)
 
@@ -2597,20 +2540,7 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
     // inputs, constants, …). If the matmul's output_buffer is one of
     // these, remapping it to the elementwise op's output buffer would
     // leave the protected buffer unwritten.
-    let mut protected: HashSet<BufferRef> = HashSet::new();
-    protected.extend(plan.output_buffers.iter().copied());
-    if let Some(b) = plan.loss_buffer {
-        protected.insert(b);
-    }
-    for entry in &plan.param_buffers {
-        protected.insert(entry.1);
-    }
-    for entry in &plan.input_buffers {
-        protected.insert(entry.1);
-    }
-    for entry in &plan.constant_buffers {
-        protected.insert(entry.0);
-    }
+    let protected: HashSet<BufferRef> = plan.externally_visible_buffers();
 
     let dispatches = &mut plan.dispatches;
     // Map: output buffer → dispatch index that writes it.
@@ -2657,10 +2587,13 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
             ops: vec![Pw::LoadInput(0), pw_op],
             output: 1,
         };
-        let epilogue_dag = match d.pointwise() {
-            Some(dag) if dag.n_inputs == 1 && !dag.has_broadcast() => dag.clone(),
-            Some(_) => continue,
-            None => canonical_dag,
+        // Only a hand-written unary kernel means what its entry says. Any
+        // other generated kernel (a reduction, for one) borrows the entry
+        // as a layout sentinel and must not be read as that unary op.
+        let epilogue_dag = match d.kernel {
+            Kernel::Pointwise(ref dag) if dag.n_inputs == 1 && !dag.has_broadcast() => dag.clone(),
+            Kernel::Default => canonical_dag,
+            _ => continue,
         };
         let primary_buf = d.input_buffers[0];
         let elem_output = d.output_buffer;
