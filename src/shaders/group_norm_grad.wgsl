@@ -39,7 +39,10 @@ fn grad_input(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_
     let group_size = channels_per_group * params.spatial;
     let c_start = group * channels_per_group;
 
-    // Pass 1: compute mean and variance of x within group
+    // Pass 1: compute mean and variance of x within group. Sums are taken
+    // about the group's first element so that E[x²] − mean² does not cancel
+    // catastrophically when the mean is large next to the spread.
+    let shift = src_b[(n * params.channels + c_start) * params.spatial];
     var sum_x = 0.0;
     var sum_x2 = 0.0;
     var j = tid;
@@ -49,7 +52,7 @@ fn grad_input(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_
         let hw = j % params.spatial;
         let c = c_start + c_local;
         let idx = ((n * params.channels + c) * params.spatial) + hw;
-        let v = src_b[idx];
+        let v = src_b[idx] - shift;
         sum_x += v;
         sum_x2 += v * v;
         j += 256u;
@@ -68,8 +71,9 @@ fn grad_input(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_
         workgroupBarrier();
         stride >>= 1u;
     }
-    let mean = wg_data[0] / f32(group_size);
-    let variance = wg_data2[0] / f32(group_size) - mean * mean;
+    let shifted_mean = wg_data[0] / f32(group_size);
+    let mean = shift + shifted_mean;
+    let variance = max(wg_data2[0] / f32(group_size) - shifted_mean * shifted_mean, 0.0);
     let inv_std = inverseSqrt(variance + eps);
     workgroupBarrier();
 
@@ -149,7 +153,9 @@ fn grad_weight_bias(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invoc
     var acc_db = 0.0;
 
     for (var n = 0u; n < params.batch; n++) {
-        // Cooperative mean/var: 256 threads stride over group_size elements
+        // Cooperative mean/var: 256 threads stride over group_size elements,
+        // shifted by the group's first element as in grad_input.
+        let shift = src_b[(n * params.channels + c_start) * params.spatial];
         var local_sum = 0.0;
         var local_sum2 = 0.0;
         var j = tid;
@@ -158,7 +164,7 @@ fn grad_weight_bias(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invoc
             let cc = c_start + j / params.spatial;
             let hw = j % params.spatial;
             let idx = ((n * params.channels + cc) * params.spatial) + hw;
-            let v = src_b[idx];
+            let v = src_b[idx] - shift;
             local_sum += v;
             local_sum2 += v * v;
             j += 256u;
@@ -178,8 +184,9 @@ fn grad_weight_bias(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invoc
             workgroupBarrier();
             stride >>= 1u;
         }
-        let mean = wg_data[0] / f32(group_size);
-        let variance = wg_data2[0] / f32(group_size) - mean * mean;
+        let shifted_mean = wg_data[0] / f32(group_size);
+        let mean = shift + shifted_mean;
+        let variance = max(wg_data2[0] / f32(group_size) - shifted_mean * shifted_mean, 0.0);
         let inv_std = inverseSqrt(variance + eps);
         workgroupBarrier();
 

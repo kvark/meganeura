@@ -176,3 +176,104 @@ fn layer_norm_weight_gradient_sums_short_batches() {
         check_parameter_gradients(&format!("rows={rows}"), &graph, &parameters, &inputs, 1e-2);
     }
 }
+
+/// GroupNorm backward derived its variance as E[x²] − mean², which cancels
+/// catastrophically for activations with a large mean and can even go
+/// negative. The forward pass uses a stable form, so the two disagreed.
+#[test]
+fn group_norm_backward_is_stable_for_large_means() {
+    let (batch, channels, spatial, groups) = (2usize, 4usize, 64usize, 2usize);
+    let eps = 1e-5f32;
+    let n = batch * channels * spatial;
+    let x: Vec<f32> = values(n, 0.37, 0.2)
+        .iter()
+        .map(|v| 50.0 + v * 0.25)
+        .collect();
+    let w: Vec<f32> = values(channels, 0.9, 0.4).iter().map(|v| 1.0 + v).collect();
+    let b = values(channels, 0.5, 0.2);
+    let target = values(n, 0.23, 0.9);
+
+    let mut graph = Graph::new();
+    let xs = graph.parameter("x", &[n]);
+    let ws = graph.parameter("w", &[channels]);
+    let bs = graph.parameter("b", &[channels]);
+    let y = graph.group_norm(
+        xs,
+        ws,
+        bs,
+        batch as u32,
+        channels as u32,
+        spatial as u32,
+        groups as u32,
+        eps,
+    );
+    let t = graph.input("target", &[n]);
+    let weighted = graph.mul(y, t);
+    let loss = graph.sum_all(weighted);
+    graph.set_outputs(vec![loss]);
+
+    let mut session = meganeura::build(&graph, meganeura::SessionConfig::from_env()).0;
+    session.set_parameter("x", &x);
+    session.set_parameter("w", &w);
+    session.set_parameter("b", &b);
+    session.set_input("target", &target);
+    session.set_learning_rate(0.0);
+    session.step();
+    session.wait();
+    let mut dx = vec![0.0; n];
+    let mut dw = vec![0.0; channels];
+    let mut db = vec![0.0; channels];
+    session.read_param_grad("x", &mut dx);
+    session.read_param_grad("w", &mut dw);
+    session.read_param_grad("b", &mut db);
+
+    // f64 reference.
+    let per_group = channels / groups;
+    let group_size = per_group * spatial;
+    let mut want_dx = vec![0.0f64; n];
+    let mut want_dw = vec![0.0f64; channels];
+    let mut want_db = vec![0.0f64; channels];
+    for image in 0..batch {
+        for group in 0..groups {
+            let index = |local: usize| {
+                let c = group * per_group + local / spatial;
+                ((image * channels + c) * spatial + local % spatial, c)
+            };
+            let mean =
+                (0..group_size).map(|j| x[index(j).0] as f64).sum::<f64>() / group_size as f64;
+            let var = (0..group_size)
+                .map(|j| (x[index(j).0] as f64 - mean).powi(2))
+                .sum::<f64>()
+                / group_size as f64;
+            let inv_std = 1.0 / (var + eps as f64).sqrt();
+            let (mut mean_g, mut mean_gx) = (0.0, 0.0);
+            for j in 0..group_size {
+                let (i, c) = index(j);
+                let xhat = (x[i] as f64 - mean) * inv_std;
+                let g = target[i] as f64 * w[c] as f64;
+                mean_g += g / group_size as f64;
+                mean_gx += g * xhat / group_size as f64;
+                want_dw[c] += target[i] as f64 * xhat;
+                want_db[c] += target[i] as f64;
+            }
+            for j in 0..group_size {
+                let (i, c) = index(j);
+                let xhat = (x[i] as f64 - mean) * inv_std;
+                let g = target[i] as f64 * w[c] as f64;
+                want_dx[i] = inv_std * (g - mean_g - xhat * mean_gx);
+            }
+        }
+    }
+    let check = |name: &str, got: &[f32], want: &[f64]| {
+        let scale = want.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (g as f64 - w).abs() <= 2e-2 * scale,
+                "{name}[{i}]: got {g}, want {w} (scale {scale})"
+            );
+        }
+    };
+    check("dx", &dx, &want_dx);
+    check("dw", &dw, &want_dw);
+    check("db", &db, &want_db);
+}
