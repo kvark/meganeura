@@ -5096,6 +5096,17 @@ impl<'a> Compiler<'a> {
                 let out_h = (in_h + 2 * padding_h - kernel_h) / stride + 1;
                 let out_w = (in_w + 2 * padding_w - kernel_w) / stride + 1;
                 let batch = in_shape[0] as u32 / (channels * in_h * in_w);
+                // The kernel stages one filter in a 49-entry shared array and
+                // puts every (batch, channel) plane on the Z grid axis.
+                assert!(
+                    kernel_h * kernel_w <= 49,
+                    "depthwise convolution supports kernels up to 7x7, got {kernel_h}x{kernel_w}"
+                );
+                assert!(
+                    batch * channels <= 65535,
+                    "depthwise convolution batch * channels ({}) exceeds the portable grid limit",
+                    batch * channels
+                );
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::Conv2dDw,
                     workgroups: [out_w.div_ceil(16), out_h.div_ceil(16), batch * channels],
