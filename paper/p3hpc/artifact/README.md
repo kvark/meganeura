@@ -9,10 +9,13 @@ graphics-only qualification conditions. Inferena `06f2f800` and Meganeura
 replaces the accidental Ctrl-C campaign as a whole; its replicates are not
 spliced with earlier results. The 780M failure remains.
 
-The next collection uses v13 (Inferena `129e26af`, Meganeura `e8d7d9e`), with
+The next collection uses v13 (Inferena `757f6a8`, Meganeura `dd9bf8ac`), with
 joint graph/schedule search, a shared native deadline, and matched uniform
 parameters. It warms search comparisons for two pairs and 250 ms and held-out
-timing for five calls and two seconds. This auditor and its pinned hashes
+timing for five calls and two seconds. The separate ROCm Whisper repeatability
+investigation adds an eager efficient SDPA policy and still requires paired
+AMD qualification. Its failures and controls are not in the v10 measurement
+stream. This auditor and its pinned hashes
 still describe v10. Earlier supplementary ZIPs must be
 regenerated after the AMD replacement; they are not updated by changing these
 sources and tables.

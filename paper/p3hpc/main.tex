@@ -307,7 +307,9 @@ Inductor's internal \code{triton.cudagraphs} mechanism is disabled so the
 explicit capture is the sole replay owner. XPU uses the public math
 scaled-dot-product-attention (SDPA) backend to accommodate graph capture;
 the setting and a qualified embedding-backward workaround are recorded
-(Section~\ref{sec:availability}). Other backends retain automatic SDPA selection.
+(Section~\ref{sec:availability}). Other backends retain automatic SDPA
+selection in the timed cohort. The separate ROCm Whisper investigation in
+that section uses a different, explicitly recorded attention policy.
 MPS also compiles all requested
 phases. MPS's Inductor path is exercised \cite{pytorch2026mpssource}, but
 the pinned MPS API offers no equivalent public whole-phase replay interface.
@@ -1008,8 +1010,22 @@ claim that the device can never execute the workload.
 The ROCm-specific overrides and failures are a concrete portability cost;
 the Vulkan path does not need those overrides. Windows, meanwhile,
 completes all 30 pairs through Vulkan and compiled, replayed CUDA.
-Earlier max-autotune findings are separate from these current records.
-\footnote{\href{https://github.com/kvark/inferena/blob/06f2f800a4a57254d25b3331f1876631305a15ab/EXPERIMENT.md}{Inferena protocol and bring-up notes, revision \code{06f2f800}}.}
+Earlier max-autotune findings are separate from these current records.\footnote{\href{https://github.com/kvark/inferena/blob/06f2f800a4a57254d25b3331f1876631305a15ab/EXPERIMENT.md}{Inferena protocol and bring-up notes, revision \code{06f2f800}}.}
+
+A separate RX~7900~XT study finds a numerical portability failure in
+default-compiled PyTorch 2.13.0/ROCm 7.2. Switching to deterministic uniform
+weights (\path{name-index-uniform-v1}) exposed Whisper training drift
+already observed with sinusoidal weights. Two uncaptured strict-f32 calls
+differ by up to $1.97\times10^{-3}$, exceeding the $9.10\times10^{-6}$
+bound under unchanged tolerances before HIP capture; inference capture passes.
+With math SDPA, the fully eager encoder repeats but the compiled encoder
+does not, even when SDPA itself is eager. Eager efficient SDPA gives bit-exact
+training outputs in the reported control. The updated harness records that
+choice, retaining encoder compilation, graph replay, and numerical gates.\footnote{\href{https://github.com/kvark/inferena/blob/757f6a80b3dee2d6e9392fbbfc28e64febc9fe28/EXPERIMENT.md}{ROCm Whisper controls and reference policy, revision \code{757f6a8}}.}
+This is a data-sensitive failure in the AMD vendor stack, not a setup
+problem; the controls do not locate the underlying defect. These diagnostics
+remain separate from the timing cohort, and the workaround still needs
+paired qualification in both arithmetic contracts.
 
 MI300X exposes a different boundary: driver availability for a
 compute-focused accelerator. PyTorch/ROCm runs strict 135M on the attempted
@@ -1174,6 +1190,7 @@ sustained throughput. No outlier was removed to improve a ratio, and the
 data do not separate tuning-choice variation from changing machine state.
 
 Strict f32 constrains permissions, not operation order or bitwise identity.
+Qualification on one parameter distribution does not certify another.
 Cross-engine sampled outputs and gradient norms can miss localized or sign
 errors. Full-element replay qualification checks PyTorch against itself;
 it does not turn the cross-engine gate into an elementwise gradient

@@ -45,10 +45,13 @@ The P3HPC paper has been accepted. See the
 for venue requirements and the [current evidence guide](p3hpc/RESULTS.md)
 for the final common-revision cohort.
 
-The next collection uses Inferena protocol v13, pinned to Meganeura `e8d7d9e`:
+The next collection uses Inferena protocol v13 (`757f6a8`), pinned to Meganeura `dd9bf8ac`:
 sixteen graph/schedule forms, a shared session deadline, and a 250 ms paired
 search warmup floor. Both engines warm each measured phase for at least five
 calls and two seconds. It retains v12's matched uniform synthetic parameters.
+ROCm Whisper uses eager efficient SDPA inside the compiled encoder after a
+data-sensitive repeatability failure. The [separate qualification finding](p3hpc/RESULTS.md#rocm-whisper-repeatability-separate-qualification-finding)
+is a portability case study, not a new timing result.
 Until those results arrive, the P3HPC tables and measured methodology still
 describe v10. Do not relabel old records or mix cohorts.
 

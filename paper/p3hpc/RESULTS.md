@@ -6,15 +6,17 @@ The replacement RX 7900 XT archive is complete; it supersedes the accidentally
 interrupted upload. No old and new replicates are spliced together.
 
 The next candidate is **Inferena protocol v13**, revision
-[`129e26af`](https://github.com/kvark/inferena/blob/129e26afc77394abddf5d054871021da22d83bd4/EXPERIMENT.md)
+[`757f6a8`](https://github.com/kvark/inferena/blob/757f6a80b3dee2d6e9392fbbfc28e64febc9fe28/EXPERIMENT.md)
 on `experiment/p3hpc-cuda-graphs`, pinned to Meganeura
-`e8d7d9e3b2192671c0a9fb1aab2e3fc505153260` and Blade
+`dd9bf8acfd69918c4e4feb1db9c40a3b8f44aa36` and Blade
 `fbb4f28c4869e81ae15de58925945b423b9c1ac5`. It retains sixteen graph/schedule
 forms, interleaves graph and physical-plan choices, and warms paired
 comparisons for two pairs and 250 ms within the shared 60-second session
 deadline. Both engines still warm held-out timing for five calls and two
-seconds. Reference compilation/replay, checkpoints and numerical gates are
-unchanged. No v13 qualification or measurement campaign has been run here.
+seconds. Checkpoints, compilation deadlines, replay requirements and numerical
+gates are unchanged. ROCm Whisper now uses eager efficient SDPA inside the
+otherwise compiled encoder, following the separate failure investigation below.
+The affected AMD path still needs paired qualification in both contracts.
 Use the instructions in Inferena's `EXPERIMENT.md` to qualify each backend
 before collection. Do not relabel the paper's v10 records as v13.
 
@@ -23,6 +25,46 @@ The sinusoidal fixture was nearly rank two and also exceeded the gradient
 bounds in PyTorch f32; a GELU derivative bug was fixed independently.
 V12 introduced matched uniform parameters and pinned the fix. V13 retains
 both, rather than relaxing validation or hiding the failed qualification.
+
+## ROCm Whisper repeatability: separate qualification finding
+
+The RX 7900 XT campaign `rubik-20260923T152328187857Z-2a8cbf52` uses Inferena
+`2a8cbf52b8131223d207c054d749c715e625afec`, Meganeura `dd9bf8ac`, and PyTorch
+2.13.0+rocm7.2 / ROCm 7.2.53211. Its first four strict pairs pass. Whisper's
+PyTorch inference capture passes, but training fails at `uncaptured repeat 1
+output 0`, before training HIP capture or cross-engine validation. Meganeura
+finishes its run, but that does not establish a valid paired comparison.
+
+The failed encoder output has 576,000 elements. Maximum error is
+0.00196732 against a 9.10140e-6 bound; RMS error is 9.50484e-5 against
+3.07932e-6. There are 161,419 pointwise mismatches (28.0%); that count is
+diagnostic, not an additional acceptance gate.
+
+The AMD-side investigation identifies the switch from sinusoidal weights to
+`name-index-uniform-v1` as the point where the repeatability check began to
+fail. It reports elevated drift with the earlier weights as well. The new
+fixture exposed the failure under the unchanged tolerance rule; it does not
+locate the underlying compiler or kernel defect. Do not describe the uniform
+initializer as injecting randomness between calls: its values are fixed by
+the canonical parameter name and element index.
+
+Reported same-GPU controls distinguish math SDPA inside a compiled encoder
+(fails even when SDPA itself is eager) from eager efficient SDPA (bit-exact
+training outputs). A fully eager encoder with math SDPA also repeats exactly.
+Automatic selection passes some isolated runs but fails in the campaign;
+the enabled-backend list alone does not identify the selected kernel.
+Inferena `757f6a8` therefore records eager efficient SDPA for ROCm Whisper
+only. The encoder remains compiled, HIP replay remains enabled, and no
+tolerance is relaxed. This is a numerical portability finding in the AMD
+vendor stack, not an installation or collection setup failure.
+
+Evidence stays outside Git: `amd-dgpu-temp.tgz`, SHA-256
+`366a8d035e5a86ed7aa3cf4b37bb2183c7f0a8ca7f2f1f20d182c5eed59792fb`.
+That archive establishes the failed uniform-fixture campaign. The initializer
+bisection and backend controls were reported separately by the AMD-side
+investigation; no quantitative old/new-weight comparison is inferred from
+this archive. Neither these failures nor the passing controls enter the v10
+tables, portability scores, or supplementary measurement stream.
 
 ## Optimizer studies outside the cohort
 
