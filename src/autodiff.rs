@@ -252,7 +252,11 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // No gradient for labels (they're targets)
             }
             Op::BceLoss => {
-                // dL/dpred = grad_output · (pred - labels) / (pred * (1-pred) * N)
+                // dL/dpred = grad_output · (pred - labels) / (max(pred * (1-pred), 1e-12) * N)
+                //
+                // A saturated sigmoid gives pred exactly 0 or 1 in f32. The
+                // forward clamps pred and stays finite; the floor keeps this
+                // finite too, as PyTorch's BCE backward does.
                 let pred = node.inputs[0];
                 let labels = node.inputs[1];
                 let pred_shape = forward.nodes()[pred as usize].ty.shape.clone();
@@ -263,6 +267,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let neg_pred = graph.neg(pred);
                 let one_minus_pred = graph.add(ones, neg_pred);
                 let denom = graph.mul(pred, one_minus_pred);
+                let denom = graph.clamp(denom, 1e-12, f32::MAX);
                 let recip_denom = graph.recip(denom);
                 let inv_n = graph.constant(vec![1.0 / n as f32; n], &pred_shape);
                 let grad_pred = graph.mul(diff, recip_denom);
