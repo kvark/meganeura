@@ -396,11 +396,7 @@ pub fn magnitudes(
     inputs: &[&Tensor],
     output: &Tensor,
 ) -> Result<Vec<f64>, Error> {
-    if let Some(custom) = basic::magnitude(node, inputs, output)
-        .or_else(|| norm::magnitude(node, inputs, output))
-        .or_else(|| vision::magnitude(node, inputs, output))
-        .or_else(|| attention::magnitude(graph, node, inputs, output))
-    {
+    if let Some(custom) = custom_magnitude(graph, node, inputs, output) {
         return Ok(custom);
     }
     if is_multilinear(&node.op) {
@@ -436,8 +432,16 @@ pub fn error_scales(graph: &Graph, values: &[Tensor]) -> Result<Vec<Vec<f64>>, E
     for node in graph.nodes() {
         let inputs: Vec<&Tensor> = node.inputs.iter().map(|&i| &values[i as usize]).collect();
         let out = &values[node.id as usize];
-        let mut scale = magnitudes(graph, node, &inputs, out)?;
-        if propagates_scale(&node.op) {
+        let propagates = propagates_scale(&node.op);
+        // For a propagating op the scales of its inputs dominate their
+        // absolute values, so the op on those scales bounds the op on
+        // absolute inputs that `magnitudes` would evaluate again.
+        let mut scale = match custom_magnitude(graph, node, &inputs, out) {
+            Some(custom) => custom,
+            None if propagates => out.data.iter().map(|v| v.abs()).collect(),
+            None => magnitudes(graph, node, &inputs, out)?,
+        };
+        if propagates {
             let input_scales: Vec<Tensor> = node
                 .inputs
                 .iter()
@@ -488,6 +492,19 @@ fn propagates_scale(op: &Op) -> bool {
                 | Op::Embedding
                 | Op::PrefixLast
         )
+}
+
+/// An op-specific error scale, where one is defined.
+fn custom_magnitude(
+    graph: &Graph,
+    node: &Node,
+    inputs: &[&Tensor],
+    output: &Tensor,
+) -> Option<Vec<f64>> {
+    basic::magnitude(node, inputs, output)
+        .or_else(|| norm::magnitude(node, inputs, output))
+        .or_else(|| vision::magnitude(node, inputs, output))
+        .or_else(|| attention::magnitude(graph, node, inputs, output))
 }
 
 /// Ops whose outputs are sums of products of their inputs, so that the op

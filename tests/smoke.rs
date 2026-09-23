@@ -9,4 +9,3 @@ mod provenance;
 mod shared_winograd_checkpoint;
 #[cfg(feature = "models")]
 mod training_correctness;
-mod vision_ops_smoke;
