@@ -15,10 +15,10 @@
 - Spread global and adaptive gradient clipping, and large whole-tensor sums,
   across many workgroups instead of one per tensor.
 - Reduce per-channel bias gradients in place instead of transposing them,
-  compute GroupNorm backward statistics once, reduce attention's dot(dO, O)
-  once for the dK/dV kernels, fold row blocks in norm weight gradients, pool
-  wide planes with a workgroup each, tile transposes, and read the logits
-  twice rather than three times in cross-entropy.
+  compute GroupNorm backward statistics once, share attention's dot(dO, O)
+  between dQ and dK/dV to preserve parallel execution, fold row blocks in
+  norm weight gradients, pool wide planes with a workgroup each, tile
+  transposes, and read the logits twice rather than three times in cross-entropy.
 
 - Search matrix tiles, K staging, unrolling and split-K as e-graph alternatives,
   preserving logical fusion choices and qualifying complete implementations.
