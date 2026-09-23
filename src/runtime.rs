@@ -7618,7 +7618,7 @@ impl Session {
                         dst: buf(dispatch.output_buffer),
                         params: UnaryParams {
                             len: dispatch.params[0],
-                            _pad0: 0,
+                            _pad0: dispatch.params.get(1).copied().unwrap_or(0), // mean divisor
                             _pad1: 0,
                             _pad2: 0,
                         },

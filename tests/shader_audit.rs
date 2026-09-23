@@ -871,3 +871,42 @@ fn bce_gradient_is_finite_for_saturated_predictions() {
         );
     }
 }
+
+/// Large sums and means split across workgroups and finish in a second
+/// dispatch; small ones keep the single-workgroup kernel.
+#[test]
+fn whole_tensor_sums_match_reference() {
+    for n in [1000usize, 70_000, 1_000_003] {
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[n]);
+        let sum = graph.sum_all(x);
+        let mean = graph.mean_all(x);
+        graph.set_outputs(vec![sum, mean]);
+        let (mut session, _) = meganeura::build(
+            &graph,
+            meganeura::SessionConfig {
+                mode: meganeura::Mode::Inference,
+                ..meganeura::SessionConfig::default()
+            },
+        );
+        let xs = values(n, 0.013, 0.2);
+        session.set_input("x", &xs);
+        session.step();
+        session.wait();
+        let want: f64 = xs.iter().map(|&v| v as f64).sum();
+        let mut got = [0.0f32];
+        session.read_output_by_index(0, &mut got);
+        assert!(
+            (got[0] as f64 - want).abs() < 1e-3,
+            "n={n} sum: {} vs {want}",
+            got[0]
+        );
+        session.read_output_by_index(1, &mut got);
+        let want_mean = want / n as f64;
+        assert!(
+            (got[0] as f64 - want_mean).abs() < 1e-7,
+            "n={n} mean: {} vs {want_mean}",
+            got[0]
+        );
+    }
+}
