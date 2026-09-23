@@ -1,10 +1,10 @@
 // Cross-entropy loss with fused softmax gradient.
 //
 // For each batch item:
-//   1. Parallel max reduction over features (numerical stability)
-//   2. Parallel sum-exp reduction
-//   3. Parallel Σ(labels) reduction  ← generalizes to arbitrary label weights
-//   4. Parallel gradient output + serial loss accumulation
+//   1. One pass over logits and labels: online max / sum-exp (the running
+//      sum is rescaled whenever the running max grows) and Σ(labels),
+//      combined across lanes in a single tree
+//   2. One pass writing the gradient and accumulating the loss
 //
 // Forward:  L = -Σ labels · log_softmax(logits)
 // Gradient: ∂L/∂logits_j = softmax_j · S − labels_j,  where S = Σ_i labels_i.
@@ -31,6 +31,8 @@ var<storage, read_write> grad_out: array<f32>;
 var<storage, read_write> loss_out: array<f32>;
 var<uniform> params: Params;
 var<workgroup> wg_buf: array<f32, 256>;
+var<workgroup> wg_sum: array<f32, 256>;
+var<workgroup> wg_labels: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn main(
@@ -41,72 +43,46 @@ fn main(
     let features = params.features;
     let offset = b * features;
 
-    // === Pass 1: parallel max reduction ===
-    var local_max = -3.402823e+38; // -FLT_MAX
+    // === Pass 1: online max / sum-exp and Σ(labels) ===
+    // Starting from -FLT_MAX rather than -inf keeps exp(x - max) defined
+    // when a lane sees no finite logit.
+    var local_max = -3.402823e+38;
+    var local_sum = 0.0;
+    var local_label_sum = 0.0;
     var j = tid;
     loop {
         if j >= features { break; }
-        local_max = max(local_max, logits[offset + j]);
-        j += 256u;
-    }
-    wg_buf[tid] = local_max;
-    workgroupBarrier();
-
-    // Tree reduction for max
-    for (var s = 128u; s > 0u; s >>= 1u) {
-        if tid < s {
-            wg_buf[tid] = max(wg_buf[tid], wg_buf[tid + s]);
+        let x = logits[offset + j];
+        if x > local_max {
+            local_sum = local_sum * exp(local_max - x) + 1.0;
+            local_max = x;
+        } else {
+            local_sum += exp(x - local_max);
         }
-        workgroupBarrier();
-    }
-    let max_val = wg_buf[0];
-    workgroupBarrier();
-
-    // === Pass 2: parallel sum-exp reduction ===
-    var local_sum = 0.0;
-    j = tid;
-    loop {
-        if j >= features { break; }
-        local_sum += exp(logits[offset + j] - max_val);
-        j += 256u;
-    }
-    wg_buf[tid] = local_sum;
-    workgroupBarrier();
-
-    // Tree reduction for sum
-    for (var s = 128u; s > 0u; s >>= 1u) {
-        if tid < s {
-            wg_buf[tid] += wg_buf[tid + s];
-        }
-        workgroupBarrier();
-    }
-    let log_sum_exp = log(wg_buf[0]) + max_val;
-    workgroupBarrier();
-
-    // === Pass 3: parallel Σ(labels) reduction ===
-    // Needed for the generalized gradient `softmax·S − labels`, which reduces
-    // to the standard form `softmax − labels` when labels is a probability
-    // distribution (S=1) and to the correct policy-gradient magnitudes when
-    // labels carry per-class weights (S≠1).
-    var local_label_sum = 0.0;
-    j = tid;
-    loop {
-        if j >= features { break; }
         local_label_sum += labels[offset + j];
         j += 256u;
     }
-    wg_buf[tid] = local_label_sum;
+    wg_buf[tid] = local_max;
+    wg_sum[tid] = local_sum;
+    wg_labels[tid] = local_label_sum;
     workgroupBarrier();
+
     for (var s = 128u; s > 0u; s >>= 1u) {
         if tid < s {
-            wg_buf[tid] += wg_buf[tid + s];
+            let max_a = wg_buf[tid];
+            let max_b = wg_buf[tid + s];
+            let merged = max(max_a, max_b);
+            wg_sum[tid] = wg_sum[tid] * exp(max_a - merged) + wg_sum[tid + s] * exp(max_b - merged);
+            wg_buf[tid] = merged;
+            wg_labels[tid] += wg_labels[tid + s];
         }
         workgroupBarrier();
     }
-    let label_sum = wg_buf[0];
+    let log_sum_exp = log(wg_sum[0]) + wg_buf[0];
+    let label_sum = wg_labels[0];
     workgroupBarrier();
 
-    // === Pass 4: parallel gradient + partial loss ===
+    // === Pass 2: parallel gradient + partial loss ===
     let inv_batch = 1.0 / f32(params.batch);
     var local_loss = 0.0;
     j = tid;
