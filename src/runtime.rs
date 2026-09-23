@@ -2527,6 +2527,13 @@ pub struct SessionOptions {
     pub no_alias: bool,
     /// Keep every buffer host-visible instead of device-local.
     pub no_device_local: bool,
+    /// Fill every allocation that holds no parameter with NaN (all bits set)
+    /// instead of zero at session build. Constants are still uploaded, and
+    /// inputs are whatever the caller writes. A kernel that reads memory no
+    /// dispatch wrote — padding beyond a logical extent, a buffer another
+    /// tenant of its allocation left behind, a fused-away producer — then
+    /// yields NaN instead of a plausible zero. Testing aid.
+    pub poison: bool,
     /// Skip zeroing named parameter buffers during session construction.
     ///
     /// This is disabled by default so an unset parameter has deterministic
@@ -3388,6 +3395,10 @@ impl Session {
             .enumerate()
             .map(|(index, _)| !opts.skip_parameter_zero || !parameter_allocations[index])
             .collect();
+        let fill_byte: Vec<u8> = parameter_allocations
+            .iter()
+            .map(|&parameter| if opts.poison && !parameter { 0xFF } else { 0 })
+            .collect();
         let shared_zero_allocations = alias
             .device_local
             .iter()
@@ -3481,7 +3492,11 @@ impl Session {
             for (index, buffer) in physical_buffers.iter().enumerate() {
                 if !alias.device_local[index] && zero_on_init[index] {
                     unsafe {
-                        std::ptr::write_bytes(buffer.handle.data(), 0, alias.sizes[index].max(4));
+                        std::ptr::write_bytes(
+                            buffer.handle.data(),
+                            fill_byte[index],
+                            alias.sizes[index].max(4),
+                        );
                     }
                 }
             }
@@ -3558,7 +3573,7 @@ impl Session {
                 for (i, &device_local) in alias.device_local.iter().enumerate() {
                     if device_local && zero_on_init[i] {
                         let size = alias.sizes[i].max(4) as u64;
-                        transfer.fill_buffer(physical_buffers[i].handle.at(0), size, 0);
+                        transfer.fill_buffer(physical_buffers[i].handle.at(0), size, fill_byte[i]);
                     }
                 }
             }

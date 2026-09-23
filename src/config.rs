@@ -150,6 +150,8 @@ registry! {
         "Enable the experimental reduced-precision cooperative flash backward.";
     NO_ALIAS: "MEGANEURA_NO_ALIAS", Bool, Diagnostic,
         "Disable buffer lifetime aliasing; every logical buffer gets its own allocation.";
+    POISON: "MEGANEURA_POISON", Bool, Diagnostic,
+        "Fill every non-parameter buffer with NaN at session build, so a kernel that reads memory nothing wrote produces NaN instead of a plausible zero.";
     NO_DEVICE_LOCAL: "MEGANEURA_NO_DEVICE_LOCAL", Bool, Diagnostic,
         "Keep all buffers host-visible instead of device-local.";
     SERIAL_DISPATCH: "MEGANEURA_SERIAL_DISPATCH", Bool, Diagnostic,
@@ -344,6 +346,7 @@ impl SessionOptions {
             // agree by construction on this path.
             gpu_timing: GPU_TIMING.bool_or(false),
             no_alias: NO_ALIAS.bool_or(false),
+            poison: POISON.bool_or(false),
             no_device_local: NO_DEVICE_LOCAL.bool_or(false),
             skip_parameter_zero: false,
             serial_dispatch: SERIAL_DISPATCH.bool_or(false),
