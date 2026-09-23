@@ -661,7 +661,6 @@ pub enum ShaderGroup {
     GlobalAvgPool,
     GlobalAvgPoolGrad,
     PairwiseGrad,
-    GradClipZero,
     GradClipNormSq,
     GradClipScale,
     AdaptiveGradClip,
@@ -849,7 +848,6 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
             ShaderModule::new(include_str!("shaders/global_avg_pool_grad.wgsl"))
         }
         ShaderGroup::PairwiseGrad => ShaderModule::new(include_str!("shaders/pairwise_grad.wgsl")),
-        ShaderGroup::GradClipZero => ShaderModule::new(include_str!("shaders/grad_clip_zero.wgsl")),
         ShaderGroup::GradClipNormSq => {
             ShaderModule::new(include_str!("shaders/grad_clip_norm_sq.wgsl"))
         }
@@ -6539,10 +6537,6 @@ mod tests {
                 naga::valid::Capabilities::empty(),
             ),
             (
-                ShaderGroup::GradClipZero,
-                naga::valid::Capabilities::empty(),
-            ),
-            (
                 ShaderGroup::GradClipNormSq,
                 naga::valid::Capabilities::empty(),
             ),
@@ -6895,7 +6889,6 @@ mod tests {
             (ShaderGroup::BceLoss, empty),
             (ShaderGroup::GlobalAvgPoolGrad, empty),
             (ShaderGroup::PairwiseGrad, empty),
-            (ShaderGroup::GradClipZero, empty),
             (ShaderGroup::GradClipNormSq, empty),
             (ShaderGroup::GradClipScale, empty),
             (ShaderGroup::AdaptiveGradClip, empty),
@@ -7152,7 +7145,6 @@ mod tests {
                     vec!["matrix_a", "matrix_b", "matrix_c", "params"]
                 }
                 ShaderEntry::WinogradWeightTransform => vec!["src", "dst", "params"],
-                ShaderEntry::GradClipZero => vec!["acc"],
                 ShaderEntry::GradClipNormSq => vec!["grad", "acc", "params"],
                 ShaderEntry::GradClipScale => vec!["grad", "acc", "params"],
                 ShaderEntry::AdaptiveGradClip => vec!["param", "grad", "params"],
@@ -7186,7 +7178,6 @@ mod tests {
             ShaderEntry::BiasAdd,
             ShaderEntry::BiasMul,
             ShaderEntry::SgdUpdate,
-            ShaderEntry::GradClipZero,
             ShaderEntry::GradClipNormSq,
             ShaderEntry::GradClipScale,
             ShaderEntry::AdaptiveGradClip,
