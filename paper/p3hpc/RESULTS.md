@@ -6,18 +6,19 @@ The replacement RX 7900 XT archive is complete; it supersedes the accidentally
 interrupted upload. No old and new replicates are spliced together.
 
 The next candidate is **Inferena protocol v14**, revision
-[`e5d5952`](https://github.com/kvark/inferena/blob/e5d5952f4747cb0904f796b0e6c387d1ed5bb5b4/EXPERIMENT.md)
+[`65a8623`](https://github.com/kvark/inferena/blob/65a86235a0fa3964fe147fd678c2334a49ef6f99/EXPERIMENT.md)
 on `experiment/p3hpc-cuda-graphs`, pinned to Meganeura
-`2fc49b4a6968f2a6f5ced491346110b6718c88dd` and Blade
+`c475fd0e05f72929eca3bf994584805596b80b8c` and Blade
 `fbb4f28c4869e81ae15de58925945b423b9c1ac5`. It retains sixteen graph/schedule
 forms, interleaves graph and physical-plan choices, and warms paired
 comparisons for two pairs and 250 ms within the shared 60-second session
 deadline. Both engines still warm held-out timing for five calls and two
 seconds. Checkpoints, compilation deadlines, replay requirements and numerical
 gates are unchanged. The pin includes #211's reference suite and runtime
-correctness fixes. Uncaptured PyTorch calls now receive the same full-tensor
-repeatability checks as captured calls. Failed compiled phases retain their
-failure, without discarding previously qualified inference. One separate
+correctness fixes, plus #212's reference-check guards. Uncaptured PyTorch calls
+now receive the same full-tensor repeatability checks as captured calls.
+Failed compiled phases retain their failure, without discarding previously
+qualified inference. One separate
 eager/math diagnostic may validate native results, but never supplies compiled
 timings. The remaining planned conditions continue after classified numerical
 failures; unknown execution faults still stop collection. Incomplete phase
@@ -52,8 +53,9 @@ error bound accepted arbitrary finite errors. Follow-up
 `4c6925bd0d8f1ce07a0f9ae7809e84dffeed366e`, checks those contracts and gradient
 inventory lengths. It also avoids reading a nonexistent gradient for packed
 parameters that are observed outputs but do not reach the loss. This follow-up
-changes reference checks and tests, not production kernels; it is not yet the
-Inferena dependency pin.
+changes reference checks and tests, not production kernels. It merged as
+`c475fd0e05f72929eca3bf994584805596b80b8c` and is now the Inferena dependency pin;
+the before/after runtime study below concerns #211, not this test-only follow-up.
 
 Focused operator, block and regression checks passed on RTX 5070 and Arc B570.
 The four follow-up guard/smoke cases passed on both. A 24-case NVIDIA
@@ -87,6 +89,8 @@ series changes from 6.271 to 6.173 ms. Training changes by -0.3% to +1.3%.
 Preparation changes by at most 1.5%, but a brief CPU build overlapped the first
 NVIDIA Whisper calibration, so these are not clean preparation-cost ablations.
 None of these spot timings enter the paper's cohort tables.
+The repeated NVIDIA checks below supersede the single-process performance
+interpretation, without discarding these original observations.
 
 Fresh strict PyTorch qualification passed all phases for Whisper on both GPUs
 and StableDiffusion on NVIDIA. Intel StableDiffusion exhausted the 120-second
@@ -106,6 +110,55 @@ eager timing substitution and reuse of incomplete replicate groups. Clippy
 passed for the harness and the reference-test target. Raw diagnostics remain
 outside Git under `/var/tmp/meganeura-pr211.viemZ0` on zork; only methods,
 revisions, findings and summary values are retained here.
+
+### NVIDIA repetition and kernel-cost check
+
+Two additional fresh processes per revision and model used the exact same
+binaries and settings as above. The second pair ran after/before and the third
+before/after, with no concurrent builds or GPU work. Each process still includes
+full search, qualification, five-call/two-second warmup, and 20 held-out samples.
+The original process remains included; no run was discarded or retried.
+
+| Model | Before: process inference medians (ms) | After: process inference medians (ms) | Change of medians |
+|---|---|---|---:|
+| Whisper-tiny | 5.804, 6.246, 6.238 | 6.193, 6.168, 6.206 | -0.7% |
+| StableDiffusion | 1.618, 1.607, 1.618 | 1.734, 1.673, 1.731 | +7.0% |
+
+Whisper's apparent regression does not reproduce. Its first process selected an
+additional private matrix-kernel change and returned a faster first inference
+series; the same session's later latency series was already 6.271 ms. The two
+new before/after pairs select the same kernel changes and are within 1.3%.
+Median training is 28.563 → 28.499 ms for Whisper and 7.105 → 7.136 ms for
+StableDiffusion. All new post-fix runs retain full-tensor candidate qualification
+and pass the existing sampled-output/gradient-norm comparison against the
+preserved strict CUDA PyTorch reference.
+
+StableDiffusion is slower at the default tuned policy in this small repeat.
+All three pre-fix inference sessions select graph 1 with eight submission chunks.
+Post-fix sessions select four, eight and four chunks respectively. In the first
+post-fix search, eight chunks measured 1.68765 ms against four chunks at 1.74201 ms,
+but was rejected by the unchanged 5% minimum-improvement floor plus measured
+noise margin. The first pre-fix search instead rejected the intermediate
+four-chunk candidate and later accepted eight chunks against a slower incumbent.
+This illustrates sensitivity to earlier search decisions; it does not isolate
+the cost of more accurate arithmetic. The floor and all collection settings
+remain unchanged in the new pin.
+
+A separate diagnostic disables measured construction in both arms and collects
+eight per-pass timestamp samples from each ordinary plan, one process per arm.
+It is not a replacement benchmark or a matched-plan measurement of the tuned
+winner. Both revisions have 55 dispatches for Whisper and 229 for StableDiffusion.
+Whisper's timestamped GPU total is 5.809 → 5.804 ms; its normalization family is
+0.129 → 0.111 ms. StableDiffusion's GPU total is 2.272 → 2.308 ms (+1.6%), with
+normalization at 0.233 → 0.252 ms, about 19 µs more. This supports a modest
+normalization cost on Diffusion, alongside the separate tuning-selection effect.
+Do not subtract these instrumented, untuned totals from tuned wall times to
+attribute the remainder to barriers or CPU overhead.
+
+The repeat and profiling artifacts remain outside Git at
+`/var/tmp/meganeura-pr211-repeat.KAcYQO` on zork. No new cohort was collected.
+The newly merged #212 changes only the reference validator/tests, not the
+runtime paths measured in this #211 comparison.
 
 ## ROCm Whisper repeatability: separate qualification finding
 
