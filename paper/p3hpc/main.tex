@@ -256,6 +256,61 @@ with private probes. Paired whole-program comparisons require two warmup
 pairs and 250\,ms, subject to that deadline. These changes are not results
 of the frozen cohort.
 
+\section{Checking the Compiler and Its Kernels}
+\label{sec:validation}
+
+Agreement between two frameworks is useful evidence, but it does not tell
+us which one is wrong when they disagree. Repeating a result is weaker
+still: a deterministic indexing error repeats perfectly. We therefore
+separate three checks in \system{}'s development suite. This suite was
+added after the cohort reported below; it is not a retrospective certificate
+for those binaries.\footnote{\href{https://github.com/kvark/meganeura/tree/2fc49b4a6968f2a6f5ced491346110b6718c88dd/src/reference}{Reference interpreter and checks at revision \code{2fc49b4}}.}
+
+First, a simple CPU interpreter evaluates graph operators in 64-bit
+floating point, without sharing GPU lowering or shader code. Inputs are
+rounded to their declared storage precision before evaluation. We compare
+symbolic derivatives evaluated by this interpreter with central finite
+differences. Nonuniform weighted losses exercise gradients other than
+the special case of an all-ones upstream derivative; directional probes
+check combinations of parameter elements. These tests exclude GPU execution
+as a cause, although reference mistakes, finite-difference error, and
+nondifferentiable inputs still need to be considered.
+
+Second, operator-family sweeps compare every GPU output element and
+parameter-gradient element with the interpreter. Shapes exercise tile
+edges, reduction splits, and alternative lowerings. The default comparison
+uses per-element magnitude scales, including sums of absolute products
+for cancellation-prone reductions. This is a practical error model, not
+a proved bound for every fused computation. Third, composed blocks and
+seeded random graphs pass through differentiation, e-graph optimization,
+dispatch fusion, and memory planning. Their outputs and gradients are
+compared with the unoptimized reference, including gradients packed by
+the optimizer. Nonparameter storage is initially filled with NaNs to expose
+missing writes and invalid reuse.
+
+These checks found dropped parameter gradients during fusion, loss
+reductions that were not scalar, cancellation in normalization, and
+vanishing GELU tails. They complement the broad state, checkpoint, loader,
+and profiling tests rather than adding a separate executable for each bug.
+An exhaustive operator match requires an explicit reference case or an
+unsupported result when the IR grows; packed quantized formats remain
+unsupported. Passing the tested graphs does not establish coverage of all
+shapes, schedules, drivers, or devices.
+
+The interpreter is a development tool, not a full-model oracle in the
+timing loop. The benchmark instead applies fixed repeatability and
+cross-engine gates (Section~\ref{sec:gates}). Its follow-up collector
+treats a failed reference as an outcome: qualified inference remains
+available if training fails, and the failed compiled phase retains no
+accepted timing. One fresh eager, uncaptured PyTorch process with math
+attention checks the same weights, inputs, device, and arithmetic contract.
+It must pass the same repeatability gates before serving as a separate
+correctness reference. It never supplies replacement compiled timings.
+Unexplained execution faults stop collection; classified numerical failures
+do not prevent the remaining planned conditions from running. Failed and
+unreached phases remain in the coverage counts, and incomplete replicate
+groups stay out of aggregate speed comparisons.
+
 \section{Methodology}
 \label{sec:method}
 
@@ -370,6 +425,7 @@ expose no implementation that engages them.
 No quantization or persistent f16 tensor storage is enabled.
 
 \subsection{Independent numerical gates}
+\label{sec:gates}
 
 Cross-engine forward validation checks shape, relative L2 error below
 1\% over 256 evenly spaced output samples, and relative scalar-loss
@@ -404,8 +460,9 @@ Strict gradients use those bounds per parameter and over the whole gradient;
 accelerated gradients use whole-gradient bounds with coefficient $10^{-2}$.
 Ordinary repeatability and replay errors are recorded separately against
 the first uncaptured result.
-Capture or validation failures abort the requested condition; no eager
-timing replaces a failed graph run.
+In the reported cohort, capture or validation failures abort collection;
+no eager timing replaces a failed graph run. The later phase-level failure
+policy in Section~\ref{sec:validation} does not change these archived results.
 The retained reports establish that this qualification ran, but do not
 contain all tensor elements for independent offline revalidation.
 

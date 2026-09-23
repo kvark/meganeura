@@ -5,27 +5,107 @@ graphics-only qualification, and the earlier H100 size study separate.
 The replacement RX 7900 XT archive is complete; it supersedes the accidentally
 interrupted upload. No old and new replicates are spliced together.
 
-The next candidate is **Inferena protocol v13**, revision
-[`757f6a8`](https://github.com/kvark/inferena/blob/757f6a80b3dee2d6e9392fbbfc28e64febc9fe28/EXPERIMENT.md)
+The next candidate is **Inferena protocol v14**, revision
+[`e5d5952`](https://github.com/kvark/inferena/blob/e5d5952f4747cb0904f796b0e6c387d1ed5bb5b4/EXPERIMENT.md)
 on `experiment/p3hpc-cuda-graphs`, pinned to Meganeura
-`dd9bf8acfd69918c4e4feb1db9c40a3b8f44aa36` and Blade
+`2fc49b4a6968f2a6f5ced491346110b6718c88dd` and Blade
 `fbb4f28c4869e81ae15de58925945b423b9c1ac5`. It retains sixteen graph/schedule
 forms, interleaves graph and physical-plan choices, and warms paired
 comparisons for two pairs and 250 ms within the shared 60-second session
 deadline. Both engines still warm held-out timing for five calls and two
 seconds. Checkpoints, compilation deadlines, replay requirements and numerical
-gates are unchanged. ROCm Whisper now uses eager efficient SDPA inside the
-otherwise compiled encoder, following the separate failure investigation below.
-That policy also failed a later AMD run. The affected path remains unqualified;
+gates are unchanged. The pin includes #211's reference suite and runtime
+correctness fixes. Uncaptured PyTorch calls now receive the same full-tensor
+repeatability checks as captured calls. Failed compiled phases retain their
+failure, without discarding previously qualified inference. One separate
+eager/math diagnostic may validate native results, but never supplies compiled
+timings. The remaining planned conditions continue after classified numerical
+failures; unknown execution faults still stop collection. Incomplete phase
+replicate groups are excluded from performance aggregates.
+ROCm Whisper returns to ordinary compiled automatic SDPA: the eager-efficient
+workaround did not restore repeatability. The failure remains unresolved;
 an isolated passing retry does not establish a fix.
 Use the instructions in Inferena's `EXPERIMENT.md` to qualify each backend
-before collection. Do not relabel the paper's v10 records as v13.
+before collection. Do not relabel the paper's v10 records as v14.
 
 The v11 B570 StableDiffusion gradient failure was investigated separately.
 The sinusoidal fixture was nearly rank two and also exceeded the gradient
 bounds in PyTorch f32; a GELU derivative bug was fixed independently.
-V12 introduced matched uniform parameters and pinned the fix. V13 retains
-both, rather than relaxing validation or hiding the failed qualification.
+V12 introduced matched uniform parameters and pinned the fix. Later candidates
+retain both, rather than relaxing validation or hiding the failed qualification.
+
+## Reference-suite review and timing checks: September 23
+
+Merged [#211](https://github.com/kvark/meganeura/pull/211) adds an independent
+f64 graph interpreter, finite-difference checks of symbolic derivatives,
+GPU comparisons of complete outputs and gradients, and composed/random graph
+checks through the compiler. It also fixes production code: gradient-observable
+fusion, scalar loss reductions, normalization cancellation, GELU tails, RoPE
+indexing, and cooperative-convolution bounds. It is not just a test-only change.
+The new paper section describes these checks separately from the benchmark's
+sampled cross-engine comparison and full-tensor repeatability gates.
+
+Review found two ways the comparison helper could accept unchecked values:
+zipping a short error-scale array silently omitted elements, and an infinite
+error bound accepted arbitrary finite errors. Follow-up
+[#212](https://github.com/kvark/meganeura/pull/212), revision
+`4c6925bd0d8f1ce07a0f9ae7809e84dffeed366e`, checks those contracts and gradient
+inventory lengths. It also avoids reading a nonexistent gradient for packed
+parameters that are observed outputs but do not reach the loss. This follow-up
+changes reference checks and tests, not production kernels; it is not yet the
+Inferena dependency pin.
+
+Focused operator, block and regression checks passed on RTX 5070 and Arc B570.
+The four follow-up guard/smoke cases passed on both. A 24-case NVIDIA
+normalization sweep also passed, with a driver-lifetime diagnostic workaround:
+repeated context creation in the test executable can fail to load
+`libnvidia-tls.so.595.91.07` because its static TLS block cannot be allocated.
+Preloading `libGLX_nvidia.so.0` kept the driver loaded and avoided that failure.
+The benchmark runs did **not** use this preload. The existing Naga workgroup
+layout validation warnings remain. These are targeted checks, not a full-suite
+or all-platform correctness certificate.
+
+Strict-f32 timing checks used the unchanged native Inferena runner with
+Meganeura [before #211](https://github.com/kvark/meganeura/tree/dd9bf8acfd69918c4e4feb1db9c40a3b8f44aa36)
+and [after #211](https://github.com/kvark/meganeura/tree/2fc49b4a6968f2a6f5ced491346110b6718c88dd).
+Both binaries matched explicit clean builds of their declared dependency pins.
+Measured construction stayed enabled with the usual 60-second session search,
+at least five calls and two seconds of held-out warmup, and 20 timed samples.
+GPUs and revisions ran serially, one process per condition.
+
+| GPU / model | Inference before → after (ms) | Training before → after (ms) |
+|---|---:|---:|
+| RTX 5070 / Whisper-tiny | 5.804 → 6.193 | 28.599 → 28.522 |
+| RTX 5070 / StableDiffusion | 1.618 → 1.734 | 7.066 → 7.136 |
+| Arc B570 / Whisper-tiny | 13.879 → 13.902 | 95.179 → 95.322 |
+| Arc B570 / StableDiffusion | 2.999 → 2.996 | 12.097 → 12.252 |
+
+Intel inference is essentially unchanged in these samples; NVIDIA inference
+is 6.7–7.2% slower. This warrants replication, not a confirmed regression claim:
+there is only one fresh process per arm, and NVIDIA Whisper's same-shape latency
+series changes from 6.271 to 6.173 ms. Training changes by -0.3% to +1.3%.
+Preparation changes by at most 1.5%, but a brief CPU build overlapped the first
+NVIDIA Whisper calibration, so these are not clean preparation-cost ablations.
+None of these spot timings enter the paper's cohort tables.
+
+Fresh strict PyTorch qualification passed all phases for Whisper on both GPUs
+and StableDiffusion on NVIDIA. Intel StableDiffusion exhausted the 120-second
+compile limit with `TORCHINDUCTOR_COMPILE_THREADS=1`, used here to limit host RAM.
+That failed result was retained. A separate eager/math, uncaptured Intel process
+passed full-tensor repeatability, and served only as a correctness reference.
+All four native comparisons passed the existing cross-engine gates: sampled
+output relative-L2 errors were 3.3e-6–1.5e-5 and parameter-gradient-norm vector
+errors were 3.3e-7–1.6e-6. This does not claim full-vector agreement across engines,
+nor a passing compiled Intel StableDiffusion condition. No AMD, Apple, Windows,
+accelerated-mode or larger-model qualification was run here.
+
+Inferena's nine Python tests, including actual CUDA replay and a deliberately
+drifting CPU training model, and its nine Rust harness tests passed. The drift
+test preserves qualified inference and rejects training; receipt tests prevent
+eager timing substitution and reuse of incomplete replicate groups. Clippy
+passed for the harness and the reference-test target. Raw diagnostics remain
+outside Git under `/var/tmp/meganeura-pr211.viemZ0` on zork; only methods,
+revisions, findings and summary values are retained here.
 
 ## ROCm Whisper repeatability: separate qualification finding
 
