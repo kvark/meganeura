@@ -188,13 +188,14 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
             }
             Op::Relu => {
-                // dL/dx = dL/dy * (x > 0)
+                // dL/dx = dL/dy * (x > 0). With y = max(x, 0), y > 0 exactly
+                // when x > 0, so take the mask from the output: the next
+                // layer keeps y alive anyway, while x can then be freed or
+                // fused into the ReLU.
                 let x = node.inputs[0];
-                let zero = graph.constant(
-                    vec![0.0; forward.nodes()[x as usize].ty.num_elements()],
-                    &forward.nodes()[x as usize].ty.shape,
-                );
-                let mask = graph.greater(x, zero);
+                let y = node.id;
+                let zero = graph.constant(vec![0.0; node.ty.num_elements()], &node.ty.shape);
+                let mask = graph.greater(y, zero);
                 let grad_x = graph.mul(grad_output, mask);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
