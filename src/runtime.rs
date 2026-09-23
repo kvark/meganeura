@@ -842,6 +842,15 @@ struct MaxPool2dParams {
     _pad1: u32,
 }
 
+// max_pool_2d_grad: var grad_out, src, dst, params
+#[derive(blade_macros::ShaderData)]
+struct MaxPool2dGradData {
+    grad_out: blade_graphics::BufferPiece,
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: MaxPool2dParams,
+}
+
 // global_avg_pool: var src, dst, params
 #[derive(blade_macros::ShaderData)]
 struct GlobalAvgPoolData {
@@ -1981,6 +1990,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::ChunkedRelativeAttention => ChunkedRelativeAttentionData::layout(),
         ShaderEntry::PrefixLast => PrefixLastData::layout(),
         ShaderEntry::MaxPool2d => MaxPool2dData::layout(),
+        ShaderEntry::MaxPool2dGrad => MaxPool2dGradData::layout(),
         ShaderEntry::GlobalAvgPool => GlobalAvgPoolData::layout(),
         ShaderEntry::GlobalAvgPoolGrad => UnaryData::layout(),
         ShaderEntry::WinogradInputTransform
@@ -8432,6 +8442,31 @@ impl Session {
                             out_w: dispatch.params[9],
                             _pad0: dispatch.params[10],
                             _pad1: dispatch.params[11],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::MaxPool2dGrad => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &MaxPool2dGradData {
+                        grad_out: buf(dispatch.input_buffers[0]),
+                        src: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: MaxPool2dParams {
+                            batch: p[0],
+                            channels: p[1],
+                            in_h: p[2],
+                            in_w: p[3],
+                            kernel_h: p[4],
+                            kernel_w: p[5],
+                            stride: p[6],
+                            padding: p[7],
+                            out_h: p[8],
+                            out_w: p[9],
+                            _pad0: p[10],
+                            _pad1: p[11],
                         },
                     },
                 );

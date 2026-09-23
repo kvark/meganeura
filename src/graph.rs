@@ -642,6 +642,18 @@ pub enum Op {
         padding: u32,
     },
 
+    /// Backward of MaxPool2d. Inputs: `[grad_output, input]`; routes each
+    /// output gradient to its window's first maximum.
+    MaxPool2dGrad {
+        channels: u32,
+        in_h: u32,
+        in_w: u32,
+        kernel_h: u32,
+        kernel_w: u32,
+        stride: u32,
+        padding: u32,
+    },
+
     /// Global average pooling: `input[N*C*H*W]` → `output[N*C]`
     /// Averages over the spatial dimensions (H,W) for each channel.
     GlobalAvgPool {

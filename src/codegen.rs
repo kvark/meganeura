@@ -658,6 +658,7 @@ pub enum ShaderGroup {
     PrefixLast,
     RoPEDynamic,
     MaxPool2d,
+    MaxPool2dGrad,
     GlobalAvgPool,
     GlobalAvgPoolGrad,
     PairwiseGrad,
@@ -841,6 +842,9 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         ShaderGroup::PrefixLast => ShaderModule::new(include_str!("shaders/prefix_last.wgsl")),
         ShaderGroup::RoPEDynamic => ShaderModule::new(include_str!("shaders/rope_dynamic.wgsl")),
         ShaderGroup::MaxPool2d => ShaderModule::new(include_str!("shaders/max_pool_2d.wgsl")),
+        ShaderGroup::MaxPool2dGrad => {
+            ShaderModule::new(include_str!("shaders/max_pool_2d_grad.wgsl"))
+        }
         ShaderGroup::GlobalAvgPool => {
             ShaderModule::new(include_str!("shaders/global_avg_pool.wgsl"))
         }
@@ -7128,6 +7132,7 @@ mod tests {
                 ShaderEntry::MaxPool2d
                 | ShaderEntry::GlobalAvgPool
                 | ShaderEntry::GlobalAvgPoolGrad => vec!["src", "dst", "params"],
+                ShaderEntry::MaxPool2dGrad => vec!["grad_out", "src", "dst", "params"],
                 ShaderEntry::PairwiseGrad => {
                     vec!["src_a", "src_b", "src_c", "dst", "params"]
                 }
@@ -7257,6 +7262,7 @@ mod tests {
             ShaderEntry::RoPEDynamicFactors,
             ShaderEntry::RoPEPositions,
             ShaderEntry::MaxPool2d,
+            ShaderEntry::MaxPool2dGrad,
             ShaderEntry::GlobalAvgPool,
             ShaderEntry::GlobalAvgPoolGrad,
             ShaderEntry::PairwiseGrad,

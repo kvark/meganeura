@@ -10,9 +10,10 @@ use std::{io, path::Path};
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
 // Version 10 changes default extraction and adds pre-allocation attention choices.
-// Version 11 fixes short-batch LayerNorm weight gradients, adds broadcast
-// pointwise loads and a GroupNorm backward statistics dispatch whose
-// gradient kernels bind one more buffer; older plans must be rebuilt.
+// Version 11 fixes short-batch LayerNorm weight gradients and replaces the
+// approximate MaxPool2d backward, adds broadcast pointwise loads and a
+// GroupNorm backward statistics dispatch whose gradient kernels bind one more
+// buffer; older plans must be rebuilt.
 const CACHE_FORMAT_VERSION: u32 = 11;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
