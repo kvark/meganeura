@@ -1,5 +1,25 @@
 # Unreleased
 
+- Fix wrong training gradients: scalar attention backward dropped every
+  dimension past 63 for heads wider than 64 on sequences shorter than the
+  flash block; LayerNorm weight gradients for two or three rows kept only
+  the first row and wrote past the output; MaxPool2d backward spread
+  gradients evenly over the wrong elements instead of routing them to each
+  window's maximum (ResNet's stem); BCE produced NaN once a sigmoid
+  saturated; GroupNorm backward derived its variance by cancellation.
+  The plan cache format is bumped so stale plans are rebuilt.
+- Fold uniform constant tensors into pointwise kernels, take the ReLU mask
+  from its output, and read biases through broadcast loads, so bias adds
+  fuse with their activations and backward passes stop reading
+  activation-sized constants.
+- Spread global and adaptive gradient clipping, and large whole-tensor sums,
+  across many workgroups instead of one per tensor.
+- Reduce per-channel bias gradients in place instead of transposing them,
+  compute GroupNorm backward statistics once, reduce attention's dot(dO, O)
+  once for the dK/dV kernels, fold row blocks in norm weight gradients, pool
+  wide planes with a workgroup each, tile transposes, and read the logits
+  twice rather than three times in cross-entropy.
+
 - Search matrix tiles, K staging, unrolling and split-K as e-graph alternatives,
   preserving logical fusion choices and qualifying complete implementations.
 - Use one egglog rewrite engine and calibrated whole-program search instead of live attention/submission retuning.

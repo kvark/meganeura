@@ -8,6 +8,8 @@ Arbitrary elementwise DAGs (`PointwiseDAG`) fused into a single dispatch. The e-
 
 Each DAG node is an arithmetic op or activation; the schedule template walks the DAG and emits inline WGSL for the fused body. One thread per element, one dispatch for the entire chain.
 
+Inputs are read at the current element, or through a **broadcast load** at `(i / divisor) % modulus` of the flat index. Per-channel NCHW biases (`AddPerChannel`) and per-column biases and scales (`BiasAdd`, `BiasMul`) lower this way, so they fuse with the activations around them. Broadcast DAGs stay out of reduction prologues and matmul epilogues, whose element positions are not flat indices. Before chain fusion, reads of uniform constant tensors (the `zeros[n]` and `scale[n]` autodiff builds for ReLU masks, mean gradients and row broadcasts) become literals, which frees their input slots under the three-input binding cap.
+
 ## Reduction
 
 Per-row tree reduction with optional **prologue** (transform before reducing, e.g. `v*v` for sum-of-squares), **extra accumulators** (`extra_prologues`: additional integrands reduced over the same inputs in the same pass), and **epilogue** (per-element post-processing using the reduced scalars, e.g. `x * rsqrt(mean + eps) * weight` for RMSNorm). Per-row broadcast inputs, per-column inputs (weights/biases), and indexed gather streams are supported.
