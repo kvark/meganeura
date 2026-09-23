@@ -18,13 +18,11 @@ var<storage, read_write> dst: array<f32>;
 var<uniform> params: Params;
 var<workgroup> wg_data: array<f32, 256>;
 
-// grad_weight[j] = sum_i(dy[i,j] * normed[i,j])
-// grad_bias[j] = sum_i(dy[i,j])
-// For row-parallel: each WG handles one row, writes partial grad_w and grad_bias.
-// Output: dst[row * cols * 2 + j] = partial_grad_w, dst[row * cols * 2 + cols + j] = partial_grad_bias
+// grad_weight[j] = sum_i(dy[i,j] * normed[i,j]). Each workgroup writes one
+// row of products, dst[row * cols + j]; a SumRows dispatch reduces the rows
+// unless there is only one. The bias gradient is a plain SumRows of dy.
 //
 // Dispatch: [rows, 1, 1], workgroup_size(256)
-// Followed by a SumRows dispatch to reduce rows → final grad_w, grad_bias.
 @compute @workgroup_size(256)
 fn layer_norm_grad_wb(
     @builtin(workgroup_id) wgid: vec3<u32>,
