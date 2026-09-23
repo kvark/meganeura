@@ -9,9 +9,11 @@ graphics-only qualification conditions. Inferena `06f2f800` and Meganeura
 replaces the accidental Ctrl-C campaign as a whole; its replicates are not
 spliced with earlier results. The 780M failure remains.
 
-The next collection uses v11, with a shared native search deadline and a
-two-second minimum workload warmup on both engines. This auditor and its
-pinned hashes still describe v10. Earlier supplementary ZIPs must be
+The next collection uses v13 (Inferena `129e26af`, Meganeura `e8d7d9e`), with
+joint graph/schedule search, a shared native deadline, and matched uniform
+parameters. It warms search comparisons for two pairs and 250 ms and held-out
+timing for five calls and two seconds. This auditor and its pinned hashes
+still describe v10. Earlier supplementary ZIPs must be
 regenerated after the AMD replacement; they are not updated by changing these
 sources and tables.
 
@@ -75,8 +77,8 @@ tensor elements; the checker cannot reconstruct elements never retained.
 
 The separate H100 search pilot retains its own analyzer and never enters
 current aggregates. The original MI300X report is not a timing result.
-The PDF and both ZIP files remain outside Git. Local v11 acceptance runs
-do not enter the v10 paper tables or supplementary record stream.
+The PDF and both ZIP files remain outside Git. Subsequent qualification and
+schedule-search diagnostics do not enter the v10 tables or record stream.
 
 ## Original-submission artifact (legacy)
 

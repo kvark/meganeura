@@ -45,10 +45,17 @@ The P3HPC paper has been accepted. See the
 for venue requirements and the [current evidence guide](p3hpc/RESULTS.md)
 for the final common-revision cohort.
 
-The next collection uses Inferena protocol v11: private kernel tuning shares
-the session deadline, and both engines warm each phase for at least five calls
-and two seconds. Until those results arrive, the P3HPC tables and measured
-methodology continue to describe v10. Do not relabel the old records as v11.
+The next collection uses Inferena protocol v13, pinned to Meganeura `e8d7d9e`:
+sixteen graph/schedule forms, a shared session deadline, and a 250 ms paired
+search warmup floor. Both engines warm each measured phase for at least five
+calls and two seconds. It retains v12's matched uniform synthetic parameters.
+Until those results arrive, the P3HPC tables and measured methodology still
+describe v10. Do not relabel old records or mix cohorts.
+
+Both papers separate the historical greedy/egglog rewrite ablation (no
+distinguishable GPU gain) from the newer one-graph/joint-schedule diagnostic
+(both arms already use egglog). The latter's GPU timings and preparation
+costs are listed in [RESULTS.md](p3hpc/RESULTS.md#optimizer-studies-outside-the-cohort).
 
 Replay the camera-ready evidence without a GPU, from the repository root
 with the nine current archives and the separately retained earlier cohort

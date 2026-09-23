@@ -109,11 +109,13 @@ budget allocation, not a monotonic-performance guarantee: an exhausted total
 budget or a change in execution state can still defeat that expectation.
 Held-out inference and minimal-shape measurements must check the selected plan;
 training improvements do not compensate for inference regressions.
-The next-cohort policy is not yet released: B570 qualification exposed a
-post-tuning full-gradient rejection on the first StableDiffusion training
-program. Private kernel checks are not a whole-model guarantee. Preserving
-the pre-tuning implementation and revalidating it is needed before that
-policy can be qualified across platforms.
+The v11 B570 qualification failure was subsequently traced to the nearly
+rank-two sinusoidal fixture and a GELU derivative bug, not evidence that the
+numerical gate should be weakened. Inferena v12 replaced the fixture with
+matched uniform parameters and picked up the derivative fix. V13 pins the
+reviewed joint schedule search and checks its sixteen-form frontier and
+250 ms comparison warmup. Each backend still needs qualification at the new
+pin; earlier successes do not certify it.
 
 This is a bounded first implementation, not exhaustive graph scheduling. Small
 graphs are searched together. Larger pure graphs can expose all operators with

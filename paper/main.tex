@@ -414,28 +414,42 @@ extracted graph.
 
 The production optimizer uses bounded equality saturation through
 egglog~\cite{zhang2023egglog}. An e-graph groups equivalent expressions
-without immediately discarding all but one. Large graphs use repeated-region
-outlining and bounded residual windows; fixed-window and whole-graph modes
-remain diagnostic alternatives. There is no separate production greedy
+without immediately discarding all but one. Small graphs are searched together;
+larger pure graphs expose a bounded joint region of rewritable operators,
+with opaque cut edges. If it exceeds the bound or crosses precision domains,
+search falls back to a verified repeated region. Mutations are not crossed.
+There is no separate production greedy
 rewriter. Ordinary construction extracts one graph using estimated tensor
 traffic. Calibrated construction uses the same rules and extractor to retain
-several forms for measurement.
+several forms for measurement. The cost counts logical bytes, not physical HBM
+traffic or latency; caches, arithmetic, occupancy and launch costs are omitted.
+
+The current rules also retain scalar matrix tiles, K stages, counted/unrolled
+loops and split-K schedules, including transposed and packed projections.
+Lowering locks an explicit schedule; automatic alternatives retain private
+kernel probes and legal cooperative paths. Derivative products inherit the
+forward schedule subject to legality checks. Independent gradient scheduling
+and cooperative tile-shape search remain outside this catalog.
 
 Each retained forward form is lowered independently, and differentiated
 separately for training. Private sessions receive representative weights
 and inputs. Legal kernel choices are tuned before complete programs compete
 on fresh recording, submission, and execution time. Candidates must pass
 full-output and gradient checks as well as the paired timing guard.
-The search also considers dispatch fusion and submission chunking; it does
-not mutate an allocated session's graph to install a different structure.
+Graph and physical-plan ranks are interleaved, including dispatch fusion,
+attention layouts/splits, convolution weight splits and submission chunking.
+The default frontier retains sixteen graph/implementation forms. Comparisons
+warm incumbent and challenger for at least two pairs and 250\,ms, within the
+total deadline. The search does not mutate an allocated session's graph to
+install a different structure.
 
 Equality saturation is established prior art~\cite{willsey2021egg,
 yang2021tensat}. Here it supplies one transformation system for both ordinary
 and measured construction. Extraction and measurement are bounded, not
 globally optimal: a wider search can still return a slower program if its
 budget is spread too thinly or timings change with machine state.
-The measurements in Section~\ref{sec:ablation} describe the earlier,
-narrower optimizer, not this construction-time search.
+Section~\ref{sec:ablation} separates the historical rewrite-engine ablation
+from a current schedule-search diagnostic. Neither updates the frozen cohort.
 
 \subsection{Kernel archetypes and specialization}
 
@@ -1174,54 +1188,57 @@ tuner. The other keeps matmul tile, K-stage, and split-K variants as
 equal expressions and times the whole step, locking the schedule that
 extraction produced so the tuner cannot replace it.
 
-Both policies ran in one process on an RTX~5070 on 22~September 2026,
-strict f32, cooperative matrices disabled, clocks unlocked. Each built
-the same four products, checked them against a CPU reference to
-$10^{-3}$ absolute error, and took the median of eight profiled GPU
-samples after a short burst. This is one run per policy, not a
-multi-process cohort, and it is not part of the frozen tables.
-The compiler is development revision \code{81b46bc} plus the K-stage
-equalities measured here, on branch
-\code{perf/nvidia-inference-2026-09-22}.
+Both policies ran in one process per device, first on an RTX~5070 and then
+on Arc~B570 on 22~September 2026, strict f32, cooperative matrices disabled,
+clocks unlocked. Each built the same four products, checked every output
+against an f64 CPU reference $r$, requiring absolute error at most
+$2\times10^{-5}+2\times10^{-4}|r|$, and took the upper median
+of eight profiled GPU samples after twelve warmup steps. This is one run per
+policy, not a multi-process cohort, and it is not part of the frozen tables.
+The compiler is development revision \code{2153aeb}, whose tree was merged
+as \code{e8d7d9e}. The opt-in \code{search\_study} example reproduces the method.
 
 \begin{table}[t]
-\caption{Profiled GPU time for one f32 product. One-graph tuning extracts
-once, then searches square tiles and K stages. Measured equalities may
-also select split-K.}
+\caption{Profiled GPU time in $\mu$s: one graph + tuner $\rightarrow$
+measured schedule equalities. Dimensions are $M\times N\times K$.}
 \label{tab:tile-study}
 \centering
 \small
 \begin{tabular}{lrr}
 \toprule
-Product & One graph + tuner & Measured equalities \\
+Product & RTX 5070 & Arc B570 \\
 \midrule
-$50\times4096\times720$ & 50.2\,$\mu$s & 50.1\,$\mu$s \\
-$50\times960\times720$ & 31.3\,$\mu$s & 19.1\,$\mu$s \\
-$50\times720\times960$ & 25.2\,$\mu$s & 19.1\,$\mu$s \\
-$50\times960\times720$ + add & 31.7\,$\mu$s & 19.0\,$\mu$s \\
+$50\times4096\times720$ & 57.95 $\to$ 45.57 & 135.42 $\to$ 110.73 \\
+$50\times960\times720$ & 31.36 $\to$ 19.01 & 53.85 $\to$ 39.12 \\
+$50\times720\times960$ & 25.50 $\to$ 17.15 & 63.12 $\to$ 38.70 \\
+$50\times960\times720$ + add & 31.42 $\to$ 18.94 & 54.17 $\to$ 34.17 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-On the three shorter products the measured policy is 1.3--1.7$\times$
-faster (Table~\ref{tab:tile-study}). It selects split-K with eight
-partials, a $64\times64$ tile, and K stage 8, including when the add is
-fused into the product. The wide product ties: both policies keep the
-unrolled $64\times64$ kernel. Split-K was extracted and lost the noise
-gate.
+The measured policy is 1.27--1.66$\times$ faster on NVIDIA and
+1.22--1.63$\times$ on Intel (Table~\ref{tab:tile-study}). All 24 candidates
+per case pass the oracle on both devices. Private probes use the same
+defaults, but total preparation budgets differ: ordinary probes allow two
+seconds; measured construction permits forty seconds and 24 programs.
+Per-product construction, qualification and brief readout take 0.4--0.7\,s
+versus 6.3--7.1\,s on NVIDIA and 0.8--1.7\,s versus 7.4--12.5\,s on Intel.
+These are not isolated shader compile times or a fixed-budget comparison.
 
 The same products on the preceding main revision \code{da30316} already
 show the same kind of gap, without tile equalities and without the
 unrolled K loop. One-graph tuning took 57.8, 31.7, 25.2, and
 31.8\,$\mu$s. That revision's explicit split-K list selected eight-way
 split-K and took 45.3, 19.5, 19.0, and 21.2\,$\mu$s. The speedup over
-one-graph tuning is the split-K schedule. Representing that schedule as
-an egglog equality did not beat the explicit list, and on the wide
-product the noise gate dropped a schedule the list had kept.
+one-graph tuning comes from finding the split-K schedule. These earlier
+measurements do not isolate the representation from subsequent search and
+code-generation changes.
 
 The result argues for searching split-K. It does not, by itself, argue
-for egglog. An enumerated list of the same kernels produced the win, and
-the wide GEMM shows the equality search can miss it.
+for egglog over an equally capable enumerator. Both current arms already
+use egglog. Its architectural benefit here is keeping schedule and graph
+alternatives together in one transformation system, not making the same
+kernel intrinsically faster.
 
 \subsection{Cooperative matrices and epilogues}
 

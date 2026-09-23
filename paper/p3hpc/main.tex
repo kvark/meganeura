@@ -151,7 +151,7 @@ in greater detail \cite{malyshau2026meganeura}.
   \node[graph, text width=25mm, below=of source] (typed)
     {Typed static graph};
   \node[graph, text width=25mm, below=of typed] (rewrite)
-    {Bounded equality saturation};
+    {E-graph: expressions\\+ matrix schedules};
   \node[graph, text width=22mm, below left=4.5mm and 2.5mm of rewrite] (infer)
     {Inference\\graph};
   \node[train, text width=25mm, below right=4.5mm and 2.5mm of rewrite] (training)
@@ -183,8 +183,8 @@ in greater detail \cite{malyshau2026meganeura}.
 \end{tikzpicture}%
 }
 \caption{The shared compilation path. Each forward-graph candidate can
-produce its own differentiated training graph. Legal kernel choices are
-tuned before complete programs are compared.}
+produce its own differentiated training graph. Explicit matrix schedules
+are preserved; remaining kernel choices are tuned before programs compete.}
 \label{fig:pipeline}
 \end{figure}
 
@@ -193,17 +193,27 @@ Native builders and importers for Open Neural Network Exchange (ONNX)
 and Neural Network Exchange Format (NNEF) construct the graph.
 Egglog retains equivalent expressions in an e-graph using bounded equality
 saturation \cite{zhang2023egglog}. It adds alternatives to equivalence classes
-instead of committing to the first profitable local rewrite. Large graphs
-are divided into smaller regions; repeated regions reuse the same optimization
-work. Training adds reverse-mode
+instead of committing to the first profitable local rewrite. Search covers
+small graphs or bounded regions of rewritable operators, including independent
+projections. Larger cases fall back to verified repeated regions. Precision
+domains and mutations are boundaries. Training adds reverse-mode
 differentiation and, when requested by the application, a stochastic
 gradient descent (SGD) or Adam update.
 The benchmark measures forward, loss, and backward only.
 The ordinary builder extracts one graph by estimated tensor traffic.
 Measured construction keeps several forms until their implementations
 have been timed. Both paths use the same e-graph rules, extractor, and lowering
-code; there is no separate greedy optimizer. Estimated tensor traffic orders
-exploration, but does not decide the measured winner.
+code; there is no separate greedy optimizer. The cost counts logical tensor
+bytes, not HBM transactions or latency: it omits caches, arithmetic,
+occupancy and launch costs. It orders exploration, not the measured winner.
+
+Matrix tile dimensions, K stages, counted or unrolled loops, and split-K
+are now implementation alternatives in the same e-graph. This covers
+transposed products and packed projections. Lowering locks an extracted
+schedule; an automatic alternative retains ordinary kernel probes, including
+cooperative paths where legal. Derivative products inherit the forward
+schedule subject to legality checks. Independent gradient schedules and
+cooperative tile dimensions are not yet searched this way.
 
 Code generation uses a small set of reusable kernel families:
 pointwise expressions, reductions, general matrix multiplication (GEMM), convolutions and
@@ -230,7 +240,8 @@ Graph forms therefore compete after kernel search, rather than being
 discarded before tuning begins. Finite budgets can leave that search
 incomplete; retaining equivalent expressions does not guarantee faster code.
 
-The measured v10 protocol allows four graph forms and 64 programs per session, with a
+The primary tables measure the earlier v10 protocol, before these schedule
+equalities and broader regions. It allows four graph forms and 64 programs per session, with a
 60-second total search deadline. Each program gets up to two seconds of
 private kernel search and 1\,GiB of scratch space, without a class-count cap.
 The two active plans and state snapshots are bounded by 75\% of reported
@@ -239,6 +250,11 @@ Deadlines are soft around in-flight driver and validation work.
 The search includes dispatch fusion and submission chunking as well as
 kernel geometry. On large graphs, alternative extraction covers one verified
 repeated region, not every possible graph partition.
+The next-cohort policy retains sixteen graph/implementation forms, interleaves
+graph and physical-plan choices, and shares the remaining session deadline
+with private probes. Paired whole-program comparisons require two warmup
+pairs and 250\,ms, subject to that deadline. These changes are not results
+of the frozen cohort.
 
 \section{Methodology}
 \label{sec:method}
@@ -564,6 +580,54 @@ without model-specific code. It is not an ablation of the current
 60-second policy or its additional native-f32 permissions.
 The pilot's preparation costs are discussed in Section~\ref{sec:productivity};
 its records are separate from the primary tables and aggregates.
+
+\subsection{What the e-graph contributes}
+\label{sec:egraph-ablation}
+
+The earlier rewrite-only ablation found essentially the same active graphs
+with greedy and outlined egglog, and no GPU gain distinguishable from
+run-to-run variation. SmolLM inference rewriting took 0.089\,ms with greedy,
+2.94\,ms with outlining, and 56.2\,ms with whole-graph saturation.
+Egglog retains alternatives through measurement; it does not make the same
+kernel faster.
+
+Table~\ref{tab:tile-study} tests that expanded search at development revision
+\code{2153aeb}, whose tree was merged as \code{e8d7d9e}. Both arms use egglog;
+one extracts once and runs private kernel probes, the other retains tile
+and split-K alternatives for whole-step comparison. Strict f32 products,
+with cooperative matrices disabled, pass a full-output f64 oracle.
+Each entry is the upper median of eight profiled GPU samples after twelve warmup
+steps, from one process per GPU. These are kernel diagnostics, not cohort
+wall times or a controlled greedy-versus-egglog comparison.
+
+\begin{table}[t]
+\caption{GPU time in $\mu$s: one graph + tuner $\rightarrow$ measured
+schedule equalities. Dimensions are $M\times N\times K$.}
+\label{tab:tile-study}
+\centering
+\small
+\begin{tabular}{lrr}
+\toprule
+Product & RTX 5070 & Arc B570 \\
+\midrule
+$50\times4096\times720$ & 57.95 $\to$ 45.57 & 135.42 $\to$ 110.73 \\
+$50\times960\times720$ & 31.36 $\to$ 19.01 & 53.85 $\to$ 39.12 \\
+$50\times720\times960$ & 25.50 $\to$ 17.15 & 63.12 $\to$ 38.70 \\
+$50\times960\times720$ + add & 31.42 $\to$ 18.94 & 54.17 $\to$ 34.17 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The wider search is 1.27--1.66$\times$ faster on NVIDIA and
+1.22--1.63$\times$ on Intel. Preparation is not held equal: per-product
+construction, qualification and brief readout rise from 0.4--0.7 to
+6.3--7.1\,s on NVIDIA and from 0.8--1.7 to 7.4--12.5\,s on Intel.
+Private probes use the same policy: two seconds per program, while measured
+construction permits forty seconds and 24 programs. A preceding split-K enumerator
+reached 19--21\,$\mu$s on the shorter NVIDIA products. The benefit is
+finding the schedule; egglog supplies a shared way to retain it alongside
+graph rewrites. This does not establish an advantage over an equally
+capable enumerator or predict whole-model gains.
 
 \subsection{Earlier larger-model study}
 \label{sec:scaling}
@@ -1141,21 +1205,11 @@ weights and compilation work, prioritize expensive kernels, and make choices
 that survive longer timing windows. B570 also needs support for rectangular
 cooperative tiles. More search alone is not the answer.
 
-A development check after this cohort was frozen, on an RTX~5070 and not
-part of Table~\ref{tab:performance}, compares two ways of choosing a
-single f32 product. Extracting one graph and then running the kernel
-tuner keeps a 32-wide tile and takes 31.3 and 25.2\,$\mu$s on
-$50\times960\times720$ and $50\times720\times960$. Letting the e-graph
-treat tile, K stage, and split-K as the same tensor, then timing the
-whole step, selects eight-way split-K and takes 19.1\,$\mu$s on both.
-The wide $50\times4096\times720$ product stays at 50\,$\mu$s either
-way. The preceding compiler, which enumerated split-K directly instead
-of as an equality, already reached 19--21\,$\mu$s on the shorter
-products and 45.3\,$\mu$s on the wide one. The gain over one-graph
-tuning is the split-K kernel. Moving that choice into egglog did not
-improve on the explicit list. The next cohort should not assume that a
-larger e-graph is faster; it should check whether the schedule that won
-is actually installed.
+The schedule study in Section~\ref{sec:egraph-ablation} motivates searching
+implementations jointly with graph forms. Logical tensor bytes alone cannot
+rank their execution time. Reusing measured kernel-class costs could improve
+search order without replacing the final whole-program comparison. That
+empirical extraction model is not implemented yet.
 
 Beyond GPU optimization, neural accelerators would need a backend for their
 operator, layout, and precision constraints. Unsupported operations could
@@ -1190,8 +1244,8 @@ models run; it used a different optimizer and does not measure this
 search at that size.
 
 Keeping graph compilation and measured choice in one small runtime is
-still worth doing. The next step is to make the winning schedule the one
-that actually gets installed, at a cost we can afford, and to close
+still worth doing. The next cohort must check whether the expanded schedule
+search improves whole-model inference at a cost we can afford, and close
 specific kernel and driver gaps. Coverage belongs in that picture with
 speed. Vulkan reaches devices this PyTorch stack does not, and MI300X is
 where our own Vulkan path currently stops.
@@ -1263,13 +1317,11 @@ Each campaign writes a manifest and a sibling \code{latest.tgz};
 rename/copy that archive before collecting another device.
 Failures stop collection and retain preceding records.
 Rerunning reproduces the procedure, not the original timing noise.
-Raw records retain environment, precision, memory-accounting bases,
-20 call samples per phase, and validation diagnostics.
 
 \textbf{Other evidence.}
-The timeline/compiler experiments retain their own source refs and
-reproduction instructions; they are not mixed into the final-cohort
-tables. The \href{https://github.com/kvark/dinovision/tree/dc35cdf1c7c910cdd93c5b5362846842ae469a21}{DinoVision source}
+The \href{https://github.com/kvark/meganeura/blob/e8d7d9e3b2192671c0a9fb1aab2e3fc505153260/examples/search_study.rs}{schedule diagnostic}
+and timeline/compiler experiments retain separate source refs and do not enter
+cohort aggregates. The \href{https://github.com/kvark/dinovision/tree/dc35cdf1c7c910cdd93c5b5362846842ae469a21}{DinoVision source}
 and \href{https://huggingface.co/mad-bot/dinovision/tree/2c3f9017fe74c41482b165890c14737a2ccd4b6a}{evidence archive}
 likewise describe a separately versioned physical deployment.
 The artifact has not been independently evaluated.

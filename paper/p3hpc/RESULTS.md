@@ -5,20 +5,84 @@ graphics-only qualification, and the earlier H100 size study separate.
 The replacement RX 7900 XT archive is complete; it supersedes the accidentally
 interrupted upload. No old and new replicates are spliced together.
 
-The **v11 candidate**, Inferena `c8adf75741ffa2fd078e22c63e0aa94f1f23d90c`,
-is on hold, not a released common-cohort revision:
-kernel tuning uses the remaining shared session deadline, and both engines
-warm each phase for at least five calls and two seconds. Numerical gates,
-checkpoints, engine pins and reference compilation/replay settings are unchanged.
-Local acceptance runs are separate from this paper's v10 evidence. Do not change
-the measured methodology or tables to v11 until that cohort is collected.
+The next candidate is **Inferena protocol v13**, revision
+[`129e26af`](https://github.com/kvark/inferena/blob/129e26afc77394abddf5d054871021da22d83bd4/EXPERIMENT.md)
+on `experiment/p3hpc-cuda-graphs`, pinned to Meganeura
+`e8d7d9e3b2192671c0a9fb1aab2e3fc505153260` and Blade
+`fbb4f28c4869e81ae15de58925945b423b9c1ac5`. It retains sixteen graph/schedule
+forms, interleaves graph and physical-plan choices, and warms paired
+comparisons for two pairs and 250 ms within the shared 60-second session
+deadline. Both engines still warm held-out timing for five calls and two
+seconds. Reference compilation/replay, checkpoints and numerical gates are
+unchanged. No v13 qualification or measurement campaign has been run here.
+Use the instructions in Inferena's `EXPERIMENT.md` to qualify each backend
+before collection. Do not relabel the paper's v10 records as v13.
 
-Local 5070 qualification passed all ten conditions. B570 passed strict SmolLM2
-and SmolVLA, then rejected post-tuning StableDiffusion training gradients.
-The first program has no qualified incumbent to return when its kernel changes
-fail the full-model check. A native rollback fix must be merged and pinned,
-then qualified, before collection. Keep the failed record; do not relax the
-numerical gate or retry it into the published cohort.
+The v11 B570 StableDiffusion gradient failure was investigated separately.
+The sinusoidal fixture was nearly rank two and also exceeded the gradient
+bounds in PyTorch f32; a GELU derivative bug was fixed independently.
+V12 introduced matched uniform parameters and pinned the fix. V13 retains
+both, rather than relaxing validation or hiding the failed qualification.
+
+## Optimizer studies outside the cohort
+
+Do not label the current schedule study as greedy versus egglog: **both arms
+already use egglog**. The historical rewrite-only ablation, first recorded in
+`22594fe`, found essentially the same active graphs and no GPU improvement
+distinguishable from run-to-run variation. Its SmolLM CPU rewrite times were
+0.089 ms (greedy), 2.94 ms (outlined egglog), 32.6 ms (windowed), and 56.2 ms
+(whole graph); whole differentiated-graph saturation took 7.43 s. Those numbers
+describe the earlier rule set, not the current scheduler or an execution
+speedup. There is no supported positive GPU effect size for that comparison.
+
+The September 22 schedule diagnostic used
+[`2153aeb`](https://github.com/kvark/meganeura/tree/2153aeba92469a494de4a08202faf94e597e3d26),
+whose tree is identical to merged `e8d7d9e`. It compares one ordinary extraction
+plus private kernel probes with joint graph/schedule search. The exact
+[`search_study` example](https://github.com/kvark/meganeura/blob/e8d7d9e3b2192671c0a9fb1aab2e3fc505153260/examples/search_study.rs)
+checks every output against an f64 oracle with absolute error bound
+`2e-5 + 2e-4 * abs(reference)`. All 24 candidates per case passed on both GPUs.
+Cooperative matrices were disabled; clocks were not forced. GPUs ran serially.
+Each number is the upper median of eight sums of per-dispatch GPU timestamps
+after twelve warmup steps, one process per device. It excludes CPU submission
+and is not a multi-process inference benchmark.
+
+| M × N × K | RTX 5070: one graph → joint (µs) | Arc B570: one graph → joint (µs) |
+|---|---:|---:|
+| 50 × 4096 × 720 | 57.95 → 45.57 | 135.42 → 110.73 |
+| 50 × 960 × 720 | 31.36 → 19.01 | 53.85 → 39.12 |
+| 50 × 720 × 960 | 25.50 → 17.15 | 63.12 → 38.70 |
+| 50 × 960 × 720 + add | 31.42 → 18.94 | 54.17 → 34.17 |
+
+Speedups are 1.27–1.66× on NVIDIA and 1.22–1.63× on Intel. Private probes use
+the same defaults, but the total budgets differ: two-second ordinary kernel
+probes versus up to forty seconds, sixteen forms and 24 programs for joint
+search. Observed per-product construction, qualification and brief readout
+increase from 0.4–0.7 to 6.3–7.1 seconds on NVIDIA and 0.8–1.7 to 7.4–12.5
+seconds on Intel. This is not a fixed-budget or pure shader-compilation study.
+
+The preceding explicit split-K enumerator at `da30316` already gave
+45.3 / 19.5 / 19.0 / 21.2 µs on those NVIDIA shapes, versus one-graph
+57.8 / 31.7 / 25.2 / 31.8 µs. Finding split-K explains the gain; the data do
+not show that an equality representation beats an equally capable enumerator.
+Egglog's benefit is retaining these choices together with graph rewrites in
+one transformation system.
+
+To reproduce separately from collection, at the pinned source:
+
+```sh
+cargo build --release --example search_study
+MEGANEURA_DEVICE_ID=12036 MEGANEURA_GPU_TIMING=1 target/release/examples/search_study
+MEGANEURA_DEVICE_ID=57868 MEGANEURA_GPU_TIMING=1 target/release/examples/search_study
+```
+
+Those device IDs belong to this workstation; use the intended adapter's ID
+elsewhere. The example disables cooperative matrices; the environment setting
+enables timestamp readout. Do not run it alongside a collection or include these
+times in the publication aggregates. The full-model SmolVLA checkpoint in
+[compiler-search.md](../../docs/compiler-search.md#api-and-current-boundary)
+also compares two already-egraph revisions and changes multiple policies;
+it is not a causal egglog-versus-greedy result.
 
 ## Identity and health
 
