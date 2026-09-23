@@ -3,8 +3,8 @@
 //! [`crate::autodiff::differentiate`] turns a forward graph into a graph
 //! that also computes parameter gradients. Evaluating both with the
 //! reference interpreter separates two questions that a GPU gradient check
-//! conflates: is the differentiation rule right (checked here, where finite
-//! differences in double precision are accurate to about 1e-9), and does
+//! conflates: does the differentiation rule agree with the reference's
+//! finite differences (subject to conditioning and step size), and does
 //! each kernel compute its op (checked by [`super::gpu`]).
 
 use super::{Comparison, Error, Feeds, Report, Rng, Tolerance, check_f64, evaluate};
@@ -61,6 +61,7 @@ pub fn check(graph: &Graph, feeds: &Feeds, options: &Options) -> Result<Report, 
         })
         .collect();
     let grad_ids = &backward.outputs()[backward.num_user_outputs()..];
+    assert_eq!(params.len(), grad_ids.len(), "missing reference gradients");
     let mut analytic = Vec::with_capacity(params.len());
     for (&(ref name, param), &grad) in params.iter().zip(grad_ids) {
         let n = graph.node(param).ty.num_elements();

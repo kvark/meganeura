@@ -128,7 +128,14 @@ fn training_outputs_survive_fusion_and_backward() {
         let y = g.matmul(h, w_out);
         let y2 = g.matmul(y, w2);
         let loss = g.mse_loss(y2, target);
-        g.set_outputs(vec![loss, y, y2]);
+        // A packed projection that is observed but does not reach the loss
+        // must also be checked, without inventing a device gradient for it.
+        let gate = g.parameter("gate", &[4, 3]);
+        let up = g.parameter("up", &[4, 3]);
+        let a = g.matmul(x, gate);
+        let b = g.matmul(x, up);
+        let observed = g.swiglu(a, b);
+        g.set_outputs(vec![loss, y, y2, observed]);
         let mut feeds = Feeds::new();
         feeds.fill_random(&g, 40 + batch as u64, 1.0);
         gpu::check_training(&g, &feeds, &gpu::Options::default())
