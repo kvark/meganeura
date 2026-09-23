@@ -421,3 +421,31 @@ fn global_grad_clip_measures_large_gradients() {
         }
     }
 }
+
+/// The tiled transpose must handle edges that do not fill a 16x16 tile.
+#[test]
+fn transpose_matches_reference_on_ragged_tiles() {
+    for (m, n) in [(1usize, 1usize), (3, 40), (17, 33), (64, 16), (100, 7)] {
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[m, n]);
+        let y = graph.transpose(x);
+        graph.set_outputs(vec![y]);
+        let (mut session, _) = meganeura::build(
+            &graph,
+            meganeura::SessionConfig {
+                mode: meganeura::Mode::Inference,
+                ..meganeura::SessionConfig::default()
+            },
+        );
+        let xs: Vec<f32> = (0..m * n).map(|i| i as f32).collect();
+        session.set_input("x", &xs);
+        session.step();
+        session.wait();
+        let got = session.read_output(m * n);
+        for r in 0..m {
+            for c in 0..n {
+                assert_eq!(got[c * m + r], xs[r * n + c], "{m}x{n} at ({r}, {c})");
+            }
+        }
+    }
+}
