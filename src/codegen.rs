@@ -1242,10 +1242,10 @@ fn conv_gemm_tiled(
         let arguments = values.iter().map(|v| format!("{v}u")).collect::<Vec<_>>();
         (
             format!("const params = Params({});", arguments.join(", ")),
-            // Same exact reciprocal as the uniform shader. The multipliers are
-            // constants here, so the sequence can fold. WGSL `/` is a separate
-            // candidate and is not used for this kernel.
-            crate::divisor::SHADER,
+            // Divisors are constants in this specialization, so integer `/`
+            // is exact and lowers to a short multiply-high. The uniform shader
+            // keeps the software reciprocal because its divisor is dynamic.
+            crate::divisor::NATIVE_SHADER,
         )
     } else {
         (

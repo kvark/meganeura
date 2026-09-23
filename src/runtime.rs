@@ -7553,7 +7553,7 @@ impl Session {
                             len: dispatch.params[0],   // m
                             _pad0: dispatch.params[1], // n
                             _pad1: dispatch.params.get(2).copied().unwrap_or(0),
-                            _pad2: 0,
+                            _pad2: dispatch.params.get(3).copied().unwrap_or(0),
                         },
                     },
                 );

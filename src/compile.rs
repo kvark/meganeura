@@ -2797,6 +2797,16 @@ mod conv_tile {
         assert_eq!(conv_register_tile(256, 196, 1, true), 64);
         assert_eq!(conv_register_tile(64, 147, 1, true), 16);
     }
+
+    #[test]
+    fn splits_only_tall_narrow_row_reductions() {
+        // 12544 x 64 is the ResNet stem bias reduction: 2 column groups.
+        assert_eq!(super::Compiler::row_reduction_splits(12544, 64), 49);
+        assert_eq!(super::Compiler::row_reduction_splits(3136, 64), 13);
+        // Few rows, and matrices wide enough to fill the launch, stay one reduction.
+        assert_eq!(super::Compiler::row_reduction_splits(32, 64), 1);
+        assert_eq!(super::Compiler::row_reduction_splits(10_000, 4096), 1);
+    }
 }
 
 /// Scalar convolution with geometry baked into the pipeline.
@@ -2909,6 +2919,61 @@ impl<'a> Compiler<'a> {
         let idx = self.plan.buffers.len() as u32;
         self.plan.buffers.push(size_bytes);
         BufferRef(idx)
+    }
+
+    /// How many row slices a cooperative [`ShaderEntry::SumRows`] launch needs.
+    ///
+    /// Eight lanes already share each column. A tall matrix with few column
+    /// groups still leaves those lanes on a long chain and the GPU idle.
+    /// Short or wide reductions stay one slice so their rounding is unchanged.
+    fn row_reduction_splits(rows: u32, cols: u32) -> u32 {
+        let groups = cols.div_ceil(32).max(1);
+        let trip = rows.div_ceil(8);
+        if trip <= 64 || groups >= 128 {
+            return 1;
+        }
+        let want = 128u32.div_ceil(groups);
+        let cap = trip.div_ceil(32).clamp(2, 256);
+        want.clamp(2, cap)
+    }
+
+    fn push_sum_rows(&mut self, rows: u32, cols: u32, src: BufferRef, dst: BufferRef) {
+        let splits = Self::row_reduction_splits(rows, cols);
+        if splits == 1 {
+            self.plan.dispatches.push(Dispatch {
+                shader: ShaderEntry::SumRows,
+                workgroups: [cols.div_ceil(32), 1, 1],
+                input_buffers: vec![src],
+                output_buffer: dst,
+                extra_outputs: vec![],
+                params: vec![rows, cols, 0, 0],
+                ..Default::default()
+            });
+            return;
+        }
+        let bytes = (splits as usize)
+            .checked_mul(cols as usize)
+            .and_then(|n| n.checked_mul(4))
+            .expect("row-split reduction size");
+        let partial = self.alloc_buffer(bytes);
+        self.plan.dispatches.push(Dispatch {
+            shader: ShaderEntry::SumRows,
+            workgroups: [cols.div_ceil(32), splits, 1],
+            input_buffers: vec![src],
+            output_buffer: partial,
+            extra_outputs: vec![],
+            params: vec![rows, cols, 0, splits],
+            ..Default::default()
+        });
+        self.plan.dispatches.push(Dispatch {
+            shader: ShaderEntry::SumRows,
+            workgroups: [cols.div_ceil(32), 1, 1],
+            input_buffers: vec![partial],
+            output_buffer: dst,
+            extra_outputs: vec![],
+            params: vec![splits, cols, 0, 0],
+            ..Default::default()
+        });
     }
 
     /// Buffer already allocated for a `CrossEntropyLogitsGrad` on the same
@@ -3798,22 +3863,13 @@ impl<'a> Compiler<'a> {
             }
 
             Op::SumRows => {
-                // [M, N] → [N]: one workgroup per 32-column tile; eight
-                // row lanes cooperate on each column.
+                // [M, N] → [N]. Tall narrow shapes are sliced across extra
+                // workgroups; short and wide shapes stay one reduction.
                 let input = self.get_buffer(node.inputs[0]);
                 let in_shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let m = in_shape[0] as u32;
                 let n = in_shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::SumRows,
-                    workgroups: [n.div_ceil(32), 1, 1],
-                    input_buffers: vec![input],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![m, n, 0, 0],
-
-                    ..Default::default()
-                });
+                self.push_sum_rows(m, n, input, out_buf);
             }
 
             Op::ExclusiveCumsum { reverse } => {
@@ -5825,16 +5881,7 @@ impl<'a> Compiler<'a> {
 
                         ..Default::default()
                     });
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::SumRows,
-                        workgroups: [cols.div_ceil(32), 1, 1],
-                        input_buffers: vec![temp_buf],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![rows, cols, 0, 0],
-
-                        ..Default::default()
-                    });
+                    self.push_sum_rows(rows, cols, temp_buf, out_buf);
                 } else {
                     // Small row count: single-pass is fine
                     self.plan.dispatches.push(Dispatch {
@@ -5898,16 +5945,7 @@ impl<'a> Compiler<'a> {
 
                         ..Default::default()
                     });
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::SumRows,
-                        workgroups: [cols.div_ceil(32), 1, 1],
-                        input_buffers: vec![temp_buf],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![rows, cols, 0, 0],
-
-                        ..Default::default()
-                    });
+                    self.push_sum_rows(rows, cols, temp_buf, out_buf);
                 } else {
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::LayerNormGradWB,
