@@ -3050,6 +3050,12 @@ impl<'a> Compiler<'a> {
                 [q_seq.div_ceil(bq), num_heads, 1],
             )
         } else {
+            // The scalar backward kernels give each of their 64 lanes at most
+            // four dimensions.
+            assert!(
+                head_dim <= 256,
+                "scalar attention backward supports heads up to 256 wide, got {head_dim}"
+            );
             (ShaderEntry::MultiHeadAttn, [q_seq, num_heads, 1])
         }
     }
