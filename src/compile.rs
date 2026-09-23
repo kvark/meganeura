@@ -388,6 +388,7 @@ pub enum ShaderEntry {
     RoPEDynamicFactors,
     RoPEPositions,
     MaxPool2d,
+    MaxPool2dGrad,
     GlobalAvgPool,
     GlobalAvgPoolGrad,
     PairwiseGrad,
@@ -467,6 +468,7 @@ impl ShaderEntry {
             | ShaderEntry::Upsample2x
             | ShaderEntry::Upsample2xGrad
             | ShaderEntry::MaxPool2d
+            | ShaderEntry::MaxPool2dGrad
             | ShaderEntry::WinogradInputTransform
             | ShaderEntry::WinogradOutputTransform
             | ShaderEntry::WinogradBatchedMatMul
@@ -676,6 +678,7 @@ impl ShaderEntry {
             ShaderEntry::RoPEDynamic | ShaderEntry::RoPEDynamicFactors => ShaderGroup::RoPEDynamic,
             ShaderEntry::RoPEPositions => ShaderGroup::RoPEDynamic,
             ShaderEntry::MaxPool2d => ShaderGroup::MaxPool2d,
+            ShaderEntry::MaxPool2dGrad => ShaderGroup::MaxPool2dGrad,
             ShaderEntry::GlobalAvgPool => ShaderGroup::GlobalAvgPool,
             ShaderEntry::GlobalAvgPoolGrad => ShaderGroup::GlobalAvgPoolGrad,
             ShaderEntry::PairwiseGrad => ShaderGroup::PairwiseGrad,
@@ -800,6 +803,7 @@ impl ShaderEntry {
             ShaderEntry::RoPEDynamicFactors => "with_factors",
             ShaderEntry::RoPEPositions => "with_positions",
             ShaderEntry::MaxPool2d => "max_pool_2d",
+            ShaderEntry::MaxPool2dGrad => "main",
             ShaderEntry::GlobalAvgPool => "global_avg_pool",
             ShaderEntry::GlobalAvgPoolGrad => "main",
             ShaderEntry::PairwiseGrad => "main",
@@ -5683,6 +5687,36 @@ impl<'a> Compiler<'a> {
                     shader: ShaderEntry::MaxPool2d,
                     workgroups: [total.div_ceil(256), 1, 1],
                     input_buffers: vec![input],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![
+                        batch, channels, in_h, in_w, kernel_h, kernel_w, stride, padding, out_h,
+                        out_w, 0, 0,
+                    ],
+
+                    ..Default::default()
+                });
+            }
+
+            Op::MaxPool2dGrad {
+                channels,
+                in_h,
+                in_w,
+                kernel_h,
+                kernel_w,
+                stride,
+                padding,
+            } => {
+                let grad_out = self.get_buffer(node.inputs[0]);
+                let input = self.get_buffer(node.inputs[1]);
+                let total = node.ty.num_elements() as u32;
+                let batch = total / (channels * in_h * in_w);
+                let out_h = (in_h + 2 * padding - kernel_h) / stride + 1;
+                let out_w = (in_w + 2 * padding - kernel_w) / stride + 1;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::MaxPool2dGrad,
+                    workgroups: [total.div_ceil(256), 1, 1],
+                    input_buffers: vec![grad_out, input],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![

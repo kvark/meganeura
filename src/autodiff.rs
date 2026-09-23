@@ -685,6 +685,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::NormalizeInnerSumGrad { .. }
             | Op::PairwiseGrad { .. }
             | Op::GlobalAvgPoolGrad { .. }
+            | Op::MaxPool2dGrad { .. }
             | Op::CrossEntropyLogitsGrad => {}
             Op::Gelu => {
                 let x = node.inputs[0];
@@ -1238,23 +1239,26 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 channels,
                 in_h,
                 in_w,
-                kernel_h: _,
-                kernel_w: _,
+                kernel_h,
+                kernel_w,
                 stride,
-                padding: _,
+                padding,
             } => {
-                // Approximate backward: treat like average pool (uniform gradient spread).
-                // Exact MaxPool backward requires argmax indices from forward.
+                // Each output gradient goes to its window's winner, which the
+                // backward kernel recomputes from the input.
                 let x = node.inputs[0];
                 let x_ty = forward.nodes()[x as usize].ty.clone();
-                let out_h = node.ty.shape[0] / (channels as usize); // approximate
-                let _spatial_ratio = (in_h * in_w) / (out_h as u32);
                 let grad_x = graph.add_raw_node(
-                    Op::GlobalAvgPoolGrad {
+                    Op::MaxPool2dGrad {
                         channels,
-                        spatial: stride * stride, // each output maps to stride*stride inputs
+                        in_h,
+                        in_w,
+                        kernel_h,
+                        kernel_w,
+                        stride,
+                        padding,
                     },
-                    vec![grad_output],
+                    vec![grad_output, x],
                     x_ty,
                 );
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);

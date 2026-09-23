@@ -756,3 +756,83 @@ fn norm_weight_gradients_fold_row_blocks() {
         }
     }
 }
+
+/// MaxPool2d routes each output gradient to the input that won its window
+/// (the first maximum in row-major window order, as PyTorch does). Its
+/// backward used to spread gradients evenly over stride² consecutive
+/// elements, which is neither the argmax nor the right window.
+#[test]
+fn max_pool_gradient_routes_to_argmax() {
+    // ResNet's stem pool (3x3, stride 2, padding 1) plus a ragged shape.
+    for (batch, channels, h, w, k, stride, padding) in [
+        (2usize, 3usize, 12usize, 12usize, 3usize, 2usize, 1usize),
+        (1, 2, 9, 7, 2, 2, 0),
+        (1, 1, 10, 10, 3, 1, 1),
+    ] {
+        let out_h = (h + 2 * padding - k) / stride + 1;
+        let out_w = (w + 2 * padding - k) / stride + 1;
+        let n_in = batch * channels * h * w;
+        let n_out = batch * channels * out_h * out_w;
+        let mut graph = Graph::new();
+        let x = graph.parameter("x", &[n_in]);
+        let y = graph.max_pool_2d(
+            x,
+            batch as u32,
+            channels as u32,
+            h as u32,
+            w as u32,
+            k as u32,
+            k as u32,
+            stride as u32,
+            padding as u32,
+        );
+        let t = graph.input("t", &[n_out]);
+        let weighted = graph.mul(y, t);
+        let loss = graph.sum_all(weighted);
+        graph.set_outputs(vec![loss]);
+
+        // Distinct values, with some ties to exercise first-maximum routing.
+        let xs: Vec<f32> = (0..n_in).map(|i| ((i * 37) % 23) as f32 * 0.25).collect();
+        let ts = values(n_out, 0.31, 0.4);
+        let mut session = meganeura::build(&graph, meganeura::SessionConfig::from_env()).0;
+        session.set_parameter("x", &xs);
+        session.set_input("t", &ts);
+        session.set_learning_rate(0.0);
+        session.step();
+        session.wait();
+        let mut got = vec![0.0; n_in];
+        session.read_param_grad("x", &mut got);
+
+        let mut want = vec![0.0f64; n_in];
+        for plane in 0..batch * channels {
+            for oh in 0..out_h {
+                for ow in 0..out_w {
+                    let mut best: Option<(f32, usize)> = None;
+                    for kh in 0..k {
+                        for kw in 0..k {
+                            let ih = (oh * stride + kh) as isize - padding as isize;
+                            let iw = (ow * stride + kw) as isize - padding as isize;
+                            if ih < 0 || iw < 0 || ih >= h as isize || iw >= w as isize {
+                                continue;
+                            }
+                            let i = plane * h * w + ih as usize * w + iw as usize;
+                            if best.is_none_or(|(value, _)| xs[i] > value) {
+                                best = Some((xs[i], i));
+                            }
+                        }
+                    }
+                    let (_, i) = best.expect("every window overlaps the input");
+                    want[i] += ts[(plane * out_h + oh) * out_w + ow] as f64;
+                }
+            }
+        }
+        for i in 0..n_in {
+            assert!(
+                (got[i] as f64 - want[i]).abs() < 1e-5,
+                "{h}x{w} k{k} s{stride} p{padding} dx[{i}]: got {}, want {}",
+                got[i],
+                want[i]
+            );
+        }
+    }
+}
