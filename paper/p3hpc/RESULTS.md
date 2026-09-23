@@ -8,8 +8,9 @@ interrupted upload. No old and new replicates are spliced together.
 The next candidate is **Inferena protocol v13**, revision
 [`129e26af`](https://github.com/kvark/inferena/blob/129e26afc77394abddf5d054871021da22d83bd4/EXPERIMENT.md)
 on `experiment/p3hpc-cuda-graphs`, pinned to Meganeura
-`e8d7d9e3b2192671c0a9fb1aab2e3fc505153260` and Blade
-`fbb4f28c4869e81ae15de58925945b423b9c1ac5`. It retains sixteen graph/schedule
+`dd9bf8acfd69918c4e4feb1db9c40a3b8f44aa36` and Blade
+`fbb4f28c4869e81ae15de58925945b423b9c1ac5`; the Inferena revision that
+carries this engine pin supersedes `129e26af` for collection. It retains sixteen graph/schedule
 forms, interleaves graph and physical-plan choices, and warms paired
 comparisons for two pairs and 250 ms within the shared 60-second session
 deadline. Both engines still warm held-out timing for five calls and two

@@ -45,7 +45,7 @@ The P3HPC paper has been accepted. See the
 for venue requirements and the [current evidence guide](p3hpc/RESULTS.md)
 for the final common-revision cohort.
 
-The next collection uses Inferena protocol v13, pinned to Meganeura `e8d7d9e`:
+The next collection uses Inferena protocol v13, pinned to Meganeura `dd9bf8a`:
 sixteen graph/schedule forms, a shared session deadline, and a 250 ms paired
 search warmup floor. Both engines warm each measured phase for at least five
 calls and two seconds. It retains v12's matched uniform synthetic parameters.

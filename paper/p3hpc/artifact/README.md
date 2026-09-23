@@ -9,7 +9,7 @@ graphics-only qualification conditions. Inferena `06f2f800` and Meganeura
 replaces the accidental Ctrl-C campaign as a whole; its replicates are not
 spliced with earlier results. The 780M failure remains.
 
-The next collection uses v13 (Inferena `129e26af`, Meganeura `e8d7d9e`), with
+The next collection uses v13 (Meganeura `dd9bf8a`, Blade `fbb4f28`), with
 joint graph/schedule search, a shared native deadline, and matched uniform
 parameters. It warms search comparisons for two pairs and 250 ms and held-out
 timing for five calls and two seconds. This auditor and its pinned hashes
