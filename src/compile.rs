@@ -5553,6 +5553,49 @@ impl<'a> Compiler<'a> {
                 });
             }
 
+            Op::GlobalAvgPool { channels, spatial } if spatial > 32 => {
+                // One thread per (batch, channel) plane serialises a whole
+                // plane per lane: EfficientNet's squeeze-excite pools
+                // 112x112 planes, 32 of them at batch 1. Give each plane a
+                // workgroup with contiguous loads instead.
+                use crate::schedule::{PointwiseDAG, Pw, ReduceOp, ReductionKernel};
+                let input = self.get_buffer(node.inputs[0]);
+                let rows = node.ty.num_elements() as u32;
+                debug_assert_eq!(rows % channels, 0);
+                let kernel = ReductionKernel {
+                    op: ReduceOp::Sum,
+                    prologue: PointwiseDAG {
+                        n_inputs: 1,
+                        ops: vec![
+                            Pw::LoadInput(0),
+                            Pw::const_f32(1.0 / spatial as f32),
+                            Pw::Mul(0, 1),
+                        ],
+                        output: 2,
+                    },
+                    extra_prologues: vec![],
+                    epilogue: None,
+                    n_per_elem: 1,
+                    n_per_row: 0,
+                    workgroup_size: 256,
+                    rows_per_workgroup: 1,
+                    gather_elem: Vec::new(),
+                    input_row_repeats: Vec::new(),
+                };
+                self.plan.dispatches.push(Dispatch {
+                    // Generated-reduction routing takes priority over the
+                    // sentinel entry in pipeline selection and binding.
+                    shader: ShaderEntry::GlobalAvgPool,
+                    workgroups: [rows, 1, 1],
+                    input_buffers: vec![input],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![rows, spatial, 1.0_f32.to_bits(), 0],
+                    kernel: Kernel::Reduction(kernel),
+                    ..Default::default()
+                });
+            }
+
             Op::GlobalAvgPool { channels, spatial } => {
                 let input = self.get_buffer(node.inputs[0]);
                 let total_out = node.ty.num_elements() as u32;

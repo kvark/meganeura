@@ -325,3 +325,39 @@ fn per_channel_bias_gradient_matches_reference() {
         }
     }
 }
+
+/// Wide planes pool through a workgroup-per-plane reduction; narrow ones
+/// keep the one-thread-per-plane kernel. Both must average exactly.
+#[test]
+fn global_avg_pool_matches_reference() {
+    for (batch, channels, spatial) in [(2usize, 3usize, 7usize), (2, 3, 1000), (1, 32, 12544)] {
+        let n = batch * channels * spatial;
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[n]);
+        let y = graph.global_avg_pool(x, batch as u32, channels as u32, spatial as u32);
+        graph.set_outputs(vec![y]);
+        let (mut session, _) = meganeura::build(
+            &graph,
+            meganeura::SessionConfig {
+                mode: meganeura::Mode::Inference,
+                ..meganeura::SessionConfig::default()
+            },
+        );
+        let xs = values(n, 0.013, 0.2);
+        session.set_input("x", &xs);
+        session.step();
+        session.wait();
+        let got = session.read_output(batch * channels);
+        for (row, value) in got.iter().enumerate() {
+            let want = xs[row * spatial..(row + 1) * spatial]
+                .iter()
+                .map(|&v| v as f64)
+                .sum::<f64>()
+                / spatial as f64;
+            assert!(
+                (*value as f64 - want).abs() < 1e-5,
+                "{batch}x{channels}x{spatial} row {row}: got {value}, want {want}"
+            );
+        }
+    }
+}
