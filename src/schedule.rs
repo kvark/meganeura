@@ -38,6 +38,15 @@ use crate::codegen::ShaderModule;
 pub enum Pw {
     /// Load input stream `idx` at the current element position.
     LoadInput(u8),
+    /// Load input stream `input` at `(i / divisor) % modulus`, where `i` is
+    /// the flat element index: a per-channel bias over NCHW is
+    /// `divisor = H*W, modulus = C`. Only flat pointwise kernels can emit
+    /// it; see [`PointwiseDAG::has_broadcast`].
+    LoadBroadcast {
+        input: u8,
+        divisor: u32,
+        modulus: u32,
+    },
     /// Literal f32 constant. Stored as bit pattern so `Hash`/`Eq` are stable.
     Const(u32),
     // Binary ops — reference earlier value-node indices.
@@ -98,12 +107,31 @@ impl PointwiseDAG {
     /// reduction prologues. The indent and `let v{k} = ` prefix are
     /// emitted by this method.
     pub fn emit_body(&self, load: impl Fn(u8) -> String) -> String {
+        self.emit_body_with(load, |_, _, _| {
+            panic!("broadcast loads are only valid in flat pointwise kernels")
+        })
+    }
+
+    /// [`Self::emit_body`] for a kernel that can also address broadcast
+    /// loads: `broadcast(idx, divisor, modulus)` returns the load expression.
+    pub fn emit_body_with(
+        &self,
+        load: impl Fn(u8) -> String,
+        broadcast: impl Fn(u8, u32, u32) -> String,
+    ) -> String {
         let mut out = String::new();
         for (k, op) in self.ops.iter().enumerate() {
             let _ = write!(out, "    let v{} = ", k);
             match *op {
                 Pw::LoadInput(idx) => {
                     let _ = write!(out, "{}", load(idx));
+                }
+                Pw::LoadBroadcast {
+                    input,
+                    divisor,
+                    modulus,
+                } => {
+                    let _ = write!(out, "{}", broadcast(input, divisor, modulus));
                 }
                 Pw::Const(bits) => {
                     // Reconstruct f32 and emit with a decimal point + `f` suffix
@@ -202,6 +230,22 @@ impl PointwiseDAG {
         }
     }
 
+    /// Whether any input is read through a broadcast index rather than at
+    /// the current element. Such DAGs cannot move into reduction prologues
+    /// or matmul epilogues, whose element positions are not flat indices.
+    pub fn has_broadcast(&self) -> bool {
+        self.ops
+            .iter()
+            .any(|op| matches!(op, Pw::LoadBroadcast { .. }))
+    }
+
+    /// Whether input stream `idx` is read through a broadcast index.
+    pub fn broadcasts_input(&self, idx: u8) -> bool {
+        self.ops
+            .iter()
+            .any(|op| matches!(*op, Pw::LoadBroadcast { input, .. } if input == idx))
+    }
+
     /// Fuse a `producer` DAG into one of this DAG's input streams.
     ///
     /// Returns a new DAG equivalent to "whatever `self` does, but wherever
@@ -229,22 +273,43 @@ impl PointwiseDAG {
         // a new op — it aliases directly to `producer.output`.
         let mut self_remap: Vec<u16> = Vec::with_capacity(self.ops.len());
 
+        let remap_input = |j: u8| {
+            if j < consumer_input_idx {
+                producer.n_inputs + j
+            } else {
+                producer.n_inputs + j - 1
+            }
+        };
         for op in &self.ops {
-            if let Pw::LoadInput(j) = *op {
-                if j == consumer_input_idx {
+            match *op {
+                Pw::LoadInput(j) if j == consumer_input_idx => {
                     self_remap.push(producer.output);
                     continue;
                 }
+                // A producer that reads nothing is a literal, which is the
+                // same at every index; anything else is only valid at the
+                // consumer's own element.
+                Pw::LoadBroadcast { input, .. } if input == consumer_input_idx => {
+                    assert_eq!(
+                        producer.n_inputs, 0,
+                        "fuse_input: cannot substitute a computed value for a broadcast load"
+                    );
+                    self_remap.push(producer.output);
+                    continue;
+                }
+                _ => {}
             }
             let remapped = match *op {
-                Pw::LoadInput(j) => {
-                    let new_j = if j < consumer_input_idx {
-                        producer.n_inputs + j
-                    } else {
-                        producer.n_inputs + j - 1
-                    };
-                    Pw::LoadInput(new_j)
-                }
+                Pw::LoadInput(j) => Pw::LoadInput(remap_input(j)),
+                Pw::LoadBroadcast {
+                    input,
+                    divisor,
+                    modulus,
+                } => Pw::LoadBroadcast {
+                    input: remap_input(input),
+                    divisor,
+                    modulus,
+                },
                 Pw::Const(bits) => Pw::Const(bits),
                 Pw::Add(a, b) => Pw::Add(self_remap[a as usize], self_remap[b as usize]),
                 Pw::Mul(a, b) => Pw::Mul(self_remap[a as usize], self_remap[b as usize]),
@@ -564,7 +629,15 @@ fn lower_pointwise(dag: &PointwiseDAG, grid: GridShape) -> ShaderModule {
     );
     src.push_str("    let i = gid.x;\n");
     src.push_str("    if i >= params.len { return; }\n");
-    src.push_str(&dag.emit_body(|idx| format!("{}[i]", input_names[idx as usize])));
+    src.push_str(&dag.emit_body_with(
+        |idx| format!("{}[i]", input_names[idx as usize]),
+        |idx, divisor, modulus| {
+            format!(
+                "{}[(i / {divisor}u) % {modulus}u]",
+                input_names[idx as usize]
+            )
+        },
+    ));
     let _ = writeln!(src, "    dst[i] = v{};", dag.output);
     src.push_str("}\n");
 
