@@ -199,7 +199,13 @@ impl PointwiseDAG {
                     let _ = write!(out, "v{} / (1.0 + exp(-v{}))", a, a);
                 }
                 Pw::Tanh(a) => {
-                    let _ = write!(out, "tanh(v{})", a);
+                    // Saturated outside ±10 (exactly ±1 in f32): some drivers
+                    // evaluate tanh through exp(2x), which overflows to NaN.
+                    let _ = write!(
+                        out,
+                        "select(tanh(v{a}), sign(v{a}), abs(v{a}) > 10.0)",
+                        a = a
+                    );
                 }
             }
             out.push_str(";\n");

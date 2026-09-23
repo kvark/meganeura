@@ -79,7 +79,9 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         }
         wg_dot[tid] = partial;
         tree_reduce(tid);
-        let score = softcap * tanh(wg_dot[0] / softcap);
+        // Saturate beyond ±10: some drivers overflow tanh's exp(2x) to NaN.
+        let capped = wg_dot[0] / softcap;
+        let score = softcap * select(tanh(capped), sign(capped), abs(capped) > 10.0);
         workgroupBarrier();
 
         let new_max = max(max_score, score);

@@ -65,7 +65,10 @@ fn silu(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn tanh_(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if i >= params.len { return; }
-    dst[i] = tanh(src[i]);
+    // tanh is exactly ±1 in f32 beyond |x| = 10, and some drivers (Metal)
+    // evaluate it through exp(2x), which overflows to inf/inf = NaN.
+    let x = src[i];
+    dst[i] = select(tanh(x), sign(x), abs(x) > 10.0);
 }
 
 // gelu approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))),
