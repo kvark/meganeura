@@ -1754,6 +1754,12 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
                 if slot_count != 1 {
                     continue;
                 }
+                // A broadcast read wants the producer at another element.
+                if c.pointwise()
+                    .is_some_and(|dag| dag.broadcasts_input(slot_idx as u8))
+                {
+                    continue;
+                }
                 // Arity cap: the runtime binds pointwise pipelines via
                 // UnaryData (n=1), BinaryData (n=2), or TernaryData (n=3).
                 // A higher-arity fused DAG would need a wider layout we
@@ -2004,7 +2010,7 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                     continue;
                 }
                 let p = &plan.dispatches[pi];
-                if p.pointwise().is_none() || p.fusion_barrier {
+                if p.pointwise().is_none_or(PointwiseDAG::has_broadcast) || p.fusion_barrier {
                     continue;
                 }
                 // Producer must cover the per-element domain (outer*inner).
@@ -2629,7 +2635,7 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
             output: 1,
         };
         let epilogue_dag = match d.pointwise() {
-            Some(dag) if dag.n_inputs == 1 => dag.clone(),
+            Some(dag) if dag.n_inputs == 1 && !dag.has_broadcast() => dag.clone(),
             Some(_) => continue,
             None => canonical_dag,
         };
@@ -5068,16 +5074,44 @@ impl<'a> Compiler<'a> {
                 let src = self.get_buffer(node.inputs[0]);
                 let bias = self.get_buffer(node.inputs[1]);
                 let len = node.ty.shape[0] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::AddPerChannel,
-                    workgroups: [len.div_ceil(256), 1, 1],
-                    input_buffers: vec![src, bias],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![len, spatial, channels, 0],
+                if self.options.use_schedule_pointwise {
+                    // As a pointwise DAG the bias add fuses with the
+                    // activation after it, so a conv -> bias -> ReLU block
+                    // writes one activation instead of two.
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::Add,
+                        workgroups: [len.div_ceil(256), 1, 1],
+                        input_buffers: vec![src, bias],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![len, 0, 0, 0],
+                        kernel: Kernel::Pointwise(PointwiseDAG {
+                            n_inputs: 2,
+                            ops: vec![
+                                Pw::LoadInput(0),
+                                Pw::LoadBroadcast {
+                                    input: 1,
+                                    divisor: spatial,
+                                    modulus: channels,
+                                },
+                                Pw::Add(0, 1),
+                            ],
+                            output: 2,
+                        }),
+                        ..Default::default()
+                    });
+                } else {
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::AddPerChannel,
+                        workgroups: [len.div_ceil(256), 1, 1],
+                        input_buffers: vec![src, bias],
+                        output_buffer: out_buf,
+                        extra_outputs: vec![],
+                        params: vec![len, spatial, channels, 0],
 
-                    ..Default::default()
-                });
+                        ..Default::default()
+                    });
+                }
             }
 
             Op::Conv2dDw {
@@ -7486,7 +7520,10 @@ mod tests {
             plan.constant_buffers.iter().map(|entry| entry.0).collect();
         for dispatch in plan.dispatches.iter().filter(|d| d.pointwise().is_some()) {
             assert!(
-                dispatch.input_buffers.iter().all(|b| !constants.contains(b)),
+                dispatch
+                    .input_buffers
+                    .iter()
+                    .all(|b| !constants.contains(b)),
                 "{} still reads a constant tensor",
                 dispatch.label
             );
@@ -7497,6 +7534,23 @@ mod tests {
                 .all(|d| d.shader != ShaderEntry::Greater),
             "the ReLU mask was not fused into its consumer"
         );
+    }
+
+    #[test]
+    fn per_channel_bias_fuses_into_relu() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[2 * 8 * 36]);
+        let b = g.parameter("b", &[8]);
+        let y = g.add_per_channel(x, b, 8, 36);
+        let y = g.relu(y);
+        g.set_outputs(vec![y]);
+        let plan = compile(&g);
+        assert_eq!(plan.dispatches.len(), 1, "{:#?}", plan.dispatches);
+        let dag = plan.dispatches[0]
+            .pointwise()
+            .expect("fused pointwise kernel");
+        assert!(dag.has_broadcast());
+        assert!(dag.ops.contains(&Pw::Relu(2)));
     }
 
     #[test]

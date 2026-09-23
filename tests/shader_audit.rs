@@ -509,3 +509,35 @@ fn cross_entropy_online_pass_matches_reference() {
         "loss: got {got_loss}, want {want_loss}"
     );
 }
+
+/// The per-channel bias add is a broadcast pointwise kernel that fuses with
+/// the activation after it; the fused kernel must index the bias exactly.
+#[test]
+fn fused_per_channel_bias_and_relu_match_reference() {
+    let (batch, channels, spatial) = (3usize, 7usize, 45usize);
+    let n = batch * channels * spatial;
+    let mut graph = Graph::new();
+    let x = graph.input("x", &[n]);
+    let b = graph.input("b", &[channels]);
+    let y = graph.add_per_channel(x, b, channels as u32, spatial as u32);
+    let y = graph.relu(y);
+    graph.set_outputs(vec![y]);
+    let (mut session, _) = meganeura::build(
+        &graph,
+        meganeura::SessionConfig {
+            mode: meganeura::Mode::Inference,
+            ..meganeura::SessionConfig::default()
+        },
+    );
+    let xs = values(n, 0.29, 0.1);
+    let bs = values(channels, 1.3, 0.7);
+    session.set_input("x", &xs);
+    session.set_input("b", &bs);
+    session.step();
+    session.wait();
+    let got = session.read_output(n);
+    for i in 0..n {
+        let want = (xs[i] + bs[(i / spatial) % channels]).max(0.0);
+        assert_eq!(got[i], want, "element {i}");
+    }
+}
