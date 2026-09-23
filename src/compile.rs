@@ -3862,39 +3862,9 @@ impl<'a> Compiler<'a> {
                 self.emit_binary(ShaderEntry::Greater, node, out_buf);
             }
 
-            Op::BiasAdd => {
-                let a = self.get_buffer(node.inputs[0]);
-                let b = self.get_buffer(node.inputs[1]);
-                let len = node.ty.num_elements() as u32;
-                let bias_len = self.graph.node(node.inputs[1]).ty.num_elements() as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::BiasAdd,
-                    workgroups: [len.div_ceil(256), 1, 1],
-                    input_buffers: vec![a, b],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![len, bias_len, 0, 0],
+            Op::BiasAdd => self.emit_row_broadcast(ShaderEntry::BiasAdd, node, out_buf),
 
-                    ..Default::default()
-                });
-            }
-
-            Op::BiasMul => {
-                let a = self.get_buffer(node.inputs[0]);
-                let scale = self.get_buffer(node.inputs[1]);
-                let len = node.ty.num_elements() as u32;
-                let scale_len = self.graph.node(node.inputs[1]).ty.num_elements() as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::BiasMul,
-                    workgroups: [len.div_ceil(256), 1, 1],
-                    input_buffers: vec![a, scale],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![len, scale_len, 0, 0],
-
-                    ..Default::default()
-                });
-            }
+            Op::BiasMul => self.emit_row_broadcast(ShaderEntry::BiasMul, node, out_buf),
 
             Op::Relu => {
                 self.emit_unary(ShaderEntry::Relu, node, out_buf);
@@ -6606,6 +6576,57 @@ impl<'a> Compiler<'a> {
         });
     }
 
+    /// `out[i] = a[i] (+ or *) b[i % len(b)]`: a bias or scale per column.
+    /// As a broadcast pointwise DAG it fuses with its neighbours, and a
+    /// constant operand (autodiff broadcasts a row with `zeros + b`) folds
+    /// to a literal.
+    fn emit_row_broadcast(&mut self, shader: ShaderEntry, node: &Node, out_buf: BufferRef) {
+        let a = self.get_buffer(node.inputs[0]);
+        let b = self.get_buffer(node.inputs[1]);
+        let len = node.ty.num_elements() as u32;
+        let row_len = self.graph.node(node.inputs[1]).ty.num_elements() as u32;
+        if !self.options.use_schedule_pointwise {
+            self.plan.dispatches.push(Dispatch {
+                shader,
+                workgroups: [len.div_ceil(256), 1, 1],
+                input_buffers: vec![a, b],
+                output_buffer: out_buf,
+                extra_outputs: vec![],
+                params: vec![len, row_len, 0, 0],
+
+                ..Default::default()
+            });
+            return;
+        }
+        let combine = match shader {
+            ShaderEntry::BiasAdd => Pw::Add(0, 1),
+            ShaderEntry::BiasMul => Pw::Mul(0, 1),
+            _ => unreachable!("not a row broadcast: {shader:?}"),
+        };
+        self.plan.dispatches.push(Dispatch {
+            shader: pointwise_sentinel(2),
+            workgroups: [len.div_ceil(256), 1, 1],
+            input_buffers: vec![a, b],
+            output_buffer: out_buf,
+            extra_outputs: vec![],
+            params: vec![len, 0, 0, 0],
+            kernel: Kernel::Pointwise(PointwiseDAG {
+                n_inputs: 2,
+                ops: vec![
+                    Pw::LoadInput(0),
+                    Pw::LoadBroadcast {
+                        input: 1,
+                        divisor: 1,
+                        modulus: row_len,
+                    },
+                    combine,
+                ],
+                output: 2,
+            }),
+            ..Default::default()
+        });
+    }
+
     fn emit_binary(&mut self, shader: ShaderEntry, node: &Node, out_buf: BufferRef) {
         let a = self.get_buffer(node.inputs[0]);
         let b = self.get_buffer(node.inputs[1]);
@@ -6901,9 +6922,13 @@ mod tests {
 
         let plan = compile(&g);
         assert_eq!(plan.dispatches.len(), 1);
-        assert_eq!(plan.dispatches[0].shader, ShaderEntry::BiasAdd);
         assert_eq!(plan.dispatches[0].params[0], 512); // 4*128
-        assert_eq!(plan.dispatches[0].params[1], 128); // bias len
+        let dag = plan.dispatches[0].pointwise().expect("broadcast pointwise");
+        assert!(dag.ops.contains(&Pw::LoadBroadcast {
+            input: 1,
+            divisor: 1,
+            modulus: 128,
+        }));
     }
 
     #[test]
@@ -7637,11 +7662,13 @@ mod tests {
 
         let opt = crate::optimize::optimize(&g);
         let plan = compile(&opt);
-        // With cooperative matrix, matmul+bias_add+relu are separate dispatches
-        assert_eq!(plan.dispatches.len(), 3);
+        // The matmul keeps no epilogue; the bias add and ReLU fuse into one
+        // broadcast pointwise dispatch after it.
+        assert_eq!(plan.dispatches.len(), 2);
         assert_eq!(plan.dispatches[0].shader, ShaderEntry::MatMul);
-        assert_eq!(plan.dispatches[1].shader, ShaderEntry::BiasAdd);
-        assert_eq!(plan.dispatches[2].shader, ShaderEntry::Relu);
+        let dag = plan.dispatches[1].pointwise().expect("fused bias and ReLU");
+        assert!(dag.has_broadcast());
+        assert!(dag.ops.iter().any(|op| matches!(op, Pw::Relu(_))));
     }
 
     #[test]
