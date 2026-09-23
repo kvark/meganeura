@@ -449,3 +449,63 @@ fn transpose_matches_reference_on_ragged_tiles() {
         }
     }
 }
+
+/// Cross-entropy combines max, sum-exp and the label sum in one online pass.
+/// Wide logit ranges make lanes rescale their running sums repeatedly.
+#[test]
+fn cross_entropy_online_pass_matches_reference() {
+    let (rows, classes) = (3usize, 5000usize);
+    let logits: Vec<f32> = (0..rows * classes)
+        .map(|i| ((i * 7919) % 1000) as f32 * 0.08 - 40.0 + (i % 5000) as f32 * 0.004)
+        .collect();
+    let mut labels = vec![0.0f32; rows * classes];
+    for r in 0..rows {
+        labels[r * classes + (r * 1777) % classes] = 0.75;
+        labels[r * classes + (r * 331 + 5) % classes] = 0.5;
+    }
+    let mut graph = Graph::new();
+    let x = graph.parameter("x", &[rows, classes]);
+    let y = graph.input("y", &[rows, classes]);
+    let loss = graph.cross_entropy_loss(x, y);
+    graph.set_outputs(vec![loss]);
+    let mut session = meganeura::build(&graph, meganeura::SessionConfig::from_env()).0;
+    session.set_parameter("x", &logits);
+    session.set_input("y", &labels);
+    session.set_learning_rate(0.0);
+    session.step();
+    session.wait();
+    let got_loss = session.read_loss();
+    let mut got_grad = vec![0.0; rows * classes];
+    session.read_param_grad("x", &mut got_grad);
+
+    let mut want_loss = 0.0f64;
+    for r in 0..rows {
+        let row = &logits[r * classes..(r + 1) * classes];
+        let max = row.iter().fold(f64::MIN, |m, &v| m.max(v as f64));
+        let lse = row
+            .iter()
+            .map(|&v| (v as f64 - max).exp())
+            .sum::<f64>()
+            .ln()
+            + max;
+        let label_sum: f64 = labels[r * classes..(r + 1) * classes]
+            .iter()
+            .map(|&v| v as f64)
+            .sum();
+        for c in 0..classes {
+            let i = r * classes + c;
+            let log_softmax = logits[i] as f64 - lse;
+            want_loss -= labels[i] as f64 * log_softmax / rows as f64;
+            let want = (log_softmax.exp() * label_sum - labels[i] as f64) / rows as f64;
+            assert!(
+                (got_grad[i] as f64 - want).abs() < 1e-5,
+                "grad[{r}, {c}]: got {}, want {want}",
+                got_grad[i]
+            );
+        }
+    }
+    assert!(
+        (got_loss as f64 - want_loss).abs() < 1e-3 * want_loss.abs().max(1.0),
+        "loss: got {got_loss}, want {want_loss}"
+    );
+}
