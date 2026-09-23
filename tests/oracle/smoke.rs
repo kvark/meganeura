@@ -37,3 +37,22 @@ fn smoke() {
     println!("{report}");
     report.assert_passed("training");
 }
+
+/// With poisoning, memory nothing wrote reads as NaN: an input the caller
+/// never set produces NaN rather than a plausible zero.
+#[test]
+fn poison_reaches_unwritten_memory() {
+    let mut g = Graph::new();
+    let x = g.input("x", &[300]);
+    let y = g.neg(x);
+    g.set_outputs(vec![y]);
+    let mut config = meganeura::SessionConfig::from_env();
+    config.mode = meganeura::Mode::Inference;
+    config.runtime.poison = true;
+    let (mut session, _) = meganeura::build(&g, config);
+    session.step();
+    session.wait();
+    let mut out = vec![0.0f32; 300];
+    session.read_output_by_index(0, &mut out);
+    assert!(out.iter().all(|v| v.is_nan()), "{:?}", &out[..4]);
+}
