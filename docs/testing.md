@@ -42,8 +42,8 @@ conflates them:
 1. **Is the differentiation rule right?** `reference::gradients::check`
    evaluates `autodiff::differentiate` with the reference interpreter and
    compares every parameter gradient with central finite differences, in
-   `f64` on the CPU. At that precision the check needs no loose tolerance,
-   and a failure can only be the rule. Ops sit mid-graph under
+   `f64` on the CPU. This excludes GPU execution as the cause, not mistakes
+   in the reference or finite-difference error. Ops sit mid-graph under
    `gradients::weighted_loss` (`coef · Σ w ⊙ y` with fixed random `w`), so a
    backward that assumes `dL/dy = 1` fails. Random directional probes cover
    every element at once, including ones with small gradients that
@@ -68,10 +68,11 @@ of products the rounding error scales with `Σ|aᵢbᵢ|`, not with the result,
 so `reference::error_scales` evaluates such ops on the magnitudes of their
 inputs and carries these scales through every linear op in the graph. Element
 `i` passes when `|got − want| ≤ rtol · (sᵢ + floor · max s)`, with
-`rtol = 2e-4` by default. A wrong index, mask or missing term errs by the
-size of the value itself, several orders of magnitude above this.
+`rtol = 2e-4` by default. This accommodates cancellation without scaling the
+bound to observed device errors. It is a practical error model, not a proof
+that every wrong index or missing term will be detected.
 
-Every case runs under each alternative lowering as well as the default:
+Family sweeps can run each alternative lowering as well as the default:
 the hand-written pointwise and reduction shaders instead of the generated
 ones, and no dispatch fusion (`gpu::Options::lowerings`). Training checks
 compare every user output and every parameter gradient, including a

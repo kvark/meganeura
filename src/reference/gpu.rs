@@ -168,12 +168,17 @@ pub fn check_training(graph: &Graph, feeds: &Feeds, options: &Options) -> Result
         });
     }
 
-    let params = graph.nodes().iter().filter_map(|n| match n.op {
-        Op::Parameter { ref name } => Some(name.clone()),
-        _ => None,
-    });
+    let params: Vec<_> = graph
+        .nodes()
+        .iter()
+        .filter_map(|n| match n.op {
+            Op::Parameter { ref name } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
     let grads = &backward.outputs()[backward.num_user_outputs()..];
-    for (name, &grad_id) in params.zip(grads) {
+    assert_eq!(params.len(), grads.len(), "missing reference gradients");
+    for (name, &grad_id) in params.into_iter().zip(grads) {
         if let Some(got) = packed_gradient(&session, &name) {
             let (want, magnitude) = (&values[grad_id as usize], &scales[grad_id as usize]);
             report.comparisons.push(Comparison {
@@ -222,6 +227,9 @@ fn packed_gradient(session: &crate::Session, name: &str) -> Option<Vec<f32>> {
         .iter()
         .find(|entry| entry.1.iter().any(|source| source.0 == name))?;
     let packed = &plan.param_buffers.iter().find(|entry| entry.1 == buffer)?.0;
+    if !session.has_param_grad(packed) {
+        return None;
+    }
     let ty = plan.param_types.get(&buffer)?;
     let mut grad = vec![0.0f32; ty.num_elements()];
     session.read_param_grad(packed, &mut grad);
