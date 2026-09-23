@@ -50,8 +50,9 @@ sixteen graph/schedule forms, a shared session deadline, and a 250 ms paired
 search warmup floor. Both engines warm each measured phase for at least five
 calls and two seconds. It retains v12's matched uniform synthetic parameters.
 ROCm Whisper uses eager efficient SDPA inside the compiled encoder after a
-data-sensitive repeatability failure. The [separate qualification finding](p3hpc/RESULTS.md#rocm-whisper-repeatability-separate-qualification-finding)
-is a portability case study, not a new timing result.
+data-sensitive repeatability failure, but that policy also failed a later run
+and is not a qualified fix. The [separate qualification finding](p3hpc/RESULTS.md#rocm-whisper-repeatability-separate-qualification-finding)
+remains unresolved; it is a portability case study, not a new timing result.
 Until those results arrive, the P3HPC tables and measured methodology still
 describe v10. Do not relabel old records or mix cohorts.
 

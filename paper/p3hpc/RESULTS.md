@@ -16,7 +16,8 @@ deadline. Both engines still warm held-out timing for five calls and two
 seconds. Checkpoints, compilation deadlines, replay requirements and numerical
 gates are unchanged. ROCm Whisper now uses eager efficient SDPA inside the
 otherwise compiled encoder, following the separate failure investigation below.
-The affected AMD path still needs paired qualification in both contracts.
+That policy also failed a later AMD run. The affected path remains unqualified;
+an isolated passing retry does not establish a fix.
 Use the instructions in Inferena's `EXPERIMENT.md` to qualify each backend
 before collection. Do not relabel the paper's v10 records as v13.
 
@@ -48,9 +49,9 @@ locate the underlying compiler or kernel defect. Do not describe the uniform
 initializer as injecting randomness between calls: its values are fixed by
 the canonical parameter name and element index.
 
-Reported same-GPU controls distinguish math SDPA inside a compiled encoder
-(fails even when SDPA itself is eager) from eager efficient SDPA (bit-exact
-training outputs). A fully eager encoder with math SDPA also repeats exactly.
+Initial same-GPU controls found math SDPA inside a compiled encoder failed
+even when SDPA itself was eager, while eager efficient SDPA gave bit-exact
+training outputs. A fully eager encoder with math SDPA also repeated exactly.
 Automatic selection passes some isolated runs but fails in the campaign;
 the enabled-backend list alone does not identify the selected kernel.
 Inferena `757f6a8` therefore records eager efficient SDPA for ROCm Whisper
@@ -58,12 +59,30 @@ only. The encoder remains compiled, HIP replay remains enabled, and no
 tolerance is relaxed. This is a numerical portability finding in the AMD
 vendor stack, not an installation or collection setup failure.
 
-Evidence stays outside Git: `amd-dgpu-temp.tgz`, SHA-256
+A later campaign, `rubik-20260923T163520494362Z-757f6a80`, confirms failure with
+the eager efficient policy correctly applied at `757f6a80`. The first four strict
+pairs pass, with bit-exact ordinary output repeats in all three phases. Whisper
+again fails at `uncaptured repeat 1 output 0`, with maximum
+error 0.00235241 against 9.10142e-6 and RMS error 9.13354e-5 against 3.07931e-6.
+There are 157,226 pointwise mismatches out of 576,000. Compilation completed in
+7.90584 seconds and inference capture passed; no accelerated pair was reached.
+This counterexample invalidates the policy as an established workaround and
+prevents attributing the fault specifically to math SDPA. The underlying defect
+remains unresolved. Retrying until a process passes would select successful
+runs, not demonstrate repeatability. No tolerance change, automatic retry, or
+eager timing substitution is justified by these controls.
+
+Evidence stays outside Git. The earlier `2a8cbf52` upload, `amd-dgpu-temp.tgz`,
+had SHA-256
 `366a8d035e5a86ed7aa3cf4b37bb2183c7f0a8ca7f2f1f20d182c5eed59792fb`.
 That archive establishes the failed uniform-fixture campaign. The initializer
 bisection and backend controls were reported separately by the AMD-side
 investigation; no quantitative old/new-weight comparison is inferred from
-this archive. Neither these failures nor the passing controls enter the v10
+this archive. The replacement upload with that filename contains the
+`757f6a80` campaign, SHA-256
+`46960bab05d86559153ce5d2f74bdf99d36f1a4a93dd41bc029078db4176da39`;
+its manifest, PyTorch error record, preparation receipt and runner log agree.
+Neither these failures nor the passing controls enter the v10
 tables, portability scores, or supplementary measurement stream.
 
 ## Optimizer studies outside the cohort

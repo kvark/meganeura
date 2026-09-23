@@ -1020,12 +1020,14 @@ differ by up to $1.97\times10^{-3}$, exceeding the $9.10\times10^{-6}$
 bound under unchanged tolerances before HIP capture; inference capture passes.
 With math SDPA, the fully eager encoder repeats but the compiled encoder
 does not, even when SDPA itself is eager. Eager efficient SDPA gives bit-exact
-training outputs in the reported control. The updated harness records that
-choice, retaining encoder compilation, graph replay, and numerical gates.\footnote{\href{https://github.com/kvark/inferena/blob/757f6a80b3dee2d6e9392fbbfc28e64febc9fe28/EXPERIMENT.md}{ROCm Whisper controls and reference policy, revision \code{757f6a8}}.}
-This is a data-sensitive failure in the AMD vendor stack, not a setup
-problem; the controls do not locate the underlying defect. These diagnostics
-remain separate from the timing cohort, and the workaround still needs
-paired qualification in both arithmetic contracts.
+training outputs in an initial control, but a later run with that policy also
+fails at the same check, with maximum error $2.35\times10^{-3}$.
+It is not a qualified workaround, and the passing control does not
+isolate the fault to math SDPA.\footnote{\href{https://github.com/kvark/inferena/blob/757f6a80b3dee2d6e9392fbbfc28e64febc9fe28/EXPERIMENT.md}{Initial ROCm Whisper controls and reference policy, revision \code{757f6a8}}.}
+This is unresolved numerical portability in the compiled PyTorch/ROCm path,
+not a setup problem. Retrying until a process passes would select a successful
+run, not repair the failure. These diagnostics remain separate from the timing
+cohort; no tolerance is relaxed or eager timing substituted.
 
 MI300X exposes a different boundary: driver availability for a
 compute-focused accelerator. PyTorch/ROCm runs strict 135M on the attempted
