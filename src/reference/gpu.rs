@@ -1,7 +1,7 @@
 //! Run a graph on the GPU and compare it with the reference.
 
-use super::{Comparison, Error, Feeds, Report, Tensor, Tolerance, check, evaluate, magnitudes};
-use crate::graph::{DType, Graph, NodeId, Op};
+use super::{Comparison, Error, Feeds, Report, Tensor, Tolerance, check, error_scales, evaluate};
+use crate::graph::{DType, Graph, Op};
 use crate::train::{Mode, SessionConfig, build};
 
 /// How to build the session under test.
@@ -72,19 +72,17 @@ fn upload(session: &mut crate::Session, graph: &Graph, feeds: &Feeds) -> Result<
     Ok(())
 }
 
-/// Reference value and error scale of `node`.
-fn reference(graph: &Graph, values: &[Tensor], id: NodeId) -> Result<(Tensor, Vec<f64>), Error> {
-    let node = graph.node(id);
-    let inputs: Vec<&Tensor> = node.inputs.iter().map(|&i| &values[i as usize]).collect();
-    let out = values[id as usize].clone();
-    let magnitude = magnitudes(graph, node, &inputs, &out)?;
-    Ok((out, magnitude))
+/// Reference values and error scales of every node.
+fn reference(graph: &Graph, feeds: &Feeds) -> Result<(Vec<Tensor>, Vec<Vec<f64>>), Error> {
+    let values = evaluate(graph, feeds)?;
+    let scales = error_scales(graph, &values)?;
+    Ok((values, scales))
 }
 
 /// Build an inference session for `graph`, run one step, and compare every
 /// graph output with the reference.
 pub fn check_inference(graph: &Graph, feeds: &Feeds, options: &Options) -> Result<Report, Error> {
-    let values = evaluate(graph, feeds)?;
+    let (values, scales) = reference(graph, feeds)?;
     let (mut session, _) = build(graph, options.session_config(Mode::Inference));
     upload(&mut session, graph, feeds)?;
     session.step();
@@ -92,12 +90,12 @@ pub fn check_inference(graph: &Graph, feeds: &Feeds, options: &Options) -> Resul
     let mut report = Report::default();
     for (index, &id) in graph.outputs().iter().enumerate() {
         let node = graph.node(id);
-        let (want, magnitude) = reference(graph, &values, id)?;
+        let (want, magnitude) = (&values[id as usize], &scales[id as usize]);
         let mut got = vec![0.0f32; want.len()];
         session.read_output_by_index(index, &mut got);
         report.comparisons.push(Comparison {
             what: format!("output {index} (%{id} {})", op_name(&node.op)),
-            result: check(&got, &want.data, &magnitude, options.tolerance),
+            result: check(&got, &want.data, magnitude, options.tolerance),
         });
     }
     Ok(report)
@@ -112,7 +110,7 @@ pub fn check_inference(graph: &Graph, feeds: &Feeds, options: &Options) -> Resul
 /// those against finite differences independently of any kernel.
 pub fn check_training(graph: &Graph, feeds: &Feeds, options: &Options) -> Result<Report, Error> {
     let backward = crate::autodiff::differentiate(graph);
-    let values = evaluate(&backward, feeds)?;
+    let (values, scales) = reference(&backward, feeds)?;
     let (mut session, _) = build(graph, options.session_config(Mode::Training));
     upload(&mut session, graph, feeds)?;
     session.step();
@@ -120,13 +118,13 @@ pub fn check_training(graph: &Graph, feeds: &Feeds, options: &Options) -> Result
 
     let mut report = Report::default();
     let loss_id = backward.outputs()[0];
-    let (want, magnitude) = reference(&backward, &values, loss_id)?;
+    let (want, magnitude) = (&values[loss_id as usize], &scales[loss_id as usize]);
     report.comparisons.push(Comparison {
         what: "loss".to_string(),
         result: check(
             &[session.read_loss()],
             &want.data,
-            &magnitude,
+            magnitude,
             options.tolerance,
         ),
     });
@@ -140,7 +138,7 @@ pub fn check_training(graph: &Graph, feeds: &Feeds, options: &Options) -> Result
         if !session.has_param_grad(&name) {
             // The compiler omits gradients of parameters that do not reach
             // the loss. The reference must agree they are zero.
-            let (want, _) = reference(&backward, &values, grad_id)?;
+            let want = &values[grad_id as usize];
             report.comparisons.push(Comparison {
                 what: format!("gradient of {name} (absent on device)"),
                 result: check(
@@ -152,12 +150,12 @@ pub fn check_training(graph: &Graph, feeds: &Feeds, options: &Options) -> Result
             });
             continue;
         }
-        let (want, magnitude) = reference(&backward, &values, grad_id)?;
+        let (want, magnitude) = (&values[grad_id as usize], &scales[grad_id as usize]);
         let mut got = vec![0.0f32; want.len()];
         session.read_param_grad(&name, &mut got);
         report.comparisons.push(Comparison {
             what: format!("gradient of {name}"),
-            result: check(&got, &want.data, &magnitude, options.tolerance),
+            result: check(&got, &want.data, magnitude, options.tolerance),
         });
     }
     Ok(report)

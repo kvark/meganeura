@@ -3,3 +3,10 @@
 //! autodiff rule against finite differences on the CPU.
 mod losses;
 mod smoke;
+mod attention;
+mod vision;
+mod norm;
+mod basic;
+mod autodiff;
+mod fuzz;
+mod regressions;

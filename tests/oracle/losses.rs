@@ -1,3 +1,6 @@
+//! Loss ops write one partial per row or workgroup. Their value is the sum,
+//! whether read by `read_loss` or consumed by another node.
+
 use meganeura::Graph;
 use meganeura::reference::{Feeds, gpu};
 
@@ -15,12 +18,13 @@ fn run(consume: bool, bce: bool) {
     g.set_outputs(vec![out]);
     let mut feeds = Feeds::new();
     feeds.fill_random(&g, 3, 1.0);
-    let report = gpu::check_inference(&g, &feeds, &gpu::Options::default()).unwrap();
-    println!("consume={consume} bce={bce}\n{report}");
+    gpu::check_inference(&g, &feeds, &gpu::Options::default())
+        .unwrap()
+        .assert_passed(&format!("consume={consume} bce={bce}"));
 }
 
 #[test]
-fn loss_consumers() {
+fn loss_value_is_the_sum_of_partials_for_every_consumer() {
     for bce in [false, true] {
         for consume in [false, true] {
             run(consume, bce);

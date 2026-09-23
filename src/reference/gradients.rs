@@ -82,6 +82,12 @@ pub fn check(graph: &Graph, feeds: &Feeds, options: &Options) -> Result<Report, 
     let mut report = Report::default();
     let mut perturbed = feeds.clone();
     let h_for = |x: f64| options.step * x.abs().max(1.0);
+    // A central difference cannot resolve changes in the loss below its
+    // rounding error, about eps·|L| per evaluation, divided by 2h. Treat
+    // that as an absolute floor on every comparison.
+    let base_loss = loss(graph, feeds)?;
+    let noise = |h: f64| 64.0 * f64::EPSILON * (base_loss.abs() + 1.0) / h;
+    let floor = |h: f64| noise(h) / options.tolerance.rtol;
 
     for (p, &(ref name, _)) in params.iter().enumerate() {
         let base = feeds
@@ -103,11 +109,12 @@ pub fn check(graph: &Graph, feeds: &Feeds, options: &Options) -> Result<Report, 
             let minus = loss(graph, &perturbed)?;
             numeric[i] = (plus - minus) / (2.0 * h);
         }
-        perturbed.values.insert(name.clone(), base);
+        perturbed.values.insert(name.clone(), base.clone());
         let magnitude: Vec<f64> = analytic[p]
             .iter()
             .zip(&numeric)
-            .map(|(a, n)| a.abs().max(n.abs()))
+            .zip(&base)
+            .map(|((a, n), &x)| a.abs().max(n.abs()) + floor(h_for(x)))
             .collect();
         report.comparisons.push(Comparison {
             what: format!("d loss / d {name}"),
@@ -149,7 +156,12 @@ pub fn check(graph: &Graph, feeds: &Feeds, options: &Options) -> Result<Report, 
         let numeric = (loss(graph, &plus)? - loss(graph, &minus)?) / (2.0 * h);
         report.comparisons.push(Comparison {
             what: format!("directional probe {probe}"),
-            result: check_f64(&[predicted], &[numeric], &[scale], options.tolerance),
+            result: check_f64(
+                &[predicted],
+                &[numeric],
+                &[scale + floor(h)],
+                options.tolerance,
+            ),
         });
     }
     Ok(report)
