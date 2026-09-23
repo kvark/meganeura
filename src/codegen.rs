@@ -5918,18 +5918,21 @@ pub fn generate_conv2d_coop_module(
         src.push_str("    }\n");
         src.push_str("    }\n");
     } else {
-        // A direct cooperative store at a partial right edge crosses the
-        // logical NCHW row boundary. Full column tiles keep the fast path;
-        // only the final partial workgroup stages through the now-dead f32
-        // input tiles and performs bounds-checked scalar stores.
-        let _ = writeln!(src, "    if (tile_col + {output_tile}u) <= n_total {{");
+        // A direct cooperative store writes whole tiles. At a partial right
+        // edge it crosses the logical NCHW row boundary, and at a partial
+        // bottom edge its extra rows are the next image's first channels
+        // (or past the buffer). Only fully covered workgroups keep the fast
+        // path; edge workgroups stage through the now-dead f32 input tiles
+        // and perform bounds-checked scalar stores.
+        let _ = writeln!(
+            src,
+            "    if (tile_col + {output_tile}u) <= n_total && (tile_row + {output_tile}u) <= m_total {{"
+        );
         src.push_str("        if sg == 0u {\n");
         src.push_str("        coopStoreT(acc00, &dst[c00], n_total);\n");
         src.push_str("        coopStoreT(acc01, &dst[c01], n_total);\n");
-        src.push_str("        if m1_valid {\n");
-        src.push_str("            coopStoreT(acc10, &dst[c10], n_total);\n");
-        src.push_str("            coopStoreT(acc11, &dst[c11], n_total);\n");
-        src.push_str("        }\n");
+        src.push_str("        coopStoreT(acc10, &dst[c10], n_total);\n");
+        src.push_str("        coopStoreT(acc11, &dst[c11], n_total);\n");
         src.push_str("        }\n");
         src.push_str("    } else {\n");
         src.push_str("        if sg == 0u {\n");
@@ -7334,11 +7337,16 @@ mod tests {
                     config.tile_size,
                     result.err()
                 );
+                // f32 grad-input kernels store only fully covered
+                // workgroups directly; edge workgroups (right or bottom) go
+                // through bounds-checked scalar stores.
+                let full_tile_gate = ") <= n_total && (tile_row + ";
                 if !config.use_f16_input && direction == Conv2dCoopDirection::GradInput {
-                    assert!(sm.source.contains(") <= n_total {"));
+                    assert!(sm.source.contains(full_tile_gate));
+                    assert!(sm.source.contains(") <= m_total {"));
                     assert!(sm.source.contains("shared_b0[flat]"));
                 } else {
-                    assert!(!sm.source.contains(") <= n_total {"));
+                    assert!(!sm.source.contains(full_tile_gate));
                 }
             }
         }
