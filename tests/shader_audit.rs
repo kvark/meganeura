@@ -561,3 +561,62 @@ fn fused_per_channel_bias_and_relu_match_reference() {
         assert_eq!(got[i], want, "element {i}");
     }
 }
+
+/// Adaptive clipping measures every parameter with many workgroups and
+/// scales each by min(1, clip * max(pmin, ||p||) / ||g||). With SGD the step
+/// reveals the scale the GPU computed for each parameter.
+#[test]
+fn adaptive_grad_clip_measures_large_parameters() {
+    let sizes = [300_001usize, 5, 70_000];
+    let (clip, pmin, lr) = (0.05f32, 1e-3f32, 0.5f32);
+    let mut graph = Graph::new();
+    let mut terms = Vec::new();
+    for (i, &n) in sizes.iter().enumerate() {
+        let p = graph.parameter(&format!("p{i}"), &[n]);
+        let t = graph.input(&format!("t{i}"), &[n]);
+        let product = graph.mul(p, t);
+        terms.push(graph.sum_all(product));
+    }
+    let loss = terms
+        .into_iter()
+        .reduce(|a, b| graph.add(a, b))
+        .expect("at least one term");
+    graph.set_outputs(vec![loss]);
+
+    let initial: Vec<Vec<f32>> = sizes
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| values(n, 0.21 + i as f32 * 0.05, 1.1))
+        .collect();
+    let targets: Vec<Vec<f32>> = sizes
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| values(n, 0.37 + i as f32 * 0.1, 0.3))
+        .collect();
+
+    let mut session = meganeura::build(&graph, meganeura::SessionConfig::from_env()).0;
+    for (i, _) in sizes.iter().enumerate() {
+        session.set_parameter(&format!("p{i}"), &initial[i]);
+        session.set_input(&format!("t{i}"), &targets[i]);
+    }
+    session.set_adaptive_grad_clip(clip, pmin);
+    session.set_learning_rate(lr);
+    session.step();
+    session.wait();
+
+    let norm = |v: &[f32]| v.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
+    for (i, &n) in sizes.iter().enumerate() {
+        let upper = clip as f64 * norm(&initial[i]).max(pmin as f64);
+        let scale = (upper / norm(&targets[i])).min(1.0);
+        let mut after = vec![0.0; n];
+        session.read_param(&format!("p{i}"), &mut after);
+        for j in [0, n / 2, n - 1] {
+            let want = initial[i][j] as f64 - lr as f64 * targets[i][j] as f64 * scale;
+            assert!(
+                (after[j] as f64 - want).abs() <= 1e-5 * want.abs().max(1e-2),
+                "p{i}[{j}]: got {}, want {want}",
+                after[j]
+            );
+        }
+    }
+}

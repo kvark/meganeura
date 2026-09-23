@@ -32,8 +32,10 @@ fn moments_are_lazy_and_accumulators_are_counted_once() {
         let before = s.memory_summary();
         assert_eq!(before.adam_state_bytes, 0);
         assert_eq!(before.grad_accumulator_bytes, 0);
-        // The clip total plus one partial slot per (single-workgroup) parameter.
-        assert_eq!(before.optimizer_aux_bytes, 4 + 3 * 4);
+        // The clip total, a two-float partial slot per (single-workgroup)
+        // parameter, and one adaptive-clip scale per parameter.
+        let clip_scratch = 3 * 8 + 3 * 4;
+        assert_eq!(before.optimizer_aux_bytes, 4 + clip_scratch);
         assert_eq!(
             s.read_adam_states(&["b"]),
             vec![(vec![0.0; 5], vec![0.0; 5])]
@@ -61,7 +63,7 @@ fn moments_are_lazy_and_accumulators_are_counted_once() {
         );
 
         s.set_adam_grouped_grad_norm("b", 1);
-        assert_eq!(s.memory_summary().optimizer_aux_bytes, 24 + 3 * 4);
+        assert_eq!(s.memory_summary().optimizer_aux_bytes, 24 + clip_scratch);
         assert_eq!(s.memory_summary().adam_state_bytes, 0);
         s.set_adam(0.001, 0.9, 0.999, 1e-8);
         let allocated = s.memory_summary();

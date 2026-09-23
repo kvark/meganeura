@@ -7148,7 +7148,9 @@ mod tests {
                 ShaderEntry::WinogradWeightTransform => vec!["src", "dst", "params"],
                 ShaderEntry::GradClipNormSq => vec!["grad", "acc", "params"],
                 ShaderEntry::GradClipScale => vec!["grad", "acc", "params"],
-                ShaderEntry::AdaptiveGradClip => vec!["param", "grad", "params"],
+                ShaderEntry::AdaptiveGradClip => {
+                    vec!["param", "grad", "partials", "scales", "params"]
+                }
                 ShaderEntry::GradAccum => vec!["grad", "acc", "params"],
             }
         }
