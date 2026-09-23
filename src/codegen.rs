@@ -7094,9 +7094,10 @@ mod tests {
                 ShaderEntry::GroupNormApply => {
                     vec!["src", "src_b", "bias", "dst", "partials", "params"]
                 }
-                ShaderEntry::GroupNormGradInput => vec!["src_a", "src_b", "bias", "dst", "params"],
-                ShaderEntry::GroupNormGradWeightBias => {
-                    vec!["src_a", "src_b", "bias", "dst", "params"]
+                ShaderEntry::GroupNormGradInput
+                | ShaderEntry::GroupNormGradWeightBias
+                | ShaderEntry::GroupNormGradStats => {
+                    vec!["src_a", "src_b", "bias", "dst", "stats", "params"]
                 }
                 ShaderEntry::Concat => vec!["src_a", "src_b", "dst", "params"],
                 ShaderEntry::SplitA | ShaderEntry::SplitB => vec!["src", "dst", "params"],
@@ -7227,6 +7228,7 @@ mod tests {
             ShaderEntry::GroupNormApply,
             ShaderEntry::GroupNormGradInput,
             ShaderEntry::GroupNormGradWeightBias,
+            ShaderEntry::GroupNormGradStats,
             ShaderEntry::Concat,
             ShaderEntry::SplitA,
             ShaderEntry::SplitB,

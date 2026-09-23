@@ -337,6 +337,9 @@ pub enum ShaderEntry {
     GroupNormApply,
     GroupNormGradInput,
     GroupNormGradWeightBias,
+    /// Per-(batch, group) mean and inverse deviation shared by both
+    /// GroupNorm backward kernels.
+    GroupNormGradStats,
     Concat,
     SplitA,
     SplitB,
@@ -489,6 +492,7 @@ impl ShaderEntry {
             | ShaderEntry::GroupNormApply
             | ShaderEntry::GroupNormGradInput
             | ShaderEntry::GroupNormGradWeightBias
+            | ShaderEntry::GroupNormGradStats
             | ShaderEntry::GlobalAvgPool
             | ShaderEntry::GlobalAvgPoolGrad
             | ShaderEntry::PairwiseGrad => "normalization_reduction",
@@ -636,6 +640,7 @@ impl ShaderEntry {
             ShaderEntry::GroupNormApply => ShaderGroup::GroupNorm,
             ShaderEntry::GroupNormGradInput => ShaderGroup::GroupNormGrad,
             ShaderEntry::GroupNormGradWeightBias => ShaderGroup::GroupNormGrad,
+            ShaderEntry::GroupNormGradStats => ShaderGroup::GroupNormGrad,
             ShaderEntry::Concat => ShaderGroup::Concat,
             ShaderEntry::SplitA | ShaderEntry::SplitB => ShaderGroup::Split,
             ShaderEntry::Upsample2x => ShaderGroup::Upsample,
@@ -759,6 +764,7 @@ impl ShaderEntry {
             ShaderEntry::GroupNormApply => "apply",
             ShaderEntry::GroupNormGradInput => "grad_input",
             ShaderEntry::GroupNormGradWeightBias => "grad_weight_bias",
+            ShaderEntry::GroupNormGradStats => "grad_stats",
             ShaderEntry::Concat => "main",
             ShaderEntry::SplitA => "split_a",
             ShaderEntry::SplitB => "split_b",
@@ -2911,6 +2917,9 @@ struct Compiler<'a> {
     /// pre-allocates the dV buffer here. When GradV is later compiled
     /// for the same fwd_node, it reuses this buffer and skips dispatching.
     fused_grad_kv_dv: HashMap<NodeId, BufferRef>,
+    /// GroupNorm backward statistics per (input node, eps bits), computed
+    /// once for the input and weight/bias gradients.
+    group_norm_grad_stats: HashMap<(NodeId, u32), BufferRef>,
 }
 
 impl<'a> Compiler<'a> {
@@ -2947,6 +2956,7 @@ impl<'a> Compiler<'a> {
             coop_caps,
             allow_reduced_precision_attention_backward,
             fused_grad_kv_dv: HashMap::new(),
+            group_norm_grad_stats: HashMap::new(),
         }
     }
 
@@ -3038,6 +3048,34 @@ impl<'a> Compiler<'a> {
 
     /// Buffer already allocated for a `CrossEntropyLogitsGrad` on the same
     /// `(logits, labels)` pair. Present only on training graphs.
+    /// The (mean, inv_std) buffer for GroupNorm backward over `input`,
+    /// emitting its dispatch the first time either gradient asks for it.
+    fn group_norm_grad_stats(
+        &mut self,
+        input: NodeId,
+        [batch, channels, spatial, num_groups]: [u32; 4],
+        eps: f32,
+    ) -> BufferRef {
+        let key = (input, eps.to_bits());
+        if let Some(&stats) = self.group_norm_grad_stats.get(&key) {
+            return stats;
+        }
+        let slots = (batch * num_groups) as usize;
+        let stats = self.alloc_buffer(slots * 2 * 4);
+        let x = self.get_buffer(input);
+        self.plan.dispatches.push(Dispatch {
+            shader: ShaderEntry::GroupNormGradStats,
+            workgroups: [batch * num_groups, 1, 1],
+            input_buffers: vec![x],
+            output_buffer: stats,
+            extra_outputs: vec![],
+            params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
+            ..Default::default()
+        });
+        self.group_norm_grad_stats.insert(key, stats);
+        stats
+    }
+
     fn ce_logits_grad_buffer(&self, logits: NodeId, labels: NodeId) -> Option<BufferRef> {
         self.graph.nodes().iter().find_map(|node| {
             if matches!(node.op, Op::CrossEntropyLogitsGrad)
@@ -4854,10 +4892,15 @@ impl<'a> Compiler<'a> {
                 let weight = self.get_buffer(node.inputs[2]);
                 let total = node.ty.shape[0] as u32;
                 let batch = total / (channels * spatial);
+                let stats = self.group_norm_grad_stats(
+                    node.inputs[1],
+                    [batch, channels, spatial, num_groups],
+                    eps,
+                );
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::GroupNormGradInput,
                     workgroups: [batch * num_groups, 1, 1],
-                    input_buffers: vec![grad_out, input, weight],
+                    input_buffers: vec![grad_out, input, weight, stats],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
@@ -4876,10 +4919,15 @@ impl<'a> Compiler<'a> {
                 let input = self.get_buffer(node.inputs[1]);
                 let go_total = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let batch = go_total / (channels * spatial);
+                let stats = self.group_norm_grad_stats(
+                    node.inputs[1],
+                    [batch, channels, spatial, num_groups],
+                    eps,
+                );
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::GroupNormGradWeightBias,
                     workgroups: [channels, 1, 1],
-                    input_buffers: vec![grad_out, input],
+                    input_buffers: vec![grad_out, input, stats],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
                     params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
