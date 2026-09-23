@@ -774,9 +774,11 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // y[n,c,s] = x[n,c,s] + bias[c]
                 //
                 // dL/dx is the upstream gradient. dL/dbias reduces over
-                // both batch and spatial dimensions. Express the reduction
-                // with existing transpose + SumRows primitives so the
-                // portable backend needs no one-off gradient shader.
+                // both batch and spatial dimensions. Each (batch, channel)
+                // plane is contiguous in NCHW, so sum along it first and
+                // then across the batch. Reducing the planes in place reads
+                // the gradient once; transposing them first read it three
+                // times and left a tall, narrow SumRows.
                 let input = node.inputs[0];
                 let bias = node.inputs[1];
                 accumulate_grad(&mut graph, &mut grads, input, grad_output);
@@ -788,12 +790,14 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let batch = total / (channels * spatial);
 
                 let by_channel_spatial = graph.reshape(grad_output, &[batch * channels, spatial]);
-                let spatial_major = graph.transpose(by_channel_spatial);
-                let batch_channel_ty = TensorType::f32(vec![batch * channels]);
-                let batch_channel = graph.sum_rows(spatial_major, &batch_channel_ty);
-                let batch_by_channel = graph.reshape(batch_channel, &[batch, channels]);
+                let batch_channel = graph.sum_inner(by_channel_spatial);
                 let bias_ty = forward.nodes()[bias as usize].ty.clone();
-                let grad_bias = graph.sum_rows(batch_by_channel, &bias_ty);
+                let grad_bias = if batch == 1 {
+                    graph.reshape(batch_channel, &bias_ty.shape)
+                } else {
+                    let batch_by_channel = graph.reshape(batch_channel, &[batch, channels]);
+                    graph.sum_rows(batch_by_channel, &bias_ty)
+                };
                 accumulate_grad(&mut graph, &mut grads, bias, grad_bias);
             }
             Op::WinogradConv2d {

@@ -277,3 +277,51 @@ fn group_norm_backward_is_stable_for_large_means() {
     check("dw", &dw, &want_dw);
     check("db", &db, &want_db);
 }
+
+/// The per-channel bias gradient now reduces each contiguous (batch,
+/// channel) plane instead of transposing the whole gradient first.
+#[test]
+fn per_channel_bias_gradient_matches_reference() {
+    for batch in [1usize, 3] {
+        let (channels, spatial) = (5usize, 37usize);
+        let n = batch * channels * spatial;
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[n]);
+        let b = graph.parameter("b", &[channels]);
+        let y = graph.add_per_channel(x, b, channels as u32, spatial as u32);
+        let y = graph.relu(y);
+        let t = graph.input("t", &[n]);
+        let weighted = graph.mul(y, t);
+        let loss = graph.sum_all(weighted);
+        graph.set_outputs(vec![loss]);
+        let bias = values(channels, 0.9, 0.4);
+        let xs = values(n, 0.31, 0.2);
+        let ts = values(n, 0.17, 0.5);
+
+        let mut session = meganeura::build(&graph, meganeura::SessionConfig::from_env()).0;
+        session.set_parameter("b", &bias);
+        session.set_input("x", &xs);
+        session.set_input("t", &ts);
+        session.set_learning_rate(0.0);
+        session.step();
+        session.wait();
+        let mut got = vec![0.0; channels];
+        session.read_param_grad("b", &mut got);
+
+        let mut want = vec![0.0f64; channels];
+        for i in 0..n {
+            let c = (i / spatial) % channels;
+            if xs[i] + bias[c] > 0.0 {
+                want[c] += ts[i] as f64;
+            }
+        }
+        for c in 0..channels {
+            assert!(
+                (got[c] as f64 - want[c]).abs() < 1e-4,
+                "batch={batch} b[{c}]: got {}, want {}",
+                got[c],
+                want[c]
+            );
+        }
+    }
+}
