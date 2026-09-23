@@ -2,6 +2,28 @@ use meganeura::Graph;
 use meganeura::reference::{Feeds, gpu, gradients};
 
 #[test]
+fn comparison_checks_every_element_with_a_finite_bound() {
+    use meganeura::reference::{Tolerance, check};
+    let tolerance = Tolerance::default();
+    assert!(std::panic::catch_unwind(|| check(&[100.0], &[1.0], &[], tolerance)).is_err());
+    for magnitude in [f64::NAN, f64::INFINITY, -1.0] {
+        assert!(check(&[100.0], &[1.0], &[magnitude], tolerance).is_err());
+    }
+    assert!(check(&[1.0], &[1.0], &[1.0], tolerance).is_ok());
+    assert!(check(&[f32::NAN], &[1.0], &[1.0], tolerance).is_err());
+    // Some ops intentionally return nonfinite values, such as log(0).
+    assert!(
+        check(
+            &[f32::NEG_INFINITY],
+            &[f64::NEG_INFINITY],
+            &[f64::INFINITY],
+            tolerance
+        )
+        .is_ok()
+    );
+}
+
+#[test]
 fn smoke() {
     let mut g = Graph::new();
     let x = g.input("x", &[5, 7]);

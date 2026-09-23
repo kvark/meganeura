@@ -603,6 +603,7 @@ pub fn check_f64(
     tol: Tolerance,
 ) -> Result<(), Mismatch> {
     assert_eq!(got.len(), want.len(), "compared tensors differ in length");
+    assert_eq!(magnitude.len(), want.len(), "missing element error scales");
     let max_mag = magnitude
         .iter()
         .copied()
@@ -616,7 +617,7 @@ pub fn check_f64(
         let ok = if !w.is_finite() || !g.is_finite() {
             g == w || (g.is_nan() && w.is_nan())
         } else {
-            error <= allowed
+            allowed.is_finite() && allowed >= 0.0 && error <= allowed
         };
         if ok {
             continue;
