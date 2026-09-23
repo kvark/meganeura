@@ -2288,11 +2288,15 @@ pub(crate) fn select_variants(
             //     a complete M tile there; batch zero otherwise looks correct
             //     while every later image reads padding.
             //
-            // (Conv2dGemm also stores via coopStoreT and needs the same
-            // check; its `m`/`n` come from the params destructure above.)
+            // (Conv2dGemm and the direct-store f16 Conv2dGradInputGemm also
+            // store via coopStoreT and need the same check; their `m`/`n`
+            // come from the params destructure above. Generated f32
+            // grad-input kernels store edge tiles with bounds checks.)
             let store_ok = n.is_multiple_of(16)
-                && (!matches!(group, ShaderGroup::Conv2dGemm)
-                    || batch == 1
+                && (!matches!(
+                    group,
+                    ShaderGroup::Conv2dGemm | ShaderGroup::Conv2dGradInputGemm
+                ) || batch == 1
                     || m.is_multiple_of(output_tile));
             let vec4_ok = match group {
                 ShaderGroup::MatMulBT => store_ok,

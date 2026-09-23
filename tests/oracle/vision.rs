@@ -63,7 +63,15 @@ fn inference(
     options: &gpu::Options,
     expected: &[ShaderEntry],
 ) {
-    let shaders = dispatched(graph, Mode::Inference, options);
+    // Which register tile a shape gets depends on the device: with f32
+    // cooperative tiles the selection prefers the widest. The expectation is
+    // about the portable kernels, so check it against the plan without them;
+    // the values are checked under `options`, cooperative kernels included.
+    let portable = gpu::Options {
+        coop: CoopPolicy::Disabled,
+        ..options.clone()
+    };
+    let shaders = dispatched(graph, Mode::Inference, &portable);
     for e in expected {
         failures.expect_shader(label, &shaders, e);
     }
