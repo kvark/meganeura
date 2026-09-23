@@ -334,6 +334,8 @@ pub enum ShaderEntry {
     RmsNormRsqrt,
     GroupNorm,
     GroupNormSilu,
+    /// Per-slice (sum, M2) of a group, first pass of chunked GroupNorm.
+    GroupNormStats,
     GroupNormApply,
     GroupNormGradInput,
     GroupNormGradWeightBias,
@@ -491,6 +493,7 @@ impl ShaderEntry {
             | ShaderEntry::RmsNormRsqrt
             | ShaderEntry::GroupNorm
             | ShaderEntry::GroupNormSilu
+            | ShaderEntry::GroupNormStats
             | ShaderEntry::GroupNormApply
             | ShaderEntry::GroupNormGradInput
             | ShaderEntry::GroupNormGradWeightBias
@@ -639,7 +642,7 @@ impl ShaderEntry {
             ShaderEntry::RmsNormRsqrt => ShaderGroup::RmsNormRsqrt,
             ShaderEntry::GroupNorm => ShaderGroup::GroupNorm,
             ShaderEntry::GroupNormSilu => ShaderGroup::GroupNormSilu,
-            ShaderEntry::GroupNormApply => ShaderGroup::GroupNorm,
+            ShaderEntry::GroupNormApply | ShaderEntry::GroupNormStats => ShaderGroup::GroupNorm,
             ShaderEntry::GroupNormGradInput => ShaderGroup::GroupNormGrad,
             ShaderEntry::GroupNormGradWeightBias => ShaderGroup::GroupNormGrad,
             ShaderEntry::GroupNormGradStats => ShaderGroup::GroupNormGrad,
@@ -765,6 +768,7 @@ impl ShaderEntry {
             ShaderEntry::RmsNormRsqrt => "main",
             ShaderEntry::GroupNorm | ShaderEntry::GroupNormSilu => "main",
             ShaderEntry::GroupNormApply => "apply",
+            ShaderEntry::GroupNormStats => "stats",
             ShaderEntry::GroupNormGradInput => "grad_input",
             ShaderEntry::GroupNormGradWeightBias => "grad_weight_bias",
             ShaderEntry::GroupNormGradStats => "grad_stats",
@@ -1040,30 +1044,6 @@ fn merge_horizontal(dispatches: &[Dispatch], batch: &[usize]) -> Dispatch {
     }
     merged.label = format!("{}x{}", merged.label, n);
     merged
-}
-
-fn group_norm_stats_kernel() -> crate::schedule::ReductionKernel {
-    use crate::schedule::{PointwiseDAG, Pw, ReduceOp, ReductionKernel};
-    ReductionKernel {
-        op: ReduceOp::Sum,
-        prologue: PointwiseDAG {
-            n_inputs: 1,
-            ops: vec![Pw::LoadInput(0)],
-            output: 0,
-        },
-        extra_prologues: vec![PointwiseDAG {
-            n_inputs: 1,
-            ops: vec![Pw::LoadInput(0), Pw::Mul(0, 0)],
-            output: 1,
-        }],
-        epilogue: None,
-        n_per_elem: 1,
-        n_per_row: 0,
-        workgroup_size: 256,
-        rows_per_workgroup: 1,
-        gather_elem: Vec::new(),
-        input_row_repeats: Vec::new(),
-    }
 }
 
 /// A single GPU dispatch in the execution plan.
@@ -4680,10 +4660,30 @@ impl<'a> Compiler<'a> {
             } => {
                 // Route through unified attention shader.
                 // kv_seq=0 signals causal mask at runtime.
-                let q = self.get_buffer(node.inputs[0]);
-                let k = self.get_buffer(node.inputs[1]);
+                let mut q = self.get_buffer(node.inputs[0]);
+                let mut k = self.get_buffer(node.inputs[1]);
                 let v = self.get_buffer(node.inputs[2]);
                 let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
+                if let Op::CausalAttentionRoPE { rope_theta, .. } = node.op {
+                    // The attention kernels have no rotation of their own:
+                    // rotate Q and K into scratch first, as the backward
+                    // (which differentiates explicit RoPE nodes) assumes.
+                    for (operand, input) in [(&mut q, node.inputs[0]), (&mut k, node.inputs[1])] {
+                        let ty = &self.graph.node(input).ty;
+                        let dim = ty.shape[1] as u32;
+                        let rotated = self.alloc_buffer(ty.size_bytes());
+                        self.plan.dispatches.push(Dispatch {
+                            shader: ShaderEntry::RoPE,
+                            workgroups: [(seq * dim / 2).div_ceil(256), 1, 1],
+                            input_buffers: vec![*operand],
+                            output_buffer: rotated,
+                            extra_outputs: vec![],
+                            params: vec![seq, dim, rope_theta.to_bits(), 0, head_dim, 0, 0, 0],
+                            ..Default::default()
+                        });
+                        *operand = rotated;
+                    }
+                }
                 let lse_buf = self.find_lse_buffer(node.id);
                 let (shader, workgroups) =
                     self.attention_dispatch(seq, head_dim, num_heads, node.requires_full_precision);
@@ -4783,7 +4783,6 @@ impl<'a> Compiler<'a> {
                         ..Default::default()
                     });
                 } else {
-                    let group_size = (channels / num_groups) * spatial;
                     let slices = batch * num_groups * chunks;
                     let partials = self.alloc_buffer(slices as usize * 2 * 4);
                     let params = vec![
@@ -4797,16 +4796,12 @@ impl<'a> Compiler<'a> {
                         0,
                     ];
                     self.plan.dispatches.push(Dispatch {
-                        // Generated-reduction routing takes priority over the
-                        // sentinel entry in pipeline selection and binding.
-                        shader: ShaderEntry::GroupNorm,
+                        shader: ShaderEntry::GroupNormStats,
                         workgroups: [slices, 1, 1],
                         input_buffers: vec![x],
                         output_buffer: partials,
                         extra_outputs: vec![],
-                        params: vec![slices, group_size / chunks, 0, 0],
-
-                        kernel: Kernel::Reduction(group_norm_stats_kernel()),
+                        params: params.clone(),
                         ..Default::default()
                     });
                     self.plan.dispatches.push(Dispatch {
@@ -4848,7 +4843,6 @@ impl<'a> Compiler<'a> {
                         ..Default::default()
                     });
                 } else {
-                    let group_size = (channels / num_groups) * spatial;
                     let slices = batch * num_groups * chunks;
                     let partials = self.alloc_buffer(slices as usize * 2 * 4);
                     let params = vec![
@@ -4862,14 +4856,12 @@ impl<'a> Compiler<'a> {
                         0,
                     ];
                     self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::GroupNorm,
+                        shader: ShaderEntry::GroupNormStats,
                         workgroups: [slices, 1, 1],
                         input_buffers: vec![x],
                         output_buffer: partials,
                         extra_outputs: vec![],
-                        params: vec![slices, group_size / chunks, 0, 0],
-
-                        kernel: Kernel::Reduction(group_norm_stats_kernel()),
+                        params: params.clone(),
                         ..Default::default()
                     });
                     self.plan.dispatches.push(Dispatch {
@@ -7910,11 +7902,12 @@ mod tests {
 
         let large = make_plan(8202);
         assert_eq!(large.dispatches.len(), 2);
-        assert!(large.dispatches[0].reduction().is_some());
+        assert_eq!(large.dispatches[0].shader, ShaderEntry::GroupNormStats);
         assert_eq!(large.dispatches[1].shader, ShaderEntry::GroupNormApply);
         let chunks = large.dispatches[1].params[5];
         assert_eq!(chunks, 3);
         assert_eq!(8202 % chunks, 0);
-        assert_eq!(large.dispatches[0].params[..2], [8 * chunks, 8202 / chunks]);
+        assert_eq!(large.dispatches[0].workgroups[0], 8 * chunks);
+        assert_eq!(large.dispatches[0].params, large.dispatches[1].params);
     }
 }
