@@ -2,7 +2,7 @@ struct Params {
     m: u32,
     n: u32,
     serial_rows: u32,
-    _pad1: u32,
+    row_splits: u32,
 }
 
 var<storage> src: array<f32>;
@@ -31,10 +31,17 @@ fn sum_rows(
         }
         return;
     }
+    // row_splits > 1 cuts a tall reduction into slices so the launch grid
+    // is not stuck at one workgroup per 32 columns. Slice 0 with a single
+    // split is the whole column, written at dst[col].
+    let splits = max(params.row_splits, 1u);
+    let rows_per = (params.m + splits - 1u) / splits;
+    let row_lo = wgid.y * rows_per;
+    let row_hi = min(row_lo + rows_per, params.m);
     let col = wgid.x * 32u + lid.x;
     var acc = 0.0;
-    if col < params.n {
-        for (var row = lid.y; row < params.m; row += 8u) {
+    if col < params.n && row_lo < row_hi {
+        for (var row = row_lo + lid.y; row < row_hi; row += 8u) {
             acc += src[row * params.n + col];
         }
     }
@@ -52,6 +59,6 @@ fn sum_rows(
     }
     workgroupBarrier();
     if lid.y == 0u && col < params.n {
-        dst[col] = partials[lid.x] + partials[32u + lid.x];
+        dst[wgid.y * params.n + col] = partials[lid.x] + partials[32u + lid.x];
     }
 }

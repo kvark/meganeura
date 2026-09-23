@@ -1,5 +1,17 @@
 pub(crate) const SHADER: &str = include_str!("shaders/divisor.wgsl");
 
+/// Exact `u32` division for shaders whose divisor is a compile-time constant.
+///
+/// The software reciprocal expands to a chain of 24-bit multiplies. ACO lowers
+/// a constant integer `/` to a short multiply-high sequence instead, and the
+/// result is the same integer.
+pub(crate) const NATIVE_SHADER: &str = "\
+fn divide_exact(value: u32, divisor: u32, multiplier: u32) -> u32 {
+    let _unused = multiplier;
+    return value / divisor;
+}
+";
+
 pub(crate) fn multiplier(divisor: u32) -> u32 {
     assert_ne!(divisor, 0, "index divisor must be positive");
     // Division by one bypasses multiplication in the shader.
