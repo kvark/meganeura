@@ -28,7 +28,9 @@ fn build_graph() -> Graph {
     let attention = graph.multi_head_attn(q, k, v, heads, heads, head_dim, false);
     let weights = graph.input("weights", &[seq, width]);
     let weighted = graph.mul(attention, weights);
-    let loss = graph.mean_all(weighted);
+    // A sum, not a mean: mean-scaled gradients sit near the absolute
+    // tolerance below, which let a dropped half of each head pass.
+    let loss = graph.sum_all(weighted);
     graph.set_outputs(vec![loss]);
     graph
 }
