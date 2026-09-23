@@ -89,7 +89,7 @@ pub fn check(graph: &Graph, feeds: &Feeds, options: &Options) -> Result<Report, 
     let noise = |h: f64| 64.0 * f64::EPSILON * (base_loss.abs() + 1.0) / h;
     let floor = |h: f64| noise(h) / options.tolerance.rtol;
 
-    for (p, &(ref name, _)) in params.iter().enumerate() {
+    for (p, name) in params.iter().map(|entry| &entry.0).enumerate() {
         let base = feeds
             .get(name)
             .ok_or_else(|| Error::MissingFeed(name.clone()))?
@@ -129,7 +129,7 @@ pub fn check(graph: &Graph, feeds: &Feeds, options: &Options) -> Result<Report, 
         let mut predicted = 0.0;
         let mut scale = 0.0;
         let h = options.step;
-        for (p, &(ref name, _)) in params.iter().enumerate() {
+        for (p, name) in params.iter().map(|entry| &entry.0).enumerate() {
             let base = feeds
                 .get(name)
                 .ok_or_else(|| Error::MissingFeed(name.clone()))?;

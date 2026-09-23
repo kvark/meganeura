@@ -78,7 +78,7 @@ fn plan(g: &Graph, options: &gpu::Options) -> Vec<(ShaderEntry, bool)> {
     let mut config = SessionConfig::from_env();
     config.mode = Mode::Inference;
     config.options = options.compile.clone();
-    config.optimize = options.optimize.clone();
+    config.optimize = options.optimize;
     config.runtime.coop = options.coop;
     let (session, _) = meganeura::build(g, config);
     session

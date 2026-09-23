@@ -37,7 +37,7 @@ impl Options {
         let mut config = SessionConfig::from_env();
         config.mode = mode;
         config.options = self.compile.clone();
-        config.optimize = self.optimize.clone();
+        config.optimize = self.optimize;
         config.runtime.coop = self.coop;
         config.runtime.poison = self.poison;
         config

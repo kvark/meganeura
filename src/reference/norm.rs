@@ -123,7 +123,7 @@ fn rotation<'a>(node: &Node, ins: &[&'a Tensor]) -> Result<Rotation<'a>, Error> 
     };
     let (rows, dim) = matrix(node, ins[0], "input")?;
     let head_dim = head_dim as usize;
-    if head_dim == 0 || head_dim % 2 != 0 || dim % head_dim != 0 {
+    if head_dim == 0 || !head_dim.is_multiple_of(2) || dim % head_dim != 0 {
         return Err(invalid(
             node,
             format!("head_dim {head_dim} must be even and divide {dim}"),

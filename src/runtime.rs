@@ -645,6 +645,14 @@ struct GroupNormData {
     params: GroupNormParams,
 }
 
+/// Statistics pass: reads the tensor, writes (sum, M2) per slice.
+#[derive(blade_macros::ShaderData)]
+struct GroupNormStatsData {
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: GroupNormParams,
+}
+
 /// Normalisation pass: reads the tensor and the partials, writes the result.
 #[derive(blade_macros::ShaderData)]
 struct GroupNormApplyData {
@@ -1953,6 +1961,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::RmsNormRsqrt => UnaryData::layout(),
         ShaderEntry::GroupNorm | ShaderEntry::GroupNormSilu => GroupNormData::layout(),
         ShaderEntry::GroupNormApply => GroupNormApplyData::layout(),
+        ShaderEntry::GroupNormStats => GroupNormStatsData::layout(),
         ShaderEntry::GroupNormGradInput
         | ShaderEntry::GroupNormGradWeightBias
         | ShaderEntry::GroupNormGradStats => GroupNormGradData::layout(),
@@ -8067,6 +8076,26 @@ impl Session {
                             num_groups: p[3],
                             eps_bits: p[4],
                             chunks: 1,
+                            apply_silu: 0,
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::GroupNormStats => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &GroupNormStatsData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: GroupNormParams {
+                            batch: p[0],
+                            channels: p[1],
+                            spatial: p[2],
+                            num_groups: p[3],
+                            eps_bits: p[4],
+                            chunks: p[5],
                             apply_silu: 0,
                             _pad2: 0,
                         },
