@@ -3369,21 +3369,7 @@ impl<'a> Compiler<'a> {
                     continue;
                 }
             }
-            // Loss ops output scalar [1] but the shader writes per-batch
-            // or per-workgroup partial losses. Allocate enough space for
-            // the shader; read_loss() sums all elements on the CPU side.
-            let size = match node.op {
-                Op::CrossEntropyLoss => {
-                    let batch = self.graph.node(node.inputs[0]).ty.shape[0];
-                    batch * 4
-                }
-                Op::BceLoss => {
-                    let n: usize = self.graph.node(node.inputs[0]).ty.shape.iter().product();
-                    n.div_ceil(256) * 4
-                }
-                _ => node.ty.size_bytes(),
-            };
-            let buf = self.alloc_buffer(size);
+            let buf = self.alloc_buffer(node.ty.size_bytes());
             self.node_buffers.insert(node.id, buf);
 
             match node.op {
@@ -4417,18 +4403,28 @@ impl<'a> Compiler<'a> {
                 // write_grad=0 and binds the loss buffer as a dummy.
                 let grad_buf = self.ce_logits_grad_buffer(node.inputs[0], node.inputs[1]);
                 let write_grad = u32::from(grad_buf.is_some());
-                let grad_buf = grad_buf.unwrap_or(out_buf);
-                // One workgroup per batch item (256 threads each).
+                // One workgroup per batch item (256 threads each), each
+                // writing its row's share of the loss. The node's value is
+                // their sum, so reduce the rows unless there is only one.
+                let partials = if batch > 1 {
+                    self.alloc_buffer(batch as usize * 4)
+                } else {
+                    out_buf
+                };
+                let grad_buf = grad_buf.unwrap_or(partials);
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::CrossEntropyLoss,
                     workgroups: [batch, 1, 1],
                     input_buffers: vec![logits, labels],
                     output_buffer: grad_buf,
-                    extra_outputs: vec![out_buf],
+                    extra_outputs: vec![partials],
                     params: vec![batch, features, write_grad, 0],
 
                     ..Default::default()
                 });
+                if batch > 1 {
+                    self.emit_reduce_all(ShaderEntry::SumAll, partials, out_buf, batch);
+                }
             }
 
             Op::BceLoss => {
@@ -4436,16 +4432,26 @@ impl<'a> Compiler<'a> {
                 let labels = self.get_buffer(node.inputs[1]);
                 let len = self.graph.node(node.inputs[0]).ty.num_elements() as u32;
                 let num_wgs = len.div_ceil(256);
+                // Each workgroup writes its share of the mean; the node's
+                // value is their sum.
+                let partials = if num_wgs > 1 {
+                    self.alloc_buffer(num_wgs as usize * 4)
+                } else {
+                    out_buf
+                };
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::BceLoss,
                     workgroups: [num_wgs, 1, 1],
                     input_buffers: vec![pred, labels],
-                    output_buffer: out_buf,
+                    output_buffer: partials,
                     extra_outputs: vec![],
                     params: vec![len, 0, 0, 0],
 
                     ..Default::default()
                 });
+                if num_wgs > 1 {
+                    self.emit_reduce_all(ShaderEntry::SumAll, partials, out_buf, num_wgs);
+                }
             }
 
             Op::Transpose => {

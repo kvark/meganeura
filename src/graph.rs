@@ -3123,8 +3123,6 @@ impl Graph {
         let l_shape = &self.node(logits).ty.shape;
         let t_shape = &self.node(labels).ty.shape;
         assert_eq!(l_shape, t_shape, "logits and labels must match");
-        // Scalar output. The shader writes per-batch partial losses into an
-        // oversized buffer; read_loss() sums them on the CPU side.
         let ty = TensorType::f32(vec![1]);
         self.add_node(Op::CrossEntropyLoss, vec![logits, labels], ty)
     }
@@ -3138,8 +3136,6 @@ impl Graph {
         let p_shape = &self.node(pred).ty.shape;
         let l_shape = &self.node(labels).ty.shape;
         assert_eq!(p_shape, l_shape, "pred and labels must match");
-        // Scalar output. The shader writes per-workgroup partial losses
-        // into an oversized buffer; read_loss() sums them on the CPU side.
         let ty = TensorType::f32(vec![1]);
         self.add_node(Op::BceLoss, vec![pred, labels], ty)
     }
