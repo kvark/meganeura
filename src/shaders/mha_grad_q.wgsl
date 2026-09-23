@@ -1,6 +1,8 @@
 // MHA gradient wrt Q — recomputes Q·K scores (no score buffer).
-// Dispatch: [q_seq, num_heads, 1], WG=64. Head dimensions below 64 use
-// zero-padded lanes; every storage access must therefore be lane-guarded.
+// Dispatch: [q_seq, num_heads, 1], WG=64. Lane `tid` owns dimensions
+// `tid + 64 * c` for c < MAX_CHUNKS, so heads up to 256 wide are covered.
+// Dimensions past head_dim are zero-padded; every storage access must
+// therefore be guarded by `dim < head_dim`.
 
 struct Params {
     q_seq: u32,
@@ -23,6 +25,9 @@ var<storage, read_write> dst: array<f32>;  // dQ
 var<uniform> params: Params;
 var<workgroup> wg_a: array<f32, 64>;
 var<workgroup> wg_b: array<f32, 64>;
+
+const LANES: u32 = 64u;
+const MAX_CHUNKS: u32 = 4u;
 
 // Fused dual tree_reduce: reduces wg_a and wg_b simultaneously,
 // saving 7 barriers vs doing them sequentially.
@@ -77,28 +82,35 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let kv_dim = num_kv_heads * head_dim;
     let scale = inverseSqrt(f32(head_dim));
     let q_base = pos * (num_heads * head_dim) + head * head_dim;
-    let lane_active = tid < head_dim;
-    var q_val = 0.0;
-    var do_val = 0.0;
-    var out_val = 0.0;
-    if lane_active {
-        q_val = src_a[q_base + tid];
-        do_val = d_out[q_base + tid];
-        out_val = fwd_dst[q_base + tid];
+    var q_val: array<f32, MAX_CHUNKS>;
+    var do_val: array<f32, MAX_CHUNKS>;
+    var row_part = 0.0;
+    for (var c = 0u; c < MAX_CHUNKS; c++) {
+        let dim = tid + c * LANES;
+        q_val[c] = 0.0;
+        do_val[c] = 0.0;
+        if dim < head_dim {
+            q_val[c] = src_a[q_base + dim];
+            do_val[c] = d_out[q_base + dim];
+            row_part += do_val[c] * fwd_dst[q_base + dim];
+        }
     }
     let lse_idx = (pos * num_heads + head) * 2u;
     let max_s = lse[lse_idx];
     let log_sum = lse[lse_idx + 1u];
 
     // Pre-compute row_sum = sum_d(dO[d] * O[d])
-    wg_a[tid] = do_val * out_val;
+    wg_a[tid] = row_part;
     tree_reduce_a(tid);
     let row_sum = wg_a[0];
     // Every lane must capture the reduced value before wg_a is reused for
     // the first Q·K reduction below.
     workgroupBarrier();
 
-    var my_dq = 0.0;
+    var my_dq: array<f32, MAX_CHUNKS>;
+    for (var c = 0u; c < MAX_CHUNKS; c++) {
+        my_dq[c] = 0.0;
+    }
 
     let kv_len = select(kv_seq, pos + 1u, kv_seq == 0u);
     let window = params.window_size;
@@ -108,14 +120,20 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         let k_base = t * kv_dim + kv_head_off;
 
         // Fused: compute Q·K score AND dO·V in one reduction pass
-        var k_val = 0.0;
-        var v_val = 0.0;
-        if lane_active {
-            k_val = src_b[k_base + tid];
-            v_val = bias[k_base + tid];
+        var k_val: array<f32, MAX_CHUNKS>;
+        var qk = 0.0;
+        var dov = 0.0;
+        for (var c = 0u; c < MAX_CHUNKS; c++) {
+            let dim = tid + c * LANES;
+            k_val[c] = 0.0;
+            if dim < head_dim {
+                k_val[c] = src_b[k_base + dim];
+                qk += q_val[c] * k_val[c];
+                dov += do_val[c] * bias[k_base + dim];
+            }
         }
-        wg_a[tid] = q_val * k_val;
-        wg_b[tid] = do_val * v_val;
+        wg_a[tid] = qk;
+        wg_b[tid] = dov;
         dual_tree_reduce(tid);
         let score = wg_a[0] * scale;
         let dp_t = wg_b[0];
@@ -130,10 +148,15 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         let ds_t = p_t * (dp_t - row_sum);
 
         // Accumulate dQ
-        my_dq += ds_t * scale * k_val;
+        for (var c = 0u; c < MAX_CHUNKS; c++) {
+            my_dq[c] += ds_t * scale * k_val[c];
+        }
     }
 
-    if lane_active {
-        dst[q_base + tid] = my_dq;
+    for (var c = 0u; c < MAX_CHUNKS; c++) {
+        let dim = tid + c * LANES;
+        if dim < head_dim {
+            dst[q_base + dim] = my_dq[c];
+        }
     }
 }

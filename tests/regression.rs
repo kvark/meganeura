@@ -34,6 +34,7 @@ mod multi_input_trainer;
 mod scatter_add_atomic;
 mod schedule_pointwise;
 mod schedule_reduction;
+mod shader_audit;
 #[cfg(all(feature = "hf-hub", feature = "models"))]
 mod smollm2_correctness;
 mod softplus_tail;
