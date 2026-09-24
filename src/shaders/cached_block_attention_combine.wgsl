@@ -19,7 +19,7 @@ struct Params {
     block_len: u32,
     max_seq: u32,
     splits: u32,
-    chunk: u32,
+    _pad: u32,
 }
 
 var<storage> partials: array<f32>;

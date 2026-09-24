@@ -1,9 +1,8 @@
 // Flash-decoding split-K partial: one workgroup per (row, split, head)
 // computes the online-softmax partial for its slice of the KV range.
-// A split that starts past kv_len writes the identity partial —
-// m = -1e30, l = 0, acc = 0 — which the combine folds away with weight
-// exp(-1e30 - m) = 0, so short contexts pay only for the empty slices'
-// launches.
+// A split that starts past kv_len (when there are fewer key tiles than
+// splits) writes the identity partial — m = -1e30, l = 0, acc = 0 — which
+// the combine folds away with weight exp(-1e30 - m) = 0.
 //
 // Partial row, one per (row, head, split):
 //   [0..head_dim]  acc = sum exp(score - m) * V   (unscaled)
@@ -18,7 +17,7 @@ struct Params {
     block_len: u32,
     max_seq: u32,
     splits: u32,
-    chunk: u32,
+    _pad: u32,
 }
 
 var<storage> src_a: array<f32>;
@@ -65,9 +64,13 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         kv_len - params.window_size,
         params.window_size != 0u && kv_len > params.window_size,
     );
-    // This split's token range, clamped to what exists.
-    let split_begin = first_kv + split * params.chunk;
-    let split_end = min(split_begin + params.chunk, kv_len);
+    // Share the live range evenly, in whole key tiles, so the splits divide
+    // the work at any context length; a fixed share of max_seq would leave
+    // all but the first split idle on a short context.
+    let tiles = (kv_len - first_kv + BKV - 1u) / BKV;
+    let chunk = (tiles + params.splits - 1u) / params.splits * BKV;
+    let split_begin = first_kv + split * chunk;
+    let split_end = min(split_begin + chunk, kv_len);
 
     let kv_head = head / (params.num_heads / params.num_kv_heads);
     let kv_head_off = kv_head * $HEAD_DIM;
