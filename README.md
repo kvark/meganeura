@@ -164,7 +164,7 @@ an uninitialized model. See [compiler search](docs/compiler-search.md).
 | `MEGANEURA_NO_DEVICE_LOCAL` | Keep all buffers host-visible. |
 | `MEGANEURA_POISON` | Fill non-parameter buffers with NaN at session build, so reads of memory nothing wrote show up. |
 | `MEGANEURA_SERIAL_DISPATCH` | One compute pass per dispatch — serial execution for bisection. |
-| `MEGANEURA_NO_WINOGRAD` | Skip the Conv2d-to-Winograd rewrite; its selection heuristic weighs channel counts only, so this measures which side of it a workload belongs on. |
+| `MEGANEURA_NO_WINOGRAD` | Skip the Winograd rewrite of 3×3 stride-1 convolutions and their input gradients; its selection heuristic weighs channel counts only, so this measures which side of it a workload belongs on. |
 | `MEGANEURA_PIN_BUFS=3,25-40` | Force-pin logical buffers to bisect aliasing corruption. |
 | `MEGANEURA_DUMP_PLAN` | Dump dispatch order, provenance, and the alias map at build. |
 | `MEGANEURA_DUMP_WGSL=<dir>` | Write every generated shader into `<dir>`. |

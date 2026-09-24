@@ -5380,68 +5380,6 @@ impl Session {
                                 }
                             }
                         }
-                        crate::graph::ParamTransform::Winograd3x3 {
-                            out_channels,
-                            in_channels,
-                        } => {
-                            // G matrix for Winograd F(2,3)
-                            let g: [[f32; 3]; 4] = [
-                                [1.0, 0.0, 0.0],
-                                [0.5, 0.5, 0.5],
-                                [0.5, -0.5, 0.5],
-                                [0.0, 0.0, 1.0],
-                            ];
-                            let mut staging =
-                                (!self.logical_host_visible(derived_buf)).then(|| {
-                                    vec![0.0f32; self.plan.buffers[derived_buf.0 as usize] / 4]
-                                });
-                            let derived_ptr = match staging {
-                                Some(ref mut data) => data.as_mut_ptr(),
-                                None => self.buffers[derived_buf.0 as usize].data() as *mut f32,
-                            };
-                            for co in 0..out_channels {
-                                for ci in 0..in_channels {
-                                    // Extract 3x3 filter: [Co, Ci, 3, 3]
-                                    let base = (co * in_channels + ci) * 9;
-                                    let w = [
-                                        [data[base], data[base + 1], data[base + 2]],
-                                        [data[base + 3], data[base + 4], data[base + 5]],
-                                        [data[base + 6], data[base + 7], data[base + 8]],
-                                    ];
-                                    // u = G × w × G^T (4×4 result)
-                                    // First: tmp = G × w (4×3)
-                                    let mut tmp = [[0.0f32; 3]; 4];
-                                    for r in 0..4 {
-                                        for c in 0..3 {
-                                            for k in 0..3 {
-                                                tmp[r][c] += g[r][k] * w[k][c];
-                                            }
-                                        }
-                                    }
-                                    // Then: u = tmp × G^T (4×4)
-                                    #[allow(clippy::needless_range_loop)]
-                                    for r in 0..4 {
-                                        for c in 0..4 {
-                                            let mut val = 0.0f32;
-                                            for k in 0..3 {
-                                                val += tmp[r][k] * g[c][k];
-                                                // G^T[k][c] = G[c][k]
-                                            }
-                                            let alpha = r * 4 + c;
-                                            let idx = alpha * out_channels * in_channels
-                                                + co * in_channels
-                                                + ci;
-                                            unsafe {
-                                                *derived_ptr.add(idx) = val;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            if let Some(data) = staging {
-                                self.upload_buffer(derived_buf, bytemuck::cast_slice(&data));
-                            }
-                        }
                     }
                 }
 
@@ -5490,13 +5428,7 @@ impl Session {
                 .plan
                 .derived_params
                 .iter()
-                .filter(|entry| {
-                    matches!(
-                        entry.2,
-                        crate::graph::ParamTransform::HorizontalConcat
-                            | crate::graph::ParamTransform::VerticalConcat
-                    ) && entry.1.iter().any(|s| s.0 == name)
-                })
+                .filter(|entry| entry.1.iter().any(|s| s.0 == name))
                 .cloned()
                 .collect();
             for (derived_buf, sources, transform) in derived {
@@ -5507,7 +5439,6 @@ impl Session {
                     crate::graph::ParamTransform::VerticalConcat => {
                         self.copy_parameter_rows(derived_buf, name, data, &sources);
                     }
-                    _ => unreachable!(),
                 }
             }
             return;

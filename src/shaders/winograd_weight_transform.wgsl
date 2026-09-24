@@ -2,11 +2,15 @@
 // U = G × w × G^T where G = [[1,0,0],[1/2,1/2,1/2],[1/2,-1/2,1/2],[0,0,1]]
 // Each thread handles one (co, ci) pair.
 // Dispatch: [ceil(Co*Ci / 256), 1, 1]
+//
+// With `adjoint`, the source is [Ci, Co, 3, 3] and w[co, ci, kh, kw] reads
+// src[ci, co, 2-kh, 2-kw]: the rotated, channel-transposed kernel whose
+// convolution is the input gradient of the source kernel's.
 
 struct Params {
     out_channels: u32,
     in_channels: u32,
-    _pad0: u32,
+    adjoint: u32,
     _pad1: u32,
     _pad2: u32,
     _pad3: u32,
@@ -18,6 +22,10 @@ var<storage> src: array<f32>;              // weight [Co, Ci, 3, 3] = [Co*Ci*9]
 var<storage, read_write> dst: array<f32>;  // U [16, Co, Ci] = [16*Co*Ci]
 var<uniform> params: Params;
 
+fn tap(base: u32, i: u32) -> f32 {
+    return src[select(base + i, base + 8u - i, params.adjoint != 0u)];
+}
+
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
@@ -28,10 +36,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ci = idx % params.in_channels;
 
     // Load 3×3 filter
-    let base = idx * 9u;
-    let w00 = src[base];     let w01 = src[base + 1u]; let w02 = src[base + 2u];
-    let w10 = src[base + 3u]; let w11 = src[base + 4u]; let w12 = src[base + 5u];
-    let w20 = src[base + 6u]; let w21 = src[base + 7u]; let w22 = src[base + 8u];
+    let base = select(idx, ci * params.out_channels + co, params.adjoint != 0u) * 9u;
+    let w00 = tap(base, 0u); let w01 = tap(base, 1u); let w02 = tap(base, 2u);
+    let w10 = tap(base, 3u); let w11 = tap(base, 4u); let w12 = tap(base, 5u);
+    let w20 = tap(base, 6u); let w21 = tap(base, 7u); let w22 = tap(base, 8u);
 
     // tmp = G × w (4×3)
     // G = [[1,0,0],[0.5,0.5,0.5],[0.5,-0.5,0.5],[0,0,1]]

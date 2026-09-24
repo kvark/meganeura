@@ -680,14 +680,23 @@ pub enum Op {
     },
 
     /// Winograd F(2,3) convolution for 3×3 stride-1 kernels.
-    /// Inputs: `[input, winograd_weight]` where `winograd_weight` is `[16*Co*Ci]`.
-    /// Compiler emits 3 dispatches: input transform, batched matmul, output transform.
+    /// Inputs: `[input, kernel]`, the kernel in `Conv2d` layout.
+    ///
+    /// With `adjoint`, the kernel is read as its flipped channel transpose:
+    /// `kernel` is `[in_channels, out_channels, 3, 3]` and the op computes
+    /// `Conv2dGradInput` of that kernel for input `grad_output`. That is the
+    /// convolution of the output gradient with the rotated kernel at padding
+    /// `2 - p`.
+    ///
+    /// The compiler emits four dispatches: weight transform, input
+    /// transform, batched matmul, output transform.
     WinogradConv2d {
         in_channels: u32,
         in_h: u32,
         in_w: u32,
         out_channels: u32,
         padding: u32,
+        adjoint: bool,
     },
 
     /// Fused GroupNorm + SiLU: normalize then apply SiLU activation.
@@ -861,11 +870,6 @@ pub enum ParamTransform {
     HorizontalConcat,
     /// Vertical concatenation: append dense source rows without transposing.
     VerticalConcat,
-    /// Winograd F(2,3) weight transform: [Co, Ci, 3, 3] → [16, Co, Ci].
-    Winograd3x3 {
-        out_channels: usize,
-        in_channels: usize,
-    },
 }
 
 /// A derived parameter is created by the optimizer when fusing ops

@@ -798,16 +798,20 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 };
                 accumulate_grad(&mut graph, &mut grads, bias, grad_bias);
             }
+            // The adjoint form is an input gradient: backward-only, like
+            // `Conv2dGradInput`.
+            Op::WinogradConv2d { adjoint: true, .. } => {}
             Op::WinogradConv2d {
                 in_channels,
                 in_h,
                 in_w,
                 out_channels,
                 padding,
+                adjoint: false,
             } => {
-                // inputs: [input, winograd_weight, original_weight]
+                // inputs: [input, kernel]; differentiate the direct convolution.
                 let input = node.inputs[0];
-                let original_kernel = node.inputs[2];
+                let original_kernel = node.inputs[1];
                 let in_size = forward.nodes()[input as usize].ty.shape[0] as u32;
                 let batch = in_size / (in_channels * in_h * in_w);
                 let grad_input = graph.conv2d_grad_input(
