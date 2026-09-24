@@ -19,7 +19,7 @@ pub(crate) struct CachedBlockAttentionParams {
     pub block_len: u32,
     pub max_seq: u32,
     pub splits: u32,
-    pub chunk: u32,
+    pub _pad: u32,
 }
 
 impl CachedBlockAttentionParams {
@@ -5261,7 +5261,7 @@ impl<'a> Compiler<'a> {
                     block_len,
                     max_seq,
                     splits: 0,
-                    chunk: 0,
+                    _pad: 0,
                 };
                 let splits = self.options.cached_attention_splits.unwrap_or_else(|| {
                     if block_len == 1 && max_seq > 64 {
@@ -5276,7 +5276,6 @@ impl<'a> Compiler<'a> {
                 );
                 if splits > 1 {
                     params.splits = splits;
-                    params.chunk = max_seq.div_ceil(splits);
                     let scratch_idx = self.plan.buffers.len() as u32;
                     self.plan.buffers.push(
                         block_len as usize
