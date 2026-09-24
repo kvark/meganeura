@@ -550,9 +550,9 @@ fn epilogue_stage_maps(
 /// contain multiple entry points (e.g. `Unary` has relu, sigmoid, neg).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ShaderGroup {
-    Unary,
-    Binary,
-    BiasAdd,
+    /// Generated pointwise and reduction kernels, lowered from their
+    /// dispatch's `kernel` rather than from a module of this group.
+    Generated,
     Sgd,
     Adam,
     Transpose,
@@ -576,9 +576,7 @@ pub enum ShaderGroup {
     MatMulGemvBT,
     MatMulGemvBTAdd,
     Reduce,
-    Softmax,
     CrossEntropy,
-    RmsNorm,
     RmsNormAdd,
     CachedBlockAttentionSplit,
     CachedBlockAttentionCombine,
@@ -627,9 +625,6 @@ pub enum ShaderGroup {
     /// Per-channel broadcast mul: `dst[n,c,h,w] = src[n,c,h,w] * gate[n,c]`.
     /// Used by EfficientNet Squeeze-and-Excitation.
     MulPerChannel,
-    /// Per-channel broadcast add: `dst[n,c,h,w] = src[n,c,h,w] + bias[c]`.
-    /// Used to apply a fused-BN per-channel bias to a conv output.
-    AddPerChannel,
     Conv2dGemm,
     Conv2dGemmSmall,
     Conv2dGemm16,
@@ -685,9 +680,9 @@ impl ShaderGroup {
 /// Generate a `naga::Module` for a shader group.
 pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
     match group {
-        ShaderGroup::Unary => ShaderModule::new(include_str!("shaders/unary.wgsl")),
-        ShaderGroup::Binary => ShaderModule::new(include_str!("shaders/binary.wgsl")),
-        ShaderGroup::BiasAdd => ShaderModule::new(include_str!("shaders/bias_add.wgsl")),
+        ShaderGroup::Generated => {
+            unreachable!("generated kernels are lowered from their dispatch's kernel")
+        }
         ShaderGroup::Sgd => ShaderModule::new(include_str!("shaders/sgd.wgsl")),
         ShaderGroup::Adam => ShaderModule::new(include_str!("shaders/adam.wgsl")),
         ShaderGroup::Transpose => ShaderModule::new(include_str!("shaders/transpose.wgsl")),
@@ -707,10 +702,8 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
             generate_module_gemv(group, WeightFormat::F32, GemvShape::initial(group))
         }
         ShaderGroup::Reduce => ShaderModule::new(include_str!("shaders/reduce.wgsl")),
-        ShaderGroup::Softmax => ShaderModule::new(include_str!("shaders/softmax.wgsl")),
         ShaderGroup::CrossEntropy => ShaderModule::new(include_str!("shaders/cross_entropy.wgsl")),
-        ShaderGroup::RmsNorm => generate_rms_norm_module(false),
-        ShaderGroup::RmsNormAdd => generate_rms_norm_module(true),
+        ShaderGroup::RmsNormAdd => generate_rms_norm_add_module(),
         ShaderGroup::CachedBlockAttentionSplit | ShaderGroup::CachedBlockAttentionCombine => {
             generate_cached_attention_module(group, None)
         }
@@ -777,9 +770,6 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         ShaderGroup::Conv2dDw => ShaderModule::new(include_str!("shaders/conv2d_dw.wgsl")),
         ShaderGroup::MulPerChannel => {
             ShaderModule::new(include_str!("shaders/mul_per_channel.wgsl"))
-        }
-        ShaderGroup::AddPerChannel => {
-            ShaderModule::new(include_str!("shaders/add_per_channel.wgsl"))
         }
         ShaderGroup::Conv2dGemm
         | ShaderGroup::Conv2dGemmSmall
@@ -865,15 +855,13 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
     }
 }
 
-fn generate_rms_norm_module(add_residual: bool) -> ShaderModule {
-    let epilogue = if add_residual {
-        include_str!("shaders/rms_norm_add_epilogue.wgsl")
-    } else {
-        include_str!("shaders/rms_norm_epilogue.wgsl")
-    };
+fn generate_rms_norm_add_module() -> ShaderModule {
     let source = preprocess(
         include_str!("shaders/rms_norm.wgsl"),
-        &[("$EPILOGUE", epilogue)],
+        &[(
+            "$EPILOGUE",
+            include_str!("shaders/rms_norm_add_epilogue.wgsl"),
+        )],
     );
     ShaderModule::new(&source)
 }
@@ -1015,10 +1003,6 @@ pub fn module_to_wgsl(module: &Module, capabilities: naga::valid::Capabilities) 
     naga::back::wgsl::write_string(module, &info, naga::back::wgsl::WriterFlags::empty())
         .expect("WGSL write failed")
 }
-
-// ---------------------------------------------------------------------------
-// unary.wgsl: relu, sigmoid, neg
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // matmul.wgsl — 4×4 register-tiled matrix multiply (64×64 output tiles)
@@ -6362,9 +6346,6 @@ mod tests {
     #[test]
     fn all_shaders_generate_valid_modules() {
         let groups = [
-            (ShaderGroup::Unary, naga::valid::Capabilities::empty()),
-            (ShaderGroup::Binary, naga::valid::Capabilities::empty()),
-            (ShaderGroup::BiasAdd, naga::valid::Capabilities::empty()),
             (
                 ShaderGroup::ChunkedRelativeAttention,
                 naga::valid::Capabilities::empty(),
@@ -6406,12 +6387,10 @@ mod tests {
                 gemv_caps(ShaderGroup::MatMulGemvBTAdd),
             ),
             (ShaderGroup::Reduce, naga::valid::Capabilities::empty()),
-            (ShaderGroup::Softmax, naga::valid::Capabilities::empty()),
             (
                 ShaderGroup::CrossEntropy,
                 naga::valid::Capabilities::empty(),
             ),
-            (ShaderGroup::RmsNorm, naga::valid::Capabilities::empty()),
             (ShaderGroup::RmsNormAdd, naga::valid::Capabilities::empty()),
             (ShaderGroup::Embedding, naga::valid::Capabilities::empty()),
             (
@@ -6557,29 +6536,6 @@ mod tests {
     /// Verify the generated modules contain the expected entry points.
     #[test]
     fn entry_points_present() {
-        let m = generate_module(ShaderGroup::Unary, MatmulKnobs::default());
-        let names: Vec<&str> = m
-            .module
-            .entry_points
-            .iter()
-            .map(|ep| ep.name.as_str())
-            .collect();
-        assert!(names.contains(&"relu"), "missing relu");
-        assert!(names.contains(&"sigmoid"), "missing sigmoid");
-        assert!(names.contains(&"neg"), "missing neg");
-        assert!(names.contains(&"silu"), "missing silu");
-
-        let m = generate_module(ShaderGroup::Binary, MatmulKnobs::default());
-        let names: Vec<&str> = m
-            .module
-            .entry_points
-            .iter()
-            .map(|ep| ep.name.as_str())
-            .collect();
-        assert!(names.contains(&"add"));
-        assert!(names.contains(&"mul"));
-        assert!(names.contains(&"greater"));
-
         let m = generate_module(ShaderGroup::Reduce, MatmulKnobs::default());
         let names: Vec<&str> = m
             .module
@@ -6602,7 +6558,6 @@ mod tests {
 
     #[test]
     fn test_rms_norm_wgsl() {
-        let _ = generate_wgsl(ShaderGroup::RmsNorm);
         let _ = generate_wgsl(ShaderGroup::RmsNormAdd);
     }
 
@@ -6809,9 +6764,6 @@ mod tests {
             | naga::valid::Capabilities::SHADER_FLOAT16
             | naga::valid::Capabilities::SUBGROUP;
         let groups: &[(ShaderGroup, naga::valid::Capabilities)] = &[
-            (ShaderGroup::Unary, empty),
-            (ShaderGroup::Binary, empty),
-            (ShaderGroup::BiasAdd, empty),
             (ShaderGroup::Sgd, empty),
             (ShaderGroup::Adam, empty),
             (ShaderGroup::Transpose, empty),
@@ -6825,9 +6777,7 @@ mod tests {
             (ShaderGroup::MatMulATAdd, empty),
             (ShaderGroup::MatMulBTAdd, empty),
             (ShaderGroup::Reduce, empty),
-            (ShaderGroup::Softmax, empty),
             (ShaderGroup::CrossEntropy, empty),
-            (ShaderGroup::RmsNorm, empty),
             (ShaderGroup::RmsNormAdd, empty),
             (ShaderGroup::Embedding, empty),
             (ShaderGroup::ToF16, f16),
@@ -6933,6 +6883,8 @@ mod tests {
         // builtin args are not bound by blade and can be ignored.
         fn expected_globals(entry: &ShaderEntry) -> Vec<&'static str> {
             match *entry {
+                // Generated kernels bind by their kernel's own layout.
+                ShaderEntry::Generated => Vec::new(),
                 ShaderEntry::BlockMatMul
                 | ShaderEntry::BlockMatMulAT
                 | ShaderEntry::BlockMatMulBT => vec!["matrix_a", "matrix_b", "matrix_c", "params"],
@@ -6951,30 +6903,11 @@ mod tests {
                 | ShaderEntry::FusedMatMulBTAdd => {
                     vec!["matrix_a", "matrix_b", "matrix_c", "src", "params"]
                 }
-                ShaderEntry::Relu
-                | ShaderEntry::Sigmoid
-                | ShaderEntry::Neg
-                | ShaderEntry::Abs
-                | ShaderEntry::Log
-                | ShaderEntry::Recip
-                | ShaderEntry::Silu
-                | ShaderEntry::Gelu
-                | ShaderEntry::Tanh
-                | ShaderEntry::SumAll
+                ShaderEntry::SumAll
                 | ShaderEntry::MeanAll
                 | ShaderEntry::SumRows
                 | ShaderEntry::RoPE
                 | ShaderEntry::RoPEGrad => vec!["src", "dst", "params"],
-                ShaderEntry::Add
-                | ShaderEntry::Mul
-                | ShaderEntry::Greater
-                | ShaderEntry::SwiGLU
-                | ShaderEntry::GeGLU => {
-                    vec!["src_a", "src_b", "dst", "params"]
-                }
-                ShaderEntry::BiasAdd | ShaderEntry::BiasMul => {
-                    vec!["src", "bias", "dst", "params"]
-                }
                 ShaderEntry::SgdUpdate => vec!["param", "grad", "dst", "params"],
                 ShaderEntry::AdamUpdate => {
                     vec!["param", "grad", "m", "v", "grouped_grad_norm", "params"]
@@ -6984,12 +6917,10 @@ mod tests {
                     vec!["indices", "src", "row_scale", "dst", "params"]
                 }
                 ShaderEntry::BceLoss => vec!["pred", "labels", "loss_out", "params"],
-                ShaderEntry::Softmax => vec!["src", "dst", "params"],
                 ShaderEntry::CrossEntropyLoss => {
                     vec!["logits", "labels", "grad_out", "loss_out", "params"]
                 }
                 ShaderEntry::Transpose => vec!["src", "dst", "params"],
-                ShaderEntry::RmsNorm => vec!["src", "bias", "dst", "params"],
                 ShaderEntry::RmsNormAdd => vec!["src", "bias", "residual", "dst", "params"],
                 ShaderEntry::Embedding => vec!["indices", "src", "dst", "params"],
                 ShaderEntry::ToF16 => vec!["src", "dst", "params"],
@@ -7079,7 +7010,6 @@ mod tests {
                     vec!["src", "weight", "dst", "params"]
                 }
                 ShaderEntry::MulPerChannel => vec!["src", "gate", "dst", "params"],
-                ShaderEntry::AddPerChannel => vec!["src", "bias", "dst", "params"],
                 ShaderEntry::Conv2dGemm
                 | ShaderEntry::Conv2dGemmSmall
                 | ShaderEntry::Conv2dGemm16
@@ -7141,17 +7071,6 @@ mod tests {
             ShaderEntry::FusedMatMulAdd,
             ShaderEntry::FusedMatMulATAdd,
             ShaderEntry::FusedMatMulBTAdd,
-            ShaderEntry::Relu,
-            ShaderEntry::Sigmoid,
-            ShaderEntry::Neg,
-            ShaderEntry::Abs,
-            ShaderEntry::Log,
-            ShaderEntry::Recip,
-            ShaderEntry::Add,
-            ShaderEntry::Mul,
-            ShaderEntry::Greater,
-            ShaderEntry::BiasAdd,
-            ShaderEntry::BiasMul,
             ShaderEntry::SgdUpdate,
             ShaderEntry::GradClipNormSq,
             ShaderEntry::GradClipScale,
@@ -7159,17 +7078,11 @@ mod tests {
             ShaderEntry::GradAccum,
             ShaderEntry::SumAll,
             ShaderEntry::MeanAll,
-            ShaderEntry::Softmax,
             ShaderEntry::CrossEntropyLoss,
             ShaderEntry::Transpose,
-            ShaderEntry::Silu,
-            ShaderEntry::RmsNorm,
             ShaderEntry::Embedding,
             ShaderEntry::RoPE,
             ShaderEntry::RoPEGrad,
-            ShaderEntry::Gelu,
-            ShaderEntry::GeGLU,
-            ShaderEntry::Tanh,
             ShaderEntry::LayerNorm,
             ShaderEntry::MultiHeadAttn,
             ShaderEntry::FlashAttention,
@@ -7211,7 +7124,6 @@ mod tests {
             ShaderEntry::Upsample2xGrad,
             ShaderEntry::Conv2dDw,
             ShaderEntry::MulPerChannel,
-            ShaderEntry::AddPerChannel,
             ShaderEntry::Conv2dGemm,
             ShaderEntry::Conv2dGemmSmall,
             ShaderEntry::Conv2dGemm16,

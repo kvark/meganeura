@@ -10,10 +10,9 @@
 //!     `naga::front::wgsl`. Parsing is ~100µs — specialization is cheap.
 //!   - `PointwiseDAG` is shared across all archetypes (used as prologue /
 //!     epilogue on heavy kernels in later steps).
-//!   - Generated pointwise kernels for `n_inputs ∈ {1, 2}` use the same
-//!     binding names as the existing hand-written `unary.wgsl` / `binary.wgsl`
-//!     shaders (`src` / `src_a`+`src_b`), so they plug into the existing
-//!     `UnaryData` / `BinaryData` runtime layouts with zero extra plumbing.
+//!   - Generated pointwise kernels bind `src` (one input) or `src_a`,
+//!     `src_b`, `src_c`, then `dst` and `params`: the runtime's `UnaryData`,
+//!     `BinaryData` and `TernaryData` layouts.
 //!
 //! This commit lands archetype 1 (pointwise) as a standalone lowerer.
 //! Wiring into `compile.rs` / `runtime.rs` happens in the next step.
@@ -1110,7 +1109,7 @@ fn per_col_binding_names(n: u8) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// Equivalent of `unary.wgsl`'s `relu`: dst[i] = max(src[i], 0).
+    /// dst[i] = max(src[i], 0).
     fn relu_dag() -> PointwiseDAG {
         PointwiseDAG {
             n_inputs: 1,
@@ -1119,7 +1118,7 @@ mod tests {
         }
     }
 
-    /// Equivalent of `binary.wgsl`'s `add`: dst[i] = src_a[i] + src_b[i].
+    /// dst[i] = src_a[i] + src_b[i].
     fn add_dag() -> PointwiseDAG {
         PointwiseDAG {
             n_inputs: 2,
@@ -1128,7 +1127,7 @@ mod tests {
         }
     }
 
-    /// Equivalent of `binary.wgsl`'s `swiglu`: silu(src_a[i]) * src_b[i].
+    /// silu(src_a[i]) * src_b[i].
     fn swiglu_dag() -> PointwiseDAG {
         PointwiseDAG {
             n_inputs: 2,
@@ -1148,7 +1147,7 @@ mod tests {
             dag: relu_dag(),
             grid: GridShape::default(),
         });
-        // Match unary.wgsl so UnaryData layout can bind the generated shader.
+        // The names UnaryData binds.
         assert!(sm.source.contains("var<storage> src: array<f32>;"));
         assert!(
             sm.source
@@ -1164,7 +1163,7 @@ mod tests {
             dag: add_dag(),
             grid: GridShape::default(),
         });
-        // Match binary.wgsl so BinaryData layout can bind the generated shader.
+        // The names BinaryData binds.
         assert!(sm.source.contains("var<storage> src_a: array<f32>;"));
         assert!(sm.source.contains("var<storage> src_b: array<f32>;"));
         assert!(sm.source.contains("dst[i] = v2;"));

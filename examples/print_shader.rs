@@ -10,7 +10,7 @@ fn main() {
     let wgsl = match group {
         "MultiHeadAttn" => generate_wgsl(ShaderGroup::MultiHeadAttn),
         "FlashAttention" => generate_wgsl(ShaderGroup::FlashAttention),
-        "RmsNorm" => generate_wgsl(ShaderGroup::RmsNorm),
+        "RmsNormAdd" => generate_wgsl(ShaderGroup::RmsNormAdd),
         // Cooperative execution is a modifier, not a group of its own, so
         // it needs a tile config rather than a group name.
         _ => {

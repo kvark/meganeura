@@ -61,9 +61,10 @@ impl Sweep {
     }
 }
 
-fn options(schedule_reduction: bool) -> gpu::Options {
+/// Default options, with or without dispatch fusion.
+fn options(fused: bool) -> gpu::Options {
     let mut options = gpu::Options::default();
-    options.compile.use_schedule_reduction = schedule_reduction;
+    options.compile.fuse_dispatches = fused;
     options
 }
 

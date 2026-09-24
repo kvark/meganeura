@@ -325,15 +325,6 @@ struct TernaryData {
     params: UnaryParams,
 }
 
-// bias_add: var src, bias, dst, params
-#[derive(blade_macros::ShaderData)]
-struct BiasAddData {
-    src: blade_graphics::BufferPiece,
-    bias: blade_graphics::BufferPiece,
-    dst: blade_graphics::BufferPiece,
-    params: BiasAddParams,
-}
-
 #[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 #[repr(C)]
 struct BiasAddParams {
@@ -359,15 +350,6 @@ struct MulPerChannelParams {
     spatial: u32,
     _pad0: u32,
     _pad1: u32,
-}
-
-// add_per_channel: var src, bias, dst, params
-#[derive(blade_macros::ShaderData)]
-struct AddPerChannelData {
-    src: blade_graphics::BufferPiece,
-    bias: blade_graphics::BufferPiece,
-    dst: blade_graphics::BufferPiece,
-    params: AddPerChannelParams,
 }
 
 #[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
@@ -937,14 +919,6 @@ struct LayerNormData {
     bias: blade_graphics::BufferPiece,  // bias
     dst: blade_graphics::BufferPiece,
     params: MatMulParams, // rows, cols, eps_bits, _pad
-}
-
-// softmax: var src, dst, params
-#[derive(blade_macros::ShaderData)]
-struct SoftmaxData {
-    src: blade_graphics::BufferPiece,
-    dst: blade_graphics::BufferPiece,
-    params: SoftmaxParams,
 }
 
 #[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
@@ -1895,6 +1869,10 @@ pub fn matmul_with_prologue_layout(n_factors: usize) -> blade_graphics::ShaderDa
 pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayout {
     use blade_graphics::ShaderData;
     match *entry {
+        // Generated kernels take their layout from their kernel.
+        ShaderEntry::Generated => blade_graphics::ShaderDataLayout {
+            bindings: Vec::new(),
+        },
         ShaderEntry::MatMul
         | ShaderEntry::MatMulAT
         | ShaderEntry::MatMulBT
@@ -1908,21 +1886,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::FusedMatMulBTAdd
         | ShaderEntry::MatMulGemvBTAdd
         | ShaderEntry::MatMulGemvAdd => FusedMatMulAddData::layout(),
-        ShaderEntry::Relu
-        | ShaderEntry::Sigmoid
-        | ShaderEntry::Tanh
-        | ShaderEntry::Neg
-        | ShaderEntry::Abs
-        | ShaderEntry::Log
-        | ShaderEntry::Recip
-        | ShaderEntry::Silu => UnaryData::layout(),
-        ShaderEntry::Add
-        | ShaderEntry::Mul
-        | ShaderEntry::Greater
-        | ShaderEntry::SwiGLU
-        | ShaderEntry::GeGLU => BinaryData::layout(),
         ShaderEntry::PairwiseGrad => TernaryData::layout(),
-        ShaderEntry::BiasAdd | ShaderEntry::BiasMul => BiasAddData::layout(),
         ShaderEntry::SgdUpdate => SgdData::layout(),
         ShaderEntry::AdamUpdate => AdamData::layout(),
         ShaderEntry::ScatterAdd => ScatterAddData::layout(),
@@ -1932,15 +1896,12 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::GeGLUConcat
         | ShaderEntry::GeGLUConcatGrad => BinaryData::layout(),
         ShaderEntry::SumAll | ShaderEntry::MeanAll | ShaderEntry::SumRows => UnaryData::layout(),
-        ShaderEntry::Softmax => SoftmaxData::layout(),
         ShaderEntry::CrossEntropyLoss => CrossEntropyData::layout(),
         ShaderEntry::BceLoss => BceData::layout(),
         ShaderEntry::Transpose => TransposeData::layout(),
-        ShaderEntry::RmsNorm => RmsNormData::layout(),
         ShaderEntry::Embedding => EmbeddingData::layout(),
         ShaderEntry::ToF16 => UnaryData::layout(),
         ShaderEntry::RoPE | ShaderEntry::RoPEGrad => RoPEData::layout(),
-        ShaderEntry::Gelu => UnaryData::layout(),
         ShaderEntry::LayerNorm => LayerNormData::layout(),
         ShaderEntry::RmsNormAdd => RmsNormAddData::layout(),
         ShaderEntry::MultiHeadAttn
@@ -1970,7 +1931,6 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => UnaryData::layout(),
         ShaderEntry::Conv2dDw => Conv2dDwData::layout(),
         ShaderEntry::MulPerChannel => MulPerChannelData::layout(),
-        ShaderEntry::AddPerChannel => AddPerChannelData::layout(),
         ShaderEntry::Conv2dGemm
         | ShaderEntry::Conv2dGemmSmall
         | ShaderEntry::Conv2dGemm16
@@ -7441,6 +7401,9 @@ impl Session {
         }
 
         match dispatch.shader {
+            ShaderEntry::Generated => {
+                unreachable!("generated kernels are bound by their kernel above")
+            }
             ShaderEntry::BlockMatMul | ShaderEntry::BlockMatMulAT | ShaderEntry::BlockMatMulBT => {
                 pc.bind(
                     0,
@@ -7527,15 +7490,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::Relu
-            | ShaderEntry::Sigmoid
-            | ShaderEntry::Tanh
-            | ShaderEntry::Neg
-            | ShaderEntry::Abs
-            | ShaderEntry::Log
-            | ShaderEntry::Recip
-            | ShaderEntry::ToF16
-            | ShaderEntry::Silu => {
+            ShaderEntry::ToF16 => {
                 pc.bind(
                     0,
                     &UnaryData {
@@ -7569,26 +7524,6 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::Add
-            | ShaderEntry::Mul
-            | ShaderEntry::Greater
-            | ShaderEntry::SwiGLU
-            | ShaderEntry::GeGLU => {
-                pc.bind(
-                    0,
-                    &BinaryData {
-                        src_a: buf(dispatch.input_buffers[0]),
-                        src_b: buf(dispatch.input_buffers[1]),
-                        dst: buf(dispatch.output_buffer),
-                        params: UnaryParams {
-                            len: dispatch.params[0],
-                            _pad0: 0,
-                            _pad1: 0,
-                            _pad2: 0,
-                        },
-                    },
-                );
-            }
             ShaderEntry::PairwiseGrad => {
                 pc.bind(
                     0,
@@ -7602,22 +7537,6 @@ impl Session {
                             _pad0: dispatch.params[1],
                             _pad1: dispatch.params[2],
                             _pad2: dispatch.params[3],
-                        },
-                    },
-                );
-            }
-            ShaderEntry::BiasAdd | ShaderEntry::BiasMul => {
-                pc.bind(
-                    0,
-                    &BiasAddData {
-                        src: buf(dispatch.input_buffers[0]),
-                        bias: buf(dispatch.input_buffers[1]),
-                        dst: buf(dispatch.output_buffer),
-                        params: BiasAddParams {
-                            len: dispatch.params[0],
-                            bias_len: dispatch.params[1],
-                            _pad0: 0,
-                            _pad1: 0,
                         },
                     },
                 );
@@ -7665,21 +7584,6 @@ impl Session {
                             _pad0: dispatch.params[1], // n
                             _pad1: dispatch.params.get(2).copied().unwrap_or(0),
                             _pad2: dispatch.params.get(3).copied().unwrap_or(0),
-                        },
-                    },
-                );
-            }
-            ShaderEntry::Softmax => {
-                pc.bind(
-                    0,
-                    &SoftmaxData {
-                        src: buf(dispatch.input_buffers[0]),
-                        dst: buf(dispatch.output_buffer),
-                        params: SoftmaxParams {
-                            batch: dispatch.params[0],
-                            features: dispatch.params[1],
-                            _pad0: 0,
-                            _pad1: 0,
                         },
                     },
                 );
@@ -7737,22 +7641,6 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::RmsNorm => {
-                pc.bind(
-                    0,
-                    &RmsNormData {
-                        src: buf(dispatch.input_buffers[0]),
-                        bias: buf(dispatch.input_buffers[1]),
-                        dst: buf(dispatch.output_buffer),
-                        params: BiasAddParams {
-                            len: dispatch.params[0],
-                            bias_len: dispatch.params[1],
-                            _pad0: dispatch.params[2], // eps_bits
-                            _pad1: 0,
-                        },
-                    },
-                );
-            }
             ShaderEntry::RmsNormAdd => {
                 pc.bind(
                     0,
@@ -7798,21 +7686,6 @@ impl Session {
                             theta_bits: dispatch.params[2],
                             pos_offset: dispatch.params[3],
                             head_dim: dispatch.params[4],
-                            _pad0: 0,
-                            _pad1: 0,
-                            _pad2: 0,
-                        },
-                    },
-                );
-            }
-            ShaderEntry::Gelu => {
-                pc.bind(
-                    0,
-                    &UnaryData {
-                        src: buf(dispatch.input_buffers[0]),
-                        dst: buf(dispatch.output_buffer),
-                        params: UnaryParams {
-                            len: dispatch.params[0],
                             _pad0: 0,
                             _pad1: 0,
                             _pad2: 0,
@@ -8225,23 +8098,6 @@ impl Session {
                             spatial: p[1],
                             _pad0: 0,
                             _pad1: 0,
-                        },
-                    },
-                );
-            }
-            ShaderEntry::AddPerChannel => {
-                let p = &dispatch.params;
-                pc.bind(
-                    0,
-                    &AddPerChannelData {
-                        src: buf(dispatch.input_buffers[0]),
-                        bias: buf(dispatch.input_buffers[1]),
-                        dst: buf(dispatch.output_buffer),
-                        params: AddPerChannelParams {
-                            len: p[0],
-                            spatial: p[1],
-                            channels: p[2],
-                            _pad0: 0,
                         },
                     },
                 );
