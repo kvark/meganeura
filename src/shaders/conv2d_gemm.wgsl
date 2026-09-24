@@ -44,7 +44,6 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let iw0 = i32(ow * params.stride) - i32(params.padding_w);
     let batch_src = n * input_stride;
     let b_step = split_digits(256u / $BM_U, params.kernel_h, params.kernel_w, params.kernel_w_multiplier, params.kernel_hw_multiplier);
-    var b_k = split_digits(tid / $BM_U, params.kernel_h, params.kernel_w, params.kernel_w_multiplier, params.kernel_hw_multiplier);
 
     $ACC_DECL
 
@@ -65,6 +64,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
 
         // Load B tile: im2col(input)^T [K, oH*oW].
         // B[k, hw] = input[n, ci, oh*stride+kh-pad, ow*stride+kw-pad]
+        var b_k = split_digits(t + tid / $BM_U, params.kernel_h, params.kernel_w, params.kernel_w_multiplier, params.kernel_hw_multiplier);
         for (var e = 0u; e < $STAGE_EPT_U; e++) {
             let row_local = tid / $BM_U + e * (256u / $BM_U);  // K dimension
             let k_idx = t + row_local;
