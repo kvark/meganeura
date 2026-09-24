@@ -92,19 +92,20 @@ impl CostModel<Cost> for Excluding {
         &self,
         egraph: &egglog::EGraph,
         func: &egglog::Function,
-        row: &egglog::FunctionRow,
+        enode: &egglog::Enode<'_>,
     ) -> Cost {
         Cost {
             forbidden: usize::from(
                 self.forbidden
                     .binary_search_by(|edge| {
-                        edge.head.as_str().cmp(func.name()).then_with(|| {
-                            edge.inputs.as_slice().cmp(&row.vals[..row.vals.len() - 1])
-                        })
+                        edge.head
+                            .as_str()
+                            .cmp(func.name())
+                            .then_with(|| edge.inputs.as_slice().cmp(enode.children))
                     })
                     .is_ok(),
             ),
-            estimate: self.costs.enode_cost(egraph, func, row),
+            estimate: self.costs.enode_cost(egraph, func, enode),
             unscheduled: usize::from(super::matrix_family(func.name()) == Some(func.name())),
         }
     }
@@ -130,8 +131,7 @@ fn edges(
                     continue;
                 }
                 let inputs: Vec<_> = args.iter().map(|&arg| values[arg].unwrap()).collect();
-                let value = egraph
-                    .lookup_function(head, &inputs)
+                let value = super::lookup_value(egraph, head, &inputs)
                     .ok_or("extracted term is missing from the e-graph")?;
                 if head != "Leaf" {
                     result.push((
@@ -312,9 +312,7 @@ fn segment_candidates(
         .parse_and_run_program(None, &program)
         .map_err(|e| e.to_string())?;
     let sort = egraph.get_sort_by_name("Op").unwrap().clone();
-    let value = egraph
-        .lookup_function(&root_name, &[])
-        .ok_or("missing extraction root")?;
+    let value = super::lookup_value(&egraph, &root_name, &[]).ok_or("missing extraction root")?;
     let costs = match config.extraction_cost {
         super::ExtractionCost::AstSize => FusionCostModel::ast_size(),
         super::ExtractionCost::TensorTraffic => FusionCostModel::with_sizes(super::eclass_sizes(
