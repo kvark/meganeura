@@ -3,7 +3,8 @@
 //!
 //! Kernel selection (`Compiler::attention_dispatch*` in `src/compile.rs`,
 //! default knobs): with `ept = min(head_dim, 32)` and
-//! `bq = 256 / (head_dim / ept)`, a forward or dQ dispatch uses the flash
+//! `bq = 256 / (head_dim / ept)` for power-of-two widths (see
+//! `codegen::attention_lanes` for the others), a forward or dQ dispatch uses the flash
 //! kernel when `q_seq >= bq` and the one-query scalar kernel otherwise; dK/dV
 //! makes the same choice on the KV length (`q_seq` when causal). So flash
 //! starts at 256 rows for `head_dim <= 32` (one lane per query, the tiled
@@ -301,19 +302,21 @@ fn causal_forward_wide_heads() {
     );
 }
 
-/// Attention kernels need power-of-two heads. Other widths (80 is common)
-/// are refused when the session is built, never computed wrongly.
+/// Other widths split into power-of-two lane groups with several elements
+/// each (80 = 4 × 20 at the default cap, 72 = 4 × 18, 20 = 1 × 20); the
+/// one-query kernel pads its lanes to the next power of two. The shapes
+/// reach both forward kernels and both backward kernels.
 #[test]
-fn causal_head_dim_80_is_refused() {
-    for s in [shape(9, 9, 2, 1, 80), shape(70, 70, 2, 1, 80)] {
-        let g = forward_graph(Kind::Causal, s);
-        let refused = std::panic::catch_unwind(|| {
-            let mut config = meganeura::SessionConfig::from_env();
-            config.mode = meganeura::Mode::Inference;
-            meganeura::build(&g, config)
-        });
-        assert!(refused.is_err(), "{s:?} built");
-    }
+fn non_power_of_two_heads() {
+    let shapes = [
+        shape(9, 9, 2, 1, 80),
+        shape(70, 70, 2, 1, 80),
+        shape(40, 40, 3, 1, 96),
+        shape(130, 130, 2, 2, 72),
+        shape(300, 300, 1, 1, 20),
+    ];
+    forward_sweep(&[Kind::Causal, Kind::Window(5), Kind::Full], &shapes);
+    backward_sweep(&[Kind::Causal, Kind::Mha { cross: true }], &shapes);
 }
 
 #[test]
@@ -440,6 +443,7 @@ fn attention_training() {
         (Kind::Window(4), shape(33, 33, 2, 1, 256)),
         (Kind::Mha { cross: true }, shape(40, 35, 2, 1, 256)),
         (Kind::Rope(10_000.0), shape(33, 33, 2, 1, 256)),
+        (Kind::Causal, shape(70, 70, 2, 1, 80)),
     ];
     for (n, &(kind, s)) in TRAINABLE.iter().chain(&flash).enumerate() {
         let g = training_graph(kind, s);
@@ -468,9 +472,10 @@ fn cached_graph(s: Shape, window: Option<u32>) -> Graph {
 
 #[test]
 fn cached_attention() {
-    // One query: `cached_attention.wgsl`; several: the cached flash kernel
-    // (32 queries per workgroup). Positions cover a partial first key tile,
-    // whole tiles plus a tail, and the last cache row.
+    // One 64-wide query: `cached_attention.wgsl`; otherwise the cached flash
+    // kernel (32 queries per workgroup at width 64, 16 at 80 or 96).
+    // Positions cover a partial first key tile, whole tiles plus a tail, and
+    // the last cache row.
     let mut sweep = Sweep::default();
     let options = gpu::Options::default();
     for (n, &(queries, max_seq, kv_pos)) in [
@@ -483,8 +488,8 @@ fn cached_attention() {
     .iter()
     .enumerate()
     {
-        for (heads, kv_heads) in [(2, 1), (2, 2)] {
-            let s = shape(queries, max_seq, heads, kv_heads, 64);
+        for (heads, kv_heads, dim) in [(2, 1, 64), (2, 2, 64), (2, 1, 80), (1, 1, 96)] {
+            let s = shape(queries, max_seq, heads, kv_heads, dim);
             let g = cached_graph(s, None);
             let mut feeds = Feeds::new();
             feeds.set_u32("kv_pos", &[kv_pos]);
