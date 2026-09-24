@@ -82,13 +82,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Build two shared suites plus the environment-isolated tests.
-      # Linux instruments this same run, not a second copy of the suite.
+      # One run of the shared suites. Linux instruments that run; it is not a
+      # second copy of the suite.
       #
-      # Nothing is a default feature, so Linux first checks+tests the bare
-      # build the way a pinning embedder sees it, then repeats it with
-      # every feature to cover `gguf` / `models` / `hub`. macOS goes
-      # straight to the all-features run.
+      # Nothing is a default feature. The quality job `cargo check`s the bare
+      # build a pinning embedder compiles. Execution is all-features on every
+      # OS: `gguf` / `models` / `hub` add tests, and the core tests do not
+      # change under those features, so Linux does not run the suite twice.
+      #
+      # `--test-threads=4` overrides `.cargo/config.toml`, which keeps a
+      # workstation at one thread. A hosted runner can keep four sessions
+      # in flight: most of a test is graph setup and waiting on the queue.
+      # Libtest would otherwise use one thread per CPU.
       #
       # `MEGANEURA_SKIP_BIT_EXACT` gates one class of test: exact equality
       # between a fused path and its explicit expansion. The contract holds
@@ -97,23 +102,14 @@ jobs:
       # cases, Metal on two others. Gating the class beats naming cases one
       # at a time, which grew with every adapter; `tests/schedule_*.rs`
       # still run these at full strength locally.
-      - name: Check + unit + integration tests, no features
-        if: runner.os == 'Linux'
-        run: |
-          cargo check --all-targets
-          cargo test --tests -- --test-threads=1
-        env:
-          MEGANEURA_SKIP_BACKPROP: ${{ matrix.skip_backprop }}
-          MEGANEURA_SKIP_BIT_EXACT: "1"
-
       - name: Unit + integration tests, all features
         shell: bash
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
             cargo llvm-cov clean --workspace
-            cargo llvm-cov --tests --all-features --no-report -- --test-threads=1
+            cargo llvm-cov --tests --all-features --no-report -- --test-threads=4
           else
-            cargo test --tests --all-features -- --test-threads=1
+            cargo test --tests --all-features -- --test-threads=4
           fi
         env:
           # MHA backward shaders produce numerically unstable gradients on

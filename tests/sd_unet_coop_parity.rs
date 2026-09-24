@@ -4,10 +4,7 @@
 //! opening 4-to-64-channel convolution then corrupted the whole SD U-Net.
 
 use meganeura::models::sd_unet;
-use meganeura::{Graph, Session};
-use std::sync::Mutex;
-
-static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
+use meganeura::{CoopPolicy, Graph, Session};
 
 fn name_seed(name: &str) -> f32 {
     let mut hash = 0u32;
@@ -35,24 +32,19 @@ fn initialize(session: &mut Session) {
 }
 
 fn run(cooperative: bool) -> Vec<f32> {
-    // SAFETY: the test holds GPU_TEST_LOCK while changing process-global
-    // feature switches and is intended to run serially with other GPU tests.
-    unsafe {
-        std::env::remove_var("MEGANEURA_COOP_F16");
-        if cooperative {
-            std::env::remove_var("MEGANEURA_DISABLE_COOP");
-        } else {
-            std::env::set_var("MEGANEURA_DISABLE_COOP", "1");
-        }
-    }
-
     let config = sd_unet::Config::small();
     let output_len =
         (config.batch_size * config.in_channels * config.resolution * config.resolution) as usize;
     let mut graph = Graph::new();
     let output = sd_unet::build_unet(&mut graph, &config);
     graph.set_outputs(vec![output]);
-    let mut session = meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
+    let mut session_config = meganeura::SessionConfig::inference_from_env();
+    session_config.runtime.coop = if cooperative {
+        CoopPolicy::Auto
+    } else {
+        CoopPolicy::Disabled
+    };
+    let mut session = meganeura::build(&graph, session_config).0;
     initialize(&mut session);
 
     let noisy_latent = (0..output_len)
@@ -74,7 +66,6 @@ fn run(cooperative: bool) -> Vec<f32> {
 
 #[test]
 fn sd_unet_f32_coop_matches_scalar() {
-    let _guard = GPU_TEST_LOCK.lock().expect("GPU test lock poisoned");
     let scalar = run(false);
     let cooperative = run(true);
 

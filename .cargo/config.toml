@@ -1,3 +1,4 @@
 [env]
-# Integration suites share one GPU. An explicit caller setting still wins.
+# Workstation default: the suites share one GPU. CI passes `--test-threads=4`.
+# An explicit caller setting still wins over this.
 RUST_TEST_THREADS = "1"
