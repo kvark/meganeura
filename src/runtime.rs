@@ -1462,6 +1462,9 @@ impl Pipelines {
                     crate::codegen::generate_flash_grad_kv_coop_module(hd)
                 }
                 ShaderGroup::MultiHeadAttn => crate::codegen::generate_attention_module(hd),
+                ShaderGroup::CachedQueryAttention => {
+                    crate::codegen::generate_cached_query_attention_module(hd)
+                }
                 ShaderGroup::CachedBlockAttention
                 | ShaderGroup::CachedBlockAttentionSplit
                 | ShaderGroup::CachedBlockAttentionCombine => {
@@ -1518,7 +1521,8 @@ impl Pipelines {
             | ShaderGroup::FlashGradQ
             | ShaderGroup::FlashGradQCoop
             | ShaderGroup::FlashGradKV
-            | ShaderGroup::FlashGradKVCoop => dispatch.params.get(3).copied(),
+            | ShaderGroup::FlashGradKVCoop
+            | ShaderGroup::CachedQueryAttention => dispatch.params.get(3).copied(),
             _ => None,
         }
     }
