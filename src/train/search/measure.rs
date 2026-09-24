@@ -308,7 +308,8 @@ mod tests {
 
     #[test]
     fn program_search_preserves_update_and_failure_contracts() {
-        use crate::compile::{Dispatch, ShaderEntry};
+        use crate::compile::{Dispatch, Kernel, ShaderEntry};
+        use crate::schedule::{PointwiseDAG, Pw};
         let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
         let mut graph = crate::Graph::new();
         let x = graph.input("x", &[2]);
@@ -317,13 +318,25 @@ mod tests {
         let loss = graph.sum_all(y);
         graph.set_outputs(vec![loss]);
         let mut plan = crate::compile::compile(&crate::autodiff::differentiate(&graph));
+        // An in-program update: w -= 0.25 * grad.
         let (w, grad) = plan.param_grad_pairs[0];
         plan.dispatches.push(Dispatch {
-            shader: ShaderEntry::SgdUpdate,
+            shader: ShaderEntry::Generated,
             input_buffers: vec![w, grad],
             output_buffer: w,
             workgroups: [1, 1, 1],
-            params: vec![2, 0.25f32.to_bits(), 0, 0],
+            params: vec![2, 0, 0, 0],
+            kernel: Kernel::Pointwise(PointwiseDAG {
+                n_inputs: 2,
+                ops: vec![
+                    Pw::LoadInput(0),
+                    Pw::LoadInput(1),
+                    Pw::Const(0.25f32.to_bits()),
+                    Pw::Mul(1, 2),
+                    Pw::Sub(0, 3),
+                ],
+                output: 4,
+            }),
             ..Default::default()
         });
         for invalidate in [false, true] {

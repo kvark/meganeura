@@ -683,8 +683,8 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         ShaderGroup::Generated => {
             unreachable!("generated kernels are lowered from their dispatch's kernel")
         }
-        ShaderGroup::Sgd => ShaderModule::new(include_str!("shaders/sgd.wgsl")),
-        ShaderGroup::Adam => ShaderModule::new(include_str!("shaders/adam.wgsl")),
+        ShaderGroup::Sgd => optimizer_module(include_str!("shaders/sgd.wgsl")),
+        ShaderGroup::Adam => optimizer_module(include_str!("shaders/adam.wgsl")),
         ShaderGroup::Transpose => ShaderModule::new(include_str!("shaders/transpose.wgsl")),
         ShaderGroup::MatMul => gen_matmul(knobs),
         ShaderGroup::MatMulAdd => gen_matmul_add(knobs),
@@ -841,15 +841,15 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         }
         ShaderGroup::PairwiseGrad => ShaderModule::new(include_str!("shaders/pairwise_grad.wgsl")),
         ShaderGroup::GradClipNormSq => {
-            ShaderModule::new(include_str!("shaders/grad_clip_norm_sq.wgsl"))
+            optimizer_module(include_str!("shaders/grad_clip_norm_sq.wgsl"))
         }
         ShaderGroup::GradClipScale => {
-            ShaderModule::new(include_str!("shaders/grad_clip_scale.wgsl"))
+            optimizer_module(include_str!("shaders/grad_clip_scale.wgsl"))
         }
         ShaderGroup::AdaptiveGradClip => {
-            ShaderModule::new(include_str!("shaders/adaptive_grad_clip.wgsl"))
+            optimizer_module(include_str!("shaders/adaptive_grad_clip.wgsl"))
         }
-        ShaderGroup::GradAccum => ShaderModule::new(include_str!("shaders/grad_accum.wgsl")),
+        ShaderGroup::GradAccum => optimizer_module(include_str!("shaders/grad_accum.wgsl")),
     }
 }
 
@@ -1152,6 +1152,14 @@ fn tiled_matmul_body(
         tile.bn() + 1,
         interleave_columns,
     )
+}
+
+/// An optimizer kernel over the segments of one arena chunk.
+fn optimizer_module(source: &str) -> ShaderModule {
+    ShaderModule::new(&format!(
+        "{}\n{source}",
+        include_str!("shaders/optimizer_segments.wgsl")
+    ))
 }
 
 /// Generate an ordinary scalar convolution with a measured K-tile candidate.
@@ -6930,10 +6938,16 @@ mod tests {
                 | ShaderEntry::SumRows
                 | ShaderEntry::RoPE
                 | ShaderEntry::RoPEGrad => vec!["src", "dst", "params"],
-                ShaderEntry::SgdUpdate => vec!["param", "grad", "dst", "params"],
-                ShaderEntry::AdamUpdate => {
-                    vec!["param", "grad", "m", "v", "grouped_grad_norm", "params"]
-                }
+                ShaderEntry::SgdUpdate => vec!["segments", "param", "grad", "params"],
+                ShaderEntry::AdamUpdate => vec![
+                    "segments",
+                    "param",
+                    "grad",
+                    "m",
+                    "v",
+                    "grouped_grad_norm",
+                    "params",
+                ],
                 ShaderEntry::ScatterAdd => vec!["indices", "src", "dst", "params"],
                 ShaderEntry::ScatterAddAtomic => {
                     vec!["indices", "src", "row_scale", "dst", "params"]
@@ -7070,12 +7084,12 @@ mod tests {
                     vec!["matrix_a", "matrix_b", "matrix_c", "params"]
                 }
                 ShaderEntry::WinogradWeightTransform => vec!["src", "dst", "params"],
-                ShaderEntry::GradClipNormSq => vec!["grad", "acc", "params"],
-                ShaderEntry::GradClipScale => vec!["grad", "acc", "params"],
+                ShaderEntry::GradClipNormSq
+                | ShaderEntry::GradClipScale
+                | ShaderEntry::GradAccum => vec!["segments", "grad", "acc", "params"],
                 ShaderEntry::AdaptiveGradClip => {
-                    vec!["param", "grad", "partials", "scales", "params"]
+                    vec!["segments", "param", "grad", "partials", "scales", "params"]
                 }
-                ShaderEntry::GradAccum => vec!["grad", "acc", "params"],
             }
         }
 

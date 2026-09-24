@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 mod checkpoint;
+mod optimizer;
 pub(crate) mod search_state;
 mod tuning;
 pub use crate::tune::TuneOutcome;
@@ -359,126 +360,6 @@ struct AddPerChannelParams {
     spatial: u32,
     channels: u32,
     _pad0: u32,
-}
-
-// sgd: var param, grad, dst, params
-#[derive(blade_macros::ShaderData)]
-struct SgdData {
-    param: blade_graphics::BufferPiece,
-    grad: blade_graphics::BufferPiece,
-    dst: blade_graphics::BufferPiece,
-    params: SgdParams,
-}
-
-#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
-#[repr(C)]
-struct SgdParams {
-    len: u32,
-    lr: f32,
-    _pad0: u32,
-    _pad1: u32,
-}
-
-// adam: var param (rw), grad (ro), m (rw), v (rw), params
-#[derive(blade_macros::ShaderData)]
-struct AdamData {
-    param: blade_graphics::BufferPiece,
-    grad: blade_graphics::BufferPiece,
-    m: blade_graphics::BufferPiece,
-    v: blade_graphics::BufferPiece,
-    grouped_grad_norm: blade_graphics::BufferPiece,
-    params: AdamParams,
-}
-
-#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
-#[repr(C)]
-struct AdamParams {
-    len: u32,
-    lr: f32,
-    beta1: f32,
-    beta2: f32,
-    eps: f32,
-    step: f32,
-    wd: f32,
-    grad_group_size: u32,
-    algorithm: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
-}
-
-// Grad-clip norm: squared partial sums of `grad` into disjoint `acc` slots,
-// or (square == 0) the total of those partials into one slot.
-#[derive(blade_macros::ShaderData)]
-struct GradClipNormSqData {
-    grad: blade_graphics::BufferPiece,
-    acc: blade_graphics::BufferPiece,
-    params: GradClipNormSqParams,
-}
-
-#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
-#[repr(C)]
-struct GradClipNormSqParams {
-    len: u32,
-    slot: u32,
-    square: u32,
-    _pad0: u32,
-}
-
-// Grad-clip post-pass: in-place multiply `grad` by min(1, max_norm/sqrt(acc)).
-#[derive(blade_macros::ShaderData)]
-struct GradClipScaleData {
-    grad: blade_graphics::BufferPiece,
-    acc: blade_graphics::BufferPiece,
-    params: GradClipScaleParams,
-}
-
-#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
-#[repr(C)]
-struct GradClipScaleParams {
-    len: u32,
-    max_norm: f32,
-    _pad0: u32,
-    _pad1: u32,
-}
-
-#[derive(blade_macros::ShaderData)]
-struct AdaptiveGradClipData {
-    param: blade_graphics::BufferPiece,
-    grad: blade_graphics::BufferPiece,
-    partials: blade_graphics::BufferPiece,
-    scales: blade_graphics::BufferPiece,
-    params: AdaptiveGradClipParams,
-}
-
-#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
-#[repr(C)]
-struct AdaptiveGradClipParams {
-    len: u32,
-    clip: f32,
-    pmin: f32,
-    slot: u32,
-    slots: u32,
-    index: u32,
-    mode: u32,
-    _pad0: u32,
-}
-
-// Temporal grad accumulation: acc[i] += grad[i] * scale.
-#[derive(blade_macros::ShaderData)]
-struct GradAccumData {
-    grad: blade_graphics::BufferPiece,
-    acc: blade_graphics::BufferPiece,
-    params: GradAccumParams,
-}
-
-#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
-#[repr(C)]
-struct GradAccumParams {
-    len: u32,
-    scale: f32,
-    _pad0: u32,
-    _pad1: u32,
 }
 
 // reduce: var src, dst, params (same layout as UnaryData)
@@ -1891,8 +1772,8 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::MatMulGemvBTAdd
         | ShaderEntry::MatMulGemvAdd => FusedMatMulAddData::layout(),
         ShaderEntry::PairwiseGrad => TernaryData::layout(),
-        ShaderEntry::SgdUpdate => SgdData::layout(),
-        ShaderEntry::AdamUpdate => AdamData::layout(),
+        ShaderEntry::SgdUpdate => optimizer::SgdData::layout(),
+        ShaderEntry::AdamUpdate => optimizer::AdamData::layout(),
         ShaderEntry::ScatterAdd => ScatterAddData::layout(),
         ShaderEntry::ScatterAddAtomic => ScatterAddAtomicData::layout(),
         ShaderEntry::SwiGLUConcat
@@ -1970,10 +1851,10 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::WinogradOutputTransform
         | ShaderEntry::WinogradWeightTransform => WinogradTransformData::layout(),
         ShaderEntry::WinogradBatchedMatMul => MatMulData::layout(),
-        ShaderEntry::GradClipNormSq => GradClipNormSqData::layout(),
-        ShaderEntry::GradClipScale => GradClipScaleData::layout(),
-        ShaderEntry::AdaptiveGradClip => AdaptiveGradClipData::layout(),
-        ShaderEntry::GradAccum => GradAccumData::layout(),
+        ShaderEntry::GradClipNormSq | ShaderEntry::GradClipScale | ShaderEntry::GradAccum => {
+            optimizer::GradPassData::layout()
+        }
+        ShaderEntry::AdaptiveGradClip => optimizer::AdaptiveGradClipData::layout(),
     }
 }
 
@@ -2051,7 +1932,7 @@ fn record_groups(
     plan: &ExecutionPlan,
     groups: &[std::ops::Range<usize>],
     pipelines: &Pipelines,
-    buffers: &[blade_graphics::Buffer],
+    buffers: &[blade_graphics::BufferPiece],
     chunks: usize,
 ) {
     let total = groups.len();
@@ -2526,6 +2407,10 @@ pub struct SessionOptions {
     /// Force-pin logical buffers by id/range, e.g. `"3,17,25-40"` — the
     /// aliasing-corruption bisection aid.
     pub pin_buffers: Option<String>,
+    /// Largest parameter-arena chunk in bytes (default
+    /// [`crate::memplan::ARENA_CHUNK_BYTES`]); smaller values spread the
+    /// optimizer over more dispatches, for testing.
+    pub arena_chunk_bytes: Option<usize>,
     /// Reuse one staging buffer across `set_parameter` uploads instead of
     /// restaging per parameter.
     pub reuse_upload_staging: bool,
@@ -2700,10 +2585,10 @@ impl DebugStepReport {
 
 pub struct Session {
     gpu: Arc<Gpu>,
-    /// Per-logical-buffer view: `buffers[i]` backs `BufferRef(i)`. Aliased
-    /// logical buffers hold copies of the same handle; the deduplicated
-    /// owning handles live in `physical_buffers`.
-    buffers: Vec<blade_graphics::Buffer>,
+    /// Per-logical-buffer view: `buffers[i]` backs `BufferRef(i)`, at its
+    /// offset within its physical allocation. Aliased logical buffers share
+    /// a handle; the deduplicated owning handles live in `physical_buffers`.
+    buffers: Vec<blade_graphics::BufferPiece>,
     /// One handle per physical allocation (what actually gets destroyed).
     physical_buffers: Vec<Arc<PhysicalBuffer>>,
     /// Logical-to-physical mapping, allocation sizes, and per-allocation
@@ -2751,8 +2636,13 @@ pub struct Session {
     /// overridden by another `set_learning_rate` / `set_adam` call or
     /// cleared via `clear_optimizer()`.
     pending_lr: Option<f32>,
-    /// Per-parameter Adam/LaProp state, empty until configured or restored.
-    adam_state: Vec<(blade_graphics::Buffer, blade_graphics::Buffer)>,
+    /// Adam/LaProp moments `(m, v)` with the optimizer chunks' layout,
+    /// absent until configured or restored.
+    adam_state: Option<(optimizer::ChunkBuffers, optimizer::ChunkBuffers)>,
+    /// Layout of the trainable pairs for the optimizer passes.
+    optimizer_chunks: Vec<optimizer::Chunk>,
+    /// Host-visible segment table the optimizer passes read.
+    optimizer_segments: Option<blade_graphics::Buffer>,
     /// Optional exact temporal sum of grouped gradient L2 norms for one
     /// parameter. Adam already visits every scalar gradient, so collecting
     /// this diagnostic does not require another dispatch or shader variant.
@@ -2775,7 +2665,7 @@ pub struct Session {
     /// optimizer read the single-step grad — giving PyTorch-style
     /// temporal accumulation. Allocated lazily on first
     /// `set_grad_accumulate`; cleared by `zero_grad`.
-    grad_accum_bufs: Vec<blade_graphics::Buffer>,
+    grad_accum: Option<optimizer::ChunkBuffers>,
     /// `Some(scale)` enables temporal accumulation (`scale` = 1/micro so
     /// the accumulator holds the mean grad); `None` = direct optimizer
     /// reads of the per-step grad (default).
@@ -2893,8 +2783,12 @@ impl std::error::Error for ExternalBindError {}
 /// About 16 elements per lane, so small tensors keep one workgroup and the
 /// embedding tables that dominate a language model spread across the device
 /// instead of streaming through a single workgroup.
-fn grad_clip_workgroups(len: u32) -> u32 {
-    len.div_ceil(4096).clamp(1, 256)
+/// `piece` advanced by `offset` bytes.
+fn piece_at(piece: blade_graphics::BufferPiece, offset: u64) -> blade_graphics::BufferPiece {
+    blade_graphics::BufferPiece {
+        buffer: piece.buffer,
+        offset: piece.offset + offset,
+    }
 }
 
 fn create_optimizer_buffer(
@@ -3257,6 +3151,11 @@ impl Session {
         } else {
             crate::memplan::plan_buffer_aliasing(&plan, &groups, opts.pin_buffers.as_deref())
         };
+        alias.pack_arena(
+            &plan,
+            opts.arena_chunk_bytes
+                .unwrap_or(crate::memplan::ARENA_CHUNK_BYTES),
+        );
         let device_parameters = opts.device_parameters;
         // Only a parameter-bearing physical allocation may be
         // relocated, and it must be on its own physical buffer.
@@ -3280,12 +3179,14 @@ impl Session {
                     continue;
                 }
                 let physical = alias.map[buffer.0 as usize];
+                // Its own pinned allocation, or a parameter arena.
                 assert!(
-                    alias
-                        .map
-                        .iter()
-                        .enumerate()
-                        .all(|(i, &p)| p != physical || i == buffer.0 as usize),
+                    alias.arena.iter().any(|chunk| chunk.params == physical)
+                        || alias
+                            .map
+                            .iter()
+                            .enumerate()
+                            .all(|(i, &p)| p != physical || i == buffer.0 as usize),
                     "device parameter must have its own pinned allocation"
                 );
                 alias.device_local[physical] = true;
@@ -3302,6 +3203,7 @@ impl Session {
             alias.device_local.fill(false);
         }
         let alias = alias;
+        let optimizer_chunks = optimizer::chunks(&plan, &alias);
         // Debug aid: dump dispatch order, declared accesses, and the
         // alias map for corruption bisection (see MEGANEURA_PIN_BUFS).
         if opts.dump_plan {
@@ -3478,10 +3380,11 @@ impl Session {
                 }
             }
         }
-        let buffers: Vec<blade_graphics::Buffer> = alias
+        let buffers: Vec<blade_graphics::BufferPiece> = alias
             .map
             .iter()
-            .map(|&p| physical_buffers[p].handle)
+            .zip(&alias.offsets)
+            .map(|(&p, &offset)| physical_buffers[p].handle.at(offset as u64))
             .collect();
 
         // Upload constant buffer data (gradient constants, scale factors, etc.)
@@ -3578,17 +3481,11 @@ impl Session {
             None
         };
         let grad_clip_partials = if !plan.param_grad_pairs.is_empty() {
-            let slots: u64 = plan
-                .param_grad_pairs
-                .iter()
-                .map(|&(param, _)| {
-                    u64::from(grad_clip_workgroups(Self::optimizer_len(&plan, param)))
-                })
-                .sum();
+            // One (param², grad²) pair per optimizer workgroup.
             Some(create_optimizer_buffer(
                 &gpu,
                 "grad_clip_partials",
-                slots * 8,
+                optimizer::clip_slots(&plan) * 8,
                 optimizer_device,
                 &mut optimizer_device_bufs,
             ))
@@ -3672,10 +3569,12 @@ impl Session {
             grad_clip_acc,
             grad_clip_partials,
             agc_scales,
-            grad_accum_bufs: Vec::new(),
+            grad_accum: None,
             grad_accum_scale: None,
             lr_multipliers: Vec::new(),
-            adam_state: Vec::new(),
+            adam_state: None,
+            optimizer_chunks,
+            optimizer_segments: None,
             adam_grouped_grad_norm: None,
             adam_step: 0,
             pending_adam: None,
@@ -3791,24 +3690,12 @@ impl Session {
             memory: blade_graphics::Memory::External(source),
         });
 
-        let idx = buf_ref.0 as usize;
-        let pidx = self.alias.map[idx];
-        // Externally bindable slots (inputs/params/outputs) are pinned by
-        // the aliasing pass, so this physical allocation has one tenant.
-        debug_assert!(
-            self.alias
-                .map
-                .iter()
-                .enumerate()
-                .all(|(j, &p)| p != pidx || j == idx),
-            "external slot shares a physical allocation"
-        );
-        self.physical_buffers[pidx] = Arc::new(PhysicalBuffer {
+        let device_local = !blade_graphics::Memory::External(source).is_host_visible();
+        let physical = Arc::new(PhysicalBuffer {
             gpu: Arc::clone(&self.gpu),
             handle: imported,
         });
-        self.buffers[idx] = imported;
-        self.alias.device_local[pidx] = !blade_graphics::Memory::External(source).is_host_visible();
+        self.rebind_logical(buf_ref.0 as usize, physical, 0, device_local);
         Ok(())
     }
 
@@ -3852,17 +3739,52 @@ impl Session {
                 source: source_size,
             });
         }
-        let target_physical = self.alias.map[target.0 as usize];
         let source_physical = source.alias.map[source_buffer.0 as usize];
-        let shared = Arc::clone(&source.physical_buffers[source_physical]);
-        self.physical_buffers[target_physical] = Arc::clone(&shared);
-        self.alias.device_local[target_physical] = source.alias.device_local[source_physical];
-        for (logical, &physical) in self.alias.map.iter().enumerate() {
-            if physical == target_physical {
-                self.buffers[logical] = shared.handle;
-            }
-        }
+        self.rebind_logical(
+            target.0 as usize,
+            Arc::clone(&source.physical_buffers[source_physical]),
+            source.alias.offsets[source_buffer.0 as usize],
+            source.alias.device_local[source_physical],
+        );
         Ok(())
+    }
+
+    /// Back logical buffer `index` with `physical` at byte `offset`. Its old
+    /// allocation is replaced when it was the only tenant, and otherwise
+    /// kept for the others (an arena, for instance); the optimizer then
+    /// updates this parameter on its own.
+    fn rebind_logical(
+        &mut self,
+        index: usize,
+        physical: Arc<PhysicalBuffer>,
+        offset: usize,
+        device_local: bool,
+    ) {
+        let old = self.alias.map[index];
+        let arena = self
+            .alias
+            .arena
+            .iter()
+            .any(|chunk| chunk.params == old || chunk.grads == old);
+        let shared = self
+            .alias
+            .map
+            .iter()
+            .enumerate()
+            .any(|(other, &p)| p == old && other != index);
+        self.buffers[index] = physical.handle.at(offset as u64);
+        let target = if arena || shared {
+            self.physical_buffers.push(physical);
+            self.alias.sizes.push(self.plan.buffers[index]);
+            self.alias.device_local.push(device_local);
+            self.physical_buffers.len() - 1
+        } else {
+            self.physical_buffers[old] = physical;
+            self.alias.device_local[old] = device_local;
+            old
+        };
+        self.alias.map[index] = target;
+        self.alias.offsets[index] = offset;
     }
 
     /// Size in bytes of the GPU buffer backing the given slot.
@@ -5478,7 +5400,7 @@ impl Session {
                 assert_eq!(data.len(), bytes);
                 if host_visible || (offset.is_multiple_of(4) && bytes.is_multiple_of(4)) {
                     self.write_raw_buffer_at(
-                        self.buffers[derived_buf.0 as usize].at(offset as u64),
+                        piece_at(self.buffers[derived_buf.0 as usize], offset as u64),
                         data,
                         host_visible,
                     );
@@ -5587,7 +5509,7 @@ impl Session {
                 if !self.logical_host_visible(buf_ref) {
                     return None;
                 }
-                let buffer = &self.buffers[buf_ref.0 as usize];
+                let buffer = self.buffers[buf_ref.0 as usize];
                 let size = self.plan.buffers[buf_ref.0 as usize];
                 return Some((buffer.data(), size));
             }
@@ -5611,9 +5533,7 @@ impl Session {
     pub fn input_buffer(&self, name: &str) -> Option<blade_graphics::BufferPiece> {
         for &(ref input_name, buf_ref) in &self.plan.input_buffers {
             if input_name == name {
-                return Some(blade_graphics::BufferPiece::from(
-                    self.buffers[buf_ref.0 as usize],
-                ));
+                return Some(self.buffers[buf_ref.0 as usize]);
             }
         }
         None
@@ -5635,9 +5555,7 @@ impl Session {
     /// The handle must not be used after the session is destroyed.
     pub fn output_buffer(&self, index: usize) -> Option<blade_graphics::BufferPiece> {
         let &buf_ref = self.plan.output_buffers.get(index)?;
-        Some(blade_graphics::BufferPiece::from(
-            self.buffers[buf_ref.0 as usize],
-        ))
+        Some(self.buffers[buf_ref.0 as usize])
     }
 
     /// Upload u32 input data (e.g. token IDs for embedding lookup).
@@ -5699,8 +5617,10 @@ impl Session {
         if !source_is_f32 {
             for row in 0..rows {
                 self.write_raw_buffer_at(
-                    self.buffers[destination.0 as usize]
-                        .at(((row * destination_columns + column_offset) * 4) as u64),
+                    piece_at(
+                        self.buffers[destination.0 as usize],
+                        ((row * destination_columns + column_offset) * 4) as u64,
+                    ),
                     bytemuck::cast_slice(&data[row * columns..(row + 1) * columns]),
                     false,
                 );
@@ -5720,9 +5640,11 @@ impl Session {
             let mut transfer = encoder.transfer("parameter_columns");
             for row in 0..rows {
                 transfer.copy_buffer_to_buffer(
-                    self.buffers[source.0 as usize].at((row * columns * 4) as u64),
-                    self.buffers[destination.0 as usize]
-                        .at(((row * destination_columns + column_offset) * 4) as u64),
+                    piece_at(self.buffers[source.0 as usize], (row * columns * 4) as u64),
+                    piece_at(
+                        self.buffers[destination.0 as usize],
+                        ((row * destination_columns + column_offset) * 4) as u64,
+                    ),
                     (columns * 4) as u64,
                 );
             }
@@ -5733,7 +5655,7 @@ impl Session {
     }
 
     fn upload_buffer(&self, buf_ref: BufferRef, data: &[u8]) {
-        let buffer = &self.buffers[buf_ref.0 as usize];
+        let buffer = self.buffers[buf_ref.0 as usize];
         let expected = self.plan.buffers[buf_ref.0 as usize];
         // All upload paths (set_parameter, set_input, set_input_u32,
         // upload_param, gradient clip rewrite, checkpoint restore) are
@@ -5772,8 +5694,13 @@ impl Session {
 
     /// Write `data` into a GPU buffer, staging through a host-visible
     /// allocation when the destination is device-local.
-    fn write_raw_buffer(&self, buffer: &blade_graphics::Buffer, data: &[u8], host_visible: bool) {
-        self.write_raw_buffer_at(buffer.at(0), data, host_visible);
+    fn write_raw_buffer(
+        &self,
+        buffer: blade_graphics::BufferPiece,
+        data: &[u8],
+        host_visible: bool,
+    ) {
+        self.write_raw_buffer_at(buffer, data, host_visible);
     }
 
     fn write_raw_buffer_at(
@@ -5835,7 +5762,12 @@ impl Session {
         }
     }
 
-    fn read_raw_f32(&self, buffer: &blade_graphics::Buffer, out: &mut [f32], host_visible: bool) {
+    fn read_raw_f32(
+        &self,
+        buffer: blade_graphics::BufferPiece,
+        out: &mut [f32],
+        host_visible: bool,
+    ) {
         if out.is_empty() {
             return;
         }
@@ -5883,7 +5815,7 @@ impl Session {
 
     fn read_staged_f32(
         &self,
-        buffer: &blade_graphics::Buffer,
+        buffer: blade_graphics::BufferPiece,
         out: &mut [f32],
         readback: &mut Readback,
     ) {
@@ -5911,7 +5843,7 @@ impl Session {
         for (index, chunk) in out.chunks_mut(staging.size / 4).enumerate() {
             encoder.start();
             encoder.transfer("readback_copy").copy_buffer_to_buffer(
-                buffer.at((index * staging.size) as u64),
+                piece_at(buffer, (index * staging.size) as u64),
                 staging.buffer.at(0),
                 std::mem::size_of_val(chunk) as u64,
             );
@@ -5931,7 +5863,7 @@ impl Session {
     /// Read back the loss value.
     pub fn read_loss(&self) -> f32 {
         if let Some(buf_ref) = self.plan.loss_buffer {
-            let buffer = &self.buffers[buf_ref.0 as usize];
+            let buffer = self.buffers[buf_ref.0 as usize];
             let n = self.plan.buffers[buf_ref.0 as usize] / 4;
             if !self.logical_host_visible(buf_ref) {
                 let mut values = vec![0.0; n];
@@ -5951,12 +5883,9 @@ impl Session {
     /// True when a logical buffer's content can be trusted after `step()`:
     /// it is the only tenant of its physical allocation.
     fn buffer_unaliased(&self, buf: BufferRef) -> bool {
-        let phys = self.alias.map[buf.0 as usize];
-        self.alias
-            .map
-            .iter()
-            .enumerate()
-            .all(|(i, &p)| p != phys || i == buf.0 as usize)
+        let index = buf.0 as usize;
+        (0..self.alias.map.len())
+            .all(|other| other == index || !self.alias.overlap(&self.plan.buffers, index, other))
     }
 
     /// True when every tenant of this allocation is an immutable constant
@@ -5972,7 +5901,12 @@ impl Session {
         else {
             return false;
         };
-        let tenant_count = self.alias.map.iter().filter(|&&p| p == phys).count();
+        let tenant_count = (0..self.alias.map.len())
+            .filter(|&other| {
+                self.alias
+                    .overlap(&self.plan.buffers, buf.0 as usize, other)
+            })
+            .count();
         let mut constant_count = 0usize;
         for &(buffer, ref data) in &self.plan.constant_buffers {
             if self.alias.map[buffer.0 as usize] != phys {
@@ -6146,7 +6080,7 @@ impl Session {
             "read_buffer: F32 view exceeds buffer capacity"
         );
         self.read_raw_f32(
-            &self.buffers[buf_ref.0 as usize],
+            self.buffers[buf_ref.0 as usize],
             out,
             self.logical_host_visible(buf_ref),
         );
@@ -6229,7 +6163,7 @@ impl Session {
 
     fn read_f32_buffers(
         &self,
-        buffers: &[(blade_graphics::Buffer, usize)],
+        buffers: &[(blade_graphics::BufferPiece, usize)],
         label: &'static str,
     ) -> Vec<Vec<f32>> {
         if buffers.is_empty() {
@@ -6264,7 +6198,7 @@ impl Session {
             for &(buffer, offset, byte_len) in &requests {
                 if byte_len != 0 {
                     transfer.copy_buffer_to_buffer(
-                        buffer.at(0),
+                        buffer,
                         staging.at(offset as u64),
                         byte_len as u64,
                     );
@@ -6393,8 +6327,8 @@ impl Session {
             "read_adam_m: out.len()={} but param '{name}' has {n} elements",
             out.len()
         );
-        if let Some(&(buffer, _)) = self.adam_state.get(idx) {
-            self.read_raw_f32(&buffer, out, !self.optimizer_device);
+        if let Some((buffer, _)) = self.adam_moments(idx) {
+            self.read_raw_f32(buffer, out, !self.optimizer_device);
         } else {
             out.fill(0.0);
         }
@@ -6413,8 +6347,8 @@ impl Session {
             "read_adam_v: out.len()={} but param '{name}' has {n} elements",
             out.len()
         );
-        if let Some(&(_, buffer)) = self.adam_state.get(idx) {
-            self.read_raw_f32(&buffer, out, !self.optimizer_device);
+        if let Some((_, buffer)) = self.adam_moments(idx) {
+            self.read_raw_f32(buffer, out, !self.optimizer_device);
         } else {
             out.fill(0.0);
         }
@@ -6424,7 +6358,7 @@ impl Session {
     /// transfer through cached download memory. Results have the same order
     /// as `names`.
     pub fn read_adam_states(&self, names: &[&str]) -> Vec<(Vec<f32>, Vec<f32>)> {
-        if self.adam_state.is_empty() {
+        if self.adam_state.is_none() {
             return names
                 .iter()
                 .map(|name| {
@@ -6445,10 +6379,8 @@ impl Session {
                     .unwrap_or_else(|| panic!("no Adam state for param: {name}"));
                 let byte_len = self.param_size(name).expect("param exists; size known")
                     * std::mem::size_of::<f32>();
-                [
-                    (self.adam_state[idx].0, byte_len),
-                    (self.adam_state[idx].1, byte_len),
-                ]
+                let (m, v) = self.adam_moments(idx).expect("Adam state");
+                [(m, byte_len), (v, byte_len)]
             })
             .collect();
         let mut values = self
@@ -6479,7 +6411,7 @@ impl Session {
         );
         self.ensure_adam_state();
         self.write_raw_buffer(
-            &self.adam_state[idx].0,
+            self.adam_moments(idx).expect("Adam state").0,
             bytemuck::cast_slice(data),
             !self.optimizer_device,
         );
@@ -6501,7 +6433,7 @@ impl Session {
         );
         self.ensure_adam_state();
         self.write_raw_buffer(
-            &self.adam_state[idx].1,
+            self.adam_moments(idx).expect("Adam state").1,
             bytemuck::cast_slice(data),
             !self.optimizer_device,
         );
@@ -6528,56 +6460,6 @@ impl Session {
             .param_grad_pairs
             .iter()
             .position(|&(p, _)| p == param_buf)
-    }
-
-    fn ensure_adam_state(&mut self) {
-        if !self.adam_state.is_empty() || self.plan.param_grad_pairs.is_empty() {
-            return;
-        }
-        for &(param, _) in &self.plan.param_grad_pairs {
-            Self::optimizer_len(&self.plan, param);
-        }
-        let bytes = self
-            .plan
-            .param_grad_pairs
-            .iter()
-            .try_fold(0usize, |sum, &(p, _)| {
-                sum.checked_add(self.plan.buffers[p.0 as usize].max(4).checked_mul(2)?)
-            })
-            .expect("Adam state size overflow");
-        ensure_device_memory_budget(&self.gpu, bytes, "Adam state");
-        self.wait();
-        let mut device_buffers = Vec::new();
-        self.adam_state = self
-            .plan
-            .param_grad_pairs
-            .iter()
-            .enumerate()
-            .map(|(index, &(param, _))| {
-                let size = self.plan.buffers[param.0 as usize].max(4) as u64;
-                let mut create = |suffix| {
-                    create_optimizer_buffer(
-                        &self.gpu,
-                        &format!("adam_{suffix}_{index}"),
-                        size,
-                        self.optimizer_device,
-                        &mut device_buffers,
-                    )
-                };
-                (create("m"), create("v"))
-            })
-            .collect();
-        if !device_buffers.is_empty() {
-            self.encoder.start();
-            {
-                let mut transfer = self.encoder.transfer("zero_adam");
-                for (buffer, size) in device_buffers {
-                    transfer.fill_buffer(buffer.at(0), size, 0);
-                }
-            }
-            self.sync_point = Some(self.gpu.submit(&mut self.encoder));
-            self.wait();
-        }
     }
 
     /// Bulk read of per-parameter gradient L2 norms (Frobenius for
@@ -6784,315 +6666,31 @@ impl Session {
             );
         }
 
-        // Temporal grad accumulation: add this step's (overwritten) grads
-        // into the persistent accumulators that the clip/optimizer below
-        // will read. Runs in its own pass after backward (it reads grad
-        // buffers the backward just wrote).
-        if let Some(scale) = self.grad_accum_scale {
-            {
-                let pipeline = self.pipelines.scalar(ShaderEntry::GradAccum);
-                let mut pass = self.encoder.compute("grad_accum");
-                for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
-                    let len = Self::optimizer_len(&self.plan, param_buf);
-                    let mut pc = pass.with(pipeline);
-                    pc.bind(
-                        0,
-                        &GradAccumData {
-                            grad: self.buffers[grad_buf.0 as usize].at(0),
-                            acc: self.grad_accum_bufs[idx].at(0),
-                            params: GradAccumParams {
-                                len,
-                                scale,
-                                _pad0: 0,
-                                _pad1: 0,
-                            },
-                        },
-                    );
-                    pc.dispatch([len.div_ceil(256), 1, 1]);
-                }
-            }
-            // Submit + wait so the accumulator this pass wrote is fully
-            // durable before the optimizer's separate passes read it.
-            // Sharing one submission left a write/read hazard that
-            // corrupted the accumulator on the apply step.
-            self.sync_point = Some(self.gpu.submit(&mut self.encoder));
-            self.wait();
-            self.encoder.start();
-        }
-
         // Gradient clipping runs after backward and before the optimizer in
         // the same GPU submission. Global clipping measures the concatenated
         // gradient; AGC measures each parameter and its gradient separately.
-        let needs_clip = (self.pending_grad_clip.is_some() || self.pending_agc.is_some())
-            && !self.plan.param_grad_pairs.is_empty()
-            && (self.pending_lr.is_some() || self.pending_adam.is_some())
-            && self.grad_clip_acc.is_some();
+        let update = if let Some(lr) = self.pending_lr {
+            Some(optimizer::Update::Sgd { lr })
+        } else {
+            self.pending_adam.map(
+                |(lr, beta1, beta2, eps, algorithm)| optimizer::Update::Adam {
+                    lr,
+                    beta1,
+                    beta2,
+                    eps,
+                    algorithm,
+                },
+            )
+        };
+        let needs_clip =
+            (self.pending_grad_clip.is_some() || self.pending_agc.is_some()) && update.is_some();
         // Cadence: skip the clip on (every-1)/every fraction of steps
         // when grad_clip_every > 1. Default 1 = every step.
-        let do_clip_now = needs_clip && {
+        let clip = needs_clip && {
             self.grad_clip_tick = self.grad_clip_tick.wrapping_add(1);
             self.grad_clip_tick.is_multiple_of(self.grad_clip_every)
         };
-        if do_clip_now {
-            let accumulating = self.grad_accum_scale.is_some();
-            if let Some((clip, pmin)) = self.pending_agc {
-                // Three passes, as for global clipping: per-workgroup norm
-                // pairs, one scale per parameter, then the scaling itself.
-                let pipeline = self.pipelines.scalar(ShaderEntry::AdaptiveGradClip);
-                let partials = self
-                    .grad_clip_partials
-                    .as_ref()
-                    .expect("grad_clip_partials allocated when param_grad_pairs nonempty");
-                let scales = self
-                    .agc_scales
-                    .as_ref()
-                    .expect("agc_scales allocated when param_grad_pairs nonempty");
-                for (mode, label) in [(0u32, "agc_norms"), (1, "agc_factor"), (2, "agc_apply")] {
-                    let mut pass = self.encoder.compute(label);
-                    let mut slot = 0u32;
-                    for (idx, &(param_buf, grad_buf)) in
-                        self.plan.param_grad_pairs.iter().enumerate()
-                    {
-                        let len = Self::optimizer_len(&self.plan, param_buf);
-                        let slots = grad_clip_workgroups(len);
-                        let mut pc = pass.with(pipeline);
-                        pc.bind(
-                            0,
-                            &AdaptiveGradClipData {
-                                param: self.buffers[param_buf.0 as usize].at(0),
-                                grad: Self::grad_source(
-                                    &self.buffers,
-                                    &self.grad_accum_bufs,
-                                    accumulating,
-                                    idx,
-                                    grad_buf,
-                                ),
-                                partials: partials.at(0),
-                                scales: scales.at(0),
-                                params: AdaptiveGradClipParams {
-                                    len,
-                                    clip,
-                                    pmin,
-                                    slot,
-                                    slots,
-                                    index: idx as u32,
-                                    mode,
-                                    _pad0: 0,
-                                },
-                            },
-                        );
-                        pc.dispatch(match mode {
-                            0 => [slots, 1, 1],
-                            1 => [1, 1, 1],
-                            _ => [len.div_ceil(256), 1, 1],
-                        });
-                        slot += slots;
-                    }
-                }
-            } else {
-                // GPU-side gradient clipping in three passes (all in the
-                // same submission as forward+backward and the optimizer):
-                //   1. GradClipNormSq (square) — every workgroup of every
-                //      gradient writes its squared partial sum to its own
-                //      slot, so these dispatches need no barriers
-                //   2. GradClipNormSq (total) — one workgroup sums the slots
-                //   3. GradClipScale — for each grad, multiply in place by
-                //      min(1, max_norm / sqrt(acc))
-                // Pass boundaries keep the three stages ordered.
-                let max_norm = self.pending_grad_clip.unwrap();
-                let acc_buf = self
-                    .grad_clip_acc
-                    .as_ref()
-                    .expect("grad_clip_acc allocated when param_grad_pairs nonempty");
-                let partials = self
-                    .grad_clip_partials
-                    .as_ref()
-                    .expect("grad_clip_partials allocated when param_grad_pairs nonempty");
-
-                let pipeline = self.pipelines.scalar(ShaderEntry::GradClipNormSq);
-                let mut slot = 0u32;
-                {
-                    let mut pass = self.encoder.compute("grad_clip_norm_sq");
-                    for (idx, &(param_buf, grad_buf)) in
-                        self.plan.param_grad_pairs.iter().enumerate()
-                    {
-                        let len = Self::optimizer_len(&self.plan, param_buf);
-                        let groups = grad_clip_workgroups(len);
-                        let mut pc = pass.with(pipeline);
-                        pc.bind(
-                            0,
-                            &GradClipNormSqData {
-                                grad: Self::grad_source(
-                                    &self.buffers,
-                                    &self.grad_accum_bufs,
-                                    accumulating,
-                                    idx,
-                                    grad_buf,
-                                ),
-                                acc: partials.at(0),
-                                params: GradClipNormSqParams {
-                                    len,
-                                    slot,
-                                    square: 1,
-                                    _pad0: 0,
-                                },
-                            },
-                        );
-                        pc.dispatch([groups, 1, 1]);
-                        slot += groups;
-                    }
-                }
-                {
-                    let mut pass = self.encoder.compute("grad_clip_norm_total");
-                    let mut pc = pass.with(pipeline);
-                    pc.bind(
-                        0,
-                        &GradClipNormSqData {
-                            grad: partials.at(0),
-                            acc: acc_buf.at(0),
-                            params: GradClipNormSqParams {
-                                len: slot,
-                                slot: 0,
-                                square: 0,
-                                _pad0: 0,
-                            },
-                        },
-                    );
-                    pc.dispatch([1, 1, 1]);
-                }
-                // Pass 3: scale each gradient by min(1, max_norm/sqrt(acc)).
-                {
-                    let pipeline = self.pipelines.scalar(ShaderEntry::GradClipScale);
-                    let mut pass = self.encoder.compute("grad_clip_scale");
-                    for (idx, &(param_buf, grad_buf)) in
-                        self.plan.param_grad_pairs.iter().enumerate()
-                    {
-                        let len = Self::optimizer_len(&self.plan, param_buf);
-                        let mut pc = pass.with(pipeline);
-                        pc.bind(
-                            0,
-                            &GradClipScaleData {
-                                grad: Self::grad_source(
-                                    &self.buffers,
-                                    &self.grad_accum_bufs,
-                                    accumulating,
-                                    idx,
-                                    grad_buf,
-                                ),
-                                acc: acc_buf.at(0),
-                                params: GradClipScaleParams {
-                                    len,
-                                    max_norm,
-                                    _pad0: 0,
-                                    _pad1: 0,
-                                },
-                            },
-                        );
-                        pc.dispatch([len.div_ceil(256), 1, 1]);
-                    }
-                }
-            }
-        }
-
-        // If training, append SGD updates as a final barrier group (all
-        // independent, so one pass). This avoids a second submit/wait cycle.
-        // Per-parameter LR multipliers are applied here: the effective LR
-        // for a given param is `base_lr * longest_matching_prefix_multiplier`
-        // (default 1.0). Param-name lookup uses the plan's param_buffers
-        // table; the cost is negligible (small N at session-build time).
-        if !self.plan.param_grad_pairs.is_empty() {
-            let accumulating = self.grad_accum_scale.is_some();
-            let lr = self.pending_lr;
-            if let Some(learning_rate) = lr {
-                let pipeline = self.pipelines.scalar(ShaderEntry::SgdUpdate);
-                let mut pass = self.encoder.compute("sgd_update");
-                for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
-                    let len = Self::optimizer_len(&self.plan, param_buf);
-                    let effective_lr = learning_rate
-                        * Self::lr_multiplier_for_buf(
-                            &self.plan.param_buffers,
-                            &self.lr_multipliers,
-                            param_buf,
-                        );
-                    let mut pc = pass.with(pipeline);
-                    pc.bind(
-                        0,
-                        &SgdData {
-                            param: self.buffers[param_buf.0 as usize].at(0),
-                            grad: Self::grad_source(
-                                &self.buffers,
-                                &self.grad_accum_bufs,
-                                accumulating,
-                                idx,
-                                grad_buf,
-                            ),
-                            dst: self.buffers[param_buf.0 as usize].at(0),
-                            params: SgdParams {
-                                len,
-                                lr: effective_lr,
-                                _pad0: 0,
-                                _pad1: 0,
-                            },
-                        },
-                    );
-                    pc.dispatch([len.div_ceil(256), 1, 1]);
-                }
-            } else if let Some((lr, beta1, beta2, eps, algorithm)) = self.pending_adam {
-                self.adam_step += 1;
-                let wd = self.adam_wd;
-                let pipeline = self.pipelines.scalar(ShaderEntry::AdamUpdate);
-                let mut pass = self.encoder.compute("adam_update");
-                for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
-                    let len = Self::optimizer_len(&self.plan, param_buf);
-                    let effective_lr = lr
-                        * Self::lr_multiplier_for_buf(
-                            &self.plan.param_buffers,
-                            &self.lr_multipliers,
-                            param_buf,
-                        );
-                    let (ref m_buf, ref v_buf) = self.adam_state[idx];
-                    let (grouped_grad_norm, grad_group_size) = Self::adam_grouped_grad_norm_binding(
-                        self.adam_grouped_grad_norm.as_ref(),
-                        self.grad_clip_acc
-                            .as_ref()
-                            .expect("Adam requires a gradient accumulator buffer"),
-                        idx,
-                    );
-                    let mut pc = pass.with(pipeline);
-                    pc.bind(
-                        0,
-                        &AdamData {
-                            param: self.buffers[param_buf.0 as usize].at(0),
-                            grad: Self::grad_source(
-                                &self.buffers,
-                                &self.grad_accum_bufs,
-                                accumulating,
-                                idx,
-                                grad_buf,
-                            ),
-                            m: m_buf.at(0),
-                            v: v_buf.at(0),
-                            grouped_grad_norm,
-                            params: AdamParams {
-                                len,
-                                lr: effective_lr,
-                                beta1,
-                                beta2,
-                                eps,
-                                step: self.adam_step as f32,
-                                wd,
-                                grad_group_size,
-                                algorithm: algorithm as u32,
-                                _pad0: 0,
-                                _pad1: 0,
-                                _pad2: 0,
-                            },
-                        },
-                    );
-                    pc.dispatch([len.div_ceil(256), 1, 1]);
-                }
-            }
-        }
+        self.encode_optimizer(update, clip);
 
         self.sync_point = Some(self.gpu.submit(&mut self.encoder));
     }
@@ -7112,42 +6710,12 @@ impl Session {
         u32::try_from(len).expect("optimizer parameter exceeds u32 element limit")
     }
 
-    /// The buffer the optimizer/clip should read for param `idx`'s
-    /// gradient: the persistent accumulator when temporal accumulation is
-    /// active, else the per-step grad buffer the backward just wrote.
-    fn grad_source(
-        buffers: &[blade_graphics::Buffer],
-        accum_bufs: &[blade_graphics::Buffer],
-        accumulating: bool,
-        idx: usize,
-        grad_buf: BufferRef,
-    ) -> blade_graphics::BufferPiece {
-        if accumulating {
-            accum_bufs[idx].at(0)
-        } else {
-            buffers[grad_buf.0 as usize].at(0)
-        }
-    }
-
-    fn adam_grouped_grad_norm_binding(
-        accumulator: Option<&AdamGroupedGradNorm>,
-        fallback: &blade_graphics::Buffer,
-        param_index: usize,
-    ) -> (blade_graphics::BufferPiece, u32) {
-        match accumulator {
-            Some(value) if value.param_index == param_index => {
-                (value.buffer.at(0), value.group_size)
-            }
-            _ => (fallback.at(0), 0),
-        }
-    }
-
     fn bind_dispatch(
-        buffers: &[blade_graphics::Buffer],
+        buffers: &[blade_graphics::BufferPiece],
         dispatch: &crate::compile::Dispatch,
         pc: &mut impl blade_graphics::traits::PipelineEncoder,
     ) {
-        let buf = |r: BufferRef| buffers[r.0 as usize].at(0);
+        let buf = |r: BufferRef| buffers[r.0 as usize];
         if dispatch.horizontal_batch >= 2 {
             let count = dispatch.horizontal_batch as usize;
             let mut pieces = vec![buf(dispatch.input_buffers[0])];
@@ -7472,22 +7040,6 @@ impl Session {
                             _pad0: dispatch.params[1],
                             _pad1: dispatch.params[2],
                             _pad2: dispatch.params[3],
-                        },
-                    },
-                );
-            }
-            ShaderEntry::SgdUpdate => {
-                pc.bind(
-                    0,
-                    &SgdData {
-                        param: buf(dispatch.input_buffers[0]),
-                        grad: buf(dispatch.input_buffers[1]),
-                        dst: buf(dispatch.output_buffer),
-                        params: SgdParams {
-                            len: dispatch.params[0],
-                            lr: f32::from_bits(dispatch.params[1]),
-                            _pad0: 0,
-                            _pad1: 0,
                         },
                     },
                 );
@@ -7823,8 +7375,8 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::AdamUpdate => {
-                unreachable!("AdamUpdate is dispatched via adam_step/set_adam, not bind_dispatch");
+            ShaderEntry::SgdUpdate | ShaderEntry::AdamUpdate => {
+                unreachable!("optimizer updates are encoded by the optimizer passes")
             }
             ShaderEntry::GradClipNormSq
             | ShaderEntry::GradClipScale
@@ -8385,35 +7937,7 @@ impl Session {
     /// Apply SGD updates to all parameters on the GPU.
     pub fn sgd_step(&mut self, learning_rate: f32) {
         let _span = tracing::info_span!("sgd_step").entered();
-        self.wait();
-        self.encoder.start();
-
-        // All SGD updates are independent (different param/grad buffers),
-        // so they share a single compute pass — no barriers between them.
-        let pipeline = self.pipelines.scalar(ShaderEntry::SgdUpdate);
-        let mut pass = self.encoder.compute("sgd_update");
-        for &(param_buf, grad_buf) in &self.plan.param_grad_pairs {
-            let len = Self::optimizer_len(&self.plan, param_buf);
-            let mut pc = pass.with(pipeline);
-            pc.bind(
-                0,
-                &SgdData {
-                    param: self.buffers[param_buf.0 as usize].at(0),
-                    grad: self.buffers[grad_buf.0 as usize].at(0),
-                    dst: self.buffers[param_buf.0 as usize].at(0),
-                    params: SgdParams {
-                        len,
-                        lr: learning_rate,
-                        _pad0: 0,
-                        _pad1: 0,
-                    },
-                },
-            );
-            pc.dispatch([len.div_ceil(256), 1, 1]);
-        }
-        drop(pass);
-
-        self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+        self.run_optimizer(optimizer::Update::Sgd { lr: learning_rate });
     }
 
     /// Configure SGD updates to run after each `step()`.
@@ -8525,7 +8049,7 @@ impl Session {
                 *v *= scale;
             }
             self.write_raw_buffer(
-                &self.buffers[grad_buf.0 as usize],
+                self.buffers[grad_buf.0 as usize],
                 bytemuck::cast_slice(&data),
                 self.logical_host_visible(grad_buf),
             );
@@ -8604,7 +8128,7 @@ impl Session {
                 param[i] -= learning_rate * grad[i];
             }
             self.write_raw_buffer(
-                &self.buffers[param_buf.0 as usize],
+                self.buffers[param_buf.0 as usize],
                 bytemuck::cast_slice(&param),
                 self.logical_host_visible(param_buf),
             );
@@ -8614,53 +8138,13 @@ impl Session {
     /// Apply Adam optimizer updates to all parameters on the GPU.
     pub fn adam_step(&mut self, lr: f32, beta1: f32, beta2: f32, eps: f32) {
         let _span = tracing::info_span!("adam_step").entered();
-        self.ensure_adam_state();
-        self.adam_step += 1;
-        self.wait();
-        self.encoder.start();
-
-        let pipeline = self.pipelines.scalar(ShaderEntry::AdamUpdate);
-        let mut pass = self.encoder.compute("adam_update");
-        for (idx, &(param_buf, grad_buf)) in self.plan.param_grad_pairs.iter().enumerate() {
-            let len = Self::optimizer_len(&self.plan, param_buf);
-            let (ref m_buf, ref v_buf) = self.adam_state[idx];
-            let (grouped_grad_norm, grad_group_size) = Self::adam_grouped_grad_norm_binding(
-                self.adam_grouped_grad_norm.as_ref(),
-                self.grad_clip_acc
-                    .as_ref()
-                    .expect("Adam requires a gradient accumulator buffer"),
-                idx,
-            );
-            let mut pc = pass.with(pipeline);
-            pc.bind(
-                0,
-                &AdamData {
-                    param: self.buffers[param_buf.0 as usize].at(0),
-                    grad: self.buffers[grad_buf.0 as usize].at(0),
-                    m: m_buf.at(0),
-                    v: v_buf.at(0),
-                    grouped_grad_norm,
-                    params: AdamParams {
-                        len,
-                        lr,
-                        beta1,
-                        beta2,
-                        eps,
-                        step: self.adam_step as f32,
-                        wd: self.adam_wd,
-                        grad_group_size,
-                        algorithm: AdaptiveOptimizer::Adam as u32,
-                        _pad0: 0,
-                        _pad1: 0,
-                        _pad2: 0,
-                    },
-                },
-            );
-            pc.dispatch([len.div_ceil(256), 1, 1]);
-        }
-        drop(pass);
-
-        self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+        self.run_optimizer(optimizer::Update::Adam {
+            lr,
+            beta1,
+            beta2,
+            eps,
+            algorithm: AdaptiveOptimizer::Adam,
+        });
     }
 
     /// Configure Adam updates to run after each `step()`.
@@ -8746,7 +8230,7 @@ impl Session {
         );
         self.read_f32_buffers(
             &[(
-                accumulator.buffer,
+                accumulator.buffer.at(0),
                 accumulator.len * std::mem::size_of::<f32>(),
             )],
             "adam_grouped_grad_norm_readback",
@@ -8793,56 +8277,16 @@ impl Session {
             self.grad_accum_scale = None;
             return;
         }
-        if self.grad_accum_bufs.is_empty() {
-            let accumulator_bytes = self
-                .plan
-                .param_grad_pairs
-                .iter()
-                .try_fold(0usize, |total, &(_, grad_buf)| {
-                    total.checked_add(self.plan.buffers[grad_buf.0 as usize].max(4))
-                })
-                .expect("gradient accumulator size overflow");
+        if self.grad_accum.is_none() {
             ensure_device_memory_budget(
                 &self.gpu,
-                accumulator_bytes,
+                optimizer::ChunkBuffers::bytes(self),
                 "gradient accumulation buffers",
             );
             let mut device_bufs = Vec::new();
-            self.grad_accum_bufs = self
-                .plan
-                .param_grad_pairs
-                .iter()
-                .enumerate()
-                .map(|(i, &(_, grad_buf))| {
-                    let size = (self.plan.buffers[grad_buf.0 as usize] as u64).max(4);
-                    create_optimizer_buffer(
-                        &self.gpu,
-                        &format!("grad_accum_{i}"),
-                        size,
-                        self.optimizer_device,
-                        &mut device_bufs,
-                    )
-                })
-                .collect();
-            if !device_bufs.is_empty() {
-                let mut encoder =
-                    self.gpu
-                        .create_command_encoder(blade_graphics::CommandEncoderDesc {
-                            name: "zero_grad_accum",
-                            buffer_count: 1,
-                            manual_barriers: false,
-                        });
-                encoder.start();
-                {
-                    let mut transfer = encoder.transfer("zero_grad_accum");
-                    for &(buf, size) in &device_bufs {
-                        transfer.fill_buffer(buf.at(0), size, 0);
-                    }
-                }
-                let sync = self.gpu.submit(&mut encoder);
-                let _ = wait_for_timed_encoder(&self.gpu, &sync, &mut encoder, self.gpu_timing);
-                self.gpu.destroy_command_encoder(&mut encoder);
-            }
+            let accumulators = optimizer::ChunkBuffers::new(self, "grad_accum", &mut device_bufs);
+            self.grad_accum = Some(accumulators);
+            self.zero_optimizer_buffers(&device_bufs, "zero_grad_accum");
         }
         self.grad_accum_scale = Some(1.0 / micro_batches as f32);
     }
@@ -8854,30 +8298,25 @@ impl Session {
     /// Zero the gradient accumulators (PyTorch `optimizer.zero_grad()`).
     /// No-op unless [`Session::set_grad_accumulate`] is active.
     pub fn zero_grad(&mut self) {
-        if self.grad_accum_bufs.is_empty() {
+        if self.grad_accum.is_none() {
             return;
         }
         self.wait();
+        let buffers: Vec<_> = self
+            .grad_accum
+            .as_ref()
+            .expect("gradient accumulators")
+            .buffers
+            .iter()
+            .zip(&self.optimizer_chunks)
+            .map(|(&buffer, chunk)| (buffer, chunk.bytes as u64))
+            .collect();
         if self.optimizer_device {
-            self.encoder.start();
-            {
-                let mut transfer = self.encoder.transfer("zero_grad");
-                for (buf, &(_, grad_buf)) in
-                    self.grad_accum_bufs.iter().zip(&self.plan.param_grad_pairs)
-                {
-                    let size = self.plan.buffers[grad_buf.0 as usize].max(4) as u64;
-                    transfer.fill_buffer(buf.at(0), size, 0);
-                }
-            }
-            self.sync_point = Some(self.gpu.submit(&mut self.encoder));
-            self.wait();
+            self.zero_optimizer_buffers(&buffers, "zero_grad");
         } else {
-            for (buf, &(_, grad_buf)) in
-                self.grad_accum_bufs.iter().zip(&self.plan.param_grad_pairs)
-            {
-                let size = self.plan.buffers[grad_buf.0 as usize].max(4);
+            for (buffer, size) in buffers {
                 unsafe {
-                    std::ptr::write_bytes(buf.data(), 0, size);
+                    std::ptr::write_bytes(buffer.data(), 0, size as usize);
                 }
             }
         }
@@ -8886,28 +8325,11 @@ impl Session {
     pub fn memory_summary(&self) -> MemorySummary {
         let total: usize = self.plan.buffers.iter().sum();
         let largest = self.plan.buffers.iter().copied().max().unwrap_or(0);
-        let adam_bytes: usize = self
-            .plan
-            .param_grad_pairs
-            .iter()
-            .take(self.adam_state.len())
-            .map(|&(p, _)| self.plan.buffers[p.0 as usize].max(4) * 2)
-            .sum();
-        let grad_accumulator_bytes = self
-            .plan
-            .param_grad_pairs
-            .iter()
-            .take(self.grad_accum_bufs.len())
-            .map(|&(_, g)| self.plan.buffers[g.0 as usize].max(4))
-            .sum();
+        let chunk_bytes = optimizer::ChunkBuffers::bytes(self);
+        let adam_bytes = usize::from(self.adam_state.is_some()) * chunk_bytes * 2;
+        let grad_accumulator_bytes = usize::from(self.grad_accum.is_some()) * chunk_bytes;
         let clip_partial_bytes = if self.grad_clip_partials.is_some() {
-            self.plan
-                .param_grad_pairs
-                .iter()
-                .map(|&(param, _)| {
-                    grad_clip_workgroups(Self::optimizer_len(&self.plan, param)) as usize * 8
-                })
-                .sum()
+            optimizer::clip_slots(&self.plan) as usize * 8
         } else {
             0
         };
@@ -8995,9 +8417,13 @@ impl Drop for Session {
         }
         // `buffers` holds aliased copies of these handles; destroy each
         // physical allocation exactly once.
-        for &(m_buf, v_buf) in &self.adam_state {
-            self.gpu.destroy_buffer(m_buf);
-            self.gpu.destroy_buffer(v_buf);
+        if let Some((ref m, ref v)) = self.adam_state {
+            for &buffer in m.buffers.iter().chain(&v.buffers) {
+                self.gpu.destroy_buffer(buffer);
+            }
+        }
+        if let Some(buffer) = self.optimizer_segments {
+            self.gpu.destroy_buffer(buffer);
         }
         if let Some(buffer) = self.grad_clip_acc {
             self.gpu.destroy_buffer(buffer);
@@ -9011,8 +8437,10 @@ impl Drop for Session {
         if let Some(ref accumulator) = self.adam_grouped_grad_norm {
             self.gpu.destroy_buffer(accumulator.buffer);
         }
-        for &buffer in &self.grad_accum_bufs {
-            self.gpu.destroy_buffer(buffer);
+        if let Some(ref accumulators) = self.grad_accum {
+            for &buffer in &accumulators.buffers {
+                self.gpu.destroy_buffer(buffer);
+            }
         }
     }
 }
