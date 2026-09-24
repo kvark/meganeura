@@ -557,7 +557,16 @@ fn optimizer_updates(measure: bool, tile: u32) {
                 assert_eq!(session.adam_step_count(), if adam { step } else { 0 });
                 assert_eq!(
                     session.memory_summary().adam_state_bytes,
-                    if adam { (nx + nw) * 8 } else { 0 }
+                    // Moments follow the parameter arena's 256-byte slots.
+                    if adam {
+                        [nx, nw]
+                            .map(|n| (n * 4).next_multiple_of(256))
+                            .iter()
+                            .sum::<usize>()
+                            * 2
+                    } else {
+                        0
+                    }
                 );
                 for (name, n, seed) in [("x", nx, 7), ("w", nw, 19)] {
                     let mut actual = vec![f32::NAN; n];
