@@ -822,9 +822,7 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         ShaderGroup::CachedAttention => {
             ShaderModule::new(include_str!("shaders/cached_attention.wgsl"))
         }
-        ShaderGroup::CachedQueryAttention => {
-            generate_flash_attention(64, 8, FlashAttentionShape::default(), true)
-        }
+        ShaderGroup::CachedQueryAttention => generate_cached_query_attention_module(64),
         ShaderGroup::CachedBlockAttention => generate_module_block_attention(),
         ShaderGroup::ChunkedRelativeAttention => {
             ShaderModule::new(include_str!("shaders/chunked_relative_attention.wgsl"))
@@ -3377,12 +3375,12 @@ pub(crate) fn generate_cached_attention_module(
 /// for causal vs non-causal masks.
 pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
     use std::fmt::Write;
-    assert!(
-        head_dim.is_power_of_two() && head_dim >= 2,
-        "attention head_dim must be a power of 2 ≥ 2, got {head_dim}"
-    );
+    assert!(head_dim >= 1, "attention needs a nonempty head");
 
-    let hd = head_dim;
+    // One lane per dimension, padded to a power of two for the tree
+    // reductions. Lanes past the head contribute zero and store nothing.
+    let hd = head_dim.next_power_of_two().max(2);
+    let last = head_dim - 1;
     let bkv: u32 = 8;
     let mut src = String::new();
 
@@ -3459,7 +3457,9 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
     src.push_str("    let kv_dim = num_kv_heads * head_dim;\n");
     src.push_str("    let scale = inverseSqrt(f32(head_dim));\n");
     src.push_str("    let q_base = pos * (num_heads * head_dim) + head * head_dim;\n");
-    src.push_str("    let q_val = src_a[q_base + tid];\n\n");
+    src.push_str("    let live = tid < head_dim;\n");
+    let _ = writeln!(src, "    let d = min(tid, {last}u);");
+    src.push_str("    let q_val = select(0.0, src_a[q_base + d], live);\n\n");
 
     // Online softmax accumulators
     src.push_str("    var my_out = 0.0;\n");
@@ -3478,7 +3478,7 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
     src.push_str("            let k_base = (t + i) * kv_dim + kv_head_off;\n");
     let _ = writeln!(
         src,
-        "            wg_scores[i * {hd}u + tid] = q_val * src_b[k_base + tid];"
+        "            wg_scores[i * {hd}u + tid] = select(0.0, q_val * src_b[k_base + d], live);"
     );
     src.push_str("        }\n");
     src.push_str("        tree_reduce_8(tid);\n\n");
@@ -3489,7 +3489,7 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
     src.push_str("            let weight = exp(score - new_max);\n");
     src.push_str("            sum_exp = sum_exp * correction + weight;\n");
     src.push_str("            let v_base = (t + i) * kv_dim + kv_head_off;\n");
-    src.push_str("            my_out = my_out * correction + weight * bias[v_base + tid];\n");
+    src.push_str("            my_out = my_out * correction + weight * bias[v_base + d];\n");
     src.push_str("            max_score = new_max;\n");
     src.push_str("        }\n");
     // Every lane reads the reduced scores from lane zero. Do not let faster
@@ -3501,14 +3501,14 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
     // --- Tail: remaining KV positions one at a time ---
     src.push_str("    for (; t < kv_len; t++) {\n");
     src.push_str("        let k_base = t * kv_dim + kv_head_off;\n");
-    src.push_str("        wg_dot[tid] = q_val * src_b[k_base + tid];\n");
+    src.push_str("        wg_dot[tid] = select(0.0, q_val * src_b[k_base + d], live);\n");
     src.push_str("        tree_reduce(tid);\n");
     src.push_str("        let score = wg_dot[0] * scale;\n\n");
     src.push_str("        let new_max = max(max_score, score);\n");
     src.push_str("        let correction = exp(max_score - new_max);\n");
     src.push_str("        let weight = exp(score - new_max);\n");
     src.push_str("        sum_exp = sum_exp * correction + weight;\n");
-    src.push_str("        my_out = my_out * correction + weight * bias[k_base + tid];\n");
+    src.push_str("        my_out = my_out * correction + weight * bias[k_base + d];\n");
     src.push_str("        max_score = new_max;\n");
     // wg_dot is reused on the next iteration and its reduced element is read
     // by every lane, so scratch reuse needs the same synchronization.
@@ -3517,7 +3517,7 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
 
     // Final output
     src.push_str("    let safe_sum = select(sum_exp, 1.0, sum_exp == 0.0);\n");
-    src.push_str("    dst[q_base + tid] = my_out / safe_sum;\n\n");
+    src.push_str("    if live {\n        dst[q_base + tid] = my_out / safe_sum;\n    }\n\n");
 
     // LSE output for backward pass
     src.push_str("    if tid == 0u {\n");
@@ -3624,7 +3624,38 @@ mod coop_caps_tests {
     }
 }
 
-pub const CACHED_ATTENTION_QUERIES: u32 = 32; // 256 threads / (64 dimensions / 8 elements)
+/// How the attention kernels split one head across threads: `tpq` threads
+/// per query, each owning `ept` elements, with `tpq · ept = head_dim`.
+///
+/// `tpq` is a power of two for the tree reductions; `ept` need not be, so
+/// any width works (80 = 16 × 5, 96 = 16 × 6). For power-of-two widths this
+/// is `ept = min(head_dim, ept_cap)`; otherwise `ept` may exceed the cap.
+pub fn attention_lanes(head_dim: u32, ept_cap: u32) -> (u32, u32) {
+    assert!(head_dim >= 1, "attention needs a nonempty head");
+    let padded = head_dim.next_power_of_two();
+    let widest = padded / padded.min(ept_cap.max(1));
+    let tpq = widest.min(1 << head_dim.trailing_zeros());
+    (head_dim / tpq, tpq)
+}
+
+/// Elements per thread of the cached multi-query kernel.
+const CACHED_ATTENTION_EPT: u32 = 8;
+
+/// Queries per workgroup of the cached multi-query kernel for `head_dim`.
+pub fn cached_attention_queries(head_dim: u32) -> u32 {
+    let (_, tpq) = attention_lanes(head_dim, CACHED_ATTENTION_EPT);
+    FlashAttentionShape::default().threads / tpq
+}
+
+/// The cached multi-query attention kernel for `head_dim`.
+pub(crate) fn generate_cached_query_attention_module(head_dim: u32) -> ShaderModule {
+    generate_flash_attention(
+        head_dim,
+        CACHED_ATTENTION_EPT,
+        FlashAttentionShape::default(),
+        true,
+    )
+}
 
 pub fn generate_flash_attention_module(
     head_dim: u32,
@@ -3642,22 +3673,18 @@ fn generate_flash_attention(
 ) -> ShaderModule {
     use std::fmt::Write;
     assert!(matches!(shape.threads, 128 | 256) && shape.keys.is_power_of_two() && shape.keys <= 16);
-    assert!(
-        head_dim.is_power_of_two() && head_dim >= 2,
-        "attention head_dim must be a power of 2 ≥ 2, got {head_dim}"
-    );
 
     let hd = head_dim;
     // which honors MEGANEURA_FLASH_EPT_CAP overrides.
-    let ept: u32 = hd.min(ept_cap);
-    let tpq = hd / ept; // threads per query
+    let (ept, tpq) = attention_lanes(hd, ept_cap);
     let d_stride = if shape.interleave { tpq } else { 1 };
     let bq: u32 = (shape.threads / tpq).max(1);
-    if cached {
-        assert_eq!(bq, CACHED_ATTENTION_QUERIES);
-    }
     // Fall back to BQ=1 kernel when multi-query isn't beneficial
     if bq <= 1 {
+        assert!(
+            !cached,
+            "cached attention needs several queries per workgroup"
+        );
         return generate_attention_module(head_dim);
     }
     let wg_size = bq * tpq;
@@ -5013,12 +5040,9 @@ pub fn generate_flash_grad_kv_coop_module(head_dim: u32) -> ShaderModule {
 /// scalars directly from global memory.
 pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule {
     use std::fmt::Write;
-    assert!(head_dim.is_power_of_two() && head_dim >= 2);
-
     let hd = head_dim;
     // Backward uses its own cap because these kernels carry more live state.
-    let ept: u32 = hd.min(ept_cap);
-    let tpq = hd / ept; // threads per query
+    let (ept, tpq) = attention_lanes(hd, ept_cap);
     let bq: u32 = (256 / tpq).max(1);
     if bq <= 1 {
         // Fall back to hand-written shader
@@ -5297,14 +5321,11 @@ pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule
 /// dK/dV by loading Q/dO/O scalars directly from global memory.
 pub fn generate_flash_grad_kv_module(head_dim: u32, ept_cap: u32) -> ShaderModule {
     use std::fmt::Write;
-    assert!(head_dim.is_power_of_two() && head_dim >= 2);
-
     let hd = head_dim;
     // Backward uses its own cap because these kernels carry more live state.
     // The fused dK+dV kernel reports 210 regs at EPT=32 on Blackwell,
     // so the auto-tune typically chooses a smaller value here.
-    let ept: u32 = hd.min(ept_cap);
-    let tpq = hd / ept; // threads per KV position
+    let (ept, tpq) = attention_lanes(hd, ept_cap); // tpq threads per KV position
     let bkv: u32 = (256 / tpq).max(1);
     if bkv <= 1 {
         return ShaderModule::new(include_str!("shaders/mha_grad_kv.wgsl"));

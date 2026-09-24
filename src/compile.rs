@@ -2857,6 +2857,8 @@ impl<'a> Compiler<'a> {
             && self.coop_caps.supports_16x16_f16()
             && head_dim >= 16
             && head_dim.is_multiple_of(16)
+            // Only power-of-two widths have run on cooperative hardware.
+            && head_dim.is_power_of_two()
             && q_seq >= 16
         {
             return (
@@ -2864,9 +2866,8 @@ impl<'a> Compiler<'a> {
                 [q_seq.div_ceil(16), num_heads, 1],
             );
         }
-        // EPT (elements per thread) must match forward codegen.
-        let ept = head_dim.min(self.options.knobs.flash_ept_cap);
-        let tpq = head_dim / ept; // threads per query
+        // The lane split must match forward codegen.
+        let (_, tpq) = crate::codegen::attention_lanes(head_dim, self.options.knobs.flash_ept_cap);
         let bq = (self.options.knobs.flash.threads / tpq).max(1);
         if bq >= 2 && q_seq >= bq {
             (
@@ -2886,8 +2887,7 @@ impl<'a> Compiler<'a> {
         num_heads: u32,
         ept_cap: u32,
     ) -> (ShaderEntry, [u32; 3]) {
-        let ept = head_dim.min(ept_cap);
-        let tpq = head_dim / ept;
+        let (_, tpq) = crate::codegen::attention_lanes(head_dim, ept_cap);
         let bq = (256 / tpq).max(1);
         if bq >= 2 && q_seq >= bq {
             (
@@ -5218,13 +5218,18 @@ impl<'a> Compiler<'a> {
                 let v_cache = self.get_buffer(node.inputs[2]);
                 let kv_pos_input = self.get_buffer(node.inputs[3]);
                 let q_seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
-                let block_queries = crate::codegen::CACHED_ATTENTION_QUERIES;
+                // The single-query kernel is written for 64-wide heads; the
+                // generated multi-query kernel takes any width.
+                let (shader, block_queries) = if q_seq == 1 && head_dim == 64 {
+                    (ShaderEntry::CachedAttention, 1)
+                } else {
+                    (
+                        ShaderEntry::CachedQueryAttention,
+                        crate::codegen::cached_attention_queries(head_dim),
+                    )
+                };
                 self.plan.dispatches.push(Dispatch {
-                    shader: if q_seq > 1 {
-                        ShaderEntry::CachedQueryAttention
-                    } else {
-                        ShaderEntry::CachedAttention
-                    },
+                    shader,
                     workgroups: [q_seq.div_ceil(block_queries), num_heads, 1],
                     input_buffers: vec![q, k_cache, v_cache, kv_pos_input],
                     output_buffer: out_buf,
@@ -5653,6 +5658,7 @@ impl<'a> Compiler<'a> {
                     && self.coop_caps.supports_16x16_f16()
                     && head_dim >= 16
                     && head_dim.is_multiple_of(16)
+                    && head_dim.is_power_of_two()
                     && q_seq >= 16;
                 let (grad_q_shader, grad_q_wgs) = if bwd_coop_enabled {
                     (
@@ -5751,6 +5757,7 @@ impl<'a> Compiler<'a> {
                     && self.coop_caps.supports_16x16_f16()
                     && head_dim >= 16
                     && head_dim.is_multiple_of(16)
+                    && head_dim.is_power_of_two()
                     && dispatch_kv >= 16;
                 let (shader, workgroups) = if bwd_coop_enabled {
                     (

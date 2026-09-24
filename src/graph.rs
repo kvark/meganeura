@@ -2784,7 +2784,6 @@ impl Graph {
     /// Every query attends to positions 0..=kv_pos. Unlike
     /// [`Self::cached_block_attention`], this has no token-causal mask within
     /// the query block: one video's frame can attend to all its own patches.
-    /// Currently requires head_dim=64.
     #[track_caller]
     pub fn cached_attention(
         &mut self,
@@ -2799,7 +2798,10 @@ impl Graph {
         let q_shape = &self.node(q).ty.shape;
         assert_eq!(q_shape.len(), 2, "q must be 2D");
         assert!(q_shape[0] > 0, "cached attention needs a query");
-        assert_eq!(head_dim, 64, "cached attention supports 64-wide heads");
+        assert!(
+            (1..=512).contains(&head_dim),
+            "cached attention supports heads 1 to 512 wide"
+        );
         assert!(num_kv_heads > 0 && num_heads.is_multiple_of(num_kv_heads));
         assert_eq!(
             q_shape[1],
