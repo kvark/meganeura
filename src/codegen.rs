@@ -1239,10 +1239,11 @@ fn conv_gemm_tiled(
             crate::divisor::SHADER,
         )
     };
+    let helpers = format!("{divisor}\n{}", include_str!("shaders/digits.wgsl"));
     let src = preprocess(
         src,
         &[
-            ("$DIVISOR", divisor),
+            ("$DIVISOR", &helpers),
             ("$PARAMS_TYPE", include_str!("shaders/conv2d_params.wgsl")),
             ("$PARAMS_DECL", &declaration),
             ("$BM_U", &format!("{bm}u")),
