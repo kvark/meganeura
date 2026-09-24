@@ -547,54 +547,47 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 num_heads,
                 num_kv_heads,
                 head_dim,
-                is_cross,
+                ..
+            }
+            | Op::CausalAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            }
+            | Op::CausalAttentionRoPE {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                ..
+            }
+            | Op::SlidingWindowAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                ..
+            }
+            | Op::FullAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
             } => {
-                let q = node.inputs[0];
-                let k = node.inputs[1];
-                let v = node.inputs[2];
-                let fwd_node = node.id;
-
-                let q_ty = forward.nodes()[q as usize].ty.clone();
-                let k_ty = forward.nodes()[k as usize].ty.clone();
-                let v_ty = forward.nodes()[v as usize].ty.clone();
-
-                let grad_q = graph.add_raw_node(
-                    Op::MultiHeadAttnGradQ {
-                        fwd_node,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        is_cross,
-                    },
-                    vec![grad_output, q, k, v],
-                    q_ty.clone(),
+                // The gradient kernels take the mask (causal, window, full,
+                // cross) from the forward node, so every variant shares them.
+                let is_cross = matches!(node.op, Op::MultiHeadAttn { is_cross: true, .. });
+                let rope_theta = match node.op {
+                    Op::CausalAttentionRoPE { rope_theta, .. } => Some(rope_theta),
+                    _ => None,
+                };
+                attention_backward(
+                    &mut graph,
+                    &mut grads,
+                    forward,
+                    &node,
+                    grad_output,
+                    [num_heads, num_kv_heads, head_dim],
+                    is_cross,
+                    rope_theta,
                 );
-                let grad_k = graph.add_raw_node(
-                    Op::MultiHeadAttnGradK {
-                        fwd_node,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        is_cross,
-                    },
-                    vec![grad_output, q, k, v],
-                    k_ty.clone(),
-                );
-                let grad_v = graph.add_raw_node(
-                    Op::MultiHeadAttnGradV {
-                        fwd_node,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        is_cross,
-                    },
-                    vec![grad_output, q, k, v],
-                    v_ty,
-                );
-
-                accumulate_grad(&mut graph, &mut grads, q, grad_q);
-                accumulate_grad(&mut graph, &mut grads, k, grad_k);
-                accumulate_grad(&mut graph, &mut grads, v, grad_v);
             }
             // FusedMatMul*Add(a, b, d) = MatMul*(a, b) + d
             // Backward: same as MatMul backward + Add backward (passthrough to d)
@@ -992,173 +985,6 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_x = graph.rope_grad(grad_output, theta, pos_offset, head_dim);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
-            Op::CausalAttention {
-                num_heads,
-                num_kv_heads,
-                head_dim,
-            }
-            | Op::CausalAttentionRoPE {
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                ..
-            } => {
-                // CausalAttention is MultiHeadAttn with is_cross=false and causal mask.
-                // Reuse the MultiHeadAttnGrad ops.
-                let q_raw = node.inputs[0];
-                let k_raw = node.inputs[1];
-                let v = node.inputs[2];
-                let fwd_node = node.id;
-
-                // Get types from the forward graph (before any backward-graph nodes)
-                let q_ty = forward.nodes()[q_raw as usize].ty.clone();
-                let k_ty = forward.nodes()[k_raw as usize].ty.clone();
-                let v_ty = forward.nodes()[v as usize].ty.clone();
-
-                // For CausalAttentionRoPE: Q and K are un-rotated. The grad
-                // kernels recompute Q·K scores, so they need the rotated versions.
-                let (q, k) = if let Op::CausalAttentionRoPE { rope_theta, .. } = node.op {
-                    let q_rotated = graph.add_raw_node(
-                        Op::RoPE {
-                            theta: rope_theta,
-                            pos_offset: 0,
-                            head_dim,
-                            freq_factors: false,
-                        },
-                        vec![q_raw],
-                        q_ty.clone(),
-                    );
-                    let k_rotated = graph.add_raw_node(
-                        Op::RoPE {
-                            theta: rope_theta,
-                            pos_offset: 0,
-                            head_dim,
-                            freq_factors: false,
-                        },
-                        vec![k_raw],
-                        k_ty.clone(),
-                    );
-                    (q_rotated, k_rotated)
-                } else {
-                    (q_raw, k_raw)
-                };
-
-                let grad_q = graph.add_raw_node(
-                    Op::MultiHeadAttnGradQ {
-                        fwd_node,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        is_cross: false,
-                    },
-                    vec![grad_output, q, k, v],
-                    q_ty.clone(),
-                );
-                let grad_k = graph.add_raw_node(
-                    Op::MultiHeadAttnGradK {
-                        fwd_node,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        is_cross: false,
-                    },
-                    vec![grad_output, q, k, v],
-                    k_ty.clone(),
-                );
-                let grad_v = graph.add_raw_node(
-                    Op::MultiHeadAttnGradV {
-                        fwd_node,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        is_cross: false,
-                    },
-                    vec![grad_output, q, k, v],
-                    v_ty,
-                );
-                // For CausalAttentionRoPE: grad flows through RoPE backward
-                // to the original un-rotated Q/K.
-                if let Op::CausalAttentionRoPE { rope_theta, .. } = node.op {
-                    let grad_q_unrotated = graph.add_raw_node(
-                        Op::RoPEGrad {
-                            theta: rope_theta,
-                            pos_offset: 0,
-                            head_dim,
-                        },
-                        vec![grad_q],
-                        q_ty.clone(),
-                    );
-                    let grad_k_unrotated = graph.add_raw_node(
-                        Op::RoPEGrad {
-                            theta: rope_theta,
-                            pos_offset: 0,
-                            head_dim,
-                        },
-                        vec![grad_k],
-                        k_ty.clone(),
-                    );
-                    accumulate_grad(&mut graph, &mut grads, q_raw, grad_q_unrotated);
-                    accumulate_grad(&mut graph, &mut grads, k_raw, grad_k_unrotated);
-                } else {
-                    accumulate_grad(&mut graph, &mut grads, q_raw, grad_q);
-                    accumulate_grad(&mut graph, &mut grads, k_raw, grad_k);
-                }
-                accumulate_grad(&mut graph, &mut grads, v, grad_v);
-            }
-            Op::SlidingWindowAttention {
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                ..
-            } => {
-                // Same backward as CausalAttention — compile.rs extracts window_size
-                // from the forward node and passes it to the backward shaders.
-                let q = node.inputs[0];
-                let k = node.inputs[1];
-                let v = node.inputs[2];
-                let fwd_node = node.id;
-
-                let q_ty = forward.nodes()[q as usize].ty.clone();
-                let k_ty = forward.nodes()[k as usize].ty.clone();
-                let v_ty = forward.nodes()[v as usize].ty.clone();
-
-                let grad_q = graph.add_raw_node(
-                    Op::MultiHeadAttnGradQ {
-                        fwd_node,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        is_cross: false,
-                    },
-                    vec![grad_output, q, k, v],
-                    q_ty.clone(),
-                );
-                let grad_k = graph.add_raw_node(
-                    Op::MultiHeadAttnGradK {
-                        fwd_node,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        is_cross: false,
-                    },
-                    vec![grad_output, q, k, v],
-                    k_ty.clone(),
-                );
-                let grad_v = graph.add_raw_node(
-                    Op::MultiHeadAttnGradV {
-                        fwd_node,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        is_cross: false,
-                    },
-                    vec![grad_output, q, k, v],
-                    v_ty,
-                );
-                accumulate_grad(&mut graph, &mut grads, q, grad_q);
-                accumulate_grad(&mut graph, &mut grads, k, grad_k);
-                accumulate_grad(&mut graph, &mut grads, v, grad_v);
-            }
             Op::LayerNorm { eps } => {
                 let x = node.inputs[0];
                 let w = node.inputs[1];
@@ -1175,61 +1001,6 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
                 let _ = w_ty; // keep for future use
-            }
-            Op::FullAttention {
-                num_heads,
-                num_kv_heads,
-                head_dim,
-            } => {
-                // FullAttention is non-causal: attends to all positions.
-                // Backward is same as CausalAttention but kv_seq != 0.
-                let q_raw = node.inputs[0];
-                let k_raw = node.inputs[1];
-                let v = node.inputs[2];
-                let fwd_node = node.id;
-
-                let q_ty = forward.nodes()[q_raw as usize].ty.clone();
-                let k_ty = forward.nodes()[k_raw as usize].ty.clone();
-                let v_ty = forward.nodes()[v as usize].ty.clone();
-
-                let (q, k) = (q_raw, k_raw);
-
-                let grad_q = graph.add_raw_node(
-                    Op::MultiHeadAttnGradQ {
-                        fwd_node,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        is_cross: false,
-                    },
-                    vec![grad_output, q, k, v],
-                    q_ty.clone(),
-                );
-                let grad_k = graph.add_raw_node(
-                    Op::MultiHeadAttnGradK {
-                        fwd_node,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        is_cross: false,
-                    },
-                    vec![grad_output, q, k, v],
-                    k_ty.clone(),
-                );
-                let grad_v = graph.add_raw_node(
-                    Op::MultiHeadAttnGradV {
-                        fwd_node,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        is_cross: false,
-                    },
-                    vec![grad_output, q, k, v],
-                    v_ty,
-                );
-                accumulate_grad(&mut graph, &mut grads, q_raw, grad_q);
-                accumulate_grad(&mut graph, &mut grads, k_raw, grad_k);
-                accumulate_grad(&mut graph, &mut grads, v, grad_v);
             }
             // Inference-only ops: should not appear in training graphs
             Op::CrossAttention { .. }
@@ -1332,6 +1103,99 @@ impl Graph {
         let ty = target_ty.clone();
         self.add_raw_node(Op::SumRows, vec![x], ty)
     }
+}
+
+/// Accumulate the gradients of an attention node with respect to its Q, K
+/// and V inputs. With `rope_theta`, the node rotated Q and K itself: the
+/// gradient kernels see the rotated operands and the gradients flow back
+/// through the inverse rotation.
+#[allow(clippy::too_many_arguments)]
+fn attention_backward(
+    graph: &mut Graph,
+    grads: &mut HashMap<NodeId, NodeId>,
+    forward: &Graph,
+    node: &crate::graph::Node,
+    grad_output: NodeId,
+    [num_heads, num_kv_heads, head_dim]: [u32; 3],
+    is_cross: bool,
+    rope_theta: Option<f32>,
+) {
+    let (q_raw, k_raw, v) = (node.inputs[0], node.inputs[1], node.inputs[2]);
+    let ty = |id: NodeId| forward.nodes()[id as usize].ty.clone();
+    let rotate = |graph: &mut Graph, x: NodeId, theta: f32| {
+        graph.add_raw_node(
+            Op::RoPE {
+                theta,
+                pos_offset: 0,
+                head_dim,
+                freq_factors: false,
+            },
+            vec![x],
+            ty(x),
+        )
+    };
+    let (q, k) = match rope_theta {
+        Some(theta) => (rotate(graph, q_raw, theta), rotate(graph, k_raw, theta)),
+        None => (q_raw, k_raw),
+    };
+    let fwd_node = node.id;
+    let operands = vec![grad_output, q, k, v];
+    let grad_q = graph.add_raw_node(
+        Op::MultiHeadAttnGradQ {
+            fwd_node,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            is_cross,
+        },
+        operands.clone(),
+        ty(q_raw),
+    );
+    let grad_k = graph.add_raw_node(
+        Op::MultiHeadAttnGradK {
+            fwd_node,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            is_cross,
+        },
+        operands.clone(),
+        ty(k_raw),
+    );
+    let grad_v = graph.add_raw_node(
+        Op::MultiHeadAttnGradV {
+            fwd_node,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            is_cross,
+        },
+        operands,
+        ty(v),
+    );
+    let (grad_q, grad_k) = match rope_theta {
+        Some(theta) => {
+            let unrotate = |graph: &mut Graph, g: NodeId, x: NodeId| {
+                graph.add_raw_node(
+                    Op::RoPEGrad {
+                        theta,
+                        pos_offset: 0,
+                        head_dim,
+                    },
+                    vec![g],
+                    ty(x),
+                )
+            };
+            (
+                unrotate(graph, grad_q, q_raw),
+                unrotate(graph, grad_k, k_raw),
+            )
+        }
+        None => (grad_q, grad_k),
+    };
+    accumulate_grad(graph, grads, q_raw, grad_q);
+    accumulate_grad(graph, grads, k_raw, grad_k);
+    accumulate_grad(graph, grads, v, grad_v);
 }
 
 fn gelu_derivative(graph: &mut Graph, x: NodeId) -> NodeId {
