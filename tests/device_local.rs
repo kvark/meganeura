@@ -1,11 +1,7 @@
-//! Step-local intermediates default to `Memory::Device` (no CPU
-//! mapping); `MEGANEURA_NO_DEVICE_LOCAL=1` forces everything back to
-//! host-visible `Memory::Shared`. Training must produce the same numbers
-//! in both layouts, and user-visible buffers (loss, outputs, params)
-//! must remain readable regardless.
-//!
-//! Kept in its own test binary: the env var is process-global and the
-//! sessions here are built sequentially to avoid racing other tests.
+//! Step-local intermediates default to device-local memory. Training must
+//! produce the same numbers when `SessionOptions::no_device_local` keeps
+//! every buffer host-visible, and user-visible buffers (loss, outputs,
+//! params) must remain readable regardless.
 
 use meganeura::{Graph, nn};
 
@@ -61,9 +57,11 @@ fn model(bs: usize) -> Graph {
     g
 }
 
-fn run(bs: usize) -> (f32, Vec<f32>) {
+fn run(bs: usize, no_device_local: bool) -> (f32, Vec<f32>) {
     let g = model(bs);
-    let mut s = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
+    let mut config = meganeura::SessionConfig::from_env();
+    config.runtime.no_device_local = no_device_local;
+    let mut s = meganeura::build(&g, config).0;
     s.set_parameter("fc1.weight", &vec![0.05; 8 * 16]);
     s.set_parameter("fc1.bias", &[0.1; 16]);
     s.set_parameter("norm.weight", &[1.0; 16]);
@@ -86,13 +84,8 @@ fn run(bs: usize) -> (f32, Vec<f32>) {
 
 #[test]
 fn device_local_intermediates_match_shared() {
-    // Force the all-host-visible layout for the baseline.
-    unsafe { std::env::set_var("MEGANEURA_NO_DEVICE_LOCAL", "1") };
-    let (shared_loss, shared_y) = run(4);
-    unsafe { std::env::remove_var("MEGANEURA_NO_DEVICE_LOCAL") };
-
-    // Default layout: step-local intermediates are device-local.
-    let (device_loss, device_y) = run(4);
+    let (shared_loss, shared_y) = run(4, true);
+    let (device_loss, device_y) = run(4, false);
 
     assert!(
         (shared_loss - device_loss).abs() <= 1e-6 * shared_loss.abs().max(1.0),

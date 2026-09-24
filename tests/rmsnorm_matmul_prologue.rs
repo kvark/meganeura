@@ -2,26 +2,13 @@
 //! prologue fusion. Ineligible matmuls must remain scalar, while eligible
 //! matmuls must preserve the rsqrt dependency and observe parameter updates.
 
-use meganeura::{Graph, Session};
-use std::sync::Mutex;
-
-static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
+use meganeura::{CoopPolicy, Graph, Session};
 
 const ROWS: usize = 64;
 const INNER: usize = 64;
 const COLS: usize = 64;
 
 fn build(cooperative: bool, expose_normalized: bool) -> Session {
-    // SAFETY: the test serializes its process-global feature switches.
-    unsafe {
-        std::env::remove_var("MEGANEURA_COOP_F16");
-        if cooperative {
-            std::env::remove_var("MEGANEURA_DISABLE_COOP");
-        } else {
-            std::env::set_var("MEGANEURA_DISABLE_COOP", "1");
-        }
-    }
-
     let mut graph = Graph::new();
     let x = graph.input("x", &[ROWS, INNER]);
     let norm_weight = graph.parameter("norm.weight", &[INNER]);
@@ -35,7 +22,13 @@ fn build(cooperative: bool, expose_normalized: bool) -> Session {
     } else {
         graph.set_outputs(vec![output]);
     }
-    meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0
+    let mut config = meganeura::SessionConfig::inference_from_env();
+    config.runtime.coop = if cooperative {
+        CoopPolicy::Auto
+    } else {
+        CoopPolicy::Disabled
+    };
+    meganeura::build(&graph, config).0
 }
 
 fn run(
@@ -70,7 +63,6 @@ fn relative_l2(got: &[f32], reference: &[f32]) -> f64 {
 
 #[test]
 fn coop_rmsnorm_matmul_prologue_matches_scalar_after_updates() {
-    let _guard = GPU_TEST_LOCK.lock().expect("GPU test lock poisoned");
     let mut scalar = build(false, false);
     let mut unfused_cooperative = build(true, true);
     let mut cooperative = build(true, false);
@@ -107,6 +99,4 @@ fn coop_rmsnorm_matmul_prologue_matches_scalar_after_updates() {
             "cooperative RmsNorm matmul diverged from scalar after update {update}: {scalar_error:.6e}"
         );
     }
-
-    unsafe { std::env::remove_var("MEGANEURA_DISABLE_COOP") };
 }

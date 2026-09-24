@@ -25,32 +25,11 @@ name = "regression"
 name = "oracle"
 path = "tests/oracle/main.rs"
 
-# These tests change process-global environment variables.
-[[test]]
-name = "device_local"
-
-[[test]]
-name = "flash_grad_kv_short"
-
-[[test]]
-name = "rmsnorm_matmul_prologue"
-
-[[test]]
-name = "int_dot_gemv"
-
-[[test]]
-name = "shared_parameters"
-
-
-[[test]]
-name = "sd_unet_coop_parity"
-required-features = ["models"]
-
 [features]
 # Nothing is enabled by default: a pinning embedder gets the core graph,
 # compile and runtime without first-party model definitions or the GGUF
-# loader. The tests and examples declare what they need, and CI checks
-# the bare build before the all-features one.
+# loader. The tests and examples declare what they need. The quality job
+# checks the bare build; test jobs run the suite once with every feature.
 default = []
 # First-party model definitions: `src/models` (SmolLM2, SmolVLA, SD-UNet,
 # ResNet, EfficientNet, Whisper, SmolVLM2). Stays a module rather than a
