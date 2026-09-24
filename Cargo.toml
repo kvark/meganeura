@@ -58,7 +58,7 @@ blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev 
 blade-macros = "0.3"
 # `default-features = false` drops egglog's `bin` stack (clap, mimalloc,
 # env_logger, chrono, graphviz); library builds use the shared rewrite engine.
-egglog = { version = "2.0", default-features = false }
+egglog = { version = "3.0", default-features = false }
 bytemuck = { version = "1", features = ["derive"] }
 naga = { git = "https://github.com/gfx-rs/wgpu", rev = "323acfb729a00c3030e362faa27252afe6368792", version = "30", default-features = false, features = ["wgsl-in", "wgsl-out", "spv-out"] }
 serde = { version = "1", features = ["derive"] }
