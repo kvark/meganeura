@@ -73,8 +73,7 @@ bound to observed device errors. It is a practical error model, not a proof
 that every wrong index or missing term will be detected.
 
 Family sweeps can run each alternative lowering as well as the default:
-the hand-written pointwise and reduction shaders instead of the generated
-ones, and no dispatch fusion (`gpu::Options::lowerings`). Training checks
+no dispatch fusion (`gpu::Options::lowerings`). Training checks
 compare every user output and every parameter gradient, including a
 parameter's slice of a packed parameter the optimizer replaced it with.
 
