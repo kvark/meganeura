@@ -430,24 +430,9 @@ fn main() {
         );
     }
 
-    // 10. Unary/Binary ops
-    println!("\nElementwise ops:");
+    // 10. Whole-tensor reductions (elementwise ops are generated per DAG)
+    println!("\nReductions:");
     {
-        let sm_unary = meganeura::codegen::generate_module(
-            ShaderGroup::Unary,
-            meganeura::codegen::MatmulKnobs::default(),
-        );
-        analyze("relu", &sm_unary, &ShaderEntry::Relu, dump, gpu_ref);
-        analyze("silu", &sm_unary, &ShaderEntry::Silu, dump, gpu_ref);
-        analyze("gelu", &sm_unary, &ShaderEntry::Gelu, dump, gpu_ref);
-
-        let sm_binary = meganeura::codegen::generate_module(
-            ShaderGroup::Binary,
-            meganeura::codegen::MatmulKnobs::default(),
-        );
-        analyze("add", &sm_binary, &ShaderEntry::Add, dump, gpu_ref);
-        analyze("mul", &sm_binary, &ShaderEntry::Mul, dump, gpu_ref);
-
         let sm_reduce = meganeura::codegen::generate_module(
             ShaderGroup::Reduce,
             meganeura::codegen::MatmulKnobs::default(),
@@ -456,15 +441,9 @@ fn main() {
         analyze("mean_all", &sm_reduce, &ShaderEntry::MeanAll, dump, gpu_ref);
     }
 
-    // 11. Softmax + losses
-    println!("\nSoftmax/Losses:");
+    // 11. Losses (softmax is a generated reduction)
+    println!("\nLosses:");
     {
-        let sm = meganeura::codegen::generate_module(
-            ShaderGroup::Softmax,
-            meganeura::codegen::MatmulKnobs::default(),
-        );
-        analyze("softmax", &sm, &ShaderEntry::Softmax, dump, gpu_ref);
-
         let sm_ce = meganeura::codegen::generate_module(
             ShaderGroup::CrossEntropy,
             meganeura::codegen::MatmulKnobs::default(),

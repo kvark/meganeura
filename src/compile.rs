@@ -146,18 +146,6 @@ impl Default for TuningKnobs {
 /// the library itself takes only this typed struct.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompileOptions {
-    /// Route unary + binary pointwise ops through the schedule-template
-    /// codegen path (with chain fusion) instead of the hand-written
-    /// unary.wgsl / binary.wgsl shaders. The generated WGSL uses the same
-    /// UnaryData / BinaryData / TernaryData binding layouts, so no runtime
-    /// surface changes for callers.
-    pub use_schedule_pointwise: bool,
-    /// Route reduction-shaped ops (currently Softmax) through the
-    /// schedule-template reduction archetype instead of hand-written
-    /// shaders. Generated kernels use workgroup-per-row tree reduction,
-    /// which is much more parallel than the 1-thread-per-row loops in
-    /// the existing softmax.wgsl. Enabled by default after parity validation.
-    pub use_schedule_reduction: bool,
     /// Apply dispatch-level fusion passes (matmul epilogues, pointwise
     /// chains, reduction prologues, RmsNorm→matmul prologues). These are
     /// numerics-neutral performance transforms; debug sessions disable them
@@ -200,8 +188,6 @@ pub struct CompileOptions {
 impl Default for CompileOptions {
     fn default() -> Self {
         Self {
-            use_schedule_pointwise: true,
-            use_schedule_reduction: true,
             fuse_dispatches: true,
             knobs: TuningKnobs::default(),
             flash_forward_coop: true,
@@ -240,6 +226,9 @@ impl CompileOptions {
 pub enum ShaderEntry {
     #[default]
     MatMul,
+    /// A generated pointwise or reduction kernel. The dispatch's `kernel`
+    /// says what it computes and determines its binding layout.
+    Generated,
     MatMulAT,
     MatMulBT,
     BlockMatMul,
@@ -259,32 +248,15 @@ pub enum ShaderEntry {
     FusedMatMulAdd,
     FusedMatMulATAdd,
     FusedMatMulBTAdd,
-    Relu,
-    Sigmoid,
-    Tanh,
-    Neg,
-    Abs,
-    Log,
-    Recip,
-    Add,
-    Mul,
-    Greater,
-    BiasAdd,
-    BiasMul,
     SgdUpdate,
     AdamUpdate,
     ScatterAdd,
     ScatterAddAtomic,
     SumAll,
     MeanAll,
-    Softmax,
     CrossEntropyLoss,
     BceLoss,
     Transpose,
-    Silu,
-    SwiGLU,
-    GeGLU,
-    RmsNorm,
     /// RmsNorm with the consumer's residual add folded in. Selected by
     /// `fuse_rmsnorm_into_add` for a norm whose only reader is an `Add`;
     /// computes the same values with one dispatch instead of two.
@@ -293,7 +265,6 @@ pub enum ShaderEntry {
     ToF16,
     RoPE,
     RoPEGrad,
-    Gelu,
     LayerNorm,
     MultiHeadAttn,
     /// Flash Attention 2 forward: BQ>1 multi-query tiling.
@@ -354,9 +325,6 @@ pub enum ShaderEntry {
     /// Per-channel broadcast multiply: `dst[n,c,h,w] = src[n,c,h,w] * gate[n,c]`.
     /// Used by EfficientNet Squeeze-and-Excitation.
     MulPerChannel,
-    /// Per-channel broadcast add: `dst[n,c,h,w] = src[n,c,h,w] + bias[c]`.
-    /// Used to apply a fused-BN per-channel bias to a conv output.
-    AddPerChannel,
     Conv2dGemm,
     Conv2dGemmSmall,
     /// 16×16 register tile for convolutions whose 32-wide grid is still tiny.
@@ -422,6 +390,7 @@ impl ShaderEntry {
     /// individual shader variants continue to evolve.
     pub fn profile_family(&self) -> &'static str {
         match *self {
+            ShaderEntry::Generated => "pointwise",
             ShaderEntry::MatMul
             | ShaderEntry::MatMulAT
             | ShaderEntry::MatMulBT
@@ -478,10 +447,8 @@ impl ShaderEntry {
 
             ShaderEntry::SumAll
             | ShaderEntry::MeanAll
-            | ShaderEntry::Softmax
             | ShaderEntry::CrossEntropyLoss
             | ShaderEntry::BceLoss
-            | ShaderEntry::RmsNorm
             | ShaderEntry::RmsNormAdd
             | ShaderEntry::LayerNorm
             | ShaderEntry::SumRows
@@ -521,24 +488,8 @@ impl ShaderEntry {
             | ShaderEntry::CacheWritePrefix
             | ShaderEntry::PrefixLast => "data_movement",
 
-            ShaderEntry::Relu
-            | ShaderEntry::Sigmoid
-            | ShaderEntry::Tanh
-            | ShaderEntry::Neg
-            | ShaderEntry::Abs
-            | ShaderEntry::Log
-            | ShaderEntry::Recip
-            | ShaderEntry::Add
-            | ShaderEntry::Mul
-            | ShaderEntry::Greater
-            | ShaderEntry::BiasAdd
-            | ShaderEntry::BiasMul
-            | ShaderEntry::Silu
-            | ShaderEntry::SwiGLU
-            | ShaderEntry::GeGLU
-            | ShaderEntry::RoPE
+            ShaderEntry::RoPE
             | ShaderEntry::RoPEGrad
-            | ShaderEntry::Gelu
             | ShaderEntry::SwiGLUGradGate
             | ShaderEntry::SwiGLUGradUp
             | ShaderEntry::SiluGrad
@@ -547,7 +498,6 @@ impl ShaderEntry {
             | ShaderEntry::GeGLUConcat
             | ShaderEntry::GeGLUConcatGrad
             | ShaderEntry::MulPerChannel
-            | ShaderEntry::AddPerChannel
             | ShaderEntry::RoPEDynamic
             | ShaderEntry::RoPEDynamicFactors
             | ShaderEntry::RoPEPositions => "pointwise",
@@ -576,6 +526,7 @@ impl ShaderEntry {
     pub fn shader_group(&self) -> crate::codegen::ShaderGroup {
         use crate::codegen::ShaderGroup;
         match *self {
+            ShaderEntry::Generated => ShaderGroup::Generated,
             ShaderEntry::MatMul => ShaderGroup::MatMul,
             ShaderEntry::MatMulAT => ShaderGroup::MatMulAT,
             ShaderEntry::MatMulBT => ShaderGroup::MatMulBT,
@@ -589,33 +540,19 @@ impl ShaderEntry {
             ShaderEntry::FusedMatMulAdd => ShaderGroup::MatMulAdd,
             ShaderEntry::FusedMatMulATAdd => ShaderGroup::MatMulATAdd,
             ShaderEntry::FusedMatMulBTAdd => ShaderGroup::MatMulBTAdd,
-            ShaderEntry::Relu
-            | ShaderEntry::Sigmoid
-            | ShaderEntry::Tanh
-            | ShaderEntry::Neg
-            | ShaderEntry::Abs
-            | ShaderEntry::Log
-            | ShaderEntry::Recip => ShaderGroup::Unary,
-            ShaderEntry::Add | ShaderEntry::Mul | ShaderEntry::Greater => ShaderGroup::Binary,
-            ShaderEntry::BiasAdd | ShaderEntry::BiasMul => ShaderGroup::BiasAdd,
             ShaderEntry::SgdUpdate => ShaderGroup::Sgd,
             ShaderEntry::AdamUpdate => ShaderGroup::Adam,
             ShaderEntry::ScatterAdd => ShaderGroup::ScatterAdd,
             ShaderEntry::ScatterAddAtomic => ShaderGroup::ScatterAddAtomic,
             ShaderEntry::SumAll | ShaderEntry::MeanAll => ShaderGroup::Reduce,
-            ShaderEntry::Softmax => ShaderGroup::Softmax,
             ShaderEntry::CrossEntropyLoss => ShaderGroup::CrossEntropy,
             ShaderEntry::BceLoss => ShaderGroup::BceLoss,
             ShaderEntry::Transpose => ShaderGroup::Transpose,
-            ShaderEntry::Silu => ShaderGroup::Unary,
-            ShaderEntry::SwiGLU | ShaderEntry::GeGLU => ShaderGroup::Binary,
-            ShaderEntry::RmsNorm => ShaderGroup::RmsNorm,
             ShaderEntry::RmsNormAdd => ShaderGroup::RmsNormAdd,
             ShaderEntry::Embedding => ShaderGroup::Embedding,
             ShaderEntry::ToF16 => ShaderGroup::ToF16,
             ShaderEntry::RoPE => ShaderGroup::RoPE,
             ShaderEntry::RoPEGrad => ShaderGroup::RoPEGrad,
-            ShaderEntry::Gelu => ShaderGroup::Unary,
             ShaderEntry::LayerNorm => ShaderGroup::LayerNorm,
             ShaderEntry::MultiHeadAttn => ShaderGroup::MultiHeadAttn,
             ShaderEntry::FlashAttention => ShaderGroup::FlashAttention,
@@ -652,7 +589,6 @@ impl ShaderEntry {
             ShaderEntry::Upsample2xGrad => ShaderGroup::UpsampleGrad,
             ShaderEntry::Conv2dDw => ShaderGroup::Conv2dDw,
             ShaderEntry::MulPerChannel => ShaderGroup::MulPerChannel,
-            ShaderEntry::AddPerChannel => ShaderGroup::AddPerChannel,
             ShaderEntry::Conv2dGemm => ShaderGroup::Conv2dGemm,
             ShaderEntry::Conv2dGemmCoopGen(..) => ShaderGroup::Conv2dGemmCoop,
             ShaderEntry::Conv2dGemmSmall => ShaderGroup::Conv2dGemmSmall,
@@ -698,6 +634,7 @@ impl ShaderEntry {
 
     pub fn entry_point(&self) -> &'static str {
         match *self {
+            ShaderEntry::Generated => crate::schedule::POINTWISE_ENTRY,
             ShaderEntry::BlockMatMul | ShaderEntry::BlockMatMulAT | ShaderEntry::BlockMatMulBT => {
                 "main"
             }
@@ -711,37 +648,20 @@ impl ShaderEntry {
             | ShaderEntry::FusedMatMulAdd
             | ShaderEntry::FusedMatMulATAdd
             | ShaderEntry::FusedMatMulBTAdd
-            | ShaderEntry::BiasAdd
             | ShaderEntry::SgdUpdate
             | ShaderEntry::AdamUpdate
             | ShaderEntry::ScatterAdd
             | ShaderEntry::ScatterAddAtomic
-            | ShaderEntry::Softmax
             | ShaderEntry::CrossEntropyLoss
             | ShaderEntry::BceLoss
             | ShaderEntry::Transpose => "main",
-            ShaderEntry::BiasMul => "mul",
-            ShaderEntry::Relu => "relu",
-            ShaderEntry::Sigmoid => "sigmoid",
-            ShaderEntry::Tanh => "tanh_",
-            ShaderEntry::Neg => "neg",
-            ShaderEntry::Abs => "abs_",
-            ShaderEntry::Log => "log_",
-            ShaderEntry::Recip => "recip",
-            ShaderEntry::Add => "add",
-            ShaderEntry::Mul => "mul",
-            ShaderEntry::Greater => "greater",
             ShaderEntry::SumAll => "sum_all",
             ShaderEntry::MeanAll => "mean_all",
-            ShaderEntry::Silu => "silu",
-            ShaderEntry::SwiGLU => "swiglu",
-            ShaderEntry::GeGLU => "geglu",
-            ShaderEntry::RmsNorm | ShaderEntry::RmsNormAdd => "main",
+            ShaderEntry::RmsNormAdd => "main",
             ShaderEntry::Embedding => "main",
             ShaderEntry::ToF16 => "main",
             ShaderEntry::RoPE => "main",
             ShaderEntry::RoPEGrad => "main",
-            ShaderEntry::Gelu => "gelu",
             ShaderEntry::LayerNorm => "main",
             ShaderEntry::MultiHeadAttn
             | ShaderEntry::FlashAttention
@@ -779,7 +699,6 @@ impl ShaderEntry {
             ShaderEntry::Upsample2xGrad => "main",
             ShaderEntry::Conv2dDw => "main",
             ShaderEntry::MulPerChannel => "main",
-            ShaderEntry::AddPerChannel => "main",
             ShaderEntry::Conv2dGemm
             | ShaderEntry::Conv2dGemmSmall
             | ShaderEntry::Conv2dGemm16
@@ -1325,13 +1244,9 @@ impl ExecutionPlan {
     fn finish(mut self, options: &CompileOptions) -> Self {
         if options.fuse_dispatches {
             fuse_epilogues(&mut self);
-            if options.use_schedule_pointwise {
-                fold_uniform_constants(&mut self);
-                fuse_pointwise_chains(&mut self);
-            }
-            if options.use_schedule_reduction {
-                fuse_reduction_chains(&mut self);
-            }
+            fold_uniform_constants(&mut self);
+            fuse_pointwise_chains(&mut self);
+            fuse_reduction_chains(&mut self);
             fuse_row_scaled_scatters(&mut self);
         }
         // RmsNorm+MatMul prologue fusion is applied later in the runtime,
@@ -1501,17 +1416,8 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
                 continue;
             };
             let mul = &plan.dispatches[mul_index];
-            let plain_mul = mul.shader == ShaderEntry::Mul
-                && mul.input_buffers.len() == 2
-                && mul.reduction().is_none()
-                && match mul.pointwise() {
-                    None => true,
-                    Some(dag) => {
-                        dag.n_inputs == 2
-                            && dag.ops == [Pw::LoadInput(0), Pw::LoadInput(1), Pw::Mul(0, 1)]
-                            && dag.output == 2
-                    }
-                };
+            let plain_mul = mul.input_buffers.len() == 2
+                && mul.pointwise() == Some(&pointwise(2, [Pw::Mul(0, 1)]));
             if !plain_mul || protected.contains(&product) {
                 continue;
             }
@@ -1607,16 +1513,6 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
     }
 }
 
-/// The sentinel entry whose data layout binds a pointwise DAG of `arity`.
-fn pointwise_sentinel(arity: usize) -> ShaderEntry {
-    match arity {
-        1 => ShaderEntry::Relu,
-        2 => ShaderEntry::Add,
-        3 => ShaderEntry::SwiGLUGradGate, // dummy for TernaryData layout
-        _ => unreachable!("pointwise arity {arity} has no binding layout"),
-    }
-}
-
 /// Replace pointwise reads of uniform constant tensors with literals.
 ///
 /// Autodiff seeds ReLU masks with `zeros[n]` and mean gradients with
@@ -1666,7 +1562,7 @@ fn fold_uniform_constants(plan: &mut ExecutionPlan) {
             inputs.remove(slot);
         }
         if inputs.len() != dispatch.input_buffers.len() {
-            dispatch.shader = pointwise_sentinel(inputs.len());
+            dispatch.shader = ShaderEntry::Generated;
             dispatch.input_buffers = inputs;
             dispatch.kernel = Kernel::Pointwise(dag);
         }
@@ -1675,9 +1571,7 @@ fn fold_uniform_constants(plan: &mut ExecutionPlan) {
 
 /// Post-compile pass: merge sequential single-use pointwise dispatches into
 /// a single deeper-DAG dispatch, eliminating the intermediate buffer and
-/// the barrier between them. Only runs when
-/// `CompileOptions::use_schedule_pointwise` is set (pointwise dispatches
-/// carry the DAG the pass needs).
+/// the barrier between them.
 ///
 /// Conservative criteria — a producer P is fused into consumer C only when:
 ///   1. Both `P.pointwise()` and `C.pointwise()` are `Some`.
@@ -1804,7 +1698,7 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
             // Update the sentinel `shader` so the (legacy) pipeline
             // lookup still resolves — actual binding/pipeline come from
             // the `pointwise` DAG's arity.
-            consumer_d.shader = pointwise_sentinel(consumer_d.input_buffers.len());
+            consumer_d.shader = ShaderEntry::Generated;
 
             // Drop the producer dispatch.
             plan.dispatches.remove(pi);
@@ -2203,18 +2097,15 @@ fn rmsnorm_kernel(cols: u32, eps: f32) -> ReductionKernel {
 }
 
 fn is_plain_rmsnorm(dispatch: &Dispatch) -> bool {
-    if dispatch.shader != ShaderEntry::RmsNorm || dispatch.input_buffers.len() != 2 {
-        return false;
-    }
-    match dispatch.kernel {
-        Kernel::Default => true,
-        Kernel::Reduction(ref kernel) => {
-            // The shader entry survives pointwise/gather fusion. Only the
-            // canonical norm can be replaced by a dedicated runtime shader.
-            *kernel == rmsnorm_kernel(dispatch.params[1], f32::from_bits(dispatch.params[2]))
-        }
-        _ => false,
-    }
+    // The canonical generated norm only: after pointwise or gather fusion
+    // the reduction differs, and a dedicated runtime shader cannot replace it.
+    dispatch.input_buffers.len() == 2
+        && dispatch.params.len() >= 3
+        && dispatch.reduction()
+            == Some(&rmsnorm_kernel(
+                dispatch.params[1],
+                f32::from_bits(dispatch.params[2]),
+            ))
 }
 
 /// Fold a plain RmsNorm into its GEMV consumers, provided no other operation
@@ -2306,8 +2197,7 @@ pub fn fuse_rmsnorm_into_gemv(plan: &mut ExecutionPlan) {
 pub fn fuse_rmsnorm_into_add(plan: &mut ExecutionPlan) {
     use std::collections::HashMap;
 
-    let plain_add = binary_shader_to_pointwise(&ShaderEntry::Add)
-        .expect("the Add shader has a pointwise representation");
+    let plain_add = pointwise(2, [Pw::Add(0, 1)]);
 
     let mut readers: HashMap<BufferRef, Vec<usize>> = HashMap::new();
     for (i, d) in plan.dispatches.iter().enumerate() {
@@ -2335,15 +2225,11 @@ pub fn fuse_rmsnorm_into_add(plan: &mut ExecutionPlan) {
         }
         let ai = cons[0];
         let add = &plan.dispatches[ai];
-        // A scheduled plain Add carries its canonical three-node pointwise
-        // DAG. Pointwise fusion may instead have absorbed a consumer (for
-        // example Gemma4's `(norm + embedding) / sqrt(2)`) into that DAG.
-        // RmsNormAdd has no pointwise epilogue, so replacing a non-canonical
-        // Add dispatch would silently drop the absorbed consumer.
-        let has_fused_epilogue = add
-            .pointwise()
-            .is_some_and(|pointwise| pointwise != &plain_add);
-        if add.shader != ShaderEntry::Add || add.output_buffer == normed || has_fused_epilogue {
+        // Only the canonical Add qualifies. Pointwise fusion may have
+        // absorbed a consumer (for example Gemma4's `(norm + embedding) /
+        // sqrt(2)`) into its DAG, and RmsNormAdd has no pointwise epilogue,
+        // so replacing that dispatch would silently drop the consumer.
+        if add.pointwise() != Some(&plain_add) || add.output_buffer == normed {
             continue;
         }
         // The add's other input carries the residual.
@@ -2549,30 +2435,10 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
             continue;
         }
 
-        // Generated pointwise dispatches retain a legacy shader entry as a
-        // runtime-layout sentinel. That entry does not describe the DAG: for
-        // example Clamp and Exp both currently use `Relu`. Preserve the exact
-        // DAG when one is present instead of silently changing its meaning.
-        use crate::schedule::Pw;
-        let d_shader = d.shader.clone();
-        let pw_op = match d_shader {
-            ShaderEntry::Relu => Pw::Relu(0),
-            ShaderEntry::Sigmoid => Pw::Sigmoid(0),
-            ShaderEntry::Neg => Pw::Neg(0),
-            ShaderEntry::Silu => Pw::Silu(0),
-            _ => continue,
-        };
-        let canonical_dag = PointwiseDAG {
-            n_inputs: 1,
-            ops: vec![Pw::LoadInput(0), pw_op],
-            output: 1,
-        };
-        // Only a hand-written unary kernel means what its entry says. Any
-        // other generated kernel (a reduction, for one) borrows the entry
-        // as a layout sentinel and must not be read as that unary op.
+        // Every elementwise op lowers to a generated DAG; the dispatch's
+        // shader entry only names its binding layout.
         let epilogue_dag = match d.kernel {
             Kernel::Pointwise(ref dag) if dag.n_inputs == 1 && !dag.has_broadcast() => dag.clone(),
-            Kernel::Default => canonical_dag,
             _ => continue,
         };
         let primary_buf = d.input_buffers[0];
@@ -2639,82 +2505,34 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
     }
 }
 
-/// Build a 1-input pointwise DAG equivalent to `shader`, or `None` if the
-/// shader isn't a unary elementwise op. Used when
-/// `CompileOptions::use_schedule_pointwise` is set to route unary ops
-/// through the generated codegen path instead of the hand-written shader.
-fn unary_shader_to_pointwise(shader: &ShaderEntry) -> Option<PointwiseDAG> {
-    use crate::schedule::Pw;
-    let op = match *shader {
-        ShaderEntry::Relu => Pw::Relu(0),
-        ShaderEntry::Sigmoid => Pw::Sigmoid(0),
-        ShaderEntry::Tanh => Pw::Tanh(0),
-        ShaderEntry::Neg => Pw::Neg(0),
-        ShaderEntry::Abs => Pw::Abs(0),
-        ShaderEntry::Log => Pw::Log(0),
-        ShaderEntry::Recip => Pw::Recip(0),
-        ShaderEntry::Silu => Pw::Silu(0),
-        ShaderEntry::Gelu => {
-            // Tanh-approx GELU as unary.wgsl's `gelu` entry spells it:
-            // 0.5·x·(1 + tanh(u)) = x·sigmoid(2u), u = √(2/π)·(x + 0.044715·x³).
-            // The sigmoid form does not cancel to zero for negative x.
-            return Some(PointwiseDAG {
-                n_inputs: 1,
-                ops: vec![
-                    Pw::LoadInput(0),                 // v0 = x
-                    Pw::Mul(0, 0),                    // v1 = x²
-                    Pw::Mul(1, 0),                    // v2 = x³
-                    Pw::const_f32(0.044715),          // v3
-                    Pw::Mul(2, 3),                    // v4 = 0.044715·x³
-                    Pw::Add(0, 4),                    // v5 = x + 0.044715·x³
-                    Pw::const_f32(2.0 * 0.797_884_6), // v6 = 2·√(2/π)
-                    Pw::Mul(5, 6),                    // v7 = 2u
-                    Pw::Sigmoid(7),                   // v8
-                    Pw::Mul(0, 8),                    // v9 = gelu
-                ],
-                output: 9,
-            });
-        }
-        _ => return None,
-    };
-    Some(PointwiseDAG {
-        n_inputs: 1,
-        ops: vec![Pw::LoadInput(0), op],
-        output: 1,
-    })
+/// A pointwise DAG over `n_inputs` loads followed by `ops`, whose operand
+/// indices count the loads first. The last op is the output.
+fn pointwise(n_inputs: u8, ops: impl IntoIterator<Item = Pw>) -> PointwiseDAG {
+    let mut all: Vec<Pw> = (0..n_inputs).map(Pw::LoadInput).collect();
+    all.extend(ops);
+    PointwiseDAG {
+        n_inputs,
+        output: (all.len() - 1) as u16,
+        ops: all,
+    }
 }
 
-/// Build a 2-input pointwise DAG equivalent to `shader`, or `None` if the
-/// shader isn't a binary elementwise op using the shared `BinaryData`
-/// binding layout.
-fn binary_shader_to_pointwise(shader: &ShaderEntry) -> Option<PointwiseDAG> {
-    use crate::schedule::Pw;
-    // All binary shaders read two streams, named src_a/src_b by
-    // `schedule::PointwiseDAG::input_binding_names(2)` to match binary.wgsl.
-    let (ops, output) = match *shader {
-        ShaderEntry::Add => (vec![Pw::LoadInput(0), Pw::LoadInput(1), Pw::Add(0, 1)], 2),
-        ShaderEntry::Mul => (vec![Pw::LoadInput(0), Pw::LoadInput(1), Pw::Mul(0, 1)], 2),
-        ShaderEntry::Greater => (
-            vec![Pw::LoadInput(0), Pw::LoadInput(1), Pw::Greater(0, 1)],
-            2,
-        ),
-        ShaderEntry::SwiGLU => (
-            // swiglu(a, b) = silu(a) * b
-            vec![
-                Pw::LoadInput(0),
-                Pw::LoadInput(1),
-                Pw::Silu(0),
-                Pw::Mul(2, 1),
-            ],
-            3,
-        ),
-        _ => return None,
-    };
-    Some(PointwiseDAG {
-        n_inputs: 2,
-        ops,
-        output,
-    })
+/// Tanh-form GELU of value `x`, appended to a DAG whose next value index is
+/// `next`: 0.5·x·(1 + tanh(u)) = x·sigmoid(2u), u = √(2/π)·(x + 0.044715·x³).
+/// The sigmoid spelling does not cancel to zero for negative x.
+fn gelu_ops(x: u16, next: u16) -> [Pw; 9] {
+    let n = next;
+    [
+        Pw::Mul(x, x),                    // n   = x²
+        Pw::Mul(n, x),                    // n+1 = x³
+        Pw::const_f32(0.044715),          // n+2
+        Pw::Mul(n + 1, n + 2),            // n+3 = 0.044715·x³
+        Pw::Add(x, n + 3),                // n+4 = x + 0.044715·x³
+        Pw::const_f32(2.0 * 0.797_884_6), // n+5 = 2·√(2/π)
+        Pw::Mul(n + 4, n + 5),            // n+6 = 2u
+        Pw::Sigmoid(n + 6),               // n+7
+        Pw::Mul(x, n + 7),                // n+8 = gelu(x)
+    ]
 }
 
 const MAX_COMPUTE_WORKGROUPS_PER_DIMENSION: u32 = 65_535;
@@ -3136,7 +2954,7 @@ impl<'a> Compiler<'a> {
             input_row_repeats: Vec::new(),
         };
         self.plan.dispatches.push(Dispatch {
-            shader: ShaderEntry::Relu, // sentinel; routing is via `reduction`
+            shader: ShaderEntry::Generated,
             workgroups: [rows.div_ceil(rows_per_workgroup), 1, 1],
             input_buffers: vec![input],
             output_buffer: output,
@@ -3217,7 +3035,7 @@ impl<'a> Compiler<'a> {
         let lanes = head_dim.next_power_of_two().clamp(2, WORKGROUP_SIZE);
         let row_dot = self.alloc_buffer(rows as usize * 4);
         self.plan.dispatches.push(Dispatch {
-            shader: ShaderEntry::Relu, // sentinel; routing is via `reduction`
+            shader: ShaderEntry::Generated,
             workgroups: [rows.div_ceil(WORKGROUP_SIZE / lanes), 1, 1],
             input_buffers: vec![d_out, o],
             output_buffer: row_dot,
@@ -3347,6 +3165,20 @@ impl<'a> Compiler<'a> {
         // Generate labels for profiling
         for d in &mut self.plan.dispatches {
             d.label = match d.shader {
+                // A generated kernel is named after the op that produced it.
+                ShaderEntry::Generated => {
+                    let op = d.origin.first().map_or_else(
+                        || "Generated".to_string(),
+                        |&n| {
+                            let op = format!("{:?}", self.graph.node(n).op);
+                            op.split(|c: char| !c.is_ascii_alphanumeric())
+                                .next()
+                                .unwrap_or_default()
+                                .to_string()
+                        },
+                    );
+                    format!("{op}[{}x{}]", d.params[0], d.params[1])
+                }
                 ShaderEntry::BlockMatMul
                 | ShaderEntry::BlockMatMulAT
                 | ShaderEntry::BlockMatMulBT => {
@@ -3385,8 +3217,7 @@ impl<'a> Compiler<'a> {
                         d.shader, d.params[0], d.params[1], nh, nkv
                     )
                 }
-                ShaderEntry::RmsNorm
-                | ShaderEntry::RmsNormGradW
+                ShaderEntry::RmsNormGradW
                 | ShaderEntry::RmsNormGradWRowPar
                 | ShaderEntry::RmsNormGradX
                 | ShaderEntry::LayerNormGradWB
@@ -3478,7 +3309,7 @@ impl<'a> Compiler<'a> {
                 let input = self.get_buffer(node.inputs[0]);
                 let len = node.ty.num_elements() as u32;
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Relu,
+                    shader: ShaderEntry::Generated,
                     workgroups: [len.div_ceil(256), 1, 1],
                     input_buffers: vec![input],
                     output_buffer: out_buf,
@@ -3806,39 +3637,39 @@ impl<'a> Compiler<'a> {
             }
 
             Op::Add => {
-                self.emit_binary(ShaderEntry::Add, node, out_buf);
+                self.emit_pointwise(pointwise(2, [Pw::Add(0, 1)]), node, out_buf);
             }
             Op::Mul => {
-                self.emit_binary(ShaderEntry::Mul, node, out_buf);
+                self.emit_pointwise(pointwise(2, [Pw::Mul(0, 1)]), node, out_buf);
             }
             Op::Greater => {
-                self.emit_binary(ShaderEntry::Greater, node, out_buf);
+                self.emit_pointwise(pointwise(2, [Pw::Greater(0, 1)]), node, out_buf);
             }
 
-            Op::BiasAdd => self.emit_row_broadcast(ShaderEntry::BiasAdd, node, out_buf),
+            Op::BiasAdd => self.emit_row_broadcast(crate::schedule::Pw::Add(0, 1), node, out_buf),
 
-            Op::BiasMul => self.emit_row_broadcast(ShaderEntry::BiasMul, node, out_buf),
+            Op::BiasMul => self.emit_row_broadcast(crate::schedule::Pw::Mul(0, 1), node, out_buf),
 
             Op::Relu => {
-                self.emit_unary(ShaderEntry::Relu, node, out_buf);
+                self.emit_pointwise(pointwise(1, [Pw::Relu(0)]), node, out_buf);
             }
             Op::Sigmoid => {
-                self.emit_unary(ShaderEntry::Sigmoid, node, out_buf);
+                self.emit_pointwise(pointwise(1, [Pw::Sigmoid(0)]), node, out_buf);
             }
             Op::Tanh => {
-                self.emit_unary(ShaderEntry::Tanh, node, out_buf);
+                self.emit_pointwise(pointwise(1, [Pw::Tanh(0)]), node, out_buf);
             }
             Op::Neg => {
-                self.emit_unary(ShaderEntry::Neg, node, out_buf);
+                self.emit_pointwise(pointwise(1, [Pw::Neg(0)]), node, out_buf);
             }
             Op::Abs => {
-                self.emit_unary(ShaderEntry::Abs, node, out_buf);
+                self.emit_pointwise(pointwise(1, [Pw::Abs(0)]), node, out_buf);
             }
             Op::Log => {
-                self.emit_unary(ShaderEntry::Log, node, out_buf);
+                self.emit_pointwise(pointwise(1, [Pw::Log(0)]), node, out_buf);
             }
             Op::Recip => {
-                self.emit_unary(ShaderEntry::Recip, node, out_buf);
+                self.emit_pointwise(pointwise(1, [Pw::Recip(0)]), node, out_buf);
             }
             Op::Exp => {
                 self.emit_generated_unary(Pw::Exp(0), node, out_buf);
@@ -3848,7 +3679,7 @@ impl<'a> Compiler<'a> {
                 let len = node.ty.num_elements() as u32;
                 let pointwise = softplus::forward(beta);
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Relu,
+                    shader: ShaderEntry::Generated,
                     workgroups: [len.div_ceil(256), 1, 1],
                     input_buffers: vec![input],
                     output_buffer: out_buf,
@@ -3875,7 +3706,7 @@ impl<'a> Compiler<'a> {
                     output: 4,
                 };
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Relu,
+                    shader: ShaderEntry::Generated,
                     workgroups: [len.div_ceil(256), 1, 1],
                     input_buffers: vec![input],
                     output_buffer: out_buf,
@@ -3893,7 +3724,7 @@ impl<'a> Compiler<'a> {
                     output: 2,
                 };
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Mul,
+                    shader: ShaderEntry::Generated,
                     workgroups: [len.div_ceil(256), 1, 1],
                     input_buffers: vec![input],
                     output_buffer: out_buf,
@@ -3908,7 +3739,7 @@ impl<'a> Compiler<'a> {
                 let len = node.ty.num_elements() as u32;
                 let pointwise = softplus::backward(beta);
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Add,
+                    shader: ShaderEntry::Generated,
                     workgroups: [len.div_ceil(256), 1, 1],
                     input_buffers: vec![grad_output, input],
                     output_buffer: out_buf,
@@ -4037,7 +3868,7 @@ impl<'a> Compiler<'a> {
                     input_row_repeats: vec![],
                 };
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Relu,
+                    shader: ShaderEntry::Generated,
                     workgroups: [rows.div_ceil(256), 1, 1],
                     input_buffers: vec![input],
                     output_buffer: out_buf,
@@ -4108,7 +3939,7 @@ impl<'a> Compiler<'a> {
                     input_row_repeats: vec![],
                 };
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Relu,
+                    shader: ShaderEntry::Generated,
                     workgroups: [rows.div_ceil(256), 1, 1],
                     input_buffers: vec![grad_output, input, sum],
                     output_buffer: out_buf,
@@ -4149,7 +3980,7 @@ impl<'a> Compiler<'a> {
                     input_row_repeats: vec![pairs, 1],
                 };
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Relu,
+                    shader: ShaderEntry::Generated,
                     workgroups: [total.div_ceil(256), 1, 1],
                     input_buffers: vec![left, right],
                     output_buffer: out_buf,
@@ -4221,7 +4052,7 @@ impl<'a> Compiler<'a> {
                     input_row_repeats: vec![1, pairs],
                 };
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Relu,
+                    shader: ShaderEntry::Generated,
                     workgroups: [vector_rows.div_ceil(256), 1, 1],
                     input_buffers: vec![vectors, directions],
                     output_buffer: out_buf,
@@ -4238,66 +4069,17 @@ impl<'a> Compiler<'a> {
                 let shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let batch = shape[0] as u32;
                 let features = shape[1] as u32;
-                if self.options.use_schedule_reduction {
-                    self.emit_softmax_schedule(input, out_buf, batch, features);
-                } else {
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::Softmax,
-                        workgroups: [batch.div_ceil(256), 1, 1],
-                        input_buffers: vec![input],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![batch, features, 0, 0],
-
-                        ..Default::default()
-                    });
-                }
+                self.emit_softmax_schedule(input, out_buf, batch, features, false);
             }
 
             Op::LogSoftmax => {
-                // Two-pass: Softmax → temp_buf, then elementwise Log →
-                // out_buf. The previous implementation dispatched only
-                // the Softmax shader and labeled the output as
-                // log_softmax, producing softmax(x) values where the
-                // backward (correctly) assumed log_softmax(x). Result:
-                // forward and backward computed gradients for different
-                // mathematical functions. Caught by `gradcheck.rs::
-                // log_softmax_mid_chain` after the autodiff fix exposed
-                // the disagreement.
-                //
-                // TODO: replace with a single dedicated log_softmax
-                // shader (computes `x - log_sum_exp(x)` in one pass —
-                // also more numerically stable than `log(softmax(x))`
-                // for very negative log_softmax values). The two-pass
-                // version is correct but allocates an extra batch*features
-                // f32 buffer per LogSoftmax node.
+                // x - max - log(sum(exp(x - max))) directly: exact for very
+                // negative outputs, where log(softmax(x)) loses them.
                 let input = self.get_buffer(node.inputs[0]);
                 let shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let batch = shape[0] as u32;
                 let features = shape[1] as u32;
-                let n_bytes = (batch as usize) * (features as usize) * 4;
-                let softmax_buf = self.alloc_buffer(n_bytes);
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Softmax,
-                    workgroups: [batch.div_ceil(256), 1, 1],
-                    input_buffers: vec![input],
-                    output_buffer: softmax_buf,
-                    extra_outputs: vec![],
-                    params: vec![batch, features, 0, 0],
-
-                    ..Default::default()
-                });
-                let len = batch * features;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Log,
-                    workgroups: [len.div_ceil(256), 1, 1],
-                    input_buffers: vec![softmax_buf],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![len, 0, 0, 0],
-
-                    ..Default::default()
-                });
+                self.emit_softmax_schedule(input, out_buf, batch, features, true);
             }
 
             Op::CrossEntropyLoss => {
@@ -4382,15 +4164,18 @@ impl<'a> Compiler<'a> {
             }
 
             Op::Silu => {
-                self.emit_unary(ShaderEntry::Silu, node, out_buf);
+                self.emit_pointwise(pointwise(1, [Pw::Silu(0)]), node, out_buf);
             }
 
             Op::SwiGLU => {
-                self.emit_binary(ShaderEntry::SwiGLU, node, out_buf);
+                self.emit_pointwise(pointwise(2, [Pw::Silu(0), Pw::Mul(2, 1)]), node, out_buf);
             }
 
             Op::GeGLU => {
-                self.emit_binary(ShaderEntry::GeGLU, node, out_buf);
+                // geglu(gate, up) = gelu(gate) · up
+                let mut ops = gelu_ops(0, 2).to_vec();
+                ops.push(Pw::Mul(10, 1));
+                self.emit_pointwise(pointwise(2, ops), node, out_buf);
             }
 
             Op::SwiGLUConcat => {
@@ -4467,20 +4252,7 @@ impl<'a> Compiler<'a> {
                 let shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let rows = shape[0] as u32;
                 let cols = shape[1] as u32;
-                if self.options.use_schedule_reduction {
-                    self.emit_rmsnorm_schedule(x, w, out_buf, rows, cols, eps);
-                } else {
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::RmsNorm,
-                        workgroups: [rows, 1, 1],
-                        input_buffers: vec![x, w],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![rows, cols, eps.to_bits(), 0],
-
-                        ..Default::default()
-                    });
-                }
+                self.emit_rmsnorm_schedule(x, w, out_buf, rows, cols, eps);
             }
 
             Op::Embedding => {
@@ -4538,7 +4310,7 @@ impl<'a> Compiler<'a> {
                 let params = vec![total, seq_len, embed_dim, 0];
                 if u64::from(vocab_size as u32) * u64::from(seq_len) > 1_000_000 {
                     self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::Relu,
+                        shader: ShaderEntry::Generated,
                         workgroups: [total.div_ceil(256), 1, 1],
                         input_buffers: vec![src],
                         output_buffer: out_buf,
@@ -5118,44 +4890,31 @@ impl<'a> Compiler<'a> {
                 let src = self.get_buffer(node.inputs[0]);
                 let bias = self.get_buffer(node.inputs[1]);
                 let len = node.ty.shape[0] as u32;
-                if self.options.use_schedule_pointwise {
-                    // As a pointwise DAG the bias add fuses with the
-                    // activation after it, so a conv -> bias -> ReLU block
-                    // writes one activation instead of two.
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::Add,
-                        workgroups: [len.div_ceil(256), 1, 1],
-                        input_buffers: vec![src, bias],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![len, 0, 0, 0],
-                        kernel: Kernel::Pointwise(PointwiseDAG {
-                            n_inputs: 2,
-                            ops: vec![
-                                Pw::LoadInput(0),
-                                Pw::LoadBroadcast {
-                                    input: 1,
-                                    divisor: spatial,
-                                    modulus: channels,
-                                },
-                                Pw::Add(0, 1),
-                            ],
-                            output: 2,
-                        }),
-                        ..Default::default()
-                    });
-                } else {
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::AddPerChannel,
-                        workgroups: [len.div_ceil(256), 1, 1],
-                        input_buffers: vec![src, bias],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![len, spatial, channels, 0],
-
-                        ..Default::default()
-                    });
-                }
+                // As a pointwise DAG the bias add fuses with the activation
+                // after it, so a conv -> bias -> ReLU block writes one
+                // activation instead of two.
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::Generated,
+                    workgroups: [len.div_ceil(256), 1, 1],
+                    input_buffers: vec![src, bias],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![len, 0, 0, 0],
+                    kernel: Kernel::Pointwise(PointwiseDAG {
+                        n_inputs: 2,
+                        ops: vec![
+                            Pw::LoadInput(0),
+                            Pw::LoadBroadcast {
+                                input: 1,
+                                divisor: spatial,
+                                modulus: channels,
+                            },
+                            Pw::Add(0, 1),
+                        ],
+                        output: 2,
+                    }),
+                    ..Default::default()
+                });
             }
 
             Op::Conv2dDw {
@@ -5697,7 +5456,7 @@ impl<'a> Compiler<'a> {
                 self.plan.dispatches.push(Dispatch {
                     // Generated-reduction routing takes priority over the
                     // sentinel entry in pipeline selection and binding.
-                    shader: ShaderEntry::GlobalAvgPool,
+                    shader: ShaderEntry::Generated,
                     workgroups: [rows, 1, 1],
                     input_buffers: vec![input],
                     output_buffer: out_buf,
@@ -5742,7 +5501,7 @@ impl<'a> Compiler<'a> {
             }
 
             Op::Gelu => {
-                self.emit_unary(ShaderEntry::Gelu, node, out_buf);
+                self.emit_pointwise(pointwise(1, gelu_ops(0, 1)), node, out_buf);
             }
 
             Op::LayerNorm { eps } => {
@@ -6259,19 +6018,16 @@ impl<'a> Compiler<'a> {
             .1
     }
 
-    /// Emit softmax as two schedule-template reductions:
-    ///
-    ///   1. Max reduction (identity prologue) → `row_max` buffer `[batch]`.
-    ///   2. Sum reduction with prologue `exp(src - row_max)` and epilogue
-    ///      `exp(src - row_max) / row_sum` → output `[batch, features]`.
-    ///
-    /// Matches softmax.wgsl semantics bit-for-bit on finite inputs.
+    /// Softmax, or log-softmax with `log`, as two row reductions: the row
+    /// max, then the sum of `exp(x - max)` with an epilogue producing
+    /// `exp(x - max) / sum` or `(x - max) - log(sum)`.
     fn emit_softmax_schedule(
         &mut self,
         input: BufferRef,
         out_buf: BufferRef,
         batch: u32,
         features: u32,
+        log: bool,
     ) {
         use crate::schedule::{PointwiseDAG, Pw, ReduceOp, ReductionEpilogue, ReductionKernel};
 
@@ -6308,7 +6064,7 @@ impl<'a> Compiler<'a> {
         };
         self.plan.dispatches.push(Dispatch {
             // Sentinel shader for runtime data-layout selection (UnaryData).
-            shader: ShaderEntry::Relu,
+            shader: ShaderEntry::Generated,
             workgroups: [batch.div_ceil(rows_per_workgroup), 1, 1],
             input_buffers: vec![input],
             output_buffer: row_max,
@@ -6341,8 +6097,16 @@ impl<'a> Compiler<'a> {
                 Pw::LoadInput(1), // v1 = row_max
                 Pw::LoadInput(2), // v2 = row_sum
                 Pw::Sub(0, 1),    // v3 = src - row_max
-                Pw::Exp(3),       // v4 = exp(src - row_max)
-                Pw::Div(4, 2),    // v5 = exp(...) / row_sum
+                if log {
+                    Pw::Log(2) // v4 = log(row_sum)
+                } else {
+                    Pw::Exp(3) // v4 = exp(src - row_max)
+                },
+                if log {
+                    Pw::Sub(3, 4) // v5 = (src - row_max) - log(row_sum)
+                } else {
+                    Pw::Div(4, 2) // v5 = exp(...) / row_sum
+                },
             ],
             output: 5,
         };
@@ -6366,7 +6130,7 @@ impl<'a> Compiler<'a> {
             // buffer inputs → we key the runtime off `reduction.is_some()`
             // and the kernel's arity, so the shader field is purely a
             // historical leftover here.
-            shader: ShaderEntry::Add,
+            shader: ShaderEntry::Generated,
             workgroups: [batch.div_ceil(rows_per_workgroup), 1, 1],
             input_buffers: vec![input, row_max],
             output_buffer: out_buf,
@@ -6403,7 +6167,7 @@ impl<'a> Compiler<'a> {
 
         // Uses RmsNormData layout: src + bias (per-col weight) + dst + params.
         self.plan.dispatches.push(Dispatch {
-            shader: ShaderEntry::RmsNorm, // sentinel for layout
+            shader: ShaderEntry::Generated,
             workgroups: [rows.div_ceil(rows_per_workgroup), 1, 1],
             input_buffers: vec![x, w],
             output_buffer: out_buf,
@@ -6422,7 +6186,7 @@ impl<'a> Compiler<'a> {
         let input = self.get_buffer(node.inputs[0]);
         let len = node.ty.num_elements() as u32;
         self.plan.dispatches.push(Dispatch {
-            shader: ShaderEntry::Relu,
+            shader: ShaderEntry::Generated,
             workgroups: [len.div_ceil(256), 1, 1],
             input_buffers: vec![input],
             output_buffer: out_buf,
@@ -6438,23 +6202,28 @@ impl<'a> Compiler<'a> {
         });
     }
 
-    fn emit_unary(&mut self, shader: ShaderEntry, node: &Node, out_buf: BufferRef) {
-        let input = self.get_buffer(node.inputs[0]);
+    /// One elementwise dispatch computing `dag` over the node's inputs.
+    fn emit_pointwise(&mut self, dag: PointwiseDAG, node: &Node, out_buf: BufferRef) {
+        let input_buffers: Vec<BufferRef> = node
+            .inputs
+            .iter()
+            .map(|&input| self.get_buffer(input))
+            .collect();
+        assert_eq!(
+            input_buffers.len(),
+            usize::from(dag.n_inputs),
+            "{:?}",
+            node.op
+        );
         let len = node.ty.num_elements() as u32;
-        let pointwise = if self.options.use_schedule_pointwise {
-            unary_shader_to_pointwise(&shader)
-        } else {
-            None
-        };
         self.plan.dispatches.push(Dispatch {
-            shader,
+            shader: ShaderEntry::Generated,
             workgroups: [len.div_ceil(256), 1, 1],
-            input_buffers: vec![input],
+            input_buffers,
             output_buffer: out_buf,
             extra_outputs: vec![],
             params: vec![len, 0, 0, 0],
-
-            kernel: pointwise.map_or(Kernel::Default, Kernel::Pointwise),
+            kernel: Kernel::Pointwise(dag),
             ..Default::default()
         });
     }
@@ -6463,31 +6232,18 @@ impl<'a> Compiler<'a> {
     /// As a broadcast pointwise DAG it fuses with its neighbours, and a
     /// constant operand (autodiff broadcasts a row with `zeros + b`) folds
     /// to a literal.
-    fn emit_row_broadcast(&mut self, shader: ShaderEntry, node: &Node, out_buf: BufferRef) {
+    fn emit_row_broadcast(
+        &mut self,
+        combine: crate::schedule::Pw,
+        node: &Node,
+        out_buf: BufferRef,
+    ) {
         let a = self.get_buffer(node.inputs[0]);
         let b = self.get_buffer(node.inputs[1]);
         let len = node.ty.num_elements() as u32;
         let row_len = self.graph.node(node.inputs[1]).ty.num_elements() as u32;
-        if !self.options.use_schedule_pointwise {
-            self.plan.dispatches.push(Dispatch {
-                shader,
-                workgroups: [len.div_ceil(256), 1, 1],
-                input_buffers: vec![a, b],
-                output_buffer: out_buf,
-                extra_outputs: vec![],
-                params: vec![len, row_len, 0, 0],
-
-                ..Default::default()
-            });
-            return;
-        }
-        let combine = match shader {
-            ShaderEntry::BiasAdd => Pw::Add(0, 1),
-            ShaderEntry::BiasMul => Pw::Mul(0, 1),
-            _ => unreachable!("not a row broadcast: {shader:?}"),
-        };
         self.plan.dispatches.push(Dispatch {
-            shader: pointwise_sentinel(2),
+            shader: ShaderEntry::Generated,
             workgroups: [len.div_ceil(256), 1, 1],
             input_buffers: vec![a, b],
             output_buffer: out_buf,
@@ -6506,28 +6262,6 @@ impl<'a> Compiler<'a> {
                 ],
                 output: 2,
             }),
-            ..Default::default()
-        });
-    }
-
-    fn emit_binary(&mut self, shader: ShaderEntry, node: &Node, out_buf: BufferRef) {
-        let a = self.get_buffer(node.inputs[0]);
-        let b = self.get_buffer(node.inputs[1]);
-        let len = node.ty.num_elements() as u32;
-        let pointwise = if self.options.use_schedule_pointwise {
-            binary_shader_to_pointwise(&shader)
-        } else {
-            None
-        };
-        self.plan.dispatches.push(Dispatch {
-            shader,
-            workgroups: [len.div_ceil(256), 1, 1],
-            input_buffers: vec![a, b],
-            output_buffer: out_buf,
-            extra_outputs: vec![],
-            params: vec![len, 0, 0, 0],
-
-            kernel: pointwise.map_or(Kernel::Default, Kernel::Pointwise),
             ..Default::default()
         });
     }
@@ -6736,11 +6470,12 @@ mod tests {
 
         let plan = compile(&g);
         assert_eq!(plan.dispatches.len(), 4);
-        assert_eq!(plan.dispatches[0].shader, ShaderEntry::Relu);
-        assert_eq!(plan.dispatches[1].shader, ShaderEntry::Sigmoid);
-        assert_eq!(plan.dispatches[2].shader, ShaderEntry::Neg);
-        assert_eq!(plan.dispatches[3].shader, ShaderEntry::Relu);
-        assert!(plan.dispatches[3].pointwise().is_some());
+        use crate::schedule::Pw;
+        let last_op = |d: &Dispatch| d.pointwise().expect("generated").ops.last().cloned();
+        assert_eq!(last_op(&plan.dispatches[0]), Some(Pw::Relu(0)));
+        assert_eq!(last_op(&plan.dispatches[1]), Some(Pw::Sigmoid(0)));
+        assert_eq!(last_op(&plan.dispatches[2]), Some(Pw::Neg(0)));
+        assert_eq!(last_op(&plan.dispatches[3]), Some(Pw::Exp(0)));
         // All unary ops: params = [len, 0, 0, 0]
         for d in &plan.dispatches {
             assert_eq!(d.params[0], 32); // 4*8
@@ -6761,7 +6496,7 @@ mod tests {
 
         assert_eq!(plan.dispatches.len(), 2);
         let copy = &plan.dispatches[0];
-        assert_eq!(copy.shader, ShaderEntry::Relu);
+        assert_eq!(copy.shader, ShaderEntry::Generated);
         assert_eq!(copy.params, [8, 0, 0, 0]);
         assert_eq!(copy.workgroups, [1, 1, 1]);
         assert_eq!(copy.input_buffers.len(), 1);
@@ -6786,9 +6521,11 @@ mod tests {
 
         let plan = compile(&g);
         assert_eq!(plan.dispatches.len(), 3);
-        assert_eq!(plan.dispatches[0].shader, ShaderEntry::Add);
-        assert_eq!(plan.dispatches[1].shader, ShaderEntry::Mul);
-        assert_eq!(plan.dispatches[2].shader, ShaderEntry::Greater);
+        use crate::schedule::Pw;
+        let last_op = |d: &Dispatch| d.pointwise().expect("generated").ops.last().cloned();
+        assert_eq!(last_op(&plan.dispatches[0]), Some(Pw::Add(0, 1)));
+        assert_eq!(last_op(&plan.dispatches[1]), Some(Pw::Mul(0, 1)));
+        assert_eq!(last_op(&plan.dispatches[2]), Some(Pw::Greater(0, 1)));
         for d in &plan.dispatches {
             assert_eq!(d.input_buffers.len(), 2);
             assert_eq!(d.params[0], 32);
@@ -7099,10 +6836,8 @@ mod tests {
         g.set_outputs(vec![sm]);
 
         let plan = compile(&g);
-        // With use_schedule_reduction=true (default), softmax compiles to
-        // 2 Reduction dispatches (max + sum/normalize). With =false, it's
-        // 1 Softmax dispatch. Check that it compiles and has the right
-        // batch/features params.
+        // Softmax compiles to 2 Reduction dispatches (max, then
+        // sum/normalize). Check that it has the right batch/features params.
         assert_eq!(plan.dispatches.len(), 2);
         assert_eq!(plan.dispatches[0].params[0], 100); // batch/outer
         assert_eq!(plan.dispatches[0].params[1], 10); // features/inner
@@ -7172,7 +6907,7 @@ mod tests {
         let softmax_dispatches = plan
             .dispatches
             .iter()
-            .filter(|d| d.shader == ShaderEntry::Softmax || d.reduction().is_some())
+            .filter(|d| d.reduction().is_some())
             .count();
         assert_eq!(
             softmax_dispatches, 0,
@@ -7379,7 +7114,7 @@ mod tests {
                 let normalized = plan
                     .dispatches
                     .iter()
-                    .find(|dispatch| dispatch.shader == ShaderEntry::RmsNorm)
+                    .find(|dispatch| dispatch.reduction().is_some())
                     .expect("scheduled normalization")
                     .clone();
                 assert!(normalized.reduction().is_some());
@@ -7411,12 +7146,7 @@ mod tests {
 
         let mut scalar_plan = compile(&g);
         fuse_rmsnorm_prologues(&mut scalar_plan);
-        assert!(
-            scalar_plan
-                .dispatches
-                .iter()
-                .any(|dispatch| dispatch.shader == ShaderEntry::RmsNorm)
-        );
+        assert!(scalar_plan.dispatches.iter().any(is_plain_rmsnorm));
         assert!(
             scalar_plan
                 .dispatches
@@ -7532,7 +7262,7 @@ mod tests {
         let plan = compile(&g);
         // Nop should produce no dispatch
         assert_eq!(plan.dispatches.len(), 1);
-        assert_eq!(plan.dispatches[0].shader, ShaderEntry::Relu);
+        assert!(plan.dispatches[0].pointwise().is_some());
     }
 
     #[test]
@@ -7582,9 +7312,9 @@ mod tests {
             );
         }
         assert!(
-            plan.dispatches
-                .iter()
-                .all(|d| d.shader != ShaderEntry::Greater),
+            plan.dispatches.iter().all(|d| !d
+                .pointwise()
+                .is_some_and(|dag| dag.ops.contains(&crate::schedule::Pw::Greater(0, 1)))),
             "the ReLU mask was not fused into its consumer"
         );
     }
@@ -7658,16 +7388,6 @@ mod tests {
         // Verify all shader entries have valid group and entry_point
         let entries = [
             ShaderEntry::MatMul,
-            ShaderEntry::Relu,
-            ShaderEntry::Sigmoid,
-            ShaderEntry::Neg,
-            ShaderEntry::Abs,
-            ShaderEntry::Log,
-            ShaderEntry::Recip,
-            ShaderEntry::Add,
-            ShaderEntry::Mul,
-            ShaderEntry::Greater,
-            ShaderEntry::BiasAdd,
             ShaderEntry::SgdUpdate,
             ShaderEntry::AdamUpdate,
             ShaderEntry::ScatterAdd,
@@ -7675,7 +7395,6 @@ mod tests {
             ShaderEntry::SumAll,
             ShaderEntry::MeanAll,
             ShaderEntry::SumRows,
-            ShaderEntry::Softmax,
             ShaderEntry::CrossEntropyLoss,
             ShaderEntry::BceLoss,
             ShaderEntry::Transpose,
@@ -7859,7 +7578,7 @@ mod tests {
             ShaderEntry::LayerNormGradX.profile_family(),
             "normalization_reduction"
         );
-        assert_eq!(ShaderEntry::SwiGLU.profile_family(), "pointwise");
+        assert_eq!(ShaderEntry::SwiGLUGradGate.profile_family(), "pointwise");
         assert_eq!(ShaderEntry::Transpose.profile_family(), "data_movement");
         assert_eq!(ShaderEntry::AdamUpdate.profile_family(), "optimizer");
 

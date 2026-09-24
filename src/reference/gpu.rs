@@ -33,24 +33,14 @@ impl Default for Options {
 }
 
 impl Options {
-    /// The default options and one variant per alternative lowering: the
-    /// hand-written pointwise and reduction shaders instead of the
-    /// generated ones, and no dispatch fusion. Each must compute the same
-    /// values, so suites run their cases under all of them.
+    /// The default options and one variant per alternative lowering (no
+    /// dispatch fusion). Each must compute the same values, so suites run
+    /// their cases under all of them.
     pub fn lowerings() -> Vec<(&'static str, Options)> {
         let default = Options::default();
-        let mut hand_pointwise = default.clone();
-        hand_pointwise.compile.use_schedule_pointwise = false;
-        let mut hand_reduction = default.clone();
-        hand_reduction.compile.use_schedule_reduction = false;
         let mut unfused = default.clone();
         unfused.compile.fuse_dispatches = false;
-        vec![
-            ("default", default),
-            ("hand-written pointwise", hand_pointwise),
-            ("hand-written reductions", hand_reduction),
-            ("unfused", unfused),
-        ]
+        vec![("default", default), ("unfused", unfused)]
     }
 
     fn session_config(&self, mode: Mode) -> SessionConfig<'static> {

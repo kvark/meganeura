@@ -42,27 +42,20 @@ fn is_scalar_matmul(d: &Dispatch) -> bool {
 }
 
 fn is_rms_norm(d: &Dispatch) -> bool {
-    matches!(d.shader, ShaderEntry::RmsNorm)
+    // Generated kernels are labelled after the op that produced them.
+    d.reduction().is_some() && d.label.starts_with("RmsNorm")
 }
 
-/// Elementwise-ish consumers whose work *could* be absorbed into a
-/// matmul epilogue if their sole input came from a scalar matmul:
-///   - unary: Relu/Sigmoid/Silu/Neg/Tanh/Abs (though only Relu/Silu/
-///     Sigmoid/Neg are currently plumbed in fuse_epilogues).
-///   - binary: Add/BiasAdd (only BiasAdd is broadcast-friendly).
+/// Elementwise consumers whose work *could* be absorbed into a matmul
+/// epilogue if their sole input came from a scalar matmul. Epilogues take
+/// single-input DAGs; a second operand needs an extra binding.
 fn absorbable_into_matmul(d: &Dispatch) -> Option<&'static str> {
-    use ShaderEntry::*;
-    match d.shader {
-        Relu => Some("Relu"),
-        Silu => Some("Silu"),
-        Sigmoid => Some("Sigmoid"),
-        Neg => Some("Neg"),
-        Tanh => Some("Tanh (not currently in epilogue enum)"),
-        Abs => Some("Abs (not currently in epilogue enum)"),
-        Add => Some("Add (binary, extra buffer)"),
-        BiasAdd => Some("BiasAdd"),
-        _ => None,
-    }
+    let dag = d.pointwise()?;
+    Some(match (dag.n_inputs, dag.has_broadcast()) {
+        (1, _) => "unary pointwise",
+        (2, true) => "broadcast add/mul (bias)",
+        _ => "binary pointwise (extra buffer)",
+    })
 }
 
 fn count_consumers(plan: &ExecutionPlan) -> HashMap<BufferRef, Vec<usize>> {
@@ -161,7 +154,10 @@ fn diagnose(plan: &ExecutionPlan) -> Vec<Finding> {
         // Pattern 3: MatMul → (single consumer) Add/BiasAdd with a matmul-fused variant
         // already existing (FusedMatMulAdd). Count cases where this is being done in
         // two dispatches.
-        if matches!(d.shader, ShaderEntry::Add | ShaderEntry::BiasAdd) && d.pointwise().is_none() {
+        let is_add = d.pointwise().is_some_and(|dag| {
+            dag.n_inputs == 2 && matches!(dag.ops.last(), Some(meganeura::schedule::Pw::Add(..)))
+        });
+        if is_add {
             for (slot_idx, in_buf) in d.input_buffers.iter().enumerate() {
                 if !external.contains(in_buf)
                     && let Some(&prod_i) = producer.get(in_buf)

@@ -32,10 +32,9 @@ fn run(build: &dyn Fn(&mut Graph) -> BuildResult, n_out: usize, fuse: bool) -> V
     let (out, f_inputs, u_inputs) = build(&mut g);
     g.set_outputs(vec![out]);
 
-    // Isolate the reduction-fusion pass; keep pointwise fusion on both
-    // sides so only the reduction folding differs.
+    // Fused against unfused dispatches.
     let opts = CompileOptions {
-        use_schedule_reduction: fuse,
+        fuse_dispatches: fuse,
         ..CompileOptions::default()
     };
     let mut session: Session = meganeura::build(
@@ -660,10 +659,7 @@ fn two_gather_reduction_actually_fuses() {
     let y = g.sum_inner(prod);
     g.set_outputs(vec![y]);
 
-    let opts = CompileOptions {
-        use_schedule_reduction: true,
-        ..CompileOptions::default()
-    };
+    let opts = CompileOptions::default();
     let plan = compile_with(&g, &opts);
 
     let reductions: Vec<_> = plan
@@ -713,10 +709,7 @@ fn shared_gather_and_offset_fold_into_each_reduction() {
     let output = graph.add(reduced_a, reduced_b);
     graph.set_outputs(vec![output]);
 
-    let opts = CompileOptions {
-        use_schedule_reduction: true,
-        ..CompileOptions::default()
-    };
+    let opts = CompileOptions::default();
     let plan = compile_with(&graph, &opts);
     let reductions: Vec<_> = plan
         .dispatches
@@ -734,7 +727,7 @@ fn shared_gather_and_offset_fold_into_each_reduction() {
         dispatch.shader == ShaderEntry::Embedding && dispatch.reduction().is_none()
     }));
     assert!(!plan.dispatches.iter().any(|dispatch| {
-        dispatch.shader == ShaderEntry::Add && dispatch.params[0] == (m * n) as u32
+        dispatch.pointwise().is_some() && dispatch.params[0] == (m * n) as u32
     }));
 }
 
