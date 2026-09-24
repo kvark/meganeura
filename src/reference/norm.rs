@@ -171,6 +171,26 @@ fn rope(x: &Tensor, rot: &Rotation<'_>) -> Vec<f64> {
     out
 }
 
+/// A rotation carries componentwise input errors through its absolute matrix.
+/// In particular, a zero-angle rotation must not reset a cancelled input's scale.
+pub(super) fn rotation_error_scale(
+    node: &Node,
+    ins: &[&Tensor],
+    input_scale: &[f64],
+) -> Result<Vec<f64>, Error> {
+    let rot = rotation(node, ins)?;
+    let x = ins[0];
+    assert_eq!(input_scale.len(), x.len());
+    let mut scale = vec![0.0; x.len()];
+    for_each_pair(x, rot.head_dim, |r, i, i0, i1| {
+        let (sin, cos) = rot.angle(r, i).sin_cos();
+        let (a, b) = (input_scale[i0], input_scale[i1]);
+        scale[i0] = cos.abs() * a + sin.abs() * b;
+        scale[i1] = sin.abs() * a + cos.abs() * b;
+    });
+    Ok(scale)
+}
+
 /// `(M, D, P)` of a pairwise op: `left`/`directions` is `[M, D]` and the
 /// paired tensor is `[M·P, D]`.
 fn pairwise_dims(
