@@ -2895,6 +2895,16 @@ pub struct SessionOptions {
     /// is written before the first step can enable it to avoid touching the
     /// complete model allocation twice.
     pub skip_parameter_zero: bool,
+    /// Reserve no device memory for named parameters.
+    ///
+    /// A second execution shape (single-token decode beside a resident
+    /// prefill session) would otherwise allocate a full second copy of the
+    /// weights and KV cache before [`Session::share_parameter_from`] can
+    /// alias them. Each deferred parameter is a 4-byte placeholder until
+    /// `share_parameter_from` installs the donor buffer, or
+    /// [`Session::allocate_deferred_parameter`] creates a private one.
+    /// Stepping before that reads the placeholder.
+    pub defer_parameters: bool,
     /// One compute pass per dispatch — serial execution for bisection.
     pub serial_dispatch: bool,
     /// Dump dispatch order, provenance, accesses, and the alias map at
@@ -3120,6 +3130,9 @@ pub struct Session {
     /// Debug session: aliasing off, every buffer host-visible, all node
     /// values readable via [`Session::read_node`].
     debug: bool,
+    /// Physical allocations that are 4-byte stand-ins for named parameters.
+    /// Cleared when the real buffer is shared or allocated.
+    deferred_parameters: Vec<bool>,
     /// Optimizer / gradient scratch (Adam m/v, clip acc, grad-accum) live
     /// in device-local memory. False when `debug` or `no_device_local`.
     optimizer_device: bool,
@@ -3694,16 +3707,6 @@ impl Session {
             alias.physical_bytes() as f64 / 1e6,
             alias.device_local_bytes() as f64 / 1e6,
         );
-        let physical_allocation_bytes = alias
-            .sizes
-            .iter()
-            .try_fold(0usize, |sum, &size| sum.checked_add(size.max(4)))
-            .expect("session allocation size overflow");
-        let planned_allocation_bytes = physical_allocation_bytes
-            .checked_add(usize::from(!plan.param_grad_pairs.is_empty()) * 4)
-            .expect("session allocation size overflow");
-        ensure_device_memory_budget(&gpu, planned_allocation_bytes, "session buffers");
-        drop(memory_plan_span);
         let parameter_allocations = {
             let mut allocations = vec![false; alias.sizes.len()];
             for &(_, buffer) in &plan.param_buffers {
@@ -3711,20 +3714,67 @@ impl Session {
             }
             allocations
         };
+        // Named parameters stay pinned to their own physical buffer, so a
+        // second execution shape can omit those allocations and later alias
+        // the donor session's buffers. Counting them here would refuse a
+        // decode graph whose weights already live in the prefill session.
+        let deferred_parameters = {
+            let mut deferred = vec![false; alias.sizes.len()];
+            if opts.defer_parameters {
+                for &(_, buffer) in &plan.param_buffers {
+                    let logical = buffer.0 as usize;
+                    let physical = alias.map[logical];
+                    assert!(
+                        alias
+                            .map
+                            .iter()
+                            .enumerate()
+                            .all(|(index, &mapped)| mapped != physical || index == logical),
+                        "deferred parameter must have its own pinned allocation"
+                    );
+                    deferred[physical] = true;
+                }
+            }
+            deferred
+        };
+        let reserved = |index: usize, size: usize| -> usize {
+            if deferred_parameters[index] {
+                4
+            } else {
+                size.max(4)
+            }
+        };
+        let physical_allocation_bytes = alias
+            .sizes
+            .iter()
+            .enumerate()
+            .try_fold(0usize, |sum, (index, &size)| {
+                sum.checked_add(reserved(index, size))
+            })
+            .expect("session allocation size overflow");
+        let planned_allocation_bytes = physical_allocation_bytes
+            .checked_add(usize::from(!plan.param_grad_pairs.is_empty()) * 4)
+            .expect("session allocation size overflow");
+        ensure_device_memory_budget(&gpu, planned_allocation_bytes, "session buffers");
+        drop(memory_plan_span);
         let shared_allocations = alias.device_local.iter().filter(|&&device| !device).count();
         let device_allocations = alias.device_local.len() - shared_allocations;
         let shared_bytes = alias
             .sizes
             .iter()
+            .enumerate()
             .zip(&alias.device_local)
-            .filter_map(|(&size, &device)| (!device).then_some(size.max(4)))
+            .filter_map(|((index, &size), &device)| (!device).then_some(reserved(index, size)))
             .sum::<usize>();
         let device_bytes = physical_allocation_bytes - shared_bytes;
         let zero_on_init: Vec<bool> = alias
             .device_local
             .iter()
             .enumerate()
-            .map(|(index, _)| !opts.skip_parameter_zero || !parameter_allocations[index])
+            .map(|(index, _)| {
+                !deferred_parameters[index]
+                    && (!opts.skip_parameter_zero || !parameter_allocations[index])
+            })
             .collect();
         let shared_zero_allocations = alias
             .device_local
@@ -3763,7 +3813,7 @@ impl Session {
                     if alias.device_local[i] != device_local {
                         continue;
                     }
-                    let size = size.max(4);
+                    let size = reserved(i, size);
                     let handle = gpu.create_buffer(blade_graphics::BufferDesc {
                         name: &format!("buf_{}", i),
                         size: size as u64,
@@ -3980,6 +4030,7 @@ impl Session {
             profile_window: None,
             profiled_pass_map: Vec::new(),
             debug: opts.debug,
+            deferred_parameters,
             optimizer_device,
             written,
             pending_lr: None,
@@ -4176,6 +4227,64 @@ impl Session {
         for (logical, &physical) in self.alias.map.iter().enumerate() {
             if physical == target_physical {
                 self.buffers[logical] = shared.handle;
+            }
+        }
+        self.deferred_parameters[target_physical] = false;
+        Ok(())
+    }
+
+    /// Allocate a private buffer for a parameter left as a placeholder by
+    /// [`SessionOptions::defer_parameters`].
+    ///
+    /// No-op when that parameter already has a real allocation, including
+    /// after [`Session::share_parameter_from`]. The new buffer is zeroed.
+    pub fn allocate_deferred_parameter(&mut self, name: &str) -> Result<(), ShareParameterError> {
+        let target = self
+            .plan
+            .param_buffers
+            .iter()
+            .find(|entry| entry.0 == name)
+            .map(|entry| entry.1)
+            .ok_or(ShareParameterError::UnknownTarget)?;
+        let physical = self.alias.map[target.0 as usize];
+        if !self.deferred_parameters[physical] {
+            return Ok(());
+        }
+        self.wait();
+        let size = self.alias.sizes[physical].max(4);
+        ensure_device_memory_budget(&self.gpu, size, "deferred parameter");
+        let device_local = self.alias.device_local[physical];
+        let handle = self.gpu.create_buffer(blade_graphics::BufferDesc {
+            name: "deferred_parameter",
+            size: size as u64,
+            memory: if device_local {
+                blade_graphics::Memory::DeviceTransient
+            } else {
+                blade_graphics::Memory::Shared
+            },
+        });
+        if device_local {
+            self.encoder.start();
+            {
+                let mut transfer = self.encoder.transfer("zero_deferred_parameter");
+                transfer.fill_buffer(handle.at(0), size as u64, 0);
+            }
+            let submission = self.gpu.submit(&mut self.encoder);
+            let _ =
+                wait_for_timed_encoder(&self.gpu, &submission, &mut self.encoder, self.gpu_timing);
+        } else {
+            unsafe {
+                std::ptr::write_bytes(handle.data(), 0, size);
+            }
+        }
+        self.physical_buffers[physical] = Arc::new(PhysicalBuffer {
+            gpu: Arc::clone(&self.gpu),
+            handle,
+        });
+        self.deferred_parameters[physical] = false;
+        for (logical, &mapped) in self.alias.map.iter().enumerate() {
+            if mapped == physical {
+                self.buffers[logical] = handle;
             }
         }
         Ok(())
