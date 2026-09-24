@@ -93,6 +93,36 @@ pub fn load(
     Ok(report)
 }
 
+/// Load weights needed only by `session`, after its common parameters were
+/// bound from `source` during construction.
+pub(super) fn load_private(
+    session: &mut Session,
+    source: &Session,
+    model: &GgufModel,
+    config: &ModelConfig,
+    report: &mut LoadReport,
+) -> Result<(), GgufError> {
+    for name in graph::parameter_names(config) {
+        if source.has_parameter(&name) || !session.has_parameter(&name) {
+            continue;
+        }
+        let tensor = resolve(model, config, &name)?;
+        load_one(session, &name, &tensor, config, report)?;
+    }
+    for name in graph::optional_parameter_names(config) {
+        if source.has_parameter(&name)
+            || !session.has_parameter(&name)
+            || !model.tensors.contains_key(&name)
+        {
+            continue;
+        }
+        let tensor = resolve(model, config, &name)?;
+        load_one(session, &name, &tensor, config, report)?;
+    }
+    report.skipped.retain(|name| !session.has_parameter(name));
+    Ok(())
+}
+
 /// The tensor a parameter is actually made of: sliced out of a packed
 /// tensor where the architecture packs, and un-permuted where the
 /// converter permuted.

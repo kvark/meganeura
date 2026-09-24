@@ -9,6 +9,17 @@ fn graph(rows: usize) -> Graph {
     graph
 }
 
+fn graph_with_bias(rows: usize) -> Graph {
+    let mut graph = Graph::new();
+    let input = graph.input("x", &[1, rows]);
+    let weight = graph.parameter("weight", &[rows, rows]);
+    let bias = graph.parameter("bias", &[1, rows]);
+    let product = graph.matmul(input, weight);
+    let output = graph.add(product, bias);
+    graph.set_outputs(vec![output]);
+    graph
+}
+
 #[test]
 fn separately_compiled_sessions_can_share_parameter_lifetime() {
     for (source_shared, target_shared) in [(false, true), (true, false)] {
@@ -38,6 +49,28 @@ fn separately_compiled_sessions_can_share_parameter_lifetime() {
         target.wait();
         assert_eq!(target.read_output(2), [12.0, 20.0]);
     }
+}
+
+#[test]
+fn construction_shares_available_parameters_and_allocates_the_rest() {
+    let mut source = meganeura::build(&graph(2), SessionConfig::inference_from_env()).0;
+    source.set_parameter("weight", &[2.0, 0.0, 0.0, 3.0]);
+
+    let mut config = SessionConfig::inference_from_env();
+    config.share_parameters_from = Some(&mut source);
+    let mut target = meganeura::build(&graph_with_bias(2), config).0;
+    drop(source);
+
+    let mut values = [1.0; 4];
+    target.read_param("weight", &mut values);
+    assert_eq!(values, [2.0, 0.0, 0.0, 3.0]);
+    let mut bias = [1.0; 2];
+    target.read_param("bias", &mut bias);
+    assert_eq!(bias, [0.0, 0.0]);
+    target.set_input("x", &[4.0, 5.0]);
+    target.step();
+    target.wait();
+    assert_eq!(target.read_output(2), [8.0, 15.0]);
 }
 
 /// `loss = Σ (x · a) · weight` over two parameters, so `weight` sits at an
@@ -105,4 +138,24 @@ fn training_sessions_share_parameters_in_either_direction() {
         reader.wait();
         assert_eq!(reader.read_output(2), [next_weight[0], next_weight[1]]);
     }
+}
+
+#[test]
+fn construction_preserves_a_donor_arena_offset() {
+    let mut trainer = meganeura::build(&training_graph(), SessionConfig::default()).0;
+    trainer.set_parameter("a", &[1.0, -1.0, 0.5, 2.0]);
+    trainer.set_parameter("weight", &[2.0, 0.0, 0.0, 3.0]);
+
+    let mut config = SessionConfig::inference_from_env();
+    config.share_parameters_from = Some(&mut trainer);
+    let mut reader = meganeura::build(&graph(2), config).0;
+    drop(trainer);
+
+    let mut values = [0.0; 4];
+    reader.read_param("weight", &mut values);
+    assert_eq!(values, [2.0, 0.0, 0.0, 3.0]);
+    reader.set_input("x", &[4.0, 5.0]);
+    reader.step();
+    reader.wait();
+    assert_eq!(reader.read_output(2), [8.0, 15.0]);
 }
