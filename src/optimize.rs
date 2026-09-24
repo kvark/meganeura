@@ -143,7 +143,7 @@ impl egglog::extract::CostModel<u64> for FusionCostModel {
         &self,
         _egraph: &egglog::EGraph,
         func: &egglog::Function,
-        row: &egglog::FunctionRow,
+        enode: &egglog::Enode<'_>,
     ) -> u64 {
         let name = func.name();
         // Leaves exist regardless; their bytes are charged to the ops
@@ -156,12 +156,11 @@ impl egglog::extract::CostModel<u64> for FusionCostModel {
         };
         // Values are sort-local: an integer node id can have the same raw
         // value as an unrelated tensor e-class. Only Op arguments read tensors.
-        if let Some((out, args)) = row.vals.split_last()
-            && let Some(&out_bytes) = sizes.get(out)
-        {
-            let read = args
+        if let Some(&out_bytes) = sizes.get(&enode.eclass) {
+            let read = enode
+                .children
                 .iter()
-                .zip(&func.schema().input)
+                .zip(&func.func_type().input)
                 .filter(|&(_, sort)| sort.name() == "Op")
                 .filter_map(|(value, _)| sizes.get(value))
                 .fold(0u64, |total, bytes| total.saturating_add(*bytes));
@@ -828,6 +827,24 @@ fn segment_program(g: &Graph, seg: &Segment) -> (String, Vec<usize>) {
 /// extraction. Nodes sharing an e-class denote the same tensor, so the
 /// insert is idempotent. Unfusing an existing matrix addition also creates a
 /// new intermediate of the same output shape; it must not get a token cost.
+fn lookup_value(
+    egraph: &egglog::EGraph,
+    name: &str,
+    inputs: &[egglog::Value],
+) -> Option<egglog::Value> {
+    use egglog::Read as _;
+
+    egraph.read(|state| {
+        let inputs = egglog::RawValues(inputs.to_vec());
+        match state.table_subtype(name)? {
+            egglog::ast::FunctionSubtype::Constructor => {
+                state.eclass_of(name, inputs).ok().flatten()
+            }
+            egglog::ast::FunctionSubtype::Custom => state.lookup(name, inputs).ok().flatten(),
+        }
+    })
+}
+
 fn eclass_sizes(
     graph: &Graph,
     egraph: &egglog::EGraph,
@@ -840,7 +857,7 @@ fn eclass_sizes(
             continue;
         }
         let var = format!("$n{}", node.id);
-        if let Some(value) = egraph.lookup_function(&var, &[]) {
+        if let Some(value) = lookup_value(egraph, &var, &[]) {
             sizes.insert(value, node.ty.size_bytes() as u64);
         }
         let product = match node.op {
@@ -854,11 +871,11 @@ fn eclass_sizes(
             .map(|id| {
                 let name = format!("$n{id}");
                 egraph.get_function(&name)?;
-                egraph.lookup_function(&name, &[])
+                lookup_value(egraph, &name, &[])
             })
             .collect::<Option<Vec<_>>>();
         if let Some(inputs) = inputs
-            && let Some(value) = egraph.lookup_function(product, &inputs)
+            && let Some(value) = lookup_value(egraph, product, &inputs)
         {
             sizes.insert(value, node.ty.size_bytes() as u64);
         }
@@ -988,7 +1005,7 @@ fn process_segment(
     let mut terms = Vec::new();
     for &root in &roots {
         let var = format!("$n{}", root);
-        match egraph.lookup_function(&var, &[]) {
+        match lookup_value(&egraph, &var, &[]) {
             Some(value) => {
                 let extraction = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     extractor.extract_best(&egraph, &mut dag, value)
@@ -1725,8 +1742,8 @@ mod tests {
                  (let a (Leaf 0)) (let b (Op1 1 a))",
             )
             .unwrap();
-        let a = egraph.lookup_function("a", &[]).unwrap();
-        let b = egraph.lookup_function("b", &[]).unwrap();
+        let a = lookup_value(&egraph, "a", &[]).unwrap();
+        let b = lookup_value(&egraph, "b", &[]).unwrap();
         assert_eq!(b, egraph.base_to_value(1i64));
         let cost = FusionCostModel::with_sizes(HashMap::from([(a, 1024), (b, 2048)]));
         let extractor = Extractor::compute_costs_from_rootsorts(None, &egraph, cost);
@@ -1742,9 +1759,9 @@ mod tests {
                 "(let a (Leaf 0)) (let b (Leaf 1)) (let c (MatMul a b)) (run 4)",
             )
             .unwrap();
-        let a = egraph.lookup_function("a", &[]).unwrap();
-        let b = egraph.lookup_function("b", &[]).unwrap();
-        let c = egraph.lookup_function("c", &[]).unwrap();
+        let a = lookup_value(&egraph, "a", &[]).unwrap();
+        let b = lookup_value(&egraph, "b", &[]).unwrap();
+        let c = lookup_value(&egraph, "c", &[]).unwrap();
         let costs = FusionCostModel::with_sizes(HashMap::from([(a, 512), (b, 1024), (c, 256)]));
         let extractor = Extractor::compute_costs_from_rootsorts(None, &egraph, costs);
         for (cost, _) in extractor.extract_variants(
