@@ -19,9 +19,9 @@
 //! goes to the tuned K-split GEMV, where a block of rows goes to the tiled
 //! matmul; compiling one graph for both would give up one or the other.
 //!
-//! So there are two sessions, differing only in `block_size`, and
-//! [`Session::share_parameter_from`] points the decode session's parameter
-//! buffers *at the prefill session's own*. That aliases rather than copies,
+//! So there are two sessions, differing only in `block_size`, and the decode
+//! session is constructed with the prefill session's parameter buffers. That
+//! aliases rather than copies,
 //! which buys two things at once: the weights are stored once however many
 //! sessions read them, and the K/V caches are literally the same buffers —
 //! so a prompt processed by the prefill session is already in the cache the
@@ -149,27 +149,27 @@ impl Generator {
         }
         let prefill_block = options.prefill_block.max(1);
 
-        // The decode session is built first because it is the one that
-        // must exist; the prefill session then joins its context, which
-        // is what makes sharing buffers legal.
         let mut decode_graph = crate::Graph::new();
         let built = graph::build(&mut decode_graph, model, &config, 1, options.max_seq_len)?;
         decode_graph.set_outputs(built.outputs());
-        let mut decode = crate::build(&decode_graph, crate::SessionConfig::inference_from_env()).0;
-
-        let report = weights::load(&mut decode, model, &config)?;
-        weights::reset_caches(&mut decode, &built, &config);
-
-        let prefill = if prefill_block > 1 {
-            Some(Self::build_prefill(
-                model,
-                &config,
-                prefill_block,
-                options.max_seq_len,
-                &mut decode,
-            )?)
+        let (decode, prefill, report) = if prefill_block > 1 {
+            let (mut prefill, mut report) =
+                Self::build_prefill(model, &config, prefill_block, options.max_seq_len)?;
+            let mut cfg = crate::SessionConfig::inference_from_env_on(prefill.context());
+            cfg.share_parameters_from = Some(&mut prefill);
+            let mut decode = crate::build(&decode_graph, cfg).0;
+            // Shape-specific optimization may retain a weight only in the
+            // decode plan. Such parameters have ordinary private allocations
+            // and still need their GGUF contents loaded.
+            weights::load_private(&mut decode, &prefill, model, &config, &mut report)?;
+            weights::reset_caches(&mut decode, &built, &config);
+            (decode, Some(prefill), report)
         } else {
-            None
+            let mut decode =
+                crate::build(&decode_graph, crate::SessionConfig::inference_from_env()).0;
+            let report = weights::load(&mut decode, model, &config)?;
+            weights::reset_caches(&mut decode, &built, &config);
+            (decode, None, report)
         };
 
         // A file may carry weights and no vocabulary, which is still
@@ -210,42 +210,21 @@ impl Generator {
         })
     }
 
-    /// Build the wide-block session and point it at the decode session's
-    /// buffers.
+    /// Build and initialize the wide-block session. The decode session is
+    /// subsequently constructed from its parameter bindings.
     fn build_prefill(
         model: &GgufModel,
         config: &ModelConfig,
         block: usize,
         max_seq_len: usize,
-        decode: &mut Session,
-    ) -> Result<Session, GgufError> {
+    ) -> Result<(Session, weights::LoadReport), GgufError> {
         let mut g = crate::Graph::new();
         let built = graph::build(&mut g, model, config, block, max_seq_len)?;
         g.set_outputs(built.outputs());
-        // Same context, or the buffers cannot be shared at all.
-        let cfg = crate::SessionConfig::inference_from_env_on(decode.context());
-        let mut prefill = crate::build(&g, cfg).0;
-
-        // Every parameter the two have in common becomes one buffer: the
-        // weights so they are stored once, and the caches so a prompt this
-        // session writes is already visible to the decode session.
-        let shared: Vec<String> = prefill
-            .plan()
-            .param_buffers
-            .iter()
-            .map(|entry| entry.0.clone())
-            .collect();
-        for name in shared {
-            if !decode.has_parameter(&name) {
-                continue;
-            }
-            prefill.share_parameter_from(decode, &name).map_err(|e| {
-                GgufError::BadMetadata(format!(
-                    "the prefill and decode sessions disagree about `{name}`: {e:?}"
-                ))
-            })?;
-        }
-        Ok(prefill)
+        let mut prefill = crate::build(&g, crate::SessionConfig::inference_from_env()).0;
+        let report = weights::load(&mut prefill, model, config)?;
+        weights::reset_caches(&mut prefill, &built, config);
+        Ok((prefill, report))
     }
 
     /// What the file said the model is.

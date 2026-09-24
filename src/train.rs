@@ -253,6 +253,13 @@ pub struct SessionConfig<'a> {
     /// renderer is the motivating use case — see
     /// [`Session::with_context`] for details.
     pub gpu: Option<Arc<blade_graphics::Context>>,
+    /// Reuse same-named, same-sized parameter allocations from this session
+    /// while constructing the new one. Parameters absent from the source
+    /// retain ordinary private, zero-initialized allocations.
+    ///
+    /// When `gpu` is `None`, the source session's context is used.
+    /// Construction panics if a same-named parameter has a different size.
+    pub share_parameters_from: Option<&'a mut Session>,
     pub options: compile::CompileOptions,
     /// When set, load a previously-compiled plan from this path if it
     /// matches the semantic graph, mode, compiler configuration, and target
@@ -303,6 +310,7 @@ impl SessionConfig<'_> {
 pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, optimize::OptimizeReport) {
     let _span = tracing::info_span!("build_session").entered();
     let mode = cfg.mode;
+    let mut share_parameters_from = cfg.share_parameters_from;
     let mut options = cfg.options;
     if cfg.runtime.debug {
         // Dispatch-level fusion is numerics-neutral; disabling it in debug
@@ -322,7 +330,10 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, optimiz
     // first-device capability snapshot.
     let gpu = match cfg.gpu {
         Some(gpu) => gpu,
-        None => runtime::default_gpu_context(),
+        None => share_parameters_from
+            .as_ref()
+            .map(|source| source.context())
+            .unwrap_or_else(runtime::default_gpu_context),
     };
     let coop_caps = cfg
         .runtime
@@ -344,7 +355,13 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, optimiz
         match cache::load_build_plan(forward_graph, build_hash, path) {
             Ok(Some(plan)) => {
                 log::info!("loaded cached execution plan from {}", path.display());
-                let session = make_session(plan, gpu, cfg.runtime.clone(), cfg.tune);
+                let session = make_session(
+                    plan,
+                    gpu,
+                    cfg.runtime.clone(),
+                    share_parameters_from.take(),
+                    cfg.tune,
+                );
                 return (session, optimize::OptimizeReport::empty());
             }
             Ok(None) => log::info!("no valid cache found, recompiling"),
@@ -372,7 +389,13 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, optimiz
         }
     }
 
-    let session = make_session(plan, gpu, cfg.runtime.clone(), cfg.tune);
+    let session = make_session(
+        plan,
+        gpu,
+        cfg.runtime.clone(),
+        share_parameters_from,
+        cfg.tune,
+    );
     (session, report)
 }
 
@@ -445,9 +468,10 @@ fn make_session(
     plan: compile::ExecutionPlan,
     gpu: Arc<blade_graphics::Context>,
     opts: runtime::SessionOptions,
+    share_parameters_from: Option<&mut Session>,
     tune: bool,
 ) -> Session {
-    let mut session = Session::with_context_opts(plan, gpu, opts);
+    let mut session = Session::with_context_opts_sharing(plan, gpu, opts, share_parameters_from);
     if tune {
         let _span = tracing::info_span!("tune").entered();
         session.tune();

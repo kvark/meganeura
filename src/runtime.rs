@@ -3020,7 +3020,16 @@ impl Session {
     /// with explicit session options. [`Session::with_context`] is the
     /// defaults-taking shorthand.
     pub fn with_context_opts(plan: ExecutionPlan, gpu: Arc<Gpu>, opts: SessionOptions) -> Self {
-        Self::build_session_impl(plan, gpu, opts)
+        Self::build_session_impl(plan, gpu, opts, None)
+    }
+
+    pub(crate) fn with_context_opts_sharing(
+        plan: ExecutionPlan,
+        gpu: Arc<Gpu>,
+        opts: SessionOptions,
+        parameter_source: Option<&mut Session>,
+    ) -> Self {
+        Self::build_session_impl(plan, gpu, opts, parameter_source)
     }
 
     /// Create a session that reuses an externally-owned Blade GPU context.
@@ -3032,10 +3041,22 @@ impl Session {
     /// pipelines, the command encoder — on drop; the context is released
     /// once the last `Arc` clone is dropped.
     pub fn with_context(plan: ExecutionPlan, gpu: Arc<Gpu>) -> Self {
-        Self::build_session_impl(plan, gpu, SessionOptions::default())
+        Self::build_session_impl(plan, gpu, SessionOptions::default(), None)
     }
 
-    fn build_session_impl(plan: ExecutionPlan, gpu: Arc<Gpu>, opts: SessionOptions) -> Self {
+    fn build_session_impl(
+        plan: ExecutionPlan,
+        gpu: Arc<Gpu>,
+        opts: SessionOptions,
+        mut parameter_source: Option<&mut Session>,
+    ) -> Self {
+        if let Some(source) = parameter_source.as_deref_mut() {
+            assert!(
+                Arc::ptr_eq(&gpu, &source.gpu),
+                "parameter source uses a different GPU context"
+            );
+            source.wait();
+        }
         let _session_span = tracing::info_span!(
             "session_init",
             dispatches = plan.dispatches.len(),
@@ -3202,6 +3223,74 @@ impl Session {
             }
             alias.device_local.fill(false);
         }
+        // Install compatible donor bindings before budgeting or allocating.
+        // A parameter in an arena leaves that arena as an individual piece;
+        // this preserves the donor's offset and lets the optimizer treat the
+        // rebound parameter exactly like a post-construction share.
+        let mut provided_physical = vec![None; alias.sizes.len()];
+        let mut provided_parameters = 0usize;
+        if let Some(source) = parameter_source.as_deref() {
+            for &(ref name, target) in &plan.param_buffers {
+                let Some(source_buffer) = source
+                    .plan
+                    .param_buffers
+                    .iter()
+                    .find(|entry| entry.0 == *name)
+                    .map(|entry| entry.1)
+                else {
+                    continue;
+                };
+                let target_index = target.0 as usize;
+                let source_index = source_buffer.0 as usize;
+                let target_size = plan.buffers[target_index];
+                let source_size = source.plan.buffers[source_index];
+                assert_eq!(
+                    target_size, source_size,
+                    "parameter source has incompatible storage for `{name}`"
+                );
+
+                let source_physical = source.alias.map[source_index];
+                let target_physical = alias.map[target_index];
+                let target_is_arena = alias
+                    .arena
+                    .iter()
+                    .any(|chunk| chunk.params == target_physical);
+                let target_is_shared =
+                    alias.map.iter().enumerate().any(|(index, &physical)| {
+                        index != target_index && physical == target_physical
+                    });
+                let shared = Arc::clone(&source.physical_buffers[source_physical]);
+                let device_local = source.alias.device_local[source_physical];
+                let physical = if target_is_arena || target_is_shared {
+                    let physical = alias.sizes.len();
+                    alias.sizes.push(target_size);
+                    alias.device_local.push(device_local);
+                    provided_physical.push(Some(shared));
+                    physical
+                } else {
+                    alias.device_local[target_physical] = device_local;
+                    provided_physical[target_physical] = Some(shared);
+                    target_physical
+                };
+                alias.map[target_index] = physical;
+                alias.offsets[target_index] = source.alias.offsets[source_index];
+                provided_parameters += 1;
+            }
+        }
+        // A fully donated parameter arena no longer has logical tenants. Keep
+        // a harmless minimum-sized backing slot because optimizer metadata
+        // retains its physical index, but do not reserve the arena's capacity.
+        parameter_memory.resize(alias.sizes.len(), None);
+        for physical in 0..alias.sizes.len() {
+            if provided_physical[physical].is_none() && !alias.map.contains(&physical) {
+                alias.sizes[physical] = 0;
+                alias.device_local[physical] = false;
+                parameter_memory[physical] = None;
+            }
+        }
+        if provided_parameters != 0 {
+            log::info!("reused {provided_parameters} parameter allocations from donor session");
+        }
         let alias = alias;
         let optimizer_chunks = optimizer::chunks(&plan, &alias);
         // Debug aid: dump dispatch order, declared accesses, and the
@@ -3245,7 +3334,10 @@ impl Session {
         let physical_allocation_bytes = alias
             .sizes
             .iter()
-            .try_fold(0usize, |sum, &size| sum.checked_add(size.max(4)))
+            .zip(&provided_physical)
+            .try_fold(0usize, |sum, (&size, provided)| {
+                sum.checked_add(if provided.is_none() { size.max(4) } else { 0 })
+            })
             .expect("session allocation size overflow");
         let planned_allocation_bytes = physical_allocation_bytes
             .checked_add(usize::from(!plan.param_grad_pairs.is_empty()) * 4)
@@ -3259,20 +3351,36 @@ impl Session {
             }
             allocations
         };
-        let shared_allocations = alias.device_local.iter().filter(|&&device| !device).count();
-        let device_allocations = alias.device_local.len() - shared_allocations;
+        let shared_allocations = alias
+            .device_local
+            .iter()
+            .zip(&provided_physical)
+            .filter(|&(device, provided)| !*device && provided.is_none())
+            .count();
+        let device_allocations = alias
+            .device_local
+            .iter()
+            .zip(&provided_physical)
+            .filter(|&(device, provided)| *device && provided.is_none())
+            .count();
         let shared_bytes = alias
             .sizes
             .iter()
             .zip(&alias.device_local)
-            .filter_map(|(&size, &device)| (!device).then_some(size.max(4)))
+            .zip(&provided_physical)
+            .filter_map(|((&size, &device), provided)| {
+                (!device && provided.is_none()).then_some(size.max(4))
+            })
             .sum::<usize>();
         let device_bytes = physical_allocation_bytes - shared_bytes;
         let zero_on_init: Vec<bool> = alias
             .device_local
             .iter()
             .enumerate()
-            .map(|(index, _)| !opts.skip_parameter_zero || !parameter_allocations[index])
+            .map(|(index, _)| {
+                provided_physical[index].is_none()
+                    && (!opts.skip_parameter_zero || !parameter_allocations[index])
+            })
             .collect();
         let fill_byte: Vec<u8> = parameter_allocations
             .iter()
@@ -3309,10 +3417,10 @@ impl Session {
                 trace_min_duration_us = 1_000u64,
             )
             .entered();
-            let mut slots = vec![None; alias.sizes.len()];
+            let mut slots = provided_physical;
             let mut create_class = |device_local: bool| {
                 for (i, &size) in alias.sizes.iter().enumerate() {
-                    if alias.device_local[i] != device_local {
+                    if slots[i].is_some() || alias.device_local[i] != device_local {
                         continue;
                     }
                     let size = size.max(4);
