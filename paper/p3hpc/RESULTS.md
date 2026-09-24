@@ -6,16 +6,18 @@ The replacement RX 7900 XT archive is complete; it supersedes the accidentally
 interrupted upload. No old and new replicates are spliced together.
 
 The next candidate is **Inferena protocol v14**, revision
-[`65a8623`](https://github.com/kvark/inferena/blob/65a86235a0fa3964fe147fd678c2334a49ef6f99/EXPERIMENT.md)
+[`adfa3e9`](https://github.com/kvark/inferena/blob/adfa3e93ae564e41ddd7a2210591b550a8175aa6/EXPERIMENT.md)
 on `experiment/p3hpc-cuda-graphs`, pinned to Meganeura
-`c475fd0e05f72929eca3bf994584805596b80b8c` and Blade
+`2f018f9722dd403f14c33e4361bbff60f3dc2083` and Blade
 `fbb4f28c4869e81ae15de58925945b423b9c1ac5`. It retains sixteen graph/schedule
 forms, interleaves graph and physical-plan choices, and warms paired
 comparisons for two pairs and 250 ms within the shared 60-second session
 deadline. Both engines still warm held-out timing for five calls and two
 seconds. Checkpoints, compilation deadlines, replay requirements and numerical
 gates are unchanged. The pin includes #211's reference suite and runtime
-correctness fixes, plus #212's reference-check guards. Uncaptured PyTorch calls
+correctness fixes, #212's reference-check guards, and #213's simplified
+lowerings, training Winograd and attention changes. It also includes #214's
+compact search receipts and reference-scale correction. Uncaptured PyTorch calls
 now receive the same full-tensor repeatability checks as captured calls.
 Failed compiled phases retain their failure, without discarding previously
 qualified inference. One separate
@@ -54,7 +56,7 @@ error bound accepted arbitrary finite errors. Follow-up
 inventory lengths. It also avoids reading a nonexistent gradient for packed
 parameters that are observed outputs but do not reach the loss. This follow-up
 changes reference checks and tests, not production kernels. It merged as
-`c475fd0e05f72929eca3bf994584805596b80b8c` and is now the Inferena dependency pin;
+`c475fd0e05f72929eca3bf994584805596b80b8c` and was the previous Inferena pin;
 the before/after runtime study below concerns #211, not this test-only follow-up.
 
 Focused operator, block and regression checks passed on RTX 5070 and Arc B570.
@@ -159,6 +161,131 @@ The repeat and profiling artifacts remain outside Git at
 `/var/tmp/meganeura-pr211-repeat.KAcYQO` on zork. No new cohort was collected.
 The newly merged #212 changes only the reference validator/tests, not the
 runtime paths measured in this #211 comparison.
+
+## Simplified lowerings and training Winograd: September 24
+
+Merged [#213](https://github.com/kvark/meganeura/pull/213), `a63bb726`, removes
+duplicate hand-written elementwise/reduction paths, carries mixed-radix
+convolution indices between tile loads, and extends Winograd to training
+forward and input gradients. Weight gradients remain direct. Logical weights
+stay authoritative; transformed weights are execution scratch. Attention now
+handles more head widths and cached decode splits use the live KV range.
+The stateless paper workload does not measure that last improvement.
+
+The comparison uses the unchanged Inferena workloads with Meganeura
+`c475fd0e05f72929eca3bf994584805596b80b8c` and
+`a63bb726b48492283b71deb282083c6c07bf1577`. Both GPUs run serially with measured
+construction enabled, a 60-second soft session budget, five calls and two
+seconds of held-out warmup, and 20 samples. Convolution models receive two
+fresh processes per arm, in before/after then after/before order; Whisper
+receives one. These diagnostics do not enter the frozen cohort tables.
+Large-record analysis overlapped the first Intel diffusion calibration; the
+reverse-order pair ran without it. Both observations are retained below.
+
+Values are medians of the process medians, in milliseconds:
+
+| GPU / model | Inference before → after | Minimal forward before → after | Training before → after |
+|---|---:|---:|---:|
+| RTX 5070 / StableDiffusion | 1.761 → 1.734 | 1.716 → 1.693 | 7.123 → 6.535 |
+| RTX 5070 / ResNet-50 | 5.229 → 5.226 | 2.705 → 2.697 | 30.598 → 27.465 |
+| RTX 5070 / Whisper-tiny | 6.226 → 6.248 | 6.248 → 6.254 | 28.530 → 28.538 |
+| Arc B570 / StableDiffusion | 2.992 → 2.974 | 3.145 → 2.985 | 12.597 → 11.438 |
+| Arc B570 / ResNet-50 | 12.811 → 12.928 | 5.072 → 5.355 | 57.737 → 54.535 |
+| Arc B570 / Whisper-tiny | 13.875 → 13.839 | 13.824 → 13.837 | 95.480 → 95.039 |
+
+Convolution training improves 5.5–10.2%; ordinary inference stays within 1.6%.
+Intel ResNet minimal forward is an exception: 4.925 → 5.188 ms in the first
+pair and 5.218 → 5.521 ms in the second. Intel diffusion's earlier minimal
+forward varies with the selected two- versus eight-chunk plan, 3.308 versus
+2.981 ms. These are complete tuned-pipeline comparisons, not isolated kernel
+speedups or statistical confidence intervals.
+
+Preparation also falls for the convolution models. The clean Intel diffusion
+pair takes 181.439 → 133.946 seconds. Its old inference searches reach the
+60-second deadline with 62 trials; the new searches finish 64 trials in about
+37 seconds. These include search, compilation, initialization and qualification,
+not just shader compilation. Whisper preparation is essentially unchanged.
+
+Training uses more execution-plan storage: ResNet rises from 485 to 606 MB on
+both GPUs, and NVIDIA diffusion from 116 to 198 MB. Intel diffusion's selected
+plans span 116–160 MB before and 215–239 MB after. These are allocated plan
+bytes after aliasing, not comparative resident-VRAM peaks.
+
+All before/after sampled outputs and per-parameter gradient-norm comparisons
+agree to rounding scale. ResNet output samples are identical, with gradient-norm
+relative-L2 changes below 1.7e-9; Whisper samples and norms are identical.
+Both strict diffusion repetitions and Whisper pass comparison against the
+preserved independent PyTorch references described above. Intel diffusion uses
+the separate eager reference, not a substituted compiled timing. One new
+accelerated diffusion process per GPU also passes against those f32 references;
+output relative-L2 error is at most 4.9e-6 and gradient-norm vector error at most
+8.1e-7. This is a numerical cross-check, not an accelerated paired timing study.
+The construction gate still checks full tensors against each revision's
+ordinary plan. No AMD, Apple, Windows or full five-model campaign was run here.
+
+Sixteen focused checks per GPU pass on the merged revision: elementwise and
+reduction families, normalization, convolution tiles and split-K gradients,
+Winograd forward/backward, non-power-of-two attention, cached attention, and
+checkpoint state. One additional attention-training test fails on both GPUs
+with identical failures before and after #213. The reference checker resets
+the incoming error scale after RoPE, even when a zero-angle rotation leaves a
+cancelled gradient unchanged. Follow-up
+[#214](https://github.com/kvark/meganeura/pull/214) propagates that scale through
+the absolute rotation matrix. With this checker fix, attention training and
+all eight rotary checks pass on both GPUs. No shader or tolerance changes.
+
+The same follow-up uses egglog's let-binding printer for diagnostic expressions.
+Expanding shared residual nodes into trees produced roughly 650 MiB
+ResNet JSON records. This changes receipt formatting, not extracted graphs or
+candidate ordering. Four search tests, the new CPU rotation check, clippy, and
+Inferena's nine harness tests pass. These fixes merged as `2f018f9` and are in
+the new Inferena pin, but not the before/after timings above. NVIDIA oracle
+checks use the driver-lifetime
+preload described above; benchmark processes do not.
+The follow-up's CI also passes, including Linux host coverage and macOS tests.
+A final native ResNet check on B570 with the merged pin and normal 60-second
+budget completes all three phases, retaining 16 graph forms per phase and
+identical recorded outputs, loss and gradient norms. Its JSON is 5,729,552 bytes,
+versus 680,306,712 bytes for the earlier #213 record. Trial counts differ, so
+this is a receipt-size check, not a preparation-speed ablation. An earlier
+one-second smoke budget was too short to qualify training and produced no
+result; that diagnostic does not change the collection budget.
+
+### Forward tile-loader control
+
+The Intel single-image regression also appears with measured construction off.
+Both ordinary plans have 149 dispatches. Eight per-pass samples give GPU totals
+of 5.453 → 5.604 ms; most of the increase is in convolutions. These instrumented
+totals are not subtracted from the tuned wall times to infer barrier or CPU cost.
+
+Branch `experiment/pr213-conv-loader-control` preserves two controls based on
+`a63bb726`: `e0f9c4c` restores only the preceding forward-convolution loader;
+`938acc0` instead resets its mixed-radix index at each K tile and carries it
+only through that tile's loads. The latter is one moved declaration with the
+K-stage offset added. It avoids carrying index state through the multiply loop;
+there is no new model/device rule or tuning option.
+
+The staging-local version reduces timestamped convolution time on both GPUs.
+Intel single-image wall time is 5.736 → 5.369 ms in the timestamp-enabled
+control. An initial NVIDIA pair has variable wall times, 3.457 ms original
+versus 3.651 ms changed, despite lower convolution GPU time. A separate plain
+repeat brackets the changed process with two original processes: batch-four
+inference is 5.928 / 5.907 versus 5.561 ms, and single-image is 3.726 / 3.721
+versus 3.644 ms. Diffusion is essentially unchanged on both GPUs. All outputs,
+losses and gradient norms recorded by these controls are identical across the
+shader change. These untuned controls are not replacements for the table above
+or a clock-controlled register-pressure study.
+
+Follow-up [#215](https://github.com/kvark/meganeura/pull/215) contains this
+two-line shader diff. The existing tiled-convolution and Winograd-training
+oracle checks pass on both GPUs; shader-generation validation and clippy pass.
+This shader change is not in the `2f018f9` benchmark pin. Review it before
+launching another full cohort; the original #213 latency regression remains
+in that pin.
+
+Raw records and commands remain outside Git under
+`/var/tmp/meganeura-pr213.6TmK2x` on zork. No publication artifacts or collected
+cohort files were replaced.
 
 ## ROCm Whisper repeatability: separate qualification finding
 

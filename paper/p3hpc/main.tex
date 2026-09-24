@@ -214,6 +214,8 @@ schedule; an automatic alternative retains ordinary kernel probes, including
 cooperative paths where legal. Derivative products inherit the forward
 schedule subject to legality checks. Independent gradient schedules and
 cooperative tile dimensions are not yet searched this way.
+Some shape-based choices, including direct versus Winograd convolution,
+remain outside this search.
 
 Code generation uses a small set of reusable kernel families:
 pointwise expressions, reductions, general matrix multiplication (GEMM), convolutions and
@@ -264,7 +266,7 @@ us which one is wrong when they disagree. Repeating a result is weaker
 still: a deterministic indexing error repeats perfectly. We therefore
 separate three checks in \system{}'s development suite. This suite was
 added after the cohort reported below; it is not a retrospective certificate
-for those binaries.\footnote{\href{https://github.com/kvark/meganeura/tree/c475fd0e05f72929eca3bf994584805596b80b8c/src/reference}{Reference interpreter and checks at revision \code{c475fd0}}.}
+for those binaries.\footnote{\href{https://github.com/kvark/meganeura/tree/2f018f9722dd403f14c33e4361bbff60f3dc2083/src/reference}{Reference interpreter and checks at revision \code{2f018f9}}.}
 
 First, a simple CPU interpreter evaluates graph operators in 64-bit
 floating point, without sharing GPU lowering or shader code. Inputs are
