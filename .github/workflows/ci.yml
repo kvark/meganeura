@@ -153,6 +153,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Windows has no GPU runner; check goes straight to all features.
       - run: cargo check --lib --tests --all-features
+      # CPU-only source generation catches checkout line-ending and rewrite
+      # regressions without requiring a GPU-backed Windows runner.
+      - name: GEMV source-generation regression
+        run: cargo test --lib --all-features codegen::tests::packed_gemv_rmsnorm_keeps_the_decoder -- --exact
 
   msrv:
     name: Rust MSRV
