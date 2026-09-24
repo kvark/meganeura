@@ -241,7 +241,6 @@ fn packed_gradient(session: &crate::Session, name: &str) -> Option<Vec<f32>> {
         ParamTransform::VerticalConcat => {
             Some(grad[offset * width..(offset + extent) * width].to_vec())
         }
-        ParamTransform::Winograd3x3 { .. } => None,
     }
 }
 

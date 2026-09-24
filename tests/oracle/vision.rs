@@ -347,30 +347,119 @@ fn conv2d_winograd() {
     failures.assert_none();
 }
 
+/// The input gradient of a 3×3 stride-1 convolution is the convolution of
+/// the output gradient with the rotated, channel-transposed kernel at
+/// padding `2 - p`, so it takes the Winograd path too (`adjoint`).
+#[test]
+fn conv2d_winograd_grad_input() {
+    let cases = [
+        Conv::new(2, 64, (8, 8), 64, (3, 3), 1, (1, 1)),
+        // Padding 0: the adjoint pads by 2; odd extents, uneven channels.
+        Conv::new(3, 67, (7, 9), 63, (3, 3), 1, (0, 0)),
+        // Padding 2: the adjoint is unpadded.
+        Conv::new(1, 130, (5, 6), 32, (3, 3), 1, (2, 2)),
+    ];
+    let mut failures = Failures::default();
+    for (i, &c) in cases.iter().enumerate() {
+        let g = c.grad_input_graph();
+        let mut feeds = Feeds::new();
+        feeds.fill_random(&g, 220 + i as u64, 1.0);
+        let mut options = gpu::Options::default();
+        options.optimize.no_winograd = false;
+        inference(
+            &mut failures,
+            &format!("winograd grad input {c:?}"),
+            &g,
+            &feeds,
+            &options,
+            &[
+                ShaderEntry::WinogradWeightTransform,
+                ShaderEntry::WinogradBatchedMatMul,
+            ],
+        );
+    }
+    failures.assert_none();
+}
+
+/// Training rewrites the forward convolution and its input gradient; the
+/// weight gradient stays a direct GEMM.
+#[test]
+fn conv2d_winograd_training() {
+    let mut failures = Failures::default();
+    for (i, c) in [
+        Conv::new(2, 64, (6, 7), 65, (3, 3), 1, (1, 1)),
+        Conv::new(1, 70, (5, 5), 60, (3, 3), 1, (0, 0)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut g = Graph::new();
+        let x = g.parameter("x", &[c.x_len()]);
+        let w = g.parameter("w", &[c.w_len()]);
+        let y = c.conv(&mut g, x, w);
+        let loss = gradients::weighted_loss(&mut g, y, 1250 + i as u64, 0.7);
+        g.set_outputs(vec![loss]);
+        let mut feeds = Feeds::new();
+        feeds.fill_random(&g, 1260 + i as u64, 1.0);
+        let mut options = gpu::Options::default();
+        options.optimize.no_winograd = false;
+        let shaders = dispatched(&g, Mode::Training, &options);
+        let transforms = shaders
+            .iter()
+            .filter(|&s| *s == ShaderEntry::WinogradWeightTransform)
+            .count();
+        if transforms != 2 {
+            failures.0.push(format!(
+                "{c:?}: expected Winograd forward and input gradient, plan has {shaders:?}"
+            ));
+        }
+        let report = gpu::check_training(&g, &feeds, &options).unwrap();
+        failures.report(&format!("{c:?} winograd training"), &report);
+    }
+    failures.assert_none();
+}
+
 /// The reference defines `WinogradConv2d` as the 3×3 convolution with its
-/// original weight; evaluate the rewritten graph against the source graph.
+/// kernel, and the adjoint form as the input gradient of that kernel;
+/// evaluate each rewritten graph against its source graph.
 #[test]
 fn winograd_reference_matches_conv2d() {
+    let rewrite = |g: &Graph| {
+        let mut rewritten = g.deep_clone();
+        let mut fusions = Vec::new();
+        meganeura::optimize::apply_winograd_conv_fusions(
+            &mut rewritten,
+            &mut fusions,
+            &meganeura::OptimizeConfig::default(),
+        );
+        assert_eq!(fusions.len(), 1, "the conv was not rewritten");
+        rewritten
+    };
     let c = Conv::new(2, 64, (5, 7), 65, (3, 3), 1, (1, 1));
     let g = c.forward_graph();
-    let mut rewritten = g.deep_clone();
-    let mut fusions = Vec::new();
-    meganeura::optimize::apply_winograd_conv_fusions(
-        &mut rewritten,
-        &mut fusions,
-        &meganeura::OptimizeConfig::default(),
-    );
-    assert_eq!(fusions.len(), 1, "the conv was not rewritten");
-    // The transformed weight is appended after the conv that reads it.
-    let rewritten = rewritten.toposort();
     let mut feeds = Feeds::new();
     feeds.fill_random(&g, 3, 1.0);
-    // The transformed weight's value is derived; any value of the right
-    // length must give the same result.
-    feeds.fill_random(&rewritten, 4, 1.0);
     let want = meganeura::reference::evaluate_outputs(&g, &feeds).unwrap();
-    let got = meganeura::reference::evaluate_outputs(&rewritten, &feeds).unwrap();
+    let got = meganeura::reference::evaluate_outputs(&rewrite(&g), &feeds).unwrap();
     assert_eq!(want, got);
+    // The adjoint sums the same products in another order.
+    for p in 0..3 {
+        let c = Conv::new(2, 65, (5, 7), 64, (3, 3), 1, (p, p));
+        let g = c.grad_input_graph();
+        let mut feeds = Feeds::new();
+        feeds.fill_random(&g, 4 + u64::from(p), 1.0);
+        let want = meganeura::reference::evaluate_outputs(&g, &feeds).unwrap();
+        let got = meganeura::reference::evaluate_outputs(&rewrite(&g), &feeds).unwrap();
+        for (want, got) in want.iter().zip(&got) {
+            assert_eq!(want.data.len(), got.data.len());
+            for (a, b) in want.data.iter().zip(&got.data) {
+                assert!(
+                    (a - b).abs() <= 1e-12 * (1.0 + a.abs()),
+                    "padding {p}: {a} vs {b}"
+                );
+            }
+        }
+    }
 }
 
 /// `Conv2dDw` has one kernel: 16×16 output tiles per (batch, channel)

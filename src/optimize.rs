@@ -1619,10 +1619,15 @@ pub fn apply_group_norm_silu_fusions(graph: &mut Graph, fusions: &mut Vec<(Strin
     }
 }
 
-/// Rewrite Conv2d(3×3, stride=1) → WinogradConv2d with pre-transformed weights.
+/// Rewrite 3×3 stride-1 convolutions, and their input gradients, to
+/// Winograd F(2,3).
 ///
-/// For each matching Conv2d node, creates a derived parameter for the Winograd-transformed
-/// weights and rewrites the node to WinogradConv2d.
+/// The input gradient of such a convolution with padding `p ≤ 2` is itself
+/// a 3×3 stride-1 convolution of the output gradient, with the kernel
+/// flipped and its channels transposed, at padding `2 - p`
+/// (`WinogradConv2d { adjoint: true }`). Weight gradients stay direct.
+///
+/// Run on the final graph: autodiff differentiates the direct convolution.
 pub fn apply_winograd_conv_fusions(
     graph: &mut Graph,
     fusions: &mut Vec<(String, u32)>,
@@ -1632,105 +1637,68 @@ pub fn apply_winograd_conv_fusions(
         log::info!("Winograd convolution disabled by OptimizeConfig::no_winograd");
         return;
     }
-    let mut transformed = HashMap::new();
-    let node_ids: Vec<usize> = (0..graph.nodes().len()).collect();
-    for &id in &node_ids {
+    for id in 0..graph.nodes().len() {
         let node = &graph.nodes()[id];
-        let (in_channels, in_h, in_w, out_channels, kernel_h, kernel_w, stride, padding) =
-            match node.op {
-                Op::Conv2d {
+        let (rewrite, name) = match node.op {
+            Op::Conv2d {
+                in_channels,
+                in_h,
+                in_w,
+                out_channels,
+                kernel_h: 3,
+                kernel_w: 3,
+                stride: 1,
+                padding_h,
+                padding_w,
+            } if padding_h == padding_w => (
+                Op::WinogradConv2d {
                     in_channels,
                     in_h,
                     in_w,
                     out_channels,
-                    kernel_h,
-                    kernel_w,
-                    stride,
-                    padding_h,
-                    padding_w,
-                    ..
-                } => {
-                    // Winograd F(2,3) is a 3×3 stride-1 specialization. Only
-                    // applies when padding_h == padding_w (symmetric).
-                    if padding_h != padding_w {
-                        continue;
-                    }
-                    (
-                        in_channels,
-                        in_h,
-                        in_w,
-                        out_channels,
-                        kernel_h,
-                        kernel_w,
-                        stride,
-                        padding_h,
-                    )
-                }
-                _ => continue,
-            };
-        // Only match 3×3 stride-1 convolutions with enough channels to
-        // amortize transform overhead (input/output transforms are O(tiles)
-        // while matmul savings are O(tiles × Ci)).
-        if kernel_h != 3 || kernel_w != 3 || stride != 1 {
-            continue;
-        }
-        if (in_channels * out_channels) < 4096 {
-            continue; // too small, GEMM is faster
-        }
-
-        let weight_id = node.inputs[1];
-        let requires_full_precision = node.requires_full_precision;
-        let weight_name = match graph.node(weight_id).op {
-            Op::Parameter { ref name } => name.clone(),
+                    padding: padding_h,
+                    adjoint: false,
+                },
+                "Conv2d(3x3)→WinogradConv2d",
+            ),
+            Op::Conv2dGradInput {
+                in_channels,
+                in_h,
+                in_w,
+                out_channels,
+                kernel_h: 3,
+                kernel_w: 3,
+                stride: 1,
+                padding_h,
+                padding_w,
+            } if padding_h == padding_w && padding_h <= 2 => (
+                Op::WinogradConv2d {
+                    in_channels: out_channels,
+                    in_h: in_h + 2 * padding_h - 2,
+                    in_w: in_w + 2 * padding_h - 2,
+                    out_channels: in_channels,
+                    padding: 2 - padding_h,
+                    adjoint: true,
+                },
+                "Conv2dGradInput(3x3)→WinogradConv2d",
+            ),
             _ => continue,
         };
-        let input_id = node.inputs[0];
-
-        let key = (weight_id, in_channels, out_channels);
-        let wino_param = if let Some(&parameter) = transformed.get(&key) {
-            graph.nodes_mut()[parameter as usize].requires_full_precision |=
-                requires_full_precision;
-            parameter
-        } else {
-            // One transform per logical weight and channel layout.
-            let wino_name = format!("{}:winograd", weight_name);
-
-            // Record derivation so runtime can fill this from original weights
-            graph.derived_params.push(crate::graph::DerivedParam {
-                name: wino_name.clone(),
-                sources: vec![(weight_name, (out_channels * in_channels * 9) as usize)],
-                rows: 1, // not used for Winograd
-                transform: crate::graph::ParamTransform::Winograd3x3 {
-                    out_channels: out_channels as usize,
-                    in_channels: in_channels as usize,
-                },
-            });
-
-            // Create new parameter node for Winograd-transformed weights [16 * Co * Ci]
-            let wino_size = 16 * out_channels as usize * in_channels as usize;
-            let parameter = graph.add_raw_node_with_precision(
-                Op::Parameter { name: wino_name },
-                vec![],
-                TensorType::f32(vec![wino_size]),
-                requires_full_precision,
-            );
-
-            transformed.insert(key, parameter);
-            parameter
-        };
-
-        // Rewrite Conv2d → WinogradConv2d
-        // Keep original weight as 3rd input for backward pass (grad_input/grad_weight)
-        graph.nodes_mut()[id].op = Op::WinogradConv2d {
+        // Input/output transforms are O(tiles) while the matmul savings are
+        // O(tiles × channels): small channel counts stay on the direct GEMM.
+        let Op::WinogradConv2d {
             in_channels,
-            in_h,
-            in_w,
             out_channels,
-            padding,
+            ..
+        } = rewrite
+        else {
+            unreachable!()
         };
-        graph.nodes_mut()[id].inputs = vec![input_id, wino_param, weight_id];
-
-        fusions.push(("Conv2d(3x3)→WinogradConv2d".to_string(), id as u32));
+        if in_channels * out_channels < 4096 {
+            continue;
+        }
+        graph.nodes_mut()[id].op = rewrite;
+        fusions.push((name.to_string(), id as u32));
     }
 }
 

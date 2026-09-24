@@ -397,13 +397,7 @@ fn prepare_graph(
             let mut fusions = Vec::new();
             optimize::apply_group_norm_silu_fusions(&mut g, &mut fusions);
             optimize::apply_winograd_conv_fusions(&mut g, &mut fusions, &optimize);
-            for (name, count) in fusions.iter().fold(
-                std::collections::BTreeMap::<&str, usize>::new(),
-                |mut acc, entry| {
-                    *acc.entry(entry.0.as_str()).or_default() += 1;
-                    acc
-                },
-            ) {
+            for (name, count) in fusion_counts(&fusions) {
                 log::info!("inference fusion: {}x {}", count, name);
             }
             (g, forward_report)
@@ -423,14 +417,28 @@ fn prepare_graph(
                 "full graph (forward + backward): {} nodes",
                 full.nodes().len()
             );
-            if skip_full_optimize {
+            let (mut g, report) = if skip_full_optimize {
                 (full, forward_report)
             } else {
                 let _span = tracing::info_span!("optimize_full").entered();
                 optimize::optimize_owned_with_config(full, optimize)
+            };
+            let mut fusions = Vec::new();
+            optimize::apply_winograd_conv_fusions(&mut g, &mut fusions, &optimize);
+            for (name, count) in fusion_counts(&fusions) {
+                log::info!("training fusion: {}x {}", count, name);
             }
+            (g, report)
         }
     }
+}
+
+fn fusion_counts(fusions: &[(String, u32)]) -> std::collections::BTreeMap<&str, usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    for fusion in fusions {
+        *counts.entry(fusion.0.as_str()).or_default() += 1;
+    }
+    counts
 }
 
 fn make_session(

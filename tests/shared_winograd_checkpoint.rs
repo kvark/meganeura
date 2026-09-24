@@ -13,17 +13,24 @@ fn graph() -> Graph {
 }
 
 #[test]
-fn tied_convolutions_share_one_derived_weight() {
+fn tied_convolutions_read_the_logical_weight() {
     let mut g = graph();
     optimize::apply_winograd_conv_fusions(&mut g, &mut Vec::new(), &Default::default());
-    assert_eq!(g.derived_params.len(), 1);
+    // The transformed kernel is scratch derived on every pass, not a parameter.
+    assert!(g.derived_params.is_empty());
+    let kernel = g
+        .nodes()
+        .iter()
+        .find(|n| matches!(n.op, meganeura::graph::Op::Parameter { .. }))
+        .unwrap()
+        .id;
     let nodes: Vec<_> = g
         .nodes()
         .iter()
         .filter(|n| matches!(n.op, meganeura::graph::Op::WinogradConv2d { .. }))
         .collect();
     assert_eq!(nodes.len(), 2);
-    assert_eq!(nodes[0].inputs[1], nodes[1].inputs[1]);
+    assert!(nodes.iter().all(|n| n.inputs[1] == kernel));
 }
 
 #[test]
