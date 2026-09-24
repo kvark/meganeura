@@ -4965,6 +4965,7 @@ impl<'a> Compiler<'a> {
                 in_w,
                 out_channels,
                 padding,
+                adjoint,
             } => {
                 let out_h = in_h + 2 * padding - 2; // 3x3 stride 1
                 let out_w = in_w + 2 * padding - 2;
@@ -4976,22 +4977,22 @@ impl<'a> Compiler<'a> {
                 // Temp buffers
                 let input_xform_size = (16 * in_channels * total_tiles * 4) as usize;
                 let mm_out_size = (16 * out_channels * total_tiles * 4) as usize;
+                let weight_xform =
+                    self.alloc_buffer((16 * out_channels * in_channels * 4) as usize);
                 let input_xform_buf = self.alloc_buffer(input_xform_size);
                 let mm_out_buf = self.alloc_buffer(mm_out_size);
 
                 let input = self.get_buffer(node.inputs[0]);
-                let weight_xform = self.get_buffer(node.inputs[1]); // Winograd-transformed weights [16*Co*Ci]
-                // input[2] is the original weight [Co*Ci*9] (for backward, and for re-transform)
-                let original_weight = self.get_buffer(node.inputs[2]);
+                let weight = self.get_buffer(node.inputs[1]);
 
-                // Dispatch 0: Weight transform (re-transform every step for training)
+                // Dispatch 0: transform the current weights, [Co·Ci·9] → [16, Co, Ci].
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::WinogradWeightTransform,
-                    workgroups: [out_channels * in_channels.div_ceil(256), 1, 1],
-                    input_buffers: vec![original_weight],
+                    workgroups: [(out_channels * in_channels).div_ceil(256), 1, 1],
+                    input_buffers: vec![weight],
                     output_buffer: weight_xform,
                     extra_outputs: vec![],
-                    params: vec![out_channels, in_channels, 0, 0, 0, 0, 0, 0],
+                    params: vec![out_channels, in_channels, u32::from(adjoint), 0, 0, 0, 0, 0],
 
                     ..Default::default()
                 });

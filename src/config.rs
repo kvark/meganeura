@@ -157,7 +157,7 @@ registry! {
     SERIAL_DISPATCH: "MEGANEURA_SERIAL_DISPATCH", Bool, Diagnostic,
         "One compute pass per dispatch — guarantees serial execution for bisection.";
     NO_WINOGRAD: "MEGANEURA_NO_WINOGRAD", Bool, Diagnostic,
-        "Skip the Conv2d-to-Winograd rewrite; the selection heuristic weighs channel counts only, so this measures which side of it a workload belongs on.";
+        "Skip the Winograd rewrite of 3×3 stride-1 convolutions and their input gradients; the selection heuristic weighs channel counts only, so this measures which side of it a workload belongs on.";
     PIN_BUFS: "MEGANEURA_PIN_BUFS", Text, Diagnostic,
         "Force-pin logical buffers by id/range (e.g. \"3,17,25-40\") to bisect aliasing bugs.";
     DUMP_PLAN: "MEGANEURA_DUMP_PLAN", Bool, Diagnostic,

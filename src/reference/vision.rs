@@ -249,6 +249,7 @@ fn conv_window(node: &Node) -> Result<Window, Error> {
             in_w,
             out_channels,
             padding,
+            ..
         } => Window::new(
             node,
             in_channels,
@@ -477,22 +478,31 @@ pub(super) fn eval(node: &Node, ins: &[&Tensor]) -> Result<Vec<f64>, Error> {
         Op::Conv2d { .. } | Op::Conv2dDw { .. } => {
             convolve(node, conv_window(node)?, arg(0)?, arg(1)?)?
         }
-        // Inputs are `[input, winograd_weight, original_weight]`. The
-        // transformed weight is derived from the original one (see
-        // `optimize::apply_winograd_conv_fusions`), so the original weight
-        // alone defines the result.
+        // Inputs are `[input, kernel]`; F(2,3) is an evaluation strategy.
+        // The adjoint form reads the kernel rotated and channel-transposed.
         Op::WinogradConv2d {
             in_channels,
             out_channels,
+            adjoint,
             ..
         } => {
-            let original = ins.get(2).copied().ok_or_else(|| Error::Unsupported {
-                node: node.id,
-                reason: "WinogradConv2d without its original 3×3 weight".to_string(),
-            })?;
-            let transformed = 16 * in_channels as usize * out_channels as usize;
-            expect_len(node, "Winograd weight", arg(1)?, transformed)?;
-            convolve(node, conv_window(node)?, arg(0)?, original)?
+            let (x, w) = (arg(0)?, arg(1)?);
+            if adjoint {
+                let (ci, co) = (in_channels as usize, out_channels as usize);
+                expect_len(node, "kernel", w, 9 * ci * co)?;
+                let mut rotated = vec![0.0; w.len()];
+                for o in 0..co {
+                    for i in 0..ci {
+                        for tap in 0..9 {
+                            rotated[(o * ci + i) * 9 + tap] = w.data[(i * co + o) * 9 + 8 - tap];
+                        }
+                    }
+                }
+                let rotated = Tensor::new(vec![rotated.len()], rotated);
+                convolve(node, conv_window(node)?, x, &rotated)?
+            } else {
+                convolve(node, conv_window(node)?, x, w)?
+            }
         }
         // The adjoint of Conv2d in its input: inputs `[dy, kernel]`.
         Op::Conv2dGradInput { .. } => {
