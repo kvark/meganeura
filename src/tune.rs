@@ -1329,11 +1329,7 @@ mod tests {
             .iter()
             .find(|d| d.shader == ShaderEntry::MatMulGemv && d.gemv_rmsnorm.is_some())
             .expect("packed GEMV did not absorb the RmsNorm");
-        assert!(
-            plan.dispatches
-                .iter()
-                .all(|d| d.shader != ShaderEntry::RmsNorm)
-        );
+        assert!(plan.dispatches.iter().all(|d| d.reduction().is_none()));
         let mut class =
             TuneClass::from_dispatch(dispatch, None).expect("fused packed Q4_0 GEMV is tunable");
         assert!(class.gemv_rmsnorm);

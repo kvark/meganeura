@@ -213,7 +213,7 @@ fn large_scatter_add_with_repeated_indices() {
 }
 
 /// Softplus keeps relative accuracy far into its negative tail, forward and
-/// backward, for several `beta`, in both lowerings. The tolerance has no
+/// backward, for several `beta`, fused and unfused. The tolerance has no
 /// floor, so a tail value that is merely small next to others still counts.
 #[test]
 fn softplus_tail_keeps_relative_accuracy() {
@@ -229,7 +229,7 @@ fn softplus_tail_keeps_relative_accuracy() {
         ..Default::default()
     };
     for beta in [0.25f32, 1.0, 10.0] {
-        for schedule in [false, true] {
+        for fused in [false, true] {
             let input: Vec<f32> = scaled.iter().map(|x| x / beta).collect();
             let mut g = Graph::new();
             let x = g.parameter("x", &[input.len()]);
@@ -239,10 +239,10 @@ fn softplus_tail_keeps_relative_accuracy() {
             let mut feeds = Feeds::new();
             feeds.set("x", &input);
             let mut options = strict.clone();
-            options.compile.use_schedule_pointwise = schedule;
+            options.compile.fuse_dispatches = fused;
             gpu::check_training(&g, &feeds, &options)
                 .unwrap()
-                .assert_passed(&format!("beta {beta} schedule {schedule}"));
+                .assert_passed(&format!("beta {beta} fused {fused}"));
         }
     }
 

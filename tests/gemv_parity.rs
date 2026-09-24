@@ -3,7 +3,7 @@
 //! GLU, and a quantized weight with a folded RmsNorm. The default f32 GEMV
 //! at decode shapes is checked against the f64 reference by `oracle`.
 
-use meganeura::{Graph, compile};
+use meganeura::Graph;
 
 /// Reference CPU matmul for [1,K] × [K,N] → [1,N].
 fn cpu_gemv(a: &[f32], b: &[f32], k: usize, n: usize) -> Vec<f32> {
@@ -84,7 +84,7 @@ fn q40_rmsnorm_folds_into_gemv() {
             .plan()
             .dispatches
             .iter()
-            .all(|d| d.shader != compile::ShaderEntry::RmsNorm)
+            .all(|d| d.reduction().is_none())
     );
     session.set_input("x", &x);
     session.set_parameter("nw", &nw);
