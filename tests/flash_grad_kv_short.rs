@@ -15,17 +15,6 @@ fn run(
     window: u32,
     cooperative: bool,
 ) -> ([Vec<f32>; 3], bool) {
-    unsafe {
-        std::env::set_var(
-            "MEGANEURA_FLASH_FWD_COOP",
-            if cooperative { "1" } else { "0" },
-        );
-        std::env::set_var(
-            "MEGANEURA_FLASH_BWD_COOP",
-            if cooperative { "1" } else { "0" },
-        );
-    }
-
     let (num_heads, num_kv_heads, head_dim) = (3, 1, 64);
     let mut graph = Graph::new();
     let q = graph.parameter("q", &[q_seq, num_heads as usize * head_dim as usize]);
@@ -39,14 +28,14 @@ fn run(
     let loss = graph.mean_all(attention);
     graph.set_outputs(vec![loss]);
 
-    let (mut session, _) = build(
-        &graph,
-        SessionConfig {
-            mode: Mode::Training,
-            gpu: Some(gpu),
-            ..SessionConfig::from_env()
-        },
-    );
+    let mut config = SessionConfig {
+        mode: Mode::Training,
+        gpu: Some(gpu),
+        ..SessionConfig::from_env()
+    };
+    config.options.flash_forward_coop = cooperative;
+    config.options.flash_backward_coop = cooperative;
+    let (mut session, _) = build(&graph, config);
     let uses_coop = session
         .plan()
         .dispatches

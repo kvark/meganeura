@@ -96,15 +96,18 @@ weights have no reference yet: the interpreter reports them as unsupported.
 ## Suite layout
 
 `smoke`, `regression` and `oracle` compile their modules into three
-executables (`oracle` from `tests/oracle/`). Four environment-mutating test
-targets remain process-isolated, for seven integration executables. Add a
-case to an existing module, or register a module in one of these suites;
+executables (`oracle` from `tests/oracle/`). `gguf_model` is a fourth,
+behind the `gguf` feature. Add a case to an existing module;
 `autotests = false` deliberately stops new files becoming new link jobs.
-The repository defaults `RUST_TEST_THREADS` to 1 for its shared GPU; an explicit
-environment setting or `--test-threads` still overrides that default.
 For example, the old `--test checkpoint_validation` selection becomes
 `--test smoke checkpoint_validation::`. `--test tune` becomes
 `--test regression tune::`.
+
+Tests set `SessionConfig` fields and do not write environment variables.
+The repository defaults `RUST_TEST_THREADS` to 1 for a shared workstation
+GPU; an explicit environment setting or `--test-threads` still overrides
+that default. CI passes `--test-threads=4`: most of a test is graph setup
+and queue waits, and a hosted runner keeps four sessions in flight.
 
 ## Track coverage before pruning
 

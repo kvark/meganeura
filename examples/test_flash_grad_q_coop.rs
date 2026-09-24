@@ -4,7 +4,13 @@
 
 use meganeura::Graph;
 
-fn build_and_run(seq: usize, num_heads: u32, head_dim: u32, causal: bool) -> Vec<f32> {
+fn build_and_run(
+    seq: usize,
+    num_heads: u32,
+    head_dim: u32,
+    causal: bool,
+    backward_coop: bool,
+) -> Vec<f32> {
     let d = (num_heads * head_dim) as usize;
     let mut g = Graph::new();
     let q = g.parameter("q_param", &[seq, d]);
@@ -19,7 +25,11 @@ fn build_and_run(seq: usize, num_heads: u32, head_dim: u32, causal: bool) -> Vec
     g.set_outputs(vec![loss]);
 
     // build_session differentiates internally (training session).
-    let mut sess = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
+    // Scalar forward in both runs, so the comparison is only the backward kernel.
+    let mut config = meganeura::SessionConfig::from_env();
+    config.options.flash_forward_coop = false;
+    config.options.flash_backward_coop = backward_coop;
+    let mut sess = meganeura::build(&g, config).0;
 
     let total = seq * d;
     let qd: Vec<f32> = (0..total).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
@@ -51,23 +61,11 @@ fn main() {
     for (label, seq, heads, hd, causal) in cases {
         eprintln!("\n=== {label} ===");
 
-        // Force scalar FORWARD in both runs so the only difference is
-        // the backward kernel — otherwise a coop-capable session from
-        // an earlier iteration leaves coop forward on, and the test
-        // compares (scalar+scalar) vs (coop+coop) which conflates
-        // forward and backward errors.
-        unsafe {
-            std::env::set_var("MEGANEURA_FLASH_FWD_COOP", "0");
-            std::env::set_var("MEGANEURA_FLASH_BWD_COOP", "0");
-        }
         eprintln!("  scalar:");
-        let scalar = build_and_run(seq, heads, hd, causal);
+        let scalar = build_and_run(seq, heads, hd, causal, false);
 
-        unsafe {
-            std::env::set_var("MEGANEURA_FLASH_BWD_COOP", "1");
-        }
         eprintln!("  coop:");
-        let coop = build_and_run(seq, heads, hd, causal);
+        let coop = build_and_run(seq, heads, hd, causal, true);
 
         assert_eq!(scalar.len(), coop.len(), "{label}: shape mismatch");
         let mut max_abs = 0f32;

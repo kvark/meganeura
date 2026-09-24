@@ -20,7 +20,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Instant,
 };
 #[cfg(feature = "profiler")]
@@ -65,21 +65,18 @@ impl ProfilerInner {
 
 /// The profiler state: armed once — by `init` or the first GPU-context
 /// initialization — and thereafter only read. The event buffer inside is
-/// a `Mutex`, so post-arming sharing is lock-sharing as usual and the
-/// static is never rewritten.
+/// a `Mutex`, so post-arming sharing is lock-sharing as usual.
+/// `OnceLock` makes the first arm safe when several sessions start at once.
 ///
 /// [`arm`]: arm
-static mut PROFILER: Option<Arc<Mutex<ProfilerInner>>> = None;
+static PROFILER: OnceLock<Arc<Mutex<ProfilerInner>>> = OnceLock::new();
 
 /// The profiler state, when it is armed. Everything that records or dumps
 /// runs after `init`, or after a GPU context existed to have armed it —
 /// so regular paths read through [`profiler`], and only
 /// `now_ns`/`event_count`/GPU-timestamp recording keep a soft option.
 fn armed() -> Option<&'static Arc<Mutex<ProfilerInner>>> {
-    // SAFETY: the static is written only by [`arm`], which runs before any
-    // recording or dumping (from `init` and from context initialization),
-    // and then never rewritten.
-    unsafe { (&raw const PROFILER).as_ref().and_then(|st| st.as_ref()) }
+    PROFILER.get()
 }
 
 /// Arm the in-process event buffer without installing a tracing
@@ -87,18 +84,14 @@ fn armed() -> Option<&'static Arc<Mutex<ProfilerInner>>> {
 ///
 /// Called by GPU-context initialization and by `init`; after that,
 /// GPU-timestamp recording and trace dumping never see an unarmed state.
+/// Concurrent callers arm one shared buffer.
 pub fn arm() {
-    // SAFETY: arming happens before any recording; gated on being unarmed
-    // so it runs once per process, and `init` races nothing — its callers
-    // run before GPU work starts.
-    if armed().is_none() {
-        unsafe {
-            PROFILER = Some(Arc::new(Mutex::new(ProfilerInner {
-                epoch: Instant::now(),
-                events: Vec::with_capacity(8192),
-            })));
-        }
-    }
+    PROFILER.get_or_init(|| {
+        Arc::new(Mutex::new(ProfilerInner {
+            epoch: Instant::now(),
+            events: Vec::with_capacity(8192),
+        }))
+    });
 }
 
 /// The armed profiler; panics when used before [`arm`].
