@@ -160,6 +160,8 @@ registry! {
         "Skip the Winograd rewrite of 3×3 stride-1 convolutions and their input gradients; the selection heuristic weighs channel counts only, so this measures which side of it a workload belongs on.";
     PIN_BUFS: "MEGANEURA_PIN_BUFS", Text, Diagnostic,
         "Force-pin logical buffers by id/range (e.g. \"3,17,25-40\") to bisect aliasing bugs.";
+    ARENA_CHUNK_BYTES: "MEGANEURA_ARENA_CHUNK_BYTES", U32, Diagnostic,
+        "Largest parameter-arena chunk in bytes; smaller values spread the optimizer over more dispatches.";
     DUMP_PLAN: "MEGANEURA_DUMP_PLAN", Bool, Diagnostic,
         "Dump dispatch order, provenance, accesses, and the alias map at session build.";
     DUMP_WGSL: "MEGANEURA_DUMP_WGSL", Text, Diagnostic,
@@ -352,6 +354,7 @@ impl SessionOptions {
             serial_dispatch: SERIAL_DISPATCH.bool_or(false),
             dump_plan: DUMP_PLAN.bool_or(false),
             pin_buffers: PIN_BUFS.text(),
+            arena_chunk_bytes: ARENA_CHUNK_BYTES.u32_value().map(|bytes| bytes as usize),
             // Reuse one staging buffer over restaging per set_parameter call.
             reuse_upload_staging: REUSE_UPLOAD.bool_or(false),
             device_parameters: match DEVICE_PARAMETERS.text().as_deref() {

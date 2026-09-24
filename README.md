@@ -166,6 +166,7 @@ an uninitialized model. See [compiler search](docs/compiler-search.md).
 | `MEGANEURA_SERIAL_DISPATCH` | One compute pass per dispatch — serial execution for bisection. |
 | `MEGANEURA_NO_WINOGRAD` | Skip the Winograd rewrite of 3×3 stride-1 convolutions and their input gradients; its selection heuristic weighs channel counts only, so this measures which side of it a workload belongs on. |
 | `MEGANEURA_PIN_BUFS=3,25-40` | Force-pin logical buffers to bisect aliasing corruption. |
+| `MEGANEURA_ARENA_CHUNK_BYTES` | Largest parameter-arena chunk in bytes; smaller values spread the optimizer over more dispatches. |
 | `MEGANEURA_DUMP_PLAN` | Dump dispatch order, provenance, and the alias map at build. |
 | `MEGANEURA_DUMP_WGSL=<dir>` | Write every generated shader into `<dir>`. |
 | `MEGANEURA_OPTIMIZER` | Rewrite mode: `off` \| `egglog-windowed` \| `egglog-outlined` (default) \| `egglog-whole`. Legacy `greedy` maps to outlined egglog. |

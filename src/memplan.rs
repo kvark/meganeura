@@ -17,6 +17,11 @@
 //! padding garbage can only land in the discarded output padding.
 //! Re-check this reasoning if a kernel ever gains unguarded reads.
 //!
+//! Trainable parameters and their gradients are pinned too, but packed into
+//! arenas (see [`ArenaChunk`]) so the optimizer updates many parameters per
+//! dispatch. A logical buffer is therefore a byte range of its physical
+//! allocation, at [`AliasPlan::offsets`].
+//!
 //! Memory placement is a second bit, not the same as pinning. Pinned
 //! user-facing slots (params, inputs, constants, outputs, loss) stay
 //! `Memory::Shared`. Parameter-gradient buffers are pinned so the
@@ -28,10 +33,34 @@
 use crate::compile::{BufferRef, ExecutionPlan, ShaderEntry};
 use std::{collections::HashMap, ops::Range};
 
+/// Storage buffers may be bound at offsets that are multiples of this
+/// (the largest `minStorageBufferOffsetAlignment` Vulkan permits).
+pub const ARENA_ALIGNMENT: usize = 256;
+
+/// Largest arena chunk: the smallest `maxStorageBufferRange` Vulkan
+/// guarantees, since a buffer bound at an offset sees the rest of it.
+pub const ARENA_CHUNK_BYTES: usize = 128 << 20;
+
+/// Trainable parameters, and separately their gradients, packed back to back
+/// at the same offsets, so one optimizer dispatch covers the whole chunk.
+#[derive(Clone, Debug)]
+pub struct ArenaChunk {
+    /// Physical allocation holding the parameters.
+    pub params: usize,
+    /// Physical allocation holding the gradients.
+    pub grads: usize,
+    /// Bytes spanned by the chunk's slots.
+    pub bytes: usize,
+    /// `(index into param_grad_pairs, byte offset)` of each slot.
+    pub slots: Vec<(usize, usize)>,
+}
+
 /// Mapping from the plan's logical buffers onto physical allocations.
 pub struct AliasPlan {
     /// Physical allocation index for each logical buffer.
     pub map: Vec<usize>,
+    /// Byte offset of each logical buffer within its physical allocation.
+    pub offsets: Vec<usize>,
     /// Size in bytes of each physical allocation (max over its tenants).
     pub sizes: Vec<usize>,
     /// Per physical allocation: every tenant is a step-local
@@ -40,6 +69,8 @@ pub struct AliasPlan {
     /// Pinned buffers — anything uploaded, read back, or externally
     /// bindable — must stay host-visible.
     pub device_local: Vec<bool>,
+    /// Arenas of trainable parameters and gradients.
+    pub arena: Vec<ArenaChunk>,
 }
 
 impl AliasPlan {
@@ -48,8 +79,120 @@ impl AliasPlan {
     pub fn identity(buffer_sizes: &[usize]) -> Self {
         Self {
             map: (0..buffer_sizes.len()).collect(),
+            offsets: vec![0; buffer_sizes.len()],
             sizes: buffer_sizes.to_vec(),
             device_local: vec![false; buffer_sizes.len()],
+            arena: Vec::new(),
+        }
+    }
+
+    /// Whether logical buffers `a` and `b` occupy overlapping bytes of one
+    /// allocation, given the plan's logical sizes.
+    pub fn overlap(&self, sizes: &[usize], a: usize, b: usize) -> bool {
+        self.map[a] == self.map[b]
+            && self.offsets[a] < self.offsets[b] + sizes[b].max(1)
+            && self.offsets[b] < self.offsets[a] + sizes[a].max(1)
+    }
+
+    /// Move the eligible trainable parameters and their gradients out of
+    /// their dedicated allocations into arena chunks of at most
+    /// `chunk_bytes` (a larger pair gets a chunk of its own).
+    ///
+    /// A pair is eligible when its parameter is stored as `f32` (the only
+    /// storage the optimizer updates) and neither buffer has another role
+    /// that needs a whole allocation of its own: an input, a constant, or a
+    /// buffer of another pair.
+    pub fn pack_arena(&mut self, plan: &ExecutionPlan, chunk_bytes: usize) {
+        let mut roles = vec![0u32; plan.buffers.len()];
+        for &(p, g) in &plan.param_grad_pairs {
+            roles[p.0 as usize] += 1;
+            roles[g.0 as usize] += 1;
+        }
+        for &(_, b) in &plan.input_buffers {
+            roles[b.0 as usize] += 2;
+        }
+        for &(b, _) in &plan.constant_buffers {
+            roles[b.0 as usize] += 2;
+        }
+        let eligible = |&(p, g): &(BufferRef, BufferRef)| {
+            p != g
+                && roles[p.0 as usize] == 1
+                && roles[g.0 as usize] == 1
+                && plan
+                    .param_types
+                    .get(&p)
+                    .is_none_or(|ty| ty.dtype == crate::graph::DType::F32)
+        };
+        let mut chunks: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
+        for (index, pair) in plan.param_grad_pairs.iter().enumerate() {
+            if !eligible(pair) {
+                continue;
+            }
+            let bytes = plan.buffers[pair.0.0 as usize]
+                .max(plan.buffers[pair.1.0 as usize])
+                .max(4)
+                .next_multiple_of(ARENA_ALIGNMENT);
+            match chunks.last_mut() {
+                Some(&mut (ref mut used, ref mut slots)) if *used + bytes <= chunk_bytes => {
+                    slots.push((index, *used));
+                    *used += bytes;
+                }
+                _ => chunks.push((bytes, vec![(index, 0)])),
+            }
+        }
+        if chunks.is_empty() {
+            return;
+        }
+        let mut retired = vec![false; self.sizes.len()];
+        for (bytes, slots) in chunks {
+            let params = self.sizes.len();
+            let grads = params + 1;
+            self.sizes.extend([bytes, bytes]);
+            let mut grads_device = true;
+            for &(index, offset) in &slots {
+                let (p, g) = plan.param_grad_pairs[index];
+                let (p, g) = (p.0 as usize, g.0 as usize);
+                grads_device &= self.device_local[self.map[g]];
+                retired[self.map[p]] = true;
+                retired[self.map[g]] = true;
+                self.map[p] = params;
+                self.map[g] = grads;
+                self.offsets[p] = offset;
+                self.offsets[g] = offset;
+            }
+            self.device_local.extend([false, grads_device]);
+            self.arena.push(ArenaChunk {
+                params,
+                grads,
+                bytes,
+                slots,
+            });
+        }
+        // Drop the dedicated allocations the tenants left.
+        retired.resize(self.sizes.len(), false);
+        let mut renumber = vec![usize::MAX; self.sizes.len()];
+        let mut next = 0;
+        for (physical, &gone) in retired.iter().enumerate() {
+            if !gone {
+                renumber[physical] = next;
+                next += 1;
+            }
+        }
+        fn keep<T>(values: &mut Vec<T>, retired: &[bool]) {
+            let mut physical = 0;
+            values.retain(|_| {
+                physical += 1;
+                !retired[physical - 1]
+            });
+        }
+        keep(&mut self.sizes, &retired);
+        keep(&mut self.device_local, &retired);
+        for physical in &mut self.map {
+            *physical = renumber[*physical];
+        }
+        for chunk in &mut self.arena {
+            chunk.params = renumber[chunk.params];
+            chunk.grads = renumber[chunk.grads];
         }
     }
 
@@ -222,9 +365,11 @@ pub fn plan_buffer_aliasing(
     }
 
     AliasPlan {
+        offsets: vec![0; map.len()],
         map,
         sizes,
         device_local,
+        arena: Vec::new(),
     }
 }
 
@@ -306,12 +451,14 @@ pub fn plan_no_alias(
     let device_ok = device_local_eligible(plan);
     AliasPlan {
         map: (0..plan.buffers.len()).collect(),
+        offsets: vec![0; plan.buffers.len()],
         sizes: plan.buffers.clone(),
         device_local: pinned
             .iter()
             .enumerate()
             .map(|(i, &p)| !p || device_ok[i])
             .collect(),
+        arena: Vec::new(),
     }
 }
 
@@ -767,6 +914,50 @@ mod tests {
             !alias.device_local[alias.map[1]],
             "parameters stay host-visible"
         );
+    }
+
+    #[test]
+    fn trainable_pairs_pack_into_aligned_arena_chunks() {
+        // Three f32 pairs of 100, 600 and 300 bytes, then a pair whose
+        // gradient is a constant: that one keeps dedicated allocations.
+        let mut p = plan(vec![100, 100, 600, 600, 300, 300, 16, 16], Vec::new());
+        for (i, (param, grad)) in [(0, 1), (2, 3), (4, 5), (6, 7)].into_iter().enumerate() {
+            p.param_buffers.push((format!("w{i}"), BufferRef(param)));
+            p.param_grad_pairs.push((BufferRef(param), BufferRef(grad)));
+        }
+        p.constant_buffers.push((BufferRef(7), vec![1.0; 4]));
+        let mut alias = plan_buffer_aliasing(&p, &[], None);
+        let before = alias.sizes.len();
+        alias.pack_arena(&p, 1024);
+
+        // 256 + 768 fits one chunk; the third pair starts another.
+        assert_eq!(alias.arena.len(), 2);
+        assert_eq!(alias.arena[0].slots, [(0, 0), (1, 256)]);
+        assert_eq!(alias.arena[0].bytes, 1024);
+        assert_eq!(alias.arena[1].slots, [(2, 0)]);
+        for chunk in &alias.arena {
+            for &(index, offset) in &chunk.slots {
+                let (param, grad) = p.param_grad_pairs[index];
+                assert_eq!(alias.map[param.0 as usize], chunk.params);
+                assert_eq!(alias.map[grad.0 as usize], chunk.grads);
+                assert_eq!(alias.offsets[param.0 as usize], offset);
+                assert_eq!(alias.offsets[grad.0 as usize], offset);
+                assert_eq!(offset % ARENA_ALIGNMENT, 0);
+            }
+            assert!(!alias.device_local[chunk.params]);
+            assert!(alias.device_local[chunk.grads]);
+        }
+        // Six dedicated allocations became four arena chunks' worth.
+        assert_eq!(alias.sizes.len(), before - 6 + 4);
+        assert_eq!(alias.sizes.len(), alias.device_local.len());
+        for (logical, &physical) in alias.map.iter().enumerate() {
+            assert!(physical < alias.sizes.len(), "buffer {logical}");
+        }
+        // The pair with a constant gradient is not packed.
+        assert_eq!(alias.offsets[6], 0);
+        assert!(alias.map.iter().filter(|&&m| m == alias.map[6]).count() == 1);
+        assert!(!alias.overlap(&p.buffers, 0, 2));
+        assert!(alias.overlap(&p.buffers, 0, 0));
     }
 
     #[test]

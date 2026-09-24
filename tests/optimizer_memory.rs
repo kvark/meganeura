@@ -52,14 +52,17 @@ fn moments_are_lazy_and_accumulators_are_counted_once() {
 
         s.set_grad_accumulate(3);
         let accumulated = s.memory_summary();
-        assert_eq!(accumulated.grad_accumulator_bytes, (3 + 5 + 7) * 4);
+        // Optimizer state follows the parameter arena, whose slots start at
+        // storage-binding offsets: one 256-byte slot per parameter here.
+        let slots = 3 * 256;
+        assert_eq!(accumulated.grad_accumulator_bytes, slots);
         assert_eq!(
             accumulated.total_allocated_bytes() - before.total_allocated_bytes(),
-            60
+            slots
         );
         assert_eq!(
             accumulated.device_local_bytes - before.device_local_bytes,
-            if debug { 0 } else { 60 }
+            if debug { 0 } else { slots }
         );
 
         s.set_adam_grouped_grad_norm("b", 1);
@@ -67,10 +70,10 @@ fn moments_are_lazy_and_accumulators_are_counted_once() {
         assert_eq!(s.memory_summary().adam_state_bytes, 0);
         s.set_adam(0.001, 0.9, 0.999, 1e-8);
         let allocated = s.memory_summary();
-        assert_eq!(allocated.adam_state_bytes, (3 + 5 + 7) * 4 * 2);
+        assert_eq!(allocated.adam_state_bytes, slots * 2);
         assert_eq!(
             allocated.device_local_bytes - accumulated.device_local_bytes,
-            if debug { 0 } else { 120 }
+            if debug { 0 } else { slots * 2 }
         );
         s.step();
         s.wait();
@@ -101,7 +104,7 @@ fn explicit_moment_write_initializes_storage_without_configuring_updates() {
         s.read_adam_states(&["a"]),
         vec![(vec![1.0, 2.0, 3.0], vec![0.0; 3])]
     );
-    assert_eq!(s.memory_summary().adam_state_bytes, 120);
+    assert_eq!(s.memory_summary().adam_state_bytes, 3 * 256 * 2);
     s.step();
     s.wait();
     assert_eq!(s.adam_step_count(), 0);
@@ -234,4 +237,68 @@ fn parameter_reads_reject_wrong_storage_and_oversized_views() {
     assert!(catch_unwind(AssertUnwindSafe(|| s.read_param("p", &mut [0.0; 3]))).is_err());
     assert!(catch_unwind(AssertUnwindSafe(|| s.read_params(&["p"]))).is_err());
     assert!(catch_unwind(AssertUnwindSafe(|| s.read_all_param_norms())).is_err());
+}
+
+/// Every optimizer feature gives bit-identical results whether the
+/// parameters share one arena chunk (one dispatch per pass) or each has
+/// its own: the per-element arithmetic and the partial-norm order agree.
+#[test]
+fn arena_chunking_does_not_change_updates() {
+    let run = |chunk: Option<usize>| {
+        let mut graph = Graph::new();
+        let mut terms = Vec::new();
+        for (name, len) in [("a", 3), ("b", 300), ("c", 1500)] {
+            let p = graph.parameter(name, &[len]);
+            let squared = graph.mul(p, p);
+            terms.push(graph.sum_all(squared));
+        }
+        let sum = graph.add(terms[0], terms[1]);
+        let loss = graph.add(sum, terms[2]);
+        graph.set_outputs(vec![loss]);
+        let mut s = meganeura::build(
+            &graph,
+            SessionConfig {
+                runtime: SessionOptions {
+                    coop: CoopPolicy::Disabled,
+                    arena_chunk_bytes: chunk,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .0;
+        for (name, len) in [("a", 3), ("b", 300), ("c", 1500)] {
+            let values: Vec<f32> = (0..len)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0)
+                .collect();
+            s.set_parameter(name, &values);
+        }
+        s.set_lr_multiplier("b", 2.0);
+        s.set_grad_clip_norm(5.0);
+        s.set_adam(0.01, 0.9, 0.999, 1e-8);
+        s.set_adam_grouped_grad_norm("c", 3);
+        for _ in 0..2 {
+            s.step();
+        }
+        s.set_adaptive_grad_clip(0.05, 1e-3);
+        s.set_grad_accumulate(2);
+        s.zero_grad();
+        for _ in 0..2 {
+            s.step();
+        }
+        s.set_learning_rate(0.02);
+        s.step();
+        s.wait();
+        let names = ["a", "b", "c"];
+        (
+            s.read_params(&names),
+            s.read_adam_states(&names),
+            s.read_adam_grouped_grad_norm("c"),
+        )
+    };
+    let packed = run(None);
+    let separate = run(Some(256));
+    assert_eq!(packed, separate);
+    // The updates did happen.
+    assert!(packed.2.iter().all(|&norm| norm > 0.0));
 }

@@ -1256,7 +1256,7 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
         self.encoder.start();
         self.encoder.transfer("tune_upload").copy_buffer_to_buffer(
             self.staging.buffer().at(0),
-            self.buffers[index].at(0),
+            self.buffers[index].into(),
             std::mem::size_of_val(data) as u64,
         );
         self.submit_wait();
@@ -1277,7 +1277,7 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
         self.encoder
             .transfer("tune_readback")
             .copy_buffer_to_buffer(
-                self.buffers[index].at(0),
+                self.buffers[index].into(),
                 self.staging.buffer().at(0),
                 (elements * 4) as u64,
             );
@@ -1296,13 +1296,14 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
     }
 
     fn run(&mut self, sequence: &[(&bg::ComputePipeline, &Dispatch)], repeats: u32) -> f64 {
+        let pieces: Vec<bg::BufferPiece> = self.buffers.iter().map(|&b| b.into()).collect();
         let start = Instant::now();
         self.encoder.start();
         for _ in 0..repeats {
             for &(pipeline, dispatch) in sequence {
                 let mut pass = self.encoder.compute("tune_kernel");
                 let mut pc = pass.with(pipeline);
-                Session::bind_dispatch(&self.buffers, dispatch, &mut pc);
+                Session::bind_dispatch(&pieces, dispatch, &mut pc);
                 pc.dispatch(dispatch.workgroups);
             }
         }

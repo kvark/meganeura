@@ -341,7 +341,7 @@ impl Session {
     pub fn save_checkpoint(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         struct CheckpointTensor {
             name: String,
-            buffer: blade_graphics::Buffer,
+            buffer: blade_graphics::BufferPiece,
             offset: usize,
             byte_len: usize,
             dtype: Dtype,
@@ -390,9 +390,9 @@ impl Session {
 
         // Collect Adam moment buffers (parallel to param_grad_pairs)
         for (idx, &(param_buf, _)) in self.plan.param_grad_pairs.iter().enumerate() {
-            if idx >= self.adam_state.len() {
+            let Some((m, v)) = self.adam_moments(idx) else {
                 break;
-            }
+            };
             let param = params
                 .iter()
                 .find(|p| p.buffer == param_buf)
@@ -405,10 +405,7 @@ impl Session {
             }
             layout.adam_parameters.push(param.name.clone());
             let byte_len = param.byte_len;
-            for (suffix, buf) in [
-                ("adam_m", &self.adam_state[idx].0),
-                ("adam_v", &self.adam_state[idx].1),
-            ] {
+            for (suffix, buf) in [("adam_m", m), ("adam_v", v)] {
                 let offset = total_bytes
                     .checked_add(3)
                     .ok_or_else(|| invalid("checkpoint size overflow"))?
@@ -416,7 +413,7 @@ impl Session {
                     * 4;
                 tensors.push(CheckpointTensor {
                     name: format!("{suffix}.{}", param.name),
-                    buffer: *buf,
+                    buffer: buf,
                     offset,
                     byte_len,
                     dtype: Dtype::F32,
@@ -472,7 +469,7 @@ impl Session {
                 let aligned_len = tensor.byte_len / 4 * 4;
                 if aligned_len != 0 {
                     transfer.copy_buffer_to_buffer(
-                        tensor.buffer.at(0),
+                        tensor.buffer,
                         staging.at(tensor.offset as u64),
                         aligned_len as u64,
                     );
@@ -579,14 +576,17 @@ impl Session {
             self.ensure_adam_state();
         }
         if restore.reset_moments {
-            for (index, &(m, v)) in self.adam_state.iter().enumerate() {
+            for index in 0..self.plan.param_grad_pairs.len() {
                 if moment_indices.contains(&index) {
                     continue;
                 }
+                let Some((m, v)) = self.adam_moments(index) else {
+                    break;
+                };
                 let param = self.plan.param_grad_pairs[index].0;
                 let zeros = vec![0; self.plan.buffers[param.0 as usize].max(4)];
-                self.write_raw_buffer(&m, &zeros, !self.optimizer_device);
-                self.write_raw_buffer(&v, &zeros, !self.optimizer_device);
+                self.write_raw_buffer(m, &zeros, !self.optimizer_device);
+                self.write_raw_buffer(v, &zeros, !self.optimizer_device);
             }
         }
         for write in restore.writes {
@@ -598,7 +598,7 @@ impl Session {
                 ),
                 Target::Moment { index, second } => {
                     let param = self.plan.param_grad_pairs[index].0;
-                    let (m, v) = self.adam_state[index];
+                    let (m, v) = self.adam_moments(index).expect("Adam state");
                     (
                         if second { v } else { m },
                         self.plan.buffers[param.0 as usize],
@@ -607,11 +607,11 @@ impl Session {
                 }
             };
             if write.data.len() == capacity {
-                self.write_raw_buffer(&buffer, write.data, host_visible);
+                self.write_raw_buffer(buffer, write.data, host_visible);
             } else {
                 let mut padded = vec![0; capacity];
                 padded[..write.data.len()].copy_from_slice(write.data);
-                self.write_raw_buffer(&buffer, &padded, host_visible);
+                self.write_raw_buffer(buffer, &padded, host_visible);
             }
         }
         if let Some(step) = restore.adam_step {
