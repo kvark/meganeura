@@ -469,7 +469,8 @@ fn segment_candidates(
         super::sweep_dead_nodes(&mut candidate);
         result.push(Candidate {
             graph: candidate.into_toposort(),
-            expression: terms.to_string(term),
+            expression: terms
+                .to_string_with_let(&mut egglog::util::SymbolGen::new("search_".into()), term),
         });
         if result.len() == limit {
             break;
@@ -722,6 +723,24 @@ mod tests {
         );
         graph.nodes_mut()[out as usize].requires_full_precision = true;
         assert!(candidates(&graph, Default::default(), 8).is_err());
+    }
+
+    #[test]
+    fn residual_receipts_preserve_sharing() {
+        let mut graph = Graph::new();
+        let mut x = graph.input("x", &[3, 7]);
+        let w = graph.parameter("w", &[7, 7]);
+        for _ in 0..16 {
+            let product = graph.matmul(x, w);
+            x = graph.add(product, x);
+        }
+        graph.set_outputs(vec![x]);
+        let space = candidates(&graph, Default::default(), 2).unwrap();
+        assert_eq!(space.candidates.len(), 2);
+        for candidate in space.candidates {
+            assert!(candidate.expression.contains("(let "));
+            assert!(candidate.expression.len() < 16_000);
+        }
     }
 
     #[test]
