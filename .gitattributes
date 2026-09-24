@@ -1,0 +1,2 @@
+# Shader generators use structural substitutions with LF-delimited anchors.
+*.wgsl text eol=lf
