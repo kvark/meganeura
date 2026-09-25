@@ -23,11 +23,15 @@ PHASES = ("inference", "latency", "training")
 DEVICES = {
     "nvidia-5070": "RTX 5070",
     "nvidia-h100": "H100",
-    "nvidia-3050": "RTX 3050 (Windows)",
+    "nvidia-3050": "RTX 3050",
     "amd-7900xt": "RX 7900 XT",
     "intel-b570": "Arc B570",
     "apple-m3": "Apple M3",
 }
+OPERATING_SYSTEMS = {"nvidia-3050": "Windows", "apple-m3": "macOS"}
+MESA_DRIVERS = {"amd": "RADV", "intel": "ANV"}
+BACKENDS = {"cuda": "CUDA", "rocm": "ROCm", "xpu": "XPU", "mps": "MPS"}
+MODEL_LABELS = {"StableDiffusion": "SD U-Net"}
 QUALIFICATIONS = {"amd-780m-qualify": "Radeon 780M",
                   "amd-9600x-qualify": "Ryzen 9600X iGPU",
                   "intel-rplu-qualify": "Intel RPL-U"}
@@ -550,85 +554,157 @@ def portability_score(rows, engine, phase):
     return len(costs) / sum(costs)
 
 
+def label(model):
+    return MODEL_LABELS.get(model, model)
+
+
+def driver_label(device, campaign):
+    info = campaign["native_device"]["driver_info"].split("-")[0]
+    if not info:
+        return "built-in"
+    return f"{info} ({MESA_DRIVERS[device.split('-')[0]]})" if info.startswith("Mesa") else info
+
+
+def ratio_plot(campaigns, rows):
+    # Strict Meganeura/PyTorch ratios on a log axis, one row per GPU and one
+    # marker per workload. A phase without a qualified reference is omitted.
+    low, high, width, gap, left, pitch = 0.15, 6.0, 50, 7, 21, 6
+    marks = {"SmolLM2-135M": ("circle", "0072B2"), "SmolVLA": ("square", "E69F00"),
+             "StableDiffusion": ("triangle", "009E73"), "ResNet-50": ("diamond", "D55E00"),
+             "Whisper-tiny": ("cross", "CC79A7")}
+
+    def x_of(origin, value):
+        return origin + math.log(value / low) / math.log(high / low) * width
+
+    def marker(shape, color, x, y):
+        c = "p" + color
+        if shape == "circle":
+            return rf"\fill[{c}] ({x:.3f},{y:.3f}) circle (0.8);"
+        if shape == "square":
+            return rf"\fill[{c}] ({x - 0.72:.3f},{y - 0.72:.3f}) rectangle ({x + 0.72:.3f},{y + 0.72:.3f});"
+        if shape == "triangle":
+            return rf"\fill[{c}] ({x:.3f},{y + 0.95:.3f}) -- ({x - 0.9:.3f},{y - 0.7:.3f}) -- ({x + 0.9:.3f},{y - 0.7:.3f}) -- cycle;"
+        if shape == "diamond":
+            return (rf"\fill[{c}] ({x:.3f},{y + 1:.3f}) -- ({x + 0.85:.3f},{y:.3f}) -- "
+                    rf"({x:.3f},{y - 1:.3f}) -- ({x - 0.85:.3f},{y:.3f}) -- cycle;")
+        return (rf"\draw[{c},line width=0.45mm] ({x - 0.75:.3f},{y - 0.75:.3f}) -- ({x + 0.75:.3f},{y + 0.75:.3f}) "
+                rf"({x - 0.75:.3f},{y + 0.75:.3f}) -- ({x + 0.75:.3f},{y - 0.75:.3f});")
+
+    devices = list(DEVICES)
+    top, bottom = pitch / 2, pitch / 2 - len(devices) * pitch
+    chart = [r"\begin{tikzpicture}[x=1mm,y=1mm,font=\scriptsize]",
+             *[rf"\definecolor{{p{color}}}{{HTML}}{{{color}}}" for _, color in marks.values()]]
+    for i in range(1, len(devices), 2):
+        chart.append(rf"\fill[black!5] ({left - 20},{top - i * pitch}) rectangle "
+                     rf"({left + 3 * width + 2 * gap},{top - (i + 1) * pitch});")
+    for i, device in enumerate(devices):
+        chart.append(rf"\node[anchor=east] at ({left - 1},{-i * pitch}) {{{DEVICES[device]}}};")
+    for panel, (phase, title) in enumerate((("inference", "Inference"), ("latency", "Minimal shape"),
+                                            ("training", "F+L+B"))):
+        origin = left + panel * (width + gap)
+        chart.append(rf"\node at ({origin + width / 2},{top + 3}) {{{title}}};")
+        for tick in (0.25, 0.5, 1, 2, 4):
+            x = x_of(origin, tick)
+            style = "black!55,semithick" if tick == 1 else "black!15"
+            chart.extend([rf"\draw[{style}] ({x:.3f},{top}) -- ({x:.3f},{bottom});",
+                          rf"\node[below] at ({x:.3f},{bottom}) {{{tick:g}}};"])
+        chart.append(rf"\draw[black!40] ({origin},{bottom}) rectangle ({origin + width},{top});")
+        for i, device in enumerate(devices):
+            row_y = -i * pitch
+            for j, model in enumerate(MODELS):
+                value = rows[device]["strict", model, primary_condition(campaigns[device])]["ratio_" + phase]
+                if value is None:
+                    continue
+                require(low < value < high, "ratio outside the plotted range")
+                shape, color = marks[model]
+                chart.append(marker(shape, color, x_of(origin, value), row_y + (2 - j) * 0.95))
+    legend_y = bottom - 9
+    x = left + 12
+    for model in MODELS:
+        shape, color = marks[model]
+        chart.extend([marker(shape, color, x, legend_y),
+                      rf"\node[anchor=west] at ({x + 1.3},{legend_y}) {{{label(model)}}};"])
+        x += 31
+    chart.extend([r"\end{tikzpicture}", ""])
+    return "\n".join(chart)
+
+
 def tables(campaigns, rows, groups):
     output = {}
     paired_devices = DEVICES
     lines = []
-    for device, label in paired_devices.items():
+    for device, name in paired_devices.items():
         c = campaigns[device]
         backend = c["args"]["backend"]
-        driver = c["native_device"]["driver_info"].split("-")[0] or "Metal"
         valid = [sum(phase in run["phases"] for batch in groups[device].values() for run in batch) for phase in PHASES]
-        replay = {"cuda": "CUDA Graph", "rocm": "HIP graph", "xpu": "XPU graph"}.get(backend, "no public replay" if backend == "mps" else "none")
-        lines.append([label, backend.upper() + "/compiled", driver, replay, "/".join(map(str, valid))])
-    output["devices.tex"] = tex_table("llllc", "Device & PyTorch path & Graphics driver & Explicit replay & Paired inf./min./F+L+B", lines)
+        replay = {"cuda": "CUDA Graph", "rocm": "HIP graph", "xpu": "XPU graph"}.get(backend, "none")
+        lines.append([name, OPERATING_SYSTEMS.get(device, "Linux"), "Metal" if backend == "mps" else "Vulkan",
+                      driver_label(device, c), BACKENDS[backend], replay, "/".join(map(str, valid))])
+    output["devices.tex"] = tex_table("lllllll", "GPU & OS & API & Driver & PyTorch & Replay & Pairs (inf./min./F+L+B)", lines)
     lines = []
-    for device, label in QUALIFICATIONS.items():
+    for device, name in QUALIFICATIONS.items():
         conditions = len(groups[device])
-        stage = {"intel-rplu-qualify": "XPU device unavailable",
-                 "amd-9600x-qualify": "Reported ROCm crash / incorrect output",
-                 "amd-780m-qualify": "HIP launch failure (strict 135M)"}[device]
-        lines.append([label, f"Vulkan: {conditions}/10", "No qualified GPU comparison", stage])
-    lines.append(["MI300X (earlier attempt)", "No validated Vulkan run", "Strict 135M ran", "Vulkan driver support"])
-    output["qualification.tex"] = tex_table("llll",
-        "Device & Meganeura & PyTorch GPU & Blocking stage", lines)
+        reference = {"intel-rplu-qualify": r"no XPU device$^\dagger$",
+                     "amd-9600x-qualify": r"ROCm crash, wrong output$^\dagger$",
+                     "amd-780m-qualify": "HIP launch failure"}[device]
+        lines.append([name, f"Vulkan {conditions}/10", reference])
+    lines.append([r"MI300X$^\dagger$", "no Vulkan driver", "strict 135M ran"])
+    output["qualification.tex"] = tex_table("lll", "GPU & Meganeura & PyTorch GPU path", lines)
     lines = []
-    for device, label in paired_devices.items():
+    for device, name in paired_devices.items():
         c = campaigns[device]
         condition = primary_condition(c)
         for model in MODELS:
-            counts = "/".join(str(rows[device][precision, model, condition]["replicates"])
-                              for precision in ("strict", "accelerated"))
             values = []
             for precision in ("strict", "accelerated"):
                 row = rows[device][precision, model, condition]
+                require(row["replicates"] == 3, "paired group lacks three processes")
                 for phase in PHASES:
                     value = ratio(row["ratio_" + phase])
                     if row["ratio_" + phase] is None and row["meganeura_" + phase + "_replicates"] == 3:
-                        value = f"M: {row['meganeura_' + phase]:.2f} ms"
+                        value = rf"{row['meganeura_' + phase]:.2f}\,ms$^\dagger$"
                     values.append(value)
-            lines.append([label if model == MODELS[0] else "", model, counts, *values])
-    ratio_heading = (r"Device & Workload & $n$ (S/A) & \multicolumn{3}{c}{Strict} & \multicolumn{3}{c}{Accelerated} \\"
-                     r" \cmidrule(lr){4-6}\cmidrule(lr){7-9}"
-                     r" & & & Inf. & Min. & F+L+B & Inf. & Min. & F+L+B")
-    output["ratios.tex"] = tex_table("llcrrrrrr", ratio_heading, lines)
+            lines.append([name if model == MODELS[0] else "", label(model), *values])
+    ratio_heading = (r"GPU & Workload & \multicolumn{3}{c}{Strict} & \multicolumn{3}{c}{Accelerated} \\"
+                     r" \cmidrule(lr){3-5}\cmidrule(lr){6-8}"
+                     r" & & Inf. & Min. & F+L+B & Inf. & Min. & F+L+B")
+    output["ratios.tex"] = tex_table("llrrrrrr", ratio_heading, lines)
     lines = []
-    for device, label in paired_devices.items():
+    for device, name in paired_devices.items():
         runs = [run for batch in groups[device].values() for run in batch]
         compile_s = [sum(run["pair"][engine]["timings"]["compile_s"] for run in runs) for engine in ENGINES]
         graph_s = [sum(phase.get(part + "_s", 0) for run in runs
                        for phase in run["pair"]["pytorch"]["execution"]["graph_replay"]["phases"].values())
                    for part in ("capture", "validation")]
-        lines.append([label, str(len(runs)), *[f"{value / 60:.2f}" for value in (*compile_s, *graph_s)]])
+        lines.append([name, str(len(runs)), *[f"{value / 60:.2f}" for value in (*compile_s, *graph_s)]])
     output["preparation.tex"] = tex_table("lrrrrr",
-        r"Device & Attempts & M compile+tune & P compile & P capture & P qualification", lines)
+        r"GPU & Processes & M prepare & P compile & P capture & P check", lines)
     lines = []
-    for device, label in paired_devices.items():
+    for device, name in paired_devices.items():
         searches = [session["search"] for batch in groups[device].values() for run in batch
                     for session in run["pair"]["meganeura"]["optimizer"]["sessions"]]
-        lines.append([label, str(len(searches)),
+        lines.append([name, str(len(searches)),
                       str(sum(s["programs"] for s in searches)), str(sum(s["truncated"] for s in searches)),
                       str(sum(s["selected_graph"] != 0 for s in searches)),
                       str(sum(s["program_rejections"] for s in searches))])
-    output["search.tex"] = tex_table("lrrrrr", r"Device & Sessions & Programs & Truncated & Changed graph & Rejected programs", lines)
+    output["search.tex"] = tex_table("lrrrrr",
+        r"GPU & Sessions & Programs & Out of time & Changed graph & Rejected", lines)
     lines = []
     for device in ("nvidia-5070", "amd-7900xt", "nvidia-h100"):
+        first = True
         for model in ("SmolLM2-135M", "SmolLM2-360M", "SmolLM2-1.7B"):
             if model.endswith("1.7B") and device != "nvidia-h100":
                 continue
             for precision in ("strict", "accelerated"):
                 source = device if model.endswith("135M") else device + "-large"
                 row = rows[source][precision, model, "default-graph1"]
-                lines.append([DEVICES[device], model.removeprefix("SmolLM2-"), precision,
-                              *[f"{row[engine + '_' + phase]:.2f}" for phase in PHASES for engine in ENGINES]])
-    output["scaling.tex"] = tex_table("lllrrrrrr", r"Device & Model & Arithmetic & \multicolumn{2}{c}{Prefill ms} & \multicolumn{2}{c}{One token ms} & \multicolumn{2}{c}{F+L+B ms} \\ & & & M & P & M & P & M & P", lines)
-    lines = []
-    for model, device in (("SmolLM2-135M", "nvidia-h100"), ("SmolLM2-360M", "nvidia-h100-large"), ("SmolLM2-1.7B", "nvidia-h100-large")):
-        row = rows[device]["strict", model, "default-graph1"]
-        lines.append([model, str(row["replicates"]), *[f"{row[key] / 2**30:.2f}"
-                      for key in ("meganeura_memory", "pytorch_memory", "pytorch_reserved")]])
-    output["memory.tex"] = tex_table("lrrrr",
-        r"Model & $n$ & M plan & P allocated & P reserved", lines)
+                require(row["replicates"] == 3, "size-study group lacks three processes")
+                lines.append([DEVICES[device] if first else "",
+                              model.removeprefix("SmolLM2-") if precision == "strict" else "",
+                              "S" if precision == "strict" else "A",
+                              *[f"{row['meganeura_' + phase]:.2f} ({ratio(row['ratio_' + phase])})" for phase in PHASES]])
+                first = False
+    output["scaling.tex"] = tex_table("lllrrr", r"GPU & Size & & Prefill & One token & F+L+B", lines)
     lines, scores = [], []
     for model in MODELS:
         values = []
@@ -637,45 +713,11 @@ def tables(campaigns, rows, groups):
                     for device in DEVICES]
             values.extend(portability_score(data, engine, phase) for engine in ENGINES)
         scores.append(values)
-        lines.append([model, *[f"{x:.2f}" for x in values]])
+        lines.append([label(model), *[f"{x:.2f}" for x in values]])
     lines.append(["Workload mean", *[f"{statistics.mean(col):.2f}" for col in zip(*scores)]])
     output["portability.tex"] = tex_table("lrrrrrr", r"Workload & \multicolumn{2}{c}{Inference} & \multicolumn{2}{c}{Minimal} & \multicolumn{2}{c}{F+L+B} \\ & M & P & M & P & M & P", lines)
-    # Paired bars, not a stack: forward and F+L+B are separate measurements.
-    chart = [r"\begin{tikzpicture}[x=1mm,y=1mm,font=\scriptsize]"]
-    devices = list(paired_devices)
-    bottom = 1 - len(devices) * 10
-    for panel, (phase, title) in enumerate((("inference", "Prefill (ms)"), ("training", "F+L+B (ms)"))):
-        maximum = max(rows[device]["strict", "SmolLM2-135M", primary_condition(campaigns[device])][engine + "_" + phase + "_max"]
-                      for device in devices for engine in ENGINES)
-        limit = math.ceil(maximum / 30) * 30
-        origin = 32 + panel * 94
-        chart.append(rf"\node at ({origin + 29},7) {{{title}}};")
-        for tick in range(4):
-            x = origin + tick * 18
-            chart.extend([rf"\draw[black!15] ({x},1) -- ({x},{bottom});",
-                          rf"\node[below] at ({x},{bottom}) {{{limit * tick // 3}}};"])
-        for i, device in enumerate(devices):
-            y = -i * 10
-            row = rows[device]["strict", "SmolLM2-135M", primary_condition(campaigns[device])]
-            label = DEVICES[device] + (rf" ($n={row['replicates']}$)" if row["replicates"] != 3 else "")
-            chart.append(rf"\node[anchor=east] at ({origin - 1},{y - 3}) {{{label}}};")
-            for j, (engine, color) in enumerate(zip(ENGINES, ("blue!65!black", "orange!80!black"))):
-                value = row[engine + "_" + phase]
-                end = origin + value / limit * 54
-                top = y - j * 3.5
-                low = origin + row[engine + "_" + phase + "_min"] / limit * 54
-                high = origin + row[engine + "_" + phase + "_max"] / limit * 54
-                chart.extend([rf"\fill[{color}] ({origin},{top}) rectangle ({end:.4f},{top - 2.8});",
-                              rf"\node[anchor=west,inner sep=1pt] at ({high:.4f},{top - 1.4}) {{{value:.1f}}};"])
-                chart.append(rf"\draw[black,|-|] ({low:.4f},{top - 1.4}) -- ({high:.4f},{top - 1.4});")
-    chart.extend([rf"\fill[blue!65!black] (49,{bottom - 11}) rectangle (53,{bottom - 8});",
-                  rf"\node[anchor=west] at (54,{bottom - 9.5}) {{Meganeura}};",
-                  rf"\fill[orange!80!black] (85,{bottom - 11}) rectangle (89,{bottom - 8});",
-                  rf"\node[anchor=west] at (90,{bottom - 9.5}) {{PyTorch}};",
-                  r"\end{tikzpicture}", ""])
-    output["smollm2.tex"] = "\n".join(chart)
+    output["ratio-plot.tex"] = ratio_plot(campaigns, rows)
     return output
-
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

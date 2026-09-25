@@ -1,10 +1,10 @@
-\begin{tabular}{llll}
+\begin{tabular}{lll}
 \toprule
-Device & Meganeura & PyTorch GPU & Blocking stage \\
+GPU & Meganeura & PyTorch GPU path \\
 \midrule
-Radeon 780M & Vulkan: 10/10 & No qualified GPU comparison & HIP launch failure (strict 135M) \\
-Ryzen 9600X iGPU & Vulkan: 10/10 & No qualified GPU comparison & Reported ROCm crash / incorrect output \\
-Intel RPL-U & Vulkan: 10/10 & No qualified GPU comparison & XPU device unavailable \\
-MI300X (earlier attempt) & No validated Vulkan run & Strict 135M ran & Vulkan driver support \\
+Radeon 780M & Vulkan 10/10 & HIP launch failure \\
+Ryzen 9600X iGPU & Vulkan 10/10 & ROCm crash, wrong output$^\dagger$ \\
+Intel RPL-U & Vulkan 10/10 & no XPU device$^\dagger$ \\
+MI300X$^\dagger$ & no Vulkan driver & strict 135M ran \\
 \bottomrule
 \end{tabular}

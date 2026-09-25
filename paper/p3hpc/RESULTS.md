@@ -1,11 +1,15 @@
 # P3HPC cohort: September 25, 2026
 
 The final v14 collection is usable with the failures and timing variation
-described below. No GPU measurements were rerun during this audit.
-All framework timing tables and the figure use only this cohort. Earlier
-size-study rows, optimizer timing ablations, compiler comparisons and profile
-timing tables have been removed. The separate DinoVision application and
-MI300X driver findings supply no framework comparison times.
+described below. All framework timing tables and the ratio figure use only
+this cohort. Earlier size-study rows, optimizer timing ablations, compiler
+comparisons and profile timing tables have been removed. The separate
+DinoVision application and MI300X driver findings supply no framework
+comparison times.
+
+One same-revision measurement was added afterwards: a native-only search
+ablation on the RTX 5070 / Arc B570 host (see "Search ablation"). It reruns
+no PyTorch or 60-second search timing; its search arm is the cohort itself.
 
 ## Frozen inputs
 
@@ -214,29 +218,113 @@ expensive than default compilation. Max-autotune failures and long waits in
 bring-up explain the bounded reference policy, but their older timings are
 not reused. Do not infer whole-model startup from Naga parse time.
 H100 strict native plan allocations grow 1.58 → 3.90 → 17.04 GiB; these are
-not physical VRAM peaks or comparable in scope to PyTorch allocator peaks.
+not physical VRAM peaks or comparable in scope to PyTorch allocator peaks,
+so the paper no longer reports a memory table.
+
+## Search ablation
+
+Question: how much does the measured search buy over no search, and over the
+library's older two-second tuner? Setup, on the cohort's RTX 5070 / Arc B570
+host with the same drivers (NVIDIA 595.91.07, Mesa 26.0.3), 2026-09-25:
+
+- Inferena `7b8fcb72` plus `ablation-runner.patch`, which only exposes two
+  library options; its defaults reproduce the cohort runner.
+- Meganeura alone, strict f32, five workloads, three fresh processes per
+  workload and policy, rotated policy order, cohort warmup and sampling.
+- `off`: ordinary extraction, heuristic kernels (`MEGANEURA_TUNE=0`).
+- `tune2s`: ordinary extraction plus `TuneOptions::default()`: at most eight
+  kernel classes within two seconds; graph and dispatch plan unchanged.
+- The 60-second search arm is the cohort's own native timings; not rerun.
+
+All 60 processes pass. Every output agrees with the cohort's PyTorch outputs
+for the same GPU, workload and replicate: worst sampled-output error
+0.0042%, loss 0.0011%, total gradient 0.030%, parameter-norm vector 0.15%.
+
+Geometric-mean speedup over `off` across the five workloads (inference /
+minimal / F+L+B), with median preparation per workload process:
+
+| GPU | Policy | Preparation | Speedup |
+|---|---|---:|---|
+| RTX 5070 | 2 s tuner | 4.9 s | 1.02 / 1.09 / 1.02 |
+| RTX 5070 | 60 s search | 119.1 s | 1.39 / 1.55 / 1.23 |
+| Arc B570 | 2 s tuner | 7.7 s | 1.10 / 1.06 / 1.02 |
+| Arc B570 | 60 s search | 143.8 s | 1.48 / 1.23 / 1.18 |
+
+`off` prepares in a median of 2.1 s (RTX 5070) and 1.7 s (B570). The search
+gains concentrate in SmolLM2, SmolVLA and the U-Net (inference 1.50-2.13x);
+ResNet and Whisper inference gain at most 12%. The two-second tuner gains
+2-10% on average and 1.38x at most (B570 SmolLM2 prefill). At this revision,
+it does not retain most of the search's benefit. The data do not separate
+the search's wider scope from its longer budget.
+
+The kernel-level `search_study` example, rerun at `0dbfcc00` on both GPUs,
+reproduces the earlier tile study: keeping tile/split-K equalities beats
+one-graph tuning by 1.27-1.66x (RTX 5070) and 1.23-1.63x (B570), always by
+choosing eight-way split-K; setup rises from 0.4-0.7 to 6.2-7.1 s and from
+0.8-1.8 to 7.6-11.7 s.
+
+The archive `search-ablation.tgz` (SHA-256 in
+[search-ablation.sha256](artifact/search-ablation.sha256)) holds every runner
+record and log, the driver `ablation.py`, the patch and the tile-study output.
+It lives next to the cohort archives in `~/Downloads/p3hpc`.
+
+### Where the search time goes
+
+Per-trial receipts in the six main campaigns (504 sessions, 19,696 programs,
+median 45.5 of 64 per session; 426.7 search-minutes in total):
+
+| Part | Minutes | Share of trial time |
+|---|---:|---:|
+| Kernel probes | 122.5 | 29.1% |
+| Candidate session construction (allocation, pipeline compilation) | 81.0 | 19.3% |
+| Full-tensor qualification | 59.4 | 14.1% |
+| Weight and input initialization | 40.2 | 9.6% |
+| Whole-program comparison | 117.3 | 27.9% |
+| - of which timed paired samples | 35.4 | |
+| - of which warmup and overhead (floor: 18,152 x 250 ms = 75.6) | 81.9 | |
+
+Extraction and plan compilation before the trials take 5.7 minutes; lowering
+to WGSL 0.56. `measure.rs` qualifies each challenger before tuning, after
+tuning and after timing, and re-qualifies the incumbent after every trial
+(75,013 qualification steps). The Inferena runner ignores the incumbent in its
+`initialize` callback, so every candidate uploads its weights again although
+`build_measured` can share immutable parameters. Of 18,152 comparisons, 561
+replaced the incumbent.
+
+## Footprint
+
+Measured with [footprint.py](artifact/footprint.py):
+
+- Meganeura `0dbfcc00` `src/`: 41,617 Rust lines and 4,713 WGSL lines in 87
+  shader files, excluding blank lines, comments and `#[cfg(test)]` modules.
+- Inferena `7b8fcb72` native runner (Meganeura `0dbfcc00`), stripped:
+  14,177,128 bytes (13.5 MiB), linking only libc, libm and libgcc_s. Built with
+  rustc 1.98.0; the cohort receipts do not record the compiler version.
+- PyTorch 2.13.0+cu130 in the measured environment: torch's dependency
+  closure is 29 distributions, 4.41 GiB; torch plus triton are 1.69 GiB.
 
 ## Reproduction and paper status
 
 ```sh
 python3 paper/p3hpc/artifact/cohort.py "$HOME/Downloads/p3hpc" \
   --check paper/p3hpc/tables --output target/p3hpc-20260925
+python3 paper/p3hpc/artifact/search_ablation.py "$HOME/Downloads/p3hpc" \
+  "$HOME/Downloads/p3hpc/search-ablation.tgz" \
+  --check paper/p3hpc/tables --output target/p3hpc-20260925
 python3 -m unittest discover -s paper/p3hpc/artifact -p 'test_*.py'
 ```
 
-The audit regenerates nine LaTeX fragments, the SmolLM2 figure among them,
-plus per-condition timings/ranges, failures, and compact search summaries.
-Generated data remain under ignored `target/`. Only analysis code, hashes,
-compact findings, and paper sources are tracked.
+The two analyzers regenerate nine LaTeX fragments: eight from `cohort.py`,
+including the strict ratio figure (`ratio-plot.tex`), and `ablation.tex`.
+They also write per-condition timings/ranges, failures, compact search
+summaries and the ablation CSV. Generated data remain under ignored `target/`.
 
-The artifact description now follows the SC26 AD template at
+The artifact description follows the SC26 AD template at
 [`sc26-repro/b5195e6`](https://github.com/jennfshr/sc26-repro/tree/b5195e67d9ad0b5d07e8b6840558c7251c73b3c0/for-paper-authors),
 using its vendored `sc26repro.sty`, contribution/artifact mapping and six
 required artifact subsections. It is appended after the bibliography; there
 is no AE/badge claim. The paper retains IEEE proceedings formatting.
 
-This update does not regenerate the PDF or either submission ZIP. Existing
-submission files still describe the earlier cohort and must be rebuilt at
-final packaging. The supplement must include its README and the new checker,
-hash manifest, tables, and record stream together. Earlier audit and diagnostic
-notes remain in Git history at `cc49b11`.
+The PDF, source ZIP and supplementary ZIP are built together under the
+ignored `paper/p3hpc/submission/`; see [paper/README.md](../README.md).
+Earlier audit and diagnostic notes remain in Git history at `cc49b11`.

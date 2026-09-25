@@ -1,12 +1,12 @@
-\begin{tabular}{llllc}
+\begin{tabular}{lllllll}
 \toprule
-Device & PyTorch path & Graphics driver & Explicit replay & Paired inf./min./F+L+B \\
+GPU & OS & API & Driver & PyTorch & Replay & Pairs (inf./min./F+L+B) \\
 \midrule
-RTX 5070 & CUDA/compiled & 595.91.07 & CUDA Graph & 30/30/30 \\
-H100 & CUDA/compiled & 580.126.09 & CUDA Graph & 30/30/30 \\
-RTX 3050 (Windows) & CUDA/compiled & 591.86 & CUDA Graph & 30/30/30 \\
-RX 7900 XT & ROCM/compiled & Mesa 26.0.3 & HIP graph & 30/24/24 \\
-Arc B570 & XPU/compiled & Mesa 26.0.3 & XPU graph & 30/30/30 \\
-Apple M3 & MPS/compiled & Metal & no public replay & 30/30/30 \\
+RTX 5070 & Linux & Vulkan & 595.91.07 & CUDA & CUDA Graph & 30/30/30 \\
+H100 & Linux & Vulkan & 580.126.09 & CUDA & CUDA Graph & 30/30/30 \\
+RTX 3050 & Windows & Vulkan & 591.86 & CUDA & CUDA Graph & 30/30/30 \\
+RX 7900 XT & Linux & Vulkan & Mesa 26.0.3 (RADV) & ROCm & HIP graph & 30/24/24 \\
+Arc B570 & Linux & Vulkan & Mesa 26.0.3 (ANV) & XPU & XPU graph & 30/30/30 \\
+Apple M3 & macOS & Metal & built-in & MPS & none & 30/30/30 \\
 \bottomrule
 \end{tabular}

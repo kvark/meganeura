@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import verify
 import cohort
+import search_ablation
 
 
 PAPER = Path(__file__).resolve().parents[2]
@@ -52,6 +53,17 @@ class EvidenceTests(unittest.TestCase):
         self.assertIsNone(row["ratio_training"])
         self.assertEqual(cohort.portability_score([row], "meganeura", "training"), 1.0)
         self.assertEqual(cohort.portability_score([row], "pytorch", "training"), 0.0)
+
+    def test_ablation_outputs_must_match_the_reference(self):
+        outputs = {"output_shape": [1, 4], "logits_sample": [1.0, 2.0, 3.0], "loss": 2.0,
+                   "grad_norm": 5.0, "gradient_norms": {"a": 3.0, "b": 4.0}}
+        reference = {"outputs": copy.deepcopy(outputs)}
+        errors = search_ablation.validate({"outputs": copy.deepcopy(outputs)}, reference)
+        self.assertEqual(max(errors.values()), 0.0)
+        outputs["gradient_norms"]["b"] = 5.0
+        with self.assertRaisesRegex(ValueError, "gradient gate"):
+            search_ablation.validate({"outputs": outputs}, reference)
+        self.assertAlmostEqual(search_ablation.geomean([1.0, 4.0]), 2.0)
 
     def test_streamed_records_preserve_raw_summary_identity(self):
         record = {"framework": "pytorch", "status": "ok", "timings": {"inference_ms": 1.0}}
