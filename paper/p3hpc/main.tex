@@ -1,4 +1,5 @@
 \documentclass[conference]{IEEEtran}
+\usepackage{fancyhdr}
 
 \usepackage[T1]{fontenc}
 \usepackage{booktabs}
@@ -37,6 +38,18 @@ kvark@fastmail.com \quad ORCID: 0009-0005-6410-4276}}
 
 \begin{document}
 \maketitle
+% SC26 proceedings copyright block (SC26 Instructions for Workshop Authors, Step 3a).
+\thispagestyle{fancy}
+\lhead{}
+\rhead{}
+\chead{}
+\lfoot{\footnotesize{
+SC26 Workshops, November 15-20, 2026, Chicago, Illinois, USA
+\newline 979-8-3195-1221-5/26/\$31.00 \copyright 2026 IEEE}}
+\rfoot{}
+\cfoot{}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
 
 \begin{abstract}
 Vulkan and Metal already run on nearly every consumer GPU. Can they also

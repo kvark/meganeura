@@ -65,14 +65,21 @@ After building the PDF, package the source and supplementary ZIPs together:
 
 ```sh
 python3 paper/p3hpc/artifact/submission.py "$HOME/Downloads/p3hpc" \
-  --pdf paper/p3hpc/main.pdf --output paper/p3hpc/submission
+  --pdf paper/p3hpc/main.pdf --output paper/p3hpc/submission \
+  --submission-id <SC submission number>
 ```
 
 The source ZIP carries both bibliography files, `main.bbl`, the class/style,
-the AD, figures and tables with their relative paths. The supplement's
-top-level README is [artifact/SUPPLEMENT.md](p3hpc/artifact/SUPPLEMENT.md);
-it also contains a regenerated `records.jsonl.xz`, the ablation archive, the
-analyzers and a `MANIFEST.sha256`. Do not use the legacy packager below for
+SC's `fancyhdr.sty`, the AD, figures and tables with their relative paths.
+SC26 wants auxiliary materials as one `<SC submission number>aux.zip` with a
+short `readme.txt`; ours is [artifact/SUPPLEMENT.md](p3hpc/artifact/SUPPLEMENT.md)
+and sits at the archive root with a regenerated `records.jsonl.xz`, the
+ablation archive, the analyzers and a `MANIFEST.sha256`.
+
+The first-page copyright block follows the
+[SC26 Instructions for Workshop Authors](https://submissions.supercomputing.org/static_resources/SC26_Instructions_for_Workshop_Authors.pdf)
+(Step 3a) with SC's `fancyhdr.sty`. The camera-ready PDF must also pass IEEE
+PDF eXpress (conference ID 72768X) and stay under 4 MB. Do not use the legacy packager below for
 the current cohort.
 
 ## Original arXiv report

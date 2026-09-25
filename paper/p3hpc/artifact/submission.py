@@ -4,10 +4,13 @@
 Run from anywhere after building `paper/p3hpc/main.pdf`:
 
     python3 paper/p3hpc/artifact/submission.py "$HOME/Downloads/p3hpc" \\
-        --pdf paper/p3hpc/main.pdf --output paper/p3hpc/submission
+        --pdf paper/p3hpc/main.pdf --output paper/p3hpc/submission \\
+        --submission-id <SC submission number>
 
-The records stream is regenerated from the campaign archives with
-`cohort.py --bundle`, so the supplement never mixes checkers and records.
+SC26 requires auxiliary materials as one `<SC submission number>aux.zip` with a
+short `readme.txt`; files sit at the archive root. The records stream is
+regenerated from the campaign archives with `cohort.py --bundle`, so the
+supplement never mixes checkers and records.
 """
 
 import argparse
@@ -30,7 +33,8 @@ SOURCE_README = """# Meganeura P3HPC paper sources
 
 Build from `paper/p3hpc` with a TeX Live installation that has the
 PostScript base fonts (Times, Courier, Helvetica), booktabs, pgf/TikZ,
-microtype, xcolor and tagging:
+microtype, xcolor and tagging. `fancyhdr.sty` is the copy SC26 supplies for
+the first-page copyright block:
 
     latexmk -pdf -interaction=nonstopmode -halt-on-error main.tex
 
@@ -53,6 +57,7 @@ def main():
     parser.add_argument("archives", type=Path, help="directory holding the campaign archives and search-ablation.tgz")
     parser.add_argument("--pdf", type=Path, required=True, help="built paper PDF to copy beside the ZIPs")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--submission-id", help="SC submission number; names the auxiliary ZIP <id>aux.zip")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     bbl = args.pdf.with_suffix(".bbl")
@@ -60,8 +65,8 @@ def main():
         sys.exit(f"missing {bbl}; build the PDF with BibTeX first")
 
     files = {}
-    for name in ("main.tex", "artifact-description.tex", "sc26repro.sty", "IEEEtran.cls",
-                 "IEEEtran.bst", "references.bib"):
+    for name in ("main.tex", "artifact-description.tex", "sc26repro.sty", "fancyhdr.sty",
+                 "IEEEtran.cls", "IEEEtran.bst", "references.bib"):
         files[f"paper/p3hpc/{name}"] = (P3HPC / name).read_bytes()
     files["paper/p3hpc/main.bbl"] = bbl.read_bytes()
     for table in TABLES:
@@ -77,7 +82,7 @@ def main():
         bundle = Path(directory) / "records.jsonl.xz"
         subprocess.run([sys.executable, str(HERE / "cohort.py"), str(args.archives), "--bundle", str(bundle)],
                        check=True, stdout=subprocess.DEVNULL)
-        files = {"README.md": (HERE / "SUPPLEMENT.md").read_bytes(),
+        files = {"readme.txt": (HERE / "SUPPLEMENT.md").read_bytes(),
                  "records.jsonl.xz": bundle.read_bytes(),
                  "search-ablation.tgz": (args.archives / "search-ablation.tgz").read_bytes()}
     for name in ("cohort.py", "search_ablation.py", "footprint.py", "cohort.sha256", "search-ablation.sha256"):
@@ -86,11 +91,12 @@ def main():
         files[f"tables/{table}.tex"] = (P3HPC / "tables" / f"{table}.tex").read_bytes()
     manifest = "".join(f"{hashlib.sha256(data).hexdigest()}  {name}\n" for name, data in sorted(files.items()))
     files["MANIFEST.sha256"] = manifest.encode()
-    with zipfile.ZipFile(args.output / "meganeura-p3hpc-supplement.zip", "w") as archive:
+    auxiliary = f"{args.submission_id}aux.zip" if args.submission_id else "meganeura-p3hpc-aux.zip"
+    with zipfile.ZipFile(args.output / auxiliary, "w") as archive:
         for name, data in sorted(files.items()):
-            write(archive, f"meganeura-p3hpc-supplement/{name}", data)
+            write(archive, name, data)
     shutil.copy2(args.pdf, args.output / "meganeura-p3hpc.pdf")
-    for name in ("meganeura-p3hpc.pdf", "meganeura-p3hpc-source.zip", "meganeura-p3hpc-supplement.zip"):
+    for name in ("meganeura-p3hpc.pdf", "meganeura-p3hpc-source.zip", auxiliary):
         path = args.output / name
         print(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {name}  ({path.stat().st_size} bytes)")
 
