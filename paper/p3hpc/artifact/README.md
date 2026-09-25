@@ -1,281 +1,135 @@
-# Meganeura P3HPC artifacts
+# Meganeura P3HPC evidence
 
-## Camera-ready cohort
+This directory contains the CPU-only auditor for the September 25 v14 cohort.
+The paper uses Inferena `7b8fcb72`, Meganeura `0dbfcc00`, and PyTorch 2.13.0
+at source `cf30153c`. Full revisions and findings are in
+[RESULTS.md](../RESULTS.md). Raw measurements, PDFs and ZIPs stay outside Git.
 
-The v9 archives contain eight complete 30-pair device campaigns and a complete
-12-pair H100 extension. The September 20 presentation separates 222 GPU-reference
-pairs from 30 RPL-U qualification processes. CPU-reference timings are not
-reported; the original records remain intact for numerical/provenance checks.
-Inferena fa5a04e1 and Meganeura 428fc2d2 are the measured revisions.
-[RESULTS.md](../RESULTS.md) records scope, findings and interpretation;
-[cohort.sha256](cohort.sha256) identifies the nine original archives.
+The fourteen campaign archives, plus the later search-ablation archive,
+contain:
 
-From the repository root, with Python 3.11+:
+- Six main five-model campaigns: 180 qualified inference phase pairs and
+  174 qualified pairs in each other phase.
+- Three completed larger-model campaigns: 24 full pairs, including 360M on
+  RTX 5070, RX 7900 XT and H100, and 1.7B on H100.
+- Two hard-failed GPU-reference attempts: 780M 135M and B570 360M.
+- Three Vulkan qualifications against eager CPU PyTorch: ten conditions each
+  on 780M, Ryzen 9600X's iGPU, and Intel RPL-U. No CPU/GPU timing comparison.
+- `search-ablation.tgz`: 60 native-only processes on the RTX 5070 / B570 host
+  without search and with the library's two-second tuner, plus the runner
+  patch, driver script and kernel-level tile study. Its SHA-256 is in
+  [search-ablation.sha256](search-ablation.sha256).
 
-    python3 paper/p3hpc/artifact/cohort.py "$HOME/Downloads/p3hpc" \
-      --check paper/p3hpc/tables --output target/p3hpc-final-data
+RX 7900 XT's main campaign also contains six separate eager/math diagnostics
+after compiled Whisper training failed repeatability. Qualified inference is
+retained. Failed or unreached phases have no accepted paired timing.
+The native times remain in the table, qualified independently by those
+diagnostics. This is a failure of PyTorch's ROCm path, not of Meganeura or
+the GPU. Eager diagnostic timings never replace compiled timings.
 
-The audit checks source/checkpoint identity, raw/joined agreement, 20-sample
-medians, cross-engine numerical gates, fixed per-tensor/whole-gradient
-replay bounds, native search/precision policies, compiled reference/replay
-receipts and all three-process gradient reports. Nine LaTeX table/figure
-fragments and a 74-row GPU-reference condition CSV are regenerated without a
-GPU/network. A separate qualification table lists RPL-U's ten passing
-workload/precision conditions without CPU-versus-GPU timing ratios.
+Two standalone crash logs accompany the archives. The 780M text traceback
+differs from the archived process; it is not counted as another measurement.
 
-The supplementary ZIP is self-contained for this audit. Its records.jsonl.xz
-is a lossless compression of every original JSON value, including raw/joined
-records and full replay statistics. Pass it instead of the archive directory:
+## Audit and regenerate
 
-    python cohort.py records.jsonl.xz --check tables --output regenerated
-
-To produce that compact representation from the original archives:
-
-    python3 paper/p3hpc/artifact/cohort.py "$HOME/Downloads/p3hpc" \
-      --bundle /absolute/path/to/records.jsonl.xz
-
-The stream contains an archive-digest header followed by nine JSON maps in
-the analyzer's declared device order. Standard-library lzma supplies XZ
-decompression; no executable/model/cache/trace data is stored. Original
-runner text logs are omitted, not measurement fields. The checker cannot
-reconstruct tensor elements that the runners never retained.
-
-The separately labeled H100 search pilot has its original v7 analyzer and
-does not enter primary tables/aggregates. The MI300X report likewise is not
-a timing cell. No public hosting choice is required to replay the supplied
-supplement; a persistent DOI would still help discovery.
-
-The publication PDF, LaTeX source ZIP and supplementary ZIP stay outside Git.
-The annotated paper-p3hpc-2026 tag preserves the measured engine. No GPU benchmark was run
-during the paper update.
-
-## Original-submission artifact (legacy)
-
-The remaining instructions, `verify.py`, and `package.py` apply to the
-original five-machine dataset used by the companion report. They do **not**
-verify or package the new camera-ready cohort. Keep this distinction when
-interpreting the existing CPU-only CI check.
-
-This research object supports the paper *Vulkan and Metal as a
-Performance-Portability Layer for GPU Training and Inference*. It contains
-the frozen measurements, the exact analysis used to generate the paper's
-tables and aggregate values, and source snapshots for the two measured
-systems. The analysis replay needs only Python 3 and does not need a GPU or
-network access.
-
-The extended companion report is
-[arXiv:2608.01563](https://arxiv.org/abs/2608.01563).
-
-The package has not yet been independently evaluated. Its permanent DOI is
-pending the workshop artifact-freeze process.
-
-## Quick verification
-
-From the extracted top-level directory, run:
+From the repository root, using standard-library Python 3.11+:
 
 ```sh
-./verify.sh
-```
-
-or, on a system that does not preserve executable bits:
-
-```sh
-python3 verify.py
-```
-
-This command takes seconds. It checks every packaged file against
-`MANIFEST.sha256`, parses and audits the raw records, regenerates all six
-LaTeX table/figure fragments in a temporary directory, and compares them
-byte-for-byte with `expected/tables/`. Add `--show-facts` to print the full
-aggregate fact block used for the prose audit.
-
-The checks include raw-versus-joined record equality, median recomputation,
-and replay of the sampled-output and gradient-norm validity gates. These
-records retain 256 output samples and one norm per parameter tensor, not full
-outputs or elementwise gradients. The verifier cannot validate unretained
-elements or assert arbitrary claims in the paper's prose.
-
-This is the recommended first evaluation tier. It verifies the retained
-observations and their analysis without pretending that hardware-dependent
-timing can be recreated on an arbitrary machine.
-
-From the Meganeura checkout (not an extracted bundle), use:
-
-```sh
-python3 paper/p3hpc/artifact/verify.py --repository --show-facts
+python3 paper/p3hpc/artifact/cohort.py "$HOME/Downloads/p3hpc" \
+  --check paper/p3hpc/tables --output target/p3hpc-20260925
+python3 paper/p3hpc/artifact/search_ablation.py "$HOME/Downloads/p3hpc" \
+  "$HOME/Downloads/p3hpc/search-ablation.tgz" \
+  --check paper/p3hpc/tables --output target/p3hpc-20260925
 python3 -m unittest discover -s paper/p3hpc/artifact -p 'test_*.py'
 ```
 
-Repository mode checks `paper/results/` and replays the tracked tables in a
-temporary directory. It does not require or assert a bundle manifest or a
-packaged expected-facts file. Neither mode launches a GPU or collects timings.
+The auditor checks archive hashes, source/checkpoint identity, raw/joined
+agreement, sample medians, cross-engine numerical gates, full-tensor
+repeatability/replay receipts, construction limits, workload warmups,
+compilation deadlines and phase-level replication. It does not execute archive
+contents, use a GPU, or access the network. Reading one JSON file at a time
+keeps the detailed search receipts manageable.
 
-## Contributions and supporting artifacts
+`cohort.py` writes eight LaTeX fragments (including the strict ratio figure,
+`ratio-plot.tex`), `conditions.csv`, `failures.json`, and
+`search-summary.json`. `search_ablation.py` checks every ablation record's
+identity and policy, validates its outputs against the cohort's PyTorch
+outputs for the same GPU, workload and replicate, and writes `ablation.tex`
+and `ablation.csv`. The 60-second search arm comes from the cohort; the
+ablation never supplies a PyTorch or search timing.
+[footprint.py](footprint.py) reproduces the source-line, stripped-runner and
+PyTorch install-closure figures.
+Each CSV row includes per-phase paired counts, independently qualified counts
+for each engine, medians, process ranges and ratios. An empty ratio means there is no qualified paired timing, not zero.
 
-The paper makes four principal contributions:
+Headline medians use every main-matrix phase group with three qualified pairs.
+The Pennycook table keeps all six main platforms for every workload/phase.
+An engine without a qualified three-process timing on any of those platforms
+gets zero for that workload/phase. Where only one engine qualifies, its
+efficiency is one as the best available result. RX 7900 XT stays included:
+Meganeura's Whisper timings qualify through the separate eager diagnostics;
+PyTorch's training failed and its minimal timing was unreached. No speed
+ratio is invented for either missing phase.
+The size study and CPU-oracle qualifications never enter these aggregates.
 
-- **C1: graphics APIs as an ML performance-portability layer.** Supported by
-  **A1**, the complete strict and accelerated five-machine result matrix;
-  **A2**, the deterministic analysis; and **A3**, the frozen source.
-- **C2: mechanism-resolved performance results.** Supported by the ordinary
-  timings in **A1** and the per-dispatch timestamp sidecars in **A4**.
-- **C3: independent correctness gates.** Supported by the output, loss,
-  total-gradient-norm, and per-parameter-gradient-norm evidence in every **A1** record.
-- **C4: validity-disciplined Pennycook aggregation.** Supported by **A1** and
-  the aggregation implementation and expected output in **A2**, including the
-  symmetric oracle-dispute exclusion and its cross-backend audit.
+Apple M3 passes validation, but has large process-to-process timing variation
+in both engines, with possible sleep interruptions reported by the operator.
+The auditor prints a post-hoc check dropping samples above three times their
+own process median, using the same rule for both engines. Five of 3,600
+samples are flagged; no inference aggregate changes, and only PyTorch strict
+SmolLM2 training changes (2.51%). This cannot remove variation spanning whole
+timing windows. The primary results keep all samples and process ranges.
+Near-ties are not statistically established wins.
 
-The computational artifacts are:
+## Supplementary record stream
 
-- **A1 — `results/`:** 50 device/workload/arithmetic cells. Each cell has a
-  Meganeura record, a PyTorch record, and a joined summary: 150 JSON files in
-  total. Ten SVGs retain the harness's per-device presentation output.
-- **A2 — `mktables.py`, `verify.py`, and `expected/`:** standard-library-only
-  analysis, structural checks, generated tables, and the fact block.
-- **A3 — `source/`:** Git-archive snapshots of Meganeura and Inferena at the
-  measured revisions. A separate Meganeura snapshot retains the revision used
-  for the gap profiles.
-- **A4 — `results/*/profiles/`:** five structured hardware-timestamp
-  sidecars for NVIDIA ResNet-50 and Apple Whisper, including normal benchmark
-  samples, instrumentation overhead, dispatch geometry, and family totals.
-- **A5 — DinoVision deployment evidence:** the physical Quest 3S case study
-  is larger and independently versioned. Source is frozen at
-  [kvark/dinovision commit dc35cdf1](https://github.com/kvark/dinovision/tree/dc35cdf1c7c910cdd93c5b5362846842ae469a21),
-  and weights, raw records, manifests, and media are frozen at
-  [Hugging Face revision 2c3f9017](https://huggingface.co/mad-bot/dinovision/tree/2c3f9017fe74c41482b165890c14737a2ccd4b6a).
-  A5 is not part of the performance-portability aggregate.
-
-`BUILD_INFO.json` records the full revisions and package provenance.
-`ENVIRONMENTS.json` is a mechanically extracted summary; the unabridged
-metadata remains in every raw JSON file.
-
-## Frozen revisions
-
-- Meganeura matrix: `7561a64ec5a7e4bcdcd2c719aaaffe5912ed5e85`
-  (`paper-arxiv-1`)
-- Inferena harness: `7ca9c5c7b2cd614343a3de3dcc86999ced66e8c0`
-  (`paper-arxiv-1`)
-- Meganeura gap profiles: `b1405a3a52fabf9858aca5cbd80e246811cb6a58`
-
-The public repositories are
-[Meganeura](https://github.com/kvark/meganeura) and
-[Inferena](https://github.com/kvark/inferena). The source snapshots make
-inspection possible without the network; Git clones are preferable for a
-full rerun because they preserve revision metadata.
-
-## Machine and software matrix
-
-| Artifact directory | Measured path | Python and reference | Meganeura driver | Warmups / samples |
-|---|---|---|---|---:|
-| `nvidia` | RTX 5070, CUDA | Python 3.14.4; PyTorch 2.13.0+cu130, CUDA 13.0 | Vulkan, NVIDIA 595.71.05 | 5 / 20 |
-| `amd-d` | RX 7900 XT, ROCm | Python 3.12.13; PyTorch 2.10.0+rocm7.1, ROCm 7.1.25424 | Vulkan, RADV Mesa 26.0.3 | 5 / 20 |
-| `amd-i` | Radeon 780M, ROCm | Python 3.12.3; PyTorch 2.12.0+rocm7.14.0, ROCm 7.14.60850 | Vulkan, RADV Mesa 25.2.8 | 5 / 20 |
-| `intel` | RPL-U iGPU versus CPU fallback | Python 3.13.7; PyTorch 2.11.0+xpu executing on CPU | Vulkan, ANV Mesa 26.0.3 | 4 / 20 |
-| `mac` | Apple M3, MPS | Python 3.13.3; PyTorch 2.11.0 on MPS | Metal, macOS 15.7.3 | 5 / 20 |
-
-The Intel collection records four untimed warmups rather than five. All
-three timed series still retain 20 samples. The deviation is disclosed here
-and in the workshop manuscript; it is not normalized after collection.
-
-The reference package channels differ because the newest usable vendor wheel
-differed by machine. Most importantly, the discrete and integrated AMD
-machines intentionally use different ROCm channels. The tagged Inferena
-requirements files are installation starting points, not complete lockfiles;
-the original experiment did not retain a full transitive `pip freeze` for
-every host. Exact Python, PyTorch, GPU runtime, driver, arithmetic, and
-protocol metadata are retained. This limitation prevents a claim of
-bit-identical environment reconstruction.
-
-## Protocol
-
-There are five workloads, five machines, and two arithmetic contracts:
-
-- `paper-v1-strict`: persistent data, accumulation, and output are f32;
-  PyTorch TF32 and Meganeura f16 cooperative-input paths are disabled.
-- `paper-v1-accelerated`: PyTorch may use TF32 and Meganeura may use eligible
-  f16-input/f32-accumulate forward paths. These permissions are not treated
-  as numerically equivalent to each other or merged with strict results.
-
-Each retained cell contains full/prefill inference, a minimal-shape latency
-series, and forward-loss-backward timing without an optimizer update. The
-LLM minimal shape is a stateless one-token forward without a KV cache and is
-not decode latency. Inputs are deterministic. The analyzer reports medians
-and applies the paper's independent forward and backward validity gates
-before performance-portability aggregation.
-
-## Full experiment rerun
-
-A rerun requires one of the measured GPU/driver classes or a new machine on
-which the comparison will constitute an extension rather than an exact
-reproduction. Start from the public frozen tags:
+At final packaging, preserve every original JSON value and every text log:
 
 ```sh
-git clone --branch paper-arxiv-1 https://github.com/kvark/meganeura.git
-git clone --branch paper-arxiv-1 https://github.com/kvark/inferena.git
-cd inferena
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements-<nvidia|amd|intel|apple>.txt
-./run.sh --check
+python3 paper/p3hpc/artifact/cohort.py "$HOME/Downloads/p3hpc" \
+  --bundle /absolute/path/to/records.jsonl.xz
 ```
 
-Before timing, compare `python --version`, `torch.__version__`, the reported
-GPU runtime, and the graphics driver with the matrix above and
-`ENVIRONMENTS.json`. Package indexes move, so explicitly install the recorded
-PyTorch build if the requirements file resolves another version. For the RX
-7900 XT, use the recorded ROCm 7.1 PyTorch channel rather than the newer 7.14
-pin needed by the 780M.
+This XZ stream is not an engine cache or a new measurement protocol.
+Its first line is an object with `format: p3hpc-files-v3` and the input digest
+map. Each input then has a filename line, one `[path, value]` line per retained
+file, and a `null` terminator. JSON files retain parsed values; text logs
+retain strings. The order follows [cohort.sha256](cohort.sha256).
+Ordinary SVG presentations, model weights, executables, caches and traces are
+not needed to replay the analysis.
 
-Run only the two evaluated engines, first under the practical permission and
-then under the strict control:
+From an extracted supplement containing the analyzers, manifests, stream,
+ablation archive and tables:
 
 ```sh
-./run.sh -f pytorch,meganeura \
-  --warmup-runs 5 --measurement-runs 20 \
-  --results-dir results/paper-v1-accelerated
-
-./run.sh -f pytorch,meganeura --strict \
-  --warmup-runs 5 --measurement-runs 20 \
-  --results-dir results/paper-v1-strict
+python3 cohort.py records.jsonl.xz --check tables --output regenerated
+python3 search_ablation.py records.jsonl.xz search-ablation.tgz --check tables --output regenerated
 ```
 
-Use `--warmup-runs 4` only when recreating the recorded Intel protocol.
-`--profile --profile-samples 5` requests structured per-dispatch timestamps;
-the supplied gap profiles were captured at the separately disclosed
-Meganeura profile revision. No RenderDoc capture is required.
+The original archive hashes establish input identity; a separate
+`MANIFEST.sha256` must protect the actual packaged files. Full-element
+qualification reports do not include every tensor element. The checker
+cannot reconstruct values the runners never retained.
 
-One strict-plus-accelerated sweep took less than an hour per original
-machine, dominated by `torch.compile`. Hardware access and moving vendor
-package channels are the expensive parts; analysis replay is intentionally
-separate and fast.
+The source ZIP and supplementary ZIP must each have clear top-level
+instructions. The supplementary ZIP must contain a **README**. Do not include
+earlier benchmark cohorts, H100 tuning pilots, or development timing profiles.
+Separate availability notes for MI300X and the qualification-only GPUs are
+supporting evidence, not substitutes for current results.
 
-## Known limitations
+The source ZIP must include `artifact-description.tex` and `sc26repro.sty` as
+well as `main.tex`, both bibliography files and the required figures/tables.
+The AD uses the SC26 template; the optional AE section is omitted. Both
+measured repositories carry the public tag `paper-p3hpc-2026-final`.
 
-- One physical machine represents each vendor/class except AMD; the artifact
-  does not establish vendor-wide performance.
-- Timings are 20 samples from one process-level collection per cell, not
-  independent process replicates.
-- The Apple and Intel references are eager, and Intel falls back to CPU.
-- No manual CUDA Graph capture was added to PyTorch.
-- The post-freeze observability and shader-consolidation work linked from the
-  paper (Meganeura PR 137) is intentionally absent from this bundle's frozen
-  source and did not affect any reported measurement or source-size count.
-- The PyTorch/ROCm Whisper backward record on the 780M fails the
-  cross-backend oracle-consistency check in both arithmetic contracts. Raw
-  timings and diagnostics are retained, but that paired training comparison
-  is excluded symmetrically from ratios and aggregation; its valid forward
-  timings remain included. The records identify an unusable local oracle but
-  do not establish whether the root cause lies in PyTorch, ROCm, or the driver.
-- The gap profiles predate the matrix freeze by one Meganeura revision. The
-  NVIDIA control median matches the frozen result; the Apple profile is
-  explicitly a pre-optimization diagnostic.
-- Full transitive Python environment freezes were not retained.
+The PDF, source ZIP and supplementary ZIP are rebuilt together under the
+ignored `paper/p3hpc/submission/` (see [paper/README.md](../../README.md)).
+Do not combine the checkers with old tables or a v2 record stream.
 
-## License, citation, and contact
+## Legacy original-submission audit
 
-The packaged code, measurements, and documentation are distributed under
-the MIT license in `LICENSE`. Citation metadata in `CITATION.cff` includes the
-public companion-report identifier.
-
-Questions: Dzmitry Malyshau, `kvark@fastmail.com`, ORCID
-`0009-0005-6410-4276`.
+`verify.py`, `verify.sh`, `package.py`, and most cases in `test_verify.py`
+still cover the original five-machine data under `paper/results/`.
+They do not package or verify the current cohort. The earlier detailed
+artifact instructions and measurements remain in Git history; `cohort.py`
+is the entry point for the current paper.

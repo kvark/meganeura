@@ -100,6 +100,23 @@ splits and convolution weight splits use the existing compiler, with no
 session-buffer patching. There is no reusable command recording or separate
 live structural tuner.
 
+The collection harness gives private probes the remaining shared session
+deadline, not an independent two-second slice. The shorter slices repeatedly
+interrupted expensive qualification on B570 SmolLM2 and left later, repeated
+matrix classes untuned. Completing the ordinary candidate's kernel search
+first recovered a faster incumbent without adding another optimizer. This is
+budget allocation, not a monotonic-performance guarantee: an exhausted total
+budget or a change in execution state can still defeat that expectation.
+Held-out inference and minimal-shape measurements must check the selected plan;
+training improvements do not compensate for inference regressions.
+The v11 B570 qualification failure was subsequently traced to the nearly
+rank-two sinusoidal fixture and a GELU derivative bug, not evidence that the
+numerical gate should be weakened. Inferena v12 replaced the fixture with
+matched uniform parameters and picked up the derivative fix. V13 pins the
+reviewed joint schedule search and checks its sixteen-form frontier and
+250 ms comparison warmup. Each backend still needs qualification at the new
+pin; earlier successes do not certify it.
+
 This is a bounded first implementation, not exhaustive graph scheduling. Small
 graphs are searched together. Larger pure graphs can expose all operators with
 rewrite rules, with other operators as opaque cut edges, within the same node

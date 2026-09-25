@@ -1,7 +1,10 @@
-\begin{tabular}{llrl}
+\begin{tabular}{lll}
 \toprule
-Device & Meganeura path & Qualified conditions & PyTorch GPU \\
+GPU & Meganeura & PyTorch GPU path \\
 \midrule
-Intel RPL-U & Vulkan & 10/10 & Unavailable \\
+Radeon 780M & Vulkan 10/10 & HIP launch failure \\
+Ryzen 9600X iGPU & Vulkan 10/10 & ROCm crash, wrong output$^\dagger$ \\
+Intel RPL-U & Vulkan 10/10 & no XPU device$^\dagger$ \\
+MI300X$^\dagger$ & no Vulkan driver & strict 135M ran \\
 \bottomrule
 \end{tabular}
