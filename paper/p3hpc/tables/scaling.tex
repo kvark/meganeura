@@ -1,12 +1,20 @@
-\begin{tabular}{llrrrrrrrrr}
+\begin{tabular}{lllrrrrrr}
 \toprule
-Model & Arithmetic & $n$ & \multicolumn{2}{c}{Prefill ms} & \multicolumn{2}{c}{One token ms} & \multicolumn{2}{c}{F+L+B ms} & \multicolumn{2}{c}{Compile s} \\ & & & M & P & M & P & M & P & M & P \\
+Device & Model & Arithmetic & \multicolumn{2}{c}{Prefill ms} & \multicolumn{2}{c}{One token ms} & \multicolumn{2}{c}{F+L+B ms} \\ & & & M & P & M & P & M & P \\
 \midrule
-SmolLM2-135M & strict & 3 & 9.63 & 3.32 & 1.86 & 1.27 & 38.65 & 9.87 & 3.53 & 54.15 \\
-SmolLM2-135M & accelerated & 3 & 8.68 & 2.22 & 1.83 & 1.26 & 36.90 & 6.97 & 4.33 & 54.20 \\
-SmolLM2-360M & strict & 3 & 15.32 & 5.13 & 2.58 & 1.85 & 52.57 & 14.98 & 5.56 & 58.40 \\
-SmolLM2-360M & accelerated & 3 & 14.13 & 2.86 & 2.58 & 1.86 & 50.92 & 9.02 & 5.80 & 58.66 \\
-SmolLM2-1.7B & strict & 3 & 34.20 & 11.90 & 8.10 & 3.24 & 103.48 & 35.81 & 14.80 & 40.06 \\
-SmolLM2-1.7B & accelerated & 3 & 53.66 & 4.39 & 8.19 & 3.25 & 116.18 & 16.37 & 12.58 & 40.78 \\
+RTX 5070 & 135M & strict & 7.29 & 6.08 & 1.51 & 1.64 & 31.94 & 15.60 \\
+RTX 5070 & 135M & accelerated & 7.52 & 2.73 & 1.52 & 1.64 & 30.79 & 9.56 \\
+RTX 5070 & 360M & strict & 19.94 & 11.82 & 4.45 & 3.18 & 60.41 & 28.64 \\
+RTX 5070 & 360M & accelerated & 17.23 & 5.01 & 4.45 & 3.18 & 57.09 & 16.67 \\
+RX 7900 XT & 135M & strict & 6.14 & 9.20 & 1.18 & 6.19 & 26.92 & 30.56 \\
+RX 7900 XT & 135M & accelerated & 7.40 & 9.20 & 1.18 & 6.19 & 26.01 & 30.67 \\
+RX 7900 XT & 360M & strict & 12.07 & 17.14 & 2.57 & 10.04 & 42.68 & 49.48 \\
+RX 7900 XT & 360M & accelerated & 13.87 & 17.18 & 2.57 & 10.05 & 41.45 & 49.62 \\
+H100 & 135M & strict & 6.06 & 3.30 & 1.29 & 1.28 & 32.20 & 9.92 \\
+H100 & 135M & accelerated & 8.07 & 2.16 & 1.29 & 1.28 & 29.92 & 6.86 \\
+H100 & 360M & strict & 9.82 & 5.10 & 2.13 & 1.84 & 44.51 & 15.02 \\
+H100 & 360M & accelerated & 14.02 & 2.80 & 2.17 & 1.84 & 44.24 & 9.14 \\
+H100 & 1.7B & strict & 29.90 & 11.87 & 7.13 & 3.24 & 99.80 & 35.84 \\
+H100 & 1.7B & accelerated & 53.58 & 4.37 & 7.27 & 3.24 & 107.78 & 16.39 \\
 \bottomrule
 \end{tabular}

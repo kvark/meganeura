@@ -25,19 +25,41 @@ class EvidenceTests(unittest.TestCase):
     def test_current_cohort_keeps_partial_and_cpu_runs_out_of_aggregates(self):
         campaigns = {device: {"args": {"backend": backend, "eager": backend == "cpu"}}
                      for device, backend in (("full", "cuda"), ("partial", "rocm"), ("oracle", "cpu"))}
-        rows = {device: {("strict", model, cohort.primary_condition(c)): {"replicates": 3}
+        rows = {device: {("strict", model, cohort.primary_condition(c)):
+                        {"replicates_" + phase: 3 for phase in cohort.PHASES}
                         for model in cohort.MODELS} for device, c in campaigns.items()}
-        rows["partial"]["strict", "SmolLM2-135M", "default-graph1"]["replicates"] = 2
+        rows["partial"]["strict", "SmolLM2-135M", "default-graph1"]["replicates_training"] = 0
         self.assertEqual(cohort.complete_devices(campaigns, rows, "strict"), ["full"])
         self.assertEqual(cohort.complete_devices(campaigns, rows, "accelerated"), [])
+        pair = {engine: {"timing_samples_ms": {phase: [1.0] for phase in cohort.PHASES},
+                         "timings": {"compile_s": 0.0}, "execution": {"graph_replay": {"phases": {}}}}
+                for engine in cohort.ENGINES}
+        key = ("strict", "Whisper-tiny", "default-graph1")
+        runs = [{"pair": pair, "phases": ("inference",), "diagnostic_errors": None} for _ in range(3)]
+        row = cohort.aggregate({key: runs})[key]
+        self.assertEqual(row["replicates_inference"], 3)
+        self.assertEqual(row["replicates_training"], 0)
+        self.assertEqual(row["ratio_inference"], 1)
+        self.assertIsNone(row["ratio_training"])
+        self.assertIsNone(row["meganeura_training"])
+        for run in runs:
+            run["diagnostic_errors"] = {"output_relative_l2_error": 0.0}
+        row = cohort.aggregate({key: runs})[key]
+        self.assertEqual(row["meganeura_training"], 1.0)
+        self.assertEqual(row["meganeura_training_replicates"], 3)
+        self.assertEqual(row["pytorch_training_replicates"], 0)
+        self.assertIsNone(row["pytorch_training"])
+        self.assertIsNone(row["ratio_training"])
+        self.assertEqual(cohort.portability_score([row], "meganeura", "training"), 1.0)
+        self.assertEqual(cohort.portability_score([row], "pytorch", "training"), 0.0)
 
     def test_streamed_records_preserve_raw_summary_identity(self):
         record = {"framework": "pytorch", "status": "ok", "timings": {"inference_ms": 1.0}}
         records = cohort.read_records(iter((("raw.json", copy.deepcopy(record)),
-                                           ("summary.json", [copy.deepcopy(record)]))), False)
+                                           ("summary.json", [copy.deepcopy(record)]))))
         self.assertEqual(records["raw.json"], records["summary.json"][0])
         record["timings"]["inference_ms"] = 2.0
-        changed = cohort.read_records(iter((("raw.json", record),)), False)
+        changed = cohort.read_records(iter((("raw.json", record),)))
         self.assertNotEqual(records["raw.json"]["source_digest"], changed["raw.json"]["source_digest"])
 
     def test_frozen_inventory_and_gates(self):

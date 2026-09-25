@@ -1,0 +1,196 @@
+% SC26 AD template, jennfshr/sc26-repro b5195e67d9ad0b5d07e8b6840558c7251c73b3c0.
+% Included after the paper's references using the supplied IEEEtran/sc26repro style.
+% No AE appendix or badge claim is submitted.
+%\usetag{explanation}
+%\usetag{example}
+\appendixAD
+
+\section{Overview of Contributions and Artifacts}
+
+\subsection{Paper's Main Contributions}
+
+\begin{description}
+\item[$C_1$] A shared graph compiler and training runtime over Vulkan and Metal,
+with measured graph/kernel selection and independent correctness checks.
+\item[$C_2$] A cross-vendor comparison with explicit arithmetic, preparation,
+replay, and failure policies, including models up to 1.7B parameters.
+\item[$C_3$] A physical deployment that shares the graphics context and queue
+between neural inference and rendering.
+\end{description}
+
+\subsection{Computational Artifacts}
+
+\begin{description}
+\item[$A_1$] The public
+\href{https://github.com/kvark/meganeura/tree/0dbfcc0029bf98b33a03fc792e1f4e90ead17f23}{Meganeura}
+and \href{https://github.com/kvark/inferena/tree/7b8fcb72e55410d8e33bbe948f89be50c691fcf7}{Inferena}
+sources, both tagged \code{paper-p3hpc-2026-final}, and the paper's
+supplementary records and CPU-only analyzer. No DOI has been assigned.
+\item[$A_2$] The public
+\href{https://github.com/kvark/dinovision/tree/dc35cdf1c7c910cdd93c5b5362846842ae469a21}{DinoVision source}
+and \href{https://huggingface.co/mad-bot/dinovision/tree/2c3f9017fe74c41482b165890c14737a2ccd4b6a}{evidence archive}.
+No DOI has been assigned.
+\end{description}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Artifact & Contributions & Related paper elements\\
+\midrule
+$A_1$ & $C_1$, $C_2$ & Tables~\ref{tab:devices}--\ref{tab:pp},\\
+      &              & Tables~\ref{tab:preparation}, \ref{tab:memory}, Figure~\ref{fig:smollm2}\\
+$A_2$ & $C_3$ & Section~\ref{sec:edge}, Figure~\ref{fig:dinovision}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Artifact Identification}
+
+\newartifact
+
+\artrel
+The sources implement the compiler, validation tools and paired collection.
+The supplement preserves the cohort used in every framework timing table
+and the SmolLM2 chart. Separate driver bring-up notes document availability
+limits; they supply no missing cohort timing.
+
+\artexp
+Offline analysis should reproduce the tables and figure exactly.
+It checks 198 complete GPU pairs, six inference-only pairs with separate
+eager diagnostics, and 30 CPU-oracle qualifications. Two hard-failed
+campaigns are retained, not replaced by successful retries.
+Fresh runs reproduce the procedure, not the original timing noise or
+the exact driver-dependent failure.
+
+\arttime
+Offline setup and analysis each take about 1--5 minutes on an ordinary
+workstation; no GPU is needed. For fresh collection, allow roughly
+10--30 minutes for setup plus downloads, and 120--240 minutes per GPU
+campaign. These are planning estimates, not measured end-to-end costs.
+Large models and CPU-oracle qualification can take longer. Repeating
+all platforms requires separate machines; it is not a single short run.
+
+\artin
+
+\artinpart{Hardware}
+Offline replay needs only a CPU and enough disk for the supplied records.
+Fresh collection needs the relevant Vulkan or Metal GPU plus its
+PyTorch backend. The primary systems are RTX~5070, RTX~3050, H100,
+RX~7900~XT, Arc~B570 and Apple~M3. The qualification-only GPUs are
+Radeon~780M, Ryzen~9600X's integrated Radeon and Intel RPL-U.
+H100 has 80\,GB device memory for the 1.7B extension.
+Driver versions and replay differences are in Table~\ref{tab:devices}
+and the campaign manifests.
+
+\artinpart{Software}
+Analysis uses standard-library Python 3.11 or later.
+Collection uses Python 3.13.13 and PyTorch 2.13.0, source
+\code{cf30153c4c131c8164ee7798e5022d810682e2cb}, from the
+\href{https://download.pytorch.org/whl/}{PyTorch wheel index}.
+Inferena pins Meganeura \code{0dbfcc00}, Blade \code{fbb4f28},
+the Rust dependency lockfile, and platform-specific Python requirements.
+The measured Inferena revision is \code{7b8fcb72}.
+The pinned \href{https://github.com/kvark/inferena/blob/7b8fcb72e55410d8e33bbe948f89be50c691fcf7/EXPERIMENT.md}{collection instructions}
+cover Linux, Windows and macOS, including the Windows Rust build toolchain.
+Manifests retain package versions and PyTorch build configuration.
+Rust compiler versions were not retained in every campaign receipt;
+this limits exact reconstruction of native builds.
+
+\artinpart{Datasets / Inputs}
+Inputs are synthetic and deterministic. Non-language-model weights use
+\code{name-index-uniform-v1}. The setup downloads SmolLM2 checkpoints
+from \href{https://huggingface.co/HuggingFaceTB}{HuggingFaceTB} at pinned
+model revisions; the manifest records their hashes. Model shapes and
+arithmetic contracts are given in the methods section.
+The supplement contains all retained JSON values and 244 text logs from
+fourteen campaign archives and two standalone crash logs, compressed
+as \path{records.jsonl.xz}. It excludes weights, executables and caches.
+Archive hashes establish provenance; the supplement's own manifest
+protects the packaged files.
+
+\artinpart{Installation and Deployment}
+For offline analysis, unpack the supplement and use its README.
+For fresh collection, check out the Inferena tag above, install Rust
+and \href{https://docs.astral.sh/uv/}{uv}, and run the platform setup
+script with \code{cu130}, \code{rocm7.2}, \code{xpu}, \code{mps} or
+\code{cpu}. It creates an isolated environment with managed Python.
+Use the Windows setup script on Windows.
+The collector builds the native runner and prepares pinned models.
+Driver installation remains a platform prerequisite, not a Python
+environment operation.
+
+\artcomp
+Setup precedes device selection and collection; collection produces
+manifests and per-process records; CPU-only analysis validates those
+records and generates the tables.
+Run \code{python scripts/p3hpc.py} in the managed environment for the
+five-model matrix. It uses three fresh process pairs per condition,
+both arithmetic contracts, at least five warmups and two seconds per
+phase, then twenty samples. Native search has a shared soft 60-second
+deadline per session; default PyTorch compilation has a supervised
+120-second deadline. CUDA/HIP/XPU use checked replay; MPS compiles
+without a public equivalent.
+Use \code{--models SmolLM2-360M} for the desktop extension and add
+\code{SmolLM2-1.7B} on H100. CPU-oracle qualification uses
+\code{--backend cpu --qualify-only --eager}, never a CPU/GPU speed ratio.
+\code{--gpu} selects the native GPU on multi-GPU hosts.
+Copy or rename \code{latest.tgz} before another campaign replaces it.
+
+\artout
+Run \code{python cohort.py records.jsonl.xz --check tables --output regenerated}.
+The analyzer checks source identity, raw/joined agreement, numerical gates,
+preparation and replay policies, and phase-level replication.
+It regenerates nine LaTeX fragments, per-condition CSV medians and ranges,
+failure records and search summaries. Failed PyTorch phases remain absent;
+independently qualified native timings remain available. Eager diagnostics
+never replace compiled timing. The supplement README explains the M3
+timing sensitivity and six-platform portability scores.
+The artifact has not undergone independent artifact evaluation.
+
+\newartifact
+
+\artrel
+DinoVision exercises native checkpoint transfer and shared rendering/ML
+resources on a physical headset, separately from the framework comparison.
+
+\artexp
+The retained outputs should reproduce the stated host/device error checks,
+and the sweep records should reproduce the reported queue-sharing tradeoffs.
+It is not a PyTorch comparison or an on-device training benchmark.
+
+\arttime
+Allow about 5--15 minutes to inspect the retained records. A new physical
+run requires Android deployment and headset setup; allow 60--120 minutes
+if the Android toolchain is already installed. These are estimates.
+
+\artin
+
+\artinpart{Hardware}
+Offline inspection needs only a CPU. Physical reproduction requires a
+Quest~3S, a development host and a GPU for decoder training.
+
+\artinpart{Software}
+The pinned DinoVision source contains the Rust dependency lockfile and
+deployment instructions. Android and OpenXR tools are needed for physical
+deployment. The archive records the measured application and device setup;
+no Android framework comparison is claimed.
+
+\artinpart{Datasets / Inputs}
+The public evidence archive contains the fixed frame, parameters, output
+checks, raw sweep samples, manifests and full-resolution media.
+
+\artinpart{Installation and Deployment}
+Follow the pinned source and archive instructions to build and install the
+application. Offline analysis does not require the headset or a new build.
+
+\artcomp
+Train and save the decoder on the host, transfer its checkpoint, then run
+the joined encoder/decoder on the headset's rendering context.
+Check the fixed-frame host/device outputs before the live queue-sharing
+sweep. Retained evidence allows these two checks to be inspected separately.
+
+\artout
+The output check measures numerical agreement, not image-quality superiority.
+The sweep measures application submissions, eye updates and worker latency.
+Its records support Section~\ref{sec:edge}; none enters the framework timing
+tables or portability aggregate.

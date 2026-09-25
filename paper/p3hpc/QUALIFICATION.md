@@ -6,8 +6,8 @@ not a performance competitor. Do not publish CPU/GPU timing ratios or include
 these runs in GPU performance, preparation-time or portability-score aggregates.
 
 The existing collector already supports this; no new harness is needed.
-The September 21 qualification uses Inferena `06f2f800` and Meganeura
-`dbb43648` on `experiment/p3hpc-cuda-graphs`. Both devices below pass all ten
+The September 25 qualification uses Inferena `7b8fcb72` and Meganeura
+`0dbfcc00`, tagged `paper-p3hpc-2026-final` in both repositories. All three devices below pass all ten
 workload/precision conditions at those pins. Repeat qualification after an
 engine update before claiming coverage of the new revision.
 
@@ -20,8 +20,8 @@ reason to label this processor's integrated GPU as a separate Mendocino APU.
 From the Inferena checkout, with Rust, uv and a working RADV Vulkan driver:
 
 ```sh
-git switch experiment/p3hpc-cuda-graphs
-git pull --ff-only
+git fetch origin tag paper-p3hpc-2026-final
+git switch --detach paper-p3hpc-2026-final
 bash scripts/setup.sh cpu .venv-p3hpc-cpu
 cargo run --release --locked -p inferena-meganeura -- --list-devices
 .venv-p3hpc-cpu/bin/python scripts/p3hpc.py \
@@ -61,8 +61,24 @@ cp ../inferena-results/latest.tgz ../inferena-results/intel-rpl-u-qualification.
 ```
 
 The current archives establish ten passing workload/precision conditions,
-one process each, on RPL-U and the Ryzen iGPU. These are qualification runs,
+one process each, on RPL-U, Radeon 780M, and the Ryzen iGPU. These are qualification runs,
 not three-replicate timing campaigns. The paper reports no CPU-reference timings.
+
+## Radeon 780M
+
+The compiled ROCm campaign failed on its first strict SmolLM2-135M condition
+with an unspecified HIP launch failure. Separate qualification passed:
+
+```sh
+.venv-p3hpc-cpu/bin/python scripts/p3hpc.py \
+  --backend cpu --gpu 'AMD Radeon 780M' --qualify-only --eager
+cp ../inferena-results/latest.tgz ../inferena-results/amd-780m-qualification.tgz
+```
+
+The supplied run used the ROCm wheel with `--backend cpu`, which is also valid.
+Its architecture/copy overrides are recorded, but do not configure Vulkan or
+the CPU oracle. This establishes the tested native path, not a claim that every
+possible PyTorch GPU configuration must fail.
 
 ## Evidence and archive lifetime
 

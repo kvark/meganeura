@@ -2,8 +2,9 @@
 \toprule
 Device & Meganeura & PyTorch GPU & Blocking stage \\
 \midrule
-Intel RPL-U & Vulkan: 10/10 & No usable GPU path & XPU device unavailable \\
-Ryzen 9600X iGPU & Vulkan: 10/10 & No usable GPU path & ROCm crash / incorrect output \\
+Radeon 780M & Vulkan: 10/10 & No qualified GPU comparison & HIP launch failure (strict 135M) \\
+Ryzen 9600X iGPU & Vulkan: 10/10 & No qualified GPU comparison & Reported ROCm crash / incorrect output \\
+Intel RPL-U & Vulkan: 10/10 & No qualified GPU comparison & XPU device unavailable \\
 MI300X (earlier attempt) & No validated Vulkan run & Strict 135M ran & Vulkan driver support \\
 \bottomrule
 \end{tabular}
