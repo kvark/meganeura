@@ -158,6 +158,17 @@ impl Generator {
             let mut cfg = crate::SessionConfig::inference_from_env_on(prefill.context());
             cfg.share_parameters_from = Some(&mut prefill);
             let mut decode = crate::build(&decode_graph, cfg).0;
+            // Every parameter the two have in common must be one buffer: the
+            // weights so they are stored once, and the caches so a prompt the
+            // prefill session writes is already visible to decode.
+            for entry in &decode.plan().param_buffers {
+                let name = &entry.0;
+                if prefill.has_parameter(name) && !decode.shares_parameter(&prefill, name) {
+                    return Err(GgufError::BadMetadata(format!(
+                        "the prefill and decode sessions store `{name}` differently"
+                    )));
+                }
+            }
             // Shape-specific optimization may retain a weight only in the
             // decode plan. Such parameters have ordinary private allocations
             // and still need their GGUF contents loaded.

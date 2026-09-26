@@ -93,8 +93,12 @@ pub fn load(
     Ok(report)
 }
 
-/// Load weights needed only by `session`, after its common parameters were
-/// bound from `source` during construction.
+/// Load the weights `session` does not share with `source`, after its common
+/// parameters were bound from `source` during construction.
+///
+/// Parameters are loaded by their GGUF names. A derived parameter (packed
+/// from several weights) is filled only by `set_parameter` of a source name
+/// the same session holds, so GGUF graphs do not rely on them.
 pub(super) fn load_private(
     session: &mut Session,
     source: &Session,
@@ -103,15 +107,15 @@ pub(super) fn load_private(
     report: &mut LoadReport,
 ) -> Result<(), GgufError> {
     for name in graph::parameter_names(config) {
-        if source.has_parameter(&name) || !session.has_parameter(&name) {
+        if !session.has_parameter(&name) || session.shares_parameter(source, &name) {
             continue;
         }
         let tensor = resolve(model, config, &name)?;
         load_one(session, &name, &tensor, config, report)?;
     }
     for name in graph::optional_parameter_names(config) {
-        if source.has_parameter(&name)
-            || !session.has_parameter(&name)
+        if !session.has_parameter(&name)
+            || session.shares_parameter(source, &name)
             || !model.tensors.contains_key(&name)
         {
             continue;

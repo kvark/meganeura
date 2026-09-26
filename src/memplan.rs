@@ -94,6 +94,41 @@ impl AliasPlan {
             && self.offsets[b] < self.offsets[a] + sizes[a].max(1)
     }
 
+    /// Point logical buffer `index` (of `size` bytes) at another allocation,
+    /// at byte `offset`, and return the physical index to install it under.
+    /// That is its old allocation when it was the only tenant; otherwise
+    /// (an arena, for instance) a new entry appended here, leaving the old
+    /// allocation to its other tenants.
+    pub fn rebind(
+        &mut self,
+        index: usize,
+        size: usize,
+        offset: usize,
+        device_local: bool,
+    ) -> usize {
+        let old = self.map[index];
+        let arena = self
+            .arena
+            .iter()
+            .any(|chunk| chunk.params == old || chunk.grads == old);
+        let shared = self
+            .map
+            .iter()
+            .enumerate()
+            .any(|(other, &physical)| physical == old && other != index);
+        let target = if arena || shared {
+            self.sizes.push(size);
+            self.device_local.push(device_local);
+            self.sizes.len() - 1
+        } else {
+            self.device_local[old] = device_local;
+            old
+        };
+        self.map[index] = target;
+        self.offsets[index] = offset;
+        target
+    }
+
     /// Move the eligible trainable parameters and their gradients out of
     /// their dedicated allocations into arena chunks of at most
     /// `chunk_bytes` (a larger pair gets a chunk of its own).

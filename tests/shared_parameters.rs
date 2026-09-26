@@ -59,6 +59,7 @@ fn construction_shares_available_parameters_and_allocates_the_rest() {
     let mut config = SessionConfig::inference_from_env();
     config.share_parameters_from = Some(&mut source);
     let mut target = meganeura::build(&graph_with_bias(2), config).0;
+    assert!(target.shares_parameter(&source, "weight"));
     drop(source);
 
     let mut values = [1.0; 4];
@@ -158,4 +159,88 @@ fn construction_preserves_a_donor_arena_offset() {
     reader.step();
     reader.wait();
     assert_eq!(reader.read_output(2), [8.0, 15.0]);
+}
+
+#[test]
+fn construction_skips_a_parameter_stored_differently() {
+    let mut source = meganeura::build(&graph(2), SessionConfig::inference_from_env()).0;
+    source.set_parameter("weight", &[2.0, 0.0, 0.0, 3.0]);
+
+    let mut config = SessionConfig::inference_from_env();
+    config.share_parameters_from = Some(&mut source);
+    let mut target = meganeura::build(&graph(3), config).0;
+    assert!(!target.shares_parameter(&source, "weight"));
+    let mut values = [1.0; 9];
+    target.read_param("weight", &mut values);
+    assert_eq!(values, [0.0; 9]);
+    target.set_parameter("weight", &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+    target.set_input("x", &[4.0, 5.0, 6.0]);
+    target.step();
+    target.wait();
+    assert_eq!(target.read_output(3), [4.0, 5.0, 6.0]);
+    // The source keeps its own values.
+    let mut values = [0.0; 4];
+    source.read_param("weight", &mut values);
+    assert_eq!(values, [2.0, 0.0, 0.0, 3.0]);
+}
+
+/// A training session built on another session's parameter trains the
+/// shared allocation, and its remaining parameters from its arena.
+#[test]
+fn construction_donates_into_a_training_arena() {
+    let a = [1.0, -1.0, 0.5, 2.0];
+    let weight = [2.0, 0.0, 0.0, 3.0];
+    let (next_a, next_weight) = sgd_step(a, weight, 0.125);
+    let mut reader = meganeura::build(&graph(2), SessionConfig::inference_from_env()).0;
+    reader.set_parameter("weight", &weight);
+    let config = SessionConfig {
+        share_parameters_from: Some(&mut reader),
+        ..Default::default()
+    };
+    let mut trainer = meganeura::build(&training_graph(), config).0;
+    assert!(trainer.shares_parameter(&reader, "weight"));
+    trainer.set_parameter("a", &a);
+    trainer.set_input("x", &[1.0, 2.0]);
+    trainer.set_learning_rate(0.125);
+    trainer.step();
+    trainer.wait();
+    let mut values = [0.0; 4];
+    trainer.read_param("a", &mut values);
+    assert_eq!(values, next_a);
+    trainer.read_param("weight", &mut values);
+    assert_eq!(values, next_weight);
+    reader.read_param("weight", &mut values);
+    assert_eq!(values, next_weight);
+}
+
+/// With every parameter donated, the new session's parameter arena has no
+/// tenants left and shrinks to a placeholder; training still updates the
+/// donated allocations.
+#[test]
+fn construction_donates_a_whole_training_arena() {
+    let a = [1.0, -1.0, 0.5, 2.0];
+    let weight = [2.0, 0.0, 0.0, 3.0];
+    let (next_a, next_weight) = sgd_step(a, weight, 0.125);
+    let mut donor = meganeura::build(&training_graph(), SessionConfig::default()).0;
+    donor.set_parameter("a", &a);
+    donor.set_parameter("weight", &weight);
+    let unshared = donor.memory_summary().allocated_buffer_bytes;
+    let config = SessionConfig {
+        share_parameters_from: Some(&mut donor),
+        ..Default::default()
+    };
+    let mut trainer = meganeura::build(&training_graph(), config).0;
+    assert!(trainer.memory_summary().allocated_buffer_bytes < unshared);
+    trainer.set_input("x", &[1.0, 2.0]);
+    trainer.set_learning_rate(0.125);
+    trainer.step();
+    trainer.wait();
+    let mut values = [0.0; 4];
+    for (name, expected) in [("a", next_a), ("weight", next_weight)] {
+        assert!(trainer.shares_parameter(&donor, name));
+        trainer.read_param(name, &mut values);
+        assert_eq!(values, expected, "{name}");
+        donor.read_param(name, &mut values);
+        assert_eq!(values, expected, "{name}");
+    }
 }
