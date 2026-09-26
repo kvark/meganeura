@@ -253,12 +253,13 @@ pub struct SessionConfig<'a> {
     /// renderer is the motivating use case — see
     /// [`Session::with_context`] for details.
     pub gpu: Option<Arc<blade_graphics::Context>>,
-    /// Reuse same-named, same-sized parameter allocations from this session
-    /// while constructing the new one. Parameters absent from the source
-    /// retain ordinary private, zero-initialized allocations.
+    /// Reuse same-named parameter allocations from this session while
+    /// constructing the new one, so they are never allocated twice.
+    /// Parameters absent from the source, or stored differently there (size,
+    /// weight format or logical type), keep ordinary private zero-initialized
+    /// allocations; [`Session::shares_parameter`] tells which were shared.
     ///
     /// When `gpu` is `None`, the source session's context is used.
-    /// Construction panics if a same-named parameter has a different size.
     pub share_parameters_from: Option<&'a mut Session>,
     pub options: compile::CompileOptions,
     /// When set, load a previously-compiled plan from this path if it

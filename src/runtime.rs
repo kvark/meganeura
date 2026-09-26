@@ -3242,38 +3242,29 @@ impl Session {
                 };
                 let target_index = target.0 as usize;
                 let source_index = source_buffer.0 as usize;
-                let target_size = plan.buffers[target_index];
-                let source_size = source.plan.buffers[source_index];
-                assert_eq!(
-                    target_size, source_size,
-                    "parameter source has incompatible storage for `{name}`"
-                );
-
+                // Same bytes, same storage format and the same logical
+                // tensor; anything else keeps a private allocation.
+                if plan.buffers[target_index] != source.plan.buffers[source_index]
+                    || plan.weight_buffers.get(&target)
+                        != source.plan.weight_buffers.get(&source_buffer)
+                    || plan.param_types.get(&target) != source.plan.param_types.get(&source_buffer)
+                {
+                    log::warn!(
+                        "parameter `{name}` is stored differently in the source session; \
+                         allocating it separately"
+                    );
+                    continue;
+                }
                 let source_physical = source.alias.map[source_index];
-                let target_physical = alias.map[target_index];
-                let target_is_arena = alias
-                    .arena
-                    .iter()
-                    .any(|chunk| chunk.params == target_physical);
-                let target_is_shared =
-                    alias.map.iter().enumerate().any(|(index, &physical)| {
-                        index != target_index && physical == target_physical
-                    });
-                let shared = Arc::clone(&source.physical_buffers[source_physical]);
-                let device_local = source.alias.device_local[source_physical];
-                let physical = if target_is_arena || target_is_shared {
-                    let physical = alias.sizes.len();
-                    alias.sizes.push(target_size);
-                    alias.device_local.push(device_local);
-                    provided_physical.push(Some(shared));
-                    physical
-                } else {
-                    alias.device_local[target_physical] = device_local;
-                    provided_physical[target_physical] = Some(shared);
-                    target_physical
-                };
-                alias.map[target_index] = physical;
-                alias.offsets[target_index] = source.alias.offsets[source_index];
+                let physical = alias.rebind(
+                    target_index,
+                    plan.buffers[target_index],
+                    source.alias.offsets[source_index],
+                    source.alias.device_local[source_physical],
+                );
+                provided_physical.resize(alias.sizes.len(), None);
+                provided_physical[physical] =
+                    Some(Arc::clone(&source.physical_buffers[source_physical]));
                 provided_parameters += 1;
             }
         }
@@ -3868,31 +3859,29 @@ impl Session {
         offset: usize,
         device_local: bool,
     ) {
-        let old = self.alias.map[index];
-        let arena = self
-            .alias
-            .arena
-            .iter()
-            .any(|chunk| chunk.params == old || chunk.grads == old);
-        let shared = self
-            .alias
-            .map
-            .iter()
-            .enumerate()
-            .any(|(other, &p)| p == old && other != index);
         self.buffers[index] = physical.handle.at(offset as u64);
-        let target = if arena || shared {
+        let target = self
+            .alias
+            .rebind(index, self.plan.buffers[index], offset, device_local);
+        if target == self.physical_buffers.len() {
             self.physical_buffers.push(physical);
-            self.alias.sizes.push(self.plan.buffers[index]);
-            self.alias.device_local.push(device_local);
-            self.physical_buffers.len() - 1
         } else {
-            self.physical_buffers[old] = physical;
-            self.alias.device_local[old] = device_local;
-            old
+            self.physical_buffers[target] = physical;
+        }
+    }
+
+    /// Whether this session's parameter `name` is the same storage as
+    /// `other`'s: shared with [`Session::share_parameter_from`] or
+    /// [`crate::SessionConfig::share_parameters_from`].
+    pub fn shares_parameter(&self, other: &Session, name: &str) -> bool {
+        let (Some(mine), Some(theirs)) = (self.param_buffer(name), other.param_buffer(name)) else {
+            return false;
         };
-        self.alias.map[index] = target;
-        self.alias.offsets[index] = offset;
+        let (mine, theirs) = (mine.0 as usize, theirs.0 as usize);
+        Arc::ptr_eq(
+            &self.physical_buffers[self.alias.map[mine]],
+            &other.physical_buffers[other.alias.map[theirs]],
+        ) && self.alias.offsets[mine] == other.alias.offsets[theirs]
     }
 
     /// Size in bytes of the GPU buffer backing the given slot.
