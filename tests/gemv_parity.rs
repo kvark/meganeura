@@ -231,7 +231,10 @@ fn dense_transposed_glu_matches_reference_after_restage() {
                         let report = session
                             .tune_with(meganeura::tune::TuneOptions {
                                 scope: meganeura::tune::TuneScope::Dense,
-                                max_time: std::time::Duration::from_secs(10),
+                                // A ceiling, not an expectation: CI shares the
+                                // GPU among concurrent tests, and the checks
+                                // below need the whole class searched.
+                                max_time: std::time::Duration::from_secs(60),
                                 sample_pairs: 4,
                                 dispatches_per_sample: 1,
                                 ..Default::default()
