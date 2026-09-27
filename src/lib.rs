@@ -64,7 +64,7 @@ pub use load::onnx::{OnnxError, OnnxModel, load_onnx, load_onnx_bytes};
 pub use optimize::{ExtractionCost, OptimizeConfig, OptimizeMode, OptimizeReport};
 pub use runtime::{
     CoopPolicy, DebugStepReport, DeviceMemoryStats, DispatchAnomaly, ExternalBindError,
-    ExternalSlot, GpuOptions, MemorySummary, ReadNodeError, Session, SessionOptions,
+    ExternalSlot, GpuOptions, MemorySummary, ReadNodeError, RecordError, Session, SessionOptions,
     ShareParameterError, TuneOutcome, init_gpu_context, init_gpu_context_with,
 };
 pub use train::{

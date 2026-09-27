@@ -2607,6 +2607,10 @@ pub struct Session {
     /// See [`Session::set_submission_chunks`]. Always at least 1.
     submission_chunks: usize,
     sync_point: Option<blade_graphics::SyncPoint>,
+    /// Latest caller submission carrying work from [`Session::record`], as
+    /// reported through [`Session::track_submission`]. Waited on alongside
+    /// `sync_point`; it has no timings to harvest from `encoder`.
+    external_sync_point: Option<blade_graphics::SyncPoint>,
     /// Calibrated timings harvested when the most recent submission completed.
     last_gpu_timings: Option<crate::profiler::GpuTimings>,
     /// This session's context collects pass timestamps. See
@@ -2643,6 +2647,10 @@ pub struct Session {
     optimizer_chunks: Vec<optimizer::Chunk>,
     /// Host-visible segment table the optimizer passes read.
     optimizer_segments: Option<blade_graphics::Buffer>,
+    /// Contents last written to `optimizer_segments`. The table is only
+    /// rewritten when it changes, so a step recorded while an earlier one is
+    /// in flight does not touch memory the GPU may be reading.
+    optimizer_table: Vec<optimizer::Segment>,
     /// Optional exact temporal sum of grouped gradient L2 norms for one
     /// parameter. Adam already visits every scalar gradient, so collecting
     /// this diagnostic does not require another dispatch or shader variant.
@@ -2777,6 +2785,28 @@ impl std::fmt::Display for ExternalBindError {
 }
 
 impl std::error::Error for ExternalBindError {}
+
+/// Error returned by [`Session::record`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordError {
+    /// Temporal gradient accumulation is enabled. Its step needs a
+    /// submission boundary between accumulating and applying the update,
+    /// which a caller-owned encoder cannot provide.
+    GradAccumulation,
+}
+
+impl std::fmt::Display for RecordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::GradAccumulation => write!(
+                f,
+                "a step with gradient accumulation cannot be recorded into a caller's encoder"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RecordError {}
 
 /// Workgroups the global gradient-norm pass gives one parameter.
 ///
@@ -3653,6 +3683,7 @@ impl Session {
             encoder,
             submission_chunks: 1,
             sync_point: None,
+            external_sync_point: None,
             gpu_timing,
             last_gpu_timings: None,
             profile_window: None,
@@ -3674,6 +3705,7 @@ impl Session {
             adam_state: None,
             optimizer_chunks,
             optimizer_segments: None,
+            optimizer_table: Vec::new(),
             adam_grouped_grad_norm: None,
             adam_step: 0,
             pending_adam: None,
@@ -6679,8 +6711,13 @@ impl Session {
         eprintln!("---");
     }
 
-    /// Wait for any pending GPU work.
+    /// Wait for any pending GPU work, including a caller submission reported
+    /// through [`Session::track_submission`].
     pub fn wait(&mut self) {
+        if let Some(sp) = self.external_sync_point.take() {
+            let _span = tracing::info_span!("wait_external").entered();
+            let _ = self.gpu.wait_for(&sp, !0);
+        }
         if let Some(sp) = self.sync_point.take() {
             let _span = tracing::info_span!("wait").entered();
             self.last_gpu_timings =
@@ -6703,8 +6740,96 @@ impl Session {
 
         self.encoder.start();
         self.profiled_pass_map.clear();
+        self.encode_step(self.submission_chunks, self.profile_window.clone());
+        self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+    }
 
-        if let Some(window) = self.profile_window.clone() {
+    /// Record one step — the same work as [`Session::step`] — into a
+    /// caller's command encoder instead of submitting it, so a host
+    /// application can put inference or training in its own submissions
+    /// next to its other passes (rendering, simulation, video processing).
+    ///
+    /// The encoder must belong to this session's context (build the session
+    /// with [`crate::SessionConfig::gpu`] or [`Session::with_context`] set to
+    /// the application's context) and be started. Nothing is submitted: the
+    /// work runs when the caller submits the encoder.
+    ///
+    /// The encoder must use automatic barriers (`manual_barriers: false`).
+    /// Blade then orders every pass after the ones recorded before it, which
+    /// is what orders the step's passes among themselves and against the
+    /// caller's passes on either side.
+    ///
+    /// # Data flow
+    ///
+    /// [`Session::input_buffer`] and [`Session::output_buffer`] name the
+    /// session's storage, so the caller's own passes can write inputs and
+    /// consume outputs in the same encoder, with no host round trip. Parameter updates of a training
+    /// session happen on the GPU as part of the recorded step.
+    ///
+    /// # Synchronization
+    ///
+    /// The session cannot see the caller's submission. Host-side access that
+    /// needs the GPU idle — [`Session::set_input`], readbacks,
+    /// [`Session::wait`], dropping the session — only waits for it after
+    /// [`Session::track_submission`] reports the returned sync point.
+    /// Without that, the caller must wait before such calls. Recording
+    /// several steps before a submission, or recording while earlier
+    /// recorded work is in flight, is fine; the recorded steps execute in
+    /// queue order.
+    ///
+    /// Settings baked into the recording (learning rate, Adam step count)
+    /// are those current at the call. A parameter layout change, such as
+    /// [`Session::share_parameter_from`], rewrites optimizer metadata on the
+    /// host at the next recording and requires the GPU to be idle.
+    ///
+    /// # Limitations
+    ///
+    /// - Temporal gradient accumulation
+    ///   ([`Session::set_grad_accumulate`]) needs a submission boundary
+    ///   inside the step and is rejected with
+    ///   [`RecordError::GradAccumulation`].
+    /// - [`Session::set_submission_chunks`] and the profiling window apply to
+    ///   [`Session::step`] only; the caller decides how to split submissions.
+    pub fn record(
+        &mut self,
+        encoder: &mut blade_graphics::CommandEncoder,
+    ) -> Result<(), RecordError> {
+        if self.grad_accum_scale.is_some() {
+            return Err(RecordError::GradAccumulation);
+        }
+        let _span = tracing::info_span!(
+            "record",
+            dispatches = self.plan.dispatches.len(),
+            groups = self.groups.len(),
+        )
+        .entered();
+        // The recording code writes into `self.encoder`. Lending the
+        // caller's encoder in its place keeps a single code path for both.
+        std::mem::swap(&mut self.encoder, encoder);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.encode_step(1, None);
+        }));
+        std::mem::swap(&mut self.encoder, encoder);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        Ok(())
+    }
+
+    /// Report the sync point of a caller submission that carries work
+    /// recorded by [`Session::record`], so that [`Session::wait`], the
+    /// host-side uploads and readbacks, and dropping the session wait for
+    /// it. Only the latest submission needs reporting: submissions to one
+    /// queue complete in order.
+    pub fn track_submission(&mut self, sync_point: blade_graphics::SyncPoint) {
+        self.external_sync_point = Some(sync_point);
+    }
+
+    /// Record forward, backward and the optimizer into `self.encoder`, which
+    /// must be started. `chunks` above one submits all but the last chunk;
+    /// with a `profile_window`, the dispatches in it get passes of their own.
+    fn encode_step(&mut self, chunks: usize, profile_window: Option<std::ops::Range<usize>>) {
+        if let Some(window) = profile_window {
             // Multi-pass mode: one compute pass per dispatch in the window,
             // with per-pass barriers and GPU timestamps. Enables
             // dump_gpu_timings() and profiled_dispatch_timings() after wait().
@@ -6759,7 +6884,7 @@ impl Session {
                 &self.groups,
                 &self.pipelines,
                 &self.buffers,
-                self.submission_chunks,
+                chunks,
             );
         }
 
@@ -6788,8 +6913,6 @@ impl Session {
             self.grad_clip_tick.is_multiple_of(self.grad_clip_every)
         };
         self.encode_optimizer(update, clip);
-
-        self.sync_point = Some(self.gpu.submit(&mut self.encoder));
     }
 
     fn optimizer_len(plan: &ExecutionPlan, param: BufferRef) -> u32 {

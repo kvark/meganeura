@@ -117,7 +117,7 @@ impl ChunkBuffers {
 /// One entry of the segment table; see `optimizer_segments.wgsl`.
 #[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 #[repr(C)]
-struct Segment {
+pub(super) struct Segment {
     offset: u32,
     len: u32,
     first_group: u32,
@@ -269,7 +269,8 @@ pub(super) enum Update {
 
 impl Session {
     /// Split the chunks into dispatch units and write their segment table.
-    /// The GPU must be idle: the table is host-visible and rewritten here.
+    /// The table is host-visible, so when it changes (after a parameter is
+    /// rebound, for instance) the GPU must be idle.
     fn optimizer_units(&mut self, accumulating: bool) -> Vec<Unit> {
         struct Plan {
             chunk: usize,
@@ -348,28 +349,35 @@ impl Session {
             units.push((plan, start, groups, slot));
             slot += groups;
         }
-        let bytes = (std::mem::size_of_val(table.as_slice()) as u64).max(4);
-        if self
-            .optimizer_segments
-            .is_none_or(|buffer| buffer.size() < bytes)
-        {
-            if let Some(buffer) = self.optimizer_segments.take() {
-                self.gpu.destroy_buffer(buffer);
+        let unchanged = self.optimizer_segments.is_some()
+            && bytemuck::cast_slice::<Segment, u8>(&table)
+                == bytemuck::cast_slice::<Segment, u8>(&self.optimizer_table);
+        if !unchanged {
+            let bytes = (std::mem::size_of_val(table.as_slice()) as u64).max(4);
+            if self
+                .optimizer_segments
+                .is_none_or(|buffer| buffer.size() < bytes)
+            {
+                if let Some(buffer) = self.optimizer_segments.take() {
+                    self.gpu.destroy_buffer(buffer);
+                }
+                self.optimizer_segments =
+                    Some(self.gpu.create_buffer(blade_graphics::BufferDesc {
+                        name: "optimizer_segments",
+                        size: bytes,
+                        memory: blade_graphics::Memory::Shared,
+                    }));
             }
-            self.optimizer_segments = Some(self.gpu.create_buffer(blade_graphics::BufferDesc {
-                name: "optimizer_segments",
-                size: bytes,
-                memory: blade_graphics::Memory::Shared,
-            }));
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    table.as_ptr().cast::<u8>(),
+                    self.optimizer_segments.unwrap().data(),
+                    std::mem::size_of_val(table.as_slice()),
+                );
+            }
+            self.optimizer_table = table;
         }
         let segments = self.optimizer_segments.unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                table.as_ptr().cast::<u8>(),
-                segments.data(),
-                std::mem::size_of_val(table.as_slice()),
-            );
-        }
         let accumulators = self.grad_accum.as_ref().filter(|_| accumulating);
         units
             .into_iter()
