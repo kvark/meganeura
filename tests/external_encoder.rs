@@ -3,9 +3,8 @@
 //! An application that already drives the GPU (a renderer, a video
 //! pipeline) wants the model in its own submissions, next to its own
 //! passes, rather than in a queue submission per step. These tests record
-//! into an encoder created with `manual_barriers`, where nothing orders a
-//! pass after the previous one unless someone asks, and check the results
-//! against `Session::step`.
+//! between the application's own passes and check the results against
+//! `Session::step`.
 
 use std::sync::Arc;
 
@@ -41,11 +40,11 @@ fn seed(session: &mut Session, layers: usize, dim: usize) {
     }
 }
 
-fn manual_encoder(gpu: &bg::Context) -> bg::CommandEncoder {
+fn app_encoder(gpu: &bg::Context) -> bg::CommandEncoder {
     gpu.create_command_encoder(bg::CommandEncoderDesc {
         name: "application",
         buffer_count: 1,
-        manual_barriers: true,
+        manual_barriers: false,
     })
 }
 
@@ -103,7 +102,7 @@ fn recorded_inference_matches_step_between_application_passes() {
     let result = shared_buffer(&gpu, "app_result", &vec![f32::NAN; len]);
     let input = session.input_buffer("x").unwrap();
     let output = session.output_buffer(0).unwrap();
-    let mut encoder = manual_encoder(&gpu);
+    let mut encoder = app_encoder(&gpu);
     encoder.start();
     encoder
         .transfer("upload")
@@ -184,7 +183,7 @@ fn recorded_training_steps_match_step() {
         reference.wait();
 
         let mut recorded = training_session(&gpu, adam);
-        let mut encoder = manual_encoder(&gpu);
+        let mut encoder = app_encoder(&gpu);
         encoder.start();
         for _ in 0..STEPS {
             recorded.record(&mut encoder).unwrap();
@@ -217,7 +216,7 @@ fn gradient_accumulation_cannot_be_recorded() {
     let gpu = Arc::new(meganeura::init_gpu_context().expect("GPU context"));
     let mut session = training_session(&gpu, false);
     session.set_grad_accumulate(2);
-    let mut encoder = manual_encoder(&gpu);
+    let mut encoder = app_encoder(&gpu);
     encoder.start();
     assert_eq!(
         session.record(&mut encoder),

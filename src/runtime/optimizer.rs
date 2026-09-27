@@ -413,8 +413,7 @@ impl Session {
         if let Some(scale) = self.grad_accum_scale {
             {
                 let pipeline = self.pipelines.scalar(ShaderEntry::GradAccum);
-                let mut pass =
-                    super::compute_pass(&mut self.encoder, self.explicit_barriers, "grad_accum");
+                let mut pass = self.encoder.compute("grad_accum");
                 for unit in &units {
                     let mut pc = pass.with(pipeline);
                     pc.bind(
@@ -455,8 +454,7 @@ impl Session {
             None => {}
             Some(Update::Sgd { lr }) => {
                 let pipeline = self.pipelines.scalar(ShaderEntry::SgdUpdate);
-                let mut pass =
-                    super::compute_pass(&mut self.encoder, self.explicit_barriers, "sgd_update");
+                let mut pass = self.encoder.compute("sgd_update");
                 for unit in &units {
                     let mut pc = pass.with(pipeline);
                     pc.bind(
@@ -500,8 +498,7 @@ impl Session {
                         ),
                     };
                 let pipeline = self.pipelines.scalar(ShaderEntry::AdamUpdate);
-                let mut pass =
-                    super::compute_pass(&mut self.encoder, self.explicit_barriers, "adam_update");
+                let mut pass = self.encoder.compute("adam_update");
                 for unit in &units {
                     let mut pc = pass.with(pipeline);
                     pc.bind(
@@ -544,11 +541,7 @@ impl Session {
         let pipeline = self.pipelines.scalar(ShaderEntry::GradClipNormSq);
         let slots: u32 = units.iter().map(|unit| unit.groups).sum();
         {
-            let mut pass = super::compute_pass(
-                &mut self.encoder,
-                self.explicit_barriers,
-                "grad_clip_norm_sq",
-            );
+            let mut pass = self.encoder.compute("grad_clip_norm_sq");
             for unit in units {
                 let mut pc = pass.with(pipeline);
                 pc.bind(
@@ -569,11 +562,7 @@ impl Session {
             }
         }
         {
-            let mut pass = super::compute_pass(
-                &mut self.encoder,
-                self.explicit_barriers,
-                "grad_clip_norm_total",
-            );
+            let mut pass = self.encoder.compute("grad_clip_norm_total");
             let mut pc = pass.with(pipeline);
             pc.bind(
                 0,
@@ -592,8 +581,7 @@ impl Session {
             pc.dispatch([1, 1, 1]);
         }
         let pipeline = self.pipelines.scalar(ShaderEntry::GradClipScale);
-        let mut pass =
-            super::compute_pass(&mut self.encoder, self.explicit_barriers, "grad_clip_scale");
+        let mut pass = self.encoder.compute("grad_clip_scale");
         for unit in units {
             let mut pc = pass.with(pipeline);
             pc.bind(
@@ -621,7 +609,7 @@ impl Session {
         let scales = self.agc_scales.expect("optimizer scratch");
         let pipeline = self.pipelines.scalar(ShaderEntry::AdaptiveGradClip);
         for (mode, label) in [(0u32, "agc_norms"), (1, "agc_factor"), (2, "agc_apply")] {
-            let mut pass = super::compute_pass(&mut self.encoder, self.explicit_barriers, label);
+            let mut pass = self.encoder.compute(label);
             for unit in units {
                 let mut pc = pass.with(pipeline);
                 pc.bind(

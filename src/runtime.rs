@@ -1923,26 +1923,11 @@ fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
     groups
 }
 
-/// Open a compute pass. With `explicit_barrier`, a barrier covering every
-/// pass recorded so far comes first, so the pass is ordered after them even
-/// in an encoder created with `manual_barriers`.
-fn compute_pass<'a>(
-    encoder: &'a mut blade_graphics::CommandEncoder,
-    explicit_barrier: bool,
-    label: &str,
-) -> blade_graphics::ComputeCommandEncoder<'a> {
-    if explicit_barrier {
-        encoder.barrier();
-    }
-    encoder.compute(label)
-}
-
 /// Record the compiled graph, leaving the last chunk open for appended work.
 #[allow(clippy::too_many_arguments)]
 fn record_groups(
     gpu: &Gpu,
     encoder: &mut blade_graphics::CommandEncoder,
-    explicit_barriers: bool,
     sync_point: &mut Option<blade_graphics::SyncPoint>,
     plan: &ExecutionPlan,
     groups: &[std::ops::Range<usize>],
@@ -1963,7 +1948,7 @@ fn record_groups(
         let end = (start + per_chunk).min(total);
         {
             let label = format!("step {}/{}", chunk_index + 1, chunk_count);
-            let mut pass = compute_pass(encoder, explicit_barriers, &label);
+            let mut pass = encoder.compute(&label);
             for (gi, group) in groups.iter().enumerate().take(end).skip(start) {
                 if gi > start {
                     pass.barrier();
@@ -2626,10 +2611,6 @@ pub struct Session {
     /// reported through [`Session::track_submission`]. Waited on alongside
     /// `sync_point`; it has no timings to harvest from `encoder`.
     external_sync_point: Option<blade_graphics::SyncPoint>,
-    /// Set while [`Session::record`] writes into a caller's encoder, which
-    /// may use manual barriers: every pass is then preceded by an explicit
-    /// barrier instead of relying on the automatic one.
-    explicit_barriers: bool,
     /// Calibrated timings harvested when the most recent submission completed.
     last_gpu_timings: Option<crate::profiler::GpuTimings>,
     /// This session's context collects pass timestamps. See
@@ -3703,7 +3684,6 @@ impl Session {
             submission_chunks: 1,
             sync_point: None,
             external_sync_point: None,
-            explicit_barriers: false,
             gpu_timing,
             last_gpu_timings: None,
             profile_window: None,
@@ -6772,10 +6752,12 @@ impl Session {
     /// The encoder must belong to this session's context (build the session
     /// with [`crate::SessionConfig::gpu`] or [`Session::with_context`] set to
     /// the application's context) and be started. Nothing is submitted: the
-    /// work runs when the caller submits the encoder. The recorded passes
-    /// are fenced by barriers on both sides, so they are ordered after the
-    /// passes recorded before this call and before those recorded after
-    /// it, including in an encoder created with `manual_barriers`.
+    /// work runs when the caller submits the encoder.
+    ///
+    /// The encoder must use automatic barriers (`manual_barriers: false`).
+    /// Blade then orders every pass after the ones recorded before it, which
+    /// is what orders the step's passes among themselves and against the
+    /// caller's passes on either side.
     ///
     /// # Data flow
     ///
@@ -6824,13 +6806,9 @@ impl Session {
         // The recording code writes into `self.encoder`. Lending the
         // caller's encoder in its place keeps a single code path for both.
         std::mem::swap(&mut self.encoder, encoder);
-        self.explicit_barriers = true;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.encode_step(1, None);
-            // Order the caller's later passes after the step.
-            self.encoder.barrier();
         }));
-        self.explicit_barriers = false;
         std::mem::swap(&mut self.encoder, encoder);
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
@@ -6901,7 +6879,6 @@ impl Session {
             record_groups(
                 &self.gpu,
                 &mut self.encoder,
-                self.explicit_barriers,
                 &mut self.sync_point,
                 &self.plan,
                 &self.groups,

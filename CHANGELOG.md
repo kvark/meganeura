@@ -2,7 +2,7 @@
 
 - `Session::record` puts a step — inference, or training with its optimizer
   update — into a caller's command encoder instead of a submission of its
-  own, fenced by barriers so it works in encoders with manual barriers.
+  own; the encoder must use automatic barriers.
   `Session::track_submission` lets `wait`, uploads, readbacks and drop wait
   for the caller's submission.
 - Fix wrong training gradients: scalar attention backward dropped every
