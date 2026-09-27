@@ -12,6 +12,7 @@ mod device_local;
 mod eager;
 #[cfg(feature = "models")]
 mod efficientnet_smoke;
+mod external_encoder;
 mod flash_grad_kv_short;
 mod gemma_inference_ops;
 mod gemv_parity;
