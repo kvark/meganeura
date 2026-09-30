@@ -147,10 +147,10 @@ fn plan(s: Shape, tile: u32, splits: u32) -> (ExecutionPlan, Option<BufferRef>) 
     for d in &mut plan.dispatches {
         match d.shader {
             ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGemmSmall | ShaderEntry::Conv2dGemm16 => {
-                d.shader = if tile == 32 {
-                    ShaderEntry::Conv2dGemmSmall
-                } else {
-                    ShaderEntry::Conv2dGemm
+                d.shader = match tile {
+                    16 => ShaderEntry::Conv2dGemm16,
+                    32 => ShaderEntry::Conv2dGemmSmall,
+                    _ => ShaderEntry::Conv2dGemm,
                 };
                 let (oh, ow) = s.output();
                 d.workgroups = [(oh * ow).div_ceil(tile), s.co.div_ceil(tile), s.batch];
@@ -159,10 +159,10 @@ fn plan(s: Shape, tile: u32, splits: u32) -> (ExecutionPlan, Option<BufferRef>) 
             ShaderEntry::Conv2dGradInputGemm
             | ShaderEntry::Conv2dGradInputGemmSmall
             | ShaderEntry::Conv2dGradInputGemm16 => {
-                d.shader = if tile == 32 {
-                    ShaderEntry::Conv2dGradInputGemmSmall
-                } else {
-                    ShaderEntry::Conv2dGradInputGemm
+                d.shader = match tile {
+                    16 => ShaderEntry::Conv2dGradInputGemm16,
+                    32 => ShaderEntry::Conv2dGradInputGemmSmall,
+                    _ => ShaderEntry::Conv2dGradInputGemm,
                 };
                 d.workgroups = [(s.h * s.w).div_ceil(tile), s.ci.div_ceil(tile), s.batch];
                 forced += 1;
@@ -170,10 +170,10 @@ fn plan(s: Shape, tile: u32, splits: u32) -> (ExecutionPlan, Option<BufferRef>) 
             ShaderEntry::Conv2dGradWeightGemm
             | ShaderEntry::Conv2dGradWeightGemmSmall
             | ShaderEntry::Conv2dGradWeightGemm16 => {
-                d.shader = if tile == 32 {
-                    ShaderEntry::Conv2dGradWeightGemmSmall
-                } else {
-                    ShaderEntry::Conv2dGradWeightGemm
+                d.shader = match tile {
+                    16 => ShaderEntry::Conv2dGradWeightGemm16,
+                    32 => ShaderEntry::Conv2dGradWeightGemmSmall,
+                    _ => ShaderEntry::Conv2dGradWeightGemm,
                 };
                 d.workgroups = [(s.ci * s.kh * s.kw).div_ceil(tile), s.co.div_ceil(tile), 1];
                 forced += 1;
@@ -189,7 +189,9 @@ fn plan(s: Shape, tile: u32, splits: u32) -> (ExecutionPlan, Option<BufferRef>) 
             .position(|d| {
                 matches!(
                     d.shader,
-                    ShaderEntry::Conv2dGradWeightGemm | ShaderEntry::Conv2dGradWeightGemmSmall
+                    ShaderEntry::Conv2dGradWeightGemm
+                        | ShaderEntry::Conv2dGradWeightGemmSmall
+                        | ShaderEntry::Conv2dGradWeightGemm16
                 )
             })
             .unwrap();
@@ -505,7 +507,7 @@ fn split_weight_gradients_preserve_optimizer_updates_with_and_without_aliasing()
 #[test]
 #[ignore = "GPU isolated sequence qualification/timing; requires idle device"]
 fn split_sequence_measurement_preserves_state_budgets_and_subsequent_updates() {
-    for tile in [32, 64] {
+    for tile in [16, 32, 64] {
         optimizer_updates(true, tile);
     }
 }
@@ -586,6 +588,7 @@ fn optimizer_updates(measure: bool, tile: u32) {
                             d.shader,
                             ShaderEntry::Conv2dGradWeightGemm
                                 | ShaderEntry::Conv2dGradWeightGemmSmall
+                                | ShaderEntry::Conv2dGradWeightGemm16
                         )
                     })
                     .unwrap();
