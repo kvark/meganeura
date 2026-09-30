@@ -22,6 +22,9 @@ required-features = ["gguf"]
 name = "regression"
 
 [[test]]
+name = "batched_transpose"
+
+[[test]]
 name = "oracle"
 path = "tests/oracle/main.rs"
 

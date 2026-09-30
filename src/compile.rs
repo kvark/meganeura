@@ -4149,11 +4149,13 @@ impl<'a> Compiler<'a> {
             Op::Transpose => {
                 let input = self.get_buffer(node.inputs[0]);
                 let shape = &self.graph.node(node.inputs[0]).ty.shape;
-                let m = shape[0] as u32;
-                let n = shape[1] as u32;
+                let rank = shape.len();
+                let m = shape[rank - 2] as u32;
+                let n = shape[rank - 1] as u32;
+                let batch = shape[..rank - 2].iter().product::<usize>() as u32;
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::Transpose,
-                    workgroups: [n.div_ceil(16), m.div_ceil(16), 1],
+                    workgroups: [n.div_ceil(16), m.div_ceil(16), batch],
                     input_buffers: vec![input],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
