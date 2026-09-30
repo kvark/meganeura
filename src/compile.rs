@@ -171,6 +171,10 @@ pub struct CompileOptions {
     /// None retains the ordinary lowering; measured construction searches this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_attention_splits: Option<u32>,
+    /// Opt-in two-pass scalar convolution weight gradients. Changes reduction
+    /// order; qualify values/gradients and whole-step timing before deployment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conv_weight_splits: Option<ConvWeightSplits>,
     /// Quantize the activation row to Q8_1 inside the K-split GEMV and do
     /// the inner product with integer dot products, for the weight formats
     /// that have an int-dot kernel (GGML Q4_0 and Meganeura Q8).
@@ -194,9 +198,22 @@ impl Default for CompileOptions {
             flash_backward_coop: false,
             gemv_shape: None,
             cached_attention_splits: None,
+            conv_weight_splits: None,
             quantized_activations: true,
         }
     }
+}
+
+/// Bounded split-K lowering for convolution gradients with too few workgroups.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ConvWeightSplits {
+    /// Only split dispatches with fewer than this many unsplit workgroups.
+    pub workgroup_threshold: u32,
+    /// Maximum reduction positions per partition; a positive multiple of 16.
+    pub reduction_chunk: u32,
+    /// Total logical partial-buffer budget, before aliasing. Selections that
+    /// would exceed the remaining budget keep their original implementation.
+    pub max_partial_bytes: usize,
 }
 
 impl CompileOptions {
@@ -1252,6 +1269,10 @@ impl ExecutionPlan {
         // RmsNorm+MatMul prologue fusion is applied later in the runtime,
         // after per-dispatch coop selection — the prologue path currently
         // only has a coop-matmul implementation. See Session::with_context.
+
+        if let Some(splits) = options.conv_weight_splits {
+            self.split_low_occupancy_conv_weights(splits);
+        }
 
         self
     }
