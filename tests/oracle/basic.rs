@@ -372,6 +372,25 @@ fn row_normalization_and_scans() {
 }
 
 #[test]
+fn batched_transpose() {
+    for (shape, expected) in [
+        (vec![3, 17, 19], vec![3, 19, 17]),
+        (vec![2, 3, 4, 5], vec![2, 3, 5, 4]),
+    ] {
+        case(
+            &format!("transpose {shape:?}"),
+            |g| {
+                let x = g.input("x", &shape);
+                let y = g.transpose(x);
+                assert_eq!(g.node(y).ty.shape, expected);
+                vec![y]
+            },
+            |_| {},
+        );
+    }
+}
+
+#[test]
 fn normalize_inner_sum_and_its_gradient() {
     // Rows above and below the floor.
     let (m, n) = (6, 5);

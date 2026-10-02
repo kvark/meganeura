@@ -1191,6 +1191,47 @@ fn conv2d_grad_weight_split_k() {
     failures.assert_none();
 }
 
+#[test]
+fn conv2d_grad_weight_selected_splits() {
+    let options = gpu::Options {
+        compile: meganeura::CompileOptions {
+            conv_weight_splits: Some(meganeura::compile::ConvWeightSplits {
+                workgroup_threshold: 48,
+                reduction_chunk: 512,
+                max_partial_bytes: 64 << 10,
+            }),
+            ..Default::default()
+        },
+        coop: CoopPolicy::Disabled,
+        ..Default::default()
+    };
+    let mut failures = Failures::default();
+    for c in [
+        Conv::new(9, 2, (7, 9), 3, (3, 3), 1, (1, 1)),
+        // Keep the 524,288-position reduction, with only one output weight.
+        Conv::new(128, 1, (64, 64), 1, (1, 1), 1, (0, 0)),
+    ] {
+        let g = c.grad_weight_graph();
+        let mut feeds = Feeds::new();
+        feeds.fill_random(&g, 1729, 1.0);
+        for scale in [1.0, 1e-12] {
+            feeds.set("dy", &random(c.y_len(), 1730, -scale, scale));
+            inference(
+                &mut failures,
+                &format!("selected split {c:?}, scale={scale:e}"),
+                &g,
+                &feeds,
+                &options,
+                &[
+                    ShaderEntry::Conv2dGradWeightGemmSplit16,
+                    ShaderEntry::SumRows,
+                ],
+            );
+        }
+    }
+    failures.assert_none();
+}
+
 /// A pooling window that covers only padding has no maximum. PyTorch
 /// forbids it (`padding <= kernel / 2`); the builder does not, and the
 /// kernel writes `-f32::MAX` there, so the reference rejects the graph.
