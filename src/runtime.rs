@@ -1653,16 +1653,23 @@ struct MatMulRmsNormParams {
     eps_bits: u32,
 }
 
-/// `params` uniform. Used for gather reductions and any arity outside the
-/// three fixed layout structs — avoids a per-combination `ShaderData`
-/// struct. `bind<D>` ignores `D::layout()` (uses the pipeline's layout),
-/// so the static `layout()` here is a harmless placeholder.
-struct HorizMatMulData {
+/// A run of storage buffers followed by one params uniform.
+///
+/// Binds a variable number of buffers because the shaders these serve take
+/// their operand count as a parameter: a horizontal matmul binds one input
+/// per matrix in the pack, and a dynamic reduction binds one per gathered
+/// stream. Neither has a fixed arity, so neither can use a `ShaderData`
+/// struct with named fields — `bind<D>` ignores `D::layout()` and uses the
+/// pipeline's own, which is what makes a single generic shape work for both.
+///
+/// `layout()` is therefore a placeholder that is never consulted; the
+/// pipelines these bind against carry the real layout.
+struct BufferListData<P> {
     buffers: Vec<blade_graphics::BufferPiece>,
-    params: MatMulParams,
+    params: P,
 }
 
-impl blade_graphics::ShaderData for HorizMatMulData {
+impl<P: blade_graphics::ShaderBindable + Copy> blade_graphics::ShaderData for BufferListData<P> {
     fn layout() -> blade_graphics::ShaderDataLayout {
         blade_graphics::ShaderDataLayout::default()
     }
@@ -1677,25 +1684,11 @@ impl blade_graphics::ShaderData for HorizMatMulData {
     }
 }
 
-struct DynReductionData {
-    buffers: Vec<blade_graphics::BufferPiece>,
-    params: ReductionParams,
-}
+/// Horizontal matmul bindings: every matrix in the pack, then `params`.
+type HorizMatMulData = BufferListData<MatMulParams>;
 
-impl blade_graphics::ShaderData for DynReductionData {
-    fn layout() -> blade_graphics::ShaderDataLayout {
-        blade_graphics::ShaderDataLayout::default()
-    }
-    fn fill(&self, mut context: blade_graphics::PipelineContext) {
-        use blade_graphics::ShaderBindable;
-        let mut index = 0u32;
-        for b in &self.buffers {
-            b.bind_to(&mut context, index);
-            index += 1;
-        }
-        self.params.bind_to(&mut context, index);
-    }
-}
+/// Gather-reduction bindings: one buffer per gathered stream, then `params`.
+type DynReductionData = BufferListData<ReductionParams>;
 
 fn reduction_data_layout(
     kernel: &crate::schedule::ReductionKernel,
