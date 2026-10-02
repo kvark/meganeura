@@ -1,5 +1,14 @@
 # Unreleased
 
+- The causal and sliding-window key range that every attention kernel computes
+  is emitted from one place (`codegen::kv_range`) instead of being written out
+  five times. It is the correctness-critical part of the mask, and a fix that
+  reached four of the five kernels would train against a different objective
+  than it evaluates. The attention uniform declarations are likewise two named
+  constants rather than eight inline literals.
+- `HorizMatMulData` and `DynReductionData` had byte-identical `ShaderData`
+  impls differing only in the params type; both are now
+  `BufferListData<P>`.
 - `optimizer_memory::optimizer_clipping_and_diagnostics_ignore_poisoned_allocation_padding`
   compared `f32` results for bit equality across allocation paddings, which
   failed on rounding rather than on a defect. Padding cannot reach the

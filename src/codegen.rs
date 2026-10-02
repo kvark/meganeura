@@ -2123,6 +2123,53 @@ fn substitute(source: &str, old: &str, new: &str) -> String {
     source.replace(old, new)
 }
 
+/// The attention uniform for an uncached kernel.
+///
+/// Eight `u32` — 32 bytes, matching `AttentionParams` in `runtime.rs`. The
+/// three trailing fields are padding rather than data, and the size has to
+/// match the Rust side exactly because the buffer is written from there, so
+/// this lives in one place rather than in each generator's prologue.
+const ATTENTION_PARAMS_WGSL: &str = "struct Params {\n    q_seq: u32,\n    kv_seq: u32,\n    packed_heads: u32,\n    head_dim: u32,\n    window_size: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n";
+
+/// The attention uniform for a kernel reading a KV cache.
+///
+/// Four `u32` — 16 bytes. A cached kernel gets its sequence lengths from the
+/// cache's own metadata, so it carries fewer fields than [`ATTENTION_PARAMS_WGSL`]
+/// rather than the same ones with different values.
+const CACHED_ATTENTION_PARAMS_WGSL: &str = "struct Params {\n    q_seq: u32,\n    num_heads: u32,\n    num_kv_heads: u32,\n    head_dim: u32,\n}\n\n";
+
+/// The causal + sliding-window key range a query row may attend to.
+///
+/// Returns the WGSL declaring `row_kv_start` and `row_kv_len` from an
+/// expression for the query position, at the given indent. Attention reads
+/// `[row_kv_start, row_kv_len)`; a key position outside it is masked.
+///
+/// Causal attention attends to positions at or below the query, so the
+/// exclusive end is `qpos + 1` — except for an uncached row, which sees the
+/// whole context. A sliding window clamps the start to the last
+/// `window_size` positions, and `window_size == 0` disables the clamp, which
+/// is what `select` picks apart here.
+///
+/// Every forward and backward attention kernel needs this, and they need it
+/// identically: a mask fix that missed one of them would train against a
+/// different objective than it evaluates. `qpos` is an expression rather than
+/// a fixed name because the callers hold the query position under different
+/// locals — `qpos`, `qpos_thread`, `qp`, or a loop counter — and spelling the
+/// range out at each site is how those five copies drifted apart in the first
+/// place.
+fn kv_range(qpos: &str, indent: usize) -> String {
+    let pad = " ".repeat(indent);
+    format!(
+        "{pad}let row_kv_len = select(kv_seq, {qpos} + 1u, kv_seq == 0u);\n\
+         {pad}let row_kv_start = select(0u, row_kv_len - min(row_kv_len, window_size), window_size > 0u);\n"
+    )
+}
+
+/// [`kv_range`] followed by a blank line, for the sites that want one.
+fn kv_range_block(qpos: &str, indent: usize) -> String {
+    format!("{}\n", kv_range(qpos, indent))
+}
+
 /// The K-split GEMV with the RmsNorm of its input folded in:
 /// `C[1, N] = (rmsnorm(A) * norm_w) × B[K, N]`.
 ///
@@ -3392,9 +3439,7 @@ pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
     let mut src = String::new();
 
     // Params struct (matches AttentionParams, 8 u32 = 32 bytes)
-    src.push_str(
-        "struct Params {\n    q_seq: u32,\n    kv_seq: u32,\n    packed_heads: u32,\n    head_dim: u32,\n    window_size: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n",
-    );
+    src.push_str(ATTENTION_PARAMS_WGSL);
     src.push_str("var<storage> src_a: array<f32>;\n"); // Q
     src.push_str("var<storage> src_b: array<f32>;\n"); // K
     src.push_str("var<storage> bias: array<f32>;\n"); // V
@@ -3700,11 +3745,9 @@ fn generate_flash_attention(
 
     // Params struct (matches AttentionParams: 8 u32 = 32 bytes)
     if cached {
-        src.push_str("struct Params {\n    q_seq: u32,\n    num_heads: u32,\n    num_kv_heads: u32,\n    head_dim: u32,\n}\n\n");
+        src.push_str(CACHED_ATTENTION_PARAMS_WGSL);
     } else {
-        src.push_str(
-            "struct Params {\n    q_seq: u32,\n    kv_seq: u32,\n    packed_heads: u32,\n    head_dim: u32,\n    window_size: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n",
-        );
+        src.push_str(ATTENTION_PARAMS_WGSL);
     }
     src.push_str("var<storage> src_a: array<f32>;\n"); // Q
     src.push_str("var<storage> src_b: array<f32>;\n"); // K
@@ -4057,7 +4100,7 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     let mut src = String::new();
     src.push_str("enable f16;\n");
     src.push_str("enable wgpu_cooperative_matrix;\n\n");
-    src.push_str("struct Params {\n    q_seq: u32,\n    kv_seq: u32,\n    packed_heads: u32,\n    head_dim: u32,\n    window_size: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n");
+    src.push_str(ATTENTION_PARAMS_WGSL);
     src.push_str("var<storage> src_a: array<f32>;\n"); // Q
     src.push_str("var<storage> src_b: array<f32>;\n"); // K
     src.push_str("var<storage> bias: array<f32>;\n"); // V
@@ -4098,10 +4141,7 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     src.push_str("    let q_valid = qpos < q_seq && head < num_heads;\n\n");
 
     // Per-row valid KV range (causal + sliding window).
-    src.push_str("    let row_kv_len = select(kv_seq, qpos + 1u, kv_seq == 0u);\n");
-    src.push_str(
-        "    let row_kv_start = select(0u, row_kv_len - min(row_kv_len, window_size), window_size > 0u);\n\n",
-    );
+    src.push_str(&kv_range_block("qpos", 4));
 
     // Workgroup-wide bounds (drives all threads through the same
     // outer KV loop).
@@ -4327,7 +4367,7 @@ pub fn generate_flash_grad_q_coop_module(head_dim: u32) -> ShaderModule {
     let mut src = String::new();
     src.push_str("enable f16;\n");
     src.push_str("enable wgpu_cooperative_matrix;\n\n");
-    src.push_str("struct Params {\n    q_seq: u32,\n    kv_seq: u32,\n    packed_heads: u32,\n    head_dim: u32,\n    window_size: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n");
+    src.push_str(ATTENTION_PARAMS_WGSL);
     src.push_str("var<storage> d_out: array<f32>;\n");
     src.push_str("var<storage> src_a: array<f32>;\n"); // Q
     src.push_str("var<storage> src_b: array<f32>;\n"); // K
@@ -4520,10 +4560,7 @@ pub fn generate_flash_grad_q_coop_module(head_dim: u32) -> ShaderModule {
     let _ = writeln!(src, "                let j = idx % {bkv}u;");
     src.push_str("                let qpos = pos_base + r;\n");
     src.push_str("                let kv_pos = t + j;\n");
-    src.push_str("                let row_kv_len = select(kv_seq, qpos + 1u, kv_seq == 0u);\n");
-    src.push_str(
-        "                let row_kv_start = select(0u, row_kv_len - min(row_kv_len, window_size), window_size > 0u);\n",
-    );
+    src.push_str(&kv_range("qpos", 16));
     src.push_str("                let q_valid = qpos < q_seq && head < num_heads;\n");
     src.push_str(
         "                let masked = !(q_valid && kv_pos >= row_kv_start && kv_pos < row_kv_len);\n",
@@ -4563,10 +4600,7 @@ pub fn generate_flash_grad_q_coop_module(head_dim: u32) -> ShaderModule {
     // Each thread handles its own (row, chunk) — replicated softmax
     // (4-way), unique chunk-of-K accumulation.
     src.push_str("    for (; t < max_kv_len; t = t + 1u) {\n");
-    src.push_str("        let row_kv_len = select(kv_seq, qpos_thread + 1u, kv_seq == 0u);\n");
-    src.push_str(
-        "        let row_kv_start = select(0u, row_kv_len - min(row_kv_len, window_size), window_size > 0u);\n",
-    );
+    src.push_str(&kv_range("qpos_thread", 8));
     src.push_str(
         "        let masked = !(q_valid_thread && t >= row_kv_start && t < row_kv_len);\n",
     );
@@ -4664,7 +4698,7 @@ pub fn generate_flash_grad_kv_coop_module(head_dim: u32) -> ShaderModule {
     let mut src = String::new();
     src.push_str("enable f16;\n");
     src.push_str("enable wgpu_cooperative_matrix;\n\n");
-    src.push_str("struct Params {\n    q_seq: u32,\n    kv_seq: u32,\n    packed_heads: u32,\n    head_dim: u32,\n    window_size: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n");
+    src.push_str(ATTENTION_PARAMS_WGSL);
     src.push_str("var<storage> d_out: array<f32>;\n");
     src.push_str("var<storage> src_a: array<f32>;\n"); // Q
     src.push_str("var<storage> src_b: array<f32>;\n"); // K
@@ -4899,10 +4933,7 @@ pub fn generate_flash_grad_kv_coop_module(head_dim: u32) -> ShaderModule {
         "                    let masked = !(kp < effective_kv_seq && kv_head < num_kv_heads && qp < q_seq && q_head < num_heads);\n",
     );
     // Causal: qp >= kp. Sliding window: qp - window < kp <= qp.
-    src.push_str("                    let row_kv_len = select(kv_seq, qp + 1u, kv_seq == 0u);\n");
-    src.push_str(
-        "                    let row_kv_start = select(0u, row_kv_len - min(row_kv_len, window_size), window_size > 0u);\n",
-    );
+    src.push_str(&kv_range("qp", 20));
     src.push_str(
         "                    let attn_masked = masked || (kp < row_kv_start) || (kp >= row_kv_len);\n",
     );
@@ -4964,10 +4995,7 @@ pub fn generate_flash_grad_kv_coop_module(head_dim: u32) -> ShaderModule {
     src.push_str("        for (; t < q_seq; t = t + 1u) {\n");
     src.push_str("            let masked = !(kv_valid_thread && q_head < num_heads);\n");
     src.push_str("            if !masked {\n");
-    src.push_str("                let row_kv_len = select(kv_seq, t + 1u, kv_seq == 0u);\n");
-    src.push_str(
-        "                let row_kv_start = select(0u, row_kv_len - min(row_kv_len, window_size), window_size > 0u);\n",
-    );
+    src.push_str(&kv_range("t", 16));
     src.push_str(
         "                let attn_masked = (kv_pos_thread < row_kv_start) || (kv_pos_thread >= row_kv_len);\n",
     );
@@ -5059,7 +5087,7 @@ pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule
     let mut src = String::new();
 
     // Params + bindings (match MultiHeadAttnGradData)
-    src.push_str("struct Params {\n    q_seq: u32,\n    kv_seq: u32,\n    packed_heads: u32,\n    head_dim: u32,\n    window_size: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n");
+    src.push_str(ATTENTION_PARAMS_WGSL);
     src.push_str("var<storage> d_out: array<f32>;\n");
     src.push_str("var<storage> src_a: array<f32>;\n"); // Q
     src.push_str("var<storage> src_b: array<f32>;\n"); // K
@@ -5341,7 +5369,7 @@ pub fn generate_flash_grad_kv_module(head_dim: u32, ept_cap: u32) -> ShaderModul
     let mut src = String::new();
 
     // Params + bindings (match MultiHeadAttnGradKVData)
-    src.push_str("struct Params {\n    q_seq: u32,\n    kv_seq: u32,\n    packed_heads: u32,\n    head_dim: u32,\n    window_size: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n");
+    src.push_str(ATTENTION_PARAMS_WGSL);
     src.push_str("var<storage> d_out: array<f32>;\n");
     src.push_str("var<storage> src_a: array<f32>;\n"); // Q
     src.push_str("var<storage> src_b: array<f32>;\n"); // K
