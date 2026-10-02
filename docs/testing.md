@@ -165,13 +165,41 @@ the trade needs the attention sensitivity understood first. Two tests must
 not be read as evidence that a plan change broke convolution: the failure is
 in the harness, not the kernels.
 
-**The attention oracle is order-dependent.** `attention::causal_forward` and
-its siblings fail when run under a filter that selects a subset of the
-`attention` module, and pass when the whole module runs. Plans, coop policy
-and workgroup geometry are identical either way, so the difference is in
-state the process carries between cases. Tolerance misses are small and
-consistent with f16 rounding on the large-head-dim cases (`dim` 128 and 256),
-so they are not obviously the same problem as the context churn above.
+**The attention oracle is order-dependent, and the plan is not why.**
+`attention::causal_forward` and its siblings fail under a filter that selects
+a subset of the `attention` module and pass when the whole module runs. The
+whole `attention` module creates 422 GPU contexts; one test creates 17.
+
+Ruled out by measurement, in order:
+
+- *Context count.* It is not the driver limit — that produces
+  `NoSupportedDeviceFound`, and these cases run fine at 422 contexts. It is
+  not "warm-up" either: `attention_autodiff` runs before `causal_forward`
+  alphabetically and creates no context at all.
+- *The plan.* Hashing every dispatch's `shader`, `params`, `workgroups` and
+  buffer bindings gives `0x384f3e69d4f3f584` for the failing `q=31, dim=256`
+  case in both runs — byte-identical. `MEGANEURA_DUMP_PLAN` agrees, and the
+  sweep's own kernel list agrees (`MultiHeadAttn`, `coop=false`).
+- *The operands.* `Feeds::fill_random` is seeded from a constant
+  (`100 + shape_index`), `Feeds::set` widens f32 to f64, and the graph is the
+  same object either way.
+- *The tolerance.* `Tolerance::default()` is a constant (`rtol` 2e-4,
+  `floor` 1e-3) and `Options::default()` re-reads it per call.
+
+What is left is the GPU returning a different result for the same plan and the
+same inputs: element 0 is `8.7646484e-1` alone and `8.7633395e-1` in the
+module, a relative difference of `1.5e-4` — about 2500 ULP at that magnitude,
+so a genuine reduction-order difference rather than rounding. Something
+process-wide changes how the driver executes the reduction, and it is not any
+of the above. Candidates not yet eliminated: driver-side shader cache state,
+and an interaction with the `profiler`'s process-global armed buffer, which
+`init_gpu_context_with` arms on every call. Both are outside this crate's
+control until someone can hold a fixed plan and vary only the process history.
+
+Until that is understood, do not "fix" these by loosening the tolerance — the
+whole module passing is evidence the kernels are correct, so the subset
+failures are a harness artefact, not a kernel defect. And do not read a
+failing attention case as evidence that a scheduling change broke something.
 
 **Padding and `f32` equality.** A padded allocation must not change a
 result — every optimizer, clip and accumulation pass bounds its loops by
