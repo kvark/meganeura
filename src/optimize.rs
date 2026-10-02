@@ -1269,7 +1269,8 @@ impl Stamper<'_> {
             "Neg" => (Op::Neg, ty_of(inputs[0]), None),
             "Transpose" => {
                 let mut s = shape(inputs[0]);
-                s.reverse();
+                let rank = s.len();
+                s.swap(rank - 2, rank - 1);
                 (Op::Transpose, TensorType::f32(s), None)
             }
             "Silu" => (Op::Silu, ty_of(inputs[0]), Some("Mul+Sigmoid→Silu")),

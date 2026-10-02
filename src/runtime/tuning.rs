@@ -782,8 +782,7 @@ impl Session {
                 }
                 let compiled = {
                     let _timer = PhaseTimer::new(&mut prep.pipelines);
-                    self.pipelines
-                        .ensure_tune_tile(&self.gpu, dispatch, MatmulTile::Tile64)
+                    self.pipelines.prepare(&self.gpu, dispatch, None)
                 };
                 outcome.compile_time = prep.pipelines.unwrap();
                 if let Err(error) = compiled {
@@ -827,7 +826,7 @@ impl Session {
                     .iter()
                     .map(|dispatch| {
                         let key = if i == 1 && outcome.candidate_split_k.is_some() {
-                            Variant::Scalar(dispatch.shader.clone())
+                            Pipelines::key(dispatch)
                         } else {
                             tile_variant(dispatch, [outcome.initial, outcome.candidate][i])
                         };

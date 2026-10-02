@@ -523,14 +523,17 @@ pub(super) fn eval(node: &Node, ins: &[&Tensor]) -> Result<Vec<f64>, Error> {
         }
         Op::Transpose => {
             let x = arg(0)?;
-            if x.shape.len() != 2 {
-                return Err(invalid(node, "transpose needs a 2D input"));
+            let rank = x.shape.len();
+            if rank < 2 {
+                return Err(invalid(node, "transpose needs at least a 2D input"));
             }
-            let (r, c) = (x.shape[0], x.shape[1]);
+            let (r, c) = (x.shape[rank - 2], x.shape[rank - 1]);
             let mut out = vec![0.0; x.len()];
-            for i in 0..r {
-                for j in 0..c {
-                    out[j * r + i] = x.data[i * c + j];
+            for b in 0..x.len() / (r * c) {
+                for i in 0..r {
+                    for j in 0..c {
+                        out[b * r * c + j * r + i] = x.data[b * r * c + i * c + j];
+                    }
                 }
             }
             out

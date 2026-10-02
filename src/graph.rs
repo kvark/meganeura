@@ -1633,11 +1633,15 @@ impl Graph {
         self.mean_all(a)
     }
 
+    /// Swap the last two axes, preserving any leading batch axes.
     #[track_caller]
     pub fn transpose(&mut self, x: NodeId) -> NodeId {
         let x_shape = &self.node(x).ty.shape;
-        assert_eq!(x_shape.len(), 2, "transpose requires 2D tensor");
-        let ty = TensorType::f32(vec![x_shape[1], x_shape[0]]);
+        assert!(x_shape.len() >= 2, "transpose requires at least 2D tensor");
+        let mut shape = x_shape.clone();
+        let rank = shape.len();
+        shape.swap(rank - 2, rank - 1);
+        let ty = TensorType::f32(shape);
         self.add_node(Op::Transpose, vec![x], ty)
     }
 
@@ -3385,15 +3389,15 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "transpose requires 2D tensor")]
-    fn transpose_non_2d() {
+    #[should_panic(expected = "transpose requires at least 2D tensor")]
+    fn transpose_vector() {
         let mut g = Graph::new();
         let x = g.add_raw_node(
             Op::Input {
                 name: "x".to_string(),
             },
             vec![],
-            TensorType::f32(vec![2, 3, 4]),
+            TensorType::f32(vec![24]),
         );
         g.transpose(x);
     }

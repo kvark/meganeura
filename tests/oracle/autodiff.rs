@@ -246,6 +246,20 @@ fn reductions_and_rows() {
     );
 }
 
+#[test]
+fn batched_transpose() {
+    for shape in [vec![3, 17, 19], vec![2, 3, 4, 5]] {
+        grad_case(
+            &format!("transpose {shape:?}"),
+            |g| {
+                let x = g.parameter("x", &shape);
+                g.transpose(x)
+            },
+            |_| {},
+        );
+    }
+}
+
 /// `StopGradient` is exempt from finite differences by definition: its
 /// derivative is declared zero while its value depends on the input. Check
 /// the declared behaviour instead: the detached branch contributes nothing.

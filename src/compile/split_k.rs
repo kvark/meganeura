@@ -2,6 +2,42 @@ use super::{BufferRef, Dispatch, ExecutionPlan, ShaderEntry};
 use crate::tune::{MatmulTile, TuneClass, TuneError};
 
 impl ExecutionPlan {
+    pub(super) fn split_low_occupancy_conv_weights(&mut self, options: super::ConvWeightSplits) {
+        assert!(options.reduction_chunk >= 16 && options.reduction_chunk.is_multiple_of(16));
+        let mut bytes = 0usize;
+        let mut selections = Vec::new();
+        for (index, dispatch) in self.dispatches.iter().enumerate() {
+            let Some(class) = TuneClass::from_dispatch(dispatch, None).filter(|c| {
+                c.shader == ShaderEntry::Conv2dGradWeightGemm
+                    && matches!(dispatch.conv_k_tile(), None | Some(16))
+                    && dispatch.input_buffers[0] != dispatch.input_buffers[1]
+                    && dispatch.workgroups[0].saturating_mul(dispatch.workgroups[1])
+                        < options.workgroup_threshold
+            }) else {
+                continue;
+            };
+            let splits = class.k.div_ceil(16).div_ceil(options.reduction_chunk / 16);
+            if !(2..=65_535).contains(&splits) {
+                continue;
+            }
+            let Some(total) = (class.m as usize)
+                .checked_mul(class.n as usize)
+                .and_then(|n| n.checked_mul(splits as usize))
+                .and_then(|n| n.checked_mul(4))
+                .and_then(|n| n.checked_add(bytes))
+                .filter(|&n| n <= options.max_partial_bytes)
+            else {
+                continue;
+            };
+            selections.push((index, splits));
+            bytes = total;
+        }
+        if let Err(error) = self.split_conv_weight_gradients(&selections, options.max_partial_bytes)
+        {
+            log::warn!("keeping unsplit convolution gradients: {error}");
+        }
+    }
+
     /// Lower one matrix product (with optional addition) to partials + SumRows.
     /// This is a candidate, not a selection: qualify and time the entire sequence.
     pub(crate) fn split_matmul(
@@ -218,6 +254,47 @@ impl ExecutionPlan {
 mod tests {
     use super::*;
     use crate::Graph;
+
+    #[test]
+    fn opt_in_weight_splits_preserve_defaults_and_respect_budget() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[128 * 3 * 64 * 64]);
+        let dy = graph.input("dy", &[128 * 8 * 64 * 64]);
+        let dw = graph.conv2d_grad_weight(dy, x, 3, 64, 64, 8, 5, 5, 1, 2, 2);
+        graph.set_outputs(vec![dw]);
+        let base = super::super::compile(&graph);
+        assert_eq!(base.dispatches.len(), 1);
+        let capacity = 600 * 1024 * 4;
+        for (groups, chunk, budget, expected) in [
+            (48, 512, capacity, 2),
+            (48, 512, capacity - 1, 1),
+            (5, 512, capacity, 1),
+            (48, 524288, capacity, 1),
+        ] {
+            let options = super::super::CompileOptions {
+                conv_weight_splits: Some(super::super::ConvWeightSplits {
+                    workgroup_threshold: groups,
+                    reduction_chunk: chunk,
+                    max_partial_bytes: budget,
+                }),
+                ..Default::default()
+            };
+            let plan = super::super::compile_with(&graph, &options);
+            assert_eq!(plan.dispatches.len(), expected);
+            assert_eq!(plan.output_buffers, base.output_buffers);
+            if expected == 2 {
+                assert_eq!(
+                    plan.dispatches[0].shader,
+                    ShaderEntry::Conv2dGradWeightGemmSplit16
+                );
+                assert_eq!(plan.dispatches[0].workgroups, [5, 1, 1024]);
+                assert_eq!(plan.dispatches[1].shader, ShaderEntry::SumRows);
+                assert_eq!(*plan.buffers.last().unwrap(), capacity);
+            } else {
+                assert_eq!(plan.dispatches, base.dispatches);
+            }
+        }
+    }
 
     #[test]
     #[ignore = "GPU dense split-K candidate qualification on an idle device"]
