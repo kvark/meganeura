@@ -2,7 +2,7 @@ use crate::codegen::ShaderGroup;
 use crate::graph::{DType, Graph, Node, NodeId, Op, PairwiseGradKind};
 use crate::schedule::{PointwiseDAG, Pw, ReductionEpilogue, ReductionKernel};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 mod softplus;
 mod split_k;
@@ -892,6 +892,140 @@ fn norm_weight_grad_rows_per_workgroup(rows: u32) -> u32 {
     1 << block.ilog2()
 }
 
+/// Reorder dispatches by dependency level so parallel branches cluster
+/// together, then partition the result into barrier groups.
+///
+/// Level is 0 for dispatches that depend on no other dispatch, and
+/// `1 + max(level of producers)` otherwise. A stable sort by level is a valid
+/// topological order in which every dispatch at the same level is mutually
+/// independent, so those can share one compute pass.
+///
+/// A new group starts wherever a dispatch reads a buffer written earlier in
+/// the current group. After the reorder that aligns with level boundaries,
+/// and it is the level structure that makes it safe rather than a coincidence
+/// of buffer numbering.
+///
+/// `serial` forces one dispatch per group. That is a debugging aid — it
+/// removes every implicit barrier — and it is why this is a parameter rather
+/// than a property of the plan.
+///
+/// Horizontal fusion runs here because it rewrites the group list as it merges
+/// dispatches: packing two matmuls into one shrinks the dispatch vector, so
+/// the groups have to be rebuilt against the new indices. It has to be in the
+/// same place as the grouping, not called from the runtime afterwards.
+///
+/// This lives in the compiler, next to the fusion passes it feeds, so that
+/// `runtime` only records passes and `memplan` is not handed a value the
+/// runtime had to invent. The plan is a complete, ordered program by the time
+/// it leaves here.
+pub fn schedule_dispatches(plan: &mut ExecutionPlan, serial: bool, fuse_horizontal: bool) {
+    reorder_by_level(&mut plan.dispatches);
+    let mut groups = if serial {
+        (0..plan.dispatches.len()).map(|i| i..i + 1).collect()
+    } else {
+        compute_groups(&plan.dispatches)
+    };
+    if fuse_horizontal {
+        fuse_horizontal_matmuls(&mut plan.dispatches, &mut groups);
+    }
+    warn_on_hazards(&plan.dispatches, &groups);
+    plan.groups = groups;
+}
+
+/// Reorder dispatches by dependency level so parallel branches cluster
+/// together.
+///
+/// Level is defined as: 0 for dispatches with no dependencies on other
+/// dispatches (only on inputs/params), and `1 + max(level of producers)`
+/// otherwise. A stable sort by level produces a valid topological order where
+/// all dispatches at the same level are mutually independent — they can share
+/// a single compute pass without any barrier between them.
+fn reorder_by_level(dispatches: &mut Vec<Dispatch>) {
+    let n = dispatches.len();
+    if n == 0 {
+        return;
+    }
+    // Map: buffer id → index of the dispatch that writes it.
+    let mut producer: HashMap<u32, usize> = HashMap::new();
+    let mut levels = vec![0u32; n];
+    for (i, dispatch) in dispatches.iter().enumerate() {
+        let level = dispatch
+            .input_buffers
+            .iter()
+            .filter_map(|b| producer.get(&b.0))
+            .map(|&pred| levels[pred] + 1)
+            .max()
+            .unwrap_or(0);
+        levels[i] = level;
+        producer.insert(dispatch.output_buffer.0, i);
+        for &extra in &dispatch.extra_outputs {
+            producer.insert(extra.0, i);
+        }
+    }
+    // Stable sort by level keeps topological order within a level.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| levels[i]);
+    let old = std::mem::take(dispatches);
+    *dispatches = order.iter().map(|&i| old[i].clone()).collect();
+}
+
+/// Partition the (reordered) dispatch list into barrier groups.
+///
+/// Dispatches in the same group share one compute pass (no barrier between
+/// them). A new group starts whenever a dispatch reads a buffer written by an
+/// earlier dispatch in the current group (RAW hazard). After level-based
+/// reordering this aligns exactly with level boundaries.
+fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
+    let mut groups = Vec::new();
+    let mut dirty = HashSet::<u32>::new();
+    let mut start = 0;
+    for (i, dispatch) in dispatches.iter().enumerate() {
+        if dispatch.input_buffers.iter().any(|b| dirty.contains(&b.0)) {
+            groups.push(start..i);
+            start = i;
+            dirty.clear();
+        }
+        dirty.insert(dispatch.output_buffer.0);
+        for &extra in &dispatch.extra_outputs {
+            dirty.insert(extra.0);
+        }
+    }
+    if !dispatches.is_empty() {
+        groups.push(start..dispatches.len());
+    }
+    groups
+}
+
+/// Report any read-after-write hazard inside a group. Such a group is unsafe
+/// to record as one pass: the dispatches would have no barrier between them,
+/// so the later read could observe the earlier write before it lands.
+///
+/// A hazard here is a compiler bug, not a user error, so this warns rather
+/// than panics — a wrong number from a session that still runs is easier to
+/// diagnose from a log line than from a failed build.
+fn warn_on_hazards(dispatches: &[Dispatch], groups: &[std::ops::Range<usize>]) {
+    for group in groups {
+        let mut written = HashSet::<u32>::new();
+        for i in group.clone() {
+            let d = &dispatches[i];
+            for ib in &d.input_buffers {
+                if written.contains(&ib.0) {
+                    log::warn!(
+                        "RAW hazard in group: dispatch {} ({:?}) reads buf {} written earlier in same group",
+                        i,
+                        d.shader,
+                        ib.0
+                    );
+                }
+            }
+            written.insert(d.output_buffer.0);
+            for &extra in &d.extra_outputs {
+                written.insert(extra.0);
+            }
+        }
+    }
+}
+
 /// Pack independent same-A matmuls that share a barrier group into one
 /// dispatch (`workgroups[2] = N`, `horizontal_batch = N`).
 pub fn fuse_horizontal_matmuls(
@@ -1164,6 +1298,17 @@ pub struct ExecutionPlan {
     /// The dispatch sequence. For a training graph, this includes
     /// forward, backward, and parameter update dispatches.
     pub dispatches: Vec<Dispatch>,
+    /// Barrier groups: each range of dispatch indices shares one compute
+    /// pass, and pass boundaries emit the barriers that order them.
+    ///
+    /// Filled by [`schedule_dispatches`] rather than by `compile`, because
+    /// the two steps are not separable — horizontal fusion changes how many
+    /// dispatches there are, so the groups can only be computed once the
+    /// fusion has run. `runtime` records these; `memplan` uses them to find
+    /// each buffer's live range. Defaults to one group per dispatch so a
+    /// deserialized or hand-built plan is still recordable.
+    #[serde(default)]
+    pub groups: Vec<std::ops::Range<usize>>,
     /// Index of the loss buffer (first graph output, for reading back).
     pub loss_buffer: Option<BufferRef>,
     /// All graph output buffers (for reading back multiple outputs).
@@ -2708,6 +2853,7 @@ impl<'a> Compiler<'a> {
                 input_buffers: Vec::new(),
                 constant_buffers: Vec::new(),
                 dispatches: Vec::new(),
+                groups: Vec::new(),
                 loss_buffer: None,
                 output_buffers: Vec::new(),
                 param_grad_pairs: Vec::new(),
