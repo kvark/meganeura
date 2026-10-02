@@ -1,5 +1,12 @@
 # Unreleased
 
+- `profile_windows::windowed_capture_times_every_dispatch_and_preserves_the_result`
+  compared its output for bit equality, which fails on Intel with a ~2.7e-5
+  relative drift — ordinary f32 accumulation over six layers, a few hundred ULP.
+  It now uses a `1e-4` tolerance, measured against what it must still catch: a
+  missed or repeated pass leaves whole layers at the wrong value and moves the
+  output by `O(1)`. Verified by injecting a 0.01 offset and confirming the check
+  still fails.
 - `SessionConfig::from_env` no longer falls through to a different GPU when
   `MEGANEURA_DEVICE_ID` names a device it cannot open. It logged a warning and
   set `gpu: None`, after which `build` reached `default_gpu_context` — which
