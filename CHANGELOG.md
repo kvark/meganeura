@@ -1,5 +1,23 @@
 # Unreleased
 
+- Adam's bias correction is computed on the host. `adam.wgsl` used to raise
+  `pow(beta, step)` once per parameter element — four transcendental ops per
+  element, per step, for a value that is uniform across the whole dispatch
+  and constant for the step. The uniform now carries `1 / (1 - beta1^step)`
+  and `1 / (1 - beta2 ^ step)`, which also keeps one rounding for the whole
+  step instead of one per thread.
+- Check the test harness itself. `smoke::harness_manifest` walks the `mod`
+  graph from the `[[test]]` targets and fails when a file under `tests/` is
+  unreachable or a `mod` names a file that is not there. `outline_optimize`,
+  `profile_windows` and `resnet_correctness` each carried real assertions
+  and none of them was compiled. The two PyTorch-parity tests that compare
+  against a gitignored fixture are now `#[ignore]`d instead of returning
+  early, so a run without the fixture reports them as not-run rather than
+  green.
+- Move the lint contract from `lib.rs` to `[lints]` in `Cargo.toml`, add a
+  `clippy.toml` with the two thresholds the codebase overrides, and drop 24
+  per-function `#[allow(clippy::too_many_arguments)]` attributes that the
+  crate-level allow already covered.
 - `Session::record` puts a step — inference, or training with its optimizer
   update — into a caller's command encoder instead of a submission of its
   own; the encoder must use automatic barriers.

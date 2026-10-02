@@ -1924,7 +1924,6 @@ fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
 }
 
 /// Record the compiled graph, leaving the last chunk open for appended work.
-#[allow(clippy::too_many_arguments)]
 fn record_groups(
     gpu: &Gpu,
     encoder: &mut blade_graphics::CommandEncoder,

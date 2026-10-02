@@ -225,7 +225,6 @@ pub struct Conv2d {
 }
 
 impl Conv2d {
-    #[allow(clippy::too_many_arguments)]
     #[track_caller]
     pub fn new(
         g: &mut Graph,

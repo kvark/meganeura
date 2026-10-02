@@ -1,18 +1,8 @@
-#![allow(
-    clippy::match_like_matches_macro,
-    clippy::redundant_pattern_matching,
-    clippy::needless_lifetimes,
-    clippy::new_without_default,
-    clippy::single_match,
-    clippy::too_many_arguments,
-    clippy::collapsible_if,
-    clippy::needless_range_loop
-)]
-#![warn(
-    trivial_numeric_casts,
-    unused_extern_crates,
-    clippy::pattern_type_mismatch
-)]
+// The lint contract is in `Cargo.toml` under `[lints]`, so it applies to
+// every target rather than only the library. `pattern_type_mismatch` is
+// allowed there and re-enabled here, because the library enforces it while
+// the tests and examples deliberately use the more readable tuple patterns.
+#![warn(clippy::pattern_type_mismatch)]
 
 //! Meganeura: graph-optimized neural network framework on blade-graphics.
 //!

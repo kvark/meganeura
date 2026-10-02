@@ -1,0 +1,22 @@
+# Clippy thresholds this crate overrides from the defaults, and why.
+#
+# The `[lints]` table in Cargo.toml is the policy; this file is the numeric
+# detail that has nowhere else to live. Both are checked in so a local run
+# and CI's `-D warnings` agree.
+
+# `graph.rs` has ~10 builders over this many arguments (`conv2d` takes
+# kernel, stride, padding, dilation, groups and their h/w splits). The
+# parameter count is a real ergonomic observation about those signatures,
+# not a defect, and the fix is option structs — a change to the public graph
+# API rather than a lint to raise. CI's `-D warnings` would otherwise block
+# every build on that refactor, so the threshold is raised and the decision
+# is recorded in tests/audits instead.
+too-many-arguments-threshold = 12
+
+# `enum Op`, `enum Variant` and `enum ShaderEntry` mix unit variants with
+# ones carrying a `Vec`, a `String` or a nested kernel struct. That is the
+# shape a shader-variant enum takes when each variant names its own
+# codegen parameters, and boxing those fields would cost an allocation on a
+# path that already builds them once per session. This is the threshold
+# behind `clippy::large_enum_variant`.
+enum-variant-size-threshold = 512

@@ -22,6 +22,10 @@ mod horizontal_matmul;
 mod int_dot_gemv;
 mod laprop;
 mod multi_input_trainer;
+mod outline_optimize;
+mod profile_windows;
+#[cfg(feature = "models")]
+mod resnet_correctness;
 mod rmsnorm_matmul_prologue;
 mod schedule_pointwise;
 mod schedule_reduction;

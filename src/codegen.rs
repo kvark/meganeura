@@ -1399,7 +1399,6 @@ fn matmul_vars_full(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Where the tiled skeleton reads A and B.
 ///
 /// `*_idx` address the storage buffers; `*_row`/`*_col` split the flat
@@ -5997,7 +5996,6 @@ pub fn generate_conv2d_coop_module(
 /// Emit the im2col staging loop for grad_input (backward) direction.
 ///
 /// Loads from `grad_out` with compile-time kernel decomposition.
-#[allow(clippy::too_many_arguments)]
 fn emit_grad_input_im2col_stage(
     src: &mut String,
     shared_name: &str,
@@ -6105,7 +6103,6 @@ fn emit_grad_input_im2col_stage(
 /// Emit the weight staging for grad_input (backward) direction.
 ///
 /// Weight is stored as [Co, Ci, kH, kW]; we load weight_T[Ci, Co*kH*kW].
-#[allow(clippy::too_many_arguments)]
 fn emit_grad_input_weight_stage(
     src: &mut String,
     shared_name: &str,
@@ -6167,7 +6164,6 @@ fn emit_grad_input_weight_stage(
 /// vec4 loads; an 8x8 tile has only 64 shared elements, so each of the 64
 /// threads stages one scalar instead. Mapping an 8x8 tile with the vec4
 /// layout would address it as 16 rows by 16 columns and write out of bounds.
-#[allow(clippy::too_many_arguments)]
 fn emit_forward_weight_stage(
     src: &mut String,
     shared_name: &str,
@@ -6275,7 +6271,6 @@ fn emit_forward_weight_stage(
 /// Emit the im2col staging loop for forward direction.
 ///
 /// Loads from `src` (input) with compile-time kernel decomposition.
-#[allow(clippy::too_many_arguments)]
 fn emit_forward_im2col_stage(
     src: &mut String,
     shared_name: &str,

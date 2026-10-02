@@ -36,7 +36,6 @@ struct Window {
 }
 
 impl Window {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         node: &Node,
         ci: u32,

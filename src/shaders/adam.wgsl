@@ -5,7 +5,14 @@ struct Params {
     beta1: f32,
     beta2: f32,
     eps: f32,
-    step: f32,
+    // 1 / (1 - beta1^step) and 1 / (1 - beta2^step), computed on the host.
+    // The exponent is uniform across the dispatch and constant for the
+    // step, so raising it per element would repeat one `pow` for every
+    // parameter element. The host also keeps one rounding for the whole
+    // step instead of one per thread. Must match `AdamParams` in
+    // `runtime/optimizer.rs`.
+    bias_correction1: f32,
+    bias_correction2: f32,
     wd: f32,
     grad_group_size: u32,
     // Pair index whose grouped gradient norms are collected.
@@ -41,7 +48,7 @@ fn update(s: Segment, i: u32) {
     // Update biased second moment
     let v_new = params.beta2 * v[e] + (1.0 - params.beta2) * g * g;
     v[e] = v_new;
-    let v_hat = v_new / (1.0 - pow(params.beta2, params.step));
+    let v_hat = v_new * params.bias_correction2;
 
     // Adam accumulates momentum on raw gradients and normalizes the result.
     // LaProp normalizes each gradient first and then accumulates
@@ -52,7 +59,7 @@ fn update(s: Segment, i: u32) {
     }
     let m_new = params.beta1 * m[e] + (1.0 - params.beta1) * moment_input;
     m[e] = m_new;
-    let m_hat = m_new / (1.0 - pow(params.beta1, params.step));
+    let m_hat = m_new * params.bias_correction1;
 
     var step = m_hat / (sqrt(v_hat) + params.eps);
     if params.algorithm == ADAM_ALGORITHM_LAPROP {
