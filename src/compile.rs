@@ -6155,7 +6155,6 @@ impl<'a> Compiler<'a> {
     ///   op: Sum
     ///   epilogue: (x - mean) * rsqrt(var + eps) * weight[col] + bias[col]
     ///   where mean = r0/cols, var = r1/cols - mean².
-    #[allow(clippy::too_many_arguments)]
     /// Emit RmsNorm as a single schedule-template reduction:
     ///   prologue: v*v (sum-of-squares)
     ///   op: Sum

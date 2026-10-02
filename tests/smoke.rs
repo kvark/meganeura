@@ -4,6 +4,7 @@ mod cache_inference;
 mod checkpoint_validation;
 mod debug_session;
 mod gpu_smoke;
+mod harness_manifest;
 mod optimizer_memory;
 mod provenance;
 mod shared_winograd_checkpoint;

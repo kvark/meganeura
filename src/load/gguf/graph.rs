@@ -762,7 +762,6 @@ fn norm(
 /// Qwen3's Q/K norms are one head wide and shared by every head, so the
 /// rows are reshaped to `[rows * heads, head_dim]`, normed, and reshaped
 /// back — the norm's own per-row behaviour then *is* the per-head one.
-#[allow(clippy::too_many_arguments)]
 fn per_head_norm(
     g: &mut Graph,
     model: &GgufModel,

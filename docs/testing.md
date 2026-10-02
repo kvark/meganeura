@@ -93,6 +93,29 @@ Limits: lavapipe has no cooperative-matrix support, so those kernels are only
 checked on hardware that has it; run the suite there too. Packed quantized
 weights have no reference yet: the interpreter reports them as unsupported.
 
+## The oracle does not cover quantized activations
+
+`CompileOptions::quantized_activations` defaults to **true**, and for a
+quantized weight format it quantizes the GEMV activation row to Q8_1 and runs
+the inner product on integer dot products. This is the one switch in the
+compiler that changes the numbers rather than the route to them, so it is
+never selected by measurement — but it means the default decode path is not
+the path the f64 reference describes, and the oracle cannot check it,
+because packed weights have no reference.
+
+What covers it instead: `regression::int_dot_gemv` pins the exact integer
+arithmetic against a host model of `vec_dot_*_q8_1` and separately bounds the
+error against the f32 path, so a matching-but-wrong reference cannot pass
+vacuously. `gguf_model::a_quantized_model_agrees_with_its_own_dequantization`
+does the same end to end, guarded by
+`gguf_model::quantizing_actually_changes_the_weights`.
+
+The gap is coverage, not correctness: a regression that made this fire on an
+*additional* weight format or shader group would be invisible to every check
+above, because they all construct the graphs that select it explicitly. Set
+`quantized_activations: false` in a test that means to measure the f32 path —
+`gpu_smoke` does this for exactly that reason.
+
 ## Suite layout
 
 `smoke`, `regression` and `oracle` compile their modules into three
@@ -103,11 +126,63 @@ For example, the old `--test checkpoint_validation` selection becomes
 `--test smoke checkpoint_validation::`. `--test tune` becomes
 `--test regression tune::`.
 
+The cost of that choice is that a new file under `tests/` is dead code until
+one of those roots declares it as a `mod` child, and nothing in the build
+notices when that is missing. `smoke::harness_manifest` walks the same graph
+the compiler does — from the `[[test]]` targets, through their `mod`
+declarations — and fails if a file is unreachable, or if a `mod` names a
+file that is not there. It also asserts `autotests = false` is still set, so
+it cannot pass vacuously if autodiscovery comes back. Three files
+(`outline_optimize`, `profile_windows`, `resnet_correctness`) sat uncompiled
+until that check existed.
+
+A test whose fixture is not in the repository must be `#[ignore]`d, not
+return early on a missing file. `resnet_mini_matches_pytorch` and
+`whisper_conv_stem_ffn_matches_pytorch` compare against PyTorch output that
+`scripts/gen_reference.py` writes into the gitignored `bench/results/`. An
+early `return` made them report green while checking nothing, which is how
+they went unnoticed for as long as they were uncompiled.
+
 Tests set `SessionConfig` fields and do not write environment variables.
 The repository defaults `RUST_TEST_THREADS` to 1 for a shared workstation
 GPU; an explicit environment setting or `--test-threads` still overrides
 that default. CI passes `--test-threads=4`: most of a test is graph setup
 and queue waits, and a hosted runner keeps four sessions in flight.
+
+## Known failures on real hardware
+
+These reproduce on a clean checkout with all features, and are recorded here
+because the CI adapter (lavapipe) does not reach them. Confirm before
+attributing one to your change.
+
+**Context churn exhausts the NVIDIA driver.** `NoSupportedDeviceFound` after
+roughly ten create/drop cycles in one process; lavapipe and the Intel driver
+tolerate it. It fails `vision::conv2d_grad_weight_split_k` and
+`vision::conv2d_tuned_kernels` on the RTX 5070, each of which builds nine
+sessions. Sharing one context across the whole oracle fixes those two, but it
+also changes the attention comparisons' results, so it is not a free win —
+the trade needs the attention sensitivity understood first. Two tests must
+not be read as evidence that a plan change broke convolution: the failure is
+in the harness, not the kernels.
+
+**The attention oracle is order-dependent.** `attention::causal_forward` and
+its siblings fail when run under a filter that selects a subset of the
+`attention` module, and pass when the whole module runs. Plans, coop policy
+and workgroup geometry are identical either way, so the difference is in
+state the process carries between cases. Tolerance misses are small and
+consistent with f16 rounding on the large-head-dim cases (`dim` 128 and 256),
+so they are not obviously the same problem as the context churn above.
+
+**Padding changes optimizer results in one configuration.** In
+`optimizer_memory::optimizer_clipping_and_diagnostics_ignore_poisoned_allocation_padding`,
+LaProp plus *global* gradient clipping plus a padded gradient allocation
+yields a last-ULP difference against the same run with no padding. Adam is
+unaffected, and adaptive clipping is unaffected; the gradients themselves
+are bit-identical in every combination, so the divergence is in the clip
+pass, not in backward. `optimizer_len` (`runtime.rs`) falls back to
+`plan.buffers[param] / 4` when a buffer has no `param_types` entry, and a
+gradient never has one — so the fallback returns the *padded* element count
+for a gradient-sized allocation. That path is the thing to check first.
 
 ## Track coverage before pruning
 

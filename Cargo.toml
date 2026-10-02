@@ -25,6 +25,38 @@ name = "regression"
 name = "oracle"
 path = "tests/oracle/main.rs"
 
+# The crate's lint contract lives here rather than in `lib.rs` so it applies to
+# every target and can be read without opening a source file. CI still runs
+# clippy with `-D warnings`; this table is what makes the policy explicit and
+# locally enforceable rather than implied.
+#
+# The allows below are style lints that fight the shapes this codebase
+# deliberately uses — many-argument graph and model builders, `match` arms
+# whose bodies differ, single-arm matches that read better than `_ => {}`.
+# `too_many_arguments` in particular is allowed crate-wide, so a per-function
+# `#[allow]` for it would be dead weight; the graph builders that need
+# narrower signatures are a design question, not a lint to silence locally.
+[lints.rust]
+trivial_numeric_casts = "warn"
+unused_extern_crates = "warn"
+
+[lints.clippy]
+match_like_matches_macro = "allow"
+redundant_pattern_matching = "allow"
+needless_lifetimes = "allow"
+new_without_default = "allow"
+single_match = "allow"
+too_many_arguments = "allow"
+collapsible_if = "allow"
+needless_range_loop = "allow"
+# Deliberately library-only. `lib.rs` has two targeted `#[allow]`s at the
+# two sites that trip it; the tests, examples and benches follow the
+# `for (a, b) in &map` / `.map(|(a, b)| ..)` style the lint rejects in
+# roughly 70 places, and rewriting them to `&_` patterns would be churn
+# against no defect. Set per-target where a stricter rule is wanted:
+#   RUSTFLAGS="-W clippy::pattern_type_mismatch"
+pattern_type_mismatch = "allow"
+
 [features]
 # Nothing is enabled by default: a pinning embedder gets the core graph,
 # compile and runtime without first-party model definitions or the GGUF

@@ -112,7 +112,6 @@ pub fn build_graph(g: &mut Graph, batch: u32) -> NodeId {
 ///
 /// SE is intentionally absent — V2's design moves SE into MBConv only.
 #[doc(hidden)]
-#[allow(clippy::too_many_arguments)]
 pub fn fused_mbconv(
     g: &mut Graph,
     x: NodeId,
@@ -182,7 +181,6 @@ pub fn fused_mbconv(
 /// helper assumes `expand_ratio > 1` (V1's MBConv1-style is handled
 /// by `fused_mbconv` instead in the V2 architecture).
 #[doc(hidden)]
-#[allow(clippy::too_many_arguments)]
 pub fn mbconv(
     g: &mut Graph,
     x: NodeId,

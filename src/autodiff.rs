@@ -1113,7 +1113,6 @@ impl Graph {
 /// and V inputs. With `rope_theta`, the node rotated Q and K itself: the
 /// gradient kernels see the rotated operands and the gradients flow back
 /// through the inverse rotation.
-#[allow(clippy::too_many_arguments)]
 fn attention_backward(
     graph: &mut Graph,
     grads: &mut HashMap<NodeId, NodeId>,

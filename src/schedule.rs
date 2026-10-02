@@ -655,7 +655,6 @@ fn lower_pointwise(dag: &PointwiseDAG, grid: GridShape) -> ShaderModule {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn lower_reduction(
     op: ReduceOp,
     prologue: &PointwiseDAG,

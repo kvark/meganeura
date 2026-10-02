@@ -2212,7 +2212,6 @@ impl Graph {
     ///
     /// Same as `causal_attention` but each position only attends to the
     /// last `window_size` positions (inclusive).
-    #[allow(clippy::too_many_arguments)]
     #[track_caller]
     pub fn sliding_window_attention(
         &mut self,
@@ -2265,7 +2264,6 @@ impl Graph {
     // --- GroupNorm ops ---
 
     /// Group normalization. Input is flat `[N*C*H*W]`, weight `[C]`, bias `[C]`.
-    #[allow(clippy::too_many_arguments)]
     pub fn group_norm(
         &mut self,
         x: NodeId,
@@ -2291,7 +2289,6 @@ impl Graph {
     }
 
     /// GroupNorm backward w.r.t. input.
-    #[allow(clippy::too_many_arguments)]
     pub fn group_norm_grad_input(
         &mut self,
         grad_output: NodeId,
@@ -2318,7 +2315,6 @@ impl Graph {
     }
 
     /// GroupNorm backward w.r.t. weight+bias (concatenated `[2*C]` output).
-    #[allow(clippy::too_many_arguments)]
     pub fn group_norm_grad_weight_bias(
         &mut self,
         grad_output: NodeId,
@@ -2463,7 +2459,6 @@ impl Graph {
     ///
     /// Tensors are flat 1D arrays in NCHW order. `input` shape must be `[N * C_in * H * W]`
     /// and `kernel` shape `[C_out * C_in * kH * kW]` (both stored as single-dim in the graph).
-    #[allow(clippy::too_many_arguments)]
     pub fn conv2d(
         &mut self,
         input: NodeId,
@@ -2497,7 +2492,6 @@ impl Graph {
     /// Conv2d with separate height/width padding (for Conv1d emulation etc.).
     /// Input and kernel must have the flat shapes documented by [`Self::conv2d`].
     #[track_caller]
-    #[allow(clippy::too_many_arguments)]
     pub fn conv2d_hw(
         &mut self,
         input: NodeId,
@@ -2586,7 +2580,6 @@ impl Graph {
     /// `[N, C, oH, oW]` flattened (same NCHW layout convention as
     /// [`Self::conv2d`]). No autodiff support — used only with frozen
     /// pretrained weights (e.g. P2P-fine-tuned EfficientNet).
-    #[allow(clippy::too_many_arguments)]
     pub fn conv2d_dw(
         &mut self,
         input: NodeId,
@@ -2622,7 +2615,6 @@ impl Graph {
     }
 
     /// Conv2d backward w.r.t. input.
-    #[allow(clippy::too_many_arguments)]
     pub fn conv2d_grad_input(
         &mut self,
         grad_output: NodeId,
@@ -2658,7 +2650,6 @@ impl Graph {
     }
 
     /// Conv2d backward w.r.t. kernel weights.
-    #[allow(clippy::too_many_arguments)]
     pub fn conv2d_grad_weight(
         &mut self,
         grad_output: NodeId,
@@ -2829,7 +2820,6 @@ impl Graph {
     /// runtime-valid prefix. Query row `i` attends through absolute cache
     /// position `kv_pos + i`, so chunks compose exactly with single-token
     /// decoding.
-    #[allow(clippy::too_many_arguments)]
     #[track_caller]
     pub fn cached_block_attention(
         &mut self,

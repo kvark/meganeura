@@ -45,13 +45,22 @@ fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     out
 }
 
+/// Compared against PyTorch, not the f64 reference, so it needs a fixture
+/// that is not in the repository. `#[ignore]` rather than an early `return`
+/// on a missing file, so a CI run reports it as not-run instead of green.
+///
+/// To run it:
+///   python3 scripts/gen_reference.py
+///   cargo test --test regression --all-features -- --ignored whisper_conv_stem
 #[test]
+#[ignore = "needs PyTorch reference; run scripts/gen_reference.py first"]
 fn whisper_conv_stem_ffn_matches_pytorch() {
     let path = "bench/results/whisper_reference.json";
-    if !std::path::Path::new(path).exists() {
-        eprintln!("SKIP: {path} not found (run: python3 scripts/gen_reference.py)");
-        return;
-    }
+    assert!(
+        std::path::Path::new(path).exists(),
+        "{path} is missing. Run `python3 scripts/gen_reference.py` — the point of \
+         this test is the PyTorch comparison, so there is nothing to fall back to."
+    );
     let json = std::fs::read_to_string(path).unwrap();
 
     let input = parse_f32_array(&json, "input");
