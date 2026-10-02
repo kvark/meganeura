@@ -38,8 +38,7 @@ impl Shape {
 }
 
 fn gpu() -> Arc<blade_graphics::Context> {
-    let gpu =
-        Arc::new(meganeura::init_gpu_context_with(meganeura::GpuOptions::from_env()).unwrap());
+    let gpu = crate::support::gpu::gpu();
     eprintln!("GPU: {}", gpu.device_information().device_name);
     gpu
 }

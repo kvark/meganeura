@@ -84,7 +84,7 @@ fn global_grad_clip_measures_large_gradients() {
     let max_norm = (norm * 0.25) as f32;
     let lr = 0.5f32;
 
-    let mut session = meganeura::build(&graph, meganeura::SessionConfig::from_env()).0;
+    let mut session = meganeura::build(&graph, crate::support::gpu::config()).0;
     for (i, &n) in sizes.iter().enumerate() {
         session.set_parameter(&format!("p{i}"), &vec![0.0; n]);
         session.set_input(&format!("t{i}"), &targets[i]);
@@ -141,7 +141,7 @@ fn adaptive_grad_clip_measures_large_parameters() {
         .map(|(i, &n)| values(n, 0.37 + i as f32 * 0.1, 0.3))
         .collect();
 
-    let mut session = meganeura::build(&graph, meganeura::SessionConfig::from_env()).0;
+    let mut session = meganeura::build(&graph, crate::support::gpu::config()).0;
     for (i, _) in sizes.iter().enumerate() {
         session.set_parameter(&format!("p{i}"), &initial[i]);
         session.set_input(&format!("t{i}"), &targets[i]);
@@ -202,7 +202,7 @@ fn flash_attention_backward_uses_precomputed_row_dots() {
             ("v", values(seq * kv_width, 0.023, 1.1)),
         ];
         let inputs = [("weights", values(seq * q_width, 0.013, 1.7))];
-        let mut training = meganeura::build(&graph, meganeura::SessionConfig::from_env()).0;
+        let mut training = meganeura::build(&graph, crate::support::gpu::config()).0;
         let dispatches = &training.plan().dispatches;
         let query = dispatches
             .iter()
@@ -224,8 +224,7 @@ fn flash_attention_backward_uses_precomputed_row_dots() {
         training.step();
         training.wait();
 
-        let mut inference =
-            meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
+        let mut inference = meganeura::build(&graph, crate::support::gpu::inference_config()).0;
         for (name, data) in &parameters {
             let mut gradient = vec![0.0; data.len()];
             training.read_param_grad(name, &mut gradient);
@@ -254,7 +253,7 @@ fn bce_gradient_is_finite_for_saturated_predictions() {
     let t = graph.input("t", &[4]);
     let loss = graph.bce_loss(p, t);
     graph.set_outputs(vec![loss]);
-    let mut session = meganeura::build(&graph, meganeura::SessionConfig::from_env()).0;
+    let mut session = meganeura::build(&graph, crate::support::gpu::config()).0;
     let xs = [30.0f32, -30.0, 0.3, -1.2];
     let ts = [0.0f32, 1.0, 1.0, 0.0];
     session.set_parameter("x", &xs);

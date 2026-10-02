@@ -8,5 +8,6 @@ mod harness_manifest;
 mod optimizer_memory;
 mod provenance;
 mod shared_winograd_checkpoint;
+mod support;
 #[cfg(feature = "models")]
 mod training_correctness;

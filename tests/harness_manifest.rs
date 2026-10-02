@@ -103,11 +103,19 @@ fn declared_roots() -> Vec<PathBuf> {
 }
 
 /// The files one test file declares as `mod` children, resolved the way the
-/// compiler resolves them: siblings in its own directory.
+/// compiler resolves them.
 ///
-/// Only the bare `mod name;` form is recognised. That is the convention
-/// every root uses, and staying narrow means a file cannot pass the guard by
-/// declaring its children some other way.
+/// Two forms exist in this tree and both have to be understood, or the guard
+/// reports a working module as missing: `mod name;` is a sibling `name.rs`,
+/// and `mod name;` where `name/` is a directory is that directory's
+/// `mod.rs`. The oracle already uses the second form (`mod gpu;` is
+/// `tests/oracle/gpu.rs`, `mod vision;` lives beside it), and the test
+/// harnesses use it for shared helpers.
+///
+/// Only the bare `mod name;` spelling is recognised. Staying narrow means a
+/// file cannot pass the guard by declaring its children some other way, at the
+/// cost of not catching an inline `mod name { .. }` — which cannot contain a
+/// sibling test file anyway.
 fn submodules(file: &Path, source: &str) -> Vec<PathBuf> {
     let dir = file.parent().unwrap_or(Path::new(".")).to_path_buf();
     source
@@ -117,7 +125,14 @@ fn submodules(file: &Path, source: &str) -> Vec<PathBuf> {
             if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 return None;
             }
-            Some(dir.join(format!("{name}.rs")))
+            // A directory module resolves to its `mod.rs`; anything else is
+            // the sibling file.
+            let directory = dir.join(name);
+            if directory.is_dir() {
+                Some(directory.join("mod.rs"))
+            } else {
+                Some(dir.join(format!("{name}.rs")))
+            }
         })
         .collect()
 }

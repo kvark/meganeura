@@ -1,5 +1,30 @@
 # Unreleased
 
+- `SessionConfig::from_env` no longer falls through to a different GPU when
+  `MEGANEURA_DEVICE_ID` names a device it cannot open. It logged a warning and
+  set `gpu: None`, after which `build` reached `default_gpu_context` — which
+  names no device, so Blade picked whichever adapter initialised first. On a
+  machine with an NVIDIA card and an Intel one, that meant sessions silently
+  moved hardware after the NVIDIA driver stopped issuing contexts (about ten
+  per process). Results, timings and capabilities from then on belonged to
+  neither the request nor an error. A requested device is now a hard failure,
+  with a message pointing at `SessionConfig::from_env_with_gpu` for callers
+  that build several sessions. That constructor is public now; it was private,
+  which left no supported way to share one context across repeated builds.
+- The test harnesses and `load::gguf::Generator` share one context instead of
+  creating one per session, which is what exhausted the driver's budget in the
+  first place. `tests/support/gpu.rs` and `SessionConfig::from_env_with_gpu`
+  cover the general case.
+- This fixes a batch of failures that were never kernel defects:
+  `vision::conv2d_grad_weight_split_k`, `vision::conv2d_tuned_kernels`, five
+  `conv_derivatives` cases, `flash_grad_kv_short`,
+  `schedule_reduction::pairwise_squared_distance...`, all seven
+  `shared_parameters` cases and the `cached_query_attention` case. Those
+  either could not get a context or were being compared against the wrong GPU.
+- Five `attention` oracle cases still fail on the RTX 5070 and now fail
+  honestly: the cooperative flash forward emits values that are exactly
+  `f16(reference)` on a device that advertises no f32 cooperative tile. See
+  `docs/testing.md`.
 - The causal and sliding-window key range that every attention kernel computes
   is emitted from one place (`codegen::kv_range`) instead of being written out
   five times. It is the correctness-critical part of the mask, and a fix that

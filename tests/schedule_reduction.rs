@@ -42,7 +42,7 @@ fn run(build: &dyn Fn(&mut Graph) -> BuildResult, n_out: usize, fuse: bool) -> V
         SessionConfig {
             mode: Mode::Inference,
             options: opts,
-            ..SessionConfig::from_env()
+            ..crate::support::gpu::config()
         },
     )
     .0;
@@ -123,7 +123,7 @@ fn narrow_sum_inner_matches_ones_matmul_bit_exactly() {
         &graph,
         SessionConfig {
             mode: Mode::Inference,
-            ..SessionConfig::default()
+            ..crate::support::gpu::config()
         },
     )
     .0;

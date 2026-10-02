@@ -161,7 +161,7 @@ fn a_million_f32_parameters_do_not_reserve_eight_mib_of_unused_moments() {
     let p = graph.parameter("p", &[1024, 1024]);
     let loss = graph.mean_all(p);
     graph.set_outputs(vec![loss]);
-    let mut s = meganeura::build(&graph, SessionConfig::default()).0;
+    let mut s = meganeura::build(&graph, crate::support::gpu::config()).0;
     let before = s.memory_summary();
     assert_eq!(before.adam_state_bytes, 0);
     s.set_adam(0.001, 0.9, 0.999, 1e-8);
@@ -200,7 +200,7 @@ fn optimizer_clipping_and_diagnostics_ignore_poisoned_allocation_padding() {
                     .push((gradient, bytemuck::cast_slice(&poison).to_vec()));
                 let mut s = meganeura::Session::with_context_opts(
                     plan,
-                    std::sync::Arc::new(meganeura::init_gpu_context().unwrap()),
+                    crate::support::gpu::gpu(),
                     SessionOptions {
                         debug,
                         coop: CoopPolicy::Disabled,

@@ -102,6 +102,28 @@ impl Default for GenerationOptions {
     }
 }
 
+/// One context for every session this module builds.
+///
+/// `inference_from_env` creates a device-selected context per call and hands
+/// it to a single session. A caller loading several models would cross the
+/// point where the NVIDIA driver stops issuing contexts — after which
+/// `from_env` refuses rather than continuing on a different adapter — and a
+/// generator wanting both prefill and decode would be two contexts on its own.
+/// Sharing keeps device selection one decision, made once.
+fn session_config() -> crate::SessionConfig<'static> {
+    static CONTEXT: std::sync::OnceLock<std::sync::Arc<blade_graphics::Context>> =
+        std::sync::OnceLock::new();
+    let gpu = CONTEXT
+        .get_or_init(|| {
+            std::sync::Arc::new(
+                crate::runtime::init_gpu_context_with(crate::GpuOptions::from_env())
+                    .expect("a GPU context to load the model on"),
+            )
+        })
+        .clone();
+    crate::SessionConfig::inference_from_env_on(gpu)
+}
+
 /// A loaded model, ready to generate.
 pub struct Generator {
     /// Absent when [`GeneratorOptions::prefill_block`] is 1, in which case
@@ -176,8 +198,7 @@ impl Generator {
             weights::reset_caches(&mut decode, &built, &config);
             (decode, Some(prefill), report)
         } else {
-            let mut decode =
-                crate::build(&decode_graph, crate::SessionConfig::inference_from_env()).0;
+            let mut decode = crate::build(&decode_graph, session_config()).0;
             let report = weights::load(&mut decode, model, &config)?;
             weights::reset_caches(&mut decode, &built, &config);
             (decode, None, report)
@@ -232,7 +253,7 @@ impl Generator {
         let mut g = crate::Graph::new();
         let built = graph::build(&mut g, model, config, block, max_seq_len)?;
         g.set_outputs(built.outputs());
-        let mut prefill = crate::build(&g, crate::SessionConfig::inference_from_env()).0;
+        let mut prefill = crate::build(&g, session_config()).0;
         let report = weights::load(&mut prefill, model, config)?;
         weights::reset_caches(&mut prefill, &built, config);
         Ok((prefill, report))

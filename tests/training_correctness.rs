@@ -88,7 +88,7 @@ fn smollm2_training_loss_decreases() {
         seq_len, vocab
     );
     let g = smollm2::build_training_graph(&config, seq_len);
-    let session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
+    let session = meganeura::build(&g, crate::support::gpu::config()).0;
 
     // Deterministic input: token_ids and one-hot labels
     let token_ids: Vec<u32> = (0..seq_len as u32).map(|i| i % vocab as u32).collect();
@@ -129,12 +129,11 @@ fn smollm2_weight_sharing_inference_to_training() {
     let mut infer_g = Graph::new();
     let logits = smollm2::build_graph(&mut infer_g, &config, seq_len);
     infer_g.set_outputs(vec![logits]);
-    let mut infer_session =
-        meganeura::build(&infer_g, meganeura::SessionConfig::inference_from_env()).0;
+    let mut infer_session = meganeura::build(&infer_g, crate::support::gpu::inference_config()).0;
 
     // Build training session (forward + backward + loss)
     let train_g = smollm2::build_training_graph(&config, seq_len);
-    let mut train_session = meganeura::build(&train_g, meganeura::SessionConfig::from_env()).0;
+    let mut train_session = meganeura::build(&train_g, crate::support::gpu::config()).0;
 
     // Initialize inference session with deterministic weights
     for (name, buf_ref) in infer_session.plan().param_buffers.clone() {
@@ -207,12 +206,11 @@ fn smolvla_weight_sharing_inference_to_training() {
     let mut infer_g = Graph::new();
     let pred = smolvla::build_action_expert(&mut infer_g, &config, action_seq_len, vlm_seq_len);
     infer_g.set_outputs(vec![pred]);
-    let mut infer_session =
-        meganeura::build(&infer_g, meganeura::SessionConfig::inference_from_env()).0;
+    let mut infer_session = meganeura::build(&infer_g, crate::support::gpu::inference_config()).0;
 
     // Build training session
     let train_g = smolvla::build_action_expert_training(&config, action_seq_len, vlm_seq_len);
-    let mut train_session = meganeura::build(&train_g, meganeura::SessionConfig::from_env()).0;
+    let mut train_session = meganeura::build(&train_g, crate::support::gpu::config()).0;
 
     // Init inference params
     for (name, buf_ref) in infer_session.plan().param_buffers.clone() {
@@ -282,7 +280,7 @@ fn smolvla_training_loss_decreases() {
         action_seq_len, vlm_seq_len
     );
     let g = smolvla::build_action_expert_training(&config, action_seq_len, vlm_seq_len);
-    let session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
+    let session = meganeura::build(&g, crate::support::gpu::config()).0;
 
     let expert_hidden = config.expert.hidden_size;
     let kv_dim = config.expert.kv_dim();
@@ -336,7 +334,7 @@ fn sd_unet_training_loss_decreases() {
     let mut g = Graph::new();
     let loss = sd_unet::build_training_graph(&mut g, &config);
     g.set_outputs(vec![loss]);
-    let session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
+    let session = meganeura::build(&g, crate::support::gpu::config()).0;
 
     let noisy_latent: Vec<f32> = (0..in_size).map(|i| (i as f32 * 0.01).sin()).collect();
     let noise_target: Vec<f32> = (0..in_size).map(|i| (i as f32 * 0.007).cos()).collect();
@@ -379,7 +377,7 @@ fn smollm2_kv_cache_decode_graph() {
     let (logits, k_caches, v_caches) = smollm2::build_decode_graph(&mut g, &config, max_seq);
     g.set_outputs(vec![logits]);
 
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    let mut session = meganeura::build(&g, crate::support::gpu::inference_config()).0;
 
     // Initialize model weights
     for (name, buf_ref) in session.plan().param_buffers.clone() {
@@ -439,7 +437,7 @@ fn resnet50_training_loss_decreases() {
     let image_size = (batch * 3 * 224 * 224) as usize;
     let num_classes = 1000;
 
-    let mut sess = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
+    let mut sess = meganeura::build(&g, crate::support::gpu::config()).0;
 
     // Use very small init for ResNet (no BN at training time → needs small weights)
     for (name, buf_ref) in sess.plan().param_buffers.clone() {
@@ -500,7 +498,7 @@ fn whisper_encoder_training_loss_decreases() {
     let g = whisper::build_training_graph(&config, batch, mel_len);
 
     verify_training_decreases_loss(
-        meganeura::build(&g, meganeura::SessionConfig::from_env()).0,
+        meganeura::build(&g, crate::support::gpu::config()).0,
         |s| {
             let mel_size = (batch * config.n_mels as u32 * mel_len) as usize;
             let mel: Vec<f32> = (0..mel_size).map(|i| (i as f32 * 0.01).sin()).collect();

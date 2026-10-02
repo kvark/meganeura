@@ -29,7 +29,7 @@ fn accumulate_two_micro_equals_mean_grad_step() {
 
     // --- Reference: read gradA and gradB separately, mean, manual SGD ---
     let g = build();
-    let mut s = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
+    let mut s = meganeura::build(&g, crate::support::gpu::config()).0;
     s.set_parameter("w", &W_INIT);
     s.clear_optimizer();
     s.set_input("x", &a_x);
@@ -51,7 +51,7 @@ fn accumulate_two_micro_equals_mean_grad_step() {
     }
 
     // --- Native accumulation: zero_grad, A, B (scale 1/2), then SGD ---
-    let mut s = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
+    let mut s = meganeura::build(&g, crate::support::gpu::config()).0;
     s.set_parameter("w", &W_INIT);
     s.set_grad_accumulate(2);
     s.zero_grad();
@@ -83,7 +83,7 @@ fn zero_grad_clears_accumulator() {
     let x = vec![1.0f32, 0.5, -0.3, 0.2, 0.8, 0.1];
     let t = vec![0.4f32, -0.1, 0.6, 0.2];
     let g = build();
-    let mut s = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
+    let mut s = meganeura::build(&g, crate::support::gpu::config()).0;
     s.set_parameter("w", &W_INIT);
     s.set_grad_accumulate(2);
 

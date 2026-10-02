@@ -111,7 +111,7 @@ fn production_optimization_preserves_outputs() {
     // Fully optimized production training session (forward optimize →
     // autodiff → full-graph optimize). Greedy is the production default;
     // the two tests above exercise outlined egglog explicitly.
-    let mut opt_session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
+    let mut opt_session = meganeura::build(&g, crate::support::gpu::config()).0;
 
     // Baseline: autodiff + compile with no optimization at all.
     let sorted = g.toposort();

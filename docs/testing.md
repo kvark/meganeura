@@ -153,53 +153,63 @@ and queue waits, and a hosted runner keeps four sessions in flight.
 
 These reproduce on a clean checkout with all features, and are recorded here
 because the CI adapter (lavapipe) does not reach them. Confirm before
-attributing one to your change.
+attributing one to your change. The first is a real defect in a shipped path;
+the rest are harness or measurement artefacts.
 
-**Context churn exhausts the NVIDIA driver.** `NoSupportedDeviceFound` after
-roughly ten create/drop cycles in one process; lavapipe and the Intel driver
-tolerate it. It fails `vision::conv2d_grad_weight_split_k` and
-`vision::conv2d_tuned_kernels` on the RTX 5070, each of which builds nine
-sessions. Sharing one context across the whole oracle fixes those two, but it
-also changes the attention comparisons' results, so it is not a free win —
-the trade needs the attention sensitivity understood first. Two tests must
-not be read as evidence that a plan change broke convolution: the failure is
-in the harness, not the kernels.
+**Cooperative flash forward loses half precision on NVIDIA.** Five `attention`
+oracle cases fail on the RTX 5070 and pass on Intel, lavapipe and the rest.
+The worst elements of every failing comparison are *exactly* `f16(want)`:
 
-**The attention oracle is order-dependent, and the plan is not why.**
-`attention::causal_forward` and its siblings fail under a filter that selects
-a subset of the `attention` module and pass when the whole module runs. The
-whole `attention` module creates 422 GPU contexts; one test creates 17.
+| got | reference | `f16(reference)` |
+|---|---|---|
+| `-1.052734375` | `-1.0522552728652954` | `-1.052734375` |
+| `-1.03515625` | `-1.0346871614456177` | `-1.03515625` |
+| `0.5654296875` | `0.5656632781028748` | `0.5654296875` |
+| `0.5009765625` | `0.5007421970367432` | `0.5009765625` |
 
-Ruled out by measurement, in order:
+So the output is being rounded to f16 on the way out, not merely accumulated
+differently. Isolated by elimination, not inference:
 
-- *Context count.* It is not the driver limit — that produces
-  `NoSupportedDeviceFound`, and these cases run fine at 422 contexts. It is
-  not "warm-up" either: `attention_autodiff` runs before `causal_forward`
-  alphabetically and creates no context at all.
-- *The plan.* Hashing every dispatch's `shader`, `params`, `workgroups` and
-  buffer bindings gives `0x384f3e69d4f3f584` for the failing `q=31, dim=256`
-  case in both runs — byte-identical. `MEGANEURA_DUMP_PLAN` agrees, and the
-  sweep's own kernel list agrees (`MultiHeadAttn`, `coop=false`).
-- *The operands.* `Feeds::fill_random` is seeded from a constant
-  (`100 + shape_index`), `Feeds::set` widens f32 to f64, and the graph is the
-  same object either way.
-- *The tolerance.* `Tolerance::default()` is a constant (`rtol` 2e-4,
-  `floor` 1e-3) and `Options::default()` re-reads it per call.
+- `MEGANEURA_FLASH_FWD_COOP=0` → 18 passed, 0 failed. That is the only switch
+  that changes the outcome.
+- `MEGANEURA_DISABLE_COOP=1` → 18 passed, 0 failed, and the dumped plans are
+  byte-identical to the default, so this is not dispatch selection.
+- On this device `auto_tune` reports `f16_tile: 16, f32_tile: 0` — there is no
+  f32 cooperative tile at all — and `CoopPolicy::Auto` selects the f16 one.
+  `compile::attention_dispatch` gates that choice on `!requires_full_precision`,
+  which an inference graph does not set.
 
-What is left is the GPU returning a different result for the same plan and the
-same inputs: element 0 is `8.7646484e-1` alone and `8.7633395e-1` in the
-module, a relative difference of `1.5e-4` — about 2500 ULP at that magnitude,
-so a genuine reduction-order difference rather than rounding. Something
-process-wide changes how the driver executes the reduction, and it is not any
-of the above. Candidates not yet eliminated: driver-side shader cache state,
-and an interaction with the `profiler`'s process-global armed buffer, which
-`init_gpu_context_with` arms on every call. Both are outside this crate's
-control until someone can hold a fixed plan and vary only the process history.
+This is a real accuracy defect in a shipped path, and the oracle was right to
+fail on it. It was masked for as long as the suite silently fell through to
+Intel after exhausting the NVIDIA context budget below. `CoopPolicy::NativeF32`
+disables f16 tiles and would be the conservative default here, but choosing
+between them is a performance decision that wants a measurement, not a test
+failure.
 
-Until that is understood, do not "fix" these by loosening the tolerance — the
-whole module passing is evidence the kernels are correct, so the subset
-failures are a harness artefact, not a kernel defect. And do not read a
-failing attention case as evidence that a scheduling change broke something.
+**Context churn exhausted the NVIDIA driver, and hid the above.** The driver
+issues about ten contexts per process, then refuses with
+`NoSupportedDeviceFound`. `SessionConfig::from_env` logged that and set
+`gpu: None`, after which `build` called `default_gpu_context()` — which names
+no device, so Blade picked whatever adapter initialised first. On this box
+that is the Intel B570. Sessions 1–10 ran on the RTX 5070 and everything after
+ran on Intel, silently, which is why the attention cases appeared to
+"pass" and why running a larger selection produced different answers than
+running a smaller one.
+
+`from_env` now panics when `MEGANEURA_DEVICE_ID` names a device it cannot
+open, rather than continuing elsewhere: a caller that asked for hardware by id
+should not be handed different hardware with a `log::warn!` nobody installs a
+logger for. That exposed the context churn as a loud failure, so the harnesses
+now share one context (`tests/support/gpu.rs`) instead of building one per
+session, and `Generator` shares one per process.
+
+With that fixed the attention failures stopped being selection-dependent and
+became what they always were: a real f16 precision loss on the cooperative
+flash forward, described above. The plan really was identical between runs
+(`0x384f3e69d4f3f584` for the failing `q=31, dim=256` case), the operands
+really were identical (`Feeds::fill_random` seeded from a constant,
+`Feeds::set` widening f32 to f64) and the tolerance really was a constant
+(`rtol` 2e-4, `floor` 1e-3). What differed was which GPU ran them.
 
 **Padding and `f32` equality.** A padded allocation must not change a
 result — every optimizer, clip and accumulation pass bounds its loops by
