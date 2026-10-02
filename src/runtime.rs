@@ -1,6 +1,6 @@
 use crate::compile::{BufferRef, CachedBlockAttentionParams, Dispatch, ExecutionPlan, ShaderEntry};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 mod checkpoint;
@@ -1851,70 +1851,12 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
     }
 }
 
-// ---- Dispatch scheduling ----
-
-/// Reorder dispatches by dependency level so parallel branches cluster together.
-///
-/// Level is defined as: 0 for dispatches with no dependencies on other
-/// dispatches (only on inputs/params), and `1 + max(level of producers)`
-/// otherwise. A stable sort by level produces a valid topological order where
-/// all dispatches at the same level are mutually independent — they can share
-/// a single compute pass without any barrier between them.
-fn reorder_by_level(dispatches: &mut Vec<Dispatch>) {
-    let n = dispatches.len();
-    if n == 0 {
-        return;
-    }
-    // Map: buffer id → index of the dispatch that writes it.
-    let mut producer: HashMap<u32, usize> = HashMap::new();
-    let mut levels = vec![0u32; n];
-    for (i, dispatch) in dispatches.iter().enumerate() {
-        let level = dispatch
-            .input_buffers
-            .iter()
-            .filter_map(|b| producer.get(&b.0))
-            .map(|&pred| levels[pred] + 1)
-            .max()
-            .unwrap_or(0);
-        levels[i] = level;
-        producer.insert(dispatch.output_buffer.0, i);
-        for &extra in &dispatch.extra_outputs {
-            producer.insert(extra.0, i);
-        }
-    }
-    // Stable sort by level keeps topological order within a level.
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by_key(|&i| levels[i]);
-    let old = std::mem::take(dispatches);
-    *dispatches = order.iter().map(|&i| old[i].clone()).collect();
-}
-
-/// Partition the (reordered) dispatch list into barrier groups.
-///
-/// Dispatches in the same group share one compute pass (no barrier between
-/// them). A new group starts whenever a dispatch reads a buffer written by
-/// an earlier dispatch in the current group (RAW hazard). After level-based
-/// reordering this aligns exactly with level boundaries.
-fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
-    let mut groups = Vec::new();
-    let mut dirty = HashSet::<u32>::new();
-    let mut start = 0;
-    for (i, dispatch) in dispatches.iter().enumerate() {
-        if dispatch.input_buffers.iter().any(|b| dirty.contains(&b.0)) {
-            groups.push(start..i);
-            start = i;
-            dirty.clear();
-        }
-        dirty.insert(dispatch.output_buffer.0);
-        for &extra in &dispatch.extra_outputs {
-            dirty.insert(extra.0);
-        }
-    }
-    if !dispatches.is_empty() {
-        groups.push(start..dispatches.len());
-    }
-    groups
-}
+// ---- Dispatch recording ----
+//
+// Ordering the dispatches and partitioning them into barrier groups is the
+// compiler's job (`compile::schedule_dispatches`): horizontal fusion changes
+// how many dispatches a plan has, so the groups cannot be computed apart from
+// it. Recording them is all that is left here.
 
 /// Record the compiled graph, leaving the last chunk open for appended work.
 fn record_groups(
@@ -3137,45 +3079,23 @@ impl Session {
                 .fit_shared_memory(head_dim, gpu.capabilities().max_compute_shared_memory_size);
         }
 
-        // Reorder dispatches by dependency level so parallel branches (e.g. Q/K/V
-        // projections) cluster together, then partition into barrier groups.
-        reorder_by_level(&mut plan.dispatches);
-        let mut groups = if opts.serial_dispatch {
-            // Debug: one dispatch per pass — guarantees serial execution.
+        // Order the dispatches into barrier groups. The compiler owns this because
+        // horizontal fusion changes how many dispatches there are, so the
+        // groups cannot be computed independently of it.
+        if opts.serial_dispatch {
             log::info!("MEGANEURA_SERIAL_DISPATCH: forcing one dispatch per pass");
-            (0..plan.dispatches.len()).map(|i| i..i + 1).collect()
-        } else {
-            compute_groups(&plan.dispatches)
-        };
-        if !opts.serial_dispatch && !opts.debug {
-            crate::compile::fuse_horizontal_matmuls(&mut plan.dispatches, &mut groups);
         }
+        crate::compile::schedule_dispatches(
+            &mut plan,
+            opts.serial_dispatch,
+            !opts.serial_dispatch && !opts.debug,
+        );
+        let groups = std::mem::take(&mut plan.groups);
         log::info!(
             "{} dispatches → {} barrier groups",
             plan.dispatches.len(),
             groups.len()
         );
-        // Validate: no RAW hazard within a group (concurrent dispatch safety).
-        for group in &groups {
-            let mut written = HashSet::<u32>::new();
-            for i in group.clone() {
-                let d = &plan.dispatches[i];
-                for ib in &d.input_buffers {
-                    if written.contains(&ib.0) {
-                        log::warn!(
-                            "RAW hazard in group: dispatch {} ({:?}) reads buf {} written earlier in same group",
-                            i,
-                            d.shader,
-                            ib.0
-                        );
-                    }
-                }
-                written.insert(d.output_buffer.0);
-                for eo in &d.extra_outputs {
-                    written.insert(eo.0);
-                }
-            }
-        }
         drop(schedule_span);
 
         // Lifetime-based buffer aliasing: step-local intermediates with
@@ -4592,7 +4512,7 @@ mod variant_tests {
 
 #[cfg(test)]
 mod split_k_tests {
-    use super::{BufferRef, Dispatch, ShaderEntry, compute_groups, reorder_by_level};
+    use super::{BufferRef, Dispatch, ShaderEntry};
 
     #[test]
     fn split_sequences_get_barriers_and_reuse_nonoverlapping_partials() {
@@ -4621,8 +4541,8 @@ mod split_k_tests {
             plan.split_conv_weight_gradients(&[(0, 2), (1, 2)], bytes * 4),
             Ok(bytes * 4)
         );
-        reorder_by_level(&mut plan.dispatches);
-        let groups = compute_groups(&plan.dispatches);
+        crate::compile::schedule_dispatches(&mut plan, false, false);
+        let groups = plan.groups.clone();
         assert_eq!(groups, [0..1, 1..2, 2..3, 3..4]);
         let alias = crate::memplan::plan_buffer_aliasing(&plan, &groups, None);
         assert_eq!(alias.map[4], alias.map[5]);
