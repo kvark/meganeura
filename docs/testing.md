@@ -192,6 +192,31 @@ against: a single leaked `1000.0` tail element inflates the adaptive-clip
 norm by roughly 2400x, so the check still separates noise from a real leak by
 about five orders of magnitude.
 
+## Claims that were checked and did not hold
+
+Recorded because an audit that only keeps its hits teaches the wrong lesson,
+and because each of these looked like a defect on inspection.
+
+**Adding a `ShaderEntry` variant already breaks the build.** There are ~105
+variants and five exhaustive matches over them — `profile_family`,
+`shader_group`, `entry_point` in `compile.rs`, and `shader_data_layout` and
+`bind_dispatch` in `runtime.rs`. A new variant produces five `E0004`s naming
+the function and line. So the "15 coordinated edits" cost is not what the
+type system sees; what it does not check is the WGSL and the pipeline `key()`,
+and `key()` is a cascade over *dispatch shape* (kernel, epilogue, weight
+format, coop), not over entries, so it has no per-entry arm to miss.
+
+**RMSNorm's `(2..=32)` rows-per-workgroup bound is not an occupancy bug.** At
+`cols == 64` the bound gives `rows_per_workgroup == 1`, so a 256-thread
+workgroup covers one row: 64 lanes compute, 192 exit early, and the reduction
+tree still runs over all 256. The obvious fix — extending the bound to
+`(2..=64)` so eight rows share a workgroup — measures no better. On an RTX
+5070, 65536 rows, 200 runs: `cols=64` at 6.7 GB/s against `cols=32` at
+6.6 GB/s, a ratio of 0.98 and 1.00 across two runs. The kernel runs at ~6.6
+GB/s, which is memory-bound, so idle lanes cost nothing. Widening the bound
+would only churn the reduction order for nothing. Do not "fix" this without a
+new measurement showing the kernel has become compute-bound.
+
 A test that compares `f32` results should say which it means. Bit equality is
 the right contract for a value that must be reproduced exactly (an inference
 logit, a checkpoint byte-for-byte) and the wrong one for an accumulation
