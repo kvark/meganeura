@@ -1,5 +1,15 @@
 # Unreleased
 
+- `optimizer_memory::optimizer_clipping_and_diagnostics_ignore_poisoned_allocation_padding`
+  compared `f32` results for bit equality across allocation paddings, which
+  failed on rounding rather than on a defect. Padding cannot reach the
+  arithmetic — every optimizer, clip and accumulation pass bounds its loops by
+  the segment table's logical length — but it can permute the order in which
+  f32 values are summed, and the LaProp plus adaptive-clip path reduces a
+  workgroup-sized tree whose lane occupancy follows the tile layout. Both
+  observed values sit within one ULP of the exact f64 result. The test now
+  compares with a `1e-5` relative tolerance, which still separates rounding
+  from a real poison leak by about five orders of magnitude.
 - Adam's bias correction is computed on the host. `adam.wgsl` used to raise
   `pow(beta, step)` once per parameter element — four transcendental ops per
   element, per step, for a value that is uniform across the whole dispatch

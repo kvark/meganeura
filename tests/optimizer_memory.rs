@@ -1,5 +1,49 @@
 use meganeura::{CoopPolicy, Graph, SessionConfig, SessionOptions};
 
+/// A few ULP of relative slack; see [`close`].
+const TOLERANCE: f32 = 1.0e-5;
+
+/// Relative agreement, the same form `gguf_model` uses.
+///
+/// Bit identity is the wrong contract here. This test exists to prove that
+/// allocation padding never reaches the arithmetic, and it does — the
+/// poisoned tails are excluded by `i < s.len` in every optimizer, clip and
+/// accumulation pass, and the gradients themselves are bit-identical across
+/// the paddings. What the padding *can* legitimately perturb is the order in
+/// which f32 values are summed, and that is enough to move a result by a
+/// unit in the last place: the LaProp and adaptive-clip path reduces a
+/// workgroup-sized tree whose lane occupancy depends on the tile layout, and
+/// reassociating six squares in a different order is not exact.
+///
+/// Demanding `f32` equality therefore failed on rounding, not on a defect,
+/// and the fix is to state the property the test actually means: the
+/// padding-relative result must agree to within f32 noise. The tolerance is
+/// loose enough to absorb a few ULP and far tighter than the failure it
+/// guards against — a single leaked `1000.0` tail element inflates the
+/// adaptive-clip norm by roughly 2400x, so noise and a real leak stay about
+/// five orders of magnitude apart.
+fn close(a: &[f32], b: &[f32], tolerance: f32) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| (x - y).abs() <= tolerance * (1.0 + x.abs().max(y.abs())))
+}
+
+/// What one configuration of the padding test produced: the parameter, the
+/// `(m, v)` moments per parameter, and the grouped gradient norm.
+type Observed = (Vec<Vec<f32>>, Vec<(Vec<f32>, Vec<f32>)>, Vec<f32>);
+
+fn close_observed(left: &Observed, right: &Observed) -> bool {
+    close(&left.0[0], &right.0[0], TOLERANCE)
+        && left.1.len() == right.1.len()
+        && left
+            .1
+            .iter()
+            .zip(&right.1)
+            .all(|((lm, lv), (rm, rv))| close(lm, rm, TOLERANCE) && close(lv, rv, TOLERANCE))
+        && close(&left.2, &right.2, TOLERANCE)
+}
+
 fn session(debug: bool) -> meganeura::Session {
     let mut graph = Graph::new();
     let a = graph.parameter("a", &[3]);
@@ -139,7 +183,7 @@ fn a_million_f32_parameters_do_not_reserve_eight_mib_of_unused_moments() {
 fn optimizer_clipping_and_diagnostics_ignore_poisoned_allocation_padding() {
     for debug in [false, true] {
         for mode in 0..6 {
-            let run = |param_padding, grad_padding| {
+            let run = |param_padding, grad_padding| -> Observed {
                 let mut graph = Graph::new();
                 let p = graph.parameter("p", &[2, 3]);
                 let loss = graph.mean_all(p);
@@ -213,10 +257,12 @@ fn optimizer_clipping_and_diagnostics_ignore_poisoned_allocation_padding() {
             };
             let expected = run(0, 0);
             for (param_padding, grad_padding) in [(64, 128), (64, 0), (0, 128)] {
-                assert_eq!(
-                    run(param_padding, grad_padding),
-                    expected,
-                    "mode={mode}, debug={debug}, padding=({param_padding},{grad_padding})"
+                let got = run(param_padding, grad_padding);
+                assert!(
+                    close_observed(&got, &expected),
+                    "mode={mode}, debug={debug}, padding=({param_padding},{grad_padding})\n\
+                     got:      {got:?}\n\
+                     expected: {expected:?}"
                 );
             }
         }
