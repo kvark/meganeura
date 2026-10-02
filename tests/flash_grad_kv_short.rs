@@ -31,7 +31,7 @@ fn run(
     let mut config = SessionConfig {
         mode: Mode::Training,
         gpu: Some(gpu),
-        ..SessionConfig::from_env()
+        ..crate::support::gpu::config()
     };
     config.options.flash_forward_coop = cooperative;
     config.options.flash_backward_coop = cooperative;
@@ -90,9 +90,7 @@ fn assert_close(label: &str, scalar: &[f32], cooperative: &[f32]) {
 
 #[test]
 fn short_cross_self_and_window_attention_gradients_match_scalar() {
-    let gpu = Arc::new(
-        meganeura::init_gpu_context_with(meganeura::GpuOptions::from_env()).expect("GPU context"),
-    );
+    let gpu = crate::support::gpu::gpu();
     let has_coop = gpu
         .capabilities()
         .cooperative_matrix

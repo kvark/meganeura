@@ -27,7 +27,7 @@ fn tall_matmul_splits_dispatch_across_z() {
     let output = graph.matmul(input, weight);
     graph.set_outputs(vec![output]);
 
-    let mut session = meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
+    let mut session = meganeura::build(&graph, crate::support::gpu::inference_config()).0;
     session.set_input("input", &vec![1.25_f32; ROWS]);
     session.set_parameter("weight", &[2.0]);
     session.step();
@@ -49,7 +49,7 @@ fn simple_sgd_decreases_loss() {
     let loss = g.mean_all(y);
     g.set_outputs(vec![loss]);
 
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
+    let mut session = meganeura::build(&g, crate::support::gpu::config()).0;
     session.set_parameter("w", &[0.1_f32; 8 * 4]);
     session.set_input("x", &[1.0_f32; 4 * 8]);
     session.step();
@@ -85,7 +85,7 @@ fn smolvla_training_backprop_smoke() {
     let vlm_seq_len = 4;
 
     let training_g = smolvla::build_action_expert_training(&config, action_seq_len, vlm_seq_len);
-    let mut session = meganeura::build(&training_g, meganeura::SessionConfig::from_env()).0;
+    let mut session = meganeura::build(&training_g, crate::support::gpu::config()).0;
 
     // Initialize with small uniform weights
     for (name, buf_ref) in session.plan().param_buffers.clone() {
@@ -328,7 +328,7 @@ fn smollm2_e2e_gradient_finite_diff() {
     let mut train_sess = if use_unopt {
         meganeura::build(&g, meganeura::SessionConfig::unoptimized_from_env()).0
     } else {
-        meganeura::build(&g, meganeura::SessionConfig::from_env()).0
+        meganeura::build(&g, crate::support::gpu::config()).0
     };
 
     // Deterministic init
@@ -375,7 +375,7 @@ fn smollm2_e2e_gradient_finite_diff() {
 
     // --- Build inference session for finite differences ---
     let gi = meganeura::models::smollm2::build_training_graph(&config, seq);
-    let mut infer_sess = meganeura::build(&gi, meganeura::SessionConfig::inference_from_env()).0;
+    let mut infer_sess = meganeura::build(&gi, crate::support::gpu::inference_config()).0;
 
     // Same init (must use the same scale)
     for (name, buf_ref) in infer_sess.plan().param_buffers.clone() {
@@ -538,7 +538,7 @@ fn checkpoint_round_trip() {
     let loss = g.mean_all(y);
     g.set_outputs(vec![loss]);
 
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
+    let mut session = meganeura::build(&g, crate::support::gpu::config()).0;
     session.set_parameter("w", &[0.1_f32; 8 * 4]);
     session.set_input("x", &[1.0_f32; 4 * 8]);
 
@@ -567,7 +567,7 @@ fn checkpoint_round_trip() {
     session.read_buffer(w_buf, &mut w_saved);
 
     // Fresh session, load checkpoint
-    let mut session2 = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
+    let mut session2 = meganeura::build(&g, crate::support::gpu::config()).0;
     session2.load_checkpoint(&tmp).expect("load checkpoint");
 
     let mut w_loaded = vec![0.0f32; 32];
@@ -609,7 +609,7 @@ fn batched_parameter_read_matches_uploaded_values() {
 
     let a_values = [0.25_f32, -1.0, 2.5, 7.0, -3.25, 0.125];
     let b_values = [4.0_f32, 3.0, 2.0, 1.0, -5.0];
-    let mut session = meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
+    let mut session = meganeura::build(&graph, crate::support::gpu::inference_config()).0;
     session.set_parameter("a", &a_values);
     session.set_parameter("b", &b_values);
 
@@ -635,11 +635,11 @@ fn checkpoint_round_trip_preserves_odd_f16_tail() {
     let values = [0.25_f32, -0.5, 0.75];
     let input = [1.0_f32, 2.0, 3.0];
     let tmp = std::env::temp_dir().join("meganeura_test_odd_f16_ckpt.safetensors");
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    let mut session = meganeura::build(&g, crate::support::gpu::inference_config()).0;
     session.set_parameter("w", &values);
     session.save_checkpoint(&tmp).expect("save checkpoint");
 
-    let mut restored = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    let mut restored = meganeura::build(&g, crate::support::gpu::inference_config()).0;
     restored.load_checkpoint(&tmp).expect("load checkpoint");
     restored.set_input("x", &input);
     restored.step();
@@ -670,7 +670,7 @@ fn grad_inspection_api_basic() {
     let target = g.input("target", &[2, 2]);
     let loss = g.mse_loss(h, target);
     g.set_outputs(vec![loss]);
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
+    let mut session = meganeura::build(&g, crate::support::gpu::config()).0;
 
     session.set_input("x", &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     session.set_input("target", &[0.5, 0.5, 0.5, 0.5]);
@@ -740,7 +740,7 @@ fn lr_multipliers_apply_to_sgd_update() {
     let target = g.input("target", &[2, 2]);
     let loss = g.mse_loss(h, target);
     g.set_outputs(vec![loss]);
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
+    let mut session = meganeura::build(&g, crate::support::gpu::config()).0;
 
     let init = vec![1.0, 0.1, 0.1, 1.0];
 
@@ -856,7 +856,7 @@ fn full_precision_weight_gradient_preserves_tiny_values() {
     let loss = graph.mul(mean, scale);
     graph.set_outputs(vec![loss]);
 
-    let mut session = meganeura::build(&graph, meganeura::SessionConfig::from_env()).0;
+    let mut session = meganeura::build(&graph, crate::support::gpu::config()).0;
     session.set_input("input", &vec![1.0; ROWS * INPUTS]);
     session.set_parameter("weight", &vec![0.0; INPUTS * OUTPUTS]);
     session.step();
@@ -913,8 +913,8 @@ fn q4_matmul_correctness() {
     let c_q4 = g_q4.matmul(a_q4, b_q4);
     g_q4.set_outputs(vec![c_q4]);
 
-    let mut sess_ref = meganeura::build(&g_ref, meganeura::SessionConfig::inference_from_env()).0;
-    let mut sess_q4 = meganeura::build(&g_q4, meganeura::SessionConfig::inference_from_env()).0;
+    let mut sess_ref = meganeura::build(&g_ref, crate::support::gpu::inference_config()).0;
+    let mut sess_q4 = meganeura::build(&g_q4, crate::support::gpu::inference_config()).0;
 
     // Use values closer to real model scale
     let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect();
@@ -1010,7 +1010,7 @@ fn q4_matmul_single_row_matches_reference() {
         let b_q4 = g.parameter_q4("b", &[k, n]);
         let c = g.matmul(a_in, b_q4);
         g.set_outputs(vec![c]);
-        let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+        let mut session = meganeura::build(&g, crate::support::gpu::inference_config()).0;
         session.set_input("a", &a);
         session.set_parameter("b", &b);
         session.step();
@@ -1054,7 +1054,7 @@ fn q4_matmul_single_row_matches_reference() {
     let mm = g.matmul(a_in, b_q4);
     let c = g.add(mm, d_in);
     g.set_outputs(vec![c]);
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    let mut session = meganeura::build(&g, crate::support::gpu::inference_config()).0;
     session.set_input("a", &a);
     session.set_parameter("b", &b);
     session.set_input("d", &bias);
@@ -1093,7 +1093,7 @@ fn smollm2_q4_projections_match_f32_decode() {
         let mut g = Graph::new();
         let (logits, _k, _v) = smollm2::build_decode_graph_with(&mut g, config, 16, weights);
         g.set_outputs(vec![logits]);
-        let mut s = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+        let mut s = meganeura::build(&g, crate::support::gpu::inference_config()).0;
         let mut param_bytes = 0usize;
         for (name, buf) in s.plan().param_buffers.clone() {
             let bytes = s.plan().buffers[buf.0 as usize];
@@ -1204,7 +1204,7 @@ fn q4_matmul_after_rms_norm_matches_reference() {
     let w_q4 = g.parameter_q4("w", &[k, n]);
     let out = g.matmul(h, w_q4);
     g.set_outputs(vec![out]);
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    let mut session = meganeura::build(&g, crate::support::gpu::inference_config()).0;
     session.set_input("x", &x);
     session.set_parameter("norm_w", &nw);
     session.set_parameter("w", &w);
@@ -1257,7 +1257,7 @@ fn q4_matmul_with_relu_epilogue_matches_cpu() {
     let mm = g.matmul(x, w_q4);
     let out = g.relu(mm);
     g.set_outputs(vec![out]);
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    let mut session = meganeura::build(&g, crate::support::gpu::inference_config()).0;
     session.set_input("x", &a);
     session.set_parameter("w", &w);
     session.step();
@@ -1319,7 +1319,7 @@ fn small_tile_matmul_with_epilogue_matches_cpu() {
     let mm = g.matmul(x, p);
     let out = g.relu(mm);
     g.set_outputs(vec![out]);
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    let mut session = meganeura::build(&g, crate::support::gpu::inference_config()).0;
     session.set_input("x", &a);
     session.set_parameter("w", &w);
     session.step();
@@ -1419,7 +1419,7 @@ fn assert_gguf_packed_matmul(
                 quantized_activations: false,
                 ..meganeura::compile::CompileOptions::from_env()
             },
-            ..meganeura::SessionConfig::inference_from_env()
+            ..crate::support::gpu::inference_config()
         },
     )
     .0;
@@ -1485,8 +1485,7 @@ fn k_quants_are_load_only_and_refuse_transposed_b() {
             let w = build(&mut g, dtype, "w", &[k, n]);
             let out = g.matmul(x, w);
             g.set_outputs(vec![out]);
-            let mut session =
-                meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+            let mut session = meganeura::build(&g, crate::support::gpu::inference_config()).0;
             session.set_parameter("w", &vec![0.1f32; k * n]);
         });
         if upload.is_ok() {
@@ -1500,7 +1499,7 @@ fn k_quants_are_load_only_and_refuse_transposed_b() {
             let w = build(&mut g, dtype, "w", &[256, 512]);
             let out = g.matmul_bt(x, w);
             g.set_outputs(vec![out]);
-            let _ = meganeura::build(&g, meganeura::SessionConfig::inference_from_env());
+            let _ = meganeura::build(&g, crate::support::gpu::inference_config());
         });
         if bt.is_ok() {
             failures.push(format!("{dtype:?}: matmul_bt should have been refused"));
@@ -1681,7 +1680,7 @@ fn q3k_swiglu_packed_concat_matches_reference() {
     let up = g.matmul(x, up_w);
     let out = g.swiglu(gate, up);
     g.set_outputs(vec![out]);
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    let mut session = meganeura::build(&g, crate::support::gpu::inference_config()).0;
     assert!(
         session.has_parameter("gate+up"),
         "expected SwiGLU concat fusion so packed upload restages the derived weight"
@@ -1785,7 +1784,7 @@ fn q6k_preserves_subnormal_block_scales() {
     let w = g.parameter_q6k("w", &[k, n]);
     let out = g.matmul(x, w);
     g.set_outputs(vec![out]);
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    let mut session = meganeura::build(&g, crate::support::gpu::inference_config()).0;
     session.set_input("x", &a);
     session.set_parameter_packed("w", &packed);
     session.step();
@@ -1839,7 +1838,7 @@ fn q4k_swiglu_packed_concat_matches_reference() {
     let up = g.matmul(x, up_w);
     let out = g.swiglu(gate, up);
     g.set_outputs(vec![out]);
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    let mut session = meganeura::build(&g, crate::support::gpu::inference_config()).0;
     assert!(
         session.has_parameter("gate+up"),
         "expected SwiGLU concat fusion so packed upload restages the derived weight"
@@ -1976,8 +1975,7 @@ fn k_quants_reject_f32_parameter_upload() {
             };
             let out = graph.matmul(x, w);
             graph.set_outputs(vec![out]);
-            let mut session =
-                meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
+            let mut session = meganeura::build(&graph, crate::support::gpu::inference_config()).0;
             session.set_parameter("w", &vec![0.1; k * n]);
         });
         assert!(
@@ -2062,7 +2060,7 @@ fn q4_layer_nan_hunt() {
             g.set_outputs(vec![x]);
         }
 
-        let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+        let mut session = meganeura::build(&g, crate::support::gpu::inference_config()).0;
 
         // Set dummy inputs
         session.set_input_u32("token_ids", &[10, 20, 30, 40, 50, 60]);
@@ -2151,7 +2149,7 @@ fn conv2d_1x1_batch_replicated_input_is_uniform() {
     let y = g.conv2d(input, kernel, batch, in_ch, h, w, out_ch, 1, 1, 1, 0);
     g.set_outputs(vec![y]);
 
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    let mut session = meganeura::build(&g, crate::support::gpu::inference_config()).0;
 
     // Deterministic kernel weights so every conv output is nonzero.
     let kernel_data: Vec<f32> = (0..(out_ch * in_ch))
@@ -2230,7 +2228,7 @@ fn upload_buffer_rejects_undersized_parameter_upload() {
     let y = g.bias_add(x, bias);
     g.set_outputs(vec![y]);
 
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    let mut session = meganeura::build(&g, crate::support::gpu::inference_config()).0;
     let undersized = vec![0.5_f32; 24]; // 24 floats == 96 bytes
     // Buffer is 48 floats == 192 bytes.  upload_buffer must panic with
     // "byte-size mismatch ... got 96, slot expects 192".

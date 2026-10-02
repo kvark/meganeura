@@ -116,7 +116,7 @@ fn whisper_conv_stem_ffn_matches_pytorch() {
     let x = g.layer_norm(x, fln_w, fln_b, 1e-5);
     g.set_outputs(vec![x]);
 
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    let mut session = meganeura::build(&g, crate::support::gpu::inference_config()).0;
 
     // Load weights
     session.set_parameter("conv1.weight", &parse_f32_array(&json, "conv1.weight"));

@@ -481,7 +481,7 @@ fn run(
                 quantized_activations,
                 ..CompileOptions::from_env()
             },
-            ..SessionConfig::from_env()
+            ..crate::support::gpu::config()
         },
     );
     let dispatch = session
@@ -542,7 +542,7 @@ fn run_q40_rmsnorm(
                 quantized_activations: true,
                 ..CompileOptions::from_env()
             },
-            ..SessionConfig::from_env()
+            ..crate::support::gpu::config()
         },
     );
     let dispatch = session

@@ -272,7 +272,7 @@ fn padded_session(padding: usize, debug: bool) -> Session {
     plan.buffers[gradient.0 as usize] += padding;
     Session::with_context_opts(
         plan,
-        std::sync::Arc::new(meganeura::init_gpu_context().unwrap()),
+        crate::support::gpu::gpu(),
         SessionOptions {
             debug,
             coop: CoopPolicy::Disabled,

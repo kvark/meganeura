@@ -10,7 +10,6 @@ use meganeura::compile::{ExecutionPlan, Kernel, ShaderEntry, group_norm_chunks};
 use meganeura::graph::Op;
 use meganeura::reference::{Feeds, Report, Rng, gpu, gradients};
 use meganeura::{CoopPolicy, Graph, Mode, NodeId, Session, SessionConfig, SessionOptions};
-use std::sync::Arc;
 
 /// Shaders the session compiled for `graph` under `options` dispatches.
 fn dispatched(graph: &Graph, mode: Mode, options: &gpu::Options) -> Vec<ShaderEntry> {
@@ -1019,10 +1018,11 @@ fn vision_chain_autodiff() {
 fn check_plan(graph: &Graph, feeds: &Feeds, plan: ExecutionPlan) -> Report {
     use meganeura::reference::{Comparison, Tolerance, check, evaluate, magnitudes};
     let values = evaluate(graph, feeds).unwrap();
-    let context = meganeura::init_gpu_context_with(meganeura::GpuOptions::from_env()).unwrap();
     let mut session = Session::with_context_opts(
         plan,
-        Arc::new(context),
+        // `check_plan` bypasses `build`, so it does not inherit the shared
+        // context the reference helpers hand their sessions.
+        gpu::shared_context(),
         SessionOptions {
             poison: true,
             coop: CoopPolicy::Disabled,

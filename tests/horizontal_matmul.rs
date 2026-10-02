@@ -73,7 +73,7 @@ fn same_a_qkv_pack_matches_cpu() {
         &g,
         SessionConfig {
             mode: Mode::Inference,
-            ..SessionConfig::from_env()
+            ..crate::support::gpu::config()
         },
     );
     assert!(
@@ -125,7 +125,7 @@ fn different_a_does_not_pack() {
         &g,
         SessionConfig {
             mode: Mode::Inference,
-            ..SessionConfig::from_env()
+            ..crate::support::gpu::config()
         },
     );
     assert!(

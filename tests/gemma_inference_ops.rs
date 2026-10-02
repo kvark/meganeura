@@ -47,7 +47,7 @@ fn batched_f16_matmul_bt_preserves_fused_clamp_bounds() {
     let product = graph.matmul_bt(an, bn);
     let output = graph.clamp(product, -3.25, 4.5);
     graph.set_outputs(vec![output]);
-    let mut session = meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
+    let mut session = meganeura::build(&graph, crate::support::gpu::inference_config()).0;
     session.set_input("a", &a);
     session.set_parameter("b", &b);
     session.step();

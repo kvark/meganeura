@@ -21,11 +21,10 @@ fn timing_context() -> Option<Arc<blade_graphics::Context>> {
         .clone()
 }
 
+/// The shared process context. Timing is a separate one above, because it has
+/// to be created with the timestamp pools enabled from the start.
 fn ordinary_context() -> Arc<blade_graphics::Context> {
-    static CONTEXT: OnceLock<Arc<blade_graphics::Context>> = OnceLock::new();
-    Arc::clone(CONTEXT.get_or_init(|| {
-        Arc::new(init_gpu_context_with(GpuOptions::default()).expect("GPU context"))
-    }))
+    crate::support::gpu::gpu()
 }
 
 const LAYERS: usize = 6;

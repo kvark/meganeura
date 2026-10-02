@@ -99,7 +99,7 @@ fn resnet_mini_matches_pytorch() {
     let logits = g.bias_add(logits, fc_b);
     g.set_outputs(vec![logits]);
 
-    let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+    let mut session = meganeura::build(&g, crate::support::gpu::inference_config()).0;
 
     // Load weights
     session.set_parameter("conv1_weight", &parse_f32_array(&json, "conv1_weight"));

@@ -36,5 +36,6 @@ mod shared_parameters;
 #[cfg(all(feature = "hf-hub", feature = "models"))]
 mod smollm2_correctness;
 mod submission_chunks;
+mod support;
 mod tune;
 mod whisper_correctness;

@@ -33,7 +33,7 @@ fn trainer_drives_three_named_streams() {
     let n = 32;
 
     let g = build_xy_plus_bias_regressor(batch, in_d, out_d);
-    let session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
+    let session = meganeura::build(&g, crate::support::gpu::config()).0;
 
     // Deterministic synthetic data.
     let x: Vec<f32> = (0..n * in_d).map(|i| (i as f32 * 0.1).sin()).collect();

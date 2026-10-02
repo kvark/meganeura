@@ -1,4 +1,4 @@
-use meganeura::{Graph, SessionConfig};
+use meganeura::Graph;
 
 #[test]
 fn cache_writes_alias_before_following_views_are_allocated() {
@@ -58,7 +58,7 @@ fn check_cached_blocks<const BLOCK: usize>() {
     let v = g.reshape(v, &[FRAMES * BLOCK, KV_DIM]);
     let out = g.cached_attention(q, k, v, last_token, HEADS as u32, KV_HEADS as u32, D as u32);
     g.set_outputs(vec![out]);
-    let mut session = meganeura::build(&g, SessionConfig::inference_from_env()).0;
+    let mut session = meganeura::build(&g, crate::support::gpu::inference_config()).0;
     let mut keys = vec![0.0; FRAMES * BLOCK * KV_DIM];
     let mut values = keys.clone();
     session.set_parameter("k_cache", &keys);

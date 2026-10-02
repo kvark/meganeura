@@ -50,7 +50,7 @@ fn eval_while_building_matches_compiled_session() {
         &g,
         SessionConfig {
             mode: Mode::Inference,
-            ..SessionConfig::from_env()
+            ..crate::support::gpu::config()
         },
     );
     s.set_input("x", &x_data);

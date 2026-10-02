@@ -191,7 +191,7 @@ fn reduced_storage_tiles_preserve_outputs() {
             y
         };
         graph.set_outputs(vec![y]);
-        let mut config = SessionConfig::inference_from_env();
+        let mut config = crate::support::gpu::inference_config();
         config.runtime.coop = CoopPolicy::Disabled;
         config.tune = false;
         let mut session = build(&graph, config).0;
@@ -548,7 +548,7 @@ fn tune_native_cooperative_f32() {
     // Deliberately fail on unsupported hardware: a scalar fallback must not
     // masquerade as native-f32 qualification. Run this test only on a device
     // advertising f32 tiles, separately from the portable qualification tests.
-    let gpu = std::sync::Arc::new(meganeura::init_gpu_context().unwrap());
+    let gpu = crate::support::gpu::gpu();
     assert!(
         meganeura::runtime::auto_tune(&gpu, 0).coop_caps.f32_tile > 0,
         "native f32 matrix hardware required; this test cannot qualify a scalar fallback"

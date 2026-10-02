@@ -30,7 +30,7 @@ fn read_node_by_name_matches_cpu() {
                 debug: true,
                 ..Default::default()
             },
-            ..SessionConfig::from_env()
+            ..crate::support::gpu::config()
         },
     );
 
@@ -92,7 +92,7 @@ fn step_debug_attributes_first_nan() {
                 debug: true,
                 ..Default::default()
             },
-            ..SessionConfig::from_env()
+            ..crate::support::gpu::config()
         },
     );
 
