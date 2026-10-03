@@ -38,7 +38,7 @@ impl<'a> Compiler<'a> {
             coop_caps,
             shared_memory_bytes,
             allow_reduced_precision_attention_backward,
-            fused_grad_kv_dv: HashMap::new(),
+            pending_grad_v_buffers: HashMap::new(),
             attention_row_dots: HashMap::new(),
             group_norm_grad_stats: HashMap::new(),
         }
@@ -474,6 +474,9 @@ impl<'a> Compiler<'a> {
                     self.plan.input_buffers.push((name.clone(), buf));
                 }
                 Op::Constant { .. } => {}
+                Op::MultiHeadAttnGradV { fwd_node, .. } => {
+                    self.pending_grad_v_buffers.insert(fwd_node, buf);
+                }
                 Op::MultiHeadAttn { num_heads, .. }
                 | Op::CausalAttention { num_heads, .. }
                 | Op::CausalAttentionRoPE { num_heads, .. }
@@ -3093,10 +3096,13 @@ impl<'a> Compiler<'a> {
                 };
                 let dispatch_kv = if is_causal { q_seq } else { kv_seq };
 
-                // GradKV: pre-allocate dV buffer. When GradV is later
-                // compiled for the same fwd_node, it reuses this buffer.
-                let dv_buf = self.alloc_buffer(self.graph.node(node.inputs[3]).ty.size_bytes());
-                self.fused_grad_kv_dv.insert(fwd_node, dv_buf);
+                // Use GradV's already-allocated destination, including any
+                // views established in the first pass. If there is no GradV
+                // node, the fused kernel still needs a scratch destination.
+                let dv_buf = match self.pending_grad_v_buffers.remove(&fwd_node) {
+                    Some(buf) => buf,
+                    None => self.alloc_buffer(self.graph.node(node.inputs[3]).ty.size_bytes()),
+                };
                 let attention_params = vec![
                     q_seq,
                     kv_seq,
@@ -3157,15 +3163,12 @@ impl<'a> Compiler<'a> {
             }
 
             Op::MultiHeadAttnGradV { fwd_node, .. } => {
-                // GradK is deliberately compiled as a fused dK+dV dispatch.
-                // Autodiff appends GradK before GradV, and topological sorting
-                // preserves that dependency-equivalent ID order.
-                let dv_buf = *self.fused_grad_kv_dv.get(&fwd_node).unwrap_or_else(|| {
-                    panic!(
-                        "attention GradV for forward node {fwd_node} compiled before fused GradKV"
-                    )
-                });
-                self.node_buffers.insert(node.id, dv_buf);
+                // GradK emits the fused dK+dV dispatch. Never remap this
+                // output here: its views already alias the allocated buffer.
+                assert!(
+                    !self.pending_grad_v_buffers.contains_key(&fwd_node),
+                    "attention GradV for forward node {fwd_node} compiled before fused GradKV"
+                );
                 return;
             }
 

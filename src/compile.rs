@@ -2824,11 +2824,10 @@ struct Compiler<'a> {
     /// from device capability: availability does not imply adequate gradient
     /// accuracy.
     allow_reduced_precision_attention_backward: bool,
-    /// Fused GradKV: maps fwd_node → pre-allocated dV buffer.
-    /// When GradK is compiled, it emits a fused GradKV dispatch and
-    /// pre-allocates the dV buffer here. When GradV is later compiled
-    /// for the same fwd_node, it reuses this buffer and skips dispatching.
-    fused_grad_kv_dv: HashMap<NodeId, BufferRef>,
+    /// Fused GradKV: maps fwd_node → pending, pre-allocated dV buffer.
+    /// Allocate GradV's destination before any Identity/reshape views alias
+    /// it. GradK writes both gradients; GradV emits no separate dispatch.
+    pending_grad_v_buffers: HashMap<NodeId, BufferRef>,
     attention_row_dots: HashMap<(BufferRef, BufferRef, u32, u32), BufferRef>,
     /// GroupNorm backward statistics per (input node, eps bits), computed
     /// once for the input and weight/bias gradients.
@@ -2921,6 +2920,51 @@ mod tests {
             };
             assert_eq!(d.mnk(), None, "{shader:?} with two params");
         }
+    }
+
+    #[test]
+    fn attention_value_gradient_views_share_fused_output() {
+        let mut g = Graph::new();
+        // A flattened V parameter makes autodiff reshape dV before using it.
+        // Check two attention nodes so their fused outputs cannot be shared.
+        let q = g.parameter("q", &[3, 8]);
+        let k = g.parameter("k", &[5, 8]);
+        let flat_v = g.parameter("v", &[40]);
+        let v = g.reshape(flat_v, &[5, 8]);
+        let first = g.multi_head_attn(q, k, v, 2, 2, 4, true);
+        let flat_v2 = g.parameter("v2", &[40]);
+        let v2 = g.reshape(flat_v2, &[5, 8]);
+        let second = g.multi_head_attn(first, k, v2, 2, 2, 4, true);
+        let loss = g.sum_all(second);
+        g.set_outputs(vec![loss]);
+        let backward = crate::autodiff::differentiate(&g);
+        let plan = compile(&backward);
+        let buffers: HashMap<_, _> = plan.node_buffers.iter().copied().collect();
+        let mut checked = 0;
+        for node in backward.nodes() {
+            if let Op::MultiHeadAttnGradV { fwd_node, .. } = node.op {
+                let fused = plan
+                    .dispatches
+                    .iter()
+                    .find(|d| {
+                        d.origin.iter().any(|&id| {
+                            matches!(backward.node(id).op,
+                            Op::MultiHeadAttnGradK { fwd_node: fwd, .. } if fwd == fwd_node)
+                        })
+                    })
+                    .expect("fused dK/dV producer");
+                assert_eq!(fused.extra_outputs, vec![buffers[&node.id]]);
+                checked += 1;
+            }
+            if matches!(node.op, Op::Identity | Op::StopGradient) {
+                assert_eq!(
+                    buffers[&node.id], buffers[&node.inputs[0]],
+                    "view {} must alias its input {}",
+                    node.id, node.inputs[0]
+                );
+            }
+        }
+        assert_eq!(checked, 2);
     }
 
     #[test]
