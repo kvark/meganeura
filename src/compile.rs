@@ -1234,15 +1234,17 @@ impl Dispatch {
     /// | `params` order | shaders |
     /// |---|---|
     /// | `(m, k, n)` | `MatMul`, `MatMulGemv`, `MatMulGemvAdd`, `FusedMatMulAdd` |
-    /// | `(m, n, k)` | `MatMulAT`, `MatMulBT`, `MatMulGemvBT`, `FusedMatMulATAdd` |
+    /// | `(m, n, k)` | `MatMulAT`, `MatMulBT`, `MatMulGemvBT`, `MatMulGemvBTAdd`, `FusedMatMulATAdd`, `FusedMatMulBTAdd` |
+    /// | `(m, n, k)` | `BlockMatMul`, `BlockMatMulAT`, `BlockMatMulBT` |
     ///
     /// The `AT`/`BT` variants take A already transposed — A is `[K, M]` rather
     /// than `[M, K]` — so their natural order already is `(m, n, k)`.
     ///
     /// Every binding site that needs the logical shape should call this rather
-    /// than re-derive the swap, because the two sites that used to do it each
-    /// listed a different subset: one swapped only for `MatMul`, the other only
-    /// for `MatMul` and `FusedMatMulAdd`.
+    /// than re-derive the swap. There were three copies of the rule — the
+    /// horizontal-batch binding, the cooperative-prologue binding, and the arms
+    /// of `bind_dispatch` itself — and the first two each listed a different
+    /// subset of the shaders that need it.
     ///
     /// Returns `None` for a dispatch that is not a contraction, so a caller
     /// binding an elementwise kernel cannot silently pick up three unrelated
@@ -1258,7 +1260,12 @@ impl Dispatch {
             ShaderEntry::MatMulAT
             | ShaderEntry::MatMulBT
             | ShaderEntry::MatMulGemvBT
-            | ShaderEntry::FusedMatMulATAdd => Some((a, b, c)),
+            | ShaderEntry::MatMulGemvBTAdd
+            | ShaderEntry::FusedMatMulATAdd
+            | ShaderEntry::FusedMatMulBTAdd
+            | ShaderEntry::BlockMatMul
+            | ShaderEntry::BlockMatMulAT
+            | ShaderEntry::BlockMatMulBT => Some((a, b, c)),
             _ => None,
         }
     }
@@ -6508,13 +6515,18 @@ mod tests {
     /// `Dispatch::mnk` must agree with the order each contraction shader's
     /// constructor writes into `params`.
     ///
-    /// The two binding sites that used to do this swap each listed a different
-    /// subset of the shaders — one swapped only for `MatMul`, the other for
-    /// `MatMul` and `FusedMatMulAdd` — so neither matched the four that store
-    /// `(m, k, n)`. This test states the intended mapping in one place: a
-    /// `MatMulAT` reads `(m, n, k)` straight out of `params`, and a `MatMul`
-    /// reads `(m, k, n)` and swaps. Adding a contraction shader means adding it
-    /// to `mnk` and to this table, or the two disagree and this fails.
+    /// The rule was written out in three places — the horizontal-batch binding,
+    /// the cooperative-prologue binding, and the arms of `bind_dispatch` — and
+    /// the first two each listed a different subset of the shaders that need it.
+    /// This test states the intended mapping in one place: a `MatMulAT` reads
+    /// `(m, n, k)` straight out of `params`, and a `MatMul` reads `(m, k, n)` and
+    /// swaps.
+    ///
+    /// This test only covers the shaders its own table names, so it cannot
+    /// detect a contraction shader `mnk` forgot — it was written after one was.
+    /// The backstop is the `mnk` closure in `bind_dispatch`, which panics naming
+    /// the shader; adding a contraction binding without a row in the table fails
+    /// loudly the first time any test reaches it.
     #[test]
     fn mnk_matches_the_params_order_each_shader_is_built_with() {
         /// One row: the shader, the `params` it is constructed with, and what
@@ -6530,7 +6542,14 @@ mod tests {
             (ShaderEntry::MatMulAT, [10, 20, 30], (10, 20, 30)),
             (ShaderEntry::MatMulBT, [10, 20, 30], (10, 20, 30)),
             (ShaderEntry::MatMulGemvBT, [10, 20, 30], (10, 20, 30)),
+            (ShaderEntry::MatMulGemvBTAdd, [10, 20, 30], (10, 20, 30)),
             (ShaderEntry::FusedMatMulATAdd, [10, 20, 30], (10, 20, 30)),
+            (ShaderEntry::FusedMatMulBTAdd, [10, 20, 30], (10, 20, 30)),
+            // Block matmuls are per-block tiles with the block count in
+            // `params[3]`, so `(m, n, k)` is already in that order.
+            (ShaderEntry::BlockMatMul, [10, 20, 30], (10, 20, 30)),
+            (ShaderEntry::BlockMatMulAT, [10, 20, 30], (10, 20, 30)),
+            (ShaderEntry::BlockMatMulBT, [10, 20, 30], (10, 20, 30)),
         ];
 
         for &(ref shader, params, want) in cases.iter() {

@@ -6848,6 +6848,23 @@ impl Session {
         pc: &mut impl blade_graphics::traits::PipelineEncoder,
     ) {
         let buf = |r: BufferRef| buffers[r.0 as usize];
+        // `Dispatch::mnk` owns the `(m, n, k)` reinterpretation. The arms below
+        // used to spell out `params[0..3]` with a per-shader swap, and three
+        // copies of that rule had drifted apart — see `Dispatch::mnk`.
+        //
+        // A contraction shader missing from that table panics here, naming
+        // itself. That is the backstop for a newly added one: `mnk`'s unit test
+        // only covers the shaders its own table names, so it cannot detect a
+        // shader the table forgot. This can, and does, immediately.
+        let mnk = |d: &crate::compile::Dispatch| match d.mnk() {
+            Some(shape) => shape,
+            None => panic!(
+                "Dispatch::mnk has no (m, n, k) for {:?}. Either it is not a \\
+                 contraction, or it is one that was added without a row in the \\
+                 table — add it there and to the test alongside it.",
+                d.shader
+            ),
+        };
         if dispatch.horizontal_batch >= 2 {
             let count = dispatch.horizontal_batch as usize;
             let mut pieces = vec![buf(dispatch.input_buffers[0])];
@@ -7034,6 +7051,7 @@ impl Session {
                 unreachable!("generated kernels are bound by their kernel above")
             }
             ShaderEntry::BlockMatMul | ShaderEntry::BlockMatMulAT | ShaderEntry::BlockMatMulBT => {
+                let (m, n, k) = mnk(dispatch);
                 pc.bind(
                     0,
                     &MatMulData {
@@ -7041,15 +7059,16 @@ impl Session {
                         matrix_b: buf(dispatch.input_buffers[1]),
                         matrix_c: buf(dispatch.output_buffer),
                         params: MatMulParams {
-                            m: dispatch.params[0],
-                            n: dispatch.params[1],
-                            k: dispatch.params[2],
+                            m,
+                            n,
+                            k,
                             _pad: dispatch.params[3],
                         },
                     },
                 );
             }
             ShaderEntry::MatMul | ShaderEntry::MatMulGemv => {
+                let (m, n, k) = mnk(dispatch);
                 pc.bind(
                     0,
                     &MatMulData {
@@ -7057,16 +7076,16 @@ impl Session {
                         matrix_b: buf(dispatch.input_buffers[1]),
                         matrix_c: buf(dispatch.output_buffer),
                         params: MatMulParams {
-                            m: dispatch.params[0],
-                            n: dispatch.params[2],
-                            k: dispatch.params[1],
+                            m,
+                            n,
+                            k,
                             _pad: dispatch.workgroups[1],
                         },
                     },
                 );
             }
             ShaderEntry::MatMulAT | ShaderEntry::MatMulBT | ShaderEntry::MatMulGemvBT => {
-                // params layout: [m, n, k, 0]
+                let (m, n, k) = mnk(dispatch);
                 pc.bind(
                     0,
                     &MatMulData {
@@ -7074,15 +7093,16 @@ impl Session {
                         matrix_b: buf(dispatch.input_buffers[1]),
                         matrix_c: buf(dispatch.output_buffer),
                         params: MatMulParams {
-                            m: dispatch.params[0],
-                            n: dispatch.params[1],
-                            k: dispatch.params[2],
+                            m,
+                            n,
+                            k,
                             _pad: dispatch.workgroups[1],
                         },
                     },
                 );
             }
             ShaderEntry::FusedMatMulAdd | ShaderEntry::MatMulGemvAdd => {
+                let (m, n, k) = mnk(dispatch);
                 pc.bind(
                     0,
                     &FusedMatMulAddData {
@@ -7091,9 +7111,9 @@ impl Session {
                         matrix_c: buf(dispatch.output_buffer),
                         src: buf(dispatch.input_buffers[2]), // addend
                         params: MatMulParams {
-                            m: dispatch.params[0],
-                            n: dispatch.params[2],
-                            k: dispatch.params[1],
+                            m,
+                            n,
+                            k,
                             _pad: dispatch.workgroups[1],
                         },
                     },
@@ -7102,7 +7122,7 @@ impl Session {
             ShaderEntry::FusedMatMulATAdd
             | ShaderEntry::FusedMatMulBTAdd
             | ShaderEntry::MatMulGemvBTAdd => {
-                // params layout: [m, n, k, 0] (same as AT/BT, no swizzle)
+                let (m, n, k) = mnk(dispatch);
                 pc.bind(
                     0,
                     &FusedMatMulAddData {
@@ -7111,9 +7131,9 @@ impl Session {
                         matrix_c: buf(dispatch.output_buffer),
                         src: buf(dispatch.input_buffers[2]), // addend
                         params: MatMulParams {
-                            m: dispatch.params[0],
-                            n: dispatch.params[1],
-                            k: dispatch.params[2],
+                            m,
+                            n,
+                            k,
                             _pad: dispatch.workgroups[1],
                         },
                     },
