@@ -314,8 +314,18 @@ reconsidering.
 
 - **`bind_dispatch` is ~1210 lines** (`src/runtime.rs:6845`) — a 60-arm match
   over `dispatch.shader`, each arm building a binding struct. Measured at
-  **28% of the per-step host path** (187 ns of ~657 ns per dispatch), so this is
-  the one structural item with a number attached and a plausible payoff.
+  **28% of the per-step host path** (187 ns of ~657 ns per dispatch).
+  **But splitting it would not make it faster**, and that was checked rather
+  than assumed: timing `bind_dispatch` per shader entry across the whole
+  `bench_step_cpu` sweep gives 138–174 ns for every entry, with no hot arm.
+  The cost is uniform, so it is the binding model rather than one arm doing
+  something wasteful, and moving the arms into sub-functions would move the same
+  work. It stays a readability item.
+
+  What *did* turn up while measuring it is that the `(m, n, k)` rule had a
+  **third** copy here as well as the two already fixed — see below. Routing
+  every contraction arm through `Dispatch::mnk()` also replaced thirteen
+  `params[0..3]` spellings.
 - **Module sizes**: `runtime.rs` 8578, `codegen.rs` 7976, `compile.rs` 7784,
   `graph.rs` 3409. The file split recommended in July 2026 is still open; the
   one boundary that mattered (compile↔runtime) is now closed.

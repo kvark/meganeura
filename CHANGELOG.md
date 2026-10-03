@@ -1,5 +1,22 @@
 # Unreleased
 
+- `bind_dispatch`'s contraction arms now read `(m, n, k)` through
+  `Dispatch::mnk()` instead of spelling out `params[0..3]` with a per-shader
+  swap — thirteen sites, and the third copy of a rule that had already drifted
+  between the two other places it was written. Routing them through the accessor
+  found a gap in its own table: `FusedMatMulBTAdd` was missing, so 14 GGUF, 4
+  oracle and 9 smoke tests panicked on a name lookup rather than binding a wrong
+  shape. That is now a row in the table, and the `mnk` closure in
+  `bind_dispatch` panics *naming the shader* rather than reporting a generic
+  expectation failure, since it is the backstop for a contraction shader added
+  without a table row — a case the unit test structurally cannot catch, because
+  it only enumerates the shaders the table already names.
+
+  Splitting `bind_dispatch` for its own sake was measured and rejected: timing
+  it per shader entry across the `bench_step_cpu` sweep gives 138-174 ns for
+  every entry with no hot arm, so the 187 ns is the binding model rather than
+  one arm doing something wasteful.
+
 - `DType::block_geometry()` is the single source for quantized block geometry,
   replacing five independent tables: the `DType` doc comments, the seven
   divisibility asserts in `Graph::parameter_q*k`, the per-dtype arms of
