@@ -312,20 +312,35 @@ reconsidering.
 
 **Status: open. None are urgent; all are real.**
 
-- **`bind_dispatch` is ~1210 lines** (`src/runtime.rs:6845`) — a 60-arm match
-  over `dispatch.shader`, each arm building a binding struct. Measured at
-  **28% of the per-step host path** (187 ns of ~657 ns per dispatch).
-  **But splitting it would not make it faster**, and that was checked rather
-  than assumed: timing `bind_dispatch` per shader entry across the whole
-  `bench_step_cpu` sweep gives 138–174 ns for every entry, with no hot arm.
-  The cost is uniform, so it is the binding model rather than one arm doing
-  something wasteful, and moving the arms into sub-functions would move the same
-  work. It stays a readability item.
+- ~~**`bind_dispatch` is ~1210 lines.**~~ **Done.** One 58-arm match over
+  `dispatch.shader` is now a routing match plus eight family functions:
 
-  What *did* turn up while measuring it is that the `(m, n, k)` rule had a
-  **third** copy here as well as the two already fixed — see below. Routing
-  every contraction arm through `Dispatch::mnk()` also replaced thirteen
-  `params[0..3]` spellings.
+  | | lines | | lines |
+  |---|---|---|---|
+  | `bind_dispatch` | 333 | `bind_norm` | 195 |
+  | `bind_matmul` | 120 | `bind_activation` | 78 |
+  | `bind_conv` | 196 | `bind_reduction` | 58 |
+  | `bind_attention` | 202 | `bind_loss` | 48 |
+  | | | `bind_pointwise` | 203 |
+
+  The design point is that **the routing match is the only exhaustive one and it
+  has no wildcard arm**, so adding a `ShaderEntry` variant fails to compile at
+  the routing decision. Each family's inner match ends in `unreachable!` — if a
+  routing arm and a family ever drift, the compiler still passes and the
+  mismatch is caught the first time a test reaches it.
+
+  Splitting it does **not** make it faster, and that was measured before doing
+  it: timing `bind_dispatch` per shader entry across the whole `bench_step_cpu`
+  sweep gives 138–174 ns for every entry with no hot arm, so the 187 ns that is
+  28% of the per-step host path is the binding model rather than one arm doing
+  something wasteful. Moving the arms moves the same work.
+
+  Verified rather than assumed: the sequence of 65 `pc.bind` calls is
+  byte-identical before and after, so nothing was reordered or dropped.
+
+  The `(m, n, k)` rule had a **third** copy here as well as the two already
+  fixed — see below. Routing every contraction arm through `Dispatch::mnk()`
+  also replaced thirteen `params[0..3]` spellings.
 - **Module sizes**: `runtime.rs` 8592, `codegen.rs` 8146, `compile.rs` 7928,
   `graph.rs` 3527. The file split recommended in July 2026 is still open; the one
   boundary that mattered (compile↔runtime) is now closed, and `runtime/optimizer.rs`
