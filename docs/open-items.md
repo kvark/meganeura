@@ -365,7 +365,10 @@ reconsidering.
     to change was relative: `include_str!("shaders/...")` inside the moved
     generators became `"../shaders/..."`, which the compiler caught immediately.
 
-  No behaviour changed: 491 + 22 + 112 + 121 + 64 green on both GPUs.
+  No behaviour changed: 491 + 22 + 112 + 121 + 64 green on both GPUs, and the
+  set of `pub` item names across `src/` is identical before and after — 711 each,
+  none added and none removed. That is the check that makes "pure
+  reorganisation" a claim rather than an assertion.
 - ~~**`(m,n,k)` is reinterpreted differently at two binding sites.**~~ **Done.**
   The two sites disagreed: the horizontal-batch binding swapped `n` and `k` only
   for `ShaderEntry::MatMul`, and the cooperative-prologue binding only for
