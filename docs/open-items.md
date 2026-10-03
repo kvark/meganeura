@@ -326,9 +326,15 @@ reconsidering.
   **third** copy here as well as the two already fixed — see below. Routing
   every contraction arm through `Dispatch::mnk()` also replaced thirteen
   `params[0..3]` spellings.
-- **Module sizes**: `runtime.rs` 8578, `codegen.rs` 7976, `compile.rs` 7784,
-  `graph.rs` 3409. The file split recommended in July 2026 is still open; the
-  one boundary that mattered (compile↔runtime) is now closed.
+- **Module sizes**: `runtime.rs` 8592, `codegen.rs` 8146, `compile.rs` 7928,
+  `graph.rs` 3527. The file split recommended in July 2026 is still open; the one
+  boundary that mattered (compile↔runtime) is now closed, and `runtime/optimizer.rs`
+  already exists as a precedent.
+
+  This is the one item left with no measurement attached, because there is
+  nothing to measure: it is churn. Every change above landed in these files
+  without difficulty, and the only cost of size is navigation. Worth doing when
+  something else is being changed in the same file, not on its own.
 - ~~**`(m,n,k)` is reinterpreted differently at two binding sites.**~~ **Done.**
   The two sites disagreed: the horizontal-batch binding swapped `n` and `k` only
   for `ShaderEntry::MatMul`, and the cooperative-prologue binding only for
