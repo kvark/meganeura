@@ -17,7 +17,7 @@ made) · **done** (kept for the record, with what it cost).
 | 3 | Per-step CPU work in the step loop | **measured — the cost is real; the two targets named were the wrong ones** | below |
 | 4 | `step()` fences before recording, so CPU and GPU never overlap | **measured — not worth doing** | below |
 | 3c | CPU/GPU split benchmark (`bench_step_cpu`) | done | below |
-| 5 | Structural: god functions, duplicated `(m,n,k)`, split tables | open | below |
+| 5 | Structural: god functions, duplicated `(m,n,k)`, split tables | **done** | below |
 | 6 | Importers accept malformed input without a fuzz corpus | **done — found two panics** | below |
 | 7 | `EntrySpec` table for `ShaderEntry` | retracted | below |
 | 8 | RMSNorm `(2..=32)` rows-per-workgroup bound | retracted | below |
@@ -341,15 +341,31 @@ reconsidering.
   The `(m, n, k)` rule had a **third** copy here as well as the two already
   fixed — see below. Routing every contraction arm through `Dispatch::mnk()`
   also replaced thirteen `params[0..3]` spellings.
-- **Module sizes**: `runtime.rs` 8592, `codegen.rs` 8146, `compile.rs` 7928,
-  `graph.rs` 3527. The file split recommended in July 2026 is still open; the one
-  boundary that mattered (compile↔runtime) is now closed, and `runtime/optimizer.rs`
-  already exists as a precedent.
+- ~~**Module sizes.**~~ **Done.** `runtime.rs` 8592 → 5666, `codegen.rs` 8146 →
+  5419, `compile.rs` 7928 → 4326. The split is by responsibility, not by line
+  count:
 
-  This is the one item left with no measurement attached, because there is
-  nothing to measure: it is churn. Every change above landed in these files
-  without difficulty, and the only cost of size is navigation. Worth doing when
-  something else is being changed in the same file, not on its own.
+  | moved | to | lines | why that seam |
+  |---|---|---|---|
+  | `impl Compiler` | `compile/emit.rs` | 3634 | everything here *emits* dispatches; everything in the parent *describes* the plan |
+  | attention + conv generators | `codegen/attention.rs` | 2744 | the matmul family stays put; everything that is not a matmul is here |
+  | `Session` binding | `runtime/binding.rs` | 1477 | given a `Dispatch`, what goes in binding 0 |
+  | `Session` transfers | `runtime/transfer.rs` | 1444 | everything that touches a buffer from the CPU side |
+  | `GpuOptions`, context creation | `runtime/context.rs` | 99 | nothing here touches a `Session` |
+  | host-side Q4/Q8 packing | `runtime/quantize.rs` | 187 | callable from `f32` without a GGUF file, unlike the load-only formats |
+
+  Two conventions, both forced by the compiler rather than chosen:
+
+  - Methods and helpers that move become `pub(super)`, because an inherent impl
+    in a child module is only reachable from the parent if the methods are
+    visible there. `pub(super)` rather than `pub` keeps the surface unchanged —
+    no caller outside the module can reach them either way.
+  - Public items are re-exported (`pub use attention::*;`, `pub use
+    context::*;`), so every existing path still resolves. The one path that had
+    to change was relative: `include_str!("shaders/...")` inside the moved
+    generators became `"../shaders/..."`, which the compiler caught immediately.
+
+  No behaviour changed: 491 + 22 + 112 + 121 + 64 green on both GPUs.
 - ~~**`(m,n,k)` is reinterpreted differently at two binding sites.**~~ **Done.**
   The two sites disagreed: the horizontal-batch binding swapped `n` and `k` only
   for `ShaderEntry::MatMul`, and the cooperative-prologue binding only for
