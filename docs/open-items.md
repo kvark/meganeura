@@ -14,7 +14,7 @@ made) · **done** (kept for the record, with what it cost).
 |---|---|---|---|
 | 1 | Cooperative flash forward loses f16 precision on NVIDIA | open — needs measurement | below |
 | 2 | `load::onnx` slices with a file-controlled length | **done** | below |
-| 3 | Per-step CPU work: segment table rebuild, pipeline hash lookup | **measured — real, and the dominant cost** | below |
+| 3 | Per-step CPU work in the step loop | **measured — the cost is real; the two targets named were the wrong ones** | below |
 | 4 | `step()` fences before recording, so CPU and GPU never overlap | **measured — not worth doing** | below |
 | 3c | CPU/GPU split benchmark (`bench_step_cpu`) | done | below |
 | 5 | Structural: god functions, duplicated `(m,n,k)`, split tables | open | below |
@@ -120,8 +120,9 @@ four panic at the slice.
 
 ## 3. Per-step CPU work in the training loop
 
-**Status: measured. Both findings are real, and together they are the dominant
-cost of a step — the opposite of what the audit assumed.**
+**Status: measured. The cost is real and dominant, but neither target the audit
+named accounts for much of it. See "attribution" below — the per-dispatch hash
+is ~7% of the host path.
 
 Three findings, all on the per-step path:
 
@@ -187,14 +188,38 @@ separate them (`8×64` and `8×1024`, both 105 dispatches and 16 parameters,
 would need a parameter-heavy, dispatch-light model to show up, which is not
 what this sweep builds. Worth doing for a large model, not worth doing first.
 
-**What is still attributable.** The benchmark measures the whole host path, not
-its parts. 3b is the per-dispatch term and the flat line is entirely consistent
-with a per-dispatch hash. Attributing the ~680 ns between the hash lookup, the
-binding-struct construction in `bind_dispatch`, and the encoder call itself
-needs a profiler run on the `record` span, which `step()` already emits via
-`tracing::info_span!`. That is the next step, not a rewrite.
+**Attribution: the audit named the wrong targets.** Timing the four phases
+inside `record_groups` — pipeline lookup, `pass.with`, `bind_dispatch`,
+`pc.dispatch` — gives, per dispatch (instrumented, so upper bounds; ~90 ns of
+the total is the instrumentation itself):
 
----
+| phase | ns/dispatch | share |
+|---|---|---|
+| `pipelines::get` (the HashMap lookup) | 44 | 7% |
+| `pass.with(pipeline)` | 58 | 9% |
+| `bind_dispatch` | 187 | 28% |
+| `pc.dispatch(workgroups)` — the driver call | 369 | 56% |
+
+So 3b, the hash lookup the audit pointed at, is **7%** of the host path.
+Removing it entirely would be a 7% saving on a cost that is itself ~90–98% of a
+step — worth about 6% end to end on a small model, and it costs a
+`Vec<&ComputePipeline>` plus a lifetime change to `Pipelines`. That is not
+nothing, but it is not the win the audit implied, and it should not be the first
+thing done.
+
+84% is `bind_dispatch` plus the driver call, and 56% of the whole host path is a
+single `pc.dispatch` — a call into Blade that records into the command encoder.
+That is not ours to optimise; it is the cost of issuing a dispatch at all.
+Which reframes the finding: **the host cost of a step is roughly what issuing
+D dispatches costs**, and the only levers that matter are issuing fewer
+dispatches or making each one cheaper to record. `bind_dispatch` at 28% is the
+part that is ours, and it is a 60-arm match building a struct per dispatch —
+which is item 5's god-function problem, now with a number attached.
+
+**What is left to decide.** Whether reducing dispatch count (fewer, wider
+dispatches) is available at the shapes that matter, and whether `bind_dispatch`
+can avoid constructing its binding struct per call. Both are design questions
+with a measurement in hand, which is more than the audit had.
 
 ## 4. `step()` fences before recording
 
@@ -243,7 +268,9 @@ reconsidering.
 **Status: open. None are urgent; all are real.**
 
 - **`bind_dispatch` is ~1210 lines** (`src/runtime.rs:6845`) — a 60-arm match
-  over `dispatch.shader`, each arm building a binding struct.
+  over `dispatch.shader`, each arm building a binding struct. Measured at
+  **28% of the per-step host path** (187 ns of ~657 ns per dispatch), so this is
+  the one structural item with a number attached and a plausible payoff.
 - **Module sizes**: `runtime.rs` 8578, `codegen.rs` 7976, `compile.rs` 7784,
   `graph.rs` 3409. The file split recommended in July 2026 is still open; the
   one boundary that mattered (compile↔runtime) is now closed.
