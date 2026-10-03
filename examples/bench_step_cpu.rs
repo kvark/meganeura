@@ -162,7 +162,13 @@ fn measure(blocks: usize, width: usize, batch: usize, runs: usize) -> Measuremen
         session.record(&mut encoder).expect("record");
         encode_idle.push(start.elapsed());
     }
+    if std::env::var_os("MEGANEURA_PHASES").is_some() {
+        meganeura::runtime::phases::report();
+    }
     let idle = ms(median(encode_idle));
+    if std::env::var_os("MEGANEURA_PHASES").is_some() {
+        meganeura::runtime::phases::report();
+    }
 
     let mut whole = Vec::with_capacity(runs);
     for _ in 0..runs {
