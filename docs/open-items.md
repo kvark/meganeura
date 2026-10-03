@@ -12,7 +12,7 @@ made) · **done** (kept for the record, with what it cost).
 
 | # | Item | Status | Where |
 |---|---|---|---|
-| 1 | Cooperative flash forward loses f16 precision on NVIDIA | open — needs measurement | below |
+| 1 | Cooperative flash forward loses f16 precision on NVIDIA | **measured — trade is real; the fix has a portability cost** | below |
 | 2 | `load::onnx` slices with a file-controlled length | **done** | below |
 | 3 | Per-step CPU work in the step loop | **measured — the cost is real; the two targets named were the wrong ones** | below |
 | 4 | `step()` fences before recording, so CPU and GPU never overlap | **measured — not worth doing** | below |
@@ -21,55 +21,101 @@ made) · **done** (kept for the record, with what it cost).
 | 6 | Importers accept malformed input without a fuzz corpus | **done — found two panics** | below |
 | 7 | `EntrySpec` table for `ShaderEntry` | retracted | below |
 | 8 | RMSNorm `(2..=32)` rows-per-workgroup bound | retracted | below |
+| 11 | The ~9 ms periodic driver stall on this box | noted | below |
 
 ---
 
 ## 1. Cooperative flash forward loses f16 precision on NVIDIA
 
-**Status: open. This is the only item here that is a defect in a shipped path
-rather than a harness artefact or a tidiness question.**
+**Status: measured. The speed is worth having; the error is not all of it
+unavoidable. The remaining fix is a judgement call, recorded here with both
+sides measured.**
 
 Five `attention` oracle cases fail on the RTX 5070 and pass on Intel, lavapipe
-and every other adapter. The worst element of every failing comparison is
-*exactly* `f16(reference)`:
+and every other adapter. `MEGANEURA_FLASH_FWD_COOP=0` makes all 17 pass — the
+only switch that changes the outcome, and re-verified rather than taken from the
+earlier audit. `MEGANEURA_DISABLE_COOP=1` passes too, with a **byte-identical**
+plan, so this is not dispatch selection: the cooperative *forward* kernel is
+reached through `Auto` even when cooperative dispatch is disabled.
 
-| got | reference | `f16(reference)` |
+**Where the f16 actually is.** Reading `generate_flash_attention_coop_module`:
+
+- `coop_mat16x16<f32,C>` — the QK^T accumulator is already f32.
+- `local_o: array<f32, chunk_hd>`, and PV accumulates as
+  `local_o[e] + p * f32(shared_v[...])` — f32 throughout.
+- `dst[...] = local_o[e] / safe_sum` — the output is f32.
+- The f16 is `shared_q`, `shared_k_t`, `shared_v`: Q, K and V are rounded to
+  f16 when staged into workgroup memory.
+
+So the loss is representational, in the *inputs*. Q and K must be f16 — they are
+operands of `coopLoadT<coop_mat16x16<f16,A/B>>`. **V is not.** The cooperative
+matmul is QK^T only; PV is a scalar loop. V's f16 storage is an artefact, and
+the `f32(shared_v[...])` conversion in the accumulate line is the tell: it exists
+only because the storage was f16.
+
+**The measurement.** `examples/bench_attention_coop` sweeps the three policies
+over the oracle's own flash shapes against an independent f64 CPU reference.
+RTX 5070, minimum of 200 steps, coop:
+
+| shape | Auto (f16 coop) | NativeF32 | Disabled | Auto vs scalar |
+|---|---|---|---|---|
+| hd=64, q=31 (scalar control) | 0.031 | 0.028 | 0.029 | 1.06x |
+| hd=256, q=33 | 0.036 | 0.069 | 0.099 | 2.7x |
+| hd=128, q=64, gqa | 0.032 | 0.092 | 0.103 | 3.2x |
+| hd=128, q=63 (scalar control) | 0.086 | 0.050 | 0.063 | 0.73x |
+| hd=64, q=130 | 0.046 | 0.081 | 0.096 | 2.1x |
+| hd=32, q=260 | 0.037 | 0.110 | 0.090 | 2.4x |
+| hd=16, q=257 | 0.064 | 0.096 | 0.097 | 1.5x |
+| q=1024, 8 heads, hd=64 | 0.293 | 0.584 | 0.526 | 1.8x |
+
+Two things. `NativeF32` tracks `Disabled` everywhere, confirming the auto-tune
+report that this device advertises no f32 cooperative tile — so on NVIDIA
+`NativeF32` *is* "use the scalar kernel". And the speed is real: 1.8x at the
+largest shape, up to 3.2x where flash selects. The two "scalar control" rows are
+shapes below the flash threshold, where no policy should matter and none does.
+
+**What staging V as f32 buys.** Measured by changing `shared_v` to `array<f32>`
+and removing the one conversion — six lines, no policy change, no tolerance
+change:
+
+| shape | worst_abs as f16 | worst_abs as f32 | ratio | time as f16 | time as f32 |
+|---|---|---|---|---|---|
+| hd=256, q=33 | 2.72e-4 | 6.31e-5 | 4.3x | 0.036 | 0.068 |
+| hd=128, q=64 | 2.55e-4 | 8.11e-5 | 3.1x | 0.032 | 0.036 |
+| hd=64, q=130 | 2.36e-4 | 8.03e-5 | 2.9x | 0.046 | 0.046 |
+| hd=32, q=260 | 2.36e-4 | 1.00e-4 | 2.4x | 0.037 | 0.044 |
+| q=1024, 8 heads | 2.83e-4 | 1.44e-4 | 2.0x | 0.254 | 0.344 |
+
+So V accounts for roughly three quarters of the error: Q and K's f16 rounding
+barely registers, because the coop matmul accumulates them in f32 over `hd` terms
+and softmax then normalises. Recovering it costs **1.35x on the forward at the
+largest shape** (0.254 → 0.344 ms), which still leaves the path 1.5x faster than
+the scalar kernel.
+
+**Why this was not simply done.** Workgroup storage. With `bkv=16`:
+
+| head_dim | shared (V as f16) | shared (V as f32) |
 |---|---|---|
-| `-1.052734375` | `-1.0522552728652954` | `-1.052734375` |
-| `-1.03515625` | `-1.0346871614456177` | `-1.03515625` |
-| `0.5654296875` | `0.5656632781028748` | `0.5654296875` |
-| `0.5009765625` | `0.5007421970367432` | `0.5009765625` |
+| 64 | 7 KB | 9 KB |
+| 128 | 13 KB | 17 KB |
+| 256 | 25 KB | 33 KB |
 
-Isolated by elimination, not inference:
+25 KB is already over the 16 KB that WebGPU guarantees, so this path needs an
+opt-in above the floor either way — but 33 KB excludes devices that offer exactly
+32 KB, which 25 KB does not. That is a narrowing of the set of hardware the
+cooperative forward works on, traded for 2–4x accuracy on a path that is
+documented as reduced precision.
 
-- `MEGANEURA_FLASH_FWD_COOP=0` → 18 passed, 0 failed. The only switch that
-  changes the outcome.
-- `MEGANEURA_DISABLE_COOP=1` → 18 passed, 0 failed, and the dumped plans are
-  **byte-identical** to the default. So it is not dispatch selection.
-- On this device `runtime::auto_tune` reports `f16_tile: 16, f32_tile: 0` — no
-  f32 cooperative tile is advertised at all — and `CoopPolicy::Auto` selects the
-  f16 one.
-- `compile::attention_dispatch` gates the choice on `!requires_full_precision`,
-  which an inference graph does not set.
+That is a policy decision, not a bug fix, so it is not taken unilaterally here.
+Loosening the oracle's tolerance to accept 2.4e-4 would hide the defect rather
+than address it, which is worse than either option.
 
-This was invisible for as long as the oracle silently fell through to the Intel
-card after exhausting the NVIDIA context budget (see item 9 below); the oracle
-was right to fail on it.
-
-**What would close it.** A measurement of what each option costs on the shapes
-that matter, because the fix is a policy choice rather than a bug fix:
-
-- keep `Auto` (f16 coop forward) — fastest, loses ~2 decimal digits
-- make `NativeF32` the default — the device has no f32 tile, so this selects
-  the scalar kernel for these shapes
-- gate coop forward on `requires_full_precision` for inference too
-
-The third is a one-line change and would be wrong without the measurement: it
-gives up the ~3.2x-per-dispatch speedup the code comments cite. Recorded rather
-than papered over; loosening the oracle's tolerance to hide it would be worse
-than the defect.
-
----
+**What would close it.** A decision on the table above. If V as f32: it is six
+lines, it recovers three quarters of the error, and it needs a head_dim at which
+the extra 8 KB is refused rather than assumed. If V stays f16: the oracle needs a
+tolerance derived from the representation (one f16 ulp) for cooperative paths,
+stated as the contract that path actually offers — with the default documented as
+f16 rather than leaving it implicit.
 
 ## 2. `load::onnx` slices with a file-controlled length
 
@@ -410,7 +456,41 @@ suite now panics rather than falling through, so a violation is loud.
 
 ---
 
-## 10. Claims retracted during this work
+## 11. The measurement pitfall on this hardware
+
+**Status: noted so the next benchmark does not rediscover it.**
+
+An earlier version of `bench_attention_coop` reported ~8.6 ms for the scalar
+kernel and ~1.6 ms for the cooperative one — the cooperative kernel appearing six
+times *faster* than the scalar path it is supposed to beat. Two effects
+combined.
+
+**The NVIDIA driver takes a periodic ~9 ms stall.** On a 200-step run of an 8x8
+matmul, which contains no attention kernel at all:
+
+| policy | p10 | p50 | p90 | p99 | min |
+|---|---|---|---|---|---|
+| Auto | 0.057 ms | 1.32 ms | 8.95 ms | 9.70 ms | 0.055 ms |
+| NativeF32 | 0.065 ms | 1.33 ms | 9.08 ms | 9.48 ms | 0.064 ms |
+| Disabled | 0.060 ms | 0.077 ms | 9.16 ms | 9.85 ms | 0.059 ms |
+
+Identical shape for all three policies, so it is not the graph. Which sample the
+median lands on depends on where the stall boundaries fall relative to the sample
+count, which is why successive runs of the same binary reported different
+policies as the slow one.
+
+**Timing a bare `step` measures submission, not the step.** Successive steps
+pipeline, so a loop of them reports whichever stall the driver happened to take.
+Each step has to be timed with its own `wait()` inside the measured region.
+
+With both corrected, the minimum is stable to within 10% across runs and
+policies, and the numbers become interpretable. `bench_step_cpu` uses a median,
+which is defensible there because host encode time has no such bimodality — but
+that is a property of that measurement, not a general licence.
+
+---
+
+## 12. Claims retracted during this work
 
 Recorded because an audit that only keeps its hits teaches the wrong lesson.
 Each of these looked like a defect and was checked instead of assumed.
@@ -429,3 +509,14 @@ Each of these looked like a defect and was checked instead of assumed.
   now uses a measured tolerance.
 - **Adding a `ShaderEntry` variant needs fifteen edits.** Five compiler-caught
   `E0004`s; see item 7.
+- **Removing the `Pipelines::get` hash is worth doing.** Measured at 7% of the
+  host path, and 56% of that path is one `pc.dispatch` into the driver; see
+  item 3.
+- **Cooperative flash forward is "~3.2x per dispatch" faster than scalar.** The
+  shape is real — 3.2x at `hd=128` with GQA — but it is not uniform: 1.06x on a
+  shape below the flash threshold and 1.8x at `q=1024`, and the first version of
+  the measurement had it *slower*, inverted, because of the stall in item 11.
+- **`Pipelines::get` hashing a `Vec`-bearing enum is expensive.** A standalone
+  microbenchmark puts a `HashMap` probe of that enum at 23 ns, of which 12 ns is
+  hashing the key. The width of the enum is not the cost; the per-dispatch count
+  is.
