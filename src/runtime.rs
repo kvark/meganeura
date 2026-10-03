@@ -6856,10 +6856,7 @@ impl Session {
             }
             pieces.push(buf(dispatch.output_buffer));
             pieces.extend(dispatch.extra_outputs.iter().map(|&r| buf(r)));
-            let (m, n, k) = match dispatch.shader {
-                ShaderEntry::MatMul => (dispatch.params[0], dispatch.params[2], dispatch.params[1]),
-                _ => (dispatch.params[0], dispatch.params[1], dispatch.params[2]),
-            };
+            let (m, n, k) = dispatch.mnk().expect("horizontal batch is a contraction");
             pc.bind(
                 0,
                 &HorizMatMulData {
@@ -7014,12 +7011,9 @@ impl Session {
         // Only applies when use_coop is set AND a prologue is attached.
         if let Some(ref prologue) = dispatch.matmul_prologue {
             if dispatch.use_coop() && prologue.factors.len() == 2 {
-                let (m, n, k) = match dispatch.shader {
-                    ShaderEntry::MatMul | ShaderEntry::FusedMatMulAdd => {
-                        (dispatch.params[0], dispatch.params[2], dispatch.params[1])
-                    }
-                    _ => (dispatch.params[0], dispatch.params[1], dispatch.params[2]),
-                };
+                let (m, n, k) = dispatch
+                    .mnk()
+                    .expect("a fused prologue is attached to a contraction");
                 pc.bind(
                     0,
                     &MatMulPrologue2Data {

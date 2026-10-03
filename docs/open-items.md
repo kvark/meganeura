@@ -319,11 +319,26 @@ reconsidering.
 - **Module sizes**: `runtime.rs` 8578, `codegen.rs` 7976, `compile.rs` 7784,
   `graph.rs` 3409. The file split recommended in July 2026 is still open; the
   one boundary that mattered (compile↔runtime) is now closed.
-- **`(m,n,k)` is reinterpreted differently at two binding sites.**
-  `src/runtime.rs:6859` and `:7017` both special-case
-  `ShaderEntry::MatMul` to swap `n` and `k`. A `Dispatch::mnk()` accessor next
-  to the existing `scalar_matmul()` / `conv_k_tile()` / `gemv_shape()` accessors
-  would centralise it.
+- ~~**`(m,n,k)` is reinterpreted differently at two binding sites.**~~ **Done.**
+  The two sites disagreed: the horizontal-batch binding swapped `n` and `k` only
+  for `ShaderEntry::MatMul`, and the cooperative-prologue binding only for
+  `MatMul` and `FusedMatMulAdd`. Neither matched the shaders that actually store
+  `(m, k, n)` in `params` — `MatMul`, `MatMulGemv`, `MatMulGemvAdd`,
+  `FusedMatMulAdd`. `Dispatch::mnk()` now encodes the verified table beside
+  `scalar_matmul()` / `conv_k_tile()` / `gemv_shape()`, and returns `None` for a
+  non-contraction rather than handing back three unrelated numbers.
+
+  Whether either site was *wrong in practice* was checked rather than assumed.
+  Instrumenting `merge_horizontal` across the whole suite shows only `MatMul`
+  (55), `MatMulBT` (29) and `MatMulAT` (44) are ever horizontally merged, so the
+  first site's list happened to be complete for every case the suite produces —
+  by luck, since the merge predicate at `compile.rs:1058` restricts the kernel
+  but not the shader. The prologue site is **never reached by any test at all**,
+  so its old list could not be validated empirically; the centralisation makes it
+  correct by construction instead.
+
+  Three tests pin it, including a table of all eight contraction shaders against
+  the order their constructors use.
 - **Quantized block geometry lives in three independent tables**: the `DType`
   doc comments, five `assert!`s in `Graph::parameter_q*k`, and an inline
   `(block, stride)` match at `runtime.rs:4932`. Two of the Q8_0 numbers differ
