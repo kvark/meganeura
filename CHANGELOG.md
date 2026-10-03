@@ -1,5 +1,22 @@
 # Unreleased
 
+- `DType::block_geometry()` is the single source for quantized block geometry,
+  replacing five independent tables: the `DType` doc comments, the seven
+  divisibility asserts in `Graph::parameter_q*k`, the per-dtype arms of
+  `TensorType::size_bytes`, the inline `(block, stride)` match in
+  `set_parameter_packed`, and the loader's separate GGML table. Nothing enforced
+  the relationship between them, so a stride change could resize a buffer
+  without changing what the copy loop writes. `WeightFormat::dtype()` maps a
+  format to the `DType` it stores so the copy loop cannot name a different
+  geometry than the buffer was sized with.
+
+  Meganeura's own `Q4_0` and `Q8_0` still keep their own arithmetic and resolve
+  to no `DType` counterpart, and the GGUF loader keeps its own table: `DType::Q4_0`
+  is Meganeura's *asymmetric* Q4 rather than GGML's symmetric one, and `Q8_0`
+  pads to 36 bytes where GGML uses 34. Merging those two is what would erase the
+  difference, so it is left explicit. Three tests, one restating each stride as
+  the literal arithmetic it replaced.
+
 - `Dispatch::mnk()` centralises the `(m, n, k)` reinterpretation that two
   binding sites each did differently: the horizontal-batch binding swapped only
   for `ShaderEntry::MatMul`, the cooperative-prologue binding only for `MatMul`

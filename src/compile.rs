@@ -63,6 +63,27 @@ pub enum WeightFormat {
 }
 
 impl WeightFormat {
+    /// The [`crate::graph::DType`] this format stores, for the block-quantized
+    /// ones.
+    ///
+    /// Every quantized format except Meganeura's own `Q4`/`Q8` is byte-for-byte
+    /// a GGML type, so the mapping is total for them. `Q4` and `Q8` have no GGML
+    /// `DType` — `DType::Q4_0` is Meganeura's asymmetric Q4 and `DType::Q8_0` is
+    /// Meganeura's Q8 — so they return `None` and keep their own arithmetic.
+    pub fn dtype(self) -> Option<crate::graph::DType> {
+        use crate::graph::DType;
+        match self {
+            Self::Q4K => Some(DType::Q4K),
+            Self::Q6K => Some(DType::Q6K),
+            Self::Q5K => Some(DType::Q5K),
+            Self::Q3K => Some(DType::Q3K),
+            Self::Q40 => Some(DType::Q40),
+            Self::F32 => Some(DType::F32),
+            Self::F16 => Some(DType::F16),
+            Self::Q4 | Self::Q8 => None,
+        }
+    }
+
     pub fn is_quantized(self) -> bool {
         matches!(
             self,

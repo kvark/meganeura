@@ -339,11 +339,21 @@ reconsidering.
 
   Three tests pin it, including a table of all eight contraction shaders against
   the order their constructors use.
-- **Quantized block geometry lives in three independent tables**: the `DType`
-  doc comments, five `assert!`s in `Graph::parameter_q*k`, and an inline
-  `(block, stride)` match at `runtime.rs:4932`. Two of the Q8_0 numbers differ
-  deliberately (Meganeura pads to 36 bytes, GGML uses 34) and that is
-  documented, but nothing enforces the relationship.
+- ~~**Quantized block geometry lives in three independent tables.**~~ **Done**,
+  though it was five. `DType::block_geometry()` is now the single source for
+  `(elements per block, bytes per block)`, read by `TensorType::size_bytes`, by
+  `set_parameter_packed`'s copy loop and by all six `Graph::parameter_q*k`
+  divisibility asserts; `WeightFormat::dtype()` maps a format to the `DType` it
+  stores so the copy loop cannot name a different geometry than the buffer was
+  sized with. Three tests, including one that restates each stride as the
+  literal arithmetic it replaced (`blocks * 36 * 4` and so on) so a change to
+  the table cannot quietly resize a buffer.
+
+  Meganeura's `Q4_0` and `Q8_0` still keep their own arithmetic and resolve to
+  no `DType` counterpart — that is deliberate, since `DType::Q4_0` is
+  Meganeura's *asymmetric* Q4 and `DType::Q8_0` pads to 36 bytes where GGML uses
+  34. The GGUF loader's table stays separate for the same reason: it describes
+  GGML's wire format, and merging the two is what would erase that difference.
 
 ---
 
