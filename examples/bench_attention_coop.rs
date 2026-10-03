@@ -98,12 +98,54 @@ fn feeds(s: &Shape) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
 ///
 /// Independent of the device by construction: it shares no code with the WGSL,
 /// so an error against it is the kernel's, not a bug in a shared helper.
+/// Which operands to round to f16 before computing the reference.
+///
+/// Rounding inside the reference and subtracting from the true reference
+/// isolates how much of the kernel's error each operand accounts for, with no
+/// shader involved. If the kernel's measured error equals the sum of these, the
+/// f32 accumulation is contributing nothing and the whole error is input
+/// rounding — which is a different fix from tightening the accumulation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rounding {
+    None,
+    Q,
+    K,
+    V,
+    /// Q and K together: the pair whose product feeds `exp`.
+    Qk,
+    All,
+}
+
+impl Rounding {
+    fn rounds_q(self) -> bool {
+        matches!(self, Rounding::Q | Rounding::Qk | Rounding::All)
+    }
+
+    fn rounds_k(self) -> bool {
+        matches!(self, Rounding::K | Rounding::Qk | Rounding::All)
+    }
+
+    fn rounds_v(self) -> bool {
+        matches!(self, Rounding::V | Rounding::All)
+    }
+}
+
 fn reference(s: &Shape, q: &[f32], k: &[f32], v: &[f32]) -> Vec<f32> {
+    reference_with(s, q, k, v, Rounding::None)
+}
+
+/// Round through `f16`, the same conversion the shader's `f16(x)` performs.
+fn to_f16(x: f32) -> f32 {
+    half::f16::from_f32(x).to_f32()
+}
+
+fn reference_with(s: &Shape, q: &[f32], k: &[f32], v: &[f32], round: Rounding) -> Vec<f32> {
     let (qlen, kvlen, heads, kv_heads, hd) = *s;
     let qw = heads * hd;
     let kw = kv_heads * hd;
     let mut out = vec![0f64; qlen * qw];
     let scale = 1.0 / (hd as f64).sqrt();
+    let (rq, rk, rv) = (round.rounds_q(), round.rounds_k(), round.rounds_v());
 
     for h in 0..heads {
         let kvh = h * kv_heads / heads;
@@ -114,7 +156,11 @@ fn reference(s: &Shape, q: &[f32], k: &[f32], v: &[f32]) -> Vec<f32> {
                 .map(|j| {
                     let mut acc = 0f64;
                     for d in 0..hd {
-                        acc += (q[i * qw + h * hd + d] as f64) * (k[j * kw + kvh * hd + d] as f64);
+                        let qv = q[i * qw + h * hd + d] as f64;
+                        let kvd = k[j * kw + kvh * hd + d] as f64;
+                        let qv = if rq { to_f16(qv as f32) as f64 } else { qv };
+                        let kvd = if rk { to_f16(kvd as f32) as f64 } else { kvd };
+                        acc += qv * kvd;
                     }
                     acc * scale
                 })
@@ -129,13 +175,23 @@ fn reference(s: &Shape, q: &[f32], k: &[f32], v: &[f32]) -> Vec<f32> {
             for d in 0..hd {
                 let mut acc = 0f64;
                 for (j, &s) in scores.iter().enumerate() {
-                    acc += (s / sum) * (v[j * kw + kvh * hd + d] as f64);
+                    let vv = v[j * kw + kvh * hd + d] as f64;
+                    let vv = if rv { to_f16(vv as f32) as f64 } else { vv };
+                    acc += (s / sum) * vv;
                 }
                 out[i * qw + h * hd + d] = acc;
             }
         }
     }
     out.iter().map(|&x| x as f32).collect()
+}
+
+/// Worst absolute difference between two reference evaluations.
+fn ref_delta(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max)
 }
 
 /// One context for the whole process.
@@ -240,6 +296,15 @@ struct Row {
     worst_abs: f32,
     worst_f16: f32,
     exactly_f16: f64,
+    /// Worst error the reference produces when only that operand is rounded to
+    /// f16. These are the floor each operand sets, independent of any shader.
+    d_q: f32,
+    d_k: f32,
+    d_v: f32,
+    /// Q and K together: the pair whose product feeds `exp`, so their errors
+    /// are amplified by the softmax rather than averaged by it.
+    d_qk: f32,
+    d_all: f32,
 }
 
 fn run(g: &Graph, s: &Shape, feeds: &(Vec<f32>, Vec<f32>, Vec<f32>), coop: CoopPolicy) -> Row {
@@ -271,11 +336,20 @@ fn run(g: &Graph, s: &Shape, feeds: &(Vec<f32>, Vec<f32>, Vec<f32>), coop: CoopP
     session.read_output_by_index(0, &mut got);
     let want = reference(s, &feeds.0, &feeds.1, &feeds.2);
     let e = errors(&got, &want);
+    // Analytic decomposition: round each operand in the *reference* and see
+    // what that alone costs. No shader involved, so this is the floor the
+    // kernel is working against.
+    let analytic = |r| ref_delta(&reference_with(s, &feeds.0, &feeds.1, &feeds.2, r), &want);
     Row {
         time_ms: ms(fastest(times)),
         worst_abs: e.worst_abs,
         worst_f16: e.worst_f16,
         exactly_f16: e.exactly_f16,
+        d_q: analytic(Rounding::Q),
+        d_k: analytic(Rounding::K),
+        d_v: analytic(Rounding::V),
+        d_qk: analytic(Rounding::Qk),
+        d_all: analytic(Rounding::All),
     }
 }
 
@@ -310,9 +384,12 @@ fn main() {
             shape.0, shape.1, shape.2, shape.3, shape.4
         );
         println!(
-            "  {:<22} {:>9} {:>12} {:>12} {:>9}   {}",
-            "policy", "time_ms", "worst_abs", "f16(ref)", "exact_f16", "verdict"
+            "  {:<22} {:>9} {:>12} {:>12} {:>9}   verdict",
+            "policy", "time_ms", "worst_abs", "f16(ref)", "exact_f16"
         );
+        // `Auto` is the policy whose arithmetic is in question, so its row
+        // carries the attribution too.
+        let mut auto: Option<Row> = None;
         for (name, coop) in policies {
             let row = run(&g, &shape, &f, coop);
             // Equal to f16 precision means the difference is the rounding of the
@@ -330,6 +407,32 @@ fn main() {
                 row.worst_f16,
                 row.exactly_f16 * 100.0,
                 verdict
+            );
+            if name.starts_with("Auto") {
+                auto = Some(row);
+            }
+        }
+
+        // The attribution: round one operand at a time *in the reference* and
+        // see what that costs on its own. No shader is involved, so these are
+        // the floors the operands set — the error a perfect kernel would still
+        // have with f16 inputs.
+        if let Some(a) = auto {
+            println!(
+                "  {:<22} {:>10.3e} {:>10.3e} {:>10.3e} {:>10.3e} {:>10.3e}",
+                "reference floor:", a.d_q, a.d_k, a.d_v, a.d_qk, a.d_all
+            );
+            println!(
+                "  {:<22} {:<10} {:<10} {:<10} {:<10} {:>10}",
+                "attribution: (worst abs)", "Q", "K", "V", "Q+K", "all three"
+            );
+            println!(
+                "  {:<22} measured {:.3e} vs floor {:.3e}  ->  {:.0}% of it is the operands, {:.0}% is the kernel's own arithmetic",
+                "",
+                a.worst_abs,
+                a.d_all,
+                100.0 * a.d_all / a.worst_abs.max(1e-30),
+                100.0 * (a.worst_abs - a.d_all).max(0.0) / a.worst_abs.max(1e-30)
             );
         }
         println!();

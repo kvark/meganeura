@@ -1,5 +1,34 @@
 # Unreleased
 
+- The cooperative attention kernels rounded tensors to f16 that no cooperative
+  matrix instruction consumes, and the rounding survived to the output. Five
+  `attention` oracle cases failed on the RTX 5070 and passed on every other
+  adapter. This was never an accumulation problem: `coop_mat16x16<f32,C>`,
+  `local_o`, and the output store were all already f32. The f16 was workgroup
+  *staging*, and V is not an operand of any matrix instruction — the cooperative
+  matmul is QK^T only, so PV is a scalar loop that read back
+  `f32(shared_v[...])`, undoing a rounding the shader had just applied.
+  `examples/bench_attention_coop` measures the floor by rounding one operand at
+  a time in the f64 CPU reference and differencing against the exact evaluation:
+  the measured error equals the floor to three digits (2.360e-4 of 2.360e-4 at
+  head_dim 64), V alone accounts for essentially all of it, and Q and K together
+  cost 3-4x less because the softmax averages their error while a convex
+  combination does not cancel V's.
+  Three instances, all the same shape — a second copy of a tensor whose other
+  copy is the real cooperative operand, read only by scalar code:
+  `shared_v` in `flash_attention_coop`, `shared_k` in `flash_grad_q_coop`, and
+  `shared_q`/`shared_do` in `flash_grad_kv_coop`. All four arrays become `f32`;
+  every remaining `array<f16>` in workgroup memory feeds a `coopLoadT` or
+  `coopStoreT`. The forward was also inconsistent with its own non-cooperative
+  counterpart, which already staged V as `f32`.
+  Residual error is now 6.3e-5 to 1.09e-4, matching the analytic Q+K floor — the
+  part the hardware forces and nothing else. `CoopPolicy` is unchanged, no
+  tolerance was changed, and `Auto` still uses the cooperative matmul. All 17
+  attention cases pass and the suite is green on the RTX 5070 and the Intel
+  B570. New test `every_f16_workgroup_array_is_a_cooperative_operand` asserts the
+  invariant over the generated WGSL; it is structural rather than numeric because
+  most of these variants are unreachable without cooperative-matrix hardware.
+
 - `profile_windows::windowed_capture_times_every_dispatch_and_preserves_the_result`
   compared its output for bit equality, which fails on Intel with a ~2.7e-5
   relative drift — ordinary f32 accumulation over six layers, a few hundred ULP.
