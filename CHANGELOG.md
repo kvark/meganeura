@@ -1,5 +1,24 @@
 # Unreleased
 
+- `bind_dispatch` was one 58-arm match over `ShaderEntry` and 1237 lines. It is
+  now a routing match plus eight family functions — `bind_matmul` (120 lines),
+  `bind_conv` (196), `bind_attention` (202), `bind_norm` (195),
+  `bind_activation` (78), `bind_reduction` (58), `bind_loss` (48) and
+  `bind_pointwise` (203) — with `bind_dispatch` itself at 333.
+
+  The routing match is the only exhaustive one and deliberately has no wildcard
+  arm, so a new `ShaderEntry` variant fails to compile at the routing decision
+  instead of reaching some family's inner match and landing in its
+  `unreachable!` at runtime. Each family's inner match keeps a trailing
+  `unreachable!`, so a routing arm that drifts from its family is caught by the
+  first test that reaches it.
+
+  Splitting it does not make it faster and was not sold as such: timing
+  `bind_dispatch` per shader entry across the `bench_step_cpu` sweep gives
+  138-174 ns for every entry with no hot arm, so the 187 ns that is 28% of the
+  host path is the binding model, not one arm. The sequence of 65 `pc.bind` calls
+  is byte-identical before and after.
+
 - `bind_dispatch`'s contraction arms now read `(m, n, k)` through
   `Dispatch::mnk()` instead of spelling out `params[0..3]` with a per-shader
   swap — thirteen sites, and the third copy of a rule that had already drifted

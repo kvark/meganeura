@@ -6842,25 +6842,33 @@ impl Session {
         u32::try_from(len).expect("optimizer parameter exceeds u32 element limit")
     }
 
+    /// Bind one dispatch's shader data.
+    ///
+    /// The arms live in one function per shader family (`bind_matmul`,
+    /// `bind_attention`, and so on) because a single 1200-line match over 58
+    /// arms is not navigable. The routing match here is the only exhaustive
+    /// one and it stays on purpose: a new `ShaderEntry` variant fails to
+    /// compile at the routing decision rather than reaching some family's
+    /// inner match and landing in its `unreachable!` at runtime.
     fn bind_dispatch(
         buffers: &[blade_graphics::BufferPiece],
         dispatch: &crate::compile::Dispatch,
         pc: &mut impl blade_graphics::traits::PipelineEncoder,
     ) {
         let buf = |r: BufferRef| buffers[r.0 as usize];
-        // `Dispatch::mnk` owns the `(m, n, k)` reinterpretation. The arms below
+        // `Dispatch::mnk` owns the `(m, n, k)` reinterpretation. The arms
         // used to spell out `params[0..3]` with a per-shader swap, and three
-        // copies of that rule had drifted apart — see `Dispatch::mnk`.
+        // copies of that rule had drifted apart.
         //
         // A contraction shader missing from that table panics here, naming
-        // itself. That is the backstop for a newly added one: `mnk`'s unit test
-        // only covers the shaders its own table names, so it cannot detect a
-        // shader the table forgot. This can, and does, immediately.
+        // itself. That is the backstop for a newly added one: `mnk`'s unit
+        // test only covers the shaders its own table names, so it cannot
+        // detect a shader the table forgot. This can, and does, immediately.
         let mnk = |d: &crate::compile::Dispatch| match d.mnk() {
             Some(shape) => shape,
             None => panic!(
-                "Dispatch::mnk has no (m, n, k) for {:?}. Either it is not a \\
-                 contraction, or it is one that was added without a row in the \\
+                "Dispatch::mnk has no (m, n, k) for {:?}. Either it is not a \
+                 contraction, or it is one that was added without a row in the \
                  table — add it there and to the test alongside it.",
                 d.shader
             ),
@@ -6873,7 +6881,7 @@ impl Session {
             }
             pieces.push(buf(dispatch.output_buffer));
             pieces.extend(dispatch.extra_outputs.iter().map(|&r| buf(r)));
-            let (m, n, k) = dispatch.mnk().expect("horizontal batch is a contraction");
+            let (m, n, k) = mnk(dispatch);
             pc.bind(
                 0,
                 &HorizMatMulData {
@@ -7028,9 +7036,7 @@ impl Session {
         // Only applies when use_coop is set AND a prologue is attached.
         if let Some(ref prologue) = dispatch.matmul_prologue {
             if dispatch.use_coop() && prologue.factors.len() == 2 {
-                let (m, n, k) = dispatch
-                    .mnk()
-                    .expect("a fused prologue is attached to a contraction");
+                let (m, n, k) = mnk(dispatch);
                 pc.bind(
                     0,
                     &MatMulPrologue2Data {
@@ -7050,6 +7056,149 @@ impl Session {
             ShaderEntry::Generated => {
                 unreachable!("generated kernels are bound by their kernel above")
             }
+            ShaderEntry::SgdUpdate | ShaderEntry::AdamUpdate => {
+                unreachable!("optimizer updates are encoded by the optimizer passes")
+            }
+            ShaderEntry::GradClipNormSq
+            | ShaderEntry::GradClipScale
+            | ShaderEntry::AdaptiveGradClip
+            | ShaderEntry::GradAccum => {
+                unreachable!(
+                    "Grad-clip/accum shaders are dispatched directly from step(), \
+                     not via bind_dispatch"
+                );
+            }
+            ShaderEntry::BlockMatMul | ShaderEntry::BlockMatMulAT | ShaderEntry::BlockMatMulBT => {
+                Session::bind_matmul(buffers, dispatch, pc)
+            }
+            ShaderEntry::MatMul | ShaderEntry::MatMulGemv => {
+                Session::bind_matmul(buffers, dispatch, pc)
+            }
+            ShaderEntry::MatMulAT | ShaderEntry::MatMulBT | ShaderEntry::MatMulGemvBT => {
+                Session::bind_matmul(buffers, dispatch, pc)
+            }
+            ShaderEntry::FusedMatMulAdd | ShaderEntry::MatMulGemvAdd => {
+                Session::bind_matmul(buffers, dispatch, pc)
+            }
+            ShaderEntry::FusedMatMulATAdd
+            | ShaderEntry::FusedMatMulBTAdd
+            | ShaderEntry::MatMulGemvBTAdd => Session::bind_matmul(buffers, dispatch, pc),
+            ShaderEntry::WinogradBatchedMatMul => Session::bind_matmul(buffers, dispatch, pc),
+            ShaderEntry::Conv2dDw => Session::bind_conv(buffers, dispatch, pc),
+            ShaderEntry::Conv2dGemm
+            | ShaderEntry::Conv2dGemmSmall
+            | ShaderEntry::Conv2dGemm16
+            | ShaderEntry::Conv2dGemmCoopGen(..) => Session::bind_conv(buffers, dispatch, pc),
+            ShaderEntry::Conv2dGradInputGemm
+            | ShaderEntry::Conv2dGradInputGemmSmall
+            | ShaderEntry::Conv2dGradInputGemm16
+            | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => {
+                Session::bind_conv(buffers, dispatch, pc)
+            }
+            ShaderEntry::Conv2dGradWeightGemm
+            | ShaderEntry::Conv2dGradWeightGemmSmall
+            | ShaderEntry::Conv2dGradWeightGemm16
+            | ShaderEntry::Conv2dGradWeightGemmSplit
+            | ShaderEntry::Conv2dGradWeightGemmSplitSmall
+            | ShaderEntry::Conv2dGradWeightGemmSplit16 => Session::bind_conv(buffers, dispatch, pc),
+            ShaderEntry::WinogradInputTransform
+            | ShaderEntry::WinogradOutputTransform
+            | ShaderEntry::WinogradWeightTransform => Session::bind_conv(buffers, dispatch, pc),
+            ShaderEntry::MaxPool2d => Session::bind_conv(buffers, dispatch, pc),
+            ShaderEntry::MaxPool2dGrad => Session::bind_conv(buffers, dispatch, pc),
+            ShaderEntry::GlobalAvgPool => Session::bind_conv(buffers, dispatch, pc),
+            ShaderEntry::GlobalAvgPoolGrad => Session::bind_conv(buffers, dispatch, pc),
+            ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => {
+                Session::bind_conv(buffers, dispatch, pc)
+            }
+            ShaderEntry::MultiHeadAttn
+            | ShaderEntry::FlashAttention
+            | ShaderEntry::FlashAttentionCoop => Session::bind_attention(buffers, dispatch, pc),
+            ShaderEntry::MultiHeadAttnGradKV
+            | ShaderEntry::FlashGradKV
+            | ShaderEntry::FlashGradKVCoop => Session::bind_attention(buffers, dispatch, pc),
+            ShaderEntry::MultiHeadAttnGradQ
+            | ShaderEntry::FlashGradQ
+            | ShaderEntry::FlashGradQCoop => Session::bind_attention(buffers, dispatch, pc),
+            ShaderEntry::CachedAttention | ShaderEntry::CachedQueryAttention => {
+                Session::bind_attention(buffers, dispatch, pc)
+            }
+            ShaderEntry::CachedBlockAttention | ShaderEntry::CachedBlockAttentionSplit => {
+                Session::bind_attention(buffers, dispatch, pc)
+            }
+            ShaderEntry::CachedBlockAttentionCombine => {
+                Session::bind_attention(buffers, dispatch, pc)
+            }
+            ShaderEntry::ChunkedRelativeAttention => Session::bind_attention(buffers, dispatch, pc),
+            ShaderEntry::PrefixLast => Session::bind_attention(buffers, dispatch, pc),
+            ShaderEntry::CacheWrite => Session::bind_attention(buffers, dispatch, pc),
+            ShaderEntry::CacheWritePrefix => Session::bind_attention(buffers, dispatch, pc),
+            ShaderEntry::RmsNormAdd => Session::bind_norm(buffers, dispatch, pc),
+            ShaderEntry::LayerNorm => Session::bind_norm(buffers, dispatch, pc),
+            ShaderEntry::RmsNormGradW
+            | ShaderEntry::RmsNormGradWRowPar
+            | ShaderEntry::RmsNormGradX => Session::bind_norm(buffers, dispatch, pc),
+            ShaderEntry::LayerNormGradWB | ShaderEntry::LayerNormGradX => {
+                Session::bind_norm(buffers, dispatch, pc)
+            }
+            ShaderEntry::RmsNormRsqrt => Session::bind_norm(buffers, dispatch, pc),
+            ShaderEntry::GroupNorm | ShaderEntry::GroupNormSilu => {
+                Session::bind_norm(buffers, dispatch, pc)
+            }
+            ShaderEntry::GroupNormStats => Session::bind_norm(buffers, dispatch, pc),
+            ShaderEntry::GroupNormApply => Session::bind_norm(buffers, dispatch, pc),
+            ShaderEntry::GroupNormGradInput
+            | ShaderEntry::GroupNormGradWeightBias
+            | ShaderEntry::GroupNormGradStats => Session::bind_norm(buffers, dispatch, pc),
+            ShaderEntry::SwiGLUConcat
+            | ShaderEntry::SwiGLUConcatGrad
+            | ShaderEntry::GeGLUConcat
+            | ShaderEntry::GeGLUConcatGrad => Session::bind_activation(buffers, dispatch, pc),
+            ShaderEntry::SwiGLUGradGate => Session::bind_activation(buffers, dispatch, pc),
+            ShaderEntry::SwiGLUGradUp => Session::bind_activation(buffers, dispatch, pc),
+            ShaderEntry::SiluGrad => Session::bind_activation(buffers, dispatch, pc),
+            ShaderEntry::PairwiseGrad => Session::bind_reduction(buffers, dispatch, pc),
+            ShaderEntry::SumAll | ShaderEntry::MeanAll => {
+                Session::bind_reduction(buffers, dispatch, pc)
+            }
+            ShaderEntry::SumRows => Session::bind_reduction(buffers, dispatch, pc),
+            ShaderEntry::CrossEntropyLoss => Session::bind_loss(buffers, dispatch, pc),
+            ShaderEntry::BceLoss => Session::bind_loss(buffers, dispatch, pc),
+            ShaderEntry::ToF16 => Session::bind_pointwise(buffers, dispatch, pc),
+            ShaderEntry::Transpose => Session::bind_pointwise(buffers, dispatch, pc),
+            ShaderEntry::Embedding => Session::bind_pointwise(buffers, dispatch, pc),
+            ShaderEntry::RoPE | ShaderEntry::RoPEGrad => {
+                Session::bind_pointwise(buffers, dispatch, pc)
+            }
+            ShaderEntry::RoPEDynamicFactors => Session::bind_pointwise(buffers, dispatch, pc),
+            ShaderEntry::RoPEDynamic | ShaderEntry::RoPEPositions => {
+                Session::bind_pointwise(buffers, dispatch, pc)
+            }
+            ShaderEntry::Concat => Session::bind_pointwise(buffers, dispatch, pc),
+            ShaderEntry::SplitA | ShaderEntry::SplitB => {
+                Session::bind_pointwise(buffers, dispatch, pc)
+            }
+            ShaderEntry::MulPerChannel => Session::bind_pointwise(buffers, dispatch, pc),
+            ShaderEntry::ScatterAdd => Session::bind_pointwise(buffers, dispatch, pc),
+            ShaderEntry::ScatterAddAtomic => Session::bind_pointwise(buffers, dispatch, pc),
+        }
+    }
+
+    /// Contraction kernels: the plain and fused forms, plus Winograd's
+    /// batched matmul. Every arm reads its shape through `Dispatch::mnk`, which
+    /// owns the `(m, n, k)` reinterpretation.
+    fn bind_matmul(
+        buffers: &[blade_graphics::BufferPiece],
+        dispatch: &crate::compile::Dispatch,
+        pc: &mut impl blade_graphics::traits::PipelineEncoder,
+    ) {
+        let buf = |r: BufferRef| buffers[r.0 as usize];
+        // See the note on `mnk` in `bind_dispatch`.
+        let mnk = |d: &crate::compile::Dispatch| match d.mnk() {
+            Some(shape) => shape,
+            None => panic!("Dispatch::mnk has no (m, n, k) for {:?}", d.shader),
+        };
+        match dispatch.shader {
             ShaderEntry::BlockMatMul | ShaderEntry::BlockMatMulAT | ShaderEntry::BlockMatMulBT => {
                 let (m, n, k) = mnk(dispatch);
                 pc.bind(
@@ -7139,201 +7288,13 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::ToF16 => {
+            ShaderEntry::WinogradBatchedMatMul => {
                 pc.bind(
                     0,
-                    &UnaryData {
-                        src: buf(dispatch.input_buffers[0]),
-                        dst: buf(dispatch.output_buffer),
-                        params: UnaryParams {
-                            len: dispatch.params[0],
-                            _pad0: 0,
-                            _pad1: 0,
-                            _pad2: 0,
-                        },
-                    },
-                );
-            }
-            ShaderEntry::SwiGLUConcat
-            | ShaderEntry::SwiGLUConcatGrad
-            | ShaderEntry::GeGLUConcat
-            | ShaderEntry::GeGLUConcatGrad => {
-                pc.bind(
-                    0,
-                    &BinaryData {
-                        src_a: buf(dispatch.input_buffers[0]),
-                        src_b: buf(dispatch.input_buffers[1]),
-                        dst: buf(dispatch.output_buffer),
-                        params: UnaryParams {
-                            len: dispatch.params[0],
-                            _pad0: dispatch.params[1], // half_n
-                            _pad1: 0,
-                            _pad2: 0,
-                        },
-                    },
-                );
-            }
-            ShaderEntry::PairwiseGrad => {
-                pc.bind(
-                    0,
-                    &TernaryData {
-                        src_a: buf(dispatch.input_buffers[0]),
-                        src_b: buf(dispatch.input_buffers[1]),
-                        src_c: buf(dispatch.input_buffers[2]),
-                        dst: buf(dispatch.output_buffer),
-                        params: UnaryParams {
-                            len: dispatch.params[0],
-                            _pad0: dispatch.params[1],
-                            _pad1: dispatch.params[2],
-                            _pad2: dispatch.params[3],
-                        },
-                    },
-                );
-            }
-            ShaderEntry::SumAll | ShaderEntry::MeanAll => {
-                pc.bind(
-                    0,
-                    &UnaryData {
-                        src: buf(dispatch.input_buffers[0]),
-                        dst: buf(dispatch.output_buffer),
-                        params: UnaryParams {
-                            len: dispatch.params[0],
-                            _pad0: dispatch.params.get(1).copied().unwrap_or(0), // mean divisor
-                            _pad1: 0,
-                            _pad2: 0,
-                        },
-                    },
-                );
-            }
-            ShaderEntry::SumRows => {
-                // Rows, columns, and optional serial-row layout.
-                pc.bind(
-                    0,
-                    &UnaryData {
-                        src: buf(dispatch.input_buffers[0]),
-                        dst: buf(dispatch.output_buffer),
-                        params: UnaryParams {
-                            len: dispatch.params[0],   // m
-                            _pad0: dispatch.params[1], // n
-                            _pad1: dispatch.params.get(2).copied().unwrap_or(0),
-                            _pad2: dispatch.params.get(3).copied().unwrap_or(0),
-                        },
-                    },
-                );
-            }
-            ShaderEntry::CrossEntropyLoss => {
-                let loss_buf = dispatch
-                    .extra_outputs
-                    .first()
-                    .copied()
-                    .unwrap_or(dispatch.output_buffer);
-                pc.bind(
-                    0,
-                    &CrossEntropyData {
-                        logits: buf(dispatch.input_buffers[0]),
-                        labels: buf(dispatch.input_buffers[1]),
-                        grad_out: buf(dispatch.output_buffer),
-                        loss_out: buf(loss_buf),
-                        params: SoftmaxParams {
-                            batch: dispatch.params[0],
-                            features: dispatch.params[1],
-                            _pad0: dispatch.params.get(2).copied().unwrap_or(0),
-                            _pad1: 0,
-                        },
-                    },
-                );
-            }
-            ShaderEntry::BceLoss => {
-                pc.bind(
-                    0,
-                    &BceData {
-                        pred: buf(dispatch.input_buffers[0]),
-                        labels: buf(dispatch.input_buffers[1]),
-                        loss_out: buf(dispatch.output_buffer),
-                        params: UnaryParams {
-                            len: dispatch.params[0],
-                            _pad0: 0,
-                            _pad1: 0,
-                            _pad2: 0,
-                        },
-                    },
-                );
-            }
-            ShaderEntry::Transpose => {
-                pc.bind(
-                    0,
-                    &TransposeData {
-                        src: buf(dispatch.input_buffers[0]),
-                        dst: buf(dispatch.output_buffer),
-                        params: TransposeParams {
-                            m: dispatch.params[0],
-                            n: dispatch.params[1],
-                            _pad0: 0,
-                            _pad1: 0,
-                        },
-                    },
-                );
-            }
-            ShaderEntry::RmsNormAdd => {
-                pc.bind(
-                    0,
-                    &RmsNormAddData {
-                        src: buf(dispatch.input_buffers[0]),
-                        bias: buf(dispatch.input_buffers[1]),
-                        residual: buf(dispatch.input_buffers[2]),
-                        dst: buf(dispatch.output_buffer),
-                        params: BiasAddParams {
-                            len: dispatch.params[0],
-                            bias_len: dispatch.params[1],
-                            _pad0: dispatch.params[2], // eps_bits
-                            _pad1: 0,
-                        },
-                    },
-                );
-            }
-            ShaderEntry::Embedding => {
-                pc.bind(
-                    0,
-                    &EmbeddingData {
-                        indices: buf(dispatch.input_buffers[0]),
-                        src: buf(dispatch.input_buffers[1]),
-                        dst: buf(dispatch.output_buffer),
-                        params: UnaryParams {
-                            len: dispatch.params[0],
-                            _pad0: dispatch.params[1],
-                            _pad1: 0,
-                            _pad2: 0,
-                        },
-                    },
-                );
-            }
-            ShaderEntry::RoPE | ShaderEntry::RoPEGrad => {
-                pc.bind(
-                    0,
-                    &RoPEData {
-                        src: buf(dispatch.input_buffers[0]),
-                        dst: buf(dispatch.output_buffer),
-                        params: RoPEParams {
-                            seq: dispatch.params[0],
-                            dim: dispatch.params[1],
-                            theta_bits: dispatch.params[2],
-                            pos_offset: dispatch.params[3],
-                            head_dim: dispatch.params[4],
-                            _pad0: 0,
-                            _pad1: 0,
-                            _pad2: 0,
-                        },
-                    },
-                );
-            }
-            ShaderEntry::LayerNorm => {
-                pc.bind(
-                    0,
-                    &LayerNormData {
-                        src: buf(dispatch.input_buffers[0]),
-                        src_b: buf(dispatch.input_buffers[1]),
-                        bias: buf(dispatch.input_buffers[2]),
-                        dst: buf(dispatch.output_buffer),
+                    &MatMulData {
+                        matrix_a: buf(dispatch.input_buffers[0]),
+                        matrix_b: buf(dispatch.input_buffers[1]),
+                        matrix_c: buf(dispatch.output_buffer),
                         params: MatMulParams {
                             m: dispatch.params[0],
                             n: dispatch.params[1],
@@ -7343,6 +7304,219 @@ impl Session {
                     },
                 );
             }
+            _ => unreachable!("bind_matmul is reached only for its own shaders"),
+        }
+    }
+
+    /// Convolution and pooling, forward and backward, including the Winograd
+    /// transforms. The GEMM forms carry a `..` in their pattern because their
+    /// parameters differ; only the binding layout is shared.
+    fn bind_conv(
+        buffers: &[blade_graphics::BufferPiece],
+        dispatch: &crate::compile::Dispatch,
+        pc: &mut impl blade_graphics::traits::PipelineEncoder,
+    ) {
+        let buf = |r: BufferRef| buffers[r.0 as usize];
+        match dispatch.shader {
+            ShaderEntry::Conv2dDw => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &Conv2dDwData {
+                        src: buf(dispatch.input_buffers[0]),
+                        weight: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: Conv2dDwParams {
+                            batch: p[0],
+                            channels: p[1],
+                            in_h: p[2],
+                            in_w: p[3],
+                            kernel_h: p[4],
+                            kernel_w: p[5],
+                            stride: p[6],
+                            padding_h: p[7],
+                            out_h: p[8],
+                            out_w: p[9],
+                            padding_w: p[10],
+                            _pad: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::Conv2dGemm
+            | ShaderEntry::Conv2dGemmSmall
+            | ShaderEntry::Conv2dGemm16
+            | ShaderEntry::Conv2dGemmCoopGen(..) => {
+                pc.bind(
+                    0,
+                    &Conv2dData {
+                        src: buf(dispatch.input_buffers[0]),
+                        weight: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: Conv2dParams::from(dispatch),
+                    },
+                );
+            }
+            ShaderEntry::Conv2dGradInputGemm
+            | ShaderEntry::Conv2dGradInputGemmSmall
+            | ShaderEntry::Conv2dGradInputGemm16
+            | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => {
+                pc.bind(
+                    0,
+                    &Conv2dGradInputData {
+                        grad_out: buf(dispatch.input_buffers[0]),
+                        weight: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: Conv2dParams::from(dispatch),
+                    },
+                );
+            }
+            ShaderEntry::Conv2dGradWeightGemm
+            | ShaderEntry::Conv2dGradWeightGemmSmall
+            | ShaderEntry::Conv2dGradWeightGemm16
+            | ShaderEntry::Conv2dGradWeightGemmSplit
+            | ShaderEntry::Conv2dGradWeightGemmSplitSmall
+            | ShaderEntry::Conv2dGradWeightGemmSplit16 => {
+                pc.bind(
+                    0,
+                    &Conv2dGradWeightData {
+                        grad_out: buf(dispatch.input_buffers[0]),
+                        src: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: Conv2dParams::from(dispatch),
+                    },
+                );
+            }
+            ShaderEntry::WinogradInputTransform
+            | ShaderEntry::WinogradOutputTransform
+            | ShaderEntry::WinogradWeightTransform => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &WinogradTransformData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: WinogradTransformParams {
+                            p0: p[0],
+                            p1: p[1],
+                            p2: p[2],
+                            p3: p[3],
+                            p4: p[4],
+                            p5: p[5],
+                            p6: p[6],
+                            p7: p[7],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::MaxPool2d => {
+                pc.bind(
+                    0,
+                    &MaxPool2dData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: MaxPool2dParams {
+                            batch: dispatch.params[0],
+                            channels: dispatch.params[1],
+                            in_h: dispatch.params[2],
+                            in_w: dispatch.params[3],
+                            kernel_h: dispatch.params[4],
+                            kernel_w: dispatch.params[5],
+                            stride: dispatch.params[6],
+                            padding: dispatch.params[7],
+                            out_h: dispatch.params[8],
+                            out_w: dispatch.params[9],
+                            _pad0: dispatch.params[10],
+                            _pad1: dispatch.params[11],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::MaxPool2dGrad => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &MaxPool2dGradData {
+                        grad_out: buf(dispatch.input_buffers[0]),
+                        src: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: MaxPool2dParams {
+                            batch: p[0],
+                            channels: p[1],
+                            in_h: p[2],
+                            in_w: p[3],
+                            kernel_h: p[4],
+                            kernel_w: p[5],
+                            stride: p[6],
+                            padding: p[7],
+                            out_h: p[8],
+                            out_w: p[9],
+                            _pad0: p[10],
+                            _pad1: p[11],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::GlobalAvgPool => {
+                pc.bind(
+                    0,
+                    &GlobalAvgPoolData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: GlobalAvgPoolParams {
+                            channels: dispatch.params[0],
+                            spatial: dispatch.params[1],
+                            total_out: dispatch.params[2],
+                            _pad: dispatch.params[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::GlobalAvgPoolGrad => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &UnaryData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: p[0],
+                            _pad0: p[1],
+                            _pad1: p[2],
+                            _pad2: p[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &UnaryData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: p[0],
+                            _pad0: p[1],
+                            _pad1: p[2],
+                            _pad2: p[3],
+                        },
+                    },
+                );
+            }
+            _ => unreachable!("bind_conv is reached only for its own shaders"),
+        }
+    }
+
+    /// Attention forward, both gradients, the cached variants, and the
+    /// chunked-relative and prefix-last forms decoded alongside them.
+    fn bind_attention(
+        buffers: &[blade_graphics::BufferPiece],
+        dispatch: &crate::compile::Dispatch,
+        pc: &mut impl blade_graphics::traits::PipelineEncoder,
+    ) {
+        let buf = |r: BufferRef| buffers[r.0 as usize];
+        match dispatch.shader {
             ShaderEntry::MultiHeadAttn
             | ShaderEntry::FlashAttention
             | ShaderEntry::FlashAttentionCoop => {
@@ -7420,16 +7594,65 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::SwiGLUGradGate => {
+            ShaderEntry::CachedAttention | ShaderEntry::CachedQueryAttention => {
                 pc.bind(
                     0,
-                    &TernaryData {
-                        src_a: buf(dispatch.input_buffers[0]), // grad_out
-                        src_b: buf(dispatch.input_buffers[1]), // gate
-                        src_c: buf(dispatch.input_buffers[2]), // up
+                    &CachedAttentionData {
+                        src_a: buf(dispatch.input_buffers[0]),      // Q
+                        src_b: buf(dispatch.input_buffers[1]),      // K cache
+                        bias: buf(dispatch.input_buffers[2]),       // V cache
+                        kv_pos_buf: buf(dispatch.input_buffers[3]), // kv_pos
                         dst: buf(dispatch.output_buffer),
-                        params: UnaryParams {
-                            len: dispatch.params[0],
+                        params: MatMulParams {
+                            m: dispatch.params[0],
+                            n: dispatch.params[1],
+                            k: dispatch.params[2],
+                            _pad: dispatch.params[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::CachedBlockAttention | ShaderEntry::CachedBlockAttentionSplit => {
+                pc.bind(
+                    0,
+                    &CachedBlockAttentionData {
+                        src_a: buf(dispatch.input_buffers[0]),
+                        src_b: buf(dispatch.input_buffers[1]),
+                        bias: buf(dispatch.input_buffers[2]),
+                        kv_pos_buf: buf(dispatch.input_buffers[3]),
+                        valid_len_buf: buf(dispatch.input_buffers[4]),
+                        dst: buf(dispatch.output_buffer),
+                        params: CachedBlockAttentionParams::from_words(&dispatch.params)
+                            .expect("cached attention parameter layout"),
+                    },
+                );
+            }
+            ShaderEntry::CachedBlockAttentionCombine => {
+                pc.bind(
+                    0,
+                    &CachedBlockAttentionCombineData {
+                        partials: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: CachedBlockAttentionParams::from_words(&dispatch.params)
+                            .expect("cached attention parameter layout"),
+                    },
+                );
+            }
+            ShaderEntry::ChunkedRelativeAttention => {
+                pc.bind(
+                    0,
+                    &ChunkedRelativeAttentionData {
+                        src_a: buf(dispatch.input_buffers[0]),
+                        src_b: buf(dispatch.input_buffers[1]),
+                        bias: buf(dispatch.input_buffers[2]),
+                        relative_k: buf(dispatch.input_buffers[3]),
+                        dst: buf(dispatch.output_buffer),
+                        params: ChunkedRelativeAttentionParams {
+                            seq_len: dispatch.params[0],
+                            num_heads: dispatch.params[1],
+                            head_dim: dispatch.params[2],
+                            left_context: dispatch.params[3],
+                            softcap_bits: dispatch.params[4],
                             _pad0: 0,
                             _pad1: 0,
                             _pad2: 0,
@@ -7437,15 +7660,31 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::SwiGLUGradUp => {
+            ShaderEntry::PrefixLast => {
                 pc.bind(
                     0,
-                    &BinaryData {
-                        src_a: buf(dispatch.input_buffers[0]), // grad_out
-                        src_b: buf(dispatch.input_buffers[1]), // gate
+                    &PrefixLastData {
+                        src: buf(dispatch.input_buffers[0]),
+                        valid_len_buf: buf(dispatch.input_buffers[1]),
                         dst: buf(dispatch.output_buffer),
+                        params: MatMulParams {
+                            m: dispatch.params[0],
+                            n: dispatch.params[1],
+                            k: 0,
+                            _pad: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::CacheWrite => {
+                pc.bind(
+                    0,
+                    &CacheWriteData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        kv_pos_buf: buf(dispatch.input_buffers[2]),
                         params: UnaryParams {
-                            len: dispatch.params[0],
+                            len: dispatch.params[0], // dim
                             _pad0: 0,
                             _pad1: 0,
                             _pad2: 0,
@@ -7453,18 +7692,66 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::SiluGrad => {
+            ShaderEntry::CacheWritePrefix => {
                 pc.bind(
                     0,
-                    &BinaryData {
-                        src_a: buf(dispatch.input_buffers[0]), // grad_out
-                        src_b: buf(dispatch.input_buffers[1]), // x
+                    &CacheWritePrefixData {
+                        src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
-                        params: UnaryParams {
+                        kv_pos_buf: buf(dispatch.input_buffers[2]),
+                        valid_len_buf: buf(dispatch.input_buffers[3]),
+                        params: MatMulParams {
+                            m: dispatch.params[0],
+                            n: dispatch.params[1],
+                            k: dispatch.params[2],
+                            _pad: dispatch.params[3],
+                        },
+                    },
+                );
+            }
+            _ => unreachable!("bind_attention is reached only for its own shaders"),
+        }
+    }
+
+    /// Normalisation and its gradients. GroupNorm is four dispatches — stats,
+    /// apply, and two gradient halves — rather than one.
+    fn bind_norm(
+        buffers: &[blade_graphics::BufferPiece],
+        dispatch: &crate::compile::Dispatch,
+        pc: &mut impl blade_graphics::traits::PipelineEncoder,
+    ) {
+        let buf = |r: BufferRef| buffers[r.0 as usize];
+        match dispatch.shader {
+            ShaderEntry::RmsNormAdd => {
+                pc.bind(
+                    0,
+                    &RmsNormAddData {
+                        src: buf(dispatch.input_buffers[0]),
+                        bias: buf(dispatch.input_buffers[1]),
+                        residual: buf(dispatch.input_buffers[2]),
+                        dst: buf(dispatch.output_buffer),
+                        params: BiasAddParams {
                             len: dispatch.params[0],
-                            _pad0: 0,
+                            bias_len: dispatch.params[1],
+                            _pad0: dispatch.params[2], // eps_bits
                             _pad1: 0,
-                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::LayerNorm => {
+                pc.bind(
+                    0,
+                    &LayerNormData {
+                        src: buf(dispatch.input_buffers[0]),
+                        src_b: buf(dispatch.input_buffers[1]),
+                        bias: buf(dispatch.input_buffers[2]),
+                        dst: buf(dispatch.output_buffer),
+                        params: MatMulParams {
+                            m: dispatch.params[0],
+                            n: dispatch.params[1],
+                            k: dispatch.params[2],
+                            _pad: dispatch.params[3],
                         },
                     },
                 );
@@ -7517,55 +7804,6 @@ impl Session {
                             _pad0: dispatch.params[1],
                             _pad1: dispatch.params[2],
                             _pad2: dispatch.params[3],
-                        },
-                    },
-                );
-            }
-            ShaderEntry::SgdUpdate | ShaderEntry::AdamUpdate => {
-                unreachable!("optimizer updates are encoded by the optimizer passes")
-            }
-            ShaderEntry::GradClipNormSq
-            | ShaderEntry::GradClipScale
-            | ShaderEntry::AdaptiveGradClip
-            | ShaderEntry::GradAccum => {
-                unreachable!(
-                    "Grad-clip/accum shaders are dispatched directly from step(), \
-                     not via bind_dispatch"
-                );
-            }
-            ShaderEntry::ScatterAdd => {
-                pc.bind(
-                    0,
-                    &ScatterAddData {
-                        indices: buf(dispatch.input_buffers[0]),
-                        src: buf(dispatch.input_buffers[1]),
-                        dst: buf(dispatch.output_buffer),
-                        params: ScatterAddParams {
-                            total: dispatch.params[0],
-                            seq_len: dispatch.params[1],
-                            embed_dim: dispatch.params[2],
-                            _pad: 0,
-                        },
-                    },
-                );
-            }
-            ShaderEntry::ScatterAddAtomic => {
-                pc.bind(
-                    0,
-                    &ScatterAddAtomicData {
-                        indices: buf(dispatch.input_buffers[0]),
-                        src: buf(dispatch.input_buffers[1]),
-                        row_scale: buf(dispatch
-                            .input_buffers
-                            .get(2)
-                            .copied()
-                            .unwrap_or(dispatch.input_buffers[1])),
-                        dst: buf(dispatch.output_buffer),
-                        params: ScatterAddParams {
-                            total: dispatch.params[0],
-                            seq_len: dispatch.params[1],
-                            embed_dim: dispatch.params[2],
-                            _pad: dispatch.params[3],
                         },
                     },
                 );
@@ -7669,8 +7907,23 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::Concat => {
-                let p = &dispatch.params;
+            _ => unreachable!("bind_norm is reached only for its own shaders"),
+        }
+    }
+
+    /// Fused activation blocks and their gradients: the SwiGLU and GeGLU concat
+    /// forms plus the separate gate and up gradients.
+    fn bind_activation(
+        buffers: &[blade_graphics::BufferPiece],
+        dispatch: &crate::compile::Dispatch,
+        pc: &mut impl blade_graphics::traits::PipelineEncoder,
+    ) {
+        let buf = |r: BufferRef| buffers[r.0 as usize];
+        match dispatch.shader {
+            ShaderEntry::SwiGLUConcat
+            | ShaderEntry::SwiGLUConcatGrad
+            | ShaderEntry::GeGLUConcat
+            | ShaderEntry::GeGLUConcatGrad => {
                 pc.bind(
                     0,
                     &BinaryData {
@@ -7678,129 +7931,250 @@ impl Session {
                         src_b: buf(dispatch.input_buffers[1]),
                         dst: buf(dispatch.output_buffer),
                         params: UnaryParams {
-                            len: p[0],
-                            _pad0: p[1],
-                            _pad1: p[2],
-                            _pad2: p[3],
+                            len: dispatch.params[0],
+                            _pad0: dispatch.params[1], // half_n
+                            _pad1: 0,
+                            _pad2: 0,
                         },
                     },
                 );
             }
-            ShaderEntry::SplitA | ShaderEntry::SplitB => {
-                let p = &dispatch.params;
+            ShaderEntry::SwiGLUGradGate => {
+                pc.bind(
+                    0,
+                    &TernaryData {
+                        src_a: buf(dispatch.input_buffers[0]), // grad_out
+                        src_b: buf(dispatch.input_buffers[1]), // gate
+                        src_c: buf(dispatch.input_buffers[2]), // up
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::SwiGLUGradUp => {
+                pc.bind(
+                    0,
+                    &BinaryData {
+                        src_a: buf(dispatch.input_buffers[0]), // grad_out
+                        src_b: buf(dispatch.input_buffers[1]), // gate
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::SiluGrad => {
+                pc.bind(
+                    0,
+                    &BinaryData {
+                        src_a: buf(dispatch.input_buffers[0]), // grad_out
+                        src_b: buf(dispatch.input_buffers[1]), // x
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            _ => unreachable!("bind_activation is reached only for its own shaders"),
+        }
+    }
+
+    /// Whole-tensor and per-row reductions, and the pairwise gradient that
+    /// closes them out.
+    fn bind_reduction(
+        buffers: &[blade_graphics::BufferPiece],
+        dispatch: &crate::compile::Dispatch,
+        pc: &mut impl blade_graphics::traits::PipelineEncoder,
+    ) {
+        let buf = |r: BufferRef| buffers[r.0 as usize];
+        match dispatch.shader {
+            ShaderEntry::PairwiseGrad => {
+                pc.bind(
+                    0,
+                    &TernaryData {
+                        src_a: buf(dispatch.input_buffers[0]),
+                        src_b: buf(dispatch.input_buffers[1]),
+                        src_c: buf(dispatch.input_buffers[2]),
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: dispatch.params[1],
+                            _pad1: dispatch.params[2],
+                            _pad2: dispatch.params[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::SumAll | ShaderEntry::MeanAll => {
                 pc.bind(
                     0,
                     &UnaryData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
                         params: UnaryParams {
-                            len: p[0],
-                            _pad0: p[1],
-                            _pad1: p[2],
-                            _pad2: p[3],
+                            len: dispatch.params[0],
+                            _pad0: dispatch.params.get(1).copied().unwrap_or(0), // mean divisor
+                            _pad1: 0,
+                            _pad2: 0,
                         },
                     },
                 );
             }
-            ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => {
-                let p = &dispatch.params;
+            ShaderEntry::SumRows => {
+                // Rows, columns, and optional serial-row layout.
                 pc.bind(
                     0,
                     &UnaryData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
                         params: UnaryParams {
-                            len: p[0],
-                            _pad0: p[1],
-                            _pad1: p[2],
-                            _pad2: p[3],
+                            len: dispatch.params[0],   // m
+                            _pad0: dispatch.params[1], // n
+                            _pad1: dispatch.params.get(2).copied().unwrap_or(0),
+                            _pad2: dispatch.params.get(3).copied().unwrap_or(0),
                         },
                     },
                 );
             }
-            ShaderEntry::MulPerChannel => {
-                let p = &dispatch.params;
+            _ => unreachable!("bind_reduction is reached only for its own shaders"),
+        }
+    }
+
+    /// The two loss kernels. Both read the same `len` parameter and differ only
+    /// in what they do with it.
+    fn bind_loss(
+        buffers: &[blade_graphics::BufferPiece],
+        dispatch: &crate::compile::Dispatch,
+        pc: &mut impl blade_graphics::traits::PipelineEncoder,
+    ) {
+        let buf = |r: BufferRef| buffers[r.0 as usize];
+        match dispatch.shader {
+            ShaderEntry::CrossEntropyLoss => {
+                let loss_buf = dispatch
+                    .extra_outputs
+                    .first()
+                    .copied()
+                    .unwrap_or(dispatch.output_buffer);
                 pc.bind(
                     0,
-                    &MulPerChannelData {
+                    &CrossEntropyData {
+                        logits: buf(dispatch.input_buffers[0]),
+                        labels: buf(dispatch.input_buffers[1]),
+                        grad_out: buf(dispatch.output_buffer),
+                        loss_out: buf(loss_buf),
+                        params: SoftmaxParams {
+                            batch: dispatch.params[0],
+                            features: dispatch.params[1],
+                            _pad0: dispatch.params.get(2).copied().unwrap_or(0),
+                            _pad1: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::BceLoss => {
+                pc.bind(
+                    0,
+                    &BceData {
+                        pred: buf(dispatch.input_buffers[0]),
+                        labels: buf(dispatch.input_buffers[1]),
+                        loss_out: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            _ => unreachable!("bind_loss is reached only for its own shaders"),
+        }
+    }
+
+    /// Everything elementwise or layout-only: casts, transposes, RoPE,
+    /// concatenation, embedding gather, and the scatter-add gradients.
+    fn bind_pointwise(
+        buffers: &[blade_graphics::BufferPiece],
+        dispatch: &crate::compile::Dispatch,
+        pc: &mut impl blade_graphics::traits::PipelineEncoder,
+    ) {
+        let buf = |r: BufferRef| buffers[r.0 as usize];
+        match dispatch.shader {
+            ShaderEntry::ToF16 => {
+                pc.bind(
+                    0,
+                    &UnaryData {
                         src: buf(dispatch.input_buffers[0]),
-                        gate: buf(dispatch.input_buffers[1]),
                         dst: buf(dispatch.output_buffer),
-                        params: MulPerChannelParams {
-                            len: p[0],
-                            spatial: p[1],
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::Transpose => {
+                pc.bind(
+                    0,
+                    &TransposeData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: TransposeParams {
+                            m: dispatch.params[0],
+                            n: dispatch.params[1],
                             _pad0: 0,
                             _pad1: 0,
                         },
                     },
                 );
             }
-            ShaderEntry::Conv2dDw => {
-                let p = &dispatch.params;
+            ShaderEntry::Embedding => {
                 pc.bind(
                     0,
-                    &Conv2dDwData {
-                        src: buf(dispatch.input_buffers[0]),
-                        weight: buf(dispatch.input_buffers[1]),
+                    &EmbeddingData {
+                        indices: buf(dispatch.input_buffers[0]),
+                        src: buf(dispatch.input_buffers[1]),
                         dst: buf(dispatch.output_buffer),
-                        params: Conv2dDwParams {
-                            batch: p[0],
-                            channels: p[1],
-                            in_h: p[2],
-                            in_w: p[3],
-                            kernel_h: p[4],
-                            kernel_w: p[5],
-                            stride: p[6],
-                            padding_h: p[7],
-                            out_h: p[8],
-                            out_w: p[9],
-                            padding_w: p[10],
-                            _pad: 0,
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: dispatch.params[1],
+                            _pad1: 0,
+                            _pad2: 0,
                         },
                     },
                 );
             }
-            ShaderEntry::Conv2dGemm
-            | ShaderEntry::Conv2dGemmSmall
-            | ShaderEntry::Conv2dGemm16
-            | ShaderEntry::Conv2dGemmCoopGen(..) => {
+            ShaderEntry::RoPE | ShaderEntry::RoPEGrad => {
                 pc.bind(
                     0,
-                    &Conv2dData {
+                    &RoPEData {
                         src: buf(dispatch.input_buffers[0]),
-                        weight: buf(dispatch.input_buffers[1]),
                         dst: buf(dispatch.output_buffer),
-                        params: Conv2dParams::from(dispatch),
-                    },
-                );
-            }
-            ShaderEntry::Conv2dGradInputGemm
-            | ShaderEntry::Conv2dGradInputGemmSmall
-            | ShaderEntry::Conv2dGradInputGemm16
-            | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => {
-                pc.bind(
-                    0,
-                    &Conv2dGradInputData {
-                        grad_out: buf(dispatch.input_buffers[0]),
-                        weight: buf(dispatch.input_buffers[1]),
-                        dst: buf(dispatch.output_buffer),
-                        params: Conv2dParams::from(dispatch),
-                    },
-                );
-            }
-            ShaderEntry::Conv2dGradWeightGemm
-            | ShaderEntry::Conv2dGradWeightGemmSmall
-            | ShaderEntry::Conv2dGradWeightGemm16
-            | ShaderEntry::Conv2dGradWeightGemmSplit
-            | ShaderEntry::Conv2dGradWeightGemmSplitSmall
-            | ShaderEntry::Conv2dGradWeightGemmSplit16 => {
-                pc.bind(
-                    0,
-                    &Conv2dGradWeightData {
-                        grad_out: buf(dispatch.input_buffers[0]),
-                        src: buf(dispatch.input_buffers[1]),
-                        dst: buf(dispatch.output_buffer),
-                        params: Conv2dParams::from(dispatch),
+                        params: RoPEParams {
+                            seq: dispatch.params[0],
+                            dim: dispatch.params[1],
+                            theta_bits: dispatch.params[2],
+                            pos_offset: dispatch.params[3],
+                            head_dim: dispatch.params[4],
+                            _pad0: 0,
+                            _pad1: 0,
+                            _pad2: 0,
+                        },
                     },
                 );
             }
@@ -7845,185 +8219,24 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::CacheWrite => {
-                pc.bind(
-                    0,
-                    &CacheWriteData {
-                        src: buf(dispatch.input_buffers[0]),
-                        dst: buf(dispatch.output_buffer),
-                        kv_pos_buf: buf(dispatch.input_buffers[2]),
-                        params: UnaryParams {
-                            len: dispatch.params[0], // dim
-                            _pad0: 0,
-                            _pad1: 0,
-                            _pad2: 0,
-                        },
-                    },
-                );
-            }
-            ShaderEntry::CacheWritePrefix => {
-                pc.bind(
-                    0,
-                    &CacheWritePrefixData {
-                        src: buf(dispatch.input_buffers[0]),
-                        dst: buf(dispatch.output_buffer),
-                        kv_pos_buf: buf(dispatch.input_buffers[2]),
-                        valid_len_buf: buf(dispatch.input_buffers[3]),
-                        params: MatMulParams {
-                            m: dispatch.params[0],
-                            n: dispatch.params[1],
-                            k: dispatch.params[2],
-                            _pad: dispatch.params[3],
-                        },
-                    },
-                );
-            }
-            ShaderEntry::CachedAttention | ShaderEntry::CachedQueryAttention => {
-                pc.bind(
-                    0,
-                    &CachedAttentionData {
-                        src_a: buf(dispatch.input_buffers[0]),      // Q
-                        src_b: buf(dispatch.input_buffers[1]),      // K cache
-                        bias: buf(dispatch.input_buffers[2]),       // V cache
-                        kv_pos_buf: buf(dispatch.input_buffers[3]), // kv_pos
-                        dst: buf(dispatch.output_buffer),
-                        params: MatMulParams {
-                            m: dispatch.params[0],
-                            n: dispatch.params[1],
-                            k: dispatch.params[2],
-                            _pad: dispatch.params[3],
-                        },
-                    },
-                );
-            }
-            ShaderEntry::CachedBlockAttention | ShaderEntry::CachedBlockAttentionSplit => {
-                pc.bind(
-                    0,
-                    &CachedBlockAttentionData {
-                        src_a: buf(dispatch.input_buffers[0]),
-                        src_b: buf(dispatch.input_buffers[1]),
-                        bias: buf(dispatch.input_buffers[2]),
-                        kv_pos_buf: buf(dispatch.input_buffers[3]),
-                        valid_len_buf: buf(dispatch.input_buffers[4]),
-                        dst: buf(dispatch.output_buffer),
-                        params: CachedBlockAttentionParams::from_words(&dispatch.params)
-                            .expect("cached attention parameter layout"),
-                    },
-                );
-            }
-            ShaderEntry::CachedBlockAttentionCombine => {
-                pc.bind(
-                    0,
-                    &CachedBlockAttentionCombineData {
-                        partials: buf(dispatch.input_buffers[0]),
-                        dst: buf(dispatch.output_buffer),
-                        params: CachedBlockAttentionParams::from_words(&dispatch.params)
-                            .expect("cached attention parameter layout"),
-                    },
-                );
-            }
-            ShaderEntry::ChunkedRelativeAttention => {
-                pc.bind(
-                    0,
-                    &ChunkedRelativeAttentionData {
-                        src_a: buf(dispatch.input_buffers[0]),
-                        src_b: buf(dispatch.input_buffers[1]),
-                        bias: buf(dispatch.input_buffers[2]),
-                        relative_k: buf(dispatch.input_buffers[3]),
-                        dst: buf(dispatch.output_buffer),
-                        params: ChunkedRelativeAttentionParams {
-                            seq_len: dispatch.params[0],
-                            num_heads: dispatch.params[1],
-                            head_dim: dispatch.params[2],
-                            left_context: dispatch.params[3],
-                            softcap_bits: dispatch.params[4],
-                            _pad0: 0,
-                            _pad1: 0,
-                            _pad2: 0,
-                        },
-                    },
-                );
-            }
-            ShaderEntry::PrefixLast => {
-                pc.bind(
-                    0,
-                    &PrefixLastData {
-                        src: buf(dispatch.input_buffers[0]),
-                        valid_len_buf: buf(dispatch.input_buffers[1]),
-                        dst: buf(dispatch.output_buffer),
-                        params: MatMulParams {
-                            m: dispatch.params[0],
-                            n: dispatch.params[1],
-                            k: 0,
-                            _pad: 0,
-                        },
-                    },
-                );
-            }
-            ShaderEntry::MaxPool2d => {
-                pc.bind(
-                    0,
-                    &MaxPool2dData {
-                        src: buf(dispatch.input_buffers[0]),
-                        dst: buf(dispatch.output_buffer),
-                        params: MaxPool2dParams {
-                            batch: dispatch.params[0],
-                            channels: dispatch.params[1],
-                            in_h: dispatch.params[2],
-                            in_w: dispatch.params[3],
-                            kernel_h: dispatch.params[4],
-                            kernel_w: dispatch.params[5],
-                            stride: dispatch.params[6],
-                            padding: dispatch.params[7],
-                            out_h: dispatch.params[8],
-                            out_w: dispatch.params[9],
-                            _pad0: dispatch.params[10],
-                            _pad1: dispatch.params[11],
-                        },
-                    },
-                );
-            }
-            ShaderEntry::MaxPool2dGrad => {
+            ShaderEntry::Concat => {
                 let p = &dispatch.params;
                 pc.bind(
                     0,
-                    &MaxPool2dGradData {
-                        grad_out: buf(dispatch.input_buffers[0]),
-                        src: buf(dispatch.input_buffers[1]),
+                    &BinaryData {
+                        src_a: buf(dispatch.input_buffers[0]),
+                        src_b: buf(dispatch.input_buffers[1]),
                         dst: buf(dispatch.output_buffer),
-                        params: MaxPool2dParams {
-                            batch: p[0],
-                            channels: p[1],
-                            in_h: p[2],
-                            in_w: p[3],
-                            kernel_h: p[4],
-                            kernel_w: p[5],
-                            stride: p[6],
-                            padding: p[7],
-                            out_h: p[8],
-                            out_w: p[9],
-                            _pad0: p[10],
-                            _pad1: p[11],
+                        params: UnaryParams {
+                            len: p[0],
+                            _pad0: p[1],
+                            _pad1: p[2],
+                            _pad2: p[3],
                         },
                     },
                 );
             }
-            ShaderEntry::GlobalAvgPool => {
-                pc.bind(
-                    0,
-                    &GlobalAvgPoolData {
-                        src: buf(dispatch.input_buffers[0]),
-                        dst: buf(dispatch.output_buffer),
-                        params: GlobalAvgPoolParams {
-                            channels: dispatch.params[0],
-                            spatial: dispatch.params[1],
-                            total_out: dispatch.params[2],
-                            _pad: dispatch.params[3],
-                        },
-                    },
-                );
-            }
-            ShaderEntry::GlobalAvgPoolGrad => {
+            ShaderEntry::SplitA | ShaderEntry::SplitB => {
                 let p = &dispatch.params;
                 pc.bind(
                     0,
@@ -8039,44 +8252,61 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::WinogradInputTransform
-            | ShaderEntry::WinogradOutputTransform
-            | ShaderEntry::WinogradWeightTransform => {
+            ShaderEntry::MulPerChannel => {
                 let p = &dispatch.params;
                 pc.bind(
                     0,
-                    &WinogradTransformData {
+                    &MulPerChannelData {
                         src: buf(dispatch.input_buffers[0]),
+                        gate: buf(dispatch.input_buffers[1]),
                         dst: buf(dispatch.output_buffer),
-                        params: WinogradTransformParams {
-                            p0: p[0],
-                            p1: p[1],
-                            p2: p[2],
-                            p3: p[3],
-                            p4: p[4],
-                            p5: p[5],
-                            p6: p[6],
-                            p7: p[7],
+                        params: MulPerChannelParams {
+                            len: p[0],
+                            spatial: p[1],
+                            _pad0: 0,
+                            _pad1: 0,
                         },
                     },
                 );
             }
-            ShaderEntry::WinogradBatchedMatMul => {
+            ShaderEntry::ScatterAdd => {
                 pc.bind(
                     0,
-                    &MatMulData {
-                        matrix_a: buf(dispatch.input_buffers[0]),
-                        matrix_b: buf(dispatch.input_buffers[1]),
-                        matrix_c: buf(dispatch.output_buffer),
-                        params: MatMulParams {
-                            m: dispatch.params[0],
-                            n: dispatch.params[1],
-                            k: dispatch.params[2],
+                    &ScatterAddData {
+                        indices: buf(dispatch.input_buffers[0]),
+                        src: buf(dispatch.input_buffers[1]),
+                        dst: buf(dispatch.output_buffer),
+                        params: ScatterAddParams {
+                            total: dispatch.params[0],
+                            seq_len: dispatch.params[1],
+                            embed_dim: dispatch.params[2],
+                            _pad: 0,
+                        },
+                    },
+                );
+            }
+            ShaderEntry::ScatterAddAtomic => {
+                pc.bind(
+                    0,
+                    &ScatterAddAtomicData {
+                        indices: buf(dispatch.input_buffers[0]),
+                        src: buf(dispatch.input_buffers[1]),
+                        row_scale: buf(dispatch
+                            .input_buffers
+                            .get(2)
+                            .copied()
+                            .unwrap_or(dispatch.input_buffers[1])),
+                        dst: buf(dispatch.output_buffer),
+                        params: ScatterAddParams {
+                            total: dispatch.params[0],
+                            seq_len: dispatch.params[1],
+                            embed_dim: dispatch.params[2],
                             _pad: dispatch.params[3],
                         },
                     },
                 );
             }
+            _ => unreachable!("bind_pointwise is reached only for its own shaders"),
         }
     }
 
