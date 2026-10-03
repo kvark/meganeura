@@ -13,9 +13,10 @@ made) · **done** (kept for the record, with what it cost).
 | # | Item | Status | Where |
 |---|---|---|---|
 | 1 | Cooperative flash forward loses f16 precision on NVIDIA | open — needs measurement | below |
-| 2 | `load::onnx` slices with a file-controlled length | open — do next | below |
-| 3 | Per-step CPU work: segment table rebuild, pipeline hash lookup | blocked — needs benchmark | below |
-| 4 | `step()` fences before recording, so CPU and GPU never overlap | blocked — needs benchmark | below |
+| 2 | `load::onnx` slices with a file-controlled length | **done** | below |
+| 3 | Per-step CPU work: segment table rebuild, pipeline hash lookup | **measured — real, and the dominant cost** | below |
+| 4 | `step()` fences before recording, so CPU and GPU never overlap | **measured — not worth doing** | below |
+| 3c | CPU/GPU split benchmark (`bench_step_cpu`) | done | below |
 | 5 | Structural: god functions, duplicated `(m,n,k)`, split tables | open | below |
 | 6 | Importers accept malformed input without a fuzz corpus | open | below |
 | 7 | `EntrySpec` table for `ShaderEntry` | retracted | below |
@@ -72,7 +73,10 @@ than the defect.
 
 ## 2. `load::onnx` slices with a file-controlled length
 
-**Status: open. Cheapest real fix in this list; a panic on untrusted input.**
+**Status: done.** Seven sites across four functions now go through one
+`delimited` helper; the three RoPE builders use `u32::try_from`. Four tests
+cover it, and reverting the helper makes all four panic, so they are load-bearing
+rather than decorative.
 
 `src/load/onnx.rs:209-213`:
 
@@ -98,16 +102,26 @@ silently; and `src/graph.rs:2058,2111,2146` do `x_shape[1] as u32` in the three
 RoPE builders, where the adjacent `dim % 2 == 0` and `dim % head_dim == 0`
 asserts do not catch a dimension that truncated to a valid-looking value.
 
-**What would close it.** Check `p + len` against `buf.len()` and return `None`
-(or a typed `OnnxError`) instead of slicing. One `checked_add` per field. Then
-the same treatment for the dimension walk.
+**What was done.** `delimited(buf, len, start) -> Option<(&[u8], usize)>` does
+`usize::try_from`, `checked_add` and `get`, and every length-delimited site uses
+it, so there is one bounds-checked path rather than seven hand-written slices.
+The `Result`-returning callers get a typed `OnnxError::ParseError`; the
+parsers that return a value directly `break`, which is what their existing
+malformed-input handling already does. The fixed-width wire types (`pos += 8`,
+`pos += 4`) were also unchecked and could step past the end without the loop
+noticing; those are `checked_add` now.
+
+Tests: a length past the end, a start past the end, `usize::MAX` (which must
+not wrap the end back into range), and a sweep of lengths and offsets that must
+return rather than panic. Reverting `delimited` to the unchecked form makes all
+four panic at the slice.
 
 ---
 
 ## 3. Per-step CPU work in the training loop
 
-**Status: blocked. Needs the benchmark harness in item 3b before anyone can say
-whether these matter.**
+**Status: measured. Both findings are real, and together they are the dominant
+cost of a step — the opposite of what the audit assumed.**
 
 Three findings, all on the per-step path:
 
@@ -131,25 +145,61 @@ long as the session has trainable pairs.
 `SpecializedConv(ShaderEntry, Vec<u32>, u32)`. The comment at `runtime.rs:1114`
 says variants are "resolved after compilation or tuning, never while recording a
 step", which is true of the *key* but not of the lookup. Storing
-`selected: Vec<&ComputePipeline>` after `select()` removes it.
+`selected: Vec<&ComputePipeline>` after `select()` removes it. This is the
+per-dispatch half of the measured cost below, and it is worth roughly a third of
+the per-dispatch figure by inspection, not by attribution — see "what is still
+attributable".
 
-**3c. Benchmark harness.** Neither 3a nor 3b can be justified without measuring
-CPU-side step cost on a model with enough dispatches and parameters for the
-per-step work to show. `bench_ci_latency` reports `train_step_median_ms` at
-0.06 ms, which is far too small to resolve this. What is needed is a
-dispatch-count and parameter-count sweep with the CPU time per step separated
-from the GPU wait — the existing `MEGANEURA_TRACE` Perfetto capture is the right
-tool, since `step()` already emits a `tracing::info_span!`.
+**3c. The benchmark that settles both. `examples/bench_step_cpu.rs`.**
 
-**What would close it.** Write 3c, measure 3a and 3b against it, and only then
-decide. The user has already asked that caching be measured before it is built,
-and that applies to all three.
+`Session::record` encodes a step into a caller's encoder and does not submit,
+so it times the host path exactly — walking dispatches, resolving each
+pipeline, building its binding struct, issuing the call. `Session::step` is the
+whole step. The difference is what an encoder rotation could overlap.
+
+RTX 5070, 40 runs, median, chain of `matmul + bias_mul + gelu` blocks:
+
+| blocks | width | dispatches | params | step_ms | encode_ms | idle_ms | encode share |
+|---|---|---|---|---|---|---|---|
+| 4 | 64 | 53 | 8 | 0.043 | 0.038 | 0.037 | 89% |
+| 8 | 64 | 105 | 16 | 0.080 | 0.075 | 0.072 | 94% |
+| 16 | 64 | 209 | 32 | 0.149 | 0.141 | 0.140 | 95% |
+| 32 | 64 | 417 | 64 | 0.303 | 0.297 | 0.279 | 98% |
+
+The Intel B570 shows the same shape (`encode` 0.041 / 0.081 / 0.162 / 0.325 ms
+for the same dispatch counts).
+
+Two things follow, and neither was expected:
+
+- **Encoding is ~90–98% of step time**, and it scales linearly with dispatch
+  count at a flat **~680 ns per dispatch** (690 / 686 / 700 / 678 ns across a
+  8× range). Not a fixed overhead and not queueing: a straight line through the
+  origin in dispatch count.
+- **`idle_ms` matches `encode_ms`**, which is the control that matters.
+  Repeating the encode with the device already idle gives the same number, so
+  there is no fence hiding inside `encode_step` and the 3a rebuild is not
+  hiding behind a wait. This is what rules out the alternative explanation.
+
+**Consequence for 3a.** `optimizer_units` rebuilds a table sized by *parameters*,
+and the sweep shows step time tracking *dispatches* — the two cases that
+separate them (`8×64` and `8×1024`, both 105 dispatches and 16 parameters,
+0.071 and 0.075 ms) differ by 5%. So 3a is real but small at these sizes; it
+would need a parameter-heavy, dispatch-light model to show up, which is not
+what this sweep builds. Worth doing for a large model, not worth doing first.
+
+**What is still attributable.** The benchmark measures the whole host path, not
+its parts. 3b is the per-dispatch term and the flat line is entirely consistent
+with a per-dispatch hash. Attributing the ~680 ns between the hash lookup, the
+binding-struct construction in `bind_dispatch`, and the encoder call itself
+needs a profiler run on the `record` span, which `step()` already emits via
+`tracing::info_span!`. That is the next step, not a rewrite.
 
 ---
 
 ## 4. `step()` fences before recording
 
-**Status: blocked on the same benchmark.**
+**Status: measured. The premise is right and the conclusion is that it does not
+matter — do not do this.**
 
 `src/runtime.rs`, `Session::step`:
 
@@ -160,24 +210,33 @@ self.encode_step(...);
 self.sync_point = Some(self.gpu.submit(&mut self.encoder));
 ```
 
-The `wait()` blocks on the *previous* step's fence before any recording starts,
-so the CPU record time is fully exposed rather than overlapped with GPU
-execution. The encoder is already double-buffered (`buffer_count: 2` at
-`runtime.rs:3548`) and `Session::record` already documents that recording while
-earlier work is in flight is fine — `step()` just does not do it. The one
-constraint is that the encoder ring must not re-record a live command buffer,
-which `submission_chunks: 1` currently guarantees.
+The `wait()` blocks on the *previous* step's fence before recording starts, so
+the host record time is exposed rather than overlapped. The encoder is already
+double-buffered (`buffer_count: 2` at `runtime.rs:3548`) and `Session::record`
+documents that recording while earlier work is in flight is fine — `step()`
+just does not do it.
 
-The repository's own measurement is in `docs/gpu-gap-2026-09.md:93-94`:
-~0.75 ms in `step` against ~3.01 ms waiting, on average.
+That reasoning is sound but measures out as not worth acting on. From the
+`bench_step_cpu` table, `step_ms - encode_ms` — everything an encoder rotation
+could hide — is **0.005 ms at 53 dispatches and 0.006–0.014 ms at 417**, against
+an encode cost of 0.038–0.297 ms. The overlappable fraction is 1–5% and does not
+grow with dispatch count, because the thing to be hidden is the *submit*, which
+is a fixed cost, while the thing actually costing time is the per-dispatch
+encode loop, which a rotation does not reduce: the CPU still has to walk every
+dispatch.
 
-**What would close it.** Same benchmark as 3c. If CPU record time is a
-meaningful fraction of step time, a two-slot encoder rotation lets recording of
-step N+1 overlap execution of step N. Worth measuring first: the fix changes
-submission structure, and if the GPU is the bottleneck everywhere it is pure
-risk for nothing.
+A two-slot encoder rotation would change submission structure and gain a few
+microseconds per step on small models. On the `gpu-gap-2026-09.md` figures that
+motivated it (~0.75 ms in `step` against ~3.01 ms waiting) the ratio inverts,
+which suggests those measurements were taken with a different cost
+distribution — most likely a larger model where dispatch count is higher and
+the encode loop dominates, in which case the fix for item 4 would be item 3b,
+not a rotation.
 
----
+**What would reopen this.** A model with enough dispatches that `encode_ms`
+exceeds the GPU wait, which is the regime where the two swap. That is a
+different regime from the one the audit observed, so re-measure there before
+reconsidering.
 
 ## 5. Structural items
 
