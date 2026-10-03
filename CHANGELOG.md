@@ -1,5 +1,28 @@
 # Unreleased
 
+- The file split recommended in July 2026: `runtime.rs` 8592 to 5666,
+  `codegen.rs` 8146 to 5419, `compile.rs` 7928 to 4326. The seams are by
+  responsibility rather than by size:
+
+    impl Compiler                    -> compile/emit.rs       3634 lines
+    attention and conv generators    -> codegen/attention.rs   2744
+    Session binding                  -> runtime/binding.rs     1477
+    Session transfers                -> runtime/transfer.rs    1444
+    host-side Q4/Q8 packing          -> runtime/quantize.rs     187
+    GpuOptions and context creation -> runtime/context.rs       99
+
+  `compile/emit.rs` holds everything that *emits* dispatches while its parent
+  *describes* the plan. `codegen/attention.rs` keeps the matmul family in place
+  and takes everything that is not a matmul. `runtime/binding.rs` answers one
+  question — given a compiled dispatch, what goes in binding 0 — and
+  `runtime/transfer.rs` is everything that touches a buffer from the CPU side.
+
+  Methods and helpers that move become `pub(super)`, because an inherent impl in
+  a child module is unreachable from the parent otherwise. Public items are
+  re-exported so every existing path still resolves; the only path that had to
+  change was relative, since `include_str!("shaders/...")` inside the moved
+  generators became `"../shaders/..."`.
+
 - `bind_dispatch` was one 58-arm match over `ShaderEntry` and 1237 lines. It is
   now a routing match plus eight family functions — `bind_matmul` (120 lines),
   `bind_conv` (196), `bind_attention` (202), `bind_norm` (195),
