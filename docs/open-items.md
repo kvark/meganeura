@@ -18,7 +18,7 @@ made) · **done** (kept for the record, with what it cost).
 | 4 | `step()` fences before recording, so CPU and GPU never overlap | **measured — not worth doing** | below |
 | 3c | CPU/GPU split benchmark (`bench_step_cpu`) | done | below |
 | 5 | Structural: god functions, duplicated `(m,n,k)`, split tables | open | below |
-| 6 | Importers accept malformed input without a fuzz corpus | open | below |
+| 6 | Importers accept malformed input without a fuzz corpus | **done — found two panics** | below |
 | 7 | `EntrySpec` table for `ShaderEntry` | retracted | below |
 | 8 | RMSNorm `(2..=32)` rows-per-workgroup bound | retracted | below |
 
@@ -191,7 +191,9 @@ what this sweep builds. Worth doing for a large model, not worth doing first.
 **Attribution: the audit named the wrong targets.** Timing the four phases
 inside `record_groups` — pipeline lookup, `pass.with`, `bind_dispatch`,
 `pc.dispatch` — gives, per dispatch (instrumented, so upper bounds; ~90 ns of
-the total is the instrumentation itself):
+the total is the instrumentation itself). The instrumentation was temporary and
+is not in the tree; `bench_step_cpu` is the part that stays, and the split below
+would need the same four `Instant::now()` pairs re-added to reproduce:
 
 | phase | ns/dispatch | share |
 |---|---|---|
@@ -289,26 +291,47 @@ reconsidering.
 
 ## 6. Importers accept malformed input without a fuzz corpus
 
-**Status: open.**
+**Status: done. `proptest` over arbitrary bytes found two reachable panics, both
+fixed; the corpus is checked in.**
 
-`tests/oracle/fuzz.rs` is hand-rolled — no `proptest`, `quickcheck` or
-`cargo-fuzz` anywhere in the tree — and covers random *graphs* through the
-compiler, not random *files* through the importers. `load::onnx` has 6 unit
-tests and `load::nnef` has 4, all with well-formed input. Item 2 is the
-sharpest instance of what that leaves open.
+`proptest` as a dev-dependency, four properties in `tests/importer_fuzz.rs`, all
+asserting the same contract: arbitrary input must come back as a `Result::Err`
+and never a panic. 256 cases by default, `PROPTEST_CASES=20000` clean. The cases
+are arbitrary bytes, not well-formed documents with a field perturbed, because
+the failures here are structural — a length that runs past the end, a varint
+that overflows — and those are what a hand-built corpus misses.
 
-The existing fuzzer's op mix is also narrow: 18 op kinds, all 2-D
-elementwise/contraction, over dims drawn from `[1, 3, 4, 8, 17]` — every
-dimension tiny or odd, so tile-edge behaviour is never randomly explored, and
-no attention, convolution or long-axis reduction appears. 65 graphs by
-default; `ORACLE_FUZZ_COUNT=400` is opt-in.
+**Two panics, both shrunk to a minimal input:**
 
-**What would close it.** `proptest` as a dev-dependency with a byte-oriented
-strategy for the ONNX and NNEF readers — arbitrary bytes, not well-formed
-protobuf — asserting the parse either succeeds or returns an error, never
-panics. The exit criterion is a malformed-input corpus in the repository.
+**1. NNEF: a body that closes before it opens.** `parse_graph_nnef` finds the
+body with an independent `find('{')` and `rfind('}')`, so the two-byte input
+`"}{"` leaves `body_start > body_end`. Every slice in the header parser spans
+that range. One comparison at the source fixes it, and two unit tests pin it —
+one for the rejected shapes, one asserting `{}` still parses so the check cannot
+be over-tightened into rejecting valid input.
 
----
+**2. ONNX: an overflowing length in the protobuf dependency.**
+`oxionnx-proto-0.1.2/src/parser.rs:73` tests `pos + len > buf.len()`, which
+overflows for a large declared length and passes the check before slicing
+`buf[pos..pos + len]`. This is not ours to patch. `load_onnx_bytes` contains it
+with `catch_unwind`, because the function's signature promises a `Result` and a
+caller loading an untrusted file should not be able to abort their process with
+four bytes of input. The fence is deliberately at that boundary rather than
+around just the dependency call: `extract_shapes_from_proto` and
+`translate_graph` follow, are ours, and are not supposed to panic — one
+boundary covers all three.
+
+The panic message is left reaching stderr on purpose. Suppressing it would need
+a global hook swap around a library call, and it would also hide a panic from
+our own code below, which is a bug worth being loud about.
+
+**The corpus.** `tests/importer_fuzz.proptest-regressions` holds both minimal
+inputs, so they replay on every run. proptest appends to that file per failing
+test, so two simultaneous failures under parallel threads can clobber each
+other; the suite runs `--test-threads=1`, and the test file says so.
+
+Both fixes are verified by reverting them: each makes its recorded corpus entry
+fail again.
 
 ## 7. `EntrySpec` table for `ShaderEntry` — retracted
 

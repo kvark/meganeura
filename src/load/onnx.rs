@@ -53,10 +53,37 @@ pub fn load_onnx(path: &Path) -> Result<OnnxModel, OnnxError> {
 /// Load an ONNX model from raw bytes.
 /// If `path` is provided, external data files are resolved relative to its parent directory.
 pub fn load_onnx_bytes(bytes: &[u8], path: Option<&Path>) -> Result<OnnxModel, OnnxError> {
-    let (onnx_graph, onnx_weights) = if let Some(p) = path.and_then(|p| p.parent()) {
-        model::load_with_path(bytes, p).map_err(OnnxError::ParseError)?
-    } else {
-        model::load(bytes).map_err(OnnxError::ParseError)?
+    // The protobuf reader is a dependency and does not bounds-check its
+    // length-delimited fields. `oxionnx-proto-0.1.2/src/parser.rs:73` tests
+    // `pos + len > buf.len()`, which overflows for a large declared length and
+    // so passes the check before slicing `buf[pos..pos + len]` out of range.
+    // Four bytes of input reach it.
+    //
+    // Containing that here is the boundary fix. Reimplementing the protobuf
+    // parser to get it right would be a large change to defend against one
+    // checked line in someone else's crate, and the panic may equally come from
+    // the shape walk or `translate_graph` below, which are ours and are not
+    // supposed to panic at all — a fence that turns any of those into an
+    // `Err` is correct for every one of them.
+    //
+    // The panic message still reaches stderr. That is deliberate: a panic from
+    // our own code below is a bug and should be loud, and it is cheaper to keep
+    // the default hook than to suppress it globally around a library call.
+    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Some(p) = path.and_then(|p| p.parent()) {
+            model::load_with_path(bytes, p)
+        } else {
+            model::load(bytes)
+        }
+    }));
+    let (onnx_graph, onnx_weights) = match parsed {
+        Ok(Ok(ok)) => ok,
+        Ok(Err(e)) => return Err(OnnxError::ParseError(e)),
+        Err(_) => {
+            return Err(OnnxError::ParseError(
+                "malformed model: the protobuf reader rejected the input".into(),
+            ));
+        }
     };
 
     // Convert oxionnx Tensor weights to Vec<f32>

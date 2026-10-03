@@ -19,6 +19,7 @@ mod gemv_parity;
 mod grad_accumulate;
 mod grad_clip;
 mod horizontal_matmul;
+mod importer_fuzz;
 mod int_dot_gemv;
 mod laprop;
 mod multi_input_trainer;
