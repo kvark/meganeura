@@ -2059,7 +2059,11 @@ impl Graph {
     ) -> NodeId {
         let x_shape = &self.node(x).ty.shape;
         assert_eq!(x_shape.len(), 2, "rope requires 2D input");
-        let dim = x_shape[1] as u32;
+        // Checked, not truncated: a head dimension is carried to the device as
+        // a `u32`, so a shape that does not fit would otherwise be silently
+        // narrowed to a plausible-looking value and pass the divisibility
+        // asserts below.
+        let dim = u32::try_from(x_shape[1]).expect("rope head dimension exceeds u32");
         assert_eq!(dim % 2, 0, "rope requires even last dim");
         assert_eq!(dim % head_dim, 0, "rope: dim must be divisible by head_dim");
         assert_eq!(head_dim % 2, 0, "rope: head_dim must be even");
@@ -2112,7 +2116,11 @@ impl Graph {
     ) -> NodeId {
         let x_shape = &self.node(x).ty.shape;
         assert_eq!(x_shape.len(), 2, "rope requires 2D input");
-        let dim = x_shape[1] as u32;
+        // Checked, not truncated: a head dimension is carried to the device as
+        // a `u32`, so a shape that does not fit would otherwise be silently
+        // narrowed to a plausible-looking value and pass the divisibility
+        // asserts below.
+        let dim = u32::try_from(x_shape[1]).expect("rope head dimension exceeds u32");
         assert_eq!(dim % 2, 0, "rope requires even last dim");
         assert_eq!(dim % head_dim, 0, "rope: dim must be divisible by head_dim");
         assert_eq!(head_dim % 2, 0, "rope: head_dim must be even");
@@ -2147,7 +2155,11 @@ impl Graph {
     ) -> NodeId {
         let x_shape = &self.node(x).ty.shape;
         assert_eq!(x_shape.len(), 2, "rope requires 2D input");
-        let dim = x_shape[1] as u32;
+        // Checked, not truncated: a head dimension is carried to the device as
+        // a `u32`, so a shape that does not fit would otherwise be silently
+        // narrowed to a plausible-looking value and pass the divisibility
+        // asserts below.
+        let dim = u32::try_from(x_shape[1]).expect("rope head dimension exceeds u32");
         assert_eq!(dim % 2, 0, "rope requires even last dim");
         assert_eq!(dim % head_dim, 0, "rope: dim must be divisible by head_dim");
         assert_eq!(head_dim % 2, 0, "rope: head_dim must be even");

@@ -120,11 +120,11 @@ fn extract_graph_bytes(model_bytes: &[u8]) -> Result<Vec<u8>, OnnxError> {
             2 => {
                 let (len, p) =
                     read_proto_varint(model_bytes, pos).map_err(OnnxError::ParseError)?;
-                let len = len as usize;
+                let (field, end) = delimited(model_bytes, len, p).ok_or_else(truncated)?;
                 if field_no == 7 {
-                    return Ok(model_bytes[p..p + len].to_vec());
+                    return Ok(field.to_vec());
                 }
-                pos = p + len;
+                pos = end;
             }
             _ => {
                 return Err(OnnxError::ParseError(format!(
@@ -156,19 +156,19 @@ fn parse_value_info_shapes(
                 let (_, p) = read_proto_varint(graph_bytes, pos).map_err(OnnxError::ParseError)?;
                 pos = p;
             }
-            1 => pos += 8,
-            5 => pos += 4,
+            1 => pos = pos.checked_add(8).ok_or_else(truncated)?,
+            5 => pos = pos.checked_add(4).ok_or_else(truncated)?,
             2 => {
                 let (len, p) =
                     read_proto_varint(graph_bytes, pos).map_err(OnnxError::ParseError)?;
-                let len = len as usize;
+                let (field, end) = delimited(graph_bytes, len, p).ok_or_else(truncated)?;
                 if field_no == target_field {
                     // This is a ValueInfoProto — parse name and shape from it
-                    if let Some((name, shape)) = parse_single_value_info(&graph_bytes[p..p + len]) {
+                    if let Some((name, shape)) = parse_single_value_info(field) {
                         results.push((name, shape));
                     }
                 }
-                pos = p + len;
+                pos = end;
             }
             _ => {
                 return Err(OnnxError::ParseError(format!(
@@ -203,17 +203,28 @@ fn parse_single_value_info(buf: &[u8]) -> Option<(String, Vec<usize>)> {
                 let (_, p) = read_proto_varint(buf, pos).ok()?;
                 pos = p;
             }
-            1 => pos += 8,
-            5 => pos += 4,
+            1 => match pos.checked_add(8) {
+                Some(next) => pos = next,
+                None => break,
+            },
+            5 => match pos.checked_add(4) {
+                Some(next) => pos = next,
+                None => break,
+            },
             2 => {
                 let (len, p) = read_proto_varint(buf, pos).ok()?;
-                let len = len as usize;
+                // The length comes from the file, so it is not a bound this
+                // function can assume; `delimited` resolves the range with
+                // checks and yields `None` for one that runs past the end.
+                // A malformed model is a parse failure, which is what this
+                // function's signature already says.
+                let (field, end) = delimited(buf, len, p)?;
                 match field_no {
-                    1 => name = String::from_utf8_lossy(&buf[p..p + len]).into_owned(),
-                    2 => type_bytes = Some(&buf[p..p + len]),
+                    1 => name = String::from_utf8_lossy(field).into_owned(),
+                    2 => type_bytes = Some(field),
                     _ => {}
                 }
-                pos = p + len;
+                pos = end;
             }
             _ => return None,
         }
@@ -238,16 +249,22 @@ fn parse_type_proto_shape(buf: &[u8]) -> Option<Vec<usize>> {
                 let (_, p) = read_proto_varint(buf, pos).ok()?;
                 pos = p;
             }
-            1 => pos += 8,
-            5 => pos += 4,
+            1 => match pos.checked_add(8) {
+                Some(next) => pos = next,
+                None => break,
+            },
+            5 => match pos.checked_add(4) {
+                Some(next) => pos = next,
+                None => break,
+            },
             2 => {
                 let (len, p) = read_proto_varint(buf, pos).ok()?;
-                let len = len as usize;
+                let (field, end) = delimited(buf, len, p)?;
                 if field_no == 1 {
                     // tensor_type = TypeProto.Tensor
-                    return parse_tensor_type_shape(&buf[p..p + len]);
+                    return parse_tensor_type_shape(field);
                 }
-                pos = p + len;
+                pos = end;
             }
             _ => return None,
         }
@@ -269,16 +286,22 @@ fn parse_tensor_type_shape(buf: &[u8]) -> Option<Vec<usize>> {
                 let (_, p) = read_proto_varint(buf, pos).ok()?;
                 pos = p;
             }
-            1 => pos += 8,
-            5 => pos += 4,
+            1 => match pos.checked_add(8) {
+                Some(next) => pos = next,
+                None => break,
+            },
+            5 => match pos.checked_add(4) {
+                Some(next) => pos = next,
+                None => break,
+            },
             2 => {
                 let (len, p) = read_proto_varint(buf, pos).ok()?;
-                let len = len as usize;
+                let (field, end) = delimited(buf, len, p)?;
                 if field_no == 2 {
                     // shape = TensorShapeProto
-                    return Some(parse_tensor_shape_dims(&buf[p..p + len]));
+                    return Some(parse_tensor_shape_dims(field));
                 }
-                pos = p + len;
+                pos = end;
             }
             _ => return None,
         }
@@ -307,18 +330,26 @@ fn parse_tensor_shape_dims(buf: &[u8]) -> Vec<usize> {
                 };
                 pos = p;
             }
-            1 => pos += 8,
-            5 => pos += 4,
+            1 => match pos.checked_add(8) {
+                Some(next) => pos = next,
+                None => break,
+            },
+            5 => match pos.checked_add(4) {
+                Some(next) => pos = next,
+                None => break,
+            },
             2 => {
                 let Ok((len, p)) = read_proto_varint(buf, pos) else {
                     break;
                 };
-                let len = len as usize;
+                let Some((field, end)) = delimited(buf, len, p) else {
+                    break;
+                };
                 if field_no == 1 {
                     // Dimension message
-                    dims.push(parse_dimension(&buf[p..p + len]));
+                    dims.push(parse_dimension(field));
                 }
-                pos = p + len;
+                pos = end;
             }
             _ => break,
         }
@@ -349,13 +380,26 @@ fn parse_dimension(buf: &[u8]) -> usize {
                     return val as usize;
                 }
             }
-            1 => pos += 8,
-            5 => pos += 4,
+            1 => match pos.checked_add(8) {
+                Some(next) => pos = next,
+                None => break,
+            },
+            5 => match pos.checked_add(4) {
+                Some(next) => pos = next,
+                None => break,
+            },
             2 => {
                 let Ok((len, p)) = read_proto_varint(buf, pos) else {
                     break;
                 };
-                pos = p + len as usize;
+                // A length that runs past the end is a truncated field, not a
+                // reason to stop with a wrong answer: the caller sees the
+                // dynamic-dimension sentinel below rather than a shape read
+                // from out-of-range bytes.
+                let Some((_, end)) = delimited(buf, len, p) else {
+                    break;
+                };
+                pos = end;
             }
             _ => break,
         }
@@ -383,6 +427,28 @@ fn read_proto_varint(buf: &[u8], mut pos: usize) -> Result<(u64, usize), String>
         }
     }
     Ok((result, pos))
+}
+
+/// A field claimed more bytes than the buffer holds.
+fn truncated() -> OnnxError {
+    OnnxError::ParseError("a field length runs past the end of the message".into())
+}
+
+/// Resolve a length-delimited field's payload range inside `buf`.
+///
+/// A protobuf length is a `u64` read from the file, so it is not a bound the
+/// parser can assume: `len as usize` truncates on a 32-bit target and `p + len`
+/// can wrap. Every site that skips or slices such a field goes through here, so
+/// a length that runs past the end of the buffer is a parse failure rather than
+/// a panic escaping an API that returns `Result`.
+///
+/// Returns the payload and the position just past it.
+fn delimited<'a>(buf: &'a [u8], len: u64, start: usize) -> Option<(&'a [u8], usize)> {
+    let len = usize::try_from(len).ok()?;
+    let end = start.checked_add(len)?;
+    // `get` returns `None` rather than panicking when the range is out of
+    // bounds or inverted, which `start <= end` guarantees is only the former.
+    Some((buf.get(start..end)?, end))
 }
 
 /// Translate an oxionnx Graph into a Meganeura Graph.
@@ -1456,5 +1522,69 @@ mod tests {
         let model = result.unwrap();
         assert_eq!(model.graph.outputs().len(), 1);
         assert_eq!(model.weights.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod length_tests {
+    use super::{delimited, parse_single_value_info, parse_tensor_shape_dims};
+
+    /// A length-delimited field whose declared length runs past the end of the
+    /// buffer. `delimited` exists to turn this from a panic into a `None`.
+    #[test]
+    fn a_length_past_the_end_is_rejected_not_sliced() {
+        let buf = [0u8; 4];
+        // Declared length 1000 against a 4-byte buffer.
+        assert!(delimited(&buf, 1000, 0).is_none());
+        // Length that fits, so this one resolves.
+        assert_eq!(
+            delimited(&buf, 4, 0).map(|(f, e)| (f.len(), e)),
+            Some((4, 4))
+        );
+        // A start past the end, even with a zero length.
+        assert!(delimited(&buf, 0, 5).is_none());
+        // `usize::MAX` must not wrap the end back into range.
+        assert!(delimited(&buf, usize::MAX as u64, 1).is_none());
+    }
+
+    /// The same, through the public-ish parse path: a ValueInfo whose field 2
+    /// claims more bytes than are present.
+    ///
+    /// Field 2, wire type 2, length varint 0xFE 0x3F (127), then two bytes.
+    /// Before the bounds check this sliced `buf[2..129]` and panicked.
+    #[test]
+    fn a_value_info_with_an_oversized_field_does_not_panic() {
+        let buf = [0x12, 0x7E, 0x02, 0x03];
+        assert!(parse_single_value_info(&buf).is_none());
+    }
+
+    /// A truncated tensor shape must not read out of range. This parser
+    /// returns a value directly and `break`s on malformed input, so what it
+    /// promises is "no panic, and no dimension invented from out-of-range
+    /// bytes" — an empty list rather than the single valid dimension sitting
+    /// after the truncated field.
+    #[test]
+    fn a_truncated_tensor_shape_does_not_panic() {
+        // Field 2, wire type 2, declared length 200 (varint 0xC8 0x01), then
+        // one byte of payload. The `0x08 0x01` that follows would decode as
+        // field 1 varint 1 if the length were trusted.
+        let buf = [0x12, 0xC8, 0x01, 0x08, 0x01];
+        let dims = parse_tensor_shape_dims(&buf);
+        assert!(
+            dims.is_empty(),
+            "a truncated field must not yield dimensions, got {dims:?}"
+        );
+    }
+
+    /// Every one of a wide spread of hostile lengths must return rather than
+    /// panic. Cheap, and it pins the property the helper exists for.
+    #[test]
+    fn no_length_panics() {
+        let buf: Vec<u8> = (0..64u8).collect();
+        for start in 0..buf.len() + 2 {
+            for len in [0u64, 1, 7, 63, 64, 65, 1 << 20, u64::MAX, u64::MAX - 1] {
+                let _ = delimited(&buf, len, start);
+            }
+        }
     }
 }
