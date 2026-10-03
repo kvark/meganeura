@@ -1,5 +1,22 @@
 # Unreleased
 
+- `Dispatch::mnk()` centralises the `(m, n, k)` reinterpretation that two
+  binding sites each did differently: the horizontal-batch binding swapped only
+  for `ShaderEntry::MatMul`, the cooperative-prologue binding only for `MatMul`
+  and `FusedMatMulAdd`, and the shaders that actually store `(m, k, n)` in
+  `params` are `MatMul`, `MatMulGemv`, `MatMulGemvAdd` and `FusedMatMulAdd`. The
+  accessor documents which is which — the `AT`/`BT` variants take A already
+  transposed, so their natural order already is `(m, n, k)` — and returns `None`
+  for a non-contraction rather than three unrelated numbers from `params`. Three
+  tests pin it, including the full table of eight contraction shaders.
+
+  Whether either site was wrong in practice was measured, not assumed:
+  instrumenting `merge_horizontal` across the suite shows only `MatMul`,
+  `MatMulBT` and `MatMulAT` are ever merged, so the first list happened to be
+  complete — though the merge predicate restricts the kernel and not the shader,
+  so that was luck. The prologue site is reached by no test at all, so its list
+  could not be validated empirically and is now correct by construction.
+
 - The cooperative attention kernels rounded tensors to f16 that no cooperative
   matrix instruction consumes, and the rounding survived to the output. Five
   `attention` oracle cases failed on the RTX 5070 and passed on every other

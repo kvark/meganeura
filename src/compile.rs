@@ -1205,6 +1205,43 @@ pub enum Kernel {
 }
 
 impl Dispatch {
+    /// `(m, n, k)` for a contraction dispatch, in that order.
+    ///
+    /// `params` does not hold `(m, n, k)` for every contraction shader. Four of
+    /// them store `(m, k, n)` and have to be read back swapped:
+    ///
+    /// | `params` order | shaders |
+    /// |---|---|
+    /// | `(m, k, n)` | `MatMul`, `MatMulGemv`, `MatMulGemvAdd`, `FusedMatMulAdd` |
+    /// | `(m, n, k)` | `MatMulAT`, `MatMulBT`, `MatMulGemvBT`, `FusedMatMulATAdd` |
+    ///
+    /// The `AT`/`BT` variants take A already transposed — A is `[K, M]` rather
+    /// than `[M, K]` — so their natural order already is `(m, n, k)`.
+    ///
+    /// Every binding site that needs the logical shape should call this rather
+    /// than re-derive the swap, because the two sites that used to do it each
+    /// listed a different subset: one swapped only for `MatMul`, the other only
+    /// for `MatMul` and `FusedMatMulAdd`.
+    ///
+    /// Returns `None` for a dispatch that is not a contraction, so a caller
+    /// binding an elementwise kernel cannot silently pick up three unrelated
+    /// numbers from `params`.
+    pub fn mnk(&self) -> Option<(u32, u32, u32)> {
+        let p = &self.params;
+        let (a, b, c) = (p.first().copied()?, p.get(1).copied()?, p.get(2).copied()?);
+        match self.shader {
+            ShaderEntry::MatMul
+            | ShaderEntry::MatMulGemv
+            | ShaderEntry::MatMulGemvAdd
+            | ShaderEntry::FusedMatMulAdd => Some((a, c, b)),
+            ShaderEntry::MatMulAT
+            | ShaderEntry::MatMulBT
+            | ShaderEntry::MatMulGemvBT
+            | ShaderEntry::FusedMatMulATAdd => Some((a, b, c)),
+            _ => None,
+        }
+    }
+
     pub fn use_coop(&self) -> bool {
         matches!(
             self.kernel,
@@ -6446,6 +6483,73 @@ impl<'a> Compiler<'a> {
 mod tests {
     use super::*;
     use crate::graph::Graph;
+
+    /// `Dispatch::mnk` must agree with the order each contraction shader's
+    /// constructor writes into `params`.
+    ///
+    /// The two binding sites that used to do this swap each listed a different
+    /// subset of the shaders — one swapped only for `MatMul`, the other for
+    /// `MatMul` and `FusedMatMulAdd` — so neither matched the four that store
+    /// `(m, k, n)`. This test states the intended mapping in one place: a
+    /// `MatMulAT` reads `(m, n, k)` straight out of `params`, and a `MatMul`
+    /// reads `(m, k, n)` and swaps. Adding a contraction shader means adding it
+    /// to `mnk` and to this table, or the two disagree and this fails.
+    #[test]
+    fn mnk_matches_the_params_order_each_shader_is_built_with() {
+        /// One row: the shader, the `params` it is constructed with, and what
+        /// `mnk` must return for that `params`.
+        type Case = (ShaderEntry, [u32; 3], (u32, u32, u32));
+        let cases: &[Case] = &[
+            // A is [M, K], B is [K, N]: params hold (m, k, n).
+            (ShaderEntry::MatMul, [10, 20, 30], (10, 30, 20)),
+            (ShaderEntry::MatMulGemv, [10, 20, 30], (10, 30, 20)),
+            (ShaderEntry::MatMulGemvAdd, [10, 20, 30], (10, 30, 20)),
+            (ShaderEntry::FusedMatMulAdd, [10, 20, 30], (10, 30, 20)),
+            // A is already [K, M]: params hold (m, n, k) already.
+            (ShaderEntry::MatMulAT, [10, 20, 30], (10, 20, 30)),
+            (ShaderEntry::MatMulBT, [10, 20, 30], (10, 20, 30)),
+            (ShaderEntry::MatMulGemvBT, [10, 20, 30], (10, 20, 30)),
+            (ShaderEntry::FusedMatMulATAdd, [10, 20, 30], (10, 20, 30)),
+        ];
+
+        for &(ref shader, params, want) in cases.iter() {
+            let d = Dispatch {
+                shader: shader.clone(),
+                params: params.to_vec(),
+                ..Dispatch::default()
+            };
+            assert_eq!(
+                d.mnk(),
+                Some(want),
+                "{shader:?}: params are {params:?}, so mnk must be {want:?}"
+            );
+        }
+    }
+
+    /// A dispatch that is not a contraction must not hand back three numbers
+    /// from `params` that merely happen to be there.
+    #[test]
+    fn mnk_is_none_for_a_non_contraction() {
+        let d = Dispatch {
+            shader: ShaderEntry::LayerNorm,
+            params: vec![64, 64, 0],
+            ..Dispatch::default()
+        };
+        assert_eq!(d.mnk(), None);
+    }
+
+    /// `params` shorter than three is not a shape.
+    #[test]
+    fn mnk_is_none_when_params_are_short() {
+        for shader in [ShaderEntry::MatMul, ShaderEntry::MatMulAT] {
+            let d = Dispatch {
+                shader: shader.clone(),
+                params: vec![10, 20],
+                ..Dispatch::default()
+            };
+            assert_eq!(d.mnk(), None, "{shader:?} with two params");
+        }
+    }
 
     #[test]
     fn test_compile_simple() {
