@@ -168,6 +168,23 @@ fn random(g: &Graph, seed: u64) -> Feeds {
     feeds
 }
 
+#[test]
+fn reshaped_value_parameter_training() {
+    let mut g = Graph::new();
+    let q = g.parameter("q", &[3, 8]);
+    let k = g.parameter("k", &[5, 8]);
+    let flat_v = g.parameter("v", &[40]);
+    let v = g.reshape(flat_v, &[5, 8]);
+    let o = g.multi_head_attn(q, k, v, 2, 2, 4, true);
+    let loss = gradients::weighted_loss(&mut g, o, 11, 0.7);
+    g.set_outputs(vec![loss]);
+    let feeds = random(&g, 20261003);
+    let mut sweep = Sweep::default();
+    sweep.autodiff("reshaped V", &g, &feeds);
+    sweep.training("reshaped V", &g, &feeds);
+    sweep.finish();
+}
+
 /// Runs cases, keeps going past failures, and reports every kernel used.
 #[derive(Default)]
 struct Sweep {
