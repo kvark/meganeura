@@ -2678,11 +2678,10 @@ struct Compiler<'a> {
     /// from device capability: availability does not imply adequate gradient
     /// accuracy.
     allow_reduced_precision_attention_backward: bool,
-    /// Fused GradKV: maps fwd_node → pre-allocated dV buffer.
-    /// When GradK is compiled, it emits a fused GradKV dispatch and
-    /// pre-allocates the dV buffer here. When GradV is later compiled
-    /// for the same fwd_node, it reuses this buffer and skips dispatching.
-    fused_grad_kv_dv: HashMap<NodeId, BufferRef>,
+    /// Fused GradKV: maps fwd_node → pending, pre-allocated dV buffer.
+    /// Allocate GradV's destination before any Identity/reshape views alias
+    /// it. GradK writes both gradients; GradV emits no separate dispatch.
+    pending_grad_v_buffers: HashMap<NodeId, BufferRef>,
     attention_row_dots: HashMap<(BufferRef, BufferRef, u32, u32), BufferRef>,
     /// GroupNorm backward statistics per (input node, eps bits), computed
     /// once for the input and weight/bias gradients.
@@ -2722,7 +2721,7 @@ impl<'a> Compiler<'a> {
             options,
             coop_caps,
             allow_reduced_precision_attention_backward,
-            fused_grad_kv_dv: HashMap::new(),
+            pending_grad_v_buffers: HashMap::new(),
             attention_row_dots: HashMap::new(),
             group_norm_grad_stats: HashMap::new(),
         }
@@ -3140,6 +3139,9 @@ impl<'a> Compiler<'a> {
                     self.plan.input_buffers.push((name.clone(), buf));
                 }
                 Op::Constant { .. } => {}
+                Op::MultiHeadAttnGradV { fwd_node, .. } => {
+                    self.pending_grad_v_buffers.insert(fwd_node, buf);
+                }
                 Op::MultiHeadAttn { num_heads, .. }
                 | Op::CausalAttention { num_heads, .. }
                 | Op::CausalAttentionRoPE { num_heads, .. }
@@ -5755,10 +5757,13 @@ impl<'a> Compiler<'a> {
                 };
                 let dispatch_kv = if is_causal { q_seq } else { kv_seq };
 
-                // GradKV: pre-allocate dV buffer. When GradV is later
-                // compiled for the same fwd_node, it reuses this buffer.
-                let dv_buf = self.alloc_buffer(self.graph.node(node.inputs[3]).ty.size_bytes());
-                self.fused_grad_kv_dv.insert(fwd_node, dv_buf);
+                // Use GradV's already-allocated destination, including any
+                // views established in the first pass. If there is no GradV
+                // node, the fused kernel still needs a scratch destination.
+                let dv_buf = match self.pending_grad_v_buffers.remove(&fwd_node) {
+                    Some(buf) => buf,
+                    None => self.alloc_buffer(self.graph.node(node.inputs[3]).ty.size_bytes()),
+                };
                 let attention_params = vec![
                     q_seq,
                     kv_seq,
@@ -5815,15 +5820,12 @@ impl<'a> Compiler<'a> {
             }
 
             Op::MultiHeadAttnGradV { fwd_node, .. } => {
-                // GradK is deliberately compiled as a fused dK+dV dispatch.
-                // Autodiff appends GradK before GradV, and topological sorting
-                // preserves that dependency-equivalent ID order.
-                let dv_buf = *self.fused_grad_kv_dv.get(&fwd_node).unwrap_or_else(|| {
-                    panic!(
-                        "attention GradV for forward node {fwd_node} compiled before fused GradKV"
-                    )
-                });
-                self.node_buffers.insert(node.id, dv_buf);
+                // GradK emits the fused dK+dV dispatch. Never remap this
+                // output here: its views already alias the allocated buffer.
+                assert!(
+                    !self.pending_grad_v_buffers.contains_key(&fwd_node),
+                    "attention GradV for forward node {fwd_node} compiled before fused GradKV"
+                );
                 return;
             }
 
@@ -6300,6 +6302,51 @@ impl<'a> Compiler<'a> {
 mod tests {
     use super::*;
     use crate::graph::Graph;
+
+    #[test]
+    fn attention_value_gradient_views_share_fused_output() {
+        let mut g = Graph::new();
+        // A flattened V parameter makes autodiff reshape dV before using it.
+        // Check two attention nodes so their fused outputs cannot be shared.
+        let q = g.parameter("q", &[3, 8]);
+        let k = g.parameter("k", &[5, 8]);
+        let flat_v = g.parameter("v", &[40]);
+        let v = g.reshape(flat_v, &[5, 8]);
+        let first = g.multi_head_attn(q, k, v, 2, 2, 4, true);
+        let flat_v2 = g.parameter("v2", &[40]);
+        let v2 = g.reshape(flat_v2, &[5, 8]);
+        let second = g.multi_head_attn(first, k, v2, 2, 2, 4, true);
+        let loss = g.sum_all(second);
+        g.set_outputs(vec![loss]);
+        let backward = crate::autodiff::differentiate(&g);
+        let plan = compile(&backward);
+        let buffers: HashMap<_, _> = plan.node_buffers.iter().copied().collect();
+        let mut checked = 0;
+        for node in backward.nodes() {
+            if let Op::MultiHeadAttnGradV { fwd_node, .. } = node.op {
+                let fused = plan
+                    .dispatches
+                    .iter()
+                    .find(|d| {
+                        d.origin.iter().any(|&id| {
+                            matches!(backward.node(id).op,
+                            Op::MultiHeadAttnGradK { fwd_node: fwd, .. } if fwd == fwd_node)
+                        })
+                    })
+                    .expect("fused dK/dV producer");
+                assert_eq!(fused.extra_outputs, vec![buffers[&node.id]]);
+                checked += 1;
+            }
+            if matches!(node.op, Op::Identity | Op::StopGradient) {
+                assert_eq!(
+                    buffers[&node.id], buffers[&node.inputs[0]],
+                    "view {} must alias its input {}",
+                    node.id, node.inputs[0]
+                );
+            }
+        }
+        assert_eq!(checked, 2);
+    }
 
     #[test]
     fn test_compile_simple() {
