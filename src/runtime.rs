@@ -4926,14 +4926,14 @@ fn scatter_packed_concat_columns(
         | crate::compile::WeightFormat::Q3K) => {
             // Q4_0 blocks 32 elements where the K-quants take 256; the
             // copy is otherwise identical, so the block size joins the
-            // stride rather than earning a second arm.
-            let (block, stride) = match fmt {
-                crate::compile::WeightFormat::Q40 => (32, 18),
-                crate::compile::WeightFormat::Q4K => (256, 144),
-                crate::compile::WeightFormat::Q5K => (256, 176),
-                crate::compile::WeightFormat::Q6K => (256, 210),
-                _ => (256, 110),
-            };
+            // stride rather than earning a second arm. The numbers come from
+            // `DType::block_geometry`, which `TensorType::size_bytes` and the
+            // `Graph::parameter_q*k` asserts also read, so the three cannot
+            // drift apart.
+            let (block, stride) = fmt
+                .dtype()
+                .and_then(|d| d.block_geometry())
+                .expect("a block-quantized weight format has block geometry");
             assert!(rows.is_multiple_of(block));
             let bpc = rows / block;
             let unpadded = bpc * src_cols * stride;
