@@ -121,7 +121,7 @@ Reverting any one of the four arrays makes it fail.
 cover it, and reverting the helper makes all four panic, so they are load-bearing
 rather than decorative.
 
-`src/load/onnx.rs:209-213`:
+This, as it stood:
 
 ```rust
 let (len, p) = read_proto_varint(buf, pos).ok()?;
@@ -138,14 +138,16 @@ slice length with no bounds check. A malformed or hostile `.onnx` panics here
 rather than returning the `None` the enclosing `Option`-returning signature
 promises — the panic escapes through `load_onnx`'s error type entirely.
 
-Two smaller truncations in the same reader: the dimension walk at
-`onnx.rs:206-207` steps `pos` by a fixed amount per field and only re-checks
-against `buf.len()` at the top of the loop, so a truncated stream misparses
-silently; and `src/graph.rs:2058,2111,2146` do `x_shape[1] as u32` in the three
-RoPE builders, where the adjacent `dim % 2 == 0` and `dim % head_dim == 0`
-asserts do not catch a dimension that truncated to a valid-looking value.
+Two smaller truncations elsewhere: the dimension walk in `load/onnx` steps `pos`
+by a fixed amount per field and only re-checks against `buf.len()` at the top of
+the loop, so a truncated stream misparses silently — that one is fixed, see
+below; and the three RoPE builders in `graph.rs` did `x_shape[1] as u32` for the
+head dimension, where the adjacent `dim % 2 == 0` and `dim % head_dim == 0`
+asserts do not catch a dimension that truncated to a valid-looking value — also
+fixed.
 
-**What was done.** `delimited(buf, len, start) -> Option<(&[u8], usize)>` does
+**What was done.** `delimited(buf, len, start) -> Option<(&[u8], usize)>` — one
+helper, in `load/onnx.rs` beside `read_proto_varint` — does
 `usize::try_from`, `checked_add` and `get`, and every length-delimited site uses
 it, so there is one bounds-checked path rather than seven hand-written slices.
 The `Result`-returning callers get a typed `OnnxError::ParseError`; the
@@ -170,29 +172,38 @@ is ~7% of the host path.
 Three findings, all on the per-step path:
 
 **3a. `optimizer_units()` rebuilds the whole segment table every step.**
-`src/runtime/optimizer.rs:432`. Per step it rebuilds a `Vec<Plan>` with a
+`src/runtime/optimizer.rs`. Per step it rebuilds a `Vec<Plan>` with a
 `Vec<(usize,u32)>` per arena chunk, rebuilds the entire `Vec<Segment>` — one
 `optimizer_len` HashMap lookup per parameter, plus a `lr_multiplier_for_buf`
 prefix scan — then `bytemuck`-memcmps the full table (`#params × 32` bytes) to
 decide whether to re-upload. The table only changes when a parameter is
-rebound (`optimizer.rs:271-273`), so most of that work is recomputing an
-invariant. The `memcmp` is itself a working measurement of "did it change?",
-which is how the potential saving can be bounded without new instrumentation —
-but nobody has run it against a model large enough for the answer to matter.
+rebound, so most of that work is recomputing an invariant. Note the cost is paid
+even with no optimizer and no clipping configured, as long as the session has
+trainable pairs.
 
-Note the cost is paid even with no optimizer and no clipping configured, as
-long as the session has trainable pairs.
+**Measured, and small.** The sweep below varies dispatch count and parameter
+count independently, and the two cases that separate them — `8×64` and `8×1024`,
+both 105 dispatches and 16 parameters — differ by 5% (0.071 vs 0.075 ms). Step
+time tracks *dispatches*, not parameters, so a table sized by parameters does
+not show up at these sizes. It is real work being repeated, and it is worth
+removing for a large, parameter-heavy, dispatch-light model; it is not worth
+removing first, and the sweep here does not build one.
 
 **3b. `Pipelines::get` is a SipHash lookup per dispatch, per step.**
-`src/runtime.rs:1508`. `&self.map[&self.selected[dispatch_index]]` hashes a
-`Variant` — a wide enum some of whose variants embed a `Vec`, e.g.
-`SpecializedConv(ShaderEntry, Vec<u32>, u32)`. The comment at `runtime.rs:1114`
-says variants are "resolved after compilation or tuning, never while recording a
-step", which is true of the *key* but not of the lookup. Storing
-`selected: Vec<&ComputePipeline>` after `select()` removes it. This is the
-per-dispatch half of the measured cost below, and it is worth roughly a third of
-the per-dispatch figure by inspection, not by attribution — see "what is still
-attributable".
+`&self.map[&self.selected[dispatch_index]]` hashes a `Variant` — a wide enum
+some of whose variants embed a `Vec`, e.g. `SpecializedConv(ShaderEntry,
+Vec<u32>, u32)`. The comment above `select()` says variants are "resolved after
+compilation or tuning, never while recording a step", which is true of the *key*
+but not of the lookup. Storing `selected: Vec<&ComputePipeline>` after `select()`
+removes it.
+
+**Measured, and small.** Timing the four phases inside `record_groups` puts this
+at **7% of the host path** — 44 ns of ~657 ns per dispatch, and the host path is
+itself 89–98% of a step, so removing it entirely is worth about 6% end to end on
+a small model. A standalone microbenchmark agrees: a `HashMap<Variant, _>` probe
+over a 4096-key enum is 23 ns, of which 12 ns is hashing the key. The width of
+the enum is not the cost; the per-dispatch count is. Recommendation **withdrawn**:
+this is not where the time is.
 
 **3c. The benchmark that settles both. `examples/bench_step_cpu.rs`.**
 
@@ -282,9 +293,9 @@ self.sync_point = Some(self.gpu.submit(&mut self.encoder));
 
 The `wait()` blocks on the *previous* step's fence before recording starts, so
 the host record time is exposed rather than overlapped. The encoder is already
-double-buffered (`buffer_count: 2` at `runtime.rs:3548`) and `Session::record`
-documents that recording while earlier work is in flight is fine — `step()`
-just does not do it.
+double-buffered (`buffer_count: 2` where `Session` builds its encoder), and
+`Session::record` documents that recording while earlier work is in flight is
+fine — `step()` just does not do it.
 
 That reasoning is sound but measures out as not worth acting on. From the
 `bench_step_cpu` table, `step_ms - encode_ms` — everything an encoder rotation
@@ -382,7 +393,7 @@ reconsidering.
   Instrumenting `merge_horizontal` across the whole suite shows only `MatMul`
   (55), `MatMulBT` (29) and `MatMulAT` (44) are ever horizontally merged, so the
   first site's list happened to be complete for every case the suite produces —
-  by luck, since the merge predicate at `compile.rs:1058` restricts the kernel
+  by luck, since `merge_horizontal`'s predicate in `compile.rs` restricts the kernel
   but not the shader. The prologue site is **never reached by any test at all**,
   so its old list could not be validated empirically; the centralisation makes it
   correct by construction instead.
