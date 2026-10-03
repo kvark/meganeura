@@ -219,6 +219,10 @@ name = "bench_step_cpu"
 path = "examples/bench_step_cpu.rs"
 
 [[example]]
+name = "bench_attention_coop"
+path = "examples/bench_attention_coop.rs"
+
+[[example]]
 name = "qwen3"
 path = "examples/qwen3.rs"
 required-features = ["hf-hub"]
