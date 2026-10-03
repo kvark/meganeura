@@ -4110,7 +4110,29 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
 
     let _ = writeln!(src, "var<workgroup> shared_q: array<f16, {}>;", bq * hd);
     let _ = writeln!(src, "var<workgroup> shared_k_t: array<f16, {}>;", hd * bkv);
-    let _ = writeln!(src, "var<workgroup> shared_v: array<f16, {}>;", bkv * hd);
+    // V is f32, unlike Q and K — and unlike the non-cooperative flash kernel
+    // above, which also stages V as f32.
+    //
+    // The cooperative matrix is QK^T only. `shared_q` and `shared_k_t` are
+    // operands of `coopLoadT<coop_mat16x16<f16,A/B>>` and have to be f16 for
+    // the instruction. V is not an operand of any matrix instruction: PV is a
+    // scalar loop, so the f16 staging bought nothing and cost the conversion
+    // back to f32 on every element of every score.
+    //
+    // It is also where essentially all of the error was. Rounding V to f16 on
+    // its own reproduces the cooperative kernel's entire worst-case error —
+    // 2.36e-4 of 2.36e-4 at head_dim 64, 2.44e-4 of 2.71e-4 at 256, 2.40e-4 of
+    // 2.55e-4 at 128 — against 3.8e-5..9.6e-5 for Q and 4.5e-5..8.3e-5 for K.
+    // `examples/bench_attention_coop` derives those floors by rounding one
+    // operand at a time in an f64 CPU reference and differencing against the
+    // exact evaluation, so no shader is involved.
+    //
+    // Q and K stay f16 because the hardware requires it, and their residual is
+    // 3-4x smaller anyway: their errors are summed over `head_dim` terms and
+    // then normalised by the softmax, whereas V's error enters the output
+    // linearly as a convex combination, and positive weights summing to one do
+    // not cancel a rounding error the way an average over `head_dim` terms does.
+    let _ = writeln!(src, "var<workgroup> shared_v: array<f32, {}>;", bkv * hd);
     let _ = writeln!(
         src,
         "var<workgroup> shared_score: array<f32, {}>;",
@@ -4196,7 +4218,7 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
         "            shared_k_t[d * 16u + ki] = f16(src_b[kv_pos * kv_dim + kv_head_off + d]);\n",
     );
     src.push_str(
-        "            shared_v[ki * head_dim + d] = f16(bias[kv_pos * kv_dim + kv_head_off + d]);\n",
+        "            shared_v[ki * head_dim + d] = bias[kv_pos * kv_dim + kv_head_off + d];\n",
     );
     src.push_str("        }\n");
     src.push_str("        workgroupBarrier();\n\n");
@@ -4266,7 +4288,7 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     );
     let _ = writeln!(
         src,
-        "                local_o[e] = local_o[e] + p * f32(shared_v[j * {hd}u + d_off + e]);"
+        "                local_o[e] = local_o[e] + p * shared_v[j * {hd}u + d_off + e];"
     );
     src.push_str("            }\n");
     src.push_str("        }\n");
@@ -4379,7 +4401,14 @@ pub fn generate_flash_grad_q_coop_module(head_dim: u32) -> ShaderModule {
 
     let _ = writeln!(src, "var<workgroup> shared_q: array<f16, {}>;", bq * hd);
     let _ = writeln!(src, "var<workgroup> shared_do: array<f16, {}>;", bq * hd);
-    let _ = writeln!(src, "var<workgroup> shared_k: array<f16, {}>;", bkv * hd);
+    // Two copies of K: `shared_k_t` is the cooperative operand for the score
+    // matmul and has to be f16, `shared_k` is the untransposed copy the scalar
+    // `dS·K` loop reads and does not.
+    //
+    // Staging the second copy as f16 and converting it straight back on read
+    // (`f32(shared_k[...])`) is the same avoidable loss the cooperative forward
+    // had with V: the accumulator is f32, so the f16 only rounded the value.
+    let _ = writeln!(src, "var<workgroup> shared_k: array<f32, {}>;", bkv * hd);
     let _ = writeln!(src, "var<workgroup> shared_k_t: array<f16, {}>;", hd * bkv);
     let _ = writeln!(src, "var<workgroup> shared_v_t: array<f16, {}>;", hd * bkv);
     let _ = writeln!(
@@ -4501,7 +4530,7 @@ pub fn generate_flash_grad_q_coop_module(head_dim: u32) -> ShaderModule {
     src.push_str("            let kv_pos = t + ki;\n");
     src.push_str("            let k_v = src_b[kv_pos * kv_dim + kv_head_off + d];\n");
     src.push_str("            let v_v = bias[kv_pos * kv_dim + kv_head_off + d];\n");
-    src.push_str("            shared_k[i] = f16(k_v);\n");
+    src.push_str("            shared_k[i] = k_v;\n");
     let _ = writeln!(src, "            shared_k_t[d * {bkv}u + ki] = f16(k_v);");
     let _ = writeln!(src, "            shared_v_t[d * {bkv}u + ki] = f16(v_v);");
     src.push_str("        }\n");
@@ -4588,7 +4617,7 @@ pub fn generate_flash_grad_q_coop_module(head_dim: u32) -> ShaderModule {
     );
     let _ = writeln!(
         src,
-        "                let kv = f32(shared_k[j * {hd}u + d_off + e]);"
+        "                let kv = shared_k[j * {hd}u + d_off + e];"
     );
     src.push_str("                local_dq[e] = local_dq[e] + p * kv;\n");
     src.push_str("            }\n");
@@ -4711,9 +4740,17 @@ pub fn generate_flash_grad_kv_coop_module(head_dim: u32) -> ShaderModule {
 
     let _ = writeln!(src, "var<workgroup> shared_k: array<f16, {}>;", bkv * hd);
     let _ = writeln!(src, "var<workgroup> shared_v: array<f16, {}>;", bkv * hd);
-    let _ = writeln!(src, "var<workgroup> shared_q: array<f16, {}>;", bq * hd);
+    // Four copies of the Q-side data, and only two of them are cooperative
+    // operands. `shared_k`, `shared_k_t`, `shared_v` and `shared_do_t` feed
+    // `coopLoadT` for the score and `dp` matmuls and have to be f16;
+    // `shared_q` and `shared_do` are the untransposed copies that the scalar
+    // `dS·Q` (for dK) and `p·dO` (for dV) loops read, and do not.
+    //
+    // Those two were staged as f16 and converted straight back on read, which
+    // rounds a value the f32 accumulator then had to work around.
+    let _ = writeln!(src, "var<workgroup> shared_q: array<f32, {}>;", bq * hd);
     let _ = writeln!(src, "var<workgroup> shared_q_t: array<f16, {}>;", hd * bq);
-    let _ = writeln!(src, "var<workgroup> shared_do: array<f16, {}>;", bq * hd);
+    let _ = writeln!(src, "var<workgroup> shared_do: array<f32, {}>;", bq * hd);
     let _ = writeln!(src, "var<workgroup> shared_do_t: array<f16, {}>;", hd * bq);
     let _ = writeln!(
         src,
@@ -4816,8 +4853,8 @@ pub fn generate_flash_grad_kv_coop_module(head_dim: u32) -> ShaderModule {
     src.push_str("                    let q_off = qp * q_dim + q_head * head_dim + d;\n");
     src.push_str("                    let qv = src_a[q_off];\n");
     src.push_str("                    let dov = d_out[q_off];\n");
-    src.push_str("                    shared_q[i] = f16(qv);\n");
-    src.push_str("                    shared_do[i] = f16(dov);\n");
+    src.push_str("                    shared_q[i] = qv;\n");
+    src.push_str("                    shared_do[i] = dov;\n");
     let _ = writeln!(
         src,
         "                    shared_q_t[d * {bq}u + qi] = f16(qv);"
@@ -4827,8 +4864,8 @@ pub fn generate_flash_grad_kv_coop_module(head_dim: u32) -> ShaderModule {
         "                    shared_do_t[d * {bq}u + qi] = f16(dov);"
     );
     src.push_str("                } else {\n");
-    src.push_str("                    shared_q[i] = f16(0.0);\n");
-    src.push_str("                    shared_do[i] = f16(0.0);\n");
+    src.push_str("                    shared_q[i] = 0.0;\n");
+    src.push_str("                    shared_do[i] = 0.0;\n");
     let _ = writeln!(
         src,
         "                    shared_q_t[d * {bq}u + qi] = f16(0.0);"
@@ -4855,7 +4892,7 @@ pub fn generate_flash_grad_kv_coop_module(head_dim: u32) -> ShaderModule {
     );
     let _ = writeln!(
         src,
-        "                    row_part = row_part + f32(shared_do[kv_row * {hd}u + d_off + e]) * fwd_dst[q_base + e];"
+        "                    row_part = row_part + shared_do[kv_row * {hd}u + d_off + e] * fwd_dst[q_base + e];"
     );
     src.push_str("                }\n");
     src.push_str("            }\n");
@@ -4978,11 +5015,11 @@ pub fn generate_flash_grad_kv_coop_module(head_dim: u32) -> ShaderModule {
     );
     let _ = writeln!(
         src,
-        "                    let dov = f32(shared_do[q * {hd}u + d_off + e]);"
+        "                    let dov = shared_do[q * {hd}u + d_off + e];"
     );
     let _ = writeln!(
         src,
-        "                    let qv  = f32(shared_q [q * {hd}u + d_off + e]);"
+        "                    let qv  = shared_q[q * {hd}u + d_off + e];"
     );
     src.push_str("                    local_dv[e] = local_dv[e] + p  * dov;\n");
     src.push_str("                    local_dk[e] = local_dk[e] + ds * qv;\n");
@@ -6395,7 +6432,140 @@ mod tests {
         }
     }
 
-    /// Verify every shader group generates a valid Naga module.
+    /// Every `array<f16>` in workgroup memory must be an operand of a
+    /// cooperative matrix load or store.
+    ///
+    /// A cooperative matmul instruction takes f16 operands, so staging Q and K
+    /// as f16 to feed `coopLoadT<coop_mat16x16<f16,A/B>>` is forced by the
+    /// hardware. Staging anything else as f16 is not: it rounds a value that
+    /// then goes through f32 arithmetic, and the rounding is pure loss.
+    ///
+    /// This is not hypothetical. `generate_flash_attention_coop_module` staged
+    /// V as f16 while using it only in the scalar PV loop — the accumulator was
+    /// already f32, so the kernel converted each element straight back. That
+    /// one staging array accounted for the entire worst-case error of the
+    /// cooperative forward on NVIDIA: rounding V to f16 in an f64 CPU reference
+    /// reproduces the measured error to the digit (2.36e-4 of 2.36e-4 at
+    /// head_dim 64, 2.44e-4 of 2.71e-4 at 256), while Q and K together
+    /// contribute 3-4x less because the softmax averages their error away.
+    /// `examples/bench_attention_coop` measures both.
+    ///
+    /// The assertion is structural rather than numeric so it catches the next
+    /// one at compile-test time instead of on hardware with a cooperative
+    /// matrix, where most of these variants are otherwise unreachable.
+    #[test]
+    fn every_f16_workgroup_array_is_a_cooperative_operand() {
+        /// Does `line` contain `pattern` with `name` already substituted?
+        /// `regex` is not a dependency here, and the pattern is only ever
+        /// `\b<identifier>\s*[\[,]`, so a scan for the identifier followed by
+        /// optional space and one of two delimiters is enough — and it keeps the
+        /// check free of a regex engine for a three-character test.
+        fn regex_like(line: &str, pattern: &str) -> bool {
+            // Strip the leading `\b` and trailing character class to get the
+            // identifier out of the pattern.
+            let name = pattern
+                .trim_start_matches("\\b")
+                .split("\\s")
+                .next()
+                .unwrap_or(pattern);
+            line.match_indices(name).any(|(at, _)| {
+                let before_ok = at == 0
+                    || !line[..at]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                let rest = &line[at + name.len()..];
+                let after = rest.trim_start();
+                before_ok && after.starts_with('[') || after.starts_with(',')
+            })
+        }
+
+        fn check(label: &str, source: &str) {
+            // Declarations look like `var<workgroup> name: array<f16, N>;`.
+            let mut offenders = Vec::new();
+            for line in source.lines() {
+                let Some(rest) = line.split("var<workgroup>").nth(1) else {
+                    continue;
+                };
+                if !rest.contains("array<f16") {
+                    continue;
+                }
+                let name = rest
+                    .split_whitespace()
+                    .next()
+                    .expect("a declaration has a name")
+                    .trim_end_matches(':');
+                // `coopLoadT`/`coopStoreT` take the array as their first
+                // argument, so the name appearing on such a line is what makes
+                // the f16 storage necessary.
+                // Match `name[` and `name [`: the generated source is not
+                // consistent about the space, and a check that misses one
+                // spelling would silently pass a real offender.
+                let pattern = format!(r"\b{name}\s*[\[,]");
+                let is_operand = source
+                    .lines()
+                    .filter(|l| l.contains("coopLoadT") || l.contains("coopStoreT"))
+                    .any(|l| regex_like(l, &pattern));
+                if !is_operand {
+                    offenders.push(name.to_string());
+                }
+            }
+            assert!(
+                offenders.is_empty(),
+                "{label}: workgroup arrays staged as f16 but never loaded into or stored from a \
+                 cooperative matrix: {offenders:?}. f16 is only justified for an operand of \
+                 coopLoadT/coopStoreT; anything read by scalar code should be f32."
+            );
+        }
+
+        let head_dims = [16u32, 32, 64, 128, 256];
+        for hd in head_dims {
+            check(
+                &format!("flash_attention_coop hd={hd}"),
+                &generate_flash_attention_coop_module(hd).source,
+            );
+            check(
+                &format!("flash_grad_q_coop hd={hd}"),
+                &generate_flash_grad_q_coop_module(hd).source,
+            );
+            check(
+                &format!("flash_grad_kv_coop hd={hd}"),
+                &generate_flash_grad_kv_coop_module(hd).source,
+            );
+        }
+
+        // The cooperative matmul family. Its f16 staging is the split
+        // `hi`/`lo` form of `CoopConfig::compensated` (Ootomo & Yokota), which
+        // reconstructs f32's mantissa from two f16 operands — so the f16 is
+        // load-bearing there and the assertion holds.
+        for tile_size in [8u32, 16] {
+            for use_f16_input in [false, true] {
+                for compensated in [false, true] {
+                    let config = CoopConfig {
+                        tile_size,
+                        use_f16_input,
+                        compensated,
+                    };
+                    for group in [
+                        ShaderGroup::MatMul,
+                        ShaderGroup::MatMulAdd,
+                        ShaderGroup::BlockMatMul,
+                    ] {
+                        if coop_shape(group).is_none() {
+                            continue;
+                        }
+                        check(
+                            &format!(
+                                "{group:?} tile={tile_size} f16={use_f16_input} comp={compensated}"
+                            ),
+                            &generate_module_coop(group, &config).source,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn all_shaders_generate_valid_modules() {
         let groups = [

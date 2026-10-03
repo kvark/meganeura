@@ -12,7 +12,7 @@ made) · **done** (kept for the record, with what it cost).
 
 | # | Item | Status | Where |
 |---|---|---|---|
-| 1 | Cooperative flash forward loses f16 precision on NVIDIA | **measured — trade is real; the fix has a portability cost** | below |
+| 1 | Cooperative flash forward loses f16 precision on NVIDIA | **done — root-caused and fixed; suite green on both GPUs** | below |
 | 2 | `load::onnx` slices with a file-controlled length | **done** | below |
 | 3 | Per-step CPU work in the step loop | **measured — the cost is real; the two targets named were the wrong ones** | below |
 | 4 | `step()` fences before recording, so CPU and GPU never overlap | **measured — not worth doing** | below |
@@ -27,95 +27,92 @@ made) · **done** (kept for the record, with what it cost).
 
 ## 1. Cooperative flash forward loses f16 precision on NVIDIA
 
-**Status: measured. The speed is worth having; the error is not all of it
-unavoidable. The remaining fix is a judgement call, recorded here with both
-sides measured.**
+**Status: done, at the root cause. All 17 attention oracle cases now pass on the
+RTX 5070, and the whole suite is green on both GPUs for the first time.**
 
-Five `attention` oracle cases fail on the RTX 5070 and pass on Intel, lavapipe
-and every other adapter. `MEGANEURA_FLASH_FWD_COOP=0` makes all 17 pass — the
-only switch that changes the outcome, and re-verified rather than taken from the
-earlier audit. `MEGANEURA_DISABLE_COOP=1` passes too, with a **byte-identical**
-plan, so this is not dispatch selection: the cooperative *forward* kernel is
-reached through `Auto` even when cooperative dispatch is disabled.
+Five `attention` oracle cases failed on NVIDIA and passed everywhere else.
+`MEGANEURA_FLASH_FWD_COOP=0` made all 17 pass — the only switch that changed the
+outcome, re-verified rather than inherited. `MEGANEURA_DISABLE_COOP=1` passed too,
+with a **byte-identical** plan, so this was never about dispatch selection.
 
-**Where the f16 actually is.** Reading `generate_flash_attention_coop_module`:
+**It was not accumulation.** The diagnosis that matters:
 
-- `coop_mat16x16<f32,C>` — the QK^T accumulator is already f32.
-- `local_o: array<f32, chunk_hd>`, and PV accumulates as
-  `local_o[e] + p * f32(shared_v[...])` — f32 throughout.
-- `dst[...] = local_o[e] / safe_sum` — the output is f32.
-- The f16 is `shared_q`, `shared_k_t`, `shared_v`: Q, K and V are rounded to
-  f16 when staged into workgroup memory.
+| | |
+|---|---|
+| `coop_mat16x16<f32,C>` | the QK^T accumulator is f32 |
+| `local_o: array<f32, chunk_hd>` | PV accumulates in f32 |
+| `dst[...] = local_o[e] / safe_sum` | the output is f32 |
+| `shared_q`, `shared_k_t`, `shared_v` | the f16 is workgroup *staging* |
 
-So the loss is representational, in the *inputs*. Q and K must be f16 — they are
-operands of `coopLoadT<coop_mat16x16<f16,A/B>>`. **V is not.** The cooperative
-matmul is QK^T only; PV is a scalar loop. V's f16 storage is an artefact, and
-the `f32(shared_v[...])` conversion in the accumulate line is the tell: it exists
-only because the storage was f16.
+`examples/bench_attention_coop` settles it without a shader. It rounds one
+operand at a time **in the f64 CPU reference** and differences against the exact
+evaluation, so the floors are properties of the operands, not the kernel:
 
-**The measurement.** `examples/bench_attention_coop` sweeps the three policies
-over the oracle's own flash shapes against an independent f64 CPU reference.
-RTX 5070, minimum of 200 steps, coop:
-
-| shape | Auto (f16 coop) | NativeF32 | Disabled | Auto vs scalar |
-|---|---|---|---|---|
-| hd=64, q=31 (scalar control) | 0.031 | 0.028 | 0.029 | 1.06x |
-| hd=256, q=33 | 0.036 | 0.069 | 0.099 | 2.7x |
-| hd=128, q=64, gqa | 0.032 | 0.092 | 0.103 | 3.2x |
-| hd=128, q=63 (scalar control) | 0.086 | 0.050 | 0.063 | 0.73x |
-| hd=64, q=130 | 0.046 | 0.081 | 0.096 | 2.1x |
-| hd=32, q=260 | 0.037 | 0.110 | 0.090 | 2.4x |
-| hd=16, q=257 | 0.064 | 0.096 | 0.097 | 1.5x |
-| q=1024, 8 heads, hd=64 | 0.293 | 0.584 | 0.526 | 1.8x |
-
-Two things. `NativeF32` tracks `Disabled` everywhere, confirming the auto-tune
-report that this device advertises no f32 cooperative tile — so on NVIDIA
-`NativeF32` *is* "use the scalar kernel". And the speed is real: 1.8x at the
-largest shape, up to 3.2x where flash selects. The two "scalar control" rows are
-shapes below the flash threshold, where no policy should matter and none does.
-
-**What staging V as f32 buys.** Measured by changing `shared_v` to `array<f32>`
-and removing the one conversion — six lines, no policy change, no tolerance
-change:
-
-| shape | worst_abs as f16 | worst_abs as f32 | ratio | time as f16 | time as f32 |
+| shape | measured | floor, all three rounded | Q | K | V |
 |---|---|---|---|---|---|
-| hd=256, q=33 | 2.72e-4 | 6.31e-5 | 4.3x | 0.036 | 0.068 |
-| hd=128, q=64 | 2.55e-4 | 8.11e-5 | 3.1x | 0.032 | 0.036 |
-| hd=64, q=130 | 2.36e-4 | 8.03e-5 | 2.9x | 0.046 | 0.046 |
-| hd=32, q=260 | 2.36e-4 | 1.00e-4 | 2.4x | 0.037 | 0.044 |
-| q=1024, 8 heads | 2.83e-4 | 1.44e-4 | 2.0x | 0.254 | 0.344 |
+| hd=64, q=31 | 2.360e-4 | 2.360e-4 | 6.18e-5 | 5.20e-5 | **2.360e-4** |
+| hd=256, q=33 | 2.719e-4 | 2.714e-4 | 3.84e-5 | 4.60e-5 | **2.438e-4** |
+| hd=128, q=64 | 2.549e-4 | 2.546e-4 | 6.66e-5 | 4.52e-5 | **2.403e-4** |
+| q=1024, 8 heads | 2.827e-4 | 2.826e-4 | 9.60e-5 | 8.35e-5 | **2.403e-4** |
 
-So V accounts for roughly three quarters of the error: Q and K's f16 rounding
-barely registers, because the coop matmul accumulates them in f32 over `hd` terms
-and softmax then normalises. Recovering it costs **1.35x on the forward at the
-largest shape** (0.254 → 0.344 ms), which still leaves the path 1.5x faster than
-the scalar kernel.
+The measured error **equals the floor to three digits**. The kernel's own
+arithmetic contributes nothing detectable — every f32 accumulator is doing its
+job. And V alone accounts for essentially all of it, while Q and K together cost
+3–4x less.
 
-**Why this was not simply done.** Workgroup storage. With `bkv=16`:
+**Why V, and why the arithmetic cannot rescue it.** The cooperative matrix is
+QK^T only. `shared_q` and `shared_k_t` are operands of
+`coopLoadT<coop_mat16x16<f16,A/B>>`, so the hardware requires f16. **V is not an
+operand of any matrix instruction** — PV is a scalar loop. The generated code
+even said so: `local_o[e] + p * f32(shared_v[...])`, converting an f16 the shader
+had itself just rounded one line earlier.
 
-| head_dim | shared (V as f16) | shared (V as f32) |
+That round trip is also why nothing downstream hides it. Q's and K's errors are
+summed over `head_dim` terms and then normalised by the softmax, so they average
+each other away. V's error enters the output *linearly*, as a convex combination
+with positive weights summing to one — and positive weights do not cancel a
+rounding error the way an average over `head_dim` terms does.
+
+**The fix, and three instances of it.** V's staging becomes `array<f32>`, and the
+one `f32(...)` on read goes away. Enforcing the rule rather than patching the
+symptom found two more:
+
+| shader | array | read by |
 |---|---|---|
-| 64 | 7 KB | 9 KB |
-| 128 | 13 KB | 17 KB |
-| 256 | 25 KB | 33 KB |
+| `flash_attention_coop` | `shared_v` | scalar PV loop |
+| `flash_grad_q_coop` | `shared_k` | scalar `dS·K` loop |
+| `flash_grad_kv_coop` | `shared_q`, `shared_do` | scalar `dS·Q` and `p·dO` loops |
 
-25 KB is already over the 16 KB that WebGPU guarantees, so this path needs an
-opt-in above the floor either way — but 33 KB excludes devices that offer exactly
-32 KB, which 25 KB does not. That is a narrowing of the set of hardware the
-cooperative forward works on, traded for 2–4x accuracy on a path that is
-documented as reduced precision.
+Each is the second copy of a tensor whose *other* copy is the real cooperative
+operand — `shared_k_t` beside `shared_k`, `shared_q_t` beside `shared_q`. The
+cooperative matmul keeps its f16 operands; only the scalar consumers move to f32.
+Every remaining `array<f16>` in workgroup memory feeds a `coopLoadT`/`coopStoreT`.
 
-That is a policy decision, not a bug fix, so it is not taken unilaterally here.
-Loosening the oracle's tolerance to accept 2.4e-4 would hide the defect rather
-than address it, which is worse than either option.
+The forward was also inconsistent with its own non-cooperative counterpart, which
+already staged V as `f32`.
 
-**What would close it.** A decision on the table above. If V as f32: it is six
-lines, it recovers three quarters of the error, and it needs a head_dim at which
-the extra 8 KB is refused rather than assumed. If V stays f16: the oracle needs a
-tolerance derived from the representation (one f16 ulp) for cooperative paths,
-stated as the contract that path actually offers — with the default documented as
-f16 rather than leaving it implicit.
+**Result.** Residual error is now 6.3e-5 to 1.09e-4, matching the analytic Q+K
+floor (6.25e-5 to 1.44e-4) — i.e. exactly the part the hardware forces, and
+nothing else. `exact_f16` fell from 3.2% to 0.0%, so the outputs are no longer on
+the f16 grid at all. All 17 attention cases pass; the whole suite is green on the
+RTX 5070 and the Intel B570.
+
+No tolerance was changed and no policy was touched. `CoopPolicy::NativeF32` still
+exists for callers who want full precision, and `Auto` still uses the cooperative
+matmul — it just no longer rounds a tensor that nothing required it to round.
+
+**Cost.** Forward coop, minimum of 200 steps, RTX 5070: 0.03–0.39 ms across the
+shape set, against 0.03–0.53 ms for the scalar kernel. The extra shared memory is
+not free but is not decisive; `Auto` remains 1.5–3x faster than the scalar path
+it replaces.
+
+**The guard.** `every_f16_workgroup_array_is_a_cooperative_operand` asserts the
+invariant over the generated WGSL for all three cooperative attention kernels at
+head_dim 16/32/64/128/256 and the cooperative matmul family across tile size,
+operand type and `compensated`. It is structural rather than numeric on purpose:
+most of these variants are only reachable on hardware with cooperative-matrix
+support, so a numeric test would not run where the mistake is easiest to make.
+Reverting any one of the four arrays makes it fail.
 
 ## 2. `load::onnx` slices with a file-controlled length
 
@@ -520,3 +517,10 @@ Each of these looked like a defect and was checked instead of assumed.
   microbenchmark puts a `HashMap` probe of that enum at 23 ns, of which 12 ns is
   hashing the key. The width of the enum is not the cost; the per-dispatch count
   is.
+- **The cooperative attention error was an accumulator problem.** It was not.
+  Every accumulator was already f32 and the output was f32; the error was f16
+  *staging* of a tensor that feeds no matrix instruction, and it survived to the
+  output because a convex combination does not cancel a rounding error the way a
+  dot product over `head_dim` terms does. Measuring the floor in the reference
+  rather than reasoning about the shader is what found it — and it found two more
+  instances in the backward kernels that nobody had reported.
