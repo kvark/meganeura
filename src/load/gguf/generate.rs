@@ -102,14 +102,7 @@ impl Default for GenerationOptions {
     }
 }
 
-/// One context for every session this module builds.
-///
-/// `inference_from_env` creates a device-selected context per call and hands
-/// it to a single session. A caller loading several models would cross the
-/// point where the NVIDIA driver stops issuing contexts — after which
-/// `from_env` refuses rather than continuing on a different adapter — and a
-/// generator wanting both prefill and decode would be two contexts on its own.
-/// Sharing keeps device selection one decision, made once.
+/// Share the selected device across prefill, decode and repeated model loads.
 fn session_config() -> crate::SessionConfig<'static> {
     static CONTEXT: std::sync::OnceLock<std::sync::Arc<blade_graphics::Context>> =
         std::sync::OnceLock::new();

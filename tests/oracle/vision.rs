@@ -23,7 +23,7 @@ fn dispatched(graph: &Graph, mode: Mode, options: &gpu::Options) -> Vec<ShaderEn
         .plan()
         .dispatches
         .iter()
-        .map(|d| d.shader())
+        .map(|d| d.shader.clone())
         .collect()
 }
 
@@ -1128,10 +1128,10 @@ fn conv2d_tuned_kernels() {
             let conv = plan
                 .dispatches
                 .iter_mut()
-                .find(|d| is_conv_gemm(&d.shader()))
+                .find(|d| is_conv_gemm(&d.shader))
                 .unwrap();
-            let shader = conv.shader();
-            conv.set_kernel(kernel.clone());
+            let shader = conv.shader.clone();
+            conv.kernel = kernel.clone();
             let report = check_plan(g, &feeds, plan);
             failures.report(&format!("{label} {shader:?} {kernel:?}"), &report);
         }
@@ -1174,7 +1174,7 @@ fn conv2d_grad_weight_split_k() {
             let index = plan
                 .dispatches
                 .iter()
-                .position(|d| is_conv_gemm(&d.shader()))
+                .position(|d| is_conv_gemm(&d.shader))
                 .unwrap();
             if let Err(e) = plan.split_conv_weight_gradients(&[(index, splits)], usize::MAX) {
                 failures
@@ -1182,7 +1182,7 @@ fn conv2d_grad_weight_split_k() {
                     .push(format!("{c:?} splits {splits}: refused: {e:?}"));
                 continue;
             }
-            let shaders: Vec<_> = plan.dispatches.iter().map(|d| d.shader()).collect();
+            let shaders: Vec<_> = plan.dispatches.iter().map(|d| d.shader.clone()).collect();
             failures.expect_shader(&format!("{c:?}"), &shaders, &split_shader);
             let report = check_plan(&g, &feeds, plan);
             failures.report(&format!("{c:?} splits {splits} {split_shader:?}"), &report);

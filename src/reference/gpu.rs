@@ -56,31 +56,14 @@ impl Options {
     }
 }
 
-/// One context for every session this module builds.
-///
-/// [`SessionConfig::from_env`] creates a GPU context eagerly whenever a
-/// device id, timing or capture is requested, and `build` creates another when
-/// none was supplied. A differential suite runs hundreds of throwaway
-/// sessions in one process, so it crossed the point where the NVIDIA driver
-/// stops handing out contexts — after about ten — and every case past that
-/// point silently landed on a different adapter. The suite was therefore
-/// measuring two GPUs and reporting whichever it got as the answer.
-///
-/// Sharing is what these checks want anyway: they compare kernels against the
-/// f64 reference, so the device has to be the same one throughout for the
-/// comparison to mean anything. Sessions still isolate each case — buffers,
-/// poisoning and the dispatch plan are per-session — so nothing else is
-/// shared.
+/// Reuse one environment-selected context across reference checks.
 pub fn shared_context() -> Arc<blade_graphics::Context> {
     static CONTEXT: OnceLock<Arc<blade_graphics::Context>> = OnceLock::new();
     CONTEXT
         .get_or_init(|| {
             crate::runtime::init_gpu_context_with(crate::GpuOptions::from_env())
                 .map(Arc::new)
-                .expect(
-                    "a GPU context for the reference checks. If MEGANEURA_DEVICE_ID names a \
-                     device that cannot be opened, this is where it surfaces.",
-                )
+                .expect("GPU context for reference checks")
         })
         .clone()
 }

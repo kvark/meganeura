@@ -433,8 +433,8 @@ fn uniform_constant_aliases(plan: &ExecutionPlan) -> Vec<Option<usize>> {
         mark(buffer);
     }
     for dispatch in &plan.dispatches {
-        mark(dispatch.output_buffer());
-        for &buffer in &dispatch.extra_outputs() {
+        mark(dispatch.output_buffer);
+        for &buffer in &dispatch.extra_outputs {
             mark(buffer);
         }
     }
@@ -570,13 +570,31 @@ fn compute_pinned(
     let mut uses = vec![BufferUse::default(); n];
     for (i, d) in plan.dispatches.iter().enumerate() {
         let g = group_of[i];
-        d.visit_inputs(|b| uses[b.0 as usize].read(g));
-        d.visit_outputs(|b| uses[b.0 as usize].write(g));
-        if matches!(
-            d.shader(),
-            ShaderEntry::CacheWrite | ShaderEntry::CacheWritePrefix
-        ) {
-            pinned[d.output_buffer().0 as usize] = true;
+        for b in &d.input_buffers {
+            uses[b.0 as usize].read(g);
+        }
+        if let Some(epi) = d.matmul_epilogue.as_ref() {
+            for &(b, _) in &epi.inputs {
+                uses[b.0 as usize].read(g);
+            }
+        }
+        if let Some(pro) = d.matmul_prologue.as_ref() {
+            for &(b, _) in &pro.factors {
+                uses[b.0 as usize].read(g);
+            }
+        }
+        uses[d.output_buffer.0 as usize].write(g);
+        for b in &d.extra_outputs {
+            uses[b.0 as usize].write(g);
+        }
+        match d.shader {
+            // KV caches persist across steps.
+            ShaderEntry::CacheWrite => pinned[d.output_buffer.0 as usize] = true,
+            // Read-modify-write accumulation into the output.
+            ShaderEntry::ScatterAdd | ShaderEntry::ScatterAddAtomic => {
+                uses[d.output_buffer.0 as usize].read(g);
+            }
+            _ => {}
         }
     }
     // Keep an attention operation's external bindings live across its whole
@@ -586,20 +604,20 @@ fn compute_pinned(
         .dispatches
         .iter()
         .enumerate()
-        .filter(|&(_, d)| d.shader() == ShaderEntry::CachedBlockAttentionSplit)
-        .map(|(i, d)| (d.output_buffer(), i))
+        .filter(|&(_, d)| d.shader == ShaderEntry::CachedBlockAttentionSplit)
+        .map(|(i, d)| (d.output_buffer, i))
         .collect();
     for (i, d) in plan.dispatches.iter().enumerate() {
-        if d.shader() != ShaderEntry::CachedBlockAttentionCombine {
+        if d.shader != ShaderEntry::CachedBlockAttentionCombine {
             continue;
         }
-        let Some(&producer) = d.input_buffers().first().and_then(|b| partials.get(b)) else {
+        let Some(&producer) = d.input_buffers.first().and_then(|b| partials.get(b)) else {
             continue;
         };
         let first = group_of[producer];
         let last = group_of[i];
-        uses[d.output_buffer().0 as usize].write(first);
-        for b in &plan.dispatches[producer].input_buffers() {
+        uses[d.output_buffer.0 as usize].write(first);
+        for b in &plan.dispatches[producer].input_buffers {
             uses[b.0 as usize].read(last);
         }
     }
@@ -645,25 +663,15 @@ fn compute_pinned(
 
 #[cfg(test)]
 mod tests {
-    use crate::compile::{DispatchOp, dispatch};
-
     use super::*;
     use crate::compile::Dispatch;
 
     fn dispatch(inputs: &[u32], output: u32) -> Dispatch {
-        Dispatch::new(
-            DispatchOp::Pointwise(dispatch::Pointwise {
-                inputs: inputs.iter().map(|&b| BufferRef(b)).collect(),
-                dst: BufferRef(output),
-                len: 1,
-                dag: crate::schedule::PointwiseDAG {
-                    n_inputs: inputs.len() as u8,
-                    ops: vec![crate::schedule::Pw::const_f32(0.0)],
-                    output: 0,
-                },
-            }),
-            [1, 1, 1],
-        )
+        Dispatch {
+            input_buffers: inputs.iter().map(|&b| BufferRef(b)).collect(),
+            output_buffer: BufferRef(output),
+            ..Default::default()
+        }
     }
 
     fn plan(buffers: Vec<usize>, dispatches: Vec<Dispatch>) -> ExecutionPlan {
@@ -704,10 +712,10 @@ mod tests {
                 iv.0 = iv.0.min(g);
                 iv.1 = iv.1.max(g);
             };
-            for b in &d.input_buffers() {
+            for b in &d.input_buffers {
                 touch(b.0);
             }
-            touch(d.output_buffer().0);
+            touch(d.output_buffer.0);
         }
         for a in 0..plan.buffers.len() {
             for b in (a + 1)..plan.buffers.len() {
@@ -766,34 +774,8 @@ mod tests {
 
         // A split attention result may not reuse its query's allocation:
         // the tuner must be free to evaluate the same operation unsplit.
-        p.dispatches[1].op =
-            DispatchOp::CachedBlockAttentionSplit(dispatch::CachedBlockAttention {
-                q: BufferRef(1),
-                k_cache: BufferRef(0),
-                v_cache: BufferRef(0),
-                position: BufferRef(0),
-                valid_len: BufferRef(0),
-                dst: BufferRef(2),
-                window_size: 0,
-                num_heads: 1,
-                num_kv_heads: 1,
-                head_dim: 1,
-                block_len: 1,
-                max_seq: 1,
-                splits: 2,
-            });
-        p.dispatches[2].op =
-            DispatchOp::CachedBlockAttentionCombine(dispatch::CachedAttentionCombine {
-                partials: BufferRef(2),
-                dst: BufferRef(3),
-                window_size: 0,
-                num_heads: 1,
-                num_kv_heads: 1,
-                head_dim: 1,
-                block_len: 1,
-                max_seq: 1,
-                splits: 2,
-            });
+        p.dispatches[1].shader = ShaderEntry::CachedBlockAttentionSplit;
+        p.dispatches[2].shader = ShaderEntry::CachedBlockAttentionCombine;
         let alias = plan_buffer_aliasing(&p, &groups, None);
         assert_ne!(alias.map[1], alias.map[3]);
         check_disjoint(&p, &groups, &alias);
@@ -925,16 +907,7 @@ mod tests {
     #[test]
     fn cache_write_output_is_pinned() {
         let mut d = dispatch(&[0], 1);
-        d.op = DispatchOp::CacheWrite(dispatch::CacheWrite {
-            src: BufferRef(0),
-            cache: BufferRef(1),
-            position: BufferRef(0),
-            dim: 1,
-        });
-        let mut remapped = d.clone();
-        remapped.map_buffers(|buffer| BufferRef(buffer.0 + 10));
-        assert_eq!(remapped.output_buffer(), BufferRef(11));
-        assert_eq!(remapped.input_buffers()[1], remapped.output_buffer());
+        d.shader = ShaderEntry::CacheWrite;
         let mut p = plan(
             vec![16, 256, 64, 16],
             vec![d, dispatch(&[1], 2), dispatch(&[2], 3)],

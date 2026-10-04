@@ -47,7 +47,7 @@ fn run(
             .plan()
             .dispatches
             .iter()
-            .any(|dispatch| dispatch.shader() == shader)
+            .any(|dispatch| dispatch.shader == shader)
     });
 
     let q_data: Vec<f32> = (0..q_seq * num_heads as usize * head_dim as usize)

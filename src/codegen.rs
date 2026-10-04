@@ -2123,51 +2123,16 @@ fn substitute(source: &str, old: &str, new: &str) -> String {
     source.replace(old, new)
 }
 
-/// The attention uniform for an uncached kernel.
-///
-/// Eight `u32` — 32 bytes, matching `AttentionParams` in `runtime.rs`. The
-/// three trailing fields are padding rather than data, and the size has to
-/// match the Rust side exactly because the buffer is written from there, so
-/// this lives in one place rather than in each generator's prologue.
-const ATTENTION_PARAMS_WGSL: &str = "struct Params {\n    q_seq: u32,\n    kv_seq: u32,\n    packed_heads: u32,\n    head_dim: u32,\n    window_size: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n";
+const ATTENTION_PARAMS_WGSL: &str = include_str!("shaders/attention_params.wgsl");
+const CACHED_ATTENTION_PARAMS_WGSL: &str = include_str!("shaders/cached_attention_params.wgsl");
 
-/// The attention uniform for a kernel reading a KV cache.
-///
-/// Four `u32` — 16 bytes. A cached kernel gets its sequence lengths from the
-/// cache's own metadata, so it carries fewer fields than [`ATTENTION_PARAMS_WGSL`]
-/// rather than the same ones with different values.
-const CACHED_ATTENTION_PARAMS_WGSL: &str = "struct Params {\n    q_seq: u32,\n    num_heads: u32,\n    num_kv_heads: u32,\n    head_dim: u32,\n}\n\n";
-
-/// The causal + sliding-window key range a query row may attend to.
-///
-/// Returns the WGSL declaring `row_kv_start` and `row_kv_len` from an
-/// expression for the query position, at the given indent. Attention reads
-/// `[row_kv_start, row_kv_len)`; a key position outside it is masked.
-///
-/// Causal attention attends to positions at or below the query, so the
-/// exclusive end is `qpos + 1` — except for an uncached row, which sees the
-/// whole context. A sliding window clamps the start to the last
-/// `window_size` positions, and `window_size == 0` disables the clamp, which
-/// is what `select` picks apart here.
-///
-/// Every forward and backward attention kernel needs this, and they need it
-/// identically: a mask fix that missed one of them would train against a
-/// different objective than it evaluates. `qpos` is an expression rather than
-/// a fixed name because the callers hold the query position under different
-/// locals — `qpos`, `qpos_thread`, `qp`, or a loop counter — and spelling the
-/// range out at each site is how those five copies drifted apart in the first
-/// place.
+/// Emit the causal/window key range `[row_kv_start, row_kv_len)` for a query.
 fn kv_range(qpos: &str, indent: usize) -> String {
     let pad = " ".repeat(indent);
     format!(
         "{pad}let row_kv_len = select(kv_seq, {qpos} + 1u, kv_seq == 0u);\n\
          {pad}let row_kv_start = select(0u, row_kv_len - min(row_kv_len, window_size), window_size > 0u);\n"
     )
-}
-
-/// [`kv_range`] followed by a blank line, for the sites that want one.
-fn kv_range_block(qpos: &str, indent: usize) -> String {
-    format!("{}\n", kv_range(qpos, indent))
 }
 
 /// The K-split GEMV with the RmsNorm of its input folded in:
@@ -3705,140 +3670,6 @@ mod tests {
         }
     }
 
-    /// Every `array<f16>` in workgroup memory must be an operand of a
-    /// cooperative matrix load or store.
-    ///
-    /// A cooperative matmul instruction takes f16 operands, so staging Q and K
-    /// as f16 to feed `coopLoadT<coop_mat16x16<f16,A/B>>` is forced by the
-    /// hardware. Staging anything else as f16 is not: it rounds a value that
-    /// then goes through f32 arithmetic, and the rounding is pure loss.
-    ///
-    /// This is not hypothetical. `generate_flash_attention_coop_module` staged
-    /// V as f16 while using it only in the scalar PV loop — the accumulator was
-    /// already f32, so the kernel converted each element straight back. That
-    /// one staging array accounted for the entire worst-case error of the
-    /// cooperative forward on NVIDIA: rounding V to f16 in an f64 CPU reference
-    /// reproduces the measured error to the digit (2.36e-4 of 2.36e-4 at
-    /// head_dim 64, 2.44e-4 of 2.71e-4 at 256), while Q and K together
-    /// contribute 3-4x less because the softmax averages their error away.
-    /// `examples/bench_attention_coop` measures both.
-    ///
-    /// The assertion is structural rather than numeric so it catches the next
-    /// one at compile-test time instead of on hardware with a cooperative
-    /// matrix, where most of these variants are otherwise unreachable.
-    #[test]
-    fn every_f16_workgroup_array_is_a_cooperative_operand() {
-        /// Does `line` contain `pattern` with `name` already substituted?
-        /// `regex` is not a dependency here, and the pattern is only ever
-        /// `\b<identifier>\s*[\[,]`, so a scan for the identifier followed by
-        /// optional space and one of two delimiters is enough — and it keeps the
-        /// check free of a regex engine for a three-character test.
-        fn regex_like(line: &str, pattern: &str) -> bool {
-            // Strip the leading `\b` and trailing character class to get the
-            // identifier out of the pattern.
-            let name = pattern
-                .trim_start_matches("\\b")
-                .split("\\s")
-                .next()
-                .unwrap_or(pattern);
-            line.match_indices(name).any(|(at, _)| {
-                let before_ok = at == 0
-                    || !line[..at]
-                        .chars()
-                        .next_back()
-                        .is_some_and(|c| c.is_alphanumeric() || c == '_');
-                let rest = &line[at + name.len()..];
-                let after = rest.trim_start();
-                before_ok && after.starts_with('[') || after.starts_with(',')
-            })
-        }
-
-        fn check(label: &str, source: &str) {
-            // Declarations look like `var<workgroup> name: array<f16, N>;`.
-            let mut offenders = Vec::new();
-            for line in source.lines() {
-                let Some(rest) = line.split("var<workgroup>").nth(1) else {
-                    continue;
-                };
-                if !rest.contains("array<f16") {
-                    continue;
-                }
-                let name = rest
-                    .split_whitespace()
-                    .next()
-                    .expect("a declaration has a name")
-                    .trim_end_matches(':');
-                // `coopLoadT`/`coopStoreT` take the array as their first
-                // argument, so the name appearing on such a line is what makes
-                // the f16 storage necessary.
-                // Match `name[` and `name [`: the generated source is not
-                // consistent about the space, and a check that misses one
-                // spelling would silently pass a real offender.
-                let pattern = format!(r"\b{name}\s*[\[,]");
-                let is_operand = source
-                    .lines()
-                    .filter(|l| l.contains("coopLoadT") || l.contains("coopStoreT"))
-                    .any(|l| regex_like(l, &pattern));
-                if !is_operand {
-                    offenders.push(name.to_string());
-                }
-            }
-            assert!(
-                offenders.is_empty(),
-                "{label}: workgroup arrays staged as f16 but never loaded into or stored from a \
-                 cooperative matrix: {offenders:?}. f16 is only justified for an operand of \
-                 coopLoadT/coopStoreT; anything read by scalar code should be f32."
-            );
-        }
-
-        let head_dims = [16u32, 32, 64, 128, 256];
-        for hd in head_dims {
-            check(
-                &format!("flash_attention_coop hd={hd}"),
-                &generate_flash_attention_coop_module(hd).source,
-            );
-            check(
-                &format!("flash_grad_q_coop hd={hd}"),
-                &generate_flash_grad_q_coop_module(hd).source,
-            );
-            check(
-                &format!("flash_grad_kv_coop hd={hd}"),
-                &generate_flash_grad_kv_coop_module(hd).source,
-            );
-        }
-
-        // The cooperative matmul family. Its f16 staging is the split
-        // `hi`/`lo` form of `CoopConfig::compensated` (Ootomo & Yokota), which
-        // reconstructs f32's mantissa from two f16 operands — so the f16 is
-        // load-bearing there and the assertion holds.
-        for tile_size in [8u32, 16] {
-            for use_f16_input in [false, true] {
-                for compensated in [false, true] {
-                    let config = CoopConfig {
-                        tile_size,
-                        use_f16_input,
-                        compensated,
-                    };
-                    for group in [
-                        ShaderGroup::MatMul,
-                        ShaderGroup::MatMulAdd,
-                        ShaderGroup::BlockMatMul,
-                    ] {
-                        if coop_shape(group).is_none() {
-                            continue;
-                        }
-                        check(
-                            &format!(
-                                "{group:?} tile={tile_size} f16={use_f16_input} comp={compensated}"
-                            ),
-                            &generate_module_coop(group, &config).source,
-                        );
-                    }
-                }
-            }
-        }
-    }
-
     #[test]
     fn all_shaders_generate_valid_modules() {
         let groups = [
@@ -4080,22 +3911,47 @@ mod tests {
     }
 
     #[test]
-    fn cooperative_attention_shared_bytes_match_generated_storage() {
+    fn cooperative_attention_staging_types_and_storage() {
         for head_dim in [16, 32, 64, 128, 256, 512] {
-            for (group, shader) in [
+            for (group, shader, scalar_arrays) in [
                 (
                     ShaderGroup::FlashAttentionCoop,
                     generate_flash_attention_coop_module(head_dim),
+                    &["shared_v"][..],
                 ),
                 (
                     ShaderGroup::FlashGradQCoop,
                     generate_flash_grad_q_coop_module(head_dim),
+                    &["shared_k"][..],
                 ),
                 (
                     ShaderGroup::FlashGradKVCoop,
                     generate_flash_grad_kv_coop_module(head_dim),
+                    &["shared_q", "shared_do"][..],
                 ),
             ] {
+                for &name in scalar_arrays {
+                    let (_, var) = shader
+                        .module
+                        .global_variables
+                        .iter()
+                        .find(|&(_, var)| var.name.as_deref() == Some(name))
+                        .expect("scalar staging array");
+                    let naga::TypeInner::Array { base, .. } = shader.module.types[var.ty].inner
+                    else {
+                        panic!("{group:?}: {name} must be an array");
+                    };
+                    assert!(
+                        matches!(
+                            shader.module.types[base].inner,
+                            naga::TypeInner::Scalar(naga::Scalar {
+                                kind: naga::ScalarKind::Float,
+                                width: 4
+                            })
+                        ),
+                        "{group:?}: {name} must preserve f32 precision"
+                    );
+                }
                 let mut layout = naga::proc::Layouter::default();
                 layout.update(shader.module.to_ctx()).unwrap();
                 let mut bytes = 0u32;

@@ -624,7 +624,7 @@ fn capture_windows(
     let pipeline_keys = session.dispatch_pipeline_keys();
     let loss_dispatch = plan.loss_buffer.and_then(|loss| {
         plan.dispatches.iter().rposition(|dispatch| {
-            dispatch.output_buffer() == loss || dispatch.extra_outputs().contains(&loss)
+            dispatch.output_buffer == loss || dispatch.extra_outputs.contains(&loss)
         })
     });
     let has_backward = !plan.param_grad_pairs.is_empty();
@@ -654,13 +654,13 @@ fn capture_windows(
     let mut dispatches = Vec::with_capacity(dispatch_count);
     for (index, dispatch) in plan.dispatches.iter().enumerate() {
         let input_buffer_bytes = dispatch
-            .input_buffers()
+            .input_buffers
             .iter()
             .map(|buffer| plan.buffers[buffer.0 as usize])
             .sum();
-        let output_buffer_bytes = plan.buffers[dispatch.output_buffer().0 as usize]
+        let output_buffer_bytes = plan.buffers[dispatch.output_buffer.0 as usize]
             + dispatch
-                .extra_outputs()
+                .extra_outputs
                 .iter()
                 .map(|buffer| plan.buffers[buffer.0 as usize])
                 .sum::<usize>();
@@ -669,7 +669,7 @@ fn capture_windows(
             index,
             phase: phases[index].to_string(),
             family: dispatch.profile_family().to_string(),
-            shader: format!("{:?}", dispatch.shader()),
+            shader: format!("{:?}", dispatch.shader),
             label: dispatch.label.clone(),
             origin: dispatch.origin.clone(),
             timestamp_label: timestamp_labels[index].clone(),
@@ -685,9 +685,9 @@ fn capture_windows(
             cooperative: dispatch.use_coop(),
             small_tile: dispatch.use_small_tiles(),
             requires_full_precision: dispatch.requires_full_precision,
-            weight_format: format!("{:?}", dispatch.weight_format()),
-            has_prologue: dispatch.matmul_prologue().is_some(),
-            has_epilogue: dispatch.matmul_epilogue().is_some(),
+            weight_format: format!("{:?}", dispatch.weight_format),
+            has_prologue: dispatch.matmul_prologue.is_some(),
+            has_epilogue: dispatch.matmul_epilogue.is_some(),
             timing_samples_ms: timing_samples[index].clone(),
             median_ms,
             p25_ms: quantile(&timing_samples[index], 0.25),

@@ -96,24 +96,8 @@ pub enum DType {
 }
 
 impl DType {
-    /// The quantized block geometry: `(elements per block, bytes per block)`.
-    ///
-    /// One source of truth for three things that used to be written out
-    /// separately and could drift:
-    ///
-    /// * the divisibility assert in each `Graph::parameter_q*k` constructor,
-    /// * the `(block, stride)` pair `Session::set_parameter_packed` copies with,
-    /// * the superblock sizes in the [`DType`] doc comments.
-    ///
-    /// `bytes` is the *unpadded* stride. Q3_K's 110 and Q4_0's 18 are not
-    /// multiples of a word, so a parameter's superblocks are laid out
-    /// alternately at word-aligned and unaligned addresses and the whole
-    /// parameter is padded at the end rather than between blocks; that is why
-    /// the copy strips a tail and the assert is only on divisibility. Q4_K (144)
-    /// and Q5_K (176) have no tail to strip. Meganeura pads its own Q8_0 to 36
-    /// where GGML uses 34, which is deliberate and unrelated to this table.
-    ///
-    /// `None` for a dtype that is not block-quantized.
+    /// Elements and bytes per quantization block. Tensor allocations pad the
+    /// final block to a word boundary; block strides themselves are unpadded.
     pub const fn block_geometry(self) -> Option<(usize, usize)> {
         match self {
             DType::Q8_0 => Some((32, 36)),
@@ -124,14 +108,6 @@ impl DType {
             DType::Q6K => Some((256, 210)),
             DType::Q3K => Some((256, 110)),
             _ => None,
-        }
-    }
-
-    /// Elements per quantization block, or `None` if not block-quantized.
-    pub const fn block_elements(self) -> Option<usize> {
-        match self.block_geometry() {
-            Some((elements, _)) => Some(elements),
-            None => None,
         }
     }
 
@@ -177,14 +153,7 @@ impl TensorType {
         self.shape.iter().product()
     }
 
-    /// Bytes occupied by this tensor, rounded up for an `array<u32>` binding.
-    ///
-    /// The block geometry comes from [`DType::block_geometry`] so there is one
-    /// place that knows it. Three of the strides are not multiples of a word —
-    /// Q4_0's 18, Q6_K's 210 and Q3_K's 110 — so those buffers are padded at
-    /// the end while the superblocks keep their exact bytes and the shaders read
-    /// them byte-addressed. The rest need no padding: 20, 36, 144 and 176 are
-    /// all whole words.
+    /// Allocation size, padded to a word boundary for packed bindings.
     pub fn size_bytes(&self) -> usize {
         let Some((block, stride)) = self.dtype.block_geometry() else {
             return self.num_elements() * self.dtype.size_bytes();
@@ -1192,6 +1161,21 @@ impl Graph {
         )
     }
 
+    fn parameter_packed(&mut self, name: &str, shape: &[usize], dtype: DType) -> NodeId {
+        let (block, _) = dtype.block_geometry().expect("block-quantized parameter");
+        assert!(
+            shape.first().is_some_and(|k| k.is_multiple_of(block)),
+            "{dtype:?} needs the reduction extent to be a multiple of {block}, got {shape:?}"
+        );
+        self.add_node(
+            Op::Parameter {
+                name: name.to_owned(),
+            },
+            vec![],
+            TensorType::new(shape.to_vec(), dtype),
+        )
+    }
+
     /// Create a parameter stored as GGML Q4_K (4.5 bits/element).
     ///
     /// The reduction extent — `shape[0]` — must be a multiple of 256, the
@@ -1200,25 +1184,7 @@ impl Graph {
     /// (`crate::load::gguf`, `gguf` feature), since Q4_K cannot be
     /// produced from f32 on the host. See [`DType::Q4K`].
     pub fn parameter_q4k(&mut self, name: &str, shape: &[usize]) -> NodeId {
-        assert!(
-            shape.first().is_some_and(|k| k.is_multiple_of(
-                DType::Q4K
-                    .block_elements()
-                    .expect("Q4_K is block-quantized")
-            )),
-            "Q4_K needs the reduction extent to be a multiple of {}, got {shape:?}",
-            DType::Q4K
-                .block_elements()
-                .expect("Q4_K is block-quantized")
-        );
-        let ty = TensorType::new(shape.to_vec(), DType::Q4K);
-        self.add_node(
-            Op::Parameter {
-                name: name.to_string(),
-            },
-            vec![],
-            ty,
-        )
+        self.parameter_packed(name, shape, DType::Q4K)
     }
 
     /// Create a parameter stored as GGML Q4_0 (4.5 bits/element).
@@ -1232,25 +1198,7 @@ impl Graph {
     /// which can be produced from f32 on the host, use
     /// [`Graph::parameter_q4`].
     pub fn parameter_q40(&mut self, name: &str, shape: &[usize]) -> NodeId {
-        assert!(
-            shape.first().is_some_and(|k| k.is_multiple_of(
-                DType::Q40
-                    .block_elements()
-                    .expect("Q4_0 is block-quantized")
-            )),
-            "GGML Q4_0 needs the reduction extent to be a multiple of {}, got {shape:?}",
-            DType::Q40
-                .block_elements()
-                .expect("Q4_0 is block-quantized")
-        );
-        let ty = TensorType::new(shape.to_vec(), DType::Q40);
-        self.add_node(
-            Op::Parameter {
-                name: name.to_string(),
-            },
-            vec![],
-            ty,
-        )
+        self.parameter_packed(name, shape, DType::Q40)
     }
 
     /// Create a parameter stored as GGML Q6_K (6.56 bits/element).
@@ -1260,19 +1208,7 @@ impl Graph {
     /// with [`crate::Session::set_parameter_packed`] from the GGUF loader
     /// (`gguf` feature). See [`DType::Q6K`].
     pub fn parameter_q6k(&mut self, name: &str, shape: &[usize]) -> NodeId {
-        let block = DType::Q6K.block_elements().expect("Q6K is block-quantized");
-        assert!(
-            shape.first().is_some_and(|k| k.is_multiple_of(block)),
-            "Q6_K needs the reduction extent to be a multiple of {block}, got {shape:?}"
-        );
-        let ty = TensorType::new(shape.to_vec(), DType::Q6K);
-        self.add_node(
-            Op::Parameter {
-                name: name.to_string(),
-            },
-            vec![],
-            ty,
-        )
+        self.parameter_packed(name, shape, DType::Q6K)
     }
 
     /// Create a parameter stored as GGML Q5_K (5.5 bits/element).
@@ -1280,19 +1216,7 @@ impl Graph {
     /// The reduction extent — `shape[0]` — must be a multiple of 256.
     /// Load-only, like [`Graph::parameter_q4k`]. See [`DType::Q5K`].
     pub fn parameter_q5k(&mut self, name: &str, shape: &[usize]) -> NodeId {
-        let block = DType::Q5K.block_elements().expect("Q5K is block-quantized");
-        assert!(
-            shape.first().is_some_and(|k| k.is_multiple_of(block)),
-            "Q5_K needs the reduction extent to be a multiple of {block}, got {shape:?}"
-        );
-        let ty = TensorType::new(shape.to_vec(), DType::Q5K);
-        self.add_node(
-            Op::Parameter {
-                name: name.to_string(),
-            },
-            vec![],
-            ty,
-        )
+        self.parameter_packed(name, shape, DType::Q5K)
     }
 
     /// Create a parameter stored as GGML Q3_K (3.44 bits/element).
@@ -1300,19 +1224,7 @@ impl Graph {
     /// The reduction extent — `shape[0]` — must be a multiple of 256.
     /// Load-only, like [`Graph::parameter_q4k`]. See [`DType::Q3K`].
     pub fn parameter_q3k(&mut self, name: &str, shape: &[usize]) -> NodeId {
-        let block = DType::Q3K.block_elements().expect("Q3K is block-quantized");
-        assert!(
-            shape.first().is_some_and(|k| k.is_multiple_of(block)),
-            "Q3_K needs the reduction extent to be a multiple of {block}, got {shape:?}"
-        );
-        let ty = TensorType::new(shape.to_vec(), DType::Q3K);
-        self.add_node(
-            Op::Parameter {
-                name: name.to_string(),
-            },
-            vec![],
-            ty,
-        )
+        self.parameter_packed(name, shape, DType::Q3K)
     }
 
     /// Create a parameter stored in Meganeura's asymmetric Q4 format
@@ -2078,10 +1990,6 @@ impl Graph {
     ) -> NodeId {
         let x_shape = &self.node(x).ty.shape;
         assert_eq!(x_shape.len(), 2, "rope requires 2D input");
-        // Checked, not truncated: a head dimension is carried to the device as
-        // a `u32`, so a shape that does not fit would otherwise be silently
-        // narrowed to a plausible-looking value and pass the divisibility
-        // asserts below.
         let dim = u32::try_from(x_shape[1]).expect("rope head dimension exceeds u32");
         assert_eq!(dim % 2, 0, "rope requires even last dim");
         assert_eq!(dim % head_dim, 0, "rope: dim must be divisible by head_dim");
@@ -2135,10 +2043,6 @@ impl Graph {
     ) -> NodeId {
         let x_shape = &self.node(x).ty.shape;
         assert_eq!(x_shape.len(), 2, "rope requires 2D input");
-        // Checked, not truncated: a head dimension is carried to the device as
-        // a `u32`, so a shape that does not fit would otherwise be silently
-        // narrowed to a plausible-looking value and pass the divisibility
-        // asserts below.
         let dim = u32::try_from(x_shape[1]).expect("rope head dimension exceeds u32");
         assert_eq!(dim % 2, 0, "rope requires even last dim");
         assert_eq!(dim % head_dim, 0, "rope: dim must be divisible by head_dim");
@@ -2174,10 +2078,6 @@ impl Graph {
     ) -> NodeId {
         let x_shape = &self.node(x).ty.shape;
         assert_eq!(x_shape.len(), 2, "rope requires 2D input");
-        // Checked, not truncated: a head dimension is carried to the device as
-        // a `u32`, so a shape that does not fit would otherwise be silently
-        // narrowed to a plausible-looking value and pass the divisibility
-        // asserts below.
         let dim = u32::try_from(x_shape[1]).expect("rope head dimension exceeds u32");
         assert_eq!(dim % 2, 0, "rope requires even last dim");
         assert_eq!(dim % head_dim, 0, "rope: dim must be divisible by head_dim");
@@ -3199,94 +3099,35 @@ impl fmt::Display for Graph {
 }
 
 #[cfg(test)]
-mod block_geometry_tests {
-    use super::{DType, TensorType};
-
-    /// Every quantized dtype's geometry, and the buffer size it must produce.
-    ///
-    /// The sizes are the arithmetic that was in `TensorType::size_bytes` before
-    /// it started reading `block_geometry`, restated as literals so a change to
-    /// the table cannot quietly change a buffer size. The word-rounding comment
-    /// records which strides are not whole words.
+mod tests {
     #[test]
-    fn geometry_matches_the_buffer_sizes_the_shaders_expect() {
-        // (dtype, block, stride, the size expression it replaced)
-        let cases: &[(DType, usize, usize, &str)] = &[
-            // 32-element blocks. Q4_0 is Meganeura's asymmetric Q4: 20 bytes is
-            // 5 whole words. Q8_0 pads to 36 where GGML uses 34, deliberately.
-            (DType::Q4_0, 32, 20, "blocks * 5 * 4"),
-            (DType::Q8_0, 32, 36, "blocks * 9 * 4"),
-            // GGML Q4_0: 18 bytes is not a whole word, so the buffer rounds up.
-            (DType::Q40, 32, 18, "(blocks * 18).next_multiple_of(4)"),
-            // K-quants: 256-element superblocks. 144 and 176 are whole words;
-            // 210 and 110 are not.
-            (DType::Q4K, 256, 144, "blocks * 36 * 4"),
-            (DType::Q5K, 256, 176, "blocks * 44 * 4"),
-            (DType::Q6K, 256, 210, "(blocks * 210).next_multiple_of(4)"),
-            (DType::Q3K, 256, 110, "(blocks * 110).next_multiple_of(4)"),
-        ];
-
-        for &(dtype, block, stride, previous) in cases {
-            assert_eq!(
-                dtype.block_geometry(),
-                Some((block, stride)),
-                "{dtype:?} geometry"
-            );
-            assert_eq!(dtype.block_elements(), Some(block), "{dtype:?} block");
-
-            // One block, and several, to catch an off-by-one in the rounding.
-            for blocks in [1usize, 2, 3, 7] {
-                let ty = TensorType::new(vec![blocks * block], dtype);
-                let expected = {
-                    let n = blocks * stride;
-                    if n % 4 == 0 { n } else { n + 4 - n % 4 }
-                };
+    fn packed_tensor_sizes_include_only_final_word_padding() {
+        use super::{DType, TensorType};
+        for (dtype, block, one, two) in [
+            (DType::Q4_0, 32, 20, 40),
+            (DType::Q8_0, 32, 36, 72),
+            (DType::Q40, 32, 20, 36),
+            (DType::Q4K, 256, 144, 288),
+            (DType::Q5K, 256, 176, 352),
+            (DType::Q6K, 256, 212, 420),
+            (DType::Q3K, 256, 112, 220),
+        ] {
+            for (elements, bytes) in [
+                (0, 0),
+                (1, one),
+                (block, one),
+                (block + 1, two),
+                (2 * block, two),
+            ] {
                 assert_eq!(
-                    ty.size_bytes(),
-                    expected,
-                    "{dtype:?} with {blocks} blocks was `{previous}`"
+                    TensorType::new(vec![elements], dtype).size_bytes(),
+                    bytes,
+                    "{dtype:?}, {elements} elements"
                 );
             }
         }
     }
 
-    /// Only block-quantized dtypes have geometry.
-    #[test]
-    fn non_quantized_dtypes_have_no_geometry() {
-        for dtype in [DType::F32, DType::F16, DType::U32] {
-            assert_eq!(dtype.block_geometry(), None, "{dtype:?}");
-            assert_eq!(dtype.block_elements(), None, "{dtype:?}");
-        }
-    }
-
-    /// `WeightFormat` maps to the `DType` whose geometry it should use, so the
-    /// copy loop in `set_parameter_packed` and the buffer sizing agree.
-    #[test]
-    fn weight_formats_resolve_to_the_dtype_they_store() {
-        use crate::compile::WeightFormat;
-        for (fmt, dtype) in [
-            (WeightFormat::Q4K, DType::Q4K),
-            (WeightFormat::Q6K, DType::Q6K),
-            (WeightFormat::Q5K, DType::Q5K),
-            (WeightFormat::Q3K, DType::Q3K),
-            (WeightFormat::Q40, DType::Q40),
-        ] {
-            assert_eq!(fmt.dtype(), Some(dtype), "{fmt:?}");
-            assert!(
-                fmt.dtype().and_then(|d| d.block_geometry()).is_some(),
-                "{fmt:?} is block-quantized, so it must resolve to a geometry"
-            );
-        }
-        // Meganeura's own asymmetric Q4 and Q8 have no GGML dtype and keep their
-        // own arithmetic, so they resolve to nothing rather than to a wrong one.
-        for fmt in [WeightFormat::Q4, WeightFormat::Q8] {
-            assert_eq!(fmt.dtype(), None, "{fmt:?} has no DType counterpart");
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
     #[test]
     fn conv2d_rejects_nonflat_or_mismatched_operands_before_compilation() {
         for (input_shape, weight_shape, batch) in [

@@ -181,7 +181,7 @@ impl Sweep {
         let names: BTreeSet<String> = plan
             .dispatches
             .iter()
-            .map(|d| format!("{:?}", d.shader()))
+            .map(|d| format!("{:?}", d.shader))
             .collect();
         self.kernels.extend(names.iter().cloned());
         names.into_iter().collect::<Vec<_>>().join(" ")

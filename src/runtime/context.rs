@@ -1,7 +1,4 @@
 //! Device selection and context creation.
-//!
-//! Split out because nothing here touches a `Session`: it is the layer that
-//! answers "which adapter, and with what capabilities" before one exists.
 
 /// GPU context creation options. The library never reads the environment;
 /// map device, timing and capture overrides with
