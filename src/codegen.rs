@@ -4080,6 +4080,41 @@ mod tests {
     }
 
     #[test]
+    fn cooperative_attention_shared_bytes_match_generated_storage() {
+        for head_dim in [16, 32, 64, 128, 256, 512] {
+            for (group, shader) in [
+                (
+                    ShaderGroup::FlashAttentionCoop,
+                    generate_flash_attention_coop_module(head_dim),
+                ),
+                (
+                    ShaderGroup::FlashGradQCoop,
+                    generate_flash_grad_q_coop_module(head_dim),
+                ),
+                (
+                    ShaderGroup::FlashGradKVCoop,
+                    generate_flash_grad_kv_coop_module(head_dim),
+                ),
+            ] {
+                let mut layout = naga::proc::Layouter::default();
+                layout.update(shader.module.to_ctx()).unwrap();
+                let mut bytes = 0u32;
+                for (_, var) in shader.module.global_variables.iter() {
+                    if var.space == naga::AddressSpace::WorkGroup {
+                        let ty = layout[var.ty];
+                        bytes = ty.alignment.round_up(bytes) + ty.size;
+                    }
+                }
+                assert_eq!(
+                    attention_coop_shared_bytes(group, head_dim),
+                    u64::from(bytes),
+                    "{group:?}, head_dim={head_dim}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_flash_attention_wgsl() {
         let mut shape = FlashAttentionShape::default();
         shape.fit_shared_memory(1024, 32768);

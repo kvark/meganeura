@@ -31,9 +31,22 @@ fn ordinary_context() -> Arc<blade_graphics::Context> {
 /// summation order.
 fn close(a: &[f32], b: &[f32], tolerance: f32) -> bool {
     a.len() == b.len()
-        && a.iter()
-            .zip(b)
-            .all(|(x, y)| (x - y).abs() <= tolerance * (1.0 + x.abs().max(y.abs())))
+        && a.iter().zip(b).all(|(x, y)| {
+            x.is_finite()
+                && y.is_finite()
+                && (x - y).abs() <= tolerance * (1.0 + x.abs().max(y.abs()))
+        })
+}
+
+#[test]
+fn result_comparison_rejects_nonfinite_values() {
+    assert!(close(&[1.0], &[1.0 + 1.0e-5], 1.0e-4));
+    assert!(!close(&[1.01], &[1.0], 1.0e-4));
+    for value in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+        assert!(!close(&[value], &[1.0], 1.0e-4));
+        assert!(!close(&[1.0], &[value], 1.0e-4));
+        assert!(!close(&[value], &[value], 1.0e-4));
+    }
 }
 
 const LAYERS: usize = 6;

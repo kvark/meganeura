@@ -1,78 +1,56 @@
 //! CPU-side cost of a training step, separated from GPU execution.
 //!
-//! Items 3 and 4 of `docs/open-items.md` are blocked on the same missing
-//! measurement: how much host time a step spends *recording* versus waiting on
-//! the GPU. `bench_ci_latency` reports `train_step_median_ms` for a model small
-//! enough that the two are indistinguishable, and it reports one number for
-//! both together.
+//! Supports the host-cost measurements in items 3 and 4 of `docs/open-items.md`.
+//! `Session::record` encodes a step into a caller's encoder without submitting,
+//! measuring host cost. `Session::step` followed by `Session::wait` measures the
+//! whole step. A configurable chain of blocks varies the dispatch and parameter
+//! counts.
 //!
-//! This separates them, using `Session::record` — which encodes a step into a
-//! caller's encoder and does not submit — as the host cost, and `Session::step`
-//! as the whole step. The model is a configurable chain of blocks because the
-//! interesting quantity is dispatches and parameters, not layers, so this
-//! sweeps both.
-//!
-//! `idle_ms` repeats the encode with the device already idle. If it matches
-//! `encode_ms` there is no fence hidden inside `encode_step` and the number is
-//! real host work; that is the control, because a per-step rebuild could
-//! otherwise be hiding behind a wait.
+//! Encoding-only samples run with the device idle. Whole-step samples report
+//! the recording/submission call and the following completion wait separately.
+//! These timings do not measure the benefit of overlapping CPU and GPU work;
+//! that needs a comparison with an encoder rotation.
 //!
 //! Run:
 //!   cargo run --release --example bench_step_cpu
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use meganeura::{CoopPolicy, Graph, Mode, Session, SessionConfig};
 
-/// Build a chain of `blocks` independent `matmul + bias + gelu` units.
-///
-/// Independent rather than sequential so the plan has one barrier group per
-/// block — that is what makes dispatch count, and therefore the per-dispatch
-/// host work, scale with depth. `width` drives both the dispatch count and the
-/// parameter count, which the optimizer's segment table is sized by.
-fn build(blocks: usize, width: usize, batch: usize) -> (Graph, Vec<String>) {
+/// Build a chain of `blocks` sequential `matmul + bias_mul + gelu` units.
+fn build(blocks: usize, width: usize, batch: usize) -> Graph {
     let mut g = Graph::new();
-    let mut names = Vec::new();
     // One input of [batch, width]: each block is a batched matmul against a
     // [width, width] weight, so dispatch count scales with depth while the
-    // parameter count scales with width squared.
-    let x = g.input("x", &[batch, width]);
-    let mut current = vec![x];
+    // number of parameter elements scales with width squared.
+    let mut current = g.input("x", &[batch, width]);
     for b in 0..blocks {
-        let w = format!("w{b}");
-        let weight = g.parameter(&w, &[width, width]);
-        // A scalar-shaped parameter per block, so the parameter count is driven
-        // by depth as well as by width.
+        let weight = g.parameter(&format!("w{b}"), &[width, width]);
+        // One scaling vector per block.
         let scale = g.parameter(&format!("s{b}"), &[width]);
-        let next: Vec<_> = current
-            .iter()
-            .map(|&node| {
-                let m = g.matmul(node, weight);
-                let biased = g.bias_mul(m, scale);
-                g.gelu(biased)
-            })
-            .collect();
-        names.push(w);
-        current = next;
+        let m = g.matmul(current, weight);
+        let biased = g.bias_mul(m, scale);
+        current = g.gelu(biased);
     }
     // `differentiate` requires a graph ending in a scalar loss, so reduce the
-    // block outputs rather than exposing them directly.
-    let mut total = current[0];
-    for &node in &current[1..] {
-        total = g.add(total, node);
-    }
-    let loss = g.mean_all(total);
+    // final block output.
+    let loss = g.mean_all(current);
     g.set_outputs(vec![loss]);
-    (g, names)
+    g
 }
 
-fn train_session(blocks: usize, width: usize, batch: usize) -> Session {
-    let (g, _) = build(blocks, width, batch);
-    // `SessionConfig::default()` names no device, so it ignores
-    // MEGANEURA_DEVICE_ID and always picks the same adapter. Going through
-    // `from_env` honours it, and sharing one context across the sweep keeps
-    // the driver's per-process context budget from running out.
-    let base = meganeura::SessionConfig::from_env();
+fn train_session(
+    gpu: &Arc<blade_graphics::Context>,
+    blocks: usize,
+    width: usize,
+    batch: usize,
+) -> Session {
+    let g = build(blocks, width, batch);
+    let base = SessionConfig::from_env_with_gpu(Some(Arc::clone(gpu)));
     let (session, _) = meganeura::build(
         &g,
         SessionConfig {
@@ -104,29 +82,32 @@ fn ms(d: Duration) -> f64 {
 /// resolving each pipeline, building its binding struct and issuing the
 /// dispatch call. Nothing is submitted, so there is no fence and no queueing.
 ///
-/// `whole` is an ordinary `Session::step`, which encodes and submits.
-///
-/// `whole - encode` is what an encoder rotation could in principle overlap
-/// with GPU execution — which is the question item 4 asks.
+/// `whole` covers `Session::step` and the completion wait. `step_call` includes
+/// recording and submission; `wait` includes the remaining device work and
+/// host synchronization, so it is not a hardware timestamp measurement.
 struct Measurement {
     encode: f64,
-    /// The same encode with the device already idle: if this matches `encode`
-    /// there is no hidden fence in the recording path.
-    encode_idle: f64,
     whole: f64,
+    step_call: f64,
+    wait: f64,
     dispatches: usize,
     params: usize,
 }
 
-fn measure(blocks: usize, width: usize, batch: usize, runs: usize) -> Measurement {
-    let mut session = train_session(blocks, width, batch);
+fn measure(
+    gpu: &Arc<blade_graphics::Context>,
+    blocks: usize,
+    width: usize,
+    batch: usize,
+    runs: usize,
+) -> Measurement {
+    let mut session = train_session(gpu, blocks, width, batch);
     let dispatches = session.plan().dispatches.len();
     let params = session.plan().param_grad_pairs.len();
     session.set_adam(1e-3, 0.9, 0.999, 1e-8);
     let feed: Vec<f32> = vec![0.5; batch * width];
 
     // An encoder we own, so `record` can encode into it without submitting.
-    let gpu = session.context();
     let mut encoder = gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
         name: "bench_step_cpu",
         buffer_count: 2,
@@ -149,44 +130,37 @@ fn measure(blocks: usize, width: usize, batch: usize, runs: usize) -> Measuremen
         encode.push(start.elapsed());
     }
 
-    // The same encodes against an encoder with nothing in flight, and again
-    // with the GPU deliberately idle, to separate a hidden fence from real
-    // encoding work. `record` does not call `wait`, so a fence here would be
-    // inside `encode_step` -- measuring with the device already idle is the
-    // control.
-    let mut encode_idle = Vec::with_capacity(runs);
-    for _ in 0..runs {
-        session.wait();
-        encoder.start();
-        let start = Instant::now();
-        session.record(&mut encoder).expect("record");
-        encode_idle.push(start.elapsed());
-    }
-    let idle = ms(median(encode_idle));
-
     let mut whole = Vec::with_capacity(runs);
+    let mut step_call = Vec::with_capacity(runs);
+    let mut wait = Vec::with_capacity(runs);
     for _ in 0..runs {
         session.set_input("x", &feed);
         let start = Instant::now();
         session.step();
-        whole.push(start.elapsed());
+        let submitted = start.elapsed();
+        session.wait();
+        let completed = start.elapsed();
+        step_call.push(submitted);
+        wait.push(completed - submitted);
+        whole.push(completed);
     }
-    session.wait();
+    gpu.destroy_command_encoder(&mut encoder);
 
     Measurement {
         encode: ms(median(encode)),
-        encode_idle: idle,
         whole: ms(median(whole)),
+        step_call: ms(median(step_call)),
+        wait: ms(median(wait)),
         dispatches,
         params,
     }
 }
 
 fn main() {
-    println!("device: {:?}", {
-        let s = train_session(1, 8, 1);
-        s.context().device_information().device_name.clone()
-    });
+    let gpu = Arc::new(
+        meganeura::init_gpu_context_with(meganeura::GpuOptions::from_env()).expect("GPU context"),
+    );
+    println!("device: {:?}", gpu.device_information().device_name);
     println!("(set MEGANEURA_DEVICE_ID to choose the adapter)");
     println!();
     println!(
@@ -198,13 +172,13 @@ fn main() {
         "params",
         "step_ms",
         "encode_ms",
-        "idle_ms",
-        "overlappable"
+        "step_call_ms",
+        "wait_ms"
     );
-    println!("{}", "-".repeat(72));
+    println!("{}", "-".repeat(89));
 
-    // Sweep dispatch count and parameter count independently: the segment
-    // table scales with parameters, the pipeline lookup with dispatches.
+    // Vary depth, matrix width and batch size. Depth changes both dispatch and
+    // parameter counts; width changes parameter sizes at a fixed count.
     let cases = [
         (4usize, 64usize, 1usize),
         (8, 64, 1),
@@ -216,25 +190,19 @@ fn main() {
         (8, 256, 4),
     ];
     for (blocks, width, batch) in cases {
-        let m = measure(blocks, width, batch, 40);
+        let m = measure(&gpu, blocks, width, batch, 40);
         println!(
             "{:>7} {:>7} {:>5} {:>10} {:>7} {:>11.4} {:>11.4} {:>11.4} {:>12.4}",
-            blocks,
-            width,
-            batch,
-            m.dispatches,
-            m.params,
-            m.whole,
-            m.encode,
-            m.encode_idle,
-            m.whole - m.encode
+            blocks, width, batch, m.dispatches, m.params, m.whole, m.encode, m.step_call, m.wait
         );
     }
 
     println!();
     println!(
-        "`encode_ms` is `Session::record`, which encodes without submitting, so\n\
-         it is the host cost exactly. `overlappable` is `step_ms - encode_ms`:\n\
-         what an encoder rotation could hide behind GPU execution."
+        "`encode_ms` times `Session::record` on an idle device. `step_ms` times\n\
+         `Session::step` plus `Session::wait`, excluding input upload.\n\
+         `step_call_ms` includes recording/submission; `wait_ms` is the following\n\
+         completion wait, including host synchronization. Columns are separate\n\
+         medians and need not add up. Overlap savings require a separate experiment."
     );
 }

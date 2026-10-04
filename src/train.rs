@@ -340,6 +340,7 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, optimiz
         .runtime
         .coop
         .filter_caps(runtime::auto_tune(&gpu, 0).coop_caps);
+    let shared_memory_bytes = gpu.capabilities().max_compute_shared_memory_size;
     let mode_tag = match mode {
         Mode::Training => 0,
         Mode::Inference => 1,
@@ -350,6 +351,7 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, optimiz
         mode_tag,
         skip_full_optimize,
         coop_caps,
+        shared_memory_bytes,
     );
 
     if let Some(path) = cache_path {
@@ -374,7 +376,7 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, optimiz
         prepare_graph(forward_graph, mode, cfg.optimize, skip_full_optimize);
     let plan = {
         let _span = tracing::info_span!("compile").entered();
-        compile::compile_owned_with_caps(final_graph, &options, coop_caps)
+        compile::compile_owned_with_caps(final_graph, &options, coop_caps, shared_memory_bytes)
     };
     log::info!(
         "execution plan: {} buffers, {} dispatches",

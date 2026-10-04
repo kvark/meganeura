@@ -20,7 +20,7 @@ pub struct GpuOptions {
 }
 
 /// Create a GPU context with the same environment-independent defaults as
-/// [`Session::new`]. Use [`init_gpu_context_with`] for explicit options.
+/// [`crate::Session::new`]. Use [`init_gpu_context_with`] for explicit options.
 pub fn init_gpu_context() -> Result<blade_graphics::Context, blade_graphics::NotSupportedError> {
     init_gpu_context_with(GpuOptions::default())
 }
