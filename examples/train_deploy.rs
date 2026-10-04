@@ -33,7 +33,6 @@ fn main() {
         training,
         TrainConfig {
             optimizer: Optimizer::sgd(0.4),
-            learning_rate: 0.4,
             log_interval: 0,
         },
     );

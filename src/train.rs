@@ -58,9 +58,6 @@ impl Default for Optimizer {
 pub struct TrainConfig {
     /// Optimizer to use (SGD or Adam).
     pub optimizer: Optimizer,
-    /// Backward-compatible alias: sets SGD learning rate.
-    /// Ignored if `optimizer` is explicitly set to Adam.
-    pub learning_rate: f32,
     /// Print loss every `log_interval` steps. 0 disables step logging.
     pub log_interval: usize,
 }
@@ -69,7 +66,6 @@ impl Default for TrainConfig {
     fn default() -> Self {
         Self {
             optimizer: Optimizer::default(),
-            learning_rate: 0.01,
             log_interval: 100,
         }
     }
@@ -124,8 +120,7 @@ impl TrainHistory {
 
 /// Drives the training loop over a [`Session`] and [`DataLoader`].
 ///
-/// Encapsulates the epoch → batch → step → SGD update cycle, with
-/// configurable logging and loss tracking.
+/// Runs batches and optimizer updates, with configurable logging and loss tracking.
 pub struct Trainer {
     session: Session,
     config: TrainConfig,
@@ -158,10 +153,7 @@ impl Trainer {
         loader.shuffle(epoch as u64);
         loader.reset();
 
-        // Optimizer config is persistent — set once at the top of the
-        // epoch rather than re-arming each step. Subclasses that want a
-        // per-step LR schedule can override via `set_learning_rate` /
-        // `set_adam` mid-loop.
+        // Optimizer settings persist across the epoch's steps.
         match self.config.optimizer {
             Optimizer::Sgd { learning_rate } => {
                 self.session.set_learning_rate(learning_rate);
@@ -623,7 +615,12 @@ mod tests {
     #[test]
     fn test_train_config_default() {
         let config = TrainConfig::default();
-        assert_eq!(config.learning_rate, 0.01);
+        assert!(matches!(
+            config.optimizer,
+            Optimizer::Sgd {
+                learning_rate: 0.01
+            }
+        ));
         assert_eq!(config.log_interval, 100);
     }
 

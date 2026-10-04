@@ -2098,6 +2098,41 @@ impl Graph {
     }
 
     #[track_caller]
+    fn attention_type(
+        &self,
+        q: NodeId,
+        k: NodeId,
+        v: NodeId,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) -> TensorType {
+        let q_shape = &self.node(q).ty.shape;
+        let k_shape = &self.node(k).ty.shape;
+        let v_shape = &self.node(v).ty.shape;
+        assert_eq!(q_shape.len(), 2, "q must be 2D");
+        assert_eq!(k_shape.len(), 2, "k must be 2D");
+        assert_eq!(v_shape.len(), 2, "v must be 2D");
+        assert_eq!(
+            q_shape[1],
+            (num_heads * head_dim) as usize,
+            "q dim mismatch"
+        );
+        assert_eq!(
+            k_shape[1],
+            (num_kv_heads * head_dim) as usize,
+            "k dim mismatch"
+        );
+        assert_eq!(
+            v_shape[1],
+            (num_kv_heads * head_dim) as usize,
+            "v dim mismatch"
+        );
+        assert_eq!(v_shape[0], k_shape[0], "v seq must match k seq");
+        TensorType::f32(q_shape.clone())
+    }
+
+    #[track_caller]
     pub fn causal_attention(
         &mut self,
         q: NodeId,
@@ -2107,31 +2142,12 @@ impl Graph {
         num_kv_heads: u32,
         head_dim: u32,
     ) -> NodeId {
-        let q_shape = &self.node(q).ty.shape;
-        let k_shape = &self.node(k).ty.shape;
-        let v_shape = &self.node(v).ty.shape;
-        assert_eq!(q_shape.len(), 2, "q must be 2D");
-        assert_eq!(k_shape.len(), 2, "k must be 2D");
-        assert_eq!(v_shape.len(), 2, "v must be 2D");
-        let seq = q_shape[0];
+        let ty = self.attention_type(q, k, v, num_heads, num_kv_heads, head_dim);
         assert_eq!(
-            q_shape[1],
-            (num_heads * head_dim) as usize,
-            "q dim mismatch"
+            self.node(k).ty.shape[0],
+            ty.shape[0],
+            "k seq must match q seq"
         );
-        assert_eq!(k_shape[0], seq, "k seq must match q seq");
-        assert_eq!(
-            k_shape[1],
-            (num_kv_heads * head_dim) as usize,
-            "k dim mismatch"
-        );
-        assert_eq!(v_shape[0], seq, "v seq must match q seq");
-        assert_eq!(
-            v_shape[1],
-            (num_kv_heads * head_dim) as usize,
-            "v dim mismatch"
-        );
-        let ty = TensorType::f32(vec![seq, (num_heads * head_dim) as usize]);
         self.add_node(
             Op::CausalAttention {
                 num_heads,
@@ -2158,32 +2174,13 @@ impl Graph {
         head_dim: u32,
         window_size: u32,
     ) -> NodeId {
-        let q_shape = &self.node(q).ty.shape;
-        let k_shape = &self.node(k).ty.shape;
-        let v_shape = &self.node(v).ty.shape;
-        assert_eq!(q_shape.len(), 2, "q must be 2D");
-        assert_eq!(k_shape.len(), 2, "k must be 2D");
-        assert_eq!(v_shape.len(), 2, "v must be 2D");
-        let seq = q_shape[0];
+        let ty = self.attention_type(q, k, v, num_heads, num_kv_heads, head_dim);
         assert_eq!(
-            q_shape[1],
-            (num_heads * head_dim) as usize,
-            "q dim mismatch"
-        );
-        assert_eq!(k_shape[0], seq, "k seq must match q seq");
-        assert_eq!(
-            k_shape[1],
-            (num_kv_heads * head_dim) as usize,
-            "k dim mismatch"
-        );
-        assert_eq!(v_shape[0], seq, "v seq must match q seq");
-        assert_eq!(
-            v_shape[1],
-            (num_kv_heads * head_dim) as usize,
-            "v dim mismatch"
+            self.node(k).ty.shape[0],
+            ty.shape[0],
+            "k seq must match q seq"
         );
         assert!(window_size > 0, "window_size must be > 0");
-        let ty = TensorType::f32(vec![seq, (num_heads * head_dim) as usize]);
         self.add_node(
             Op::SlidingWindowAttention {
                 num_heads,
@@ -2915,31 +2912,12 @@ impl Graph {
         num_kv_heads: u32,
         head_dim: u32,
     ) -> NodeId {
-        let q_shape = &self.node(q).ty.shape;
-        let k_shape = &self.node(k).ty.shape;
-        let v_shape = &self.node(v).ty.shape;
-        assert_eq!(q_shape.len(), 2, "q must be 2D");
-        assert_eq!(k_shape.len(), 2, "k must be 2D");
-        assert_eq!(v_shape.len(), 2, "v must be 2D");
-        let seq = q_shape[0];
+        let ty = self.attention_type(q, k, v, num_heads, num_kv_heads, head_dim);
         assert_eq!(
-            q_shape[1],
-            (num_heads * head_dim) as usize,
-            "q dim mismatch"
+            self.node(k).ty.shape[0],
+            ty.shape[0],
+            "k seq must match q seq"
         );
-        assert_eq!(k_shape[0], seq, "k seq must match q seq");
-        assert_eq!(
-            k_shape[1],
-            (num_kv_heads * head_dim) as usize,
-            "k dim mismatch"
-        );
-        assert_eq!(v_shape[0], seq, "v seq must match q seq");
-        assert_eq!(
-            v_shape[1],
-            (num_kv_heads * head_dim) as usize,
-            "v dim mismatch"
-        );
-        let ty = TensorType::f32(vec![seq, (num_heads * head_dim) as usize]);
         self.add_node(
             Op::FullAttention {
                 num_heads,
@@ -2961,31 +2939,7 @@ impl Graph {
         num_kv_heads: u32,
         head_dim: u32,
     ) -> NodeId {
-        let q_shape = &self.node(q).ty.shape;
-        let k_shape = &self.node(k).ty.shape;
-        let v_shape = &self.node(v).ty.shape;
-        assert_eq!(q_shape.len(), 2, "q must be 2D");
-        assert_eq!(k_shape.len(), 2, "k must be 2D");
-        assert_eq!(v_shape.len(), 2, "v must be 2D");
-        let q_seq = q_shape[0];
-        let kv_seq = k_shape[0];
-        assert_eq!(
-            q_shape[1],
-            (num_heads * head_dim) as usize,
-            "q dim mismatch"
-        );
-        assert_eq!(
-            k_shape[1],
-            (num_kv_heads * head_dim) as usize,
-            "k dim mismatch"
-        );
-        assert_eq!(v_shape[0], kv_seq, "v seq must match k seq");
-        assert_eq!(
-            v_shape[1],
-            (num_kv_heads * head_dim) as usize,
-            "v dim mismatch"
-        );
-        let ty = TensorType::f32(vec![q_seq, (num_heads * head_dim) as usize]);
+        let ty = self.attention_type(q, k, v, num_heads, num_kv_heads, head_dim);
         self.add_node(
             Op::CrossAttention {
                 num_heads,
@@ -3011,30 +2965,7 @@ impl Graph {
         head_dim: u32,
         is_cross: bool,
     ) -> NodeId {
-        let q_shape = &self.node(q).ty.shape;
-        let k_shape = &self.node(k).ty.shape;
-        let v_shape = &self.node(v).ty.shape;
-        assert_eq!(q_shape.len(), 2, "q must be 2D");
-        assert_eq!(k_shape.len(), 2, "k must be 2D");
-        assert_eq!(v_shape.len(), 2, "v must be 2D");
-        let q_seq = q_shape[0];
-        assert_eq!(
-            q_shape[1],
-            (num_heads * head_dim) as usize,
-            "q dim mismatch"
-        );
-        assert_eq!(
-            k_shape[1],
-            (num_kv_heads * head_dim) as usize,
-            "k dim mismatch"
-        );
-        assert_eq!(v_shape[0], k_shape[0], "v seq must match k seq");
-        assert_eq!(
-            v_shape[1],
-            (num_kv_heads * head_dim) as usize,
-            "v dim mismatch"
-        );
-        let ty = TensorType::f32(vec![q_seq, (num_heads * head_dim) as usize]);
+        let ty = self.attention_type(q, k, v, num_heads, num_kv_heads, head_dim);
         self.add_node(
             Op::MultiHeadAttn {
                 num_heads,

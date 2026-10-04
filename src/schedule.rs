@@ -1,21 +1,7 @@
-//! Schedule templates — generic kernel generators that lower to Naga IR.
+//! Kernel schedules that emit WGSL and parse it into Naga modules.
 //!
-//! Foundation of the generic-fusion plan (see `docs/plan-generic-fusion.md`).
-//! Instead of carrying a zoo of hand-written WGSL files, we define a handful
-//! of **schedule templates** (pointwise, reduction, matmul±prologue±epilogue,
-//! attention) and generate WGSL from parameterized specifications.
-//!
-//! Design:
-//!   - Keep Naga `Module` as our IR; emit WGSL source text, parse via
-//!     `naga::front::wgsl`. Parsing is ~100µs — specialization is cheap.
-//!   - `PointwiseDAG` is shared across all archetypes (used as prologue /
-//!     epilogue on heavy kernels in later steps).
-//!   - Generated pointwise kernels bind `src` (one input) or `src_a`,
-//!     `src_b`, `src_c`, then `dst` and `params`: the runtime's `UnaryData`,
-//!     `BinaryData` and `TernaryData` layouts.
-//!
-//! This commit lands archetype 1 (pointwise) as a standalone lowerer.
-//! Wiring into `compile.rs` / `runtime.rs` happens in the next step.
+//! `PointwiseDAG` describes fused scalar expressions shared by standalone
+//! pointwise/reduction kernels and matmul epilogues.
 
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::Write;

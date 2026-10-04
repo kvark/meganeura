@@ -42,6 +42,8 @@ trainer.train(&mut data, /* epochs = */ 10); // data loader: see examples/mnist.
 A two-layer MLP, trained end to end on the GPU, in one screen.
 
 For local iteration see [testing and coverage](docs/testing.md) and [debugging the stack](#debugging).
+The [shader generation investigation](docs/shader-generation.md) compares WGSL,
+synaga and other shader construction approaches.
 
 ## Why Meganeura
 

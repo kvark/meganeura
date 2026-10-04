@@ -56,7 +56,6 @@ fn trainer_drives_three_named_streams() {
         TrainConfig {
             optimizer: meganeura::Optimizer::adam(0.05),
             log_interval: 0,
-            ..TrainConfig::default()
         },
     );
 

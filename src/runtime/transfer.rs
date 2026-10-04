@@ -23,28 +23,7 @@ impl Session {
         for &(ref param_name, buf_ref) in &self.plan.param_buffers {
             if param_name == name {
                 if let Some(&(fmt, rows, cols)) = self.plan.weight_buffers.get(&buf_ref) {
-                    let packed = match fmt {
-                        crate::compile::WeightFormat::Q4 => quantize_q4_0(data, rows, cols),
-                        crate::compile::WeightFormat::Q8 => quantize_q8_0(data, rows, cols),
-                        crate::compile::WeightFormat::F16 => data
-                            .iter()
-                            .map(|&v| half::f16::from_f32(v).to_bits())
-                            .flat_map(|b| b.to_le_bytes())
-                            .collect(),
-                        // No K-quant encoder is implemented here. Falling
-                        // back to a cruder one would silently produce worse
-                        // weights than the file the caller already has, so
-                        // refuse and point at the path that keeps them.
-                        fmt @ (crate::compile::WeightFormat::Q40
-                        | crate::compile::WeightFormat::Q4K
-                        | crate::compile::WeightFormat::Q6K
-                        | crate::compile::WeightFormat::Q5K
-                        | crate::compile::WeightFormat::Q3K) => panic!(
-                            "parameter `{name}` is {fmt:?}; no encoder for it is implemented \
-                             here, so load it with set_parameter_packed from a GGUF file"
-                        ),
-                        crate::compile::WeightFormat::F32 => unreachable!(),
-                    };
+                    let packed = quantize::encode_parameter(name, data, fmt, rows, cols);
                     self.upload_parameter_bytes(buf_ref, &packed);
                 } else {
                     self.upload_parameter_bytes(buf_ref, bytemuck::cast_slice(data));
@@ -95,28 +74,13 @@ impl Session {
                                     .find(|src| src.0 == name)
                                     .map(|src| src.1)
                                     .unwrap();
-                                let packed = match derived_fmt {
-                                    crate::compile::WeightFormat::Q4 => {
-                                        quantize_q4_0(data, rows, src_cols)
-                                    }
-                                    crate::compile::WeightFormat::Q8 => {
-                                        quantize_q8_0(data, rows, src_cols)
-                                    }
-                                    crate::compile::WeightFormat::F16 => data
-                                        .iter()
-                                        .map(|&v| half::f16::from_f32(v).to_bits())
-                                        .flat_map(|b| b.to_le_bytes())
-                                        .collect(),
-                                    fmt @ (crate::compile::WeightFormat::Q40
-                                    | crate::compile::WeightFormat::Q4K
-                                    | crate::compile::WeightFormat::Q6K
-                                    | crate::compile::WeightFormat::Q5K
-                                    | crate::compile::WeightFormat::Q3K) => panic!(
-                                        "derived parameter is {fmt:?}; load its sources with \
-                                         set_parameter_packed"
-                                    ),
-                                    crate::compile::WeightFormat::F32 => unreachable!(),
-                                };
+                                let packed = quantize::encode_parameter(
+                                    name,
+                                    data,
+                                    derived_fmt,
+                                    rows,
+                                    src_cols,
+                                );
                                 self.restage_packed_concat(derived_buf, name, &packed, sources);
                             } else {
                                 // f32: direct copy into GPU buffer
