@@ -1546,7 +1546,7 @@ pub fn compile(graph: &Graph) -> ExecutionPlan {
 pub fn compile_with(graph: &Graph, options: &CompileOptions) -> ExecutionPlan {
     // No coop capability — callers that know the target hardware go
     // through the capabilities-taking paths below.
-    compile_with_caps(graph, options, crate::codegen::CoopCaps::default())
+    compile_with_caps(graph, options, crate::codegen::CoopCaps::default(), 0)
 }
 
 /// Compile for a concrete cooperative-matrix capability set.
@@ -1558,12 +1558,14 @@ pub(crate) fn compile_with_caps(
     graph: &Graph,
     options: &CompileOptions,
     coop_caps: crate::codegen::CoopCaps,
+    shared_memory_bytes: u32,
 ) -> ExecutionPlan {
     let allow_reduced_precision_attention_backward = options.flash_backward_coop;
     compile_with_caps_policy(
         graph,
         options,
         coop_caps,
+        shared_memory_bytes,
         allow_reduced_precision_attention_backward,
     )
 }
@@ -1578,12 +1580,14 @@ pub(crate) fn compile_owned_with_caps(
     mut graph: Graph,
     options: &CompileOptions,
     coop_caps: crate::codegen::CoopCaps,
+    shared_memory_bytes: u32,
 ) -> ExecutionPlan {
     let allow_reduced_precision_attention_backward = options.flash_backward_coop;
     let mut plan = Compiler::new_with_options(
         &graph,
         options.clone(),
         coop_caps,
+        shared_memory_bytes,
         allow_reduced_precision_attention_backward,
     )
     .into_plan();
@@ -1595,12 +1599,14 @@ fn compile_with_caps_policy(
     graph: &Graph,
     options: &CompileOptions,
     coop_caps: crate::codegen::CoopCaps,
+    shared_memory_bytes: u32,
     allow_reduced_precision_attention_backward: bool,
 ) -> ExecutionPlan {
     let mut plan = Compiler::new_with_options(
         graph,
         options.clone(),
         coop_caps,
+        shared_memory_bytes,
         allow_reduced_precision_attention_backward,
     )
     .into_plan();
@@ -2884,6 +2890,7 @@ struct Compiler<'a> {
     /// attention selection is plan-time (unlike ordinary matmul selection),
     /// so this must be the eventual session's target rather than global state.
     coop_caps: crate::codegen::CoopCaps,
+    shared_memory_bytes: u32,
     /// Experimental f16-input attention backward is deliberately separate
     /// from device capability: availability does not imply adequate gradient
     /// accuracy.
@@ -3134,8 +3141,8 @@ mod tests {
 
         let options = CompileOptions::default();
         let caps = crate::codegen::CoopCaps::default();
-        let borrowed = compile_with_caps(&g, &options, caps);
-        let owned = compile_owned_with_caps(g.deep_clone(), &options, caps);
+        let borrowed = compile_with_caps(&g, &options, caps, 0);
+        let owned = compile_owned_with_caps(g.deep_clone(), &options, caps, 0);
 
         assert_eq!(
             serde_json::to_value(borrowed).unwrap(),
@@ -4141,6 +4148,7 @@ mod tests {
             &graph,
             CompileOptions::default(),
             crate::codegen::CoopCaps::default(),
+            0,
             false,
         );
         for hd_log2 in 1..=8 {
@@ -4196,8 +4204,13 @@ mod tests {
             f16_tile: 16,
             f32_tile: 0,
         };
-        let safe =
-            compile_with_caps_policy(&differentiated, &CompileOptions::default(), f16_only, false);
+        let safe = compile_with_caps_policy(
+            &differentiated,
+            &CompileOptions::default(),
+            f16_only,
+            49_152,
+            false,
+        );
         let safe_entries: Vec<_> = safe
             .dispatches
             .iter()
@@ -4207,8 +4220,13 @@ mod tests {
         assert!(!safe_entries.contains(&ShaderEntry::FlashGradQCoop));
         assert!(!safe_entries.contains(&ShaderEntry::FlashGradKVCoop));
 
-        let experimental =
-            compile_with_caps_policy(&differentiated, &CompileOptions::default(), f16_only, true);
+        let experimental = compile_with_caps_policy(
+            &differentiated,
+            &CompileOptions::default(),
+            f16_only,
+            49_152,
+            true,
+        );
         let experimental_entries: Vec<_> = experimental
             .dispatches
             .iter()
@@ -4218,7 +4236,8 @@ mod tests {
         assert!(experimental_entries.contains(&ShaderEntry::FlashGradKVCoop));
 
         g.nodes_mut()[attention as usize].requires_full_precision = true;
-        let full = compile_with_caps_policy(&g, &CompileOptions::default(), f16_only, false);
+        let full =
+            compile_with_caps_policy(&g, &CompileOptions::default(), f16_only, 49_152, false);
         assert!(
             full.dispatches
                 .iter()
@@ -4234,6 +4253,7 @@ mod tests {
             &differentiated,
             &CompileOptions::default(),
             crate::codegen::CoopCaps::default(),
+            0,
             false,
         );
         assert!(scalar.dispatches.iter().all(|dispatch| !matches!(
@@ -4266,6 +4286,7 @@ mod tests {
                 f16_tile: 16,
                 f32_tile: 0,
             },
+            49_152,
             true,
         );
 
@@ -4279,6 +4300,55 @@ mod tests {
                 .iter()
                 .all(|dispatch| { dispatch.shader != ShaderEntry::MultiHeadAttnGradKV })
         );
+    }
+
+    #[test]
+    fn cooperative_attention_respects_shared_memory_limits() {
+        let caps = crate::codegen::CoopCaps {
+            f16_tile: 16,
+            f32_tile: 0,
+        };
+        let options = CompileOptions {
+            flash_backward_coop: true,
+            ..CompileOptions::default()
+        };
+        for (head_dim, bytes, expected) in [
+            (64, 0, [false, false, false]),
+            (64, 16_384, [true, true, false]),
+            (128, 32_768, [true, true, false]),
+            (256, 49_152, [true, false, false]),
+            (256, 52_415, [true, false, false]),
+            (256, 52_416, [true, true, false]),
+            (256, 70_080, [true, true, true]),
+            (512, 65_536, [false, false, false]),
+        ] {
+            let mut graph = Graph::new();
+            let shape = [32, head_dim as usize];
+            let q = graph.parameter("q", &shape);
+            let k = graph.parameter("k", &shape);
+            let v = graph.parameter("v", &shape);
+            let attention = graph.causal_attention(q, k, v, 1, 1, head_dim);
+            let loss = graph.sum_all(attention);
+            graph.set_outputs(vec![loss]);
+            let differentiated = crate::autodiff::differentiate(&graph);
+            let plan = compile_with_caps(&differentiated, &options, caps, bytes);
+            for (shader, wanted) in [
+                ShaderEntry::FlashAttentionCoop,
+                ShaderEntry::FlashGradQCoop,
+                ShaderEntry::FlashGradKVCoop,
+            ]
+            .into_iter()
+            .zip(expected)
+            {
+                assert_eq!(
+                    plan.dispatches
+                        .iter()
+                        .any(|dispatch| dispatch.shader == shader),
+                    wanted,
+                    "{shader:?}, head_dim={head_dim}, shared_memory_bytes={bytes}",
+                );
+            }
+        }
     }
 
     #[test]

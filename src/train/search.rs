@@ -114,6 +114,7 @@ pub fn build_measured(
         .runtime
         .coop
         .filter_caps(runtime::auto_tune(&gpu, 0).coop_caps);
+    let shared_memory_bytes = gpu.capabilities().max_compute_shared_memory_size;
     let (ordinary, _) = prepare_graph(
         forward_graph,
         cfg.mode,
@@ -204,7 +205,7 @@ pub fn build_measured(
                 fuse_dispatches: fusion,
                 ..cfg.options.clone()
             };
-            let plan = compile::compile_with_caps(&graph, &options, caps);
+            let plan = compile::compile_with_caps(&graph, &options, caps, shared_memory_bytes);
             if !seeds.iter().any(|seed| seed.plan == plan) {
                 seeds.push(Seed {
                     description: format!("graph={index}, dispatch_fusion={fusion}"),
@@ -216,12 +217,7 @@ pub fn build_measured(
         }
     }
     let preparation_time = start.elapsed();
-    let programs = implementations(
-        seeds,
-        caps,
-        gpu.capabilities().max_compute_shared_memory_size,
-        options.max_plan_bytes,
-    );
+    let programs = implementations(seeds, caps, shared_memory_bytes, options.max_plan_bytes);
     measure::select(
         programs,
         gpu,
@@ -405,7 +401,8 @@ fn implementations(
                     options.knobs.flash = shape;
                     options.flash_forward_coop = false;
                 }
-                let plan = compile::compile_with_caps(&seed.graph, &options, caps);
+                let plan =
+                    compile::compile_with_caps(&seed.graph, &options, caps, shared_memory_bytes);
                 if plan == seed.plan
                     || (flash.is_some()
                         && !plan

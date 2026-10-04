@@ -1,5 +1,13 @@
 # Unreleased
 
+- Bound cooperative attention's workgroup staging by the selected device's
+  shared-memory limit, falling back independently for forward, dQ and dK/dV.
+  Include the limit in cached-plan compatibility and invalidate older plans.
+- Correct `bench_step_cpu` to time GPU completion and report submission and
+  wait separately; withdraw the overlap conclusions based on submission-only
+  timings. Reject nonfinite values in the profiling result comparison and fix
+  the context module's broken documentation link.
+
 - The file split recommended in July 2026: `runtime.rs` 8592 to 5666,
   `codegen.rs` 8146 to 5419, `compile.rs` 7928 to 4326. The seams are by
   responsibility rather than by size:

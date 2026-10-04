@@ -9,6 +9,7 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
+// Version 16 bounds cooperative attention staging by device shared memory.
 // Version 15 gives `WinogradConv2d` its logical kernel instead of a derived
 // transformed parameter, and adds the adjoint (input-gradient) form.
 // Version 14 marks generated kernels as `ShaderEntry::Generated` and drops
@@ -16,7 +17,7 @@ use std::{io, path::Path};
 // Version 13 reduces loss partials into a scalar, lowers LayerNorm to the
 // two-pass kernel, carries RoPE's static offset into the dynamic kernels, and
 // changes which dispatches fusion may merge.
-const CACHE_FORMAT_VERSION: u32 = 15;
+const CACHE_FORMAT_VERSION: u32 = 16;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]
@@ -126,6 +127,7 @@ pub(crate) fn hash_build_config(
     mode_tag: u8,
     skip_full_optimize: bool,
     coop_caps: CoopCaps,
+    shared_memory_bytes: u32,
 ) -> u64 {
     #[derive(Serialize)]
     struct BuildFingerprint<'a> {
@@ -135,6 +137,7 @@ pub(crate) fn hash_build_config(
         mode_tag: u8,
         skip_full_optimize: bool,
         coop_caps: CoopCaps,
+        shared_memory_bytes: u32,
     }
 
     let fingerprint = BuildFingerprint {
@@ -144,6 +147,7 @@ pub(crate) fn hash_build_config(
         mode_tag,
         skip_full_optimize,
         coop_caps,
+        shared_memory_bytes,
         // Flash coop flags and EPT caps live in `options`, hashed above.
     };
     hash_serializable(&fingerprint)
@@ -361,14 +365,18 @@ mod tests {
     fn test_build_hash_includes_mode_options_and_target() {
         let defaults = CompileOptions::default();
         let optimize = OptimizeConfig::default();
-        let base = hash_build_config(&defaults, &optimize, 0, false, CoopCaps::default());
+        let base = hash_build_config(&defaults, &optimize, 0, false, CoopCaps::default(), 49_152);
         assert_ne!(
             base,
-            hash_build_config(&defaults, &optimize, 1, false, CoopCaps::default()),
+            hash_build_config(&defaults, &optimize, 1, false, CoopCaps::default(), 49_152),
         );
         assert_ne!(
             base,
-            hash_build_config(&defaults, &optimize, 0, true, CoopCaps::default()),
+            hash_build_config(&defaults, &optimize, 0, true, CoopCaps::default(), 49_152),
+        );
+        assert_ne!(
+            base,
+            hash_build_config(&defaults, &optimize, 0, false, CoopCaps::default(), 65_536),
         );
         assert_ne!(
             base,
@@ -381,6 +389,7 @@ mod tests {
                 0,
                 false,
                 CoopCaps::default(),
+                49_152,
             ),
         );
         assert_ne!(
@@ -394,6 +403,7 @@ mod tests {
                     f16_tile: 16,
                     f32_tile: 0,
                 },
+                49_152,
             ),
         );
     }
@@ -408,7 +418,7 @@ mod tests {
         let options = CompileOptions::default();
         let defaults = OptimizeConfig::default();
         let hash = |config: &OptimizeConfig| {
-            hash_build_config(&options, config, 1, false, CoopCaps::default())
+            hash_build_config(&options, config, 1, false, CoopCaps::default(), 49_152)
         };
         let plan = compile::compile(&graph);
         let path = std::env::temp_dir().join(format!(

@@ -10,6 +10,18 @@
 
 use super::*;
 
+/// Workgroup storage for the fixed 16-query, 16-key cooperative tiles.
+/// The fixed terms include score tiles and backward row statistics.
+pub(crate) fn attention_coop_shared_bytes(group: ShaderGroup, head_dim: u32) -> u64 {
+    let (per_dim, fixed) = match group {
+        ShaderGroup::FlashAttentionCoop => (128u64, 1024),
+        ShaderGroup::FlashGradQCoop => (192, 3264),
+        ShaderGroup::FlashGradKVCoop => (256, 4544),
+        _ => unreachable!("shared-memory accounting requires cooperative attention"),
+    };
+    per_dim * u64::from(head_dim) + fixed
+}
+
 pub fn attention_lanes(head_dim: u32, ept_cap: u32) -> (u32, u32) {
     assert!(head_dim >= 1, "attention needs a nonempty head");
     let padded = head_dim.next_power_of_two();

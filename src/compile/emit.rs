@@ -16,6 +16,7 @@ impl<'a> Compiler<'a> {
         graph: &'a Graph,
         options: CompileOptions,
         coop_caps: crate::codegen::CoopCaps,
+        shared_memory_bytes: u32,
         allow_reduced_precision_attention_backward: bool,
     ) -> Self {
         if let Some(shape) = options.gemv_shape {
@@ -44,6 +45,7 @@ impl<'a> Compiler<'a> {
             node_buffers: HashMap::new(),
             options,
             coop_caps,
+            shared_memory_bytes,
             allow_reduced_precision_attention_backward,
             fused_grad_kv_dv: HashMap::new(),
             attention_row_dots: HashMap::new(),
@@ -208,6 +210,8 @@ impl<'a> Compiler<'a> {
             // Only power-of-two widths have run on cooperative hardware.
             && head_dim.is_power_of_two()
             && q_seq >= 16
+            && crate::codegen::attention_coop_shared_bytes(ShaderGroup::FlashAttentionCoop, head_dim)
+                <= u64::from(self.shared_memory_bytes)
         {
             return (
                 ShaderEntry::FlashAttentionCoop,
@@ -3020,7 +3024,11 @@ impl<'a> Compiler<'a> {
                     && head_dim >= 16
                     && head_dim.is_multiple_of(16)
                     && head_dim.is_power_of_two()
-                    && q_seq >= 16;
+                    && q_seq >= 16
+                    && crate::codegen::attention_coop_shared_bytes(
+                        ShaderGroup::FlashGradQCoop,
+                        head_dim,
+                    ) <= u64::from(self.shared_memory_bytes);
                 let (grad_q_shader, grad_q_wgs) = if bwd_coop_enabled {
                     (
                         ShaderEntry::FlashGradQCoop,
@@ -3119,7 +3127,11 @@ impl<'a> Compiler<'a> {
                     && head_dim >= 16
                     && head_dim.is_multiple_of(16)
                     && head_dim.is_power_of_two()
-                    && dispatch_kv >= 16;
+                    && dispatch_kv >= 16
+                    && crate::codegen::attention_coop_shared_bytes(
+                        ShaderGroup::FlashGradKVCoop,
+                        head_dim,
+                    ) <= u64::from(self.shared_memory_bytes);
                 let (shader, workgroups) = if bwd_coop_enabled {
                     (
                         ShaderEntry::FlashGradKVCoop,
