@@ -9,6 +9,7 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
+// Version 17 stores typed dispatch operations, including operands and dimensions.
 // Version 16 bounds cooperative attention staging by device shared memory.
 // Version 15 gives `WinogradConv2d` its logical kernel instead of a derived
 // transformed parameter, and adds the adjoint (input-gradient) form.
@@ -17,11 +18,11 @@ use std::{io, path::Path};
 // Version 13 reduces loss partials into a scalar, lowers LayerNorm to the
 // two-pass kernel, carries RoPE's static offset into the dynamic kernels, and
 // changes which dispatches fusion may merge.
-const CACHE_FORMAT_VERSION: u32 = 16;
+const CACHE_FORMAT_VERSION: u32 = 17;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]
-struct CachedPlan {
+struct CachedPlan<Plan = ExecutionPlan> {
     #[serde(default)]
     format_version: u32,
     graph_hash: u64,
@@ -30,7 +31,7 @@ struct CachedPlan {
     /// hashing. Zero is the public `save_plan`/`load_plan` compatibility key.
     #[serde(default)]
     build_hash: u64,
-    plan: ExecutionPlan,
+    plan: Plan,
 }
 
 /// Save a compiled execution plan to a RON file.
@@ -76,7 +77,8 @@ fn load_plan_impl(
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let cached: CachedPlan =
+    // Read compatibility metadata before decoding the versioned plan schema.
+    let cached: CachedPlan<serde::de::IgnoredAny> =
         ron::from_str(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     if cached.format_version != CACHE_FORMAT_VERSION {
@@ -95,6 +97,8 @@ fn load_plan_impl(
         log::info!("cache invalidated: build configuration mismatch");
         return Ok(None);
     }
+    let cached: CachedPlan =
+        ron::from_str(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(Some(cached.plan))
 }
 
@@ -498,7 +502,8 @@ mod cache_format_tests {
             format_version: CACHE_FORMAT_VERSION - 1,
             graph_hash: hash_graph(&graph),
             build_hash: 0,
-            plan: crate::compile::compile(&graph),
+            // The prior schema cannot be deserialized as today's DispatchOp.
+            plan: "legacy execution plan schema",
         };
         let path = std::env::temp_dir().join(format!(
             "meganeura-previous-cache-format-{}.ron",

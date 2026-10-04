@@ -206,14 +206,15 @@ fn flash_attention_backward_uses_precomputed_row_dots() {
         let dispatches = &training.plan().dispatches;
         let query = dispatches
             .iter()
-            .find(|d| d.shader == ShaderEntry::FlashGradQ)
+            .find(|d| d.shader() == ShaderEntry::FlashGradQ)
             .unwrap();
         let kv = dispatches
             .iter()
-            .find(|d| d.shader == ShaderEntry::FlashGradKV)
+            .find(|d| d.shader() == ShaderEntry::FlashGradKV)
             .unwrap();
         assert_eq!(
-            query.input_buffers[5], kv.input_buffers[5],
+            query.input_buffers()[5],
+            kv.input_buffers()[5],
             "dQ and dK/dV must share the row reduction"
         );
         for (name, data) in &parameters {

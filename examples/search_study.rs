@@ -121,7 +121,10 @@ fn describe(session: &Session) -> String {
         .map(|dispatch| {
             format!(
                 "{:?} {:?} wg={:?} locked={}",
-                dispatch.shader, dispatch.kernel, dispatch.workgroups, dispatch.schedule_locked
+                dispatch.shader(),
+                dispatch.kernel(),
+                dispatch.workgroups,
+                dispatch.schedule_locked
             )
         })
         .collect::<Vec<_>>()

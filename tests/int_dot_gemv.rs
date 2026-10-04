@@ -490,13 +490,13 @@ fn run(
         .iter()
         .find(|d| {
             matches!(
-                d.shader,
+                d.shader(),
                 ShaderEntry::MatMulGemv | ShaderEntry::MatMulGemvAdd
             )
         })
         .expect("the test graph should compile to one GEMV");
     assert_eq!(
-        dispatch.shader,
+        dispatch.shader(),
         if addend.is_some() {
             ShaderEntry::MatMulGemvAdd
         } else {
@@ -549,10 +549,10 @@ fn run_q40_rmsnorm(
         .plan()
         .dispatches
         .iter()
-        .find(|dispatch| dispatch.shader == ShaderEntry::MatMulGemv)
+        .find(|dispatch| dispatch.shader() == ShaderEntry::MatMulGemv)
         .expect("RmsNorm output should feed a GEMV");
     assert!(dispatch.gemv_int_dot());
-    assert_eq!(dispatch.gemv_rmsnorm.is_some(), !expose_normalized);
+    assert_eq!(dispatch.gemv_rmsnorm().is_some(), !expose_normalized);
 
     session.set_input("x", x);
     session.set_parameter("norm", norm_weight);

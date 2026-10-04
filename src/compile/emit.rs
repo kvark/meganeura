@@ -103,15 +103,17 @@ impl<'a> Compiler<'a> {
     pub(super) fn push_sum_rows(&mut self, rows: u32, cols: u32, src: BufferRef, dst: BufferRef) {
         let splits = Self::row_reduction_splits(rows, cols);
         if splits == 1 {
-            self.plan.dispatches.push(Dispatch {
-                shader: ShaderEntry::SumRows,
-                workgroups: [cols.div_ceil(32), 1, 1],
-                input_buffers: vec![src],
-                output_buffer: dst,
-                extra_outputs: vec![],
-                params: vec![rows, cols, 0, 0],
-                ..Default::default()
-            });
+            self.plan.dispatches.push(Dispatch::new(
+                DispatchOp::SumRows(dispatch::SumRows {
+                    src,
+                    dst,
+                    rows,
+                    cols,
+                    serial_rows: 0,
+                    splits: 0,
+                }),
+                [cols.div_ceil(32), 1, 1],
+            ));
             return;
         }
         let bytes = (splits as usize)
@@ -119,24 +121,28 @@ impl<'a> Compiler<'a> {
             .and_then(|n| n.checked_mul(4))
             .expect("row-split reduction size");
         let partial = self.alloc_buffer(bytes);
-        self.plan.dispatches.push(Dispatch {
-            shader: ShaderEntry::SumRows,
-            workgroups: [cols.div_ceil(32), splits, 1],
-            input_buffers: vec![src],
-            output_buffer: partial,
-            extra_outputs: vec![],
-            params: vec![rows, cols, 0, splits],
-            ..Default::default()
-        });
-        self.plan.dispatches.push(Dispatch {
-            shader: ShaderEntry::SumRows,
-            workgroups: [cols.div_ceil(32), 1, 1],
-            input_buffers: vec![partial],
-            output_buffer: dst,
-            extra_outputs: vec![],
-            params: vec![splits, cols, 0, 0],
-            ..Default::default()
-        });
+        self.plan.dispatches.push(Dispatch::new(
+            DispatchOp::SumRows(dispatch::SumRows {
+                src,
+                dst: partial,
+                rows,
+                cols,
+                serial_rows: 0,
+                splits,
+            }),
+            [cols.div_ceil(32), splits, 1],
+        ));
+        self.plan.dispatches.push(Dispatch::new(
+            DispatchOp::SumRows(dispatch::SumRows {
+                src: partial,
+                dst,
+                rows: splits,
+                cols,
+                serial_rows: 0,
+                splits: 0,
+            }),
+            [cols.div_ceil(32), 1, 1],
+        ));
     }
 
     /// Buffer already allocated for a `CrossEntropyLogitsGrad` on the same
@@ -156,15 +162,19 @@ impl<'a> Compiler<'a> {
         let slots = (batch * num_groups) as usize;
         let stats = self.alloc_buffer(slots * 2 * 4);
         let x = self.get_buffer(input);
-        self.plan.dispatches.push(Dispatch {
-            shader: ShaderEntry::GroupNormGradStats,
-            workgroups: [batch * num_groups, 1, 1],
-            input_buffers: vec![x],
-            output_buffer: stats,
-            extra_outputs: vec![],
-            params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
-            ..Default::default()
-        });
+        self.plan.dispatches.push(Dispatch::new(
+            DispatchOp::GroupNormGradStats(dispatch::GroupNormStats {
+                src: x,
+                dst: stats,
+                batch,
+                channels,
+                spatial,
+                num_groups,
+                eps_bits: eps.to_bits(),
+                chunks: 0,
+            }),
+            [batch * num_groups, 1, 1],
+        ));
         self.group_norm_grad_stats.insert(key, stats);
         stats
     }
@@ -194,7 +204,7 @@ impl<'a> Compiler<'a> {
         head_dim: u32,
         num_heads: u32,
         requires_full_precision: bool,
-    ) -> (ShaderEntry, [u32; 3]) {
+    ) -> (fn(dispatch::AttentionForward) -> DispatchOp, [u32; 3]) {
         // Pick the coop-matrix flash forward when the GPU has the
         // 16x16 f16 cooperative_matrix path (NVIDIA, RDNA3, Xe-HPG)
         // and the shape is compatible. ~3.2x faster per dispatch than
@@ -214,7 +224,7 @@ impl<'a> Compiler<'a> {
                 <= u64::from(self.shared_memory_bytes)
         {
             return (
-                ShaderEntry::FlashAttentionCoop,
+                DispatchOp::FlashAttentionCoop,
                 [q_seq.div_ceil(16), num_heads, 1],
             );
         }
@@ -223,11 +233,11 @@ impl<'a> Compiler<'a> {
         let bq = (self.options.knobs.flash.threads / tpq).max(1);
         if bq >= 2 && q_seq >= bq {
             (
-                ShaderEntry::FlashAttention,
+                DispatchOp::FlashAttention,
                 [q_seq.div_ceil(bq), num_heads, 1],
             )
         } else {
-            (ShaderEntry::MultiHeadAttn, [q_seq, num_heads, 1])
+            (DispatchOp::MultiHeadAttn, [q_seq, num_heads, 1])
         }
     }
 
@@ -311,17 +321,17 @@ impl<'a> Compiler<'a> {
             gather_elem: Vec::new(),
             input_row_repeats: Vec::new(),
         };
-        self.plan.dispatches.push(Dispatch {
-            shader: ShaderEntry::Generated,
-            workgroups: [rows.div_ceil(rows_per_workgroup), 1, 1],
-            input_buffers: vec![input],
-            output_buffer: output,
-            extra_outputs: vec![],
-            params: vec![rows, inner, 1.0_f32.to_bits(), 0],
-
-            kernel: Kernel::Reduction(kernel),
-            ..Default::default()
-        });
+        self.plan.dispatches.push(Dispatch::new(
+            DispatchOp::Reduction(dispatch::Reduction {
+                inputs: vec![input],
+                dst: output,
+                outer: rows,
+                inner,
+                round_one_bits: 1.0_f32.to_bits(),
+                kernel,
+            }),
+            [rows.div_ceil(rows_per_workgroup), 1, 1],
+        ));
     }
 
     /// Sum or mean of a whole tensor into `output[0]`.
@@ -332,7 +342,7 @@ impl<'a> Compiler<'a> {
     /// limited to a single workgroup.
     pub(super) fn emit_reduce_all(
         &mut self,
-        shader: ShaderEntry,
+        make_op: fn(dispatch::ReduceAll) -> DispatchOp,
         input: BufferRef,
         output: BufferRef,
         len: u32,
@@ -340,37 +350,36 @@ impl<'a> Compiler<'a> {
         const PER_WORKGROUP: u32 = 16 * 1024;
         let groups = (len / PER_WORKGROUP).clamp(1, 256);
         if groups == 1 {
-            self.plan.dispatches.push(Dispatch {
-                shader,
-                workgroups: [1, 1, 1],
-                input_buffers: vec![input],
-                output_buffer: output,
-                extra_outputs: vec![],
-                params: vec![len, 0, 0, 0],
-
-                ..Default::default()
-            });
+            self.plan.dispatches.push(Dispatch::new(
+                make_op(dispatch::ReduceAll {
+                    src: input,
+                    dst: output,
+                    len,
+                    divisor: 0,
+                }),
+                [1, 1, 1],
+            ));
             return;
         }
         let partials = self.alloc_buffer(groups as usize * 4);
-        self.plan.dispatches.push(Dispatch {
-            shader: shader.clone(),
-            workgroups: [groups, 1, 1],
-            input_buffers: vec![input],
-            output_buffer: partials,
-            extra_outputs: vec![],
-            params: vec![len, 0, 0, 0],
-            ..Default::default()
-        });
-        self.plan.dispatches.push(Dispatch {
-            shader,
-            workgroups: [1, 1, 1],
-            input_buffers: vec![partials],
-            output_buffer: output,
-            extra_outputs: vec![],
-            params: vec![groups, len, 0, 0],
-            ..Default::default()
-        });
+        self.plan.dispatches.push(Dispatch::new(
+            make_op(dispatch::ReduceAll {
+                src: input,
+                dst: partials,
+                len,
+                divisor: 0,
+            }),
+            [groups, 1, 1],
+        ));
+        self.plan.dispatches.push(Dispatch::new(
+            make_op(dispatch::ReduceAll {
+                src: partials,
+                dst: output,
+                len: groups,
+                divisor: len,
+            }),
+            [1, 1, 1],
+        ));
     }
 
     /// D[row] = dot(d_out[row], o[row]) over `head_dim`-wide rows, for the
@@ -392,31 +401,32 @@ impl<'a> Compiler<'a> {
         const WORKGROUP_SIZE: u32 = 256;
         let lanes = head_dim.next_power_of_two().clamp(2, WORKGROUP_SIZE);
         let row_dot = self.alloc_buffer(rows as usize * 4);
-        self.plan.dispatches.push(Dispatch {
-            shader: ShaderEntry::Generated,
-            workgroups: [rows.div_ceil(WORKGROUP_SIZE / lanes), 1, 1],
-            input_buffers: vec![d_out, o],
-            output_buffer: row_dot,
-            extra_outputs: vec![],
-            params: vec![rows, head_dim, 1.0_f32.to_bits(), 0],
-            kernel: Kernel::Reduction(ReductionKernel {
-                op: ReduceOp::Sum,
-                prologue: PointwiseDAG {
-                    n_inputs: 2,
-                    ops: vec![Pw::LoadInput(0), Pw::LoadInput(1), Pw::Mul(0, 1)],
-                    output: 2,
+        self.plan.dispatches.push(Dispatch::new(
+            DispatchOp::Reduction(dispatch::Reduction {
+                inputs: vec![d_out, o],
+                dst: row_dot,
+                outer: rows,
+                inner: head_dim,
+                round_one_bits: 1.0_f32.to_bits(),
+                kernel: ReductionKernel {
+                    op: ReduceOp::Sum,
+                    prologue: PointwiseDAG {
+                        n_inputs: 2,
+                        ops: vec![Pw::LoadInput(0), Pw::LoadInput(1), Pw::Mul(0, 1)],
+                        output: 2,
+                    },
+                    extra_prologues: vec![],
+                    epilogue: None,
+                    n_per_elem: 2,
+                    n_per_row: 0,
+                    workgroup_size: WORKGROUP_SIZE,
+                    rows_per_workgroup: WORKGROUP_SIZE / lanes,
+                    gather_elem: Vec::new(),
+                    input_row_repeats: Vec::new(),
                 },
-                extra_prologues: vec![],
-                epilogue: None,
-                n_per_elem: 2,
-                n_per_row: 0,
-                workgroup_size: WORKGROUP_SIZE,
-                rows_per_workgroup: WORKGROUP_SIZE / lanes,
-                gather_elem: Vec::new(),
-                input_row_repeats: Vec::new(),
             }),
-            ..Default::default()
-        });
+            [rows.div_ceil(WORKGROUP_SIZE / lanes), 1, 1],
+        ));
         self.attention_row_dots.insert(key, row_dot);
         row_dot
     }
@@ -431,16 +441,18 @@ impl<'a> Compiler<'a> {
         let total = rows
             .checked_mul(inner)
             .expect("inner broadcast element count exceeds u32");
-        self.plan.dispatches.push(Dispatch {
-            shader: ShaderEntry::GlobalAvgPoolGrad,
-            workgroups: [total.div_ceil(256), 1, 1],
-            input_buffers: vec![input],
-            output_buffer: output,
-            extra_outputs: vec![],
-            params: vec![total, inner, 1, 0],
+        self.plan.dispatches.push(Dispatch::new(
+            DispatchOp::GlobalAvgPoolGrad(dispatch::RowBroadcast {
+                src: input,
+                dst: output,
+                len: total,
+                inner,
+                mode: 1,
 
-            ..Default::default()
-        });
+                offset: 0,
+            }),
+            [total.div_ceil(256), 1, 1],
+        ));
     }
 
     pub(super) fn compile(&mut self) {
@@ -528,7 +540,7 @@ impl<'a> Compiler<'a> {
 
         // Generate labels for profiling
         for d in &mut self.plan.dispatches {
-            d.label = match d.shader {
+            d.label = match d.shader() {
                 // A generated kernel is named after the op that produced it.
                 ShaderEntry::Generated => {
                     let op = d.origin.first().map_or_else(
@@ -541,14 +553,22 @@ impl<'a> Compiler<'a> {
                                 .to_string()
                         },
                     );
-                    format!("{op}[{}x{}]", d.params[0], d.params[1])
+                    format!(
+                        "{op}[{}x{}]",
+                        d.parameter_words()[0],
+                        d.parameter_words()[1]
+                    )
                 }
                 ShaderEntry::BlockMatMul
                 | ShaderEntry::BlockMatMulAT
                 | ShaderEntry::BlockMatMulBT => {
                     format!(
                         "{:?}[g={},{}x{}x{}]",
-                        d.shader, d.params[3], d.params[0], d.params[1], d.params[2]
+                        d.shader(),
+                        d.parameter_words()[3],
+                        d.parameter_words()[0],
+                        d.parameter_words()[1],
+                        d.parameter_words()[2]
                     )
                 }
                 ShaderEntry::MatMul
@@ -557,7 +577,10 @@ impl<'a> Compiler<'a> {
                 | ShaderEntry::MatMulGemvAdd => {
                     format!(
                         "{:?}[{}x{}x{}]",
-                        d.shader, d.params[0], d.params[2], d.params[1]
+                        d.shader(),
+                        d.parameter_words()[0],
+                        d.parameter_words()[2],
+                        d.parameter_words()[1]
                     )
                 }
                 ShaderEntry::MatMulAT
@@ -568,17 +591,24 @@ impl<'a> Compiler<'a> {
                 | ShaderEntry::FusedMatMulBTAdd => {
                     format!(
                         "{:?}[{}x{}x{}]",
-                        d.shader, d.params[0], d.params[1], d.params[2]
+                        d.shader(),
+                        d.parameter_words()[0],
+                        d.parameter_words()[1],
+                        d.parameter_words()[2]
                     )
                 }
                 ShaderEntry::MultiHeadAttn
                 | ShaderEntry::MultiHeadAttnGradQ
                 | ShaderEntry::MultiHeadAttnGradKV => {
-                    let nh = d.params[2] >> 16;
-                    let nkv = d.params[2] & 0xFFFF;
+                    let nh = d.parameter_words()[2] >> 16;
+                    let nkv = d.parameter_words()[2] & 0xFFFF;
                     format!(
                         "{:?}[q={},kv={},h={}/{}]",
-                        d.shader, d.params[0], d.params[1], nh, nkv
+                        d.shader(),
+                        d.parameter_words()[0],
+                        d.parameter_words()[1],
+                        nh,
+                        nkv
                     )
                 }
                 ShaderEntry::RmsNormGradW
@@ -586,13 +616,18 @@ impl<'a> Compiler<'a> {
                 | ShaderEntry::RmsNormGradX
                 | ShaderEntry::LayerNormGradWB
                 | ShaderEntry::LayerNormGradX => {
-                    format!("{:?}[{}x{}]", d.shader, d.params[0], d.params[1])
+                    format!(
+                        "{:?}[{}x{}]",
+                        d.shader(),
+                        d.parameter_words()[0],
+                        d.parameter_words()[1]
+                    )
                 }
                 _ => {
-                    if d.params[0] > 0 {
-                        format!("{:?}[{}]", d.shader, d.params[0])
+                    if d.parameter_words()[0] > 0 {
+                        format!("{:?}[{}]", d.shader(), d.parameter_words()[0])
                     } else {
-                        format!("{:?}", d.shader)
+                        format!("{:?}", d.shader())
                     }
                 }
             };
@@ -673,19 +708,20 @@ impl<'a> Compiler<'a> {
                 let input = self.get_buffer(node.inputs[0]);
                 let len = node.ty.num_elements() as u32;
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Generated,
-                    workgroups: [len.div_ceil(256), 1, 1],
-                    input_buffers: vec![input],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![len, 0, 0, 0],
-                    kernel: Kernel::Pointwise(PointwiseDAG {
-                        n_inputs: 1,
-                        ops: vec![Pw::LoadInput(0)],
-                        output: 0,
-                    }),
                     fusion_barrier: true,
-                    ..Default::default()
+                    ..Dispatch::new(
+                        DispatchOp::Pointwise(dispatch::Pointwise {
+                            inputs: vec![input],
+                            dst: out_buf,
+                            len,
+                            dag: PointwiseDAG {
+                                n_inputs: 1,
+                                ops: vec![Pw::LoadInput(0)],
+                                output: 0,
+                            },
+                        }),
+                        [len.div_ceil(256), 1, 1],
+                    )
                 });
             }
 
@@ -709,30 +745,34 @@ impl<'a> Compiler<'a> {
                     // 32 threads cooperatively K-split with a shared-
                     // memory tree reduction. Many more WGs than N/128,
                     // giving occupancy to hide DRAM latency at M=1.
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::MatMulGemv,
-                        workgroups: [n / 4, 1, 1],
-                        input_buffers: vec![a, b],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![m, k, n, 0],
-
-                        weight_format: wf,
-                        kernel: self.options.gemv_kernel(ShaderGroup::MatMulGemv, wf),
-                        ..Default::default()
-                    });
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::Matmul(dispatch::Matmul {
+                            implementation: self.options.gemv_kernel(ShaderGroup::MatMulGemv, wf),
+                            weight_format: wf,
+                            ..dispatch::Matmul::new(
+                                dispatch::MatmulKind::Gemv,
+                                a,
+                                b,
+                                out_buf,
+                                [m, n, k],
+                            )
+                        }),
+                        [n / 4, 1, 1],
+                    ));
                 } else {
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::MatMul,
-                        workgroups: matmul_workgroups(m, n, 64),
-                        input_buffers: vec![a, b],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![m, k, n, 0],
-
-                        weight_format: wf,
-                        ..Default::default()
-                    });
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::Matmul(dispatch::Matmul {
+                            weight_format: wf,
+                            ..dispatch::Matmul::new(
+                                dispatch::MatmulKind::Plain,
+                                a,
+                                b,
+                                out_buf,
+                                [m, n, k],
+                            )
+                        }),
+                        matmul_workgroups(m, n, 64),
+                    ));
                 }
             }
 
@@ -746,17 +786,19 @@ impl<'a> Compiler<'a> {
                 let k = a_shape[0] as u32; // A is [K, M]
                 let m = a_shape[1] as u32;
                 let n = b_shape[1] as u32; // B is [K, N]
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MatMulAT,
-                    workgroups: matmul_workgroups(m, n, 64),
-                    input_buffers: vec![a, b],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![m, n, k, 0],
-
-                    weight_format: wf,
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::Matmul(dispatch::Matmul {
+                        weight_format: wf,
+                        ..dispatch::Matmul::new(
+                            dispatch::MatmulKind::TransposeA,
+                            a,
+                            b,
+                            out_buf,
+                            [m, n, k],
+                        )
+                    }),
+                    matmul_workgroups(m, n, 64),
+                ));
             }
 
             Op::MatMulBT => {
@@ -791,32 +833,36 @@ impl<'a> Compiler<'a> {
                     // Only f32 and f16 reach here; the assert above turned
                     // every block format away, so the K-split GEMV-BT never
                     // sees packed data.
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::MatMulGemvBT,
-                        workgroups: row_gemv_workgroups(
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::Matmul(dispatch::Matmul {
+                            implementation: self.options.gemv_kernel(ShaderGroup::MatMulGemvBT, wf),
+                            weight_format: wf,
+                            ..dispatch::Matmul::new(
+                                dispatch::MatmulKind::GemvBT,
+                                a,
+                                b,
+                                out_buf,
+                                [m, n, k],
+                            )
+                        }),
+                        row_gemv_workgroups(
                             n.div_ceil(self.options.gemv_shape.map_or(1, |s| s.bt_rows)),
                         ),
-                        input_buffers: vec![a, b],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![m, n, k, 0],
-
-                        weight_format: wf,
-                        kernel: self.options.gemv_kernel(ShaderGroup::MatMulGemvBT, wf),
-                        ..Default::default()
-                    });
+                    ));
                 } else {
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::MatMulBT,
-                        workgroups: matmul_workgroups(m, n, 64),
-                        input_buffers: vec![a, b],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![m, n, k, 0],
-
-                        weight_format: wf,
-                        ..Default::default()
-                    });
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::Matmul(dispatch::Matmul {
+                            weight_format: wf,
+                            ..dispatch::Matmul::new(
+                                dispatch::MatmulKind::TransposeB,
+                                a,
+                                b,
+                                out_buf,
+                                [m, n, k],
+                            )
+                        }),
+                        matmul_workgroups(m, n, 64),
+                    ));
                 }
             }
 
@@ -838,23 +884,29 @@ impl<'a> Compiler<'a> {
                         "block tensor exceeds shader index range"
                     );
                 }
-                let (shader, groups, m, n, k) = match node.op {
+                let (kind, groups, m, n, k) = match node.op {
                     Op::BlockMatMul => (
-                        ShaderEntry::BlockMatMul,
+                        dispatch::MatmulKind::Block {
+                            batches: u32::try_from(b_ty.shape[0]).unwrap(),
+                        },
                         b_ty.shape[0],
                         a_ty.shape[0],
                         b_ty.shape[2],
                         b_ty.shape[1],
                     ),
                     Op::BlockMatMulAT { groups } => (
-                        ShaderEntry::BlockMatMulAT,
+                        dispatch::MatmulKind::BlockAT {
+                            batches: u32::try_from(groups).unwrap(),
+                        },
                         groups,
                         a_ty.shape[1] / groups,
                         b_ty.shape[1] / groups,
                         a_ty.shape[0],
                     ),
                     Op::BlockMatMulBT => (
-                        ShaderEntry::BlockMatMulBT,
+                        dispatch::MatmulKind::BlockBT {
+                            batches: u32::try_from(b_ty.shape[0]).unwrap(),
+                        },
                         b_ty.shape[0],
                         a_ty.shape[0],
                         b_ty.shape[1],
@@ -873,19 +925,17 @@ impl<'a> Compiler<'a> {
                 let tile = if small { 32 } else { 64 };
                 let workgroups = [n.div_ceil(tile), m.div_ceil(tile), groups];
                 assert!(workgroups.iter().all(|&v| v <= 65535));
-                self.plan.dispatches.push(Dispatch {
-                    shader,
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::Matmul(dispatch::Matmul {
+                        implementation: if small {
+                            dispatch::MatmulImplementation::SmallTile
+                        } else {
+                            dispatch::MatmulImplementation::Default
+                        },
+                        ..dispatch::Matmul::new(kind, a, b, out_buf, [m, n, k])
+                    }),
                     workgroups,
-                    input_buffers: vec![a, b],
-                    output_buffer: out_buf,
-                    params: vec![m, n, k, groups],
-                    kernel: if small {
-                        Kernel::SmallTile
-                    } else {
-                        Kernel::Default
-                    },
-                    ..Default::default()
-                });
+                ));
             }
 
             Op::FusedMatMulAdd => {
@@ -900,30 +950,36 @@ impl<'a> Compiler<'a> {
                 let k = a_shape[1] as u32;
                 let n = b_shape[1] as u32;
                 if m == 1 && n.is_multiple_of(4) {
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::MatMulGemvAdd,
-                        workgroups: [n / 4, 1, 1],
-                        input_buffers: vec![a, b, d],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![m, k, n, 0],
-
-                        weight_format: wf,
-                        kernel: self.options.gemv_kernel(ShaderGroup::MatMulGemvAdd, wf),
-                        ..Default::default()
-                    });
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::Matmul(dispatch::Matmul {
+                            implementation: self
+                                .options
+                                .gemv_kernel(ShaderGroup::MatMulGemvAdd, wf),
+                            weight_format: wf,
+                            ..dispatch::Matmul::new(
+                                dispatch::MatmulKind::GemvAdd { addend: d },
+                                a,
+                                b,
+                                out_buf,
+                                [m, n, k],
+                            )
+                        }),
+                        [n / 4, 1, 1],
+                    ));
                 } else {
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::FusedMatMulAdd,
-                        workgroups: matmul_workgroups(m, n, 64),
-                        input_buffers: vec![a, b, d],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![m, k, n, 0],
-
-                        weight_format: wf,
-                        ..Default::default()
-                    });
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::Matmul(dispatch::Matmul {
+                            weight_format: wf,
+                            ..dispatch::Matmul::new(
+                                dispatch::MatmulKind::Add { addend: d },
+                                a,
+                                b,
+                                out_buf,
+                                [m, n, k],
+                            )
+                        }),
+                        matmul_workgroups(m, n, 64),
+                    ));
                 }
             }
 
@@ -938,17 +994,19 @@ impl<'a> Compiler<'a> {
                 let k = a_shape[0] as u32;
                 let m = a_shape[1] as u32;
                 let n = b_shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::FusedMatMulATAdd,
-                    workgroups: matmul_workgroups(m, n, 64),
-                    input_buffers: vec![a, b, d],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![m, n, k, 0],
-
-                    weight_format: wf,
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::Matmul(dispatch::Matmul {
+                        weight_format: wf,
+                        ..dispatch::Matmul::new(
+                            dispatch::MatmulKind::AddAT { addend: d },
+                            a,
+                            b,
+                            out_buf,
+                            [m, n, k],
+                        )
+                    }),
+                    matmul_workgroups(m, n, 64),
+                ));
             }
 
             Op::FusedMatMulBTAdd => {
@@ -972,32 +1030,34 @@ impl<'a> Compiler<'a> {
                 let k = a_shape[1] as u32;
                 let n = b_shape[0] as u32;
                 let gemv = m == 1 && k.is_multiple_of(4);
-                self.plan.dispatches.push(Dispatch {
-                    shader: if gemv {
-                        ShaderEntry::MatMulGemvBTAdd
-                    } else {
-                        ShaderEntry::FusedMatMulBTAdd
-                    },
-                    workgroups: if gemv {
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::Matmul(dispatch::Matmul {
+                        weight_format: wf,
+                        implementation: if gemv {
+                            self.options.gemv_kernel(ShaderGroup::MatMulGemvBTAdd, wf)
+                        } else {
+                            dispatch::MatmulImplementation::Default
+                        },
+                        ..dispatch::Matmul::new(
+                            if gemv {
+                                dispatch::MatmulKind::GemvBTAdd { addend: d }
+                            } else {
+                                dispatch::MatmulKind::AddBT { addend: d }
+                            },
+                            a,
+                            b,
+                            out_buf,
+                            [m, n, k],
+                        )
+                    }),
+                    if gemv {
                         row_gemv_workgroups(
                             n.div_ceil(self.options.gemv_shape.map_or(1, |s| s.bt_rows)),
                         )
                     } else {
                         matmul_workgroups(m, n, 64)
                     },
-                    input_buffers: vec![a, b, d],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![m, n, k, 0],
-
-                    weight_format: wf,
-                    kernel: if gemv {
-                        self.options.gemv_kernel(ShaderGroup::MatMulGemvBTAdd, wf)
-                    } else {
-                        Kernel::Default
-                    },
-                    ..Default::default()
-                });
+                ));
             }
 
             Op::Add => {
@@ -1042,15 +1102,15 @@ impl<'a> Compiler<'a> {
                 let input = self.get_buffer(node.inputs[0]);
                 let len = node.ty.num_elements() as u32;
                 let pointwise = softplus::forward(beta);
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Generated,
-                    workgroups: [len.div_ceil(256), 1, 1],
-                    input_buffers: vec![input],
-                    output_buffer: out_buf,
-                    params: vec![len, 0, 0, 0],
-                    kernel: Kernel::Pointwise(pointwise),
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::Pointwise(dispatch::Pointwise {
+                        inputs: vec![input],
+                        dst: out_buf,
+                        len,
+                        dag: pointwise,
+                    }),
+                    [len.div_ceil(256), 1, 1],
+                ));
             }
             Op::Clamp { min, max } => {
                 let input = self.get_buffer(node.inputs[0]);
@@ -1069,15 +1129,15 @@ impl<'a> Compiler<'a> {
                     ],
                     output: 4,
                 };
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Generated,
-                    workgroups: [len.div_ceil(256), 1, 1],
-                    input_buffers: vec![input],
-                    output_buffer: out_buf,
-                    params: vec![len, 0, 0, 0],
-                    kernel: Kernel::Pointwise(pointwise),
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::Pointwise(dispatch::Pointwise {
+                        inputs: vec![input],
+                        dst: out_buf,
+                        len,
+                        dag: pointwise,
+                    }),
+                    [len.div_ceil(256), 1, 1],
+                ));
             }
             Op::Scale { factor } => {
                 let input = self.get_buffer(node.inputs[0]);
@@ -1087,42 +1147,42 @@ impl<'a> Compiler<'a> {
                     ops: vec![Pw::LoadInput(0), Pw::const_f32(factor), Pw::Mul(0, 1)],
                     output: 2,
                 };
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Generated,
-                    workgroups: [len.div_ceil(256), 1, 1],
-                    input_buffers: vec![input],
-                    output_buffer: out_buf,
-                    params: vec![len, 0, 0, 0],
-                    kernel: Kernel::Pointwise(pointwise),
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::Pointwise(dispatch::Pointwise {
+                        inputs: vec![input],
+                        dst: out_buf,
+                        len,
+                        dag: pointwise,
+                    }),
+                    [len.div_ceil(256), 1, 1],
+                ));
             }
             Op::SoftplusGrad { beta } => {
                 let grad_output = self.get_buffer(node.inputs[0]);
                 let input = self.get_buffer(node.inputs[1]);
                 let len = node.ty.num_elements() as u32;
                 let pointwise = softplus::backward(beta);
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Generated,
-                    workgroups: [len.div_ceil(256), 1, 1],
-                    input_buffers: vec![grad_output, input],
-                    output_buffer: out_buf,
-                    params: vec![len, 0, 0, 0],
-                    kernel: Kernel::Pointwise(pointwise),
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::Pointwise(dispatch::Pointwise {
+                        inputs: vec![grad_output, input],
+                        dst: out_buf,
+                        len,
+                        dag: pointwise,
+                    }),
+                    [len.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::SumAll => {
                 let input = self.get_buffer(node.inputs[0]);
                 let len = self.graph.node(node.inputs[0]).ty.num_elements() as u32;
-                self.emit_reduce_all(ShaderEntry::SumAll, input, out_buf, len);
+                self.emit_reduce_all(DispatchOp::SumAll, input, out_buf, len);
             }
 
             Op::MeanAll => {
                 let input = self.get_buffer(node.inputs[0]);
                 let len = self.graph.node(node.inputs[0]).ty.num_elements() as u32;
-                self.emit_reduce_all(ShaderEntry::MeanAll, input, out_buf, len);
+                self.emit_reduce_all(DispatchOp::MeanAll, input, out_buf, len);
             }
 
             Op::SumRows => {
@@ -1142,16 +1202,17 @@ impl<'a> Compiler<'a> {
                 let in_shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let m = in_shape[0] as u32;
                 let n = in_shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::GlobalAvgPoolGrad,
-                    workgroups: [m.div_ceil(256), 1, 1],
-                    input_buffers: vec![input],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![m, n, 3, u32::from(reverse)],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::GlobalAvgPoolGrad(dispatch::RowBroadcast {
+                        src: input,
+                        dst: out_buf,
+                        len: m,
+                        inner: n,
+                        mode: 3,
+                        offset: u32::from(reverse),
+                    }),
+                    [m.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::ShiftInner { offset } => {
@@ -1162,16 +1223,17 @@ impl<'a> Compiler<'a> {
                 let len = m
                     .checked_mul(n)
                     .expect("shift_inner element count exceeds u32");
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::GlobalAvgPoolGrad,
-                    workgroups: [len.div_ceil(256), 1, 1],
-                    input_buffers: vec![input],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![len, n, 2, offset as u32],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::GlobalAvgPoolGrad(dispatch::RowBroadcast {
+                        src: input,
+                        dst: out_buf,
+                        len,
+                        inner: n,
+                        mode: 2,
+                        offset: offset as u32,
+                    }),
+                    [len.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::SumInner => {
@@ -1231,17 +1293,17 @@ impl<'a> Compiler<'a> {
                     gather_elem: vec![],
                     input_row_repeats: vec![],
                 };
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Generated,
-                    workgroups: [rows.div_ceil(256), 1, 1],
-                    input_buffers: vec![input],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![rows, inner, 1.0_f32.to_bits(), 0],
-
-                    kernel: Kernel::Reduction(kernel),
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::Reduction(dispatch::Reduction {
+                        inputs: vec![input],
+                        dst: out_buf,
+                        outer: rows,
+                        inner,
+                        round_one_bits: 1.0_f32.to_bits(),
+                        kernel,
+                    }),
+                    [rows.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::NormalizeInnerSumGrad { inner, floor } => {
@@ -1302,17 +1364,17 @@ impl<'a> Compiler<'a> {
                     gather_elem: vec![],
                     input_row_repeats: vec![],
                 };
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Generated,
-                    workgroups: [rows.div_ceil(256), 1, 1],
-                    input_buffers: vec![grad_output, input, sum],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![rows, inner, 1.0_f32.to_bits(), 0],
-
-                    kernel: Kernel::Reduction(kernel),
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::Reduction(dispatch::Reduction {
+                        inputs: vec![grad_output, input, sum],
+                        dst: out_buf,
+                        outer: rows,
+                        inner,
+                        round_one_bits: 1.0_f32.to_bits(),
+                        kernel,
+                    }),
+                    [rows.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::PairwiseSquaredDistance { pairs } => {
@@ -1343,17 +1405,17 @@ impl<'a> Compiler<'a> {
                     gather_elem: vec![],
                     input_row_repeats: vec![pairs, 1],
                 };
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Generated,
-                    workgroups: [total.div_ceil(256), 1, 1],
-                    input_buffers: vec![left, right],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![total, inner, 1.0_f32.to_bits(), 0],
-
-                    kernel: Kernel::Reduction(kernel),
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::Reduction(dispatch::Reduction {
+                        inputs: vec![left, right],
+                        dst: out_buf,
+                        outer: total,
+                        inner,
+                        round_one_bits: 1.0_f32.to_bits(),
+                        kernel,
+                    }),
+                    [total.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::PairwiseGrad { kind, inner, pairs } => {
@@ -1367,16 +1429,19 @@ impl<'a> Compiler<'a> {
                     PairwiseGradKind::DistanceRight => 1,
                     PairwiseGradKind::RejectionDirections => 2,
                 };
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::PairwiseGrad,
-                    workgroups: [total.div_ceil(256), 1, 1],
-                    input_buffers: vec![grad_output, first, second],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![total, inner, pairs, mode],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::PairwiseGrad(dispatch::PairwiseGradient {
+                        gradient: grad_output,
+                        a: first,
+                        b: second,
+                        dst: out_buf,
+                        total,
+                        inner,
+                        pairs,
+                        mode,
+                    }),
+                    [total.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::PairwiseVectorRejection { pairs } => {
@@ -1415,17 +1480,17 @@ impl<'a> Compiler<'a> {
                     gather_elem: vec![],
                     input_row_repeats: vec![1, pairs],
                 };
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Generated,
-                    workgroups: [vector_rows.div_ceil(256), 1, 1],
-                    input_buffers: vec![vectors, directions],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![vector_rows, inner, 1.0_f32.to_bits(), 0],
-
-                    kernel: Kernel::Reduction(kernel),
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::Reduction(dispatch::Reduction {
+                        inputs: vec![vectors, directions],
+                        dst: out_buf,
+                        outer: vector_rows,
+                        inner,
+                        round_one_bits: 1.0_f32.to_bits(),
+                        kernel,
+                    }),
+                    [vector_rows.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::Softmax => {
@@ -1468,18 +1533,20 @@ impl<'a> Compiler<'a> {
                     out_buf
                 };
                 let grad_buf = grad_buf.unwrap_or(partials);
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::CrossEntropyLoss,
-                    workgroups: [batch, 1, 1],
-                    input_buffers: vec![logits, labels],
-                    output_buffer: grad_buf,
-                    extra_outputs: vec![partials],
-                    params: vec![batch, features, write_grad, 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::CrossEntropyLoss(dispatch::CrossEntropy {
+                        logits,
+                        labels,
+                        gradient: grad_buf,
+                        loss: partials,
+                        batch,
+                        features,
+                        write_grad,
+                    }),
+                    [batch, 1, 1],
+                ));
                 if batch > 1 {
-                    self.emit_reduce_all(ShaderEntry::SumAll, partials, out_buf, batch);
+                    self.emit_reduce_all(DispatchOp::SumAll, partials, out_buf, batch);
                 }
             }
 
@@ -1495,18 +1562,17 @@ impl<'a> Compiler<'a> {
                 } else {
                     out_buf
                 };
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::BceLoss,
-                    workgroups: [num_wgs, 1, 1],
-                    input_buffers: vec![pred, labels],
-                    output_buffer: partials,
-                    extra_outputs: vec![],
-                    params: vec![len, 0, 0, 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::BceLoss(dispatch::BinaryLoss {
+                        prediction: pred,
+                        labels,
+                        dst: partials,
+                        len,
+                    }),
+                    [num_wgs, 1, 1],
+                ));
                 if num_wgs > 1 {
-                    self.emit_reduce_all(ShaderEntry::SumAll, partials, out_buf, num_wgs);
+                    self.emit_reduce_all(DispatchOp::SumAll, partials, out_buf, num_wgs);
                 }
             }
 
@@ -1517,16 +1583,15 @@ impl<'a> Compiler<'a> {
                 let m = shape[rank - 2] as u32;
                 let n = shape[rank - 1] as u32;
                 let batch = shape[..rank - 2].iter().product::<usize>() as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Transpose,
-                    workgroups: [n.div_ceil(16), m.div_ceil(16), batch],
-                    input_buffers: vec![input],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![m, n, 0, 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::Transpose(dispatch::Transpose {
+                        src: input,
+                        dst: out_buf,
+                        rows: m,
+                        cols: n,
+                    }),
+                    [n.div_ceil(16), m.div_ceil(16), batch],
+                ));
             }
 
             Op::Silu => {
@@ -1549,32 +1614,32 @@ impl<'a> Compiler<'a> {
                 let input = self.get_buffer(node.inputs[0]);
                 let out_len = node.ty.num_elements() as u32;
                 let half_n = node.ty.shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::SwiGLUConcat,
-                    workgroups: [out_len.div_ceil(256), 1, 1],
-                    input_buffers: vec![input, input], // src_b unused in forward
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![out_len, half_n, 0, 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::SwiGLUConcat(dispatch::GatedActivation {
+                        src_a: input,
+                        src_b: input,
+                        dst: out_buf,
+                        len: out_len,
+                        half_width: half_n,
+                    }),
+                    [out_len.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::GeGLUConcat => {
                 let input = self.get_buffer(node.inputs[0]);
                 let out_len = node.ty.num_elements() as u32;
                 let half_n = node.ty.shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::GeGLUConcat,
-                    workgroups: [out_len.div_ceil(256), 1, 1],
-                    input_buffers: vec![input, input],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![out_len, half_n, 0, 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::GeGLUConcat(dispatch::GatedActivation {
+                        src_a: input,
+                        src_b: input,
+                        dst: out_buf,
+                        len: out_len,
+                        half_width: half_n,
+                    }),
+                    [out_len.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::SwiGLUConcatGrad => {
@@ -1583,16 +1648,16 @@ impl<'a> Compiler<'a> {
                 let input = self.get_buffer(node.inputs[1]);
                 let grad_out_len = self.graph.node(node.inputs[0]).ty.num_elements() as u32;
                 let half_n = self.graph.node(node.inputs[0]).ty.shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::SwiGLUConcatGrad,
-                    workgroups: [grad_out_len.div_ceil(256), 1, 1],
-                    input_buffers: vec![input, grad_out],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![grad_out_len, half_n, 0, 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::SwiGLUConcatGrad(dispatch::GatedActivation {
+                        src_a: input,
+                        src_b: grad_out,
+                        dst: out_buf,
+                        len: grad_out_len,
+                        half_width: half_n,
+                    }),
+                    [grad_out_len.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::GeGLUConcatGrad => {
@@ -1600,16 +1665,16 @@ impl<'a> Compiler<'a> {
                 let input = self.get_buffer(node.inputs[1]);
                 let grad_out_len = self.graph.node(node.inputs[0]).ty.num_elements() as u32;
                 let half_n = self.graph.node(node.inputs[0]).ty.shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::GeGLUConcatGrad,
-                    workgroups: [grad_out_len.div_ceil(256), 1, 1],
-                    input_buffers: vec![input, grad_out],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![grad_out_len, half_n, 0, 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::GeGLUConcatGrad(dispatch::GatedActivation {
+                        src_a: input,
+                        src_b: grad_out,
+                        dst: out_buf,
+                        len: grad_out_len,
+                        half_width: half_n,
+                    }),
+                    [grad_out_len.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::RmsNorm { eps } => {
@@ -1636,17 +1701,17 @@ impl<'a> Compiler<'a> {
                     .checked_mul(hidden)
                     .expect("embedding output exceeds u32 indexing")
                     .div_ceil(256);
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Embedding,
-                    workgroups: [workgroups, 1, 1],
-                    input_buffers: vec![indices, table],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![seq, hidden, 0, 0],
-
-                    weight_format: wf,
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::Embedding(dispatch::Embedding {
+                        indices,
+                        table,
+                        dst: out_buf,
+                        rows: seq,
+                        embed_dim: hidden,
+                        weight_format: wf,
+                    }),
+                    [workgroups, 1, 1],
+                ));
             }
 
             Op::ToF16 => {
@@ -1654,16 +1719,14 @@ impl<'a> Compiler<'a> {
                 // params); dst is an f16 buffer.
                 let src = self.get_buffer(node.inputs[0]);
                 let len = node.ty.num_elements() as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::ToF16,
-                    workgroups: [len.div_ceil(256), 1, 1],
-                    input_buffers: vec![src],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![len, 0, 0, 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::ToF16(dispatch::Unary {
+                        src,
+                        dst: out_buf,
+                        len,
+                    }),
+                    [len.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::ScatterAdd { vocab_size } => {
@@ -1673,46 +1736,45 @@ impl<'a> Compiler<'a> {
                 let seq_len = src_shape[0] as u32;
                 let embed_dim = src_shape[1] as u32;
                 let total = vocab_size as u32 * embed_dim;
-                let params = vec![total, seq_len, embed_dim, 0];
                 if u64::from(vocab_size as u32) * u64::from(seq_len) > 1_000_000 {
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::Generated,
-                        workgroups: [total.div_ceil(256), 1, 1],
-                        input_buffers: vec![src],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![total, 0, 0, 0],
-                        kernel: Kernel::Pointwise(PointwiseDAG {
-                            n_inputs: 1,
-                            ops: vec![Pw::const_f32(0.0)],
-                            output: 0,
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::Pointwise(dispatch::Pointwise {
+                            inputs: vec![src],
+                            dst: out_buf,
+                            len: total,
+                            dag: PointwiseDAG {
+                                n_inputs: 1,
+                                ops: vec![Pw::const_f32(0.0)],
+                                output: 0,
+                            },
                         }),
-
-                        ..Default::default()
-                    });
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::ScatterAddAtomic,
-                        workgroups: [(seq_len * embed_dim).div_ceil(256), 1, 1],
-                        // The output is also an input so scheduling inserts a
-                        // global barrier after the zeroing dispatch.
-                        input_buffers: vec![indices, src, out_buf],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params,
-
-                        ..Default::default()
-                    });
+                        [total.div_ceil(256), 1, 1],
+                    ));
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::ScatterAddAtomic(dispatch::AtomicScatter {
+                            indices,
+                            src,
+                            dst: out_buf,
+                            total,
+                            seq_len,
+                            embed_dim,
+                            row_scale: None,
+                            serial_rows: false,
+                        }),
+                        [(seq_len * embed_dim).div_ceil(256), 1, 1],
+                    ));
                 } else {
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::ScatterAdd,
-                        workgroups: [total.div_ceil(256), 1, 1],
-                        input_buffers: vec![indices, src],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params,
-
-                        ..Default::default()
-                    });
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::ScatterAdd(dispatch::Scatter {
+                            indices,
+                            src,
+                            dst: out_buf,
+                            total,
+                            seq_len,
+                            embed_dim,
+                        }),
+                        [total.div_ceil(256), 1, 1],
+                    ));
                 }
             }
 
@@ -1730,40 +1792,49 @@ impl<'a> Compiler<'a> {
                     // Dynamic offset with per-pair divisors.
                     let offset_buf = self.get_buffer(node.inputs[1]);
                     let factors = self.get_buffer(node.inputs[2]);
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::RoPEDynamicFactors,
-                        workgroups: [(seq * dim / 2).div_ceil(256), 1, 1],
-                        input_buffers: vec![input, offset_buf, factors],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![seq, dim, theta.to_bits(), pos_offset, head_dim, 0, 0, 0],
-
-                        ..Default::default()
-                    });
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::RoPEDynamicFactors(dispatch::RopeFactors {
+                            src: input,
+                            position: offset_buf,
+                            factors,
+                            dst: out_buf,
+                            seq,
+                            dim,
+                            theta_bits: theta.to_bits(),
+                            pos_offset,
+                            head_dim,
+                        }),
+                        [(seq * dim / 2).div_ceil(256), 1, 1],
+                    ));
                 } else if node.inputs.len() == 2 {
                     // Dynamic offset: read pos_offset from input buffer
                     let offset_buf = self.get_buffer(node.inputs[1]);
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::RoPEDynamic,
-                        workgroups: [(seq * dim / 2).div_ceil(256), 1, 1],
-                        input_buffers: vec![input, offset_buf],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![seq, dim, theta.to_bits(), pos_offset, head_dim, 0, 0, 0],
-
-                        ..Default::default()
-                    });
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::RoPEDynamic(dispatch::RopeDynamic {
+                            src: input,
+                            position: offset_buf,
+                            dst: out_buf,
+                            seq,
+                            dim,
+                            theta_bits: theta.to_bits(),
+                            pos_offset,
+                            head_dim,
+                        }),
+                        [(seq * dim / 2).div_ceil(256), 1, 1],
+                    ));
                 } else {
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::RoPE,
-                        workgroups: [(seq * dim / 2).div_ceil(256), 1, 1],
-                        input_buffers: vec![input],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![seq, dim, theta.to_bits(), pos_offset, head_dim, 0, 0, 0],
-
-                        ..Default::default()
-                    });
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::RoPE(dispatch::Rope {
+                            src: input,
+                            dst: out_buf,
+                            seq,
+                            dim,
+                            theta_bits: theta.to_bits(),
+                            pos_offset,
+                            head_dim,
+                        }),
+                        [(seq * dim / 2).div_ceil(256), 1, 1],
+                    ));
                 }
             }
 
@@ -1773,16 +1844,19 @@ impl<'a> Compiler<'a> {
                 let shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let seq = shape[0] as u32;
                 let dim = shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::RoPEPositions,
-                    workgroups: [(seq * dim / 2).div_ceil(256), 1, 1],
-                    input_buffers: vec![input, positions],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![seq, dim, theta.to_bits(), 0, head_dim, 0, 0, 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::RoPEPositions(dispatch::RopeDynamic {
+                        src: input,
+                        position: positions,
+                        dst: out_buf,
+                        seq,
+                        dim,
+                        theta_bits: theta.to_bits(),
+                        pos_offset: 0,
+                        head_dim,
+                    }),
+                    [(seq * dim / 2).div_ceil(256), 1, 1],
+                ));
             }
 
             Op::CausalAttention {
@@ -1810,31 +1884,39 @@ impl<'a> Compiler<'a> {
                         let ty = &self.graph.node(input).ty;
                         let dim = ty.shape[1] as u32;
                         let rotated = self.alloc_buffer(ty.size_bytes());
-                        self.plan.dispatches.push(Dispatch {
-                            shader: ShaderEntry::RoPE,
-                            workgroups: [(seq * dim / 2).div_ceil(256), 1, 1],
-                            input_buffers: vec![*operand],
-                            output_buffer: rotated,
-                            extra_outputs: vec![],
-                            params: vec![seq, dim, rope_theta.to_bits(), 0, head_dim, 0, 0, 0],
-                            ..Default::default()
-                        });
+                        self.plan.dispatches.push(Dispatch::new(
+                            DispatchOp::RoPE(dispatch::Rope {
+                                src: *operand,
+                                dst: rotated,
+                                seq,
+                                dim,
+                                theta_bits: rope_theta.to_bits(),
+                                pos_offset: 0,
+                                head_dim,
+                            }),
+                            [(seq * dim / 2).div_ceil(256), 1, 1],
+                        ));
                         *operand = rotated;
                     }
                 }
                 let lse_buf = self.find_lse_buffer(node.id);
-                let (shader, workgroups) =
+                let (make_op, workgroups) =
                     self.attention_dispatch(seq, head_dim, num_heads, node.requires_full_precision);
-                self.plan.dispatches.push(Dispatch {
-                    shader,
+                self.plan.dispatches.push(Dispatch::new(
+                    make_op(dispatch::AttentionForward {
+                        q,
+                        k,
+                        v,
+                        dst: out_buf,
+                        lse: lse_buf,
+                        q_seq: seq,
+                        kv_seq: 0,
+                        packed_heads: (num_heads << 16) | num_kv_heads,
+                        head_dim,
+                        window_size: 0,
+                    }),
                     workgroups,
-                    input_buffers: vec![q, k, v],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![lse_buf],
-                    params: vec![seq, 0, (num_heads << 16) | num_kv_heads, head_dim],
-
-                    ..Default::default()
-                });
+                ));
             }
 
             Op::SlidingWindowAttention {
@@ -1850,24 +1932,23 @@ impl<'a> Compiler<'a> {
                 let v = self.get_buffer(node.inputs[2]);
                 let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
-                let (shader, workgroups) =
+                let (make_op, workgroups) =
                     self.attention_dispatch(seq, head_dim, num_heads, node.requires_full_precision);
-                self.plan.dispatches.push(Dispatch {
-                    shader,
-                    workgroups,
-                    input_buffers: vec![q, k, v],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![lse_buf],
-                    params: vec![
-                        seq,
-                        0,
-                        (num_heads << 16) | num_kv_heads,
+                self.plan.dispatches.push(Dispatch::new(
+                    make_op(dispatch::AttentionForward {
+                        q,
+                        k,
+                        v,
+                        dst: out_buf,
+                        lse: lse_buf,
+                        q_seq: seq,
+                        kv_seq: 0,
+                        packed_heads: (num_heads << 16) | num_kv_heads,
                         head_dim,
                         window_size,
-                    ],
-
-                    ..Default::default()
-                });
+                    }),
+                    workgroups,
+                ));
             }
 
             Op::RoPEGrad {
@@ -1879,16 +1960,18 @@ impl<'a> Compiler<'a> {
                 let shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let seq = shape[0] as u32;
                 let dim = shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::RoPEGrad,
-                    workgroups: [(seq * dim / 2).div_ceil(256), 1, 1],
-                    input_buffers: vec![grad_out],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![seq, dim, theta.to_bits(), pos_offset, head_dim, 0, 0, 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::RoPEGrad(dispatch::Rope {
+                        src: grad_out,
+                        dst: out_buf,
+                        seq,
+                        dim,
+                        theta_bits: theta.to_bits(),
+                        pos_offset,
+                        head_dim,
+                    }),
+                    [(seq * dim / 2).div_ceil(256), 1, 1],
+                ));
             }
 
             Op::GroupNorm {
@@ -1910,48 +1993,53 @@ impl<'a> Compiler<'a> {
                     // enough. Keep its single dispatch instead of paying for
                     // an intermediate buffer, another full tensor pass, and a
                     // global barrier merely to split the group once.
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::GroupNorm,
-                        workgroups: [batch * num_groups, 1, 1],
-                        input_buffers: vec![x, weight, bias],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
-
-                        ..Default::default()
-                    });
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::GroupNorm(dispatch::GroupNorm {
+                            src: x,
+                            weight,
+                            bias,
+                            dst: out_buf,
+                            batch,
+                            channels,
+                            spatial,
+                            num_groups,
+                            eps_bits: eps.to_bits(),
+                        }),
+                        [batch * num_groups, 1, 1],
+                    ));
                 } else {
                     let slices = batch * num_groups * chunks;
                     let partials = self.alloc_buffer(slices as usize * 2 * 4);
-                    let params = vec![
-                        batch,
-                        channels,
-                        spatial,
-                        num_groups,
-                        eps.to_bits(),
-                        chunks,
-                        0,
-                        0,
-                    ];
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::GroupNormStats,
-                        workgroups: [slices, 1, 1],
-                        input_buffers: vec![x],
-                        output_buffer: partials,
-                        extra_outputs: vec![],
-                        params: params.clone(),
-                        ..Default::default()
-                    });
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::GroupNormApply,
-                        workgroups: [slices, 1, 1],
-                        input_buffers: vec![x, partials, weight, bias],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params,
-
-                        ..Default::default()
-                    });
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::GroupNormStats(dispatch::GroupNormStats {
+                            src: x,
+                            dst: partials,
+                            batch,
+                            channels,
+                            spatial,
+                            num_groups,
+                            eps_bits: eps.to_bits(),
+                            chunks,
+                        }),
+                        [slices, 1, 1],
+                    ));
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::GroupNormApply(dispatch::GroupNormApply {
+                            src: x,
+                            partials,
+                            weight,
+                            bias,
+                            dst: out_buf,
+                            batch,
+                            channels,
+                            spatial,
+                            num_groups,
+                            eps_bits: eps.to_bits(),
+                            chunks,
+                            apply_silu: 0,
+                        }),
+                        [slices, 1, 1],
+                    ));
                 }
             }
 
@@ -1970,48 +2058,53 @@ impl<'a> Compiler<'a> {
                 // workgroup per slice of a group, rather than one per group.
                 let chunks = group_norm_chunks(batch, channels, spatial, num_groups);
                 if chunks == 1 {
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::GroupNormSilu,
-                        workgroups: [batch * num_groups, 1, 1],
-                        input_buffers: vec![x, weight, bias],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
-
-                        ..Default::default()
-                    });
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::GroupNormSilu(dispatch::GroupNorm {
+                            src: x,
+                            weight,
+                            bias,
+                            dst: out_buf,
+                            batch,
+                            channels,
+                            spatial,
+                            num_groups,
+                            eps_bits: eps.to_bits(),
+                        }),
+                        [batch * num_groups, 1, 1],
+                    ));
                 } else {
                     let slices = batch * num_groups * chunks;
                     let partials = self.alloc_buffer(slices as usize * 2 * 4);
-                    let params = vec![
-                        batch,
-                        channels,
-                        spatial,
-                        num_groups,
-                        eps.to_bits(),
-                        chunks,
-                        1,
-                        0,
-                    ];
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::GroupNormStats,
-                        workgroups: [slices, 1, 1],
-                        input_buffers: vec![x],
-                        output_buffer: partials,
-                        extra_outputs: vec![],
-                        params: params.clone(),
-                        ..Default::default()
-                    });
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::GroupNormApply,
-                        workgroups: [slices, 1, 1],
-                        input_buffers: vec![x, partials, weight, bias],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params,
-
-                        ..Default::default()
-                    });
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::GroupNormStats(dispatch::GroupNormStats {
+                            src: x,
+                            dst: partials,
+                            batch,
+                            channels,
+                            spatial,
+                            num_groups,
+                            eps_bits: eps.to_bits(),
+                            chunks,
+                        }),
+                        [slices, 1, 1],
+                    ));
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::GroupNormApply(dispatch::GroupNormApply {
+                            src: x,
+                            partials,
+                            weight,
+                            bias,
+                            dst: out_buf,
+                            batch,
+                            channels,
+                            spatial,
+                            num_groups,
+                            eps_bits: eps.to_bits(),
+                            chunks,
+                            apply_silu: 1,
+                        }),
+                        [slices, 1, 1],
+                    ));
                 }
             }
 
@@ -2031,16 +2124,21 @@ impl<'a> Compiler<'a> {
                     [batch, channels, spatial, num_groups],
                     eps,
                 );
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::GroupNormGradInput,
-                    workgroups: [batch * num_groups, 1, 1],
-                    input_buffers: vec![grad_out, input, weight, stats],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::GroupNormGradInput(dispatch::GroupNormGradInput {
+                        dy: grad_out,
+                        src: input,
+                        weight,
+                        stats,
+                        dst: out_buf,
+                        batch,
+                        channels,
+                        spatial,
+                        num_groups,
+                        eps_bits: eps.to_bits(),
+                    }),
+                    [batch * num_groups, 1, 1],
+                ));
             }
 
             Op::GroupNormGradWeightBias {
@@ -2058,16 +2156,20 @@ impl<'a> Compiler<'a> {
                     [batch, channels, spatial, num_groups],
                     eps,
                 );
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::GroupNormGradWeightBias,
-                    workgroups: [channels, 1, 1],
-                    input_buffers: vec![grad_out, input, stats],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![batch, channels, spatial, num_groups, eps.to_bits(), 0, 0, 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::GroupNormGradWeightBias(dispatch::GroupNormGradWeightBias {
+                        dy: grad_out,
+                        src: input,
+                        stats,
+                        dst: out_buf,
+                        batch,
+                        channels,
+                        spatial,
+                        num_groups,
+                        eps_bits: eps.to_bits(),
+                    }),
+                    [channels, 1, 1],
+                ));
             }
 
             Op::Concat {
@@ -2079,16 +2181,18 @@ impl<'a> Compiler<'a> {
                 let b = self.get_buffer(node.inputs[1]);
                 let total = node.ty.shape[0] as u32;
                 let batch = total / ((channels_a + channels_b) * spatial);
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Concat,
-                    workgroups: [total.div_ceil(256), 1, 1],
-                    input_buffers: vec![a, b],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![batch, channels_a, channels_b, spatial],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::Concat(dispatch::Concat {
+                        a,
+                        b,
+                        dst: out_buf,
+                        batch,
+                        channels_a,
+                        channels_b,
+                        spatial,
+                    }),
+                    [total.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::SplitA {
@@ -2099,16 +2203,17 @@ impl<'a> Compiler<'a> {
                 let x = self.get_buffer(node.inputs[0]);
                 let total = node.ty.shape[0] as u32;
                 let batch = total / (channels_a * spatial);
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::SplitA,
-                    workgroups: [total.div_ceil(256), 1, 1],
-                    input_buffers: vec![x],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![batch, channels_a, channels_b, spatial],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::SplitA(dispatch::Split {
+                        src: x,
+                        dst: out_buf,
+                        batch,
+                        channels_a,
+                        channels_b,
+                        spatial,
+                    }),
+                    [total.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::SplitB {
@@ -2119,16 +2224,17 @@ impl<'a> Compiler<'a> {
                 let x = self.get_buffer(node.inputs[0]);
                 let total = node.ty.shape[0] as u32;
                 let batch = total / (channels_b * spatial);
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::SplitB,
-                    workgroups: [total.div_ceil(256), 1, 1],
-                    input_buffers: vec![x],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![batch, channels_a, channels_b, spatial],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::SplitB(dispatch::Split {
+                        src: x,
+                        dst: out_buf,
+                        batch,
+                        channels_a,
+                        channels_b,
+                        spatial,
+                    }),
+                    [total.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::Upsample2x {
@@ -2139,16 +2245,17 @@ impl<'a> Compiler<'a> {
                 let x = self.get_buffer(node.inputs[0]);
                 let total = node.ty.shape[0] as u32;
                 let batch = total / (channels * in_h * 2 * in_w * 2);
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Upsample2x,
-                    workgroups: [total.div_ceil(256), 1, 1],
-                    input_buffers: vec![x],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![batch, channels, in_h, in_w],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::Upsample2x(dispatch::Upsample {
+                        src: x,
+                        dst: out_buf,
+                        batch,
+                        channels,
+                        in_h,
+                        in_w,
+                    }),
+                    [total.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::Upsample2xGrad {
@@ -2159,16 +2266,17 @@ impl<'a> Compiler<'a> {
                 let grad = self.get_buffer(node.inputs[0]);
                 let total = node.ty.shape[0] as u32;
                 let batch = total / (channels * in_h * in_w);
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Upsample2xGrad,
-                    workgroups: [total.div_ceil(256), 1, 1],
-                    input_buffers: vec![grad],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![batch, channels, in_h, in_w],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::Upsample2xGrad(dispatch::Upsample {
+                        src: grad,
+                        dst: out_buf,
+                        batch,
+                        channels,
+                        in_h,
+                        in_w,
+                    }),
+                    [total.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::Conv2d {
@@ -2209,30 +2317,33 @@ impl<'a> Compiler<'a> {
                         batch,
                         self.coop_caps.f32_tile > 0,
                     );
-                    self.plan.dispatches.push(Dispatch {
-                        shader: conv_gemm_entry(0, tile),
-                        workgroups: [spatial.div_ceil(tile), out_channels.div_ceil(tile), batch],
-                        input_buffers: vec![input, kernel],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![
-                            batch,
-                            in_channels,
-                            in_h,
-                            in_w,
-                            out_channels,
-                            kernel_h,
-                            kernel_w,
-                            stride,
-                            padding_h,
-                            out_h,
-                            out_w,
-                            padding_w,
-                        ],
-                        kernel: exact_conv_kernel(),
-
-                        ..Default::default()
-                    });
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::Convolution(dispatch::Convolution {
+                            kind: dispatch::ConvolutionKind::Forward,
+                            implementation: dispatch::ConvolutionImplementation::Scalar {
+                                tile,
+                                k_tile: Some(16),
+                            },
+                            args: dispatch::ConvolutionArgs {
+                                a: input,
+                                b: kernel,
+                                dst: out_buf,
+                                batch,
+                                in_channels,
+                                in_h,
+                                in_w,
+                                out_channels,
+                                kernel_h,
+                                kernel_w,
+                                stride,
+                                padding_h,
+                                out_h,
+                                out_w,
+                                padding_w,
+                            },
+                        }),
+                        [spatial.div_ceil(tile), out_channels.div_ceil(tile), batch],
+                    ));
                 } // else (non-1x1 conv)
             }
 
@@ -2240,16 +2351,17 @@ impl<'a> Compiler<'a> {
                 let src = self.get_buffer(node.inputs[0]);
                 let gate = self.get_buffer(node.inputs[1]);
                 let len = node.ty.shape[0] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MulPerChannel,
-                    workgroups: [len.div_ceil(256), 1, 1],
-                    input_buffers: vec![src, gate],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![len, spatial, channels, 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::MulPerChannel(dispatch::MulPerChannel {
+                        src,
+                        gate,
+                        dst: out_buf,
+                        len,
+                        spatial,
+                        channels,
+                    }),
+                    [len.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::AddPerChannel { channels, spatial } => {
@@ -2259,28 +2371,27 @@ impl<'a> Compiler<'a> {
                 // As a pointwise DAG the bias add fuses with the activation
                 // after it, so a conv -> bias -> ReLU block writes one
                 // activation instead of two.
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Generated,
-                    workgroups: [len.div_ceil(256), 1, 1],
-                    input_buffers: vec![src, bias],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![len, 0, 0, 0],
-                    kernel: Kernel::Pointwise(PointwiseDAG {
-                        n_inputs: 2,
-                        ops: vec![
-                            Pw::LoadInput(0),
-                            Pw::LoadBroadcast {
-                                input: 1,
-                                divisor: spatial,
-                                modulus: channels,
-                            },
-                            Pw::Add(0, 1),
-                        ],
-                        output: 2,
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::Pointwise(dispatch::Pointwise {
+                        inputs: vec![src, bias],
+                        dst: out_buf,
+                        len,
+                        dag: PointwiseDAG {
+                            n_inputs: 2,
+                            ops: vec![
+                                Pw::LoadInput(0),
+                                Pw::LoadBroadcast {
+                                    input: 1,
+                                    divisor: spatial,
+                                    modulus: channels,
+                                },
+                                Pw::Add(0, 1),
+                            ],
+                            output: 2,
+                        },
                     }),
-                    ..Default::default()
-                });
+                    [len.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::Conv2dDw {
@@ -2310,19 +2421,25 @@ impl<'a> Compiler<'a> {
                     "depthwise convolution batch * channels ({}) exceeds the portable grid limit",
                     batch * channels
                 );
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Conv2dDw,
-                    workgroups: [out_w.div_ceil(16), out_h.div_ceil(16), batch * channels],
-                    input_buffers: vec![input, kernel],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![
-                        batch, channels, in_h, in_w, kernel_h, kernel_w, stride, padding_h, out_h,
-                        out_w, padding_w,
-                    ],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::Conv2dDw(dispatch::DepthwiseConv {
+                        src: input,
+                        weight: kernel,
+                        dst: out_buf,
+                        batch,
+                        channels,
+                        in_h,
+                        in_w,
+                        kernel_h,
+                        kernel_w,
+                        stride,
+                        padding_h,
+                        out_h,
+                        out_w,
+                        padding_w,
+                    }),
+                    [out_w.div_ceil(16), out_h.div_ceil(16), batch * channels],
+                ));
             }
 
             Op::WinogradConv2d {
@@ -2352,26 +2469,23 @@ impl<'a> Compiler<'a> {
                 let weight = self.get_buffer(node.inputs[1]);
 
                 // Dispatch 0: transform the current weights, [Co·Ci·9] → [16, Co, Ci].
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::WinogradWeightTransform,
-                    workgroups: [(out_channels * in_channels).div_ceil(256), 1, 1],
-                    input_buffers: vec![weight],
-                    output_buffer: weight_xform,
-                    extra_outputs: vec![],
-                    params: vec![out_channels, in_channels, u32::from(adjoint), 0, 0, 0, 0, 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::WinogradWeightTransform(dispatch::WinogradWeightTransform {
+                        src: weight,
+                        dst: weight_xform,
+                        out_channels,
+                        in_channels,
+                        adjoint: u32::from(adjoint),
+                    }),
+                    [(out_channels * in_channels).div_ceil(256), 1, 1],
+                ));
 
                 // Dispatch 1: Input transform
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::WinogradInputTransform,
-                    workgroups: [(total_tiles * in_channels).div_ceil(256), 1, 1],
-                    input_buffers: vec![input],
-                    output_buffer: input_xform_buf,
-                    extra_outputs: vec![],
-                    params: vec![
-                        batch_size,
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::WinogradInputTransform(dispatch::WinogradInputTransform {
+                        src: input,
+                        dst: input_xform_buf,
+                        batch: batch_size,
                         in_channels,
                         in_h,
                         in_w,
@@ -2379,44 +2493,38 @@ impl<'a> Compiler<'a> {
                         tiles_h,
                         tiles_w,
                         total_tiles,
-                    ],
-
-                    ..Default::default()
-                });
+                    }),
+                    [(total_tiles * in_channels).div_ceil(256), 1, 1],
+                ));
 
                 // Dispatch 2: Batched matmul
                 // weight_xform[16, Co, Ci] × input_xform[16, Ci, P] → mm_out[16, Co, P]
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::WinogradBatchedMatMul,
-                    workgroups: [total_tiles.div_ceil(64), out_channels.div_ceil(64), 16],
-                    input_buffers: vec![weight_xform, input_xform_buf],
-                    output_buffer: mm_out_buf,
-                    extra_outputs: vec![],
-                    params: vec![out_channels, total_tiles, in_channels, 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::Matmul(dispatch::Matmul::new(
+                        dispatch::MatmulKind::Winograd { planes: 0 },
+                        weight_xform,
+                        input_xform_buf,
+                        mm_out_buf,
+                        [out_channels, total_tiles, in_channels],
+                    )),
+                    [total_tiles.div_ceil(64), out_channels.div_ceil(64), 16],
+                ));
 
                 // Dispatch 3: Output transform
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::WinogradOutputTransform,
-                    workgroups: [(total_tiles * out_channels).div_ceil(256), 1, 1],
-                    input_buffers: vec![mm_out_buf],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![
-                        batch_size,
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::WinogradOutputTransform(dispatch::WinogradOutputTransform {
+                        src: mm_out_buf,
+                        dst: out_buf,
+                        batch: batch_size,
                         out_channels,
                         out_h,
                         out_w,
                         tiles_h,
                         tiles_w,
                         total_tiles,
-                        0,
-                    ],
-
-                    ..Default::default()
-                });
+                    }),
+                    [(total_tiles * out_channels).div_ceil(256), 1, 1],
+                ));
             }
 
             Op::Conv2dGradInput {
@@ -2451,30 +2559,33 @@ impl<'a> Compiler<'a> {
                             batch,
                             self.coop_caps.f32_tile > 0,
                         );
-                        self.plan.dispatches.push(Dispatch {
-                            shader: conv_gemm_entry(1, tile),
-                            workgroups: [spatial.div_ceil(tile), in_channels.div_ceil(tile), batch],
-                            input_buffers: vec![grad_out, kernel],
-                            output_buffer: out_buf,
-                            extra_outputs: vec![],
-                            params: vec![
-                                batch,
-                                in_channels,
-                                in_h,
-                                in_w,
-                                out_channels,
-                                kernel_h,
-                                kernel_w,
-                                stride,
-                                padding_h,
-                                out_h,
-                                out_w,
-                                padding_w,
-                            ],
-                            kernel: exact_conv_kernel(),
-
-                            ..Default::default()
-                        });
+                        self.plan.dispatches.push(Dispatch::new(
+                            DispatchOp::Convolution(dispatch::Convolution {
+                                kind: dispatch::ConvolutionKind::InputGradient,
+                                implementation: dispatch::ConvolutionImplementation::Scalar {
+                                    tile,
+                                    k_tile: Some(16),
+                                },
+                                args: dispatch::ConvolutionArgs {
+                                    a: grad_out,
+                                    b: kernel,
+                                    dst: out_buf,
+                                    batch,
+                                    in_channels,
+                                    in_h,
+                                    in_w,
+                                    out_channels,
+                                    kernel_h,
+                                    kernel_w,
+                                    stride,
+                                    padding_h,
+                                    out_h,
+                                    out_w,
+                                    padding_w,
+                                },
+                            }),
+                            [spatial.div_ceil(tile), in_channels.div_ceil(tile), batch],
+                        ));
                     }
                 }
             }
@@ -2506,30 +2617,33 @@ impl<'a> Compiler<'a> {
                     let m_total = out_channels; // Co
                     // Batch is folded into K, so it does not add workgroups.
                     let tile = conv_register_tile(m_total, n_total, 1, self.coop_caps.f32_tile > 0);
-                    self.plan.dispatches.push(Dispatch {
-                        shader: conv_gemm_entry(2, tile),
-                        workgroups: [n_total.div_ceil(tile), m_total.div_ceil(tile), 1],
-                        input_buffers: vec![grad_out, input],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![
-                            batch,
-                            in_channels,
-                            in_h,
-                            in_w,
-                            out_channels,
-                            kernel_h,
-                            kernel_w,
-                            stride,
-                            padding_h,
-                            out_h,
-                            out_w,
-                            padding_w,
-                        ],
-                        kernel: exact_conv_kernel(),
-
-                        ..Default::default()
-                    });
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::Convolution(dispatch::Convolution {
+                            kind: dispatch::ConvolutionKind::WeightGradient,
+                            implementation: dispatch::ConvolutionImplementation::Scalar {
+                                tile,
+                                k_tile: Some(16),
+                            },
+                            args: dispatch::ConvolutionArgs {
+                                a: grad_out,
+                                b: input,
+                                dst: out_buf,
+                                batch,
+                                in_channels,
+                                in_h,
+                                in_w,
+                                out_channels,
+                                kernel_h,
+                                kernel_w,
+                                stride,
+                                padding_h,
+                                out_h,
+                                out_w,
+                                padding_w,
+                            },
+                        }),
+                        [n_total.div_ceil(tile), m_total.div_ceil(tile), 1],
+                    ));
                 }
             }
 
@@ -2539,16 +2653,15 @@ impl<'a> Compiler<'a> {
                 let kv_pos_input = self.get_buffer(node.inputs[2]);
                 let dim = self.graph.node(node.inputs[0]).ty.shape[1] as u32;
                 debug_assert_eq!(out_buf, cache);
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::CacheWrite,
-                    workgroups: [dim.div_ceil(256), 1, 1],
-                    input_buffers: vec![new_kv, cache, kv_pos_input],
-                    output_buffer: cache,
-                    extra_outputs: vec![],
-                    params: vec![dim, 0, 0, 0], // kv_pos read from input buffer at runtime
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::CacheWrite(dispatch::CacheWrite {
+                        src: new_kv,
+                        cache,
+                        position: kv_pos_input,
+                        dim,
+                    }),
+                    [dim.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::CacheWritePrefix => {
@@ -2562,16 +2675,18 @@ impl<'a> Compiler<'a> {
                 let dim = new_shape[1] as u32;
                 let max_seq = cache_shape[0] as u32;
                 debug_assert_eq!(out_buf, cache);
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::CacheWritePrefix,
-                    workgroups: [(block_len * dim).div_ceil(256), 1, 1],
-                    input_buffers: vec![new_kv, cache, kv_pos_input, valid_len_input],
-                    output_buffer: cache,
-                    extra_outputs: vec![],
-                    params: vec![dim, block_len, max_seq, 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::CacheWritePrefix(dispatch::CacheWritePrefix {
+                        src: new_kv,
+                        cache,
+                        position: kv_pos_input,
+                        valid_len: valid_len_input,
+                        dim,
+                        block_len,
+                        max_seq,
+                    }),
+                    [(block_len * dim).div_ceil(256), 1, 1],
+                ));
             }
 
             Op::CachedAttention {
@@ -2586,24 +2701,29 @@ impl<'a> Compiler<'a> {
                 let q_seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 // The single-query kernel is written for 64-wide heads; the
                 // generated multi-query kernel takes any width.
-                let (shader, block_queries) = if q_seq == 1 && head_dim == 64 {
-                    (ShaderEntry::CachedAttention, 1)
-                } else {
-                    (
-                        ShaderEntry::CachedQueryAttention,
-                        crate::codegen::cached_attention_queries(head_dim),
-                    )
-                };
-                self.plan.dispatches.push(Dispatch {
-                    shader,
-                    workgroups: [q_seq.div_ceil(block_queries), num_heads, 1],
-                    input_buffers: vec![q, k_cache, v_cache, kv_pos_input],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![q_seq, num_heads, num_kv_heads, head_dim],
-
-                    ..Default::default()
-                });
+                let (make_op, block_queries): (fn(dispatch::CachedAttention) -> DispatchOp, u32) =
+                    if q_seq == 1 && head_dim == 64 {
+                        (DispatchOp::CachedAttention, 1)
+                    } else {
+                        (
+                            DispatchOp::CachedQueryAttention,
+                            crate::codegen::cached_attention_queries(head_dim),
+                        )
+                    };
+                self.plan.dispatches.push(Dispatch::new(
+                    make_op(dispatch::CachedAttention {
+                        q,
+                        k_cache,
+                        v_cache,
+                        position: kv_pos_input,
+                        dst: out_buf,
+                        q_seq,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                    }),
+                    [q_seq.div_ceil(block_queries), num_heads, 1],
+                ));
             }
 
             Op::CachedBlockAttention {
@@ -2651,37 +2771,57 @@ impl<'a> Compiler<'a> {
                             * 4,
                     );
                     let partials = BufferRef(scratch_idx);
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::CachedBlockAttentionSplit,
-                        workgroups: [block_len, splits, num_heads],
-                        input_buffers: vec![q, k_cache, v_cache, kv_pos_input, valid_len_input],
-                        output_buffer: partials,
-                        extra_outputs: vec![],
-                        params: params.to_words(),
-
-                        ..Default::default()
-                    });
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::CachedBlockAttentionCombine,
-                        workgroups: [block_len, num_heads, 1],
-                        input_buffers: vec![partials],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: params.to_words(),
-
-                        ..Default::default()
-                    });
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::CachedBlockAttentionSplit(dispatch::CachedBlockAttention {
+                            q,
+                            k_cache,
+                            v_cache,
+                            position: kv_pos_input,
+                            valid_len: valid_len_input,
+                            dst: partials,
+                            window_size: params.window_size,
+                            num_heads: params.num_heads,
+                            num_kv_heads: params.num_kv_heads,
+                            head_dim: params.head_dim,
+                            block_len: params.block_len,
+                            max_seq: params.max_seq,
+                            splits: params.splits,
+                        }),
+                        [block_len, splits, num_heads],
+                    ));
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::CachedBlockAttentionCombine(dispatch::CachedAttentionCombine {
+                            partials,
+                            dst: out_buf,
+                            window_size: params.window_size,
+                            num_heads: params.num_heads,
+                            num_kv_heads: params.num_kv_heads,
+                            head_dim: params.head_dim,
+                            block_len: params.block_len,
+                            max_seq: params.max_seq,
+                            splits: params.splits,
+                        }),
+                        [block_len, num_heads, 1],
+                    ));
                 } else {
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::CachedBlockAttention,
-                        workgroups: [block_len, num_heads, 1],
-                        input_buffers: vec![q, k_cache, v_cache, kv_pos_input, valid_len_input],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: params.to_words(),
-
-                        ..Default::default()
-                    });
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::CachedBlockAttention(dispatch::CachedBlockAttention {
+                            q,
+                            k_cache,
+                            v_cache,
+                            position: kv_pos_input,
+                            valid_len: valid_len_input,
+                            dst: out_buf,
+                            window_size: params.window_size,
+                            num_heads: params.num_heads,
+                            num_kv_heads: params.num_kv_heads,
+                            head_dim: params.head_dim,
+                            block_len: params.block_len,
+                            max_seq: params.max_seq,
+                            splits: params.splits,
+                        }),
+                        [block_len, num_heads, 1],
+                    ));
                 }
             }
 
@@ -2696,25 +2836,21 @@ impl<'a> Compiler<'a> {
                 let v = self.get_buffer(node.inputs[2]);
                 let relative_k = self.get_buffer(node.inputs[3]);
                 let seq_len = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::ChunkedRelativeAttention,
-                    workgroups: [seq_len, num_heads, 1],
-                    input_buffers: vec![q, k, v, relative_k],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::ChunkedRelativeAttention(dispatch::ChunkedRelativeAttention {
+                        q,
+                        k,
+                        v,
+                        relative_k,
+                        dst: out_buf,
                         seq_len,
                         num_heads,
                         head_dim,
                         left_context,
                         softcap_bits,
-                        0,
-                        0,
-                        0,
-                    ],
-
-                    ..Default::default()
-                });
+                    }),
+                    [seq_len, num_heads, 1],
+                ));
             }
 
             Op::PrefixLast => {
@@ -2723,16 +2859,16 @@ impl<'a> Compiler<'a> {
                 let shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let rows = shape[0] as u32;
                 let cols = shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::PrefixLast,
-                    workgroups: [cols.div_ceil(256), 1, 1],
-                    input_buffers: vec![input, valid_len],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![cols, rows, 0, 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::PrefixLast(dispatch::PrefixLast {
+                        src: input,
+                        valid_len,
+                        dst: out_buf,
+                        cols,
+                        rows,
+                    }),
+                    [cols.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::MaxPool2d {
@@ -2750,19 +2886,23 @@ impl<'a> Compiler<'a> {
                 let out_h = (in_h + 2 * padding - kernel_h) / stride + 1;
                 let out_w = (in_w + 2 * padding - kernel_w) / stride + 1;
                 let total = batch * channels * out_h * out_w;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MaxPool2d,
-                    workgroups: [total.div_ceil(256), 1, 1],
-                    input_buffers: vec![input],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![
-                        batch, channels, in_h, in_w, kernel_h, kernel_w, stride, padding, out_h,
-                        out_w, 0, 0,
-                    ],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::MaxPool2d(dispatch::MaxPool {
+                        src: input,
+                        dst: out_buf,
+                        batch,
+                        channels,
+                        in_h,
+                        in_w,
+                        kernel_h,
+                        kernel_w,
+                        stride,
+                        padding,
+                        out_h,
+                        out_w,
+                    }),
+                    [total.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::MaxPool2dGrad {
@@ -2780,19 +2920,24 @@ impl<'a> Compiler<'a> {
                 let batch = total / (channels * in_h * in_w);
                 let out_h = (in_h + 2 * padding - kernel_h) / stride + 1;
                 let out_w = (in_w + 2 * padding - kernel_w) / stride + 1;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MaxPool2dGrad,
-                    workgroups: [total.div_ceil(256), 1, 1],
-                    input_buffers: vec![grad_out, input],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![
-                        batch, channels, in_h, in_w, kernel_h, kernel_w, stride, padding, out_h,
-                        out_w, 0, 0,
-                    ],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::MaxPool2dGrad(dispatch::MaxPoolGradient {
+                        dy: grad_out,
+                        src: input,
+                        dst: out_buf,
+                        batch,
+                        channels,
+                        in_h,
+                        in_w,
+                        kernel_h,
+                        kernel_w,
+                        stride,
+                        padding,
+                        out_h,
+                        out_w,
+                    }),
+                    [total.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::GlobalAvgPool { channels, spatial } if spatial > 32 => {
@@ -2824,33 +2969,32 @@ impl<'a> Compiler<'a> {
                     gather_elem: Vec::new(),
                     input_row_repeats: Vec::new(),
                 };
-                self.plan.dispatches.push(Dispatch {
-                    // Generated-reduction routing takes priority over the
-                    // sentinel entry in pipeline selection and binding.
-                    shader: ShaderEntry::Generated,
-                    workgroups: [rows, 1, 1],
-                    input_buffers: vec![input],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![rows, spatial, 1.0_f32.to_bits(), 0],
-                    kernel: Kernel::Reduction(kernel),
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::Reduction(dispatch::Reduction {
+                        inputs: vec![input],
+                        dst: out_buf,
+                        outer: rows,
+                        inner: spatial,
+                        round_one_bits: 1.0_f32.to_bits(),
+                        kernel,
+                    }),
+                    [rows, 1, 1],
+                ));
             }
 
             Op::GlobalAvgPool { channels, spatial } => {
                 let input = self.get_buffer(node.inputs[0]);
                 let total_out = node.ty.num_elements() as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::GlobalAvgPool,
-                    workgroups: [total_out.div_ceil(256), 1, 1],
-                    input_buffers: vec![input],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![channels, spatial, total_out, 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::GlobalAvgPool(dispatch::GlobalAvgPool {
+                        src: input,
+                        dst: out_buf,
+                        channels,
+                        spatial,
+                        total_out,
+                    }),
+                    [total_out.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::GlobalAvgPoolGrad {
@@ -2859,16 +3003,18 @@ impl<'a> Compiler<'a> {
             } => {
                 let grad_output = self.get_buffer(node.inputs[0]);
                 let total = node.ty.num_elements() as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::GlobalAvgPoolGrad,
-                    workgroups: [total.div_ceil(256), 1, 1],
-                    input_buffers: vec![grad_output],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![total, spatial, 0, 0],
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::GlobalAvgPoolGrad(dispatch::RowBroadcast {
+                        src: grad_output,
+                        dst: out_buf,
+                        len: total,
+                        inner: spatial,
+                        mode: 0,
 
-                    ..Default::default()
-                });
+                        offset: 0,
+                    }),
+                    [total.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::Gelu => {
@@ -2886,16 +3032,19 @@ impl<'a> Compiler<'a> {
                 // performs a single reduction per row, which forces the
                 // cancelling E[x²] − E[x]² variance; the hand-written
                 // kernel takes the mean first, then the squared deviations.
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::LayerNorm,
-                    workgroups: [rows, 1, 1],
-                    input_buffers: vec![x, w, bias],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![rows, cols, eps.to_bits(), 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::LayerNorm(dispatch::LayerNorm {
+                        src: x,
+                        weight: w,
+                        bias,
+                        dst: out_buf,
+                        rows,
+                        cols,
+                        eps_bits: eps.to_bits(),
+                        block_rows: 0,
+                    }),
+                    [rows, 1, 1],
+                ));
             }
 
             Op::FullAttention {
@@ -2910,18 +3059,23 @@ impl<'a> Compiler<'a> {
                 let v = self.get_buffer(node.inputs[2]);
                 let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
-                let (shader, workgroups) =
+                let (make_op, workgroups) =
                     self.attention_dispatch(seq, head_dim, num_heads, node.requires_full_precision);
-                self.plan.dispatches.push(Dispatch {
-                    shader,
+                self.plan.dispatches.push(Dispatch::new(
+                    make_op(dispatch::AttentionForward {
+                        q,
+                        k,
+                        v,
+                        dst: out_buf,
+                        lse: lse_buf,
+                        q_seq: seq,
+                        kv_seq: seq,
+                        packed_heads: (num_heads << 16) | num_kv_heads,
+                        head_dim,
+                        window_size: 0,
+                    }),
                     workgroups,
-                    input_buffers: vec![q, k, v],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![lse_buf],
-                    params: vec![seq, seq, (num_heads << 16) | num_kv_heads, head_dim],
-
-                    ..Default::default()
-                });
+                ));
             }
 
             Op::CrossAttention {
@@ -2936,22 +3090,27 @@ impl<'a> Compiler<'a> {
                 let q_seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let kv_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
-                let (shader, workgroups) = self.attention_dispatch(
+                let (make_op, workgroups) = self.attention_dispatch(
                     q_seq,
                     head_dim,
                     num_heads,
                     node.requires_full_precision,
                 );
-                self.plan.dispatches.push(Dispatch {
-                    shader,
+                self.plan.dispatches.push(Dispatch::new(
+                    make_op(dispatch::AttentionForward {
+                        q,
+                        k,
+                        v,
+                        dst: out_buf,
+                        lse: lse_buf,
+                        q_seq,
+                        kv_seq,
+                        packed_heads: (num_heads << 16) | num_kv_heads,
+                        head_dim,
+                        window_size: 0,
+                    }),
                     workgroups,
-                    input_buffers: vec![q, k, v],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![lse_buf],
-                    params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
-
-                    ..Default::default()
-                });
+                ));
             }
 
             Op::MultiHeadAttn {
@@ -2966,22 +3125,27 @@ impl<'a> Compiler<'a> {
                 let q_seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let kv_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
-                let (shader, workgroups) = self.attention_dispatch(
+                let (make_op, workgroups) = self.attention_dispatch(
                     q_seq,
                     head_dim,
                     num_heads,
                     node.requires_full_precision,
                 );
-                self.plan.dispatches.push(Dispatch {
-                    shader,
+                self.plan.dispatches.push(Dispatch::new(
+                    make_op(dispatch::AttentionForward {
+                        q,
+                        k,
+                        v,
+                        dst: out_buf,
+                        lse: lse_buf,
+                        q_seq,
+                        kv_seq,
+                        packed_heads: (num_heads << 16) | num_kv_heads,
+                        head_dim,
+                        window_size: 0,
+                    }),
                     workgroups,
-                    input_buffers: vec![q, k, v],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![lse_buf],
-                    params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
-
-                    ..Default::default()
-                });
+                ));
             }
 
             Op::MultiHeadAttnGradQ {
@@ -3029,45 +3193,47 @@ impl<'a> Compiler<'a> {
                         ShaderGroup::FlashGradQCoop,
                         head_dim,
                     ) <= u64::from(self.shared_memory_bytes);
-                let (grad_q_shader, grad_q_wgs) = if bwd_coop_enabled {
-                    (
-                        ShaderEntry::FlashGradQCoop,
-                        [q_seq.div_ceil(16), num_heads, 1],
-                    )
-                } else {
-                    let (raw_shader, wgs) = Self::attention_dispatch_bwd(
-                        q_seq,
-                        head_dim,
-                        num_heads,
-                        self.options.knobs.flash_grad_q_ept_cap,
-                    );
-                    let mapped = match raw_shader {
-                        ShaderEntry::FlashAttention => ShaderEntry::FlashGradQ,
-                        _ => ShaderEntry::MultiHeadAttnGradQ,
+                let (make_op, grad_q_wgs): (fn(dispatch::AttentionGradQ) -> DispatchOp, [u32; 3]) =
+                    if bwd_coop_enabled {
+                        (
+                            DispatchOp::FlashGradQCoop,
+                            [q_seq.div_ceil(16), num_heads, 1],
+                        )
+                    } else {
+                        let (raw_shader, wgs) = Self::attention_dispatch_bwd(
+                            q_seq,
+                            head_dim,
+                            num_heads,
+                            self.options.knobs.flash_grad_q_ept_cap,
+                        );
+                        let mapped: fn(dispatch::AttentionGradQ) -> DispatchOp = match raw_shader {
+                            ShaderEntry::FlashAttention => DispatchOp::FlashGradQ,
+                            _ => DispatchOp::MultiHeadAttnGradQ,
+                        };
+                        (mapped, wgs)
                     };
-                    (mapped, wgs)
-                };
-                let row_source = if grad_q_shader == ShaderEntry::FlashGradQCoop {
+                let row_source = if bwd_coop_enabled {
                     fwd_o
                 } else {
                     self.emit_attention_row_dot(d_out, fwd_o, q_seq * num_heads, head_dim)
                 };
-                self.plan.dispatches.push(Dispatch {
-                    shader: grad_q_shader,
-                    workgroups: grad_q_wgs,
-                    input_buffers: vec![d_out, q, k, v, lse_buf, row_source],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![
+                self.plan.dispatches.push(Dispatch::new(
+                    make_op(dispatch::AttentionGradQ {
+                        d_out,
+                        q,
+                        k,
+                        v,
+                        lse: lse_buf,
+                        row_source,
+                        dst: out_buf,
                         q_seq,
                         kv_seq,
-                        (num_heads << 16) | num_kv_heads,
+                        packed_heads: (num_heads << 16) | num_kv_heads,
                         head_dim,
                         window_size,
-                    ],
-
-                    ..Default::default()
-                });
+                    }),
+                    grad_q_wgs,
+                ));
             }
 
             Op::MultiHeadAttnGradK {
@@ -3106,13 +3272,6 @@ impl<'a> Compiler<'a> {
                 // compiled for the same fwd_node, it reuses this buffer.
                 let dv_buf = self.alloc_buffer(self.graph.node(node.inputs[3]).ty.size_bytes());
                 self.fused_grad_kv_dv.insert(fwd_node, dv_buf);
-                let attention_params = vec![
-                    q_seq,
-                    kv_seq,
-                    (num_heads << 16) | num_kv_heads,
-                    head_dim,
-                    window_size,
-                ];
                 let (grad_kv_shader, grad_kv_wgs) = Self::attention_dispatch_bwd(
                     dispatch_kv,
                     head_dim,
@@ -3132,37 +3291,46 @@ impl<'a> Compiler<'a> {
                         ShaderGroup::FlashGradKVCoop,
                         head_dim,
                     ) <= u64::from(self.shared_memory_bytes);
-                let (shader, workgroups) = if bwd_coop_enabled {
-                    (
-                        ShaderEntry::FlashGradKVCoop,
-                        [dispatch_kv.div_ceil(16), num_kv_heads, 1],
-                    )
-                } else {
-                    let s = match grad_kv_shader {
-                        ShaderEntry::FlashAttention => ShaderEntry::FlashGradKV,
-                        _ => ShaderEntry::MultiHeadAttnGradKV,
+                let (make_op, workgroups): (fn(dispatch::AttentionGradKV) -> DispatchOp, [u32; 3]) =
+                    if bwd_coop_enabled {
+                        (
+                            DispatchOp::FlashGradKVCoop,
+                            [dispatch_kv.div_ceil(16), num_kv_heads, 1],
+                        )
+                    } else {
+                        let s: fn(dispatch::AttentionGradKV) -> DispatchOp = match grad_kv_shader {
+                            ShaderEntry::FlashAttention => DispatchOp::FlashGradKV,
+                            _ => DispatchOp::MultiHeadAttnGradKV,
+                        };
+                        (s, grad_kv_wgs)
                     };
-                    (s, grad_kv_wgs)
-                };
                 // The scalar and flash dK/dV kernels need dot(dO, O) for
                 // every query row. Reduce it once here; recomputing it in
                 // every KV workgroup read O and spent a third of the inner
                 // loop's products on it. The cooperative kernel keeps O.
-                let row_source = if shader == ShaderEntry::FlashGradKVCoop {
+                let row_source = if bwd_coop_enabled {
                     fwd_o
                 } else {
                     self.emit_attention_row_dot(d_out, fwd_o, q_seq * num_heads, head_dim)
                 };
-                self.plan.dispatches.push(Dispatch {
-                    shader,
+                self.plan.dispatches.push(Dispatch::new(
+                    make_op(dispatch::AttentionGradKV {
+                        d_out,
+                        q,
+                        k,
+                        v,
+                        lse: lse_buf,
+                        row_source,
+                        dk: out_buf,
+                        dv: dv_buf,
+                        q_seq,
+                        kv_seq,
+                        packed_heads: (num_heads << 16) | num_kv_heads,
+                        head_dim,
+                        window_size,
+                    }),
                     workgroups,
-                    input_buffers: vec![d_out, q, k, v, lse_buf, row_source],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![dv_buf],
-                    params: attention_params,
-
-                    ..Default::default()
-                });
+                ));
             }
 
             Op::MultiHeadAttnGradV { fwd_node, .. } => {
@@ -3184,16 +3352,16 @@ impl<'a> Compiler<'a> {
                 let gate = self.get_buffer(node.inputs[1]);
                 let up = self.get_buffer(node.inputs[2]);
                 let len = node.ty.num_elements() as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::SwiGLUGradGate,
-                    workgroups: [len.div_ceil(256), 1, 1],
-                    input_buffers: vec![grad_out, gate, up],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![len, 0, 0, 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::SwiGLUGradGate(dispatch::GateGradient {
+                        dy: grad_out,
+                        gate,
+                        up,
+                        dst: out_buf,
+                        len,
+                    }),
+                    [len.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::SwiGLUGradUp => {
@@ -3201,16 +3369,15 @@ impl<'a> Compiler<'a> {
                 let grad_out = self.get_buffer(node.inputs[0]);
                 let gate = self.get_buffer(node.inputs[1]);
                 let len = node.ty.num_elements() as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::SwiGLUGradUp,
-                    workgroups: [len.div_ceil(256), 1, 1],
-                    input_buffers: vec![grad_out, gate],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![len, 0, 0, 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::SwiGLUGradUp(dispatch::BinaryGradient {
+                        dy: grad_out,
+                        src: gate,
+                        dst: out_buf,
+                        len,
+                    }),
+                    [len.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::SiluGrad => {
@@ -3218,16 +3385,15 @@ impl<'a> Compiler<'a> {
                 let grad_out = self.get_buffer(node.inputs[0]);
                 let x = self.get_buffer(node.inputs[1]);
                 let len = node.ty.num_elements() as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::SiluGrad,
-                    workgroups: [len.div_ceil(256), 1, 1],
-                    input_buffers: vec![grad_out, x],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![len, 0, 0, 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::SiluGrad(dispatch::BinaryGradient {
+                        dy: grad_out,
+                        src: x,
+                        dst: out_buf,
+                        len,
+                    }),
+                    [len.div_ceil(256), 1, 1],
+                ));
             }
 
             Op::RmsNormGradW { eps } => {
@@ -3244,29 +3410,35 @@ impl<'a> Compiler<'a> {
                     let block = norm_weight_grad_rows_per_workgroup(rows);
                     let blocks = rows.div_ceil(block);
                     let temp_buf = self.alloc_buffer((blocks as usize) * (cols as usize) * 4);
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::RmsNormGradWRowPar,
-                        workgroups: [blocks, 1, 1],
-                        input_buffers: vec![dy, x, w],
-                        output_buffer: temp_buf,
-                        extra_outputs: vec![],
-                        params: vec![rows, cols, eps.to_bits(), block],
-
-                        ..Default::default()
-                    });
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::RmsNormGradWRowPar(dispatch::NormGradient {
+                            dy,
+                            src: x,
+                            weight: w,
+                            dst: temp_buf,
+                            rows,
+                            cols,
+                            eps_bits: eps.to_bits(),
+                            block_rows: block,
+                        }),
+                        [blocks, 1, 1],
+                    ));
                     self.push_sum_rows(blocks, cols, temp_buf, out_buf);
                 } else {
                     // Small row count: single-pass is fine
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::RmsNormGradW,
-                        workgroups: [cols.div_ceil(256), 1, 1],
-                        input_buffers: vec![dy, x, w],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![rows, cols, eps.to_bits(), 0],
-
-                        ..Default::default()
-                    });
+                    self.plan.dispatches.push(Dispatch::new(
+                        DispatchOp::RmsNormGradW(dispatch::NormGradient {
+                            dy,
+                            src: x,
+                            weight: w,
+                            dst: out_buf,
+                            rows,
+                            cols,
+                            eps_bits: eps.to_bits(),
+                            block_rows: 0,
+                        }),
+                        [cols.div_ceil(256), 1, 1],
+                    ));
                 }
             }
 
@@ -3286,16 +3458,19 @@ impl<'a> Compiler<'a> {
                 let workgroups = WG
                     .checked_div(lanes_per_row)
                     .map_or(rows, |packed_rows| rows.div_ceil(packed_rows));
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::RmsNormGradX,
-                    workgroups: [workgroups, 1, 1],
-                    input_buffers: vec![dy, x, w],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![rows, cols, eps.to_bits(), lanes_per_row],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::RmsNormGradX(dispatch::NormGradient {
+                        dy,
+                        src: x,
+                        weight: w,
+                        dst: out_buf,
+                        rows,
+                        cols,
+                        eps_bits: eps.to_bits(),
+                        block_rows: lanes_per_row,
+                    }),
+                    [workgroups, 1, 1],
+                ));
             }
 
             Op::LayerNormGradWB { eps } => {
@@ -3314,16 +3489,19 @@ impl<'a> Compiler<'a> {
                 } else {
                     out_buf
                 };
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::LayerNormGradWB,
-                    workgroups: [blocks, 1, 1],
-                    input_buffers: vec![dy, x, w],
-                    output_buffer: partial,
-                    extra_outputs: vec![],
-                    params: vec![rows, cols, eps.to_bits(), block],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::LayerNormGradWB(dispatch::NormGradient {
+                        dy,
+                        src: x,
+                        weight: w,
+                        dst: partial,
+                        rows,
+                        cols,
+                        eps_bits: eps.to_bits(),
+                        block_rows: block,
+                    }),
+                    [blocks, 1, 1],
+                ));
                 if blocks > 1 {
                     self.push_sum_rows(blocks, cols, partial, out_buf);
                 }
@@ -3336,16 +3514,19 @@ impl<'a> Compiler<'a> {
                 let x_shape = &self.graph.node(node.inputs[1]).ty.shape;
                 let rows = x_shape[0] as u32;
                 let cols = x_shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::LayerNormGradX,
-                    workgroups: [rows, 1, 1],
-                    input_buffers: vec![dy, x, w],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![rows, cols, eps.to_bits(), 0],
-
-                    ..Default::default()
-                });
+                self.plan.dispatches.push(Dispatch::new(
+                    DispatchOp::LayerNormGradX(dispatch::NormGradient {
+                        dy,
+                        src: x,
+                        weight: w,
+                        dst: out_buf,
+                        rows,
+                        cols,
+                        eps_bits: eps.to_bits(),
+                        block_rows: 0,
+                    }),
+                    [rows, 1, 1],
+                ));
             }
         }
 
@@ -3353,9 +3534,9 @@ impl<'a> Compiler<'a> {
         // and packed weights retain their own implementations.
         if let Some(spec) = node.matmul_impl
             && self.plan.dispatches.len() == dispatch_start + 1
-            && self.plan.dispatches[dispatch_start].shader.is_matmul()
+            && self.plan.dispatches[dispatch_start].shader().is_matmul()
             && !self.plan.dispatches[dispatch_start]
-                .weight_format
+                .weight_format()
                 .is_quantized()
         {
             let shape = spec.shape;
@@ -3364,7 +3545,7 @@ impl<'a> Compiler<'a> {
                 "illegal extracted matmul: {spec:?}"
             );
             let dispatch = &mut self.plan.dispatches[dispatch_start];
-            dispatch.kernel = Kernel::ScalarMatmul(shape);
+            dispatch.set_kernel(Kernel::ScalarMatmul(shape));
             dispatch.workgroups = matmul_workgroups_rect(
                 node.ty.shape[0] as u32,
                 node.ty.shape[1] as u32,
@@ -3443,18 +3624,17 @@ impl<'a> Compiler<'a> {
             gather_elem: Vec::new(),
             input_row_repeats: Vec::new(),
         };
-        self.plan.dispatches.push(Dispatch {
-            // Sentinel shader for runtime data-layout selection (UnaryData).
-            shader: ShaderEntry::Generated,
-            workgroups: [batch.div_ceil(rows_per_workgroup), 1, 1],
-            input_buffers: vec![input],
-            output_buffer: row_max,
-            extra_outputs: vec![],
-            params: vec![batch, features, 0, 0],
-
-            kernel: Kernel::Reduction(max_kernel),
-            ..Default::default()
-        });
+        self.plan.dispatches.push(Dispatch::new(
+            DispatchOp::Reduction(dispatch::Reduction {
+                inputs: vec![input],
+                dst: row_max,
+                outer: batch,
+                inner: features,
+                round_one_bits: 0,
+                kernel: max_kernel,
+            }),
+            [batch.div_ceil(rows_per_workgroup), 1, 1],
+        ));
 
         // --- Dispatch 2: sum reduction with exp-subtract prologue + normalize epilogue ---
         // Prologue DAG: inputs are 0=src (per-elem), 1=row_max (per-row).
@@ -3506,21 +3686,17 @@ impl<'a> Compiler<'a> {
             gather_elem: Vec::new(),
             input_row_repeats: Vec::new(),
         };
-        self.plan.dispatches.push(Dispatch {
-            // Sentinel for runtime data-layout: 1 per-elem + 1 per-row → 2
-            // buffer inputs → we key the runtime off `reduction.is_some()`
-            // and the kernel's arity, so the shader field is purely a
-            // historical leftover here.
-            shader: ShaderEntry::Generated,
-            workgroups: [batch.div_ceil(rows_per_workgroup), 1, 1],
-            input_buffers: vec![input, row_max],
-            output_buffer: out_buf,
-            extra_outputs: vec![],
-            params: vec![batch, features, 0, 0],
-
-            kernel: Kernel::Reduction(sum_kernel),
-            ..Default::default()
-        });
+        self.plan.dispatches.push(Dispatch::new(
+            DispatchOp::Reduction(dispatch::Reduction {
+                inputs: vec![input, row_max],
+                dst: out_buf,
+                outer: batch,
+                inner: features,
+                round_one_bits: 0,
+                kernel: sum_kernel,
+            }),
+            [batch.div_ceil(rows_per_workgroup), 1, 1],
+        ));
     }
 
     /// Emit LayerNorm as a single schedule-template reduction with two
@@ -3546,40 +3722,35 @@ impl<'a> Compiler<'a> {
         let rows_per_workgroup = kernel.rows_per_workgroup;
 
         // Uses RmsNormData layout: src + bias (per-col weight) + dst + params.
-        self.plan.dispatches.push(Dispatch {
-            shader: ShaderEntry::Generated,
-            workgroups: [rows.div_ceil(rows_per_workgroup), 1, 1],
-            input_buffers: vec![x, w],
-            output_buffer: out_buf,
-            extra_outputs: vec![],
-            // The schedule shader embeds epsilon in its DAG, but retain the
-            // bits in dispatch metadata as well: runtime may rewrite this
-            // dispatch to RmsNormRsqrt for a cooperative matmul prologue.
-            params: vec![rows, cols, eps.to_bits(), 0],
-
-            kernel: Kernel::Reduction(kernel),
-            ..Default::default()
-        });
+        self.plan.dispatches.push(Dispatch::new(
+            DispatchOp::Reduction(dispatch::Reduction {
+                inputs: vec![x, w],
+                dst: out_buf,
+                outer: rows,
+                inner: cols,
+                round_one_bits: eps.to_bits(),
+                kernel,
+            }),
+            [rows.div_ceil(rows_per_workgroup), 1, 1],
+        ));
     }
 
     pub(super) fn emit_generated_unary(&mut self, op: Pw, node: &Node, out_buf: BufferRef) {
         let input = self.get_buffer(node.inputs[0]);
         let len = node.ty.num_elements() as u32;
-        self.plan.dispatches.push(Dispatch {
-            shader: ShaderEntry::Generated,
-            workgroups: [len.div_ceil(256), 1, 1],
-            input_buffers: vec![input],
-            output_buffer: out_buf,
-            extra_outputs: vec![],
-            params: vec![len, 0, 0, 0],
-
-            kernel: Kernel::Pointwise(PointwiseDAG {
-                n_inputs: 1,
-                ops: vec![Pw::LoadInput(0), op],
-                output: 1,
+        self.plan.dispatches.push(Dispatch::new(
+            DispatchOp::Pointwise(dispatch::Pointwise {
+                inputs: vec![input],
+                dst: out_buf,
+                len,
+                dag: PointwiseDAG {
+                    n_inputs: 1,
+                    ops: vec![Pw::LoadInput(0), op],
+                    output: 1,
+                },
             }),
-            ..Default::default()
-        });
+            [len.div_ceil(256), 1, 1],
+        ));
     }
 
     /// One elementwise dispatch computing `dag` over the node's inputs.
@@ -3596,16 +3767,15 @@ impl<'a> Compiler<'a> {
             node.op
         );
         let len = node.ty.num_elements() as u32;
-        self.plan.dispatches.push(Dispatch {
-            shader: ShaderEntry::Generated,
-            workgroups: [len.div_ceil(256), 1, 1],
-            input_buffers,
-            output_buffer: out_buf,
-            extra_outputs: vec![],
-            params: vec![len, 0, 0, 0],
-            kernel: Kernel::Pointwise(dag),
-            ..Default::default()
-        });
+        self.plan.dispatches.push(Dispatch::new(
+            DispatchOp::Pointwise(dispatch::Pointwise {
+                inputs: input_buffers,
+                dst: out_buf,
+                len,
+                dag,
+            }),
+            [len.div_ceil(256), 1, 1],
+        ));
     }
 
     /// `out[i] = a[i] (+ or *) b[i % len(b)]`: a bias or scale per column.
@@ -3622,27 +3792,26 @@ impl<'a> Compiler<'a> {
         let b = self.get_buffer(node.inputs[1]);
         let len = node.ty.num_elements() as u32;
         let row_len = self.graph.node(node.inputs[1]).ty.num_elements() as u32;
-        self.plan.dispatches.push(Dispatch {
-            shader: ShaderEntry::Generated,
-            workgroups: [len.div_ceil(256), 1, 1],
-            input_buffers: vec![a, b],
-            output_buffer: out_buf,
-            extra_outputs: vec![],
-            params: vec![len, 0, 0, 0],
-            kernel: Kernel::Pointwise(PointwiseDAG {
-                n_inputs: 2,
-                ops: vec![
-                    Pw::LoadInput(0),
-                    Pw::LoadBroadcast {
-                        input: 1,
-                        divisor: 1,
-                        modulus: row_len,
-                    },
-                    combine,
-                ],
-                output: 2,
+        self.plan.dispatches.push(Dispatch::new(
+            DispatchOp::Pointwise(dispatch::Pointwise {
+                inputs: vec![a, b],
+                dst: out_buf,
+                len,
+                dag: PointwiseDAG {
+                    n_inputs: 2,
+                    ops: vec![
+                        Pw::LoadInput(0),
+                        Pw::LoadBroadcast {
+                            input: 1,
+                            divisor: 1,
+                            modulus: row_len,
+                        },
+                        combine,
+                    ],
+                    output: 2,
+                },
             }),
-            ..Default::default()
-        });
+            [len.div_ceil(256), 1, 1],
+        ));
     }
 }

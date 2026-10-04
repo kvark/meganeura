@@ -8,7 +8,7 @@ pub(crate) fn persistent_writes(plan: &ExecutionPlan) -> Vec<BufferRef> {
     let writes: HashSet<_> = plan
         .dispatches
         .iter()
-        .flat_map(|d| std::iter::once(d.output_buffer).chain(d.extra_outputs.iter().copied()))
+        .flat_map(|d| std::iter::once(d.output_buffer()).chain(d.extra_outputs()))
         .collect();
     let mut buffers: Vec<_> = plan
         .input_buffers

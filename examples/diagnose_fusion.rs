@@ -36,7 +36,7 @@ fn is_scalar_matmul(d: &Dispatch) -> bool {
     use ShaderEntry::*;
     !d.use_coop()
         && matches!(
-            d.shader,
+            d.shader(),
             MatMul | MatMulAT | MatMulBT | FusedMatMulAdd | FusedMatMulATAdd | FusedMatMulBTAdd
         )
 }
@@ -61,7 +61,7 @@ fn absorbable_into_matmul(d: &Dispatch) -> Option<&'static str> {
 fn count_consumers(plan: &ExecutionPlan) -> HashMap<BufferRef, Vec<usize>> {
     let mut m: HashMap<BufferRef, Vec<usize>> = HashMap::new();
     for (i, d) in plan.dispatches.iter().enumerate() {
-        for b in &d.input_buffers {
+        for b in &d.input_buffers() {
             m.entry(*b).or_default().push(i);
         }
     }
@@ -71,7 +71,7 @@ fn count_consumers(plan: &ExecutionPlan) -> HashMap<BufferRef, Vec<usize>> {
 fn producer_of(plan: &ExecutionPlan) -> HashMap<BufferRef, usize> {
     let mut m = HashMap::new();
     for (i, d) in plan.dispatches.iter().enumerate() {
-        m.insert(d.output_buffer, i);
+        m.insert(d.output_buffer(), i);
     }
     m
 }
@@ -107,7 +107,7 @@ fn diagnose(plan: &ExecutionPlan) -> Vec<Finding> {
     for (i, d) in plan.dispatches.iter().enumerate() {
         // Pattern 1: absorb-into-matmul epilogue.
         if let Some(reason) = absorbable_into_matmul(d)
-            && let Some(&primary) = d.input_buffers.first()
+            && let Some(&primary) = d.input_buffers().first()
             && !external.contains(&primary)
             && let Some(&prod_i) = producer.get(&primary)
         {
@@ -119,8 +119,8 @@ fn diagnose(plan: &ExecutionPlan) -> Vec<Finding> {
                     consumer_idx: i,
                     note: format!(
                         "{} → {} ({})",
-                        shader_name(&prod.shader),
-                        shader_name(&d.shader),
+                        shader_name(&prod.shader()),
+                        shader_name(&d.shader()),
                         reason
                     ),
                 });
@@ -130,12 +130,12 @@ fn diagnose(plan: &ExecutionPlan) -> Vec<Finding> {
         // Pattern 2: MatMul consumes an RmsNorm output — a candidate for
         // the RmsNormRsqrt + prologue fusion if not already applied.
         if matches!(
-            d.shader,
+            d.shader(),
             ShaderEntry::MatMul | ShaderEntry::MatMulBT | ShaderEntry::MatMulAT
         ) && !d.use_coop()
-            && d.input_buffers.len() >= 2
+            && d.input_buffers().len() >= 2
         {
-            for (slot_idx, in_buf) in d.input_buffers[..2].iter().enumerate() {
+            for (slot_idx, in_buf) in d.input_buffers()[..2].iter().enumerate() {
                 if let Some(&prod_i) = producer.get(in_buf)
                     && is_rms_norm(&plan.dispatches[prod_i])
                     && consumers.get(in_buf).map_or(0, |v| v.len()) == 1
@@ -145,7 +145,7 @@ fn diagnose(plan: &ExecutionPlan) -> Vec<Finding> {
                         kind: "RmsNorm+MatMul not fused",
                         producer_idx: prod_i,
                         consumer_idx: i,
-                        note: format!("RmsNorm → {} (slot {})", shader_name(&d.shader), slot_idx),
+                        note: format!("RmsNorm → {} (slot {})", shader_name(&d.shader()), slot_idx),
                     });
                 }
             }
@@ -158,7 +158,7 @@ fn diagnose(plan: &ExecutionPlan) -> Vec<Finding> {
             dag.n_inputs == 2 && matches!(dag.ops.last(), Some(meganeura::schedule::Pw::Add(..)))
         });
         if is_add {
-            for (slot_idx, in_buf) in d.input_buffers.iter().enumerate() {
+            for (slot_idx, in_buf) in d.input_buffers().iter().enumerate() {
                 if !external.contains(in_buf)
                     && let Some(&prod_i) = producer.get(in_buf)
                     && is_scalar_matmul(&plan.dispatches[prod_i])
@@ -170,8 +170,8 @@ fn diagnose(plan: &ExecutionPlan) -> Vec<Finding> {
                         consumer_idx: i,
                         note: format!(
                             "{} → {} (producer at input slot {})",
-                            shader_name(&plan.dispatches[prod_i].shader),
-                            shader_name(&d.shader),
+                            shader_name(&plan.dispatches[prod_i].shader()),
+                            shader_name(&d.shader()),
                             slot_idx
                         ),
                     });
@@ -221,7 +221,7 @@ fn print_report(label: &str, plan: &ExecutionPlan, findings: &[Finding]) {
 fn dispatch_histogram(plan: &ExecutionPlan) -> Vec<(String, usize)> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for d in &plan.dispatches {
-        *counts.entry(shader_name(&d.shader)).or_default() += 1;
+        *counts.entry(shader_name(&d.shader())).or_default() += 1;
     }
     let mut v: Vec<_> = counts.into_iter().collect();
     v.sort_by_key(|entry| std::cmp::Reverse(entry.1));
@@ -237,19 +237,10 @@ fn analyze(label: &str, plan: &ExecutionPlan) {
     }
     let mut shapes = BTreeMap::new();
     for d in &plan.dispatches {
-        let (m, n, k) = match d.shader {
-            ShaderEntry::MatMul
-            | ShaderEntry::FusedMatMulAdd
-            | ShaderEntry::MatMulGemv
-            | ShaderEntry::MatMulGemvAdd => (d.params[0], d.params[2], d.params[1]),
-            ShaderEntry::MatMulAT
-            | ShaderEntry::MatMulBT
-            | ShaderEntry::FusedMatMulATAdd
-            | ShaderEntry::FusedMatMulBTAdd
-            | ShaderEntry::MatMulGemvBT => (d.params[0], d.params[1], d.params[2]),
-            _ => continue,
+        let Some((m, n, k)) = d.mnk() else {
+            continue;
         };
-        let key = (shader_name(&d.shader), m, n, k, d.requires_full_precision);
+        let key = (shader_name(&d.shader()), m, n, k, d.requires_full_precision);
         *shapes.entry(key).or_insert(0usize) += 1;
     }
     println!("\n  matmul shape classes (entry, M, N, K, full-precision operands):");
