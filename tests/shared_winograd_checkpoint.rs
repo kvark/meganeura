@@ -35,8 +35,7 @@ fn tied_convolutions_read_the_logical_weight() {
 
 #[test]
 fn portable_checkpoint_roundtrips_between_direct_and_shared_winograd() {
-    let context =
-        std::sync::Arc::new(meganeura::init_gpu_context_with(Default::default()).unwrap());
+    let context = crate::support::gpu::gpu();
     let build = |direct| {
         meganeura::build(
             &graph(),

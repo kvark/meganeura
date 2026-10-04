@@ -1,5 +1,176 @@
 # Unreleased
 
+- Bound cooperative attention's workgroup staging by the selected device's
+  shared-memory limit, falling back independently for forward, dQ and dK/dV.
+  Include the limit in cached-plan compatibility and invalidate older plans.
+- Correct `bench_step_cpu` to time GPU completion and report submission and
+  wait separately; withdraw the overlap conclusions based on submission-only
+  timings. Reject nonfinite values in the profiling result comparison and fix
+  the context module's broken documentation link.
+
+- The file split recommended in July 2026: `runtime.rs` 8592 to 5666,
+  `codegen.rs` 8146 to 5419, `compile.rs` 7928 to 4326. The seams are by
+  responsibility rather than by size:
+
+    impl Compiler                    -> compile/emit.rs       3634 lines
+    attention and conv generators    -> codegen/attention.rs   2744
+    Session binding                  -> runtime/binding.rs     1477
+    Session transfers                -> runtime/transfer.rs    1444
+    host-side Q4/Q8 packing          -> runtime/quantize.rs     187
+    GpuOptions and context creation -> runtime/context.rs       99
+
+  `compile/emit.rs` holds everything that *emits* dispatches while its parent
+  *describes* the plan. `codegen/attention.rs` keeps the matmul family in place
+  and takes everything that is not a matmul. `runtime/binding.rs` answers one
+  question — given a compiled dispatch, what goes in binding 0 — and
+  `runtime/transfer.rs` is everything that touches a buffer from the CPU side.
+
+  Methods and helpers that move become `pub(super)`, because an inherent impl in
+  a child module is unreachable from the parent otherwise. Public items are
+  re-exported so every existing path still resolves; the only path that had to
+  change was relative, since `include_str!("shaders/...")` inside the moved
+  generators became `"../shaders/..."`.
+
+- `bind_dispatch` was one 58-arm match over `ShaderEntry` and 1237 lines. It is
+  now a routing match plus eight family functions — `bind_matmul` (120 lines),
+  `bind_conv` (196), `bind_attention` (202), `bind_norm` (195),
+  `bind_activation` (78), `bind_reduction` (58), `bind_loss` (48) and
+  `bind_pointwise` (203) — with `bind_dispatch` itself at 333.
+
+  The routing match is the only exhaustive one and deliberately has no wildcard
+  arm, so a new `ShaderEntry` variant fails to compile at the routing decision
+  instead of reaching some family's inner match and landing in its
+  `unreachable!` at runtime. Each family's inner match keeps a trailing
+  `unreachable!`, so a routing arm that drifts from its family is caught by the
+  first test that reaches it.
+
+  Splitting it does not make it faster and was not sold as such: timing
+  `bind_dispatch` per shader entry across the `bench_step_cpu` sweep gives
+  138-174 ns for every entry with no hot arm, so the 187 ns that is 28% of the
+  host path is the binding model, not one arm. The sequence of 65 `pc.bind` calls
+  is byte-identical before and after.
+
+- `bind_dispatch`'s contraction arms now read `(m, n, k)` through
+  `Dispatch::mnk()` instead of spelling out `params[0..3]` with a per-shader
+  swap — thirteen sites, and the third copy of a rule that had already drifted
+  between the two other places it was written. Routing them through the accessor
+  found a gap in its own table: `FusedMatMulBTAdd` was missing, so 14 GGUF, 4
+  oracle and 9 smoke tests panicked on a name lookup rather than binding a wrong
+  shape. That is now a row in the table, and the `mnk` closure in
+  `bind_dispatch` panics *naming the shader* rather than reporting a generic
+  expectation failure, since it is the backstop for a contraction shader added
+  without a table row — a case the unit test structurally cannot catch, because
+  it only enumerates the shaders the table already names.
+
+  Splitting `bind_dispatch` for its own sake was measured and rejected: timing
+  it per shader entry across the `bench_step_cpu` sweep gives 138-174 ns for
+  every entry with no hot arm, so the 187 ns is the binding model rather than
+  one arm doing something wasteful.
+
+- `DType::block_geometry()` is the single source for quantized block geometry,
+  replacing five independent tables: the `DType` doc comments, the seven
+  divisibility asserts in `Graph::parameter_q*k`, the per-dtype arms of
+  `TensorType::size_bytes`, the inline `(block, stride)` match in
+  `set_parameter_packed`, and the loader's separate GGML table. Nothing enforced
+  the relationship between them, so a stride change could resize a buffer
+  without changing what the copy loop writes. `WeightFormat::dtype()` maps a
+  format to the `DType` it stores so the copy loop cannot name a different
+  geometry than the buffer was sized with.
+
+  Meganeura's own `Q4_0` and `Q8_0` still keep their own arithmetic and resolve
+  to no `DType` counterpart, and the GGUF loader keeps its own table: `DType::Q4_0`
+  is Meganeura's *asymmetric* Q4 rather than GGML's symmetric one, and `Q8_0`
+  pads to 36 bytes where GGML uses 34. Merging those two is what would erase the
+  difference, so it is left explicit. Three tests, one restating each stride as
+  the literal arithmetic it replaced.
+
+- `Dispatch::mnk()` centralises the `(m, n, k)` reinterpretation that two
+  binding sites each did differently: the horizontal-batch binding swapped only
+  for `ShaderEntry::MatMul`, the cooperative-prologue binding only for `MatMul`
+  and `FusedMatMulAdd`, and the shaders that actually store `(m, k, n)` in
+  `params` are `MatMul`, `MatMulGemv`, `MatMulGemvAdd` and `FusedMatMulAdd`. The
+  accessor documents which is which — the `AT`/`BT` variants take A already
+  transposed, so their natural order already is `(m, n, k)` — and returns `None`
+  for a non-contraction rather than three unrelated numbers from `params`. Three
+  tests pin it, including the full table of eight contraction shaders.
+
+  Whether either site was wrong in practice was measured, not assumed:
+  instrumenting `merge_horizontal` across the suite shows only `MatMul`,
+  `MatMulBT` and `MatMulAT` are ever merged, so the first list happened to be
+  complete — though the merge predicate restricts the kernel and not the shader,
+  so that was luck. The prologue site is reached by no test at all, so its list
+  could not be validated empirically and is now correct by construction.
+
+- The cooperative attention kernels rounded tensors to f16 that no cooperative
+  matrix instruction consumes, and the rounding survived to the output. Five
+  `attention` oracle cases failed on the RTX 5070 and passed on every other
+  adapter. This was never an accumulation problem: `coop_mat16x16<f32,C>`,
+  `local_o`, and the output store were all already f32. The f16 was workgroup
+  *staging*, and V is not an operand of any matrix instruction — the cooperative
+  matmul is QK^T only, so PV is a scalar loop that read back
+  `f32(shared_v[...])`, undoing a rounding the shader had just applied.
+  `examples/bench_attention_coop` measures the floor by rounding one operand at
+  a time in the f64 CPU reference and differencing against the exact evaluation:
+  the measured error equals the floor to three digits (2.360e-4 of 2.360e-4 at
+  head_dim 64), V alone accounts for essentially all of it, and Q and K together
+  cost 3-4x less because the softmax averages their error while a convex
+  combination does not cancel V's.
+  Three instances, all the same shape — a second copy of a tensor whose other
+  copy is the real cooperative operand, read only by scalar code:
+  `shared_v` in `flash_attention_coop`, `shared_k` in `flash_grad_q_coop`, and
+  `shared_q`/`shared_do` in `flash_grad_kv_coop`. All four arrays become `f32`;
+  every remaining `array<f16>` in workgroup memory feeds a `coopLoadT` or
+  `coopStoreT`. The forward was also inconsistent with its own non-cooperative
+  counterpart, which already staged V as `f32`.
+  Residual error is now 6.3e-5 to 1.09e-4, matching the analytic Q+K floor — the
+  part the hardware forces and nothing else. `CoopPolicy` is unchanged, no
+  tolerance was changed, and `Auto` still uses the cooperative matmul. All 17
+  attention cases pass and the suite is green on the RTX 5070 and the Intel
+  B570. New test `every_f16_workgroup_array_is_a_cooperative_operand` asserts the
+  invariant over the generated WGSL; it is structural rather than numeric because
+  most of these variants are unreachable without cooperative-matrix hardware.
+
+- `profile_windows::windowed_capture_times_every_dispatch_and_preserves_the_result`
+  compared its output for bit equality, which fails on Intel with a ~2.7e-5
+  relative drift — ordinary f32 accumulation over six layers, a few hundred ULP.
+  It now uses a `1e-4` tolerance, measured against what it must still catch: a
+  missed or repeated pass leaves whole layers at the wrong value and moves the
+  output by `O(1)`. Verified by injecting a 0.01 offset and confirming the check
+  still fails.
+- `SessionConfig::from_env` no longer falls through to a different GPU when
+  `MEGANEURA_DEVICE_ID` names a device it cannot open. It logged a warning and
+  set `gpu: None`, after which `build` reached `default_gpu_context` — which
+  names no device, so Blade picked whichever adapter initialised first. On a
+  machine with an NVIDIA card and an Intel one, that meant sessions silently
+  moved hardware after the NVIDIA driver stopped issuing contexts (about ten
+  per process). Results, timings and capabilities from then on belonged to
+  neither the request nor an error. A requested device is now a hard failure,
+  with a message pointing at `SessionConfig::from_env_with_gpu` for callers
+  that build several sessions. That constructor is public now; it was private,
+  which left no supported way to share one context across repeated builds.
+- The test harnesses and `load::gguf::Generator` share one context instead of
+  creating one per session, which is what exhausted the driver's budget in the
+  first place. `tests/support/gpu.rs` and `SessionConfig::from_env_with_gpu`
+  cover the general case.
+- This fixes a batch of failures that were never kernel defects:
+  `vision::conv2d_grad_weight_split_k`, `vision::conv2d_tuned_kernels`, five
+  `conv_derivatives` cases, `flash_grad_kv_short`,
+  `schedule_reduction::pairwise_squared_distance...`, all seven
+  `shared_parameters` cases and the `cached_query_attention` case. Those
+  either could not get a context or were being compared against the wrong GPU.
+- Five `attention` oracle cases still fail on the RTX 5070 and now fail
+  honestly: the cooperative flash forward emits values that are exactly
+  `f16(reference)` on a device that advertises no f32 cooperative tile. See
+  `docs/testing.md`.
+- The causal and sliding-window key range that every attention kernel computes
+  is emitted from one place (`codegen::kv_range`) instead of being written out
+  five times. It is the correctness-critical part of the mask, and a fix that
+  reached four of the five kernels would train against a different objective
+  than it evaluates. The attention uniform declarations are likewise two named
+  constants rather than eight inline literals.
+- `HorizMatMulData` and `DynReductionData` had byte-identical `ShaderData`
+  impls differing only in the params type; both are now
+  `BufferListData<P>`.
 - `optimizer_memory::optimizer_clipping_and_diagnostics_ignore_poisoned_allocation_padding`
   compared `f32` results for bit equality across allocation paddings, which
   failed on rounding rather than on a defect. Padding cannot reach the

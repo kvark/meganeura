@@ -19,6 +19,7 @@ mod gemv_parity;
 mod grad_accumulate;
 mod grad_clip;
 mod horizontal_matmul;
+mod importer_fuzz;
 mod int_dot_gemv;
 mod laprop;
 mod multi_input_trainer;
@@ -36,5 +37,6 @@ mod shared_parameters;
 #[cfg(all(feature = "hf-hub", feature = "models"))]
 mod smollm2_correctness;
 mod submission_chunks;
+mod support;
 mod tune;
 mod whisper_correctness;

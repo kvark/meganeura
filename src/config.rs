@@ -394,7 +394,19 @@ impl GpuOptions {
 }
 
 impl SessionConfig<'_> {
-    fn from_env_with_gpu(gpu: Option<std::sync::Arc<blade_graphics::Context>>) -> Self {
+    /// [`SessionConfig::from_env`] using an existing GPU context.
+    ///
+    /// `from_env` creates a device-selected context, hands it to one session,
+    /// and drops it — so an application building sessions in a loop exhausts
+    /// the driver's context budget. The NVIDIA driver stops issuing new
+    /// contexts after roughly ten create/drop cycles in a process, after
+    /// which `from_env` fails rather than continuing on another adapter.
+    /// This applies the same environment overrides to a context the caller
+    /// already holds, so repeated builds share one device.
+    ///
+    /// Pass `None` to apply the environment without selecting a device, which
+    /// defers context creation to [`crate::Session::with_context`] and friends.
+    pub fn from_env_with_gpu(gpu: Option<std::sync::Arc<blade_graphics::Context>>) -> Self {
         log_overrides();
         Self {
             gpu,
@@ -419,11 +431,42 @@ impl SessionConfig<'_> {
     pub fn from_env() -> Self {
         let gpu_opts = GpuOptions::from_env();
         let timing_requested = gpu_opts.timing;
+        let requested_device = gpu_opts.device_id;
         let gpu = if gpu_opts.device_id.is_some() || gpu_opts.timing || gpu_opts.capture {
             match crate::runtime::init_gpu_context_with(gpu_opts) {
                 Ok(context) => Some(std::sync::Arc::new(context)),
                 Err(e) => {
-                    log::warn!("env-selected GPU init failed ({e:?}); using default adapter");
+                    // A named device that could not be opened is not a
+                    // preference to be traded away. Silently continuing on
+                    // another adapter is the worst outcome available: the
+                    // caller asked for hardware by id and gets different
+                    // hardware, with results, timings and capabilities that
+                    // belong to neither the request nor an error.
+                    //
+                    // This is reachable without misconfiguration. The NVIDIA
+                    // driver refuses new contexts after roughly ten
+                    // create/drop cycles in a process, so an application
+                    // building sessions in a loop crosses the limit and
+                    // starts landing on whatever other adapter is present —
+                    // silently, since `gpu: None` below just means "use the
+                    // default adapter". Here that limit would move every
+                    // session after the tenth onto a different GPU.
+                    //
+                    // Timing and capture are different: they are capabilities
+                    // rather than device selection, and losing them degrades
+                    // instrumentation without moving work elsewhere.
+                    if let Some(device) = requested_device {
+                        panic!(
+                            "MEGANEURA_DEVICE_ID={device:#x} was requested but that device could \
+                             not be opened ({e:?}). Refusing to continue on a different adapter: \
+                             a session on another device reports different results, timings and \
+                             capabilities than the one asked for. If the process has exhausted \
+                             its context budget, share one context across sessions with \
+                             `SessionConfig::from_env_with_gpu` instead of calling \
+                             `from_env` per session."
+                        );
+                    }
+                    log::warn!("GPU init for timing/capture failed ({e:?}); running untimed");
                     None
                 }
             }

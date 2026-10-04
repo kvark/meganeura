@@ -682,6 +682,7 @@ mod tests {
             input_buffers: Vec::new(),
             constant_buffers: Vec::new(),
             dispatches,
+            groups: Vec::new(),
             loss_buffer: None,
             output_buffers: Vec::new(),
             param_grad_pairs: Vec::new(),

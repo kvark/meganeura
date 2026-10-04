@@ -76,10 +76,10 @@ fn recorded_inference_matches_step_between_application_passes() {
     let bytes = (len * 4) as u64;
     let x: Vec<f32> = (0..len).map(|i| (i as f32 * 0.011).sin()).collect();
 
-    let gpu = Arc::new(meganeura::init_gpu_context().expect("GPU context"));
+    let gpu = crate::support::gpu::gpu();
     let config = SessionConfig {
         gpu: Some(Arc::clone(&gpu)),
-        ..SessionConfig::inference_from_env()
+        ..crate::support::gpu::inference_config()
     };
     let mut session = meganeura::build(&chain(LAYERS, ROWS, DIM), config).0;
     seed(&mut session, LAYERS, DIM);
@@ -149,7 +149,7 @@ fn training_graph() -> Graph {
 fn training_session(gpu: &Arc<bg::Context>, adam: bool) -> Session {
     let config = SessionConfig {
         gpu: Some(Arc::clone(gpu)),
-        ..SessionConfig::default()
+        ..crate::support::gpu::config()
     };
     let mut session = meganeura::build(&training_graph(), config).0;
     for (name, phase) in [("w0", 0.3), ("w1", 1.1)] {
@@ -174,7 +174,7 @@ fn training_session(gpu: &Arc<bg::Context>, adam: bool) -> Session {
 #[test]
 fn recorded_training_steps_match_step() {
     const STEPS: usize = 3;
-    let gpu = Arc::new(meganeura::init_gpu_context().expect("GPU context"));
+    let gpu = crate::support::gpu::gpu();
     for adam in [false, true] {
         let mut reference = training_session(&gpu, adam);
         for _ in 0..STEPS {
@@ -213,7 +213,7 @@ fn recorded_training_steps_match_step() {
 
 #[test]
 fn gradient_accumulation_cannot_be_recorded() {
-    let gpu = Arc::new(meganeura::init_gpu_context().expect("GPU context"));
+    let gpu = crate::support::gpu::gpu();
     let mut session = training_session(&gpu, false);
     session.set_grad_accumulate(2);
     let mut encoder = app_encoder(&gpu);

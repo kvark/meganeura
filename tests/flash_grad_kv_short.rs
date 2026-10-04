@@ -13,9 +13,10 @@ fn run(
     q_seq: usize,
     kv_seq: usize,
     window: u32,
+    head_dim: u32,
     cooperative: bool,
-) -> ([Vec<f32>; 3], bool) {
-    let (num_heads, num_kv_heads, head_dim) = (3, 1, 64);
+) -> ([Vec<f32>; 3], [bool; 3]) {
+    let (num_heads, num_kv_heads) = (3, 1);
     let mut graph = Graph::new();
     let q = graph.parameter("q", &[q_seq, num_heads as usize * head_dim as usize]);
     let k = graph.parameter("k", &[kv_seq, num_kv_heads as usize * head_dim as usize]);
@@ -31,16 +32,23 @@ fn run(
     let mut config = SessionConfig {
         mode: Mode::Training,
         gpu: Some(gpu),
-        ..SessionConfig::from_env()
+        ..crate::support::gpu::config()
     };
     config.options.flash_forward_coop = cooperative;
     config.options.flash_backward_coop = cooperative;
     let (mut session, _) = build(&graph, config);
-    let uses_coop = session
-        .plan()
-        .dispatches
-        .iter()
-        .any(|dispatch| dispatch.shader == ShaderEntry::FlashGradKVCoop);
+    let uses_coop = [
+        ShaderEntry::FlashAttentionCoop,
+        ShaderEntry::FlashGradQCoop,
+        ShaderEntry::FlashGradKVCoop,
+    ]
+    .map(|shader| {
+        session
+            .plan()
+            .dispatches
+            .iter()
+            .any(|dispatch| dispatch.shader == shader)
+    });
 
     let q_data: Vec<f32> = (0..q_seq * num_heads as usize * head_dim as usize)
         .map(|i| ((i as f32 * 0.017) + 0.3).sin() * 0.1)
@@ -90,24 +98,28 @@ fn assert_close(label: &str, scalar: &[f32], cooperative: &[f32]) {
 
 #[test]
 fn short_cross_self_and_window_attention_gradients_match_scalar() {
-    let gpu = Arc::new(
-        meganeura::init_gpu_context_with(meganeura::GpuOptions::from_env()).expect("GPU context"),
-    );
+    let gpu = crate::support::gpu::gpu();
     let has_coop = gpu
         .capabilities()
         .cooperative_matrix
         .f16_f32_shapes
         .contains(&[16, 16, 16]);
 
-    for (label, q_seq, kv_seq, window) in [
-        ("cross", 50, 16, 0),
-        ("self", 50, 50, 0),
-        ("window", 50, 50, 17),
+    // Minimum workgroup storage for forward, dQ, dK/dV at each width.
+    // Wide heads must exercise scalar fallback even on cooperative hardware.
+    for (label, q_seq, kv_seq, window, head_dim, storage) in [
+        ("cross", 50, 16, 0, 64, [9_216, 15_552, 20_928]),
+        ("self", 50, 50, 0, 64, [9_216, 15_552, 20_928]),
+        ("window", 50, 50, 17, 64, [9_216, 15_552, 20_928]),
+        ("wide backward", 33, 33, 0, 256, [33_792, 52_416, 70_080]),
+        ("wide forward", 17, 17, 0, 512, [66_560, 101_568, 135_616]),
     ] {
-        let (scalar, scalar_used_coop) = run(gpu.clone(), q_seq, kv_seq, window, false);
-        let (cooperative, coop_used_coop) = run(gpu.clone(), q_seq, kv_seq, window, true);
-        assert!(!scalar_used_coop);
-        assert_eq!(coop_used_coop, has_coop);
+        let (scalar, scalar_used_coop) = run(gpu.clone(), q_seq, kv_seq, window, head_dim, false);
+        let (cooperative, coop_used_coop) = run(gpu.clone(), q_seq, kv_seq, window, head_dim, true);
+        assert_eq!(scalar_used_coop, [false; 3]);
+        let expected = storage
+            .map(|bytes| has_coop && bytes <= gpu.capabilities().max_compute_shared_memory_size);
+        assert_eq!(coop_used_coop, expected, "{label}");
         for (i, name) in ["dQ", "dK", "dV"].into_iter().enumerate() {
             assert_close(&format!("{label} {name}"), &scalar[i], &cooperative[i]);
         }

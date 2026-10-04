@@ -22,7 +22,7 @@ fn build(cooperative: bool, expose_normalized: bool) -> Session {
     } else {
         graph.set_outputs(vec![output]);
     }
-    let mut config = meganeura::SessionConfig::inference_from_env();
+    let mut config = crate::support::gpu::inference_config();
     config.runtime.coop = if cooperative {
         CoopPolicy::Auto
     } else {

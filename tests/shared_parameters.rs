@@ -24,13 +24,13 @@ fn graph_with_bias(rows: usize) -> Graph {
 fn separately_compiled_sessions_can_share_parameter_lifetime() {
     for (source_shared, target_shared) in [(false, true), (true, false)] {
         let source_graph = graph(2);
-        let mut config = SessionConfig::inference_from_env();
+        let mut config = crate::support::gpu::inference_config();
         config.runtime.no_device_local = source_shared;
         let mut source = meganeura::build(&source_graph, config).0;
         source.set_parameter("weight", &[2.0, 0.0, 0.0, 3.0]);
 
         let target_graph = graph(2);
-        let mut config = SessionConfig::inference_from_env();
+        let mut config = crate::support::gpu::inference_config();
         config.runtime.no_device_local = target_shared;
         config.gpu = Some(source.context());
         let mut target = meganeura::build(&target_graph, config).0;
@@ -53,10 +53,10 @@ fn separately_compiled_sessions_can_share_parameter_lifetime() {
 
 #[test]
 fn construction_shares_available_parameters_and_allocates_the_rest() {
-    let mut source = meganeura::build(&graph(2), SessionConfig::inference_from_env()).0;
+    let mut source = meganeura::build(&graph(2), crate::support::gpu::inference_config()).0;
     source.set_parameter("weight", &[2.0, 0.0, 0.0, 3.0]);
 
-    let mut config = SessionConfig::inference_from_env();
+    let mut config = crate::support::gpu::inference_config();
     config.share_parameters_from = Some(&mut source);
     let mut target = meganeura::build(&graph_with_bias(2), config).0;
     assert!(target.shares_parameter(&source, "weight"));
@@ -108,8 +108,8 @@ fn training_sessions_share_parameters_in_either_direction() {
     let weight = [2.0, 0.0, 0.0, 3.0];
     let (next_a, next_weight) = sgd_step(a, weight, 0.125);
     for training_is_source in [true, false] {
-        let mut trainer = meganeura::build(&training_graph(), SessionConfig::default()).0;
-        let mut config = SessionConfig::inference_from_env();
+        let mut trainer = meganeura::build(&training_graph(), crate::support::gpu::config()).0;
+        let mut config = crate::support::gpu::inference_config();
         config.gpu = Some(trainer.context());
         let mut reader = meganeura::build(&graph(2), config).0;
         trainer.set_parameter("a", &a);
@@ -143,11 +143,11 @@ fn training_sessions_share_parameters_in_either_direction() {
 
 #[test]
 fn construction_preserves_a_donor_arena_offset() {
-    let mut trainer = meganeura::build(&training_graph(), SessionConfig::default()).0;
+    let mut trainer = meganeura::build(&training_graph(), crate::support::gpu::config()).0;
     trainer.set_parameter("a", &[1.0, -1.0, 0.5, 2.0]);
     trainer.set_parameter("weight", &[2.0, 0.0, 0.0, 3.0]);
 
-    let mut config = SessionConfig::inference_from_env();
+    let mut config = crate::support::gpu::inference_config();
     config.share_parameters_from = Some(&mut trainer);
     let mut reader = meganeura::build(&graph(2), config).0;
     drop(trainer);
@@ -163,10 +163,10 @@ fn construction_preserves_a_donor_arena_offset() {
 
 #[test]
 fn construction_skips_a_parameter_stored_differently() {
-    let mut source = meganeura::build(&graph(2), SessionConfig::inference_from_env()).0;
+    let mut source = meganeura::build(&graph(2), crate::support::gpu::inference_config()).0;
     source.set_parameter("weight", &[2.0, 0.0, 0.0, 3.0]);
 
-    let mut config = SessionConfig::inference_from_env();
+    let mut config = crate::support::gpu::inference_config();
     config.share_parameters_from = Some(&mut source);
     let mut target = meganeura::build(&graph(3), config).0;
     assert!(!target.shares_parameter(&source, "weight"));
@@ -191,7 +191,7 @@ fn construction_donates_into_a_training_arena() {
     let a = [1.0, -1.0, 0.5, 2.0];
     let weight = [2.0, 0.0, 0.0, 3.0];
     let (next_a, next_weight) = sgd_step(a, weight, 0.125);
-    let mut reader = meganeura::build(&graph(2), SessionConfig::inference_from_env()).0;
+    let mut reader = meganeura::build(&graph(2), crate::support::gpu::inference_config()).0;
     reader.set_parameter("weight", &weight);
     let config = SessionConfig {
         share_parameters_from: Some(&mut reader),
@@ -221,7 +221,7 @@ fn construction_donates_a_whole_training_arena() {
     let a = [1.0, -1.0, 0.5, 2.0];
     let weight = [2.0, 0.0, 0.0, 3.0];
     let (next_a, next_weight) = sgd_step(a, weight, 0.125);
-    let mut donor = meganeura::build(&training_graph(), SessionConfig::default()).0;
+    let mut donor = meganeura::build(&training_graph(), crate::support::gpu::config()).0;
     donor.set_parameter("a", &a);
     donor.set_parameter("weight", &weight);
     let unshared = donor.memory_summary().allocated_buffer_bytes;

@@ -26,7 +26,7 @@ fn config(mode: Mode, coop: bool) -> SessionConfig<'static> {
             },
             ..SessionOptions::default()
         },
-        ..SessionConfig::default()
+        ..crate::support::gpu::config()
     }
 }
 

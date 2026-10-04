@@ -38,7 +38,7 @@ fn run(cooperative: bool) -> Vec<f32> {
     let mut graph = Graph::new();
     let output = sd_unet::build_unet(&mut graph, &config);
     graph.set_outputs(vec![output]);
-    let mut session_config = meganeura::SessionConfig::inference_from_env();
+    let mut session_config = crate::support::gpu::inference_config();
     session_config.runtime.coop = if cooperative {
         CoopPolicy::Auto
     } else {

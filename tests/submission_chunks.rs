@@ -59,7 +59,7 @@ fn run(chunks: usize, layers: usize, rows: usize, dim: usize, steps: usize) -> V
         &g,
         SessionConfig {
             mode: Mode::Inference,
-            ..SessionConfig::from_env()
+            ..crate::support::gpu::config()
         },
     );
     session.set_submission_chunks(chunks);

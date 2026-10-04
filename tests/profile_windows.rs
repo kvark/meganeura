@@ -21,11 +21,32 @@ fn timing_context() -> Option<Arc<blade_graphics::Context>> {
         .clone()
 }
 
+/// The shared process context. Timing is a separate one above, because it has
+/// to be created with the timestamp pools enabled from the start.
 fn ordinary_context() -> Arc<blade_graphics::Context> {
-    static CONTEXT: OnceLock<Arc<blade_graphics::Context>> = OnceLock::new();
-    Arc::clone(CONTEXT.get_or_init(|| {
-        Arc::new(init_gpu_context_with(GpuOptions::default()).expect("GPU context"))
-    }))
+    crate::support::gpu::gpu()
+}
+
+/// Relative agreement, for a result whose exact `f32` bits depend on the
+/// summation order.
+fn close(a: &[f32], b: &[f32], tolerance: f32) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x.is_finite()
+                && y.is_finite()
+                && (x - y).abs() <= tolerance * (1.0 + x.abs().max(y.abs()))
+        })
+}
+
+#[test]
+fn result_comparison_rejects_nonfinite_values() {
+    assert!(close(&[1.0], &[1.0 + 1.0e-5], 1.0e-4));
+    assert!(!close(&[1.01], &[1.0], 1.0e-4));
+    for value in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+        assert!(!close(&[value], &[1.0], 1.0e-4));
+        assert!(!close(&[1.0], &[value], 1.0e-4));
+        assert!(!close(&[value], &[value], 1.0e-4));
+    }
 }
 
 const LAYERS: usize = 6;
@@ -239,7 +260,21 @@ fn windowed_capture_times_every_dispatch_and_preserves_the_result() {
 
     let mut out = vec![0.0f32; ROWS * DIM];
     session.read_output_by_index(0, &mut out);
-    assert_eq!(out, reference, "windowed profiling changed the result");
+    // Compared with a tolerance, not bit-for-bit, and the tolerance is
+    // measured rather than chosen: this chain's f32 results drift by ~2.7e-5
+    // relative between an unprofiled step and one split into replay windows,
+    // which is ordinary accumulation drift over six layers (a few hundred ULP).
+    //
+    // That is not slack for a wrong answer — it is four orders of magnitude
+    // below what a missed or repeated pass produces, which leaves whole layers
+    // at the wrong value and moves the output by O(1). Verified by injecting a
+    // 0.01 offset into the compared output and confirming the check still
+    // fails. The structural assertions above pin the window count and budget
+    // directly; this one is the backstop for the replay being complete.
+    assert!(
+        close(&out, &reference, 1.0e-4),
+        "windowed profiling changed the result"
+    );
 }
 
 #[test]

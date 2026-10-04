@@ -65,7 +65,7 @@ fn q40_rmsnorm_folds_into_gemv() {
     let w = g.parameter_q40("w", &[K, N]);
     let y = g.matmul(h, w);
     g.set_outputs(vec![y]);
-    let mut config = meganeura::SessionConfig::inference_from_env();
+    let mut config = crate::support::gpu::inference_config();
     config.options.gemv_shape = Some(meganeura::GemvShape {
         threads: 64,
         reduction: meganeura::GemvReduction::Subgroup,
@@ -133,7 +133,7 @@ fn dense_transposed_glu_matches_reference_after_restage() {
                     g.swiglu(gate, up)
                 };
                 g.set_outputs(vec![out]);
-                let mut config = meganeura::SessionConfig::inference_from_env();
+                let mut config = crate::support::gpu::inference_config();
                 config.tune = false;
                 let mut session = meganeura::build(&g, config).0;
                 assert_eq!(session.plan().derived_params.len(), 1);
@@ -375,7 +375,7 @@ fn gemv_shapes_cover_widths_reductions_and_row_tails() {
                 gemv_shape: Some(shape),
                 ..CompileOptions::from_env()
             },
-            ..SessionConfig::from_env()
+            ..crate::support::gpu::config()
         };
         let mut s = meganeura::build(&g, config).0;
         let shaders: Vec<_> = s.plan().dispatches.iter().map(|d| &d.shader).collect();

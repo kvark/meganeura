@@ -12,7 +12,7 @@ fn readback_preserves_bits_across_sizes_and_updates() {
     let input = graph.input("x", &[len]);
     let output = graph.materialize(input);
     graph.set_outputs(vec![output]);
-    let mut session = meganeura::build(&graph, meganeura::SessionConfig::inference_from_env()).0;
+    let mut session = meganeura::build(&graph, crate::support::gpu::inference_config()).0;
     for seed in [0u32, 17] {
         let mut values: Vec<_> = (0..len)
             .map(|i| {
@@ -59,7 +59,7 @@ fn model(bs: usize) -> Graph {
 
 fn run(bs: usize, no_device_local: bool) -> (f32, Vec<f32>) {
     let g = model(bs);
-    let mut config = meganeura::SessionConfig::from_env();
+    let mut config = crate::support::gpu::config();
     config.runtime.no_device_local = no_device_local;
     let mut s = meganeura::build(&g, config).0;
     s.set_parameter("fc1.weight", &vec![0.05; 8 * 16]);

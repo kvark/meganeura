@@ -114,6 +114,10 @@ tracing-subscriber = { version = "0.3", optional = true, features = ["registry"]
 # Replay small paired timing differences without lossy f64 JSON parsing.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 env_logger = "0.11"
+# Property-based corpus for the importers, which take untrusted files. A
+# malformed model must come back as a `Result::Err`, never a panic — see
+# `tests/importer_fuzz.rs`.
+proptest = "1"
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 
 [[example]]
@@ -209,6 +213,14 @@ required-features = ["hf-hub"]
 [[example]]
 name = "bench_ci_latency"
 path = "bench/bench_ci_latency.rs"
+
+[[example]]
+name = "bench_step_cpu"
+path = "examples/bench_step_cpu.rs"
+
+[[example]]
+name = "bench_attention_coop"
+path = "examples/bench_attention_coop.rs"
 
 [[example]]
 name = "qwen3"

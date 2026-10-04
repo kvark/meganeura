@@ -14,7 +14,7 @@ fn deduplicated_constants_execute_and_remain_readable() {
         &graph,
         SessionConfig {
             mode: Mode::Inference,
-            ..SessionConfig::default()
+            ..crate::support::gpu::config()
         },
     )
     .0;
