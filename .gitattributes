@@ -1,2 +1,2 @@
-# Shader generators use structural substitutions with LF-delimited anchors.
+# WGSL template sections use LF-delimited markers.
 *.wgsl text eol=lf

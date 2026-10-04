@@ -170,12 +170,23 @@ impl CoopConfig {
 }
 
 /// Replace `$VAR` occurrences in `source` with the corresponding values.
+/// Replacements run in order: insert fragments before filling their slots.
 fn preprocess(source: &str, vars: &[(&str, &str)]) -> String {
     let mut s = source.to_string();
     for &(key, val) in vars {
         s = s.replace(key, val);
     }
     s
+}
+
+/// Named fragments in WGSL templates are delimited by `// @section NAME`.
+fn template_section<'a>(source: &'a str, name: &str) -> &'a str {
+    let marker = format!("// @section {name}\n");
+    let (_, rest) = source
+        .split_once(&marker)
+        .unwrap_or_else(|| panic!("missing shader template section: {name}"));
+    rest.split_once("// @section ")
+        .map_or(rest, |(section, _)| section)
 }
 
 /// A parsed shader module together with the WGSL source text.
@@ -426,7 +437,7 @@ pub fn generate_matmul_with_epilogue(
     epilogue: Option<&crate::compile::MatMulEpilogue>,
     options: MatMulOptions,
 ) -> ShaderModule {
-    generate_partitioned_matmul(group, epilogue, options, 1)
+    generate_partitioned_matmul(group, epilogue, options, 1, 1)
 }
 
 pub(crate) fn generate_split_matmul(
@@ -453,6 +464,7 @@ pub(crate) fn generate_split_matmul(
             },
         },
         splits,
+        1,
     )
 }
 
@@ -461,6 +473,7 @@ fn generate_partitioned_matmul(
     epilogue: Option<&crate::compile::MatMulEpilogue>,
     options: MatMulOptions,
     splits: u32,
+    copies: u32,
 ) -> ShaderModule {
     if matches!(group, ShaderGroup::MatMulBT | ShaderGroup::MatMulBTAdd)
         && options.format.is_quantized()
@@ -518,6 +531,7 @@ fn generate_partitioned_matmul(
         &epi_body,
         options,
         splits,
+        copies,
     )
 }
 
@@ -905,82 +919,110 @@ pub fn generate_horizontal_matmul(
     coop: Option<&CoopConfig>,
 ) -> ShaderModule {
     assert!((2..=3).contains(&count));
-    let base = match coop {
-        Some(config) => generate_module_coop(group, config),
-        None => generate_module(group, MatmulKnobs::default()),
-    };
-    let src = &base.source;
-    let Some((header, rest)) = src.split_once("@compute") else {
-        panic!("matmul source missing @compute");
-    };
-    let compute_attr = if rest.contains("@workgroup_size(64)") {
-        "@compute @workgroup_size(64)"
-    } else {
-        "@compute @workgroup_size(16, 16)"
-    };
-    let b_line = header
-        .lines()
-        .find(|l| l.contains("var<storage> matrix_b"))
-        .unwrap_or("var<storage> matrix_b: array<f32>;");
-    let b_ty = b_line
-        .split_once(':')
-        .map(|(_, t)| t.trim().trim_end_matches(';').trim())
-        .unwrap_or("array<f32>");
-    let mut header = header.replace("var<storage> matrix_b:", "var<storage> matrix_b0:");
-    header = header.replace(
-        "var<storage, read_write> matrix_c:",
-        "var<storage, read_write> matrix_c0:",
-    );
-    let extras: String = (1..count)
-        .map(|i| {
-            format!("var<storage> matrix_b{i}: {b_ty};\nvar<storage, read_write> matrix_c{i}: array<f32>;\n")
-        })
-        .collect();
-    if let Some(pos) = header.find("var<storage, read_write> matrix_c0:") {
-        let insert_at = header[pos..]
-            .find('\n')
-            .map(|n| pos + n + 1)
-            .unwrap_or(header.len());
-        header.insert_str(insert_at, &extras);
-    } else {
-        header.push_str(&extras);
+    match coop {
+        Some(config) => {
+            let (fused_add, variant) =
+                coop_shape(group).unwrap_or_else(|| panic!("no cooperative form for {group:?}"));
+            gen_matmul_coop_wgsl_full(fused_add, variant, config, None, None, count)
+        }
+        None => generate_partitioned_matmul(group, None, MatMulOptions::default(), 1, count),
     }
-    let mut bodies = String::new();
-    for i in 0..count {
-        let mut fn_src = rest.replace("fn main", &format!("fn horiz_{i}"));
-        fn_src = fn_src.replacen("@workgroup_size(64)", "", 1);
-        fn_src = fn_src.replacen("@workgroup_size(16, 16)", "", 1);
-        fn_src = fn_src.replace("@builtin(workgroup_id) ", "");
-        fn_src = fn_src.replace("@builtin(local_invocation_id) ", "");
-        fn_src = fn_src.replace("@builtin(subgroup_id) ", "");
-        fn_src = fn_src.replace("matrix_b[", &format!("matrix_b{i}["));
-        fn_src = fn_src.replace("matrix_c[", &format!("matrix_c{i}["));
-        bodies.push_str(&fn_src);
-        bodies.push('\n');
-    }
-    let subgroup_arg = if coop.is_some() {
-        ", @builtin(subgroup_id) sg: u32"
-    } else {
-        ""
+}
+
+/// Compose declarations and kernel functions through named slots, before parsing.
+fn matmul_module(source: &str, b_storage: &str, coop: bool, count: u32) -> ShaderModule {
+    let interface = include_str!("shaders/matmul_entry.wgsl");
+    let entry = |name: &str, compute: bool| {
+        preprocess(
+            template_section(
+                interface,
+                if compute {
+                    "entry_signature"
+                } else {
+                    "helper_signature"
+                },
+            ),
+            &[
+                ("$NAME", name),
+                ("$WORKGROUP_SIZE", if coop { "64" } else { "16, 16" }),
+                (
+                    "$SUBGROUP",
+                    if !coop {
+                        ""
+                    } else if compute {
+                        ", @builtin(subgroup_id) sg: u32"
+                    } else {
+                        ", sg: u32"
+                    },
+                ),
+            ],
+        )
     };
-    let subgroup_call = if coop.is_some() { ", sg" } else { "" };
-    let mut dispatch = format!(
-        "{compute_attr}\nfn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>{subgroup_arg}) {{\n"
-    );
+    let mut bindings = String::new();
+    let mut kernels = String::new();
+    let mut calls = String::new();
     for i in 0..count {
-        let cond = if i + 1 == count {
-            "else".to_string()
-        } else if i == 0 {
-            format!("if wgid.z == {i}u")
+        let suffix = if count == 1 {
+            String::new()
         } else {
-            format!("else if wgid.z == {i}u")
+            i.to_string()
         };
-        dispatch.push_str(&format!(
-            "    {cond} {{ horiz_{i}(wgid, lid{subgroup_call}); }}\n"
+        let b = format!("matrix_b{suffix}");
+        let c = format!("matrix_c{suffix}");
+        bindings.push_str(&preprocess(
+            template_section(interface, "bindings"),
+            &[
+                ("$B_BUFFER", &b),
+                ("$C_BUFFER", &c),
+                ("$B_STORAGE", b_storage),
+            ],
+        ));
+        let name = if count == 1 {
+            "main".to_owned()
+        } else {
+            format!("horiz_{i}")
+        };
+        kernels.push_str(&preprocess(
+            template_section(source, "kernel"),
+            &[
+                ("$ENTRY_SIGNATURE", &entry(&name, count == 1)),
+                ("$B_BUFFER", &b),
+                ("$C_BUFFER", &c),
+            ],
+        ));
+        if count > 1 {
+            let condition = if i == 0 {
+                format!("if wgid.z == {i}u")
+            } else if i + 1 == count {
+                "else".to_owned()
+            } else {
+                format!("else if wgid.z == {i}u")
+            };
+            calls.push_str(&preprocess(
+                template_section(interface, "call"),
+                &[
+                    ("$CONDITION", &condition),
+                    ("$NAME", &name),
+                    ("$SUBGROUP_ARG", if coop { ", sg" } else { "" }),
+                ],
+            ));
+        }
+    }
+    let mut source = preprocess(
+        template_section(source, "header"),
+        &[("$MATRIX_BINDINGS", &bindings)],
+    );
+    source.push_str(&kernels);
+    if count > 1 {
+        source.push_str(&preprocess(
+            template_section(interface, "dispatch"),
+            &[
+                ("$ENTRY_SIGNATURE", &entry("main", true)),
+                ("$CALLS", &calls),
+            ],
         ));
     }
-    dispatch.push_str("}\n");
-    ShaderModule::new(&format!("{header}{bodies}{dispatch}"))
+    ShaderModule::new(&source)
 }
 
 /// Generate WGSL source for a shader group.
@@ -1346,6 +1388,7 @@ fn matmul_vars_tiled(
     epilogue_body: &str,
     options: MatMulOptions,
     splits: u32,
+    copies: u32,
 ) -> ShaderModule {
     let MatMulIndexing {
         a_idx,
@@ -1369,10 +1412,10 @@ fn matmul_vars_tiled(
         format!("{}\n{}", fused_decl, epilogue_decl)
     };
     let store_body = if epilogue_body.is_empty() {
-        format!("matrix_c[idx] = s[i][j]{};", fused_expr)
+        format!("$C_BUFFER[idx] = s[i][j]{};", fused_expr)
     } else {
         format!(
-            "var val = s[i][j]{};\n                {}\n                matrix_c[idx] = val;",
+            "var val = s[i][j]{};\n                {}\n                $C_BUFFER[idx] = val;",
             fused_expr, epilogue_body
         )
     };
@@ -1380,13 +1423,13 @@ fn matmul_vars_tiled(
         WeightFormat::F32 => (
             "",
             "array<f32>",
-            format!("matrix_b[{}]", b_idx),
+            format!("$B_BUFFER[{}]", b_idx),
             String::new(),
         ),
         WeightFormat::F16 => (
             "enable f16;",
             "array<f16>",
-            format!("f32(matrix_b[{}])", b_idx),
+            format!("f32($B_BUFFER[{}])", b_idx),
             String::new(),
         ),
         WeightFormat::Q4 => (
@@ -1509,7 +1552,6 @@ fn matmul_vars_tiled(
             ),
             ("$B_STAGE_BODY", &b_stage_body),
             ("$ENABLE_F16", enable_f16),
-            ("$B_STORAGE_TYPE", b_storage),
             ("$B_LOAD_EXPR", &b_load_expr),
             ("$B_DEQUANT_FN", &b_dequant_fn),
             ("$A_INDEX", a_idx),
@@ -1539,7 +1581,7 @@ fn matmul_vars_tiled(
             ("$ACC_ARRAY", &acc_array),
         ],
     );
-    ShaderModule::new(&src)
+    matmul_module(&src, b_storage, false, copies)
 }
 
 /// f16 → f32 for the packed-weight kernels' block scales.
@@ -1710,6 +1752,7 @@ fn gen_block_matmul(group: ShaderGroup, tile: MatMulTile) -> ShaderModule {
             ..Default::default()
         },
         1,
+        1,
     )
 }
 
@@ -1757,330 +1800,44 @@ pub fn generate_module_weighted(
     }
 }
 
-/// Substitute `old` for `new`, refusing to do nothing.
-///
-/// These kernels are built by rewriting a source that someone else is free
-/// to edit. A replacement whose anchor has drifted is not a no-op with a
-/// slightly different kernel at the end of it — it is a kernel missing a
-/// declaration or a stride, which surfaces as a parse error at best and a
-/// wrong answer at worst. Failing here names the anchor instead.
-fn substitute(source: &str, old: &str, new: &str) -> String {
-    assert!(
-        source.contains(old),
-        "GEMV substitution anchor is no longer present: {old:?}"
-    );
-    source.replace(old, new)
-}
-
 const ATTENTION_PARAMS_WGSL: &str = include_str!("shaders/attention_params.wgsl");
 const CACHED_ATTENTION_PARAMS_WGSL: &str = include_str!("shaders/cached_attention_params.wgsl");
+const GEMV_TEMPLATE: &str = include_str!("shaders/matmul_gemv.wgsl");
 
-/// The K-split GEMV with the RmsNorm of its input folded in:
-/// `C[1, N] = (rmsnorm(A) * norm_w) × B[K, N]`.
-///
-/// Derived from `matmul_gemv.wgsl` by substitution so shape and reduction
-/// changes reach it automatically. Each consuming workgroup recomputes the
-/// small sum-of-squares prologue, avoiding a separate dispatch and boundary.
-fn gemv_rmsnorm_source(group: ShaderGroup, format: WeightFormat) -> String {
-    assert!(matches!(
-        group,
-        ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvBT
-    ));
-    let transposed = group == ShaderGroup::MatMulGemvBT;
-    // `_pad` carries eps; the fused kernel needs no other new parameter.
-    // Start from the already-format-specialized GEMV so packed decoders
-    // compose with the prologue rather than being overwritten by it.
-    let src = gemv_source(group, format);
-    let src = substitute(&src, "    _pad: u32,", "    eps_bits: u32,");
-    let src = if src.contains("var<storage> matrix_b: array<vec4<f32>>;") {
-        substitute(
-            &src,
-            "var<storage> matrix_b: array<vec4<f32>>;",
-            "var<storage> norm_w: array<f32>;\nvar<storage> matrix_b: array<vec4<f32>>;",
-        )
-    } else if src.contains("var<storage> matrix_b: array<vec4<f16>>;") {
-        substitute(
-            &src,
-            "var<storage> matrix_b: array<vec4<f16>>;",
-            "var<storage> norm_w: array<f32>;\nvar<storage> matrix_b: array<vec4<f16>>;",
-        )
-    } else {
-        substitute(
-            &src,
-            "var<storage> matrix_b: array<u32>;",
-            "var<storage> norm_w: array<f32>;\nvar<storage> matrix_b: array<u32>;",
-        )
-    };
-    let src = substitute(
-        &src,
-        "var<workgroup> reduce_buf:",
-        "var<workgroup> scale_buf: array<f32, LANES>;\n\
-         var<workgroup> inv_rms: f32;\nvar<workgroup> reduce_buf:",
-    );
-    // The early-out must not precede the prologue's barriers, which every
-    // lane has to reach. The dispatch is exactly N/4 workgroups, so it
-    // never fires in practice, but keep it uniform regardless.
-    let src = if transposed {
-        let src = substitute(&src, "    if col >= params.n { return; }\n", "");
-        substitute(
-            &src,
-            "    var acc = 0.0;",
-            "    let k = params.k;\n    // Each thread accumulates a partial sum over its K-stride slice.\n    var acc = 0.0;",
-        )
-    } else {
-        substitute(
-            &src,
-            "    if col4 >= n_v4 { return; }\n    let k = params.k;\n",
-            "    let k = params.k;\n",
-        )
-    };
-    let src = substitute(
-        &src,
-        "    // Each thread accumulates a partial sum over its K-stride slice.",
-        "    // Prologue: sum of squares over A, reduced across the workgroup.\n\
-    var ss = 0.0;\n\
-    var si = lane;\n\
-    loop {\n\
-        if si >= k { break; }\n\
-        let v = matrix_a[si];\n\
-        ss += v * v;\n\
-        si += LANES;\n\
-    }\n\
-    scale_buf[lane] = ss;\n\
-    workgroupBarrier();\n\
-    var sstride = LANES / 2u;\n\
-    loop {\n\
-        if sstride == 0u { break; }\n\
-        if lane < sstride { scale_buf[lane] += scale_buf[lane + sstride]; }\n\
-        workgroupBarrier();\n\
-        sstride >>= 1u;\n\
-    }\n\
-    if lane == 0u {\n\
-        inv_rms = inverseSqrt(scale_buf[0] / f32(k) + bitcast<f32>(params.eps_bits));\n\
-    }\n\
-    workgroupBarrier();\n\
-    let rs = inv_rms;\n\
-    if col4 >= n_v4 { return; }\n\
-\n\
-    // Each thread accumulates a partial sum over its K-stride slice.",
-    );
-    if transposed {
-        let src = substitute(
-            &src,
-            "if col4 >= n_v4 { return; }",
-            "if col >= params.n { return; }",
-        );
-        let src = substitute(
-            &src,
-            "let v = matrix_a[si];",
-            "let v = matrix_a[si / 4u][si % 4u];",
-        );
-        substitute(
-            &src,
-            "        let a = matrix_a[kk_v4];",
-            "        let at = kk_v4 * 4u;\n        let a = matrix_a[kk_v4] * rs * vec4<f32>(norm_w[at], norm_w[at+1u], norm_w[at+2u], norm_w[at+3u]);",
-        )
-    } else {
-        substitute(
-            &src,
-            "        let a = matrix_a[kk];",
-            "        let a = matrix_a[kk] * rs * norm_w[kk];",
-        )
-    }
-}
-
-pub fn generate_module_gemv_rmsnorm(
-    group: ShaderGroup,
-    shape: GemvShape,
-    format: WeightFormat,
-) -> ShaderModule {
-    ShaderModule::new(&gemv_shape_source(
-        &gemv_row_source(
-            &gemv_rmsnorm_source(group, format),
-            shape.for_group(group).bt_rows,
-        ),
-        shape,
-    ))
-}
-
-const LANES_PREFIX: &str = "const LANES: u32 = ";
-
-/// Share A loads and the norm prologue across contiguous B rows. Vector
-/// accumulators reuse the same tree/subgroup reduction as single-row GEMV.
-fn gemv_row_source(source: &str, rows: u32) -> String {
-    if rows == 1 {
-        return source.to_owned();
-    }
-    assert!(matches!(rows, 2 | 4));
-    let source = substitute(
-        source,
-        "let col = wgid.x + grid.x * wgid.y;",
-        &format!("let col = (wgid.x + grid.x * wgid.y) * {rows}u;"),
-    );
-    let source = substitute(
-        &source,
-        "reduce_buf: array<f32, LANES>",
-        &format!("reduce_buf: array<vec{rows}<f32>, LANES>"),
-    );
-    let mut source = substitute(
-        &source,
-        "var acc = 0.0;",
-        &format!("var acc = vec{rows}<f32>(0.0);"),
-    );
-    let start = source.find("        let b = ").expect("GEMV weight load");
-    let end = start
-        + source[start..]
-            .find("        kk_v4 +=")
-            .expect("GEMV K stride");
-    let load_end = start + source[start..].find(';').unwrap();
-    let load = source[start + "        let b = ".len()..load_end].to_owned();
-    let mut body = String::new();
-    for (row, component) in ["x", "y", "z", "w"].iter().take(rows as usize).enumerate() {
-        let value = substitute(
-            &load,
-            "row_off + kk_v4",
-            &format!("row_off + {row}u * k_v4 + kk_v4"),
-        );
-        body.push_str(&format!(
-            "        if col + {row}u < params.n {{ acc.{component} += dot(a, {value}); }}\n"
-        ));
-    }
-    source.replace_range(start..end, &body);
-    let start = source
-        .find("        matrix_c[col] = ")
-        .expect("GEMV output store");
-    let end = start + source[start..].find(';').unwrap() + 1;
-    let addend = source[start..end].contains("src[col]");
-    let mut body = "        let total = reduce_buf[0] + reduce_buf[1];\n".to_owned();
-    for (row, component) in ["x", "y", "z", "w"].iter().take(rows as usize).enumerate() {
-        let residual = if addend {
-            format!(" + src[col + {row}u]")
-        } else {
-            String::new()
-        };
-        body.push_str(&format!("        if col + {row}u < params.n {{ matrix_c[col + {row}u] = total.{component}{residual}; }}\n"));
-    }
-    source.replace_range(start..end, &body);
-    source
-}
-
-/// The width a GEMV source is written against, from its `LANES` constant.
-///
-/// Every kernel in the family declares that constant once and derives its
-/// workgroup size, its `reduce_buf` extent and every loop stride from it, so
-/// rewriting the declaration rewrites all of them at once. That matters more
-/// than it looks: the strides are not spelled the same way across the family
-/// — elements here, vec4s in the transposed form, whole blocks in the
-/// int-dot one — and rewriting them one variable name at a time left the
-/// transposed kernel counting overlapping ranges at every width but its
-/// declared one.
-fn gemv_declared_threads(source: &str) -> u32 {
-    let start = source.find(LANES_PREFIX).expect("GEMV LANES constant") + LANES_PREFIX.len();
-    let end = start + source[start..].find('u').expect("GEMV LANES literal");
-    source[start..end]
-        .trim()
-        .parse()
-        .expect("GEMV LANES is a literal")
-}
-
-/// Rewrite a GEMV source to the requested workgroup width and reduction.
-///
-/// The sources are written for readability at their declared width with a
-/// spelled-out halving tree; both are regenerated here. Everything outside
-/// the reduction — the K-stride loop, the store expression, any fused add or
-/// decoder — is untouched, so this composes with the format-specific
-/// substitutions rather than duplicating them.
-fn gemv_shape_source(source: &str, shape: GemvShape) -> String {
-    // Every generated GEMV passes through here, whether its shape came from
-    // the caller's configuration or from measurement, so this is the one
-    // place a width that no source can be built at has to be refused.
+/// Apply width and reduction slots shared by floating-point and integer-dot GEMV.
+fn specialize_gemv(source: &str, shape: GemvShape) -> String {
     shape.validate();
-    let initial = gemv_declared_threads(source);
-    let threads = shape.threads;
-    let declaration = format!("{LANES_PREFIX}{initial}u;");
-    assert_eq!(
-        source.matches(declaration.as_str()).count(),
-        1,
-        "a GEMV source must declare LANES exactly once"
-    );
-    let mut source = source.replace(&declaration, &format!("{LANES_PREFIX}{threads}u;"));
-
-    let start = source
-        .find("    reduce_buf[lane] = acc;")
-        .expect("GEMV reduction");
-    let end = start
-        + source[start..]
-            .find("    if lane == 0u")
-            .expect("GEMV store");
-    let reduction = match shape.reduction {
+    let (reduction, subgroup_args, total) = match shape.reduction {
         GemvReduction::Tree => {
-            let mut body = "    reduce_buf[lane] = acc;\n    workgroupBarrier();\n".to_owned();
-            let mut stride = threads / 2;
+            let mut body = template_section(GEMV_TEMPLATE, "tree_start").to_owned();
+            let mut stride = shape.threads / 2;
             while stride > 1 {
-                body.push_str(&format!(
-                    "    if lane < {stride}u {{ reduce_buf[lane] += reduce_buf[lane + {stride}u]; }}\n    workgroupBarrier();\n"
+                body.push_str(&preprocess(
+                    template_section(GEMV_TEMPLATE, "tree_step"),
+                    &[("$STRIDE", &stride.to_string())],
                 ));
                 stride /= 2;
             }
-            body
+            (body, "", "reduce_buf[0] + reduce_buf[1]")
         }
-        // Use actual subgroup IDs, never lane/width. Elect a participating
-        // leader even for a partially populated subgroup. The subgroup count
-        // is workgroup-uniform, so the conditional barrier is convergent.
-        GemvReduction::Subgroup => "    var group_total = subgroupAdd(acc);\n\
-             \x20   if wave_count > 1u {\n\
-             \x20       if sg_id == subgroupBroadcastFirst(sg_id) {\n\
-             \x20           reduce_buf[wave_id] = group_total;\n\
-             \x20       }\n\
-             \x20       workgroupBarrier();\n\
-             \x20       if lane == 0u {\n\
-             \x20           group_total = reduce_buf[0];\n\
-             \x20           for (var g = 1u; g < wave_count; g += 1u) {\n\
-             \x20               group_total += reduce_buf[g];\n\
-             \x20           }\n\
-             \x20       }\n\
-             \x20   }\n"
-            .to_owned(),
+        GemvReduction::Subgroup => (
+            template_section(GEMV_TEMPLATE, "subgroup_reduce").to_owned(),
+            ", @builtin(subgroup_invocation_id) sg_id: u32, @builtin(subgroup_id) wave_id: u32, @builtin(num_subgroups) wave_count: u32",
+            "group_total",
+        ),
     };
-    source.replace_range(start..end, &reduction);
-
-    if shape.reduction == GemvReduction::Subgroup {
-        // Lane 0 already holds the whole workgroup's sum, so the store must
-        // not fold in a second slot. The store expression is otherwise left
-        // alone, which is what keeps the fused-add and transposed-B forms
-        // working without their own reduction code.
-        let folded = source.replace("reduce_buf[0] + reduce_buf[1]", "group_total");
-        assert_ne!(folded, source, "GEMV store did not fold two reduce slots");
-        source = folded;
-        let signature = "@builtin(local_invocation_id) lid: vec3<u32>)";
-        let with_builtins = source.replace(
-            signature,
-            "@builtin(local_invocation_id) lid: vec3<u32>, \
-             @builtin(subgroup_invocation_id) sg_id: u32, \
-             @builtin(subgroup_id) wave_id: u32, \
-             @builtin(num_subgroups) wave_count: u32)",
-        );
-        assert_ne!(with_builtins, source, "GEMV entry point signature changed");
-        source = with_builtins;
-    }
-    source
+    preprocess(
+        source,
+        &[
+            ("$REDUCTION", &reduction),
+            ("$SUBGROUP_ARGS", subgroup_args),
+            ("$TOTAL", total),
+            ("$LANES", &shape.threads.to_string()),
+        ],
+    )
 }
 
-/// Q4 variant of the K-split GEMV, derived from the canonical shader by
-/// substitution like the f16 one, so tile shape and reduction changes
-/// reach it automatically.
-///
-/// `matrix_b` becomes a raw `array<u32>` of packed blocks and the vec4
-/// load becomes four `dequant_q4` calls, one per output column in the
-/// vec4. Block metadata is indexed by absolute (k, n), which the K-split
-/// loop already has, so no re-blocking is needed.
-///
-/// Applies to `matmul_gemv.wgsl` and `matmul_gemv_add.wgsl`, which share
-/// the declaration and the load line. `matmul_gemv_bt.wgsl` is not
-/// covered: it reads B as [N, K], and the Q4 block layout runs along K
-/// per column of a [K, N] weight, so it needs its own index mapping.
-/// The WGSL helper block and scalar entry point for a packed B format,
-/// or `None` for formats the GEMV reads directly.
+/// Helpers and scalar load function for a block-packed B format.
 fn packed_decoder(mode: WeightFormat) -> Option<(String, &'static str)> {
     // Q4_K and Q5_K share the `get_scale_min_k4` block, so it is prepended
     // rather than duplicated in each decoder.
@@ -2096,59 +1853,214 @@ fn packed_decoder(mode: WeightFormat) -> Option<(String, &'static str)> {
     }
 }
 
-/// Re-point a K-split GEMV at a block-packed B buffer.
-///
-/// The GEMV reads B as `vec4<f32>` rows; `helpers` supplies the WGSL dequant
-/// functions and `call` names the scalar entry point, so the four columns of
-/// each vec4 are decoded individually instead of loaded.
-/// The WGSL for one GEMV group and weight format, at its declared width.
-///
-/// Shaping is deliberately not done here: [`gemv_shape_source`] applies it
-/// once, afterwards, so a width or reduction choice reaches the f16 and
-/// block-packed forms without each substitution having to know about it.
-fn gemv_source(group: ShaderGroup, mode: WeightFormat) -> String {
-    let base = match group {
-        ShaderGroup::MatMulGemv => include_str!("shaders/matmul_gemv.wgsl"),
-        ShaderGroup::MatMulGemvAdd => include_str!("shaders/matmul_gemv_add.wgsl"),
-        ShaderGroup::MatMulGemvBT | ShaderGroup::MatMulGemvBTAdd => {
-            include_str!("shaders/matmul_gemv_bt.wgsl")
-        }
+pub fn generate_module_gemv_rmsnorm(
+    group: ShaderGroup,
+    shape: GemvShape,
+    format: WeightFormat,
+) -> ShaderModule {
+    assert!(matches!(
+        group,
+        ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvBT
+    ));
+    generate_gemv(group, format, shape, true)
+}
+
+pub(crate) fn generate_module_gemv(
+    group: ShaderGroup,
+    format: WeightFormat,
+    shape: GemvShape,
+) -> ShaderModule {
+    generate_gemv(group, format, shape, false)
+}
+
+fn generate_gemv(
+    group: ShaderGroup,
+    format: WeightFormat,
+    shape: GemvShape,
+    norm: bool,
+) -> ShaderModule {
+    let (transposed, add) = match group {
+        ShaderGroup::MatMulGemv => (false, false),
+        ShaderGroup::MatMulGemvAdd => (false, true),
+        ShaderGroup::MatMulGemvBT => (true, false),
+        ShaderGroup::MatMulGemvBTAdd => (true, true),
         _ => panic!("{group:?} is not a GEMV group"),
     };
-    let source = match (group, mode) {
-        (_, WeightFormat::F32) => base.to_owned(),
-        (ShaderGroup::MatMulGemvBT | ShaderGroup::MatMulGemvBTAdd, WeightFormat::F16) => {
-            gemv_bt_f16_source(base)
-        }
-        (_, WeightFormat::F16) => gemv_f16_source(base),
-        // Blocks run along the parameter's first dimension, which is N for a
-        // transposed B, while every packed decoder indexes along K. The
-        // kernel would return plausible but wrong numbers, so refuse.
-        (ShaderGroup::MatMulGemvBT | ShaderGroup::MatMulGemvBTAdd, _) => panic!(
-            "no {mode:?} variant for {group:?}; block-quantized weights run \
-             their blocks along K and cannot serve a transposed B"
-        ),
-        _ => {
-            let (helpers, call) = packed_decoder(mode).unwrap_or_else(|| {
-                panic!("no {mode:?} decoder for {group:?}");
-            });
-            gemv_packed_source(base, helpers.as_str(), call)
+    assert!(
+        !transposed || !format.is_quantized(),
+        "no {format:?} variant for {group:?}; block-quantized weights cannot serve a transposed B"
+    );
+    let shape = shape.for_group(group);
+    let rows = shape.bt_rows;
+    let fragment = |name| template_section(GEMV_TEMPLATE, name);
+    let b_storage = match format {
+        WeightFormat::F32 => "array<vec4<f32>>",
+        WeightFormat::F16 => "array<vec4<f16>>",
+        _ => "array<u32>",
+    };
+    let load = |index: &str| {
+        if format == WeightFormat::F16 {
+            format!("vec4<f32>(matrix_b[{index}])")
+        } else {
+            format!("matrix_b[{index}]")
         }
     };
-    if group == ShaderGroup::MatMulGemvBTAdd {
-        let source = substitute(
-            &source,
-            "var<uniform> params:",
-            "var<storage> src: array<f32>;\nvar<uniform> params:",
-        );
-        substitute(
-            &source,
-            "matrix_c[col] = reduce_buf[0] + reduce_buf[1];",
-            "matrix_c[col] = reduce_buf[0] + reduce_buf[1] + src[col];",
+    let addend = |index: &str| {
+        if add {
+            format!(" + src[{index}]")
+        } else {
+            String::new()
+        }
+    };
+    let (helpers, weight_load) = match packed_decoder(format) {
+        Some((helpers, call)) => (
+            format!("{F16_DECODE_FN}{helpers}"),
+            preprocess(fragment("packed_load"), &[("$DEQUANT", call)]),
+        ),
+        None => (
+            String::new(),
+            preprocess(
+                fragment("weight_load"),
+                &[("$B_VALUE", &load("kk * n_v4 + col4"))],
+            ),
+        ),
+    };
+    let (accumulate, store) = if rows == 1 {
+        (
+            preprocess(
+                fragment("bt_accumulate"),
+                &[("$B_VALUE", &load("row_off + kk_v4"))],
+            ),
+            preprocess(fragment("bt_store"), &[("$ADDEND", &addend("col"))]),
         )
     } else {
-        source
-    }
+        let mut accumulate = String::new();
+        let mut store = fragment("bt_total").to_owned();
+        for (row, component) in ["x", "y", "z", "w"].iter().take(rows as usize).enumerate() {
+            let index = format!("col + {row}u");
+            let vars = [
+                ("$ROW", row.to_string()),
+                ("$COMPONENT", component.to_string()),
+                (
+                    "$B_VALUE",
+                    load(&format!("row_off + {row}u * k_v4 + kk_v4")),
+                ),
+                ("$ADDEND", addend(&index)),
+            ];
+            let vars: Vec<_> = vars
+                .iter()
+                .map(|&(key, ref value)| (key, value.as_str()))
+                .collect();
+            accumulate.push_str(&preprocess(fragment("bt_row_accumulate"), &vars));
+            store.push_str(&preprocess(fragment("bt_row_store"), &vars));
+        }
+        (accumulate, store)
+    };
+    let norm_prologue = if norm {
+        let prologue = preprocess(
+            include_str!("shaders/matmul_gemv_norm_prologue.wgsl"),
+            &[(
+                "$NORM_VALUE",
+                if transposed {
+                    "matrix_a[si / 4u][si % 4u]"
+                } else {
+                    "matrix_a[si]"
+                },
+            )],
+        );
+        format!(
+            "{prologue}{}",
+            fragment(if transposed {
+                "bt_norm_end"
+            } else {
+                "norm_end"
+            })
+        )
+    } else {
+        String::new()
+    };
+    let acc_type = if rows == 1 {
+        "f32".to_owned()
+    } else {
+        format!("vec{rows}<f32>")
+    };
+    let source = preprocess(
+        fragment(if transposed { "transposed" } else { "forward" }),
+        &[
+            ("$ACCUMULATE", &accumulate),
+            ("$STORE", &store),
+            ("$WEIGHT_LOAD", &weight_load),
+            ("$WEIGHT_HELPERS", &helpers),
+            (
+                "$ENABLE_F16",
+                if format == WeightFormat::F16 {
+                    "enable f16;"
+                } else {
+                    ""
+                },
+            ),
+            ("$EPS_FIELD", if norm { "eps_bits" } else { "_pad" }),
+            (
+                "$NORM_WEIGHT",
+                if norm { fragment("norm_weight") } else { "" },
+            ),
+            (
+                "$NORM_SCRATCH",
+                if norm { fragment("norm_scratch") } else { "" },
+            ),
+            (
+                "$NORM_K",
+                if norm && transposed {
+                    fragment("norm_k")
+                } else {
+                    ""
+                },
+            ),
+            ("$NORM_PROLOGUE", &norm_prologue),
+            (
+                "$EARLY_RETURN",
+                if norm {
+                    ""
+                } else if transposed {
+                    fragment("bt_guard")
+                } else {
+                    fragment("guard")
+                },
+            ),
+            ("$A_LOAD", fragment(if norm { "bt_norm_a" } else { "bt_a" })),
+            ("$A_SCALE", if norm { " * rs * norm_w[kk]" } else { "" }),
+            ("$B_STORAGE", b_storage),
+            (
+                "$ADDEND_DECL",
+                if !add {
+                    ""
+                } else if transposed {
+                    fragment("bt_addend")
+                } else {
+                    fragment("addend")
+                },
+            ),
+            ("$ADDEND", &addend("col4")),
+            (
+                "$COL_EXPR",
+                &if rows == 1 {
+                    "wgid.x + grid.x * wgid.y".to_owned()
+                } else {
+                    format!("(wgid.x + grid.x * wgid.y) * {rows}u")
+                },
+            ),
+            ("$ACC_TYPE", &acc_type),
+            (
+                "$ACC_ZERO",
+                &if rows == 1 {
+                    "0.0".to_owned()
+                } else {
+                    format!("{acc_type}(0.0)")
+                },
+            ),
+        ],
+    );
+    ShaderModule::new(&specialize_gemv(&source, shape))
 }
 
 /// The Q8_1-activation, integer-dot GEMV at an explicit shape.
@@ -2213,7 +2125,7 @@ pub(crate) fn generate_module_gemv_int_dot(
         (
             include_str!("shaders/matmul_gemv_int_dot_norm_decl.wgsl"),
             include_str!("shaders/matmul_gemv_int_dot_norm_a.wgsl"),
-            include_str!("shaders/matmul_gemv_int_dot_norm_prologue.wgsl"),
+            include_str!("shaders/matmul_gemv_norm_prologue.wgsl"),
         )
     } else {
         ("", include_str!("shaders/matmul_gemv_int_dot_a.wgsl"), "")
@@ -2225,83 +2137,14 @@ pub(crate) fn generate_module_gemv_int_dot(
             ("$A_FN_DECL", a_fn),
             ("$NORM_DECL", norm_decl),
             ("$NORM_PROLOGUE", norm_prologue),
+            ("$NORM_VALUE", "matrix_a[si]"),
             ("$ADDEND_DECL", addend_decl),
             ("$ADDEND", addend),
             ("$WEIGHT_HELPERS", weight_helpers.as_str()),
             ("$BLOCK_DOT", block_dot),
         ],
     );
-    ShaderModule::new(&gemv_shape_source(&source, shape))
-}
-
-/// Generate one GEMV pipeline at an explicit shape.
-///
-/// `generate_module` and `generate_module_weighted` call this with
-/// [`GemvShape::initial`]; the tuner calls it with whichever shape it is
-/// measuring.
-pub(crate) fn generate_module_gemv(
-    group: ShaderGroup,
-    mode: WeightFormat,
-    shape: GemvShape,
-) -> ShaderModule {
-    ShaderModule::new(&gemv_shape_source(
-        &gemv_row_source(&gemv_source(group, mode), shape.for_group(group).bt_rows),
-        shape,
-    ))
-}
-
-fn gemv_packed_source(src: &str, helpers: &str, call: &str) -> String {
-    src.replace(
-        "var<storage> matrix_b: array<vec4<f32>>;",
-        "var<storage> matrix_b: array<u32>;",
-    )
-    .replace(
-        "@compute @workgroup_size(",
-        &format!("{F16_DECODE_FN}{helpers}\n@compute @workgroup_size("),
-    )
-    .replace(
-        "let b = matrix_b[kk * n_v4 + col4];",
-        &format!(
-            "let col = col4 * 4u;\n\
-        let b = vec4<f32>(\n\
-            {call}(kk, col),\n\
-            {call}(kk, col + 1u),\n\
-            {call}(kk, col + 2u),\n\
-            {call}(kk, col + 3u),\n\
-        );"
-        ),
-    )
-}
-
-fn gemv_f16_source(src: &str) -> String {
-    // `enable` directives must precede every declaration, so prepend rather
-    // than splice at the matrix_b declaration - spliced there it landed
-    // after matrix_a and the shader could never compile.
-    "enable f16;\n".to_string()
-        + &src
-            .replace(
-                "var<storage> matrix_b: array<vec4<f32>>;",
-                "var<storage> matrix_b: array<vec4<f16>>;",
-            )
-            .replace(
-                "let b = matrix_b[kk * n_v4 + col4];",
-                "let b = vec4<f32>(matrix_b[kk * n_v4 + col4]);",
-            )
-}
-
-fn gemv_bt_f16_source(src: &str) -> String {
-    "enable f16;\n".to_string()
-        + &src
-            .replace(
-                "var<storage> matrix_b: array<vec4<f32>>;",
-                "var<storage> matrix_b: array<vec4<f16>>;",
-            )
-            // The shader reads `matrix_b[row_off + kk_v4]`; convert at the load
-            // so the f32 accumulation below is unchanged.
-            .replace(
-                "let b = matrix_b[row_off + kk_v4];",
-                "let b = vec4<f32>(matrix_b[row_off + kk_v4]);",
-            )
+    ShaderModule::new(&specialize_gemv(&source, shape))
 }
 
 fn gen_matmul_coop_wgsl(
@@ -2309,7 +2152,7 @@ fn gen_matmul_coop_wgsl(
     variant: MatMulCoopVariant,
     config: &CoopConfig,
 ) -> ShaderModule {
-    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, None)
+    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, None, 1)
 }
 
 /// Generate coop matmul with an optional [`crate::compile::MatMulPrologue`].
@@ -2319,7 +2162,7 @@ pub fn gen_matmul_coop_with_prologue(
     config: &CoopConfig,
     prologue: &crate::compile::MatMulPrologue,
 ) -> ShaderModule {
-    gen_matmul_coop_wgsl_full(fused_add, variant, config, Some(prologue), None)
+    gen_matmul_coop_wgsl_full(fused_add, variant, config, Some(prologue), None, 1)
 }
 
 /// Generate a cooperative matmul that stages its f32 accumulators through
@@ -2341,7 +2184,7 @@ pub fn generate_coop_matmul_with_dag_epilogue(
     );
     let (fused_add, variant) = coop_shape(group)
         .unwrap_or_else(|| panic!("cooperative epilogue not supported for {group:?}"));
-    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, Some(epilogue))
+    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, Some(epilogue), 1)
 }
 
 fn gen_matmul_coop_wgsl_full(
@@ -2350,6 +2193,7 @@ fn gen_matmul_coop_wgsl_full(
     config: &CoopConfig,
     prologue: Option<&crate::compile::MatMulPrologue>,
     epilogue: Option<&crate::compile::MatMulEpilogue>,
+    copies: u32,
 ) -> ShaderModule {
     let tile = config.tile_size;
     let output_tile = config.output_tile();
@@ -2482,7 +2326,7 @@ fn gen_matmul_coop_wgsl_full(
                \n            let cc4 = {col} + v4_col;\
                \n            let flat = v4_row * {t}u + v4_col;\
                \n            if tr < k && (cc4 + 4u) <= n && (n & 3u) == 0u {{\
-               \n                let v = matrix_b[(tr * n + cc4) >> 2u];\
+               \n                let v = $B_BUFFER[(tr * n + cc4) >> 2u];\
                \n                {st_x}\
                \n                {st_y}\
                \n                {st_z}\
@@ -2496,10 +2340,10 @@ fn gen_matmul_coop_wgsl_full(
                \n                let a1 = tr * n + cc4 + 1u;\
                \n                let a2 = tr * n + cc4 + 2u;\
                \n                let a3 = tr * n + cc4 + 3u;\
-               \n                let v0 = matrix_b[a0 >> 2u][a0 & 3u];\
-               \n                let v1 = matrix_b[a1 >> 2u][a1 & 3u];\
-               \n                let v2 = matrix_b[a2 >> 2u][a2 & 3u];\
-               \n                let v3 = matrix_b[a3 >> 2u][a3 & 3u];\
+               \n                let v0 = $B_BUFFER[a0 >> 2u][a0 & 3u];\
+               \n                let v1 = $B_BUFFER[a1 >> 2u][a1 & 3u];\
+               \n                let v2 = $B_BUFFER[a2 >> 2u][a2 & 3u];\
+               \n                let v3 = $B_BUFFER[a3 >> 2u][a3 & 3u];\
                \n                {st_m0}\
                \n                {st_m1}\
                \n                {st_m2}\
@@ -2527,7 +2371,7 @@ fn gen_matmul_coop_wgsl_full(
         // shared rows). shared[row * tile + col] where row = K-offset,
         // col = N-offset.
         //
-        // The fast vec4 load `matrix_b[(cc * k + tr4) >> 2u]` packs the
+        // The fast vec4 load `$B_BUFFER[(cc * k + tr4) >> 2u]` packs the
         // 4 lanes as four consecutive K-elements for the same N-row. That
         // packing is only correct when `k % 4 == 0` (else the lanes pull
         // from the next N-row and the kernel misinterprets memory) *and*
@@ -2558,7 +2402,7 @@ fn gen_matmul_coop_wgsl_full(
                \n            let cc = {col} + v4_row;\
                \n            let tr4 = t + v4_col;\
                \n            if cc < n && (tr4 + 4u) <= k && (k & 3u) == 0u {{\
-               \n                let v = matrix_b[(cc * k + tr4) >> 2u];\
+               \n                let v = $B_BUFFER[(cc * k + tr4) >> 2u];\
                \n                {st_x}\
                \n                {st_y}\
                \n                {st_z}\
@@ -2572,10 +2416,10 @@ fn gen_matmul_coop_wgsl_full(
                \n                let a1 = cc * k + tr4 + 1u;\
                \n                let a2 = cc * k + tr4 + 2u;\
                \n                let a3 = cc * k + tr4 + 3u;\
-               \n                let v0 = matrix_b[a0 >> 2u][a0 & 3u];\
-               \n                let v1 = matrix_b[a1 >> 2u][a1 & 3u];\
-               \n                let v2 = matrix_b[a2 >> 2u][a2 & 3u];\
-               \n                let v3 = matrix_b[a3 >> 2u][a3 & 3u];\
+               \n                let v0 = $B_BUFFER[a0 >> 2u][a0 & 3u];\
+               \n                let v1 = $B_BUFFER[a1 >> 2u][a1 & 3u];\
+               \n                let v2 = $B_BUFFER[a2 >> 2u][a2 & 3u];\
+               \n                let v3 = $B_BUFFER[a3 >> 2u][a3 & 3u];\
                \n                {st_m0}\
                \n                {st_m1}\
                \n                {st_m2}\
@@ -2601,7 +2445,7 @@ fn gen_matmul_coop_wgsl_full(
             MatMulCoopVariant::BT => ("cc * k + tr", "cc1 * k + tr"),
         };
         let gen_scalar_b = |shared: &str, in_col: &str, b_index: &str| -> String {
-            let st = store(shared, "flat", &format!("matrix_b[{b_index}]"));
+            let st = store(shared, "flat", &format!("$B_BUFFER[{b_index}]"));
             let stz = store(shared, "flat", "0.0");
             format!(
                 "{{\
@@ -2850,7 +2694,7 @@ fn gen_matmul_coop_wgsl_full(
                  \x20               let idx = row * n + col;\n\
                  \x20               var val = shared_c[local_idx];\n\
                  \x20               {epilogue_body}\n\
-                 \x20               matrix_c[idx] = val;\n\
+                 \x20               $C_BUFFER[idx] = val;\n\
                  \x20           }}\n\
                  \x20       }}\n\
                  \x20   }}",
@@ -2862,15 +2706,15 @@ fn gen_matmul_coop_wgsl_full(
         (
             String::new(),
             "if sg == 0u {\n\
-             \x20   coopStoreT(acc00, &matrix_c[c00], n);\n\
+             \x20   coopStoreT(acc00, &$C_BUFFER[c00], n);\n\
              \x20   if n1_valid {\n\
-             \x20       coopStoreT(acc01, &matrix_c[c01], n);\n\
+             \x20       coopStoreT(acc01, &$C_BUFFER[c01], n);\n\
              \x20   }\n\
              \x20   if m1_valid {\n\
-             \x20       coopStoreT(acc10, &matrix_c[c10], n);\n\
+             \x20       coopStoreT(acc10, &$C_BUFFER[c10], n);\n\
              \x20   }\n\
              \x20   if n1_valid && m1_valid {\n\
-             \x20       coopStoreT(acc11, &matrix_c[c11], n);\n\
+             \x20       coopStoreT(acc11, &$C_BUFFER[c11], n);\n\
              \x20   }\n\
              \x20   }"
                 .to_string(),
@@ -2919,7 +2763,6 @@ fn gen_matmul_coop_wgsl_full(
             ("$COOP_AB", &coop_ab),
             ("$COOP_BA", &coop_ba),
             ("$A_STORAGE", a_storage),
-            ("$B_STORAGE", b_storage),
             ("$STAGING_VARS", &staging_vars),
             ("$B_STAGE_0", &b_stage_0),
             ("$B_STAGE_1", &b_stage_1),
@@ -2938,7 +2781,7 @@ fn gen_matmul_coop_wgsl_full(
         ],
     );
 
-    ShaderModule::new(&src)
+    matmul_module(&src, b_storage, true, copies)
 }
 
 /// Variant selector for gen_matmul_coop_inner.
@@ -2952,277 +2795,7 @@ pub enum MatMulCoopVariant {
     AT,
 }
 
-// ---------------------------------------------------------------------------
-// reduce.wgsl: sum_all, mean_all
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Unified attention: BKV=8 tiled, runtime causal detection, parameterized head_dim.
-// Replaces gen_causal_attention, gen_full_attention, gen_cross_attention, and
-// the schedule-template `lower_attention` for MultiHeadAttn.
-//
-// Param layout matches MultiHeadAttnData (AttentionParams):
-//   params = [q_seq, kv_seq, packed_heads, head_dim, window_size, ...]
-//   kv_seq == 0 → causal (kv_len = pos + 1)
-//   kv_seq >  0 → non-causal (kv_len = kv_seq)
-//   window_size > 0 → sliding window (kv_start = max(0, pos+1-window))
-// ---------------------------------------------------------------------------
-
-/// The score-reduction round of `cached_block_attention.wgsl`: one value
-/// per slot in workgroup memory, visible to all threads. The tree spends a
-/// barrier per halving level. A subgroup form (one `subgroupAdd` per wave
-/// behind a leader-elected slot, as the GEMV family does) measured slower
-/// here: the wave's cross-lane adds cost more than the barriers they
-/// remove at a 64-thread workgroup.
-const ATTENTION_TREE_REDUCE: &str = "\
-    workgroupBarrier();\n\
-    if tid < 32u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 32u]; } }\n\
-    workgroupBarrier();\n\
-    if tid < 16u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 16u]; } }\n\
-    workgroupBarrier();\n\
-    if tid < 8u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 8u]; } }\n\
-    workgroupBarrier();\n\
-    if tid < 4u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 4u]; } }\n\
-    workgroupBarrier();\n\
-    if tid < 2u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 2u]; } }\n\
-    workgroupBarrier();\n\
-    if tid < 1u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 1u]; } }\n\
-    workgroupBarrier();";
-
-/// The cached-block attention kernel. `generate_module` routes here with
-/// the tree score reduction as the portable default.
-pub fn generate_module_block_attention() -> ShaderModule {
-    generate_cached_attention_module(ShaderGroup::CachedBlockAttention, None)
-}
-
-pub(crate) fn generate_cached_attention_module(
-    group: ShaderGroup,
-    head_dim: Option<u32>,
-) -> ShaderModule {
-    let source = match group {
-        ShaderGroup::CachedBlockAttention => include_str!("shaders/cached_block_attention.wgsl"),
-        ShaderGroup::CachedBlockAttentionSplit => {
-            include_str!("shaders/cached_block_attention_split.wgsl")
-        }
-        ShaderGroup::CachedBlockAttentionCombine => {
-            include_str!("shaders/cached_block_attention_combine.wgsl")
-        }
-        _ => unreachable!("not cached attention: {group:?}"),
-    };
-    let (dimension, values) = match head_dim {
-        Some(hd) => {
-            assert!((1..=512).contains(&hd));
-            (format!("{hd}u"), hd.div_ceil(64))
-        }
-        None => ("params.head_dim".to_string(), 8),
-    };
-    ShaderModule::new(&preprocess(
-        source,
-        &[
-            ("$SCORE_REDUCE", ATTENTION_TREE_REDUCE),
-            ("$HEAD_DIM", &dimension),
-            ("$VALUES_PER_THREAD", &format!("{values}u")),
-        ],
-    ))
-}
-
-/// Generate a BKV=8 tiled attention shader parameterized by `head_dim`.
-///
-/// The shader uses online softmax with 8-way KV tiling to reduce
-/// workgroup barriers by 8× compared to the un-tiled archetype.
-/// Runtime causal detection via `kv_seq == 0` avoids separate shaders
-/// for causal vs non-causal masks.
-pub fn generate_attention_module(head_dim: u32) -> ShaderModule {
-    use std::fmt::Write;
-    assert!(head_dim >= 1, "attention needs a nonempty head");
-
-    // One lane per dimension, padded to a power of two for the tree
-    // reductions. Lanes past the head contribute zero and store nothing.
-    let hd = head_dim.next_power_of_two().max(2);
-    let last = head_dim - 1;
-    let bkv: u32 = 8;
-    let mut src = String::new();
-
-    // Params struct (matches AttentionParams, 8 u32 = 32 bytes)
-    src.push_str(ATTENTION_PARAMS_WGSL);
-    src.push_str("var<storage> src_a: array<f32>;\n"); // Q
-    src.push_str("var<storage> src_b: array<f32>;\n"); // K
-    src.push_str("var<storage> bias: array<f32>;\n"); // V
-    src.push_str("var<storage, read_write> dst: array<f32>;\n"); // O
-    src.push_str("var<storage, read_write> lse: array<f32>;\n"); // LSE
-    src.push_str("var<uniform> params: Params;\n\n");
-
-    // Shared memory: BKV * head_dim for tiled scores, head_dim for tail
-    let _ = writeln!(src, "var<workgroup> wg_scores: array<f32, {}>;\n", bkv * hd);
-    let _ = writeln!(src, "var<workgroup> wg_dot: array<f32, {}>;\n", hd);
-
-    // tree_reduce_8: reduce BKV=8 dot products simultaneously
-    src.push_str("fn tree_reduce_8(tid: u32) {\n");
-    let mut stride = hd / 2;
-    while stride > 0 {
-        src.push_str("    workgroupBarrier();\n");
-        let _ = writeln!(src, "    if tid < {stride}u {{");
-        let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
-        let _ = writeln!(
-            src,
-            "            wg_scores[i * {hd}u + tid] += wg_scores[i * {hd}u + tid + {stride}u];"
-        );
-        src.push_str("        }\n    }\n");
-        stride /= 2;
-    }
-    src.push_str("    workgroupBarrier();\n}\n\n");
-
-    // tree_reduce: single dot product for tail
-    src.push_str("fn tree_reduce(tid: u32) {\n");
-    stride = hd / 2;
-    while stride > 0 {
-        src.push_str("    workgroupBarrier();\n");
-        let _ = writeln!(
-            src,
-            "    if tid < {stride}u {{ wg_dot[tid] += wg_dot[tid + {stride}u]; }}"
-        );
-        stride /= 2;
-    }
-    src.push_str("    workgroupBarrier();\n}\n\n");
-
-    // Main kernel
-    let _ = writeln!(src, "@compute @workgroup_size({hd})");
-    src.push_str(
-        "fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n",
-    );
-    src.push_str("    let pos = wgid.x;\n");
-    src.push_str("    let head = wgid.y;\n");
-    src.push_str("    let tid = lid.x;\n");
-    src.push_str("    let q_seq = params.q_seq;\n");
-    src.push_str("    let kv_seq = params.kv_seq;\n");
-    src.push_str("    let num_heads = params.packed_heads >> 16u;\n");
-    src.push_str("    let num_kv_heads = params.packed_heads & 0xFFFFu;\n");
-    src.push_str("    let head_dim = params.head_dim;\n");
-    src.push_str("    if pos >= q_seq || head >= num_heads { return; }\n\n");
-
-    // Runtime causal detection: kv_seq=0 means causal (kv_len = pos + 1)
-    src.push_str("    let kv_len = select(kv_seq, pos + 1u, kv_seq == 0u);\n");
-    // Sliding window: window_size>0 limits how far back we attend
-    src.push_str("    let window_size = params.window_size;\n");
-    src.push_str(
-        "    let kv_start = select(0u, kv_len - min(kv_len, window_size), window_size > 0u);\n\n",
-    );
-
-    // GQA head mapping
-    src.push_str("    let kv_head = head / (num_heads / num_kv_heads);\n");
-    src.push_str("    let kv_head_off = kv_head * head_dim;\n");
-    src.push_str("    let kv_dim = num_kv_heads * head_dim;\n");
-    src.push_str("    let scale = inverseSqrt(f32(head_dim));\n");
-    src.push_str("    let q_base = pos * (num_heads * head_dim) + head * head_dim;\n");
-    src.push_str("    let live = tid < head_dim;\n");
-    let _ = writeln!(src, "    let d = min(tid, {last}u);");
-    src.push_str("    let q_val = select(0.0, src_a[q_base + d], live);\n\n");
-
-    // Online softmax accumulators
-    src.push_str("    var my_out = 0.0;\n");
-    src.push_str("    var max_score = -1e30;\n");
-    src.push_str("    var sum_exp = 0.0;\n\n");
-
-    // --- Tiled KV loop: process BKV positions per reduction ---
-    let _ = writeln!(src, "    let kv_range = kv_len - kv_start;");
-    let _ = writeln!(
-        src,
-        "    let tile_end = kv_start + (kv_range / {bkv}u) * {bkv}u;"
-    );
-    src.push_str("    var t = kv_start;\n");
-    let _ = writeln!(src, "    for (; t < tile_end; t += {bkv}u) {{");
-    let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
-    src.push_str("            let k_base = (t + i) * kv_dim + kv_head_off;\n");
-    let _ = writeln!(
-        src,
-        "            wg_scores[i * {hd}u + tid] = select(0.0, q_val * src_b[k_base + d], live);"
-    );
-    src.push_str("        }\n");
-    src.push_str("        tree_reduce_8(tid);\n\n");
-    let _ = writeln!(src, "        for (var i = 0u; i < {bkv}u; i++) {{");
-    let _ = writeln!(src, "            let score = wg_scores[i * {hd}u] * scale;");
-    src.push_str("            let new_max = max(max_score, score);\n");
-    src.push_str("            let correction = exp(max_score - new_max);\n");
-    src.push_str("            let weight = exp(score - new_max);\n");
-    src.push_str("            sum_exp = sum_exp * correction + weight;\n");
-    src.push_str("            let v_base = (t + i) * kv_dim + kv_head_off;\n");
-    src.push_str("            my_out = my_out * correction + weight * bias[v_base + d];\n");
-    src.push_str("            max_score = new_max;\n");
-    src.push_str("        }\n");
-    // Every lane reads the reduced scores from lane zero. Do not let faster
-    // lanes overwrite wg_scores for the next tile until all lanes have
-    // consumed the current tile.
-    src.push_str("        workgroupBarrier();\n");
-    src.push_str("    }\n\n");
-
-    // --- Tail: remaining KV positions one at a time ---
-    src.push_str("    for (; t < kv_len; t++) {\n");
-    src.push_str("        let k_base = t * kv_dim + kv_head_off;\n");
-    src.push_str("        wg_dot[tid] = select(0.0, q_val * src_b[k_base + d], live);\n");
-    src.push_str("        tree_reduce(tid);\n");
-    src.push_str("        let score = wg_dot[0] * scale;\n\n");
-    src.push_str("        let new_max = max(max_score, score);\n");
-    src.push_str("        let correction = exp(max_score - new_max);\n");
-    src.push_str("        let weight = exp(score - new_max);\n");
-    src.push_str("        sum_exp = sum_exp * correction + weight;\n");
-    src.push_str("        my_out = my_out * correction + weight * bias[k_base + d];\n");
-    src.push_str("        max_score = new_max;\n");
-    // wg_dot is reused on the next iteration and its reduced element is read
-    // by every lane, so scratch reuse needs the same synchronization.
-    src.push_str("        workgroupBarrier();\n");
-    src.push_str("    }\n\n");
-
-    // Final output
-    src.push_str("    let safe_sum = select(sum_exp, 1.0, sum_exp == 0.0);\n");
-    src.push_str("    if live {\n        dst[q_base + tid] = my_out / safe_sum;\n    }\n\n");
-
-    // LSE output for backward pass
-    src.push_str("    if tid == 0u {\n");
-    src.push_str("        let idx = (pos * num_heads + head) * 2u;\n");
-    src.push_str("        lse[idx] = max_score;\n");
-    src.push_str("        lse[idx + 1u] = select(log(sum_exp), -1e30, sum_exp == 0.0);\n");
-    src.push_str("    }\n");
-    src.push_str("}\n");
-
-    let module = parse_source(&src).unwrap_or_else(|e| {
-        panic!(
-            "generated unified attention WGSL failed to parse:\n{}\n---\n{}",
-            e, src
-        )
-    });
-    ShaderModule {
-        module,
-        source: src,
-        hint: "attention",
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Flash Attention 2 forward: multiple query positions per workgroup.
-//
-// BQ = 256 / head_dim query positions per workgroup (e.g. 4 for hd=64).
-// Each group of head_dim threads handles one query position. K tiles are
-// staged in shared memory and reused across all BQ groups, reducing
-// global memory reads by BQ×.
-//
-// Falls back to generate_attention_module (BQ=1) when head_dim > 128.
-// ---------------------------------------------------------------------------
-
-/// Generate a Flash Attention 2 forward kernel with BQ>1 multi-query tiling.
-///
-/// Flash Attention 2 forward with multi-query tiling and vectorized threads.
-///
-/// Each thread handles EPT (elements per thread) head_dim elements, reducing
-/// the tree reduction depth from log2(head_dim) to log2(head_dim/EPT).
-/// This dramatically cuts workgroup barriers while increasing per-thread
-/// compute and register-based V accumulation.
-///
-/// For head_dim=64, EPT=8: TPQ=8 threads/query, BQ=32 queries/WG,
-/// tree depth=3 (vs 6), workgroups reduced 8x.
-/// Cooperative-matrix capability snapshot the compiler consults to
-/// pick between scalar and coop kernel variants. Set once by
-/// `runtime::install_auto_tune` from the Blade probe; defaults to
-/// all-zero (no coop available → scalar everywhere).
+/// Cooperative-matrix tile sizes supported by the device, filtered by precision policy.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CoopCaps {
     pub f16_tile: u32,
@@ -3281,15 +2854,6 @@ mod coop_caps_tests {
     }
 }
 
-/// How the attention kernels split one head across threads: `tpq` threads
-/// per query, each owning `ept` elements, with `tpq · ept = head_dim`.
-///
-/// `tpq` is a power of two for the tree reductions; `ept` need not be, so
-/// any width works (80 = 16 × 5, 96 = 16 × 6). For power-of-two widths this
-/// is `ept = min(head_dim, ept_cap)`; otherwise `ept` may exceed the cap.
-// Attention and convolution kernels live in `codegen/attention.rs`. The
-// generators are re-exported so every existing path —
-// `codegen::generate_flash_attention_coop_module` and so on — is unchanged.
 mod attention;
 pub use attention::*;
 
@@ -4336,16 +3900,7 @@ mod tests {
         }
     }
 
-    /// Every shape must parse, validate and keep the kernel's own store.
-    ///
-    /// The shapes are generated by substitution into one source per group, so
-    /// the risk is not that a shape is wrong in isolation but that it fails to
-    /// compose with a format's substitutions — the fused add's extra `src`
-    /// term, or a decoder call spliced where the vec4 load used to be. Each is
-    /// run through naga's validator with exactly the capabilities
-    /// its reduction justifies, so a shape that produces invalid WGSL — or one
-    /// that quietly starts needing a capability the caller does not request —
-    /// fails here rather than at pipeline creation on someone's GPU.
+    /// Shape, format and fused-add slots must compose with only the requested capabilities.
     #[test]
     fn every_gemv_shape_composes_with_every_weight_format() {
         let legacy: GemvShape =
@@ -4419,7 +3974,7 @@ mod tests {
                                 "{format:?} {group:?} {shape:?} lost its B representation"
                             );
                             assert!(
-                                source.contains(&format!("{LANES_PREFIX}{threads}u;")),
+                                source.contains(&format!("const LANES: u32 = {threads}u;")),
                                 "{format:?} {group:?} {shape:?} kept the declared width"
                             );
                             let subgroup = reduction == GemvReduction::Subgroup;
@@ -4428,14 +3983,13 @@ mod tests {
                                 subgroup,
                                 "{format:?} {group:?} {shape:?} reduction mismatch"
                             );
-                            // The tree walks the workgroup in halves; the subgroup
-                            // form must leave the total in slot 0 alone.
+                            // The tree leaves two partials; the subgroup form produces a total.
                             assert_eq!(
                                 source.contains("reduce_buf[0] + reduce_buf[1]"),
                                 !subgroup,
                                 "{format:?} {group:?} {shape:?} store expression mismatch"
                             );
-                            // The fused add's own term survives the rewrite.
+                            // The fused add is applied after the reduction.
                             if group == ShaderGroup::MatMulGemvAdd {
                                 assert!(
                                     source.contains("src[col4]"),
@@ -4456,14 +4010,7 @@ mod tests {
         }
     }
 
-    /// The int-dot GEMV takes the same shape axis as the rest of the family.
-    ///
-    /// It is a separate source rather than a substitution into
-    /// `matmul_gemv.wgsl`, so nothing guarantees the shaping markers still
-    /// line up except checking. The packed intrinsic is chosen by the
-    /// device's `shader_integer_dot_product` capability; this pins that a
-    /// module generated without the capability expands the dot product
-    /// scalar-wise, and one generated with it emits the intrinsic.
+    /// Integer-dot templates share the shape slots and select hardware or scalar dot products.
     #[test]
     fn the_int_dot_gemv_takes_every_shape() {
         for group in [ShaderGroup::MatMulGemv, ShaderGroup::MatMulGemvAdd] {
@@ -4519,7 +4066,7 @@ mod tests {
                                 assert!(
                                     module
                                         .source
-                                        .contains(&format!("{LANES_PREFIX}{threads}u;")),
+                                        .contains(&format!("const LANES: u32 = {threads}u;")),
                                     "{group:?} {format:?} {shape:?}: wrong width"
                                 );
                                 assert!(module.source.contains("blk += LANES;"));
@@ -4541,10 +4088,6 @@ mod tests {
         }
     }
 
-    /// The tree spends a barrier per halving level; the subgroup form spends
-    /// two whatever the width. That difference is the entire point of the
-    /// axis, so pin it rather than trusting the generated text to stay
-    /// correct.
     #[test]
     fn packed_gemv_rmsnorm_keeps_the_decoder() {
         for format in [

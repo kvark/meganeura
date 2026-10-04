@@ -49,7 +49,7 @@ var<storage, read_write> matrix_c: array<vec4<f32>>;
 $ADDEND_DECL
 var<uniform> params: Params;
 // Workgroup width; see `matmul_gemv.wgsl`.
-const LANES: u32 = 256u;
+const LANES: u32 = $LANESu;
 
 var<workgroup> reduce_buf: array<vec4<f32>, LANES>;
 
@@ -84,7 +84,7 @@ fn q40_nibbles(byte_base: u32, i: u32) -> u32 {
 }
 
 @compute @workgroup_size(LANES)
-fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>$SUBGROUP_ARGS) {
     let col4 = wgid.x;
     let lane = lid.x;
     let n_v4 = params.n / 4u;
@@ -142,23 +142,8 @@ $NORM_PROLOGUE
         blk += LANES;
     }
 
-    reduce_buf[lane] = acc;
-    workgroupBarrier();
-    if lane < 128u { reduce_buf[lane] += reduce_buf[lane + 128u]; }
-    workgroupBarrier();
-    if lane < 64u { reduce_buf[lane] += reduce_buf[lane + 64u]; }
-    workgroupBarrier();
-    if lane < 32u { reduce_buf[lane] += reduce_buf[lane + 32u]; }
-    workgroupBarrier();
-    if lane < 16u { reduce_buf[lane] += reduce_buf[lane + 16u]; }
-    workgroupBarrier();
-    if lane < 8u  { reduce_buf[lane] += reduce_buf[lane + 8u];  }
-    workgroupBarrier();
-    if lane < 4u  { reduce_buf[lane] += reduce_buf[lane + 4u];  }
-    workgroupBarrier();
-    if lane < 2u  { reduce_buf[lane] += reduce_buf[lane + 2u];  }
-    workgroupBarrier();
+$REDUCTION
     if lane == 0u {
-        matrix_c[col4] = reduce_buf[0] + reduce_buf[1]$ADDEND;
+        matrix_c[col4] = $TOTAL$ADDEND;
     }
 }

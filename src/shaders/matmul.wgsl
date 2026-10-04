@@ -1,3 +1,4 @@
+// @section header
 // Register-tiled matmul: C = A × B (+ D if fused_add)
 // One skeleton for every tile (BM=$BM_U, BN=$BN_U, KTILE=$K_TILE_U, workgroup
 // [16,16,1]): TM=TN=4 with 16 accumulators for the 64×64 tile, TM=TN=2
@@ -25,16 +26,15 @@ struct Params {
 }
 
 var<storage> matrix_a: array<f32>;
-var<storage> matrix_b: $B_STORAGE_TYPE;
-var<storage, read_write> matrix_c: array<f32>;
+$MATRIX_BINDINGS
 $FUSED_ADD_DECL
 var<uniform> params: Params;
 var<workgroup> shared_a: array<f32, $SHARED_A_SIZE>;
 var<workgroup> shared_b: array<f32, $SHARED_B_SIZE>;
 $B_DEQUANT_FN
 
-@compute @workgroup_size(16, 16)
-fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+// @section kernel
+$ENTRY_SIGNATURE {
     let tx = lid.x;
     let ty = lid.y;
     let tile_row = select(($TILE_ROW), wgid.y, SPLITS > 1u) * $BM_U;
