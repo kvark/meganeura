@@ -21,12 +21,6 @@ fn timing_context() -> Option<Arc<blade_graphics::Context>> {
         .clone()
 }
 
-/// The shared process context. Timing is a separate one above, because it has
-/// to be created with the timestamp pools enabled from the start.
-fn ordinary_context() -> Arc<blade_graphics::Context> {
-    crate::support::gpu::gpu()
-}
-
 /// Relative agreement, for a result whose exact `f32` bits depend on the
 /// summation order.
 fn close(a: &[f32], b: &[f32], tolerance: f32) -> bool {
@@ -92,7 +86,7 @@ fn input() -> Vec<f32> {
 }
 
 fn build_session() -> Session {
-    let mut config = SessionConfig::inference_from_env_on(ordinary_context());
+    let mut config = SessionConfig::inference_from_env_on(crate::support::gpu::gpu());
     config.runtime.gpu_timing = false;
     let (mut session, _) = meganeura::train::build(&build_chain(), config);
     seed(&mut session);
@@ -260,17 +254,8 @@ fn windowed_capture_times_every_dispatch_and_preserves_the_result() {
 
     let mut out = vec![0.0f32; ROWS * DIM];
     session.read_output_by_index(0, &mut out);
-    // Compared with a tolerance, not bit-for-bit, and the tolerance is
-    // measured rather than chosen: this chain's f32 results drift by ~2.7e-5
-    // relative between an unprofiled step and one split into replay windows,
-    // which is ordinary accumulation drift over six layers (a few hundred ULP).
-    //
-    // That is not slack for a wrong answer — it is four orders of magnitude
-    // below what a missed or repeated pass produces, which leaves whole layers
-    // at the wrong value and moves the output by O(1). Verified by injecting a
-    // 0.01 offset into the compared output and confirming the check still
-    // fails. The structural assertions above pin the window count and budget
-    // directly; this one is the backstop for the replay being complete.
+    // Replay windows change f32 reduction order; measured relative drift was
+    // 2.7e-5 on Intel, well below the error from a missing or repeated pass.
     assert!(
         close(&out, &reference, 1.0e-4),
         "windowed profiling changed the result"
@@ -310,7 +295,7 @@ fn a_plan_within_the_budget_is_captured_in_one_replay() {
 
 #[test]
 fn a_failed_capture_leaves_the_session_unprofiled() {
-    let mut config = SessionConfig::inference_from_env_on(ordinary_context());
+    let mut config = SessionConfig::inference_from_env_on(crate::support::gpu::gpu());
     config.runtime.gpu_timing = false;
     let (mut session, _) = meganeura::train::build(&build_chain(), config);
     seed(&mut session);

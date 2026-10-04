@@ -65,26 +65,11 @@ fn cache_roundtrip_preserves_plan() {
         .zip(loaded.dispatches.iter())
         .enumerate()
     {
-        assert_eq!(a.shader(), b.shader(), "dispatch[{}] shader", i);
+        assert_eq!(a.shader, b.shader, "dispatch[{}] shader", i);
         assert_eq!(a.workgroups, b.workgroups, "dispatch[{}] workgroups", i);
-        assert_eq!(
-            a.input_buffers(),
-            b.input_buffers(),
-            "dispatch[{}] inputs",
-            i
-        );
-        assert_eq!(
-            a.output_buffer(),
-            b.output_buffer(),
-            "dispatch[{}] output",
-            i
-        );
-        assert_eq!(
-            a.parameter_words(),
-            b.parameter_words(),
-            "dispatch[{}] params",
-            i
-        );
+        assert_eq!(a.input_buffers, b.input_buffers, "dispatch[{}] inputs", i);
+        assert_eq!(a.output_buffer, b.output_buffer, "dispatch[{}] output", i);
+        assert_eq!(a.params, b.params, "dispatch[{}] params", i);
     }
 
     let _ = std::fs::remove_file(&path);

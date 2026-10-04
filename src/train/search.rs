@@ -304,8 +304,8 @@ fn implementations(
     let heads: Vec<_> = seeds
         .iter()
         .flat_map(|seed| &seed.plan.dispatches)
-        .filter(|d| d.shader().is_attention())
-        .filter_map(compile::Dispatch::attention_head_dim)
+        .filter(|d| d.shader.is_attention())
+        .map(|d| d.params[3])
         .collect();
     let mut attention = vec![(0, None)];
     if !heads.is_empty() {
@@ -408,7 +408,7 @@ fn implementations(
                         && !plan
                             .dispatches
                             .iter()
-                            .any(|d| d.shader() == compile::ShaderEntry::FlashAttention))
+                            .any(|d| d.shader == compile::ShaderEntry::FlashAttention))
                 {
                     continue;
                 }
@@ -444,17 +444,19 @@ fn low_occupancy_weight_splits(
             .enumerate()
             .filter_map(|(index, dispatch)| {
                 let weight = matches!(
-                    dispatch.shader(),
+                    dispatch.shader,
                     compile::ShaderEntry::Conv2dGradWeightGemm
                         | compile::ShaderEntry::Conv2dGradWeightGemmSmall
                         | compile::ShaderEntry::Conv2dGradWeightGemm16
                 );
                 let groups = dispatch.workgroups[0].saturating_mul(dispatch.workgroups[1]);
-                let args = &dispatch.convolution()?.args;
-                let k = args
-                    .batch
-                    .saturating_mul(args.out_h)
-                    .saturating_mul(args.out_w);
+                let k = dispatch
+                    .params
+                    .first()
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_mul(dispatch.params.get(9).copied().unwrap_or(0))
+                    .saturating_mul(dispatch.params.get(10).copied().unwrap_or(0));
                 (weight
                     && (1..48).contains(&groups)
                     && matches!(dispatch.conv_k_tile(), None | Some(16))

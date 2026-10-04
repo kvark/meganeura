@@ -86,7 +86,7 @@ fn plan(g: &Graph, options: &gpu::Options) -> Vec<(ShaderEntry, bool)> {
         .plan()
         .dispatches
         .iter()
-        .map(|d| (d.shader(), d.gemv_rmsnorm().is_some()))
+        .map(|d| (d.shader.clone(), d.gemv_rmsnorm.is_some()))
         .collect()
 }
 

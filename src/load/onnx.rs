@@ -53,38 +53,16 @@ pub fn load_onnx(path: &Path) -> Result<OnnxModel, OnnxError> {
 /// Load an ONNX model from raw bytes.
 /// If `path` is provided, external data files are resolved relative to its parent directory.
 pub fn load_onnx_bytes(bytes: &[u8], path: Option<&Path>) -> Result<OnnxModel, OnnxError> {
-    // The protobuf reader is a dependency and does not bounds-check its
-    // length-delimited fields. `oxionnx-proto-0.1.2/src/parser.rs:73` tests
-    // `pos + len > buf.len()`, which overflows for a large declared length and
-    // so passes the check before slicing `buf[pos..pos + len]` out of range.
-    // Four bytes of input reach it.
-    //
-    // Containing that here is the boundary fix. Reimplementing the protobuf
-    // parser to get it right would be a large change to defend against one
-    // checked line in someone else's crate, and the panic may equally come from
-    // the shape walk or `translate_graph` below, which are ours and are not
-    // supposed to panic at all — a fence that turns any of those into an
-    // `Err` is correct for every one of them.
-    //
-    // The panic message still reaches stderr. That is deliberate: a panic from
-    // our own code below is a bug and should be loud, and it is cheaper to keep
-    // the default hook than to suppress it globally around a library call.
-    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    // oxionnx-proto can panic on overflowing lengths; contain dependency panics.
+    let (onnx_graph, onnx_weights) = std::panic::catch_unwind(|| {
         if let Some(p) = path.and_then(|p| p.parent()) {
             model::load_with_path(bytes, p)
         } else {
             model::load(bytes)
         }
-    }));
-    let (onnx_graph, onnx_weights) = match parsed {
-        Ok(Ok(ok)) => ok,
-        Ok(Err(e)) => return Err(OnnxError::ParseError(e)),
-        Err(_) => {
-            return Err(OnnxError::ParseError(
-                "malformed model: the protobuf reader rejected the input".into(),
-            ));
-        }
-    };
+    })
+    .map_err(|_| OnnxError::ParseError("malformed model: protobuf reader panicked".into()))?
+    .map_err(OnnxError::ParseError)?;
 
     // Convert oxionnx Tensor weights to Vec<f32>
     let weights: HashMap<String, Vec<f32>> = onnx_weights
@@ -240,11 +218,6 @@ fn parse_single_value_info(buf: &[u8]) -> Option<(String, Vec<usize>)> {
             },
             2 => {
                 let (len, p) = read_proto_varint(buf, pos).ok()?;
-                // The length comes from the file, so it is not a bound this
-                // function can assume; `delimited` resolves the range with
-                // checks and yields `None` for one that runs past the end.
-                // A malformed model is a parse failure, which is what this
-                // function's signature already says.
                 let (field, end) = delimited(buf, len, p)?;
                 match field_no {
                     1 => name = String::from_utf8_lossy(field).into_owned(),
@@ -419,10 +392,6 @@ fn parse_dimension(buf: &[u8]) -> usize {
                 let Ok((len, p)) = read_proto_varint(buf, pos) else {
                     break;
                 };
-                // A length that runs past the end is a truncated field, not a
-                // reason to stop with a wrong answer: the caller sees the
-                // dynamic-dimension sentinel below rather than a shape read
-                // from out-of-range bytes.
                 let Some((_, end)) = delimited(buf, len, p) else {
                     break;
                 };
@@ -461,20 +430,10 @@ fn truncated() -> OnnxError {
     OnnxError::ParseError("a field length runs past the end of the message".into())
 }
 
-/// Resolve a length-delimited field's payload range inside `buf`.
-///
-/// A protobuf length is a `u64` read from the file, so it is not a bound the
-/// parser can assume: `len as usize` truncates on a 32-bit target and `p + len`
-/// can wrap. Every site that skips or slices such a field goes through here, so
-/// a length that runs past the end of the buffer is a parse failure rather than
-/// a panic escaping an API that returns `Result`.
-///
-/// Returns the payload and the position just past it.
-fn delimited<'a>(buf: &'a [u8], len: u64, start: usize) -> Option<(&'a [u8], usize)> {
+/// Resolve a length-delimited payload and its end offset without wrapping.
+fn delimited(buf: &[u8], len: u64, start: usize) -> Option<(&[u8], usize)> {
     let len = usize::try_from(len).ok()?;
     let end = start.checked_add(len)?;
-    // `get` returns `None` rather than panicking when the range is out of
-    // bounds or inverted, which `start <= end` guarantees is only the former.
     Some((buf.get(start..end)?, end))
 }
 
@@ -1556,45 +1515,26 @@ mod tests {
 mod length_tests {
     use super::{delimited, parse_single_value_info, parse_tensor_shape_dims};
 
-    /// A length-delimited field whose declared length runs past the end of the
-    /// buffer. `delimited` exists to turn this from a panic into a `None`.
     #[test]
     fn a_length_past_the_end_is_rejected_not_sliced() {
         let buf = [0u8; 4];
-        // Declared length 1000 against a 4-byte buffer.
         assert!(delimited(&buf, 1000, 0).is_none());
-        // Length that fits, so this one resolves.
         assert_eq!(
             delimited(&buf, 4, 0).map(|(f, e)| (f.len(), e)),
             Some((4, 4))
         );
-        // A start past the end, even with a zero length.
         assert!(delimited(&buf, 0, 5).is_none());
-        // `usize::MAX` must not wrap the end back into range.
         assert!(delimited(&buf, usize::MAX as u64, 1).is_none());
     }
 
-    /// The same, through the public-ish parse path: a ValueInfo whose field 2
-    /// claims more bytes than are present.
-    ///
-    /// Field 2, wire type 2, length varint 0xFE 0x3F (127), then two bytes.
-    /// Before the bounds check this sliced `buf[2..129]` and panicked.
     #[test]
     fn a_value_info_with_an_oversized_field_does_not_panic() {
         let buf = [0x12, 0x7E, 0x02, 0x03];
         assert!(parse_single_value_info(&buf).is_none());
     }
 
-    /// A truncated tensor shape must not read out of range. This parser
-    /// returns a value directly and `break`s on malformed input, so what it
-    /// promises is "no panic, and no dimension invented from out-of-range
-    /// bytes" — an empty list rather than the single valid dimension sitting
-    /// after the truncated field.
     #[test]
     fn a_truncated_tensor_shape_does_not_panic() {
-        // Field 2, wire type 2, declared length 200 (varint 0xC8 0x01), then
-        // one byte of payload. The `0x08 0x01` that follows would decode as
-        // field 1 varint 1 if the length were trusted.
         let buf = [0x12, 0xC8, 0x01, 0x08, 0x01];
         let dims = parse_tensor_shape_dims(&buf);
         assert!(
@@ -1603,8 +1543,6 @@ mod length_tests {
         );
     }
 
-    /// Every one of a wide spread of hostile lengths must return rather than
-    /// panic. Cheap, and it pins the property the helper exists for.
     #[test]
     fn no_length_panics() {
         let buf: Vec<u8> = (0..64u8).collect();

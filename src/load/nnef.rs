@@ -194,9 +194,6 @@ fn parse_graph_nnef(text: &str) -> ParseResult {
     let body_end = full
         .rfind('}')
         .ok_or_else(|| NnefError::ParseError("no '}' found".into()))?;
-    // `find` and `rfind` are independent, so a file like `}{` puts the closing
-    // brace first and leaves `body_start > body_end`. Every slice below spans
-    // that range, so reject it here rather than let each one discover it.
     if body_end < body_start {
         return Err(NnefError::ParseError(
             "graph body closes before it opens".into(),
@@ -944,32 +941,13 @@ graph G( x ) -> ( out )
 
 #[cfg(test)]
 mod malformed_tests {
-    use super::*;
+    use super::parse_graph_nnef;
 
-    /// `parse_graph_nnef` finds the body with an independent `find('{')` and
-    /// `rfind('}')`, so a file that closes before it opens leaves the start past
-    /// the end. Every slice in the header parser spans that range, so this has
-    /// to be rejected before any of them.
-    ///
-    /// Found by `proptest`, which shrank to the two bytes below.
     #[test]
-    fn a_body_that_closes_before_it_opens_is_an_error_not_a_panic() {
+    fn graph_body_delimiters_must_be_ordered() {
         for text in ["}{", "}", "{", "version 1.0; }", "graph g() -> (o) }{"] {
-            let result = parse_graph_nnef(text);
-            assert!(
-                result.is_err(),
-                "{text:?} should not parse, got {:?}",
-                result.is_ok()
-            );
+            assert!(parse_graph_nnef(text).is_err(), "{text:?}");
         }
-    }
-
-    /// The brace ordering above is the invariant; these are the shapes that
-    /// satisfy it and must therefore reach the body parser instead of being
-    /// rejected here.
-    #[test]
-    fn an_empty_body_is_accepted_as_empty() {
-        // `{}` has body_start == body_end, so it is well-ordered.
         assert!(parse_graph_nnef("{}").is_ok());
     }
 }

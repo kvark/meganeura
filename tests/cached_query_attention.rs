@@ -25,7 +25,7 @@ fn cache_writes_alias_before_following_views_are_allocated() {
             .1;
         assert_eq!(plan.output_buffers, vec![cache]);
         assert_eq!(plan.dispatches.len(), 1);
-        assert_eq!(plan.dispatches[0].output_buffer(), cache);
+        assert_eq!(plan.dispatches[0].output_buffer, cache);
     }
 }
 

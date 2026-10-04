@@ -99,9 +99,9 @@ fn main() {
     for (ms, index, dispatch) in ranked.iter().take(30) {
         eprintln!(
             "  {ms:7.3} ms  #{index:<3} {:?} wg={:?} params={:?}",
-            dispatch.shader(),
+            dispatch.shader,
             dispatch.workgroups,
-            &dispatch.parameter_words()[..dispatch.parameter_words().len().min(12)]
+            &dispatch.params[..dispatch.params.len().min(12)]
         );
     }
     sess.dump_gpu_timings();

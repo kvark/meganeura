@@ -1,5 +1,4 @@
 use super::{BufferRef, Dispatch, ExecutionPlan, ShaderEntry};
-use crate::compile::{DispatchOp, dispatch};
 use crate::tune::{MatmulTile, TuneClass, TuneError};
 
 impl ExecutionPlan {
@@ -11,7 +10,7 @@ impl ExecutionPlan {
             let Some(class) = TuneClass::from_dispatch(dispatch, None).filter(|c| {
                 c.shader == ShaderEntry::Conv2dGradWeightGemm
                     && matches!(dispatch.conv_k_tile(), None | Some(16))
-                    && dispatch.input_buffers()[0] != dispatch.input_buffers()[1]
+                    && dispatch.input_buffers[0] != dispatch.input_buffers[1]
                     && dispatch.workgroups[0].saturating_mul(dispatch.workgroups[1])
                         < options.workgroup_threshold
             }) else {
@@ -64,8 +63,8 @@ impl ExecutionPlan {
                     )
             })
             .ok_or(TuneError("split-K requires a scalar matrix product"))?;
-        let mut bindings = dispatch.input_buffers();
-        bindings.push(dispatch.output_buffer());
+        let mut bindings = dispatch.input_buffers.clone();
+        bindings.push(dispatch.output_buffer);
         let mut unique = bindings.clone();
         unique.sort_unstable_by_key(|b| b.0);
         unique.dedup();
@@ -101,8 +100,8 @@ impl ExecutionPlan {
             u32::try_from(self.buffers.len()).map_err(|_| TuneError("too many buffers"))?,
         );
         let mut producer = dispatch.clone();
-        producer.set_kernel(super::Kernel::SplitMatmul { shape, splits });
-        producer.set_output(partial);
+        producer.kernel = super::Kernel::SplitMatmul { shape, splits };
+        producer.output_buffer = partial;
         producer.workgroups = [
             class.n.div_ceil(shape.cols()),
             class.m.div_ceil(shape.rows()),
@@ -110,21 +109,16 @@ impl ExecutionPlan {
         ];
         producer.label = format!("{} split-K {splits}", dispatch.label);
         let reduction = Dispatch {
+            shader: ShaderEntry::SumRows,
+            workgroups: [columns.div_ceil(256), 1, 1],
+            input_buffers: vec![partial],
+            output_buffer: dispatch.output_buffer,
+            params: vec![splits, columns, 1, 0],
             requires_full_precision: dispatch.requires_full_precision,
             fusion_barrier: dispatch.fusion_barrier,
             label: format!("{} split-K reduction", dispatch.label),
             origin: dispatch.origin.clone(),
-            ..Dispatch::new(
-                DispatchOp::SumRows(dispatch::SumRows {
-                    src: partial,
-                    dst: dispatch.output_buffer(),
-                    rows: splits,
-                    cols: columns,
-                    serial_rows: 1,
-                    splits: 0,
-                }),
-                [columns.div_ceil(256), 1, 1],
-            )
+            ..Default::default()
         };
         self.buffers.push(bytes);
         self.dispatches
@@ -170,9 +164,9 @@ impl ExecutionPlan {
                     "split-K requires an unmodified legal scalar weight gradient",
                 ))?;
             let bindings: Vec<_> = dispatch
-                .input_buffers()
-                .into_iter()
-                .chain(std::iter::once(dispatch.output_buffer()))
+                .input_buffers
+                .iter()
+                .chain(std::iter::once(&dispatch.output_buffer))
                 .collect();
             for (i, buffer) in bindings.iter().enumerate() {
                 if bindings[..i].contains(buffer) {
@@ -225,30 +219,25 @@ impl ExecutionPlan {
                 MatmulTile::Tile32 | MatmulTile::SpecializedConv { tile_size: 32, .. } => 32,
                 _ => 64,
             };
-            producer.set_shader(match width {
+            producer.shader = match width {
                 16 => ShaderEntry::Conv2dGradWeightGemmSplit16,
                 32 => ShaderEntry::Conv2dGradWeightGemmSplitSmall,
                 _ => ShaderEntry::Conv2dGradWeightGemmSplit,
-            });
+            };
             producer.workgroups[2] = splits;
-            producer.set_output(partial);
+            producer.output_buffer = partial;
             producer.label = format!("{} split-K partials ({splits})", dispatch.label);
             let reduction = Dispatch {
+                shader: ShaderEntry::SumRows,
+                workgroups: [columns.div_ceil(32), 1, 1],
+                input_buffers: vec![partial],
+                output_buffer: dispatch.output_buffer,
+                params: vec![splits, columns, 0, 0],
                 requires_full_precision: dispatch.requires_full_precision,
                 fusion_barrier: dispatch.fusion_barrier,
                 label: format!("{} split-K reduction", dispatch.label),
                 origin: dispatch.origin.clone(),
-                ..Dispatch::new(
-                    DispatchOp::SumRows(dispatch::SumRows {
-                        src: partial,
-                        dst: dispatch.output_buffer(),
-                        rows: splits,
-                        cols: columns,
-                        serial_rows: 0,
-                        splits: 0,
-                    }),
-                    [columns.div_ceil(32), 1, 1],
-                )
+                ..Default::default()
             };
             replacements.push((index, bytes, producer, reduction));
         }
@@ -295,11 +284,11 @@ mod tests {
             assert_eq!(plan.output_buffers, base.output_buffers);
             if expected == 2 {
                 assert_eq!(
-                    plan.dispatches[0].shader(),
+                    plan.dispatches[0].shader,
                     ShaderEntry::Conv2dGradWeightGemmSplit16
                 );
                 assert_eq!(plan.dispatches[0].workgroups, [5, 1, 1024]);
-                assert_eq!(plan.dispatches[1].shader(), ShaderEntry::SumRows);
+                assert_eq!(plan.dispatches[1].shader, ShaderEntry::SumRows);
                 assert_eq!(*plan.buffers.last().unwrap(), capacity);
             } else {
                 assert_eq!(plan.dispatches, base.dispatches);
@@ -412,7 +401,7 @@ mod tests {
             .iter()
             .position(|d| {
                 matches!(
-                    d.shader(),
+                    d.shader,
                     ShaderEntry::Conv2dGradWeightGemm
                         | ShaderEntry::Conv2dGradWeightGemmSmall
                         | ShaderEntry::Conv2dGradWeightGemm16
@@ -426,7 +415,7 @@ mod tests {
     fn split_sequence_preserves_logical_output_and_provenance() {
         let (mut plan, index) = plan();
         let original = plan.clone();
-        let output = original.dispatches[index].output_buffer();
+        let output = original.dispatches[index].output_buffer;
         let bytes = original.buffers[output.0 as usize] * 3;
         assert_eq!(
             plan.split_conv_weight_gradients(&[(index, 3)], bytes),
@@ -438,18 +427,12 @@ mod tests {
         let a = &plan.dispatches[index];
         let b = &plan.dispatches[index + 1];
         assert_eq!(a.workgroups[2], 3);
-        assert_eq!(
-            a.input_buffers(),
-            original.dispatches[index].input_buffers()
-        );
-        assert_eq!(
-            a.parameter_words(),
-            original.dispatches[index].parameter_words()
-        );
+        assert_eq!(a.input_buffers, original.dispatches[index].input_buffers);
+        assert_eq!(a.params, original.dispatches[index].params);
         assert!(TuneClass::from_dispatch(a, None).is_none());
-        assert_eq!(b.shader(), ShaderEntry::SumRows);
-        assert_eq!(b.input_buffers(), [a.output_buffer()]);
-        assert_eq!(b.output_buffer(), output);
+        assert_eq!(b.shader, ShaderEntry::SumRows);
+        assert_eq!(b.input_buffers, [a.output_buffer]);
+        assert_eq!(b.output_buffer, output);
         for dispatch in [a, b] {
             assert_eq!(dispatch.origin, original.dispatches[index].origin);
             assert_eq!(
@@ -476,8 +459,8 @@ mod tests {
     fn all_selections_are_checked_before_any_plan_change() {
         let (mut plan, index) = plan();
         let mut second = plan.dispatches[index].clone();
-        let size = plan.buffers[second.output_buffer().0 as usize];
-        second.set_output(BufferRef(plan.buffers.len() as u32));
+        let size = plan.buffers[second.output_buffer.0 as usize];
+        second.output_buffer = BufferRef(plan.buffers.len() as u32);
         plan.buffers.push(size);
         let other = plan.dispatches.len();
         plan.dispatches.push(second);
@@ -511,18 +494,18 @@ mod tests {
         }
         rejected(plan.clone(), &[(index, 2)], 0);
         for change in [
-            |d: &mut Dispatch| d.set_kernel(crate::compile::Kernel::Cooperative),
+            |d: &mut Dispatch| d.kernel = crate::compile::Kernel::Cooperative,
             |d: &mut Dispatch| d.workgroups[2] = 2,
-            |d: &mut Dispatch| d.convolution_mut().unwrap().args.kernel_w = 0,
-            |d: &mut Dispatch| d.set_input(0, d.output_buffer()),
-            |d: &mut Dispatch| d.set_output(BufferRef(u32::MAX)),
+            |d: &mut Dispatch| d.params[6] = 0,
+            |d: &mut Dispatch| d.input_buffers[0] = d.output_buffer,
+            |d: &mut Dispatch| d.output_buffer = BufferRef(u32::MAX),
         ] {
             let mut changed = plan.clone();
             change(&mut changed.dispatches[index]);
             rejected(changed, &[(index, 2)], usize::MAX);
         }
         let mut small = plan.clone();
-        small.buffers[plan.dispatches[index].output_buffer().0 as usize] -= 4;
+        small.buffers[plan.dispatches[index].output_buffer.0 as usize] -= 4;
         rejected(small, &[(index, 2)], usize::MAX);
         let mut unchanged = plan.clone();
         assert_eq!(unchanged.split_conv_weight_gradients(&[], 0), Ok(0));
@@ -567,27 +550,13 @@ mod tests {
         ] {
             let (mut plan, index) = plan();
             let d = &mut plan.dispatches[index];
-            d.set_shader(ShaderEntry::Conv2dGradWeightGemmSmall);
-            {
-                let args = &mut d.convolution_mut().expect("convolution").args;
-                args.batch = 1;
-                args.in_channels = channels;
-                args.in_h = 1;
-                args.in_w = width;
-                args.out_channels = channels;
-                args.kernel_h = 1;
-                args.kernel_w = 1;
-                args.stride = 1;
-                args.padding_h = 0;
-                args.out_h = 1;
-                args.out_w = width;
-                args.padding_w = 0;
-            }
+            d.shader = ShaderEntry::Conv2dGradWeightGemmSmall;
+            d.params = vec![1, channels, 1, width, channels, 1, 1, 1, 0, 1, width, 0];
             d.workgroups = [channels.div_ceil(32), channels.div_ceil(32), 1];
-            for &buffer in &d.input_buffers() {
+            for &buffer in &d.input_buffers {
                 plan.buffers[buffer.0 as usize] = channels as usize * width as usize * 4;
             }
-            plan.buffers[d.output_buffer().0 as usize] = channels as usize * channels as usize * 4;
+            plan.buffers[d.output_buffer.0 as usize] = channels as usize * channels as usize * 4;
             let before = serde_json::to_value(&plan).unwrap();
             assert_eq!(
                 plan.split_conv_weight_gradients(&[(index, splits)], usize::MAX),

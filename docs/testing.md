@@ -149,67 +149,19 @@ GPU; an explicit environment setting or `--test-threads` still overrides
 that default. CI passes `--test-threads=4`: most of a test is graph setup
 and queue waits, and a hosted runner keeps four sessions in flight.
 
-## Known failures on real hardware
+## Hardware checks
 
-These reproduce on a clean checkout with all features, and are recorded here
-because the CI adapter (lavapipe) does not reach them. Confirm before
-attributing one to your change. The first is a real defect in a shipped path;
-the rest are harness or measurement artefacts.
+Pin the adapter with `MEGANEURA_DEVICE_ID` and reuse a GPU context across
+sessions. The test helpers do this automatically; an explicitly requested
+device that cannot be opened is an error. Repeated context creation exhausted
+the NVIDIA driver on the RTX 5070 and previously caused silent fallback to
+another adapter.
 
-**Cooperative flash forward loses half precision on NVIDIA.** Five `attention`
-oracle cases fail on the RTX 5070 and pass on Intel, lavapipe and the rest.
-The worst elements of every failing comparison are *exactly* `f16(want)`:
-
-| got | reference | `f16(reference)` |
-|---|---|---|
-| `-1.052734375` | `-1.0522552728652954` | `-1.052734375` |
-| `-1.03515625` | `-1.0346871614456177` | `-1.03515625` |
-| `0.5654296875` | `0.5656632781028748` | `0.5654296875` |
-| `0.5009765625` | `0.5007421970367432` | `0.5009765625` |
-
-So the output is being rounded to f16 on the way out, not merely accumulated
-differently. Isolated by elimination, not inference:
-
-- `MEGANEURA_FLASH_FWD_COOP=0` → 18 passed, 0 failed. That is the only switch
-  that changes the outcome.
-- `MEGANEURA_DISABLE_COOP=1` → 18 passed, 0 failed, and the dumped plans are
-  byte-identical to the default, so this is not dispatch selection.
-- On this device `auto_tune` reports `f16_tile: 16, f32_tile: 0` — there is no
-  f32 cooperative tile at all — and `CoopPolicy::Auto` selects the f16 one.
-  `compile::attention_dispatch` gates that choice on `!requires_full_precision`,
-  which an inference graph does not set.
-
-This is a real accuracy defect in a shipped path, and the oracle was right to
-fail on it. It was masked for as long as the suite silently fell through to
-Intel after exhausting the NVIDIA context budget below. `CoopPolicy::NativeF32`
-disables f16 tiles and would be the conservative default here, but choosing
-between them is a performance decision that wants a measurement, not a test
-failure.
-
-**Context churn exhausted the NVIDIA driver, and hid the above.** The driver
-issues about ten contexts per process, then refuses with
-`NoSupportedDeviceFound`. `SessionConfig::from_env` logged that and set
-`gpu: None`, after which `build` called `default_gpu_context()` — which names
-no device, so Blade picked whatever adapter initialised first. On this box
-that is the Intel B570. Sessions 1–10 ran on the RTX 5070 and everything after
-ran on Intel, silently, which is why the attention cases appeared to
-"pass" and why running a larger selection produced different answers than
-running a smaller one.
-
-`from_env` now panics when `MEGANEURA_DEVICE_ID` names a device it cannot
-open, rather than continuing elsewhere: a caller that asked for hardware by id
-should not be handed different hardware with a `log::warn!` nobody installs a
-logger for. That exposed the context churn as a loud failure, so the harnesses
-now share one context (`tests/support/gpu.rs`) instead of building one per
-session, and `Generator` shares one per process.
-
-With that fixed the attention failures stopped being selection-dependent and
-became what they always were: a real f16 precision loss on the cooperative
-flash forward, described above. The plan really was identical between runs
-(`0x384f3e69d4f3f584` for the failing `q=31, dim=256` case), the operands
-really were identical (`Feeds::fill_random` seeded from a constant,
-`Feeds::set` widening f32 to f64) and the tolerance really was a constant
-(`rtol` 2e-4, `floor` 1e-3). What differed was which GPU ran them.
+Cooperative attention now keeps scalar-consumed staging in f32 and selects
+forward, dQ and dK/dV independently according to available workgroup memory.
+The attention oracle and wide-head parity cases cover precision and fallback;
+CPU shader checks cover staging types and storage requirements even when the
+CI adapter lacks cooperative matrices.
 
 **Padding and `f32` equality.** A padded allocation must not change a
 result — every optimizer, clip and accumulation pass bounds its loops by
@@ -229,31 +181,6 @@ loose enough for a few ULP and far tighter than the failure it guards
 against: a single leaked `1000.0` tail element inflates the adaptive-clip
 norm by roughly 2400x, so the check still separates noise from a real leak by
 about five orders of magnitude.
-
-## Claims that were checked and did not hold
-
-Recorded because an audit that only keeps its hits teaches the wrong lesson,
-and because each of these looked like a defect on inspection.
-
-**Adding a `ShaderEntry` variant already breaks the build.** There are ~105
-variants and five exhaustive matches over them — `profile_family`,
-`shader_group`, `entry_point` in `compile.rs`, and `shader_data_layout` and
-`bind_dispatch` in `runtime.rs`. A new variant produces five `E0004`s naming
-the function and line. So the "15 coordinated edits" cost is not what the
-type system sees; what it does not check is the WGSL and the pipeline `key()`,
-and `key()` is a cascade over *dispatch shape* (kernel, epilogue, weight
-format, coop), not over entries, so it has no per-entry arm to miss.
-
-**RMSNorm's `(2..=32)` rows-per-workgroup bound is not an occupancy bug.** At
-`cols == 64` the bound gives `rows_per_workgroup == 1`, so a 256-thread
-workgroup covers one row: 64 lanes compute, 192 exit early, and the reduction
-tree still runs over all 256. The obvious fix — extending the bound to
-`(2..=64)` so eight rows share a workgroup — measures no better. On an RTX
-5070, 65536 rows, 200 runs: `cols=64` at 6.7 GB/s against `cols=32` at
-6.6 GB/s, a ratio of 0.98 and 1.00 across two runs. The kernel runs at ~6.6
-GB/s, which is memory-bound, so idle lanes cost nothing. Widening the bound
-would only churn the reduction order for nothing. Do not "fix" this without a
-new measurement showing the kernel has become compute-bound.
 
 A test that compares `f32` results should say which it means. Bit equality is
 the right contract for a value that must be reproduced exactly (an inference

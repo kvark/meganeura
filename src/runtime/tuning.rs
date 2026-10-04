@@ -1,5 +1,5 @@
 use super::{Gpu, Pipelines, Session, Variant, ensure_device_memory_budget};
-use crate::compile::{BufferRef, Dispatch, DispatchOp, ShaderEntry};
+use crate::compile::{BufferRef, Dispatch, ShaderEntry};
 use crate::tune::{
     MatmulTile, TuneClass, TuneDecision, TuneError, TuneOptions, TuneOutcome, TunePreparationTimes,
     TuneQualificationTimes, TuneReport, TuneScratchStats, TuneScratchUsage, TuneStaging,
@@ -86,13 +86,13 @@ pub(super) fn tile_module(
     tile: MatmulTile,
     knobs: crate::codegen::MatmulKnobs,
 ) -> crate::codegen::ShaderModule {
-    let entry = &dispatch.shader();
+    let entry = &dispatch.shader;
     if let MatmulTile::Scalar(shape) = tile {
         return crate::codegen::generate_matmul_with_epilogue(
             entry.shader_group(),
             None,
             crate::codegen::MatMulOptions {
-                format: dispatch.weight_format(),
+                format: dispatch.weight_format,
                 tile: shape.geometry(),
                 knobs: crate::codegen::MatmulKnobs {
                     k_stage: shape.k_stage,
@@ -112,28 +112,28 @@ pub(super) fn tile_module(
         if dispatch.gemv_int_dot() {
             return crate::codegen::generate_module_gemv_int_dot(
                 group,
-                dispatch.weight_format(),
+                dispatch.weight_format,
                 shape,
                 knobs.integer_dot,
-                dispatch.gemv_rmsnorm().is_some(),
+                dispatch.gemv_rmsnorm.is_some(),
             );
         }
-        if dispatch.gemv_rmsnorm().is_some() {
+        if dispatch.gemv_rmsnorm.is_some() {
             return crate::codegen::generate_module_gemv_rmsnorm(
                 group,
                 shape,
-                dispatch.weight_format(),
+                dispatch.weight_format,
             );
         }
-        return crate::codegen::generate_module_gemv(group, dispatch.weight_format(), shape);
+        return crate::codegen::generate_module_gemv(group, dispatch.weight_format, shape);
     }
     let selected_entry = tile.shader(entry);
-    if dispatch.weight_format().uses_reduced_storage() {
+    if dispatch.weight_format.uses_reduced_storage() {
         return crate::codegen::generate_matmul_with_epilogue(
             selected_entry.shader_group(),
             None,
             crate::codegen::MatMulOptions {
-                format: dispatch.weight_format(),
+                format: dispatch.weight_format,
                 tile: match tile {
                     MatmulTile::Tile32 => crate::codegen::MatMulTile::Small,
                     MatmulTile::Tile64 => crate::codegen::MatMulTile::Large,
@@ -144,10 +144,7 @@ pub(super) fn tile_module(
         );
     }
     if let MatmulTile::SpecializedConv { k_tile, .. } = tile {
-        let DispatchOp::Convolution(ref op) = dispatch.op else {
-            unreachable!("convolution tuning")
-        };
-        let params = super::Conv2dParams::from(op);
+        let params = super::Conv2dParams::from(dispatch);
         return crate::codegen::generate_conv_module(
             selected_entry.shader_group(),
             k_tile,
@@ -261,8 +258,11 @@ fn collect_classes(
             excluded += 1;
             continue;
         };
-        let mut binding_refs = dispatch.input_buffers();
-        binding_refs.push(dispatch.output_buffer());
+        let mut binding_refs: Vec<BufferRef> = dispatch.input_buffers.clone();
+        if let Some(ref rn) = dispatch.gemv_rmsnorm {
+            binding_refs.push(rn.weight);
+        }
+        binding_refs.push(dispatch.output_buffer);
         let bindings: Vec<_> = binding_refs.iter().collect();
         let physical: Vec<_> = bindings.iter().map(|b| alias.map[b.0 as usize]).collect();
         // Do not transfer isolated timings to overlapping bindings, even if
@@ -716,16 +716,15 @@ impl Session {
             .collect();
         let output_index = sizes.len() - 1;
         let mut dispatch = self.plan.dispatches[class.members[0]].clone();
-        let mut bindings = dispatch.input_buffers();
-        bindings.push(dispatch.output_buffer());
-        dispatch.map_buffers(|buffer| {
-            BufferRef(
-                bindings
-                    .iter()
-                    .position(|&b| b == buffer)
-                    .expect("tuning buffer") as u32,
-            )
-        });
+        dispatch.input_buffers = (0..output_index).map(|i| BufferRef(i as u32)).collect();
+        dispatch.output_buffer = BufferRef(output_index as u32);
+        if let Some(ref mut rn) = dispatch.gemv_rmsnorm {
+            // A, B, norm_w, C. bind_dispatch reads A/B from input_buffers
+            // and the norm vector from the fusion record.
+            dispatch.input_buffers = vec![BufferRef(0), BufferRef(1)];
+            rn.weight = BufferRef(2);
+            dispatch.output_buffer = BufferRef(3);
+        }
         let mut variants = [vec![dispatch.clone()], vec![dispatch]];
         outcome.initial.apply(&mut variants[0][0], &class.key);
         outcome.candidate.apply(&mut variants[1][0], &class.key);
@@ -989,10 +988,9 @@ fn split_dispatches(
         .buffer_sizes()
         .ok_or(TuneError("invalid split-K extents"))?;
     let mut dispatch = dispatch.clone();
-    dispatch.set_kernel(crate::compile::Kernel::Default); // Split-K has its own K=16 shader.
-    dispatch.set_input(0, BufferRef(0));
-    dispatch.set_input(1, BufferRef(1));
-    dispatch.set_output(BufferRef(2));
+    dispatch.kernel = crate::compile::Kernel::Default; // Split-K has its own K=16 shader.
+    dispatch.input_buffers = vec![BufferRef(0), BufferRef(1)];
+    dispatch.output_buffer = BufferRef(2);
     plan.dispatches.push(dispatch);
     let bytes = plan.split_conv_weight_gradients(&[(0, splits)], usize::MAX)?;
     Ok((plan.dispatches, bytes))
@@ -1582,8 +1580,6 @@ fn qualify_output(class: &TuneClass, inputs: &[Vec<f32>], output: &[f32], scale:
 
 #[cfg(test)]
 mod tests {
-    use crate::compile::{DispatchOp, dispatch};
-
     use super::*;
 
     #[test]
@@ -1693,25 +1689,17 @@ mod tests {
             reduction: crate::codegen::GemvReduction::Subgroup,
             bt_rows: 1,
         };
-        let dispatch = Dispatch::new(
-            DispatchOp::Matmul(dispatch::Matmul {
-                implementation: dispatch::MatmulImplementation::Gemv {
-                    shape: crate::codegen::GemvShape::initial(
-                        crate::codegen::ShaderGroup::MatMulGemv,
-                    ),
-                    integer_dot: true,
-                },
-                weight_format: crate::compile::WeightFormat::Q40,
-                ..dispatch::Matmul::new(
-                    dispatch::MatmulKind::Gemv,
-                    crate::compile::BufferRef(0),
-                    crate::compile::BufferRef(0),
-                    crate::compile::BufferRef(0),
-                    [1, 16, 256],
-                )
-            }),
-            [4, 1, 1],
-        );
+        let dispatch = Dispatch {
+            shader: ShaderEntry::MatMulGemv,
+            params: vec![1, 256, 16, 0],
+            workgroups: [4, 1, 1],
+            weight_format: crate::compile::WeightFormat::Q40,
+            kernel: crate::compile::Kernel::Gemv {
+                shape: crate::codegen::GemvShape::initial(crate::codegen::ShaderGroup::MatMulGemv),
+                integer_dot: true,
+            },
+            ..Default::default()
+        };
         assert!(matches!(Pipelines::key(&dispatch), Variant::GemvIntDot(..)));
         assert!(matches!(
             tile_variant(&dispatch, MatmulTile::Gemv(shape)),
@@ -1727,8 +1715,10 @@ mod tests {
             .contains("dot_q4_q8_packed")
         );
 
-        let mut ordinary = dispatch.clone();
-        ordinary.set_kernel(crate::compile::Kernel::Default);
+        let ordinary = Dispatch {
+            kernel: crate::compile::Kernel::Default,
+            ..dispatch
+        };
         assert!(matches!(
             Pipelines::key(&ordinary),
             Variant::Weight(_, crate::compile::WeightFormat::Q40)
@@ -1752,33 +1742,14 @@ mod tests {
             ),
         ] {
             let [batch, ci, h, w, co, kh, kw, stride, ph, oh, ow, pw] = params;
-            let dispatch = Dispatch::new(
-                DispatchOp::Convolution(dispatch::Convolution {
-                    kind: dispatch::ConvolutionKind::WeightGradient,
-                    implementation: dispatch::ConvolutionImplementation::Scalar {
-                        tile: 32,
-                        k_tile: None,
-                    },
-                    args: dispatch::ConvolutionArgs {
-                        a: BufferRef(0),
-                        b: BufferRef(1),
-                        dst: BufferRef(2),
-                        batch,
-                        in_channels: ci,
-                        in_h: h,
-                        in_w: w,
-                        out_channels: co,
-                        kernel_h: kh,
-                        kernel_w: kw,
-                        stride,
-                        padding_h: ph,
-                        out_h: oh,
-                        out_w: ow,
-                        padding_w: pw,
-                    },
-                }),
-                [(ci * kh * kw).div_ceil(32), co.div_ceil(32), 1],
-            );
+            let dispatch = Dispatch {
+                shader: ShaderEntry::Conv2dGradWeightGemmSmall,
+                input_buffers: vec![BufferRef(0), BufferRef(1)],
+                output_buffer: BufferRef(2),
+                params: params.to_vec(),
+                workgroups: [(ci * kh * kw).div_ceil(32), co.div_ceil(32), 1],
+                ..Default::default()
+            };
             let class = TuneClass::from_dispatch(&dispatch, None).unwrap();
             let inputs = test_inputs(&class.buffer_sizes().unwrap(), pattern);
             let n = ci * kh * kw;
@@ -1833,34 +1804,13 @@ mod tests {
     #[test]
     fn split_scratch_contract_and_full_partial_oracles_reject_corruption() {
         let dispatch = Dispatch {
+            shader: ShaderEntry::Conv2dGradWeightGemmSmall,
+            workgroups: [1, 1, 1],
+            input_buffers: vec![BufferRef(0), BufferRef(1)],
+            output_buffer: BufferRef(2),
+            params: vec![2, 2, 1, 41, 3, 1, 1, 1, 0, 1, 41, 0],
             requires_full_precision: true,
-            ..Dispatch::new(
-                DispatchOp::Convolution(dispatch::Convolution {
-                    kind: dispatch::ConvolutionKind::WeightGradient,
-                    implementation: dispatch::ConvolutionImplementation::Scalar {
-                        tile: 32,
-                        k_tile: None,
-                    },
-                    args: dispatch::ConvolutionArgs {
-                        a: BufferRef(0),
-                        b: BufferRef(1),
-                        dst: BufferRef(2),
-                        batch: 2,
-                        in_channels: 2,
-                        in_h: 1,
-                        in_w: 41,
-                        out_channels: 3,
-                        kernel_h: 1,
-                        kernel_w: 1,
-                        stride: 1,
-                        padding_h: 0,
-                        out_h: 1,
-                        out_w: 41,
-                        padding_w: 0,
-                    },
-                }),
-                [1, 1, 1],
-            )
+            ..Default::default()
         };
         let class = TuneClass::from_dispatch(&dispatch, None).unwrap();
         let sizes = class.buffer_sizes().unwrap();
@@ -1868,9 +1818,9 @@ mod tests {
             let (sequence, partial_bytes) = split_dispatches(&dispatch, &class, splits).unwrap();
             assert_eq!(partial_bytes, sizes[2] * splits as usize);
             assert_eq!(sequence.len(), 2);
-            assert_eq!(sequence[0].output_buffer(), BufferRef(3));
-            assert_eq!(sequence[1].input_buffers(), [BufferRef(3)]);
-            assert_eq!(sequence[1].output_buffer(), BufferRef(2));
+            assert_eq!(sequence[0].output_buffer, BufferRef(3));
+            assert_eq!(sequence[1].input_buffers, [BufferRef(3)]);
+            assert_eq!(sequence[1].output_buffer, BufferRef(2));
             let mut allocation = sizes.clone();
             allocation.push(partial_bytes);
             assert_eq!(
@@ -1962,8 +1912,7 @@ mod tests {
         invalid[1].origin.push(12345);
         assert!(selection_swaps(&left.dispatches, &invalid, &classes, &right_classes).is_err());
         invalid[1] = right.dispatches[1].clone();
-        let op = invalid[1].matmul_mut().unwrap();
-        std::mem::swap(&mut op.a, &mut op.b);
+        invalid[1].input_buffers.swap(0, 1);
         assert!(selection_swaps(&left.dispatches, &invalid, &classes, &right_classes).is_err());
         assert_eq!(left.dispatches, original_left);
         for swap in swaps {
@@ -2502,10 +2451,9 @@ mod tests {
         assert_eq!(excluded, 0);
         assert_eq!(classes.len(), 1);
         assert_eq!(classes[0].members.len(), 2);
-        alias.device_local[plan.dispatches[1].output_buffer().0 as usize] = true;
+        alias.device_local[plan.dispatches[1].output_buffer.0 as usize] = true;
         assert_eq!(collect_classes(&plan, &alias, None).0.len(), 2);
-        let output = plan.dispatches[0].output_buffer();
-        plan.dispatches[0].set_input(1, output);
+        plan.dispatches[0].input_buffers[1] = plan.dispatches[0].output_buffer;
         assert_eq!(collect_classes(&plan, &alias, None).1, 1);
     }
 
@@ -2579,50 +2527,12 @@ mod tests {
                 {
                     continue;
                 }
-                let dispatch = Dispatch::new(
-                    if convolution {
-                        let mut op = dispatch::Convolution {
-                            kind: dispatch::ConvolutionKind::Forward,
-                            implementation: dispatch::ConvolutionImplementation::Scalar {
-                                tile: 64,
-                                k_tile: None,
-                            },
-                            args: dispatch::ConvolutionArgs {
-                                a: BufferRef(0),
-                                b: BufferRef(1),
-                                dst: BufferRef(2),
-                                batch: 2,
-                                in_channels: 3,
-                                in_h: 7,
-                                in_w: 9,
-                                out_channels: 5,
-                                kernel_h: 3,
-                                kernel_w: 2,
-                                stride: 2,
-                                padding_h: 0,
-                                out_h: 3,
-                                out_w: 5,
-                                padding_w: 1,
-                            },
-                        };
-                        op.select_shader(entry.clone());
-                        DispatchOp::Convolution(op)
-                    } else {
-                        let mut op = dispatch::Matmul::new(
-                            dispatch::MatmulKind::Add {
-                                addend: BufferRef(3),
-                            },
-                            BufferRef(0),
-                            BufferRef(1),
-                            BufferRef(2),
-                            [2, 7, 3],
-                        );
-                        op.weight_format = format;
-                        op.select_shader(entry.clone());
-                        DispatchOp::Matmul(op)
-                    },
-                    [0; 3],
-                );
+                let dispatch = Dispatch {
+                    shader: entry.clone(),
+                    weight_format: format,
+                    params: vec![2, 3, 7, 9, 5, 3, 2, 2, 0, 3, 5, 1],
+                    ..Default::default()
+                };
                 if convolution && !specialized {
                     assert_eq!(
                         tile_variant(&dispatch, tile),

@@ -102,7 +102,7 @@ fn run_case(
         .iter()
         .position(|d| {
             matches!(
-                d.shader(),
+                d.shader,
                 ShaderEntry::Conv2dGradWeightGemm | ShaderEntry::Conv2dGradWeightGemmSmall
             )
         })

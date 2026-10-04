@@ -1,12 +1,4 @@
-//! Attention and convolution kernels.
-//!
-//! The matmul family stays in the parent module; everything that is not a
-//! matmul lives here — the flash and cached attention forward and backward
-//! kernels, the cooperative variants of both, and the convolution and pooling
-//! kernels with their backward stages.
-//!
-//! Private helpers are `pub(super)` because the generators they belong to are
-//! public and callers in the parent may still reach for them.
+//! Attention and cooperative convolution kernels.
 
 use super::*;
 
@@ -450,28 +442,7 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
 
     let _ = writeln!(src, "var<workgroup> shared_q: array<f16, {}>;", bq * hd);
     let _ = writeln!(src, "var<workgroup> shared_k_t: array<f16, {}>;", hd * bkv);
-    // V is f32, unlike Q and K — and unlike the non-cooperative flash kernel
-    // above, which also stages V as f32.
-    //
-    // The cooperative matrix is QK^T only. `shared_q` and `shared_k_t` are
-    // operands of `coopLoadT<coop_mat16x16<f16,A/B>>` and have to be f16 for
-    // the instruction. V is not an operand of any matrix instruction: PV is a
-    // scalar loop, so the f16 staging bought nothing and cost the conversion
-    // back to f32 on every element of every score.
-    //
-    // It is also where essentially all of the error was. Rounding V to f16 on
-    // its own reproduces the cooperative kernel's entire worst-case error —
-    // 2.36e-4 of 2.36e-4 at head_dim 64, 2.44e-4 of 2.71e-4 at 256, 2.40e-4 of
-    // 2.55e-4 at 128 — against 3.8e-5..9.6e-5 for Q and 4.5e-5..8.3e-5 for K.
-    // `examples/bench_attention_coop` derives those floors by rounding one
-    // operand at a time in an f64 CPU reference and differencing against the
-    // exact evaluation, so no shader is involved.
-    //
-    // Q and K stay f16 because the hardware requires it, and their residual is
-    // 3-4x smaller anyway: their errors are summed over `head_dim` terms and
-    // then normalised by the softmax, whereas V's error enters the output
-    // linearly as a convex combination, and positive weights summing to one do
-    // not cancel a rounding error the way an average over `head_dim` terms does.
+    // Only Q and K feed cooperative instructions; scalar PV needs f32 V.
     let _ = writeln!(src, "var<workgroup> shared_v: array<f32, {}>;", bkv * hd);
     let _ = writeln!(
         src,
@@ -503,7 +474,7 @@ pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
     src.push_str("    let q_valid = qpos < q_seq && head < num_heads;\n\n");
 
     // Per-row valid KV range (causal + sliding window).
-    src.push_str(&kv_range_block("qpos", 4));
+    src.push_str(&kv_range("qpos", 4));
 
     // Workgroup-wide bounds (drives all threads through the same
     // outer KV loop).
