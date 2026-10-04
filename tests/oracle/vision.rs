@@ -1073,7 +1073,8 @@ fn is_conv_gemm(shader: &ShaderEntry) -> bool {
 /// The compiler emits every implicit-GEMM convolution as the exact-divisor
 /// kernel with a 16-deep K stage; the tuner may replace it with a 32-deep K
 /// stage or the uniform software-divisor shader. Force each on each tile
-/// width and direction. Most reductions here (K = 45, 27, 54, 90, 18, 84)
+/// width and direction, plus the rectangular weight-gradient candidate.
+/// Most reductions here (K = 45, 27, 54, 90, 18, 84)
 /// are multiples of neither stage.
 #[test]
 fn conv2d_tuned_kernels() {
@@ -1120,8 +1121,18 @@ fn conv2d_tuned_kernels() {
         let mut feeds = Feeds::new();
         feeds.fill_random(g, 1600 + i as u64, 1.0);
         for kernel in [
-            Kernel::SpecializedConv { k_tile: 16 },
-            Kernel::SpecializedConv { k_tile: 32 },
+            Kernel::SpecializedConv {
+                k_tile: 16,
+                tile_columns: None,
+            },
+            Kernel::SpecializedConv {
+                k_tile: 32,
+                tile_columns: None,
+            },
+            Kernel::SpecializedConv {
+                k_tile: 32,
+                tile_columns: Some(16),
+            },
             Kernel::Default,
         ] {
             let mut plan = meganeura::compile::compile(g);
@@ -1130,6 +1141,25 @@ fn conv2d_tuned_kernels() {
                 .iter_mut()
                 .find(|d| is_conv_gemm(&d.shader))
                 .unwrap();
+            if matches!(
+                kernel,
+                Kernel::SpecializedConv {
+                    tile_columns: Some(_),
+                    ..
+                }
+            ) {
+                if !matches!(
+                    conv.shader,
+                    ShaderEntry::Conv2dGradWeightGemm
+                        | ShaderEntry::Conv2dGradWeightGemmSmall
+                        | ShaderEntry::Conv2dGradWeightGemm16
+                ) {
+                    continue;
+                }
+                conv.shader = ShaderEntry::Conv2dGradWeightGemmSmall;
+                let columns = conv.params[1] * conv.params[5] * conv.params[6];
+                conv.workgroups = [columns.div_ceil(16), conv.params[4].div_ceil(32), 1];
+            }
             let shader = conv.shader.clone();
             conv.kernel = kernel.clone();
             let report = check_plan(g, &feeds, plan);
