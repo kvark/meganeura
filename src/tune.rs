@@ -10,7 +10,7 @@
 //! reduced-storage kernels participate without changing their arithmetic.
 
 use crate::codegen::CoopConfig;
-use crate::compile::{Dispatch, ShaderEntry};
+use crate::compile::{Dispatch, ShaderEntry, dispatch};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -76,8 +76,8 @@ pub struct TuneConv2d {
 }
 
 impl TuneConv2d {
-    fn from_params(params: &[u32]) -> Option<Self> {
-        let &[
+    fn from_convolution(args: &dispatch::ConvolutionArgs) -> Option<Self> {
+        let &dispatch::ConvolutionArgs {
             batch,
             in_channels,
             in_h,
@@ -90,10 +90,8 @@ impl TuneConv2d {
             out_h,
             out_w,
             padding_w,
-        ] = params
-        else {
-            return None;
-        };
+            ..
+        } = args;
         let shape = Self {
             batch,
             in_channels,
@@ -277,14 +275,14 @@ impl MatmulTile {
     pub(crate) fn selected(dispatch: &Dispatch, config: Option<&CoopConfig>) -> Option<Self> {
         use crate::compile::Kernel;
         let small = dispatch.use_small_tiles();
-        if let Some(group) = gemv_group(&dispatch.shader) {
-            match dispatch.kernel {
+        if let Some(group) = gemv_group(&dispatch.shader()) {
+            match dispatch.kernel() {
                 Kernel::Default => Some(Self::Gemv(crate::codegen::GemvShape::initial(group))),
                 Kernel::Gemv { shape, .. } => Some(Self::Gemv(shape)),
                 _ => None,
             }
-        } else if let Some(launched) = conv_launched_tile(&dispatch.shader) {
-            match dispatch.kernel {
+        } else if let Some(launched) = conv_launched_tile(&dispatch.shader()) {
+            match dispatch.kernel() {
                 Kernel::Default | Kernel::SmallTile => Some(match launched {
                     16 => Self::Tile16,
                     32 => Self::Tile32,
@@ -298,7 +296,7 @@ impl MatmulTile {
                 _ => None,
             }
         } else {
-            match dispatch.kernel {
+            match dispatch.kernel() {
                 Kernel::Default | Kernel::SmallTile => {
                     Some(if small { Self::Tile32 } else { Self::Tile64 })
                 }
@@ -331,18 +329,18 @@ impl MatmulTile {
 
     pub(crate) fn configure(self, dispatch: &mut Dispatch) {
         if let Self::Gemv(shape) = self {
-            dispatch.kernel = crate::compile::Kernel::Gemv {
+            dispatch.set_kernel(crate::compile::Kernel::Gemv {
                 shape,
                 integer_dot: dispatch.gemv_int_dot(),
-            };
+            });
             return;
         }
-        dispatch.shader = self.shader(&dispatch.shader);
-        dispatch.kernel = match self {
+        dispatch.set_shader(self.shader(&dispatch.shader()));
+        dispatch.set_kernel(match self {
             Self::Tile16 => crate::compile::Kernel::Default,
             Self::Tile32
                 if !matches!(
-                    dispatch.shader,
+                    dispatch.shader(),
                     ShaderEntry::Conv2dGemmSmall
                         | ShaderEntry::Conv2dGradInputGemmSmall
                         | ShaderEntry::Conv2dGradWeightGemmSmall
@@ -357,7 +355,7 @@ impl MatmulTile {
                 crate::compile::Kernel::SpecializedConv { k_tile }
             }
             Self::Gemv(_) => unreachable!(),
-        };
+        });
     }
 
     pub(crate) fn shader(self, entry: &ShaderEntry) -> ShaderEntry {
@@ -482,7 +480,7 @@ impl MatmulTile {
 impl TuneClass {
     pub(crate) fn from_dispatch(dispatch: &Dispatch, config: Option<&CoopConfig>) -> Option<Self> {
         let addend = matches!(
-            dispatch.shader,
+            dispatch.shader(),
             ShaderEntry::FusedMatMulAdd
                 | ShaderEntry::FusedMatMulATAdd
                 | ShaderEntry::FusedMatMulBTAdd
@@ -490,7 +488,7 @@ impl TuneClass {
                 | ShaderEntry::MatMulGemvBTAdd
         );
         if !matches!(
-            dispatch.shader,
+            dispatch.shader(),
             ShaderEntry::MatMul
                 | ShaderEntry::FusedMatMulAdd
                 | ShaderEntry::MatMulAT
@@ -511,19 +509,20 @@ impl TuneClass {
                 | ShaderEntry::Conv2dGradWeightGemmSmall
                 | ShaderEntry::Conv2dGradWeightGemm16
         ) || dispatch.use_coop_compensated()
-            || (dispatch.use_coop() && dispatch.weight_format.uses_reduced_storage())
-            || dispatch.horizontal_batch >= 2
-            || dispatch.matmul_prologue.is_some()
-            || dispatch.matmul_epilogue.is_some()
-            || !dispatch.extra_outputs.is_empty()
+            || (dispatch.use_coop() && dispatch.weight_format().uses_reduced_storage())
+            || dispatch.horizontal_batch() >= 2
+            || dispatch.matmul_prologue().is_some()
+            || dispatch.matmul_epilogue().is_some()
+            || !dispatch.extra_outputs().is_empty()
             || dispatch.pointwise().is_some()
             || dispatch.reduction().is_some()
-            || dispatch.input_buffers.len() != if addend { 3 } else { 2 }
+            || dispatch.input_buffers().len()
+                != (if addend { 3 } else { 2 }) + usize::from(dispatch.gemv_rmsnorm().is_some())
             || dispatch.schedule_locked
         {
             return None;
         }
-        let shader = match dispatch.shader {
+        let shader = match dispatch.shader() {
             ShaderEntry::Conv2dGemmSmall | ShaderEntry::Conv2dGemm16 => ShaderEntry::Conv2dGemm,
             ShaderEntry::Conv2dGradInputGemmSmall | ShaderEntry::Conv2dGradInputGemm16 => {
                 ShaderEntry::Conv2dGradInputGemm
@@ -531,7 +530,7 @@ impl TuneClass {
             ShaderEntry::Conv2dGradWeightGemmSmall | ShaderEntry::Conv2dGradWeightGemm16 => {
                 ShaderEntry::Conv2dGradWeightGemm
             }
-            _ => dispatch.shader.clone(),
+            _ => dispatch.shader(),
         };
         let conv2d = if matches!(
             shader,
@@ -541,17 +540,13 @@ impl TuneClass {
         ) {
             if dispatch.use_coop()
                 || dispatch.use_small_tiles()
-                || dispatch.weight_format.uses_reduced_storage()
+                || dispatch.weight_format().uses_reduced_storage()
             {
                 return None;
             }
-            Some(TuneConv2d::from_params(&dispatch.params)?)
+            Some(TuneConv2d::from_convolution(&dispatch.convolution()?.args)?)
         } else {
-            if dispatch.conv_k_tile().is_some()
-                || dispatch.workgroups[2] != 1
-                || dispatch.params.len() != 4
-                || dispatch.params[3] != 0
-            {
+            if dispatch.conv_k_tile().is_some() || dispatch.workgroups[2] != 1 {
                 return None;
             }
             None
@@ -574,18 +569,8 @@ impl TuneClass {
                 let k = s.batch.checked_mul(spatial)?;
                 (s.out_channels, n, k)
             }
-        } else if matches!(
-            shader,
-            ShaderEntry::MatMul
-                | ShaderEntry::FusedMatMulAdd
-                // The forward GEMV pair carries `[m, k, n]` like the tiled
-                // forward matmul; only the transposed form is `[m, n, k]`.
-                | ShaderEntry::MatMulGemv
-                | ShaderEntry::MatMulGemvAdd
-        ) {
-            (dispatch.params[0], dispatch.params[2], dispatch.params[1])
         } else {
-            (dispatch.params[0], dispatch.params[1], dispatch.params[2])
+            dispatch.mnk()?
         };
         // Scalar K loops advance by at most 32, including the final padded tile.
         if m == 0
@@ -604,14 +589,10 @@ impl TuneClass {
             k,
             conv2d,
             requires_full_precision: dispatch.requires_full_precision,
-            weight_format: dispatch.weight_format,
+            weight_format: dispatch.weight_format(),
             gemv_int_dot: dispatch.gemv_int_dot(),
-            gemv_rmsnorm: dispatch.gemv_rmsnorm.is_some(),
-            gemv_rmsnorm_eps_bits: dispatch
-                .gemv_rmsnorm
-                .as_ref()
-                .map(|rn| rn.eps_bits)
-                .unwrap_or(0),
+            gemv_rmsnorm: dispatch.gemv_rmsnorm().is_some(),
+            gemv_rmsnorm_eps_bits: dispatch.gemv_rmsnorm().map(|rn| rn.eps_bits).unwrap_or(0),
             device_local: [false; 4],
             binding_bytes: Vec::new(),
         };
@@ -1193,36 +1174,43 @@ pub(crate) fn decide<Class, Choice: Copy>(
 
 #[cfg(test)]
 mod tests {
+    use crate::compile::{DispatchOp, dispatch};
+
     use super::*;
 
     fn dispatch() -> Dispatch {
-        Dispatch {
-            params: vec![33, 17, 65, 0],
-            workgroups: [2, 1, 1],
-            input_buffers: vec![crate::compile::BufferRef(0), crate::compile::BufferRef(1)],
-            output_buffer: crate::compile::BufferRef(2),
-            ..Default::default()
-        }
+        Dispatch::new(
+            DispatchOp::Matmul(dispatch::Matmul::new(
+                dispatch::MatmulKind::Plain,
+                crate::compile::BufferRef(0),
+                crate::compile::BufferRef(1),
+                crate::compile::BufferRef(2),
+                [33, 65, 17],
+            )),
+            [2, 1, 1],
+        )
     }
 
     #[test]
     fn activation_quantization_splits_the_tuning_class() {
-        let ordinary = Dispatch {
-            shader: ShaderEntry::MatMulGemv,
-            params: vec![1, 256, 16, 0],
-            workgroups: [4, 1, 1],
-            weight_format: crate::compile::WeightFormat::Q40,
-            input_buffers: vec![crate::compile::BufferRef(0), crate::compile::BufferRef(1)],
-            output_buffer: crate::compile::BufferRef(2),
-            ..Default::default()
-        };
-        let quantized = Dispatch {
-            kernel: crate::compile::Kernel::Gemv {
-                shape: crate::codegen::GemvShape::initial(crate::codegen::ShaderGroup::MatMulGemv),
-                integer_dot: true,
-            },
-            ..ordinary.clone()
-        };
+        let ordinary = Dispatch::new(
+            DispatchOp::Matmul(dispatch::Matmul {
+                weight_format: crate::compile::WeightFormat::Q40,
+                ..dispatch::Matmul::new(
+                    dispatch::MatmulKind::Gemv,
+                    crate::compile::BufferRef(0),
+                    crate::compile::BufferRef(1),
+                    crate::compile::BufferRef(2),
+                    [1, 16, 256],
+                )
+            }),
+            [4, 1, 1],
+        );
+        let mut quantized = ordinary.clone();
+        quantized.set_kernel(crate::compile::Kernel::Gemv {
+            shape: crate::codegen::GemvShape::initial(crate::codegen::ShaderGroup::MatMulGemv),
+            integer_dot: true,
+        });
 
         let a = TuneClass::from_dispatch(&ordinary, None).expect("ordinary Q4_0 GEMV");
         let b = TuneClass::from_dispatch(&quantized, None).expect("int-dot Q4_0 GEMV");
@@ -1272,14 +1260,14 @@ mod tests {
             let dispatch = plan
                 .dispatches
                 .iter()
-                .find(|d| d.shader == ShaderEntry::MatMulGemv)
+                .find(|d| d.shader() == ShaderEntry::MatMulGemv)
                 .unwrap_or_else(|| panic!("{dtype:?}: no K-split GEMV"));
             let mut class = TuneClass::from_dispatch(dispatch, None)
                 .unwrap_or_else(|| panic!("{dtype:?}: GEMV is not tunable"));
             class.binding_bytes = dispatch
-                .input_buffers
+                .input_buffers()
                 .iter()
-                .chain(std::iter::once(&dispatch.output_buffer))
+                .chain(std::iter::once(&dispatch.output_buffer()))
                 .map(|buffer| plan.buffers[buffer.0 as usize])
                 .collect();
             assert_eq!(
@@ -1327,7 +1315,7 @@ mod tests {
         let dispatch = plan
             .dispatches
             .iter()
-            .find(|d| d.shader == ShaderEntry::MatMulGemv && d.gemv_rmsnorm.is_some())
+            .find(|d| d.shader() == ShaderEntry::MatMulGemv && d.gemv_rmsnorm().is_some())
             .expect("packed GEMV did not absorb the RmsNorm");
         assert!(plan.dispatches.iter().all(|d| d.reduction().is_none()));
         let mut class =
@@ -1335,9 +1323,8 @@ mod tests {
         assert!(class.gemv_rmsnorm);
         assert_eq!(class.weight_format, crate::compile::WeightFormat::Q40);
         assert_eq!((class.m, class.n, class.k), (1, N as u32, K as u32));
-        let mut bindings: Vec<_> = dispatch.input_buffers.clone();
-        bindings.push(dispatch.gemv_rmsnorm.as_ref().unwrap().weight);
-        bindings.push(dispatch.output_buffer);
+        let mut bindings: Vec<_> = dispatch.input_buffers();
+        bindings.push(dispatch.output_buffer());
         class.binding_bytes = bindings
             .iter()
             .map(|b| plan.buffers[b.0 as usize])
@@ -1374,19 +1361,23 @@ mod tests {
 
         const K: u32 = 1536;
         const N: u32 = 262_144;
-        let dispatch = Dispatch {
-            shader: ShaderEntry::MatMulGemv,
-            params: vec![1, K, N, 0],
-            workgroups: [N / 4, 1, 1],
-            weight_format: crate::compile::WeightFormat::Q8,
-            gemv_rmsnorm: Some(crate::compile::GemvRmsNorm {
-                weight: crate::compile::BufferRef(2),
-                eps_bits: 1e-6f32.to_bits(),
+        let dispatch = Dispatch::new(
+            DispatchOp::Matmul(dispatch::Matmul {
+                rmsnorm: Some(crate::compile::GemvRmsNorm {
+                    weight: crate::compile::BufferRef(2),
+                    eps_bits: 1e-6f32.to_bits(),
+                }),
+                weight_format: crate::compile::WeightFormat::Q8,
+                ..dispatch::Matmul::new(
+                    dispatch::MatmulKind::Gemv,
+                    crate::compile::BufferRef(0),
+                    crate::compile::BufferRef(1),
+                    crate::compile::BufferRef(3),
+                    [1, N, K],
+                )
             }),
-            input_buffers: vec![crate::compile::BufferRef(0), crate::compile::BufferRef(1)],
-            output_buffer: crate::compile::BufferRef(3),
-            ..Default::default()
-        };
+            [N / 4, 1, 1],
+        );
         let mut class = TuneClass::from_dispatch(&dispatch, None)
             .expect("vocab-width fused Q8 GEMV must be a tune class");
         assert!(class.gemv_rmsnorm);
@@ -1431,8 +1422,9 @@ mod tests {
         MatmulTile::Tile64.apply(&mut d, &class);
         assert_eq!(d.workgroups, [2, 1, 1]);
         assert!(!d.use_small_tiles());
-        d.shader = ShaderEntry::MatMulGemvBT;
-        d.params = vec![1, 262_145, 4, 0];
+        d.set_shader(ShaderEntry::MatMulGemvBT);
+        let matrix = d.matmul_mut().unwrap();
+        (matrix.m, matrix.n, matrix.k) = (1, 262_145, 4);
         d.workgroups = crate::compile::row_gemv_workgroups(262_145);
         let class = TuneClass::from_dispatch(&d, None).unwrap();
         for bt_rows in crate::codegen::GemvShape::BT_ROWS {
@@ -1477,11 +1469,17 @@ mod tests {
                 ShaderEntry::FusedMatMulATAdd | ShaderEntry::FusedMatMulBTAdd
             );
             let mut transposed = d.clone();
-            transposed.shader = shader;
-            transposed.params = vec![33, 65, 17, 0];
-            if fused {
-                transposed.input_buffers.push(crate::compile::BufferRef(3));
-            }
+            transposed.matmul_mut().unwrap().kind = match shader {
+                ShaderEntry::MatMulAT => dispatch::MatmulKind::TransposeA,
+                ShaderEntry::MatMulBT => dispatch::MatmulKind::TransposeB,
+                ShaderEntry::FusedMatMulATAdd => dispatch::MatmulKind::AddAT {
+                    addend: crate::compile::BufferRef(3),
+                },
+                ShaderEntry::FusedMatMulBTAdd => dispatch::MatmulKind::AddBT {
+                    addend: crate::compile::BufferRef(3),
+                },
+                _ => unreachable!(),
+            };
             let class = TuneClass::from_dispatch(&transposed, None).unwrap();
             assert_eq!((class.m, class.n, class.k), (33, 65, 17));
             assert_eq!(class.has_addend(), fused);
@@ -1496,17 +1494,21 @@ mod tests {
     #[test]
     fn unsupported_modifiers_never_enter_the_search() {
         let base = dispatch();
-        let mut variants = vec![base.clone(); 10];
-        variants[0].kernel = crate::compile::Kernel::Cooperative;
-        variants[1].horizontal_batch = 2;
-        variants[2].kernel = crate::compile::Kernel::CooperativeCompensated;
-        variants[3].extra_outputs.push(crate::compile::BufferRef(3));
-        variants[4].workgroups[2] = 2;
-        variants[5].shader = ShaderEntry::MatMulGemv;
-        variants[6].params[0] = 0;
-        variants[7].params[3] = 1;
-        variants[8].params[0] = 32 * 65_535 + 1;
-        variants[9].workgroups = [1, 2, 1]; // wrong row/column geometry
+        let mut variants = vec![base.clone(); 8];
+        variants[0].set_kernel(crate::compile::Kernel::Cooperative);
+        variants[1]
+            .matmul_mut()
+            .unwrap()
+            .siblings
+            .push((crate::compile::BufferRef(3), crate::compile::BufferRef(4)));
+        variants[2].set_kernel(crate::compile::Kernel::CooperativeCompensated);
+        variants[3].workgroups[2] = 2;
+        variants[4].set_shader(ShaderEntry::MatMulGemv);
+        variants[5].matmul_mut().unwrap().m = 0;
+        variants[6].matmul_mut().unwrap().m = 32 * 65_535 + 1;
+        variants[7].workgroups = [1, 2, 1]; // wrong row/column geometry
+        // Unrelated extra outputs and a nonzero reserved shape word are no
+        // longer representable by a matrix payload.
         for d in variants {
             assert!(TuneClass::from_dispatch(&d, None).is_none());
         }
@@ -1516,19 +1518,50 @@ mod tests {
     }
 
     fn conv_dispatch(shader: ShaderEntry) -> Dispatch {
-        let mut d = dispatch();
-        d.shader = shader;
-        d.kernel = crate::compile::Kernel::Default;
-        d.params = vec![2, 3, 7, 9, 5, 3, 2, 2, 0, 3, 5, 1];
-        d.workgroups = if matches!(
-            d.shader,
-            ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGradInputGemm
-        ) {
-            [1, 1, 2]
-        } else {
-            [1, 1, 1]
+        use dispatch::{
+            Convolution, ConvolutionArgs, ConvolutionImplementation, ConvolutionKind, DispatchOp,
         };
-        d
+        let kind = match shader {
+            ShaderEntry::Conv2dGemm => ConvolutionKind::Forward,
+            ShaderEntry::Conv2dGradInputGemm => ConvolutionKind::InputGradient,
+            ShaderEntry::Conv2dGradWeightGemm => ConvolutionKind::WeightGradient,
+            _ => unreachable!(),
+        };
+        Dispatch::new(
+            DispatchOp::Convolution(Convolution {
+                kind,
+                implementation: ConvolutionImplementation::Scalar {
+                    tile: 64,
+                    k_tile: None,
+                },
+                args: ConvolutionArgs {
+                    a: crate::compile::BufferRef(0),
+                    b: crate::compile::BufferRef(1),
+                    dst: crate::compile::BufferRef(2),
+                    batch: 2,
+                    in_channels: 3,
+                    in_h: 7,
+                    in_w: 9,
+                    out_channels: 5,
+                    kernel_h: 3,
+                    kernel_w: 2,
+                    stride: 2,
+                    padding_h: 0,
+                    out_h: 3,
+                    out_w: 5,
+                    padding_w: 1,
+                },
+            }),
+            [
+                1,
+                1,
+                if kind == ConvolutionKind::WeightGradient {
+                    1
+                } else {
+                    2
+                },
+            ],
+        )
     }
 
     #[test]
@@ -1588,7 +1621,7 @@ mod tests {
             assert!(!MatmulTile::CooperativeF32 { tile_size: 16 }.fits(&class));
             MatmulTile::Tile32.apply(&mut d, &class);
             assert_eq!(
-                d.shader,
+                d.shader(),
                 if forward {
                     ShaderEntry::Conv2dGemmSmall
                 } else if dx {
@@ -1635,30 +1668,27 @@ mod tests {
             ShaderEntry::Conv2dGradWeightGemm,
         ] {
             let base = conv_dispatch(shader);
-            let mut variants = vec![base; 17];
-            variants[0].kernel = crate::compile::Kernel::SmallTile;
-            variants[1].kernel = crate::compile::Kernel::Cooperative;
-            variants[2].kernel = crate::compile::Kernel::CooperativeCompensated;
-            variants[3].params.pop();
-            variants[4].params[7] = 0;
-            variants[5].params[9] += 1;
-            variants[6].params[11] = u32::MAX;
-            variants[7].params[2] = u32::MAX;
-            variants[8].workgroups[0] += 1;
-            variants[9].workgroups[2] += 1;
-            variants[10].params[0] = 0;
-            variants[11].params[1] = u32::MAX;
-            variants[12].weight_format = crate::compile::WeightFormat::F16;
-            variants[13].shader = ShaderEntry::Conv2dGradInputGemmCoopGen(3, 2, 2);
-            variants[14].kernel = crate::compile::Kernel::SpecializedConv { k_tile: 7 };
-            variants[15].input_buffers.pop();
-            variants[16].params[5] = 100;
+            // Operand arity, packed weights and unrelated implementation
+            // families are constrained by the payload type.
+            let mut variants = vec![base; 12];
+            variants[0].set_kernel(crate::compile::Kernel::Cooperative);
+            variants[1].convolution_mut().unwrap().args.stride = 0;
+            variants[2].convolution_mut().unwrap().args.out_h += 1;
+            variants[3].convolution_mut().unwrap().args.padding_w = u32::MAX;
+            variants[4].convolution_mut().unwrap().args.in_h = u32::MAX;
+            variants[5].workgroups[0] += 1;
+            variants[6].workgroups[2] += 1;
+            variants[7].convolution_mut().unwrap().args.batch = 0;
+            variants[8].convolution_mut().unwrap().args.in_channels = u32::MAX;
+            variants[9].set_shader(ShaderEntry::Conv2dGradInputGemmCoopGen(3, 2, 2));
+            variants[10].set_kernel(crate::compile::Kernel::SpecializedConv { k_tile: 7 });
+            variants[11].convolution_mut().unwrap().args.kernel_h = 100;
             for d in variants {
                 assert!(TuneClass::from_dispatch(&d, None).is_none(), "{d:?}");
             }
         }
         let mut d = conv_dispatch(ShaderEntry::Conv2dGradInputGemm);
-        d.params[0] = 65_536;
+        d.convolution_mut().unwrap().args.batch = 65_536;
         d.workgroups[2] = 65_536;
         assert!(TuneClass::from_dispatch(&d, None).is_none());
     }
@@ -1672,14 +1702,42 @@ mod tests {
                 ShaderEntry::Conv2dGradWeightGemm,
             ] {
                 let mut d = conv_dispatch(shader);
-                d.params = vec![2, 3, 1, divisor, 5, 1, 1, 1, 0, 1, divisor, 0];
+                {
+                    let args = &mut d.convolution_mut().expect("convolution").args;
+                    args.batch = 2;
+                    args.in_channels = 3;
+                    args.in_h = 1;
+                    args.in_w = divisor;
+                    args.out_channels = 5;
+                    args.kernel_h = 1;
+                    args.kernel_w = 1;
+                    args.stride = 1;
+                    args.padding_h = 0;
+                    args.out_h = 1;
+                    args.out_w = divisor;
+                    args.padding_w = 0;
+                }
                 assert!(TuneClass::from_dispatch(&d, None).is_some(), "{d:?}");
             }
         }
         // No f32 integer-domain limit, but a padded K loop must not wrap u32.
         let mut d = conv_dispatch(ShaderEntry::Conv2dGradWeightGemm);
         for (batch, width, admitted) in [(2, (1 << 23) + 1, true), (65_535, 65_537, false)] {
-            d.params = vec![batch, 1, 1, width, 1, 1, 1, 1, 0, 1, width, 0];
+            {
+                let args = &mut d.convolution_mut().expect("convolution").args;
+                args.batch = batch;
+                args.in_channels = 1;
+                args.in_h = 1;
+                args.in_w = width;
+                args.out_channels = 1;
+                args.kernel_h = 1;
+                args.kernel_w = 1;
+                args.stride = 1;
+                args.padding_h = 0;
+                args.out_h = 1;
+                args.out_w = width;
+                args.padding_w = 0;
+            }
             assert_eq!(TuneClass::from_dispatch(&d, None).is_some(), admitted);
         }
     }
@@ -2029,7 +2087,8 @@ mod tests {
         let native = MatmulTile::CooperativeF32 { tile_size: 8 };
         let class = class(32, 64, 17);
         let mut d = dispatch();
-        d.params = vec![class.m, class.k, class.n, 0];
+        let matrix = d.matmul_mut().unwrap();
+        (matrix.m, matrix.n, matrix.k) = (class.m, class.n, class.k);
         native.apply(&mut d, &class);
         assert_eq!(d.workgroups, [2, 4, 1]);
         assert!(d.use_coop() && !d.use_coop_compensated() && !d.use_small_tiles());

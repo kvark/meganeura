@@ -288,35 +288,19 @@ the same graph, inputs, device and synchronization contract.
 
 **Status: open. None are urgent; all are real.**
 
-- ~~**`bind_dispatch` is ~1210 lines.**~~ **Done.** One 58-arm match over
-  `dispatch.shader` is now a routing match plus eight family functions:
+- ~~**`bind_dispatch` is ~1210 lines.**~~ **Done.** `Dispatch` keeps shared
+  launch metadata and owns a `DispatchOp` enum. Each operation carries its
+  named operands and dimensions; matrix and convolution payloads carry their
+  own implementation choices. `shader()` derives the pipeline entry.
 
-  | | lines | | lines |
-  |---|---|---|---|
-  | `bind_dispatch` | 333 | `bind_norm` | 195 |
-  | `bind_matmul` | 120 | `bind_activation` | 78 |
-  | `bind_conv` | 196 | `bind_reduction` | 58 |
-  | `bind_attention` | 202 | `bind_loss` | 48 |
-  | | | `bind_pointwise` | 203 |
+  Binding matches `DispatchOp` exhaustively. Its matrix, convolution and
+  generated-kernel helpers accept the corresponding payload directly.
+  Scheduling, memory planning and tuning visit those payloads' buffers,
+  including fused operands and additional outputs. In-place outputs have one
+  stored buffer reference, so remapping preserves their input/output alias.
 
-  The design point is that **the routing match is the only exhaustive one and it
-  has no wildcard arm**, so adding a `ShaderEntry` variant fails to compile at
-  the routing decision. Each family's inner match ends in `unreachable!` — if a
-  routing arm and a family ever drift, the compiler still passes and the
-  mismatch is caught the first time a test reaches it.
+  The recording measurements above predate this representation change.
 
-  Splitting it does **not** make it faster, and that was measured before doing
-  it: timing `bind_dispatch` per shader entry across the whole `bench_step_cpu`
-  sweep gives 138–174 ns for every entry with no hot arm, so the 187 ns that is
-  28% of the per-step host path is the binding model rather than one arm doing
-  something wasteful. Moving the arms moves the same work.
-
-  Verified rather than assumed: the sequence of 65 `pc.bind` calls is
-  byte-identical before and after, so nothing was reordered or dropped.
-
-  The `(m, n, k)` rule had a **third** copy here as well as the two already
-  fixed — see below. Routing every contraction arm through `Dispatch::mnk()`
-  also replaced thirteen `params[0..3]` spellings.
 - ~~**Module sizes.**~~ **Done.** `runtime.rs` 8592 → 5666, `codegen.rs` 8146 →
   5419, `compile.rs` 7928 → 4326. The split is by responsibility, not by line
   count:
@@ -346,25 +330,11 @@ the same graph, inputs, device and synchronization contract.
   none added and none removed. That is the check that makes "pure
   reorganisation" a claim rather than an assertion.
 - ~~**`(m,n,k)` is reinterpreted differently at two binding sites.**~~ **Done.**
-  The two sites disagreed: the horizontal-batch binding swapped `n` and `k` only
-  for `ShaderEntry::MatMul`, and the cooperative-prologue binding only for
-  `MatMul` and `FusedMatMulAdd`. Neither matched the shaders that actually store
-  `(m, k, n)` in `params` — `MatMul`, `MatMulGemv`, `MatMulGemvAdd`,
-  `FusedMatMulAdd`. `Dispatch::mnk()` now encodes the verified table beside
-  `scalar_matmul()` / `conv_k_tile()` / `gemv_shape()`, and returns `None` for a
-  non-contraction rather than handing back three unrelated numbers.
+  Matrix payloads store canonical `m`, `n` and `k` dimensions. Ordinary,
+  horizontal and prologue bindings read those fields directly, as do tuning
+  and kernel selection. `Dispatch::mnk()` returns the same dimensions for
+  every matrix layout and `None` for other operation families.
 
-  Whether either site was *wrong in practice* was checked rather than assumed.
-  Instrumenting `merge_horizontal` across the whole suite shows only `MatMul`
-  (55), `MatMulBT` (29) and `MatMulAT` (44) are ever horizontally merged, so the
-  first site's list happened to be complete for every case the suite produces —
-  by luck, since `merge_horizontal`'s predicate in `compile.rs` restricts the kernel
-  but not the shader. The prologue site is **never reached by any test at all**,
-  so its old list could not be validated empirically; the centralisation makes it
-  correct by construction instead.
-
-  Three tests pin it, including a table of all eight contraction shaders against
-  the order their constructors use.
 - ~~**Quantized block geometry lives in three independent tables.**~~ **Done**,
   though it was five. `DType::block_geometry()` is now the single source for
   `(elements per block, bytes per block)`, read by `TensorType::size_bytes`, by

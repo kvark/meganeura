@@ -850,17 +850,17 @@ impl Session {
         self.wait();
         let mut report = DebugStepReport::default();
         for (i, d) in self.plan.dispatches.iter().enumerate() {
-            if !self.debug && !self.buffer_unaliased(d.output_buffer) {
+            if !self.debug && !self.buffer_unaliased(d.output_buffer()) {
                 report.skipped_aliased += 1;
                 continue;
             }
-            let buf_size = self.plan.buffers[d.output_buffer.0 as usize];
+            let buf_size = self.plan.buffers[d.output_buffer().0 as usize];
             let n = (buf_size / 4).min(65536);
             if n == 0 {
                 continue;
             }
             let mut data = vec![0.0f32; n];
-            self.read_buffer(d.output_buffer, &mut data);
+            self.read_buffer(d.output_buffer(), &mut data);
             let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
             let has_nan = data.iter().any(|v| v.is_nan());
             let has_inf = data.iter().any(|v| v.is_infinite());
@@ -868,7 +868,7 @@ impl Session {
                 report.anomalies.push(DispatchAnomaly {
                     dispatch: i,
                     label: if d.label.is_empty() {
-                        format!("{:?}", d.shader)
+                        format!("{:?}", d.shader())
                     } else {
                         d.label.clone()
                     },
@@ -889,14 +889,14 @@ impl Session {
     /// instability first appears in the forward/backward chain.
     pub fn trace_dispatches(&self, threshold: f32) {
         for (i, d) in self.plan.dispatches.iter().enumerate() {
-            let buf_size = self.plan.buffers[d.output_buffer.0 as usize];
+            let buf_size = self.plan.buffers[d.output_buffer().0 as usize];
             let n = buf_size / 4;
             if n == 0 {
                 continue;
             }
             let read_n = n.min(65536);
             let mut data = vec![0.0f32; read_n];
-            self.read_buffer(d.output_buffer, &mut data);
+            self.read_buffer(d.output_buffer(), &mut data);
 
             let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
             let has_nan = data.iter().any(|v| v.is_nan());
@@ -904,7 +904,7 @@ impl Session {
 
             if has_nan || has_inf || max_abs > threshold || (max_abs == 0.0 && n > 100) {
                 let label = if d.label.is_empty() {
-                    format!("{:?}", d.shader)
+                    format!("{:?}", d.shader())
                 } else {
                     d.label.clone()
                 };

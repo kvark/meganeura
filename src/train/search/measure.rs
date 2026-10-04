@@ -264,6 +264,7 @@ pub(super) fn select(
 mod tests {
     use super::*;
     use crate::TuneOptions;
+    use crate::compile::{DispatchOp, dispatch};
     use crate::train::BuildSearchOptions;
 
     fn select(
@@ -299,16 +300,22 @@ mod tests {
         plan.param_grad_pairs.push((BufferRef(0), BufferRef(1)));
         assert_eq!(super::plan_bytes(&plan).unwrap(), bytes);
         plan.param_grad_pairs.clear();
-        plan.dispatches.push(Dispatch {
-            output_buffer: plan.input_buffers[0].1,
-            ..Default::default()
-        });
+        plan.dispatches.push(Dispatch::new(
+            DispatchOp::Matmul(dispatch::Matmul::new(
+                dispatch::MatmulKind::Plain,
+                crate::compile::BufferRef(0),
+                crate::compile::BufferRef(0),
+                plan.input_buffers[0].1,
+                [0, 0, 0],
+            )),
+            [0; 3],
+        ));
         assert_eq!(super::plan_bytes(&plan).unwrap(), bytes + 8);
     }
 
     #[test]
     fn program_search_preserves_update_and_failure_contracts() {
-        use crate::compile::{Dispatch, Kernel, ShaderEntry};
+        use crate::compile::Dispatch;
         use crate::schedule::{PointwiseDAG, Pw};
         let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
         let mut graph = crate::Graph::new();
@@ -320,25 +327,25 @@ mod tests {
         let mut plan = crate::compile::compile(&crate::autodiff::differentiate(&graph));
         // An in-program update: w -= 0.25 * grad.
         let (w, grad) = plan.param_grad_pairs[0];
-        plan.dispatches.push(Dispatch {
-            shader: ShaderEntry::Generated,
-            input_buffers: vec![w, grad],
-            output_buffer: w,
-            workgroups: [1, 1, 1],
-            params: vec![2, 0, 0, 0],
-            kernel: Kernel::Pointwise(PointwiseDAG {
-                n_inputs: 2,
-                ops: vec![
-                    Pw::LoadInput(0),
-                    Pw::LoadInput(1),
-                    Pw::Const(0.25f32.to_bits()),
-                    Pw::Mul(1, 2),
-                    Pw::Sub(0, 3),
-                ],
-                output: 4,
+        plan.dispatches.push(Dispatch::new(
+            DispatchOp::Pointwise(dispatch::Pointwise {
+                inputs: vec![w, grad],
+                dst: w,
+                len: 2,
+                dag: PointwiseDAG {
+                    n_inputs: 2,
+                    ops: vec![
+                        Pw::LoadInput(0),
+                        Pw::LoadInput(1),
+                        Pw::Const(0.25f32.to_bits()),
+                        Pw::Mul(1, 2),
+                        Pw::Sub(0, 3),
+                    ],
+                    output: 4,
+                },
             }),
-            ..Default::default()
-        });
+            [1, 1, 1],
+        ));
         for invalidate in [false, true] {
             let initialized = std::cell::Cell::new(0);
             let programs = ["baseline", "candidate"].map(|name| {

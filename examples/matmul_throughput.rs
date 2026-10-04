@@ -90,13 +90,13 @@ fn bench_shape(
         .iter()
         .find(|d| {
             matches!(
-                d.shader,
+                d.shader(),
                 meganeura::compile::ShaderEntry::MatMul
                     | meganeura::compile::ShaderEntry::MatMulGemv
             )
         })
         .map(|d| {
-            let kernel = match d.shader {
+            let kernel = match d.shader() {
                 meganeura::compile::ShaderEntry::MatMulGemv => "gemv",
                 _ if d.use_coop() => "coop",
                 _ if d.use_small_tiles() => "small",

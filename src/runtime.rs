@@ -1,4 +1,7 @@
-use crate::compile::{BufferRef, CachedBlockAttentionParams, Dispatch, ExecutionPlan, ShaderEntry};
+use crate::compile::{
+    BufferRef, CachedBlockAttentionParams, Dispatch, DispatchOp, ExecutionPlan, ShaderEntry,
+    dispatch,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -631,33 +634,30 @@ struct Conv2dParams {
     output_spatial_multiplier: u32,
 }
 
-impl From<&Dispatch> for Conv2dParams {
-    fn from(dispatch: &Dispatch) -> Self {
-        let p = &dispatch.params;
-        let column_width = match dispatch.shader {
-            ShaderEntry::Conv2dGradInputGemm
-            | ShaderEntry::Conv2dGradInputGemmSmall
-            | ShaderEntry::Conv2dGradInputGemm16
-            | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => p[3],
-            _ => p[10],
+impl From<&dispatch::Convolution> for Conv2dParams {
+    fn from(op: &dispatch::Convolution) -> Self {
+        let p = &op.args;
+        let column_width = match op.kind {
+            dispatch::ConvolutionKind::InputGradient => p.in_w,
+            _ => p.out_w,
         };
         Self {
-            batch: p[0],
-            in_channels: p[1],
-            in_h: p[2],
-            in_w: p[3],
-            out_channels: p[4],
-            kernel_h: p[5],
-            kernel_w: p[6],
-            stride: p[7],
-            padding_h: p[8],
-            out_h: p[9],
-            out_w: p[10],
-            padding_w: p[11],
-            kernel_w_multiplier: crate::divisor::multiplier(p[6]),
-            kernel_hw_multiplier: crate::divisor::multiplier(p[5] * p[6]),
+            batch: p.batch,
+            in_channels: p.in_channels,
+            in_h: p.in_h,
+            in_w: p.in_w,
+            out_channels: p.out_channels,
+            kernel_h: p.kernel_h,
+            kernel_w: p.kernel_w,
+            stride: p.stride,
+            padding_h: p.padding_h,
+            out_h: p.out_h,
+            out_w: p.out_w,
+            padding_w: p.padding_w,
+            kernel_w_multiplier: crate::divisor::multiplier(p.kernel_w),
+            kernel_hw_multiplier: crate::divisor::multiplier(p.kernel_h * p.kernel_w),
             column_width_multiplier: crate::divisor::multiplier(column_width),
-            output_spatial_multiplier: crate::divisor::multiplier(p[9] * p[10]),
+            output_spatial_multiplier: crate::divisor::multiplier(p.out_h * p.out_w),
         }
     }
 }
@@ -912,8 +912,8 @@ struct EpiloguePipelineKey(
 );
 
 fn epilogue_pipeline_key(dispatch: &Dispatch) -> Option<EpiloguePipelineKey> {
-    let format = dispatch.weight_format;
-    dispatch.matmul_epilogue.as_ref().map(|epilogue| {
+    let format = dispatch.weight_format();
+    dispatch.matmul_epilogue().map(|epilogue| {
         EpiloguePipelineKey(
             epilogue.clone(),
             format,
@@ -953,7 +953,7 @@ enum Variant {
         crate::codegen::ScalarMatmulShape,
         u32,
     ),
-    SpecializedConv(ShaderEntry, Vec<u32>, u32),
+    SpecializedConv(ShaderEntry, [u32; 12], u32),
     ScalarMatmul(
         ShaderEntry,
         crate::compile::WeightFormat,
@@ -1184,16 +1184,20 @@ impl Pipelines {
                 ShaderEntry::AdaptiveGradClip,
                 ShaderEntry::GradAccum,
             ] {
-                pipelines
-                    .prepare(
-                        gpu,
-                        &Dispatch {
-                            shader,
-                            ..Default::default()
-                        },
-                        None,
-                    )
+                let module = crate::codegen::generate_module(
+                    shader.shader_group(),
+                    crate::codegen::MatmulKnobs::default(),
+                );
+                let generated = create_gen_shader(gpu, module, wgsl_dump_dir)
                     .expect("optimizer shader was rejected");
+                let key = Variant::Scalar(shader.clone());
+                let pipeline = create_profiled_pipeline(
+                    gpu,
+                    key.label(),
+                    &shader_data_layout(&shader),
+                    generated.at(shader.entry_point()),
+                );
+                pipelines.map.insert(key, pipeline);
             }
         }
         pipelines.select(&plan.dispatches);
@@ -1223,9 +1227,9 @@ impl Pipelines {
             matmul_knobs.interleave_columns = shape.interleave_columns;
             matmul_knobs.unroll_k = shape.unroll_k;
         }
-        let group = dispatch.shader.shader_group();
-        let mut layout = shader_data_layout(&dispatch.shader);
-        let mut entry_point = dispatch.shader.entry_point();
+        let group = dispatch.shader().shader_group();
+        let mut layout = shader_data_layout(&dispatch.shader());
+        let mut entry_point = dispatch.shader().entry_point();
         let cooperative =
             || *coop_config.expect("cooperative dispatch needs a qualified device configuration");
         let module = match key {
@@ -1246,7 +1250,7 @@ impl Pipelines {
                 group,
                 shape,
                 splits,
-                dispatch.weight_format,
+                dispatch.weight_format(),
                 matmul_knobs,
             ),
             Variant::SpecializedConv(..) => {
@@ -1258,7 +1262,7 @@ impl Pipelines {
             | Variant::GemvIntDot(_, _, shape)
             | Variant::GemvRmsNorm(_, _, shape)
             | Variant::GemvRmsNormIntDot(_, _, shape) => {
-                if dispatch.gemv_rmsnorm.is_some() {
+                if dispatch.gemv_rmsnorm().is_some() {
                     layout = <MatMulRmsNormData as blade_graphics::ShaderData>::layout();
                 }
                 tuning::tile_module(dispatch, crate::tune::MatmulTile::Gemv(shape), matmul_knobs)
@@ -1267,7 +1271,7 @@ impl Pipelines {
                 let mut config = cooperative();
                 config.compensated = dispatch.use_coop_compensated();
                 use crate::codegen::Conv2dCoopDirection;
-                match dispatch.shader {
+                match dispatch.shader() {
                     ShaderEntry::Conv2dGemmCoopGen(kh, kw, stride) => {
                         crate::codegen::generate_conv2d_coop_module(
                             kh,
@@ -1291,9 +1295,9 @@ impl Pipelines {
             }
             Variant::Epilogue(..) => crate::codegen::generate_matmul_with_epilogue(
                 group,
-                dispatch.matmul_epilogue.as_ref(),
+                dispatch.matmul_epilogue(),
                 crate::codegen::MatMulOptions {
-                    format: dispatch.weight_format,
+                    format: dispatch.weight_format(),
                     tile: epilogue_tile(dispatch),
                     knobs: matmul_knobs,
                 },
@@ -1301,16 +1305,10 @@ impl Pipelines {
             Variant::CoopEpilogue(..) => crate::codegen::generate_coop_matmul_with_dag_epilogue(
                 group,
                 &cooperative(),
-                dispatch
-                    .matmul_epilogue
-                    .as_ref()
-                    .expect("cooperative epilogue"),
+                dispatch.matmul_epilogue().expect("cooperative epilogue"),
             ),
             Variant::CoopPrologue(..) => {
-                let prologue = dispatch
-                    .matmul_prologue
-                    .as_ref()
-                    .expect("cooperative prologue");
+                let prologue = dispatch.matmul_prologue().expect("cooperative prologue");
                 let (add, variant) =
                     crate::codegen::coop_shape(group).expect("cooperative matrix group");
                 layout = matmul_with_prologue_layout(prologue.factors.len());
@@ -1389,37 +1387,32 @@ impl Pipelines {
     }
 
     fn attention_head_dim(dispatch: &Dispatch) -> Option<u32> {
-        use crate::codegen::ShaderGroup;
-        match dispatch.shader.shader_group() {
-            ShaderGroup::CachedBlockAttention
-            | ShaderGroup::CachedBlockAttentionSplit
-            | ShaderGroup::CachedBlockAttentionCombine => {
-                CachedBlockAttentionParams::from_words(&dispatch.params).map(|p| p.head_dim)
-            }
-            ShaderGroup::MultiHeadAttn
-            | ShaderGroup::FlashAttention
-            | ShaderGroup::FlashAttentionCoop
-            | ShaderGroup::FlashGradQ
-            | ShaderGroup::FlashGradQCoop
-            | ShaderGroup::FlashGradKV
-            | ShaderGroup::FlashGradKVCoop
-            | ShaderGroup::CachedQueryAttention => dispatch.params.get(3).copied(),
-            _ => None,
+        match dispatch.op {
+            DispatchOp::MultiHeadAttnGradQ(_)
+            | DispatchOp::MultiHeadAttnGradKV(_)
+            | DispatchOp::CachedAttention(_) => None,
+            _ => dispatch.attention_head_dim(),
         }
     }
 
-    /// Resolve one implementation. Geometry and arithmetic must not depend on
-    /// which unrelated pipelines happen to have been compiled.
     fn key(dispatch: &Dispatch) -> Variant {
-        let entry = dispatch.shader.clone();
-        if let crate::compile::Kernel::SplitMatmul { shape, splits } = dispatch.kernel {
-            return Variant::SplitMatmul(entry, dispatch.weight_format, shape, splits);
+        let entry = dispatch.shader();
+        if let crate::compile::Kernel::SplitMatmul { shape, splits } = dispatch.kernel() {
+            return Variant::SplitMatmul(entry, dispatch.weight_format(), shape, splits);
         }
         if let Some(k_tile) = dispatch.conv_k_tile() {
-            return Variant::SpecializedConv(entry, dispatch.params.clone(), k_tile);
+            return Variant::SpecializedConv(
+                entry,
+                dispatch
+                    .convolution()
+                    .expect("convolution")
+                    .args
+                    .geometry_words(),
+                k_tile,
+            );
         }
-        if dispatch.horizontal_batch >= 2 {
-            return Variant::Horizontal(entry, dispatch.horizontal_batch, horiz_kind(dispatch));
+        if dispatch.horizontal_batch() >= 2 {
+            return Variant::Horizontal(entry, dispatch.horizontal_batch(), horiz_kind(dispatch));
         }
         if let Some(epilogue) = epilogue_pipeline_key(dispatch) {
             return if dispatch.use_coop() {
@@ -1429,20 +1422,20 @@ impl Pipelines {
             };
         }
         if let Some(shape) = dispatch.scalar_matmul() {
-            return Variant::ScalarMatmul(entry, dispatch.weight_format, shape);
+            return Variant::ScalarMatmul(entry, dispatch.weight_format(), shape);
         }
-        if dispatch.gemv_int_dot() || dispatch.gemv_rmsnorm.is_some() {
+        if dispatch.gemv_int_dot() || dispatch.gemv_rmsnorm().is_some() {
             let shape = dispatch
                 .gemv_shape()
                 .unwrap_or_else(|| crate::codegen::GemvShape::initial(entry.shader_group()));
             return if dispatch.gemv_int_dot() {
-                if dispatch.gemv_rmsnorm.is_some() {
-                    Variant::GemvRmsNormIntDot(entry, dispatch.weight_format, shape)
+                if dispatch.gemv_rmsnorm().is_some() {
+                    Variant::GemvRmsNormIntDot(entry, dispatch.weight_format(), shape)
                 } else {
-                    Variant::GemvIntDot(entry, dispatch.weight_format, shape)
+                    Variant::GemvIntDot(entry, dispatch.weight_format(), shape)
                 }
             } else {
-                Variant::GemvRmsNorm(entry, dispatch.weight_format, shape)
+                Variant::GemvRmsNorm(entry, dispatch.weight_format(), shape)
             };
         }
         if let Some(kernel) = dispatch.reduction() {
@@ -1455,17 +1448,17 @@ impl Pipelines {
             return Variant::Attention(entry, dim);
         }
         if let Some(shape) = dispatch.gemv_shape() {
-            return Variant::Gemv(entry, dispatch.weight_format, shape);
+            return Variant::Gemv(entry, dispatch.weight_format(), shape);
         }
-        if dispatch.weight_format.uses_reduced_storage() {
+        if dispatch.weight_format().uses_reduced_storage() {
             return if dispatch.use_small_tiles() {
-                Variant::WeightSmall(entry, dispatch.weight_format)
+                Variant::WeightSmall(entry, dispatch.weight_format())
             } else {
-                Variant::Weight(entry, dispatch.weight_format)
+                Variant::Weight(entry, dispatch.weight_format())
             };
         }
         if dispatch.use_coop() {
-            if let Some(ref prologue) = dispatch.matmul_prologue {
+            if let Some(prologue) = dispatch.matmul_prologue() {
                 return Variant::CoopPrologue(
                     entry,
                     prologue.factors.iter().map(|f| f.1.clone()).collect(),
@@ -1942,7 +1935,10 @@ pub(crate) fn select_variants(
             // promotion may replace it. Any other measured K stage stays.
             if matches!(dispatch.conv_k_tile(), Some(k_tile) if k_tile != 16)
                 || dispatch.scalar_matmul().is_some()
-                || matches!(dispatch.kernel, crate::compile::Kernel::SplitMatmul { .. })
+                || matches!(
+                    dispatch.kernel(),
+                    crate::compile::Kernel::SplitMatmul { .. }
+                )
             {
                 continue;
             }
@@ -1961,48 +1957,39 @@ pub(crate) fn select_variants(
             // accumulators through workgroup memory, then apply scalar
             // WGSL with bounds checks. DAGs needing extra storage bindings
             // stay on scalar geometry.
-            if dispatch.matmul_epilogue.is_some() {
-                match dispatch.matmul_epilogue {
-                    Some(ref epilogue) if epilogue.inputs.is_empty() => {}
+            if dispatch.matmul_epilogue().is_some() {
+                match dispatch.matmul_epilogue() {
+                    Some(epilogue) if epilogue.inputs.is_empty() => {}
                     _ => continue,
                 }
             }
-            let group = dispatch.shader.shader_group();
-            // Extract (m, n, k, batch) from dispatch params based on shader group.
+            let group = dispatch.shader().shader_group();
             let (m, n, k, batch) = match group {
-                ShaderGroup::MatMul | ShaderGroup::MatMulAdd => (
-                    dispatch.params[0],
-                    dispatch.params[2],
-                    dispatch.params[1],
-                    1u32,
-                ),
+                ShaderGroup::MatMul
+                | ShaderGroup::MatMulAdd
+                | ShaderGroup::MatMulAT
+                | ShaderGroup::MatMulBT => {
+                    let op = dispatch.matmul().expect("matrix operation");
+                    (op.m, op.n, op.k, 1)
+                }
                 ShaderGroup::Conv2dGemm => {
-                    // Forward: C[Co, oH*oW] = W[Co, K] × im2col[K, oH*oW]
-                    // params: [batch, in_channels, in_h, in_w, out_channels, kernel_h, kernel_w, stride, padding_h, out_h, out_w, padding_w]
-                    let out_ch = dispatch.params[4];
-                    let kh = dispatch.params[5];
-                    let kw = dispatch.params[6];
-                    let in_ch = dispatch.params[1];
-                    let out_h = dispatch.params[9];
-                    let out_w = dispatch.params[10];
-                    (out_ch, out_h * out_w, in_ch * kh * kw, dispatch.params[0])
+                    let args = &dispatch.convolution().expect("convolution").args;
+                    (
+                        args.out_channels,
+                        args.out_h * args.out_w,
+                        args.in_channels * args.kernel_h * args.kernel_w,
+                        args.batch,
+                    )
                 }
                 ShaderGroup::Conv2dGradInputGemm => {
-                    // params: [batch, in_channels, in_h, in_w, out_channels, kernel_h, kernel_w, stride, padding, out_h, out_w, ...]
-                    let in_ch = dispatch.params[1];
-                    let in_h = dispatch.params[2];
-                    let in_w = dispatch.params[3];
-                    let out_ch = dispatch.params[4];
-                    let kh = dispatch.params[5];
-                    let kw = dispatch.params[6];
-                    (in_ch, in_h * in_w, out_ch * kh * kw, dispatch.params[0])
+                    let args = &dispatch.convolution().expect("convolution").args;
+                    (
+                        args.in_channels,
+                        args.in_h * args.in_w,
+                        args.out_channels * args.kernel_h * args.kernel_w,
+                        args.batch,
+                    )
                 }
-                ShaderGroup::MatMulAT | ShaderGroup::MatMulBT => (
-                    dispatch.params[0],
-                    dispatch.params[1],
-                    dispatch.params[2],
-                    1u32,
-                ),
                 _ => continue,
             };
             if apple_f32_coop
@@ -2092,19 +2079,11 @@ pub(crate) fn select_variants(
                 _ => true,
             };
             let _ = k;
-            if coop_wgs >= min_wgs && !dispatch.weight_format.uses_reduced_storage() && vec4_ok {
-                dispatch.kernel = crate::compile::Kernel::Cooperative;
-                // Route conv2d coop dispatches to generated specialized kernels
-                if is_conv_bwd {
-                    let kh = dispatch.params[5];
-                    let kw = dispatch.params[6];
-                    let stride = dispatch.params[7];
-                    dispatch.shader = ShaderEntry::Conv2dGradInputGemmCoopGen(kh, kw, stride);
-                } else if matches!(group, ShaderGroup::Conv2dGemm) {
-                    let kh = dispatch.params[5];
-                    let kw = dispatch.params[6];
-                    let stride = dispatch.params[7];
-                    dispatch.shader = ShaderEntry::Conv2dGemmCoopGen(kh, kw, stride);
+            if coop_wgs >= min_wgs && !dispatch.weight_format().uses_reduced_storage() && vec4_ok {
+                dispatch.set_kernel(crate::compile::Kernel::Cooperative);
+                if let Some(op) = dispatch.convolution_mut() {
+                    op.implementation =
+                        dispatch::ConvolutionImplementation::Cooperative { specialized: true };
                 }
                 dispatch.workgroups = [m.div_ceil(output_tile), n.div_ceil(output_tile), batch];
                 // coopStore/coopLoad operate on full tiles without per-element
@@ -2113,13 +2092,13 @@ pub(crate) fn select_variants(
                 let padded_m = m.div_ceil(output_tile) * output_tile;
                 let padded_n = n.div_ceil(output_tile) * output_tile;
                 let padded_bytes = (padded_m * padded_n * batch * 4) as usize;
-                let buf_idx = dispatch.output_buffer.0 as usize;
+                let buf_idx = dispatch.output_buffer().0 as usize;
                 if plan.buffers[buf_idx] < padded_bytes {
                     plan.buffers[buf_idx] = padded_bytes;
                 }
                 // FusedMatMulAdd: also pad the addend (src) buffer.
-                if dispatch.input_buffers.len() > 2 {
-                    let src_idx = dispatch.input_buffers[2].0 as usize;
+                if dispatch.input_buffers().len() > 2 {
+                    let src_idx = dispatch.input_buffers()[2].0 as usize;
                     if plan.buffers[src_idx] < padded_bytes {
                         plan.buffers[src_idx] = padded_bytes;
                     }
@@ -2150,12 +2129,15 @@ pub(crate) fn select_variants(
             if dispatch.use_coop()
                 || dispatch.use_small_tiles()
                 || dispatch.scalar_matmul().is_some()
-                || matches!(dispatch.kernel, crate::compile::Kernel::SplitMatmul { .. })
-                || dispatch.weight_format.uses_reduced_storage()
+                || matches!(
+                    dispatch.kernel(),
+                    crate::compile::Kernel::SplitMatmul { .. }
+                )
+                || dispatch.weight_format().uses_reduced_storage()
             {
                 continue;
             }
-            let group = dispatch.shader.shader_group();
+            let group = dispatch.shader().shader_group();
             let wgs_64: u32 = dispatch.workgroups.iter().product();
             let has_small = matches!(
                 group,
@@ -2165,13 +2147,8 @@ pub(crate) fn select_variants(
                     | ShaderGroup::MatMulBT
             );
             if has_small && wgs_64 < 16 {
-                dispatch.kernel = crate::compile::Kernel::SmallTile;
-                let (m, n) = match group {
-                    ShaderGroup::MatMul | ShaderGroup::MatMulAdd => {
-                        (dispatch.params[0], dispatch.params[2])
-                    }
-                    _ => (dispatch.params[0], dispatch.params[1]),
-                };
+                dispatch.set_kernel(crate::compile::Kernel::SmallTile);
+                let (m, n, _) = dispatch.mnk().expect("matrix operation");
                 dispatch.workgroups = [n.div_ceil(32), m.div_ceil(32), 1];
             }
         }
@@ -2228,8 +2205,23 @@ mod block_matmul_variant_tests {
 
 #[cfg(test)]
 mod coop_precision_tests {
+    use crate::compile::{DispatchOp, dispatch};
+
     use super::{Dispatch, coop_preserves_required_precision};
     use crate::codegen::CoopConfig;
+
+    fn dispatch() -> Dispatch {
+        Dispatch::new(
+            DispatchOp::Matmul(dispatch::Matmul::new(
+                dispatch::MatmulKind::Plain,
+                crate::compile::BufferRef(0),
+                crate::compile::BufferRef(1),
+                crate::compile::BufferRef(2),
+                [1, 1, 1],
+            )),
+            [1, 1, 1],
+        )
+    }
 
     #[test]
     fn auto_keeps_full_precision_work_off_f16_coop() {
@@ -2240,9 +2232,9 @@ mod coop_precision_tests {
         };
         let full_precision = Dispatch {
             requires_full_precision: true,
-            ..Default::default()
+            ..dispatch()
         };
-        let ordinary = Dispatch::default();
+        let ordinary = dispatch();
 
         assert!(!coop_preserves_required_precision(
             &f16_coop,
@@ -2268,7 +2260,7 @@ mod coop_precision_tests {
         };
         let full_precision = Dispatch {
             requires_full_precision: true,
-            ..Default::default()
+            ..dispatch()
         };
 
         assert!(coop_preserves_required_precision(
@@ -3070,8 +3062,8 @@ impl Session {
         if let Some(head_dim) = plan
             .dispatches
             .iter()
-            .filter(|dispatch| dispatch.shader == ShaderEntry::FlashAttention)
-            .map(|dispatch| dispatch.params[3])
+            .filter(|dispatch| dispatch.shader() == ShaderEntry::FlashAttention)
+            .filter_map(Dispatch::attention_head_dim)
             .max()
         {
             plan.knobs
@@ -3235,17 +3227,17 @@ impl Session {
                     eprintln!(
                         "g{gi:03} d{i:03} {} nodes={:?} coop={} epilogue={} in={:?} out={} wg={:?} params={:?}",
                         if d.label.is_empty() {
-                            format!("{:?}", d.shader)
+                            format!("{:?}", d.shader())
                         } else {
                             d.label.clone()
                         },
                         d.origin,
                         d.use_coop(),
-                        d.matmul_epilogue.is_some(),
-                        d.input_buffers.iter().map(|b| b.0).collect::<Vec<_>>(),
-                        d.output_buffer.0,
+                        d.matmul_epilogue().is_some(),
+                        d.input_buffers().iter().map(|b| b.0).collect::<Vec<_>>(),
+                        d.output_buffer().0,
                         d.workgroups,
-                        d.params
+                        d.parameter_words()
                     );
                 }
             }
@@ -3562,8 +3554,8 @@ impl Session {
         // zeros that look like data.
         let mut written = vec![false; plan.buffers.len()];
         for d in &plan.dispatches {
-            written[d.output_buffer.0 as usize] = true;
-            for b in &d.extra_outputs {
+            written[d.output_buffer().0 as usize] = true;
+            for b in &d.extra_outputs() {
                 written[b.0 as usize] = true;
             }
         }
@@ -4083,6 +4075,8 @@ pub(crate) fn parse_device_id(value: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod variant_tests {
+    use crate::compile::{DispatchOp, dispatch};
+
     use super::{
         Dispatch, HorizMatMulKind, Pipelines, ShaderEntry, Variant, epilogue_pipeline_key,
         epilogue_tile, select_variants,
@@ -4103,10 +4097,16 @@ mod variant_tests {
     }
 
     fn matmul(f: impl FnOnce(&mut Dispatch)) -> Variant {
-        let mut d = Dispatch {
-            shader: ShaderEntry::MatMul,
-            ..Default::default()
-        };
+        let mut d = Dispatch::new(
+            DispatchOp::Matmul(dispatch::Matmul::new(
+                dispatch::MatmulKind::Plain,
+                crate::compile::BufferRef(0),
+                crate::compile::BufferRef(0),
+                crate::compile::BufferRef(0),
+                [0, 0, 0],
+            )),
+            [0; 3],
+        );
         f(&mut d);
         Pipelines::key(&d)
     }
@@ -4120,13 +4120,13 @@ mod variant_tests {
 
         assert_eq!(
             matmul(|d| {
-                d.kernel = crate::compile::Kernel::SmallTile;
-                d.weight_format = crate::compile::WeightFormat::F16;
+                d.set_kernel(crate::compile::Kernel::SmallTile);
+                d.matmul_mut().expect("matmul").weight_format = crate::compile::WeightFormat::F16;
             }),
             Variant::WeightSmall(ShaderEntry::MatMul, crate::compile::WeightFormat::F16),
         );
         assert_eq!(
-            matmul(|d| d.kernel = crate::compile::Kernel::Cooperative),
+            matmul(|d| d.set_kernel(crate::compile::Kernel::Cooperative)),
             Variant::Coop(ShaderEntry::MatMul),
         );
     }
@@ -4137,36 +4137,52 @@ mod variant_tests {
     #[test]
     fn epilogue_fusion_has_no_fallback() {
         let candidates = matmul(|d| {
-            d.matmul_epilogue = Some(relu_epilogue());
+            d.matmul_mut().expect("matmul").epilogue = Some(relu_epilogue());
         });
         assert!(matches!(candidates, Variant::Epilogue(..)));
 
         let coop = matmul(|d| {
-            d.matmul_epilogue = Some(relu_epilogue());
-            d.kernel = crate::compile::Kernel::Cooperative;
+            d.matmul_mut().expect("matmul").epilogue = Some(relu_epilogue());
+            d.set_kernel(crate::compile::Kernel::Cooperative);
         });
         assert!(matches!(coop, Variant::CoopEpilogue(..)));
 
         let q4 = matmul(|d| {
-            d.matmul_epilogue = Some(relu_epilogue());
-            d.weight_format = crate::compile::WeightFormat::Q4;
+            d.matmul_mut().expect("matmul").epilogue = Some(relu_epilogue());
+            d.matmul_mut().expect("matmul").weight_format = crate::compile::WeightFormat::Q4;
         });
         assert!(matches!(q4, Variant::Epilogue(..)));
         assert_ne!(
             epilogue_pipeline_key(&{
-                let mut d = Dispatch {
-                    shader: ShaderEntry::MatMul,
-                    matmul_epilogue: Some(relu_epilogue()),
-                    ..Default::default()
-                };
-                d.weight_format = crate::compile::WeightFormat::Q4;
+                let mut d = Dispatch::new(
+                    DispatchOp::Matmul(dispatch::Matmul {
+                        epilogue: Some(relu_epilogue()),
+                        ..dispatch::Matmul::new(
+                            dispatch::MatmulKind::Plain,
+                            crate::compile::BufferRef(0),
+                            crate::compile::BufferRef(0),
+                            crate::compile::BufferRef(0),
+                            [0, 0, 0],
+                        )
+                    }),
+                    [0; 3],
+                );
+                d.matmul_mut().expect("matmul").weight_format = crate::compile::WeightFormat::Q4;
                 d
             }),
-            epilogue_pipeline_key(&Dispatch {
-                shader: ShaderEntry::MatMul,
-                matmul_epilogue: Some(relu_epilogue()),
-                ..Default::default()
-            }),
+            epilogue_pipeline_key(&Dispatch::new(
+                DispatchOp::Matmul(dispatch::Matmul {
+                    epilogue: Some(relu_epilogue()),
+                    ..dispatch::Matmul::new(
+                        dispatch::MatmulKind::Plain,
+                        crate::compile::BufferRef(0),
+                        crate::compile::BufferRef(0),
+                        crate::compile::BufferRef(0),
+                        [0, 0, 0],
+                    )
+                }),
+                [0; 3]
+            )),
             "Q4 and F32 epilogue pipelines must not share a key"
         );
     }
@@ -4176,15 +4192,21 @@ mod variant_tests {
     /// generated for the same geometry, so the tile belongs in the key.
     #[test]
     fn small_tile_epilogue_gets_its_own_pipeline() {
-        let large = Dispatch {
-            shader: ShaderEntry::MatMul,
-            matmul_epilogue: Some(relu_epilogue()),
-            ..Default::default()
-        };
-        let small = Dispatch {
-            kernel: crate::compile::Kernel::SmallTile,
-            ..large.clone()
-        };
+        let large = Dispatch::new(
+            DispatchOp::Matmul(dispatch::Matmul {
+                epilogue: Some(relu_epilogue()),
+                ..dispatch::Matmul::new(
+                    dispatch::MatmulKind::Plain,
+                    crate::compile::BufferRef(0),
+                    crate::compile::BufferRef(0),
+                    crate::compile::BufferRef(0),
+                    [0, 0, 0],
+                )
+            }),
+            [0; 3],
+        );
+        let mut small = large.clone();
+        small.set_kernel(crate::compile::Kernel::SmallTile);
         assert_ne!(
             epilogue_pipeline_key(&small),
             epilogue_pipeline_key(&large),
@@ -4201,22 +4223,16 @@ mod variant_tests {
                         interleave_columns,
                         unroll_k: true,
                     };
-                    let dispatch = Dispatch {
-                        kernel: crate::compile::Kernel::ScalarMatmul(shape),
-                        ..large.clone()
-                    };
+                    let mut dispatch = large.clone();
+                    dispatch.set_kernel(crate::compile::Kernel::ScalarMatmul(shape));
                     assert!(matches!(Pipelines::key(&dispatch), Variant::Epilogue(..)));
                     assert_eq!(epilogue_tile(&dispatch), shape.geometry());
                     assert!(keys.insert(Pipelines::key(&dispatch)), "{shape:?}");
-                    let split = Dispatch {
-                        kernel: crate::compile::Kernel::SplitMatmul { shape, splits: 4 },
-                        matmul_epilogue: None,
-                        ..dispatch
-                    };
-                    let half = Dispatch {
-                        weight_format: crate::compile::WeightFormat::F16,
-                        ..split.clone()
-                    };
+                    let mut split = dispatch;
+                    split.set_kernel(crate::compile::Kernel::SplitMatmul { shape, splits: 4 });
+                    split.matmul_mut().unwrap().epilogue = None;
+                    let mut half = split.clone();
+                    half.matmul_mut().unwrap().weight_format = crate::compile::WeightFormat::F16;
                     assert_ne!(Pipelines::key(&split), Pipelines::key(&half));
                 }
             }
@@ -4231,16 +4247,16 @@ mod variant_tests {
     #[test]
     fn epilogue_dispatch_does_not_request_unreachable_variants() {
         let epilogue_small = matmul(|d| {
-            d.matmul_epilogue = Some(relu_epilogue());
-            d.kernel = crate::compile::Kernel::SmallTile;
-            d.weight_format = crate::compile::WeightFormat::Q4;
+            d.matmul_mut().expect("matmul").epilogue = Some(relu_epilogue());
+            d.set_kernel(crate::compile::Kernel::SmallTile);
+            d.matmul_mut().expect("matmul").weight_format = crate::compile::WeightFormat::Q4;
         });
         assert!(matches!(epilogue_small, Variant::Epilogue(..)));
 
         // Removing the epilogue still preserves both tile and storage format.
         let plain_small = matmul(|d| {
-            d.kernel = crate::compile::Kernel::SmallTile;
-            d.weight_format = crate::compile::WeightFormat::Q4;
+            d.set_kernel(crate::compile::Kernel::SmallTile);
+            d.matmul_mut().expect("matmul").weight_format = crate::compile::WeightFormat::Q4;
         });
         assert_eq!(
             plain_small,
@@ -4294,7 +4310,7 @@ mod variant_tests {
         };
         select_variants(&mut weighted, None, false, false);
         assert_eq!(
-            weighted.dispatches[0].weight_format,
+            weighted.dispatches[0].weight_format(),
             crate::compile::WeightFormat::Q4
         );
         let pipelines = Pipelines::new(&gpu, &weighted, None, None);
@@ -4323,7 +4339,7 @@ mod variant_tests {
             crate::compile::compile(&g)
         };
         assert!(
-            plan.dispatches[0].matmul_epilogue.is_some(),
+            plan.dispatches[0].matmul_epilogue().is_some(),
             "expected the relu to fuse into the matmul"
         );
         select_variants(&mut plan, None, false, false);
@@ -4397,14 +4413,25 @@ mod variant_tests {
 
     #[test]
     fn horizontal_pack_keys_include_precision() {
-        let scalar = matmul(|d| d.horizontal_batch = 3);
+        let scalar = matmul(|d| {
+            d.matmul_mut().unwrap().siblings = vec![
+                (crate::compile::BufferRef(3), crate::compile::BufferRef(4)),
+                (crate::compile::BufferRef(5), crate::compile::BufferRef(6)),
+            ]
+        });
         let coop = matmul(|d| {
-            d.horizontal_batch = 3;
-            d.kernel = crate::compile::Kernel::Cooperative;
+            d.matmul_mut().unwrap().siblings = vec![
+                (crate::compile::BufferRef(3), crate::compile::BufferRef(4)),
+                (crate::compile::BufferRef(5), crate::compile::BufferRef(6)),
+            ];
+            d.set_kernel(crate::compile::Kernel::Cooperative);
         });
         let compensated = matmul(|d| {
-            d.horizontal_batch = 3;
-            d.kernel = crate::compile::Kernel::CooperativeCompensated;
+            d.matmul_mut().unwrap().siblings = vec![
+                (crate::compile::BufferRef(3), crate::compile::BufferRef(4)),
+                (crate::compile::BufferRef(5), crate::compile::BufferRef(6)),
+            ];
+            d.set_kernel(crate::compile::Kernel::CooperativeCompensated);
         });
         assert_eq!(
             scalar,
@@ -4421,7 +4448,9 @@ mod variant_tests {
 
 #[cfg(test)]
 mod split_k_tests {
-    use super::{BufferRef, Dispatch, ShaderEntry};
+    use crate::compile::{DispatchOp, dispatch};
+
+    use super::{BufferRef, Dispatch};
 
     #[test]
     fn split_sequences_get_barriers_and_reuse_nonoverlapping_partials() {
@@ -4434,17 +4463,38 @@ mod split_k_tests {
         ];
         plan.output_buffers = vec![BufferRef(2), BufferRef(3)];
         let first = Dispatch {
-            shader: ShaderEntry::Conv2dGradWeightGemmSmall,
-            workgroups: [2, 2, 1],
-            input_buffers: vec![BufferRef(0), BufferRef(1)],
-            output_buffer: BufferRef(2),
-            params: vec![1, 33, 1, 33, 33, 1, 1, 1, 0, 1, 33, 0],
             requires_full_precision: true,
-            ..Default::default()
+            ..Dispatch::new(
+                DispatchOp::Convolution(dispatch::Convolution {
+                    kind: dispatch::ConvolutionKind::WeightGradient,
+                    implementation: dispatch::ConvolutionImplementation::Scalar {
+                        tile: 32,
+                        k_tile: None,
+                    },
+                    args: dispatch::ConvolutionArgs {
+                        a: BufferRef(0),
+                        b: BufferRef(1),
+                        dst: BufferRef(2),
+                        batch: 1,
+                        in_channels: 33,
+                        in_h: 1,
+                        in_w: 33,
+                        out_channels: 33,
+                        kernel_h: 1,
+                        kernel_w: 1,
+                        stride: 1,
+                        padding_h: 0,
+                        out_h: 1,
+                        out_w: 33,
+                        padding_w: 0,
+                    },
+                }),
+                [2, 2, 1],
+            )
         };
         let mut second = first.clone();
-        second.input_buffers[1] = BufferRef(2);
-        second.output_buffer = BufferRef(3);
+        second.set_input(1, BufferRef(2));
+        second.set_output(BufferRef(3));
         plan.dispatches = vec![first, second];
         assert_eq!(
             plan.split_conv_weight_gradients(&[(0, 2), (1, 2)], bytes * 4),

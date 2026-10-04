@@ -4,8 +4,10 @@ use crate::schedule::{PointwiseDAG, Pw, ReductionEpilogue, ReductionKernel};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+pub mod dispatch;
 mod softplus;
 mod split_k;
+pub use dispatch::DispatchOp;
 
 /// Host layout of the cached block-attention WGSL uniform. Dispatch encoding,
 /// runtime binding and tuning all use this layout rather than indexing words.
@@ -20,18 +22,6 @@ pub(crate) struct CachedBlockAttentionParams {
     pub max_seq: u32,
     pub splits: u32,
     pub _pad: u32,
-}
-
-impl CachedBlockAttentionParams {
-    pub fn from_words(words: &[u32]) -> Option<Self> {
-        bytemuck::try_from_bytes(bytemuck::cast_slice(words))
-            .ok()
-            .copied()
-    }
-
-    pub fn to_words(self) -> Vec<u32> {
-        bytemuck::cast_slice(std::slice::from_ref(&self)).to_vec()
-    }
 }
 
 /// Weight storage format for matmul B operands.
@@ -238,8 +228,12 @@ pub struct ConvWeightSplits {
 }
 
 impl CompileOptions {
-    fn gemv_kernel(&self, group: ShaderGroup, format: WeightFormat) -> Kernel {
-        Kernel::Gemv {
+    fn gemv_kernel(
+        &self,
+        group: ShaderGroup,
+        format: WeightFormat,
+    ) -> dispatch::MatmulImplementation {
+        dispatch::MatmulImplementation::Gemv {
             shape: self.gemv_shape.map_or_else(
                 || crate::codegen::GemvShape::initial(group),
                 |shape| shape.for_group(group),
@@ -783,9 +777,7 @@ impl ShaderEntry {
 impl Dispatch {
     /// Coarse workload family for this concrete dispatch.
     ///
-    /// Generated schedule kernels retain a legacy `shader` entry for binding
-    /// layout compatibility, so their schedule kind takes precedence over
-    /// that placeholder when profiling.
+    /// Generated pointwise and reduction operations keep their own family.
     pub fn profile_family(&self) -> &'static str {
         if self.is_row_data_movement() {
             "data_movement"
@@ -794,17 +786,16 @@ impl Dispatch {
         } else if self.pointwise().is_some() {
             "pointwise"
         } else {
-            self.shader.profile_family()
+            self.shader().profile_family()
         }
     }
 
     fn is_inner_broadcast(&self) -> bool {
-        self.shader == ShaderEntry::GlobalAvgPoolGrad && self.params.get(2) == Some(&1)
+        matches!(self.op, DispatchOp::GlobalAvgPoolGrad(ref op) if op.mode == 1)
     }
 
     fn is_row_data_movement(&self) -> bool {
-        self.shader == ShaderEntry::GlobalAvgPoolGrad
-            && self.params.get(2).is_some_and(|&mode| mode != 0)
+        matches!(self.op, DispatchOp::GlobalAvgPoolGrad(ref op) if op.mode != 0)
     }
 
     fn is_zero_fill(&self) -> bool {
@@ -815,8 +806,7 @@ impl Dispatch {
 
     #[cfg(test)]
     fn is_row_scaled_atomic_scatter(&self) -> bool {
-        self.shader == ShaderEntry::ScatterAddAtomic
-            && self.params.get(3).is_some_and(|&mode| mode != 0)
+        matches!(self.op, DispatchOp::ScatterAddAtomic(ref op) if op.row_scale.is_some())
     }
 }
 
@@ -970,18 +960,16 @@ fn reorder_by_level(dispatches: &mut Vec<Dispatch>) {
     let mut producer: HashMap<u32, usize> = HashMap::new();
     let mut levels = vec![0u32; n];
     for (i, dispatch) in dispatches.iter().enumerate() {
-        let level = dispatch
-            .input_buffers
-            .iter()
-            .filter_map(|b| producer.get(&b.0))
-            .map(|&pred| levels[pred] + 1)
-            .max()
-            .unwrap_or(0);
+        let mut level = 0;
+        dispatch.visit_inputs(|b| {
+            if let Some(&pred) = producer.get(&b.0) {
+                level = level.max(levels[pred] + 1);
+            }
+        });
         levels[i] = level;
-        producer.insert(dispatch.output_buffer.0, i);
-        for &extra in &dispatch.extra_outputs {
-            producer.insert(extra.0, i);
-        }
+        dispatch.visit_outputs(|b| {
+            producer.insert(b.0, i);
+        });
     }
     // Stable sort by level keeps topological order within a level.
     let mut order: Vec<usize> = (0..n).collect();
@@ -1001,15 +989,18 @@ fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
     let mut dirty = HashSet::<u32>::new();
     let mut start = 0;
     for (i, dispatch) in dispatches.iter().enumerate() {
-        if dispatch.input_buffers.iter().any(|b| dirty.contains(&b.0)) {
+        let mut hazard = false;
+        dispatch.visit_inputs(|b| {
+            hazard |= dirty.contains(&b.0);
+        });
+        if hazard {
             groups.push(start..i);
             start = i;
             dirty.clear();
         }
-        dirty.insert(dispatch.output_buffer.0);
-        for &extra in &dispatch.extra_outputs {
-            dirty.insert(extra.0);
-        }
+        dispatch.visit_outputs(|b| {
+            dirty.insert(b.0);
+        });
     }
     if !dispatches.is_empty() {
         groups.push(start..dispatches.len());
@@ -1029,18 +1020,18 @@ fn warn_on_hazards(dispatches: &[Dispatch], groups: &[std::ops::Range<usize>]) {
         let mut written = HashSet::<u32>::new();
         for i in group.clone() {
             let d = &dispatches[i];
-            for ib in &d.input_buffers {
+            for ib in &d.input_buffers() {
                 if written.contains(&ib.0) {
                     log::warn!(
                         "RAW hazard in group: dispatch {} ({:?}) reads buf {} written earlier in same group",
                         i,
-                        d.shader,
+                        d.shader(),
                         ib.0
                     );
                 }
             }
-            written.insert(d.output_buffer.0);
-            for &extra in &d.extra_outputs {
+            written.insert(d.output_buffer().0);
+            for &extra in &d.extra_outputs() {
                 written.insert(extra.0);
             }
         }
@@ -1089,117 +1080,263 @@ pub fn fuse_horizontal_matmuls(
 
 fn can_horizontal_fuse(a: &Dispatch, b: &Dispatch) -> bool {
     matches!(
-        a.shader,
+        a.shader(),
         ShaderEntry::MatMul | ShaderEntry::MatMulAT | ShaderEntry::MatMulBT
-    ) && a.shader == b.shader
+    ) && a.shader() == b.shader()
         && a.workgroups == b.workgroups
         && a.workgroups[2] == 1
-        && a.params == b.params
-        && a.kernel == b.kernel
+        && a.mnk() == b.mnk()
+        && a.kernel() == b.kernel()
         && matches!(
-            a.kernel,
+            a.kernel(),
             Kernel::Default
                 | Kernel::SmallTile
                 | Kernel::Cooperative
                 | Kernel::CooperativeCompensated
         )
-        && !a.weight_format.uses_reduced_storage()
-        && a.weight_format == b.weight_format
-        && a.matmul_prologue.is_none()
-        && b.matmul_prologue.is_none()
-        && a.matmul_epilogue.is_none()
-        && b.matmul_epilogue.is_none()
-        && a.gemv_rmsnorm.is_none()
-        && b.gemv_rmsnorm.is_none()
-        && a.input_buffers.len() == 2
-        && b.input_buffers.len() == 2
-        && a.input_buffers[0] == b.input_buffers[0]
+        && !a.weight_format().uses_reduced_storage()
+        && a.weight_format() == b.weight_format()
+        && a.matmul_prologue().is_none()
+        && b.matmul_prologue().is_none()
+        && a.matmul_epilogue().is_none()
+        && b.matmul_epilogue().is_none()
+        && a.gemv_rmsnorm().is_none()
+        && b.gemv_rmsnorm().is_none()
+        && a.input_buffers().len() == 2
+        && b.input_buffers().len() == 2
+        && a.input_buffers()[0] == b.input_buffers()[0]
 }
 
 fn merge_horizontal(dispatches: &[Dispatch], batch: &[usize]) -> Dispatch {
     let mut merged = dispatches[batch[0]].clone();
     let n = batch.len() as u32;
-    merged.horizontal_batch = n;
     merged.workgroups[2] = n;
-    merged.input_buffers = vec![merged.input_buffers[0]];
-    merged.extra_outputs.clear();
-    for (k, &idx) in batch.iter().enumerate() {
+    for &idx in &batch[1..] {
         let d = &dispatches[idx];
         merged.requires_full_precision |= d.requires_full_precision;
-        merged.input_buffers.push(d.input_buffers[1]);
-        if k == 0 {
-            merged.output_buffer = d.output_buffer;
-        } else {
-            merged.extra_outputs.push(d.output_buffer);
-        }
+        let source = d.matmul().expect("horizontal matmul");
+        merged
+            .matmul_mut()
+            .expect("horizontal matmul")
+            .siblings
+            .push((source.b, source.dst));
     }
     merged.label = format!("{}x{}", merged.label, n);
     merged
 }
 
-/// A single GPU dispatch in the execution plan.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// A typed operation and the metadata shared by all execution-plan entries.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dispatch {
-    pub shader: ShaderEntry,
+    pub op: DispatchOp,
     pub workgroups: [u32; 3],
-    /// Buffer bindings: maps the node IDs for inputs/outputs to buffer slots.
-    pub input_buffers: Vec<BufferRef>,
-    pub output_buffer: BufferRef,
-    /// Extra output buffers (e.g. LSE + scores for attention forward).
-    pub extra_outputs: Vec<BufferRef>,
-    /// Extra params to upload as a uniform buffer.
-    pub params: Vec<u32>,
-    /// Exactly one implementation of the shader's binding contract.
-    #[serde(default)]
-    pub kernel: Kernel,
-    /// The matrix implementation was fixed by extraction. Later kernel
-    /// probes must not replace it.
-    #[serde(default)]
+    /// Prevent runtime tuning from replacing an extracted implementation.
     pub schedule_locked: bool,
-    /// Number of same-A sibling matmuls packed into this dispatch (D1).
-    /// 0/1 = not packed. Extra B operands follow A in `input_buffers`;
-    /// extra C outputs are `extra_outputs`. `workgroups[2]` is the pack
-    /// count when this is ≥ 2 (only applied when the original Z was 1).
-    #[serde(default)]
-    pub horizontal_batch: u32,
-    /// The dispatch belongs to numerically sensitive derivative work and may
-    /// not be promoted to a reduced-input-precision implementation. Native
-    /// f32 cooperative kernels remain eligible.
-    #[serde(default)]
+    /// Require full-precision operands when selecting cooperative kernels.
     pub requires_full_precision: bool,
-    /// Prevent this dispatch from being absorbed into a producer or consumer.
-    /// Used for explicit memory-placement boundaries such as [`Op::Materialize`].
-    #[serde(default)]
+    /// Preserve explicit materialization boundaries during fusion.
     pub fusion_barrier: bool,
-    /// Fused elementwise epilogue (PointwiseDAG) applied in the matmul
-    /// store loop. `None` = no epilogue (default). When present, saves
-    /// one dispatch + barrier per fused op.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub matmul_epilogue: Option<MatMulEpilogue>,
-    /// RmsNorm folded into this GEMV's A operand. See [`GemvRmsNorm`].
-    #[serde(default)]
-    pub gemv_rmsnorm: Option<GemvRmsNorm>,
-    /// Multiplicative prologue applied during matmul A-tile staging.
-    /// When present, the coop matmul fills `$A_TRANSFORM` and
-    /// `$PROLOGUE_DECL` template variables from the prologue's factors.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub matmul_prologue: Option<MatMulPrologue>,
-    /// Human-readable label for profiling (e.g. `"MatMul[50,720,960]"`).
-    #[serde(default)]
     pub label: String,
-    /// Graph node ids this dispatch implements. One entry normally; several
-    /// after dispatch-level fusion absorbs a neighbor. Provenance only —
-    /// execution never reads it, but labels, plan dumps, profiler rows, and
-    /// `Session::read_node` do.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub origin: Vec<NodeId>,
-    /// Storage format of the B (weight) input buffer.
-    #[serde(default)]
-    pub weight_format: WeightFormat,
 }
 
-/// Mutually exclusive implementations. Bindings and launch geometry live on
-/// the dispatch; shader-specific configuration lives only in its variant.
+impl Dispatch {
+    pub fn new(op: DispatchOp, workgroups: [u32; 3]) -> Self {
+        Self {
+            op,
+            workgroups,
+            schedule_locked: false,
+            requires_full_precision: false,
+            fusion_barrier: false,
+            label: String::new(),
+            origin: Vec::new(),
+        }
+    }
+
+    pub fn shader(&self) -> ShaderEntry {
+        self.op.shader()
+    }
+
+    pub fn set_shader(&mut self, shader: ShaderEntry) {
+        match self.op {
+            DispatchOp::Matmul(ref mut op) => op.select_shader(shader),
+            DispatchOp::Convolution(ref mut op) => op.select_shader(shader),
+            _ => assert_eq!(
+                self.shader(),
+                shader,
+                "replace the typed operation to change its kind"
+            ),
+        }
+    }
+
+    pub fn visit_inputs(&self, visit: impl FnMut(BufferRef)) {
+        self.op.visit_inputs(visit);
+    }
+
+    pub fn visit_outputs(&self, visit: impl FnMut(BufferRef)) {
+        self.op.visit_outputs(visit);
+    }
+
+    pub fn input_buffers(&self) -> Vec<BufferRef> {
+        self.op.inputs()
+    }
+
+    pub fn output_buffer(&self) -> BufferRef {
+        self.op.output()
+    }
+
+    pub fn extra_outputs(&self) -> Vec<BufferRef> {
+        self.op.extra_outputs()
+    }
+
+    /// Diagnostic parameter words in the historical shader order.
+    /// Binding and compiler passes use the named operation fields.
+    pub fn parameter_words(&self) -> Vec<u32> {
+        self.op.parameter_words()
+    }
+
+    pub fn set_input(&mut self, index: usize, buffer: BufferRef) {
+        self.op.set_input(index, buffer);
+    }
+
+    pub fn set_output(&mut self, buffer: BufferRef) {
+        self.op.set_output(buffer);
+    }
+
+    pub fn map_buffers(&mut self, map: impl FnMut(BufferRef) -> BufferRef) {
+        self.op.map_buffers(map);
+    }
+
+    pub fn matmul(&self) -> Option<&dispatch::Matmul> {
+        match self.op {
+            DispatchOp::Matmul(ref op) => Some(op),
+            _ => None,
+        }
+    }
+
+    pub fn matmul_mut(&mut self) -> Option<&mut dispatch::Matmul> {
+        match self.op {
+            DispatchOp::Matmul(ref mut op) => Some(op),
+            _ => None,
+        }
+    }
+
+    pub fn convolution(&self) -> Option<&dispatch::Convolution> {
+        match self.op {
+            DispatchOp::Convolution(ref op) => Some(op),
+            _ => None,
+        }
+    }
+
+    pub fn convolution_mut(&mut self) -> Option<&mut dispatch::Convolution> {
+        match self.op {
+            DispatchOp::Convolution(ref mut op) => Some(op),
+            _ => None,
+        }
+    }
+
+    pub fn pointwise_payload(&self) -> Option<&dispatch::Pointwise> {
+        match self.op {
+            DispatchOp::Pointwise(ref op) => Some(op),
+            _ => None,
+        }
+    }
+
+    pub fn reduction_payload(&self) -> Option<&dispatch::Reduction> {
+        match self.op {
+            DispatchOp::Reduction(ref op) => Some(op),
+            _ => None,
+        }
+    }
+
+    pub fn attention_head_dim(&self) -> Option<u32> {
+        match self.op {
+            DispatchOp::MultiHeadAttn(ref op)
+            | DispatchOp::FlashAttention(ref op)
+            | DispatchOp::FlashAttentionCoop(ref op) => Some(op.head_dim),
+            DispatchOp::MultiHeadAttnGradQ(ref op)
+            | DispatchOp::FlashGradQ(ref op)
+            | DispatchOp::FlashGradQCoop(ref op) => Some(op.head_dim),
+            DispatchOp::MultiHeadAttnGradKV(ref op)
+            | DispatchOp::FlashGradKV(ref op)
+            | DispatchOp::FlashGradKVCoop(ref op) => Some(op.head_dim),
+            DispatchOp::CachedAttention(ref op) | DispatchOp::CachedQueryAttention(ref op) => {
+                Some(op.head_dim)
+            }
+            DispatchOp::CachedBlockAttention(ref op)
+            | DispatchOp::CachedBlockAttentionSplit(ref op) => Some(op.head_dim),
+            DispatchOp::CachedBlockAttentionCombine(ref op) => Some(op.head_dim),
+            _ => None,
+        }
+    }
+
+    pub fn pointwise_payload_mut(&mut self) -> Option<&mut dispatch::Pointwise> {
+        match self.op {
+            DispatchOp::Pointwise(ref mut op) => Some(op),
+            _ => None,
+        }
+    }
+
+    pub fn reduction_payload_mut(&mut self) -> Option<&mut dispatch::Reduction> {
+        match self.op {
+            DispatchOp::Reduction(ref mut op) => Some(op),
+            _ => None,
+        }
+    }
+
+    pub fn kernel(&self) -> Kernel {
+        match self.op {
+            DispatchOp::Matmul(ref op) => op.kernel(),
+            DispatchOp::Convolution(ref op) => op.kernel(),
+            _ => Kernel::Default,
+        }
+    }
+
+    pub fn set_kernel(&mut self, kernel: Kernel) {
+        match self.op {
+            DispatchOp::Matmul(ref mut op) => op.set_kernel(kernel),
+            DispatchOp::Convolution(ref mut op) => op.set_kernel(kernel),
+            _ => assert_eq!(
+                kernel,
+                Kernel::Default,
+                "implementation does not apply to this operation"
+            ),
+        }
+    }
+
+    pub fn weight_format(&self) -> WeightFormat {
+        match self.op {
+            DispatchOp::Matmul(ref op) => op.weight_format,
+            DispatchOp::Embedding(ref op) => op.weight_format,
+            _ => WeightFormat::F32,
+        }
+    }
+
+    pub fn horizontal_batch(&self) -> u32 {
+        self.matmul().map_or(0, |op| {
+            if op.siblings.is_empty() {
+                0
+            } else {
+                op.siblings.len() as u32 + 1
+            }
+        })
+    }
+
+    pub fn matmul_epilogue(&self) -> Option<&MatMulEpilogue> {
+        self.matmul().and_then(|op| op.epilogue.as_ref())
+    }
+
+    pub fn matmul_prologue(&self) -> Option<&MatMulPrologue> {
+        self.matmul().and_then(|op| op.prologue.as_ref())
+    }
+
+    pub fn gemv_rmsnorm(&self) -> Option<&GemvRmsNorm> {
+        self.matmul().and_then(|op| op.rmsnorm.as_ref())
+    }
+}
+
+/// A numerical implementation selection. Dispatch payloads store only the
+/// implementation choices supported by their operation family.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kernel {
     #[default]
@@ -1221,90 +1358,49 @@ pub enum Kernel {
         /// Precision policy, never enabled by measurement.
         integer_dot: bool,
     },
-    Pointwise(PointwiseDAG),
-    Reduction(ReductionKernel),
 }
 
 impl Dispatch {
-    /// `(m, n, k)` for a contraction dispatch, in that order.
-    ///
-    /// `params` does not hold `(m, n, k)` for every contraction shader. Four of
-    /// them store `(m, k, n)` and have to be read back swapped:
-    ///
-    /// | `params` order | shaders |
-    /// |---|---|
-    /// | `(m, k, n)` | `MatMul`, `MatMulGemv`, `MatMulGemvAdd`, `FusedMatMulAdd` |
-    /// | `(m, n, k)` | `MatMulAT`, `MatMulBT`, `MatMulGemvBT`, `MatMulGemvBTAdd`, `FusedMatMulATAdd`, `FusedMatMulBTAdd` |
-    /// | `(m, n, k)` | `BlockMatMul`, `BlockMatMulAT`, `BlockMatMulBT` |
-    ///
-    /// The `AT`/`BT` variants take A already transposed — A is `[K, M]` rather
-    /// than `[M, K]` — so their natural order already is `(m, n, k)`.
-    ///
-    /// Every binding site that needs the logical shape should call this rather
-    /// than re-derive the swap. There were three copies of the rule — the
-    /// horizontal-batch binding, the cooperative-prologue binding, and the arms
-    /// of `bind_dispatch` itself — and the first two each listed a different
-    /// subset of the shaders that need it.
-    ///
-    /// Returns `None` for a dispatch that is not a contraction, so a caller
-    /// binding an elementwise kernel cannot silently pick up three unrelated
-    /// numbers from `params`.
+    /// Logical contraction dimensions, independent of shader parameter order.
     pub fn mnk(&self) -> Option<(u32, u32, u32)> {
-        let p = &self.params;
-        let (a, b, c) = (p.first().copied()?, p.get(1).copied()?, p.get(2).copied()?);
-        match self.shader {
-            ShaderEntry::MatMul
-            | ShaderEntry::MatMulGemv
-            | ShaderEntry::MatMulGemvAdd
-            | ShaderEntry::FusedMatMulAdd => Some((a, c, b)),
-            ShaderEntry::MatMulAT
-            | ShaderEntry::MatMulBT
-            | ShaderEntry::MatMulGemvBT
-            | ShaderEntry::MatMulGemvBTAdd
-            | ShaderEntry::FusedMatMulATAdd
-            | ShaderEntry::FusedMatMulBTAdd
-            | ShaderEntry::BlockMatMul
-            | ShaderEntry::BlockMatMulAT
-            | ShaderEntry::BlockMatMulBT => Some((a, b, c)),
-            _ => None,
-        }
+        self.matmul().map(|op| (op.m, op.n, op.k))
     }
 
     pub fn use_coop(&self) -> bool {
         matches!(
-            self.kernel,
+            self.kernel(),
             Kernel::Cooperative | Kernel::CooperativeCompensated
         )
     }
 
     pub fn use_coop_compensated(&self) -> bool {
-        matches!(self.kernel, Kernel::CooperativeCompensated)
+        matches!(self.kernel(), Kernel::CooperativeCompensated)
     }
 
     pub fn use_small_tiles(&self) -> bool {
         matches!(
-            self.kernel,
+            self.kernel(),
             Kernel::SmallTile
                 | Kernel::ScalarMatmul(crate::codegen::ScalarMatmulShape { tile_size: 32, .. })
         )
     }
 
     pub fn scalar_matmul(&self) -> Option<crate::codegen::ScalarMatmulShape> {
-        match self.kernel {
+        match self.kernel() {
             Kernel::ScalarMatmul(shape) => Some(shape),
             _ => None,
         }
     }
 
     pub fn conv_k_tile(&self) -> Option<u32> {
-        match self.kernel {
+        match self.kernel() {
             Kernel::SpecializedConv { k_tile } => Some(k_tile),
             _ => None,
         }
     }
 
     pub fn gemv_shape(&self) -> Option<crate::codegen::GemvShape> {
-        match self.kernel {
+        match self.kernel() {
             Kernel::Gemv { shape, .. } => Some(shape),
             _ => None,
         }
@@ -1312,7 +1408,7 @@ impl Dispatch {
 
     pub fn gemv_int_dot(&self) -> bool {
         matches!(
-            self.kernel,
+            self.kernel(),
             Kernel::Gemv {
                 integer_dot: true,
                 ..
@@ -1321,22 +1417,20 @@ impl Dispatch {
     }
 
     pub fn pointwise(&self) -> Option<&PointwiseDAG> {
-        match self.kernel {
-            Kernel::Pointwise(ref dag) => Some(dag),
+        match self.op {
+            DispatchOp::Pointwise(ref op) => Some(&op.dag),
             _ => None,
         }
     }
-
     pub fn reduction(&self) -> Option<&ReductionKernel> {
-        match self.kernel {
-            Kernel::Reduction(ref kernel) => Some(kernel),
+        match self.op {
+            DispatchOp::Reduction(ref op) => Some(&op.kernel),
             _ => None,
         }
     }
-
     pub fn reduction_mut(&mut self) -> Option<&mut ReductionKernel> {
-        match self.kernel {
-            Kernel::Reduction(ref mut kernel) => Some(kernel),
+        match self.op {
+            DispatchOp::Reduction(ref mut op) => Some(&mut op.kernel),
             _ => None,
         }
     }
@@ -1463,7 +1557,7 @@ impl ExecutionPlan {
         visible.extend(self.constant_buffers.iter().map(|entry| entry.0));
         visible.extend(self.lse_buffers.iter().map(|entry| entry.1));
         for dispatch in &self.dispatches {
-            visible.extend(dispatch.extra_outputs.iter().copied());
+            visible.extend(dispatch.extra_outputs().iter().copied());
         }
         visible
     }
@@ -1633,49 +1727,49 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
         let mut producer = HashMap::new();
         let mut reads = HashMap::new();
         for (index, dispatch) in plan.dispatches.iter().enumerate() {
-            producer.insert(dispatch.output_buffer, index);
-            for buffer in &dispatch.input_buffers {
+            producer.insert(dispatch.output_buffer(), index);
+            for buffer in &dispatch.input_buffers() {
                 *reads.entry(*buffer).or_insert(0usize) += 1;
             }
         }
 
         let mut candidate = None;
         for (scatter_index, scatter) in plan.dispatches.iter().enumerate() {
-            if scatter.shader != ShaderEntry::ScatterAddAtomic
-                || scatter.params.get(3) != Some(&0)
-                || scatter.input_buffers.len() != 3
-            {
+            let DispatchOp::ScatterAddAtomic(ref scatter_op) = scatter.op else {
+                continue;
+            };
+            if scatter_op.row_scale.is_some() {
                 continue;
             }
-            let indices = scatter.input_buffers[0];
-            let product = scatter.input_buffers[1];
+            let indices = scatter_op.indices;
+            let product = scatter_op.src;
             let Some(&mul_index) = producer.get(&product) else {
                 continue;
             };
             let mul = &plan.dispatches[mul_index];
-            let plain_mul = mul.input_buffers.len() == 2
+            let plain_mul = mul.input_buffers().len() == 2
                 && mul.pointwise() == Some(&pointwise(2, [Pw::Mul(0, 1)]));
             if !plain_mul || protected.contains(&product) {
                 continue;
             }
 
-            let broadcast_side = mul
-                .input_buffers
-                .iter()
-                .enumerate()
-                .find_map(|(side, buffer)| match producer.get(buffer).copied() {
-                    Some(index) if plan.dispatches[index].is_inner_broadcast() => {
-                        Some((side, index))
-                    }
-                    _ => None,
-                });
+            let broadcast_side =
+                mul.input_buffers()
+                    .iter()
+                    .enumerate()
+                    .find_map(|(side, buffer)| match producer.get(buffer).copied() {
+                        Some(index) if plan.dispatches[index].is_inner_broadcast() => {
+                            Some((side, index))
+                        }
+                        _ => None,
+                    });
             let Some((broadcast_side, broadcast_index)) = broadcast_side else {
                 continue;
             };
             let broadcast = &plan.dispatches[broadcast_index];
-            let broadcast_output = broadcast.output_buffer;
-            let factors = mul.input_buffers[1 - broadcast_side];
-            if broadcast.input_buffers.len() != 1
+            let broadcast_output = broadcast.output_buffer();
+            let factors = mul.input_buffers()[1 - broadcast_side];
+            if broadcast.input_buffers().len() != 1
                 || protected.contains(&broadcast_output)
                 || reads.get(&broadcast_output).copied() != Some(1)
                 || reads.get(&product).copied() != Some(2)
@@ -1686,17 +1780,17 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
             let Some((zero_index, _)) = plan.dispatches.iter().enumerate().find(|entry| {
                 let dispatch = entry.1;
                 dispatch.is_zero_fill()
-                    && dispatch.output_buffer == scatter.output_buffer
-                    && dispatch.params.first() == scatter.params.first()
+                    && dispatch.output_buffer() == scatter.output_buffer()
+                    && dispatch
+                        .pointwise_payload()
+                        .is_some_and(|op| op.len == scatter_op.total)
             }) else {
                 continue;
             };
-            if scatter.params.len() < 4 {
-                continue;
-            }
-            let source_len = scatter.params[1].saturating_mul(scatter.params[2]);
-            if mul.params != [source_len, 0, 0, 0]
-                || broadcast.params != [source_len, scatter.params[2], 1, 0]
+            let source_len = scatter_op.seq_len.saturating_mul(scatter_op.embed_dim);
+            if mul.pointwise_payload().unwrap().len != source_len
+                || !matches!(broadcast.op, DispatchOp::GlobalAvgPoolGrad(ref op)
+                    if op.len == source_len && op.inner == scatter_op.embed_dim && op.mode == 1 && op.offset == 0)
                 || scatter.workgroups != [source_len.div_ceil(256), 1, 1]
             {
                 continue;
@@ -1708,7 +1802,7 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
                 broadcast_index,
                 indices,
                 factors,
-                broadcast.input_buffers[0],
+                broadcast.input_buffers()[0],
             ));
             break;
         }
@@ -1726,21 +1820,23 @@ fn fuse_row_scaled_scatters(plan: &mut ExecutionPlan) {
             break;
         };
 
-        let output = plan.dispatches[scatter_index].output_buffer;
-        let total = plan.dispatches[scatter_index].params[0];
         let scatter = &mut plan.dispatches[scatter_index];
-        scatter.input_buffers = vec![indices, factors, row_scale, output];
-        let small_row = scatter.params[2] <= 16;
-        scatter.params[3] = if small_row { 2 } else { 1 };
-        if small_row {
-            scatter.workgroups = [scatter.params[1].div_ceil(256), 1, 1];
+        let DispatchOp::ScatterAddAtomic(ref mut op) = scatter.op else {
+            unreachable!("checked scatter")
+        };
+        let total = op.total;
+        op.indices = indices;
+        op.src = factors;
+        op.row_scale = Some(row_scale);
+        op.serial_rows = op.embed_dim <= 16;
+        if op.serial_rows {
+            scatter.workgroups = [op.seq_len.div_ceil(256), 1, 1];
         }
-        scatter.kernel = Kernel::Default;
         scatter.label = format!("ScatterAddAtomicRowMul[{total}]");
         // The zero entry point does not read `src`, but its shared binding
         // layout still requires a valid buffer. Stop it from retaining the
         // now-eliminated product buffer.
-        plan.dispatches[zero_index].input_buffers = vec![factors];
+        plan.dispatches[zero_index].set_input(0, factors);
 
         let mut remove = [mul_index, broadcast_index];
         remove.sort_unstable();
@@ -1780,7 +1876,7 @@ fn fold_uniform_constants(plan: &mut ExecutionPlan) {
             continue;
         };
         let mut dag = dag.clone();
-        let mut inputs = dispatch.input_buffers.clone();
+        let mut inputs = dispatch.input_buffers();
         // Walk backwards so earlier slot indices stay valid. Keep one input:
         // pointwise dispatches bind at least one stream.
         for slot in (0..inputs.len()).rev() {
@@ -1798,10 +1894,10 @@ fn fold_uniform_constants(plan: &mut ExecutionPlan) {
             dag = dag.fuse_input(slot as u8, &literal);
             inputs.remove(slot);
         }
-        if inputs.len() != dispatch.input_buffers.len() {
-            dispatch.shader = ShaderEntry::Generated;
-            dispatch.input_buffers = inputs;
-            dispatch.kernel = Kernel::Pointwise(dag);
+        if inputs.len() != dispatch.input_buffers().len() {
+            let op = dispatch.pointwise_payload_mut().expect("checked pointwise");
+            op.inputs = inputs;
+            op.dag = dag;
         }
     }
 }
@@ -1832,17 +1928,17 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
         // Producer: output_buffer -> dispatch index.
         let mut producer: HashMap<BufferRef, usize> = HashMap::new();
         for (i, d) in plan.dispatches.iter().enumerate() {
-            producer.insert(d.output_buffer, i);
+            producer.insert(d.output_buffer(), i);
         }
 
         // Reader counts.
         let mut reads: HashMap<BufferRef, usize> = HashMap::new();
         for d in &plan.dispatches {
-            for b in &d.input_buffers {
+            for b in &d.input_buffers() {
                 *reads.entry(*b).or_default() += 1;
             }
             // extra_outputs are also "referenced"; count them as protected.
-            for b in &d.extra_outputs {
+            for b in &d.extra_outputs() {
                 protected.insert(*b);
             }
         }
@@ -1857,7 +1953,7 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
             // Find a fusion candidate: exactly one input slot that resolves
             // to a pointwise producer satisfying the criteria.
             let mut candidate: Option<(u8, usize)> = None; // (input_idx, producer_dispatch_idx)
-            for (slot_idx, buf) in c.input_buffers.iter().enumerate() {
+            for (slot_idx, buf) in c.input_buffers().iter().enumerate() {
                 if protected.contains(buf) {
                     continue;
                 }
@@ -1878,11 +1974,11 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
                 if p.workgroups != c.workgroups {
                     continue;
                 }
-                if p.params.first() != c.params.first() {
+                if p.pointwise_payload().unwrap().len != c.pointwise_payload().unwrap().len {
                     continue;
                 }
                 // The consumer must read this buffer in exactly one slot.
-                let slot_count = c.input_buffers.iter().filter(|b| *b == buf).count();
+                let slot_count = c.input_buffers().iter().filter(|b| *b == buf).count();
                 if slot_count != 1 {
                     continue;
                 }
@@ -1896,7 +1992,7 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
                 // UnaryData (n=1), BinaryData (n=2), or TernaryData (n=3).
                 // A higher-arity fused DAG would need a wider layout we
                 // don't plumb yet.
-                let new_arity = p.input_buffers.len() + c.input_buffers.len() - 1;
+                let new_arity = p.input_buffers().len() + c.input_buffers().len() - 1;
                 if new_arity > 3 {
                     continue;
                 }
@@ -1918,24 +2014,18 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
 
             // Rebuild consumer input_buffers: producer inputs, then
             // consumer inputs with the fused slot removed, in order.
-            let mut new_inputs: Vec<BufferRef> = producer_d.input_buffers.clone();
-            for (idx, b) in consumer_d.input_buffers.iter().enumerate() {
+            let mut new_inputs: Vec<BufferRef> = producer_d.input_buffers();
+            for (idx, b) in consumer_d.input_buffers().iter().enumerate() {
                 if idx as u8 != input_idx {
                     new_inputs.push(*b);
                 }
             }
-            consumer_d.input_buffers = new_inputs;
-            consumer_d.kernel = Kernel::Pointwise(fused_dag);
+            let op = consumer_d
+                .pointwise_payload_mut()
+                .expect("checked pointwise");
+            op.inputs = new_inputs;
+            op.dag = fused_dag;
             consumer_d.origin.extend(producer_d.origin.iter().copied());
-            // The consumer now reads from more buffers; its ShaderEntry
-            // (used only to pick the data layout) must reflect the new
-            // arity. The runtime binds via UnaryData for n=1, BinaryData
-            // for n=2; arities >2 would need a wider layout we don't yet
-            // plumb. Guard against that.
-            // Update the sentinel `shader` so the (legacy) pipeline
-            // lookup still resolves — actual binding/pipeline come from
-            // the `pointwise` DAG's arity.
-            consumer_d.shader = ShaderEntry::Generated;
 
             // Drop the producer dispatch.
             plan.dispatches.remove(pi);
@@ -1958,7 +2048,7 @@ fn shared_pointwise_consumers_are_foldable(
     let mut foldable_reads = 0usize;
     for dispatch in &plan.dispatches {
         let occurrences = dispatch
-            .input_buffers
+            .input_buffers()
             .iter()
             .filter(|&&input| input == buffer)
             .count();
@@ -1976,16 +2066,20 @@ fn shared_pointwise_consumers_are_foldable(
         }
         let per_elem = kernel.n_per_elem as usize;
         let input_index = dispatch
-            .input_buffers
+            .input_buffers()
             .iter()
             .position(|&input| input == buffer)
             .unwrap();
         if kernel.gather_elem.iter().any(|&g| g)
             || kernel.n_per_row != 0
             || input_index >= per_elem
-            || producer.params.first().copied()
-                != Some(dispatch.params[0].saturating_mul(dispatch.params[1]))
-            || per_elem - 1 + producer.input_buffers.len() > 3
+            || producer.pointwise_payload().unwrap().len
+                != dispatch
+                    .reduction_payload()
+                    .unwrap()
+                    .outer
+                    .saturating_mul(dispatch.reduction_payload().unwrap().inner)
+            || per_elem - 1 + producer.input_buffers().len() > 3
         {
             return false;
         }
@@ -2004,7 +2098,7 @@ fn shared_embedding_consumers_are_foldable(
     let mut foldable_reads = 0usize;
     for dispatch in &plan.dispatches {
         let occurrences = dispatch
-            .input_buffers
+            .input_buffers()
             .iter()
             .filter(|&&input| input == buffer)
             .count();
@@ -2020,8 +2114,8 @@ fn shared_embedding_consumers_are_foldable(
         if kernel.input_row_repeats.iter().any(|&factor| factor != 1) {
             return false;
         }
-        if dispatch.params.first().copied() != Some(outer)
-            || dispatch.params.get(1).copied() != Some(inner)
+        if dispatch.reduction_payload().unwrap().outer != outer
+            || dispatch.reduction_payload().unwrap().inner != inner
         {
             return false;
         }
@@ -2029,7 +2123,7 @@ fn shared_embedding_consumers_are_foldable(
         let mut is_direct_stream = false;
         for stream in 0..kernel.n_per_elem as usize {
             let is_gather = kernel.gather_elem.get(stream).copied().unwrap_or(false);
-            if !is_gather && dispatch.input_buffers.get(stream_position) == Some(&buffer) {
+            if !is_gather && dispatch.input_buffers().get(stream_position) == Some(&buffer) {
                 is_direct_stream = true;
                 break;
             }
@@ -2074,11 +2168,11 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
     let scan = |plan: &ExecutionPlan| -> (HashMap<BufferRef, usize>, HashMap<BufferRef, usize>) {
         let mut producer = HashMap::new();
         for (i, d) in plan.dispatches.iter().enumerate() {
-            producer.insert(d.output_buffer, i);
+            producer.insert(d.output_buffer(), i);
         }
         let mut reads: HashMap<BufferRef, usize> = HashMap::new();
         for d in &plan.dispatches {
-            for b in &d.input_buffers {
+            for b in &d.input_buffers() {
                 *reads.entry(*b).or_default() += 1;
             }
         }
@@ -2103,12 +2197,12 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
             {
                 continue;
             }
-            let outer = c.params[0];
-            let inner = c.params[1];
+            let outer = c.reduction_payload().unwrap().outer;
+            let inner = c.reduction_payload().unwrap().inner;
             let per_elem = kernel.n_per_elem as usize;
 
             for s in 0..per_elem {
-                let buf = c.input_buffers[s];
+                let buf = c.input_buffers()[s];
                 if prot.contains(&buf) {
                     continue;
                 }
@@ -2123,11 +2217,11 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                     continue;
                 }
                 // Producer must cover the per-element domain (outer*inner).
-                if p.params.first().copied() != Some(outer.saturating_mul(inner)) {
+                if p.pointwise_payload().unwrap().len != outer.saturating_mul(inner) {
                     continue;
                 }
                 // Arity cap (binding vocab supports ≤3 per-elem streams).
-                let new_n_per_elem = per_elem - 1 + p.input_buffers.len();
+                let new_n_per_elem = per_elem - 1 + p.input_buffers().len();
                 if new_n_per_elem > 3 || kernel.n_per_row != 0 {
                     continue;
                 }
@@ -2159,13 +2253,13 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 kernel.gather_elem = Vec::new();
                 // Rebuild input_buffers: producer inputs first (matching
                 // fuse_input's ordering), then consumer's others.
-                let mut new_inputs = producer_d.input_buffers.clone();
-                for (idx, b) in c.input_buffers.iter().enumerate() {
+                let mut new_inputs = producer_d.input_buffers();
+                for (idx, b) in c.input_buffers().iter().enumerate() {
                     if idx != s {
                         new_inputs.push(*b);
                     }
                 }
-                c.input_buffers = new_inputs;
+                c.reduction_payload_mut().expect("checked reduction").inputs = new_inputs;
                 c.origin.extend(producer_d.origin.iter().copied());
                 if read_count == 1 {
                     plan.dispatches.remove(pi);
@@ -2193,8 +2287,8 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
             if kernel.input_row_repeats.iter().any(|&factor| factor != 1) {
                 continue;
             }
-            let outer = c.params[0];
-            let inner = c.params[1];
+            let outer = c.reduction_payload().unwrap().outer;
+            let inner = c.reduction_payload().unwrap().inner;
             let per_elem = kernel.n_per_elem as usize;
 
             // Flat position of each per-element stream in input_buffers,
@@ -2214,7 +2308,7 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 if kernel.gather_elem.get(s).copied().unwrap_or(false) {
                     continue; // already a gather leaf
                 }
-                let buf = c.input_buffers[flat_pos];
+                let buf = c.input_buffers()[flat_pos];
                 if prot.contains(&buf) {
                     continue;
                 }
@@ -2225,14 +2319,8 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                     continue;
                 }
                 let p = &plan.dispatches[pi];
-                // Plain Embedding dispatch: indexed load, gathered axis ==
-                // reduced axis (params [seq, hidden] = [outer, inner]).
-                let is_embedding = p.shader == ShaderEntry::Embedding
-                    && p.reduction().is_none()
-                    && p.pointwise().is_none()
-                    && p.params.first().copied() == Some(outer)
-                    && p.params.get(1).copied() == Some(inner)
-                    && p.input_buffers.len() == 2;
+                let is_embedding = matches!(p.op, DispatchOp::Embedding(ref op)
+                    if op.rows == outer && op.embed_dim == inner && op.weight_format == WeightFormat::F32);
                 if !is_embedding {
                     continue;
                 }
@@ -2242,8 +2330,8 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 {
                     continue;
                 }
-                let idx_buf = p.input_buffers[0]; // Embedding inputs[0] = indices
-                let table_buf = p.input_buffers[1]; // inputs[1] = table
+                let idx_buf = p.input_buffers()[0]; // Embedding inputs[0] = indices
+                let table_buf = p.input_buffers()[1]; // inputs[1] = table
                 let producer_origin = p.origin.clone();
 
                 let c = &mut plan.dispatches[ci];
@@ -2254,8 +2342,9 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 kernel.gather_elem[s] = true;
                 // Replace stream s's buffer (the embedding output) with the
                 // table, and splice the indices buffer right after it.
-                c.input_buffers[flat_pos] = table_buf;
-                c.input_buffers.insert(flat_pos + 1, idx_buf);
+                let inputs = &mut c.reduction_payload_mut().expect("checked reduction").inputs;
+                inputs[flat_pos] = table_buf;
+                inputs.insert(flat_pos + 1, idx_buf);
                 c.origin.extend(producer_origin);
                 // Drop the embedding dispatch if it's now unused.
                 if reads.get(&buf).copied().unwrap_or(0) == 1 {
@@ -2336,13 +2425,10 @@ fn rmsnorm_kernel(cols: u32, eps: f32) -> ReductionKernel {
 fn is_plain_rmsnorm(dispatch: &Dispatch) -> bool {
     // The canonical generated norm only: after pointwise or gather fusion
     // the reduction differs, and a dedicated runtime shader cannot replace it.
-    dispatch.input_buffers.len() == 2
-        && dispatch.params.len() >= 3
-        && dispatch.reduction()
-            == Some(&rmsnorm_kernel(
-                dispatch.params[1],
-                f32::from_bits(dispatch.params[2]),
-            ))
+    dispatch.reduction_payload().is_some_and(|op| {
+        op.inputs.len() == 2
+            && op.kernel == rmsnorm_kernel(op.inner, f32::from_bits(op.round_one_bits))
+    })
 }
 
 /// Fold a plain RmsNorm into its GEMV consumers, provided no other operation
@@ -2352,7 +2438,7 @@ pub fn fuse_rmsnorm_into_gemv(plan: &mut ExecutionPlan) {
 
     let mut readers: HashMap<BufferRef, Vec<usize>> = HashMap::new();
     for (i, d) in plan.dispatches.iter().enumerate() {
-        for buf in &d.input_buffers {
+        for buf in &d.input_buffers() {
             readers.entry(*buf).or_default().push(i);
         }
     }
@@ -2364,12 +2450,12 @@ pub fn fuse_rmsnorm_into_gemv(plan: &mut ExecutionPlan) {
         if !is_plain_rmsnorm(norm) {
             continue;
         }
-        let normed = norm.output_buffer;
+        let normed = norm.output_buffer();
         if external.contains(&normed) {
             continue;
         }
         // Only fuse a single-row norm; the fused kernel assumes M = 1.
-        if norm.params.first().copied().unwrap_or(0) != 1 {
+        if norm.reduction_payload().unwrap().outer != 1 {
             continue;
         }
         let Some(consumers) = readers.get(&normed) else {
@@ -2386,17 +2472,17 @@ pub fn fuse_rmsnorm_into_gemv(plan: &mut ExecutionPlan) {
             || consumers.iter().any(|&c| {
                 let d = &plan.dispatches[c];
                 !matches!(
-                    d.shader,
+                    d.shader(),
                     ShaderEntry::MatMulGemv | ShaderEntry::MatMulGemvBT
-                ) || d.input_buffers.first() != Some(&normed)
+                ) || d.input_buffers().first() != Some(&normed)
             })
         {
             continue;
         }
         let (src, weight, eps_bits) = (
-            norm.input_buffers[0],
-            norm.input_buffers[1],
-            norm.params.get(2).copied().unwrap_or(0),
+            norm.input_buffers()[0],
+            norm.input_buffers()[1],
+            norm.reduction_payload().unwrap().round_one_bits,
         );
         for &c in consumers {
             rewrite.push((c, src, weight, eps_bits));
@@ -2409,8 +2495,9 @@ pub fn fuse_rmsnorm_into_gemv(plan: &mut ExecutionPlan) {
 
     for (idx, src, weight, eps_bits) in rewrite {
         let d = &mut plan.dispatches[idx];
-        d.input_buffers[0] = src;
-        d.gemv_rmsnorm = Some(GemvRmsNorm { weight, eps_bits });
+        let matmul = d.matmul_mut().expect("checked GEMV");
+        matmul.a = src;
+        matmul.rmsnorm = Some(GemvRmsNorm { weight, eps_bits });
     }
     let dropped = drop_norm.len();
     drop_norm.sort_unstable();
@@ -2438,7 +2525,7 @@ pub fn fuse_rmsnorm_into_add(plan: &mut ExecutionPlan) {
 
     let mut readers: HashMap<BufferRef, Vec<usize>> = HashMap::new();
     for (i, d) in plan.dispatches.iter().enumerate() {
-        for buf in &d.input_buffers {
+        for buf in &d.input_buffers() {
             readers.entry(*buf).or_default().push(i);
         }
     }
@@ -2450,7 +2537,7 @@ pub fn fuse_rmsnorm_into_add(plan: &mut ExecutionPlan) {
         if !is_plain_rmsnorm(norm) {
             continue;
         }
-        let normed = norm.output_buffer;
+        let normed = norm.output_buffer();
         if external.contains(&normed) {
             continue;
         }
@@ -2466,12 +2553,12 @@ pub fn fuse_rmsnorm_into_add(plan: &mut ExecutionPlan) {
         // absorbed a consumer (for example Gemma4's `(norm + embedding) /
         // sqrt(2)`) into its DAG, and RmsNormAdd has no pointwise epilogue,
         // so replacing that dispatch would silently drop the consumer.
-        if add.pointwise() != Some(&plain_add) || add.output_buffer == normed {
+        if add.pointwise() != Some(&plain_add) || add.output_buffer() == normed {
             continue;
         }
         // The add's other input carries the residual.
         let residual = *add
-            .input_buffers
+            .input_buffers()
             .iter()
             .find(|&&b| b != normed)
             .expect("an add has two inputs");
@@ -2485,18 +2572,21 @@ pub fn fuse_rmsnorm_into_add(plan: &mut ExecutionPlan) {
     }
     let fused = rewrite.len();
     for (ni, ai, residual) in rewrite {
-        let out = plan.dispatches[ai].output_buffer;
+        let out = plan.dispatches[ai].output_buffer();
         let d = &mut plan.dispatches[ni];
-        d.shader = ShaderEntry::RmsNormAdd;
-        // A scheduled RmsNorm carries a generated reduction kernel which
-        // implements only the original normalization. If it survives this
-        // rewrite, pipeline selection prefers that kernel over RmsNormAdd
-        // and silently drops the residual. Route the fused operation through
-        // its dedicated shader and restore its one-workgroup-per-row shape.
-        d.kernel = Kernel::Default;
-        d.workgroups = [d.params[0], 1, 1];
-        d.input_buffers.push(residual);
-        d.output_buffer = out;
+        let op = d.reduction_payload().unwrap();
+        let (rows, cols, eps_bits) = (op.outer, op.inner, op.round_one_bits);
+        let (src, weight) = (op.inputs[0], op.inputs[1]);
+        d.op = DispatchOp::RmsNormAdd(dispatch::NormResidual {
+            src,
+            weight,
+            residual,
+            dst: out,
+            rows,
+            cols,
+            eps_bits,
+        });
+        d.workgroups = [rows, 1, 1];
     }
     drop_dispatches.sort_unstable();
     drop_dispatches.dedup();
@@ -2513,12 +2603,12 @@ pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
 
     let mut producer: HashMap<BufferRef, usize> = HashMap::new();
     for (i, d) in plan.dispatches.iter().enumerate() {
-        producer.insert(d.output_buffer, i);
+        producer.insert(d.output_buffer(), i);
     }
 
     let mut read_count: HashMap<BufferRef, usize> = HashMap::new();
     for d in &plan.dispatches {
-        for buf in &d.input_buffers {
+        for buf in &d.input_buffers() {
             *read_count.entry(*buf).or_default() += 1;
         }
     }
@@ -2535,7 +2625,7 @@ pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
         // has already selected for cooperative matrices.
         if !d.use_coop()
             || !matches!(
-                d.shader,
+                d.shader(),
                 ShaderEntry::MatMul
                     | ShaderEntry::MatMulAT
                     | ShaderEntry::FusedMatMulAdd
@@ -2546,7 +2636,7 @@ pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
         }
         // Skip GEMV variants (M=1) — those use a different kernel path.
         if matches!(
-            d.shader,
+            d.shader(),
             ShaderEntry::MatMulGemv
                 | ShaderEntry::MatMulGemvAdd
                 | ShaderEntry::MatMulGemvBT
@@ -2554,10 +2644,10 @@ pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
         ) {
             continue;
         }
-        if d.input_buffers.is_empty() {
+        if d.input_buffers().is_empty() {
             continue;
         }
-        let a_buf = d.input_buffers[0];
+        let a_buf = d.input_buffers()[0];
         if external.contains(&a_buf) {
             continue;
         }
@@ -2577,11 +2667,10 @@ pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
 
     for &(norm_idx, matmul_idx) in &to_fuse {
         let norm = &plan.dispatches[norm_idx];
-        let x_buf = norm.input_buffers[0]; // raw x
-        let w_norm_buf = norm.input_buffers[1]; // norm weight
-        let rows = norm.params[0];
-        let cols = norm.params[1];
-        let eps_bits = norm.params[2];
+        let x_buf = norm.input_buffers()[0]; // raw x
+        let w_norm_buf = norm.input_buffers()[1]; // norm weight
+        let op = norm.reduction_payload().unwrap();
+        let (rows, cols, eps_bits) = (op.outer, op.inner, op.round_one_bits);
 
         // Allocate rsqrt_cache buffer: one f32 per row.
         let rsqrt_buf_idx = plan.buffers.len() as u32;
@@ -2593,36 +2682,39 @@ pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
         let norm_origin = plan.dispatches[norm_idx].origin.clone();
         let norm_label = plan.dispatches[norm_idx].label.clone();
         plan.dispatches[norm_idx] = Dispatch {
-            shader: ShaderEntry::RmsNormRsqrt,
-            workgroups: [rows, 1, 1],
-            input_buffers: vec![x_buf],
-            output_buffer: rsqrt_buf,
-            extra_outputs: vec![],
-            params: vec![rows, cols, eps_bits, 0],
-
             origin: norm_origin.clone(),
             label: norm_label,
-            ..Default::default()
+            ..Dispatch::new(
+                DispatchOp::RmsNormRsqrt(dispatch::RmsNormRsqrt {
+                    src: x_buf,
+                    dst: rsqrt_buf,
+                    rows,
+                    cols,
+                    eps_bits,
+                }),
+                [rows, 1, 1],
+            )
         };
 
         // Modify the matmul: read raw x instead of normalized x. The
         // normalization now happens inside the matmul, so it inherits the
         // norm node's provenance too.
-        plan.dispatches[matmul_idx].input_buffers[0] = x_buf;
+        plan.dispatches[matmul_idx]
+            .matmul_mut()
+            .expect("checked matmul")
+            .a = x_buf;
         plan.dispatches[matmul_idx].origin.extend(norm_origin);
 
-        // Attach the prologue: multiply A-elements by rsqrt[gr] and
-        // w_norm[tc]. Also declare both factor buffers as dispatch inputs so
-        // scheduling and memory planning preserve the producer dependency and
-        // lifetime; shader binding still uses the typed prologue metadata.
+        // The payload's buffer visitor includes both prologue factors in
+        // scheduling dependencies and memory lifetimes.
         let factors = vec![
             (rsqrt_buf, PrologueLoadKind::PerRow),
             (w_norm_buf, PrologueLoadKind::PerKCol),
         ];
         plan.dispatches[matmul_idx]
-            .input_buffers
-            .extend(factors.iter().map(|&(buffer, _)| buffer));
-        plan.dispatches[matmul_idx].matmul_prologue = Some(MatMulPrologue { factors });
+            .matmul_mut()
+            .expect("checked matmul")
+            .prologue = Some(MatMulPrologue { factors });
     }
 
     if !to_fuse.is_empty() {
@@ -2649,13 +2741,13 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
     // Map: output buffer → dispatch index that writes it.
     let mut producer: HashMap<BufferRef, usize> = HashMap::new();
     for (i, d) in dispatches.iter().enumerate() {
-        producer.insert(d.output_buffer, i);
+        producer.insert(d.output_buffer(), i);
     }
 
     // Count how many dispatches read each buffer (consumers).
     let mut read_count: HashMap<BufferRef, usize> = HashMap::new();
     for d in dispatches.iter() {
-        for buf in &d.input_buffers {
+        for buf in &d.input_buffers() {
             *read_count.entry(*buf).or_default() += 1;
         }
     }
@@ -2668,18 +2760,18 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
         // Binary ops (BiasAdd, Add) would require extra buffer bindings in the
         // shader data layout, which is a larger change. TODO: extend shader data
         // layouts to support dynamic extra bindings for binary epilogues.
-        if d.input_buffers.len() != 1 {
+        if d.input_buffers().len() != 1 {
             continue;
         }
 
         // Every elementwise op lowers to a generated DAG; the dispatch's
         // shader entry only names its binding layout.
-        let epilogue_dag = match d.kernel {
-            Kernel::Pointwise(ref dag) if dag.n_inputs == 1 && !dag.has_broadcast() => dag.clone(),
+        let epilogue_dag = match d.pointwise() {
+            Some(dag) if dag.n_inputs == 1 && !dag.has_broadcast() => dag.clone(),
             _ => continue,
         };
-        let primary_buf = d.input_buffers[0];
-        let elem_output = d.output_buffer;
+        let primary_buf = d.input_buffers()[0];
+        let elem_output = d.output_buffer();
         let consumer_requires_full_precision = d.requires_full_precision;
 
         // The elementwise op reads from primary_buf. Find the matmul that produced it.
@@ -2694,7 +2786,7 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
         // stay out: their epilogue path is a separate generator and
         // quantized weights still do not feed coop tiles.
         let is_matmul = matches!(
-            prod.shader,
+            prod.shader(),
             ShaderEntry::MatMul
                 | ShaderEntry::MatMulAT
                 | ShaderEntry::MatMulBT
@@ -2719,16 +2811,17 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
         }
 
         // Build or extend the MatMulEpilogue DAG on the producer.
-        if let Some(ref mut epi) = dispatches[prod_idx].matmul_epilogue {
+        let matmul = dispatches[prod_idx].matmul_mut().expect("checked matmul");
+        if let Some(ref mut epi) = matmul.epilogue {
             epi.dag = epilogue_dag.fuse_input(0, &epi.dag);
         } else {
-            dispatches[prod_idx].matmul_epilogue = Some(MatMulEpilogue {
+            matmul.epilogue = Some(MatMulEpilogue {
                 dag: epilogue_dag,
                 inputs: vec![],
             });
         }
         dispatches[prod_idx].requires_full_precision |= consumer_requires_full_precision;
-        dispatches[prod_idx].output_buffer = elem_output;
+        dispatches[prod_idx].set_output(elem_output);
         let absorbed_origin = dispatches[i].origin.clone();
         dispatches[prod_idx].origin.extend(absorbed_origin);
         producer.insert(elem_output, prod_idx);
@@ -2857,29 +2950,6 @@ mod conv_tile {
     }
 }
 
-/// Scalar convolution with geometry baked into the pipeline.
-///
-/// The uniform software divisor stays available as a measured alternative.
-/// This kernel uses the same exact reciprocal, with the multipliers as
-/// constants, and the K stage the uniform shader already uses.
-fn exact_conv_kernel() -> Kernel {
-    Kernel::SpecializedConv { k_tile: 16 }
-}
-
-fn conv_gemm_entry(kind: u8, tile: u32) -> ShaderEntry {
-    match (kind, tile) {
-        (0, 16) => ShaderEntry::Conv2dGemm16,
-        (0, 32) => ShaderEntry::Conv2dGemmSmall,
-        (0, _) => ShaderEntry::Conv2dGemm,
-        (1, 16) => ShaderEntry::Conv2dGradInputGemm16,
-        (1, 32) => ShaderEntry::Conv2dGradInputGemmSmall,
-        (1, _) => ShaderEntry::Conv2dGradInputGemm,
-        (2, 16) => ShaderEntry::Conv2dGradWeightGemm16,
-        (2, 32) => ShaderEntry::Conv2dGradWeightGemmSmall,
-        _ => ShaderEntry::Conv2dGradWeightGemm,
-    }
-}
-
 struct Compiler<'a> {
     graph: &'a Graph,
     plan: ExecutionPlan,
@@ -2915,57 +2985,33 @@ mod tests {
     use super::*;
     use crate::graph::Graph;
 
-    /// `Dispatch::mnk` must agree with the order each contraction shader's
-    /// constructor writes into `params`.
-    ///
-    /// The rule was written out in three places — the horizontal-batch binding,
-    /// the cooperative-prologue binding, and the arms of `bind_dispatch` — and
-    /// the first two each listed a different subset of the shaders that need it.
-    /// This test states the intended mapping in one place: a `MatMulAT` reads
-    /// `(m, n, k)` straight out of `params`, and a `MatMul` reads `(m, k, n)` and
-    /// swaps.
-    ///
-    /// This test only covers the shaders its own table names, so it cannot
-    /// detect a contraction shader `mnk` forgot — it was written after one was.
-    /// The backstop is the `mnk` closure in `bind_dispatch`, which panics naming
-    /// the shader; adding a contraction binding without a row in the table fails
-    /// loudly the first time any test reaches it.
     #[test]
-    fn mnk_matches_the_params_order_each_shader_is_built_with() {
-        /// One row: the shader, the `params` it is constructed with, and what
-        /// `mnk` must return for that `params`.
-        type Case = (ShaderEntry, [u32; 3], (u32, u32, u32));
-        let cases: &[Case] = &[
-            // A is [M, K], B is [K, N]: params hold (m, k, n).
-            (ShaderEntry::MatMul, [10, 20, 30], (10, 30, 20)),
-            (ShaderEntry::MatMulGemv, [10, 20, 30], (10, 30, 20)),
-            (ShaderEntry::MatMulGemvAdd, [10, 20, 30], (10, 30, 20)),
-            (ShaderEntry::FusedMatMulAdd, [10, 20, 30], (10, 30, 20)),
-            // A is already [K, M]: params hold (m, n, k) already.
-            (ShaderEntry::MatMulAT, [10, 20, 30], (10, 20, 30)),
-            (ShaderEntry::MatMulBT, [10, 20, 30], (10, 20, 30)),
-            (ShaderEntry::MatMulGemvBT, [10, 20, 30], (10, 20, 30)),
-            (ShaderEntry::MatMulGemvBTAdd, [10, 20, 30], (10, 20, 30)),
-            (ShaderEntry::FusedMatMulATAdd, [10, 20, 30], (10, 20, 30)),
-            (ShaderEntry::FusedMatMulBTAdd, [10, 20, 30], (10, 20, 30)),
-            // Block matmuls are per-block tiles with the block count in
-            // `params[3]`, so `(m, n, k)` is already in that order.
-            (ShaderEntry::BlockMatMul, [10, 20, 30], (10, 20, 30)),
-            (ShaderEntry::BlockMatMulAT, [10, 20, 30], (10, 20, 30)),
-            (ShaderEntry::BlockMatMulBT, [10, 20, 30], (10, 20, 30)),
-        ];
-
-        for &(ref shader, params, want) in cases.iter() {
-            let d = Dispatch {
-                shader: shader.clone(),
-                params: params.to_vec(),
-                ..Dispatch::default()
-            };
-            assert_eq!(
-                d.mnk(),
-                Some(want),
-                "{shader:?}: params are {params:?}, so mnk must be {want:?}"
-            );
+    fn matrix_dimensions_are_independent_of_layout_and_implementation() {
+        let mut graph = Graph::new();
+        let a = graph.input("a", &[10, 20]);
+        let b = graph.parameter("b", &[20, 30]);
+        let y = graph.matmul(a, b);
+        graph.set_outputs(vec![y]);
+        let mut dispatch = compile(&graph).dispatches.remove(0);
+        for kind in [
+            dispatch::MatmulKind::Plain,
+            dispatch::MatmulKind::TransposeA,
+            dispatch::MatmulKind::TransposeB,
+            dispatch::MatmulKind::Gemv,
+            dispatch::MatmulKind::Block { batches: 2 },
+            dispatch::MatmulKind::Add {
+                addend: BufferRef(3),
+            },
+        ] {
+            dispatch.matmul_mut().unwrap().kind = kind;
+            for implementation in [
+                dispatch::MatmulImplementation::Default,
+                dispatch::MatmulImplementation::SmallTile,
+                dispatch::MatmulImplementation::Cooperative,
+            ] {
+                dispatch.matmul_mut().unwrap().implementation = implementation;
+                assert_eq!(dispatch.mnk(), Some((10, 30, 20)));
+            }
         }
     }
 
@@ -2973,25 +3019,20 @@ mod tests {
     /// from `params` that merely happen to be there.
     #[test]
     fn mnk_is_none_for_a_non_contraction() {
-        let d = Dispatch {
-            shader: ShaderEntry::LayerNorm,
-            params: vec![64, 64, 0],
-            ..Dispatch::default()
-        };
+        let d = Dispatch::new(
+            DispatchOp::LayerNorm(dispatch::LayerNorm {
+                src: crate::compile::BufferRef(0),
+                weight: crate::compile::BufferRef(0),
+                bias: crate::compile::BufferRef(0),
+                dst: crate::compile::BufferRef(0),
+                rows: 64,
+                cols: 64,
+                eps_bits: 0,
+                block_rows: 0,
+            }),
+            [0; 3],
+        );
         assert_eq!(d.mnk(), None);
-    }
-
-    /// `params` shorter than three is not a shape.
-    #[test]
-    fn mnk_is_none_when_params_are_short() {
-        for shader in [ShaderEntry::MatMul, ShaderEntry::MatMulAT] {
-            let d = Dispatch {
-                shader: shader.clone(),
-                params: vec![10, 20],
-                ..Dispatch::default()
-            };
-            assert_eq!(d.mnk(), None, "{shader:?} with two params");
-        }
     }
 
     #[test]
@@ -3031,7 +3072,7 @@ mod tests {
         let plan = compile(&g);
         let dispatch = &plan.dispatches[0];
         assert!(dispatch.schedule_locked);
-        match dispatch.kernel {
+        match dispatch.kernel() {
             Kernel::ScalarMatmul(shape) => {
                 assert_eq!((shape.rows(), shape.cols(), shape.k_stage), (64, 32, 32));
             }
@@ -3051,7 +3092,7 @@ mod tests {
         });
         let plan = compile(&g);
         assert!(plan.dispatches[0].schedule_locked);
-        match plan.dispatches[0].kernel {
+        match plan.dispatches[0].kernel() {
             Kernel::SplitMatmul { splits, shape } => {
                 assert_eq!(splits, 8);
                 assert_eq!((shape.rows(), shape.cols(), shape.k_stage), (64, 64, 8));
@@ -3059,7 +3100,7 @@ mod tests {
             ref other => panic!("expected split-K, got {other:?}"),
         }
         assert_eq!(plan.dispatches[0].workgroups[2], 8);
-        assert_eq!(plan.dispatches[1].shader, ShaderEntry::SumRows);
+        assert_eq!(plan.dispatches[1].shader(), ShaderEntry::SumRows);
         assert!(!plan.dispatches[1].schedule_locked);
 
         // K is too short for eight splits, so the single kernel stays locked.
@@ -3082,7 +3123,7 @@ mod tests {
         assert_eq!(plan.dispatches.len(), 1);
         assert!(plan.dispatches[0].schedule_locked);
         assert!(matches!(
-            &plan.dispatches[0].kernel,
+            &plan.dispatches[0].kernel(),
             Kernel::ScalarMatmul(shape) if shape.k_stage == 8 && shape.rows() == 64
         ));
     }
@@ -3109,13 +3150,13 @@ mod tests {
             decode
                 .dispatches
                 .iter()
-                .any(|dispatch| dispatch.shader == ShaderEntry::CachedBlockAttentionSplit)
+                .any(|dispatch| dispatch.shader() == ShaderEntry::CachedBlockAttentionSplit)
         );
         assert!(
             decode
                 .dispatches
                 .iter()
-                .any(|dispatch| dispatch.shader == ShaderEntry::CachedBlockAttentionCombine)
+                .any(|dispatch| dispatch.shader() == ShaderEntry::CachedBlockAttentionCombine)
         );
 
         let prefill = compile_shape(4);
@@ -3123,10 +3164,10 @@ mod tests {
             prefill
                 .dispatches
                 .iter()
-                .any(|dispatch| dispatch.shader == ShaderEntry::CachedBlockAttention)
+                .any(|dispatch| dispatch.shader() == ShaderEntry::CachedBlockAttention)
         );
         assert!(prefill.dispatches.iter().all(|dispatch| !matches!(
-            dispatch.shader,
+            dispatch.shader(),
             ShaderEntry::CachedBlockAttentionSplit | ShaderEntry::CachedBlockAttentionCombine
         )));
     }
@@ -3170,9 +3211,9 @@ mod tests {
         let plan = compile(&optimized);
         // MatMul with Relu fused into epilogue (epilogue fusion pass)
         assert_eq!(plan.dispatches.len(), 1);
-        assert_eq!(plan.dispatches[0].shader, ShaderEntry::MatMul);
+        assert_eq!(plan.dispatches[0].shader(), ShaderEntry::MatMul);
         assert_eq!(
-            plan.dispatches[0].matmul_epilogue.as_ref().unwrap().dag.ops,
+            plan.dispatches[0].matmul_epilogue().unwrap().dag.ops,
             [
                 crate::schedule::Pw::LoadInput(0),
                 crate::schedule::Pw::Relu(0)
@@ -3200,8 +3241,8 @@ mod tests {
         assert_eq!(last_op(&plan.dispatches[3]), Some(Pw::Exp(0)));
         // All unary ops: params = [len, 0, 0, 0]
         for d in &plan.dispatches {
-            assert_eq!(d.params[0], 32); // 4*8
-            assert_eq!(d.input_buffers.len(), 1);
+            assert_eq!(d.parameter_words()[0], 32); // 4*8
+            assert_eq!(d.input_buffers().len(), 1);
         }
     }
 
@@ -3218,17 +3259,17 @@ mod tests {
 
         assert_eq!(plan.dispatches.len(), 2);
         let copy = &plan.dispatches[0];
-        assert_eq!(copy.shader, ShaderEntry::Generated);
-        assert_eq!(copy.params, [8, 0, 0, 0]);
+        assert_eq!(copy.shader(), ShaderEntry::Generated);
+        assert_eq!(copy.parameter_words(), [8, 0, 0, 0]);
         assert_eq!(copy.workgroups, [1, 1, 1]);
-        assert_eq!(copy.input_buffers.len(), 1);
-        assert_ne!(copy.input_buffers[0], copy.output_buffer);
+        assert_eq!(copy.input_buffers().len(), 1);
+        assert_ne!(copy.input_buffers()[0], copy.output_buffer());
         assert!(copy.pointwise().is_some());
         assert!(copy.fusion_barrier);
 
         let split = &plan.dispatches[1];
-        assert_eq!(split.shader, ShaderEntry::SplitA);
-        assert_eq!(split.input_buffers, [copy.output_buffer]);
+        assert_eq!(split.shader(), ShaderEntry::SplitA);
+        assert_eq!(split.input_buffers(), [copy.output_buffer()]);
     }
 
     #[test]
@@ -3249,8 +3290,8 @@ mod tests {
         assert_eq!(last_op(&plan.dispatches[1]), Some(Pw::Mul(0, 1)));
         assert_eq!(last_op(&plan.dispatches[2]), Some(Pw::Greater(0, 1)));
         for d in &plan.dispatches {
-            assert_eq!(d.input_buffers.len(), 2);
-            assert_eq!(d.params[0], 32);
+            assert_eq!(d.input_buffers().len(), 2);
+            assert_eq!(d.parameter_words()[0], 32);
         }
     }
 
@@ -3264,7 +3305,7 @@ mod tests {
 
         let plan = compile(&g);
         assert_eq!(plan.dispatches.len(), 1);
-        assert_eq!(plan.dispatches[0].params[0], 512); // 4*128
+        assert_eq!(plan.dispatches[0].parameter_words()[0], 512); // 4*128
         let dag = plan.dispatches[0].pointwise().expect("broadcast pointwise");
         assert!(dag.ops.contains(&Pw::LoadBroadcast {
             input: 1,
@@ -3283,11 +3324,11 @@ mod tests {
 
         let plan = compile(&g);
         assert_eq!(plan.dispatches.len(), 2);
-        assert_eq!(plan.dispatches[0].shader, ShaderEntry::SumAll);
-        assert_eq!(plan.dispatches[1].shader, ShaderEntry::MeanAll);
+        assert_eq!(plan.dispatches[0].shader(), ShaderEntry::SumAll);
+        assert_eq!(plan.dispatches[1].shader(), ShaderEntry::MeanAll);
         // params = [len, 0, 0, 0]
         for d in &plan.dispatches {
-            assert_eq!(d.params[0], 32);
+            assert_eq!(d.parameter_words()[0], 32);
         }
     }
 
@@ -3338,8 +3379,8 @@ mod tests {
         assert_eq!(forward_plan.dispatches.len(), 1);
         let reduction = &forward_plan.dispatches[0];
         assert!(reduction.reduction().is_some());
-        assert_eq!(reduction.params[..2], [100, 3]);
-        assert_eq!(reduction.input_buffers.len(), 1);
+        assert_eq!(reduction.parameter_words()[..2], [100, 3]);
+        assert_eq!(reduction.input_buffers().len(), 1);
 
         let mut backward = Graph::new();
         let row_gradient = backward.input("row_gradient", &[100, 1]);
@@ -3350,8 +3391,8 @@ mod tests {
         assert_eq!(backward_plan.dispatches.len(), 1);
         let broadcast = &backward_plan.dispatches[0];
         assert!(broadcast.is_inner_broadcast());
-        assert_eq!(broadcast.params, [300, 3, 1, 0]);
-        assert_eq!(broadcast.input_buffers.len(), 1);
+        assert_eq!(broadcast.parameter_words(), [300, 3, 1, 0]);
+        assert_eq!(broadcast.input_buffers().len(), 1);
 
         let mut non_unit = Graph::new();
         let input = non_unit.input("input", &[100, 3]);
@@ -3360,7 +3401,7 @@ mod tests {
         non_unit.set_outputs(vec![output]);
         let non_unit_plan = compile(&non_unit);
         assert_eq!(non_unit_plan.dispatches.len(), 1);
-        assert_eq!(non_unit_plan.dispatches[0].shader, ShaderEntry::MatMul);
+        assert_eq!(non_unit_plan.dispatches[0].shader(), ShaderEntry::MatMul);
         assert!(non_unit_plan.dispatches[0].reduction().is_none());
     }
 
@@ -3378,7 +3419,7 @@ mod tests {
             .dispatches
             .iter()
             .find(|dispatch| {
-                dispatch.is_inner_broadcast() && dispatch.params == [513 * 16, 16, 1, 0]
+                dispatch.is_inner_broadcast() && dispatch.parameter_words() == [513 * 16, 16, 1, 0]
             })
             .expect("sum_inner backward should emit a direct row broadcast");
         assert_eq!(broadcast.workgroups, [33, 1, 1]);
@@ -3405,7 +3446,7 @@ mod tests {
         let narrow_grad_plan = compile(&narrow_grad);
         let grad_x = &narrow_grad_plan.dispatches[0];
         assert_eq!(grad_x.workgroups, [2, 1, 1]);
-        assert_eq!(grad_x.params[3], 4);
+        assert_eq!(grad_x.parameter_words()[3], 4);
 
         let mut wide = Graph::new();
         let dy = wide.input("dy", &[100, 33]);
@@ -3415,7 +3456,7 @@ mod tests {
         wide.set_outputs(vec![output]);
         let wide_plan = compile(&wide);
         assert_eq!(wide_plan.dispatches[0].workgroups, [100, 1, 1]);
-        assert_eq!(wide_plan.dispatches[0].params[3], 0);
+        assert_eq!(wide_plan.dispatches[0].parameter_words()[3], 0);
     }
 
     #[test]
@@ -3426,7 +3467,7 @@ mod tests {
         let output = f32_graph.embedding(indices, table);
         f32_graph.set_outputs(vec![output]);
         let f32_plan = compile(&f32_graph);
-        assert_eq!(f32_plan.dispatches[0].shader, ShaderEntry::Embedding);
+        assert_eq!(f32_plan.dispatches[0].shader(), ShaderEntry::Embedding);
         assert_eq!(f32_plan.dispatches[0].workgroups, [7, 1, 1]);
 
         let mut f16_graph = Graph::new();
@@ -3439,10 +3480,10 @@ mod tests {
         let embedding = f16_plan
             .dispatches
             .iter()
-            .find(|dispatch| dispatch.shader == ShaderEntry::Embedding)
+            .find(|dispatch| dispatch.shader() == ShaderEntry::Embedding)
             .unwrap();
         assert_eq!(embedding.workgroups, [516, 1, 1]);
-        assert_eq!(embedding.weight_format, WeightFormat::F16);
+        assert_eq!(embedding.weight_format(), WeightFormat::F16);
     }
 
     #[test]
@@ -3454,7 +3495,7 @@ mod tests {
         small.set_outputs(vec![small_output]);
         let small_plan = compile(&small);
         assert_eq!(small_plan.dispatches.len(), 1);
-        assert_eq!(small_plan.dispatches[0].shader, ShaderEntry::ScatterAdd);
+        assert_eq!(small_plan.dispatches[0].shader(), ShaderEntry::ScatterAdd);
 
         let mut large = Graph::new();
         let large_indices = large.input_u32("indices", &[256]);
@@ -3465,14 +3506,14 @@ mod tests {
         assert_eq!(large_plan.dispatches.len(), 2);
         assert!(large_plan.dispatches[0].is_zero_fill());
         assert_eq!(
-            large_plan.dispatches[1].shader,
+            large_plan.dispatches[1].shader(),
             ShaderEntry::ScatterAddAtomic
         );
         assert_eq!(large_plan.dispatches[1].workgroups, [3, 1, 1]);
         assert!(
             large_plan.dispatches[1]
-                .input_buffers
-                .contains(&large_plan.dispatches[1].output_buffer)
+                .input_buffers()
+                .contains(&large_plan.dispatches[1].output_buffer())
         );
     }
 
@@ -3501,25 +3542,25 @@ mod tests {
             .find(|dispatch| dispatch.is_row_scaled_atomic_scatter())
             .expect("gathered row reduction should fuse its table gradient");
         assert_eq!(
-            fused.params,
+            fused.parameter_words(),
             [VOCAB as u32 * INNER as u32, SEQ as u32, INNER as u32, 2]
         );
         assert_eq!(fused.workgroups, [4, 1, 1]);
-        assert_eq!(fused.input_buffers.len(), 4);
-        assert_eq!(fused.input_buffers[3], fused.output_buffer);
+        assert_eq!(fused.input_buffers().len(), 4);
+        assert_eq!(fused.input_buffers()[3], fused.output_buffer());
         assert!(!plan.dispatches.iter().any(|dispatch| {
             dispatch.is_inner_broadcast()
-                && dispatch.params == [SEQ as u32 * INNER as u32, INNER as u32, 1, 0]
+                && dispatch.parameter_words() == [SEQ as u32 * INNER as u32, INNER as u32, 1, 0]
         }));
 
         let zero = plan
             .dispatches
             .iter()
             .find(|dispatch| {
-                dispatch.is_zero_fill() && dispatch.output_buffer == fused.output_buffer
+                dispatch.is_zero_fill() && dispatch.output_buffer() == fused.output_buffer()
             })
             .expect("fused atomic scatter still needs its zeroing pass");
-        assert_eq!(zero.input_buffers[0], fused.input_buffers[1]);
+        assert_eq!(zero.input_buffers()[0], fused.input_buffers()[1]);
     }
 
     #[test]
@@ -3546,7 +3587,7 @@ mod tests {
             .iter()
             .find(|dispatch| dispatch.is_row_scaled_atomic_scatter())
             .expect("gathered row reduction should fuse its table gradient");
-        assert_eq!(fused.params[3], 1);
+        assert_eq!(fused.parameter_words()[3], 1);
         assert_eq!(fused.workgroups, [(SEQ * INNER).div_ceil(256) as u32, 1, 1]);
     }
 
@@ -3561,8 +3602,8 @@ mod tests {
         // Softmax compiles to 2 Reduction dispatches (max, then
         // sum/normalize). Check that it has the right batch/features params.
         assert_eq!(plan.dispatches.len(), 2);
-        assert_eq!(plan.dispatches[0].params[0], 100); // batch/outer
-        assert_eq!(plan.dispatches[0].params[1], 10); // features/inner
+        assert_eq!(plan.dispatches[0].parameter_words()[0], 100); // batch/outer
+        assert_eq!(plan.dispatches[0].parameter_words()[1], 10); // features/inner
         for dispatch in &plan.dispatches {
             assert_eq!(dispatch.workgroups, [7, 1, 1]);
             assert_eq!(dispatch.reduction().unwrap().rows_per_workgroup, 16);
@@ -3602,13 +3643,13 @@ mod tests {
         let plan = compile(&g);
         // One partial per row, then their sum into the scalar loss.
         assert_eq!(plan.dispatches.len(), 2);
-        assert_eq!(plan.dispatches[0].shader, ShaderEntry::CrossEntropyLoss);
+        assert_eq!(plan.dispatches[0].shader(), ShaderEntry::CrossEntropyLoss);
         assert_eq!(plan.dispatches[0].workgroups, [4, 1, 1]);
-        assert_eq!(plan.dispatches[0].params[0], 4);
-        assert_eq!(plan.dispatches[0].params[1], 10);
-        assert_eq!(plan.dispatches[0].params[2], 0);
-        assert_eq!(plan.dispatches[1].shader, ShaderEntry::SumAll);
-        assert_eq!(plan.loss_buffer, Some(plan.dispatches[1].output_buffer));
+        assert_eq!(plan.dispatches[0].parameter_words()[0], 4);
+        assert_eq!(plan.dispatches[0].parameter_words()[1], 10);
+        assert_eq!(plan.dispatches[0].parameter_words()[2], 0);
+        assert_eq!(plan.dispatches[1].shader(), ShaderEntry::SumAll);
+        assert_eq!(plan.loss_buffer, Some(plan.dispatches[1].output_buffer()));
     }
 
     #[test]
@@ -3623,9 +3664,13 @@ mod tests {
         let ce = plan
             .dispatches
             .iter()
-            .find(|d| d.shader == ShaderEntry::CrossEntropyLoss)
+            .find(|d| d.shader() == ShaderEntry::CrossEntropyLoss)
             .expect("CE forward");
-        assert_eq!(ce.params[2], 1, "training CE must write the fused grad");
+        assert_eq!(
+            ce.parameter_words()[2],
+            1,
+            "training CE must write the fused grad"
+        );
         let softmax_dispatches = plan
             .dispatches
             .iter()
@@ -3646,67 +3691,75 @@ mod tests {
 
         let plan = compile(&g);
         assert_eq!(plan.dispatches.len(), 1);
-        assert_eq!(plan.dispatches[0].shader, ShaderEntry::Transpose);
-        assert_eq!(plan.dispatches[0].params[0], 4); // m
-        assert_eq!(plan.dispatches[0].params[1], 8); // n
+        assert_eq!(plan.dispatches[0].shader(), ShaderEntry::Transpose);
+        assert_eq!(plan.dispatches[0].parameter_words()[0], 4); // m
+        assert_eq!(plan.dispatches[0].parameter_words()[1], 8); // n
     }
 
     #[test]
     fn horizontal_fuse_packs_same_a_matmuls() {
         let mut dispatches = vec![
-            Dispatch {
-                shader: ShaderEntry::MatMul,
-                workgroups: [2, 2, 1],
-                input_buffers: vec![BufferRef(0), BufferRef(1)],
-                output_buffer: BufferRef(2),
-                params: vec![32, 32, 32, 0],
-                ..Default::default()
-            },
-            Dispatch {
-                shader: ShaderEntry::MatMul,
-                workgroups: [2, 2, 1],
-                input_buffers: vec![BufferRef(0), BufferRef(3)],
-                output_buffer: BufferRef(4),
-                params: vec![32, 32, 32, 0],
-                ..Default::default()
-            },
-            Dispatch {
-                shader: ShaderEntry::MatMul,
-                workgroups: [2, 2, 1],
-                input_buffers: vec![BufferRef(0), BufferRef(5)],
-                output_buffer: BufferRef(6),
-                params: vec![32, 32, 32, 0],
-                ..Default::default()
-            },
+            Dispatch::new(
+                DispatchOp::Matmul(dispatch::Matmul::new(
+                    dispatch::MatmulKind::Plain,
+                    BufferRef(0),
+                    BufferRef(1),
+                    BufferRef(2),
+                    [32, 32, 32],
+                )),
+                [2, 2, 1],
+            ),
+            Dispatch::new(
+                DispatchOp::Matmul(dispatch::Matmul::new(
+                    dispatch::MatmulKind::Plain,
+                    BufferRef(0),
+                    BufferRef(3),
+                    BufferRef(4),
+                    [32, 32, 32],
+                )),
+                [2, 2, 1],
+            ),
+            Dispatch::new(
+                DispatchOp::Matmul(dispatch::Matmul::new(
+                    dispatch::MatmulKind::Plain,
+                    BufferRef(0),
+                    BufferRef(5),
+                    BufferRef(6),
+                    [32, 32, 32],
+                )),
+                [2, 2, 1],
+            ),
         ];
         let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
         groups.push(0..3);
         fuse_horizontal_matmuls(&mut dispatches, &mut groups);
         assert_eq!(dispatches.len(), 1);
-        assert_eq!(dispatches[0].horizontal_batch, 3);
+        assert_eq!(dispatches[0].horizontal_batch(), 3);
         assert_eq!(dispatches[0].workgroups[2], 3);
-        assert_eq!(dispatches[0].input_buffers.len(), 4);
-        assert_eq!(dispatches[0].extra_outputs.len(), 2);
+        assert_eq!(dispatches[0].input_buffers().len(), 4);
+        assert_eq!(dispatches[0].extra_outputs().len(), 2);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0], 0..1);
     }
 
     fn mm_dispatch(a: u32, b: u32, c: u32, wgz: u32, n: u32) -> Dispatch {
-        Dispatch {
-            shader: ShaderEntry::MatMul,
-            workgroups: [2, 2, wgz],
-            input_buffers: vec![BufferRef(a), BufferRef(b)],
-            output_buffer: BufferRef(c),
-            params: vec![32, 32, n, 0],
-            ..Default::default()
-        }
+        Dispatch::new(
+            DispatchOp::Matmul(dispatch::Matmul::new(
+                dispatch::MatmulKind::Plain,
+                BufferRef(a),
+                BufferRef(b),
+                BufferRef(c),
+                [32, n, 32],
+            )),
+            [2, 2, wgz],
+        )
     }
 
     #[test]
     fn horizontal_fusion_preserves_precision() {
         let mut dispatches = vec![mm_dispatch(0, 1, 2, 1, 32), mm_dispatch(0, 3, 4, 1, 32)];
         for d in &mut dispatches {
-            d.kernel = crate::compile::Kernel::Cooperative;
+            d.set_kernel(crate::compile::Kernel::Cooperative);
         }
         dispatches[1].requires_full_precision = true;
         let mut groups = Vec::new();
@@ -3716,11 +3769,11 @@ mod tests {
 
         assert_eq!(dispatches.len(), 1);
         let packed = &dispatches[0];
-        assert_eq!(packed.horizontal_batch, 2);
+        assert_eq!(packed.horizontal_batch(), 2);
         assert_eq!(packed.workgroups, [2, 2, 2]);
         assert!(packed.use_coop());
         assert!(packed.requires_full_precision);
-        assert_eq!(packed.extra_outputs, [BufferRef(4)]);
+        assert_eq!(packed.extra_outputs(), [BufferRef(4)]);
     }
 
     #[test]
@@ -3741,22 +3794,30 @@ mod tests {
             (
                 "fused add has three inputs",
                 vec![
-                    Dispatch {
-                        shader: ShaderEntry::FusedMatMulAdd,
-                        workgroups: [2, 2, 1],
-                        input_buffers: vec![BufferRef(0), BufferRef(1), BufferRef(7)],
-                        output_buffer: BufferRef(2),
-                        params: vec![32, 32, 32, 0],
-                        ..Default::default()
-                    },
-                    Dispatch {
-                        shader: ShaderEntry::FusedMatMulAdd,
-                        workgroups: [2, 2, 1],
-                        input_buffers: vec![BufferRef(0), BufferRef(3), BufferRef(8)],
-                        output_buffer: BufferRef(4),
-                        params: vec![32, 32, 32, 0],
-                        ..Default::default()
-                    },
+                    Dispatch::new(
+                        DispatchOp::Matmul(dispatch::Matmul::new(
+                            dispatch::MatmulKind::Add {
+                                addend: BufferRef(7),
+                            },
+                            BufferRef(0),
+                            BufferRef(1),
+                            BufferRef(2),
+                            [32, 32, 32],
+                        )),
+                        [2, 2, 1],
+                    ),
+                    Dispatch::new(
+                        DispatchOp::Matmul(dispatch::Matmul::new(
+                            dispatch::MatmulKind::Add {
+                                addend: BufferRef(8),
+                            },
+                            BufferRef(0),
+                            BufferRef(3),
+                            BufferRef(4),
+                            [32, 32, 32],
+                        )),
+                        [2, 2, 1],
+                    ),
                 ],
             ),
         ];
@@ -3768,7 +3829,7 @@ mod tests {
             fuse_horizontal_matmuls(&mut dispatches, &mut groups);
             assert_eq!(dispatches.len(), n, "{label} should not pack");
             assert!(
-                dispatches.iter().all(|d| d.horizontal_batch < 2),
+                dispatches.iter().all(|d| d.horizontal_batch() < 2),
                 "{label} should leave horizontal_batch unset"
             );
         }
@@ -3786,7 +3847,7 @@ mod tests {
         let d = &plan.dispatches[0];
         // workgroups = [ceil(N/64), ceil(M/64), 1] = [1, 1, 1] (4×4 register-tiled)
         assert_eq!(d.workgroups, [1, 1, 1]);
-        assert_eq!(d.params, vec![33, 64, 17, 0]);
+        assert_eq!(d.parameter_words(), vec![33, 64, 17, 0]);
     }
 
     #[test]
@@ -3800,7 +3861,7 @@ mod tests {
 
         let plan = compile(&graph);
         let dispatch = &plan.dispatches[0];
-        assert_eq!(dispatch.shader, ShaderEntry::MatMul);
+        assert_eq!(dispatch.shader(), ShaderEntry::MatMul);
         assert_eq!(dispatch.workgroups, [1, 32_768, 2]);
         assert!(
             dispatch
@@ -3842,8 +3903,8 @@ mod tests {
                 assert!(normalized.reduction().is_some());
                 assert!(!is_plain_rmsnorm(&normalized));
                 for dispatch in &mut plan.dispatches {
-                    if dispatch.shader == ShaderEntry::MatMul {
-                        dispatch.kernel = Kernel::Cooperative;
+                    if dispatch.shader() == ShaderEntry::MatMul {
+                        dispatch.set_kernel(Kernel::Cooperative);
                     }
                 }
                 match consumer {
@@ -3873,29 +3934,41 @@ mod tests {
             scalar_plan
                 .dispatches
                 .iter()
-                .all(|dispatch| dispatch.matmul_prologue.is_none())
+                .all(|dispatch| dispatch.matmul_prologue().is_none())
         );
 
         let mut coop_plan = compile(&g);
         let matmul_index = coop_plan
             .dispatches
             .iter()
-            .position(|dispatch| dispatch.shader == ShaderEntry::MatMul)
+            .position(|dispatch| dispatch.shader() == ShaderEntry::MatMul)
             .expect("matmul dispatch");
-        coop_plan.dispatches[matmul_index].kernel = crate::compile::Kernel::Cooperative;
+        coop_plan.dispatches[matmul_index].set_kernel(crate::compile::Kernel::Cooperative);
         fuse_rmsnorm_prologues(&mut coop_plan);
 
         let rsqrt = coop_plan
             .dispatches
             .iter()
-            .find(|dispatch| dispatch.shader == ShaderEntry::RmsNormRsqrt)
+            .find(|dispatch| dispatch.shader() == ShaderEntry::RmsNormRsqrt)
             .expect("RmsNorm rsqrt dispatch");
-        assert_eq!(rsqrt.params[2], 1e-5f32.to_bits());
+        assert_eq!(rsqrt.parameter_words()[2], 1e-5f32.to_bits());
         let matmul = &coop_plan.dispatches[matmul_index];
-        let prologue = matmul.matmul_prologue.as_ref().expect("matmul prologue");
+        let prologue = matmul.matmul_prologue().expect("matmul prologue");
         assert_eq!(prologue.factors.len(), 2);
         for &(factor, _) in &prologue.factors {
-            assert!(matmul.input_buffers.contains(&factor));
+            assert!(matmul.input_buffers().contains(&factor));
+        }
+        let mut remapped = matmul.clone();
+        remapped.map_buffers(|buffer| BufferRef(buffer.0 + 100));
+        assert_eq!(remapped.mnk(), matmul.mnk());
+        assert_eq!(remapped.output_buffer().0, matmul.output_buffer().0 + 100);
+        for (&(before, ref kind), &(after, ref mapped_kind)) in prologue
+            .factors
+            .iter()
+            .zip(&remapped.matmul_prologue().unwrap().factors)
+        {
+            assert_eq!((after.0, mapped_kind), (before.0 + 100, kind));
+            assert!(remapped.input_buffers().contains(&after));
         }
     }
 
@@ -3914,7 +3987,7 @@ mod tests {
         let forward = plan
             .dispatches
             .iter()
-            .find(|dispatch| dispatch.shader == ShaderEntry::Conv2dGemm)
+            .find(|dispatch| dispatch.shader() == ShaderEntry::Conv2dGemm)
             .unwrap();
         assert_eq!(forward.workgroups, [3000u32.div_ceil(64), 8, 1]);
 
@@ -3923,7 +3996,7 @@ mod tests {
         let grad_input = training
             .dispatches
             .iter()
-            .find(|dispatch| dispatch.shader == ShaderEntry::Conv2dGradInputGemm)
+            .find(|dispatch| dispatch.shader() == ShaderEntry::Conv2dGradInputGemm)
             .unwrap();
         assert_eq!(grad_input.workgroups, [3000u32.div_ceil(64), 2, 1]);
     }
@@ -4003,7 +4076,7 @@ mod tests {
         // The matmul keeps no epilogue; the bias add and ReLU fuse into one
         // broadcast pointwise dispatch after it.
         assert_eq!(plan.dispatches.len(), 2);
-        assert_eq!(plan.dispatches[0].shader, ShaderEntry::MatMul);
+        assert_eq!(plan.dispatches[0].shader(), ShaderEntry::MatMul);
         let dag = plan.dispatches[1].pointwise().expect("fused bias and ReLU");
         assert!(dag.has_broadcast());
         assert!(dag.ops.iter().any(|op| matches!(op, Pw::Relu(_))));
@@ -4026,7 +4099,7 @@ mod tests {
         for dispatch in plan.dispatches.iter().filter(|d| d.pointwise().is_some()) {
             assert!(
                 dispatch
-                    .input_buffers
+                    .input_buffers()
                     .iter()
                     .all(|b| !constants.contains(b)),
                 "{} still reads a constant tensor",
@@ -4069,9 +4142,9 @@ mod tests {
 
         let plan = compile(&g);
         assert_eq!(plan.dispatches.len(), 1);
-        assert_eq!(plan.dispatches[0].weight_format, WeightFormat::Q4);
-        assert!(plan.dispatches[0].matmul_epilogue.is_some());
-        assert_eq!(plan.dispatches[0].shader, ShaderEntry::MatMul);
+        assert_eq!(plan.dispatches[0].weight_format(), WeightFormat::Q4);
+        assert!(plan.dispatches[0].matmul_epilogue().is_some());
+        assert_eq!(plan.dispatches[0].shader(), ShaderEntry::MatMul);
     }
 
     #[test]
@@ -4086,8 +4159,7 @@ mod tests {
         let plan = compile(&g);
         assert_eq!(plan.dispatches.len(), 1);
         let epilogue = plan.dispatches[0]
-            .matmul_epilogue
-            .as_ref()
+            .matmul_epilogue()
             .expect("clamp should fuse into the matmul store");
         assert_eq!(
             epilogue.dag,
@@ -4167,7 +4239,21 @@ mod tests {
                 let fwd_bq = (threads / fwd_tpq).max(1);
                 let (fwd_entry, fwd_wg) = compiler.attention_dispatch(256, hd, 1, false);
                 if fwd_bq >= 2 {
-                    assert_eq!(fwd_entry, ShaderEntry::FlashAttention);
+                    assert!(matches!(
+                        fwd_entry(dispatch::AttentionForward {
+                            q: BufferRef(0),
+                            k: BufferRef(1),
+                            v: BufferRef(2),
+                            dst: BufferRef(3),
+                            lse: BufferRef(4),
+                            q_seq: 256,
+                            kv_seq: 0,
+                            packed_heads: (1 << 16) | 1,
+                            head_dim: hd,
+                            window_size: 0,
+                        }),
+                        DispatchOp::FlashAttention(_)
+                    ));
                     assert_eq!(fwd_wg[0], 256u32.div_ceil(fwd_bq));
                 }
             }
@@ -4214,7 +4300,7 @@ mod tests {
         let safe_entries: Vec<_> = safe
             .dispatches
             .iter()
-            .map(|dispatch| dispatch.shader.clone())
+            .map(|dispatch| dispatch.shader())
             .collect();
         assert!(safe_entries.contains(&ShaderEntry::FlashAttentionCoop));
         assert!(!safe_entries.contains(&ShaderEntry::FlashGradQCoop));
@@ -4230,7 +4316,7 @@ mod tests {
         let experimental_entries: Vec<_> = experimental
             .dispatches
             .iter()
-            .map(|dispatch| dispatch.shader.clone())
+            .map(|dispatch| dispatch.shader())
             .collect();
         assert!(experimental_entries.contains(&ShaderEntry::FlashGradQCoop));
         assert!(experimental_entries.contains(&ShaderEntry::FlashGradKVCoop));
@@ -4241,12 +4327,12 @@ mod tests {
         assert!(
             full.dispatches
                 .iter()
-                .any(|d| d.shader == ShaderEntry::FlashAttention)
+                .any(|d| d.shader() == ShaderEntry::FlashAttention)
         );
         assert!(
             full.dispatches
                 .iter()
-                .all(|d| d.shader != ShaderEntry::FlashAttentionCoop)
+                .all(|d| d.shader() != ShaderEntry::FlashAttentionCoop)
         );
 
         let scalar = compile_with_caps_policy(
@@ -4257,7 +4343,7 @@ mod tests {
             false,
         );
         assert!(scalar.dispatches.iter().all(|dispatch| !matches!(
-            &dispatch.shader,
+            &dispatch.shader(),
             ShaderEntry::FlashAttentionCoop
                 | ShaderEntry::FlashGradQCoop
                 | ShaderEntry::FlashGradKVCoop
@@ -4293,12 +4379,12 @@ mod tests {
         assert!(
             plan.dispatches
                 .iter()
-                .any(|dispatch| dispatch.shader == ShaderEntry::FlashGradKVCoop)
+                .any(|dispatch| dispatch.shader() == ShaderEntry::FlashGradKVCoop)
         );
         assert!(
             plan.dispatches
                 .iter()
-                .all(|dispatch| { dispatch.shader != ShaderEntry::MultiHeadAttnGradKV })
+                .all(|dispatch| { dispatch.shader() != ShaderEntry::MultiHeadAttnGradKV })
         );
     }
 
@@ -4343,7 +4429,7 @@ mod tests {
                 assert_eq!(
                     plan.dispatches
                         .iter()
-                        .any(|dispatch| dispatch.shader == shader),
+                        .any(|dispatch| dispatch.shader() == shader),
                     wanted,
                     "{shader:?}, head_dim={head_dim}, shared_memory_bytes={bytes}",
                 );
@@ -4402,16 +4488,19 @@ mod tests {
 
         let small = make_plan(256);
         assert_eq!(small.dispatches.len(), 1);
-        assert_eq!(small.dispatches[0].shader, ShaderEntry::GroupNorm);
+        assert_eq!(small.dispatches[0].shader(), ShaderEntry::GroupNorm);
 
         let large = make_plan(8202);
         assert_eq!(large.dispatches.len(), 2);
-        assert_eq!(large.dispatches[0].shader, ShaderEntry::GroupNormStats);
-        assert_eq!(large.dispatches[1].shader, ShaderEntry::GroupNormApply);
-        let chunks = large.dispatches[1].params[5];
+        assert_eq!(large.dispatches[0].shader(), ShaderEntry::GroupNormStats);
+        assert_eq!(large.dispatches[1].shader(), ShaderEntry::GroupNormApply);
+        let chunks = large.dispatches[1].parameter_words()[5];
         assert_eq!(chunks, 3);
         assert_eq!(8202 % chunks, 0);
         assert_eq!(large.dispatches[0].workgroups[0], 8 * chunks);
-        assert_eq!(large.dispatches[0].params, large.dispatches[1].params);
+        assert_eq!(
+            large.dispatches[0].parameter_words()[..6],
+            large.dispatches[1].parameter_words()[..6]
+        );
     }
 }

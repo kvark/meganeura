@@ -22,7 +22,7 @@ fn softplus_compiles_to_one_pointwise_dispatch() {
     let plan = compile_with(&graph, &CompileOptions::default());
     assert_eq!(plan.dispatches.len(), 1);
     let dispatch = &plan.dispatches[0];
-    assert_eq!(dispatch.input_buffers.len(), 1);
+    assert_eq!(dispatch.input_buffers().len(), 1);
     assert!(dispatch.pointwise().is_some());
 }
 

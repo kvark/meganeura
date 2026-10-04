@@ -81,13 +81,13 @@ fn same_a_qkv_pack_matches_cpu() {
             .plan()
             .dispatches
             .iter()
-            .any(|d| d.horizontal_batch == 3),
+            .any(|d| d.horizontal_batch() == 3),
         "Q/K/V-style siblings should pack into one dispatch; got {:?}",
         session
             .plan()
             .dispatches
             .iter()
-            .map(|d| (d.shader.clone(), d.horizontal_batch, d.workgroups))
+            .map(|d| (d.shader(), d.horizontal_batch(), d.workgroups))
             .collect::<Vec<_>>()
     );
 
@@ -133,7 +133,7 @@ fn different_a_does_not_pack() {
             .plan()
             .dispatches
             .iter()
-            .all(|d| d.horizontal_batch < 2),
+            .all(|d| d.horizontal_batch() < 2),
         "independent A operands must not pack"
     );
 }

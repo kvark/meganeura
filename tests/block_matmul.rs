@@ -42,12 +42,12 @@ fn cpu_production_shapes_use_one_dispatch_per_product() {
                 assert_eq!(plan.dispatches.len(), 1);
                 let d = &plan.dispatches[0];
                 assert!(matches!(
-                    d.shader,
+                    d.shader(),
                     ShaderEntry::BlockMatMul
                         | ShaderEntry::BlockMatMulAT
                         | ShaderEntry::BlockMatMulBT
                 ));
-                assert_eq!(d.params, [rows as u32, n as u32, k as u32, 8]);
+                assert_eq!(d.parameter_words(), [rows as u32, n as u32, k as u32, 8]);
                 let tile = if d.use_small_tiles() { 32 } else { 64 };
                 assert_eq!(
                     d.workgroups,

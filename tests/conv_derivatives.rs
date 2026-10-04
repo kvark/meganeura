@@ -144,13 +144,13 @@ fn plan(s: Shape, tile: u32, splits: u32) -> (ExecutionPlan, Option<BufferRef>) 
     let mut plan = meganeura::compile::compile(&meganeura::autodiff::differentiate(&graph));
     let mut forced = 0;
     for d in &mut plan.dispatches {
-        match d.shader {
+        match d.shader() {
             ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGemmSmall | ShaderEntry::Conv2dGemm16 => {
-                d.shader = match tile {
+                d.set_shader(match tile {
                     16 => ShaderEntry::Conv2dGemm16,
                     32 => ShaderEntry::Conv2dGemmSmall,
                     _ => ShaderEntry::Conv2dGemm,
-                };
+                });
                 let (oh, ow) = s.output();
                 d.workgroups = [(oh * ow).div_ceil(tile), s.co.div_ceil(tile), s.batch];
                 forced += 1;
@@ -158,22 +158,22 @@ fn plan(s: Shape, tile: u32, splits: u32) -> (ExecutionPlan, Option<BufferRef>) 
             ShaderEntry::Conv2dGradInputGemm
             | ShaderEntry::Conv2dGradInputGemmSmall
             | ShaderEntry::Conv2dGradInputGemm16 => {
-                d.shader = match tile {
+                d.set_shader(match tile {
                     16 => ShaderEntry::Conv2dGradInputGemm16,
                     32 => ShaderEntry::Conv2dGradInputGemmSmall,
                     _ => ShaderEntry::Conv2dGradInputGemm,
-                };
+                });
                 d.workgroups = [(s.h * s.w).div_ceil(tile), s.ci.div_ceil(tile), s.batch];
                 forced += 1;
             }
             ShaderEntry::Conv2dGradWeightGemm
             | ShaderEntry::Conv2dGradWeightGemmSmall
             | ShaderEntry::Conv2dGradWeightGemm16 => {
-                d.shader = match tile {
+                d.set_shader(match tile {
                     16 => ShaderEntry::Conv2dGradWeightGemm16,
                     32 => ShaderEntry::Conv2dGradWeightGemmSmall,
                     _ => ShaderEntry::Conv2dGradWeightGemm,
-                };
+                });
                 d.workgroups = [(s.ci * s.kh * s.kw).div_ceil(tile), s.co.div_ceil(tile), 1];
                 forced += 1;
             }
@@ -187,7 +187,7 @@ fn plan(s: Shape, tile: u32, splits: u32) -> (ExecutionPlan, Option<BufferRef>) 
             .iter()
             .position(|d| {
                 matches!(
-                    d.shader,
+                    d.shader(),
                     ShaderEntry::Conv2dGradWeightGemm
                         | ShaderEntry::Conv2dGradWeightGemmSmall
                         | ShaderEntry::Conv2dGradWeightGemm16
@@ -230,12 +230,8 @@ fn run_split(
     let half_inputs = cooperative && meganeura::runtime::auto_tune(gpu, 0).coop_caps.f32_tile == 0;
     if cooperative {
         assert!(
-            session
-                .plan()
-                .dispatches
-                .iter()
-                .any(|d| d.use_coop()
-                    && matches!(d.shader, ShaderEntry::Conv2dGradInputGemmCoopGen(..))),
+            session.plan().dispatches.iter().any(|d| d.use_coop()
+                && matches!(d.shader(), ShaderEntry::Conv2dGradInputGemmCoopGen(..))),
             "generated dX kernel must actually execute"
         );
     }
@@ -354,7 +350,7 @@ fn run_split(
             .iter()
             .find(|d| {
                 matches!(
-                    d.shader,
+                    d.shader(),
                     ShaderEntry::Conv2dGemm
                         | ShaderEntry::Conv2dGemmSmall
                         | ShaderEntry::Conv2dGemm16
@@ -364,7 +360,7 @@ fn run_split(
             .unwrap();
         assert_eq!(forward.workgroups[2], s.batch);
         let mut actual = vec![f32::NAN; ny];
-        session.read_buffer(forward.output_buffer, &mut actual);
+        session.read_buffer(forward.output_buffer(), &mut actual);
         check(&format!("{s:?}, forward"), &actual, &output, 1.0);
         for (name, expected) in [("x", dx), ("w", dw)] {
             let mut actual = vec![f32::NAN; expected.len()];
@@ -584,7 +580,7 @@ fn optimizer_updates(measure: bool, tile: u32) {
                     .iter()
                     .position(|d| {
                         matches!(
-                            d.shader,
+                            d.shader(),
                             ShaderEntry::Conv2dGradWeightGemm
                                 | ShaderEntry::Conv2dGradWeightGemmSmall
                                 | ShaderEntry::Conv2dGradWeightGemm16
@@ -891,7 +887,8 @@ fn generated_conv_indexing_matches_full_oracle_at_reciprocal_boundaries() {
                     .plan()
                     .dispatches
                     .iter()
-                    .any(|d| d.use_coop() && matches!(d.shader, ShaderEntry::Conv2dGemmCoopGen(..)))
+                    .any(|d| d.use_coop()
+                        && matches!(d.shader(), ShaderEntry::Conv2dGemmCoopGen(..)))
             );
         }
     }

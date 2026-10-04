@@ -1,5 +1,11 @@
 # Unreleased
 
+- Store dispatch operations as typed enum payloads with named operands and
+  dimensions. Derive shader selection from the operation, bind payloads
+  exhaustively, and visit their buffers for scheduling, aliasing and tuning.
+  Store matrix dimensions in canonical `(m, n, k)` order. Bump the cache format
+  to 17 and invalidate older plans before decoding their obsolete schema.
+
 - Bound cooperative attention's workgroup staging by the selected device's
   shared-memory limit, falling back independently for forward, dQ and dK/dV.
   Include the limit in cached-plan compatibility and invalidate older plans.
@@ -31,41 +37,11 @@
   change was relative, since `include_str!("shaders/...")` inside the moved
   generators became `"../shaders/..."`.
 
-- `bind_dispatch` was one 58-arm match over `ShaderEntry` and 1237 lines. It is
-  now a routing match plus eight family functions — `bind_matmul` (120 lines),
-  `bind_conv` (196), `bind_attention` (202), `bind_norm` (195),
-  `bind_activation` (78), `bind_reduction` (58), `bind_loss` (48) and
-  `bind_pointwise` (203) — with `bind_dispatch` itself at 333.
-
-  The routing match is the only exhaustive one and deliberately has no wildcard
-  arm, so a new `ShaderEntry` variant fails to compile at the routing decision
-  instead of reaching some family's inner match and landing in its
-  `unreachable!` at runtime. Each family's inner match keeps a trailing
-  `unreachable!`, so a routing arm that drifts from its family is caught by the
-  first test that reaches it.
-
-  Splitting it does not make it faster and was not sold as such: timing
-  `bind_dispatch` per shader entry across the `bench_step_cpu` sweep gives
-  138-174 ns for every entry with no hot arm, so the 187 ns that is 28% of the
-  host path is the binding model, not one arm. The sequence of 65 `pc.bind` calls
-  is byte-identical before and after.
-
-- `bind_dispatch`'s contraction arms now read `(m, n, k)` through
-  `Dispatch::mnk()` instead of spelling out `params[0..3]` with a per-shader
-  swap — thirteen sites, and the third copy of a rule that had already drifted
-  between the two other places it was written. Routing them through the accessor
-  found a gap in its own table: `FusedMatMulBTAdd` was missing, so 14 GGUF, 4
-  oracle and 9 smoke tests panicked on a name lookup rather than binding a wrong
-  shape. That is now a row in the table, and the `mnk` closure in
-  `bind_dispatch` panics *naming the shader* rather than reporting a generic
-  expectation failure, since it is the backstop for a contraction shader added
-  without a table row — a case the unit test structurally cannot catch, because
-  it only enumerates the shaders the table already names.
-
-  Splitting `bind_dispatch` for its own sake was measured and rejected: timing
-  it per shader entry across the `bench_step_cpu` sweep gives 138-174 ns for
-  every entry with no hot arm, so the 187 ns is the binding model rather than
-  one arm doing something wasteful.
+- Earlier binding cleanup split `bind_dispatch` into eight shader-family
+  functions and consolidated contraction dimensions in `Dispatch::mnk()`.
+  The typed operation model above supersedes the shader routing and parameter
+  ordering table. Before the representation change, per-entry binding timings
+  across the `bench_step_cpu` sweep ranged from 138–174 ns, with no hot arm.
 
 - `DType::block_geometry()` is the single source for quantized block geometry,
   replacing five independent tables: the `DType` doc comments, the seven
@@ -83,23 +59,6 @@
   pads to 36 bytes where GGML uses 34. Merging those two is what would erase the
   difference, so it is left explicit. Three tests, one restating each stride as
   the literal arithmetic it replaced.
-
-- `Dispatch::mnk()` centralises the `(m, n, k)` reinterpretation that two
-  binding sites each did differently: the horizontal-batch binding swapped only
-  for `ShaderEntry::MatMul`, the cooperative-prologue binding only for `MatMul`
-  and `FusedMatMulAdd`, and the shaders that actually store `(m, k, n)` in
-  `params` are `MatMul`, `MatMulGemv`, `MatMulGemvAdd` and `FusedMatMulAdd`. The
-  accessor documents which is which — the `AT`/`BT` variants take A already
-  transposed, so their natural order already is `(m, n, k)` — and returns `None`
-  for a non-contraction rather than three unrelated numbers from `params`. Three
-  tests pin it, including the full table of eight contraction shaders.
-
-  Whether either site was wrong in practice was measured, not assumed:
-  instrumenting `merge_horizontal` across the suite shows only `MatMul`,
-  `MatMulBT` and `MatMulAT` are ever merged, so the first list happened to be
-  complete — though the merge predicate restricts the kernel and not the shader,
-  so that was luck. The prologue site is reached by no test at all, so its list
-  could not be validated empirically and is now correct by construction.
 
 - The cooperative attention kernels rounded tensors to f16 that no cooperative
   matrix instruction consumes, and the rounding survived to the output. Five

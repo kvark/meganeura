@@ -679,12 +679,12 @@ fn two_gather_reduction_actually_fuses() {
         "both embedding producers should fold as gather streams"
     );
     // Both indices + both tables present as input buffers (4 streams).
-    assert_eq!(reductions[0].input_buffers.len(), 4);
+    assert_eq!(reductions[0].input_buffers().len(), 4);
     // No standalone Embedding dispatches remain.
     let embeds = plan
         .dispatches
         .iter()
-        .filter(|d| d.shader == ShaderEntry::Embedding && d.reduction().is_none())
+        .filter(|d| d.shader() == ShaderEntry::Embedding && d.reduction().is_none())
         .count();
     assert_eq!(embeds, 0, "embedding dispatches should be folded away");
 }
@@ -721,13 +721,13 @@ fn shared_gather_and_offset_fold_into_each_reduction() {
         let kernel = reduction.reduction().unwrap();
         assert_eq!(kernel.n_per_elem, 3);
         assert_eq!(kernel.gather_elem, vec![true, false, false]);
-        assert_eq!(reduction.input_buffers.len(), 4);
+        assert_eq!(reduction.input_buffers().len(), 4);
     }
     assert!(!plan.dispatches.iter().any(|dispatch| {
-        dispatch.shader == ShaderEntry::Embedding && dispatch.reduction().is_none()
+        dispatch.shader() == ShaderEntry::Embedding && dispatch.reduction().is_none()
     }));
     assert!(!plan.dispatches.iter().any(|dispatch| {
-        dispatch.pointwise().is_some() && dispatch.params[0] == (m * n) as u32
+        dispatch.pointwise().is_some() && dispatch.parameter_words()[0] == (m * n) as u32
     }));
 }
 

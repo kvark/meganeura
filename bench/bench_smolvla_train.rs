@@ -238,7 +238,7 @@ fn main() {
         let count_dispatches = |plan: &meganeura::compile::ExecutionPlan| {
             let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
             for d in &plan.dispatches {
-                *counts.entry(format!("{:?}", d.shader)).or_default() += 1;
+                *counts.entry(format!("{:?}", d.shader())).or_default() += 1;
             }
             counts
         };

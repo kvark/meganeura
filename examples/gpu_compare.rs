@@ -24,7 +24,7 @@ fn bench_matmul(n: usize, warmup: usize, iters: usize) -> (f64, &'static str) {
         .plan()
         .dispatches
         .iter()
-        .find(|d| matches!(d.shader, meganeura::compile::ShaderEntry::MatMul))
+        .find(|d| matches!(d.shader(), meganeura::compile::ShaderEntry::MatMul))
         .map(|d| {
             if d.use_coop() {
                 "coop"

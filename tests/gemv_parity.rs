@@ -76,7 +76,7 @@ fn q40_rmsnorm_folds_into_gemv() {
         .plan()
         .dispatches
         .iter()
-        .filter(|d| d.gemv_rmsnorm.is_some())
+        .filter(|d| d.gemv_rmsnorm().is_some())
         .count();
     assert_eq!(fused, 1, "Q40 GEMV should fold the RmsNorm");
     assert!(
@@ -153,7 +153,7 @@ fn dense_transposed_glu_matches_reference_after_restage() {
                             .plan()
                             .dispatches
                             .iter()
-                            .filter(|d| d.gemv_rmsnorm.is_some())
+                            .filter(|d| d.gemv_rmsnorm().is_some())
                             .count(),
                         1
                     );
@@ -378,7 +378,7 @@ fn gemv_shapes_cover_widths_reductions_and_row_tails() {
             ..crate::support::gpu::config()
         };
         let mut s = meganeura::build(&g, config).0;
-        let shaders: Vec<_> = s.plan().dispatches.iter().map(|d| &d.shader).collect();
+        let shaders: Vec<_> = s.plan().dispatches.iter().map(|d| d.shader()).collect();
         for expected in [
             ShaderEntry::MatMulGemv,
             ShaderEntry::MatMulGemvAdd,
@@ -386,10 +386,7 @@ fn gemv_shapes_cover_widths_reductions_and_row_tails() {
             ShaderEntry::MatMulGemvBTAdd,
         ] {
             assert_eq!(
-                shaders
-                    .iter()
-                    .filter(|&&shader| *shader == expected)
-                    .count(),
+                shaders.iter().filter(|shader| **shader == expected).count(),
                 1,
                 "{shape:?}: missing {expected:?}; got {shaders:?}"
             );
