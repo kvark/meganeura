@@ -3,7 +3,7 @@
     var si = lane;
     loop {
         if si >= k { break; }
-        let v = matrix_a[si];
+        let v = $NORM_VALUE;
         ss += v * v;
         si += LANES;
     }

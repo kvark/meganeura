@@ -1,3 +1,4 @@
+// @section header
 // Cooperative matrix matmul: 2×2 tile grid ($OUTPUT_M×$OUTPUT_N output per WG)
 // Dispatch: [ceil(m/$OUTPUT_M), ceil(n/$OUTPUT_N), 1], WG=64
 // One template for every tile. $TILE_M, $TILE_N and $TILE_K are the C rows,
@@ -16,8 +17,7 @@ struct Params {
 }
 
 var<storage> matrix_a: $A_STORAGE;
-var<storage> matrix_b: $B_STORAGE;
-var<storage, read_write> matrix_c: array<f32>;
+$MATRIX_BINDINGS
 $FUSED_ADD_DECL
 $PROLOGUE_DECL
 $EPILOGUE_DECL
@@ -30,8 +30,8 @@ $SHARED_LO_DECL
 $RESULT_SHARED_DECL
 $PROLOGUE_CACHE_DECL
 
-@compute @workgroup_size(64)
-fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(subgroup_id) sg: u32) {
+// @section kernel
+$ENTRY_SIGNATURE {
     let tile_row = wgid.x * $OUTPUT_M_U;
     let tile_col = wgid.y * $OUTPUT_N_U;
     let m = params.m;

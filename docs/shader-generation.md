@@ -107,3 +107,25 @@ kernel alone does not exercise the complexity driving the current rewrites.
 All experimental compilation and validation ran outside the repository under
 `/tmp/meganeura-shader-probe*`. No GPU execution, performance comparison or
 complete alternative-frontend migration was performed.
+
+## Follow-up implementation
+
+The WGSL refactor now uses explicit slots for GEMV loads, reductions, row
+grouping, fused normalization and stores. Horizontal matmul composes binding
+declarations and kernel functions from named template sections. Neither path
+finds or rewrites WGSL statements to specialize a shader.
+
+Single-query, multi-query, cached and backward attention bodies live in
+`src/shaders/`. The host selects geometry, optional resources, memory paths
+and unrolled fragments. Cooperative attention bodies were extracted in the
+preceding cleanup.
+
+Sections use `// @section NAME`; slots retain the existing `$NAME`
+substitution. Fragments are inserted before their parameter slots are filled.
+This adds no frontend dependency or shader language.
+
+Before/after comparison of 1,662 generated shader variants produced identical
+canonical WGSL, including GEMV, horizontal and ordinary matmul, and attention.
+The all-feature test suite passed 813 tests with 23 ignored. Formatting,
+Clippy, the build without features, rustdoc and package assembly passed.
+The GPU run still emitted the preexisting Vulkan workgroup-layout diagnostics.

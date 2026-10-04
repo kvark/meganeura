@@ -33,19 +33,7 @@ const BKV: u32 = 16u;
 const MAX_VALUES_PER_THREAD: u32 = $VALUES_PER_THREAD;
 
 fn tree_reduce_bkv(tid: u32) {
-    workgroupBarrier();
-    if tid < 32u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 32u]; } }
-    workgroupBarrier();
-    if tid < 16u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 16u]; } }
-    workgroupBarrier();
-    if tid < 8u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 8u]; } }
-    workgroupBarrier();
-    if tid < 4u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 4u]; } }
-    workgroupBarrier();
-    if tid < 2u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 2u]; } }
-    workgroupBarrier();
-    if tid < 1u { for (var i = 0u; i < BKV; i++) { wg_scores[i * 64u + tid] += wg_scores[i * 64u + tid + 1u]; } }
-    workgroupBarrier();
+$SCORE_REDUCE
 }
 
 @compute @workgroup_size(64)
