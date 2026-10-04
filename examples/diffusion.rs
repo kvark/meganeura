@@ -12,7 +12,7 @@
 ///
 /// MSE loss is built from primitives: `mean_all(mul(diff, diff))`
 /// where `diff = add(pred, neg(target))`.
-use meganeura::{DataLoader, Graph, TrainConfig, Trainer};
+use meganeura::{DataLoader, Graph, Optimizer, TrainConfig, Trainer};
 use std::time::Instant;
 
 fn main() {
@@ -118,9 +118,8 @@ fn main() {
     // --- Train ---
     println!("\ntraining ({} epochs)...", epochs);
     let config = TrainConfig {
-        learning_rate: lr,
+        optimizer: Optimizer::sgd(lr),
         log_interval: 20,
-        ..TrainConfig::default()
     };
     let mut trainer = Trainer::new(session, config);
 

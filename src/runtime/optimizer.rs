@@ -24,18 +24,8 @@ pub(super) const TILE: u32 = 1024;
 /// Workgroups in x before a grid wraps into y.
 const GRID_WIDTH: u32 = 32768;
 
-/// `1 / (1 - beta^step)`, the reciprocal Adam divides biased moments by.
-///
-/// The shader's bias correction is a per-element multiply by this value, so
-/// the exponent is taken here, once per step, instead of once per parameter
-/// element on the GPU. Beyond the arithmetic, this keeps the correction
-/// identical across every parameter: the host and the device agree on one
-/// `f32` rather than each rounding `beta^step` independently per thread.
-///
-/// `f32::powf` underflows to zero for a small beta and a large step, which
-/// is the correct limit — the correction converges to one — and yields an
-/// exact zero denominator only at `beta == 1` for any step, which would make
-/// the moment unnormalizable regardless of where the power is taken.
+/// `1 / (1 - beta^step)`, computed once per step for the shader to multiply
+/// into each biased moment.
 fn bias_correction(beta: f32, step: u32) -> f32 {
     1.0 / (1.0 - beta.powi(step as i32))
 }

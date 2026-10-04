@@ -7,6 +7,7 @@
 //! Modules are passed directly to blade via `naga_module` for SPIR-V
 //! compilation.
 
+use crate::compile::WeightFormat;
 use naga::Module;
 
 /// Forward attention staging and lane layout, independent of the EPT cap.
@@ -461,8 +462,6 @@ fn generate_partitioned_matmul(
     options: MatMulOptions,
     splits: u32,
 ) -> ShaderModule {
-    // Store-side fusion compiles through this generator rather than
-    // `generate_module_weighted`, which already refuses quantized BT.
     if matches!(group, ShaderGroup::MatMulBT | ShaderGroup::MatMulBTAdd)
         && options.format.is_quantized()
     {
@@ -501,7 +500,7 @@ fn generate_partitioned_matmul(
     } else {
         fused_expr
     };
-    let (a_row, a_col, b_row, b_col) = epilogue_stage_maps(group);
+    let (a_row, a_col, b_row, b_col) = matmul_stage_maps(group);
     matmul_vars_tiled(
         MatMulIndexing {
             a_idx,
@@ -524,7 +523,7 @@ fn generate_partitioned_matmul(
 
 /// Thread-to-element staging maps. The widths are `$BM_U`, `$BN_U` and
 /// `$K_TILE_U`, so one mapping covers every scalar matmul tile.
-fn epilogue_stage_maps(
+fn matmul_stage_maps(
     group: ShaderGroup,
 ) -> (&'static str, &'static str, &'static str, &'static str) {
     let a_transposed = matches!(group, ShaderGroup::MatMulAT | ShaderGroup::MatMulATAdd);
@@ -686,15 +685,22 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         ShaderGroup::Sgd => optimizer_module(include_str!("shaders/sgd.wgsl")),
         ShaderGroup::Adam => optimizer_module(include_str!("shaders/adam.wgsl")),
         ShaderGroup::Transpose => ShaderModule::new(include_str!("shaders/transpose.wgsl")),
-        ShaderGroup::MatMul => gen_matmul(knobs),
-        ShaderGroup::MatMulAdd => gen_matmul_add(knobs),
-        ShaderGroup::MatMulAT => gen_matmul_at(knobs),
-        ShaderGroup::MatMulBT => gen_matmul_bt(knobs),
+        ShaderGroup::MatMul
+        | ShaderGroup::MatMulAdd
+        | ShaderGroup::MatMulAT
+        | ShaderGroup::MatMulBT
+        | ShaderGroup::MatMulATAdd
+        | ShaderGroup::MatMulBTAdd => generate_matmul_with_epilogue(
+            group,
+            None,
+            MatMulOptions {
+                knobs,
+                ..Default::default()
+            },
+        ),
         ShaderGroup::BlockMatMul | ShaderGroup::BlockMatMulAT | ShaderGroup::BlockMatMulBT => {
             gen_block_matmul(group, MatMulTile::Large)
         }
-        ShaderGroup::MatMulATAdd => gen_matmul_at_add(knobs),
-        ShaderGroup::MatMulBTAdd => gen_matmul_bt_add(knobs),
         ShaderGroup::MatMulGemv
         | ShaderGroup::MatMulGemvAdd
         | ShaderGroup::MatMulGemvBT
@@ -1035,52 +1041,6 @@ const B_COL_FWD: &str = "flat % $BN_U"; // N varies fast (coalesced in [K,N])
 const B_ROW_BT: &str = "flat % $K_TILE_U"; // K varies fast (coalesced in [N,K])
 const B_COL_BT: &str = "flat / $K_TILE_U"; // N varies slowly
 
-fn matmul_vars(
-    a_idx: &str,
-    b_idx: &str,
-    a_row: &str,
-    a_col: &str,
-    b_row: &str,
-    b_col: &str,
-    fused_decl: &str,
-    fused_expr: &str,
-    knobs: MatmulKnobs,
-) -> ShaderModule {
-    matmul_vars_full(
-        a_idx,
-        b_idx,
-        a_row,
-        a_col,
-        b_row,
-        b_col,
-        fused_decl,
-        fused_expr,
-        "",
-        "",
-        WeightFormat::F32,
-        knobs,
-    )
-}
-
-fn matmul_vars_with_mode(
-    a_idx: &str,
-    b_idx: &str,
-    a_row: &str,
-    a_col: &str,
-    b_row: &str,
-    b_col: &str,
-    fused_decl: &str,
-    fused_expr: &str,
-    mode: WeightFormat,
-    knobs: MatmulKnobs,
-) -> ShaderModule {
-    matmul_vars_full(
-        a_idx, b_idx, a_row, a_col, b_row, b_col, fused_decl, fused_expr, "", "", mode, knobs,
-    )
-}
-
-use crate::compile::WeightFormat;
-
 /// Tile geometry for the register-tiled scalar matmul skeleton.
 ///
 /// Public because the epilogue generators are driven by the runtime's
@@ -1359,44 +1319,6 @@ fn tiled_gemm_body(
     acc_array.push_str("    )");
 
     (acc_decl, body, acc_array)
-}
-
-fn matmul_vars_full(
-    a_idx: &str,
-    b_idx: &str,
-    a_row: &str,
-    a_col: &str,
-    b_row: &str,
-    b_col: &str,
-    fused_decl: &str,
-    fused_expr: &str,
-    epilogue_decl: &str,
-    epilogue_body: &str,
-    b_mode: WeightFormat,
-    knobs: MatmulKnobs,
-) -> ShaderModule {
-    matmul_vars_tiled(
-        MatMulIndexing {
-            a_idx,
-            b_idx,
-            a_row,
-            a_col,
-            b_row,
-            b_col,
-            tile_row: "wgid.y + wgid.z * params._pad",
-            c_idx: "row * params.n + col",
-        },
-        fused_decl,
-        fused_expr,
-        epilogue_decl,
-        epilogue_body,
-        MatMulOptions {
-            format: b_mode,
-            tile: MatMulTile::Large,
-            knobs,
-        },
-        1,
-    )
 }
 
 /// Where the tiled skeleton reads A and B.
@@ -1722,225 +1644,24 @@ const Q3K_DEQUANT_FN: &str = include_str!("shaders/dequant_q3k.wgsl");
 /// Block i starts at matrix_b[i * 9]. scale_f16 in low 16 bits of first u32.
 const Q8_DEQUANT_FN: &str = include_str!("shaders/dequant_q8.wgsl");
 
-fn matmul_small_vars(
-    a_idx: &str,
-    b_idx: &str,
-    a_row: &str,
-    a_col: &str,
-    b_row: &str,
-    b_col: &str,
-    fused_decl: &str,
-    fused_expr: &str,
-    knobs: MatmulKnobs,
-) -> ShaderModule {
-    matmul_vars_tiled(
-        MatMulIndexing {
-            a_idx,
-            b_idx,
-            a_row,
-            a_col,
-            b_row,
-            b_col,
-            tile_row: "wgid.y + wgid.z * params._pad",
-            c_idx: "row * params.n + col",
-        },
-        fused_decl,
-        fused_expr,
-        "",
-        "",
-        MatMulOptions {
-            format: WeightFormat::F32,
-            tile: MatMulTile::Small,
-            knobs,
-        },
-        1,
-    )
-}
-
-fn gen_matmul_small(knobs: MatmulKnobs) -> ShaderModule {
-    matmul_small_vars(
-        MATMUL_A_FWD,
-        MATMUL_B_FWD,
-        A_ROW_FWD,
-        A_COL_FWD,
-        B_ROW_FWD,
-        B_COL_FWD,
-        "",
-        "",
-        knobs,
-    )
-}
-fn gen_matmul_small_add(knobs: MatmulKnobs) -> ShaderModule {
-    matmul_small_vars(
-        MATMUL_A_FWD,
-        MATMUL_B_FWD,
-        A_ROW_FWD,
-        A_COL_FWD,
-        B_ROW_FWD,
-        B_COL_FWD,
-        "var<storage> src: array<f32>;",
-        " + src[idx]",
-        knobs,
-    )
-}
-fn gen_matmul_small_at(knobs: MatmulKnobs) -> ShaderModule {
-    matmul_small_vars(
-        MATMUL_A_AT,
-        MATMUL_B_FWD,
-        A_ROW_AT,
-        A_COL_AT,
-        B_ROW_FWD,
-        B_COL_FWD,
-        "",
-        "",
-        knobs,
-    )
-}
-fn gen_matmul_small_bt(knobs: MatmulKnobs) -> ShaderModule {
-    matmul_small_vars(
-        MATMUL_A_FWD,
-        MATMUL_B_BT,
-        A_ROW_FWD,
-        A_COL_FWD,
-        B_ROW_BT,
-        B_COL_BT,
-        "",
-        "",
-        knobs,
-    )
-}
-
-fn gen_matmul(knobs: MatmulKnobs) -> ShaderModule {
-    matmul_vars(
-        MATMUL_A_FWD,
-        MATMUL_B_FWD,
-        A_ROW_FWD,
-        A_COL_FWD,
-        B_ROW_FWD,
-        B_COL_FWD,
-        "",
-        "",
-        knobs,
-    )
-}
-
-fn gen_matmul_add(knobs: MatmulKnobs) -> ShaderModule {
-    matmul_vars(
-        MATMUL_A_FWD,
-        MATMUL_B_FWD,
-        A_ROW_FWD,
-        A_COL_FWD,
-        B_ROW_FWD,
-        B_COL_FWD,
-        "var<storage> src: array<f32>;",
-        " + src[idx]",
-        knobs,
-    )
-}
-
-/// FusedMatMulATAdd: C = A^T × B + D  (A=[K,M], B=[K,N], D=[M,N], C=[M,N])
-fn gen_matmul_at_add(knobs: MatmulKnobs) -> ShaderModule {
-    matmul_vars(
-        MATMUL_A_AT,
-        MATMUL_B_FWD,
-        A_ROW_AT,
-        A_COL_AT,
-        B_ROW_FWD,
-        B_COL_FWD,
-        "var<storage> src: array<f32>;",
-        " + src[idx]",
-        knobs,
-    )
-}
-
-/// FusedMatMulBTAdd: C = A × B^T + D  (A=[M,K], B=[N,K], D=[M,N], C=[M,N])
-fn gen_matmul_bt_add(knobs: MatmulKnobs) -> ShaderModule {
-    matmul_vars(
-        MATMUL_A_FWD,
-        MATMUL_B_BT,
-        A_ROW_FWD,
-        A_COL_FWD,
-        B_ROW_BT,
-        B_COL_BT,
-        "var<storage> src: array<f32>;",
-        " + src[idx]",
-        knobs,
-    )
-}
-
-/// MatMulBT: C = A @ B^T  (A=[M,K], B=[N,K], C=[M,N])
-///
-/// Coalesced B load: consecutive threads read adjacent K values from B[N,K]
-/// (K is the row-major fast dimension), then store transposed into shared_b.
-fn gen_matmul_bt(knobs: MatmulKnobs) -> ShaderModule {
-    matmul_vars(
-        MATMUL_A_FWD,
-        MATMUL_B_BT,
-        A_ROW_FWD,
-        A_COL_FWD,
-        B_ROW_BT,
-        B_COL_BT,
-        "",
-        "",
-        knobs,
-    )
-}
-
-/// MatMulAT: C = A^T @ B  (A=[K,M], B=[K,N], C=[M,N])
-///
-/// Coalesced A load: consecutive threads read adjacent M values from A[K,M]
-/// (M is the row-major fast dimension), then store transposed into shared_a.
-fn gen_matmul_at(knobs: MatmulKnobs) -> ShaderModule {
-    matmul_vars(
-        MATMUL_A_AT,
-        MATMUL_B_FWD,
-        A_ROW_AT,
-        A_COL_AT,
-        B_ROW_FWD,
-        B_COL_FWD,
-        "",
-        "",
-        knobs,
-    )
-}
-
-// ---------------------------------------------------------------------------
-// matmul_coop.wgsl — cooperative matrix multiply (16×16 tiles)
-//
-// Uses cooperative matrix operations for hardware-accelerated matrix multiply
-// on supported GPUs (VK_KHR_cooperative_matrix on Vulkan, simdgroup_matrix
-// on Metal).
-//
-// Workgroup [8, 8, 1], dispatched as [ceil(M/8), ceil(N/8), 1].
-// Each workgroup computes one 8×8 output tile, iterating over K in
-// steps of 8.
-// ---------------------------------------------------------------------------
-
-/// Cooperative matrix matmul: C = A × B.
-///
-/// Parameterized by `CoopConfig` to support different tile sizes and precisions:
-/// - 16×16 f16 tiles (RDNA3/Volta+): mixed-precision f16×f16+f32
-/// -  8×8  f32 tiles (Apple Silicon): all-f32 via simdgroup_matrix
-///
-/// The default `generate_module` path uses 16×16 f16 for backward compat.
-/// Use `generate_coop_module` with a `CoopConfig` for runtime-detected config.
-/// Generate a matmul module with f16 weight (B) storage.
-/// Returns a module containing all matmul variants (Normal, AT, BT)
-/// Generate a matmul module for the given weight storage format.
-/// Generate the 32x32 small-tile form of a matmul group.
-///
-/// Tiling is a modifier on the matmul groups, like weight format: the
-/// dispatch carries `use_small_tiles` and the pipeline is picked from it,
-/// so the tiling does not multiply the group enum.
+/// Generate the 32×32 small-tile form of a matmul group.
 pub fn generate_module_small(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
     match group {
         ShaderGroup::BlockMatMul | ShaderGroup::BlockMatMulAT | ShaderGroup::BlockMatMulBT => {
             gen_block_matmul(group, MatMulTile::Small)
         }
-        ShaderGroup::MatMul => gen_matmul_small(knobs),
-        ShaderGroup::MatMulAdd => gen_matmul_small_add(knobs),
-        ShaderGroup::MatMulAT => gen_matmul_small_at(knobs),
-        ShaderGroup::MatMulBT => gen_matmul_small_bt(knobs),
+        ShaderGroup::MatMul
+        | ShaderGroup::MatMulAdd
+        | ShaderGroup::MatMulAT
+        | ShaderGroup::MatMulBT => generate_matmul_with_epilogue(
+            group,
+            None,
+            MatMulOptions {
+                tile: MatMulTile::Small,
+                knobs,
+                ..Default::default()
+            },
+        ),
         _ => generate_module(group, knobs),
     }
 }
@@ -1967,7 +1688,7 @@ fn gen_block_matmul(group: ShaderGroup, tile: MatMulTile) -> ShaderModule {
         ),
         _ => unreachable!(),
     };
-    let (a_row, a_col, b_row, b_col) = epilogue_stage_maps(ordinary);
+    let (a_row, a_col, b_row, b_col) = matmul_stage_maps(ordinary);
     matmul_vars_tiled(
         MatMulIndexing {
             a_idx,
@@ -1997,96 +1718,24 @@ pub fn generate_module_weighted(
     format: WeightFormat,
     knobs: MatmulKnobs,
 ) -> ShaderModule {
-    let mode = format;
     match group {
-        ShaderGroup::MatMul => matmul_vars_with_mode(
-            MATMUL_A_FWD,
-            MATMUL_B_FWD,
-            A_ROW_FWD,
-            A_COL_FWD,
-            B_ROW_FWD,
-            B_COL_FWD,
-            "",
-            "",
-            mode,
-            knobs,
-        ),
-        ShaderGroup::MatMulAdd => matmul_vars_with_mode(
-            MATMUL_A_FWD,
-            MATMUL_B_FWD,
-            A_ROW_FWD,
-            A_COL_FWD,
-            B_ROW_FWD,
-            B_COL_FWD,
-            "var<storage> src: array<f32>;",
-            " + src[idx]",
-            mode,
-            knobs,
-        ),
-        ShaderGroup::MatMulAT => matmul_vars_with_mode(
-            MATMUL_A_AT,
-            MATMUL_B_FWD,
-            A_ROW_AT,
-            A_COL_AT,
-            B_ROW_FWD,
-            B_COL_FWD,
-            "",
-            "",
-            mode,
-            knobs,
-        ),
-        ShaderGroup::MatMulATAdd => matmul_vars_with_mode(
-            MATMUL_A_AT,
-            MATMUL_B_FWD,
-            A_ROW_AT,
-            A_COL_AT,
-            B_ROW_FWD,
-            B_COL_FWD,
-            "var<storage> src: array<f32>;",
-            " + src[idx]",
-            mode,
-            knobs,
-        ),
-        // The packed decoders address blocks along `params.k`, but packing
-        // runs along the parameter's first dimension. Those coincide for a
-        // forward `[K, N]` weight and diverge for a transposed `[N, K]` one,
-        // so any block format here decodes the wrong block entirely. This
-        // covers Q4 and Q8 as well: nothing in the tree produced a
-        // quantized transposed matmul, so the arms that would have served
-        // them were dead and wrong rather than merely unused. `compile.rs`
-        // keeps them off this group, so the panic is a backstop. f16 is
-        // exempt - an elementwise cast, not a block layout.
-        ShaderGroup::MatMulBT | ShaderGroup::MatMulBTAdd if mode.is_quantized() => panic!(
-            "{mode:?} has no transposed-B variant: its blocks run along the \
-             parameter's first dimension, which is N here, not K"
-        ),
-        ShaderGroup::MatMulBT => matmul_vars_with_mode(
-            MATMUL_A_FWD,
-            MATMUL_B_BT,
-            A_ROW_FWD,
-            A_COL_FWD,
-            B_ROW_BT,
-            B_COL_BT,
-            "",
-            "",
-            mode,
-            knobs,
-        ),
-        ShaderGroup::MatMulBTAdd => matmul_vars_with_mode(
-            MATMUL_A_FWD,
-            MATMUL_B_BT,
-            A_ROW_FWD,
-            A_COL_FWD,
-            B_ROW_BT,
-            B_COL_BT,
-            "var<storage> src: array<f32>;",
-            " + src[idx]",
-            mode,
-            knobs,
+        ShaderGroup::MatMul
+        | ShaderGroup::MatMulAdd
+        | ShaderGroup::MatMulAT
+        | ShaderGroup::MatMulATAdd
+        | ShaderGroup::MatMulBT
+        | ShaderGroup::MatMulBTAdd => generate_matmul_with_epilogue(
+            group,
+            None,
+            MatMulOptions {
+                format,
+                knobs,
+                ..Default::default()
+            },
         ),
         // The f16 embedding is a variant of the same gather, selected by the
         // table's dtype rather than by a separate op and shader group.
-        ShaderGroup::Embedding if mode == WeightFormat::F16 => {
+        ShaderGroup::Embedding if format == WeightFormat::F16 => {
             ShaderModule::new(include_str!("shaders/embedding_f16.wgsl"))
         }
         // Every block-packed format takes the same K-split GEMV with its
@@ -2096,12 +1745,12 @@ pub fn generate_module_weighted(
         | ShaderGroup::MatMulGemvAdd
         | ShaderGroup::MatMulGemvBT
         | ShaderGroup::MatMulGemvBTAdd => {
-            generate_module_gemv(group, mode, GemvShape::initial(group))
+            generate_module_gemv(group, format, GemvShape::initial(group))
         }
         // Unsupported packed routes must fail closed: falling through would
         // read compressed bytes as f32 and produce plausible garbage.
-        _ if mode.is_quantized() => panic!(
-            "no {mode:?} variant for {group:?}; block-quantized weights are \
+        _ if format.is_quantized() => panic!(
+            "no {format:?} variant for {group:?}; block-quantized weights are \
              supported on forward tiled matmul groups and K-split GEMV only"
         ),
         _ => generate_module(group, knobs),
@@ -2125,15 +1774,6 @@ fn substitute(source: &str, old: &str, new: &str) -> String {
 
 const ATTENTION_PARAMS_WGSL: &str = include_str!("shaders/attention_params.wgsl");
 const CACHED_ATTENTION_PARAMS_WGSL: &str = include_str!("shaders/cached_attention_params.wgsl");
-
-/// Emit the causal/window key range `[row_kv_start, row_kv_len)` for a query.
-fn kv_range(qpos: &str, indent: usize) -> String {
-    let pad = " ".repeat(indent);
-    format!(
-        "{pad}let row_kv_len = select(kv_seq, {qpos} + 1u, kv_seq == 0u);\n\
-         {pad}let row_kv_start = select(0u, row_kv_len - min(row_kv_len, window_size), window_size > 0u);\n"
-    )
-}
 
 /// The K-split GEMV with the RmsNorm of its input folded in:
 /// `C[1, N] = (rmsnorm(A) * norm_w) × B[K, N]`.

@@ -49,35 +49,8 @@ pub fn differentiate(forward: &Graph) -> Graph {
         };
         let gradient_start = graph.nodes().len();
 
-        // ───────────────────────────────────────────────────────────────
-        // CONTRACT for every backward arm below:
-        //
-        //   The arm MUST consume `grad_output` to chain the upstream
-        //   gradient. A backward that emits a constant local Jacobian
-        //   (e.g. `(1/N)` broadcast for a mean reduction) WITHOUT
-        //   multiplying by `grad_output` is a bug — it works only when
-        //   this op happens to be the final loss (where grad_output IS
-        //   1.0). When the op is mid-graph (followed by `mul(coef)`,
-        //   `add(other_loss)`, etc.), the upstream gradient — including
-        //   any coefficients composed onto this op's output — is silently
-        //   discarded.
-        //
-        //   Historical bugs of this exact pattern (fixed 2026-04-28):
-        //   `Op::SumAll`, `Op::MeanAll`, `Op::CrossEntropyLoss`,
-        //   `Op::BceLoss`. All hardcoded `grad_output = 1`. Symptom:
-        //   loss-coefficient knobs (value_loss_coef, recon_loss_coef,
-        //   entropy_beta, etc.) had no effect on the gradient because
-        //   their factor was discarded at the reduction.
-        //
-        //   Verification: every Op family is exercised by `tests/gradcheck.rs`
-        //   in a mid-graph context (followed by `mul(coef)`); analytical
-        //   vs finite-difference must agree across coef ≠ 1.
-        //
-        //   When adding a new Op: write the chain rule as `dL/dx = J^T ·
-        //   grad_output` (broadcast scalar grad_output to x's shape via
-        //   the `broadcast_scalar` helper if needed). Then add a gradcheck
-        //   test before merging.
-        // ───────────────────────────────────────────────────────────────
+        // Every local derivative must multiply by grad_output, including scalar
+        // reductions and losses used inside a larger expression.
         match node.op {
             Op::MatMul => {
                 // C = A @ B

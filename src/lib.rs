@@ -1,7 +1,4 @@
-// The lint contract is in `Cargo.toml` under `[lints]`, so it applies to
-// every target rather than only the library. `pattern_type_mismatch` is
-// allowed there and re-enabled here, because the library enforces it while
-// the tests and examples deliberately use the more readable tuple patterns.
+// Tests and examples allow implicit tuple-reference patterns; the library does not.
 #![warn(clippy::pattern_type_mismatch)]
 
 //! Meganeura: graph-optimized neural network framework on blade-graphics.

@@ -4,6 +4,35 @@
 //! unlike the K-quants and GGML Q4_0, which are load-only. The block geometry
 //! they follow is `DType::block_geometry`.
 
+use crate::compile::WeightFormat;
+
+pub(super) fn encode_parameter(
+    name: &str,
+    data: &[f32],
+    format: WeightFormat,
+    rows: usize,
+    cols: usize,
+) -> Vec<u8> {
+    match format {
+        WeightFormat::Q4 => quantize_q4_0(data, rows, cols),
+        WeightFormat::Q8 => quantize_q8_0(data, rows, cols),
+        WeightFormat::F16 => data
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+            .collect(),
+        WeightFormat::Q40
+        | WeightFormat::Q4K
+        | WeightFormat::Q6K
+        | WeightFormat::Q5K
+        | WeightFormat::Q3K => {
+            panic!(
+                "parameter `{name}` is {format:?}; load it with set_parameter_packed (no host encoder)"
+            )
+        }
+        WeightFormat::F32 => unreachable!("f32 parameters do not need encoding"),
+    }
+}
+
 pub fn quantize_q4_0(data: &[f32], rows: usize, cols: usize) -> Vec<u8> {
     assert_eq!(data.len(), rows * cols);
     assert!(

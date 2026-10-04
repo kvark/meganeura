@@ -153,8 +153,9 @@ impl Config {
 /// and predicts denoised action velocities via flow matching.
 ///
 /// Inputs:
-/// - `action_tokens`: action sequence embeddings `[chunk_size, expert_hidden]`
-/// - `vlm_hidden`: VLM backbone hidden states `[vlm_seq, text_hidden]` for cross-attention
+/// - `noisy_actions`: `[action_seq_len, max_action_dim]`
+/// - `timestep`: sinusoidal embedding `[1, expert_hidden * 2]`
+/// - `vlm_kv_layer_i` for each cross-attention layer: `[vlm_seq_len, kv_dim]`
 ///
 /// Returns: denoised action prediction `[chunk_size, action_dim]`
 pub fn build_action_expert(
@@ -163,9 +164,18 @@ pub fn build_action_expert(
     action_seq_len: usize,
     vlm_seq_len: usize,
 ) -> NodeId {
+    action_expert(g, config, action_seq_len, vlm_seq_len, false)
+}
+
+fn action_expert(
+    g: &mut Graph,
+    config: &Config,
+    action_seq_len: usize,
+    vlm_seq_len: usize,
+    training: bool,
+) -> NodeId {
     let expert = &config.expert;
     let expert_hidden = expert.hidden_size;
-    let text_hidden = config.vlm.text.hidden_size;
     let kv_dim = expert.kv_dim();
     let attn_dim = expert.num_attention_heads as usize * expert.head_dim as usize;
     let eps = expert.rms_norm_eps;
@@ -204,9 +214,6 @@ pub fn build_action_expert(
     // time_embed: [1, expert_hidden] — broadcast-added to action tokens
     x = g.broadcast_add(x, time_embed);
 
-    // VLM hidden states for cross-attention KV
-    let _vlm_hidden = g.input("vlm_hidden", &[vlm_seq_len, text_hidden]);
-
     // Expert transformer layers
     for i in 0..expert.num_layers {
         let prefix = format!("model.vlm_with_expert.lm_expert.layers.{}", i);
@@ -219,83 +226,64 @@ pub fn build_action_expert(
         );
         let h = g.rms_norm(x, ln1_w, eps);
 
-        // Attention
-        if is_cross_attn {
-            // Cross-attention: expert queries attend to VLM K/V
-            // q: [chunk, attn_dim] from expert hidden
-            let wq = g.parameter(
-                &format!("{}.self_attn.q_proj.weight", prefix),
-                &[expert_hidden, attn_dim],
-            );
-            let q = g.matmul(h, wq);
-
-            // k/v come from VLM hidden states (projected down to kv_dim)
-            // In SmolVLA, cross-attn k/v projections take kv_dim input
-            let wk = g.parameter(
-                &format!("{}.self_attn.k_proj.weight", prefix),
-                &[kv_dim, kv_dim],
-            );
-            let wv = g.parameter(
-                &format!("{}.self_attn.v_proj.weight", prefix),
-                &[kv_dim, kv_dim],
-            );
-
-            // VLM K/V: project VLM hidden → kv_dim using VLM's projections
-            // The cross-attention reuses VLM's pre-computed KV
-            let vlm_kv = g.input(&format!("vlm_kv_layer_{}", i), &[vlm_seq_len, kv_dim]);
-            let k = g.matmul(vlm_kv, wk);
-            let v = g.matmul(vlm_kv, wv);
-
-            let attn = g.cross_attention(
-                q,
-                k,
-                v,
-                expert.num_attention_heads,
-                expert.num_key_value_heads,
-                expert.head_dim,
-            );
-
-            let wo = g.parameter(
-                &format!("{}.self_attn.o_proj.weight", prefix),
-                &[attn_dim, expert_hidden],
-            );
-            let attn_out = g.matmul(attn, wo);
-            x = g.add(x, attn_out);
+        let (kv_input, kv_input_dim) = if is_cross_attn {
+            (
+                g.input(&format!("vlm_kv_layer_{}", i), &[vlm_seq_len, kv_dim]),
+                kv_dim,
+            )
         } else {
-            // Self-attention: action tokens attend to each other
-            let wq = g.parameter(
-                &format!("{}.self_attn.q_proj.weight", prefix),
-                &[expert_hidden, attn_dim],
-            );
-            let wk = g.parameter(
-                &format!("{}.self_attn.k_proj.weight", prefix),
-                &[expert_hidden, kv_dim],
-            );
-            let wv = g.parameter(
-                &format!("{}.self_attn.v_proj.weight", prefix),
-                &[expert_hidden, kv_dim],
-            );
-
-            let q = g.matmul(h, wq);
-            let k = g.matmul(h, wk);
-            let v = g.matmul(h, wv);
-
-            let attn = g.causal_attention(
+            (h, expert_hidden)
+        };
+        let wq = g.parameter(
+            &format!("{}.self_attn.q_proj.weight", prefix),
+            &[expert_hidden, attn_dim],
+        );
+        let wk = g.parameter(
+            &format!("{}.self_attn.k_proj.weight", prefix),
+            &[kv_input_dim, kv_dim],
+        );
+        let wv = g.parameter(
+            &format!("{}.self_attn.v_proj.weight", prefix),
+            &[kv_input_dim, kv_dim],
+        );
+        let q = g.matmul(h, wq);
+        let k = g.matmul(kv_input, wk);
+        let v = g.matmul(kv_input, wv);
+        let attn = if training {
+            g.multi_head_attn(
                 q,
                 k,
                 v,
                 expert.num_attention_heads,
                 expert.num_key_value_heads,
                 expert.head_dim,
-            );
-
-            let wo = g.parameter(
-                &format!("{}.self_attn.o_proj.weight", prefix),
-                &[attn_dim, expert_hidden],
-            );
-            let attn_out = g.matmul(attn, wo);
-            x = g.add(x, attn_out);
-        }
+                is_cross_attn,
+            )
+        } else if is_cross_attn {
+            g.cross_attention(
+                q,
+                k,
+                v,
+                expert.num_attention_heads,
+                expert.num_key_value_heads,
+                expert.head_dim,
+            )
+        } else {
+            g.causal_attention(
+                q,
+                k,
+                v,
+                expert.num_attention_heads,
+                expert.num_key_value_heads,
+                expert.head_dim,
+            )
+        };
+        let wo = g.parameter(
+            &format!("{}.self_attn.o_proj.weight", prefix),
+            &[attn_dim, expert_hidden],
+        );
+        let attn_out = g.matmul(attn, wo);
+        x = g.add(x, attn_out);
 
         // Post-attention RMSNorm + SwiGLU FFN
         let ln2_w = g.parameter(
@@ -405,159 +393,9 @@ pub fn build_action_expert_training(
     vlm_seq_len: usize,
 ) -> Graph {
     let mut g = Graph::new();
-    let expert = &config.expert;
-    let expert_hidden = expert.hidden_size;
-    let kv_dim = expert.kv_dim();
-    let eps = expert.rms_norm_eps;
-
-    let num_heads = expert.num_attention_heads;
-    let num_kv_heads = expert.num_key_value_heads;
-    let hd = expert.head_dim;
-    let q_dim = (num_heads * hd) as usize;
-    let kv_dim_full = (num_kv_heads * hd) as usize;
-
-    // --- Inputs ---
-    let noisy_actions = g.input("noisy_actions", &[action_seq_len, config.max_action_dim]);
-    let timestep = g.input("timestep", &[1, expert_hidden * 2]);
-
-    // --- Action input projection ---
-    let action_in_w = g.parameter(
-        "model.action_in_proj.weight",
-        &[config.max_action_dim, expert_hidden],
-    );
-    let action_in_b = g.parameter("model.action_in_proj.bias", &[expert_hidden]);
-    let mut x = g.matmul(noisy_actions, action_in_w);
-    x = g.bias_add(x, action_in_b);
-
-    // --- Timestep MLP ---
-    let time_in_w = g.parameter(
-        "model.action_time_mlp_in.weight",
-        &[expert_hidden * 2, expert_hidden],
-    );
-    let time_in_b = g.parameter("model.action_time_mlp_in.bias", &[expert_hidden]);
-    let time_out_w = g.parameter(
-        "model.action_time_mlp_out.weight",
-        &[expert_hidden, expert_hidden],
-    );
-    let time_out_b = g.parameter("model.action_time_mlp_out.bias", &[expert_hidden]);
-    let time_h = g.matmul(timestep, time_in_w);
-    let time_h = g.bias_add(time_h, time_in_b);
-    let time_h = g.silu(time_h);
-    let time_h = g.matmul(time_h, time_out_w);
-    let time_embed = g.bias_add(time_h, time_out_b);
-    x = g.broadcast_add(x, time_embed);
-
-    // --- Expert transformer layers ---
-    for i in 0..expert.num_layers {
-        let prefix = format!("model.vlm_with_expert.lm_expert.layers.{}", i);
-        let is_cross_attn = i % expert.self_attn_every_n_layers != 0;
-
-        // Pre-attention RMSNorm
-        let ln1_w = g.parameter(
-            &format!("{}.input_layernorm.weight", prefix),
-            &[expert_hidden],
-        );
-        let h = g.rms_norm(x, ln1_w, eps);
-
-        if is_cross_attn {
-            // Cross-attention: q from action tokens, k/v from VLM hidden states
-            let wq = g.parameter(
-                &format!("{}.self_attn.q_proj.weight", prefix),
-                &[expert_hidden, q_dim],
-            );
-            let q = g.matmul(h, wq); // [action_seq, num_heads*head_dim]
-
-            let vlm_kv = g.input(&format!("vlm_kv_layer_{}", i), &[vlm_seq_len, kv_dim]);
-            let wk = g.parameter(
-                &format!("{}.self_attn.k_proj.weight", prefix),
-                &[kv_dim, kv_dim_full],
-            );
-            let wv = g.parameter(
-                &format!("{}.self_attn.v_proj.weight", prefix),
-                &[kv_dim, kv_dim_full],
-            );
-            let k = g.matmul(vlm_kv, wk); // [vlm_seq, num_kv_heads*head_dim]
-            let v = g.matmul(vlm_kv, wv); // [vlm_seq, num_kv_heads*head_dim]
-
-            let attn = g.multi_head_attn(q, k, v, num_heads, num_kv_heads, hd, true);
-
-            let wo = g.parameter(
-                &format!("{}.self_attn.o_proj.weight", prefix),
-                &[q_dim, expert_hidden],
-            );
-            let attn_out = g.matmul(attn, wo); // [action_seq, expert_hidden]
-            x = g.add(x, attn_out);
-        } else {
-            // Self-attention: q/k/v all from action tokens
-            let wq = g.parameter(
-                &format!("{}.self_attn.q_proj.weight", prefix),
-                &[expert_hidden, q_dim],
-            );
-            let wk = g.parameter(
-                &format!("{}.self_attn.k_proj.weight", prefix),
-                &[expert_hidden, kv_dim_full],
-            );
-            let wv = g.parameter(
-                &format!("{}.self_attn.v_proj.weight", prefix),
-                &[expert_hidden, kv_dim_full],
-            );
-            let q = g.matmul(h, wq); // [action_seq, num_heads*head_dim]
-            let k = g.matmul(h, wk); // [action_seq, num_kv_heads*head_dim]
-            let v = g.matmul(h, wv); // [action_seq, num_kv_heads*head_dim]
-
-            let attn = g.multi_head_attn(q, k, v, num_heads, num_kv_heads, hd, false);
-
-            let wo = g.parameter(
-                &format!("{}.self_attn.o_proj.weight", prefix),
-                &[q_dim, expert_hidden],
-            );
-            let attn_out = g.matmul(attn, wo); // [action_seq, expert_hidden]
-            x = g.add(x, attn_out);
-        }
-
-        // Post-attention RMSNorm + SwiGLU FFN
-        let ln2_w = g.parameter(
-            &format!("{}.post_attention_layernorm.weight", prefix),
-            &[expert_hidden],
-        );
-        let h = g.rms_norm(x, ln2_w, eps);
-
-        // Naive SwiGLU: separate gate and up projections.
-        // The optimizer fuses into SwiGLUConcat(MatMul(h, concat_w)).
-        let w_gate = g.parameter(
-            &format!("{}.mlp.gate_proj.weight", prefix),
-            &[expert_hidden, expert.intermediate_size],
-        );
-        let w_up = g.parameter(
-            &format!("{}.mlp.up_proj.weight", prefix),
-            &[expert_hidden, expert.intermediate_size],
-        );
-        let w_down = g.parameter(
-            &format!("{}.mlp.down_proj.weight", prefix),
-            &[expert.intermediate_size, expert_hidden],
-        );
-        let gate = g.matmul(h, w_gate);
-        let up = g.matmul(h, w_up);
-        let gate_up = g.swiglu(gate, up);
-        let ffn_out = g.matmul(gate_up, w_down);
-        x = g.add(x, ffn_out);
-    }
-
-    // --- Action output projection ---
-    let action_out_w = g.parameter(
-        "model.action_out_proj.weight",
-        &[expert_hidden, config.max_action_dim],
-    );
-    let action_out_b = g.parameter("model.action_out_proj.bias", &[config.max_action_dim]);
-    let out = g.matmul(x, action_out_w);
-    let out = g.bias_add(out, action_out_b); // [action_seq, max_action_dim]
-
-    // --- MSE loss ---
+    let out = action_expert(&mut g, config, action_seq_len, vlm_seq_len, true);
     let target = g.input("target_actions", &[action_seq_len, config.max_action_dim]);
-    let neg_target = g.neg(target);
-    let diff = g.add(out, neg_target);
-    let sq_diff = g.mul(diff, diff);
-    let loss = g.mean_all(sq_diff);
+    let loss = g.mse_loss(out, target);
     g.set_outputs(vec![loss]);
     g
 }

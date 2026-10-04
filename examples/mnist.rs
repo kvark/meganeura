@@ -10,7 +10,7 @@
 /// Expected files (gzipped or raw):
 ///   data/train-images-idx3-ubyte.gz  (or without .gz)
 ///   data/train-labels-idx1-ubyte.gz  (or without .gz)
-use meganeura::{DataLoader, Graph, MnistDataset, TrainConfig, Trainer};
+use meganeura::{DataLoader, Graph, MnistDataset, Optimizer, TrainConfig, Trainer};
 use std::path::Path;
 
 fn main() {
@@ -89,9 +89,8 @@ fn main() {
     // --- Training loop ---
     println!("training...");
     let config = TrainConfig {
-        learning_rate: lr,
+        optimizer: Optimizer::sgd(lr),
         log_interval: 50,
-        ..TrainConfig::default()
     };
     let mut trainer = Trainer::new(session, config);
     let history = trainer.train(&mut loader, epochs);
