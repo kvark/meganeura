@@ -737,21 +737,67 @@ fn translate_node(
 
         // --- Embedding (Gather with axis=0) ---
         OpKind::Gather => {
+            let data = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
+            let indices = resolve_input(&node.inputs[1], name_to_id, &node.name)?;
+            let data_shape = get_shape(&node.inputs[0], shapes);
+            let indices_shape = get_shape(&node.inputs[1], shapes);
+            let rank = data_shape.len() as i64;
             let axis = attrs.i("axis", 0);
-            if axis != 0 {
-                return Err(OnnxError::UnsupportedOp(format!(
-                    "Gather with axis={axis} (only axis=0 supported)"
+            let axis = if axis < 0 { axis + rank } else { axis };
+            if !(0..rank).contains(&axis) {
+                return Err(OnnxError::ShapeError(format!(
+                    "node '{}': Gather axis {axis} of {data_shape:?}",
+                    node.name
                 )));
             }
-            // ONNX Gather: data[indices] where data is the table
-            // Meganeura embedding: (indices, table) -> output
-            // Note: ONNX input order is (data, indices), we need (indices, data)
-            let table = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
-            let indices = resolve_input(&node.inputs[1], name_to_id, &node.name)?;
-            let out = graph.embedding(indices, table);
-            let table_shape = get_shape(&node.inputs[0], shapes);
-            let indices_shape = get_shape(&node.inputs[1], shapes);
-            let hidden = table_shape.get(1).copied().unwrap_or(1);
+            let axis = axis as usize;
+            // Shape arithmetic (`Shape` → `Gather`) folds at import.
+            if let (Some(values), Some(picks)) = (
+                constant_values(graph, data, weights),
+                constant_values(graph, indices, weights),
+            ) {
+                let (values, picks) = (values.to_vec(), picks.to_vec());
+                let dim = data_shape[axis];
+                let inner: usize = data_shape[axis + 1..].iter().product();
+                let outer: usize = data_shape[..axis].iter().product();
+                if values.len() != outer * dim * inner {
+                    return Err(OnnxError::ShapeError(format!(
+                        "node '{}': Gather data does not match {data_shape:?}",
+                        node.name
+                    )));
+                }
+                let mut out = Vec::with_capacity(outer * picks.len() * inner);
+                for o in 0..outer {
+                    for &pick in &picks {
+                        let pick = pick as i64;
+                        let pick = if pick < 0 { pick + dim as i64 } else { pick };
+                        if !(0..dim as i64).contains(&pick) {
+                            return Err(OnnxError::ShapeError(format!(
+                                "node '{}': Gather index {pick} out of {dim}",
+                                node.name
+                            )));
+                        }
+                        let start = (o * dim + pick as usize) * inner;
+                        out.extend_from_slice(&values[start..start + inner]);
+                    }
+                }
+                let mut out_shape = data_shape[..axis].to_vec();
+                out_shape.extend_from_slice(&indices_shape);
+                out_shape.extend_from_slice(&data_shape[axis + 1..]);
+                let id = graph.constant(out, &out_shape);
+                register_output(node, 0, id, &out_shape, name_to_id, shapes);
+                return Ok(());
+            }
+            // Otherwise an embedding lookup: rows of the table by index.
+            if axis != 0 || graph.node(indices).ty.dtype != crate::graph::DType::U32 {
+                return Err(OnnxError::UnsupportedOp(format!(
+                    "Gather on axis {axis} with {:?} indices (supported: constant folding, \
+                     or rows of a table by U32 indices)",
+                    graph.node(indices).ty.dtype
+                )));
+            }
+            let out = graph.embedding(indices, data);
+            let hidden = data_shape.get(1).copied().unwrap_or(1);
             let seq_len = indices_shape.iter().product::<usize>().max(1);
             register_output(node, 0, out, &[seq_len, hidden], name_to_id, shapes);
         }
@@ -834,31 +880,109 @@ fn translate_node(
         }
 
         OpKind::Squeeze | OpKind::Unsqueeze => {
-            // Shape-only: just propagate with adjusted shape
+            // Shape-only: the tensor keeps its data under the new shape.
             let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let x_shape = get_shape(&node.inputs[0], shapes);
-            // Compute new shape (simplified)
-            let new_shape = match node.op {
-                OpKind::Squeeze => x_shape.iter().copied().filter(|&d| d != 1).collect(),
-                OpKind::Unsqueeze => {
-                    let axes = attrs.ints("axes");
-                    let mut s = x_shape.clone();
-                    for &ax in axes.iter().rev() {
-                        let pos = if ax < 0 {
-                            (s.len() as i64 + ax + 1) as usize
-                        } else {
-                            ax as usize
-                        };
-                        s.insert(pos.min(s.len()), 1);
-                    }
-                    s
+            // Axes are an attribute before opset 13 and an input after.
+            let mut axes: Vec<i64> = attrs.ints("axes").to_vec();
+            if axes.is_empty()
+                && let Some(&id) = node.inputs.get(1).and_then(|name| name_to_id.get(name))
+                && let Some(values) = constant_values(graph, id, weights)
+            {
+                axes = values.iter().map(|&v| v as i64).collect();
+            }
+            let new_shape = if matches!(node.op, OpKind::Squeeze) {
+                let rank = x_shape.len() as i64;
+                let squeezed: Vec<usize> = axes
+                    .iter()
+                    .map(|&a| (if a < 0 { a + rank } else { a }) as usize)
+                    .collect();
+                x_shape
+                    .iter()
+                    .enumerate()
+                    .filter(|&(d, &dim)| {
+                        dim != 1 || !(squeezed.is_empty() || squeezed.contains(&d))
+                    })
+                    .map(|(_, &dim)| dim)
+                    .collect()
+            } else {
+                // Axes index the output, so insert in ascending order.
+                let rank = (x_shape.len() + axes.len()) as i64;
+                let mut positions: Vec<usize> = axes
+                    .iter()
+                    .map(|&a| (if a < 0 { a + rank } else { a }).clamp(0, rank) as usize)
+                    .collect();
+                positions.sort_unstable();
+                let mut s = x_shape.clone();
+                for pos in positions {
+                    s.insert(pos.min(s.len()), 1);
                 }
-                _ => unreachable!(),
+                s
             };
             if !node.outputs.is_empty() {
                 name_to_id.insert(node.outputs[0].clone(), x);
                 shapes.insert(node.outputs[0].clone(), new_shape);
             }
+        }
+
+        OpKind::Expand => {
+            let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
+            let x_shape = get_shape(&node.inputs[0], shapes);
+            let target: Option<Vec<usize>> = node
+                .inputs
+                .get(1)
+                .and_then(|name| name_to_id.get(name))
+                .and_then(|&id| constant_values(graph, id, weights))
+                .map(|values| values.iter().map(|&v| v.max(0.0) as usize).collect());
+            let Some(target) = target else {
+                return Err(OnnxError::UnsupportedOp(
+                    "Expand: the shape must be a constant".into(),
+                ));
+            };
+            let out_shape = broadcast_shape(&x_shape, &target);
+            let mut shape = vec![1; out_shape.len().saturating_sub(x_shape.len())];
+            shape.extend_from_slice(&x_shape);
+            if shape.len() != out_shape.len()
+                || shape
+                    .iter()
+                    .zip(&out_shape)
+                    .any(|(&s, &o)| s != o && s != 1)
+            {
+                return Err(OnnxError::ShapeError(format!(
+                    "node '{}': cannot expand {x_shape:?} to {target:?}",
+                    node.name
+                )));
+            }
+            let mut out = x;
+            // Repeat along each broadcast axis by doubling concatenations.
+            for axis in 0..shape.len() {
+                let copies = out_shape[axis];
+                if shape[axis] != 1 || copies == 1 {
+                    continue;
+                }
+                let outer = shape[..axis].iter().product::<usize>() as u32;
+                let inner = shape[axis + 1..].iter().product::<usize>() as u32;
+                let (mut acc, mut acc_n) = (None, 0u32);
+                let (mut piece, mut piece_n) = (out, 1u32);
+                let mut remaining = copies;
+                while remaining > 0 {
+                    if remaining & 1 == 1 {
+                        acc = Some(match acc {
+                            None => piece,
+                            Some(a) => graph.concat(a, piece, outer, acc_n, piece_n, inner),
+                        });
+                        acc_n += piece_n;
+                    }
+                    remaining >>= 1;
+                    if remaining > 0 {
+                        piece = graph.concat(piece, piece, outer, piece_n, piece_n, inner);
+                        piece_n *= 2;
+                    }
+                }
+                out = acc.unwrap_or(out);
+                shape[axis] = copies;
+            }
+            register_output(node, 0, out, &out_shape, name_to_id, shapes);
         }
 
         // --- Identity / Dropout (inference mode) ---
@@ -995,6 +1119,24 @@ fn translate_node(
                 )));
             }
             let axis = axis as usize;
+            // Concatenated shape vectors fold at import.
+            let names: Vec<&String> = node.inputs.iter().filter(|name| !name.is_empty()).collect();
+            if axis == 0 && out_shape.len() == 1 {
+                let parts: Option<Vec<Vec<f32>>> = names
+                    .iter()
+                    .map(|name| {
+                        let id = *name_to_id.get(*name)?;
+                        constant_values(graph, id, weights).map(<[f32]>::to_vec)
+                    })
+                    .collect();
+                if let Some(parts) = parts {
+                    let data = parts.concat();
+                    let len = data.len();
+                    let id = graph.constant(data, &[len]);
+                    register_output(node, 0, id, &[len], name_to_id, shapes);
+                    return Ok(());
+                }
+            }
             for name in inputs {
                 let b = resolve_input(name, name_to_id, &node.name)?;
                 let b_shape = get_shape(name, shapes);
