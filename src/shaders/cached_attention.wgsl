@@ -62,7 +62,9 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let num_heads = params.num_heads;
     let num_kv_heads = params.num_kv_heads;
     let head_dim = params.head_dim;
-    let kv_len = kv_pos_buf[0] + 1u; // attend to positions 0..kv_pos inclusive
+    // Attend to positions 0..kv_pos inclusive, within the cache's rows.
+    let cache_rows = arrayLength(&src_b) / (num_kv_heads * head_dim);
+    let kv_len = min(kv_pos_buf[0] + 1u, cache_rows);
 
     if head >= num_heads { return; }
 
