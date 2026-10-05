@@ -31,6 +31,7 @@ const TABLE: &[(&str, Coverage)] = &[
     ("Log", Covered(".log(")),
     ("Recip", Covered(".recip(")),
     ("Exp", Covered(".exp(")),
+    ("Erf", Covered(".erf(")),
     ("Sqrt", Covered(".sqrt(")),
     ("Rsqrt", Covered(".rsqrt(")),
     ("Offset", Covered(".add_scalar(")),

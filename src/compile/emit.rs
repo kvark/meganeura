@@ -1069,6 +1069,9 @@ impl<'a> Compiler<'a> {
             Op::Exp => {
                 self.emit_generated_unary(Pw::Exp(0), node, out_buf);
             }
+            Op::Erf => {
+                self.emit_generated_unary(Pw::Erf(0), node, out_buf);
+            }
             Op::Sqrt => {
                 self.emit_generated_unary(Pw::Sqrt(0), node, out_buf);
             }

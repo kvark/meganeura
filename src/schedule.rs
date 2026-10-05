@@ -58,6 +58,8 @@ pub enum Pw {
     Silu(u16),
     /// `tanh(v)`.
     Tanh(u16),
+    /// The error function, to about 1.2e-7 relative accuracy.
+    Erf(u16),
 }
 
 impl Pw {
@@ -106,6 +108,29 @@ impl PointwiseDAG {
     ) -> String {
         let mut out = String::new();
         for (k, op) in self.ops.iter().enumerate() {
+            if let Pw::Erf(a) = *op {
+                // A Taylor series near zero, where `1 - erfc` would lose
+                // the relative precision, and Numerical Recipes' Chebyshev
+                // fit of erfc elsewhere.
+                let _ = writeln!(
+                    out,
+                    "    let v{k}_z = abs(v{a});\n    \
+                     let v{k}_s = v{a} * v{a};\n    \
+                     let v{k}_t = 1.0 / (1.0 + 0.5 * v{k}_z);\n    \
+                     let v{k}_c = v{k}_t * exp(-v{k}_s - 1.26551223 + v{k}_t * (1.00002368 + \
+                     v{k}_t * (0.37409196 + v{k}_t * (0.09678418 + v{k}_t * (-0.18628806 + \
+                     v{k}_t * (0.27886807 + v{k}_t * (-1.13520398 + v{k}_t * (1.48851587 + \
+                     v{k}_t * (-0.82215223 + v{k}_t * 0.17087277)))))))));\n    \
+                     let v{k}_p = v{a} * (1.1283792 + v{k}_s * (-0.37612639 + v{k}_s * \
+                     (0.11283792 + v{k}_s * (-0.026866172 + v{k}_s * (0.0052239776 + \
+                     v{k}_s * -0.00085483270)))));"
+                );
+                let _ = writeln!(
+                    out,
+                    "    let v{k} = select(sign(v{a}) * (1.0 - v{k}_c), v{k}_p, v{k}_z < 0.5);"
+                );
+                continue;
+            }
             let _ = write!(out, "    let v{} = ", k);
             match *op {
                 Pw::LoadInput(idx) => {
@@ -183,6 +208,7 @@ impl PointwiseDAG {
                 Pw::Silu(a) => {
                     let _ = write!(out, "v{} / (1.0 + exp(-v{}))", a, a);
                 }
+                Pw::Erf(_) => unreachable!("emitted above"),
                 Pw::Tanh(a) => {
                     // Saturated outside ±10 (exactly ±1 in f32): some drivers
                     // evaluate tanh through exp(2x), which overflows to NaN.
@@ -320,6 +346,7 @@ impl PointwiseDAG {
                 Pw::Sigmoid(a) => Pw::Sigmoid(self_remap[a as usize]),
                 Pw::Silu(a) => Pw::Silu(self_remap[a as usize]),
                 Pw::Tanh(a) => Pw::Tanh(self_remap[a as usize]),
+                Pw::Erf(a) => Pw::Erf(self_remap[a as usize]),
             };
             self_remap.push(ops.len() as u16);
             ops.push(remapped);

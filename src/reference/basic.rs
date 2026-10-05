@@ -39,6 +39,36 @@ pub(super) fn gelu(x: f64) -> f64 {
     x * sigmoid(2.0 * GELU_C * (x + 0.044715 * x * x * x))
 }
 
+/// The error function to near f64 precision: its Maclaurin series where
+/// that converges quickly, and the continued fraction of erfc beyond.
+pub(super) fn erf(x: f64) -> f64 {
+    let z = x.abs();
+    if z < 3.0 {
+        // erf(z) = 2/√π Σ (-1)ⁿ z^(2n+1) / (n! (2n+1))
+        let (mut term, mut sum) = (z, z);
+        for n in 1..200 {
+            term *= -z * z / n as f64;
+            let next = term / (2 * n + 1) as f64;
+            sum += next;
+            if next.abs() < 1e-17 * sum.abs() {
+                break;
+            }
+        }
+        return (std::f64::consts::FRAC_2_SQRT_PI * sum).copysign(x);
+    }
+    if z > 6.0 {
+        return 1.0f64.copysign(x);
+    }
+    // erfc(z) = exp(-z²)/√π · 1/(z + (1/2)/(z + 1/(z + (3/2)/(z + …)))),
+    // evaluated from the tail.
+    let mut fraction = z;
+    for k in (1..120).rev() {
+        fraction = z + (k as f64 / 2.0) / fraction;
+    }
+    let erfc = (-z * z).exp() / (std::f64::consts::PI.sqrt() * fraction);
+    (1.0 - erfc).copysign(x)
+}
+
 pub(super) fn gelu_derivative(x: f64) -> f64 {
     let s = sigmoid(2.0 * GELU_C * (x + 0.044715 * x * x * x));
     s + 2.0 * x * s * (1.0 - s) * GELU_C * (1.0 + 3.0 * 0.044715 * x * x)
@@ -54,6 +84,7 @@ pub(super) fn derivative(op: &Op, x: f64) -> Option<f64> {
         Op::Exp => x.exp(),
         Op::Log => 1.0 / x,
         Op::Recip => -1.0 / (x * x),
+        Op::Erf => std::f64::consts::FRAC_2_SQRT_PI * (-x * x).exp(),
         Op::Sqrt => 0.5 / x.sqrt(),
         Op::Rsqrt => -0.5 / (x * x.sqrt()),
         Op::Offset { .. } => 1.0,
@@ -359,6 +390,7 @@ pub(super) fn eval(node: &Node, ins: &[&Tensor]) -> Result<Vec<f64>, Error> {
         Op::Log => map(arg(0)?, f64::ln),
         Op::Recip => map(arg(0)?, |x| 1.0 / x),
         Op::Exp => map(arg(0)?, f64::exp),
+        Op::Erf => map(arg(0)?, erf),
         Op::Sqrt => map(arg(0)?, f64::sqrt),
         Op::Rsqrt => map(arg(0)?, |x| 1.0 / x.sqrt()),
         Op::Offset { value } => map(arg(0)?, |x| x + f64::from(value)),

@@ -31,6 +31,7 @@ impl Op {
                 | Op::Neg
                 | Op::Abs
                 | Op::Exp
+                | Op::Erf
                 | Op::Log
                 | Op::Recip
                 | Op::Sqrt

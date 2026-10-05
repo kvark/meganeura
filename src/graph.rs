@@ -222,6 +222,8 @@ pub enum Op {
     Log,
     Recip,
     Exp,
+    /// The error function, elementwise.
+    Erf,
     /// Elementwise square root.
     Sqrt,
     /// Elementwise reciprocal square root.
@@ -1486,6 +1488,11 @@ impl Graph {
     pub fn exp(&mut self, x: NodeId) -> NodeId {
         let ty = self.node(x).ty.clone();
         self.add_node(Op::Exp, vec![x], ty)
+    }
+
+    pub fn erf(&mut self, x: NodeId) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::Erf, vec![x], ty)
     }
 
     pub fn sqrt(&mut self, x: NodeId) -> NodeId {
