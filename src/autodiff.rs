@@ -462,8 +462,8 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_x = graph.mul(grad_output, slope);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
-            // Integer inputs carry no gradient.
-            Op::ToF32 => {}
+            // Integer values carry no gradient.
+            Op::ToF32 | Op::ToU32 => {}
             Op::Erf => {
                 // d/dx erf(x) = 2/√π · exp(-x²)
                 let x = node.inputs[0];
@@ -1103,6 +1103,8 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::CachedAttention { .. }
             | Op::CachedBlockAttention { .. }
             | Op::ChunkedRelativeAttention { .. }
+            | Op::BiasedAttention { .. }
+            | Op::BiasedCachedAttention { .. }
             | Op::PrefixLast
             | Op::RoPEPositions { .. }
             | Op::GroupNormSilu { .. } => {

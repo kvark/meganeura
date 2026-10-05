@@ -284,6 +284,7 @@ pub fn eval_node(
         | Op::Sin
         | Op::Cos
         | Op::ToF32
+        | Op::ToU32
         | Op::Sqrt
         | Op::Rsqrt
         | Op::Offset { .. }
@@ -377,7 +378,9 @@ pub fn eval_node(
         | Op::SlidingWindowAttention { .. }
         | Op::CachedAttention { .. }
         | Op::CachedBlockAttention { .. }
-        | Op::ChunkedRelativeAttention { .. } => attention::eval(graph, node, inputs)?,
+        | Op::ChunkedRelativeAttention { .. }
+        | Op::BiasedAttention { .. }
+        | Op::BiasedCachedAttention { .. } => attention::eval(graph, node, inputs)?,
     };
     let expected = node.ty.num_elements();
     if data.len() != expected {

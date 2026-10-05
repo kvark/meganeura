@@ -370,15 +370,36 @@ impl Graph {
                 num_kv_heads,
                 head_dim,
             } => {
-                // Key `j` is visible when `j <= kv_pos`.
                 let keys = self.node(arg(1)).ty.shape[0];
-                let iota = self.constant((0..keys).map(|j| j as f32).collect(), &[1, keys]);
-                let pos = self.scalar_row(arg(3), keys);
-                let hidden = self.greater(iota, pos);
-                let mask = self.scale(hidden, f32::MIN);
-                let mask = self.view(mask, &[keys]);
+                let mask = self.cache_mask(arg(3), keys);
                 let heads = Heads::new(num_heads, num_kv_heads, head_dim);
                 self.attend(arg(0), arg(1), arg(2), heads, Some(mask))
+            }
+            Op::BiasedAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                scale_bits,
+                causal,
+            } => {
+                let mask = causal.then(|| self.window_mask(ty.shape[0], 0));
+                let heads = Heads::new(num_heads, num_kv_heads, head_dim);
+                let scale = f32::from_bits(scale_bits);
+                self.attend_biased([arg(0), arg(1), arg(2), arg(3)], heads, scale, mask)
+            }
+            Op::BiasedCachedAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                scale_bits,
+            } => {
+                // Every query row shares the cache row biases.
+                let (rows, keys) = (ty.shape[0], self.node(arg(1)).ty.shape[0]);
+                let mask = self.cache_mask(arg(3), keys);
+                let bias = self.repeat_axis(arg(4), num_heads as usize, keys, rows);
+                let heads = Heads::new(num_heads, num_kv_heads, head_dim);
+                let scale = f32::from_bits(scale_bits);
+                self.attend_biased([arg(0), arg(1), arg(2), bias], heads, scale, Some(mask))
             }
             Op::CachedBlockAttention {
                 num_heads,
@@ -429,6 +450,36 @@ impl Graph {
             ),
             ref other => panic!("{other:?} has no expansion"),
         }
+    }
+
+    /// The additive mask hiding cache rows past `kv_pos`, `[keys]`.
+    fn cache_mask(&mut self, kv_pos: NodeId, keys: usize) -> NodeId {
+        // Key `j` is visible when `j <= kv_pos`.
+        let iota = self.constant((0..keys).map(|j| j as f32).collect(), &[1, keys]);
+        let pos = self.scalar_row(kv_pos, keys);
+        let hidden = self.greater(iota, pos);
+        let mask = self.scale(hidden, f32::MIN);
+        self.view(mask, &[keys])
+    }
+
+    /// [`Self::attend`] with logits `scale · q·k + bias`, the bias holding
+    /// `heads · rows · keys` values.
+    fn attend_biased(
+        &mut self,
+        [q, k, v, bias]: [NodeId; 4],
+        heads: Heads,
+        scale: f32,
+        mask: Option<NodeId>,
+    ) -> NodeId {
+        let (rows, keys) = (self.node(q).ty.shape[0], self.node(k).ty.shape[0]);
+        let qh = self.split_heads(q, heads.heads, heads.dim);
+        let kh = self.kv_heads(k, heads, keys);
+        let vh = self.kv_heads(v, heads, keys);
+        let scores = self.batch_matmul_bt(qh, kh);
+        let scores = self.scale(scores, scale);
+        let bias = self.view(bias, &[heads.heads, rows, keys]);
+        let scores = self.add(scores, bias);
+        self.weigh(scores, vh, heads, rows, keys, mask)
     }
 
     /// A `U32` scalar buffer as `[1, n]` copies of its value.
@@ -996,6 +1047,7 @@ fn accepts(op: &Op, ins: &[&TensorType], out: &TensorType) -> bool {
             | Op::RoPEPositions { .. }
             | Op::CachedAttention { .. }
             | Op::CachedBlockAttention { .. }
+            | Op::BiasedCachedAttention { .. }
     );
     if out.dtype != F32 || (!integer_inputs && ins.iter().any(|t| t.dtype != F32)) {
         return false;
@@ -1163,6 +1215,37 @@ fn accepts(op: &Op, ins: &[&TensorType], out: &TensorType) -> bool {
             arity(5)
                 && attention_ok(&ins[..3], out, num_heads, num_kv_heads, head_dim)
                 && ins[3..].iter().all(|t| t.dtype == U32 && t.shape == [1])
+        }
+        Op::BiasedAttention {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale_bits,
+            causal,
+        } => {
+            let (rows, keys) = (out.shape[0], ins[1].shape.first().copied().unwrap_or(0));
+            arity(4)
+                && head_dim <= 512
+                && attention_ok(&ins[..3], out, num_heads, num_kv_heads, head_dim)
+                && f32::from_bits(scale_bits).is_finite()
+                && (!causal || rows == keys)
+                && ins[3].shape == [num_heads as usize, rows, keys]
+        }
+        Op::BiasedCachedAttention {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale_bits,
+        } => {
+            let keys = ins[1].shape.first().copied().unwrap_or(0);
+            arity(5)
+                && head_dim <= 512
+                && attention_ok(&ins[..3], out, num_heads, num_kv_heads, head_dim)
+                && f32::from_bits(scale_bits).is_finite()
+                && ins[3].dtype == U32
+                && ins[3].shape == [1]
+                && ins[4].dtype == F32
+                && ins[4].shape == [num_heads as usize, keys]
         }
         Op::ChunkedRelativeAttention {
             num_heads,
@@ -1738,6 +1821,17 @@ fn attention_guess(g: &Graph, product: NodeId, keep: Option<NodeId>) -> Vec<(Op,
         mask = input(g, scores, 1);
         scores = unview(g, input(g, scores, 0).unwrap_or(scores));
     }
+    // An additive bias between the scaled scores and the mask.
+    let mut bias = None;
+    if matches!(g.node(scores).op, Op::Add) {
+        for (a, b) in operands(g, scores) {
+            if matches!(g.node(a).op, Op::Scale { .. }) {
+                scores = a;
+                bias = Some(b);
+                break;
+            }
+        }
+    }
     let Op::Scale { factor } = g.node(scores).op else {
         return out;
     };
@@ -1788,6 +1882,9 @@ fn attention_guess(g: &Graph, product: NodeId, keep: Option<NodeId>) -> Vec<(Op,
         return out;
     };
     let (heads, kv_heads, dim) = (heads as u32, kv_heads as u32, dim as u32);
+    if let Some(bias) = bias {
+        return biased_guess(g, [q, k, v, bias], [heads, kv_heads, dim], factor, mask);
+    }
     match mask.map(|m| unview(g, m)) {
         None => out.push((
             Op::MultiHeadAttn {
@@ -1877,6 +1974,55 @@ fn attention_guess(g: &Graph, product: NodeId, keep: Option<NodeId>) -> Vec<(Op,
         }
     }
     out
+}
+
+/// Biased attention around `bias`, by its mask: none, causal (a constant)
+/// or a cache prefix, whose bias rows are repeated for every query row.
+fn biased_guess(
+    g: &Graph,
+    [q, k, v, bias]: [NodeId; 4],
+    [num_heads, num_kv_heads, head_dim]: [u32; 3],
+    scale: f32,
+    mask: Option<NodeId>,
+) -> Vec<(Op, Vec<NodeId>)> {
+    let scale_bits = scale.to_bits();
+    let bias = unview(g, bias);
+    let biased = |causal| Op::BiasedAttention {
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        scale_bits,
+        causal,
+    };
+    let Some(mask) = mask.map(|m| unview(g, m)) else {
+        return vec![(biased(false), vec![q, k, v, bias])];
+    };
+    if constant(g, mask).is_some() {
+        return vec![(biased(true), vec![q, k, v, bias])];
+    }
+    let kv_pos = input(g, mask, 0)
+        .and_then(|hidden| input(g, hidden, 1))
+        .and_then(|pos| scalar_source(g, pos));
+    let mut rows = bias;
+    while let Op::Concat { .. } = g.node(rows).op {
+        let Some(first) = input(g, rows, 0) else {
+            break;
+        };
+        rows = unview(g, first);
+    }
+    kv_pos
+        .map(|kv_pos| {
+            vec![(
+                Op::BiasedCachedAttention {
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    scale_bits,
+                },
+                vec![q, k, v, kv_pos, rows],
+            )]
+        })
+        .unwrap_or_default()
 }
 
 /// The epsilon of `bcast(rsqrt(mean(·) + eps))`.

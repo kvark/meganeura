@@ -603,6 +603,39 @@ fn attention() {
             },
         ),
         case(
+            "biased",
+            false,
+            |g| {
+                let [q, k, v] = qkv(g, 5, 7, 2, 1, 8);
+                let bias = g.parameter("bias", &[2, 5, 7]);
+                g.biased_attention([q, k, v, bias], 2, 1, 8, 1.0, false)
+            },
+            |_| {},
+        ),
+        case(
+            "biased_causal",
+            false,
+            |g| {
+                let [q, k, v] = qkv(g, 6, 6, 4, 2, 8);
+                let bias = g.parameter("bias", &[4, 6, 6]);
+                g.biased_attention([q, k, v, bias], 4, 2, 8, 0.5, true)
+            },
+            |_| {},
+        ),
+        case(
+            "biased_cached",
+            false,
+            |g| {
+                let [q, k, v] = qkv(g, 2, 9, 2, 1, 8);
+                let pos = g.input_u32("pos", &[1]);
+                let bias = g.parameter("bias", &[2, 9]);
+                g.biased_cached_attention([q, k, v, pos, bias], 2, 1, 8, 1.0)
+            },
+            |f| {
+                f.set_u32("pos", &[6]);
+            },
+        ),
+        case(
             "chunked_relative",
             false,
             |g| {
@@ -678,6 +711,8 @@ fn every_composite_is_covered() {
         ("CachedAttention", "cached"),
         ("CachedBlockAttention", "cached_block"),
         ("ChunkedRelativeAttention", "chunked_relative"),
+        ("BiasedAttention", "biased"),
+        ("BiasedCachedAttention", "biased_cached"),
     ];
     let this = include_str!("composites.rs");
     for name in &names {

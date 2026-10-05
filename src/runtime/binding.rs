@@ -852,6 +852,22 @@ impl Session {
                     },
                 );
             }
+            ShaderEntry::BiasedAttention => {
+                let p = &dispatch.params;
+                let input = |i: usize| buf(dispatch.input_buffers[i]);
+                pc.bind(
+                    0,
+                    &super::BiasedAttentionData {
+                        q: input(0),
+                        k: input(1),
+                        v: input(2),
+                        bias: input(3),
+                        kv_pos: input(4),
+                        dst: buf(dispatch.output_buffer),
+                        params: [p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]],
+                    },
+                );
+            }
             ShaderEntry::Permute => {
                 let p = &dispatch.params;
                 pc.bind(

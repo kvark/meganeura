@@ -83,7 +83,8 @@ impl Op {
             | Op::SplitA { .. }
             | Op::SplitB { .. }
             | Op::ToF16
-            | Op::ToF32 => Primitive,
+            | Op::ToF32
+            | Op::ToU32 => Primitive,
             // Gather, scatter and dynamic slices.
             Op::Embedding
             | Op::ScatterAdd { .. }
@@ -125,7 +126,9 @@ impl Op {
             | Op::SlidingWindowAttention { .. }
             | Op::CachedAttention { .. }
             | Op::CachedBlockAttention { .. }
-            | Op::ChunkedRelativeAttention { .. } => Composite,
+            | Op::ChunkedRelativeAttention { .. }
+            | Op::BiasedAttention { .. }
+            | Op::BiasedCachedAttention { .. } => Composite,
 
             Op::SoftplusGrad { .. }
             | Op::NormalizeInnerSumGrad { .. }
