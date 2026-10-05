@@ -211,7 +211,12 @@ impl Session {
             ShaderEntry::Generated => {
                 unreachable!("generated kernels are bound by their kernel above")
             }
-            ShaderEntry::BlockMatMul | ShaderEntry::BlockMatMulAT | ShaderEntry::BlockMatMulBT => {
+            ShaderEntry::BlockMatMul
+            | ShaderEntry::BlockMatMulAT
+            | ShaderEntry::BlockMatMulBT
+            | ShaderEntry::BatchMatMul
+            | ShaderEntry::BatchMatMulAT
+            | ShaderEntry::BatchMatMulBT => {
                 let (m, n, k) = mnk();
                 pc.bind(
                     0,
@@ -843,6 +848,21 @@ impl Session {
                             _pad0: p[1],
                             _pad1: p[2],
                             _pad2: p[3],
+                        },
+                    },
+                );
+            }
+            ShaderEntry::Permute => {
+                let p = &dispatch.params;
+                pc.bind(
+                    0,
+                    &super::PermuteData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: super::PermuteParams {
+                            total: p[0],
+                            dims: [p[1], p[2], p[3]],
+                            strides: [p[4], p[5], p[6], p[7]],
                         },
                     },
                 );

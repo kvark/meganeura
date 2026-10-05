@@ -119,6 +119,30 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, a, grad_a);
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
             }
+            // C = A·B: dA = dC·Bᵀ, dB = Aᵀ·dC, per batch.
+            Op::BatchMatMul => {
+                let (a, b) = (node.inputs[0], node.inputs[1]);
+                let grad_a = graph.batch_matmul_bt(grad_output, b);
+                let grad_b = graph.batch_matmul_at(a, grad_output);
+                accumulate_grad(&mut graph, &mut grads, a, grad_a);
+                accumulate_grad(&mut graph, &mut grads, b, grad_b);
+            }
+            // C = Aᵀ·B: dA = B·dCᵀ, dB = A·dC.
+            Op::BatchMatMulAT => {
+                let (a, b) = (node.inputs[0], node.inputs[1]);
+                let grad_a = graph.batch_matmul_bt(b, grad_output);
+                let grad_b = graph.batch_matmul(a, grad_output);
+                accumulate_grad(&mut graph, &mut grads, a, grad_a);
+                accumulate_grad(&mut graph, &mut grads, b, grad_b);
+            }
+            // C = A·Bᵀ: dA = dC·B, dB = dCᵀ·A.
+            Op::BatchMatMulBT => {
+                let (a, b) = (node.inputs[0], node.inputs[1]);
+                let grad_a = graph.batch_matmul(grad_output, b);
+                let grad_b = graph.batch_matmul_at(grad_output, a);
+                accumulate_grad(&mut graph, &mut grads, a, grad_a);
+                accumulate_grad(&mut graph, &mut grads, b, grad_b);
+            }
             Op::Add => {
                 let a = node.inputs[0];
                 let b = node.inputs[1];
@@ -477,6 +501,16 @@ pub fn differentiate(forward: &Graph) -> Graph {
                     vec![grad_output, x],
                     forward.nodes()[x as usize].ty.clone(),
                 );
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
+            Op::Permute { ref perm } => {
+                // The inverse permutation puts each axis back.
+                let mut inverse = vec![0; perm.len()];
+                for (d, &axis) in perm.iter().enumerate() {
+                    inverse[axis] = d;
+                }
+                let x = node.inputs[0];
+                let grad_x = graph.permute(grad_output, &inverse);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
             Op::Transpose => {

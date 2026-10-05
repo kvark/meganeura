@@ -125,6 +125,57 @@ fn erf() {
     grad_case("erf", build, fix);
 }
 
+/// Small shapes take the 32-wide tile, large ones the 64-wide tile; the
+/// gradient of each form exercises the other two.
+#[test]
+fn batch_matmul() {
+    for (batch, m, k, n) in [(3, 5, 7, 4), (2, 130, 70, 90)] {
+        for form in ["nn", "at", "bt"] {
+            let what = format!("batch_matmul {form} {batch}x{m}x{k}x{n}");
+            let build = |g: &mut Graph| match form {
+                "nn" => {
+                    let a = g.parameter("a", &[batch, m, k]);
+                    let b = g.parameter("b", &[batch, k, n]);
+                    g.batch_matmul(a, b)
+                }
+                "at" => {
+                    let a = g.parameter("a", &[batch, k, m]);
+                    let b = g.parameter("b", &[batch, k, n]);
+                    g.batch_matmul_at(a, b)
+                }
+                _ => {
+                    let a = g.parameter("a", &[batch, m, k]);
+                    let b = g.parameter("b", &[batch, n, k]);
+                    g.batch_matmul_bt(a, b)
+                }
+            };
+            inference_case(&what, build, |_| {});
+            if m < 100 {
+                grad_case(&what, build, |_| {});
+            }
+        }
+    }
+}
+
+#[test]
+fn permute() {
+    for (shape, perm) in [
+        (vec![2, 3, 4, 5], vec![0, 2, 1, 3]),
+        (vec![2, 3, 4, 5], vec![0, 2, 3, 1]),
+        (vec![2, 3, 4, 5], vec![3, 1, 0, 2]),
+        (vec![4, 6, 5], vec![2, 0, 1]),
+        (vec![7, 9], vec![1, 0]),
+    ] {
+        let what = format!("permute {shape:?} by {perm:?}");
+        let build = |g: &mut Graph| {
+            let x = g.parameter("x", &shape);
+            g.permute(x, &perm)
+        };
+        inference_case(&what, build, |_| {});
+        grad_case(&what, build, |_| {});
+    }
+}
+
 /// Values a step away from both bounds, so finite differences never
 /// straddle one.
 #[test]

@@ -266,6 +266,10 @@ pub enum ShaderEntry {
     BlockMatMul,
     BlockMatMulAT,
     BlockMatMulBT,
+    /// Batch-major products: `[B, M, K] × [B, K, N] → [B, M, N]`.
+    BatchMatMul,
+    BatchMatMulAT,
+    BatchMatMulBT,
     /// M=1 GEMV specialization of MatMul. Selected when `C = A × B` has
     /// a single row on the output side (LM decode path).
     MatMulGemv,
@@ -347,6 +351,8 @@ pub enum ShaderEntry {
     GroupNormGradStats,
     Concat,
     SplitA,
+    /// Axis permutation of a tensor of rank at most 4.
+    Permute,
     SplitB,
     Upsample2x,
     Upsample2xGrad,
@@ -429,6 +435,9 @@ impl ShaderEntry {
             | ShaderEntry::BlockMatMul
             | ShaderEntry::BlockMatMulAT
             | ShaderEntry::BlockMatMulBT
+            | ShaderEntry::BatchMatMul
+            | ShaderEntry::BatchMatMulAT
+            | ShaderEntry::BatchMatMulBT
             | ShaderEntry::MatMulGemv
             | ShaderEntry::MatMulGemvAdd
             | ShaderEntry::MatMulGemvBT
@@ -516,6 +525,7 @@ impl ShaderEntry {
             | ShaderEntry::Concat
             | ShaderEntry::SplitA
             | ShaderEntry::SplitB
+            | ShaderEntry::Permute
             | ShaderEntry::CacheWrite
             | ShaderEntry::CacheWritePrefix
             | ShaderEntry::PrefixLast => "data_movement",
@@ -565,6 +575,9 @@ impl ShaderEntry {
             ShaderEntry::BlockMatMul => ShaderGroup::BlockMatMul,
             ShaderEntry::BlockMatMulAT => ShaderGroup::BlockMatMulAT,
             ShaderEntry::BlockMatMulBT => ShaderGroup::BlockMatMulBT,
+            ShaderEntry::BatchMatMul => ShaderGroup::BatchMatMul,
+            ShaderEntry::BatchMatMulAT => ShaderGroup::BatchMatMulAT,
+            ShaderEntry::BatchMatMulBT => ShaderGroup::BatchMatMulBT,
             ShaderEntry::MatMulGemv => ShaderGroup::MatMulGemv,
             ShaderEntry::MatMulGemvAdd => ShaderGroup::MatMulGemvAdd,
             ShaderEntry::MatMulGemvBT => ShaderGroup::MatMulGemvBT,
@@ -617,6 +630,7 @@ impl ShaderEntry {
             ShaderEntry::GroupNormGradStats => ShaderGroup::GroupNormGrad,
             ShaderEntry::Concat => ShaderGroup::Concat,
             ShaderEntry::SplitA | ShaderEntry::SplitB => ShaderGroup::Split,
+            ShaderEntry::Permute => ShaderGroup::Permute,
             ShaderEntry::Upsample2x => ShaderGroup::Upsample,
             ShaderEntry::Upsample2xGrad => ShaderGroup::UpsampleGrad,
             ShaderEntry::Conv2dDw => ShaderGroup::Conv2dDw,
@@ -667,9 +681,12 @@ impl ShaderEntry {
     pub fn entry_point(&self) -> &'static str {
         match *self {
             ShaderEntry::Generated => crate::schedule::POINTWISE_ENTRY,
-            ShaderEntry::BlockMatMul | ShaderEntry::BlockMatMulAT | ShaderEntry::BlockMatMulBT => {
-                "main"
-            }
+            ShaderEntry::BlockMatMul
+            | ShaderEntry::BlockMatMulAT
+            | ShaderEntry::BlockMatMulBT
+            | ShaderEntry::BatchMatMul
+            | ShaderEntry::BatchMatMulAT
+            | ShaderEntry::BatchMatMulBT => "main",
             ShaderEntry::MatMul
             | ShaderEntry::MatMulAT
             | ShaderEntry::MatMulBT
@@ -726,6 +743,7 @@ impl ShaderEntry {
             ShaderEntry::GroupNormGradStats => "grad_stats",
             ShaderEntry::Concat => "main",
             ShaderEntry::SplitA => "split_a",
+            ShaderEntry::Permute => "main",
             ShaderEntry::SplitB => "split_b",
             ShaderEntry::Upsample2x => "main",
             ShaderEntry::Upsample2xGrad => "main",
@@ -1194,7 +1212,10 @@ impl Dispatch {
             | ShaderEntry::FusedMatMulBTAdd
             | ShaderEntry::BlockMatMul
             | ShaderEntry::BlockMatMulAT
-            | ShaderEntry::BlockMatMulBT => Some((a, b, c)),
+            | ShaderEntry::BlockMatMulBT
+            | ShaderEntry::BatchMatMul
+            | ShaderEntry::BatchMatMulAT
+            | ShaderEntry::BatchMatMulBT => Some((a, b, c)),
             _ => None,
         }
     }

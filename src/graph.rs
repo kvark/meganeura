@@ -210,6 +210,12 @@ pub enum Op {
     },
     /// `[M, G*K] × [G, N, K]ᵀ → [M, G*N]`, independently per block.
     BlockMatMulBT,
+    /// Batch-major product: `[B, M, K] × [B, K, N] → [B, M, N]`.
+    BatchMatMul,
+    /// `[B, K, M]ᵀ × [B, K, N] → [B, M, N]`, per batch.
+    BatchMatMulAT,
+    /// `[B, M, K] × [B, N, K]ᵀ → [B, M, N]`, per batch.
+    BatchMatMulBT,
     Add,
     Mul,
 
@@ -321,6 +327,11 @@ pub enum Op {
 
     // Transpose (swap last two dims)
     Transpose,
+    /// Reorder the axes of a tensor of rank at most 4: output axis `d` is
+    /// input axis `perm[d]`.
+    Permute {
+        perm: Vec<usize>,
+    },
 
     // Broadcast add (bias add: [M,N] + [N])
     BiasAdd,
@@ -1351,6 +1362,48 @@ impl Graph {
         self.block_matmul_impl(a, b, true)
     }
 
+    /// One matrix product per batch: `[B, M, K] × [B, K, N] → [B, M, N]`.
+    #[track_caller]
+    pub fn batch_matmul(&mut self, a: NodeId, b: NodeId) -> NodeId {
+        self.batch_matmul_impl(a, b, Op::BatchMatMul)
+    }
+
+    /// `[B, K, M]ᵀ × [B, K, N] → [B, M, N]`, per batch.
+    #[track_caller]
+    pub fn batch_matmul_at(&mut self, a: NodeId, b: NodeId) -> NodeId {
+        self.batch_matmul_impl(a, b, Op::BatchMatMulAT)
+    }
+
+    /// `[B, M, K] × [B, N, K]ᵀ → [B, M, N]`, per batch.
+    #[track_caller]
+    pub fn batch_matmul_bt(&mut self, a: NodeId, b: NodeId) -> NodeId {
+        self.batch_matmul_impl(a, b, Op::BatchMatMulBT)
+    }
+
+    #[track_caller]
+    fn batch_matmul_impl(&mut self, a: NodeId, b: NodeId, op: Op) -> NodeId {
+        let a_ty = &self.node(a).ty;
+        let b_ty = &self.node(b).ty;
+        assert_eq!(a_ty.dtype, DType::F32, "batch matmul requires F32");
+        assert_eq!(b_ty.dtype, DType::F32, "batch matmul requires F32");
+        let (&[batch, a0, a1], &[b_batch, b0, b1]) = (a_ty.shape.as_slice(), b_ty.shape.as_slice())
+        else {
+            panic!(
+                "batch matmul requires 3D operands, got {:?} and {:?}",
+                a_ty.shape, b_ty.shape
+            );
+        };
+        assert_eq!(batch, b_batch, "batch matmul batch sizes differ");
+        let (m, k, n, b_k) = match op {
+            Op::BatchMatMul => (a0, a1, b1, b0),
+            Op::BatchMatMulAT => (a1, a0, b1, b0),
+            Op::BatchMatMulBT => (a0, a1, b0, b1),
+            _ => unreachable!(),
+        };
+        assert_eq!(k, b_k, "batch matmul inner dimensions differ");
+        self.add_node(op, vec![a, b], TensorType::f32(vec![batch, m, n]))
+    }
+
     #[track_caller]
     fn block_matmul_impl(&mut self, a: NodeId, b: NodeId, transpose_b: bool) -> NodeId {
         let a_ty = &self.node(a).ty;
@@ -1617,6 +1670,31 @@ impl Graph {
         shape.swap(rank - 2, rank - 1);
         let ty = TensorType::f32(shape);
         self.add_node(Op::Transpose, vec![x], ty)
+    }
+
+    /// Reorder the axes of `x`: output axis `d` is input axis `perm[d]`.
+    /// Rank at most 4.
+    #[track_caller]
+    pub fn permute(&mut self, x: NodeId, perm: &[usize]) -> NodeId {
+        let shape = self.node(x).ty.shape.clone();
+        assert_eq!(perm.len(), shape.len(), "permute needs one entry per axis");
+        assert!(shape.len() <= 4, "permute supports rank at most 4");
+        let mut seen = [false; 4];
+        for &axis in perm {
+            assert!(
+                axis < perm.len() && !seen[axis],
+                "{perm:?} is not a permutation"
+            );
+            seen[axis] = true;
+        }
+        let out: Vec<usize> = perm.iter().map(|&axis| shape[axis]).collect();
+        self.add_node(
+            Op::Permute {
+                perm: perm.to_vec(),
+            },
+            vec![x],
+            TensorType::f32(out),
+        )
     }
 
     // --- Reductions ---

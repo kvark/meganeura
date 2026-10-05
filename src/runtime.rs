@@ -307,6 +307,22 @@ struct UnaryParams {
     _pad2: u32,
 }
 
+// permute: var src, dst, params (eight words)
+#[derive(blade_macros::ShaderData)]
+pub(crate) struct PermuteData {
+    pub(crate) src: blade_graphics::BufferPiece,
+    pub(crate) dst: blade_graphics::BufferPiece,
+    pub(crate) params: PermuteParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+pub(crate) struct PermuteParams {
+    pub(crate) total: u32,
+    pub(crate) dims: [u32; 3],
+    pub(crate) strides: [u32; 4],
+}
+
 // binary: var src_a, src_b, dst, params
 #[derive(blade_macros::ShaderData)]
 struct BinaryData {
@@ -1756,9 +1772,12 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::MatMulBT
         | ShaderEntry::MatMulGemv
         | ShaderEntry::MatMulGemvBT => MatMulData::layout(),
-        ShaderEntry::BlockMatMul | ShaderEntry::BlockMatMulAT | ShaderEntry::BlockMatMulBT => {
-            MatMulData::layout()
-        }
+        ShaderEntry::BlockMatMul
+        | ShaderEntry::BlockMatMulAT
+        | ShaderEntry::BlockMatMulBT
+        | ShaderEntry::BatchMatMul
+        | ShaderEntry::BatchMatMulAT
+        | ShaderEntry::BatchMatMulBT => MatMulData::layout(),
         ShaderEntry::FusedMatMulAdd
         | ShaderEntry::FusedMatMulATAdd
         | ShaderEntry::FusedMatMulBTAdd
@@ -1806,6 +1825,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::GroupNormGradStats => GroupNormGradData::layout(),
         ShaderEntry::Concat => BinaryData::layout(),
         ShaderEntry::SplitA | ShaderEntry::SplitB => UnaryData::layout(),
+        ShaderEntry::Permute => PermuteData::layout(),
         ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => UnaryData::layout(),
         ShaderEntry::Conv2dDw => Conv2dDwData::layout(),
         ShaderEntry::MulPerChannel => MulPerChannelData::layout(),
