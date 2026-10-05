@@ -86,6 +86,33 @@ fn elu() {
     check_reference(&g, &[("x", x)], &[]);
 }
 
+/// ELU's derivative is 1 at exactly zero (both sides agree there), also
+/// on the device, and exp(x) on the negative side.
+#[test]
+fn elu_gradient_at_zero() {
+    let mut g = Graph::new();
+    let x = g.parameter("x", &[5]);
+    let y = g.elu(x);
+    let loss = g.sum_all(y);
+    g.set_outputs(vec![loss]);
+    let diff = meganeura::autodiff::differentiate(&g);
+    let mut feeds = meganeura::reference::Feeds::new();
+    feeds.set("x", &[0.0, -1.0, -1e-4, 1e-4, 1.0]);
+    let out = meganeura::reference::evaluate_outputs(&diff, &feeds).unwrap();
+    let want = [1.0, (-1.0f64).exp(), (-1e-4f64).exp(), 1.0, 1.0];
+    for (g, w) in out[1].data.iter().zip(want) {
+        assert!((g - w).abs() < 1e-7, "{:?}", out[1].data);
+    }
+    // An all-zero tensor, through a training step on the device.
+    let mut zeros = meganeura::reference::Feeds::new();
+    zeros.set("x", &[0.0; 5]);
+    gpu::check_training(&g, &zeros, &gpu::Options::default())
+        .unwrap()
+        .assert_passed("elu at zero");
+    let out = meganeura::reference::evaluate_outputs(&diff, &zeros).unwrap();
+    assert_eq!(out[1].data, vec![1.0; 5]);
+}
+
 #[test]
 fn data_movement() {
     let x = values(D.len(), 2);
