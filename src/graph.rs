@@ -345,6 +345,10 @@ pub enum Op {
     Permute {
         perm: Vec<usize>,
     },
+    /// Repeat the unit axes of a tensor of rank at most 4 to the result's
+    /// extents (NumPy broadcasting at equal rank). One strided read; the
+    /// gradient sums the repeated axes.
+    BroadcastTo,
 
     // Broadcast add (bias add: [M,N] + [N])
     BiasAdd,
@@ -1778,6 +1782,25 @@ impl Graph {
             vec![x],
             TensorType::f32(out),
         )
+    }
+
+    /// Repeat the unit axes of `x` to `shape`, of the same rank (at most
+    /// 4): every other axis must already match.
+    #[track_caller]
+    pub fn broadcast_to(&mut self, x: NodeId, shape: &[usize]) -> NodeId {
+        let ty = &self.node(x).ty;
+        assert_eq!(ty.dtype, DType::F32, "broadcast_to moves F32 elements");
+        assert!(shape.len() <= 4, "broadcast_to supports rank at most 4");
+        assert_eq!(ty.rank(), shape.len(), "broadcast_to keeps the rank");
+        assert!(
+            ty.shape.iter().zip(shape).all(|(&a, &b)| a == b || a == 1),
+            "cannot broadcast {:?} to {shape:?}",
+            ty.shape
+        );
+        if ty.shape == shape {
+            return x;
+        }
+        self.add_node(Op::BroadcastTo, vec![x], TensorType::f32(shape.to_vec()))
     }
 
     // --- Reductions ---

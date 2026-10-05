@@ -626,6 +626,28 @@ pub(super) fn eval(node: &Node, ins: &[&Tensor]) -> Result<Vec<f64>, Error> {
             }
             out
         }
+        Op::BroadcastTo => {
+            let x = arg(0)?;
+            let out = &node.ty.shape;
+            if x.shape.len() != out.len() {
+                return Err(invalid(node, "broadcast keeps the rank"));
+            }
+            (0..node.ty.num_elements())
+                .map(|mut i| {
+                    // Peel output coordinates; repeated axes read index 0.
+                    let (mut source, mut stride) = (0, 1);
+                    for d in (0..out.len()).rev() {
+                        let coordinate = i % out[d];
+                        i /= out[d];
+                        if x.shape[d] != 1 {
+                            source += coordinate * stride;
+                        }
+                        stride *= x.shape[d];
+                    }
+                    x.data[source]
+                })
+                .collect()
+        }
         Op::Permute { ref perm } => {
             let x = arg(0)?;
             if perm.len() != x.shape.len() {

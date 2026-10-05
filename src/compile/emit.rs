@@ -1677,6 +1677,26 @@ impl<'a> Compiler<'a> {
                 self.emit_strided_copy(input, out_buf, dims, out_strides);
             }
 
+            Op::BroadcastTo => {
+                let input = self.get_buffer(node.inputs[0]);
+                let in_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                // Repeated axes read with stride zero.
+                let pad = 4 - in_shape.len();
+                let mut dims = [1u32; 4];
+                let mut strides = [0u32; 4];
+                let mut stride = 1usize;
+                for d in (0..in_shape.len()).rev() {
+                    dims[pad + d] =
+                        u32::try_from(node.ty.shape[d]).expect("broadcast dim exceeds u32");
+                    if in_shape[d] != 1 {
+                        strides[pad + d] =
+                            u32::try_from(stride).expect("broadcast stride exceeds u32");
+                    }
+                    stride *= in_shape[d];
+                }
+                self.emit_strided_copy(input, out_buf, dims, strides);
+            }
+
             Op::Silu => {
                 self.emit_pointwise(pointwise(1, [Pw::Silu(0)]), node, out_buf);
             }

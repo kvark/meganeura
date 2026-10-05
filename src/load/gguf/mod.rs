@@ -14,8 +14,8 @@
 //! use meganeura::load::gguf::{load_gguf, GenerationOptions};
 //!
 //! let model = load_gguf(std::path::Path::new("model.gguf"))?;
-//! let mut gen = model.generator(256)?;
-//! println!("{}", gen.generate("The meaning of life is", &GenerationOptions::default())?);
+//! let mut generator = model.generator(256)?;
+//! println!("{}", generator.generate("The meaning of life is", &GenerationOptions::default())?);
 //! # Ok::<(), meganeura::load::gguf::GgufError>(())
 //! ```
 //!

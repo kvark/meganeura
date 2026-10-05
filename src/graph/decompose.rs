@@ -287,17 +287,11 @@ impl Graph {
                 self.add_per_channel(scaled, bias, channels, spatial)
             }
             Op::Upsample2x { in_w, .. } => {
-                // Each pixel twice along the row, then each row twice.
-                let x = arg(0);
+                // Every row twice, every pixel of it twice.
                 let w = in_w as usize;
-                let total = self.node(x).ty.num_elements();
-                let rows = total / w;
-                let pixels = self.view(x, &[total, 1]);
-                let wide = self.broadcast_inner(pixels, 2);
-                let wide = self.view(wide, &[total * 2]);
-                let rows_u32 = u32::try_from(rows).expect("upsample rows exceed u32");
-                let width = u32::try_from(2 * w).expect("upsample width exceeds u32");
-                self.concat(wide, wide, rows_u32, 1, 1, width)
+                let rows = self.node(arg(0)).ty.num_elements() / w;
+                let x = self.view(arg(0), &[rows, 1, w, 1]);
+                self.broadcast_to(x, &[rows, 2, w, 2])
             }
             ref other => self.expand_sequence_op(other, inputs, ty),
         };
@@ -708,7 +702,7 @@ impl Graph {
     }
 
     /// `times` copies of every `[inner]` block of `x`, grouped per `outer`
-    /// index, by doubling concatenations: `[outer · times · inner]`.
+    /// index: `[outer, times, inner]`, one broadcast read.
     pub(crate) fn repeat_axis(
         &mut self,
         x: NodeId,
@@ -716,26 +710,14 @@ impl Graph {
         inner: usize,
         times: usize,
     ) -> NodeId {
-        let outer = u32::try_from(outer).expect("repeat outer exceeds u32");
-        let inner = u32::try_from(inner).expect("repeat inner exceeds u32");
-        let (mut acc, mut acc_n) = (None, 0u32);
-        let (mut piece, mut piece_n) = (x, 1u32);
-        let mut remaining = times;
-        while remaining > 0 {
-            if remaining & 1 == 1 {
-                acc = Some(match acc {
-                    None => piece,
-                    Some(a) => self.concat(a, piece, outer, acc_n, piece_n, inner),
-                });
-                acc_n += piece_n;
-            }
-            remaining >>= 1;
-            if remaining > 0 {
-                piece = self.concat(piece, piece, outer, piece_n, piece_n, inner);
-                piece_n *= 2;
-            }
-        }
-        acc.expect("repeat at least once")
+        let x = self.view(x, &[outer, 1, inner]);
+        self.broadcast_to(x, &[outer, times, inner])
+    }
+
+    /// `[rows, width]` zeros, read from one broadcast scalar.
+    pub(crate) fn zeros(&mut self, rows: usize, width: usize) -> NodeId {
+        let zero = self.constant(vec![0.0], &[1, 1]);
+        self.broadcast_to(zero, &[rows, width])
     }
 
     /// A per-channel vector `[C]` spread over its planes: `[C·spatial]`.
@@ -758,7 +740,7 @@ impl Graph {
             return self.greater(x, x);
         }
         let (rows_u32, keep, gap) = (rows as u32, (n - o.abs()) as u32, o.unsigned_abs() as u32);
-        let zeros = self.constant(vec![0.0; rows * gap as usize], &[rows * gap as usize]);
+        let zeros = self.zeros(rows, gap as usize);
         if o > 0 {
             let kept = self.split_a(x, rows_u32, keep, gap, 1);
             self.concat(zeros, kept, rows_u32, gap, keep, 1)
@@ -1646,16 +1628,22 @@ fn guesses(g: &Graph, root: NodeId) -> Vec<(Op, Vec<NodeId>)> {
                         out.push((Op::ShiftInner { offset }, vec![x]));
                     }
                 }
-                // upsample: each row of the widened image twice
-                if a == b
-                    && let Some(pixels) = input(g, a, 0).map(|w| unview(g, w))
-                    && let Some(x) = input(g, pixels, 0)
-                {
-                    let x = unview(g, x);
-                    if let Some(op) = upsample_dims(g, root, x) {
-                        out.push((op, vec![x]));
-                    }
-                }
+            }
+        }
+        Op::BroadcastTo => {
+            // upsample: each pixel spread over a 2×2 block
+            if let Some(x) = input(g, core, 0)
+                && let [rows, 2, w, 2] = g.node(core).ty.shape[..]
+                && g.node(x).ty.shape[..] == [rows, 1, w, 1]
+            {
+                out.push((
+                    Op::Upsample2x {
+                        channels: 1,
+                        in_h: rows as u32,
+                        in_w: w as u32,
+                    },
+                    vec![unview(g, x)],
+                ));
             }
         }
         _ => {}
@@ -1699,7 +1687,7 @@ fn heads_source(g: &Graph, id: NodeId) -> Option<NodeId> {
 /// itself, before any repetition for grouped KV.
 fn heads_split(g: &Graph, id: NodeId) -> Option<(NodeId, NodeId)> {
     let mut id = unview(g, id);
-    while let Op::Concat { .. } = g.node(id).op {
+    if matches!(g.node(id).op, Op::BroadcastTo) {
         id = unview(g, input(g, id, 0)?);
     }
     if !matches!(g.node(id).op, Op::Permute { .. }) {
@@ -2004,11 +1992,10 @@ fn biased_guess(
         .and_then(|hidden| input(g, hidden, 1))
         .and_then(|pos| scalar_source(g, pos));
     let mut rows = bias;
-    while let Op::Concat { .. } = g.node(rows).op {
-        let Some(first) = input(g, rows, 0) else {
-            break;
-        };
-        rows = unview(g, first);
+    if matches!(g.node(rows).op, Op::BroadcastTo)
+        && let Some(source) = input(g, rows, 0)
+    {
+        rows = unview(g, source);
     }
     kv_pos
         .map(|kv_pos| {
@@ -2039,7 +2026,7 @@ fn norm_eps(g: &Graph, inv: NodeId) -> Option<f32> {
 fn repeated_rows(g: &Graph, id: NodeId) -> Option<(NodeId, u32)> {
     let repeated = &g.node(id).ty;
     let mut base = unview(g, id);
-    while let Op::Concat { .. } = g.node(base).op {
+    if matches!(g.node(base).op, Op::BroadcastTo) {
         base = unview(g, g.node(base).inputs[0]);
     }
     let x = &g.node(base).ty;
@@ -2052,24 +2039,4 @@ fn per_channel_dims(g: &Graph, node: &Node, gate: NodeId) -> (u32, u32) {
     let planes = g.node(gate).ty.num_elements().max(1);
     let spatial = (node.ty.num_elements() / planes) as u32;
     (planes as u32, spatial)
-}
-
-/// The upsample op producing `root` from planes `x`.
-fn upsample_dims(g: &Graph, root: NodeId, x: NodeId) -> Option<Op> {
-    let total = g.node(x).ty.num_elements();
-    if g.node(root).ty.num_elements() != 4 * total {
-        return None;
-    }
-    // Rows and width are only fixed together: try every factorization the
-    // verification can accept, starting from square planes.
-    let concat = unview(g, root);
-    let Op::Concat { spatial, .. } = g.node(concat).op else {
-        return None;
-    };
-    let w = spatial as usize / 2;
-    (w > 0 && total.is_multiple_of(w)).then(|| Op::Upsample2x {
-        channels: 1,
-        in_h: (total / w) as u32,
-        in_w: w as u32,
-    })
 }

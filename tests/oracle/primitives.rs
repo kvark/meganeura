@@ -208,6 +208,32 @@ fn max_inner_ties() {
         .assert_passed("all-equal rows");
 }
 
+/// Broadcasts along leading, interior, trailing and several axes at
+/// once; the gradient sums over the repeated axes.
+#[test]
+fn broadcast_to() {
+    let cases: [(&[usize], &[usize]); 5] = [
+        (&[1, 3], &[4, 3]),
+        (&[3, 1], &[3, 5]),
+        (&[2, 1, 3], &[2, 4, 3]),
+        (&[1, 2, 1, 3], &[2, 2, 3, 3]),
+        (&[2, 1, 3, 1], &[2, 2, 3, 2]),
+    ];
+    for (from, to) in cases {
+        let what = format!("broadcast {from:?} to {to:?}");
+        grad_case(
+            &what,
+            |g| {
+                let t = g.parameter("t", from);
+                let b = g.broadcast_to(t, to);
+                let rows = to[0];
+                g.reshape(b, &[rows, to[1..].iter().product()])
+            },
+            |_| {},
+        );
+    }
+}
+
 #[test]
 #[should_panic(expected = "permute moves F32 elements")]
 fn permute_rejects_other_storage() {

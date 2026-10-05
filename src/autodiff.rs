@@ -521,6 +521,12 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 );
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
+            Op::BroadcastTo => {
+                let x = node.inputs[0];
+                let in_shape = forward.nodes()[x as usize].ty.shape.clone();
+                let grad_x = sum_to(&mut graph, grad_output, &node.ty.shape, &in_shape);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
             Op::Permute { ref perm } => {
                 // The inverse permutation puts each axis back.
                 let mut inverse = vec![0; perm.len()];
@@ -1201,6 +1207,24 @@ impl Graph {
         let ty = target_ty.clone();
         self.add_raw_node(Op::SumRows, vec![x], ty)
     }
+}
+
+/// Sum `grad` (of `out_shape`) over the axes `in_shape` broadcast: the
+/// repeated axes move last and reduce as rows.
+fn sum_to(graph: &mut Graph, grad: NodeId, out_shape: &[usize], in_shape: &[usize]) -> NodeId {
+    let repeated: Vec<usize> = (0..out_shape.len())
+        .filter(|&d| in_shape[d] == 1 && out_shape[d] != 1)
+        .collect();
+    let kept: Vec<usize> = (0..out_shape.len())
+        .filter(|d| !repeated.contains(d))
+        .collect();
+    let perm: Vec<usize> = kept.iter().chain(&repeated).copied().collect();
+    let moved = graph.permute(grad, &perm);
+    let span: usize = repeated.iter().map(|&d| out_shape[d]).product();
+    let rows = out_shape.iter().product::<usize>() / span;
+    let moved = graph.reshape(moved, &[rows, span]);
+    let summed = graph.sum_inner(moved);
+    graph.reshape(summed, in_shape)
 }
 
 /// Accumulate the gradients of an attention node with respect to its Q, K
