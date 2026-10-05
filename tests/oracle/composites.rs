@@ -10,34 +10,14 @@ use meganeura::graph::OpClass;
 use meganeura::reference::{Feeds, evaluate_outputs, gradients};
 use meganeura::{CompileOptions, Graph, Mode, NodeId, OptimizeConfig, compile_plan};
 
-/// Everything about a plan that decides its cost, order-independent.
 fn signature(graph: &Graph, mode: Mode) -> Vec<String> {
-    let plan = compile_plan(
+    compile_plan(
         graph,
         mode,
         OptimizeConfig::default(),
         &CompileOptions::default(),
-    );
-    let mut dispatches: Vec<String> = plan
-        .dispatches
-        .iter()
-        .map(|d| {
-            format!(
-                "{:?} {:?} {:?} {:?} in={} out_extra={}",
-                d.shader,
-                d.kernel,
-                d.params,
-                d.workgroups,
-                d.input_buffers.len(),
-                d.extra_outputs.len()
-            )
-        })
-        .collect();
-    dispatches.sort();
-    let mut buffers = plan.buffers.clone();
-    buffers.sort_unstable();
-    dispatches.push(format!("buffers {buffers:?}"));
-    dispatches
+    )
+    .signature()
 }
 
 /// One composite case: a graph whose last output applies the composite.
@@ -387,10 +367,9 @@ fn vision() {
             },
             |_| {},
         ),
-        // Inference only, as the original op has no gradient.
         case(
             "mul_per_channel",
-            false,
+            true,
             |g| {
                 let x = g.parameter("x", &[2 * 3 * 16]);
                 let gate = g.parameter("gate", &[6]);

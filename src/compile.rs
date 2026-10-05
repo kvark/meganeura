@@ -1362,6 +1362,33 @@ pub struct ExecutionPlan {
 }
 
 impl ExecutionPlan {
+    /// Everything about the plan that decides its cost, independent of
+    /// dispatch order and buffer numbering: each dispatch's shader, kernel,
+    /// parameters, grid and operand counts, and the buffer sizes. Two plans
+    /// with equal signatures do the same work.
+    pub fn signature(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .dispatches
+            .iter()
+            .map(|d| {
+                format!(
+                    "{:?} {:?} {:?} {:?} in={} extra={}",
+                    d.shader,
+                    d.kernel,
+                    d.params,
+                    d.workgroups,
+                    d.input_buffers.len(),
+                    d.extra_outputs.len()
+                )
+            })
+            .collect();
+        out.sort();
+        let mut buffers = self.buffers.clone();
+        buffers.sort_unstable();
+        out.push(format!("buffers {buffers:?}"));
+        out
+    }
+
     fn node_buffer(&self, node_id: NodeId) -> BufferRef {
         let &(mapped_id, buffer) = self
             .node_buffers

@@ -844,11 +844,19 @@ pub fn differentiate(forward: &Graph) -> Graph {
                      Add a depthwise grad kernel before training through it."
                 );
             }
-            Op::MulPerChannel { .. } => {
-                panic!(
-                    "MulPerChannel autodiff not implemented — used only for \
-                     EfficientNet SE in the frozen-weights inference path."
-                );
+            Op::MulPerChannel { channels, spatial } => {
+                // y[p, s] = src[p, s] · gate[p] over planes p: the source's
+                // gradient is gated the same way, the gate's sums each plane.
+                let (src, gate) = (node.inputs[0], node.inputs[1]);
+                let grad_src = graph.mul_per_channel(grad_output, gate, channels, spatial);
+                let planes = forward.nodes()[gate as usize].ty.num_elements();
+                let product = graph.mul(grad_output, src);
+                let product = graph.view(product, &[planes, spatial as usize]);
+                let grad_gate = graph.sum_inner(product);
+                let gate_shape = forward.nodes()[gate as usize].ty.shape.clone();
+                let grad_gate = graph.view(grad_gate, &gate_shape);
+                accumulate_grad(&mut graph, &mut grads, src, grad_src);
+                accumulate_grad(&mut graph, &mut grads, gate, grad_gate);
             }
             Op::AddPerChannel { channels, spatial } => {
                 // y[n,c,s] = x[n,c,s] + bias[c]

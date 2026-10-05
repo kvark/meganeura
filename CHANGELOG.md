@@ -1,5 +1,21 @@
 # Unreleased
 
+- Ops are classified as primitive, composite or private (`Op::class`).
+  Every composite has a decomposition into primitives (`Graph::decompose`),
+  and every build recognizes decompositions again (`Graph::recompose`), so a
+  model spelled in primitives builds exactly the plan of the model written
+  with composites: the same kernels, parameters, grids and buffers, for
+  inference and training. Tests hold every composite, every model builder,
+  every GGUF architecture and the ONNX fixtures to identical plans, and a
+  decomposed SmolLM2 runs bit for bit like the original in the same time.
+  `compile_plan` and `ExecutionPlan::signature` compare plans without a GPU.
+- Equivalent spellings build one way: full, cross and multi-head attention
+  share a lowering, a sliding window spanning the sequence is causal
+  attention, and upsample and per-channel gate attributes that do not
+  change the result take one canonical value.
+- `MulPerChannel` has a gradient. Its lowering, and `AddPerChannel`'s,
+  process every element of a tensor of any rank.
+- `CausalAttentionRoPE`, which nothing builds, is a private fused op.
 - A primitive op set (`Op::is_primitive`) that model builders can rely on,
   with new primitives `max_inner`, `sqrt`, `rsqrt` and `add_scalar`, and a
   gradient for `clamp`. `Graph::decomposed_softmax` and

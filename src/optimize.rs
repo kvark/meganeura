@@ -1742,7 +1742,7 @@ fn build_structural_index(g: &Graph) -> StructuralIndex {
 /// them by name (e.g. the packed-SwiGLU sources feed derived params).
 /// CacheWrite executes for its side effect (it mutates the cache buffer
 /// in place; decode graphs never read its result), so it is a root.
-fn sweep_dead_nodes(g: &mut Graph) {
+pub(crate) fn sweep_dead_nodes(g: &mut Graph) {
     let n = g.nodes().len();
     let mut live = vec![false; n];
     let mut stack: Vec<usize> = g.outputs().iter().map(|&o| o as usize).collect();

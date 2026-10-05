@@ -22,6 +22,8 @@ mod horizontal_matmul;
 mod importer_fuzz;
 mod int_dot_gemv;
 mod laprop;
+#[cfg(feature = "models")]
+mod model_parity;
 mod multi_input_trainer;
 mod onnx_exports;
 mod outline_optimize;

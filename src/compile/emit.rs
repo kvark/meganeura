@@ -2369,7 +2369,7 @@ impl<'a> Compiler<'a> {
             Op::MulPerChannel { channels, spatial } => {
                 let src = self.get_buffer(node.inputs[0]);
                 let gate = self.get_buffer(node.inputs[1]);
-                let len = node.ty.shape[0] as u32;
+                let len = node.ty.num_elements() as u32;
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::MulPerChannel,
                     workgroups: [len.div_ceil(256), 1, 1],
@@ -2385,7 +2385,7 @@ impl<'a> Compiler<'a> {
             Op::AddPerChannel { channels, spatial } => {
                 let src = self.get_buffer(node.inputs[0]);
                 let bias = self.get_buffer(node.inputs[1]);
-                let len = node.ty.shape[0] as u32;
+                let len = node.ty.num_elements() as u32;
                 // As a pointwise DAG the bias add fuses with the activation
                 // after it, so a conv -> bias -> ReLU block writes one
                 // activation instead of two.

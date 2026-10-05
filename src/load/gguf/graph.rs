@@ -1154,6 +1154,87 @@ mod tests {
         }
     }
 
+    /// Every architecture builds the same plan from its decomposition into
+    /// primitives, prefilling a block and decoding a token.
+    #[test]
+    fn decomposed_models_build_the_same_plans() {
+        use crate::train::{Mode, compile_plan};
+        let plan = |g: &crate::Graph| {
+            compile_plan(
+                g,
+                Mode::Inference,
+                crate::OptimizeConfig::default(),
+                &crate::CompileOptions::default(),
+            )
+            .signature()
+        };
+        for arch in [
+            "llama", "qwen2", "qwen3", "gemma", "gemma2", "gemma3", "phi2", "phi3", "gemma4",
+        ] {
+            let mut model = fixture::model(arch);
+            let config = ModelConfig::from_gguf(&model).unwrap();
+            pack_like_the_converter(&mut model, &config);
+            for block in [4, 1] {
+                let mut g = crate::Graph::new();
+                let built = build(&mut g, &model, &config, block, 16)
+                    .unwrap_or_else(|e| panic!("{arch}: {e}"));
+                g.set_outputs(built.outputs());
+                let decomposed = g.decompose();
+                assert!(
+                    decomposed.nodes().iter().all(|n| n.op.is_primitive()),
+                    "{arch}: decomposition left a non-primitive"
+                );
+                let (original, rebuilt) = (plan(&g), plan(&decomposed));
+                if original != rebuilt {
+                    let only = |a: &[String], b: &[String]| {
+                        a.iter()
+                            .filter(|x| !b.contains(x))
+                            .map(|s| s.chars().take(160).collect::<String>())
+                            .collect::<Vec<_>>()
+                    };
+                    panic!(
+                        "{arch} block {block}: plans differ\n  only original: {:#?}\n  only decomposed: {:#?}",
+                        only(&original, &rebuilt),
+                        only(&rebuilt, &original)
+                    );
+                }
+            }
+        }
+    }
+
+    /// Replace the fixture's per-projection tensors by the packed ones an
+    /// architecture's files carry: Q, K and V as one `attn_qkv`, gate and
+    /// up as one `ffn_up`.
+    fn pack_like_the_converter(model: &mut GgufModel, config: &ModelConfig) {
+        let arch = config.architecture;
+        for layer in 0..config.num_layers {
+            let mut pack = |parts: &[&str], packed: &str| {
+                let names: Vec<String> = parts
+                    .iter()
+                    .map(|p| format!("blk.{layer}.{p}.weight"))
+                    .collect();
+                let Some(first) = model.tensors.get(&names[0]) else {
+                    return;
+                };
+                let rows = first.dims[0];
+                let width: usize = names.iter().map(|n| model.tensors[n].dims[1]).sum();
+                for name in &names {
+                    model.tensors.remove(name);
+                }
+                model.tensors.insert(
+                    format!("blk.{layer}.{packed}.weight"),
+                    fixture::f32_tensor(vec![rows, width]),
+                );
+            };
+            if arch.packs_qkv() {
+                pack(&["attn_q", "attn_k", "attn_v"], "attn_qkv");
+            }
+            if arch.packs_gate_up() {
+                pack(&["ffn_gate", "ffn_up"], "ffn_up");
+            }
+        }
+    }
+
     #[test]
     fn an_oversized_whole_tensor_is_rejected() {
         // Nothing reads the surplus rows, so accepting it would load a
