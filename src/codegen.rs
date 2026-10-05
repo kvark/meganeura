@@ -1447,43 +1447,43 @@ fn matmul_vars_tiled(
         WeightFormat::Q4 => (
             "",
             "array<u32>",
-            "dequant_q4(b_row, b_col)".to_string(),
+            "dequant_q4(select(0u, b_row, in_bounds), select(0u, b_col, in_bounds))".to_string(),
             format!("{F16_DECODE_FN}{Q4_DEQUANT_FN}"),
         ),
         WeightFormat::Q8 => (
             "",
             "array<u32>",
-            "dequant_q8(b_row, b_col)".to_string(),
+            "dequant_q8(select(0u, b_row, in_bounds), select(0u, b_col, in_bounds))".to_string(),
             format!("{F16_DECODE_FN}{Q8_DEQUANT_FN}"),
         ),
         WeightFormat::Q40 => (
             "",
             "array<u32>",
-            "dequant_q40(b_row, b_col)".to_string(),
+            "dequant_q40(select(0u, b_row, in_bounds), select(0u, b_col, in_bounds))".to_string(),
             format!("{F16_DECODE_FN}{Q40_DEQUANT_FN}"),
         ),
         WeightFormat::Q4K => (
             "",
             "array<u32>",
-            "dequant_q4k(b_row, b_col)".to_string(),
+            "dequant_q4k(select(0u, b_row, in_bounds), select(0u, b_col, in_bounds))".to_string(),
             format!("{F16_DECODE_FN}{K_SCALE_MIN_FN}{Q4K_DEQUANT_FN}"),
         ),
         WeightFormat::Q6K => (
             "",
             "array<u32>",
-            "dequant_q6k(b_row, b_col)".to_string(),
+            "dequant_q6k(select(0u, b_row, in_bounds), select(0u, b_col, in_bounds))".to_string(),
             format!("{F16_DECODE_FN}{Q6K_DEQUANT_FN}"),
         ),
         WeightFormat::Q5K => (
             "",
             "array<u32>",
-            "dequant_q5k(b_row, b_col)".to_string(),
+            "dequant_q5k(select(0u, b_row, in_bounds), select(0u, b_col, in_bounds))".to_string(),
             format!("{F16_DECODE_FN}{K_SCALE_MIN_FN}{Q5K_DEQUANT_FN}"),
         ),
         WeightFormat::Q3K => (
             "",
             "array<u32>",
-            "dequant_q3k(b_row, b_col)".to_string(),
+            "dequant_q3k(select(0u, b_row, in_bounds), select(0u, b_col, in_bounds))".to_string(),
             format!("{F16_DECODE_FN}{Q3K_DEQUANT_FN}"),
         ),
     };
@@ -1504,7 +1504,10 @@ fn matmul_vars_tiled(
         let n_local = tid % $BN_U;\n\
         let k_base = (tid / $BN_U) * 8u;\n\
         let b_col = tile_col + n_local;\n\
-        let unpacked = {pack8}(t + k_base, b_col);\n\
+        // Blocks are 32 wide, so 8 values from inside K stay inside it;\n\
+        // lanes past the matrix decode the first group and discard it.\n\
+        let in_group = (t + k_base < params.k) && (b_col < params.n);\n\
+        let unpacked = {pack8}(select(0u, t + k_base, in_group), select(0u, b_col, in_group));\n\
         for (var i = 0u; i < 8u; i++) {{\n\
             let b_row = t + k_base + i;\n\
             let in_bounds = (b_row < params.k) && (b_col < params.n);\n\
