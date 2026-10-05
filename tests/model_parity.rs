@@ -22,6 +22,15 @@ fn plan(graph: &Graph, mode: Mode) -> Vec<String> {
 
 #[track_caller]
 fn assert_parity(what: &str, graph: &Graph, modes: &[Mode]) {
+    // Models need only the public ops: primitives and composites.
+    for node in graph.nodes() {
+        assert_ne!(
+            node.op.class(),
+            OpClass::Private,
+            "{what} builds the private op {:?}",
+            node.op
+        );
+    }
     let decomposed = graph.decompose();
     assert!(
         decomposed

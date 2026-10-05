@@ -1179,6 +1179,12 @@ mod tests {
                 let built = build(&mut g, &model, &config, block, 16)
                     .unwrap_or_else(|e| panic!("{arch}: {e}"));
                 g.set_outputs(built.outputs());
+                assert!(
+                    g.nodes()
+                        .iter()
+                        .all(|n| n.op.class() != crate::graph::OpClass::Private),
+                    "{arch} builds a private op"
+                );
                 let decomposed = g.decompose();
                 assert!(
                     decomposed.nodes().iter().all(|n| n.op.is_primitive()),
