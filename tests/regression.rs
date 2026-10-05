@@ -23,6 +23,7 @@ mod importer_fuzz;
 mod int_dot_gemv;
 mod laprop;
 mod multi_input_trainer;
+mod onnx_exports;
 mod outline_optimize;
 mod profile_windows;
 #[cfg(feature = "models")]
