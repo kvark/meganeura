@@ -59,7 +59,8 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let a_row = tile_row + row_local;
             let a_col = t + col_local;
             let in_bounds_a = a_row < m_total && a_col < k_total;
-            shared_a[row_local * $A_STRIDE_U + col_local] = select(0.0, weight[a_row * k_total + a_col], in_bounds_a);
+            // `select` evaluates both arms: an index past the end reads element 0.
+            shared_a[row_local * $A_STRIDE_U + col_local] = select(0.0, weight[select(0u, a_row * k_total + a_col, in_bounds_a)], in_bounds_a);
         }
 
         // Load B tile: im2col(input)^T [K, oH*oW].

@@ -208,6 +208,48 @@ fn max_inner_ties() {
         .assert_passed("all-equal rows");
 }
 
+/// Concatenation and splits differentiate by element counts, whatever
+/// the operands' rank.
+#[test]
+fn concat_of_matrices() {
+    grad_case(
+        "concat of matrices",
+        |g| {
+            let a = g.parameter("a", &[4, 3]);
+            let b = g.parameter("b", &[4, 2]);
+            let ab = g.concat(a, b, 4, 3, 2, 1);
+            let ab = g.reshape(ab, &[4, 5]);
+            g.split_a(ab, 4, 4, 1, 1)
+        },
+        |_| {},
+    );
+}
+
+/// Running sums before (or after) each element of a row, over a width
+/// spanning several workgroups' worth of elements.
+#[test]
+fn exclusive_cumsum() {
+    for (width, reverse) in [(9, false), (9, true), (300, false), (300, true)] {
+        let what = format!("exclusive cumsum over {width}, reverse {reverse}");
+        inference_case(
+            &what,
+            |g| {
+                let x = g.input("x", &[4, width]);
+                g.exclusive_cumsum(x, reverse)
+            },
+            |_| {},
+        );
+        grad_case(
+            &what,
+            |g| {
+                let x = g.parameter("x", &[4, width]);
+                g.exclusive_cumsum(x, reverse)
+            },
+            |_| {},
+        );
+    }
+}
+
 /// Broadcasts along leading, interior, trailing and several axes at
 /// once; the gradient sums over the repeated axes.
 #[test]
@@ -567,10 +609,9 @@ fn decomposed_rms_norm_reaches_plan_fusions() {
         named,
         "decomposed and named norms should lower identically"
     );
-    // Recomposition is not an optimization: it holds with the optimizer
-    // off as well.
-    assert_eq!(
-        plan(&build(true), OptimizeMode::Off),
-        plan(&build(false), OptimizeMode::Off)
-    );
+    // With the optimizer off the graph builds as written: the decomposed
+    // norm stays in primitives, and nothing fuses it.
+    let off = plan(&build(true), OptimizeMode::Off);
+    assert!(!off.1, "the optimizer is off");
+    assert!(off.0 > named.0, "{off:?} should run the primitives");
 }

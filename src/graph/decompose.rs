@@ -8,12 +8,17 @@
 //! the graph around the node is structurally the composite's own
 //! expansion. Recognition is therefore exact, and `recompose(decompose(g))`
 //! restores every composite of `g`, so both spellings build the same plan.
+//! Composites a graph already names are left as written.
 //!
 //! The expansions are written to be maximally composed: where a composite
 //! contains another (a loss containing a log-softmax), it expands to that
-//! composite rather than to its primitives. Recomposition runs bottom-up,
-//! so the inner composite is recognized first and the outer one then
-//! matches its one-level expansion.
+//! composite rather than to its primitives. Recognition first names those
+//! nested composites, then matches the larger ones against templates that
+//! name them too.
+//!
+//! Training builds recognize only composites whose gradient is exactly
+//! their decomposition's ([`Graph::recompose_for_training`]), and builds
+//! with the optimizer off recognize nothing.
 
 use std::collections::HashMap;
 
@@ -34,7 +39,7 @@ impl Graph {
 
     /// A copy with the composites `select` picks replaced by primitives,
     /// including any composites their expansions contain.
-    fn decompose_where(&self, select: impl Fn(&Op) -> bool) -> Graph {
+    pub fn decompose_where(&self, select: impl Fn(&Op) -> bool) -> Graph {
         let mut graph = self.deep_clone();
         while let Some(next) = graph.expand_composites(&select) {
             graph = next;
@@ -204,20 +209,6 @@ impl Graph {
                 let along = self.broadcast_inner(along, width);
                 let projection = self.mul(along, directions);
                 self.sub(vectors, projection)
-            }
-            Op::ExclusiveCumsum { reverse } => {
-                // y = x·U, U[k, n] = 1 where k sums into n.
-                let n = self.node(arg(0)).ty.shape[1];
-                let mut upper = vec![0.0; n * n];
-                for k in 0..n {
-                    for j in 0..n {
-                        if (k < j && !reverse) || (k > j && reverse) {
-                            upper[k * n + j] = 1.0;
-                        }
-                    }
-                }
-                let upper = self.constant(upper, &[n, n]);
-                self.matmul(arg(0), upper)
             }
             Op::ShiftInner { offset } => self.expand_shift(arg(0), offset),
             Op::CrossEntropyLoss => {
@@ -580,20 +571,26 @@ impl Graph {
         let rh = self.split_heads(relative, heads.heads, heads.dim);
         let direct = self.batch_matmul_bt(qh, kh);
         // q_i · r_t for every relative row t, then t = left - 1 - (i - j)
-        // selected per query row by a 0/1 matrix.
+        // gathered per (i, j): rows (i, t) of a [rows · left, heads] table.
+        // Keys outside the window read row (i, 0); the mask drops them.
         let by_offset = self.batch_matmul_bt(qh, rh);
-        let by_offset = self.permute(by_offset, &[1, 0, 2]);
-        let mut select = vec![0.0; rows * left * rows];
-        for i in 0..rows {
-            for j in 0..=i {
-                if i - j <= left - 2 {
-                    select[(i * left + (left - 1 - (i - j))) * rows + j] = 1.0;
-                }
-            }
-        }
-        let select = self.constant(select, &[rows, left, rows]);
-        let relative = self.batch_matmul(by_offset, select);
-        let relative = self.permute(relative, &[1, 0, 2]);
+        let by_offset = self.permute(by_offset, &[1, 2, 0]);
+        let table = self.view(by_offset, &[rows * left, heads.heads]);
+        let indices: Vec<u32> = (0..rows * rows)
+            .map(|n| {
+                let (i, j) = (n / rows, n % rows);
+                let t = if j <= i && i - j <= left - 2 {
+                    left - 1 - (i - j)
+                } else {
+                    0
+                };
+                (i * left + t) as u32
+            })
+            .collect();
+        let indices = self.constant_u32(&indices, &[rows * rows]);
+        let relative = self.embedding(indices, table);
+        let relative = self.view(relative, &[rows, rows, heads.heads]);
+        let relative = self.permute(relative, &[2, 0, 1]);
         let logits = self.add(direct, relative);
         let logits = self.scale(logits, 1.0 / cap);
         let logits = self.tanh(logits);
@@ -751,37 +748,65 @@ impl Graph {
     }
 
     /// The graph with every recognizable expansion replaced by its
-    /// composite. Nodes keep their ids; superseded interior nodes are left
-    /// for dead-code elimination.
+    /// composite, superseded nodes swept and the rest sorted. Composites
+    /// already named stay as written.
     ///
-    /// Composites that occur inside other composites' expansions are
-    /// expanded first, so a graph that spells a larger composite partly
-    /// with them recomposes as the fully decomposed graph does. Recognition
-    /// then runs from the outputs back: the outermost composite claims its
-    /// nodes before a smaller one could match part of them.
+    /// Composites that occur inside other composites' expansions (the
+    /// activations, softmaxes and norms) are recognized first, so the larger
+    /// ones match them by name, as a graph that names them already does.
+    /// Recognition then runs from the outputs back: the outermost composite
+    /// claims its nodes before a smaller one could match part of them.
     pub fn recompose(&self) -> Graph {
+        self.recompose_where(|_, _| true)
+    }
+
+    /// [`Graph::recompose`] restricted to composites whose gradient is
+    /// exactly their decomposition's ([`Op::differentiates_as_decomposed`]),
+    /// so recognizing a training graph never changes what it learns.
+    pub fn recompose_for_training(&self) -> Graph {
+        self.recompose_where(|op, inputs| op.differentiates_as_decomposed(inputs.len()))
+    }
+
+    fn recompose_where(&self, allow: impl Fn(&Op, &[NodeId]) -> bool) -> Graph {
         let mut graph = self.deep_clone();
         graph.canonicalize_attributes();
-        let mut graph = graph.decompose_where(is_nested);
+        if graph.canonicalize_primitives() {
+            // Recognition walks the ids from the outputs back.
+            graph = graph.into_toposort();
+        }
         let mut templates = HashMap::new();
+        graph.recognize(|op, ins| is_nested(op) && allow(op, ins), &mut templates);
+        graph.recognize(|op, ins| !is_nested(op) && allow(op, ins), &mut templates);
+        // Drop what the composites superseded, so later passes see a graph
+        // the size of the one written with composites.
+        crate::optimize::sweep_dead_nodes(&mut graph);
+        graph.into_toposort()
+    }
+
+    /// One sweep from the outputs back, replacing each node that roots the
+    /// expansion of a composite `allow` picks by that composite.
+    fn recognize(&mut self, allow: impl Fn(&Op, &[NodeId]) -> bool, templates: &mut Templates) {
         // Reshapes of each node: a guess finds an input up to the reshapes
         // around it, and the input is whichever one the expansion reads.
         let mut views: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
-        for node in &graph.nodes {
+        for node in &self.nodes {
             if matches!(node.op, Op::Identity) {
                 views.entry(node.inputs[0]).or_default().push(node.id);
             }
         }
-        for id in (0..graph.nodes.len() as NodeId).rev() {
-            if matches!(graph.node(id).op, Op::Nop) {
+        for id in (0..self.nodes.len() as NodeId).rev() {
+            if matches!(self.node(id).op, Op::Nop) {
                 continue;
             }
             // Of the composites the node is the root of, the largest: a
             // smaller one matching is only part of it.
             let mut best: Option<(usize, Op, Vec<NodeId>)> = None;
-            for (op, inputs) in guesses(&graph, id) {
-                for inputs in input_variants(&graph, &views, &inputs) {
-                    if let Some(size) = graph.expands_to(id, &op, &inputs, &mut templates)
+            for (op, inputs) in guesses(self, id) {
+                if !allow(&op, &inputs) {
+                    continue;
+                }
+                for inputs in input_variants(self, &views, &inputs) {
+                    if let Some(size) = self.expands_to(id, &op, &inputs, templates)
                         && best.as_ref().is_none_or(|b| size > b.0)
                     {
                         best = Some((size, op.clone(), inputs));
@@ -790,16 +815,51 @@ impl Graph {
                 }
             }
             if let Some((_, op, inputs)) = best {
-                let node = &mut graph.nodes[id as usize];
+                let node = &mut self.nodes[id as usize];
                 node.op = op;
                 node.inputs = inputs;
                 node.matmul_impl = None;
             }
         }
-        // Drop what the composites superseded, so later passes see a graph
-        // the size of the one written with composites.
-        crate::optimize::sweep_dead_nodes(&mut graph);
-        graph.into_toposort()
+    }
+
+    /// Rewrite primitive spellings that differ from the expansions' only
+    /// by an exact identity: `recip(sqrt(x))` is `rsqrt(x)`, and the
+    /// reciprocal of a row broadcast is the broadcast of the reciprocal.
+    /// Whether it appended nodes.
+    fn canonicalize_primitives(&mut self) -> bool {
+        let before = self.nodes.len();
+        for id in 0..before {
+            let Op::Recip = self.nodes[id].op else {
+                continue;
+            };
+            let src = self.nodes[id].inputs[0];
+            match self.nodes[src as usize].op {
+                Op::Sqrt => {
+                    let x = self.nodes[src as usize].inputs[0];
+                    self.nodes[id].op = Op::Rsqrt;
+                    self.nodes[id].inputs = vec![x];
+                }
+                Op::BroadcastInner { .. } => {
+                    // bcast(recip(s)), with a fresh recip of the row values.
+                    let s_id = self.nodes[src as usize].inputs[0];
+                    let bcast = self.nodes[src as usize].op.clone();
+                    let mut ty = self.nodes[s_id as usize].ty.clone();
+                    ty.dtype = self.nodes[id].ty.dtype;
+                    let inner = match self.nodes[s_id as usize].op {
+                        Op::Sqrt => {
+                            let x = self.nodes[s_id as usize].inputs[0];
+                            self.add_raw_node(Op::Rsqrt, vec![x], ty)
+                        }
+                        _ => self.add_raw_node(Op::Recip, vec![s_id], ty),
+                    };
+                    self.nodes[id].op = bcast;
+                    self.nodes[id].inputs = vec![inner];
+                }
+                _ => {}
+            }
+        }
+        self.nodes.len() > before
     }
 
     /// Give composites the one spelling their expansion determines, where
@@ -881,7 +941,7 @@ impl Graph {
         root: NodeId,
         op: &Op,
         inputs: &[NodeId],
-        templates: &mut HashMap<String, Option<(Graph, NodeId)>>,
+        templates: &mut Templates,
     ) -> Option<usize> {
         if op.class() != OpClass::Composite || inputs.iter().any(|&i| i >= root) {
             return None;
@@ -906,6 +966,9 @@ impl Graph {
         .then_some(template.nodes().len())
     }
 }
+
+/// Verified templates by op and types: the expansion and its root.
+type Templates = HashMap<String, Option<(Graph, NodeId)>>;
 
 /// Where a RoPE row sits: its index plus a static offset and an optional
 /// `U32` scalar buffer, or an explicit `U32` position per row.
@@ -994,8 +1057,9 @@ fn is_nested(op: &Op) -> bool {
     )
 }
 
-/// The full decomposition of `op` over placeholder inputs of `types`, and
-/// its root. Placeholders are the first nodes.
+/// The decomposition of `op` over placeholder inputs of `types` into
+/// primitives and [nested](is_nested) composites, and its root.
+/// Placeholders are the first nodes.
 fn template(op: &Op, types: &[&TensorType], ty: &TensorType) -> Option<(Graph, NodeId)> {
     let mut graph = Graph::new();
     let placeholders: Vec<NodeId> = types
@@ -1013,7 +1077,12 @@ fn template(op: &Op, types: &[&TensorType], ty: &TensorType) -> Option<(Graph, N
         .collect();
     let top = graph.expand(op, &placeholders, ty);
     graph.set_outputs(vec![top]);
-    let full = graph.decompose();
+    // Nested composites recognized as in the graph's first sweep, so both
+    // name them over the same views.
+    let mut full = graph.decompose();
+    if !is_nested(op) {
+        full.recognize(|op, _| is_nested(op), &mut HashMap::new());
+    }
     let top = full.outputs()[0];
     Some((full, top))
 }
@@ -1078,9 +1147,7 @@ fn accepts(op: &Op, ins: &[&TensorType], out: &TensorType) -> bool {
                 && ins[0] == out
                 && matrix(ins[1]).is_some_and(|(m, d)| out.shape == [m * p, d])
         }
-        Op::ExclusiveCumsum { .. } | Op::ShiftInner { .. } => {
-            arity(1) && ins[0] == out && matrix(out).is_some()
-        }
+        Op::ShiftInner { .. } => arity(1) && ins[0] == out && matrix(out).is_some(),
         Op::CrossEntropyLoss => {
             arity(2) && matrix(ins[0]).is_some() && ins[1] == ins[0] && out.shape == [1]
         }
@@ -1321,7 +1388,7 @@ fn same_op(a: &Op, b: &Op) -> bool {
         (Some(x), Some(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits())
         }
-        (None, None) => format!("{a:?}") == format!("{b:?}"),
+        (None, None) => super::key::structural_key(a) == super::key::structural_key(b),
         _ => false,
     }
 }
@@ -1387,13 +1454,12 @@ fn guesses(g: &Graph, root: NodeId) -> Vec<(Op, Vec<NodeId>)> {
                 if is(g, b, |op| matches!(op, Op::Sigmoid)) {
                     out.push((Op::Gelu, vec![a]));
                 }
-                // glu: (gate · sigmoid(·)) · up
-                if is(g, a, |op| matches!(op, Op::Mul)) {
-                    for (gate, s) in operands(g, a) {
-                        if is(g, s, |op| matches!(op, Op::Sigmoid)) {
-                            out.push((Op::SwiGLU, vec![gate, b]));
-                            out.push((Op::GeGLU, vec![gate, b]));
-                        }
+                // glu: act(gate) · up
+                if let Some(gate) = input(g, a, 0) {
+                    match g.node(a).op {
+                        Op::Silu => out.push((Op::SwiGLU, vec![gate, b])),
+                        Op::Gelu => out.push((Op::GeGLU, vec![gate, b])),
+                        _ => {}
                     }
                 }
                 // per-channel gate over flat planes: view(src) · bcast(view(gate))
@@ -1418,54 +1484,15 @@ fn guesses(g: &Graph, root: NodeId) -> Vec<(Op, Vec<NodeId>)> {
             }
         }
         Op::BiasAdd => {
-            // layer_norm: ((x - mean) · inv ⊙ w) + b
-            if let (Some(scaled), Some(b)) = (input(g, core, 0), input(g, core, 1))
-                && is(g, scaled, |op| matches!(op, Op::BiasMul))
-                && let (Some(normalized), Some(w)) = (input(g, scaled, 0), input(g, scaled, 1))
+            // layer_norm: rms_norm(x - mean, w) + b
+            if let (Some(norm), Some(b)) = (input(g, core, 0), input(g, core, 1))
+                && is(g, norm, |op| matches!(op, Op::RmsNorm { .. }))
+                && let (Some(centered), Some(w)) = (input(g, norm, 0), input(g, norm, 1))
+                && let Op::RmsNorm { eps } = g.node(norm).op
+                && let Some(x) = input(g, centered, 0)
             {
-                for (centered, inv) in operands(g, normalized) {
-                    if let Some(eps) = norm_eps(g, inv)
-                        && let Some(x) = input(g, centered, 0)
-                    {
-                        out.push((Op::LayerNorm { eps }, vec![unview(g, x), w, b]));
-                        out.push((Op::LayerNorm { eps }, vec![x, w, b]));
-                    }
-                }
-            }
-            // group_norm: view(groups normalized ⊙ spread(w)) + spread(b)
-            if let (Some(scaled), Some(spread_b)) = (input(g, core, 0), input(g, core, 1)) {
-                let scaled = unview(g, scaled);
-                if is(g, scaled, |op| matches!(op, Op::BiasMul))
-                    && let (Some(normalized), Some(spread_w)) =
-                        (input(g, scaled, 0), input(g, scaled, 1))
-                {
-                    let normalized = unview(g, normalized);
-                    let spread = |id: NodeId| input(g, unview(g, id), 0).map(|c| unview(g, c));
-                    if let (Some(w), Some(bias)) = (spread(spread_w), spread(spread_b)) {
-                        for (centered, inv) in operands(g, normalized) {
-                            if let Some(eps) = norm_eps(g, inv)
-                                && let Some(groups) = input(g, centered, 0)
-                            {
-                                let channels = g.node(w).ty.num_elements() as u32;
-                                let group_len =
-                                    g.node(groups).ty.shape.get(1).copied().unwrap_or(0);
-                                let plane = g.node(scaled).ty.shape.get(1).copied().unwrap_or(0);
-                                if channels > 0 && group_len > 0 && plane % channels as usize == 0 {
-                                    let spatial = (plane / channels as usize) as u32;
-                                    out.push((
-                                        Op::GroupNorm {
-                                            num_groups: (plane / group_len) as u32,
-                                            eps,
-                                            channels,
-                                            spatial,
-                                        },
-                                        vec![unview(g, groups), w, bias],
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
+                out.push((Op::LayerNorm { eps }, vec![unview(g, x), w, b]));
+                out.push((Op::LayerNorm { eps }, vec![x, w, b]));
             }
             // add_per_channel: view(src) + spread(bias)
             if let (Some(src), Some(bias)) = (input(g, core, 0), input(g, core, 1)) {
@@ -1482,6 +1509,12 @@ fn guesses(g: &Graph, root: NodeId) -> Vec<(Op, Vec<NodeId>)> {
                         vec![unview(g, src), bias],
                     ));
                 }
+            }
+        }
+        Op::AddPerChannel { .. } => {
+            // group_norm: add_per_channel(view(groups normalized ⊙ spread(w)), b)
+            if let (Some(scaled), Some(bias)) = (input(g, core, 0), input(g, core, 1)) {
+                out.extend(group_norm_guess(g, scaled, bias));
             }
         }
         Op::Add => {
@@ -1524,13 +1557,12 @@ fn guesses(g: &Graph, root: NodeId) -> Vec<(Op, Vec<NodeId>)> {
                 {
                     // mean_all: sum · 1/n
                     out.push((Op::MeanAll, vec![terms]));
-                    // cross entropy: -Σ labels · log_softmax(logits) / B, the
-                    // log-softmax being (logits - max) - lse
+                    // cross entropy: -Σ labels · log_softmax(logits) / B
                     for (labels, log_p) in operands(g, terms) {
-                        if let Some(shifted) = input(g, log_p, 0)
-                            && let Some(logits) = input(g, shifted, 0)
+                        if is(g, log_p, |op| matches!(op, Op::LogSoftmax))
+                            && let Some(logits) = input(g, log_p, 0)
                         {
-                            out.push((Op::CrossEntropyLoss, vec![unview(g, logits), labels]));
+                            out.push((Op::CrossEntropyLoss, vec![logits, labels]));
                         }
                     }
                     // bce: -mean(t·log p + (1-t)·log(1-p)), p = clamp(pred)
@@ -1594,17 +1626,6 @@ fn guesses(g: &Graph, root: NodeId) -> Vec<(Op, Vec<NodeId>)> {
                 && let Some((left, pairs)) = repeated_rows(g, left)
             {
                 out.push((Op::PairwiseSquaredDistance { pairs }, vec![left, right]));
-            }
-        }
-        Op::MatMul => {
-            // exclusive cumsum: x · triangular constant
-            if let (Some(x), Some(u)) = (input(g, core, 0), input(g, core, 1))
-                && let Op::Constant { ref data } = g.node(u).op
-                && let [n, cols] = g.node(u).ty.shape[..]
-                && n == cols
-            {
-                let reverse = n > 1 && data[n] == 1.0;
-                out.push((Op::ExclusiveCumsum { reverse }, vec![x]));
             }
         }
         Op::Greater => {
@@ -1794,13 +1815,10 @@ fn attention_guess(g: &Graph, product: NodeId, keep: Option<NodeId>) -> Vec<(Op,
     let Some(v) = heads_source(g, vh) else {
         return out;
     };
-    // softmax(scores): exp(scores - max) · ...
     let softmax = unview(g, weights);
-    let Some(scores) = operands(g, softmax).into_iter().find_map(|(e, _)| {
-        matches!(g.node(e).op, Op::Exp)
-            .then(|| input(g, e, 0).and_then(|s| input(g, s, 0)))
-            .flatten()
-    }) else {
+    let Some(scores) =
+        input(g, softmax, 0).filter(|_| is(g, softmax, |op| matches!(op, Op::Softmax)))
+    else {
         return out;
     };
     let mut scores = unview(g, scores);
@@ -1840,10 +1858,11 @@ fn attention_guess(g: &Graph, product: NodeId, keep: Option<NodeId>) -> Vec<(Op,
             let Some((qh, q, k, _)) = qh_of(direct) else {
                 continue;
             };
-            // permute(batch_matmul(permute(batch_matmul_bt(qh, rh)), select))
+            // permute(gather(view(permute(batch_matmul_bt(qh, rh)))))
             let rel = (|| {
-                let by_row = input(g, input(g, relative, 0)?, 0)?;
-                let by_offset = input(g, by_row, 0)?;
+                let gathered = unview(g, input(g, relative, 0)?);
+                let table = unview(g, input(g, gathered, 1)?);
+                let by_offset = unview(g, input(g, table, 0)?);
                 heads_source(g, input(g, by_offset, 1)?)
             })();
             let (Some(rel), Some(&[heads, _, dim])) = (rel, Some(&g.node(qh).ty.shape[..])) else {
@@ -2010,6 +2029,45 @@ fn biased_guess(
             )]
         })
         .unwrap_or_default()
+}
+
+/// Group norm whose per-channel bias add is over `scaled`:
+/// `view(groups normalized ⊙ spread(w))`.
+fn group_norm_guess(g: &Graph, scaled: NodeId, bias: NodeId) -> Vec<(Op, Vec<NodeId>)> {
+    let mut out = Vec::new();
+    let scaled = unview(g, scaled);
+    if !is(g, scaled, |op| matches!(op, Op::BiasMul)) {
+        return out;
+    }
+    let (Some(normalized), Some(spread_w)) = (input(g, scaled, 0), input(g, scaled, 1)) else {
+        return out;
+    };
+    let normalized = unview(g, normalized);
+    let Some(w) = input(g, unview(g, spread_w), 0).map(|c| unview(g, c)) else {
+        return out;
+    };
+    for (centered, inv) in operands(g, normalized) {
+        if let Some(eps) = norm_eps(g, inv)
+            && let Some(groups) = input(g, centered, 0)
+        {
+            let channels = g.node(w).ty.num_elements() as u32;
+            let group_len = g.node(groups).ty.shape.get(1).copied().unwrap_or(0);
+            let plane = g.node(scaled).ty.shape.get(1).copied().unwrap_or(0);
+            if channels > 0 && group_len > 0 && plane % channels as usize == 0 {
+                let spatial = (plane / channels as usize) as u32;
+                out.push((
+                    Op::GroupNorm {
+                        num_groups: (plane / group_len) as u32,
+                        eps,
+                        channels,
+                        spatial,
+                    },
+                    vec![unview(g, groups), w, bias],
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// The epsilon of `bcast(rsqrt(mean(·) + eps))`.

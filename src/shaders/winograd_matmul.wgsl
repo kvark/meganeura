@@ -50,7 +50,8 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let a_row = tile_row + row_local;
             let a_col = t + col_local;
             let ib = a_row < m && a_col < k;
-            shared_a[row_local * 16u + col_local] = select(0.0, matrix_a[plane_a + a_row * k + a_col], ib);
+            // `select` evaluates both arms: an index past the end reads the plane's first.
+            shared_a[row_local * 16u + col_local] = select(0.0, matrix_a[plane_a + select(0u, a_row * k + a_col, ib)], ib);
         }
 
         // Load B tile: B[z, K, N] → shared_b[16, 64]
@@ -61,7 +62,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let b_row = t + row_local;
             let b_col = tile_col + col_local;
             let ib = b_row < k && b_col < n;
-            shared_b[row_local * 64u + col_local] = select(0.0, matrix_b[plane_b + b_row * n + b_col], ib);
+            shared_b[row_local * 64u + col_local] = select(0.0, matrix_b[plane_b + select(0u, b_row * n + b_col, ib)], ib);
         }
 
         workgroupBarrier();

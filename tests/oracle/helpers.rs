@@ -331,7 +331,13 @@ fn t5_blocks_take_the_fused_path() {
                 .any(|s| matches!(s, ShaderEntry::BatchMatMulBT | ShaderEntry::Permute)),
             "{what} fell back to primitive attention: {shaders:?}"
         );
-        assert_eq!(p.signature(), plan(&g.decompose()).signature(), "{what}");
+        let decomposed = plan(&g.decompose());
+        assert_eq!(
+            p.dispatch_inventory(),
+            decomposed.dispatch_inventory(),
+            "{what}"
+        );
+        assert_eq!(p.dataflow_digest(), decomposed.dataflow_digest(), "{what}");
     };
 
     let mut g = Graph::new();

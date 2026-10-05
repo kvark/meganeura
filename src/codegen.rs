@@ -308,7 +308,7 @@ pub fn matmul_prologue_to_wgsl(
                 cache_inits.push(format!(
                     "    if lid.x < {output_tile}u {{\n\
                      \x20       let gr = tile_row + lid.x;\n\
-                     \x20       {cache_name}[lid.x] = select(0.0, {buf_name}[gr], gr < m);\n\
+                     \x20       {cache_name}[lid.x] = select(0.0, {buf_name}[select(0u, gr, gr < m)], gr < m);\n\
                      \x20   }}"
                 ));
                 // Access: use shared cache with row index relative to tile_row.
@@ -509,7 +509,7 @@ fn generate_partitioned_matmul(
         _ => panic!("epilogue fusion not supported for {:?}", group),
     };
     let fused_expr = if splits > 1 && !fused_expr.is_empty() {
-        " + select(0.0, src[idx - split_id * params.m * params.n], split_id == 0u)"
+        " + select(0.0, src[select(0u, idx, split_id == 0u)], split_id == 0u)"
     } else {
         fused_expr
     };
@@ -1435,13 +1435,13 @@ fn matmul_vars_tiled(
         WeightFormat::F32 => (
             "",
             "array<f32>",
-            format!("$B_BUFFER[{}]", b_idx),
+            format!("$B_BUFFER[select(0u, {}, in_bounds)]", b_idx),
             String::new(),
         ),
         WeightFormat::F16 => (
             "enable f16;",
             "array<f16>",
-            format!("f32($B_BUFFER[{}])", b_idx),
+            format!("f32($B_BUFFER[select(0u, {}, in_bounds)])", b_idx),
             String::new(),
         ),
         WeightFormat::Q4 => (

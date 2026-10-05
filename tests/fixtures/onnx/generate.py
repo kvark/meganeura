@@ -1,10 +1,13 @@
-"""Generate transformer-layer ONNX fixtures as `torch.onnx.export` writes them.
+"""Generate transformer-layer ONNX fixtures in the form PyTorch's exporter writes.
 
-Each model is spelled node for node the way PyTorch's exporter emits a
-Hugging Face layer with static shapes: linear layers as MatMul + Add,
+The models are authored here node by node with `onnx.helper`, not produced
+by `torch.onnx.export`: each follows the pattern the exporter emits for a
+Hugging Face layer with static shapes (linear layers as MatMul + Add,
 attention heads through Reshape and Transpose, decomposed normalizations,
-and activations as elementary math. The expected output comes from ONNX's
-own reference evaluator, independent of Meganeura.
+activations as elementary math), so a change in the exporter's output is
+not covered. `scripts/export_onnx.py` exports whole models with the
+exporter itself. The expected output comes from ONNX's own reference
+evaluator, independent of Meganeura.
 
     pip install onnx numpy
     python tests/fixtures/onnx/generate.py

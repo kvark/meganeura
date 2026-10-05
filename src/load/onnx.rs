@@ -2075,7 +2075,7 @@ mod tests {
             assert!((g - w).abs() < 1e-6, "{g} vs {w}");
         }
 
-        let optimized = crate::optimize::optimize(&model.graph);
+        let optimized = crate::optimize::optimize(&model.graph.recompose());
         let output = optimized.node(optimized.outputs()[0]);
         assert!(fused(&output.op), "got {:?}", output.op);
         assert!(

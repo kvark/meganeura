@@ -394,6 +394,18 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, optimiz
     (session, report)
 }
 
+/// `graph` with the composites spelled in primitives recognized: all of
+/// them for inference, only those with exact gradients for training, and
+/// none when optimization is off, so that mode builds the graph as written.
+pub(crate) fn recognize(graph: &Graph, mode: Mode, optimize: &optimize::OptimizeConfig) -> Graph {
+    let _span = tracing::info_span!("recompose").entered();
+    match (optimize.mode, mode) {
+        (optimize::OptimizeMode::Off, _) => graph.deep_clone(),
+        (_, Mode::Inference) => graph.recompose(),
+        (_, Mode::Training) => graph.recompose_for_training(),
+    }
+}
+
 fn prepare_graph(
     forward_graph: &Graph,
     mode: Mode,
@@ -402,10 +414,7 @@ fn prepare_graph(
 ) -> (Graph, optimize::OptimizeReport) {
     // Composites written as their decompositions build as the composites,
     // so their fused kernels and gradients apply.
-    let recomposed = {
-        let _span = tracing::info_span!("recompose").entered();
-        forward_graph.recompose()
-    };
+    let recomposed = recognize(forward_graph, mode, &optimize);
     let forward_graph = &recomposed;
     let (optimized_forward, forward_report) = {
         let _span = tracing::info_span!("optimize_forward").entered();
@@ -524,7 +533,7 @@ pub fn build_session_unoptimized(forward_graph: &Graph) -> Session {
 pub fn compile_training_graph(
     forward_graph: &Graph,
 ) -> (crate::compile::ExecutionPlan, optimize::OptimizeReport) {
-    let optimized_forward = optimize::optimize(&forward_graph.recompose()).toposort();
+    let optimized_forward = optimize::optimize(&forward_graph.recompose_for_training()).toposort();
     let full_graph = autodiff::differentiate(&optimized_forward);
     let (optimized, report) = optimize::optimize_with_report(&full_graph);
     let plan = compile::compile(&optimized);
