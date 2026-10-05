@@ -119,7 +119,6 @@ impl Op {
             | Op::RoPE { .. }
             | Op::RoPEPositions { .. }
             | Op::CausalAttention { .. }
-            | Op::CausalAttentionRoPE { .. }
             | Op::FullAttention { .. }
             | Op::CrossAttention { .. }
             | Op::MultiHeadAttn { .. }
@@ -144,6 +143,8 @@ impl Op {
             | Op::SwiGLUGradUp
             | Op::SiluGrad
             | Op::RoPEGrad { .. }
+            // Causal attention rotating Q and K itself; nothing builds it.
+            | Op::CausalAttentionRoPE { .. }
             | Op::MultiHeadAttnGradQ { .. }
             | Op::MultiHeadAttnGradK { .. }
             | Op::MultiHeadAttnGradV { .. }

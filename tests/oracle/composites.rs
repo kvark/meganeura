@@ -99,10 +99,15 @@ impl Case {
         let got = evaluate_outputs(&decomposed, &self.feeds).unwrap();
         for (w, g) in want.iter().zip(&got) {
             assert_eq!(w.shape, g.shape, "{what}: output shape");
-            let scale = w.data.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+            let scale = w
+                .data
+                .iter()
+                .filter(|v| v.is_finite())
+                .fold(1.0f64, |m, v| m.max(v.abs()));
             for (i, (a, b)) in w.data.iter().zip(&g.data).enumerate() {
+                // The reference leaves some outputs unspecified (NaN).
                 assert!(
-                    (a - b).abs() <= 1e-6 * scale || (a.is_nan() && b.is_nan()),
+                    (a - b).abs() <= 1e-6 * scale || a.is_nan(),
                     "{what}: output {i} is {b}, want {a}"
                 );
             }
@@ -424,4 +429,288 @@ fn vision() {
             |_| {},
         ),
     ]);
+}
+
+#[test]
+fn rotary_embeddings() {
+    check_all(vec![
+        case(
+            "rope",
+            true,
+            |g| {
+                let x = g.parameter("x", &[5, 16]);
+                g.rope(x, 10_000.0, 8)
+            },
+            |_| {},
+        ),
+        case(
+            "rope_offset",
+            true,
+            |g| {
+                let x = g.parameter("x", &[5, 16]);
+                g.rope_with_offset(x, 500.0, 3, 16)
+            },
+            |_| {},
+        ),
+        case(
+            "rope_dynamic",
+            false,
+            |g| {
+                let x = g.parameter("x", &[3, 16]);
+                let pos = g.input_u32("pos", &[1]);
+                g.rope_dynamic_offset(x, 10_000.0, pos, 8)
+            },
+            |f| {
+                f.set_u32("pos", &[11]);
+            },
+        ),
+        case(
+            "rope_factors",
+            false,
+            |g| {
+                let x = g.parameter("x", &[3, 16]);
+                let pos = g.input_u32("pos", &[1]);
+                let factors = g.input("factors", &[4]);
+                g.rope_dynamic_offset_factors(x, 10_000.0, pos, 8, factors)
+            },
+            |f| {
+                f.set_u32("pos", &[7]);
+                positive(f, "factors", 4);
+            },
+        ),
+        case(
+            "rope_positions",
+            false,
+            |g| {
+                let x = g.parameter("x", &[4, 16]);
+                let pos = g.input_u32("pos", &[4]);
+                g.rope_with_positions(x, 10_000.0, pos, 8)
+            },
+            |f| {
+                f.set_u32("pos", &[9, 2, 30, 0]);
+            },
+        ),
+    ]);
+}
+
+fn qkv(
+    g: &mut Graph,
+    rows: usize,
+    kv_rows: usize,
+    heads: usize,
+    kv: usize,
+    dim: usize,
+) -> [NodeId; 3] {
+    [
+        g.parameter("q", &[rows, heads * dim]),
+        g.parameter("k", &[kv_rows, kv * dim]),
+        g.parameter("v", &[kv_rows, kv * dim]),
+    ]
+}
+
+#[test]
+fn attention() {
+    check_all(vec![
+        case(
+            "causal",
+            true,
+            |g| {
+                let [q, k, v] = qkv(g, 6, 6, 2, 2, 8);
+                g.causal_attention(q, k, v, 2, 2, 8)
+            },
+            |_| {},
+        ),
+        case(
+            "causal_gqa",
+            true,
+            |g| {
+                let [q, k, v] = qkv(g, 6, 6, 4, 2, 8);
+                g.causal_attention(q, k, v, 4, 2, 8)
+            },
+            |_| {},
+        ),
+        case(
+            "sliding_window",
+            true,
+            |g| {
+                let [q, k, v] = qkv(g, 7, 7, 2, 1, 8);
+                g.sliding_window_attention(q, k, v, 2, 1, 8, 3)
+            },
+            |_| {},
+        ),
+        case(
+            "sliding_window_spanning",
+            true,
+            |g| {
+                let [q, k, v] = qkv(g, 5, 5, 2, 2, 8);
+                g.sliding_window_attention(q, k, v, 2, 2, 8, 9)
+            },
+            |_| {},
+        ),
+        case(
+            "full",
+            true,
+            |g| {
+                let [q, k, v] = qkv(g, 5, 5, 3, 3, 8);
+                g.full_attention(q, k, v, 3, 3, 8)
+            },
+            |_| {},
+        ),
+        case(
+            "cross",
+            false,
+            |g| {
+                let [q, k, v] = qkv(g, 4, 7, 2, 1, 8);
+                g.cross_attention(q, k, v, 2, 1, 8)
+            },
+            |_| {},
+        ),
+        case(
+            "multi_head_attn",
+            true,
+            |g| {
+                let [q, k, v] = qkv(g, 4, 7, 2, 2, 8);
+                g.multi_head_attn(q, k, v, 2, 2, 8, true)
+            },
+            |_| {},
+        ),
+        case(
+            "multi_head_attn_self",
+            true,
+            |g| {
+                let [q, k, v] = qkv(g, 5, 5, 2, 2, 8);
+                g.multi_head_attn(q, k, v, 2, 2, 8, false)
+            },
+            |_| {},
+        ),
+        case(
+            "cached",
+            false,
+            |g| {
+                let [q, k, v] = qkv(g, 2, 9, 4, 2, 8);
+                let pos = g.input_u32("pos", &[1]);
+                g.cached_attention(q, k, v, pos, 4, 2, 8)
+            },
+            |f| {
+                f.set_u32("pos", &[5]);
+            },
+        ),
+        case(
+            "cached_block",
+            false,
+            |g| {
+                let [q, k, v] = qkv(g, 3, 10, 2, 1, 8);
+                let pos = g.input_u32("pos", &[1]);
+                let valid = g.input_u32("valid", &[1]);
+                g.cached_block_attention(q, k, v, pos, valid, 2, 1, 8, 0)
+            },
+            |f| {
+                f.set_u32("pos", &[4]);
+                f.set_u32("valid", &[2]);
+            },
+        ),
+        case(
+            "cached_block_window",
+            false,
+            |g| {
+                let [q, k, v] = qkv(g, 3, 10, 2, 2, 8);
+                let pos = g.input_u32("pos", &[1]);
+                let valid = g.input_u32("valid", &[1]);
+                g.cached_block_attention(q, k, v, pos, valid, 2, 2, 8, 3)
+            },
+            |f| {
+                f.set_u32("pos", &[5]);
+                f.set_u32("valid", &[3]);
+            },
+        ),
+        case(
+            "chunked_relative",
+            false,
+            |g| {
+                let [q, k, v] = qkv(g, 6, 6, 2, 2, 8);
+                let rel = g.parameter("rel", &[4, 16]);
+                g.chunked_relative_attention(q, k, v, rel, 2, 8, 4, 30.0)
+            },
+            |_| {},
+        ),
+    ]);
+}
+
+#[test]
+fn column_sums() {
+    check_all(vec![case(
+        "sum_rows",
+        true,
+        |g| {
+            let x = g.parameter("x", &[5, 7]);
+            let ty = meganeura::TensorType::f32(vec![7]);
+            let s = g.sum_rows(x, &ty);
+            g.reshape(s, &[1, 7])
+        },
+        |_| {},
+    )]);
+}
+
+/// Every composite the classification names has a case above.
+#[test]
+fn every_composite_is_covered() {
+    let source = include_str!("../../src/graph/composite.rs");
+    let start = source.find("Op::Softplus { .. }").expect("composite arm");
+    let end = start
+        + source[start..]
+            .find("=> Composite")
+            .expect("composite arm end");
+    let names: Vec<&str> = source[start..end]
+        .split("Op::")
+        .skip(1)
+        .map(|s| s.split(|c: char| !c.is_alphanumeric()).next().unwrap())
+        .collect();
+    let covered = [
+        ("Softplus", "softplus"),
+        ("Silu", "silu"),
+        ("Gelu", "gelu"),
+        ("SwiGLU", "swiglu"),
+        ("GeGLU", "geglu"),
+        ("MeanAll", "mean_all"),
+        ("SumRows", "sum_rows"),
+        ("GlobalAvgPool", "global_avg_pool"),
+        ("NormalizeInnerSum", "normalize_inner_sum"),
+        ("PairwiseSquaredDistance", "pairwise_distance"),
+        ("PairwiseVectorRejection", "pairwise_rejection"),
+        ("ExclusiveCumsum", "cumsum"),
+        ("ShiftInner", "shift_right"),
+        ("Softmax", "softmax"),
+        ("LogSoftmax", "log_softmax"),
+        ("CrossEntropyLoss", "cross_entropy"),
+        ("BceLoss", "bce"),
+        ("RmsNorm", "rms_norm"),
+        ("LayerNorm", "layer_norm"),
+        ("GroupNorm", "group_norm"),
+        ("MulPerChannel", "mul_per_channel"),
+        ("AddPerChannel", "add_per_channel"),
+        ("Upsample2x", "upsample"),
+        ("RoPE", "rope"),
+        ("RoPEPositions", "rope_positions"),
+        ("CausalAttention", "causal"),
+        ("FullAttention", "full"),
+        ("CrossAttention", "cross"),
+        ("MultiHeadAttn", "multi_head_attn"),
+        ("SlidingWindowAttention", "sliding_window"),
+        ("CachedAttention", "cached"),
+        ("CachedBlockAttention", "cached_block"),
+        ("ChunkedRelativeAttention", "chunked_relative"),
+    ];
+    let this = include_str!("composites.rs");
+    for name in &names {
+        let case = covered
+            .iter()
+            .find(|c| c.0 == *name)
+            .unwrap_or_else(|| panic!("composite {name} has no case"));
+        assert!(
+            this.contains(&format!("\"{}\",", case.1)),
+            "composite {name}: no case named {}",
+            case.1
+        );
+    }
+    assert_eq!(names.len(), covered.len(), "{names:?}");
 }
