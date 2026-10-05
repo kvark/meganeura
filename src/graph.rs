@@ -1,5 +1,8 @@
 use std::fmt;
 
+mod composite;
+pub(crate) use composite::mean_factor;
+
 pub type NodeId = u32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -219,6 +222,14 @@ pub enum Op {
     Log,
     Recip,
     Exp,
+    /// Elementwise square root.
+    Sqrt,
+    /// Elementwise reciprocal square root.
+    Rsqrt,
+    /// Add a compile-time scalar to every element.
+    Offset {
+        value: f32,
+    },
     /// Numerically stable `ln(1 + exp(beta * x)) / beta`.
     Softplus {
         beta: f32,
@@ -248,6 +259,8 @@ pub enum Op {
     /// so the fusion pass can fold a pointwise/gather producer into its
     /// prologue. The differentiable equivalent of `matmul(x, ones[N,1])`.
     SumInner,
+    /// Row-wise maximum over the inner axis: `[M, N]` → `[M, 1]`.
+    MaxInner,
     /// Backward helper for [`Op::SumInner`]: repeat each `[M, 1]` row across
     /// the inner axis, `[M, 1]` → `[M, N]`.
     BroadcastInner {
@@ -1475,6 +1488,29 @@ impl Graph {
         self.add_node(Op::Exp, vec![x], ty)
     }
 
+    pub fn sqrt(&mut self, x: NodeId) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::Sqrt, vec![x], ty)
+    }
+
+    pub fn rsqrt(&mut self, x: NodeId) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::Rsqrt, vec![x], ty)
+    }
+
+    /// Add the compile-time scalar `value` to every element.
+    pub fn add_scalar(&mut self, x: NodeId, value: f32) -> NodeId {
+        assert!(value.is_finite(), "added scalar must be finite");
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::Offset { value }, vec![x], ty)
+    }
+
+    /// Element-wise difference: `a - b` = `a + neg(b)`.
+    pub fn sub(&mut self, a: NodeId, b: NodeId) -> NodeId {
+        let nb = self.neg(b);
+        self.add(a, nb)
+    }
+
     pub fn softplus(&mut self, x: NodeId, beta: f32) -> NodeId {
         assert!(
             beta.is_finite() && beta > 0.0,
@@ -1602,6 +1638,29 @@ impl Graph {
         let m = shape[0];
         let ty = TensorType::f32(vec![m, 1]);
         self.add_node(Op::SumInner, vec![x], ty)
+    }
+
+    /// Row-wise maximum over the inner axis: `x: [M, N] → [M, 1]`.
+    #[track_caller]
+    pub fn max_inner(&mut self, x: NodeId) -> NodeId {
+        let shape = &self.node(x).ty.shape;
+        assert_eq!(
+            shape.len(),
+            2,
+            "max_inner expects a 2D [M, N] input, got shape {shape:?}"
+        );
+        assert!(shape[1] > 0, "max_inner needs a non-empty inner row");
+        let ty = TensorType::f32(vec![shape[0], 1]);
+        self.add_node(Op::MaxInner, vec![x], ty)
+    }
+
+    /// Row-wise mean over the inner axis: `x: [M, N] → [M, 1]`, spelled
+    /// as the sum scaled by `1 / N`.
+    #[track_caller]
+    pub fn mean_inner(&mut self, x: NodeId) -> NodeId {
+        let inner = self.node(x).ty.shape.get(1).copied().unwrap_or(0);
+        let sum = self.sum_inner(x);
+        self.scale(sum, mean_factor(inner))
     }
 
     /// Repeat each scalar row of `x: [M, 1]` across `inner` columns.

@@ -277,6 +277,9 @@ pub fn eval_node(
         | Op::Log
         | Op::Recip
         | Op::Exp
+        | Op::Sqrt
+        | Op::Rsqrt
+        | Op::Offset { .. }
         | Op::Softplus { .. }
         | Op::SoftplusGrad { .. }
         | Op::Clamp { .. }
@@ -285,6 +288,7 @@ pub fn eval_node(
         | Op::MeanAll
         | Op::SumRows
         | Op::SumInner
+        | Op::MaxInner
         | Op::BroadcastInner { .. }
         | Op::NormalizeInnerSum { .. }
         | Op::NormalizeInnerSumGrad { .. }
@@ -490,6 +494,7 @@ fn propagates_scale(op: &Op) -> bool {
                 | Op::Materialize
                 | Op::StopGradient
                 | Op::BroadcastInner { .. }
+                | Op::MaxInner
                 | Op::BiasMul
                 | Op::MulPerChannel { .. }
                 | Op::ShiftInner { .. }

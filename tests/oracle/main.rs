@@ -9,6 +9,7 @@ mod coverage;
 mod fuzz;
 mod losses;
 mod norm;
+mod primitives;
 mod regressions;
 mod smoke;
 mod vision;

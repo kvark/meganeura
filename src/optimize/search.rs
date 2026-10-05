@@ -103,7 +103,8 @@ impl CostModel<Cost> for Excluding {
                             .cmp(func.name())
                             .then_with(|| edge.inputs.as_slice().cmp(enode.children))
                     })
-                    .is_ok(),
+                    .is_ok()
+                    || super::is_pattern_only(func.name()),
             ),
             estimate: self.costs.enode_cost(egraph, func, enode),
             unscheduled: usize::from(super::matrix_family(func.name()) == Some(func.name())),
