@@ -163,6 +163,48 @@ def llama_layer():
     b.finish("llama_layer", x, y, 17)
 
 
+def llama_gqa_dynamic_layer():
+    """LlamaDecoderLayer with grouped-query attention, exported with dynamic
+    batch and sequence axes: reshape targets come from Shape, Gather,
+    Unsqueeze and Concat, and KV heads repeat through Unsqueeze, Expand and
+    Reshape (`repeat_kv`)."""
+    kv_heads = HEADS // 2
+    b = Builder(3)
+    x = "hidden_states"
+    shape = b.op("Shape", x)
+    batch = b.op("Unsqueeze", b.op("Gather", shape, b.const("zero", 0, np.int64), axis=0), b.const("axes", [0], np.int64))
+    seq = b.op("Unsqueeze", b.op("Gather", shape, b.const("one", 1, np.int64), axis=0), b.const("axes", [0], np.int64))
+
+    def dims(*parts):
+        return b.op("Concat", *[p if isinstance(p, str) else b.const("dim", [p], np.int64) for p in parts], axis=0)
+
+    def heads(t, n):
+        t = b.op("Reshape", t, dims(batch, seq, n, HEAD))
+        return b.op("Transpose", t, perm=[0, 2, 1, 3])
+
+    def repeat_kv(t):
+        t = b.op("Unsqueeze", t, b.const("axes", [2], np.int64))
+        t = b.op("Expand", t, dims(batch, kv_heads, HEADS // kv_heads, seq, HEAD))
+        return b.op("Reshape", t, dims(batch, HEADS, seq, HEAD))
+
+    h = b.rms_norm(x)
+    q = heads(b.linear(h, HIDDEN, HIDDEN, bias=False), HEADS)
+    k = repeat_kv(heads(b.linear(h, HIDDEN, kv_heads * HEAD, bias=False), kv_heads))
+    v = repeat_kv(heads(b.linear(h, HIDDEN, kv_heads * HEAD, bias=False), kv_heads))
+    scores = b.op("Div", b.op("MatMul", q, b.op("Transpose", k, perm=[0, 1, 3, 2])), b.const("scale", np.sqrt(HEAD)))
+    causal = np.triu(np.full((SEQ, SEQ), np.finfo(np.float32).min), 1)[None, None]
+    probs = b.op("Softmax", b.op("Add", scores, b.const("mask", causal)), axis=-1)
+    context = b.op("Transpose", b.op("MatMul", probs, v), perm=[0, 2, 1, 3])
+    context = b.op("Reshape", context, dims(batch, seq, HIDDEN))
+    h = b.op("Add", x, b.linear(context, HIDDEN, HIDDEN, bias=False))
+    n = b.rms_norm(h)
+    gate = b.linear(n, HIDDEN, FFN, bias=False)
+    silu = b.op("Mul", gate, b.op("Sigmoid", gate))
+    down = b.linear(b.op("Mul", silu, b.linear(n, HIDDEN, FFN, bias=False)), FFN, HIDDEN, bias=False)
+    b.finish("llama_gqa_dynamic_layer", x, b.op("Add", h, down), 17)
+
+
 if __name__ == "__main__":
     bert_layer()
     llama_layer()
+    llama_gqa_dynamic_layer()

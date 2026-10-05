@@ -21,8 +21,15 @@
   rotary tables and biases broadcast along trailing axes. Reshape honors
   `0` dimensions and shape constants. `tests/fixtures/onnx` holds BERT-
   and Llama-style layer exports with outputs from ONNX's reference
-  evaluator; both run on the GPU and fold their norms, softmax and SwiGLU
+  evaluator; they run on the GPU and fold their norms, softmax and SwiGLU
   into fused kernels.
+- The ONNX importer folds shape arithmetic (`Shape`, `Gather`, `Concat`,
+  `Unsqueeze` on constants), so exports with dynamic axes load; reads
+  `Squeeze`/`Unsqueeze` axes from inputs as opset 13 writes them, inserting
+  several unsqueezed axes in output order and squeezing only the named
+  ones; and expands broadcast axes with `Expand`, as grouped-query
+  attention's `repeat_kv` does. A `Gather` that is neither foldable nor a
+  table lookup by U32 indices is a load error rather than a panic.
 - Keep scalar consumers of cooperative attention staging in f32. Check
   forward, dQ and dK/dV workgroup storage against the selected device's limit
   and include that limit in plan-cache compatibility.

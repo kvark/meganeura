@@ -73,3 +73,12 @@ fn llama_layer() {
         1
     );
 }
+
+#[test]
+fn llama_gqa_dynamic_layer() {
+    let ops = run("llama_gqa_dynamic_layer");
+    assert_eq!(count(&ops, |op| matches!(op, Op::RmsNorm { .. })), 2);
+    assert_eq!(count(&ops, |op| matches!(op, Op::Softmax)), 1);
+    // Shape arithmetic is folded at import: nothing on the GPU computes it.
+    assert_eq!(count(&ops, |op| matches!(op, Op::Constant { .. })), 0);
+}
