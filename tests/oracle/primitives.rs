@@ -214,6 +214,18 @@ fn to_f32() {
     }
 }
 
+/// The squeeze-excite gate, now differentiable.
+#[test]
+fn mul_per_channel_gradient() {
+    let build = |g: &mut Graph| {
+        let x = g.parameter("x", &[2 * 3 * 8]);
+        let gate = g.parameter("gate", &[6]);
+        let y = g.mul_per_channel(x, gate, 3, 8);
+        g.reshape(y, &[6, 8])
+    };
+    grad_case("mul_per_channel", build, |_| {});
+}
+
 /// Values a step away from both bounds, so finite differences never
 /// straddle one.
 #[test]

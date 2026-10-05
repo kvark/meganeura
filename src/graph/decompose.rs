@@ -731,21 +731,42 @@ impl Graph {
         graph.canonicalize_attributes();
         let mut graph = graph.decompose_where(is_nested);
         let mut templates = HashMap::new();
+        // Reshapes of each node: a guess finds an input up to the reshapes
+        // around it, and the input is whichever one the expansion reads.
+        let mut views: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for node in &graph.nodes {
+            if matches!(node.op, Op::Identity) {
+                views.entry(node.inputs[0]).or_default().push(node.id);
+            }
+        }
         for id in (0..graph.nodes.len() as NodeId).rev() {
             if matches!(graph.node(id).op, Op::Nop) {
                 continue;
             }
+            // Of the composites the node is the root of, the largest: a
+            // smaller one matching is only part of it.
+            let mut best: Option<(usize, Op, Vec<NodeId>)> = None;
             for (op, inputs) in guesses(&graph, id) {
-                if graph.expands_to(id, &op, &inputs, &mut templates) {
-                    let node = &mut graph.nodes[id as usize];
-                    node.op = op;
-                    node.inputs = inputs;
-                    node.matmul_impl = None;
-                    break;
+                for inputs in input_variants(&graph, &views, &inputs) {
+                    if let Some(size) = graph.expands_to(id, &op, &inputs, &mut templates)
+                        && best.as_ref().is_none_or(|b| size > b.0)
+                    {
+                        best = Some((size, op.clone(), inputs));
+                        break;
+                    }
                 }
             }
+            if let Some((_, op, inputs)) = best {
+                let node = &mut graph.nodes[id as usize];
+                node.op = op;
+                node.inputs = inputs;
+                node.matmul_impl = None;
+            }
         }
-        graph
+        // Drop what the composites superseded, so later passes see a graph
+        // the size of the one written with composites.
+        crate::optimize::sweep_dead_nodes(&mut graph);
+        graph.into_toposort()
     }
 
     /// Give composites the one spelling their expansion determines, where
@@ -821,29 +842,27 @@ impl Graph {
     }
 
     /// Whether the graph at `root` is exactly the full decomposition of
-    /// `op` over `inputs`.
+    /// `op` over `inputs`, and if so the decomposition's size.
     fn expands_to(
         &self,
         root: NodeId,
         op: &Op,
         inputs: &[NodeId],
         templates: &mut HashMap<String, Option<(Graph, NodeId)>>,
-    ) -> bool {
+    ) -> Option<usize> {
         if op.class() != OpClass::Composite || inputs.iter().any(|&i| i >= root) {
-            return false;
+            return None;
         }
         let types: Vec<&TensorType> = inputs.iter().map(|&i| &self.node(i).ty).collect();
         let ty = &self.node(root).ty;
         if !accepts(op, &types, ty) {
-            return false;
+            return None;
         }
         let key = format!("{op:?} {types:?} {ty:?}");
         let template = templates
             .entry(key)
             .or_insert_with(|| template(op, &types, ty));
-        let Some(&(ref template, top)) = template.as_ref() else {
-            return false;
-        };
+        let &(ref template, top) = template.as_ref()?;
         Matcher {
             template,
             graph: self,
@@ -851,6 +870,7 @@ impl Graph {
             memo: HashMap::new(),
         }
         .same(top, root)
+        .then_some(template.nodes().len())
     }
 }
 
@@ -882,6 +902,50 @@ impl Heads {
     fn scale(self) -> f32 {
         1.0 / (self.dim as f32).sqrt()
     }
+}
+
+/// `inputs` first, then with inputs swapped for the reshapes around them:
+/// the views of each input, and what an input that is itself a view reads.
+fn input_variants(
+    g: &Graph,
+    views: &HashMap<NodeId, Vec<NodeId>>,
+    inputs: &[NodeId],
+) -> Vec<Vec<NodeId>> {
+    const LIMIT: usize = 32;
+    let choices: Vec<Vec<NodeId>> = inputs
+        .iter()
+        .map(|&i| {
+            let mut near = vec![i];
+            let mut frontier = vec![i];
+            while let Some(n) = frontier.pop() {
+                for &v in views.get(&n).into_iter().flatten() {
+                    if !near.contains(&v) && near.len() < 4 {
+                        near.push(v);
+                        frontier.push(v);
+                    }
+                }
+            }
+            if matches!(g.node(i).op, Op::Identity) && !near.contains(&g.node(i).inputs[0]) {
+                near.push(g.node(i).inputs[0]);
+            }
+            near
+        })
+        .collect();
+    let mut out = vec![Vec::new()];
+    for choice in &choices {
+        out = out
+            .into_iter()
+            .flat_map(|prefix| {
+                choice.iter().map(move |&c| {
+                    let mut next = prefix.clone();
+                    next.push(c);
+                    next
+                })
+            })
+            .take(LIMIT)
+            .collect();
+    }
+    out
 }
 
 /// Composites that appear inside other composites' expansions.
@@ -987,11 +1051,11 @@ fn accepts(op: &Op, ins: &[&TensorType], out: &TensorType) -> bool {
             arity(2) && matrix(ins[0]).is_some() && ins[1] == ins[0] && out.shape == [1]
         }
         Op::BceLoss => arity(2) && ins[1] == ins[0] && out.shape == [1],
+        // Per-channel ops and pooling act on flat NCHW tensors.
         Op::MulPerChannel { spatial, .. } => {
             arity(2)
                 && ins[0] == out
                 && out.rank() == 1
-                && ins[1].rank() == 1
                 && elems(ins[1]) * spatial as usize == elems(out)
         }
         Op::AddPerChannel { channels, spatial } => {
@@ -999,7 +1063,7 @@ fn accepts(op: &Op, ins: &[&TensorType], out: &TensorType) -> bool {
             arity(2)
                 && ins[0] == out
                 && out.rank() == 1
-                && ins[1].shape == [channels as usize]
+                && elems(ins[1]) == channels as usize
                 && plane > 0
                 && elems(out) % plane == 0
         }
@@ -1013,8 +1077,8 @@ fn accepts(op: &Op, ins: &[&TensorType], out: &TensorType) -> bool {
             arity(3)
                 && ins[0] == out
                 && out.rank() == 1
-                && ins[1].shape == [channels as usize]
-                && ins[2].shape == [channels as usize]
+                && elems(ins[1]) == channels as usize
+                && elems(ins[2]) == channels as usize
                 && num_groups > 0
                 && channels % num_groups == 0
                 && plane > 0
@@ -1022,7 +1086,6 @@ fn accepts(op: &Op, ins: &[&TensorType], out: &TensorType) -> bool {
         }
         Op::Upsample2x { in_w, .. } => {
             arity(1)
-                && ins[0].rank() == 1
                 && out.shape == [4 * elems(ins[0])]
                 && in_w > 0
                 && elems(ins[0]) % in_w as usize == 0
@@ -1241,7 +1304,7 @@ fn guesses(g: &Graph, root: NodeId) -> Vec<(Op, Vec<NodeId>)> {
                     && let Some(shifted) = input(g, a, 0)
                     && let Some(x) = input(g, shifted, 0)
                 {
-                    out.push((Op::Softmax, vec![unview(g, x), x]));
+                    out.push((Op::Softmax, vec![x]));
                 }
                 // cached block attention: out · bcast(rows kept)
                 if let Some(perm) = Some(unview(g, a))
@@ -1273,10 +1336,8 @@ fn guesses(g: &Graph, root: NodeId) -> Vec<(Op, Vec<NodeId>)> {
                     && is(g, b, |op| matches!(op, Op::BroadcastInner { .. }))
                 {
                     let (src, gate) = (unview(g, a), unview(g, gate));
-                    if g.node(src).ty.rank() == 1 && g.node(gate).ty.rank() == 1 {
-                        let (channels, spatial) = per_channel_dims(g, node, gate);
-                        out.push((Op::MulPerChannel { channels, spatial }, vec![src, gate]));
-                    }
+                    let (channels, spatial) = per_channel_dims(g, node, gate);
+                    out.push((Op::MulPerChannel { channels, spatial }, vec![src, gate]));
                 }
             }
         }
@@ -1347,10 +1408,7 @@ fn guesses(g: &Graph, root: NodeId) -> Vec<(Op, Vec<NodeId>)> {
                 let bias = input(g, bias, 0).map_or(bias, |b| unview(g, b));
                 let channels = g.node(bias).ty.num_elements() as u32;
                 let plane = g.node(src).ty.shape.get(1).copied().unwrap_or(0) as u32;
-                if channels > 0
-                    && plane.is_multiple_of(channels)
-                    && g.node(unview(g, src)).ty.rank() == 1
-                {
+                if channels > 0 && plane.is_multiple_of(channels) {
                     out.push((
                         Op::AddPerChannel {
                             channels,
@@ -1429,7 +1487,6 @@ fn guesses(g: &Graph, root: NodeId) -> Vec<(Op, Vec<NodeId>)> {
                     let spatial = g.node(planes).ty.shape.get(1).copied().unwrap_or(0);
                     let total = g.node(x).ty.num_elements();
                     if spatial > 0
-                        && g.node(x).ty.rank() == 1
                         && let [batch, channels] = node.ty.shape[..]
                         && batch * channels * spatial == total
                     {
@@ -1552,11 +1609,20 @@ fn scalar_source(g: &Graph, id: NodeId) -> Option<NodeId> {
 
 /// The tensor behind a `split_heads` (or its repetition for grouped KV).
 fn heads_source(g: &Graph, id: NodeId) -> Option<NodeId> {
+    heads_split(g, id).map(|(source, _)| source)
+}
+
+/// The tensor behind a `split_heads`, and the split `[heads, rows, dim]`
+/// itself, before any repetition for grouped KV.
+fn heads_split(g: &Graph, id: NodeId) -> Option<(NodeId, NodeId)> {
     let mut id = unview(g, id);
     while let Op::Concat { .. } = g.node(id).op {
         id = unview(g, input(g, id, 0)?);
     }
-    matches!(g.node(id).op, Op::Permute { .. }).then(|| unview(g, input(g, id, 0)?).into())?
+    if !matches!(g.node(id).op, Op::Permute { .. }) {
+        return None;
+    }
+    Some((unview(g, input(g, id, 0)?), id))
 }
 
 /// A RoPE whose concatenated halves are `concat`.
@@ -1678,10 +1744,10 @@ fn attention_guess(g: &Graph, product: NodeId, keep: Option<NodeId>) -> Vec<(Op,
     let Some(logits) = input(g, scores, 0) else {
         return out;
     };
-    let qh_of = |id: NodeId| -> Option<(NodeId, NodeId, NodeId)> {
+    let qh_of = |id: NodeId| -> Option<(NodeId, NodeId, NodeId, NodeId)> {
         let qh = input(g, id, 0)?;
-        let kh = input(g, id, 1)?;
-        Some((qh, heads_source(g, qh)?, heads_source(g, kh)?))
+        let (k, kh) = heads_split(g, input(g, id, 1)?)?;
+        Some((qh, heads_source(g, qh)?, k, kh))
     };
     // Chunked relative: cap · tanh((q·k + relative) / cap)
     if matches!(g.node(logits).op, Op::Tanh) {
@@ -1689,7 +1755,7 @@ fn attention_guess(g: &Graph, product: NodeId, keep: Option<NodeId>) -> Vec<(Op,
             return out;
         };
         for (direct, relative) in operands(g, sum) {
-            let Some((qh, q, k)) = qh_of(direct) else {
+            let Some((qh, q, k, _)) = qh_of(direct) else {
                 continue;
             };
             // permute(batch_matmul(permute(batch_matmul_bt(qh, rh)), select))
@@ -1713,15 +1779,15 @@ fn attention_guess(g: &Graph, product: NodeId, keep: Option<NodeId>) -> Vec<(Op,
         }
         return out;
     }
-    let Some((qh, q, k)) = qh_of(logits) else {
+    let Some((qh, q, k, kh)) = qh_of(logits) else {
         return out;
     };
-    let &[heads, rows, dim] = &g.node(qh).ty.shape[..] else {
+    let (&[heads, rows, dim], &[kv_heads, keys, _]) =
+        (&g.node(qh).ty.shape[..], &g.node(kh).ty.shape[..])
+    else {
         return out;
     };
-    let kv_heads = (g.node(k).ty.shape[1] / dim) as u32;
-    let (heads, dim) = (heads as u32, dim as u32);
-    let keys = g.node(k).ty.shape[0];
+    let (heads, kv_heads, dim) = (heads as u32, kv_heads as u32, dim as u32);
     match mask.map(|m| unview(g, m)) {
         None => out.push((
             Op::MultiHeadAttn {
