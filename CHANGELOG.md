@@ -14,6 +14,15 @@
   ops broadcast per-row `[M, 1]` values and fold scalar constants. RMSNorm,
   LayerNorm and softmax written this way load as the fused kernels.
   Unsupported broadcasts are load errors rather than panics.
+- New primitives `erf`, `batch_matmul` (with `_at`/`_bt` forms for its
+  gradient) and `permute` (rank at most 4). The ONNX importer uses them to
+  load transformer layers as `torch.onnx.export` writes them: N-D `MatMul`,
+  any `Transpose`, `Slice` and `Concat` on any axis, `Erf`, and masks,
+  rotary tables and biases broadcast along trailing axes. Reshape honors
+  `0` dimensions and shape constants. `tests/fixtures/onnx` holds BERT-
+  and Llama-style layer exports with outputs from ONNX's reference
+  evaluator; both run on the GPU and fold their norms, softmax and SwiGLU
+  into fused kernels.
 - Keep scalar consumers of cooperative attention staging in f32. Check
   forward, dQ and dK/dV workgroup storage against the selected device's limit
   and include that limit in plan-cache compatibility.

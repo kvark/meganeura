@@ -10,7 +10,7 @@ use std::path::Path;
 use oxionnx_core::{Graph as OnnxGraph, Node as OnnxNode, OpKind};
 use oxionnx_proto::model;
 
-use crate::graph::{Graph, NodeId, Op, TensorType};
+use crate::graph::{Graph, NodeId, Op};
 
 /// Result of loading an ONNX model.
 pub struct OnnxModel {
@@ -587,12 +587,7 @@ fn translate_node(
         OpKind::ReduceMean | OpKind::ReduceSum | OpKind::ReduceMax => {
             reduce_op(graph, node, name_to_id, shapes, weights)?;
         }
-        // Needs an erf primitive, which does not exist yet.
-        OpKind::Erf => {
-            return Err(OnnxError::UnsupportedOp(
-                "Erf: export GELU as a Gelu node (opset 20) or with the tanh approximation".into(),
-            ));
-        }
+        OpKind::Erf => unary_op(graph, node, name_to_id, shapes, Op::Erf)?,
 
         // Cast: passthrough (we only support f32)
         OpKind::Cast => {
@@ -628,18 +623,13 @@ fn translate_node(
             let b = resolve_input(&node.inputs[1], name_to_id, &node.name)?;
             let a_shape = get_shape(&node.inputs[0], shapes);
             let b_shape = get_shape(&node.inputs[1], shapes);
-            // Flatten to 2D if needed
-            let a_2d = flatten_to_2d(&a_shape);
-            let b_2d = flatten_to_2d(&b_shape);
-            let out = graph.matmul(a, b);
-            let out_shape = if a_2d.len() == 2 && b_2d.len() == 2 {
-                vec![a_2d[0], b_2d[1]]
-            } else {
-                vec![
-                    a_shape.first().copied().unwrap_or(1),
-                    b_shape.last().copied().unwrap_or(1),
-                ]
-            };
+            let (out, out_shape) =
+                matmul_nd(graph, a, &a_shape, b, &b_shape)?.ok_or_else(|| {
+                    OnnxError::ShapeError(format!(
+                        "node '{}': MatMul of {a_shape:?} and {b_shape:?}",
+                        node.name
+                    ))
+                })?;
             register_output(node, 0, out, &out_shape, name_to_id, shapes);
         }
 
@@ -689,8 +679,28 @@ fn translate_node(
         }
 
         // --- Softmax ---
-        OpKind::Softmax => unary_op(graph, node, name_to_id, shapes, Op::Softmax)?,
-        OpKind::LogSoftmax => unary_op(graph, node, name_to_id, shapes, Op::LogSoftmax)?,
+        OpKind::Softmax | OpKind::LogSoftmax => {
+            let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
+            let x_shape = get_shape(&node.inputs[0], shapes);
+            let rank = x_shape.len() as i64;
+            // Opset 13 normalizes along `axis`, default -1; earlier opsets
+            // flatten at `axis`, which is the same when it is the last. An
+            // absent axis takes the modern default.
+            let axis = attrs.i("axis", -1);
+            if axis != -1 && axis != rank - 1 {
+                return Err(OnnxError::UnsupportedOp(format!(
+                    "{} along axis {axis} of {x_shape:?} (supported: the last axis)",
+                    node.op.as_str()
+                )));
+            }
+            let x = as_matrix(graph, x, &x_shape)?;
+            let out = if matches!(node.op, OpKind::Softmax) {
+                graph.softmax(x)
+            } else {
+                graph.log_softmax(x)
+            };
+            register_output(node, 0, out, &x_shape, name_to_id, shapes);
+        }
 
         // --- Normalization ---
         OpKind::LayerNorm => {
@@ -705,8 +715,12 @@ fn translate_node(
                 graph.constant(vec![0.0; n], &scale_shape)
             };
             let eps = attrs.f("epsilon", 1e-5);
-            let out = graph.layer_norm(x, scale, bias, eps);
             let x_shape = get_shape(&node.inputs[0], shapes);
+            let x = as_matrix(graph, x, &x_shape)?;
+            let cols = x_shape.last().copied().unwrap_or(1);
+            let scale = view(graph, scale, &[cols])?;
+            let bias = view(graph, bias, &[cols])?;
+            let out = graph.layer_norm(x, scale, bias, eps);
             register_output(node, 0, out, &x_shape, name_to_id, shapes);
         }
 
@@ -714,8 +728,10 @@ fn translate_node(
             let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let scale = resolve_input(&node.inputs[1], name_to_id, &node.name)?;
             let eps = attrs.f("epsilon", 1e-5);
-            let out = graph.rms_norm(x, scale, eps);
             let x_shape = get_shape(&node.inputs[0], shapes);
+            let x = as_matrix(graph, x, &x_shape)?;
+            let scale = view(graph, scale, &[x_shape.last().copied().unwrap_or(1)])?;
+            let out = graph.rms_norm(x, scale, eps);
             register_output(node, 0, out, &x_shape, name_to_id, shapes);
         }
 
@@ -744,43 +760,51 @@ fn translate_node(
         OpKind::Transpose => {
             let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let x_shape = get_shape(&node.inputs[0], shapes);
-            let perm = attrs.ints("perm");
-
-            if x_shape.len() == 2 && (perm.is_empty() || perm == [1, 0]) {
-                let out = graph.transpose(x);
-                let out_shape = vec![x_shape[1], x_shape[0]];
-                register_output(node, 0, out, &out_shape, name_to_id, shapes);
-            } else if perm.is_empty() {
-                // Default: reverse all dims. Only support 2D.
-                if x_shape.len() == 2 {
-                    let out = graph.transpose(x);
-                    let out_shape = vec![x_shape[1], x_shape[0]];
-                    register_output(node, 0, out, &out_shape, name_to_id, shapes);
-                } else {
-                    return Err(OnnxError::UnsupportedOp(format!(
-                        "Transpose with {}D (only 2D supported)",
-                        x_shape.len()
-                    )));
-                }
-            } else {
+            let rank = x_shape.len();
+            let perm: Vec<usize> = match *attrs.ints("perm") {
+                [] => (0..rank).rev().collect(),
+                ref perm => perm.iter().map(|&axis| axis as usize).collect(),
+            };
+            let mut sorted = perm.clone();
+            sorted.sort_unstable();
+            if sorted != (0..rank).collect::<Vec<_>>() || rank > 4 {
                 return Err(OnnxError::UnsupportedOp(format!(
-                    "Transpose with perm={perm:?} (only [1,0] or default supported)"
+                    "Transpose of {x_shape:?} by {perm:?} (supported: rank at most 4)"
                 )));
             }
+            let out_shape: Vec<usize> = perm.iter().map(|&axis| x_shape[axis]).collect();
+            let x = view(graph, x, &x_shape)?;
+            // Swapping the last two axes is the batched transpose kernel.
+            let swaps_last_two = rank >= 2
+                && perm[..rank - 2]
+                    .iter()
+                    .enumerate()
+                    .all(|(d, &axis)| d == axis)
+                && perm[rank - 2] == rank - 1;
+            let out = if perm.iter().enumerate().all(|(d, &axis)| d == axis) {
+                x
+            } else if swaps_last_two {
+                graph.transpose(x)
+            } else {
+                graph.permute(x, &perm)
+            };
+            register_output(node, 0, out, &out_shape, name_to_id, shapes);
         }
 
-        // --- Reshape / Flatten / Squeeze / Unsqueeze ---
-        // These are shape-only ops. In our flat IR, they are identity if the total
-        // element count doesn't change. We track the new shape for downstream ops.
         OpKind::Reshape => {
             let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
             let x_shape = get_shape(&node.inputs[0], shapes);
             let total = x_shape.iter().product::<usize>().max(1);
 
             // Get target shape from the second input (should be a constant)
+            let target = node
+                .inputs
+                .get(1)
+                .and_then(|name| name_to_id.get(name))
+                .and_then(|&id| constant_values(graph, id, weights));
             let new_shape = if node.inputs.len() > 1 && !node.inputs[1].is_empty() {
-                if let Some(shape_data) = weights.get(&node.inputs[1]) {
-                    resolve_reshape_dims(shape_data, total)
+                if let Some(shape_data) = target {
+                    resolve_reshape_dims(shape_data, &x_shape, total)
                 } else {
                     // Shape input might be produced by a Shape/Constant node
                     // For now, pass through with same shape
@@ -955,33 +979,102 @@ fn translate_node(
 
         // --- Concat ---
         OpKind::Concat => {
+            let mut inputs = node.inputs.iter().filter(|name| !name.is_empty());
+            let first = inputs.next().ok_or_else(|| {
+                OnnxError::ShapeError(format!("node '{}': empty Concat", node.name))
+            })?;
+            let mut out = resolve_input(first, name_to_id, &node.name)?;
+            let mut out_shape = get_shape(first, shapes);
+            let rank = out_shape.len() as i64;
             let axis = attrs.i("axis", 0);
-            if node.inputs.len() != 2 {
-                return Err(OnnxError::UnsupportedOp(format!(
-                    "Concat with {} inputs (only 2 supported)",
-                    node.inputs.len()
+            let axis = if axis < 0 { axis + rank } else { axis };
+            if !(0..rank).contains(&axis) {
+                return Err(OnnxError::ShapeError(format!(
+                    "node '{}': Concat axis {axis} of {out_shape:?}",
+                    node.name
                 )));
             }
-            let a = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
-            let b = resolve_input(&node.inputs[1], name_to_id, &node.name)?;
-            let a_shape = get_shape(&node.inputs[0], shapes);
-            let b_shape = get_shape(&node.inputs[1], shapes);
+            let axis = axis as usize;
+            for name in inputs {
+                let b = resolve_input(name, name_to_id, &node.name)?;
+                let b_shape = get_shape(name, shapes);
+                let matches = b_shape.len() == out_shape.len()
+                    && (0..out_shape.len()).all(|d| d == axis || b_shape[d] == out_shape[d]);
+                if !matches {
+                    return Err(OnnxError::ShapeError(format!(
+                        "node '{}': Concat of {out_shape:?} and {b_shape:?} on axis {axis}",
+                        node.name
+                    )));
+                }
+                // The channel-concat kernel is axis-generic: everything
+                // before the axis is its batch, everything after its spatial.
+                let outer = out_shape[..axis].iter().product::<usize>() as u32;
+                let inner = out_shape[axis + 1..].iter().product::<usize>() as u32;
+                out = graph.concat(
+                    out,
+                    b,
+                    outer,
+                    out_shape[axis] as u32,
+                    b_shape[axis] as u32,
+                    inner,
+                );
+                out_shape[axis] += b_shape[axis];
+            }
+            register_output(node, 0, out, &out_shape, name_to_id, shapes);
+        }
 
-            // Only channel-dim concat for 4D (NCHW)
-            if a_shape.len() == 4 && axis == 1 {
-                let batch = a_shape[0] as u32;
-                let ca = a_shape[1] as u32;
-                let cb = b_shape[1] as u32;
-                let spatial = (a_shape[2] * a_shape[3]) as u32;
-                let out = graph.concat(a, b, batch, ca, cb, spatial);
-                let out_shape = vec![a_shape[0], a_shape[1] + b_shape[1], a_shape[2], a_shape[3]];
-                register_output(node, 0, out, &out_shape, name_to_id, shapes);
-            } else {
+        OpKind::Slice => {
+            let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
+            let x_shape = get_shape(&node.inputs[0], shapes);
+            let ints = |slot: usize| -> Option<Vec<i64>> {
+                let id = *name_to_id.get(node.inputs.get(slot)?)?;
+                let values = constant_values(graph, id, weights)?;
+                Some(values.iter().map(|&v| v as i64).collect())
+            };
+            let (Some(starts), Some(ends)) = (ints(1), ints(2)) else {
+                return Err(OnnxError::UnsupportedOp(
+                    "Slice: starts and ends must be constants".into(),
+                ));
+            };
+            let axes = ints(3).unwrap_or_else(|| (0..starts.len() as i64).collect());
+            let steps = ints(4).unwrap_or_else(|| vec![1; starts.len()]);
+            if axes.len() != starts.len()
+                || ends.len() != starts.len()
+                || steps.iter().any(|&step| step != 1)
+            {
                 return Err(OnnxError::UnsupportedOp(format!(
-                    "Concat on axis={axis} with {}D tensors (only NCHW channel concat supported)",
-                    a_shape.len()
+                    "Slice with axes {axes:?} and steps {steps:?} (supported: unit steps)"
                 )));
             }
+            let mut out = x;
+            let mut out_shape = x_shape;
+            for ((&axis, &start), &end) in axes.iter().zip(&starts).zip(&ends) {
+                let rank = out_shape.len() as i64;
+                let axis = if axis < 0 { axis + rank } else { axis };
+                if !(0..rank).contains(&axis) {
+                    return Err(OnnxError::ShapeError(format!(
+                        "node '{}': Slice axis {axis} of {out_shape:?}",
+                        node.name
+                    )));
+                }
+                let axis = axis as usize;
+                let dim = out_shape[axis] as i64;
+                // Negative bounds count from the end; both clamp to the axis.
+                let clamp = |v: i64| (if v < 0 { v + dim } else { v }).clamp(0, dim) as u32;
+                let (start, end) = (clamp(start), clamp(end).max(clamp(start)));
+                let outer = out_shape[..axis].iter().product::<usize>() as u32;
+                let inner = out_shape[axis + 1..].iter().product::<usize>() as u32;
+                let dim = dim as u32;
+                // Drop the leading `start`, then keep the first `end - start`.
+                if start > 0 {
+                    out = graph.split_b(out, outer, start, dim - start, inner);
+                }
+                if end < dim {
+                    out = graph.split_a(out, outer, end - start, dim - end, inner);
+                }
+                out_shape[axis] = (end - start) as usize;
+            }
+            register_output(node, 0, out, &out_shape, name_to_id, shapes);
         }
 
         // --- GroupNorm ---
@@ -1159,37 +1252,110 @@ fn binary_op(
 ) -> Result<(), OnnxError> {
     let a = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
     let b = resolve_input(&node.inputs[1], name_to_id, &node.name)?;
-    let out = broadcast_binary(graph, a, b, kind, weights).ok_or_else(|| {
-        OnnxError::ShapeError(format!(
-            "node '{}': cannot broadcast {:?} with {:?}",
-            node.name,
-            graph.node(a).ty.shape,
-            graph.node(b).ty.shape
-        ))
-    })?;
     let a_shape = get_shape(&node.inputs[0], shapes);
     let b_shape = get_shape(&node.inputs[1], shapes);
-    let out_shape = broadcast_shape(&a_shape, &b_shape);
+    let (out, out_shape) = broadcast_binary(graph, (a, &a_shape), (b, &b_shape), kind, weights)?
+        .ok_or_else(|| {
+            OnnxError::ShapeError(format!(
+                "node '{}': cannot broadcast {a_shape:?} with {b_shape:?}",
+                node.name
+            ))
+        })?;
     register_output(node, 0, out, &out_shape, name_to_id, shapes);
     Ok(())
 }
 
-/// `a op b` for the broadcasts exported graphs use: a scalar constant
-/// (folded into the op as an attribute, even against a one-element
-/// tensor), equal element counts, a per-row `[M, 1]` value, or a
-/// per-column vector of the last dimension.
-fn broadcast_binary(
+/// `id` with `shape`, through a zero-cost reshape when its graph shape
+/// differs. The importer tracks ONNX shapes and lets graph nodes carry any
+/// view with the same element count.
+fn view(graph: &mut Graph, id: NodeId, shape: &[usize]) -> Result<NodeId, OnnxError> {
+    let current = &graph.node(id).ty;
+    if current.shape == shape {
+        return Ok(id);
+    }
+    if current.num_elements() != shape.iter().product::<usize>() {
+        return Err(OnnxError::ShapeError(format!(
+            "cannot view {:?} as {shape:?}",
+            current.shape
+        )));
+    }
+    // One view per (tensor, shape): rewrite rules see a tensor used twice
+    // through views as the same value only when both uses share the node.
+    let existing = graph.nodes()[id as usize..].iter().find(|node| {
+        matches!(node.op, Op::Identity) && node.inputs == [id] && node.ty.shape == shape
+    });
+    if let Some(node) = existing {
+        return Ok(node.id);
+    }
+    Ok(graph.reshape(id, shape))
+}
+
+/// `id` as a matrix of rows along its last axis.
+fn as_matrix(graph: &mut Graph, id: NodeId, shape: &[usize]) -> Result<NodeId, OnnxError> {
+    let cols = shape.last().copied().unwrap_or(1).max(1);
+    let rows = shape.iter().product::<usize>() / cols;
+    view(graph, id, &[rows, cols])
+}
+
+/// NumPy-style matrix product: a shared `[K, N]` right side multiplies
+/// every row of `a`, and equal leading batch axes multiply per batch.
+fn matmul_nd(
     graph: &mut Graph,
     a: NodeId,
+    a_shape: &[usize],
     b: NodeId,
+    b_shape: &[usize],
+) -> Result<Option<(NodeId, Vec<usize>)>, OnnxError> {
+    let (ra, rb) = (a_shape.len(), b_shape.len());
+    if ra < 2 || rb < 2 || a_shape[ra - 1] != b_shape[rb - 2] {
+        return Ok(None);
+    }
+    let (m, k, n) = (a_shape[ra - 2], a_shape[ra - 1], b_shape[rb - 1]);
+    let b_batch: usize = b_shape[..rb - 2].iter().product();
+    if b_batch == 1 {
+        let rows = a_shape[..ra - 1].iter().product();
+        let a = view(graph, a, &[rows, k])?;
+        let b = view(graph, b, &[k, n])?;
+        let mut shape = a_shape[..ra - 1].to_vec();
+        shape.push(n);
+        return Ok(Some((graph.matmul(a, b), shape)));
+    }
+    let strip = |s: &[usize]| {
+        s.iter()
+            .skip_while(|&&d| d == 1)
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    if strip(&a_shape[..ra - 2]) != strip(&b_shape[..rb - 2]) {
+        return Ok(None);
+    }
+    let lead = if ra >= rb {
+        &a_shape[..ra - 2]
+    } else {
+        &b_shape[..rb - 2]
+    };
+    let a = view(graph, a, &[b_batch, m, k])?;
+    let b = view(graph, b, &[b_batch, k, n])?;
+    let mut shape = lead.to_vec();
+    shape.extend([m, n]);
+    Ok(Some((graph.batch_matmul(a, b), shape)))
+}
+
+/// `a op b` for the broadcasts exported graphs use: a scalar constant
+/// (folded into the op as an attribute, even against a one-element
+/// tensor), equal element counts, a smaller operand matching the trailing
+/// axes (a bias, a mask, a rotary table), or one value per row along the
+/// last axis. Returns the result and its shape.
+fn broadcast_binary(
+    graph: &mut Graph,
+    (a, a_shape): (NodeId, &[usize]),
+    (b, b_shape): (NodeId, &[usize]),
     kind: BinaryKind,
     weights: &HashMap<String, Vec<f32>>,
-) -> Option<NodeId> {
-    let a_shape = graph.node(a).ty.shape.clone();
-    let b_shape = graph.node(b).ty.shape.clone();
+) -> Result<Option<(NodeId, Vec<usize>)>, OnnxError> {
     let (a_len, b_len) = (
-        graph.node(a).ty.num_elements(),
-        graph.node(b).ty.num_elements(),
+        a_shape.iter().product::<usize>(),
+        b_shape.iter().product::<usize>(),
     );
     // Folded scalars become kernel constants, which must be finite.
     let foldable = |v: f32, kind: BinaryKind| {
@@ -1199,18 +1365,21 @@ fn broadcast_binary(
         && let Some(v) = scalar_constant(graph, b, weights)
         && foldable(v, kind)
     {
-        return Some(match kind {
+        let a = as_matrix(graph, a, a_shape)?;
+        let out = match kind {
             BinaryKind::Add => graph.add_scalar(a, v),
             BinaryKind::Sub => graph.add_scalar(a, -v),
             BinaryKind::Mul => graph.scale(a, v),
             BinaryKind::Div => graph.scale(a, 1.0 / v),
-        });
+        };
+        return Ok(Some((out, broadcast_shape(a_shape, b_shape))));
     }
     if a_len == 1
         && let Some(v) = scalar_constant(graph, a, weights)
         && v.is_finite()
     {
-        return Some(match kind {
+        let b = as_matrix(graph, b, b_shape)?;
+        let out = match kind {
             BinaryKind::Add => graph.add_scalar(b, v),
             BinaryKind::Sub => {
                 let negated = graph.neg(b);
@@ -1221,60 +1390,78 @@ fn broadcast_binary(
                 let inverse = graph.recip(b);
                 graph.scale(inverse, v)
             }
-        });
+        };
+        return Ok(Some((out, broadcast_shape(a_shape, b_shape))));
     }
     if a_len == b_len {
-        let b = if a_shape == b_shape {
-            b
+        let shape = if a_shape.len() >= b_shape.len() {
+            a_shape
         } else {
-            graph.reshape(b, &a_shape)
+            b_shape
         };
-        return Some(match kind {
+        // Both on the canonical matrix view, so every elementwise use of a
+        // tensor reads the same node.
+        let a = as_matrix(graph, a, shape)?;
+        let b = as_matrix(graph, b, shape)?;
+        let out = match kind {
             BinaryKind::Add => graph.add(a, b),
             BinaryKind::Sub => graph.sub(a, b),
             BinaryKind::Mul => graph.mul(a, b),
             BinaryKind::Div => graph.div(a, b),
-        });
+        };
+        return Ok(Some((out, shape.to_vec())));
     }
     if a_len < b_len {
         return match kind {
-            BinaryKind::Add | BinaryKind::Mul => broadcast_binary(graph, b, a, kind, weights),
-            BinaryKind::Sub | BinaryKind::Div => None,
+            BinaryKind::Add | BinaryKind::Mul => {
+                broadcast_binary(graph, (b, b_shape), (a, a_shape), kind, weights)
+            }
+            BinaryKind::Sub | BinaryKind::Div => Ok(None),
         };
     }
-    let &[rows, cols] = a_shape.as_slice() else {
-        return None;
-    };
-    if b_shape == [rows, 1] {
+    let rank = a_shape.len();
+    if b_shape.len() > rank || rank == 0 {
+        return Ok(None);
+    }
+    // `b` padded to `a`'s rank with leading unit axes.
+    let mut padded = vec![1; rank - b_shape.len()];
+    padded.extend_from_slice(b_shape);
+    let cols = a_shape[rank - 1];
+    // One value per row: `a`'s shape with the last axis reduced.
+    if padded[..rank - 1] == a_shape[..rank - 1] && padded[rank - 1] == 1 {
+        let rows = a_len / cols.max(1);
+        let a = view(graph, a, &[rows, cols])?;
+        let b = view(graph, b, &[rows, 1])?;
         // Divide by the reciprocal of the narrow side before broadcasting.
         let b = match kind {
             BinaryKind::Div => graph.recip(b),
             _ => b,
         };
         let b = graph.broadcast_inner(b, cols);
-        return Some(match kind {
+        let out = match kind {
             BinaryKind::Add => graph.add(a, b),
             BinaryKind::Sub => graph.sub(a, b),
             BinaryKind::Mul | BinaryKind::Div => graph.mul(a, b),
-        });
-    }
-    if b_len == cols {
-        let b = if b_shape.len() == 1 {
-            b
-        } else {
-            graph.reshape(b, &[cols])
         };
+        return Ok(Some((out, a_shape.to_vec())));
+    }
+    // Trailing axes: `b` repeats along `a`'s leading ones.
+    let leading = padded.iter().take_while(|&&d| d == 1).count();
+    if padded[leading..] == a_shape[leading..] && b_len > 0 {
+        let a = view(graph, a, &[a_len / b_len, b_len])?;
+        let b = view(graph, b, &[b_len])?;
         let b = match kind {
             BinaryKind::Sub => graph.neg(b),
             BinaryKind::Div => graph.recip(b),
             _ => b,
         };
-        return Some(match kind {
+        let out = match kind {
             BinaryKind::Add | BinaryKind::Sub => graph.bias_add(a, b),
             BinaryKind::Mul | BinaryKind::Div => graph.bias_mul(a, b),
-        });
+        };
+        return Ok(Some((out, a_shape.to_vec())));
     }
-    None
+    Ok(None)
 }
 
 /// The values of a constant: an initializer or a `Constant` node.
@@ -1320,13 +1507,14 @@ fn reduce_op(
     }
     let last_axis = matches!(*axes.as_slice(), [axis] if axis == -1 || axis == rank - 1);
     let keepdims = node.attrs.i("keepdims", 1) != 0;
-    if !last_axis || !keepdims || graph.node(x).ty.rank() != 2 {
+    if !last_axis || !keepdims {
         return Err(OnnxError::UnsupportedOp(format!(
             "{}: axes {axes:?} of {x_shape:?} with keepdims={keepdims} \
              (supported: the last axis, kept)",
             node.op.as_str()
         )));
     }
+    let x = as_matrix(graph, x, &x_shape)?;
     let out = match node.op {
         OpKind::ReduceMean => graph.mean_inner(x),
         OpKind::ReduceSum => graph.sum_inner(x),
@@ -1349,7 +1537,9 @@ fn unary_op(
 ) -> Result<(), OnnxError> {
     let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
     let x_shape = get_shape(&node.inputs[0], shapes);
-    let ty = TensorType::f32(x_shape.clone());
+    // Elementwise: keep whatever view the input has, so no reshape lands
+    // inside a pattern the optimizer would fold.
+    let ty = graph.node(x).ty.clone();
     let out = graph.add_raw_node(op, vec![x], ty);
     register_output(node, 0, out, &x_shape, name_to_id, shapes);
     Ok(())
@@ -1384,30 +1574,21 @@ fn broadcast_shape(a: &[usize], b: &[usize]) -> Vec<usize> {
 }
 
 /// Resolve ONNX reshape target dims (handling -1 and 0).
-fn resolve_reshape_dims(shape_data: &[f32], total_elements: usize) -> Vec<usize> {
-    let raw: Vec<i64> = shape_data.iter().map(|&v| v as i64).collect();
-    let mut neg_idx = None;
-    let mut known_product = 1usize;
-
-    for (i, &d) in raw.iter().enumerate() {
-        if d == -1 {
-            neg_idx = Some(i);
-        } else if d == 0 {
-            // 0 means "keep original dim" — we don't track original per-dim, use 1
-        } else {
-            known_product *= d as usize;
-        }
-    }
-
-    let mut result: Vec<usize> = raw
+fn resolve_reshape_dims(shape_data: &[f32], input: &[usize], total_elements: usize) -> Vec<usize> {
+    // `0` copies the input's dimension at that index; `-1` takes the rest.
+    let mut result: Vec<usize> = shape_data
         .iter()
-        .map(|&d| if d == -1 || d == 0 { 1 } else { d as usize })
+        .enumerate()
+        .map(|(i, &d)| match d as i64 {
+            0 => input.get(i).copied().unwrap_or(1),
+            d if d < 0 => 1,
+            d => d as usize,
+        })
         .collect();
-
-    if let Some(idx) = neg_idx {
-        result[idx] = total_elements / known_product.max(1);
+    if let Some(idx) = shape_data.iter().position(|&d| d as i64 == -1) {
+        let known = result.iter().product::<usize>().max(1);
+        result[idx] = total_elements / known;
     }
-
     result
 }
 
@@ -1424,8 +1605,12 @@ mod tests {
 
     #[test]
     fn test_resolve_reshape_dims() {
-        assert_eq!(resolve_reshape_dims(&[2.0, -1.0], 6), vec![2, 3]);
-        assert_eq!(resolve_reshape_dims(&[3.0, 4.0], 12), vec![3, 4]);
+        assert_eq!(resolve_reshape_dims(&[2.0, -1.0], &[6], 6), vec![2, 3]);
+        assert_eq!(resolve_reshape_dims(&[3.0, 4.0], &[12], 12), vec![3, 4]);
+        assert_eq!(
+            resolve_reshape_dims(&[0.0, -1.0, 2.0], &[3, 8], 24),
+            vec![3, 4, 2]
+        );
     }
 
     #[test]
