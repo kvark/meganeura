@@ -8,6 +8,12 @@
   `Softmax`, `RmsNorm` and `LayerNorm` kernels, so they reach the same
   plan-level fusions as the named ops. Norms written with
   `x / sqrt(variance + eps)` fold as well.
+- The ONNX importer accepts decomposed exports instead of rejecting them:
+  `Sqrt`, `Exp`, `Tanh`, `Pow` with a constant exponent, and last-axis
+  `ReduceMean`, `ReduceSum` and `ReduceMax` map onto primitives, and binary
+  ops broadcast per-row `[M, 1]` values and fold scalar constants. RMSNorm,
+  LayerNorm and softmax written this way load as the fused kernels.
+  Unsupported broadcasts are load errors rather than panics.
 - Keep scalar consumers of cooperative attention staging in f32. Check
   forward, dQ and dK/dV workgroup storage against the selected device's limit
   and include that limit in plan-cache compatibility.

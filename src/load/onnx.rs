@@ -552,24 +552,46 @@ fn translate_node(
         OpKind::Gelu => unary_op(graph, node, name_to_id, shapes, Op::Gelu)?,
         OpKind::SiLU => unary_op(graph, node, name_to_id, shapes, Op::Silu)?,
 
-        // Elementary math ops — these should not appear in well-exported ONNX models.
-        // They are decomposition artifacts from PyTorch's torch.onnx.export.
-        // Use opset >= 17 with SimplifiedLayerNormalization, or export with
-        // `optimum-cli` which preserves compound ops.
-        OpKind::Sqrt
-        | OpKind::Exp
-        | OpKind::Tanh
-        | OpKind::Erf
-        | OpKind::Pow
-        | OpKind::ReduceMean
-        | OpKind::ReduceSum => {
-            return Err(OnnxError::UnsupportedOp(format!(
-                "{}: this is likely a decomposed subgraph from torch.onnx.export. \
-                 Use `optimum-cli export onnx` or opset extensions \
-                 (SimplifiedLayerNormalization, Gelu, etc.) to export compound ops \
-                 instead of their decomposed forms",
-                node.op.as_str()
-            )));
+        // Elementary math, as exporters write decomposed norms and
+        // activations. These map onto primitives, and the optimizer folds
+        // recognized decompositions back into fused kernels.
+        OpKind::Sqrt => unary_op(graph, node, name_to_id, shapes, Op::Sqrt)?,
+        OpKind::Exp => unary_op(graph, node, name_to_id, shapes, Op::Exp)?,
+        OpKind::Tanh => unary_op(graph, node, name_to_id, shapes, Op::Tanh)?,
+        OpKind::Pow => {
+            let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
+            let exponent = node
+                .inputs
+                .get(1)
+                .and_then(|name| name_to_id.get(name))
+                .and_then(|&id| scalar_constant(graph, id, weights));
+            let out = match exponent {
+                Some(1.0) => x,
+                Some(2.0) => graph.mul(x, x),
+                Some(3.0) => {
+                    let square = graph.mul(x, x);
+                    graph.mul(square, x)
+                }
+                Some(0.5) => graph.sqrt(x),
+                Some(-0.5) => graph.rsqrt(x),
+                Some(-1.0) => graph.recip(x),
+                other => {
+                    return Err(OnnxError::UnsupportedOp(format!(
+                        "Pow: exponent {other:?} (supported: constant 1, 2, 3, 0.5, -0.5, -1)"
+                    )));
+                }
+            };
+            let x_shape = get_shape(&node.inputs[0], shapes);
+            register_output(node, 0, out, &x_shape, name_to_id, shapes);
+        }
+        OpKind::ReduceMean | OpKind::ReduceSum | OpKind::ReduceMax => {
+            reduce_op(graph, node, name_to_id, shapes, weights)?;
+        }
+        // Needs an erf primitive, which does not exist yet.
+        OpKind::Erf => {
+            return Err(OnnxError::UnsupportedOp(
+                "Erf: export GELU as a Gelu node (opset 20) or with the tanh approximation".into(),
+            ));
         }
 
         // Cast: passthrough (we only support f32)
@@ -595,33 +617,10 @@ fn translate_node(
         }
 
         // --- Element-wise binary ---
-        OpKind::Add => binary_op(graph, node, name_to_id, shapes, BinaryKind::Add)?,
-        OpKind::Mul => binary_op(graph, node, name_to_id, shapes, BinaryKind::Mul)?,
-
-        // Sub: a - b = a + neg(b)
-        OpKind::Sub => {
-            let a = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
-            let b = resolve_input(&node.inputs[1], name_to_id, &node.name)?;
-            let neg_b = graph.neg(b);
-            let a_shape = get_shape(&node.inputs[0], shapes);
-            let b_shape = get_shape(&node.inputs[1], shapes);
-            let out = if a_shape == b_shape {
-                graph.add(a, neg_b)
-            } else {
-                // Broadcast: assume bias-like pattern
-                graph.bias_add(a, neg_b)
-            };
-            register_output(node, 0, out, &a_shape, name_to_id, shapes);
-        }
-
-        // Div: a / b = a * recip(b)
-        OpKind::Div => {
-            let a = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
-            let b = resolve_input(&node.inputs[1], name_to_id, &node.name)?;
-            let out = graph.div(a, b);
-            let a_shape = get_shape(&node.inputs[0], shapes);
-            register_output(node, 0, out, &a_shape, name_to_id, shapes);
-        }
+        OpKind::Add => binary_op(graph, node, name_to_id, shapes, weights, BinaryKind::Add)?,
+        OpKind::Sub => binary_op(graph, node, name_to_id, shapes, weights, BinaryKind::Sub)?,
+        OpKind::Mul => binary_op(graph, node, name_to_id, shapes, weights, BinaryKind::Mul)?,
+        OpKind::Div => binary_op(graph, node, name_to_id, shapes, weights, BinaryKind::Div)?,
 
         // --- MatMul ---
         OpKind::MatMul => {
@@ -1142,9 +1141,12 @@ fn translate_node(
 
 // --- Helpers ---
 
+#[derive(Clone, Copy)]
 enum BinaryKind {
     Add,
+    Sub,
     Mul,
+    Div,
 }
 
 fn binary_op(
@@ -1152,31 +1154,188 @@ fn binary_op(
     node: &OnnxNode,
     name_to_id: &mut HashMap<String, NodeId>,
     shapes: &mut HashMap<String, Vec<usize>>,
+    weights: &HashMap<String, Vec<f32>>,
     kind: BinaryKind,
 ) -> Result<(), OnnxError> {
     let a = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
     let b = resolve_input(&node.inputs[1], name_to_id, &node.name)?;
+    let out = broadcast_binary(graph, a, b, kind, weights).ok_or_else(|| {
+        OnnxError::ShapeError(format!(
+            "node '{}': cannot broadcast {:?} with {:?}",
+            node.name,
+            graph.node(a).ty.shape,
+            graph.node(b).ty.shape
+        ))
+    })?;
     let a_shape = get_shape(&node.inputs[0], shapes);
     let b_shape = get_shape(&node.inputs[1], shapes);
-
-    let out = if a_shape == b_shape {
-        match kind {
-            BinaryKind::Add => graph.add(a, b),
-            BinaryKind::Mul => graph.mul(a, b),
-        }
-    } else {
-        // Broadcast: smaller tensor is the bias/scalar
-        match kind {
-            BinaryKind::Add => graph.bias_add(a, b),
-            BinaryKind::Mul => {
-                // Element-wise mul doesn't have a broadcast variant in our IR,
-                // but for same-total-elements it works as-is
-                graph.mul(a, b)
-            }
-        }
-    };
-
     let out_shape = broadcast_shape(&a_shape, &b_shape);
+    register_output(node, 0, out, &out_shape, name_to_id, shapes);
+    Ok(())
+}
+
+/// `a op b` for the broadcasts exported graphs use: a scalar constant
+/// (folded into the op as an attribute, even against a one-element
+/// tensor), equal element counts, a per-row `[M, 1]` value, or a
+/// per-column vector of the last dimension.
+fn broadcast_binary(
+    graph: &mut Graph,
+    a: NodeId,
+    b: NodeId,
+    kind: BinaryKind,
+    weights: &HashMap<String, Vec<f32>>,
+) -> Option<NodeId> {
+    let a_shape = graph.node(a).ty.shape.clone();
+    let b_shape = graph.node(b).ty.shape.clone();
+    let (a_len, b_len) = (
+        graph.node(a).ty.num_elements(),
+        graph.node(b).ty.num_elements(),
+    );
+    // Folded scalars become kernel constants, which must be finite.
+    let foldable = |v: f32, kind: BinaryKind| {
+        v.is_finite() && (!matches!(kind, BinaryKind::Div) || (1.0 / v).is_finite())
+    };
+    if b_len == 1
+        && let Some(v) = scalar_constant(graph, b, weights)
+        && foldable(v, kind)
+    {
+        return Some(match kind {
+            BinaryKind::Add => graph.add_scalar(a, v),
+            BinaryKind::Sub => graph.add_scalar(a, -v),
+            BinaryKind::Mul => graph.scale(a, v),
+            BinaryKind::Div => graph.scale(a, 1.0 / v),
+        });
+    }
+    if a_len == 1
+        && let Some(v) = scalar_constant(graph, a, weights)
+        && v.is_finite()
+    {
+        return Some(match kind {
+            BinaryKind::Add => graph.add_scalar(b, v),
+            BinaryKind::Sub => {
+                let negated = graph.neg(b);
+                graph.add_scalar(negated, v)
+            }
+            BinaryKind::Mul => graph.scale(b, v),
+            BinaryKind::Div => {
+                let inverse = graph.recip(b);
+                graph.scale(inverse, v)
+            }
+        });
+    }
+    if a_len == b_len {
+        let b = if a_shape == b_shape {
+            b
+        } else {
+            graph.reshape(b, &a_shape)
+        };
+        return Some(match kind {
+            BinaryKind::Add => graph.add(a, b),
+            BinaryKind::Sub => graph.sub(a, b),
+            BinaryKind::Mul => graph.mul(a, b),
+            BinaryKind::Div => graph.div(a, b),
+        });
+    }
+    if a_len < b_len {
+        return match kind {
+            BinaryKind::Add | BinaryKind::Mul => broadcast_binary(graph, b, a, kind, weights),
+            BinaryKind::Sub | BinaryKind::Div => None,
+        };
+    }
+    let &[rows, cols] = a_shape.as_slice() else {
+        return None;
+    };
+    if b_shape == [rows, 1] {
+        // Divide by the reciprocal of the narrow side before broadcasting.
+        let b = match kind {
+            BinaryKind::Div => graph.recip(b),
+            _ => b,
+        };
+        let b = graph.broadcast_inner(b, cols);
+        return Some(match kind {
+            BinaryKind::Add => graph.add(a, b),
+            BinaryKind::Sub => graph.sub(a, b),
+            BinaryKind::Mul | BinaryKind::Div => graph.mul(a, b),
+        });
+    }
+    if b_len == cols {
+        let b = if b_shape.len() == 1 {
+            b
+        } else {
+            graph.reshape(b, &[cols])
+        };
+        let b = match kind {
+            BinaryKind::Sub => graph.neg(b),
+            BinaryKind::Div => graph.recip(b),
+            _ => b,
+        };
+        return Some(match kind {
+            BinaryKind::Add | BinaryKind::Sub => graph.bias_add(a, b),
+            BinaryKind::Mul | BinaryKind::Div => graph.bias_mul(a, b),
+        });
+    }
+    None
+}
+
+/// The values of a constant: an initializer or a `Constant` node.
+fn constant_values<'a>(
+    graph: &'a Graph,
+    id: NodeId,
+    weights: &'a HashMap<String, Vec<f32>>,
+) -> Option<&'a [f32]> {
+    match graph.node(id).op {
+        Op::Constant { ref data } => Some(data),
+        Op::Parameter { ref name } => weights.get(name).map(Vec::as_slice),
+        _ => None,
+    }
+}
+
+/// The value of a one-element constant.
+fn scalar_constant(graph: &Graph, id: NodeId, weights: &HashMap<String, Vec<f32>>) -> Option<f32> {
+    match *constant_values(graph, id, weights)? {
+        [v] => Some(v),
+        _ => None,
+    }
+}
+
+/// `ReduceMean`, `ReduceSum` or `ReduceMax` over the last axis, keeping
+/// it: the per-row reductions norms and softmax are written with.
+fn reduce_op(
+    graph: &mut Graph,
+    node: &OnnxNode,
+    name_to_id: &mut HashMap<String, NodeId>,
+    shapes: &mut HashMap<String, Vec<usize>>,
+    weights: &HashMap<String, Vec<f32>>,
+) -> Result<(), OnnxError> {
+    let x = resolve_input(&node.inputs[0], name_to_id, &node.name)?;
+    let x_shape = get_shape(&node.inputs[0], shapes);
+    let rank = x_shape.len() as i64;
+    // Axes are an attribute before opset 18 (13 for ReduceSum), an input after.
+    let mut axes: Vec<i64> = node.attrs.ints("axes").to_vec();
+    if axes.is_empty()
+        && let Some(&id) = node.inputs.get(1).and_then(|name| name_to_id.get(name))
+        && let Some(values) = constant_values(graph, id, weights)
+    {
+        axes = values.iter().map(|&v| v as i64).collect();
+    }
+    let last_axis = matches!(*axes.as_slice(), [axis] if axis == -1 || axis == rank - 1);
+    let keepdims = node.attrs.i("keepdims", 1) != 0;
+    if !last_axis || !keepdims || graph.node(x).ty.rank() != 2 {
+        return Err(OnnxError::UnsupportedOp(format!(
+            "{}: axes {axes:?} of {x_shape:?} with keepdims={keepdims} \
+             (supported: the last axis, kept)",
+            node.op.as_str()
+        )));
+    }
+    let out = match node.op {
+        OpKind::ReduceMean => graph.mean_inner(x),
+        OpKind::ReduceSum => graph.sum_inner(x),
+        _ => graph.max_inner(x),
+    };
+    let mut out_shape = x_shape;
+    if let Some(last) = out_shape.last_mut() {
+        *last = 1;
+    }
     register_output(node, 0, out, &out_shape, name_to_id, shapes);
     Ok(())
 }
@@ -1508,6 +1667,167 @@ mod tests {
         let model = result.unwrap();
         assert_eq!(model.graph.outputs().len(), 1);
         assert_eq!(model.weights.len(), 2);
+    }
+
+    /// A decomposed export, built from `(op, inputs, outputs)` triples over
+    /// input `x: [4, 16]`, scalar initializers and per-column parameters.
+    fn decomposed_model(
+        nodes: &[(&str, &[&str], &str)],
+        scalars: &[(&str, f32)],
+        columns: &[&str],
+    ) -> OnnxModel {
+        let nodes: Vec<_> = nodes
+            .iter()
+            .map(|&(op, inputs, output)| build_node_proto(op, inputs, &[output], &[], &[]))
+            .collect();
+        let mut inits = Vec::new();
+        let mut inputs = vec![build_value_info("x", &[4, 16])];
+        for &(name, value) in scalars {
+            inits.push(build_tensor_proto(name, &[1], &[value]));
+            inputs.push(build_value_info(name, &[1]));
+        }
+        for (i, &name) in columns.iter().enumerate() {
+            let data: Vec<f32> = (0..16).map(|j| 0.5 + 0.05 * (i * 16 + j) as f32).collect();
+            inits.push(build_tensor_proto(name, &[16], &data));
+            inputs.push(build_value_info(name, &[16]));
+        }
+        let bytes = build_onnx_model(&nodes, &inits, &inputs, &[build_value_info("y", &[4, 16])]);
+        load_onnx_bytes(&bytes, None).expect("decomposed export loads")
+    }
+
+    /// The loaded graph computes `expected`'s output, and the optimizer
+    /// folds it into the single fused op `fused` reports.
+    fn assert_folds(
+        model: &OnnxModel,
+        expected: impl FnOnce(&mut Graph, NodeId, &[NodeId]) -> NodeId,
+        columns: &[&str],
+        fused: impl Fn(&Op) -> bool,
+    ) {
+        use crate::reference::{Feeds, evaluate_outputs};
+        let mut feeds = Feeds::new();
+        let x: Vec<f32> = (0..64).map(|i| (i as f32 * 0.37).sin() * 2.0).collect();
+        feeds.set("x", &x);
+        for (name, data) in &model.weights {
+            feeds.set(name, data);
+        }
+        let got = evaluate_outputs(&model.graph, &feeds).unwrap();
+
+        let mut reference = Graph::new();
+        let rx = reference.input("x", &[4, 16]);
+        let params: Vec<_> = columns
+            .iter()
+            .map(|name| reference.parameter(name, &[16]))
+            .collect();
+        let out = expected(&mut reference, rx, &params);
+        reference.set_outputs(vec![out]);
+        let want = evaluate_outputs(&reference, &feeds).unwrap();
+        for (g, w) in got[0].data.iter().zip(&want[0].data) {
+            assert!((g - w).abs() < 1e-6, "{g} vs {w}");
+        }
+
+        let optimized = crate::optimize::optimize(&model.graph);
+        let output = optimized.node(optimized.outputs()[0]);
+        assert!(fused(&output.op), "got {:?}", output.op);
+        assert!(
+            optimized
+                .nodes()
+                .iter()
+                .all(|node| !matches!(node.op, Op::Sqrt | Op::Rsqrt | Op::Exp | Op::MaxInner)),
+            "primitives left after folding: {:?}",
+            optimized.nodes().iter().map(|n| &n.op).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn decomposed_rms_norm_export_folds() {
+        let model = decomposed_model(
+            &[
+                ("Pow", &["x", "two"], "square"),
+                ("ReduceMean", &["square", "axes"], "mean"),
+                ("Add", &["mean", "eps"], "shifted"),
+                ("Sqrt", &["shifted"], "root"),
+                ("Div", &["x", "root"], "normalized"),
+                ("Mul", &["normalized", "w"], "y"),
+            ],
+            &[("two", 2.0), ("axes", -1.0), ("eps", 1e-6)],
+            &["w"],
+        );
+        assert_folds(
+            &model,
+            |g, x, p| g.rms_norm(x, p[0], 1e-6),
+            &["w"],
+            |op| matches!(*op, Op::RmsNorm { eps } if eps == 1e-6),
+        );
+    }
+
+    #[test]
+    fn decomposed_layer_norm_export_folds() {
+        let model = decomposed_model(
+            &[
+                ("ReduceMean", &["x", "axes"], "mean"),
+                ("Sub", &["x", "mean"], "centered"),
+                ("Pow", &["centered", "two"], "square"),
+                ("ReduceMean", &["square", "axes"], "variance"),
+                ("Add", &["variance", "eps"], "shifted"),
+                ("Sqrt", &["shifted"], "root"),
+                ("Div", &["centered", "root"], "normalized"),
+                ("Mul", &["normalized", "w"], "scaled"),
+                ("Add", &["scaled", "b"], "y"),
+            ],
+            &[("two", 2.0), ("axes", -1.0), ("eps", 1e-5)],
+            &["w", "b"],
+        );
+        assert_folds(
+            &model,
+            |g, x, p| g.layer_norm(x, p[0], p[1], 1e-5),
+            &["w", "b"],
+            |op| matches!(*op, Op::LayerNorm { eps } if eps == 1e-5),
+        );
+    }
+
+    #[test]
+    fn decomposed_softmax_export_folds() {
+        let model = decomposed_model(
+            &[
+                ("ReduceMax", &["x", "axes"], "max"),
+                ("Sub", &["x", "max"], "shifted"),
+                ("Exp", &["shifted"], "e"),
+                ("ReduceSum", &["e", "axes"], "total"),
+                ("Div", &["e", "total"], "y"),
+            ],
+            &[("axes", -1.0)],
+            &[],
+        );
+        assert_folds(
+            &model,
+            |g, x, _| g.softmax(x),
+            &[],
+            |op| matches!(*op, Op::Softmax),
+        );
+    }
+
+    #[test]
+    fn reductions_over_other_axes_are_refused() {
+        let nodes = [build_node_proto(
+            "ReduceMean",
+            &["x", "axes"],
+            &["y"],
+            &[],
+            &[],
+        )];
+        let bytes = build_onnx_model(
+            &nodes,
+            &[build_tensor_proto("axes", &[1], &[0.0])],
+            &[
+                build_value_info("x", &[4, 16]),
+                build_value_info("axes", &[1]),
+            ],
+            &[build_value_info("y", &[1, 16])],
+        );
+        assert!(matches!(
+            load_onnx_bytes(&bytes, None),
+            Err(OnnxError::UnsupportedOp(_))
+        ));
     }
 }
 
