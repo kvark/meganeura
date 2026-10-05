@@ -400,6 +400,13 @@ fn prepare_graph(
     optimize: optimize::OptimizeConfig,
     skip_full_optimize: bool,
 ) -> (Graph, optimize::OptimizeReport) {
+    // Composites written as their decompositions build as the composites,
+    // so their fused kernels and gradients apply.
+    let recomposed = {
+        let _span = tracing::info_span!("recompose").entered();
+        forward_graph.recompose()
+    };
+    let forward_graph = &recomposed;
     let (optimized_forward, forward_report) = {
         let _span = tracing::info_span!("optimize_forward").entered();
         optimize::optimize_with_config(forward_graph, optimize)
@@ -517,11 +524,24 @@ pub fn build_session_unoptimized(forward_graph: &Graph) -> Session {
 pub fn compile_training_graph(
     forward_graph: &Graph,
 ) -> (crate::compile::ExecutionPlan, optimize::OptimizeReport) {
-    let optimized_forward = optimize::optimize(forward_graph).toposort();
+    let optimized_forward = optimize::optimize(&forward_graph.recompose()).toposort();
     let full_graph = autodiff::differentiate(&optimized_forward);
     let (optimized, report) = optimize::optimize_with_report(&full_graph);
     let plan = compile::compile(&optimized);
     (plan, report)
+}
+
+/// The execution plan [`build`] compiles for `forward_graph`, without a
+/// GPU: no cooperative matrices and 32 KiB of workgroup memory. Compares
+/// what two spellings of a model build.
+pub fn compile_plan(
+    forward_graph: &Graph,
+    mode: Mode,
+    optimize: optimize::OptimizeConfig,
+    options: &compile::CompileOptions,
+) -> compile::ExecutionPlan {
+    let (graph, _) = prepare_graph(forward_graph, mode, optimize, false);
+    compile::compile_owned_with_caps(graph, options, Default::default(), 32 * 1024)
 }
 
 #[cfg(test)]

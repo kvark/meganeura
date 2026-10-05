@@ -57,7 +57,7 @@ pub use runtime::{
 pub use train::{
     EpochStats, LossHistory, MetricCallback, Mode, Optimizer, SessionConfig, StepMetrics,
     TrainConfig, TrainHistory, Trainer, build, build_inference_session, build_session,
-    build_session_unoptimized, compile_training_graph,
+    build_session_unoptimized, compile_plan, compile_training_graph,
 };
 pub use tune::{
     MatmulTile, TuneClass, TuneConv2d, TuneDecision, TuneError, TuneOptions, TunePhaseTimes,

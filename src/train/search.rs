@@ -131,7 +131,7 @@ pub fn build_measured(
         && options.max_graphs > 1
         && start.elapsed() < options.max_time
     {
-        let source = forward_graph.toposort();
+        let source = forward_graph.recompose().toposort();
         let limit = options.max_graphs - 1;
         let space = optimize::search::candidates(&source, cfg.optimize, limit);
         let spaces = if space.is_ok()

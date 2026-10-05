@@ -325,7 +325,10 @@ fn decomposed_rms_norm_reaches_plan_fusions() {
         named,
         "decomposed and named norms should lower identically"
     );
-    let primitive = plan(&build(true), OptimizeMode::Off);
-    assert!(!primitive.1);
-    assert!(primitive.0 > named.0, "{primitive:?} vs {named:?}");
+    // Recomposition is not an optimization: it holds with the optimizer
+    // off as well.
+    assert_eq!(
+        plan(&build(true), OptimizeMode::Off),
+        plan(&build(false), OptimizeMode::Off)
+    );
 }
