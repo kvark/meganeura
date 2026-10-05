@@ -705,8 +705,11 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
 (rewrite (GeGLU (MatMulBT ?h ?wg) (MatMulBT ?h ?wu)) (GeGLUPackedBT ?h ?wg ?wu))
 
 ; --- Composite recognition ---
-; Decompositions into primitives (`Graph::decomposed_*`) become fused
-; kernels. Primitives without a named constructor are encoded generically,
+; Builds recognize composites spelled exactly as their decompositions
+; before optimizing (`Graph::recompose`). These rules catch spellings that
+; differ, as exporters write them: commuted operands, a reciprocal of a
+; square root, a reciprocal taken after a broadcast. Primitives without a
+; named constructor are encoded generically,
 ; so the encoder also states what each one computes as a pattern-only
 ; `P*` term in the same e-class. Those terms exist only to be matched here;
 ; extraction never selects them.
