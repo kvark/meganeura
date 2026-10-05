@@ -1,6 +1,8 @@
 use std::fmt;
 
 mod composite;
+mod decompose;
+pub use composite::OpClass;
 pub(crate) use composite::mean_factor;
 
 pub type NodeId = u32;

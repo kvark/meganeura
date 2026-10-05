@@ -5,6 +5,7 @@ mod attention;
 mod autodiff;
 mod basic;
 mod blocks;
+mod composites;
 mod coverage;
 mod fuzz;
 mod losses;
