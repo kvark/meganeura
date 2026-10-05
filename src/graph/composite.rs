@@ -52,7 +52,9 @@ impl Op {
                 | Op::SumAll
                 // Contraction and data movement
                 | Op::MatMul
+                | Op::BatchMatMul
                 | Op::Transpose
+                | Op::Permute { .. }
                 | Op::Identity
                 | Op::Embedding
                 | Op::StopGradient

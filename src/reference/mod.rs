@@ -266,6 +266,9 @@ pub fn eval_node(
         | Op::BlockMatMul
         | Op::BlockMatMulAT { .. }
         | Op::BlockMatMulBT
+        | Op::BatchMatMul
+        | Op::BatchMatMulAT
+        | Op::BatchMatMulBT
         | Op::Add
         | Op::Mul
         | Op::Greater
@@ -301,6 +304,7 @@ pub fn eval_node(
         | Op::CrossEntropyLogitsGrad
         | Op::BceLoss
         | Op::Transpose
+        | Op::Permute { .. }
         | Op::BiasAdd
         | Op::BiasMul
         | Op::Nop
@@ -491,6 +495,7 @@ fn propagates_scale(op: &Op) -> bool {
                 | Op::Relu
                 | Op::Abs
                 | Op::Transpose
+                | Op::Permute { .. }
                 | Op::Identity
                 | Op::Materialize
                 | Op::StopGradient
@@ -536,6 +541,9 @@ fn is_multilinear(op: &Op) -> bool {
             | Op::BlockMatMul
             | Op::BlockMatMulAT { .. }
             | Op::BlockMatMulBT
+            | Op::BatchMatMul
+            | Op::BatchMatMulAT
+            | Op::BatchMatMulBT
             | Op::Add
             | Op::SumAll
             | Op::MeanAll

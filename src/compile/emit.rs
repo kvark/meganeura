@@ -576,7 +576,10 @@ impl<'a> Compiler<'a> {
                 }
                 ShaderEntry::BlockMatMul
                 | ShaderEntry::BlockMatMulAT
-                | ShaderEntry::BlockMatMulBT => {
+                | ShaderEntry::BlockMatMulBT
+                | ShaderEntry::BatchMatMul
+                | ShaderEntry::BatchMatMulAT
+                | ShaderEntry::BatchMatMulBT => {
                     format!(
                         "{:?}[g={},{}x{}x{}]",
                         d.shader, d.params[3], d.params[0], d.params[1], d.params[2]
@@ -851,7 +854,12 @@ impl<'a> Compiler<'a> {
                 }
             }
 
-            Op::BlockMatMul | Op::BlockMatMulAT { .. } | Op::BlockMatMulBT => {
+            Op::BlockMatMul
+            | Op::BlockMatMulAT { .. }
+            | Op::BlockMatMulBT
+            | Op::BatchMatMul
+            | Op::BatchMatMulAT
+            | Op::BatchMatMulBT => {
                 let a = self.get_buffer(node.inputs[0]);
                 let b = self.get_buffer(node.inputs[1]);
                 let a_ty = &self.graph.node(node.inputs[0]).ty;
@@ -890,6 +898,29 @@ impl<'a> Compiler<'a> {
                         a_ty.shape[0],
                         b_ty.shape[1],
                         b_ty.shape[2],
+                    ),
+                    // The output is `[B, M, N]` and the reduction runs along
+                    // the side of `a` that does not land in the output.
+                    Op::BatchMatMul => (
+                        ShaderEntry::BatchMatMul,
+                        node.ty.shape[0],
+                        node.ty.shape[1],
+                        node.ty.shape[2],
+                        a_ty.shape[2],
+                    ),
+                    Op::BatchMatMulAT => (
+                        ShaderEntry::BatchMatMulAT,
+                        node.ty.shape[0],
+                        node.ty.shape[1],
+                        node.ty.shape[2],
+                        a_ty.shape[1],
+                    ),
+                    Op::BatchMatMulBT => (
+                        ShaderEntry::BatchMatMulBT,
+                        node.ty.shape[0],
+                        node.ty.shape[1],
+                        node.ty.shape[2],
+                        a_ty.shape[2],
                     ),
                     _ => unreachable!(),
                 };
@@ -1586,6 +1617,35 @@ impl<'a> Compiler<'a> {
                     extra_outputs: vec![],
                     params: vec![m, n, 0, 0],
 
+                    ..Default::default()
+                });
+            }
+
+            Op::Permute { ref perm } => {
+                let input = self.get_buffer(node.inputs[0]);
+                let in_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                // Row-major input strides, then those of each output axis,
+                // padded to rank 4 with leading unit axes.
+                let mut strides = vec![1usize; in_shape.len()];
+                for d in (0..in_shape.len().saturating_sub(1)).rev() {
+                    strides[d] = strides[d + 1] * in_shape[d + 1];
+                }
+                let pad = 4 - perm.len();
+                let mut dims = [1u32; 4];
+                let mut out_strides = [0u32; 4];
+                for (d, &axis) in perm.iter().enumerate() {
+                    dims[pad + d] = u32::try_from(in_shape[axis]).expect("permute dim exceeds u32");
+                    out_strides[pad + d] =
+                        u32::try_from(strides[axis]).expect("permute stride exceeds u32");
+                }
+                let total =
+                    u32::try_from(node.ty.num_elements()).expect("permute size exceeds u32");
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::Permute,
+                    workgroups: [total.div_ceil(256), 1, 1],
+                    input_buffers: vec![input],
+                    output_buffer: out_buf,
+                    params: [&[total, dims[1], dims[2], dims[3]][..], &out_strides].concat(),
                     ..Default::default()
                 });
             }

@@ -576,6 +576,9 @@ pub enum ShaderGroup {
     BlockMatMul,
     BlockMatMulAT,
     BlockMatMulBT,
+    BatchMatMul,
+    BatchMatMulAT,
+    BatchMatMulBT,
     MatMulATAdd,
     MatMulBTAdd,
     /// M=1 matmul (GEMV): `C[1,N] = A[1,K] × B[K,N]`. One thread per
@@ -631,6 +634,7 @@ pub enum ShaderGroup {
     GroupNormGrad,
     Concat,
     Split,
+    Permute,
     Upsample,
     UpsampleGrad,
     /// Depthwise Conv2d (groups == channels). Used by EfficientNet MBConv.
@@ -712,9 +716,12 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
                 ..Default::default()
             },
         ),
-        ShaderGroup::BlockMatMul | ShaderGroup::BlockMatMulAT | ShaderGroup::BlockMatMulBT => {
-            gen_block_matmul(group, MatMulTile::Large)
-        }
+        ShaderGroup::BlockMatMul
+        | ShaderGroup::BlockMatMulAT
+        | ShaderGroup::BlockMatMulBT
+        | ShaderGroup::BatchMatMul
+        | ShaderGroup::BatchMatMulAT
+        | ShaderGroup::BatchMatMulBT => gen_block_matmul(group, MatMulTile::Large),
         ShaderGroup::MatMulGemv
         | ShaderGroup::MatMulGemvAdd
         | ShaderGroup::MatMulGemvBT
@@ -785,6 +792,7 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         }
         ShaderGroup::Concat => ShaderModule::new(include_str!("shaders/concat.wgsl")),
         ShaderGroup::Split => ShaderModule::new(include_str!("shaders/split.wgsl")),
+        ShaderGroup::Permute => ShaderModule::new(include_str!("shaders/permute.wgsl")),
         ShaderGroup::Upsample => ShaderModule::new(include_str!("shaders/upsample.wgsl")),
         ShaderGroup::UpsampleGrad => ShaderModule::new(include_str!("shaders/upsample_grad.wgsl")),
         ShaderGroup::Conv2dDw => ShaderModule::new(include_str!("shaders/conv2d_dw.wgsl")),
@@ -1689,9 +1697,12 @@ const Q8_DEQUANT_FN: &str = include_str!("shaders/dequant_q8.wgsl");
 /// Generate the 32×32 small-tile form of a matmul group.
 pub fn generate_module_small(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
     match group {
-        ShaderGroup::BlockMatMul | ShaderGroup::BlockMatMulAT | ShaderGroup::BlockMatMulBT => {
-            gen_block_matmul(group, MatMulTile::Small)
-        }
+        ShaderGroup::BlockMatMul
+        | ShaderGroup::BlockMatMulAT
+        | ShaderGroup::BlockMatMulBT
+        | ShaderGroup::BatchMatMul
+        | ShaderGroup::BatchMatMulAT
+        | ShaderGroup::BatchMatMulBT => gen_block_matmul(group, MatMulTile::Small),
         ShaderGroup::MatMul
         | ShaderGroup::MatMulAdd
         | ShaderGroup::MatMulAT
@@ -1727,6 +1738,25 @@ fn gen_block_matmul(group: ShaderGroup, tile: MatMulTile) -> ShaderModule {
             "(a_row * params._pad + wgid.z) * params.k + a_col",
             "(wgid.z * params.n + b_col) * params.k + b_row",
             "(row * params._pad + wgid.z) * params.n + col",
+        ),
+        // Batch-major: one whole matrix per `wgid.z`.
+        ShaderGroup::BatchMatMul => (
+            ShaderGroup::MatMul,
+            "(wgid.z * params.m + a_row) * params.k + a_col",
+            "(wgid.z * params.k + b_row) * params.n + b_col",
+            "(wgid.z * params.m + row) * params.n + col",
+        ),
+        ShaderGroup::BatchMatMulAT => (
+            ShaderGroup::MatMulAT,
+            "(wgid.z * params.k + a_col) * params.m + a_row",
+            "(wgid.z * params.k + b_row) * params.n + b_col",
+            "(wgid.z * params.m + row) * params.n + col",
+        ),
+        ShaderGroup::BatchMatMulBT => (
+            ShaderGroup::MatMulBT,
+            "(wgid.z * params.m + a_row) * params.k + a_col",
+            "(wgid.z * params.n + b_col) * params.k + b_row",
+            "(wgid.z * params.m + row) * params.n + col",
         ),
         _ => unreachable!(),
     };
@@ -2897,6 +2927,15 @@ mod tests {
                 ShaderGroup::BlockMatMulBT,
                 naga::valid::Capabilities::empty(),
             ),
+            (ShaderGroup::BatchMatMul, naga::valid::Capabilities::empty()),
+            (
+                ShaderGroup::BatchMatMulAT,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
+                ShaderGroup::BatchMatMulBT,
+                naga::valid::Capabilities::empty(),
+            ),
             (ShaderGroup::MatMulATAdd, naga::valid::Capabilities::empty()),
             (ShaderGroup::MatMulBTAdd, naga::valid::Capabilities::empty()),
             // The GEMV family's reduction is a generation-time choice, and
@@ -3365,6 +3404,9 @@ mod tests {
             (ShaderGroup::BlockMatMul, empty),
             (ShaderGroup::BlockMatMulAT, empty),
             (ShaderGroup::BlockMatMulBT, empty),
+            (ShaderGroup::BatchMatMul, empty),
+            (ShaderGroup::BatchMatMulAT, empty),
+            (ShaderGroup::BatchMatMulBT, empty),
             (ShaderGroup::MatMulATAdd, empty),
             (ShaderGroup::MatMulBTAdd, empty),
             (ShaderGroup::Reduce, empty),
@@ -3478,7 +3520,10 @@ mod tests {
                 ShaderEntry::Generated => Vec::new(),
                 ShaderEntry::BlockMatMul
                 | ShaderEntry::BlockMatMulAT
-                | ShaderEntry::BlockMatMulBT => vec!["matrix_a", "matrix_b", "matrix_c", "params"],
+                | ShaderEntry::BlockMatMulBT
+                | ShaderEntry::BatchMatMul
+                | ShaderEntry::BatchMatMulAT
+                | ShaderEntry::BatchMatMulBT => vec!["matrix_a", "matrix_b", "matrix_c", "params"],
                 ShaderEntry::MatMul
                 | ShaderEntry::MatMulAT
                 | ShaderEntry::MatMulBT
@@ -3599,7 +3644,9 @@ mod tests {
                     vec!["src_a", "src_b", "bias", "dst", "stats", "params"]
                 }
                 ShaderEntry::Concat => vec!["src_a", "src_b", "dst", "params"],
-                ShaderEntry::SplitA | ShaderEntry::SplitB => vec!["src", "dst", "params"],
+                ShaderEntry::SplitA | ShaderEntry::SplitB | ShaderEntry::Permute => {
+                    vec!["src", "dst", "params"]
+                }
                 ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => {
                     vec!["src", "dst", "params"]
                 }
@@ -3658,6 +3705,9 @@ mod tests {
             ShaderEntry::BlockMatMul,
             ShaderEntry::BlockMatMulAT,
             ShaderEntry::BlockMatMulBT,
+            ShaderEntry::BatchMatMul,
+            ShaderEntry::BatchMatMulAT,
+            ShaderEntry::BatchMatMulBT,
             ShaderEntry::MatMul,
             ShaderEntry::MatMulAT,
             ShaderEntry::MatMulBT,
@@ -3717,6 +3767,7 @@ mod tests {
             ShaderEntry::Concat,
             ShaderEntry::SplitA,
             ShaderEntry::SplitB,
+            ShaderEntry::Permute,
             ShaderEntry::Upsample2x,
             ShaderEntry::Upsample2xGrad,
             ShaderEntry::Conv2dDw,

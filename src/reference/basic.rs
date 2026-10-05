@@ -199,6 +199,35 @@ fn block_matmul(node: &Node, a: &Tensor, b: &Tensor, transpose_b: bool) -> Resul
     Ok(out)
 }
 
+/// One `matmul_kind` per batch, with the batch op's transposition.
+fn batch_matmul(node: &Node, a: &Tensor, b: &Tensor) -> Result<Vec<f64>, Error> {
+    let (&[batch, a0, a1], &[b_batch, b0, b1]) = (a.shape.as_slice(), b.shape.as_slice()) else {
+        return Err(invalid(node, "batch matmul operands must be 3D"));
+    };
+    if batch != b_batch {
+        return Err(invalid(node, "batch sizes differ"));
+    }
+    let op = match node.op {
+        Op::BatchMatMul => Op::MatMul,
+        Op::BatchMatMulAT => Op::MatMulAT,
+        _ => Op::MatMulBT,
+    };
+    let mut out = Vec::new();
+    for i in 0..batch {
+        let slice = |t: &Tensor, rows: usize, cols: usize| Tensor {
+            shape: vec![rows, cols],
+            data: t.data[i * rows * cols..(i + 1) * rows * cols].to_vec(),
+        };
+        out.extend(matmul_kind(
+            node,
+            &op,
+            &slice(a, a0, a1),
+            &slice(b, b0, b1),
+        )?);
+    }
+    Ok(out)
+}
+
 fn block_matmul_at(node: &Node, a: &Tensor, b: &Tensor, groups: usize) -> Result<Vec<f64>, Error> {
     if a.shape.len() != 2 || b.shape.len() != 2 || a.shape[0] != b.shape[0] {
         return Err(invalid(node, "block matmul AT needs [K, G*M] and [K, G*N]"));
@@ -376,6 +405,9 @@ pub(super) fn eval(node: &Node, ins: &[&Tensor]) -> Result<Vec<f64>, Error> {
         }
         Op::BlockMatMul => block_matmul(node, arg(0)?, arg(1)?, false)?,
         Op::BlockMatMulBT => block_matmul(node, arg(0)?, arg(1)?, true)?,
+        Op::BatchMatMul | Op::BatchMatMulAT | Op::BatchMatMulBT => {
+            batch_matmul(node, arg(0)?, arg(1)?)?
+        }
         Op::BlockMatMulAT { groups } => block_matmul_at(node, arg(0)?, arg(1)?, groups)?,
 
         Op::Add => zip(node, arg(0)?, arg(1)?, |a, b| a + b)?,
@@ -587,6 +619,28 @@ pub(super) fn eval(node: &Node, ins: &[&Tensor]) -> Result<Vec<f64>, Error> {
                 }
             }
             out
+        }
+        Op::Permute { ref perm } => {
+            let x = arg(0)?;
+            if perm.len() != x.shape.len() {
+                return Err(invalid(node, "permutation rank differs from the input"));
+            }
+            let out_shape: Vec<usize> = perm.iter().map(|&axis| x.shape[axis]).collect();
+            let mut strides = vec![1; x.shape.len()];
+            for d in (0..x.shape.len().saturating_sub(1)).rev() {
+                strides[d] = strides[d + 1] * x.shape[d + 1];
+            }
+            (0..x.len())
+                .map(|mut i| {
+                    // Peel output coordinates from the last axis inward.
+                    let mut source = 0;
+                    for d in (0..out_shape.len()).rev() {
+                        source += (i % out_shape[d]) * strides[perm[d]];
+                        i /= out_shape[d];
+                    }
+                    x.data[source]
+                })
+                .collect()
         }
         Op::BiasAdd => row_broadcast(node, arg(0)?, arg(1)?, |a, b| a + b)?,
         Op::BiasMul => row_broadcast(node, arg(0)?, arg(1)?, |a, b| a * b)?,
