@@ -1368,11 +1368,13 @@ pub struct ExecutionPlan {
 }
 
 impl ExecutionPlan {
-    /// Everything about the plan that decides its cost, independent of
-    /// dispatch order and buffer numbering: each dispatch's shader, kernel,
-    /// parameters, grid and operand counts, and the buffer sizes. Two plans
-    /// with equal signatures do the same work.
-    pub fn signature(&self) -> Vec<String> {
+    /// The dispatches the plan runs, independent of their order and buffer
+    /// numbering: each one's shader, kernel, parameters, grid and operand
+    /// counts, sorted, then the buffer sizes. Equal inventories launch the
+    /// same kernels on the same shapes, so they cost the same; they do not
+    /// show that the kernels read the same values, which
+    /// [`Self::dataflow_digest`] does.
+    pub fn dispatch_inventory(&self) -> Vec<String> {
         let mut out: Vec<String> = self
             .dispatches
             .iter()
@@ -1393,6 +1395,63 @@ impl ExecutionPlan {
         buffers.sort_unstable();
         out.push(format!("buffers {buffers:?}"));
         out
+    }
+
+    /// A digest of what the plan computes. Each value written is hashed
+    /// from its dispatch (shader, kernel, parameters, grid) and the digests
+    /// of the values it reads, starting from parameters and inputs by name,
+    /// derived parameters by source, and constants by content. The digest
+    /// covers every value written and the outputs, so it is independent of
+    /// dispatch order and buffer numbering but changes when any dispatch
+    /// reads another value or a constant differs.
+    pub fn dataflow_digest(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        fn hash(value: impl Hash) -> u64 {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            value.hash(&mut h);
+            h.finish()
+        }
+        let mut current: HashMap<BufferRef, u64> = HashMap::new();
+        for &(ref name, buf) in self.param_buffers.iter().chain(&self.input_buffers) {
+            current.insert(buf, hash(("leaf", name)));
+        }
+        for &(buf, ref data) in &self.constant_buffers {
+            let bits: Vec<u32> = data.iter().map(|v| v.to_bits()).collect();
+            current.insert(buf, hash(("constant", bits)));
+        }
+        for &(buf, ref sources, ref transform) in &self.derived_params {
+            current.insert(buf, hash(("derived", sources, format!("{transform:?}"))));
+        }
+        let unwritten = hash("unwritten");
+        let mut written = Vec::with_capacity(self.dispatches.len());
+        for d in &self.dispatches {
+            let reads: Vec<u64> = d
+                .input_buffers
+                .iter()
+                .map(|b| current.get(b).copied().unwrap_or(unwritten))
+                .collect();
+            let produced = hash((
+                format!("{:?} {:?}", d.shader, d.kernel),
+                &d.params,
+                d.workgroups,
+                reads,
+            ));
+            for (slot, out) in std::iter::once(&d.output_buffer)
+                .chain(&d.extra_outputs)
+                .enumerate()
+            {
+                let value = hash((produced, slot));
+                current.insert(*out, value);
+                written.push(value);
+            }
+        }
+        written.sort_unstable();
+        let outputs: Vec<u64> = self
+            .output_buffers
+            .iter()
+            .map(|b| current.get(b).copied().unwrap_or(unwritten))
+            .collect();
+        hash((written, outputs))
     }
 
     fn node_buffer(&self, node_id: NodeId) -> BufferRef {

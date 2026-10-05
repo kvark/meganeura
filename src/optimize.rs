@@ -155,9 +155,6 @@ impl egglog::extract::CostModel<u64> for FusionCostModel {
         if name == "Leaf" {
             return 0;
         }
-        if is_pattern_only(name) {
-            return PATTERN_ONLY_COST;
-        }
         let Some(sizes) = self.sizes.as_ref() else {
             return 1;
         };
@@ -645,20 +642,6 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
   (GeGLU Op Op)
   (GeGLUPacked Op Op Op)
   (GeGLUPackedBT Op Op Op)
-  (Softmax Op)
-  (RmsNorm i64 Op Op)
-  (LayerNorm i64 Op Op Op)
-  (PExp Op)
-  (PRecip Op)
-  (PRsqrt Op)
-  (PSqrt Op)
-  (PMaxInner Op)
-  (PSumInner Op)
-  (PMeanInner Op)
-  (PBroadcastInner Op)
-  (POffset i64 Op)
-  (PBiasMul Op Op)
-  (PBiasAdd Op Op)
   (Op1 i64 Op)
   (Op2 i64 Op Op)
   (Op3 i64 Op Op Op)
@@ -703,49 +686,6 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
 (rewrite (Mul ?up (Gelu ?gate)) (GeGLU ?gate ?up))
 (rewrite (GeGLU (MatMul ?h ?wg) (MatMul ?h ?wu)) (GeGLUPacked ?h ?wg ?wu))
 (rewrite (GeGLU (MatMulBT ?h ?wg) (MatMulBT ?h ?wu)) (GeGLUPackedBT ?h ?wg ?wu))
-
-; --- Composite recognition ---
-; Builds recognize composites spelled exactly as their decompositions
-; before optimizing (`Graph::recompose`). These rules catch spellings that
-; differ, as exporters write them: commuted operands, a reciprocal of a
-; square root, a reciprocal taken after a broadcast. Primitives without a
-; named constructor are encoded generically,
-; so the encoder also states what each one computes as a pattern-only
-; `P*` term in the same e-class. Those terms exist only to be matched here;
-; extraction never selects them.
-
-; softmax(x) = e / sum(e), e = exp(x - max(x))
-(rule ((= ?e (PExp (Add ?x (Neg (PBroadcastInner (PMaxInner ?x))))))
-       (= ?y (Mul ?e (PBroadcastInner (PRecip (PSumInner ?e))))))
-      ((union ?y (Softmax ?x))))
-(rule ((= ?e (PExp (Add ?x (Neg (PBroadcastInner (PMaxInner ?x))))))
-       (= ?y (Mul (PBroadcastInner (PRecip (PSumInner ?e))) ?e)))
-      ((union ?y (Softmax ?x))))
-
-; 1 / sqrt(v) is rsqrt(v), as exporters spell it
-(rule ((= ?r (PRecip (PSqrt ?v)))) ((union ?r (PRsqrt ?v))))
-; and a reciprocal commutes with a broadcast, which division applies first
-(rule ((= ?r (PRecip (PBroadcastInner ?s))))
-      ((union ?r (PBroadcastInner (PRecip ?s)))))
-
-; rms_norm(x, w) = x * rsqrt(mean(x²) + eps) * w
-(rule ((= ?r (PRsqrt (POffset ?eps (PMeanInner (Mul ?x ?x)))))
-       (= ?y (PBiasMul (Mul ?x (PBroadcastInner ?r)) ?w)))
-      ((union ?y (RmsNorm ?eps ?x ?w))))
-(rule ((= ?r (PRsqrt (POffset ?eps (PMeanInner (Mul ?x ?x)))))
-       (= ?y (PBiasMul (Mul (PBroadcastInner ?r) ?x) ?w)))
-      ((union ?y (RmsNorm ?eps ?x ?w))))
-
-; layer_norm(x, w, b) = c * rsqrt(mean(c²) + eps) * w + b, c = x - mean(x)
-(rule ((= ?c (Add ?x (Neg (PBroadcastInner (PMeanInner ?x)))))
-       (= ?r (PRsqrt (POffset ?eps (PMeanInner (Mul ?c ?c)))))
-       (= ?y (PBiasAdd (PBiasMul (Mul ?c (PBroadcastInner ?r)) ?w) ?b)))
-      ((union ?y (LayerNorm ?eps ?x ?w ?b))))
-(rule ((= ?c (Add ?x (Neg (PBroadcastInner (PMeanInner ?x)))))
-       (= ?r (PRsqrt (POffset ?eps (PMeanInner (Mul ?c ?c)))))
-       (= ?y (PBiasAdd (PBiasMul (Mul (PBroadcastInner ?r) ?c) ?w) ?b)))
-      ((union ?y (LayerNorm ?eps ?x ?w ?b))))
-
 ",
     );
     if pack_swiglu {
@@ -755,8 +695,7 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
     }
     // Saturation is bounded: the deepest rewrite chain is three rules
     // (Mul(x, Sigmoid(x)) -> Silu, Mul(Silu, up) -> SwiGLU, then
-    // SwiGLU(MatMul, MatMul) -> SwiGLUPacked, and likewise recip∘broadcast,
-    // recip∘sqrt -> rsqrt, then a norm), so three iterations reach a
+    // SwiGLU(MatMul, MatMul) -> SwiGLUPacked), so three iterations reach a
     // fixpoint; the fourth is margin for future rules.
 }
 
@@ -848,65 +787,6 @@ fn node_to_egglog_expr(node: &Node) -> String {
     }
 }
 
-/// Pattern-only constructors: facts the encoder states about generically
-/// encoded primitives so composite rules can match them. Extraction must
-/// never select one, since stamping cannot rebuild it.
-const PATTERN_ONLY: &[&str] = &[
-    "PExp",
-    "PRecip",
-    "PRsqrt",
-    "PSqrt",
-    "PMaxInner",
-    "PSumInner",
-    "PMeanInner",
-    "PBroadcastInner",
-    "POffset",
-    "PBiasMul",
-    "PBiasAdd",
-];
-
-/// Larger than any real extraction cost, but far from saturating when a
-/// handful are summed.
-const PATTERN_ONLY_COST: u64 = 1 << 48;
-
-pub(crate) fn is_pattern_only(name: &str) -> bool {
-    PATTERN_ONLY.contains(&name)
-}
-
-/// The pattern-only term for a primitive that composite rules match on,
-/// stated over the node's own inputs. A mean is a sum scaled by exactly
-/// `1 / N`, recognized here because egglog cannot compare the factor.
-fn pattern_term(g: &Graph, node: &Node, segment: &HashSet<usize>) -> Option<String> {
-    let arg = |slot: usize| format!("$n{}", node.inputs[slot]);
-    Some(match node.op {
-        Op::Exp => format!("(PExp {})", arg(0)),
-        Op::Recip => format!("(PRecip {})", arg(0)),
-        Op::Rsqrt => format!("(PRsqrt {})", arg(0)),
-        Op::Sqrt => format!("(PSqrt {})", arg(0)),
-        Op::MaxInner => format!("(PMaxInner {})", arg(0)),
-        Op::SumInner => format!("(PSumInner {})", arg(0)),
-        Op::BroadcastInner { .. } => format!("(PBroadcastInner {})", arg(0)),
-        Op::Offset { value } => format!("(POffset {} {})", value.to_bits(), arg(0)),
-        Op::BiasMul => format!("(PBiasMul {} {})", arg(0), arg(1)),
-        Op::BiasAdd => format!("(PBiasAdd {} {})", arg(0), arg(1)),
-        Op::Scale { factor } => {
-            // The sum's own input is bound only when the sum is encoded
-            // in this segment, rather than as an opaque leaf.
-            let sum = g.node(node.inputs[0]);
-            if !matches!(sum.op, Op::SumInner) || !segment.contains(&(sum.id as usize)) {
-                return None;
-            }
-            let summed = sum.inputs[0];
-            let inner = g.node(summed).ty.shape[1];
-            if factor.to_bits() != crate::graph::mean_factor(inner).to_bits() {
-                return None;
-            }
-            format!("(PMeanInner $n{summed})")
-        }
-        _ => return None,
-    })
-}
-
 /// Egglog program for one segment instance: external dependencies become
 /// opaque `Leaf` terms, segment nodes are encoded in id order. Returns
 /// the program and the external node ids (needed to size their e-classes
@@ -939,9 +819,6 @@ fn segment_program(g: &Graph, seg: &Segment) -> (String, Vec<usize>) {
             continue;
         }
         prog.push_str(&format!("(let $n{} {})\n", id, node_to_egglog_expr(node)));
-        if let Some(pattern) = pattern_term(g, node, &idset) {
-            prog.push_str(&format!("(union $n{id} {pattern})\n"));
-        }
     }
     // See the comment at the end of `egglog_prelude` for the bound.
     prog.push_str("(run 4)\n");
@@ -1408,35 +1285,6 @@ impl Stamper<'_> {
             "SwiGLU" => (Op::SwiGLU, ty_of(inputs[0]), Some("Silu+Mul→SwiGLU")),
             "Gelu" => (Op::Gelu, ty_of(inputs[0]), None),
             "GeGLU" => (Op::GeGLU, ty_of(inputs[0]), Some("Gelu+Mul→GeGLU")),
-            "Softmax" => (
-                Op::Softmax,
-                ty_of(inputs[0]),
-                Some("decomposed softmax→Softmax"),
-            ),
-            "RmsNorm" => {
-                let &[eps] = attrs else {
-                    return Err(format!("RmsNorm takes one attribute, got {attrs:?}"));
-                };
-                (
-                    Op::RmsNorm {
-                        eps: f32::from_bits(eps as u32),
-                    },
-                    ty_of(inputs[0]),
-                    Some("decomposed RMSNorm→RmsNorm"),
-                )
-            }
-            "LayerNorm" => {
-                let &[eps] = attrs else {
-                    return Err(format!("LayerNorm takes one attribute, got {attrs:?}"));
-                };
-                (
-                    Op::LayerNorm {
-                        eps: f32::from_bits(eps as u32),
-                    },
-                    ty_of(inputs[0]),
-                    Some("decomposed LayerNorm→LayerNorm"),
-                )
-            }
             other => return Err(format!("unknown constructor {}", other)),
         };
         let id = self.place(op, inputs.clone(), ty, target);
@@ -1692,9 +1540,6 @@ fn static_constructor(name: &str) -> Result<&'static str, String> {
         "GeGLU" => "GeGLU",
         "GeGLUPacked" => "GeGLUPacked",
         "GeGLUPackedBT" => "GeGLUPackedBT",
-        "Softmax" => "Softmax",
-        "RmsNorm" => "RmsNorm",
-        "LayerNorm" => "LayerNorm",
         other => return Err(format!("unknown constructor {}", other)),
     })
 }
@@ -2646,43 +2491,31 @@ mod tests {
         g.nodes().iter().map(|node| &node.op).collect()
     }
 
+    /// Composites spelled in primitives reach the optimizer recognized: the
+    /// egglog rules no longer recognize them, so `optimize` alone leaves a
+    /// decomposition as written.
     #[test]
-    fn decomposed_softmax_becomes_the_fused_kernel() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 16]);
-        let y = g.decomposed_softmax(x);
-        g.set_outputs(vec![y]);
-        assert!(g.nodes().iter().all(|node| node.op.is_primitive()));
-
-        let (opt, report) = optimize_with_report(&g);
-        let out = opt.node(opt.outputs()[0]);
-        assert!(matches!(out.op, Op::Softmax), "got {:?}", out.op);
-        assert!(matches!(opt.node(out.inputs[0]).op, Op::Input { .. }));
-        assert_eq!(live_ops(&opt).len(), 2, "{:?}", live_ops(&opt));
-        assert!(
-            report
-                .fusions_applied
-                .iter()
-                .any(|f| f.0.contains("Softmax"))
-        );
-    }
-
-    #[test]
-    fn decomposed_rms_norm_becomes_the_fused_kernel() {
+    fn the_optimizer_leaves_decompositions_to_recognition() {
         let mut g = Graph::new();
         let x = g.input("x", &[4, 16]);
         let w = g.parameter("w", &[16]);
-        let y = g.decomposed_rms_norm(x, w, 1e-6);
+        let h = g.decomposed_rms_norm(x, w, 1e-6);
+        let y = g.decomposed_softmax(h);
         g.set_outputs(vec![y]);
-        assert!(g.nodes().iter().all(|node| node.op.is_primitive()));
-
         let opt = optimize(&g);
+        assert!(
+            opt.nodes().iter().all(|node| node.op.is_primitive()),
+            "{:?}",
+            live_ops(&opt)
+        );
+        let opt = optimize(&g.recompose());
         let out = opt.node(opt.outputs()[0]);
-        match out.op {
+        assert!(matches!(out.op, Op::Softmax), "{:?}", live_ops(&opt));
+        match opt.node(out.inputs[0]).op {
             Op::RmsNorm { eps } => assert_eq!(eps.to_bits(), 1e-6f32.to_bits()),
             ref other => panic!("expected RmsNorm, got {other:?}"),
         }
-        assert_eq!(live_ops(&opt).len(), 3, "{:?}", live_ops(&opt));
+        assert_eq!(live_ops(&opt).len(), 4, "{:?}", live_ops(&opt));
     }
 
     #[test]
@@ -2695,7 +2528,7 @@ mod tests {
         g.set_outputs(vec![y]);
         assert!(g.nodes().iter().all(|node| node.op.is_primitive()));
 
-        let opt = optimize(&g);
+        let opt = optimize(&g.recompose());
         let out = opt.node(opt.outputs()[0]);
         match out.op {
             Op::LayerNorm { eps } => assert_eq!(eps.to_bits(), 1e-5f32.to_bits()),
@@ -2704,7 +2537,8 @@ mod tests {
         assert_eq!(live_ops(&opt).len(), 4, "{:?}", live_ops(&opt));
     }
 
-    /// Exporters write `x / sqrt(v)` as a reciprocal of a square root.
+    /// Exporters write `x / sqrt(v)` as a reciprocal of a square root,
+    /// taken after the broadcast.
     #[test]
     fn reciprocal_square_root_matches_rsqrt() {
         let mut g = Graph::new();
@@ -2718,13 +2552,13 @@ mod tests {
         let normalized = g.div(x, root);
         let y = g.bias_mul(normalized, w);
         g.set_outputs(vec![y]);
-        let opt = optimize(&g);
+        let opt = optimize(&g.recompose());
         let out = opt.node(opt.outputs()[0]);
         assert!(matches!(out.op, Op::RmsNorm { .. }), "{:?}", live_ops(&opt));
     }
 
-    /// Composites inside a training graph fold too, while the primitives
-    /// the backward pass reads stay live.
+    /// Composites with exact gradients fold in training graphs too, while
+    /// the primitives the backward pass reads stay live.
     #[test]
     fn decompositions_fold_in_training_graphs() {
         let mut g = Graph::new();
@@ -2734,7 +2568,8 @@ mod tests {
         let y = g.decomposed_softmax(h);
         let loss = g.sum_all(y);
         g.set_outputs(vec![loss]);
-        let opt = optimize(&crate::autodiff::differentiate(&g));
+        let forward = g.recompose_for_training();
+        let opt = optimize(&crate::autodiff::differentiate(&forward));
         let ops = live_ops(&opt);
         assert!(ops.iter().any(|op| matches!(op, Op::Softmax)), "{ops:?}");
         assert!(
@@ -2743,8 +2578,9 @@ mod tests {
         );
     }
 
-    /// A near miss stays as written: the rules check the whole structure,
-    /// including the mean's exact factor and which tensor the max is of.
+    /// A near miss stays as written: recognition checks the whole
+    /// structure, including the mean's exact factor and which tensor the
+    /// max is of.
     #[test]
     fn near_misses_are_not_fused() {
         let mut g = Graph::new();
@@ -2771,7 +2607,7 @@ mod tests {
         let not_softmax = g.mul(e, inv);
         g.set_outputs(vec![not_rms, not_softmax]);
 
-        let opt = optimize(&g);
+        let opt = optimize(&g.recompose());
         assert!(
             opt.nodes()
                 .iter()

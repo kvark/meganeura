@@ -534,7 +534,9 @@ pub fn differentiate(forward: &Graph) -> Graph {
                     inverse[axis] = d;
                 }
                 let x = node.inputs[0];
-                let grad_x = graph.permute(grad_output, &inverse);
+                // The gradient may arrive through a view of the result.
+                let grad = graph.reshape(grad_output, &node.ty.shape);
+                let grad_x = graph.permute(grad, &inverse);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
             Op::Transpose => {
@@ -814,7 +816,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
             } => {
                 let input = node.inputs[0];
                 let kernel = node.inputs[1];
-                let in_size = forward.nodes()[input as usize].ty.shape[0] as u32;
+                let in_size = forward.nodes()[input as usize].ty.num_elements() as u32;
                 let batch = in_size / (in_channels * in_h * in_w);
                 let grad_input = graph.conv2d_grad_input(
                     grad_output,
@@ -911,7 +913,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // inputs: [input, kernel]; differentiate the direct convolution.
                 let input = node.inputs[0];
                 let original_kernel = node.inputs[1];
-                let in_size = forward.nodes()[input as usize].ty.shape[0] as u32;
+                let in_size = forward.nodes()[input as usize].ty.num_elements() as u32;
                 let batch = in_size / (in_channels * in_h * in_w);
                 let grad_input = graph.conv2d_grad_input(
                     grad_output,
@@ -955,7 +957,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let x = node.inputs[0];
                 let w = node.inputs[1];
                 let b = node.inputs[2];
-                let x_size = forward.nodes()[x as usize].ty.shape[0] as u32;
+                let x_size = forward.nodes()[x as usize].ty.num_elements() as u32;
                 let batch = x_size / (channels * spatial);
 
                 let grad_x = graph.group_norm_grad_input(
@@ -994,7 +996,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
             } => {
                 let a = node.inputs[0];
                 let b = node.inputs[1];
-                let a_size = forward.nodes()[a as usize].ty.shape[0] as u32;
+                let a_size = forward.nodes()[a as usize].ty.num_elements() as u32;
                 let batch = a_size / (channels_a * spatial);
                 let grad_a = graph.split_a(grad_output, batch, channels_a, channels_b, spatial);
                 let grad_b = graph.split_b(grad_output, batch, channels_a, channels_b, spatial);
@@ -1007,7 +1009,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 in_w,
             } => {
                 let x = node.inputs[0];
-                let x_size = forward.nodes()[x as usize].ty.shape[0] as u32;
+                let x_size = forward.nodes()[x as usize].ty.num_elements() as u32;
                 let batch = x_size / (channels * in_h * in_w);
                 let grad_x = graph.upsample_2x_grad(grad_output, batch, channels, in_h, in_w);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
@@ -1032,7 +1034,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // test stayed at 2.0 after 400 updates). Same trap fires
                 // for any user split off a parameter subtree.
                 let x = node.inputs[0];
-                let grad_out_size = forward.nodes()[node.id as usize].ty.shape[0] as u32;
+                let grad_out_size = forward.nodes()[node.id as usize].ty.num_elements() as u32;
                 let batch = grad_out_size / (channels_a * spatial);
                 let zeros_b_size = batch as usize * channels_b as usize * spatial as usize;
                 let zeros_b = graph.constant(vec![0.0; zeros_b_size], &[zeros_b_size]);
@@ -1049,7 +1051,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // Backward: zero-fill the first Ca channels, scatter
                 // `grad_output` into the last Cb channels.
                 let x = node.inputs[0];
-                let grad_out_size = forward.nodes()[node.id as usize].ty.shape[0] as u32;
+                let grad_out_size = forward.nodes()[node.id as usize].ty.num_elements() as u32;
                 let batch = grad_out_size / (channels_b * spatial);
                 let zeros_a_size = batch as usize * channels_a as usize * spatial as usize;
                 let zeros_a = graph.constant(vec![0.0; zeros_a_size], &[zeros_a_size]);
@@ -1219,6 +1221,8 @@ fn sum_to(graph: &mut Graph, grad: NodeId, out_shape: &[usize], in_shape: &[usiz
         .filter(|d| !repeated.contains(d))
         .collect();
     let perm: Vec<usize> = kept.iter().chain(&repeated).copied().collect();
+    // The gradient may arrive through a view of the result.
+    let grad = graph.reshape(grad, out_shape);
     let moved = graph.permute(grad, &perm);
     let span: usize = repeated.iter().map(|&d| out_shape[d]).product();
     let rows = out_shape.iter().product::<usize>() / span;

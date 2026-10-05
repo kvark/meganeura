@@ -2,9 +2,9 @@
 //!
 //! A model built only from primitives runs without any model-specific
 //! kernel: every primitive has a lowering, a gradient and a reference
-//! implementation. Fused kernels are the compiler's business: every build
-//! recognizes composites spelled in primitives ([`Graph::recompose`]), so a
-//! new model needs a new kernel only to run faster, not to run at all.
+//! implementation. Fused kernels are the compiler's business: optimized
+//! builds recognize composites spelled in primitives ([`Graph::recompose`]),
+//! so a new model needs a new kernel only to run faster, not to run at all.
 //!
 //! The set follows StableHLO's meaning for each op, restricted to what a
 //! statically planned graph needs: static shapes, reductions and broadcasts
@@ -73,6 +73,7 @@ impl Op {
             | Op::SumInner
             | Op::MaxInner
             | Op::SumAll
+            | Op::ExclusiveCumsum { .. }
             | Op::Transpose
             | Op::Permute { .. }
             | Op::BroadcastTo
@@ -105,7 +106,6 @@ impl Op {
             | Op::NormalizeInnerSum { .. }
             | Op::PairwiseSquaredDistance { .. }
             | Op::PairwiseVectorRejection { .. }
-            | Op::ExclusiveCumsum { .. }
             | Op::ShiftInner { .. }
             | Op::Softmax
             | Op::LogSoftmax
@@ -170,6 +170,27 @@ impl Op {
     /// Whether this op belongs to the primitive set.
     pub fn is_primitive(&self) -> bool {
         self.class() == OpClass::Primitive
+    }
+
+    /// Whether autodiff differentiates this composite, applied to `arity`
+    /// inputs, exactly as it does its decomposition, so that recognizing it
+    /// in a training graph changes no gradient. The losses' gradients treat
+    /// the labels as constant and skip the clamp; RoPE differentiates only
+    /// its static form; the rest are inference-only.
+    pub fn differentiates_as_decomposed(&self, arity: usize) -> bool {
+        match *self {
+            Op::RoPE { .. } => arity == 1,
+            Op::CrossEntropyLoss
+            | Op::BceLoss
+            | Op::RoPEPositions { .. }
+            | Op::CrossAttention { .. }
+            | Op::CachedAttention { .. }
+            | Op::CachedBlockAttention { .. }
+            | Op::ChunkedRelativeAttention { .. }
+            | Op::BiasedAttention { .. }
+            | Op::BiasedCachedAttention { .. } => false,
+            _ => true,
+        }
     }
 }
 

@@ -1,8 +1,9 @@
-//! Transformer layers as `torch.onnx.export` writes them, end to end.
+//! Transformer layers in the form PyTorch's exporter writes, end to end.
 //!
-//! `tests/fixtures/onnx/generate.py` builds the models and their expected
+//! `tests/fixtures/onnx/generate.py` authors the models node by node in
+//! that form (they are not exporter output) and computes their expected
 //! outputs with ONNX's reference evaluator. Each must import, run on the
-//! GPU, and fold its decomposed norms and softmax back into fused kernels.
+//! GPU, and build its decomposed norms and softmax as fused kernels.
 
 use std::path::PathBuf;
 
@@ -25,7 +26,7 @@ fn floats(name: &str) -> Vec<f32> {
         .collect()
 }
 
-/// Run the export and return the optimized graph's ops for inspection.
+/// Run the export and return the recognized, optimized graph's ops.
 fn run(name: &str) -> Vec<Op> {
     let model = load_onnx(&fixture(&format!("{name}.onnx")))
         .unwrap_or_else(|e| panic!("{name}: import failed: {e}"));
@@ -47,7 +48,7 @@ fn run(name: &str) -> Vec<Op> {
         assert!(g.is_finite() && e.is_finite(), "{name}: element {i} is {g}");
         assert!((g - e).abs() < 2e-4, "{name}: element {i} is {g}, want {e}");
     }
-    let graph = meganeura::optimize::optimize(&model.graph);
+    let graph = meganeura::optimize::optimize(&model.graph.recompose());
     graph.nodes().iter().map(|node| node.op.clone()).collect()
 }
 

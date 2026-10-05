@@ -1160,13 +1160,13 @@ mod tests {
     fn decomposed_models_build_the_same_plans() {
         use crate::train::{Mode, compile_plan};
         let plan = |g: &crate::Graph| {
-            compile_plan(
+            let plan = compile_plan(
                 g,
                 Mode::Inference,
                 crate::OptimizeConfig::default(),
                 &crate::CompileOptions::default(),
-            )
-            .signature()
+            );
+            (plan.dispatch_inventory(), plan.dataflow_digest())
         };
         for arch in [
             "llama", "qwen2", "qwen3", "gemma", "gemma2", "gemma3", "phi2", "phi3", "gemma4",
@@ -1200,8 +1200,8 @@ mod tests {
                     };
                     panic!(
                         "{arch} block {block}: plans differ\n  only original: {:#?}\n  only decomposed: {:#?}",
-                        only(&original, &rebuilt),
-                        only(&rebuilt, &original)
+                        only(&original.0, &rebuilt.0),
+                        only(&rebuilt.0, &original.0)
                     );
                 }
             }

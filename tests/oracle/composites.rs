@@ -2,22 +2,25 @@
 //!
 //! For every composite: the decomposition holds only primitives, computes
 //! what the composite computes on the reference interpreter, and builds
-//! exactly the same execution plan once recomposed, for inference and,
-//! where the composite is differentiable, for training. The same plan is
-//! the same performance.
+//! exactly the same execution plan once recomposed: the same dispatches
+//! reading the same values ([`ExecutionPlan::dataflow_digest`]), for
+//! inference and, where the composite is differentiable, for training.
+//!
+//! [`ExecutionPlan::dataflow_digest`]: meganeura::compile::ExecutionPlan::dataflow_digest
 
 use meganeura::graph::OpClass;
 use meganeura::reference::{Feeds, evaluate_outputs, gradients};
 use meganeura::{CompileOptions, Graph, Mode, NodeId, OptimizeConfig, compile_plan};
 
-fn signature(graph: &Graph, mode: Mode) -> Vec<String> {
-    compile_plan(
+/// The plan's dispatch inventory, and the digest of what it computes.
+fn signature(graph: &Graph, mode: Mode) -> (Vec<String>, u64) {
+    let plan = compile_plan(
         graph,
         mode,
         OptimizeConfig::default(),
         &CompileOptions::default(),
-    )
-    .signature()
+    );
+    (plan.dispatch_inventory(), plan.dataflow_digest())
 }
 
 /// One composite case: a graph whose last output applies the composite.
@@ -93,13 +96,44 @@ impl Case {
             }
         }
 
+        // Same gradients: training recognizes only composites whose
+        // gradient is their decomposition's, so recognizing changes none.
+        if self.trainable {
+            let primitive = param_grads(&decomposed, &self.feeds);
+            let recognized = param_grads(&decomposed.recompose_for_training(), &self.feeds);
+            assert_eq!(primitive.len(), recognized.len(), "{what}: parameters");
+            for ((name, p), (_, r)) in primitive.iter().zip(&recognized) {
+                // A parameter without a gradient has a scalar zero.
+                let zero = |g: &[f64]| g.iter().all(|&v| v == 0.0);
+                if p.len() != r.len() && zero(p) && zero(r) {
+                    continue;
+                }
+                assert_eq!(p.len(), r.len(), "{what}: gradient of {name}");
+                let scale = p.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+                for (i, (a, b)) in p.iter().zip(r).enumerate() {
+                    assert!(
+                        (a - b).abs() <= 1e-6 * scale,
+                        "{what}: gradient of {name}[{i}] is {b} recognized, {a} in primitives"
+                    );
+                }
+            }
+        }
+
         // Same plans.
         let mut modes = vec![Mode::Inference];
         if self.trainable {
             modes.push(Mode::Training);
         }
         for mode in modes {
-            let original = signature(&self.graph, mode);
+            // Training recognizes only composites with exact gradients; the
+            // others build as their primitives do.
+            let written = match mode {
+                Mode::Inference => self.graph.deep_clone(),
+                Mode::Training => self
+                    .graph
+                    .decompose_where(|op| !op.differentiates_as_decomposed(1)),
+            };
+            let original = signature(&written, mode);
             let rebuilt = signature(&decomposed, mode);
             if original != rebuilt {
                 let only = |a: &[String], b: &[String]| {
@@ -110,8 +144,8 @@ impl Case {
                 };
                 panic!(
                     "{what} ({mode:?}): plans differ\n  only original: {:#?}\n  only decomposed: {:#?}\n  recomposed ops: {:?}",
-                    only(&original, &rebuilt),
-                    only(&rebuilt, &original),
+                    only(&original.0, &rebuilt.0),
+                    only(&rebuilt.0, &original.0),
                     decomposed
                         .recompose()
                         .nodes()
@@ -122,6 +156,28 @@ impl Case {
             }
         }
     }
+}
+
+/// The loss gradient of each parameter of `forward`, on the reference
+/// interpreter, by parameter name.
+fn param_grads(forward: &Graph, feeds: &Feeds) -> Vec<(String, Vec<f64>)> {
+    let names: Vec<String> = forward
+        .nodes()
+        .iter()
+        .filter_map(|node| match node.op {
+            meganeura::graph::Op::Parameter { ref name } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    let diff = meganeura::autodiff::differentiate(forward);
+    let out = evaluate_outputs(&diff, feeds).unwrap();
+    let mut grads: Vec<_> = names
+        .into_iter()
+        .zip(&out[forward.outputs().len()..])
+        .map(|(name, grad)| (name, grad.data.clone()))
+        .collect();
+    grads.sort_by(|a, b| a.0.cmp(&b.0));
+    grads
 }
 
 fn check_all(cases: Vec<Case>) {
@@ -304,24 +360,6 @@ fn reductions_and_losses() {
                 let v = g.parameter("v", &[12, 6]);
                 let u = g.parameter("u", &[4, 6]);
                 g.pairwise_vector_rejection(v, u, 3)
-            },
-            |_| {},
-        ),
-        case(
-            "cumsum",
-            true,
-            |g| {
-                let x = g.parameter("x", &[4, 9]);
-                g.exclusive_cumsum(x, false)
-            },
-            |_| {},
-        ),
-        case(
-            "cumsum_reverse",
-            true,
-            |g| {
-                let x = g.parameter("x", &[4, 9]);
-                g.exclusive_cumsum(x, true)
             },
             |_| {},
         ),
@@ -689,7 +727,6 @@ fn every_composite_is_covered() {
         ("NormalizeInnerSum", "normalize_inner_sum"),
         ("PairwiseSquaredDistance", "pairwise_distance"),
         ("PairwiseVectorRejection", "pairwise_rejection"),
-        ("ExclusiveCumsum", "cumsum"),
         ("ShiftInner", "shift_right"),
         ("Softmax", "softmax"),
         ("LogSoftmax", "log_softmax"),
@@ -727,4 +764,58 @@ fn every_composite_is_covered() {
         );
     }
     assert_eq!(names.len(), covered.len(), "{names:?}");
+}
+
+/// Why training builds leave the losses in primitives: their fused
+/// gradients treat the labels as constant and differentiate through the
+/// probability clamp, so recognizing them would change what a model with
+/// trainable labels, or a saturated prediction, learns.
+#[test]
+fn loss_gradients_stay_exact_in_training() {
+    let differentiated = |build: &dyn Fn(&mut Graph) -> NodeId, feeds: &Feeds| {
+        let mut g = Graph::new();
+        let loss = build(&mut g);
+        g.set_outputs(vec![loss]);
+        let recognized = g.decompose().recompose_for_training();
+        assert!(
+            recognized.nodes().iter().all(|n| !matches!(
+                n.op,
+                meganeura::graph::Op::CrossEntropyLoss | meganeura::graph::Op::BceLoss
+            )),
+            "a loss was recognized for training"
+        );
+        param_grads(&recognized, feeds)
+    };
+
+    // Cross entropy at logits [0, 0]: ∂/∂labels = -log_softmax = [ln 2, ln 2].
+    let mut feeds = Feeds::new();
+    feeds.set("logits", &[0.0, 0.0]);
+    feeds.set("labels", &[0.5, 0.5]);
+    let grads = differentiated(
+        &|g| {
+            let logits = g.parameter("logits", &[1, 2]);
+            let labels = g.parameter("labels", &[1, 2]);
+            g.cross_entropy_loss(logits, labels)
+        },
+        &feeds,
+    );
+    let (_, labels) = grads.iter().find(|(n, _)| n == "labels").unwrap();
+    for &g in labels {
+        assert!((g - std::f64::consts::LN_2).abs() < 1e-7, "{labels:?}");
+    }
+
+    // BCE below the clamp: the clamped prediction does not move the loss.
+    let mut feeds = Feeds::new();
+    feeds.set("pred", &[1e-8]);
+    feeds.set("labels", &[1.0]);
+    let grads = differentiated(
+        &|g| {
+            let pred = g.parameter("pred", &[1, 1]);
+            let labels = g.input("labels", &[1, 1]);
+            g.bce_loss(pred, labels)
+        },
+        &feeds,
+    );
+    let (_, pred) = grads.iter().find(|(n, _)| n == "pred").unwrap();
+    assert_eq!(pred, &vec![0.0]);
 }

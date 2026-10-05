@@ -13,13 +13,21 @@
   constant indices.
 - Ops are classified as primitive, composite or private (`Op::class`).
   Every composite has a decomposition into primitives (`Graph::decompose`),
-  and every build recognizes decompositions again (`Graph::recompose`), so a
-  model spelled in primitives builds exactly the plan of the model written
-  with composites: the same kernels, parameters, grids and buffers, for
-  inference and training. Tests hold every composite, every model builder,
-  every GGUF architecture and the ONNX fixtures to identical plans, and a
-  decomposed SmolLM2 runs bit for bit like the original in the same time.
-  `compile_plan` and `ExecutionPlan::signature` compare plans without a GPU.
+  and optimized builds recognize decompositions again (`Graph::recompose`),
+  so a model spelled in primitives builds the plan of the model written
+  with composites. Composites a graph names stay as written. Inference
+  builds recognize every composite; training builds only those whose
+  gradient is exactly their decomposition's
+  (`Graph::recompose_for_training`), leaving the losses, the inference-only
+  attention forms and RoPE with dynamic positions in primitives; builds
+  with the optimizer off recognize nothing, so they run the primitives.
+  Recognition matches whole templates exactly, comparing attributes by
+  their bits. Tests hold every composite, every model builder, every GGUF
+  architecture and the ONNX fixtures to the same dispatches
+  (`ExecutionPlan::dispatch_inventory`) and the same values flowing between
+  them (`ExecutionPlan::dataflow_digest`), compare each recognized
+  composite's gradient with its decomposition's, and compile plans without
+  a GPU (`compile_plan`).
 - Equivalent spellings build one way: full, cross and multi-head attention
   share a lowering, a sliding window spanning the sequence is causal
   attention, and upsample and per-channel gate attributes that do not
@@ -28,35 +36,46 @@
   process every element of a tensor of any rank.
 - `CausalAttentionRoPE`, which nothing builds, is a private fused op.
 - A primitive op set (`Op::is_primitive`) that model builders can rely on,
-  with new primitives `max_inner`, `sqrt`, `rsqrt` and `add_scalar`, and a
-  gradient for `clamp`. `Graph::decomposed_softmax` and
-  `Graph::decomposed_rms_norm` and `Graph::decomposed_layer_norm` are
-  written in primitives only; the optimizer folds them into the fused
-  `Softmax`, `RmsNorm` and `LayerNorm` kernels, so they reach the same
-  plan-level fusions as the named ops. Norms written with
-  `x / sqrt(variance + eps)` fold as well.
+  with new primitives `max_inner`, `sqrt`, `rsqrt`, `add_scalar`,
+  `broadcast_to` (NumPy broadcasting at equal rank, up to 4) and
+  `exclusive_cumsum`, and a gradient for `clamp`.
+  `Graph::decomposed_softmax` and `Graph::decomposed_rms_norm` and
+  `Graph::decomposed_layer_norm` are written in primitives only; builds
+  recognize them as the fused `Softmax`, `RmsNorm` and `LayerNorm` kernels,
+  so they reach the same plan-level fusions as the named ops. Norms written
+  with `x / sqrt(variance + eps)` are recognized as well.
 - The ONNX importer accepts decomposed exports instead of rejecting them:
   `Sqrt`, `Exp`, `Tanh`, `Pow` with a constant exponent, and last-axis
   `ReduceMean`, `ReduceSum` and `ReduceMax` map onto primitives, and binary
-  ops broadcast per-row `[M, 1]` values and fold scalar constants. RMSNorm,
-  LayerNorm and softmax written this way load as the fused kernels.
-  Unsupported broadcasts are load errors rather than panics.
+  ops follow NumPy broadcasting along each axis and fold scalar constants.
+  RMSNorm, LayerNorm and softmax written this way build as the fused
+  kernels. Incompatible shapes are load errors rather than panics or wrong
+  results.
 - New primitives `erf`, `batch_matmul` (with `_at`/`_bt` forms for its
   gradient) and `permute` (rank at most 4). The ONNX importer uses them to
-  load transformer layers as `torch.onnx.export` writes them: N-D `MatMul`,
-  any `Transpose`, `Slice` and `Concat` on any axis, `Erf`, and masks,
-  rotary tables and biases broadcast along trailing axes. Reshape honors
-  `0` dimensions and shape constants. `tests/fixtures/onnx` holds BERT-
-  and Llama-style layer exports with outputs from ONNX's reference
-  evaluator; they run on the GPU and fold their norms, softmax and SwiGLU
-  into fused kernels.
+  load transformer layers in the form PyTorch's exporter writes: N-D
+  `MatMul`, any `Transpose`, `Slice` and `Concat` on any axis, `Erf`, and
+  masks, rotary tables and biases broadcast along trailing axes. Reshape
+  honors `0` dimensions and shape constants. `tests/fixtures/onnx` holds
+  BERT- and Llama-style layers authored node by node in that form (not
+  produced by the exporter itself), with outputs from ONNX's reference
+  evaluator; they run on the GPU and build their norms, softmax and SwiGLU
+  as fused kernels.
 - The ONNX importer folds shape arithmetic (`Shape`, `Gather`, `Concat`,
   `Unsqueeze` on constants), so exports with dynamic axes load; reads
   `Squeeze`/`Unsqueeze` axes from inputs as opset 13 writes them, inserting
   several unsqueezed axes in output order and squeezing only the named
   ones; and expands broadcast axes with `Expand`, as grouped-query
-  attention's `repeat_kv` does. A `Gather` that is neither foldable nor a
+  attention's `repeat_kv` does, in one broadcast. A `Gather` that is neither foldable nor a
   table lookup by U32 indices is a load error rather than a panic.
+- Matmul, convolution and Winograd tile loads no longer read past the end
+  of their operands for rows and columns outside the matrix, which
+  crashed software Vulkan when a small operand sat at the end of mapped
+  memory.
+- Concatenation, split, convolution, group norm and upsample gradients
+  size their operands by element count, so operands of any rank
+  differentiate; permute and broadcast gradients accept a gradient that
+  arrives through a view.
 - Keep scalar consumers of cooperative attention staging in f32. Check
   forward, dQ and dK/dV workgroup storage against the selected device's limit
   and include that limit in plan-cache compatibility.

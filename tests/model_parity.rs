@@ -2,22 +2,28 @@
 //!
 //! `Graph::decompose` spells each composite in primitives. Builds recognize
 //! the composites again, so the decomposed model must compile to exactly
-//! the plan of the model as written — the same kernels, parameters, grids
-//! and buffers, and so the same performance — for inference and, where the
-//! model trains, for training. No GPU is needed: plans compile on the CPU.
+//! the plan of the model as written: the same kernels, parameters, grids
+//! and buffers, and the same values flowing between them
+//! ([`ExecutionPlan::dataflow_digest`]). Training recognizes only
+//! composites with exact gradients, so there the comparison is with the
+//! model whose other composites are spelled in primitives too. No GPU is
+//! needed: plans compile on the CPU.
+//!
+//! [`ExecutionPlan::dataflow_digest`]: meganeura::compile::ExecutionPlan::dataflow_digest
 
 use meganeura::graph::OpClass;
 use meganeura::models::{efficientnet, resnet, sd_unet, smollm2, smolvla, smolvlm2, whisper};
 use meganeura::{CompileOptions, Graph, Mode, NodeId, OptimizeConfig, compile_plan};
 
-fn plan(graph: &Graph, mode: Mode) -> Vec<String> {
-    compile_plan(
+/// The plan's dispatch inventory, and the digest of what it computes.
+fn plan(graph: &Graph, mode: Mode) -> (Vec<String>, u64) {
+    let plan = compile_plan(
         graph,
         mode,
         OptimizeConfig::default(),
         &CompileOptions::default(),
-    )
-    .signature()
+    );
+    (plan.dispatch_inventory(), plan.dataflow_digest())
 }
 
 #[track_caller]
@@ -45,7 +51,13 @@ fn assert_parity(what: &str, graph: &Graph, modes: &[Mode]) {
         .filter(|n| n.op.class() == OpClass::Composite)
         .count();
     for &mode in modes {
-        let (original, rebuilt) = (plan(graph, mode), plan(&decomposed, mode));
+        // Training recognizes only composites with exact gradients, so the
+        // others build as their primitives do.
+        let written = match mode {
+            Mode::Inference => graph.deep_clone(),
+            Mode::Training => graph.decompose_where(|op| !op.differentiates_as_decomposed(1)),
+        };
+        let (original, rebuilt) = (plan(&written, mode), plan(&decomposed, mode));
         if original != rebuilt {
             let only = |a: &[String], b: &[String]| {
                 a.iter()
@@ -55,8 +67,8 @@ fn assert_parity(what: &str, graph: &Graph, modes: &[Mode]) {
             };
             panic!(
                 "{what} ({mode:?}, {composites} composites): plans differ\n  only original: {:#?}\n  only decomposed: {:#?}",
-                only(&original, &rebuilt),
-                only(&rebuilt, &original)
+                only(&original.0, &rebuilt.0),
+                only(&rebuilt.0, &original.0)
             );
         }
     }
@@ -385,4 +397,39 @@ fn recomposition_keeps_models_as_written() {
             only(&after, &before)
         );
     }
+}
+
+/// The digest tells apart plans that launch the same kernels on different
+/// values: swapped operands, or a constant with other contents.
+#[test]
+fn dataflow_digest_sees_what_the_inventory_does_not() {
+    let swapped = |swap: bool| {
+        graph_with(|g| {
+            let x = g.input("x", &[4, 8]);
+            let y = g.input("y", &[4, 8]);
+            let (a, b) = if swap { (y, x) } else { (x, y) };
+            vec![g.sub(a, b)]
+        })
+    };
+    let (p, q) = (
+        plan(&swapped(false), Mode::Inference),
+        plan(&swapped(true), Mode::Inference),
+    );
+    assert_eq!(p.0, q.0, "the same kernels");
+    assert_ne!(p.1, q.1, "on swapped operands");
+
+    let scaled = |value: f32| {
+        graph_with(|g| {
+            let x = g.input("x", &[4, 8]);
+            let w = g.constant((0..8).map(|i| value + i as f32).collect(), &[8]);
+            vec![g.bias_mul(x, w)]
+        })
+    };
+    let (p, q) = (
+        plan(&scaled(2.0), Mode::Inference),
+        plan(&scaled(3.0), Mode::Inference),
+    );
+    assert_eq!(p.0, q.0, "the same kernels");
+    assert_ne!(p.1, q.1, "with other constants");
+    assert_eq!(p, plan(&scaled(2.0), Mode::Inference), "deterministic");
 }

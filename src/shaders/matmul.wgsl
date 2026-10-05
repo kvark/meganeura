@@ -59,7 +59,8 @@ $ENTRY_SIGNATURE {
             let a_row = tile_row + row_local;
             let a_col = t + col_local;
             let in_bounds = (a_row < params.m) && (a_col < params.k);
-            shared_a[row_local * $A_STRIDE_U + col_local] = select(0.0, matrix_a[$A_INDEX], in_bounds);
+            // `select` evaluates both arms: an index past the end reads element 0.
+            shared_a[row_local * $A_STRIDE_U + col_local] = select(0.0, matrix_a[select(0u, $A_INDEX, in_bounds)], in_bounds);
         }
         $B_STAGE_BODY
         workgroupBarrier();
