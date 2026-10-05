@@ -3,9 +3,11 @@
 - A primitive op set (`Op::is_primitive`) that model builders can rely on,
   with new primitives `max_inner`, `sqrt`, `rsqrt` and `add_scalar`, and a
   gradient for `clamp`. `Graph::decomposed_softmax` and
-  `Graph::decomposed_rms_norm` are written in primitives only; the
-  optimizer folds them into the fused `Softmax` and `RmsNorm` kernels, so
-  they reach the same plan-level fusions as the named ops.
+  `Graph::decomposed_rms_norm` and `Graph::decomposed_layer_norm` are
+  written in primitives only; the optimizer folds them into the fused
+  `Softmax`, `RmsNorm` and `LayerNorm` kernels, so they reach the same
+  plan-level fusions as the named ops. Norms written with
+  `x / sqrt(variance + eps)` fold as well.
 - Keep scalar consumers of cooperative attention staging in f32. Check
   forward, dQ and dK/dV workgroup storage against the selected device's limit
   and include that limit in plan-cache compatibility.

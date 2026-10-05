@@ -647,15 +647,18 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
   (GeGLUPackedBT Op Op Op)
   (Softmax Op)
   (RmsNorm i64 Op Op)
+  (LayerNorm i64 Op Op Op)
   (PExp Op)
   (PRecip Op)
   (PRsqrt Op)
+  (PSqrt Op)
   (PMaxInner Op)
   (PSumInner Op)
   (PMeanInner Op)
   (PBroadcastInner Op)
   (POffset i64 Op)
   (PBiasMul Op Op)
+  (PBiasAdd Op Op)
   (Op1 i64 Op)
   (Op2 i64 Op Op)
   (Op3 i64 Op Op Op)
@@ -716,6 +719,12 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
        (= ?y (Mul (PBroadcastInner (PRecip (PSumInner ?e))) ?e)))
       ((union ?y (Softmax ?x))))
 
+; 1 / sqrt(v) is rsqrt(v), as exporters spell it
+(rule ((= ?r (PRecip (PSqrt ?v)))) ((union ?r (PRsqrt ?v))))
+; and a reciprocal commutes with a broadcast, which division applies first
+(rule ((= ?r (PRecip (PBroadcastInner ?s))))
+      ((union ?r (PBroadcastInner (PRecip ?s)))))
+
 ; rms_norm(x, w) = x * rsqrt(mean(x²) + eps) * w
 (rule ((= ?r (PRsqrt (POffset ?eps (PMeanInner (Mul ?x ?x)))))
        (= ?y (PBiasMul (Mul ?x (PBroadcastInner ?r)) ?w)))
@@ -723,6 +732,16 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
 (rule ((= ?r (PRsqrt (POffset ?eps (PMeanInner (Mul ?x ?x)))))
        (= ?y (PBiasMul (Mul (PBroadcastInner ?r) ?x) ?w)))
       ((union ?y (RmsNorm ?eps ?x ?w))))
+
+; layer_norm(x, w, b) = c * rsqrt(mean(c²) + eps) * w + b, c = x - mean(x)
+(rule ((= ?c (Add ?x (Neg (PBroadcastInner (PMeanInner ?x)))))
+       (= ?r (PRsqrt (POffset ?eps (PMeanInner (Mul ?c ?c)))))
+       (= ?y (PBiasAdd (PBiasMul (Mul ?c (PBroadcastInner ?r)) ?w) ?b)))
+      ((union ?y (LayerNorm ?eps ?x ?w ?b))))
+(rule ((= ?c (Add ?x (Neg (PBroadcastInner (PMeanInner ?x)))))
+       (= ?r (PRsqrt (POffset ?eps (PMeanInner (Mul ?c ?c)))))
+       (= ?y (PBiasAdd (PBiasMul (Mul (PBroadcastInner ?r) ?c) ?w) ?b)))
+      ((union ?y (LayerNorm ?eps ?x ?w ?b))))
 
 ",
     );
@@ -733,8 +752,9 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
     }
     // Saturation is bounded: the deepest rewrite chain is three rules
     // (Mul(x, Sigmoid(x)) -> Silu, Mul(Silu, up) -> SwiGLU, then
-    // SwiGLU(MatMul, MatMul) -> SwiGLUPacked), so three iterations reach
-    // a fixpoint; the fourth is margin for future rules.
+    // SwiGLU(MatMul, MatMul) -> SwiGLUPacked, and likewise recip∘broadcast,
+    // recip∘sqrt -> rsqrt, then a norm), so three iterations reach a
+    // fixpoint; the fourth is margin for future rules.
 }
 
 fn rule_graph(pack_swiglu: bool, tiles: bool) -> egglog::EGraph {
@@ -832,12 +852,14 @@ const PATTERN_ONLY: &[&str] = &[
     "PExp",
     "PRecip",
     "PRsqrt",
+    "PSqrt",
     "PMaxInner",
     "PSumInner",
     "PMeanInner",
     "PBroadcastInner",
     "POffset",
     "PBiasMul",
+    "PBiasAdd",
 ];
 
 /// Larger than any real extraction cost, but far from saturating when a
@@ -857,11 +879,13 @@ fn pattern_term(g: &Graph, node: &Node, segment: &HashSet<usize>) -> Option<Stri
         Op::Exp => format!("(PExp {})", arg(0)),
         Op::Recip => format!("(PRecip {})", arg(0)),
         Op::Rsqrt => format!("(PRsqrt {})", arg(0)),
+        Op::Sqrt => format!("(PSqrt {})", arg(0)),
         Op::MaxInner => format!("(PMaxInner {})", arg(0)),
         Op::SumInner => format!("(PSumInner {})", arg(0)),
         Op::BroadcastInner { .. } => format!("(PBroadcastInner {})", arg(0)),
         Op::Offset { value } => format!("(POffset {} {})", value.to_bits(), arg(0)),
         Op::BiasMul => format!("(PBiasMul {} {})", arg(0), arg(1)),
+        Op::BiasAdd => format!("(PBiasAdd {} {})", arg(0), arg(1)),
         Op::Scale { factor } => {
             // The sum's own input is bound only when the sum is encoded
             // in this segment, rather than as an opaque leaf.
@@ -1398,6 +1422,18 @@ impl Stamper<'_> {
                     Some("decomposed RMSNorm→RmsNorm"),
                 )
             }
+            "LayerNorm" => {
+                let &[eps] = attrs else {
+                    return Err(format!("LayerNorm takes one attribute, got {attrs:?}"));
+                };
+                (
+                    Op::LayerNorm {
+                        eps: f32::from_bits(eps as u32),
+                    },
+                    ty_of(inputs[0]),
+                    Some("decomposed LayerNorm→LayerNorm"),
+                )
+            }
             other => return Err(format!("unknown constructor {}", other)),
         };
         let id = self.place(op, inputs.clone(), ty, target);
@@ -1655,6 +1691,7 @@ fn static_constructor(name: &str) -> Result<&'static str, String> {
         "GeGLUPackedBT" => "GeGLUPackedBT",
         "Softmax" => "Softmax",
         "RmsNorm" => "RmsNorm",
+        "LayerNorm" => "LayerNorm",
         other => return Err(format!("unknown constructor {}", other)),
     })
 }
@@ -2643,6 +2680,44 @@ mod tests {
             ref other => panic!("expected RmsNorm, got {other:?}"),
         }
         assert_eq!(live_ops(&opt).len(), 3, "{:?}", live_ops(&opt));
+    }
+
+    #[test]
+    fn decomposed_layer_norm_becomes_the_fused_kernel() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 16]);
+        let w = g.parameter("w", &[16]);
+        let b = g.parameter("b", &[16]);
+        let y = g.decomposed_layer_norm(x, w, b, 1e-5);
+        g.set_outputs(vec![y]);
+        assert!(g.nodes().iter().all(|node| node.op.is_primitive()));
+
+        let opt = optimize(&g);
+        let out = opt.node(opt.outputs()[0]);
+        match out.op {
+            Op::LayerNorm { eps } => assert_eq!(eps.to_bits(), 1e-5f32.to_bits()),
+            ref other => panic!("expected LayerNorm, got {other:?}"),
+        }
+        assert_eq!(live_ops(&opt).len(), 4, "{:?}", live_ops(&opt));
+    }
+
+    /// Exporters write `x / sqrt(v)` as a reciprocal of a square root.
+    #[test]
+    fn reciprocal_square_root_matches_rsqrt() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 16]);
+        let w = g.parameter("w", &[16]);
+        let square = g.mul(x, x);
+        let mean = g.mean_inner(square);
+        let mean = g.add_scalar(mean, 1e-6);
+        let root = g.sqrt(mean);
+        let root = g.broadcast_inner(root, 16);
+        let normalized = g.div(x, root);
+        let y = g.bias_mul(normalized, w);
+        g.set_outputs(vec![y]);
+        let opt = optimize(&g);
+        let out = opt.node(opt.outputs()[0]);
+        assert!(matches!(out.op, Op::RmsNorm { .. }), "{:?}", live_ops(&opt));
     }
 
     /// Composites inside a training graph fold too, while the primitives

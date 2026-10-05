@@ -133,6 +133,21 @@ fn decomposed_rms_norm() {
     }
 }
 
+#[test]
+fn decomposed_layer_norm() {
+    for (rows, cols) in [(6, 10), (2, 300)] {
+        let what = format!("decomposed layer_norm {rows}x{cols}");
+        let build = |g: &mut Graph| {
+            let x = g.parameter("x", &[rows, cols]);
+            let w = g.parameter("w", &[cols]);
+            let b = g.parameter("b", &[cols]);
+            g.decomposed_layer_norm(x, w, b, 1e-5)
+        };
+        inference_case(&what, build, |_| {});
+        grad_case(&what, build, |_| {});
+    }
+}
+
 /// Folding back into `RmsNorm` restores the plan-level fusions keyed on
 /// it: a decode-shaped norm feeding a GEMV becomes the GEMV's prologue,
 /// exactly as when the graph names `rms_norm` itself.
