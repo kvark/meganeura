@@ -75,6 +75,7 @@ impl Op {
             | Op::SumAll
             | Op::Transpose
             | Op::Permute { .. }
+            | Op::BroadcastTo
             | Op::Identity
             | Op::Materialize
             | Op::StopGradient

@@ -939,7 +939,12 @@ fn translate_node(
                     "Expand: the shape must be a constant".into(),
                 ));
             };
-            let out_shape = broadcast_shape(&x_shape, &target);
+            let Some(out_shape) = broadcast_shape(&x_shape, &target) else {
+                return Err(OnnxError::ShapeError(format!(
+                    "node '{}': cannot expand {x_shape:?} to {target:?}",
+                    node.name
+                )));
+            };
             let mut shape = vec![1; out_shape.len().saturating_sub(x_shape.len())];
             shape.extend_from_slice(&x_shape);
             if shape.len() != out_shape.len()
@@ -953,35 +958,12 @@ fn translate_node(
                     node.name
                 )));
             }
-            let mut out = x;
-            // Repeat along each broadcast axis by doubling concatenations.
-            for axis in 0..shape.len() {
-                let copies = out_shape[axis];
-                if shape[axis] != 1 || copies == 1 {
-                    continue;
-                }
-                let outer = shape[..axis].iter().product::<usize>() as u32;
-                let inner = shape[axis + 1..].iter().product::<usize>() as u32;
-                let (mut acc, mut acc_n) = (None, 0u32);
-                let (mut piece, mut piece_n) = (out, 1u32);
-                let mut remaining = copies;
-                while remaining > 0 {
-                    if remaining & 1 == 1 {
-                        acc = Some(match acc {
-                            None => piece,
-                            Some(a) => graph.concat(a, piece, outer, acc_n, piece_n, inner),
-                        });
-                        acc_n += piece_n;
-                    }
-                    remaining >>= 1;
-                    if remaining > 0 {
-                        piece = graph.concat(piece, piece, outer, piece_n, piece_n, inner);
-                        piece_n *= 2;
-                    }
-                }
-                out = acc.unwrap_or(out);
-                shape[axis] = copies;
-            }
+            let out = expand_to(graph, x, &shape, &out_shape).ok_or_else(|| {
+                OnnxError::UnsupportedOp(format!(
+                    "node '{}': Expand of {x_shape:?} to {out_shape:?} needs more than 4 axes",
+                    node.name
+                ))
+            })?;
             register_output(node, 0, out, &out_shape, name_to_id, shapes);
         }
 
@@ -1483,11 +1465,12 @@ fn matmul_nd(
     Ok(Some((graph.batch_matmul(a, b), shape)))
 }
 
-/// `a op b` for the broadcasts exported graphs use: a scalar constant
-/// (folded into the op as an attribute, even against a one-element
-/// tensor), equal element counts, a smaller operand matching the trailing
-/// axes (a bias, a mask, a rotary table), or one value per row along the
-/// last axis. Returns the result and its shape.
+/// NumPy-broadcast `a ∘ b`, or `None` when the shapes are incompatible or
+/// need more than four alternating broadcast axes. A folded scalar becomes a
+/// kernel constant, equal shapes run elementwise, and a narrow operand that
+/// is a row per matrix row or a trailing block uses the dedicated broadcast
+/// ops; anything else broadcasts each operand to the result shape first.
+/// Returns the result and its shape.
 fn broadcast_binary(
     graph: &mut Graph,
     (a, a_shape): (NodeId, &[usize]),
@@ -1495,32 +1478,46 @@ fn broadcast_binary(
     kind: BinaryKind,
     weights: &HashMap<String, Vec<f32>>,
 ) -> Result<Option<(NodeId, Vec<usize>)>, OnnxError> {
-    let (a_len, b_len) = (
-        a_shape.iter().product::<usize>(),
-        b_shape.iter().product::<usize>(),
-    );
-    // Folded scalars become kernel constants, which must be finite.
-    let foldable = |v: f32, kind: BinaryKind| {
-        v.is_finite() && (!matches!(kind, BinaryKind::Div) || (1.0 / v).is_finite())
+    let Some(out_shape) = broadcast_shape(a_shape, b_shape) else {
+        return Ok(None);
     };
-    if b_len == 1
+    let rank = out_shape.len();
+    let padded = |shape: &[usize]| {
+        let mut p = vec![1; rank - shape.len()];
+        p.extend_from_slice(shape);
+        p
+    };
+    let (pa, pb) = (padded(a_shape), padded(b_shape));
+    let (a_full, b_full) = (pa == out_shape, pb == out_shape);
+    let elementwise = |graph: &mut Graph, a: NodeId, b: NodeId| match kind {
+        BinaryKind::Add => graph.add(a, b),
+        BinaryKind::Sub => graph.sub(a, b),
+        BinaryKind::Mul => graph.mul(a, b),
+        BinaryKind::Div => graph.div(a, b),
+    };
+    // Folded scalars become kernel constants, which must be finite.
+    let foldable =
+        |v: f32| v.is_finite() && (!matches!(kind, BinaryKind::Div) || (1.0 / v).is_finite());
+    if a_full
+        && pb.iter().all(|&d| d == 1)
         && let Some(v) = scalar_constant(graph, b, weights)
-        && foldable(v, kind)
+        && foldable(v)
     {
-        let a = as_matrix(graph, a, a_shape)?;
+        let a = as_matrix(graph, a, &out_shape)?;
         let out = match kind {
             BinaryKind::Add => graph.add_scalar(a, v),
             BinaryKind::Sub => graph.add_scalar(a, -v),
             BinaryKind::Mul => graph.scale(a, v),
             BinaryKind::Div => graph.scale(a, 1.0 / v),
         };
-        return Ok(Some((out, broadcast_shape(a_shape, b_shape))));
+        return Ok(Some((out, out_shape)));
     }
-    if a_len == 1
+    if b_full
+        && pa.iter().all(|&d| d == 1)
         && let Some(v) = scalar_constant(graph, a, weights)
         && v.is_finite()
     {
-        let b = as_matrix(graph, b, b_shape)?;
+        let b = as_matrix(graph, b, &out_shape)?;
         let out = match kind {
             BinaryKind::Add => graph.add_scalar(b, v),
             BinaryKind::Sub => {
@@ -1533,77 +1530,67 @@ fn broadcast_binary(
                 graph.scale(inverse, v)
             }
         };
-        return Ok(Some((out, broadcast_shape(a_shape, b_shape))));
+        return Ok(Some((out, out_shape)));
     }
-    if a_len == b_len {
-        let shape = if a_shape.len() >= b_shape.len() {
-            a_shape
-        } else {
-            b_shape
-        };
+    if a_full && b_full {
         // Both on the canonical matrix view, so every elementwise use of a
         // tensor reads the same node.
-        let a = as_matrix(graph, a, shape)?;
-        let b = as_matrix(graph, b, shape)?;
-        let out = match kind {
-            BinaryKind::Add => graph.add(a, b),
-            BinaryKind::Sub => graph.sub(a, b),
-            BinaryKind::Mul => graph.mul(a, b),
-            BinaryKind::Div => graph.div(a, b),
-        };
-        return Ok(Some((out, shape.to_vec())));
+        let a = as_matrix(graph, a, &out_shape)?;
+        let b = as_matrix(graph, b, &out_shape)?;
+        return Ok(Some((elementwise(graph, a, b), out_shape)));
     }
-    if a_len < b_len {
-        return match kind {
-            BinaryKind::Add | BinaryKind::Mul => {
-                broadcast_binary(graph, (b, b_shape), (a, a_shape), kind, weights)
-            }
-            BinaryKind::Sub | BinaryKind::Div => Ok(None),
-        };
+    let commutes = matches!(kind, BinaryKind::Add | BinaryKind::Mul);
+    if b_full && !a_full && commutes {
+        return broadcast_binary(graph, (b, b_shape), (a, a_shape), kind, weights);
     }
-    let rank = a_shape.len();
-    if b_shape.len() > rank || rank == 0 {
+    let total = out_shape.iter().product::<usize>();
+    if a_full && rank > 0 {
+        let cols = out_shape[rank - 1];
+        let b_len = pb.iter().product::<usize>();
+        // One value per row: the result's shape with the last axis reduced.
+        if pb[..rank - 1] == out_shape[..rank - 1] && pb[rank - 1] == 1 && cols > 0 {
+            let a = view(graph, a, &[total / cols, cols])?;
+            let b = view(graph, b, &[total / cols, 1])?;
+            // Divide by the reciprocal of the narrow side before broadcasting.
+            let b = match kind {
+                BinaryKind::Div => graph.recip(b),
+                _ => b,
+            };
+            let b = graph.broadcast_inner(b, cols);
+            let out = match kind {
+                BinaryKind::Add => graph.add(a, b),
+                BinaryKind::Sub => graph.sub(a, b),
+                BinaryKind::Mul | BinaryKind::Div => graph.mul(a, b),
+            };
+            return Ok(Some((out, out_shape)));
+        }
+        // Trailing axes: `b` repeats along the leading ones.
+        let leading = pb.iter().take_while(|&&d| d == 1).count();
+        if pb[leading..] == out_shape[leading..] && b_len > 0 {
+            let a = view(graph, a, &[total / b_len, b_len])?;
+            let b = view(graph, b, &[b_len])?;
+            let b = match kind {
+                BinaryKind::Sub => graph.neg(b),
+                BinaryKind::Div => graph.recip(b),
+                _ => b,
+            };
+            let out = match kind {
+                BinaryKind::Add | BinaryKind::Sub => graph.bias_add(a, b),
+                BinaryKind::Mul | BinaryKind::Div => graph.bias_mul(a, b),
+            };
+            return Ok(Some((out, out_shape)));
+        }
+    }
+    // Anything else: each operand broadcast to the result's shape.
+    let (Some(a), Some(b)) = (
+        expand_to(graph, a, &pa, &out_shape),
+        expand_to(graph, b, &pb, &out_shape),
+    ) else {
         return Ok(None);
-    }
-    // `b` padded to `a`'s rank with leading unit axes.
-    let mut padded = vec![1; rank - b_shape.len()];
-    padded.extend_from_slice(b_shape);
-    let cols = a_shape[rank - 1];
-    // One value per row: `a`'s shape with the last axis reduced.
-    if padded[..rank - 1] == a_shape[..rank - 1] && padded[rank - 1] == 1 {
-        let rows = a_len / cols.max(1);
-        let a = view(graph, a, &[rows, cols])?;
-        let b = view(graph, b, &[rows, 1])?;
-        // Divide by the reciprocal of the narrow side before broadcasting.
-        let b = match kind {
-            BinaryKind::Div => graph.recip(b),
-            _ => b,
-        };
-        let b = graph.broadcast_inner(b, cols);
-        let out = match kind {
-            BinaryKind::Add => graph.add(a, b),
-            BinaryKind::Sub => graph.sub(a, b),
-            BinaryKind::Mul | BinaryKind::Div => graph.mul(a, b),
-        };
-        return Ok(Some((out, a_shape.to_vec())));
-    }
-    // Trailing axes: `b` repeats along `a`'s leading ones.
-    let leading = padded.iter().take_while(|&&d| d == 1).count();
-    if padded[leading..] == a_shape[leading..] && b_len > 0 {
-        let a = view(graph, a, &[a_len / b_len, b_len])?;
-        let b = view(graph, b, &[b_len])?;
-        let b = match kind {
-            BinaryKind::Sub => graph.neg(b),
-            BinaryKind::Div => graph.recip(b),
-            _ => b,
-        };
-        let out = match kind {
-            BinaryKind::Add | BinaryKind::Sub => graph.bias_add(a, b),
-            BinaryKind::Mul | BinaryKind::Div => graph.bias_mul(a, b),
-        };
-        return Ok(Some((out, a_shape.to_vec())));
-    }
-    Ok(None)
+    };
+    let a = as_matrix(graph, a, &out_shape)?;
+    let b = as_matrix(graph, b, &out_shape)?;
+    Ok(Some((elementwise(graph, a, b), out_shape)))
 }
 
 /// The values of a constant: an initializer or a `Constant` node.
@@ -1703,16 +1690,50 @@ fn register_output(
     }
 }
 
+/// `x` of `shape` broadcast to `out_shape` by one broadcast; the ranks
+/// match and each axis of `shape` is equal or one. Neighbouring axes that
+/// are both repeated, or both kept, merge, so up to four alternating groups
+/// fit; past that, `None`.
+fn expand_to(graph: &mut Graph, x: NodeId, shape: &[usize], out_shape: &[usize]) -> Option<NodeId> {
+    if shape == out_shape {
+        return Some(x);
+    }
+    let (mut from, mut to): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
+    let mut last = None;
+    for (&s, &o) in shape.iter().zip(out_shape) {
+        if o == 1 {
+            continue;
+        }
+        let repeated = s != o;
+        if last == Some(repeated) {
+            *from.last_mut()? *= s;
+            *to.last_mut()? *= o;
+        } else {
+            from.push(s);
+            to.push(o);
+            last = Some(repeated);
+        }
+    }
+    if to.len() > 4 {
+        return None;
+    }
+    let x = view(graph, x, &from).ok()?;
+    Some(graph.broadcast_to(x, &to))
+}
+
 /// Compute the broadcast output shape (NumPy-style).
-fn broadcast_shape(a: &[usize], b: &[usize]) -> Vec<usize> {
+fn broadcast_shape(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
     let len = a.len().max(b.len());
     let mut result = vec![1; len];
     for i in 0..len {
         let da = if i < a.len() { a[a.len() - 1 - i] } else { 1 };
         let db = if i < b.len() { b[b.len() - 1 - i] } else { 1 };
-        result[len - 1 - i] = da.max(db);
+        if da != db && da != 1 && db != 1 {
+            return None;
+        }
+        result[len - 1 - i] = if da == 1 { db } else { da };
     }
-    result
+    Some(result)
 }
 
 /// Resolve ONNX reshape target dims (handling -1 and 0).
@@ -1740,9 +1761,11 @@ mod tests {
 
     #[test]
     fn test_broadcast_shape() {
-        assert_eq!(broadcast_shape(&[3, 4], &[4]), vec![3, 4]);
-        assert_eq!(broadcast_shape(&[1, 4], &[3, 4]), vec![3, 4]);
-        assert_eq!(broadcast_shape(&[2, 1], &[1, 3]), vec![2, 3]);
+        assert_eq!(broadcast_shape(&[3, 4], &[4]), Some(vec![3, 4]));
+        assert_eq!(broadcast_shape(&[1, 4], &[3, 4]), Some(vec![3, 4]));
+        assert_eq!(broadcast_shape(&[2, 1], &[1, 3]), Some(vec![2, 3]));
+        assert_eq!(broadcast_shape(&[0, 1], &[1, 3]), Some(vec![0, 3]));
+        assert_eq!(broadcast_shape(&[2, 3], &[3, 2]), None);
     }
 
     #[test]
@@ -2131,6 +2154,133 @@ mod tests {
             &[],
             |op| matches!(*op, Op::Softmax),
         );
+    }
+
+    /// A one-node model over inputs `a` and `b` (with `b` an initializer
+    /// when `b_data` is given), evaluated on the reference interpreter.
+    fn one_node(
+        op: &str,
+        (a_shape, a_data): (&[i64], &[f32]),
+        (b_shape, b_data): (&[i64], &[f32]),
+        b_constant: bool,
+    ) -> Result<(OnnxModel, Vec<f32>), OnnxError> {
+        let node = build_node_proto(op, &["a", "b"], &["y"], &[], &[]);
+        let mut inits = Vec::new();
+        if b_constant {
+            inits.push(build_tensor_proto("b", b_shape, b_data));
+        }
+        let bytes = build_onnx_model(
+            &[node],
+            &inits,
+            &[
+                build_value_info("a", a_shape),
+                build_value_info("b", b_shape),
+            ],
+            &[build_value_info("y", &[])],
+        );
+        let model = load_onnx_bytes(&bytes, None)?;
+        let mut feeds = crate::reference::Feeds::new();
+        feeds.set("a", a_data);
+        if !b_constant {
+            feeds.set("b", b_data);
+        }
+        for (name, data) in &model.weights {
+            feeds.set(name, data);
+        }
+        let out = crate::reference::evaluate_outputs(&model.graph, &feeds).unwrap();
+        Ok((model, out[0].data.iter().map(|&v| v as f32).collect()))
+    }
+
+    fn has_concat(model: &OnnxModel) -> bool {
+        model
+            .graph
+            .nodes()
+            .iter()
+            .any(|n| matches!(n.op, Op::Concat { .. }))
+    }
+
+    /// `Expand` along leading, interior, trailing and several axes is one
+    /// broadcast, with no copy tree of concatenations.
+    #[test]
+    fn expand_broadcasts_each_singleton_axis() {
+        let cases: [(&[i64], &[i64]); 5] = [
+            (&[1, 3], &[4, 3]),
+            (&[3, 1], &[3, 5]),
+            (&[2, 1, 3], &[2, 4, 3]),
+            (&[3], &[2, 2, 3]),
+            (&[2, 1, 1, 3, 1], &[2, 4, 5, 3, 1]),
+        ];
+        for (from, to) in cases {
+            let n: i64 = from.iter().product();
+            let data: Vec<f32> = (0..n).map(|i| i as f32 + 1.0).collect();
+            let target: Vec<f32> = to.iter().map(|&d| d as f32).collect();
+            let (model, got) =
+                one_node("Expand", (from, &data), (&[to.len() as i64], &target), true).unwrap();
+            // NumPy: index each output position back through unit axes.
+            let to: Vec<usize> = to.iter().map(|&d| d as usize).collect();
+            let mut from_p = vec![1usize; to.len() - from.len()];
+            from_p.extend(from.iter().map(|&d| d as usize));
+            let total: usize = to.iter().product();
+            let want: Vec<f32> = (0..total)
+                .map(|mut i| {
+                    let mut src = 0;
+                    let mut stride = 1;
+                    for axis in (0..to.len()).rev() {
+                        let coord = i % to[axis];
+                        i /= to[axis];
+                        if from_p[axis] != 1 {
+                            src += coord * stride;
+                        }
+                        stride *= from_p[axis];
+                    }
+                    data[src]
+                })
+                .collect();
+            assert_eq!(got, want, "{from:?} -> {to:?}");
+            assert!(!has_concat(&model), "{from:?} -> {to:?} copies by concat");
+        }
+    }
+
+    /// Operands broadcast along different axes: `[2, 1] ∘ [1, 2]` is a
+    /// `[2, 2]` outer combination for every operator.
+    #[test]
+    fn binary_ops_broadcast_along_their_own_axes() {
+        let (a, b) = ([1.0f32, 2.0], [4.0f32, 8.0]);
+        type Apply = fn(f32, f32) -> f32;
+        let cases: [(&str, Apply); 4] = [
+            ("Add", |x, y| x + y),
+            ("Sub", |x, y| x - y),
+            ("Mul", |x, y| x * y),
+            ("Div", |x, y| x / y),
+        ];
+        for (op, f) in cases {
+            for b_constant in [false, true] {
+                let (_, got) = one_node(op, (&[2, 1], &a), (&[1, 2], &b), b_constant).unwrap();
+                let want = [f(a[0], b[0]), f(a[0], b[1]), f(a[1], b[0]), f(a[1], b[1])];
+                assert_eq!(got, want, "{op}");
+                // And the other way around.
+                let (_, got) = one_node(op, (&[1, 2], &b), (&[2, 1], &a), b_constant).unwrap();
+                let want = [f(b[0], a[0]), f(b[1], a[0]), f(b[0], a[1]), f(b[1], a[1])];
+                assert_eq!(got, want, "{op} swapped");
+            }
+        }
+        // A narrow left side of a non-commuting op.
+        let (_, got) = one_node("Sub", (&[2], &a), (&[3, 2], &[1.0; 6]), false).unwrap();
+        assert_eq!(got, [0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn incompatible_broadcasts_are_refused() {
+        let six = [1.0; 6];
+        for op in ["Add", "Sub", "Mul", "Div"] {
+            assert!(
+                matches!(
+                    one_node(op, (&[2, 3], &six), (&[3, 2], &six), false),
+                    Err(OnnxError::ShapeError(_))
+                ),
+                "{op}"
+            );
+        }
     }
 
     #[test]

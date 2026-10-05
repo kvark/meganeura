@@ -78,6 +78,7 @@ const TABLE: &[(&str, Coverage)] = &[
     ("Greater", Covered(".greater(")),
     ("Transpose", Covered(".transpose(")),
     ("Permute", Covered(".permute(")),
+    ("BroadcastTo", Covered(".broadcast_to(")),
     ("BiasAdd", Covered(".bias_add(")),
     ("BiasMul", Covered(".bias_mul(")),
     ("FusedMatMulAdd", Covered("Op::FusedMatMulAdd")),

@@ -309,6 +309,7 @@ pub fn eval_node(
         | Op::BceLoss
         | Op::Transpose
         | Op::Permute { .. }
+        | Op::BroadcastTo
         | Op::BiasAdd
         | Op::BiasMul
         | Op::Nop
@@ -502,6 +503,7 @@ fn propagates_scale(op: &Op) -> bool {
                 | Op::Abs
                 | Op::Transpose
                 | Op::Permute { .. }
+                | Op::BroadcastTo
                 | Op::Identity
                 | Op::Materialize
                 | Op::StopGradient

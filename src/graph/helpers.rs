@@ -132,8 +132,9 @@ impl Graph {
             return x;
         }
         let pixels = dims.len() as u32;
-        let gap = (dims.len() * (stride as usize - 1)) as u32;
-        let zeros = self.constant(vec![0.0; gap as usize], &[gap as usize]);
+        let gap = dims.len() * (stride as usize - 1);
+        let zeros = self.zeros(1, gap);
+        let zeros = self.view(zeros, &[gap]);
         // Each pixel followed by its zeros, then the trailing zeros of a
         // row dropped.
         let spaced = self.concat(x, zeros, pixels, 1, stride - 1, 1);
@@ -152,8 +153,9 @@ impl Graph {
             return x;
         }
         let rows = dims.planes() * dims.h;
-        let gap = (rows as usize * (stride as usize - 1) * dims.w as usize) as u32;
-        let zeros = self.constant(vec![0.0; gap as usize], &[gap as usize]);
+        let gap = rows as usize * (stride as usize - 1) * dims.w as usize;
+        let zeros = self.zeros(1, gap);
+        let zeros = self.view(zeros, &[gap]);
         let spaced = self.concat(x, zeros, rows, dims.w, (stride - 1) * dims.w, 1);
         let height = dims.h * stride;
         let out = self.split_a(
@@ -177,11 +179,10 @@ impl Graph {
         scale_w: u32,
     ) -> NodeId {
         assert!(scale_h > 0 && scale_w > 0, "scales must be positive");
-        let pixels = dims.len();
-        let x = self.view(x, &[pixels, 1]);
-        let wide = self.broadcast_inner(x, scale_w as usize);
         let rows = (dims.planes() * dims.h) as usize;
-        let out = self.repeat_axis(wide, rows, (dims.w * scale_w) as usize, scale_h as usize);
+        let w = dims.w as usize;
+        let x = self.view(x, &[rows, 1, w, 1]);
+        let out = self.broadcast_to(x, &[rows, scale_h as usize, w, scale_w as usize]);
         self.flat(out)
     }
 
