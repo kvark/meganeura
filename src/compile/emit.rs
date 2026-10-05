@@ -449,6 +449,30 @@ impl<'a> Compiler<'a> {
         row_dot
     }
 
+    /// Copy into `output`, of extents `dims` (rank 4, leading unit axes
+    /// for lower ranks), the input element at `Σ index · strides`: a
+    /// permutation, or a broadcast where a stride is zero.
+    pub(super) fn emit_strided_copy(
+        &mut self,
+        input: BufferRef,
+        output: BufferRef,
+        dims: [u32; 4],
+        strides: [u32; 4],
+    ) {
+        let total = dims
+            .iter()
+            .try_fold(1u32, |n, &d| n.checked_mul(d))
+            .expect("strided copy size exceeds u32");
+        self.plan.dispatches.push(Dispatch {
+            shader: ShaderEntry::Permute,
+            workgroups: linear_grid(total.div_ceil(256)),
+            input_buffers: vec![input],
+            output_buffer: output,
+            params: [&[total, dims[1], dims[2], dims[3]][..], &strides].concat(),
+            ..Default::default()
+        });
+    }
+
     pub(super) fn emit_broadcast_inner(
         &mut self,
         input: BufferRef,
@@ -1650,16 +1674,7 @@ impl<'a> Compiler<'a> {
                     out_strides[pad + d] =
                         u32::try_from(strides[axis]).expect("permute stride exceeds u32");
                 }
-                let total =
-                    u32::try_from(node.ty.num_elements()).expect("permute size exceeds u32");
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::Permute,
-                    workgroups: [total.div_ceil(256), 1, 1],
-                    input_buffers: vec![input],
-                    output_buffer: out_buf,
-                    params: [&[total, dims[1], dims[2], dims[3]][..], &out_strides].concat(),
-                    ..Default::default()
-                });
+                self.emit_strided_copy(input, out_buf, dims, out_strides);
             }
 
             Op::Silu => {

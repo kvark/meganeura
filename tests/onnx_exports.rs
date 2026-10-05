@@ -42,12 +42,11 @@ fn run(name: &str) -> Vec<Op> {
     let expected = floats(&format!("{name}.expected.bin"));
     let mut got = vec![0.0; expected.len()];
     session.read_output_by_index(0, &mut got);
-    let worst = got
-        .iter()
-        .zip(&expected)
-        .map(|(g, e)| (g - e).abs())
-        .fold(0.0f32, f32::max);
-    assert!(worst < 2e-4, "{name}: max abs error {worst}");
+    // Every value must be finite: a NaN would drop out of a max-fold.
+    for (i, (&g, &e)) in got.iter().zip(&expected).enumerate() {
+        assert!(g.is_finite() && e.is_finite(), "{name}: element {i} is {g}");
+        assert!((g - e).abs() < 2e-4, "{name}: element {i} is {g}, want {e}");
+    }
     let graph = meganeura::optimize::optimize(&model.graph);
     graph.nodes().iter().map(|node| node.op.clone()).collect()
 }

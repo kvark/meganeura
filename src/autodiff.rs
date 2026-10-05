@@ -317,18 +317,21 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 accumulate_grad(&mut graph, &mut grads, x, grad_broadcast);
             }
             Op::MaxInner => {
-                // The gradient flows to every element equal to its row's
-                // maximum, `x == max` spelled `1 - (max > x)`. Ties all
-                // receive it, as in StableHLO's reduce-max gradient
-                // before normalization.
+                // The gradient is split evenly between the elements equal to
+                // their row's maximum (`x == max` spelled `1 - (max > x)`),
+                // as PyTorch's `amax` does: a row of one repeated value then
+                // passes its gradient through exactly once.
                 let x = node.inputs[0];
                 let n = forward.nodes()[x as usize].ty.shape[1];
                 let max = graph.broadcast_inner(node.id, n);
                 let below = graph.greater(max, x);
                 let below = graph.neg(below);
                 let at_max = graph.add_scalar(below, 1.0);
-                let grad = graph.broadcast_inner(grad_output, n);
-                let grad_x = graph.mul(grad, at_max);
+                let ties = graph.sum_inner(at_max);
+                let share = graph.recip(ties);
+                let share = graph.mul(grad_output, share);
+                let share = graph.broadcast_inner(share, n);
+                let grad_x = graph.mul(share, at_max);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
             Op::BroadcastInner { .. } => {

@@ -129,7 +129,9 @@ fn erf() {
 /// gradient of each form exercises the other two.
 #[test]
 fn batch_matmul() {
-    for (batch, m, k, n) in [(3, 5, 7, 4), (2, 130, 70, 90)] {
+    // 5·4 output tiles of 64 or fewer select the 32-wide tile; 257×257
+    // (5·5 = 25 tiles) is the smallest square to select the 64-wide one.
+    for (batch, m, k, n) in [(3, 5, 7, 4), (2, 130, 70, 90), (2, 257, 33, 257)] {
         for form in ["nn", "at", "bt"] {
             let what = format!("batch_matmul {form} {batch}x{m}x{k}x{n}");
             let build = |g: &mut Graph| match form {
@@ -152,6 +154,120 @@ fn batch_matmul() {
             inference_case(&what, build, |_| {});
             if m < 100 {
                 grad_case(&what, build, |_| {});
+            }
+            // The tile the case is meant to cover is the one selected.
+            let mut g = Graph::new();
+            let y = build(&mut g);
+            g.set_outputs(vec![y]);
+            let plan = meganeura::compile_plan(
+                &g,
+                meganeura::Mode::Inference,
+                meganeura::OptimizeConfig::default(),
+                &meganeura::CompileOptions::default(),
+            );
+            let large = m.div_ceil(64) * n.div_ceil(64) >= 16;
+            let kernel = &plan.dispatches[0].kernel;
+            assert_eq!(
+                matches!(kernel, meganeura::compile::Kernel::SmallTile),
+                !large,
+                "{what}: {kernel:?}"
+            );
+        }
+    }
+}
+
+/// A row maximum shares its gradient between tied elements: the maximum
+/// of a broadcast scalar is the scalar itself, with derivative exactly 1.
+#[test]
+fn max_inner_ties() {
+    for width in [2, 3, 8] {
+        let what = format!("max of a {width}-way broadcast");
+        grad_case(
+            &what,
+            |g| {
+                let t = g.parameter("t", &[4, 1]);
+                let b = g.broadcast_inner(t, width);
+                g.max_inner(b)
+            },
+            |_| {},
+        );
+    }
+    // An all-equal row: each element receives a quarter of the gradient.
+    let mut g = Graph::new();
+    let x = g.parameter("x", &[3, 4]);
+    let m = g.max_inner(x);
+    let loss = g.sum_all(m);
+    g.set_outputs(vec![loss]);
+    let diff = meganeura::autodiff::differentiate(&g);
+    let mut feeds = Feeds::new();
+    feeds.set("x", &[0.5; 12]);
+    let out = meganeura::reference::evaluate_outputs(&diff, &feeds).unwrap();
+    assert_eq!(out[1].data, vec![0.25; 12]);
+    gpu::check_training(&g, &feeds, &gpu::Options::default())
+        .unwrap()
+        .assert_passed("all-equal rows");
+}
+
+#[test]
+#[should_panic(expected = "permute moves F32 elements")]
+fn permute_rejects_other_storage() {
+    let mut g = Graph::new();
+    let x = g.parameter_f16("x", &[2, 2]);
+    g.permute(x, &[1, 0]);
+}
+
+/// Strided copies spread their grid over two axes, each within the
+/// portable limit of 65535 workgroups.
+#[test]
+fn permute_grid_stays_within_limits() {
+    for elements in [65_535 * 256, 65_536 * 256, 3 * 65_535 * 256 + 7] {
+        let mut g = Graph::new();
+        let x = g.input("x", &[elements / 4, 4]);
+        let y = g.permute(x, &[1, 0]);
+        g.set_outputs(vec![y]);
+        let plan = meganeura::compile_plan(
+            &g,
+            meganeura::Mode::Inference,
+            meganeura::OptimizeConfig::default(),
+            &meganeura::CompileOptions::default(),
+        );
+        let [gx, gy, gz] = plan.dispatches[0].workgroups;
+        assert!(
+            gx <= 65_535 && gy <= 65_535 && gz == 1,
+            "{elements}: {gx}x{gy}"
+        );
+        assert!(
+            (gx * gy) as usize * 256 >= elements,
+            "{elements}: {gx}x{gy}"
+        );
+    }
+}
+
+/// On the device, a permutation past the one-axis grid limit.
+#[test]
+fn permute_past_one_axis_grid() {
+    let (a, b, c) = (2, 4096, 2049);
+    let n = a * b * c;
+    assert!(n > 65_536 * 256);
+    let mut g = Graph::new();
+    let x = g.parameter("x", &[a, b, c]);
+    let y = g.permute(x, &[0, 2, 1]);
+    g.set_outputs(vec![y]);
+    let data: Vec<f32> = (0..n).map(|i| (i % 8191) as f32).collect();
+    let mut config = meganeura::SessionConfig::from_env();
+    config.mode = meganeura::Mode::Inference;
+    config.gpu = Some(gpu::shared_context());
+    let (mut session, _) = meganeura::build(&g, config);
+    session.set_parameter("x", &data);
+    session.step();
+    session.wait();
+    let mut got = vec![0.0; n];
+    session.read_output_by_index(0, &mut got);
+    for i in 0..a {
+        for k in 0..c {
+            for j in 0..b {
+                let out = (i * c + k) * b + j;
+                assert_eq!(got[out], data[(i * b + j) * c + k], "element {out}");
             }
         }
     }
