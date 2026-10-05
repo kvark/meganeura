@@ -2,10 +2,9 @@
 //!
 //! A model built only from primitives runs without any model-specific
 //! kernel: every primitive has a lowering, a gradient and a reference
-//! implementation. Fused kernels are the optimizer's business. Its rewrite
-//! rules recognize a decomposition such as [`Graph::decomposed_softmax`]
-//! and replace it with the fused op, so a new model needs a new kernel only
-//! to run faster, not to run at all.
+//! implementation. Fused kernels are the compiler's business: every build
+//! recognizes composites spelled in primitives ([`Graph::recompose`]), so a
+//! new model needs a new kernel only to run faster, not to run at all.
 //!
 //! The set follows StableHLO's meaning for each op, restricted to what a
 //! statically planned graph needs: static shapes, reductions and broadcasts
@@ -185,7 +184,7 @@ impl Graph {
     /// built from primitives:
     /// `exp(x - max(x)) / sum(exp(x - max(x)))`.
     ///
-    /// The optimizer replaces this with the fused [`Op::Softmax`] kernel.
+    /// This is [`Op::Softmax`]'s decomposition; builds recognize it as one.
     #[track_caller]
     pub fn decomposed_softmax(&mut self, x: NodeId) -> NodeId {
         let inner = self.node(x).ty.shape[1];
@@ -202,7 +201,7 @@ impl Graph {
     /// RMS normalization of `x: [M, N]` with weight `[N]`, built from
     /// primitives: `x * rsqrt(mean(x²) + eps) * weight`.
     ///
-    /// The optimizer replaces this with the fused [`Op::RmsNorm`] kernel.
+    /// This is [`Op::RmsNorm`]'s decomposition; builds recognize it as one.
     #[track_caller]
     pub fn decomposed_rms_norm(&mut self, x: NodeId, weight: NodeId, eps: f32) -> NodeId {
         let inner = self.node(x).ty.shape[1];
@@ -219,7 +218,8 @@ impl Graph {
     /// built from primitives:
     /// `(x - mean(x)) * rsqrt(mean((x - mean(x))²) + eps) * weight + bias`.
     ///
-    /// The optimizer replaces this with the fused [`Op::LayerNorm`] kernel.
+    /// This is [`Op::LayerNorm`]'s full decomposition; builds recognize it
+    /// as one.
     #[track_caller]
     pub fn decomposed_layer_norm(
         &mut self,
