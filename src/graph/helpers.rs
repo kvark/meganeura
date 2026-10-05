@@ -63,15 +63,16 @@ pub fn t5_bucket(relative: i32, num_buckets: u32, max_distance: u32, bidirection
 
 impl Graph {
     /// ELU with α = 1: `x` where positive, `exp(x) - 1` elsewhere, as
-    /// `relu(x) + exp(-relu(-x)) - 1`.
+    /// `(x + n) + (exp(-n) - 1)` with `n = relu(-x)`. The identity path
+    /// carries the derivative 1 at zero, where both ReLU masks are closed.
     pub fn elu(&mut self, x: NodeId) -> NodeId {
-        let positive = self.relu(x);
         let negated = self.neg(x);
-        let negative = self.relu(negated);
-        let negative = self.neg(negative);
-        let tail = self.exp(negative);
+        let n = self.relu(negated);
+        let head = self.add(x, n);
+        let minus_n = self.neg(n);
+        let tail = self.exp(minus_n);
         let tail = self.add_scalar(tail, -1.0);
-        self.add(positive, tail)
+        self.add(head, tail)
     }
 
     /// Crop `[top, bottom]` rows and `[left, right]` columns from every

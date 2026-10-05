@@ -433,3 +433,55 @@ fn dataflow_digest_sees_what_the_inventory_does_not() {
     assert_ne!(p.1, q.1, "with other constants");
     assert_eq!(p, plan(&scaled(2.0), Mode::Inference), "deterministic");
 }
+
+/// What a dispatch computes includes its fused metadata: changing a
+/// matmul's epilogue, weight format or precision policy, while keeping its
+/// shader, kernel, parameters, grid and buffers, changes the digest.
+#[test]
+fn dataflow_digest_covers_fused_metadata() {
+    use meganeura::compile::{MatMulEpilogue, WeightFormat};
+    use meganeura::schedule::{PointwiseDAG, Pw};
+    let g = graph_with(|g| {
+        let x = g.input("x", &[8, 16]);
+        let w = g.parameter("w", &[16, 8]);
+        vec![g.matmul(x, w)]
+    });
+    let base = compile_plan(
+        &g,
+        Mode::Inference,
+        OptimizeConfig::default(),
+        &CompileOptions::default(),
+    );
+    let index = base
+        .dispatches
+        .iter()
+        .position(|d| d.matmul_epilogue.is_none() && format!("{:?}", d.shader).contains("MatMul"))
+        .expect("a matmul dispatch");
+    type Mutation = fn(&mut meganeura::compile::Dispatch);
+    let mutations: [(&str, Mutation); 3] = [
+        ("relu epilogue", |d| {
+            d.matmul_epilogue = Some(MatMulEpilogue {
+                dag: PointwiseDAG {
+                    n_inputs: 1,
+                    ops: vec![Pw::LoadInput(0), Pw::Relu(0)],
+                    output: 1,
+                },
+                inputs: Vec::new(),
+            })
+        }),
+        ("f16 weights", |d| d.weight_format = WeightFormat::F16),
+        ("full precision", |d| {
+            d.requires_full_precision = !d.requires_full_precision
+        }),
+    ];
+    for (what, mutate) in mutations {
+        let mut changed = base.clone();
+        mutate(&mut changed.dispatches[index]);
+        assert_ne!(base.dataflow_digest(), changed.dataflow_digest(), "{what}");
+        assert_ne!(
+            base.dispatch_inventory(),
+            changed.dispatch_inventory(),
+            "{what}"
+        );
+    }
+}

@@ -1369,24 +1369,36 @@ pub struct ExecutionPlan {
 
 impl ExecutionPlan {
     /// The dispatches the plan runs, independent of their order and buffer
-    /// numbering: each one's shader, kernel, parameters, grid and operand
-    /// counts, sorted, then the buffer sizes. Equal inventories launch the
-    /// same kernels on the same shapes, so they cost the same; they do not
-    /// show that the kernels read the same values, which
-    /// [`Self::dataflow_digest`] does.
+    /// numbering: each one's shader, kernel, parameters, grid, operand
+    /// counts and fused prologue, epilogue, norm, weight format and
+    /// precision policy, sorted, then the buffer sizes. Equal inventories
+    /// launch the same kernels on the same shapes. They do not show that the
+    /// kernels read the same values, which [`Self::dataflow_digest`] does,
+    /// and neither measures scheduling, memory traffic or device time.
     pub fn dispatch_inventory(&self) -> Vec<String> {
         let mut out: Vec<String> = self
             .dispatches
             .iter()
             .map(|d| {
+                let kinds = |e: &MatMulEpilogue| {
+                    e.inputs.iter().map(|i| i.1.clone()).collect::<Vec<_>>()
+                };
                 format!(
-                    "{:?} {:?} {:?} {:?} in={} extra={}",
+                    "{:?} {:?} {:?} {:?} in={} extra={} epilogue={:?} prologue={:?} norm={:?} weights={:?} batch={} full={}",
                     d.shader,
                     d.kernel,
                     d.params,
                     d.workgroups,
                     d.input_buffers.len(),
-                    d.extra_outputs.len()
+                    d.extra_outputs.len(),
+                    d.matmul_epilogue.as_ref().map(|e| (&e.dag, kinds(e))),
+                    d.matmul_prologue
+                        .as_ref()
+                        .map(|p| p.factors.iter().map(|f| f.1.clone()).collect::<Vec<_>>()),
+                    d.gemv_rmsnorm.as_ref().map(|n| n.eps_bits),
+                    d.weight_format,
+                    d.horizontal_batch,
+                    d.requires_full_precision,
                 )
             })
             .collect();
@@ -1398,13 +1410,16 @@ impl ExecutionPlan {
     }
 
     /// A digest of what the plan computes. Each value written is hashed
-    /// from its dispatch (shader, kernel, parameters, grid) and the digests
-    /// of the values it reads, starting from parameters and inputs by name,
-    /// derived parameters by source, and constants by content. The digest
-    /// covers every value written and the outputs, so it is independent of
-    /// dispatch order and buffer numbering but changes when any dispatch
-    /// reads another value or a constant differs.
+    /// from everything its dispatch computes it with: shader, kernel,
+    /// parameters, grid, fused prologue, epilogue and norm, weight format
+    /// and precision policy, and the digests of the values it reads,
+    /// including those the fused metadata reads. Leaves are parameters and
+    /// inputs by name, derived parameters by source, and constants by
+    /// content. The digest covers every value written and the outputs, so
+    /// it is independent of dispatch order and buffer numbering but changes
+    /// when any dispatch computes differently or reads another value.
     pub fn dataflow_digest(&self) -> u64 {
+        use crate::graph::key::structural_key;
         use std::hash::{Hash, Hasher};
         fn hash(value: impl Hash) -> u64 {
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1420,21 +1435,37 @@ impl ExecutionPlan {
             current.insert(buf, hash(("constant", bits)));
         }
         for &(buf, ref sources, ref transform) in &self.derived_params {
-            current.insert(buf, hash(("derived", sources, format!("{transform:?}"))));
+            current.insert(buf, hash(("derived", sources, structural_key(transform))));
         }
         let unwritten = hash("unwritten");
         let mut written = Vec::with_capacity(self.dispatches.len());
         for d in &self.dispatches {
-            let reads: Vec<u64> = d
-                .input_buffers
-                .iter()
-                .map(|b| current.get(b).copied().unwrap_or(unwritten))
-                .collect();
+            let value = |b: &BufferRef| current.get(b).copied().unwrap_or(unwritten);
+            let reads: Vec<u64> = d.input_buffers.iter().map(value).collect();
+            let epilogue = d.matmul_epilogue.as_ref().map(|e| {
+                let inputs: Vec<_> = e
+                    .inputs
+                    .iter()
+                    .map(|entry| (value(&entry.0), entry.1.clone()))
+                    .collect();
+                (structural_key(&e.dag), inputs)
+            });
+            let prologue = d.matmul_prologue.as_ref().map(|p| {
+                p.factors
+                    .iter()
+                    .map(|entry| (value(&entry.0), entry.1.clone()))
+                    .collect::<Vec<_>>()
+            });
+            let norm = d
+                .gemv_rmsnorm
+                .as_ref()
+                .map(|n| (value(&n.weight), n.eps_bits));
             let produced = hash((
-                format!("{:?} {:?}", d.shader, d.kernel),
-                &d.params,
-                d.workgroups,
-                reads,
+                (structural_key(&d.shader), structural_key(&d.kernel)),
+                (&d.params, d.workgroups, reads),
+                (epilogue, prologue, norm),
+                structural_key(&d.weight_format),
+                (d.horizontal_batch, d.requires_full_precision),
             ));
             for (slot, out) in std::iter::once(&d.output_buffer)
                 .chain(&d.extra_outputs)
