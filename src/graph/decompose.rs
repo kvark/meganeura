@@ -304,10 +304,331 @@ impl Graph {
         self.view(root, &ty.shape)
     }
 
-    /// Placeholder until the remaining composites have expansions.
+    /// Expansions of the rotary-embedding and attention composites.
     #[track_caller]
-    fn expand_sequence_op(&mut self, op: &Op, _inputs: &[NodeId], _ty: &TensorType) -> NodeId {
-        panic!("{op:?} has no expansion")
+    fn expand_sequence_op(&mut self, op: &Op, inputs: &[NodeId], ty: &TensorType) -> NodeId {
+        let arg = |i: usize| inputs[i];
+        match *op {
+            Op::RoPE {
+                theta,
+                pos_offset,
+                head_dim,
+                freq_factors,
+            } => {
+                let positions = match inputs.len() {
+                    1 => Positions::Offset(pos_offset, None),
+                    _ => Positions::Offset(pos_offset, Some(arg(1))),
+                };
+                let factors = freq_factors.then(|| arg(2));
+                self.expand_rope(arg(0), theta, head_dim, positions, factors)
+            }
+            Op::RoPEPositions { theta, head_dim } => {
+                self.expand_rope(arg(0), theta, head_dim, Positions::PerRow(arg(1)), None)
+            }
+            Op::CausalAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            } => {
+                let rows = ty.shape[0];
+                let mask = self.window_mask(rows, 0);
+                let heads = Heads::new(num_heads, num_kv_heads, head_dim);
+                self.attend(arg(0), arg(1), arg(2), heads, Some(mask))
+            }
+            Op::SlidingWindowAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                window_size,
+            } => {
+                let rows = ty.shape[0];
+                let mask = self.window_mask(rows, window_size as usize);
+                let heads = Heads::new(num_heads, num_kv_heads, head_dim);
+                self.attend(arg(0), arg(1), arg(2), heads, Some(mask))
+            }
+            Op::FullAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            }
+            | Op::CrossAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            }
+            | Op::MultiHeadAttn {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                ..
+            } => {
+                let heads = Heads::new(num_heads, num_kv_heads, head_dim);
+                self.attend(arg(0), arg(1), arg(2), heads, None)
+            }
+            Op::CachedAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            } => {
+                // Key `j` is visible when `j <= kv_pos`.
+                let keys = self.node(arg(1)).ty.shape[0];
+                let iota = self.constant((0..keys).map(|j| j as f32).collect(), &[1, keys]);
+                let pos = self.scalar_row(arg(3), keys);
+                let hidden = self.greater(iota, pos);
+                let mask = self.scale(hidden, f32::MIN);
+                let mask = self.view(mask, &[keys]);
+                let heads = Heads::new(num_heads, num_kv_heads, head_dim);
+                self.attend(arg(0), arg(1), arg(2), heads, Some(mask))
+            }
+            Op::CachedBlockAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                window_size,
+            } => {
+                // Row `i` sees key `j` when `j - i <= kv_pos`, and with a
+                // window `W` also `j - i > kv_pos - W`. Rows from
+                // `valid_len` on are unspecified; they come out as zero.
+                let rows = ty.shape[0];
+                let keys = self.node(arg(1)).ty.shape[0];
+                let offsets = self.constant(
+                    (0..rows * keys)
+                        .map(|n| (n % keys) as f32 - (n / keys) as f32)
+                        .collect(),
+                    &[rows, keys],
+                );
+                let pos = self.scalar_row(arg(3), rows * keys);
+                let pos = self.view(pos, &[rows, keys]);
+                let mut hidden = self.greater(offsets, pos);
+                if window_size > 0 {
+                    let floor = self.add_scalar(pos, 1.0 - window_size as f32);
+                    let old = self.greater(floor, offsets);
+                    hidden = self.add(hidden, old);
+                }
+                let mask = self.scale(hidden, f32::MIN);
+                let mask = self.view(mask, &[rows * keys]);
+                let heads = Heads::new(num_heads, num_kv_heads, head_dim);
+                let out = self.attend(arg(0), arg(1), arg(2), heads, Some(mask));
+                let iota = self.constant((0..rows).map(|i| i as f32).collect(), &[rows, 1]);
+                let valid = self.scalar_row(arg(4), rows);
+                let valid = self.view(valid, &[rows, 1]);
+                let keep = self.greater(valid, iota);
+                let keep = self.broadcast_inner(keep, ty.shape[1]);
+                self.mul(out, keep)
+            }
+            Op::ChunkedRelativeAttention {
+                num_heads,
+                head_dim,
+                left_context,
+                softcap_bits,
+            } => self.expand_chunked_relative(
+                [arg(0), arg(1), arg(2), arg(3)],
+                Heads::new(num_heads, num_heads, head_dim),
+                left_context as usize,
+                f32::from_bits(softcap_bits),
+            ),
+            ref other => panic!("{other:?} has no expansion"),
+        }
+    }
+
+    /// A `U32` scalar buffer as `[1, n]` copies of its value.
+    fn scalar_row(&mut self, scalar: NodeId, n: usize) -> NodeId {
+        let value = self.to_f32(scalar);
+        let value = self.view(value, &[1, 1]);
+        self.broadcast_inner(value, n)
+    }
+
+    /// The additive causal mask of `rows` self-attention rows, `[rows²]`,
+    /// limited to the last `window` keys when nonzero.
+    fn window_mask(&mut self, rows: usize, window: usize) -> NodeId {
+        let mask = (0..rows * rows)
+            .map(|n| {
+                let (i, j) = (n / rows, n % rows);
+                let visible = j <= i && (window == 0 || i - j < window);
+                if visible { 0.0 } else { f32::MIN }
+            })
+            .collect();
+        self.constant(mask, &[rows * rows])
+    }
+
+    /// `x: [rows, heads·dim]` as `[heads, rows, dim]`.
+    fn split_heads(&mut self, x: NodeId, heads: usize, dim: usize) -> NodeId {
+        let rows = self.node(x).ty.shape[0];
+        let x = self.view(x, &[rows, heads, dim]);
+        self.permute(x, &[1, 0, 2])
+    }
+
+    /// Softmax attention of `q` over `k`/`v` in the shared layout: query
+    /// head `h` reads KV head `h / (heads / kv_heads)`, logits are scaled
+    /// by `1/√dim`, and `mask` (`[keys]` or `[rows·keys]`) is added to
+    /// them when present.
+    fn attend(
+        &mut self,
+        q: NodeId,
+        k: NodeId,
+        v: NodeId,
+        heads: Heads,
+        mask: Option<NodeId>,
+    ) -> NodeId {
+        let (rows, keys) = (self.node(q).ty.shape[0], self.node(k).ty.shape[0]);
+        let qh = self.split_heads(q, heads.heads, heads.dim);
+        let kh = self.kv_heads(k, heads, keys);
+        let vh = self.kv_heads(v, heads, keys);
+        let scores = self.batch_matmul_bt(qh, kh);
+        let scores = self.scale(scores, heads.scale());
+        self.weigh(scores, vh, heads, rows, keys, mask)
+    }
+
+    /// `x: [keys, kv_heads·dim]` as `[heads, keys, dim]`, each KV head
+    /// repeated for the query heads that share it.
+    fn kv_heads(&mut self, x: NodeId, heads: Heads, keys: usize) -> NodeId {
+        let xh = self.split_heads(x, heads.kv_heads, heads.dim);
+        let group = heads.heads / heads.kv_heads;
+        if group == 1 {
+            return xh;
+        }
+        let repeated = self.repeat_axis(xh, heads.kv_heads, keys * heads.dim, group);
+        self.view(repeated, &[heads.heads, keys, heads.dim])
+    }
+
+    /// Mask, softmax and weigh `vh` by `scores: [heads, rows, keys]`;
+    /// returns `[rows, heads·dim]`.
+    fn weigh(
+        &mut self,
+        scores: NodeId,
+        vh: NodeId,
+        heads: Heads,
+        rows: usize,
+        keys: usize,
+        mask: Option<NodeId>,
+    ) -> NodeId {
+        let scores = match mask {
+            Some(mask) => {
+                let width = self.node(mask).ty.num_elements();
+                let flat = self.view(scores, &[heads.heads * rows * keys / width, width]);
+                self.bias_add(flat, mask)
+            }
+            None => scores,
+        };
+        let scores = self.view(scores, &[heads.heads * rows, keys]);
+        let weights = self.softmax(scores);
+        let weights = self.view(weights, &[heads.heads, rows, keys]);
+        let out = self.batch_matmul(weights, vh);
+        let out = self.permute(out, &[1, 0, 2]);
+        self.view(out, &[rows, heads.heads * heads.dim])
+    }
+
+    /// Transformer-XL chunked attention: unscaled logits `q·(k + r)` with
+    /// relative key row `left - 1 - (i - j)`, soft-capped, over keys at
+    /// distance below `left - 1`.
+    fn expand_chunked_relative(
+        &mut self,
+        [q, k, v, relative]: [NodeId; 4],
+        heads: Heads,
+        left: usize,
+        cap: f32,
+    ) -> NodeId {
+        let rows = self.node(q).ty.shape[0];
+        let qh = self.split_heads(q, heads.heads, heads.dim);
+        let kh = self.split_heads(k, heads.heads, heads.dim);
+        let vh = self.split_heads(v, heads.heads, heads.dim);
+        let rh = self.split_heads(relative, heads.heads, heads.dim);
+        let direct = self.batch_matmul_bt(qh, kh);
+        // q_i · r_t for every relative row t, then t = left - 1 - (i - j)
+        // selected per query row by a 0/1 matrix.
+        let by_offset = self.batch_matmul_bt(qh, rh);
+        let by_offset = self.permute(by_offset, &[1, 0, 2]);
+        let mut select = vec![0.0; rows * left * rows];
+        for i in 0..rows {
+            for j in 0..=i {
+                if i - j <= left - 2 {
+                    select[(i * left + (left - 1 - (i - j))) * rows + j] = 1.0;
+                }
+            }
+        }
+        let select = self.constant(select, &[rows, left, rows]);
+        let relative = self.batch_matmul(by_offset, select);
+        let relative = self.permute(relative, &[1, 0, 2]);
+        let logits = self.add(direct, relative);
+        let logits = self.scale(logits, 1.0 / cap);
+        let logits = self.tanh(logits);
+        let logits = self.scale(logits, cap);
+        let mask = self.window_mask(rows, left - 1);
+        self.weigh(logits, vh, heads, rows, rows, Some(mask))
+    }
+
+    /// Rotate pairs `(d, d + dim/2)` of every head by `pos · θ^(-2d/dim)`,
+    /// divided by `factors[d]` when present. `θ` and the position offset
+    /// stay exact in the graph so recognition reads them back.
+    fn expand_rope(
+        &mut self,
+        x: NodeId,
+        theta: f32,
+        head_dim: u32,
+        positions: Positions,
+        factors: Option<NodeId>,
+    ) -> NodeId {
+        let shape = self.node(x).ty.shape.clone();
+        let (rows, width) = (shape[0], shape[1]);
+        let dim = head_dim as usize;
+        let (heads, half) = (width / dim, dim / 2);
+        let pos = match positions {
+            Positions::Offset(offset, dynamic) => {
+                let iota = self.constant((0..rows).map(|r| r as f32).collect(), &[rows, 1]);
+                let pos = self.add_scalar(iota, offset as f32);
+                match dynamic {
+                    Some(kv) => {
+                        let kv = self.scalar_row(kv, rows);
+                        let kv = self.view(kv, &[rows, 1]);
+                        self.add(pos, kv)
+                    }
+                    None => pos,
+                }
+            }
+            Positions::PerRow(p) => {
+                let p = self.to_f32(p);
+                self.view(p, &[rows, 1])
+            }
+        };
+        let theta = self.constant(vec![theta], &[1]);
+        let ln_theta = self.log(theta);
+        let ln_theta = self.view(ln_theta, &[1, 1]);
+        let ln_theta = self.broadcast_inner(ln_theta, half);
+        let exponents = self.constant(
+            (0..half).map(|d| -2.0 * d as f32 / dim as f32).collect(),
+            &[1, half],
+        );
+        let inv_freq = self.mul(exponents, ln_theta);
+        let mut inv_freq = self.exp(inv_freq);
+        if let Some(factors) = factors {
+            let factors = self.view(factors, &[1, half]);
+            let inv = self.recip(factors);
+            inv_freq = self.mul(inv_freq, inv);
+        }
+        let angle = self.matmul(pos, inv_freq);
+        let cos = self.cos(angle);
+        let cos = self.view(cos, &[rows * half]);
+        let sin = self.sin(angle);
+        let sin = self.view(sin, &[rows * half]);
+        let xh = self.split_heads(x, heads, dim);
+        let blocks = u32::try_from(heads * rows).expect("rope rows exceed u32");
+        let half_u32 = half as u32;
+        let first = self.split_a(xh, blocks, half_u32, half_u32, 1);
+        let first = self.view(first, &[heads, rows * half]);
+        let second = self.split_b(xh, blocks, half_u32, half_u32, 1);
+        let second = self.view(second, &[heads, rows * half]);
+        let a = self.bias_mul(first, cos);
+        let b = self.bias_mul(second, sin);
+        let out_first = self.sub(a, b);
+        let c = self.bias_mul(first, sin);
+        let d = self.bias_mul(second, cos);
+        let out_second = self.add(c, d);
+        let out_first = self.view(out_first, &[heads * rows * half]);
+        let out_second = self.view(out_second, &[heads * rows * half]);
+        let joined = self.concat(out_first, out_second, blocks, half_u32, half_u32, 1);
+        let joined = self.view(joined, &[heads, rows, dim]);
+        let joined = self.permute(joined, &[1, 0, 2]);
+        self.view(joined, &[rows, width])
     }
 
     /// `x` with `shape`, through a reshape only when it differs.
@@ -444,6 +765,41 @@ impl Graph {
                     in_h: (self.node(inputs[0]).ty.num_elements() / in_w as usize) as u32,
                     in_w,
                 }),
+                // Every key visible: one op, whichever spelling.
+                Op::FullAttention {
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                }
+                | Op::CrossAttention {
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                }
+                | Op::MultiHeadAttn {
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    ..
+                } => Some(Op::MultiHeadAttn {
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    is_cross: self.node(inputs[0]).ty.shape[0] != self.node(inputs[1]).ty.shape[0],
+                }),
+                // A window spanning the sequence is plain causal attention.
+                Op::SlidingWindowAttention {
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    window_size,
+                } if window_size as usize >= self.node(inputs[0]).ty.shape[0] => {
+                    Some(Op::CausalAttention {
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                    })
+                }
                 Op::ShiftInner { offset } => {
                     let cols = self.node(inputs[0]).ty.shape[1] as i64;
                     if offset == 0 {
@@ -498,6 +854,36 @@ impl Graph {
     }
 }
 
+/// Where a RoPE row sits: its index plus a static offset and an optional
+/// `U32` scalar buffer, or an explicit `U32` position per row.
+enum Positions {
+    Offset(u32, Option<NodeId>),
+    PerRow(NodeId),
+}
+
+/// Head layout of an attention op.
+#[derive(Clone, Copy)]
+struct Heads {
+    heads: usize,
+    kv_heads: usize,
+    dim: usize,
+}
+
+impl Heads {
+    fn new(heads: u32, kv_heads: u32, dim: u32) -> Self {
+        Self {
+            heads: heads as usize,
+            kv_heads: kv_heads as usize,
+            dim: dim as usize,
+        }
+    }
+
+    /// The logit scale every attention kernel applies.
+    fn scale(self) -> f32 {
+        1.0 / (self.dim as f32).sqrt()
+    }
+}
+
 /// Composites that appear inside other composites' expansions.
 fn is_nested(op: &Op) -> bool {
     matches!(
@@ -538,8 +924,16 @@ fn template(op: &Op, types: &[&TensorType], ty: &TensorType) -> Option<(Graph, N
 /// Whether `op` is well-typed over `ins` producing `out`: the contract its
 /// builder enforces, which its expansion relies on.
 fn accepts(op: &Op, ins: &[&TensorType], out: &TensorType) -> bool {
-    use super::DType::F32;
-    if ins.iter().any(|t| t.dtype != F32) || out.dtype != F32 {
+    use super::DType::{F32, U32};
+    // Only position and length scalars are integers.
+    let integer_inputs = matches!(
+        *op,
+        Op::RoPE { .. }
+            | Op::RoPEPositions { .. }
+            | Op::CachedAttention { .. }
+            | Op::CachedBlockAttention { .. }
+    );
+    if out.dtype != F32 || (!integer_inputs && ins.iter().any(|t| t.dtype != F32)) {
         return false;
     }
     let elems = |t: &TensorType| t.num_elements();
@@ -633,8 +1027,123 @@ fn accepts(op: &Op, ins: &[&TensorType], out: &TensorType) -> bool {
                 && in_w > 0
                 && elems(ins[0]) % in_w as usize == 0
         }
+        Op::RoPE {
+            head_dim,
+            freq_factors,
+            ..
+        } => {
+            let d = head_dim as usize;
+            let scalar = |t: &TensorType| t.dtype == U32 && t.shape == [1];
+            let extra_ok = match ins.len() {
+                1 => !freq_factors,
+                2 => !freq_factors && scalar(ins[1]),
+                3 => {
+                    freq_factors && scalar(ins[1]) && ins[2].dtype == F32 && ins[2].shape == [d / 2]
+                }
+                _ => false,
+            };
+            extra_ok && rope_x_ok(ins[0], out, d)
+        }
+        Op::RoPEPositions { head_dim, .. } => {
+            arity(2)
+                && rope_x_ok(ins[0], out, head_dim as usize)
+                && ins[1].dtype == U32
+                && ins[1].shape == [out.shape[0]]
+        }
+        Op::CausalAttention {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        }
+        | Op::SlidingWindowAttention {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            ..
+        } => {
+            arity(3)
+                && attention_ok(ins, out, num_heads, num_kv_heads, head_dim)
+                && ins[1].shape[0] == out.shape[0]
+        }
+        Op::FullAttention {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        }
+        | Op::CrossAttention {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        }
+        | Op::MultiHeadAttn {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            ..
+        } => arity(3) && attention_ok(ins, out, num_heads, num_kv_heads, head_dim),
+        Op::CachedAttention {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        } => {
+            arity(4)
+                && attention_ok(&ins[..3], out, num_heads, num_kv_heads, head_dim)
+                && ins[3].dtype == U32
+                && ins[3].shape == [1]
+        }
+        Op::CachedBlockAttention {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            ..
+        } => {
+            arity(5)
+                && attention_ok(&ins[..3], out, num_heads, num_kv_heads, head_dim)
+                && ins[3..].iter().all(|t| t.dtype == U32 && t.shape == [1])
+        }
+        Op::ChunkedRelativeAttention {
+            num_heads,
+            head_dim,
+            left_context,
+            softcap_bits,
+        } => {
+            let cap = f32::from_bits(softcap_bits);
+            arity(4)
+                && attention_ok(&ins[..3], out, num_heads, num_heads, head_dim)
+                && ins[1].shape == out.shape
+                && ins[3].dtype == F32
+                && ins[3].shape == [left_context as usize, out.shape[1]]
+                && left_context > 1
+                && cap > 0.0
+                && cap.is_finite()
+        }
         _ => true,
     }
+}
+
+/// A RoPE input: `[rows, heads · dim]` with an even `dim`.
+fn rope_x_ok(x: &TensorType, out: &TensorType, dim: usize) -> bool {
+    x == out
+        && x.dtype == super::DType::F32
+        && dim > 0
+        && dim.is_multiple_of(2)
+        && matches!(x.shape[..], [rows, width] if rows > 0 && width > 0 && width.is_multiple_of(dim))
+}
+
+/// Q, K and V of an attention op in the shared layout.
+fn attention_ok(ins: &[&TensorType], out: &TensorType, heads: u32, kv: u32, dim: u32) -> bool {
+    let (heads, kv, dim) = (heads as usize, kv as usize, dim as usize);
+    let f32_matrix = |t: &TensorType, cols: usize| {
+        t.dtype == super::DType::F32 && matches!(t.shape[..], [rows, c] if rows > 0 && c == cols)
+    };
+    heads > 0
+        && kv > 0
+        && dim > 0
+        && heads.is_multiple_of(kv)
+        && ins[0] == out
+        && f32_matrix(out, heads * dim)
+        && f32_matrix(ins[1], kv * dim)
+        && ins[2] == ins[1]
 }
 
 /// Structural equality between a template expansion, whose first nodes are
@@ -733,6 +1242,14 @@ fn guesses(g: &Graph, root: NodeId) -> Vec<(Op, Vec<NodeId>)> {
                     && let Some(x) = input(g, shifted, 0)
                 {
                     out.push((Op::Softmax, vec![unview(g, x), x]));
+                }
+                // cached block attention: out · bcast(rows kept)
+                if let Some(perm) = Some(unview(g, a))
+                    && matches!(g.node(perm).op, Op::Permute { .. })
+                    && let Some(product) = input(g, perm, 0).map(|p| unview(g, p))
+                    && matches!(g.node(product).op, Op::BatchMatMul)
+                {
+                    out.extend(attention_guess(g, product, Some(b)));
                 }
                 // silu: x · sigmoid(x)
                 if is(g, b, |op| matches!(op, Op::Sigmoid)) && input(g, b, 0) == Some(a) {
@@ -928,6 +1445,16 @@ fn guesses(g: &Graph, root: NodeId) -> Vec<(Op, Vec<NodeId>)> {
                 let _ = factor;
             }
         }
+        Op::Permute { .. } => {
+            if let Some(inner) = input(g, core, 0) {
+                let inner = unview(g, inner);
+                match g.node(inner).op {
+                    Op::Concat { .. } => out.extend(rope_guess(g, inner)),
+                    Op::BatchMatMul => out.extend(attention_guess(g, inner, None)),
+                    _ => {}
+                }
+            }
+        }
         Op::SumInner => {
             // sum_rows: sum over the transpose
             if let Some(t) = input(g, core, 0)
@@ -1002,6 +1529,284 @@ fn guesses(g: &Graph, root: NodeId) -> Vec<(Op, Vec<NodeId>)> {
             {
                 let inner = g.node(x).ty.shape.get(1).copied().unwrap_or(0) as u32;
                 out.push((Op::NormalizeInnerSum { inner, floor }, vec![x]));
+            }
+        }
+    }
+    out
+}
+
+/// Constant data of a node, if it is one.
+fn constant(g: &Graph, id: NodeId) -> Option<&[f32]> {
+    match g.node(id).op {
+        Op::Constant { ref data } => Some(data),
+        _ => None,
+    }
+}
+
+/// The `U32` scalar a `scalar_row` broadcast reads.
+fn scalar_source(g: &Graph, id: NodeId) -> Option<NodeId> {
+    let bcast = unview(g, id);
+    let value = unview(g, input(g, bcast, 0)?);
+    matches!(g.node(value).op, Op::ToF32).then(|| input(g, value, 0))?
+}
+
+/// The tensor behind a `split_heads` (or its repetition for grouped KV).
+fn heads_source(g: &Graph, id: NodeId) -> Option<NodeId> {
+    let mut id = unview(g, id);
+    while let Op::Concat { .. } = g.node(id).op {
+        id = unview(g, input(g, id, 0)?);
+    }
+    matches!(g.node(id).op, Op::Permute { .. }).then(|| unview(g, input(g, id, 0)?).into())?
+}
+
+/// A RoPE whose concatenated halves are `concat`.
+fn rope_guess(g: &Graph, concat: NodeId) -> Vec<(Op, Vec<NodeId>)> {
+    let mut out = Vec::new();
+    let Op::Concat { channels_a, .. } = g.node(concat).op else {
+        return out;
+    };
+    let head_dim = 2 * channels_a;
+    let Some(first) = input(g, concat, 0).map(|f| unview(g, f)) else {
+        return out;
+    };
+    for (a, _) in operands(g, first) {
+        let (Some(split), Some(cos)) = (input(g, a, 0), input(g, a, 1)) else {
+            continue;
+        };
+        let split = unview(g, split);
+        let cos = unview(g, cos);
+        let (Some(xh), Some(angle)) = (input(g, split, 0), input(g, cos, 0)) else {
+            continue;
+        };
+        let Some(x) = input(g, xh, 0).map(|x| unview(g, x)) else {
+            continue;
+        };
+        let (Some(pos), Some(inv)) = (input(g, angle, 0), input(g, angle, 1)) else {
+            continue;
+        };
+        // inv_freq = exp(exponents · ln θ), divided by factors when present
+        let mut factors = None;
+        let mut exp = inv;
+        if matches!(g.node(inv).op, Op::Mul) {
+            for (e, r) in operands(g, inv) {
+                if matches!(g.node(r).op, Op::Recip) {
+                    factors = input(g, r, 0).map(|f| unview(g, f));
+                    exp = e;
+                }
+            }
+        }
+        let theta = input(g, exp, 0).and_then(|product| {
+            operands(g, product).into_iter().find_map(|(_, ln)| {
+                let log = unview(g, input(g, ln, 0)?);
+                let c = input(g, log, 0)?;
+                constant(g, c).and_then(|d| d.first().copied())
+            })
+        });
+        let Some(theta) = theta else {
+            continue;
+        };
+        match g.node(pos).op {
+            Op::Offset { value } => out.push((
+                Op::RoPE {
+                    theta,
+                    pos_offset: value as u32,
+                    head_dim,
+                    freq_factors: false,
+                },
+                vec![x],
+            )),
+            Op::Add => {
+                for (offset, kv) in operands(g, pos) {
+                    if let Op::Offset { value } = g.node(offset).op
+                        && let Some(kv) = scalar_source(g, kv)
+                    {
+                        let mut inputs = vec![x, kv];
+                        inputs.extend(factors);
+                        out.push((
+                            Op::RoPE {
+                                theta,
+                                pos_offset: value as u32,
+                                head_dim,
+                                freq_factors: factors.is_some(),
+                            },
+                            inputs,
+                        ));
+                    }
+                }
+            }
+            _ => {
+                let converted = unview(g, pos);
+                if matches!(g.node(converted).op, Op::ToF32)
+                    && let Some(p) = input(g, converted, 0)
+                {
+                    out.push((Op::RoPEPositions { theta, head_dim }, vec![x, p]));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Attention whose value product is `product`; `keep` is the row mask of a
+/// cached block, when the root multiplies by one.
+fn attention_guess(g: &Graph, product: NodeId, keep: Option<NodeId>) -> Vec<(Op, Vec<NodeId>)> {
+    let mut out = Vec::new();
+    let (Some(weights), Some(vh)) = (input(g, product, 0), input(g, product, 1)) else {
+        return out;
+    };
+    let Some(v) = heads_source(g, vh) else {
+        return out;
+    };
+    // softmax(scores): exp(scores - max) · ...
+    let softmax = unview(g, weights);
+    let Some(scores) = operands(g, softmax).into_iter().find_map(|(e, _)| {
+        matches!(g.node(e).op, Op::Exp)
+            .then(|| input(g, e, 0).and_then(|s| input(g, s, 0)))
+            .flatten()
+    }) else {
+        return out;
+    };
+    let mut scores = unview(g, scores);
+    let mut mask = None;
+    if matches!(g.node(scores).op, Op::BiasAdd) {
+        mask = input(g, scores, 1);
+        scores = unview(g, input(g, scores, 0).unwrap_or(scores));
+    }
+    let Op::Scale { factor } = g.node(scores).op else {
+        return out;
+    };
+    let Some(logits) = input(g, scores, 0) else {
+        return out;
+    };
+    let qh_of = |id: NodeId| -> Option<(NodeId, NodeId, NodeId)> {
+        let qh = input(g, id, 0)?;
+        let kh = input(g, id, 1)?;
+        Some((qh, heads_source(g, qh)?, heads_source(g, kh)?))
+    };
+    // Chunked relative: cap · tanh((q·k + relative) / cap)
+    if matches!(g.node(logits).op, Op::Tanh) {
+        let Some(sum) = input(g, logits, 0).and_then(|s| input(g, s, 0)) else {
+            return out;
+        };
+        for (direct, relative) in operands(g, sum) {
+            let Some((qh, q, k)) = qh_of(direct) else {
+                continue;
+            };
+            // permute(batch_matmul(permute(batch_matmul_bt(qh, rh)), select))
+            let rel = (|| {
+                let by_row = input(g, input(g, relative, 0)?, 0)?;
+                let by_offset = input(g, by_row, 0)?;
+                heads_source(g, input(g, by_offset, 1)?)
+            })();
+            let (Some(rel), Some(&[heads, _, dim])) = (rel, Some(&g.node(qh).ty.shape[..])) else {
+                continue;
+            };
+            out.push((
+                Op::ChunkedRelativeAttention {
+                    num_heads: heads as u32,
+                    head_dim: dim as u32,
+                    left_context: g.node(rel).ty.shape[0] as u32,
+                    softcap_bits: factor.to_bits(),
+                },
+                vec![q, k, v, rel],
+            ));
+        }
+        return out;
+    }
+    let Some((qh, q, k)) = qh_of(logits) else {
+        return out;
+    };
+    let &[heads, rows, dim] = &g.node(qh).ty.shape[..] else {
+        return out;
+    };
+    let kv_heads = (g.node(k).ty.shape[1] / dim) as u32;
+    let (heads, dim) = (heads as u32, dim as u32);
+    let keys = g.node(k).ty.shape[0];
+    match mask.map(|m| unview(g, m)) {
+        None => out.push((
+            Op::MultiHeadAttn {
+                num_heads: heads,
+                num_kv_heads: kv_heads,
+                head_dim: dim,
+                is_cross: rows != keys,
+            },
+            vec![q, k, v],
+        )),
+        Some(m) if constant(g, m).is_some() => {
+            let data = constant(g, m).unwrap_or_default();
+            out.push((
+                Op::CausalAttention {
+                    num_heads: heads,
+                    num_kv_heads: kv_heads,
+                    head_dim: dim,
+                },
+                vec![q, k, v],
+            ));
+            // The last row sees the window.
+            let window = data[data.len().saturating_sub(rows)..]
+                .iter()
+                .filter(|&&x| x == 0.0)
+                .count();
+            out.push((
+                Op::SlidingWindowAttention {
+                    num_heads: heads,
+                    num_kv_heads: kv_heads,
+                    head_dim: dim,
+                    window_size: window as u32,
+                },
+                vec![q, k, v],
+            ));
+        }
+        Some(m) => {
+            // Cached: scale(hidden, MIN), hidden = greater(·, kv_pos) [+ window]
+            let Some(hidden) = input(g, m, 0) else {
+                return out;
+            };
+            let mut window = 0;
+            let mut comparison = hidden;
+            if matches!(g.node(hidden).op, Op::Add) {
+                for (a, b) in operands(g, hidden) {
+                    if let Some(floor) = input(g, b, 0)
+                        && let Op::Offset { value } = g.node(floor).op
+                    {
+                        window = (1.0 - value) as u32;
+                        comparison = a;
+                    }
+                }
+            }
+            let Some(pos) = input(g, comparison, 1) else {
+                return out;
+            };
+            let Some(kv_pos) = scalar_source(g, pos) else {
+                return out;
+            };
+            let heads_attrs = (heads, kv_heads, dim);
+            match keep {
+                None => out.push((
+                    Op::CachedAttention {
+                        num_heads: heads_attrs.0,
+                        num_kv_heads: heads_attrs.1,
+                        head_dim: heads_attrs.2,
+                    },
+                    vec![q, k, v, kv_pos],
+                )),
+                Some(keep) => {
+                    let valid = (|| {
+                        let greater = input(g, keep, 0)?;
+                        scalar_source(g, input(g, greater, 0)?)
+                    })();
+                    if let Some(valid) = valid {
+                        out.push((
+                            Op::CachedBlockAttention {
+                                num_heads: heads_attrs.0,
+                                num_kv_heads: heads_attrs.1,
+                                head_dim: heads_attrs.2,
+                                window_size: window,
+                            },
+                            vec![q, k, v, kv_pos, valid],
+                        ));
+                    }
+                }
             }
         }
     }
