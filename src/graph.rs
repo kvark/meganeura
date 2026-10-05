@@ -2,8 +2,10 @@ use std::fmt;
 
 mod composite;
 mod decompose;
+mod helpers;
 pub use composite::OpClass;
 pub(crate) use composite::mean_factor;
+pub use helpers::{Nchw, t5_bucket};
 
 pub type NodeId = u32;
 

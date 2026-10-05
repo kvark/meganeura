@@ -1,5 +1,16 @@
 # Unreleased
 
+- `Graph::biased_attention` and `Graph::biased_cached_attention`: softmax
+  attention with an additive bias per head, query row and key (T5 relative
+  positions, ALiBi), a configurable logit scale, and full, causal or cache
+  masking, lowered to one fused kernel for heads up to 512 wide.
+- Building blocks in `graph::helpers`, spelled in primitives, for audio and
+  sequence models such as Lyria: `elu`, `crop_2d`, `pixel_shuffle_w`,
+  `dilate_w`/`dilate_h`, `upsample_nearest`, `conv_transpose_2d` (PyTorch
+  kernel layout, separate strides, through the forward convolution),
+  `t5_relative_bias` and `t5_relative_bias_cached` (with `t5_bucket`).
+  New primitives `to_u32` and `constant_u32` drive gathers by computed or
+  constant indices.
 - Ops are classified as primitive, composite or private (`Op::class`).
   Every composite has a decomposition into primitives (`Graph::decompose`),
   and every build recognizes decompositions again (`Graph::recompose`), so a
