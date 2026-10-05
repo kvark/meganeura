@@ -425,6 +425,16 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_x = graph.mul(grad_output, node.id);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
+            Op::Erf => {
+                // d/dx erf(x) = 2/√π · exp(-x²)
+                let x = node.inputs[0];
+                let square = graph.mul(x, x);
+                let exponent = graph.scale(square, -1.0);
+                let density = graph.exp(exponent);
+                let slope = graph.scale(density, std::f32::consts::FRAC_2_SQRT_PI);
+                let grad_x = graph.mul(grad_output, slope);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
             Op::Sqrt => {
                 // d/dx sqrt(x) = 1 / (2 sqrt(x))
                 let x = node.inputs[0];

@@ -277,6 +277,7 @@ pub fn eval_node(
         | Op::Log
         | Op::Recip
         | Op::Exp
+        | Op::Erf
         | Op::Sqrt
         | Op::Rsqrt
         | Op::Offset { .. }

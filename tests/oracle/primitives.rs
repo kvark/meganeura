@@ -75,6 +75,56 @@ fn elementwise_primitives() {
     grad_case("add_scalar", build, |_| {});
 }
 
+/// Known values of erf, so the reference the GPU kernel is compared with is
+/// itself right, in both its series and continued-fraction ranges.
+#[test]
+fn erf_reference_values() {
+    let points: [f64; 10] = [0.0, 0.1, 0.5, 1.0, 2.0, 2.9, 3.5, 4.5, -1.5, 7.0];
+    let known = [
+        0.0,
+        0.112_462_916_018_284_9,
+        0.520_499_877_813_046_5,
+        0.842_700_792_949_714_9,
+        0.995_322_265_018_952_7,
+        0.999_958_902_121_900_5,
+        0.999_999_256_901_627_7,
+        0.999_999_999_803_383_4,
+        -0.966_105_146_475_310_7,
+        1.0,
+    ];
+    let mut g = Graph::new();
+    let x = g.input("x", &[1, points.len()]);
+    let y = g.erf(x);
+    g.set_outputs(vec![y]);
+    let mut feeds = Feeds::new();
+    feeds.set("x", &points.map(|v| v as f32));
+    let got = meganeura::reference::evaluate_outputs(&g, &feeds).unwrap();
+    for ((&p, &want), &got) in points.iter().zip(&known).zip(&got[0].data) {
+        // The feed rounds each point to f32 first.
+        let slope = std::f64::consts::FRAC_2_SQRT_PI * (-p * p).exp();
+        let rounding = (f64::from(p as f32) - p).abs() * slope;
+        assert!(
+            (got - want).abs() <= 1e-14 + rounding * 1.01,
+            "erf({p}) = {got}, want {want}"
+        );
+    }
+}
+
+#[test]
+fn erf() {
+    let build = |g: &mut Graph| {
+        let x = g.parameter("x", &[4, 16]);
+        g.erf(x)
+    };
+    // Spans the kernel's Taylor and erfc ranges and the saturated tail.
+    let fix = |feeds: &mut Feeds| {
+        let data: Vec<f32> = (0..64).map(|i| -4.1 + 0.13 * i as f32).collect();
+        feeds.set("x", &data);
+    };
+    inference_case("erf", build, fix);
+    grad_case("erf", build, fix);
+}
+
 /// Values a step away from both bounds, so finite differences never
 /// straddle one.
 #[test]
