@@ -292,6 +292,21 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_broadcast = graph.broadcast_inner(grad_output, n);
                 accumulate_grad(&mut graph, &mut grads, x, grad_broadcast);
             }
+            Op::MaxInner => {
+                // The gradient flows to every element equal to its row's
+                // maximum, `x == max` spelled `1 - (max > x)`. Ties all
+                // receive it, as in StableHLO's reduce-max gradient
+                // before normalization.
+                let x = node.inputs[0];
+                let n = forward.nodes()[x as usize].ty.shape[1];
+                let max = graph.broadcast_inner(node.id, n);
+                let below = graph.greater(max, x);
+                let below = graph.neg(below);
+                let at_max = graph.add_scalar(below, 1.0);
+                let grad = graph.broadcast_inner(grad_output, n);
+                let grad_x = graph.mul(grad, at_max);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
             Op::BroadcastInner { .. } => {
                 // BroadcastInner: [M, 1] → [M, N]. Its transpose sums the
                 // repeated gradient columns back into one scalar per row.
@@ -408,6 +423,41 @@ pub fn differentiate(forward: &Graph) -> Graph {
             Op::Exp => {
                 let x = node.inputs[0];
                 let grad_x = graph.mul(grad_output, node.id);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
+            Op::Sqrt => {
+                // d/dx sqrt(x) = 1 / (2 sqrt(x))
+                let x = node.inputs[0];
+                let recip_y = graph.recip(node.id);
+                let slope = graph.scale(recip_y, 0.5);
+                let grad_x = graph.mul(grad_output, slope);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
+            Op::Rsqrt => {
+                // d/dx x^(-1/2) = -x^(-3/2) / 2 = -y³ / 2
+                let x = node.inputs[0];
+                let y = node.id;
+                let y2 = graph.mul(y, y);
+                let y3 = graph.mul(y2, y);
+                let slope = graph.scale(y3, -0.5);
+                let grad_x = graph.mul(grad_output, slope);
+                accumulate_grad(&mut graph, &mut grads, x, grad_x);
+            }
+            Op::Offset { .. } => {
+                accumulate_grad(&mut graph, &mut grads, node.inputs[0], grad_output);
+            }
+            Op::Clamp { min, max } => {
+                // The gradient passes where the input lies strictly inside
+                // the range, as `Clamp`'s reference derivative has it.
+                let x = node.inputs[0];
+                let shape = forward.nodes()[x as usize].ty.shape.clone();
+                let n = shape.iter().product();
+                let lo = graph.constant(vec![min; n], &shape);
+                let hi = graph.constant(vec![max; n], &shape);
+                let above = graph.greater(x, lo);
+                let below = graph.greater(hi, x);
+                let inside = graph.mul(above, below);
+                let grad_x = graph.mul(grad_output, inside);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
             Op::Softplus { beta } => {
@@ -987,7 +1037,6 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::CachedBlockAttention { .. }
             | Op::ChunkedRelativeAttention { .. }
             | Op::PrefixLast
-            | Op::Clamp { .. }
             | Op::RoPEPositions { .. }
             | Op::GroupNormSilu { .. } => {
                 panic!(

@@ -21,6 +21,10 @@ use egglog::{Term, TermDag, TermId, ast::Literal, extract::Extractor};
 use std::collections::{HashMap, HashSet};
 use std::{fmt, time::Instant};
 
+/// Structural memo of named-constructor nodes: (constructor, inputs,
+/// attributes, precision policy) → node.
+pub(crate) type StructuralIndex = HashMap<(&'static str, Vec<NodeId>, Vec<i64>, bool), NodeId>;
+
 /// Node-count ceiling for a single egglog saturation. Above this, the
 /// graph is segmented (see module docs). Shared-parameter graphs create
 /// large e-classes that make pattern matching superlinear: the SmolVLA
@@ -150,6 +154,9 @@ impl egglog::extract::CostModel<u64> for FusionCostModel {
         // that read them.
         if name == "Leaf" {
             return 0;
+        }
+        if is_pattern_only(name) {
+            return PATTERN_ONLY_COST;
         }
         let Some(sizes) = self.sizes.as_ref() else {
             return 1;
@@ -638,6 +645,17 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
   (GeGLU Op Op)
   (GeGLUPacked Op Op Op)
   (GeGLUPackedBT Op Op Op)
+  (Softmax Op)
+  (RmsNorm i64 Op Op)
+  (PExp Op)
+  (PRecip Op)
+  (PRsqrt Op)
+  (PMaxInner Op)
+  (PSumInner Op)
+  (PMeanInner Op)
+  (PBroadcastInner Op)
+  (POffset i64 Op)
+  (PBiasMul Op Op)
   (Op1 i64 Op)
   (Op2 i64 Op Op)
   (Op3 i64 Op Op Op)
@@ -682,6 +700,29 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
 (rewrite (Mul ?up (Gelu ?gate)) (GeGLU ?gate ?up))
 (rewrite (GeGLU (MatMul ?h ?wg) (MatMul ?h ?wu)) (GeGLUPacked ?h ?wg ?wu))
 (rewrite (GeGLU (MatMulBT ?h ?wg) (MatMulBT ?h ?wu)) (GeGLUPackedBT ?h ?wg ?wu))
+
+; --- Composite recognition ---
+; Decompositions into primitives (`Graph::decomposed_*`) become fused
+; kernels. Primitives without a named constructor are encoded generically,
+; so the encoder also states what each one computes as a pattern-only
+; `P*` term in the same e-class. Those terms exist only to be matched here;
+; extraction never selects them.
+
+; softmax(x) = e / sum(e), e = exp(x - max(x))
+(rule ((= ?e (PExp (Add ?x (Neg (PBroadcastInner (PMaxInner ?x))))))
+       (= ?y (Mul ?e (PBroadcastInner (PRecip (PSumInner ?e))))))
+      ((union ?y (Softmax ?x))))
+(rule ((= ?e (PExp (Add ?x (Neg (PBroadcastInner (PMaxInner ?x))))))
+       (= ?y (Mul (PBroadcastInner (PRecip (PSumInner ?e))) ?e)))
+      ((union ?y (Softmax ?x))))
+
+; rms_norm(x, w) = x * rsqrt(mean(x²) + eps) * w
+(rule ((= ?r (PRsqrt (POffset ?eps (PMeanInner (Mul ?x ?x)))))
+       (= ?y (PBiasMul (Mul ?x (PBroadcastInner ?r)) ?w)))
+      ((union ?y (RmsNorm ?eps ?x ?w))))
+(rule ((= ?r (PRsqrt (POffset ?eps (PMeanInner (Mul ?x ?x)))))
+       (= ?y (PBiasMul (Mul (PBroadcastInner ?r) ?x) ?w)))
+      ((union ?y (RmsNorm ?eps ?x ?w))))
 
 ",
     );
@@ -784,6 +825,61 @@ fn node_to_egglog_expr(node: &Node) -> String {
     }
 }
 
+/// Pattern-only constructors: facts the encoder states about generically
+/// encoded primitives so composite rules can match them. Extraction must
+/// never select one, since stamping cannot rebuild it.
+const PATTERN_ONLY: &[&str] = &[
+    "PExp",
+    "PRecip",
+    "PRsqrt",
+    "PMaxInner",
+    "PSumInner",
+    "PMeanInner",
+    "PBroadcastInner",
+    "POffset",
+    "PBiasMul",
+];
+
+/// Larger than any real extraction cost, but far from saturating when a
+/// handful are summed.
+const PATTERN_ONLY_COST: u64 = 1 << 48;
+
+pub(crate) fn is_pattern_only(name: &str) -> bool {
+    PATTERN_ONLY.contains(&name)
+}
+
+/// The pattern-only term for a primitive that composite rules match on,
+/// stated over the node's own inputs. A mean is a sum scaled by exactly
+/// `1 / N`, recognized here because egglog cannot compare the factor.
+fn pattern_term(g: &Graph, node: &Node, segment: &HashSet<usize>) -> Option<String> {
+    let arg = |slot: usize| format!("$n{}", node.inputs[slot]);
+    Some(match node.op {
+        Op::Exp => format!("(PExp {})", arg(0)),
+        Op::Recip => format!("(PRecip {})", arg(0)),
+        Op::Rsqrt => format!("(PRsqrt {})", arg(0)),
+        Op::MaxInner => format!("(PMaxInner {})", arg(0)),
+        Op::SumInner => format!("(PSumInner {})", arg(0)),
+        Op::BroadcastInner { .. } => format!("(PBroadcastInner {})", arg(0)),
+        Op::Offset { value } => format!("(POffset {} {})", value.to_bits(), arg(0)),
+        Op::BiasMul => format!("(PBiasMul {} {})", arg(0), arg(1)),
+        Op::Scale { factor } => {
+            // The sum's own input is bound only when the sum is encoded
+            // in this segment, rather than as an opaque leaf.
+            let sum = g.node(node.inputs[0]);
+            if !matches!(sum.op, Op::SumInner) || !segment.contains(&(sum.id as usize)) {
+                return None;
+            }
+            let summed = sum.inputs[0];
+            let inner = g.node(summed).ty.shape[1];
+            if factor.to_bits() != crate::graph::mean_factor(inner).to_bits() {
+                return None;
+            }
+            format!("(PMeanInner $n{summed})")
+        }
+        _ => return None,
+    })
+}
+
 /// Egglog program for one segment instance: external dependencies become
 /// opaque `Leaf` terms, segment nodes are encoded in id order. Returns
 /// the program and the external node ids (needed to size their e-classes
@@ -816,6 +912,9 @@ fn segment_program(g: &Graph, seg: &Segment) -> (String, Vec<usize>) {
             continue;
         }
         prog.push_str(&format!("(let $n{} {})\n", id, node_to_egglog_expr(node)));
+        if let Some(pattern) = pattern_term(g, node, &idset) {
+            prog.push_str(&format!("(union $n{id} {pattern})\n"));
+        }
     }
     // See the comment at the end of `egglog_prelude` for the bound.
     prog.push_str("(run 4)\n");
@@ -969,7 +1068,7 @@ fn instance_ext_map(
 fn process_segment(
     g: &mut Graph,
     seg: &Segment,
-    index: &mut HashMap<(&'static str, Vec<NodeId>, bool), NodeId>,
+    index: &mut StructuralIndex,
     report: &mut OptimizeReport,
     config: OptimizeConfig,
 ) {
@@ -1091,9 +1190,8 @@ fn process_segment(
 /// survive.
 struct Stamper<'a> {
     g: &'a mut Graph,
-    /// Structural memo for named constructors:
-    /// (name, children, precision policy) → node.
-    index: &'a mut HashMap<(&'static str, Vec<NodeId>, bool), NodeId>,
+    /// Structural memo for named constructors.
+    index: &'a mut StructuralIndex,
     /// Node ids of the encoded instance (terms only reference these).
     seg_ids: &'a HashSet<usize>,
     /// Id shift of the instance being stamped.
@@ -1114,14 +1212,15 @@ impl Stamper<'_> {
     fn stamp_root(&mut self, root: usize, dag: &TermDag, term_id: TermId) -> Result<(), String> {
         match *dag.get(term_id) {
             Term::App(ref name, ref children) if named_constructor_exists(name) => {
-                let inputs = self.resolve_children(dag, children)?;
+                let (attrs, children) = split_attributes(dag, children);
+                let inputs = self.resolve_children(dag, &children)?;
                 // Unchanged term → nothing to do.
                 if named_constructor(&self.g.node(root as u32).op) == Some(name.as_str())
                     && self.g.node(root as u32).inputs == inputs
                 {
                     return Ok(());
                 }
-                self.build_named(name, inputs, Some(root as u32))?;
+                self.build_named(name, inputs, &attrs, Some(root as u32))?;
                 Ok(())
             }
             _ => {
@@ -1169,14 +1268,16 @@ impl Stamper<'_> {
                 orig
             }
             Term::App(ref name, ref children) => {
-                let inputs = self.resolve_children(dag, children)?;
+                let (attrs, children) = split_attributes(dag, children);
+                let inputs = self.resolve_children(dag, &children)?;
                 match self.index.get(&(
                     static_constructor(name)?,
                     inputs.clone(),
+                    attrs.clone(),
                     self.requires_full_precision,
                 )) {
                     Some(&hit) => hit,
-                    None => self.build_named(name, inputs, None)?,
+                    None => self.build_named(name, inputs, &attrs, None)?,
                 }
             }
             ref other => return Err(format!("unexpected term {:?}", other)),
@@ -1198,10 +1299,13 @@ impl Stamper<'_> {
     }
 
     /// Create (or overwrite `target` with) a named-constructor node.
+    /// `attrs` are the constructor's integer attributes, such as an
+    /// epsilon's bits.
     fn build_named(
         &mut self,
         name: &str,
         inputs: Vec<NodeId>,
+        attrs: &[i64],
         target: Option<NodeId>,
     ) -> Result<NodeId, String> {
         match matrix_family(name).unwrap_or(name) {
@@ -1277,6 +1381,23 @@ impl Stamper<'_> {
             "SwiGLU" => (Op::SwiGLU, ty_of(inputs[0]), Some("Silu+Mul→SwiGLU")),
             "Gelu" => (Op::Gelu, ty_of(inputs[0]), None),
             "GeGLU" => (Op::GeGLU, ty_of(inputs[0]), Some("Gelu+Mul→GeGLU")),
+            "Softmax" => (
+                Op::Softmax,
+                ty_of(inputs[0]),
+                Some("decomposed softmax→Softmax"),
+            ),
+            "RmsNorm" => {
+                let &[eps] = attrs else {
+                    return Err(format!("RmsNorm takes one attribute, got {attrs:?}"));
+                };
+                (
+                    Op::RmsNorm {
+                        eps: f32::from_bits(eps as u32),
+                    },
+                    ty_of(inputs[0]),
+                    Some("decomposed RMSNorm→RmsNorm"),
+                )
+            }
             other => return Err(format!("unknown constructor {}", other)),
         };
         let id = self.place(op, inputs.clone(), ty, target);
@@ -1285,6 +1406,7 @@ impl Stamper<'_> {
             (
                 static_constructor(name)?,
                 inputs,
+                attrs.to_vec(),
                 self.requires_full_precision,
             ),
             id,
@@ -1324,7 +1446,7 @@ impl Stamper<'_> {
         else {
             let gate = self.lookup_or_build(&scheduled, vec![h, wg])?;
             let up = self.lookup_or_build(&scheduled, vec![h, wu])?;
-            return self.build_named(unpacked, vec![gate, up], target);
+            return self.build_named(unpacked, vec![gate, up], &[], target);
         };
         self.g.nodes_mut()[wide_mm as usize].matmul_impl = scheduled_matmul(packed_key);
         let shape = &self.g.node(wide_mm).ty.shape;
@@ -1336,7 +1458,12 @@ impl Stamper<'_> {
             target,
         );
         self.index.insert(
-            (packed_key, inputs.to_vec(), self.requires_full_precision),
+            (
+                packed_key,
+                inputs.to_vec(),
+                Vec::new(),
+                self.requires_full_precision,
+            ),
             id,
         );
         self.fusions.push((
@@ -1350,10 +1477,11 @@ impl Stamper<'_> {
         match self.index.get(&(
             static_constructor(name)?,
             inputs.clone(),
+            Vec::new(),
             self.requires_full_precision,
         )) {
             Some(&hit) => Ok(hit),
-            None => self.build_named(name, inputs, None),
+            None => self.build_named(name, inputs, &[], None),
         }
     }
 
@@ -1525,8 +1653,23 @@ fn static_constructor(name: &str) -> Result<&'static str, String> {
         "GeGLU" => "GeGLU",
         "GeGLUPacked" => "GeGLUPacked",
         "GeGLUPackedBT" => "GeGLUPackedBT",
+        "Softmax" => "Softmax",
+        "RmsNorm" => "RmsNorm",
         other => return Err(format!("unknown constructor {}", other)),
     })
+}
+
+/// Separate a constructor's integer attributes from its operands.
+fn split_attributes(dag: &TermDag, children: &[TermId]) -> (Vec<i64>, Vec<TermId>) {
+    let mut attrs = Vec::new();
+    let mut operands = Vec::new();
+    for &child in children {
+        match *dag.get(child) {
+            Term::Lit(Literal::Int(v)) => attrs.push(v),
+            _ => operands.push(child),
+        }
+    }
+    (attrs, operands)
 }
 
 fn lit_node_id(dag: &TermDag, term_id: TermId) -> Result<usize, String> {
@@ -1539,12 +1682,17 @@ fn lit_node_id(dag: &TermDag, term_id: TermId) -> Result<usize, String> {
 /// Structural memo of the existing graph for named constructors, so
 /// term resolution finds each instance's own nodes (and never duplicates
 /// an existing equivalent node).
-fn build_structural_index(g: &Graph) -> HashMap<(&'static str, Vec<NodeId>, bool), NodeId> {
+fn build_structural_index(g: &Graph) -> StructuralIndex {
     let mut index = HashMap::new();
     for node in g.nodes() {
         if let Some(name) = named_constructor(&node.op) {
             index.insert(
-                (name, node.inputs.clone(), node.requires_full_precision),
+                (
+                    name,
+                    node.inputs.clone(),
+                    Vec::new(),
+                    node.requires_full_precision,
+                ),
                 node.id,
             );
         }
@@ -2452,5 +2600,106 @@ mod tests {
         assert!(matches!(out1.op, Op::Relu));
         // The shared MatMul must still be live for the Relu path.
         assert!(matches!(opt.node(out1.inputs[0]).op, Op::MatMul));
+    }
+
+    fn live_ops(g: &Graph) -> Vec<&Op> {
+        g.nodes().iter().map(|node| &node.op).collect()
+    }
+
+    #[test]
+    fn decomposed_softmax_becomes_the_fused_kernel() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 16]);
+        let y = g.decomposed_softmax(x);
+        g.set_outputs(vec![y]);
+        assert!(g.nodes().iter().all(|node| node.op.is_primitive()));
+
+        let (opt, report) = optimize_with_report(&g);
+        let out = opt.node(opt.outputs()[0]);
+        assert!(matches!(out.op, Op::Softmax), "got {:?}", out.op);
+        assert!(matches!(opt.node(out.inputs[0]).op, Op::Input { .. }));
+        assert_eq!(live_ops(&opt).len(), 2, "{:?}", live_ops(&opt));
+        assert!(
+            report
+                .fusions_applied
+                .iter()
+                .any(|f| f.0.contains("Softmax"))
+        );
+    }
+
+    #[test]
+    fn decomposed_rms_norm_becomes_the_fused_kernel() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 16]);
+        let w = g.parameter("w", &[16]);
+        let y = g.decomposed_rms_norm(x, w, 1e-6);
+        g.set_outputs(vec![y]);
+        assert!(g.nodes().iter().all(|node| node.op.is_primitive()));
+
+        let opt = optimize(&g);
+        let out = opt.node(opt.outputs()[0]);
+        match out.op {
+            Op::RmsNorm { eps } => assert_eq!(eps.to_bits(), 1e-6f32.to_bits()),
+            ref other => panic!("expected RmsNorm, got {other:?}"),
+        }
+        assert_eq!(live_ops(&opt).len(), 3, "{:?}", live_ops(&opt));
+    }
+
+    /// Composites inside a training graph fold too, while the primitives
+    /// the backward pass reads stay live.
+    #[test]
+    fn decompositions_fold_in_training_graphs() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 16]);
+        let w = g.parameter("w", &[16]);
+        let h = g.decomposed_rms_norm(x, w, 1e-5);
+        let y = g.decomposed_softmax(h);
+        let loss = g.sum_all(y);
+        g.set_outputs(vec![loss]);
+        let opt = optimize(&crate::autodiff::differentiate(&g));
+        let ops = live_ops(&opt);
+        assert!(ops.iter().any(|op| matches!(op, Op::Softmax)), "{ops:?}");
+        assert!(
+            ops.iter().any(|op| matches!(op, Op::RmsNorm { .. })),
+            "{ops:?}"
+        );
+    }
+
+    /// A near miss stays as written: the rules check the whole structure,
+    /// including the mean's exact factor and which tensor the max is of.
+    #[test]
+    fn near_misses_are_not_fused() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 16]);
+        let w = g.parameter("w", &[16]);
+        // Mean factor for 8 elements over a 16-wide row.
+        let square = g.mul(x, x);
+        let sum = g.sum_inner(square);
+        let mean = g.scale(sum, 1.0 / 8.0);
+        let mean = g.add_scalar(mean, 1e-5);
+        let inv = g.rsqrt(mean);
+        let inv = g.broadcast_inner(inv, 16);
+        let normalized = g.mul(x, inv);
+        let not_rms = g.bias_mul(normalized, w);
+        // Shifted by another tensor's maximum.
+        let z = g.input("z", &[4, 16]);
+        let max = g.max_inner(z);
+        let max = g.broadcast_inner(max, 16);
+        let shifted = g.sub(x, max);
+        let e = g.exp(shifted);
+        let total = g.sum_inner(e);
+        let inv = g.recip(total);
+        let inv = g.broadcast_inner(inv, 16);
+        let not_softmax = g.mul(e, inv);
+        g.set_outputs(vec![not_rms, not_softmax]);
+
+        let opt = optimize(&g);
+        assert!(
+            opt.nodes()
+                .iter()
+                .all(|node| !matches!(node.op, Op::Softmax | Op::RmsNorm { .. })),
+            "{:?}",
+            live_ops(&opt)
+        );
     }
 }

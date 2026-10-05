@@ -283,11 +283,29 @@ impl<'a> Compiler<'a> {
         inner: u32,
         rows_per_workgroup: u32,
     ) {
-        use crate::schedule::ReduceOp;
+        self.emit_inner_reduction(
+            crate::schedule::ReduceOp::Sum,
+            input,
+            output,
+            rows,
+            inner,
+            rows_per_workgroup,
+        );
+    }
 
+    /// `[rows, inner]` → `[rows, 1]` with `op` combining each row.
+    pub(super) fn emit_inner_reduction(
+        &mut self,
+        op: crate::schedule::ReduceOp,
+        input: BufferRef,
+        output: BufferRef,
+        rows: u32,
+        inner: u32,
+        rows_per_workgroup: u32,
+    ) {
         const WORKGROUP_SIZE: u32 = 256;
         let kernel = ReductionKernel {
-            op: ReduceOp::Sum,
+            op,
             prologue: PointwiseDAG {
                 n_inputs: 1,
                 ops: vec![Pw::LoadInput(0)],
@@ -1032,6 +1050,20 @@ impl<'a> Compiler<'a> {
             Op::Exp => {
                 self.emit_generated_unary(Pw::Exp(0), node, out_buf);
             }
+            Op::Sqrt => {
+                self.emit_generated_unary(Pw::Sqrt(0), node, out_buf);
+            }
+            Op::Rsqrt => {
+                self.emit_generated_unary(Pw::Rsqrt(0), node, out_buf);
+            }
+            Op::Offset { value } => {
+                let dag = PointwiseDAG {
+                    n_inputs: 1,
+                    ops: vec![Pw::LoadInput(0), Pw::const_f32(value), Pw::Add(0, 1)],
+                    output: 2,
+                };
+                self.emit_pointwise(dag, node, out_buf);
+            }
             Op::Softplus { beta } => {
                 let input = self.get_buffer(node.inputs[0]);
                 let len = node.ty.num_elements() as u32;
@@ -1181,6 +1213,21 @@ impl<'a> Compiler<'a> {
                 let m = in_shape[0] as u32;
                 let n = in_shape[1] as u32;
                 self.emit_sum_inner(input, out_buf, m, n);
+            }
+
+            Op::MaxInner => {
+                let input = self.get_buffer(node.inputs[0]);
+                let in_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let (m, n) = (in_shape[0] as u32, in_shape[1] as u32);
+                let rows_per_workgroup = if n <= 32 { 256 } else { 1 };
+                self.emit_inner_reduction(
+                    crate::schedule::ReduceOp::Max,
+                    input,
+                    out_buf,
+                    m,
+                    n,
+                    rows_per_workgroup,
+                );
             }
 
             Op::BroadcastInner { inner } => {

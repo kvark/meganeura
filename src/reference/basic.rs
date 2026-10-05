@@ -54,6 +54,9 @@ pub(super) fn derivative(op: &Op, x: f64) -> Option<f64> {
         Op::Exp => x.exp(),
         Op::Log => 1.0 / x,
         Op::Recip => -1.0 / (x * x),
+        Op::Sqrt => 0.5 / x.sqrt(),
+        Op::Rsqrt => -0.5 / (x * x.sqrt()),
+        Op::Offset { .. } => 1.0,
         Op::Softplus { beta } => sigmoid(f64::from(beta) * x),
         Op::Clamp { min, max } => {
             if x > f64::from(min) && x < f64::from(max) {
@@ -356,6 +359,9 @@ pub(super) fn eval(node: &Node, ins: &[&Tensor]) -> Result<Vec<f64>, Error> {
         Op::Log => map(arg(0)?, f64::ln),
         Op::Recip => map(arg(0)?, |x| 1.0 / x),
         Op::Exp => map(arg(0)?, f64::exp),
+        Op::Sqrt => map(arg(0)?, f64::sqrt),
+        Op::Rsqrt => map(arg(0)?, |x| 1.0 / x.sqrt()),
+        Op::Offset { value } => map(arg(0)?, |x| x + f64::from(value)),
         Op::Softplus { beta } => {
             let beta = f64::from(beta);
             map(arg(0)?, |x| {
@@ -391,6 +397,18 @@ pub(super) fn eval(node: &Node, ins: &[&Tensor]) -> Result<Vec<f64>, Error> {
             let (rows, cols) = rows_cols(x);
             (0..rows)
                 .map(|r| x.data[r * cols..(r + 1) * cols].iter().sum())
+                .collect()
+        }
+        Op::MaxInner => {
+            let x = arg(0)?;
+            let (rows, cols) = rows_cols(x);
+            (0..rows)
+                .map(|r| {
+                    x.data[r * cols..(r + 1) * cols]
+                        .iter()
+                        .copied()
+                        .fold(f64::NEG_INFINITY, f64::max)
+                })
                 .collect()
         }
         Op::BroadcastInner { inner } => {
