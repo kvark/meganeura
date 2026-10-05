@@ -38,6 +38,7 @@ const TABLE: &[(&str, Coverage)] = &[
     ("Sin", Covered(".sin(")),
     ("Cos", Covered(".cos(")),
     ("ToF32", Covered(".to_f32(")),
+    ("ToU32", Covered(".to_u32(")),
     ("Sqrt", Covered(".sqrt(")),
     ("Rsqrt", Covered(".rsqrt(")),
     ("Offset", Covered(".add_scalar(")),
@@ -151,6 +152,11 @@ const TABLE: &[(&str, Coverage)] = &[
     (
         "ChunkedRelativeAttention",
         Covered(".chunked_relative_attention("),
+    ),
+    ("BiasedAttention", Covered(".biased_attention(")),
+    (
+        "BiasedCachedAttention",
+        Covered(".biased_cached_attention("),
     ),
     ("PrefixLast", Covered(".prefix_last(")),
     (

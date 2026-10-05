@@ -95,6 +95,13 @@ fn rope(x: &[f64], width: usize, head_dim: usize, theta: f64) -> Vec<f64> {
 enum Logit<'a> {
     /// `q·k / sqrt(head_dim)`.
     Scaled,
+    /// `scale · q·k + bias[h · head_stride + i · row_stride + j]`.
+    Biased {
+        scale: f64,
+        bias: &'a [f64],
+        head_stride: usize,
+        row_stride: usize,
+    },
     /// `cap · tanh(q·(k + r) / cap)` where `r` is row `left - 1 - (i - j)`
     /// of the relative keys.
     Relative {
@@ -167,6 +174,17 @@ impl Problem<'_> {
                     .rope_ln_theta
                     .map_or(1.0, |ln| 1.0 + (i + j) as f64 * (ln + 2.0));
                 (dot * scale, abs * scale * rope)
+            }
+            Logit::Biased {
+                scale,
+                bias,
+                head_stride,
+                row_stride,
+            } => {
+                let dot: f64 = q.iter().zip(k).map(|(a, b)| a * b).sum();
+                let abs: f64 = q.iter().zip(k).map(|(a, b)| (a * b).abs()).sum();
+                let b = bias[h * head_stride + i * row_stride + j];
+                (scale * dot + b, scale.abs() * abs + b.abs())
             }
             Logit::Relative { rel, left, cap } => {
                 let rb = (left - 1 - (i - j)) * self.q_width() + h * self.heads.dim;
@@ -428,6 +446,18 @@ fn problem<'a>(
             head_dim,
             ..
         } => (num_heads, num_heads, head_dim),
+        Op::BiasedAttention {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            ..
+        }
+        | Op::BiasedCachedAttention {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            ..
+        } => (num_heads, num_kv_heads, head_dim),
         _ => return Err(invalid(node, "not an attention op")),
     };
     let heads = Heads::new(node, heads, kv_heads, dim)?;
@@ -511,6 +541,47 @@ fn problem<'a>(
                 })
                 .collect()
         }
+        Op::BiasedAttention {
+            scale_bits,
+            causal: is_causal,
+            ..
+        } => {
+            let bias = arg(3)?;
+            if bias.shape != [heads.heads, q_rows, kv_rows] {
+                return Err(invalid(node, "bias must be [heads, rows, keys]"));
+            }
+            if is_causal {
+                same_length()?;
+            }
+            logit = Logit::Biased {
+                scale: f64::from(f32::from_bits(scale_bits)),
+                bias: &bias.data,
+                head_stride: q_rows * kv_rows,
+                row_stride: kv_rows,
+            };
+            if is_causal {
+                causal(q_rows, 0)
+            } else {
+                vec![Some(0..kv_rows); q_rows]
+            }
+        }
+        Op::BiasedCachedAttention { scale_bits, .. } => {
+            let pos = arg(3)?.index(0);
+            let bias = arg(4)?;
+            if pos >= kv_rows {
+                return Err(invalid(node, format!("kv_pos {pos} outside the cache")));
+            }
+            if bias.shape != [heads.heads, kv_rows] {
+                return Err(invalid(node, "bias must be [heads, max_seq]"));
+            }
+            logit = Logit::Biased {
+                scale: f64::from(f32::from_bits(scale_bits)),
+                bias: &bias.data,
+                head_stride: kv_rows,
+                row_stride: 0,
+            };
+            vec![Some(0..pos + 1); q_rows]
+        }
         Op::ChunkedRelativeAttention {
             left_context,
             softcap_bits,
@@ -587,7 +658,9 @@ pub(super) fn magnitude(
         | Op::SlidingWindowAttention { .. }
         | Op::CachedAttention { .. }
         | Op::CachedBlockAttention { .. }
-        | Op::ChunkedRelativeAttention { .. } => solve(graph, node, ins).ok().map(|r| r.1),
+        | Op::ChunkedRelativeAttention { .. }
+        | Op::BiasedAttention { .. }
+        | Op::BiasedCachedAttention { .. } => solve(graph, node, ins).ok().map(|r| r.1),
         _ => None,
     }
 }

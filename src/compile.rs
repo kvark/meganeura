@@ -384,6 +384,9 @@ pub enum ShaderEntry {
     CacheWrite,
     CacheWritePrefix,
     CachedAttention,
+    /// Attention with an additive per-head bias, one workgroup per query
+    /// row and head: full, causal or over a cache prefix.
+    BiasedAttention,
     CachedQueryAttention,
     CachedBlockAttention,
     /// Flash-decoding split-K partial: per-slice online-softmax partials.
@@ -456,6 +459,7 @@ impl ShaderEntry {
             | ShaderEntry::MultiHeadAttnGradKV
             | ShaderEntry::FlashGradKV
             | ShaderEntry::CachedAttention
+            | ShaderEntry::BiasedAttention
             | ShaderEntry::CachedQueryAttention
             | ShaderEntry::CachedBlockAttention
             | ShaderEntry::CachedBlockAttentionSplit
@@ -654,6 +658,7 @@ impl ShaderEntry {
             ShaderEntry::CacheWrite => ShaderGroup::CacheWrite,
             ShaderEntry::CacheWritePrefix => ShaderGroup::CacheWritePrefix,
             ShaderEntry::CachedAttention => ShaderGroup::CachedAttention,
+            ShaderEntry::BiasedAttention => ShaderGroup::BiasedAttention,
             ShaderEntry::CachedQueryAttention => ShaderGroup::CachedQueryAttention,
             ShaderEntry::CachedBlockAttention => ShaderGroup::CachedBlockAttention,
             ShaderEntry::CachedBlockAttentionSplit => ShaderGroup::CachedBlockAttentionSplit,
@@ -766,6 +771,7 @@ impl ShaderEntry {
             ShaderEntry::CacheWrite => "main",
             ShaderEntry::CacheWritePrefix => "main",
             ShaderEntry::CachedAttention => "main",
+            ShaderEntry::BiasedAttention => "main",
             ShaderEntry::CachedQueryAttention => "main",
             ShaderEntry::CachedBlockAttention => "main",
             ShaderEntry::CachedBlockAttentionSplit => "main",
@@ -1405,7 +1411,8 @@ impl ExecutionPlan {
         for node in graph.nodes() {
             if let Op::Constant { ref data } = node.op {
                 let buffer = self.node_buffer(node.id);
-                self.constant_buffers.push((buffer, data.clone()));
+                self.constant_buffers
+                    .push((buffer, constant_words(data.clone(), node.ty.dtype)));
             }
         }
     }
@@ -1413,9 +1420,11 @@ impl ExecutionPlan {
     fn attach_owned_constant_buffers(&mut self, graph: &mut Graph) {
         for node in graph.nodes_mut() {
             let node_id = node.id;
+            let dtype = node.ty.dtype;
             if let Op::Constant { ref mut data } = node.op {
                 let buffer = self.node_buffer(node_id);
-                self.constant_buffers.push((buffer, std::mem::take(data)));
+                self.constant_buffers
+                    .push((buffer, constant_words(std::mem::take(data), dtype)));
             }
         }
     }
@@ -1514,6 +1523,15 @@ fn topological_order(graph: &Graph) -> Vec<NodeId> {
     }
 
     order
+}
+
+/// The words a constant uploads: its values, or for `U32` constants (held
+/// as exact values in the graph) their integer bits.
+fn constant_words(data: Vec<f32>, dtype: crate::graph::DType) -> Vec<f32> {
+    match dtype {
+        crate::graph::DType::U32 => data.into_iter().map(|v| f32::from_bits(v as u32)).collect(),
+        _ => data,
+    }
 }
 
 pub fn compile(graph: &Graph) -> ExecutionPlan {

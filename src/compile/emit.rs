@@ -1112,6 +1112,9 @@ impl<'a> Compiler<'a> {
             Op::ToF32 => {
                 self.emit_generated_unary(Pw::U32ToF32(0), node, out_buf);
             }
+            Op::ToU32 => {
+                self.emit_generated_unary(Pw::F32ToU32(0), node, out_buf);
+            }
             Op::Sqrt => {
                 self.emit_generated_unary(Pw::Sqrt(0), node, out_buf);
             }
@@ -2700,6 +2703,64 @@ impl<'a> Compiler<'a> {
                     extra_outputs: vec![],
                     params: vec![dim, block_len, max_seq, 0],
 
+                    ..Default::default()
+                });
+            }
+
+            Op::BiasedAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                scale_bits,
+                causal,
+            } => {
+                let rows = node.ty.shape[0] as u32;
+                let keys = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
+                let inputs: Vec<_> = node.inputs.iter().map(|&i| self.get_buffer(i)).collect();
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::BiasedAttention,
+                    workgroups: [rows, num_heads, 1],
+                    // The kernel reads no position here; any buffer binds.
+                    input_buffers: vec![inputs[0], inputs[1], inputs[2], inputs[3], inputs[0]],
+                    output_buffer: out_buf,
+                    params: vec![
+                        rows,
+                        keys,
+                        (num_heads << 16) | num_kv_heads,
+                        head_dim,
+                        scale_bits,
+                        u32::from(causal),
+                        rows * keys,
+                        keys,
+                    ],
+                    ..Default::default()
+                });
+            }
+
+            Op::BiasedCachedAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                scale_bits,
+            } => {
+                let rows = node.ty.shape[0] as u32;
+                let keys = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
+                let inputs: Vec<_> = node.inputs.iter().map(|&i| self.get_buffer(i)).collect();
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::BiasedAttention,
+                    workgroups: [rows, num_heads, 1],
+                    input_buffers: vec![inputs[0], inputs[1], inputs[2], inputs[4], inputs[3]],
+                    output_buffer: out_buf,
+                    params: vec![
+                        rows,
+                        keys,
+                        (num_heads << 16) | num_kv_heads,
+                        head_dim,
+                        scale_bits,
+                        2,
+                        keys,
+                        0,
+                    ],
                     ..Default::default()
                 });
             }

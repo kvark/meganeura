@@ -323,6 +323,18 @@ pub(crate) struct PermuteParams {
     pub(crate) strides: [u32; 4],
 }
 
+// biased attention: q, k, v, bias, kv_pos, dst, params (eight words)
+#[derive(blade_macros::ShaderData)]
+pub(crate) struct BiasedAttentionData {
+    pub(crate) q: blade_graphics::BufferPiece,
+    pub(crate) k: blade_graphics::BufferPiece,
+    pub(crate) v: blade_graphics::BufferPiece,
+    pub(crate) bias: blade_graphics::BufferPiece,
+    pub(crate) kv_pos: blade_graphics::BufferPiece,
+    pub(crate) dst: blade_graphics::BufferPiece,
+    pub(crate) params: [u32; 8],
+}
+
 // binary: var src_a, src_b, dst, params
 #[derive(blade_macros::ShaderData)]
 struct BinaryData {
@@ -1826,6 +1838,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::Concat => BinaryData::layout(),
         ShaderEntry::SplitA | ShaderEntry::SplitB => UnaryData::layout(),
         ShaderEntry::Permute => PermuteData::layout(),
+        ShaderEntry::BiasedAttention => BiasedAttentionData::layout(),
         ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => UnaryData::layout(),
         ShaderEntry::Conv2dDw => Conv2dDwData::layout(),
         ShaderEntry::MulPerChannel => MulPerChannelData::layout(),

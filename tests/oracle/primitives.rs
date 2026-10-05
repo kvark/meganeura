@@ -226,6 +226,94 @@ fn mul_per_channel_gradient() {
     grad_case("mul_per_channel", build, |_| {});
 }
 
+/// Attention with an additive per-head bias, against the reference, at
+/// head widths below, at and above one lane per dimension.
+#[test]
+fn biased_attention() {
+    for (rows, keys, heads, kv, dim, causal) in [
+        (5, 7, 2, 1, 8, false),
+        (6, 6, 4, 2, 64, true),
+        (3, 9, 2, 2, 80, false),
+        (4, 4, 1, 1, 200, true),
+    ] {
+        let what = format!("biased attention {rows}x{keys} h{heads}/{kv} d{dim} causal={causal}");
+        let mut g = Graph::new();
+        let q = g.parameter("q", &[rows, heads * dim]);
+        let k = g.parameter("k", &[keys, kv * dim]);
+        let v = g.parameter("v", &[keys, kv * dim]);
+        let bias = g.parameter("bias", &[heads, rows, keys]);
+        let y = g.biased_attention(
+            [q, k, v, bias],
+            heads as u32,
+            kv as u32,
+            dim as u32,
+            0.7,
+            causal,
+        );
+        g.set_outputs(vec![y]);
+        let mut feeds = Feeds::new();
+        feeds.fill_random(&g, dim as u64, 1.0);
+        for (label, options) in variants() {
+            gpu::check_inference(&g, &feeds, &options)
+                .unwrap_or_else(|e| panic!("{what} ({label}): {e}"))
+                .assert_passed(&format!("{what} ({label})"));
+        }
+    }
+}
+
+#[test]
+fn biased_cached_attention() {
+    for (rows, max_seq, pos, heads, kv, dim) in [(1, 12, 6, 4, 2, 16), (3, 9, 8, 2, 1, 72)] {
+        let what = format!("biased cached attention {rows} rows, pos {pos}, d{dim}");
+        let mut g = Graph::new();
+        let q = g.parameter("q", &[rows, heads * dim]);
+        let k = g.parameter("k", &[max_seq, kv * dim]);
+        let v = g.parameter("v", &[max_seq, kv * dim]);
+        let p = g.input_u32("pos", &[1]);
+        let bias = g.parameter("bias", &[heads, max_seq]);
+        let y =
+            g.biased_cached_attention([q, k, v, p, bias], heads as u32, kv as u32, dim as u32, 1.0);
+        g.set_outputs(vec![y]);
+        let mut feeds = Feeds::new();
+        feeds.set_u32("pos", &[pos]);
+        feeds.fill_random(&g, dim as u64, 1.0);
+        for (label, options) in variants() {
+            gpu::check_inference(&g, &feeds, &options)
+                .unwrap_or_else(|e| panic!("{what} ({label}): {e}"))
+                .assert_passed(&format!("{what} ({label})"));
+        }
+    }
+}
+
+/// Index math for gathers: rows picked by a U32 constant, and by indices
+/// computed from a runtime position and converted with `to_u32`.
+#[test]
+fn computed_indices() {
+    let mut g = Graph::new();
+    let table = g.parameter("table", &[10, 4]);
+    let fixed = g.constant_u32(&[3, 0, 9, 3], &[4]);
+    let picked = g.embedding(fixed, table);
+    // Rows pos + 2 - j for j in 0..3: descending from pos + 2.
+    let pos = g.input_u32("pos", &[1]);
+    let pos = g.to_f32(pos);
+    let pos = g.reshape(pos, &[1, 1]);
+    let pos = g.broadcast_inner(pos, 3);
+    let pos = g.reshape(pos, &[3]);
+    let down = g.constant(vec![2.0, 1.0, 0.0], &[3]);
+    let index = g.add(pos, down);
+    let index = g.to_u32(index);
+    let walked = g.embedding(index, table);
+    g.set_outputs(vec![picked, walked]);
+    let mut feeds = Feeds::new();
+    feeds.set_u32("pos", &[5]);
+    feeds.fill_random(&g, 9, 1.0);
+    for (label, options) in variants() {
+        gpu::check_inference(&g, &feeds, &options)
+            .unwrap()
+            .assert_passed(&format!("computed indices ({label})"));
+    }
+}
+
 /// Values a step away from both bounds, so finite differences never
 /// straddle one.
 #[test]

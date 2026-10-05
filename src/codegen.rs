@@ -664,6 +664,7 @@ pub enum ShaderGroup {
     CacheWrite,
     CacheWritePrefix,
     CachedAttention,
+    BiasedAttention,
     CachedQueryAttention,
     CachedBlockAttention,
     ChunkedRelativeAttention,
@@ -793,6 +794,9 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         ShaderGroup::Concat => ShaderModule::new(include_str!("shaders/concat.wgsl")),
         ShaderGroup::Split => ShaderModule::new(include_str!("shaders/split.wgsl")),
         ShaderGroup::Permute => ShaderModule::new(include_str!("shaders/permute.wgsl")),
+        ShaderGroup::BiasedAttention => {
+            ShaderModule::new(include_str!("shaders/biased_attention.wgsl"))
+        }
         ShaderGroup::Upsample => ShaderModule::new(include_str!("shaders/upsample.wgsl")),
         ShaderGroup::UpsampleGrad => ShaderModule::new(include_str!("shaders/upsample_grad.wgsl")),
         ShaderGroup::Conv2dDw => ShaderModule::new(include_str!("shaders/conv2d_dw.wgsl")),
@@ -3644,6 +3648,9 @@ mod tests {
                     vec!["src_a", "src_b", "bias", "dst", "stats", "params"]
                 }
                 ShaderEntry::Concat => vec!["src_a", "src_b", "dst", "params"],
+                ShaderEntry::BiasedAttention => {
+                    vec!["q", "k", "v", "bias", "kv_pos", "dst", "params"]
+                }
                 ShaderEntry::SplitA | ShaderEntry::SplitB | ShaderEntry::Permute => {
                     vec!["src", "dst", "params"]
                 }
@@ -3768,6 +3775,7 @@ mod tests {
             ShaderEntry::SplitA,
             ShaderEntry::SplitB,
             ShaderEntry::Permute,
+            ShaderEntry::BiasedAttention,
             ShaderEntry::Upsample2x,
             ShaderEntry::Upsample2xGrad,
             ShaderEntry::Conv2dDw,

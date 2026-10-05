@@ -238,6 +238,9 @@ pub enum Op {
     Cos,
     /// Convert a `U32` tensor to `F32`, exactly below 2²⁴.
     ToF32,
+    /// Convert an `F32` tensor to `U32` indices, truncating toward zero and
+    /// clamping negatives to zero.
+    ToU32,
     /// Elementwise square root.
     Sqrt,
     /// Elementwise reciprocal square root.
@@ -834,6 +837,29 @@ pub enum Op {
     /// Copy row `valid_len - 1` from a padded 2-D prefix into a one-row
     /// tensor. Inputs: `[input, valid_len]`.
     PrefixLast,
+
+    /// Softmax attention with an additive bias for every head, query row
+    /// and key: `softmax(scale · q·k + bias) · v`, causally masked when
+    /// `causal`. Inputs `[q, k, v, bias]`: q `[rows, heads · dim]`, k and v
+    /// `[keys, kv_heads · dim]`, bias `[heads, rows, keys]`. T5's relative
+    /// positions and ALiBi are such biases.
+    BiasedAttention {
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        scale_bits: u32,
+        causal: bool,
+    },
+    /// [`Op::BiasedAttention`] over a cache: every query attends rows
+    /// `0..=kv_pos`, with a bias per head and cache row shared by the
+    /// queries. Inputs `[q, k_cache, v_cache, kv_pos, bias]`, bias
+    /// `[heads, max_seq]`.
+    BiasedCachedAttention {
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        scale_bits: u32,
+    },
 }
 
 /// Implementation chosen for a matrix op. Equality saturation treats these
@@ -1296,6 +1322,19 @@ impl Graph {
         self.add_node(Op::Constant { data }, vec![], ty)
     }
 
+    /// A constant of `U32` indices, below 2²⁴ so they convert exactly.
+    #[track_caller]
+    pub fn constant_u32(&mut self, data: &[u32], shape: &[usize]) -> NodeId {
+        assert_eq!(data.len(), shape.iter().product::<usize>());
+        assert!(
+            data.iter().all(|&v| v < 1 << 24),
+            "U32 constants are held exactly below 2^24"
+        );
+        let ty = TensorType::new(shape.to_vec(), DType::U32);
+        let data = data.iter().map(|&v| v as f32).collect();
+        self.add_node(Op::Constant { data }, vec![], ty)
+    }
+
     pub fn scalar(&mut self, value: f32) -> NodeId {
         self.constant(vec![value], &[1])
     }
@@ -1568,6 +1607,16 @@ impl Graph {
         assert_eq!(ty.dtype, DType::U32, "to_f32 converts U32 tensors");
         let ty = TensorType::f32(ty.shape.clone());
         self.add_node(Op::ToF32, vec![x], ty)
+    }
+
+    /// Convert computed `F32` positions or offsets to `U32` indices, for
+    /// a gather.
+    #[track_caller]
+    pub fn to_u32(&mut self, x: NodeId) -> NodeId {
+        let ty = &self.node(x).ty;
+        assert_eq!(ty.dtype, DType::F32, "to_u32 converts F32 tensors");
+        let ty = TensorType::new(ty.shape.clone(), DType::U32);
+        self.add_node(Op::ToU32, vec![x], ty)
     }
 
     pub fn erf(&mut self, x: NodeId) -> NodeId {
@@ -3028,6 +3077,88 @@ impl Graph {
             },
             vec![q, k, v, relative_k],
             self.node(q).ty.clone(),
+        )
+    }
+
+    /// Softmax attention with an additive bias per head, query row and key:
+    /// `softmax(scale · q·k + bias) · v`, causally masked when `causal`.
+    /// `bias` is `[num_heads, rows, keys]`; see [`Op::BiasedAttention`].
+    #[track_caller]
+    pub fn biased_attention(
+        &mut self,
+        [q, k, v, bias]: [NodeId; 4],
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        scale: f32,
+        causal: bool,
+    ) -> NodeId {
+        let ty = self.attention_type(q, k, v, num_heads, num_kv_heads, head_dim);
+        let (rows, keys) = (ty.shape[0], self.node(k).ty.shape[0]);
+        assert!(
+            head_dim <= 512,
+            "biased attention supports heads up to 512 wide"
+        );
+        assert!(scale.is_finite(), "attention scale must be finite");
+        assert!(
+            !causal || rows == keys,
+            "causal attention needs as many keys as queries"
+        );
+        assert_eq!(
+            self.node(bias).ty,
+            TensorType::f32(vec![num_heads as usize, rows, keys]),
+            "bias must be [heads, rows, keys]"
+        );
+        self.add_node(
+            Op::BiasedAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                scale_bits: scale.to_bits(),
+                causal,
+            },
+            vec![q, k, v, bias],
+            ty,
+        )
+    }
+
+    /// Cached attention over rows `0..=kv_pos` with a bias per head and
+    /// cache row, `[num_heads, max_seq]`; see [`Op::BiasedCachedAttention`].
+    #[track_caller]
+    pub fn biased_cached_attention(
+        &mut self,
+        [q, k_cache, v_cache, kv_pos, bias]: [NodeId; 5],
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        scale: f32,
+    ) -> NodeId {
+        let ty = self.attention_type(q, k_cache, v_cache, num_heads, num_kv_heads, head_dim);
+        let max_seq = self.node(k_cache).ty.shape[0];
+        assert!(
+            head_dim <= 512,
+            "biased attention supports heads up to 512 wide"
+        );
+        assert!(scale.is_finite(), "attention scale must be finite");
+        let pos = &self.node(kv_pos).ty;
+        assert!(
+            pos.dtype == DType::U32 && pos.shape == [1],
+            "kv_pos must be a U32 scalar"
+        );
+        assert_eq!(
+            self.node(bias).ty,
+            TensorType::f32(vec![num_heads as usize, max_seq]),
+            "bias must be [heads, max_seq]"
+        );
+        self.add_node(
+            Op::BiasedCachedAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                scale_bits: scale.to_bits(),
+            },
+            vec![q, k_cache, v_cache, kv_pos, bias],
+            ty,
         )
     }
 

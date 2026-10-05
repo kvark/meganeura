@@ -64,6 +64,8 @@ pub enum Pw {
     Cos(u16),
     /// Reinterpret a loaded word as `u32` and convert it to `f32`.
     U32ToF32(u16),
+    /// Truncate a non-negative value to `u32` and store its bits.
+    F32ToU32(u16),
 }
 
 impl Pw {
@@ -222,6 +224,9 @@ impl PointwiseDAG {
                 Pw::U32ToF32(a) => {
                     let _ = write!(out, "f32(bitcast<u32>(v{a}))");
                 }
+                Pw::F32ToU32(a) => {
+                    let _ = write!(out, "bitcast<f32>(u32(max(v{a}, 0.0)))");
+                }
                 Pw::Tanh(a) => {
                     // Saturated outside ±10 (exactly ±1 in f32): some drivers
                     // evaluate tanh through exp(2x), which overflows to NaN.
@@ -363,6 +368,7 @@ impl PointwiseDAG {
                 Pw::Sin(a) => Pw::Sin(self_remap[a as usize]),
                 Pw::Cos(a) => Pw::Cos(self_remap[a as usize]),
                 Pw::U32ToF32(a) => Pw::U32ToF32(self_remap[a as usize]),
+                Pw::F32ToU32(a) => Pw::F32ToU32(self_remap[a as usize]),
             };
             self_remap.push(ops.len() as u16);
             ops.push(remapped);

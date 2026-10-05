@@ -428,6 +428,7 @@ pub(super) fn eval(node: &Node, ins: &[&Tensor]) -> Result<Vec<f64>, Error> {
         Op::Sin => map(arg(0)?, f64::sin),
         Op::Cos => map(arg(0)?, f64::cos),
         Op::ToF32 => arg(0)?.data.clone(),
+        Op::ToU32 => map(arg(0)?, |x| x.max(0.0).trunc()),
         Op::Sqrt => map(arg(0)?, f64::sqrt),
         Op::Rsqrt => map(arg(0)?, |x| 1.0 / x.sqrt()),
         Op::Offset { value } => map(arg(0)?, |x| x + f64::from(value)),
