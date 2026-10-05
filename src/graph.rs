@@ -1754,6 +1754,11 @@ impl Graph {
     /// Rank at most 4.
     #[track_caller]
     pub fn permute(&mut self, x: NodeId, perm: &[usize]) -> NodeId {
+        assert_eq!(
+            self.node(x).ty.dtype,
+            DType::F32,
+            "permute moves F32 elements"
+        );
         let shape = self.node(x).ty.shape.clone();
         assert_eq!(perm.len(), shape.len(), "permute needs one entry per axis");
         assert!(shape.len() <= 4, "permute supports rank at most 4");

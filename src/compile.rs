@@ -2770,6 +2770,13 @@ fn gelu_ops(x: u16, next: u16) -> [Pw; 9] {
 const MAX_COMPUTE_WORKGROUPS_PER_DIMENSION: u32 = 65_535;
 
 /// Tile row-GEMV workgroups across X and Y within the portable limit.
+/// `groups` workgroups of a one-dimensional kernel over X and Y, each
+/// within the portable per-axis limit; the kernel flattens them back.
+pub(crate) fn linear_grid(groups: u32) -> [u32; 3] {
+    let y = groups.div_ceil(MAX_COMPUTE_WORKGROUPS_PER_DIMENSION).max(1);
+    [groups.div_ceil(y).max(1), y, 1]
+}
+
 pub(crate) fn row_gemv_workgroups(n: u32) -> [u32; 3] {
     // Large vocabularies can exceed the portable X workgroup limit. Spread
     // rows over Y as well; the kernel flattens the actual dispatch grid.
