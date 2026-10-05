@@ -176,6 +176,44 @@ fn permute() {
     }
 }
 
+#[test]
+fn sin_cos() {
+    for (what, sine) in [("sin", true), ("cos", false)] {
+        let build = |g: &mut Graph| {
+            let x = g.parameter("x", &[4, 9]);
+            if sine { g.sin(x) } else { g.cos(x) }
+        };
+        let fix = |feeds: &mut Feeds| {
+            let data: Vec<f32> = (0..36).map(|i| -9.0 + 0.5 * i as f32).collect();
+            feeds.set("x", &data);
+        };
+        inference_case(what, build, fix);
+        grad_case(what, build, fix);
+    }
+}
+
+/// Positions arrive as `U32` and convert exactly.
+#[test]
+fn to_f32() {
+    let mut g = Graph::new();
+    let p = g.input_u32("p", &[2, 5]);
+    let y = g.to_f32(p);
+    let w = g.parameter("w", &[2, 5]);
+    let y = g.mul(y, w);
+    g.set_outputs(vec![y]);
+    let mut feeds = Feeds::new();
+    feeds.set_u32(
+        "p",
+        &[0, 1, 7, 255, 4096, 65_537, 1 << 20, 3, 9, (1 << 24) - 1],
+    );
+    feeds.fill_random(&g, 5, 1.0);
+    for (label, options) in variants() {
+        gpu::check_inference(&g, &feeds, &options)
+            .unwrap()
+            .assert_passed(&format!("to_f32 ({label})"));
+    }
+}
+
 /// Values a step away from both bounds, so finite differences never
 /// straddle one.
 #[test]

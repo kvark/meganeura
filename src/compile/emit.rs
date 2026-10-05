@@ -1103,6 +1103,15 @@ impl<'a> Compiler<'a> {
             Op::Erf => {
                 self.emit_generated_unary(Pw::Erf(0), node, out_buf);
             }
+            Op::Sin => {
+                self.emit_generated_unary(Pw::Sin(0), node, out_buf);
+            }
+            Op::Cos => {
+                self.emit_generated_unary(Pw::Cos(0), node, out_buf);
+            }
+            Op::ToF32 => {
+                self.emit_generated_unary(Pw::U32ToF32(0), node, out_buf);
+            }
             Op::Sqrt => {
                 self.emit_generated_unary(Pw::Sqrt(0), node, out_buf);
             }

@@ -14,51 +14,158 @@
 
 use super::{Graph, NodeId, Op};
 
+/// Where an op sits in the architecture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpClass {
+    /// Part of the primitive set: every lowering, gradient and reference
+    /// implementation is defined directly on it.
+    Primitive,
+    /// A named operation with a decomposition into primitives
+    /// ([`Graph::decompose`]). The decomposition is recognized again
+    /// ([`Graph::recompose`]), so either spelling builds the same plan.
+    Composite,
+    /// A fused kernel or gradient helper that only the optimizer and
+    /// autodiff create.
+    Private,
+}
+
 impl Op {
-    /// Whether this op belongs to the primitive set, which model builders
-    /// and loaders can rely on: everything else is a fused kernel, a
-    /// composite with a decomposition, or a gradient helper.
+    /// The op's place in the architecture. The match is exhaustive, so
+    /// every new op has to declare one.
+    pub fn class(&self) -> OpClass {
+        use OpClass::{Composite, Primitive, Private};
+        match *self {
+            // Leaves.
+            Op::Parameter { .. } | Op::Input { .. } | Op::Constant { .. } => Primitive,
+            // `dot_general`, in each operand layout.
+            Op::MatMul
+            | Op::MatMulAT
+            | Op::MatMulBT
+            | Op::BlockMatMul
+            | Op::BlockMatMulAT { .. }
+            | Op::BlockMatMulBT
+            | Op::BatchMatMul
+            | Op::BatchMatMulAT
+            | Op::BatchMatMulBT => Primitive,
+            // Elementwise math and comparison.
+            Op::Add
+            | Op::Mul
+            | Op::Greater
+            | Op::Neg
+            | Op::Abs
+            | Op::Exp
+            | Op::Erf
+            | Op::Log
+            | Op::Recip
+            | Op::Sqrt
+            | Op::Rsqrt
+            | Op::Sin
+            | Op::Cos
+            | Op::Tanh
+            | Op::Sigmoid
+            | Op::Relu
+            | Op::Scale { .. }
+            | Op::Offset { .. }
+            | Op::Clamp { .. } => Primitive,
+            // Broadcasts, reductions and data movement.
+            Op::BiasAdd
+            | Op::BiasMul
+            | Op::BroadcastInner { .. }
+            | Op::SumInner
+            | Op::MaxInner
+            | Op::SumAll
+            | Op::Transpose
+            | Op::Permute { .. }
+            | Op::Identity
+            | Op::Materialize
+            | Op::StopGradient
+            | Op::Concat { .. }
+            | Op::SplitA { .. }
+            | Op::SplitB { .. }
+            | Op::ToF16
+            | Op::ToF32 => Primitive,
+            // Gather, scatter and dynamic slices.
+            Op::Embedding
+            | Op::ScatterAdd { .. }
+            | Op::CacheWrite
+            | Op::CacheWritePrefix
+            | Op::PrefixLast => Primitive,
+            // Convolution and `reduce_window`.
+            Op::Conv2d { .. } | Op::Conv2dDw { .. } | Op::MaxPool2d { .. } => Primitive,
+
+            Op::Softplus { .. }
+            | Op::Silu
+            | Op::Gelu
+            | Op::SwiGLU
+            | Op::GeGLU
+            | Op::MeanAll
+            | Op::SumRows
+            | Op::GlobalAvgPool { .. }
+            | Op::NormalizeInnerSum { .. }
+            | Op::PairwiseSquaredDistance { .. }
+            | Op::PairwiseVectorRejection { .. }
+            | Op::ExclusiveCumsum { .. }
+            | Op::ShiftInner { .. }
+            | Op::Softmax
+            | Op::LogSoftmax
+            | Op::CrossEntropyLoss
+            | Op::BceLoss
+            | Op::RmsNorm { .. }
+            | Op::LayerNorm { .. }
+            | Op::GroupNorm { .. }
+            | Op::MulPerChannel { .. }
+            | Op::AddPerChannel { .. }
+            | Op::Upsample2x { .. }
+            | Op::RoPE { .. }
+            | Op::RoPEPositions { .. }
+            | Op::CausalAttention { .. }
+            | Op::CausalAttentionRoPE { .. }
+            | Op::FullAttention { .. }
+            | Op::CrossAttention { .. }
+            | Op::MultiHeadAttn { .. }
+            | Op::SlidingWindowAttention { .. }
+            | Op::CachedAttention { .. }
+            | Op::CachedBlockAttention { .. }
+            | Op::ChunkedRelativeAttention { .. } => Composite,
+
+            Op::SoftplusGrad { .. }
+            | Op::NormalizeInnerSumGrad { .. }
+            | Op::PairwiseGrad { .. }
+            | Op::CrossEntropyLogitsGrad
+            | Op::FusedMatMulAdd
+            | Op::FusedMatMulATAdd
+            | Op::FusedMatMulBTAdd
+            | Op::Nop
+            | Op::SwiGLUConcat
+            | Op::SwiGLUConcatGrad
+            | Op::GeGLUConcat
+            | Op::GeGLUConcatGrad
+            | Op::SwiGLUGradGate
+            | Op::SwiGLUGradUp
+            | Op::SiluGrad
+            | Op::RoPEGrad { .. }
+            | Op::MultiHeadAttnGradQ { .. }
+            | Op::MultiHeadAttnGradK { .. }
+            | Op::MultiHeadAttnGradV { .. }
+            | Op::RmsNormGradW { .. }
+            | Op::RmsNormGradX { .. }
+            | Op::LayerNormGradWB { .. }
+            | Op::LayerNormGradX { .. }
+            | Op::Conv2dGradInput { .. }
+            | Op::Conv2dGradWeight { .. }
+            | Op::MaxPool2dGrad { .. }
+            | Op::GlobalAvgPoolGrad { .. }
+            | Op::WinogradConv2d { .. }
+            | Op::GroupNormSilu { .. }
+            | Op::GroupNormGradInput { .. }
+            | Op::GroupNormGradWeightBias { .. }
+            | Op::Upsample2xGrad { .. } => Private,
+        }
+    }
+
+    /// Whether this op belongs to the primitive set.
     pub fn is_primitive(&self) -> bool {
-        matches!(
-            *self,
-            Op::Parameter { .. }
-                | Op::Input { .. }
-                | Op::Constant { .. }
-                // Elementwise
-                | Op::Add
-                | Op::Mul
-                | Op::Greater
-                | Op::Neg
-                | Op::Abs
-                | Op::Exp
-                | Op::Erf
-                | Op::Log
-                | Op::Recip
-                | Op::Sqrt
-                | Op::Rsqrt
-                | Op::Tanh
-                | Op::Sigmoid
-                | Op::Relu
-                | Op::Scale { .. }
-                | Op::Offset { .. }
-                | Op::Clamp { .. }
-                // Broadcasts along rows and along the inner axis
-                | Op::BiasAdd
-                | Op::BiasMul
-                | Op::BroadcastInner { .. }
-                // Reductions
-                | Op::SumInner
-                | Op::MaxInner
-                | Op::SumAll
-                // Contraction and data movement
-                | Op::MatMul
-                | Op::BatchMatMul
-                | Op::Transpose
-                | Op::Permute { .. }
-                | Op::Identity
-                | Op::Embedding
-                | Op::StopGradient
-        )
+        self.class() == OpClass::Primitive
     }
 }
 
