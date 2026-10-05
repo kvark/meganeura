@@ -794,8 +794,9 @@ fn lower_reduction(
                 // buffer, then the gathered row's `inner`-stride slice is
                 // indexed by the reduction column. Valid only when the
                 // gathered axis IS the reduced axis (table stride == inner).
+                // An index past the table reads its last row.
                 format!(
-                    "{0}[{0}_idx[{1}] * params.inner + {2}]",
+                    "{0}[min({0}_idx[{1}], arrayLength(&{0}) / params.inner - 1u) * params.inner + {2}]",
                     per_elem_names[i], source_row, col_var
                 )
             } else if repeat == 1 {
@@ -1463,11 +1464,11 @@ mod tests {
         // Indirect (gathered) loads, not the direct row_offset form.
         assert!(
             sm.source
-                .contains("src_a[src_a_idx[row] * params.inner + col]")
+                .contains("src_a[min(src_a_idx[row], arrayLength(&src_a) / params.inner - 1u) * params.inner + col]")
         );
         assert!(
             sm.source
-                .contains("src_b[src_b_idx[row] * params.inner + col]")
+                .contains("src_b[min(src_b_idx[row], arrayLength(&src_b) / params.inner - 1u) * params.inner + col]")
         );
         assert!(!sm.source.contains("src_a[row_offset"));
         // The prologue multiply still fuses in.
@@ -1497,7 +1498,7 @@ mod tests {
         // Stream 0 gathered, stream 1 direct.
         assert!(
             sm.source
-                .contains("src_a[src_a_idx[row] * params.inner + col]")
+                .contains("src_a[min(src_a_idx[row], arrayLength(&src_a) / params.inner - 1u) * params.inner + col]")
         );
         assert!(sm.source.contains("src_b[row_offset + col]"));
         assert!(sm.source.contains("var<storage> src_a_idx: array<u32>;"));

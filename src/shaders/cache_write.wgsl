@@ -18,5 +18,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let j = gid.x;
     if j >= params.dim { return; }
     let kv_pos = kv_pos_buf[0];
+    // A position past the cache writes nothing rather than past its end.
+    if kv_pos >= arrayLength(&dst) / params.dim { return; }
     dst[kv_pos * params.dim + j] = src[j];
 }

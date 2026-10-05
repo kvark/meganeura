@@ -68,10 +68,12 @@
   ones; and expands broadcast axes with `Expand`, as grouped-query
   attention's `repeat_kv` does, in one broadcast. A `Gather` that is neither foldable nor a
   table lookup by U32 indices is a load error rather than a panic.
-- Matmul, convolution and Winograd tile loads no longer read past the end
-  of their operands for rows and columns outside the matrix, which
-  crashed software Vulkan when a small operand sat at the end of mapped
-  memory.
+- Shaders keep every read inside its buffer themselves, since they compile
+  without bounds checks: tile loads of the scalar, quantized, cooperative,
+  convolution and Winograd matmuls clamp the index of lanes outside the
+  matrix (reading past the end crashed software Vulkan); token ids, gather
+  indices and cache positions past their table or cache stay inside it;
+  and buffers are allocated in whole 16-byte vec4s.
 - Concatenation, split, convolution, group norm and upsample gradients
   size their operands by element count, so operands of any rank
   differentiate; permute and broadcast gradients accept a gradient that

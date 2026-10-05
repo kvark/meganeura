@@ -311,6 +311,30 @@ fn permute_grid_stays_within_limits() {
     }
 }
 
+/// Shaders bound their own reads: a token id past the table reads its
+/// last row instead of memory past the buffer.
+#[test]
+fn gather_past_the_table_stays_inside() {
+    let mut g = Graph::new();
+    let ids = g.input_u32("ids", &[3]);
+    let table = g.parameter("table", &[4, 5]);
+    let y = g.embedding(ids, table);
+    g.set_outputs(vec![y]);
+    let data: Vec<f32> = (0..20).map(|i| i as f32).collect();
+    let mut config = meganeura::SessionConfig::from_env();
+    config.mode = meganeura::Mode::Inference;
+    config.gpu = Some(gpu::shared_context());
+    let (mut session, _) = meganeura::build(&g, config);
+    session.set_parameter("table", &data);
+    session.set_input_u32("ids", &[1, 1_000_000, 3]);
+    session.step();
+    session.wait();
+    let mut got = vec![0.0; 15];
+    session.read_output_by_index(0, &mut got);
+    let row = |r: usize| data[r * 5..r * 5 + 5].to_vec();
+    assert_eq!(got, [row(1), row(3), row(3)].concat());
+}
+
 /// On the device, a permutation past the one-axis grid limit.
 #[test]
 fn permute_past_one_axis_grid() {

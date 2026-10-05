@@ -17,6 +17,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if i >= total { return; }
     let row = i / params.hidden;
     let col = i % params.hidden;
-    let token_id = indices[row];
+    // An id past the table reads its last row rather than past its end.
+    let token_id = min(indices[row], arrayLength(&src) / params.hidden - 1u);
     dst[i] = src[token_id * params.hidden + col];
 }

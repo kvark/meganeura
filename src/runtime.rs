@@ -3389,7 +3389,10 @@ impl Session {
                     if slots[i].is_some() || alias.device_local[i] != device_local {
                         continue;
                     }
-                    let size = size.max(4);
+                    // Whole vec4s: kernels that read a tensor as
+                    // `array<vec4<f32>>` reach its last elements only when
+                    // the binding covers the vec4 that holds them.
+                    let size = size.max(16).next_multiple_of(16);
                     let handle = gpu.create_buffer(blade_graphics::BufferDesc {
                         name: &format!("buf_{}", i),
                         size: size as u64,
