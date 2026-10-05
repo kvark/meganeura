@@ -8,6 +8,7 @@ mod blocks;
 mod composites;
 mod coverage;
 mod fuzz;
+mod helpers;
 mod losses;
 mod norm;
 mod primitives;
