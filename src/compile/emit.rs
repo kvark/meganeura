@@ -270,9 +270,28 @@ impl<'a> Compiler<'a> {
         rows: u32,
         inner: u32,
     ) {
+        self.emit_packed_inner_reduction(
+            crate::schedule::ReduceOp::Sum,
+            input,
+            output,
+            rows,
+            inner,
+        );
+    }
+
+    /// `[rows, inner]` → `[rows, 1]`, packing narrow rows into one
+    /// workgroup so short reductions do not launch mostly idle lanes.
+    pub(super) fn emit_packed_inner_reduction(
+        &mut self,
+        op: crate::schedule::ReduceOp,
+        input: BufferRef,
+        output: BufferRef,
+        rows: u32,
+        inner: u32,
+    ) {
         const WORKGROUP_SIZE: u32 = 256;
         let rows_per_workgroup = if inner <= 32 { WORKGROUP_SIZE } else { 1 };
-        self.emit_sum_inner_with_rows_per_workgroup(input, output, rows, inner, rows_per_workgroup);
+        self.emit_inner_reduction(op, input, output, rows, inner, rows_per_workgroup);
     }
 
     pub(super) fn emit_sum_inner_with_rows_per_workgroup(
@@ -1219,14 +1238,12 @@ impl<'a> Compiler<'a> {
                 let input = self.get_buffer(node.inputs[0]);
                 let in_shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let (m, n) = (in_shape[0] as u32, in_shape[1] as u32);
-                let rows_per_workgroup = if n <= 32 { 256 } else { 1 };
-                self.emit_inner_reduction(
+                self.emit_packed_inner_reduction(
                     crate::schedule::ReduceOp::Max,
                     input,
                     out_buf,
                     m,
                     n,
-                    rows_per_workgroup,
                 );
             }
 
