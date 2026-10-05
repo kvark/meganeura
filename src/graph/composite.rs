@@ -100,4 +100,31 @@ impl Graph {
         let normalized = self.mul(x, inv);
         self.bias_mul(normalized, weight)
     }
+
+    /// Layer normalization of `x: [M, N]` with weight and bias `[N]`,
+    /// built from primitives:
+    /// `(x - mean(x)) * rsqrt(mean((x - mean(x))²) + eps) * weight + bias`.
+    ///
+    /// The optimizer replaces this with the fused [`Op::LayerNorm`] kernel.
+    #[track_caller]
+    pub fn decomposed_layer_norm(
+        &mut self,
+        x: NodeId,
+        weight: NodeId,
+        bias: NodeId,
+        eps: f32,
+    ) -> NodeId {
+        let inner = self.node(x).ty.shape[1];
+        let mean = self.mean_inner(x);
+        let mean = self.broadcast_inner(mean, inner);
+        let centered = self.sub(x, mean);
+        let square = self.mul(centered, centered);
+        let variance = self.mean_inner(square);
+        let variance = self.add_scalar(variance, eps);
+        let inv = self.rsqrt(variance);
+        let inv = self.broadcast_inner(inv, inner);
+        let normalized = self.mul(centered, inv);
+        let scaled = self.bias_mul(normalized, weight);
+        self.bias_add(scaled, bias)
+    }
 }
