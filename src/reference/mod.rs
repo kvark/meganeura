@@ -281,6 +281,9 @@ pub fn eval_node(
         | Op::Recip
         | Op::Exp
         | Op::Erf
+        | Op::Sin
+        | Op::Cos
+        | Op::ToF32
         | Op::Sqrt
         | Op::Rsqrt
         | Op::Offset { .. }

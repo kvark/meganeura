@@ -230,6 +230,12 @@ pub enum Op {
     Exp,
     /// The error function, elementwise.
     Erf,
+    /// Elementwise sine.
+    Sin,
+    /// Elementwise cosine.
+    Cos,
+    /// Convert a `U32` tensor to `F32`, exactly below 2²⁴.
+    ToF32,
     /// Elementwise square root.
     Sqrt,
     /// Elementwise reciprocal square root.
@@ -1541,6 +1547,25 @@ impl Graph {
     pub fn exp(&mut self, x: NodeId) -> NodeId {
         let ty = self.node(x).ty.clone();
         self.add_node(Op::Exp, vec![x], ty)
+    }
+
+    pub fn sin(&mut self, x: NodeId) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::Sin, vec![x], ty)
+    }
+
+    pub fn cos(&mut self, x: NodeId) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        self.add_node(Op::Cos, vec![x], ty)
+    }
+
+    /// Convert `U32` values such as positions to `F32`.
+    #[track_caller]
+    pub fn to_f32(&mut self, x: NodeId) -> NodeId {
+        let ty = &self.node(x).ty;
+        assert_eq!(ty.dtype, DType::U32, "to_f32 converts U32 tensors");
+        let ty = TensorType::f32(ty.shape.clone());
+        self.add_node(Op::ToF32, vec![x], ty)
     }
 
     pub fn erf(&mut self, x: NodeId) -> NodeId {

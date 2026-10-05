@@ -60,6 +60,10 @@ pub enum Pw {
     Tanh(u16),
     /// The error function, to about 1.2e-7 relative accuracy.
     Erf(u16),
+    Sin(u16),
+    Cos(u16),
+    /// Reinterpret a loaded word as `u32` and convert it to `f32`.
+    U32ToF32(u16),
 }
 
 impl Pw {
@@ -209,6 +213,15 @@ impl PointwiseDAG {
                     let _ = write!(out, "v{} / (1.0 + exp(-v{}))", a, a);
                 }
                 Pw::Erf(_) => unreachable!("emitted above"),
+                Pw::Sin(a) => {
+                    let _ = write!(out, "sin(v{a})");
+                }
+                Pw::Cos(a) => {
+                    let _ = write!(out, "cos(v{a})");
+                }
+                Pw::U32ToF32(a) => {
+                    let _ = write!(out, "f32(bitcast<u32>(v{a}))");
+                }
                 Pw::Tanh(a) => {
                     // Saturated outside ±10 (exactly ±1 in f32): some drivers
                     // evaluate tanh through exp(2x), which overflows to NaN.
@@ -347,6 +360,9 @@ impl PointwiseDAG {
                 Pw::Silu(a) => Pw::Silu(self_remap[a as usize]),
                 Pw::Tanh(a) => Pw::Tanh(self_remap[a as usize]),
                 Pw::Erf(a) => Pw::Erf(self_remap[a as usize]),
+                Pw::Sin(a) => Pw::Sin(self_remap[a as usize]),
+                Pw::Cos(a) => Pw::Cos(self_remap[a as usize]),
+                Pw::U32ToF32(a) => Pw::U32ToF32(self_remap[a as usize]),
             };
             self_remap.push(ops.len() as u16);
             ops.push(remapped);
