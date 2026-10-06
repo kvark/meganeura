@@ -2,19 +2,20 @@
 
 use super::{
     AttentionParams, BceData, BiasAddParams, BinaryData, CacheWriteData, CacheWritePrefixData,
-    CachedAttentionData, CachedBlockAttentionCombineData, CachedBlockAttentionData,
-    ChunkedRelativeAttentionData, ChunkedRelativeAttentionParams, Conv2dData, Conv2dDwData,
-    Conv2dDwParams, Conv2dGradInputData, Conv2dGradWeightData, Conv2dParams, CrossEntropyData,
-    DynReductionData, EmbeddingData, FourBufData, FusedMatMulAddData, GlobalAvgPoolData,
-    GlobalAvgPoolParams, GroupNormApplyData, GroupNormData, GroupNormGradData, GroupNormParams,
-    GroupNormStatsData, HorizMatMulData, LayerNormData, MatMulData, MatMulParams,
-    MatMulPrologue2Data, MatMulRmsNormData, MatMulRmsNormParams, MaxPool2dData, MaxPool2dGradData,
-    MaxPool2dParams, MulPerChannelData, MulPerChannelParams, MultiHeadAttnData,
-    MultiHeadAttnGradData, MultiHeadAttnGradKVData, PrefixLastData, ReductionParams,
-    ReductionPass1Data, ReductionPass2RowData, RmsNormAddData, RmsNormData, RoPEData,
-    RoPEDynamicData, RoPEDynamicFactorsData, RoPEParams, ScatterAddAtomicData, ScatterAddData,
-    ScatterAddParams, Session, SoftmaxParams, TernaryData, TransposeData, TransposeParams,
-    UnaryData, UnaryParams, WinogradTransformData, WinogradTransformParams, reduction_is_dynamic,
+    CachedAttentionData, CachedAttentionParams, CachedBlockAttentionCombineData,
+    CachedBlockAttentionData, ChunkedRelativeAttentionData, ChunkedRelativeAttentionParams,
+    Conv2dData, Conv2dDwData, Conv2dDwParams, Conv2dGradInputData, Conv2dGradWeightData,
+    Conv2dParams, CrossEntropyData, DynReductionData, EmbeddingData, FourBufData,
+    FusedMatMulAddData, GlobalAvgPoolData, GlobalAvgPoolParams, GroupNormApplyData, GroupNormData,
+    GroupNormGradData, GroupNormParams, GroupNormStatsData, HorizMatMulData, LayerNormData,
+    MatMulData, MatMulParams, MatMulPrologue2Data, MatMulRmsNormData, MatMulRmsNormParams,
+    MaxPool2dData, MaxPool2dGradData, MaxPool2dParams, MulPerChannelData, MulPerChannelParams,
+    MultiHeadAttnData, MultiHeadAttnGradData, MultiHeadAttnGradKVData, PrefixLastData,
+    ReductionParams, ReductionPass1Data, ReductionPass2RowData, RmsNormAddData, RmsNormData,
+    RoPEData, RoPEDynamicData, RoPEDynamicFactorsData, RoPEParams, ScatterAddAtomicData,
+    ScatterAddData, ScatterAddParams, Session, SoftmaxParams, TernaryData, TransposeData,
+    TransposeParams, UnaryData, UnaryParams, WinogradTransformData, WinogradTransformParams,
+    reduction_is_dynamic,
 };
 use crate::compile::{BufferRef, CachedBlockAttentionParams, Dispatch, ShaderEntry};
 
@@ -76,7 +77,7 @@ impl Session {
                 outer: dispatch.params[0],
                 inner: dispatch.params[1],
                 round_one_bits: dispatch.params.get(2).copied().unwrap_or(0),
-                _pad1: 0,
+                table_rows: dispatch.params.get(3).copied().unwrap_or(0),
             };
             if reduction_is_dynamic(k) {
                 // Buffers in binding order: each input stream (gather idx
@@ -467,7 +468,7 @@ impl Session {
                         params: UnaryParams {
                             len: dispatch.params[0],
                             _pad0: dispatch.params[1],
-                            _pad1: 0,
+                            _pad1: dispatch.params[2], // table rows
                             _pad2: 0,
                         },
                     },
@@ -1050,8 +1051,8 @@ impl Session {
                         dst: buf(dispatch.output_buffer),
                         kv_pos_buf: buf(dispatch.input_buffers[2]),
                         params: UnaryParams {
-                            len: dispatch.params[0], // dim
-                            _pad0: 0,
+                            len: dispatch.params[0],   // dim
+                            _pad0: dispatch.params[1], // cache rows
                             _pad1: 0,
                             _pad2: 0,
                         },
@@ -1084,11 +1085,13 @@ impl Session {
                         bias: buf(dispatch.input_buffers[2]),       // V cache
                         kv_pos_buf: buf(dispatch.input_buffers[3]), // kv_pos
                         dst: buf(dispatch.output_buffer),
-                        params: MatMulParams {
-                            m: dispatch.params[0],
-                            n: dispatch.params[1],
-                            k: dispatch.params[2],
-                            _pad: dispatch.params[3],
+                        params: CachedAttentionParams {
+                            queries: dispatch.params[0],
+                            num_heads: dispatch.params[1],
+                            num_kv_heads: dispatch.params[2],
+                            head_dim: dispatch.params[3],
+                            max_seq: dispatch.params[4],
+                            _pad: [0; 3],
                         },
                     },
                 );

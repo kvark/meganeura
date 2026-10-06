@@ -796,7 +796,7 @@ fn lower_reduction(
                 // gathered axis IS the reduced axis (table stride == inner).
                 // An index past the table reads its last row.
                 format!(
-                    "{0}[min({0}_idx[{1}], arrayLength(&{0}) / params.inner - 1u) * params.inner + {2}]",
+                    "{0}[min({0}_idx[{1}], params.table_rows - 1u) * params.inner + {2}]",
                     per_elem_names[i], source_row, col_var
                 )
             } else if repeat == 1 {
@@ -823,7 +823,7 @@ fn lower_reduction(
 
     let mut src = String::new();
     src.push_str(
-        "struct Params {\n    outer: u32,\n    inner: u32,\n    round_one_bits: u32,\n    _pad1: u32,\n}\n\n",
+        "struct Params {\n    outer: u32,\n    inner: u32,\n    round_one_bits: u32,\n    table_rows: u32,\n}\n\n",
     );
     for (i, name) in per_elem_names.iter().enumerate() {
         let _ = writeln!(src, "var<storage> {}: array<f32>;", name);
@@ -1463,12 +1463,14 @@ mod tests {
         assert!(sm.source.contains("var<storage> src_b_idx: array<u32>;"));
         // Indirect (gathered) loads, not the direct row_offset form.
         assert!(
-            sm.source
-                .contains("src_a[min(src_a_idx[row], arrayLength(&src_a) / params.inner - 1u) * params.inner + col]")
+            sm.source.contains(
+                "src_a[min(src_a_idx[row], params.table_rows - 1u) * params.inner + col]"
+            )
         );
         assert!(
-            sm.source
-                .contains("src_b[min(src_b_idx[row], arrayLength(&src_b) / params.inner - 1u) * params.inner + col]")
+            sm.source.contains(
+                "src_b[min(src_b_idx[row], params.table_rows - 1u) * params.inner + col]"
+            )
         );
         assert!(!sm.source.contains("src_a[row_offset"));
         // The prologue multiply still fuses in.
@@ -1497,8 +1499,9 @@ mod tests {
         });
         // Stream 0 gathered, stream 1 direct.
         assert!(
-            sm.source
-                .contains("src_a[min(src_a_idx[row], arrayLength(&src_a) / params.inner - 1u) * params.inner + col]")
+            sm.source.contains(
+                "src_a[min(src_a_idx[row], params.table_rows - 1u) * params.inner + col]"
+            )
         );
         assert!(sm.source.contains("src_b[row_offset + col]"));
         assert!(sm.source.contains("var<storage> src_a_idx: array<u32>;"));

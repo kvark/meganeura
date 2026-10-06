@@ -284,6 +284,39 @@ fn permute_rejects_other_storage() {
     g.permute(x, &[1, 0]);
 }
 
+/// The new elementwise primitives and `max_inner` compute on F32 storage
+/// and refuse other storage at construction, rather than relabeling it.
+#[test]
+fn f32_primitives_reject_other_storage() {
+    type Build = fn(&mut Graph, NodeId) -> NodeId;
+    let builders: [(&str, Build); 7] = [
+        ("sin", |g, x| g.sin(x)),
+        ("cos", |g, x| g.cos(x)),
+        ("erf", |g, x| g.erf(x)),
+        ("sqrt", |g, x| g.sqrt(x)),
+        ("rsqrt", |g, x| g.rsqrt(x)),
+        ("add_scalar", |g, x| g.add_scalar(x, 1.0)),
+        ("max_inner", |g, x| g.max_inner(x)),
+    ];
+    for (name, build) in builders {
+        for storage in ["u32", "f16"] {
+            let refused = std::panic::catch_unwind(|| {
+                let mut g = Graph::new();
+                let x = match storage {
+                    "u32" => g.input_u32("x", &[2, 2]),
+                    _ => g.parameter_f16("x", &[2, 2]),
+                };
+                build(&mut g, x);
+            });
+            assert!(refused.is_err(), "{name} accepted {storage} storage");
+        }
+        // F32 storage builds.
+        let mut g = Graph::new();
+        let x = g.input("x", &[2, 2]);
+        build(&mut g, x);
+    }
+}
+
 /// Strided copies spread their grid over two axes, each within the
 /// portable limit of 65535 workgroups.
 #[test]

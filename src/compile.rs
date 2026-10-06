@@ -2330,8 +2330,16 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 let idx_buf = p.input_buffers[0]; // Embedding inputs[0] = indices
                 let table_buf = p.input_buffers[1]; // inputs[1] = table
                 let producer_origin = p.origin.clone();
+                // Gathered indices are clamped to the table's rows, one
+                // count per kernel: every gathered table must share it.
+                let table_rows = p.params[2];
+                let kernel_rows = plan.dispatches[ci].params[3];
+                if kernel_rows != 0 && kernel_rows != table_rows {
+                    continue;
+                }
 
                 let c = &mut plan.dispatches[ci];
+                c.params[3] = table_rows;
                 let kernel = c.reduction_mut().expect("checked");
                 if kernel.gather_elem.is_empty() {
                     kernel.gather_elem = vec![false; per_elem];

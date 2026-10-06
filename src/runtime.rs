@@ -401,7 +401,7 @@ struct ReductionParams {
     outer: u32,
     inner: u32,
     round_one_bits: u32,
-    _pad1: u32,
+    table_rows: u32,
 }
 
 // Schedule-template reduction bindings — arity 1 (pure): var src, dst, params.
@@ -775,7 +775,18 @@ struct CachedAttentionData {
     bias: blade_graphics::BufferPiece,
     kv_pos_buf: blade_graphics::BufferPiece,
     dst: blade_graphics::BufferPiece,
-    params: MatMulParams, // queries, num_heads, num_kv_heads, head_dim
+    params: CachedAttentionParams,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct CachedAttentionParams {
+    queries: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    max_seq: u32,
+    _pad: [u32; 3],
 }
 
 #[derive(blade_macros::ShaderData)]

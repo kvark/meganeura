@@ -1810,7 +1810,7 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![indices, table],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![seq, hidden, 0, 0],
+                    params: vec![seq, hidden, tbl_shape[0] as u32, 0],
 
                     weight_format: wf,
                     ..Default::default()
@@ -2713,7 +2713,13 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![new_kv, cache, kv_pos_input],
                     output_buffer: cache,
                     extra_outputs: vec![],
-                    params: vec![dim, 0, 0, 0], // kv_pos read from input buffer at runtime
+                    // kv_pos is read from its buffer at run time.
+                    params: vec![
+                        dim,
+                        self.graph.node(node.inputs[1]).ty.shape[0] as u32,
+                        0,
+                        0,
+                    ],
 
                     ..Default::default()
                 });
@@ -2826,7 +2832,16 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![q, k_cache, v_cache, kv_pos_input],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![q_seq, num_heads, num_kv_heads, head_dim],
+                    params: vec![
+                        q_seq,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        self.graph.node(node.inputs[1]).ty.shape[0] as u32,
+                        0,
+                        0,
+                        0,
+                    ],
 
                     ..Default::default()
                 });

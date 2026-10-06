@@ -402,7 +402,7 @@ pub(crate) fn recognize(graph: &Graph, mode: Mode, optimize: &optimize::Optimize
     match (optimize.mode, mode) {
         (optimize::OptimizeMode::Off, _) => graph.deep_clone(),
         (_, Mode::Inference) => graph.recompose(),
-        (_, Mode::Training) => graph.recompose_for_training(),
+        (_, Mode::Training) => graph.recompose_for(Mode::Training),
     }
 }
 
@@ -533,7 +533,8 @@ pub fn build_session_unoptimized(forward_graph: &Graph) -> Session {
 pub fn compile_training_graph(
     forward_graph: &Graph,
 ) -> (crate::compile::ExecutionPlan, optimize::OptimizeReport) {
-    let optimized_forward = optimize::optimize(&forward_graph.recompose_for_training()).toposort();
+    let optimized_forward =
+        optimize::optimize(&forward_graph.recompose_for(Mode::Training)).toposort();
     let full_graph = autodiff::differentiate(&optimized_forward);
     let (optimized, report) = optimize::optimize_with_report(&full_graph);
     let plan = compile::compile(&optimized);
