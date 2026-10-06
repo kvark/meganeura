@@ -188,6 +188,8 @@ pub enum MatmulTile {
     /// Both spatial tiles and K-stage sizes are selected by measurement.
     SpecializedConv {
         tile_size: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tile_columns: Option<u32>,
         k_tile: u32,
     },
     /// Hardware-native f32 operands/accumulators, never f16 staging.
@@ -290,8 +292,12 @@ impl MatmulTile {
                     32 => Self::Tile32,
                     _ => Self::Tile64,
                 }),
-                Kernel::SpecializedConv { k_tile } => Some(Self::SpecializedConv {
+                Kernel::SpecializedConv {
+                    k_tile,
+                    tile_columns,
+                } => Some(Self::SpecializedConv {
                     tile_size: launched,
+                    tile_columns,
                     k_tile,
                 }),
                 Kernel::Cooperative => Self::native_cooperative(config),
@@ -303,8 +309,12 @@ impl MatmulTile {
                     Some(if small { Self::Tile32 } else { Self::Tile64 })
                 }
                 Kernel::ScalarMatmul(shape) => Some(Self::Scalar(shape)),
-                Kernel::SpecializedConv { k_tile } => Some(Self::SpecializedConv {
+                Kernel::SpecializedConv {
+                    k_tile,
+                    tile_columns,
+                } => Some(Self::SpecializedConv {
                     tile_size: if small { 32 } else { 64 },
+                    tile_columns,
                     k_tile,
                 }),
                 Kernel::Cooperative => Self::native_cooperative(config),
@@ -353,9 +363,14 @@ impl MatmulTile {
             Self::Tile32 | Self::Tile64 => crate::compile::Kernel::Default,
             Self::Scalar(shape) => crate::compile::Kernel::ScalarMatmul(shape),
             Self::CooperativeF32 { .. } => crate::compile::Kernel::Cooperative,
-            Self::SpecializedConv { k_tile, .. } => {
-                crate::compile::Kernel::SpecializedConv { k_tile }
-            }
+            Self::SpecializedConv {
+                k_tile,
+                tile_columns,
+                ..
+            } => crate::compile::Kernel::SpecializedConv {
+                k_tile,
+                tile_columns,
+            },
             Self::Gemv(_) => unreachable!(),
         };
     }
@@ -384,7 +399,17 @@ impl MatmulTile {
                     class.batch_dispatches(),
                 ];
             }
-            Self::SpecializedConv { tile_size, .. } => tile_size,
+            Self::SpecializedConv {
+                tile_size,
+                tile_columns,
+                ..
+            } => {
+                return [
+                    class.n.div_ceil(tile_columns.unwrap_or(tile_size)),
+                    class.m.div_ceil(tile_size),
+                    class.batch_dispatches(),
+                ];
+            }
             Self::CooperativeF32 { tile_size } => {
                 let tile = 2 * tile_size;
                 // Cooperative tiles use X for rows, Y for columns.
@@ -429,10 +454,18 @@ impl MatmulTile {
             }
             return Some(sizes);
         }
-        if let Self::SpecializedConv { tile_size, k_tile } = self {
+        if let Self::SpecializedConv {
+            tile_size,
+            tile_columns,
+            k_tile,
+        } = self
+        {
             if class.conv2d.is_none()
                 || !matches!(tile_size, 16 | 32 | 64)
                 || !matches!(k_tile, 16 | 32)
+                || (tile_columns.is_some()
+                    && (class.shader != ShaderEntry::Conv2dGradWeightGemm
+                        || (tile_size, tile_columns, k_tile) != (32, Some(16), 32)))
             {
                 return None;
             }
@@ -750,9 +783,17 @@ impl TuneClass {
                 for k_tile in [16, 32] {
                     out.push(MatmulTile::SpecializedConv {
                         tile_size: tile,
+                        tile_columns: None,
                         k_tile,
                     });
                 }
+            }
+            if self.shader == ShaderEntry::Conv2dGradWeightGemm {
+                out.push(MatmulTile::SpecializedConv {
+                    tile_size: 32,
+                    tile_columns: Some(16),
+                    k_tile: 32,
+                });
             }
             return out
                 .into_iter()
@@ -1576,9 +1617,14 @@ mod tests {
             );
             let candidates = class.challengers(MatmulTile::Tile64, Some(&native_config(16)));
             // 16/32/64 tiles, each with the plain kernel and two K stages,
-            // minus the 64-wide incumbent.
-            assert_eq!(candidates.len(), 8);
+            // minus the incumbent, plus one rectangular weight-gradient candidate.
+            assert_eq!(candidates.len(), if forward || dx { 8 } else { 9 });
             for candidate in candidates {
+                assert_eq!(
+                    serde_json::from_value::<MatmulTile>(serde_json::to_value(candidate).unwrap())
+                        .unwrap(),
+                    candidate,
+                );
                 candidate.apply(&mut d, &class);
                 assert_eq!(MatmulTile::selected(&d, None), Some(candidate));
                 let mut restored = TuneClass::from_dispatch(&d, None).unwrap();
@@ -1635,7 +1681,7 @@ mod tests {
             ShaderEntry::Conv2dGradWeightGemm,
         ] {
             let base = conv_dispatch(shader);
-            let mut variants = vec![base; 17];
+            let mut variants = vec![base; 20];
             variants[0].kernel = crate::compile::Kernel::SmallTile;
             variants[1].kernel = crate::compile::Kernel::Cooperative;
             variants[2].kernel = crate::compile::Kernel::CooperativeCompensated;
@@ -1650,9 +1696,25 @@ mod tests {
             variants[11].params[1] = u32::MAX;
             variants[12].weight_format = crate::compile::WeightFormat::F16;
             variants[13].shader = ShaderEntry::Conv2dGradInputGemmCoopGen(3, 2, 2);
-            variants[14].kernel = crate::compile::Kernel::SpecializedConv { k_tile: 7 };
+            variants[14].kernel = crate::compile::Kernel::SpecializedConv {
+                k_tile: 7,
+                tile_columns: None,
+            };
             variants[15].input_buffers.pop();
             variants[16].params[5] = 100;
+            for (d, (k_tile, columns)) in
+                variants[17..].iter_mut().zip([(32, 0), (16, 16), (32, 17)])
+            {
+                d.shader = if d.shader == ShaderEntry::Conv2dGradWeightGemm {
+                    ShaderEntry::Conv2dGradWeightGemmSmall
+                } else {
+                    ShaderEntry::Conv2dGradInputGemmSmall
+                };
+                d.kernel = crate::compile::Kernel::SpecializedConv {
+                    k_tile,
+                    tile_columns: Some(columns),
+                };
+            }
             for d in variants {
                 assert!(TuneClass::from_dispatch(&d, None).is_none(), "{d:?}");
             }
@@ -1686,6 +1748,25 @@ mod tests {
 
     #[test]
     fn scope_and_convolution_contracts_preserve_historical_reports() {
+        assert_eq!(
+            serde_json::from_str::<MatmulTile>(
+                r#"{"SpecializedConv":{"tile_size":32,"k_tile":16}}"#,
+            )
+            .unwrap(),
+            MatmulTile::SpecializedConv {
+                tile_size: 32,
+                tile_columns: None,
+                k_tile: 16,
+            },
+        );
+        assert_eq!(
+            serde_json::from_str::<crate::compile::Kernel>(r#"{"SpecializedConv":{"k_tile":16}}"#)
+                .unwrap(),
+            crate::compile::Kernel::SpecializedConv {
+                k_tile: 16,
+                tile_columns: None,
+            },
+        );
         assert_eq!(TuneOptions::default().scope, TuneScope::All);
         let dense = class(3, 5, 7);
         let conv = TuneClass::from_dispatch(&conv_dispatch(ShaderEntry::Conv2dGradInputGemm), None)

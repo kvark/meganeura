@@ -67,7 +67,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         // weight layout: [Co, Ci, kH, kW] → weight[co * Ci*kH*kW + ci * kH*kW + kh*kW + kw]
         let k_idx_a = t + a_col;
         let k_rem_a = a_k.middle * params.kernel_w + a_k.inner;
-        for (var e = 0u; e < $STAGE_EPT_U; e++) {
+        for (var e = 0u; e < $STAGE_A_EPT_U; e++) {
             let row_local = tid / $KTILE_U + e * (256u / $KTILE_U);  // M dimension (Ci)
             let ci = tile_row + row_local;
 
@@ -83,7 +83,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         // B[k, hw] where k = co*kH*kW+kh*kW+kw, hw = ih*W+iw
         // grad_out position: oh = (ih + pad_h - kh) / stride when divisible,
         // likewise ow.
-        for (var e = 0u; e < $STAGE_EPT_U; e++) {
+        for (var e = 0u; e < $STAGE_B_EPT_U; e++) {
             let row_local = tid / $BM_U + e * (256u / $BM_U);  // K dimension
             let k_idx = t + row_local;
 

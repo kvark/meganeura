@@ -992,7 +992,7 @@ enum Variant {
         crate::codegen::ScalarMatmulShape,
         u32,
     ),
-    SpecializedConv(ShaderEntry, Vec<u32>, u32),
+    SpecializedConv(ShaderEntry, Vec<u32>, u32, Option<u32>),
     ScalarMatmul(
         ShaderEntry,
         crate::compile::WeightFormat,
@@ -1086,7 +1086,7 @@ impl Variant {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
             Variant::Attention(ref e, _, _)
             | Variant::SplitMatmul(ref e, _, _, _)
-            | Variant::SpecializedConv(ref e, _, _)
+            | Variant::SpecializedConv(ref e, _, _, _)
             | Variant::ScalarMatmul(ref e, _, _)
             | Variant::Epilogue(ref e, _)
             | Variant::CoopEpilogue(ref e, _)
@@ -1114,8 +1114,9 @@ impl Variant {
             Variant::ScalarMatmul(ref e, format, shape) => {
                 format!("{e:?}:scalar-{format:?}-{shape:?}")
             }
-            Variant::SpecializedConv(ref e, ref params, k_tile) => {
-                format!("{e:?}:fixed-native-div-k{k_tile}-{params:?}")
+            Variant::SpecializedConv(ref e, ref params, k_tile, tile_columns) => {
+                let columns = tile_columns.map(|n| format!("-n{n}")).unwrap_or_default();
+                format!("{e:?}:fixed-native-div-k{k_tile}{columns}-{params:?}")
             }
             Variant::Reduction(hash) => format!("generated-reduction:{hash:016x}"),
             Variant::Pointwise(hash) => format!("generated-pointwise:{hash:016x}"),
@@ -1456,8 +1457,12 @@ impl Pipelines {
         if let crate::compile::Kernel::SplitMatmul { shape, splits } = dispatch.kernel {
             return Variant::SplitMatmul(entry, dispatch.weight_format, shape, splits);
         }
-        if let Some(k_tile) = dispatch.conv_k_tile() {
-            return Variant::SpecializedConv(entry, dispatch.params.clone(), k_tile);
+        if let crate::compile::Kernel::SpecializedConv {
+            k_tile,
+            tile_columns,
+        } = dispatch.kernel
+        {
+            return Variant::SpecializedConv(entry, dispatch.params.clone(), k_tile, tile_columns);
         }
         if dispatch.horizontal_batch >= 2 {
             return Variant::Horizontal(entry, dispatch.horizontal_batch, horiz_kind(dispatch));

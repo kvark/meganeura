@@ -223,6 +223,7 @@ fn run_split(
         SessionOptions {
             coop: policy,
             no_alias: true, // Keep forward output available for the independent full oracle.
+            arena_chunk_bytes: Some(256), // Separate x/w allocations keep forward tile tuning eligible.
             ..Default::default()
         },
     );
@@ -299,7 +300,7 @@ fn run_split(
                 })
                 .unwrap();
             assert_eq!(report.eligible_classes, 3, "{s:?}: {report:?}");
-            assert_eq!(report.outcomes.len(), 24, "{s:?}: {report:?}");
+            assert_eq!(report.outcomes.len(), 25, "{s:?}: {report:?}");
             assert!(
                 report.outcomes.iter().all(|o| o.qualified
                     && o.class.conv2d.is_some()

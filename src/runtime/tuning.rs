@@ -143,11 +143,17 @@ pub(super) fn tile_module(
             },
         );
     }
-    if let MatmulTile::SpecializedConv { k_tile, .. } = tile {
+    if let MatmulTile::SpecializedConv {
+        k_tile,
+        tile_columns,
+        ..
+    } = tile
+    {
         let params = super::Conv2dParams::from(dispatch);
         return crate::codegen::generate_conv_module(
             selected_entry.shader_group(),
             k_tile,
+            tile_columns,
             Some(bytemuck::cast_slice(std::slice::from_ref(&params))),
         );
     }
@@ -2016,11 +2022,16 @@ mod tests {
             }
             values
         };
-        let class = collect_classes(&b.plan, &b.alias, None).0.remove(0);
+        let class = collect_classes(&b.plan, &b.alias, None)
+            .0
+            .into_iter()
+            .find(|c| !convolution || c.key.shader == ShaderEntry::Conv2dGradWeightGemm)
+            .unwrap();
         let alternative = if convolution {
             MatmulTile::SpecializedConv {
                 tile_size: 32,
-                k_tile: 16,
+                tile_columns: Some(16),
+                k_tile: 32,
             }
         } else {
             MatmulTile::Scalar(crate::codegen::ScalarMatmulShape {
@@ -2478,13 +2489,22 @@ mod tests {
                 MatmulTile::CooperativeF32 { tile_size: 16 },
                 MatmulTile::SpecializedConv {
                     tile_size: 32,
+                    tile_columns: None,
                     k_tile: 16,
                 },
                 MatmulTile::SpecializedConv {
                     tile_size: 64,
+                    tile_columns: None,
                     k_tile: 32,
                 },
             ];
+            if entry == ShaderEntry::Conv2dGradWeightGemm {
+                tiles.push(MatmulTile::SpecializedConv {
+                    tile_size: 32,
+                    tile_columns: Some(16),
+                    k_tile: 32,
+                });
+            }
             for tile_size in [32, 64] {
                 for k_stage in [8, 16, 32] {
                     for interleave_columns in [false, true] {
@@ -2533,6 +2553,25 @@ mod tests {
                     params: vec![2, 3, 7, 9, 5, 3, 2, 2, 0, 3, 5, 1],
                     ..Default::default()
                 };
+                if matches!(
+                    tile,
+                    MatmulTile::SpecializedConv {
+                        tile_columns: Some(_),
+                        ..
+                    }
+                ) {
+                    assert_ne!(
+                        tile_variant(&dispatch, tile),
+                        tile_variant(
+                            &dispatch,
+                            MatmulTile::SpecializedConv {
+                                tile_size: 32,
+                                tile_columns: None,
+                                k_tile: 32,
+                            }
+                        ),
+                    );
+                }
                 if convolution && !specialized {
                     assert_eq!(
                         tile_variant(&dispatch, tile),

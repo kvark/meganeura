@@ -52,7 +52,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         if t >= k_total { break; }
 
         // Load A tile: weight[Co, K].
-        for (var e = 0u; e < $STAGE_EPT_U; e++) {
+        for (var e = 0u; e < $STAGE_A_EPT_U; e++) {
             let flat = tid + e * 256u;
             let row_local = flat / $KTILE_U;  // M dimension (Co)
             let col_local = flat % $KTILE_U;  // K dimension
@@ -66,7 +66,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         // Load B tile: im2col(input)^T [K, oH*oW].
         // B[k, hw] = input[n, ci, oh*stride+kh-pad, ow*stride+kw-pad]
         var b_k = split_digits(t + tid / $BM_U, params.kernel_h, params.kernel_w, params.kernel_w_multiplier, params.kernel_hw_multiplier);
-        for (var e = 0u; e < $STAGE_EPT_U; e++) {
+        for (var e = 0u; e < $STAGE_B_EPT_U; e++) {
             let row_local = tid / $BM_U + e * (256u / $BM_U);  // K dimension
             let k_idx = t + row_local;
 

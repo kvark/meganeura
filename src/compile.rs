@@ -1187,6 +1187,8 @@ pub enum Kernel {
     },
     SpecializedConv {
         k_tile: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tile_columns: Option<u32>,
     },
     Cooperative,
     /// Experimental f16 hi/lo staging, not a full-range f32 implementation.
@@ -1257,7 +1259,7 @@ impl Dispatch {
 
     pub fn conv_k_tile(&self) -> Option<u32> {
         match self.kernel {
-            Kernel::SpecializedConv { k_tile } => Some(k_tile),
+            Kernel::SpecializedConv { k_tile, .. } => Some(k_tile),
             _ => None,
         }
     }
@@ -2966,7 +2968,10 @@ mod conv_tile {
 /// This kernel uses the same exact reciprocal, with the multipliers as
 /// constants, and the K stage the uniform shader already uses.
 fn exact_conv_kernel() -> Kernel {
-    Kernel::SpecializedConv { k_tile: 16 }
+    Kernel::SpecializedConv {
+        k_tile: 16,
+        tile_columns: None,
+    }
 }
 
 fn conv_gemm_entry(kind: u8, tile: u32) -> ShaderEntry {
