@@ -103,6 +103,11 @@ fn reference(graph: &Graph, feeds: &Feeds) -> Result<(Vec<Tensor>, Vec<Vec<f64>>
     Ok((values, scales))
 }
 
+fn dispatched(session: &crate::Session) -> Vec<crate::compile::ShaderEntry> {
+    let plan = session.plan();
+    plan.dispatches.iter().map(|d| d.shader.clone()).collect()
+}
+
 /// Build an inference session for `graph`, run one step, and compare every
 /// graph output with the reference.
 pub fn check_inference(graph: &Graph, feeds: &Feeds, options: &Options) -> Result<Report, Error> {
@@ -111,7 +116,10 @@ pub fn check_inference(graph: &Graph, feeds: &Feeds, options: &Options) -> Resul
     upload(&mut session, graph, feeds)?;
     session.step();
     session.wait();
-    let mut report = Report::default();
+    let mut report = Report {
+        shaders: dispatched(&session),
+        ..Report::default()
+    };
     for (index, &id) in graph.outputs().iter().enumerate() {
         let node = graph.node(id);
         let (want, magnitude) = (&values[id as usize], &scales[id as usize]);
@@ -140,7 +148,10 @@ pub fn check_training(graph: &Graph, feeds: &Feeds, options: &Options) -> Result
     session.step();
     session.wait();
 
-    let mut report = Report::default();
+    let mut report = Report {
+        shaders: dispatched(&session),
+        ..Report::default()
+    };
     let loss_id = backward.outputs()[0];
     let (want, magnitude) = (&values[loss_id as usize], &scales[loss_id as usize]);
     report.comparisons.push(Comparison {

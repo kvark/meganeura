@@ -188,6 +188,7 @@ impl Family for Path {
                         MIN_F32_COOPERATIVE_WORKGROUPS
                     };
                     if workgroups < minimum {
+                        // Policy, not legality: tuning may still measure it.
                         Err("too few tiles to amortize staging")
                     } else {
                         Ok(())
@@ -198,7 +199,7 @@ impl Family for Path {
                 if problem.pinned {
                     Err("a schedule pinned a scalar kernel")
                 } else if problem.reduced_storage {
-                    Err("packed weights have no 32-wide kernel")
+                    Err("packed weights keep their compiled kernel")
                 } else if problem.layout.transposed_with_addend() {
                     Err("no 32-wide kernel for transposed products with an addend")
                 } else if problem.compiled_workgroups >= SMALL_TILE_BELOW_WORKGROUPS {

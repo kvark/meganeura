@@ -13,8 +13,9 @@
 
 use meganeura::compile::{ShaderEntry, compile_with};
 use meganeura::graph::Op;
-use meganeura::kernels::attention_grad::{AttentionGrad, Part, Path};
+use meganeura::kernels::attention_grad::{AttentionGrad, Operands, Part, Path};
 use meganeura::reference::{Feeds, gpu, gradients};
+use meganeura::{CoopCaps, CoopPolicy};
 use meganeura::{Graph, NodeId, TensorType};
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -309,9 +310,12 @@ fn backward_sweep(kinds: &[Kind], shapes: &[Shape]) {
 /// Every attention backward path, pinned in turn, against the reference on
 /// shapes that span each path's admission edges: one row, ragged tiles,
 /// the cooperative 16-row tile, the f32 path's 128 rows on either side, a
-/// width that is not a power of two and GQA. A path a shape or the device
-/// does not admit falls back to the usual choice, which other cases cover;
-/// the paths every device runs must each be exercised for both parts.
+/// width that is not a power of two and GQA.
+///
+/// Each case runs on the session under test and records the kernels that
+/// session dispatched, so the coverage below is what actually ran on this
+/// device. Every path the device can run must have run for both dQ and
+/// dK/dV, and the f16 path must not run without its precision opt-in.
 #[test]
 fn every_backward_path_against_the_reference() {
     let shapes = [
@@ -336,36 +340,94 @@ fn every_backward_path_against_the_reference() {
             let mut options = gpu::Options::default();
             options.compile.prefer_attention_grad = Some(path);
             options.compile.flash_backward_coop = true;
-            let chosen: Vec<AttentionGrad> = compile_with(&g, &options.compile)
-                .dispatches
-                .iter()
-                .filter_map(|d| match d.shader {
-                    ShaderEntry::AttentionGrad(kernel) => Some(kernel),
-                    _ => None,
-                })
-                .collect();
-            if chosen.iter().all(|kernel| kernel.path != path) {
-                continue;
-            }
-            exercised.extend(
-                chosen
-                    .iter()
-                    .filter(|kernel| kernel.path == path)
-                    .map(|kernel| format!("{kernel:?}")),
-            );
-            sweep.inference(
+            let ran = run_recording(
+                &mut sweep,
                 &format!("{kind:?} backward {s:?} preferring {path:?}"),
                 &g,
                 &feeds,
                 &options,
             );
+            exercised.extend(
+                attention_grads(&ran)
+                    .filter(|kernel| kernel.path == path)
+                    .map(|kernel| format!("{kernel:?}")),
+            );
         }
     }
+
+    // The f16 path rounds dO, so without the opt-in it must not run even
+    // when preferred.
+    let g = backward_graph(Kind::Causal, shape(17, 17, 2, 2, 16));
+    let mut strict = gpu::Options::default();
+    strict.compile.prefer_attention_grad = Some(Path::Cooperative(Operands::F16));
+    strict.compile.flash_backward_coop = false;
+    let ran = run_recording(
+        &mut sweep,
+        "f16 cooperative preferred without its opt-in",
+        &g,
+        &random(&g, 400),
+        &strict,
+    );
+    assert!(
+        attention_grads(&ran).all(|kernel| kernel.path != Path::Cooperative(Operands::F16)),
+        "the f16 path ran without its opt-in"
+    );
+
     println!("exercised: {exercised:?}");
-    for kernel in ["dQ-flash", "dQ-rowwise", "dKV-flash", "dKV-rowwise"] {
-        assert!(exercised.contains(kernel), "{kernel} never ran");
+    let caps = session_caps(&gpu::Options::default());
+    let mut expected = vec!["flash", "rowwise"];
+    if caps.f32_tile == 8 {
+        expected.push("cooperative-f32");
+    }
+    if caps.f16_tile == 16 {
+        expected.push("cooperative-f16");
+    }
+    for path in expected {
+        for part in ["dQ", "dKV"] {
+            let kernel = format!("{part}-{path}");
+            assert!(exercised.contains(&kernel), "{kernel} never ran");
+        }
     }
     sweep.finish();
+}
+
+/// Check `g` on the session under test, returning the shaders it ran.
+fn run_recording(
+    sweep: &mut Sweep,
+    label: &str,
+    g: &Graph,
+    feeds: &Feeds,
+    options: &gpu::Options,
+) -> Vec<ShaderEntry> {
+    let mut ran = Vec::new();
+    sweep.run(label, || {
+        let report = gpu::check_inference(g, feeds, options).map_err(|e| e.to_string())?;
+        ran.clone_from(&report.shaders);
+        let text = report.to_string();
+        if report.passed() { Ok(text) } else { Err(text) }
+    });
+    ran
+}
+
+fn attention_grads(shaders: &[ShaderEntry]) -> impl Iterator<Item = AttentionGrad> + '_ {
+    shaders.iter().filter_map(|shader| match *shader {
+        ShaderEntry::AttentionGrad(kernel) => Some(kernel),
+        _ => None,
+    })
+}
+
+/// The cooperative tiles a session built with `options` may use: the
+/// device's, filtered by the session's policy.
+fn session_caps(options: &gpu::Options) -> CoopCaps {
+    let caps = meganeura::runtime::auto_tune(&gpu::shared_context(), 0).coop_caps;
+    match options.coop {
+        CoopPolicy::Disabled => CoopCaps::default(),
+        CoopPolicy::NativeF32 => CoopCaps {
+            f16_tile: 0,
+            ..caps
+        },
+        _ => caps,
+    }
 }
 
 #[test]
