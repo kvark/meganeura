@@ -40,14 +40,20 @@ $DIMENSIONS
     let head_dim = params.head_dim;
     let valid = pos < q_seq && head < num_heads;
 
-    let my_kv_len = select(kv_seq, select(pos + 1u, 0u, !valid), kv_seq == 0u);
-    let window_size = $WINDOW;
+$BLOCK_CAUSAL
+    var my_kv_len = select(kv_seq, select(pos + 1u, 0u, !valid), kv_seq == 0u);
+    if block_causal { my_kv_len = select(q_seq, pos + 1u, pos < prefix_len); }
+    let window_size = select($WINDOW, 0u, block_causal);
     let my_kv_start = select(0u, my_kv_len - min(my_kv_len, window_size), window_size > 0u);
 
     let last_pos = min(wgid.x * $BQu + $BQu - 1u, q_seq - 1u);
     let first_pos = wgid.x * $BQu;
-    let max_kv_len = select(kv_seq, last_pos + 1u, kv_seq == 0u);
-    let first_kv_len = select(kv_seq, first_pos + 1u, kv_seq == 0u);
+    var max_kv_len = select(kv_seq, last_pos + 1u, kv_seq == 0u);
+    var first_kv_len = select(kv_seq, first_pos + 1u, kv_seq == 0u);
+    if block_causal {
+        max_kv_len = select(q_seq, last_pos + 1u, last_pos < prefix_len);
+        first_kv_len = select(q_seq, first_pos + 1u, first_pos < prefix_len);
+    }
     let min_kv_start = select(0u, first_kv_len - min(first_kv_len, window_size), window_size > 0u);
 
     let kv_head = head / (num_heads / max(num_kv_heads, 1u));

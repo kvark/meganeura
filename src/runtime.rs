@@ -2108,7 +2108,9 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::Conv2dGradWeightGemmSplit
         | ShaderEntry::Conv2dGradWeightGemmSplitSmall
         | ShaderEntry::Conv2dGradWeightGemmSplit16 => Conv2dGradWeightData::layout(),
-        ShaderEntry::RoPEDynamic | ShaderEntry::RoPEPositions => RoPEDynamicData::layout(),
+        ShaderEntry::RoPEDynamic | ShaderEntry::RoPEPositions | ShaderEntry::AxialRoPE => {
+            RoPEDynamicData::layout()
+        }
         ShaderEntry::RoPEDynamicFactors => RoPEDynamicFactorsData::layout(),
         ShaderEntry::CacheWrite => CacheWriteData::layout(),
         ShaderEntry::CacheWritePrefix => CacheWritePrefixData::layout(),

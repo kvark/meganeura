@@ -1120,6 +1120,8 @@ pub fn differentiate(forward: &Graph) -> Graph {
             | Op::BiasedCachedAttention { .. }
             | Op::PrefixLast
             | Op::RoPEPositions { .. }
+            | Op::AxialRoPE { .. }
+            | Op::BlockCausalAttention { .. }
             | Op::GroupNormSilu { .. } => {
                 panic!(
                     "autodiff not supported for {:?} — this op cannot appear in training graphs. \
