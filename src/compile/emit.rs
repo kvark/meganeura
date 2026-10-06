@@ -3260,7 +3260,7 @@ impl<'a> Compiler<'a> {
                 // derivatives can lose material information there, so keep
                 // this experimental path explicit rather than enabling it
                 // merely because the device advertises f16 matrices.
-                let bwd_coop_enabled = node.attention_ept_cap.is_none()
+                let f16_coop_enabled = node.attention_ept_cap.is_none()
                     && self.allow_reduced_precision_attention_backward
                     && self.coop_caps.supports_16x16_f16()
                     && head_dim >= 16
@@ -3268,15 +3268,27 @@ impl<'a> Compiler<'a> {
                     && head_dim.is_power_of_two()
                     && q_seq >= 16
                     && crate::codegen::attention_coop_shared_bytes(
-                        ShaderGroup::FlashGradQCoop,
+                        ShaderGroup::FlashGradQCoopF16,
                         head_dim,
                     ) <= u64::from(self.shared_memory_bytes);
                 let ept_cap = node
                     .attention_ept_cap
                     .unwrap_or(self.options.knobs.flash_grad_q_ept_cap);
-                let (grad_q_shader, grad_q_wgs) = if bwd_coop_enabled {
+                let f32_coop_enabled = node.attention_ept_cap.is_none()
+                    && self.coop_caps.f32_tile == 8
+                    && head_dim == 64
+                    && q_seq >= 128
+                    && (is_causal || kv_seq >= 128)
+                    && workgroups_within_portable_limits([q_seq.div_ceil(16), num_heads, 1])
+                    && self.shared_memory_bytes >= crate::codegen::FLASH_GRAD_COOP_F32_SHARED_BYTES;
+                let (grad_q_shader, grad_q_wgs) = if f32_coop_enabled {
                     (
-                        ShaderEntry::FlashGradQCoop,
+                        ShaderEntry::FlashGradQCoopF32,
+                        [q_seq.div_ceil(16), num_heads, 1],
+                    )
+                } else if f16_coop_enabled {
+                    (
+                        ShaderEntry::FlashGradQCoopF16,
                         [q_seq.div_ceil(16), num_heads, 1],
                     )
                 } else {
@@ -3288,7 +3300,7 @@ impl<'a> Compiler<'a> {
                     };
                     (mapped, wgs)
                 };
-                let row_source = if grad_q_shader == ShaderEntry::FlashGradQCoop {
+                let row_source = if grad_q_shader == ShaderEntry::FlashGradQCoopF16 {
                     fwd_o
                 } else {
                     self.emit_attention_row_dot(d_out, fwd_o, q_seq * num_heads, head_dim)
@@ -3370,7 +3382,7 @@ impl<'a> Compiler<'a> {
                 // See GradQ above: reduced-input precision in backward is an
                 // experimental opt-in until its error is bounded (or loss
                 // scaling keeps the derivative operands representable).
-                let bwd_coop_enabled = node.attention_ept_cap.is_none()
+                let f16_coop_enabled = node.attention_ept_cap.is_none()
                     && self.allow_reduced_precision_attention_backward
                     && self.coop_caps.supports_16x16_f16()
                     && head_dim >= 16
@@ -3378,12 +3390,28 @@ impl<'a> Compiler<'a> {
                     && head_dim.is_power_of_two()
                     && dispatch_kv >= 16
                     && crate::codegen::attention_coop_shared_bytes(
-                        ShaderGroup::FlashGradKVCoop,
+                        ShaderGroup::FlashGradKVCoopF16,
                         head_dim,
                     ) <= u64::from(self.shared_memory_bytes);
-                let (shader, workgroups) = if bwd_coop_enabled {
+                let f32_coop_enabled = node.attention_ept_cap.is_none()
+                    && self.coop_caps.f32_tile == 8
+                    && head_dim == 64
+                    && q_seq >= 128
+                    && dispatch_kv >= 128
+                    && workgroups_within_portable_limits([
+                        dispatch_kv.div_ceil(16),
+                        num_kv_heads,
+                        1,
+                    ])
+                    && self.shared_memory_bytes >= crate::codegen::FLASH_GRAD_COOP_F32_SHARED_BYTES;
+                let (shader, workgroups) = if f32_coop_enabled {
                     (
-                        ShaderEntry::FlashGradKVCoop,
+                        ShaderEntry::FlashGradKVCoopF32,
+                        [dispatch_kv.div_ceil(16), num_kv_heads, 1],
+                    )
+                } else if f16_coop_enabled {
+                    (
+                        ShaderEntry::FlashGradKVCoopF16,
                         [dispatch_kv.div_ceil(16), num_kv_heads, 1],
                     )
                 } else {
@@ -3397,7 +3425,7 @@ impl<'a> Compiler<'a> {
                 // every query row. Reduce it once here; recomputing it in
                 // every KV workgroup read O and spent a third of the inner
                 // loop's products on it. The cooperative kernel keeps O.
-                let row_source = if shader == ShaderEntry::FlashGradKVCoop {
+                let row_source = if shader == ShaderEntry::FlashGradKVCoopF16 {
                     fwd_o
                 } else {
                     self.emit_attention_row_dot(d_out, fwd_o, q_seq * num_heads, head_dim)

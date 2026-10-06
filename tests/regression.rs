@@ -7,6 +7,8 @@ mod cached_query_attention;
 mod constant_dedup;
 mod conv_derivatives;
 mod coop_conv_unaligned_k;
+mod coop_f32_attention;
+mod coop_f32_matmul;
 mod coop_matmul_skinny;
 mod device_local;
 mod eager;

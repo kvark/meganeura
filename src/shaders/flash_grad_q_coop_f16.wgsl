@@ -1,4 +1,4 @@
-// QK^T and dO V^T use f16 cooperative operands. The scalar dS K accumulation
+// F16 cooperative operands for QK^T and dO V^T. The scalar dS K accumulation
 // uses the untransposed f32 K copy, with dQ held in registers across KV tiles.
 enable f16;
 enable wgpu_cooperative_matrix;

@@ -39,8 +39,8 @@ fn run(
     let (mut session, _) = build(&graph, config);
     let uses_coop = [
         ShaderEntry::FlashAttentionCoop,
-        ShaderEntry::FlashGradQCoop,
-        ShaderEntry::FlashGradKVCoop,
+        ShaderEntry::FlashGradQCoopF16,
+        ShaderEntry::FlashGradKVCoopF16,
     ]
     .map(|shader| {
         session
