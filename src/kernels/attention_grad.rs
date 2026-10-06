@@ -127,6 +127,19 @@ impl Family for Path {
     ];
 
     fn admits(self, problem: &Problem, target: &Target) -> Result<(), Rejection> {
+        let kernel = AttentionGrad::new(problem.part, self);
+        self.admits_shape(problem, target)?;
+        // Every path launches one workgroup per tile of rows on X.
+        if crate::compile::workgroups_within_portable_limits(kernel.workgroups(problem)) {
+            Ok(())
+        } else {
+            Err("grid exceeds the portable dispatch limit")
+        }
+    }
+}
+
+impl Path {
+    fn admits_shape(self, problem: &Problem, target: &Target) -> Result<(), Rejection> {
         let head_dim = problem.head_dim;
         let kernel = AttentionGrad::new(problem.part, self);
         match self {
@@ -138,11 +151,7 @@ impl Family for Path {
                 } else if head_dim != F32_HEAD_DIM {
                     Err("head width is not 64")
                 } else if problem.rows < F32_MIN_ROWS || problem.other_rows < F32_MIN_ROWS {
-                    Err("fewer than 128 rows on a side")
-                } else if !crate::compile::workgroups_within_portable_limits(
-                    kernel.workgroups(problem),
-                ) {
-                    Err("grid exceeds the portable dispatch limit")
+                    Err("fewer than 128 rows on a side, where it was not measured to pay off")
                 } else if kernel.shared_bytes(head_dim) > u64::from(target.shared_memory_bytes) {
                     Err("tiles exceed workgroup memory")
                 } else {
@@ -356,8 +365,9 @@ mod tests {
         }
     }
 
-    /// The fallback admits every head the builders accept, whatever the
-    /// target, so selection never fails on a supported problem.
+    /// The fallback admits every head the builders accept within the
+    /// dispatch limit, whatever the target, so selection never fails on a
+    /// supported problem.
     #[test]
     fn rowwise_admits_every_supported_problem() {
         let bare = Target {
@@ -442,6 +452,8 @@ mod tests {
     #[test]
     fn full_precision_cooperative_is_preferred_where_it_runs() {
         const F32: Path = Path::Cooperative(Operands::F32);
+        const SHORT: Rejection =
+            "fewer than 128 rows on a side, where it was not measured to pay off";
         let target = Target {
             cooperative_f32: true,
             ..ROOMY
@@ -458,13 +470,13 @@ mod tests {
             assert_eq!(AttentionGrad::select(&p, &strict).path, F32);
             for (p, reason) in [
                 (problem(part, 128, 128), "head width is not 64"),
-                (problem(part, 127, 64), "fewer than 128 rows on a side"),
+                (problem(part, 127, 64), SHORT),
                 (
                     Problem {
                         other_rows: 127,
                         ..p
                     },
-                    "fewer than 128 rows on a side",
+                    SHORT,
                 ),
                 (
                     problem(part, 16 * 65_536, 64),
@@ -479,6 +491,37 @@ mod tests {
             };
             assert_eq!(F32.admits(&p, &small), Err("tiles exceed workgroup memory"));
         }
+    }
+
+    /// No path launches past the portable dispatch limit, so a preference
+    /// for one-row workgroups over 65536 query rows falls back to flash
+    /// tiles, and the limit itself is admitted.
+    #[test]
+    fn every_path_stays_within_the_dispatch_limit() {
+        let rowwise = Target {
+            prefer: Some(Path::Rowwise),
+            cooperative_f16: false,
+            ..ROOMY
+        };
+        // The reviewed case: one 16-wide head at the default caps.
+        let tall = Problem {
+            other_rows: 2,
+            ept_cap: 16,
+            ..problem(Part::Q, 65_536, 16)
+        };
+        assert_eq!(
+            Path::Rowwise.admits(&tall, &rowwise),
+            Err("grid exceeds the portable dispatch limit")
+        );
+        let chosen = AttentionGrad::select(&tall, &rowwise);
+        assert_eq!(chosen.path, Path::Flash);
+        assert_eq!(chosen.workgroups(&tall), [256, 2, 1]);
+        let limit = Problem {
+            rows: 65_535,
+            ..tall
+        };
+        assert_eq!(Path::Rowwise.admits(&limit, &rowwise), Ok(()));
+        assert_eq!(AttentionGrad::select(&limit, &rowwise).path, Path::Rowwise);
     }
 
     /// A preferred path is tried first and still has to admit the problem.

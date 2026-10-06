@@ -693,6 +693,9 @@ pub struct Comparison {
 #[derive(Clone, Debug, Default)]
 pub struct Report {
     pub comparisons: Vec<Comparison>,
+    /// The shader of every dispatch the session under test ran, so a check
+    /// can confirm which kernels it exercised.
+    pub shaders: Vec<crate::compile::ShaderEntry>,
 }
 
 impl Report {

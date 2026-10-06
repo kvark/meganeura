@@ -7,12 +7,12 @@
 //! - the variants, in order of preference, with the last a fallback that
 //!   admits every problem the family accepts;
 //! - what each variant admits on a given target, stated as a reason when it
-//!   declines ([`Family::admits`]);
+//!   declines;
 //! - its geometry, generated module, binding layout and required
 //!   capabilities.
 //!
 //! The rest of the crate sees one shader entry per family and asks the
-//! family about the variant it carries. [`select`] picks the first variant
+//! family about the variant it carries. Selection picks the first variant
 //! a problem admits, so a specialized path only ever replaces a fallback
 //! that computes the same thing, and the tests can run every admitted
 //! variant against the same reference.
@@ -56,11 +56,14 @@ pub(crate) struct Selection<F> {
 
 /// The most preferred variant of `F` that admits `problem` on `target`.
 ///
-/// Panics when none does: the fallback declines only problems the family
-/// does not support at all, which the graph builders refuse earlier.
+/// Panics when none does. The fallback declines only problems no variant
+/// can run: shapes the graph builders refuse, or launches beyond the
+/// portable dispatch limit that the preferred tilings stay within.
 pub(crate) fn select<F: Family>(problem: &F::Problem, target: &F::Target) -> Selection<F> {
     let mut declined = Vec::new();
-    for &variant in F::preferred(target).iter().chain(F::PREFERENCE) {
+    let preferred = F::preferred(target);
+    let rest = F::PREFERENCE.iter().filter(|&&v| Some(v) != preferred);
+    for &variant in preferred.iter().chain(rest) {
         match variant.admits(problem, target) {
             Ok(()) => {
                 if !declined.is_empty() {
