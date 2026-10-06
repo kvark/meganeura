@@ -1,6 +1,7 @@
 //! Lower graph nodes into dispatches.
 
 use super::*;
+use crate::kernels::attention_grad::{self, AttentionGrad, Part};
 
 impl<'a> Compiler<'a> {
     pub(super) fn new_with_options(
@@ -222,30 +223,43 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// Backward attention dispatch — same EPT/TPQ/BQ pattern as the
-    /// forward kernel.
-    pub(super) fn attention_dispatch_bwd(
-        q_seq: u32,
+    /// The attention backward kernel for `part` of `node`, its workgroups
+    /// and the scalar paths' elements per thread. A schedule's per-node cap
+    /// pins a scalar path; otherwise the family picks the preferred kernel
+    /// the target admits.
+    pub(super) fn attention_grad_kernel(
+        &self,
+        node: &Node,
+        part: Part,
+        [rows, other_rows]: [u32; 2],
+        heads: u32,
         head_dim: u32,
-        num_heads: u32,
-        ept_cap: u32,
-    ) -> (ShaderEntry, [u32; 3]) {
-        let (_, tpq) = crate::codegen::attention_lanes(head_dim, ept_cap);
-        let bq = (256 / tpq).max(1);
-        if bq >= 2 && q_seq >= bq {
-            (
-                ShaderEntry::FlashAttention,
-                [q_seq.div_ceil(bq), num_heads, 1],
-            )
-        } else {
-            // The scalar backward kernels give each of their 64 lanes at most
-            // four dimensions.
-            assert!(
-                head_dim <= 256,
-                "scalar attention backward supports heads up to 256 wide, got {head_dim}"
-            );
-            (ShaderEntry::MultiHeadAttn, [q_seq, num_heads, 1])
-        }
+    ) -> (AttentionGrad, [u32; 3], u32) {
+        let knobs = &self.options.knobs;
+        let default_ept = match part {
+            Part::Q => knobs.flash_grad_q_ept_cap,
+            Part::KV => knobs.flash_grad_kv_ept_cap,
+        };
+        let problem = attention_grad::Problem {
+            part,
+            rows,
+            other_rows,
+            heads,
+            head_dim,
+            ept_cap: node.attention_ept_cap.unwrap_or(default_ept),
+            pinned: node.attention_ept_cap.is_some(),
+        };
+        let target = attention_grad::Target {
+            cooperative_f16: self.coop_caps.supports_16x16_f16(),
+            cooperative_f32: self.coop_caps.f32_tile == 8,
+            shared_memory_bytes: self.shared_memory_bytes,
+            // Rounding dO to f16 loses small derivatives, so the f16 path is
+            // an explicit opt-in rather than following from the device
+            // advertising f16 matrices.
+            reduced_precision: self.allow_reduced_precision_attention_backward,
+        };
+        let kernel = AttentionGrad::select(&problem, &target);
+        (kernel, kernel.workgroups(&problem), problem.ept_cap)
     }
 
     pub(super) fn get_buffer(&self, node: NodeId) -> BufferRef {
@@ -630,8 +644,10 @@ impl<'a> Compiler<'a> {
                     )
                 }
                 ShaderEntry::MultiHeadAttn
-                | ShaderEntry::MultiHeadAttnGradQ
-                | ShaderEntry::MultiHeadAttnGradKV => {
+                | ShaderEntry::AttentionGrad(AttentionGrad {
+                    path: attention_grad::Path::Rowwise,
+                    ..
+                }) => {
                     let nh = d.params[2] >> 16;
                     let nkv = d.params[2] & 0xFFFF;
                     format!(
@@ -3255,64 +3271,27 @@ impl<'a> Compiler<'a> {
                     Op::SlidingWindowAttention { window_size, .. } => window_size,
                     _ => 0,
                 };
-                // The cooperative backward path rounds dO to f16 before its
-                // matrix products. Unlike forward activations, small
-                // derivatives can lose material information there, so keep
-                // this experimental path explicit rather than enabling it
-                // merely because the device advertises f16 matrices.
-                let f16_coop_enabled = node.attention_ept_cap.is_none()
-                    && self.allow_reduced_precision_attention_backward
-                    && self.coop_caps.supports_16x16_f16()
-                    && head_dim >= 16
-                    && head_dim.is_multiple_of(16)
-                    && head_dim.is_power_of_two()
-                    && q_seq >= 16
-                    && crate::codegen::attention_coop_shared_bytes(
-                        ShaderGroup::FlashGradQCoopF16,
-                        head_dim,
-                    ) <= u64::from(self.shared_memory_bytes);
-                let ept_cap = node
-                    .attention_ept_cap
-                    .unwrap_or(self.options.knobs.flash_grad_q_ept_cap);
-                let f32_coop_enabled = node.attention_ept_cap.is_none()
-                    && self.coop_caps.f32_tile == 8
-                    && head_dim == 64
-                    && q_seq >= 128
-                    && (is_causal || kv_seq >= 128)
-                    && workgroups_within_portable_limits([q_seq.div_ceil(16), num_heads, 1])
-                    && self.shared_memory_bytes >= crate::codegen::FLASH_GRAD_COOP_F32_SHARED_BYTES;
-                let (grad_q_shader, grad_q_wgs) = if f32_coop_enabled {
-                    (
-                        ShaderEntry::FlashGradQCoopF32,
-                        [q_seq.div_ceil(16), num_heads, 1],
-                    )
-                } else if f16_coop_enabled {
-                    (
-                        ShaderEntry::FlashGradQCoopF16,
-                        [q_seq.div_ceil(16), num_heads, 1],
-                    )
-                } else {
-                    let (raw_shader, wgs) =
-                        Self::attention_dispatch_bwd(q_seq, head_dim, num_heads, ept_cap);
-                    let mapped = match raw_shader {
-                        ShaderEntry::FlashAttention => ShaderEntry::FlashGradQ,
-                        _ => ShaderEntry::MultiHeadAttnGradQ,
-                    };
-                    (mapped, wgs)
-                };
-                let row_source = if grad_q_shader == ShaderEntry::FlashGradQCoopF16 {
-                    fwd_o
-                } else {
+                let dispatch_kv = if is_causal { q_seq } else { kv_seq };
+                let (kernel, workgroups, ept_cap) = self.attention_grad_kernel(
+                    node,
+                    Part::Q,
+                    [q_seq, dispatch_kv],
+                    num_heads,
+                    head_dim,
+                );
+                let row_source = if kernel.reads_row_dot() {
                     self.emit_attention_row_dot(d_out, fwd_o, q_seq * num_heads, head_dim)
+                } else {
+                    fwd_o
                 };
                 self.plan.dispatches.push(Dispatch {
-                    kernel: if grad_q_shader == ShaderEntry::FlashGradQ {
+                    kernel: if kernel.takes_ept_cap() {
                         Kernel::AttentionBackward { ept_cap }
                     } else {
                         Kernel::Default
                     },
-                    shader: grad_q_shader,
-                    workgroups: grad_q_wgs,
+                    shader: ShaderEntry::AttentionGrad(kernel),
+                    workgroups,
                     input_buffers: vec![d_out, q, k, v, lse_buf, row_source],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
@@ -3374,69 +3353,28 @@ impl<'a> Compiler<'a> {
                     head_dim,
                     window_size,
                 ];
-                let ept_cap = node
-                    .attention_ept_cap
-                    .unwrap_or(self.options.knobs.flash_grad_kv_ept_cap);
-                let (grad_kv_shader, grad_kv_wgs) =
-                    Self::attention_dispatch_bwd(dispatch_kv, head_dim, num_kv_heads, ept_cap);
-                // See GradQ above: reduced-input precision in backward is an
-                // experimental opt-in until its error is bounded (or loss
-                // scaling keeps the derivative operands representable).
-                let f16_coop_enabled = node.attention_ept_cap.is_none()
-                    && self.allow_reduced_precision_attention_backward
-                    && self.coop_caps.supports_16x16_f16()
-                    && head_dim >= 16
-                    && head_dim.is_multiple_of(16)
-                    && head_dim.is_power_of_two()
-                    && dispatch_kv >= 16
-                    && crate::codegen::attention_coop_shared_bytes(
-                        ShaderGroup::FlashGradKVCoopF16,
-                        head_dim,
-                    ) <= u64::from(self.shared_memory_bytes);
-                let f32_coop_enabled = node.attention_ept_cap.is_none()
-                    && self.coop_caps.f32_tile == 8
-                    && head_dim == 64
-                    && q_seq >= 128
-                    && dispatch_kv >= 128
-                    && workgroups_within_portable_limits([
-                        dispatch_kv.div_ceil(16),
-                        num_kv_heads,
-                        1,
-                    ])
-                    && self.shared_memory_bytes >= crate::codegen::FLASH_GRAD_COOP_F32_SHARED_BYTES;
-                let (shader, workgroups) = if f32_coop_enabled {
-                    (
-                        ShaderEntry::FlashGradKVCoopF32,
-                        [dispatch_kv.div_ceil(16), num_kv_heads, 1],
-                    )
-                } else if f16_coop_enabled {
-                    (
-                        ShaderEntry::FlashGradKVCoopF16,
-                        [dispatch_kv.div_ceil(16), num_kv_heads, 1],
-                    )
-                } else {
-                    let s = match grad_kv_shader {
-                        ShaderEntry::FlashAttention => ShaderEntry::FlashGradKV,
-                        _ => ShaderEntry::MultiHeadAttnGradKV,
-                    };
-                    (s, grad_kv_wgs)
-                };
-                // The scalar and flash dK/dV kernels need dot(dO, O) for
-                // every query row. Reduce it once here; recomputing it in
-                // every KV workgroup read O and spent a third of the inner
-                // loop's products on it. The cooperative kernel keeps O.
-                let row_source = if shader == ShaderEntry::FlashGradKVCoopF16 {
-                    fwd_o
-                } else {
+                let (kernel, workgroups, ept_cap) = self.attention_grad_kernel(
+                    node,
+                    Part::KV,
+                    [dispatch_kv, q_seq],
+                    num_kv_heads,
+                    head_dim,
+                );
+                // Most dK/dV kernels need dot(dO, O) for every query row.
+                // Reduce it once here; recomputing it in every KV workgroup
+                // read O and spent a third of the inner loop's products on it.
+                let row_source = if kernel.reads_row_dot() {
                     self.emit_attention_row_dot(d_out, fwd_o, q_seq * num_heads, head_dim)
+                } else {
+                    fwd_o
                 };
                 self.plan.dispatches.push(Dispatch {
-                    kernel: if shader == ShaderEntry::FlashGradKV {
+                    kernel: if kernel.takes_ept_cap() {
                         Kernel::AttentionBackward { ept_cap }
                     } else {
                         Kernel::Default
                     },
-                    shader,
+                    shader: ShaderEntry::AttentionGrad(kernel),
                     workgroups,
                     input_buffers: vec![d_out, q, k, v, lse_buf, row_source],
                     output_buffer: out_buf,

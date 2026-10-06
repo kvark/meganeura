@@ -1,5 +1,14 @@
 # Unreleased
 
+- Kernel families (`kernels`): interchangeable implementations of one
+  computation, each declaring what it admits on a target and why it
+  declines, with a fallback that admits every supported problem. Attention
+  backward is the first: `ShaderEntry::AttentionGrad` carries the part
+  (dQ or dK/dV) and path (f32 or f16 cooperative, flash or rowwise) in
+  place of eight entries, and one selector replaces the per-part
+  promotion logic. Profile and pipeline names read
+  `AttentionGrad(dQ-flash)`, `AttentionGrad(dKV-cooperative-f32)` and so
+  on. Plan-cache format 21.
 - Measured training builds explore independent scalar dQ and dK/dV layouts
   through egglog, interleaved with graph alternatives under the existing
   search bounds. Each dispatch and pipeline key retains its extracted EPT

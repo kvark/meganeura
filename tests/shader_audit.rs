@@ -173,6 +173,7 @@ fn adaptive_grad_clip_measures_large_parameters() {
 #[test]
 fn flash_attention_backward_uses_precomputed_row_dots() {
     use meganeura::compile::ShaderEntry;
+    use meganeura::kernels::attention_grad::{AttentionGrad, Operands, Part, Path};
     // (seq, heads, kv_heads, head_dim, causal): 64-wide heads split each KV
     // row across two threads; 32-wide heads give each row one thread.
     for (seq, heads, kv_heads, head_dim, causal) in [
@@ -209,7 +210,10 @@ fn flash_attention_backward_uses_precomputed_row_dots() {
             .find(|d| {
                 matches!(
                     d.shader,
-                    ShaderEntry::FlashGradQ | ShaderEntry::FlashGradQCoopF32
+                    ShaderEntry::AttentionGrad(AttentionGrad {
+                        part: Part::Q,
+                        path: Path::Flash | Path::Cooperative(Operands::F32),
+                    })
                 )
             })
             .unwrap();
@@ -218,7 +222,10 @@ fn flash_attention_backward_uses_precomputed_row_dots() {
             .find(|d| {
                 matches!(
                     d.shader,
-                    ShaderEntry::FlashGradKV | ShaderEntry::FlashGradKVCoopF32
+                    ShaderEntry::AttentionGrad(AttentionGrad {
+                        part: Part::KV,
+                        path: Path::Flash | Path::Cooperative(Operands::F32),
+                    })
                 )
             })
             .unwrap();

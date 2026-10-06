@@ -542,6 +542,7 @@ mod tests {
     #[test]
     fn backward_equalities_keep_masks_and_independent_layouts() {
         use crate::compile::{Kernel, ShaderEntry};
+        use crate::kernels::attention_grad::{AttentionGrad, Part, Path};
         for (queries, keys, window, dim) in [
             (129, 129, 0, 64),
             (129, 129, 19, 64),
@@ -600,8 +601,14 @@ mod tests {
                 assert_eq!(forward(&plan), forward(&ordinary));
                 for dispatch in &plan.dispatches {
                     let index = match dispatch.shader {
-                        ShaderEntry::FlashGradQ => 0,
-                        ShaderEntry::FlashGradKV => 1,
+                        ShaderEntry::AttentionGrad(AttentionGrad {
+                            part: Part::Q,
+                            path: Path::Flash,
+                        }) => 0,
+                        ShaderEntry::AttentionGrad(AttentionGrad {
+                            part: Part::KV,
+                            path: Path::Flash,
+                        }) => 1,
                         _ => continue,
                     };
                     if let Some(ept_cap) = pair[index] {

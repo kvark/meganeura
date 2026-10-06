@@ -10,8 +10,7 @@ use super::{
 pub(crate) fn attention_coop_shared_bytes(group: ShaderGroup, head_dim: u32) -> u64 {
     let (per_dim, fixed) = match group {
         ShaderGroup::FlashAttentionCoop => (128u64, 1024),
-        ShaderGroup::FlashGradQCoopF16 => (192, 3264),
-        ShaderGroup::FlashGradKVCoopF16 => (256, 4544),
+        ShaderGroup::AttentionGrad(kernel) => return kernel.shared_bytes(head_dim),
         _ => unreachable!("shared-memory accounting requires cooperative attention"),
     };
     per_dim * u64::from(head_dim) + fixed

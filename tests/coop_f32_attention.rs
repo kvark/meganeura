@@ -2,6 +2,14 @@
 //! masks and sliding windows. The f64 interpreter checks every gradient.
 use meganeura::{CoopPolicy, Graph, build, compile::ShaderEntry, reference};
 
+use meganeura::kernels::attention_grad::{AttentionGrad, Operands, Part, Path};
+
+const COOP_F32: Path = Path::Cooperative(Operands::F32);
+
+fn grad(part: Part, path: Path) -> ShaderEntry {
+    ShaderEntry::AttentionGrad(AttentionGrad::new(part, path))
+}
+
 fn supported() -> bool {
     let gpu = crate::support::gpu::gpu();
     let caps = gpu.capabilities();
@@ -92,7 +100,7 @@ fn check_case(
             .plan()
             .dispatches
             .iter()
-            .any(|dispatch| dispatch.shader == ShaderEntry::FlashGradKVCoopF32)
+            .any(|dispatch| dispatch.shader == grad(Part::KV, COOP_F32))
     );
     let backward = meganeura::autodiff::differentiate(&graph);
     assert!(
@@ -100,7 +108,7 @@ fn check_case(
             .plan()
             .dispatches
             .iter()
-            .any(|dispatch| dispatch.shader == ShaderEntry::FlashGradQCoopF32)
+            .any(|dispatch| dispatch.shader == grad(Part::Q, COOP_F32))
     );
     for &scale in upstream_scales {
         let weights = values(q_seq * q_width, 0.019, scale);

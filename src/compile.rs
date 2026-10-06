@@ -310,24 +310,8 @@ pub enum ShaderEntry {
     /// `MEGANEURA_FLASH_FWD_COOP=0`.
     /// BQ=BKV=16, dispatched as `[ceil(q_seq/16), num_heads, 1]`.
     FlashAttentionCoop,
-    /// F16-input cooperative products for score=Q·K^T and dp=dO·V^T,
-    /// with scalar f32 dQ+=ds·K accumulation. Opt-in via
-    /// `MEGANEURA_FLASH_BWD_COOP=1`. BQ=BKV=16,
-    /// dispatched as `[ceil(q_seq/16), num_heads, 1]`.
-    FlashGradQCoopF16,
-    /// F16-input cooperative flash backward dK + dV kernel (fused).
-    /// Two coop matmuls per Q-tile: score = K·Q^T, dp = V·dO^T.
-    /// dV/dK accumulate per-thread. Dispatched as
-    /// `[ceil(dispatch_kv/16), num_kv_heads, 1]`.
-    FlashGradKVCoopF16,
-    /// F32 cooperative dK/dV, 16 keys per tile, specialized for 64-wide heads.
-    FlashGradKVCoopF32,
-    /// F32 cooperative dQ, 16 queries per tile, specialized for 64-wide heads.
-    FlashGradQCoopF32,
-    MultiHeadAttnGradQ,
-    FlashGradQ,
-    MultiHeadAttnGradKV,
-    FlashGradKV,
+    /// Attention backward; the kernel family says which part and path.
+    AttentionGrad(crate::kernels::attention_grad::AttentionGrad),
     SwiGLUGradGate,
     SwiGLUGradUp,
     SiluGrad,
@@ -456,14 +440,7 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttn
             | ShaderEntry::FlashAttention
             | ShaderEntry::FlashAttentionCoop
-            | ShaderEntry::FlashGradQCoopF16
-            | ShaderEntry::FlashGradKVCoopF16
-            | ShaderEntry::FlashGradKVCoopF32
-            | ShaderEntry::FlashGradQCoopF32
-            | ShaderEntry::MultiHeadAttnGradQ
-            | ShaderEntry::FlashGradQ
-            | ShaderEntry::MultiHeadAttnGradKV
-            | ShaderEntry::FlashGradKV
+            | ShaderEntry::AttentionGrad(_)
             | ShaderEntry::CachedAttention
             | ShaderEntry::BiasedAttention
             | ShaderEntry::CachedQueryAttention
@@ -612,14 +589,7 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttn => ShaderGroup::MultiHeadAttn,
             ShaderEntry::FlashAttention => ShaderGroup::FlashAttention,
             ShaderEntry::FlashAttentionCoop => ShaderGroup::FlashAttentionCoop,
-            ShaderEntry::FlashGradQCoopF16 => ShaderGroup::FlashGradQCoopF16,
-            ShaderEntry::FlashGradKVCoopF16 => ShaderGroup::FlashGradKVCoopF16,
-            ShaderEntry::FlashGradKVCoopF32 => ShaderGroup::FlashGradKVCoopF32,
-            ShaderEntry::FlashGradQCoopF32 => ShaderGroup::FlashGradQCoopF32,
-            ShaderEntry::MultiHeadAttnGradQ => ShaderGroup::MultiHeadAttnGradQ,
-            ShaderEntry::FlashGradQ => ShaderGroup::FlashGradQ,
-            ShaderEntry::MultiHeadAttnGradKV => ShaderGroup::MultiHeadAttnGradKV,
-            ShaderEntry::FlashGradKV => ShaderGroup::FlashGradKV,
+            ShaderEntry::AttentionGrad(kernel) => ShaderGroup::AttentionGrad(kernel),
             ShaderEntry::SwiGLUGradGate | ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => {
                 ShaderGroup::SwiGLUGrad
             }
@@ -728,14 +698,7 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttn
             | ShaderEntry::FlashAttention
             | ShaderEntry::FlashAttentionCoop
-            | ShaderEntry::MultiHeadAttnGradQ
-            | ShaderEntry::FlashGradQ
-            | ShaderEntry::FlashGradQCoopF16
-            | ShaderEntry::MultiHeadAttnGradKV
-            | ShaderEntry::FlashGradKV
-            | ShaderEntry::FlashGradKVCoopF16
-            | ShaderEntry::FlashGradQCoopF32
-            | ShaderEntry::FlashGradKVCoopF32 => "main",
+            | ShaderEntry::AttentionGrad(_) => "main",
             ShaderEntry::SwiGLUGradGate => "swiglu_grad_gate",
             ShaderEntry::SwiGLUGradUp => "swiglu_grad_up",
             ShaderEntry::SiluGrad => "silu_grad",
@@ -3071,6 +3034,14 @@ mod emit;
 mod tests {
     use super::*;
     use crate::graph::Graph;
+    use crate::kernels::attention_grad::{self, AttentionGrad, Operands, Part, Path};
+
+    const COOP_F16: Path = Path::Cooperative(Operands::F16);
+    const COOP_F32: Path = Path::Cooperative(Operands::F32);
+
+    fn grad(part: Part, path: Path) -> ShaderEntry {
+        ShaderEntry::AttentionGrad(AttentionGrad::new(part, path))
+    }
 
     /// `Dispatch::mnk` must agree with the order each contraction shader's
     /// constructor writes into `params`.
@@ -4373,17 +4344,30 @@ mod tests {
                     assert_eq!(fwd_wg[0], 256u32.div_ceil(fwd_bq));
                 }
             }
-            let (grad_q_entry, grad_q_wg) =
-                Compiler::attention_dispatch_bwd(256, hd, 1, grad_q_ept);
-            let (grad_kv_entry, grad_kv_wg) =
-                Compiler::attention_dispatch_bwd(256, hd, 1, grad_kv_ept);
-            if grad_q_bq >= 2 {
-                assert_eq!(grad_q_entry, ShaderEntry::FlashAttention);
-                assert_eq!(grad_q_wg[0], 256u32.div_ceil(grad_q_bq));
-            }
-            if grad_kv_bq >= 2 {
-                assert_eq!(grad_kv_entry, ShaderEntry::FlashAttention);
-                assert_eq!(grad_kv_wg[0], 256u32.div_ceil(grad_kv_bq));
+            let scalar = attention_grad::Target {
+                cooperative_f16: false,
+                cooperative_f32: false,
+                shared_memory_bytes: 0,
+                reduced_precision: false,
+            };
+            for (part, ept_cap, bq) in [
+                (Part::Q, grad_q_ept, grad_q_bq),
+                (Part::KV, grad_kv_ept, grad_kv_bq),
+            ] {
+                let problem = attention_grad::Problem {
+                    part,
+                    rows: 256,
+                    other_rows: 256,
+                    heads: 1,
+                    head_dim: hd,
+                    ept_cap,
+                    pinned: false,
+                };
+                let kernel = AttentionGrad::select(&problem, &scalar);
+                if bq >= 2 {
+                    assert_eq!(kernel.path, Path::Flash);
+                    assert_eq!(kernel.workgroups(&problem)[0], 256u32.div_ceil(bq));
+                }
             }
         }
     }
@@ -4419,8 +4403,8 @@ mod tests {
             .map(|dispatch| dispatch.shader.clone())
             .collect();
         assert!(safe_entries.contains(&ShaderEntry::FlashAttentionCoop));
-        assert!(!safe_entries.contains(&ShaderEntry::FlashGradQCoopF16));
-        assert!(!safe_entries.contains(&ShaderEntry::FlashGradKVCoopF16));
+        assert!(!safe_entries.contains(&grad(Part::Q, COOP_F16)));
+        assert!(!safe_entries.contains(&grad(Part::KV, COOP_F16)));
 
         let experimental = compile_with_caps_policy(
             &differentiated,
@@ -4434,8 +4418,8 @@ mod tests {
             .iter()
             .map(|dispatch| dispatch.shader.clone())
             .collect();
-        assert!(experimental_entries.contains(&ShaderEntry::FlashGradQCoopF16));
-        assert!(experimental_entries.contains(&ShaderEntry::FlashGradKVCoopF16));
+        assert!(experimental_entries.contains(&grad(Part::Q, COOP_F16)));
+        assert!(experimental_entries.contains(&grad(Part::KV, COOP_F16)));
 
         g.nodes_mut()[attention as usize].requires_full_precision = true;
         let full =
@@ -4461,8 +4445,7 @@ mod tests {
         assert!(scalar.dispatches.iter().all(|dispatch| !matches!(
             &dispatch.shader,
             ShaderEntry::FlashAttentionCoop
-                | ShaderEntry::FlashGradQCoopF16
-                | ShaderEntry::FlashGradKVCoopF16
+                | ShaderEntry::AttentionGrad(AttentionGrad { path: COOP_F16, .. })
         )));
     }
 
@@ -4495,12 +4478,12 @@ mod tests {
         assert!(
             plan.dispatches
                 .iter()
-                .any(|dispatch| dispatch.shader == ShaderEntry::FlashGradKVCoopF16)
+                .any(|dispatch| dispatch.shader == grad(Part::KV, COOP_F16))
         );
         assert!(
             plan.dispatches
                 .iter()
-                .all(|dispatch| { dispatch.shader != ShaderEntry::MultiHeadAttnGradKV })
+                .all(|dispatch| { dispatch.shader != grad(Part::KV, Path::Rowwise) })
         );
     }
 
@@ -4537,8 +4520,8 @@ mod tests {
                 bytes,
             );
             for (shader, expected) in [
-                (ShaderEntry::FlashGradQCoopF32, expected[0]),
-                (ShaderEntry::FlashGradKVCoopF32, expected[1]),
+                (grad(Part::Q, COOP_F32), expected[0]),
+                (grad(Part::KV, COOP_F32), expected[1]),
             ] {
                 assert_eq!(
                     plan.dispatches
@@ -4579,15 +4562,11 @@ mod tests {
                 32_768,
             );
             for (cap, cooperative, scalar) in [
-                (
-                    q_cap,
-                    ShaderEntry::FlashGradQCoopF32,
-                    ShaderEntry::FlashGradQ,
-                ),
+                (q_cap, grad(Part::Q, COOP_F32), grad(Part::Q, Path::Flash)),
                 (
                     kv_cap,
-                    ShaderEntry::FlashGradKVCoopF32,
-                    ShaderEntry::FlashGradKV,
+                    grad(Part::KV, COOP_F32),
+                    grad(Part::KV, Path::Flash),
                 ),
             ] {
                 let dispatch = plan
@@ -4638,8 +4617,8 @@ mod tests {
             let plan = compile_with_caps(&differentiated, &options, caps, bytes);
             for (shader, wanted) in [
                 ShaderEntry::FlashAttentionCoop,
-                ShaderEntry::FlashGradQCoopF16,
-                ShaderEntry::FlashGradKVCoopF16,
+                grad(Part::Q, COOP_F16),
+                grad(Part::KV, COOP_F16),
             ]
             .into_iter()
             .zip(expected)

@@ -21,6 +21,7 @@ pub mod data;
 mod divisor;
 pub mod eager;
 pub mod graph;
+pub mod kernels;
 pub mod load;
 #[doc(hidden)]
 pub mod memplan;

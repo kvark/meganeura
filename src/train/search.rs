@@ -652,7 +652,7 @@ mod tests {
                     session
                         .dispatch_pipeline_keys()
                         .into_iter()
-                        .filter(|key| key.contains("FlashGrad")),
+                        .filter(|key| key.contains("-flash)")),
                 );
                 for (index, &id) in full.outputs().iter().enumerate() {
                     let want = &values[id as usize].data;
@@ -689,7 +689,7 @@ mod tests {
                 .iter()
                 .any(|trial| trial.description.starts_with("graph=1,"))
         );
-        for name in ["FlashGradQ", "FlashGradKV"] {
+        for name in ["AttentionGrad(dQ-flash)", "AttentionGrad(dKV-flash)"] {
             assert!(
                 observed
                     .iter()

@@ -18,6 +18,7 @@ use std::process::Command;
 
 use meganeura::codegen::{CoopConfig, ShaderGroup, ShaderModule};
 use meganeura::compile::ShaderEntry;
+use meganeura::kernels::attention_grad::{AttentionGrad, Part, Path};
 
 fn analyze_spirv(name: &str, module: &naga::Module, dump: bool) {
     let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
@@ -361,7 +362,7 @@ fn main() {
         analyze(
             "flash_grad_q_hd64",
             &sm_gq,
-            &ShaderEntry::FlashGradQ,
+            &ShaderEntry::AttentionGrad(AttentionGrad::new(Part::Q, Path::Flash)),
             dump,
             gpu_ref,
         );
@@ -373,7 +374,7 @@ fn main() {
         analyze(
             "flash_grad_kv_hd64",
             &sm_gkv,
-            &ShaderEntry::FlashGradKV,
+            &ShaderEntry::AttentionGrad(AttentionGrad::new(Part::KV, Path::Flash)),
             dump,
             gpu_ref,
         );
