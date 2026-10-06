@@ -82,6 +82,7 @@ impl Graph {
                 let new = &mut out.nodes[id as usize];
                 new.name.clone_from(&node.name);
                 new.matmul_impl = node.matmul_impl;
+                new.attention_ept_cap = node.attention_ept_cap;
                 id
             };
             map.push(id);

@@ -20,6 +20,12 @@ For the later NVIDIA/Intel attention, matrix and e-graph investigation, see
 [GPU gap, September 21](gpu-gap-2026-09.md). Reproducers remain on its experiment
 branch; the proposed production changes contain no raw sweep or trace archives.
 
+The [October 5 Intel follow-up](gpu-gap-2026-10.md) profiles the current code,
+batches scalar attention-gradient reductions, and retains repeated comparisons
+on Arc B570 and RTX 5070. Its results are separate from the paper cohort.
+The October 6 continuation adds egglog backward-layout exploration and checks
+its coverage within the existing 60-second training search budget.
+
 ## Compiler stages — September 10
 
 Source: `experiment/compiler-stages-2026-09-10` in

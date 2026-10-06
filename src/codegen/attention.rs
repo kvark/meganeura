@@ -323,6 +323,11 @@ fn generate_coop_attention(template: &str, head_dim: u32, hint: &'static str) ->
     attention_module(source, hint)
 }
 
+fn backward_attention_tile(head_dim: u32, threads: u32) -> u32 {
+    // Budget 16 KiB for two input tiles and two partial-dot arrays.
+    (2048 / (head_dim + threads)).clamp(1, 4)
+}
+
 /// dQ stages K/V tiles; multi-lane queries also reduce partial dot products.
 pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule {
     let (ept, tpq) = attention_lanes(head_dim, ept_cap);
@@ -330,8 +335,12 @@ pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule
     if bq <= 1 {
         return ShaderModule::new(include_str!("../shaders/mha_grad_q.wgsl"));
     }
-    let bkv = if tpq == 1 { 8 } else { 1 };
     let threads = bq * tpq;
+    let bkv = if tpq == 1 {
+        8
+    } else {
+        backward_attention_tile(head_dim, threads)
+    };
     let template = include_str!("../shaders/flash_grad_q.wgsl");
     let fragment = |name| template_section(template, name);
     let elements = |name| unroll_elements(fragment(name), ept, 1);
@@ -366,10 +375,8 @@ pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule
             ("$TILE_ACCUMULATE", &elements("tile_accumulate")),
             ("$TAIL_DOT", &elements("tail_dot")),
             ("$TAIL_ACCUMULATE", &elements("tail_accumulate")),
-            ("$KV_LOAD", &elements("kv_load")),
-            ("$DOT", &elements("dot")),
-            ("$ACCUMULATE", &elements("accumulate")),
             ("$STORE", &elements("store")),
+            ("$GROUP_ELEMENTS", &(bkv * threads).to_string()),
             ("$TILE_ELEMENTS", &(bkv * head_dim).to_string()),
             ("$HEAD_DIM", &head_dim.to_string()),
             ("$THREADS", &threads.to_string()),
@@ -382,7 +389,7 @@ pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule
     attention_module(source, "flash_grad_q")
 }
 
-/// dK/dV loads Q/dO directly for single-lane heads, or stages them for grouped reductions.
+/// dK/dV batches Q/dO rows for grouped reductions; single-lane heads load directly.
 pub fn generate_flash_grad_kv_module(head_dim: u32, ept_cap: u32) -> ShaderModule {
     let (ept, tpq) = attention_lanes(head_dim, ept_cap);
     let bkv = (256 / tpq).max(1);
@@ -392,10 +399,20 @@ pub fn generate_flash_grad_kv_module(head_dim: u32, ept_cap: u32) -> ShaderModul
     let template = include_str!("../shaders/flash_grad_kv.wgsl");
     let fragment = |name| template_section(template, name);
     let elements = |name| unroll_elements(fragment(name), ept, 1);
+    let query_tile = backward_attention_tile(head_dim, bkv * tpq);
     let source = preprocess(
         fragment("main"),
         &[
             ("$PARAMS", ATTENTION_PARAMS_WGSL),
+            (
+                "$QUERY_LOOP",
+                fragment(if tpq > 1 {
+                    "tiled_query_loop"
+                } else {
+                    "direct_query_loop"
+                }),
+            ),
+            ("$TILE_Q_LOAD", &elements("tile_q_load")),
             ("$SHARED", if tpq > 1 { fragment("shared") } else { "" }),
             (
                 "$REDUCTION",
@@ -408,29 +425,14 @@ pub fn generate_flash_grad_kv_module(head_dim: u32, ept_cap: u32) -> ShaderModul
             ("$KV_INIT", &elements("kv_init")),
             ("$KV_LOAD", &elements("kv_load")),
             ("$GRAD_INIT", &elements("grad_init")),
-            (
-                "$Q_LOAD",
-                &if tpq == 1 {
-                    elements("q_load_direct")
-                } else {
-                    preprocess(
-                        fragment("q_stage"),
-                        &[("$Q_REGISTERS", &elements("q_load_shared"))],
-                    )
-                },
-            ),
+            ("$Q_LOAD", &elements("q_load_direct")),
             ("$DOT", &elements("dot")),
-            (
-                "$SCORE",
-                fragment(if tpq > 1 {
-                    "grouped_score"
-                } else {
-                    "direct_score"
-                }),
-            ),
+            ("$SCORE", fragment("direct_score")),
             ("$ACCUMULATE", &elements("accumulate")),
-            ("$BARRIER", if tpq > 1 { fragment("barrier") } else { "" }),
             ("$STORE", &elements("store")),
+            ("$QUERY_TILE", &query_tile.to_string()),
+            ("$QUERY_ELEMENTS", &(query_tile * head_dim).to_string()),
+            ("$GROUP_ELEMENTS", &(query_tile * bkv * tpq).to_string()),
             ("$HEAD_DIM", &head_dim.to_string()),
             ("$THREADS", &(bkv * tpq).to_string()),
             ("$EPT", &ept.to_string()),

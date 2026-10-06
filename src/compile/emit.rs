@@ -3260,7 +3260,8 @@ impl<'a> Compiler<'a> {
                 // derivatives can lose material information there, so keep
                 // this experimental path explicit rather than enabling it
                 // merely because the device advertises f16 matrices.
-                let bwd_coop_enabled = self.allow_reduced_precision_attention_backward
+                let bwd_coop_enabled = node.attention_ept_cap.is_none()
+                    && self.allow_reduced_precision_attention_backward
                     && self.coop_caps.supports_16x16_f16()
                     && head_dim >= 16
                     && head_dim.is_multiple_of(16)
@@ -3270,18 +3271,17 @@ impl<'a> Compiler<'a> {
                         ShaderGroup::FlashGradQCoop,
                         head_dim,
                     ) <= u64::from(self.shared_memory_bytes);
+                let ept_cap = node
+                    .attention_ept_cap
+                    .unwrap_or(self.options.knobs.flash_grad_q_ept_cap);
                 let (grad_q_shader, grad_q_wgs) = if bwd_coop_enabled {
                     (
                         ShaderEntry::FlashGradQCoop,
                         [q_seq.div_ceil(16), num_heads, 1],
                     )
                 } else {
-                    let (raw_shader, wgs) = Self::attention_dispatch_bwd(
-                        q_seq,
-                        head_dim,
-                        num_heads,
-                        self.options.knobs.flash_grad_q_ept_cap,
-                    );
+                    let (raw_shader, wgs) =
+                        Self::attention_dispatch_bwd(q_seq, head_dim, num_heads, ept_cap);
                     let mapped = match raw_shader {
                         ShaderEntry::FlashAttention => ShaderEntry::FlashGradQ,
                         _ => ShaderEntry::MultiHeadAttnGradQ,
@@ -3294,6 +3294,11 @@ impl<'a> Compiler<'a> {
                     self.emit_attention_row_dot(d_out, fwd_o, q_seq * num_heads, head_dim)
                 };
                 self.plan.dispatches.push(Dispatch {
+                    kernel: if grad_q_shader == ShaderEntry::FlashGradQ {
+                        Kernel::AttentionBackward { ept_cap }
+                    } else {
+                        Kernel::Default
+                    },
                     shader: grad_q_shader,
                     workgroups: grad_q_wgs,
                     input_buffers: vec![d_out, q, k, v, lse_buf, row_source],
@@ -3357,16 +3362,16 @@ impl<'a> Compiler<'a> {
                     head_dim,
                     window_size,
                 ];
-                let (grad_kv_shader, grad_kv_wgs) = Self::attention_dispatch_bwd(
-                    dispatch_kv,
-                    head_dim,
-                    num_kv_heads,
-                    self.options.knobs.flash_grad_kv_ept_cap,
-                );
+                let ept_cap = node
+                    .attention_ept_cap
+                    .unwrap_or(self.options.knobs.flash_grad_kv_ept_cap);
+                let (grad_kv_shader, grad_kv_wgs) =
+                    Self::attention_dispatch_bwd(dispatch_kv, head_dim, num_kv_heads, ept_cap);
                 // See GradQ above: reduced-input precision in backward is an
                 // experimental opt-in until its error is bounded (or loss
                 // scaling keeps the derivative operands representable).
-                let bwd_coop_enabled = self.allow_reduced_precision_attention_backward
+                let bwd_coop_enabled = node.attention_ept_cap.is_none()
+                    && self.allow_reduced_precision_attention_backward
                     && self.coop_caps.supports_16x16_f16()
                     && head_dim >= 16
                     && head_dim.is_multiple_of(16)
@@ -3398,6 +3403,11 @@ impl<'a> Compiler<'a> {
                     self.emit_attention_row_dot(d_out, fwd_o, q_seq * num_heads, head_dim)
                 };
                 self.plan.dispatches.push(Dispatch {
+                    kernel: if shader == ShaderEntry::FlashGradKV {
+                        Kernel::AttentionBackward { ept_cap }
+                    } else {
+                        Kernel::Default
+                    },
                     shader,
                     workgroups,
                     input_buffers: vec![d_out, q, k, v, lse_buf, row_source],

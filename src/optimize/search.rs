@@ -106,7 +106,9 @@ impl CostModel<Cost> for Excluding {
                     .is_ok(),
             ),
             estimate: self.costs.enode_cost(egraph, func, enode),
-            unscheduled: usize::from(super::matrix_family(func.name()) == Some(func.name())),
+            unscheduled: usize::from(
+                super::implementation_family(func.name()) == Some(func.name()),
+            ),
         }
     }
 }
@@ -254,6 +256,39 @@ pub(crate) fn repeated_candidates(
     )
 }
 
+/// Search derivative layouts after differentiation. Forward values and mask
+/// metadata stay opaque; dQ and dK/dV are separate implementation families.
+pub(crate) fn backward_candidates(
+    graph: &Graph,
+    config: super::OptimizeConfig,
+    limit: usize,
+) -> Result<SearchSpace, String> {
+    let ids: Vec<_> = graph
+        .nodes()
+        .iter()
+        .filter(|node| super::attention_gradient_constructor(&node.op).is_some())
+        .map(|node| node.id as usize)
+        .collect();
+    if ids.is_empty() || limit == 0 {
+        return Ok(SearchSpace {
+            candidates: Vec::new(),
+            truncated: false,
+        });
+    }
+    if ids.len() > config.saturation_cutoff.min(super::SATURATION_CUTOFF) {
+        return Err("attention gradients exceed a bounded region".into());
+    }
+    segment_candidates(
+        graph,
+        Segment {
+            ids,
+            shifts: vec![0],
+        },
+        config,
+        limit,
+    )
+}
+
 fn segment_candidates(
     graph: &Graph,
     segment: Segment,
@@ -366,7 +401,7 @@ fn segment_candidates(
         }
         let mut branches = Vec::new();
         let mut sites = Vec::new();
-        let mut schedule = Vec::new();
+        let mut schedules_by_family = BTreeMap::<&str, Vec<Edge>>::new();
         let mut families = BTreeMap::<String, Vec<Edge>>::new();
         for (value, edge) in edges(&egraph, &terms, term)? {
             let branching = *choices.entry(value).or_insert_with(|| {
@@ -378,14 +413,17 @@ fn segment_candidates(
             if !branching {
                 continue;
             }
-            if let Some(logical) = super::matrix_family(&edge.head) {
+            if let Some(logical) = super::implementation_family(&edge.head) {
                 if edge.head != logical {
-                    schedule.push(edge.clone());
+                    let axis = super::attention_gradient_family(&edge.head).unwrap_or("matrix");
+                    schedules_by_family
+                        .entry(axis)
+                        .or_default()
+                        .push(edge.clone());
                 }
                 let family: Vec<_> = std::iter::once(logical)
                     .chain(
-                        super::matrix_constructors()
-                            .iter()
+                        super::implementation_constructors()
                             .filter(|entry| entry.1 == logical)
                             .map(|entry| entry.0.as_str()),
                     )
@@ -415,7 +453,7 @@ fn segment_candidates(
             .chain(sites)
             .chain(branches.into_iter().map(|edge| vec![edge]))
             .map(|edges| (false, edges))
-            .chain((!schedule.is_empty()).then_some((true, schedule)));
+            .chain(schedules_by_family.into_values().map(|edges| (true, edges)));
         for (is_schedule, excluded) in exclusions {
             let mut next = forbidden.to_vec();
             next.extend(excluded);
@@ -499,6 +537,96 @@ mod tests {
                     matches!(child.op, Op::MatMul) && child.matmul_impl.is_some() == scheduled
                 })
         })
+    }
+
+    #[test]
+    fn backward_equalities_keep_masks_and_independent_layouts() {
+        use crate::compile::{Kernel, ShaderEntry};
+        for (queries, keys, window, dim) in [
+            (129, 129, 0, 64),
+            (129, 129, 19, 64),
+            (17, 65, 0, 64),
+            (16, 16, 0, 512),
+            (8, 8, 0, 1024),
+        ] {
+            let mut graph = Graph::new();
+            let q = graph.parameter("q", &[queries, 3 * dim as usize]);
+            let k = graph.parameter("k", &[keys, dim as usize]);
+            let v = graph.parameter("v", &[keys, dim as usize]);
+            let y = if queries != keys {
+                graph.multi_head_attn(q, k, v, 3, 1, dim, true)
+            } else if window != 0 {
+                graph.sliding_window_attention(q, k, v, 3, 1, dim, window)
+            } else {
+                graph.causal_attention(q, k, v, 3, 1, dim)
+            };
+            let loss = graph.mean_all(y);
+            graph.set_outputs(vec![loss]);
+            let full = crate::autodiff::differentiate(&graph).into_toposort();
+            let ordinary = crate::compile::compile(&full);
+            let space = super::backward_candidates(&full, Default::default(), 16).unwrap();
+            assert!(!space.candidates.is_empty() && space.candidates.len() <= 16);
+            let mut layouts = std::collections::HashSet::new();
+            for form in space.candidates {
+                let mut pair = [None; 2];
+                for node in form.graph.nodes() {
+                    let (index, fwd_node) = match node.op {
+                        Op::MultiHeadAttnGradQ { fwd_node, .. } => (0, fwd_node),
+                        Op::MultiHeadAttnGradK { fwd_node, .. } => (1, fwd_node),
+                        _ => continue,
+                    };
+                    pair[index] = node.attention_ept_cap;
+                    assert_eq!(
+                        crate::graph::key::structural_key(&form.graph.node(fwd_node).op),
+                        crate::graph::key::structural_key(&graph.node(y).op),
+                    );
+                }
+                layouts.insert(pair);
+                let plan = crate::compile::compile(&form.graph);
+                let forward = |plan: &crate::compile::ExecutionPlan| {
+                    plan.dispatches
+                        .iter()
+                        .filter(|d| d.shader.is_attention())
+                        .map(|d| {
+                            (
+                                d.shader.clone(),
+                                d.params.clone(),
+                                d.workgroups,
+                                d.kernel.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(forward(&plan), forward(&ordinary));
+                for dispatch in &plan.dispatches {
+                    let index = match dispatch.shader {
+                        ShaderEntry::FlashGradQ => 0,
+                        ShaderEntry::FlashGradKV => 1,
+                        _ => continue,
+                    };
+                    if let Some(ept_cap) = pair[index] {
+                        assert_eq!(dispatch.kernel, Kernel::AttentionBackward { ept_cap });
+                    }
+                    assert_eq!(dispatch.params[4], window);
+                }
+            }
+            if dim < 1024 {
+                assert!(layouts.contains(&[Some(4), Some(4)]), "{layouts:?}");
+            }
+            assert!(layouts.iter().any(|pair| pair[0] != pair[1]), "{layouts:?}");
+            for index in 0..2 {
+                assert!(
+                    layouts.iter().any(|pair| pair[index] == Some(8)),
+                    "{layouts:?}"
+                );
+            }
+            assert!(
+                crate::optimize::optimize(&full)
+                    .nodes()
+                    .iter()
+                    .all(|node| node.attention_ept_cap.is_none())
+            );
+        }
     }
 
     #[test]
