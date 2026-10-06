@@ -1996,14 +1996,9 @@ pub(crate) fn select_variants(
                 }
             }
             let group = dispatch.shader.shader_group();
-            // Extract (m, n, k, batch) from dispatch params based on shader group.
+            // Extract (m, n, k, batch) from dispatch params based on shader
+            // group. Dense products are the matmul family's, below.
             let (m, n, k, batch) = match group {
-                ShaderGroup::MatMul | ShaderGroup::MatMulAdd => (
-                    dispatch.params[0],
-                    dispatch.params[2],
-                    dispatch.params[1],
-                    1u32,
-                ),
                 ShaderGroup::Conv2dGemm => {
                     // Forward: C[Co, oH*oW] = W[Co, K] × im2col[K, oH*oW]
                     // params: [batch, in_channels, in_h, in_w, out_channels, kernel_h, kernel_w, stride, padding_h, out_h, out_w, padding_w]
@@ -2025,22 +2020,9 @@ pub(crate) fn select_variants(
                     let kw = dispatch.params[6];
                     (in_ch, in_h * in_w, out_ch * kh * kw, dispatch.params[0])
                 }
-                ShaderGroup::MatMulAT | ShaderGroup::MatMulBT => (
-                    dispatch.params[0],
-                    dispatch.params[1],
-                    dispatch.params[2],
-                    1u32,
-                ),
                 _ => continue,
             };
-            let output_tile = if matches!(
-                group,
-                ShaderGroup::Conv2dGemm | ShaderGroup::Conv2dGradInputGemm
-            ) {
-                config.output_tile()
-            } else {
-                config.matmul_output_tile()
-            };
+            let output_tile = config.output_tile();
             if f32_8x8_coop && matches!(group, ShaderGroup::Conv2dGemm) {
                 continue;
             }
@@ -2087,15 +2069,8 @@ pub(crate) fn select_variants(
             //
             // Generated f32 grad-input kernels use bounds-checked stores
             // and do not need this direct-store alignment gate.
-            let store_ok = n.is_multiple_of(16)
-                && (!matches!(
-                    group,
-                    ShaderGroup::Conv2dGemm | ShaderGroup::Conv2dGradInputGemm
-                ) || batch == 1
-                    || m.is_multiple_of(output_tile));
+            let store_ok = n.is_multiple_of(16) && (batch == 1 || m.is_multiple_of(output_tile));
             let vec4_ok = match group {
-                ShaderGroup::MatMulBT => store_ok,
-                ShaderGroup::MatMulAT => store_ok,
                 ShaderGroup::Conv2dGradInputGemm => {
                     // Generated f32 grad-input kernels stage a partial
                     // right-edge tile through shared memory for
@@ -2103,9 +2078,7 @@ pub(crate) fn select_variants(
                     // direct-store alignment gate.
                     (!config.use_f16_input || store_ok) && k >= 4
                 }
-                ShaderGroup::Conv2dGemm => store_ok && k >= 4,
-                ShaderGroup::MatMul | ShaderGroup::MatMulAdd => store_ok && k >= 4,
-                _ => true,
+                _ => store_ok && k >= 4,
             };
             if coop_wgs >= u64::from(min_wgs)
                 && !dispatch.weight_format.uses_reduced_storage()
@@ -2127,24 +2100,15 @@ pub(crate) fn select_variants(
                 dispatch.workgroups = coop_grid;
                 // Direct cooperative stores cover complete sub-tiles.
                 // Reserve full output tiles for any bottom-edge writes.
-                let buf_idx = dispatch.output_buffer.0 as usize;
-                if plan.buffers[buf_idx] < padded_bytes {
-                    plan.buffers[buf_idx] = padded_bytes;
-                }
-                // F32 8x8 dense matrices stage addends through checked
-                // loads. In particular, external inputs retain their logical
-                // upload size. Older direct cooperative loads need padding.
-                if dispatch.input_buffers.len() > 2
-                    && !(f32_8x8_coop && matches!(group, ShaderGroup::MatMulAdd))
-                {
-                    let src_idx = dispatch.input_buffers[2].0 as usize;
-                    if plan.buffers[src_idx] < padded_bytes {
-                        plan.buffers[src_idx] = padded_bytes;
-                    }
+                pad_buffer(&mut plan.buffers, dispatch.output_buffer, padded_bytes);
+                if dispatch.input_buffers.len() > 2 {
+                    pad_buffer(&mut plan.buffers, dispatch.input_buffers[2], padded_bytes);
                 }
             }
         }
     }
+
+    select_matmul_paths(plan, coop_config, allow_raw_f16);
 
     // Apply RmsNorm+MatMul prologue fusion only after per-dispatch coop
     // selection. A coop-capable device can still route small matmuls to a
@@ -2158,42 +2122,56 @@ pub(crate) fn select_variants(
         crate::compile::fuse_rmsnorm_into_add(plan);
         crate::compile::fuse_rmsnorm_into_gemv(plan);
     }
+}
 
-    // Small-tile selection: use 32×32 tiles when the 64×64 dispatch
-    // produces very few workgroups (< 16). The 4× more workgroups from
-    // smaller tiles improve occupancy on GPUs with many SMs.
-    {
-        use crate::codegen::ShaderGroup;
-        for dispatch in plan.dispatches.iter_mut() {
-            if dispatch.use_coop()
-                || dispatch.use_small_tiles()
-                || dispatch.scalar_matmul().is_some()
-                || matches!(dispatch.kernel, crate::compile::Kernel::SplitMatmul { .. })
-                || dispatch.weight_format.uses_reduced_storage()
-            {
-                continue;
+/// Pick each dense product's path from its kernel family, and size its
+/// workgroups and buffers for it.
+fn select_matmul_paths(
+    plan: &mut ExecutionPlan,
+    coop_config: Option<&crate::codegen::CoopConfig>,
+    allow_raw_f16: bool,
+) {
+    use crate::kernels::matmul;
+    let target = matmul::Target {
+        cooperative: coop_config.copied(),
+        allow_raw_f16,
+    };
+    for index in 0..plan.dispatches.len() {
+        let Some(problem) = matmul::Problem::of(&plan.dispatches[index]) else {
+            continue;
+        };
+        match matmul::select(&problem, &target) {
+            matmul::Path::Cooperative => {
+                let config = coop_config.expect("cooperative paths need a configuration");
+                let geometry = matmul::cooperative_geometry(&problem, config)
+                    .expect("an admitted cooperative product is legal");
+                let dispatch = &mut plan.dispatches[index];
+                dispatch.kernel = crate::compile::Kernel::Cooperative;
+                dispatch.workgroups = geometry.grid;
+                pad_buffer(
+                    &mut plan.buffers,
+                    dispatch.output_buffer,
+                    geometry.output_bytes,
+                );
+                if geometry.pad_addend {
+                    let addend = dispatch.input_buffers[2];
+                    pad_buffer(&mut plan.buffers, addend, geometry.output_bytes);
+                }
             }
-            let group = dispatch.shader.shader_group();
-            let wgs_64: u32 = dispatch.workgroups.iter().product();
-            let has_small = matches!(
-                group,
-                ShaderGroup::MatMul
-                    | ShaderGroup::MatMulAdd
-                    | ShaderGroup::MatMulAT
-                    | ShaderGroup::MatMulBT
-            );
-            if has_small && wgs_64 < 16 {
+            matmul::Path::SmallTile => {
+                let dispatch = &mut plan.dispatches[index];
                 dispatch.kernel = crate::compile::Kernel::SmallTile;
-                let (m, n) = match group {
-                    ShaderGroup::MatMul | ShaderGroup::MatMulAdd => {
-                        (dispatch.params[0], dispatch.params[2])
-                    }
-                    _ => (dispatch.params[0], dispatch.params[1]),
-                };
-                dispatch.workgroups = [n.div_ceil(32), m.div_ceil(32), 1];
+                dispatch.workgroups = matmul::tiled_workgroups(&problem, 32);
             }
+            matmul::Path::Compiled => {}
         }
     }
+}
+
+/// Grow `buffer` to at least `bytes`.
+fn pad_buffer(buffers: &mut [usize], buffer: BufferRef, bytes: usize) {
+    let size = &mut buffers[buffer.0 as usize];
+    *size = (*size).max(bytes);
 }
 
 fn coop_preserves_required_precision(

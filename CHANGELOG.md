@@ -11,6 +11,11 @@
   on. Plan-cache format 21. `CompileOptions::prefer_attention_grad` tries
   one path first wherever it admits the problem, and the oracle suite runs
   every path on shapes spanning each one's admission edges.
+- Dense matrix products are the second kernel family: session
+  construction picks cooperative, 32-wide or compiled tiles through one
+  selector with stated reasons, and tuning asks the same family whether a
+  cooperative kernel is legal, where the two kept separate copies of the
+  alignment, grid and padding checks.
 - Measured training builds explore independent scalar dQ and dK/dV layouts
   through egglog, interleaved with graph alternatives under the existing
   search bounds. Each dispatch and pipeline key retains its extracted EPT

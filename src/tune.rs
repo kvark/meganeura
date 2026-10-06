@@ -439,22 +439,20 @@ impl MatmulTile {
         }
         let mut sizes = class.buffer_sizes()?;
         if let Self::CooperativeF32 { tile_size } = self {
-            if class.conv2d.is_some()
-                || class.weight_format.uses_reduced_storage()
-                || !matches!(tile_size, 8 | 16)
-                || !class.n.is_multiple_of(16)
-                || (matches!(
-                    class.shader,
-                    ShaderEntry::MatMul | ShaderEntry::FusedMatMulAdd
-                ) && class.k < 4)
-            {
+            use crate::kernels::matmul;
+            if class.conv2d.is_some() || !matches!(tile_size, 8 | 16) {
                 return None;
             }
-            let tile = self.coop_config().unwrap().matmul_output_tile();
-            let bytes = crate::compile::cooperative_output_bytes(class.m, class.n, 1, tile)?;
-            *sizes.last_mut()? = bytes;
-            if class.has_addend() && tile_size != 8 {
-                sizes[2] = bytes;
+            let problem = matmul::Problem::plain(
+                matmul::Layout::of(class.shader.shader_group())?,
+                [class.m, class.n, class.k],
+                class.weight_format.uses_reduced_storage(),
+            );
+            // The same legality session construction applies.
+            let geometry = matmul::cooperative_geometry(&problem, &self.coop_config()?).ok()?;
+            *sizes.last_mut()? = geometry.output_bytes;
+            if geometry.pad_addend {
+                sizes[2] = geometry.output_bytes;
             }
         }
         if !crate::compile::workgroups_within_portable_limits(self.workgroups(class)) {
