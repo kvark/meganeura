@@ -100,7 +100,7 @@ impl Case {
         // gradient is their decomposition's, so recognizing changes none.
         if self.trainable {
             let primitive = param_grads(&decomposed, &self.feeds);
-            let recognized = param_grads(&decomposed.recompose_for_training(), &self.feeds);
+            let recognized = param_grads(&decomposed.recompose_for(Mode::Training), &self.feeds);
             assert_eq!(primitive.len(), recognized.len(), "{what}: parameters");
             for ((name, p), (_, r)) in primitive.iter().zip(&recognized) {
                 // A parameter without a gradient has a scalar zero.
@@ -127,12 +127,7 @@ impl Case {
         for mode in modes {
             // Training recognizes only composites with exact gradients; the
             // others build as their primitives do.
-            let written = match mode {
-                Mode::Inference => self.graph.deep_clone(),
-                Mode::Training => self
-                    .graph
-                    .decompose_where(|op| !op.differentiates_as_decomposed(1)),
-            };
+            let written = self.graph.decompose_for(mode);
             let original = signature(&written, mode);
             let rebuilt = signature(&decomposed, mode);
             if original != rebuilt {
@@ -776,7 +771,7 @@ fn loss_gradients_stay_exact_in_training() {
         let mut g = Graph::new();
         let loss = build(&mut g);
         g.set_outputs(vec![loss]);
-        let recognized = g.decompose().recompose_for_training();
+        let recognized = g.decompose().recompose_for(Mode::Training);
         assert!(
             recognized.nodes().iter().all(|n| !matches!(
                 n.op,

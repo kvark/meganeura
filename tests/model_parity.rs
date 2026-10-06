@@ -53,10 +53,7 @@ fn assert_parity(what: &str, graph: &Graph, modes: &[Mode]) {
     for &mode in modes {
         // Training recognizes only composites with exact gradients, so the
         // others build as their primitives do.
-        let written = match mode {
-            Mode::Inference => graph.deep_clone(),
-            Mode::Training => graph.decompose_where(|op| !op.differentiates_as_decomposed(1)),
-        };
+        let written = graph.decompose_for(mode);
         let (original, rebuilt) = (plan(&written, mode), plan(&decomposed, mode));
         if original != rebuilt {
             let only = |a: &[String], b: &[String]| {

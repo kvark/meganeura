@@ -5,8 +5,8 @@ enable f16;
 struct Params {
     seq: u32,
     hidden: u32,
-    _pad0: u32,
-    _pad1: u32,
+    rows: u32, // table rows
+    _pad: u32,
 }
 
 var<storage> indices: array<u32>;
@@ -22,6 +22,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let row = i / params.hidden;
     let col = i % params.hidden;
     // An id past the table reads its last row rather than past its end.
-    let token_id = min(indices[row], arrayLength(&src) / params.hidden - 1u);
+    let token_id = min(indices[row], params.rows - 1u);
     dst[i] = f32(src[token_id * params.hidden + col]);
 }

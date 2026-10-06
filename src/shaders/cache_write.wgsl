@@ -3,7 +3,7 @@
 
 struct Params {
     dim: u32,
-    _pad0: u32,
+    rows: u32, // cache rows
     _pad1: u32,
     _pad2: u32,
 }
@@ -19,6 +19,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if j >= params.dim { return; }
     let kv_pos = kv_pos_buf[0];
     // A position past the cache writes nothing rather than past its end.
-    if kv_pos >= arrayLength(&dst) / params.dim { return; }
+    if kv_pos >= params.rows { return; }
     dst[kv_pos * params.dim + j] = src[j];
 }

@@ -37,9 +37,10 @@ impl Graph {
         self.decompose_where(|_| true)
     }
 
-    /// A copy with the composites `select` picks replaced by primitives,
-    /// including any composites their expansions contain.
-    pub fn decompose_where(&self, select: impl Fn(&Op) -> bool) -> Graph {
+    /// A copy with the composites `select` picks expanded, pass after pass,
+    /// until it picks none. An expansion's own composites are expanded only
+    /// if `select` picks them too.
+    pub(crate) fn decompose_where(&self, select: impl Fn(&Node) -> bool) -> Graph {
         let mut graph = self.deep_clone();
         while let Some(next) = graph.expand_composites(&select) {
             graph = next;
@@ -49,9 +50,9 @@ impl Graph {
 
     /// One pass replacing each selected composite by its one-level
     /// expansion, or `None` when there is none.
-    fn expand_composites(&self, select: &impl Fn(&Op) -> bool) -> Option<Graph> {
-        let chosen = |op: &Op| op.class() == OpClass::Composite && select(op);
-        if !self.nodes.iter().any(|node| chosen(&node.op)) {
+    fn expand_composites(&self, select: &impl Fn(&Node) -> bool) -> Option<Graph> {
+        let chosen = |node: &Node| node.op.class() == OpClass::Composite && select(node);
+        if !self.nodes.iter().any(&chosen) {
             return None;
         }
         let mut out = Graph {
@@ -65,7 +66,7 @@ impl Graph {
         for node in &self.nodes {
             let inputs: Vec<NodeId> = node.inputs.iter().map(|&i| map[i as usize]).collect();
             out.new_nodes_require_full_precision = node.requires_full_precision;
-            let id = if chosen(&node.op) {
+            let id = if chosen(node) {
                 let id = out.expand(&node.op, &inputs, &node.ty);
                 if node.name.is_some() {
                     out.nodes[id as usize].name.clone_from(&node.name);
@@ -94,7 +95,7 @@ impl Graph {
     /// Append the one-level expansion of composite `op` applied to
     /// `inputs`, producing a tensor of type `ty`, and return its root.
     #[track_caller]
-    pub fn expand(&mut self, op: &Op, inputs: &[NodeId], ty: &TensorType) -> NodeId {
+    pub(crate) fn expand(&mut self, op: &Op, inputs: &[NodeId], ty: &TensorType) -> NodeId {
         let arg = |i: usize| inputs[i];
         let root = match *op {
             Op::Softmax => {
@@ -760,11 +761,29 @@ impl Graph {
         self.recompose_where(|_, _| true)
     }
 
-    /// [`Graph::recompose`] restricted to composites whose gradient is
-    /// exactly their decomposition's ([`Op::differentiates_as_decomposed`]),
-    /// so recognizing a training graph never changes what it learns.
-    pub fn recompose_for_training(&self) -> Graph {
-        self.recompose_where(|op, inputs| op.differentiates_as_decomposed(inputs.len()))
+    /// What a build in `mode` recognizes. Inference recognizes every
+    /// composite ([`Graph::recompose`]); training only those whose gradient
+    /// is exactly their decomposition's, so recognizing a training graph
+    /// never changes what it learns.
+    pub fn recompose_for(&self, mode: crate::Mode) -> Graph {
+        match mode {
+            crate::Mode::Inference => self.recompose(),
+            crate::Mode::Training => {
+                self.recompose_where(|op, inputs| op.differentiates_as_decomposed(inputs.len()))
+            }
+        }
+    }
+
+    /// The graph as a build in `mode` treats it: the composites that mode
+    /// does not recognize spelled in primitives, the rest as written. A
+    /// model and its decomposition build the same plan once both are seen
+    /// this way.
+    pub fn decompose_for(&self, mode: crate::Mode) -> Graph {
+        match mode {
+            crate::Mode::Inference => self.deep_clone(),
+            crate::Mode::Training => self
+                .decompose_where(|node| !node.op.differentiates_as_decomposed(node.inputs.len())),
+        }
     }
 
     fn recompose_where(&self, allow: impl Fn(&Op, &[NodeId]) -> bool) -> Graph {

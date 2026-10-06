@@ -1,10 +1,15 @@
 //! The primitive op set, and composite ops written in terms of it.
 //!
 //! A model built only from primitives runs without any model-specific
-//! kernel: every primitive has a lowering, a gradient and a reference
-//! implementation. Fused kernels are the compiler's business: optimized
-//! builds recognize composites spelled in primitives ([`Graph::recompose`]),
-//! so a new model needs a new kernel only to run faster, not to run at all.
+//! kernel: every primitive has a lowering and a reference implementation,
+//! and all but a few have a gradient (depthwise convolution and
+//! `PrefixLast` are inference-only). Fused kernels are the compiler's
+//! business: optimized builds recognize composites spelled in primitives
+//! ([`Graph::recompose`]), so a new model needs a new kernel only to run
+//! faster, not to run at all.
+//!
+//! The class is a structural role. What an op supports (storage types,
+//! shapes, training) is stated by its builder.
 //!
 //! The set follows StableHLO's meaning for each op, restricted to what a
 //! statically planned graph needs: static shapes, reductions and broadcasts
@@ -16,12 +21,14 @@ use super::{Graph, NodeId, Op};
 /// Where an op sits in the architecture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpClass {
-    /// Part of the primitive set: every lowering, gradient and reference
-    /// implementation is defined directly on it.
+    /// Part of the primitive set: its lowering and reference
+    /// implementation, and its gradient where it has one, are defined
+    /// directly on it.
     Primitive,
     /// A named operation with a decomposition into primitives
-    /// ([`Graph::decompose`]). The decomposition is recognized again
-    /// ([`Graph::recompose`]), so either spelling builds the same plan.
+    /// ([`Graph::decompose`]). Optimized builds recognize the decomposition
+    /// again ([`Graph::recompose_for`]), training builds only where the
+    /// gradient is the decomposition's.
     Composite,
     /// A fused kernel or gradient helper that only the optimizer and
     /// autodiff create.
@@ -174,22 +181,40 @@ impl Op {
 
     /// Whether autodiff differentiates this composite, applied to `arity`
     /// inputs, exactly as it does its decomposition, so that recognizing it
-    /// in a training graph changes no gradient. The losses' gradients treat
-    /// the labels as constant and skip the clamp; RoPE differentiates only
-    /// its static form; the rest are inference-only.
-    pub fn differentiates_as_decomposed(&self, arity: usize) -> bool {
+    /// in a training graph changes no gradient. A list of the cases the
+    /// gradient comparison in `tests/oracle/composites.rs` verifies; any
+    /// other op is not recognized for training. The losses are absent
+    /// because their gradients treat the labels as constant and skip the
+    /// clamp, RoPE is present only in its static form, and the cached,
+    /// biased and chunked attention forms are inference-only.
+    pub(crate) fn differentiates_as_decomposed(&self, arity: usize) -> bool {
         match *self {
-            Op::RoPE { .. } => arity == 1,
-            Op::CrossEntropyLoss
-            | Op::BceLoss
-            | Op::RoPEPositions { .. }
-            | Op::CrossAttention { .. }
-            | Op::CachedAttention { .. }
-            | Op::CachedBlockAttention { .. }
-            | Op::ChunkedRelativeAttention { .. }
-            | Op::BiasedAttention { .. }
-            | Op::BiasedCachedAttention { .. } => false,
-            _ => true,
+            Op::RoPE { freq_factors, .. } => arity == 1 && !freq_factors,
+            Op::Softplus { .. }
+            | Op::Silu
+            | Op::Gelu
+            | Op::SwiGLU
+            | Op::GeGLU
+            | Op::MeanAll
+            | Op::SumRows
+            | Op::GlobalAvgPool { .. }
+            | Op::NormalizeInnerSum { .. }
+            | Op::PairwiseSquaredDistance { .. }
+            | Op::PairwiseVectorRejection { .. }
+            | Op::ShiftInner { .. }
+            | Op::Softmax
+            | Op::LogSoftmax
+            | Op::RmsNorm { .. }
+            | Op::LayerNorm { .. }
+            | Op::GroupNorm { .. }
+            | Op::MulPerChannel { .. }
+            | Op::AddPerChannel { .. }
+            | Op::Upsample2x { .. }
+            | Op::CausalAttention { .. }
+            | Op::FullAttention { .. }
+            | Op::MultiHeadAttn { .. }
+            | Op::SlidingWindowAttention { .. } => true,
+            _ => false,
         }
     }
 }

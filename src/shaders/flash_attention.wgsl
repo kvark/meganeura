@@ -135,10 +135,7 @@ var<storage, read_write> lse: array<f32>;
 
 // @section cached_dimensions
     // Positions 0..kv_pos inclusive, within the cache's rows.
-    let kv_seq = min(
-        kv_pos_buf[0] + 1u,
-        arrayLength(&src_b) / (params.num_kv_heads * params.head_dim),
-    );
+    let kv_seq = min(kv_pos_buf[0] + 1u, params.max_seq);
     let num_heads = params.num_heads;
     let num_kv_heads = params.num_kv_heads;
 

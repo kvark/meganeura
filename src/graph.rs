@@ -1597,14 +1597,14 @@ impl Graph {
         self.add_node(Op::Exp, vec![x], ty)
     }
 
+    #[track_caller]
     pub fn sin(&mut self, x: NodeId) -> NodeId {
-        let ty = self.node(x).ty.clone();
-        self.add_node(Op::Sin, vec![x], ty)
+        self.f32_unary(Op::Sin, x, "sin")
     }
 
+    #[track_caller]
     pub fn cos(&mut self, x: NodeId) -> NodeId {
-        let ty = self.node(x).ty.clone();
-        self.add_node(Op::Cos, vec![x], ty)
+        self.f32_unary(Op::Cos, x, "cos")
     }
 
     /// Convert `U32` values such as positions to `F32`.
@@ -1626,26 +1626,35 @@ impl Graph {
         self.add_node(Op::ToU32, vec![x], ty)
     }
 
+    #[track_caller]
     pub fn erf(&mut self, x: NodeId) -> NodeId {
-        let ty = self.node(x).ty.clone();
-        self.add_node(Op::Erf, vec![x], ty)
+        self.f32_unary(Op::Erf, x, "erf")
     }
 
+    #[track_caller]
     pub fn sqrt(&mut self, x: NodeId) -> NodeId {
-        let ty = self.node(x).ty.clone();
-        self.add_node(Op::Sqrt, vec![x], ty)
+        self.f32_unary(Op::Sqrt, x, "sqrt")
     }
 
+    #[track_caller]
     pub fn rsqrt(&mut self, x: NodeId) -> NodeId {
-        let ty = self.node(x).ty.clone();
-        self.add_node(Op::Rsqrt, vec![x], ty)
+        self.f32_unary(Op::Rsqrt, x, "rsqrt")
     }
 
     /// Add the compile-time scalar `value` to every element.
+    #[track_caller]
     pub fn add_scalar(&mut self, x: NodeId, value: f32) -> NodeId {
         assert!(value.is_finite(), "added scalar must be finite");
+        self.f32_unary(Op::Offset { value }, x, "add_scalar")
+    }
+
+    /// An elementwise op on F32 storage, its result of the same type. Other
+    /// storage is converted explicitly first (`to_f32`).
+    #[track_caller]
+    fn f32_unary(&mut self, op: Op, x: NodeId, name: &str) -> NodeId {
         let ty = self.node(x).ty.clone();
-        self.add_node(Op::Offset { value }, vec![x], ty)
+        assert_eq!(ty.dtype, DType::F32, "{name} computes on F32 storage");
+        self.add_node(op, vec![x], ty)
     }
 
     /// Element-wise difference: `a - b` = `a + neg(b)`.
@@ -1842,6 +1851,11 @@ impl Graph {
             "max_inner expects a 2D [M, N] input, got shape {shape:?}"
         );
         assert!(shape[1] > 0, "max_inner needs a non-empty inner row");
+        assert_eq!(
+            self.node(x).ty.dtype,
+            DType::F32,
+            "max_inner reduces F32 storage"
+        );
         let ty = TensorType::f32(vec![shape[0], 1]);
         self.add_node(Op::MaxInner, vec![x], ty)
     }
@@ -3114,6 +3128,10 @@ impl Graph {
     /// Softmax attention with an additive bias per head, query row and key:
     /// `softmax(scale · q·k + bias) · v`, causally masked when `causal`.
     /// `bias` is `[num_heads, rows, keys]`; see [`Op::BiasedAttention`].
+    ///
+    /// Inference-only: the named op has no gradient, though its
+    /// decomposition into primitives does. The fused kernel takes heads up
+    /// to 512 wide, a limit of that kernel rather than of the operation.
     #[track_caller]
     pub fn biased_attention(
         &mut self,
@@ -3155,6 +3173,8 @@ impl Graph {
 
     /// Cached attention over rows `0..=kv_pos` with a bias per head and
     /// cache row, `[num_heads, max_seq]`; see [`Op::BiasedCachedAttention`].
+    ///
+    /// Inference-only, with the fused kernel's head width limit of 512.
     #[track_caller]
     pub fn biased_cached_attention(
         &mut self,

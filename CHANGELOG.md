@@ -16,11 +16,13 @@
   and optimized builds recognize decompositions again (`Graph::recompose`),
   so a model spelled in primitives builds the plan of the model written
   with composites. Composites a graph names stay as written. Inference
-  builds recognize every composite; training builds only those whose
-  gradient is exactly their decomposition's
-  (`Graph::recompose_for_training`), leaving the losses, the inference-only
-  attention forms and RoPE with dynamic positions in primitives; builds
-  with the optimizer off recognize nothing, so they run the primitives.
+  builds recognize every composite; training builds only a list of those
+  whose gradient is verified to be exactly their decomposition's
+  (`Graph::recompose_for`), leaving the losses, the inference-only
+  attention forms and RoPE with dynamic positions in primitives
+  (`Graph::decompose_for` shows a graph as a build in a mode treats it);
+  builds with the optimizer off recognize nothing, so they run the
+  primitives.
   Recognition matches whole templates exactly, comparing attributes by
   their bits. Tests hold every composite, every model builder, every GGUF
   architecture and the ONNX fixtures to the same dispatches
@@ -72,8 +74,12 @@
   without bounds checks: tile loads of the scalar, quantized, cooperative,
   convolution and Winograd matmuls clamp the index of lanes outside the
   matrix (reading past the end crashed software Vulkan); token ids, gather
-  indices and cache positions past their table or cache stay inside it;
-  and buffers are allocated in whole 16-byte vec4s.
+  indices and cache positions past their table or cache stay inside it,
+  bounded by row counts passed in the kernels' parameters; and buffers are
+  allocated in whole 16-byte vec4s.
+- The new elementwise primitives (`sqrt`, `rsqrt`, `erf`, `sin`, `cos`,
+  `add_scalar`) and `max_inner` refuse storage other than F32 at
+  construction instead of relabeling it.
 - Concatenation, split, convolution, group norm and upsample gradients
   size their operands by element count, so operands of any rank
   differentiate; permute and broadcast gradients accept a gradient that

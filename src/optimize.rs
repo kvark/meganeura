@@ -21,10 +21,6 @@ use egglog::{Term, TermDag, TermId, ast::Literal, extract::Extractor};
 use std::collections::{HashMap, HashSet};
 use std::{fmt, time::Instant};
 
-/// Structural memo of named-constructor nodes: (constructor, inputs,
-/// attributes, precision policy) → node.
-pub(crate) type StructuralIndex = HashMap<(&'static str, Vec<NodeId>, Vec<i64>, bool), NodeId>;
-
 /// Node-count ceiling for a single egglog saturation. Above this, the
 /// graph is segmented (see module docs). Shared-parameter graphs create
 /// large e-classes that make pattern matching superlinear: the SmolVLA
@@ -686,6 +682,7 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
 (rewrite (Mul ?up (Gelu ?gate)) (GeGLU ?gate ?up))
 (rewrite (GeGLU (MatMul ?h ?wg) (MatMul ?h ?wu)) (GeGLUPacked ?h ?wg ?wu))
 (rewrite (GeGLU (MatMulBT ?h ?wg) (MatMulBT ?h ?wu)) (GeGLUPackedBT ?h ?wg ?wu))
+
 ",
     );
     if pack_swiglu {
@@ -695,8 +692,8 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
     }
     // Saturation is bounded: the deepest rewrite chain is three rules
     // (Mul(x, Sigmoid(x)) -> Silu, Mul(Silu, up) -> SwiGLU, then
-    // SwiGLU(MatMul, MatMul) -> SwiGLUPacked), so three iterations reach a
-    // fixpoint; the fourth is margin for future rules.
+    // SwiGLU(MatMul, MatMul) -> SwiGLUPacked), so three iterations reach
+    // a fixpoint; the fourth is margin for future rules.
 }
 
 fn rule_graph(pack_swiglu: bool, tiles: bool) -> egglog::EGraph {
@@ -972,7 +969,7 @@ fn instance_ext_map(
 fn process_segment(
     g: &mut Graph,
     seg: &Segment,
-    index: &mut StructuralIndex,
+    index: &mut HashMap<(&'static str, Vec<NodeId>, bool), NodeId>,
     report: &mut OptimizeReport,
     config: OptimizeConfig,
 ) {
@@ -1094,8 +1091,9 @@ fn process_segment(
 /// survive.
 struct Stamper<'a> {
     g: &'a mut Graph,
-    /// Structural memo for named constructors.
-    index: &'a mut StructuralIndex,
+    /// Structural memo for named constructors:
+    /// (name, children, precision policy) → node.
+    index: &'a mut HashMap<(&'static str, Vec<NodeId>, bool), NodeId>,
     /// Node ids of the encoded instance (terms only reference these).
     seg_ids: &'a HashSet<usize>,
     /// Id shift of the instance being stamped.
@@ -1116,15 +1114,14 @@ impl Stamper<'_> {
     fn stamp_root(&mut self, root: usize, dag: &TermDag, term_id: TermId) -> Result<(), String> {
         match *dag.get(term_id) {
             Term::App(ref name, ref children) if named_constructor_exists(name) => {
-                let (attrs, children) = split_attributes(dag, children);
-                let inputs = self.resolve_children(dag, &children)?;
+                let inputs = self.resolve_children(dag, children)?;
                 // Unchanged term → nothing to do.
                 if named_constructor(&self.g.node(root as u32).op) == Some(name.as_str())
                     && self.g.node(root as u32).inputs == inputs
                 {
                     return Ok(());
                 }
-                self.build_named(name, inputs, &attrs, Some(root as u32))?;
+                self.build_named(name, inputs, Some(root as u32))?;
                 Ok(())
             }
             _ => {
@@ -1172,16 +1169,14 @@ impl Stamper<'_> {
                 orig
             }
             Term::App(ref name, ref children) => {
-                let (attrs, children) = split_attributes(dag, children);
-                let inputs = self.resolve_children(dag, &children)?;
+                let inputs = self.resolve_children(dag, children)?;
                 match self.index.get(&(
                     static_constructor(name)?,
                     inputs.clone(),
-                    attrs.clone(),
                     self.requires_full_precision,
                 )) {
                     Some(&hit) => hit,
-                    None => self.build_named(name, inputs, &attrs, None)?,
+                    None => self.build_named(name, inputs, None)?,
                 }
             }
             ref other => return Err(format!("unexpected term {:?}", other)),
@@ -1203,13 +1198,10 @@ impl Stamper<'_> {
     }
 
     /// Create (or overwrite `target` with) a named-constructor node.
-    /// `attrs` are the constructor's integer attributes, such as an
-    /// epsilon's bits.
     fn build_named(
         &mut self,
         name: &str,
         inputs: Vec<NodeId>,
-        attrs: &[i64],
         target: Option<NodeId>,
     ) -> Result<NodeId, String> {
         match matrix_family(name).unwrap_or(name) {
@@ -1293,7 +1285,6 @@ impl Stamper<'_> {
             (
                 static_constructor(name)?,
                 inputs,
-                attrs.to_vec(),
                 self.requires_full_precision,
             ),
             id,
@@ -1333,7 +1324,7 @@ impl Stamper<'_> {
         else {
             let gate = self.lookup_or_build(&scheduled, vec![h, wg])?;
             let up = self.lookup_or_build(&scheduled, vec![h, wu])?;
-            return self.build_named(unpacked, vec![gate, up], &[], target);
+            return self.build_named(unpacked, vec![gate, up], target);
         };
         self.g.nodes_mut()[wide_mm as usize].matmul_impl = scheduled_matmul(packed_key);
         let shape = &self.g.node(wide_mm).ty.shape;
@@ -1345,12 +1336,7 @@ impl Stamper<'_> {
             target,
         );
         self.index.insert(
-            (
-                packed_key,
-                inputs.to_vec(),
-                Vec::new(),
-                self.requires_full_precision,
-            ),
+            (packed_key, inputs.to_vec(), self.requires_full_precision),
             id,
         );
         self.fusions.push((
@@ -1364,11 +1350,10 @@ impl Stamper<'_> {
         match self.index.get(&(
             static_constructor(name)?,
             inputs.clone(),
-            Vec::new(),
             self.requires_full_precision,
         )) {
             Some(&hit) => Ok(hit),
-            None => self.build_named(name, inputs, &[], None),
+            None => self.build_named(name, inputs, None),
         }
     }
 
@@ -1544,19 +1529,6 @@ fn static_constructor(name: &str) -> Result<&'static str, String> {
     })
 }
 
-/// Separate a constructor's integer attributes from its operands.
-fn split_attributes(dag: &TermDag, children: &[TermId]) -> (Vec<i64>, Vec<TermId>) {
-    let mut attrs = Vec::new();
-    let mut operands = Vec::new();
-    for &child in children {
-        match *dag.get(child) {
-            Term::Lit(Literal::Int(v)) => attrs.push(v),
-            _ => operands.push(child),
-        }
-    }
-    (attrs, operands)
-}
-
 fn lit_node_id(dag: &TermDag, term_id: TermId) -> Result<usize, String> {
     match *dag.get(term_id) {
         Term::Lit(Literal::Int(v)) => Ok(v as usize),
@@ -1567,17 +1539,12 @@ fn lit_node_id(dag: &TermDag, term_id: TermId) -> Result<usize, String> {
 /// Structural memo of the existing graph for named constructors, so
 /// term resolution finds each instance's own nodes (and never duplicates
 /// an existing equivalent node).
-fn build_structural_index(g: &Graph) -> StructuralIndex {
+fn build_structural_index(g: &Graph) -> HashMap<(&'static str, Vec<NodeId>, bool), NodeId> {
     let mut index = HashMap::new();
     for node in g.nodes() {
         if let Some(name) = named_constructor(&node.op) {
             index.insert(
-                (
-                    name,
-                    node.inputs.clone(),
-                    Vec::new(),
-                    node.requires_full_precision,
-                ),
+                (name, node.inputs.clone(), node.requires_full_precision),
                 node.id,
             );
         }
@@ -2568,7 +2535,7 @@ mod tests {
         let y = g.decomposed_softmax(h);
         let loss = g.sum_all(y);
         g.set_outputs(vec![loss]);
-        let forward = g.recompose_for_training();
+        let forward = g.recompose_for(crate::Mode::Training);
         let opt = optimize(&crate::autodiff::differentiate(&forward));
         let ops = live_ops(&opt);
         assert!(ops.iter().any(|op| matches!(op, Op::Softmax)), "{ops:?}");
