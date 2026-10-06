@@ -385,8 +385,8 @@ impl MatmulTile {
                 ];
             }
             Self::SpecializedConv { tile_size, .. } => tile_size,
-            Self::CooperativeF32 { tile_size } => {
-                let tile = 2 * tile_size;
+            Self::CooperativeF32 { .. } => {
+                let tile = self.coop_config().unwrap().matmul_output_tile();
                 // Cooperative tiles use X for rows, Y for columns.
                 return [class.m.div_ceil(tile), class.n.div_ceil(tile), 1];
             }
@@ -450,18 +450,14 @@ impl MatmulTile {
             {
                 return None;
             }
-            let tile = 2 * tile_size;
-            let padded_m = class.m.div_ceil(tile).checked_mul(tile)?;
-            let padded_n = class.n.div_ceil(tile).checked_mul(tile)?;
-            let bytes = usize::try_from(padded_m.checked_mul(padded_n)?)
-                .ok()?
-                .checked_mul(4)?;
+            let tile = self.coop_config().unwrap().matmul_output_tile();
+            let bytes = crate::compile::cooperative_output_bytes(class.m, class.n, 1, tile)?;
             *sizes.last_mut()? = bytes;
-            if class.has_addend() {
+            if class.has_addend() && tile_size != 8 {
                 sizes[2] = bytes;
             }
         }
-        if self.workgroups(class).iter().any(|&n| n == 0 || n > 65_535) {
+        if !crate::compile::workgroups_within_portable_limits(self.workgroups(class)) {
             return None;
         }
         Some(sizes)
@@ -1965,8 +1961,8 @@ mod tests {
     fn native_candidates_ignore_profitability_but_obey_capability_and_precision() {
         let config = native_config(8);
         let native = MatmulTile::CooperativeF32 { tile_size: 8 };
-        // One workgroup, and then a dimension above the static 1024 veto.
-        for class in [class(16, 16, 8), class(2048, 32, 17)] {
+        // One workgroup, and then a dimension beyond the old 1024 veto.
+        for class in [class(32, 32, 8), class(2048, 32, 17)] {
             assert!(
                 class
                     .challengers(MatmulTile::Tile64, Some(&config))
@@ -2005,14 +2001,15 @@ mod tests {
         let mut class = class(33, 32, 17);
         assert!(!native.fits(&class));
         let required = native.buffer_sizes(&class).unwrap();
-        assert_eq!(required, [33 * 17 * 4, 17 * 32 * 4, 48 * 32 * 4]);
+        assert_eq!(required, [33 * 17 * 4, 17 * 32 * 4, 64 * 32 * 4]);
         class.binding_bytes = required;
         assert!(native.fits(&class));
         class.shader = ShaderEntry::FusedMatMulAdd;
         class.binding_bytes = class.buffer_sizes().unwrap();
-        class.binding_bytes[3] = 48 * 32 * 4;
-        assert!(!native.fits(&class)); // output fits, addend does not
-        class.binding_bytes[2] = 48 * 32 * 4;
+        class.binding_bytes[3] = 64 * 32 * 4;
+        // Native 8x8 stages an edge addend with checked scalar loads;
+        // unlike the direct-load path, its external input need not grow.
+        assert_eq!(native.buffer_sizes(&class).unwrap()[2], 33 * 32 * 4);
         assert!(native.fits(&class));
         class.n = 17;
         assert!(native.buffer_sizes(&class).is_none());
@@ -2031,7 +2028,7 @@ mod tests {
         let mut d = dispatch();
         d.params = vec![class.m, class.k, class.n, 0];
         native.apply(&mut d, &class);
-        assert_eq!(d.workgroups, [2, 4, 1]);
+        assert_eq!(d.workgroups, [1, 2, 1]);
         assert!(d.use_coop() && !d.use_coop_compensated() && !d.use_small_tiles());
         assert!(TuneClass::from_dispatch(&d, Some(&config)).is_some());
         assert!(TuneClass::from_dispatch(&d, None).is_none());

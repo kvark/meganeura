@@ -1373,15 +1373,21 @@ impl Pipelines {
                     hd,
                     ept.unwrap_or(knobs.flash_grad_q_ept_cap),
                 ),
-                ShaderGroup::FlashGradQCoop => {
-                    crate::codegen::generate_flash_grad_q_coop_module(hd)
+                ShaderGroup::FlashGradQCoopF16 => {
+                    crate::codegen::generate_flash_grad_q_coop_f16_module(hd)
                 }
                 ShaderGroup::FlashGradKV => crate::codegen::generate_flash_grad_kv_module(
                     hd,
                     ept.unwrap_or(knobs.flash_grad_kv_ept_cap),
                 ),
-                ShaderGroup::FlashGradKVCoop => {
-                    crate::codegen::generate_flash_grad_kv_coop_module(hd)
+                ShaderGroup::FlashGradKVCoopF16 => {
+                    crate::codegen::generate_flash_grad_kv_coop_f16_module(hd)
+                }
+                ShaderGroup::FlashGradKVCoopF32 => {
+                    crate::codegen::generate_flash_grad_kv_coop_f32_module(hd)
+                }
+                ShaderGroup::FlashGradQCoopF32 => {
+                    crate::codegen::generate_flash_grad_q_coop_f32_module(hd)
                 }
                 ShaderGroup::MultiHeadAttn => crate::codegen::generate_attention_module(hd),
                 ShaderGroup::CachedQueryAttention => {
@@ -1441,9 +1447,11 @@ impl Pipelines {
             | ShaderGroup::FlashAttention
             | ShaderGroup::FlashAttentionCoop
             | ShaderGroup::FlashGradQ
-            | ShaderGroup::FlashGradQCoop
+            | ShaderGroup::FlashGradQCoopF16
             | ShaderGroup::FlashGradKV
-            | ShaderGroup::FlashGradKVCoop
+            | ShaderGroup::FlashGradKVCoopF16
+            | ShaderGroup::FlashGradKVCoopF32
+            | ShaderGroup::FlashGradQCoopF32
             | ShaderGroup::CachedQueryAttention => dispatch.params.get(3).copied(),
             _ => None,
         }
@@ -1833,12 +1841,14 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::MultiHeadAttn
         | ShaderEntry::FlashAttention
         | ShaderEntry::FlashAttentionCoop => MultiHeadAttnData::layout(),
-        ShaderEntry::MultiHeadAttnGradQ | ShaderEntry::FlashGradQ | ShaderEntry::FlashGradQCoop => {
-            MultiHeadAttnGradData::layout()
-        }
+        ShaderEntry::MultiHeadAttnGradQ
+        | ShaderEntry::FlashGradQ
+        | ShaderEntry::FlashGradQCoopF16
+        | ShaderEntry::FlashGradQCoopF32 => MultiHeadAttnGradData::layout(),
         ShaderEntry::MultiHeadAttnGradKV
         | ShaderEntry::FlashGradKV
-        | ShaderEntry::FlashGradKVCoop => MultiHeadAttnGradKVData::layout(),
+        | ShaderEntry::FlashGradKVCoopF16
+        | ShaderEntry::FlashGradKVCoopF32 => MultiHeadAttnGradKVData::layout(),
         ShaderEntry::SwiGLUGradGate => TernaryData::layout(),
         ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => BinaryData::layout(),
         ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradWRowPar | ShaderEntry::RmsNormGradX => {
@@ -1976,17 +1986,10 @@ pub(crate) fn select_variants(
 ) {
     if let Some(config) = coop_config {
         use crate::codegen::ShaderGroup;
-        let output_tile = config.output_tile();
-        let _half_tile = config.tile_size;
-        // Apple's native 8x8 f32 cooperative matrix path is useful for
-        // compact GEMMs, but loses to the scalar tiled kernels once a
-        // dimension grows beyond 1024. Its forward convolution staging
-        // is also slower than the scalar im2col path; grad-input remains
-        // profitable and is selected independently below.
-        // Native 8×8 f32 tiles (Apple simdgroup) lose to the scalar path
-        // on large GEMMs and on forward conv. Key off the tile, not OS:
-        // iOS and future 8×8 f32 advertisers need the same veto.
-        let apple_f32_coop = !config.use_f16_input && config.tile_size == 8;
+        // Forward convolution retains the older two-by-two cooperative
+        // tile and its scalar im2col path is faster on the measured 8x8 f32 device.
+        // Dense matrices have a separate multi-SIMD-group layout.
+        let f32_8x8_coop = !config.use_f16_input && config.tile_size == 8;
         for dispatch in &mut plan.dispatches {
             // K=16 is the compiled exact-indexing kernel. Cooperative
             // promotion may replace it. Any other measured K stage stays.
@@ -2001,7 +2004,7 @@ pub(crate) fn select_variants(
             // the f16 exponent range: values below the minimum subnormal
             // become zero in both halves before the matrix multiply. Keep
             // such work on scalar f32 unless the caller explicitly selected
-            // `AllowF16`. Native f32 cooperative implementations remain
+            // `AllowF16`. F32 cooperative implementations remain
             // eligible.
             if !coop_preserves_required_precision(config, dispatch, allow_raw_f16) {
                 continue;
@@ -2055,19 +2058,27 @@ pub(crate) fn select_variants(
                 ),
                 _ => continue,
             };
-            if apple_f32_coop
-                && (matches!(group, ShaderGroup::Conv2dGemm)
-                    || (matches!(
-                        group,
-                        ShaderGroup::MatMul
-                            | ShaderGroup::MatMulAdd
-                            | ShaderGroup::MatMulAT
-                            | ShaderGroup::MatMulBT
-                    ) && m.max(n).max(k) > 1024))
-            {
+            let output_tile = if matches!(
+                group,
+                ShaderGroup::Conv2dGemm | ShaderGroup::Conv2dGradInputGemm
+            ) {
+                config.output_tile()
+            } else {
+                config.matmul_output_tile()
+            };
+            if f32_8x8_coop && matches!(group, ShaderGroup::Conv2dGemm) {
                 continue;
             }
-            let coop_wgs = m.div_ceil(output_tile) * n.div_ceil(output_tile) * batch;
+            let coop_grid = [m.div_ceil(output_tile), n.div_ceil(output_tile), batch];
+            if !crate::compile::workgroups_within_portable_limits(coop_grid) {
+                continue;
+            }
+            let Some(padded_bytes) =
+                crate::compile::cooperative_output_bytes(m, n, batch, output_tile)
+            else {
+                continue;
+            };
+            let coop_wgs: u64 = coop_grid.into_iter().map(u64::from).product();
             // Conv2d backward GEMM has all-scalar staging with heavy im2col
             // decomposition (integer division), and only 64 threads vs 256
             // for the scalar shader. Require more workgroups to amortize.
@@ -2083,44 +2094,24 @@ pub(crate) fn select_variants(
                 // enough independent tiles to fill the device.
                 128
             } else {
-                16 // enables coop for attention K/V projections (N=320, 20 WGs)
+                16 // amortize staging across enough independent f32 tiles
             };
-            // matmul_coop.wgsl's vec4 staging packs 4 consecutive elements
-            // from the contiguous axis into a single 128-bit load. The
-            // gating expression `(tr4 + 4u) <= k` / `(v4_col + 4u) <= n`
-            // skips the load whenever the relevant dimension is < 4,
-            // zero-padding the whole tile and silently producing zero
-            // output. Refuse to enable coop in those cases — the scalar
-            // / small-tile fallbacks handle them correctly.
+            // Retain the conservative staging/store gates shared with the
+            // older cooperative kernels. The 8x8 f32 dense kernel stages checked
+            // scalar loads, while legacy kernels may load packed vec4s.
+            // The normal and convolution paths still require K >= 4.
             //
-            // Required vec4 dimensions per variant:
-            //   * MatMul / MatMulAdd:  A vec4 along K, B vec4 along N.
-            //   * MatMulAT:            A vec4-T along M, B vec4 along N.
-            //   * MatMulBT:            A vec4 along K, B vec4-T along K.
-            // matmul_coop.wgsl correctness conditions:
+            // Direct cooperative stores write complete sub-tiles: 8x8 on
+            // the f32 path, 16x16 on the common f16 path. Keep N aligned
+            // to 16 for both so stores never straddle logical rows.
+            // Bottom-edge stores are safe for a single matrix: its allocation
+            // rounds M up to a multiple of output_tile, while consumers retain
+            // the logical M extent. Batched convolution instead needs full
+            // M tiles: later batches must not start after padding that their
+            // consumers do not account for.
             //
-            //   * Vec4 STAGING along the K direction (vec4_a for
-            //     Normal/BT, vec4_b_transposed for BT) now has a
-            //     per-lane fallback (codegen.rs), so any K is fine for
-            //     those variants.
-            //
-            //   * The OUTPUT STORE uses `coopStoreT(acc, &c[row*n+col],
-            //     n)` which writes a 16×16 sub-tile with row stride
-            //     `n`. A right-edge tile with N not divisible by 16
-            //     straddles logical rows, so it remains unsupported. A
-            //     bottom-edge tile is safe for one matrix: session construction
-            //     pads the allocation to `ceil(M/16) * N`, and consumers retain
-            //     the logical M extent, so the extra rows are never observed.
-            //     It is not safe for batched convolution. The cooperative
-            //     kernel stores each later batch after the padded M rows, while
-            //     every consumer addresses it after the logical M rows. Require
-            //     a complete M tile there; batch zero otherwise looks correct
-            //     while every later image reads padding.
-            //
-            // (Conv2dGemm and the direct-store f16 Conv2dGradInputGemm also
-            // store via coopStoreT and need the same check; their `m`/`n`
-            // come from the params destructure above. Generated f32
-            // grad-input kernels store edge tiles with bounds checks.)
+            // Generated f32 grad-input kernels use bounds-checked stores
+            // and do not need this direct-store alignment gate.
             let store_ok = n.is_multiple_of(16)
                 && (!matches!(
                     group,
@@ -2141,8 +2132,10 @@ pub(crate) fn select_variants(
                 ShaderGroup::MatMul | ShaderGroup::MatMulAdd => store_ok && k >= 4,
                 _ => true,
             };
-            let _ = k;
-            if coop_wgs >= min_wgs && !dispatch.weight_format.uses_reduced_storage() && vec4_ok {
+            if coop_wgs >= u64::from(min_wgs)
+                && !dispatch.weight_format.uses_reduced_storage()
+                && vec4_ok
+            {
                 dispatch.kernel = crate::compile::Kernel::Cooperative;
                 // Route conv2d coop dispatches to generated specialized kernels
                 if is_conv_bwd {
@@ -2156,19 +2149,19 @@ pub(crate) fn select_variants(
                     let stride = dispatch.params[7];
                     dispatch.shader = ShaderEntry::Conv2dGemmCoopGen(kh, kw, stride);
                 }
-                dispatch.workgroups = [m.div_ceil(output_tile), n.div_ceil(output_tile), batch];
-                // coopStore/coopLoad operate on full tiles without per-element
-                // bounds checking. Pad output and addend buffers so edge
-                // tiles don't read/write past the end.
-                let padded_m = m.div_ceil(output_tile) * output_tile;
-                let padded_n = n.div_ceil(output_tile) * output_tile;
-                let padded_bytes = (padded_m * padded_n * batch * 4) as usize;
+                dispatch.workgroups = coop_grid;
+                // Direct cooperative stores cover complete sub-tiles.
+                // Reserve full output tiles for any bottom-edge writes.
                 let buf_idx = dispatch.output_buffer.0 as usize;
                 if plan.buffers[buf_idx] < padded_bytes {
                     plan.buffers[buf_idx] = padded_bytes;
                 }
-                // FusedMatMulAdd: also pad the addend (src) buffer.
-                if dispatch.input_buffers.len() > 2 {
+                // F32 8x8 dense matrices stage addends through checked
+                // loads. In particular, external inputs retain their logical
+                // upload size. Older direct cooperative loads need padding.
+                if dispatch.input_buffers.len() > 2
+                    && !(f32_8x8_coop && matches!(group, ShaderGroup::MatMulAdd))
+                {
                     let src_idx = dispatch.input_buffers[2].0 as usize;
                     if plan.buffers[src_idx] < padded_bytes {
                         plan.buffers[src_idx] = padded_bytes;
@@ -2329,6 +2322,96 @@ mod coop_precision_tests {
     }
 
     #[test]
+    fn coop_f32_matmul_selects_gqa_and_vocabulary_projections() {
+        let config = CoopConfig {
+            tile_size: 8,
+            use_f16_input: false,
+            compensated: false,
+        };
+        for n in [192, 49_152] {
+            let mut graph = crate::Graph::new();
+            let x = graph.input("x", &[128, 576]);
+            let w = graph.parameter("w", &[576, n]);
+            let y = graph.matmul(x, w);
+            graph.set_outputs(vec![y]);
+            let mut plan = crate::compile::compile_with(&graph, &Default::default());
+            super::select_variants(&mut plan, Some(&config), false, false);
+            assert_eq!(plan.dispatches.len(), 1);
+            let dispatch = &plan.dispatches[0];
+            assert!(dispatch.use_coop());
+            assert_eq!(dispatch.workgroups, [4, n as u32 / 32, 1]);
+        }
+    }
+
+    #[test]
+    fn coop_f32_promotion_and_tuning_agree_at_launch_boundaries() {
+        let config = CoopConfig {
+            tile_size: 8,
+            use_f16_input: false,
+            compensated: false,
+        };
+        let candidate = crate::tune::MatmulTile::CooperativeF32 { tile_size: 8 };
+        for groups in [65_535, 65_536] {
+            for (m, n) in [(groups * 32, 16), (16, groups * 32)] {
+                // Only compile metadata: even the review's 128 MiB output
+                // requires no tensor or GPU allocation in this regression.
+                let mut graph = crate::Graph::new();
+                let a = graph.input("a", &[m, 4]);
+                let b = graph.input("b", &[4, n]);
+                let y = graph.matmul(a, b);
+                graph.set_outputs(vec![y]);
+                let mut plan = crate::compile::compile(&graph);
+                let before = plan.dispatches[0].clone();
+                let buffers = plan.buffers.clone();
+                let legal = groups == 65_535;
+                let tuning_legal = crate::tune::TuneClass::from_dispatch(&before, Some(&config))
+                    .and_then(|class| candidate.buffer_sizes(&class))
+                    .is_some();
+                assert_eq!(tuning_legal, legal);
+                super::select_variants(&mut plan, Some(&config), false, false);
+                let after = &plan.dispatches[0];
+                assert_eq!(after.use_coop(), legal, "{m}x{n}x4");
+                if legal {
+                    assert_eq!(
+                        after.workgroups,
+                        [(m as u32).div_ceil(32), (n as u32).div_ceil(32), 1]
+                    );
+                } else {
+                    assert_eq!(after.workgroups, before.workgroups);
+                    assert_eq!(after.kernel, before.kernel);
+                    assert_eq!(
+                        plan.buffers, buffers,
+                        "rejected promotion must not pad buffers"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn coop_f32_padding_does_not_wrap_at_four_gib() {
+        let config = CoopConfig {
+            tile_size: 8,
+            use_f16_input: false,
+            compensated: false,
+        };
+        let mut graph = crate::Graph::new();
+        let a = graph.input("a", &[32_767, 4]);
+        let b = graph.input("b", &[4, 32_768]);
+        let y = graph.matmul(a, b);
+        graph.set_outputs(vec![y]);
+        let mut plan = crate::compile::compile(&graph);
+        super::select_variants(&mut plan, Some(&config), false, false);
+        let dispatch = &plan.dispatches[0];
+        assert!(dispatch.use_coop());
+        assert_eq!(
+            plan.buffers[dispatch.output_buffer.0 as usize],
+            1_usize << 32
+        );
+    }
+
+    #[test]
     fn compensated_f16_does_not_extend_exponent_range() {
         let value = 1.0e-12_f32;
         let high = half::f16::from_f32(value);
@@ -2412,13 +2495,15 @@ pub struct SessionOptions {
 /// How cooperative-matrix hardware may be used.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CoopPolicy {
-    /// Prefer native f32 tiles. On f16-only devices, enable f16 tiles for
+    /// Prefer f32 operands and accumulators. On f16-only devices, enable f16 tiles for
     /// work that permits reduced input precision; `requires_full_precision`
     /// dispatches retain scalar f32 operands.
     #[default]
     Auto,
-    /// Allow only native f32 operands and accumulators. Devices with only
-    /// reduced-input cooperative tiles retain scalar f32 implementations.
+    /// Allow only f32 cooperative operands and accumulators, without f16
+    /// staging or compensation. This is a precision policy, not a vendor
+    /// restriction. Devices with only reduced-input cooperative tiles retain
+    /// scalar f32 implementations.
     NativeF32,
     /// Never use cooperative matrices — force the scalar paths.
     Disabled,
@@ -2833,7 +2918,7 @@ fn create_optimizer_buffer(
 
 impl Session {
     /// Select the safest cooperative matrix config from GPU capabilities.
-    /// Prefers native f32 for training correctness. The faster f16-input path
+    /// Prefers f32 operands for training correctness. The f16-input path
     /// remains opt-in because rounding compounds across deep training graphs.
     fn select_coop_config(
         caps: &crate::codegen::CoopCaps,
@@ -2854,7 +2939,7 @@ impl Session {
             caps.f16_tile,
             caps.f32_tile
         );
-        // Prefer native f32 tiles. f16-only devices enable the f16 path for
+        // Prefer f32 cooperative tiles. f16-only devices enable the f16 path for
         // precision-insensitive work; `select_variants` keeps derivative
         // work scalar unless the caller explicitly opts into raw f16 via
         // `CoopPolicy::AllowF16`.
@@ -2902,7 +2987,7 @@ impl Session {
         // pattern like A[i,j]=i+1, B[i,j]=j+1 misses bugs where the shader
         // loses index dependence (e.g. coop-load layout mismatches that
         // only surface when neighboring K-indices carry different weights).
-        let ot = config.output_tile() as usize;
+        let ot = config.matmul_output_tile() as usize;
         let m: usize = ot * 2; // 2 row tiles
         let inner: usize = ot * 2; // 2 K-tiles (exercises K-loop accumulation)
         let n_out: usize = ot * 2; // 2 column tiles
@@ -2965,7 +3050,7 @@ impl Session {
         {
             let mut pass = encoder.compute("coop_test");
             let mut pc = pass.with(&pipeline);
-            let ot = config.output_tile();
+            let ot = config.matmul_output_tile();
             pc.bind(
                 0,
                 &MatMulData {

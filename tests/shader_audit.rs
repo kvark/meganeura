@@ -206,11 +206,21 @@ fn flash_attention_backward_uses_precomputed_row_dots() {
         let dispatches = &training.plan().dispatches;
         let query = dispatches
             .iter()
-            .find(|d| d.shader == ShaderEntry::FlashGradQ)
+            .find(|d| {
+                matches!(
+                    d.shader,
+                    ShaderEntry::FlashGradQ | ShaderEntry::FlashGradQCoopF32
+                )
+            })
             .unwrap();
         let kv = dispatches
             .iter()
-            .find(|d| d.shader == ShaderEntry::FlashGradKV)
+            .find(|d| {
+                matches!(
+                    d.shader,
+                    ShaderEntry::FlashGradKV | ShaderEntry::FlashGradKVCoopF32
+                )
+            })
             .unwrap();
         assert_eq!(
             query.input_buffers[5], kv.input_buffers[5],

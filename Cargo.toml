@@ -196,6 +196,11 @@ name = "bench_ci_latency"
 path = "bench/bench_ci_latency.rs"
 
 [[example]]
+name = "bench_coop_f32"
+path = "bench/bench_coop_f32.rs"
+required-features = ["models"]
+
+[[example]]
 name = "qwen3"
 path = "examples/qwen3.rs"
 required-features = ["hf-hub"]

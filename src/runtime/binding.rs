@@ -536,7 +536,8 @@ impl Session {
             }
             ShaderEntry::MultiHeadAttnGradKV
             | ShaderEntry::FlashGradKV
-            | ShaderEntry::FlashGradKVCoop => {
+            | ShaderEntry::FlashGradKVCoopF16
+            | ShaderEntry::FlashGradKVCoopF32 => {
                 pc.bind(
                     0,
                     &MultiHeadAttnGradKVData {
@@ -563,7 +564,8 @@ impl Session {
             }
             ShaderEntry::MultiHeadAttnGradQ
             | ShaderEntry::FlashGradQ
-            | ShaderEntry::FlashGradQCoop => {
+            | ShaderEntry::FlashGradQCoopF16
+            | ShaderEntry::FlashGradQCoopF32 => {
                 pc.bind(
                     0,
                     &MultiHeadAttnGradData {

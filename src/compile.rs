@@ -310,16 +310,20 @@ pub enum ShaderEntry {
     /// `MEGANEURA_FLASH_FWD_COOP=0`.
     /// BQ=BKV=16, dispatched as `[ceil(q_seq/16), num_heads, 1]`.
     FlashAttentionCoop,
-    /// Cooperative-matrix flash backward dQ kernel. Three coop matmuls
-    /// per KV tile: score=Q·K^T, dp=dO·V^T, dQ+=ds·K. Opt-in via
+    /// F16-input cooperative products for score=Q·K^T and dp=dO·V^T,
+    /// with scalar f32 dQ+=ds·K accumulation. Opt-in via
     /// `MEGANEURA_FLASH_BWD_COOP=1`. BQ=BKV=16,
     /// dispatched as `[ceil(q_seq/16), num_heads, 1]`.
-    FlashGradQCoop,
-    /// Cooperative-matrix flash backward dK + dV kernel (fused).
+    FlashGradQCoopF16,
+    /// F16-input cooperative flash backward dK + dV kernel (fused).
     /// Two coop matmuls per Q-tile: score = K·Q^T, dp = V·dO^T.
     /// dV/dK accumulate per-thread. Dispatched as
     /// `[ceil(dispatch_kv/16), num_kv_heads, 1]`.
-    FlashGradKVCoop,
+    FlashGradKVCoopF16,
+    /// F32 cooperative dK/dV, 16 keys per tile, specialized for 64-wide heads.
+    FlashGradKVCoopF32,
+    /// F32 cooperative dQ, 16 queries per tile, specialized for 64-wide heads.
+    FlashGradQCoopF32,
     MultiHeadAttnGradQ,
     FlashGradQ,
     MultiHeadAttnGradKV,
@@ -452,8 +456,10 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttn
             | ShaderEntry::FlashAttention
             | ShaderEntry::FlashAttentionCoop
-            | ShaderEntry::FlashGradQCoop
-            | ShaderEntry::FlashGradKVCoop
+            | ShaderEntry::FlashGradQCoopF16
+            | ShaderEntry::FlashGradKVCoopF16
+            | ShaderEntry::FlashGradKVCoopF32
+            | ShaderEntry::FlashGradQCoopF32
             | ShaderEntry::MultiHeadAttnGradQ
             | ShaderEntry::FlashGradQ
             | ShaderEntry::MultiHeadAttnGradKV
@@ -606,8 +612,10 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttn => ShaderGroup::MultiHeadAttn,
             ShaderEntry::FlashAttention => ShaderGroup::FlashAttention,
             ShaderEntry::FlashAttentionCoop => ShaderGroup::FlashAttentionCoop,
-            ShaderEntry::FlashGradQCoop => ShaderGroup::FlashGradQCoop,
-            ShaderEntry::FlashGradKVCoop => ShaderGroup::FlashGradKVCoop,
+            ShaderEntry::FlashGradQCoopF16 => ShaderGroup::FlashGradQCoopF16,
+            ShaderEntry::FlashGradKVCoopF16 => ShaderGroup::FlashGradKVCoopF16,
+            ShaderEntry::FlashGradKVCoopF32 => ShaderGroup::FlashGradKVCoopF32,
+            ShaderEntry::FlashGradQCoopF32 => ShaderGroup::FlashGradQCoopF32,
             ShaderEntry::MultiHeadAttnGradQ => ShaderGroup::MultiHeadAttnGradQ,
             ShaderEntry::FlashGradQ => ShaderGroup::FlashGradQ,
             ShaderEntry::MultiHeadAttnGradKV => ShaderGroup::MultiHeadAttnGradKV,
@@ -722,10 +730,12 @@ impl ShaderEntry {
             | ShaderEntry::FlashAttentionCoop
             | ShaderEntry::MultiHeadAttnGradQ
             | ShaderEntry::FlashGradQ
-            | ShaderEntry::FlashGradQCoop
+            | ShaderEntry::FlashGradQCoopF16
             | ShaderEntry::MultiHeadAttnGradKV
             | ShaderEntry::FlashGradKV
-            | ShaderEntry::FlashGradKVCoop => "main",
+            | ShaderEntry::FlashGradKVCoopF16
+            | ShaderEntry::FlashGradQCoopF32
+            | ShaderEntry::FlashGradKVCoopF32 => "main",
             ShaderEntry::SwiGLUGradGate => "swiglu_grad_gate",
             ShaderEntry::SwiGLUGradUp => "swiglu_grad_up",
             ShaderEntry::SiluGrad => "silu_grad",
@@ -2870,6 +2880,51 @@ fn gelu_ops(x: u16, next: u16) -> [Pw; 9] {
 
 const MAX_COMPUTE_WORKGROUPS_PER_DIMENSION: u32 = 65_535;
 
+/// Conservative launch domain shared by automatic promotion and tuning.
+/// A supported matrix shape does not imply a larger dispatch-axis limit.
+pub(crate) fn workgroups_within_portable_limits(workgroups: [u32; 3]) -> bool {
+    workgroups
+        .into_iter()
+        .all(|count| count > 0 && count <= MAX_COMPUTE_WORKGROUPS_PER_DIMENSION)
+}
+
+/// Reserve complete cooperative output tiles without wrapping shader indices
+/// or host byte counts. In particular, a valid 4 GiB allocation is not zero.
+pub(crate) fn cooperative_output_bytes(m: u32, n: u32, batch: u32, tile: u32) -> Option<usize> {
+    let rows = m.div_ceil(tile).checked_mul(tile)?;
+    let cols = n.div_ceil(tile).checked_mul(tile)?;
+    let elements = rows.checked_mul(cols)?.checked_mul(batch)?;
+    usize::try_from(elements).ok()?.checked_mul(4)
+}
+
+#[cfg(test)]
+mod dispatch_limits {
+    use super::{cooperative_output_bytes, workgroups_within_portable_limits};
+
+    #[test]
+    fn cooperative_padding_checks_shader_and_host_extents() {
+        assert_eq!(cooperative_output_bytes(65, 272, 1, 32), Some(96 * 288 * 4));
+        assert_eq!(
+            cooperative_output_bytes(32_767, 32_768, 1, 32),
+            usize::try_from(1_u64 << 32).ok(),
+        );
+        assert_eq!(cooperative_output_bytes(65_535, 65_536, 1, 32), None);
+        assert_eq!(cooperative_output_bytes(32, 32, u32::MAX, 32), None);
+    }
+
+    #[test]
+    fn every_axis_must_be_nonzero_and_within_the_portable_limit() {
+        assert!(workgroups_within_portable_limits([65_535; 3]));
+        for axis in 0..3 {
+            for count in [0, 65_536, u32::MAX] {
+                let mut grid = [1; 3];
+                grid[axis] = count;
+                assert!(!workgroups_within_portable_limits(grid));
+            }
+        }
+    }
+}
+
 /// Tile row-GEMV workgroups across X and Y within the portable limit.
 /// `groups` workgroups of a one-dimensional kernel over X and Y, each
 /// within the portable per-axis limit; the kernel flattens them back.
@@ -2909,7 +2964,7 @@ fn matmul_workgroups_rect(m: u32, n: u32, row_tile: u32, col_tile: u32) -> [u32;
 /// Largest of 64/32/16 whose launch grid has at least 64 workgroups.
 ///
 /// A 64-wide tile with only a few workgroups leaves most of the GPU idle.
-/// Native f32 cooperative kernels are selected on that same 64-wide entry
+/// F32 cooperative kernels are selected on that same 64-wide entry
 /// once its grid reaches 16 workgroups, so devices that have one keep it.
 /// The 16-wide tile is the tail: one accumulator per thread, used when the
 /// wider launches would sit almost empty.
@@ -4364,8 +4419,8 @@ mod tests {
             .map(|dispatch| dispatch.shader.clone())
             .collect();
         assert!(safe_entries.contains(&ShaderEntry::FlashAttentionCoop));
-        assert!(!safe_entries.contains(&ShaderEntry::FlashGradQCoop));
-        assert!(!safe_entries.contains(&ShaderEntry::FlashGradKVCoop));
+        assert!(!safe_entries.contains(&ShaderEntry::FlashGradQCoopF16));
+        assert!(!safe_entries.contains(&ShaderEntry::FlashGradKVCoopF16));
 
         let experimental = compile_with_caps_policy(
             &differentiated,
@@ -4379,8 +4434,8 @@ mod tests {
             .iter()
             .map(|dispatch| dispatch.shader.clone())
             .collect();
-        assert!(experimental_entries.contains(&ShaderEntry::FlashGradQCoop));
-        assert!(experimental_entries.contains(&ShaderEntry::FlashGradKVCoop));
+        assert!(experimental_entries.contains(&ShaderEntry::FlashGradQCoopF16));
+        assert!(experimental_entries.contains(&ShaderEntry::FlashGradKVCoopF16));
 
         g.nodes_mut()[attention as usize].requires_full_precision = true;
         let full =
@@ -4406,8 +4461,8 @@ mod tests {
         assert!(scalar.dispatches.iter().all(|dispatch| !matches!(
             &dispatch.shader,
             ShaderEntry::FlashAttentionCoop
-                | ShaderEntry::FlashGradQCoop
-                | ShaderEntry::FlashGradKVCoop
+                | ShaderEntry::FlashGradQCoopF16
+                | ShaderEntry::FlashGradKVCoopF16
         )));
     }
 
@@ -4440,13 +4495,115 @@ mod tests {
         assert!(
             plan.dispatches
                 .iter()
-                .any(|dispatch| dispatch.shader == ShaderEntry::FlashGradKVCoop)
+                .any(|dispatch| dispatch.shader == ShaderEntry::FlashGradKVCoopF16)
         );
         assert!(
             plan.dispatches
                 .iter()
                 .all(|dispatch| { dispatch.shader != ShaderEntry::MultiHeadAttnGradKV })
         );
+    }
+
+    #[test]
+    fn coop_f32_attention_backward_requires_qualified_shape_and_storage() {
+        for (tile, head_dim, q_seq, kv_seq, bytes, expected) in [
+            (8, 64, 129, 145, 18_624, [true, true]),
+            (8, 64, 129, 145, 18_623, [false, false]),
+            (0, 64, 129, 145, 32_768, [false, false]),
+            (16, 64, 129, 145, 32_768, [false, false]),
+            (8, 128, 129, 145, 32_768, [false, false]),
+            (8, 64, 50, 145, 32_768, [false, false]),
+            (8, 64, 129, 16, 32_768, [false, false]),
+            (8, 64, 16 * 65_535, 128, 32_768, [true, true]),
+            (8, 64, 16 * 65_536, 128, 32_768, [false, true]),
+            (8, 64, 128, 16 * 65_535, 32_768, [true, true]),
+            (8, 64, 128, 16 * 65_536, 32_768, [true, false]),
+        ] {
+            let mut graph = Graph::new();
+            let q = graph.parameter("q", &[q_seq, head_dim]);
+            let k = graph.parameter("k", &[kv_seq, head_dim]);
+            let v = graph.parameter("v", &[kv_seq, head_dim]);
+            let attention = graph.multi_head_attn(q, k, v, 1, 1, head_dim as u32, true);
+            let loss = graph.sum_all(attention);
+            graph.set_outputs(vec![loss]);
+            let backward = crate::autodiff::differentiate(&graph);
+            let plan = compile_with_caps(
+                &backward,
+                &CompileOptions::default(),
+                crate::codegen::CoopCaps {
+                    f16_tile: 0,
+                    f32_tile: tile,
+                },
+                bytes,
+            );
+            for (shader, expected) in [
+                (ShaderEntry::FlashGradQCoopF32, expected[0]),
+                (ShaderEntry::FlashGradKVCoopF32, expected[1]),
+            ] {
+                assert_eq!(
+                    plan.dispatches
+                        .iter()
+                        .any(|dispatch| dispatch.shader == shader),
+                    expected,
+                    "{shader:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coop_f32_attention_backward_respects_independent_scalar_layouts() {
+        for (q_cap, kv_cap) in [(Some(4), None), (None, Some(8))] {
+            let mut graph = Graph::new();
+            let q = graph.parameter("q", &[129, 64]);
+            let k = graph.parameter("k", &[145, 64]);
+            let v = graph.parameter("v", &[145, 64]);
+            let attention = graph.multi_head_attn(q, k, v, 1, 1, 64, true);
+            let loss = graph.sum_all(attention);
+            graph.set_outputs(vec![loss]);
+            let mut backward = crate::autodiff::differentiate(&graph);
+            for node in backward.nodes_mut() {
+                match node.op {
+                    Op::MultiHeadAttnGradQ { .. } => node.attention_ept_cap = q_cap,
+                    Op::MultiHeadAttnGradK { .. } => node.attention_ept_cap = kv_cap,
+                    _ => {}
+                }
+            }
+            let plan = compile_with_caps(
+                &backward,
+                &CompileOptions::default(),
+                crate::codegen::CoopCaps {
+                    f16_tile: 0,
+                    f32_tile: 8,
+                },
+                32_768,
+            );
+            for (cap, cooperative, scalar) in [
+                (
+                    q_cap,
+                    ShaderEntry::FlashGradQCoopF32,
+                    ShaderEntry::FlashGradQ,
+                ),
+                (
+                    kv_cap,
+                    ShaderEntry::FlashGradKVCoopF32,
+                    ShaderEntry::FlashGradKV,
+                ),
+            ] {
+                let dispatch = plan
+                    .dispatches
+                    .iter()
+                    .find(|dispatch| dispatch.shader == cooperative || dispatch.shader == scalar)
+                    .unwrap();
+                if let Some(ept_cap) = cap {
+                    assert_eq!(dispatch.shader, scalar);
+                    assert_eq!(dispatch.kernel, Kernel::AttentionBackward { ept_cap });
+                } else {
+                    assert_eq!(dispatch.shader, cooperative);
+                    assert_eq!(dispatch.kernel, Kernel::Default);
+                }
+            }
+        }
     }
 
     #[test]
@@ -4481,8 +4638,8 @@ mod tests {
             let plan = compile_with_caps(&differentiated, &options, caps, bytes);
             for (shader, wanted) in [
                 ShaderEntry::FlashAttentionCoop,
-                ShaderEntry::FlashGradQCoop,
-                ShaderEntry::FlashGradKVCoop,
+                ShaderEntry::FlashGradQCoopF16,
+                ShaderEntry::FlashGradKVCoopF16,
             ]
             .into_iter()
             .zip(expected)
