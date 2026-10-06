@@ -257,6 +257,7 @@ impl<'a> Compiler<'a> {
             // an explicit opt-in rather than following from the device
             // advertising f16 matrices.
             reduced_precision: self.allow_reduced_precision_attention_backward,
+            prefer: self.options.prefer_attention_grad,
         };
         let kernel = AttentionGrad::select(&problem, &target);
         (kernel, kernel.workgroups(&problem), problem.ept_cap)

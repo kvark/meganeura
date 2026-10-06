@@ -96,6 +96,8 @@ pub(crate) struct Target {
     pub shared_memory_bytes: u32,
     /// [`CompileOptions::flash_backward_coop`](crate::CompileOptions).
     pub reduced_precision: bool,
+    /// [`CompileOptions::prefer_attention_grad`](crate::CompileOptions).
+    pub prefer: Option<Path>,
 }
 
 /// Rows per cooperative tile.
@@ -113,6 +115,10 @@ const ROWWISE_MAX_HEAD_DIM: u32 = 256;
 impl Family for Path {
     type Problem = Problem;
     type Target = Target;
+    fn preferred(target: &Target) -> Option<Self> {
+        target.prefer
+    }
+
     const PREFERENCE: &'static [Self] = &[
         Path::Cooperative(Operands::F32),
         Path::Cooperative(Operands::F16),
@@ -334,6 +340,7 @@ mod tests {
         cooperative_f32: false,
         shared_memory_bytes: 1 << 20,
         reduced_precision: true,
+        prefer: None,
     };
 
     #[test]
@@ -358,6 +365,7 @@ mod tests {
             cooperative_f32: false,
             shared_memory_bytes: 0,
             reduced_precision: false,
+            prefer: None,
         };
         for part in [Part::Q, Part::KV] {
             for rows in [1, 2, 15, 16, 129] {
@@ -471,6 +479,25 @@ mod tests {
             };
             assert_eq!(F32.admits(&p, &small), Err("tiles exceed workgroup memory"));
         }
+    }
+
+    /// A preferred path is tried first and still has to admit the problem.
+    #[test]
+    fn preference_comes_first_but_still_admits() {
+        let p = problem(Part::Q, 256, 64);
+        let rowwise = Target {
+            prefer: Some(Path::Rowwise),
+            ..ROOMY
+        };
+        assert_eq!(AttentionGrad::select(&p, &rowwise).path, Path::Rowwise);
+        let f32 = Target {
+            prefer: Some(Path::Cooperative(Operands::F32)),
+            ..ROOMY
+        };
+        assert_eq!(
+            AttentionGrad::select(&p, &f32).path,
+            Path::Cooperative(Operands::F16)
+        );
     }
 
     #[test]

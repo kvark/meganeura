@@ -33,6 +33,13 @@ pub(crate) trait Family: Copy + Eq + std::fmt::Debug + 'static {
 
     /// Whether this variant computes `problem` on `target`, and if not, why.
     fn admits(self, problem: &Self::Problem, target: &Self::Target) -> Result<(), Rejection>;
+
+    /// A variant `target` asks to try before the usual order, as a test
+    /// pinning each variant in turn does. It is still subject to
+    /// [`Family::admits`].
+    fn preferred(_target: &Self::Target) -> Option<Self> {
+        None
+    }
 }
 
 /// The variant [`select`] picked, and the reasons every preferred variant
@@ -52,7 +59,7 @@ pub(crate) struct Selection<F> {
 /// does not support at all, which the graph builders refuse earlier.
 pub(crate) fn select<F: Family>(problem: &F::Problem, target: &F::Target) -> Selection<F> {
     let mut declined = Vec::new();
-    for &variant in F::PREFERENCE {
+    for &variant in F::preferred(target).iter().chain(F::PREFERENCE) {
         match variant.admits(problem, target) {
             Ok(()) => {
                 if !declined.is_empty() {
