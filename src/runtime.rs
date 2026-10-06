@@ -1,4 +1,5 @@
 use crate::compile::{BufferRef, CachedBlockAttentionParams, Dispatch, ExecutionPlan, ShaderEntry};
+use crate::kernels::attention_grad::Part as AttentionGradPart;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1369,26 +1370,7 @@ impl Pipelines {
                 ShaderGroup::FlashAttentionCoop => {
                     crate::codegen::generate_flash_attention_coop_module(hd)
                 }
-                ShaderGroup::FlashGradQ => crate::codegen::generate_flash_grad_q_module(
-                    hd,
-                    ept.unwrap_or(knobs.flash_grad_q_ept_cap),
-                ),
-                ShaderGroup::FlashGradQCoopF16 => {
-                    crate::codegen::generate_flash_grad_q_coop_f16_module(hd)
-                }
-                ShaderGroup::FlashGradKV => crate::codegen::generate_flash_grad_kv_module(
-                    hd,
-                    ept.unwrap_or(knobs.flash_grad_kv_ept_cap),
-                ),
-                ShaderGroup::FlashGradKVCoopF16 => {
-                    crate::codegen::generate_flash_grad_kv_coop_f16_module(hd)
-                }
-                ShaderGroup::FlashGradKVCoopF32 => {
-                    crate::codegen::generate_flash_grad_kv_coop_f32_module(hd)
-                }
-                ShaderGroup::FlashGradQCoopF32 => {
-                    crate::codegen::generate_flash_grad_q_coop_f32_module(hd)
-                }
+                ShaderGroup::AttentionGrad(kernel) => kernel.generate(hd, ept, &knobs),
                 ShaderGroup::MultiHeadAttn => crate::codegen::generate_attention_module(hd),
                 ShaderGroup::CachedQueryAttention => {
                     crate::codegen::generate_cached_query_attention_module(hd)
@@ -1446,13 +1428,10 @@ impl Pipelines {
             ShaderGroup::MultiHeadAttn
             | ShaderGroup::FlashAttention
             | ShaderGroup::FlashAttentionCoop
-            | ShaderGroup::FlashGradQ
-            | ShaderGroup::FlashGradQCoopF16
-            | ShaderGroup::FlashGradKV
-            | ShaderGroup::FlashGradKVCoopF16
-            | ShaderGroup::FlashGradKVCoopF32
-            | ShaderGroup::FlashGradQCoopF32
             | ShaderGroup::CachedQueryAttention => dispatch.params.get(3).copied(),
+            ShaderGroup::AttentionGrad(kernel) if kernel.specializes_head_dim() => {
+                dispatch.params.get(3).copied()
+            }
             _ => None,
         }
     }
@@ -1841,14 +1820,10 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::MultiHeadAttn
         | ShaderEntry::FlashAttention
         | ShaderEntry::FlashAttentionCoop => MultiHeadAttnData::layout(),
-        ShaderEntry::MultiHeadAttnGradQ
-        | ShaderEntry::FlashGradQ
-        | ShaderEntry::FlashGradQCoopF16
-        | ShaderEntry::FlashGradQCoopF32 => MultiHeadAttnGradData::layout(),
-        ShaderEntry::MultiHeadAttnGradKV
-        | ShaderEntry::FlashGradKV
-        | ShaderEntry::FlashGradKVCoopF16
-        | ShaderEntry::FlashGradKVCoopF32 => MultiHeadAttnGradKVData::layout(),
+        ShaderEntry::AttentionGrad(kernel) => match kernel.part {
+            AttentionGradPart::Q => MultiHeadAttnGradData::layout(),
+            AttentionGradPart::KV => MultiHeadAttnGradKVData::layout(),
+        },
         ShaderEntry::SwiGLUGradGate => TernaryData::layout(),
         ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => BinaryData::layout(),
         ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradWRowPar | ShaderEntry::RmsNormGradX => {

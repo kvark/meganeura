@@ -20,6 +20,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use meganeura::kernels::attention_grad::{AttentionGrad, Operands, Part, Path};
+
+const COOP_F32: Path = Path::Cooperative(Operands::F32);
+
+fn grad(part: Part, path: Path) -> ShaderEntry {
+    ShaderEntry::AttentionGrad(AttentionGrad::new(part, path))
+}
+
 const REPLAYS: usize = 16;
 const ROUNDS: usize = 8;
 
@@ -308,14 +316,14 @@ fn attention(gpu: &Arc<blade_graphics::Context>, records: &mut Vec<Value>) {
         for (direction, scalar, cooperative, lengths) in [
             (
                 "dq",
-                ShaderEntry::FlashGradQ,
-                ShaderEntry::FlashGradQCoopF32,
+                grad(Part::Q, Path::Flash),
+                grad(Part::Q, COOP_F32),
                 vec![q_len],
             ),
             (
                 "dkv",
-                ShaderEntry::FlashGradKV,
-                ShaderEntry::FlashGradKVCoopF32,
+                grad(Part::KV, Path::Flash),
+                grad(Part::KV, COOP_F32),
                 vec![kv_len, kv_len],
             ),
         ] {
@@ -417,7 +425,7 @@ fn training(gpu: &Arc<blade_graphics::Context>, records: &mut Vec<Value>) {
                 .plan()
                 .dispatches
                 .iter()
-                .any(|d| d.shader == ShaderEntry::FlashGradQCoopF32),
+                .any(|d| d.shader == grad(Part::Q, COOP_F32)),
             coop
         );
         for (name, buffer) in session.plan().param_buffers.clone() {

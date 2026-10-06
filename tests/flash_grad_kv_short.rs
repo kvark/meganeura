@@ -8,6 +8,14 @@ use std::sync::Arc;
 
 use meganeura::{Graph, Mode, SessionConfig, build, compile::ShaderEntry};
 
+use meganeura::kernels::attention_grad::{AttentionGrad, Operands, Part, Path};
+
+const COOP_F16: Path = Path::Cooperative(Operands::F16);
+
+fn grad(part: Part, path: Path) -> ShaderEntry {
+    ShaderEntry::AttentionGrad(AttentionGrad::new(part, path))
+}
+
 fn run(
     gpu: Arc<blade_graphics::Context>,
     q_seq: usize,
@@ -39,8 +47,8 @@ fn run(
     let (mut session, _) = build(&graph, config);
     let uses_coop = [
         ShaderEntry::FlashAttentionCoop,
-        ShaderEntry::FlashGradQCoopF16,
-        ShaderEntry::FlashGradKVCoopF16,
+        grad(Part::Q, COOP_F16),
+        grad(Part::KV, COOP_F16),
     ]
     .map(|shader| {
         session

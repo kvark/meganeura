@@ -18,6 +18,7 @@ use super::{
     reduction_is_dynamic,
 };
 use crate::compile::{BufferRef, CachedBlockAttentionParams, Dispatch, ShaderEntry};
+use crate::kernels::attention_grad::{AttentionGrad, Part as AttentionGradPart};
 
 impl Session {
     pub(super) fn bind_dispatch(
@@ -534,10 +535,10 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::MultiHeadAttnGradKV
-            | ShaderEntry::FlashGradKV
-            | ShaderEntry::FlashGradKVCoopF16
-            | ShaderEntry::FlashGradKVCoopF32 => {
+            ShaderEntry::AttentionGrad(AttentionGrad {
+                part: AttentionGradPart::KV,
+                ..
+            }) => {
                 pc.bind(
                     0,
                     &MultiHeadAttnGradKVData {
@@ -562,10 +563,10 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::MultiHeadAttnGradQ
-            | ShaderEntry::FlashGradQ
-            | ShaderEntry::FlashGradQCoopF16
-            | ShaderEntry::FlashGradQCoopF32 => {
+            ShaderEntry::AttentionGrad(AttentionGrad {
+                part: AttentionGradPart::Q,
+                ..
+            }) => {
                 pc.bind(
                     0,
                     &MultiHeadAttnGradData {
