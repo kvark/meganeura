@@ -8,7 +8,9 @@
   place of eight entries, and one selector replaces the per-part
   promotion logic. Profile and pipeline names read
   `AttentionGrad(dQ-flash)`, `AttentionGrad(dKV-cooperative-f32)` and so
-  on. Plan-cache format 21.
+  on. Plan-cache format 21. `CompileOptions::prefer_attention_grad` tries
+  one path first wherever it admits the problem, and the oracle suite runs
+  every path on shapes spanning each one's admission edges.
 - Measured training builds explore independent scalar dQ and dK/dV layouts
   through egglog, interleaved with graph alternatives under the existing
   search bounds. Each dispatch and pipeline key retains its extracted EPT

@@ -202,6 +202,11 @@ pub struct CompileOptions {
     /// selected kernel but never flips it. Set it false to keep f32
     /// activations, e.g. to pin packed-weight decode fidelity in a test.
     pub quantized_activations: bool,
+    /// An attention backward path to try before the usual order wherever
+    /// it admits the problem, so a test or benchmark can run each path in
+    /// turn. Paths that decline fall back to the usual choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer_attention_grad: Option<crate::kernels::attention_grad::Path>,
 }
 
 impl Default for CompileOptions {
@@ -215,6 +220,7 @@ impl Default for CompileOptions {
             cached_attention_splits: None,
             conv_weight_splits: None,
             quantized_activations: true,
+            prefer_attention_grad: None,
         }
     }
 }
@@ -4349,6 +4355,7 @@ mod tests {
                 cooperative_f32: false,
                 shared_memory_bytes: 0,
                 reduced_precision: false,
+                prefer: None,
             };
             for (part, ept_cap, bq) in [
                 (Part::Q, grad_q_ept, grad_q_bq),

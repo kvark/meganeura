@@ -11,8 +11,9 @@
 //! `tpq == 1` backward path), 128 for 64, 64 for 128, 32 for 256 and 16 for
 //! 512. Forward kernels stage keys in tiles of 8 with a one-key tail.
 
-use meganeura::compile::compile_with;
+use meganeura::compile::{ShaderEntry, compile_with};
 use meganeura::graph::Op;
+use meganeura::kernels::attention_grad::{AttentionGrad, Part, Path};
 use meganeura::reference::{Feeds, gpu, gradients};
 use meganeura::{Graph, NodeId, TensorType};
 use std::collections::BTreeSet;
@@ -301,6 +302,68 @@ fn backward_sweep(kinds: &[Kind], shapes: &[Shape]) {
             let feeds = random(&g, 200 + n as u64);
             sweep.inference(&format!("{kind:?} backward {s:?}"), &g, &feeds, &options);
         }
+    }
+    sweep.finish();
+}
+
+/// Every attention backward path, pinned in turn, against the reference on
+/// shapes that span each path's admission edges: one row, ragged tiles,
+/// the cooperative 16-row tile, the f32 path's 128 rows on either side, a
+/// width that is not a power of two and GQA. A path a shape or the device
+/// does not admit falls back to the usual choice, which other cases cover;
+/// the paths every device runs must each be exercised for both parts.
+#[test]
+fn every_backward_path_against_the_reference() {
+    let shapes = [
+        (Kind::Causal, shape(1, 1, 2, 1, 64)),
+        (Kind::Causal, shape(17, 17, 2, 2, 16)),
+        (Kind::Window(17), shape(33, 33, 2, 1, 256)),
+        (Kind::Mha { cross: true }, shape(20, 9, 2, 1, 48)),
+        (Kind::Causal, shape(130, 130, 2, 1, 64)),
+        (Kind::Mha { cross: true }, shape(129, 145, 4, 2, 64)),
+    ];
+    let paths: Vec<Path> = AttentionGrad::ALL
+        .iter()
+        .filter(|kernel| kernel.part == Part::Q)
+        .map(|kernel| kernel.path)
+        .collect();
+    let mut sweep = Sweep::default();
+    let mut exercised = BTreeSet::new();
+    for (n, &(kind, s)) in shapes.iter().enumerate() {
+        let g = backward_graph(kind, s);
+        let feeds = random(&g, 300 + n as u64);
+        for &path in &paths {
+            let mut options = gpu::Options::default();
+            options.compile.prefer_attention_grad = Some(path);
+            options.compile.flash_backward_coop = true;
+            let chosen: Vec<AttentionGrad> = compile_with(&g, &options.compile)
+                .dispatches
+                .iter()
+                .filter_map(|d| match d.shader {
+                    ShaderEntry::AttentionGrad(kernel) => Some(kernel),
+                    _ => None,
+                })
+                .collect();
+            if chosen.iter().all(|kernel| kernel.path != path) {
+                continue;
+            }
+            exercised.extend(
+                chosen
+                    .iter()
+                    .filter(|kernel| kernel.path == path)
+                    .map(|kernel| format!("{kernel:?}")),
+            );
+            sweep.inference(
+                &format!("{kind:?} backward {s:?} preferring {path:?}"),
+                &g,
+                &feeds,
+                &options,
+            );
+        }
+    }
+    println!("exercised: {exercised:?}");
+    for kernel in ["dQ-flash", "dQ-rowwise", "dKV-flash", "dKV-rowwise"] {
+        assert!(exercised.contains(kernel), "{kernel} never ran");
     }
     sweep.finish();
 }
