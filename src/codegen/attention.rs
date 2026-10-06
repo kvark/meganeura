@@ -221,6 +221,14 @@ fn generate_flash_attention(
                 },
             ),
             (
+                "$BLOCK_CAUSAL",
+                if cached {
+                    "    let block_causal = false;\n    let prefix_len = 0u;"
+                } else {
+                    "    let block_causal = (params.window_size & 0x80000000u) != 0u;\n    let prefix_len = params.window_size & 0x7fffffffu;"
+                },
+            ),
+            (
                 "$LSE_BINDING",
                 if cached { "" } else { fragment("lse_binding") },
             ),

@@ -352,6 +352,7 @@ pub fn eval_node(
         | Op::RoPE { .. }
         | Op::RoPEGrad { .. }
         | Op::RoPEPositions { .. }
+        | Op::AxialRoPE { .. }
         | Op::PairwiseSquaredDistance { .. }
         | Op::PairwiseVectorRejection { .. }
         | Op::PairwiseGrad { .. } => norm::eval(node, inputs)?,
@@ -371,6 +372,7 @@ pub fn eval_node(
         Op::CausalAttention { .. }
         | Op::CausalAttentionRoPE { .. }
         | Op::FullAttention { .. }
+        | Op::BlockCausalAttention { .. }
         | Op::CrossAttention { .. }
         | Op::MultiHeadAttn { .. }
         | Op::MultiHeadAttnGradQ { .. }
@@ -470,7 +472,7 @@ pub fn error_scales(graph: &Graph, values: &[Tensor]) -> Result<Vec<Vec<f64>>, E
             }
         } else if matches!(
             node.op,
-            Op::RoPE { .. } | Op::RoPEGrad { .. } | Op::RoPEPositions { .. }
+            Op::RoPE { .. } | Op::RoPEGrad { .. } | Op::RoPEPositions { .. } | Op::AxialRoPE { .. }
         ) {
             let propagated =
                 norm::rotation_error_scale(node, &inputs, &scales[node.inputs[0] as usize])?;

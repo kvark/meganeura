@@ -4138,7 +4138,7 @@ mod tests {
                 | ShaderEntry::Conv2dGradWeightGemmSplit16 => {
                     vec!["grad_out", "src", "dst", "params"]
                 }
-                ShaderEntry::RoPEDynamic | ShaderEntry::RoPEPositions => {
+                ShaderEntry::RoPEDynamic | ShaderEntry::RoPEPositions | ShaderEntry::AxialRoPE => {
                     vec!["src", "dst", "pos_offset_buf", "params"]
                 }
                 ShaderEntry::RoPEDynamicFactors => {
@@ -4260,6 +4260,7 @@ mod tests {
             ShaderEntry::RoPEDynamic,
             ShaderEntry::RoPEDynamicFactors,
             ShaderEntry::RoPEPositions,
+            ShaderEntry::AxialRoPE,
             ShaderEntry::MaxPool2d,
             ShaderEntry::MaxPool2dGrad,
             ShaderEntry::GlobalAvgPool,

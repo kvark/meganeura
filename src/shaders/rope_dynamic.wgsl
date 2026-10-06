@@ -83,6 +83,53 @@ fn with_positions(@builtin(global_invocation_id) gid: vec3<u32>) {
     dst[idx1] = v0 * sin_val + v1 * cos_val;
 }
 
+// Three-axis, adjacent-pair RoPE used by image diffusion transformers.
+// `pos_offset_buf` is `[seq, 3]`; negative coordinates are passed as the
+// two's-complement bit pattern of an i32.
+@compute @workgroup_size(256)
+fn axial_positions(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let pairs_per_row = params.dim / 2u;
+    let total = params.seq * pairs_per_row;
+    if i >= total { return; }
+
+    let row = i / pairs_per_row;
+    let pair_in_row = i % pairs_per_row;
+    let pairs_per_head = params.head_dim / 2u;
+    let head = pair_in_row / pairs_per_head;
+    let pair_in_head = pair_in_row % pairs_per_head;
+
+    let axis0_pairs = params._pad0 / 2u;
+    let axis1_pairs = params._pad1 / 2u;
+    var axis = 0u;
+    var local_pair = pair_in_head;
+    var axis_dim = params._pad0;
+    if pair_in_head >= axis0_pairs {
+        axis = 1u;
+        local_pair = pair_in_head - axis0_pairs;
+        axis_dim = params._pad1;
+    }
+    if pair_in_head >= axis0_pairs + axis1_pairs {
+        axis = 2u;
+        local_pair = pair_in_head - axis0_pairs - axis1_pairs;
+        axis_dim = params._pad2;
+    }
+
+    let pos = bitcast<i32>(pos_offset_buf[row * 3u + axis]);
+    let theta = bitcast<f32>(params.theta_bits);
+    let exponent = -2.0 * f32(local_pair) / f32(axis_dim);
+    let angle = f32(pos) * pow(theta, exponent);
+    let cos_val = cos(angle);
+    let sin_val = sin(angle);
+
+    let idx0 = row * params.dim + head * params.head_dim + pair_in_head * 2u;
+    let idx1 = idx0 + 1u;
+    let v0 = src[idx0];
+    let v1 = src[idx1];
+    dst[idx0] = v0 * cos_val - v1 * sin_val;
+    dst[idx1] = v0 * sin_val + v1 * cos_val;
+}
+
 
 // The freq-factor form: a per-pair divisor on top of the uniform base, as
 // GGML's rope consumes the `rope_freqs` tensor — pair i's angle runs at

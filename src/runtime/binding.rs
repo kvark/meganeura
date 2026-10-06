@@ -1027,7 +1027,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::RoPEDynamic | ShaderEntry::RoPEPositions => {
+            ShaderEntry::RoPEDynamic | ShaderEntry::RoPEPositions | ShaderEntry::AxialRoPE => {
                 pc.bind(
                     0,
                     &RoPEDynamicData {
@@ -1040,9 +1040,9 @@ impl Session {
                             theta_bits: dispatch.params[2],
                             pos_offset: dispatch.params[3],
                             head_dim: dispatch.params[4],
-                            _pad0: 0,
-                            _pad1: 0,
-                            _pad2: 0,
+                            _pad0: *dispatch.params.get(5).unwrap_or(&0),
+                            _pad1: *dispatch.params.get(6).unwrap_or(&0),
+                            _pad2: *dispatch.params.get(7).unwrap_or(&0),
                         },
                     },
                 );

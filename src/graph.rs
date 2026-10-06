@@ -461,6 +461,14 @@ pub enum Op {
         theta: f32,
         head_dim: u32,
     },
+    /// Interleaved RoPE with three independent position axes per row.
+    /// Inputs: `[x (F32), positions (U32 [seq, 3])]` where signed positions
+    /// are carried in two's-complement form.
+    AxialRoPE {
+        theta: f32,
+        head_dim: u32,
+        axes_dim: [u32; 3],
+    },
 
     // Fused causal multi-head attention with GQA
     // inputs: [q, k, v] as 2D: q=[seq, num_heads*head_dim], k/v=[seq, num_kv_heads*head_dim]
@@ -496,6 +504,16 @@ pub enum Op {
         num_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,
+    },
+
+    /// Self-attention with a causal prefix and a bidirectional suffix. Every
+    /// suffix query sees the complete sequence. This is the text + image mask
+    /// used by single-stream diffusion transformers such as Qwen-Image 2.1.
+    BlockCausalAttention {
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        prefix_len: u32,
     },
 
     // Cross-attention: query attends to key/value from a different sequence
@@ -2427,6 +2445,39 @@ impl Graph {
         )
     }
 
+    /// Apply adjacent-pair, three-axis RoPE using one signed `(frame, y, x)`
+    /// position per row. Signed positions are supplied through a U32 input by
+    /// casting each `i32` to `u32`.
+    #[track_caller]
+    pub fn axial_rope_with_positions(
+        &mut self,
+        x: NodeId,
+        theta: f32,
+        positions: NodeId,
+        head_dim: u32,
+        axes_dim: [u32; 3],
+    ) -> NodeId {
+        let x_shape = &self.node(x).ty.shape;
+        assert_eq!(x_shape.len(), 2, "axial rope requires 2D input");
+        let dim = u32::try_from(x_shape[1]).expect("rope dimension exceeds u32");
+        assert_eq!(dim % head_dim, 0, "rope: dim must be divisible by head_dim");
+        assert!(axes_dim.iter().all(|axis| axis.is_multiple_of(2)));
+        assert_eq!(axes_dim.iter().sum::<u32>(), head_dim);
+        let position_ty = &self.node(positions).ty;
+        assert_eq!(position_ty.dtype, DType::U32, "rope positions must be U32");
+        assert_eq!(position_ty.shape, vec![x_shape[0], 3]);
+        let ty = self.node(x).ty.clone();
+        self.add_node(
+            Op::AxialRoPE {
+                theta,
+                head_dim,
+                axes_dim,
+            },
+            vec![x, positions],
+            ty,
+        )
+    }
+
     #[track_caller]
     fn attention_type(
         &self,
@@ -3351,6 +3402,32 @@ impl Graph {
                 num_heads,
                 num_kv_heads,
                 head_dim,
+            },
+            vec![q, k, v],
+            ty,
+        )
+    }
+
+    #[track_caller]
+    pub fn block_causal_attention(
+        &mut self,
+        q: NodeId,
+        k: NodeId,
+        v: NodeId,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        prefix_len: u32,
+    ) -> NodeId {
+        let ty = self.attention_type(q, k, v, num_heads, num_kv_heads, head_dim);
+        assert_eq!(self.node(k).ty.shape[0], ty.shape[0]);
+        assert!(prefix_len as usize <= ty.shape[0]);
+        self.add_node(
+            Op::BlockCausalAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                prefix_len,
             },
             vec![q, k, v],
             ty,

@@ -10,6 +10,37 @@ fn invalid(node: &Node, reason: impl Into<String>) -> Error {
     }
 }
 
+#[cfg(test)]
+mod qwen_image_tests {
+    use crate::Graph;
+    use crate::reference::{Feeds, evaluate_outputs};
+
+    #[test]
+    fn axial_rope_uses_signed_positions_and_adjacent_pairs() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[1, 6]);
+        let positions = graph.input_u32("positions", &[1, 3]);
+        let out = graph.axial_rope_with_positions(x, 10_000.0, positions, 6, [2, 2, 2]);
+        graph.set_outputs(vec![out]);
+        let mut feeds = Feeds::new();
+        feeds
+            .set("x", &[1.0, 0.0, 1.0, 0.0, 1.0, 0.0])
+            .set_u32("positions", &[1, (-1i32) as u32, 2]);
+        let out = evaluate_outputs(&graph, &feeds).unwrap().remove(0);
+        let expected = [
+            1.0f64.cos(),
+            1.0f64.sin(),
+            1.0f64.cos(),
+            -1.0f64.sin(),
+            2.0f64.cos(),
+            2.0f64.sin(),
+        ];
+        for (got, want) in out.data.iter().zip(expected) {
+            assert!((got - want).abs() < 1.0e-12, "{got} != {want}");
+        }
+    }
+}
+
 /// `[rows, cols]` of a 2D tensor.
 fn matrix(node: &Node, t: &Tensor, what: &str) -> Result<(usize, usize), Error> {
     match t.shape[..] {
@@ -216,7 +247,7 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 
 pub(super) fn eval(node: &Node, ins: &[&Tensor]) -> Result<Vec<f64>, Error> {
     let arity = match node.op {
-        Op::RmsNorm { .. } | Op::RoPEPositions { .. } => 2,
+        Op::RmsNorm { .. } | Op::RoPEPositions { .. } | Op::AxialRoPE { .. } => 2,
         Op::RoPE { freq_factors, .. } => {
             if freq_factors {
                 3
@@ -336,6 +367,53 @@ pub(super) fn eval(node: &Node, ins: &[&Tensor]) -> Result<Vec<f64>, Error> {
         }
         Op::RoPE { .. } | Op::RoPEGrad { .. } | Op::RoPEPositions { .. } => {
             rope(ins[0], &rotation(node, ins)?)
+        }
+        Op::AxialRoPE {
+            theta,
+            head_dim,
+            axes_dim,
+        } => {
+            let x = ins[0];
+            let positions = ins[1];
+            let (rows, dim) = matrix(node, x, "input")?;
+            if positions.shape != [rows, 3] {
+                return Err(invalid(node, "axial positions must have shape [rows, 3]"));
+            }
+            let head_dim = head_dim as usize;
+            let axis_pairs = [
+                axes_dim[0] as usize / 2,
+                axes_dim[1] as usize / 2,
+                axes_dim[2] as usize / 2,
+            ];
+            let mut out = vec![0.0; x.len()];
+            for row in 0..rows {
+                for head in 0..dim / head_dim {
+                    let base = row * dim + head * head_dim;
+                    for pair in 0..head_dim / 2 {
+                        let (axis, local) = if pair < axis_pairs[0] {
+                            (0, pair)
+                        } else if pair < axis_pairs[0] + axis_pairs[1] {
+                            (1, pair - axis_pairs[0])
+                        } else {
+                            (2, pair - axis_pairs[0] - axis_pairs[1])
+                        };
+                        let raw = positions.data[row * 3 + axis];
+                        let pos = if raw > i32::MAX as f64 {
+                            raw - 4294967296.0
+                        } else {
+                            raw
+                        };
+                        let angle = pos
+                            * f64::from(theta).powf(-2.0 * local as f64 / axes_dim[axis] as f64);
+                        let (sin, cos) = angle.sin_cos();
+                        let i0 = base + pair * 2;
+                        let i1 = i0 + 1;
+                        out[i0] = x.data[i0] * cos - x.data[i1] * sin;
+                        out[i1] = x.data[i0] * sin + x.data[i1] * cos;
+                    }
+                }
+            }
+            out
         }
         // out[m, p] = ‖left[m] − right[m·P + p]‖².
         Op::PairwiseSquaredDistance { pairs } => {

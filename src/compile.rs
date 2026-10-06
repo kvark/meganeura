@@ -424,6 +424,7 @@ pub enum ShaderEntry {
     RoPEDynamic,
     RoPEDynamicFactors,
     RoPEPositions,
+    AxialRoPE,
     MaxPool2d,
     MaxPool2dGrad,
     GlobalAvgPool,
@@ -569,7 +570,8 @@ impl ShaderEntry {
             | ShaderEntry::MulPerChannel
             | ShaderEntry::RoPEDynamic
             | ShaderEntry::RoPEDynamicFactors
-            | ShaderEntry::RoPEPositions => "pointwise",
+            | ShaderEntry::RoPEPositions
+            | ShaderEntry::AxialRoPE => "pointwise",
         }
     }
 
@@ -690,7 +692,7 @@ impl ShaderEntry {
             ShaderEntry::ChunkedRelativeAttention => ShaderGroup::ChunkedRelativeAttention,
             ShaderEntry::PrefixLast => ShaderGroup::PrefixLast,
             ShaderEntry::RoPEDynamic | ShaderEntry::RoPEDynamicFactors => ShaderGroup::RoPEDynamic,
-            ShaderEntry::RoPEPositions => ShaderGroup::RoPEDynamic,
+            ShaderEntry::RoPEPositions | ShaderEntry::AxialRoPE => ShaderGroup::RoPEDynamic,
             ShaderEntry::MaxPool2d => ShaderGroup::MaxPool2d,
             ShaderEntry::MaxPool2dGrad => ShaderGroup::MaxPool2dGrad,
             ShaderEntry::GlobalAvgPool => ShaderGroup::GlobalAvgPool,
@@ -802,6 +804,7 @@ impl ShaderEntry {
             ShaderEntry::RoPEDynamic => "main",
             ShaderEntry::RoPEDynamicFactors => "with_factors",
             ShaderEntry::RoPEPositions => "with_positions",
+            ShaderEntry::AxialRoPE => "axial_positions",
             ShaderEntry::MaxPool2d => "max_pool_2d",
             ShaderEntry::MaxPool2dGrad => "main",
             ShaderEntry::GlobalAvgPool => "global_avg_pool",

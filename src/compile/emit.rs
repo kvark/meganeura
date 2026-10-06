@@ -597,6 +597,7 @@ impl<'a> Compiler<'a> {
                 | Op::CausalAttentionRoPE { num_heads, .. }
                 | Op::SlidingWindowAttention { num_heads, .. }
                 | Op::FullAttention { num_heads, .. }
+                | Op::BlockCausalAttention { num_heads, .. }
                 | Op::CrossAttention { num_heads, .. } => {
                     let q_seq = node.ty.shape[0];
                     // LSE buffer: [0..q_seq*num_heads*2): LSE data (max_score, log_sum_exp per pos×head)
@@ -2023,6 +2024,36 @@ impl<'a> Compiler<'a> {
                 });
             }
 
+            Op::AxialRoPE {
+                theta,
+                head_dim,
+                axes_dim,
+            } => {
+                let input = self.get_buffer(node.inputs[0]);
+                let positions = self.get_buffer(node.inputs[1]);
+                let shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let seq = shape[0] as u32;
+                let dim = shape[1] as u32;
+                self.plan.dispatches.push(Dispatch {
+                    shader: ShaderEntry::AxialRoPE,
+                    workgroups: [(seq * dim / 2).div_ceil(256), 1, 1],
+                    input_buffers: vec![input, positions],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![],
+                    params: vec![
+                        seq,
+                        dim,
+                        theta.to_bits(),
+                        0,
+                        head_dim,
+                        axes_dim[0],
+                        axes_dim[1],
+                        axes_dim[2],
+                    ],
+                    ..Default::default()
+                });
+            }
+
             Op::CausalAttention {
                 num_heads,
                 num_kv_heads,
@@ -3216,6 +3247,41 @@ impl<'a> Compiler<'a> {
                     extra_outputs: vec![],
                     params: vec![rows, cols, eps.to_bits(), 0],
 
+                    ..Default::default()
+                });
+            }
+
+            Op::BlockCausalAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                prefix_len,
+            } => {
+                let q = self.get_buffer(node.inputs[0]);
+                let k = self.get_buffer(node.inputs[1]);
+                let v = self.get_buffer(node.inputs[2]);
+                let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
+                let lse_buf = self.find_lse_buffer(node.id);
+                let (shader, workgroups) = self.attention_dispatch(
+                    seq,
+                    head_dim,
+                    num_heads,
+                    node.requires_full_precision,
+                    node.attention_impl,
+                );
+                self.plan.dispatches.push(Dispatch {
+                    shader,
+                    workgroups,
+                    input_buffers: vec![q, k, v],
+                    output_buffer: out_buf,
+                    extra_outputs: vec![lse_buf],
+                    params: vec![
+                        seq,
+                        seq,
+                        (num_heads << 16) | num_kv_heads,
+                        head_dim,
+                        0x8000_0000 | prefix_len,
+                    ],
                     ..Default::default()
                 });
             }
