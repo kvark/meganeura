@@ -3224,6 +3224,40 @@ mod tests {
     }
 
     #[test]
+    fn scalar_attention_backward_staging_fits_16_kib() {
+        for head_dim in [16, 32, 64, 80, 128, 256, 512, 1024] {
+            for cap in [4, 8, 16, 32, 64] {
+                for shader in [
+                    generate_flash_grad_q_module(head_dim, cap),
+                    generate_flash_grad_kv_module(head_dim, cap),
+                ] {
+                    naga::valid::Validator::new(
+                        naga::valid::ValidationFlags::all()
+                            & !naga::valid::ValidationFlags::BINDINGS,
+                        naga::valid::Capabilities::all(),
+                    )
+                    .validate(&shader.module)
+                    .unwrap();
+                    let mut layout = naga::proc::Layouter::default();
+                    layout.update(shader.module.to_ctx()).unwrap();
+                    let mut bytes = 0;
+                    for (_, var) in shader.module.global_variables.iter() {
+                        if var.space == naga::AddressSpace::WorkGroup {
+                            let ty = layout[var.ty];
+                            bytes = ty.alignment.round_up(bytes) + ty.size;
+                        }
+                    }
+                    assert!(
+                        bytes <= 16384,
+                        "{}: head={head_dim}, cap={cap}, bytes={bytes}",
+                        shader.hint
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_flash_attention_wgsl() {
         let mut shape = FlashAttentionShape::default();
         shape.fit_shared_memory(1024, 32768);

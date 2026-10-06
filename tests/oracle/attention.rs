@@ -306,6 +306,38 @@ fn backward_sweep(kinds: &[Kind], shapes: &[Shape]) {
 }
 
 #[test]
+fn independent_backward_layouts() {
+    let mut sweep = Sweep::default();
+    let options = gpu::Options::default();
+    for (kind, s) in [
+        (Kind::Causal, shape(129, 129, 3, 1, 64)),
+        (Kind::Window(19), shape(129, 129, 3, 1, 64)),
+        (Kind::Mha { cross: true }, shape(33, 65, 3, 1, 80)),
+    ] {
+        let mut graph = backward_graph(kind, s);
+        let mut outputs = graph.outputs().to_vec();
+        for (id, cap, other_cap) in [(outputs[1], 4, 8), (outputs[2], 8, 4)] {
+            graph.nodes_mut()[id as usize].attention_ept_cap = Some(cap);
+            let node = graph.node(id).clone();
+            let other = graph.add_raw_node(node.op, node.inputs, node.ty);
+            graph.nodes_mut()[other as usize].attention_ept_cap = Some(other_cap);
+            outputs.push(other);
+        }
+        graph.set_outputs(outputs);
+        let feeds = random(&graph, 20261006);
+        // Each session contains two layouts of each backward kernel at the
+        // same head width. A pipeline key missing EPT silently mixes them up.
+        sweep.inference(
+            &format!("{kind:?} mixed backward layouts"),
+            &graph,
+            &feeds,
+            &options,
+        );
+    }
+    sweep.finish();
+}
+
+#[test]
 fn causal_forward() {
     forward_sweep(&[Kind::Causal], SELF_SHAPES);
 }
@@ -416,6 +448,7 @@ fn cross_backward() {
         shape(5, 1, 2, 2, 64),
         shape(40, 9, 2, 1, 256),  // flash dQ, scalar dK/dV
         shape(5, 40, 2, 1, 256),  // scalar dQ, flash dK/dV
+        shape(5, 129, 3, 1, 64),  // grouped dK/dV, partial query and key tiles
         shape(7, 300, 2, 2, 32),  // scalar dQ, flash dK/dV with tpq=1
         shape(257, 20, 4, 1, 32), // flash dQ tpq=1, scalar dK/dV
     ];

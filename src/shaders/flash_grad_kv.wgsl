@@ -49,6 +49,14 @@ $GRAD_INIT
     let wg_start = select(0u, first_t, kv_seq == 0u);
     let wg_end = select(q_seq, min(q_seq, last_t + window), window > 0u);
 
+$QUERY_LOOP
+
+    if valid {
+$STORE
+    }
+}
+
+// @section direct_query_loop
     for (var pos = wg_start; pos < wg_end; pos++) {
         for (var head_rel = 0u; head_rel < heads_per_kv; head_rel++) {
             let head = kv_head * heads_per_kv + head_rel;
@@ -67,14 +75,8 @@ $SCORE
                 let w_dk = ds_t * scale;
 $ACCUMULATE
             }
-$BARRIER
         }
     }
-
-    if valid {
-$STORE
-    }
-}
 
 // @section kv_init
     var k$INDEX = 0.0;
@@ -92,10 +94,6 @@ $STORE
             let q$INDEX = src_a[q_base + $INDEXu];
             let do$INDEX = d_out[q_base + $INDEXu];
 
-// @section q_load_shared
-            let q$INDEX = shared_q[d_base + $INDEXu];
-            let do$INDEX = shared_do[d_base + $INDEXu];
-
 // @section dot
             score_part += q$INDEX * k$INDEX;
             dp_part += do$INDEX * v$INDEX;
@@ -110,15 +108,21 @@ $STORE
 
 // @section reduce_step
     workgroupBarrier();
-    if local < $STRIDEu { wg_score[base + local] += wg_score[base + local + $STRIDEu]; wg_dp[base + local] += wg_dp[base + local + $STRIDEu]; }
+    if local < $STRIDEu {
+        for (var qi = 0u; qi < $QUERY_TILEu; qi++) {
+            let offset = qi * $THREADSu + base + local;
+            wg_score[offset] += wg_score[offset + $STRIDEu];
+            wg_dp[offset] += wg_dp[offset + $STRIDEu];
+        }
+    }
 
 // @section shared
-var<workgroup> shared_q: array<f32, $HEAD_DIM>;
-var<workgroup> shared_do: array<f32, $HEAD_DIM>;
+var<workgroup> shared_q: array<f32, $QUERY_ELEMENTS>;
+var<workgroup> shared_do: array<f32, $QUERY_ELEMENTS>;
 
 // @section reduction
-var<workgroup> wg_score: array<f32, $THREADS>;
-var<workgroup> wg_dp: array<f32, $THREADS>;
+var<workgroup> wg_score: array<f32, $GROUP_ELEMENTS>;
+var<workgroup> wg_dp: array<f32, $GROUP_ELEMENTS>;
 
 fn reduce_pair(tid: u32) {
     let local = tid % $TPQu;
@@ -127,25 +131,59 @@ $REDUCE_STEP
     workgroupBarrier();
 }
 
-// @section q_stage
-            for (var d = lid.x; d < $HEAD_DIMu; d += $THREADSu) {
-                shared_q[d] = src_a[q_base + d];
-                shared_do[d] = d_out[q_base + d];
-            }
-            workgroupBarrier();
-
-$Q_REGISTERS
-
-// @section grouped_score
-            wg_score[ki * $TPQu + lane] = score_part;
-            wg_dp[ki * $TPQu + lane] = dp_part;
-            reduce_pair(lid.x);
-            let score = wg_score[ki * $TPQu] * scale;
-            let dp_t = wg_dp[ki * $TPQu];
-
 // @section direct_score
             let score = score_part * scale;
             let dp_t = dp_part;
 
-// @section barrier
-            workgroupBarrier();
+// @section tiled_query_loop
+    let query_end = wg_end * heads_per_kv;
+    for (var first = wg_start * heads_per_kv; first < query_end; first += $QUERY_TILEu) {
+        for (var flat = lid.x; flat < $QUERY_ELEMENTSu; flat += $THREADSu) {
+            let qi = flat / $HEAD_DIMu;
+            let d = flat % $HEAD_DIMu;
+            let query = first + qi;
+            let pos = query / heads_per_kv;
+            let head = kv_head * heads_per_kv + query % heads_per_kv;
+            let q_base = pos * q_dim + head * head_dim;
+            var q_value = 0.0;
+            var do_value = 0.0;
+            if query < query_end {
+                q_value = src_a[q_base + d];
+                do_value = d_out[q_base + d];
+            }
+            shared_q[flat] = q_value;
+            shared_do[flat] = do_value;
+        }
+        workgroupBarrier();
+        for (var qi = 0u; qi < $QUERY_TILEu; qi++) {
+            let q_offset = qi * $HEAD_DIMu + d_base;
+$TILE_Q_LOAD
+            var score_part = 0.0;
+            var dp_part = 0.0;
+$DOT
+            wg_score[qi * $THREADSu + lid.x] = score_part;
+            wg_dp[qi * $THREADSu + lid.x] = dp_part;
+        }
+        reduce_pair(lid.x);
+        for (var qi = 0u; qi < $QUERY_TILEu; qi++) {
+            let query = first + qi;
+            let pos = query / heads_per_kv;
+            let head = kv_head * heads_per_kv + query % heads_per_kv;
+            let score = wg_score[qi * $THREADSu + ki * $TPQu] * scale;
+            let dp_t = wg_dp[qi * $THREADSu + ki * $TPQu];
+            if valid && query < query_end && pos >= start_pos && pos < end_pos {
+                let row_sum = fwd_dst[pos * num_heads + head];
+                let lse_idx = (pos * num_heads + head) * 2u;
+                let p_t = exp(min(score - lse[lse_idx], 0.0) - lse[lse_idx + 1u]);
+                let w_dk = p_t * (dp_t - row_sum) * scale;
+                let q_offset = qi * $HEAD_DIMu + d_base;
+$TILE_Q_LOAD
+$ACCUMULATE
+            }
+        }
+        workgroupBarrier();
+    }
+
+// @section tile_q_load
+            let q$INDEX = shared_q[q_offset + $INDEXu];
+            let do$INDEX = shared_do[q_offset + $INDEXu];

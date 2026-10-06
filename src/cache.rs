@@ -9,6 +9,7 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
+// Version 19 stores per-dispatch scalar attention-gradient layouts.
 // Version 18 restores the flat dispatch representation.
 // Version 17 stores typed dispatch operations, including operands and dimensions.
 // Version 16 bounds cooperative attention staging by device shared memory.
@@ -19,7 +20,7 @@ use std::{io, path::Path};
 // Version 13 reduces loss partials into a scalar, lowers LayerNorm to the
 // two-pass kernel, carries RoPE's static offset into the dynamic kernels, and
 // changes which dispatches fusion may merge.
-const CACHE_FORMAT_VERSION: u32 = 18;
+const CACHE_FORMAT_VERSION: u32 = 19;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]

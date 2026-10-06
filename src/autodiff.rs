@@ -20,6 +20,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
         graph.nodes_mut()[id as usize].name = node.name.clone();
         // Keep the implementation of a measured candidate.
         graph.nodes_mut()[id as usize].matmul_impl = node.matmul_impl;
+        graph.nodes_mut()[id as usize].attention_ept_cap = node.attention_ept_cap;
     }
     graph.derived_params = forward.derived_params.clone();
 

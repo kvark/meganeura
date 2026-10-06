@@ -89,23 +89,18 @@ $STORE
 // @section tail_accumulate
             dq$INDEX += w * shared_k[d_base + $INDEXu];
 
-// @section kv_load
-        let k$INDEX = shared_k[d_base + $INDEXu];
-        let v$INDEX = shared_v[d_base + $INDEXu];
-
-// @section dot
-        score_part += q$INDEX * k$INDEX;
-        dp_part += do$INDEX * v$INDEX;
-
-// @section accumulate
-            dq$INDEX += w * k$INDEX;
-
 // @section store
         dst[q_base + d_base + $INDEXu] = dq$INDEX;
 
 // @section reduce_step
     workgroupBarrier();
-    if local < $STRIDEu { wg_score[base + local] += wg_score[base + local + $STRIDEu]; wg_dp[base + local] += wg_dp[base + local + $STRIDEu]; }
+    if local < $STRIDEu {
+        for (var i = 0u; i < $BKVu; i++) {
+            let offset = i * $THREADSu + base + local;
+            wg_score[offset] += wg_score[offset + $STRIDEu];
+            wg_dp[offset] += wg_dp[offset + $STRIDEu];
+        }
+    }
 
 // @section tile_load_first
         if lid.x < $TILE_ELEMENTSu {
@@ -126,8 +121,8 @@ $STORE
         }
 
 // @section reduction
-var<workgroup> wg_score: array<f32, $THREADS>;
-var<workgroup> wg_dp: array<f32, $THREADS>;
+var<workgroup> wg_score: array<f32, $GROUP_ELEMENTS>;
+var<workgroup> wg_dp: array<f32, $GROUP_ELEMENTS>;
 fn reduce_score_dp(tid: u32) {
     let local = tid % $TPQu;
     let base = (tid / $TPQu) * $TPQu;
@@ -181,29 +176,41 @@ $TAIL_ACCUMULATE
     }
 
 // @section grouped_kv_loop
-    for (var t = min_kv_start; t < max_kv_len; t++) {
-        let k_base = t * kv_dim + kv_head_off;
-        for (var d = lid.x; d < $HEAD_DIMu; d += $THREADSu) {
-            shared_k[d] = src_b[k_base + d];
-            shared_v[d] = bias[k_base + d];
+    for (var t = min_kv_start; t < max_kv_len; t += $BKVu) {
+        for (var flat = lid.x; flat < $TILE_ELEMENTSu; flat += $THREADSu) {
+            let ki = flat / $HEAD_DIMu;
+            let d = flat % $HEAD_DIMu;
+            let k_base = (t + ki) * kv_dim + kv_head_off;
+            var k_value = 0.0;
+            var v_value = 0.0;
+            if t + ki < max_kv_len {
+                k_value = src_b[k_base + d];
+                v_value = bias[k_base + d];
+            }
+            shared_k[flat] = k_value;
+            shared_v[flat] = v_value;
         }
         workgroupBarrier();
 
-$KV_LOAD
-        var score_part = 0.0;
-        var dp_part = 0.0;
-$DOT
-        wg_score[qi * $TPQu + lane] = score_part;
-        wg_dp[qi * $TPQu + lane] = dp_part;
+        for (var i = 0u; i < $BKVu; i++) {
+            let k_off = i * $HEAD_DIMu + d_base;
+            var score_part = 0.0;
+            var dp_part = 0.0;
+$TILE_DOT
+            wg_score[i * $THREADSu + lid.x] = score_part;
+            wg_dp[i * $THREADSu + lid.x] = dp_part;
+        }
         reduce_score_dp(lid.x);
-        let score = wg_score[qi * $TPQu] * scale;
-        let dp_t = wg_dp[qi * $TPQu];
-
-        if valid && t >= my_kv_start && t < my_kv_len {
-            let p_t = exp(min(score - max_s, 0.0) - log_sum);
-            let ds_t = p_t * (dp_t - row_sum);
-            let w = ds_t * scale;
-$ACCUMULATE
+        for (var i = 0u; i < $BKVu; i++) {
+            let kv_pos = t + i;
+            let k_off = i * $HEAD_DIMu + d_base;
+            let score = wg_score[i * $THREADSu + qi * $TPQu] * scale;
+            let dp_t = wg_dp[i * $THREADSu + qi * $TPQu];
+            if valid && kv_pos >= my_kv_start && kv_pos < my_kv_len {
+                let p_t = exp(min(score - max_s, 0.0) - log_sum);
+                let w = p_t * (dp_t - row_sum) * scale;
+$TILE_ACCUMULATE
+            }
         }
         workgroupBarrier();
     }

@@ -90,9 +90,9 @@ An initializer may share compatible immutable weights from the idle incumbent.
 
 Implemented choices include fused and unfused graph forms, scalar matmul
 tile, K-stage, unrolling and split-K equalities lowered by the ordinary compiler,
-dispatch fusion,
-forward-attention layouts, cached-attention splits, low-occupancy convolution
-weight-gradient splits, and fresh submission chunk counts. An extracted matmul
+dispatch fusion, forward-attention layouts, independent scalar dQ and dK/dV
+layouts, cached-attention splits, low-occupancy convolution weight-gradient
+splits, and fresh submission chunk counts. An extracted matmul
 schedule is locked, so a later kernel probe cannot replace its tile. Unlocked
 dispatches still use those probes before whole-plan comparison. Attention
 splits and convolution weight splits use the existing compiler, with no
@@ -123,8 +123,9 @@ graphs are searched together. Larger pure graphs can expose all operators with
 rewrite rules, with other operators as opaque cut edges, within the same node
 bound. This includes independent projections outside a repeated body. If that
 region is too large or crosses precision domains, search falls back to one
-verified repeated region. Sparse search does not cross mutations. Attention
-layouts and submission chunks are still uniform across a plan. A matmul tile
+verified repeated region. Sparse search does not cross mutations. Forward
+attention layouts and submission chunks are still uniform across a plan.
+Backward layouts are attached to individual gradient nodes. A matmul tile
 is whatever enode extraction kept for that site. The report must be read with
 those limits.
 The matrix catalog covers ordinary and transposed products, with or without an
@@ -168,6 +169,27 @@ to 2.60 ms with identical candidates and decision thresholds. This identifies a
 measurement sensitivity, not its exact hardware cause. The time floor avoids
 charging 64 pairs to every expensive workload. It can reduce the number of plans
 visited; the report records the policy and truncated work.
+
+Training forms also retain attention-gradient EPT caps of 4, 8, 16, 32 and 64
+as egglog equalities, guarded by head-width and row-count legality. dQ and
+dK/dV are separate families, so their caps can differ, including between
+attention sites. This extraction runs after
+differentiation, over the gradient operators with forward values and mask
+metadata as opaque dependencies. It shares the existing extractor, compiler
+and whole-step qualification; it does not time or patch live gradient kernels.
+The selected cap is recorded in each scalar flash dispatch and its pipeline
+key. An explicit scalar choice does not promote to reduced-precision backward.
+
+Graph rank and backward-layout rank are interleaved before lowering. After the
+ordinary incumbent, the frontier covers a backward layout on the first
+extracted graph, then that graph's original layout. This keeps a useful matrix
+schedule reachable when a short budget permits only a few trials. Further
+forms cover the independent axes and their combinations. These forms count
+toward the same `max_graphs`, and the ordinary incumbent is retained. Regions
+over the saturation bound are reported as skipped. The frontier is bounded,
+so it does not enumerate every combination or guarantee a win within a short
+deadline. Inference and ordinary unmeasured construction retain their existing
+layout selection.
 
 A learned empirical extraction cost is not implemented yet. A useful next step
 would reuse isolated measurements by implementation class

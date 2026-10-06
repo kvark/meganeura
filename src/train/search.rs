@@ -9,7 +9,10 @@ use serde::Serialize;
 
 mod measure;
 pub use measure::BuildSearchTrial;
-use std::time::{Duration, Instant};
+use std::{
+    collections,
+    time::{Duration, Instant},
+};
 
 #[derive(Clone, Serialize)]
 pub struct BuildSearchOptions {
@@ -82,11 +85,12 @@ pub struct BuildSearchReport {
 /// from the original forward graph (one bounded region, repeated where verified).
 /// They are not greedily optimized again. Each training form is differentiated
 /// separately, so parameter transformations and gradients stay consistent.
-/// Matrix tile and split-K choices are egglog equalities. Lowering emits the
-/// extracted schedule and locks it. Complete plans still vary dispatch fusion,
-/// cached-attention splits, low-occupancy convolution weight-gradient splits,
-/// and submission chunk counts. Unlocked dispatches are kernel-tuned before
-/// comparison. This bounded search does not promise a global optimum.
+/// Matrix tile, split-K and independent attention-gradient layouts are egglog
+/// equalities. Lowering emits the extracted schedule. Complete plans vary
+/// dispatch fusion, cached-attention splits, low-occupancy convolution
+/// weight-gradient splits, and submission chunk counts. Unlocked dispatches
+/// are kernel-tuned before comparison. This bounded search does not promise
+/// a global optimum.
 ///
 /// `options.tuning` replaces `cfg.tune`. Build-plan caching is not yet supported:
 /// calibration data and measured policy are not part of the ordinary cache key.
@@ -186,6 +190,20 @@ pub fn build_measured(
             }
         }
     }
+    if cfg.mode == crate::Mode::Training
+        && cfg.optimize.mode != optimize::OptimizeMode::Off
+        && options.max_graphs > 1
+    {
+        let space = backward_layouts(
+            graphs,
+            cfg.optimize,
+            options.max_graphs,
+            start + options.max_time,
+            &mut skipped_regions,
+        );
+        graphs = space.candidates;
+        extraction_truncated |= space.truncated;
+    }
     let expressions = graphs.iter().map(|form| form.expression.clone()).collect();
     // Compile graph forms only once. Physical alternatives remain lazy, and are
     // interleaved across forms rather than spending the budget on the first form.
@@ -234,6 +252,66 @@ pub fn build_measured(
         initialize,
         qualify,
     )
+}
+
+/// Cover a joint graph/layout choice early, then interleave both axes. A
+/// backward-only prefix can displace the useful matrix forms under a deadline.
+fn backward_layouts(
+    graphs: Vec<optimize::search::Candidate>,
+    config: optimize::OptimizeConfig,
+    limit: usize,
+    deadline: Instant,
+    skipped: &mut Vec<String>,
+) -> optimize::search::SearchSpace {
+    let mut layouts: Vec<Option<collections::VecDeque<optimize::search::Candidate>>> =
+        (0..graphs.len()).map(|_| None).collect();
+    let mut candidates = Vec::new();
+    let mut truncated = false;
+    let prefix = [(0, 0), (1, 1), (1, 0)];
+    let diagonal = (1..limit)
+        .flat_map(|rank| (0..graphs.len().min(rank + 1)).map(move |index| (index, rank - index)));
+    let mut visited = collections::HashSet::new();
+    for (index, layout) in prefix.into_iter().chain(diagonal) {
+        if index >= graphs.len() || !visited.insert((index, layout)) {
+            continue;
+        }
+        if candidates.len() == limit || Instant::now() >= deadline {
+            return optimize::search::SearchSpace {
+                candidates,
+                truncated: true,
+            };
+        }
+        let graph = &graphs[index];
+        if layout == 0 {
+            candidates.push(optimize::search::Candidate {
+                graph: graph.graph.deep_clone(),
+                expression: graph.expression.clone(),
+            });
+            continue;
+        }
+        let pending = layouts[index].get_or_insert_with(|| {
+            match optimize::search::backward_candidates(&graph.graph, config, limit - 1) {
+                Ok(space) => {
+                    truncated |= space.truncated;
+                    space.candidates.into()
+                }
+                Err(error) => {
+                    skipped.push(format!("backward layouts for form {index}: {error}"));
+                    collections::VecDeque::new()
+                }
+            }
+        });
+        if let Some(form) = pending.pop_front() {
+            candidates.push(optimize::search::Candidate {
+                graph: form.graph,
+                expression: format!("{}; backward={}", graph.expression, form.expression),
+            });
+        }
+    }
+    optimize::search::SearchSpace {
+        candidates,
+        truncated: truncated || layouts.iter().flatten().any(|pending| !pending.is_empty()),
+    }
 }
 
 struct Seed {
@@ -512,6 +590,112 @@ mod tests {
                     1
                 );
             }
+        }
+    }
+
+    #[test]
+    fn measured_attention_reaches_backward_layouts_with_a_small_budget() {
+        use crate::{CoopPolicy, Mode, reference};
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[33, 64]);
+        let q = graph.parameter("q", &[64, 128]);
+        let q = graph.matmul(x, q);
+        let k = graph.parameter("k", &[65, 64]);
+        let v = graph.parameter("v", &[65, 64]);
+        let y = graph.multi_head_attn(q, k, v, 2, 1, 64, true);
+        let loss = reference::gradients::weighted_loss(&mut graph, y, 11, 0.7);
+        graph.set_outputs(vec![loss, y]);
+        let full = crate::autodiff::differentiate(&graph);
+        let mut feeds = reference::Feeds::new();
+        feeds.fill_random(&graph, 20261006, 0.5);
+        let values = reference::evaluate(&full, &feeds).unwrap();
+        let scales = reference::error_scales(&full, &values).unwrap();
+        let mut observed = std::collections::HashSet::new();
+        let mut joint_schedule = false;
+        let (_, report) = build_measured(
+            &graph,
+            SessionConfig {
+                mode: Mode::Training,
+                gpu: Some(reference::gpu::shared_context()),
+                runtime: crate::SessionOptions {
+                    coop: CoopPolicy::Disabled,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            BuildSearchOptions {
+                max_graphs: 6,
+                max_programs: 6,
+                max_time: Duration::from_secs(30),
+                warmup_runs: 1,
+                warmup_time: Duration::ZERO,
+                tuning: TuneOptions {
+                    max_classes: 0,
+                    sample_pairs: 4,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            |session, _| {
+                session.set_input("x", &feeds.f32("x").unwrap());
+                for name in ["q", "k", "v"] {
+                    session.set_parameter(name, &feeds.f32(name).unwrap());
+                }
+                Ok(())
+            },
+            |session| {
+                joint_schedule |= session.plan().dispatches.iter().any(|d| d.schedule_locked)
+                    && session.plan().dispatches.iter().any(|d| {
+                        matches!(d.kernel, compile::Kernel::AttentionBackward { ept_cap: 4 })
+                    });
+                observed.extend(
+                    session
+                        .dispatch_pipeline_keys()
+                        .into_iter()
+                        .filter(|key| key.contains("FlashGrad")),
+                );
+                for (index, &id) in full.outputs().iter().enumerate() {
+                    let want = &values[id as usize].data;
+                    let mut got = vec![0.0; want.len()];
+                    if index < full.num_user_outputs() {
+                        session.read_output_by_index(index, &mut got);
+                    } else {
+                        session.read_param_grad(
+                            ["q", "k", "v"][index - full.num_user_outputs()],
+                            &mut got,
+                        );
+                    }
+                    reference::check(&got, want, &scales[id as usize], Default::default())
+                        .map_err(|error| format!("output {index}: {error}"))?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(report.graphs.len() <= 6 && report.trials.len() <= 6);
+        assert!(
+            report.skipped_regions.is_empty(),
+            "{:?}",
+            report.skipped_regions
+        );
+        assert!(report.trials.iter().all(|trial| trial.outcome.qualified));
+        assert!(
+            joint_schedule,
+            "the bounded search lost the matrix/layout combination"
+        );
+        assert!(
+            report
+                .trials
+                .iter()
+                .any(|trial| trial.description.starts_with("graph=1,"))
+        );
+        for name in ["FlashGradQ", "FlashGradKV"] {
+            assert!(
+                observed
+                    .iter()
+                    .any(|key| key.starts_with(name) && key.ends_with("Some(4)")),
+                "{observed:?}"
+            );
         }
     }
 

@@ -1,5 +1,13 @@
 # Unreleased
 
+- Measured training builds explore independent scalar dQ and dK/dV layouts
+  through egglog, interleaved with graph alternatives under the existing
+  search bounds. Each dispatch and pipeline key retains its extracted EPT
+  cap. Plan-cache format 19 records these layouts.
+- Batch scalar attention-gradient reductions across query/key tiles, reducing
+  workgroup synchronization while preserving f32 arithmetic and mask bounds.
+  [Repeated Intel measurements](docs/gpu-gap-2026-10.md) reduce Whisper-tiny
+  training time by 35.5% and SmolLM2-135M training time by 12.5%.
 - `Graph::biased_attention` and `Graph::biased_cached_attention`: softmax
   attention with an additive bias per head, query row and key (T5 relative
   positions, ALiBi), a configurable logit scale, and full, causal or cache

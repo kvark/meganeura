@@ -1003,11 +1003,9 @@ enum Variant {
     /// identifies them.
     Reduction(u64),
     Pointwise(u64),
-    /// Attention kernels specialize their workgroup layout and generated
-    /// WGSL for `head_dim`. Keying only by `ShaderEntry` made a graph
-    /// containing different attention widths run every dispatch through
-    /// whichever width happened to be encountered last.
-    Attention(ShaderEntry, u32),
+    /// Attention specialization includes the head width and the scalar
+    /// backward EPT cap. Both can differ between dispatches in one plan.
+    Attention(ShaderEntry, u32, Option<u32>),
     /// Epilogue-fused matmuls, keyed by their actual DAG. The cooperative form
     /// uses workgroup memory to expose accumulator lanes to the epilogue.
     Epilogue(ShaderEntry, EpiloguePipelineKey),
@@ -1086,7 +1084,7 @@ impl Variant {
     fn entry(&self) -> Option<&ShaderEntry> {
         match *self {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
-            Variant::Attention(ref e, _)
+            Variant::Attention(ref e, _, _)
             | Variant::SplitMatmul(ref e, _, _, _)
             | Variant::SpecializedConv(ref e, _, _)
             | Variant::ScalarMatmul(ref e, _, _)
@@ -1121,7 +1119,9 @@ impl Variant {
             }
             Variant::Reduction(hash) => format!("generated-reduction:{hash:016x}"),
             Variant::Pointwise(hash) => format!("generated-pointwise:{hash:016x}"),
-            Variant::Attention(ref e, head_dim) => format!("{e:?}:head-dim-{head_dim}"),
+            Variant::Attention(ref e, head_dim, ept) => {
+                format!("{e:?}:head-dim-{head_dim}:ept-{ept:?}")
+            }
             Variant::Epilogue(ref e, ref key) => epilogue_profile_key(e, key, false),
             Variant::CoopEpilogue(ref e, ref key) => epilogue_profile_key(e, key, true),
             Variant::CoopPrologue(ref e, ref kinds) => {
@@ -1360,7 +1360,7 @@ impl Pipelines {
                     prologue,
                 )
             }
-            Variant::Attention(_, hd) => match group {
+            Variant::Attention(_, hd, ept) => match group {
                 ShaderGroup::FlashAttention => crate::codegen::generate_flash_attention_module(
                     hd,
                     knobs.flash_ept_cap,
@@ -1369,15 +1369,17 @@ impl Pipelines {
                 ShaderGroup::FlashAttentionCoop => {
                     crate::codegen::generate_flash_attention_coop_module(hd)
                 }
-                ShaderGroup::FlashGradQ => {
-                    crate::codegen::generate_flash_grad_q_module(hd, knobs.flash_grad_q_ept_cap)
-                }
+                ShaderGroup::FlashGradQ => crate::codegen::generate_flash_grad_q_module(
+                    hd,
+                    ept.unwrap_or(knobs.flash_grad_q_ept_cap),
+                ),
                 ShaderGroup::FlashGradQCoop => {
                     crate::codegen::generate_flash_grad_q_coop_module(hd)
                 }
-                ShaderGroup::FlashGradKV => {
-                    crate::codegen::generate_flash_grad_kv_module(hd, knobs.flash_grad_kv_ept_cap)
-                }
+                ShaderGroup::FlashGradKV => crate::codegen::generate_flash_grad_kv_module(
+                    hd,
+                    ept.unwrap_or(knobs.flash_grad_kv_ept_cap),
+                ),
                 ShaderGroup::FlashGradKVCoop => {
                     crate::codegen::generate_flash_grad_kv_coop_module(hd)
                 }
@@ -1491,7 +1493,11 @@ impl Pipelines {
             return Variant::Pointwise(dag.hash_key());
         }
         if let Some(dim) = Self::attention_head_dim(dispatch) {
-            return Variant::Attention(entry, dim);
+            let ept = match dispatch.kernel {
+                crate::compile::Kernel::AttentionBackward { ept_cap } => Some(ept_cap),
+                _ => None,
+            };
+            return Variant::Attention(entry, dim, ept);
         }
         if let Some(shape) = dispatch.gemv_shape() {
             return Variant::Gemv(entry, dispatch.weight_format, shape);

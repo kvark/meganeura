@@ -638,6 +638,8 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
   (GeGLU Op Op)
   (GeGLUPacked Op Op Op)
   (GeGLUPackedBT Op Op Op)
+  (AttentionGradQ i64 Op Op Op Op)
+  (AttentionGradKV i64 Op Op Op Op)
   (Op1 i64 Op)
   (Op2 i64 Op Op)
   (Op3 i64 Op Op Op)
@@ -645,6 +647,7 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
   (Op5 i64 Op Op Op Op Op)
   (Op6 i64 Op Op Op Op Op Op)
 )
+(relation AttentionLayout (i64 i64))
 
 ; --- Algebraic simplifications ---
 (rewrite (Neg (Neg ?x)) ?x)
@@ -769,7 +772,9 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::Nop => unreachable!("Nop nodes are filtered before encoding"),
         ref op => {
             let args: Vec<String> = node.inputs.iter().map(|i| format!("$n{}", i)).collect();
-            if let Some(name) = named_constructor(op) {
+            if let Some(name) = attention_gradient_constructor(op) {
+                format!("({name} {} {})", node.id, args.join(" "))
+            } else if let Some(name) = named_constructor(op) {
                 format!("({} {})", name, args.join(" "))
             } else {
                 assert!(
@@ -816,6 +821,22 @@ fn segment_program(g: &Graph, seg: &Segment) -> (String, Vec<usize>) {
             continue;
         }
         prog.push_str(&format!("(let $n{} {})\n", id, node_to_egglog_expr(node)));
+        let dimensions = match node.op {
+            Op::MultiHeadAttnGradQ { head_dim, .. } => Some((1, head_dim)),
+            Op::MultiHeadAttnGradK { head_dim, .. } => Some((2, head_dim)),
+            _ => None,
+        };
+        if let Some((input, head_dim)) = dimensions {
+            let rows = g.node(node.inputs[input]).ty.shape[0] as u32;
+            for &cap in ATTENTION_GRADIENT_EPT_CAPS {
+                let (_, lanes) = crate::codegen::attention_lanes(head_dim, cap);
+                let tile = (256 / lanes).max(1);
+                // The one-query fallback only supports heads through 256.
+                if head_dim <= 256 || (tile >= 2 && rows >= tile) {
+                    prog.push_str(&format!("(AttentionLayout {id} {cap})\n"));
+                }
+            }
+        }
     }
     // See the comment at the end of `egglog_prelude` for the bound.
     prog.push_str("(run 4)\n");
@@ -1157,7 +1178,9 @@ impl Stamper<'_> {
             Term::App(ref name, ref children) if name == "Leaf" => {
                 self.translate(lit_node_id(dag, children[0])?)?
             }
-            Term::App(ref name, ref children) if name.starts_with("Op") => {
+            Term::App(ref name, ref children)
+                if name.starts_with("Op") || attention_gradient_family(name).is_some() =>
+            {
                 let orig = self.translate(lit_node_id(dag, children[0])?)?;
                 let inputs = self.resolve_children(dag, &children[1..])?;
                 if self.g.node(orig).inputs != inputs {
@@ -1165,6 +1188,12 @@ impl Stamper<'_> {
                     // equivalent producers. Op, attributes, and type are
                     // untouched.
                     self.g.nodes_mut()[orig as usize].inputs = inputs;
+                }
+                if let Some((_, cap)) = name.split_once("__")
+                    && attention_gradient_family(name).is_some()
+                {
+                    self.g.nodes_mut()[orig as usize].attention_ept_cap =
+                        Some(cap.parse().map_err(|_| "invalid attention EPT cap")?);
                 }
                 orig
             }
@@ -1380,6 +1409,7 @@ impl Stamper<'_> {
             }
         };
         self.g.nodes_mut()[id as usize].matmul_impl = None;
+        self.g.nodes_mut()[id as usize].attention_ept_cap = None;
         id
     }
 }
@@ -1479,6 +1509,48 @@ fn matrix_family(name: &str) -> Option<&'static str> {
     )
 }
 
+fn attention_gradient_constructor(op: &Op) -> Option<&'static str> {
+    match *op {
+        Op::MultiHeadAttnGradQ { .. } => Some("AttentionGradQ"),
+        Op::MultiHeadAttnGradK { .. } => Some("AttentionGradKV"),
+        _ => None,
+    }
+}
+
+fn attention_gradient_family(name: &str) -> Option<&'static str> {
+    match name.split_once("__").map_or(name, |(logical, _)| logical) {
+        "AttentionGradQ" => Some("AttentionGradQ"),
+        "AttentionGradKV" => Some("AttentionGradKV"),
+        _ => None,
+    }
+}
+
+const ATTENTION_GRADIENT_EPT_CAPS: &[u32] = &[4, 8, 16, 32, 64];
+
+fn attention_gradient_constructors() -> &'static [(String, &'static str)] {
+    static NAMES: std::sync::LazyLock<Vec<(String, &'static str)>> =
+        std::sync::LazyLock::new(|| {
+            ATTENTION_GRADIENT_EPT_CAPS
+                .iter()
+                .flat_map(|cap| {
+                    ["AttentionGradQ", "AttentionGradKV"]
+                        .map(|logical| (format!("{logical}__{cap}"), logical))
+                })
+                .collect()
+        });
+    &NAMES
+}
+
+fn implementation_family(name: &str) -> Option<&'static str> {
+    matrix_family(name).or_else(|| attention_gradient_family(name))
+}
+
+fn implementation_constructors() -> impl Iterator<Item = &'static (String, &'static str)> {
+    matrix_constructors()
+        .iter()
+        .chain(attention_gradient_constructors())
+}
+
 fn tile_equality_rules() -> String {
     use std::fmt::Write;
     let mut program = String::new();
@@ -1491,6 +1563,15 @@ fn tile_equality_rules() -> String {
         let _ = writeln!(
             program,
             "(constructor {name} ({sorts}) Op)\n(rewrite ({logical} {args}) ({name} {args}))"
+        );
+    }
+    for &(ref name, logical) in attention_gradient_constructors() {
+        let cap = name.split_once("__").unwrap().1;
+        let _ = writeln!(
+            program,
+            "(constructor {name} (i64 Op Op Op Op) Op)\n\
+             (rewrite ({logical} ?id ?do ?q ?k ?v) ({name} ?id ?do ?q ?k ?v)\n\
+               :when ((AttentionLayout ?id {cap})))"
         );
     }
     program
@@ -1764,7 +1845,8 @@ mod tests {
         let b = lookup_value(&egraph, "b", &[]).unwrap();
         let c = lookup_value(&egraph, "c", &[]).unwrap();
         let costs = FusionCostModel::with_sizes(HashMap::from([(a, 512), (b, 1024), (c, 256)]));
-        let extractor = Extractor::compute_costs_from_rootsorts(None, &egraph, costs);
+        let sort = egraph.get_sort_by_name("Op").unwrap().clone();
+        let extractor = Extractor::compute_costs_from_rootsorts(Some(vec![sort]), &egraph, costs);
         for (cost, _) in extractor.extract_variants(
             &egraph,
             &mut TermDag::default(),

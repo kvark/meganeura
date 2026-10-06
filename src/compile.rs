@@ -1198,6 +1198,9 @@ pub enum Kernel {
     },
     Pointwise(PointwiseDAG),
     Reduction(ReductionKernel),
+    AttentionBackward {
+        ept_cap: u32,
+    },
 }
 
 impl Dispatch {

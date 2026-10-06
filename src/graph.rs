@@ -887,6 +887,9 @@ pub struct Node {
     /// Set when egglog extracted a concrete matrix implementation.
     #[serde(default)]
     pub matmul_impl: Option<MatmulImpl>,
+    /// Scalar attention-gradient layout selected by measured extraction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_ept_cap: Option<u32>,
     /// Prevent reduced-precision kernel promotion for numerically sensitive
     /// work derived by autodiff. Forward tensors remain logically f32 too;
     /// this flag only constrains optional runtime accelerations such as
@@ -1144,6 +1147,7 @@ impl Graph {
             requires_full_precision,
             name: None,
             matmul_impl: None,
+            attention_ept_cap: None,
         });
         id
     }
