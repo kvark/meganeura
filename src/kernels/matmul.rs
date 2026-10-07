@@ -50,8 +50,7 @@ impl Layout {
         )
     }
 
-    /// Transposed products with an addend have cooperative kernels that
-    /// only measurement selects, and no 32-wide scalar kernel.
+    /// Transposed products with an addend have no 32-wide scalar kernel.
     fn transposed_with_addend(self) -> bool {
         matches!(self, Self::TransposedAAdd | Self::TransposedBAdd)
     }
@@ -167,8 +166,8 @@ impl Family for Path {
                 };
                 if problem.pinned {
                     Err("a schedule pinned a scalar kernel")
-                } else if problem.layout.transposed_with_addend() {
-                    Err("only measurement promotes transposed products with an addend")
+                } else if problem.layout.transposed_with_addend() && config.use_f16_input {
+                    Err("f16 transposed addends are not qualified for automatic promotion")
                 } else if config.use_f16_input
                     && problem.requires_full_precision
                     && !target.allow_raw_f16
@@ -364,13 +363,75 @@ mod tests {
     }
 
     #[test]
-    fn transposed_addends_are_left_to_measurement() {
+    fn transposed_addends_promote_only_with_f32_operands() {
+        for layout in [Layout::TransposedAAdd, Layout::TransposedBAdd] {
+            let problem = Problem {
+                requires_full_precision: true,
+                ..Problem::plain(layout, [1024, 1024, 256], false)
+            };
+            for config in [
+                F32,
+                CoopConfig {
+                    tile_size: 16,
+                    ..F32
+                },
+            ] {
+                assert_eq!(select(&problem, &target(&config)), Path::Cooperative);
+                let edge = Problem::plain(layout, [65, 272, 33], false);
+                let geometry = cooperative_geometry(&edge, &config).unwrap();
+                assert_eq!(select(&edge, &target(&config)), Path::Cooperative);
+                assert_eq!(geometry.grid, [3, 9, 1]);
+                assert_eq!(geometry.output_bytes, 96 * 288 * 4);
+                assert_eq!(geometry.pad_addend, config.tile_size != 8);
+            }
+            // Even an explicit F16 permission does not broaden this default.
+            for compensated in [false, true] {
+                let config = CoopConfig {
+                    compensated,
+                    ..F16
+                };
+                for allow_raw_f16 in [false, true] {
+                    let target = Target {
+                        cooperative: Some(config),
+                        allow_raw_f16,
+                    };
+                    assert_eq!(select(&problem, &target), Path::Compiled);
+                }
+            }
+            let disabled = Target {
+                cooperative: None,
+                allow_raw_f16: false,
+            };
+            assert_eq!(select(&problem, &disabled), Path::Compiled);
+        }
+    }
+
+    #[test]
+    fn transposed_addends_keep_existing_safety_and_occupancy_checks() {
         for layout in [Layout::TransposedAAdd, Layout::TransposedBAdd] {
             let problem = Problem::plain(layout, [1024, 1024, 256], false);
-            assert_eq!(select(&problem, &target(&F32)), Path::Compiled);
-            let small = Problem::plain(layout, [32, 32, 32], false);
-            assert_eq!(select(&small, &target(&F32)), Path::Compiled);
-            assert!(cooperative_geometry(&problem, &F32).is_ok());
+            for fallback in [
+                Problem {
+                    pinned: true,
+                    ..problem
+                },
+                Problem {
+                    epilogue_inputs: true,
+                    ..problem
+                },
+                Problem {
+                    reduced_storage: true,
+                    ..problem
+                },
+                Problem::plain(layout, [32, 32, 32], false),
+                Problem::plain(layout, [1024, 17, 256], false),
+                // A legal scalar grid must not become 65536 cooperative groups.
+                Problem::plain(layout, [2_097_152, 16, 4], false),
+                // Whole-tile output padding exceeds the shader's index domain.
+                Problem::plain(layout, [65_535, 65_536, 256], false),
+            ] {
+                assert_eq!(select(&fallback, &target(&F32)), Path::Compiled);
+            }
         }
     }
 

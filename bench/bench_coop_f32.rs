@@ -2,7 +2,7 @@
 //!
 //! Build first, then run on an otherwise idle device:
 //! cargo build --release --example bench_coop_f32 --features models
-//! target/release/examples/bench_coop_f32 [all|matmul|attention|training]
+//! target/release/examples/bench_coop_f32 [all|matmul|transposed-add|attention|training]
 //!
 //! One shared context, identical inputs, no search, no GPU timestamps. Reports
 //! construction separately; warmup and ABBA batches time recording, submission
@@ -191,7 +191,11 @@ fn measure(
         "samples_ms":samples, "dispatch_inventory":sessions.each_ref().map(inventory)})
 }
 
-fn matmul(gpu: &Arc<blade_graphics::Context>, records: &mut Vec<Value>) {
+fn matmul(
+    gpu: &Arc<blade_graphics::Context>,
+    records: &mut Vec<Value>,
+    transposed_add_only: bool,
+) {
     for (label, m, n, k, kind) in [
         ("gqa-projection", 128, 192, 576, "nn"),
         ("vocabulary", 128, 49_152, 576, "nn"),
@@ -202,10 +206,29 @@ fn matmul(gpu: &Arc<blade_graphics::Context>, records: &mut Vec<Value>) {
         ("prologue", 65, 256, 33, "prologue"),
         ("addend", 65, 256, 33, "addend"),
         ("epilogue", 65, 256, 33, "epilogue"),
+        ("at-add-ragged", 65, 272, 33, "at-add"),
+        ("bt-add-ragged", 65, 272, 33, "bt-add"),
+        // Accumulated dW and dX for the 128x576 -> 128x192 projection.
+        ("at-add-gqa-dw", 576, 192, 128, "at-add"),
+        ("bt-add-gqa-dx", 128, 576, 192, "bt-add"),
+        // The same gradients for a wider 576 -> 1536 MLP projection.
+        ("at-add-mlp-dw", 576, 1536, 128, "at-add"),
+        ("bt-add-mlp-dx", 128, 576, 1536, "bt-add"),
     ] {
+        if transposed_add_only && !matches!(kind, "at-add" | "bt-add") {
+            continue;
+        }
+        let transposed_a = matches!(kind, "at" | "at-add");
+        let transposed_b = matches!(kind, "bt" | "bt-add");
+        let add_shader = match kind {
+            "addend" => Some(ShaderEntry::FusedMatMulAdd),
+            "at-add" => Some(ShaderEntry::FusedMatMulATAdd),
+            "bt-add" => Some(ShaderEntry::FusedMatMulBTAdd),
+            _ => None,
+        };
         let mut graph = Graph::new();
-        let a = graph.input("a", &if kind == "at" { [k, m] } else { [m, k] });
-        let b = graph.input("b", &if kind == "bt" { [n, k] } else { [k, n] });
+        let a = graph.input("a", &if transposed_a { [k, m] } else { [m, k] });
+        let b = graph.input("b", &if transposed_b { [n, k] } else { [k, n] });
         let lhs = if kind == "prologue" {
             let norm = graph.input("norm", &[k]);
             graph.rms_norm(a, norm, 1e-5)
@@ -213,12 +236,12 @@ fn matmul(gpu: &Arc<blade_graphics::Context>, records: &mut Vec<Value>) {
             a
         };
         let y = match kind {
-            "at" => graph.matmul_at(lhs, b),
-            "bt" => graph.matmul_bt(lhs, b),
+            "at" | "at-add" => graph.matmul_at(lhs, b),
+            "bt" | "bt-add" => graph.matmul_bt(lhs, b),
             _ => graph.matmul(lhs, b),
         };
         let y = match kind {
-            "addend" => {
+            "addend" | "at-add" | "bt-add" => {
                 let src = graph.input("src", &[m, n]);
                 graph.add(y, src)
             }
@@ -235,6 +258,12 @@ fn matmul(gpu: &Arc<blade_graphics::Context>, records: &mut Vec<Value>) {
                 session.plan().dispatches.iter().any(Dispatch::use_coop),
                 coop
             );
+            // Both sides must already fuse the add: this is not a comparison
+            // against a scalar product followed by a separate addition.
+            if let Some(ref shader) = add_shader {
+                assert_eq!(session.plan().dispatches.len(), 1);
+                assert_eq!(&session.plan().dispatches[0].shader, shader);
+            }
             if coop {
                 let matrix = session
                     .plan()
@@ -245,7 +274,6 @@ fn matmul(gpu: &Arc<blade_graphics::Context>, records: &mut Vec<Value>) {
                 match kind {
                     "prologue" => assert!(matrix.matmul_prologue.is_some()),
                     "epilogue" => assert!(matrix.matmul_epilogue.is_some()),
-                    "addend" => assert_eq!(matrix.shader, ShaderEntry::FusedMatMulAdd),
                     _ => {}
                 }
             }
@@ -254,7 +282,7 @@ fn matmul(gpu: &Arc<blade_graphics::Context>, records: &mut Vec<Value>) {
             if kind == "prologue" {
                 session.set_input("norm", &vec![1.0; k]);
             }
-            if kind == "addend" {
+            if add_shader.is_some() {
                 session.set_input("src", &values(m * n, 3, 0.001));
             }
             session
@@ -468,7 +496,9 @@ fn training(gpu: &Arc<blade_graphics::Context>, records: &mut Vec<Value>) {
 fn main() {
     env_logger::init();
     let suite = std::env::args().nth(1).unwrap_or_else(|| "all".into());
-    assert!(["all", "matmul", "attention", "training"].contains(&suite.as_str()));
+    assert!(
+        ["all", "matmul", "transposed-add", "attention", "training"].contains(&suite.as_str())
+    );
     let gpu = Arc::new(
         meganeura::init_gpu_context_with(GpuOptions {
             timing: false,
@@ -480,8 +510,8 @@ fn main() {
     assert!(caps.cooperative_matrix.f32_shapes.contains(&[8, 8, 8]));
     assert!(caps.max_compute_shared_memory_size >= 18_624);
     let mut records = Vec::new();
-    if suite == "all" || suite == "matmul" {
-        matmul(&gpu, &mut records);
+    if matches!(suite.as_str(), "all" | "matmul" | "transposed-add") {
+        matmul(&gpu, &mut records, suite == "transposed-add");
     }
     if suite == "all" || suite == "attention" {
         attention(&gpu, &mut records);
