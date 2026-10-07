@@ -120,7 +120,7 @@ fn run_case(
     gpu: &Arc<blade_graphics::Context>,
     indexing_audit: bool,
 ) -> Result<Value, Box<dyn Error>> {
-    let (mut session, build) = make_session(case, gpu, CoopPolicy::Disabled);
+    let (mut session, build) = make_session_with_timing(case, gpu, CoopPolicy::Disabled, true);
     let keys = session.dispatch_pipeline_keys();
     let mut record = json!({"name": case.name, "description": case.description, "work": case.work,
         "status": "running", "build": build, "host_start": host_sample(),
@@ -173,7 +173,7 @@ fn run_case(
             // the retained step's wall timer.
             if preparations != 0 {
                 let state = snapshot(session, case);
-                let comparison = compare("profiled", (preparations - 1) as u32, &reference, &state);
+                let comparison = compare("profiled", 0, &reference, &state);
                 valid &= comparison.passed;
                 comparisons.push(comparison);
             }
@@ -199,7 +199,7 @@ fn run_case(
         }
     };
     let state = snapshot(&mut session, case);
-    let comparison = compare("profiled", (preparations - 1) as u32, &reference, &state);
+    let comparison = compare("profiled", 0, &reference, &state);
     valid &= comparison.passed;
     comparisons.push(comparison);
     assert_eq!(preparations, PROFILE_SAMPLES);
@@ -228,7 +228,7 @@ fn run_case(
     let no_update_state = ["adam_bytes", "accumulator_bytes"]
         .iter()
         .all(|key| record["final_memory"][key] == 0)
-        && record["final_memory"]["auxiliary_bytes"] == 4;
+        && record["final_memory"]["auxiliary_bytes"] == record["initial_memory"]["auxiliary_bytes"];
     valid &= same_memory && no_update_state;
     record["same_memory"] = json!(same_memory);
     record["host_finish"] = host_sample();
@@ -287,7 +287,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "case_order": cases.iter().map(|c| c.name).collect::<Vec<_>>(),
             "device": {"name": info.device_name, "driver": info.driver_info, "f32_tile": caps.f32_tile, "f16_tile": caps.f16_tile},
             "cooperative_policy": "Disabled", "compile_options": compile_options(),
-            "runtime_options": format!("{:?}", runtime_options(CoopPolicy::Disabled)), "optimize": meganeura::optimize::OptimizeConfig::default(),
+            "runtime_options": format!("{:?}", meganeura::SessionOptions { gpu_timing: true, ..runtime_options(CoopPolicy::Disabled) }), "optimize": meganeura::optimize::OptimizeConfig::default(),
             "warmup": WARMUP, "settling": SETTLING, "normal_samples": NORMAL_SAMPLES, "profile_samples": PROFILE_SAMPLES,
             "contract": "strict scalar f32; fixed-input F+L+B, no optimizer/clip/accumulation; normal step+wait before and after one-pass-per-dispatch capture; all profiled full states checked before the next capture; telemetry active",
             "gpu_timing": true, "nvidia_smi_before": before, "rustflags": std::env::var("RUSTFLAGS").ok()}, "cases": []});
@@ -376,9 +376,11 @@ mod tests {
             .unwrap(),
         );
         for case in profile_cases() {
-            let (mut session, _) = make_session(&case, &gpu, CoopPolicy::Disabled);
+            let (mut session, _) =
+                make_session_with_timing(&case, &gpu, CoopPolicy::Disabled, true);
             advance(&mut session, 3);
             let reference = snapshot(&mut session, &case);
+            let initial_aux_bytes = session.memory_summary().optimizer_aux_bytes;
             let mut preparations = 0;
             let mut checked = 0;
             let profile = capture_session_profile(
@@ -405,7 +407,11 @@ mod tests {
             assert_eq!(preparations, 2);
             assert_eq!(profile.plan.dispatch_count, session.plan().dispatches.len());
             assert_eq!(profile.plan.adam_state_bytes, 0);
-            assert_eq!(profile.plan.optimizer_aux_bytes, 4);
+            assert_eq!(profile.plan.optimizer_aux_bytes, initial_aux_bytes);
+            assert_eq!(
+                session.memory_summary().optimizer_aux_bytes,
+                initial_aux_bytes
+            );
             assert!(
                 profile
                     .dispatches

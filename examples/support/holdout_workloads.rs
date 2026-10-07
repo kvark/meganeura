@@ -288,6 +288,15 @@ pub fn make_session(
     gpu: &Arc<blade_graphics::Context>,
     policy: CoopPolicy,
 ) -> (Session, Value) {
+    make_session_with_timing(case, gpu, policy, false)
+}
+
+pub fn make_session_with_timing(
+    case: &Case,
+    gpu: &Arc<blade_graphics::Context>,
+    policy: CoopPolicy,
+    gpu_timing: bool,
+) -> (Session, Value) {
     let start = Instant::now();
     let (mut session, _) = meganeura::build(
         &case.graph,
@@ -298,7 +307,10 @@ pub fn make_session(
                 Mode::Training
             },
             gpu: Some(Arc::clone(gpu)),
-            runtime: runtime_options(policy),
+            runtime: SessionOptions {
+                gpu_timing,
+                ..runtime_options(policy)
+            },
             options: compile_options(),
             ..Default::default()
         },

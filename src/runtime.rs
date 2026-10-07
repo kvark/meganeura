@@ -4405,7 +4405,7 @@ mod variant_tests {
         };
         select_variants(&mut demoted, None, false, false);
         assert!(demoted.dispatches[0].use_small_tiles());
-        let pipelines = Pipelines::new(&gpu, &demoted, None, None);
+        let mut pipelines = Pipelines::new(&gpu, &demoted, None, None);
         assert!(
             pipelines
                 .map
@@ -4419,6 +4419,9 @@ mod variant_tests {
                 .contains_key(&Variant::SmallTile(ShaderEntry::MatMul)),
             "no dispatch can select SmallTile here, so it must not be built"
         );
+        for pipeline in pipelines.map.values_mut() {
+            gpu.destroy_compute_pipeline(pipeline);
+        }
 
         // Q4 matmul + relu: reduced-storage weights, now fused.
         let mut weighted = {
@@ -4435,7 +4438,7 @@ mod variant_tests {
             weighted.dispatches[0].weight_format,
             crate::compile::WeightFormat::Q4
         );
-        let pipelines = Pipelines::new(&gpu, &weighted, None, None);
+        let mut pipelines = Pipelines::new(&gpu, &weighted, None, None);
         assert!(
             !pipelines.map.contains_key(&Variant::Weight(
                 ShaderEntry::MatMul,
@@ -4443,6 +4446,9 @@ mod variant_tests {
             )),
             "no dispatch can select the plain weighted kernel here"
         );
+        for pipeline in pipelines.map.values_mut() {
+            gpu.destroy_compute_pipeline(pipeline);
+        }
     }
 
     /// A fused epilogue must not keep a matmul on 64×64 geometry once the

@@ -267,11 +267,11 @@ fn collect_classes(
         let physical: Vec<_> = bindings.iter().map(|b| alias.map[b.0 as usize]).collect();
         // Do not transfer isolated timings to overlapping bindings, even if
         // readonly input aliasing is legal. It changes the cache working set.
-        if physical
-            .iter()
-            .enumerate()
-            .any(|(i, p)| physical[..i].contains(p))
-        {
+        if bindings.iter().enumerate().any(|(i, b)| {
+            bindings[..i]
+                .iter()
+                .any(|other| alias.overlap(&plan.buffers, b.0 as usize, other.0 as usize))
+        }) {
             excluded += 1;
             continue;
         }
@@ -360,6 +360,7 @@ impl Session {
             || self.plan.buffers != other.plan.buffers
             || self.plan.knobs != other.plan.knobs
             || self.alias.map != other.alias.map
+            || self.alias.offsets != other.alias.offsets
             || self.alias.sizes != other.alias.sizes
             || self.alias.device_local != other.alias.device_local
             || self.groups != other.groups
@@ -2453,6 +2454,15 @@ mod tests {
         assert_eq!(classes[0].members.len(), 2);
         alias.device_local[plan.dispatches[1].output_buffer.0 as usize] = true;
         assert_eq!(collect_classes(&plan, &alias, None).0.len(), 2);
+        let first = plan.dispatches[0].input_buffers[0].0 as usize;
+        let second = plan.dispatches[0].input_buffers[1].0 as usize;
+        alias.map[second] = alias.map[first];
+        alias.offsets[second] = plan.buffers[first].next_multiple_of(256);
+        assert_eq!(collect_classes(&plan, &alias, None).1, 0);
+        alias.offsets[second] = plan.buffers[first] - 4;
+        assert_eq!(collect_classes(&plan, &alias, None).1, 1);
+        alias.map[second] = second;
+        alias.offsets[second] = 0;
         plan.dispatches[0].input_buffers[1] = plan.dispatches[0].output_buffer;
         assert_eq!(collect_classes(&plan, &alias, None).1, 1);
     }
