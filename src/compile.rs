@@ -4392,6 +4392,168 @@ mod tests {
         )));
     }
 
+    /// `full_attention` and `cross_attention` are `multi_head_attn`'s self
+    /// and cross forms, so their forward plans, their backward plans fed
+    /// the gradient ops directly (as the GPU oracle does), and full
+    /// attention's training plans must be the same dispatches over the same
+    /// dataflow on every target. This is what lets the oracle run each shape
+    /// sweep through one wrapper only.
+    #[test]
+    fn attention_wrappers_build_identical_plans() {
+        type Build = fn(&mut Graph, [NodeId; 3], [u32; 3]) -> NodeId;
+        let full: Build = |g, [q, k, v], [h, kvh, d]| g.full_attention(q, k, v, h, kvh, d);
+        let cross: Build = |g, [q, k, v], [h, kvh, d]| g.cross_attention(q, k, v, h, kvh, d);
+        let self_mha: Build =
+            |g, [q, k, v], [h, kvh, d]| g.multi_head_attn(q, k, v, h, kvh, d, false);
+        let cross_mha: Build =
+            |g, [q, k, v], [h, kvh, d]| g.multi_head_attn(q, k, v, h, kvh, d, true);
+        // (q rows, kv rows, heads, kv heads, head width): every flash and
+        // scalar threshold the oracle's self and cross sweeps cross.
+        let self_shapes = [
+            (1, 1, 2, 1, 64),
+            (13, 13, 4, 2, 64),
+            (33, 33, 2, 1, 256),
+            (64, 64, 4, 1, 128),
+            (130, 130, 2, 1, 64),
+            (260, 260, 2, 2, 32),
+        ];
+        let cross_shapes = [
+            (1, 7, 2, 1, 64),
+            (40, 9, 2, 1, 256),
+            (5, 129, 3, 1, 64),
+            (7, 300, 2, 2, 32),
+            (257, 20, 4, 1, 32),
+        ];
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Form {
+            Forward,
+            Backward,
+            Training,
+        }
+        let graph = |build: Build, (q, kv, h, kvh, d): (usize, usize, u32, u32, u32), form| {
+            let train = form == Form::Training;
+            let mut g = Graph::new();
+            let leaf = |g: &mut Graph, name, shape: &[usize]| {
+                if train {
+                    g.parameter(name, shape)
+                } else {
+                    g.input(name, shape)
+                }
+            };
+            let width = |heads: u32| (heads * d) as usize;
+            let q = leaf(&mut g, "q", &[q, width(h)]);
+            let k = leaf(&mut g, "k", &[kv, width(kvh)]);
+            let v = leaf(&mut g, "v", &[kv, width(kvh)]);
+            let o = build(&mut g, [q, k, v], [h, kvh, d]);
+            match form {
+                Form::Forward => {
+                    g.set_outputs(vec![o]);
+                    g
+                }
+                Form::Training => {
+                    let loss = g.sum_all(o);
+                    g.set_outputs(vec![loss]);
+                    crate::autodiff::differentiate(&g)
+                }
+                Form::Backward => {
+                    let is_cross = matches!(g.node(o).op, Op::CrossAttention { .. })
+                        || matches!(g.node(o).op, Op::MultiHeadAttn { is_cross: true, .. });
+                    let d_out = g.input("d_out", &[q_rows(&g, q), width(h)]);
+                    let inputs = vec![d_out, q, k, v];
+                    let (q_ty, k_ty) = (g.node(q).ty.clone(), g.node(k).ty.clone());
+                    let (num_heads, num_kv_heads, head_dim, fwd_node) = (h, kvh, d, o);
+                    let grads = [
+                        (
+                            Op::MultiHeadAttnGradQ {
+                                fwd_node,
+                                num_heads,
+                                num_kv_heads,
+                                head_dim,
+                                is_cross,
+                            },
+                            q_ty,
+                        ),
+                        (
+                            Op::MultiHeadAttnGradK {
+                                fwd_node,
+                                num_heads,
+                                num_kv_heads,
+                                head_dim,
+                                is_cross,
+                            },
+                            k_ty.clone(),
+                        ),
+                        (
+                            Op::MultiHeadAttnGradV {
+                                fwd_node,
+                                num_heads,
+                                num_kv_heads,
+                                head_dim,
+                                is_cross,
+                            },
+                            k_ty,
+                        ),
+                    ];
+                    let mut outputs = vec![o];
+                    for (op, ty) in grads {
+                        outputs.push(g.add_raw_node(op, inputs.clone(), ty));
+                    }
+                    g.set_outputs(outputs);
+                    g
+                }
+            }
+        };
+        fn q_rows(g: &Graph, q: NodeId) -> usize {
+            g.node(q).ty.shape[0]
+        }
+        let targets = [
+            (crate::codegen::CoopCaps::default(), 0, false),
+            (
+                crate::codegen::CoopCaps {
+                    f16_tile: 16,
+                    f32_tile: 0,
+                },
+                65_536,
+                true,
+            ),
+            (
+                crate::codegen::CoopCaps {
+                    f16_tile: 0,
+                    f32_tile: 8,
+                },
+                32_768,
+                false,
+            ),
+        ];
+        // Cross attention is inference-only, so it has no training form.
+        let all = [Form::Forward, Form::Backward, Form::Training];
+        let pairs = [
+            (full, self_mha, &self_shapes[..], &all[..]),
+            (cross, cross_mha, &cross_shapes[..], &all[..2]),
+        ];
+        for (wrapper, general, shapes, forms) in pairs {
+            for &shape in shapes {
+                for &form in forms {
+                    for (caps, bytes, reduced) in targets {
+                        let plan = |build| {
+                            compile_with_caps_policy(
+                                &graph(build, shape, form),
+                                &CompileOptions::default(),
+                                caps,
+                                bytes,
+                                reduced,
+                            )
+                        };
+                        let (a, b) = (plan(wrapper), plan(general));
+                        let context = format!("{shape:?} {form:?} {caps:?}");
+                        assert_eq!(a.dispatch_inventory(), b.dispatch_inventory(), "{context}");
+                        assert_eq!(a.dataflow_digest(), b.dataflow_digest(), "{context}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn short_cross_attention_selects_coop_grad_kv() {
         // The scalar flash heuristic uses BQ=128 at head_dim=64, so a
