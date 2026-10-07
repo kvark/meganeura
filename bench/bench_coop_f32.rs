@@ -191,11 +191,7 @@ fn measure(
         "samples_ms":samples, "dispatch_inventory":sessions.each_ref().map(inventory)})
 }
 
-fn matmul(
-    gpu: &Arc<blade_graphics::Context>,
-    records: &mut Vec<Value>,
-    transposed_add_only: bool,
-) {
+fn matmul(gpu: &Arc<blade_graphics::Context>, records: &mut Vec<Value>, transposed_add_only: bool) {
     for (label, m, n, k, kind) in [
         ("gqa-projection", 128, 192, 576, "nn"),
         ("vocabulary", 128, 49_152, 576, "nn"),
@@ -496,9 +492,7 @@ fn training(gpu: &Arc<blade_graphics::Context>, records: &mut Vec<Value>) {
 fn main() {
     env_logger::init();
     let suite = std::env::args().nth(1).unwrap_or_else(|| "all".into());
-    assert!(
-        ["all", "matmul", "transposed-add", "attention", "training"].contains(&suite.as_str())
-    );
+    assert!(["all", "matmul", "transposed-add", "attention", "training"].contains(&suite.as_str()));
     let gpu = Arc::new(
         meganeura::init_gpu_context_with(GpuOptions {
             timing: false,

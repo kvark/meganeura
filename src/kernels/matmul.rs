@@ -386,10 +386,7 @@ mod tests {
             }
             // Even an explicit F16 permission does not broaden this default.
             for compensated in [false, true] {
-                let config = CoopConfig {
-                    compensated,
-                    ..F16
-                };
+                let config = CoopConfig { compensated, ..F16 };
                 for allow_raw_f16 in [false, true] {
                     let target = Target {
                         cooperative: Some(config),
