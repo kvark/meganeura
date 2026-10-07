@@ -596,7 +596,34 @@ fn sliding_window_forward() {
 
 #[test]
 fn full_forward() {
-    forward_sweep(&[Kind::Full, Kind::Mha { cross: false }], SELF_SHAPES);
+    forward_sweep(&[Kind::Full], SELF_SHAPES);
+}
+
+/// `full_attention` and `cross_attention` lower exactly as
+/// `multi_head_attn`'s self and cross forms (checked on the host by
+/// `attention_wrappers_build_identical_plans`), so the shape sweeps run one
+/// wrapper; these cases keep the general builder's own wiring on the GPU.
+#[test]
+fn multi_head_wrapper() {
+    let cases = [
+        (Kind::Mha { cross: false }, shape(130, 130, 2, 1, 64)),
+        (Kind::Mha { cross: true }, shape(5, 129, 3, 1, 64)),
+    ];
+    let mut sweep = Sweep::default();
+    let options = gpu::Options::default();
+    for (n, (kind, s)) in cases.into_iter().enumerate() {
+        let g = forward_graph(kind, s);
+        sweep.inference(
+            &format!("{kind:?} {s:?}"),
+            &g,
+            &random(&g, 500 + n as u64),
+            &options,
+        );
+        let g = backward_graph(kind, s);
+        let feeds = random(&g, 600 + n as u64);
+        sweep.inference(&format!("{kind:?} backward {s:?}"), &g, &feeds, &options);
+    }
+    sweep.finish();
 }
 
 #[test]
@@ -609,7 +636,7 @@ fn cross_forward() {
         shape(130, 9, 4, 2, 64),  // flash forward, one KV tile plus tail
         shape(257, 20, 2, 1, 32), // flash tpq=1
     ];
-    forward_sweep(&[Kind::Cross, Kind::Mha { cross: true }], &shapes);
+    forward_sweep(&[Kind::Cross], &shapes);
 }
 
 #[test]
@@ -644,7 +671,7 @@ fn sliding_window_backward() {
 
 #[test]
 fn full_backward() {
-    backward_sweep(&[Kind::Full, Kind::Mha { cross: false }], SELF_SHAPES);
+    backward_sweep(&[Kind::Full], SELF_SHAPES);
 }
 
 #[test]
@@ -658,7 +685,7 @@ fn cross_backward() {
         shape(7, 300, 2, 2, 32),  // scalar dQ, flash dK/dV with tpq=1
         shape(257, 20, 4, 1, 32), // flash dQ tpq=1, scalar dK/dV
     ];
-    backward_sweep(&[Kind::Cross, Kind::Mha { cross: true }], &shapes);
+    backward_sweep(&[Kind::Cross], &shapes);
 }
 
 #[test]

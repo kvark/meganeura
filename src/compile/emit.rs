@@ -3158,63 +3158,19 @@ impl<'a> Compiler<'a> {
                 });
             }
 
+            // Full and cross attention are the wrapper's self and cross
+            // forms: one lowering, with the key length from K's shape.
             Op::FullAttention {
                 num_heads,
                 num_kv_heads,
                 head_dim,
-            } => {
-                // Route through unified attention shader.
-                // kv_seq=q_seq for full (non-causal) attention.
-                let q = self.get_buffer(node.inputs[0]);
-                let k = self.get_buffer(node.inputs[1]);
-                let v = self.get_buffer(node.inputs[2]);
-                let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
-                let lse_buf = self.find_lse_buffer(node.id);
-                let (shader, workgroups) =
-                    self.attention_dispatch(seq, head_dim, num_heads, node.requires_full_precision);
-                self.plan.dispatches.push(Dispatch {
-                    shader,
-                    workgroups,
-                    input_buffers: vec![q, k, v],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![lse_buf],
-                    params: vec![seq, seq, (num_heads << 16) | num_kv_heads, head_dim],
-
-                    ..Default::default()
-                });
             }
-
-            Op::CrossAttention {
+            | Op::CrossAttention {
                 num_heads,
                 num_kv_heads,
                 head_dim,
-            } => {
-                // Route through unified attention shader.
-                let q = self.get_buffer(node.inputs[0]);
-                let k = self.get_buffer(node.inputs[1]);
-                let v = self.get_buffer(node.inputs[2]);
-                let q_seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
-                let kv_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
-                let lse_buf = self.find_lse_buffer(node.id);
-                let (shader, workgroups) = self.attention_dispatch(
-                    q_seq,
-                    head_dim,
-                    num_heads,
-                    node.requires_full_precision,
-                );
-                self.plan.dispatches.push(Dispatch {
-                    shader,
-                    workgroups,
-                    input_buffers: vec![q, k, v],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![lse_buf],
-                    params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
-
-                    ..Default::default()
-                });
             }
-
-            Op::MultiHeadAttn {
+            | Op::MultiHeadAttn {
                 num_heads,
                 num_kv_heads,
                 head_dim,
