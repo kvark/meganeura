@@ -108,10 +108,44 @@ fn dispatched(session: &crate::Session) -> Vec<crate::compile::ShaderEntry> {
     plan.dispatches.iter().map(|d| d.shader.clone()).collect()
 }
 
+/// The plan a session for `graph` built with `options` compiles, against
+/// the same device and policy, without building the session. Kernel
+/// choices made while compiling (attention among them) are final here;
+/// session construction's cooperative and small-tile choices are not yet
+/// applied.
+pub fn plan(graph: &Graph, options: &Options, mode: Mode) -> crate::compile::ExecutionPlan {
+    crate::train::plan(graph, &options.session_config(mode))
+}
+
+/// The reference values and error scales of one graph and feed, to check
+/// several sessions against without evaluating it again.
+pub struct Expected {
+    values: Vec<Tensor>,
+    scales: Vec<Vec<f64>>,
+}
+
+impl Expected {
+    pub fn inference(graph: &Graph, feeds: &Feeds) -> Result<Self, Error> {
+        let (values, scales) = reference(graph, feeds)?;
+        Ok(Self { values, scales })
+    }
+}
+
 /// Build an inference session for `graph`, run one step, and compare every
 /// graph output with the reference.
 pub fn check_inference(graph: &Graph, feeds: &Feeds, options: &Options) -> Result<Report, Error> {
-    let (values, scales) = reference(graph, feeds)?;
+    check_inference_against(graph, feeds, &Expected::inference(graph, feeds)?, options)
+}
+
+/// [`check_inference`] against values already evaluated for the same
+/// graph and feeds.
+pub fn check_inference_against(
+    graph: &Graph,
+    feeds: &Feeds,
+    expected: &Expected,
+    options: &Options,
+) -> Result<Report, Error> {
+    let (values, scales) = (&expected.values, &expected.scales);
     let (mut session, _) = build(graph, options.session_config(Mode::Inference));
     upload(&mut session, graph, feeds)?;
     session.step();

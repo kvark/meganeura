@@ -328,11 +328,7 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, optimiz
             .map(|source| source.context())
             .unwrap_or_else(runtime::default_gpu_context),
     };
-    let coop_caps = cfg
-        .runtime
-        .coop
-        .filter_caps(runtime::auto_tune(&gpu, 0).coop_caps);
-    let shared_memory_bytes = gpu.capabilities().max_compute_shared_memory_size;
+    let (coop_caps, shared_memory_bytes) = compile_target(&gpu, cfg.runtime.coop);
     let mode_tag = match mode {
         Mode::Training => 0,
         Mode::Inference => 1,
@@ -364,12 +360,13 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, optimiz
         }
     }
 
-    let (final_graph, report) =
-        prepare_graph(forward_graph, mode, cfg.optimize, skip_full_optimize);
-    let plan = {
-        let _span = tracing::info_span!("compile").entered();
-        compile::compile_owned_with_caps(final_graph, &options, coop_caps, shared_memory_bytes)
-    };
+    let (plan, report) = compile_for_target(
+        forward_graph,
+        mode,
+        &options,
+        (cfg.optimize, skip_full_optimize),
+        (coop_caps, shared_memory_bytes),
+    );
     log::info!(
         "execution plan: {} buffers, {} dispatches",
         plan.buffers.len(),
@@ -392,6 +389,47 @@ pub fn build(forward_graph: &Graph, cfg: SessionConfig<'_>) -> (Session, optimiz
         cfg.tune,
     );
     (session, report)
+}
+
+/// The cooperative tiles and workgroup memory a plan for `gpu` compiles
+/// against, filtered by the session's policy.
+fn compile_target(
+    gpu: &blade_graphics::Context,
+    policy: runtime::CoopPolicy,
+) -> (crate::codegen::CoopCaps, u32) {
+    (
+        policy.filter_caps(runtime::auto_tune(gpu, 0).coop_caps),
+        gpu.capabilities().max_compute_shared_memory_size,
+    )
+}
+
+fn compile_for_target(
+    forward_graph: &Graph,
+    mode: Mode,
+    options: &compile::CompileOptions,
+    (optimize, skip_full_optimize): (optimize::OptimizeConfig, bool),
+    (coop_caps, shared_memory_bytes): (crate::codegen::CoopCaps, u32),
+) -> (compile::ExecutionPlan, optimize::OptimizeReport) {
+    let (final_graph, report) = prepare_graph(forward_graph, mode, optimize, skip_full_optimize);
+    let _span = tracing::info_span!("compile").entered();
+    let plan =
+        compile::compile_owned_with_caps(final_graph, options, coop_caps, shared_memory_bytes);
+    (plan, report)
+}
+
+/// The plan [`build`] compiles for `forward_graph` under `cfg`, against
+/// the same target, without creating a session or reading a plan cache.
+/// Session construction then picks implementations (see
+/// `runtime::select_variants`), which this does not apply.
+pub(crate) fn plan(forward_graph: &Graph, cfg: &SessionConfig<'_>) -> compile::ExecutionPlan {
+    let gpu = cfg.gpu.clone().unwrap_or_else(runtime::default_gpu_context);
+    let mut options = cfg.options.clone();
+    if cfg.runtime.debug {
+        options.fuse_dispatches = false;
+    }
+    let target = compile_target(&gpu, cfg.runtime.coop);
+    let optimize = (cfg.optimize, cfg.skip_full_optimize);
+    compile_for_target(forward_graph, cfg.mode, &options, optimize, target).0
 }
 
 /// `graph` with the composites spelled in primitives recognized: all of

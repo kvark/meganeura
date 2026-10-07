@@ -251,7 +251,7 @@ impl AttentionGrad {
     }
 
     /// Workgroup memory of the cooperative tiles.
-    pub(crate) fn shared_bytes(self, head_dim: u32) -> u64 {
+    pub fn shared_bytes(self, head_dim: u32) -> u64 {
         let (per_dim, fixed) = match (self.path, self.part) {
             (Path::Cooperative(Operands::F32), _) => {
                 return u64::from(crate::codegen::FLASH_GRAD_COOP_F32_SHARED_BYTES);
