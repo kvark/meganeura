@@ -194,6 +194,8 @@ pub enum MatmulTile {
     CooperativeF32 {
         tile_size: u32,
     },
+    /// One aligned 16x16 output tile with f32 operands and accumulation.
+    CooperativeF32Single,
     /// A K-split GEMV at one workgroup width and cross-lane reduction.
     ///
     /// Keeps the shader entry and buffer layout. Width and reduction apply
@@ -303,6 +305,9 @@ impl MatmulTile {
                     Some(if small { Self::Tile32 } else { Self::Tile64 })
                 }
                 Kernel::ScalarMatmul(shape) => Some(Self::Scalar(shape)),
+                Kernel::CooperativeSingle => Self::native_cooperative(config)
+                    .filter(|tile| *tile == Self::CooperativeF32 { tile_size: 16 })
+                    .map(|_| Self::CooperativeF32Single),
                 Kernel::SpecializedConv { k_tile } => Some(Self::SpecializedConv {
                     tile_size: if small { 32 } else { 64 },
                     k_tile,
@@ -315,6 +320,11 @@ impl MatmulTile {
 
     pub(crate) fn coop_config(self) -> Option<CoopConfig> {
         match self {
+            Self::CooperativeF32Single => Some(CoopConfig {
+                tile_size: 16,
+                use_f16_input: false,
+                compensated: false,
+            }),
             Self::CooperativeF32 { tile_size } => Some(CoopConfig {
                 tile_size,
                 use_f16_input: false,
@@ -353,6 +363,7 @@ impl MatmulTile {
             Self::Tile32 | Self::Tile64 => crate::compile::Kernel::Default,
             Self::Scalar(shape) => crate::compile::Kernel::ScalarMatmul(shape),
             Self::CooperativeF32 { .. } => crate::compile::Kernel::Cooperative,
+            Self::CooperativeF32Single => crate::compile::Kernel::CooperativeSingle,
             Self::SpecializedConv { k_tile, .. } => {
                 crate::compile::Kernel::SpecializedConv { k_tile }
             }
@@ -385,6 +396,9 @@ impl MatmulTile {
                 ];
             }
             Self::SpecializedConv { tile_size, .. } => tile_size,
+            Self::CooperativeF32Single => {
+                return [class.m.div_ceil(16), class.n.div_ceil(16), 1];
+            }
             Self::CooperativeF32 { .. } => {
                 let tile = self.coop_config().unwrap().matmul_output_tile();
                 // Cooperative tiles use X for rows, Y for columns.
@@ -401,6 +415,20 @@ impl MatmulTile {
     }
 
     pub(crate) fn buffer_sizes(self, class: &TuneClass) -> Option<Vec<usize>> {
+        if self == Self::CooperativeF32Single
+            && (class.conv2d.is_some()
+                || class.weight_format != crate::compile::WeightFormat::F32
+                || !matches!(
+                    class.shader,
+                    ShaderEntry::MatMul | ShaderEntry::MatMulAT | ShaderEntry::MatMulBT
+                )
+                || !class.m.is_multiple_of(16)
+                || !class.n.is_multiple_of(16)
+                || !class.k.is_multiple_of(16)
+                || class.k > 8192)
+        {
+            return None;
+        }
         if let Self::Scalar(shape) = self {
             if class.conv2d.is_some()
                 || gemv_group(&class.shader).is_some()
@@ -453,9 +481,6 @@ impl MatmulTile {
             let tile = self.coop_config().unwrap().matmul_output_tile();
             let bytes = crate::compile::cooperative_output_bytes(class.m, class.n, 1, tile)?;
             *sizes.last_mut()? = bytes;
-            if class.has_addend() && tile_size != 8 {
-                sizes[2] = bytes;
-            }
         }
         if !crate::compile::workgroups_within_portable_limits(self.workgroups(class)) {
             return None;
@@ -756,6 +781,12 @@ impl TuneClass {
                 .collect();
         }
         let mut candidates: Vec<_> = [
+            Some(MatmulTile::CooperativeF32Single).filter(|_| {
+                MatmulTile::native_cooperative(config)
+                    == Some(MatmulTile::CooperativeF32 { tile_size: 16 })
+                    && (1024..=8192).contains(&self.k)
+                    && u64::from(self.m) * u64::from(self.n) <= 1_048_576
+            }),
             Some(MatmulTile::Tile64),
             Some(MatmulTile::Tile32),
             MatmulTile::native_cooperative(config)
@@ -765,7 +796,12 @@ impl TuneClass {
         .flatten()
         .collect();
         if !self.weight_format.is_quantized() {
-            candidates.retain(|tile| matches!(tile, MatmulTile::CooperativeF32 { .. }));
+            candidates.retain(|tile| {
+                matches!(
+                    tile,
+                    MatmulTile::CooperativeF32 { .. } | MatmulTile::CooperativeF32Single
+                )
+            });
             for interleave_columns in [false, true] {
                 for k_stage in [32, 16, 8] {
                     for tile_size in [64, 32] {
@@ -1993,6 +2029,78 @@ mod tests {
             );
         }
         assert!(MatmulTile::native_cooperative(Some(&native_config(4))).is_none());
+    }
+
+    #[test]
+    fn single_native_candidate_requires_aligned_plain_f32_and_native_16() {
+        let tile = MatmulTile::CooperativeF32Single;
+        let config = native_config(16);
+        for shader in [
+            ShaderEntry::MatMul,
+            ShaderEntry::MatMulAT,
+            ShaderEntry::MatMulBT,
+        ] {
+            let mut c = class(32, 48, 1024);
+            c.shader = shader.clone();
+            assert!(
+                c.challengers(MatmulTile::Tile64, Some(&config))
+                    .contains(&tile)
+            );
+            assert!(
+                !c.challengers(MatmulTile::Tile64, Some(&native_config(8)))
+                    .contains(&tile)
+            );
+            assert!(!c.challengers(MatmulTile::Tile64, None).contains(&tile));
+            assert!(
+                !c.challengers(
+                    MatmulTile::Tile64,
+                    Some(&CoopConfig {
+                        use_f16_input: true,
+                        ..config
+                    })
+                )
+                .contains(&tile)
+            );
+            let mut d = dispatch();
+            d.shader = shader.clone();
+            d.params = if shader == ShaderEntry::MatMul {
+                vec![32, 1024, 48, 0]
+            } else {
+                vec![32, 48, 1024, 0]
+            };
+            tile.apply(&mut d, &c);
+            assert_eq!(d.workgroups, [2, 3, 1]);
+            assert_eq!(MatmulTile::selected(&d, Some(&config)), Some(tile));
+            assert!(MatmulTile::selected(&d, Some(&native_config(8))).is_none());
+            assert!(TuneClass::from_dispatch(&d, Some(&config)).is_some());
+            assert!(TuneClass::from_dispatch(&d, None).is_none());
+            for (m, n, k) in [
+                (31, 48, 1024),
+                (32, 47, 1024),
+                (32, 48, 1032),
+                (32, 48, 32768),
+            ] {
+                let mut bad = class(m, n, k);
+                bad.shader = shader.clone();
+                assert!(!tile.fits(&bad));
+            }
+            for format in [
+                crate::compile::WeightFormat::F16,
+                crate::compile::WeightFormat::Q8,
+            ] {
+                c.weight_format = format;
+                assert!(!tile.fits(&c));
+            }
+        }
+        let mut fused = class(32, 48, 1024);
+        fused.shader = ShaderEntry::FusedMatMulAdd;
+        fused.binding_bytes = fused.buffer_sizes().unwrap();
+        assert!(!tile.fits(&fused));
+        assert!(
+            !class(128, 16384, 2048)
+                .challengers(MatmulTile::Tile64, Some(&config))
+                .contains(&tile)
+        );
     }
 
     #[test]

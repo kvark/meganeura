@@ -10,6 +10,7 @@ use super::{
 pub(crate) fn attention_coop_shared_bytes(group: ShaderGroup, head_dim: u32) -> u64 {
     let (per_dim, fixed) = match group {
         ShaderGroup::FlashAttentionCoop => (128u64, 1024),
+        ShaderGroup::FlashAttentionCoopF32 => (192, 1024),
         ShaderGroup::FlashGradQCoopF16 => (192, 3264),
         ShaderGroup::FlashGradKVCoopF16 => (256, 4544),
         _ => unreachable!("shared-memory accounting requires cooperative attention"),
@@ -280,11 +281,22 @@ fn generate_flash_attention(
 /// Cooperative forward attention: QKᵀ uses f16 matrix operands, while softmax
 /// and PV accumulate in f32 registers. Dispatch `[ceil(q_seq/16), num_heads, 1]`.
 pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
-    generate_coop_attention(
+    generate_flash_attention_coop(head_dim, true)
+}
+
+pub fn generate_flash_attention_coop_f32_module(head_dim: u32) -> ShaderModule {
+    generate_flash_attention_coop(head_dim, false)
+}
+
+fn generate_flash_attention_coop(head_dim: u32, use_f16: bool) -> ShaderModule {
+    let source = preprocess(
         include_str!("../shaders/flash_attention_coop.wgsl"),
-        head_dim,
-        "flash_attention_coop",
-    )
+        &[
+            ("$ENABLE_F16", if use_f16 { "enable f16;" } else { "" }),
+            ("$INPUT_TYPE", if use_f16 { "f16" } else { "f32" }),
+        ],
+    );
+    generate_coop_attention(&source, head_dim, "flash_attention_coop")
 }
 
 /// F16-input cooperative dQ: dispatch `[ceil(q_seq/16), num_heads, 1]`.
@@ -305,33 +317,38 @@ pub fn generate_flash_grad_kv_coop_f16_module(head_dim: u32) -> ShaderModule {
     )
 }
 
-/// F32 8x8 cooperative dK/dV, with 16-key tiles and full-precision matrix products.
+/// F32 cooperative dK/dV, with 16-key tiles and full-precision matrix products.
 /// The initial specialization covers the 64-wide transformer heads.
 pub fn generate_flash_grad_kv_coop_f32_module(head_dim: u32) -> ShaderModule {
+    generate_flash_grad_kv_coop_f32_module_with_tile(head_dim, 8)
+}
+
+pub fn generate_flash_grad_kv_coop_f32_module_with_tile(head_dim: u32, tile: u32) -> ShaderModule {
     assert_eq!(head_dim, 64);
+    assert!(matches!(tile, 8 | 16));
     let mut init = String::new();
     let mut accumulate = String::new();
     let mut store = String::new();
-    for column in 0..4 {
+    for column in 0..32 / tile {
         init.push_str(&format!(
-            "var dk{column} = coop_mat8x8<f32,C>();\n\
-             var dv{column} = coop_mat8x8<f32,C>();\n"
+            "var dk{column} = coop_mat{tile}x{tile}<f32,C>();\n\
+             var dv{column} = coop_mat{tile}x{tile}<f32,C>();\n"
         ));
         accumulate.push_str(&format!(
             "let b{column} = q * 64u + out_col + {}u;\n\
-             let q{column} = coopLoadT<coop_mat8x8<f32,B>>(&shared_q[b{column}], 64u);\n\
-             let do{column} = coopLoadT<coop_mat8x8<f32,B>>(&shared_do[b{column}], 64u);\n\
+             let q{column} = coopLoadT<coop_mat{tile}x{tile}<f32,B>>(&shared_q[b{column}], 64u);\n\
+             let do{column} = coopLoadT<coop_mat{tile}x{tile}<f32,B>>(&shared_do[b{column}], 64u);\n\
              dk{column} = coopMultiplyAdd(ds, q{column}, dk{column});\n\
              dv{column} = coopMultiplyAdd(p, do{column}, dv{column});\n",
-            column * 8
+            column * tile
         ));
         store.push_str(&format!(
             "let c{column} = out_row * 64u + out_col + {}u;\n\
-             if tile_sg < 4u {{\n\
+             if tile_sg < $OUTPUT_GROUPSu {{\n\
                  coopStoreT(dk{column}, &shared_k[c{column}], 64u);\n\
                  coopStoreT(dv{column}, &shared_v[c{column}], 64u);\n\
              }}\n",
-            column * 8
+            column * tile
         ));
     }
     attention_module(
@@ -342,6 +359,10 @@ pub fn generate_flash_grad_kv_coop_f32_module(head_dim: u32) -> ShaderModule {
                 ("$ACC_INIT", &init),
                 ("$ACCUMULATE", &accumulate),
                 ("$ACC_STORE", &store),
+                ("$OUTPUT_GROUPS", &(32 / tile).to_string()),
+                ("$SCORE_GROUPS", &((16 / tile).pow(2)).to_string()),
+                ("$SCORE_COLS", &(16 / tile).to_string()),
+                ("$TILE", &tile.to_string()),
             ],
         ),
         "flash_grad_kv_coop_f32",
@@ -350,24 +371,31 @@ pub fn generate_flash_grad_kv_coop_f32_module(head_dim: u32) -> ShaderModule {
 
 pub(crate) const FLASH_GRAD_COOP_F32_SHARED_BYTES: u32 = (4 * 1024 + 2 * 256 + 3 * 16) * 4;
 
-/// F32 8x8 cooperative dQ, dispatched as `[ceil(q_seq/16), num_heads, 1]`.
+/// F32 cooperative dQ, dispatched as `[ceil(q_seq/16), num_heads, 1]`.
 pub fn generate_flash_grad_q_coop_f32_module(head_dim: u32) -> ShaderModule {
+    generate_flash_grad_q_coop_f32_module_with_tile(head_dim, 8)
+}
+
+pub fn generate_flash_grad_q_coop_f32_module_with_tile(head_dim: u32, tile: u32) -> ShaderModule {
     assert_eq!(head_dim, 64);
+    assert!(matches!(tile, 8 | 16));
     let mut init = String::new();
     let mut accumulate = String::new();
     let mut store = String::new();
-    for column in 0..4 {
-        init.push_str(&format!("var dq{column} = coop_mat8x8<f32,C>();\n"));
+    for column in 0..32 / tile {
+        init.push_str(&format!(
+            "var dq{column} = coop_mat{tile}x{tile}<f32,C>();\n"
+        ));
         accumulate.push_str(&format!(
             "let b{column} = k * 64u + out_col + {}u;\n\
-             let k{column} = coopLoadT<coop_mat8x8<f32,B>>(&shared_k[b{column}], 64u);\n\
+             let k{column} = coopLoadT<coop_mat{tile}x{tile}<f32,B>>(&shared_k[b{column}], 64u);\n\
              dq{column} = coopMultiplyAdd(ds, k{column}, dq{column});\n",
-            column * 8
+            column * tile
         ));
         store.push_str(&format!(
             "let c{column} = out_row * 64u + out_col + {}u;\n\
-             if tile_sg < 4u {{ coopStoreT(dq{column}, &shared_q[c{column}], 64u); }}\n",
-            column * 8
+             if tile_sg < $OUTPUT_GROUPSu {{ coopStoreT(dq{column}, &shared_q[c{column}], 64u); }}\n",
+            column * tile
         ));
     }
     attention_module(
@@ -378,6 +406,10 @@ pub fn generate_flash_grad_q_coop_f32_module(head_dim: u32) -> ShaderModule {
                 ("$ACC_INIT", &init),
                 ("$ACCUMULATE", &accumulate),
                 ("$ACC_STORE", &store),
+                ("$OUTPUT_GROUPS", &(32 / tile).to_string()),
+                ("$SCORE_GROUPS", &((16 / tile).pow(2)).to_string()),
+                ("$SCORE_COLS", &(16 / tile).to_string()),
+                ("$TILE", &tile.to_string()),
             ],
         ),
         "flash_grad_q_coop_f32",

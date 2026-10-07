@@ -7,15 +7,14 @@ fn supported() -> bool {
         .capabilities()
         .cooperative_matrix
         .f32_shapes
-        .contains(&[8, 8, 8])
+        .iter()
+        .any(|shape| matches!(*shape, [8, 8, 8] | [16, 16, 16]))
 }
 
 #[test]
 fn coop_f32_tiles_cover_transposes_edges_and_f32_exponents() {
     if !supported() {
-        eprintln!(
-            "cooperative f32 8x8 f32 matrices unavailable; skipping device-specific coverage"
-        );
+        eprintln!("native cooperative f32 matrices unavailable; skipping device-specific coverage");
         return;
     }
     for (m, n, k) in [
@@ -192,6 +191,21 @@ fn coop_f32_prologue_addend_and_epilogue_cover_edge_rows() {
             (squared_error / squared_reference).sqrt() < 1e-5,
             "{kind}: error {squared_error}, reference {squared_reference}"
         );
+        if kind == "addend"
+            && crate::support::gpu::gpu()
+                .capabilities()
+                .cooperative_matrix
+                .f32_shapes
+                .contains(&[16, 16, 16])
+        {
+            session.set_input("a", &vec![1.0; m * k]);
+            session.set_input("b", &vec![0.125; k * n]);
+            session.set_input("src", &vec![16_777_216.0; m * n]);
+            session.step();
+            session.wait();
+            let expected = 16_777_216.0_f32 + k as f32 * 0.125;
+            assert!(session.read_output(m * n).iter().all(|&v| v == expected));
+        }
     }
 }
 

@@ -1,4 +1,4 @@
-//! Short-sequence cooperative forward/backward parity on GPUs with f16 tiles.
+//! Short-sequence cooperative forward/backward parity on supported GPUs.
 //!
 //! SmolVLA uses Q=50 with both KV=16 (cross attention) and KV=50 (self
 //! attention). These shapes must not inherit the scalar flash kernel's much
@@ -15,7 +15,7 @@ fn run(
     window: u32,
     head_dim: u32,
     cooperative: bool,
-) -> ([Vec<f32>; 3], [bool; 3]) {
+) -> ([Vec<f32>; 3], [bool; 4]) {
     let (num_heads, num_kv_heads) = (3, 1);
     let mut graph = Graph::new();
     let q = graph.parameter("q", &[q_seq, num_heads as usize * head_dim as usize]);
@@ -39,6 +39,7 @@ fn run(
     let (mut session, _) = build(&graph, config);
     let uses_coop = [
         ShaderEntry::FlashAttentionCoop,
+        ShaderEntry::FlashAttentionCoopF32,
         ShaderEntry::FlashGradQCoopF16,
         ShaderEntry::FlashGradKVCoopF16,
     ]
@@ -105,7 +106,13 @@ fn short_cross_self_and_window_attention_gradients_match_scalar() {
         .f16_f32_shapes
         .contains(&[16, 16, 16]);
 
-    // Minimum workgroup storage for forward, dQ, dK/dV at each width.
+    let has_f32 = gpu
+        .capabilities()
+        .cooperative_matrix
+        .f32_shapes
+        .contains(&[16, 16, 16]);
+
+    // Minimum workgroup storage for f16 forward, dQ, dK/dV at each width.
     // Wide heads must exercise scalar fallback even on cooperative hardware.
     for (label, q_seq, kv_seq, window, head_dim, storage) in [
         ("cross", 50, 16, 0, 64, [9_216, 15_552, 20_928]),
@@ -116,9 +123,11 @@ fn short_cross_self_and_window_attention_gradients_match_scalar() {
     ] {
         let (scalar, scalar_used_coop) = run(gpu.clone(), q_seq, kv_seq, window, head_dim, false);
         let (cooperative, coop_used_coop) = run(gpu.clone(), q_seq, kv_seq, window, head_dim, true);
-        assert_eq!(scalar_used_coop, [false; 3]);
-        let expected = storage
-            .map(|bytes| has_coop && bytes <= gpu.capabilities().max_compute_shared_memory_size);
+        assert_eq!(scalar_used_coop, [false; 4]);
+        let shared = gpu.capabilities().max_compute_shared_memory_size;
+        let f32_forward = has_f32 && 192 * head_dim + 1024 <= shared;
+        let f16 = storage.map(|bytes| has_coop && bytes <= shared);
+        let expected = [f16[0] && !f32_forward, f32_forward, f16[1], f16[2]];
         assert_eq!(coop_used_coop, expected, "{label}");
         for (i, name) in ["dQ", "dK", "dV"].into_iter().enumerate() {
             assert_close(&format!("{label} {name}"), &scalar[i], &cooperative[i]);

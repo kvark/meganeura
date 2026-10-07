@@ -1050,6 +1050,7 @@ enum Variant {
     WeightSmall(ShaderEntry, crate::compile::WeightFormat),
     /// Cooperative-matrix implementation qualified for the session's precision policy.
     Coop(ShaderEntry),
+    CoopSingle(ShaderEntry),
     /// Cooperative f16 with hi/lo residual staging (C1).
     CoopCompensated(ShaderEntry),
     /// Same-A matmul pack (D1). The kind is part of the key so a
@@ -1098,6 +1099,7 @@ impl Variant {
             | Variant::Weight(ref e, _)
             | Variant::WeightSmall(ref e, _)
             | Variant::Coop(ref e)
+            | Variant::CoopSingle(ref e)
             | Variant::CoopCompensated(ref e)
             | Variant::Horizontal(ref e, _, _)
             | Variant::SmallTile(ref e)
@@ -1140,6 +1142,7 @@ impl Variant {
             Variant::Weight(ref e, format) => format!("{e:?}:weight-{format:?}"),
             Variant::WeightSmall(ref e, format) => format!("{e:?}:weight-{format:?}-small-tile"),
             Variant::Coop(ref e) => format!("{e:?}:cooperative"),
+            Variant::CoopSingle(ref e) => format!("{e:?}:cooperative-single"),
             Variant::CoopCompensated(ref e) => format!("{e:?}:cooperative-compensated"),
             Variant::Horizontal(ref e, n, kind) => format!("{e:?}:horizontal-{n}-{kind:?}"),
             Variant::SmallTile(ref e) => format!("{e:?}:small-tile"),
@@ -1302,6 +1305,7 @@ impl Pipelines {
                 }
                 tuning::tile_module(dispatch, crate::tune::MatmulTile::Gemv(shape), matmul_knobs)
             }
+            Variant::CoopSingle(_) => crate::codegen::generate_module_coop_single(group),
             Variant::Coop(_) | Variant::CoopCompensated(_) => {
                 let mut config = cooperative();
                 config.compensated = dispatch.use_coop_compensated();
@@ -1369,6 +1373,9 @@ impl Pipelines {
                 ShaderGroup::FlashAttentionCoop => {
                     crate::codegen::generate_flash_attention_coop_module(hd)
                 }
+                ShaderGroup::FlashAttentionCoopF32 => {
+                    crate::codegen::generate_flash_attention_coop_f32_module(hd)
+                }
                 ShaderGroup::FlashGradQ => crate::codegen::generate_flash_grad_q_module(
                     hd,
                     ept.unwrap_or(knobs.flash_grad_q_ept_cap),
@@ -1384,10 +1391,16 @@ impl Pipelines {
                     crate::codegen::generate_flash_grad_kv_coop_f16_module(hd)
                 }
                 ShaderGroup::FlashGradKVCoopF32 => {
-                    crate::codegen::generate_flash_grad_kv_coop_f32_module(hd)
+                    crate::codegen::generate_flash_grad_kv_coop_f32_module_with_tile(
+                        hd,
+                        cooperative().tile_size,
+                    )
                 }
                 ShaderGroup::FlashGradQCoopF32 => {
-                    crate::codegen::generate_flash_grad_q_coop_f32_module(hd)
+                    crate::codegen::generate_flash_grad_q_coop_f32_module_with_tile(
+                        hd,
+                        cooperative().tile_size,
+                    )
                 }
                 ShaderGroup::MultiHeadAttn => crate::codegen::generate_attention_module(hd),
                 ShaderGroup::CachedQueryAttention => {
@@ -1446,6 +1459,7 @@ impl Pipelines {
             ShaderGroup::MultiHeadAttn
             | ShaderGroup::FlashAttention
             | ShaderGroup::FlashAttentionCoop
+            | ShaderGroup::FlashAttentionCoopF32
             | ShaderGroup::FlashGradQ
             | ShaderGroup::FlashGradQCoopF16
             | ShaderGroup::FlashGradKV
@@ -1461,6 +1475,9 @@ impl Pipelines {
     /// which unrelated pipelines happen to have been compiled.
     fn key(dispatch: &Dispatch) -> Variant {
         let entry = dispatch.shader.clone();
+        if dispatch.kernel == crate::compile::Kernel::CooperativeSingle {
+            return Variant::CoopSingle(entry);
+        }
         if let crate::compile::Kernel::SplitMatmul { shape, splits } = dispatch.kernel {
             return Variant::SplitMatmul(entry, dispatch.weight_format, shape, splits);
         }
@@ -1840,7 +1857,8 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::RmsNormAdd => RmsNormAddData::layout(),
         ShaderEntry::MultiHeadAttn
         | ShaderEntry::FlashAttention
-        | ShaderEntry::FlashAttentionCoop => MultiHeadAttnData::layout(),
+        | ShaderEntry::FlashAttentionCoop
+        | ShaderEntry::FlashAttentionCoopF32 => MultiHeadAttnData::layout(),
         ShaderEntry::MultiHeadAttnGradQ
         | ShaderEntry::FlashGradQ
         | ShaderEntry::FlashGradQCoopF16
@@ -2156,11 +2174,11 @@ pub(crate) fn select_variants(
                 if plan.buffers[buf_idx] < padded_bytes {
                     plan.buffers[buf_idx] = padded_bytes;
                 }
-                // F32 8x8 dense matrices stage addends through checked
-                // loads. In particular, external inputs retain their logical
-                // upload size. Older direct cooperative loads need padding.
+                // F32 dense matrices read addends through checked loads,
+                // so external inputs retain their logical upload size.
+                // Direct cooperative loads still need padding.
                 if dispatch.input_buffers.len() > 2
-                    && !(f32_8x8_coop && matches!(group, ShaderGroup::MatMulAdd))
+                    && !(!config.use_f16_input && matches!(group, ShaderGroup::MatMulAdd))
                 {
                     let src_idx = dispatch.input_buffers[2].0 as usize;
                     if plan.buffers[src_idx] < padded_bytes {

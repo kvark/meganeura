@@ -194,6 +194,22 @@ impl<'a> Compiler<'a> {
         // escape hatch).
         let coop_disabled = !self.options.flash_forward_coop;
         if !coop_disabled
+            && self.coop_caps.f32_tile == 16
+            && head_dim >= 16
+            && head_dim.is_power_of_two()
+            && q_seq >= 16
+            && q_seq.div_ceil(16) <= 65_535
+            && crate::codegen::attention_coop_shared_bytes(
+                ShaderGroup::FlashAttentionCoopF32,
+                head_dim,
+            ) <= u64::from(self.shared_memory_bytes)
+        {
+            return (
+                ShaderEntry::FlashAttentionCoopF32,
+                [q_seq.div_ceil(16), num_heads, 1],
+            );
+        }
+        if !coop_disabled
             && !requires_full_precision
             && self.coop_caps.supports_16x16_f16()
             && head_dim >= 16
@@ -3265,7 +3281,7 @@ impl<'a> Compiler<'a> {
                     .attention_ept_cap
                     .unwrap_or(self.options.knobs.flash_grad_q_ept_cap);
                 let f32_coop_enabled = node.attention_ept_cap.is_none()
-                    && self.coop_caps.f32_tile == 8
+                    && matches!(self.coop_caps.f32_tile, 8 | 16)
                     && head_dim == 64
                     && q_seq >= 128
                     && (is_causal || kv_seq >= 128)
@@ -3384,7 +3400,7 @@ impl<'a> Compiler<'a> {
                         head_dim,
                     ) <= u64::from(self.shared_memory_bytes);
                 let f32_coop_enabled = node.attention_ept_cap.is_none()
-                    && self.coop_caps.f32_tile == 8
+                    && matches!(self.coop_caps.f32_tile, 8 | 16)
                     && head_dim == 64
                     && q_seq >= 128
                     && dispatch_kv >= 128

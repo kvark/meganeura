@@ -469,7 +469,12 @@ fn main() {
         .unwrap(),
     );
     let caps = gpu.capabilities();
-    assert!(caps.cooperative_matrix.f32_shapes.contains(&[8, 8, 8]));
+    assert!(
+        caps.cooperative_matrix
+            .f32_shapes
+            .iter()
+            .any(|shape| matches!(*shape, [8, 8, 8] | [16, 16, 16]))
+    );
     assert!(caps.max_compute_shared_memory_size >= 18_624);
     let mut records = Vec::new();
     if suite == "all" || suite == "matmul" {

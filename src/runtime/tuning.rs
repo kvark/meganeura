@@ -166,6 +166,9 @@ pub(super) fn tile_module(
                 entry.shader_group(),
                 &tile.coop_config().expect("cooperative candidate"),
             ),
+            MatmulTile::CooperativeF32Single => {
+                crate::codegen::generate_module_coop_single(entry.shader_group())
+            }
             MatmulTile::SpecializedConv { .. } | MatmulTile::Gemv(_) | MatmulTile::Scalar(_) => {
                 unreachable!()
             }
@@ -1584,6 +1587,111 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "GPU qualification of native 16x16 f32 matrices"]
+    fn single_native_matmul_matches_full_f64_for_all_transposes() {
+        let gpu = std::sync::Arc::new(
+            crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap(),
+        );
+        if !gpu
+            .capabilities()
+            .cooperative_matrix
+            .f32_shapes
+            .contains(&[16, 16, 16])
+        {
+            eprintln!("native 16x16 f32 matrices unavailable; skipping device-specific coverage");
+            return;
+        }
+        for k in [1024, 8192] {
+            let (m, n) = (32, 48);
+            for transpose in 0..3 {
+                let mut graph = crate::Graph::new();
+                let a = graph.input("a", &if transpose == 1 { [k, m] } else { [m, k] });
+                let b = graph.input("b", &if transpose == 2 { [n, k] } else { [k, n] });
+                let y = match transpose {
+                    1 => graph.matmul_at(a, b),
+                    2 => graph.matmul_bt(a, b),
+                    _ => graph.matmul(a, b),
+                };
+                graph.set_outputs(vec![y]);
+                let mut session = Session::with_context_opts(
+                    crate::compile::compile(&graph),
+                    gpu.clone(),
+                    crate::SessionOptions {
+                        coop: crate::CoopPolicy::NativeF32,
+                        ..Default::default()
+                    },
+                );
+                let classes =
+                    collect_classes(&session.plan, &session.alias, session.coop_config.as_ref()).0;
+                assert_eq!(classes.len(), 1);
+                let class = &classes[0];
+                let tile = MatmulTile::CooperativeF32Single;
+                assert!(tile.fits(&class.key));
+                for &index in &class.members {
+                    session
+                        .pipelines
+                        .ensure_tune_tile(&gpu, &session.plan.dispatches[index], tile)
+                        .unwrap();
+                    tile.apply(&mut session.plan.dispatches[index], &class.key);
+                    assert!(matches!(
+                        Pipelines::key(&session.plan.dispatches[index]),
+                        Variant::CoopSingle(_)
+                    ));
+                }
+                session.pipelines.select(&session.plan.dispatches);
+                let a: Vec<f32> = (0..m * k)
+                    .map(|i| ((i * 17 % 101) as f32 - 50.0) * 0.002)
+                    .collect();
+                let b: Vec<f32> = (0..n * k)
+                    .map(|i| (((i * 17 + 31) % 101) as f32 - 50.0) * 0.002)
+                    .collect();
+                session.set_input("a", &a);
+                session.set_input("b", &b);
+                session.step();
+                session.wait();
+                let got = session.read_output(m * n);
+                let (mut error, mut reference, mut max_error, mut max_reference) =
+                    (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+                for row in 0..m {
+                    for col in 0..n {
+                        let expected: f64 = (0..k)
+                            .map(|inner| {
+                                let ai = if transpose == 1 {
+                                    inner * m + row
+                                } else {
+                                    row * k + inner
+                                };
+                                let bi = if transpose == 2 {
+                                    col * k + inner
+                                } else {
+                                    inner * n + col
+                                };
+                                f64::from(a[ai]) * f64::from(b[bi])
+                            })
+                            .sum();
+                        let actual = f64::from(got[row * n + col]);
+                        assert!(actual.is_finite());
+                        let diff = actual - expected;
+                        error += diff * diff;
+                        reference += expected * expected;
+                        max_error = max_error.max(diff.abs());
+                        max_reference = max_reference.max(expected.abs());
+                    }
+                }
+                assert!(
+                    (error / reference).sqrt() < 1e-5,
+                    "transpose={transpose}, k={k}: relative L2 {}",
+                    (error / reference).sqrt()
+                );
+                assert!(
+                    max_error < 5e-5 * max_reference + 1e-6,
+                    "transpose={transpose}, k={k}: maximum error {max_error}"
+                );
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "GPU qualification of resumable private kernel searches"]
     fn kernel_memo_resumes_only_qualified_comparisons() {
         let gpu = std::sync::Arc::new(
@@ -2495,6 +2603,12 @@ mod tests {
                     k_tile: 32,
                 },
             ];
+            if matches!(
+                entry,
+                ShaderEntry::MatMul | ShaderEntry::MatMulAT | ShaderEntry::MatMulBT
+            ) {
+                tiles.push(MatmulTile::CooperativeF32Single);
+            }
             for tile_size in [32, 64] {
                 for k_stage in [8, 16, 32] {
                     for interleave_columns in [false, true] {
