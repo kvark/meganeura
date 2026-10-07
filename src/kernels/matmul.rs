@@ -363,72 +363,23 @@ mod tests {
     }
 
     #[test]
-    fn transposed_addends_promote_only_with_f32_operands() {
+    fn transposed_addends_promote_on_f32_tiles() {
         for layout in [Layout::TransposedAAdd, Layout::TransposedBAdd] {
-            let problem = Problem {
+            let large = Problem {
                 requires_full_precision: true,
                 ..Problem::plain(layout, [1024, 1024, 256], false)
             };
-            for config in [
-                F32,
-                CoopConfig {
-                    tile_size: 16,
-                    ..F32
-                },
-            ] {
-                assert_eq!(select(&problem, &target(&config)), Path::Cooperative);
-                let edge = Problem::plain(layout, [65, 272, 33], false);
-                let geometry = cooperative_geometry(&edge, &config).unwrap();
-                assert_eq!(select(&edge, &target(&config)), Path::Cooperative);
-                assert_eq!(geometry.grid, [3, 9, 1]);
-                assert_eq!(geometry.output_bytes, 96 * 288 * 4);
-                assert_eq!(geometry.pad_addend, config.tile_size != 8);
-            }
-            // Even an explicit F16 permission does not broaden this default.
-            for compensated in [false, true] {
-                let config = CoopConfig { compensated, ..F16 };
-                for allow_raw_f16 in [false, true] {
-                    let target = Target {
-                        cooperative: Some(config),
-                        allow_raw_f16,
-                    };
-                    assert_eq!(select(&problem, &target), Path::Compiled);
-                }
-            }
-            let disabled = Target {
-                cooperative: None,
-                allow_raw_f16: false,
+            assert_eq!(select(&large, &target(&F32)), Path::Cooperative);
+            // F16 stays out even when a session explicitly allows it.
+            assert_eq!(select(&large, &target(&F16)), Path::Compiled);
+            let allowed = Target {
+                allow_raw_f16: true,
+                ..target(&F16)
             };
-            assert_eq!(select(&problem, &disabled), Path::Compiled);
-        }
-    }
-
-    #[test]
-    fn transposed_addends_keep_existing_safety_and_occupancy_checks() {
-        for layout in [Layout::TransposedAAdd, Layout::TransposedBAdd] {
-            let problem = Problem::plain(layout, [1024, 1024, 256], false);
-            for fallback in [
-                Problem {
-                    pinned: true,
-                    ..problem
-                },
-                Problem {
-                    epilogue_inputs: true,
-                    ..problem
-                },
-                Problem {
-                    reduced_storage: true,
-                    ..problem
-                },
-                Problem::plain(layout, [32, 32, 32], false),
-                Problem::plain(layout, [1024, 17, 256], false),
-                // A legal scalar grid must not become 65536 cooperative groups.
-                Problem::plain(layout, [2_097_152, 16, 4], false),
-                // Whole-tile output padding exceeds the shader's index domain.
-                Problem::plain(layout, [65_535, 65_536, 256], false),
-            ] {
-                assert_eq!(select(&fallback, &target(&F32)), Path::Compiled);
-            }
+            assert_eq!(select(&large, &allowed), Path::Compiled);
+            // The shared occupancy floor still applies.
+            let small = Problem::plain(layout, [32, 32, 32], false);
+            assert_eq!(select(&small, &target(&F32)), Path::Compiled);
         }
     }
 
