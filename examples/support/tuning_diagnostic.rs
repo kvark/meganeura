@@ -145,25 +145,32 @@ fn run_case(
 pub fn run(
     protocol: &str,
     labels: [&str; 2],
-    options: [TuneOptions; 2],
+    mut options: [TuneOptions; 2],
 ) -> Result<(), Box<dyn Error>> {
     env_logger::init();
     let mut args = std::env::args_os().skip(1);
     let path = args
         .next()
-        .ok_or("usage: <example> <new-output.json> <seed 1..6>")?;
+        .ok_or("usage: <example> <new-output.json> <seed 1..6> [search-seconds]")?;
     let seed: usize = args
         .next()
         .ok_or("missing seed")?
         .to_str()
         .ok_or("non-UTF8 seed")?
         .parse()?;
+    if let Some(seconds) = args.next() {
+        let seconds: u64 = seconds.to_str().ok_or("non-UTF8 search budget")?.parse()?;
+        if seconds == 0 {
+            return Err("search budget must be positive".into());
+        }
+        for option in &mut options {
+            option.max_time = std::time::Duration::from_secs(seconds);
+        }
+    }
     if !(1..=PROCESSES).contains(&seed) || args.next().is_some() {
-        return Err("expected one output and seed 1..6".into());
+        return Err("expected one output, seed 1..6, and optional search seconds".into());
     }
-    if !command("git", &["status", "--porcelain", "--untracked-files=no"])?.is_empty() {
-        return Err("commit tracked source before measuring".into());
-    }
+    let source = experiment_io::source_provenance()?;
     let mut output = OpenOptions::new().write(true).create_new(true).open(path)?;
     let before = command("nvidia-smi", &[]).ok();
     let monitor = gpu_monitor::Monitor::start();
@@ -171,13 +178,13 @@ pub fn run(
     let info = gpu.device_information();
     let caps = meganeura::runtime::auto_tune(&gpu, 0).coop_caps;
     let mut document = json!({"schema_version": 1, "protocol": protocol, "status": "running",
-        "metadata": {"revision": command("git", &["rev-parse", "HEAD"])?, "tracked_source_clean": true,
+        "metadata": {"revision": command("git", &["rev-parse", "HEAD"])?, "tracked_source_clean": source["tracked_source_clean"], "source": source,
             "cargo_lock_sha256": sha256(&Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"))?,
             "executable_sha256": sha256(&std::env::current_exe()?)?, "rustc": command("rustc", &["--version"])?,
             "seed": seed, "process_id": std::process::id(), "started_unix_ms": unix_ms(),
             "device": {"name": info.device_name, "driver": info.driver_info, "f32_tile": caps.f32_tile, "f16_tile": caps.f16_tile},
             "cooperative_policy": "Disabled", "compile_options": compile_options(),
-            "runtime_options": format!("{:?}", runtime_options(CoopPolicy::Disabled)), "optimize": meganeura::optimize::OptimizeConfig::default(),
+            "runtime_options": format!("{:?}", runtime_options(CoopPolicy::Disabled, false)), "optimize": meganeura::optimize::OptimizeConfig::default(),
             "prefix": PREFIX, "middle": MIDDLE, "final": FINAL,
             "arms": labels, "search_options": options,
             "contract": "strict f32; private staging policy only; full ordinary/tiny qualification unchanged; no whole-step speed claim",

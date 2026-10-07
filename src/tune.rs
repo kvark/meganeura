@@ -453,9 +453,6 @@ impl MatmulTile {
             let tile = self.coop_config().unwrap().matmul_output_tile();
             let bytes = crate::compile::cooperative_output_bytes(class.m, class.n, 1, tile)?;
             *sizes.last_mut()? = bytes;
-            if class.has_addend() && tile_size != 8 {
-                sizes[2] = bytes;
-            }
         }
         if !crate::compile::workgroups_within_portable_limits(self.workgroups(class)) {
             return None;
@@ -866,6 +863,15 @@ pub struct TuneOptions {
     pub dispatches_per_sample: u32,
     /// Required fractional improvement, in addition to a noise margin.
     pub min_improvement: f64,
+    /// Tighten cross-variant absolute and relative tolerances by this factor
+    /// in (0, 1]. Deep graphs may need extra headroom for accumulated rounding.
+    /// Private probes do not establish end-to-end numerical equivalence.
+    #[serde(default = "default_cross_variant_tolerance_scale")]
+    pub cross_variant_tolerance_scale: f64,
+}
+
+fn default_cross_variant_tolerance_scale() -> f64 {
+    1.0
 }
 
 impl Default for TuneOptions {
@@ -881,6 +887,7 @@ impl Default for TuneOptions {
             sample_pairs: 6,
             dispatches_per_sample: 16,
             min_improvement: 0.05,
+            cross_variant_tolerance_scale: default_cross_variant_tolerance_scale(),
         }
     }
 }
@@ -910,6 +917,14 @@ impl TuneOptions {
         }
         if !self.min_improvement.is_finite() || !(0.0..1.0).contains(&self.min_improvement) {
             return Err(TuneError("min_improvement must be finite and in [0, 1)"));
+        }
+        if !self.cross_variant_tolerance_scale.is_finite()
+            || self.cross_variant_tolerance_scale <= 0.0
+            || self.cross_variant_tolerance_scale > 1.0
+        {
+            return Err(TuneError(
+                "cross_variant_tolerance_scale must be finite and in (0, 1]",
+            ));
         }
         Ok(())
     }
@@ -1815,6 +1830,18 @@ mod tests {
                 min_improvement: f64::NAN,
                 ..Default::default()
             },
+            TuneOptions {
+                cross_variant_tolerance_scale: 0.0,
+                ..Default::default()
+            },
+            TuneOptions {
+                cross_variant_tolerance_scale: 1.01,
+                ..Default::default()
+            },
+            TuneOptions {
+                cross_variant_tolerance_scale: f64::NAN,
+                ..Default::default()
+            },
         ] {
             assert!(options.validate().is_err());
         }
@@ -2007,10 +2034,12 @@ mod tests {
         class.shader = ShaderEntry::FusedMatMulAdd;
         class.binding_bytes = class.buffer_sizes().unwrap();
         class.binding_bytes[3] = 64 * 32 * 4;
-        // Native 8x8 stages an edge addend with checked scalar loads;
-        // unlike the direct-load path, its external input need not grow.
+        // Cooperative addends use checked scalar loads and retain their logical size.
         assert_eq!(native.buffer_sizes(&class).unwrap()[2], 33 * 32 * 4);
         assert!(native.fits(&class));
+        let native16 = MatmulTile::CooperativeF32 { tile_size: 16 };
+        assert_eq!(native16.buffer_sizes(&class).unwrap()[2], 33 * 32 * 4);
+        assert!(native16.fits(&class));
         class.n = 17;
         assert!(native.buffer_sizes(&class).is_none());
         class.n = 32;

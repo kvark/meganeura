@@ -30,6 +30,23 @@ pub fn sha256(path: &Path) -> Result<String, Box<dyn Error>> {
         .into())
 }
 
+pub fn source_provenance() -> Result<Value, Box<dyn Error>> {
+    let status = command("git", &["status", "--porcelain", "--untracked-files=no"])?;
+    let clean = status.is_empty();
+    if !clean && std::env::var("MEGANEURA_BENCH_ALLOW_DIRTY").as_deref() != Ok("1") {
+        return Err("commit tracked source before measuring, or set MEGANEURA_BENCH_ALLOW_DIRTY=1 to record the complete tracked source patch".into());
+    }
+    let patch = if clean {
+        String::new()
+    } else {
+        format!(
+            "{}\n",
+            command("git", &["diff", "--binary", "--full-index", "HEAD", "--"])?
+        )
+    };
+    Ok(json!({"tracked_source_clean": clean, "tracked_status": status, "patch": patch}))
+}
+
 pub fn write_record(file: &mut File, record: &Value) -> Result<(), Box<dyn Error>> {
     file.seek(SeekFrom::Start(0))?;
     file.set_len(0)?;

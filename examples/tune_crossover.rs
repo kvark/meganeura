@@ -163,6 +163,7 @@ fn run_case(
         "finished_unix_ms": aa_finished_ms, "pairs": control, "comparison": aa_comparison});
     let first_winner = seed % 2;
     let search = sessions[first_winner].tune_with(TuneOptions {
+        cross_variant_tolerance_scale: 0.01,
         scope,
         max_time: Duration::from_secs(if scope == TuneScope::Convolution {
             2
@@ -320,9 +321,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if !(1..=6).contains(&seed) || args.next().is_some() {
         return Err("expected one output, seed 1..6, optional convolution scope".into());
     }
-    if !command("git", &["status", "--porcelain", "--untracked-files=no"])?.is_empty() {
-        return Err("commit tracked source before measuring".into());
-    }
+    let source = experiment_io::source_provenance()?;
     let mut output = OpenOptions::new().write(true).create_new(true).open(path)?;
     let before = command("nvidia-smi", &[]).ok();
     let monitor = gpu_monitor::Monitor::start();
@@ -344,7 +343,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "crossover-2026-09-06"
     };
     let mut document = json!({"schema_version": 1, "protocol": protocol, "status": "running",
-        "metadata": {"revision": command("git", &["rev-parse", "HEAD"])?, "tracked_source_clean": true,
+        "metadata": {"revision": command("git", &["rev-parse", "HEAD"])?, "tracked_source_clean": source["tracked_source_clean"], "source": source,
             "cargo_lock_sha256": sha256(&Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"))?,
             "executable_sha256": sha256(&std::env::current_exe()?)?, "rustc": command("rustc", &["--version"])?,
             "seed": seed, "scope": scope, "process_id": std::process::id(), "started_unix_ms": unix_ms(),
@@ -353,7 +352,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "MESA_SHADER_CACHE_DIR": std::env::var("MESA_SHADER_CACHE_DIR").ok()},
             "device": {"name": info.device_name, "driver": info.driver_info, "f32_tile": caps.f32_tile, "f16_tile": caps.f16_tile},
             "cooperative_policy": format!("{policy:?}"), "compile_options": compile_options(),
-            "runtime_options": format!("{:?}", runtime_options(policy)), "optimize": meganeura::optimize::OptimizeConfig::default(),
+            "runtime_options": format!("{:?}", runtime_options(policy, false)), "optimize": meganeura::optimize::OptimizeConfig::default(),
             "prefix": PREFIX, "warmup": WARMUP, "settling": SETTLING, "control_pairs": CONTROL_PAIRS, "block_pairs": BLOCK_PAIRS,
             "contract": "strict f32; matched evolving states; step+wait including optimizer/clip; telemetry active; swapping/search/readbacks/settling excluded",
             "nvidia_smi_before": before, "rustflags": std::env::var("RUSTFLAGS").ok(),

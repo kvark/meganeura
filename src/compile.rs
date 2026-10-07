@@ -310,6 +310,7 @@ pub enum ShaderEntry {
     /// `MEGANEURA_FLASH_FWD_COOP=0`.
     /// BQ=BKV=16, dispatched as `[ceil(q_seq/16), num_heads, 1]`.
     FlashAttentionCoop,
+    FlashAttentionCoopF32,
     /// F16-input cooperative products for score=Q·K^T and dp=dO·V^T,
     /// with scalar f32 dQ+=ds·K accumulation. Opt-in via
     /// `MEGANEURA_FLASH_BWD_COOP=1`. BQ=BKV=16,
@@ -456,6 +457,7 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttn
             | ShaderEntry::FlashAttention
             | ShaderEntry::FlashAttentionCoop
+            | ShaderEntry::FlashAttentionCoopF32
             | ShaderEntry::FlashGradQCoopF16
             | ShaderEntry::FlashGradKVCoopF16
             | ShaderEntry::FlashGradKVCoopF32
@@ -571,7 +573,10 @@ impl ShaderEntry {
     pub const fn is_attention(&self) -> bool {
         matches!(
             self,
-            Self::FlashAttention | Self::MultiHeadAttn | Self::FlashAttentionCoop
+            Self::FlashAttention
+                | Self::MultiHeadAttn
+                | Self::FlashAttentionCoop
+                | Self::FlashAttentionCoopF32
         )
     }
 
@@ -612,6 +617,7 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttn => ShaderGroup::MultiHeadAttn,
             ShaderEntry::FlashAttention => ShaderGroup::FlashAttention,
             ShaderEntry::FlashAttentionCoop => ShaderGroup::FlashAttentionCoop,
+            ShaderEntry::FlashAttentionCoopF32 => ShaderGroup::FlashAttentionCoopF32,
             ShaderEntry::FlashGradQCoopF16 => ShaderGroup::FlashGradQCoopF16,
             ShaderEntry::FlashGradKVCoopF16 => ShaderGroup::FlashGradKVCoopF16,
             ShaderEntry::FlashGradKVCoopF32 => ShaderGroup::FlashGradKVCoopF32,
@@ -728,6 +734,7 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttn
             | ShaderEntry::FlashAttention
             | ShaderEntry::FlashAttentionCoop
+            | ShaderEntry::FlashAttentionCoopF32
             | ShaderEntry::MultiHeadAttnGradQ
             | ShaderEntry::FlashGradQ
             | ShaderEntry::FlashGradQCoopF16
@@ -4388,6 +4395,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_f32_forward_attention_respects_precision_storage_and_grid_bounds() {
+        let graph = Graph::new();
+        for (tile, head_dim, rows, bytes, selected) in [
+            (16, 16, 17, 4096, true),
+            (16, 16, 17, 4095, false),
+            (16, 64, 15, 65536, false),
+            (16, 64, 1500, 65536, true),
+            (16, 48, 128, 65536, false),
+            (16, 512, 128, 65536, false),
+            (16, 64, 16 * 65536, 65536, false),
+            (8, 64, 128, 65536, false),
+        ] {
+            let compiler = Compiler::new_with_options(
+                &graph,
+                CompileOptions::default(),
+                crate::codegen::CoopCaps {
+                    f32_tile: tile,
+                    f16_tile: 16,
+                },
+                bytes,
+                false,
+            );
+            for full_precision in [false, true] {
+                let (entry, grid) = compiler.attention_dispatch(rows, head_dim, 3, full_precision);
+                assert_eq!(entry == ShaderEntry::FlashAttentionCoopF32, selected);
+                if selected {
+                    assert_eq!(grid, [rows.div_ceil(16), 3, 1]);
+                }
+            }
+        }
+    }
+
     /// A 16×16 f16-only capability set is what several NVIDIA Vulkan
     /// drivers expose (and is also used by RDNA3). Keep this plan-time path
     /// covered even when CI has no matching physical adapter.
@@ -4510,7 +4550,8 @@ mod tests {
             (8, 64, 129, 145, 18_624, [true, true]),
             (8, 64, 129, 145, 18_623, [false, false]),
             (0, 64, 129, 145, 32_768, [false, false]),
-            (16, 64, 129, 145, 32_768, [false, false]),
+            (16, 64, 129, 145, 18_624, [true, true]),
+            (16, 64, 129, 145, 18_623, [false, false]),
             (8, 128, 129, 145, 32_768, [false, false]),
             (8, 64, 50, 145, 32_768, [false, false]),
             (8, 64, 129, 16, 32_768, [false, false]),

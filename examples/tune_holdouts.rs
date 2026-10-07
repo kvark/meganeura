@@ -3,8 +3,12 @@
 #[path = "support/tuning_measurement.rs"]
 mod measurement;
 
+#[path = "support/experiment_io.rs"]
+#[allow(dead_code)]
+mod experiment_io;
 #[path = "support/holdout_workloads.rs"]
 mod workloads;
+
 use measurement::{PairedTiming, TensorComparison};
 use meganeura::{CoopPolicy, TuneOptions};
 use serde_json::{Value, json};
@@ -54,6 +58,7 @@ fn run_case(
     }
     drop(a);
     let report = match tuned.tune_with(TuneOptions {
+        cross_variant_tolerance_scale: 0.01,
         scope: meganeura::TuneScope::Dense,
         max_time: Duration::from_secs(10),
         ..Default::default()
@@ -202,9 +207,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         return Ok(());
     }
-    if !command("git", &["status", "--porcelain", "--untracked-files=no"])?.is_empty() {
-        return Err("commit tracked source changes before measuring".into());
-    }
+    let source = experiment_io::source_provenance()?;
     let mut output = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -223,7 +226,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "status": "running",
         "metadata": {
             "revision": command("git", &["rev-parse", "HEAD"] )?,
-            "tracked_source_clean": true,
+            "tracked_source_clean": source["tracked_source_clean"], "source": source,
             "cargo_lock_sha256": sha256(&Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"))?,
             "executable_sha256": sha256(&std::env::current_exe()?)?,
             "rustc": command("rustc", &["--version"] )?,
@@ -235,7 +238,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "flash_forward_coop": false, "flash_backward_coop": false,
             "compile_options": compile_options(),
             "optimize_config": meganeura::optimize::OptimizeConfig::default(),
-            "runtime_options": format!("{:?}", runtime_options(policy)),
+            "runtime_options": format!("{:?}", runtime_options(policy, false)),
             "skip_full_optimize": false, "build_cache": false,
             "prefix_steps": PREFIX_STEPS, "warmups_per_session": WARMUPS, "settling_steps": SETTLING_STEPS, "sample_pairs": SAMPLE_PAIRS,
             "contract": "strict f32; synthetic weights/inputs; matched evolving trajectories; normal step+wait including stated optimizer/clip; construction/uploads/search/readbacks excluded",

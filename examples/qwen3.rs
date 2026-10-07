@@ -268,6 +268,24 @@ fn main() {
         let k = g.matmul(h, wk);
         let v = g.matmul(h, wv);
 
+        let q_norm = g.parameter(
+            &format!("{}.self_attn.q_norm.weight", p),
+            &[head_dim as usize],
+        );
+        let k_norm = g.parameter(
+            &format!("{}.self_attn.k_norm.weight", p),
+            &[head_dim as usize],
+        );
+        let q = g.reshape(q, &[seq_len * config.num_heads as usize, head_dim as usize]);
+        let q = g.rms_norm(q, q_norm, eps);
+        let q = g.reshape(q, &[seq_len, qd]);
+        let k = g.reshape(
+            k,
+            &[seq_len * config.num_kv_heads as usize, head_dim as usize],
+        );
+        let k = g.rms_norm(k, k_norm, eps);
+        let k = g.reshape(k, &[seq_len, kv]);
+
         // RoPE
         let q = g.rope(q, theta, head_dim);
         let k = g.rope(k, theta, head_dim);

@@ -229,9 +229,7 @@ def main():
         n = 1
         for s in shape:
             n *= s
-        flat = torch.tensor(
-            [(math.sin(i * 0.01 + 1.0) * 0.1) for i in range(n)], dtype=dtype
-        )
+        flat = (torch.arange(n, dtype=dtype) * 0.01 + 1.0).sin() * 0.1
         pt_name = mega_to_pt_name(mega_name)
         if pt_name not in param_dict:
             print(f"  WARNING: no PT param for {mega_name!r} (-> {pt_name!r})")
@@ -255,15 +253,15 @@ def main():
     every_n = cfg["self_attn_every_n"]
 
     def make_input(n_elems, fn):
-        return torch.tensor([fn(i) for i in range(n_elems)], dtype=dtype)
+        return fn(torch.arange(n_elems, dtype=dtype))
 
-    noisy_actions = make_input(chunk * ad, lambda i: math.sin(i * 0.01) * 0.1)
+    noisy_actions = make_input(chunk * ad, lambda i: (i * 0.01).sin() * 0.1)
     noisy_actions = noisy_actions.reshape(1, chunk, ad)
 
-    timestep = make_input(h * 2, lambda i: math.cos(i * 0.005) * 0.1)
+    timestep = make_input(h * 2, lambda i: (i * 0.005).cos() * 0.1)
     timestep = timestep.reshape(1, 1, h * 2)
 
-    vlm_kv_flat = make_input(vlm_seq * kv_dim, lambda i: math.sin(i * 0.002) * 0.05)
+    vlm_kv_flat = make_input(vlm_seq * kv_dim, lambda i: (i * 0.002).sin() * 0.05)
     vlm_kv_tensor = vlm_kv_flat.reshape(1, vlm_seq, kv_dim)
 
     # Cross-attention layers need vlm_kv; self-attention layers get None

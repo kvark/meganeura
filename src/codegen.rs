@@ -625,6 +625,7 @@ pub enum ShaderGroup {
     /// Phase 1: coop_mat for QK^T, scalar softmax + PV. Opt-in via
     /// `MEGANEURA_FLASH_FWD_COOP=1`.
     FlashAttentionCoop,
+    FlashAttentionCoopF32,
     /// F16-input cooperative score and dP products, followed by scalar
     /// f32 dS·K accumulation for dQ. Opt-in via
     /// `MEGANEURA_FLASH_BWD_COOP=1`.
@@ -772,6 +773,7 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
             )
         }
         ShaderGroup::FlashAttentionCoop => generate_flash_attention_coop_module(64),
+        ShaderGroup::FlashAttentionCoopF32 => generate_flash_attention_coop_f32_module(64),
         ShaderGroup::FlashGradQCoopF16 => generate_flash_grad_q_coop_f16_module(64),
         ShaderGroup::FlashGradKVCoopF16 => generate_flash_grad_kv_coop_f16_module(64),
         ShaderGroup::FlashGradKVCoopF32 => generate_flash_grad_kv_coop_f32_module(64),
@@ -2708,33 +2710,24 @@ fn gen_matmul_coop_wgsl_full(
         )
     };
 
-    let (fused_decl, acc_init) = if fused_add {
-        (
-            "var<storage> src: array<f32>;".to_string(),
-            format!(
-                "var acc00 = coopLoadT<{coop_c}>(&src[c00], n);\n\
-                 \x20   var acc01 = coopLoadT<{coop_c}>(&src[c01], n);\n\
-                 \x20   var acc10 = coopLoadT<{coop_c}>(&src[c10], n);\n\
-                 \x20   var acc11 = coopLoadT<{coop_c}>(&src[c11], n);"
-            ),
-        )
+    let fused_decl = if fused_add {
+        "var<storage> src: array<f32>;"
     } else {
-        (
-            String::new(),
-            format!(
-                "var acc00 = {coop_c}();\n\
-                 \x20   var acc01 = {coop_c}();\n\
-                 \x20   var acc10 = {coop_c}();\n\
-                 \x20   var acc11 = {coop_c}();"
-            ),
-        )
+        ""
     };
+    let acc_init = format!(
+        "var acc00 = {coop_c}();\n\
+         var acc01 = {coop_c}();\n\
+         var acc10 = {coop_c}();\n\
+         var acc11 = {coop_c}();"
+    );
+    let addend = if fused_add { " + src[idx]" } else { "" };
 
     let output_tile_u = format!("{}u", output_tile);
     let tile_size_u = format!("{}u", tile);
     let shared_size_s = format!("{}", shared_size);
     let result_shared_size = output_tile * output_tile;
-    let (result_shared_decl, result_store) = if epilogue.is_some() {
+    let (result_shared_decl, result_store) = if epilogue.is_some() || fused_add {
         // Cooperative matrices are subgroup-scoped. Only one subgroup may
         // store these shared tiles; every invocation still reaches the barrier.
         let store_iters = result_shared_size.div_ceil(wg_size);
@@ -2761,7 +2754,7 @@ fn gen_matmul_coop_wgsl_full(
                  \x20           let col = tile_col + local_col;\n\
                  \x20           if row < m && col < n {{\n\
                  \x20               let idx = row * n + col;\n\
-                 \x20               var val = shared_c[local_idx];\n\
+                 \x20               var val = shared_c[local_idx]{addend};\n\
                  \x20               {epilogue_body}\n\
                  \x20               $C_BUFFER[idx] = val;\n\
                  \x20           }}\n\
@@ -2935,16 +2928,8 @@ fn gen_matmul_coop_f32_8x8(
         // Hoist pointer indices before the cooperative store statement.
         // Naga's SPIR-V backend needs their scalar expressions emitted first.
         acc_init.push_str(&format!("let c{name} = {offset};\n"));
-        let init = if fused_add {
-            acc_init.push_str(&format!(
-                "let add{name} = (sg_row + {row}u) * 32u + sg_col + {col}u;\n"
-            ));
-            format!("coopLoadT<coop_mat8x8<f32,C>>(&shared_a[add{name}], 32u)")
-        } else {
-            "coop_mat8x8<f32,C>()".to_owned()
-        };
-        acc_init.push_str(&format!("var acc{name} = {init};\n"));
-        if epilogue.is_some() {
+        acc_init.push_str(&format!("var acc{name} = coop_mat8x8<f32,C>();\n"));
+        if epilogue.is_some() || fused_add {
             acc_init.push_str(&format!(
                 "let s{name} = (sg_row + {row}u) * 32u + sg_col + {col}u;\n"
             ));
@@ -2958,7 +2943,8 @@ fn gen_matmul_coop_f32_8x8(
             ));
         }
     }
-    if epilogue.is_some() {
+    let addend = if fused_add { " + src[idx]" } else { "" };
+    if epilogue.is_some() || fused_add {
         result_store.push_str(&format!(
             "workgroupBarrier();\n\
              for (var local_idx = lid.x; local_idx < 1024u; local_idx += 128u) {{\n\
@@ -2967,7 +2953,7 @@ fn gen_matmul_coop_f32_8x8(
                  let owner = (local_idx / 512u) * 2u + (local_idx % 32u) / 16u;\n\
                  if row < m && col < n && owner >= group_base && owner < group_base + 128u / sg_size {{\n\
                      let idx = row * n + col;\n\
-                     var val = shared_c[local_idx];\n\
+                     var val = shared_c[local_idx]{addend};\n\
                      {epilogue_body}\n\
                      $C_BUFFER[idx] = val;\n\
                  }}\n\
@@ -2984,25 +2970,6 @@ fn gen_matmul_coop_f32_8x8(
             ("$A_STAGE", &a_stage),
             ("$B_STAGE", &b_stage),
             ("$ACC_INIT", &acc_init),
-            (
-                "$ADDEND_STAGE",
-                if fused_add {
-                    "for (var flat = lid.x; flat < 1024u; flat += 128u) {\n\
-                        let row = tile_row + flat / 32u;\n\
-                        let col = tile_col + flat % 32u;\n\
-                        var value = 0.0;\n\
-                        if row < m && col < n { value = src[row * n + col]; }\n\
-                        shared_a[flat] = value;\n\
-                    }\n\
-                    workgroupBarrier();"
-                } else {
-                    ""
-                },
-            ),
-            (
-                "$ACC_READY",
-                if fused_add { "workgroupBarrier();" } else { "" },
-            ),
             ("$RESULT_STORE", &result_store),
             (
                 "$FUSED_ADD_DECL",
@@ -3014,7 +2981,7 @@ fn gen_matmul_coop_f32_8x8(
             ),
             (
                 "$RESULT_SHARED_DECL",
-                if epilogue.is_some() {
+                if epilogue.is_some() || fused_add {
                     "var<workgroup> shared_c: array<f32, 1024>;"
                 } else {
                     ""
@@ -3194,6 +3161,10 @@ mod tests {
                 naga::valid::Capabilities::COOPERATIVE_MATRIX
                     | naga::valid::Capabilities::SHADER_FLOAT16
                     | naga::valid::Capabilities::SUBGROUP,
+            ),
+            (
+                ShaderGroup::FlashAttentionCoopF32,
+                naga::valid::Capabilities::COOPERATIVE_MATRIX | naga::valid::Capabilities::SUBGROUP,
             ),
             (
                 ShaderGroup::FlashGradQCoopF16,
@@ -3382,6 +3353,11 @@ mod tests {
                     &["shared_v"][..],
                 ),
                 (
+                    ShaderGroup::FlashAttentionCoopF32,
+                    generate_flash_attention_coop_f32_module(head_dim),
+                    &["shared_q", "shared_k_t", "shared_v"][..],
+                ),
+                (
                     ShaderGroup::FlashGradQCoopF16,
                     generate_flash_grad_q_coop_f16_module(head_dim),
                     &["shared_k"][..],
@@ -3469,6 +3445,14 @@ mod tests {
     #[test]
     fn coop_f32_attention_staging_preserves_f32_and_matches_storage_gate() {
         for (shader, expected_bytes) in [
+            (
+                generate_flash_grad_q_coop_f32_module_with_tile(64, 16),
+                FLASH_GRAD_COOP_F32_SHARED_BYTES,
+            ),
+            (
+                generate_flash_grad_kv_coop_f32_module_with_tile(64, 16),
+                FLASH_GRAD_COOP_F32_SHARED_BYTES,
+            ),
             (
                 generate_flash_grad_q_coop_f32_module(64),
                 FLASH_GRAD_COOP_F32_SHARED_BYTES,
@@ -3771,6 +3755,7 @@ mod tests {
             (ShaderGroup::MultiHeadAttn, empty),
             (ShaderGroup::FlashAttention, empty),
             (ShaderGroup::FlashAttentionCoop, coop),
+            (ShaderGroup::FlashAttentionCoopF32, coop),
             (ShaderGroup::MultiHeadAttnGradQ, empty),
             (ShaderGroup::FlashGradQ, empty),
             (ShaderGroup::FlashGradQCoopF16, coop),
@@ -3928,7 +3913,8 @@ mod tests {
                 ShaderEntry::LayerNorm => vec!["src", "src_b", "bias", "dst", "params"],
                 ShaderEntry::MultiHeadAttn
                 | ShaderEntry::FlashAttention
-                | ShaderEntry::FlashAttentionCoop => {
+                | ShaderEntry::FlashAttentionCoop
+                | ShaderEntry::FlashAttentionCoopF32 => {
                     vec!["src_a", "src_b", "bias", "dst", "lse", "params"]
                 }
                 ShaderEntry::MultiHeadAttnGradQ
@@ -4098,6 +4084,7 @@ mod tests {
             ShaderEntry::MultiHeadAttn,
             ShaderEntry::FlashAttention,
             ShaderEntry::FlashAttentionCoop,
+            ShaderEntry::FlashAttentionCoopF32,
             ShaderEntry::FlashGradQCoopF16,
             ShaderEntry::FlashGradKVCoopF16,
             ShaderEntry::FlashGradKVCoopF32,

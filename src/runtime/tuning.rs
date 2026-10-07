@@ -14,7 +14,7 @@ use std::{
 /// Qualified private-scratch comparisons within one graph search, on one device
 /// and under one numerical/timing policy. Never persisted or shared globally.
 #[derive(Default)]
-pub(crate) struct KernelMemo(HashMap<(u32, bool, TuneClass, Vec<MatmulTile>), KernelProgress>);
+pub(crate) struct KernelMemo(HashMap<(u32, bool, u64, TuneClass, Vec<MatmulTile>), KernelProgress>);
 
 #[derive(Clone, Copy)]
 struct KernelProgress {
@@ -267,11 +267,11 @@ fn collect_classes(
         let physical: Vec<_> = bindings.iter().map(|b| alias.map[b.0 as usize]).collect();
         // Do not transfer isolated timings to overlapping bindings, even if
         // readonly input aliasing is legal. It changes the cache working set.
-        if physical
-            .iter()
-            .enumerate()
-            .any(|(i, p)| physical[..i].contains(p))
-        {
+        if bindings.iter().enumerate().any(|(i, b)| {
+            bindings[..i]
+                .iter()
+                .any(|other| alias.overlap(&plan.buffers, b.0 as usize, other.0 as usize))
+        }) {
             excluded += 1;
             continue;
         }
@@ -360,6 +360,7 @@ impl Session {
             || self.plan.buffers != other.plan.buffers
             || self.plan.knobs != other.plan.knobs
             || self.alias.map != other.alias.map
+            || self.alias.offsets != other.alias.offsets
             || self.alias.sizes != other.alias.sizes
             || self.alias.device_local != other.alias.device_local
             || self.groups != other.groups
@@ -483,6 +484,7 @@ impl Session {
             let memo_key = (
                 self.plan.knobs.matmul_k_stage,
                 self.plan.knobs.matmul_interleave_columns,
+                options.cross_variant_tolerance_scale.to_bits(),
                 class.key.clone(),
                 std::iter::once(class.initial)
                     .chain(class.challengers.iter().copied())
@@ -874,7 +876,13 @@ impl Session {
                 let valid = {
                     let _timer = PhaseTimer::new(&mut details.validation);
                     qualify_output(&class.key, &inputs, &output, scale)
-                        && (variant == 0 || outputs_agree(&reference, &output, scale))
+                        && (variant == 0
+                            || outputs_agree(
+                                &reference,
+                                &output,
+                                scale,
+                                options.cross_variant_tolerance_scale,
+                            ))
                 };
                 if !valid {
                     outcome.decision = TuneDecision::InvalidOutput;
@@ -1376,12 +1384,16 @@ fn close(reference: f64, actual: f32, scale: f64) -> bool {
         && (reference - actual as f64).abs() <= scale * 1.0e-5 + reference.abs() * 2.0e-4
 }
 
-fn outputs_agree(reference: &[f32], actual: &[f32], scale: f64) -> bool {
+fn outputs_agree(reference: &[f32], actual: &[f32], scale: f64, tolerance_scale: f64) -> bool {
+    // Leave headroom for error accumulation when replacements compose across
+    // layers. This private kernel check cannot establish whole-graph parity.
     reference.len() == actual.len()
-        && reference
-            .iter()
-            .zip(actual)
-            .all(|(&a, &b)| close(a as f64, b, scale))
+        && reference.iter().zip(actual).all(|(&a, &b)| {
+            a.is_finite()
+                && b.is_finite()
+                && (a as f64 - b as f64).abs()
+                    <= tolerance_scale * (scale * 1.0e-5 + (a as f64).abs() * 2.0e-4)
+        })
 }
 
 fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize) -> f64 {
@@ -2453,6 +2465,15 @@ mod tests {
         assert_eq!(classes[0].members.len(), 2);
         alias.device_local[plan.dispatches[1].output_buffer.0 as usize] = true;
         assert_eq!(collect_classes(&plan, &alias, None).0.len(), 2);
+        let first = plan.dispatches[0].input_buffers[0].0 as usize;
+        let second = plan.dispatches[0].input_buffers[1].0 as usize;
+        alias.map[second] = alias.map[first];
+        alias.offsets[second] = plan.buffers[first].next_multiple_of(256);
+        assert_eq!(collect_classes(&plan, &alias, None).1, 0);
+        alias.offsets[second] = plan.buffers[first] - 4;
+        assert_eq!(collect_classes(&plan, &alias, None).1, 1);
+        alias.map[second] = second;
+        alias.offsets[second] = 0;
         plan.dispatches[0].input_buffers[1] = plan.dispatches[0].output_buffer;
         assert_eq!(collect_classes(&plan, &alias, None).1, 1);
     }
@@ -2648,6 +2669,20 @@ mod tests {
 
     #[test]
     fn reference_qualification_checks_layout_and_tiny_operands() {
+        for scale in [1.0, 1.0e-12] {
+            assert!(outputs_agree(
+                &[0.0],
+                &[(0.5e-7 * scale) as f32],
+                scale,
+                0.01
+            ));
+            assert!(!outputs_agree(
+                &[0.0],
+                &[(3.0e-7 * scale) as f32],
+                scale,
+                0.01
+            ));
+        }
         for shader in [
             ShaderEntry::MatMul,
             ShaderEntry::MatMulAT,
@@ -2681,7 +2716,7 @@ mod tests {
                 assert!(!qualify_output(&class, &inputs, &[f32::NAN; 15], scale));
                 let mut corrupt = output.clone();
                 corrupt[14] += scale as f32;
-                assert!(!outputs_agree(&output, &corrupt, scale));
+                assert!(!outputs_agree(&output, &corrupt, scale, 1.0));
                 assert!(!qualify_output(&class, &inputs, &corrupt, scale));
             }
         }

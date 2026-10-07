@@ -189,6 +189,8 @@ fn recomposition_cost() {
         ("smollm2-135m forward", &forward, Mode::Inference),
         ("smollm2-135m training", &training, Mode::Training),
     ] {
+        let written = graph.decompose_for(mode);
+        let graph = &written;
         let decomposed = graph.decompose();
         let start = Instant::now();
         let _ = graph.recompose();

@@ -118,7 +118,6 @@ def export_mnist_mlp(output_dir: str):
         onnx_path,
         input_names=["x"],
         output_names=["logits"],
-        dynamic_axes={"x": {0: "batch"}, "logits": {0: "batch"}},
         opset_version=17,
     )
     print(f"Done: {onnx_path} ({os.path.getsize(onnx_path)} bytes)")

@@ -6,6 +6,10 @@
 //! model benchmark or a comparison with another engine. Native-f32 coverage
 //! is reported explicitly; f16-input hardware is not silently substituted.
 
+#[path = "support/experiment_io.rs"]
+#[allow(dead_code)]
+mod experiment_io;
+
 use meganeura::{
     CoopPolicy, Graph, MatmulTile, Mode, Session, SessionConfig, SessionOptions, TuneOptions, build,
 };
@@ -67,12 +71,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
         return Ok(());
     }
-    let source_status = command("git", &["status", "--porcelain", "--untracked-files=no"])?;
-    if !source_status.is_empty() {
-        return Err(
-            "commit tracked source changes before measuring; results need an exact revision".into(),
-        );
-    }
+    let source = experiment_io::source_provenance()?;
     // Reserve the path before doing GPU work. Never overwrite frozen results.
     let output = OpenOptions::new()
         .write(true)
@@ -92,7 +91,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     let metadata = json!({
         "revision": command("git", &["rev-parse", "HEAD"] )?,
-        "tracked_source_clean": true,
+        "tracked_source_clean": source["tracked_source_clean"], "source": source,
         "cargo_lock_sha256": sha256(&Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"))?,
         "executable_sha256": sha256(&std::env::current_exe()?)?,
         "rustc": command("rustc", &["--version"] )?,
@@ -234,6 +233,7 @@ fn run_case(
     let before = tuned.read_output(rows * width);
     let initial_parity = parity(&reference, &before)?;
     let report = tuned.tune_with(TuneOptions {
+        cross_variant_tolerance_scale: 0.01,
         scope: meganeura::TuneScope::Dense,
         max_time: Duration::from_secs(10),
         ..Default::default()

@@ -1,7 +1,7 @@
-// QK^T uses f16 cooperative operands; V and the scalar PV accumulation stay f32.
+// QK^T uses $INPUT_TYPE cooperative operands; V and the scalar PV accumulation stay f32.
 // Each of 64 threads owns one (query row, head-dimension chunk). Keeping O,
 // its maximum and sum in registers avoids a shared-memory roundtrip per tile.
-enable f16;
+$ENABLE_F16
 enable wgpu_cooperative_matrix;
 
 $PARAMS
@@ -12,8 +12,8 @@ var<storage, read_write> dst: array<f32>;
 var<storage, read_write> lse: array<f32>;
 var<uniform> params: Params;
 
-var<workgroup> shared_q: array<f16, $TILE_ELEMENTS>;
-var<workgroup> shared_k_t: array<f16, $TILE_ELEMENTS>;
+var<workgroup> shared_q: array<$INPUT_TYPE, $TILE_ELEMENTS>;
+var<workgroup> shared_k_t: array<$INPUT_TYPE, $TILE_ELEMENTS>;
 var<workgroup> shared_v: array<f32, $TILE_ELEMENTS>;
 var<workgroup> shared_score: array<f32, 256>;
 
@@ -60,7 +60,7 @@ fn main(
         let r = i / $HEAD_DIMu;
         let col = i % $HEAD_DIMu;
         let qp = pos_base + r;
-        if qp < q_seq { shared_q[i] = f16(src_a[qp * (num_heads * head_dim) + head * head_dim + col]); } else { shared_q[i] = f16(0.0); }
+        if qp < q_seq { shared_q[i] = $INPUT_TYPE(src_a[qp * (num_heads * head_dim) + head * head_dim + col]); } else { shared_q[i] = $INPUT_TYPE(0.0); }
     }
     workgroupBarrier();
 
@@ -71,7 +71,7 @@ fn main(
             let ki = i / $HEAD_DIMu;
             let d = i % $HEAD_DIMu;
             let kv_pos = t + ki;
-            shared_k_t[d * 16u + ki] = f16(src_b[kv_pos * kv_dim + kv_head_off + d]);
+            shared_k_t[d * 16u + ki] = $INPUT_TYPE(src_b[kv_pos * kv_dim + kv_head_off + d]);
             shared_v[ki * head_dim + d] = bias[kv_pos * kv_dim + kv_head_off + d];
         }
         workgroupBarrier();
@@ -79,8 +79,8 @@ fn main(
         // Cooperative score tile.
         var score_acc = coop_mat16x16<f32,C>();
         for (var ht = 0u; ht < $HEAD_TILESu; ht = ht + 1u) {
-            let a = coopLoadT<coop_mat16x16<f16,A>>(&shared_q[ht * 16u], $HEAD_DIMu);
-            let b = coopLoadT<coop_mat16x16<f16,B>>(&shared_k_t[ht * 16u * 16u], 16u);
+            let a = coopLoadT<coop_mat16x16<$INPUT_TYPE,A>>(&shared_q[ht * 16u], $HEAD_DIMu);
+            let b = coopLoadT<coop_mat16x16<$INPUT_TYPE,B>>(&shared_k_t[ht * 16u * 16u], 16u);
             score_acc = coopMultiplyAdd(a, b, score_acc);
         }
         if sg == 0u { coopStoreT(score_acc, &shared_score[0], 16u); }

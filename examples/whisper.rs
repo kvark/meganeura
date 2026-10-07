@@ -4,7 +4,7 @@
 /// manually, and processes a synthetic mel spectrogram.
 ///
 /// Usage:
-///   cargo run --release --example whisper
+///   cargo run --release --example whisper -- [output.f32]
 use meganeura::{Graph, data::safetensors::SafeTensorsModel, models::whisper};
 
 const REPO_ID: &str = "openai/whisper-tiny";
@@ -52,22 +52,15 @@ fn main() {
     let transposed_set: std::collections::HashSet<&str> =
         transposed.iter().map(|s| s.as_str()).collect();
 
-    // Conv bias expansion: NCHW channel bias [C] → [C * spatial]
-    let conv1_spatial = mel_len as usize; // conv1: stride=1, same length
-    let conv2_spatial = ((mel_len + 2 - 3) / 2 + 1) as usize; // conv2: stride=2
-
     for (name, _) in session.plan().param_buffers.clone() {
-        // Handle fused conv bias: expand [C] → [C * spatial] for NCHW
         if name == "model.encoder.conv1.fused_bias" {
             let bias = model.tensor_f32_auto("model.encoder.conv1.bias").unwrap();
-            let expanded = expand_channel_bias(&bias, conv1_spatial);
-            session.set_parameter(&name, &expanded);
+            session.set_parameter(&name, &bias);
             continue;
         }
         if name == "model.encoder.conv2.fused_bias" {
             let bias = model.tensor_f32_auto("model.encoder.conv2.bias").unwrap();
-            let expanded = expand_channel_bias(&bias, conv2_spatial);
-            session.set_parameter(&name, &expanded);
+            session.set_parameter(&name, &bias);
             continue;
         }
         if !model.tensor_info().contains_key(&name) {
@@ -102,6 +95,14 @@ fn main() {
     // Read output
     let output_len = session.plan().buffers[session.plan().output_buffers[0].0 as usize] / 4;
     let output = session.read_output(output_len);
+    assert!(output.iter().all(|value| value.is_finite()));
+    if let Some(path) = std::env::args_os().nth(1) {
+        let bytes: Vec<u8> = output
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        std::fs::write(path, bytes).expect("write encoder output");
+    }
 
     let seq_len = output.len() / config.d_model;
     println!(
@@ -116,16 +117,4 @@ fn main() {
             output[0], output[1], output[2], output[3], output[4]
         );
     }
-}
-
-/// Expand a per-channel bias [C] to NCHW spatial [C * spatial] for element-wise add.
-fn expand_channel_bias(bias: &[f32], spatial: usize) -> Vec<f32> {
-    let c = bias.len();
-    let mut expanded = vec![0.0f32; c * spatial];
-    for ch in 0..c {
-        for s in 0..spatial {
-            expanded[ch * spatial + s] = bias[ch];
-        }
-    }
-    expanded
 }

@@ -103,7 +103,9 @@ fn run_case(
         .position(|d| {
             matches!(
                 d.shader,
-                ShaderEntry::Conv2dGradWeightGemm | ShaderEntry::Conv2dGradWeightGemmSmall
+                ShaderEntry::Conv2dGradWeightGemm
+                    | ShaderEntry::Conv2dGradWeightGemmSmall
+                    | ShaderEntry::Conv2dGradWeightGemm16
             )
         })
         .ok_or("missing scalar dW")?;
@@ -173,15 +175,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     if !(1..=4).contains(&seed) || args.next().is_some() {
         return Err("expected seed 1..4".into());
     }
-    if !command("git", &["status", "--porcelain", "--untracked-files=no"])?.is_empty() {
-        return Err("commit tracked source before measuring".into());
-    }
+    let source = experiment_io::source_provenance()?;
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     let monitor = gpu_monitor::Monitor::start();
     let gpu = Arc::new(meganeura::init_gpu_context()?);
     let info = gpu.device_information();
     let mut record = json!({"protocol": "split-k-sequence-v1", "status": "running", "metadata": {
-        "revision": command("git", &["rev-parse", "HEAD"])?, "tracked_source_clean": true,
+        "revision": command("git", &["rev-parse", "HEAD"])?, "tracked_source_clean": source["tracked_source_clean"], "source": source,
         "executable_sha256": sha256(&std::env::current_exe()?)?,
         "cargo_lock_sha256": sha256(&Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"))?,
         "rustc": command("rustc", &["--version"])?, "rustflags": std::env::var("RUSTFLAGS").ok(),

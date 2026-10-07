@@ -194,6 +194,22 @@ impl<'a> Compiler<'a> {
         // escape hatch).
         let coop_disabled = !self.options.flash_forward_coop;
         if !coop_disabled
+            && self.coop_caps.f32_tile == 16
+            && head_dim >= 16
+            && head_dim.is_power_of_two()
+            && q_seq >= 16
+            && q_seq.div_ceil(16) <= 65_535
+            && crate::codegen::attention_coop_shared_bytes(
+                ShaderGroup::FlashAttentionCoopF32,
+                head_dim,
+            ) <= u64::from(self.shared_memory_bytes)
+        {
+            return (
+                ShaderEntry::FlashAttentionCoopF32,
+                [q_seq.div_ceil(16), num_heads, 1],
+            );
+        }
+        if !coop_disabled
             && !requires_full_precision
             && self.coop_caps.supports_16x16_f16()
             && head_dim >= 16
@@ -1384,23 +1400,8 @@ impl<'a> Compiler<'a> {
                     op: crate::schedule::ReduceOp::Sum,
                     prologue: PointwiseDAG {
                         n_inputs: 3,
-                        ops: vec![
-                            Pw::LoadInput(0),
-                            Pw::LoadInput(1),
-                            Pw::LoadInput(2),
-                            floor.clone(),
-                            Pw::Sub(2, 3),
-                            Pw::Relu(4),
-                            Pw::Add(5, 3),
-                            Pw::Recip(6),
-                            Pw::Mul(7, 7),
-                            Pw::Neg(8),
-                            Pw::Mul(0, 1),
-                            Pw::Mul(10, 9),
-                            Pw::Greater(2, 3),
-                            Pw::Mul(11, 12),
-                        ],
-                        output: 13,
+                        ops: vec![Pw::LoadInput(0), Pw::LoadInput(1), Pw::Mul(0, 1)],
+                        output: 2,
                     },
                     extra_prologues: vec![],
                     epilogue: Some(ReductionEpilogue {
@@ -1416,10 +1417,15 @@ impl<'a> Compiler<'a> {
                                 Pw::Relu(5),
                                 Pw::Add(6, 4),
                                 Pw::Recip(7),
+                                Pw::Mul(8, 8),
+                                Pw::Neg(9),
+                                Pw::Mul(3, 10),
+                                Pw::Greater(2, 4),
+                                Pw::Mul(11, 12),
                                 Pw::Mul(0, 8),
-                                Pw::Add(9, 3),
+                                Pw::Add(14, 13),
                             ],
-                            output: 10,
+                            output: 15,
                         },
                         n_per_col_inputs: 0,
                     }),
@@ -3275,7 +3281,7 @@ impl<'a> Compiler<'a> {
                     .attention_ept_cap
                     .unwrap_or(self.options.knobs.flash_grad_q_ept_cap);
                 let f32_coop_enabled = node.attention_ept_cap.is_none()
-                    && self.coop_caps.f32_tile == 8
+                    && matches!(self.coop_caps.f32_tile, 8 | 16)
                     && head_dim == 64
                     && q_seq >= 128
                     && (is_causal || kv_seq >= 128)
@@ -3394,7 +3400,7 @@ impl<'a> Compiler<'a> {
                         head_dim,
                     ) <= u64::from(self.shared_memory_bytes);
                 let f32_coop_enabled = node.attention_ept_cap.is_none()
-                    && self.coop_caps.f32_tile == 8
+                    && matches!(self.coop_caps.f32_tile, 8 | 16)
                     && head_dim == 64
                     && q_seq >= 128
                     && dispatch_kv >= 128

@@ -1369,6 +1369,9 @@ impl Pipelines {
                 ShaderGroup::FlashAttentionCoop => {
                     crate::codegen::generate_flash_attention_coop_module(hd)
                 }
+                ShaderGroup::FlashAttentionCoopF32 => {
+                    crate::codegen::generate_flash_attention_coop_f32_module(hd)
+                }
                 ShaderGroup::FlashGradQ => crate::codegen::generate_flash_grad_q_module(
                     hd,
                     ept.unwrap_or(knobs.flash_grad_q_ept_cap),
@@ -1384,10 +1387,16 @@ impl Pipelines {
                     crate::codegen::generate_flash_grad_kv_coop_f16_module(hd)
                 }
                 ShaderGroup::FlashGradKVCoopF32 => {
-                    crate::codegen::generate_flash_grad_kv_coop_f32_module(hd)
+                    crate::codegen::generate_flash_grad_kv_coop_f32_module_with_tile(
+                        hd,
+                        cooperative().tile_size,
+                    )
                 }
                 ShaderGroup::FlashGradQCoopF32 => {
-                    crate::codegen::generate_flash_grad_q_coop_f32_module(hd)
+                    crate::codegen::generate_flash_grad_q_coop_f32_module_with_tile(
+                        hd,
+                        cooperative().tile_size,
+                    )
                 }
                 ShaderGroup::MultiHeadAttn => crate::codegen::generate_attention_module(hd),
                 ShaderGroup::CachedQueryAttention => {
@@ -1446,6 +1455,7 @@ impl Pipelines {
             ShaderGroup::MultiHeadAttn
             | ShaderGroup::FlashAttention
             | ShaderGroup::FlashAttentionCoop
+            | ShaderGroup::FlashAttentionCoopF32
             | ShaderGroup::FlashGradQ
             | ShaderGroup::FlashGradQCoopF16
             | ShaderGroup::FlashGradKV
@@ -1840,7 +1850,8 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::RmsNormAdd => RmsNormAddData::layout(),
         ShaderEntry::MultiHeadAttn
         | ShaderEntry::FlashAttention
-        | ShaderEntry::FlashAttentionCoop => MultiHeadAttnData::layout(),
+        | ShaderEntry::FlashAttentionCoop
+        | ShaderEntry::FlashAttentionCoopF32 => MultiHeadAttnData::layout(),
         ShaderEntry::MultiHeadAttnGradQ
         | ShaderEntry::FlashGradQ
         | ShaderEntry::FlashGradQCoopF16
@@ -2155,17 +2166,6 @@ pub(crate) fn select_variants(
                 let buf_idx = dispatch.output_buffer.0 as usize;
                 if plan.buffers[buf_idx] < padded_bytes {
                     plan.buffers[buf_idx] = padded_bytes;
-                }
-                // F32 8x8 dense matrices stage addends through checked
-                // loads. In particular, external inputs retain their logical
-                // upload size. Older direct cooperative loads need padding.
-                if dispatch.input_buffers.len() > 2
-                    && !(f32_8x8_coop && matches!(group, ShaderGroup::MatMulAdd))
-                {
-                    let src_idx = dispatch.input_buffers[2].0 as usize;
-                    if plan.buffers[src_idx] < padded_bytes {
-                        plan.buffers[src_idx] = padded_bytes;
-                    }
                 }
             }
         }
@@ -4405,7 +4405,7 @@ mod variant_tests {
         };
         select_variants(&mut demoted, None, false, false);
         assert!(demoted.dispatches[0].use_small_tiles());
-        let pipelines = Pipelines::new(&gpu, &demoted, None, None);
+        let mut pipelines = Pipelines::new(&gpu, &demoted, None, None);
         assert!(
             pipelines
                 .map
@@ -4419,6 +4419,9 @@ mod variant_tests {
                 .contains_key(&Variant::SmallTile(ShaderEntry::MatMul)),
             "no dispatch can select SmallTile here, so it must not be built"
         );
+        for pipeline in pipelines.map.values_mut() {
+            gpu.destroy_compute_pipeline(pipeline);
+        }
 
         // Q4 matmul + relu: reduced-storage weights, now fused.
         let mut weighted = {
@@ -4435,7 +4438,7 @@ mod variant_tests {
             weighted.dispatches[0].weight_format,
             crate::compile::WeightFormat::Q4
         );
-        let pipelines = Pipelines::new(&gpu, &weighted, None, None);
+        let mut pipelines = Pipelines::new(&gpu, &weighted, None, None);
         assert!(
             !pipelines.map.contains_key(&Variant::Weight(
                 ShaderEntry::MatMul,
@@ -4443,6 +4446,9 @@ mod variant_tests {
             )),
             "no dispatch can select the plain weighted kernel here"
         );
+        for pipeline in pipelines.map.values_mut() {
+            gpu.destroy_compute_pipeline(pipeline);
+        }
     }
 
     /// A fused epilogue must not keep a matmul on 64×64 geometry once the

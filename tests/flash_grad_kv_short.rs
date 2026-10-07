@@ -43,11 +43,11 @@ fn run(
         ShaderEntry::FlashGradKVCoopF16,
     ]
     .map(|shader| {
-        session
-            .plan()
-            .dispatches
-            .iter()
-            .any(|dispatch| dispatch.shader == shader)
+        session.plan().dispatches.iter().any(|dispatch| {
+            dispatch.shader == shader
+                || (shader == ShaderEntry::FlashAttentionCoop
+                    && dispatch.shader == ShaderEntry::FlashAttentionCoopF32)
+        })
     });
 
     let q_data: Vec<f32> = (0..q_seq * num_heads as usize * head_dim as usize)
@@ -117,8 +117,14 @@ fn short_cross_self_and_window_attention_gradients_match_scalar() {
         let (scalar, scalar_used_coop) = run(gpu.clone(), q_seq, kv_seq, window, head_dim, false);
         let (cooperative, coop_used_coop) = run(gpu.clone(), q_seq, kv_seq, window, head_dim, true);
         assert_eq!(scalar_used_coop, [false; 3]);
-        let expected = storage
+        let mut expected = storage
             .map(|bytes| has_coop && bytes <= gpu.capabilities().max_compute_shared_memory_size);
+        expected[0] |= gpu
+            .capabilities()
+            .cooperative_matrix
+            .f32_shapes
+            .contains(&[16, 16, 16])
+            && 192 * head_dim + 1024 <= gpu.capabilities().max_compute_shared_memory_size;
         assert_eq!(coop_used_coop, expected, "{label}");
         for (i, name) in ["dQ", "dK", "dV"].into_iter().enumerate() {
             assert_close(&format!("{label} {name}"), &scalar[i], &cooperative[i]);

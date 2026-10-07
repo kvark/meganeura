@@ -14,7 +14,6 @@
 use meganeura::Graph;
 use meganeura::NodeId;
 use meganeura::data::safetensors::SafeTensorsModel;
-use meganeura::models::efficientnet;
 use meganeura::models::efficientnet::{Spatial, fused_mbconv, mbconv};
 
 const BATCH: u32 = 4;
@@ -171,18 +170,11 @@ fn main() {
 
     println!("loading weights from {weights_path}...");
     let weights = SafeTensorsModel::load(weights_path.clone().into()).expect("safetensors load");
-    // Only set parameters that the partial graph actually requires.
-    // Load only the parameters that our partial graph references — which
-    // depends on the chosen stage. Easiest: try all, ignore not-in-graph.
-    for name in efficientnet::weight_names() {
-        if let Ok(data) = weights.tensor_f32(&name) {
-            // Try set_parameter; if the param isn't in the current graph
-            // it'll panic via "unknown parameter" — catch by checking the
-            // session's plan first via a permissive helper.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                session.set_parameter(&name, &data);
-            }));
-        }
+    for (name, _) in session.plan().param_buffers.clone() {
+        let data = weights
+            .tensor_f32(&name)
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        session.set_parameter(&name, &data);
     }
 
     // Build replicated input: a simple gradient image, repeated across batches.
@@ -211,6 +203,10 @@ fn main() {
 
     let total = (batch as usize) * (out_channels as usize) * (out_h as usize) * (out_w as usize);
     let out = session.read_output(total);
+    assert!(
+        out.iter().all(|value| value.is_finite()),
+        "nonfinite output at {out_label}"
+    );
 
     // For each batch, compute mean / max-abs of its slice.
     let per_batch_elems = (out_channels as usize) * (out_h as usize) * (out_w as usize);
@@ -246,5 +242,6 @@ fn main() {
         println!("RESULT: lanes uniform at tap {out_label} ✓ (bug is downstream)");
     } else {
         println!("RESULT: lanes DIVERGENT at tap {out_label} ‼ (bug is here or upstream)");
+        panic!("lane mismatch at {out_label}: {max_diff}");
     }
 }

@@ -19,7 +19,7 @@ use std::process::Command;
 use meganeura::codegen::{CoopConfig, ShaderGroup, ShaderModule};
 use meganeura::compile::ShaderEntry;
 
-fn analyze_spirv(name: &str, module: &naga::Module, dump: bool) {
+fn analyze_spirv(name: &str, module: &naga::Module, entry: &ShaderEntry, dump: bool) {
     let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
     let info = match naga::valid::Validator::new(flags, naga::valid::Capabilities::all())
         .validate(module)
@@ -39,7 +39,7 @@ fn analyze_spirv(name: &str, module: &naga::Module, dump: bool) {
         naga::back::spv::ZeroInitializeWorkgroupMemoryMode::None;
     let pipeline_opts = naga::back::spv::PipelineOptions {
         shader_stage: naga::ShaderStage::Compute,
-        entry_point: "main".to_string(),
+        entry_point: entry.entry_point().to_string(),
     };
     let words = match naga::back::spv::write_vec(module, &info, &opts, Some(&pipeline_opts)) {
         Ok(w) => w,
@@ -142,6 +142,25 @@ fn analyze_gpu(gpu: &blade_graphics::Context, name: &str, sm: &ShaderModule, ent
     gpu.destroy_compute_pipeline(&mut pipeline);
 }
 
+fn coop_gpu<'a>(
+    gpu: Option<&'a blade_graphics::Context>,
+    config: &CoopConfig,
+) -> Option<&'a blade_graphics::Context> {
+    gpu.filter(|gpu| {
+        let caps = &gpu.capabilities().cooperative_matrix;
+        let shapes = if config.use_f16_input {
+            &caps.f16_f32_shapes
+        } else {
+            &caps.f32_shapes
+        };
+        let supported = shapes.contains(&[config.tile_size; 3]);
+        if !supported {
+            println!("  GPU analysis unavailable for this cooperative matrix shape and type");
+        }
+        supported
+    })
+}
+
 fn analyze(
     name: &str,
     sm: &ShaderModule,
@@ -149,7 +168,7 @@ fn analyze(
     dump: bool,
     gpu: Option<&blade_graphics::Context>,
 ) {
-    analyze_spirv(name, &sm.module, dump);
+    analyze_spirv(name, &sm.module, entry, dump);
     if let Some(g) = gpu {
         analyze_gpu(g, name, sm, entry);
     }
@@ -167,7 +186,7 @@ fn main() {
             blade_graphics::Context::init(blade_graphics::ContextDesc {
                 validation: false,
                 timing: false,
-                capture: false,
+                capture: true,
                 overlay: false,
                 device_id: dev_id,
                 ..Default::default()
@@ -206,25 +225,32 @@ fn main() {
         ];
         for (name, entry) in cases {
             let sm = meganeura::codegen::generate_module_coop(entry.shader_group(), &config);
-            analyze(name, &sm, entry, dump, gpu_ref);
+            analyze(name, &sm, entry, dump, coop_gpu(gpu_ref, &config));
         }
     }
 
-    // 2. Coop matmul (f32 path, tile=8 — Apple Silicon)
-    println!("\nCooperative matmul (tile=8, f32 — Apple path):");
-    {
+    println!("\nCooperative matmul (f32 input, f32 accum):");
+    let mut tiles = vec![8];
+    if let Some(gpu) = gpu_ref {
+        for &[m, n, k] in &gpu.capabilities().cooperative_matrix.f32_shapes {
+            if m == n && n == k && !tiles.contains(&m) {
+                tiles.push(m);
+            }
+        }
+    }
+    for tile_size in tiles {
         let config = CoopConfig {
-            tile_size: 8,
+            tile_size,
             use_f16_input: false,
             compensated: false,
         };
         let sm = meganeura::codegen::generate_module_coop(ShaderGroup::MatMul, &config);
         analyze(
-            "matmul_coop_8x8_f32",
+            &format!("matmul_coop_{tile_size}x{tile_size}_f32"),
             &sm,
             &ShaderEntry::MatMul,
             dump,
-            gpu_ref,
+            coop_gpu(gpu_ref, &config),
         );
     }
 
@@ -378,13 +404,36 @@ fn main() {
             gpu_ref,
         );
 
+        let sm_f32 = meganeura::codegen::generate_flash_attention_coop_f32_module(64);
+        analyze(
+            "flash_attention_coop_f32_hd64",
+            &sm_f32,
+            &ShaderEntry::FlashAttentionCoopF32,
+            dump,
+            coop_gpu(
+                gpu_ref,
+                &CoopConfig {
+                    tile_size: 16,
+                    use_f16_input: false,
+                    compensated: false,
+                },
+            ),
+        );
+
         let sm_coop = meganeura::codegen::generate_flash_attention_coop_module(64);
         analyze(
             "flash_attention_coop_hd64",
             &sm_coop,
             &ShaderEntry::FlashAttentionCoop,
             dump,
-            gpu_ref,
+            coop_gpu(
+                gpu_ref,
+                &CoopConfig {
+                    tile_size: 16,
+                    use_f16_input: true,
+                    compensated: false,
+                },
+            ),
         );
     }
 

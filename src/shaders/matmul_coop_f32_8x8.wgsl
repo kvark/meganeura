@@ -40,11 +40,7 @@ $ENTRY_SIGNATURE {
         // but do not store it. Cooperative arithmetic stays in uniform flow.
         let sg_row = ((tile_sg % 4u) / 2u) * 16u;
         let sg_col = (tile_sg % 2u) * 16u;
-        // Reuse the A tile to bounds-check an optional addend without
-        // changing the logical size of externally supplied input buffers.
-        $ADDEND_STAGE
         $ACC_INIT
-        $ACC_READY
 
         for (var t = 0u; t < k; t += 32u) {
             $A_STAGE
