@@ -50,8 +50,7 @@ impl Layout {
         )
     }
 
-    /// Transposed products with an addend have cooperative kernels that
-    /// only measurement selects, and no 32-wide scalar kernel.
+    /// Transposed products with an addend have no 32-wide scalar kernel.
     fn transposed_with_addend(self) -> bool {
         matches!(self, Self::TransposedAAdd | Self::TransposedBAdd)
     }
@@ -167,8 +166,8 @@ impl Family for Path {
                 };
                 if problem.pinned {
                     Err("a schedule pinned a scalar kernel")
-                } else if problem.layout.transposed_with_addend() {
-                    Err("only measurement promotes transposed products with an addend")
+                } else if problem.layout.transposed_with_addend() && config.use_f16_input {
+                    Err("f16 transposed addends are not qualified for automatic promotion")
                 } else if config.use_f16_input
                     && problem.requires_full_precision
                     && !target.allow_raw_f16
@@ -364,13 +363,23 @@ mod tests {
     }
 
     #[test]
-    fn transposed_addends_are_left_to_measurement() {
+    fn transposed_addends_promote_on_f32_tiles() {
         for layout in [Layout::TransposedAAdd, Layout::TransposedBAdd] {
-            let problem = Problem::plain(layout, [1024, 1024, 256], false);
-            assert_eq!(select(&problem, &target(&F32)), Path::Compiled);
+            let large = Problem {
+                requires_full_precision: true,
+                ..Problem::plain(layout, [1024, 1024, 256], false)
+            };
+            assert_eq!(select(&large, &target(&F32)), Path::Cooperative);
+            // F16 stays out even when a session explicitly allows it.
+            assert_eq!(select(&large, &target(&F16)), Path::Compiled);
+            let allowed = Target {
+                allow_raw_f16: true,
+                ..target(&F16)
+            };
+            assert_eq!(select(&large, &allowed), Path::Compiled);
+            // The shared occupancy floor still applies.
             let small = Problem::plain(layout, [32, 32, 32], false);
             assert_eq!(select(&small, &target(&F32)), Path::Compiled);
-            assert!(cooperative_geometry(&problem, &F32).is_ok());
         }
     }
 
