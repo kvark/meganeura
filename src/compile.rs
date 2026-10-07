@@ -2930,49 +2930,8 @@ fn matmul_workgroups_rect(m: u32, n: u32, row_tile: u32, col_tile: u32) -> [u32;
     [columns, height, depth]
 }
 
-/// Largest of 64/32/16 whose launch grid has at least 64 workgroups.
-///
-/// A 64-wide tile with only a few workgroups leaves most of the GPU idle.
-/// F32 cooperative kernels are selected on that same 64-wide entry
-/// once its grid reaches 16 workgroups, so devices that have one keep it.
-/// The 16-wide tile is the tail: one accumulator per thread, used when the
-/// wider launches would sit almost empty.
-fn conv_register_tile(rows: u32, cols: u32, batch: u32, f32_coop: bool) -> u32 {
-    let batch = batch.max(1);
-    let groups = |tile: u32| rows.div_ceil(tile) * cols.div_ceil(tile) * batch;
-    if f32_coop && groups(64) >= 16 {
-        return 64;
-    }
-    for tile in [64u32, 32, 16] {
-        if groups(tile) >= 64 {
-            return tile;
-        }
-    }
-    16
-}
-
 #[cfg(test)]
-mod conv_tile {
-    use super::conv_register_tile;
-
-    #[test]
-    fn keeps_a_wide_grid_on_the_64_tile() {
-        // 256 x 3136 is 4 * 49 workgroups at tile 64.
-        assert_eq!(conv_register_tile(256, 3136, 1, false), 64);
-    }
-
-    #[test]
-    fn narrows_a_7x7_weight_gradient_to_16() {
-        // Co=64, Ci*k=147: tile 64 is 3 workgroups, tile 32 is 10, tile 16 is 40.
-        assert_eq!(conv_register_tile(64, 147, 1, false), 16);
-    }
-
-    #[test]
-    fn keeps_64_when_native_f32_coop_can_use_the_grid() {
-        assert_eq!(conv_register_tile(256, 196, 1, true), 64);
-        assert_eq!(conv_register_tile(64, 147, 1, true), 16);
-    }
-
+mod row_reduction {
     #[test]
     fn splits_only_tall_narrow_row_reductions() {
         // 12544 x 64 is the ResNet stem bias reduction: 2 column groups.
@@ -2981,29 +2940,6 @@ mod conv_tile {
         // Few rows, and matrices wide enough to fill the launch, stay one reduction.
         assert_eq!(super::Compiler::row_reduction_splits(32, 64), 1);
         assert_eq!(super::Compiler::row_reduction_splits(10_000, 4096), 1);
-    }
-}
-
-/// Scalar convolution with geometry baked into the pipeline.
-///
-/// The uniform software divisor stays available as a measured alternative.
-/// This kernel uses the same exact reciprocal, with the multipliers as
-/// constants, and the K stage the uniform shader already uses.
-fn exact_conv_kernel() -> Kernel {
-    Kernel::SpecializedConv { k_tile: 16 }
-}
-
-fn conv_gemm_entry(kind: u8, tile: u32) -> ShaderEntry {
-    match (kind, tile) {
-        (0, 16) => ShaderEntry::Conv2dGemm16,
-        (0, 32) => ShaderEntry::Conv2dGemmSmall,
-        (0, _) => ShaderEntry::Conv2dGemm,
-        (1, 16) => ShaderEntry::Conv2dGradInputGemm16,
-        (1, 32) => ShaderEntry::Conv2dGradInputGemmSmall,
-        (1, _) => ShaderEntry::Conv2dGradInputGemm,
-        (2, 16) => ShaderEntry::Conv2dGradWeightGemm16,
-        (2, 32) => ShaderEntry::Conv2dGradWeightGemmSmall,
-        _ => ShaderEntry::Conv2dGradWeightGemm,
     }
 }
 

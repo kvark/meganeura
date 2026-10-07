@@ -16,6 +16,9 @@
   selector with stated reasons, and tuning asks the same family whether a
   cooperative kernel is legal, where the two kept separate copies of the
   alignment, grid and padding checks.
+- Convolutions are the third: the compiler's register-tile choice and
+  session construction's cooperative promotion live in one module, and
+  promotion states why it declines. Selection is unchanged.
 - Measured training builds explore independent scalar dQ and dK/dV layouts
   through egglog, interleaved with graph alternatives under the existing
   search bounds. Each dispatch and pipeline key retains its extracted EPT

@@ -244,11 +244,6 @@ impl std::fmt::Display for MemorySummary {
     }
 }
 
-/// Minimum cooperative matrix workgroups for conv2d backward GEMM.
-/// Conv2d backward has all-scalar staging with heavy im2col decomposition
-/// and only 64 threads vs 256 for the scalar shader.
-const MIN_COOP_WORKGROUPS_CONV_BWD: u32 = 16;
-
 // ---- ShaderData structs matching codegen global variable names ----
 
 // matmul: var matrix_a, matrix_b, matrix_c, params
@@ -1946,168 +1941,19 @@ fn record_groups(
 ///
 /// Holds all blade-graphics resources: context, buffers, pipelines.
 /// Calling `step()` replays the pre-compiled dispatch sequence.
-/// Per-dispatch kernel-variant selection — the single owner of the runtime
-/// decisions that were historically smeared across session construction
-/// (roadmap A2): cooperative-matrix promotion (including generated conv
-/// kernels and output padding), the RmsNorm→matmul prologue fusion that
-/// depends on it, and small-tile demotion. Mutates the plan in place.
-/// This establishes deterministic initial choices. The optional scratch tuner
-/// independently checks legality within its narrower f32-matmul domain.
+/// Per-dispatch kernel-variant selection at session construction: each
+/// convolution and dense product takes the path its kernel family selects
+/// (cooperative tiles with their padding, or 32-wide tiles), then the
+/// RmsNorm→matmul prologue fusions that depend on cooperative paths run.
+/// Mutates the plan in place. Tuning may replace these initial choices by
+/// measurement, asking the same families what is legal.
 pub(crate) fn select_variants(
     plan: &mut ExecutionPlan,
     coop_config: Option<&crate::codegen::CoopConfig>,
     fuse_prologues: bool,
     allow_raw_f16: bool,
 ) {
-    if let Some(config) = coop_config {
-        use crate::codegen::ShaderGroup;
-        // Forward convolution retains the older two-by-two cooperative
-        // tile and its scalar im2col path is faster on the measured 8x8 f32 device.
-        // Dense matrices have a separate multi-SIMD-group layout.
-        let f32_8x8_coop = !config.use_f16_input && config.tile_size == 8;
-        for dispatch in &mut plan.dispatches {
-            // K=16 is the compiled exact-indexing kernel. Cooperative
-            // promotion may replace it. Any other measured K stage stays.
-            if matches!(dispatch.conv_k_tile(), Some(k_tile) if k_tile != 16)
-                || dispatch.scalar_matmul().is_some()
-                || matches!(dispatch.kernel, crate::compile::Kernel::SplitMatmul { .. })
-            {
-                continue;
-            }
-            // Autodiff marks derivative work as requiring f32 operands. A
-            // hi/lo f16 split improves mantissa precision but cannot extend
-            // the f16 exponent range: values below the minimum subnormal
-            // become zero in both halves before the matrix multiply. Keep
-            // such work on scalar f32 unless the caller explicitly selected
-            // `AllowF16`. F32 cooperative implementations remain
-            // eligible.
-            if !coop_preserves_required_precision(config, dispatch, allow_raw_f16) {
-                continue;
-            }
-            // Cooperative epilogues are supported for the compiler's
-            // current unary PointwiseDAG chains. They stage matrix
-            // accumulators through workgroup memory, then apply scalar
-            // WGSL with bounds checks. DAGs needing extra storage bindings
-            // stay on scalar geometry.
-            if dispatch.matmul_epilogue.is_some() {
-                match dispatch.matmul_epilogue {
-                    Some(ref epilogue) if epilogue.inputs.is_empty() => {}
-                    _ => continue,
-                }
-            }
-            let group = dispatch.shader.shader_group();
-            // Extract (m, n, k, batch) from dispatch params based on shader
-            // group. Dense products are the matmul family's, below.
-            let (m, n, k, batch) = match group {
-                ShaderGroup::Conv2dGemm => {
-                    // Forward: C[Co, oH*oW] = W[Co, K] × im2col[K, oH*oW]
-                    // params: [batch, in_channels, in_h, in_w, out_channels, kernel_h, kernel_w, stride, padding_h, out_h, out_w, padding_w]
-                    let out_ch = dispatch.params[4];
-                    let kh = dispatch.params[5];
-                    let kw = dispatch.params[6];
-                    let in_ch = dispatch.params[1];
-                    let out_h = dispatch.params[9];
-                    let out_w = dispatch.params[10];
-                    (out_ch, out_h * out_w, in_ch * kh * kw, dispatch.params[0])
-                }
-                ShaderGroup::Conv2dGradInputGemm => {
-                    // params: [batch, in_channels, in_h, in_w, out_channels, kernel_h, kernel_w, stride, padding, out_h, out_w, ...]
-                    let in_ch = dispatch.params[1];
-                    let in_h = dispatch.params[2];
-                    let in_w = dispatch.params[3];
-                    let out_ch = dispatch.params[4];
-                    let kh = dispatch.params[5];
-                    let kw = dispatch.params[6];
-                    (in_ch, in_h * in_w, out_ch * kh * kw, dispatch.params[0])
-                }
-                _ => continue,
-            };
-            let output_tile = config.output_tile();
-            if f32_8x8_coop && matches!(group, ShaderGroup::Conv2dGemm) {
-                continue;
-            }
-            let coop_grid = [m.div_ceil(output_tile), n.div_ceil(output_tile), batch];
-            if !crate::compile::workgroups_within_portable_limits(coop_grid) {
-                continue;
-            }
-            let Some(padded_bytes) =
-                crate::compile::cooperative_output_bytes(m, n, batch, output_tile)
-            else {
-                continue;
-            };
-            let coop_wgs: u64 = coop_grid.into_iter().map(u64::from).product();
-            // Conv2d backward GEMM has all-scalar staging with heavy im2col
-            // decomposition (integer division), and only 64 threads vs 256
-            // for the scalar shader. Require more workgroups to amortize.
-            let is_conv_bwd = matches!(group, ShaderGroup::Conv2dGradInputGemm);
-            let min_wgs = if is_conv_bwd {
-                MIN_COOP_WORKGROUPS_CONV_BWD
-            } else if config.use_f16_input {
-                // On discrete NVIDIA GPUs the f16 cooperative kernel's
-                // shared-memory staging costs more than the scalar tile
-                // kernel at low occupancy. Representative transformer
-                // projections with 20--72 output workgroups regress,
-                // while the wider backward/MLP shapes win once there are
-                // enough independent tiles to fill the device.
-                128
-            } else {
-                16 // amortize staging across enough independent f32 tiles
-            };
-            // Retain the conservative staging/store gates shared with the
-            // older cooperative kernels. The 8x8 f32 dense kernel stages checked
-            // scalar loads, while legacy kernels may load packed vec4s.
-            // The normal and convolution paths still require K >= 4.
-            //
-            // Direct cooperative stores write complete sub-tiles: 8x8 on
-            // the f32 path, 16x16 on the common f16 path. Keep N aligned
-            // to 16 for both so stores never straddle logical rows.
-            // Bottom-edge stores are safe for a single matrix: its allocation
-            // rounds M up to a multiple of output_tile, while consumers retain
-            // the logical M extent. Batched convolution instead needs full
-            // M tiles: later batches must not start after padding that their
-            // consumers do not account for.
-            //
-            // Generated f32 grad-input kernels use bounds-checked stores
-            // and do not need this direct-store alignment gate.
-            let store_ok = n.is_multiple_of(16) && (batch == 1 || m.is_multiple_of(output_tile));
-            let vec4_ok = match group {
-                ShaderGroup::Conv2dGradInputGemm => {
-                    // Generated f32 grad-input kernels stage a partial
-                    // right-edge tile through shared memory for
-                    // bounds-checked stores. f16 kernels retain the
-                    // direct-store alignment gate.
-                    (!config.use_f16_input || store_ok) && k >= 4
-                }
-                _ => store_ok && k >= 4,
-            };
-            if coop_wgs >= u64::from(min_wgs)
-                && !dispatch.weight_format.uses_reduced_storage()
-                && vec4_ok
-            {
-                dispatch.kernel = crate::compile::Kernel::Cooperative;
-                // Route conv2d coop dispatches to generated specialized kernels
-                if is_conv_bwd {
-                    let kh = dispatch.params[5];
-                    let kw = dispatch.params[6];
-                    let stride = dispatch.params[7];
-                    dispatch.shader = ShaderEntry::Conv2dGradInputGemmCoopGen(kh, kw, stride);
-                } else if matches!(group, ShaderGroup::Conv2dGemm) {
-                    let kh = dispatch.params[5];
-                    let kw = dispatch.params[6];
-                    let stride = dispatch.params[7];
-                    dispatch.shader = ShaderEntry::Conv2dGemmCoopGen(kh, kw, stride);
-                }
-                dispatch.workgroups = coop_grid;
-                // Direct cooperative stores cover complete sub-tiles.
-                // Reserve full output tiles for any bottom-edge writes.
-                pad_buffer(&mut plan.buffers, dispatch.output_buffer, padded_bytes);
-                if dispatch.input_buffers.len() > 2 {
-                    pad_buffer(&mut plan.buffers, dispatch.input_buffers[2], padded_bytes);
-                }
-            }
-        }
-    }
-
+    select_conv_paths(plan, coop_config, allow_raw_f16);
     select_matmul_paths(plan, coop_config, allow_raw_f16);
 
     // Apply RmsNorm+MatMul prologue fusion only after per-dispatch coop
@@ -2121,6 +1967,44 @@ pub(crate) fn select_variants(
         crate::compile::fuse_rmsnorm_prologues(plan);
         crate::compile::fuse_rmsnorm_into_add(plan);
         crate::compile::fuse_rmsnorm_into_gemv(plan);
+    }
+}
+
+/// Promote each 64-wide convolution its kernel family admits to a
+/// generated cooperative kernel, and size its workgroups and output.
+fn select_conv_paths(
+    plan: &mut ExecutionPlan,
+    coop_config: Option<&crate::codegen::CoopConfig>,
+    allow_raw_f16: bool,
+) {
+    use crate::kernels::conv;
+    let target = conv::Target {
+        cooperative: coop_config.copied(),
+        allow_raw_f16,
+    };
+    for index in 0..plan.dispatches.len() {
+        let Some(problem) = conv::Problem::of(&plan.dispatches[index]) else {
+            continue;
+        };
+        if conv::select(&problem, &target) != conv::Path::Cooperative {
+            continue;
+        }
+        let config = coop_config.expect("cooperative paths need a configuration");
+        let geometry = conv::cooperative_geometry(&problem, config)
+            .expect("an admitted cooperative convolution is legal");
+        let dispatch = &mut plan.dispatches[index];
+        dispatch.kernel = crate::compile::Kernel::Cooperative;
+        dispatch.shader = problem.cooperative_entry();
+        dispatch.workgroups = geometry.grid;
+        // Direct cooperative stores cover complete sub-tiles.
+        pad_buffer(
+            &mut plan.buffers,
+            dispatch.output_buffer,
+            geometry.output_bytes,
+        );
+        if let Some(&extra) = dispatch.input_buffers.get(2) {
+            pad_buffer(&mut plan.buffers, extra, geometry.output_bytes);
+        }
     }
 }
 
@@ -2174,14 +2058,6 @@ fn pad_buffer(buffers: &mut [usize], buffer: BufferRef, bytes: usize) {
     *size = (*size).max(bytes);
 }
 
-fn coop_preserves_required_precision(
-    config: &crate::codegen::CoopConfig,
-    dispatch: &Dispatch,
-    allow_raw_f16: bool,
-) -> bool {
-    !config.use_f16_input || !dispatch.requires_full_precision || allow_raw_f16
-}
-
 #[cfg(test)]
 mod block_matmul_variant_tests {
     use super::select_variants;
@@ -2224,55 +2100,10 @@ mod block_matmul_variant_tests {
 
 #[cfg(test)]
 mod coop_precision_tests {
-    use super::{Dispatch, coop_preserves_required_precision};
     use crate::codegen::CoopConfig;
 
-    #[test]
-    fn auto_keeps_full_precision_work_off_f16_coop() {
-        let f16_coop = CoopConfig {
-            tile_size: 16,
-            use_f16_input: true,
-            compensated: false,
-        };
-        let full_precision = Dispatch {
-            requires_full_precision: true,
-            ..Default::default()
-        };
-        let ordinary = Dispatch::default();
-
-        assert!(!coop_preserves_required_precision(
-            &f16_coop,
-            &full_precision,
-            false
-        ));
-        assert!(coop_preserves_required_precision(
-            &f16_coop, &ordinary, false
-        ));
-        assert!(coop_preserves_required_precision(
-            &f16_coop,
-            &full_precision,
-            true
-        ));
-    }
-
-    #[test]
-    fn native_f32_coop_preserves_full_precision_work() {
-        let f32_coop = CoopConfig {
-            tile_size: 8,
-            use_f16_input: false,
-            compensated: false,
-        };
-        let full_precision = Dispatch {
-            requires_full_precision: true,
-            ..Default::default()
-        };
-
-        assert!(coop_preserves_required_precision(
-            &f32_coop,
-            &full_precision,
-            false
-        ));
-    }
+    // Which work keeps f32 operands is the kernel families' admission rule,
+    // tested with them; these check whole plans.
 
     #[test]
     fn coop_f32_matmul_selects_gqa_and_vocabulary_projections() {
