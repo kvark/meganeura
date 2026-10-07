@@ -1,8 +1,9 @@
 //! Attention family: every forward and backward kernel variant against the
 //! reference, and every attention autodiff rule against finite differences.
 //!
-//! Kernel selection (`Compiler::attention_dispatch*` in `src/compile.rs`,
-//! default knobs): with `ept = min(head_dim, 32)` and
+//! Kernel selection (`Compiler::attention_dispatch` in
+//! `src/compile/emit.rs` forward, the `kernels::attention_grad` family
+//! backward, default knobs): with `ept = min(head_dim, 32)` and
 //! `bq = 256 / (head_dim / ept)` for power-of-two widths (see
 //! `codegen::attention_lanes` for the others), a forward or dQ dispatch uses the flash
 //! kernel when `q_seq >= bq` and the one-query scalar kernel otherwise; dK/dV
@@ -11,11 +12,11 @@
 //! `tpq == 1` backward path), 128 for 64, 64 for 128, 32 for 256 and 16 for
 //! 512. Forward kernels stage keys in tiles of 8 with a one-key tail.
 
-use meganeura::compile::{ShaderEntry, compile_with};
+use meganeura::compile::ShaderEntry;
 use meganeura::graph::Op;
 use meganeura::kernels::attention_grad::{AttentionGrad, Operands, Part, Path};
-use meganeura::reference::{Feeds, gpu, gradients};
-use meganeura::{CoopCaps, CoopPolicy};
+use meganeura::reference::{Error, Feeds, Report, gpu, gradients};
+use meganeura::{CoopCaps, CoopPolicy, Mode};
 use meganeura::{Graph, NodeId, TensorType};
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -195,17 +196,6 @@ struct Sweep {
 }
 
 impl Sweep {
-    fn kernels(&mut self, g: &Graph, options: &gpu::Options) -> String {
-        let plan = compile_with(g, &options.compile);
-        let names: BTreeSet<String> = plan
-            .dispatches
-            .iter()
-            .map(|d| format!("{:?}", d.shader))
-            .collect();
-        self.kernels.extend(names.iter().cloned());
-        names.into_iter().collect::<Vec<_>>().join(" ")
-    }
-
     fn run(&mut self, label: &str, check: impl FnOnce() -> Result<String, String>) {
         let outcome = catch_unwind(AssertUnwindSafe(check));
         match outcome {
@@ -226,14 +216,48 @@ impl Sweep {
         }
     }
 
-    fn inference(&mut self, label: &str, g: &Graph, feeds: &Feeds, options: &gpu::Options) {
-        let kernels = catch_unwind(AssertUnwindSafe(|| self.kernels(g, options)))
-            .unwrap_or_else(|_| "compile panicked".to_string());
-        self.run(&format!("{label} [{kernels}]"), || {
-            let report = gpu::check_inference(g, feeds, options).map_err(|e| e.to_string())?;
-            let text = report.to_string();
+    /// Check `g` on the session under test; returns the shaders it ran.
+    fn inference(
+        &mut self,
+        label: &str,
+        g: &Graph,
+        feeds: &Feeds,
+        options: &gpu::Options,
+    ) -> Vec<ShaderEntry> {
+        self.checked(label, || gpu::check_inference(g, feeds, options))
+    }
+
+    /// [`Sweep::inference`] against values already evaluated for `feeds`.
+    fn inference_against(
+        &mut self,
+        label: &str,
+        g: &Graph,
+        feeds: &Feeds,
+        expected: &gpu::Expected,
+        options: &gpu::Options,
+    ) -> Vec<ShaderEntry> {
+        self.checked(label, || {
+            gpu::check_inference_against(g, feeds, expected, options)
+        })
+    }
+
+    fn checked(
+        &mut self,
+        label: &str,
+        check: impl FnOnce() -> Result<Report, Error>,
+    ) -> Vec<ShaderEntry> {
+        let mut ran = Vec::new();
+        self.run(label, || {
+            let report = check().map_err(|e| e.to_string())?;
+            ran.clone_from(&report.shaders);
+            let kernels: BTreeSet<String> =
+                report.shaders.iter().map(|s| format!("{s:?}")).collect();
+            let kernels = kernels.into_iter().collect::<Vec<_>>().join(" ");
+            let text = format!("  ran {kernels}\n{report}");
             if report.passed() { Ok(text) } else { Err(text) }
         });
+        self.kernels.extend(ran.iter().map(|s| format!("{s:?}")));
+        ran
     }
 
     fn autodiff(&mut self, label: &str, g: &Graph, feeds: &Feeds) {
@@ -307,15 +331,17 @@ fn backward_sweep(kinds: &[Kind], shapes: &[Shape]) {
     sweep.finish();
 }
 
-/// Every attention backward path, pinned in turn, against the reference on
-/// shapes that span each path's admission edges: one row, ragged tiles,
-/// the cooperative 16-row tile, the f32 path's 128 rows on either side, a
-/// width that is not a power of two and GQA.
+/// Every attention backward path the device runs, pinned in turn, against
+/// the reference on shapes that span each path's admission edges: one row,
+/// ragged tiles, the cooperative 16-row tile, the f32 path's 128 rows on
+/// either side, a width that is not a power of two and GQA.
 ///
-/// Each case runs on the session under test and records the kernels that
-/// session dispatched, so the coverage below is what actually ran on this
-/// device. Every path the device can run must have run for both dQ and
-/// dK/dV, and the f16 path must not run without its precision opt-in.
+/// Cooperative paths are requested only where the target holds them. The
+/// plan each request compiles to is computed first, and a request whose
+/// attention kernels and layouts repeat one already checked for the same
+/// fixture is skipped; every fixture's reference is evaluated once. The
+/// coverage asserted is what the sessions actually dispatched, against an
+/// expectation derived from the device, not from what was selected.
 #[test]
 fn every_backward_path_against_the_reference() {
     let shapes = [
@@ -326,43 +352,62 @@ fn every_backward_path_against_the_reference() {
         (Kind::Causal, shape(130, 130, 2, 1, 64)),
         (Kind::Mha { cross: true }, shape(129, 145, 4, 2, 64)),
     ];
-    let paths: Vec<Path> = AttentionGrad::ALL
-        .iter()
-        .filter(|kernel| kernel.part == Part::Q)
-        .map(|kernel| kernel.path)
-        .collect();
+    let defaults = gpu::Options::default();
+    let required = required_backward_paths(
+        session_caps(&defaults),
+        gpu::shared_context()
+            .capabilities()
+            .max_compute_shared_memory_size,
+    );
     let mut sweep = Sweep::default();
     let mut exercised = BTreeSet::new();
+    let mut checks = 0;
     for (n, &(kind, s)) in shapes.iter().enumerate() {
         let g = backward_graph(kind, s);
         let feeds = random(&g, 300 + n as u64);
-        for &path in &paths {
-            let mut options = gpu::Options::default();
+        let expected = match gpu::Expected::inference(&g, &feeds) {
+            Ok(expected) => expected,
+            Err(error) => panic!("{kind:?} {s:?}: reference failed: {error}"),
+        };
+        let mut seen = BTreeSet::new();
+        for path in BACKWARD_PATHS {
+            let available = path == Path::Flash
+                || path == Path::Rowwise
+                || required.contains(&format!("dQ-{}", path_name(path)));
+            if !available {
+                continue;
+            }
+            let mut options = defaults.clone();
             options.compile.prefer_attention_grad = Some(path);
             options.compile.flash_backward_coop = true;
-            let ran = run_recording(
-                &mut sweep,
+            let layout: Vec<String> = gpu::plan(&g, &options, Mode::Inference)
+                .dispatches
+                .iter()
+                .filter(|d| matches!(d.shader, ShaderEntry::AttentionGrad(_)))
+                .map(|d| format!("{:?} {:?}", d.shader, d.kernel))
+                .collect();
+            if !seen.insert(layout) {
+                continue;
+            }
+            checks += 1;
+            let ran = sweep.inference_against(
                 &format!("{kind:?} backward {s:?} preferring {path:?}"),
                 &g,
                 &feeds,
+                &expected,
                 &options,
             );
-            exercised.extend(
-                attention_grads(&ran)
-                    .filter(|kernel| kernel.path == path)
-                    .map(|kernel| format!("{kernel:?}")),
-            );
+            exercised.extend(attention_grads(&ran).map(|kernel| format!("{kernel:?}")));
         }
     }
 
     // The f16 path rounds dO, so without the opt-in it must not run even
     // when preferred.
     let g = backward_graph(Kind::Causal, shape(17, 17, 2, 2, 16));
-    let mut strict = gpu::Options::default();
+    let mut strict = defaults.clone();
     strict.compile.prefer_attention_grad = Some(Path::Cooperative(Operands::F16));
     strict.compile.flash_backward_coop = false;
-    let ran = run_recording(
-        &mut sweep,
+    let ran = sweep.inference(
         "f16 cooperative preferred without its opt-in",
         &g,
         &random(&g, 400),
@@ -373,40 +418,76 @@ fn every_backward_path_against_the_reference() {
         "the f16 path ran without its opt-in"
     );
 
-    println!("exercised: {exercised:?}");
-    let caps = session_caps(&gpu::Options::default());
-    let mut expected = vec!["flash", "rowwise"];
-    if caps.f32_tile == 8 {
-        expected.push("cooperative-f32");
-    }
-    if caps.f16_tile == 16 {
-        expected.push("cooperative-f16");
-    }
-    for path in expected {
-        for part in ["dQ", "dKV"] {
-            let kernel = format!("{part}-{path}");
-            assert!(exercised.contains(&kernel), "{kernel} never ran");
-        }
-    }
+    println!("{checks} checks; exercised: {exercised:?}");
+    let missing: Vec<_> = required.difference(&exercised).collect();
+    assert!(missing.is_empty(), "never ran: {missing:?}");
     sweep.finish();
 }
 
-/// Check `g` on the session under test, returning the shaders it ran.
-fn run_recording(
-    sweep: &mut Sweep,
-    label: &str,
-    g: &Graph,
-    feeds: &Feeds,
-    options: &gpu::Options,
-) -> Vec<ShaderEntry> {
-    let mut ran = Vec::new();
-    sweep.run(label, || {
-        let report = gpu::check_inference(g, feeds, options).map_err(|e| e.to_string())?;
-        ran.clone_from(&report.shaders);
-        let text = report.to_string();
-        if report.passed() { Ok(text) } else { Err(text) }
-    });
-    ran
+const BACKWARD_PATHS: [Path; 4] = [
+    Path::Cooperative(Operands::F32),
+    Path::Cooperative(Operands::F16),
+    Path::Flash,
+    Path::Rowwise,
+];
+
+fn path_name(path: Path) -> String {
+    let name = format!("{:?}", AttentionGrad::new(Part::Q, path));
+    name.trim_start_matches("dQ-").to_string()
+}
+
+/// The implementations [`every_backward_path_against_the_reference`] must
+/// see run for both dQ and dK/dV: the scalar paths on any device, and each
+/// cooperative path where the device's matrices and workgroup memory hold
+/// it for its designated fixture. The f32 path's fixtures are the two
+/// 64-wide heads with at least 128 rows on both sides; the f16 path's is
+/// the 16-wide one, the smallest it tiles.
+fn required_backward_paths(caps: CoopCaps, shared_memory_bytes: u32) -> BTreeSet<String> {
+    let fits = |path: Path, head_dim: u32| {
+        [Part::Q, Part::KV].into_iter().all(|part| {
+            AttentionGrad::new(part, path).shared_bytes(head_dim) <= u64::from(shared_memory_bytes)
+        })
+    };
+    let f32 = Path::Cooperative(Operands::F32);
+    let f16 = Path::Cooperative(Operands::F16);
+    let mut paths = vec![Path::Flash, Path::Rowwise];
+    if caps.f32_tile == 8 && fits(f32, 64) {
+        paths.push(f32);
+    }
+    if caps.f16_tile == 16 && fits(f16, 16) {
+        paths.push(f16);
+    }
+    paths
+        .into_iter()
+        .flat_map(|path| {
+            [Part::Q, Part::KV].map(|part| format!("{:?}", AttentionGrad::new(part, path)))
+        })
+        .collect()
+}
+
+/// A device without the workgroup memory a cooperative path's tiles need
+/// correctly falls back, so the oracle must not require that path there.
+#[test]
+fn required_backward_paths_respect_workgroup_memory() {
+    let f32 = CoopCaps {
+        f16_tile: 0,
+        f32_tile: 8,
+    };
+    let scalar = ["dQ-flash", "dQ-rowwise", "dKV-flash", "dKV-rowwise"];
+    let short = required_backward_paths(f32, 18_623);
+    assert!(scalar.iter().all(|&name| short.contains(name)));
+    assert!(!short.contains("dQ-cooperative-f32") && !short.contains("dKV-cooperative-f32"));
+    let enough = required_backward_paths(f32, 18_624);
+    assert!(enough.contains("dQ-cooperative-f32") && enough.contains("dKV-cooperative-f32"));
+
+    // The f16 dK/dV tiles for a 16-wide head take 256·16 + 4544 bytes.
+    let f16 = CoopCaps {
+        f16_tile: 16,
+        f32_tile: 0,
+    };
+    assert!(!required_backward_paths(f16, 8_639).contains("dKV-cooperative-f16"));
+    assert!(required_backward_paths(f16, 8_640).contains("dQ-cooperative-f16"));
+    assert!(required_backward_paths(CoopCaps::default(), 1 << 20).len() == 4);
 }
 
 fn attention_grads(shaders: &[ShaderEntry]) -> impl Iterator<Item = AttentionGrad> + '_ {
