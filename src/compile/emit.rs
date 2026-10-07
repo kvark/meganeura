@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::kernels::attention_grad::{self, AttentionGrad, Part};
+use crate::kernels::conv;
 
 impl<'a> Compiler<'a> {
     pub(super) fn new_with_options(
@@ -2388,14 +2389,14 @@ impl<'a> Compiler<'a> {
                     // Use implicit GEMM: output = weight @ im2col(input)^T
                     // M=Co, N=oH*oW, K=Ci*kH*kW, batched in z dimension.
                     let spatial = out_h * out_w;
-                    let tile = conv_register_tile(
+                    let tile = conv::register_tile(
                         out_channels,
                         spatial,
                         batch,
                         self.coop_caps.f32_tile > 0,
                     );
                     self.plan.dispatches.push(Dispatch {
-                        shader: conv_gemm_entry(0, tile),
+                        shader: conv::entry(conv::Kind::Forward, tile),
                         workgroups: [spatial.div_ceil(tile), out_channels.div_ceil(tile), batch],
                         input_buffers: vec![input, kernel],
                         output_buffer: out_buf,
@@ -2414,7 +2415,7 @@ impl<'a> Compiler<'a> {
                             out_w,
                             padding_w,
                         ],
-                        kernel: exact_conv_kernel(),
+                        kernel: conv::exact_kernel(),
 
                         ..Default::default()
                     });
@@ -2630,14 +2631,14 @@ impl<'a> Compiler<'a> {
                     // M=Ci, N=H*W, K=Co*kH*kW, batched in z dimension.
                     {
                         let spatial = in_h * in_w;
-                        let tile = conv_register_tile(
+                        let tile = conv::register_tile(
                             in_channels,
                             spatial,
                             batch,
                             self.coop_caps.f32_tile > 0,
                         );
                         self.plan.dispatches.push(Dispatch {
-                            shader: conv_gemm_entry(1, tile),
+                            shader: conv::entry(conv::Kind::GradInput, tile),
                             workgroups: [spatial.div_ceil(tile), in_channels.div_ceil(tile), batch],
                             input_buffers: vec![grad_out, kernel],
                             output_buffer: out_buf,
@@ -2656,7 +2657,7 @@ impl<'a> Compiler<'a> {
                                 out_w,
                                 padding_w,
                             ],
-                            kernel: exact_conv_kernel(),
+                            kernel: conv::exact_kernel(),
 
                             ..Default::default()
                         });
@@ -2690,9 +2691,10 @@ impl<'a> Compiler<'a> {
                     let n_total = in_channels * kernel_h * kernel_w; // Ci*kH*kW
                     let m_total = out_channels; // Co
                     // Batch is folded into K, so it does not add workgroups.
-                    let tile = conv_register_tile(m_total, n_total, 1, self.coop_caps.f32_tile > 0);
+                    let tile =
+                        conv::register_tile(m_total, n_total, 1, self.coop_caps.f32_tile > 0);
                     self.plan.dispatches.push(Dispatch {
-                        shader: conv_gemm_entry(2, tile),
+                        shader: conv::entry(conv::Kind::GradWeight, tile),
                         workgroups: [n_total.div_ceil(tile), m_total.div_ceil(tile), 1],
                         input_buffers: vec![grad_out, input],
                         output_buffer: out_buf,
@@ -2711,7 +2713,7 @@ impl<'a> Compiler<'a> {
                             out_w,
                             padding_w,
                         ],
-                        kernel: exact_conv_kernel(),
+                        kernel: conv::exact_kernel(),
 
                         ..Default::default()
                     });

@@ -18,6 +18,7 @@
 //! variant against the same reference.
 
 pub mod attention_grad;
+pub(crate) mod conv;
 pub(crate) mod matmul;
 
 /// Why a variant declined a problem.
