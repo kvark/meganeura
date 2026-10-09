@@ -267,11 +267,11 @@ fn collect_classes(
         let physical: Vec<_> = bindings.iter().map(|b| alias.map[b.0 as usize]).collect();
         // Do not transfer isolated timings to overlapping bindings, even if
         // readonly input aliasing is legal. It changes the cache working set.
-        if physical
-            .iter()
-            .enumerate()
-            .any(|(i, p)| physical[..i].contains(p))
-        {
+        if bindings.iter().enumerate().any(|(i, a)| {
+            bindings[..i]
+                .iter()
+                .any(|b| alias.overlap(&plan.buffers, a.0 as usize, b.0 as usize))
+        }) {
             excluded += 1;
             continue;
         }
@@ -360,6 +360,7 @@ impl Session {
             || self.plan.buffers != other.plan.buffers
             || self.plan.knobs != other.plan.knobs
             || self.alias.map != other.alias.map
+            || self.alias.offsets != other.alias.offsets
             || self.alias.sizes != other.alias.sizes
             || self.alias.device_local != other.alias.device_local
             || self.groups != other.groups
@@ -2451,6 +2452,19 @@ mod tests {
         assert_eq!(excluded, 0);
         assert_eq!(classes.len(), 1);
         assert_eq!(classes[0].members.len(), 2);
+        // Two operands placed in one allocation are separate bindings while
+        // their byte ranges stay apart.
+        let input = plan.dispatches[0].input_buffers[0].0 as usize;
+        let weight = plan.dispatches[0].input_buffers[1].0 as usize;
+        alias.map[weight] = alias.map[input];
+        alias.offsets[weight] = plan.buffers[input];
+        alias.sizes[alias.map[input]] = plan.buffers[input] + plan.buffers[weight];
+        let (classes, excluded) = collect_classes(&plan, &alias, None);
+        assert_eq!((classes.len(), excluded), (1, 0));
+        assert_eq!(classes[0].members.len(), 2);
+        alias.offsets[weight] -= 4;
+        assert_eq!(collect_classes(&plan, &alias, None).1, 1);
+        alias = crate::memplan::AliasPlan::identity(&plan.buffers);
         alias.device_local[plan.dispatches[1].output_buffer.0 as usize] = true;
         assert_eq!(collect_classes(&plan, &alias, None).0.len(), 2);
         plan.dispatches[0].input_buffers[1] = plan.dispatches[0].output_buffer;
