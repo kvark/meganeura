@@ -103,11 +103,11 @@ jobs:
       #
       # `MEGANEURA_SKIP_BIT_EXACT` gates one class of test: exact equality
       # between a fused path and its explicit expansion. The contract holds
-      # on the author's hardware and breaks by a last ULP wherever the
-      # adapter reassociates the accumulation — lavapipe on two reduction
-      # cases, Metal on two others. Gating the class beats naming cases one
-      # at a time, which grew with every adapter; `tests/schedule_*.rs`
-      # still run these at full strength locally.
+      # on the author's hardware and on lavapipe, and breaks by a last ULP
+      # wherever the adapter reassociates the accumulation — Metal on two
+      # reduction cases. Gating the class beats naming cases one at a time,
+      # which grew with every adapter; `tests/schedule_*.rs` still run
+      # these at full strength locally.
       - name: Unit + integration tests, all features
         shell: bash
         run: |
