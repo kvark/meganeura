@@ -435,9 +435,6 @@ fn normalize_inner_sum_matches_explicit_forward_and_gradient() {
 
 #[test]
 fn pairwise_squared_distance_matches_explicit_forward_and_gradients() {
-    if skip_bit_exact() {
-        return;
-    }
     const ROWS: usize = 513;
     const INNER: usize = 3;
     const PAIRS: usize = 8;
@@ -512,17 +509,20 @@ fn pairwise_squared_distance_matches_explicit_forward_and_gradients() {
         for column in 0..INNER {
             let left_index = row * INNER + column;
             let mut expected_gradient = 0.0_f32;
+            let mut magnitude = 0.0_f32;
             for pair in 0..PAIRS {
                 let pair_index = row * PAIRS + pair;
                 let right_index = pair_index * INNER + column;
                 let delta = left_data[left_index] - right_data[right_index];
                 let term = weights_data[pair_index] * delta;
                 expected_gradient += term + term;
+                magnitude += (term + term).abs();
             }
+            // The pair terms cancel, and adapters may sum them in any order
+            // (lavapipe uses a tree), so bound the error by their magnitude.
             assert!(
                 (left_gradient[left_index] - expected_gradient).abs()
-                    <= left_gradient[left_index].abs().max(expected_gradient.abs()) * 1.0e-6
-                        + 1.0e-7,
+                    <= magnitude * 1.0e-6 + 1.0e-7,
                 "left gradient mismatch at [{row}, {column}]: {} != {}",
                 left_gradient[left_index],
                 expected_gradient,
