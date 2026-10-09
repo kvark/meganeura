@@ -66,7 +66,8 @@ temp buffer allocation) exceeds the occupancy improvement on 20 SMs.
 **When it would help:** Larger GPUs (80+ SMs) where occupancy matters
 more and the fixed per-dispatch overhead is amortized over more compute.
 Also beneficial with a persistent-kernel approach that avoids the
-reduction dispatch entirely.
+reduction dispatch entirely. Native 16x16 f32 devices (MI300X, 304 CUs)
+now split aligned products by default; see `runtime::select_variants`.
 
 ## Small-K coop fallback to scalar (K < 4 tiles)
 

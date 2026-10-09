@@ -50,6 +50,11 @@ pub struct TuneClass {
     /// [`Self::gemv_rmsnorm`].
     #[serde(default)]
     pub gemv_rmsnorm_eps_bits: u32,
+    /// The output holds K partitions that a following SumRows adds. Such a
+    /// product keeps its reduction: candidates write two or more partitions
+    /// into the partial buffer, whose size is the output binding's.
+    #[serde(default)]
+    pub split_k: bool,
     /// Placement of A, B, addend (false if absent), and output, respectively.
     pub device_local: [bool; 4],
     /// Declared bytes for A, B, optional addend, output, in binding order.
@@ -195,7 +200,12 @@ pub enum MatmulTile {
         tile_size: u32,
     },
     /// Aligned native 16x16 f32 products sharing a larger workgroup tile.
-    CooperativeTiled(crate::codegen::CooperativeMatmulShape),
+    /// More than one K partition writes partials that a following SumRows
+    /// adds, which only a split product has.
+    CooperativeTiled {
+        shape: crate::codegen::CooperativeMatmulShape,
+        splits: u32,
+    },
     /// A K-split GEMV at one workgroup width and cross-lane reduction.
     ///
     /// Keeps the shader entry and buffer layout. Width and reduction apply
@@ -310,12 +320,12 @@ impl MatmulTile {
                     k_tile,
                 }),
                 Kernel::Cooperative => Self::native_cooperative(config),
-                Kernel::CooperativeTiled { shape, splits: 1 }
+                Kernel::CooperativeTiled { shape, splits }
                     if config.is_some_and(|c| {
                         c.tile_size == 16 && !c.use_f16_input && !c.compensated
                     }) =>
                 {
-                    Some(Self::CooperativeTiled(shape))
+                    Some(Self::CooperativeTiled { shape, splits })
                 }
                 _ => None,
             }
@@ -324,7 +334,7 @@ impl MatmulTile {
 
     pub(crate) fn coop_config(self) -> Option<CoopConfig> {
         match self {
-            Self::CooperativeTiled(_) => Some(CoopConfig {
+            Self::CooperativeTiled { .. } => Some(CoopConfig {
                 tile_size: 16,
                 use_f16_input: false,
                 compensated: false,
@@ -367,8 +377,8 @@ impl MatmulTile {
             Self::Tile32 | Self::Tile64 => crate::compile::Kernel::Default,
             Self::Scalar(shape) => crate::compile::Kernel::ScalarMatmul(shape),
             Self::CooperativeF32 { .. } => crate::compile::Kernel::Cooperative,
-            Self::CooperativeTiled(shape) => {
-                crate::compile::Kernel::CooperativeTiled { shape, splits: 1 }
+            Self::CooperativeTiled { shape, splits } => {
+                crate::compile::Kernel::CooperativeTiled { shape, splits }
             }
             Self::SpecializedConv { k_tile, .. } => {
                 crate::compile::Kernel::SpecializedConv { k_tile }
@@ -402,7 +412,9 @@ impl MatmulTile {
                 ];
             }
             Self::SpecializedConv { tile_size, .. } => tile_size,
-            Self::CooperativeTiled(shape) => return [class.m / 64, class.n / shape.columns, 1],
+            Self::CooperativeTiled { shape, splits } => {
+                return [class.m / 64, class.n / shape.columns, splits];
+            }
             Self::CooperativeF32 { .. } => {
                 let tile = self.coop_config().unwrap().matmul_output_tile();
                 // Cooperative tiles use X for rows, Y for columns.
@@ -419,6 +431,9 @@ impl MatmulTile {
     }
 
     pub(crate) fn buffer_sizes(self, class: &TuneClass) -> Option<Vec<usize>> {
+        if class.split_k && !matches!(self, Self::CooperativeTiled { .. }) {
+            return None;
+        }
         if let Self::Scalar(shape) = self {
             if class.conv2d.is_some()
                 || gemv_group(&class.shader).is_some()
@@ -465,14 +480,19 @@ impl MatmulTile {
             }
         }
         let mut sizes = class.buffer_sizes()?;
-        if let Self::CooperativeTiled(shape) = self {
+        if let Self::CooperativeTiled { shape, splits } = self {
             if class.conv2d.is_some()
                 || !class.shader.is_matmul()
                 || class.weight_format != crate::compile::WeightFormat::F32
                 || !shape.fits_dimensions(class.m, class.n, class.k)
+                || splits == 0
+                || splits > class.k / shape.k_stage
+                || (splits > 1) != class.split_k
             {
                 return None;
             }
+            // Each partition writes a whole output of partial sums.
+            *sizes.last_mut()? = sizes.last()?.checked_mul(splits as usize)?;
         }
         if let Self::CooperativeF32 { tile_size } = self {
             use crate::kernels::matmul;
@@ -553,6 +573,11 @@ impl TuneClass {
         {
             return None;
         }
+        // Tiled products dispatch one Z layer per K partition.
+        let partitions = match dispatch.kernel {
+            crate::compile::Kernel::CooperativeTiled { splits, .. } => splits,
+            _ => 1,
+        };
         let shader = match dispatch.shader {
             ShaderEntry::Conv2dGemmSmall | ShaderEntry::Conv2dGemm16 => ShaderEntry::Conv2dGemm,
             ShaderEntry::Conv2dGradInputGemmSmall | ShaderEntry::Conv2dGradInputGemm16 => {
@@ -578,7 +603,7 @@ impl TuneClass {
             Some(TuneConv2d::from_params(&dispatch.params)?)
         } else {
             if dispatch.conv_k_tile().is_some()
-                || dispatch.workgroups[2] != 1
+                || dispatch.workgroups[2] != partitions
                 || dispatch.params.len() != 4
                 || dispatch.params[3] != 0
             {
@@ -642,6 +667,7 @@ impl TuneClass {
                 .as_ref()
                 .map(|rn| rn.eps_bits)
                 .unwrap_or(0),
+            split_k: partitions > 1,
             device_local: [false; 4],
             binding_bytes: Vec::new(),
         };
@@ -798,6 +824,24 @@ impl TuneClass {
                 .filter(|&tile| tile != initial && tile.fits(self))
                 .collect();
         }
+        if self.split_k {
+            // A split product keeps its SumRows: other shapes at the same
+            // partition count, and this shape at counts its buffer holds.
+            let MatmulTile::CooperativeTiled { shape, splits } = initial else {
+                return Vec::new();
+            };
+            return crate::codegen::CooperativeMatmulShape::all()
+                .map(|other| MatmulTile::CooperativeTiled {
+                    shape: other,
+                    splits,
+                })
+                .chain([2, 4, 8, 16].map(|count| MatmulTile::CooperativeTiled {
+                    shape,
+                    splits: count,
+                }))
+                .filter(|&tile| tile != initial && tile.fits(self))
+                .collect();
+        }
         let mut candidates: Vec<_> = [
             Some(MatmulTile::Tile64),
             Some(MatmulTile::Tile32),
@@ -810,19 +854,10 @@ impl TuneClass {
         if !self.weight_format.is_quantized() {
             candidates.retain(|tile| matches!(tile, MatmulTile::CooperativeF32 { .. }));
             if config.is_some_and(|c| c.tile_size == 16 && !c.use_f16_input && !c.compensated) {
-                for columns in [64, 128] {
-                    for k_stage in [16, 32] {
-                        for prefetch in [false, true] {
-                            candidates.push(MatmulTile::CooperativeTiled(
-                                crate::codegen::CooperativeMatmulShape {
-                                    columns,
-                                    k_stage,
-                                    prefetch,
-                                },
-                            ));
-                        }
-                    }
-                }
+                candidates.extend(
+                    crate::codegen::CooperativeMatmulShape::all()
+                        .map(|shape| MatmulTile::CooperativeTiled { shape, splits: 1 }),
+                );
             }
             for interleave_columns in [false, true] {
                 for k_stage in [32, 16, 8] {
