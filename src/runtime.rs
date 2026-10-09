@@ -2793,36 +2793,32 @@ impl Session {
             size: c_size,
             memory: bg::Memory::Shared,
         });
+        // Deterministic varying values that depend on both row and column.
+        // Keep magnitudes modest so f16 coop paths don't overflow.
+        let fill =
+            |idx: usize, dim: usize| -> f32 { (((idx * 31 + dim * 7) % 17) as f32 - 8.0) * 0.125 };
+        let a: Vec<f32> = (0..m * inner)
+            .map(|index| fill(index / inner, index % inner))
+            .collect();
+        let b: Vec<f32> = (0..inner * n_out)
+            .map(|index| fill(index / n_out + 100, index % n_out + 200))
+            .collect();
         let mut expected = vec![0.0f32; m * n_out];
+        for i in 0..m {
+            for j in 0..n_out {
+                let mut acc = 0.0f32;
+                for p in 0..inner {
+                    acc += a[i * inner + p] * b[p * n_out + j];
+                }
+                expected[i * n_out + j] = acc;
+            }
+        }
+        // Shared memory can be uncached or write-combined for the host, which
+        // makes every read slow: fill it, never read it back on the CPU.
         unsafe {
-            let a = std::slice::from_raw_parts_mut(a_buf.data() as *mut f32, m * inner);
-            let b = std::slice::from_raw_parts_mut(b_buf.data() as *mut f32, inner * n_out);
-            let c = std::slice::from_raw_parts_mut(c_buf.data() as *mut f32, m * n_out);
-            // Deterministic varying values that depend on both row and column.
-            // Keep magnitudes modest so f16 coop paths don't overflow.
-            let fill = |idx: usize, dim: usize| -> f32 {
-                (((idx * 31 + dim * 7) % 17) as f32 - 8.0) * 0.125
-            };
-            for i in 0..m {
-                for j in 0..inner {
-                    a[i * inner + j] = fill(i, j);
-                }
-            }
-            for i in 0..inner {
-                for j in 0..n_out {
-                    b[i * n_out + j] = fill(i + 100, j + 200);
-                }
-            }
-            c.fill(0.0);
-            for i in 0..m {
-                for j in 0..n_out {
-                    let mut acc = 0.0f32;
-                    for p in 0..inner {
-                        acc += a[i * inner + p] * b[p * n_out + j];
-                    }
-                    expected[i * n_out + j] = acc;
-                }
-            }
+            std::slice::from_raw_parts_mut(a_buf.data() as *mut f32, a.len()).copy_from_slice(&a);
+            std::slice::from_raw_parts_mut(b_buf.data() as *mut f32, b.len()).copy_from_slice(&b);
+            std::slice::from_raw_parts_mut(c_buf.data() as *mut f32, m * n_out).fill(0.0);
         }
 
         let mut encoder = gpu.create_command_encoder(bg::CommandEncoderDesc {
