@@ -7,12 +7,13 @@ mod gpu_monitor;
 #[allow(dead_code)] // Shares tensor arithmetic, not the candidate-pair decision rule.
 mod measurement;
 #[path = "support/holdout_workloads.rs"]
+#[allow(dead_code)] // Profiling builds its sessions with timing; the tuning examples do not.
 mod workloads;
 
 use experiment_io::{command, host_sample, sha256, unix_ms, write_record};
 use measurement::{TensorComparison, median};
 use meganeura::{
-    CoopPolicy, GpuOptions, Session, TuneOptions,
+    CoopPolicy, GpuOptions, Session, SessionOptions, TuneOptions,
     profiler::{CaptureOptions, capture_session_profile},
 };
 use serde_json::{Value, json};
@@ -46,6 +47,14 @@ fn profile_cases() -> Vec<Case> {
             case
         })
         .collect()
+}
+
+/// Profile capture needs timestamps from the session as well as the context.
+fn profile_runtime_options() -> SessionOptions {
+    SessionOptions {
+        gpu_timing: true,
+        ..runtime_options(CoopPolicy::Disabled)
+    }
 }
 
 fn advance(session: &mut Session, count: usize) {
@@ -120,7 +129,7 @@ fn run_case(
     gpu: &Arc<blade_graphics::Context>,
     indexing_audit: bool,
 ) -> Result<Value, Box<dyn Error>> {
-    let (mut session, build) = make_session(case, gpu, CoopPolicy::Disabled);
+    let (mut session, build) = make_session_with(case, gpu, profile_runtime_options());
     let keys = session.dispatch_pipeline_keys();
     let mut record = json!({"name": case.name, "description": case.description, "work": case.work,
         "status": "running", "build": build, "host_start": host_sample(),
@@ -287,7 +296,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "case_order": cases.iter().map(|c| c.name).collect::<Vec<_>>(),
             "device": {"name": info.device_name, "driver": info.driver_info, "f32_tile": caps.f32_tile, "f16_tile": caps.f16_tile},
             "cooperative_policy": "Disabled", "compile_options": compile_options(),
-            "runtime_options": format!("{:?}", runtime_options(CoopPolicy::Disabled)), "optimize": meganeura::optimize::OptimizeConfig::default(),
+            "runtime_options": format!("{:?}", profile_runtime_options()), "optimize": meganeura::optimize::OptimizeConfig::default(),
             "warmup": WARMUP, "settling": SETTLING, "normal_samples": NORMAL_SAMPLES, "profile_samples": PROFILE_SAMPLES,
             "contract": "strict scalar f32; fixed-input F+L+B, no optimizer/clip/accumulation; normal step+wait before and after one-pass-per-dispatch capture; all profiled full states checked before the next capture; telemetry active",
             "gpu_timing": true, "nvidia_smi_before": before, "rustflags": std::env::var("RUSTFLAGS").ok()}, "cases": []});
@@ -376,7 +385,7 @@ mod tests {
             .unwrap(),
         );
         for case in profile_cases() {
-            let (mut session, _) = make_session(&case, &gpu, CoopPolicy::Disabled);
+            let (mut session, _) = make_session_with(&case, &gpu, profile_runtime_options());
             advance(&mut session, 3);
             let reference = snapshot(&mut session, &case);
             let mut preparations = 0;
