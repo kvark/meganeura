@@ -1,5 +1,13 @@
 # Unreleased
 
+- Devices with native 16x16 f32 cooperative matrices (MI300X on RADV) run
+  aligned f32 products on 64-row tiles shared by four subgroups, split
+  along K when the output alone cannot occupy the device. Tuning retunes a
+  split's tile shape and partition count together with its SumRows. Dense
+  f32 GEMVs from 512 columns up group adjacent output columns on these
+  devices by default, and `GemvShape::column_groups` also accepts 2.
+  Inputs whose allocation a cooperative tile pads accept their logical
+  size. Plan-cache format 22.
 - `Graph::gelu_erf`: the exact GELU, `x·(1 + erf(x/√2))/2`; `Graph::gelu`
   stays the tanh approximation. The Whisper encoder and the `sd_unet`
   feed-forward now use the exact form, so their outputs and benchmark
