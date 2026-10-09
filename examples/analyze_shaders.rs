@@ -20,7 +20,7 @@ use meganeura::codegen::{CoopConfig, ShaderGroup, ShaderModule};
 use meganeura::compile::ShaderEntry;
 use meganeura::kernels::attention_grad::{AttentionGrad, Part, Path};
 
-fn analyze_spirv(name: &str, module: &naga::Module, dump: bool) {
+fn analyze_spirv(name: &str, module: &naga::Module, entry: &ShaderEntry, dump: bool) {
     let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
     let info = match naga::valid::Validator::new(flags, naga::valid::Capabilities::all())
         .validate(module)
@@ -40,7 +40,7 @@ fn analyze_spirv(name: &str, module: &naga::Module, dump: bool) {
         naga::back::spv::ZeroInitializeWorkgroupMemoryMode::None;
     let pipeline_opts = naga::back::spv::PipelineOptions {
         shader_stage: naga::ShaderStage::Compute,
-        entry_point: "main".to_string(),
+        entry_point: entry.entry_point().to_string(),
     };
     let words = match naga::back::spv::write_vec(module, &info, &opts, Some(&pipeline_opts)) {
         Ok(w) => w,
@@ -143,6 +143,26 @@ fn analyze_gpu(gpu: &blade_graphics::Context, name: &str, sm: &ShaderModule, ent
     gpu.destroy_compute_pipeline(&mut pipeline);
 }
 
+/// The context, if it supports the cooperative shape and type `config` needs.
+fn coop_gpu<'a>(
+    gpu: Option<&'a blade_graphics::Context>,
+    config: &CoopConfig,
+) -> Option<&'a blade_graphics::Context> {
+    gpu.filter(|gpu| {
+        let caps = &gpu.capabilities().cooperative_matrix;
+        let shapes = if config.use_f16_input {
+            &caps.f16_f32_shapes
+        } else {
+            &caps.f32_shapes
+        };
+        let supported = shapes.contains(&[config.tile_size; 3]);
+        if !supported {
+            println!("  (no GPU analysis: the device lacks this cooperative shape)");
+        }
+        supported
+    })
+}
+
 fn analyze(
     name: &str,
     sm: &ShaderModule,
@@ -150,7 +170,7 @@ fn analyze(
     dump: bool,
     gpu: Option<&blade_graphics::Context>,
 ) {
-    analyze_spirv(name, &sm.module, dump);
+    analyze_spirv(name, &sm.module, entry, dump);
     if let Some(g) = gpu {
         analyze_gpu(g, name, sm, entry);
     }
@@ -207,7 +227,7 @@ fn main() {
         ];
         for (name, entry) in cases {
             let sm = meganeura::codegen::generate_module_coop(entry.shader_group(), &config);
-            analyze(name, &sm, entry, dump, gpu_ref);
+            analyze(name, &sm, entry, dump, coop_gpu(gpu_ref, &config));
         }
     }
 
@@ -225,7 +245,7 @@ fn main() {
             &sm,
             &ShaderEntry::MatMul,
             dump,
-            gpu_ref,
+            coop_gpu(gpu_ref, &config),
         );
     }
 
@@ -385,7 +405,14 @@ fn main() {
             &sm_coop,
             &ShaderEntry::FlashAttentionCoop,
             dump,
-            gpu_ref,
+            coop_gpu(
+                gpu_ref,
+                &CoopConfig {
+                    tile_size: 16,
+                    use_f16_input: true,
+                    compensated: false,
+                },
+            ),
         );
     }
 
