@@ -155,8 +155,13 @@ pub(super) fn tile_module(
         crate::codegen::generate_module(selected_entry.shader_group(), knobs)
     } else {
         match tile {
-            MatmulTile::CooperativeTiled(shape) => {
-                crate::codegen::generate_tiled_coop_matmul(entry.shader_group(), shape, 1, None)
+            MatmulTile::CooperativeTiled { shape, splits } => {
+                crate::codegen::generate_tiled_coop_matmul(
+                    entry.shader_group(),
+                    shape,
+                    splits,
+                    None,
+                )
             }
             MatmulTile::Tile32 => {
                 crate::codegen::generate_module_small(entry.shader_group(), knobs)
@@ -186,7 +191,24 @@ struct SearchClass {
     key: TuneClass,
     initial: MatmulTile,
     members: Vec<usize>,
+    /// The SumRows of each split member, in member order.
+    reductions: Vec<usize>,
     challengers: Vec<MatmulTile>,
+}
+
+impl SearchClass {
+    /// Install `tile` on every member, with each split member's SumRows
+    /// adding exactly the partitions the tile writes.
+    fn install(&self, dispatches: &mut [Dispatch], tile: MatmulTile) {
+        for &index in &self.members {
+            tile.apply(&mut dispatches[index], &self.key);
+        }
+        if let MatmulTile::CooperativeTiled { splits, .. } = tile {
+            for &index in &self.reductions {
+                dispatches[index].params[0] = splits;
+            }
+        }
+    }
 }
 
 struct SelectionSwap {
@@ -311,6 +333,22 @@ fn collect_classes(
             excluded += 1;
             continue;
         }
+        // A split product is tunable together with the SumRows of its partials.
+        let reduction = match initial {
+            MatmulTile::CooperativeTiled { splits, .. } if key.split_k => {
+                let Some(reduction) = plan.dispatches.iter().position(|d| {
+                    d.shader == ShaderEntry::SumRows
+                        && d.input_buffers == [dispatch.output_buffer]
+                        && d.params.first() == Some(&splits)
+                        && d.params.get(1).copied() == key.m.checked_mul(key.n)
+                }) else {
+                    excluded += 1;
+                    continue;
+                };
+                Some(reduction)
+            }
+            _ => None,
+        };
         let challengers = key
             .challengers(initial, coop_config)
             .into_iter()
@@ -323,10 +361,12 @@ fn collect_classes(
                 key,
                 initial,
                 members: Vec::new(),
+                reductions: Vec::new(),
                 challengers,
             });
         }
         classes[class_index].members.push(index);
+        classes[class_index].reductions.extend(reduction);
     }
     // A structural prior, not a predicted runtime: favor repeated, large
     // contractions. Stable ties keep the source dispatch order deterministic.
@@ -430,7 +470,10 @@ impl Session {
     /// deterministic nonzero input patterns (including tiny f32 operands).
     /// Both candidates must agree elementwise; ordinary f32 classes must also
     /// match sampled f64 reference dots before alternating, batched
-    /// `encode+submit+wait` measurements.
+    /// `encode+submit+wait` measurements. A native-f32 split product runs with
+    /// its SumRows and keeps them: candidates vary its tile shape and its
+    /// partition count within the allocated partials, and agree within a bound
+    /// that follows the largest output, since partitions reorder the sum.
     /// The result is an isolated-kernel choice, not an end-to-end speed claim.
     ///
     /// Forward MatMul+Add and unpacked NCHW scalar convolution forward/dX/dW are supported;
@@ -465,7 +508,7 @@ impl Session {
         let shared_limit = self.gpu.capabilities().max_compute_shared_memory_size;
         for class in &mut classes {
             class.challengers.retain(|tile| match *tile {
-                MatmulTile::CooperativeTiled(shape) => {
+                MatmulTile::CooperativeTiled { shape, .. } => {
                     shared_limit == 0 || shape.shared_bytes() <= shared_limit
                 }
                 _ => true,
@@ -513,9 +556,7 @@ impl Session {
                         .ensure_tune_tile(&gpu, &self.plan.dispatches[class.members[0]], selected)
                         .is_ok()
                 {
-                    for &index in &class.members {
-                        selected.apply(&mut self.plan.dispatches[index], &class.key);
-                    }
+                    class.install(&mut self.plan.dispatches, selected);
                     report.reused_classes.push((class.key.clone(), selected));
                     incumbent = selected;
                     next_candidate = progress.next_candidate;
@@ -532,11 +573,7 @@ impl Session {
                 self.measure_candidate(class, &options, start, &mut outcome, &mut staging);
                 outcome.elapsed = class_start.elapsed();
                 if outcome.selected != outcome.initial {
-                    for &index in &class.members {
-                        outcome
-                            .selected
-                            .apply(&mut self.plan.dispatches[index], &class.key);
-                    }
+                    class.install(&mut self.plan.dispatches, outcome.selected);
                     incumbent = outcome.selected;
                 }
                 log::info!(
@@ -749,6 +786,26 @@ impl Session {
             variants[1] = sequence;
             sizes.push(partial_bytes);
         }
+        if class.key.split_k {
+            // Both tiles write their partitions into a partial buffer of the
+            // live size, and a SumRows adds them into the output.
+            let partial = BufferRef(sizes.len() as u32);
+            let columns = class.key.m * class.key.n;
+            sizes[output_index] = logical_sizes[output_index];
+            sizes.push(class.key.binding_bytes[output_index]);
+            for (sequence, tile) in variants
+                .iter_mut()
+                .zip([outcome.initial, outcome.candidate])
+            {
+                let MatmulTile::CooperativeTiled { splits, .. } = tile else {
+                    unreachable!("split products only take tiled candidates");
+                };
+                let sum =
+                    sequence[0].partial_sum(partial, sequence[0].output_buffer, columns, splits);
+                sequence[0].output_buffer = partial;
+                sequence.push(sum);
+            }
+        }
         let Some(bytes) = scratch_bytes(&sizes) else {
             outcome.decision = TuneDecision::ScratchLimit;
             return;
@@ -790,22 +847,30 @@ impl Session {
                 return;
             }
         }
-        if outcome.candidate_split_k.is_some() {
-            for dispatch in &variants[1] {
-                if start.elapsed() >= options.max_time {
-                    outcome.decision = TuneDecision::TimeBudget;
-                    return;
-                }
-                let compiled = {
-                    let _timer = PhaseTimer::new(&mut prep.pipelines);
-                    self.pipelines.prepare(&self.gpu, dispatch, None)
-                };
-                outcome.compile_time = prep.pipelines.unwrap();
-                if let Err(error) = compiled {
-                    outcome.decision = TuneDecision::ShaderRejected;
-                    outcome.failure = Some(error);
-                    return;
-                }
+        // Split sequences carry pipelines no tile names: a split convolution
+        // producer and the SumRows of any split.
+        let sequence_dispatches: Vec<&Dispatch> = if outcome.candidate_split_k.is_some() {
+            variants[1].iter().collect()
+        } else {
+            variants
+                .iter()
+                .flat_map(|sequence| &sequence[1..])
+                .collect()
+        };
+        for dispatch in sequence_dispatches {
+            if start.elapsed() >= options.max_time {
+                outcome.decision = TuneDecision::TimeBudget;
+                return;
+            }
+            let compiled = {
+                let _timer = PhaseTimer::new(&mut prep.pipelines);
+                self.pipelines.prepare(&self.gpu, dispatch, None)
+            };
+            outcome.compile_time = prep.pipelines.unwrap();
+            if let Err(error) = compiled {
+                outcome.decision = TuneDecision::ShaderRejected;
+                outcome.failure = Some(error);
+                return;
             }
         }
         if start.elapsed() >= options.max_time {
@@ -853,8 +918,10 @@ impl Session {
             .map(|(i, sequence)| {
                 sequence
                     .iter()
-                    .map(|dispatch| {
-                        let key = if i == 1 && outcome.candidate_split_k.is_some() {
+                    .enumerate()
+                    .map(|(position, dispatch)| {
+                        let key = if position > 0 || (i == 1 && outcome.candidate_split_k.is_some())
+                        {
                             Pipelines::key(dispatch)
                         } else {
                             tile_variant(dispatch, [outcome.initial, outcome.candidate][i])
@@ -918,10 +985,14 @@ impl Session {
                     let identical = variant == 1
                         && bytemuck::cast_slice::<f32, u8>(&baseline_outputs[pattern])
                             == bytemuck::cast_slice::<f32, u8>(&output);
+                    let agree = if class.key.split_k {
+                        reordered_outputs_agree
+                    } else {
+                        outputs_agree
+                    };
                     identical
                         || (qualify_output(&class.key, &inputs, &output, scale)
-                            && (variant == 0
-                                || outputs_agree(&baseline_outputs[pattern], &output, scale)))
+                            && (variant == 0 || agree(&baseline_outputs[pattern], &output, scale)))
                 };
                 if !valid {
                     outcome.decision = TuneDecision::InvalidOutput;
@@ -1542,6 +1613,21 @@ fn outputs_agree(reference: &[f32], actual: &[f32], scale: f64) -> bool {
             .iter()
             .zip(actual)
             .all(|(&a, &b)| close(a as f64, b, scale))
+}
+
+/// Agreement between alternatives that add the same products in another
+/// order, as different K partitions do. An element whose terms cancel can
+/// move by more than its own magnitude allows, so the bound follows the
+/// largest output instead.
+fn reordered_outputs_agree(reference: &[f32], actual: &[f32], scale: f64) -> bool {
+    let largest = reference
+        .iter()
+        .fold(0.0f64, |largest, &v| largest.max(f64::from(v).abs()));
+    reference.len() == actual.len()
+        && reference.iter().zip(actual).all(|(&a, &b)| {
+            b.is_finite()
+                && (f64::from(a) - f64::from(b)).abs() <= scale * 1.0e-5 + largest * 2.0e-4
+        })
 }
 
 fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize) -> f64 {
@@ -2319,6 +2405,83 @@ mod tests {
         assert!(a.swap_tuning_with(&mut b).is_err());
         assert_eq!(state(&a), before);
         assert_eq!(a.dispatch_pipeline_keys(), a_keys);
+    }
+
+    #[test]
+    fn reordered_sums_agree_up_to_the_largest_output() {
+        let reference = [12.0, 3.0e-3, -7.5];
+        // A cancelling element may move by more than its own magnitude.
+        assert!(!outputs_agree(&reference, &[12.0, 3.04e-3, -7.5], 1.0));
+        assert!(reordered_outputs_agree(
+            &reference,
+            &[12.0, 3.04e-3, -7.5],
+            1.0
+        ));
+        // A wrong partition still shows, as do non-finite values and extents.
+        assert!(!reordered_outputs_agree(
+            &reference,
+            &[12.0, 0.1, -7.5],
+            1.0
+        ));
+        assert!(!reordered_outputs_agree(
+            &reference,
+            &[12.0, f32::NAN, -7.5],
+            1.0
+        ));
+        assert!(!reordered_outputs_agree(&reference, &[12.0, 3.0e-3], 1.0));
+    }
+
+    #[test]
+    fn split_products_retune_together_with_their_sums() {
+        let config = crate::codegen::CoopConfig {
+            tile_size: 16,
+            use_f16_input: false,
+            compensated: false,
+        };
+        let mut graph = crate::Graph::new();
+        let x = graph.input("x", &[64, 2048]);
+        let w = graph.parameter("w", &[2048, 256]);
+        let y = graph.matmul(x, w);
+        graph.set_outputs(vec![y]);
+        let mut plan = crate::compile::compile_with(&graph, &Default::default());
+        super::super::select_variants(&mut plan, Some(&config), false, false);
+        let crate::compile::Kernel::CooperativeTiled { shape, splits: 16 } =
+            plan.dispatches[0].kernel
+        else {
+            panic!(
+                "expected sixteen tiled partitions: {:?}",
+                plan.dispatches[0]
+            );
+        };
+        let alias = crate::memplan::AliasPlan::identity(&plan.buffers);
+        let (classes, excluded) = collect_classes(&plan, &alias, Some(&config));
+        assert_eq!((classes.len(), excluded), (1, 1));
+        let class = &classes[0];
+        assert!(class.key.split_k);
+        assert_eq!(
+            (&class.members[..], &class.reductions[..]),
+            (&[0][..], &[1][..])
+        );
+        // Other shapes keep sixteen partitions; this shape tries fewer.
+        let fewer = MatmulTile::CooperativeTiled { shape, splits: 4 };
+        assert!(class.challengers.contains(&fewer));
+        assert!(class.challengers.iter().all(|c| matches!(
+            *c,
+            MatmulTile::CooperativeTiled { splits, .. } if splits >= 2
+        )));
+        class.install(&mut plan.dispatches, fewer);
+        assert_eq!(plan.dispatches[0].workgroups[2], 4);
+        assert_eq!(plan.dispatches[1].params[0], 4);
+        // The allocation still holds sixteen partitions.
+        let classes = collect_classes(&plan, &alias, Some(&config)).0;
+        assert!(
+            classes[0]
+                .challengers
+                .contains(&MatmulTile::CooperativeTiled { shape, splits: 16 })
+        );
+        // A split whose sum disagrees is not tunable.
+        plan.dispatches[1].params[0] = 16;
+        assert!(collect_classes(&plan, &alias, Some(&config)).0.is_empty());
     }
 
     #[test]

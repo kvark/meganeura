@@ -1,6 +1,31 @@
 use super::{BufferRef, Dispatch, ExecutionPlan, ShaderEntry};
 use crate::tune::{MatmulTile, TuneClass, TuneError};
 
+impl Dispatch {
+    /// The SumRows adding `splits` partial results of this product,
+    /// `columns` elements each, from `partial` into `output`.
+    pub(crate) fn partial_sum(
+        &self,
+        partial: BufferRef,
+        output: BufferRef,
+        columns: u32,
+        splits: u32,
+    ) -> Dispatch {
+        Dispatch {
+            shader: ShaderEntry::SumRows,
+            workgroups: [columns.div_ceil(256), 1, 1],
+            input_buffers: vec![partial],
+            output_buffer: output,
+            params: vec![splits, columns, 1, 0],
+            requires_full_precision: self.requires_full_precision,
+            fusion_barrier: self.fusion_barrier,
+            label: format!("{} split-K reduction", self.label),
+            origin: self.origin.clone(),
+            ..Default::default()
+        }
+    }
+}
+
 impl ExecutionPlan {
     /// Move an unfused cooperative f32 product to the shared-tile native
     /// 16x16 kernel. More than one K partition writes compact M*N partials
@@ -109,18 +134,7 @@ impl ExecutionPlan {
             u32::try_from(self.buffers.len()).map_err(|_| TuneError("too many buffers"))?,
         );
         let dispatch = &self.dispatches[index];
-        let reduction = Dispatch {
-            shader: ShaderEntry::SumRows,
-            workgroups: [columns.div_ceil(256), 1, 1],
-            input_buffers: vec![partial],
-            output_buffer: dispatch.output_buffer,
-            params: vec![splits, columns, 1, 0],
-            requires_full_precision: dispatch.requires_full_precision,
-            fusion_barrier: dispatch.fusion_barrier,
-            label: format!("{} split-K reduction", dispatch.label),
-            origin: dispatch.origin.clone(),
-            ..Default::default()
-        };
+        let reduction = dispatch.partial_sum(partial, dispatch.output_buffer, columns, splits);
         producer.output_buffer = partial;
         producer.label = format!("{} split-K {splits}", dispatch.label);
         self.buffers.push(bytes);
@@ -408,29 +422,33 @@ mod tests {
                 use_f16_input: false,
                 compensated: false,
             };
-            assert_eq!(
-                TuneClass::from_dispatch(&plan.dispatches[0], Some(&config)).is_some(),
-                splits == 1
-            );
+            let mut class = TuneClass::from_dispatch(&plan.dispatches[0], Some(&config)).unwrap();
+            assert_eq!(class.split_k, splits > 1);
+            class.binding_bytes = plan.dispatches[0]
+                .input_buffers
+                .iter()
+                .chain(std::iter::once(&plan.dispatches[0].output_buffer))
+                .map(|b| plan.buffers[b.0 as usize])
+                .collect();
+            let selected = MatmulTile::CooperativeTiled { shape, splits };
+            assert!(selected.fits(&class));
+            let challengers = class.challengers(selected, Some(&config));
             if splits == 1 {
                 assert_eq!(plan.buffers, base.buffers);
-                let mut class =
-                    TuneClass::from_dispatch(&plan.dispatches[0], Some(&config)).unwrap();
-                class.binding_bytes = plan.dispatches[0]
-                    .input_buffers
-                    .iter()
-                    .chain(std::iter::once(&plan.dispatches[0].output_buffer))
-                    .map(|b| plan.buffers[b.0 as usize])
-                    .collect();
-                let selected = MatmulTile::CooperativeTiled(shape);
-                assert!(selected.fits(&class));
                 assert!(
-                    class
-                        .challengers(selected, Some(&config))
+                    challengers
                         .iter()
                         .any(|c| matches!(c, MatmulTile::CooperativeF32 { .. }))
                 );
             } else {
+                // The SumRows stays: tiles write two to four partitions,
+                // as many as the partial buffer holds.
+                assert!(
+                    challengers
+                        .iter()
+                        .all(|c| matches!(*c, MatmulTile::CooperativeTiled { splits: 2 | 4, .. }))
+                );
+                assert!(challengers.contains(&MatmulTile::CooperativeTiled { shape, splits: 2 }));
                 assert_eq!(*plan.buffers.last().unwrap(), 128 * 256 * 4 * 4);
                 assert_eq!(
                     plan.dispatches[1].input_buffers,
