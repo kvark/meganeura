@@ -982,6 +982,7 @@ fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
 /// implementation once; preparation builds exactly the selected pipeline.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Variant {
+    CoopSplit(ShaderEntry, u32, Vec<crate::compile::PrologueLoadKind>),
     SplitMatmul(
         ShaderEntry,
         crate::compile::WeightFormat,
@@ -1081,6 +1082,7 @@ impl Variant {
         match *self {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
             Variant::Attention(ref e, _, _)
+            | Variant::CoopSplit(ref e, _, _)
             | Variant::SplitMatmul(ref e, _, _, _)
             | Variant::SpecializedConv(ref e, _, _)
             | Variant::ScalarMatmul(ref e, _, _)
@@ -1104,6 +1106,9 @@ impl Variant {
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
+            Variant::CoopSplit(ref e, splits, ref prologue) => {
+                format!("{e:?}:native-f32-split-k-{splits}:{prologue:?}")
+            }
             Variant::SplitMatmul(ref e, format, shape, splits) => {
                 format!("{e:?}:split-k-{format:?}-{splits}-{shape:?}")
             }
@@ -1270,6 +1275,17 @@ impl Pipelines {
         let cooperative =
             || *coop_config.expect("cooperative dispatch needs a qualified device configuration");
         let module = match key {
+            Variant::CoopSplit(_, splits, _) => {
+                if let Some(ref prologue) = dispatch.matmul_prologue {
+                    layout = matmul_with_prologue_layout(prologue.factors.len());
+                }
+                crate::codegen::generate_split_coop_matmul(
+                    group,
+                    &cooperative(),
+                    splits,
+                    dispatch.matmul_prologue.as_ref(),
+                )
+            }
             Variant::Scalar(_) => crate::codegen::generate_module(group, matmul_knobs),
             Variant::SmallTile(_) => crate::codegen::generate_module_small(group, matmul_knobs),
             Variant::Weight(_, format) => {
@@ -1441,6 +1457,17 @@ impl Pipelines {
     /// which unrelated pipelines happen to have been compiled.
     fn key(dispatch: &Dispatch) -> Variant {
         let entry = dispatch.shader.clone();
+        if let crate::compile::Kernel::CooperativeSplit { splits } = dispatch.kernel {
+            return Variant::CoopSplit(
+                entry,
+                splits,
+                dispatch
+                    .matmul_prologue
+                    .as_ref()
+                    .map(|p| p.factors.iter().map(|f| f.1.clone()).collect())
+                    .unwrap_or_default(),
+            );
+        }
         if let crate::compile::Kernel::SplitMatmul { shape, splits } = dispatch.kernel {
             return Variant::SplitMatmul(entry, dispatch.weight_format, shape, splits);
         }
@@ -1975,6 +2002,23 @@ pub(crate) fn select_variants(
         crate::compile::fuse_rmsnorm_prologues(plan);
         crate::compile::fuse_rmsnorm_into_add(plan);
         crate::compile::fuse_rmsnorm_into_gemv(plan);
+    }
+    // A 32x32 native f32 tile has only one wave on CDNA. Skinny products
+    // leave most SIMD slots empty unless K contributes independent work.
+    // Keep this preference confined to the qualified native 16x16 path.
+    if coop_config.is_some_and(|c| c.tile_size == 16 && !c.use_f16_input && !c.compensated) {
+        for index in (0..plan.dispatches.len()).rev() {
+            let dispatch = &plan.dispatches[index];
+            let Some((_, _, k)) = dispatch.mnk() else {
+                continue;
+            };
+            let groups = u64::from(dispatch.workgroups[0]) * u64::from(dispatch.workgroups[1]);
+            if k >= 2048 && groups <= 512 {
+                let splits = if k >= 4096 { 16 } else { 8 };
+                // Ineligible fused/pinned/unaligned forms retain their kernel.
+                let _ = plan.split_native_f32_matmul(index, splits, 32 * 1024 * 1024);
+            }
+        }
     }
 }
 

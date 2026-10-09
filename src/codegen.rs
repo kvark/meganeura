@@ -941,7 +941,7 @@ pub fn generate_horizontal_matmul(
         Some(config) => {
             let (fused_add, variant) =
                 coop_shape(group).unwrap_or_else(|| panic!("no cooperative form for {group:?}"));
-            gen_matmul_coop_wgsl_full(fused_add, variant, config, None, None, count)
+            gen_matmul_coop_wgsl_full(fused_add, variant, config, None, None, count, 1)
         }
         None => generate_partitioned_matmul(group, None, MatMulOptions::default(), 1, count),
     }
@@ -2223,7 +2223,7 @@ fn gen_matmul_coop_wgsl(
     variant: MatMulCoopVariant,
     config: &CoopConfig,
 ) -> ShaderModule {
-    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, None, 1)
+    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, None, 1, 1)
 }
 
 /// Generate coop matmul with an optional [`crate::compile::MatMulPrologue`].
@@ -2233,7 +2233,7 @@ pub fn gen_matmul_coop_with_prologue(
     config: &CoopConfig,
     prologue: &crate::compile::MatMulPrologue,
 ) -> ShaderModule {
-    gen_matmul_coop_wgsl_full(fused_add, variant, config, Some(prologue), None, 1)
+    gen_matmul_coop_wgsl_full(fused_add, variant, config, Some(prologue), None, 1, 1)
 }
 
 /// Generate a cooperative matmul that stages its f32 accumulators through
@@ -2255,7 +2255,23 @@ pub fn generate_coop_matmul_with_dag_epilogue(
     );
     let (fused_add, variant) = coop_shape(group)
         .unwrap_or_else(|| panic!("cooperative epilogue not supported for {group:?}"));
-    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, Some(epilogue), 1)
+    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, Some(epilogue), 1, 1)
+}
+
+/// Generate one K partition of a native 16x16 f32 product.
+/// The caller supplies full 32-row/column tiles, a Z grid of `splits`, and
+/// `splits * M * N` output elements, then sums the partial matrices.
+/// An addend seeds partition zero only. No nonlinear epilogue may be split.
+pub fn generate_split_coop_matmul(
+    group: ShaderGroup,
+    config: &CoopConfig,
+    splits: u32,
+    prologue: Option<&crate::compile::MatMulPrologue>,
+) -> ShaderModule {
+    assert!(config.tile_size == 16 && !config.use_f16_input && !config.compensated);
+    assert!((2..=65535).contains(&splits));
+    let (add, variant) = coop_shape(group).expect("split cooperative matrix group");
+    gen_matmul_coop_wgsl_full(add, variant, config, prologue, None, 1, splits)
 }
 
 fn gen_matmul_coop_wgsl_full(
@@ -2265,7 +2281,15 @@ fn gen_matmul_coop_wgsl_full(
     prologue: Option<&crate::compile::MatMulPrologue>,
     epilogue: Option<&crate::compile::MatMulEpilogue>,
     copies: u32,
+    splits: u32,
 ) -> ShaderModule {
+    assert!(
+        splits == 1
+            || (config.tile_size == 16
+                && !config.use_f16_input
+                && copies == 1
+                && epilogue.is_none())
+    );
     if config.tile_size == 8 && !config.use_f16_input {
         return gen_matmul_coop_f32_8x8(fused_add, variant, prologue, epilogue, copies);
     }
@@ -2716,7 +2740,7 @@ fn gen_matmul_coop_wgsl_full(
         )
     };
 
-    let (fused_decl, acc_init) = if fused_add {
+    let (fused_decl, mut acc_init) = if fused_add {
         (
             "var<storage> src: array<f32>;".to_string(),
             format!(
@@ -2736,6 +2760,28 @@ fn gen_matmul_coop_wgsl_full(
                  \x20   var acc11 = {coop_c}();"
             ),
         )
+    };
+
+    if fused_add && splits > 1 {
+        acc_init.clear();
+        for name in ["00", "01", "10", "11"] {
+            acc_init.push_str(&format!("var acc{name} = {coop_c}();\n"));
+        }
+        acc_init.push_str("if wgid.z == 0u {\n");
+        for name in ["00", "01", "10", "11"] {
+            acc_init.push_str(&format!(
+                "acc{name} = coopLoadT<{coop_c}>(&src[c{name}], n);\n"
+            ));
+        }
+        acc_init.push_str("}\n");
+    }
+    let partition = if splits > 1 {
+        format!(
+            "let chunk = ((k + 15u) / 16u + {last}u) / {splits}u * 16u;\n    let begin = wgid.z * chunk;\n    let end = min(k, begin + chunk);",
+            last = splits - 1
+        )
+    } else {
+        String::new()
     };
 
     let output_tile_u = format!("{}u", output_tile);
@@ -2783,15 +2829,15 @@ fn gen_matmul_coop_wgsl_full(
         (
             String::new(),
             "if sg == 0u {\n\
-             \x20   coopStoreT(acc00, &$C_BUFFER[c00], n);\n\
+             \x20   coopStoreT(acc00, &$C_BUFFER[o00], n);\n\
              \x20   if n1_valid {\n\
-             \x20       coopStoreT(acc01, &$C_BUFFER[c01], n);\n\
+             \x20       coopStoreT(acc01, &$C_BUFFER[o01], n);\n\
              \x20   }\n\
              \x20   if m1_valid {\n\
-             \x20       coopStoreT(acc10, &$C_BUFFER[c10], n);\n\
+             \x20       coopStoreT(acc10, &$C_BUFFER[o10], n);\n\
              \x20   }\n\
              \x20   if n1_valid && m1_valid {\n\
-             \x20       coopStoreT(acc11, &$C_BUFFER[c11], n);\n\
+             \x20       coopStoreT(acc11, &$C_BUFFER[o11], n);\n\
              \x20   }\n\
              \x20   }"
                 .to_string(),
@@ -2829,6 +2875,13 @@ fn gen_matmul_coop_wgsl_full(
     let src = preprocess(
         src,
         &[
+            ("$PARTITION", &partition),
+            ("$K_BEGIN", if splits > 1 { "begin" } else { "0u" }),
+            ("$K_END", if splits > 1 { "end" } else { "k" }),
+            (
+                "$OUTPUT_BASE",
+                if splits > 1 { "wgid.z * m * n" } else { "0u" },
+            ),
             ("$ENABLE_F16", enable_f16),
             ("$ELEM_TYPE", elem_type),
             ("$SHARED_SIZE", &shared_size_s),
@@ -3636,7 +3689,7 @@ mod tests {
                 ] {
                     let (fused_add, variant) = coop_shape(group).unwrap();
                     let module = gen_matmul_coop_wgsl_full(
-                        fused_add, variant, &config, prologue, epilogue, copies,
+                        fused_add, variant, &config, prologue, epilogue, copies, 1,
                     );
                     assert_eq!(module.module.entry_points[0].workgroup_size, [128, 1, 1]);
                     assert!(!module.source.contains("enable f16"));

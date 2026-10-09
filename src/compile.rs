@@ -1177,6 +1177,10 @@ pub enum Kernel {
         k_tile: u32,
     },
     Cooperative,
+    /// Native 16x16 f32 K partitions followed by a separate sum of partials.
+    CooperativeSplit {
+        splits: u32,
+    },
     /// Experimental f16 hi/lo staging, not a full-range f32 implementation.
     CooperativeCompensated,
     Gemv {
@@ -1220,7 +1224,7 @@ impl Dispatch {
     pub fn use_coop(&self) -> bool {
         matches!(
             self.kernel,
-            Kernel::Cooperative | Kernel::CooperativeCompensated
+            Kernel::Cooperative | Kernel::CooperativeCompensated | Kernel::CooperativeSplit { .. }
         )
     }
 

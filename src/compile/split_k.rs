@@ -2,6 +2,109 @@ use super::{BufferRef, Dispatch, ExecutionPlan, ShaderEntry};
 use crate::tune::{MatmulTile, TuneClass, TuneError};
 
 impl ExecutionPlan {
+    /// Partition an already selected native 16x16 f32 product. Full output
+    /// tiles give every partition a compact M*N stride. Preflight before
+    /// mutating the plan; nonlinear epilogues must run after the final sum.
+    pub(crate) fn split_native_f32_matmul(
+        &mut self,
+        index: usize,
+        splits: u32,
+        max_partial_bytes: usize,
+    ) -> Result<(), TuneError> {
+        let dispatch = self
+            .dispatches
+            .get(index)
+            .ok_or(TuneError("missing matrix dispatch"))?;
+        if dispatch.kernel != super::Kernel::Cooperative
+            || dispatch.schedule_locked
+            || dispatch.weight_format != super::WeightFormat::F32
+            || dispatch.horizontal_batch > 1
+            || dispatch.matmul_epilogue.is_some()
+            || dispatch.workgroups[2] != 1
+            || !dispatch.shader.is_matmul()
+        {
+            return Err(TuneError("split-K requires an unfused native f32 product"));
+        }
+        // The prologue binding layout does not carry an additional addend.
+        if dispatch.matmul_prologue.is_some()
+            && dispatch.input_buffers.len()
+                > 2 + dispatch.matmul_prologue.as_ref().unwrap().factors.len()
+        {
+            return Err(TuneError("split-K prologue with addend is unsupported"));
+        }
+        let (m, n, k) = dispatch.mnk().ok_or(TuneError("not a dense product"))?;
+        if m == 0
+            || n == 0
+            || !m.is_multiple_of(32)
+            || !n.is_multiple_of(32)
+            || !(2..=65535).contains(&splits)
+            || splits > k / 16
+            || k.checked_add(15 + splits * 16).is_none()
+        {
+            return Err(TuneError(
+                "split-K needs full output tiles and enough K tiles",
+            ));
+        }
+        if dispatch.input_buffers.contains(&dispatch.output_buffer) {
+            return Err(TuneError("split-K cannot alias an input with its output"));
+        }
+        let columns = m
+            .checked_mul(n)
+            .ok_or(TuneError("split-K output overflow"))?;
+        let binding_fits = |buffer: Option<&BufferRef>, elements: Option<u32>| {
+            buffer.zip(elements).is_some_and(|(b, elements)| {
+                (elements as usize)
+                    .checked_mul(4)
+                    .zip(self.buffers.get(b.0 as usize))
+                    .is_some_and(|(required, &available)| required <= available)
+            })
+        };
+        if !binding_fits(dispatch.input_buffers.first(), m.checked_mul(k))
+            || !binding_fits(dispatch.input_buffers.get(1), n.checked_mul(k))
+            || !binding_fits(Some(&dispatch.output_buffer), Some(columns))
+            || (matches!(
+                dispatch.shader,
+                ShaderEntry::FusedMatMulAdd
+                    | ShaderEntry::FusedMatMulATAdd
+                    | ShaderEntry::FusedMatMulBTAdd
+            ) && !binding_fits(dispatch.input_buffers.get(2), Some(columns)))
+        {
+            return Err(TuneError("split-K binding capacity is too small"));
+        }
+        if columns.div_ceil(256) > 65535 || m / 32 > 65535 || n / 32 > 65535 {
+            return Err(TuneError("split-K grid exceeds dispatch limits"));
+        }
+        let bytes = columns
+            .checked_mul(splits)
+            .and_then(|n| (n as usize).checked_mul(4))
+            .filter(|&b| b <= max_partial_bytes)
+            .ok_or(TuneError("split-K scratch budget"))?;
+        let partial = BufferRef(
+            u32::try_from(self.buffers.len()).map_err(|_| TuneError("too many buffers"))?,
+        );
+        let mut producer = dispatch.clone();
+        producer.kernel = super::Kernel::CooperativeSplit { splits };
+        producer.output_buffer = partial;
+        producer.workgroups = [m / 32, n / 32, splits];
+        producer.label = format!("{} native-f32 split-K {splits}", dispatch.label);
+        let reduction = Dispatch {
+            shader: ShaderEntry::SumRows,
+            workgroups: [columns.div_ceil(256), 1, 1],
+            input_buffers: vec![partial],
+            output_buffer: dispatch.output_buffer,
+            params: vec![splits, columns, 1, 0],
+            requires_full_precision: dispatch.requires_full_precision,
+            fusion_barrier: dispatch.fusion_barrier,
+            label: format!("{} split-K reduction", dispatch.label),
+            origin: dispatch.origin.clone(),
+            ..Default::default()
+        };
+        self.buffers.push(bytes);
+        self.dispatches
+            .splice(index..index + 1, [producer, reduction]);
+        Ok(())
+    }
+
     pub(super) fn split_low_occupancy_conv_weights(&mut self, options: super::ConvWeightSplits) {
         assert!(options.reduction_chunk >= 16 && options.reduction_chunk.is_multiple_of(16));
         let mut bytes = 0usize;
@@ -254,6 +357,52 @@ impl ExecutionPlan {
 mod tests {
     use super::*;
     use crate::Graph;
+
+    #[test]
+    fn native_split_rejections_leave_the_plan_intact_and_success_orders_the_sum() {
+        let mut graph = Graph::new();
+        let a = graph.input("a", &[64, 2048]);
+        let b = graph.input("b", &[2048, 256]);
+        let c = graph.matmul(a, b);
+        graph.set_outputs(vec![c]);
+        let mut base = super::super::compile(&graph);
+        base.dispatches[0].kernel = super::super::Kernel::Cooperative;
+        base.dispatches[0].workgroups = [2, 8, 1];
+        let bytes = 64 * 256 * 8 * 4;
+        for case in 0..6 {
+            let mut plan = base.clone();
+            let mut budget = bytes;
+            match case {
+                0 => budget -= 1,
+                1 => plan.dispatches[0].params[0] = 63,
+                2 => plan.dispatches[0].schedule_locked = true,
+                3 => plan.dispatches[0].output_buffer = plan.dispatches[0].input_buffers[0],
+                4 => {
+                    let b = plan.dispatches[0].input_buffers[1];
+                    plan.buffers[b.0 as usize] -= 4;
+                }
+                5 => plan.dispatches[0].params[1] = u32::MAX,
+                _ => unreachable!(),
+            }
+            let before = plan.clone();
+            assert!(plan.split_native_f32_matmul(0, 8, budget).is_err());
+            assert_eq!(plan, before);
+        }
+        let mut plan = base.clone();
+        plan.split_native_f32_matmul(0, 8, bytes).unwrap();
+        assert_eq!(plan.output_buffers, base.output_buffers);
+        assert_eq!(*plan.buffers.last().unwrap(), bytes);
+        assert_eq!(
+            plan.dispatches[1].input_buffers,
+            [plan.dispatches[0].output_buffer]
+        );
+        super::super::schedule_dispatches(&mut plan, false, true);
+        assert_eq!(plan.groups, [0..1, 1..2]);
+        let decoded: ExecutionPlan =
+            serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert_eq!(decoded, plan);
+        assert_eq!(decoded.input_types, base.input_types);
+    }
 
     #[test]
     fn opt_in_weight_splits_preserve_defaults_and_respect_budget() {
