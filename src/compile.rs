@@ -1177,10 +1177,6 @@ pub enum Kernel {
         k_tile: u32,
     },
     Cooperative,
-    /// Native 16x16 f32 K partitions followed by a separate sum of partials.
-    CooperativeSplit {
-        splits: u32,
-    },
     /// Four subgroup tiles sharing aligned native-f32 operands. More than
     /// one K partition requires a following SumRows dispatch.
     CooperativeTiled {
@@ -1230,10 +1226,7 @@ impl Dispatch {
     pub fn use_coop(&self) -> bool {
         matches!(
             self.kernel,
-            Kernel::Cooperative
-                | Kernel::CooperativeCompensated
-                | Kernel::CooperativeSplit { .. }
-                | Kernel::CooperativeTiled { .. }
+            Kernel::Cooperative | Kernel::CooperativeCompensated | Kernel::CooperativeTiled { .. }
         )
     }
 

@@ -461,15 +461,13 @@ impl Session {
         let start = Instant::now();
         let (mut classes, mut excluded_dispatches) =
             collect_classes(&self.plan, &self.alias, self.coop_config.as_ref());
-        let reported_shared = self.gpu.capabilities().max_compute_shared_memory_size;
-        let shared_limit = if reported_shared == 0 {
-            16 * 1024
-        } else {
-            reported_shared
-        };
+        // As in pipeline creation, zero means the backend reports no limit.
+        let shared_limit = self.gpu.capabilities().max_compute_shared_memory_size;
         for class in &mut classes {
             class.challengers.retain(|tile| match *tile {
-                MatmulTile::CooperativeTiled(shape) => shape.shared_bytes() <= shared_limit,
+                MatmulTile::CooperativeTiled(shape) => {
+                    shared_limit == 0 || shape.shared_bytes() <= shared_limit
+                }
                 _ => true,
             });
         }
