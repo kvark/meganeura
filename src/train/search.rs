@@ -119,6 +119,11 @@ pub fn build_measured(
         .coop
         .filter_caps(runtime::auto_tune(&gpu, 0).coop_caps);
     let shared_memory_bytes = gpu.capabilities().max_compute_shared_memory_size;
+    let target = optimize::search::Target {
+        caps,
+        shared_memory_bytes,
+        forward_coop: cfg.options.flash_forward_coop,
+    };
     let (ordinary, _) = prepare_graph(
         forward_graph,
         cfg.mode,
@@ -137,7 +142,7 @@ pub fn build_measured(
     {
         let source = super::recognize(forward_graph, cfg.mode, &cfg.optimize).into_toposort();
         let limit = options.max_graphs - 1;
-        let space = optimize::search::candidates(&source, cfg.optimize, limit);
+        let space = optimize::search::candidates(&source, cfg.optimize, limit, target);
         let spaces = if space.is_ok()
             || source.nodes().len()
                 <= cfg
@@ -157,7 +162,13 @@ pub fn build_measured(
                 .into_iter()
                 .take(1)
                 .map(|region| {
-                    optimize::search::repeated_candidates(&source, region, cfg.optimize, limit)
+                    optimize::search::repeated_candidates(
+                        &source,
+                        region,
+                        cfg.optimize,
+                        limit,
+                        target,
+                    )
                 })
                 .collect()
         };
@@ -197,6 +208,7 @@ pub fn build_measured(
         let space = backward_layouts(
             graphs,
             cfg.optimize,
+            target,
             options.max_graphs,
             start + options.max_time,
             &mut skipped_regions,
@@ -249,6 +261,7 @@ pub fn build_measured(
 fn backward_layouts(
     graphs: Vec<optimize::search::Candidate>,
     config: optimize::OptimizeConfig,
+    target: optimize::search::Target,
     limit: usize,
     deadline: Instant,
     skipped: &mut Vec<String>,
@@ -280,7 +293,7 @@ fn backward_layouts(
             continue;
         }
         let pending = layouts[index].get_or_insert_with(|| {
-            match optimize::search::backward_candidates(&graph.graph, config, limit - 1) {
+            match optimize::search::backward_candidates(&graph.graph, config, limit - 1, target) {
                 Ok(space) => {
                     truncated |= space.truncated;
                     space.candidates.into()
@@ -586,6 +599,142 @@ mod tests {
             }
         }
         assert!(early_physical_cover(unfused, &[]).is_empty());
+    }
+
+    #[test]
+    fn measured_native_attention_qualifies_forward_and_backward_candidates() {
+        use crate::compile::ShaderEntry;
+        use crate::kernels::attention_grad::{AttentionGrad, Operands, Part, Path};
+        use crate::{CoopPolicy, Mode, reference};
+        let gpu = reference::gpu::shared_context();
+        if !gpu
+            .capabilities()
+            .cooperative_matrix
+            .f32_shapes
+            .contains(&[16, 16, 16])
+        {
+            return;
+        }
+        let mut graph = Graph::new();
+        let q = graph.parameter("q", &[129, 128]);
+        let k = graph.parameter("k", &[129, 64]);
+        let v = graph.parameter("v", &[129, 64]);
+        let y = graph.sliding_window_attention(q, k, v, 2, 1, 64, 17);
+        let loss = reference::gradients::weighted_loss(&mut graph, y, 11, 0.7);
+        graph.set_outputs(vec![loss, y]);
+        let full = crate::autodiff::differentiate(&graph);
+        let mut feeds = reference::Feeds::new();
+        feeds.fill_random(&graph, 20261009, 0.5);
+        let values = reference::evaluate(&full, &feeds).unwrap();
+        let scales = reference::error_scales(&full, &values).unwrap();
+        let native_parts = |session: &crate::Session| {
+            session.plan().dispatches.iter().fold(0u8, |mask, d| {
+                mask | match d.shader {
+                    ShaderEntry::FlashAttentionCoopF32 => 1,
+                    ShaderEntry::AttentionGrad(AttentionGrad {
+                        part,
+                        path: Path::Cooperative(Operands::F32),
+                    }) => match part {
+                        Part::Q => 2,
+                        Part::KV => 4,
+                    },
+                    _ => 0,
+                }
+            })
+        };
+        // Also exercise the rejection path: a caller's stricter contract may
+        // reject an otherwise correct candidate, which must never be installed.
+        for reject_native in [false, true] {
+            let mut observed = std::collections::HashSet::new();
+            let (mut session, report) = build_measured(
+                &graph,
+                SessionConfig {
+                    mode: Mode::Training,
+                    gpu: Some(gpu.clone()),
+                    runtime: crate::SessionOptions {
+                        coop: CoopPolicy::NativeF32,
+                        poison: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                BuildSearchOptions {
+                    max_graphs: 8,
+                    max_programs: 12,
+                    max_time: Duration::from_secs(30),
+                    warmup_runs: 1,
+                    warmup_time: Duration::ZERO,
+                    tuning: TuneOptions {
+                        max_classes: 0,
+                        sample_pairs: 4,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                |session, _| {
+                    for name in ["q", "k", "v"] {
+                        session.set_parameter(name, &feeds.f32(name).unwrap());
+                    }
+                    Ok(())
+                },
+                |session| {
+                    let mask = native_parts(session);
+                    observed.insert(mask);
+                    for (index, &id) in full.outputs().iter().enumerate() {
+                        let want = &values[id as usize].data;
+                        let mut got = vec![0.0; want.len()];
+                        if index < full.num_user_outputs() {
+                            session.read_output_by_index(index, &mut got);
+                        } else {
+                            session.read_param_grad(
+                                ["q", "k", "v"][index - full.num_user_outputs()],
+                                &mut got,
+                            );
+                        }
+                        reference::check(&got, want, &scales[id as usize], Default::default())
+                            .map_err(|error| format!("output {index}: {error}"))?;
+                    }
+                    if reject_native && mask != 0 {
+                        Err("test contract rejects native candidates".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap();
+            assert!(
+                observed.contains(&0) && observed.contains(&7),
+                "{observed:?}"
+            );
+            assert!(
+                report.skipped_regions.is_empty(),
+                "{:?}",
+                report.skipped_regions
+            );
+            if reject_native {
+                assert_eq!(native_parts(&session), 0);
+                assert!(report.trials.iter().any(|t| !t.outcome.qualified));
+            } else {
+                assert!(
+                    report.trials.iter().all(|t| t.outcome.qualified),
+                    "{}",
+                    serde_json::to_string(&report).unwrap()
+                );
+            }
+            // Timing is deliberately not an assertion. The selected session is
+            // runnable and its ordinary incumbent was qualified just as strictly.
+            session.step();
+            session.wait();
+            let mut got = vec![0.0; 129 * 128];
+            session.read_output_by_index(1, &mut got);
+            reference::check(
+                &got,
+                &values[y as usize].data,
+                &scales[y as usize],
+                Default::default(),
+            )
+            .unwrap();
+        }
     }
 
     #[test]

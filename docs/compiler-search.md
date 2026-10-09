@@ -192,6 +192,32 @@ and whole-step qualification; it does not time or patch live gradient kernels.
 The selected cap is recorded in each scalar flash dispatch and its pipeline
 key. An explicit scalar choice does not promote to reduced-precision backward.
 
+Devices advertising native 16x16 f32 cooperative matrices also admit explicit
+`AttentionForward__native_f32`, `AttentionGradQ__native_f32` and
+`AttentionGradKV__native_f32` equalities. The graph carries the extracted
+algorithm through differentiation and lowering; scalar forward tuning cannot
+overwrite a pinned native choice. These candidates keep f32 operands and tensor
+types, including under `CoopPolicy::NativeF32`. They do not enable f16 backward.
+Admission uses the policy-filtered device capabilities, shared-memory and grid
+bounds, checked again at lowering. Forward covers power-of-two heads from 16
+and at least 16 query rows. Backward initially retains the existing kernel
+family's tested domain of 64-wide heads and at least 128 rows on both sides.
+Short forward candidates are included even where they may lose to scalar;
+measurement decides profitability. Native forward uses cooperative QK and
+scalar-f32 PV; it does not convert the probabilities or values to f16.
+
+The ordinary incumbent, including its existing f16 forward preference and
+native8 backward preference, stays in the search. Ordinary unmeasured builds
+do not select the new native16 implementations. Native8-only, f16-only and
+scalar devices retain their existing candidate sets. Native16 candidates share
+the same finite graph/program/time budgets and qualification callbacks as
+other choices; adding them does not guarantee the search reaches every
+combination. Construction reports name the extracted algorithms and record
+rejected trials. A caller can still explicitly prefer native backward with
+`CompileOptions::prefer_attention_grad` when testing that family.
+Plan-cache format 23 prevents an older runtime from reading a saved native16
+gradient choice as the previous native8-only implementation.
+
 Graph rank and backward-layout rank are interleaved before lowering. After the
 ordinary incumbent, the frontier covers a backward layout on the first
 extracted graph, then that graph's original layout. This keeps a useful matrix

@@ -1,5 +1,13 @@
 # Unreleased
 
+- Measured builds retain native16 f32 attention forward, dQ and dK/dV as
+  independent egglog implementation alternatives on supporting devices.
+  Selection uses the existing numeric qualification and whole-program timing;
+  ordinary builds and precision policies keep their previous choices. Forward
+  supports power-of-two heads from 16; backward initially covers 64-wide heads
+  with at least 128 rows on each side. Native8 and f16 kernels remain available.
+  Plan-cache format 23 rejects reuse by readers that always generate native8
+  for f32 attention gradients.
 - Devices with native 16x16 f32 cooperative matrices (MI300X on RADV) run
   aligned f32 products on 64-row tiles shared by four subgroups, split
   along K when the output alone cannot occupy the device. Tuning retunes a

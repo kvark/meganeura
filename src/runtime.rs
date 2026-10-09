@@ -1410,7 +1410,33 @@ impl Pipelines {
                 ShaderGroup::FlashAttentionCoop => {
                     crate::codegen::generate_flash_attention_coop_module(hd)
                 }
-                ShaderGroup::AttentionGrad(kernel) => kernel.generate(hd, ept, &knobs),
+                ShaderGroup::FlashAttentionCoopF32 => {
+                    let config = cooperative();
+                    if config.tile_size != 16 || config.use_f16_input || config.compensated {
+                        return Err(
+                            "native16 attention requires qualified 16x16 f32 matrices".into()
+                        );
+                    }
+                    crate::codegen::generate_flash_attention_coop_f32_module(hd)
+                }
+                ShaderGroup::AttentionGrad(kernel) => {
+                    let tile = if kernel.path
+                        == crate::kernels::attention_grad::Path::Cooperative(
+                            crate::kernels::attention_grad::Operands::F32,
+                        ) {
+                        let config = cooperative();
+                        if config.use_f16_input || config.compensated {
+                            return Err(
+                                "native-f32 attention gradients require qualified f32 matrices"
+                                    .into(),
+                            );
+                        }
+                        config.tile_size
+                    } else {
+                        8 // Unused by the other paths.
+                    };
+                    kernel.generate_with_f32_tile(hd, ept, &knobs, tile)
+                }
                 ShaderGroup::MultiHeadAttn => crate::codegen::generate_attention_module(hd),
                 ShaderGroup::CachedQueryAttention => {
                     crate::codegen::generate_cached_query_attention_module(hd)
@@ -1468,6 +1494,7 @@ impl Pipelines {
             ShaderGroup::MultiHeadAttn
             | ShaderGroup::FlashAttention
             | ShaderGroup::FlashAttentionCoop
+            | ShaderGroup::FlashAttentionCoopF32
             | ShaderGroup::CachedQueryAttention => dispatch.params.get(3).copied(),
             ShaderGroup::AttentionGrad(kernel) if kernel.specializes_head_dim() => {
                 dispatch.params.get(3).copied()
@@ -1873,7 +1900,8 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::RmsNormAdd => RmsNormAddData::layout(),
         ShaderEntry::MultiHeadAttn
         | ShaderEntry::FlashAttention
-        | ShaderEntry::FlashAttentionCoop => MultiHeadAttnData::layout(),
+        | ShaderEntry::FlashAttentionCoop
+        | ShaderEntry::FlashAttentionCoopF32 => MultiHeadAttnData::layout(),
         ShaderEntry::AttentionGrad(kernel) => match kernel.part {
             AttentionGradPart::Q => MultiHeadAttnGradData::layout(),
             AttentionGradPart::KV => MultiHeadAttnGradKVData::layout(),
