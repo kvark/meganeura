@@ -1,5 +1,7 @@
-// K-split GEMV. Forward workgroups cover four columns; transposed workgroups
-// cover one, two or four contiguous B rows. Width and reduction are shared
+// K-split GEMV. Forward workgroups cover COLUMNS groups of four adjacent
+// columns, interleaving their K-reduction lanes for contiguous weight reads.
+// Transposed workgroups cover one, two or four contiguous B rows. Width and
+// reduction are shared
 // specialization slots, including in the integer-dot templates.
 
 // @section forward
@@ -17,13 +19,14 @@ var<storage, read_write> matrix_c: array<vec4<f32>>;
 $ADDEND_DECL
 var<uniform> params: Params;
 const LANES: u32 = $LANESu;
+const COLUMNS: u32 = $COLUMN_GROUPSu;
 $NORM_SCRATCH
-var<workgroup> reduce_buf: array<vec4<f32>, LANES>;
+var<workgroup> reduce_buf: array<vec4<f32>, LANES * COLUMNS>;
 $WEIGHT_HELPERS
-@compute @workgroup_size(LANES)
+@compute @workgroup_size(LANES * COLUMNS)
 fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>$SUBGROUP_ARGS) {
-    let col4 = wgid.x;
-    let lane = lid.x;
+    let col4 = wgid.x * COLUMNS + lid.x % COLUMNS;
+    let lane = lid.x / COLUMNS;
     let n_v4 = params.n / 4u;
 $EARLY_RETURN
     let k = params.k;
@@ -38,7 +41,7 @@ $WEIGHT_LOAD
         kk += LANES;
     }
 $REDUCTION
-    if lane == 0u {
+    if lane == 0u && col4 < n_v4 {
         matrix_c[col4] = $TOTAL$ADDEND;
     }
 }
@@ -134,7 +137,7 @@ var<storage> src: array<f32>;
 var<storage> norm_w: array<f32>;
 
 // @section norm_scratch
-var<workgroup> scale_buf: array<f32, LANES>;
+var<workgroup> scale_buf: array<f32, $WORKGROUP_SIZEu>;
 var<workgroup> inv_rms: f32;
 
 // @section norm_k
@@ -149,11 +152,11 @@ var<workgroup> inv_rms: f32;
     if col >= params.n { return; }
 
 // @section tree_start
-    reduce_buf[lane] = acc;
+    reduce_buf[lid.x] = acc;
     workgroupBarrier();
 
 // @section tree_step
-    if lane < $STRIDEu { reduce_buf[lane] += reduce_buf[lane + $STRIDEu]; }
+    if lane < $STRIDEu { reduce_buf[lid.x] += reduce_buf[lid.x + $REDUCE_STRIDEu]; }
     workgroupBarrier();
 
 // @section subgroup_reduce

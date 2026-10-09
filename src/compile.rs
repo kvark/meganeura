@@ -239,11 +239,15 @@ pub struct ConvWeightSplits {
 
 impl CompileOptions {
     fn gemv_kernel(&self, group: ShaderGroup, format: WeightFormat) -> Kernel {
+        let mut shape = self.gemv_shape.map_or_else(
+            || crate::codegen::GemvShape::initial(group),
+            |shape| shape.for_group(group),
+        );
+        if format.is_quantized() {
+            shape.column_groups = 1;
+        }
         Kernel::Gemv {
-            shape: self.gemv_shape.map_or_else(
-                || crate::codegen::GemvShape::initial(group),
-                |shape| shape.for_group(group),
-            ),
+            shape,
             integer_dot: self.quantized_activations
                 && matches!(group, ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvAdd)
                 && matches!(
@@ -2902,6 +2906,10 @@ pub(crate) fn linear_grid(groups: u32) -> [u32; 3] {
     [groups.div_ceil(y).max(1), y, 1]
 }
 
+pub(crate) fn gemv_workgroups(n: u32, shape: crate::codegen::GemvShape) -> [u32; 3] {
+    [(n / 4).div_ceil(shape.column_groups), 1, 1]
+}
+
 pub(crate) fn row_gemv_workgroups(n: u32) -> [u32; 3] {
     // Large vocabularies can exceed the portable X workgroup limit. Spread
     // rows over Y as well; the kernel flattens the actual dispatch grid.
@@ -3902,6 +3910,52 @@ mod tests {
         // workgroups = [ceil(N/64), ceil(M/64), 1] = [1, 1, 1] (4×4 register-tiled)
         assert_eq!(d.workgroups, [1, 1, 1]);
         assert_eq!(d.params, vec![33, 64, 17, 0]);
+    }
+
+    #[test]
+    fn grouped_gemv_override_preserves_mixed_weight_dispatches() {
+        for add in [false, true] {
+            let mut graph = Graph::new();
+            let a = graph.input("a", &[1, 256]);
+            let dense = graph.parameter("dense", &[256, 36]);
+            let packed = graph.parameter_q40("packed", &[256, 36]);
+            let outputs: Vec<_> = [dense, packed]
+                .into_iter()
+                .map(|b| {
+                    let y = graph.matmul(a, b);
+                    if add {
+                        let bias = graph.input(&format!("bias_{b}"), &[1, 36]);
+                        let node = &mut graph.nodes_mut()[y as usize];
+                        node.op = Op::FusedMatMulAdd;
+                        node.inputs.push(bias);
+                    }
+                    y
+                })
+                .collect();
+            graph.set_outputs(outputs);
+            let plan = compile_with(
+                &graph,
+                &CompileOptions {
+                    gemv_shape: Some(crate::codegen::GemvShape {
+                        threads: 32,
+                        reduction: crate::codegen::GemvReduction::Tree,
+                        bt_rows: 1,
+                        column_groups: 8,
+                    }),
+                    ..Default::default()
+                },
+            );
+            for dispatch in &plan.dispatches {
+                let groups = if dispatch.weight_format.is_quantized() {
+                    1
+                } else {
+                    8
+                };
+                assert_eq!(dispatch.gemv_shape().unwrap().column_groups, groups);
+                assert_eq!(dispatch.workgroups, [9u32.div_ceil(groups), 1, 1]);
+            }
+            assert_eq!(plan.dispatches.len(), 2);
+        }
     }
 
     #[test]

@@ -17,7 +17,6 @@ use std::{
 pub(super) struct Program {
     pub description: String,
     pub plan: ExecutionPlan,
-    pub submission_chunks: usize,
 }
 
 #[derive(Serialize)]
@@ -141,7 +140,6 @@ pub(super) fn select(
             let build = Instant::now();
             let mut candidate =
                 Session::with_context_opts(program.plan, gpu.clone(), runtime.clone());
-            candidate.set_submission_chunks(program.submission_chunks);
             trial.construction_time = build.elapsed();
             let result = (|| {
                 let init = Instant::now();
@@ -347,7 +345,6 @@ mod tests {
                 Program {
                     description: name.into(),
                     plan,
-                    submission_chunks: 1,
                 }
             });
             let result = select(
@@ -474,7 +471,6 @@ mod tests {
                 Program {
                     description: splits.to_string(),
                     plan,
-                    submission_chunks: splits as usize,
                 }
             });
             let mut index = 0;

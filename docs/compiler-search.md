@@ -92,7 +92,7 @@ Implemented choices include fused and unfused graph forms, scalar matmul
 tile, K-stage, unrolling and split-K equalities lowered by the ordinary compiler,
 dispatch fusion, forward-attention layouts, independent scalar dQ and dK/dV
 layouts, cached-attention splits, low-occupancy convolution weight-gradient
-splits, and fresh submission chunk counts. An extracted matmul
+splits. Each measured program uses one submission. An extracted matmul
 schedule is locked, so a later kernel probe cannot replace its tile. Unlocked
 dispatches still use those probes before whole-plan comparison. Attention
 splits and convolution weight splits use the existing compiler, with no
@@ -109,6 +109,14 @@ budget or a change in execution state can still defeat that expectation.
 Held-out inference and minimal-shape measurements must check the selected plan;
 training improvements do not compensate for inference regressions.
 
+Private probes use `TuneOptions::target_sample_time` (two milliseconds by
+default) to choose a common repetition count from the faster variant's warmup.
+`dispatches_per_sample` caps that count; its default is sixteen. Setting the
+target to `None`, or disabling warmup, keeps the fixed count. The report's
+`sample_repetitions` records what was used. A decision still requires the
+configured complete sample pairs, with the same count for both variants.
+Numerical qualification and the improvement threshold are unchanged.
+
 The September 25 v14 cohort pins Inferena `7b8fcb72` and Meganeura `0dbfcc00`,
 both tagged `paper-p3hpc-2026-final`. It uses matched uniform synthetic
 parameters, sixteen graph/schedule forms, up to 64 programs, a shared soft
@@ -124,7 +132,7 @@ rewrite rules, with other operators as opaque cut edges, within the same node
 bound. This includes independent projections outside a repeated body. If that
 region is too large or crosses precision domains, search falls back to one
 verified repeated region. Sparse search does not cross mutations. Forward
-attention layouts and submission chunks are still uniform across a plan.
+attention layouts are still uniform across a plan.
 Backward layouts are attached to individual gradient nodes. A matmul tile
 is whatever enode extraction kept for that site. The report must be read with
 those limits.
@@ -156,8 +164,12 @@ one tile. Tile variants count toward `max_graphs` (sixteen by default, including
 ordinary form). Split tile widths and K staging are visited early; ordinary
 construction already probes single-pass kernels. This is coverage ordering, not
 a claimed prediction of latency. Graph rank and physical rank are traversed
-diagonally, so a larger frontier cannot postpone every submission alternative
+diagonally, so a larger frontier cannot postpone every physical alternative
 until after all graph baselines. Time and program bounds are unchanged.
+
+Dispatch fusion is a physical choice generated when visited, so enabling and
+disabling it does not consume two graph seeds. Measured construction uses one
+submission per step; submission chunking is not a search axis.
 
 The final decision uses qualified, paired whole-step wall times, including fresh
 recording and submission. Per-pass GPU times are diagnostic, not substitutes for
@@ -249,8 +261,15 @@ useful next experiment than adding guessed bandwidth or FLOP coefficients.
 The opt-in `search_study` example checks all outputs against an f64 reference.
 Run it with `MEGANEURA_EGRAPH_COST=ast-size` or `tensor-traffic` to compare ordering.
 These are kernel diagnostics, not held-out model results or a publication cohort.
-There is no persistent measured-plan cache yet. Rectangular cooperative kernels
-remain experiments. The [September 21 investigation](gpu-gap-2026-09.md) records
+There is no automatic cache for `build_measured` yet. Rectangular cooperative
+kernels remain experiments. Callers can explicitly save `session.plan()` with
+`cache::save_plan` and rebuild a session from `cache::load_plan`. This retains
+kernel choices selected by measured search; weights and mutable state must
+be initialized separately. This explicit API checks the format and graph fingerprint,
+but does not identify the GPU or build configuration; callers must keep plans
+with their compatible target and runtime policy. Ordinary `build` caching
+separately fingerprints its build configuration and target capabilities.
+The [September 21 investigation](gpu-gap-2026-09.md) records
 the earlier search limits, costing fixes and measured kernel changes. The broader
 alternatives below remain research directions, not additional dependencies or
 hidden search paths.
