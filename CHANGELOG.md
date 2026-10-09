@@ -1,5 +1,11 @@
 # Unreleased
 
+- Blade is pinned to `56f0565`. Vulkan devices with `shaderFloat16` but no
+  f16 cooperative matrix (MI300X on RADV, lavapipe) now get the 16-bit
+  storage features that f16 shaders declare, and descriptor sets are reused
+  across recordings instead of being reallocated. A Vulkan device must now
+  offer both 16-bit storage features for f16 cooperative shapes to be
+  reported.
 - Kernel families (`kernels`): interchangeable implementations of one
   computation, each declaring what it admits on a target and why it
   declines, with a fallback that admits every supported problem. Attention
