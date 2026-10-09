@@ -3234,9 +3234,19 @@ impl Graph {
 
     // --- Vision / VLA ops ---
 
+    /// GELU in its tanh approximation (PyTorch `approximate="tanh"`).
     pub fn gelu(&mut self, x: NodeId) -> NodeId {
         let ty = self.node(x).ty.clone();
         self.add_node(Op::Gelu, vec![x], ty)
+    }
+
+    /// Exact GELU, `x · (1 + erf(x/√2)) / 2` (PyTorch's default).
+    pub fn gelu_erf(&mut self, x: NodeId) -> NodeId {
+        let scaled = self.scale(x, std::f32::consts::FRAC_1_SQRT_2);
+        let erf = self.erf(scaled);
+        let shifted = self.add_scalar(erf, 1.0);
+        let half = self.scale(x, 0.5);
+        self.mul(half, shifted)
     }
 
     #[track_caller]
@@ -3388,6 +3398,34 @@ impl fmt::Display for Graph {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gelu_erf_is_exact_gelu() {
+        // x · Φ(x) to f64 precision, and the tanh form at the same points.
+        let points = [-1.0_f32, 0.5, 1.0, 2.0];
+        let exact = [
+            -0.158_655_253_931_457_07,
+            0.345_731_230_637_006_56,
+            0.841_344_746_068_542_9,
+            1.954_499_736_103_641_6,
+        ];
+        let mut g = super::Graph::new();
+        let x = g.input("x", &[points.len()]);
+        let erf = g.gelu_erf(x);
+        let tanh = g.gelu(x);
+        g.set_outputs(vec![erf, tanh]);
+        let mut feeds = crate::reference::Feeds::new();
+        feeds.set("x", &points);
+        let outputs = crate::reference::evaluate_outputs(&g, &feeds).unwrap();
+        for (i, &want) in exact.iter().enumerate() {
+            assert!(
+                (outputs[0].data[i] - want).abs() < 1e-7,
+                "gelu_erf({})",
+                points[i]
+            );
+        }
+        assert!((outputs[1].data[2] - exact[2]).abs() > 1e-4);
+    }
+
     #[test]
     fn packed_tensor_sizes_include_only_final_word_padding() {
         use super::{DType, TensorType};
