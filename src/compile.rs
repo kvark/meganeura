@@ -1305,6 +1305,9 @@ pub struct ExecutionPlan {
     pub param_types: HashMap<BufferRef, crate::graph::TensorType>,
     /// Which buffers hold inputs (filled each step).
     pub input_buffers: Vec<(String, BufferRef)>,
+    /// Logical input types, unaffected by cooperative tile padding.
+    #[serde(default)]
+    pub input_types: HashMap<BufferRef, crate::graph::TensorType>,
     /// Constant buffers with their initial data (uploaded once at session creation).
     pub constant_buffers: Vec<(BufferRef, Vec<f32>)>,
     /// The dispatch sequence. For a training graph, this includes

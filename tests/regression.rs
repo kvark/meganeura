@@ -29,6 +29,7 @@ mod model_parity;
 mod multi_input_trainer;
 mod onnx_exports;
 mod outline_optimize;
+mod padded_input;
 mod profile_windows;
 #[cfg(feature = "models")]
 mod resnet_correctness;

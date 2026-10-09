@@ -289,7 +289,7 @@ impl Session {
         self.wait();
         for &(ref input_name, buf_ref) in &self.plan.input_buffers {
             if input_name == name {
-                self.upload_buffer(buf_ref, bytemuck::cast_slice(data));
+                self.upload_input_bytes(buf_ref, bytemuck::cast_slice(data));
                 return;
             }
         }
@@ -382,11 +382,21 @@ impl Session {
         self.wait();
         for &(ref input_name, buf_ref) in &self.plan.input_buffers {
             if input_name == name {
-                self.upload_buffer(buf_ref, bytemuck::cast_slice(data));
+                self.upload_input_bytes(buf_ref, bytemuck::cast_slice(data));
                 return;
             }
         }
         panic!("unknown input: {}", name);
+    }
+
+    fn upload_input_bytes(&self, buffer: BufferRef, data: &[u8]) {
+        let capacity = self.plan.buffers[buffer.0 as usize];
+        let logical = self
+            .plan
+            .input_types
+            .get(&buffer)
+            .map_or(capacity, |ty| ty.size_bytes());
+        self.upload_padded_bytes(buffer, data, logical);
     }
 
     pub(super) fn upload_parameter_bytes(&self, buffer: BufferRef, data: &[u8]) {
@@ -396,6 +406,11 @@ impl Session {
             .param_types
             .get(&buffer)
             .map_or(capacity, |ty| ty.size_bytes());
+        self.upload_padded_bytes(buffer, data, logical);
+    }
+
+    fn upload_padded_bytes(&self, buffer: BufferRef, data: &[u8], logical: usize) {
+        let capacity = self.plan.buffers[buffer.0 as usize];
         if data.len() == logical && logical < capacity {
             let mut padded = vec![0; capacity];
             padded[..logical].copy_from_slice(data);
