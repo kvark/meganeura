@@ -17,7 +17,9 @@ $ENTRY_SIGNATURE {
     let k = params.k;
     let tile_row = wgid.x * 64u;
     let tile_col = wgid.y * $COLUMNSu;
-    let chunk = ((k / $STAGEu + $SPLITSu - 1u) / $SPLITSu) * $STAGEu;
+    // Keep split boundaries in native 16-wide tiles. Changing the staging
+    // width must not also change the floating-point reduction partitions.
+    let chunk = ((k / 16u + $SPLITSu - 1u) / $SPLITSu) * 16u;
     let begin = wgid.z * chunk;
     let end = min(k, begin + chunk);
     let output_base = wgid.z * m * n;

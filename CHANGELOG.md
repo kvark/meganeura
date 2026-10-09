@@ -1,5 +1,9 @@
 # Unreleased
 
+- Native16 f32 GEMM keeps K-split boundaries independent of staging width.
+  A wider staging tile masks its final half tile instead of moving terms
+  between partial sums. This preserves reduction order when tuning staging
+  and prefetch, avoiding amplified rounding changes in later f16 attention.
 - Measured builds retain native16 f32 attention forward, dQ and dK/dV as
   independent egglog implementation alternatives on supporting devices.
   Selection uses the existing numeric qualification and whole-program timing;

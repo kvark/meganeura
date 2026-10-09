@@ -136,7 +136,18 @@ pub fn generate_tiled_coop_matmul(
                 (false, false) => format!("((t + br{part}) * n + tile_col + bc{part}) / 4u"),
                 (false, true) => format!("((tile_col + br{part}) * k + t + bc{part}) / 4u"),
             };
-            loads += &format!("{prefix}v{part} = {buffer}[{index}];\n");
+            let k_component = if a != transposed {
+                format!("{prefix}c{part}")
+            } else {
+                format!("{prefix}r{part}")
+            };
+            if stage == 32 && splits > 1 {
+                loads += &format!(
+                    "{prefix}v{part} = vec4<f32>(0.0);\nif t + {k_component} < end {{\n{prefix}v{part} = {buffer}[{index}];\n"
+                );
+            } else {
+                loads += &format!("{prefix}v{part} = {buffer}[{index}];\n");
+            }
             for (lane, component) in ["x", "y", "z", "w"].iter().enumerate() {
                 let r = if transposed {
                     format!("({prefix}c{part} + {lane}u)")
@@ -156,6 +167,9 @@ pub fn generate_tiled_coop_matmul(
                 let stride = if a { stride_a } else { stride_b };
                 writes +=
                     &format!("{shared}[{r} * {stride}u + {c}] = {prefix}v{part}.{component};\n");
+            }
+            if stage == 32 && splits > 1 {
+                loads += "}\n";
             }
         }
     }
