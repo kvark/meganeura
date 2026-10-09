@@ -11,6 +11,137 @@ fn supported() -> bool {
 }
 
 #[test]
+fn native_f32_staging_preserves_split_reduction_order() {
+    use meganeura::{Session, SessionOptions, compile::Kernel};
+    let gpu = crate::support::gpu::gpu();
+    if !gpu
+        .capabilities()
+        .cooperative_matrix
+        .f32_shapes
+        .contains(&[16, 16, 16])
+    {
+        return;
+    }
+    // K/4 ends halfway through a 32-wide staging tile; 544 also gives an
+    // unequal last partition. Exercise both contiguous and transposed loads.
+    for k in [544, 576, 960] {
+        let (m, n) = (64, 256);
+        for kind in 0..4 {
+            let mut graph = Graph::new();
+            let a = graph.input("a", &if kind == 1 { [k, m] } else { [m, k] });
+            let b = graph.input("b", &if kind == 2 { [n, k] } else { [k, n] });
+            let y = match kind {
+                1 => graph.matmul_at(a, b),
+                2 => graph.matmul_bt(a, b),
+                _ => graph.matmul(a, b),
+            };
+            let y = if kind == 3 {
+                let c = graph.input("c", &[m, n]);
+                graph.add(y, c)
+            } else {
+                y
+            };
+            graph.set_outputs(vec![y]);
+            let mut config = crate::support::gpu::inference_config();
+            config.runtime.coop = CoopPolicy::NativeF32;
+            config.tune = false;
+            let (session, _) = build(&graph, config);
+            let plan = session.plan().clone();
+            drop(session);
+            let index = plan
+                .dispatches
+                .iter()
+                .position(|d| matches!(d.kernel, Kernel::CooperativeTiled { splits: 4, .. }))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "split native16 product kind={kind}, K={k}: {:?}",
+                        plan.dispatches
+                    )
+                });
+            let a: Vec<_> = (0..m * k)
+                .map(|i| ((i * 17 % 101) as f32 - 50.0) * 0.013)
+                .collect();
+            let b: Vec<_> = (0..n * k)
+                .map(|i| ((i * 31 % 97) as f32 - 48.0) * 0.017)
+                .collect();
+            let c: Vec<_> = (0..m * n).map(|i| (i % 7) as f32 * 0.1).collect();
+            let mut reference = vec![0.0f64; m * n];
+            for row in 0..m {
+                for col in 0..n {
+                    let mut value = if kind == 3 {
+                        f64::from(c[row * n + col])
+                    } else {
+                        0.0
+                    };
+                    for inner in 0..k {
+                        let ai = if kind == 1 {
+                            inner * m + row
+                        } else {
+                            row * k + inner
+                        };
+                        let bi = if kind == 2 {
+                            col * k + inner
+                        } else {
+                            inner * n + col
+                        };
+                        value += f64::from(a[ai]) * f64::from(b[bi]);
+                    }
+                    reference[row * n + col] = value;
+                }
+            }
+            let mut baseline = None;
+            for columns in [64, 128] {
+                for stage in [16, 32] {
+                    for prefetch in [false, true] {
+                        let mut variant = plan.clone();
+                        let Kernel::CooperativeTiled { ref mut shape, .. } =
+                            variant.dispatches[index].kernel
+                        else {
+                            unreachable!()
+                        };
+                        shape.columns = columns;
+                        shape.k_stage = stage;
+                        shape.prefetch = prefetch;
+                        variant.dispatches[index].workgroups[1] = n as u32 / columns;
+                        let mut session = Session::with_context_opts(
+                            variant,
+                            gpu.clone(),
+                            SessionOptions {
+                                coop: CoopPolicy::NativeF32,
+                                ..Default::default()
+                            },
+                        );
+                        session.set_input("a", &a);
+                        session.set_input("b", &b);
+                        if kind == 3 {
+                            session.set_input("c", &c);
+                        }
+                        session.step();
+                        session.wait();
+                        let actual = session.read_output(m * n);
+                        for (&value, &expected) in actual.iter().zip(&reference) {
+                            assert!(
+                                (f64::from(value) - expected).abs()
+                                    <= 1e-5 * (1.0 + expected.abs()),
+                                "kind={kind}, K={k}, stage={stage}, prefetch={prefetch}: {value} != {expected}"
+                            );
+                        }
+                        if let Some(ref baseline) = baseline {
+                            assert_eq!(
+                                &actual, baseline,
+                                "kind={kind}, K={k}, columns={columns}, stage={stage}, prefetch={prefetch}"
+                            );
+                        } else {
+                            baseline = Some(actual);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn coop_f32_tiles_cover_transposes_edges_and_f32_exponents() {
     if !supported() {
         eprintln!("native f32 cooperative matrices unavailable; skipping device-specific coverage");
