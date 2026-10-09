@@ -41,6 +41,11 @@ trainer.train(&mut data, /* epochs = */ 10); // data loader: see examples/mnist.
 
 A two-layer MLP, trained end to end on the GPU, in one screen.
 
+For class labels, `Graph::cross_entropy_loss_indices` takes an `input_u32`
+of shape `[batch]`. Upload indices with `Session::set_input_u32`; the loss and
+gradient read these indices directly. Use
+`cross_entropy_loss` for dense or weighted targets.
+
 For local iteration see [testing and coverage](docs/testing.md) and [debugging the stack](#debugging).
 The [shader generation investigation](docs/shader-generation.md) compares WGSL,
 synaga and other shader construction approaches.

@@ -389,7 +389,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::CrossEntropyLoss => {
+            ShaderEntry::CrossEntropyLoss | ShaderEntry::CrossEntropyLossIndices => {
                 let loss_buf = dispatch
                     .extra_outputs
                     .first()

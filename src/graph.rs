@@ -328,7 +328,7 @@ pub enum Op {
     },
     Softmax,
 
-    // Loss
+    // Dense F32 targets match logits; indexed U32 targets have one label per row.
     CrossEntropyLoss,
     BceLoss,
     /// Logits gradient already written by a sibling [`Op::CrossEntropyLoss`]
@@ -3354,6 +3354,34 @@ impl Graph {
         assert_eq!(l_shape, t_shape, "logits and labels must match");
         let ty = TensorType::f32(vec![1]);
         self.add_node(Op::CrossEntropyLoss, vec![logits, labels], ty)
+    }
+
+    /// Mean cross-entropy for F32 `[batch, classes]` logits and U32 `[batch]`
+    /// class indices. Labels stay indexed through loss and gradient evaluation.
+    /// Dense or weighted targets use [`Self::cross_entropy_loss`].
+    ///
+    /// Supports up to 2²⁴ classes. Out-of-range indices produce zero target
+    /// rows, contributing zero loss and gradient; the divisor remains `batch`.
+    #[track_caller]
+    pub fn cross_entropy_loss_indices(&mut self, logits: NodeId, labels: NodeId) -> NodeId {
+        let ty = &self.node(logits).ty;
+        assert_eq!(ty.dtype, DType::F32, "cross-entropy logits must be F32");
+        assert_eq!(ty.shape.len(), 2, "cross-entropy logits must be a matrix");
+        let (batch, classes) = (ty.shape[0], ty.shape[1]);
+        assert!(batch > 0 && (1..=1 << 24).contains(&classes));
+        let targets = &self.node(labels).ty;
+        assert_eq!(targets.dtype, DType::U32, "class indices must be U32");
+        assert_eq!(
+            targets.shape,
+            [batch],
+            "one class index is required per row"
+        );
+
+        self.add_node(
+            Op::CrossEntropyLoss,
+            vec![logits, labels],
+            TensorType::f32(vec![1]),
+        )
     }
 
     /// Binary cross-entropy loss: `-mean(t*log(p) + (1-t)*log(1-p))`.

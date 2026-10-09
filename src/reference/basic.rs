@@ -2,6 +2,7 @@
 
 use super::{Error, Tensor};
 use crate::graph::{Node, Op};
+use std::borrow;
 
 fn invalid(node: &Node, reason: impl Into<String>) -> Error {
     Error::Invalid {
@@ -14,6 +15,22 @@ fn invalid(node: &Node, reason: impl Into<String>) -> Error {
 fn rows_cols(t: &Tensor) -> (usize, usize) {
     let cols = t.shape.last().copied().unwrap_or(1).max(1);
     (t.len() / cols, cols)
+}
+
+// Expand only in the independent CPU oracle; GPU lowering retains the indices.
+fn loss_labels<'a>(logits: &Tensor, labels: &'a Tensor) -> borrow::Cow<'a, [f64]> {
+    if labels.shape == logits.shape {
+        return borrow::Cow::Borrowed(&labels.data);
+    }
+    let (rows, cols) = rows_cols(logits);
+    let mut dense = vec![0.0; logits.len()];
+    for row in 0..rows {
+        let col = labels.index(row);
+        if col < cols {
+            dense[row * cols + col] = 1.0;
+        }
+    }
+    borrow::Cow::Owned(dense)
 }
 
 fn sigmoid(x: f64) -> f64 {
@@ -568,12 +585,13 @@ pub(super) fn eval(node: &Node, ins: &[&Tensor]) -> Result<Vec<f64>, Error> {
             // L = -(1/B) Σ_b Σ_j labels · log_softmax(logits)
             let (logits, labels) = (arg(0)?, arg(1)?);
             let (rows, cols) = rows_cols(logits);
+            let labels = loss_labels(logits, labels);
             let mut loss = 0.0;
             for r in 0..rows {
                 let row = &logits.data[r * cols..(r + 1) * cols];
                 let lse = log_sum_exp(row);
                 for c in 0..cols {
-                    loss -= labels.data[r * cols + c] * (row[c] - lse);
+                    loss -= labels[r * cols + c] * (row[c] - lse);
                 }
             }
             vec![loss / rows as f64]
@@ -582,13 +600,14 @@ pub(super) fn eval(node: &Node, ins: &[&Tensor]) -> Result<Vec<f64>, Error> {
             // (softmax · Σlabels − labels) / B
             let (logits, labels) = (arg(0)?, arg(1)?);
             let (rows, cols) = rows_cols(logits);
+            let labels = loss_labels(logits, labels);
             let softmax = softmax_rows(logits);
             let mut out = vec![0.0; logits.len()];
             for r in 0..rows {
-                let s: f64 = labels.data[r * cols..(r + 1) * cols].iter().sum();
+                let s: f64 = labels[r * cols..(r + 1) * cols].iter().sum();
                 for c in 0..cols {
                     let i = r * cols + c;
-                    out[i] = (softmax[i] * s - labels.data[i]) / rows as f64;
+                    out[i] = (softmax[i] * s - labels[i]) / rows as f64;
                 }
             }
             out
@@ -898,13 +917,14 @@ pub(super) fn magnitude(node: &Node, ins: &[&Tensor], out: &Tensor) -> Option<Ve
         Op::CrossEntropyLoss => {
             let (logits, labels) = (ins[0], ins[1]);
             let (rows, cols) = rows_cols(logits);
+            let labels = loss_labels(logits, labels);
             let mut total = 0.0;
             for r in 0..rows {
                 let row = &logits.data[r * cols..(r + 1) * cols];
                 let lse = log_sum_exp(row);
                 for c in 0..cols {
-                    total += (labels.data[r * cols + c] * (row[c] - lse)).abs()
-                        + (labels.data[r * cols + c] * lse).abs();
+                    total += (labels[r * cols + c] * (row[c] - lse)).abs()
+                        + (labels[r * cols + c] * lse).abs();
                 }
             }
             Some(vec![total / rows as f64])
@@ -913,16 +933,17 @@ pub(super) fn magnitude(node: &Node, ins: &[&Tensor], out: &Tensor) -> Option<Ve
         Op::CrossEntropyLogitsGrad => {
             let (logits, labels) = (ins[0], ins[1]);
             let (rows, cols) = rows_cols(logits);
+            let labels = loss_labels(logits, labels);
             let softmax = softmax_rows(logits);
             let mut m = vec![0.0; logits.len()];
             for r in 0..rows {
-                let s: f64 = labels.data[r * cols..(r + 1) * cols]
+                let s: f64 = labels[r * cols..(r + 1) * cols]
                     .iter()
                     .map(|v| v.abs())
                     .sum();
                 for c in 0..cols {
                     let i = r * cols + c;
-                    m[i] = (softmax[i] * s + labels.data[i].abs()) / rows as f64;
+                    m[i] = (softmax[i] * s + labels[i].abs()) / rows as f64;
                 }
             }
             Some(m)
