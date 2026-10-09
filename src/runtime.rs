@@ -1810,7 +1810,9 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::GeGLUConcat
         | ShaderEntry::GeGLUConcatGrad => BinaryData::layout(),
         ShaderEntry::SumAll | ShaderEntry::MeanAll | ShaderEntry::SumRows => UnaryData::layout(),
-        ShaderEntry::CrossEntropyLoss => CrossEntropyData::layout(),
+        ShaderEntry::CrossEntropyLoss | ShaderEntry::CrossEntropyLossIndices => {
+            CrossEntropyData::layout()
+        }
         ShaderEntry::BceLoss => BceData::layout(),
         ShaderEntry::Transpose => TransposeData::layout(),
         ShaderEntry::Embedding => EmbeddingData::layout(),

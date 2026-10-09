@@ -26,7 +26,7 @@ struct Params {
 }
 
 var<storage> logits: array<f32>;
-var<storage> labels: array<f32>;
+var<storage> labels: array<u32>;
 var<storage, read_write> grad_out: array<f32>;
 var<storage, read_write> loss_out: array<f32>;
 var<uniform> params: Params;
@@ -34,14 +34,11 @@ var<workgroup> wg_buf: array<f32, 256>;
 var<workgroup> wg_sum: array<f32, 256>;
 var<workgroup> wg_labels: array<f32, 256>;
 
-@compute @workgroup_size(256)
-fn main(
-    @builtin(workgroup_id) wgid: vec3<u32>,
-    @builtin(local_invocation_index) tid: u32,
-) {
-    let b = wgid.x;
+fn cross_entropy(b: u32, tid: u32, indexed: bool) {
     let features = params.features;
     let offset = b * features;
+    var index = 0u;
+    if indexed { index = labels[b]; }
 
     // === Pass 1: online max / sum-exp and Σ(labels) ===
     // Starting from -FLT_MAX rather than -inf keeps exp(x - max) defined
@@ -59,7 +56,9 @@ fn main(
         } else {
             local_sum += exp(x - local_max);
         }
-        local_label_sum += labels[offset + j];
+        if !indexed {
+            local_label_sum += bitcast<f32>(labels[offset + j]);
+        }
         j += 256u;
     }
     wg_buf[tid] = local_max;
@@ -79,7 +78,8 @@ fn main(
         workgroupBarrier();
     }
     let log_sum_exp = log(wg_sum[0]) + wg_buf[0];
-    let label_sum = wg_labels[0];
+    var label_sum = wg_labels[0];
+    if indexed { label_sum = select(0.0, 1.0, index < features); }
     workgroupBarrier();
 
     // === Pass 2: parallel gradient + partial loss ===
@@ -90,11 +90,25 @@ fn main(
         if j >= features { break; }
         let log_softmax = logits[offset + j] - log_sum_exp;
         let softmax = exp(log_softmax);
-        local_loss -= labels[offset + j] * log_softmax;
+        var label = select(0.0, 1.0, index == j);
+        if !indexed {
+            label = bitcast<f32>(labels[offset + j]);
+            local_loss -= label * log_softmax;
+        }
         if params.write_grad != 0u {
-            grad_out[offset + j] = (softmax * label_sum - labels[offset + j]) * inv_batch;
+            grad_out[offset + j] = (softmax * label_sum - label) * inv_batch;
         }
         j += 256u;
+    }
+
+    // An indexed row has one loss term; invalid indices contribute zero.
+    if indexed {
+        if tid == 0u {
+            var loss = 0.0;
+            if index < features { loss = log_sum_exp - logits[offset + index]; }
+            loss_out[b] = loss * inv_batch;
+        }
+        return;
     }
 
     // Reduce loss across threads
@@ -111,4 +125,21 @@ fn main(
     if tid == 0u {
         loss_out[b] = wg_buf[0] * inv_batch;
     }
+}
+
+// Separate entry points let the driver remove the unused label representation.
+@compute @workgroup_size(256)
+fn main(
+    @builtin(workgroup_id) wgid: vec3<u32>,
+    @builtin(local_invocation_index) tid: u32,
+) {
+    cross_entropy(wgid.x, tid, false);
+}
+
+@compute @workgroup_size(256)
+fn indexed(
+    @builtin(workgroup_id) wgid: vec3<u32>,
+    @builtin(local_invocation_index) tid: u32,
+) {
+    cross_entropy(wgid.x, tid, true);
 }

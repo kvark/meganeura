@@ -297,6 +297,7 @@ pub enum ShaderEntry {
     SumAll,
     MeanAll,
     CrossEntropyLoss,
+    CrossEntropyLossIndices,
     BceLoss,
     Transpose,
     /// RmsNorm with the consumer's residual add folded in. Selected by
@@ -482,6 +483,7 @@ impl ShaderEntry {
             ShaderEntry::SumAll
             | ShaderEntry::MeanAll
             | ShaderEntry::CrossEntropyLoss
+            | ShaderEntry::CrossEntropyLossIndices
             | ShaderEntry::BceLoss
             | ShaderEntry::RmsNormAdd
             | ShaderEntry::LayerNorm
@@ -583,7 +585,9 @@ impl ShaderEntry {
             ShaderEntry::ScatterAdd => ShaderGroup::ScatterAdd,
             ShaderEntry::ScatterAddAtomic => ShaderGroup::ScatterAddAtomic,
             ShaderEntry::SumAll | ShaderEntry::MeanAll => ShaderGroup::Reduce,
-            ShaderEntry::CrossEntropyLoss => ShaderGroup::CrossEntropy,
+            ShaderEntry::CrossEntropyLoss | ShaderEntry::CrossEntropyLossIndices => {
+                ShaderGroup::CrossEntropy
+            }
             ShaderEntry::BceLoss => ShaderGroup::BceLoss,
             ShaderEntry::Transpose => ShaderGroup::Transpose,
             ShaderEntry::RmsNormAdd => ShaderGroup::RmsNormAdd,
@@ -693,6 +697,7 @@ impl ShaderEntry {
             | ShaderEntry::CrossEntropyLoss
             | ShaderEntry::BceLoss
             | ShaderEntry::Transpose => "main",
+            ShaderEntry::CrossEntropyLossIndices => "indexed",
             ShaderEntry::SumAll => "sum_all",
             ShaderEntry::MeanAll => "mean_all",
             ShaderEntry::RmsNormAdd => "main",

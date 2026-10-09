@@ -1606,7 +1606,11 @@ impl<'a> Compiler<'a> {
                 };
                 let grad_buf = grad_buf.unwrap_or(partials);
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::CrossEntropyLoss,
+                    shader: if self.graph.node(node.inputs[1]).ty.dtype == DType::U32 {
+                        ShaderEntry::CrossEntropyLossIndices
+                    } else {
+                        ShaderEntry::CrossEntropyLoss
+                    },
                     workgroups: [batch, 1, 1],
                     input_buffers: vec![logits, labels],
                     output_buffer: grad_buf,

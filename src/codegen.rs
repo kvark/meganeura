@@ -3865,7 +3865,7 @@ mod tests {
                     vec!["indices", "src", "row_scale", "dst", "params"]
                 }
                 ShaderEntry::BceLoss => vec!["pred", "labels", "loss_out", "params"],
-                ShaderEntry::CrossEntropyLoss => {
+                ShaderEntry::CrossEntropyLoss | ShaderEntry::CrossEntropyLossIndices => {
                     vec!["logits", "labels", "grad_out", "loss_out", "params"]
                 }
                 ShaderEntry::Transpose => vec!["src", "dst", "params"],
@@ -4021,6 +4021,7 @@ mod tests {
             ShaderEntry::SumAll,
             ShaderEntry::MeanAll,
             ShaderEntry::CrossEntropyLoss,
+            ShaderEntry::CrossEntropyLossIndices,
             ShaderEntry::Transpose,
             ShaderEntry::Embedding,
             ShaderEntry::RoPE,
