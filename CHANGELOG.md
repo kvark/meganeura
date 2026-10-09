@@ -1,5 +1,15 @@
 # Unreleased
 
+- `Graph::gelu_erf`: the exact GELU, `x·(1 + erf(x/√2))/2`; `Graph::gelu`
+  stays the tanh approximation. The Whisper encoder and the `sd_unet`
+  feed-forward now use the exact form, so their outputs and benchmark
+  workloads change.
+- `normalize_inner_sum` computes as its decomposition does, forward and
+  gradient, so the fused and explicit graphs agree bit for bit on lavapipe
+  as well.
+- Tuning treats disjoint slices of one allocation as separate bindings,
+  and the cooperative probe at session start no longer reads mapped
+  memory back on the CPU.
 - Blade is pinned to `56f0565`. Vulkan devices with `shaderFloat16` but no
   f16 cooperative matrix (MI300X on RADV, lavapipe) now get the 16-bit
   storage features that f16 shaders declare, and descriptor sets are reused
