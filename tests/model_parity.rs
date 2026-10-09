@@ -189,6 +189,9 @@ fn recomposition_cost() {
         ("smollm2-135m forward", &forward, Mode::Inference),
         ("smollm2-135m training", &training, Mode::Training),
     ] {
+        // As in assert_parity: training recognizes only composites with
+        // exact gradients, so the others build as their primitives do.
+        let written = graph.decompose_for(mode);
         let decomposed = graph.decompose();
         let start = Instant::now();
         let _ = graph.recompose();
@@ -197,7 +200,7 @@ fn recomposition_cost() {
         let _ = decomposed.recompose();
         let from_primitives = start.elapsed();
         let start = Instant::now();
-        let original = plan(graph, mode);
+        let original = plan(&written, mode);
         let build = start.elapsed();
         let start = Instant::now();
         let rebuilt = plan(&decomposed, mode);
