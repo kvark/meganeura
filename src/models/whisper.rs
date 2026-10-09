@@ -73,7 +73,7 @@ pub fn build_encoder(g: &mut Graph, config: &Config, batch: u32, mel_len: u32) -
         0,
     );
     let x = g.add_per_channel(x, conv1_b, d as u32, mel_len);
-    let x = g.gelu(x);
+    let x = g.gelu_erf(x);
 
     // Conv2: (d_model → d_model, kernel=3, stride=2, padding=1 on H only)
     let seq_len = (mel_len + 2 - 3) / 2 + 1;
@@ -83,7 +83,7 @@ pub fn build_encoder(g: &mut Graph, config: &Config, batch: u32, mel_len: u32) -
         x, conv2_w, batch, d as u32, mel_len, 1, d as u32, 3, 1, 2, 1, 0,
     );
     let x = g.add_per_channel(x, conv2_b, d as u32, seq_len);
-    let x = g.gelu(x);
+    let x = g.gelu_erf(x);
 
     // The conv output is [batch * d_model * seq_len] in NCHW(flat).
     // We need it as [batch * seq_len, d_model] for the transformer.
@@ -150,7 +150,7 @@ pub fn build_encoder(g: &mut Graph, config: &Config, batch: u32, mel_len: u32) -
         let ff1_b = g.parameter(&format!("{lname}.fc1.bias"), &[config.ffn_dim]);
         let h = g.matmul(h, ff1_w);
         let h = g.bias_add(h, ff1_b);
-        let h = g.gelu(h);
+        let h = g.gelu_erf(h);
 
         let ff2_w = g.parameter(&format!("{lname}.fc2.weight"), &[config.ffn_dim, d]);
         let ff2_b = g.parameter(&format!("{lname}.fc2.bias"), &[d]);
