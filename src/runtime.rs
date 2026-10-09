@@ -1193,6 +1193,12 @@ fn create_profiled_pipeline(
 }
 
 impl Pipelines {
+    fn destroy(&mut self, gpu: &Gpu) {
+        for (_, mut pipeline) in self.map.drain() {
+            gpu.destroy_compute_pipeline(&mut pipeline);
+        }
+    }
+
     fn new(
         gpu: &Gpu,
         plan: &ExecutionPlan,
@@ -4185,7 +4191,7 @@ mod variant_tests {
         };
         select_variants(&mut demoted, None, false, false);
         assert!(demoted.dispatches[0].use_small_tiles());
-        let pipelines = Pipelines::new(&gpu, &demoted, None, None);
+        let mut pipelines = Pipelines::new(&gpu, &demoted, None, None);
         assert!(
             pipelines
                 .map
@@ -4199,6 +4205,7 @@ mod variant_tests {
                 .contains_key(&Variant::SmallTile(ShaderEntry::MatMul)),
             "no dispatch can select SmallTile here, so it must not be built"
         );
+        pipelines.destroy(&gpu);
 
         // Q4 matmul + relu: reduced-storage weights, now fused.
         let mut weighted = {
@@ -4215,7 +4222,7 @@ mod variant_tests {
             weighted.dispatches[0].weight_format,
             crate::compile::WeightFormat::Q4
         );
-        let pipelines = Pipelines::new(&gpu, &weighted, None, None);
+        let mut pipelines = Pipelines::new(&gpu, &weighted, None, None);
         assert!(
             !pipelines.map.contains_key(&Variant::Weight(
                 ShaderEntry::MatMul,
@@ -4223,6 +4230,7 @@ mod variant_tests {
             )),
             "no dispatch can select the plain weighted kernel here"
         );
+        pipelines.destroy(&gpu);
     }
 
     /// A fused epilogue must not keep a matmul on 64×64 geometry once the
@@ -5550,9 +5558,7 @@ impl Drop for Session {
         if let Some(staging) = self.readback.get_mut().staging.take() {
             self.gpu.destroy_buffer(staging.buffer);
         }
-        for pipeline in self.pipelines.map.values_mut() {
-            self.gpu.destroy_compute_pipeline(pipeline);
-        }
+        self.pipelines.destroy(&self.gpu);
         // `buffers` holds aliased copies of these handles; destroy each
         // physical allocation exactly once.
         if let Some((ref m, ref v)) = self.adam_state {
