@@ -103,7 +103,9 @@ fn run_case(
         .position(|d| {
             matches!(
                 d.shader,
-                ShaderEntry::Conv2dGradWeightGemm | ShaderEntry::Conv2dGradWeightGemmSmall
+                ShaderEntry::Conv2dGradWeightGemm
+                    | ShaderEntry::Conv2dGradWeightGemmSmall
+                    | ShaderEntry::Conv2dGradWeightGemm16
             )
         })
         .ok_or("missing scalar dW")?;
