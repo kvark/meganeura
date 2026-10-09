@@ -115,7 +115,10 @@ impl Problem {
                 .as_ref()
                 .is_some_and(|epilogue| !epilogue.inputs.is_empty()),
             pinned: dispatch.scalar_matmul().is_some()
-                || matches!(dispatch.kernel, Kernel::SplitMatmul { .. }),
+                || matches!(
+                    dispatch.kernel,
+                    Kernel::SplitMatmul { .. } | Kernel::CooperativeSplit { .. }
+                ),
             compiled_workgroups: dispatch.workgroups.iter().product(),
         })
     }
