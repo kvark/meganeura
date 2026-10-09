@@ -982,6 +982,12 @@ fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
 /// implementation once; preparation builds exactly the selected pipeline.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Variant {
+    CoopTiled(
+        ShaderEntry,
+        crate::codegen::CooperativeMatmulShape,
+        u32,
+        Vec<crate::compile::PrologueLoadKind>,
+    ),
     CoopSplit(ShaderEntry, u32, Vec<crate::compile::PrologueLoadKind>),
     SplitMatmul(
         ShaderEntry,
@@ -1083,6 +1089,7 @@ impl Variant {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
             Variant::Attention(ref e, _, _)
             | Variant::CoopSplit(ref e, _, _)
+            | Variant::CoopTiled(ref e, _, _, _)
             | Variant::SplitMatmul(ref e, _, _, _)
             | Variant::SpecializedConv(ref e, _, _)
             | Variant::ScalarMatmul(ref e, _, _)
@@ -1106,6 +1113,9 @@ impl Variant {
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
+            Variant::CoopTiled(ref e, shape, splits, ref prologue) => {
+                format!("{e:?}:native-f32-tiled-{shape:?}-split-k-{splits}:{prologue:?}")
+            }
             Variant::CoopSplit(ref e, splits, ref prologue) => {
                 format!("{e:?}:native-f32-split-k-{splits}:{prologue:?}")
             }
@@ -1275,6 +1285,35 @@ impl Pipelines {
         let cooperative =
             || *coop_config.expect("cooperative dispatch needs a qualified device configuration");
         let module = match key {
+            Variant::CoopTiled(_, shape, splits, _) => {
+                let config = cooperative();
+                if config.tile_size != 16 || config.use_f16_input || config.compensated {
+                    return Err("tiled cooperative matmul requires native 16x16 f32".to_owned());
+                }
+                if !dispatch
+                    .mnk()
+                    .is_some_and(|(m, n, k)| shape.fits_dimensions(m, n, k))
+                {
+                    return Err(
+                        "tiled cooperative matmul requires complete aligned tiles".to_owned()
+                    );
+                }
+                let shared_limit = gpu.capabilities().max_compute_shared_memory_size;
+                if shared_limit != 0
+                    && tiled_coop_shared_bytes(dispatch, shape) > u64::from(shared_limit)
+                {
+                    return Err("tiled cooperative matmul exceeds device shared memory".to_owned());
+                }
+                if let Some(ref prologue) = dispatch.matmul_prologue {
+                    layout = matmul_with_prologue_layout(prologue.factors.len());
+                }
+                crate::codegen::generate_tiled_coop_matmul(
+                    group,
+                    shape,
+                    splits,
+                    dispatch.matmul_prologue.as_ref(),
+                )
+            }
             Variant::CoopSplit(_, splits, _) => {
                 if let Some(ref prologue) = dispatch.matmul_prologue {
                     layout = matmul_with_prologue_layout(prologue.factors.len());
@@ -1457,6 +1496,18 @@ impl Pipelines {
     /// which unrelated pipelines happen to have been compiled.
     fn key(dispatch: &Dispatch) -> Variant {
         let entry = dispatch.shader.clone();
+        if let crate::compile::Kernel::CooperativeTiled { shape, splits } = dispatch.kernel {
+            return Variant::CoopTiled(
+                entry,
+                shape,
+                splits,
+                dispatch
+                    .matmul_prologue
+                    .as_ref()
+                    .map(|p| p.factors.iter().map(|f| f.1.clone()).collect())
+                    .unwrap_or_default(),
+            );
+        }
         if let crate::compile::Kernel::CooperativeSplit { splits } = dispatch.kernel {
             return Variant::CoopSplit(
                 entry,
@@ -1972,6 +2023,19 @@ fn record_groups(
 
 // ---- Session ----
 
+fn tiled_coop_shared_bytes(
+    dispatch: &Dispatch,
+    shape: crate::codegen::CooperativeMatmulShape,
+) -> u64 {
+    let row_factors = dispatch.matmul_prologue.as_ref().map_or(0, |p| {
+        p.factors
+            .iter()
+            .filter(|f| f.1 == crate::compile::PrologueLoadKind::PerRow)
+            .count()
+    });
+    u64::from(shape.shared_bytes()) + row_factors as u64 * 64 * 4
+}
+
 /// A compiled, ready-to-execute GPU session.
 ///
 /// Holds all blade-graphics resources: context, buffers, pipelines.
@@ -2003,15 +2067,36 @@ pub(crate) fn select_variants(
         crate::compile::fuse_rmsnorm_into_add(plan);
         crate::compile::fuse_rmsnorm_into_gemv(plan);
     }
-    // A 32x32 native f32 tile has only one wave on CDNA. Skinny products
-    // leave most SIMD slots empty unless K contributes independent work.
-    // Keep this preference confined to the qualified native 16x16 path.
+    // Aligned native-f32 products share larger tiles between four subgroups.
+    // Aim for 512 independent workgroups, using K partitions only when the
+    // output supplies fewer. Keep small, ragged, pinned and fused-epilogue
+    // forms on their existing paths; tuning can challenge unsplit choices.
     if coop_config.is_some_and(|c| c.tile_size == 16 && !c.use_f16_input && !c.compensated) {
         for index in (0..plan.dispatches.len()).rev() {
             let dispatch = &plan.dispatches[index];
-            let Some((_, _, k)) = dispatch.mnk() else {
+            let Some((m, n, k)) = dispatch.mnk() else {
                 continue;
             };
+            let shape = crate::codegen::CooperativeMatmulShape {
+                columns: 128,
+                k_stage: 16,
+                prefetch: false,
+            };
+            if k >= 1024
+                && u64::from(m) * u64::from(n) >= 131072
+                && shape.fits_dimensions(m, n, k)
+                && tiled_coop_shared_bytes(dispatch, shape) <= 16 * 1024
+            {
+                let groups = (u64::from(m) / 64) * (u64::from(n) / 128);
+                let splits = (512u64.div_ceil(groups) as u32).next_power_of_two().min(16);
+                if plan
+                    .tile_native_f32_matmul(index, shape, splits, 32 * 1024 * 1024)
+                    .is_ok()
+                {
+                    continue;
+                }
+            }
+            let dispatch = &plan.dispatches[index];
             let groups = u64::from(dispatch.workgroups[0]) * u64::from(dispatch.workgroups[1]);
             if k >= 2048 && groups <= 512 {
                 let splits = if k >= 4096 { 16 } else { 8 };
@@ -2145,6 +2230,75 @@ mod block_matmul_variant_tests {
                 assert_eq!(serial.use_small_tiles(), grouped.use_small_tiles());
                 assert_eq!(serial.workgroups[..2], grouped.workgroups[..2]);
                 assert_eq!(grouped.workgroups[2], 8);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tiled_cooperative_policy_tests {
+    use super::select_variants;
+    use crate::{
+        Graph,
+        codegen::CoopConfig,
+        compile::{self, Kernel},
+    };
+
+    #[test]
+    fn measured_aligned_products_select_bounded_tiles_and_keep_fallbacks() {
+        let config = CoopConfig {
+            tile_size: 16,
+            use_f16_input: false,
+            compensated: false,
+        };
+        // Dimensions are M,N,K. These include independent qualification shapes.
+        for (m, n, k, expected) in [
+            (128, 2048, 2048, Some(16)),
+            (128, 2048, 8192, Some(16)),
+            (128, 16384, 2048, Some(2)),
+            (2048, 2048, 2048, Some(1)),
+            (64, 2048, 4096, Some(16)),
+            (256, 2048, 2048, Some(8)),
+            (128, 4096, 2048, Some(8)),
+            (64, 8192, 2048, Some(8)),
+            (128, 2048, 2044, None),
+            (96, 2048, 2048, None),
+            (128, 2064, 2048, None),
+            (64, 256, 2048, None),
+        ] {
+            let mut graph = Graph::new();
+            let a = graph.input("a", &[m, k]);
+            let b = graph.input("b", &[k, n]);
+            let y = graph.matmul(a, b);
+            graph.set_outputs(vec![y]);
+            let mut plan = compile::compile(&graph);
+            let original = plan.clone();
+            select_variants(&mut plan, Some(&config), false, false);
+            let tiled = plan.dispatches.iter().find_map(|d| match d.kernel {
+                Kernel::CooperativeTiled { shape, splits } => {
+                    assert_eq!(
+                        d.workgroups,
+                        [m as u32 / 64, n as u32 / shape.columns, splits]
+                    );
+                    assert_eq!(
+                        (shape.columns, shape.k_stage, shape.prefetch),
+                        (128, 16, false)
+                    );
+                    Some(splits)
+                }
+                _ => None,
+            });
+            assert_eq!(tiled, expected, "{m}x{n}x{k}");
+            assert_eq!(plan.output_buffers, original.output_buffers);
+            if let Some(splits) = expected {
+                assert_eq!(plan.dispatches.len(), if splits == 1 { 1 } else { 2 });
+                assert_eq!(
+                    plan.buffers.len(),
+                    original.buffers.len() + usize::from(splits > 1)
+                );
+                if splits > 1 {
+                    assert!(*plan.buffers.last().unwrap() <= 32 * 1024 * 1024);
+                }
             }
         }
     }

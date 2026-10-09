@@ -117,7 +117,9 @@ impl Problem {
             pinned: dispatch.scalar_matmul().is_some()
                 || matches!(
                     dispatch.kernel,
-                    Kernel::SplitMatmul { .. } | Kernel::CooperativeSplit { .. }
+                    Kernel::SplitMatmul { .. }
+                        | Kernel::CooperativeSplit { .. }
+                        | Kernel::CooperativeTiled { .. }
                 ),
             compiled_workgroups: dispatch.workgroups.iter().product(),
         })
