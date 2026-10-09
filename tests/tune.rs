@@ -654,12 +654,123 @@ fn tune_tiled_native_f32() {
         let tiled: Vec<_> = report
             .outcomes
             .iter()
-            .filter(|o| matches!(o.candidate, MatmulTile::CooperativeTiled(_)))
+            .filter(|o| matches!(o.candidate, MatmulTile::CooperativeTiled { .. }))
             .collect();
         assert_eq!(tiled.len(), 8, "{report:?}");
         for outcome in tiled {
             assert!(outcome.qualified, "{outcome:?}");
             assert!(outcome.candidate_median_ms.unwrap() > 0.0);
+        }
+    }
+}
+
+#[test]
+#[ignore = "GPU tuning requires native 16x16 f32 matrices and an idle device"]
+fn tune_split_native_f32_sequences() {
+    use meganeura::compile::{Kernel, ShaderEntry};
+    let gpu = crate::support::gpu::gpu();
+    assert!(
+        gpu.capabilities()
+            .cooperative_matrix
+            .f32_shapes
+            .contains(&[16, 16, 16])
+    );
+    let (m, n, k) = (64, 256, 2048);
+    for shader in [
+        ShaderEntry::MatMul,
+        ShaderEntry::MatMulAT,
+        ShaderEntry::MatMulBT,
+        ShaderEntry::FusedMatMulAdd,
+    ] {
+        let graph = matmul_graph(&shader, m, n, k);
+        let (mut session, _) = build(
+            &graph,
+            SessionConfig {
+                gpu: Some(gpu.clone()),
+                mode: Mode::Inference,
+                tune: false,
+                runtime: SessionOptions {
+                    coop: CoopPolicy::NativeF32,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let report = session
+            .tune_with(TuneOptions {
+                max_time: Duration::from_secs(60),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(report.visited_classes, 1, "{shader:?}: {report:?}");
+        // Other shapes at the selected count and fewer partitions, all
+        // measured as complete sequences with their SumRows.
+        assert!(report.outcomes.iter().any(|o| matches!(
+            o.candidate,
+            MatmulTile::CooperativeTiled { splits: 2..8, .. }
+        )));
+        for outcome in &report.outcomes {
+            assert!(outcome.qualified, "{shader:?}: {outcome:?}");
+            assert!(matches!(
+                outcome.candidate,
+                MatmulTile::CooperativeTiled { splits: 2.., .. }
+            ));
+        }
+        // Whichever won, the product and its sum agree and compute it.
+        let dispatches = &session.plan().dispatches;
+        let splits = dispatches
+            .iter()
+            .find_map(|d| match d.kernel {
+                Kernel::CooperativeTiled { splits, .. } => Some(splits),
+                _ => None,
+            })
+            .unwrap();
+        let sum = dispatches
+            .iter()
+            .find(|d| d.shader == ShaderEntry::SumRows)
+            .unwrap();
+        assert_eq!(sum.params[0], splits, "{shader:?}");
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 17 % 101) as f32 - 50.0) * 0.01)
+            .collect();
+        let b: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 31 % 97) as f32 - 48.0) * 0.01)
+            .collect();
+        let addend: Vec<f32> = (0..m * n).map(|i| (i % 7) as f32 * 0.5).collect();
+        session.set_input("a", &a);
+        session.set_input("b", &b);
+        if shader == ShaderEntry::FusedMatMulAdd {
+            session.set_input("addend", &addend);
+        }
+        session.step();
+        session.wait();
+        let got = session.read_output(m * n);
+        for row in 0..m {
+            for col in 0..n {
+                let mut expected = if shader == ShaderEntry::FusedMatMulAdd {
+                    f64::from(addend[row * n + col])
+                } else {
+                    0.0
+                };
+                for inner in 0..k {
+                    let ai = if shader == ShaderEntry::MatMulAT {
+                        inner * m + row
+                    } else {
+                        row * k + inner
+                    };
+                    let bi = if shader == ShaderEntry::MatMulBT {
+                        col * k + inner
+                    } else {
+                        inner * n + col
+                    };
+                    expected += f64::from(a[ai]) * f64::from(b[bi]);
+                }
+                let actual = f64::from(got[row * n + col]);
+                assert!(
+                    (actual - expected).abs() <= 1e-4 * (1.0 + expected.abs()),
+                    "{shader:?} [{row}, {col}]: {actual} != {expected}"
+                );
+            }
         }
     }
 }

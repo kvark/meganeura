@@ -18,6 +18,19 @@ impl CooperativeMatmulShape {
         matches!(self.columns, 64 | 128) && matches!(self.k_stage, 16 | 32)
     }
 
+    /// Every legal shape, in the order tuning challenges them.
+    pub fn all() -> impl Iterator<Item = Self> {
+        [64, 128].into_iter().flat_map(|columns| {
+            [16, 32].into_iter().flat_map(move |k_stage| {
+                [false, true].map(move |prefetch| Self {
+                    columns,
+                    k_stage,
+                    prefetch,
+                })
+            })
+        })
+    }
+
     pub fn fits_dimensions(self, m: u32, n: u32, k: u32) -> bool {
         self.legal()
             && m != 0
