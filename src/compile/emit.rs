@@ -22,6 +22,7 @@ impl<'a> Compiler<'a> {
                 param_buffers: vec![],
                 param_types: HashMap::new(),
                 input_buffers: Vec::new(),
+                input_types: HashMap::new(),
                 constant_buffers: Vec::new(),
                 dispatches: Vec::new(),
                 groups: Vec::new(),
@@ -549,6 +550,7 @@ impl<'a> Compiler<'a> {
                 }
                 Op::Input { ref name } => {
                     self.plan.input_buffers.push((name.clone(), buf));
+                    self.plan.input_types.insert(buf, node.ty.clone());
                 }
                 Op::Constant { .. } => {}
                 Op::MultiHeadAttnGradV { fwd_node, .. } => {

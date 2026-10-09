@@ -680,6 +680,7 @@ mod tests {
             param_buffers: Vec::new(),
             param_types: Default::default(),
             input_buffers: Vec::new(),
+            input_types: Default::default(),
             constant_buffers: Vec::new(),
             dispatches,
             groups: Vec::new(),
