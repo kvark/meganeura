@@ -182,7 +182,7 @@ fn run_case(
             // the retained step's wall timer.
             if preparations != 0 {
                 let state = snapshot(session, case);
-                let comparison = compare("profiled", (preparations - 1) as u32, &reference, &state);
+                let comparison = compare("profiled", 0, &reference, &state);
                 valid &= comparison.passed;
                 comparisons.push(comparison);
             }
@@ -208,7 +208,7 @@ fn run_case(
         }
     };
     let state = snapshot(&mut session, case);
-    let comparison = compare("profiled", (preparations - 1) as u32, &reference, &state);
+    let comparison = compare("profiled", 0, &reference, &state);
     valid &= comparison.passed;
     comparisons.push(comparison);
     assert_eq!(preparations, PROFILE_SAMPLES);
@@ -234,10 +234,10 @@ fn run_case(
         .iter()
         .filter(|(key, _)| key.as_str() != "process_api_sample")
         .all(|(key, value)| value == &record["final_memory"][key]);
+    // Auxiliary bytes depend on the plan's clip slots; same_memory checks them.
     let no_update_state = ["adam_bytes", "accumulator_bytes"]
         .iter()
-        .all(|key| record["final_memory"][key] == 0)
-        && record["final_memory"]["auxiliary_bytes"] == 4;
+        .all(|key| record["final_memory"][key] == 0);
     valid &= same_memory && no_update_state;
     record["same_memory"] = json!(same_memory);
     record["host_finish"] = host_sample();
@@ -386,6 +386,7 @@ mod tests {
         );
         for case in profile_cases() {
             let (mut session, _) = make_session_with(&case, &gpu, profile_runtime_options());
+            let initial_aux_bytes = session.memory_summary().optimizer_aux_bytes;
             advance(&mut session, 3);
             let reference = snapshot(&mut session, &case);
             let mut preparations = 0;
@@ -414,7 +415,7 @@ mod tests {
             assert_eq!(preparations, 2);
             assert_eq!(profile.plan.dispatch_count, session.plan().dispatches.len());
             assert_eq!(profile.plan.adam_state_bytes, 0);
-            assert_eq!(profile.plan.optimizer_aux_bytes, 4);
+            assert_eq!(profile.plan.optimizer_aux_bytes, initial_aux_bytes);
             assert!(
                 profile
                     .dispatches
