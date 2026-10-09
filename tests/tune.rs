@@ -612,3 +612,54 @@ fn tune_native_cooperative_f32() {
         }
     }
 }
+
+#[test]
+#[ignore = "GPU tuning requires native 16x16 f32 matrices and an idle device"]
+fn tune_tiled_native_f32() {
+    use meganeura::compile::ShaderEntry;
+    let gpu = crate::support::gpu::gpu();
+    assert!(
+        gpu.capabilities()
+            .cooperative_matrix
+            .f32_shapes
+            .contains(&[16, 16, 16])
+    );
+    for shader in [
+        ShaderEntry::MatMul,
+        ShaderEntry::MatMulAT,
+        ShaderEntry::MatMulBT,
+        ShaderEntry::FusedMatMulAdd,
+    ] {
+        let graph = matmul_graph(&shader, 64, 128, 96);
+        let (mut session, _) = build(
+            &graph,
+            SessionConfig {
+                gpu: Some(gpu.clone()),
+                mode: Mode::Inference,
+                tune: false,
+                runtime: SessionOptions {
+                    coop: CoopPolicy::NativeF32,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let report = session
+            .tune_with(TuneOptions {
+                max_time: Duration::from_secs(60),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(report.visited_classes, 1, "{report:?}");
+        let tiled: Vec<_> = report
+            .outcomes
+            .iter()
+            .filter(|o| matches!(o.candidate, MatmulTile::CooperativeTiled(_)))
+            .collect();
+        assert_eq!(tiled.len(), 8, "{report:?}");
+        for outcome in tiled {
+            assert!(outcome.qualified, "{outcome:?}");
+            assert!(outcome.candidate_median_ms.unwrap() > 0.0);
+        }
+    }
+}

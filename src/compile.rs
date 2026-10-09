@@ -1181,6 +1181,12 @@ pub enum Kernel {
     CooperativeSplit {
         splits: u32,
     },
+    /// Four subgroup tiles sharing aligned native-f32 operands. More than
+    /// one K partition requires a following SumRows dispatch.
+    CooperativeTiled {
+        shape: crate::codegen::CooperativeMatmulShape,
+        splits: u32,
+    },
     /// Experimental f16 hi/lo staging, not a full-range f32 implementation.
     CooperativeCompensated,
     Gemv {
@@ -1224,7 +1230,10 @@ impl Dispatch {
     pub fn use_coop(&self) -> bool {
         matches!(
             self.kernel,
-            Kernel::Cooperative | Kernel::CooperativeCompensated | Kernel::CooperativeSplit { .. }
+            Kernel::Cooperative
+                | Kernel::CooperativeCompensated
+                | Kernel::CooperativeSplit { .. }
+                | Kernel::CooperativeTiled { .. }
         )
     }
 

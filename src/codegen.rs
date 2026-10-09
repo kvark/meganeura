@@ -10,6 +10,9 @@
 use crate::compile::WeightFormat;
 use naga::Module;
 
+mod coop_tiled;
+pub use coop_tiled::{CooperativeMatmulShape, generate_tiled_coop_matmul};
+
 /// Forward attention staging and lane layout, independent of the EPT cap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FlashAttentionShape {

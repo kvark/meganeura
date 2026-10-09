@@ -11,6 +11,26 @@ impl ExecutionPlan {
         splits: u32,
         max_partial_bytes: usize,
     ) -> Result<(), TuneError> {
+        self.configure_native_f32_matmul(index, None, splits, max_partial_bytes)
+    }
+
+    pub(crate) fn tile_native_f32_matmul(
+        &mut self,
+        index: usize,
+        shape: crate::codegen::CooperativeMatmulShape,
+        splits: u32,
+        max_partial_bytes: usize,
+    ) -> Result<(), TuneError> {
+        self.configure_native_f32_matmul(index, Some(shape), splits, max_partial_bytes)
+    }
+
+    fn configure_native_f32_matmul(
+        &mut self,
+        index: usize,
+        shape: Option<crate::codegen::CooperativeMatmulShape>,
+        splits: u32,
+        max_partial_bytes: usize,
+    ) -> Result<(), TuneError> {
         let dispatch = self
             .dispatches
             .get(index)
@@ -33,13 +53,17 @@ impl ExecutionPlan {
             return Err(TuneError("split-K prologue with addend is unsupported"));
         }
         let (m, n, k) = dispatch.mnk().ok_or(TuneError("not a dense product"))?;
+        let (rows, cols, stage) = shape.map_or((32, 32, 16), |s| (64, s.columns, s.k_stage));
+        if shape.is_some_and(|s| !s.fits_dimensions(m, n, k)) {
+            return Err(TuneError("tiled native f32 needs aligned complete tiles"));
+        }
         if m == 0
             || n == 0
             || !m.is_multiple_of(32)
             || !n.is_multiple_of(32)
-            || !(2..=65535).contains(&splits)
-            || splits > k / 16
-            || k.checked_add(15 + splits * 16).is_none()
+            || !(if shape.is_some() { 1 } else { 2 }..=65535).contains(&splits)
+            || splits > k / stage
+            || k.checked_add(stage - 1 + splits * stage).is_none()
         {
             return Err(TuneError(
                 "split-K needs full output tiles and enough K tiles",
@@ -71,8 +95,17 @@ impl ExecutionPlan {
         {
             return Err(TuneError("split-K binding capacity is too small"));
         }
-        if columns.div_ceil(256) > 65535 || m / 32 > 65535 || n / 32 > 65535 {
+        if columns.div_ceil(256) > 65535 || m / rows > 65535 || n / cols > 65535 {
             return Err(TuneError("split-K grid exceeds dispatch limits"));
+        }
+        let mut producer = dispatch.clone();
+        producer.kernel = shape.map_or(super::Kernel::CooperativeSplit { splits }, |shape| {
+            super::Kernel::CooperativeTiled { shape, splits }
+        });
+        producer.workgroups = [m / rows, n / cols, splits];
+        if splits == 1 {
+            self.dispatches[index] = producer;
+            return Ok(());
         }
         let bytes = columns
             .checked_mul(splits)
@@ -82,10 +115,7 @@ impl ExecutionPlan {
         let partial = BufferRef(
             u32::try_from(self.buffers.len()).map_err(|_| TuneError("too many buffers"))?,
         );
-        let mut producer = dispatch.clone();
-        producer.kernel = super::Kernel::CooperativeSplit { splits };
         producer.output_buffer = partial;
-        producer.workgroups = [m / 32, n / 32, splits];
         producer.label = format!("{} native-f32 split-K {splits}", dispatch.label);
         let reduction = Dispatch {
             shader: ShaderEntry::SumRows,
@@ -357,6 +387,224 @@ impl ExecutionPlan {
 mod tests {
     use super::*;
     use crate::Graph;
+
+    #[test]
+    fn tiled_native_preflight_and_single_dispatch_tuning() {
+        use crate::codegen::{CoopConfig, CooperativeMatmulShape};
+        let mut graph = Graph::new();
+        let a = graph.input("a", &[128, 256]);
+        let b = graph.input("b", &[256, 256]);
+        let y = graph.matmul(a, b);
+        graph.set_outputs(vec![y]);
+        let mut base = super::super::compile(&graph);
+        base.dispatches[0].kernel = super::super::Kernel::Cooperative;
+        let shape = CooperativeMatmulShape {
+            columns: 128,
+            k_stage: 16,
+            prefetch: false,
+        };
+        for case in 0..8 {
+            let mut plan = base.clone();
+            let mut candidate = shape;
+            let mut budget = usize::MAX;
+            match case {
+                0 => candidate.columns = 0,
+                1 => candidate.k_stage = 64,
+                2 => plan.dispatches[0].params[0] = 96,
+                3 => plan.dispatches[0].params[1] = 252,
+                4 => plan.dispatches[0].params[2] = 192,
+                5 => plan.dispatches[0].schedule_locked = true,
+                6 => budget = 128 * 256 * 4 * 4 - 1,
+                7 => {
+                    let b = plan.dispatches[0].input_buffers[1];
+                    plan.buffers[b.0 as usize] -= 4;
+                }
+                _ => unreachable!(),
+            }
+            let before = plan.clone();
+            assert!(
+                plan.tile_native_f32_matmul(0, candidate, 4, budget)
+                    .is_err()
+            );
+            assert_eq!(plan, before);
+        }
+        for splits in [1, 4] {
+            let mut plan = base.clone();
+            plan.tile_native_f32_matmul(0, shape, splits, usize::MAX)
+                .unwrap();
+            assert_eq!(plan.dispatches[0].workgroups, [2, 2, splits]);
+            assert_eq!(plan.output_buffers, base.output_buffers);
+            let config = CoopConfig {
+                tile_size: 16,
+                use_f16_input: false,
+                compensated: false,
+            };
+            assert_eq!(
+                TuneClass::from_dispatch(&plan.dispatches[0], Some(&config)).is_some(),
+                splits == 1
+            );
+            if splits == 1 {
+                assert_eq!(plan.buffers, base.buffers);
+                let mut class =
+                    TuneClass::from_dispatch(&plan.dispatches[0], Some(&config)).unwrap();
+                class.binding_bytes = plan.dispatches[0]
+                    .input_buffers
+                    .iter()
+                    .chain(std::iter::once(&plan.dispatches[0].output_buffer))
+                    .map(|b| plan.buffers[b.0 as usize])
+                    .collect();
+                let selected = MatmulTile::CooperativeTiled(shape);
+                assert!(selected.fits(&class));
+                assert!(
+                    class
+                        .challengers(selected, Some(&config))
+                        .iter()
+                        .any(|c| matches!(c, MatmulTile::CooperativeF32 { .. }))
+                );
+            } else {
+                super::super::schedule_dispatches(&mut plan, false, true);
+                assert_eq!(plan.groups, [0..1, 1..2]);
+            }
+            let decoded: ExecutionPlan =
+                serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+            assert_eq!(decoded, plan);
+        }
+    }
+
+    #[test]
+    fn tiled_native_f32_covers_transposes_prologues_and_empty_partitions() {
+        use super::super::{Kernel, MatMulPrologue, PrologueLoadKind};
+        use crate::codegen::CooperativeMatmulShape;
+        let gpu = crate::reference::gpu::shared_context();
+        if !gpu
+            .capabilities()
+            .cooperative_matrix
+            .f32_shapes
+            .contains(&[16, 16, 16])
+        {
+            return;
+        }
+        for columns in [64, 128] {
+            for k_stage in [16, 32] {
+                let (m, n, k) = (64usize, 128usize, k_stage as usize * 5);
+                for transpose in 0..3 {
+                    for fusion in 0..3 {
+                        let mut graph = Graph::new();
+                        let a = graph.input("a", &if transpose == 1 { [k, m] } else { [m, k] });
+                        let b = graph.input("b", &if transpose == 2 { [n, k] } else { [k, n] });
+                        let y = match transpose {
+                            1 => graph.matmul_at(a, b),
+                            2 => graph.matmul_bt(a, b),
+                            _ => graph.matmul(a, b),
+                        };
+                        let y = if fusion == 1 {
+                            let src = graph.input("src", &[m, n]);
+                            graph.add(y, src)
+                        } else {
+                            y
+                        };
+                        graph.set_outputs(vec![y]);
+                        let mut base = super::super::compile(&crate::optimize::optimize(&graph));
+                        assert_eq!(base.dispatches.len(), 1);
+                        base.dispatches[0].kernel = Kernel::Cooperative;
+                        base.dispatches[0].workgroups = [m as u32 / 32, n as u32 / 32, 1];
+                        if fusion == 2 {
+                            let mut factors = Vec::new();
+                            for (name, count, kind) in [
+                                ("row", m, PrologueLoadKind::PerRow),
+                                ("col", k, PrologueLoadKind::PerKCol),
+                            ] {
+                                let buffer = BufferRef(base.buffers.len() as u32);
+                                base.buffers.push(count * 4);
+                                base.input_buffers.push((name.to_owned(), buffer));
+                                base.dispatches[0].input_buffers.push(buffer);
+                                factors.push((buffer, kind));
+                            }
+                            base.dispatches[0].matmul_prologue = Some(MatMulPrologue { factors });
+                        }
+                        let a: Vec<_> = (0..m * k)
+                            .map(|i| ((i * 17 % 101) as f32 - 50.0) * 1e-12)
+                            .collect();
+                        let b: Vec<_> = (0..k * n)
+                            .map(|i| ((i * 31 % 97) as f32 - 48.0) * 1e5)
+                            .collect();
+                        let src: Vec<_> = (0..m * n)
+                            .map(|i| ((i * 7 % 31) as f32 - 15.0) * 0.001)
+                            .collect();
+                        let row: Vec<_> = (0..m).map(|i| 0.5 + i as f32 * 0.01).collect();
+                        let col: Vec<_> = (0..k).map(|i| 0.75 + i as f32 * 0.002).collect();
+                        let mut expected = vec![0.0f64; m * n];
+                        for r in 0..m {
+                            for c in 0..n {
+                                let mut value = if fusion == 1 {
+                                    f64::from(src[r * n + c])
+                                } else {
+                                    0.0
+                                };
+                                for j in 0..k {
+                                    let ai = if transpose == 1 { j * m + r } else { r * k + j };
+                                    let bi = if transpose == 2 { c * k + j } else { j * n + c };
+                                    let av = if fusion == 2 {
+                                        a[ai] * row[r] * col[j]
+                                    } else {
+                                        a[ai]
+                                    };
+                                    value += f64::from(av) * f64::from(b[bi]);
+                                }
+                                expected[r * n + c] = value;
+                            }
+                        }
+                        for prefetch in [false, true] {
+                            for splits in [1, 4] {
+                                let shape = CooperativeMatmulShape {
+                                    columns,
+                                    k_stage,
+                                    prefetch,
+                                };
+                                let mut plan = base.clone();
+                                plan.tile_native_f32_matmul(0, shape, splits, usize::MAX)
+                                    .unwrap();
+                                let mut session = crate::Session::with_context_opts(
+                                    plan,
+                                    gpu.clone(),
+                                    crate::SessionOptions {
+                                        coop: crate::CoopPolicy::NativeF32,
+                                        ..Default::default()
+                                    },
+                                );
+                                session.set_input("a", &a);
+                                session.set_input("b", &b);
+                                if fusion == 1 {
+                                    session.set_input("src", &src);
+                                }
+                                if fusion == 2 {
+                                    session.set_input("row", &row);
+                                    session.set_input("col", &col);
+                                }
+                                session.step();
+                                session.wait();
+                                let got = session.read_output(m * n);
+                                let max_ref =
+                                    expected.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+                                let mut error2 = 0.0;
+                                let mut ref2 = 0.0;
+                                for (actual, expected) in got.into_iter().zip(&expected) {
+                                    let error = (f64::from(actual) - expected).abs();
+                                    assert!(
+                                        actual.is_finite() && error <= 1e-10 + 3e-5 * max_ref,
+                                        "{shape:?} transpose={transpose} fusion={fusion} splits={splits}: {actual} != {expected}"
+                                    );
+                                    error2 += error * error;
+                                    ref2 += expected * expected;
+                                }
+                                assert!((error2 / ref2).sqrt() <= 1e-5);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn native_split_rejections_leave_the_plan_intact_and_success_orders_the_sum() {

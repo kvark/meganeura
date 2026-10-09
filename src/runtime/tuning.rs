@@ -155,6 +155,9 @@ pub(super) fn tile_module(
         crate::codegen::generate_module(selected_entry.shader_group(), knobs)
     } else {
         match tile {
+            MatmulTile::CooperativeTiled(shape) => {
+                crate::codegen::generate_tiled_coop_matmul(entry.shader_group(), shape, 1, None)
+            }
             MatmulTile::Tile32 => {
                 crate::codegen::generate_module_small(entry.shader_group(), knobs)
             }
@@ -458,6 +461,18 @@ impl Session {
         let start = Instant::now();
         let (mut classes, mut excluded_dispatches) =
             collect_classes(&self.plan, &self.alias, self.coop_config.as_ref());
+        let reported_shared = self.gpu.capabilities().max_compute_shared_memory_size;
+        let shared_limit = if reported_shared == 0 {
+            16 * 1024
+        } else {
+            reported_shared
+        };
+        for class in &mut classes {
+            class.challengers.retain(|tile| match *tile {
+                MatmulTile::CooperativeTiled(shape) => shape.shared_bytes() <= shared_limit,
+                _ => true,
+            });
+        }
         classes.retain(|class| {
             if options.scope.includes(&class.key) {
                 true

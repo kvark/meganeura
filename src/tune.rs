@@ -194,6 +194,8 @@ pub enum MatmulTile {
     CooperativeF32 {
         tile_size: u32,
     },
+    /// Aligned native 16x16 f32 products sharing a larger workgroup tile.
+    CooperativeTiled(crate::codegen::CooperativeMatmulShape),
     /// A K-split GEMV at one workgroup width and cross-lane reduction.
     ///
     /// Keeps the shader entry and buffer layout. Width and reduction apply
@@ -308,6 +310,13 @@ impl MatmulTile {
                     k_tile,
                 }),
                 Kernel::Cooperative => Self::native_cooperative(config),
+                Kernel::CooperativeTiled { shape, splits: 1 }
+                    if config.is_some_and(|c| {
+                        c.tile_size == 16 && !c.use_f16_input && !c.compensated
+                    }) =>
+                {
+                    Some(Self::CooperativeTiled(shape))
+                }
                 _ => None,
             }
         }
@@ -315,6 +324,11 @@ impl MatmulTile {
 
     pub(crate) fn coop_config(self) -> Option<CoopConfig> {
         match self {
+            Self::CooperativeTiled(_) => Some(CoopConfig {
+                tile_size: 16,
+                use_f16_input: false,
+                compensated: false,
+            }),
             Self::CooperativeF32 { tile_size } => Some(CoopConfig {
                 tile_size,
                 use_f16_input: false,
@@ -353,6 +367,9 @@ impl MatmulTile {
             Self::Tile32 | Self::Tile64 => crate::compile::Kernel::Default,
             Self::Scalar(shape) => crate::compile::Kernel::ScalarMatmul(shape),
             Self::CooperativeF32 { .. } => crate::compile::Kernel::Cooperative,
+            Self::CooperativeTiled(shape) => {
+                crate::compile::Kernel::CooperativeTiled { shape, splits: 1 }
+            }
             Self::SpecializedConv { k_tile, .. } => {
                 crate::compile::Kernel::SpecializedConv { k_tile }
             }
@@ -385,6 +402,7 @@ impl MatmulTile {
                 ];
             }
             Self::SpecializedConv { tile_size, .. } => tile_size,
+            Self::CooperativeTiled(shape) => return [class.m / 64, class.n / shape.columns, 1],
             Self::CooperativeF32 { .. } => {
                 let tile = self.coop_config().unwrap().matmul_output_tile();
                 // Cooperative tiles use X for rows, Y for columns.
@@ -447,6 +465,15 @@ impl MatmulTile {
             }
         }
         let mut sizes = class.buffer_sizes()?;
+        if let Self::CooperativeTiled(shape) = self {
+            if class.conv2d.is_some()
+                || !class.shader.is_matmul()
+                || class.weight_format != crate::compile::WeightFormat::F32
+                || !shape.fits_dimensions(class.m, class.n, class.k)
+            {
+                return None;
+            }
+        }
         if let Self::CooperativeF32 { tile_size } = self {
             use crate::kernels::matmul;
             if class.conv2d.is_some() || !matches!(tile_size, 8 | 16) {
@@ -782,6 +809,21 @@ impl TuneClass {
         .collect();
         if !self.weight_format.is_quantized() {
             candidates.retain(|tile| matches!(tile, MatmulTile::CooperativeF32 { .. }));
+            if config.is_some_and(|c| c.tile_size == 16 && !c.use_f16_input && !c.compensated) {
+                for columns in [64, 128] {
+                    for k_stage in [16, 32] {
+                        for prefetch in [false, true] {
+                            candidates.push(MatmulTile::CooperativeTiled(
+                                crate::codegen::CooperativeMatmulShape {
+                                    columns,
+                                    k_stage,
+                                    prefetch,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
             for interleave_columns in [false, true] {
                 for k_stage in [32, 16, 8] {
                     for tile_size in [64, 32] {
