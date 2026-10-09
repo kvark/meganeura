@@ -376,9 +376,9 @@ fn spatial_transformer(
     );
     tokens = g.add(tokens, attended);
 
-    // Transformer feed-forward. SD 1.x uses GEGLU; GELU keeps this reduced
-    // workload within the current primitive set while preserving the dense
-    // expansion/contraction profile.
+    // Transformer feed-forward. SD 1.x uses GEGLU, whose gate is the exact
+    // GELU; an ungated exact GELU keeps the dense expansion/contraction
+    // profile of this reduced workload.
     let norm = token_layer_norm(
         g,
         tokens,
@@ -394,7 +394,7 @@ fn spatial_transformer(
         4 * channels,
         true,
     );
-    let ff = g.gelu(ff);
+    let ff = g.gelu_erf(ff);
     let ff = linear(
         g,
         ff,
