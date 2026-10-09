@@ -878,6 +878,13 @@ pub struct MatmulImpl {
     pub splits: u32,
 }
 
+/// A concrete attention algorithm retained by measured extraction. This does
+/// not change the tensor type or permit reduced-precision operands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum AttentionImpl {
+    CooperativeF32,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Node {
     pub id: NodeId,
@@ -890,6 +897,10 @@ pub struct Node {
     /// Scalar attention-gradient layout selected by measured extraction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention_ept_cap: Option<u32>,
+    /// Algorithm selected by measured extraction. Mutually exclusive with a
+    /// scalar `attention_ept_cap`; `None` retains ordinary kernel selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_impl: Option<AttentionImpl>,
     /// Prevent reduced-precision kernel promotion for numerically sensitive
     /// work derived by autodiff. Forward tensors remain logically f32 too;
     /// this flag only constrains optional runtime accelerations such as
@@ -1148,6 +1159,7 @@ impl Graph {
             name: None,
             matmul_impl: None,
             attention_ept_cap: None,
+            attention_impl: None,
         });
         id
     }

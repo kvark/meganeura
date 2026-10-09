@@ -83,6 +83,7 @@ impl Graph {
                 new.name.clone_from(&node.name);
                 new.matmul_impl = node.matmul_impl;
                 new.attention_ept_cap = node.attention_ept_cap;
+                new.attention_impl = node.attention_impl;
                 id
             };
             map.push(id);

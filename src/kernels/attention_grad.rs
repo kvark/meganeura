@@ -23,7 +23,7 @@ pub enum Part {
 /// The operand type of a cooperative path's matrix products.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Operands {
-    /// 8×8 f32 matrices: full precision, so preferred wherever they run.
+    /// Native f32 matrices: full precision, so preferred wherever they run.
     F32,
     /// 16×16 f16 matrices. Rounding dO to f16 loses small derivatives, so
     /// this is an opt-in.
@@ -91,7 +91,7 @@ pub(crate) struct Problem {
 pub(crate) struct Target {
     /// 16×16 f16 cooperative matrices.
     pub cooperative_f16: bool,
-    /// 8×8 f32 cooperative matrices.
+    /// Native 8×8 or 16×16 f32 cooperative matrices.
     pub cooperative_f32: bool,
     pub shared_memory_bytes: u32,
     /// [`CompileOptions::flash_backward_coop`](crate::CompileOptions).
@@ -147,7 +147,7 @@ impl Path {
                 if problem.pinned {
                     Err("a schedule pinned a scalar layout")
                 } else if !target.cooperative_f32 {
-                    Err("no 8x8 f32 cooperative matrices")
+                    Err("no native f32 cooperative matrices")
                 } else if head_dim != F32_HEAD_DIM {
                     Err("head width is not 64")
                 } else if problem.rows < F32_MIN_ROWS || problem.other_rows < F32_MIN_ROWS {
@@ -283,13 +283,23 @@ impl AttentionGrad {
         ept_cap: Option<u32>,
         knobs: &crate::compile::TuningKnobs,
     ) -> ShaderModule {
+        self.generate_with_f32_tile(head_dim, ept_cap, knobs, 8)
+    }
+
+    pub(crate) fn generate_with_f32_tile(
+        self,
+        head_dim: u32,
+        ept_cap: Option<u32>,
+        knobs: &crate::compile::TuningKnobs,
+        f32_tile: u32,
+    ) -> ShaderModule {
         use crate::codegen as cg;
         match (self.path, self.part) {
             (Path::Cooperative(Operands::F32), Part::Q) => {
-                cg::generate_flash_grad_q_coop_f32_module(head_dim)
+                cg::generate_flash_grad_q_coop_f32_module_with_tile(head_dim, f32_tile)
             }
             (Path::Cooperative(Operands::F32), Part::KV) => {
-                cg::generate_flash_grad_kv_coop_f32_module(head_dim)
+                cg::generate_flash_grad_kv_coop_f32_module_with_tile(head_dim, f32_tile)
             }
             (Path::Cooperative(Operands::F16), Part::Q) => {
                 cg::generate_flash_grad_q_coop_f16_module(head_dim)

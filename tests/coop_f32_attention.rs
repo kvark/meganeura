@@ -14,7 +14,11 @@ fn supported() -> bool {
     let gpu = crate::support::gpu::gpu();
     let caps = gpu.capabilities();
     caps.max_compute_shared_memory_size >= (4 * 1024 + 2 * 256 + 3 * 16) * 4
-        && caps.cooperative_matrix.f32_shapes.contains(&[8, 8, 8])
+        && caps
+            .cooperative_matrix
+            .f32_shapes
+            .iter()
+            .any(|shape| matches!(*shape, [8, 8, 8] | [16, 16, 16]))
 }
 
 #[test]
@@ -39,7 +43,7 @@ fn coop_f32_gradients_match_f64_with_small_upstream_derivatives() {
 }
 
 /// Manual stress check: the quadratic CPU f64 reference is too slow for CI.
-/// Run explicitly on a GPU with 8x8 f32 cooperative matrices:
+/// Run explicitly on a GPU with native f32 cooperative matrices:
 /// ```sh
 /// cargo test --release --all-features --test regression \
 ///   coop_f32_attention::coop_f32_long_attention_gradients_match_f64 \
@@ -94,6 +98,17 @@ fn check_case(
     config.runtime.coop = CoopPolicy::NativeF32;
     config.runtime.poison = true;
     config.tune = false;
+    config.options.prefer_attention_grad = Some(COOP_F32);
+    if crate::support::gpu::gpu()
+        .capabilities()
+        .cooperative_matrix
+        .f32_shapes
+        .contains(&[16, 16, 16])
+    {
+        graph.nodes_mut()[attention as usize].attention_impl =
+            Some(meganeura::graph::AttentionImpl::CooperativeF32);
+        config.optimize.mode = meganeura::optimize::OptimizeMode::Off;
+    }
     let (mut session, _) = build(&graph, config);
     assert!(
         session
@@ -143,6 +158,91 @@ fn check_case(
             assert!(
                 relative < tolerance,
                 "{q_seq}/{kv_seq} h={heads}/{kv_heads} window={window} causal={causal} {name} scale={scale}: relative error {relative}"
+            );
+        }
+    }
+}
+
+#[test]
+fn coop_f32_forward_matches_f64_across_heads_masks_and_tails() {
+    if !crate::support::gpu::gpu()
+        .capabilities()
+        .cooperative_matrix
+        .f32_shapes
+        .contains(&[16, 16, 16])
+    {
+        return;
+    }
+    for hd in [16, 32, 64, 128, 256] {
+        for (qs, ks, heads, kv_heads, window, causal) in [
+            (16, 19, 2, 1, 0, false),
+            (17, 17, 2, 1, 0, true),
+            (129, 19, 4, 2, 0, false),
+            (145, 145, 3, 1, 0, true),
+            (161, 161, 2, 1, 17, true),
+        ] {
+            let mut graph = Graph::new();
+            let q = graph.input("q", &[qs, heads * hd]);
+            let k = graph.input("k", &[ks, kv_heads * hd]);
+            let v = graph.input("v", &[ks, kv_heads * hd]);
+            let y = if window > 0 {
+                graph.sliding_window_attention(
+                    q,
+                    k,
+                    v,
+                    heads as u32,
+                    kv_heads as u32,
+                    hd as u32,
+                    window,
+                )
+            } else if causal {
+                graph.causal_attention(q, k, v, heads as u32, kv_heads as u32, hd as u32)
+            } else {
+                graph.multi_head_attn(q, k, v, heads as u32, kv_heads as u32, hd as u32, true)
+            };
+            graph.set_outputs(vec![y]);
+            graph.nodes_mut()[y as usize].attention_impl =
+                Some(meganeura::graph::AttentionImpl::CooperativeF32);
+            let mut config = crate::support::gpu::inference_config();
+            config.runtime.coop = CoopPolicy::NativeF32;
+            config.runtime.poison = true;
+            config.tune = false;
+            config.optimize.mode = meganeura::optimize::OptimizeMode::Off;
+            let (mut session, _) = build(&graph, config);
+            assert!(
+                session
+                    .plan()
+                    .dispatches
+                    .iter()
+                    .any(|d| d.shader == ShaderEntry::FlashAttentionCoopF32)
+            );
+            let mut feeds = reference::Feeds::new();
+            for (name, len, scale, phase) in [
+                ("q", qs * heads * hd, 0.8, 0.3),
+                ("k", ks * kv_heads * hd, 0.8, 0.7),
+                ("v", ks * kv_heads * hd, 3.0e5, 1.1),
+            ] {
+                let values: Vec<f32> = (0..len)
+                    .map(|i| (i as f32 * 0.017 + phase).sin() * scale)
+                    .collect();
+                feeds.set(name, &values);
+                session.set_input(name, &values);
+            }
+            let expected = reference::evaluate_outputs(&graph, &feeds).unwrap();
+            session.step();
+            session.wait();
+            let actual = session.read_output(qs * heads * hd);
+            let mut error = 0.0;
+            let mut norm = 0.0;
+            for (&a, &b) in actual.iter().zip(&expected[0].data) {
+                assert!(a.is_finite());
+                error += (a as f64 - b).powi(2);
+                norm += b.powi(2);
+            }
+            assert!(
+                (error / norm).sqrt() < 1e-5,
+                "hd={hd}, qs={qs}, ks={ks}, window={window}: {}",
+                (error / norm).sqrt()
             );
         }
     }

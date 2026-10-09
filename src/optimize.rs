@@ -638,6 +638,7 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
   (GeGLU Op Op)
   (GeGLUPacked Op Op Op)
   (GeGLUPackedBT Op Op Op)
+  (AttentionForward i64 Op Op Op)
   (AttentionGradQ i64 Op Op Op Op)
   (AttentionGradKV i64 Op Op Op Op)
   (Op1 i64 Op)
@@ -648,6 +649,7 @@ fn egglog_prelude(prog: &mut String, pack_swiglu: bool) {
   (Op6 i64 Op Op Op Op Op Op)
 )
 (relation AttentionLayout (i64 i64))
+(relation AttentionNativeF32 (i64))
 
 ; --- Algebraic simplifications ---
 (rewrite (Neg (Neg ?x)) ?x)
@@ -772,7 +774,7 @@ fn node_to_egglog_expr(node: &Node) -> String {
         Op::Nop => unreachable!("Nop nodes are filtered before encoding"),
         ref op => {
             let args: Vec<String> = node.inputs.iter().map(|i| format!("$n{}", i)).collect();
-            if let Some(name) = attention_gradient_constructor(op) {
+            if let Some(name) = attention_constructor(op) {
                 format!("({name} {} {})", node.id, args.join(" "))
             } else if let Some(name) = named_constructor(op) {
                 format!("({} {})", name, args.join(" "))
@@ -1179,7 +1181,7 @@ impl Stamper<'_> {
                 self.translate(lit_node_id(dag, children[0])?)?
             }
             Term::App(ref name, ref children)
-                if name.starts_with("Op") || attention_gradient_family(name).is_some() =>
+                if name.starts_with("Op") || attention_family(name).is_some() =>
             {
                 let orig = self.translate(lit_node_id(dag, children[0])?)?;
                 let inputs = self.resolve_children(dag, &children[1..])?;
@@ -1189,11 +1191,21 @@ impl Stamper<'_> {
                     // untouched.
                     self.g.nodes_mut()[orig as usize].inputs = inputs;
                 }
-                if let Some((_, cap)) = name.split_once("__")
-                    && attention_gradient_family(name).is_some()
-                {
-                    self.g.nodes_mut()[orig as usize].attention_ept_cap =
-                        Some(cap.parse().map_err(|_| "invalid attention EPT cap")?);
+                if attention_family(name).is_some() {
+                    let node = &mut self.g.nodes_mut()[orig as usize];
+                    node.attention_impl = None;
+                    node.attention_ept_cap = None;
+                    if let Some((_, implementation)) = name.split_once("__") {
+                        if implementation == "native_f32" {
+                            node.attention_impl = Some(crate::graph::AttentionImpl::CooperativeF32);
+                        } else {
+                            node.attention_ept_cap = Some(
+                                implementation
+                                    .parse()
+                                    .map_err(|_| "invalid attention EPT cap")?,
+                            );
+                        }
+                    }
                 }
                 orig
             }
@@ -1410,6 +1422,7 @@ impl Stamper<'_> {
         };
         self.g.nodes_mut()[id as usize].matmul_impl = None;
         self.g.nodes_mut()[id as usize].attention_ept_cap = None;
+        self.g.nodes_mut()[id as usize].attention_impl = None;
         id
     }
 }
@@ -1517,6 +1530,22 @@ fn attention_gradient_constructor(op: &Op) -> Option<&'static str> {
     }
 }
 
+fn attention_constructor(op: &Op) -> Option<&'static str> {
+    match *op {
+        Op::MultiHeadAttn { .. }
+        | Op::CausalAttention { .. }
+        | Op::SlidingWindowAttention { .. } => Some("AttentionForward"),
+        _ => attention_gradient_constructor(op),
+    }
+}
+
+fn attention_family(name: &str) -> Option<&'static str> {
+    match name.split_once("__").map_or(name, |(logical, _)| logical) {
+        "AttentionForward" => Some("AttentionForward"),
+        _ => attention_gradient_family(name),
+    }
+}
+
 fn attention_gradient_family(name: &str) -> Option<&'static str> {
     match name.split_once("__").map_or(name, |(logical, _)| logical) {
         "AttentionGradQ" => Some("AttentionGradQ"),
@@ -1542,12 +1571,23 @@ fn attention_gradient_constructors() -> &'static [(String, &'static str)] {
 }
 
 fn implementation_family(name: &str) -> Option<&'static str> {
-    matrix_family(name).or_else(|| attention_gradient_family(name))
+    matrix_family(name).or_else(|| attention_family(name))
+}
+
+fn native_attention_constructors() -> &'static [(String, &'static str)] {
+    static NAMES: std::sync::LazyLock<Vec<(String, &'static str)>> =
+        std::sync::LazyLock::new(|| {
+            ["AttentionForward", "AttentionGradQ", "AttentionGradKV"]
+                .map(|logical| (format!("{logical}__native_f32"), logical))
+                .into()
+        });
+    &NAMES
 }
 
 fn implementation_constructors() -> impl Iterator<Item = &'static (String, &'static str)> {
     matrix_constructors()
         .iter()
+        .chain(native_attention_constructors())
         .chain(attention_gradient_constructors())
 }
 
@@ -1563,6 +1603,19 @@ fn tile_equality_rules() -> String {
         let _ = writeln!(
             program,
             "(constructor {name} ({sorts}) Op)\n(rewrite ({logical} {args}) ({name} {args}))"
+        );
+    }
+    for &(ref name, logical) in native_attention_constructors() {
+        let (sorts, args) = if logical == "AttentionForward" {
+            ("i64 Op Op Op", "?id ?q ?k ?v")
+        } else {
+            ("i64 Op Op Op Op", "?id ?do ?q ?k ?v")
+        };
+        let _ = writeln!(
+            program,
+            "(constructor {name} ({sorts}) Op)\n\
+             (rewrite ({logical} {args}) ({name} {args})\n\
+               :when ((AttentionNativeF32 ?id)))"
         );
     }
     for &(ref name, logical) in attention_gradient_constructors() {

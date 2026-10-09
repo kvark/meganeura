@@ -188,7 +188,24 @@ impl<'a> Compiler<'a> {
         head_dim: u32,
         num_heads: u32,
         requires_full_precision: bool,
+        implementation: Option<crate::graph::AttentionImpl>,
     ) -> (ShaderEntry, [u32; 3]) {
+        if implementation == Some(crate::graph::AttentionImpl::CooperativeF32) {
+            assert!(
+                crate::kernels::attention::admits_cooperative_f32(
+                    q_seq,
+                    head_dim,
+                    num_heads,
+                    self.coop_caps,
+                    self.shared_memory_bytes,
+                ),
+                "selected native-f32 attention is unsupported on this target"
+            );
+            return (
+                ShaderEntry::FlashAttentionCoopF32,
+                [q_seq.div_ceil(16), num_heads, 1],
+            );
+        }
         // Pick the coop-matrix flash forward when the GPU has the
         // 16x16 f16 cooperative_matrix path (NVIDIA, RDNA3, Xe-HPG)
         // and the shape is compatible. ~3.2x faster per dispatch than
@@ -253,7 +270,15 @@ impl<'a> Compiler<'a> {
         };
         let target = attention_grad::Target {
             cooperative_f16: self.coop_caps.supports_16x16_f16(),
-            cooperative_f32: self.coop_caps.f32_tile == 8,
+            // Native8 retains its established default. Native16 is an
+            // explicitly extracted implementation, chosen by measurement.
+            cooperative_f32: self.coop_caps.f32_tile == 8
+                || (self.coop_caps.f32_tile == 16
+                    && (node.attention_impl.is_some()
+                        || self.options.prefer_attention_grad
+                            == Some(attention_grad::Path::Cooperative(
+                                attention_grad::Operands::F32,
+                            )))),
             shared_memory_bytes: self.shared_memory_bytes,
             // Rounding dO to f16 loses small derivatives, so the f16 path is
             // an explicit opt-in rather than following from the device
@@ -261,7 +286,18 @@ impl<'a> Compiler<'a> {
             reduced_precision: self.allow_reduced_precision_attention_backward,
             prefer: self.options.prefer_attention_grad,
         };
-        let kernel = AttentionGrad::select(&problem, &target);
+        let kernel = if node.attention_impl == Some(crate::graph::AttentionImpl::CooperativeF32) {
+            use crate::kernels::{
+                Family,
+                attention_grad::{Operands, Path},
+            };
+            let path = Path::Cooperative(Operands::F32);
+            path.admits(&problem, &target)
+                .expect("selected native-f32 attention gradient is unsupported on this target");
+            AttentionGrad::new(part, path)
+        } else {
+            AttentionGrad::select(&problem, &target)
+        };
         (kernel, kernel.workgroups(&problem), problem.ept_cap)
     }
 
@@ -2026,8 +2062,13 @@ impl<'a> Compiler<'a> {
                     }
                 }
                 let lse_buf = self.find_lse_buffer(node.id);
-                let (shader, workgroups) =
-                    self.attention_dispatch(seq, head_dim, num_heads, node.requires_full_precision);
+                let (shader, workgroups) = self.attention_dispatch(
+                    seq,
+                    head_dim,
+                    num_heads,
+                    node.requires_full_precision,
+                    node.attention_impl,
+                );
                 self.plan.dispatches.push(Dispatch {
                     shader,
                     workgroups,
@@ -2053,8 +2094,13 @@ impl<'a> Compiler<'a> {
                 let v = self.get_buffer(node.inputs[2]);
                 let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let lse_buf = self.find_lse_buffer(node.id);
-                let (shader, workgroups) =
-                    self.attention_dispatch(seq, head_dim, num_heads, node.requires_full_precision);
+                let (shader, workgroups) = self.attention_dispatch(
+                    seq,
+                    head_dim,
+                    num_heads,
+                    node.requires_full_precision,
+                    node.attention_impl,
+                );
                 self.plan.dispatches.push(Dispatch {
                     shader,
                     workgroups,
@@ -3204,6 +3250,7 @@ impl<'a> Compiler<'a> {
                     head_dim,
                     num_heads,
                     node.requires_full_precision,
+                    node.attention_impl,
                 );
                 self.plan.dispatches.push(Dispatch {
                     shader,

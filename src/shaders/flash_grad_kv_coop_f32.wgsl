@@ -46,12 +46,12 @@ fn main(
     let first_q = select(0u, kv_base, causal);
     let last_q = select(q_seq, min(q_seq, kv_base + 15u + params.window_size), causal && params.window_size > 0u);
 
-    // Normally four SIMD groups own the four 8x32 output quadrants. The
+    // SIMD groups own tile-height by 32 output regions. The
     // round loop also handles wider subgroups; extra narrow groups store
     // nothing but still participate in all cooperative operations/barriers.
-    for (var group_base = 0u; group_base < 4u; group_base += 128u / sg_size) {
+    for (var group_base = 0u; group_base < $OUTPUT_GROUPSu; group_base += 128u / sg_size) {
         let tile_sg = group_base + sg;
-        let out_row = ((tile_sg % 4u) / 2u) * 8u;
+        let out_row = ((tile_sg % $OUTPUT_GROUPSu) / 2u) * $TILEu;
         let out_col = (tile_sg % 2u) * 32u;
         $ACC_INIT
 
@@ -103,26 +103,26 @@ fn main(
                 }
                 workgroupBarrier();
 
-                for (var score_base = 0u; score_base < 4u; score_base += 128u / sg_size) {
+                for (var score_base = 0u; score_base < $SCORE_GROUPSu; score_base += 128u / sg_size) {
                     let score_sg = score_base + sg;
-                    let score_row = ((score_sg % 4u) / 2u) * 8u;
-                    let score_col = (score_sg % 2u) * 8u;
-                    var score = coop_mat8x8<f32,C>();
-                    var dp = coop_mat8x8<f32,C>();
-                    for (var h = 0u; h < 64u; h += 8u) {
+                    let score_row = ((score_sg % $SCORE_GROUPSu) / $SCORE_COLSu) * $TILEu;
+                    let score_col = (score_sg % $SCORE_COLSu) * $TILEu;
+                    var score = coop_mat$TILEx$TILE<f32,C>();
+                    var dp = coop_mat$TILEx$TILE<f32,C>();
+                    for (var h = 0u; h < 64u; h += $TILEu) {
                         let k_index = score_row * 64u + h;
                         let q_index = score_col * 64u + h;
-                        let k = coopLoadT<coop_mat8x8<f32,A>>(&shared_k[k_index], 64u);
-                        let v = coopLoadT<coop_mat8x8<f32,A>>(&shared_v[k_index], 64u);
+                        let k = coopLoadT<coop_mat$TILEx$TILE<f32,A>>(&shared_k[k_index], 64u);
+                        let v = coopLoadT<coop_mat$TILEx$TILE<f32,A>>(&shared_v[k_index], 64u);
                         // Column-major loads transpose the existing Q/dO
                         // tiles without extra workgroup-memory copies.
-                        let qt = coopLoad<coop_mat8x8<f32,B>>(&shared_q[q_index], 64u);
-                        let dot = coopLoad<coop_mat8x8<f32,B>>(&shared_do[q_index], 64u);
+                        let qt = coopLoad<coop_mat$TILEx$TILE<f32,B>>(&shared_q[q_index], 64u);
+                        let dot = coopLoad<coop_mat$TILEx$TILE<f32,B>>(&shared_do[q_index], 64u);
                         score = coopMultiplyAdd(k, qt, score);
                         dp = coopMultiplyAdd(v, dot, dp);
                     }
                     let score_index = score_row * 16u + score_col;
-                    if score_sg < 4u {
+                    if score_sg < $SCORE_GROUPSu {
                         coopStoreT(score, &shared_p[score_index], 16u);
                         coopStoreT(dp, &shared_ds[score_index], 16u);
                     }
@@ -146,10 +146,10 @@ fn main(
                 }
                 workgroupBarrier();
 
-                for (var q = 0u; q < 16u; q += 8u) {
+                for (var q = 0u; q < 16u; q += $TILEu) {
                     let a_index = out_row * 16u + q;
-                    let p = coopLoadT<coop_mat8x8<f32,A>>(&shared_p[a_index], 16u);
-                    let ds = coopLoadT<coop_mat8x8<f32,A>>(&shared_ds[a_index], 16u);
+                    let p = coopLoadT<coop_mat$TILEx$TILE<f32,A>>(&shared_p[a_index], 16u);
+                    let ds = coopLoadT<coop_mat$TILEx$TILE<f32,A>>(&shared_ds[a_index], 16u);
                     $ACCUMULATE
                 }
                 // No invocation overwrites Q/dO or score storage while
@@ -165,7 +165,7 @@ fn main(
         for (var i = lid.x; i < 1024u; i += 128u) {
             let kp = kv_base + i / 64u;
             let d = i % 64u;
-            let owner = (i / 512u) * 2u + d / 32u;
+            let owner = (i / ($TILEu * 64u)) * 2u + d / 32u;
             if kp < kv_seq && owner >= group_base && owner < group_base + 128u / sg_size {
                 let index = kp * kv_stride + kv_head * 64u + d;
                 dst[index] = shared_k[i] * scale;

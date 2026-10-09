@@ -346,6 +346,8 @@ pub enum ShaderEntry {
     /// `MEGANEURA_FLASH_FWD_COOP=0`.
     /// BQ=BKV=16, dispatched as `[ceil(q_seq/16), num_heads, 1]`.
     FlashAttentionCoop,
+    /// Forward attention using native 16x16 f32 cooperative matrices.
+    FlashAttentionCoopF32,
     /// Attention backward; the kernel family says which part and path.
     AttentionGrad(crate::kernels::attention_grad::AttentionGrad),
     SwiGLUGradGate,
@@ -476,6 +478,7 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttn
             | ShaderEntry::FlashAttention
             | ShaderEntry::FlashAttentionCoop
+            | ShaderEntry::FlashAttentionCoopF32
             | ShaderEntry::AttentionGrad(_)
             | ShaderEntry::CachedAttention
             | ShaderEntry::BiasedAttention
@@ -585,7 +588,10 @@ impl ShaderEntry {
     pub const fn is_attention(&self) -> bool {
         matches!(
             self,
-            Self::FlashAttention | Self::MultiHeadAttn | Self::FlashAttentionCoop
+            Self::FlashAttention
+                | Self::MultiHeadAttn
+                | Self::FlashAttentionCoop
+                | Self::FlashAttentionCoopF32
         )
     }
 
@@ -628,6 +634,7 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttn => ShaderGroup::MultiHeadAttn,
             ShaderEntry::FlashAttention => ShaderGroup::FlashAttention,
             ShaderEntry::FlashAttentionCoop => ShaderGroup::FlashAttentionCoop,
+            ShaderEntry::FlashAttentionCoopF32 => ShaderGroup::FlashAttentionCoopF32,
             ShaderEntry::AttentionGrad(kernel) => ShaderGroup::AttentionGrad(kernel),
             ShaderEntry::SwiGLUGradGate | ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => {
                 ShaderGroup::SwiGLUGrad
@@ -738,6 +745,7 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttn
             | ShaderEntry::FlashAttention
             | ShaderEntry::FlashAttentionCoop
+            | ShaderEntry::FlashAttentionCoopF32
             | ShaderEntry::AttentionGrad(_) => "main",
             ShaderEntry::SwiGLUGradGate => "swiglu_grad_gate",
             ShaderEntry::SwiGLUGradUp => "swiglu_grad_up",
@@ -4429,7 +4437,7 @@ mod tests {
             for threads in [128, 256] {
                 compiler.options.knobs.flash.threads = threads;
                 let fwd_bq = (threads / fwd_tpq).max(1);
-                let (fwd_entry, fwd_wg) = compiler.attention_dispatch(256, hd, 1, false);
+                let (fwd_entry, fwd_wg) = compiler.attention_dispatch(256, hd, 1, false, None);
                 if fwd_bq >= 2 {
                     assert_eq!(fwd_entry, ShaderEntry::FlashAttention);
                     assert_eq!(fwd_wg[0], 256u32.div_ceil(fwd_bq));
@@ -4747,7 +4755,8 @@ mod tests {
             (8, 64, 129, 145, 18_624, [true, true]),
             (8, 64, 129, 145, 18_623, [false, false]),
             (0, 64, 129, 145, 32_768, [false, false]),
-            (16, 64, 129, 145, 32_768, [false, false]),
+            (16, 64, 129, 145, 18_624, [false, false]),
+            (16, 64, 129, 145, 18_623, [false, false]),
             (8, 128, 129, 145, 32_768, [false, false]),
             (8, 64, 50, 145, 32_768, [false, false]),
             (8, 64, 129, 16, 32_768, [false, false]),
@@ -4786,6 +4795,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "selected native-f32 attention is unsupported")]
+    fn extracted_native_attention_cannot_silently_fall_back() {
+        let mut graph = Graph::new();
+        let q = graph.input("q", &[129, 64]);
+        let k = graph.input("k", &[129, 64]);
+        let v = graph.input("v", &[129, 64]);
+        let y = graph.multi_head_attn(q, k, v, 1, 1, 64, true);
+        graph.nodes_mut()[y as usize].attention_impl =
+            Some(crate::graph::AttentionImpl::CooperativeF32);
+        graph.set_outputs(vec![y]);
+        // Reusing an extracted native graph with the disabled precision policy
+        // must fail at compilation, before a scalar result could be mislabeled.
+        compile_with_caps(&graph, &Default::default(), Default::default(), 32768);
     }
 
     #[test]

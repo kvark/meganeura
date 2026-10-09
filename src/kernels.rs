@@ -17,6 +17,7 @@
 //! that computes the same thing, and the tests can run every admitted
 //! variant against the same reference.
 
+pub(crate) mod attention;
 pub mod attention_grad;
 pub(crate) mod conv;
 pub(crate) mod matmul;
