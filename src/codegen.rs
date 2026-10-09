@@ -76,13 +76,17 @@ pub enum GemvReduction {
 /// measures the alternatives without changing the arithmetic or bindings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct GemvShape {
-    /// Threads per workgroup: 32, 64, 128 or 256.
+    /// K-reduction lanes per column group: 32, 64, 128 or 256.
     pub threads: u32,
     pub reduction: GemvReduction,
     /// Contiguous rows of transposed B per workgroup: 1, 2 or 4.
-    /// Other layouts keep their existing four output columns per workgroup.
+    /// Applies only to transposed B.
     #[serde(default = "GemvShape::one_row")]
     pub bt_rows: u32,
+    /// Groups of four adjacent output columns in a forward workgroup.
+    /// Grouped columns use the tree reduction and at most 256 total threads.
+    #[serde(default = "GemvShape::one_row")]
+    pub column_groups: u32,
 }
 
 impl GemvShape {
@@ -102,6 +106,8 @@ impl GemvShape {
             ShaderGroup::MatMulGemvBT | ShaderGroup::MatMulGemvBTAdd
         ) {
             self.bt_rows = 1;
+        } else {
+            self.column_groups = 1;
         }
         self
     }
@@ -127,11 +133,20 @@ impl GemvShape {
             threads,
             reduction: GemvReduction::Tree,
             bt_rows: 1,
+            column_groups: 1,
         }
+    }
+
+    pub(crate) fn valid_columns(self) -> bool {
+        self.column_groups == 1
+            || (matches!(self.column_groups, 4 | 8)
+                && self.reduction == GemvReduction::Tree
+                && self.threads <= 256 / self.column_groups)
     }
 
     /// Reject geometry no GEMV source can be generated at.
     pub(crate) fn validate(self) {
+        assert!(self.valid_columns(), "unsupported GEMV column grouping");
         assert!(
             Self::WIDTHS.contains(&self.threads),
             "GEMV workgroup width must be one of {:?}, got {}",
@@ -1842,6 +1857,7 @@ const GEMV_TEMPLATE: &str = include_str!("shaders/matmul_gemv.wgsl");
 /// Apply width and reduction slots shared by floating-point and integer-dot GEMV.
 fn specialize_gemv(source: &str, shape: GemvShape) -> String {
     shape.validate();
+    let columns = shape.column_groups;
     let (reduction, subgroup_args, total) = match shape.reduction {
         GemvReduction::Tree => {
             let mut body = template_section(GEMV_TEMPLATE, "tree_start").to_owned();
@@ -1849,16 +1865,24 @@ fn specialize_gemv(source: &str, shape: GemvShape) -> String {
             while stride > 1 {
                 body.push_str(&preprocess(
                     template_section(GEMV_TEMPLATE, "tree_step"),
-                    &[("$STRIDE", &stride.to_string())],
+                    &[
+                        ("$STRIDE", &stride.to_string()),
+                        ("$REDUCE_STRIDE", &(stride * columns).to_string()),
+                    ],
                 ));
                 stride /= 2;
             }
-            (body, "", "reduce_buf[0] + reduce_buf[1]")
+            // Read by lane zero, where lid.x is the column within the group.
+            (
+                body,
+                "",
+                format!("reduce_buf[lid.x] + reduce_buf[lid.x + {columns}u]"),
+            )
         }
         GemvReduction::Subgroup => (
             template_section(GEMV_TEMPLATE, "subgroup_reduce").to_owned(),
             ", @builtin(subgroup_invocation_id) sg_id: u32, @builtin(subgroup_id) wave_id: u32, @builtin(num_subgroups) wave_count: u32",
-            "group_total",
+            "group_total".to_owned(),
         ),
     };
     preprocess(
@@ -1866,8 +1890,10 @@ fn specialize_gemv(source: &str, shape: GemvShape) -> String {
         &[
             ("$REDUCTION", &reduction),
             ("$SUBGROUP_ARGS", subgroup_args),
-            ("$TOTAL", total),
+            ("$TOTAL", &total),
             ("$LANES", &shape.threads.to_string()),
+            ("$COLUMN_GROUPS", &columns.to_string()),
+            ("$WORKGROUP_SIZE", &(shape.threads * columns).to_string()),
         ],
     )
 }
@@ -1926,6 +1952,7 @@ fn generate_gemv(
         "no {format:?} variant for {group:?}; block-quantized weights cannot serve a transposed B"
     );
     let shape = shape.for_group(group);
+    assert!(shape.column_groups == 1 || matches!(format, WeightFormat::F32 | WeightFormat::F16));
     let rows = shape.bt_rows;
     let fragment = |name| template_section(GEMV_TEMPLATE, name);
     let b_storage = match format {
@@ -1956,7 +1983,14 @@ fn generate_gemv(
             String::new(),
             preprocess(
                 fragment("weight_load"),
-                &[("$B_VALUE", &load("kk * n_v4 + col4"))],
+                &[(
+                    "$B_VALUE",
+                    &load(if shape.column_groups == 1 {
+                        "kk * n_v4 + col4"
+                    } else {
+                        "select(0u, kk * n_v4 + col4, col4 < n_v4)"
+                    }),
+                )],
             ),
         ),
     };
@@ -2005,11 +2039,11 @@ fn generate_gemv(
         );
         format!(
             "{prologue}{}",
-            fragment(if transposed {
-                "bt_norm_end"
+            if transposed {
+                fragment("bt_norm_end")
             } else {
-                "norm_end"
-            })
+                "let rs = inv_rms;"
+            }
         )
     } else {
         String::new()
@@ -2054,12 +2088,10 @@ fn generate_gemv(
             ("$NORM_PROLOGUE", &norm_prologue),
             (
                 "$EARLY_RETURN",
-                if norm {
-                    ""
-                } else if transposed {
+                if transposed && !norm {
                     fragment("bt_guard")
                 } else {
-                    fragment("guard")
+                    ""
                 },
             ),
             ("$A_LOAD", fragment(if norm { "bt_norm_a" } else { "bt_a" })),
@@ -2117,6 +2149,10 @@ pub(crate) fn generate_module_gemv_int_dot(
     packed_dot: bool,
     norm: bool,
 ) -> ShaderModule {
+    assert_eq!(
+        shape.column_groups, 1,
+        "integer-dot GEMV has no grouped-column variant"
+    );
     let dot_helpers = if packed_dot {
         include_str!("shaders/matmul_gemv_int_dot_packed.wgsl")
     } else {
@@ -4246,12 +4282,12 @@ mod tests {
         }
     }
 
-    /// Shape, format and fused-add slots must compose with only the requested capabilities.
     #[test]
     fn every_gemv_shape_composes_with_every_weight_format() {
         let legacy: GemvShape =
             serde_json::from_str(r#"{"threads":32,"reduction":"Tree"}"#).unwrap();
         assert_eq!(legacy.bt_rows, 1);
+        assert_eq!(legacy.column_groups, 1);
         let formats = [
             (WeightFormat::F32, "matrix_b: array<vec4<f32>>"),
             (WeightFormat::F16, "array<vec4<f16>>"),
@@ -4285,6 +4321,7 @@ mod tests {
                                 threads,
                                 reduction,
                                 bt_rows,
+                                column_groups: 1,
                             }
                             .for_group(group);
                             if shape.bt_rows != bt_rows {
@@ -4331,7 +4368,7 @@ mod tests {
                             );
                             // The tree leaves two partials; the subgroup form produces a total.
                             assert_eq!(
-                                source.contains("reduce_buf[0] + reduce_buf[1]"),
+                                source.contains("reduce_buf[lid.x] + reduce_buf[lid.x + 1u]"),
                                 !subgroup,
                                 "{format:?} {group:?} {shape:?} store expression mismatch"
                             );
@@ -4380,6 +4417,7 @@ mod tests {
                             threads,
                             reduction,
                             bt_rows: 1,
+                            column_groups: 1,
                         };
                         for packed_dot in [true, false] {
                             for norm in [false, true] {
@@ -4453,6 +4491,7 @@ mod tests {
                         threads: 64,
                         reduction: GemvReduction::Subgroup,
                         bt_rows: 4,
+                        column_groups: 1,
                     },
                     format,
                 );
@@ -4493,11 +4532,13 @@ mod tests {
                 threads,
                 reduction: GemvReduction::Tree,
                 bt_rows: 1,
+                column_groups: 1,
             });
             let subgroup = barriers(GemvShape {
                 threads,
                 reduction: GemvReduction::Subgroup,
                 bt_rows: 1,
+                column_groups: 1,
             });
             // The only barrier gathers partials when there is more than
             // one subgroup; a single subgroup keeps its sum in registers.

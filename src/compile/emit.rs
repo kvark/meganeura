@@ -781,13 +781,10 @@ impl<'a> Compiler<'a> {
                     // specialize only the physical forward dispatch.
                     self.emit_sum_inner(a, out_buf, m, k);
                 } else if m == 1 && n.is_multiple_of(4) {
-                    // K-split GEMV: one WG per 4 output columns (vec4),
-                    // 32 threads cooperatively K-split with a shared-
-                    // memory tree reduction. Many more WGs than N/128,
-                    // giving occupancy to hide DRAM latency at M=1.
-                    self.plan.dispatches.push(Dispatch {
+                    // K-split GEMV, optionally grouping adjacent output vec4s
+                    // within a workgroup for contiguous weight reads.
+                    let mut dispatch = Dispatch {
                         shader: ShaderEntry::MatMulGemv,
-                        workgroups: [n / 4, 1, 1],
                         input_buffers: vec![a, b],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
@@ -796,7 +793,9 @@ impl<'a> Compiler<'a> {
                         weight_format: wf,
                         kernel: self.options.gemv_kernel(ShaderGroup::MatMulGemv, wf),
                         ..Default::default()
-                    });
+                    };
+                    dispatch.workgroups = gemv_workgroups(n, dispatch.gemv_shape().unwrap());
+                    self.plan.dispatches.push(dispatch);
                 } else {
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::MatMul,
@@ -1004,9 +1003,8 @@ impl<'a> Compiler<'a> {
                 let k = a_shape[1] as u32;
                 let n = b_shape[1] as u32;
                 if m == 1 && n.is_multiple_of(4) {
-                    self.plan.dispatches.push(Dispatch {
+                    let mut dispatch = Dispatch {
                         shader: ShaderEntry::MatMulGemvAdd,
-                        workgroups: [n / 4, 1, 1],
                         input_buffers: vec![a, b, d],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
@@ -1015,7 +1013,9 @@ impl<'a> Compiler<'a> {
                         weight_format: wf,
                         kernel: self.options.gemv_kernel(ShaderGroup::MatMulGemvAdd, wf),
                         ..Default::default()
-                    });
+                    };
+                    dispatch.workgroups = gemv_workgroups(n, dispatch.gemv_shape().unwrap());
+                    self.plan.dispatches.push(dispatch);
                 } else {
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::FusedMatMulAdd,

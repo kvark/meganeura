@@ -568,7 +568,8 @@ impl Session {
                 report.outcomes.push(outcome);
             }
         }
-        if staging.buffer.is_some()
+        if staging.retained_bytes() != 0
+            || staging.baseline.is_some()
             || report
                 .outcomes
                 .iter()
@@ -672,7 +673,7 @@ impl Session {
                 report.outcomes.push(outcome);
             }
         }
-        if staging.buffer.is_some() {
+        if staging.retained_bytes() != 0 || staging.baseline.is_some() {
             let _timer = PhaseTimer::new(&mut report.final_cleanup);
             staging.clear();
         }
@@ -747,11 +748,12 @@ impl Session {
         {
             let _timer = PhaseTimer::new(&mut prep.staging);
             staging.discard_unmatched(*sizes.iter().max().unwrap());
+            staging.discard_input_b(&class.key, sizes[1]);
         }
         let checks = PhaseTimer::new(&mut prep.checks);
         let memory = self.gpu.memory_stats();
         if memory.budget != 0
-            && (bytes - staging.stats.retained_staging_bytes) as u64
+            && (bytes - staging.retained_bytes()) as u64
                 > super::safe_device_memory_remaining(memory.usage, memory.budget)
         {
             outcome.decision = TuneDecision::DeviceMemoryBudget;
@@ -797,6 +799,17 @@ impl Session {
             outcome.decision = TuneDecision::TimeBudget;
             return;
         }
+        let cached_baseline = staging.baseline.take().filter(|baseline| {
+            outcome.candidate_split_k.is_none()
+                && baseline.class == class.key
+                && baseline.tile == outcome.initial
+                && baseline.binding_bytes == sizes
+        });
+        let baseline_reused = cached_baseline.is_some();
+        let mut baseline_outputs = cached_baseline
+            .map(|baseline| baseline.outputs)
+            .unwrap_or_default();
+        let mut candidate_outputs: [Vec<f32>; 2] = Default::default();
         let mut scratch = Scratch::new(
             &sizes
                 .iter()
@@ -807,7 +820,7 @@ impl Session {
                 })
                 .collect::<Vec<_>>(),
             &sizes,
-            (output_index, class.key.output_elements()),
+            (&class.key, output_index),
             bytes,
             staging,
             prep,
@@ -817,6 +830,8 @@ impl Session {
             binding_bytes: sizes.clone(),
             staging_bytes: scratch.staging.stats.retained_staging_bytes,
             staging_reused: scratch.staging_reused,
+            input_b_reused: scratch.input_b_reused,
+            baseline_reused,
         });
         let bindings = PhaseTimer::new(&mut prep.bindings);
         let sequences: Vec<Vec<_>> = variants
@@ -841,31 +856,42 @@ impl Session {
         phases.qualification_breakdown = Some(Default::default());
         let details = phases.qualification_breakdown.as_mut().unwrap();
         let qualification = PhaseTimer::new(&mut phases.qualification);
-        for pattern in 0..2 {
+        let mut inputs = Vec::new();
+        // Finish on ordinary inputs so warmup can use the qualified buffers.
+        for pattern in [1, 0] {
             if start.elapsed() >= options.max_time {
                 outcome.decision = TuneDecision::TimeBudget;
                 return;
             }
-            let inputs = {
+            {
                 let _timer = PhaseTimer::new(&mut details.input_preparation);
-                prepared_inputs(&logical_sizes, &sizes, pattern, class.key.weight_format)
-            };
-            for (index, data) in inputs.iter().enumerate() {
-                scratch.upload(index, data, Some(&mut *details));
+                if inputs.is_empty() {
+                    inputs = prepared_inputs(
+                        &logical_sizes,
+                        &sizes,
+                        pattern as u32,
+                        class.key.weight_format,
+                    );
+                } else {
+                    update_input_pattern(&mut inputs, &logical_sizes, pattern as u32);
+                }
             }
-            let mut reference = Vec::new();
+            for (index, data) in inputs.iter().enumerate() {
+                // B is identical across this class, both patterns and warmup.
+                if index != 1 || (pattern == 1 && !scratch.input_b_reused) {
+                    scratch.upload(index, data, Some(&mut *details));
+                }
+            }
+            scratch.input_b_uploaded = true;
             for variant in 0..2 {
+                if variant == 0 && baseline_reused {
+                    continue;
+                }
                 if start.elapsed() >= options.max_time {
                     outcome.decision = TuneDecision::TimeBudget;
                     return;
                 }
-                for (index, &bytes) in sizes.iter().enumerate().skip(output_index) {
-                    let sentinel = {
-                        let _timer = PhaseTimer::new(&mut details.input_preparation);
-                        vec![f32::NAN; bytes / 4]
-                    };
-                    scratch.upload(index, &sentinel, Some(&mut *details));
-                }
+                scratch.poison_outputs(&sizes, details);
                 {
                     let _timer = PhaseTimer::new(&mut details.dispatch);
                     scratch.run(&sequences[variant], 1);
@@ -874,8 +900,15 @@ impl Session {
                 let scale = if pattern == 0 { 1.0 } else { 1.0e-12 };
                 let valid = {
                     let _timer = PhaseTimer::new(&mut details.validation);
-                    qualify_output(&class.key, &inputs, &output, scale)
-                        && (variant == 0 || outputs_agree(&reference, &output, scale))
+                    // The incumbent output has already passed the reference,
+                    // finiteness and extent checks for this exact input pattern.
+                    let identical = variant == 1
+                        && bytemuck::cast_slice::<f32, u8>(&baseline_outputs[pattern])
+                            == bytemuck::cast_slice::<f32, u8>(&output);
+                    identical
+                        || (qualify_output(&class.key, &inputs, &output, scale)
+                            && (variant == 0
+                                || outputs_agree(&baseline_outputs[pattern], &output, scale)))
                 };
                 if !valid {
                     outcome.decision = TuneDecision::InvalidOutput;
@@ -933,34 +966,31 @@ impl Session {
                         }
                     }
                 }
-                reference = output;
+                if variant == 0 {
+                    baseline_outputs[pattern] = output;
+                } else {
+                    candidate_outputs[pattern] = output;
+                }
             }
         }
         outcome.qualified = true;
         drop(qualification);
         let warmup = PhaseTimer::new(&mut phases.warmup);
-        // Time ordinary-magnitude data, not a zero-filled or subnormal
-        // workload — and the *same* data qualification ran on. Rebuilding it
-        // here without the packed-scale taming timed a workload full of NaN
-        // and wildly scaled blocks that no candidate had been qualified
-        // against, which is both a different kernel cost on hardware that
-        // penalizes them and not the thing the measurement claims to compare.
-        for (index, data) in prepared_inputs(&logical_sizes, &sizes, 0, class.key.weight_format)
-            .iter()
-            .enumerate()
-        {
-            scratch.upload(index, data, None);
-        }
+        drop(inputs);
+        let mut warmup_ms = [f64::INFINITY; 2];
         for _ in 0..options.warmup_runs {
             for variant in 0..2 {
                 if start.elapsed() >= options.max_time {
                     outcome.decision = TuneDecision::TimeBudget;
                     return;
                 }
-                scratch.run(&sequences[variant], 1);
+                let ms = scratch.run(&sequences[variant], 1);
+                warmup_ms[variant] = warmup_ms[variant].min(ms);
             }
         }
         drop(warmup);
+        let repetitions = options.sample_repetitions(warmup_ms);
+        outcome.sample_repetitions = Some(repetitions);
         let sampling = PhaseTimer::new(&mut phases.sampling);
         (outcome.baseline_ms, outcome.candidate_ms) =
             measure_pairs(options.sample_pairs, |alternative| {
@@ -968,14 +998,30 @@ impl Session {
                     return None;
                 }
                 let index = usize::from(alternative);
-                let ms = scratch.run(&sequences[index], options.dispatches_per_sample);
+                let ms = scratch.run(&sequences[index], repetitions);
                 // Do not accept a last pair that only finished after the deadline.
-                (start.elapsed() < options.max_time)
-                    .then_some(ms / options.dispatches_per_sample as f64)
+                (start.elapsed() < options.max_time).then_some(ms / repetitions as f64)
             });
         drop(sampling);
         drop(scratch);
         decide(outcome, options);
+        if outcome.candidate_split_k.is_none()
+            && matches!(
+                outcome.decision,
+                TuneDecision::FasterCandidate | TuneDecision::KeepBaseline
+            )
+        {
+            staging.baseline = Some(QualifiedBaseline {
+                class: class.key.clone(),
+                tile: outcome.selected,
+                binding_bytes: sizes,
+                outputs: if outcome.selected == outcome.candidate {
+                    candidate_outputs
+                } else {
+                    baseline_outputs
+                },
+            });
+        }
     }
 }
 
@@ -1099,7 +1145,22 @@ struct Staging<'gpu> {
     memory: TuneStaging,
     reuse: TuneStagingReuse,
     buffer: Option<bg::Buffer>,
+    input_b: Option<RetainedInput>,
+    baseline: Option<QualifiedBaseline>,
     stats: TuneScratchStats,
+}
+
+struct RetainedInput {
+    class: TuneClass,
+    buffer: bg::Buffer,
+    uploaded: bool,
+}
+
+struct QualifiedBaseline {
+    class: TuneClass,
+    tile: MatmulTile,
+    binding_bytes: Vec<usize>,
+    outputs: [Vec<f32>; 2],
 }
 
 impl<'gpu> Staging<'gpu> {
@@ -1109,11 +1170,19 @@ impl<'gpu> Staging<'gpu> {
             memory,
             reuse,
             buffer: None,
+            input_b: None,
+            baseline: None,
             stats: Default::default(),
         }
     }
 
     fn clear(&mut self) {
+        self.baseline = None;
+        self.clear_staging();
+        self.clear_input_b();
+    }
+
+    fn clear_staging(&mut self) {
         if let Some(buffer) = self.buffer.take() {
             self.gpu.destroy_buffer(buffer);
             self.stats.staging_releases += 1;
@@ -1123,7 +1192,29 @@ impl<'gpu> Staging<'gpu> {
 
     fn discard_unmatched(&mut self, bytes: usize) {
         if !reuse_staging(self.reuse, self.stats.retained_staging_bytes, bytes) {
-            self.clear();
+            self.clear_staging();
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.stats.retained_staging_bytes + self.stats.retained_input_bytes
+    }
+
+    fn clear_input_b(&mut self) {
+        if let Some(input) = self.input_b.take() {
+            self.gpu.destroy_buffer(input.buffer);
+            self.stats.input_b_releases += 1;
+            self.stats.retained_input_bytes = 0;
+        }
+    }
+
+    fn discard_input_b(&mut self, class: &TuneClass, bytes: usize) {
+        if self
+            .input_b
+            .as_ref()
+            .is_some_and(|input| input.class != *class || self.stats.retained_input_bytes != bytes)
+        {
+            self.clear_input_b();
         }
     }
 
@@ -1166,6 +1257,9 @@ struct Scratch<'gpu, 'trial> {
     buffers: Vec<bg::Buffer>,
     staging: &'trial mut Staging<'gpu>,
     staging_reused: bool,
+    class: &'trial TuneClass,
+    input_b_reused: bool,
+    input_b_uploaded: bool,
     output_index: usize,
     output_elements: usize,
     encoder: bg::CommandEncoder,
@@ -1176,13 +1270,13 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
     fn new(
         device_local: &[bool],
         sizes: &[usize],
-        output: (usize, usize),
+        output: (&'trial TuneClass, usize),
         bytes: usize,
         staging: &'trial mut Staging<'gpu>,
         preparation: &mut TunePreparationTimes,
         cleanup: &'trial mut Option<Duration>,
     ) -> Self {
-        let (output_index, output_elements) = output;
+        let (class, output_index) = output;
         let gpu = staging.gpu;
         assert!(
             staging.buffer.is_none()
@@ -1195,15 +1289,23 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
         let checks = PhaseTimer::new(&mut preparation.checks);
         ensure_device_memory_budget(
             gpu,
-            bytes - staging.stats.retained_staging_bytes,
+            bytes - staging.retained_bytes(),
             "kernel tuning scratch",
         );
         drop(checks);
         let buffers_time = PhaseTimer::new(&mut preparation.buffers);
-        let buffers = sizes
+        let retained_input = staging.input_b.take();
+        let input_b_reused = retained_input.as_ref().is_some_and(|input| input.uploaded);
+        let buffers: Vec<_> = sizes
             .iter()
             .enumerate()
             .map(|(i, &size)| {
+                if i == 1 {
+                    if let Some(ref input) = retained_input {
+                        assert_eq!(size, staging.stats.retained_input_bytes);
+                        return input.buffer;
+                    }
+                }
                 gpu.create_buffer(bg::BufferDesc {
                     name: "tune_scratch",
                     size: size as u64,
@@ -1215,6 +1317,12 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
                 })
             })
             .collect();
+        if retained_input.is_some() {
+            staging.stats.input_b_reuses += 1;
+        } else {
+            staging.stats.input_b_allocations += 1;
+            staging.stats.retained_input_bytes = sizes[1];
+        }
         drop(buffers_time);
         let staging_time = PhaseTimer::new(&mut preparation.staging);
         let staging_reused = staging.acquire(*sizes.iter().max().unwrap());
@@ -1232,8 +1340,11 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
             buffers,
             staging,
             staging_reused,
+            class,
+            input_b_reused,
+            input_b_uploaded: input_b_reused,
             output_index,
-            output_elements,
+            output_elements: class.output_elements(),
             encoder,
             cleanup,
         }
@@ -1264,6 +1375,19 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
 
     fn read_output(&mut self, times: &mut TuneQualificationTimes) -> Vec<f32> {
         self.read_buffer(self.output_index, self.output_elements, times)
+    }
+
+    fn poison_outputs(&mut self, sizes: &[usize], times: &mut TuneQualificationTimes) {
+        let _timer = PhaseTimer::new(&mut times.output_clear);
+        self.encoder.start();
+        {
+            let mut transfer = self.encoder.transfer("tune_poison");
+            for (index, &bytes) in sizes.iter().enumerate().skip(self.output_index) {
+                // Repeating 0xff produces an f32 NaN at every output element.
+                transfer.fill_buffer(self.buffers[index].into(), bytes as u64, 0xff);
+            }
+        }
+        self.submit_wait();
     }
 
     fn read_buffer(
@@ -1317,8 +1441,13 @@ impl Drop for Scratch<'_, '_> {
         let _timer = PhaseTimer::new(self.cleanup);
         self.gpu.destroy_command_encoder(&mut self.encoder);
         if self.staging.reuse == TuneStagingReuse::Fresh {
-            self.staging.clear();
+            self.staging.clear_staging();
         }
+        self.staging.input_b = Some(RetainedInput {
+            class: self.class.clone(),
+            buffer: self.buffers.swap_remove(1),
+            uploaded: self.input_b_uploaded,
+        });
         for buffer in self.buffers.drain(..) {
             self.gpu.destroy_buffer(buffer);
         }
@@ -1347,29 +1476,46 @@ fn prepared_inputs(
     inputs
 }
 
+fn pattern_scale(pattern: u32, operand: usize) -> f32 {
+    if pattern == 1 && operand != 1 {
+        1.0e-12
+    } else {
+        1.0
+    }
+}
+
 fn test_inputs(sizes: &[usize], pattern: u32) -> Vec<Vec<f32>> {
     (0..sizes.len() - 1)
         .map(|operand| {
-            let scale = if pattern == 1 && operand != 1 {
-                1.0e-12
-            } else {
-                1.0
-            };
+            let scale = pattern_scale(pattern, operand);
             (0..sizes[operand] / 4)
-                .map(|index| {
-                    let mut bits = (index as u32)
-                        .wrapping_add(0x9e37_79b9u32.wrapping_mul(operand as u32 + 1));
-                    bits ^= bits >> 16;
-                    bits = bits.wrapping_mul(0x85eb_ca6b);
-                    bits ^= bits >> 13;
-                    // All operands differ, including addend; no all-zero qualification.
-                    // Exercise full mantissas, not just values already exact
-                    // in a reduced-mantissa matrix implementation.
-                    ((bits >> 8) as f32 / 16_777_216.0 - 0.5) * scale
-                })
+                .map(|index| test_input_value(index, operand) * scale)
                 .collect()
         })
         .collect()
+}
+
+fn test_input_value(index: usize, operand: usize) -> f32 {
+    let mut bits = (index as u32).wrapping_add(0x9e37_79b9u32.wrapping_mul(operand as u32 + 1));
+    bits ^= bits >> 16;
+    bits = bits.wrapping_mul(0x85eb_ca6b);
+    bits ^= bits >> 13;
+    // Distinct operands and full mantissas, including the addend.
+    (bits >> 8) as f32 / 16_777_216.0 - 0.5
+}
+
+fn update_input_pattern(inputs: &mut [Vec<f32>], logical_sizes: &[usize], pattern: u32) {
+    for (operand, data) in inputs.iter_mut().enumerate() {
+        if operand == 1 {
+            continue;
+        }
+        let scale = pattern_scale(pattern, operand);
+        let elements = logical_sizes[operand] / 4;
+        for (index, value) in data[..elements].iter_mut().enumerate() {
+            *value = test_input_value(index, operand) * scale;
+        }
+        data[elements..].fill(0.0);
+    }
 }
 
 fn close(reference: f64, actual: f32, scale: f64) -> bool {
@@ -1584,6 +1730,70 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "GPU qualification of cached incumbent outputs and invalidation"]
+    fn qualified_baseline_checks_both_patterns_and_exact_layout() {
+        let gpu = std::sync::Arc::new(
+            crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap(),
+        );
+        let mut graph = crate::Graph::new();
+        let x = graph.input("x", &[3, 5]);
+        let w = graph.parameter("w", &[5, 7]);
+        let y = graph.matmul(x, w);
+        graph.set_outputs(vec![y]);
+        let mut session = Session::with_context_opts(
+            crate::compile::compile(&graph),
+            gpu.clone(),
+            crate::SessionOptions {
+                coop: crate::CoopPolicy::Disabled,
+                ..Default::default()
+            },
+        );
+        let (classes, _) = collect_classes(&session.plan, &session.alias, None);
+        let class = &classes[0];
+        let options = TuneOptions {
+            max_time: Duration::from_secs(30),
+            sample_pairs: 2,
+            dispatches_per_sample: 1,
+            ..Default::default()
+        };
+        for mismatch in ["none", "class", "tile", "bindings"] {
+            let mut staging = Staging::new(&gpu, options.staging, options.staging_reuse);
+            let mut first =
+                TuneOutcome::new(class.key.clone(), 1, class.initial, class.challengers[0]);
+            session.measure_candidate(class, &options, Instant::now(), &mut first, &mut staging);
+            assert!(first.qualified, "{first:?}");
+            let baseline = staging.baseline.as_mut().unwrap();
+            let initial = baseline.tile;
+            let candidate = if initial == class.initial {
+                class.challengers[0]
+            } else {
+                class.initial
+            };
+            // Corruption at the end of the tiny-pattern output must be checked,
+            // including when the regular-pattern reference is still correct.
+            *baseline.outputs[1].last_mut().unwrap() = f32::NAN;
+            match mismatch {
+                "class" => baseline.class.shader = ShaderEntry::MatMulBT,
+                "tile" => baseline.tile = candidate,
+                "bindings" => baseline.binding_bytes[0] += 4,
+                _ => {}
+            }
+            let mut second = TuneOutcome::new(class.key.clone(), 1, initial, candidate);
+            session.measure_candidate(class, &options, Instant::now(), &mut second, &mut staging);
+            assert_eq!(
+                second.scratch.as_ref().unwrap().baseline_reused,
+                mismatch == "none"
+            );
+            assert_eq!(second.qualified, mismatch != "none", "{second:?}");
+            if mismatch == "none" {
+                assert_eq!(second.decision, TuneDecision::InvalidOutput);
+            }
+            staging.clear();
+            assert!(staging.baseline.is_none());
+        }
+    }
+
+    #[test]
     #[ignore = "GPU qualification of resumable private kernel searches"]
     fn kernel_memo_resumes_only_qualified_comparisons() {
         let gpu = std::sync::Arc::new(
@@ -1608,7 +1818,8 @@ mod tests {
         let options = TuneOptions {
             max_time: Duration::from_secs(30),
             sample_pairs: 4,
-            dispatches_per_sample: 1,
+            dispatches_per_sample: 16,
+            target_sample_time: Some(Duration::from_nanos(1)),
             ..Default::default()
         };
         let mut memo = KernelMemo::default();
@@ -1617,6 +1828,18 @@ mod tests {
             .unwrap();
         assert!(first.outcomes.len() > 1);
         assert!(first.outcomes.iter().all(|o| o.qualified));
+        assert!(!first.outcomes[0].scratch.as_ref().unwrap().baseline_reused);
+        assert!(
+            first.outcomes[1..]
+                .iter()
+                .all(|o| o.scratch.as_ref().unwrap().baseline_reused)
+        );
+        assert!(
+            first
+                .outcomes
+                .iter()
+                .all(|o| o.sample_repetitions == Some(1))
+        );
         assert!(!first.time_budget_exhausted);
         assert_eq!(memo.0.len(), 1);
         // Keep an actual qualified prefix, without timing-dependent sleeps or
@@ -1645,6 +1868,13 @@ mod tests {
         assert_eq!(resumed.reused_classes.len(), 1);
         assert_eq!(resumed.outcomes.len(), first.outcomes.len() - 1);
         assert!(resumed.outcomes.iter().all(|o| o.qualified));
+        assert!(
+            !resumed.outcomes[0]
+                .scratch
+                .as_ref()
+                .unwrap()
+                .baseline_reused
+        );
         assert_eq!(
             resumed
                 .outcomes
@@ -1689,6 +1919,7 @@ mod tests {
             threads: 64,
             reduction: crate::codegen::GemvReduction::Subgroup,
             bt_rows: 1,
+            column_groups: 1,
         };
         let dispatch = Dispatch {
             shader: ShaderEntry::MatMulGemv,
@@ -2156,7 +2387,7 @@ mod tests {
     #[test]
     #[ignore = "GPU staging round-trip qualification, not a performance assertion"]
     fn tuning_staging_round_trips_all_bits_and_declared_extents() {
-        let gpu = crate::init_gpu_context().unwrap();
+        let gpu = crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap();
         for (m, n, k) in [(3, 7, 5), (33, 65, 17), (2048, 1000, 1)] {
             for device_local in [false, true] {
                 let class = TuneClass {
@@ -2172,7 +2403,9 @@ mod tests {
                     binding_bytes: Vec::new(),
                     ..Default::default()
                 };
-                let sizes = class.buffer_sizes().unwrap();
+                let mut sizes = class.buffer_sizes().unwrap();
+                let output_index = sizes.len() - 1;
+                sizes.push(17 * 4);
                 let bytes = scratch_bytes(&sizes).unwrap();
                 let patterns = [
                     0,
@@ -2194,14 +2427,14 @@ mod tests {
                     let mut scratch = Scratch::new(
                         &vec![device_local; sizes.len()],
                         &sizes,
-                        (sizes.len() - 1, class.output_elements()),
+                        (&class, output_index),
                         bytes,
                         &mut staging,
                         &mut prep,
                         &mut cleanup,
                     );
                     let mut times = TuneQualificationTimes::default();
-                    scratch.upload(sizes.len() - 1, &data, Some(&mut times));
+                    scratch.upload(output_index, &data, Some(&mut times));
                     let read = scratch.read_output(&mut times);
                     assert_eq!(read.len(), data.len());
                     assert!(
@@ -2219,6 +2452,18 @@ mod tests {
                     }
                     assert_eq!(times.validation, None);
                     assert_eq!(times.dispatch, None);
+                    let input = vec![0.375; sizes[0] / 4];
+                    scratch.upload(0, &input, Some(&mut times));
+                    scratch.poison_outputs(&sizes, &mut times);
+                    assert!(scratch.read_output(&mut times).iter().all(|v| v.is_nan()));
+                    assert!(
+                        scratch
+                            .read_buffer(output_index + 1, 17, &mut times)
+                            .iter()
+                            .all(|v| v.is_nan())
+                    );
+                    assert_eq!(scratch.read_buffer(0, input.len(), &mut times), input);
+                    assert!(times.output_clear.is_some_and(|time| !time.is_zero()));
                     drop(scratch);
                     assert!(cleanup.is_some_and(|time| !time.is_zero()));
                 }
@@ -2244,12 +2489,18 @@ mod tests {
     #[test]
     #[ignore = "GPU exact-size reuse and early-return cleanup qualification"]
     fn staging_reuse_replaces_sizes_and_cleans_up_after_early_returns() {
-        fn trial(staging: &mut Staging<'_>, n: u32, stamp: u32) -> Result<(), ()> {
+        fn trial(
+            staging: &mut Staging<'_>,
+            m: u32,
+            n: u32,
+            stamp: u32,
+            reuse_b: bool,
+        ) -> Result<(), ()> {
             let class = TuneClass {
                 weight_format: crate::compile::WeightFormat::F32,
                 gemv_int_dot: false,
                 shader: ShaderEntry::MatMul,
-                m: 3,
+                m,
                 n,
                 k: 5,
                 conv2d: None,
@@ -2260,13 +2511,14 @@ mod tests {
             };
             let sizes = class.buffer_sizes().unwrap();
             staging.discard_unmatched(*sizes.iter().max().unwrap());
+            staging.discard_input_b(&class, sizes[1]);
             let mut prep = TunePreparationTimes::default();
             let mut cleanup = None;
             let result = (|| {
                 let mut scratch = Scratch::new(
                     &vec![true; sizes.len()],
                     &sizes,
-                    (sizes.len() - 1, class.output_elements()),
+                    (&class, sizes.len() - 1),
                     scratch_bytes(&sizes).unwrap(),
                     staging,
                     &mut prep,
@@ -2276,6 +2528,15 @@ mod tests {
                     .map(|i| f32::from_bits(0x7fc0_0000 | (stamp + i)))
                     .collect();
                 let mut times = TuneQualificationTimes::default();
+                let input_b: Vec<_> = (0..sizes[1] / 4)
+                    .map(|i| ((m + n) as usize + i) as f32 / 32.0)
+                    .collect();
+                assert_eq!(scratch.input_b_reused, reuse_b);
+                if !reuse_b {
+                    scratch.upload(1, &input_b, Some(&mut times));
+                }
+                scratch.input_b_uploaded = true;
+                assert_eq!(scratch.read_buffer(1, input_b.len(), &mut times), input_b);
                 scratch.upload(sizes.len() - 1, &data, Some(&mut times));
                 let read = scratch.read_output(&mut times);
                 if read.len() == data.len()
@@ -2291,16 +2552,21 @@ mod tests {
             assert!(cleanup.is_some());
             result
         }
-        let gpu = crate::init_gpu_context().unwrap();
+        let gpu = crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap();
         for memory in [TuneStaging::Shared, TuneStaging::Download] {
             for policy in [TuneStagingReuse::Fresh, TuneStagingReuse::SameSize] {
                 let mut staging = Staging::new(&gpu, memory, policy);
-                for (index, n) in [7, 7, 65, 7].into_iter().enumerate() {
-                    assert!(trial(&mut staging, n, index as u32 * 1024).is_err());
+                for (index, (m, n)) in [(3, 7), (3, 7), (3, 65), (4, 7), (3, 7)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    assert!(trial(&mut staging, m, n, index as u32 * 1024, index == 1).is_err());
                 }
                 let fresh = policy == TuneStagingReuse::Fresh;
-                assert_eq!(staging.stats.staging_allocations, if fresh { 4 } else { 3 });
-                assert_eq!(staging.stats.staging_reuses, if fresh { 0 } else { 1 });
+                assert_eq!(staging.stats.staging_allocations, if fresh { 5 } else { 3 });
+                assert_eq!(staging.stats.staging_reuses, if fresh { 0 } else { 2 });
+                assert_eq!(staging.stats.input_b_allocations, 4);
+                assert_eq!(staging.stats.input_b_reuses, 1);
                 assert_eq!(
                     staging.stats.peak_bytes,
                     scratch_bytes(&[60, 1300, 780]).unwrap()
@@ -2311,6 +2577,11 @@ mod tests {
                 );
                 staging.clear();
                 assert_eq!(staging.stats.retained_staging_bytes, 0);
+                assert_eq!(staging.stats.retained_input_bytes, 0);
+                assert_eq!(
+                    staging.stats.input_b_allocations,
+                    staging.stats.input_b_releases
+                );
                 assert_eq!(
                     staging.stats.staging_allocations,
                     staging.stats.staging_releases
@@ -2621,6 +2892,39 @@ mod tests {
     #[test]
     fn synthetic_packed_weights_decode_to_comparable_scales() {
         let sizes = [32, 32, 16];
+        for format in [
+            crate::compile::WeightFormat::F32,
+            crate::compile::WeightFormat::F16,
+            crate::compile::WeightFormat::Q4K,
+            crate::compile::WeightFormat::Q40,
+        ] {
+            let normal = prepared_inputs(&sizes, &sizes, 0, format);
+            let tiny = prepared_inputs(&sizes, &sizes, 1, format);
+            assert!(
+                normal[1]
+                    .iter()
+                    .zip(&tiny[1])
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "B must remain valid when only the activation pattern changes"
+            );
+            assert_ne!(normal[0], tiny[0]);
+            let physical = [64, 64, 32];
+            let mut reused = prepared_inputs(&sizes, &physical, 0, format);
+            let pointers: Vec<_> = reused.iter().map(|input| input.as_ptr()).collect();
+            for pattern in [1, 0, 1, 0] {
+                update_input_pattern(&mut reused, &sizes, pattern);
+                let expected = prepared_inputs(&sizes, &physical, pattern, format);
+                for ((actual, expected), pointer) in reused.iter().zip(expected).zip(&pointers) {
+                    assert_eq!(actual.as_ptr(), *pointer, "input allocation changed");
+                    assert!(
+                        actual
+                            .iter()
+                            .zip(expected)
+                            .all(|(a, b)| a.to_bits() == b.to_bits())
+                    );
+                }
+            }
+        }
         let raw = test_inputs(&sizes, 0);
         assert_eq!(
             prepared_inputs(&sizes, &sizes, 0, crate::compile::WeightFormat::F32),

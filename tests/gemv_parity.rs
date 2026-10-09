@@ -5,6 +5,63 @@
 
 use meganeura::Graph;
 
+#[test]
+fn grouped_columns_cover_partial_tiles_with_rmsnorm() {
+    use meganeura::reference::{Feeds, evaluate_outputs};
+
+    for f16 in [false, true] {
+        let mut g = Graph::new();
+        let input = g.input("x", &[1, 68]);
+        let scale = g.parameter("scale", &[68]);
+        let normalized = g.rms_norm(input, scale, 1e-5);
+        let w = if f16 {
+            g.parameter_f16("w", &[68, 36])
+        } else {
+            g.parameter("w", &[68, 36])
+        };
+        let output = g.matmul(normalized, w);
+        g.set_outputs(vec![output]);
+        let mut feeds = Feeds::new();
+        feeds.fill_random(&g, 37, 1.0);
+        let expected: Vec<_> = evaluate_outputs(&g, &feeds).unwrap()[0]
+            .data
+            .iter()
+            .map(|&v| v as f32)
+            .collect();
+        for column_groups in [1, 4, 8] {
+            let mut config = crate::support::gpu::inference_config();
+            config.tune = false;
+            config.options.gemv_shape = Some(meganeura::GemvShape {
+                threads: 32,
+                reduction: meganeura::GemvReduction::Tree,
+                bt_rows: 1,
+                column_groups,
+            });
+            let mut session = meganeura::build(&g, config).0;
+            assert!(
+                session
+                    .plan()
+                    .dispatches
+                    .iter()
+                    .any(|d| d.gemv_rmsnorm.is_some())
+            );
+            session.set_input("x", &feeds.f32("x").unwrap());
+            for name in ["scale", "w"] {
+                session.set_parameter(name, &feeds.f32(name).unwrap());
+            }
+            session.step();
+            session.wait();
+            assert_close_named(
+                &format!("grouped RMSNorm GEMV: f16={f16}, groups={column_groups}"),
+                &session.read_output(36),
+                &expected,
+                3e-5,
+                3e-5,
+            );
+        }
+    }
+}
+
 /// Reference CPU matmul for [1,K] × [K,N] → [1,N].
 fn cpu_gemv(a: &[f32], b: &[f32], k: usize, n: usize) -> Vec<f32> {
     let mut out = vec![0.0_f32; n];
@@ -65,33 +122,6 @@ fn q40_rmsnorm_folds_into_gemv() {
     let w = g.parameter_q40("w", &[K, N]);
     let y = g.matmul(h, w);
     g.set_outputs(vec![y]);
-    let mut config = crate::support::gpu::inference_config();
-    config.options.gemv_shape = Some(meganeura::GemvShape {
-        threads: 64,
-        reduction: meganeura::GemvReduction::Subgroup,
-        bt_rows: 1,
-    });
-    let mut session = meganeura::build(&g, config).0;
-    let fused = session
-        .plan()
-        .dispatches
-        .iter()
-        .filter(|d| d.gemv_rmsnorm.is_some())
-        .count();
-    assert_eq!(fused, 1, "Q40 GEMV should fold the RmsNorm");
-    assert!(
-        session
-            .plan()
-            .dispatches
-            .iter()
-            .all(|d| d.reduction().is_none())
-    );
-    session.set_input("x", &x);
-    session.set_parameter("nw", &nw);
-    session.set_parameter_packed("w", &packed);
-    session.step();
-    session.wait();
-    let gpu = session.read_output(N);
 
     let ms = x.iter().map(|v| v * v).sum::<f32>() / K as f32;
     let inv = (ms + 1e-5).sqrt().recip();
@@ -101,7 +131,43 @@ fn q40_rmsnorm_folds_into_gemv() {
             want[col] += x[i] * inv * nw[i] * reference[i * N + col];
         }
     }
-    assert_close_named("Q40 RmsNorm GEMV", &gpu, &want, 2e-2, 2e-2);
+    for (reduction, column_groups, integer_dot) in [
+        (meganeura::GemvReduction::Subgroup, 1, true),
+        (meganeura::GemvReduction::Tree, 8, true),
+        (meganeura::GemvReduction::Tree, 8, false),
+    ] {
+        let mut config = crate::support::gpu::inference_config();
+        config.options.gemv_shape = Some(meganeura::GemvShape {
+            threads: 32,
+            reduction,
+            bt_rows: 1,
+            column_groups,
+        });
+        config.options.quantized_activations = integer_dot;
+        let mut session = meganeura::build(&g, config).0;
+        let fused = session
+            .plan()
+            .dispatches
+            .iter()
+            .filter(|d| d.gemv_rmsnorm.is_some())
+            .count();
+        assert_eq!(fused, 1, "Q40 GEMV should fold the RmsNorm");
+        assert!(
+            session
+                .plan()
+                .dispatches
+                .iter()
+                .all(|d| d.reduction().is_none())
+        );
+        session.set_input("x", &x);
+        session.set_parameter("nw", &nw);
+        session.set_parameter_packed("w", &packed);
+        session.step();
+        session.wait();
+        let gpu = session.read_output(N);
+
+        assert_close_named("Q40 RmsNorm GEMV", &gpu, &want, 2e-2, 2e-2);
+    }
 }
 
 #[test]
@@ -335,20 +401,24 @@ fn gemv_shapes_cover_widths_reductions_and_row_tails() {
     let want_bt_add: Vec<_> = want_bt.iter().zip(&addend).map(|(a, b)| a + b).collect();
 
     use GemvReduction::{Subgroup, Tree};
-    for (threads, reduction, bt_rows) in [
-        (32, Tree, 1),
-        (32, Subgroup, 4),
-        (64, Tree, 2),
-        (64, Subgroup, 1),
-        (128, Tree, 4),
-        (128, Subgroup, 2),
-        (256, Tree, 1),
-        (256, Subgroup, 4),
+    for (threads, reduction, bt_rows, column_groups) in [
+        (32, Tree, 1, 1),
+        (32, Subgroup, 4, 1),
+        (64, Tree, 2, 1),
+        (64, Subgroup, 1, 1),
+        (128, Tree, 4, 1),
+        (128, Subgroup, 2, 1),
+        (256, Tree, 1, 1),
+        (256, Subgroup, 4, 1),
+        (32, Tree, 1, 4),
+        (32, Tree, 1, 8),
+        (64, Tree, 1, 4),
     ] {
         let shape = GemvShape {
             threads,
             reduction,
             bt_rows,
+            column_groups,
         };
         let mut g = Graph::new();
         let x = g.input("x", &[1, K]);

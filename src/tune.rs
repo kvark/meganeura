@@ -414,11 +414,20 @@ impl MatmulTile {
             if gemv_group(&class.shader).is_none()
                 || !matches!(shape.threads, 32 | 64 | 128 | 256)
                 || !matches!(shape.bt_rows, 1 | 2 | 4)
+                || !shape.valid_columns()
+                || (shape.column_groups > 1
+                    && (!matches!(
+                        class.shader,
+                        ShaderEntry::MatMulGemv | ShaderEntry::MatMulGemvAdd
+                    ) || !matches!(
+                        class.weight_format,
+                        crate::compile::WeightFormat::F32 | crate::compile::WeightFormat::F16
+                    )))
             {
                 return None;
             }
             let sizes = class.buffer_sizes()?;
-            // GEMV workgroup count is N/4, independent of thread count.
+            // The default forward GEMV workgroup count is N/4.
             // Vocab-width decode (N=262144) needs 65536 groups — one past the
             // Vulkan *minimum* maxComputeWorkGroupCount. The live plan already
             // dispatches that on devices that advertise more; applying the
@@ -694,7 +703,7 @@ impl TuneClass {
         ) {
             crate::compile::row_gemv_workgroups(self.n.div_ceil(shape.bt_rows))
         } else {
-            [self.n / 4, 1, 1]
+            crate::compile::gemv_workgroups(self.n, shape)
         }
     }
 
@@ -709,6 +718,14 @@ impl TuneClass {
         if let MatmulTile::Gemv(shape) = initial {
             use crate::codegen::{GemvReduction, GemvShape};
             let mut out = Vec::new();
+            for column_groups in [4, 8] {
+                out.push(MatmulTile::Gemv(GemvShape {
+                    threads: 32,
+                    reduction: GemvReduction::Tree,
+                    bt_rows: 1,
+                    column_groups,
+                }));
+            }
             let rows: &[u32] = if matches!(
                 self.shader,
                 ShaderEntry::MatMulGemvBT | ShaderEntry::MatMulGemvBTAdd
@@ -724,6 +741,7 @@ impl TuneClass {
                             threads,
                             reduction,
                             bt_rows,
+                            column_groups: 1,
                         }));
                     }
                 }
@@ -861,7 +879,14 @@ pub struct TuneOptions {
     pub sample_pairs: usize,
     /// Separate, barrier-delimited dispatches in each timed submission;
     /// complete sequences for split-K and cached-attention measurements.
+    /// This is an upper bound when `target_sample_time` is set.
     pub dispatches_per_sample: u32,
+    /// Use warmup timings to aim for this duration in the faster variant,
+    /// capped by `dispatches_per_sample`. Both variants use the same count.
+    /// None, or no warmup, retains the fixed dispatch count. Historical
+    /// reports default to None; new searches target two milliseconds.
+    #[serde(default)]
+    pub target_sample_time: Option<Duration>,
     /// Required fractional improvement, in addition to a noise margin.
     pub min_improvement: f64,
 }
@@ -878,6 +903,7 @@ impl Default for TuneOptions {
             warmup_runs: 1,
             sample_pairs: 6,
             dispatches_per_sample: 16,
+            target_sample_time: Some(Duration::from_millis(2)),
             min_improvement: 0.05,
         }
     }
@@ -906,10 +932,25 @@ impl TuneOptions {
         if self.warmup_runs > 32 {
             return Err(TuneError("warmup_runs must not exceed 32"));
         }
+        if self.target_sample_time.is_some_and(|time| time.is_zero()) {
+            return Err(TuneError("target_sample_time must be positive when set"));
+        }
         if !self.min_improvement.is_finite() || !(0.0..1.0).contains(&self.min_improvement) {
             return Err(TuneError("min_improvement must be finite and in [0, 1)"));
         }
         Ok(())
+    }
+
+    pub(crate) fn sample_repetitions(&self, warmup_ms: [f64; 2]) -> u32 {
+        let Some(target) = self.target_sample_time else {
+            return self.dispatches_per_sample;
+        };
+        if warmup_ms.iter().any(|ms| !ms.is_finite() || *ms <= 0.0) {
+            return self.dispatches_per_sample;
+        }
+        let faster_ms = warmup_ms[0].min(warmup_ms[1]);
+        let count = (target.as_secs_f64() * 1000.0 / faster_ms).ceil() as u32;
+        count.clamp(1, self.dispatches_per_sample)
     }
 }
 
@@ -943,7 +984,7 @@ pub struct TunePhaseTimes {
     /// `None` means an older report or qualification was not reached.
     #[serde(default)]
     pub qualification_breakdown: Option<TuneQualificationTimes>,
-    /// Restoring ordinary-magnitude scratch inputs and warming both variants.
+    /// Warming both variants on the ordinary-magnitude qualification inputs.
     pub warmup: Option<Duration>,
     /// Paired timing loop, including incomplete/discarded pairs and host checks.
     /// Not the sum of accepted per-dispatch samples or GPU timestamp duration.
@@ -976,12 +1017,15 @@ pub struct TunePreparationTimes {
 /// outside these scopes remain in the enclosing qualification time.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuneQualificationTimes {
-    /// Deterministic inputs, padding and NaN output sentinels.
+    /// Deterministic inputs and padding.
     pub input_preparation: Option<Duration>,
     /// CPU copy into mapped staging memory.
     pub upload_host_copy: Option<Duration>,
     /// Upload encoding, transfer, submission and wait.
     pub upload_transfer: Option<Duration>,
+    /// GPU fill of output and split-partial NaN sentinels, including the wait.
+    #[serde(default)]
+    pub output_clear: Option<Duration>,
     /// Candidate encoding, dispatch, submission and wait.
     pub dispatch: Option<Duration>,
     /// Readback encoding, transfer, submission and wait.
@@ -1024,6 +1068,10 @@ pub struct TuneOutcome<Class = TuneClass, Choice = MatmulTile> {
     pub scratch: Option<TuneScratchUsage>,
     pub baseline_ms: Vec<f64>,
     pub candidate_ms: Vec<f64>,
+    /// Actual dispatch/sequence count used for each paired kernel sample.
+    /// None for historical reports, whole-program trials, or skipped sampling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_repetitions: Option<u32>,
     pub baseline_median_ms: Option<f64>,
     pub candidate_median_ms: Option<f64>,
     /// Twice the median absolute deviation of paired time differences.
@@ -1049,6 +1097,7 @@ impl<Class, Choice: Copy> TuneOutcome<Class, Choice> {
             scratch: None,
             baseline_ms: Vec::new(),
             candidate_ms: Vec::new(),
+            sample_repetitions: None,
             baseline_median_ms: None,
             candidate_median_ms: None,
             noise_margin_ms: None,
@@ -1062,9 +1111,16 @@ pub struct TuneScratchUsage {
     pub binding_bytes: Vec<usize>,
     pub staging_bytes: usize,
     pub staging_reused: bool,
+    /// The identical synthetic B operand was already resident for this class.
+    #[serde(default)]
+    pub input_b_reused: bool,
+    /// Both input patterns reuse full, previously qualified incumbent outputs
+    /// from this call, with the same class, tile and physical binding sizes.
+    #[serde(default)]
+    pub baseline_reused: bool,
 }
 
-/// Private staging lifetime and peak simultaneous scratch requests in one call.
+/// Private scratch lifetime and peak simultaneous allocation requests in one call.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuneScratchStats {
     pub staging_allocations: usize,
@@ -1074,6 +1130,15 @@ pub struct TuneScratchStats {
     pub peak_bytes: usize,
     /// Must be zero when `tune_with` returns, including bounded/failed searches.
     pub retained_staging_bytes: usize,
+    #[serde(default)]
+    pub input_b_allocations: usize,
+    #[serde(default)]
+    pub input_b_reuses: usize,
+    #[serde(default)]
+    pub input_b_releases: usize,
+    /// Must be zero when tuning returns, including bounded/failed searches.
+    #[serde(default)]
+    pub retained_input_bytes: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1091,7 +1156,7 @@ pub struct TuneReport {
     pub class_limit_reached: bool,
     pub time_budget_exhausted: bool,
     pub elapsed: Duration,
-    /// Release of retained staging and unused convolution pipelines, within
+    /// Release of retained scratch and unused convolution pipelines, within
     /// total `elapsed`. None when cleanup was not run or recorded.
     #[serde(default)]
     pub final_cleanup: Option<Duration>,
@@ -1290,6 +1355,7 @@ mod tests {
                         threads,
                         reduction,
                         bt_rows: 1,
+                        column_groups: 1,
                     };
                     assert!(
                         seen.contains(&MatmulTile::Gemv(shape)),
@@ -1353,6 +1419,7 @@ mod tests {
                 threads: 64,
                 reduction: GemvReduction::Subgroup,
                 bt_rows: 1,
+                column_groups: 1,
             })
             .fits(&class),
             "64-wide subgroup fused Q4_0 GEMV must fit the class scratch"
@@ -1434,6 +1501,7 @@ mod tests {
                 threads: 64,
                 reduction: crate::codegen::GemvReduction::Subgroup,
                 bt_rows,
+                column_groups: 1,
             };
             MatmulTile::Gemv(shape).apply(&mut d, &class);
             assert_eq!(
@@ -1756,6 +1824,7 @@ mod tests {
             scratch: None,
             baseline_ms: vec![10.0; 6],
             candidate_ms: vec![8.0; 6],
+            sample_repetitions: Some(16),
             baseline_median_ms: None,
             candidate_median_ms: None,
             noise_margin_ms: None,
@@ -1813,9 +1882,30 @@ mod tests {
                 min_improvement: f64::NAN,
                 ..Default::default()
             },
+            TuneOptions {
+                target_sample_time: Some(Duration::ZERO),
+                ..Default::default()
+            },
         ] {
             assert!(options.validate().is_err());
         }
+    }
+
+    #[test]
+    fn adaptive_samples_keep_a_common_bounded_count() {
+        let mut options = TuneOptions::default();
+        assert_eq!(options.sample_repetitions([0.01, 0.02]), 16);
+        assert_eq!(options.sample_repetitions([0.5, 2.0]), 4);
+        assert_eq!(options.sample_repetitions([2.0, 0.5]), 4);
+        assert_eq!(options.sample_repetitions([5.0, 3.0]), 1);
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(options.sample_repetitions([invalid, 3.0]), 16);
+            assert_eq!(options.sample_repetitions([3.0, invalid]), 16);
+        }
+        options.dispatches_per_sample = 2;
+        assert_eq!(options.sample_repetitions([0.5, 2.0]), 2);
+        options.target_sample_time = None;
+        assert_eq!(options.sample_repetitions([5.0, 3.0]), 2);
     }
 
     #[test]
@@ -1832,7 +1922,24 @@ mod tests {
             report.outcomes[0].baseline_ms
         );
         assert_eq!(restored.options.max_time, report.options.max_time);
+        assert_eq!(
+            restored.options.target_sample_time,
+            report.options.target_sample_time
+        );
         assert_eq!(restored.outcomes[0].class, report.outcomes[0].class);
+        assert_eq!(restored.outcomes[0].sample_repetitions, Some(16));
+        let mut legacy = serde_json::to_value(&report).unwrap();
+        legacy["options"]
+            .as_object_mut()
+            .unwrap()
+            .remove("target_sample_time");
+        legacy["outcomes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("sample_repetitions");
+        let restored: TuneReport = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.options.target_sample_time, None);
+        assert_eq!(restored.outcomes[0].sample_repetitions, None);
     }
 
     #[test]

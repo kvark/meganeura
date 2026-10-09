@@ -493,6 +493,9 @@ fn tuning_releases_retained_staging_after_a_later_scratch_skip() {
         &graph,
         SessionConfig {
             mode: Mode::Inference,
+            gpu: Some(std::sync::Arc::new(
+                meganeura::init_gpu_context_with(meganeura::GpuOptions::from_env()).unwrap(),
+            )),
             runtime: SessionOptions {
                 coop: CoopPolicy::Disabled,
                 ..Default::default()
@@ -526,6 +529,21 @@ fn tuning_releases_retained_staging_after_a_later_scratch_skip() {
     assert_eq!(stats.staging_releases, 1);
     assert_eq!(stats.staging_reuses, qualified - 1);
     assert_eq!(stats.retained_staging_bytes, 0);
+    assert_eq!(stats.input_b_allocations, 1);
+    assert_eq!(stats.input_b_reuses, qualified - 1);
+    assert_eq!(stats.input_b_releases, 1);
+    assert_eq!(stats.retained_input_bytes, 0);
+    let mut qualified_outcomes = report.outcomes.iter().filter(|o| o.qualified);
+    assert!(
+        !qualified_outcomes
+            .next()
+            .unwrap()
+            .scratch
+            .as_ref()
+            .unwrap()
+            .input_b_reused
+    );
+    assert!(qualified_outcomes.all(|o| o.scratch.as_ref().unwrap().input_b_reused));
     assert_eq!(stats.peak_bytes, 3 * 32 * 4096 * 4 + 32 * 32 * 4);
     assert!(report.final_cleanup.is_some());
     let keys = session.dispatch_pipeline_keys();
