@@ -793,7 +793,12 @@ impl<'a> Compiler<'a> {
                         params: vec![m, k, n, 0],
 
                         weight_format: wf,
-                        kernel: self.options.gemv_kernel(ShaderGroup::MatMulGemv, wf),
+                        kernel: self.options.gemv_kernel(
+                            ShaderGroup::MatMulGemv,
+                            wf,
+                            self.coop_caps,
+                            n,
+                        ),
                         ..Default::default()
                     };
                     dispatch.workgroups = gemv_workgroups(n, dispatch.gemv_shape().unwrap());
@@ -879,7 +884,12 @@ impl<'a> Compiler<'a> {
                         params: vec![m, n, k, 0],
 
                         weight_format: wf,
-                        kernel: self.options.gemv_kernel(ShaderGroup::MatMulGemvBT, wf),
+                        kernel: self.options.gemv_kernel(
+                            ShaderGroup::MatMulGemvBT,
+                            wf,
+                            self.coop_caps,
+                            n,
+                        ),
                         ..Default::default()
                     });
                 } else {
@@ -1013,7 +1023,12 @@ impl<'a> Compiler<'a> {
                         params: vec![m, k, n, 0],
 
                         weight_format: wf,
-                        kernel: self.options.gemv_kernel(ShaderGroup::MatMulGemvAdd, wf),
+                        kernel: self.options.gemv_kernel(
+                            ShaderGroup::MatMulGemvAdd,
+                            wf,
+                            self.coop_caps,
+                            n,
+                        ),
                         ..Default::default()
                     };
                     dispatch.workgroups = gemv_workgroups(n, dispatch.gemv_shape().unwrap());
@@ -1098,7 +1113,12 @@ impl<'a> Compiler<'a> {
 
                     weight_format: wf,
                     kernel: if gemv {
-                        self.options.gemv_kernel(ShaderGroup::MatMulGemvBTAdd, wf)
+                        self.options.gemv_kernel(
+                            ShaderGroup::MatMulGemvBTAdd,
+                            wf,
+                            self.coop_caps,
+                            n,
+                        )
                     } else {
                         Kernel::Default
                     },
