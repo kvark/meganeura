@@ -288,6 +288,14 @@ pub fn make_session(
     gpu: &Arc<blade_graphics::Context>,
     policy: CoopPolicy,
 ) -> (Session, Value) {
+    make_session_with(case, gpu, runtime_options(policy))
+}
+
+pub fn make_session_with(
+    case: &Case,
+    gpu: &Arc<blade_graphics::Context>,
+    runtime: SessionOptions,
+) -> (Session, Value) {
     let start = Instant::now();
     let (mut session, _) = meganeura::build(
         &case.graph,
@@ -298,7 +306,7 @@ pub fn make_session(
                 Mode::Training
             },
             gpu: Some(Arc::clone(gpu)),
-            runtime: runtime_options(policy),
+            runtime,
             options: compile_options(),
             ..Default::default()
         },
