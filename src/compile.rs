@@ -238,11 +238,36 @@ pub struct ConvWeightSplits {
 }
 
 impl CompileOptions {
-    fn gemv_kernel(&self, group: ShaderGroup, format: WeightFormat) -> Kernel {
+    fn gemv_kernel(
+        &self,
+        group: ShaderGroup,
+        format: WeightFormat,
+        caps: crate::codegen::CoopCaps,
+        n: u32,
+    ) -> Kernel {
         let mut shape = self.gemv_shape.map_or_else(
             || crate::codegen::GemvShape::initial(group),
             |shape| shape.for_group(group),
         );
+        // Native 16x16 f32 devices include CDNA, whose dense forward GEMVs
+        // read best with grouped columns in 256-thread workgroups. Narrower
+        // outputs keep one group to retain enough workgroups. Explicit
+        // shapes win.
+        if self.gemv_shape.is_none()
+            && caps.f32_tile == 16
+            && format == WeightFormat::F32
+            && matches!(group, ShaderGroup::MatMulGemv | ShaderGroup::MatMulGemvAdd)
+            && n >= 512
+        {
+            shape.column_groups = if n < 2048 {
+                2
+            } else if n < 16384 {
+                4
+            } else {
+                8
+            };
+            shape.threads = 256 / shape.column_groups;
+        }
         if format.is_quantized() {
             shape.column_groups = 1;
         }
@@ -3924,6 +3949,62 @@ mod tests {
         // workgroups = [ceil(N/64), ceil(M/64), 1] = [1, 1, 1] (4×4 register-tiled)
         assert_eq!(d.workgroups, [1, 1, 1]);
         assert_eq!(d.params, vec![33, 64, 17, 0]);
+    }
+
+    #[test]
+    fn native_f32_gemv_defaults_group_columns() {
+        let native = crate::codegen::CoopCaps {
+            f32_tile: 16,
+            f16_tile: 16,
+        };
+        let groups = |k: usize, n: usize, add: bool, f16: bool, caps| {
+            let mut graph = Graph::new();
+            let a = graph.input("a", &[1, k]);
+            let b = if f16 {
+                graph.parameter_f16("b", &[k, n])
+            } else {
+                graph.parameter("b", &[k, n])
+            };
+            let y = graph.matmul(a, b);
+            if add {
+                let bias = graph.input("bias", &[1, n]);
+                let node = &mut graph.nodes_mut()[y as usize];
+                node.op = Op::FusedMatMulAdd;
+                node.inputs.push(bias);
+            }
+            graph.set_outputs(vec![y]);
+            let plan = compile_with_caps(&graph, &CompileOptions::default(), caps, 65536);
+            let d = &plan.dispatches[0];
+            assert_eq!(
+                d.shader,
+                if add {
+                    ShaderEntry::MatMulGemvAdd
+                } else {
+                    ShaderEntry::MatMulGemv
+                }
+            );
+            let shape = d.gemv_shape().unwrap();
+            assert!(shape.column_groups == 1 || shape.threads * shape.column_groups == 256);
+            assert_eq!(d.workgroups, gemv_workgroups(n as u32, shape));
+            shape.column_groups
+        };
+        for add in [false, true] {
+            for (k, n, expected) in [
+                (576, 512, 2),
+                (576, 1536, 2),
+                (2048, 2048, 4),
+                (960, 2560, 4),
+                (2048, 8192, 4),
+                (576, 49152, 8),
+                // Too few output columns to share a workgroup.
+                (16384, 256, 1),
+            ] {
+                assert_eq!(groups(k, n, add, false, native), expected, "{k}x{n}");
+            }
+        }
+        // Other devices and weight formats keep the generic default.
+        assert_eq!(groups(2048, 8192, false, false, Default::default()), 1);
+        assert_eq!(groups(2048, 8192, false, true, native), 1);
     }
 
     #[test]

@@ -86,8 +86,9 @@ pub struct GemvShape {
     /// Applies only to transposed B.
     #[serde(default = "GemvShape::one_row")]
     pub bt_rows: u32,
-    /// Groups of four adjacent output columns in a forward workgroup.
-    /// Grouped columns use the tree reduction and at most 256 total threads.
+    /// Groups of four adjacent output columns in a forward workgroup: 1, 2,
+    /// 4 or 8. Grouped columns use the tree reduction and at most 256 total
+    /// threads.
     #[serde(default = "GemvShape::one_row")]
     pub column_groups: u32,
 }
@@ -142,7 +143,7 @@ impl GemvShape {
 
     pub(crate) fn valid_columns(self) -> bool {
         self.column_groups == 1
-            || (matches!(self.column_groups, 4 | 8)
+            || (matches!(self.column_groups, 2 | 4 | 8)
                 && self.reduction == GemvReduction::Tree
                 && self.threads <= 256 / self.column_groups)
     }
@@ -4390,6 +4391,54 @@ mod tests {
                                 }));
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every legal column grouping validates for dense weights, with and
+    /// without the folded RMSNorm, in one workgroup of up to 256 threads.
+    #[test]
+    fn grouped_gemv_columns_validate() {
+        for format in [WeightFormat::F32, WeightFormat::F16] {
+            let caps = if format == WeightFormat::F16 {
+                naga::valid::Capabilities::SHADER_FLOAT16
+            } else {
+                naga::valid::Capabilities::empty()
+            };
+            for column_groups in [2, 4, 8] {
+                for threads in GemvShape::WIDTHS {
+                    let shape = GemvShape {
+                        threads,
+                        reduction: GemvReduction::Tree,
+                        bt_rows: 1,
+                        column_groups,
+                    };
+                    if !shape.valid_columns() {
+                        continue;
+                    }
+                    for (group, norm) in [
+                        (ShaderGroup::MatMulGemv, false),
+                        (ShaderGroup::MatMulGemvAdd, false),
+                        (ShaderGroup::MatMulGemv, true),
+                    ] {
+                        let module = if norm {
+                            generate_module_gemv_rmsnorm(group, shape, format)
+                        } else {
+                            generate_module_gemv(group, format, shape)
+                        };
+                        naga::valid::Validator::new(
+                            naga::valid::ValidationFlags::all()
+                                ^ naga::valid::ValidationFlags::BINDINGS,
+                            caps,
+                        )
+                        .validate(&module.module)
+                        .unwrap_or_else(|e| panic!("{format:?} {group:?} {shape:?}: {e:#?}"));
+                        assert_eq!(
+                            module.module.entry_points[0].workgroup_size,
+                            [threads * column_groups, 1, 1]
+                        );
                     }
                 }
             }

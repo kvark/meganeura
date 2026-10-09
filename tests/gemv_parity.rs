@@ -28,7 +28,7 @@ fn grouped_columns_cover_partial_tiles_with_rmsnorm() {
             .iter()
             .map(|&v| v as f32)
             .collect();
-        for column_groups in [1, 4, 8] {
+        for column_groups in [1, 2, 4, 8] {
             let mut config = crate::support::gpu::inference_config();
             config.tune = false;
             config.options.gemv_shape = Some(meganeura::GemvShape {
@@ -413,6 +413,7 @@ fn gemv_shapes_cover_widths_reductions_and_row_tails() {
         (32, Tree, 1, 4),
         (32, Tree, 1, 8),
         (64, Tree, 1, 4),
+        (128, Tree, 1, 2),
     ] {
         let shape = GemvShape {
             threads,
