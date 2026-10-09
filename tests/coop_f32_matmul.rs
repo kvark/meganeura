@@ -22,8 +22,8 @@ fn coop_f32_tiles_cover_transposes_edges_and_f32_exponents() {
         (65, 256, 65),
         (65, 272, 17),
         (32, 512, 1031),
-        (64, 256, 2060),
-        (64, 256, 4108),
+        (64, 256, 2064),
+        (64, 256, 4112),
     ] {
         for addend in [false, true] {
             if addend && k < 2048 {
@@ -63,15 +63,12 @@ fn coop_f32_tiles_cover_transposes_edges_and_f32_exponents() {
                         .f32_shapes
                         .contains(&[16, 16, 16])
                 {
-                    let splits = if k >= 4096 { 16 } else { 8 };
                     assert!(
-                        session
-                            .plan()
-                            .dispatches
-                            .iter()
-                            .any(|d| d.kernel
-                                == meganeura::compile::Kernel::CooperativeSplit { splits }),
-                        "native f32 split-K must be selected"
+                        session.plan().dispatches.iter().any(|d| matches!(
+                            d.kernel,
+                            meganeura::compile::Kernel::CooperativeTiled { splits: 16, .. }
+                        )),
+                        "native f32 tiles must be split along K"
                     );
                     assert!(
                         session
@@ -142,7 +139,7 @@ fn coop_f32_prologue_addend_and_epilogue_cover_edge_rows() {
     if !supported() {
         return;
     }
-    for (m, n, k) in [(65, 256, 33), (64, 256, 2060), (64, 256, 4108)] {
+    for (m, n, k) in [(65, 256, 33), (64, 256, 2064), (64, 256, 4112)] {
         let a: Vec<f32> = (0..m * k)
             .map(|i| ((i * 17 % 101) as f32 - 50.0) * 0.002)
             .collect();
@@ -201,7 +198,7 @@ fn coop_f32_prologue_addend_and_epilogue_cover_edge_rows() {
                 assert_eq!(
                     matches!(
                         dispatch.kernel,
-                        meganeura::compile::Kernel::CooperativeSplit { .. }
+                        meganeura::compile::Kernel::CooperativeTiled { .. }
                     ),
                     kind != "epilogue"
                 );

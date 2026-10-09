@@ -44,11 +44,6 @@ $ENTRY_SIGNATURE {
     let c10 = (tile_row + $TILE_M_U) * n + tile_col;
     let c11 = (tile_row + $TILE_M_U) * n + (tile_col + $TILE_N_U);
 
-    let o00 = $OUTPUT_BASE + c00;
-    let o01 = $OUTPUT_BASE + c01;
-    let o10 = $OUTPUT_BASE + c10;
-    let o11 = $OUTPUT_BASE + c11;
-
     // Validity flags for secondary tiles
     let n1_valid = (tile_col + $TILE_N_U) < n;
     let m1_valid = (tile_row + $TILE_M_U) < m;
@@ -63,10 +58,9 @@ $ENTRY_SIGNATURE {
     // from global into shared memory so the K-loop staging reads are cheap.
     $PROLOGUE_CACHE_INIT
 
-    $PARTITION
-    var t = $K_BEGIN;
+    var t = 0u;
     loop {
-        if t >= $K_END { break; }
+        if t >= k { break; }
 
         // Stage sa0: B[t:t+tile, tile_col:tile_col+tile] → shared_a0
         $B_STAGE_0

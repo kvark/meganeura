@@ -988,7 +988,6 @@ enum Variant {
         u32,
         Vec<crate::compile::PrologueLoadKind>,
     ),
-    CoopSplit(ShaderEntry, u32, Vec<crate::compile::PrologueLoadKind>),
     SplitMatmul(
         ShaderEntry,
         crate::compile::WeightFormat,
@@ -1088,7 +1087,6 @@ impl Variant {
         match *self {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
             Variant::Attention(ref e, _, _)
-            | Variant::CoopSplit(ref e, _, _)
             | Variant::CoopTiled(ref e, _, _, _)
             | Variant::SplitMatmul(ref e, _, _, _)
             | Variant::SpecializedConv(ref e, _, _)
@@ -1115,9 +1113,6 @@ impl Variant {
         match *self {
             Variant::CoopTiled(ref e, shape, splits, ref prologue) => {
                 format!("{e:?}:native-f32-tiled-{shape:?}-split-k-{splits}:{prologue:?}")
-            }
-            Variant::CoopSplit(ref e, splits, ref prologue) => {
-                format!("{e:?}:native-f32-split-k-{splits}:{prologue:?}")
             }
             Variant::SplitMatmul(ref e, format, shape, splits) => {
                 format!("{e:?}:split-k-{format:?}-{splits}-{shape:?}")
@@ -1314,17 +1309,6 @@ impl Pipelines {
                     dispatch.matmul_prologue.as_ref(),
                 )
             }
-            Variant::CoopSplit(_, splits, _) => {
-                if let Some(ref prologue) = dispatch.matmul_prologue {
-                    layout = matmul_with_prologue_layout(prologue.factors.len());
-                }
-                crate::codegen::generate_split_coop_matmul(
-                    group,
-                    &cooperative(),
-                    splits,
-                    dispatch.matmul_prologue.as_ref(),
-                )
-            }
             Variant::Scalar(_) => crate::codegen::generate_module(group, matmul_knobs),
             Variant::SmallTile(_) => crate::codegen::generate_module_small(group, matmul_knobs),
             Variant::Weight(_, format) => {
@@ -1500,17 +1484,6 @@ impl Pipelines {
             return Variant::CoopTiled(
                 entry,
                 shape,
-                splits,
-                dispatch
-                    .matmul_prologue
-                    .as_ref()
-                    .map(|p| p.factors.iter().map(|f| f.1.clone()).collect())
-                    .unwrap_or_default(),
-            );
-        }
-        if let crate::compile::Kernel::CooperativeSplit { splits } = dispatch.kernel {
-            return Variant::CoopSplit(
-                entry,
                 splits,
                 dispatch
                     .matmul_prologue
@@ -2067,42 +2040,36 @@ pub(crate) fn select_variants(
         crate::compile::fuse_rmsnorm_into_add(plan);
         crate::compile::fuse_rmsnorm_into_gemv(plan);
     }
-    // Aligned native-f32 products share larger tiles between four subgroups.
-    // Aim for 512 independent workgroups, using K partitions only when the
-    // output supplies fewer. Keep small, ragged, pinned and fused-epilogue
-    // forms on their existing paths; tuning can challenge unsplit choices.
+    // Aligned native-f32 products share 64-row tiles between four subgroups.
+    // Up to 16 K partitions of at least 128 each raise small outputs toward
+    // 512 workgroups; 128 columns are used when partitions can still reach
+    // that target, 64 otherwise. Ragged, pinned and fused-epilogue products
+    // keep their kernel; tuning can challenge unsplit choices.
     if coop_config.is_some_and(|c| c.tile_size == 16 && !c.use_f16_input && !c.compensated) {
         for index in (0..plan.dispatches.len()).rev() {
             let dispatch = &plan.dispatches[index];
             let Some((m, n, k)) = dispatch.mnk() else {
                 continue;
             };
+            let max_splits = 1u32 << (k / 128).clamp(1, 16).ilog2();
+            let groups = |columns: u32| u64::from(m / 64) * u64::from(n / columns);
+            let wide = n.is_multiple_of(128) && groups(128) * u64::from(max_splits) >= 512;
             let shape = crate::codegen::CooperativeMatmulShape {
-                columns: 128,
+                columns: if wide { 128 } else { 64 },
                 k_stage: 16,
                 prefetch: false,
             };
-            if k >= 1024
-                && u64::from(m) * u64::from(n) >= 131072
-                && shape.fits_dimensions(m, n, k)
-                && tiled_coop_shared_bytes(dispatch, shape) <= 16 * 1024
+            if !shape.fits_dimensions(m, n, k)
+                || tiled_coop_shared_bytes(dispatch, shape) > 16 * 1024
             {
-                let groups = (u64::from(m) / 64) * (u64::from(n) / 128);
-                let splits = (512u64.div_ceil(groups) as u32).next_power_of_two().min(16);
-                if plan
-                    .tile_native_f32_matmul(index, shape, splits, 32 * 1024 * 1024)
-                    .is_ok()
-                {
-                    continue;
-                }
+                continue;
             }
-            let dispatch = &plan.dispatches[index];
-            let groups = u64::from(dispatch.workgroups[0]) * u64::from(dispatch.workgroups[1]);
-            if k >= 2048 && groups <= 512 {
-                let splits = if k >= 4096 { 16 } else { 8 };
-                // Ineligible fused/pinned/unaligned forms retain their kernel.
-                let _ = plan.split_native_f32_matmul(index, splits, 32 * 1024 * 1024);
-            }
+            let splits = 512u64
+                .div_ceil(groups(shape.columns))
+                .next_power_of_two()
+                .min(u64::from(max_splits)) as u32;
+            // Fused, pinned and aliased forms keep their kernel.
+            let _ = plan.tile_native_f32_matmul(index, shape, splits, 32 * 1024 * 1024);
         }
     }
 }
@@ -2251,20 +2218,24 @@ mod tiled_cooperative_policy_tests {
             use_f16_input: false,
             compensated: false,
         };
-        // Dimensions are M,N,K. These include independent qualification shapes.
+        // M, N, K and the expected (columns, splits), measured on MI300X.
         for (m, n, k, expected) in [
-            (128, 2048, 2048, Some(16)),
-            (128, 2048, 8192, Some(16)),
-            (128, 16384, 2048, Some(2)),
-            (2048, 2048, 2048, Some(1)),
-            (64, 2048, 4096, Some(16)),
-            (256, 2048, 2048, Some(8)),
-            (128, 4096, 2048, Some(8)),
-            (64, 8192, 2048, Some(8)),
+            (128, 2048, 2048, Some((128, 16))),
+            (128, 2048, 8192, Some((128, 16))),
+            (128, 16384, 2048, Some((128, 2))),
+            (2048, 2048, 2048, Some((128, 1))),
+            (4096, 4096, 1024, Some((128, 1))),
+            (256, 2048, 2048, Some((128, 8))),
+            (1024, 1536, 576, Some((128, 4))),
+            // 128 columns could not reach 512 workgroups with 16 partitions.
+            (64, 2048, 4096, Some((64, 16))),
+            (64, 256, 2048, Some((64, 16))),
+            (256, 576, 1536, Some((64, 8))),
+            // Short K stays in one partition.
+            (512, 512, 128, Some((64, 1))),
             (128, 2048, 2044, None),
             (96, 2048, 2048, None),
-            (128, 2064, 2048, None),
-            (64, 256, 2048, None),
+            (128, 2080, 2048, None),
         ] {
             let mut graph = Graph::new();
             let a = graph.input("a", &[m, k]);
@@ -2280,17 +2251,14 @@ mod tiled_cooperative_policy_tests {
                         d.workgroups,
                         [m as u32 / 64, n as u32 / shape.columns, splits]
                     );
-                    assert_eq!(
-                        (shape.columns, shape.k_stage, shape.prefetch),
-                        (128, 16, false)
-                    );
-                    Some(splits)
+                    assert_eq!((shape.k_stage, shape.prefetch), (16, false));
+                    Some((shape.columns, splits))
                 }
                 _ => None,
             });
             assert_eq!(tiled, expected, "{m}x{n}x{k}");
             assert_eq!(plan.output_buffers, original.output_buffers);
-            if let Some(splits) = expected {
+            if let Some((_, splits)) = expected {
                 assert_eq!(plan.dispatches.len(), if splits == 1 { 1 } else { 2 });
                 assert_eq!(
                     plan.buffers.len(),
