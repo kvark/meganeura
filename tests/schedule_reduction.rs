@@ -317,9 +317,6 @@ fn broadcast_inner_forward_and_gradient_match_explicit_repetition() {
 
 #[test]
 fn normalize_inner_sum_matches_explicit_forward_and_gradient() {
-    if skip_bit_exact() {
-        return;
-    }
     const ROWS: usize = 257;
     const INNER: usize = 8;
     const FLOOR: f32 = 0.125;
