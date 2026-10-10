@@ -29,7 +29,7 @@ pub struct BuildSearchOptions {
     /// In-flight driver work and caller validation cannot be preempted.
     pub max_time: Duration,
     pub max_programs: usize,
-    /// Explore power-of-two submission chunk counts up to this bound.
+    /// Explore power-of-two submission chunk counts up to this bound (1..=64).
     /// One keeps every candidate on a single submission.
     pub max_submission_chunks: usize,
     /// Sum of declared logical bytes and persistent-state snapshots for both
@@ -113,8 +113,8 @@ pub fn build_measured(
     if options.max_graphs == 0 || options.max_programs == 0 || options.max_time.is_zero() {
         return Err("measured construction needs positive graph, program and time bounds".into());
     }
-    if options.max_submission_chunks == 0 {
-        return Err("measured construction needs a positive submission chunk bound".into());
+    if !(1..=64).contains(&options.max_submission_chunks) {
+        return Err("measured construction needs a submission chunk bound in 1..=64".into());
     }
     options.tuning.validate().map_err(|e| e.to_string())?;
     if cfg.runtime.debug {
@@ -343,7 +343,7 @@ type AttentionChoice = (u32, Option<(u32, crate::codegen::FlashAttentionShape)>)
 struct AxisChoice {
     attention: AttentionChoice,
     fuse_dispatches: bool,
-    submission_chunks: usize,
+    submission_chunks: Option<usize>,
 }
 
 fn early_physical_cover(
@@ -354,7 +354,7 @@ fn early_physical_cover(
     let mut cover = Vec::new();
     if let Some(&submission_chunks) = chunks.get(1) {
         cover.push(AxisChoice {
-            submission_chunks,
+            submission_chunks: Some(submission_chunks),
             ..baseline
         });
     }
@@ -449,7 +449,7 @@ fn implementations(
         fuse_dispatches: seeds
             .first()
             .is_some_and(|seed| seed.options.fuse_dispatches),
-        submission_chunks: 1,
+        submission_chunks: None,
     };
     let chunks: Vec<_> = std::iter::successors(Some(1usize), |n| n.checked_mul(2))
         .take_while(|&n| n <= max_submission_chunks)
@@ -470,13 +470,22 @@ fn implementations(
                 ..baseline
             }),
             chunks.get(i).map(|&submission_chunks| AxisChoice {
-                submission_chunks,
+                submission_chunks: Some(submission_chunks),
                 ..baseline
             }),
         ]
         .into_iter()
         .flatten()
     });
+    let submission_choices: Vec<_> = std::iter::once(None)
+        .chain(
+            chunks
+                .iter()
+                .copied()
+                .map(Some)
+                .filter(|_| max_submission_chunks > 1),
+        )
+        .collect();
     let product = attention
         .iter()
         .flat_map(|&attention| {
@@ -487,10 +496,12 @@ fn implementations(
             })
         })
         .flat_map(|choice| {
-            chunks.iter().map(move |&submission_chunks| AxisChoice {
-                submission_chunks,
-                ..choice
-            })
+            submission_choices
+                .iter()
+                .map(move |&submission_chunks| AxisChoice {
+                    submission_chunks,
+                    ..choice
+                })
         });
     let tail: Vec<_> = single_axis
         .filter(|_| max_submission_chunks > 1)
@@ -558,7 +569,7 @@ fn implementations(
             };
             return Some(measure::Program {
                 description: format!(
-                    "{}, dispatch_fusion={fuse_dispatches}, attention_splits={splits}, flash={flash:?}, submission_chunks={submission_chunks}",
+                    "{}, dispatch_fusion={fuse_dispatches}, attention_splits={splits}, flash={flash:?}",
                     seed.description
                 ),
                 plan,
@@ -619,7 +630,7 @@ fn low_occupancy_weight_splits(
                 seed.description, seed.options.fuse_dispatches
             ),
             plan,
-            submission_chunks: 1,
+            submission_chunks: None,
         });
     }
     programs
@@ -634,7 +645,7 @@ mod tests {
         let baseline = AxisChoice {
             attention: (0, None),
             fuse_dispatches: true,
-            submission_chunks: 1,
+            submission_chunks: None,
         };
         let unfused = AxisChoice {
             fuse_dispatches: false,
@@ -657,7 +668,7 @@ mod tests {
         }
         assert!(early_physical_cover(unfused, &[], &[1]).is_empty());
         let chunked = AxisChoice {
-            submission_chunks: 2,
+            submission_chunks: Some(2),
             ..baseline
         };
         let cover = early_physical_cover(baseline, &[], &[1, 2, 4]);

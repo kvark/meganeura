@@ -17,7 +17,8 @@ use std::{
 pub(super) struct Program {
     pub description: String,
     pub plan: ExecutionPlan,
-    pub submission_chunks: usize,
+    /// Unspecified candidates retain the incumbent's measured submission choice.
+    pub submission_chunks: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -102,6 +103,7 @@ pub(super) fn select(
     }
     let mut incumbent: Option<(Session, SearchState)> = None;
     let mut incumbent_bytes = 0usize;
+    let mut selected_chunks = 1;
     let mut kernels = crate::runtime::KernelMemo::default();
     let mut programs = programs.into_iter();
     for index in 0..options.max_programs {
@@ -120,8 +122,12 @@ pub(super) fn select(
         }
         let trial_start = Instant::now();
         let bytes = plan_bytes(&program.plan)?;
+        let submission_chunks = program.submission_chunks.unwrap_or(selected_chunks);
         let mut trial = BuildSearchTrial {
-            description: program.description,
+            description: format!(
+                "{}, submission_chunks={submission_chunks}",
+                program.description
+            ),
             lowering_time,
             construction_time: Duration::ZERO,
             initialization_time: Duration::ZERO,
@@ -141,7 +147,7 @@ pub(super) fn select(
             let build = Instant::now();
             let mut candidate =
                 Session::with_context_opts(program.plan, gpu.clone(), runtime.clone());
-            candidate.set_submission_chunks(program.submission_chunks);
+            candidate.set_submission_chunks(submission_chunks);
             trial.construction_time = build.elapsed();
             let result = (|| {
                 let init = Instant::now();
@@ -218,6 +224,7 @@ pub(super) fn select(
                 Ok(state) if incumbent.is_none() || trial.outcome.selected == index => {
                     incumbent_bytes = plan_bytes(candidate.plan())?;
                     incumbent = Some((candidate, state));
+                    selected_chunks = submission_chunks;
                     report.selected = index;
                 }
                 Ok(_) => {}
@@ -347,7 +354,7 @@ mod tests {
                 Program {
                     description: name.into(),
                     plan,
-                    submission_chunks: 1,
+                    submission_chunks: (name == "baseline").then_some(2),
                 }
             });
             let result = select(
@@ -364,6 +371,7 @@ mod tests {
                     warmup_time: Duration::from_millis(1),
                     max_time: Duration::from_secs(30),
                     max_programs: 2,
+                    max_submission_chunks: 2,
                     max_plan_bytes: 1 << 20,
                     ..Default::default()
                 },
@@ -398,6 +406,12 @@ mod tests {
             } else {
                 let (mut selected, report) = result.unwrap();
                 assert!(report.trials.iter().all(|t| t.outcome.qualified));
+                assert!(
+                    report
+                        .trials
+                        .iter()
+                        .all(|t| t.description.ends_with("submission_chunks=2"))
+                );
                 assert_eq!(selected.read_params(&["w"])[0], [3.0, 5.0]);
                 selected.step();
                 selected.wait();
@@ -474,7 +488,7 @@ mod tests {
                 Program {
                     description: splits.to_string(),
                     plan,
-                    submission_chunks: splits as usize,
+                    submission_chunks: Some(splits as usize),
                 }
             });
             let mut index = 0;
