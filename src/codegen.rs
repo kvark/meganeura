@@ -2243,14 +2243,6 @@ pub(crate) fn generate_module_gemv_int_dot(
     ShaderModule::new(&specialize_gemv(&source, shape))
 }
 
-fn gen_matmul_coop_wgsl(
-    fused_add: bool,
-    variant: MatMulCoopVariant,
-    config: &CoopConfig,
-) -> ShaderModule {
-    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, None, 1, WeightFormat::F32)
-}
-
 /// Generate coop matmul with an optional [`crate::compile::MatMulPrologue`].
 pub fn gen_matmul_coop_with_prologue(
     fused_add: bool,
