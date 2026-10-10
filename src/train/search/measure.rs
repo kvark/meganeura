@@ -124,6 +124,8 @@ pub(super) fn select(
     kernels.bind(&gpu, &options.tuning);
     // Recent complete comparisons, without their private kernel probes.
     let mut comparison_costs = VecDeque::new();
+    // Nothing executed since the incumbent's last qualification.
+    let mut incumbent_checked = false;
     let mut programs = programs.into_iter().fuse();
     for index in 0..options.max_programs {
         if start.elapsed() >= options.max_time {
@@ -286,8 +288,12 @@ pub(super) fn select(
                 }
                 Ok::<_, String>(state)
             })();
+            // A challenger executed beside the incumbent, sharing its weights.
+            incumbent_checked = false;
             match result {
                 Ok(state) if incumbent.is_none() || trial.outcome.selected == index => {
+                    // Its last execution was its qualification.
+                    incumbent_checked = true;
                     incumbent_bytes = plan_bytes(candidate.plan())?;
                     incumbent = Some((candidate, state));
                     selected_chunks = submission_chunks;
@@ -348,16 +354,18 @@ pub(super) fn select(
         || ((report.patience_exhausted || report.trials.len() == options.max_programs)
             && programs.size_hint().1 != Some(0));
     let (mut session, state) = incumbent.ok_or("no qualified program within the search bounds")?;
-    // Challengers ran beside the incumbent since it was last checked. A failing
-    // incumbent invalidates the search: it must not survive as the supposedly
-    // safe fallback. A replaced one was discarded and needs no further check.
-    let check = Instant::now();
-    state.restore(&mut session)?;
-    session.step();
-    session.wait();
-    let result = qualify(&session);
-    report.final_qualification_time = check.elapsed();
-    result.map_err(|error| format!("incumbent failed repeated qualification: {error}"))?;
+    // Requalify an incumbent that challengers ran beside since its own check.
+    // A failing incumbent invalidates the search: it must not survive as the
+    // supposedly safe fallback. A replaced one was discarded already.
+    if !incumbent_checked {
+        let check = Instant::now();
+        state.restore(&mut session)?;
+        session.step();
+        session.wait();
+        let result = qualify(&session);
+        report.final_qualification_time = check.elapsed();
+        result.map_err(|error| format!("incumbent failed repeated qualification: {error}"))?;
+    }
     state.restore(&mut session)?;
     report.elapsed = start.elapsed();
     Ok((session, report))
@@ -691,6 +699,8 @@ mod tests {
         // Kernel classes were left to probe, so the first program was also
         // qualified before tuning.
         assert_eq!(first.trials[0].qualifications, 2);
+        // Nothing ran after the only program's last check.
+        assert!(first.final_qualification_time.is_zero());
         assert_eq!(memo.lock().unwrap().len(), 1);
         let second = search();
         let tuning = second.trials[0].kernel_tuning.as_ref().unwrap();
@@ -765,6 +775,8 @@ mod tests {
         assert_eq!(report.trials.len(), 3);
         assert!(report.patience_exhausted && report.truncated);
         assert!(!report.deadline_reserved);
+        // Challengers ran beside the incumbent after its own check.
+        assert!(!report.final_qualification_time.is_zero());
     }
 
     #[test]

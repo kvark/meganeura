@@ -87,7 +87,8 @@ pub struct BuildSearchReport {
     pub patience_exhausted: bool,
     /// Stopped early because no further comparison could finish by the deadline.
     pub deadline_reserved: bool,
-    /// Requalification of the selected program after the last trial.
+    /// Requalification of the selected program after the last trial; zero
+    /// when nothing ran after its own check.
     pub final_qualification_time: Duration,
     pub elapsed: Duration,
 }
