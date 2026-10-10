@@ -95,6 +95,8 @@ pub struct BuildSearchReport {
 /// weight-gradient splits, and caller-enabled submission chunk counts. Unlocked
 /// dispatches are kernel-tuned before comparison. This bounded search does not
 /// promise a global optimum.
+/// Submission probes use the incumbent plan; a winning layout reopens those
+/// probes, while later layouts inherit the incumbent's measured count.
 ///
 /// `options.tuning` replaces `cfg.tune`. Build-plan caching is not yet supported:
 /// calibration data and measured policy are not part of the ordinary cache key.
@@ -244,13 +246,7 @@ pub fn build_measured(
         }
     }
     let preparation_time = start.elapsed();
-    let programs = implementations(
-        seeds,
-        caps,
-        shared_memory_bytes,
-        options.max_plan_bytes,
-        options.max_submission_chunks,
-    );
+    let programs = implementations(seeds, caps, shared_memory_bytes, options.max_plan_bytes);
     measure::select(
         programs,
         gpu,
@@ -343,21 +339,10 @@ type AttentionChoice = (u32, Option<(u32, crate::codegen::FlashAttentionShape)>)
 struct AxisChoice {
     attention: AttentionChoice,
     fuse_dispatches: bool,
-    submission_chunks: Option<usize>,
 }
 
-fn early_physical_cover(
-    baseline: AxisChoice,
-    attention: &[AttentionChoice],
-    chunks: &[usize],
-) -> Vec<AxisChoice> {
+fn early_physical_cover(baseline: AxisChoice, attention: &[AttentionChoice]) -> Vec<AxisChoice> {
     let mut cover = Vec::new();
-    for &submission_chunks in chunks.iter().skip(1).take(3) {
-        cover.push(AxisChoice {
-            submission_chunks: Some(submission_chunks),
-            ..baseline
-        });
-    }
     if baseline.fuse_dispatches {
         cover.push(AxisChoice {
             fuse_dispatches: false,
@@ -402,7 +387,6 @@ fn implementations(
     caps: crate::codegen::CoopCaps,
     shared_memory_bytes: u32,
     max_partial_bytes: usize,
-    max_submission_chunks: usize,
 ) -> impl Iterator<Item = measure::Program> {
     let cached_attention = seeds.iter().any(|p| {
         p.graph
@@ -449,13 +433,9 @@ fn implementations(
         fuse_dispatches: seeds
             .first()
             .is_some_and(|seed| seed.options.fuse_dispatches),
-        submission_chunks: None,
     };
-    let chunks: Vec<_> = std::iter::successors(Some(1usize), |n| n.checked_mul(2))
-        .take_while(|&n| n <= max_submission_chunks)
-        .collect();
-    // Cover small submission counts before expanding the physical choices.
-    let cover = early_physical_cover(baseline, &attention, &chunks);
+    // Rank the first alternative on each axis and their interaction early.
+    let cover = early_physical_cover(baseline, &attention);
     let mut seen = collections::HashSet::from([baseline]);
     seen.extend(cover.iter().copied());
     let fusion: &[bool] = if baseline.fuse_dispatches {
@@ -463,49 +443,14 @@ fn implementations(
     } else {
         &[false]
     };
-    let single_axis = (1..attention.len().max(chunks.len())).flat_map(|i| {
-        [
-            attention.get(i).map(|&attention| AxisChoice {
-                attention,
-                ..baseline
-            }),
-            chunks.get(i).map(|&submission_chunks| AxisChoice {
-                submission_chunks: Some(submission_chunks),
-                ..baseline
-            }),
-        ]
-        .into_iter()
-        .flatten()
-    });
-    let submission_choices: Vec<_> = std::iter::once(None)
-        .chain(
-            chunks
-                .iter()
-                .copied()
-                .map(Some)
-                .filter(|_| max_submission_chunks > 1),
-        )
-        .collect();
-    let product = attention
+    let tail: Vec<_> = attention
         .iter()
         .flat_map(|&attention| {
             fusion.iter().map(move |&fuse_dispatches| AxisChoice {
                 attention,
                 fuse_dispatches,
-                ..baseline
             })
         })
-        .flat_map(|choice| {
-            submission_choices
-                .iter()
-                .map(move |&submission_chunks| AxisChoice {
-                    submission_chunks,
-                    ..choice
-                })
-        });
-    let tail: Vec<_> = single_axis
-        .filter(|_| max_submission_chunks > 1)
-        .chain(product)
         .filter(|&choice| seen.insert(choice))
         .collect();
     let order = physical_program_order(seeds.len(), baseline, &cover, &tail);
@@ -536,7 +481,6 @@ fn implementations(
             let AxisChoice {
                 attention: (splits, flash),
                 fuse_dispatches,
-                submission_chunks,
             } = current;
             let plan = if splits == 0
                 && flash.is_none()
@@ -573,7 +517,7 @@ fn implementations(
                     seed.description
                 ),
                 plan,
-                submission_chunks,
+                submission_chunks: None,
             });
         }
     })
@@ -645,13 +589,12 @@ mod tests {
         let baseline = AxisChoice {
             attention: (0, None),
             fuse_dispatches: true,
-            submission_chunks: None,
         };
         let unfused = AxisChoice {
             fuse_dispatches: false,
             ..baseline
         };
-        let cover = early_physical_cover(baseline, &[], &[1]);
+        let cover = early_physical_cover(baseline, &[]);
         assert_eq!(cover, vec![unfused]);
         let order = physical_program_order(8, baseline, &cover, &[]);
         assert!(order[..3].contains(&(0, unfused)));
@@ -666,16 +609,7 @@ mod tests {
                 );
             }
         }
-        assert!(early_physical_cover(unfused, &[], &[1]).is_empty());
-        let cover = early_physical_cover(baseline, &[], &[1, 2, 4, 8, 16]);
-        let order = physical_program_order(8, baseline, &cover, &[]);
-        for (submission_chunks, prefix) in [(2, 3), (4, 6), (8, 10)] {
-            let chunked = AxisChoice {
-                submission_chunks: Some(submission_chunks),
-                ..baseline
-            };
-            assert!(order[..prefix].contains(&(0, chunked)));
-        }
+        assert!(early_physical_cover(unfused, &[]).is_empty());
     }
 
     #[test]
@@ -991,6 +925,13 @@ mod tests {
             assert!(report.skipped_regions.is_empty());
             assert!(report.trials.len() >= report.graphs.len());
             assert!(report.trials.iter().all(|t| t.outcome.qualified));
+            for chunks in [2, 4] {
+                assert!(report.trials.iter().any(|trial| {
+                    trial
+                        .description
+                        .ends_with(&format!("submission_chunks={chunks}"))
+                }));
+            }
             assert_eq!(session.read_params(&["w"])[0], [0.125; 165]);
             if mode == Mode::Training {
                 session.set_learning_rate(0.1);

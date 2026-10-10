@@ -10,6 +10,7 @@ use crate::{
 };
 use serde::Serialize;
 use std::{
+    collections::VecDeque,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -104,15 +105,32 @@ pub(super) fn select(
     let mut incumbent: Option<(Session, SearchState)> = None;
     let mut incumbent_bytes = 0usize;
     let mut selected_chunks = 1;
+    let mut selected_description = String::new();
+    let mut pending_submissions = VecDeque::new();
     let mut kernels = crate::runtime::KernelMemo::default();
-    let mut programs = programs.into_iter();
+    let mut programs = programs.into_iter().fuse();
     for index in 0..options.max_programs {
         if start.elapsed() >= options.max_time {
             report.truncated = true;
             break;
         }
         let lowering = Instant::now();
-        let Some(program) = programs.next() else {
+        // Try one alternative layout before probing submissions on the winner.
+        // Later layouts inherit its count and reopen this small search if they win.
+        let program = (index == 1)
+            .then(|| programs.next())
+            .flatten()
+            .or_else(|| {
+                pending_submissions
+                    .pop_front()
+                    .map(|submission_chunks| Program {
+                        description: selected_description.clone(),
+                        plan: incumbent.as_ref().unwrap().0.plan().clone(),
+                        submission_chunks: Some(submission_chunks),
+                    })
+            })
+            .or_else(|| programs.next());
+        let Some(program) = program else {
             break;
         };
         let lowering_time = lowering.elapsed();
@@ -225,6 +243,14 @@ pub(super) fn select(
                     incumbent_bytes = plan_bytes(candidate.plan())?;
                     incumbent = Some((candidate, state));
                     selected_chunks = submission_chunks;
+                    selected_description = program.description;
+                    if program.submission_chunks.is_none() {
+                        pending_submissions =
+                            std::iter::successors(Some(1usize), |n| n.checked_mul(2))
+                                .take_while(|&n| n <= options.max_submission_chunks)
+                                .filter(|&n| n != selected_chunks)
+                                .collect();
+                    }
                     report.selected = index;
                 }
                 Ok(_) => {}
@@ -256,6 +282,7 @@ pub(super) fn select(
     // Do not lower one more program just to discover whether a bounded search
     // is truncated. Lazy producers can allocate and compile in `next()`.
     report.truncated |= start.elapsed() >= options.max_time
+        || !pending_submissions.is_empty()
         || (report.trials.len() == options.max_programs && programs.size_hint().1 != Some(0));
     incumbent
         .map(|(mut session, state)| {
