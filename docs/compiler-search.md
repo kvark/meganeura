@@ -92,7 +92,12 @@ Implemented choices include fused and unfused graph forms, scalar matmul
 tile, K-stage, unrolling and split-K equalities lowered by the ordinary compiler,
 dispatch fusion, forward-attention layouts, independent scalar dQ and dK/dV
 layouts, cached-attention splits, low-occupancy convolution weight-gradient
-splits. Each measured program uses one submission. An extracted matmul
+splits, and optional submission chunk counts. `max_submission_chunks` defaults
+to one; callers can enable powers of two up to 64. After the initial layouts,
+the search alternates layout candidates with submission probes on the incumbent.
+Later layouts inherit its measured count; a winning layout reopens those probes.
+This avoids exhausting the program limit on a layout/submission cross product,
+but does not explore every losing layout at every count. An extracted matmul
 schedule is locked, so a later kernel probe cannot replace its tile. Unlocked
 dispatches still use those probes before whole-plan comparison. Attention
 splits and convolution weight splits use the existing compiler, with no

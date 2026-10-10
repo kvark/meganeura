@@ -111,6 +111,7 @@ pub(super) fn select(
     let mut selected_description = String::new();
     let mut selected_plan: Option<ExecutionPlan> = None;
     let mut pending_submissions = VecDeque::new();
+    let mut probe_submission = true;
     let mut kernels = crate::runtime::KernelMemo::default();
     let mut programs = programs.into_iter().fuse();
     for index in 0..options.max_programs {
@@ -119,9 +120,9 @@ pub(super) fn select(
             break;
         }
         let lowering = Instant::now();
-        // Cover the first layouts before probing submissions on the winner.
-        // Later layouts inherit its count and reopen this small search if they win.
-        let program = (index < super::INITIAL_LAYOUTS)
+        // Cover the first layouts, then alternate the two frontiers so submission
+        // probes cannot consume the program budget before useful layouts arrive.
+        let program = (index < super::INITIAL_LAYOUTS || !probe_submission)
             .then(|| programs.next())
             .flatten()
             .or_else(|| {
@@ -137,6 +138,7 @@ pub(super) fn select(
         let Some(program) = program else {
             break;
         };
+        probe_submission = program.submission_chunks.is_none();
         let lowering_time = lowering.elapsed();
         if start.elapsed() >= options.max_time {
             report.truncated = true;
@@ -254,7 +256,7 @@ pub(super) fn select(
                     if program.submission_chunks.is_none() {
                         pending_submissions =
                             std::iter::successors(Some(1usize), |n| n.checked_mul(2))
-                                .take_while(|&n| n <= options.max_submission_chunks.min(8))
+                                .take_while(|&n| n <= options.max_submission_chunks)
                                 .filter(|&n| n != selected_chunks)
                                 .collect();
                     }
