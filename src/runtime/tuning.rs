@@ -14,12 +14,33 @@ use std::{
 /// Qualified private-scratch comparisons within one graph search, on one device
 /// and under one numerical/timing policy. Never persisted or shared globally.
 #[derive(Default)]
-pub(crate) struct KernelMemo(HashMap<(u32, bool, TuneClass, Vec<MatmulTile>), KernelProgress>);
+pub(crate) struct KernelMemo(HashMap<MemoKey, KernelProgress>);
 
 #[derive(Clone, Copy)]
 struct KernelProgress {
     selected: MatmulTile,
     next_candidate: usize,
+}
+
+impl KernelProgress {
+    /// Progress recorded under this class's complete candidate list.
+    fn applies_to(&self, class: &SearchClass) -> bool {
+        self.next_candidate <= class.challengers.len()
+            && (self.selected == class.initial || class.challengers.contains(&self.selected))
+    }
+}
+
+type MemoKey = (u32, bool, TuneClass, Vec<MatmulTile>);
+
+fn memo_key(plan: &crate::compile::ExecutionPlan, class: &SearchClass) -> MemoKey {
+    (
+        plan.knobs.matmul_k_stage,
+        plan.knobs.matmul_interleave_columns,
+        class.key.clone(),
+        std::iter::once(class.initial)
+            .chain(class.challengers.iter().copied())
+            .collect(),
+    )
 }
 
 struct PhaseTimer<'a> {
@@ -495,13 +516,8 @@ impl Session {
         self.tune_with_memo(options, None)
     }
 
-    pub(crate) fn tune_with_memo(
-        &mut self,
-        options: TuneOptions,
-        mut memo: Option<&mut KernelMemo>,
-    ) -> Result<TuneReport, TuneError> {
-        options.validate()?;
-        let start = Instant::now();
+    /// Eligible classes in search order, and the dispatches outside them.
+    fn tune_classes(&self, options: &TuneOptions) -> (Vec<SearchClass>, usize) {
         let (mut classes, mut excluded_dispatches) =
             collect_classes(&self.plan, &self.alias, self.coop_config.as_ref());
         // As in pipeline creation, zero means the backend reports no limit.
@@ -522,6 +538,35 @@ impl Session {
                 false
             }
         });
+        (classes, excluded_dispatches)
+    }
+
+    /// Whether [`Self::tune_with_memo`] under `options` would measure a
+    /// challenger that `memo` has not already decided. Memoized classes only
+    /// install their recorded winners, which is cheap next to probing.
+    pub(crate) fn kernel_probes_pending(
+        &self,
+        options: &TuneOptions,
+        memo: Option<&KernelMemo>,
+    ) -> bool {
+        let (classes, _) = self.tune_classes(options);
+        classes.iter().take(options.max_classes).any(|class| {
+            let decided = memo
+                .and_then(|memo| memo.0.get(&memo_key(&self.plan, class)))
+                .filter(|progress| progress.applies_to(class))
+                .map_or(0, |progress| progress.next_candidate);
+            decided < class.challengers.len()
+        })
+    }
+
+    pub(crate) fn tune_with_memo(
+        &mut self,
+        options: TuneOptions,
+        mut memo: Option<&mut KernelMemo>,
+    ) -> Result<TuneReport, TuneError> {
+        options.validate()?;
+        let start = Instant::now();
+        let (classes, excluded_dispatches) = self.tune_classes(&options);
         let mut report = TuneReport {
             options: options.clone(),
             eligible_classes: classes.len(),
@@ -537,20 +582,12 @@ impl Session {
                 break;
             }
             report.visited_classes += 1;
-            let memo_key = (
-                self.plan.knobs.matmul_k_stage,
-                self.plan.knobs.matmul_interleave_columns,
-                class.key.clone(),
-                std::iter::once(class.initial)
-                    .chain(class.challengers.iter().copied())
-                    .collect(),
-            );
+            let memo_key = memo_key(&self.plan, class);
             let mut incumbent = class.initial;
             let mut next_candidate = 0;
             if let Some(&progress) = memo.as_ref().and_then(|m| m.0.get(&memo_key)) {
                 let selected = progress.selected;
-                if progress.next_candidate <= class.challengers.len()
-                    && (selected == class.initial || class.challengers.contains(&selected))
+                if progress.applies_to(class)
                     && self
                         .pipelines
                         .ensure_tune_tile(&gpu, &self.plan.dispatches[class.members[0]], selected)
@@ -1941,6 +1978,10 @@ mod tests {
         );
         assert!(!first.time_budget_exhausted);
         assert_eq!(memo.0.len(), 1);
+        let fresh = create();
+        assert!(fresh.kernel_probes_pending(&options, None));
+        assert!(!fresh.kernel_probes_pending(&options, Some(&memo)));
+        drop(fresh);
         // Keep an actual qualified prefix, without timing-dependent sleeps or
         // an assumed GPU speed to interrupt the first search at this point.
         *memo.0.values_mut().next().unwrap() = KernelProgress {
@@ -1948,6 +1989,7 @@ mod tests {
             next_candidate: 1,
         };
         let mut session = create();
+        assert!(session.kernel_probes_pending(&options, Some(&memo)));
         session.set_input("x", &[0.25; 33 * 17]);
         session.set_parameter("w", &[0.125; 17 * 65]);
         let skipped = session
