@@ -101,8 +101,9 @@ pub struct BuildSearchReport {
 /// weight-gradient splits, and caller-enabled submission chunk counts. Unlocked
 /// dispatches are kernel-tuned before comparison. This bounded search does not
 /// promise a global optimum.
-/// Early submission probes use the incumbent plan; a winning layout reopens those
-/// probes, while later layouts inherit the incumbent's measured count.
+/// After the first layouts, alternate layout exploration with submission probes
+/// on the incumbent. A winning layout reopens those probes; later layouts inherit
+/// its measured count rather than expanding a layout/submission cross product.
 ///
 /// `options.tuning` replaces `cfg.tune`. Build-plan caching is not yet supported:
 /// calibration data and measured policy are not part of the ordinary cache key.
@@ -255,13 +256,7 @@ pub fn build_measured(
         }
     }
     let preparation_time = start.elapsed();
-    let programs = implementations(
-        seeds,
-        caps,
-        shared_memory_bytes,
-        options.max_plan_bytes,
-        options.max_submission_chunks,
-    );
+    let programs = implementations(seeds, caps, shared_memory_bytes, options.max_plan_bytes);
     measure::select(
         programs,
         gpu,
@@ -354,23 +349,10 @@ type AttentionChoice = (u32, Option<(u32, crate::codegen::FlashAttentionShape)>)
 struct AxisChoice {
     attention: AttentionChoice,
     fuse_dispatches: bool,
-    submission_chunks: Option<usize>,
 }
 
-fn early_physical_cover(
-    baseline: AxisChoice,
-    attention: &[AttentionChoice],
-    max_submission_chunks: usize,
-) -> Vec<AxisChoice> {
+fn early_physical_cover(baseline: AxisChoice, attention: &[AttentionChoice]) -> Vec<AxisChoice> {
     let mut cover = Vec::new();
-    for submission_chunks in [2, 4, 8] {
-        if submission_chunks <= max_submission_chunks {
-            cover.push(AxisChoice {
-                submission_chunks: Some(submission_chunks),
-                ..baseline
-            });
-        }
-    }
     if baseline.fuse_dispatches {
         cover.push(AxisChoice {
             fuse_dispatches: false,
@@ -417,7 +399,6 @@ fn implementations(
     caps: crate::codegen::CoopCaps,
     shared_memory_bytes: u32,
     max_partial_bytes: usize,
-    max_submission_chunks: usize,
 ) -> impl Iterator<Item = measure::Program> {
     let cached_attention = seeds.iter().any(|p| {
         p.graph
@@ -464,10 +445,9 @@ fn implementations(
         fuse_dispatches: seeds
             .first()
             .is_some_and(|seed| seed.options.fuse_dispatches),
-        submission_chunks: None,
     };
     // Rank the first alternative on each axis and their interaction early.
-    let cover = early_physical_cover(baseline, &attention, max_submission_chunks);
+    let cover = early_physical_cover(baseline, &attention);
     let mut seen = collections::HashSet::from([baseline]);
     seen.extend(cover.iter().copied());
     let fusion: &[bool] = if baseline.fuse_dispatches {
@@ -475,29 +455,13 @@ fn implementations(
     } else {
         &[false]
     };
-    let submissions: Vec<_> = std::iter::once(None)
-        .chain(
-            std::iter::successors(Some(1usize), |n| n.checked_mul(2))
-                .take_while(|&n| max_submission_chunks > 1 && n <= max_submission_chunks)
-                .map(Some),
-        )
-        .collect();
     let tail: Vec<_> = attention
         .iter()
         .flat_map(|&attention| {
             fusion.iter().map(move |&fuse_dispatches| AxisChoice {
                 attention,
                 fuse_dispatches,
-                ..baseline
             })
-        })
-        .flat_map(|choice| {
-            submissions
-                .iter()
-                .map(move |&submission_chunks| AxisChoice {
-                    submission_chunks,
-                    ..choice
-                })
         })
         .filter(|&choice| seen.insert(choice))
         .collect();
@@ -529,7 +493,6 @@ fn implementations(
             let AxisChoice {
                 attention: (splits, flash),
                 fuse_dispatches,
-                submission_chunks,
             } = current;
             let plan = if splits == 0
                 && flash.is_none()
@@ -566,7 +529,7 @@ fn implementations(
                     seed.description
                 ),
                 plan,
-                submission_chunks,
+                submission_chunks: None,
             });
         }
     })
@@ -638,13 +601,12 @@ mod tests {
         let baseline = AxisChoice {
             attention: (0, None),
             fuse_dispatches: true,
-            submission_chunks: None,
         };
         let unfused = AxisChoice {
             fuse_dispatches: false,
             ..baseline
         };
-        let cover = early_physical_cover(baseline, &[], 1);
+        let cover = early_physical_cover(baseline, &[]);
         assert_eq!(cover, vec![unfused]);
         let order = physical_program_order(8, baseline, &cover, &[]);
         assert!(order[..4].contains(&(0, unfused)));
@@ -659,7 +621,43 @@ mod tests {
                 );
             }
         }
-        assert!(early_physical_cover(unfused, &[], 1).is_empty());
+        assert!(early_physical_cover(unfused, &[]).is_empty());
+    }
+
+    #[test]
+    fn attention_layouts_fit_alongside_submission_probes() {
+        let mut graph = Graph::new();
+        let q = graph.input("q", &[129, 64]);
+        let k = graph.input("k", &[129, 64]);
+        let v = graph.input("v", &[129, 64]);
+        let y = graph.full_attention(q, k, v, 1, 1, 64);
+        graph.set_outputs(vec![y]);
+        let graph = std::sync::Arc::new(graph);
+        let options = compile::CompileOptions::default();
+        let caps = crate::codegen::CoopCaps::default();
+        let plan = compile::compile_with_caps(&graph, &options, caps, 65536);
+        let seeds = (0..16)
+            .map(|index| Seed {
+                graph: graph.clone(),
+                options: options.clone(),
+                plan: plan.clone(),
+                description: format!("graph={index}"),
+            })
+            .collect();
+        // Reserve half the ordinary 64-program allowance for submission probes.
+        // Even with a full graph frontier, distinct attention layouts must fit.
+        let programs: Vec<_> = implementations(seeds, caps, 65536, 512 << 20)
+            .take(BuildSearchOptions::default().max_programs / 2)
+            .collect();
+        assert!(programs.iter().all(|p| p.submission_chunks.is_none()));
+        assert!(programs.iter().any(|p| {
+            p.description.starts_with("graph=0,")
+                && p.plan.knobs.flash.interleave
+                && p.plan
+                    .dispatches
+                    .iter()
+                    .any(|d| d.shader == compile::ShaderEntry::FlashAttention)
+        }));
     }
 
     #[test]
@@ -943,7 +941,7 @@ mod tests {
                     warmup_time: Duration::from_millis(1),
                     max_time: Duration::from_secs(60),
                     max_programs: 24,
-                    max_submission_chunks: 4,
+                    max_submission_chunks: 64,
                     min_improvement: 0.01,
                     max_plan_bytes: 4 << 20,
                 },
@@ -976,7 +974,7 @@ mod tests {
             assert!(report.skipped_regions.is_empty());
             assert!(report.trials.len() >= report.graphs.len());
             assert!(report.trials.iter().all(|t| t.outcome.qualified));
-            for chunks in [2, 4] {
+            for chunks in [2, 4, 8, 16, 32, 64] {
                 assert!(report.trials.iter().any(|trial| {
                     trial
                         .description
