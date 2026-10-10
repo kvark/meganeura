@@ -91,6 +91,8 @@ is qualified again after measurement; the selected program is requalified once
 before construction returns, not after every trial. An invalid challenger is
 discarded; an invalid final incumbent aborts the search.
 An initializer may share compatible immutable weights from the idle incumbent.
+Sessions on one context share pipelines with identical generated code, so a
+challenger compiles only the kernels that differ from the incumbent's.
 
 Implemented choices include fused and unfused graph forms, scalar matmul
 tile, K-stage, unrolling and split-K equalities lowered by the ordinary compiler,

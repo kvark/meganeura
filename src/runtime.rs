@@ -1154,8 +1154,62 @@ impl Variant {
     }
 }
 
+/// A compiled pipeline, shared by the sessions on its context that need the
+/// same generated code. The last user destroys it.
+struct SharedPipeline {
+    gpu: Arc<Gpu>,
+    raw: blade_graphics::ComputePipeline,
+}
+
+impl Drop for SharedPipeline {
+    fn drop(&mut self) {
+        self.gpu.destroy_compute_pipeline(&mut self.raw);
+    }
+}
+
+/// Exactly what compilation consumes, so a shared pipeline is the one
+/// compiling this module would create. A live pipeline holds its context,
+/// so the context address cannot be reused while an entry can upgrade.
+#[derive(PartialEq, Eq, Hash)]
+struct SharedPipelineKey {
+    context: usize,
+    entry_point: &'static str,
+    layout: String,
+    source: String,
+}
+
+/// Live pipelines by generated code. Candidate sessions in a measured search
+/// differ in a few dispatches, so most of their pipelines are already live in
+/// the incumbent. Weak entries never extend a pipeline's lifetime.
+#[derive(Default)]
+struct SharedPipelines {
+    live: HashMap<SharedPipelineKey, std::sync::Weak<SharedPipeline>>,
+    prune_at: usize,
+}
+
+static SHARED_PIPELINES: std::sync::LazyLock<std::sync::Mutex<SharedPipelines>> =
+    std::sync::LazyLock::new(Default::default);
+
+impl SharedPipelines {
+    fn get(key: &SharedPipelineKey) -> Option<Arc<SharedPipeline>> {
+        let shared = SHARED_PIPELINES.lock().unwrap();
+        shared.live.get(key).and_then(std::sync::Weak::upgrade)
+    }
+
+    fn insert(key: SharedPipelineKey, pipeline: &Arc<SharedPipeline>) {
+        let mut shared = SHARED_PIPELINES.lock().unwrap();
+        shared.live.insert(key, Arc::downgrade(pipeline));
+        if shared.live.len() >= shared.prune_at {
+            shared
+                .live
+                .retain(|_, pipeline| pipeline.strong_count() != 0);
+            shared.prune_at = (2 * shared.live.len()).max(256);
+        }
+    }
+}
+
 struct Pipelines {
-    map: HashMap<Variant, blade_graphics::ComputePipeline>,
+    map: HashMap<Variant, Arc<SharedPipeline>>,
     /// Resolved after compilation or tuning, never while recording a step.
     selected: Vec<Variant>,
     /// Codegen knobs the plan was compiled with.
@@ -1164,18 +1218,11 @@ struct Pipelines {
     dump_dir: Option<String>,
 }
 
-/// Turn a generated module into a Blade shader, writing its WGSL into the
-/// configured dump directory first. Every module a session compiles — the
-/// standard, coop, weighted, epilogue-fused and scheduled forms alike —
-/// passes through here, so the dump sees exactly what a plan would run.
+/// Turn a generated module into a Blade shader.
 fn create_gen_shader(
     gpu: &Gpu,
     module: crate::codegen::ShaderModule,
-    dump_dir: Option<&str>,
 ) -> Result<blade_graphics::Shader, String> {
-    if let Some(dir) = dump_dir {
-        module.dump(dir);
-    }
     gpu.try_create_shader(blade_graphics::ShaderDesc {
         source: &module.source,
         naga_module: Some(module.module),
@@ -1203,14 +1250,8 @@ fn create_profiled_pipeline(
 }
 
 impl Pipelines {
-    fn destroy(&mut self, gpu: &Gpu) {
-        for (_, mut pipeline) in self.map.drain() {
-            gpu.destroy_compute_pipeline(&mut pipeline);
-        }
-    }
-
     fn new(
-        gpu: &Gpu,
+        gpu: &Arc<Gpu>,
         plan: &ExecutionPlan,
         coop_config: Option<&crate::codegen::CoopConfig>,
         wgsl_dump_dir: Option<&str>,
@@ -1253,7 +1294,7 @@ impl Pipelines {
 
     fn prepare(
         &mut self,
-        gpu: &Gpu,
+        gpu: &Arc<Gpu>,
         dispatch: &Dispatch,
         coop_config: Option<&crate::codegen::CoopConfig>,
     ) -> Result<(), String> {
@@ -1477,8 +1518,35 @@ impl Pipelines {
                 crate::codegen::generate_horizontal_matmul(group, count, coop.as_ref())
             }
         };
-        let shader = create_gen_shader(gpu, module, self.dump_dir.as_deref())?;
-        let pipeline = create_profiled_pipeline(gpu, key.label(), &layout, shader.at(entry_point));
+        // Every module a session compiles — the standard, coop, weighted,
+        // epilogue-fused and scheduled forms alike — passes through here, so
+        // the dump sees exactly what a plan would run, shared or not.
+        if let Some(ref dir) = self.dump_dir {
+            module.dump(dir);
+        }
+        let shared_key = SharedPipelineKey {
+            context: Arc::as_ptr(gpu) as usize,
+            entry_point,
+            layout: format!("{:?}", layout.bindings),
+            source: module.source.clone(),
+        };
+        let pipeline = match SharedPipelines::get(&shared_key) {
+            Some(pipeline) => pipeline,
+            None => {
+                let shader = create_gen_shader(gpu, module)?;
+                let pipeline = Arc::new(SharedPipeline {
+                    gpu: Arc::clone(gpu),
+                    raw: create_profiled_pipeline(
+                        gpu,
+                        key.label(),
+                        &layout,
+                        shader.at(entry_point),
+                    ),
+                });
+                SharedPipelines::insert(shared_key, &pipeline);
+                pipeline
+            }
+        };
         self.map.insert(key, pipeline);
         Ok(())
     }
@@ -1599,7 +1667,7 @@ impl Pipelines {
     /// directly rather than through a `Dispatch`, and so never carry a
     /// modifier.
     fn scalar(&self, entry: ShaderEntry) -> &blade_graphics::ComputePipeline {
-        &self.map[&Variant::Scalar(entry)]
+        &self.map[&Variant::Scalar(entry)].raw
     }
 
     fn select(&mut self, dispatches: &[Dispatch]) {
@@ -1617,20 +1685,22 @@ impl Pipelines {
     }
 
     fn get(&self, dispatch_index: usize) -> &blade_graphics::ComputePipeline {
-        &self.map[&self.selected[dispatch_index]]
+        &self.map[&self.selected[dispatch_index]].raw
     }
 
     fn all_pipelines(&self) -> Vec<(&str, &blade_graphics::ComputePipeline)> {
         self.map
             .iter()
-            .filter_map(|(variant, pipeline)| variant.entry().map(|e| (e.entry_point(), pipeline)))
+            .filter_map(|(variant, pipeline)| {
+                variant.entry().map(|e| (e.entry_point(), &pipeline.raw))
+            })
             .collect()
     }
 
     fn all_profile_pipelines(&self) -> Vec<(String, &blade_graphics::ComputePipeline)> {
         self.map
             .iter()
-            .map(|(variant, pipeline)| (variant.label(), pipeline))
+            .map(|(variant, pipeline)| (variant.label(), &pipeline.raw))
             .collect()
     }
 }
@@ -2946,6 +3016,26 @@ impl Session {
         }
     }
 
+    /// [`Self::test_coop_matmul`], once per context and configuration.
+    /// The test compiles and runs a kernel, and its answer does not change
+    /// for a context, so later sessions on it reuse the result.
+    fn coop_matmul_qualified(gpu: &Arc<Gpu>, config: &crate::codegen::CoopConfig) -> bool {
+        // A listed `Weak` keeps its context address from being reused.
+        type Probe = (std::sync::Weak<Gpu>, crate::codegen::CoopConfig, bool);
+        static PROBES: std::sync::Mutex<Vec<Probe>> = std::sync::Mutex::new(Vec::new());
+        let mut probes = PROBES.lock().unwrap();
+        probes.retain(|probe| probe.0.strong_count() != 0);
+        if let Some(probe) = probes
+            .iter()
+            .find(|probe| std::ptr::eq(probe.0.as_ptr(), Arc::as_ptr(gpu)) && probe.1 == *config)
+        {
+            return probe.2;
+        }
+        let qualified = Self::test_coop_matmul(gpu, config);
+        probes.push((Arc::downgrade(gpu), *config, qualified));
+        qualified
+    }
+
     /// Run a tiny cooperative matmul and check the result.
     /// Returns false if the GPU doesn't support the required cooperative
     /// matrix types (e.g. AMD RADV advertises the extension but rejects
@@ -3148,7 +3238,7 @@ impl Session {
         let coop_config = {
             let _span = tracing::info_span!("coop_probe").entered();
             Self::select_coop_config(&coop_caps, opts.coop)
-                .filter(|config| Self::test_coop_matmul(&gpu, config))
+                .filter(|config| Self::coop_matmul_qualified(&gpu, config))
         };
         if let Some(ref config) = coop_config {
             log::info!(
@@ -4368,12 +4458,49 @@ mod variant_tests {
         );
     }
 
+    /// Sessions on one context share the pipelines of identical generated
+    /// code, and the last of them destroys each pipeline. Another context
+    /// compiles its own.
+    #[test]
+    fn sessions_share_pipelines_on_one_context() {
+        use std::sync::Arc;
+        let plan = {
+            let mut g = crate::graph::Graph::new();
+            let x = g.input("x", &[8, 64]);
+            let w = g.parameter("w", &[64, 32]);
+            let mm = g.matmul(x, w);
+            let out = g.relu(mm);
+            g.set_outputs(vec![out]);
+            crate::compile::compile(&g)
+        };
+        let gpu = Arc::new(crate::init_gpu_context().unwrap());
+        let first = super::Session::with_context(plan.clone(), gpu.clone());
+        let second = super::Session::with_context(plan.clone(), gpu.clone());
+        assert!(!first.pipelines.map.is_empty());
+        for (variant, pipeline) in &first.pipelines.map {
+            assert!(Arc::ptr_eq(pipeline, &second.pipelines.map[variant]));
+        }
+        let pipelines: Vec<_> = first.pipelines.map.values().map(Arc::downgrade).collect();
+        drop(first);
+        assert!(pipelines.iter().all(|p| p.strong_count() == 1));
+        drop(second);
+        assert!(pipelines.iter().all(|p| p.strong_count() == 0));
+        let other = super::Session::with_context(
+            plan.clone(),
+            Arc::new(crate::init_gpu_context().unwrap()),
+        );
+        let third = super::Session::with_context(plan, gpu);
+        for (variant, pipeline) in &other.pipelines.map {
+            assert!(!Arc::ptr_eq(pipeline, &third.pipelines.map[variant]));
+        }
+    }
+
     /// Preparation and execution use the same key. Check this through
     /// `Pipelines::new`: a variant absent from the map is a kernel that was
     /// never compiled.
     #[test]
     fn epilogue_dispatch_compiles_no_unreachable_pipeline() {
-        let gpu = crate::init_gpu_context().unwrap();
+        let gpu = std::sync::Arc::new(crate::init_gpu_context().unwrap());
 
         // 64×64 f32 matmul: demoted to 32×32 by the occupancy pass.
         let mut demoted = {
@@ -4387,7 +4514,7 @@ mod variant_tests {
         };
         select_variants(&mut demoted, None, false, false);
         assert!(demoted.dispatches[0].use_small_tiles());
-        let mut pipelines = Pipelines::new(&gpu, &demoted, None, None);
+        let pipelines = Pipelines::new(&gpu, &demoted, None, None);
         assert!(
             pipelines
                 .map
@@ -4401,7 +4528,7 @@ mod variant_tests {
                 .contains_key(&Variant::SmallTile(ShaderEntry::MatMul)),
             "no dispatch can select SmallTile here, so it must not be built"
         );
-        pipelines.destroy(&gpu);
+        drop(pipelines);
 
         // Q4 matmul + relu: reduced-storage weights, now fused.
         let mut weighted = {
@@ -4418,7 +4545,7 @@ mod variant_tests {
             weighted.dispatches[0].weight_format,
             crate::compile::WeightFormat::Q4
         );
-        let mut pipelines = Pipelines::new(&gpu, &weighted, None, None);
+        let pipelines = Pipelines::new(&gpu, &weighted, None, None);
         assert!(
             !pipelines.map.contains_key(&Variant::Weight(
                 ShaderEntry::MatMul,
@@ -4426,7 +4553,7 @@ mod variant_tests {
             )),
             "no dispatch can select the plain weighted kernel here"
         );
-        pipelines.destroy(&gpu);
+        drop(pipelines);
     }
 
     /// A fused epilogue must not keep a matmul on 64×64 geometry once the
@@ -5754,7 +5881,7 @@ impl Drop for Session {
         if let Some(staging) = self.readback.get_mut().staging.take() {
             self.gpu.destroy_buffer(staging.buffer);
         }
-        self.pipelines.destroy(&self.gpu);
+        self.pipelines.map.clear();
         // `buffers` holds aliased copies of these handles; destroy each
         // physical allocation exactly once.
         if let Some((ref m, ref v)) = self.adam_state {
