@@ -2228,6 +2228,51 @@ impl Graph {
         self.add_node(Op::Embedding, vec![indices, table], ty)
     }
 
+    /// Store matrix weights as f16 for an inference graph.
+    ///
+    /// Converts every f32 parameter whose only uses are the weight operand of
+    /// a dense matrix product or the table of an embedding gather. Uploads
+    /// round f32 values to f16; kernels read f16 and compute in f32.
+    /// Parameters with any other use, and graph outputs, stay f32. Returns
+    /// the names of the converted parameters. Training graphs need f32
+    /// master parameters, so call this only before building inference.
+    pub fn store_weights_f16(&mut self) -> Vec<String> {
+        let mut eligible = vec![true; self.nodes.len()];
+        let mut used = vec![false; self.nodes.len()];
+        for node in &self.nodes {
+            for (position, &input) in node.inputs.iter().enumerate() {
+                used[input as usize] = true;
+                let weight_operand = position == 1
+                    && matches!(
+                        node.op,
+                        Op::MatMul
+                            | Op::MatMulBT
+                            | Op::FusedMatMulAdd
+                            | Op::FusedMatMulBTAdd
+                            | Op::Embedding
+                    );
+                if !weight_operand {
+                    eligible[input as usize] = false;
+                }
+            }
+        }
+        for &output in &self.outputs {
+            eligible[output as usize] = false;
+        }
+        let mut converted = Vec::new();
+        for node in &mut self.nodes {
+            if let Op::Parameter { ref name } = node.op
+                && node.ty.dtype == DType::F32
+                && used[node.id as usize]
+                && eligible[node.id as usize]
+            {
+                node.ty.dtype = DType::F16;
+                converted.push(name.clone());
+            }
+        }
+        converted
+    }
+
     /// Scatter-add: accumulate `src[i]` rows into `output[indices[i]]`.
     #[track_caller]
     pub fn scatter_add(&mut self, indices: NodeId, src: NodeId, vocab_size: usize) -> NodeId {

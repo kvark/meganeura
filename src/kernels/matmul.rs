@@ -65,6 +65,8 @@ pub(crate) struct Problem {
     pub k: u32,
     /// Packed or f16 weights, which only the scalar kernels decode.
     pub reduced_storage: bool,
+    /// f16 weights, which f16-input cooperative tiles also read.
+    pub f16_weights: bool,
     /// Autodiff's mark on derivative work that must keep f32 operands.
     pub requires_full_precision: bool,
     /// A fused epilogue that binds buffers of its own, which only the
@@ -85,6 +87,7 @@ impl Problem {
             n,
             k,
             reduced_storage,
+            f16_weights: false,
             requires_full_precision: false,
             epilogue_inputs: false,
             pinned: false,
@@ -109,6 +112,7 @@ impl Problem {
             n,
             k,
             reduced_storage: dispatch.weight_format.uses_reduced_storage(),
+            f16_weights: dispatch.weight_format == crate::compile::WeightFormat::F16,
             requires_full_precision: dispatch.requires_full_precision,
             epilogue_inputs: dispatch
                 .matmul_epilogue
@@ -244,7 +248,8 @@ pub(crate) fn cooperative_geometry(
     // Direct stores write whole sub-tiles, so N must stay aligned for
     // stores never to straddle rows. The bottom edge is safe: the output
     // allocation rounds M up to whole tiles.
-    if problem.reduced_storage {
+    let f16_tiles_read_f16 = problem.f16_weights && config.use_f16_input && !config.compensated;
+    if problem.reduced_storage && !f16_tiles_read_f16 {
         Err("packed weights have no cooperative kernel")
     } else if !problem.n.is_multiple_of(16) {
         Err("N is not a multiple of 16")

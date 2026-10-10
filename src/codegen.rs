@@ -931,9 +931,19 @@ pub(crate) fn coop_shape(group: ShaderGroup) -> Option<(bool, MatMulCoopVariant)
 /// tile config. Takes the scalar group: cooperative execution is a
 /// modifier on a dispatch, not a group of its own.
 pub fn generate_module_coop(group: ShaderGroup, config: &CoopConfig) -> ShaderModule {
+    generate_module_coop_weighted(group, config, WeightFormat::F32)
+}
+
+/// [`generate_module_coop`] reading B in `format`: f32, or f16 with f16-input
+/// tiles, where staging loads the stored half values without a conversion.
+pub fn generate_module_coop_weighted(
+    group: ShaderGroup,
+    config: &CoopConfig,
+    format: WeightFormat,
+) -> ShaderModule {
     let (fused_add, variant) =
         coop_shape(group).unwrap_or_else(|| panic!("no cooperative form for {group:?}"));
-    gen_matmul_coop_wgsl(fused_add, variant, config)
+    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, None, 1, format)
 }
 
 /// Pack `count` same-A matmuls into one dispatch (`workgroups.z = count`).
@@ -948,7 +958,15 @@ pub fn generate_horizontal_matmul(
         Some(config) => {
             let (fused_add, variant) =
                 coop_shape(group).unwrap_or_else(|| panic!("no cooperative form for {group:?}"));
-            gen_matmul_coop_wgsl_full(fused_add, variant, config, None, None, count)
+            gen_matmul_coop_wgsl_full(
+                fused_add,
+                variant,
+                config,
+                None,
+                None,
+                count,
+                WeightFormat::F32,
+            )
         }
         None => generate_partitioned_matmul(group, None, MatMulOptions::default(), 1, count),
     }
@@ -2230,7 +2248,7 @@ fn gen_matmul_coop_wgsl(
     variant: MatMulCoopVariant,
     config: &CoopConfig,
 ) -> ShaderModule {
-    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, None, 1)
+    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, None, 1, WeightFormat::F32)
 }
 
 /// Generate coop matmul with an optional [`crate::compile::MatMulPrologue`].
@@ -2239,8 +2257,9 @@ pub fn gen_matmul_coop_with_prologue(
     variant: MatMulCoopVariant,
     config: &CoopConfig,
     prologue: &crate::compile::MatMulPrologue,
+    format: WeightFormat,
 ) -> ShaderModule {
-    gen_matmul_coop_wgsl_full(fused_add, variant, config, Some(prologue), None, 1)
+    gen_matmul_coop_wgsl_full(fused_add, variant, config, Some(prologue), None, 1, format)
 }
 
 /// Generate a cooperative matmul that stages its f32 accumulators through
@@ -2255,6 +2274,7 @@ pub fn generate_coop_matmul_with_dag_epilogue(
     group: ShaderGroup,
     config: &CoopConfig,
     epilogue: &crate::compile::MatMulEpilogue,
+    format: WeightFormat,
 ) -> ShaderModule {
     assert!(
         epilogue.inputs.is_empty(),
@@ -2262,7 +2282,7 @@ pub fn generate_coop_matmul_with_dag_epilogue(
     );
     let (fused_add, variant) = coop_shape(group)
         .unwrap_or_else(|| panic!("cooperative epilogue not supported for {group:?}"));
-    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, Some(epilogue), 1)
+    gen_matmul_coop_wgsl_full(fused_add, variant, config, None, Some(epilogue), 1, format)
 }
 
 fn gen_matmul_coop_wgsl_full(
@@ -2272,7 +2292,19 @@ fn gen_matmul_coop_wgsl_full(
     prologue: Option<&crate::compile::MatMulPrologue>,
     epilogue: Option<&crate::compile::MatMulEpilogue>,
     copies: u32,
+    b_format: WeightFormat,
 ) -> ShaderModule {
+    let b_f16 = match b_format {
+        WeightFormat::F32 => false,
+        WeightFormat::F16 => true,
+        other => panic!("no cooperative kernel reads {other:?} weights"),
+    };
+    // Staging converts B to f16 for the tiles; stored f16 needs no conversion,
+    // but the hi/lo split and f32 tiles need the f32 value.
+    assert!(
+        !b_f16 || (config.use_f16_input && !config.compensated && copies == 1),
+        "f16 weights need plain f16-input cooperative tiles"
+    );
     if config.tile_size == 8 && !config.use_f16_input {
         return gen_matmul_coop_f32_8x8(fused_add, variant, prologue, epilogue, copies);
     }
@@ -2343,10 +2375,11 @@ fn gen_matmul_coop_wgsl_full(
     } else {
         "array<f32>"
     };
-    let b_storage = if vec4_b || vec4_b_transposed {
-        "array<vec4<f32>>"
-    } else {
-        "array<f32>"
+    let b_storage = match (vec4_b || vec4_b_transposed, b_f16) {
+        (true, false) => "array<vec4<f32>>",
+        (false, false) => "array<f32>",
+        (true, true) => "array<vec4<f16>>",
+        (false, true) => "array<f16>",
     };
 
     // Generate hoisted staging index variables
@@ -3660,7 +3693,13 @@ mod tests {
                 ] {
                     let (fused_add, variant) = coop_shape(group).unwrap();
                     let module = gen_matmul_coop_wgsl_full(
-                        fused_add, variant, &config, prologue, epilogue, copies,
+                        fused_add,
+                        variant,
+                        &config,
+                        prologue,
+                        epilogue,
+                        copies,
+                        WeightFormat::F32,
                     );
                     assert_eq!(module.module.entry_points[0].workgroup_size, [128, 1, 1]);
                     assert!(!module.source.contains("enable f16"));
@@ -3735,7 +3774,12 @@ mod tests {
             ShaderGroup::MatMulAT,
             ShaderGroup::MatMulBT,
         ] {
-            let module = generate_coop_matmul_with_dag_epilogue(group, &config, &epilogue);
+            let module = generate_coop_matmul_with_dag_epilogue(
+                group,
+                &config,
+                &epilogue,
+                WeightFormat::F32,
+            );
             assert!(module.source.contains("shared_c"));
             assert!(module.source.contains("var val = shared_c[local_idx]"));
             Validator::new(flags, capabilities)
@@ -3743,6 +3787,54 @@ mod tests {
                 .unwrap_or_else(|error| {
                     panic!("{group:?} cooperative epilogue failed validation: {error:#?}")
                 });
+        }
+    }
+
+    /// f16-input tiles read stored f16 weights directly, in every layout,
+    /// with and without a fused epilogue.
+    #[test]
+    fn cooperative_matmul_reads_f16_weights() {
+        use crate::compile::MatMulEpilogue;
+        use crate::schedule::{PointwiseDAG, Pw};
+        use naga::valid::{Capabilities, ValidationFlags, Validator};
+
+        let config = CoopConfig {
+            tile_size: 16,
+            use_f16_input: true,
+            compensated: false,
+        };
+        let epilogue = MatMulEpilogue {
+            dag: PointwiseDAG {
+                n_inputs: 1,
+                ops: vec![Pw::LoadInput(0), Pw::Silu(0)],
+                output: 1,
+            },
+            inputs: Vec::new(),
+        };
+        let capabilities = Capabilities::COOPERATIVE_MATRIX
+            | Capabilities::SHADER_FLOAT16
+            | Capabilities::SUBGROUP;
+        let flags = ValidationFlags::all() ^ ValidationFlags::BINDINGS;
+        for group in [
+            ShaderGroup::MatMul,
+            ShaderGroup::MatMulAdd,
+            ShaderGroup::MatMulAT,
+            ShaderGroup::MatMulBT,
+            ShaderGroup::MatMulBTAdd,
+        ] {
+            let plain = generate_module_coop_weighted(group, &config, WeightFormat::F16);
+            assert!(plain.source.contains("vec4<f16>"), "{group:?}");
+            let fused = generate_coop_matmul_with_dag_epilogue(
+                group,
+                &config,
+                &epilogue,
+                WeightFormat::F16,
+            );
+            for module in [plain, fused] {
+                Validator::new(flags, capabilities)
+                    .validate(&module.module)
+                    .unwrap_or_else(|error| panic!("{group:?} f16 weights: {error:#?}"));
+            }
         }
     }
 
