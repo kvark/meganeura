@@ -116,9 +116,9 @@ pub(super) fn select(
             break;
         }
         let lowering = Instant::now();
-        // Try one alternative layout before probing submissions on the winner.
+        // Cover the first layouts before probing submissions on the winner.
         // Later layouts inherit its count and reopen this small search if they win.
-        let program = (index == 1)
+        let program = (index < super::INITIAL_LAYOUTS)
             .then(|| programs.next())
             .flatten()
             .or_else(|| {
