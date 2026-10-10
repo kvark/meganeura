@@ -1262,34 +1262,101 @@ impl Pipelines {
             knobs: plan.knobs,
             dump_dir: wgsl_dump_dir.map(str::to_string),
         };
-        for dispatch in &plan.dispatches {
-            pipelines
-                .prepare(gpu, dispatch, coop_config)
-                .expect("selected shader was rejected");
-        }
-        if !plan.param_grad_pairs.is_empty() {
-            for shader in [
+        let optimizer: Vec<Dispatch> = if plan.param_grad_pairs.is_empty() {
+            Vec::new()
+        } else {
+            [
                 ShaderEntry::SgdUpdate,
                 ShaderEntry::AdamUpdate,
                 ShaderEntry::GradClipNormSq,
                 ShaderEntry::GradClipScale,
                 ShaderEntry::AdaptiveGradClip,
                 ShaderEntry::GradAccum,
-            ] {
-                pipelines
-                    .prepare(
-                        gpu,
-                        &Dispatch {
-                            shader,
-                            ..Default::default()
-                        },
-                        None,
-                    )
-                    .expect("optimizer shader was rejected");
+            ]
+            .into_iter()
+            .map(|shader| Dispatch {
+                shader,
+                ..Default::default()
+            })
+            .collect()
+        };
+        // One job per distinct implementation, in plan order.
+        let mut jobs = Vec::new();
+        let mut keys = std::collections::HashSet::new();
+        for (dispatch, coop) in plan
+            .dispatches
+            .iter()
+            .map(|dispatch| (dispatch, coop_config))
+            .chain(optimizer.iter().map(|dispatch| (dispatch, None)))
+        {
+            let key = Self::key(dispatch);
+            if keys.insert(key.clone()) {
+                jobs.push((key, dispatch, coop));
             }
+        }
+        let compiled = Self::compile_all(gpu, plan.knobs, wgsl_dump_dir, &jobs);
+        for ((key, dispatch, _), pipeline) in jobs.into_iter().zip(compiled) {
+            let pipeline = pipeline.unwrap_or_else(|error| {
+                if optimizer.iter().any(|d| std::ptr::eq(d, dispatch)) {
+                    panic!("optimizer shader was rejected: {error}")
+                } else {
+                    panic!("selected shader was rejected: {error}")
+                }
+            });
+            pipelines.map.insert(key, pipeline);
         }
         pipelines.select(&plan.dispatches);
         pipelines
+    }
+
+    /// Compile on worker threads. A driver can spend tens of milliseconds on
+    /// one pipeline and a plan has hundreds; Blade's context is thread-safe.
+    #[allow(clippy::type_complexity)]
+    fn compile_all(
+        gpu: &Arc<Gpu>,
+        knobs: crate::compile::TuningKnobs,
+        dump_dir: Option<&str>,
+        jobs: &[(Variant, &Dispatch, Option<&crate::codegen::CoopConfig>)],
+    ) -> Vec<Result<Arc<SharedPipeline>, String>> {
+        let compile = |&(ref key, dispatch, coop): &(Variant, &Dispatch, _)| {
+            Self::compile(gpu, knobs, dump_dir, dispatch, key, coop)
+        };
+        let workers = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(8)
+            .min(jobs.len());
+        if workers <= 1 {
+            return jobs.iter().map(compile).collect();
+        }
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let span = tracing::Span::current();
+        let mut results: Vec<_> = jobs.iter().map(|_| None).collect();
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..workers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let _span = span.enter();
+                        let mut compiled = Vec::new();
+                        loop {
+                            let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(job) = jobs.get(index) else {
+                                break compiled;
+                            };
+                            compiled.push((index, compile(job)));
+                        }
+                    })
+                })
+                .collect();
+            for worker in workers {
+                let compiled = worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                for (index, result) in compiled {
+                    results[index] = Some(result);
+                }
+            }
+        });
+        results.into_iter().map(Option::unwrap).collect()
     }
 
     fn prepare(
@@ -1298,12 +1365,33 @@ impl Pipelines {
         dispatch: &Dispatch,
         coop_config: Option<&crate::codegen::CoopConfig>,
     ) -> Result<(), String> {
-        use crate::codegen::ShaderGroup;
         let key = Self::key(dispatch);
         if self.map.contains_key(&key) {
             return Ok(());
         }
-        let knobs = self.knobs;
+        let pipeline = Self::compile(
+            gpu,
+            self.knobs,
+            self.dump_dir.as_deref(),
+            dispatch,
+            &key,
+            coop_config,
+        )?;
+        self.map.insert(key, pipeline);
+        Ok(())
+    }
+
+    /// Generate `dispatch`'s implementation `key` and return its pipeline,
+    /// shared with any live session on `gpu` that generated the same code.
+    fn compile(
+        gpu: &Arc<Gpu>,
+        knobs: crate::compile::TuningKnobs,
+        dump_dir: Option<&str>,
+        dispatch: &Dispatch,
+        key: &Variant,
+        coop_config: Option<&crate::codegen::CoopConfig>,
+    ) -> Result<Arc<SharedPipeline>, String> {
+        use crate::codegen::ShaderGroup;
         let mut matmul_knobs = crate::codegen::MatmulKnobs {
             k_stage: knobs.matmul_k_stage,
             interleave_columns: knobs.matmul_interleave_columns,
@@ -1320,7 +1408,7 @@ impl Pipelines {
         let mut entry_point = dispatch.shader.entry_point();
         let cooperative =
             || *coop_config.expect("cooperative dispatch needs a qualified device configuration");
-        let module = match key {
+        let module = match *key {
             Variant::CoopTiled(_, shape, splits, _) => {
                 let config = cooperative();
                 if config.tile_size != 16 || config.use_f16_input || config.compensated {
@@ -1521,7 +1609,7 @@ impl Pipelines {
         // Every module a session compiles — the standard, coop, weighted,
         // epilogue-fused and scheduled forms alike — passes through here, so
         // the dump sees exactly what a plan would run, shared or not.
-        if let Some(ref dir) = self.dump_dir {
+        if let Some(dir) = dump_dir {
             module.dump(dir);
         }
         let shared_key = SharedPipelineKey {
@@ -1530,25 +1618,16 @@ impl Pipelines {
             layout: format!("{:?}", layout.bindings),
             source: module.source.clone(),
         };
-        let pipeline = match SharedPipelines::get(&shared_key) {
-            Some(pipeline) => pipeline,
-            None => {
-                let shader = create_gen_shader(gpu, module)?;
-                let pipeline = Arc::new(SharedPipeline {
-                    gpu: Arc::clone(gpu),
-                    raw: create_profiled_pipeline(
-                        gpu,
-                        key.label(),
-                        &layout,
-                        shader.at(entry_point),
-                    ),
-                });
-                SharedPipelines::insert(shared_key, &pipeline);
-                pipeline
-            }
-        };
-        self.map.insert(key, pipeline);
-        Ok(())
+        if let Some(pipeline) = SharedPipelines::get(&shared_key) {
+            return Ok(pipeline);
+        }
+        let shader = create_gen_shader(gpu, module)?;
+        let pipeline = Arc::new(SharedPipeline {
+            gpu: Arc::clone(gpu),
+            raw: create_profiled_pipeline(gpu, key.label(), &layout, shader.at(entry_point)),
+        });
+        SharedPipelines::insert(shared_key, &pipeline);
+        Ok(pipeline)
     }
 
     fn attention_head_dim(dispatch: &Dispatch) -> Option<u32> {

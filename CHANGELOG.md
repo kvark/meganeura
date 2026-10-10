@@ -22,7 +22,8 @@
   generated WGSL, entry point and binding layout, and the last user destroys
   each pipeline. A measured-search challenger now compiles only the kernels
   that differ from the live incumbent's. The cooperative-matrix self-test
-  runs once per context and configuration, not once per session.
+  runs once per context and configuration, not once per session. Session
+  construction compiles its distinct pipelines on up to eight threads.
 - Measured builds qualify a program once before timing it, instead of up to
   four times per trial. The check before kernel tuning runs only when kernel
   classes remain to be probed. The check after measurement runs only for a
