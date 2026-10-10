@@ -31,9 +31,15 @@ pub struct BuildSearchOptions {
     /// short workloads in a different operating state from sustained execution.
     pub warmup_time: Duration,
     /// Soft total deadline, including construction, initialization and validation.
-    /// In-flight driver work and caller validation cannot be preempted.
+    /// In-flight driver work and caller validation cannot be preempted. An
+    /// incomplete comparison cannot select its program, so the search does not
+    /// start one when even its cheapest recent complete comparison would not
+    /// finish in time.
     pub max_time: Duration,
     pub max_programs: usize,
+    /// Stop once this many consecutive trials have not replaced the incumbent.
+    /// `None` searches until another bound ends it.
+    pub patience: Option<usize>,
     /// Explore power-of-two submission chunk counts up to this bound (1..=64).
     /// One keeps every candidate on a single submission.
     pub max_submission_chunks: usize,
@@ -58,6 +64,7 @@ impl Default for BuildSearchOptions {
             warmup_time: Duration::from_millis(250),
             max_time: Duration::from_secs(30),
             max_programs: 64,
+            patience: None,
             max_submission_chunks: 1,
             max_plan_bytes: 512 << 20,
             kernel_memo: None,
@@ -76,6 +83,10 @@ pub struct BuildSearchReport {
     pub selected: usize,
     pub trials: Vec<BuildSearchTrial>,
     pub truncated: bool,
+    /// Stopped by [`BuildSearchOptions::patience`].
+    pub patience_exhausted: bool,
+    /// Stopped early because no further comparison could finish by the deadline.
+    pub deadline_reserved: bool,
     /// Requalification of the selected program after the last trial.
     pub final_qualification_time: Duration,
     pub elapsed: Duration,
@@ -957,6 +968,7 @@ mod tests {
                     max_submission_chunks: 64,
                     min_improvement: 0.01,
                     max_plan_bytes: 4 << 20,
+                    patience: None,
                     kernel_memo: None,
                 },
                 |s, _| {

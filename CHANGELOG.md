@@ -1,5 +1,11 @@
 # Unreleased
 
+- Measured search no longer starts a comparison when even its cheapest recent
+  complete comparison, excluding kernel probes, could not finish by the
+  deadline: an incomplete comparison cannot select its program.
+  `BuildSearchOptions::patience` optionally stops the search after that many
+  consecutive trials without a new incumbent. `BuildSearchReport` records
+  either stop.
 - `KernelMemo` is public. `BuildSearchOptions::kernel_memo` lets searches
   share private kernel decisions, and `KernelMemo::save`/`load` carry them
   between processes. Decisions are resumed only on the same device, driver

@@ -51,6 +51,7 @@ for whole-program qualification on representative inputs.
 
 - Budget compilation, allocation, initialization, qualification and measurements,
   not just GPU kernel time. Deadlines are soft around in-flight driver calls.
+  Do not start a comparison that cannot finish: it cannot select its program.
 - Preserve a legal incumbent. An incomplete or invalid comparison cannot win.
   Measurement noise and unrepresentative inputs still limit performance claims.
 - Retain different physical interfaces, such as layouts, until their consumers

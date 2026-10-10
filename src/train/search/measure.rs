@@ -122,10 +122,29 @@ pub(super) fn select(
     });
     let kernels = shared.as_deref_mut().unwrap_or(&mut private);
     kernels.bind(&gpu, &options.tuning);
+    // Recent complete comparisons, without their private kernel probes.
+    let mut comparison_costs = VecDeque::new();
     let mut programs = programs.into_iter().fuse();
     for index in 0..options.max_programs {
         if start.elapsed() >= options.max_time {
             report.truncated = true;
+            break;
+        }
+        if options
+            .patience
+            .is_some_and(|patience| index - report.selected > patience)
+        {
+            report.patience_exhausted = true;
+            break;
+        }
+        // An incomplete comparison cannot select its program.
+        if comparison_costs
+            .iter()
+            .min()
+            .is_some_and(|&cost| start.elapsed() + cost > options.max_time)
+        {
+            report.truncated = true;
+            report.deadline_reserved = true;
             break;
         }
         let lowering = Instant::now();
@@ -300,6 +319,19 @@ pub(super) fn select(
             }
         }
         trial.outcome.elapsed = trial_start.elapsed();
+        if trial.outcome.baseline_ms.len() == options.tuning.sample_pairs
+            && trial.outcome.candidate_ms.len() == options.tuning.sample_pairs
+        {
+            let probes = trial
+                .kernel_tuning
+                .as_ref()
+                .map_or(Duration::ZERO, |t| t.elapsed);
+            comparison_costs
+                .push_back((trial.lowering_time + trial.outcome.elapsed).saturating_sub(probes));
+            if comparison_costs.len() > 3 {
+                comparison_costs.pop_front();
+            }
+        }
         log::info!(
             "program {index}: {:?}, selected={}, {:?}/{:?} ms",
             trial.outcome.decision,
@@ -313,7 +345,8 @@ pub(super) fn select(
     // is truncated. Lazy producers can allocate and compile in `next()`.
     report.truncated |= start.elapsed() >= options.max_time
         || !pending_submissions.is_empty()
-        || (report.trials.len() == options.max_programs && programs.size_hint().1 != Some(0));
+        || ((report.patience_exhausted || report.trials.len() == options.max_programs)
+            && programs.size_hint().1 != Some(0));
     let (mut session, state) = incumbent.ok_or("no qualified program within the search bounds")?;
     // Challengers ran beside the incumbent since it was last checked. A failing
     // incumbent invalidates the search: it must not survive as the supposedly
@@ -664,6 +697,94 @@ mod tests {
         assert!(tuning.outcomes.is_empty());
         assert_eq!(tuning.reused_classes.len(), 1);
         assert_eq!(second.trials[0].qualifications, 1);
+    }
+
+    /// Identical programs never replace the first, so only the stop rules end
+    /// these searches.
+    fn identical_programs(count: usize) -> impl Iterator<Item = Program> {
+        let mut graph = crate::Graph::new();
+        let x = graph.input("x", &[4]);
+        let y = graph.neg(x);
+        graph.set_outputs(vec![y]);
+        let plan = crate::compile::compile(&graph);
+        (0..count).map(move |index| Program {
+            description: index.to_string(),
+            plan: plan.clone(),
+            submission_chunks: Some(1),
+        })
+    }
+
+    fn stop_rule_search(
+        options: BuildSearchOptions,
+        delay: Duration,
+    ) -> (Session, BuildSearchReport) {
+        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
+        select(
+            identical_programs(8),
+            gpu,
+            SessionOptions::default(),
+            BuildSearchOptions {
+                tuning: TuneOptions {
+                    sample_pairs: 4,
+                    ..Default::default()
+                },
+                min_improvement: 0.99,
+                warmup_runs: 1,
+                warmup_time: Duration::from_millis(1),
+                max_programs: 8,
+                max_plan_bytes: 1 << 20,
+                ..options
+            },
+            |s, _| {
+                std::thread::sleep(delay);
+                s.set_input("x", &[1.0, 2.0, 3.0, 4.0]);
+                Ok(())
+            },
+            |s| {
+                if s.read_output(4) == [-1.0, -2.0, -3.0, -4.0] {
+                    Ok(())
+                } else {
+                    Err("negation mismatch".into())
+                }
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn patience_stops_after_trials_without_a_new_incumbent() {
+        let (_, report) = stop_rule_search(
+            BuildSearchOptions {
+                max_time: Duration::from_secs(60),
+                patience: Some(2),
+                ..Default::default()
+            },
+            Duration::ZERO,
+        );
+        assert_eq!(report.selected, 0);
+        assert_eq!(report.trials.len(), 3);
+        assert!(report.patience_exhausted && report.truncated);
+        assert!(!report.deadline_reserved);
+    }
+
+    #[test]
+    fn no_comparison_starts_that_cannot_finish() {
+        // Each trial takes about 0.4 s. The third finishes near 1.2 s, and a
+        // fourth could not complete its comparison by 1.5 s.
+        let (_, report) = stop_rule_search(
+            BuildSearchOptions {
+                max_time: Duration::from_millis(1500),
+                ..Default::default()
+            },
+            Duration::from_millis(400),
+        );
+        assert!(report.deadline_reserved && report.truncated);
+        assert_eq!(report.trials.len(), 3);
+        assert!(
+            report.trials[1..]
+                .iter()
+                .all(|t| t.outcome.decision == TuneDecision::KeepBaseline)
+        );
     }
 
     #[test]
