@@ -27,8 +27,9 @@
 - Measured builds qualify a program once before timing it, instead of up to
   four times per trial. The check before kernel tuning runs only when kernel
   classes remain to be probed. The check after measurement runs only for a
-  winner. The incumbent is requalified once before construction returns, not
-  after every trial. `BuildSearchTrial::qualifications` and
+  winner. The incumbent is requalified once before construction returns, and
+  only if a challenger ran after its own check, not after every trial.
+  `BuildSearchTrial::qualifications` and
   `BuildSearchReport::final_qualification_time` record the checks.
 - Native16 f32 GEMM keeps K-split boundaries independent of staging width.
   A wider staging tile masks its final half tile instead of moving terms
