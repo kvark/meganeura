@@ -175,8 +175,15 @@ pub(super) fn select(
             let build = Instant::now();
             // Preserve the original kernel candidates for memo reuse by submission probes.
             let original_plan = program.plan.clone();
-            let mut candidate =
-                Session::with_context_opts(program.plan, gpu.clone(), runtime.clone());
+            let mut candidate = match incumbent {
+                Some((ref mut baseline, _)) => Session::with_context_opts_inheriting(
+                    program.plan,
+                    gpu.clone(),
+                    runtime.clone(),
+                    baseline,
+                ),
+                None => Session::with_context_opts(program.plan, gpu.clone(), runtime.clone()),
+            };
             candidate.set_submission_chunks(submission_chunks);
             trial.construction_time = build.elapsed();
             let result = (|| {
@@ -428,7 +435,11 @@ mod tests {
                     max_plan_bytes: 1 << 20,
                     ..Default::default()
                 },
-                |s, _| {
+                |s, incumbent| {
+                    // An in-program update makes `w` search state, never shared.
+                    assert!(
+                        incumbent.is_none_or(|incumbent| !s.inherits_parameter(incumbent, "w"))
+                    );
                     initialized.set(initialized.get() + 1);
                     s.set_input("x", &[2.0, 4.0]);
                     s.set_parameter("w", &[3.0, 5.0]);
@@ -473,6 +484,114 @@ mod tests {
                 assert_eq!(selected.read_params(&["w"])[0], [2.5, 4.0]);
             }
         }
+    }
+
+    #[test]
+    fn challengers_inherit_immutable_and_derived_parameters() {
+        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
+        let (rows, inner, cols) = (3, 12, 8);
+        let mut graph = crate::Graph::new();
+        let x = graph.input("x", &[rows, inner]);
+        let gate = graph.parameter("gate", &[inner, cols]);
+        let up = graph.parameter("up", &[inner, cols]);
+        let (gate, up) = (graph.matmul(x, gate), graph.matmul(x, up));
+        let y = graph.swiglu(gate, up);
+        graph.set_outputs(vec![y]);
+        // The ordinary optimizer packs both projections into one derived weight.
+        let (optimized, _) = crate::optimize::optimize_with_config(&graph, Default::default());
+        let plan = crate::compile::compile(&optimized);
+        assert_eq!(plan.derived_params.len(), 1);
+        let values = |seed: usize, n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i * 7 + seed) % 11) as f32 * 0.1 - 0.5)
+                .collect()
+        };
+        let (input, weights) = (
+            values(0, rows * inner),
+            [
+                ("gate", values(1, inner * cols)),
+                ("up", values(2, inner * cols)),
+            ],
+        );
+        let product = |w: &[f32], r: usize, c: usize| -> f64 {
+            (0..inner)
+                .map(|k| f64::from(input[r * inner + k]) * f64::from(w[k * cols + c]))
+                .sum()
+        };
+        let expected: Vec<f64> = (0..rows * cols)
+            .map(|i| {
+                let (a, b) = (
+                    product(&weights[0].1, i / cols, i % cols),
+                    product(&weights[1].1, i / cols, i % cols),
+                );
+                a / (1.0 + (-a).exp()) * b
+            })
+            .collect();
+        let programs = (0..3).map(|index| Program {
+            description: index.to_string(),
+            plan: plan.clone(),
+            submission_chunks: Some(1),
+        });
+        let uploads = std::cell::Cell::new(0);
+        let (mut selected, report) = select(
+            programs,
+            gpu,
+            SessionOptions::default(),
+            BuildSearchOptions {
+                tuning: TuneOptions {
+                    max_time: Duration::ZERO,
+                    sample_pairs: 4,
+                    ..Default::default()
+                },
+                warmup_runs: 1,
+                warmup_time: Duration::from_millis(1),
+                max_time: Duration::from_secs(30),
+                max_programs: 3,
+                max_plan_bytes: 1 << 20,
+                ..Default::default()
+            },
+            |s, incumbent| {
+                s.set_input("x", &input);
+                for &(name, ref data) in &weights {
+                    if incumbent
+                        .as_deref()
+                        .is_some_and(|incumbent| s.inherits_parameter(incumbent, name))
+                    {
+                        continue;
+                    }
+                    uploads.set(uploads.get() + 1);
+                    s.set_parameter(name, data);
+                }
+                Ok(())
+            },
+            |s| {
+                let actual = s.read_output(rows * cols);
+                if actual
+                    .iter()
+                    .zip(&expected)
+                    .all(|(&a, &b)| (f64::from(a) - b).abs() < 1e-4)
+                {
+                    Ok(())
+                } else {
+                    Err(format!("SwiGLU mismatch: {actual:?} vs {expected:?}"))
+                }
+            },
+        )
+        .unwrap();
+        // Only the first program uploads: challengers inherit both sources and
+        // the weight derived from them.
+        assert_eq!(uploads.get(), weights.len());
+        assert_eq!(report.trials.len(), 3);
+        assert!(report.trials.iter().all(|t| t.outcome.qualified));
+        selected.step();
+        selected.wait();
+        assert!(
+            selected
+                .read_output(rows * cols)
+                .iter()
+                .zip(&expected)
+                .all(|(&a, &b)| (f64::from(a) - b).abs() < 1e-4)
+        );
     }
 
     #[test]

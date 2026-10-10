@@ -1,5 +1,11 @@
 # Unreleased
 
+- Measured-search challengers are constructed on the incumbent's identically
+  stored parameters that neither program writes, including fused weights,
+  instead of allocating and zeroing private copies. The new
+  `Session::inherits_parameter` tells an initializer which uploads it can
+  skip. Writing an inherited parameter writes the incumbent's storage, so
+  initializers must keep writing the same values for every candidate.
 - Sessions on one GPU context share compiled pipelines with identical
   generated WGSL, entry point and binding layout, and the last user destroys
   each pipeline. A measured-search challenger now compiles only the kernels

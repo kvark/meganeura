@@ -90,7 +90,9 @@ before tuning when kernel classes remain to be probed. Only a winning challenger
 is qualified again after measurement; the selected program is requalified once
 before construction returns, not after every trial. An invalid challenger is
 discarded; an invalid final incumbent aborts the search.
-An initializer may share compatible immutable weights from the idle incumbent.
+Each challenger is constructed on the idle incumbent's identically stored weights
+that neither program writes. `Session::inherits_parameter` tells the initializer
+which uploads it can skip; written parameters remain private search state.
 Sessions on one context share pipelines with identical generated code, so a
 challenger compiles only the kernels that differ from the incumbent's.
 
