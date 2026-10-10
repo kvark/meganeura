@@ -41,6 +41,11 @@ pub struct BuildSearchOptions {
     /// incumbent and challenger. This is not a driver-heap bound: padding,
     /// pipelines, staging and kernel-probe scratch are additional.
     pub max_plan_bytes: usize,
+    /// Private kernel decisions shared with other searches, which resume them
+    /// on the same device, driver and decision policy. `None` keeps them
+    /// private to this search. The search holds the lock while it runs.
+    #[serde(skip)]
+    pub kernel_memo: Option<std::sync::Arc<std::sync::Mutex<runtime::KernelMemo>>>,
 }
 
 impl Default for BuildSearchOptions {
@@ -55,6 +60,7 @@ impl Default for BuildSearchOptions {
             max_programs: 64,
             max_submission_chunks: 1,
             max_plan_bytes: 512 << 20,
+            kernel_memo: None,
         }
     }
 }
@@ -951,6 +957,7 @@ mod tests {
                     max_submission_chunks: 64,
                     min_improvement: 0.01,
                     max_plan_bytes: 4 << 20,
+                    kernel_memo: None,
                 },
                 |s, _| {
                     s.set_input("x", &[0.25; 99]);

@@ -122,6 +122,14 @@ budget or a change in execution state can still defeat that expectation.
 Held-out inference and minimal-shape measurements must check the selected plan;
 training improvements do not compensate for inference regressions.
 
+Private kernel decisions are keyed by complete class and candidate list, so
+`BuildSearchOptions::kernel_memo` can carry them into later searches on the same
+device, driver and decision policy; `KernelMemo::save` and `load` carry them into
+later processes. A resumed class installs its recorded winner and probes only
+the challengers it has not decided. Whole-program qualification still checks the
+result. Reusing decisions across benchmark replicates is a protocol choice: such
+replicates no longer measure independent kernel searches.
+
 Private probes use `TuneOptions::target_sample_time` (two milliseconds by
 default) to choose a common repetition count from the faster variant's warmup.
 `dispatches_per_sample` caps that count; its default is sixteen. Setting the

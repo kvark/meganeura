@@ -1,5 +1,11 @@
 # Unreleased
 
+- `KernelMemo` is public. `BuildSearchOptions::kernel_memo` lets searches
+  share private kernel decisions, and `KernelMemo::save`/`load` carry them
+  between processes. Decisions are resumed only on the same device, driver
+  and decision policy; budgets do not affect them. A resumed winner is still
+  covered by whole-program qualification. Without a memo, each search keeps
+  its decisions private, as before.
 - Measured-search challengers are constructed on the incumbent's identically
   stored parameters that neither program writes, including fused weights,
   instead of allocating and zeroing private copies. The new
