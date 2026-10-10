@@ -115,7 +115,13 @@ pub(super) fn select(
     let mut selected_plan: Option<ExecutionPlan> = None;
     let mut pending_submissions = VecDeque::new();
     let mut probe_submission = true;
-    let mut kernels = crate::runtime::KernelMemo::default();
+    let mut private = crate::runtime::KernelMemo::default();
+    let mut shared = options.kernel_memo.as_ref().map(|memo| {
+        memo.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
+    let kernels = shared.as_deref_mut().unwrap_or(&mut private);
+    kernels.bind(&gpu, &options.tuning);
     let mut programs = programs.into_iter().fuse();
     for index in 0..options.max_programs {
         if start.elapsed() >= options.max_time {
@@ -203,12 +209,12 @@ pub(super) fn select(
                 // Do not spend kernel probes on an invalid program. Memoized
                 // classes only install recorded winners, and the check after
                 // tuning covers the program as it is measured.
-                if candidate.kernel_probes_pending(&policy, Some(&kernels)) {
+                if candidate.kernel_probes_pending(&policy, Some(kernels)) {
                     validate(&mut candidate, &state, &mut trial, &mut qualify)?;
                 }
                 trial.kernel_tuning = Some(
                     candidate
-                        .tune_with_memo(policy, Some(&mut kernels))
+                        .tune_with_memo(policy, Some(&mut *kernels))
                         .map_err(|error| error.to_string())?,
                 );
                 validate(&mut candidate, &state, &mut trial, &mut qualify)?;
@@ -592,6 +598,72 @@ mod tests {
                 .zip(&expected)
                 .all(|(&a, &b)| (f64::from(a) - b).abs() < 1e-4)
         );
+    }
+
+    #[test]
+    fn later_searches_resume_shared_kernel_decisions() {
+        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
+        let mut graph = crate::Graph::new();
+        let x = graph.input("x", &[33, 17]);
+        let w = graph.parameter("w", &[17, 65]);
+        let y = graph.matmul(x, w);
+        graph.set_outputs(vec![y]);
+        let plan = crate::compile::compile(&graph);
+        let memo = Arc::new(std::sync::Mutex::new(crate::runtime::KernelMemo::default()));
+        let search = || {
+            select(
+                [Program {
+                    description: "ordinary".into(),
+                    plan: plan.clone(),
+                    submission_chunks: Some(1),
+                }],
+                gpu.clone(),
+                SessionOptions {
+                    coop: crate::CoopPolicy::Disabled,
+                    ..Default::default()
+                },
+                BuildSearchOptions {
+                    tuning: TuneOptions {
+                        max_time: Duration::from_secs(30),
+                        sample_pairs: 4,
+                        target_sample_time: Some(Duration::from_nanos(1)),
+                        ..Default::default()
+                    },
+                    max_time: Duration::from_secs(60),
+                    max_programs: 1,
+                    max_plan_bytes: 1 << 20,
+                    kernel_memo: Some(memo.clone()),
+                    ..Default::default()
+                },
+                |s, _| {
+                    s.set_input("x", &[0.25; 33 * 17]);
+                    s.set_parameter("w", &[0.125; 17 * 65]);
+                    Ok(())
+                },
+                |s| {
+                    let output = s.read_output(33 * 65);
+                    if output.iter().all(|&v| (v - 0.53125).abs() < 1e-5) {
+                        Ok(())
+                    } else {
+                        Err("matmul mismatch".into())
+                    }
+                },
+            )
+            .unwrap()
+            .1
+        };
+        let first = search();
+        let tuning = first.trials[0].kernel_tuning.as_ref().unwrap();
+        assert!(!tuning.outcomes.is_empty() && !tuning.time_budget_exhausted);
+        // Kernel classes were left to probe, so the first program was also
+        // qualified before tuning.
+        assert_eq!(first.trials[0].qualifications, 2);
+        assert_eq!(memo.lock().unwrap().len(), 1);
+        let second = search();
+        let tuning = second.trials[0].kernel_tuning.as_ref().unwrap();
+        assert!(tuning.outcomes.is_empty());
+        assert_eq!(tuning.reused_classes.len(), 1);
+        assert_eq!(second.trials[0].qualifications, 1);
     }
 
     #[test]

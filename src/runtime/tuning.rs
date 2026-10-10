@@ -11,12 +11,110 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Qualified private-scratch comparisons within one graph search, on one device
-/// and under one numerical/timing policy. Never persisted or shared globally.
+/// Qualified private-scratch kernel comparisons, resumable by later tuning.
+///
+/// Each decision covers one complete class key and candidate list, measured
+/// in private scratch, so it does not depend on the surrounding program.
+/// Later searches on the same device, driver and decision policy install the
+/// recorded winner and probe only the challengers it has not decided. Their
+/// whole-program qualification still checks every installed winner. A memo
+/// used on another device, driver or policy starts over instead of
+/// transferring decisions. Share one between searches through
+/// [`crate::train::BuildSearchOptions::kernel_memo`], and between processes
+/// with [`Self::save`] and [`Self::load`].
 #[derive(Default)]
-pub(crate) struct KernelMemo(HashMap<MemoKey, KernelProgress>);
+pub struct KernelMemo {
+    scope: Option<MemoScope>,
+    progress: HashMap<MemoKey, KernelProgress>,
+}
 
-#[derive(Clone, Copy)]
+/// What a recorded decision depends on besides its class key.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct MemoScope {
+    device: String,
+    driver: String,
+    driver_info: String,
+    /// Bits, so that a saved memo compares exactly.
+    min_improvement: u64,
+    warmup_runs: u32,
+    sample_pairs: usize,
+    dispatches_per_sample: u32,
+    target_sample_time: Option<Duration>,
+    staging: crate::tune::TuneStaging,
+    staging_reuse: crate::tune::TuneStagingReuse,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MemoFile {
+    scope: Option<MemoScope>,
+    progress: Vec<(MemoKey, KernelProgress)>,
+}
+
+impl KernelMemo {
+    /// Resume only decisions made on this device and driver under the decision
+    /// policy of `options`; budgets and scope do not change a decision.
+    pub(crate) fn bind(&mut self, gpu: &Gpu, options: &TuneOptions) {
+        let info = gpu.device_information();
+        let scope = MemoScope {
+            device: info.device_name.clone(),
+            driver: info.driver_name.clone(),
+            driver_info: info.driver_info.clone(),
+            min_improvement: options.min_improvement.to_bits(),
+            warmup_runs: options.warmup_runs,
+            sample_pairs: options.sample_pairs,
+            dispatches_per_sample: options.dispatches_per_sample,
+            target_sample_time: options.target_sample_time,
+            staging: options.staging,
+            staging_reuse: options.staging_reuse,
+        };
+        if self.scope.as_ref() != Some(&scope) {
+            if !self.progress.is_empty() {
+                log::info!(
+                    "kernel memo: discarding {} decisions from another device or policy",
+                    self.progress.len()
+                );
+            }
+            self.progress.clear();
+            self.scope = Some(scope);
+        }
+    }
+
+    /// Classes with recorded progress.
+    pub fn len(&self) -> usize {
+        self.progress.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.progress.is_empty()
+    }
+
+    /// Read a memo written by [`Self::save`]. Its scope is checked on use.
+    pub fn load(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        let file: MemoFile = serde_json::from_slice(&std::fs::read(path)?)?;
+        Ok(Self {
+            scope: file.scope,
+            progress: file.progress.into_iter().collect(),
+        })
+    }
+
+    /// Write the memo, replacing `path` only once the whole file is written.
+    pub fn save(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        let path = path.as_ref();
+        let file = MemoFile {
+            scope: self.scope.clone(),
+            progress: self
+                .progress
+                .iter()
+                .map(|(key, &progress)| (key.clone(), progress))
+                .collect(),
+        };
+        let partial = path.with_extension("partial");
+        std::fs::write(&partial, serde_json::to_vec(&file)?)?;
+        std::fs::rename(partial, path)
+    }
+}
+
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct KernelProgress {
     selected: MatmulTile,
     next_candidate: usize,
@@ -547,7 +645,7 @@ impl Session {
         let (classes, _) = self.tune_classes(options);
         classes.iter().take(options.max_classes).any(|class| {
             let decided = memo
-                .and_then(|memo| memo.0.get(&memo_key(&self.plan, class)))
+                .and_then(|memo| memo.progress.get(&memo_key(&self.plan, class)))
                 .filter(|progress| progress.applies_to(class))
                 .map_or(0, |progress| progress.next_candidate);
             decided < class.challengers.len()
@@ -580,7 +678,7 @@ impl Session {
             let memo_key = memo_key(&self.plan, class);
             let mut incumbent = class.initial;
             let mut next_candidate = 0;
-            if let Some(&progress) = memo.as_ref().and_then(|m| m.0.get(&memo_key)) {
+            if let Some(&progress) = memo.as_ref().and_then(|m| m.progress.get(&memo_key)) {
                 let selected = progress.selected;
                 if progress.applies_to(class)
                     && self
@@ -638,7 +736,7 @@ impl Session {
                         next_candidate += 1;
                     }
                     if let Some(ref mut memo) = memo {
-                        memo.0.insert(
+                        memo.progress.insert(
                             memo_key.clone(),
                             KernelProgress {
                                 selected: incumbent,
@@ -1925,6 +2023,57 @@ mod tests {
     }
 
     #[test]
+    fn kernel_memo_persists_and_discards_other_policies() {
+        let gpu = crate::init_gpu_context().unwrap();
+        let options = TuneOptions::default();
+        let mut memo = KernelMemo::default();
+        memo.bind(&gpu, &options);
+        memo.progress.insert(
+            (
+                32,
+                false,
+                TuneClass::default(),
+                vec![MatmulTile::Tile32, MatmulTile::Tile64],
+            ),
+            KernelProgress {
+                selected: MatmulTile::Tile64,
+                next_candidate: 1,
+            },
+        );
+        let path =
+            std::env::temp_dir().join(format!("meganeura-kernel-memo-{}.json", std::process::id()));
+        memo.save(&path).unwrap();
+        let mut loaded = KernelMemo::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(loaded.scope, memo.scope);
+        loaded.bind(&gpu, &options);
+        assert_eq!(loaded.len(), 1);
+        let progress = loaded.progress.values().next().unwrap();
+        assert_eq!(
+            (progress.selected, progress.next_candidate),
+            (MatmulTile::Tile64, 1)
+        );
+        // Budgets do not change a decision; the decision policy does.
+        loaded.bind(
+            &gpu,
+            &TuneOptions {
+                max_time: Duration::from_secs(1),
+                max_classes: 1,
+                ..options.clone()
+            },
+        );
+        assert_eq!(loaded.len(), 1);
+        loaded.bind(
+            &gpu,
+            &TuneOptions {
+                min_improvement: 0.1,
+                ..options
+            },
+        );
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
     #[ignore = "GPU qualification of resumable private kernel searches"]
     fn kernel_memo_resumes_only_qualified_comparisons() {
         let gpu = std::sync::Arc::new(
@@ -1972,14 +2121,14 @@ mod tests {
                 .all(|o| o.sample_repetitions == Some(1))
         );
         assert!(!first.time_budget_exhausted);
-        assert_eq!(memo.0.len(), 1);
+        assert_eq!(memo.len(), 1);
         let fresh = create();
         assert!(fresh.kernel_probes_pending(&options, None));
         assert!(!fresh.kernel_probes_pending(&options, Some(&memo)));
         drop(fresh);
         // Keep an actual qualified prefix, without timing-dependent sleeps or
         // an assumed GPU speed to interrupt the first search at this point.
-        *memo.0.values_mut().next().unwrap() = KernelProgress {
+        *memo.progress.values_mut().next().unwrap() = KernelProgress {
             selected: first.outcomes[0].selected,
             next_candidate: 1,
         };
@@ -1997,7 +2146,7 @@ mod tests {
             )
             .unwrap();
         assert!(skipped.outcomes.is_empty() && skipped.reused_classes.is_empty());
-        assert_eq!(memo.0.values().next().unwrap().next_candidate, 1);
+        assert_eq!(memo.progress.values().next().unwrap().next_candidate, 1);
         let resumed = session
             .tune_with_memo(options.clone(), Some(&mut memo))
             .unwrap();
