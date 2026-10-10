@@ -14,6 +14,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+const INITIAL_LAYOUTS: usize = 3;
+
 #[derive(Clone, Serialize)]
 pub struct BuildSearchOptions {
     /// Bound on graph/implementation forms, including ordinary extraction.
@@ -377,7 +379,7 @@ fn early_physical_cover(
     cover
 }
 
-/// Diagonal coverage of graph rank × physical rank. Neither a larger graph
+/// Cover early layouts, then graph rank × physical rank. Neither a larger graph
 /// frontier nor more physical variants should starve the other under a budget.
 fn physical_program_order(
     n_seeds: usize,
@@ -385,7 +387,9 @@ fn physical_program_order(
     cover: &[AxisChoice],
     tail: &[AxisChoice],
 ) -> Vec<(usize, AxisChoice)> {
-    let mut order = Vec::new();
+    let mut order: Vec<_> = (0..n_seeds.min(INITIAL_LAYOUTS))
+        .map(|seed| (seed, baseline))
+        .collect();
     let choices: Vec<_> = std::iter::once(baseline)
         .chain(cover.iter().copied())
         .chain(tail.iter().copied())
@@ -393,7 +397,7 @@ fn physical_program_order(
     for rank in 0..n_seeds + choices.len() - 1 {
         for (physical, &choice) in choices.iter().take(rank + 1).enumerate() {
             let seed = rank - physical;
-            if seed < n_seeds {
+            if seed < n_seeds && !(physical == 0 && seed < INITIAL_LAYOUTS) {
                 order.push((seed, choice));
             }
         }
@@ -636,7 +640,7 @@ mod tests {
         let cover = early_physical_cover(baseline, &[], 1);
         assert_eq!(cover, vec![unfused]);
         let order = physical_program_order(8, baseline, &cover, &[]);
-        assert!(order[..3].contains(&(0, unfused)));
+        assert!(order[..4].contains(&(0, unfused)));
         for seed in 0..8 {
             for choice in [baseline, unfused] {
                 assert_eq!(
