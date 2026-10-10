@@ -269,8 +269,8 @@ pub fn build_measured(
     )
 }
 
-/// Cover a joint graph/layout choice early, then interleave both axes. A
-/// backward-only prefix can displace the useful matrix forms under a deadline.
+/// Cover one backward layout and one joint graph/layout choice early, then
+/// interleave both axes so neither displaces the other under a deadline.
 fn backward_layouts(
     graphs: Vec<optimize::search::Candidate>,
     config: optimize::OptimizeConfig,
@@ -283,7 +283,7 @@ fn backward_layouts(
         (0..graphs.len()).map(|_| None).collect();
     let mut candidates = Vec::new();
     let mut truncated = false;
-    let prefix = [(0, 0), (1, 1), (1, 0)];
+    let prefix = [(0, 0), (0, 1), (1, 1), (1, 0)];
     let diagonal = (1..limit)
         .flat_map(|rank| (0..graphs.len().min(rank + 1)).map(move |index| (index, rank - index)));
     let mut visited = collections::HashSet::new();
@@ -352,7 +352,7 @@ fn early_physical_cover(
     chunks: &[usize],
 ) -> Vec<AxisChoice> {
     let mut cover = Vec::new();
-    if let Some(&submission_chunks) = chunks.get(1) {
+    for &submission_chunks in chunks.iter().skip(1).take(3) {
         cover.push(AxisChoice {
             submission_chunks: Some(submission_chunks),
             ..baseline
@@ -454,7 +454,7 @@ fn implementations(
     let chunks: Vec<_> = std::iter::successors(Some(1usize), |n| n.checked_mul(2))
         .take_while(|&n| n <= max_submission_chunks)
         .collect();
-    // Rank the first alternative on each axis and their interaction early.
+    // Cover small submission counts before expanding the physical choices.
     let cover = early_physical_cover(baseline, &attention, &chunks);
     let mut seen = collections::HashSet::from([baseline]);
     seen.extend(cover.iter().copied());
@@ -667,13 +667,15 @@ mod tests {
             }
         }
         assert!(early_physical_cover(unfused, &[], &[1]).is_empty());
-        let chunked = AxisChoice {
-            submission_chunks: Some(2),
-            ..baseline
-        };
-        let cover = early_physical_cover(baseline, &[], &[1, 2, 4]);
+        let cover = early_physical_cover(baseline, &[], &[1, 2, 4, 8, 16]);
         let order = physical_program_order(8, baseline, &cover, &[]);
-        assert!(order[..3].contains(&(0, chunked)));
+        for (submission_chunks, prefix) in [(2, 3), (4, 6), (8, 10)] {
+            let chunked = AxisChoice {
+                submission_chunks: Some(submission_chunks),
+                ..baseline
+            };
+            assert!(order[..prefix].contains(&(0, chunked)));
+        }
     }
 
     #[test]
