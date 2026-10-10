@@ -102,6 +102,9 @@ pub(super) fn select(
     if options.max_programs == 0 || options.max_time.is_zero() {
         return Err("program search needs a positive program and time budget".into());
     }
+    let mut selection = options.tuning.clone();
+    selection.min_improvement = options.min_improvement;
+    selection.validate().map_err(|error| error.to_string())?;
     let mut incumbent: Option<(Session, SearchState)> = None;
     let mut incumbent_bytes = 0usize;
     let mut selected_chunks = 1;
@@ -229,7 +232,7 @@ pub(super) fn select(
                         return Err(error);
                     }
                     validate(&mut candidate, &state, &mut trial, &mut qualify)?;
-                    decide(&mut trial.outcome, &options.tuning);
+                    decide(&mut trial.outcome, &selection);
                 } else {
                     trial.outcome.selected = index;
                 }
