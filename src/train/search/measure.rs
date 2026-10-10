@@ -34,6 +34,8 @@ pub struct BuildSearchTrial {
     pub state_copy_time: Duration,
     pub snapshot_bytes: usize,
     pub qualification_time: Duration,
+    /// Complete executions checked by the caller's `qualify`.
+    pub qualifications: u32,
     pub kernel_tuning: Option<TuneReport>,
     pub outcome: TuneOutcome<(), usize>,
 }
@@ -81,6 +83,7 @@ fn validate(
     session.wait();
     let result = check(session);
     trial.qualification_time += start.elapsed();
+    trial.qualifications += 1;
     restore(session, state, &mut trial.state_copy_time)?;
     result
 }
@@ -158,6 +161,7 @@ pub(super) fn select(
             state_copy_time: Duration::ZERO,
             snapshot_bytes: 0,
             qualification_time: Duration::ZERO,
+            qualifications: 0,
             kernel_tuning: None,
             outcome: TuneOutcome::new((), program.plan.dispatches.len(), report.selected, index),
         };
@@ -185,11 +189,16 @@ pub(super) fn select(
                 let state = SearchState::capture(&mut candidate, options.max_plan_bytes)?;
                 trial.state_copy_time += copy_start.elapsed();
                 trial.snapshot_bytes = state.bytes();
-                validate(&mut candidate, &state, &mut trial, &mut qualify)?;
                 let mut policy = options.tuning.clone();
                 policy.max_time = policy
                     .max_time
                     .min(options.max_time.saturating_sub(start.elapsed()));
+                // Do not spend kernel probes on an invalid program. Memoized
+                // classes only install recorded winners, and the check after
+                // tuning covers the program as it is measured.
+                if candidate.kernel_probes_pending(&policy, Some(&kernels)) {
+                    validate(&mut candidate, &state, &mut trial, &mut qualify)?;
+                }
                 trial.kernel_tuning = Some(
                     candidate
                         .tune_with_memo(policy, Some(&mut kernels))
@@ -233,19 +242,18 @@ pub(super) fn select(
                     if let Some(error) = failure {
                         return Err(error);
                     }
-                    validate(&mut candidate, &state, &mut trial, &mut qualify)?;
                     decide(&mut trial.outcome, &selection);
+                    // A rejected challenger is discarded either way. Confirm a
+                    // winner after its repeated execution, before it replaces
+                    // the incumbent.
+                    if trial.outcome.selected == index {
+                        validate(&mut candidate, &state, &mut trial, &mut qualify)?;
+                    }
                 } else {
                     trial.outcome.selected = index;
                 }
                 Ok::<_, String>(state)
             })();
-            // A failing challenger is discarded. A failing incumbent invalidates
-            // the search: it must not survive as the supposedly safe fallback.
-            if let Some((ref mut baseline, ref state)) = incumbent {
-                validate(baseline, state, &mut trial, &mut qualify)
-                    .map_err(|error| format!("incumbent failed repeated qualification: {error}"))?;
-            }
             match result {
                 Ok(state) if incumbent.is_none() || trial.outcome.selected == index => {
                     incumbent_bytes = plan_bytes(candidate.plan())?;
@@ -293,14 +301,20 @@ pub(super) fn select(
     report.truncated |= start.elapsed() >= options.max_time
         || !pending_submissions.is_empty()
         || (report.trials.len() == options.max_programs && programs.size_hint().1 != Some(0));
-    incumbent
-        .map(|(mut session, state)| {
-            state.restore(&mut session)?;
-            report.elapsed = start.elapsed();
-            Ok((session, report))
-        })
-        .ok_or_else(|| "no qualified program within the search bounds".into())
-        .and_then(|result| result)
+    let (mut session, state) = incumbent.ok_or("no qualified program within the search bounds")?;
+    // Challengers ran beside the incumbent since it was last checked. A failing
+    // incumbent invalidates the search: it must not survive as the supposedly
+    // safe fallback. A replaced one was discarded and needs no further check.
+    let check = Instant::now();
+    state.restore(&mut session)?;
+    session.step();
+    session.wait();
+    let result = qualify(&session);
+    report.final_qualification_time = check.elapsed();
+    result.map_err(|error| format!("incumbent failed repeated qualification: {error}"))?;
+    state.restore(&mut session)?;
+    report.elapsed = start.elapsed();
+    Ok((session, report))
 }
 
 #[cfg(test)]
@@ -403,6 +417,9 @@ mod tests {
                         sample_pairs: 4,
                         ..Default::default()
                     },
+                    // Identical programs: keep the first, so the injected
+                    // failure reaches the final incumbent check.
+                    min_improvement: 0.99,
                     warmup_runs: 2,
                     warmup_time: Duration::from_millis(1),
                     max_time: Duration::from_secs(30),
@@ -442,6 +459,8 @@ mod tests {
             } else {
                 let (mut selected, report) = result.unwrap();
                 assert!(report.trials.iter().all(|t| t.outcome.qualified));
+                // Nothing to probe, and the challenger lost: one check each.
+                assert!(report.trials.iter().all(|t| t.qualifications == 1));
                 assert!(
                     report
                         .trials

@@ -70,6 +70,8 @@ pub struct BuildSearchReport {
     pub selected: usize,
     pub trials: Vec<BuildSearchTrial>,
     pub truncated: bool,
+    /// Requalification of the selected program after the last trial.
+    pub final_qualification_time: Duration,
     pub elapsed: Duration,
 }
 
@@ -84,8 +86,11 @@ pub struct BuildSearchReport {
 ///
 /// The runner executes one step before each read-only `qualify` call. Check every
 /// observable output, gradient and persistent update against your numerical
-/// contract. Qualification runs before/after kernel tuning and after measurement;
-/// a failing challenger is discarded, a failing incumbent aborts construction.
+/// contract. Every program is qualified after kernel tuning, before it is timed;
+/// one with kernel classes left to probe is also qualified before tuning. A
+/// winning challenger is qualified again after measurement, and the selected
+/// program once more before construction returns. A failing challenger is
+/// discarded; a failing final incumbent aborts construction.
 /// Written inputs, parameters and constants are reset before each step, outside
 /// timing. The returned session retains its initialized persistent state; outputs
 /// hold its last qualified step. Timing includes fresh recording/submission/wait,

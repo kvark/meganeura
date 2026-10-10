@@ -85,7 +85,11 @@ session. The qualifier reads all observable outputs, gradients and state updates
 after exactly one step and checks the application's numerical contract. The
 runner resets persistent writes between steps and before returning the winner.
 Configure runtime optimizers and external/shared writable bindings afterward.
-An invalid challenger is discarded; an invalid incumbent aborts the search.
+Each program is qualified after kernel tuning, before it is timed, and also
+before tuning when kernel classes remain to be probed. Only a winning challenger
+is qualified again after measurement; the selected program is requalified once
+before construction returns, not after every trial. An invalid challenger is
+discarded; an invalid final incumbent aborts the search.
 An initializer may share compatible immutable weights from the idle incumbent.
 
 Implemented choices include fused and unfused graph forms, scalar matmul
