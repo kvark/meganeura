@@ -20,8 +20,11 @@ const INITIAL_LAYOUTS: usize = 3;
 pub struct BuildSearchOptions {
     /// Bound on graph/implementation forms, including ordinary extraction.
     pub max_graphs: usize,
-    /// Per-program kernel tuning and paired whole-step decision policy.
+    /// Per-program kernel tuning and shared paired sampling policy.
     pub tuning: TuneOptions,
+    /// Minimum whole-program improvement, in addition to the timing noise margin.
+    /// Independent of the private kernel threshold in `tuning`.
+    pub min_improvement: f64,
     /// Whole-program warmup pairs, independent of private kernel warmup.
     pub warmup_runs: u32,
     /// Minimum paired warmup duration. A fixed step count alone can leave
@@ -45,6 +48,7 @@ impl Default for BuildSearchOptions {
         Self {
             max_graphs: 16,
             tuning: TuneOptions::default(),
+            min_improvement: 0.05,
             warmup_runs: 2,
             warmup_time: Duration::from_millis(250),
             max_time: Duration::from_secs(30),
@@ -119,6 +123,9 @@ pub fn build_measured(
     }
     if !(1..=64).contains(&options.max_submission_chunks) {
         return Err("measured construction needs a submission chunk bound in 1..=64".into());
+    }
+    if !options.min_improvement.is_finite() || !(0.0..1.0).contains(&options.min_improvement) {
+        return Err("whole-program min_improvement must be finite and in [0, 1)".into());
     }
     options.tuning.validate().map_err(|e| e.to_string())?;
     if cfg.runtime.debug {
@@ -937,6 +944,7 @@ mod tests {
                     max_time: Duration::from_secs(60),
                     max_programs: 24,
                     max_submission_chunks: 4,
+                    min_improvement: 0.01,
                     max_plan_bytes: 4 << 20,
                 },
                 |s, _| {
