@@ -1050,8 +1050,9 @@ enum Variant {
     /// Non-f32 weight storage (f16, Q4, Q8).
     Weight(ShaderEntry, crate::compile::WeightFormat),
     WeightSmall(ShaderEntry, crate::compile::WeightFormat),
-    /// Cooperative-matrix implementation qualified for the session's precision policy.
-    Coop(ShaderEntry),
+    /// Cooperative-matrix implementation qualified for the session's precision
+    /// policy, for the weight format it reads (f32, or f16 with f16 tiles).
+    Coop(ShaderEntry, crate::compile::WeightFormat),
     /// Cooperative f16 with hi/lo residual staging (C1).
     CoopCompensated(ShaderEntry),
     /// Same-A matmul pack (D1). The kind is part of the key so a
@@ -1100,7 +1101,7 @@ impl Variant {
             | Variant::GemvRmsNormIntDot(ref e, _, _)
             | Variant::Weight(ref e, _)
             | Variant::WeightSmall(ref e, _)
-            | Variant::Coop(ref e)
+            | Variant::Coop(ref e, _)
             | Variant::CoopCompensated(ref e)
             | Variant::Horizontal(ref e, _, _)
             | Variant::SmallTile(ref e)
@@ -1145,7 +1146,8 @@ impl Variant {
             Variant::Gemv(ref e, format, shape) => format!("{e:?}:gemv-{format:?}-{shape:?}"),
             Variant::Weight(ref e, format) => format!("{e:?}:weight-{format:?}"),
             Variant::WeightSmall(ref e, format) => format!("{e:?}:weight-{format:?}-small-tile"),
-            Variant::Coop(ref e) => format!("{e:?}:cooperative"),
+            Variant::Coop(ref e, crate::compile::WeightFormat::F32) => format!("{e:?}:cooperative"),
+            Variant::Coop(ref e, format) => format!("{e:?}:cooperative-{format:?}-weights"),
             Variant::CoopCompensated(ref e) => format!("{e:?}:cooperative-compensated"),
             Variant::Horizontal(ref e, n, kind) => format!("{e:?}:horizontal-{n}-{kind:?}"),
             Variant::SmallTile(ref e) => format!("{e:?}:small-tile"),
@@ -1343,7 +1345,7 @@ impl Pipelines {
                 }
                 tuning::tile_module(dispatch, crate::tune::MatmulTile::Gemv(shape), matmul_knobs)
             }
-            Variant::Coop(_) | Variant::CoopCompensated(_) => {
+            Variant::Coop(..) | Variant::CoopCompensated(_) => {
                 let mut config = cooperative();
                 config.compensated = dispatch.use_coop_compensated();
                 use crate::codegen::Conv2dCoopDirection;
@@ -1366,7 +1368,11 @@ impl Pipelines {
                             &config,
                         )
                     }
-                    _ => crate::codegen::generate_module_coop(group, &config),
+                    _ => crate::codegen::generate_module_coop_weighted(
+                        group,
+                        &config,
+                        dispatch.weight_format,
+                    ),
                 }
             }
             Variant::Epilogue(..) => crate::codegen::generate_matmul_with_epilogue(
@@ -1385,6 +1391,7 @@ impl Pipelines {
                     .matmul_epilogue
                     .as_ref()
                     .expect("cooperative epilogue"),
+                dispatch.weight_format,
             ),
             Variant::CoopPrologue(..) => {
                 let prologue = dispatch
@@ -1399,6 +1406,7 @@ impl Pipelines {
                     variant,
                     &cooperative(),
                     prologue,
+                    dispatch.weight_format,
                 )
             }
             Variant::Attention(_, hd, ept) => match group {
@@ -1568,7 +1576,10 @@ impl Pipelines {
         if let Some(shape) = dispatch.gemv_shape() {
             return Variant::Gemv(entry, dispatch.weight_format, shape);
         }
-        if dispatch.weight_format.uses_reduced_storage() {
+        let cooperative_f16_weights = dispatch.use_coop()
+            && !dispatch.use_coop_compensated()
+            && dispatch.weight_format == crate::compile::WeightFormat::F16;
+        if dispatch.weight_format.uses_reduced_storage() && !cooperative_f16_weights {
             return if dispatch.use_small_tiles() {
                 Variant::WeightSmall(entry, dispatch.weight_format)
             } else {
@@ -1585,7 +1596,7 @@ impl Pipelines {
             return if dispatch.use_coop_compensated() {
                 Variant::CoopCompensated(entry)
             } else {
-                Variant::Coop(entry)
+                Variant::Coop(entry, dispatch.weight_format)
             };
         }
         if dispatch.use_small_tiles() {
@@ -4247,7 +4258,7 @@ mod variant_tests {
         );
         assert_eq!(
             matmul(|d| d.kernel = crate::compile::Kernel::Cooperative),
-            Variant::Coop(ShaderEntry::MatMul),
+            Variant::Coop(ShaderEntry::MatMul, crate::compile::WeightFormat::F32),
         );
     }
 
