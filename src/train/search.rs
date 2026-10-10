@@ -78,11 +78,13 @@ pub struct BuildSearchReport {
 /// Build from representative inputs, measuring logical and physical alternatives.
 ///
 /// Unlike [`super::build`], this executes private candidate sessions.
-/// `initialize` writes representative inputs and weights once per candidate. Its
-/// optional idle incumbent can donate identically represented immutable parameters
-/// via [`Session::share_parameter_from`], but must not be modified. Inputs and
-/// writable state must remain private. Configure runtime optimizers, accumulation
-/// and external bindings after construction, not inside either callback.
+/// `initialize` writes representative inputs and weights once per candidate,
+/// the same values every time. A challenger is constructed on its idle
+/// incumbent's identically stored parameters that neither program writes;
+/// [`Session::inherits_parameter`] reports them so the initializer can skip
+/// their upload. The incumbent must not be modified. Inputs and writable state
+/// remain private. Configure runtime optimizers, accumulation and external
+/// bindings after construction, not inside either callback.
 ///
 /// The runner executes one step before each read-only `qualify` call. Check every
 /// observable output, gradient and persistent update against your numerical

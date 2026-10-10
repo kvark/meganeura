@@ -3191,7 +3191,7 @@ impl Session {
     /// with explicit session options. [`Session::with_context`] is the
     /// defaults-taking shorthand.
     pub fn with_context_opts(plan: ExecutionPlan, gpu: Arc<Gpu>, opts: SessionOptions) -> Self {
-        Self::build_session_impl(plan, gpu, opts, None)
+        Self::build_session_impl(plan, gpu, opts, None, false)
     }
 
     pub(crate) fn with_context_opts_sharing(
@@ -3200,7 +3200,19 @@ impl Session {
         opts: SessionOptions,
         parameter_source: Option<&mut Session>,
     ) -> Self {
-        Self::build_session_impl(plan, gpu, opts, parameter_source)
+        Self::build_session_impl(plan, gpu, opts, parameter_source, false)
+    }
+
+    /// A measured-search challenger, constructed on the idle incumbent's
+    /// identically stored parameters that neither program writes. Written
+    /// parameters are search state, reset between trials, so they stay private.
+    pub(crate) fn with_context_opts_inheriting(
+        plan: ExecutionPlan,
+        gpu: Arc<Gpu>,
+        opts: SessionOptions,
+        incumbent: &mut Session,
+    ) -> Self {
+        Self::build_session_impl(plan, gpu, opts, Some(incumbent), true)
     }
 
     /// Create a session that reuses an externally-owned Blade GPU context.
@@ -3212,7 +3224,7 @@ impl Session {
     /// pipelines, the command encoder — on drop; the context is released
     /// once the last `Arc` clone is dropped.
     pub fn with_context(plan: ExecutionPlan, gpu: Arc<Gpu>) -> Self {
-        Self::build_session_impl(plan, gpu, SessionOptions::default(), None)
+        Self::build_session_impl(plan, gpu, SessionOptions::default(), None, false)
     }
 
     fn build_session_impl(
@@ -3220,6 +3232,7 @@ impl Session {
         gpu: Arc<Gpu>,
         opts: SessionOptions,
         mut parameter_source: Option<&mut Session>,
+        immutable_only: bool,
     ) -> Self {
         if let Some(source) = parameter_source.as_deref_mut() {
             assert!(
@@ -3379,6 +3392,18 @@ impl Session {
         let mut provided_physical = vec![None; alias.sizes.len()];
         let mut provided_parameters = 0usize;
         if let Some(source) = parameter_source.as_deref() {
+            // A measured search resets the parameters either program writes
+            // between trials. They are search state and stay private.
+            let writes = |plan: &ExecutionPlan| -> std::collections::HashSet<BufferRef> {
+                if !immutable_only {
+                    return Default::default();
+                }
+                plan.dispatches
+                    .iter()
+                    .flat_map(|d| std::iter::once(d.output_buffer).chain(d.extra_outputs.clone()))
+                    .collect()
+            };
+            let (target_writes, source_writes) = (writes(&plan), writes(&source.plan));
             for &(ref name, target) in &plan.param_buffers {
                 let Some(source_buffer) = source
                     .plan
@@ -3389,6 +3414,9 @@ impl Session {
                 else {
                     continue;
                 };
+                if target_writes.contains(&target) || source_writes.contains(&source_buffer) {
+                    continue;
+                }
                 let target_index = target.0 as usize;
                 let source_index = source_buffer.0 as usize;
                 // Same bytes, same storage format and the same logical
@@ -4036,6 +4064,40 @@ impl Session {
             &self.physical_buffers[self.alias.map[mine]],
             &other.physical_buffers[other.alias.map[theirs]],
         ) && self.alias.offsets[mine] == other.alias.offsets[theirs]
+    }
+
+    /// Whether parameter `name` and every parameter derived from it already
+    /// hold `donor`'s storage, so an initializer need not upload it.
+    ///
+    /// [`crate::train::build_measured`] constructs each challenger on the
+    /// incumbent's identically stored parameters that neither program writes.
+    /// Writing such a parameter writes the incumbent's copy too; an
+    /// initializer that does upload it must write the same values.
+    pub fn inherits_parameter(&self, donor: &Session, name: &str) -> bool {
+        // An upload also fills the fused weights derived from `name`. They are
+        // named parameters too, and must be the donor's identical derivations.
+        self.shares_parameter(donor, name)
+            && self
+                .plan
+                .derived_params
+                .iter()
+                .filter(|derived| derived.1.iter().any(|source| source.0 == name))
+                .all(|derived| {
+                    self.plan
+                        .param_buffers
+                        .iter()
+                        .find(|entry| entry.1 == derived.0)
+                        .is_some_and(|entry| {
+                            self.shares_parameter(donor, &entry.0)
+                                && donor.param_buffer(&entry.0).is_some_and(|theirs| {
+                                    donor.plan.derived_params.iter().any(|other| {
+                                        other.0 == theirs
+                                            && other.1 == derived.1
+                                            && other.2 == derived.2
+                                    })
+                                })
+                        })
+                })
     }
 
     /// Size in bytes of the GPU buffer backing the given slot.
