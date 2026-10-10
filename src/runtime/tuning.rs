@@ -66,7 +66,7 @@ impl Drop for PhaseTimer<'_> {
 impl Pipelines {
     pub(super) fn ensure_tune_tile(
         &mut self,
-        gpu: &Gpu,
+        gpu: &std::sync::Arc<Gpu>,
         dispatch: &Dispatch,
         tile: MatmulTile,
     ) -> Result<(), String> {
@@ -75,9 +75,9 @@ impl Pipelines {
         self.prepare(gpu, &selected, tile.coop_config().as_ref())
     }
 
-    fn discard_unused_convolutions(&mut self, gpu: &Gpu, plan: &crate::compile::ExecutionPlan) {
+    fn discard_unused_convolutions(&mut self, plan: &crate::compile::ExecutionPlan) {
         let used: std::collections::HashSet<_> = plan.dispatches.iter().map(Self::key).collect();
-        self.map.retain(|key, pipeline| {
+        self.map.retain(|key, _| {
             let convolution = key.entry().is_some_and(|entry| {
                 matches!(
                     entry,
@@ -92,12 +92,7 @@ impl Pipelines {
                         | ShaderEntry::Conv2dGradWeightGemm16
                 )
             });
-            if convolution && !used.contains(key) {
-                gpu.destroy_compute_pipeline(pipeline);
-                false
-            } else {
-                true
-            }
+            !convolution || used.contains(key)
         });
     }
 }
@@ -665,7 +660,7 @@ impl Session {
             let _timer = PhaseTimer::new(&mut report.final_cleanup);
             staging.clear();
             self.wait();
-            self.pipelines.discard_unused_convolutions(&gpu, &self.plan);
+            self.pipelines.discard_unused_convolutions(&self.plan);
         }
         self.pipelines.select(&self.plan.dispatches);
         report.scratch = Some(staging.stats);
@@ -963,7 +958,7 @@ impl Session {
                         } else {
                             tile_variant(dispatch, [outcome.initial, outcome.candidate][i])
                         };
-                        (&self.pipelines.map[&key], dispatch)
+                        (&self.pipelines.map[&key].raw, dispatch)
                     })
                     .collect()
             })
@@ -2415,7 +2410,7 @@ mod tests {
         for &index in &class.members {
             alternative.apply(&mut b.plan.dispatches[index], &class.key);
         }
-        b.pipelines.discard_unused_convolutions(&gpu, &b.plan);
+        b.pipelines.discard_unused_convolutions(&b.plan);
         b.pipelines.select(&b.plan.dispatches);
         if convolution {
             assert!(b.pipelines.map.len() < pipeline_count);
