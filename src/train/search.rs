@@ -29,6 +29,9 @@ pub struct BuildSearchOptions {
     /// In-flight driver work and caller validation cannot be preempted.
     pub max_time: Duration,
     pub max_programs: usize,
+    /// Explore power-of-two submission chunk counts up to this bound (1..=64).
+    /// One keeps every candidate on a single submission.
+    pub max_submission_chunks: usize,
     /// Sum of declared logical bytes and persistent-state snapshots for both
     /// incumbent and challenger. This is not a driver-heap bound: padding,
     /// pipelines, staging and kernel-probe scratch are additional.
@@ -44,6 +47,7 @@ impl Default for BuildSearchOptions {
             warmup_time: Duration::from_millis(250),
             max_time: Duration::from_secs(30),
             max_programs: 64,
+            max_submission_chunks: 1,
             max_plan_bytes: 512 << 20,
         }
     }
@@ -88,9 +92,11 @@ pub struct BuildSearchReport {
 /// Matrix tile, split-K and independent attention-gradient layouts are egglog
 /// equalities. Lowering emits the extracted schedule. Complete plans vary
 /// dispatch fusion, cached-attention splits, low-occupancy convolution
-/// weight-gradient splits. Every program uses one submission. Unlocked dispatches
-/// are kernel-tuned before comparison. This bounded search does not promise
-/// a global optimum.
+/// weight-gradient splits, and caller-enabled submission chunk counts. Unlocked
+/// dispatches are kernel-tuned before comparison. This bounded search does not
+/// promise a global optimum.
+/// Early submission probes use the incumbent plan; a winning layout reopens those
+/// probes, while later layouts inherit the incumbent's measured count.
 ///
 /// `options.tuning` replaces `cfg.tune`. Build-plan caching is not yet supported:
 /// calibration data and measured policy are not part of the ordinary cache key.
@@ -108,6 +114,9 @@ pub fn build_measured(
     }
     if options.max_graphs == 0 || options.max_programs == 0 || options.max_time.is_zero() {
         return Err("measured construction needs positive graph, program and time bounds".into());
+    }
+    if !(1..=64).contains(&options.max_submission_chunks) {
+        return Err("measured construction needs a submission chunk bound in 1..=64".into());
     }
     options.tuning.validate().map_err(|e| e.to_string())?;
     if cfg.runtime.debug {
@@ -237,7 +246,13 @@ pub fn build_measured(
         }
     }
     let preparation_time = start.elapsed();
-    let programs = implementations(seeds, caps, shared_memory_bytes, options.max_plan_bytes);
+    let programs = implementations(
+        seeds,
+        caps,
+        shared_memory_bytes,
+        options.max_plan_bytes,
+        options.max_submission_chunks,
+    );
     measure::select(
         programs,
         gpu,
@@ -256,8 +271,8 @@ pub fn build_measured(
     )
 }
 
-/// Cover a joint graph/layout choice early, then interleave both axes. A
-/// backward-only prefix can displace the useful matrix forms under a deadline.
+/// Cover one backward layout and one joint graph/layout choice early, then
+/// interleave both axes so neither displaces the other under a deadline.
 fn backward_layouts(
     graphs: Vec<optimize::search::Candidate>,
     config: optimize::OptimizeConfig,
@@ -270,7 +285,7 @@ fn backward_layouts(
         (0..graphs.len()).map(|_| None).collect();
     let mut candidates = Vec::new();
     let mut truncated = false;
-    let prefix = [(0, 0), (1, 1), (1, 0)];
+    let prefix = [(0, 0), (0, 1), (1, 1), (1, 0)];
     let diagonal = (1..limit)
         .flat_map(|rank| (0..graphs.len().min(rank + 1)).map(move |index| (index, rank - index)));
     let mut visited = collections::HashSet::new();
@@ -330,10 +345,23 @@ type AttentionChoice = (u32, Option<(u32, crate::codegen::FlashAttentionShape)>)
 struct AxisChoice {
     attention: AttentionChoice,
     fuse_dispatches: bool,
+    submission_chunks: Option<usize>,
 }
 
-fn early_physical_cover(baseline: AxisChoice, attention: &[AttentionChoice]) -> Vec<AxisChoice> {
+fn early_physical_cover(
+    baseline: AxisChoice,
+    attention: &[AttentionChoice],
+    max_submission_chunks: usize,
+) -> Vec<AxisChoice> {
     let mut cover = Vec::new();
+    for submission_chunks in [2, 4, 8] {
+        if submission_chunks <= max_submission_chunks {
+            cover.push(AxisChoice {
+                submission_chunks: Some(submission_chunks),
+                ..baseline
+            });
+        }
+    }
     if baseline.fuse_dispatches {
         cover.push(AxisChoice {
             fuse_dispatches: false,
@@ -378,6 +406,7 @@ fn implementations(
     caps: crate::codegen::CoopCaps,
     shared_memory_bytes: u32,
     max_partial_bytes: usize,
+    max_submission_chunks: usize,
 ) -> impl Iterator<Item = measure::Program> {
     let cached_attention = seeds.iter().any(|p| {
         p.graph
@@ -424,9 +453,10 @@ fn implementations(
         fuse_dispatches: seeds
             .first()
             .is_some_and(|seed| seed.options.fuse_dispatches),
+        submission_chunks: None,
     };
     // Rank the first alternative on each axis and their interaction early.
-    let cover = early_physical_cover(baseline, &attention);
+    let cover = early_physical_cover(baseline, &attention, max_submission_chunks);
     let mut seen = collections::HashSet::from([baseline]);
     seen.extend(cover.iter().copied());
     let fusion: &[bool] = if baseline.fuse_dispatches {
@@ -434,13 +464,29 @@ fn implementations(
     } else {
         &[false]
     };
+    let submissions: Vec<_> = std::iter::once(None)
+        .chain(
+            std::iter::successors(Some(1usize), |n| n.checked_mul(2))
+                .take_while(|&n| max_submission_chunks > 1 && n <= max_submission_chunks)
+                .map(Some),
+        )
+        .collect();
     let tail: Vec<_> = attention
         .iter()
         .flat_map(|&attention| {
             fusion.iter().map(move |&fuse_dispatches| AxisChoice {
                 attention,
                 fuse_dispatches,
+                ..baseline
             })
+        })
+        .flat_map(|choice| {
+            submissions
+                .iter()
+                .map(move |&submission_chunks| AxisChoice {
+                    submission_chunks,
+                    ..choice
+                })
         })
         .filter(|&choice| seen.insert(choice))
         .collect();
@@ -472,6 +518,7 @@ fn implementations(
             let AxisChoice {
                 attention: (splits, flash),
                 fuse_dispatches,
+                submission_chunks,
             } = current;
             let plan = if splits == 0
                 && flash.is_none()
@@ -508,6 +555,7 @@ fn implementations(
                     seed.description
                 ),
                 plan,
+                submission_chunks,
             });
         }
     })
@@ -564,6 +612,7 @@ fn low_occupancy_weight_splits(
                 seed.description, seed.options.fuse_dispatches
             ),
             plan,
+            submission_chunks: None,
         });
     }
     programs
@@ -578,12 +627,13 @@ mod tests {
         let baseline = AxisChoice {
             attention: (0, None),
             fuse_dispatches: true,
+            submission_chunks: None,
         };
         let unfused = AxisChoice {
             fuse_dispatches: false,
             ..baseline
         };
-        let cover = early_physical_cover(baseline, &[]);
+        let cover = early_physical_cover(baseline, &[], 1);
         assert_eq!(cover, vec![unfused]);
         let order = physical_program_order(8, baseline, &cover, &[]);
         assert!(order[..3].contains(&(0, unfused)));
@@ -598,7 +648,7 @@ mod tests {
                 );
             }
         }
-        assert!(early_physical_cover(unfused, &[]).is_empty());
+        assert!(early_physical_cover(unfused, &[], 1).is_empty());
     }
 
     #[test]
@@ -882,6 +932,7 @@ mod tests {
                     warmup_time: Duration::from_millis(1),
                     max_time: Duration::from_secs(60),
                     max_programs: 24,
+                    max_submission_chunks: 4,
                     max_plan_bytes: 4 << 20,
                 },
                 |s, _| {
@@ -913,6 +964,13 @@ mod tests {
             assert!(report.skipped_regions.is_empty());
             assert!(report.trials.len() >= report.graphs.len());
             assert!(report.trials.iter().all(|t| t.outcome.qualified));
+            for chunks in [2, 4] {
+                assert!(report.trials.iter().any(|trial| {
+                    trial
+                        .description
+                        .ends_with(&format!("submission_chunks={chunks}"))
+                }));
+            }
             assert_eq!(session.read_params(&["w"])[0], [0.125; 165]);
             if mode == Mode::Training {
                 session.set_learning_rate(0.1);

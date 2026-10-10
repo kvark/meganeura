@@ -10,6 +10,7 @@ use crate::{
 };
 use serde::Serialize;
 use std::{
+    collections::VecDeque,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -17,6 +18,8 @@ use std::{
 pub(super) struct Program {
     pub description: String,
     pub plan: ExecutionPlan,
+    /// Unspecified candidates retain the incumbent's measured submission choice.
+    pub submission_chunks: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -101,15 +104,34 @@ pub(super) fn select(
     }
     let mut incumbent: Option<(Session, SearchState)> = None;
     let mut incumbent_bytes = 0usize;
+    let mut selected_chunks = 1;
+    let mut selected_description = String::new();
+    let mut selected_plan: Option<ExecutionPlan> = None;
+    let mut pending_submissions = VecDeque::new();
     let mut kernels = crate::runtime::KernelMemo::default();
-    let mut programs = programs.into_iter();
+    let mut programs = programs.into_iter().fuse();
     for index in 0..options.max_programs {
         if start.elapsed() >= options.max_time {
             report.truncated = true;
             break;
         }
         let lowering = Instant::now();
-        let Some(program) = programs.next() else {
+        // Try one alternative layout before probing submissions on the winner.
+        // Later layouts inherit its count and reopen this small search if they win.
+        let program = (index == 1)
+            .then(|| programs.next())
+            .flatten()
+            .or_else(|| {
+                pending_submissions
+                    .pop_front()
+                    .map(|submission_chunks| Program {
+                        description: selected_description.clone(),
+                        plan: selected_plan.as_ref().unwrap().clone(),
+                        submission_chunks: Some(submission_chunks),
+                    })
+            })
+            .or_else(|| programs.next());
+        let Some(program) = program else {
             break;
         };
         let lowering_time = lowering.elapsed();
@@ -119,8 +141,12 @@ pub(super) fn select(
         }
         let trial_start = Instant::now();
         let bytes = plan_bytes(&program.plan)?;
+        let submission_chunks = program.submission_chunks.unwrap_or(selected_chunks);
         let mut trial = BuildSearchTrial {
-            description: program.description,
+            description: format!(
+                "{}, submission_chunks={submission_chunks}",
+                program.description
+            ),
             lowering_time,
             construction_time: Duration::ZERO,
             initialization_time: Duration::ZERO,
@@ -138,8 +164,11 @@ pub(super) fn select(
             trial.outcome.decision = TuneDecision::ScratchLimit;
         } else {
             let build = Instant::now();
+            // Preserve the original kernel candidates for memo reuse by submission probes.
+            let original_plan = program.plan.clone();
             let mut candidate =
                 Session::with_context_opts(program.plan, gpu.clone(), runtime.clone());
+            candidate.set_submission_chunks(submission_chunks);
             trial.construction_time = build.elapsed();
             let result = (|| {
                 let init = Instant::now();
@@ -216,6 +245,16 @@ pub(super) fn select(
                 Ok(state) if incumbent.is_none() || trial.outcome.selected == index => {
                     incumbent_bytes = plan_bytes(candidate.plan())?;
                     incumbent = Some((candidate, state));
+                    selected_chunks = submission_chunks;
+                    selected_description = program.description;
+                    selected_plan = Some(original_plan);
+                    if program.submission_chunks.is_none() {
+                        pending_submissions =
+                            std::iter::successors(Some(1usize), |n| n.checked_mul(2))
+                                .take_while(|&n| n <= options.max_submission_chunks.min(8))
+                                .filter(|&n| n != selected_chunks)
+                                .collect();
+                    }
                     report.selected = index;
                 }
                 Ok(_) => {}
@@ -247,6 +286,7 @@ pub(super) fn select(
     // Do not lower one more program just to discover whether a bounded search
     // is truncated. Lazy producers can allocate and compile in `next()`.
     report.truncated |= start.elapsed() >= options.max_time
+        || !pending_submissions.is_empty()
         || (report.trials.len() == options.max_programs && programs.size_hint().1 != Some(0));
     incumbent
         .map(|(mut session, state)| {
@@ -345,6 +385,7 @@ mod tests {
                 Program {
                     description: name.into(),
                     plan,
+                    submission_chunks: (name == "baseline").then_some(2),
                 }
             });
             let result = select(
@@ -361,6 +402,7 @@ mod tests {
                     warmup_time: Duration::from_millis(1),
                     max_time: Duration::from_secs(30),
                     max_programs: 2,
+                    max_submission_chunks: 2,
                     max_plan_bytes: 1 << 20,
                     ..Default::default()
                 },
@@ -395,6 +437,12 @@ mod tests {
             } else {
                 let (mut selected, report) = result.unwrap();
                 assert!(report.trials.iter().all(|t| t.outcome.qualified));
+                assert!(
+                    report
+                        .trials
+                        .iter()
+                        .all(|t| t.description.ends_with("submission_chunks=2"))
+                );
                 assert_eq!(selected.read_params(&["w"])[0], [3.0, 5.0]);
                 selected.step();
                 selected.wait();
@@ -471,6 +519,7 @@ mod tests {
                 Program {
                     description: splits.to_string(),
                     plan,
+                    submission_chunks: Some(splits as usize),
                 }
             });
             let mut index = 0;
