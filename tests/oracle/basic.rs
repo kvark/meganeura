@@ -5,6 +5,34 @@ use meganeura::graph::{Op, TensorType};
 use meganeura::reference::{Feeds, Rng, gpu};
 use meganeura::{Graph, NodeId};
 
+#[test]
+fn bf16_storage_reference_and_master_gradient() {
+    // Portable oracle coverage; native GPU coverage is in bf16_storage.rs.
+    let mut graph = Graph::new();
+    let values = [0.0, -0.0, 1.0 + 1.0 / 256.0, 1.0 + 3.0 / 256.0];
+    let weight = graph.parameter("weight", &[values.len()]);
+    let narrow = graph.to_bf16(weight);
+    let wide = graph.from_bf16(narrow);
+    let loss = graph.sum_all(wide);
+    graph.set_outputs(vec![loss, wide]);
+    let backward = meganeura::autodiff::differentiate(&graph);
+    let mut feeds = Feeds::new();
+    feeds.set("weight", &values);
+    let tensors = meganeura::reference::evaluate(&backward, &feeds).unwrap();
+    assert_eq!(
+        tensors[wide as usize].data,
+        [0.0, -0.0, 1.0, 1.0 + 2.0 / 128.0]
+    );
+    assert_eq!(
+        tensors[wide as usize].data[1].to_bits(),
+        (-0.0f64).to_bits()
+    );
+    assert_eq!(
+        tensors[*backward.outputs().last().unwrap() as usize].data,
+        [1.0; 4]
+    );
+}
+
 /// Build a graph with `build`, fill its inputs, adjust them with `fix`, and
 /// compare every output with the reference under every lowering.
 fn case(what: &str, build: impl FnOnce(&mut Graph) -> Vec<NodeId>, fix: impl FnOnce(&mut Feeds)) {

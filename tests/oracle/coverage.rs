@@ -102,6 +102,8 @@ const TABLE: &[(&str, Coverage)] = &[
     ("RmsNorm", Covered(".rms_norm(")),
     ("Embedding", Covered(".embedding(")),
     ("ToF16", Covered(".to_f16(")),
+    ("ToBF16", Covered(".to_bf16(")),
+    ("FromBF16", Covered(".from_bf16(")),
     ("RoPE", Covered(".rope(")),
     ("RoPEGrad", Covered(".rope_grad(")),
     ("RoPEPositions", Covered(".rope_with_positions(")),
