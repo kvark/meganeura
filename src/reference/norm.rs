@@ -54,6 +54,7 @@ fn norm_grad_inputs(node: &Node, ins: &[&Tensor]) -> Result<(usize, usize), Erro
 }
 
 /// Where each row of a RoPE input sits in the sequence.
+#[derive(Clone, Copy)]
 enum Positions<'a> {
     /// `row + offset`.
     Offset(f64),
@@ -61,30 +62,80 @@ enum Positions<'a> {
     PerRow(&'a Tensor),
 }
 
-/// The rotation a RoPE-family node applies, in the half-split
-/// ("NeoX"/HuggingFace) layout: inside every `head_dim` block, element `i`
-/// pairs with `i + head_dim/2`, and pair `i` of a row at position `pos`
-/// turns by `pos · theta^(−2i/head_dim) / factor[i]`.
+#[derive(Clone, Copy)]
+enum RotationLayout<'a> {
+    /// The half-split ("NeoX"/HuggingFace) layout: inside every `head_dim`
+    /// block, element `i` pairs with `i + head_dim/2`.
+    HalfSplit {
+        positions: Positions<'a>,
+        factors: Option<&'a Tensor>,
+    },
+    /// Three position axes occupy consecutive, adjacent-pair bands.
+    Axial {
+        positions: &'a Tensor,
+        axes_dim: [usize; 3],
+    },
+}
+
+/// The rotation a RoPE-family node applies. Pair `i` at position `pos` turns
+/// by `pos · theta^(−2i/dim)`, with optional per-pair frequency divisors.
 struct Rotation<'a> {
     theta: f64,
     head_dim: usize,
-    positions: Positions<'a>,
-    factors: Option<&'a Tensor>,
+    layout: RotationLayout<'a>,
     /// Apply the transposed rotation (the forward rotation's backward).
     inverse: bool,
 }
 
 impl Rotation<'_> {
     fn angle(&self, row: usize, pair: usize) -> f64 {
-        let pos = match self.positions {
-            Positions::Offset(offset) => row as f64 + offset,
-            Positions::PerRow(p) => p.data[row],
-        };
-        let mut freq = self.theta.powf(-2.0 * pair as f64 / self.head_dim as f64);
-        if let Some(f) = self.factors {
-            freq /= f.data[pair];
+        match self.layout {
+            RotationLayout::HalfSplit { positions, factors } => {
+                let pos = match positions {
+                    Positions::Offset(offset) => row as f64 + offset,
+                    Positions::PerRow(p) => p.data[row],
+                };
+                let mut freq = self.theta.powf(-2.0 * pair as f64 / self.head_dim as f64);
+                if let Some(f) = factors {
+                    freq /= f.data[pair];
+                }
+                pos * freq
+            }
+            RotationLayout::Axial {
+                positions,
+                axes_dim,
+            } => {
+                let axis_pairs = [axes_dim[0] / 2, axes_dim[1] / 2, axes_dim[2] / 2];
+                let (axis, local) = if pair < axis_pairs[0] {
+                    (0, pair)
+                } else if pair < axis_pairs[0] + axis_pairs[1] {
+                    (1, pair - axis_pairs[0])
+                } else {
+                    (2, pair - axis_pairs[0] - axis_pairs[1])
+                };
+                let pos = positions.data[row * 3 + axis];
+                pos * self.theta.powf(-2.0 * local as f64 / axes_dim[axis] as f64)
+            }
         }
-        pos * freq
+    }
+
+    /// Visit every rotated pair: `f(row, pair_in_head, i0, i1)` with `i0`
+    /// and `i1` the flat indices of the pair's two elements.
+    fn for_each_pair(&self, x: &Tensor, mut f: impl FnMut(usize, usize, usize, usize)) {
+        let (rows, dim) = (x.shape[0], x.shape[1]);
+        let pairs = self.head_dim / 2;
+        for row in 0..rows {
+            for head in 0..dim / self.head_dim {
+                let base = row * dim + head * self.head_dim;
+                for pair in 0..pairs {
+                    let (i0, i1) = match self.layout {
+                        RotationLayout::HalfSplit { .. } => (base + pair, base + pair + pairs),
+                        RotationLayout::Axial { .. } => (base + pair * 2, base + pair * 2 + 1),
+                    };
+                    f(row, pair, i0, i1);
+                }
+            }
+        }
     }
 }
 
@@ -92,7 +143,8 @@ impl Rotation<'_> {
 /// its operands. A RoPE row sits at `row + pos_offset`, plus the dynamic
 /// offset when a second input is present.
 fn rotation<'a>(node: &Node, ins: &[&'a Tensor]) -> Result<Rotation<'a>, Error> {
-    let (theta, head_dim, positions, factors, inverse) = match node.op {
+    let (rows, dim) = matrix(node, ins[0], "input")?;
+    let (theta, head_dim, layout, inverse) = match node.op {
         Op::RoPE {
             theta,
             pos_offset,
@@ -106,7 +158,15 @@ fn rotation<'a>(node: &Node, ins: &[&'a Tensor]) -> Result<Rotation<'a>, Error> 
             };
             let offset = Positions::Offset(f64::from(pos_offset) + dynamic);
             let factors = if freq_factors { Some(ins[2]) } else { None };
-            (theta, head_dim, offset, factors, false)
+            (
+                theta,
+                head_dim,
+                RotationLayout::HalfSplit {
+                    positions: offset,
+                    factors,
+                },
+                false,
+            )
         }
         Op::RoPEGrad {
             theta,
@@ -114,14 +174,40 @@ fn rotation<'a>(node: &Node, ins: &[&'a Tensor]) -> Result<Rotation<'a>, Error> 
             head_dim,
         } => {
             let offset = Positions::Offset(f64::from(pos_offset));
-            (theta, head_dim, offset, None, true)
+            (
+                theta,
+                head_dim,
+                RotationLayout::HalfSplit {
+                    positions: offset,
+                    factors: None,
+                },
+                true,
+            )
         }
-        Op::RoPEPositions { theta, head_dim } => {
-            (theta, head_dim, Positions::PerRow(ins[1]), None, false)
-        }
+        Op::RoPEPositions { theta, head_dim } => (
+            theta,
+            head_dim,
+            RotationLayout::HalfSplit {
+                positions: Positions::PerRow(ins[1]),
+                factors: None,
+            },
+            false,
+        ),
+        Op::AxialRoPE {
+            theta,
+            head_dim,
+            axes_dim,
+        } => (
+            theta,
+            head_dim,
+            RotationLayout::Axial {
+                positions: ins[1],
+                axes_dim: axes_dim.map(|d| d as usize),
+            },
+            false,
+        ),
         _ => unreachable!("not a RoPE op"),
     };
-    let (rows, dim) = matrix(node, ins[0], "input")?;
     let head_dim = head_dim as usize;
     if head_dim == 0 || !head_dim.is_multiple_of(2) || dim % head_dim != 0 {
         return Err(invalid(
@@ -129,39 +215,43 @@ fn rotation<'a>(node: &Node, ins: &[&'a Tensor]) -> Result<Rotation<'a>, Error> 
             format!("head_dim {head_dim} must be even and divide {dim}"),
         ));
     }
-    if let Some(f) = factors {
-        expect_len(node, f, head_dim / 2, "frequency factors")?;
-    }
-    if let Positions::PerRow(p) = positions {
-        expect_len(node, p, rows, "positions")?;
+    match layout {
+        RotationLayout::HalfSplit { positions, factors } => {
+            if let Some(f) = factors {
+                expect_len(node, f, head_dim / 2, "frequency factors")?;
+            }
+            if let Positions::PerRow(p) = positions {
+                expect_len(node, p, rows, "positions")?;
+            }
+        }
+        RotationLayout::Axial {
+            positions,
+            axes_dim,
+        } => {
+            if axes_dim.iter().any(|&d| d == 0 || !d.is_multiple_of(2))
+                || axes_dim.iter().sum::<usize>() != head_dim
+            {
+                return Err(invalid(
+                    node,
+                    "axial axis dimensions must be nonzero, even, and sum to head_dim",
+                ));
+            }
+            if positions.shape != [rows, 3] {
+                return Err(invalid(node, "axial positions must have shape [rows, 3]"));
+            }
+        }
     }
     Ok(Rotation {
         theta: f64::from(theta),
         head_dim,
-        positions,
-        factors,
+        layout,
         inverse,
     })
 }
 
-/// Visit every rotated pair: `f(row, pair_in_head, i0, i1)` with `i0`, `i1`
-/// the flat indices of the pair's two elements.
-fn for_each_pair(x: &Tensor, head_dim: usize, mut f: impl FnMut(usize, usize, usize, usize)) {
-    let (rows, dim) = (x.shape[0], x.shape[1]);
-    let half = head_dim / 2;
-    for r in 0..rows {
-        for head in 0..dim / head_dim {
-            let base = r * dim + head * head_dim;
-            for i in 0..half {
-                f(r, i, base + i, base + i + half);
-            }
-        }
-    }
-}
-
 fn rope(x: &Tensor, rot: &Rotation<'_>) -> Vec<f64> {
     let mut out = vec![0.0; x.len()];
-    for_each_pair(x, rot.head_dim, |r, i, i0, i1| {
+    rot.for_each_pair(x, |r, i, i0, i1| {
         let (sin, cos) = rot.angle(r, i).sin_cos();
         let sin = if rot.inverse { -sin } else { sin };
         let (a, b) = (x.data[i0], x.data[i1]);
@@ -178,56 +268,11 @@ pub(super) fn rotation_error_scale(
     ins: &[&Tensor],
     input_scale: &[f64],
 ) -> Result<Vec<f64>, Error> {
-    if let Op::AxialRoPE {
-        theta,
-        head_dim,
-        axes_dim,
-    } = node.op
-    {
-        let x = ins[0];
-        let positions = ins[1];
-        let (rows, dim) = matrix(node, x, "input")?;
-        if positions.shape != [rows, 3] {
-            return Err(invalid(node, "axial positions must have shape [rows, 3]"));
-        }
-        assert_eq!(input_scale.len(), x.len());
-        let head_dim = head_dim as usize;
-        let axis_pairs = [
-            axes_dim[0] as usize / 2,
-            axes_dim[1] as usize / 2,
-            axes_dim[2] as usize / 2,
-        ];
-        let mut scale = vec![0.0; x.len()];
-        for row in 0..rows {
-            for head in 0..dim / head_dim {
-                let base = row * dim + head * head_dim;
-                for pair in 0..head_dim / 2 {
-                    let (axis, local) = if pair < axis_pairs[0] {
-                        (0, pair)
-                    } else if pair < axis_pairs[0] + axis_pairs[1] {
-                        (1, pair - axis_pairs[0])
-                    } else {
-                        (2, pair - axis_pairs[0] - axis_pairs[1])
-                    };
-                    let pos = positions.data[row * 3 + axis];
-                    let angle =
-                        pos * f64::from(theta).powf(-2.0 * local as f64 / axes_dim[axis] as f64);
-                    let (sin, cos) = angle.sin_cos();
-                    let (i0, i1) = (base + pair * 2, base + pair * 2 + 1);
-                    let (a, b) = (input_scale[i0], input_scale[i1]);
-                    scale[i0] = cos.abs() * a + sin.abs() * b;
-                    scale[i1] = sin.abs() * a + cos.abs() * b;
-                }
-            }
-        }
-        return Ok(scale);
-    }
-
     let rot = rotation(node, ins)?;
     let x = ins[0];
     assert_eq!(input_scale.len(), x.len());
     let mut scale = vec![0.0; x.len()];
-    for_each_pair(x, rot.head_dim, |r, i, i0, i1| {
+    rot.for_each_pair(x, |r, i, i0, i1| {
         let (sin, cos) = rot.angle(r, i).sin_cos();
         let (a, b) = (input_scale[i0], input_scale[i1]);
         scale[i0] = cos.abs() * a + sin.abs() * b;
@@ -379,50 +424,8 @@ pub(super) fn eval(node: &Node, ins: &[&Tensor]) -> Result<Vec<f64>, Error> {
             }
             out
         }
-        Op::RoPE { .. } | Op::RoPEGrad { .. } | Op::RoPEPositions { .. } => {
+        Op::RoPE { .. } | Op::RoPEGrad { .. } | Op::RoPEPositions { .. } | Op::AxialRoPE { .. } => {
             rope(ins[0], &rotation(node, ins)?)
-        }
-        Op::AxialRoPE {
-            theta,
-            head_dim,
-            axes_dim,
-        } => {
-            let x = ins[0];
-            let positions = ins[1];
-            let (rows, dim) = matrix(node, x, "input")?;
-            if positions.shape != [rows, 3] {
-                return Err(invalid(node, "axial positions must have shape [rows, 3]"));
-            }
-            let head_dim = head_dim as usize;
-            let axis_pairs = [
-                axes_dim[0] as usize / 2,
-                axes_dim[1] as usize / 2,
-                axes_dim[2] as usize / 2,
-            ];
-            let mut out = vec![0.0; x.len()];
-            for row in 0..rows {
-                for head in 0..dim / head_dim {
-                    let base = row * dim + head * head_dim;
-                    for pair in 0..head_dim / 2 {
-                        let (axis, local) = if pair < axis_pairs[0] {
-                            (0, pair)
-                        } else if pair < axis_pairs[0] + axis_pairs[1] {
-                            (1, pair - axis_pairs[0])
-                        } else {
-                            (2, pair - axis_pairs[0] - axis_pairs[1])
-                        };
-                        let pos = positions.data[row * 3 + axis];
-                        let angle = pos
-                            * f64::from(theta).powf(-2.0 * local as f64 / axes_dim[axis] as f64);
-                        let (sin, cos) = angle.sin_cos();
-                        let i0 = base + pair * 2;
-                        let i1 = i0 + 1;
-                        out[i0] = x.data[i0] * cos - x.data[i1] * sin;
-                        out[i1] = x.data[i0] * sin + x.data[i1] * cos;
-                    }
-                }
-            }
-            out
         }
         // out[m, p] = ‖left[m] − right[m·P + p]‖².
         Op::PairwiseSquaredDistance { pairs } => {
@@ -620,11 +623,11 @@ pub(super) fn magnitude(node: &Node, ins: &[&Tensor], out: &Tensor) -> Option<Ve
         // the scale grows as `|angle| / 256`, which at the default `rtol`
         // allows about 13 ulps of angle error (product, `pow` and argument
         // reduction).
-        Op::RoPE { .. } | Op::RoPEGrad { .. } | Op::RoPEPositions { .. } => {
+        Op::RoPE { .. } | Op::RoPEGrad { .. } | Op::RoPEPositions { .. } | Op::AxialRoPE { .. } => {
             let x = ins[0];
             let rot = rotation(node, ins).ok()?;
             let mut m = vec![0.0; x.len()];
-            for_each_pair(x, rot.head_dim, |r, i, i0, i1| {
+            rot.for_each_pair(x, |r, i, i0, i1| {
                 let scale = x.data[i0].hypot(x.data[i1]) * (rot.angle(r, i).abs() / 256.0).max(1.0);
                 m[i0] = scale;
                 m[i1] = scale;

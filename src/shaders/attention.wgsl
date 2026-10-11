@@ -30,11 +30,8 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let head_dim = params.head_dim;
     if pos >= q_seq || head >= num_heads { return; }
 
-    let block_causal = (params.window_size & 0x80000000u) != 0u;
-    let prefix_len = params.window_size & 0x7fffffffu;
-    var kv_len = select(kv_seq, pos + 1u, kv_seq == 0u);
-    if block_causal { kv_len = select(q_seq, pos + 1u, pos < prefix_len); }
-    let window_size = select(params.window_size, 0u, block_causal);
+    let kv_len = select(kv_seq, pos + 1u, pos < params.causal_rows);
+    let window_size = params.window_size;
     let kv_start = select(0u, kv_len - min(kv_len, window_size), window_size > 0u);
 
     let kv_head = head / (num_heads / num_kv_heads);

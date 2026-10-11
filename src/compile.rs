@@ -2948,9 +2948,9 @@ mod dispatch_limits {
     }
 }
 
-/// Tile row-GEMV workgroups across X and Y within the portable limit.
-/// `groups` workgroups of a one-dimensional kernel over X and Y, each
-/// within the portable per-axis limit; the kernel flattens them back.
+/// Tile a one-dimensional dispatch across X and Y within the portable limit.
+/// The kernel flattens the two-dimensional grid back into `groups` logical
+/// workgroups.
 pub(crate) fn linear_grid(groups: u32) -> [u32; 3] {
     let y = groups.div_ceil(MAX_COMPUTE_WORKGROUPS_PER_DIMENSION).max(1);
     [groups.div_ceil(y).max(1), y, 1]
@@ -4711,6 +4711,98 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn forward_attention_masks_have_explicit_lengths() {
+        fn params(kind: u32) -> Vec<u32> {
+            let mut g = Graph::new();
+            let q = g.input("q", &[33, 16]);
+            let kv_rows = if kind == 4 { 29 } else { 33 };
+            let k = g.input("k", &[kv_rows, 8]);
+            let v = g.input("v", &[kv_rows, 8]);
+            let out = match kind {
+                0 => g.causal_attention(q, k, v, 2, 1, 8),
+                1 => g.sliding_window_attention(q, k, v, 2, 1, 8, 7),
+                2 => g.block_causal_attention(q, k, v, 2, 1, 8, 17),
+                3 => g.full_attention(q, k, v, 2, 1, 8),
+                4 => g.cross_attention(q, k, v, 2, 1, 8),
+                _ => unreachable!(),
+            };
+            g.set_outputs(vec![out]);
+            compile(&g).dispatches[0].params.clone()
+        }
+
+        let heads = (2 << 16) | 1;
+        assert_eq!(params(0), [33, 33, heads, 8, 0, 33]);
+        assert_eq!(params(1), [33, 33, heads, 8, 7, 33]);
+        assert_eq!(params(2), [33, 33, heads, 8, 0, 17]);
+        assert_eq!(params(3), [33, 33, heads, 8, 0, 0]);
+        assert_eq!(params(4), [33, 29, heads, 8, 0, 0]);
+    }
+
+    #[test]
+    fn rope_dispatches_tile_across_portable_grid_dimensions() {
+        const SEQ: usize = 8_192;
+        const DIM: usize = 4_096;
+        const HEAD_DIM: u32 = 128;
+
+        let mut g = Graph::new();
+        let x = g.input("x", &[SEQ, DIM]);
+        let offset = g.input_u32("offset", &[1]);
+        let factors = g.input("factors", &[HEAD_DIM as usize / 2]);
+        let positions = g.input_u32("positions", &[SEQ]);
+        let axial_positions = g.input("axial_positions", &[SEQ, 3]);
+        let mut outputs = vec![
+            g.rope(x, 10_000.0, HEAD_DIM),
+            g.rope_dynamic_offset(x, 10_000.0, offset, HEAD_DIM),
+            g.rope_dynamic_offset_factors(x, 10_000.0, offset, HEAD_DIM, factors),
+            g.rope_with_positions(x, 10_000.0, positions, HEAD_DIM),
+            g.axial_rope_with_positions(x, 10_000.0, axial_positions, HEAD_DIM, [16, 56, 56]),
+        ];
+        let x_ty = g.node(x).ty.clone();
+        outputs.push(g.add_raw_node(
+            Op::RoPEGrad {
+                theta: 10_000.0,
+                pos_offset: 0,
+                head_dim: HEAD_DIM,
+            },
+            vec![x],
+            x_ty.clone(),
+        ));
+        outputs.push(g.add_raw_node(
+            Op::CausalAttentionRoPE {
+                num_heads: 32,
+                num_kv_heads: 32,
+                head_dim: HEAD_DIM,
+                rope_theta: 10_000.0,
+            },
+            vec![x, x, x],
+            x_ty,
+        ));
+        g.set_outputs(outputs);
+
+        let plan = compile(&g);
+        let rope_dispatches: Vec<_> = plan
+            .dispatches
+            .iter()
+            .filter(|dispatch| {
+                matches!(
+                    dispatch.shader,
+                    ShaderEntry::RoPE
+                        | ShaderEntry::RoPEGrad
+                        | ShaderEntry::RoPEDynamic
+                        | ShaderEntry::RoPEDynamicFactors
+                        | ShaderEntry::RoPEPositions
+                        | ShaderEntry::AxialRoPE
+                )
+            })
+            .collect();
+        assert_eq!(rope_dispatches.len(), 8);
+        for dispatch in rope_dispatches {
+            assert_eq!(dispatch.workgroups, [32_768, 2, 1]);
+            assert!(workgroups_within_portable_limits(dispatch.workgroups));
         }
     }
 

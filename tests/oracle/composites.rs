@@ -517,6 +517,21 @@ fn rotary_embeddings() {
                 );
             },
         ),
+        case(
+            "axial_rope_single_head",
+            false,
+            |g| {
+                let x = g.parameter("x", &[4, 16]);
+                let pos = g.input("pos", &[4, 3]);
+                g.axial_rope_with_positions(x, 10_000.0, pos, 16, [4, 6, 6])
+            },
+            |f| {
+                f.set(
+                    "pos",
+                    &[0.0, -2.0, 3.0, 1.0, -1.0, 4.0, 2.0, 0.0, 5.0, 3.0, 1.0, 6.0],
+                );
+            },
+        ),
     ]);
 }
 

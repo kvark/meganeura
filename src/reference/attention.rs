@@ -694,6 +694,7 @@ pub(super) fn magnitude(
         Op::CausalAttention { .. }
         | Op::CausalAttentionRoPE { .. }
         | Op::FullAttention { .. }
+        | Op::BlockCausalAttention { .. }
         | Op::CrossAttention { .. }
         | Op::MultiHeadAttn { .. }
         | Op::MultiHeadAttnGradQ { .. }

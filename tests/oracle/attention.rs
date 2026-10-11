@@ -24,6 +24,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 #[derive(Clone, Copy, Debug)]
 enum Kind {
     Causal,
+    BlockCausal,
     Window(u32),
     Full,
     Cross,
@@ -71,6 +72,7 @@ fn forward(g: &mut Graph, kind: Kind, s: Shape, q: NodeId, k: NodeId, v: NodeId)
     let (h, kvh, hd) = (s.heads, s.kv_heads, s.dim);
     match kind {
         Kind::Causal => g.causal_attention(q, k, v, h, kvh, hd),
+        Kind::BlockCausal => g.block_causal_attention(q, k, v, h, kvh, hd, (s.q / 2 + 1) as u32),
         Kind::Window(w) => g.sliding_window_attention(q, k, v, h, kvh, hd, w),
         Kind::Full => g.full_attention(q, k, v, h, kvh, hd),
         Kind::Cross => g.cross_attention(q, k, v, h, kvh, hd),
@@ -306,13 +308,16 @@ const SELF_SHAPES: &[Shape] = &[
 ];
 
 fn forward_sweep(kinds: &[Kind], shapes: &[Shape]) {
+    forward_sweep_with_options(kinds, shapes, &gpu::Options::default());
+}
+
+fn forward_sweep_with_options(kinds: &[Kind], shapes: &[Shape], options: &gpu::Options) {
     let mut sweep = Sweep::default();
-    let options = gpu::Options::default();
     for &kind in kinds {
         for (n, &s) in shapes.iter().enumerate() {
             let g = forward_graph(kind, s);
             let feeds = random(&g, 100 + n as u64);
-            sweep.inference(&format!("{kind:?} {s:?}"), &g, &feeds, &options);
+            sweep.inference(&format!("{kind:?} {s:?}"), &g, &feeds, options);
         }
     }
     sweep.finish();
@@ -601,23 +606,14 @@ fn full_forward() {
 
 #[test]
 fn block_causal_forward() {
-    let s = shape(5, 5, 2, 2, 8);
-    let mut g = Graph::new();
-    let q = g.input("q", &[s.q, s.q_width()]);
-    let k = g.input("k", &[s.kv, s.kv_width()]);
-    let v = g.input("v", &[s.kv, s.kv_width()]);
-    let out = g.block_causal_attention(q, k, v, s.heads, s.kv_heads, s.dim, 2);
-    g.set_outputs(vec![out]);
-
-    let feeds = random(&g, 20261011);
-    let mut sweep = Sweep::default();
-    sweep.inference(
-        "block causal prefix=2",
-        &g,
-        &feeds,
-        &gpu::Options::default(),
-    );
-    sweep.finish();
+    // The prefix ends halfway through each sequence, so flash query tiles
+    // contain both causal-prefix and full-suffix rows.
+    forward_sweep(&[Kind::BlockCausal], SELF_SHAPES);
+    let flash = gpu::Options {
+        coop: CoopPolicy::Disabled,
+        ..Default::default()
+    };
+    forward_sweep_with_options(&[Kind::BlockCausal], SELF_SHAPES, &flash);
 }
 
 /// `full_attention` and `cross_attention` lower exactly as
