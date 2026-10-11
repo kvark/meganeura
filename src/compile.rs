@@ -2224,7 +2224,7 @@ fn shared_embedding_consumers_are_foldable(
 }
 
 /// Post-compile pass: fold producers into a reduction dispatch's prologue,
-/// eliminating intermediate buffers. Two phases:
+/// eliminating intermediate buffers. Three phases:
 ///
 ///   Phase 1 (pointwise → prologue): a per-element input of the reduction
 ///   produced by a pointwise dispatch is folded into the prologue DAG via
@@ -2240,6 +2240,9 @@ fn shared_embedding_consumers_are_foldable(
 ///   are folded only when all consumers are compatible reductions. This is
 ///   valid because the gathered axis is the reduced (inner) axis: `embedding`
 ///   params `[seq, hidden] = [outer, inner]`.
+///
+///   Phase 3: transpose(broadcast_inner(x)) repeats whole rows of x.
+///   A reduction can address those rows directly without either copy.
 ///
 /// Together these let `sum_inner(mul(embedding(idx,tbl), x))` collapse to
 /// one fused reduction kernel — the SH colour path — discovered from
@@ -2451,6 +2454,85 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
                 }
                 fused = true;
                 break 'outer2;
+            }
+        }
+        if !fused {
+            break;
+        }
+    }
+
+    loop {
+        let prot = protected(plan);
+        let (producer, reads) = scan(plan);
+        let mut fused = false;
+        'rows: for ci in 0..plan.dispatches.len() {
+            let c = &plan.dispatches[ci];
+            let Some(kernel) = c.reduction() else {
+                continue;
+            };
+            if c.fusion_barrier || kernel.gather_elem.iter().any(|&g| g) {
+                continue;
+            }
+            let outer = c.params[0];
+            let inner = c.params[1];
+            let per_elem = kernel.n_per_elem as usize;
+            for s in 0..per_elem {
+                if kernel.input_row_repeats.get(s).copied().unwrap_or(1) != 1 {
+                    continue;
+                }
+                let buf = c.input_buffers[s];
+                let Some(&ti) = producer.get(&buf) else {
+                    continue;
+                };
+                let t = &plan.dispatches[ti];
+                if ti >= ci
+                    || t.shader != ShaderEntry::Transpose
+                    || t.fusion_barrier
+                    || t.input_buffers.len() != 1
+                    || t.params[0] != inner
+                {
+                    continue;
+                }
+                let repeats = t.params[1];
+                let batch = t.workgroups[2];
+                if repeats <= 1 || batch.checked_mul(repeats) != Some(outer) {
+                    continue;
+                }
+                let expanded = t.input_buffers[0];
+                let Some(&bi) = producer.get(&expanded) else {
+                    continue;
+                };
+                let b = &plan.dispatches[bi];
+                if bi >= ti
+                    || b.fusion_barrier
+                    || !b.is_inner_broadcast()
+                    || b.input_buffers.len() != 1
+                    || b.params[1] != repeats
+                    || outer.checked_mul(inner) != b.params.first().copied()
+                {
+                    continue;
+                }
+                let input = b.input_buffers[0];
+                let origin = t
+                    .origin
+                    .iter()
+                    .chain(&b.origin)
+                    .copied()
+                    .collect::<Vec<_>>();
+                let c = &mut plan.dispatches[ci];
+                let kernel = c.reduction_mut().expect("checked");
+                kernel.input_row_repeats.resize(per_elem, 1);
+                kernel.input_row_repeats[s] = repeats;
+                c.input_buffers[s] = input;
+                c.origin.extend(origin);
+                if reads.get(&buf) == Some(&1) && !prot.contains(&buf) {
+                    plan.dispatches.remove(ti);
+                    if reads.get(&expanded) == Some(&1) && !prot.contains(&expanded) {
+                        plan.dispatches.remove(bi);
+                    }
+                }
+                fused = true;
+                break 'rows;
             }
         }
         if !fused {

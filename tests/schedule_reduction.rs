@@ -27,6 +27,119 @@ type F32Inputs = Vec<(&'static str, Vec<f32>)>;
 type U32Inputs = Vec<(&'static str, Vec<u32>)>;
 type BuildResult = (NodeId, F32Inputs, U32Inputs);
 
+fn repeated_rows(g: &mut Graph, x: NodeId, rows: usize, cols: usize, repeats: usize) -> NodeId {
+    let flat = g.reshape(x, &[rows * cols, 1]);
+    let expanded = g.broadcast_inner(flat, repeats);
+    let shaped = g.reshape(expanded, &[rows, cols, repeats]);
+    let transposed = g.transpose(shaped);
+    g.reshape(transposed, &[rows * repeats, cols])
+}
+
+#[test]
+fn repeated_rows_compile_without_copies() {
+    for preserve_copy in [false, true] {
+        let mut g = Graph::new();
+        let x = g.input("x", &[7, 18]);
+        let factors = g.input("factors", &[35, 18]);
+        let repeated = repeated_rows(&mut g, x, 7, 18, 5);
+        let product = g.mul(repeated, factors);
+        let reduced = g.sum_inner(product);
+        let second = g.sum_inner(repeated);
+        g.set_outputs(if preserve_copy {
+            vec![reduced, second, repeated]
+        } else {
+            vec![reduced, second]
+        });
+        let plan = compile_with(&g, &CompileOptions::default());
+        let reductions = plan
+            .dispatches
+            .iter()
+            .filter_map(|d| d.reduction())
+            .collect::<Vec<_>>();
+        assert_eq!(reductions.len(), 2);
+        assert!(reductions.iter().all(|k| k.input_row_repeats.contains(&5)));
+        assert_eq!(
+            plan.dispatches
+                .iter()
+                .filter(|d| d.shader == ShaderEntry::Transpose)
+                .count(),
+            usize::from(preserve_copy)
+        );
+        assert_eq!(
+            plan.dispatches
+                .iter()
+                .filter(|d| d.shader == ShaderEntry::GlobalAvgPoolGrad)
+                .count(),
+            usize::from(preserve_copy)
+        );
+    }
+}
+
+#[test]
+fn repeated_rows_forward_and_gradients_match_f64() {
+    let gpu = crate::support::gpu::gpu();
+    if let Ok(expected) = std::env::var("MEGANEURA_EXPECT_DEVICE_NAME") {
+        assert_eq!(gpu.device_information().device_name, expected);
+        let memory = gpu.memory_stats();
+        assert!(memory.budget.saturating_sub(memory.usage) >= 2 << 30);
+    }
+    for (rows, cols, repeats) in [(3, 1, 2), (259, 3, 5), (7, 18, 4), (5, 65, 3)] {
+        let x_data = (0..rows * cols)
+            .map(|i| ((i * 17 % 101) as f32 - 50.0) * 0.013)
+            .collect::<Vec<_>>();
+        let factor_data = (0..rows * repeats * cols)
+            .map(|i| ((i * 29 % 97) as f32 - 48.0) * 0.021)
+            .collect::<Vec<_>>();
+        for fuse in [false, true] {
+            let mut g = Graph::new();
+            let x = g.parameter("x", &[rows, cols]);
+            let factors = g.parameter("factors", &[rows * repeats, cols]);
+            let repeated = repeated_rows(&mut g, x, rows, cols, repeats);
+            let product = g.mul(repeated, factors);
+            let reduced = g.sum_inner(product);
+            let loss = g.sum_all(reduced);
+            g.set_outputs(vec![loss, reduced]);
+            let mut session = meganeura::build(
+                &g,
+                SessionConfig {
+                    mode: Mode::Training,
+                    options: CompileOptions {
+                        fuse_dispatches: fuse,
+                        ..Default::default()
+                    },
+                    ..crate::support::gpu::config()
+                },
+            )
+            .0;
+            session.set_parameter("x", &x_data);
+            session.set_parameter("factors", &factor_data);
+            session.step();
+            session.wait();
+            let mut actual = vec![0.0; rows * repeats];
+            let mut dx = vec![0.0; x_data.len()];
+            let mut df = vec![0.0; factor_data.len()];
+            session.read_output_by_index(1, &mut actual);
+            session.read_param_grad("x", &mut dx);
+            session.read_param_grad("factors", &mut df);
+            let mut expected_dx = vec![0.0_f64; x_data.len()];
+            for row in 0..rows * repeats {
+                let mut expected = 0.0_f64;
+                for col in 0..cols {
+                    let source = row / repeats * cols + col;
+                    let target = row * cols + col;
+                    expected += f64::from(x_data[source]) * f64::from(factor_data[target]);
+                    expected_dx[source] += f64::from(factor_data[target]);
+                    assert_eq!(df[target], x_data[source]);
+                }
+                assert!((f64::from(actual[row]) - expected).abs() < 2e-5 * (1.0 + expected.abs()));
+            }
+            for (actual, expected) in dx.into_iter().zip(expected_dx) {
+                assert!((f64::from(actual) - expected).abs() < 2e-5 * (1.0 + expected.abs()));
+            }
+        }
+    }
+}
+
 fn run(build: &dyn Fn(&mut Graph) -> BuildResult, n_out: usize, fuse: bool) -> Vec<f32> {
     let mut g = Graph::new();
     let (out, f_inputs, u_inputs) = build(&mut g);
