@@ -23,5 +23,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // An id past the table reads its last row rather than past its end.
     let token_id = min(indices[row], params.rows - 1u);
     let offset = token_id * params.hidden + col;
-    dst[i] = unpack2x16float(src[offset / 2u])[offset % 2u];
+    // Shift the wanted half low so only it is converted.
+    dst[i] = unpack2x16float(src[offset / 2u] >> ((offset & 1u) << 4u)).x;
 }
