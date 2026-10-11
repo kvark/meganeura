@@ -1606,10 +1606,11 @@ impl Pipelines {
                 let dag = dispatch.pointwise().expect("pointwise implementation");
                 layout = pointwise_data_layout(dag.n_inputs);
                 entry_point = crate::schedule::POINTWISE_ENTRY;
-                crate::schedule::lower(&crate::schedule::KernelTemplate::Pointwise {
-                    dag: dag.clone(),
-                    grid: crate::schedule::GridShape::default(),
-                })
+                crate::schedule::lower_pointwise_storage(
+                    dag,
+                    crate::schedule::GridShape::default(),
+                    dispatch.pointwise_storage,
+                )
             }
             Variant::Reduction(_) => {
                 let kernel = dispatch.reduction().expect("reduction implementation");
@@ -1728,7 +1729,14 @@ impl Pipelines {
             return Variant::Reduction(kernel.hash_key());
         }
         if let Some(dag) = dispatch.pointwise() {
-            return Variant::Pointwise(dag.hash_key());
+            if dispatch.pointwise_storage == crate::schedule::PointwiseStorage::default() {
+                return Variant::Pointwise(dag.hash_key());
+            }
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            dag.hash(&mut hash);
+            dispatch.pointwise_storage.hash(&mut hash);
+            return Variant::Pointwise(hash.finish());
         }
         if let Some(dim) = Self::attention_head_dim(dispatch) {
             let ept = match dispatch.kernel {

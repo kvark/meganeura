@@ -109,11 +109,12 @@ fn bf16_storage_rejects_untyped_arithmetic() {
 #[test]
 fn bf16_matrix_shaders_validate() {
     for (transpose_a, transpose_b) in [(false, false), (true, false), (false, true)] {
-        for addend in [false, true] {
+        for (addend, output_bf16) in [(false, false), (true, false), (false, true), (true, true)] {
             let entry = ShaderEntry::MatMulBF16 {
                 transpose_a,
                 transpose_b,
                 addend,
+                output_bf16,
             };
             let mut shader =
                 meganeura::codegen::generate_module(entry.shader_group(), Default::default());
@@ -151,6 +152,309 @@ fn bf16_matrix_shaders_validate() {
             }
         }
     }
+}
+
+fn connected_graph() -> (Graph, meganeura::reference::Feeds) {
+    let mut graph = Graph::new();
+    let input = graph.input("input", &[19, 17]);
+    let w1 = graph.parameter("w1", &[17, 23]);
+    let w2 = graph.parameter("w2", &[23, 7]);
+    let x = graph.to_bf16(input);
+    let w1q = graph.to_bf16(w1);
+    let w1q = graph.reshape(w1q, &[17, 23]);
+    let hidden = graph.matmul(x, w1q);
+    let hidden = graph.to_bf16(hidden);
+    let hidden = graph.from_bf16(hidden);
+    let hidden = graph.clamp(hidden, 0.0, 8.0);
+    let hidden = graph.scale(hidden, 0.5);
+    let hidden = graph.to_bf16(hidden);
+    let w2q = graph.to_bf16(w2);
+    let output = graph.matmul(hidden, w2q);
+    let square = graph.mul(output, output);
+    let loss = graph.mean_all(square);
+    graph.set_outputs(vec![loss, output]);
+    let mut feeds = meganeura::reference::Feeds::new();
+    for (name, count, divisor) in [
+        ("input", 19 * 17, 8.0),
+        ("w1", 17 * 23, 64.0),
+        ("w2", 23 * 7, 64.0),
+    ] {
+        feeds.set(
+            name,
+            &(0..count)
+                .map(|i| ((i * 37 + 11) % 53) as f32 / divisor - 26.0 / divisor)
+                .collect::<Vec<_>>(),
+        );
+    }
+    (graph, feeds)
+}
+
+#[test]
+fn bf16_connected_plan_cpu() {
+    let (graph, feeds) = connected_graph();
+    let full = meganeura::autodiff::differentiate_with_bf16_gradients(&graph);
+    let reference = meganeura::reference::evaluate(&full, &feeds).unwrap();
+    for &id in full.outputs() {
+        assert_eq!(full.node(id).ty.dtype, DType::F32);
+        assert!(reference[id as usize].data.iter().all(|v| v.is_finite()));
+    }
+    for node in full
+        .nodes()
+        .iter()
+        .filter(|n| matches!(n.op, meganeura::graph::Op::Identity))
+    {
+        assert_eq!(node.ty.dtype, full.node(node.inputs[0]).ty.dtype);
+    }
+    let plan = meganeura::compile::compile(&full);
+    let plain = meganeura::compile::compile_with(
+        &full,
+        &meganeura::CompileOptions {
+            fuse_dispatches: false,
+            ..Default::default()
+        },
+    );
+    assert!(plan.dispatches.len() < plain.dispatches.len());
+    assert!(plan.dispatches.iter().any(|d| matches!(
+        d.shader,
+        ShaderEntry::MatMulBF16 {
+            output_bf16: true,
+            ..
+        }
+    )));
+    assert!(
+        plan.dispatches
+            .iter()
+            .any(|d| d.pointwise_storage.bf16_inputs != 0 && d.pointwise_storage.bf16_output)
+    );
+    assert!(plan.param_types.values().all(|ty| ty.dtype == DType::F32));
+    for &(param, grad) in &plan.param_grad_pairs {
+        assert_eq!(
+            plan.buffers[param.0 as usize],
+            plan.buffers[grad.0 as usize]
+        );
+    }
+    println!(
+        "bf16_connected_plan dispatches={}->{}",
+        plain.dispatches.len(),
+        plan.dispatches.len()
+    );
+
+    // Visible F32 outputs must survive even when their internal consumers
+    // fold conversions. The repeated input also exercises both typed slots.
+    let mut visible = Graph::new();
+    let input = visible.input("x", &[37]);
+    let scaled = visible.scale(input, 0.75);
+    let narrow = visible.to_bf16(scaled);
+    let wide = visible.from_bf16(narrow);
+    let square = visible.mul(wide, wide);
+    let narrow_square = visible.to_bf16(square);
+    let output = visible.from_bf16(narrow_square);
+    visible.set_outputs(vec![scaled, wide, output]);
+    let plan = meganeura::compile::compile(&visible);
+    assert!(
+        plan.dispatches
+            .iter()
+            .any(|d| d.pointwise_storage.bf16_inputs == 3 && d.pointwise_storage.bf16_output)
+    );
+    for &buffer in &plan.output_buffers {
+        assert_eq!(plan.buffers[buffer.0 as usize], 37 * 4);
+        assert!(plan.dispatches.iter().any(|d| d.output_buffer == buffer));
+    }
+}
+
+#[test]
+fn bf16_pointwise_shaders_validate() {
+    use meganeura::schedule::{PointwiseDAG, PointwiseStorage, Pw};
+    let dag = PointwiseDAG {
+        n_inputs: 3,
+        ops: vec![
+            Pw::LoadInput(0),
+            Pw::LoadInput(1),
+            Pw::LoadBroadcast {
+                input: 2,
+                divisor: 1,
+                modulus: 7,
+            },
+            Pw::Mul(0, 1),
+            Pw::Add(3, 2),
+        ],
+        output: 4,
+    };
+    for inputs in 0..8 {
+        for output in [false, true] {
+            let mut shader = meganeura::schedule::lower_pointwise_storage(
+                &dag,
+                Default::default(),
+                PointwiseStorage {
+                    bf16_inputs: inputs,
+                    bf16_output: output,
+                },
+            );
+            let mut binding = 0;
+            for (_, var) in shader.module.global_variables.iter_mut() {
+                if matches!(
+                    var.space,
+                    naga::AddressSpace::Storage { .. } | naga::AddressSpace::Uniform
+                ) {
+                    var.binding = Some(naga::ResourceBinding { group: 0, binding });
+                    binding += 1;
+                }
+            }
+            let info = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&shader.module)
+            .unwrap();
+            naga::back::spv::write_vec(
+                &shader.module,
+                &info,
+                &naga::back::spv::Options {
+                    lang_version: (1, 3),
+                    capabilities: None,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[test]
+fn bf16_connected_forward_backward_and_updates() {
+    let context = crate::support::gpu::gpu();
+    if !context
+        .capabilities()
+        .cooperative_matrix
+        .bf16_f32_shapes
+        .contains(&[16, 16, 16])
+    {
+        eprintln!("native BF16 matrices unavailable; skipping device-specific coverage");
+        return;
+    }
+    assert!(
+        context
+            .memory_stats()
+            .budget
+            .saturating_sub(context.memory_stats().usage)
+            >= 2 << 30
+    );
+    let (graph, feeds) = connected_graph();
+    for fuse in [false, true] {
+        let mut options = meganeura::reference::gpu::Options::default();
+        options.compile.fuse_dispatches = fuse;
+        options.compile.bf16_matrix_gradients = true;
+        meganeura::reference::gpu::check_training(&graph, &feeds, &options)
+            .unwrap()
+            .assert_passed("connected BF16 forward/backward");
+    }
+    let mut config = crate::support::gpu::config();
+    config.tune = false;
+    config.options.bf16_matrix_gradients = true;
+    let (mut session, _) = meganeura::build(&graph, config);
+    session.set_input("input", &feeds.f32("input").unwrap());
+    for name in ["w1", "w2"] {
+        session.set_parameter(name, &feeds.f32(name).unwrap());
+    }
+    let mut first_loss = 0.0;
+    let mut final_loss = 0.0;
+    for step in 0..32 {
+        session.step();
+        session.wait();
+        let loss = session.read_loss();
+        assert!(loss.is_finite() && loss >= 0.0);
+        if step == 0 {
+            first_loss = loss;
+        }
+        final_loss = loss;
+        session.adam_step(1e-3, 0.9, 0.999, 1e-8);
+    }
+    session.wait();
+    assert!(final_loss < first_loss);
+    for (name, count) in [("w1", 17 * 23), ("w2", 23 * 7)] {
+        let mut values = vec![0.0; count];
+        session.read_param(name, &mut values);
+        assert!(values.iter().all(|v| v.is_finite()));
+        session.read_adam_m(name, &mut values);
+        assert!(values.iter().all(|v| v.is_finite()));
+        session.read_adam_v(name, &mut values);
+        assert!(values.iter().all(|v| v.is_finite() && *v >= 0.0));
+    }
+    let memory = context.memory_stats();
+    assert!(memory.budget.saturating_sub(memory.usage) >= 2 << 30);
+    println!(
+        "bf16_connected_verified updates=32 losses={first_loss}->{final_loss} memory={memory:?}"
+    );
+}
+
+#[test]
+fn bf16_matrix_reduced_gradients() {
+    let context = crate::support::gpu::gpu();
+    if !context
+        .capabilities()
+        .cooperative_matrix
+        .bf16_f32_shapes
+        .contains(&[16, 16, 16])
+    {
+        eprintln!("native BF16 matrices unavailable; skipping device-specific coverage");
+        return;
+    }
+    let mut cases = 0;
+    for layout in 0..3 {
+        for addend in [false, true] {
+            for scale in [1e-20, 1.0, 1e20] {
+                let (m, n, k) = (19, 23, 17);
+                let mut graph = Graph::new();
+                let a = graph.parameter("a", &if layout == 1 { [k, m] } else { [m, k] });
+                let b = graph.parameter("b", &if layout == 2 { [n, k] } else { [k, n] });
+                let aq = graph.to_bf16(a);
+                let bq = graph.to_bf16(b);
+                let output = match layout {
+                    0 => graph.matmul(aq, bq),
+                    1 => graph.matmul_at(aq, bq),
+                    _ => graph.matmul_bt(aq, bq),
+                };
+                let output = if addend {
+                    let bias = graph.parameter("bias", &[m, n]);
+                    graph.add(output, bias)
+                } else {
+                    output
+                };
+                let output = graph.to_bf16(output);
+                let output = graph.from_bf16(output);
+                let weights = graph.input("weights", &[m, n]);
+                let weighted = graph.mul(output, weights);
+                let loss = graph.sum_all(weighted);
+                graph.set_outputs(vec![loss, output]);
+                let mut feeds = meganeura::reference::Feeds::new();
+                for (name, count) in [("a", m * k), ("b", k * n)] {
+                    feeds.set(
+                        name,
+                        &(0..count)
+                            .map(|i| ((i * 37 + 11) % 53) as f32 / 128.0 - 26.0 / 128.0)
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                if addend {
+                    feeds.set("bias", &vec![0.125; m * n]);
+                }
+                feeds.set(
+                    "weights",
+                    &(0..m * n)
+                        .map(|i| ((i % 7) as f32 - 3.0) * scale * 1.0015)
+                        .collect::<Vec<_>>(),
+                );
+                let mut options = meganeura::reference::gpu::Options::default();
+                options.compile.bf16_matrix_gradients = true;
+                let report =
+                    meganeura::reference::gpu::check_training(&graph, &feeds, &options).unwrap();
+                report.assert_passed("BF16 reduced derivative inputs");
+                cases += 1;
+            }
+        }
+    }
+    println!("bf16_reduced_gradients_verified cases={cases}");
 }
 
 #[test]

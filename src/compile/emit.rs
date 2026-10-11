@@ -853,6 +853,7 @@ impl<'a> Compiler<'a> {
                     transpose_a,
                     transpose_b,
                     addend,
+                    output_bf16: false,
                 },
                 workgroups: grid,
                 input_buffers: node.inputs.iter().map(|&id| self.get_buffer(id)).collect(),

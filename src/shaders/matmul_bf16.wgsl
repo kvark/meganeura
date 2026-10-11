@@ -4,12 +4,13 @@ enable wgpu_cooperative_matrix;
 struct Params { m: u32, n: u32, k: u32, _pad: u32 }
 var<storage> matrix_a: array<bf16>;
 var<storage> matrix_b: array<bf16>;
-var<storage, read_write> matrix_c: array<f32>;
+var<storage, read_write> matrix_c: array<$OUT_TYPE>;
 $ADD_DECL
 var<uniform> params: Params;
 var<workgroup> stage_a: array<bf16, 256>;
 var<workgroup> stage_b: array<bf16, 256>;
 var<workgroup> result: array<f32, 256>;
+$ROUND
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -44,7 +45,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         let c = col + offset % 16u;
         if r < params.m && c < params.n {
             let index = r * params.n + c;
-            matrix_c[index] = result[offset]$ADD;
+            matrix_c[index] = $STORE(result[offset]$ADD);
         }
     }
 }

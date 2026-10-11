@@ -7,16 +7,23 @@ capabilities, not packed-u32 emulation. `Graph::to_bf16` stores two bytes per
 element with nearest-even GPU rounding; `from_bf16` widens exactly. Explicit
 BF16 operands work with `matmul`, `matmul_at` and `matmul_bt` (and an F32
 addend), producing F32 outputs and accumulation. Master parameters and their
-gradients remain F32. Backward widens the quantized forward operands and uses
-the existing F32 derivative path.
+gradients remain F32. By default, backward widens the quantized forward operands
+and uses the existing F32 derivative path. Opt-in
+`CompileOptions::bf16_matrix_gradients` uses BF16 derivative operands for
+explicit BF16 forward matrices only, with F32 accumulation and master gradients.
+It does not demote other F32 operations or enable F16 derivative inputs.
 
 This is not autocast or complete mixed-precision training. BF16 graph inputs,
 parameters, outputs and unsupported operations reject explicitly; only internal
 conversion/matrix storage is supported. Check Blade's `shader_bfloat16` and
 `bf16_f32_shapes`; matrix products currently require `[16,16,16]`. Devices
 without those features retain the existing F32/F16 paths. No default graph is
-automatically narrowed. Connected pointwise/layout/convolution regions and
-reduced-input backward execution remain work before whole-model timing.
+automatically narrowed. Explicit BF16 matrix stores and pointwise conversion
+boundaries now fuse: pointwise arithmetic widens inside the kernel and rounds
+once at its store. Shared values needed by F32 consumers or external outputs
+stay available. Reshaped BF16 activations retain F32 master-gradient views.
+Convolution, general layouts and whole-model precision selection remain work
+before complete-model timing; this is not universal BF16 activation storage.
 
 On RTX5080/580.178.04, 1,035 exact conversion cases and 18 F64-referenced matrix /
 F32-gradient fixtures pass (three layouts, optional addend, full/partial/scalar
@@ -26,6 +33,16 @@ multiple-of-four requirement; clears now round within existing padded buffers.
 The pre-existing workgroup-layout VUID10684 remains recorded. These are
 primitive checks, not a speedup claim. `tests/bf16_storage.rs` covers the path;
 unsupported hardware skips only its GPU-specific cases.
+
+The connected follow-up passes 18 reduced-gradient matrix cases (three layouts,
+optional addend, derivative scales 1e-20/1/1e20), both fused/unfused F64 checks
+and 32 synthetic Adam updates. Its two-layer clamped-activation fixture's loss
+falls .16861932 -> .03437764; master parameters and both moments remain finite.
+One additional GPU guard passes in 9.76s of child execution, with no allocation
+warnings; the known workgroup-layout message remains. CPU checks include 16
+pointwise storage combinations, 12 matrix store/layout/addend combinations,
+protected outputs and aliased BF16 views. This is not a full learner or a
+performance/learning-quality claim.
 
 ## Historical F16 weight-storage work
 

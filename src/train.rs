@@ -410,7 +410,13 @@ fn compile_for_target(
     (optimize, skip_full_optimize): (optimize::OptimizeConfig, bool),
     (coop_caps, shared_memory_bytes): (crate::codegen::CoopCaps, u32),
 ) -> (compile::ExecutionPlan, optimize::OptimizeReport) {
-    let (final_graph, report) = prepare_graph(forward_graph, mode, optimize, skip_full_optimize);
+    let (final_graph, report) = prepare_graph(
+        forward_graph,
+        mode,
+        optimize,
+        skip_full_optimize,
+        options.bf16_matrix_gradients,
+    );
     let _span = tracing::info_span!("compile").entered();
     let plan =
         compile::compile_owned_with_caps(final_graph, options, coop_caps, shared_memory_bytes);
@@ -449,6 +455,7 @@ fn prepare_graph(
     mode: Mode,
     optimize: optimize::OptimizeConfig,
     skip_full_optimize: bool,
+    bf16_matrix_gradients: bool,
 ) -> (Graph, optimize::OptimizeReport) {
     // Composites written as their decompositions build as the composites,
     // so their fused kernels and gradients apply.
@@ -482,7 +489,11 @@ fn prepare_graph(
             // sorted, differentiated, and fully optimized graphs together.
             let full = {
                 let _span = tracing::info_span!("autodiff").entered();
-                autodiff::differentiate(&sorted)
+                if bf16_matrix_gradients {
+                    autodiff::differentiate_with_bf16_gradients(&sorted)
+                } else {
+                    autodiff::differentiate(&sorted)
+                }
             };
             drop(sorted);
             log::info!(
@@ -588,7 +599,13 @@ pub fn compile_plan(
     optimize: optimize::OptimizeConfig,
     options: &compile::CompileOptions,
 ) -> compile::ExecutionPlan {
-    let (graph, _) = prepare_graph(forward_graph, mode, optimize, false);
+    let (graph, _) = prepare_graph(
+        forward_graph,
+        mode,
+        optimize,
+        false,
+        options.bf16_matrix_gradients,
+    );
     compile::compile_owned_with_caps(graph, options, Default::default(), 32 * 1024)
 }
 

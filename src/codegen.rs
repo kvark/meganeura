@@ -636,6 +636,7 @@ pub enum ShaderGroup {
         transpose_a: bool,
         transpose_b: bool,
         addend: bool,
+        output_bf16: bool,
     },
     RoPE,
     RoPEGrad,
@@ -772,11 +773,15 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
             transpose_a,
             transpose_b,
             addend,
+            output_bf16,
         } => {
             assert!(!(transpose_a && transpose_b));
             let source = preprocess(
                 include_str!("shaders/matmul_bf16.wgsl"),
                 &[
+                    ("$ROUND", include_str!("shaders/bf16_round.wgsl")),
+                    ("$OUT_TYPE", if output_bf16 { "bf16" } else { "f32" }),
+                    ("$STORE", if output_bf16 { "round_bf16" } else { "f32" }),
                     (
                         "$A_INDEX",
                         if transpose_a {
@@ -811,6 +816,7 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
             let source = preprocess(
                 include_str!("shaders/bf16_conversion.wgsl"),
                 &[
+                    ("$ROUND", include_str!("shaders/bf16_round.wgsl")),
                     ("$SRC_TYPE", if narrowing { "f32" } else { "bf16" }),
                     ("$DST_TYPE", if narrowing { "bf16" } else { "f32" }),
                     ("$CONVERT", if narrowing { "round_bf16" } else { "f32" }),
