@@ -94,9 +94,12 @@ pub(crate) struct Problem {
 }
 
 impl Problem {
-    /// The convolution `dispatch` computes, if its 64-wide entry has a
-    /// cooperative form. The narrower tiles and the weight gradient do not.
+    /// The convolution `dispatch` computes when a cooperative form exists.
+    /// Weight gradients include narrow scalar tiles and split-K partials.
     pub(crate) fn of(dispatch: &Dispatch) -> Option<Self> {
+        if dispatch.shader == ShaderEntry::Conv2dGradWeightGemmCoop {
+            return None;
+        }
         let p = &dispatch.params;
         // params: [batch, in_channels, in_h, in_w, out_channels, kernel_h,
         // kernel_w, stride, padding_h, out_h, out_w, padding_w]
@@ -105,6 +108,17 @@ impl Problem {
             ShaderGroup::Conv2dGradInputGemm => {
                 (Kind::GradInput, p[1], p[2] * p[3], p[4] * p[5] * p[6])
             }
+            ShaderGroup::Conv2dGradWeightGemm
+            | ShaderGroup::Conv2dGradWeightGemmSmall
+            | ShaderGroup::Conv2dGradWeightGemm16
+            | ShaderGroup::Conv2dGradWeightGemmSplit
+            | ShaderGroup::Conv2dGradWeightGemmSplitSmall
+            | ShaderGroup::Conv2dGradWeightGemmSplit16 => (
+                Kind::GradWeight,
+                p[4],
+                p[1].checked_mul(p[5])?.checked_mul(p[6])?,
+                p[0].checked_mul(p[9])?.checked_mul(p[10])?,
+            ),
             _ => return None,
         };
         Some(Self {
@@ -112,7 +126,11 @@ impl Problem {
             m,
             n,
             k,
-            batch: p[0],
+            batch: if kind == Kind::GradWeight {
+                dispatch.workgroups[2]
+            } else {
+                p[0]
+            },
             window: [p[5], p[6], p[7]],
             pinned: dispatch.conv_k_tile().is_some_and(|k| k != EXACT_K_TILE),
             reduced_storage: dispatch.weight_format.uses_reduced_storage(),
@@ -130,7 +148,7 @@ impl Problem {
         match self.kind {
             Kind::Forward => ShaderEntry::Conv2dGemmCoopGen(kh, kw, stride),
             Kind::GradInput => ShaderEntry::Conv2dGradInputGemmCoopGen(kh, kw, stride),
-            Kind::GradWeight => unreachable!("the weight gradient has no cooperative kernel"),
+            Kind::GradWeight => ShaderEntry::Conv2dGradWeightGemmCoop,
         }
     }
 }
@@ -181,6 +199,10 @@ impl Family for Path {
             Err("the epilogue binds buffers of its own")
         } else if problem.reduced_storage {
             Err("packed weights keep their compiled kernel")
+        } else if problem.kind == Kind::GradWeight
+            && problem.n / (problem.window[0] * problem.window[1]) < config.tile_size
+        {
+            Err("too few input channels for offset-wise cooperative tiles")
         } else if f32_8x8 && problem.kind == Kind::Forward {
             // Policy: the forward kernel keeps the older two-by-two tile,
             // and scalar im2col measured faster on the 8x8 f32 device.
@@ -224,18 +246,34 @@ pub(crate) fn cooperative_geometry(
     config: &CoopConfig,
 ) -> Result<CooperativeGeometry, Rejection> {
     let tile = config.output_tile();
-    let grid = [
-        problem.m.div_ceil(tile),
-        problem.n.div_ceil(tile),
-        problem.batch,
-    ];
+    let grid = if problem.kind == Kind::GradWeight {
+        let offsets = problem.window[0]
+            .checked_mul(problem.window[1])
+            .filter(|&v| v != 0 && problem.n.is_multiple_of(v))
+            .ok_or("invalid weight-gradient window")?;
+        [
+            problem.m.div_ceil(tile),
+            (problem.n / offsets).div_ceil(tile),
+            problem
+                .batch
+                .checked_mul(offsets)
+                .ok_or("weight-gradient grid overflow")?,
+        ]
+    } else {
+        [
+            problem.m.div_ceil(tile),
+            problem.n.div_ceil(tile),
+            problem.batch,
+        ]
+    };
     // Direct stores write whole sub-tiles: N must stay aligned so stores
     // never straddle rows, and later images must not start inside padding
     // their consumers do not account for. The generated f32 input-gradient
     // kernel stages its right edge through checked stores instead.
     let stores_aligned =
         problem.n.is_multiple_of(16) && (problem.batch == 1 || problem.m.is_multiple_of(tile));
-    let checked_stores = problem.kind == Kind::GradInput && !config.use_f16_input;
+    let checked_stores = problem.kind == Kind::GradWeight
+        || (problem.kind == Kind::GradInput && !config.use_f16_input);
     if !stores_aligned && !checked_stores {
         Err("output tiles would straddle rows or images")
     } else if problem.k < 4 {
@@ -243,9 +281,17 @@ pub(crate) fn cooperative_geometry(
     } else if !crate::compile::workgroups_within_portable_limits(grid) {
         Err("grid exceeds the portable dispatch limit")
     } else {
-        let output_bytes =
+        let output_bytes = if problem.kind == Kind::GradWeight {
+            problem
+                .m
+                .checked_mul(problem.n)
+                .and_then(|v| v.checked_mul(problem.batch))
+                .and_then(|v| usize::try_from(v).ok())
+                .and_then(|v| v.checked_mul(4))
+        } else {
             crate::compile::cooperative_output_bytes(problem.m, problem.n, problem.batch, tile)
-                .ok_or("padded output exceeds the address space")?;
+        }
+        .ok_or("padded output exceeds the address space")?;
         Ok(CooperativeGeometry { grid, output_bytes })
     }
 }
@@ -381,5 +427,29 @@ mod tests {
         let geometry = cooperative_geometry(&aligned, &F16).unwrap();
         assert_eq!(geometry.grid, [4, 98, 4]);
         assert_eq!(geometry.output_bytes, 128 * 3136 * 4 * 4);
+    }
+
+    #[test]
+    fn weight_gradient_partials_keep_compact_edges_and_precision_policy() {
+        let p = Problem {
+            batch: 128,
+            requires_full_precision: true,
+            window: [3, 2, 1],
+            ..problem(Kind::GradWeight, 17, 198, 65536)
+        };
+        let geometry = cooperative_geometry(&p, &F16).unwrap();
+        assert_eq!(geometry.grid, [1, 2, 128 * 6]);
+        assert_eq!(geometry.output_bytes, 17 * 198 * 128 * 4);
+        assert_eq!(select(&p, &target(F16)), Path::Compiled);
+        assert_eq!(
+            select(
+                &p,
+                &Target {
+                    allow_raw_f16: true,
+                    ..target(F16)
+                }
+            ),
+            Path::Cooperative
+        );
     }
 }
