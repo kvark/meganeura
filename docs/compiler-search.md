@@ -188,13 +188,18 @@ schedule exclusions alternate: many fusion sites must not fill the frontier with
 one tile. Tile variants count toward `max_graphs` (sixteen by default, including the
 ordinary form). Split tile widths and K staging are visited early; ordinary
 construction already probes single-pass kernels. This is coverage ordering, not
-a claimed prediction of latency. Graph rank and physical rank are traversed
-diagonally, so a larger frontier cannot postpone every physical alternative
-until after all graph baselines. Time and program bounds are unchanged.
+a claimed prediction of latency. After the first three graph baselines, the
+frontier alternates new graph forms using the incumbent's physical choice with
+new physical choices on the incumbent's graph. A winner on either axis carries
+over to the other. This reaches distinct attention layouts within a bounded
+budget instead of repeatedly measuring the same few layouts on every graph.
+Once both axes around the incumbent are exhausted, remaining pairs follow in
+diagonal order. Time and program bounds are unchanged; a bounded run does not
+exhaust every graph/physical interaction.
 
 Dispatch fusion is a physical choice generated when visited, so enabling and
-disabling it does not consume two graph seeds. Measured construction uses one
-submission per step; submission chunking is not a search axis.
+disabling it does not consume two graph seeds. Submission probes alternate with
+this frontier when enabled, as described above.
 
 The final decision uses qualified, paired whole-step wall times, including fresh
 recording and submission. Per-pass GPU times are diagnostic, not substitutes for
