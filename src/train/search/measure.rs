@@ -20,6 +20,32 @@ pub(super) struct Program {
     pub plan: ExecutionPlan,
     /// Unspecified candidates retain the incumbent's measured submission choice.
     pub submission_chunks: Option<usize>,
+    /// Graph form and physical choice indices of a coordinate frontier.
+    pub origin: Option<Origin>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Origin {
+    pub form: usize,
+    pub choice: usize,
+}
+
+/// Candidate programs, possibly ordered by which program currently leads.
+pub(super) trait Frontier {
+    /// The next program to measure; `incumbent` is the selected program's origin.
+    fn next(&mut self, incumbent: Option<Origin>) -> Option<Program>;
+    /// Whether a later call could still return a program.
+    fn may_remain(&self) -> bool;
+}
+
+impl<I: Iterator<Item = Program>> Frontier for std::iter::Fuse<I> {
+    fn next(&mut self, _: Option<Origin>) -> Option<Program> {
+        Iterator::next(self)
+    }
+
+    fn may_remain(&self) -> bool {
+        self.size_hint().1 != Some(0)
+    }
 }
 
 #[derive(Serialize)]
@@ -89,7 +115,7 @@ fn validate(
 }
 
 pub(super) fn select(
-    programs: impl IntoIterator<Item = Program>,
+    mut programs: impl Frontier,
     gpu: Arc<blade_graphics::Context>,
     runtime: SessionOptions,
     mut report: BuildSearchReport,
@@ -126,7 +152,7 @@ pub(super) fn select(
     let mut comparison_costs = VecDeque::new();
     // Nothing executed since the incumbent's last qualification.
     let mut incumbent_checked = false;
-    let mut programs = programs.into_iter().fuse();
+    let mut incumbent_origin = None;
     for index in 0..options.max_programs {
         if start.elapsed() >= options.max_time {
             report.truncated = true;
@@ -153,7 +179,7 @@ pub(super) fn select(
         // Cover the first layouts, then alternate the two frontiers so submission
         // probes cannot consume the program budget before useful layouts arrive.
         let program = (index < super::INITIAL_LAYOUTS || !probe_submission)
-            .then(|| programs.next())
+            .then(|| programs.next(incumbent_origin))
             .flatten()
             .or_else(|| {
                 pending_submissions
@@ -162,9 +188,10 @@ pub(super) fn select(
                         description: selected_description.clone(),
                         plan: selected_plan.as_ref().unwrap().clone(),
                         submission_chunks: Some(submission_chunks),
+                        origin: incumbent_origin,
                     })
             })
-            .or_else(|| programs.next());
+            .or_else(|| programs.next(incumbent_origin));
         let Some(program) = program else {
             break;
         };
@@ -299,6 +326,9 @@ pub(super) fn select(
                     selected_chunks = submission_chunks;
                     selected_description = program.description;
                     selected_plan = Some(original_plan);
+                    // A program without an origin keeps the coordinate frontier
+                    // where it was.
+                    incumbent_origin = program.origin.or(incumbent_origin);
                     if program.submission_chunks.is_none() {
                         pending_submissions =
                             std::iter::successors(Some(1usize), |n| n.checked_mul(2))
@@ -352,7 +382,7 @@ pub(super) fn select(
     report.truncated |= start.elapsed() >= options.max_time
         || !pending_submissions.is_empty()
         || ((report.patience_exhausted || report.trials.len() == options.max_programs)
-            && programs.size_hint().1 != Some(0));
+            && programs.may_remain());
     let (mut session, state) = incumbent.ok_or("no qualified program within the search bounds")?;
     // Requalify an incumbent that challengers ran beside since its own check.
     // A failing incumbent invalidates the search: it must not survive as the
@@ -386,7 +416,7 @@ mod tests {
         qualify: impl FnMut(&Session) -> Result<(), String>,
     ) -> Result<(Session, BuildSearchReport), String> {
         super::select(
-            programs,
+            programs.into_iter().fuse(),
             gpu,
             runtime,
             BuildSearchReport {
@@ -459,6 +489,7 @@ mod tests {
                     description: name.into(),
                     plan,
                     submission_chunks: (name == "baseline").then_some(2),
+                    origin: None,
                 }
             });
             let result = select(
@@ -578,6 +609,7 @@ mod tests {
             description: index.to_string(),
             plan: plan.clone(),
             submission_chunks: Some(1),
+            origin: None,
         });
         let uploads = std::cell::Cell::new(0);
         let (mut selected, report) = select(
@@ -670,6 +702,7 @@ mod tests {
                     description: index.to_string(),
                     plan: plan.clone(),
                     submission_chunks: Some(1),
+                    origin: None,
                 });
                 let (mut selected, report) = select(
                     programs,
@@ -766,6 +799,7 @@ mod tests {
                     description: "ordinary".into(),
                     plan: plan.clone(),
                     submission_chunks: Some(1),
+                    origin: None,
                 }],
                 gpu.clone(),
                 SessionOptions {
@@ -830,6 +864,7 @@ mod tests {
             description: index.to_string(),
             plan: plan.clone(),
             submission_chunks: Some(1),
+            origin: None,
         })
     }
 
@@ -977,6 +1012,7 @@ mod tests {
                     description: splits.to_string(),
                     plan,
                     submission_chunks: Some(splits as usize),
+                    origin: None,
                 }
             });
             let mut index = 0;

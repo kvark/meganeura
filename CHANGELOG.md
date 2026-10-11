@@ -1,5 +1,9 @@
 # Unreleased
 
+- Measured search alternates graph forms with physical choices on the current
+  winner, reaching more attention layouts within the program bound. Winning
+  choices carry over between axes; remaining interactions follow if the budget
+  permits.
 - Measured search no longer starts a comparison when even its cheapest recent
   complete comparison, excluding kernel probes, could not finish by the
   deadline: an incomplete comparison cannot select its program.

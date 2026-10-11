@@ -394,30 +394,95 @@ fn early_physical_cover(baseline: AxisChoice, attention: &[AttentionChoice]) -> 
     cover
 }
 
-/// Cover early layouts, then graph rank × physical rank. Neither a larger graph
-/// frontier nor more physical variants should starve the other under a budget.
-fn physical_program_order(
-    n_seeds: usize,
-    baseline: AxisChoice,
-    cover: &[AxisChoice],
-    tail: &[AxisChoice],
-) -> Vec<(usize, AxisChoice)> {
-    let mut order: Vec<_> = (0..n_seeds.min(INITIAL_LAYOUTS))
-        .map(|seed| (seed, baseline))
-        .collect();
-    let choices: Vec<_> = std::iter::once(baseline)
-        .chain(cover.iter().copied())
-        .chain(tail.iter().copied())
-        .collect();
-    for rank in 0..n_seeds + choices.len() - 1 {
-        for (physical, &choice) in choices.iter().take(rank + 1).enumerate() {
-            let seed = rank - physical;
-            if seed < n_seeds && !(physical == 0 && seed < INITIAL_LAYOUTS) {
-                order.push((seed, choice));
-            }
+/// Coordinate order over graph forms and physical choices (indices into the
+/// seed and choice lists). The first layouts run with the baseline choice.
+/// After that, steps alternate between the next untried graph form, run with
+/// the incumbent's physical choice, and the next untried physical choice on
+/// the incumbent's form. A winner on either axis carries over to the other:
+/// later forms inherit a winning choice, and a winning form restarts the
+/// choices it has not yet run with.
+///
+/// Physical choices such as attention layouts mostly act independently of the
+/// graph form. A diagonal over form × choice rank spends a bounded budget
+/// re-measuring the same few choices on every form; on graphs with many
+/// forms it never reaches the later choices at all. Pairs off both axes
+/// follow, diagonally, once the axes around the incumbent are exhausted.
+#[derive(Debug)]
+struct CoordinateOrder {
+    seeds: usize,
+    choices: usize,
+    tried: collections::HashSet<(usize, usize)>,
+    /// Forms that have run with any choice.
+    visited_forms: Vec<bool>,
+    initial: usize,
+    physical_next: bool,
+}
+
+impl CoordinateOrder {
+    fn new(seeds: usize, choices: usize) -> Self {
+        Self {
+            seeds,
+            choices,
+            tried: collections::HashSet::new(),
+            visited_forms: vec![false; seeds],
+            initial: 0,
+            physical_next: false,
         }
     }
-    order
+
+    /// The next (form, choice) to measure, given the incumbent's.
+    fn next(&mut self, incumbent: (usize, usize)) -> Option<(usize, usize)> {
+        if self.seeds == 0 || self.choices == 0 {
+            return None;
+        }
+        while self.initial < self.seeds.min(INITIAL_LAYOUTS) {
+            let entry = (self.initial, 0);
+            self.initial += 1;
+            if self.mark(entry) {
+                return Some(entry);
+            }
+        }
+        let (form, choice) = incumbent;
+        let physical = (0..self.choices)
+            .map(|c| (form, c))
+            .find(|entry| !self.tried.contains(entry));
+        // Unvisited forms first; once every form has run, revisit them with the
+        // incumbent's choice.
+        let graph = (0..self.seeds)
+            .find(|&s| !self.visited_forms[s])
+            .map(|s| (s, choice))
+            .filter(|entry| !self.tried.contains(entry))
+            .or_else(|| {
+                (0..self.seeds)
+                    .map(|s| (s, choice))
+                    .find(|entry| !self.tried.contains(entry))
+            });
+        // Both axes exhausted around the incumbent: the remaining pairs,
+        // diagonally, for budgets large enough to cover them.
+        let rest = || {
+            (0..self.seeds + self.choices - 1)
+                .flat_map(|rank| (0..self.choices.min(rank + 1)).map(move |c| (rank - c, c)))
+                .find(|&(s, c)| s < self.seeds && !self.tried.contains(&(s, c)))
+        };
+        let entry = if self.physical_next {
+            physical.or(graph)
+        } else {
+            graph.or(physical)
+        }
+        .or_else(rest)?;
+        self.physical_next = !self.physical_next;
+        self.mark(entry);
+        Some(entry)
+    }
+
+    fn mark(&mut self, entry: (usize, usize)) -> bool {
+        self.visited_forms[entry.0] = true;
+        self.tried.insert(entry)
+    }
+
+    fn exhausted(&self) -> bool {
+        self.tried.len() == self.seeds * self.choices
+    }
 }
 
 fn implementations(
@@ -425,7 +490,7 @@ fn implementations(
     caps: crate::codegen::CoopCaps,
     shared_memory_bytes: u32,
     max_partial_bytes: usize,
-) -> impl Iterator<Item = measure::Program> {
+) -> Implementations {
     let cached_attention = seeds.iter().any(|p| {
         p.graph
             .nodes()
@@ -472,7 +537,7 @@ fn implementations(
             .first()
             .is_some_and(|seed| seed.options.fuse_dispatches),
     };
-    // Rank the first alternative on each axis and their interaction early.
+    // Rank the first alternative on each axis early.
     let cover = early_physical_cover(baseline, &attention);
     let mut seen = collections::HashSet::from([baseline]);
     seen.extend(cover.iter().copied());
@@ -491,35 +556,55 @@ fn implementations(
         })
         .filter(|&choice| seen.insert(choice))
         .collect();
-    let order = physical_program_order(seeds.len(), baseline, &cover, &tail);
-    let mut cursor = 0;
-    let mut split_plans = Vec::new();
-    let mut queued_splits = false;
-    std::iter::from_fn(move || {
+    let choices: Vec<_> = std::iter::once(baseline).chain(cover).chain(tail).collect();
+    let order = CoordinateOrder::new(seeds.len(), choices.len());
+    let split_plans = Vec::new();
+    Implementations {
+        order,
+        choices,
+        seeds,
+        caps,
+        shared_memory_bytes,
+        max_partial_bytes,
+        split_plans,
+        queued_splits: false,
+    }
+}
+
+/// Programs in [`CoordinateOrder`], lowered lazily.
+struct Implementations {
+    order: CoordinateOrder,
+    choices: Vec<AxisChoice>,
+    seeds: Vec<Seed>,
+    caps: crate::codegen::CoopCaps,
+    shared_memory_bytes: u32,
+    max_partial_bytes: usize,
+    split_plans: Vec<measure::Program>,
+    queued_splits: bool,
+}
+
+impl measure::Frontier for Implementations {
+    fn next(&mut self, incumbent: Option<measure::Origin>) -> Option<measure::Program> {
         loop {
-            if let Some(plan) = split_plans.pop() {
+            if let Some(plan) = self.split_plans.pop() {
                 return Some(plan);
             }
-            if !queued_splits && cursor > 0 {
-                queued_splits = true;
+            if !self.queued_splits && !self.order.tried.is_empty() {
+                self.queued_splits = true;
                 // After the ordinary incumbent. Popped in reverse, so 4 splits
                 // is measured before 8.
-                split_plans = low_occupancy_weight_splits(seeds.first(), max_partial_bytes);
-                split_plans.reverse();
-                if let Some(plan) = split_plans.pop() {
-                    return Some(plan);
-                }
+                self.split_plans =
+                    low_occupancy_weight_splits(self.seeds.first(), self.max_partial_bytes);
+                self.split_plans.reverse();
+                continue;
             }
-            if cursor == order.len() {
-                return None;
-            }
-            let (seed_index, current) = order[cursor];
-            cursor += 1;
-            let seed = seeds.get(seed_index)?;
+            let incumbent = incumbent.map_or((0, 0), |origin| (origin.form, origin.choice));
+            let (seed_index, choice_index) = self.order.next(incumbent)?;
+            let seed = &self.seeds[seed_index];
             let AxisChoice {
                 attention: (splits, flash),
                 fuse_dispatches,
-            } = current;
+            } = self.choices[choice_index];
             let plan = if splits == 0
                 && flash.is_none()
                 && fuse_dispatches == seed.options.fuse_dispatches
@@ -536,8 +621,12 @@ fn implementations(
                     options.knobs.flash = shape;
                     options.flash_forward_coop = false;
                 }
-                let plan =
-                    compile::compile_with_caps(&seed.graph, &options, caps, shared_memory_bytes);
+                let plan = compile::compile_with_caps(
+                    &seed.graph,
+                    &options,
+                    self.caps,
+                    self.shared_memory_bytes,
+                );
                 if plan == seed.plan
                     || (flash.is_some()
                         && !plan
@@ -556,9 +645,17 @@ fn implementations(
                 ),
                 plan,
                 submission_chunks: None,
+                origin: Some(measure::Origin {
+                    form: seed_index,
+                    choice: choice_index,
+                }),
             });
         }
-    })
+    }
+
+    fn may_remain(&self) -> bool {
+        !self.queued_splits || !self.split_plans.is_empty() || !self.order.exhausted()
+    }
 }
 
 /// Weight-gradient split-K for convolutions that launch only a few dozen
@@ -613,6 +710,7 @@ fn low_occupancy_weight_splits(
             ),
             plan,
             submission_chunks: None,
+            origin: None,
         });
     }
     programs
@@ -634,12 +732,15 @@ mod tests {
         };
         let cover = early_physical_cover(baseline, &[]);
         assert_eq!(cover, vec![unfused]);
-        let order = physical_program_order(8, baseline, &cover, &[]);
-        assert!(order[..4].contains(&(0, unfused)));
+        // Choice 1 is the unfused cover, measured on the incumbent's form
+        // right after the first layouts and one more form.
+        let mut order = CoordinateOrder::new(8, 2);
+        let visits: Vec<_> = std::iter::from_fn(|| order.next((0, 0))).collect();
+        assert!(visits[..5].contains(&(0, 1)));
         for seed in 0..8 {
-            for choice in [baseline, unfused] {
+            for choice in 0..2 {
                 assert_eq!(
-                    order
+                    visits
                         .iter()
                         .filter(|&&entry| entry == (seed, choice))
                         .count(),
@@ -647,6 +748,7 @@ mod tests {
                 );
             }
         }
+        assert!(order.exhausted());
         assert!(early_physical_cover(unfused, &[]).is_empty());
     }
 
@@ -672,8 +774,9 @@ mod tests {
             .collect();
         // Reserve half the ordinary 64-program allowance for submission probes.
         // Even with a full graph frontier, distinct attention layouts must fit.
-        let programs: Vec<_> = implementations(seeds, caps, 65536, 512 << 20)
-            .take(BuildSearchOptions::default().max_programs / 2)
+        let mut frontier = implementations(seeds, caps, 65536, 512 << 20);
+        let programs: Vec<_> = (0..BuildSearchOptions::default().max_programs / 2)
+            .map_while(|_| measure::Frontier::next(&mut frontier, None))
             .collect();
         assert!(programs.iter().all(|p| p.submission_chunks.is_none()));
         assert!(programs.iter().any(|p| {
@@ -684,6 +787,72 @@ mod tests {
                     .iter()
                     .any(|d| d.shader == compile::ShaderEntry::FlashAttention)
         }));
+        // The graph1 Whisper winner was absent from the old 64-program
+        // diagonal search. Reserve submission probes and still reach it.
+        assert!(programs.iter().any(|p| {
+            p.origin.is_some_and(|origin| origin.form == 0)
+                && p.plan.knobs.flash_ept_cap == 32
+                && p.plan.knobs.flash
+                    == crate::codegen::FlashAttentionShape {
+                        threads: 128,
+                        keys: 16,
+                        interleave: false,
+                    }
+        }));
+    }
+
+    #[test]
+    fn physical_choices_are_not_starved_by_many_graph_forms() {
+        // Whisper-like: a dozen forms and dozens of attention layouts under the
+        // default program bound. Half the budget goes to the incumbent's choices.
+        let mut order = CoordinateOrder::new(12, 72);
+        let budget = BuildSearchOptions::default().max_programs;
+        let visits: Vec<_> = (0..budget).map_while(|_| order.next((0, 0))).collect();
+        let choices = visits.iter().filter(|&&(form, _)| form == 0).count();
+        assert!(
+            choices >= budget / 2 - INITIAL_LAYOUTS,
+            "{choices} choices on form 0"
+        );
+        assert!((0..12).all(|form| visits.contains(&(form, 0))));
+    }
+
+    #[test]
+    fn coordinate_winners_carry_over() {
+        let mut order = CoordinateOrder::new(6, 5);
+        for _ in 0..INITIAL_LAYOUTS {
+            order.next((0, 0));
+        }
+        // Choice 3 won on form 0: the next untried form inherits it.
+        let next = std::iter::from_fn(|| order.next((0, 3)))
+            .find(|&(form, _)| form != 0)
+            .unwrap();
+        assert_eq!(next, (3, 3));
+        // Form 3 won: choices continue on it, skipping the one it ran with.
+        let next = std::iter::from_fn(|| order.next((3, 3)))
+            .find(|&(form, _)| form == 3)
+            .unwrap();
+        assert_eq!(next, (3, 0));
+    }
+
+    #[test]
+    fn coordinate_order_exhausts_each_pair_once_as_winners_change() {
+        for seeds in 0..8 {
+            for choices in 0..12 {
+                let mut order = CoordinateOrder::new(seeds, choices);
+                let mut incumbent = (0, 0);
+                let mut visited = collections::HashSet::new();
+                while let Some(entry) = order.next(incumbent) {
+                    assert!(entry.0 < seeds && entry.1 < choices);
+                    assert!(visited.insert(entry));
+                    if visited.len().is_multiple_of(3) {
+                        incumbent = entry;
+                    }
+                }
+                assert_eq!(visited.len(), seeds * choices);
+                assert!(order.exhausted());
+                assert!(order.next(incumbent).is_none());
+            }
+        }
     }
 
     #[test]
