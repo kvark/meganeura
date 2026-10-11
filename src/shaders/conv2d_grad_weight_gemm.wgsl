@@ -110,7 +110,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     for (var i = 0u; i < $TM_U; i++) {
         for (var j = 0u; j < $TM_U; j++) {
             let co = tile_row + ty * $TM_U + i;
-            let cikk = tile_col + tx * $TM_U + j;
+            let cikk = tile_col + $OUT_COL;
             if co < m_total && cikk < n_total {
                 dst[$OUTPUT_OFFSET co * n_total + cikk] = s[i][j];
             }

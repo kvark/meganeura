@@ -1120,8 +1120,22 @@ fn conv2d_tuned_kernels() {
         let mut feeds = Feeds::new();
         feeds.fill_random(g, 1600 + i as u64, 1.0);
         for kernel in [
-            Kernel::SpecializedConv { k_tile: 16 },
-            Kernel::SpecializedConv { k_tile: 32 },
+            Kernel::SpecializedConv {
+                k_tile: 16,
+                interleave_columns: false,
+            },
+            Kernel::SpecializedConv {
+                k_tile: 32,
+                interleave_columns: false,
+            },
+            Kernel::SpecializedConv {
+                k_tile: 16,
+                interleave_columns: true,
+            },
+            Kernel::SpecializedConv {
+                k_tile: 32,
+                interleave_columns: true,
+            },
             Kernel::Default,
         ] {
             let mut plan = meganeura::compile::compile(g);

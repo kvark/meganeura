@@ -825,7 +825,7 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         | ShaderGroup::Conv2dGemm16
         | ShaderGroup::Conv2dGradInputGemm
         | ShaderGroup::Conv2dGradInputGemmSmall
-        | ShaderGroup::Conv2dGradInputGemm16 => generate_conv_module(group, 16, None),
+        | ShaderGroup::Conv2dGradInputGemm16 => generate_conv_module(group, 16, false, None),
         ShaderGroup::Conv2dGemmCoop | ShaderGroup::Conv2dGradInputGemmCoop => {
             panic!(
                 "conv coop kernels are generated per (kernel, stride) via generate_conv2d_coop_module"
@@ -847,22 +847,22 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
             ShaderModule::new(include_str!("shaders/winograd_weight_transform.wgsl"))
         }
         ShaderGroup::Conv2dGradWeightGemm => {
-            conv_grad_weight_tiled(MatMulTile::Large, false, 16, None)
+            conv_grad_weight_tiled(MatMulTile::Large, false, 16, false, None)
         }
         ShaderGroup::Conv2dGradWeightGemmSmall => {
-            conv_grad_weight_tiled(MatMulTile::Small, false, 16, None)
+            conv_grad_weight_tiled(MatMulTile::Small, false, 16, false, None)
         }
         ShaderGroup::Conv2dGradWeightGemm16 => {
-            conv_grad_weight_tiled(MatMulTile::Occupancy, false, 16, None)
+            conv_grad_weight_tiled(MatMulTile::Occupancy, false, 16, false, None)
         }
         ShaderGroup::Conv2dGradWeightGemmSplit => {
-            conv_grad_weight_tiled(MatMulTile::Large, true, 16, None)
+            conv_grad_weight_tiled(MatMulTile::Large, true, 16, false, None)
         }
         ShaderGroup::Conv2dGradWeightGemmSplitSmall => {
-            conv_grad_weight_tiled(MatMulTile::Small, true, 16, None)
+            conv_grad_weight_tiled(MatMulTile::Small, true, 16, false, None)
         }
         ShaderGroup::Conv2dGradWeightGemmSplit16 => {
-            conv_grad_weight_tiled(MatMulTile::Occupancy, true, 16, None)
+            conv_grad_weight_tiled(MatMulTile::Occupancy, true, 16, false, None)
         }
         ShaderGroup::CacheWrite => ShaderModule::new(include_str!("shaders/cache_write.wgsl")),
         ShaderGroup::CacheWritePrefix => {
@@ -1223,17 +1223,18 @@ fn optimizer_module(source: &str) -> ShaderModule {
 pub(crate) fn generate_conv_module(
     group: ShaderGroup,
     k_tile: u32,
+    interleave_columns: bool,
     params: Option<&[u32]>,
 ) -> ShaderModule {
     let (source, tile) = match group {
         ShaderGroup::Conv2dGemm => {
-            return conv_forward_tiled(MatMulTile::Large, k_tile, params);
+            return conv_forward_tiled(MatMulTile::Large, k_tile, interleave_columns, params);
         }
         ShaderGroup::Conv2dGemmSmall => {
-            return conv_forward_tiled(MatMulTile::Small, k_tile, params);
+            return conv_forward_tiled(MatMulTile::Small, k_tile, interleave_columns, params);
         }
         ShaderGroup::Conv2dGemm16 => {
-            return conv_forward_tiled(MatMulTile::Occupancy, k_tile, params);
+            return conv_forward_tiled(MatMulTile::Occupancy, k_tile, interleave_columns, params);
         }
         ShaderGroup::Conv2dGradInputGemm => (
             include_str!("shaders/conv2d_grad_input_gemm.wgsl"),
@@ -1248,26 +1249,62 @@ pub(crate) fn generate_conv_module(
             MatMulTile::Occupancy,
         ),
         ShaderGroup::Conv2dGradWeightGemm => {
-            return conv_grad_weight_tiled(MatMulTile::Large, false, k_tile, params);
+            return conv_grad_weight_tiled(
+                MatMulTile::Large,
+                false,
+                k_tile,
+                interleave_columns,
+                params,
+            );
         }
         ShaderGroup::Conv2dGradWeightGemmSmall => {
-            return conv_grad_weight_tiled(MatMulTile::Small, false, k_tile, params);
+            return conv_grad_weight_tiled(
+                MatMulTile::Small,
+                false,
+                k_tile,
+                interleave_columns,
+                params,
+            );
         }
         ShaderGroup::Conv2dGradWeightGemm16 => {
-            return conv_grad_weight_tiled(MatMulTile::Occupancy, false, k_tile, params);
+            return conv_grad_weight_tiled(
+                MatMulTile::Occupancy,
+                false,
+                k_tile,
+                interleave_columns,
+                params,
+            );
         }
         ShaderGroup::Conv2dGradWeightGemmSplit => {
-            return conv_grad_weight_tiled(MatMulTile::Large, true, k_tile, params);
+            return conv_grad_weight_tiled(
+                MatMulTile::Large,
+                true,
+                k_tile,
+                interleave_columns,
+                params,
+            );
         }
         ShaderGroup::Conv2dGradWeightGemmSplitSmall => {
-            return conv_grad_weight_tiled(MatMulTile::Small, true, k_tile, params);
+            return conv_grad_weight_tiled(
+                MatMulTile::Small,
+                true,
+                k_tile,
+                interleave_columns,
+                params,
+            );
         }
         ShaderGroup::Conv2dGradWeightGemmSplit16 => {
-            return conv_grad_weight_tiled(MatMulTile::Occupancy, true, k_tile, params);
+            return conv_grad_weight_tiled(
+                MatMulTile::Occupancy,
+                true,
+                k_tile,
+                interleave_columns,
+                params,
+            );
         }
         _ => panic!("not an ordinary scalar convolution: {group:?}"),
     };
-    conv_gemm_tiled(source, tile, k_tile, params)
+    conv_gemm_tiled(source, tile, k_tile, interleave_columns, params)
 }
 
 /// All three implicit-GEMM conv skeletons stage A at stride K and B at
@@ -1276,6 +1313,7 @@ fn conv_gemm_tiled(
     src: &str,
     tile: MatMulTile,
     k_tile: u32,
+    interleave_columns: bool,
     params: Option<&[u32]>,
 ) -> ShaderModule {
     assert!(matches!(k_tile, 16 | 32));
@@ -1286,7 +1324,13 @@ fn conv_gemm_tiled(
     // column is never stored or read.
     let a_stride = k_tile + 1;
     let b_stride = bm + 1;
-    let (acc_decl, compute_body, acc_array) = tiled_gemm_body(tm, tm, a_stride, b_stride, false);
+    let (acc_decl, compute_body, acc_array) =
+        tiled_gemm_body(tm, tm, a_stride, b_stride, interleave_columns);
+    let out_col = if interleave_columns {
+        "tx + j * 16u".to_owned()
+    } else {
+        format!("tx * {tm}u + j")
+    };
     let (declaration, divisor) = if let Some(values) = params {
         assert_eq!(values.len(), 16, "Conv2dParams layout");
         let arguments = values.iter().map(|v| format!("{v}u")).collect::<Vec<_>>();
@@ -1321,6 +1365,7 @@ fn conv_gemm_tiled(
             ("$ACC_DECL", &acc_decl),
             ("$COMPUTE_BODY", &compute_body),
             ("$ACC_ARRAY", &acc_array),
+            ("$OUT_COL", &out_col),
         ],
     );
     ShaderModule::new(&src)
@@ -1330,7 +1375,12 @@ fn conv_gemm_tiled(
 /// across K stages. The uniform shader splits them once per thread, because
 /// its remainders divide by dynamic values. With constant divisors a split
 /// per stage is cheap, and it measured faster than carrying the digits.
-fn conv_forward_tiled(tile: MatMulTile, k_tile: u32, params: Option<&[u32]>) -> ShaderModule {
+fn conv_forward_tiled(
+    tile: MatMulTile,
+    k_tile: u32,
+    interleave_columns: bool,
+    params: Option<&[u32]>,
+) -> ShaderModule {
     let split = |start: &str| {
         format!(
             "var b_k = split_digits({start}tid / $BM_U, params.kernel_h, params.kernel_w, params.kernel_w_multiplier, params.kernel_hw_multiplier);"
@@ -1345,13 +1395,14 @@ fn conv_forward_tiled(tile: MatMulTile, k_tile: u32, params: Option<&[u32]>) -> 
         include_str!("shaders/conv2d_gemm.wgsl"),
         &[("$B_DIGITS_ONCE", &once), ("$B_DIGITS_STAGE", &per_stage)],
     );
-    conv_gemm_tiled(&source, tile, k_tile, params)
+    conv_gemm_tiled(&source, tile, k_tile, interleave_columns, params)
 }
 
 fn conv_grad_weight_tiled(
     tile: MatMulTile,
     split_k: bool,
     k_tile: u32,
+    interleave_columns: bool,
     params: Option<&[u32]>,
 ) -> ShaderModule {
     assert!(!split_k || k_tile == 16, "split-K partitioning uses K=16");
@@ -1381,7 +1432,7 @@ fn conv_grad_weight_tiled(
             ("$OUTPUT_OFFSET", offset),
         ],
     );
-    conv_gemm_tiled(&source, tile, k_tile, params)
+    conv_gemm_tiled(&source, tile, k_tile, interleave_columns, params)
 }
 
 /// Shared unroll generator for every register-tiled GEMM skeleton
@@ -3175,11 +3226,11 @@ mod tests {
     #[test]
     fn ordinary_weight_gradients_have_no_split_partition_logic() {
         for tile in [MatMulTile::Small, MatMulTile::Large] {
-            let ordinary = conv_grad_weight_tiled(tile, false, 16, None);
+            let ordinary = conv_grad_weight_tiled(tile, false, 16, false, None);
             assert!(!ordinary.source.contains("num_workgroups"));
             assert!(!ordinary.source.contains("k_end"));
             assert!(ordinary.source.contains("var t = 0u;"));
-            let split = conv_grad_weight_tiled(tile, true, 16, None);
+            let split = conv_grad_weight_tiled(tile, true, 16, false, None);
             assert!(split.source.contains("num_workgroups"));
             assert!(split.source.contains("var t = first * 16u;"));
         }
