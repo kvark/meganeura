@@ -4,6 +4,7 @@ use crate::schedule::{PointwiseDAG, Pw, ReductionEpilogue, ReductionKernel};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+mod bf16;
 mod params;
 mod softplus;
 mod split_k;
@@ -149,6 +150,10 @@ pub struct CompileOptions {
     /// Enable the experimental reduced-precision cooperative flash
     /// backward kernels.
     pub flash_backward_coop: bool,
+    /// Explicit BF16 forward matrices also use BF16 derivative operands with
+    /// F32 accumulation. No effect on ordinary F32 forward operations.
+    #[serde(default)]
+    pub bf16_matrix_gradients: bool,
     /// Starting workgroup geometry and cross-lane reduction for the K-split
     /// GEMV family, overriding each group's own default.
     ///
@@ -191,6 +196,7 @@ impl Default for CompileOptions {
             knobs: TuningKnobs::default(),
             flash_forward_coop: true,
             flash_backward_coop: false,
+            bf16_matrix_gradients: false,
             gemv_shape: None,
             cached_attention_splits: None,
             conv_weight_splits: None,
@@ -312,11 +318,12 @@ pub enum ShaderEntry {
     ToF16,
     ToBF16,
     FromBF16,
-    /// Explicit BF16 operands with F32 output and accumulation.
+    /// Explicit BF16 operands and F32 accumulation.
     MatMulBF16 {
         transpose_a: bool,
         transpose_b: bool,
         addend: bool,
+        output_bf16: bool,
     },
     RoPE,
     RoPEGrad,
@@ -622,10 +629,12 @@ impl ShaderEntry {
                 transpose_a,
                 transpose_b,
                 addend,
+                output_bf16,
             } => ShaderGroup::MatMulBF16 {
                 transpose_a,
                 transpose_b,
                 addend,
+                output_bf16,
             },
             ShaderEntry::RoPE => ShaderGroup::RoPE,
             ShaderEntry::RoPEGrad => ShaderGroup::RoPEGrad,
@@ -1194,6 +1203,10 @@ pub struct Dispatch {
     /// Storage format of the B (weight) input buffer.
     #[serde(default)]
     pub weight_format: WeightFormat,
+    /// Explicit BF16 conversion boundaries folded into a generated pointwise
+    /// kernel. Scalar arithmetic remains F32. Never inferred from a timing.
+    #[serde(default)]
+    pub pointwise_storage: crate::schedule::PointwiseStorage,
 }
 
 /// Mutually exclusive implementations. Bindings and launch geometry live on
@@ -1599,6 +1612,7 @@ impl ExecutionPlan {
             fuse_pointwise_chains(&mut self);
             fuse_reduction_chains(&mut self);
             fuse_row_scaled_scatters(&mut self);
+            bf16::fuse_boundaries(&mut self);
         }
         // RmsNorm+MatMul prologue fusion is applied later in the runtime,
         // after per-dispatch coop selection — the prologue path currently

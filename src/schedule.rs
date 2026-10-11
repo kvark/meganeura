@@ -640,7 +640,24 @@ pub fn lower(t: &KernelTemplate) -> ShaderModule {
     }
 }
 
+/// Storage only; generated scalar expressions and sensitive consumers stay F32.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PointwiseStorage {
+    /// Bit i marks input i as BF16. Unmarked inputs are F32.
+    pub bf16_inputs: u8,
+    pub bf16_output: bool,
+}
+
 fn lower_pointwise(dag: &PointwiseDAG, grid: GridShape) -> ShaderModule {
+    lower_pointwise_storage(dag, grid, PointwiseStorage::default())
+}
+
+pub fn lower_pointwise_storage(
+    dag: &PointwiseDAG,
+    grid: GridShape,
+    storage: PointwiseStorage,
+) -> ShaderModule {
+    assert_eq!(storage.bf16_inputs >> dag.n_inputs, 0);
     assert!(
         dag.n_inputs >= 1,
         "PointwiseDAG must have at least one input stream"
@@ -653,13 +670,23 @@ fn lower_pointwise(dag: &PointwiseDAG, grid: GridShape) -> ShaderModule {
     let input_names = PointwiseDAG::input_binding_names(dag.n_inputs);
 
     let mut src = String::new();
+    if storage != PointwiseStorage::default() {
+        src.push_str("enable wgpu_bfloat16;\n");
+        src.push_str(include_str!("shaders/bf16_round.wgsl"));
+    }
     src.push_str(
         "struct Params {\n    len: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n",
     );
-    for name in &input_names {
-        let _ = writeln!(src, "var<storage> {}: array<f32>;", name);
+    for (i, name) in input_names.iter().enumerate() {
+        let ty = if storage.bf16_inputs & (1 << i) != 0 {
+            "bf16"
+        } else {
+            "f32"
+        };
+        let _ = writeln!(src, "var<storage> {name}: array<{ty}>;");
     }
-    src.push_str("var<storage, read_write> dst: array<f32>;\n");
+    let ty = if storage.bf16_output { "bf16" } else { "f32" };
+    let _ = writeln!(src, "var<storage, read_write> dst: array<{ty}>;");
     src.push_str("var<uniform> params: Params;\n\n");
     let _ = writeln!(src, "@compute @workgroup_size({})", grid.workgroup_size);
     let _ = writeln!(
@@ -669,16 +696,23 @@ fn lower_pointwise(dag: &PointwiseDAG, grid: GridShape) -> ShaderModule {
     );
     src.push_str("    let i = gid.x;\n");
     src.push_str("    if i >= params.len { return; }\n");
+    let load = |idx: u8, index: String| {
+        let value = format!("{}[{index}]", input_names[idx as usize]);
+        if storage.bf16_inputs & (1 << idx) != 0 {
+            format!("f32({value})")
+        } else {
+            value
+        }
+    };
     src.push_str(&dag.emit_body_with(
-        |idx| format!("{}[i]", input_names[idx as usize]),
-        |idx, divisor, modulus| {
-            format!(
-                "{}[(i / {divisor}u) % {modulus}u]",
-                input_names[idx as usize]
-            )
-        },
+        |idx| load(idx, "i".into()),
+        |idx, divisor, modulus| load(idx, format!("(i / {divisor}u) % {modulus}u")),
     ));
-    let _ = writeln!(src, "    dst[i] = v{};", dag.output);
+    if storage.bf16_output {
+        let _ = writeln!(src, "    dst[i] = round_bf16(v{});", dag.output);
+    } else {
+        let _ = writeln!(src, "    dst[i] = v{};", dag.output);
+    }
     src.push_str("}\n");
 
     let module = naga::front::wgsl::parse_str(&src)
