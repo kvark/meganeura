@@ -21,6 +21,63 @@ cargo test --tests -- --test-threads=1
 cargo test --tests --all-features -- --test-threads=1
 ```
 
+## Android / Quest 3S
+
+Quest 3S qualification uses Vulkan on Adreno 740, Android 14 (API 34).
+The tested driver is `810c66ceb7, Idb4ff819d7, 1782305085` (2026-06-24).
+It exposes packed integer dot products and 64-lane subgroups, but neither
+native shader f16 nor cooperative matrices. Half storage is packed into
+32-bit words and decoded into f32; conversion uses explicit nearest-even
+rounding. Subgroup GEMV derives its subgroup count from the workgroup width
+and subgroup size. Packed Q4 reads and convolution index remainders use
+forms verified on this driver.
+
+The 2026-10-10 qualification passed 163 oracle, 146 regular regression,
+63 smoke, 22 GGUF, and 571 unit tests on the headset, including the opt-in
+smoke and unit checks. Another 12 opt-in regression checks passed, covering
+tuning, training state, and PyTorch ResNet/Whisper references. Six opt-in
+cooperative-matrix checks were inapplicable; regular tests also retain their
+hardware capability gates. The three host-only manifest checks and the full
+regular suite passed separately on Windows/RTX 3050.
+
+Strict-f32, untuned Inferena runs also passed forward and training comparisons
+for StableDiffusion, ResNet-50, SmolVLA, SmolLM2-135M, and Whisper-tiny. These
+compare 256 sampled output values, shapes, losses, and parameter-gradient norms
+against preserved PyTorch records. The separate oracle suite checks full
+elementwise results. Five timed samples follow warmup; this is not a paired
+performance comparison with the reference machine.
+
+Build with the Android NDK linker configured for `aarch64-linux-android`
+(the qualification used NDK r27 and `aarch64-linux-android29-clang`):
+
+```sh
+cargo test --release --target aarch64-linux-android \
+  --features models,gguf,profiler --lib --tests --no-run
+```
+
+Push each executable printed by Cargo to `/data/local/tmp/meganeura`,
+mark it executable, and run with `TMPDIR=/data/local/tmp/meganeura` and
+`--test-threads=1`. Run the smoke suite's three `harness_manifest::` checks
+on the host checkout; exclude that module from the device run. The ONNX
+fixtures are embedded. For the opt-in PyTorch comparisons, generate
+`scripts/gen_reference.py` on the host and copy its two JSON files into
+`bench/results` relative to the device test directory. Run the applicable
+`--ignored` tuning, staging, and gradient checks separately on an idle device.
+Native cooperative-matrix checks require different hardware. The optional
+`hf-hub` downloader is not needed: Android loads supplied model assets.
+
+For unattended Quest runs, save `settings get global stay_on_while_plugged_in`,
+then temporarily keep the plugged-in headset awake:
+
+```sh
+adb shell svc power stayon true
+adb shell am broadcast -a com.oculus.vrpowermanager.prox_close
+```
+
+After testing, broadcast
+`com.oculus.vrpowermanager.automation_disable` and restore the saved global
+setting. Use `adb -s <serial-or-ip:port>` when multiple transports are present.
+
 ## Check every op against its definition
 
 [`meganeura::reference`](../src/reference/mod.rs) is the written definition

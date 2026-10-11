@@ -167,10 +167,8 @@ fn vision_classifiers() {
 #[test]
 fn onnx_exports() {
     for name in ["bert_layer", "llama_layer", "llama_gqa_dynamic_layer"] {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/onnx")
-            .join(format!("{name}.onnx"));
-        let model = meganeura::load_onnx(&path).unwrap();
+        let bytes = crate::onnx_exports::fixture(&format!("{name}.onnx"));
+        let model = meganeura::load_onnx_bytes(bytes, None).unwrap();
         assert_parity(name, &model.graph, INFERENCE);
     }
 }

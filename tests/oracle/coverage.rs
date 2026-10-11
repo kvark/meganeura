@@ -185,8 +185,9 @@ fn op_variants() -> Vec<String> {
     let source = include_str!("../../src/graph.rs");
     let start = source.find("pub enum Op {").expect("Op enum");
     let body = &source[start..];
-    let body = &body[..body.find("\n}\n").expect("end of Op enum")];
+    assert!(body.lines().any(|line| line == "}"), "end of Op enum");
     body.lines()
+        .take_while(|line| *line != "}")
         .filter_map(|line| {
             let name = line.strip_prefix("    ")?;
             let first = name.chars().next()?;

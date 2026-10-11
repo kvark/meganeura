@@ -74,13 +74,13 @@ fn q40_scale(byte_base: u32) -> f32 {
 // count, which leaves `18 * blocks` two bytes short of a word and so gets
 // padded by exactly the two bytes needed.
 fn q40_nibbles(byte_base: u32, i: u32) -> u32 {
-    let at = byte_base + 2u + i * 4u;
-    let word = matrix_b[at / 4u];
-    let shift = (at % 4u) * 8u;
-    if shift == 0u {
-        return word;
-    }
-    return (word >> shift) | (matrix_b[at / 4u + 1u] << (32u - shift));
+    let at = byte_base / 4u + i;
+    let lo = matrix_b[at];
+    let hi = matrix_b[at + 1u];
+    // An even block starts halfway through `lo`; an odd block starts at
+    // `hi`. Keep the two fixed alignments explicit: Adreno miscompiles the
+    // early-return/dynamic-shift version inside the block accumulation loop.
+    return select((lo >> 16u) | (hi << 16u), hi, (byte_base & 2u) != 0u);
 }
 
 @compute @workgroup_size(LANES)

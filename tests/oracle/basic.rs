@@ -479,25 +479,62 @@ fn gated_units_and_their_gradients() {
 
 #[test]
 fn gathers_and_scatters() {
-    let (vocab, dim, seq) = (11, 6, 9);
+    let (vocab, seq) = (11, 9);
     let indices: Vec<u32> = vec![3, 0, 10, 3, 3, 7, 1, 10, 0];
-    case(
-        "embedding and scatter_add",
-        |g| {
-            let idx = g.input_u32("idx", &[seq]);
-            let table = g.parameter("table", &[vocab, dim]);
-            let src = g.input("src", &[seq, dim]);
-            let half = g.to_f16(table);
-            vec![
-                g.embedding(idx, table),
-                g.embedding_f16(idx, half),
-                g.scatter_add(idx, src, vocab),
-            ]
-        },
-        |f| {
-            f.set_u32("idx", &indices);
-        },
-    );
+    // Odd rows cross packed-half words; 11 * 47 crosses a packing workgroup.
+    for dim in [1, 5, 6, 47] {
+        case(
+            "embedding and scatter_add",
+            |g| {
+                let idx = g.input_u32("idx", &[seq]);
+                let table = g.parameter("table", &[vocab, dim]);
+                let src = g.input("src", &[seq, dim]);
+                let half = g.to_f16(table);
+                vec![
+                    g.embedding(idx, table),
+                    g.embedding_f16(idx, half),
+                    g.scatter_add(idx, src, vocab),
+                ]
+            },
+            |f| {
+                f.set_u32("idx", &indices);
+            },
+        );
+    }
+}
+
+#[test]
+fn half_storage_roundtrip() {
+    let mut values = Vec::new();
+    for bits in [
+        0, 0x007fffff, 0x00800000, 0x32ffffff, 0x33000000, 0x33000001, 0x33800000, 0x387fffff,
+        0x38800000, 0x3f800fff, 0x3f801000, 0x3f801001, 0x3f803000, 0x477fe000, 0x477fefff,
+        0x477ff000, 0x7f800000, 0x7fc00000,
+    ] {
+        values.push(f32::from_bits(bits));
+        values.push(f32::from_bits(bits | 0x80000000));
+    }
+    values.push(0.25); // Odd tail in the final packed word.
+    let mut g = Graph::new();
+    let table = g.parameter("table", &[1, values.len()]);
+    let indices = g.input_u32("indices", &[1]);
+    let half = g.to_f16(table);
+    let output = g.embedding_f16(indices, half);
+    g.set_outputs(vec![output]);
+    let config = meganeura::SessionConfig::inference_from_env_on(gpu::shared_context());
+    let mut session = meganeura::build(&g, config).0;
+    session.set_parameter("table", &values);
+    session.set_input_u32("indices", &[0]);
+    session.step();
+    session.wait();
+    for (actual, input) in session.read_output(values.len()).into_iter().zip(values) {
+        let expected = half::f16::from_f32(input).to_f32();
+        if expected.is_nan() {
+            assert!(actual.is_nan());
+        } else {
+            assert_eq!(actual.to_bits(), expected.to_bits(), "input {input:?}");
+        }
+    }
 }
 
 #[test]

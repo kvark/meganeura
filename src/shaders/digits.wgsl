@@ -11,9 +11,11 @@ struct Digits {
 fn split_digits(value: u32, middle_n: u32, inner_n: u32, inner_multiplier: u32, block_multiplier: u32) -> Digits {
     let block = middle_n * inner_n;
     let outer = divide_exact(value, block, block_multiplier);
-    let rest = value - outer * block;
+    // Explicit remainders avoid an Adreno miscompile of the equivalent
+    // multiply/subtract form in the tiled convolution staging loop.
+    let rest = value % block;
     let middle = divide_exact(rest, inner_n, inner_multiplier);
-    return Digits(outer, middle, rest - middle * inner_n);
+    return Digits(outer, middle, rest % inner_n);
 }
 
 // Both digits of `step` are below their radices, so one carry each suffices.

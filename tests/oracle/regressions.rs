@@ -169,7 +169,7 @@ fn mixed_attention_widths_in_one_session() {
 /// gradient into the f32 master parameter, with repeated indices.
 #[test]
 fn f16_embedding_trains_the_f32_master() {
-    let (vocab, seq, hidden) = (5, 12, 8);
+    let (vocab, seq, hidden) = (5, 12, 7);
     let mut g = Graph::new();
     let idx = g.input_u32("idx", &[seq]);
     let w = g.parameter("w", &[vocab, hidden]);

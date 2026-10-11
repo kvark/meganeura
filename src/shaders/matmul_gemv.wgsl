@@ -5,7 +5,6 @@
 // specialization slots, including in the integer-dot templates.
 
 // @section forward
-$ENABLE_F16
 struct Params {
     m: u32,
     n: u32,
@@ -47,7 +46,6 @@ $REDUCTION
 }
 
 // @section transposed
-$ENABLE_F16
 struct Params {
     m: u32,
     n: u32,
@@ -160,7 +158,10 @@ var<workgroup> inv_rms: f32;
     workgroupBarrier();
 
 // @section subgroup_reduce
-    // Actual subgroup IDs also cover partially populated subgroups.
+    // These one-dimensional workgroups fill consecutive subgroups, including
+    // a possible partial final subgroup. Derive the count: Adreno 740 can
+    // report num_subgroups = 1 even when multiple subgroups execute.
+    let wave_count = (LANES + wave_size - 1u) / wave_size;
     var group_total = subgroupAdd(acc);
     if wave_count > 1u {
         if sg_id == subgroupBroadcastFirst(sg_id) {
