@@ -261,10 +261,31 @@ impl Session {
         let mut staging = self
             .packed_concat_staging
             .remove(&derived_buf)
-            .unwrap_or_else(|| vec![0u8; expected]);
-        if staging.len() != expected {
-            staging = vec![0u8; expected];
-        }
+            .filter(|staging| staging.len() == expected)
+            .unwrap_or_else(|| {
+                // An inherited allocation can already contain its siblings'
+                // weights even though this session has no host staging yet.
+                // Preserve them when only one source is uploaded again.
+                if expected.is_multiple_of(4) {
+                    // Mapped device heaps can be slow to read from the CPU.
+                    let mut image = vec![0.0f32; expected / 4];
+                    self.read_staged_f32(
+                        self.buffers[derived_buf.0 as usize],
+                        &mut image,
+                        &mut self.readback.borrow_mut(),
+                    );
+                    bytemuck::cast_slice(&image).to_vec()
+                } else {
+                    assert!(self.logical_host_visible(derived_buf));
+                    unsafe {
+                        std::slice::from_raw_parts(
+                            self.buffers[derived_buf.0 as usize].data(),
+                            expected,
+                        )
+                        .to_vec()
+                    }
+                }
+            });
         let mut col_offset = 0usize;
         for src in sources {
             if src.0 == name {

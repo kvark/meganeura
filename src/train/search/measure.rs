@@ -642,6 +642,115 @@ mod tests {
     }
 
     #[test]
+    fn partial_reuploads_preserve_inherited_packed_parameters() {
+        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
+        let (rows, inner, cols) = (3, 32, 3);
+        let expected = 4.0 / (1.0 + (-4.0_f32).exp()) * 2.0;
+        for f16 in [true, false] {
+            let mut graph = crate::Graph::new();
+            let x = graph.input("x", &[rows, inner]);
+            let mut parameter = |name| {
+                if f16 {
+                    graph.parameter_f16(name, &[inner, cols])
+                } else {
+                    graph.parameter_q4(name, &[inner, cols])
+                }
+            };
+            let (gate, up) = (parameter("gate"), parameter("up"));
+            let (gate, up) = (graph.matmul(x, gate), graph.matmul(x, up));
+            let y = graph.swiglu(gate, up);
+            graph.set_outputs(vec![y]);
+            let (optimized, _) = crate::optimize::optimize_with_config(&graph, Default::default());
+            let plan = crate::compile::compile(&optimized);
+            assert_eq!(plan.derived_params.len(), 1);
+            for device in [false, true] {
+                let initialized = std::cell::Cell::new(0);
+                let skipped = std::cell::Cell::new(0);
+                let programs = (0..3).map(|index| Program {
+                    description: index.to_string(),
+                    plan: plan.clone(),
+                    submission_chunks: Some(1),
+                });
+                let (mut selected, report) = select(
+                    programs,
+                    gpu.clone(),
+                    SessionOptions {
+                        coop: crate::CoopPolicy::Disabled,
+                        device_parameters: device.then_some(blade_graphics::Memory::Device),
+                        ..Default::default()
+                    },
+                    BuildSearchOptions {
+                        tuning: TuneOptions {
+                            max_time: Duration::ZERO,
+                            sample_pairs: 4,
+                            ..Default::default()
+                        },
+                        min_improvement: 0.99,
+                        warmup_runs: 1,
+                        warmup_time: Duration::from_millis(1),
+                        max_time: Duration::from_secs(30),
+                        max_programs: 3,
+                        max_plan_bytes: 1 << 20,
+                        ..Default::default()
+                    },
+                    |s, incumbent| {
+                        let trial = initialized.get();
+                        initialized.set(trial + 1);
+                        s.set_input("x", &vec![0.25; rows * inner]);
+                        for (index, (name, value)) in
+                            [("gate", 0.5), ("up", 0.25)].into_iter().enumerate()
+                        {
+                            if let Some(donor) = incumbent.as_deref() {
+                                assert!(s.inherits_parameter(donor, name));
+                                // Each challenger reuploads one source, with
+                                // unchanged values, and skips its sibling.
+                                if index == trial % 2 {
+                                    skipped.set(skipped.get() + 1);
+                                    continue;
+                                }
+                            }
+                            let data = vec![value; inner * cols];
+                            if trial == 2 {
+                                let packed = if f16 {
+                                    data.iter()
+                                        .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+                                        .collect()
+                                } else {
+                                    crate::runtime::quantize_q4_0(&data, inner, cols)
+                                };
+                                s.set_parameter_packed(name, &packed);
+                            } else {
+                                s.set_parameter(name, &data);
+                            }
+                        }
+                        Ok(())
+                    },
+                    |s| {
+                        let actual = s.read_output(rows * cols);
+                        if actual.iter().all(|&v| (v - expected).abs() < 1e-5) {
+                            Ok(())
+                        } else {
+                            Err(format!("SwiGLU mismatch: {actual:?} vs {expected}"))
+                        }
+                    },
+                )
+                .unwrap();
+                assert_eq!(skipped.get(), 2);
+                assert_eq!(report.trials.len(), 3);
+                assert!(report.trials.iter().all(|t| t.outcome.qualified));
+                selected.step();
+                selected.wait();
+                assert!(
+                    selected
+                        .read_output(rows * cols)
+                        .iter()
+                        .all(|&v| (v - expected).abs() < 1e-5)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn later_searches_resume_shared_kernel_decisions() {
         let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
         let mut graph = crate::Graph::new();
