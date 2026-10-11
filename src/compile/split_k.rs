@@ -27,6 +27,42 @@ impl Dispatch {
 }
 
 impl ExecutionPlan {
+    /// Short partial sums avoid losing small contributions in long scalar
+    /// reductions, notably the vocabulary projection's input gradient.
+    /// Apply after cooperative selection; preserve explicitly pinned schedules
+    /// and kernels with epilogues that cannot be moved across the reduction.
+    pub(crate) fn split_long_scalar_products(&mut self) {
+        let mut budget = 32 * 1024 * 1024;
+        for index in (0..self.dispatches.len()).rev() {
+            let dispatch = &self.dispatches[index];
+            if dispatch.use_coop() {
+                continue;
+            }
+            let Some(class) = TuneClass::from_dispatch(dispatch, None)
+                .filter(|c| c.shader.is_matmul() && c.k >= 8192)
+            else {
+                continue;
+            };
+            let tile_size = match dispatch.kernel {
+                super::Kernel::Default => 64,
+                super::Kernel::SmallTile => 32,
+                _ => continue,
+            };
+            let shape = crate::codegen::ScalarMatmulShape {
+                tile_size,
+                tile_n: 0,
+                k_stage: 16,
+                interleave_columns: false,
+                unroll_k: false,
+            };
+            let splits = class.k.div_ceil(1024);
+            let buffers = self.buffers.len();
+            if self.split_matmul(index, shape, splits, budget).is_ok() {
+                budget -= self.buffers[buffers];
+            }
+        }
+    }
+
     /// Move an unfused cooperative f32 product to the shared-tile native
     /// 16x16 kernel. More than one K partition writes compact M*N partials
     /// that a following SumRows adds up. Preflights before mutating the plan.

@@ -6,6 +6,66 @@
 use meganeura::reference::{Feeds, gpu, gradients};
 use meganeura::{Graph, NodeId};
 
+/// A vocabulary-sized reduction must retain small terms between larger ones.
+/// A single f32 accumulator drifts enough to corrupt downstream gradients.
+#[test]
+fn long_scalar_products_retain_small_contributions() {
+    let (m, k, n) = (4, 49_155, 4);
+    for layout in 0..3 {
+        let mut g = Graph::new();
+        let a_shape = if layout == 1 { [k, m] } else { [m, k] };
+        let b_shape = if layout == 2 { [n, k] } else { [k, n] };
+        let a = g.input("a", &a_shape);
+        let b = g.parameter("b", &b_shape);
+        let out = match layout {
+            1 => g.matmul_at(a, b),
+            2 => g.matmul_bt(a, b),
+            _ => g.matmul(a, b),
+        };
+        g.set_outputs(vec![out]);
+        let mut av = vec![0.0; m * k];
+        let mut bv = vec![0.0; k * n];
+        for row in 0..m {
+            for inner in 0..k {
+                let index = if layout == 1 {
+                    inner * m + row
+                } else {
+                    row * k + inner
+                };
+                av[index] = (row + 1) as f32
+                    * match inner {
+                        0 => 1.0,
+                        last if last == k - 1 => -1.0,
+                        _ => 1e-5,
+                    };
+            }
+        }
+        for inner in 0..k {
+            for col in 0..n {
+                let index = if layout == 2 {
+                    col * k + inner
+                } else {
+                    inner * n + col
+                };
+                bv[index] = [0.5, 1.0, -1.0, 2.0][col];
+            }
+        }
+        let mut feeds = Feeds::new();
+        feeds.set("a", &av).set("b", &bv);
+        let options = gpu::Options {
+            coop: meganeura::CoopPolicy::Disabled,
+            tolerance: meganeura::reference::Tolerance {
+                floor: 0.0,
+                rtol: 1e-5,
+            },
+            ..Default::default()
+        };
+        gpu::check_inference(&g, &feeds, &options)
+            .unwrap()
+            .assert_passed(&format!("layout {layout}"));
+    }
+}
+
 /// A parameter added straight into an activation receives the upstream
 /// gradient unchanged, so its gradient buffer is the output of a pointwise
 /// dispatch that also feeds the activation's backward. Dispatch fusion used

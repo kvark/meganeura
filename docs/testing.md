@@ -43,9 +43,69 @@ regular suite passed separately on Windows/RTX 3050.
 Strict-f32, untuned Inferena runs also passed forward and training comparisons
 for StableDiffusion, ResNet-50, SmolVLA, SmolLM2-135M, and Whisper-tiny. These
 compare 256 sampled output values, shapes, losses, and parameter-gradient norms
-against preserved PyTorch records. The separate oracle suite checks full
+against preserved PyTorch CUDA records. The separate oracle suite checks full
 elementwise results. Five timed samples follow warmup; this is not a paired
 performance comparison with the reference machine.
+
+For full model qualification, `scripts/qualification/prepare.py` instruments an
+isolated copy of Inferena's Android runner. It reads every source parameter and
+input before warmup, then every inference/latency output, the actual GPU loss,
+and every canonical parameter gradient after the measured training step. The
+benchmark graphs and timed regions are preserved. Content-addressed blobs and
+SHA-256 manifests retain the exact device values, including integer token IDs.
+
+`scripts/qualification/compare.py` loads those parameters and inputs into the
+matching PyTorch CPU architectures. It checks the complete parameter/gradient
+inventory and layouts, handles tied weights, and compares every element. The
+acceptance limits are `1e-6 + 1e-4 * max(abs(reference))` for maximum error and
+`1e-6 + 1e-4 * rms(reference)` for RMS error, per tensor and for all gradients
+together. Elementwise `allclose` failures are reported separately; that is not
+the acceptance policy. CPU float64 arithmetic is the default oracle, using the
+exact f32 device values promoted to float64; the GPU remains strict f32.
+
+The complete five-model run passes this policy on Quest 3S. All inference and
+latency outputs, training losses, and the following gradients were compared:
+
+| Benchmark workload | Gradient tensors | Gradient elements |
+|---|---:|---:|
+| StableDiffusion conditioned U-Net | 181 | 10,928,768 |
+| ResNet-50, batch 4 | 108 | 25,530,472 |
+| SmolVLA action expert, 16 layers / 50 actions | 152 | 99,848,592 |
+| SmolLM2-135M, 128 tokens | 272 | 134,515,008 |
+| Whisper-tiny encoder, 1,500 positions | 66 | 7,632,384 |
+
+These checks found two issues missed by the sampled comparisons: SmolVLA's
+training builder used unmasked self-attention instead of inference's causal
+attention, and SmolLM2's vocabulary-projection backward accumulated 49,152
+terms sequentially. Training now shares SmolVLA's forward builder. Long scalar
+matrix products use bounded partial sums when eligible, reducing f32 rounding
+error; cooperative and explicitly selected schedules retain their kernels.
+The final SmolLM2 gradients pass against CPU float64. Three tensors still
+exceed this strict gate against CPU float32, which itself exceeds the same
+gate against CPU float64 for those tensors. The tolerance was not widened.
+After these fixes, 957 regular and 21 applicable opt-in checks passed on Quest;
+the full regular Windows/RTX 3050 suite passed 960 checks. The same six opt-in
+cooperative-matrix checks remain inapplicable to this headset.
+
+Prepare with an archived Android runner lockfile, build with the NDK linker,
+then use the PyTorch environment to run the capture and comparison:
+
+```sh
+python scripts/qualification/prepare.py --inferena ../inferena \
+  --output target/full-model-qualification/runner --lock /path/to/Cargo.lock
+cargo build --release --locked --target aarch64-linux-android \
+  --manifest-path target/full-model-qualification/runner/Cargo.toml
+python scripts/qualification/run.py --serial QUEST_ADB_SERIAL \
+  --binary target/full-model-qualification/runner/target/aarch64-linux-android/release/inferena-meganeura \
+  --runner target/full-model-qualification/runner --inferena ../inferena \
+  --output results/quest3s/model-qualification/new-run
+```
+
+The output directory must be new. Supply the SmolLM2-135M checkpoint under
+`/data/local/tmp/meganeura/models/SmolLM2-135M` first. Each run freezes the CPU
+architecture, exporter, dependency lockfile, source patch, and binary hash with
+its evidence. This qualifies the benchmark workloads' forward/loss/backward
+computations; it does not cover optimizer updates or every possible input.
 
 Build with the Android NDK linker configured for `aarch64-linux-android`
 (the qualification used NDK r27 and `aarch64-linux-android29-clang`):
