@@ -407,6 +407,8 @@ pub enum ShaderEntry {
     Conv2dGradWeightGemmSplit,
     Conv2dGradWeightGemmSplitSmall,
     Conv2dGradWeightGemmSplit16,
+    /// Cooperative weight gradient; Z partitions use the existing SumRows reduction.
+    Conv2dGradWeightGemmCoop,
     CacheWrite,
     CacheWritePrefix,
     CachedAttention,
@@ -503,6 +505,7 @@ impl ShaderEntry {
             | ShaderEntry::Conv2dGradWeightGemmSplit
             | ShaderEntry::Conv2dGradWeightGemmSplitSmall
             | ShaderEntry::Conv2dGradWeightGemmSplit16
+            | ShaderEntry::Conv2dGradWeightGemmCoop
             | ShaderEntry::Upsample2x
             | ShaderEntry::Upsample2xGrad
             | ShaderEntry::MaxPool2d
@@ -672,6 +675,7 @@ impl ShaderEntry {
             ShaderEntry::Conv2dGradInputGemm16 => ShaderGroup::Conv2dGradInputGemm16,
             ShaderEntry::Conv2dGradInputGemmCoopGen(..) => ShaderGroup::Conv2dGradInputGemmCoop,
             ShaderEntry::Conv2dGradWeightGemm => ShaderGroup::Conv2dGradWeightGemm,
+            ShaderEntry::Conv2dGradWeightGemmCoop => ShaderGroup::Conv2dGradWeightGemm,
             ShaderEntry::Conv2dGradWeightGemmSmall => ShaderGroup::Conv2dGradWeightGemmSmall,
             ShaderEntry::Conv2dGradWeightGemm16 => ShaderGroup::Conv2dGradWeightGemm16,
             ShaderEntry::Conv2dGradWeightGemmSplit => ShaderGroup::Conv2dGradWeightGemmSplit,
@@ -788,7 +792,8 @@ impl ShaderEntry {
             | ShaderEntry::Conv2dGradWeightGemm16
             | ShaderEntry::Conv2dGradWeightGemmSplit
             | ShaderEntry::Conv2dGradWeightGemmSplitSmall
-            | ShaderEntry::Conv2dGradWeightGemmSplit16 => "main",
+            | ShaderEntry::Conv2dGradWeightGemmSplit16
+            | ShaderEntry::Conv2dGradWeightGemmCoop => "main",
             ShaderEntry::CacheWrite => "main",
             ShaderEntry::CacheWritePrefix => "main",
             ShaderEntry::CachedAttention => "main",

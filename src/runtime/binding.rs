@@ -995,7 +995,8 @@ impl Session {
             | ShaderEntry::Conv2dGradWeightGemm16
             | ShaderEntry::Conv2dGradWeightGemmSplit
             | ShaderEntry::Conv2dGradWeightGemmSplitSmall
-            | ShaderEntry::Conv2dGradWeightGemmSplit16 => {
+            | ShaderEntry::Conv2dGradWeightGemmSplit16
+            | ShaderEntry::Conv2dGradWeightGemmCoop => {
                 pc.bind(
                     0,
                     &Conv2dGradWeightData {

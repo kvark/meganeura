@@ -12,6 +12,8 @@ use naga::Module;
 
 mod coop_tiled;
 pub use coop_tiled::{CooperativeMatmulShape, generate_tiled_coop_matmul};
+mod conv_weight;
+pub(crate) use conv_weight::generate_conv_weight_coop;
 
 /// Forward attention staging and lane layout, independent of the EPT cap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -4135,7 +4137,8 @@ mod tests {
                 | ShaderEntry::Conv2dGradWeightGemm16
                 | ShaderEntry::Conv2dGradWeightGemmSplit
                 | ShaderEntry::Conv2dGradWeightGemmSplitSmall
-                | ShaderEntry::Conv2dGradWeightGemmSplit16 => {
+                | ShaderEntry::Conv2dGradWeightGemmSplit16
+                | ShaderEntry::Conv2dGradWeightGemmCoop => {
                     vec!["grad_out", "src", "dst", "params"]
                 }
                 ShaderEntry::RoPEDynamic | ShaderEntry::RoPEPositions => {

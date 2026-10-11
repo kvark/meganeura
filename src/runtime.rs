@@ -1486,6 +1486,9 @@ impl Pipelines {
                 config.compensated = dispatch.use_coop_compensated();
                 use crate::codegen::Conv2dCoopDirection;
                 match dispatch.shader {
+                    ShaderEntry::Conv2dGradWeightGemmCoop => {
+                        crate::codegen::generate_conv_weight_coop(&config)
+                    }
                     ShaderEntry::Conv2dGemmCoopGen(kh, kw, stride) => {
                         crate::codegen::generate_conv2d_coop_module(
                             kh,
@@ -2107,7 +2110,8 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::Conv2dGradWeightGemm16
         | ShaderEntry::Conv2dGradWeightGemmSplit
         | ShaderEntry::Conv2dGradWeightGemmSplitSmall
-        | ShaderEntry::Conv2dGradWeightGemmSplit16 => Conv2dGradWeightData::layout(),
+        | ShaderEntry::Conv2dGradWeightGemmSplit16
+        | ShaderEntry::Conv2dGradWeightGemmCoop => Conv2dGradWeightData::layout(),
         ShaderEntry::RoPEDynamic | ShaderEntry::RoPEPositions => RoPEDynamicData::layout(),
         ShaderEntry::RoPEDynamicFactors => RoPEDynamicFactorsData::layout(),
         ShaderEntry::CacheWrite => CacheWriteData::layout(),

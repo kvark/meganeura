@@ -43,6 +43,292 @@ fn gpu() -> Arc<blade_graphics::Context> {
     gpu
 }
 
+fn weight_session(
+    s: Shape,
+    splits: u32,
+    gpu: &Arc<blade_graphics::Context>,
+    policy: CoopPolicy,
+    force: bool,
+) -> Session {
+    let [nx, _, ny] = s.sizes();
+    let mut graph = Graph::new();
+    let x = graph.input("x", &[nx]);
+    let dy = graph.input("dy", &[ny]);
+    let dw = graph.conv2d_grad_weight(
+        dy, x, s.ci, s.h, s.w, s.co, s.kh, s.kw, s.stride, s.ph, s.pw,
+    );
+    graph.set_outputs(vec![dw]);
+    let mut plan = meganeura::compile::compile(&graph);
+    assert_eq!(plan.dispatches.len(), 1);
+    if splits > 1 {
+        let bytes = s.sizes()[1] * splits as usize * 4;
+        plan.split_conv_weight_gradients(&[(0, splits)], bytes)
+            .unwrap();
+    }
+    if force {
+        let dispatch = &mut plan.dispatches[0];
+        let caps = meganeura::runtime::auto_tune(gpu, 0).coop_caps;
+        let tile = if caps.f32_tile > 0 {
+            caps.f32_tile
+        } else {
+            caps.f16_tile
+        } * 2;
+        assert!(tile > 0);
+        dispatch.shader = ShaderEntry::Conv2dGradWeightGemmCoop;
+        dispatch.kernel = meganeura::compile::Kernel::Cooperative;
+        dispatch.workgroups = [
+            s.co.div_ceil(tile),
+            s.ci.div_ceil(tile),
+            splits * s.kh * s.kw,
+        ];
+    }
+    Session::with_context_opts(
+        plan,
+        Arc::clone(gpu),
+        SessionOptions {
+            coop: policy,
+            ..Default::default()
+        },
+    )
+}
+
+fn qualification_device(gpu: &blade_graphics::Context) {
+    if let Ok(expected) = std::env::var("MEGANEURA_EXPECT_DEVICE_NAME") {
+        assert_eq!(gpu.device_information().device_name, expected);
+        let memory = gpu.memory_stats();
+        assert!(memory.budget.saturating_sub(memory.usage) >= 2 * 1024 * 1024 * 1024);
+    }
+}
+
+#[test]
+fn cooperative_weight_gradient_matches_f64() {
+    let gpu = gpu();
+    qualification_device(&gpu);
+    let caps = meganeura::runtime::auto_tune(&gpu, 0).coop_caps;
+    if caps.f32_tile == 0 && caps.f16_tile == 0 {
+        return;
+    }
+    let shapes = [
+        (
+            Shape {
+                batch: 11,
+                ci: 7,
+                h: 13,
+                w: 9,
+                co: 17,
+                kh: 3,
+                kw: 2,
+                stride: 2,
+                ph: 1,
+                pw: 2,
+            },
+            17,
+        ),
+        (
+            Shape {
+                batch: 3,
+                ci: 3,
+                h: 9,
+                w: 11,
+                co: 5,
+                kh: 2,
+                kw: 4,
+                stride: 1,
+                ph: 1,
+                pw: 2,
+            },
+            7,
+        ),
+        (
+            Shape {
+                batch: 2,
+                ci: 1,
+                h: 1,
+                w: 1,
+                co: 1,
+                kh: 1,
+                kw: 1,
+                stride: 1,
+                ph: 0,
+                pw: 0,
+            },
+            1,
+        ),
+        (
+            Shape {
+                batch: 2,
+                ci: 33,
+                h: 9,
+                w: 7,
+                co: 35,
+                kh: 5,
+                kw: 5,
+                stride: 1,
+                ph: 2,
+                pw: 2,
+            },
+            3,
+        ),
+    ];
+    for (s, splits) in shapes {
+        let [nx, nw, ny] = s.sizes();
+        let round = |values: Vec<f32>| {
+            values
+                .into_iter()
+                .map(|v| {
+                    if caps.f32_tile == 0 {
+                        half::f16::from_f32(v).to_f32()
+                    } else {
+                        v
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let x = round(data(nx, 7, 1.0));
+        let dy = round(data(ny, 37, 1.0));
+        let expected = reference(s, &x, &vec![0.0; nw], &dy).2;
+        let mut session = weight_session(s, splits, &gpu, CoopPolicy::AllowF16, true);
+        assert_eq!(
+            session.plan().dispatches[0].shader,
+            ShaderEntry::Conv2dGradWeightGemmCoop
+        );
+        session.set_input("x", &x);
+        session.set_input("dy", &dy);
+        session.step();
+        session.wait();
+        check(
+            &format!("cooperative dW {s:?} split={splits}"),
+            &session.read_output(nw),
+            &expected,
+            1.0,
+        );
+        qualification_device(&gpu);
+    }
+}
+
+#[test]
+#[ignore = "resident hot-shape throughput, run separately from correctness/build work"]
+fn cooperative_weight_gradient_hot_shapes() {
+    let gpu = gpu();
+    qualification_device(&gpu);
+    let caps = meganeura::runtime::auto_tune(&gpu, 0).coop_caps;
+    assert!(caps.f16_tile > 0 || caps.f32_tile > 0);
+    for (batch, ci, hw, co, splits) in [(512, 32, 32, 48, 128), (128, 32, 64, 3, 128)] {
+        let s = Shape {
+            batch,
+            ci,
+            h: hw,
+            w: hw,
+            co,
+            kh: 5,
+            kw: 5,
+            stride: 1,
+            ph: 2,
+            pw: 2,
+        };
+        let [nx, nw, ny] = s.sizes();
+        let round = |values: Vec<f32>| {
+            values
+                .into_iter()
+                .map(|v| half::f16::from_f32(v).to_f32())
+                .collect::<Vec<_>>()
+        };
+        let x = round(data(nx, 7, 1.0));
+        let dy = round(data(ny, 37, 1.0));
+        let mut baseline = Vec::new();
+        for policy in [CoopPolicy::Disabled, CoopPolicy::AllowF16] {
+            let mut session = weight_session(s, splits, &gpu, policy, false);
+            let cooperative =
+                session.plan().dispatches[0].shader == ShaderEntry::Conv2dGradWeightGemmCoop;
+            assert_eq!(cooperative, policy == CoopPolicy::AllowF16);
+            session.set_input("x", &x);
+            session.set_input("dy", &dy);
+            for _ in 0..8 {
+                session.step();
+                session.wait();
+            }
+            let mut times = Vec::new();
+            for _ in 0..32 {
+                let start = std::time::Instant::now();
+                session.step();
+                session.wait();
+                times.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            times.sort_by(f64::total_cmp);
+            let output = session.read_output(nw);
+            assert!(output.iter().all(|x| x.is_finite()));
+            if baseline.is_empty() {
+                baseline = output.iter().map(|&v| f64::from(v)).collect();
+            }
+            let error = output
+                .iter()
+                .zip(&baseline)
+                .map(|(&a, &b)| (f64::from(a) - b).powi(2))
+                .sum::<f64>();
+            let norm = baseline.iter().map(|v| v * v).sum::<f64>();
+            let relative_l2 = (error / norm).sqrt();
+            assert!(relative_l2 < 2e-4, "rounded-input parity: {relative_l2}");
+            qualification_device(&gpu);
+            println!(
+                "{}",
+                serde_json::json!({"shape": [batch, ci, hw, co], "splits": splits,
+                "cooperative": cooperative, "median_ms": (times[15] + times[16]) * 0.5,
+                "relative_l2": relative_l2})
+            );
+        }
+    }
+}
+
+#[test]
+fn cooperative_weight_gradient_strict_range() {
+    let gpu = gpu();
+    qualification_device(&gpu);
+    let s = Shape {
+        batch: 8,
+        ci: 32,
+        h: 8,
+        w: 8,
+        co: 48,
+        kh: 3,
+        kw: 3,
+        stride: 1,
+        ph: 1,
+        pw: 1,
+    };
+    let [nx, nw, ny] = s.sizes();
+    let (plan, _) = plan(s, 32, 8);
+    let mut session = Session::with_context_opts(
+        plan,
+        Arc::clone(&gpu),
+        SessionOptions {
+            coop: CoopPolicy::Auto,
+            ..Default::default()
+        },
+    );
+    if meganeura::runtime::auto_tune(&gpu, 0).coop_caps.f32_tile == 0 {
+        assert!(
+            !session
+                .plan()
+                .dispatches
+                .iter()
+                .any(|d| d.shader == ShaderEntry::Conv2dGradWeightGemmCoop)
+        );
+    }
+    let x = data(nx, 7, 1.0);
+    let w = data(nw, 19, 1.0);
+    let dy = data(ny, 37, 1e-12);
+    let expected = reference(s, &x, &w, &dy).2;
+    session.set_parameter("x", &x);
+    session.set_parameter("w", &w);
+    session.set_input("dy", &dy);
+    session.step();
+    session.wait();
+    let mut actual = vec![0.0; nw];
+    session.read_param_grad("w", &mut actual);
+    check("strict dW keeps small gradients", &actual, &expected, 1e-12);
+    qualification_device(&gpu);
+}
+
 fn data(n: usize, seed: u32, scale: f32) -> Vec<f32> {
     let mut state = seed;
     (0..n)
