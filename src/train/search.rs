@@ -20,7 +20,8 @@ const INITIAL_LAYOUTS: usize = 3;
 pub struct BuildSearchOptions {
     /// Bound on graph/implementation forms, including ordinary extraction.
     pub max_graphs: usize,
-    /// Per-program kernel tuning and shared paired sampling policy.
+    /// Per-challenger kernel tuning and shared paired sampling policy.
+    /// The initial fallback always retains its ordinary kernels.
     pub tuning: TuneOptions,
     /// Minimum whole-program improvement, in addition to the timing noise margin.
     /// Independent of the private kernel threshold in `tuning`.
@@ -36,6 +37,8 @@ pub struct BuildSearchOptions {
     /// start one when even its cheapest recent complete comparison would not
     /// finish in time.
     pub max_time: Duration,
+    /// Includes the initial untuned fallback and its tuned challenger. One
+    /// returns only the fallback, without probing or applying kernel decisions.
     pub max_programs: usize,
     /// Stop once this many consecutive trials have not replaced the incumbent.
     /// `None` searches until another bound ends it.
@@ -106,7 +109,10 @@ pub struct BuildSearchReport {
 ///
 /// The runner executes one step before each read-only `qualify` call. Check every
 /// observable output, gradient and persistent update against your numerical
-/// contract. Every program is qualified after kernel tuning, before it is timed;
+/// contract. The ordinary untuned program is qualified first and retained as
+/// the initial incumbent. Its tuned version, including memoized decisions,
+/// must win a whole-program comparison to replace it. Every challenger is
+/// qualified after kernel tuning, before it is timed;
 /// one with kernel classes left to probe is also qualified before tuning. A
 /// winning challenger is qualified again after measurement. The selected program
 /// is checked before returning only if another challenger ran since its last
@@ -125,8 +131,10 @@ pub struct BuildSearchReport {
 /// equalities. Lowering emits the extracted schedule. Complete plans vary
 /// dispatch fusion, cached-attention splits, low-occupancy convolution
 /// weight-gradient splits, and caller-enabled submission chunk counts. Unlocked
-/// dispatches are kernel-tuned before comparison. This bounded search does not
-/// promise a global optimum.
+/// dispatches are kernel-tuned before comparison, reserving estimated time for
+/// whole-program warmup, sampling and qualification within the common deadline.
+/// Private kernel wins alone never replace the incumbent. This bounded search
+/// does not promise a global optimum.
 /// After the first layouts, alternate layout exploration with submission probes
 /// on the incumbent. A winning layout reopens those probes; later layouts inherit
 /// its measured count rather than expanding a layout/submission cross product.

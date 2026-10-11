@@ -695,6 +695,18 @@ impl Session {
         (classes, excluded_dispatches)
     }
 
+    /// Whether tuning can probe or reuse any eligible kernel choices.
+    pub(crate) fn has_tunable_kernels(&self, options: &TuneOptions) -> bool {
+        !options.max_time.is_zero()
+            && options.max_classes != 0
+            && self
+                .tune_classes(options)
+                .0
+                .iter()
+                .take(options.max_classes)
+                .any(|class| !class.challengers.is_empty())
+    }
+
     /// Whether [`Self::tune_with_memo`] under `options` would measure a
     /// challenger that `memo` has not already decided. Memoized classes only
     /// install their recorded winners, which is cheap next to probing.
