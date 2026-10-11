@@ -141,11 +141,37 @@ pub struct BuildSearchReport {
 ///
 /// `options.tuning` replaces `cfg.tune`. Build-plan caching is not yet supported:
 /// calibration data and measured policy are not part of the ordinary cache key.
+/// Inputs remain resident between steps. When deployment uploads inputs before
+/// each step, use [`build_measured_with_inputs`] to measure the same workload.
 pub fn build_measured(
+    forward_graph: &Graph,
+    cfg: SessionConfig<'_>,
+    options: BuildSearchOptions,
+    initialize: impl FnMut(&mut Session, Option<&mut Session>) -> Result<(), String>,
+    qualify: impl FnMut(&Session) -> Result<(), String>,
+) -> Result<(Session, BuildSearchReport), String> {
+    build_measured_with_inputs(forward_graph, cfg, options, initialize, |_| Ok(()), qualify)
+}
+
+/// Measured construction with representative input uploads before every step.
+///
+/// Follows [`build_measured`]'s qualification and state contract. After restoring
+/// persistent state, `refresh_inputs` must upload the same representative inputs
+/// for each qualification, warmup and timing execution. It must not modify
+/// parameters, optimizer configuration or other session state. Its time is
+/// outside execution samples but inside the common search deadline and recorded
+/// in [`BuildSearchTrial::input_refresh_time`] (the final incumbent refresh is
+/// part of [`BuildSearchReport::final_qualification_time`]). A refresh failure
+/// rejects the challenger; failure on the final incumbent invalidates construction.
+///
+/// Match how the application feeds inputs: host uploads can change subsequent
+/// execution costs even when the upload itself is outside the step timer.
+pub fn build_measured_with_inputs(
     forward_graph: &Graph,
     mut cfg: SessionConfig<'_>,
     options: BuildSearchOptions,
     initialize: impl FnMut(&mut Session, Option<&mut Session>) -> Result<(), String>,
+    refresh_inputs: impl FnMut(&mut Session) -> Result<(), String>,
     qualify: impl FnMut(&Session) -> Result<(), String>,
 ) -> Result<(Session, BuildSearchReport), String> {
     let start = Instant::now();
@@ -304,8 +330,7 @@ pub fn build_measured(
             ..Default::default()
         },
         start,
-        initialize,
-        qualify,
+        (initialize, refresh_inputs, qualify),
     )
 }
 

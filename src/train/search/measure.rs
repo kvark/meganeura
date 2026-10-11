@@ -56,6 +56,8 @@ pub struct BuildSearchTrial {
     /// Full session construction, including allocations, not shader-only compile time.
     pub construction_time: Duration,
     pub initialization_time: Duration,
+    /// Per-step input preparation, excluded from execution samples.
+    pub input_refresh_time: Duration,
     /// State capture and restoration, excluded from execution samples.
     pub state_copy_time: Duration,
     pub snapshot_bytes: usize,
@@ -93,8 +95,26 @@ fn restore(
     result
 }
 
-fn run(session: &mut Session, state: &SearchState, elapsed: &mut Duration) -> Result<f64, String> {
-    restore(session, state, elapsed)?;
+fn prepare(
+    session: &mut Session,
+    state: &SearchState,
+    trial: &mut BuildSearchTrial,
+    refresh_inputs: &mut impl FnMut(&mut Session) -> Result<(), String>,
+) -> Result<(), String> {
+    restore(session, state, &mut trial.state_copy_time)?;
+    let start = Instant::now();
+    let result = refresh_inputs(session);
+    trial.input_refresh_time += start.elapsed();
+    result
+}
+
+fn run(
+    session: &mut Session,
+    state: &SearchState,
+    trial: &mut BuildSearchTrial,
+    refresh_inputs: &mut impl FnMut(&mut Session) -> Result<(), String>,
+) -> Result<f64, String> {
+    prepare(session, state, trial, refresh_inputs)?;
     let start = Instant::now();
     session.step();
     session.wait();
@@ -105,10 +125,11 @@ fn validate(
     session: &mut Session,
     state: &SearchState,
     trial: &mut BuildSearchTrial,
+    refresh_inputs: &mut impl FnMut(&mut Session) -> Result<(), String>,
     check: &mut impl FnMut(&Session) -> Result<(), String>,
 ) -> Result<Duration, String> {
-    let copy_before = trial.state_copy_time;
-    restore(session, state, &mut trial.state_copy_time)?;
+    let preparation_before = trial.state_copy_time + trial.input_refresh_time;
+    prepare(session, state, trial, refresh_inputs)?;
     let start = Instant::now();
     session.step();
     session.wait();
@@ -117,7 +138,8 @@ fn validate(
     trial.qualification_time += start.elapsed();
     trial.qualifications += 1;
     restore(session, state, &mut trial.state_copy_time)?;
-    result.map(|()| execution + trial.state_copy_time - copy_before)
+    result
+        .map(|()| execution + trial.state_copy_time + trial.input_refresh_time - preparation_before)
 }
 
 fn comparison_reserve(
@@ -126,7 +148,8 @@ fn comparison_reserve(
     qualification: Duration,
 ) -> Duration {
     // Allow each challenger execution twice the observed incumbent cost.
-    // State restoration is included in `step`; readback/checking is not.
+    // State restoration and input refresh are included in `step`;
+    // readback/checking is not.
     let pair = step.saturating_mul(3);
     options
         .warmup_time
@@ -141,9 +164,13 @@ pub(super) fn select(
     runtime: SessionOptions,
     mut report: BuildSearchReport,
     start: Instant,
-    mut initialize: impl FnMut(&mut Session, Option<&mut Session>) -> Result<(), String>,
-    mut qualify: impl FnMut(&Session) -> Result<(), String>,
+    callbacks: (
+        impl FnMut(&mut Session, Option<&mut Session>) -> Result<(), String>,
+        impl FnMut(&mut Session) -> Result<(), String>,
+        impl FnMut(&Session) -> Result<(), String>,
+    ),
 ) -> Result<(Session, BuildSearchReport), String> {
+    let (mut initialize, mut refresh_inputs, mut qualify) = callbacks;
     let options = report.options.clone();
     options
         .tuning
@@ -241,6 +268,7 @@ pub(super) fn select(
             lowering_time,
             construction_time: Duration::ZERO,
             initialization_time: Duration::ZERO,
+            input_refresh_time: Duration::ZERO,
             state_copy_time: Duration::ZERO,
             snapshot_bytes: 0,
             qualification_time: Duration::ZERO,
@@ -288,8 +316,13 @@ pub(super) fn select(
                     if !policy.max_time.is_zero()
                         && candidate.kernel_probes_pending(&policy, Some(kernels))
                     {
-                        step =
-                            step.max(validate(&mut candidate, &state, &mut trial, &mut qualify)?);
+                        step = step.max(validate(
+                            &mut candidate,
+                            &state,
+                            &mut trial,
+                            &mut refresh_inputs,
+                            &mut qualify,
+                        )?);
                     }
                     let qualification = incumbent_qualification.max(trial.qualification_time);
                     trial.comparison_time_reserved =
@@ -306,7 +339,13 @@ pub(super) fn select(
                             .map_err(|error| error.to_string())?,
                     );
                 }
-                let step = validate(&mut candidate, &state, &mut trial, &mut qualify)?;
+                let step = validate(
+                    &mut candidate,
+                    &state,
+                    &mut trial,
+                    &mut refresh_inputs,
+                    &mut qualify,
+                )?;
                 trial.outcome.qualified = true;
                 if let Some((ref mut baseline, ref baseline_state)) = incumbent {
                     let warmup_start = Instant::now();
@@ -317,8 +356,8 @@ pub(super) fn select(
                         if start.elapsed() >= options.max_time {
                             break;
                         }
-                        run(baseline, baseline_state, &mut trial.state_copy_time)?;
-                        run(&mut candidate, &state, &mut trial.state_copy_time)?;
+                        run(baseline, baseline_state, &mut trial, &mut refresh_inputs)?;
+                        run(&mut candidate, &state, &mut trial, &mut refresh_inputs)?;
                         warmed += 1;
                     }
                     let mut failure = None;
@@ -328,9 +367,9 @@ pub(super) fn select(
                                 return None;
                             }
                             let result = if alternative {
-                                run(&mut candidate, &state, &mut trial.state_copy_time)
+                                run(&mut candidate, &state, &mut trial, &mut refresh_inputs)
                             } else {
-                                run(baseline, baseline_state, &mut trial.state_copy_time)
+                                run(baseline, baseline_state, &mut trial, &mut refresh_inputs)
                             };
                             match result {
                                 Ok(ms) if start.elapsed() < options.max_time => Some(ms),
@@ -350,7 +389,13 @@ pub(super) fn select(
                     // winner after its repeated execution, before it replaces
                     // the incumbent.
                     if trial.outcome.selected == index {
-                        validate(&mut candidate, &state, &mut trial, &mut qualify)?;
+                        validate(
+                            &mut candidate,
+                            &state,
+                            &mut trial,
+                            &mut refresh_inputs,
+                            &mut qualify,
+                        )?;
                     }
                 } else {
                     trial.outcome.selected = index;
@@ -447,6 +492,8 @@ pub(super) fn select(
     if !incumbent_checked {
         let check = Instant::now();
         state.restore(&mut session)?;
+        refresh_inputs(&mut session)
+            .map_err(|error| format!("incumbent input refresh failed: {error}"))?;
         session.step();
         session.wait();
         let result = qualify(&session);
@@ -481,8 +528,7 @@ mod tests {
                 ..Default::default()
             },
             Instant::now(),
-            initialize,
-            qualify,
+            (initialize, |_| Ok(()), qualify),
         )
     }
     #[test]
@@ -1057,6 +1103,92 @@ mod tests {
             submission_chunks: Some(1),
             origin: None,
         })
+    }
+
+    #[test]
+    fn refreshes_inputs_for_every_execution_and_rejects_failed_refreshes() {
+        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
+        for fail_challenger in [false, true] {
+            let mut refreshed = 0;
+            let mut checked = 0;
+            let programs = identical_programs(2).map(|mut program| {
+                program.plan.dispatches[0].label = program.description.clone();
+                program
+            });
+            let options = BuildSearchOptions {
+                tuning: TuneOptions {
+                    sample_pairs: 4,
+                    ..Default::default()
+                },
+                max_programs: 2,
+                max_time: Duration::from_secs(30),
+                min_improvement: 0.99,
+                warmup_runs: 2,
+                warmup_time: Duration::ZERO,
+                ..Default::default()
+            };
+            let (mut session, report) = super::select(
+                programs.fuse(),
+                gpu.clone(),
+                SessionOptions::default(),
+                BuildSearchReport {
+                    options,
+                    ..Default::default()
+                },
+                Instant::now(),
+                (
+                    |session: &mut Session, _: Option<&mut Session>| {
+                        // Qualification cannot pass without the refresh callback.
+                        session.set_input("x", &[99.0; 4]);
+                        Ok(())
+                    },
+                    |session: &mut Session| {
+                        refreshed += 1;
+                        if fail_challenger && session.plan().dispatches[0].label == "1" {
+                            return Err("injected input refresh failure".into());
+                        }
+                        session.set_input("x", &[1.0, 2.0, 3.0, 4.0]);
+                        Ok(())
+                    },
+                    |session: &Session| {
+                        checked += 1;
+                        assert_eq!(session.read_output(4), [-1.0, -2.0, -3.0, -4.0]);
+                        Ok(())
+                    },
+                ),
+            )
+            .unwrap();
+            assert_eq!(report.selected, 0);
+            assert!(
+                report
+                    .trials
+                    .iter()
+                    .all(|t| !t.input_refresh_time.is_zero())
+            );
+            if fail_challenger {
+                assert_eq!(refreshed, 3);
+                assert_eq!(checked, 2);
+                assert_eq!(
+                    report.trials[1].outcome.decision,
+                    TuneDecision::InvalidOutput
+                );
+                assert!(
+                    report.trials[1]
+                        .outcome
+                        .failure
+                        .as_ref()
+                        .unwrap()
+                        .contains("input refresh")
+                );
+            } else {
+                assert_eq!(refreshed, checked + 2 * 2 + 2 * 4);
+                assert_eq!(report.trials[1].outcome.baseline_ms.len(), 4);
+                assert_eq!(report.trials[1].outcome.candidate_ms.len(), 4);
+            }
+            session.step();
+            session.wait();
+            assert_eq!(session.read_output(4), [-1.0, -2.0, -3.0, -4.0]);
+        }
     }
 
     fn stop_rule_search(
