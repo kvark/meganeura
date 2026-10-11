@@ -599,6 +599,27 @@ fn full_forward() {
     forward_sweep(&[Kind::Full], SELF_SHAPES);
 }
 
+#[test]
+fn block_causal_forward() {
+    let s = shape(5, 5, 2, 2, 8);
+    let mut g = Graph::new();
+    let q = g.input("q", &[s.q, s.q_width()]);
+    let k = g.input("k", &[s.kv, s.kv_width()]);
+    let v = g.input("v", &[s.kv, s.kv_width()]);
+    let out = g.block_causal_attention(q, k, v, s.heads, s.kv_heads, s.dim, 2);
+    g.set_outputs(vec![out]);
+
+    let feeds = random(&g, 20261011);
+    let mut sweep = Sweep::default();
+    sweep.inference(
+        "block causal prefix=2",
+        &g,
+        &feeds,
+        &gpu::Options::default(),
+    );
+    sweep.finish();
+}
+
 /// `full_attention` and `cross_attention` lower exactly as
 /// `multi_head_attn`'s self and cross forms (checked on the host by
 /// `attention_wrappers_build_identical_plans`), so the shape sweeps run one

@@ -84,8 +84,8 @@ fn with_positions(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // Three-axis, adjacent-pair RoPE used by image diffusion transformers.
-// `pos_offset_buf` is `[seq, 3]`; negative coordinates are passed as the
-// two's-complement bit pattern of an i32.
+// `pos_offset_buf` is `[seq, 3]` f32 data. The shared binding is declared
+// u32 for the other entry points, so recover each coordinate by bitcast.
 @compute @workgroup_size(256)
 fn axial_positions(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -115,10 +115,10 @@ fn axial_positions(@builtin(global_invocation_id) gid: vec3<u32>) {
         axis_dim = params._pad2;
     }
 
-    let pos = bitcast<i32>(pos_offset_buf[row * 3u + axis]);
+    let pos = bitcast<f32>(pos_offset_buf[row * 3u + axis]);
     let theta = bitcast<f32>(params.theta_bits);
     let exponent = -2.0 * f32(local_pair) / f32(axis_dim);
-    let angle = f32(pos) * pow(theta, exponent);
+    let angle = pos * pow(theta, exponent);
     let cos_val = cos(angle);
     let sin_val = sin(angle);
 
