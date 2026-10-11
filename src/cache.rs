@@ -11,6 +11,8 @@ use std::{io, path::Path};
 /// in a way that can make an older plan unsafe to reuse.
 // Version 24 stores explicit key/value and causal-row lengths in forward
 // attention dispatches. Version 23 used kv_seq == 0 as a causal sentinel.
+// BF16 variants also record matrix stores and pointwise storage; older readers
+// would otherwise ignore the storage field and read halves as f32.
 // Version 23 allows native16 f32 attention gradients. The same family/path
 // serialized by older readers always generated native8, even on native16 GPUs.
 // Version 22 records forward GEMV column groups, which set the workgroup count
@@ -256,6 +258,33 @@ mod tests {
         let path = std::env::temp_dir().join("meganeura_nonexistent_cache.ron");
         let result = load_plan(&g, &path).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn bf16_storage_plan_round_trip() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[3, 7]);
+        let w = graph.parameter("w", &[7, 5]);
+        let x = graph.to_bf16(x);
+        let w = graph.to_bf16(w);
+        let product = graph.matmul(x, w);
+        let product = graph.to_bf16(product);
+        let product = graph.from_bf16(product);
+        let scaled = graph.scale(product, 0.125);
+        let scaled = graph.to_bf16(scaled);
+        let output = graph.from_bf16(scaled);
+        graph.set_outputs(vec![output]);
+        let plan = compile::compile(&graph);
+        assert!(
+            plan.dispatches
+                .iter()
+                .any(|d| d.pointwise_storage.bf16_output)
+        );
+        let path =
+            std::env::temp_dir().join(format!("meganeura-cache-bf16-{}.ron", std::process::id()));
+        save_plan(&plan, &graph, &path).unwrap();
+        assert_eq!(load_plan(&graph, &path).unwrap().unwrap(), plan);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
