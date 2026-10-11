@@ -63,7 +63,7 @@ pub(crate) struct Problem {
     pub m: u32,
     pub n: u32,
     pub k: u32,
-    /// Packed or f16 weights, which only the scalar kernels decode.
+    /// Packed or f16 weights, which need a storage-aware kernel.
     pub reduced_storage: bool,
     /// f16 weights, which f16-input cooperative tiles also read.
     pub f16_weights: bool,
@@ -312,6 +312,34 @@ mod tests {
         }
         assert_eq!(select(&product(4096, 4096, 64), &bare), Path::Compiled);
         assert_eq!(select(&product(64, 64, 64), &bare), Path::SmallTile);
+    }
+
+    #[test]
+    fn stored_f16_requires_plain_f16_cooperative_tiles() {
+        let problem = Problem::of(&Dispatch {
+            shader: crate::compile::ShaderEntry::MatMul,
+            params: vec![257, 65, 512, 0],
+            workgroups: [8, 5, 1],
+            weight_format: crate::compile::WeightFormat::F16,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(problem.reduced_storage && problem.f16_weights);
+        assert_eq!(select(&problem, &target(&F16)), Path::Cooperative);
+        for config in [
+            F32,
+            CoopConfig {
+                compensated: true,
+                ..F16
+            },
+        ] {
+            assert_eq!(select(&problem, &target(&config)), Path::Compiled);
+        }
+        let quantized = Problem {
+            f16_weights: false,
+            ..problem
+        };
+        assert_eq!(select(&quantized, &target(&F16)), Path::Compiled);
     }
 
     #[test]

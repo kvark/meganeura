@@ -3786,7 +3786,7 @@ mod tests {
     /// with and without a fused epilogue.
     #[test]
     fn cooperative_matmul_reads_f16_weights() {
-        use crate::compile::MatMulEpilogue;
+        use crate::compile::{BufferRef, MatMulEpilogue, MatMulPrologue, PrologueLoadKind};
         use crate::schedule::{PointwiseDAG, Pw};
         use naga::valid::{Capabilities, ValidationFlags, Validator};
 
@@ -3802,6 +3802,12 @@ mod tests {
                 output: 1,
             },
             inputs: Vec::new(),
+        };
+        let prologue = MatMulPrologue {
+            factors: vec![
+                (BufferRef(3), PrologueLoadKind::PerRow),
+                (BufferRef(4), PrologueLoadKind::PerKCol),
+            ],
         };
         let capabilities = Capabilities::COOPERATIVE_MATRIX
             | Capabilities::SHADER_FLOAT16
@@ -3822,7 +3828,10 @@ mod tests {
                 &epilogue,
                 WeightFormat::F16,
             );
-            for module in [plain, fused] {
+            let (add, variant) = coop_shape(group).unwrap();
+            let with_prologue =
+                gen_matmul_coop_with_prologue(add, variant, &config, &prologue, WeightFormat::F16);
+            for module in [plain, fused, with_prologue] {
                 Validator::new(flags, capabilities)
                     .validate(&module.module)
                     .unwrap_or_else(|error| panic!("{group:?} f16 weights: {error:#?}"));

@@ -2236,6 +2236,10 @@ impl Graph {
     /// Parameters with any other use, and graph outputs, stay f32. Returns
     /// the names of the converted parameters. Training graphs need f32
     /// master parameters, so call this only before building inference.
+    ///
+    /// This reduces weight storage, not necessarily latency: some devices
+    /// and shapes lose a faster f32-storage kernel. Measure the target model
+    /// before enabling it as a performance optimization.
     pub fn store_weights_f16(&mut self) -> Vec<String> {
         let mut eligible = vec![true; self.nodes.len()];
         let mut used = vec![false; self.nodes.len()];
@@ -3483,6 +3487,75 @@ impl fmt::Display for Graph {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn f16_weight_storage_converts_only_supported_uses() {
+        let mut graph = super::Graph::new();
+        let x = graph.input("x", &[3, 8]);
+        let indices = graph.input_u32("indices", &[3]);
+        let plain = graph.parameter("plain", &[8, 8]);
+        let transposed = graph.parameter("transposed", &[8, 8]);
+        let tied = graph.parameter("tied", &[8, 8]);
+        let already_half = graph.parameter_f16("already_half", &[8, 8]);
+        let mut outputs = vec![
+            graph.matmul(x, plain),
+            graph.matmul_bt(x, transposed),
+            graph.matmul(x, tied),
+            graph.embedding(indices, tied),
+            graph.matmul(x, already_half),
+        ];
+        for (name, op) in [
+            ("fused", super::Op::FusedMatMulAdd),
+            ("fused_bt", super::Op::FusedMatMulBTAdd),
+        ] {
+            let weight = graph.parameter(name, &[8, 8]);
+            outputs.push(graph.add_raw_node(
+                op,
+                vec![x, weight, x],
+                super::TensorType::f32(vec![3, 8]),
+            ));
+        }
+        graph.set_outputs(outputs);
+        assert_eq!(
+            graph.store_weights_f16(),
+            ["plain", "transposed", "tied", "fused", "fused_bt"]
+        );
+        assert!(
+            graph.store_weights_f16().is_empty(),
+            "conversion is idempotent"
+        );
+        assert!(
+            graph
+                .outputs()
+                .iter()
+                .all(|&id| graph.node(id).ty.dtype == super::DType::F32)
+        );
+        let plan = crate::compile::compile(&graph);
+        assert!(
+            plan.dispatches
+                .iter()
+                .all(|d| d.weight_format == crate::compile::WeightFormat::F16)
+        );
+    }
+
+    #[test]
+    fn f16_weight_storage_preserves_other_uses_and_outputs() {
+        let mut graph = super::Graph::new();
+        let x = graph.input("x", &[8, 8]);
+        let shared = graph.parameter("shared", &[8, 8]);
+        let exposed = graph.parameter("exposed", &[8, 8]);
+        let left = graph.parameter("left", &[8, 8]);
+        let unused = graph.parameter("unused", &[8, 8]);
+        let y = graph.matmul(x, shared);
+        let also_read = graph.relu(shared);
+        let z = graph.matmul(x, exposed);
+        let a = graph.matmul(left, x);
+        graph.set_outputs(vec![y, also_read, z, a, exposed]);
+        assert!(graph.store_weights_f16().is_empty());
+        for id in [shared, exposed, left, unused] {
+            assert_eq!(graph.node(id).ty.dtype, super::DType::F32);
+        }
+    }
+
     #[test]
     fn gelu_erf_is_exact_gelu() {
         // x · Φ(x) to f64 precision, and the tanh form at the same points.
