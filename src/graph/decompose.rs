@@ -313,6 +313,11 @@ impl Graph {
             Op::RoPEPositions { theta, head_dim } => {
                 self.expand_rope(arg(0), theta, head_dim, Positions::PerRow(arg(1)), None)
             }
+            Op::AxialRoPE {
+                theta,
+                head_dim,
+                axes_dim,
+            } => self.expand_axial_rope(arg(0), arg(1), theta, head_dim, axes_dim),
             Op::CausalAttention {
                 num_heads,
                 num_kv_heads,
@@ -352,6 +357,17 @@ impl Graph {
             } => {
                 let heads = Heads::new(num_heads, num_kv_heads, head_dim);
                 self.attend(arg(0), arg(1), arg(2), heads, None)
+            }
+            Op::BlockCausalAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                prefix_len,
+            } => {
+                let rows = ty.shape[0];
+                let mask = self.block_causal_mask(rows, prefix_len as usize);
+                let heads = Heads::new(num_heads, num_kv_heads, head_dim);
+                self.attend(arg(0), arg(1), arg(2), heads, Some(mask))
             }
             Op::CachedAttention {
                 num_heads,
@@ -490,6 +506,19 @@ impl Graph {
         self.constant(mask, &[rows * rows])
     }
 
+    /// Additive self-attention mask with a causal prefix and a fully visible
+    /// suffix. Prefix query `i` sees keys through `i`; every later query sees
+    /// every key.
+    fn block_causal_mask(&mut self, rows: usize, prefix: usize) -> NodeId {
+        let mask = (0..rows * rows)
+            .map(|n| {
+                let (i, j) = (n / rows, n % rows);
+                if i >= prefix || j <= i { 0.0 } else { f32::MIN }
+            })
+            .collect();
+        self.constant(mask, &[rows * rows])
+    }
+
     /// `x: [rows, heads·dim]` as `[heads, rows, dim]`.
     fn split_heads(&mut self, x: NodeId, heads: usize, dim: usize) -> NodeId {
         let rows = self.node(x).ty.shape[0];
@@ -602,6 +631,66 @@ impl Graph {
         self.weigh(logits, vh, heads, rows, rows, Some(mask))
     }
 
+    /// Three-axis adjacent-pair RoPE in generic data-movement and scalar
+    /// operations. Each axis is rearranged to the ordinary half-split RoPE
+    /// convention, rotated independently, and rearranged back.
+    fn expand_axial_rope(
+        &mut self,
+        x: NodeId,
+        positions: NodeId,
+        theta: f32,
+        head_dim: u32,
+        axes_dim: [u32; 3],
+    ) -> NodeId {
+        let shape = self.node(x).ty.shape.clone();
+        let (rows, width) = (shape[0], shape[1]);
+        let head_dim = head_dim as usize;
+        let heads = width / head_dim;
+        let batch = rows * heads;
+        let [d0, d1, d2] = axes_dim.map(|d| d as usize);
+
+        let positions = self.view(positions, &[rows * 3]);
+        let p0 = self.split_a(positions, rows as u32, 1, 2, 1);
+        let p12 = self.split_b(positions, rows as u32, 1, 2, 1);
+        let p1 = self.split_a(p12, rows as u32, 1, 1, 1);
+        let p2 = self.split_b(p12, rows as u32, 1, 1, 1);
+
+        let x = self.view(x, &[rows * width]);
+        let x0 = self.split_a(x, batch as u32, d0 as u32, (d1 + d2) as u32, 1);
+        let x12 = self.split_b(x, batch as u32, d0 as u32, (d1 + d2) as u32, 1);
+        let x1 = self.split_a(x12, batch as u32, d1 as u32, d2 as u32, 1);
+        let x2 = self.split_b(x12, batch as u32, d1 as u32, d2 as u32, 1);
+
+        let y0 = self.expand_axial_axis(x0, p0, theta, rows, heads, d0);
+        let y1 = self.expand_axial_axis(x1, p1, theta, rows, heads, d1);
+        let y2 = self.expand_axial_axis(x2, p2, theta, rows, heads, d2);
+        let y01 = self.concat(y0, y1, batch as u32, d0 as u32, d1 as u32, 1);
+        let y = self.concat(y01, y2, batch as u32, (d0 + d1) as u32, d2 as u32, 1);
+        self.view(y, &[rows, width])
+    }
+
+    fn expand_axial_axis(
+        &mut self,
+        x: NodeId,
+        positions: NodeId,
+        theta: f32,
+        rows: usize,
+        heads: usize,
+        dim: usize,
+    ) -> NodeId {
+        let batch = rows * heads;
+        let pairs = dim / 2;
+        let x = self.view(x, &[batch, pairs, 2]);
+        let x = self.permute(x, &[0, 2, 1]);
+        let x = self.view(x, &[batch, dim]);
+        let positions = self.view(positions, &[rows, 1]);
+        let positions = self.repeat_rows(positions, heads);
+        let x = self.expand_rope(x, theta, dim as u32, Positions::PerRowF32(positions), None);
+        let x = self.view(x, &[batch, 2, pairs]);
+        let x = self.permute(x, &[0, 2, 1]);
+        self.view(x, &[batch * dim])
+    }
+
     /// Rotate pairs `(d, d + dim/2)` of every head by `pos · θ^(-2d/dim)`,
     /// divided by `factors[d]` when present. `θ` and the position offset
     /// stay exact in the graph so recognition reads them back.
@@ -634,6 +723,7 @@ impl Graph {
                 let p = self.to_f32(p);
                 self.view(p, &[rows, 1])
             }
+            Positions::PerRowF32(p) => self.view(p, &[rows, 1]),
         };
         let theta = self.constant(vec![theta], &[1]);
         let ln_theta = self.log(theta);
@@ -996,6 +1086,7 @@ type Templates = HashMap<String, Option<(Graph, NodeId)>>;
 enum Positions {
     Offset(u32, Option<NodeId>),
     PerRow(NodeId),
+    PerRowF32(NodeId),
 }
 
 /// Head layout of an attention op.
@@ -1235,6 +1326,16 @@ fn accepts(op: &Op, ins: &[&TensorType], out: &TensorType) -> bool {
                 && ins[1].dtype == U32
                 && ins[1].shape == [out.shape[0]]
         }
+        Op::AxialRoPE {
+            head_dim, axes_dim, ..
+        } => {
+            arity(2)
+                && rope_x_ok(ins[0], out, head_dim as usize)
+                && ins[1].dtype == F32
+                && ins[1].shape == [out.shape[0], 3]
+                && axes_dim.iter().all(|d| d.is_multiple_of(2))
+                && axes_dim.iter().sum::<u32>() == head_dim
+        }
         Op::CausalAttention {
             num_heads,
             num_kv_heads,
@@ -1249,6 +1350,17 @@ fn accepts(op: &Op, ins: &[&TensorType], out: &TensorType) -> bool {
             arity(3)
                 && attention_ok(ins, out, num_heads, num_kv_heads, head_dim)
                 && ins[1].shape[0] == out.shape[0]
+        }
+        Op::BlockCausalAttention {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            prefix_len,
+        } => {
+            arity(3)
+                && attention_ok(ins, out, num_heads, num_kv_heads, head_dim)
+                && ins[1].shape[0] == out.shape[0]
+                && prefix_len as usize <= out.shape[0]
         }
         Op::FullAttention {
             num_heads,
@@ -1658,6 +1770,7 @@ fn guesses(g: &Graph, root: NodeId) -> Vec<(Op, Vec<NodeId>)> {
             }
         }
         Op::Concat { .. } => {
+            out.extend(axial_rope_guess(g, core));
             if let [a, b] = g.node(core).inputs[..] {
                 // shift: zeros ++ head, or tail ++ zeros
                 for (data, keep) in [(b, true), (a, false)] {
@@ -1738,8 +1851,18 @@ fn heads_split(g: &Graph, id: NodeId) -> Option<(NodeId, NodeId)> {
     Some((unview(g, input(g, id, 0)?), id))
 }
 
-/// A RoPE whose concatenated halves are `concat`.
-fn rope_guess(g: &Graph, concat: NodeId) -> Vec<(Op, Vec<NodeId>)> {
+#[derive(Clone, Copy)]
+struct RopeParts {
+    x: NodeId,
+    pos: NodeId,
+    theta: f32,
+    factors: Option<NodeId>,
+    head_dim: u32,
+}
+
+/// Inputs and attributes of a half-split RoPE whose concatenated halves are
+/// rooted at `concat`.
+fn rope_parts(g: &Graph, concat: NodeId) -> Vec<RopeParts> {
     let mut out = Vec::new();
     let Op::Concat { channels_a, .. } = g.node(concat).op else {
         return out;
@@ -1784,6 +1907,28 @@ fn rope_guess(g: &Graph, concat: NodeId) -> Vec<(Op, Vec<NodeId>)> {
         let Some(theta) = theta else {
             continue;
         };
+        out.push(RopeParts {
+            x,
+            pos,
+            theta,
+            factors,
+            head_dim,
+        });
+    }
+    out
+}
+
+/// A RoPE whose concatenated halves are `concat`.
+fn rope_guess(g: &Graph, concat: NodeId) -> Vec<(Op, Vec<NodeId>)> {
+    let mut out = Vec::new();
+    for parts in rope_parts(g, concat) {
+        let RopeParts {
+            x,
+            pos,
+            theta,
+            factors,
+            head_dim,
+        } = parts;
         match g.node(pos).op {
             Op::Offset { value } => out.push((
                 Op::RoPE {
@@ -1822,6 +1967,113 @@ fn rope_guess(g: &Graph, concat: NodeId) -> Vec<(Op, Vec<NodeId>)> {
                 }
             }
         }
+    }
+    out
+}
+
+/// Three adjacent-pair axial rotations joined back along each head. The
+/// expansion's nested concatenations expose the three axis widths; one axis
+/// is enough to recover the original value and position tensors, and the
+/// template matcher verifies the other two in full.
+fn axial_rope_guess(g: &Graph, concat: NodeId) -> Vec<(Op, Vec<NodeId>)> {
+    let Op::Concat {
+        channels_a: first_two,
+        channels_b: d2,
+        spatial: 1,
+    } = g.node(concat).op
+    else {
+        return Vec::new();
+    };
+    let Some(inner) = input(g, concat, 0).map(|id| unview(g, id)) else {
+        return Vec::new();
+    };
+    let Op::Concat {
+        channels_a: d0,
+        channels_b: d1,
+        spatial: 1,
+    } = g.node(inner).op
+    else {
+        return Vec::new();
+    };
+    if first_two != d0 + d1 || [d0, d1, d2].iter().any(|d| !d.is_multiple_of(2)) {
+        return Vec::new();
+    }
+
+    let Some(restored) = input(g, inner, 0).map(|id| unview(g, id)) else {
+        return Vec::new();
+    };
+    let Op::Permute { ref perm } = g.node(restored).op else {
+        return Vec::new();
+    };
+    if perm.as_slice() != [0, 2, 1] {
+        return Vec::new();
+    }
+    let Some(rope_output) = input(g, restored, 0).map(|id| unview(g, id)) else {
+        return Vec::new();
+    };
+    let Op::Permute { .. } = g.node(rope_output).op else {
+        return Vec::new();
+    };
+    let Some(rope_concat) = input(g, rope_output, 0).map(|id| unview(g, id)) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for parts in rope_parts(g, rope_concat) {
+        if parts.head_dim != d0 || parts.factors.is_some() {
+            continue;
+        }
+        let grouped = unview(g, parts.x);
+        let Op::Permute { ref perm } = g.node(grouped).op else {
+            continue;
+        };
+        if perm.as_slice() != [0, 2, 1] {
+            continue;
+        }
+        let Some(axis_values) = input(g, grouped, 0).map(|id| unview(g, id)) else {
+            continue;
+        };
+        let Op::SplitA {
+            channels_a,
+            channels_b,
+            spatial: 1,
+        } = g.node(axis_values).op
+        else {
+            continue;
+        };
+        if channels_a != d0 || channels_b != d1 + d2 {
+            continue;
+        }
+        let Some(x) = input(g, axis_values, 0).map(|id| unview(g, id)) else {
+            continue;
+        };
+
+        let repeated = unview(g, parts.pos);
+        if !matches!(g.node(repeated).op, Op::BroadcastTo) {
+            continue;
+        }
+        let Some(axis_position) = input(g, repeated, 0).map(|id| unview(g, id)) else {
+            continue;
+        };
+        let Op::SplitA {
+            channels_a: 1,
+            channels_b: 2,
+            spatial: 1,
+        } = g.node(axis_position).op
+        else {
+            continue;
+        };
+        let Some(positions) = input(g, axis_position, 0).map(|id| unview(g, id)) else {
+            continue;
+        };
+        out.push((
+            Op::AxialRoPE {
+                theta: parts.theta,
+                head_dim: d0 + d1 + d2,
+                axes_dim: [d0, d1, d2],
+            },
+            vec![x, positions],
+        ));
     }
     out
 }
@@ -1947,6 +2199,19 @@ fn attention_guess(g: &Graph, product: NodeId, keep: Option<NodeId>) -> Vec<(Op,
                 },
                 vec![q, k, v],
             ));
+            if rows == keys
+                && let Some(prefix_len) = block_causal_prefix(data, rows)
+            {
+                out.push((
+                    Op::BlockCausalAttention {
+                        num_heads: heads,
+                        num_kv_heads: kv_heads,
+                        head_dim: dim,
+                        prefix_len,
+                    },
+                    vec![q, k, v],
+                ));
+            }
         }
         Some(m) => {
             // Cached: scale(hidden, MIN), hidden = greater(·, kv_pos) [+ window]
@@ -2002,6 +2267,21 @@ fn attention_guess(g: &Graph, product: NodeId, keep: Option<NodeId>) -> Vec<(Op,
         }
     }
     out
+}
+
+fn block_causal_prefix(mask: &[f32], rows: usize) -> Option<u32> {
+    if mask.len() != rows.checked_mul(rows)? {
+        return None;
+    }
+    let prefix = (0..rows).find(|&i| mask[i * rows..(i + 1) * rows].iter().all(|&x| x == 0.0))?;
+    mask.iter()
+        .enumerate()
+        .all(|(n, &x)| {
+            let (i, j) = (n / rows, n % rows);
+            let expected = if i >= prefix || j <= i { 0.0 } else { f32::MIN };
+            x.to_bits() == expected.to_bits()
+        })
+        .then_some(prefix as u32)
 }
 
 /// Biased attention around `bias`, by its mask: none, causal (a constant)

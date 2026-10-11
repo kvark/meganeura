@@ -462,8 +462,7 @@ pub enum Op {
         head_dim: u32,
     },
     /// Interleaved RoPE with three independent position axes per row.
-    /// Inputs: `[x (F32), positions (U32 [seq, 3])]` where signed positions
-    /// are carried in two's-complement form.
+    /// Inputs: `[x (F32), positions (F32 [seq, 3])]`.
     AxialRoPE {
         theta: f32,
         head_dim: u32,
@@ -2446,8 +2445,7 @@ impl Graph {
     }
 
     /// Apply adjacent-pair, three-axis RoPE using one signed `(frame, y, x)`
-    /// position per row. Signed positions are supplied through a U32 input by
-    /// casting each `i32` to `u32`.
+    /// position per row.
     #[track_caller]
     pub fn axial_rope_with_positions(
         &mut self,
@@ -2464,7 +2462,11 @@ impl Graph {
         assert!(axes_dim.iter().all(|axis| axis.is_multiple_of(2)));
         assert_eq!(axes_dim.iter().sum::<u32>(), head_dim);
         let position_ty = &self.node(positions).ty;
-        assert_eq!(position_ty.dtype, DType::U32, "rope positions must be U32");
+        assert_eq!(
+            position_ty.dtype,
+            DType::F32,
+            "axial rope positions must be F32"
+        );
         assert_eq!(position_ty.shape, vec![x_shape[0], 3]);
         let ty = self.node(x).ty.clone();
         self.add_node(

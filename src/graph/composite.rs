@@ -98,13 +98,7 @@ impl Op {
             | Op::ScatterAdd { .. }
             | Op::CacheWrite
             | Op::CacheWritePrefix
-            | Op::PrefixLast
-            // Qwen-Image's multi-axis rotation and mixed causal/full mask
-            // are inference primitives with direct lowering and reference
-            // implementations; unlike the generic RoPE and attention ops,
-            // they do not currently have graph-level decompositions.
-            | Op::AxialRoPE { .. }
-            | Op::BlockCausalAttention { .. } => Primitive,
+            | Op::PrefixLast => Primitive,
             // Convolution and `reduce_window`.
             Op::Conv2d { .. } | Op::Conv2dDw { .. } | Op::MaxPool2d { .. } => Primitive,
 
@@ -132,8 +126,10 @@ impl Op {
             | Op::Upsample2x { .. }
             | Op::RoPE { .. }
             | Op::RoPEPositions { .. }
+            | Op::AxialRoPE { .. }
             | Op::CausalAttention { .. }
             | Op::FullAttention { .. }
+            | Op::BlockCausalAttention { .. }
             | Op::CrossAttention { .. }
             | Op::MultiHeadAttn { .. }
             | Op::SlidingWindowAttention { .. }

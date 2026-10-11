@@ -502,6 +502,21 @@ fn rotary_embeddings() {
                 f.set_u32("pos", &[9, 2, 30, 0]);
             },
         ),
+        case(
+            "axial_rope",
+            false,
+            |g| {
+                let x = g.parameter("x", &[4, 32]);
+                let pos = g.input("pos", &[4, 3]);
+                g.axial_rope_with_positions(x, 10_000.0, pos, 16, [4, 6, 6])
+            },
+            |f| {
+                f.set(
+                    "pos",
+                    &[0.0, -2.0, 3.0, 1.0, -1.0, 4.0, 2.0, 0.0, 5.0, 3.0, 1.0, 6.0],
+                );
+            },
+        ),
     ]);
 }
 
@@ -565,6 +580,15 @@ fn attention() {
             |g| {
                 let [q, k, v] = qkv(g, 5, 5, 3, 3, 8);
                 g.full_attention(q, k, v, 3, 3, 8)
+            },
+            |_| {},
+        ),
+        case(
+            "block_causal",
+            false,
+            |g| {
+                let [q, k, v] = qkv(g, 5, 5, 2, 2, 8);
+                g.block_causal_attention(q, k, v, 2, 2, 8, 2)
             },
             |_| {},
         ),
@@ -735,8 +759,10 @@ fn every_composite_is_covered() {
         ("Upsample2x", "upsample"),
         ("RoPE", "rope"),
         ("RoPEPositions", "rope_positions"),
+        ("AxialRoPE", "axial_rope"),
         ("CausalAttention", "causal"),
         ("FullAttention", "full"),
+        ("BlockCausalAttention", "block_causal"),
         ("CrossAttention", "cross"),
         ("MultiHeadAttn", "multi_head_attn"),
         ("SlidingWindowAttention", "sliding_window"),
