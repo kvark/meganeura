@@ -1,5 +1,11 @@
 # Unreleased
 
+- Measured construction starts with a qualified untuned fallback. Its tuned
+  version, including persisted kernel decisions, must pass whole-program timing
+  before replacing it. Both count toward the program and memory bounds; a
+  one-program search returns the fallback. Private probes reserve estimated
+  time for warmup, paired timing and qualification within the common deadline.
+  Incomplete or late comparisons keep the incumbent.
 - Scalar convolution tuning measures contiguous and interleaved register-tile
   columns separately for forward, input-gradient and weight-gradient kernels.
   The choice is part of the pipeline key, plan and kernel memo; ordinary builds

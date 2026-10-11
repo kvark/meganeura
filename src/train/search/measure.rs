@@ -62,6 +62,10 @@ pub struct BuildSearchTrial {
     pub qualification_time: Duration,
     /// Complete executions checked by the caller's `qualify`.
     pub qualifications: u32,
+    /// Time left for whole-program warmup, paired sampling and qualification
+    /// when assigning the private kernel budget. An estimate, not extra time.
+    pub comparison_time_reserved: Duration,
+    /// Absent for the initial, untuned fallback.
     pub kernel_tuning: Option<TuneReport>,
     pub outcome: TuneOutcome<(), usize>,
 }
@@ -102,16 +106,33 @@ fn validate(
     state: &SearchState,
     trial: &mut BuildSearchTrial,
     check: &mut impl FnMut(&Session) -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<Duration, String> {
+    let copy_before = trial.state_copy_time;
     restore(session, state, &mut trial.state_copy_time)?;
     let start = Instant::now();
     session.step();
     session.wait();
+    let execution = start.elapsed();
     let result = check(session);
     trial.qualification_time += start.elapsed();
     trial.qualifications += 1;
     restore(session, state, &mut trial.state_copy_time)?;
-    result
+    result.map(|()| execution + trial.state_copy_time - copy_before)
+}
+
+fn comparison_reserve(
+    options: &super::BuildSearchOptions,
+    step: Duration,
+    qualification: Duration,
+) -> Duration {
+    // Allow each challenger execution twice the observed incumbent cost.
+    // State restoration is included in `step`; readback/checking is not.
+    let pair = step.saturating_mul(3);
+    options
+        .warmup_time
+        .max(pair.saturating_mul(options.warmup_runs))
+        .saturating_add(pair.saturating_mul(options.tuning.sample_pairs as u32))
+        .saturating_add(qualification.saturating_mul(2))
 }
 
 pub(super) fn select(
@@ -140,6 +161,10 @@ pub(super) fn select(
     let mut selected_description = String::new();
     let mut selected_plan: Option<ExecutionPlan> = None;
     let mut pending_submissions = VecDeque::new();
+    let mut pending_tuned = None;
+    let mut initial_tuning_queued = false;
+    let mut incumbent_step = Duration::ZERO;
+    let mut incumbent_qualification = Duration::ZERO;
     let mut probe_submission = true;
     let mut private = crate::runtime::KernelMemo::default();
     let mut shared = options.kernel_memo.as_ref().map(|memo| {
@@ -178,20 +203,23 @@ pub(super) fn select(
         let lowering = Instant::now();
         // Cover the first layouts, then alternate the two frontiers so submission
         // probes cannot consume the program budget before useful layouts arrive.
-        let program = (index < super::INITIAL_LAYOUTS || !probe_submission)
-            .then(|| programs.next(incumbent_origin))
-            .flatten()
-            .or_else(|| {
-                pending_submissions
-                    .pop_front()
-                    .map(|submission_chunks| Program {
-                        description: selected_description.clone(),
-                        plan: selected_plan.as_ref().unwrap().clone(),
-                        submission_chunks: Some(submission_chunks),
-                        origin: incumbent_origin,
-                    })
-            })
-            .or_else(|| programs.next(incumbent_origin));
+        let program = pending_tuned.take().or_else(|| {
+            (index < super::INITIAL_LAYOUTS + usize::from(initial_tuning_queued)
+                || !probe_submission)
+                .then(|| programs.next(incumbent_origin))
+                .flatten()
+                .or_else(|| {
+                    pending_submissions
+                        .pop_front()
+                        .map(|submission_chunks| Program {
+                            description: selected_description.clone(),
+                            plan: selected_plan.as_ref().unwrap().clone(),
+                            submission_chunks: Some(submission_chunks),
+                            origin: incumbent_origin,
+                        })
+                })
+                .or_else(|| programs.next(incumbent_origin))
+        });
         let Some(program) = program else {
             break;
         };
@@ -206,8 +234,9 @@ pub(super) fn select(
         let submission_chunks = program.submission_chunks.unwrap_or(selected_chunks);
         let mut trial = BuildSearchTrial {
             description: format!(
-                "{}, submission_chunks={submission_chunks}",
-                program.description
+                "{}, {}submission_chunks={submission_chunks}",
+                program.description,
+                if incumbent.is_none() { "untuned, " } else { "" }
             ),
             lowering_time,
             construction_time: Duration::ZERO,
@@ -216,6 +245,7 @@ pub(super) fn select(
             snapshot_bytes: 0,
             qualification_time: Duration::ZERO,
             qualifications: 0,
+            comparison_time_reserved: Duration::ZERO,
             kernel_tuning: None,
             outcome: TuneOutcome::new((), program.plan.dispatches.len(), report.selected, index),
         };
@@ -250,22 +280,33 @@ pub(super) fn select(
                 let state = SearchState::capture(&mut candidate, options.max_plan_bytes)?;
                 trial.state_copy_time += copy_start.elapsed();
                 trial.snapshot_bytes = state.bytes();
-                let mut policy = options.tuning.clone();
-                policy.max_time = policy
-                    .max_time
-                    .min(options.max_time.saturating_sub(start.elapsed()));
-                // Do not spend kernel probes on an invalid program. Memoized
-                // classes only install recorded winners, and the check after
-                // tuning covers the program as it is measured.
-                if candidate.kernel_probes_pending(&policy, Some(kernels)) {
-                    validate(&mut candidate, &state, &mut trial, &mut qualify)?;
+                if incumbent.is_some() {
+                    let mut policy = options.tuning.clone();
+                    // Do not spend kernel probes on an invalid program.
+                    // Memoized winners still need whole-program acceptance.
+                    let mut step = incumbent_step;
+                    if !policy.max_time.is_zero()
+                        && candidate.kernel_probes_pending(&policy, Some(kernels))
+                    {
+                        step =
+                            step.max(validate(&mut candidate, &state, &mut trial, &mut qualify)?);
+                    }
+                    let qualification = incumbent_qualification.max(trial.qualification_time);
+                    trial.comparison_time_reserved =
+                        comparison_reserve(&options, step, qualification);
+                    policy.max_time = policy.max_time.min(
+                        options
+                            .max_time
+                            .saturating_sub(start.elapsed())
+                            .saturating_sub(trial.comparison_time_reserved),
+                    );
+                    trial.kernel_tuning = Some(
+                        candidate
+                            .tune_with_memo(policy, Some(&mut *kernels))
+                            .map_err(|error| error.to_string())?,
+                    );
                 }
-                trial.kernel_tuning = Some(
-                    candidate
-                        .tune_with_memo(policy, Some(&mut *kernels))
-                        .map_err(|error| error.to_string())?,
-                );
-                validate(&mut candidate, &state, &mut trial, &mut qualify)?;
+                let step = validate(&mut candidate, &state, &mut trial, &mut qualify)?;
                 trial.outcome.qualified = true;
                 if let Some((ref mut baseline, ref baseline_state)) = incumbent {
                     let warmup_start = Instant::now();
@@ -292,7 +333,8 @@ pub(super) fn select(
                                 run(baseline, baseline_state, &mut trial.state_copy_time)
                             };
                             match result {
-                                Ok(ms) => Some(ms),
+                                Ok(ms) if start.elapsed() < options.max_time => Some(ms),
+                                Ok(_) => None,
                                 Err(error) => {
                                     failure = Some(error);
                                     None
@@ -313,12 +355,26 @@ pub(super) fn select(
                 } else {
                     trial.outcome.selected = index;
                 }
-                Ok::<_, String>(state)
+                Ok::<_, String>((state, step))
             })();
             // A challenger executed beside the incumbent, sharing its weights.
             incumbent_checked = false;
             match result {
-                Ok(state) if incumbent.is_none() || trial.outcome.selected == index => {
+                Ok((state, step)) if incumbent.is_none() || trial.outcome.selected == index => {
+                    // The first program is a qualified ordinary fallback.
+                    // Tuning it, including memo reuse, is a separate challenger
+                    // charged to the same program, time and memory bounds.
+                    if incumbent.is_none() && candidate.has_tunable_kernels(&options.tuning) {
+                        pending_tuned = Some(Program {
+                            description: program.description.clone(),
+                            plan: original_plan.clone(),
+                            submission_chunks: program.submission_chunks,
+                            origin: program.origin,
+                        });
+                        initial_tuning_queued = true;
+                    }
+                    incumbent_step = step;
+                    incumbent_qualification = trial.qualification_time / trial.qualifications;
                     // Its last execution was its qualification.
                     incumbent_checked = true;
                     incumbent_bytes = plan_bytes(candidate.plan())?;
@@ -380,6 +436,7 @@ pub(super) fn select(
     // Do not lower one more program just to discover whether a bounded search
     // is truncated. Lazy producers can allocate and compile in `next()`.
     report.truncated |= start.elapsed() >= options.max_time
+        || pending_tuned.is_some()
         || !pending_submissions.is_empty()
         || ((report.patience_exhausted || report.trials.len() == options.max_programs)
             && programs.may_remain());
@@ -814,7 +871,10 @@ mod tests {
                         ..Default::default()
                     },
                     max_time: Duration::from_secs(60),
-                    max_programs: 1,
+                    max_programs: 2,
+                    // Private kernel winners must not bypass whole-model
+                    // selection, including when loaded from the shared memo.
+                    min_improvement: 0.99,
                     max_plan_bytes: 1 << 20,
                     kernel_memo: Some(memo.clone()),
                     ..Default::default()
@@ -837,19 +897,150 @@ mod tests {
             .1
         };
         let first = search();
-        let tuning = first.trials[0].kernel_tuning.as_ref().unwrap();
+        assert_eq!(first.selected, 0);
+        assert!(first.trials[0].kernel_tuning.is_none());
+        assert_eq!(first.trials[0].qualifications, 1);
+        let tuning = first.trials[1].kernel_tuning.as_ref().unwrap();
         assert!(!tuning.outcomes.is_empty() && !tuning.time_budget_exhausted);
-        // Kernel classes were left to probe, so the first program was also
-        // qualified before tuning.
-        assert_eq!(first.trials[0].qualifications, 2);
-        // Nothing ran after the only program's last check.
-        assert!(first.final_qualification_time.is_zero());
+        assert_eq!(first.trials[1].qualifications, 2);
+        assert_eq!(first.trials[1].outcome.decision, TuneDecision::KeepBaseline);
+        assert_eq!(first.trials[1].outcome.baseline_ms.len(), 4);
+        assert_eq!(first.trials[1].outcome.candidate_ms.len(), 4);
+        assert!(!first.final_qualification_time.is_zero());
         assert_eq!(memo.lock().unwrap().len(), 1);
         let second = search();
-        let tuning = second.trials[0].kernel_tuning.as_ref().unwrap();
+        assert_eq!(second.selected, 0);
+        assert!(second.trials[0].kernel_tuning.is_none());
+        let tuning = second.trials[1].kernel_tuning.as_ref().unwrap();
         assert!(tuning.outcomes.is_empty());
         assert_eq!(tuning.reused_classes.len(), 1);
-        assert_eq!(second.trials[0].qualifications, 1);
+        assert_eq!(second.trials[1].qualifications, 1);
+        assert_eq!(
+            second.trials[1].outcome.decision,
+            TuneDecision::KeepBaseline
+        );
+        assert_eq!(second.trials[1].outcome.baseline_ms.len(), 4);
+        assert_eq!(second.trials[1].outcome.candidate_ms.len(), 4);
+    }
+
+    #[test]
+    fn untuned_fallback_survives_bounds_and_failed_tuning() {
+        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
+        let mut graph = crate::Graph::new();
+        let x = graph.input("x", &[33, 17]);
+        let w = graph.parameter("w", &[17, 65]);
+        let y = graph.matmul(x, w);
+        graph.set_outputs(vec![y]);
+        let plan = crate::compile::compile(&graph);
+        let runtime = SessionOptions {
+            coop: crate::CoopPolicy::Disabled,
+            ..Default::default()
+        };
+        // Keep cold shader compilation outside the deadline test.
+        let mut warm = Session::with_context_opts(plan.clone(), gpu.clone(), runtime.clone());
+        warm.step();
+        warm.wait();
+        drop(warm);
+        for case in ["program", "memory", "qualification", "deadline"] {
+            let initialized = std::cell::Cell::new(0);
+            let mut checks = 0;
+            let mut untuned = Vec::new();
+            let (mut session, report) = select(
+                [Program {
+                    description: "ordinary".into(),
+                    plan: plan.clone(),
+                    submission_chunks: Some(1),
+                    origin: None,
+                }],
+                gpu.clone(),
+                runtime.clone(),
+                BuildSearchOptions {
+                    max_programs: if case == "program" { 1 } else { 2 },
+                    max_plan_bytes: if case == "memory" {
+                        plan_bytes(&plan).unwrap()
+                    } else {
+                        1 << 20
+                    },
+                    max_time: Duration::from_secs(if case == "deadline" { 2 } else { 30 }),
+                    warmup_runs: 1,
+                    warmup_time: Duration::ZERO,
+                    tuning: TuneOptions {
+                        max_time: Duration::from_secs(1),
+                        sample_pairs: 4,
+                        target_sample_time: Some(Duration::from_nanos(1)),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                |session, incumbent| {
+                    initialized.set(initialized.get() + 1);
+                    if incumbent.is_none() {
+                        untuned = session.plan().dispatches.clone();
+                    } else if case == "deadline" {
+                        std::thread::sleep(Duration::from_secs(2));
+                    }
+                    session.set_input("x", &[0.25; 33 * 17]);
+                    session.set_parameter("w", &[0.125; 17 * 65]);
+                    Ok(())
+                },
+                |session| {
+                    checks += 1;
+                    assert!(
+                        session
+                            .read_output(33 * 65)
+                            .iter()
+                            .all(|&x| (x - 0.53125).abs() < 1e-5)
+                    );
+                    // The baseline and pre-tuning check pass; reject the tuned
+                    // candidate, then requalify the preserved baseline.
+                    if case == "qualification" && checks == 3 {
+                        Err("injected post-tuning qualification failure".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(report.selected, 0, "{case}");
+            assert!(report.trials[0].outcome.qualified);
+            assert!(report.trials[0].kernel_tuning.is_none());
+            assert_eq!(session.plan().dispatches, untuned, "{case}");
+            match case {
+                "program" => {
+                    assert_eq!(report.trials.len(), 1);
+                    assert!(report.truncated);
+                }
+                "memory" => {
+                    assert_eq!(initialized.get(), 1);
+                    assert_eq!(
+                        report.trials[1].outcome.decision,
+                        TuneDecision::ScratchLimit
+                    );
+                }
+                "qualification" => {
+                    assert_eq!(report.trials[1].qualifications, 2);
+                    assert_eq!(
+                        report.trials[1].outcome.decision,
+                        TuneDecision::InvalidOutput
+                    );
+                    assert!(!report.final_qualification_time.is_zero());
+                }
+                "deadline" => {
+                    assert_eq!(report.trials[1].outcome.decision, TuneDecision::TimeBudget);
+                    assert!(report.trials[1].outcome.baseline_ms.is_empty());
+                    assert!(report.truncated);
+                }
+                _ => unreachable!(),
+            }
+            session.step();
+            session.wait();
+            assert!(
+                session
+                    .read_output(33 * 65)
+                    .iter()
+                    .all(|&x| (x - 0.53125).abs() < 1e-5)
+            );
+        }
     }
 
     /// Identical programs never replace the first, so only the stop rules end
