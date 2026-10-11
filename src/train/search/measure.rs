@@ -873,6 +873,16 @@ mod tests {
         delay: Duration,
     ) -> (Session, BuildSearchReport) {
         let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
+        // Compile and run the kernels before the search clock starts, so a cold
+        // pipeline cache does not spend the deadline under test.
+        let mut warm = Session::with_context_opts(
+            identical_programs(1).next().unwrap().plan,
+            gpu.clone(),
+            SessionOptions::default(),
+        );
+        warm.step();
+        warm.wait();
+        drop(warm);
         select(
             identical_programs(8),
             gpu,
@@ -925,22 +935,21 @@ mod tests {
 
     #[test]
     fn no_comparison_starts_that_cannot_finish() {
-        // Initialization alone takes 0.4 s per trial, so a fourth cannot
-        // complete by 1.5 s. GPU preparation and host contention can leave
-        // room for fewer trials; the test checks reservation, not throughput.
+        // A comparison costs at least its 0.4 s initialization, so after two
+        // programs a third could not finish by 1.15 s. The remaining 0.35 s
+        // absorbs execution with warm kernels.
         let (_, report) = stop_rule_search(
             BuildSearchOptions {
-                max_time: Duration::from_millis(1500),
+                max_time: Duration::from_millis(1150),
                 ..Default::default()
             },
             Duration::from_millis(400),
         );
         assert!(report.deadline_reserved && report.truncated);
-        assert!((1..=3).contains(&report.trials.len()));
-        assert!(
-            report.trials[1..]
-                .iter()
-                .all(|t| t.outcome.decision == TuneDecision::KeepBaseline)
+        assert_eq!(report.trials.len(), 2);
+        assert_eq!(
+            report.trials[1].outcome.decision,
+            TuneDecision::KeepBaseline
         );
     }
 
