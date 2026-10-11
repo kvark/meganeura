@@ -1390,6 +1390,18 @@ impl Pipelines {
             matmul_knobs.unroll_k = shape.unroll_k;
         }
         let group = dispatch.shader.shader_group();
+        if matches!(group, ShaderGroup::MatMulBF16 { .. })
+            && !gpu
+                .capabilities()
+                .cooperative_matrix
+                .bf16_f32_shapes
+                .contains(&[16, 16, 16])
+        {
+            return Err(
+                "BF16 matrix products require native 16x16x16 BF16/F32 cooperative matrices"
+                    .to_owned(),
+            );
+        }
         let mut layout = shader_data_layout(&dispatch.shader);
         let mut entry_point = dispatch.shader.entry_point();
         let cooperative =
@@ -2015,6 +2027,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
             bindings: Vec::new(),
         },
         ShaderEntry::MatMul
+        | ShaderEntry::MatMulBF16 { addend: false, .. }
         | ShaderEntry::MatMulAT
         | ShaderEntry::MatMulBT
         | ShaderEntry::MatMulGemv
@@ -2026,6 +2039,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::BatchMatMulAT
         | ShaderEntry::BatchMatMulBT => MatMulData::layout(),
         ShaderEntry::FusedMatMulAdd
+        | ShaderEntry::MatMulBF16 { addend: true, .. }
         | ShaderEntry::FusedMatMulATAdd
         | ShaderEntry::FusedMatMulBTAdd
         | ShaderEntry::MatMulGemvBTAdd
@@ -2046,7 +2060,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::BceLoss => BceData::layout(),
         ShaderEntry::Transpose => TransposeData::layout(),
         ShaderEntry::Embedding => EmbeddingData::layout(),
-        ShaderEntry::ToF16 => UnaryData::layout(),
+        ShaderEntry::ToF16 | ShaderEntry::ToBF16 | ShaderEntry::FromBF16 => UnaryData::layout(),
         ShaderEntry::RoPE | ShaderEntry::RoPEGrad => RoPEData::layout(),
         ShaderEntry::LayerNorm => LayerNormData::layout(),
         ShaderEntry::RmsNormAdd => RmsNormAddData::layout(),
@@ -3827,7 +3841,9 @@ impl Session {
             .iter()
             .zip(&alias.device_local)
             .zip(&zero_on_init)
-            .filter_map(|((&size, &device), &zero)| (device && zero).then_some(size.max(4)))
+            .filter_map(|((&size, &device), &zero)| {
+                (device && zero).then_some(size.max(4).next_multiple_of(4))
+            })
             .sum::<usize>();
         if device_zero_allocations != 0 {
             let _span = tracing::info_span!(
@@ -3842,7 +3858,9 @@ impl Session {
                 let mut transfer = encoder.transfer("zero_device_local");
                 for (i, &device_local) in alias.device_local.iter().enumerate() {
                     if device_local && zero_on_init[i] {
-                        let size = alias.sizes[i].max(4) as u64;
+                        // Allocations are vec4-padded, but 16-bit tensors can
+                        // have an odd logical length. Vulkan fills whole words.
+                        let size = alias.sizes[i].max(4).next_multiple_of(4) as u64;
                         transfer.fill_buffer(physical_buffers[i].handle.at(0), size, fill_byte[i]);
                     }
                 }

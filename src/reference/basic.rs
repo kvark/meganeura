@@ -742,6 +742,10 @@ pub(super) fn eval(node: &Node, ins: &[&Tensor]) -> Result<Vec<f64>, Error> {
             out
         }
         Op::ToF16 => map(arg(0)?, super::round_f16),
+        Op::ToBF16 => map(arg(0)?, |v| {
+            f64::from(half::bf16::from_f32(v as f32).to_f32())
+        }),
+        Op::FromBF16 => arg(0)?.data.clone(),
         Op::CacheWrite | Op::CacheWritePrefix => {
             let (new_kv, cache, pos) = (arg(0)?, arg(1)?, arg(2)?);
             let (rows, dim) = rows_cols(cache);

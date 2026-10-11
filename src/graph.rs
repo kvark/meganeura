@@ -101,6 +101,8 @@ pub enum DType {
     ///
     /// Load-only, for the same reason as [`DType::Q4K`].
     Q3K,
+    /// Native BF16 storage; arithmetic is widened to F32 except cooperative products.
+    BF16,
 }
 
 impl DType {
@@ -123,7 +125,7 @@ impl DType {
     pub fn size_bytes(self) -> usize {
         match self {
             DType::F32 => 4,
-            DType::F16 => 2,
+            DType::F16 | DType::BF16 => 2,
             DType::U32 => 4,
             DType::Q4_0
             | DType::Q8_0
@@ -431,6 +433,10 @@ pub enum Op {
     // inputs: [indices (U32), table (F16)] → f32 output. f16-table gather.
     // input: [x (F32)] → f16. Cast f32→f16; backward = identity.
     ToF16,
+    /// F32 to BF16 with round-to-nearest-even, using F32 straight-through gradients.
+    ToBF16,
+    /// BF16 to F32, exact.
+    FromBF16,
 
     // Rotary position embeddings
     // inputs: [x] or [x, pos_offset_input]
@@ -1735,7 +1741,8 @@ impl Graph {
         );
         // Reshape is a zero-cost view — just reinterprets the shape.
         // Uses Identity op (compiled as buffer alias, no GPU dispatch).
-        self.add_raw_node(Op::Identity, vec![x], TensorType::f32(new_shape.to_vec()))
+        let ty = TensorType::new(new_shape.to_vec(), self.node(x).ty.dtype);
+        self.add_raw_node(Op::Identity, vec![x], ty)
     }
 
     /// Copy `x` into a distinct intermediate buffer.
@@ -2217,6 +2224,22 @@ impl Graph {
         let shape = self.node(x).ty.shape.clone();
         let ty = TensorType::new(shape, DType::F16);
         self.add_node(Op::ToF16, vec![x], ty)
+    }
+
+    /// Round F32 values into native BF16 storage. Gradients remain F32.
+    pub fn to_bf16(&mut self, x: NodeId) -> NodeId {
+        let input = &self.node(x).ty;
+        assert_eq!(input.dtype, DType::F32);
+        let ty = TensorType::new(input.shape.clone(), DType::BF16);
+        self.add_node(Op::ToBF16, vec![x], ty)
+    }
+
+    /// Widen BF16 storage to F32 without changing its values.
+    pub fn from_bf16(&mut self, x: NodeId) -> NodeId {
+        let input = &self.node(x).ty;
+        assert_eq!(input.dtype, DType::BF16);
+        let ty = TensorType::f32(input.shape.clone());
+        self.add_node(Op::FromBF16, vec![x], ty)
     }
 
     /// Embedding gather from an **f16** table → f32 output. Same as

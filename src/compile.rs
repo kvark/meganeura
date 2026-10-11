@@ -310,6 +310,14 @@ pub enum ShaderEntry {
     RmsNormAdd,
     Embedding,
     ToF16,
+    ToBF16,
+    FromBF16,
+    /// Explicit BF16 operands with F32 output and accumulation.
+    MatMulBF16 {
+        transpose_a: bool,
+        transpose_b: bool,
+        addend: bool,
+    },
     RoPE,
     RoPEGrad,
     LayerNorm,
@@ -435,6 +443,7 @@ impl ShaderEntry {
         match *self {
             ShaderEntry::Generated => "pointwise",
             ShaderEntry::MatMul
+            | ShaderEntry::MatMulBF16 { .. }
             | ShaderEntry::MatMulAT
             | ShaderEntry::MatMulBT
             | ShaderEntry::BlockMatMul
@@ -525,6 +534,8 @@ impl ShaderEntry {
             | ShaderEntry::Transpose
             | ShaderEntry::Embedding
             | ShaderEntry::ToF16
+            | ShaderEntry::ToBF16
+            | ShaderEntry::FromBF16
             | ShaderEntry::Concat
             | ShaderEntry::SplitA
             | ShaderEntry::SplitB
@@ -605,6 +616,17 @@ impl ShaderEntry {
             ShaderEntry::RmsNormAdd => ShaderGroup::RmsNormAdd,
             ShaderEntry::Embedding => ShaderGroup::Embedding,
             ShaderEntry::ToF16 => ShaderGroup::ToF16,
+            ShaderEntry::ToBF16 => ShaderGroup::ToBF16,
+            ShaderEntry::FromBF16 => ShaderGroup::FromBF16,
+            ShaderEntry::MatMulBF16 {
+                transpose_a,
+                transpose_b,
+                addend,
+            } => ShaderGroup::MatMulBF16 {
+                transpose_a,
+                transpose_b,
+                addend,
+            },
             ShaderEntry::RoPE => ShaderGroup::RoPE,
             ShaderEntry::RoPEGrad => ShaderGroup::RoPEGrad,
             ShaderEntry::LayerNorm => ShaderGroup::LayerNorm,
@@ -716,6 +738,8 @@ impl ShaderEntry {
             ShaderEntry::RmsNormAdd => "main",
             ShaderEntry::Embedding => "main",
             ShaderEntry::ToF16 => "main",
+            ShaderEntry::ToBF16 | ShaderEntry::FromBF16 => "main",
+            ShaderEntry::MatMulBF16 { .. } => "main",
             ShaderEntry::RoPE => "main",
             ShaderEntry::RoPEGrad => "main",
             ShaderEntry::LayerNorm => "main",
@@ -1221,6 +1245,7 @@ impl Dispatch {
             | ShaderEntry::MatMulGemvAdd
             | ShaderEntry::FusedMatMulAdd => Some((a, c, b)),
             ShaderEntry::MatMulAT
+            | ShaderEntry::MatMulBF16 { .. }
             | ShaderEntry::MatMulBT
             | ShaderEntry::MatMulGemvBT
             | ShaderEntry::MatMulGemvBTAdd
