@@ -164,16 +164,6 @@ pub fn build_action_expert(
     action_seq_len: usize,
     vlm_seq_len: usize,
 ) -> NodeId {
-    action_expert(g, config, action_seq_len, vlm_seq_len, false)
-}
-
-fn action_expert(
-    g: &mut Graph,
-    config: &Config,
-    action_seq_len: usize,
-    vlm_seq_len: usize,
-    training: bool,
-) -> NodeId {
     let expert = &config.expert;
     let expert_hidden = expert.hidden_size;
     let kv_dim = expert.kv_dim();
@@ -249,7 +239,7 @@ fn action_expert(
         let q = g.matmul(h, wq);
         let k = g.matmul(kv_input, wk);
         let v = g.matmul(kv_input, wv);
-        let attn = if training {
+        let attn = if is_cross_attn {
             g.multi_head_attn(
                 q,
                 k,
@@ -257,16 +247,7 @@ fn action_expert(
                 expert.num_attention_heads,
                 expert.num_key_value_heads,
                 expert.head_dim,
-                is_cross_attn,
-            )
-        } else if is_cross_attn {
-            g.cross_attention(
-                q,
-                k,
-                v,
-                expert.num_attention_heads,
-                expert.num_key_value_heads,
-                expert.head_dim,
+                true,
             )
         } else {
             g.causal_attention(
@@ -377,8 +358,8 @@ pub fn expert_weight_names(config: &Config) -> Vec<String> {
 
 /// Build a training graph for the action expert with MSE loss.
 ///
-/// Uses full GQA-capable `MultiHeadAttn` op (differentiable, with LSE saved
-/// for backward) for both self-attention and cross-attention layers.
+/// Uses the same causal self-attention and full cross-attention as inference.
+/// Both operations save LSE for backward when compiled for training.
 ///
 /// Inputs:
 /// - `noisy_actions`: `[action_seq_len, max_action_dim]`
@@ -393,7 +374,7 @@ pub fn build_action_expert_training(
     vlm_seq_len: usize,
 ) -> Graph {
     let mut g = Graph::new();
-    let out = action_expert(&mut g, config, action_seq_len, vlm_seq_len, true);
+    let out = build_action_expert(&mut g, config, action_seq_len, vlm_seq_len);
     let target = g.input("target_actions", &[action_seq_len, config.max_action_dim]);
     let loss = g.mse_loss(out, target);
     g.set_outputs(vec![loss]);

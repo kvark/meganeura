@@ -106,6 +106,16 @@ fn smolvla() {
     assert_parity("smolvla expert", &forward, INFERENCE);
     let training = smolvla::build_action_expert_training(&config, 4, 6);
     assert_parity("smolvla training", &training, &[Mode::Training]);
+    // Training must differentiate the same causal forward graph as inference.
+    // MultiHeadAttn's self form is unmasked and changes this workload.
+    let mut with_loss = forward.deep_clone();
+    let target = with_loss.input("target_actions", &[4, config.max_action_dim]);
+    let loss = with_loss.mse_loss(forward.outputs()[0], target);
+    with_loss.set_outputs(vec![loss]);
+    assert_eq!(
+        plan(&training, Mode::Training),
+        plan(&with_loss, Mode::Training)
+    );
 }
 
 #[test]

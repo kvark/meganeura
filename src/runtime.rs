@@ -2224,6 +2224,8 @@ pub(crate) fn select_variants(
     select_conv_paths(plan, coop_config, allow_raw_f16);
     select_matmul_paths(plan, coop_config, allow_raw_f16);
 
+    plan.split_long_scalar_products();
+
     // Apply RmsNorm+MatMul prologue fusion only after per-dispatch coop
     // selection. A coop-capable device can still route small matmuls to a
     // scalar pipeline, which has no prologue implementation. The fusion
