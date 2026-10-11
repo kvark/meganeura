@@ -9,6 +9,8 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
+// Version 24 stores explicit key/value and causal-row lengths in forward
+// attention dispatches. Version 23 used kv_seq == 0 as a causal sentinel.
 // Version 23 allows native16 f32 attention gradients. The same family/path
 // serialized by older readers always generated native8, even on native16 GPUs.
 // Version 22 records forward GEMV column groups, which set the workgroup count
@@ -28,7 +30,7 @@ use std::{io, path::Path};
 // Version 13 reduces loss partials into a scalar, lowers LayerNorm to the
 // two-pass kernel, carries RoPE's static offset into the dynamic kernels, and
 // changes which dispatches fusion may merge.
-const CACHE_FORMAT_VERSION: u32 = 23;
+const CACHE_FORMAT_VERSION: u32 = 24;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]
@@ -499,6 +501,36 @@ mod tests {
 #[cfg(test)]
 mod cache_format_tests {
     use super::*;
+    use crate::compile;
+
+    #[test]
+    fn attention_dispatch_cache_v23_is_invalidated() {
+        let mut graph = Graph::new();
+        let q = graph.input("q", &[4, 8]);
+        let k = graph.input("k", &[4, 8]);
+        let v = graph.input("v", &[4, 8]);
+        let output = graph.causal_attention(q, k, v, 1, 1, 8);
+        graph.set_outputs(vec![output]);
+
+        let mut plan = compile::compile(&graph);
+        // Version 23 encoded causal attention with kv_seq == 0 and had no
+        // causal_rows word. Interpreting these parameters as version 24 would
+        // make every query row see zero keys.
+        plan.dispatches[0].params = vec![4, 0, (1 << 16) | 1, 8];
+        let legacy = CachedPlan {
+            format_version: 23,
+            graph_hash: hash_graph(&graph),
+            build_hash: 0,
+            plan,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "meganeura-attention-cache-v23-{}.ron",
+            std::process::id()
+        ));
+        std::fs::write(&path, ron::ser::to_string(&legacy).unwrap()).unwrap();
+        assert!(load_plan(&graph, &path).unwrap().is_none());
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn previous_cache_format_is_invalidated() {
