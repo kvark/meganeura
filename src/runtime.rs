@@ -1013,9 +1013,13 @@ enum Variant {
     Epilogue(ShaderEntry, EpiloguePipelineKey),
     CoopEpilogue(ShaderEntry, EpiloguePipelineKey),
     /// Prologue-fused coop matmuls. Prologues only apply when `use_coop`
-    /// is set; the kind sequence alone determines the shader, since buffer
+    /// is set. Weight storage and factor kinds determine the shader; buffer
     /// IDs are resolved at dispatch time.
-    CoopPrologue(ShaderEntry, Vec<crate::compile::PrologueLoadKind>),
+    CoopPrologue(
+        ShaderEntry,
+        crate::compile::WeightFormat,
+        Vec<crate::compile::PrologueLoadKind>,
+    ),
     /// GEMV with a RmsNorm folded into its A operand, at a weight format
     /// and measured shape. Packing and width are part of the key so a Q4_0
     /// winner cannot be installed on an f32 fused GEMV of the same extents.
@@ -1094,7 +1098,7 @@ impl Variant {
             | Variant::ScalarMatmul(ref e, _, _)
             | Variant::Epilogue(ref e, _)
             | Variant::CoopEpilogue(ref e, _)
-            | Variant::CoopPrologue(ref e, _)
+            | Variant::CoopPrologue(ref e, _, _)
             | Variant::GemvRmsNorm(ref e, _, _)
             | Variant::Gemv(ref e, _, _)
             | Variant::GemvIntDot(ref e, _, _)
@@ -1131,8 +1135,11 @@ impl Variant {
             }
             Variant::Epilogue(ref e, ref key) => epilogue_profile_key(e, key, false),
             Variant::CoopEpilogue(ref e, ref key) => epilogue_profile_key(e, key, true),
-            Variant::CoopPrologue(ref e, ref kinds) => {
+            Variant::CoopPrologue(ref e, crate::compile::WeightFormat::F32, ref kinds) => {
                 format!("{e:?}:cooperative-prologue:{kinds:?}")
+            }
+            Variant::CoopPrologue(ref e, format, ref kinds) => {
+                format!("{e:?}:cooperative-prologue-{format:?}-weights:{kinds:?}")
             }
             Variant::GemvRmsNorm(ref e, format, shape) => {
                 format!("{e:?}:rmsnorm-{format:?}-{shape:?}")
@@ -1590,6 +1597,7 @@ impl Pipelines {
             if let Some(ref prologue) = dispatch.matmul_prologue {
                 return Variant::CoopPrologue(
                     entry,
+                    dispatch.weight_format,
                     prologue.factors.iter().map(|f| f.1.clone()).collect(),
                 );
             }
@@ -4260,6 +4268,36 @@ mod variant_tests {
             matmul(|d| d.kernel = crate::compile::Kernel::Cooperative),
             Variant::Coop(ShaderEntry::MatMul, crate::compile::WeightFormat::F32),
         );
+        assert_eq!(
+            matmul(|d| {
+                d.kernel = crate::compile::Kernel::Cooperative;
+                d.weight_format = crate::compile::WeightFormat::F16;
+            }),
+            Variant::Coop(ShaderEntry::MatMul, crate::compile::WeightFormat::F16),
+        );
+    }
+
+    #[test]
+    fn cooperative_prologues_keep_weight_storage_in_the_key() {
+        use crate::compile::{BufferRef, Kernel, MatMulPrologue, PrologueLoadKind, WeightFormat};
+
+        let key = |format| {
+            matmul(|dispatch| {
+                dispatch.kernel = Kernel::Cooperative;
+                dispatch.weight_format = format;
+                dispatch.matmul_prologue = Some(MatMulPrologue {
+                    factors: vec![
+                        (BufferRef(3), PrologueLoadKind::PerRow),
+                        (BufferRef(4), PrologueLoadKind::PerKCol),
+                    ],
+                });
+            })
+        };
+        let (f32, f16) = (key(WeightFormat::F32), key(WeightFormat::F16));
+        assert!(matches!(f32, Variant::CoopPrologue(..)));
+        assert!(matches!(f16, Variant::CoopPrologue(..)));
+        assert_ne!(f32, f16, "mixed-storage prologues must not reuse a shader");
+        assert_ne!(f32.label(), f16.label());
     }
 
     /// A dispatch whose epilogue ops were folded into the matmul has no
