@@ -88,9 +88,10 @@ runner resets persistent writes between steps and before returning the winner.
 Configure runtime optimizers and external/shared writable bindings afterward.
 Each program is qualified after kernel tuning, before it is timed, and also
 before tuning when kernel classes remain to be probed. Only a winning challenger
-is qualified again after measurement; the selected program is requalified once
-before construction returns, not after every trial. An invalid challenger is
-discarded; an invalid final incumbent aborts the search.
+is qualified again after measurement; the selected program is requalified before
+returning only if another challenger ran since its last check, not after every
+trial. An invalid challenger is discarded; an invalid final incumbent aborts the
+search.
 Each challenger is constructed on the idle incumbent's identically stored weights
 that neither program writes. `Session::inherits_parameter` tells the initializer
 which uploads it can skip; written parameters remain private search state.
@@ -125,11 +126,13 @@ training improvements do not compensate for inference regressions.
 
 Private kernel decisions are keyed by complete class and candidate list, so
 `BuildSearchOptions::kernel_memo` can carry them into later searches on the same
-device, driver and decision policy; `KernelMemo::save` and `load` carry them into
-later processes. A resumed class installs its recorded winner and probes only
-the challengers it has not decided. Whole-program qualification still checks the
-result. Reusing decisions across benchmark replicates is a protocol choice: such
-replicates no longer measure independent kernel searches.
+engine version, device, driver and decision policy; `KernelMemo::save` and `load`
+carry them into later processes. The memo revision must also be bumped when
+kernel generation, qualification or decision semantics change between releases.
+A resumed class installs its recorded winner and probes only the challengers it
+has not decided. Whole-program qualification still checks the result. Reusing
+decisions across benchmark replicates is a protocol choice: such replicates no
+longer measure independent kernel searches.
 
 Private probes use `TuneOptions::target_sample_time` (two milliseconds by
 default) to choose a common repetition count from the faster variant's warmup.

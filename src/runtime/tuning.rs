@@ -15,10 +15,10 @@ use std::{
 ///
 /// Each decision covers one complete class key and candidate list, measured
 /// in private scratch, so it does not depend on the surrounding program.
-/// Later searches on the same device, driver and decision policy install the
-/// recorded winner and probe only the challengers it has not decided. Their
-/// whole-program qualification still checks every installed winner. A memo
-/// used on another device, driver or policy starts over instead of
+/// Later searches on the same engine, device, driver and decision policy install
+/// the recorded winner and probe only the challengers it has not decided. Their
+/// whole-program qualification still checks every installed winner. A memo used
+/// on another engine version, device, driver or policy starts over instead of
 /// transferring decisions. Share one between searches through
 /// [`crate::train::BuildSearchOptions::kernel_memo`], and between processes
 /// with [`Self::save`] and [`Self::load`].
@@ -28,9 +28,18 @@ pub struct KernelMemo {
     progress: HashMap<MemoKey, KernelProgress>,
 }
 
+// Bump when kernel generation, qualification or decision semantics change,
+// including changes between package releases. This also versions the memo schema.
+const KERNEL_MEMO_REVISION: u32 = 1;
+
 /// What a recorded decision depends on besides its class key.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct MemoScope {
+    // Unversioned files deserialize but cannot match the current scope.
+    #[serde(default)]
+    revision: u32,
+    #[serde(default)]
+    engine_version: String,
     device: String,
     driver: String,
     driver_info: String,
@@ -44,18 +53,11 @@ struct MemoScope {
     staging_reuse: crate::tune::TuneStagingReuse,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct MemoFile {
-    scope: Option<MemoScope>,
-    progress: Vec<(MemoKey, KernelProgress)>,
-}
-
-impl KernelMemo {
-    /// Resume only decisions made on this device and driver under the decision
-    /// policy of `options`; budgets and scope do not change a decision.
-    pub(crate) fn bind(&mut self, gpu: &Gpu, options: &TuneOptions) {
-        let info = gpu.device_information();
-        let scope = MemoScope {
+impl MemoScope {
+    fn new(info: &bg::DeviceInformation, options: &TuneOptions) -> Self {
+        Self {
+            revision: KERNEL_MEMO_REVISION,
+            engine_version: env!("CARGO_PKG_VERSION").into(),
             device: info.device_name.clone(),
             driver: info.driver_name.clone(),
             driver_info: info.driver_info.clone(),
@@ -66,11 +68,28 @@ impl KernelMemo {
             target_sample_time: options.target_sample_time,
             staging: options.staging,
             staging_reuse: options.staging_reuse,
-        };
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MemoFile {
+    scope: Option<MemoScope>,
+    progress: Vec<(MemoKey, KernelProgress)>,
+}
+
+impl KernelMemo {
+    /// Resume only decisions made on this engine, device and driver under the
+    /// decision policy of `options`; budgets and scope do not change a decision.
+    pub(crate) fn bind(&mut self, gpu: &Gpu, options: &TuneOptions) {
+        self.bind_scope(MemoScope::new(gpu.device_information(), options));
+    }
+
+    fn bind_scope(&mut self, scope: MemoScope) {
         if self.scope.as_ref() != Some(&scope) {
             if !self.progress.is_empty() {
                 log::info!(
-                    "kernel memo: discarding {} decisions from another device or policy",
+                    "kernel memo: discarding {} decisions from another engine, device or policy",
                     self.progress.len()
                 );
             }
@@ -98,7 +117,12 @@ impl KernelMemo {
     }
 
     /// Write the memo, replacing `path` only once the whole file is written.
+    /// Concurrent saves are independent; the last successful rename wins.
     pub fn save(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_SAVE: AtomicU64 = AtomicU64::new(0);
+
         let path = path.as_ref();
         let file = MemoFile {
             scope: self.scope.clone(),
@@ -108,9 +132,40 @@ impl KernelMemo {
                 .map(|(key, &progress)| (key.clone(), progress))
                 .collect(),
         };
-        let partial = path.with_extension("partial");
-        std::fs::write(&partial, serde_json::to_vec(&file)?)?;
-        std::fs::rename(partial, path)
+        let contents = serde_json::to_vec(&file)?;
+        let file_name = path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "memo path needs a file name",
+            )
+        })?;
+        // Keep the temporary beside the destination for an atomic rename, but
+        // never truncate a sibling file or another writer's in-flight save.
+        let (partial, mut output) = loop {
+            let mut name = file_name.to_os_string();
+            name.push(format!(
+                ".{}-{}.partial",
+                std::process::id(),
+                NEXT_SAVE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let partial = path.with_file_name(name);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&partial)
+            {
+                Ok(output) => break (partial, output),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        };
+        let result = output.write_all(&contents);
+        drop(output);
+        let result = result.and_then(|()| std::fs::rename(&partial, path));
+        if result.is_err() {
+            let _ = std::fs::remove_file(&partial);
+        }
+        result
     }
 }
 
@@ -1955,6 +2010,169 @@ fn qualify_output(class: &TuneClass, inputs: &[Vec<f32>], output: &[f32], scale:
 }
 
 #[cfg(test)]
+mod memo_tests {
+    use super::*;
+
+    struct TestDirectory(std::path::PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "meganeura-kernel-memo-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn populated_memo() -> KernelMemo {
+        let mut memo = KernelMemo::default();
+        memo.bind_scope(MemoScope::new(
+            &bg::DeviceInformation::default(),
+            &TuneOptions::default(),
+        ));
+        memo.progress.insert(
+            (
+                32,
+                false,
+                TuneClass::default(),
+                vec![MatmulTile::Tile32, MatmulTile::Tile64],
+            ),
+            KernelProgress {
+                selected: MatmulTile::Tile64,
+                next_candidate: 1,
+            },
+        );
+        memo
+    }
+
+    #[test]
+    fn persists_and_discards_other_policies() {
+        let directory = TestDirectory::new();
+        let path = directory.0.join("memo.json");
+        let memo = populated_memo();
+        memo.save(&path).unwrap();
+        let mut loaded = KernelMemo::load(&path).unwrap();
+        assert_eq!(loaded.scope, memo.scope);
+        loaded.bind_scope(memo.scope.clone().unwrap());
+        assert_eq!(loaded.len(), 1);
+        let progress = loaded.progress.values().next().unwrap();
+        assert_eq!(
+            (progress.selected, progress.next_candidate),
+            (MatmulTile::Tile64, 1)
+        );
+        // Budgets do not change a decision; the decision policy does.
+        let options = TuneOptions {
+            max_time: Duration::from_secs(1),
+            max_classes: 1,
+            ..Default::default()
+        };
+        loaded.bind_scope(MemoScope::new(&bg::DeviceInformation::default(), &options));
+        assert_eq!(loaded.len(), 1);
+        loaded.bind_scope(MemoScope::new(
+            &bg::DeviceInformation::default(),
+            &TuneOptions {
+                min_improvement: 0.1,
+                ..options
+            },
+        ));
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn discards_incompatible_engines_and_unversioned_files() {
+        let directory = TestDirectory::new();
+        let path = directory.0.join("memo.json");
+        for change in ["revision", "engine", "unversioned"] {
+            let memo = populated_memo();
+            memo.save(&path).unwrap();
+            let mut file: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let scope = file["scope"].as_object_mut().unwrap();
+            match change {
+                "revision" => scope["revision"] = (KERNEL_MEMO_REVISION + 1).into(),
+                "engine" => scope["engine_version"] = "another version".into(),
+                _ => {
+                    scope.remove("revision");
+                    scope.remove("engine_version");
+                }
+            }
+            std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+            let mut loaded = KernelMemo::load(&path).unwrap();
+            assert_eq!(loaded.len(), 1);
+            loaded.bind_scope(memo.scope.unwrap());
+            assert!(loaded.is_empty(), "{change}");
+        }
+    }
+
+    #[test]
+    fn save_preserves_partial_siblings() {
+        let directory = TestDirectory::new();
+        let path = directory.0.join("memo.json");
+        let sibling = path.with_extension("partial");
+        std::fs::write(&sibling, b"unrelated file").unwrap();
+        let memo = populated_memo();
+        for _ in 0..2 {
+            memo.save(&path).unwrap();
+            assert_eq!(KernelMemo::load(&path).unwrap().scope, memo.scope);
+            assert_eq!(std::fs::read(&sibling).unwrap(), b"unrelated file");
+        }
+        assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn failed_save_cleans_its_temporary_file() {
+        let directory = TestDirectory::new();
+        let path = directory.0.join("memo.json");
+        std::fs::create_dir(&path).unwrap();
+        assert!(populated_memo().save(&path).is_err());
+        assert!(path.is_dir());
+        assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn concurrent_saves_publish_complete_files() {
+        let directory = TestDirectory::new();
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|threads| {
+            for index in 0..8 {
+                let directory = &directory.0;
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    let mut memo = populated_memo();
+                    memo.scope.as_mut().unwrap().driver_info = index.to_string().repeat(4096);
+                    let path = directory.join(if index % 2 == 0 {
+                        "memo.json"
+                    } else {
+                        "memo.ron"
+                    });
+                    barrier.wait();
+                    for _ in 0..4 {
+                        memo.save(&path).unwrap();
+                        let loaded = KernelMemo::load(&path).unwrap();
+                        assert_eq!(loaded.len(), 1);
+                        let info = loaded.scope.unwrap().driver_info;
+                        assert_eq!(info, info[..1].repeat(4096));
+                    }
+                });
+            }
+        });
+        assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 2);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2020,57 +2238,6 @@ mod tests {
             staging.clear();
             assert!(staging.baseline.is_none());
         }
-    }
-
-    #[test]
-    fn kernel_memo_persists_and_discards_other_policies() {
-        let gpu = crate::init_gpu_context().unwrap();
-        let options = TuneOptions::default();
-        let mut memo = KernelMemo::default();
-        memo.bind(&gpu, &options);
-        memo.progress.insert(
-            (
-                32,
-                false,
-                TuneClass::default(),
-                vec![MatmulTile::Tile32, MatmulTile::Tile64],
-            ),
-            KernelProgress {
-                selected: MatmulTile::Tile64,
-                next_candidate: 1,
-            },
-        );
-        let path =
-            std::env::temp_dir().join(format!("meganeura-kernel-memo-{}.json", std::process::id()));
-        memo.save(&path).unwrap();
-        let mut loaded = KernelMemo::load(&path).unwrap();
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(loaded.scope, memo.scope);
-        loaded.bind(&gpu, &options);
-        assert_eq!(loaded.len(), 1);
-        let progress = loaded.progress.values().next().unwrap();
-        assert_eq!(
-            (progress.selected, progress.next_candidate),
-            (MatmulTile::Tile64, 1)
-        );
-        // Budgets do not change a decision; the decision policy does.
-        loaded.bind(
-            &gpu,
-            &TuneOptions {
-                max_time: Duration::from_secs(1),
-                max_classes: 1,
-                ..options.clone()
-            },
-        );
-        assert_eq!(loaded.len(), 1);
-        loaded.bind(
-            &gpu,
-            &TuneOptions {
-                min_improvement: 0.1,
-                ..options
-            },
-        );
-        assert!(loaded.is_empty());
     }
 
     #[test]

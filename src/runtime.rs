@@ -3070,6 +3070,29 @@ fn create_optimizer_buffer(
     buf
 }
 
+/// Equal allocation sizes alone do not make fused parameter contents equal.
+fn parameter_storage_matches(
+    target_plan: &ExecutionPlan,
+    target: BufferRef,
+    source_plan: &ExecutionPlan,
+    source: BufferRef,
+) -> bool {
+    let target_recipe = target_plan
+        .derived_params
+        .iter()
+        .find(|derived| derived.0 == target)
+        .map(|derived| (&derived.1, &derived.2));
+    let source_recipe = source_plan
+        .derived_params
+        .iter()
+        .find(|derived| derived.0 == source)
+        .map(|derived| (&derived.1, &derived.2));
+    target_plan.buffers[target.0 as usize] == source_plan.buffers[source.0 as usize]
+        && target_plan.weight_buffers.get(&target) == source_plan.weight_buffers.get(&source)
+        && target_plan.param_types.get(&target) == source_plan.param_types.get(&source)
+        && target_recipe == source_recipe
+}
+
 impl Session {
     /// Select the safest cooperative matrix config from GPU capabilities.
     /// Prefers f32 operands for training correctness. The f16-input path
@@ -3519,11 +3542,7 @@ impl Session {
                 let source_index = source_buffer.0 as usize;
                 // Same bytes, same storage format and the same logical
                 // tensor; anything else keeps a private allocation.
-                if plan.buffers[target_index] != source.plan.buffers[source_index]
-                    || plan.weight_buffers.get(&target)
-                        != source.plan.weight_buffers.get(&source_buffer)
-                    || plan.param_types.get(&target) != source.plan.param_types.get(&source_buffer)
-                {
+                if !parameter_storage_matches(&plan, target, &source.plan, source_buffer) {
                     log::warn!(
                         "parameter `{name}` is stored differently in the source session; \
                          allocating it separately"
@@ -4174,7 +4193,15 @@ impl Session {
     pub fn inherits_parameter(&self, donor: &Session, name: &str) -> bool {
         // An upload also fills the fused weights derived from `name`. They are
         // named parameters too, and must be the donor's identical derivations.
-        self.shares_parameter(donor, name)
+        let inherits = |name: &str| {
+            self.shares_parameter(donor, name)
+                && self.param_buffer(name).is_some_and(|mine| {
+                    donor.param_buffer(name).is_some_and(|theirs| {
+                        parameter_storage_matches(&self.plan, mine, &donor.plan, theirs)
+                    })
+                })
+        };
+        inherits(name)
             && self
                 .plan
                 .derived_params
@@ -4185,16 +4212,7 @@ impl Session {
                         .param_buffers
                         .iter()
                         .find(|entry| entry.1 == derived.0)
-                        .is_some_and(|entry| {
-                            self.shares_parameter(donor, &entry.0)
-                                && donor.param_buffer(&entry.0).is_some_and(|theirs| {
-                                    donor.plan.derived_params.iter().any(|other| {
-                                        other.0 == theirs
-                                            && other.1 == derived.1
-                                            && other.2 == derived.2
-                                    })
-                                })
-                        })
+                        .is_some_and(|entry| inherits(&entry.0))
                 })
     }
 
@@ -4449,6 +4467,95 @@ pub(crate) fn parse_device_id(value: &str) -> Option<u32> {
             || value.parse().ok(),
             |hex| u32::from_str_radix(hex, 16).ok(),
         )
+}
+
+#[cfg(test)]
+mod parameter_sharing_tests {
+    use super::{BufferRef, ExecutionPlan, parameter_storage_matches};
+    use crate::graph::{ParamTransform, TensorType};
+
+    fn plan(buffer: BufferRef) -> ExecutionPlan {
+        let mut plan = crate::compile::compile(&crate::Graph::new());
+        plan.buffers = vec![32; 2];
+        plan.param_buffers.push(("packed".into(), buffer));
+        plan.param_types.insert(buffer, TensorType::f32(vec![2, 4]));
+        plan.derived_params.push((
+            buffer,
+            vec![("left".into(), 2), ("right".into(), 2)],
+            ParamTransform::HorizontalConcat,
+        ));
+        plan
+    }
+
+    #[test]
+    fn derived_parameters_require_the_same_recipe() {
+        let (target, source) = (BufferRef(0), BufferRef(1));
+        let target_plan = plan(target);
+        let source_plan = plan(source);
+        // Buffer numbering does not affect the values stored in the parameter.
+        assert!(parameter_storage_matches(
+            &target_plan,
+            target,
+            &source_plan,
+            source
+        ));
+        for change in 0..4 {
+            let mut changed = source_plan.clone();
+            match change {
+                0 => changed.derived_params[0].2 = ParamTransform::VerticalConcat,
+                1 => changed.derived_params[0].1.reverse(),
+                2 => changed.derived_params[0].1[0].1 += 1,
+                _ => changed.derived_params.clear(),
+            }
+            assert!(
+                !parameter_storage_matches(&target_plan, target, &changed, source),
+                "different recipe {change} must stay private"
+            );
+            assert!(!parameter_storage_matches(
+                &changed,
+                source,
+                &target_plan,
+                target
+            ));
+        }
+    }
+
+    #[test]
+    fn ordinary_parameters_still_require_matching_storage() {
+        let (target, source) = (BufferRef(0), BufferRef(1));
+        let mut target_plan = plan(target);
+        let mut source_plan = plan(source);
+        target_plan.derived_params.clear();
+        source_plan.derived_params.clear();
+        assert!(parameter_storage_matches(
+            &target_plan,
+            target,
+            &source_plan,
+            source
+        ));
+        for change in 0..3 {
+            let mut changed = source_plan.clone();
+            match change {
+                0 => changed.buffers[source.0 as usize] += 4,
+                1 => {
+                    changed
+                        .param_types
+                        .insert(source, TensorType::f32(vec![4, 2]));
+                }
+                _ => {
+                    changed
+                        .weight_buffers
+                        .insert(source, (crate::compile::WeightFormat::F16, 2, 4));
+                }
+            }
+            assert!(!parameter_storage_matches(
+                &target_plan,
+                target,
+                &changed,
+                source
+            ));
+        }
+    }
 }
 
 #[cfg(test)]
