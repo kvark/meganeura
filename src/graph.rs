@@ -527,7 +527,8 @@ pub enum Op {
     // inputs: [q, k, v]
     // output: O [q_seq, num_heads*head_dim]
     // During compilation, also allocates an LSE buffer [q_seq * num_heads].
-    // Params reuse cross-attention encoding: [q_seq, kv_seq, (num_heads<<16)|num_kv_heads, head_dim]
+    // Forward params are [q_seq, kv_seq, packed_heads, head_dim,
+    // window_size, causal_rows].
     MultiHeadAttn {
         num_heads: u32,
         num_kv_heads: u32,
@@ -2458,9 +2459,19 @@ impl Graph {
         let x_shape = &self.node(x).ty.shape;
         assert_eq!(x_shape.len(), 2, "axial rope requires 2D input");
         let dim = u32::try_from(x_shape[1]).expect("rope dimension exceeds u32");
+        assert!(head_dim > 0, "axial rope requires a nonzero head dimension");
         assert_eq!(dim % head_dim, 0, "rope: dim must be divisible by head_dim");
-        assert!(axes_dim.iter().all(|axis| axis.is_multiple_of(2)));
-        assert_eq!(axes_dim.iter().sum::<u32>(), head_dim);
+        assert!(
+            axes_dim
+                .iter()
+                .all(|axis| *axis > 0 && axis.is_multiple_of(2)),
+            "axial rope axis dimensions must be nonzero and even"
+        );
+        assert_eq!(
+            axes_dim.iter().sum::<u32>(),
+            head_dim,
+            "axial rope axis dimensions must sum to head_dim"
+        );
         let position_ty = &self.node(positions).ty;
         assert_eq!(
             position_ty.dtype,
@@ -3931,5 +3942,18 @@ mod tests {
         let x = g.input("x", &[4, 8]);
         let b = g.input("b", &[4, 8]); // 2D, not 1D
         g.bias_add(x, b);
+    }
+
+    #[test]
+    fn axial_rope_rejects_zero_width_axes() {
+        for axes_dim in [[0, 8, 8], [8, 0, 8], [8, 8, 0]] {
+            let result = std::panic::catch_unwind(|| {
+                let mut g = Graph::new();
+                let x = g.input("x", &[2, 16]);
+                let positions = g.input("positions", &[2, 3]);
+                g.axial_rope_with_positions(x, 10_000.0, positions, 16, axes_dim);
+            });
+            assert!(result.is_err(), "accepted zero-width axes {axes_dim:?}");
+        }
     }
 }

@@ -30,9 +30,8 @@ fn main(
     let num_heads = params.packed_heads >> 16u;
     let num_kv_heads = params.packed_heads & 0xFFFFu;
     let head_dim = params.head_dim;
-    let block_causal = (params.window_size & 0x80000000u) != 0u;
-    let prefix_len = params.window_size & 0x7fffffffu;
-    let window_size = select(params.window_size, 0u, block_causal);
+    let causal_rows = params.causal_rows;
+    let window_size = params.window_size;
     let kv_head = head / (num_heads / max(num_kv_heads, 1u));
     let kv_head_off = kv_head * head_dim;
     let kv_dim = num_kv_heads * head_dim;
@@ -44,16 +43,11 @@ fn main(
     let qpos = pos_base + row;
     let q_valid = qpos < q_seq && head < num_heads;
 
-    var row_kv_len = select(kv_seq, qpos + 1u, kv_seq == 0u);
-    if block_causal { row_kv_len = select(q_seq, qpos + 1u, qpos < prefix_len); }
+    let row_kv_len = select(kv_seq, qpos + 1u, qpos < causal_rows);
     let row_kv_start = select(0u, row_kv_len - min(row_kv_len, window_size), window_size > 0u);
     let last_pos = min(pos_base + 15u, q_seq - 1u);
-    var max_kv_len = select(kv_seq, last_pos + 1u, kv_seq == 0u);
-    var first_kv_len = select(kv_seq, pos_base + 1u, kv_seq == 0u);
-    if block_causal {
-        max_kv_len = select(q_seq, last_pos + 1u, last_pos < prefix_len);
-        first_kv_len = select(q_seq, pos_base + 1u, pos_base < prefix_len);
-    }
+    let max_kv_len = select(kv_seq, last_pos + 1u, last_pos < causal_rows);
+    let first_kv_len = select(kv_seq, pos_base + 1u, pos_base < causal_rows);
     let min_kv_start = select(0u, first_kv_len - min(first_kv_len, window_size), window_size > 0u);
 
     var local_o: array<f32, $CHUNK_HD>;

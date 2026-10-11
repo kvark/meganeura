@@ -463,9 +463,9 @@ struct RoPEParams {
     theta_bits: u32,
     pos_offset: u32,
     head_dim: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    axis_dim0: u32,
+    axis_dim1: u32,
+    axis_dim2: u32,
 }
 
 #[derive(blade_macros::ShaderData)]
@@ -902,7 +902,7 @@ struct AttentionParams {
     packed_heads: u32,
     head_dim: u32,
     window_size: u32,
-    _pad0: u32,
+    causal_rows: u32,
     _pad1: u32,
     _pad2: u32,
 }

@@ -4,9 +4,9 @@ struct Params {
     theta_bits: u32,
     pos_offset: u32,
     head_dim: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    axis_dim0: u32,
+    axis_dim1: u32,
+    axis_dim2: u32,
 }
 
 var<storage> src: array<f32>;
@@ -14,8 +14,11 @@ var<storage, read_write> dst: array<f32>;
 var<uniform> params: Params;
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let i = gid.x + gid.y * groups.x * 256u;
     let half_dim = params.dim / 2u;
     let total = params.seq * half_dim;
     if i >= total { return; }

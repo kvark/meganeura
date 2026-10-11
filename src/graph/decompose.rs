@@ -1333,7 +1333,7 @@ fn accepts(op: &Op, ins: &[&TensorType], out: &TensorType) -> bool {
                 && rope_x_ok(ins[0], out, head_dim as usize)
                 && ins[1].dtype == F32
                 && ins[1].shape == [out.shape[0], 3]
-                && axes_dim.iter().all(|d| d.is_multiple_of(2))
+                && axes_dim.iter().all(|d| *d > 0 && d.is_multiple_of(2))
                 && axes_dim.iter().sum::<u32>() == head_dim
         }
         Op::CausalAttention {
@@ -2049,11 +2049,13 @@ fn axial_rope_guess(g: &Graph, concat: NodeId) -> Vec<(Op, Vec<NodeId>)> {
         };
 
         let repeated = unview(g, parts.pos);
-        if !matches!(g.node(repeated).op, Op::BroadcastTo) {
-            continue;
-        }
-        let Some(axis_position) = input(g, repeated, 0).map(|id| unview(g, id)) else {
-            continue;
+        let axis_position = if matches!(g.node(repeated).op, Op::BroadcastTo) {
+            let Some(axis_position) = input(g, repeated, 0).map(|id| unview(g, id)) else {
+                continue;
+            };
+            axis_position
+        } else {
+            repeated
         };
         let Op::SplitA {
             channels_a: 1,
@@ -2398,4 +2400,26 @@ fn per_channel_dims(g: &Graph, node: &Node, gate: NodeId) -> (u32, u32) {
     let planes = g.node(gate).ty.num_elements().max(1);
     let spatial = (node.ty.num_elements() / planes) as u32;
     (planes as u32, spatial)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validity_rejects_zero_width_axial_rope_axes() {
+        let x = TensorType::f32(vec![2, 16]);
+        let positions = TensorType::f32(vec![2, 3]);
+        for axes_dim in [[0, 8, 8], [8, 0, 8], [8, 8, 0]] {
+            let op = Op::AxialRoPE {
+                theta: 10_000.0,
+                head_dim: 16,
+                axes_dim,
+            };
+            assert!(
+                !accepts(&op, &[&x, &positions], &x),
+                "accepted zero-width axes {axes_dim:?}"
+            );
+        }
+    }
 }

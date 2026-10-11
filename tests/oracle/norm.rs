@@ -416,6 +416,43 @@ fn axial_rope_positions() {
     );
 }
 
+#[test]
+fn axial_rope_qwen_scale_positions() {
+    const TEXT_ROWS: usize = 64;
+    const IMAGE_WIDTH: usize = 32;
+    const IMAGE_HEIGHT: usize = 24;
+    const ROWS: usize = TEXT_ROWS + IMAGE_WIDTH * IMAGE_HEIGHT;
+
+    let mut g = Graph::new();
+    let x = g.input("x", &[ROWS, 256]);
+    let pos = g.input("pos", &[ROWS, 3]);
+    let y = g.axial_rope_with_positions(x, 10_000.0, pos, 128, [16, 56, 56]);
+    g.set_outputs(vec![y]);
+
+    // Exercise the position scale that exposed f32 angle-rounding error in
+    // Qwen-Image: a text prefix followed by a 32x24 image grid.
+    let mut positions = Vec::with_capacity(ROWS * 3);
+    for row in 0..TEXT_ROWS {
+        let p = 600.0 + row as f32;
+        positions.extend_from_slice(&[p, p, p]);
+    }
+    for y in 0..IMAGE_HEIGHT {
+        for x in 0..IMAGE_WIDTH {
+            positions.extend_from_slice(&[2_000.0, 600.0 + y as f32, 2_000.0 + x as f32]);
+        }
+    }
+    let mut feeds = random_feeds(&g, 20261012);
+    feeds.set("pos", &positions);
+    let mut sweep = Sweep::default();
+    sweep.inference(
+        "axial rope Qwen-scale positions",
+        &g,
+        &feeds,
+        &options(true),
+    );
+    sweep.finish();
+}
+
 /// `(M, D, P)` for the pairwise ops.
 const PAIRWISE_SHAPES: &[(usize, usize, usize)] =
     &[(1, 1, 1), (3, 5, 2), (17, 64, 4), (300, 3, 1), (2, 300, 3)];

@@ -8,9 +8,9 @@ struct Params {
     // Static offset added to the dynamic one (zero from the builders).
     pos_offset: u32,
     head_dim: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    axis_dim0: u32,
+    axis_dim1: u32,
+    axis_dim2: u32,
 }
 
 var<storage> src: array<f32>;
@@ -19,8 +19,11 @@ var<storage> pos_offset_buf: array<u32>;
 var<uniform> params: Params;
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let i = gid.x + gid.y * groups.x * 256u;
     let half_dim = params.dim / 2u;
     let total = params.seq * half_dim;
     if i >= total { return; }
@@ -55,8 +58,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // The storage binding is shared with the dynamic-offset entry point; this
 // entry interprets it as one absolute position per row.
 @compute @workgroup_size(256)
-fn with_positions(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn with_positions(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let i = gid.x + gid.y * groups.x * 256u;
     let half_dim = params.dim / 2u;
     let total = params.seq * half_dim;
     if i >= total { return; }
@@ -87,8 +93,11 @@ fn with_positions(@builtin(global_invocation_id) gid: vec3<u32>) {
 // `pos_offset_buf` is `[seq, 3]` f32 data. The shared binding is declared
 // u32 for the other entry points, so recover each coordinate by bitcast.
 @compute @workgroup_size(256)
-fn axial_positions(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn axial_positions(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let i = gid.x + gid.y * groups.x * 256u;
     let pairs_per_row = params.dim / 2u;
     let total = params.seq * pairs_per_row;
     if i >= total { return; }
@@ -99,20 +108,20 @@ fn axial_positions(@builtin(global_invocation_id) gid: vec3<u32>) {
     let head = pair_in_row / pairs_per_head;
     let pair_in_head = pair_in_row % pairs_per_head;
 
-    let axis0_pairs = params._pad0 / 2u;
-    let axis1_pairs = params._pad1 / 2u;
+    let axis0_pairs = params.axis_dim0 / 2u;
+    let axis1_pairs = params.axis_dim1 / 2u;
     var axis = 0u;
     var local_pair = pair_in_head;
-    var axis_dim = params._pad0;
+    var axis_dim = params.axis_dim0;
     if pair_in_head >= axis0_pairs {
         axis = 1u;
         local_pair = pair_in_head - axis0_pairs;
-        axis_dim = params._pad1;
+        axis_dim = params.axis_dim1;
     }
     if pair_in_head >= axis0_pairs + axis1_pairs {
         axis = 2u;
         local_pair = pair_in_head - axis0_pairs - axis1_pairs;
-        axis_dim = params._pad2;
+        axis_dim = params.axis_dim2;
     }
 
     let pos = bitcast<f32>(pos_offset_buf[row * 3u + axis]);
@@ -139,8 +148,11 @@ fn axial_positions(@builtin(global_invocation_id) gid: vec3<u32>) {
 var<storage> factors: array<f32>;
 
 @compute @workgroup_size(256)
-fn with_factors(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn with_factors(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let i = gid.x + gid.y * groups.x * 256u;
     let half_dim = params.dim / 2u;
     let total = params.seq * half_dim;
     if i >= total { return; }

@@ -1971,7 +1971,7 @@ impl<'a> Compiler<'a> {
                     let factors = self.get_buffer(node.inputs[2]);
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::RoPEDynamicFactors,
-                        workgroups: [(seq * dim / 2).div_ceil(256), 1, 1],
+                        workgroups: linear_grid((seq * dim / 2).div_ceil(256)),
                         input_buffers: vec![input, offset_buf, factors],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
@@ -1984,7 +1984,7 @@ impl<'a> Compiler<'a> {
                     let offset_buf = self.get_buffer(node.inputs[1]);
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::RoPEDynamic,
-                        workgroups: [(seq * dim / 2).div_ceil(256), 1, 1],
+                        workgroups: linear_grid((seq * dim / 2).div_ceil(256)),
                         input_buffers: vec![input, offset_buf],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
@@ -1995,7 +1995,7 @@ impl<'a> Compiler<'a> {
                 } else {
                     self.plan.dispatches.push(Dispatch {
                         shader: ShaderEntry::RoPE,
-                        workgroups: [(seq * dim / 2).div_ceil(256), 1, 1],
+                        workgroups: linear_grid((seq * dim / 2).div_ceil(256)),
                         input_buffers: vec![input],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
@@ -2014,7 +2014,7 @@ impl<'a> Compiler<'a> {
                 let dim = shape[1] as u32;
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::RoPEPositions,
-                    workgroups: [(seq * dim / 2).div_ceil(256), 1, 1],
+                    workgroups: linear_grid((seq * dim / 2).div_ceil(256)),
                     input_buffers: vec![input, positions],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
@@ -2036,7 +2036,7 @@ impl<'a> Compiler<'a> {
                 let dim = shape[1] as u32;
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::AxialRoPE,
-                    workgroups: [(seq * dim / 2).div_ceil(256), 1, 1],
+                    workgroups: linear_grid((seq * dim / 2).div_ceil(256)),
                     input_buffers: vec![input, positions],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
@@ -2065,8 +2065,8 @@ impl<'a> Compiler<'a> {
                 head_dim,
                 ..
             } => {
-                // Route through unified attention shader.
-                // kv_seq=0 signals causal mask at runtime.
+                // Route through the unified attention shader. Every row is
+                // causal, so the key length grows through the whole sequence.
                 let mut q = self.get_buffer(node.inputs[0]);
                 let mut k = self.get_buffer(node.inputs[1]);
                 let v = self.get_buffer(node.inputs[2]);
@@ -2081,7 +2081,7 @@ impl<'a> Compiler<'a> {
                         let rotated = self.alloc_buffer(ty.size_bytes());
                         self.plan.dispatches.push(Dispatch {
                             shader: ShaderEntry::RoPE,
-                            workgroups: [(seq * dim / 2).div_ceil(256), 1, 1],
+                            workgroups: linear_grid((seq * dim / 2).div_ceil(256)),
                             input_buffers: vec![*operand],
                             output_buffer: rotated,
                             extra_outputs: vec![],
@@ -2105,7 +2105,7 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
                     extra_outputs: vec![lse_buf],
-                    params: vec![seq, 0, (num_heads << 16) | num_kv_heads, head_dim],
+                    params: vec![seq, seq, (num_heads << 16) | num_kv_heads, head_dim, 0, seq],
 
                     ..Default::default()
                 });
@@ -2117,8 +2117,8 @@ impl<'a> Compiler<'a> {
                 head_dim,
                 window_size,
             } => {
-                // Route through unified attention shader.
-                // kv_seq=0 signals causal, window_size>0 limits the window.
+                // Route through unified attention shader. Every row is causal,
+                // and window_size limits how many preceding keys remain visible.
                 let q = self.get_buffer(node.inputs[0]);
                 let k = self.get_buffer(node.inputs[1]);
                 let v = self.get_buffer(node.inputs[2]);
@@ -2139,10 +2139,11 @@ impl<'a> Compiler<'a> {
                     extra_outputs: vec![lse_buf],
                     params: vec![
                         seq,
-                        0,
+                        seq,
                         (num_heads << 16) | num_kv_heads,
                         head_dim,
                         window_size,
+                        seq,
                     ],
 
                     ..Default::default()
@@ -2160,7 +2161,7 @@ impl<'a> Compiler<'a> {
                 let dim = shape[1] as u32;
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::RoPEGrad,
-                    workgroups: [(seq * dim / 2).div_ceil(256), 1, 1],
+                    workgroups: linear_grid((seq * dim / 2).div_ceil(256)),
                     input_buffers: vec![grad_out],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
@@ -3251,44 +3252,16 @@ impl<'a> Compiler<'a> {
                 });
             }
 
+            // Full, block-causal and cross attention share one lowering. A
+            // nonzero causal_rows applies the causal key limit only to that
+            // prefix; zero leaves every query row unmasked.
             Op::BlockCausalAttention {
                 num_heads,
                 num_kv_heads,
                 head_dim,
-                prefix_len,
-            } => {
-                let q = self.get_buffer(node.inputs[0]);
-                let k = self.get_buffer(node.inputs[1]);
-                let v = self.get_buffer(node.inputs[2]);
-                let seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
-                let lse_buf = self.find_lse_buffer(node.id);
-                let (shader, workgroups) = self.attention_dispatch(
-                    seq,
-                    head_dim,
-                    num_heads,
-                    node.requires_full_precision,
-                    node.attention_impl,
-                );
-                self.plan.dispatches.push(Dispatch {
-                    shader,
-                    workgroups,
-                    input_buffers: vec![q, k, v],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![lse_buf],
-                    params: vec![
-                        seq,
-                        seq,
-                        (num_heads << 16) | num_kv_heads,
-                        head_dim,
-                        0x8000_0000 | prefix_len,
-                    ],
-                    ..Default::default()
-                });
+                ..
             }
-
-            // Full and cross attention are the wrapper's self and cross
-            // forms: one lowering, with the key length from K's shape.
-            Op::FullAttention {
+            | Op::FullAttention {
                 num_heads,
                 num_kv_heads,
                 head_dim,
@@ -3309,6 +3282,10 @@ impl<'a> Compiler<'a> {
                 let v = self.get_buffer(node.inputs[2]);
                 let q_seq = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let kv_seq = self.graph.node(node.inputs[1]).ty.shape[0] as u32;
+                let causal_rows = match node.op {
+                    Op::BlockCausalAttention { prefix_len, .. } => prefix_len,
+                    _ => 0,
+                };
                 let lse_buf = self.find_lse_buffer(node.id);
                 let (shader, workgroups) = self.attention_dispatch(
                     q_seq,
@@ -3323,7 +3300,14 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
                     extra_outputs: vec![lse_buf],
-                    params: vec![q_seq, kv_seq, (num_heads << 16) | num_kv_heads, head_dim],
+                    params: vec![
+                        q_seq,
+                        kv_seq,
+                        (num_heads << 16) | num_kv_heads,
+                        head_dim,
+                        0,
+                        causal_rows,
+                    ],
 
                     ..Default::default()
                 });
