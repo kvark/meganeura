@@ -1220,14 +1220,15 @@ pub(crate) fn generate_conv_module(
     params: Option<&[u32]>,
 ) -> ShaderModule {
     let (source, tile) = match group {
-        ShaderGroup::Conv2dGemm => (include_str!("shaders/conv2d_gemm.wgsl"), MatMulTile::Large),
-        ShaderGroup::Conv2dGemmSmall => {
-            (include_str!("shaders/conv2d_gemm.wgsl"), MatMulTile::Small)
+        ShaderGroup::Conv2dGemm => {
+            return conv_forward_tiled(MatMulTile::Large, k_tile, params);
         }
-        ShaderGroup::Conv2dGemm16 => (
-            include_str!("shaders/conv2d_gemm.wgsl"),
-            MatMulTile::Occupancy,
-        ),
+        ShaderGroup::Conv2dGemmSmall => {
+            return conv_forward_tiled(MatMulTile::Small, k_tile, params);
+        }
+        ShaderGroup::Conv2dGemm16 => {
+            return conv_forward_tiled(MatMulTile::Occupancy, k_tile, params);
+        }
         ShaderGroup::Conv2dGradInputGemm => (
             include_str!("shaders/conv2d_grad_input_gemm.wgsl"),
             MatMulTile::Large,
@@ -1317,6 +1318,28 @@ fn conv_gemm_tiled(
         ],
     );
     ShaderModule::new(&src)
+}
+
+/// The forward convolution's B rows can carry their (ci, kh, kw) digits
+/// across K stages. The uniform shader splits them once per thread, because
+/// its remainders divide by dynamic values. With constant divisors a split
+/// per stage is cheap, and it measured faster than carrying the digits.
+fn conv_forward_tiled(tile: MatMulTile, k_tile: u32, params: Option<&[u32]>) -> ShaderModule {
+    let split = |start: &str| {
+        format!(
+            "var b_k = split_digits({start}tid / $BM_U, params.kernel_h, params.kernel_w, params.kernel_w_multiplier, params.kernel_hw_multiplier);"
+        )
+    };
+    let (once, per_stage) = if params.is_some() {
+        (String::new(), split("t + "))
+    } else {
+        (split(""), String::new())
+    };
+    let source = preprocess(
+        include_str!("shaders/conv2d_gemm.wgsl"),
+        &[("$B_DIGITS_ONCE", &once), ("$B_DIGITS_STAGE", &per_stage)],
+    );
+    conv_gemm_tiled(&source, tile, k_tile, params)
 }
 
 fn conv_grad_weight_tiled(
