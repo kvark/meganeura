@@ -8,15 +8,17 @@
   either stop.
 - `KernelMemo` is public. `BuildSearchOptions::kernel_memo` lets searches
   share private kernel decisions, and `KernelMemo::save`/`load` carry them
-  between processes. Decisions are resumed only on the same device, driver
-  and decision policy; budgets do not affect them. A resumed winner is still
-  covered by whole-program qualification. Without a memo, each search keeps
-  its decisions private, as before.
+  between processes. Saves use exclusive adjacent temporary files, so concurrent
+  writers cannot truncate one another's saves or unrelated `.partial` siblings.
+  Decisions are resumed only on the same engine version, memo revision, device,
+  driver and decision policy; budgets do not affect them. A resumed winner is
+  still covered by whole-program qualification. Without a memo, each search
+  keeps its decisions private, as before.
 - Measured-search challengers are constructed on the incumbent's identically
-  stored parameters that neither program writes, including fused weights,
-  instead of allocating and zeroing private copies. The new
-  `Session::inherits_parameter` tells an initializer which uploads it can
-  skip. Writing an inherited parameter writes the incumbent's storage, so
+  stored parameters that neither program writes, including fused weights with
+  matching derivation recipes, instead of allocating and zeroing private copies.
+  The new `Session::inherits_parameter` tells an initializer which uploads it
+  can skip. Writing an inherited parameter writes the incumbent's storage, so
   initializers must keep writing the same values for every candidate.
 - Sessions on one GPU context share compiled pipelines with identical
   generated WGSL, entry point and binding layout, and the last user destroys

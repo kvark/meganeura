@@ -85,7 +85,7 @@ pub struct BuildSearchReport {
     pub truncated: bool,
     /// Stopped by [`BuildSearchOptions::patience`].
     pub patience_exhausted: bool,
-    /// Stopped early because no further comparison could finish by the deadline.
+    /// Stopped early because recent costs predict insufficient comparison time.
     pub deadline_reserved: bool,
     /// Requalification of the selected program after the last trial; zero
     /// when nothing ran after its own check.
@@ -108,9 +108,10 @@ pub struct BuildSearchReport {
 /// observable output, gradient and persistent update against your numerical
 /// contract. Every program is qualified after kernel tuning, before it is timed;
 /// one with kernel classes left to probe is also qualified before tuning. A
-/// winning challenger is qualified again after measurement, and the selected
-/// program once more before construction returns. A failing challenger is
-/// discarded; a failing final incumbent aborts construction.
+/// winning challenger is qualified again after measurement. The selected program
+/// is checked before returning only if another challenger ran since its last
+/// check. A failing challenger is discarded; a failing final incumbent aborts
+/// construction.
 /// Written inputs, parameters and constants are reset before each step, outside
 /// timing. The returned session retains its initialized persistent state; outputs
 /// hold its last qualified step. Timing includes fresh recording/submission/wait,
