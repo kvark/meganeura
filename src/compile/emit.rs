@@ -1889,13 +1889,12 @@ impl<'a> Compiler<'a> {
             }
 
             Op::ToF16 => {
-                // Elementwise f32 → f16 cast. UnaryData layout (src, dst,
-                // params); dst is an f16 buffer.
+                // Pack two f16 elements per word without native f16 arithmetic.
                 let src = self.get_buffer(node.inputs[0]);
                 let len = node.ty.num_elements() as u32;
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::ToF16,
-                    workgroups: [len.div_ceil(256), 1, 1],
+                    workgroups: [len.div_ceil(512), 1, 1],
                     input_buffers: vec![src],
                     output_buffer: out_buf,
                     extra_outputs: vec![],

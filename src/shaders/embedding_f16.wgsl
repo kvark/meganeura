@@ -1,4 +1,3 @@
-enable f16;
 // Embedding gather from an f16 table → f32 output. Same as embedding.wgsl
 // but the source table is f16, halving the bytes read per gathered element
 // — the lever for scatter-gather-bandwidth-bound lookups (SH coefficients).
@@ -10,7 +9,7 @@ struct Params {
 }
 
 var<storage> indices: array<u32>;
-var<storage> src: array<f16>;
+var<storage> src: array<u32>;
 var<storage, read_write> dst: array<f32>;
 var<uniform> params: Params;
 
@@ -23,5 +22,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let col = i % params.hidden;
     // An id past the table reads its last row rather than past its end.
     let token_id = min(indices[row], params.rows - 1u);
-    dst[i] = f32(src[token_id * params.hidden + col]);
+    let offset = token_id * params.hidden + col;
+    dst[i] = unpack2x16float(src[offset / 2u])[offset % 2u];
 }

@@ -5,20 +5,34 @@
 //! outputs with ONNX's reference evaluator. Each must import, run on the
 //! GPU, and build its decomposed norms and softmax as fused kernels.
 
-use std::path::PathBuf;
-
 use meganeura::graph::Op;
-use meganeura::{Mode, SessionConfig, load_onnx};
+use meganeura::{Mode, SessionConfig, load_onnx_bytes};
 
-fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/onnx")
-        .join(name)
+// Embed the small fixtures so cross-compiled tests do not need the host checkout.
+pub(super) fn fixture(name: &str) -> &'static [u8] {
+    macro_rules! fixtures {
+        ($($file:literal),* $(,)?) => {
+            match name {
+                $($file => include_bytes!(concat!("fixtures/onnx/", $file)),)*
+                _ => panic!("unknown ONNX fixture: {name}"),
+            }
+        };
+    }
+    fixtures!(
+        "bert_layer.onnx",
+        "bert_layer.input.bin",
+        "bert_layer.expected.bin",
+        "llama_layer.onnx",
+        "llama_layer.input.bin",
+        "llama_layer.expected.bin",
+        "llama_gqa_dynamic_layer.onnx",
+        "llama_gqa_dynamic_layer.input.bin",
+        "llama_gqa_dynamic_layer.expected.bin",
+    )
 }
 
 fn floats(name: &str) -> Vec<f32> {
-    std::fs::read(fixture(name))
-        .unwrap()
+    fixture(name)
         .as_chunks::<4>()
         .0
         .iter()
@@ -28,7 +42,7 @@ fn floats(name: &str) -> Vec<f32> {
 
 /// Run the export and return the recognized, optimized graph's ops.
 fn run(name: &str) -> Vec<Op> {
-    let model = load_onnx(&fixture(&format!("{name}.onnx")))
+    let model = load_onnx_bytes(fixture(&format!("{name}.onnx")), None)
         .unwrap_or_else(|e| panic!("{name}: import failed: {e}"));
     let mut config = SessionConfig::from_env();
     config.mode = Mode::Inference;

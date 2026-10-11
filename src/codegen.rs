@@ -1084,7 +1084,6 @@ pub fn generate_wgsl(group: ShaderGroup) -> String {
                 | naga::valid::Capabilities::SHADER_FLOAT16
                 | naga::valid::Capabilities::SUBGROUP
         }
-        ShaderGroup::ToF16 => naga::valid::Capabilities::SHADER_FLOAT16,
         _ => naga::valid::Capabilities::empty(),
     };
     module_to_wgsl(&sm.module, capabilities)
@@ -1477,9 +1476,11 @@ fn matmul_vars_tiled(
             String::new(),
         ),
         WeightFormat::F16 => (
-            "enable f16;",
-            "array<f16>",
-            format!("f32($B_BUFFER[select(0u, {}, in_bounds)])", b_idx),
+            "",
+            "array<u32>",
+            format!(
+                "unpack2x16float($B_BUFFER[select(0u, {b_idx}, in_bounds) / 2u])[select(0u, {b_idx}, in_bounds) % 2u]"
+            ),
             String::new(),
         ),
         WeightFormat::Q4 => (
@@ -1906,7 +1907,7 @@ fn specialize_gemv(source: &str, shape: GemvShape) -> String {
         }
         GemvReduction::Subgroup => (
             template_section(GEMV_TEMPLATE, "subgroup_reduce").to_owned(),
-            ", @builtin(subgroup_invocation_id) sg_id: u32, @builtin(subgroup_id) wave_id: u32, @builtin(num_subgroups) wave_count: u32",
+            ", @builtin(subgroup_invocation_id) sg_id: u32, @builtin(subgroup_id) wave_id: u32, @builtin(subgroup_size) wave_size: u32",
             "group_total".to_owned(),
         ),
     };
@@ -1982,12 +1983,14 @@ fn generate_gemv(
     let fragment = |name| template_section(GEMV_TEMPLATE, name);
     let b_storage = match format {
         WeightFormat::F32 => "array<vec4<f32>>",
-        WeightFormat::F16 => "array<vec4<f16>>",
+        WeightFormat::F16 => "array<vec2<u32>>",
         _ => "array<u32>",
     };
     let load = |index: &str| {
         if format == WeightFormat::F16 {
-            format!("vec4<f32>(matrix_b[{index}])")
+            format!(
+                "vec4<f32>(unpack2x16float(matrix_b[{index}].x), unpack2x16float(matrix_b[{index}].y))"
+            )
         } else {
             format!("matrix_b[{index}]")
         }
@@ -2085,14 +2088,6 @@ fn generate_gemv(
             ("$STORE", &store),
             ("$WEIGHT_LOAD", &weight_load),
             ("$WEIGHT_HELPERS", &helpers),
-            (
-                "$ENABLE_F16",
-                if format == WeightFormat::F16 {
-                    "enable f16;"
-                } else {
-                    ""
-                },
-            ),
             ("$EPS_FIELD", if norm { "eps_bits" } else { "_pad" }),
             (
                 "$NORM_WEIGHT",
@@ -3217,10 +3212,7 @@ mod tests {
             ),
             (ShaderGroup::RmsNormAdd, naga::valid::Capabilities::empty()),
             (ShaderGroup::Embedding, naga::valid::Capabilities::empty()),
-            (
-                ShaderGroup::ToF16,
-                naga::valid::Capabilities::SHADER_FLOAT16,
-            ),
+            (ShaderGroup::ToF16, naga::valid::Capabilities::empty()),
             (ShaderGroup::RoPE, naga::valid::Capabilities::empty()),
             (ShaderGroup::RoPEGrad, naga::valid::Capabilities::empty()),
             (ShaderGroup::LayerNorm, naga::valid::Capabilities::empty()),
@@ -3846,7 +3838,6 @@ mod tests {
     #[cfg(not(target_vendor = "apple"))]
     fn all_shaders_compile_to_spirv() {
         let empty = naga::valid::Capabilities::empty();
-        let f16 = naga::valid::Capabilities::SHADER_FLOAT16;
         let coop = naga::valid::Capabilities::COOPERATIVE_MATRIX
             | naga::valid::Capabilities::SHADER_FLOAT16
             | naga::valid::Capabilities::SUBGROUP;
@@ -3870,7 +3861,7 @@ mod tests {
             (ShaderGroup::CrossEntropy, empty),
             (ShaderGroup::RmsNormAdd, empty),
             (ShaderGroup::Embedding, empty),
-            (ShaderGroup::ToF16, f16),
+            (ShaderGroup::ToF16, empty),
             (ShaderGroup::RoPE, empty),
             (ShaderGroup::RoPEGrad, empty),
             (ShaderGroup::LayerNorm, empty),
@@ -4410,7 +4401,7 @@ mod tests {
         assert_eq!(legacy.column_groups, 1);
         let formats = [
             (WeightFormat::F32, "matrix_b: array<vec4<f32>>"),
-            (WeightFormat::F16, "array<vec4<f16>>"),
+            (WeightFormat::F16, "array<vec2<u32>>"),
             (WeightFormat::Q4, "dequant_q4("),
             (WeightFormat::Q8, "dequant_q8("),
             (WeightFormat::Q40, "dequant_q40("),
@@ -4452,12 +4443,8 @@ mod tests {
                                 GemvReduction::Tree => naga::valid::Capabilities::empty(),
                                 GemvReduction::Subgroup => naga::valid::Capabilities::SUBGROUP,
                             } | match format {
-                                // f16 storage reads real `f16` values.
-                                WeightFormat::F16 => naga::valid::Capabilities::SHADER_FLOAT16,
-                                // Block scales are f16 bit patterns decoded with
-                                // `unpack2x16float` into f32, which is the weaker
-                                // capability — it needs no f16 arithmetic type.
-                                f if f.is_quantized() => {
+                                // Half weights and block scales decode into f32.
+                                f if f == WeightFormat::F16 || f.is_quantized() => {
                                     naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32
                                 }
                                 _ => naga::valid::Capabilities::empty(),
@@ -4519,7 +4506,7 @@ mod tests {
     fn grouped_gemv_columns_validate() {
         for format in [WeightFormat::F32, WeightFormat::F16] {
             let caps = if format == WeightFormat::F16 {
-                naga::valid::Capabilities::SHADER_FLOAT16
+                naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32
             } else {
                 naga::valid::Capabilities::empty()
             };
@@ -4723,9 +4710,9 @@ mod tests {
     }
 
     #[test]
-    fn reduced_storage_gemv_variants_keep_typed_b() {
+    fn reduced_storage_gemv_variants_decode_weights() {
         for (format, marker) in [
-            (WeightFormat::F16, "array<vec4<f16>>"),
+            (WeightFormat::F16, "array<vec2<u32>>"),
             (WeightFormat::Q4, "dequant_q4("),
             (WeightFormat::Q8, "dequant_q8("),
             (WeightFormat::Q40, "dequant_q40("),
@@ -4980,7 +4967,7 @@ mod tests {
                 MatmulKnobs::default()
             )
             .source
-            .contains("array<f16>")
+            .contains("unpack2x16float")
         );
         // The forward groups are unaffected.
         assert!(
