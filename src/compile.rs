@@ -1186,6 +1186,8 @@ pub enum Kernel {
     },
     SpecializedConv {
         k_tile: u32,
+        #[serde(default)]
+        interleave_columns: bool,
     },
     Cooperative,
     /// Four subgroup tiles sharing aligned native-f32 operands. More than
@@ -1262,9 +1264,19 @@ impl Dispatch {
 
     pub fn conv_k_tile(&self) -> Option<u32> {
         match self.kernel {
-            Kernel::SpecializedConv { k_tile } => Some(k_tile),
+            Kernel::SpecializedConv { k_tile, .. } => Some(k_tile),
             _ => None,
         }
+    }
+
+    pub fn conv_interleave_columns(&self) -> bool {
+        matches!(
+            self.kernel,
+            Kernel::SpecializedConv {
+                interleave_columns: true,
+                ..
+            }
+        )
     }
 
     pub fn gemv_shape(&self) -> Option<crate::codegen::GemvShape> {

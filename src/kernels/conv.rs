@@ -67,6 +67,7 @@ pub(crate) fn entry(kind: Kind, tile: u32) -> ShaderEntry {
 /// shader uses. The uniform software divisor stays available to tuning.
 pub(crate) fn exact_kernel() -> Kernel {
     Kernel::SpecializedConv {
+        interleave_columns: false,
         k_tile: EXACT_K_TILE,
     }
 }

@@ -1,5 +1,11 @@
 # Unreleased
 
+- Scalar convolution tuning measures contiguous and interleaved register-tile
+  columns separately for forward, input-gradient and weight-gradient kernels.
+  The choice is part of the pipeline key, plan and kernel memo; ordinary builds
+  retain contiguous columns. Plan-cache format 26 and memo revision 2 invalidate
+  older decisions. `bench_gemv_layout` measures dense GEMV layouts with finite
+  independent products and a full f64 output check before and after timing.
 - Measured search alternates graph forms with physical choices on the current
   winner, reaching more attention layouts within the program bound. Winning
   choices carry over between axes; remaining interactions follow if the budget

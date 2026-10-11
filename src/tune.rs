@@ -190,10 +190,13 @@ pub enum MatmulTile {
     Tile64,
     Scalar(crate::codegen::ScalarMatmulShape),
     /// Scalar convolution with immutable parameters and native integer division.
-    /// Both spatial tiles and K-stage sizes are selected by measurement.
+    /// Spatial tiles, K-stage sizes and column assignment are measured.
     SpecializedConv {
         tile_size: u32,
         k_tile: u32,
+        /// Give adjacent lanes adjacent columns of the register tile.
+        #[serde(default)]
+        interleave_columns: bool,
     },
     /// Hardware-native f32 operands/accumulators, never f16 staging.
     CooperativeF32 {
@@ -302,9 +305,13 @@ impl MatmulTile {
                     32 => Self::Tile32,
                     _ => Self::Tile64,
                 }),
-                Kernel::SpecializedConv { k_tile } => Some(Self::SpecializedConv {
+                Kernel::SpecializedConv {
+                    k_tile,
+                    interleave_columns,
+                } => Some(Self::SpecializedConv {
                     tile_size: launched,
                     k_tile,
+                    interleave_columns,
                 }),
                 Kernel::Cooperative => Self::native_cooperative(config),
                 _ => None,
@@ -315,9 +322,13 @@ impl MatmulTile {
                     Some(if small { Self::Tile32 } else { Self::Tile64 })
                 }
                 Kernel::ScalarMatmul(shape) => Some(Self::Scalar(shape)),
-                Kernel::SpecializedConv { k_tile } => Some(Self::SpecializedConv {
+                Kernel::SpecializedConv {
+                    k_tile,
+                    interleave_columns,
+                } => Some(Self::SpecializedConv {
                     tile_size: if small { 32 } else { 64 },
                     k_tile,
+                    interleave_columns,
                 }),
                 Kernel::Cooperative => Self::native_cooperative(config),
                 Kernel::CooperativeTiled { shape, splits }
@@ -380,9 +391,14 @@ impl MatmulTile {
             Self::CooperativeTiled { shape, splits } => {
                 crate::compile::Kernel::CooperativeTiled { shape, splits }
             }
-            Self::SpecializedConv { k_tile, .. } => {
-                crate::compile::Kernel::SpecializedConv { k_tile }
-            }
+            Self::SpecializedConv {
+                k_tile,
+                interleave_columns,
+                ..
+            } => crate::compile::Kernel::SpecializedConv {
+                k_tile,
+                interleave_columns,
+            },
             Self::Gemv(_) => unreachable!(),
         };
     }
@@ -471,7 +487,10 @@ impl MatmulTile {
             }
             return Some(sizes);
         }
-        if let Self::SpecializedConv { tile_size, k_tile } = self {
+        if let Self::SpecializedConv {
+            tile_size, k_tile, ..
+        } = self
+        {
             if class.conv2d.is_none()
                 || !matches!(tile_size, 16 | 32 | 64)
                 || !matches!(k_tile, 16 | 32)
@@ -813,10 +832,16 @@ impl TuneClass {
                     _ => MatmulTile::Tile64,
                 });
                 for k_tile in [16, 32] {
-                    out.push(MatmulTile::SpecializedConv {
-                        tile_size: tile,
-                        k_tile,
-                    });
+                    for interleave_columns in [false, true] {
+                        if tile == 16 && interleave_columns {
+                            continue;
+                        }
+                        out.push(MatmulTile::SpecializedConv {
+                            tile_size: tile,
+                            k_tile,
+                            interleave_columns,
+                        });
+                    }
                 }
             }
             return out
@@ -1714,9 +1739,9 @@ mod tests {
                 }
             );
             let candidates = class.challengers(MatmulTile::Tile64, Some(&native_config(16)));
-            // 16/32/64 tiles, each with the plain kernel and two K stages,
-            // minus the 64-wide incumbent.
-            assert_eq!(candidates.len(), 8);
+            // Plain tiles and specialized K stages; 32/64-wide tiles also
+            // challenge column interleaving. Exclude the incumbent.
+            assert_eq!(candidates.len(), 12);
             for candidate in candidates {
                 candidate.apply(&mut d, &class);
                 assert_eq!(MatmulTile::selected(&d, None), Some(candidate));
@@ -1789,7 +1814,10 @@ mod tests {
             variants[11].params[1] = u32::MAX;
             variants[12].weight_format = crate::compile::WeightFormat::F16;
             variants[13].shader = ShaderEntry::Conv2dGradInputGemmCoopGen(3, 2, 2);
-            variants[14].kernel = crate::compile::Kernel::SpecializedConv { k_tile: 7 };
+            variants[14].kernel = crate::compile::Kernel::SpecializedConv {
+                k_tile: 7,
+                interleave_columns: false,
+            };
             variants[15].input_buffers.pop();
             variants[16].params[5] = 100;
             for d in variants {

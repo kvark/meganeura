@@ -30,7 +30,7 @@ pub struct KernelMemo {
 
 // Bump when kernel generation, qualification or decision semantics change,
 // including changes between package releases. This also versions the memo schema.
-const KERNEL_MEMO_REVISION: u32 = 1;
+const KERNEL_MEMO_REVISION: u32 = 2;
 
 /// What a recorded decision depends on besides its class key.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -312,11 +312,17 @@ pub(super) fn tile_module(
             },
         );
     }
-    if let MatmulTile::SpecializedConv { k_tile, .. } = tile {
+    if let MatmulTile::SpecializedConv {
+        k_tile,
+        interleave_columns,
+        ..
+    } = tile
+    {
         let params = super::Conv2dParams::from(dispatch);
         return crate::codegen::generate_conv_module(
             selected_entry.shader_group(),
             k_tile,
+            interleave_columns,
             Some(bytemuck::cast_slice(std::slice::from_ref(&params))),
         );
     }
@@ -2058,6 +2064,51 @@ mod memo_tests {
     }
 
     #[test]
+    fn convolution_column_layout_has_distinct_pipeline_and_persisted_choices() {
+        let legacy: MatmulTile =
+            serde_json::from_str(r#"{"SpecializedConv":{"tile_size":32,"k_tile":16}}"#).unwrap();
+        let contiguous = MatmulTile::SpecializedConv {
+            tile_size: 32,
+            k_tile: 16,
+            interleave_columns: false,
+        };
+        let interleaved = MatmulTile::SpecializedConv {
+            tile_size: 32,
+            k_tile: 16,
+            interleave_columns: true,
+        };
+        assert_eq!(legacy, contiguous);
+        for entry in [
+            ShaderEntry::Conv2dGemm,
+            ShaderEntry::Conv2dGradInputGemm,
+            ShaderEntry::Conv2dGradWeightGemm,
+        ] {
+            let dispatch = Dispatch {
+                shader: entry,
+                params: vec![1; 12],
+                ..Default::default()
+            };
+            assert_ne!(
+                tile_variant(&dispatch, contiguous),
+                tile_variant(&dispatch, interleaved)
+            );
+        }
+        let directory = TestDirectory::new();
+        let path = directory.0.join("conv-memo.json");
+        let mut memo = populated_memo();
+        let (mut key, mut progress) = memo.progress.drain().next().unwrap();
+        key.3 = vec![contiguous, interleaved];
+        progress.selected = interleaved;
+        memo.progress.insert(key, progress);
+        memo.save(&path).unwrap();
+        let loaded = KernelMemo::load(&path).unwrap();
+        assert_eq!(
+            loaded.progress.values().next().unwrap().selected,
+            interleaved
+        );
+    }
+
+    #[test]
     fn persists_and_discards_other_policies() {
         let directory = TestDirectory::new();
         let path = directory.0.join("memo.json");
@@ -2705,6 +2756,7 @@ mod tests {
             MatmulTile::SpecializedConv {
                 tile_size: 32,
                 k_tile: 16,
+                interleave_columns: false,
             }
         } else {
             MatmulTile::Scalar(crate::codegen::ScalarMatmulShape {
@@ -3293,12 +3345,23 @@ mod tests {
                 MatmulTile::SpecializedConv {
                     tile_size: 32,
                     k_tile: 16,
+                    interleave_columns: false,
                 },
                 MatmulTile::SpecializedConv {
                     tile_size: 64,
                     k_tile: 32,
+                    interleave_columns: false,
                 },
             ];
+            for tile_size in [32, 64] {
+                for k_tile in [16, 32] {
+                    tiles.push(MatmulTile::SpecializedConv {
+                        tile_size,
+                        k_tile,
+                        interleave_columns: true,
+                    });
+                }
+            }
             for tile_size in [32, 64] {
                 for k_stage in [8, 16, 32] {
                     for interleave_columns in [false, true] {

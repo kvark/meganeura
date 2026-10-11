@@ -125,7 +125,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     for (var i = 0u; i < $TM_U; i++) {
         for (var j = 0u; j < $TM_U; j++) {
             let ci = tile_row + ty * $TM_U + i;
-            let hw = tile_col + tx * $TM_U + j;
+            let hw = tile_col + $OUT_COL;
             if ci < m_total && hw < n_total {
                 dst[n * output_stride + ci * n_total + hw] = s[i][j];
             }

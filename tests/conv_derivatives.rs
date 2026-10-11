@@ -432,7 +432,7 @@ fn run_split(
                 })
                 .unwrap();
             assert_eq!(report.eligible_classes, 3, "{s:?}: {report:?}");
-            assert_eq!(report.outcomes.len(), 24, "{s:?}: {report:?}");
+            assert_eq!(report.outcomes.len(), 36, "{s:?}: {report:?}");
             assert!(
                 report.outcomes.iter().all(|o| o.qualified
                     && o.class.conv2d.is_some()

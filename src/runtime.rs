@@ -971,7 +971,7 @@ enum Variant {
         crate::codegen::ScalarMatmulShape,
         u32,
     ),
-    SpecializedConv(ShaderEntry, Vec<u32>, u32),
+    SpecializedConv(ShaderEntry, Vec<u32>, u32, bool),
     ScalarMatmul(
         ShaderEntry,
         crate::compile::WeightFormat,
@@ -1071,7 +1071,7 @@ impl Variant {
             Variant::Attention(ref e, _, _)
             | Variant::CoopTiled(ref e, _, _, _)
             | Variant::SplitMatmul(ref e, _, _, _)
-            | Variant::SpecializedConv(ref e, _, _)
+            | Variant::SpecializedConv(ref e, _, _, _)
             | Variant::ScalarMatmul(ref e, _, _)
             | Variant::Epilogue(ref e, _)
             | Variant::CoopEpilogue(ref e, _)
@@ -1102,8 +1102,8 @@ impl Variant {
             Variant::ScalarMatmul(ref e, format, shape) => {
                 format!("{e:?}:scalar-{format:?}-{shape:?}")
             }
-            Variant::SpecializedConv(ref e, ref params, k_tile) => {
-                format!("{e:?}:fixed-native-div-k{k_tile}-{params:?}")
+            Variant::SpecializedConv(ref e, ref params, k_tile, interleave) => {
+                format!("{e:?}:fixed-native-div-k{k_tile}-interleave{interleave}-{params:?}")
             }
             Variant::Reduction(hash) => format!("generated-reduction:{hash:016x}"),
             Variant::Pointwise(hash) => format!("generated-pointwise:{hash:016x}"),
@@ -1664,7 +1664,12 @@ impl Pipelines {
             return Variant::SplitMatmul(entry, dispatch.weight_format, shape, splits);
         }
         if let Some(k_tile) = dispatch.conv_k_tile() {
-            return Variant::SpecializedConv(entry, dispatch.params.clone(), k_tile);
+            return Variant::SpecializedConv(
+                entry,
+                dispatch.params.clone(),
+                k_tile,
+                dispatch.conv_interleave_columns(),
+            );
         }
         if dispatch.horizontal_batch >= 2 {
             return Variant::Horizontal(entry, dispatch.horizontal_batch, horiz_kind(dispatch));
