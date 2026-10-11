@@ -8,7 +8,10 @@ use crate::{
 use std::{path::Path, sync::Arc};
 
 mod search;
-pub use search::{BuildSearchOptions, BuildSearchReport, BuildSearchTrial, build_measured};
+pub use search::{
+    BuildSearchOptions, BuildSearchReport, BuildSearchTrial, build_measured,
+    build_measured_with_inputs,
+};
 
 /// Optimizer selection.
 #[derive(Clone, Debug)]

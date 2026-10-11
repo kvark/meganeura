@@ -6,6 +6,10 @@
   one-program search returns the fallback. Private probes reserve estimated
   time for warmup, paired timing and qualification within the common deadline.
   Incomplete or late comparisons keep the incumbent.
+  `build_measured_with_inputs` refreshes representative inputs before every
+  execution, for applications that upload inputs before stepping. Upload time
+  is recorded outside execution samples, inside the common deadline. The
+  existing `build_measured` API keeps inputs resident between steps.
 - Scalar convolution tuning measures contiguous and interleaved register-tile
   columns separately for forward, input-gradient and weight-gradient kernels.
   The choice is part of the pipeline key, plan and kernel memo; ordinary builds
