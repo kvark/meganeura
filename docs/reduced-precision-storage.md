@@ -1,4 +1,33 @@
-# Reduced-precision storage: status and plan (October 10, 2026)
+# Reduced-precision storage: status and plan
+
+## Native BF16 foundation (October 11, 2026)
+
+The experimental BF16 path uses the native Naga extension and Blade Vulkan
+capabilities, not packed-u32 emulation. `Graph::to_bf16` stores two bytes per
+element with nearest-even GPU rounding; `from_bf16` widens exactly. Explicit
+BF16 operands work with `matmul`, `matmul_at` and `matmul_bt` (and an F32
+addend), producing F32 outputs and accumulation. Master parameters and their
+gradients remain F32. Backward widens the quantized forward operands and uses
+the existing F32 derivative path.
+
+This is not autocast or complete mixed-precision training. BF16 graph inputs,
+parameters, outputs and unsupported operations reject explicitly; only internal
+conversion/matrix storage is supported. Check Blade's `shader_bfloat16` and
+`bf16_f32_shapes`; matrix products currently require `[16,16,16]`. Devices
+without those features retain the existing F32/F16 paths. No default graph is
+automatically narrowed. Connected pointwise/layout/convolution regions and
+reduced-input backward execution remain work before whole-model timing.
+
+On RTX5080/580.178.04, 1,035 exact conversion cases and 18 F64-referenced matrix /
+F32-gradient fixtures pass (three layouts, optional addend, full/partial/scalar
+dimensions). The driver's plain BF16 conversion truncates; the narrowing kernel
+rounds before casting. An odd-length GPU clear originally failed Vulkan's
+multiple-of-four requirement; clears now round within existing padded buffers.
+The pre-existing workgroup-layout VUID10684 remains recorded. These are
+primitive checks, not a speedup claim. `tests/bf16_storage.rs` covers the path;
+unsupported hardware skips only its GPU-specific cases.
+
+## Historical F16 weight-storage work
 
 PR #242, branch `experiment/f16-weight-storage-2026-10-10`, based on `09fd74f`.
 
@@ -88,7 +117,7 @@ array layout. The same error reproduces on base `09fd74f` in
 `coop_matmul_skinny::matmul_non_aligned_k18`; numerical tests pass, but this is
 not a validation-clean run. It is a separate pre-existing SPIR-V issue.
 
-## Remaining stages
+## Remaining stages from the F16 study
 
 1. **Search over storage.** Let measured search choose f32 or f16 storage
    per weight instead of a session-wide switch.
@@ -101,9 +130,9 @@ not a validation-clean run. It is a separate pre-existing SPIR-V issue.
    saved for backward, f32 parameter gradients, and a static loss scale
    folded into the loss gradient. Derivative regions that need full precision
    keep their current marking.
-4. **bf16.** Storage only: pack two bf16 values per `u32`; widening is
-   `bitcast<f32>(bits << 16)`. bf16 cooperative tiles need
-   `VK_KHR_shader_bfloat16`, which Naga does not expose.
+4. **bf16.** The native foundation above supersedes the proposed packed-u32
+   emulation. Connected reduced-storage regions and whole-update acceptance
+   remain unfinished.
 
 Each stage needs its own numerical gate class: bf16 autocast in PyTorch
 already misses the 1% sampled-output gate on SmolLM2 (1.02% on the RTX 5070).

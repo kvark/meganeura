@@ -12,6 +12,40 @@ impl<'a> Compiler<'a> {
         shared_memory_bytes: u32,
         allow_reduced_precision_attention_backward: bool,
     ) -> Self {
+        for node in graph.nodes() {
+            if node.ty.dtype == DType::BF16 {
+                assert!(
+                    matches!(node.op, Op::ToBF16 | Op::Identity | Op::StopGradient),
+                    "BF16 currently supports internal conversion storage only"
+                );
+                assert!(
+                    !graph.outputs().contains(&node.id),
+                    "widen BF16 graph outputs with from_bf16"
+                );
+            }
+            if node
+                .inputs
+                .iter()
+                .any(|&id| graph.node(id).ty.dtype == DType::BF16)
+            {
+                assert!(
+                    matches!(
+                        node.op,
+                        Op::FromBF16
+                            | Op::Identity
+                            | Op::StopGradient
+                            | Op::MatMul
+                            | Op::MatMulAT
+                            | Op::MatMulBT
+                            | Op::FusedMatMulAdd
+                            | Op::FusedMatMulATAdd
+                            | Op::FusedMatMulBTAdd
+                    ),
+                    "BF16 input to unsupported operation {:?}",
+                    node.op
+                );
+            }
+        }
         if let Some(shape) = options.gemv_shape {
             shape.validate();
         }
@@ -773,6 +807,64 @@ impl<'a> Compiler<'a> {
     pub(super) fn compile_node(&mut self, node: &Node) {
         let out_buf = self.get_buffer(node.id);
         let dispatch_start = self.plan.dispatches.len();
+
+        if matches!(
+            node.op,
+            Op::MatMul
+                | Op::MatMulAT
+                | Op::MatMulBT
+                | Op::FusedMatMulAdd
+                | Op::FusedMatMulATAdd
+                | Op::FusedMatMulBTAdd
+        ) && node.inputs[..2]
+            .iter()
+            .any(|&id| self.graph.node(id).ty.dtype == DType::BF16)
+        {
+            assert!(
+                node.inputs[..2]
+                    .iter()
+                    .all(|&id| self.graph.node(id).ty.dtype == DType::BF16),
+                "BF16 matrix products require two BF16 operands"
+            );
+            let a = &self.graph.node(node.inputs[0]).ty.shape;
+            let b = &self.graph.node(node.inputs[1]).ty.shape;
+            let transpose_a = matches!(node.op, Op::MatMulAT | Op::FusedMatMulATAdd);
+            let transpose_b = matches!(node.op, Op::MatMulBT | Op::FusedMatMulBTAdd);
+            let addend = node.inputs.len() == 3;
+            if addend {
+                assert_eq!(self.graph.node(node.inputs[2]).ty.dtype, DType::F32);
+            }
+            let (m, k) = if transpose_a {
+                (a[1], a[0])
+            } else {
+                (a[0], a[1])
+            };
+            let n = if transpose_b { b[0] } else { b[1] };
+            let [m, n, k] =
+                [m, n, k].map(|dimension| u32::try_from(dimension).expect("BF16 matrix dimension"));
+            for (rows, columns) in [(m, k), (k, n), (m, n)] {
+                rows.checked_mul(columns)
+                    .expect("BF16 matrix address space");
+            }
+            let grid = [m.div_ceil(16), n.div_ceil(16), 1];
+            assert!(workgroups_within_portable_limits(grid));
+            self.plan.dispatches.push(Dispatch {
+                shader: ShaderEntry::MatMulBF16 {
+                    transpose_a,
+                    transpose_b,
+                    addend,
+                },
+                workgroups: grid,
+                input_buffers: node.inputs.iter().map(|&id| self.get_buffer(id)).collect(),
+                output_buffer: out_buf,
+                params: vec![m, n, k, 0],
+                fusion_barrier: true,
+                schedule_locked: true,
+                origin: vec![node.id],
+                ..Default::default()
+            });
+            return;
+        }
 
         match node.op {
             // Leaf nodes and dead nodes: no dispatch needed
@@ -1901,6 +1993,24 @@ impl<'a> Compiler<'a> {
                     extra_outputs: vec![],
                     params: vec![len, 0, 0, 0],
 
+                    ..Default::default()
+                });
+            }
+
+            Op::ToBF16 | Op::FromBF16 => {
+                let src = self.get_buffer(node.inputs[0]);
+                let len =
+                    u32::try_from(node.ty.num_elements()).expect("conversion length exceeds u32");
+                self.plan.dispatches.push(Dispatch {
+                    shader: if matches!(node.op, Op::ToBF16) {
+                        ShaderEntry::ToBF16
+                    } else {
+                        ShaderEntry::FromBF16
+                    },
+                    workgroups: [len.div_ceil(256), 1, 1],
+                    input_buffers: vec![src],
+                    output_buffer: out_buf,
+                    params: vec![len, 0, 0, 0],
                     ..Default::default()
                 });
             }

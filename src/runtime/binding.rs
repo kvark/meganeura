@@ -252,7 +252,10 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::MatMulAT | ShaderEntry::MatMulBT | ShaderEntry::MatMulGemvBT => {
+            ShaderEntry::MatMulAT
+            | ShaderEntry::MatMulBT
+            | ShaderEntry::MatMulGemvBT
+            | ShaderEntry::MatMulBF16 { addend: false, .. } => {
                 let (m, n, k) = mnk();
                 pc.bind(
                     0,
@@ -288,6 +291,7 @@ impl Session {
                 );
             }
             ShaderEntry::FusedMatMulATAdd
+            | ShaderEntry::MatMulBF16 { addend: true, .. }
             | ShaderEntry::FusedMatMulBTAdd
             | ShaderEntry::MatMulGemvBTAdd => {
                 let (m, n, k) = mnk();
@@ -307,7 +311,7 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::ToF16 => {
+            ShaderEntry::ToF16 | ShaderEntry::ToBF16 | ShaderEntry::FromBF16 => {
                 pc.bind(
                     0,
                     &UnaryData {

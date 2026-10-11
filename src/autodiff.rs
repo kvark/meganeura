@@ -1,5 +1,13 @@
-use crate::graph::{Graph, NodeId, Op, PairwiseGradKind, TensorType};
+use crate::graph::{DType, Graph, NodeId, Op, PairwiseGradKind, TensorType};
 use std::collections::HashMap;
+
+fn gradient_operand(graph: &mut Graph, id: NodeId) -> NodeId {
+    if graph.node(id).ty.dtype == DType::BF16 {
+        graph.from_bf16(id)
+    } else {
+        id
+    }
+}
 
 /// Build the backward (gradient) graph from a forward graph.
 ///
@@ -60,8 +68,10 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // dL/dB = A^T @ dL/dC  →  MatMulAT(A, dL/dC)
                 let a = node.inputs[0];
                 let b = node.inputs[1];
-                let grad_a = graph.matmul_bt(grad_output, b);
-                let grad_b = graph.matmul_at(a, grad_output);
+                let wide_a = gradient_operand(&mut graph, a);
+                let wide_b = gradient_operand(&mut graph, b);
+                let grad_a = graph.matmul_bt(grad_output, wide_b);
+                let grad_b = graph.matmul_at(wide_a, grad_output);
                 accumulate_grad(&mut graph, &mut grads, a, grad_a);
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
             }
@@ -71,11 +81,13 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // dB[k,n] = sum_m A[k,m]*dC[m,n] = A @ dC   → MatMul(A, dC)
                 let a = node.inputs[0];
                 let b = node.inputs[1];
-                let grad_a = graph.matmul_bt(b, grad_output);
+                let wide_a = gradient_operand(&mut graph, a);
+                let wide_b = gradient_operand(&mut graph, b);
+                let grad_a = graph.matmul_bt(wide_b, grad_output);
                 let grad_b = graph.add_raw_node(
                     Op::MatMul,
-                    vec![a, grad_output],
-                    forward.nodes()[b as usize].ty.clone(),
+                    vec![wide_a, grad_output],
+                    TensorType::f32(forward.nodes()[b as usize].ty.shape.clone()),
                 );
                 accumulate_grad(&mut graph, &mut grads, a, grad_a);
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
@@ -86,12 +98,14 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // dB[n,k] = sum_m dC[m,n]*A[m,k] = dC^T @ A → MatMulAT(dC, A)
                 let a = node.inputs[0];
                 let b = node.inputs[1];
+                let wide_a = gradient_operand(&mut graph, a);
+                let wide_b = gradient_operand(&mut graph, b);
                 let grad_a = graph.add_raw_node(
                     Op::MatMul,
-                    vec![grad_output, b],
-                    forward.nodes()[a as usize].ty.clone(),
+                    vec![grad_output, wide_b],
+                    TensorType::f32(forward.nodes()[a as usize].ty.shape.clone()),
                 );
-                let grad_b = graph.matmul_at(grad_output, a);
+                let grad_b = graph.matmul_at(grad_output, wide_a);
                 accumulate_grad(&mut graph, &mut grads, a, grad_a);
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
             }
@@ -688,8 +702,10 @@ pub fn differentiate(forward: &Graph) -> Graph {
             // Backward: same as MatMul backward + Add backward (passthrough to d)
             Op::FusedMatMulAdd => {
                 let (a, b, d) = (node.inputs[0], node.inputs[1], node.inputs[2]);
-                let grad_a = graph.matmul_bt(grad_output, b);
-                let grad_b = graph.matmul_at(a, grad_output);
+                let wide_a = gradient_operand(&mut graph, a);
+                let wide_b = gradient_operand(&mut graph, b);
+                let grad_a = graph.matmul_bt(grad_output, wide_b);
+                let grad_b = graph.matmul_at(wide_a, grad_output);
                 accumulate_grad(&mut graph, &mut grads, a, grad_a);
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
                 accumulate_grad(&mut graph, &mut grads, d, grad_output);
@@ -717,11 +733,13 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // dA = MatMulBT(B, dC) gives B[K,N] @ dC[M,N]^T = [K, M] ✓
                 // dB = MatMul(A, dC) gives A[K,M] @ dC[M,N] = [K, N] ✓
                 let (a, b, d) = (node.inputs[0], node.inputs[1], node.inputs[2]);
-                let grad_a = graph.matmul_bt(b, grad_output);
+                let wide_a = gradient_operand(&mut graph, a);
+                let wide_b = gradient_operand(&mut graph, b);
+                let grad_a = graph.matmul_bt(wide_b, grad_output);
                 let grad_b = graph.add_raw_node(
                     Op::MatMul,
-                    vec![a, grad_output],
-                    forward.nodes()[b as usize].ty.clone(),
+                    vec![wide_a, grad_output],
+                    TensorType::f32(forward.nodes()[b as usize].ty.shape.clone()),
                 );
                 accumulate_grad(&mut graph, &mut grads, a, grad_a);
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
@@ -731,12 +749,14 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // C = A @ B^T + D  (A=[M,K], B=[N,K], D=[M,N])
                 // Same as MatMulBT backward + passthrough to D
                 let (a, b, d) = (node.inputs[0], node.inputs[1], node.inputs[2]);
+                let wide_a = gradient_operand(&mut graph, a);
+                let wide_b = gradient_operand(&mut graph, b);
                 let grad_a = graph.add_raw_node(
                     Op::MatMul,
-                    vec![grad_output, b],
-                    forward.nodes()[a as usize].ty.clone(),
+                    vec![grad_output, wide_b],
+                    TensorType::f32(forward.nodes()[a as usize].ty.shape.clone()),
                 );
-                let grad_b = graph.matmul_at(grad_output, a);
+                let grad_b = graph.matmul_at(grad_output, wide_a);
                 accumulate_grad(&mut graph, &mut grads, a, grad_a);
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
                 accumulate_grad(&mut graph, &mut grads, d, grad_output);
@@ -798,7 +818,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_table = graph.scatter_add(indices, grad_output, vocab_size);
                 accumulate_grad(&mut graph, &mut grads, table, grad_table);
             }
-            Op::ToF16 => {
+            Op::ToF16 | Op::ToBF16 | Op::FromBF16 => {
                 // Straight-through: the f16 round is treated as identity for
                 // the backward, so the f32 master parameter receives the
                 // full f32 gradient (standard mixed-precision).

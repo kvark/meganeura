@@ -630,6 +630,13 @@ pub enum ShaderGroup {
     CachedBlockAttentionCombine,
     Embedding,
     ToF16,
+    ToBF16,
+    FromBF16,
+    MatMulBF16 {
+        transpose_a: bool,
+        transpose_b: bool,
+        addend: bool,
+    },
     RoPE,
     RoPEGrad,
     LayerNorm,
@@ -761,6 +768,56 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         }
         ShaderGroup::Embedding => ShaderModule::new(include_str!("shaders/embedding.wgsl")),
         ShaderGroup::ToF16 => ShaderModule::new(include_str!("shaders/to_f16.wgsl")),
+        ShaderGroup::MatMulBF16 {
+            transpose_a,
+            transpose_b,
+            addend,
+        } => {
+            assert!(!(transpose_a && transpose_b));
+            let source = preprocess(
+                include_str!("shaders/matmul_bf16.wgsl"),
+                &[
+                    (
+                        "$A_INDEX",
+                        if transpose_a {
+                            "ak * params.m + ar"
+                        } else {
+                            "ar * params.k + ak"
+                        },
+                    ),
+                    (
+                        "$B_INDEX",
+                        if transpose_b {
+                            "bc * params.k + bk"
+                        } else {
+                            "bk * params.n + bc"
+                        },
+                    ),
+                    (
+                        "$ADD_DECL",
+                        if addend {
+                            "var<storage> src: array<f32>;"
+                        } else {
+                            ""
+                        },
+                    ),
+                    ("$ADD", if addend { " + src[index]" } else { "" }),
+                ],
+            );
+            ShaderModule::new(&source)
+        }
+        ShaderGroup::ToBF16 | ShaderGroup::FromBF16 => {
+            let narrowing = group == ShaderGroup::ToBF16;
+            let source = preprocess(
+                include_str!("shaders/bf16_conversion.wgsl"),
+                &[
+                    ("$SRC_TYPE", if narrowing { "f32" } else { "bf16" }),
+                    ("$DST_TYPE", if narrowing { "bf16" } else { "f32" }),
+                    ("$CONVERT", if narrowing { "round_bf16" } else { "f32" }),
+                ],
+            );
+            ShaderModule::new(&source)
+        }
         ShaderGroup::RoPE => ShaderModule::new(include_str!("shaders/rope.wgsl")),
         ShaderGroup::RoPEGrad => ShaderModule::new(include_str!("shaders/rope_grad.wgsl")),
         ShaderGroup::LayerNorm => ShaderModule::new(include_str!("shaders/layer_norm.wgsl")),
@@ -3238,6 +3295,14 @@ mod tests {
             (ShaderGroup::RmsNormAdd, naga::valid::Capabilities::empty()),
             (ShaderGroup::Embedding, naga::valid::Capabilities::empty()),
             (ShaderGroup::ToF16, naga::valid::Capabilities::empty()),
+            (
+                ShaderGroup::ToBF16,
+                naga::valid::Capabilities::SHADER_BFLOAT16,
+            ),
+            (
+                ShaderGroup::FromBF16,
+                naga::valid::Capabilities::SHADER_BFLOAT16,
+            ),
             (ShaderGroup::RoPE, naga::valid::Capabilities::empty()),
             (ShaderGroup::RoPEGrad, naga::valid::Capabilities::empty()),
             (ShaderGroup::LayerNorm, naga::valid::Capabilities::empty()),
@@ -3887,6 +3952,14 @@ mod tests {
             (ShaderGroup::RmsNormAdd, empty),
             (ShaderGroup::Embedding, empty),
             (ShaderGroup::ToF16, empty),
+            (
+                ShaderGroup::ToBF16,
+                naga::valid::Capabilities::SHADER_BFLOAT16,
+            ),
+            (
+                ShaderGroup::FromBF16,
+                naga::valid::Capabilities::SHADER_BFLOAT16,
+            ),
             (ShaderGroup::RoPE, empty),
             (ShaderGroup::RoPEGrad, empty),
             (ShaderGroup::LayerNorm, empty),
@@ -4001,6 +4074,7 @@ mod tests {
                 | ShaderEntry::BatchMatMulAT
                 | ShaderEntry::BatchMatMulBT => vec!["matrix_a", "matrix_b", "matrix_c", "params"],
                 ShaderEntry::MatMul
+                | ShaderEntry::MatMulBF16 { addend: false, .. }
                 | ShaderEntry::MatMulAT
                 | ShaderEntry::MatMulBT
                 | ShaderEntry::MatMulGemv
@@ -4011,6 +4085,7 @@ mod tests {
                     vec!["matrix_a", "matrix_b", "matrix_c", "src", "params"]
                 }
                 ShaderEntry::FusedMatMulAdd
+                | ShaderEntry::MatMulBF16 { addend: true, .. }
                 | ShaderEntry::FusedMatMulATAdd
                 | ShaderEntry::FusedMatMulBTAdd => {
                     vec!["matrix_a", "matrix_b", "matrix_c", "src", "params"]
@@ -4041,7 +4116,9 @@ mod tests {
                 ShaderEntry::Transpose => vec!["src", "dst", "params"],
                 ShaderEntry::RmsNormAdd => vec!["src", "bias", "residual", "dst", "params"],
                 ShaderEntry::Embedding => vec!["indices", "src", "dst", "params"],
-                ShaderEntry::ToF16 => vec!["src", "dst", "params"],
+                ShaderEntry::ToF16 | ShaderEntry::ToBF16 | ShaderEntry::FromBF16 => {
+                    vec!["src", "dst", "params"]
+                }
                 ShaderEntry::LayerNorm => vec!["src", "src_b", "bias", "dst", "params"],
                 ShaderEntry::MultiHeadAttn
                 | ShaderEntry::FlashAttention

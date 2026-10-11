@@ -91,6 +91,8 @@ impl Op {
             | Op::SplitA { .. }
             | Op::SplitB { .. }
             | Op::ToF16
+            | Op::ToBF16
+            | Op::FromBF16
             | Op::ToF32
             | Op::ToU32 => Primitive,
             // Gather, scatter and dynamic slices.
