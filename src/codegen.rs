@@ -1478,8 +1478,10 @@ fn matmul_vars_tiled(
         WeightFormat::F16 => (
             "",
             "array<u32>",
+            // Shift the wanted half into the low bits and convert only it: a
+            // dynamic component index converts both halves and selects one.
             format!(
-                "unpack2x16float($B_BUFFER[select(0u, {b_idx}, in_bounds) / 2u])[select(0u, {b_idx}, in_bounds) % 2u]"
+                "unpack2x16float($B_BUFFER[select(0u, {b_idx}, in_bounds) / 2u] >> ((select(0u, {b_idx}, in_bounds) & 1u) << 4u)).x"
             ),
             String::new(),
         ),
