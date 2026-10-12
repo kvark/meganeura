@@ -40,6 +40,11 @@ impl Shape {
 fn gpu() -> Arc<blade_graphics::Context> {
     let gpu = crate::support::gpu::gpu();
     eprintln!("GPU: {}", gpu.device_information().device_name);
+    if let Ok(expected) = std::env::var("MEGANEURA_EXPECT_DEVICE_NAME") {
+        assert_eq!(gpu.device_information().device_name, expected);
+        let memory = gpu.memory_stats();
+        assert!(memory.budget.saturating_sub(memory.usage) >= 2 << 30);
+    }
     gpu
 }
 
@@ -47,11 +52,6 @@ fn gpu() -> Arc<blade_graphics::Context> {
 #[ignore = "Requires F16 cooperative hardware; checks partial workgroup rows across images"]
 fn cooperative_hardware_subtile_forward_and_input_match_f64() {
     let gpu = gpu();
-    if let Ok(expected) = std::env::var("MEGANEURA_EXPECT_DEVICE_NAME") {
-        assert_eq!(gpu.device_information().device_name, expected);
-        let memory = gpu.memory_stats();
-        assert!(memory.budget.saturating_sub(memory.usage) >= 2 << 30);
-    }
     let caps = meganeura::runtime::auto_tune(&gpu, 0).coop_caps;
     assert_eq!(caps.f16_tile, 16, "requires actual F16 sub-tile execution");
     assert_eq!(
@@ -516,6 +516,7 @@ fn run_split(
 #[test]
 fn split_weight_gradients_and_every_partial_match_full_f64_oracles() {
     let gpu = gpu();
+    let mut widened = 0;
     for (batch, ci, h, w, co, kh, kw, stride, ph, pw) in [
         (3, 5, 7, 9, 7, 2, 3, 1, 1, 0),
         (2, 17, 9, 11, 19, 3, 3, 2, 0, 1),
@@ -535,17 +536,30 @@ fn split_weight_gradients_and_every_partial_match_full_f64_oracles() {
             pw,
         };
         let (oh, ow) = s.output();
-        for tile in [32, 64] {
+        for tile in [16, 32, 64] {
             run(s, tile, &gpu, CoopPolicy::Disabled, false);
             for splits in [2, 3, 7, 16]
                 .into_iter()
                 .filter(|&count| count <= (batch * oh * ow).div_ceil(16))
             {
-                let (_, rejected) = run_split(s, tile, &gpu, CoopPolicy::Disabled, false, splits);
+                let (session, rejected) =
+                    run_split(s, tile, &gpu, CoopPolicy::Disabled, false, splits);
                 assert!(rejected.is_empty(), "{rejected:?}");
+                widened += usize::from(
+                    tile == 16
+                        && session
+                            .plan()
+                            .dispatches
+                            .iter()
+                            .any(|d| d.shader == ShaderEntry::Conv2dGradWeightGemmSplitSmall),
+                );
             }
         }
     }
+    assert!(
+        widened > 0,
+        "the F64 oracle must exercise a widened split producer"
+    );
 }
 
 #[test]
