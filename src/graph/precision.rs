@@ -9,6 +9,27 @@ impl Graph {
     /// Block/batched products, convolution and full-precision regions are not
     /// silently converted. Native BF16 cooperative support is required.
     pub fn into_bf16_matmuls(self) -> Self {
+        self.into_bf16_selected(|op| {
+            matches!(
+                op,
+                Op::MatMul
+                    | Op::MatMulAT
+                    | Op::MatMulBT
+                    | Op::FusedMatMulAdd
+                    | Op::FusedMatMulATAdd
+                    | Op::FusedMatMulBTAdd
+            )
+        })
+    }
+
+    /// Explicit BF16 convolution operands and stored results, with F32
+    /// accumulation and derivatives. Parameters and graph interfaces stay F32.
+    /// Compose with `into_bf16_matmuls` before differentiation as needed.
+    pub fn into_bf16_convolutions(self) -> Self {
+        self.into_bf16_selected(|op| matches!(op, Op::Conv2d { .. }))
+    }
+
+    fn into_bf16_selected(self, select: impl Fn(&Op) -> bool) -> Self {
         assert_eq!(
             self.num_param_grad_outputs, 0,
             "cast forward graphs before autodiff"
@@ -39,15 +60,7 @@ impl Graph {
                 _ => (),
             }
             let cast = !node.requires_full_precision
-                && matches!(
-                    node.op,
-                    Op::MatMul
-                        | Op::MatMulAT
-                        | Op::MatMulBT
-                        | Op::FusedMatMulAdd
-                        | Op::FusedMatMulATAdd
-                        | Op::FusedMatMulBTAdd
-                )
+                && select(&node.op)
                 && node.ty.dtype == DType::F32
                 && node.inputs[..2]
                     .iter()
@@ -103,6 +116,65 @@ fn narrow(graph: &mut Graph, casts: &mut HashMap<NodeId, NodeId>, id: NodeId) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bf16_convolution_is_not_rewritten_to_f32_winograd() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[64 * 8 * 8]);
+        let w = graph.parameter("w", &[64 * 64 * 3 * 3]);
+        let y = graph.conv2d(x, w, 1, 64, 8, 8, 64, 3, 3, 1, 1);
+        graph.set_outputs(vec![y]);
+        let mut bf16 = graph.deep_clone().into_bf16_convolutions();
+        let mut fusions = Vec::new();
+        crate::optimize::apply_winograd_conv_fusions(&mut bf16, &mut fusions, &Default::default());
+        assert!(fusions.is_empty());
+        crate::optimize::apply_winograd_conv_fusions(&mut graph, &mut fusions, &Default::default());
+        assert_eq!(fusions.len(), 1);
+    }
+
+    #[test]
+    fn convolution_selection_preserves_strict_regions_and_is_idempotent() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[3 * 5 * 7]);
+        let w = graph.parameter("w", &[5 * 3 * 3 * 3]);
+        let y = graph.conv2d(x, w, 1, 3, 5, 7, 5, 3, 3, 1, 1);
+        graph.begin_full_precision_region();
+        let strict = graph.conv2d(x, w, 1, 3, 5, 7, 5, 3, 3, 1, 1);
+        graph.set_outputs(vec![y, strict]);
+        let selected = graph.into_bf16_convolutions();
+        let convs: Vec<_> = selected
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::Conv2d { .. }))
+            .collect();
+        assert_eq!(convs.len(), 2);
+        assert!(
+            convs[0]
+                .inputs
+                .iter()
+                .all(|&i| selected.node(i).ty.dtype == DType::BF16)
+        );
+        assert!(
+            convs[1]
+                .inputs
+                .iter()
+                .all(|&i| selected.node(i).ty.dtype == DType::F32)
+        );
+        assert!(
+            selected
+                .outputs()
+                .iter()
+                .all(|&i| selected.node(i).ty.dtype == DType::F32)
+        );
+        assert_eq!(
+            selected.deep_clone().into_bf16_convolutions().nodes().len(),
+            selected.nodes().len()
+        );
+        assert_eq!(
+            selected.deep_clone().into_bf16_matmuls().nodes().len(),
+            selected.nodes().len()
+        );
+    }
 
     #[test]
     fn dense_selection_preserves_masters_interfaces_and_explicit_f32() {

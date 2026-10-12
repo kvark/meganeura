@@ -1411,12 +1411,14 @@ impl Pipelines {
             matmul_knobs.unroll_k = shape.unroll_k;
         }
         let group = dispatch.shader.shader_group();
-        if matches!(group, ShaderGroup::MatMulBF16 { .. })
-            && !gpu
-                .capabilities()
-                .cooperative_matrix
-                .bf16_f32_shapes
-                .contains(&[16, 16, 16])
+        if matches!(
+            group,
+            ShaderGroup::MatMulBF16 { .. } | ShaderGroup::Conv2dBF16 { .. }
+        ) && !gpu
+            .capabilities()
+            .cooperative_matrix
+            .bf16_f32_shapes
+            .contains(&[16, 16, 16])
         {
             return Err(
                 "BF16 matrix products require native 16x16x16 BF16/F32 cooperative matrices"
@@ -2115,6 +2117,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::Conv2dDw => Conv2dDwData::layout(),
         ShaderEntry::MulPerChannel => MulPerChannelData::layout(),
         ShaderEntry::Conv2dGemm
+        | ShaderEntry::Conv2dBF16 { .. }
         | ShaderEntry::Conv2dGemmSmall
         | ShaderEntry::Conv2dGemm16
         | ShaderEntry::Conv2dGemmCoopGen(..) => Conv2dData::layout(),

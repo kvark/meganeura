@@ -10,6 +10,7 @@
 use crate::compile::WeightFormat;
 use naga::Module;
 
+mod bf16;
 mod coop_tiled;
 pub use coop_tiled::{CooperativeMatmulShape, generate_tiled_coop_matmul};
 
@@ -675,6 +676,12 @@ pub enum ShaderGroup {
     /// Used by EfficientNet Squeeze-and-Excitation.
     MulPerChannel,
     Conv2dGemm,
+    Conv2dBF16 {
+        kernel_h: u32,
+        kernel_w: u32,
+        stride: u32,
+        output_bf16: bool,
+    },
     Conv2dGemmSmall,
     Conv2dGemm16,
     Conv2dGemmCoop,
@@ -769,48 +776,7 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         }
         ShaderGroup::Embedding => ShaderModule::new(include_str!("shaders/embedding.wgsl")),
         ShaderGroup::ToF16 => ShaderModule::new(include_str!("shaders/to_f16.wgsl")),
-        ShaderGroup::MatMulBF16 {
-            transpose_a,
-            transpose_b,
-            addend,
-            output_bf16,
-        } => {
-            assert!(!(transpose_a && transpose_b));
-            let source = preprocess(
-                include_str!("shaders/matmul_bf16.wgsl"),
-                &[
-                    ("$ROUND", include_str!("shaders/bf16_round.wgsl")),
-                    ("$OUT_TYPE", if output_bf16 { "bf16" } else { "f32" }),
-                    ("$STORE", if output_bf16 { "round_bf16" } else { "f32" }),
-                    (
-                        "$A_INDEX",
-                        if transpose_a {
-                            "ak * params.m + ar"
-                        } else {
-                            "ar * params.k + ak"
-                        },
-                    ),
-                    (
-                        "$B_INDEX",
-                        if transpose_b {
-                            "bc * params.k + bk"
-                        } else {
-                            "bk * params.n + bc"
-                        },
-                    ),
-                    (
-                        "$ADD_DECL",
-                        if addend {
-                            "var<storage> src: array<f32>;"
-                        } else {
-                            ""
-                        },
-                    ),
-                    ("$ADD", if addend { " + src[index]" } else { "" }),
-                ],
-            );
-            ShaderModule::new(&source)
-        }
+        ShaderGroup::MatMulBF16 { .. } | ShaderGroup::Conv2dBF16 { .. } => bf16::generate(group),
         ShaderGroup::ToBF16 | ShaderGroup::FromBF16 => {
             let narrowing = group == ShaderGroup::ToBF16;
             let source = preprocess(
@@ -4204,6 +4170,7 @@ mod tests {
                 }
                 ShaderEntry::MulPerChannel => vec!["src", "gate", "dst", "params"],
                 ShaderEntry::Conv2dGemm
+                | ShaderEntry::Conv2dBF16 { .. }
                 | ShaderEntry::Conv2dGemmSmall
                 | ShaderEntry::Conv2dGemm16
                 | ShaderEntry::Conv2dGemmCoopGen(..) => vec!["src", "weight", "dst", "params"],

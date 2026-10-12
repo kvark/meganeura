@@ -40,6 +40,7 @@ impl<'a> Compiler<'a> {
                             | Op::FusedMatMulAdd
                             | Op::FusedMatMulATAdd
                             | Op::FusedMatMulBTAdd
+                            | Op::Conv2d { .. }
                     ),
                     "BF16 input to unsupported operation {:?}",
                     node.op
@@ -2579,6 +2580,44 @@ impl<'a> Compiler<'a> {
                 let out_h = (in_h + 2 * padding_h - kernel_h) / stride + 1;
                 let out_w = (in_w + 2 * padding_w - kernel_w) / stride + 1;
                 let batch = in_shape[0] as u32 / (in_channels * in_h * in_w);
+
+                if self.graph.node(node.inputs[0]).ty.dtype == DType::BF16 {
+                    assert_eq!(self.graph.node(node.inputs[1]).ty.dtype, DType::BF16);
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::Conv2dBF16 {
+                            kernel_h,
+                            kernel_w,
+                            stride,
+                            output_bf16: false,
+                        },
+                        workgroups: [
+                            out_channels.div_ceil(32),
+                            (out_h * out_w).div_ceil(32),
+                            batch,
+                        ],
+                        input_buffers: vec![input, kernel],
+                        output_buffer: out_buf,
+                        params: vec![
+                            batch,
+                            in_channels,
+                            in_h,
+                            in_w,
+                            out_channels,
+                            kernel_h,
+                            kernel_w,
+                            stride,
+                            padding_h,
+                            out_h,
+                            out_w,
+                            padding_w,
+                        ],
+                        fusion_barrier: true,
+                        requires_full_precision: node.requires_full_precision,
+                        ..Default::default()
+                    });
+                    return;
+                }
+                assert_eq!(self.graph.node(node.inputs[1]).ty.dtype, DType::F32);
 
                 // No 1×1 MatMul shortcut: the previous one viewed NCHW
                 // input as [batch*H*W, Ci] row-major, which is a transposed

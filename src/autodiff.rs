@@ -880,9 +880,11 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
                 let kernel = node.inputs[1];
                 let in_size = forward.nodes()[input as usize].ty.num_elements() as u32;
                 let batch = in_size / (in_channels * in_h * in_w);
+                let wide_input = gradient_operand(&mut graph, input);
+                let wide_kernel = gradient_operand(&mut graph, kernel);
                 let grad_input = graph.conv2d_grad_input(
                     grad_output,
-                    kernel,
+                    wide_kernel,
                     batch,
                     in_channels,
                     in_h,
@@ -896,7 +898,7 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
                 );
                 let grad_kernel = graph.conv2d_grad_weight(
                     grad_output,
-                    input,
+                    wide_input,
                     in_channels,
                     in_h,
                     in_w,
