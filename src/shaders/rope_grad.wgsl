@@ -3,10 +3,8 @@ struct Params {
     dim: u32,
     theta_bits: u32,
     pos_offset: u32,
+    axes_dim: vec3<u32>,
     head_dim: u32,
-    axis_dim0: u32,
-    axis_dim1: u32,
-    axis_dim2: u32,
 }
 
 var<storage> src: array<f32>;       // grad_output

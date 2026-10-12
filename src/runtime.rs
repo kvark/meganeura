@@ -462,10 +462,8 @@ struct RoPEParams {
     dim: u32,
     theta_bits: u32,
     pos_offset: u32,
+    axes_dim: [u32; 3],
     head_dim: u32,
-    axis_dim0: u32,
-    axis_dim1: u32,
-    axis_dim2: u32,
 }
 
 #[derive(blade_macros::ShaderData)]
