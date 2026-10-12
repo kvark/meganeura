@@ -229,12 +229,12 @@ pub(crate) fn cooperative_geometry(
         problem.n.div_ceil(tile),
         problem.batch,
     ];
-    // Direct stores write whole sub-tiles: N must stay aligned so stores
-    // never straddle rows, and later images must not start inside padding
-    // their consumers do not account for. The generated f32 input-gradient
-    // kernel stages its right edge through checked stores instead.
-    let stores_aligned =
-        problem.n.is_multiple_of(16) && (problem.batch == 1 || problem.m.is_multiple_of(tile));
+    // Direct stores write hardware sub-tiles, not the whole workgroup tile.
+    // The second row/column sub-tile is guarded independently. Each image
+    // must end on a hardware row boundary so stores cannot touch its neighbor.
+    // The generated f32 input-gradient kernel bounds-checks edge stores.
+    let stores_aligned = problem.n.is_multiple_of(16)
+        && (problem.batch == 1 || problem.m.is_multiple_of(config.tile_size));
     let checked_stores = problem.kind == Kind::GradInput && !config.use_f16_input;
     if !stores_aligned && !checked_stores {
         Err("output tiles would straddle rows or images")
@@ -368,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn batched_outputs_need_whole_row_tiles() {
+    fn batched_outputs_need_whole_hardware_row_tiles() {
         let batched = Problem {
             batch: 4,
             ..problem(Kind::Forward, 100, 3136, 576)
@@ -381,5 +381,15 @@ mod tests {
         let geometry = cooperative_geometry(&aligned, &F16).unwrap();
         assert_eq!(geometry.grid, [4, 98, 4]);
         assert_eq!(geometry.output_bytes, 128 * 3136 * 4 * 4);
+        for kind in [Kind::Forward, Kind::GradInput] {
+            let half_workgroup = Problem {
+                kind,
+                m: 48,
+                ..batched
+            };
+            let geometry = cooperative_geometry(&half_workgroup, &F16).unwrap();
+            assert_eq!(geometry.grid, [2, 98, 4]);
+            assert_eq!(geometry.output_bytes, 64 * 3136 * 4 * 4);
+        }
     }
 }
