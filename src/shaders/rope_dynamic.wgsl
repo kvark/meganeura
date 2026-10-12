@@ -7,10 +7,8 @@ struct Params {
     theta_bits: u32,
     // Static offset added to the dynamic one (zero from the builders).
     pos_offset: u32,
+    axes_dim: vec3<u32>,
     head_dim: u32,
-    axis_dim0: u32,
-    axis_dim1: u32,
-    axis_dim2: u32,
 }
 
 var<storage> src: array<f32>;
@@ -108,22 +106,21 @@ fn axial_positions(
     let head = pair_in_row / pairs_per_head;
     let pair_in_head = pair_in_row % pairs_per_head;
 
-    let axis0_pairs = params.axis_dim0 / 2u;
-    let axis1_pairs = params.axis_dim1 / 2u;
+    let axis0_pairs = params.axes_dim.x / 2u;
+    let axis1_pairs = params.axes_dim.y / 2u;
     var axis = 0u;
-    var local_pair = pair_in_head;
-    var axis_dim = params.axis_dim0;
+    var axis_start = 0u;
     if pair_in_head >= axis0_pairs {
         axis = 1u;
-        local_pair = pair_in_head - axis0_pairs;
-        axis_dim = params.axis_dim1;
+        axis_start = axis0_pairs;
     }
     if pair_in_head >= axis0_pairs + axis1_pairs {
         axis = 2u;
-        local_pair = pair_in_head - axis0_pairs - axis1_pairs;
-        axis_dim = params.axis_dim2;
+        axis_start = axis0_pairs + axis1_pairs;
     }
 
+    let local_pair = pair_in_head - axis_start;
+    let axis_dim = params.axes_dim[axis];
     let pos = bitcast<f32>(pos_offset_buf[row * 3u + axis]);
     let theta = bitcast<f32>(params.theta_bits);
     let exponent = -2.0 * f32(local_pair) / f32(axis_dim);
