@@ -508,7 +508,7 @@ mod cache_format_tests {
     use crate::compile;
 
     #[test]
-    fn attention_dispatch_cache_v23_is_invalidated() {
+    fn legacy_attention_dispatch_caches_are_invalidated() {
         let mut graph = Graph::new();
         let q = graph.input("q", &[4, 8]);
         let k = graph.input("k", &[4, 8]);
@@ -519,9 +519,10 @@ mod cache_format_tests {
         let mut plan = compile::compile(&graph);
         // Version 23 encoded causal attention with kv_seq == 0 and had no
         // causal_rows word. Interpreting these parameters as version 24 would
-        // make every query row see zero keys.
+        // make every query row see zero keys. Experimental convolution builds
+        // also wrote this old attention layout with format version 24.
         plan.dispatches[0].params = vec![4, 0, (1 << 16) | 1, 8];
-        let legacy = CachedPlan {
+        let mut legacy = CachedPlan {
             format_version: 23,
             graph_hash: hash_graph(&graph),
             build_hash: 0,
@@ -531,8 +532,11 @@ mod cache_format_tests {
             "meganeura-attention-cache-v23-{}.ron",
             std::process::id()
         ));
-        std::fs::write(&path, ron::ser::to_string(&legacy).unwrap()).unwrap();
-        assert!(load_plan(&graph, &path).unwrap().is_none());
+        for version in [23, 24] {
+            legacy.format_version = version;
+            std::fs::write(&path, ron::ser::to_string(&legacy).unwrap()).unwrap();
+            assert!(load_plan(&graph, &path).unwrap().is_none());
+        }
         std::fs::remove_file(path).unwrap();
     }
 

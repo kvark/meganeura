@@ -47,8 +47,10 @@ pub struct BuildSearchOptions {
     /// One keeps every candidate on a single submission.
     pub max_submission_chunks: usize,
     /// Sum of declared logical bytes and persistent-state snapshots for both
-    /// incumbent and challenger. This is not a driver-heap bound: padding,
-    /// pipelines, staging and kernel-probe scratch are additional.
+    /// incumbent and challenger, counting inherited immutable parameters once.
+    /// Written parameters and their snapshots remain private to each program.
+    /// This is not a driver-heap bound: padding, pipelines, staging and
+    /// kernel-probe scratch are additional.
     pub max_plan_bytes: usize,
     /// Private kernel decisions shared with other searches, which resume them
     /// on the same device, driver and decision policy. `None` keeps them
@@ -114,10 +116,11 @@ pub struct BuildSearchReport {
 /// must win a whole-program comparison to replace it. Every challenger is
 /// qualified after kernel tuning, before it is timed;
 /// one with kernel classes left to probe is also qualified before tuning. A
-/// winning challenger is qualified again after measurement. The selected program
-/// is checked before returning only if another challenger ran since its last
-/// check. A failing challenger is discarded; a failing final incumbent aborts
-/// construction.
+/// challenger with identical dispatches and submission count keeps the incumbent
+/// without warmup or paired timing. A winning challenger is qualified again after
+/// measurement. The selected program is checked before returning only if another
+/// challenger ran since its last check. A failing challenger is discarded; a
+/// failing final incumbent aborts construction.
 /// Written inputs, parameters and constants are reset before each step, outside
 /// timing. The returned session retains its initialized persistent state; outputs
 /// hold its last qualified step. Timing includes fresh recording/submission/wait,

@@ -84,6 +84,25 @@ fn plan_bytes(plan: &ExecutionPlan) -> Result<usize, String> {
         .ok_or_else(|| "declared program bytes overflow".into())
 }
 
+fn challenger_bytes(
+    plan: &ExecutionPlan,
+    incumbent: Option<&ExecutionPlan>,
+) -> Result<usize, String> {
+    let mut bytes = plan_bytes(plan)?;
+    if let Some(incumbent) = incumbent {
+        let mut shared: Vec<_> = crate::runtime::shared_parameters(plan, incumbent, true)
+            .into_iter()
+            .map(|(target, _)| target.0 as usize)
+            .collect();
+        shared.sort_unstable();
+        shared.dedup();
+        for index in shared {
+            bytes -= plan.buffers[index].max(4);
+        }
+    }
+    Ok(bytes)
+}
+
 fn restore(
     session: &mut Session,
     state: &SearchState,
@@ -257,7 +276,10 @@ pub(super) fn select(
             break;
         }
         let trial_start = Instant::now();
-        let bytes = plan_bytes(&program.plan)?;
+        let bytes = challenger_bytes(
+            &program.plan,
+            incumbent.as_ref().map(|entry| entry.0.plan()),
+        )?;
         let submission_chunks = program.submission_chunks.unwrap_or(selected_chunks);
         let mut trial = BuildSearchTrial {
             description: format!(
@@ -348,6 +370,13 @@ pub(super) fn select(
                 )?;
                 trial.outcome.qualified = true;
                 if let Some((ref mut baseline, ref baseline_state)) = incumbent {
+                    if start.elapsed() < options.max_time
+                        && candidate.plan().dispatches == baseline.plan().dispatches
+                        && submission_chunks == selected_chunks
+                    {
+                        trial.outcome.decision = TuneDecision::KeepBaseline;
+                        return Ok((state, step));
+                    }
                     let warmup_start = Instant::now();
                     let mut warmed = 0;
                     while warmed < options.warmup_runs
@@ -548,6 +577,29 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(super::plan_bytes(&plan).unwrap(), bytes + 8);
+
+        let mut graph = crate::Graph::new();
+        let input = graph.input("x", &[2]);
+        let weight = graph.parameter("w", &[2]);
+        let output = graph.mul(input, weight);
+        graph.set_outputs(vec![output]);
+        let plan = crate::compile::compile(&graph);
+        let weight = plan.param_buffers[0].1;
+        let bytes = plan_bytes(&plan).unwrap();
+        assert_eq!(challenger_bytes(&plan, Some(&plan)).unwrap(), bytes - 8);
+        let mut changed = plan.clone();
+        changed.dispatches.push(Dispatch {
+            output_buffer: weight,
+            ..Default::default()
+        });
+        assert_eq!(challenger_bytes(&plan, Some(&changed)).unwrap(), bytes);
+        assert_eq!(challenger_bytes(&changed, Some(&plan)).unwrap(), bytes + 8);
+        changed = plan.clone();
+        changed.dispatches[0].extra_outputs.push(weight);
+        assert_eq!(challenger_bytes(&changed, Some(&plan)).unwrap(), bytes + 8);
+        changed = plan.clone();
+        changed.buffers[weight.0 as usize] += 4;
+        assert_eq!(challenger_bytes(&plan, Some(&changed)).unwrap(), bytes);
     }
 
     #[test]
@@ -729,7 +781,12 @@ mod tests {
                 warmup_time: Duration::from_millis(1),
                 max_time: Duration::from_secs(30),
                 max_programs: 3,
-                max_plan_bytes: 1 << 20,
+                max_plan_bytes: 2 * plan_bytes(&plan).unwrap()
+                    - plan
+                        .param_buffers
+                        .iter()
+                        .map(|entry| plan.buffers[entry.1.0 as usize].max(4))
+                        .sum::<usize>(),
                 ..Default::default()
             },
             |s, incumbent| {
@@ -895,78 +952,102 @@ mod tests {
         let y = graph.matmul(x, w);
         graph.set_outputs(vec![y]);
         let plan = crate::compile::compile(&graph);
-        let memo = Arc::new(std::sync::Mutex::new(crate::runtime::KernelMemo::default()));
-        let search = || {
-            select(
-                [Program {
-                    description: "ordinary".into(),
-                    plan: plan.clone(),
-                    submission_chunks: Some(1),
-                    origin: None,
-                }],
-                gpu.clone(),
-                SessionOptions {
-                    coop: crate::CoopPolicy::Disabled,
-                    ..Default::default()
-                },
-                BuildSearchOptions {
-                    tuning: TuneOptions {
-                        max_time: Duration::from_secs(30),
-                        sample_pairs: 4,
-                        target_sample_time: Some(Duration::from_nanos(1)),
+        for kernel_threshold in [0.0, 0.99] {
+            let memo = Arc::new(std::sync::Mutex::new(crate::runtime::KernelMemo::default()));
+            let search = || {
+                select(
+                    [1, 2].map(|chunks| Program {
+                        description: "ordinary".into(),
+                        plan: plan.clone(),
+                        submission_chunks: Some(chunks),
+                        origin: None,
+                    }),
+                    gpu.clone(),
+                    SessionOptions {
+                        coop: crate::CoopPolicy::Disabled,
                         ..Default::default()
                     },
-                    max_time: Duration::from_secs(60),
-                    max_programs: 2,
-                    // Private kernel winners must not bypass whole-model
-                    // selection, including when loaded from the shared memo.
-                    min_improvement: 0.99,
-                    max_plan_bytes: 1 << 20,
-                    kernel_memo: Some(memo.clone()),
-                    ..Default::default()
-                },
-                |s, _| {
-                    s.set_input("x", &[0.25; 33 * 17]);
-                    s.set_parameter("w", &[0.125; 17 * 65]);
-                    Ok(())
-                },
-                |s| {
-                    let output = s.read_output(33 * 65);
-                    if output.iter().all(|&v| (v - 0.53125).abs() < 1e-5) {
+                    BuildSearchOptions {
+                        tuning: TuneOptions {
+                            min_improvement: kernel_threshold,
+                            max_time: Duration::from_secs(30),
+                            sample_pairs: 4,
+                            target_sample_time: Some(Duration::from_nanos(1)),
+                            ..Default::default()
+                        },
+                        max_time: Duration::from_secs(60),
+                        max_programs: 3,
+                        // Private kernel winners must not bypass whole-model
+                        // selection, including when loaded from the shared memo.
+                        min_improvement: 0.99,
+                        // Enough for both plans only when weights are counted once.
+                        max_plan_bytes: 2 * plan_bytes(&plan).unwrap() - 17 * 65 * 4,
+                        kernel_memo: Some(memo.clone()),
+                        ..Default::default()
+                    },
+                    |s, _| {
+                        s.set_input("x", &[0.25; 33 * 17]);
+                        s.set_parameter("w", &[0.125; 17 * 65]);
                         Ok(())
-                    } else {
-                        Err("matmul mismatch".into())
-                    }
-                },
-            )
-            .unwrap()
-            .1
-        };
-        let first = search();
-        assert_eq!(first.selected, 0);
-        assert!(first.trials[0].kernel_tuning.is_none());
-        assert_eq!(first.trials[0].qualifications, 1);
-        let tuning = first.trials[1].kernel_tuning.as_ref().unwrap();
-        assert!(!tuning.outcomes.is_empty() && !tuning.time_budget_exhausted);
-        assert_eq!(first.trials[1].qualifications, 2);
-        assert_eq!(first.trials[1].outcome.decision, TuneDecision::KeepBaseline);
-        assert_eq!(first.trials[1].outcome.baseline_ms.len(), 4);
-        assert_eq!(first.trials[1].outcome.candidate_ms.len(), 4);
-        assert!(!first.final_qualification_time.is_zero());
-        assert_eq!(memo.lock().unwrap().len(), 1);
-        let second = search();
-        assert_eq!(second.selected, 0);
-        assert!(second.trials[0].kernel_tuning.is_none());
-        let tuning = second.trials[1].kernel_tuning.as_ref().unwrap();
-        assert!(tuning.outcomes.is_empty());
-        assert_eq!(tuning.reused_classes.len(), 1);
-        assert_eq!(second.trials[1].qualifications, 1);
-        assert_eq!(
-            second.trials[1].outcome.decision,
-            TuneDecision::KeepBaseline
-        );
-        assert_eq!(second.trials[1].outcome.baseline_ms.len(), 4);
-        assert_eq!(second.trials[1].outcome.candidate_ms.len(), 4);
+                    },
+                    |s| {
+                        let output = s.read_output(33 * 65);
+                        if output.iter().all(|&v| (v - 0.53125).abs() < 1e-5) {
+                            Ok(())
+                        } else {
+                            Err("matmul mismatch".into())
+                        }
+                    },
+                )
+                .unwrap()
+                .1
+            };
+            let first = search();
+            assert_eq!(first.selected, 0);
+            assert!(first.trials[0].kernel_tuning.is_none());
+            assert_eq!(first.trials[0].qualifications, 1);
+            let tuning = first.trials[1].kernel_tuning.as_ref().unwrap();
+            assert!(!tuning.outcomes.is_empty() && !tuning.time_budget_exhausted);
+            assert_eq!(first.trials[1].qualifications, 2);
+            assert_eq!(first.trials[1].outcome.decision, TuneDecision::KeepBaseline);
+            if kernel_threshold == 0.99 {
+                assert!(
+                    tuning
+                        .outcomes
+                        .iter()
+                        .all(|outcome| outcome.selected == outcome.initial)
+                );
+            }
+            let pairs = if first.trials[1].outcome.baseline_ms.is_empty() {
+                0
+            } else {
+                4
+            };
+            if kernel_threshold == 0.99 {
+                assert_eq!(pairs, 0);
+            }
+            assert_eq!(first.trials[1].outcome.candidate_ms.len(), pairs);
+            assert!(!first.final_qualification_time.is_zero());
+            assert_eq!(memo.lock().unwrap().len(), 1);
+            let second = search();
+            assert_eq!(second.selected, 0);
+            assert!(second.trials[0].kernel_tuning.is_none());
+            let tuning = second.trials[1].kernel_tuning.as_ref().unwrap();
+            assert!(tuning.outcomes.is_empty());
+            assert_eq!(tuning.reused_classes.len(), 1);
+            assert_eq!(second.trials[1].qualifications, 1);
+            assert_eq!(
+                second.trials[1].outcome.decision,
+                TuneDecision::KeepBaseline
+            );
+            assert_eq!(second.trials[1].outcome.baseline_ms.len(), pairs);
+            assert_eq!(second.trials[1].outcome.candidate_ms.len(), pairs);
+            for report in [&first, &second] {
+                // Same dispatches with a different submission count still get timed.
+                assert_eq!(report.trials[2].outcome.baseline_ms.len(), 4);
+                assert_eq!(report.trials[2].outcome.candidate_ms.len(), 4);
+            }
+        }
     }
 
     #[test]
@@ -1207,7 +1288,10 @@ mod tests {
         warm.wait();
         drop(warm);
         select(
-            identical_programs(8),
+            identical_programs(8).map(|mut program| {
+                program.plan.dispatches[0].label = program.description.clone();
+                program
+            }),
             gpu,
             SessionOptions::default(),
             BuildSearchOptions {
