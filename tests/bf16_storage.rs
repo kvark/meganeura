@@ -404,7 +404,7 @@ fn bf16_matrix_reduced_gradients() {
     for layout in 0..3 {
         for addend in [false, true] {
             for scale in [1e-20, 1.0, 1e20] {
-                let (m, n, k) = (19, 23, 17);
+                let (m, n, k) = (35, 37, 41);
                 let mut graph = Graph::new();
                 let a = graph.parameter("a", &if layout == 1 { [k, m] } else { [m, k] });
                 let b = graph.parameter("b", &if layout == 2 { [n, k] } else { [k, n] });
