@@ -9,6 +9,8 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
+// Version 25 stores RoPE and attention parameters in uniform byte order,
+// including padding. RoPE's head_dim moves after axes_dim.
 // Version 24 stores explicit key/value and causal-row lengths in forward
 // attention dispatches. Version 23 used kv_seq == 0 as a causal sentinel.
 // Version 23 allows native16 f32 attention gradients. The same family/path
@@ -30,7 +32,7 @@ use std::{io, path::Path};
 // Version 13 reduces loss partials into a scalar, lowers LayerNorm to the
 // two-pass kernel, carries RoPE's static offset into the dynamic kernels, and
 // changes which dispatches fusion may merge.
-const CACHE_FORMAT_VERSION: u32 = 24;
+const CACHE_FORMAT_VERSION: u32 = 25;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]
@@ -529,6 +531,34 @@ mod cache_format_tests {
         ));
         std::fs::write(&path, ron::ser::to_string(&legacy).unwrap()).unwrap();
         assert!(load_plan(&graph, &path).unwrap().is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rope_dispatch_cache_v24_is_invalidated() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[3, 32]);
+        let output = graph.rope_with_offset(x, 10_000.0, 7, 16);
+        graph.set_outputs(vec![output]);
+        let plan = compile::compile(&graph);
+        let mut legacy_plan = plan.clone();
+        // Same length as the new layout, but head_dim occupied word 4.
+        legacy_plan.dispatches[0].params = vec![3, 32, 10_000f32.to_bits(), 7, 16, 0, 0, 0];
+        let legacy = CachedPlan {
+            format_version: 24,
+            graph_hash: hash_graph(&graph),
+            build_hash: 0,
+            plan: legacy_plan,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "meganeura-rope-cache-v24-{}.ron",
+            std::process::id()
+        ));
+        std::fs::write(&path, ron::ser::to_string(&legacy).unwrap()).unwrap();
+        assert!(load_plan(&graph, &path).unwrap().is_none());
+        save_plan(&plan, &graph, &path).unwrap();
+        let restored = load_plan(&graph, &path).unwrap().unwrap();
+        assert_eq!(restored.dispatches, plan.dispatches);
         std::fs::remove_file(path).unwrap();
     }
 

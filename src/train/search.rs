@@ -501,7 +501,12 @@ fn implementations(
         .iter()
         .flat_map(|seed| &seed.plan.dispatches)
         .filter(|d| d.shader.is_attention())
-        .map(|d| d.params[3])
+        .map(|d| {
+            use crate::compile::{AttentionParams, DispatchParams};
+            AttentionParams::from_words(&d.params)
+                .expect("invalid attention parameters")
+                .head_dim
+        })
         .collect();
     let mut attention = vec![(0, None)];
     if !heads.is_empty() {
