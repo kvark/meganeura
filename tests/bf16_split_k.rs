@@ -4,6 +4,7 @@ fn graph(m: usize, n: usize, k: usize, layout: usize, add: bool, round: bool) ->
     let mut graph = Graph::new();
     let a = graph.parameter("a", &if layout == 1 { [k, m] } else { [m, k] });
     let b = graph.parameter("b", &if layout == 2 { [n, k] } else { [k, n] });
+    let bias = add.then(|| graph.parameter("bias", &[m, n]));
     let a = graph.to_bf16(a);
     let b = graph.to_bf16(b);
     let y = match layout {
@@ -11,8 +12,7 @@ fn graph(m: usize, n: usize, k: usize, layout: usize, add: bool, round: bool) ->
         1 => graph.matmul_at(a, b),
         _ => graph.matmul_bt(a, b),
     };
-    if add {
-        let bias = graph.parameter("bias", &[m, n]);
+    if let Some(bias) = bias {
         let node = &mut graph.nodes_mut()[y as usize];
         node.op = match layout {
             0 => meganeura::graph::Op::FusedMatMulAdd,
@@ -44,7 +44,11 @@ fn values(len: usize, seed: u32) -> Vec<f32> {
 fn partitions_reduce_before_rounding_and_leave_addends_unsplit() {
     for layout in 0..3 {
         for add in [false, true] {
-            let plan = meganeura::compile::compile(&graph(33, 65, 1031, layout, add, true));
+            let graph = graph(33, 65, 1031, layout, add, true);
+            for node in graph.nodes() {
+                assert!(node.inputs.iter().all(|&input| input < node.id));
+            }
+            let plan = meganeura::compile::compile(&graph);
             let index = plan
                 .dispatches
                 .iter()
