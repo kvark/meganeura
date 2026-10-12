@@ -85,16 +85,33 @@ The initializer supplies representative inputs and weights to a new private
 session. The qualifier reads all observable outputs, gradients and state updates
 after exactly one step and checks the application's numerical contract. The
 runner resets persistent writes between steps and before returning the winner.
+`build_measured` keeps inputs resident. Applications that upload inputs before
+every deployment step use `build_measured_with_inputs` and supply a
+`refresh_inputs` callback. It runs after state restoration before each
+qualification, warmup and timed execution, including the final incumbent check.
+Upload time is reported separately from execution samples and consumes the
+shared deadline.
 Configure runtime optimizers and external/shared writable bindings afterward.
-Each program is qualified after kernel tuning, before it is timed, and also
-before tuning when kernel classes remain to be probed. Only a winning challenger
-is qualified again after measurement; the selected program is requalified before
-returning only if another challenger ran since its last check, not after every
-trial. An invalid challenger is discarded; an invalid final incumbent aborts the
-search.
+The ordinary untuned program is qualified first and kept as the initial
+incumbent. Its tuned version, including memoized decisions, is a separate
+challenger that must win whole-program timing to replace it. Both count toward
+`max_programs`; a one-program search returns only the untuned fallback. Each
+challenger is qualified after kernel tuning, before it is timed, and also before
+tuning when kernel classes remain to be probed. If its dispatches and submission
+count match the incumbent's, it records `KeepBaseline` without warmup or paired
+timing. Qualification still checks the initialized inputs and state, and the
+trial still counts toward the program and patience bounds. Only a winning
+challenger is qualified again after measurement; the selected program is
+requalified before returning only if another challenger ran since its last
+check. An invalid challenger is discarded; an invalid final incumbent aborts
+the search.
 Each challenger is constructed on the idle incumbent's identically stored weights
 that neither program writes. `Session::inherits_parameter` tells the initializer
 which uploads it can skip; written parameters remain private search state.
+`max_plan_bytes` counts inherited immutable parameters once across the pair,
+including compatible derived weights. Each program is charged for its private
+buffers and persistent-state snapshots. This logical-byte budget excludes driver
+padding, pipelines, staging and kernel-probe scratch.
 Sessions on one context share pipelines with identical generated code, so a
 challenger compiles only the kernels that differ from the incumbent's.
 
@@ -114,13 +131,13 @@ splits and convolution weight splits use the existing compiler, with no
 session-buffer patching. There is no reusable command recording or separate
 live structural tuner.
 
-The collection harness gives private probes the remaining shared session
-deadline, not an independent two-second slice. The shorter slices repeatedly
-interrupted expensive qualification on B570 SmolLM2 and left later, repeated
-matrix classes untuned. Completing the ordinary candidate's kernel search
-first recovered a faster incumbent without adding another optimizer. This is
-budget allocation, not a monotonic-performance guarantee: an exhausted total
-budget or a change in execution state can still defeat that expectation.
+Private probes use the smaller of their configured budget and the remaining
+shared session deadline after reserving estimated time for whole-program warmup,
+paired sampling and qualification. The reserve uses observed step and validation
+costs, including state restoration and input refresh. Private kernel wins alone
+cannot replace the untuned fallback: incomplete or late comparisons retain the
+incumbent. Deadlines remain soft around in-flight work, and noisy measurements
+or unrepresentative inputs can still select a slower deployment program.
 Held-out inference and minimal-shape measurements must check the selected plan;
 training improvements do not compensate for inference regressions.
 

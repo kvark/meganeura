@@ -3081,6 +3081,41 @@ fn parameter_storage_matches(
         && target_recipe == source_recipe
 }
 
+/// Parameter bindings reused at construction, also used to budget search plans.
+pub(crate) fn shared_parameters(
+    plan: &ExecutionPlan,
+    source: &ExecutionPlan,
+    immutable_only: bool,
+) -> Vec<(BufferRef, BufferRef)> {
+    let writes = |plan: &ExecutionPlan| -> std::collections::HashSet<BufferRef> {
+        if !immutable_only {
+            return Default::default();
+        }
+        plan.dispatches
+            .iter()
+            .flat_map(|d| std::iter::once(d.output_buffer).chain(d.extra_outputs.iter().copied()))
+            .collect()
+    };
+    let (target_writes, source_writes) = (writes(plan), writes(source));
+    plan.param_buffers
+        .iter()
+        .filter_map(|&(ref name, target)| {
+            let source_buffer = source
+                .param_buffers
+                .iter()
+                .find(|entry| entry.0 == *name)?
+                .1;
+            if target_writes.contains(&target) || source_writes.contains(&source_buffer) {
+                return None;
+            }
+            if !parameter_storage_matches(plan, target, source, source_buffer) {
+                return None;
+            }
+            Some((target, source_buffer))
+        })
+        .collect()
+}
+
 impl Session {
     /// Select the safest cooperative matrix config from GPU capabilities.
     /// Prefers f32 operands for training correctness. The f16-input path
@@ -3505,42 +3540,9 @@ impl Session {
         let mut provided_physical = vec![None; alias.sizes.len()];
         let mut provided_parameters = 0usize;
         if let Some(source) = parameter_source.as_deref() {
-            // A measured search resets the parameters either program writes
-            // between trials. They are search state and stay private.
-            let writes = |plan: &ExecutionPlan| -> std::collections::HashSet<BufferRef> {
-                if !immutable_only {
-                    return Default::default();
-                }
-                plan.dispatches
-                    .iter()
-                    .flat_map(|d| std::iter::once(d.output_buffer).chain(d.extra_outputs.clone()))
-                    .collect()
-            };
-            let (target_writes, source_writes) = (writes(&plan), writes(&source.plan));
-            for &(ref name, target) in &plan.param_buffers {
-                let Some(source_buffer) = source
-                    .plan
-                    .param_buffers
-                    .iter()
-                    .find(|entry| entry.0 == *name)
-                    .map(|entry| entry.1)
-                else {
-                    continue;
-                };
-                if target_writes.contains(&target) || source_writes.contains(&source_buffer) {
-                    continue;
-                }
+            for (target, source_buffer) in shared_parameters(&plan, &source.plan, immutable_only) {
                 let target_index = target.0 as usize;
                 let source_index = source_buffer.0 as usize;
-                // Same bytes, same storage format and the same logical
-                // tensor; anything else keeps a private allocation.
-                if !parameter_storage_matches(&plan, target, &source.plan, source_buffer) {
-                    log::warn!(
-                        "parameter `{name}` is stored differently in the source session; \
-                         allocating it separately"
-                    );
-                    continue;
-                }
                 let source_physical = source.alias.map[source_index];
                 let physical = alias.rebind(
                     target_index,
