@@ -1,4 +1,7 @@
-use crate::compile::{BufferRef, CachedBlockAttentionParams, Dispatch, ExecutionPlan, ShaderEntry};
+use crate::compile::{
+    AttentionParams, BufferRef, CachedBlockAttentionParams, Dispatch, DispatchParams,
+    ExecutionPlan, RoPEParams, ShaderEntry,
+};
 use crate::kernels::attention_grad::Part as AttentionGradPart;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -455,17 +458,6 @@ struct EmbeddingData {
 }
 
 // rope: var src, dst, params
-#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
-#[repr(C)]
-struct RoPEParams {
-    seq: u32,
-    dim: u32,
-    theta_bits: u32,
-    pos_offset: u32,
-    axes_dim: [u32; 3],
-    head_dim: u32,
-}
-
 #[derive(blade_macros::ShaderData)]
 struct RoPEData {
     src: blade_graphics::BufferPiece,
@@ -892,19 +884,6 @@ struct MultiHeadAttnData {
 }
 
 // multi_head_attn_grad: var d_out (dO), src_a (Q), src_b (K), bias (V), lse, fwd_dst (O), dst (dQ/dK/dV), params
-#[derive(blade_macros::ShaderData, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
-#[repr(C)]
-struct AttentionParams {
-    q_seq: u32,
-    kv_seq: u32,
-    packed_heads: u32,
-    head_dim: u32,
-    window_size: u32,
-    causal_rows: u32,
-    _pad1: u32,
-    _pad2: u32,
-}
-
 #[derive(blade_macros::ShaderData)]
 struct MultiHeadAttnGradData {
     d_out: blade_graphics::BufferPiece,
@@ -1654,10 +1633,12 @@ impl Pipelines {
             ShaderGroup::MultiHeadAttn
             | ShaderGroup::FlashAttention
             | ShaderGroup::FlashAttentionCoop
-            | ShaderGroup::FlashAttentionCoopF32
-            | ShaderGroup::CachedQueryAttention => dispatch.params.get(3).copied(),
+            | ShaderGroup::FlashAttentionCoopF32 => {
+                AttentionParams::from_words(&dispatch.params).map(|p| p.head_dim)
+            }
+            ShaderGroup::CachedQueryAttention => dispatch.params.get(3).copied(),
             ShaderGroup::AttentionGrad(kernel) if kernel.specializes_head_dim() => {
-                dispatch.params.get(3).copied()
+                AttentionParams::from_words(&dispatch.params).map(|p| p.head_dim)
             }
             _ => None,
         }
@@ -3414,7 +3395,11 @@ impl Session {
             .dispatches
             .iter()
             .filter(|dispatch| dispatch.shader == ShaderEntry::FlashAttention)
-            .map(|dispatch| dispatch.params[3])
+            .map(|dispatch| {
+                AttentionParams::from_words(&dispatch.params)
+                    .expect("invalid attention parameters")
+                    .head_dim
+            })
             .max()
         {
             plan.knobs

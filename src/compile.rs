@@ -4,35 +4,10 @@ use crate::schedule::{PointwiseDAG, Pw, ReductionEpilogue, ReductionKernel};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+mod params;
 mod softplus;
 mod split_k;
-
-/// Host layout of the cached block-attention WGSL uniform. Dispatch encoding,
-/// runtime binding and tuning all use this layout rather than indexing words.
-#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
-#[repr(C)]
-pub(crate) struct CachedBlockAttentionParams {
-    pub window_size: u32,
-    pub num_heads: u32,
-    pub num_kv_heads: u32,
-    pub head_dim: u32,
-    pub block_len: u32,
-    pub max_seq: u32,
-    pub splits: u32,
-    pub _pad: u32,
-}
-
-impl CachedBlockAttentionParams {
-    pub fn from_words(words: &[u32]) -> Option<Self> {
-        bytemuck::try_from_bytes(bytemuck::cast_slice(words))
-            .ok()
-            .copied()
-    }
-
-    pub fn to_words(self) -> Vec<u32> {
-        bytemuck::cast_slice(std::slice::from_ref(&self)).to_vec()
-    }
-}
+pub(crate) use params::{AttentionParams, CachedBlockAttentionParams, DispatchParams, RoPEParams};
 
 /// Weight storage format for matmul B operands.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -4716,7 +4691,7 @@ mod tests {
 
     #[test]
     fn forward_attention_masks_have_explicit_lengths() {
-        fn params(kind: u32) -> Vec<u32> {
+        fn params(kind: u32) -> AttentionParams {
             let mut g = Graph::new();
             let q = g.input("q", &[33, 16]);
             let kv_rows = if kind == 4 { 29 } else { 33 };
@@ -4731,15 +4706,30 @@ mod tests {
                 _ => unreachable!(),
             };
             g.set_outputs(vec![out]);
-            compile(&g).dispatches[0].params.clone()
+            AttentionParams::from_words(&compile(&g).dispatches[0].params).unwrap()
         }
 
-        let heads = (2 << 16) | 1;
-        assert_eq!(params(0), [33, 33, heads, 8, 0, 33]);
-        assert_eq!(params(1), [33, 33, heads, 8, 7, 33]);
-        assert_eq!(params(2), [33, 33, heads, 8, 0, 17]);
-        assert_eq!(params(3), [33, 33, heads, 8, 0, 0]);
-        assert_eq!(params(4), [33, 29, heads, 8, 0, 0]);
+        for (kind, kv_seq, window_size, causal_rows) in [
+            (0, 33, 0, 33),
+            (1, 33, 7, 33),
+            (2, 33, 0, 17),
+            (3, 33, 0, 0),
+            (4, 29, 0, 0),
+        ] {
+            assert_eq!(
+                params(kind),
+                AttentionParams {
+                    q_seq: 33,
+                    kv_seq,
+                    packed_heads: (2 << 16) | 1,
+                    head_dim: 8,
+                    window_size,
+                    causal_rows,
+                    _pad1: 0,
+                    _pad2: 0,
+                }
+            );
+        }
     }
 
     #[test]
@@ -4803,6 +4793,92 @@ mod tests {
         for dispatch in rope_dispatches {
             assert_eq!(dispatch.workgroups, [32_768, 2, 1]);
             assert!(workgroups_within_portable_limits(dispatch.workgroups));
+            let axes_dim = if dispatch.shader == ShaderEntry::AxialRoPE {
+                [16, 56, 56]
+            } else {
+                [0; 3]
+            };
+            assert_eq!(
+                RoPEParams::from_words(&dispatch.params).unwrap(),
+                RoPEParams {
+                    axes_dim,
+                    ..RoPEParams::new(SEQ as u32, DIM as u32, 10_000.0, HEAD_DIM)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn rope_dispatches_preserve_static_offsets() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[3, 32]);
+        let offset = g.input_u32("offset", &[1]);
+        let factors = g.input("factors", &[8]);
+        let outputs = vec![
+            g.rope_with_offset(x, 1234.0, 7, 16),
+            g.rope_dynamic_offset(x, 1234.0, offset, 16),
+            g.rope_dynamic_offset_factors(x, 1234.0, offset, 16, factors),
+            g.rope_grad(x, 1234.0, 7, 16),
+        ];
+        for &output in &outputs {
+            match g.nodes_mut()[output as usize].op {
+                Op::RoPE {
+                    ref mut pos_offset, ..
+                } => *pos_offset = 7,
+                Op::RoPEGrad { .. } => {}
+                _ => unreachable!(),
+            }
+        }
+        g.set_outputs(outputs);
+        let plan = compile(&g);
+        assert_eq!(plan.dispatches.len(), 4);
+        for dispatch in &plan.dispatches {
+            assert_eq!(
+                RoPEParams::from_words(&dispatch.params).unwrap(),
+                RoPEParams {
+                    pos_offset: 7,
+                    ..RoPEParams::new(3, 32, 1234.0, 16)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn attention_backward_dispatches_encode_full_uniforms() {
+        for causal in [false, true] {
+            let mut g = Graph::new();
+            let q = g.parameter("q", &[7, 32]);
+            let k = g.parameter("k", &[7, 16]);
+            let v = g.parameter("v", &[7, 16]);
+            let y = if causal {
+                g.sliding_window_attention(q, k, v, 2, 1, 16, 3)
+            } else {
+                g.full_attention(q, k, v, 2, 1, 16)
+            };
+            let loss = g.sum_all(y);
+            g.set_outputs(vec![loss]);
+            let plan = compile(&crate::autodiff::differentiate(&g));
+            let backward: Vec<_> = plan
+                .dispatches
+                .iter()
+                .filter(|d| matches!(d.shader, ShaderEntry::AttentionGrad(_)))
+                .collect();
+            assert_eq!(backward.len(), 2);
+            for dispatch in backward {
+                assert_eq!(
+                    AttentionParams::from_words(&dispatch.params).unwrap(),
+                    AttentionParams {
+                        q_seq: 7,
+                        kv_seq: if causal { 0 } else { 7 },
+                        packed_heads: (2 << 16) | 1,
+                        head_dim: 16,
+                        window_size: if causal { 3 } else { 0 },
+                        causal_rows: 0,
+                        _pad1: 0,
+                        _pad2: 0,
+                    }
+                );
+            }
         }
     }
 

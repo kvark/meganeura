@@ -761,8 +761,12 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         }
         ShaderGroup::Embedding => ShaderModule::new(include_str!("shaders/embedding.wgsl")),
         ShaderGroup::ToF16 => ShaderModule::new(include_str!("shaders/to_f16.wgsl")),
-        ShaderGroup::RoPE => ShaderModule::new(include_str!("shaders/rope.wgsl")),
-        ShaderGroup::RoPEGrad => ShaderModule::new(include_str!("shaders/rope_grad.wgsl")),
+        ShaderGroup::RoPE => ShaderModule::new(
+            &include_str!("shaders/rope.wgsl").replace("$PARAMS", ROPE_PARAMS_WGSL),
+        ),
+        ShaderGroup::RoPEGrad => ShaderModule::new(
+            &include_str!("shaders/rope_grad.wgsl").replace("$PARAMS", ROPE_PARAMS_WGSL),
+        ),
         ShaderGroup::LayerNorm => ShaderModule::new(include_str!("shaders/layer_norm.wgsl")),
         ShaderGroup::MultiHeadAttn => {
             // Default head_dim=64 fallback; runtime calls
@@ -873,7 +877,9 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
             ShaderModule::new(include_str!("shaders/chunked_relative_attention.wgsl"))
         }
         ShaderGroup::PrefixLast => ShaderModule::new(include_str!("shaders/prefix_last.wgsl")),
-        ShaderGroup::RoPEDynamic => ShaderModule::new(include_str!("shaders/rope_dynamic.wgsl")),
+        ShaderGroup::RoPEDynamic => ShaderModule::new(
+            &include_str!("shaders/rope_dynamic.wgsl").replace("$PARAMS", ROPE_PARAMS_WGSL),
+        ),
         ShaderGroup::MaxPool2d => ShaderModule::new(include_str!("shaders/max_pool_2d.wgsl")),
         ShaderGroup::MaxPool2dGrad => {
             ShaderModule::new(include_str!("shaders/max_pool_2d_grad.wgsl"))
@@ -1902,6 +1908,7 @@ pub fn generate_module_weighted(
 }
 
 const ATTENTION_PARAMS_WGSL: &str = include_str!("shaders/attention_params.wgsl");
+const ROPE_PARAMS_WGSL: &str = include_str!("shaders/rope_params.wgsl");
 const CACHED_ATTENTION_PARAMS_WGSL: &str = include_str!("shaders/cached_attention_params.wgsl");
 const GEMV_TEMPLATE: &str = include_str!("shaders/matmul_gemv.wgsl");
 
@@ -3979,12 +3986,72 @@ mod tests {
         }
     }
 
+    fn assert_params_layout<P: crate::compile::DispatchParams>(module: &naga::Module) {
+        let params = module
+            .global_variables
+            .iter()
+            .find(|&(_, gv)| gv.name.as_deref() == Some("params"))
+            .expect("missing params uniform")
+            .1;
+        let naga::TypeInner::Struct { ref members, span } = module.types[params.ty].inner else {
+            panic!("params must be a struct");
+        };
+        assert_eq!(span as usize, std::mem::size_of::<P>(), "uniform size");
+        let fields: Vec<_> = members
+            .iter()
+            .map(|member| (member.name.as_deref().unwrap(), member.offset as usize))
+            .collect();
+        assert_eq!(fields, P::FIELDS, "uniform member names and offsets");
+    }
+
+    #[test]
+    #[should_panic(expected = "uniform member names and offsets")]
+    fn params_layout_rejects_same_size_field_swap() {
+        let source = ROPE_PARAMS_WGSL
+            .replace("theta_bits:", "swapped:")
+            .replace("pos_offset:", "theta_bits:")
+            .replace("swapped:", "pos_offset:");
+        let module =
+            naga::front::wgsl::parse_str(&format!("{source}\nvar<uniform> params: Params;"))
+                .unwrap();
+        assert_params_layout::<crate::compile::RoPEParams>(&module);
+    }
+
+    #[test]
+    #[should_panic(expected = "uniform member names and offsets")]
+    fn params_layout_rejects_offset_change() {
+        let mut module = naga::front::wgsl::parse_str(&format!(
+            "{ROPE_PARAMS_WGSL}\nvar<uniform> params: Params;"
+        ))
+        .unwrap();
+        let params_type = module.global_variables.iter().next().unwrap().1.ty;
+        let mut ty = module.types[params_type].clone();
+        let naga::TypeInner::Struct {
+            ref mut members, ..
+        } = ty.inner
+        else {
+            unreachable!();
+        };
+        // Keep names and total size unchanged, isolating the offset check.
+        // A WGSL vec3 must start at 16 here, unlike an unaligned Rust array.
+        let axes = members
+            .iter_mut()
+            .find(|m| m.name.as_deref() == Some("axes_dim"))
+            .unwrap();
+        assert_eq!(axes.offset, 16);
+        axes.offset = 12;
+        module.types.replace(params_type, ty);
+        assert_params_layout::<crate::compile::RoPEParams>(&module);
+    }
+
     /// Verify that shader global variable names match the runtime ShaderData
     /// struct field names. Blade resolves bindings by name — a mismatch causes
     /// a runtime panic ("Unable to resolve binding for ...").
     #[test]
     fn shader_globals_match_runtime_bindings() {
-        use crate::compile::ShaderEntry;
+        use crate::compile::{
+            AttentionParams, CachedBlockAttentionParams, RoPEParams, ShaderEntry,
+        };
         use std::collections::HashSet;
 
         // Expected global variable names for each ShaderEntry, derived from
@@ -4255,6 +4322,8 @@ mod tests {
             ShaderEntry::CachedAttention,
             ShaderEntry::CachedQueryAttention,
             ShaderEntry::CachedBlockAttention,
+            ShaderEntry::CachedBlockAttentionSplit,
+            ShaderEntry::CachedBlockAttentionCombine,
             ShaderEntry::ChunkedRelativeAttention,
             ShaderEntry::PrefixLast,
             ShaderEntry::RoPEDynamic,
@@ -4277,6 +4346,27 @@ mod tests {
             let expected: HashSet<&str> = expected_globals(entry).into_iter().collect();
 
             let sm = generate_module(group, MatmulKnobs::default());
+            match *entry {
+                ShaderEntry::RoPE
+                | ShaderEntry::RoPEGrad
+                | ShaderEntry::RoPEDynamic
+                | ShaderEntry::RoPEDynamicFactors
+                | ShaderEntry::RoPEPositions
+                | ShaderEntry::AxialRoPE => assert_params_layout::<RoPEParams>(&sm.module),
+                ShaderEntry::MultiHeadAttn
+                | ShaderEntry::FlashAttention
+                | ShaderEntry::FlashAttentionCoop
+                | ShaderEntry::FlashAttentionCoopF32
+                | ShaderEntry::AttentionGrad(_) => {
+                    assert_params_layout::<AttentionParams>(&sm.module)
+                }
+                ShaderEntry::CachedBlockAttention
+                | ShaderEntry::CachedBlockAttentionSplit
+                | ShaderEntry::CachedBlockAttentionCombine => {
+                    assert_params_layout::<CachedBlockAttentionParams>(&sm.module);
+                }
+                _ => {}
+            }
             let info = naga::valid::Validator::new(
                 naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS,
                 naga::valid::Capabilities::all(),

@@ -1965,6 +1965,10 @@ impl<'a> Compiler<'a> {
                 let shape = &self.graph.node(node.inputs[0]).ty.shape;
                 let seq = shape[0] as u32;
                 let dim = shape[1] as u32;
+                let params = RoPEParams {
+                    pos_offset,
+                    ..RoPEParams::new(seq, dim, theta, head_dim)
+                };
                 if node.inputs.len() == 3 {
                     // Dynamic offset with per-pair divisors.
                     let offset_buf = self.get_buffer(node.inputs[1]);
@@ -1975,7 +1979,7 @@ impl<'a> Compiler<'a> {
                         input_buffers: vec![input, offset_buf, factors],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
-                        params: vec![seq, dim, theta.to_bits(), pos_offset, head_dim, 0, 0, 0],
+                        params: params.to_words(),
 
                         ..Default::default()
                     });
@@ -1988,7 +1992,7 @@ impl<'a> Compiler<'a> {
                         input_buffers: vec![input, offset_buf],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
-                        params: vec![seq, dim, theta.to_bits(), pos_offset, head_dim, 0, 0, 0],
+                        params: params.to_words(),
 
                         ..Default::default()
                     });
@@ -1999,7 +2003,7 @@ impl<'a> Compiler<'a> {
                         input_buffers: vec![input],
                         output_buffer: out_buf,
                         extra_outputs: vec![],
-                        params: vec![seq, dim, theta.to_bits(), pos_offset, head_dim, 0, 0, 0],
+                        params: params.to_words(),
 
                         ..Default::default()
                     });
@@ -2018,7 +2022,7 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![input, positions],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![seq, dim, theta.to_bits(), 0, head_dim, 0, 0, 0],
+                    params: RoPEParams::new(seq, dim, theta, head_dim).to_words(),
 
                     ..Default::default()
                 });
@@ -2040,16 +2044,11 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![input, positions],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![
-                        seq,
-                        dim,
-                        theta.to_bits(),
-                        0,
-                        head_dim,
-                        axes_dim[0],
-                        axes_dim[1],
-                        axes_dim[2],
-                    ],
+                    params: RoPEParams {
+                        axes_dim,
+                        ..RoPEParams::new(seq, dim, theta, head_dim)
+                    }
+                    .to_words(),
                     ..Default::default()
                 });
             }
@@ -2085,7 +2084,7 @@ impl<'a> Compiler<'a> {
                             input_buffers: vec![*operand],
                             output_buffer: rotated,
                             extra_outputs: vec![],
-                            params: vec![seq, dim, rope_theta.to_bits(), 0, head_dim, 0, 0, 0],
+                            params: RoPEParams::new(seq, dim, rope_theta, head_dim).to_words(),
                             ..Default::default()
                         });
                         *operand = rotated;
@@ -2105,7 +2104,17 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
                     extra_outputs: vec![lse_buf],
-                    params: vec![seq, seq, (num_heads << 16) | num_kv_heads, head_dim, 0, seq],
+                    params: AttentionParams {
+                        q_seq: seq,
+                        kv_seq: seq,
+                        packed_heads: (num_heads << 16) | num_kv_heads,
+                        head_dim,
+                        window_size: 0,
+                        causal_rows: seq,
+                        _pad1: 0,
+                        _pad2: 0,
+                    }
+                    .to_words(),
 
                     ..Default::default()
                 });
@@ -2137,14 +2146,17 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
                     extra_outputs: vec![lse_buf],
-                    params: vec![
-                        seq,
-                        seq,
-                        (num_heads << 16) | num_kv_heads,
+                    params: AttentionParams {
+                        q_seq: seq,
+                        kv_seq: seq,
+                        packed_heads: (num_heads << 16) | num_kv_heads,
                         head_dim,
                         window_size,
-                        seq,
-                    ],
+                        causal_rows: seq,
+                        _pad1: 0,
+                        _pad2: 0,
+                    }
+                    .to_words(),
 
                     ..Default::default()
                 });
@@ -2165,7 +2177,11 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![grad_out],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![seq, dim, theta.to_bits(), pos_offset, head_dim, 0, 0, 0],
+                    params: RoPEParams {
+                        pos_offset,
+                        ..RoPEParams::new(seq, dim, theta, head_dim)
+                    }
+                    .to_words(),
 
                     ..Default::default()
                 });
@@ -3300,14 +3316,17 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![q, k, v],
                     output_buffer: out_buf,
                     extra_outputs: vec![lse_buf],
-                    params: vec![
+                    params: AttentionParams {
                         q_seq,
                         kv_seq,
-                        (num_heads << 16) | num_kv_heads,
+                        packed_heads: (num_heads << 16) | num_kv_heads,
                         head_dim,
-                        0,
+                        window_size: 0,
                         causal_rows,
-                    ],
+                        _pad1: 0,
+                        _pad2: 0,
+                    }
+                    .to_words(),
 
                     ..Default::default()
                 });
@@ -3367,13 +3386,17 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![d_out, q, k, v, lse_buf, row_source],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![
+                    params: AttentionParams {
                         q_seq,
                         kv_seq,
-                        (num_heads << 16) | num_kv_heads,
+                        packed_heads: (num_heads << 16) | num_kv_heads,
                         head_dim,
                         window_size,
-                    ],
+                        causal_rows: 0,
+                        _pad1: 0,
+                        _pad2: 0,
+                    }
+                    .to_words(),
 
                     ..Default::default()
                 });
@@ -3418,13 +3441,17 @@ impl<'a> Compiler<'a> {
                     Some(buf) => buf,
                     None => self.alloc_buffer(self.graph.node(node.inputs[3]).ty.size_bytes()),
                 };
-                let attention_params = vec![
+                let attention_params = AttentionParams {
                     q_seq,
                     kv_seq,
-                    (num_heads << 16) | num_kv_heads,
+                    packed_heads: (num_heads << 16) | num_kv_heads,
                     head_dim,
                     window_size,
-                ];
+                    causal_rows: 0,
+                    _pad1: 0,
+                    _pad2: 0,
+                }
+                .to_words();
                 let (kernel, workgroups, ept_cap) = self.attention_grad_kernel(
                     node,
                     Part::KV,

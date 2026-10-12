@@ -1,15 +1,7 @@
 // RoPE with dynamic position offset read from a storage buffer.
 // Same as rope.wgsl but pos_offset comes from a u32 buffer instead of params.
 
-struct Params {
-    seq: u32,
-    dim: u32,
-    theta_bits: u32,
-    // Static offset added to the dynamic one (zero from the builders).
-    pos_offset: u32,
-    axes_dim: vec3<u32>,
-    head_dim: u32,
-}
+$PARAMS
 
 var<storage> src: array<f32>;
 var<storage, read_write> dst: array<f32>;

@@ -1,11 +1,4 @@
-struct Params {
-    seq: u32,
-    dim: u32,
-    theta_bits: u32,
-    pos_offset: u32,
-    axes_dim: vec3<u32>,
-    head_dim: u32,
-}
+$PARAMS
 
 var<storage> src: array<f32>;       // grad_output
 var<storage, read_write> dst: array<f32>;  // grad_input

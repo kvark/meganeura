@@ -17,7 +17,9 @@ use super::{
     TransposeParams, UnaryData, UnaryParams, WinogradTransformData, WinogradTransformParams,
     reduction_is_dynamic,
 };
-use crate::compile::{BufferRef, CachedBlockAttentionParams, Dispatch, ShaderEntry};
+use crate::compile::{
+    BufferRef, CachedBlockAttentionParams, Dispatch, DispatchParams, ShaderEntry,
+};
 use crate::kernels::attention_grad::{AttentionGrad, Part as AttentionGradPart};
 
 impl Session {
@@ -481,14 +483,8 @@ impl Session {
                     &RoPEData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
-                        params: RoPEParams {
-                            seq: dispatch.params[0],
-                            dim: dispatch.params[1],
-                            theta_bits: dispatch.params[2],
-                            pos_offset: dispatch.params[3],
-                            axes_dim: [0; 3],
-                            head_dim: dispatch.params[4],
-                        },
+                        params: RoPEParams::from_words(&dispatch.params)
+                            .expect("invalid RoPE parameters"),
                     },
                 );
             }
@@ -521,16 +517,8 @@ impl Session {
                         bias: buf(dispatch.input_buffers[2]),
                         dst: buf(dispatch.output_buffer),
                         lse: buf(dispatch.extra_outputs[0]),
-                        params: AttentionParams {
-                            q_seq: dispatch.params[0],
-                            kv_seq: dispatch.params[1],
-                            packed_heads: dispatch.params[2],
-                            head_dim: dispatch.params[3],
-                            window_size: *dispatch.params.get(4).unwrap_or(&0),
-                            causal_rows: *dispatch.params.get(5).unwrap_or(&0),
-                            _pad1: 0,
-                            _pad2: 0,
-                        },
+                        params: AttentionParams::from_words(&dispatch.params)
+                            .expect("invalid attention parameters"),
                     },
                 );
             }
@@ -549,16 +537,8 @@ impl Session {
                         fwd_dst: buf(dispatch.input_buffers[5]),
                         dst: buf(dispatch.output_buffer),
                         dst2: buf(dispatch.extra_outputs[0]),
-                        params: AttentionParams {
-                            q_seq: dispatch.params[0],
-                            kv_seq: dispatch.params[1],
-                            packed_heads: dispatch.params[2],
-                            head_dim: dispatch.params[3],
-                            window_size: dispatch.params[4],
-                            causal_rows: 0,
-                            _pad1: 0,
-                            _pad2: 0,
-                        },
+                        params: AttentionParams::from_words(&dispatch.params)
+                            .expect("invalid attention parameters"),
                     },
                 );
             }
@@ -576,16 +556,8 @@ impl Session {
                         lse: buf(dispatch.input_buffers[4]),
                         fwd_dst: buf(dispatch.input_buffers[5]),
                         dst: buf(dispatch.output_buffer),
-                        params: AttentionParams {
-                            q_seq: dispatch.params[0],
-                            kv_seq: dispatch.params[1],
-                            packed_heads: dispatch.params[2],
-                            head_dim: dispatch.params[3],
-                            window_size: dispatch.params[4],
-                            causal_rows: 0,
-                            _pad1: 0,
-                            _pad2: 0,
-                        },
+                        params: AttentionParams::from_words(&dispatch.params)
+                            .expect("invalid attention parameters"),
                     },
                 );
             }
@@ -1012,14 +984,8 @@ impl Session {
                         dst: buf(dispatch.output_buffer),
                         pos_offset_buf: buf(dispatch.input_buffers[1]),
                         factors: buf(dispatch.input_buffers[2]),
-                        params: RoPEParams {
-                            seq: dispatch.params[0],
-                            dim: dispatch.params[1],
-                            theta_bits: dispatch.params[2],
-                            pos_offset: dispatch.params[3],
-                            axes_dim: [0; 3],
-                            head_dim: dispatch.params[4],
-                        },
+                        params: RoPEParams::from_words(&dispatch.params)
+                            .expect("invalid RoPE parameters"),
                     },
                 );
             }
@@ -1030,18 +996,8 @@ impl Session {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
                         pos_offset_buf: buf(dispatch.input_buffers[1]),
-                        params: RoPEParams {
-                            seq: dispatch.params[0],
-                            dim: dispatch.params[1],
-                            theta_bits: dispatch.params[2],
-                            pos_offset: dispatch.params[3],
-                            axes_dim: [
-                                *dispatch.params.get(5).unwrap_or(&0),
-                                *dispatch.params.get(6).unwrap_or(&0),
-                                *dispatch.params.get(7).unwrap_or(&0),
-                            ],
-                            head_dim: dispatch.params[4],
-                        },
+                        params: RoPEParams::from_words(&dispatch.params)
+                            .expect("invalid RoPE parameters"),
                     },
                 );
             }
