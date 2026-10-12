@@ -13,7 +13,7 @@ fn timing_context() -> Option<Arc<blade_graphics::Context>> {
         .get_or_init(|| {
             init_gpu_context_with(GpuOptions {
                 timing: true,
-                ..GpuOptions::default()
+                ..GpuOptions::from_env()
             })
             .ok()
             .map(Arc::new)
@@ -116,6 +116,46 @@ fn run_unprofiled() -> Vec<f32> {
     let mut out = vec![0.0f32; ROWS * DIM];
     session.read_output_by_index(0, &mut out);
     out
+}
+
+#[test]
+fn chunked_trace_keeps_intermediate_submission_timings() {
+    let Some(mut session) = build_timed_session() else {
+        eprintln!("SKIP: selected device cannot timestamp GPU passes");
+        return;
+    };
+    let gpu = timing_context().unwrap();
+    if let Ok(expected) = std::env::var("MEGANEURA_EXPECT_DEVICE_NAME") {
+        assert_eq!(gpu.device_information().device_name, expected);
+        assert!(!gpu.device_information().is_software_emulated);
+        let memory = gpu.memory_stats();
+        assert!(memory.budget.saturating_sub(memory.usage) >= 2 << 30);
+    }
+    let reference = run_unprofiled();
+    session.set_submission_chunks(4);
+    session.step();
+    session.wait();
+    let mut out = vec![0.0; ROWS * DIM];
+    session.read_output_by_index(0, &mut out);
+    assert!(close(&out, &reference, 1.0e-4));
+    let path = std::env::temp_dir().join(format!(
+        "meganeura-chunk-trace-{}-{}.pftrace",
+        std::process::id(),
+        meganeura::profiler::now_ns(),
+    ));
+    meganeura::profiler::save(&path).unwrap();
+    let trace = std::fs::read(&path).unwrap();
+    std::fs::remove_file(path).unwrap();
+    for chunk in 1..=4 {
+        let name = format!("step {chunk}/4");
+        assert!(
+            trace
+                .windows(name.len())
+                .any(|bytes| bytes == name.as_bytes()),
+            "missing timestamp label {name}",
+        );
+    }
+    println!("chunk_trace_verified submissions=4");
 }
 
 #[test]
