@@ -119,6 +119,11 @@ let mut generator = model.generator(2048)?;
 println!("{}", generator.generate("The meaning of life is", &GenerationOptions::default())?);
 ```
 
+`load_gguf` memory-maps files opened from disk, so model weights fault in on
+demand instead of first being copied into an equally large heap allocation.
+The in-memory `load_gguf_bytes` and `load_gguf_shared` entry points retain
+their owned-buffer behavior.
+
 `CompileOptions::quantized_activations` quantizes the GEMV activation row
 to Q8_1 and runs the inner product on integer dot products, following
 llama.cpp's `vec_dot_*_q8_1` kernels. It is on by default: a model that
