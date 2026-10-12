@@ -11,12 +11,16 @@ fn graph(m: usize, n: usize, k: usize, layout: usize, add: bool, round: bool) ->
         1 => graph.matmul_at(a, b),
         _ => graph.matmul_bt(a, b),
     };
-    let y = if add {
+    if add {
         let bias = graph.parameter("bias", &[m, n]);
-        graph.add(y, bias)
-    } else {
-        y
-    };
+        let node = &mut graph.nodes_mut()[y as usize];
+        node.op = match layout {
+            0 => meganeura::graph::Op::FusedMatMulAdd,
+            1 => meganeura::graph::Op::FusedMatMulATAdd,
+            _ => meganeura::graph::Op::FusedMatMulBTAdd,
+        };
+        node.inputs.push(bias);
+    }
     let y = if round {
         let y = graph.to_bf16(y);
         graph.from_bf16(y)
@@ -199,8 +203,10 @@ fn long_products_preserve_master_and_reduced_gradients() {
                 let loss = graph.sum_all(weighted);
                 graph.set_outputs(vec![loss, y]);
                 let mut feeds = meganeura::reference::Feeds::new();
-                feeds.set("a", &values(3 * 1031, 101));
-                feeds.set("b", &values(5 * 1031, 207));
+                for (name, len, seed) in [("a", 3 * 1031, 101), ("b", 5 * 1031, 207)] {
+                    let data: Vec<_> = values(len, seed).into_iter().map(|v| v / 1.137).collect();
+                    feeds.set(name, &data);
+                }
                 feeds.set("weights", &values(15, 509));
                 if add {
                     feeds.set("bias", &[0.125; 15]);
