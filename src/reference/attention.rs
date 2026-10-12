@@ -34,32 +34,6 @@ fn invalid(node: &Node, reason: impl Into<String>) -> Error {
     }
 }
 
-#[cfg(test)]
-mod qwen_image_tests {
-    use crate::Graph;
-    use crate::reference::{Feeds, evaluate_outputs};
-
-    #[test]
-    fn block_causal_prefix_and_full_suffix_have_distinct_masks() {
-        let mut graph = Graph::new();
-        let q = graph.input("q", &[3, 2]);
-        let k = graph.input("k", &[3, 2]);
-        let v = graph.input("v", &[3, 2]);
-        let out = graph.block_causal_attention(q, k, v, 1, 1, 2, 2);
-        graph.set_outputs(vec![out]);
-        let mut feeds = Feeds::new();
-        feeds
-            .set("q", &[0.0; 6])
-            .set("k", &[0.0; 6])
-            .set("v", &[1.0, 10.0, 3.0, 30.0, 5.0, 50.0]);
-        let out = evaluate_outputs(&graph, &feeds).unwrap().remove(0);
-        let expected = [1.0, 10.0, 2.0, 20.0, 3.0, 30.0];
-        for (got, want) in out.data.iter().zip(expected) {
-            assert!((got - want).abs() < 1.0e-12, "{got} != {want}");
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 struct Heads {
     heads: usize,

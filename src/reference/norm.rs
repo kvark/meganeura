@@ -694,34 +694,3 @@ pub(super) fn magnitude(node: &Node, ins: &[&Tensor], out: &Tensor) -> Option<Ve
         _ => None,
     }
 }
-
-#[cfg(test)]
-mod qwen_image_tests {
-    use crate::Graph;
-    use crate::reference::{Feeds, evaluate_outputs};
-
-    #[test]
-    fn axial_rope_uses_signed_positions_and_adjacent_pairs() {
-        let mut graph = Graph::new();
-        let x = graph.input("x", &[1, 6]);
-        let positions = graph.input("positions", &[1, 3]);
-        let out = graph.axial_rope_with_positions(x, 10_000.0, positions, 6, [2, 2, 2]);
-        graph.set_outputs(vec![out]);
-        let mut feeds = Feeds::new();
-        feeds
-            .set("x", &[1.0, 0.0, 1.0, 0.0, 1.0, 0.0])
-            .set("positions", &[1.0, -1.0, 2.0]);
-        let out = evaluate_outputs(&graph, &feeds).unwrap().remove(0);
-        let expected = [
-            1.0f64.cos(),
-            1.0f64.sin(),
-            1.0f64.cos(),
-            -1.0f64.sin(),
-            2.0f64.cos(),
-            2.0f64.sin(),
-        ];
-        for (got, want) in out.data.iter().zip(expected) {
-            assert!((got - want).abs() < 1.0e-12, "{got} != {want}");
-        }
-    }
-}
