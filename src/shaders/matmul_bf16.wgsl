@@ -13,6 +13,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(subgroup_id) subgroup: u32,
         @builtin(subgroup_size) subgroup_size: u32) {
     $DIMS
+    $RANGE
     let row = group.x * 32u;
     let col = group.y * 32u;
     // Four logical matrix tiles, independent of the device subgroup width.
@@ -23,7 +24,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         let a_offset = ((tile % 4u) / 2u) * 16u * 32u;
         let b_offset = (tile % 2u) * 16u;
         var accumulator = coop_mat16x16<f32, C>();
-        for (var start = 0u; start < k; start += 32u) {
+        for (var start = first; start < end; start += 32u) {
             for (var index = lane; index < 1024u; index += 128u) {
                 let ar = row + index / 32u;
                 let ak = start + index % 32u;

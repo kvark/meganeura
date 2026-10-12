@@ -847,9 +847,21 @@ impl<'a> Compiler<'a> {
                 rows.checked_mul(columns)
                     .expect("BF16 matrix address space");
             }
-            let grid = [m.div_ceil(32), n.div_ceil(32), 1];
+            // Leave fused epilogues intact. Partitions must be reduced in F32
+            // before any explicit BF16 output conversion.
+            let splits = if addend {
+                1
+            } else {
+                super::bf16::matrix_splits(m, n, k)
+            };
+            let grid = [m.div_ceil(32), n.div_ceil(32), splits];
             assert!(workgroups_within_portable_limits(grid));
-            self.plan.dispatches.push(Dispatch {
+            let partial = if splits > 1 {
+                self.alloc_buffer((m as usize) * (n as usize) * (splits as usize) * 4)
+            } else {
+                out_buf
+            };
+            let dispatch = Dispatch {
                 shader: ShaderEntry::MatMulBF16 {
                     transpose_a,
                     transpose_b,
@@ -858,13 +870,18 @@ impl<'a> Compiler<'a> {
                 },
                 workgroups: grid,
                 input_buffers: node.inputs.iter().map(|&id| self.get_buffer(id)).collect(),
-                output_buffer: out_buf,
-                params: vec![m, n, k, 0],
+                output_buffer: partial,
+                params: vec![m, n, k, splits],
                 fusion_barrier: true,
                 schedule_locked: true,
                 origin: vec![node.id],
                 ..Default::default()
-            });
+            };
+            let reduction = dispatch.partial_sum(partial, out_buf, m * n, splits);
+            self.plan.dispatches.push(dispatch);
+            if splits > 1 {
+                self.plan.dispatches.push(reduction);
+            }
             return;
         }
 

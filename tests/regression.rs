@@ -2,6 +2,7 @@
 //! Model-graph children are behind the `models` feature; run the rest featureless.
 mod adam_state_rw;
 mod back_to_back_step;
+mod bf16_split_k;
 mod bf16_storage;
 mod block_matmul;
 mod cached_query_attention;

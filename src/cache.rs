@@ -9,6 +9,7 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
+// Version 29 makes the fourth BF16 matrix parameter the K partition count.
 // Version 28 combines BF16 with unified RoPE/attention parameter encoding;
 // pre-refresh BF16 version 27 lacks that encoding.
 // Version 27 combines BF16 storage with main's explicit attention lengths;
@@ -40,7 +41,7 @@ use std::{io, path::Path};
 // Version 13 reduces loss partials into a scalar, lowers LayerNorm to the
 // two-pass kernel, carries RoPE's static offset into the dynamic kernels, and
 // changes which dispatches fusion may merge.
-const CACHE_FORMAT_VERSION: u32 = 28;
+const CACHE_FORMAT_VERSION: u32 = 29;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]

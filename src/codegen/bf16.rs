@@ -2,7 +2,7 @@ use super::{ShaderGroup, ShaderModule, preprocess};
 
 /// Dense and implicit-GEMM convolutions share the same checked cooperative loop.
 pub(super) fn generate(group: ShaderGroup) -> ShaderModule {
-    let (declaration, dimensions, a, b, index, destination, add, output_bf16) = match group {
+    let (declaration, dimensions, range, a, b, index, destination, add, output_bf16) = match group {
         ShaderGroup::MatMulBF16 {
             transpose_a,
             transpose_b,
@@ -11,7 +11,7 @@ pub(super) fn generate(group: ShaderGroup) -> ShaderModule {
         } => {
             assert!(!(transpose_a && transpose_b));
             let mut declaration = String::from(
-                "struct Params { m: u32, n: u32, k: u32, _pad: u32 }\n\
+                "struct Params { m: u32, n: u32, k: u32, splits: u32 }\n\
                  var<storage> matrix_a: array<bf16>;\n\
                  var<storage> matrix_b: array<bf16>;\n\
                  var<storage, read_write> matrix_c: array<$OUT_TYPE>;\n\
@@ -23,6 +23,9 @@ pub(super) fn generate(group: ShaderGroup) -> ShaderModule {
             (
                 declaration,
                 "let m = params.m; let n = params.n; let k = params.k;",
+                "let chunk = (k / params.splits / 32u) * 32u;\n\
+                 let first = group.z * chunk;\n\
+                 let end = select(first + chunk, k, group.z + 1u == params.splits);",
                 if transpose_a {
                     "matrix_a[ak * m + ar]"
                 } else {
@@ -33,7 +36,7 @@ pub(super) fn generate(group: ShaderGroup) -> ShaderModule {
                 } else {
                     "matrix_b[bk * n + bc]"
                 },
-                "r * n + c",
+                "(group.z * m + r) * n + c",
                 "matrix_c",
                 if addend { " + src[index]" } else { "" },
                 output_bf16,
@@ -56,6 +59,7 @@ pub(super) fn generate(group: ShaderGroup) -> ShaderModule {
             (
                 declaration,
                 "let m = params.out_channels; let n = params.out_h * params.out_w; let k = params.in_channels * KH * KW;",
+                "let first = 0u; let end = k;",
                 "weight[ar * k + ak]",
                 "load_pixel(group.z, bk, bc)",
                 "(group.z * m + r) * n + c",
@@ -71,6 +75,7 @@ pub(super) fn generate(group: ShaderGroup) -> ShaderModule {
         &[
             ("$DECL", &declaration),
             ("$DIMS", dimensions),
+            ("$RANGE", range),
             ("$A_LOAD", a),
             ("$B_LOAD", b),
             ("$INDEX", index),
