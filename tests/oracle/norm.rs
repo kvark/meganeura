@@ -289,6 +289,47 @@ const ROPE_SHAPES: &[(usize, usize, u32)] = &[
     (300, 64, 16),
 ];
 
+struct AxialRopeCase {
+    label: &'static str,
+    dim: usize,
+    head_dim: u32,
+    axes_dim: [u32; 3],
+    positions: Vec<f32>,
+}
+
+fn axial_rope_cases() -> Vec<AxialRopeCase> {
+    let signed = AxialRopeCase {
+        label: "signed axial positions",
+        dim: 32,
+        head_dim: 16,
+        axes_dim: [4, 6, 6],
+        positions: vec![0.0, -2.0, 3.0, 1.0, -1.0, 4.0, 2.0, 0.0, 5.0, 3.0, 1.0, 6.0],
+    };
+
+    const TEXT_ROWS: usize = 64;
+    const IMAGE_WIDTH: usize = 32;
+    const IMAGE_HEIGHT: usize = 24;
+    let mut positions = Vec::with_capacity((TEXT_ROWS + IMAGE_WIDTH * IMAGE_HEIGHT) * 3);
+    for row in 0..TEXT_ROWS {
+        let p = 600.0 + row as f32;
+        positions.extend_from_slice(&[p, p, p]);
+    }
+    for y in 0..IMAGE_HEIGHT {
+        for x in 0..IMAGE_WIDTH {
+            positions.extend_from_slice(&[2_000.0, 600.0 + y as f32, 2_000.0 + x as f32]);
+        }
+    }
+    let large = AxialRopeCase {
+        label: "large mixed axial positions",
+        dim: 256,
+        head_dim: 128,
+        axes_dim: [16, 56, 56],
+        positions,
+    };
+
+    vec![signed, large]
+}
+
 #[test]
 fn rope_static() {
     let mut sweep = Sweep::default();
@@ -387,69 +428,27 @@ fn rope_positions() {
             );
         }
     }
-    sweep.finish();
-}
 
-#[test]
-fn axial_rope_positions() {
-    let mut g = Graph::new();
-    let x = g.input("x", &[4, 32]);
-    let pos = g.input("pos", &[4, 3]);
-    let y = g.axial_rope_with_positions(x, 10_000.0, pos, 16, [4, 6, 6]);
-    g.set_outputs(vec![y]);
-
-    let mut feeds = random_feeds(&g, 20261011);
-    feeds.set(
-        "pos",
-        &[0.0, -2.0, 3.0, 1.0, -1.0, 4.0, 2.0, 0.0, 5.0, 3.0, 1.0, 6.0],
-    );
-    let options = options(true);
-    let mut sweep = Sweep::default();
-    sweep.inference("axial rope positions", &g, &feeds, &options);
-    sweep.finish();
-
-    assert!(
-        plan(&g, &options)
-            .iter()
-            .any(|(shader, _)| *shader == ShaderEntry::AxialRoPE),
-        "optimized axial RoPE should use its fused kernel"
-    );
-}
-
-#[test]
-fn axial_rope_qwen_scale_positions() {
-    const TEXT_ROWS: usize = 64;
-    const IMAGE_WIDTH: usize = 32;
-    const IMAGE_HEIGHT: usize = 24;
-    const ROWS: usize = TEXT_ROWS + IMAGE_WIDTH * IMAGE_HEIGHT;
-
-    let mut g = Graph::new();
-    let x = g.input("x", &[ROWS, 256]);
-    let pos = g.input("pos", &[ROWS, 3]);
-    let y = g.axial_rope_with_positions(x, 10_000.0, pos, 128, [16, 56, 56]);
-    g.set_outputs(vec![y]);
-
-    // Exercise the position scale that exposed f32 angle-rounding error in
-    // Qwen-Image: a text prefix followed by a 32x24 image grid.
-    let mut positions = Vec::with_capacity(ROWS * 3);
-    for row in 0..TEXT_ROWS {
-        let p = 600.0 + row as f32;
-        positions.extend_from_slice(&[p, p, p]);
+    for (i, case) in axial_rope_cases().into_iter().enumerate() {
+        assert_eq!(case.positions.len() % 3, 0, "{}", case.label);
+        let rows = case.positions.len() / 3;
+        let mut g = Graph::new();
+        let x = g.input("x", &[rows, case.dim]);
+        let pos = g.input("pos", &[rows, 3]);
+        let y = g.axial_rope_with_positions(x, 10_000.0, pos, case.head_dim, case.axes_dim);
+        g.set_outputs(vec![y]);
+        let mut feeds = random_feeds(&g, 20261011 + i as u64);
+        feeds.set("pos", &case.positions);
+        let options = options(true);
+        sweep.inference(case.label, &g, &feeds, &options);
+        assert!(
+            plan(&g, &options)
+                .iter()
+                .any(|(shader, _)| *shader == ShaderEntry::AxialRoPE),
+            "{} should use its fused kernel",
+            case.label
+        );
     }
-    for y in 0..IMAGE_HEIGHT {
-        for x in 0..IMAGE_WIDTH {
-            positions.extend_from_slice(&[2_000.0, 600.0 + y as f32, 2_000.0 + x as f32]);
-        }
-    }
-    let mut feeds = random_feeds(&g, 20261012);
-    feeds.set("pos", &positions);
-    let mut sweep = Sweep::default();
-    sweep.inference(
-        "axial rope Qwen-scale positions",
-        &g,
-        &feeds,
-        &options(true),
-    );
     sweep.finish();
 }
 

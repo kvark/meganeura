@@ -549,8 +549,19 @@ fn independent_backward_layouts() {
 }
 
 #[test]
-fn causal_forward() {
-    forward_sweep(&[Kind::Causal], SELF_SHAPES);
+fn causal_masks_forward() {
+    // Block-causal's prefix ends halfway through each sequence, so flash
+    // query tiles contain both causal-prefix and full-suffix rows.
+    forward_sweep(&[Kind::Causal, Kind::BlockCausal], SELF_SHAPES);
+
+    // A cooperative-capable target selects a different forward shader by
+    // default; disabling it keeps the scalar and ordinary flash paths in
+    // the same generic f64-oracle sweep.
+    let scalar = gpu::Options {
+        coop: CoopPolicy::Disabled,
+        ..Default::default()
+    };
+    forward_sweep_with_options(&[Kind::BlockCausal], SELF_SHAPES, &scalar);
 }
 
 #[test]
@@ -602,18 +613,6 @@ fn sliding_window_forward() {
 #[test]
 fn full_forward() {
     forward_sweep(&[Kind::Full], SELF_SHAPES);
-}
-
-#[test]
-fn block_causal_forward() {
-    // The prefix ends halfway through each sequence, so flash query tiles
-    // contain both causal-prefix and full-suffix rows.
-    forward_sweep(&[Kind::BlockCausal], SELF_SHAPES);
-    let flash = gpu::Options {
-        coop: CoopPolicy::Disabled,
-        ..Default::default()
-    };
-    forward_sweep_with_options(&[Kind::BlockCausal], SELF_SHAPES, &flash);
 }
 
 /// `full_attention` and `cross_attention` lower exactly as
