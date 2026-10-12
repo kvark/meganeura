@@ -103,6 +103,13 @@ fn challenger_bytes(
     Ok(bytes)
 }
 
+fn comparison_fits(elapsed: Duration, limit: Duration, costs: &VecDeque<Duration>) -> bool {
+    costs
+        .iter()
+        .min()
+        .is_none_or(|&cost| elapsed + cost <= limit)
+}
+
 fn restore(
     session: &mut Session,
     state: &SearchState,
@@ -237,11 +244,7 @@ pub(super) fn select(
             break;
         }
         // An incomplete comparison cannot select its program.
-        if comparison_costs
-            .iter()
-            .min()
-            .is_some_and(|&cost| start.elapsed() + cost > options.max_time)
-        {
+        if !comparison_fits(start.elapsed(), options.max_time, &comparison_costs) {
             report.truncated = true;
             report.deadline_reserved = true;
             break;
@@ -1342,22 +1345,18 @@ mod tests {
 
     #[test]
     fn no_comparison_starts_that_cannot_finish() {
-        // A comparison costs at least its 0.4 s initialization, so after two
-        // programs a third could not finish by 1.15 s. The remaining 0.35 s
-        // absorbs execution with warm kernels.
-        let (_, report) = stop_rule_search(
-            BuildSearchOptions {
-                max_time: Duration::from_millis(1150),
-                ..Default::default()
-            },
-            Duration::from_millis(400),
-        );
-        assert!(report.deadline_reserved && report.truncated);
-        assert_eq!(report.trials.len(), 2);
-        assert_eq!(
-            report.trials[1].outcome.decision,
-            TuneDecision::KeepBaseline
-        );
+        // Test reservation without assuming how much wall time a CI GPU needs
+        // to initialize or qualify. The search/patience test exercises sessions.
+        let limit = Duration::from_millis(1150);
+        let costs = VecDeque::from([Duration::from_millis(500), Duration::from_millis(400)]);
+        assert!(comparison_fits(Duration::from_millis(750), limit, &costs));
+        assert!(!comparison_fits(Duration::from_millis(751), limit, &costs));
+        assert!(!comparison_fits(Duration::from_millis(800), limit, &costs));
+        assert!(comparison_fits(
+            Duration::from_millis(800),
+            limit,
+            &VecDeque::new()
+        ));
     }
 
     #[test]
