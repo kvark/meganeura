@@ -70,7 +70,7 @@ profiler = ["dep:tracing-subscriber"]
 
 [dependencies]
 # Calibrated GPU pass timestamps resolved after the completion fence.
-blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "56f05651cca73659130e924e497dda633f839d40" }
+blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "7909fc17392f803b02be001041695127426e0fa3" }
 blade-macros = "0.3"
 # `default-features = false` drops egglog's `bin` stack (clap, mimalloc,
 # env_logger, chrono, graphviz); library builds use the shared rewrite engine.
