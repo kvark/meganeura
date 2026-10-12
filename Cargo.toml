@@ -53,11 +53,11 @@ default = []
 # pinning embedder can drop them the same way as `gguf`.
 models = []
 # Native GGUF authoring/format support: the `load::gguf` module and the
-# `gguf_*` examples and tests. The loader pulls no external dependency
-# of its own, so hiding it trims compiled code, not the dependency tree.
+# `gguf_*` examples and tests. Its only additional dependency provides
+# read-only file mappings; hiding the feature trims both from embedders.
 # The GGML-block `DType`s and their decode kernels stay put — they are
 # part of the core graph and serve this loader too.
-gguf = []
+gguf = ["dep:memmap2"]
 # Downloading weights from the HuggingFace Hub
 # (`SafeTensorsModel::download` / `download_file`). Off by default so
 # embedders (Android, iOS, hermetic CI) do not pull ureq/rustls or write
@@ -87,6 +87,7 @@ hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustl
 oxionnx-core = "0.1"
 oxionnx-proto = "0.1"
 half = "2"
+memmap2 = { version = "0.9.11", optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", optional = true, features = ["registry"] }
 
