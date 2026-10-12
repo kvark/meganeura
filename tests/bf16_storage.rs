@@ -458,6 +458,55 @@ fn bf16_matrix_reduced_gradients() {
 }
 
 #[test]
+fn bf16_selected_dense_graph_gradients() {
+    let context = crate::support::gpu::gpu();
+    if !context
+        .capabilities()
+        .cooperative_matrix
+        .bf16_f32_shapes
+        .contains(&[16, 16, 16])
+    {
+        eprintln!("native BF16 matrices unavailable; skipping device-specific coverage");
+        return;
+    }
+    let mut graph = Graph::new();
+    let x = graph.input("x", &[19, 17]);
+    let w1 = graph.parameter("w1", &[17, 23]);
+    let w2 = graph.parameter("w2", &[23, 7]);
+    let hidden = graph.matmul(x, w1);
+    let hidden = graph.clamp(hidden, 0.0, 8.0);
+    let hidden = graph.scale(hidden, 0.5);
+    let hidden = graph.reshape(hidden, &[19, 23]);
+    let output = graph.matmul(hidden, w2);
+    let square = graph.mul(output, output);
+    let loss = graph.mean_all(square);
+    graph.set_outputs(vec![loss, output]);
+    let graph = graph.into_bf16_matmuls();
+    let mut feeds = meganeura::reference::Feeds::new();
+    for (name, count, divisor) in [
+        ("x", 19 * 17, 8.0),
+        ("w1", 17 * 23, 64.0),
+        ("w2", 23 * 7, 64.0),
+    ] {
+        feeds.set(
+            name,
+            &(0..count)
+                .map(|i| ((i * 37 + 11) % 53) as f32 / divisor - 26.0 / divisor)
+                .collect::<Vec<_>>(),
+        );
+    }
+    for fuse in [false, true] {
+        let mut options = meganeura::reference::gpu::Options::default();
+        options.compile.fuse_dispatches = fuse;
+        options.compile.bf16_matrix_gradients = true;
+        meganeura::reference::gpu::check_training(&graph, &feeds, &options)
+            .unwrap()
+            .assert_passed("selected BF16 dense graph");
+    }
+    println!("bf16_selection_verified fused_unfused=2");
+}
+
+#[test]
 fn bf16_matrix_values_and_f32_gradients() {
     let context = crate::support::gpu::gpu();
     if !context

@@ -4,6 +4,7 @@ mod composite;
 mod decompose;
 mod helpers;
 pub(crate) mod key;
+mod precision;
 pub use composite::OpClass;
 pub(crate) use composite::mean_factor;
 pub use helpers::{Nchw, t5_bucket};
