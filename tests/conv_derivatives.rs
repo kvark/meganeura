@@ -184,6 +184,139 @@ fn bf16_convolution_storage_and_master_gradients() {
     );
 }
 
+#[test]
+#[ignore = "Requires F16 cooperative hardware; checks partial workgroup rows across images"]
+fn cooperative_hardware_subtile_forward_and_input_match_f64() {
+    let gpu = gpu();
+    if let Ok(expected) = std::env::var("MEGANEURA_EXPECT_DEVICE_NAME") {
+        assert_eq!(gpu.device_information().device_name, expected);
+        let memory = gpu.memory_stats();
+        assert!(memory.budget.saturating_sub(memory.usage) >= 2 << 30);
+    }
+    let caps = meganeura::runtime::auto_tune(&gpu, 0).coop_caps;
+    assert_eq!(caps.f16_tile, 16, "requires actual F16 sub-tile execution");
+    assert_eq!(
+        caps.f32_tile, 0,
+        "fixture explicitly qualifies the F16 path"
+    );
+    for (ci, co) in [(16, 48), (48, 16)] {
+        let shape = Shape {
+            batch: 32,
+            ci,
+            co,
+            h: 8,
+            w: 16,
+            kh: 5,
+            kw: 5,
+            stride: 1,
+            ph: 2,
+            pw: 2,
+        };
+        let [nx, nw, ny] = shape.sizes();
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[nx]);
+        let w = graph.input("w", &[nw]);
+        let dy = graph.input("dy", &[ny]);
+        let y = graph.conv2d_hw(
+            x,
+            w,
+            shape.batch,
+            ci,
+            shape.h,
+            shape.w,
+            co,
+            shape.kh,
+            shape.kw,
+            shape.stride,
+            shape.ph,
+            shape.pw,
+        );
+        let dx = graph.conv2d_grad_input(
+            dy,
+            w,
+            shape.batch,
+            ci,
+            shape.h,
+            shape.w,
+            co,
+            shape.kh,
+            shape.kw,
+            shape.stride,
+            shape.ph,
+            shape.pw,
+        );
+        graph.nodes_mut()[dx as usize].requires_full_precision = true;
+        graph.set_outputs(vec![y, dx]);
+        for policy in [CoopPolicy::AllowF16, CoopPolicy::Disabled] {
+            let cooperative = policy == CoopPolicy::AllowF16;
+            let mut session = Session::with_context_opts(
+                meganeura::compile::compile(&graph),
+                Arc::clone(&gpu),
+                SessionOptions {
+                    coop: policy,
+                    ..Default::default()
+                },
+            );
+            let selected = session
+                .plan()
+                .dispatches
+                .iter()
+                .filter(|d| {
+                    matches!(
+                        d.shader,
+                        ShaderEntry::Conv2dGemmCoopGen(..)
+                            | ShaderEntry::Conv2dGradInputGemmCoopGen(..)
+                    )
+                })
+                .count();
+            assert_eq!(selected, if cooperative { 2 } else { 0 });
+            let values = |len, seed, scale| {
+                data(len, seed, scale)
+                    .into_iter()
+                    .map(|v| {
+                        if cooperative {
+                            half::f16::from_f32(v).to_f32()
+                        } else {
+                            v
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let x = values(nx, 7, 1.0);
+            let w = values(nw, 19, 1.0);
+            session.set_input("x", &x);
+            session.set_input("w", &w);
+            for scale in [1.0, 1e-12] {
+                if cooperative && scale < 1.0 {
+                    continue;
+                }
+                let dy = values(ny, 37, scale);
+                session.set_input("dy", &dy);
+                session.step();
+                session.wait();
+                let (y, dx, _) = reference(shape, &x, &w, &dy);
+                let mut actual_y = vec![f32::NAN; ny];
+                let mut actual_dx = vec![f32::NAN; nx];
+                session.read_output_by_index(0, &mut actual_y);
+                session.read_output_by_index(1, &mut actual_dx);
+                check(
+                    &format!("{shape:?}, {policy:?}, forward"),
+                    &actual_y,
+                    &y,
+                    1.0,
+                );
+                check(
+                    &format!("{shape:?}, {policy:?}, input"),
+                    &actual_dx,
+                    &dx,
+                    scale,
+                );
+            }
+        }
+    }
+    println!("subtile_cooperative_verified shapes=2 forward_and_input_gradients=true");
+}
+
 fn data(n: usize, seed: u32, scale: f32) -> Vec<f32> {
     let mut state = seed;
     (0..n)
