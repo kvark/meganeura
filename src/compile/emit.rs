@@ -846,7 +846,7 @@ impl<'a> Compiler<'a> {
                 rows.checked_mul(columns)
                     .expect("BF16 matrix address space");
             }
-            let grid = [m.div_ceil(16), n.div_ceil(16), 1];
+            let grid = [m.div_ceil(32), n.div_ceil(32), 1];
             assert!(workgroups_within_portable_limits(grid));
             self.plan.dispatches.push(Dispatch {
                 shader: ShaderEntry::MatMulBF16 {
