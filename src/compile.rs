@@ -385,6 +385,13 @@ pub enum ShaderEntry {
     Conv2dGemm16,
     /// Generated conv2d forward coop kernel specialized for (kernel_h, kernel_w, stride).
     Conv2dGemmCoopGen(u32, u32, u32),
+    /// Explicit BF16 operands, F32 accumulation and checked partial tiles.
+    Conv2dBF16 {
+        kernel_h: u32,
+        kernel_w: u32,
+        stride: u32,
+        output_bf16: bool,
+    },
     Conv2dGradInputGemm,
     Conv2dGradInputGemmSmall,
     Conv2dGradInputGemm16,
@@ -481,6 +488,7 @@ impl ShaderEntry {
             | ShaderEntry::ChunkedRelativeAttention => "attention",
 
             ShaderEntry::Conv2dDw
+            | ShaderEntry::Conv2dBF16 { .. }
             | ShaderEntry::Conv2dGemm
             | ShaderEntry::Conv2dGemmSmall
             | ShaderEntry::Conv2dGemm16
@@ -672,6 +680,17 @@ impl ShaderEntry {
             ShaderEntry::Conv2dDw => ShaderGroup::Conv2dDw,
             ShaderEntry::MulPerChannel => ShaderGroup::MulPerChannel,
             ShaderEntry::Conv2dGemm => ShaderGroup::Conv2dGemm,
+            ShaderEntry::Conv2dBF16 {
+                kernel_h,
+                kernel_w,
+                stride,
+                output_bf16,
+            } => ShaderGroup::Conv2dBF16 {
+                kernel_h,
+                kernel_w,
+                stride,
+                output_bf16,
+            },
             ShaderEntry::Conv2dGemmCoopGen(..) => ShaderGroup::Conv2dGemmCoop,
             ShaderEntry::Conv2dGemmSmall => ShaderGroup::Conv2dGemmSmall,
             ShaderEntry::Conv2dGemm16 => ShaderGroup::Conv2dGemm16,
@@ -786,6 +805,7 @@ impl ShaderEntry {
             ShaderEntry::Conv2dDw => "main",
             ShaderEntry::MulPerChannel => "main",
             ShaderEntry::Conv2dGemm
+            | ShaderEntry::Conv2dBF16 { .. }
             | ShaderEntry::Conv2dGemmSmall
             | ShaderEntry::Conv2dGemm16
             | ShaderEntry::Conv2dGemmCoopGen(..) => "main",

@@ -937,6 +937,7 @@ impl Session {
                 );
             }
             ShaderEntry::Conv2dGemm
+            | ShaderEntry::Conv2dBF16 { .. }
             | ShaderEntry::Conv2dGemmSmall
             | ShaderEntry::Conv2dGemm16
             | ShaderEntry::Conv2dGemmCoopGen(..) => {

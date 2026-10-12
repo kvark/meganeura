@@ -72,6 +72,10 @@ pub(super) fn fuse_boundaries(plan: &mut ExecutionPlan) {
             } else if let ShaderEntry::MatMulBF16 {
                 ref mut output_bf16,
                 ..
+            }
+            | ShaderEntry::Conv2dBF16 {
+                ref mut output_bf16,
+                ..
             } = producer.shader
             {
                 assert!(!*output_bf16);
