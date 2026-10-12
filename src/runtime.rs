@@ -2704,6 +2704,7 @@ fn record_groups(
     pipelines: &Pipelines,
     buffers: &[blade_graphics::BufferPiece],
     chunks: usize,
+    timing: bool,
 ) {
     let total = groups.len();
     let per_chunk = total.div_ceil(chunks.min(total).max(1));
@@ -2735,7 +2736,14 @@ fn record_groups(
         start = end;
         chunk_index += 1;
         if start < total {
-            *sync_point = Some(gpu.submit(encoder));
+            let sync = gpu.submit(encoder);
+            if timing {
+                // The next start reuses the timestamp queries. Harvest them
+                // first; these extra waits make timed chunking diagnostic,
+                // not an unchanged measurement of ordinary submission overlap.
+                wait_for_timed_encoder(gpu, &sync, encoder, true).expect("GPU chunk timing failed");
+            }
+            *sync_point = Some(sync);
             encoder.start();
         }
     }
@@ -4847,6 +4855,10 @@ impl Session {
     /// commands submitted to the same queue before and after it — not merely
     /// those in the same command buffer.
     ///
+    /// GPU timing adds waits between chunks to harvest each submission before
+    /// its timestamp queries are reused. Traced chunking therefore changes
+    /// CPU/GPU overlap; use timing-disabled runs for ordinary latency.
+    ///
     /// Reallocates the command encoder so that no command buffer is re-recorded
     /// while still in flight. Call it once during setup rather than per step.
     /// `chunks` is clamped to at least 1; 1 restores the single-submission
@@ -6308,6 +6320,7 @@ impl Session {
                 &self.pipelines,
                 &self.buffers,
                 chunks,
+                self.gpu_timing,
             );
         }
 
