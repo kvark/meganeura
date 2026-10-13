@@ -1207,6 +1207,12 @@ fn conv2d_grad_weight_split_k() {
 
 #[test]
 fn conv2d_grad_weight_selected_splits() {
+    if let Ok(expected) = std::env::var("MEGANEURA_EXPECT_DEVICE_NAME") {
+        let gpu = gpu::shared_context();
+        assert_eq!(gpu.device_information().device_name, expected);
+        let memory = gpu.memory_stats();
+        assert!(memory.budget.saturating_sub(memory.usage) >= 2 << 30);
+    }
     let options = gpu::Options {
         compile: meganeura::CompileOptions {
             conv_weight_splits: Some(meganeura::compile::ConvWeightSplits {
@@ -1220,10 +1226,16 @@ fn conv2d_grad_weight_selected_splits() {
         ..Default::default()
     };
     let mut failures = Failures::default();
-    for c in [
-        Conv::new(9, 2, (7, 9), 3, (3, 3), 1, (1, 1)),
+    for (c, split_shader) in [
+        (
+            Conv::new(9, 2, (7, 9), 3, (3, 3), 1, (1, 1)),
+            ShaderEntry::Conv2dGradWeightGemmSplit16,
+        ),
         // Keep the 524,288-position reduction, with only one output weight.
-        Conv::new(128, 1, (64, 64), 1, (1, 1), 1, (0, 0)),
+        (
+            Conv::new(128, 1, (64, 64), 1, (1, 1), 1, (0, 0)),
+            ShaderEntry::Conv2dGradWeightGemmSplitSmall,
+        ),
     ] {
         let g = c.grad_weight_graph();
         let mut feeds = Feeds::new();
@@ -1236,10 +1248,7 @@ fn conv2d_grad_weight_selected_splits() {
                 &g,
                 &feeds,
                 &options,
-                &[
-                    ShaderEntry::Conv2dGradWeightGemmSplit16,
-                    ShaderEntry::SumRows,
-                ],
+                &[split_shader.clone(), ShaderEntry::SumRows],
             );
         }
     }

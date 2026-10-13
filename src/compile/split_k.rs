@@ -363,17 +363,24 @@ impl ExecutionPlan {
                 .ok_or(TuneError("split-K buffer index overflow"))?;
             let partial = BufferRef(buffer_index);
             let mut producer = dispatch.clone();
-            let width = match tile {
+            let mut width = match tile {
                 MatmulTile::Tile16 | MatmulTile::SpecializedConv { tile_size: 16, .. } => 16,
                 MatmulTile::Tile32 | MatmulTile::SpecializedConv { tile_size: 32, .. } => 32,
                 _ => 64,
             };
+            // Reduction partitions can fill the device without the narrowest
+            // register tile. Keep already wider selections unchanged.
+            if width == 16
+                && crate::kernels::conv::register_tile(class.m, class.n, splits, false) >= 32
+            {
+                width = 32;
+            }
             producer.shader = match width {
                 16 => ShaderEntry::Conv2dGradWeightGemmSplit16,
                 32 => ShaderEntry::Conv2dGradWeightGemmSplitSmall,
                 _ => ShaderEntry::Conv2dGradWeightGemmSplit,
             };
-            producer.workgroups[2] = splits;
+            producer.workgroups = [class.n.div_ceil(width), class.m.div_ceil(width), splits];
             producer.output_buffer = partial;
             producer.label = format!("{} split-K partials ({splits})", dispatch.label);
             let reduction = Dispatch {
@@ -664,14 +671,56 @@ mod tests {
             if expected == 2 {
                 assert_eq!(
                     plan.dispatches[0].shader,
-                    ShaderEntry::Conv2dGradWeightGemmSplit16
+                    ShaderEntry::Conv2dGradWeightGemmSplitSmall
                 );
-                assert_eq!(plan.dispatches[0].workgroups, [5, 1, 1024]);
+                assert_eq!(plan.dispatches[0].workgroups, [3, 1, 1024]);
                 assert_eq!(plan.dispatches[1].shader, ShaderEntry::SumRows);
                 assert_eq!(*plan.buffers.last().unwrap(), capacity);
             } else {
                 assert_eq!(plan.dispatches, base.dispatches);
             }
+        }
+    }
+
+    #[test]
+    fn split_weight_tiles_account_for_partition_occupancy() {
+        for (ci, co, splits, width) in [
+            (17u32, 17u32, 63, 16),
+            (17, 17, 64, 32),
+            (75, 8, 21, 16),
+            (75, 8, 22, 32),
+            (256, 256, 2, 32),
+            (512, 512, 2, 64),
+        ] {
+            let mut graph = Graph::new();
+            let x = graph.input("x", &[(ci * 2048) as usize]);
+            let dy = graph.input("dy", &[(co * 2048) as usize]);
+            let dw = graph.conv2d_grad_weight(dy, x, ci, 1, 2048, co, 1, 1, 1, 0, 0);
+            graph.set_outputs(vec![dw]);
+            let mut plan = super::super::compile(&graph);
+            let original = plan.clone();
+            let bytes = ci as usize * co as usize * splits as usize * 4;
+            assert_eq!(
+                plan.split_conv_weight_gradients(&[(0, splits)], bytes),
+                Ok(bytes)
+            );
+            let producer = &plan.dispatches[0];
+            assert_eq!(
+                producer.workgroups,
+                [ci.div_ceil(width), co.div_ceil(width), splits]
+            );
+            assert_eq!(
+                producer.shader,
+                match width {
+                    16 => ShaderEntry::Conv2dGradWeightGemmSplit16,
+                    32 => ShaderEntry::Conv2dGradWeightGemmSplitSmall,
+                    _ => ShaderEntry::Conv2dGradWeightGemmSplit,
+                }
+            );
+            assert_eq!(producer.params, original.dispatches[0].params);
+            assert_eq!(producer.kernel, original.dispatches[0].kernel);
+            assert_eq!(producer.input_buffers, original.dispatches[0].input_buffers);
+            assert_eq!(plan.output_buffers, original.output_buffers);
         }
     }
 
