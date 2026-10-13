@@ -211,6 +211,7 @@ pub fn build_measured_with_inputs(
         cfg.mode,
         cfg.optimize,
         cfg.skip_full_optimize,
+        cfg.options.bf16_matrix_gradients,
     );
     let mut graphs = vec![optimize::search::Candidate {
         graph: ordinary,
@@ -273,6 +274,7 @@ pub fn build_measured_with_inputs(
                                 cfg.mode,
                                 unfused,
                                 cfg.skip_full_optimize,
+                                cfg.options.bf16_matrix_gradients,
                             )
                             .0,
                             expression: form.expression,

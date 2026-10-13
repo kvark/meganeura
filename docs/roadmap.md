@@ -61,11 +61,13 @@ Cooperative backward remains experimental and default-off.
 
 Potential work requires independent numerical evidence:
 
-- bf16 cooperative matrices need end-to-end type, tile, feature and backend
-  support. Their exponent range addresses underflow, not f32 mantissa accuracy.
-- Mixed-precision training needs an explicit graph precision policy, f32 master
-  weights and loss-scaling behavior. Compare gradients and training trajectories
-  against f32 before making it an automatic choice.
+- Native BF16 storage and BF16/F32 cooperative matrix kernels now have explicit
+  graph selection, device-feature gating and F32 master gradients on Vulkan.
+  Their exponent range addresses underflow, not f32 mantissa accuracy; broader
+  operation coverage and automatic selection still need workload evidence.
+- A general mixed-precision training policy still needs explicit loss-scaling
+  behavior. Compare gradients and training trajectories against f32 before
+  making reduced precision an automatic choice.
 
 ## Dispatch latency and convolution
 

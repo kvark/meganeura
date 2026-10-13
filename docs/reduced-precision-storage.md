@@ -1,4 +1,55 @@
-# Reduced-precision storage: status and plan (October 10, 2026)
+# Reduced-precision storage: status and plan
+
+## Native BF16 foundation (October 11, 2026)
+
+The experimental BF16 path uses the native Naga extension and Blade Vulkan
+capabilities, not packed-u32 emulation. `Graph::to_bf16` stores two bytes per
+element with nearest-even GPU rounding; `from_bf16` widens exactly. Explicit
+BF16 operands work with `matmul`, `matmul_at` and `matmul_bt` (and an F32
+addend), producing F32 outputs and accumulation. Master parameters and their
+gradients remain F32. By default, backward widens the quantized forward operands
+and uses the existing F32 derivative path. Opt-in
+`CompileOptions::bf16_matrix_gradients` uses BF16 derivative operands for
+explicit BF16 forward matrices only, with F32 accumulation and master gradients.
+It does not demote other F32 operations or enable F16 derivative inputs.
+The graph transforms are currently intended for training. Inference would
+convert every F32 parameter to BF16 on each run; persistent BF16 parameter
+storage and direct BF16 model loading are not implemented yet.
+
+This is not autocast or complete mixed-precision training. BF16 graph inputs,
+parameters, outputs and unsupported operations reject explicitly; only internal
+conversion, pointwise, dense-matrix and convolution storage is supported. Check
+Blade's `shader_bfloat16` and `bf16_f32_shapes`; cooperative products currently
+require `[16,16,16]`. Devices without those features retain the existing
+F32/F16 paths. No default graph is automatically narrowed. Explicit BF16
+matrix stores and pointwise conversion boundaries fuse: pointwise arithmetic
+widens inside the kernel and rounds once at its store. Shared values needed by
+F32 consumers or external outputs stay available. Reshaped BF16 activations
+retain F32 master-gradient views. `Graph::into_bf16_matmuls` and
+`Graph::into_bf16_convolutions` select supported regions before autodiff;
+general layouts, attention and automatic whole-model precision selection remain
+work. This is not universal BF16 activation storage.
+
+On RTX5080/580.178.04, 1,035 exact conversion cases and 18 F64-referenced matrix /
+F32-gradient fixtures pass (three layouts, optional addend, full/partial/scalar
+dimensions). The driver's plain BF16 conversion truncates; the narrowing kernel
+rounds before casting. An odd-length GPU clear originally failed Vulkan's
+multiple-of-four requirement; clears now round within existing padded buffers.
+The pre-existing workgroup-layout VUID10684 remains recorded. These are
+primitive checks, not a speedup claim. `tests/bf16_storage.rs` covers the path;
+unsupported hardware skips only its GPU-specific cases.
+
+The connected follow-up passes 18 reduced-gradient matrix cases (three layouts,
+optional addend, derivative scales 1e-20/1/1e20), both fused/unfused F64 checks
+and 32 synthetic Adam updates. Its two-layer clamped-activation fixture's loss
+falls .16861932 -> .03437764; master parameters and both moments remain finite.
+One additional GPU guard passes in 9.76s of child execution, with no allocation
+warnings; the known workgroup-layout message remains. CPU checks include 16
+pointwise storage combinations, 12 matrix store/layout/addend combinations,
+protected outputs and aliased BF16 views. This is not a full learner or a
+performance/learning-quality claim.
+
+## Historical F16 weight-storage work
 
 PR #242, branch `experiment/f16-weight-storage-2026-10-10`, based on `09fd74f`.
 
@@ -13,11 +64,12 @@ PR #242, branch `experiment/f16-weight-storage-2026-10-10`, based on `09fd74f`.
 - The accelerated contract feeds f16 *inputs* to cooperative matrix tiles,
   converting f32 operands inside the shader; storage stays f32.
 
-## What does not
+## What did not exist in that F16 study
 
 - **Activations are always f32.** Every intermediate buffer, attention,
   normalization, pointwise and convolution kernel reads and writes f32.
-- **No bf16.** WGSL has no bf16 type; GGUF bf16 tensors are widened to f32.
+- **No bf16 at that revision.** GGUF bf16 tensors were widened to f32. The
+  native path documented above was added later.
 - **f16 weights disabled cooperative tiles** at `3102683`: `Pipelines::key`
   checked reduced storage before cooperative kernels. Fixed in this branch.
 - **No f16 training path.** Nothing keeps f32 master weights with f16 copies
@@ -88,7 +140,7 @@ array layout. The same error reproduces on base `09fd74f` in
 `coop_matmul_skinny::matmul_non_aligned_k18`; numerical tests pass, but this is
 not a validation-clean run. It is a separate pre-existing SPIR-V issue.
 
-## Remaining stages
+## Remaining stages from the F16 study
 
 1. **Search over storage.** Let measured search choose f32 or f16 storage
    per weight instead of a session-wide switch.
@@ -101,9 +153,9 @@ not a validation-clean run. It is a separate pre-existing SPIR-V issue.
    saved for backward, f32 parameter gradients, and a static loss scale
    folded into the loss gradient. Derivative regions that need full precision
    keep their current marking.
-4. **bf16.** Storage only: pack two bf16 values per `u32`; widening is
-   `bitcast<f32>(bits << 16)`. bf16 cooperative tiles need
-   `VK_KHR_shader_bfloat16`, which Naga does not expose.
+4. **bf16.** The native foundation above supersedes the proposed packed-u32
+   emulation. Automatic whole-model selection and broader operation coverage
+   remain unfinished.
 
 Each stage needs its own numerical gate class: bf16 autocast in PyTorch
 already misses the 1% sampled-output gate on SmolLM2 (1.02% on the RTX 5070).

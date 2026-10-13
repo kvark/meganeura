@@ -175,7 +175,11 @@ pub fn check_inference_against(
 /// [`crate::autodiff::differentiate`] in `f64`; [`super::gradients`] checks
 /// those against finite differences independently of any kernel.
 pub fn check_training(graph: &Graph, feeds: &Feeds, options: &Options) -> Result<Report, Error> {
-    let backward = crate::autodiff::differentiate(graph);
+    let backward = if options.compile.bf16_matrix_gradients {
+        crate::autodiff::differentiate_with_bf16_gradients(graph)
+    } else {
+        crate::autodiff::differentiate(graph)
+    };
     let (values, scales) = reference(&backward, feeds)?;
     let (mut session, _) = build(graph, options.session_config(Mode::Training));
     upload(&mut session, graph, feeds)?;

@@ -22,6 +22,19 @@ use crate::compile::{
 };
 use crate::kernels::attention_grad::{AttentionGrad, Part as AttentionGradPart};
 
+fn dense_params(dispatch: &Dispatch) -> MatMulParams {
+    let (m, n, k) = dispatch.mnk().expect("dense matrix dimensions");
+    MatMulParams {
+        m,
+        n,
+        k,
+        _pad: match dispatch.shader {
+            ShaderEntry::MatMulBF16 { .. } => dispatch.params[3],
+            _ => dispatch.workgroups[1],
+        },
+    }
+}
+
 impl Session {
     pub(super) fn bind_dispatch(
         buffers: &[blade_graphics::BufferPiece],
@@ -237,62 +250,28 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::MatMul | ShaderEntry::MatMulGemv => {
-                let (m, n, k) = mnk();
+            ShaderEntry::MatMul
+            | ShaderEntry::MatMulGemv
+            | ShaderEntry::MatMulAT
+            | ShaderEntry::MatMulBT
+            | ShaderEntry::MatMulGemvBT
+            | ShaderEntry::MatMulBF16 { addend: false, .. } => {
                 pc.bind(
                     0,
                     &MatMulData {
                         matrix_a: buf(dispatch.input_buffers[0]),
                         matrix_b: buf(dispatch.input_buffers[1]),
                         matrix_c: buf(dispatch.output_buffer),
-                        params: MatMulParams {
-                            m,
-                            n,
-                            k,
-                            _pad: dispatch.workgroups[1],
-                        },
+                        params: dense_params(dispatch),
                     },
                 );
             }
-            ShaderEntry::MatMulAT | ShaderEntry::MatMulBT | ShaderEntry::MatMulGemvBT => {
-                let (m, n, k) = mnk();
-                pc.bind(
-                    0,
-                    &MatMulData {
-                        matrix_a: buf(dispatch.input_buffers[0]),
-                        matrix_b: buf(dispatch.input_buffers[1]),
-                        matrix_c: buf(dispatch.output_buffer),
-                        params: MatMulParams {
-                            m,
-                            n,
-                            k,
-                            _pad: dispatch.workgroups[1],
-                        },
-                    },
-                );
-            }
-            ShaderEntry::FusedMatMulAdd | ShaderEntry::MatMulGemvAdd => {
-                let (m, n, k) = mnk();
-                pc.bind(
-                    0,
-                    &FusedMatMulAddData {
-                        matrix_a: buf(dispatch.input_buffers[0]),
-                        matrix_b: buf(dispatch.input_buffers[1]),
-                        matrix_c: buf(dispatch.output_buffer),
-                        src: buf(dispatch.input_buffers[2]), // addend
-                        params: MatMulParams {
-                            m,
-                            n,
-                            k,
-                            _pad: dispatch.workgroups[1],
-                        },
-                    },
-                );
-            }
-            ShaderEntry::FusedMatMulATAdd
+            ShaderEntry::FusedMatMulAdd
+            | ShaderEntry::MatMulGemvAdd
+            | ShaderEntry::FusedMatMulATAdd
+            | ShaderEntry::MatMulBF16 { addend: true, .. }
             | ShaderEntry::FusedMatMulBTAdd
             | ShaderEntry::MatMulGemvBTAdd => {
-                let (m, n, k) = mnk();
                 pc.bind(
                     0,
                     &FusedMatMulAddData {
@@ -300,16 +279,11 @@ impl Session {
                         matrix_b: buf(dispatch.input_buffers[1]),
                         matrix_c: buf(dispatch.output_buffer),
                         src: buf(dispatch.input_buffers[2]), // addend
-                        params: MatMulParams {
-                            m,
-                            n,
-                            k,
-                            _pad: dispatch.workgroups[1],
-                        },
+                        params: dense_params(dispatch),
                     },
                 );
             }
-            ShaderEntry::ToF16 => {
+            ShaderEntry::ToF16 | ShaderEntry::ToBF16 | ShaderEntry::FromBF16 => {
                 pc.bind(
                     0,
                     &UnaryData {
@@ -933,6 +907,7 @@ impl Session {
                 );
             }
             ShaderEntry::Conv2dGemm
+            | ShaderEntry::Conv2dBF16 { .. }
             | ShaderEntry::Conv2dGemmSmall
             | ShaderEntry::Conv2dGemm16
             | ShaderEntry::Conv2dGemmCoopGen(..) => {
@@ -1235,6 +1210,51 @@ impl Session {
                     },
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_uniforms_distinguish_bf16_splits_from_gemv_columns() {
+        for addend in [false, true] {
+            for splits in [1, 4, 16] {
+                let dispatch = Dispatch {
+                    shader: ShaderEntry::MatMulBF16 {
+                        transpose_a: false,
+                        transpose_b: false,
+                        addend,
+                        output_bf16: false,
+                    },
+                    params: vec![128, 256, 2560, splits],
+                    workgroups: [4, 8, splits],
+                    ..Default::default()
+                };
+                let params = dense_params(&dispatch);
+                assert_eq!(
+                    [params.m, params.n, params.k, params._pad],
+                    [128, 256, 2560, splits]
+                );
+            }
+        }
+        for shader in [
+            ShaderEntry::MatMul,
+            ShaderEntry::MatMulGemv,
+            ShaderEntry::MatMulGemvAdd,
+        ] {
+            let params = dense_params(&Dispatch {
+                shader,
+                params: vec![1, 2048, 256],
+                workgroups: [1, 8, 1],
+                ..Default::default()
+            });
+            assert_eq!(
+                [params.m, params.n, params.k, params._pad],
+                [1, 256, 2048, 8]
+            );
         }
     }
 }

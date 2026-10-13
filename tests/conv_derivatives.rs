@@ -176,6 +176,145 @@ fn cooperative_hardware_subtile_forward_and_input_match_f64() {
     println!("subtile_cooperative_verified shapes=2 forward_and_input_gradients=true");
 }
 
+#[test]
+#[ignore = "native BF16 convolution and independent F64 gradients"]
+fn bf16_convolution_storage_and_master_gradients() {
+    let gpu = gpu();
+    assert!(
+        gpu.capabilities()
+            .cooperative_matrix
+            .bf16_f32_shapes
+            .contains(&[16, 16, 16])
+    );
+    crate::support::gpu::assert_protocol_headroom(&gpu);
+    let shapes = [
+        Shape {
+            batch: 3,
+            ci: 3,
+            h: 9,
+            w: 11,
+            co: 17,
+            kh: 5,
+            kw: 5,
+            stride: 2,
+            ph: 2,
+            pw: 2,
+        },
+        Shape {
+            batch: 2,
+            ci: 17,
+            h: 7,
+            w: 9,
+            co: 33,
+            kh: 2,
+            kw: 4,
+            stride: 1,
+            ph: 0,
+            pw: 2,
+        },
+        Shape {
+            batch: 2,
+            ci: 32,
+            h: 8,
+            w: 8,
+            co: 48,
+            kh: 3,
+            kw: 3,
+            stride: 1,
+            ph: 1,
+            pw: 1,
+        },
+        Shape {
+            batch: 2,
+            ci: 5,
+            h: 5,
+            w: 7,
+            co: 3,
+            kh: 1,
+            kw: 1,
+            stride: 2,
+            ph: 0,
+            pw: 0,
+        },
+    ];
+    let mut cases = 0;
+    for s in shapes {
+        let [nx, nw, ny] = s.sizes();
+        let x = data(nx, 7, 1.0);
+        let w = data(nw, 19, 1.0);
+        let round = |v: &Vec<f32>| {
+            v.iter()
+                .map(|&x| half::bf16::from_f32(x).to_f32())
+                .collect::<Vec<_>>()
+        };
+        for scale in [1.0, 1e-12] {
+            let dy = data(ny, 37, scale);
+            let (expected_y, expected_dx, expected_dw) = reference(s, &round(&x), &round(&w), &dy);
+            for rounded_output in [false, true] {
+                let mut graph = Graph::new();
+                let input = graph.parameter("x", &[nx]);
+                let kernel = graph.parameter("w", &[nw]);
+                let input = graph.to_bf16(input);
+                let kernel = graph.to_bf16(kernel);
+                let y = graph.conv2d_hw(
+                    input, kernel, s.batch, s.ci, s.h, s.w, s.co, s.kh, s.kw, s.stride, s.ph, s.pw,
+                );
+                let y = if rounded_output {
+                    let half = graph.to_bf16(y);
+                    graph.from_bf16(half)
+                } else {
+                    y
+                };
+                let weights = graph.input("dy", &[ny]);
+                let weighted = graph.mul(y, weights);
+                let loss = graph.sum_all(weighted);
+                graph.set_outputs(vec![loss, y]);
+                let plan = meganeura::compile::compile(&meganeura::autodiff::differentiate(&graph));
+                let mut session = Session::with_context_opts(
+                    plan,
+                    Arc::clone(&gpu),
+                    SessionOptions {
+                        coop: CoopPolicy::NativeF32,
+                        ..Default::default()
+                    },
+                );
+                assert!(session.plan().dispatches.iter().any(|d| matches!(d.shader,
+                    ShaderEntry::Conv2dBF16 { output_bf16, .. } if output_bf16 == rounded_output)));
+                session.set_parameter("x", &x);
+                session.set_parameter("w", &w);
+                session.set_input("dy", &dy);
+                session.step();
+                session.wait();
+                let mut output = vec![0.0; ny];
+                session.read_output_by_index(1, &mut output);
+                if rounded_output {
+                    for (&actual, &expected) in output.iter().zip(&expected_y) {
+                        assert!(
+                            actual.is_finite()
+                                && (f64::from(actual) - expected).abs()
+                                    <= 1e-5 + expected.abs() / 128.0
+                        );
+                        assert_eq!(actual, half::bf16::from_f32(actual).to_f32());
+                    }
+                } else {
+                    check("bf16 forward", &output, &expected_y, 1.0);
+                }
+                let mut dx = vec![0.0; nx];
+                let mut dw = vec![0.0; nw];
+                session.read_param_grad("x", &mut dx);
+                session.read_param_grad("w", &mut dw);
+                check("bf16 input derivative", &dx, &expected_dx, scale);
+                check("bf16 master derivative", &dw, &expected_dw, scale);
+                cases += 1;
+            }
+        }
+    }
+    crate::support::gpu::assert_protocol_headroom(&gpu);
+    println!(
+        "bf16_convolution_verified cases={cases} full_f64_forward_and_f32_master_gradients=true"
+    );
+}
+
 fn data(n: usize, seed: u32, scale: f32) -> Vec<f32> {
     let mut state = seed;
     (0..n)
