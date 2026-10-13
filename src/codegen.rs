@@ -1,14 +1,10 @@
 //! Shader codegen via WGSL templates.
 //!
-//! Shaders are written as `.wgsl` files in `src/shaders/` and parsed at
-//! runtime by the naga WGSL frontend. The `preprocess()` helper performs
-//! `$VAR` substitution for parameterized shaders before parsing.
-//!
-//! Modules are passed directly to blade via `naga_module` for SPIR-V
-//! compilation.
+//! Shaders are written as `.wgsl` files in `src/shaders/`. The `preprocess()`
+//! helper performs `$VAR` substitution for parameterized shaders, and Blade
+//! parses the resulting source when it creates a shader.
 
 use crate::compile::WeightFormat;
-use naga::Module;
 
 mod coop_tiled;
 pub use coop_tiled::{CooperativeMatmulShape, generate_tiled_coop_matmul};
@@ -219,32 +215,35 @@ fn template_section<'a>(source: &'a str, name: &str) -> &'a str {
         .map_or(rest, |(section, _)| section)
 }
 
-/// A parsed shader module together with the WGSL source text.
-///
-/// Blade needs the source for SPIR-V debug info (OpLine) in debug builds.
+/// Generated WGSL source and its diagnostic name.
 pub struct ShaderModule {
-    pub module: Module,
+    /// Parsed only in unit-test builds so validation tests can inspect the IR.
+    #[cfg(test)]
+    pub(crate) module: naga::Module,
     pub source: String,
     pub hint: &'static str,
 }
 
 impl ShaderModule {
     pub(crate) fn new(source: &str) -> Self {
+        Self::with_hint(source.to_owned(), "")
+    }
+
+    pub(crate) fn with_hint(source: String, hint: &'static str) -> Self {
         Self {
-            module: parse_source(source).expect("WGSL parse failed"),
-            source: source.to_string(),
-            hint: "",
+            #[cfg(test)]
+            module: parse_source(&source).unwrap_or_else(|error| {
+                panic!("generated {hint} WGSL failed to parse:\n{error}\n---\n{source}")
+            }),
+            source,
+            hint,
         }
     }
 
     /// Dump WGSL source into the configured directory.
     pub fn dump(&self, dir: &str) {
         let hint = if self.hint.is_empty() {
-            self.module
-                .entry_points
-                .first()
-                .map(|e| e.name.as_str())
-                .unwrap_or("shader")
+            "shader"
         } else {
             self.hint
         };
@@ -258,8 +257,8 @@ impl ShaderModule {
     }
 }
 
-fn parse_source(source: &str) -> Result<Module, naga::front::wgsl::ParseError> {
-    let _span = tracing::info_span!("naga_parse", source_bytes = source.len()).entered();
+#[cfg(test)]
+fn parse_source(source: &str) -> Result<naga::Module, naga::front::wgsl::ParseError> {
     naga::front::wgsl::parse_str(source)
 }
 
@@ -588,11 +587,11 @@ fn matmul_stage_maps(
 }
 
 // ---------------------------------------------------------------------------
-// Shader groups — each group is a naga::Module with one or more entry points
+// Shader groups — each group is WGSL source with one or more entry points
 // ---------------------------------------------------------------------------
 
-/// A shader group corresponds to a single `naga::Module` that may
-/// contain multiple entry points (e.g. `Unary` has relu, sigmoid, neg).
+/// A shader group corresponds to one WGSL source that may contain multiple
+/// entry points (e.g. `Unary` has relu, sigmoid, neg).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ShaderGroup {
     /// Generated pointwise and reduction kernels, lowered from their
@@ -719,7 +718,7 @@ impl ShaderGroup {
     }
 }
 
-/// Generate a `naga::Module` for a shader group.
+/// Generate WGSL source for a shader group.
 pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
     match group {
         ShaderGroup::Generated => {
@@ -1083,26 +1082,7 @@ fn matmul_module(
 
 /// Generate WGSL source for a shader group.
 pub fn generate_wgsl(group: ShaderGroup) -> String {
-    let sm = generate_module(group, MatmulKnobs::default());
-    let capabilities = match group {
-        ShaderGroup::Conv2dGemmCoop | ShaderGroup::Conv2dGradInputGemmCoop => {
-            naga::valid::Capabilities::COOPERATIVE_MATRIX
-                | naga::valid::Capabilities::SHADER_FLOAT16
-                | naga::valid::Capabilities::SUBGROUP
-        }
-        _ => naga::valid::Capabilities::empty(),
-    };
-    module_to_wgsl(&sm.module, capabilities)
-}
-
-/// Convert a naga Module to WGSL source text.
-pub fn module_to_wgsl(module: &Module, capabilities: naga::valid::Capabilities) -> String {
-    let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
-    let info = naga::valid::Validator::new(flags, capabilities)
-        .validate(module)
-        .expect("generated module failed validation");
-    naga::back::wgsl::write_string(module, &info, naga::back::wgsl::WriterFlags::empty())
-        .expect("WGSL write failed")
+    generate_module(group, MatmulKnobs::default()).source
 }
 
 // ---------------------------------------------------------------------------
@@ -1113,7 +1093,7 @@ pub fn module_to_wgsl(module: &Module, capabilities: naga::valid::Capabilities) 
 // Shared memory tiles: shared_a[64*16], shared_b[16*64].
 // ---------------------------------------------------------------------------
 
-/// Register-tiled matmul: C = A × B via Naga IR with shared memory.
+/// Register-tiled matmul: C = A × B via WGSL with shared memory.
 ///
 /// BM=64, BN=64, KTILE=16, TM=4, TN=4.
 /// Workgroup [16, 16, 1], dispatched as [ceil(N/64), ceil(M/64), 1].
@@ -4453,8 +4433,8 @@ mod tests {
         }
     }
 
-    /// Verify that `generate_conv2d_coop_module` produces valid WGSL+naga modules
-    /// for various kernel configs, both forward and backward.
+    /// Verify that `generate_conv2d_coop_module` produces Naga-valid WGSL for
+    /// various kernel configs, both forward and backward.
     #[test]
     fn generated_conv2d_coop_modules_are_valid() {
         use naga::valid::{Capabilities, ValidationFlags, Validator};

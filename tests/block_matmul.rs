@@ -76,16 +76,17 @@ fn cpu_both_tile_sizes_generate_valid_f32_shaders() {
         ] {
             assert!(!module.source.contains('$'));
             assert!(!module.source.contains("enable f16"));
+            let parsed = naga::front::wgsl::parse_str(&module.source).unwrap();
             let info = naga::valid::Validator::new(
                 // Blade assigns bindings when it creates the pipeline.
                 naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS,
                 naga::valid::Capabilities::empty(),
             )
-            .validate(&module.module)
+            .validate(&parsed)
             .unwrap();
             #[cfg(not(target_vendor = "apple"))]
             naga::back::spv::write_vec(
-                &module.module,
+                &parsed,
                 &info,
                 &naga::back::spv::Options::default(),
                 Some(&naga::back::spv::PipelineOptions {

@@ -20,10 +20,17 @@ use meganeura::codegen::{CoopConfig, ShaderGroup, ShaderModule};
 use meganeura::compile::ShaderEntry;
 use meganeura::kernels::attention_grad::{AttentionGrad, Part, Path};
 
-fn analyze_spirv(name: &str, module: &naga::Module, entry: &ShaderEntry, dump: bool) {
+fn analyze_spirv(name: &str, source: &str, entry: &ShaderEntry, dump: bool) {
+    let module = match naga::front::wgsl::parse_str(source) {
+        Ok(module) => module,
+        Err(error) => {
+            eprintln!("  {name}: WGSL PARSE FAILED: {error}");
+            return;
+        }
+    };
     let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
     let info = match naga::valid::Validator::new(flags, naga::valid::Capabilities::all())
-        .validate(module)
+        .validate(&module)
     {
         Ok(info) => info,
         Err(e) => {
@@ -42,7 +49,7 @@ fn analyze_spirv(name: &str, module: &naga::Module, entry: &ShaderEntry, dump: b
         shader_stage: naga::ShaderStage::Compute,
         entry_point: entry.entry_point().to_string(),
     };
-    let words = match naga::back::spv::write_vec(module, &info, &opts, Some(&pipeline_opts)) {
+    let words = match naga::back::spv::write_vec(&module, &info, &opts, Some(&pipeline_opts)) {
         Ok(w) => w,
         Err(e) => {
             eprintln!("  {}: SPIR-V WRITE FAILED: {}", name, e);
@@ -120,7 +127,7 @@ fn analyze_gpu(gpu: &blade_graphics::Context, name: &str, sm: &ShaderModule, ent
     use blade_graphics as bg;
     let shader = gpu.create_shader(bg::ShaderDesc {
         source: &sm.source,
-        naga_module: Some(sm.module.clone()),
+        naga_module: None,
     });
     let layout = meganeura::runtime::shader_data_layout(entry);
     let mut pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
@@ -170,7 +177,7 @@ fn analyze(
     dump: bool,
     gpu: Option<&blade_graphics::Context>,
 ) {
-    analyze_spirv(name, &sm.module, entry, dump);
+    analyze_spirv(name, &sm.source, entry, dump);
     if let Some(g) = gpu {
         analyze_gpu(g, name, sm, entry);
     }

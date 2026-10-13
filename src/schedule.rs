@@ -1,4 +1,4 @@
-//! Kernel schedules that emit WGSL and parse it into Naga modules.
+//! Kernel schedules that emit WGSL for Blade to compile.
 //!
 //! `PointwiseDAG` describes fused scalar expressions shared by standalone
 //! pointwise/reduction kernels and matmul epilogues.
@@ -429,7 +429,7 @@ impl ReduceOp {
     }
 }
 
-/// A schedule template — to be lowered to a Naga [`naga::Module`].
+/// A schedule template — to be lowered to WGSL source.
 #[derive(Clone, Debug)]
 pub enum KernelTemplate {
     Pointwise {
@@ -605,7 +605,7 @@ pub const POINTWISE_ENTRY: &str = "main";
 pub const REDUCTION_ENTRY: &str = "main";
 pub const ATTENTION_ENTRY: &str = "main";
 
-/// Lower a [`KernelTemplate`] to WGSL + a parsed Naga module.
+/// Lower a [`KernelTemplate`] to WGSL source.
 pub fn lower(t: &KernelTemplate) -> ShaderModule {
     match *t {
         KernelTemplate::Pointwise { ref dag, grid } => lower_pointwise(dag, grid),
@@ -681,13 +681,7 @@ fn lower_pointwise(dag: &PointwiseDAG, grid: GridShape) -> ShaderModule {
     let _ = writeln!(src, "    dst[i] = v{};", dag.output);
     src.push_str("}\n");
 
-    let module = naga::front::wgsl::parse_str(&src)
-        .unwrap_or_else(|e| panic!("generated WGSL failed to parse:\n{}\n---\n{}", e, src));
-    ShaderModule {
-        module,
-        source: src,
-        hint: "pointwise",
-    }
+    ShaderModule::with_hint(src, "pointwise")
 }
 
 fn lower_reduction(
@@ -969,17 +963,7 @@ fn lower_reduction(
     }
     src.push_str("}\n");
 
-    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
-        panic!(
-            "generated reduction WGSL failed to parse:\n{}\n---\n{}",
-            e, src
-        )
-    });
-    ShaderModule {
-        module,
-        source: src,
-        hint: "reduction",
-    }
+    ShaderModule::with_hint(src, "reduction")
 }
 
 /// Binding names for per-row broadcast inputs used by the reduction
@@ -1095,17 +1079,7 @@ fn lower_attention(mask: AttentionMask, head_dim: u32, output_lse: bool) -> Shad
 
     src.push_str("}\n");
 
-    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
-        panic!(
-            "generated attention WGSL failed to parse:\n{}\n---\n{}",
-            e, src
-        )
-    });
-    ShaderModule {
-        module,
-        source: src,
-        hint: "attention",
-    }
+    ShaderModule::with_hint(src, "attention")
 }
 
 fn per_row_binding_names(n: u8) -> Vec<String> {

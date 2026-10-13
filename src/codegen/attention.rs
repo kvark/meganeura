@@ -2,7 +2,7 @@
 
 use super::{
     ATTENTION_PARAMS_WGSL, CACHED_ATTENTION_PARAMS_WGSL, CoopConfig, FlashAttentionShape,
-    ShaderGroup, ShaderModule, parse_source, preprocess, template_section,
+    ShaderGroup, ShaderModule, preprocess, template_section,
 };
 
 /// Workgroup storage for the fixed 16-query, 16-key cooperative tiles.
@@ -55,13 +55,7 @@ pub fn generate_flash_attention_module(
 }
 
 fn attention_module(source: String, hint: &'static str) -> ShaderModule {
-    let module = parse_source(&source)
-        .unwrap_or_else(|e| panic!("generated {hint} WGSL failed to parse:\n{e}\n---\n{source}"));
-    ShaderModule {
-        module,
-        source,
-        hint,
-    }
+    ShaderModule::with_hint(source, hint)
 }
 
 fn unroll_elements(fragment: &str, count: u32, stride: u32) -> String {

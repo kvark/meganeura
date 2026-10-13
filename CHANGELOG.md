@@ -1,5 +1,9 @@
 # Unreleased
 
+- Generated shaders are passed to Blade as WGSL source. Naga remains Blade's
+  compiler implementation and a Meganeura dev dependency for shader tests and
+  analysis tools, but is no longer part of Meganeura's production API;
+  `ShaderModule::module` and `module_to_wgsl` are removed.
 - Measured construction starts with a qualified untuned fallback. Its tuned
   version, including persisted kernel decisions, must pass whole-program timing
   before replacing it. Both count toward the program and memory bounds; a
