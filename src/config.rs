@@ -165,7 +165,7 @@ registry! {
     DUMP_PLAN: "MEGANEURA_DUMP_PLAN", Bool, Diagnostic,
         "Dump dispatch order, provenance, accesses, and the alias map at session build.";
     DUMP_WGSL: "MEGANEURA_DUMP_WGSL", Text, Diagnostic,
-        "Directory to write every generated/parsed WGSL shader into.";
+        "Directory to write every generated WGSL shader into.";
     OPTIMIZER: "MEGANEURA_OPTIMIZER", Text, Diagnostic,
         "Rewrite mode: off | egglog-windowed | egglog-outlined (default) | egglog-whole.";
     EGRAPH_COST: "MEGANEURA_EGRAPH_COST", Text, Diagnostic,

@@ -1204,14 +1204,15 @@ struct Pipelines {
     dump_dir: Option<String>,
 }
 
-/// Turn a generated module into a Blade shader.
+/// Turn generated WGSL into a Blade shader.
 fn create_gen_shader(
     gpu: &Gpu,
     module: crate::codegen::ShaderModule,
 ) -> Result<blade_graphics::Shader, String> {
+    let _span = tracing::info_span!("naga_parse", source_bytes = module.source.len()).entered();
     gpu.try_create_shader(blade_graphics::ShaderDesc {
         source: &module.source,
-        naga_module: Some(module.module),
+        naga_module: None,
     })
     .map_err(|error| error.to_string())
 }
@@ -3189,10 +3190,7 @@ impl Session {
         use blade_graphics as bg;
 
         let sm = crate::codegen::generate_module_coop(ShaderGroup::MatMul, config);
-        let shader = match gpu.try_create_shader(bg::ShaderDesc {
-            source: &sm.source,
-            naga_module: Some(sm.module),
-        }) {
+        let shader = match create_gen_shader(gpu, sm) {
             Ok(s) => s,
             Err(e) => {
                 log::warn!("cooperative matmul shader rejected: {}", e);

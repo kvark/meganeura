@@ -5,7 +5,7 @@ examples below describe that revision, before the repository cleanup.
 
 ## Recommendation
 
-Keep Naga as the runtime boundary and WGSL as the generated format. Replace
+Keep Blade's Naga compiler as the runtime boundary and WGSL as the generated format. Replace
 exact-text shader rewrites with explicit specialization points. Evaluate
 syntax-aware composition where transformations actually need to understand
 declarations or functions. A wholesale frontend migration is not justified
@@ -37,9 +37,9 @@ These are whole-repository counts, not this branch's additions.
   operations already have a typed representation, and emitting their WGSL
   expressions is compact. A general Naga builder would add little here.
 
-WGSL is parsed during pipeline construction. Blade receives the resulting
-Naga module directly; shader parsing is not per-dispatch work. Removing the
-parser would affect construction/tuning cost, not establish a GPU speedup.
+WGSL is passed to Blade during pipeline construction, where Blade parses and
+validates it with Naga; shader parsing is not per-dispatch work. Removing or
+relocating the parser affects construction/tuning cost, not GPU execution.
 Existing variant validation and numerical oracles support a controlled
 refactor. This investigation demonstrated maintenance problems, not new
 incorrect GPU results.

@@ -264,6 +264,7 @@ impl AttentionGrad {
     }
 
     /// The shader capabilities the module needs.
+    #[cfg(test)]
     pub fn capabilities(self) -> naga::valid::Capabilities {
         use naga::valid::Capabilities as C;
         match self.path {

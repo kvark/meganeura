@@ -14,7 +14,7 @@
 ## Example
 
 Define a graph, call `build_session`, train. Meganeura handles autodiff,
-graph rewrites, WGSL specialization, Naga parsing and validation, and GPU
+graph rewrites, WGSL specialization, Blade/Naga parsing and validation, and GPU
 dispatch automatically. Graph rewriting uses bounded equality saturation
 through egglog.
 

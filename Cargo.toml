@@ -76,7 +76,6 @@ blade-macros = "0.3"
 # env_logger, chrono, graphviz); library builds use the shared rewrite engine.
 egglog = { version = "3.0", default-features = false }
 bytemuck = { version = "1", features = ["derive"] }
-naga = { git = "https://github.com/gfx-rs/wgpu", rev = "323acfb729a00c3030e362faa27252afe6368792", version = "30", default-features = false, features = ["wgsl-in", "wgsl-out", "spv-out"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ron = "0.8"
@@ -96,6 +95,8 @@ tracing-subscriber = { version = "0.3", optional = true, features = ["registry"]
 # pulls in a C library, which is a needless build-script burden for
 # downstream crates that just want the inference runtime.
 [dev-dependencies]
+# Shader validation and SPIR-V inspection for tests and developer tools.
+naga = { git = "https://github.com/gfx-rs/wgpu", rev = "323acfb729a00c3030e362faa27252afe6368792", version = "30", default-features = false, features = ["wgsl-in", "spv-out"] }
 # Replay small paired timing differences without lossy f64 JSON parsing.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 env_logger = "0.11"
