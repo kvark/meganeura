@@ -239,6 +239,10 @@ fn leaf(node: &Node, name: &str, feeds: &Feeds) -> Result<Vec<f64>, Error> {
     match node.ty.dtype {
         DType::F32 | DType::U32 => Ok(data.to_vec()),
         DType::F16 => Ok(data.iter().map(|&v| round_f16(v)).collect()),
+        DType::BF16 => Ok(data
+            .iter()
+            .map(|&v| f64::from(half::bf16::from_f32(v as f32).to_f32()))
+            .collect()),
         other => Err(Error::Unsupported {
             node: node.id,
             reason: format!("{other:?} parameters are packed; feed their dequantized values"),
@@ -330,6 +334,8 @@ pub fn eval_node(
         | Op::GeGLUConcatGrad
         | Op::Embedding
         | Op::ToF16
+        | Op::ToBF16
+        | Op::FromBF16
         | Op::CacheWrite
         | Op::CacheWritePrefix
         | Op::PrefixLast

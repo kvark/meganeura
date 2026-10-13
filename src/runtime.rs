@@ -1204,6 +1204,74 @@ struct Pipelines {
     dump_dir: Option<String>,
 }
 
+fn bf16_requirements(dispatches: &[Dispatch]) -> (bool, bool) {
+    let mut storage = false;
+    let mut cooperative = false;
+    for dispatch in dispatches {
+        let matrix = matches!(
+            &dispatch.shader,
+            ShaderEntry::MatMulBF16 { .. } | ShaderEntry::Conv2dBF16 { .. }
+        );
+        storage |= matrix
+            || matches!(
+                &dispatch.shader,
+                ShaderEntry::ToBF16 | ShaderEntry::FromBF16
+            )
+            || dispatch.pointwise_storage != crate::schedule::PointwiseStorage::default();
+        cooperative |= matrix;
+    }
+    (storage, cooperative)
+}
+
+fn validate_bf16_plan(gpu: &Gpu, plan: &ExecutionPlan) {
+    let (storage, cooperative) = bf16_requirements(&plan.dispatches);
+    let capabilities = gpu.capabilities();
+    assert!(
+        !storage || capabilities.shader_bfloat16,
+        "selected plan requires native BF16 shader support, but this device does not expose it"
+    );
+    assert!(
+        !cooperative
+            || capabilities
+                .cooperative_matrix
+                .bf16_f32_shapes
+                .contains(&[16, 16, 16]),
+        "BF16 matrix products require native 16x16x16 BF16/F32 cooperative matrices"
+    );
+}
+
+#[cfg(test)]
+mod bf16_requirement_tests {
+    use super::{Dispatch, ShaderEntry, bf16_requirements};
+
+    #[test]
+    fn distinguishes_storage_from_cooperative_products() {
+        assert_eq!(bf16_requirements(&[Dispatch::default()]), (false, false));
+        assert_eq!(
+            bf16_requirements(&[Dispatch {
+                shader: ShaderEntry::ToBF16,
+                ..Default::default()
+            }]),
+            (true, false)
+        );
+        assert_eq!(
+            bf16_requirements(&[Dispatch {
+                shader: ShaderEntry::MatMulBF16 {
+                    transpose_a: false,
+                    transpose_b: false,
+                    addend: false,
+                    output_bf16: false,
+                },
+                ..Default::default()
+            }]),
+            (true, true)
+        );
+        let mut pointwise = Dispatch::default();
+        pointwise.pointwise_storage.bf16_output = true;
+        assert_eq!(bf16_requirements(&[pointwise]), (true, false));
+    }
+}
+
 /// Turn generated WGSL into a Blade shader.
 fn create_gen_shader(
     gpu: &Gpu,
@@ -1243,6 +1311,7 @@ impl Pipelines {
         coop_config: Option<&crate::codegen::CoopConfig>,
         wgsl_dump_dir: Option<&str>,
     ) -> Self {
+        validate_bf16_plan(gpu, plan);
         let mut pipelines = Self {
             map: HashMap::new(),
             selected: Vec::new(),
@@ -1391,6 +1460,20 @@ impl Pipelines {
             matmul_knobs.unroll_k = shape.unroll_k;
         }
         let group = dispatch.shader.shader_group();
+        if matches!(
+            group,
+            ShaderGroup::MatMulBF16 { .. } | ShaderGroup::Conv2dBF16 { .. }
+        ) && !gpu
+            .capabilities()
+            .cooperative_matrix
+            .bf16_f32_shapes
+            .contains(&[16, 16, 16])
+        {
+            return Err(
+                "BF16 matrix products require native 16x16x16 BF16/F32 cooperative matrices"
+                    .to_owned(),
+            );
+        }
         let mut layout = shader_data_layout(&dispatch.shader);
         let mut entry_point = dispatch.shader.entry_point();
         let cooperative =
@@ -1574,10 +1657,11 @@ impl Pipelines {
                 let dag = dispatch.pointwise().expect("pointwise implementation");
                 layout = pointwise_data_layout(dag.n_inputs);
                 entry_point = crate::schedule::POINTWISE_ENTRY;
-                crate::schedule::lower(&crate::schedule::KernelTemplate::Pointwise {
-                    dag: dag.clone(),
-                    grid: crate::schedule::GridShape::default(),
-                })
+                crate::schedule::lower_pointwise_storage(
+                    dag,
+                    crate::schedule::GridShape::default(),
+                    dispatch.pointwise_storage,
+                )
             }
             Variant::Reduction(_) => {
                 let kernel = dispatch.reduction().expect("reduction implementation");
@@ -1703,7 +1787,14 @@ impl Pipelines {
             return Variant::Reduction(kernel.hash_key());
         }
         if let Some(dag) = dispatch.pointwise() {
-            return Variant::Pointwise(dag.hash_key());
+            if dispatch.pointwise_storage == crate::schedule::PointwiseStorage::default() {
+                return Variant::Pointwise(dag.hash_key());
+            }
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            dag.hash(&mut hash);
+            dispatch.pointwise_storage.hash(&mut hash);
+            return Variant::Pointwise(hash.finish());
         }
         if let Some(dim) = Self::attention_head_dim(dispatch) {
             let ept = match dispatch.kernel {
@@ -2016,6 +2107,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
             bindings: Vec::new(),
         },
         ShaderEntry::MatMul
+        | ShaderEntry::MatMulBF16 { addend: false, .. }
         | ShaderEntry::MatMulAT
         | ShaderEntry::MatMulBT
         | ShaderEntry::MatMulGemv
@@ -2027,6 +2119,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::BatchMatMulAT
         | ShaderEntry::BatchMatMulBT => MatMulData::layout(),
         ShaderEntry::FusedMatMulAdd
+        | ShaderEntry::MatMulBF16 { addend: true, .. }
         | ShaderEntry::FusedMatMulATAdd
         | ShaderEntry::FusedMatMulBTAdd
         | ShaderEntry::MatMulGemvBTAdd
@@ -2047,7 +2140,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::BceLoss => BceData::layout(),
         ShaderEntry::Transpose => TransposeData::layout(),
         ShaderEntry::Embedding => EmbeddingData::layout(),
-        ShaderEntry::ToF16 => UnaryData::layout(),
+        ShaderEntry::ToF16 | ShaderEntry::ToBF16 | ShaderEntry::FromBF16 => UnaryData::layout(),
         ShaderEntry::RoPE | ShaderEntry::RoPEGrad => RoPEData::layout(),
         ShaderEntry::LayerNorm => LayerNormData::layout(),
         ShaderEntry::RmsNormAdd => RmsNormAddData::layout(),
@@ -2080,6 +2173,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::Conv2dDw => Conv2dDwData::layout(),
         ShaderEntry::MulPerChannel => MulPerChannelData::layout(),
         ShaderEntry::Conv2dGemm
+        | ShaderEntry::Conv2dBF16 { .. }
         | ShaderEntry::Conv2dGemmSmall
         | ShaderEntry::Conv2dGemm16
         | ShaderEntry::Conv2dGemmCoopGen(..) => Conv2dData::layout(),
@@ -3825,7 +3919,9 @@ impl Session {
             .iter()
             .zip(&alias.device_local)
             .zip(&zero_on_init)
-            .filter_map(|((&size, &device), &zero)| (device && zero).then_some(size.max(4)))
+            .filter_map(|((&size, &device), &zero)| {
+                (device && zero).then_some(size.max(4).next_multiple_of(4))
+            })
             .sum::<usize>();
         if device_zero_allocations != 0 {
             let _span = tracing::info_span!(
@@ -3840,7 +3936,9 @@ impl Session {
                 let mut transfer = encoder.transfer("zero_device_local");
                 for (i, &device_local) in alias.device_local.iter().enumerate() {
                     if device_local && zero_on_init[i] {
-                        let size = alias.sizes[i].max(4) as u64;
+                        // Allocations are vec4-padded, but 16-bit tensors can
+                        // have an odd logical length. Vulkan fills whole words.
+                        let size = alias.sizes[i].max(4).next_multiple_of(4) as u64;
                         transfer.fill_buffer(physical_buffers[i].handle.at(0), size, fill_byte[i]);
                     }
                 }

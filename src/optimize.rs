@@ -1791,6 +1791,14 @@ pub fn apply_winograd_conv_fusions(
     }
     for id in 0..graph.nodes().len() {
         let node = &graph.nodes()[id];
+        // Winograd's transforms and products have F32 storage contracts.
+        if node
+            .inputs
+            .iter()
+            .any(|&input| graph.node(input).ty.dtype != crate::graph::DType::F32)
+        {
+            continue;
+        }
         let (rewrite, name) = match node.op {
             Op::Conv2d {
                 in_channels,

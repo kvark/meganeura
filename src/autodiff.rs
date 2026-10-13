@@ -1,5 +1,21 @@
-use crate::graph::{Graph, NodeId, Op, PairwiseGradKind, TensorType};
+use crate::graph::{DType, Graph, NodeId, Op, PairwiseGradKind, TensorType};
 use std::collections::HashMap;
+
+fn gradient_operand(
+    graph: &mut Graph,
+    widened: &mut HashMap<NodeId, NodeId>,
+    id: NodeId,
+) -> NodeId {
+    if graph.node(id).ty.dtype != DType::BF16 {
+        return id;
+    }
+    if let Some(&wide) = widened.get(&id) {
+        return wide;
+    }
+    let wide = graph.from_bf16(id);
+    widened.insert(id, wide);
+    wide
+}
 
 /// Build the backward (gradient) graph from a forward graph.
 ///
@@ -8,6 +24,17 @@ use std::collections::HashMap;
 /// with outputs being the parameter gradients (in the same order as parameters
 /// appear in the original graph).
 pub fn differentiate(forward: &Graph) -> Graph {
+    differentiate_impl(forward, false)
+}
+
+/// Differentiate explicit BF16 matrix products with BF16 derivative operands
+/// and F32 accumulation/output. Other derivatives and master gradients stay
+/// F32. This is an explicit arithmetic choice, not the default F32 backward.
+pub fn differentiate_with_bf16_gradients(forward: &Graph) -> Graph {
+    differentiate_impl(forward, true)
+}
+
+fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
     let mut graph = Graph::new();
     // Copy forward graph nodes
     for node in forward.nodes() {
@@ -36,6 +63,9 @@ pub fn differentiate(forward: &Graph) -> Graph {
 
     // Map from forward node id → gradient node id
     let mut grads: HashMap<NodeId, NodeId> = HashMap::new();
+    // A quantized forward operand can feed several products. Widen it once
+    // for the full backward graph instead of allocating one F32 copy per use.
+    let mut widened: HashMap<NodeId, NodeId> = HashMap::new();
 
     // dL/dL = 1.0
     let one = graph.scalar(1.0);
@@ -51,6 +81,35 @@ pub fn differentiate(forward: &Graph) -> Graph {
         };
         let gradient_start = graph.nodes().len();
 
+        // Only explicit BF16 forward matrices opt into BF16 backward. The
+        // incoming gradient is shared by the two derivative products; bias
+        // gradients still use the original F32 value.
+        let matrix_bf16 = bf16_gradients
+            && matches!(
+                node.op,
+                Op::MatMul
+                    | Op::MatMulAT
+                    | Op::MatMulBT
+                    | Op::FusedMatMulAdd
+                    | Op::FusedMatMulATAdd
+                    | Op::FusedMatMulBTAdd
+            )
+            && node.inputs[..2]
+                .iter()
+                .all(|&id| graph.node(id).ty.dtype == DType::BF16);
+        let matrix_grad = if matrix_bf16 {
+            graph.to_bf16(grad_output)
+        } else {
+            grad_output
+        };
+        let matrix_operand = |graph: &mut Graph, widened: &mut HashMap<NodeId, NodeId>, id| {
+            if matrix_bf16 {
+                id
+            } else {
+                gradient_operand(graph, widened, id)
+            }
+        };
+
         // Every local derivative must multiply by grad_output, including scalar
         // reductions and losses used inside a larger expression.
         match node.op {
@@ -60,8 +119,10 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // dL/dB = A^T @ dL/dC  →  MatMulAT(A, dL/dC)
                 let a = node.inputs[0];
                 let b = node.inputs[1];
-                let grad_a = graph.matmul_bt(grad_output, b);
-                let grad_b = graph.matmul_at(a, grad_output);
+                let wide_a = matrix_operand(&mut graph, &mut widened, a);
+                let wide_b = matrix_operand(&mut graph, &mut widened, b);
+                let grad_a = graph.matmul_bt(matrix_grad, wide_b);
+                let grad_b = graph.matmul_at(wide_a, matrix_grad);
                 accumulate_grad(&mut graph, &mut grads, a, grad_a);
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
             }
@@ -71,11 +132,13 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // dB[k,n] = sum_m A[k,m]*dC[m,n] = A @ dC   → MatMul(A, dC)
                 let a = node.inputs[0];
                 let b = node.inputs[1];
-                let grad_a = graph.matmul_bt(b, grad_output);
+                let wide_a = matrix_operand(&mut graph, &mut widened, a);
+                let wide_b = matrix_operand(&mut graph, &mut widened, b);
+                let grad_a = graph.matmul_bt(wide_b, matrix_grad);
                 let grad_b = graph.add_raw_node(
                     Op::MatMul,
-                    vec![a, grad_output],
-                    forward.nodes()[b as usize].ty.clone(),
+                    vec![wide_a, matrix_grad],
+                    TensorType::f32(forward.nodes()[b as usize].ty.shape.clone()),
                 );
                 accumulate_grad(&mut graph, &mut grads, a, grad_a);
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
@@ -86,12 +149,14 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // dB[n,k] = sum_m dC[m,n]*A[m,k] = dC^T @ A → MatMulAT(dC, A)
                 let a = node.inputs[0];
                 let b = node.inputs[1];
+                let wide_a = matrix_operand(&mut graph, &mut widened, a);
+                let wide_b = matrix_operand(&mut graph, &mut widened, b);
                 let grad_a = graph.add_raw_node(
                     Op::MatMul,
-                    vec![grad_output, b],
-                    forward.nodes()[a as usize].ty.clone(),
+                    vec![matrix_grad, wide_b],
+                    TensorType::f32(forward.nodes()[a as usize].ty.shape.clone()),
                 );
-                let grad_b = graph.matmul_at(grad_output, a);
+                let grad_b = graph.matmul_at(matrix_grad, wide_a);
                 accumulate_grad(&mut graph, &mut grads, a, grad_a);
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
             }
@@ -688,8 +753,10 @@ pub fn differentiate(forward: &Graph) -> Graph {
             // Backward: same as MatMul backward + Add backward (passthrough to d)
             Op::FusedMatMulAdd => {
                 let (a, b, d) = (node.inputs[0], node.inputs[1], node.inputs[2]);
-                let grad_a = graph.matmul_bt(grad_output, b);
-                let grad_b = graph.matmul_at(a, grad_output);
+                let wide_a = matrix_operand(&mut graph, &mut widened, a);
+                let wide_b = matrix_operand(&mut graph, &mut widened, b);
+                let grad_a = graph.matmul_bt(matrix_grad, wide_b);
+                let grad_b = graph.matmul_at(wide_a, matrix_grad);
                 accumulate_grad(&mut graph, &mut grads, a, grad_a);
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
                 accumulate_grad(&mut graph, &mut grads, d, grad_output);
@@ -717,11 +784,13 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // dA = MatMulBT(B, dC) gives B[K,N] @ dC[M,N]^T = [K, M] ✓
                 // dB = MatMul(A, dC) gives A[K,M] @ dC[M,N] = [K, N] ✓
                 let (a, b, d) = (node.inputs[0], node.inputs[1], node.inputs[2]);
-                let grad_a = graph.matmul_bt(b, grad_output);
+                let wide_a = matrix_operand(&mut graph, &mut widened, a);
+                let wide_b = matrix_operand(&mut graph, &mut widened, b);
+                let grad_a = graph.matmul_bt(wide_b, matrix_grad);
                 let grad_b = graph.add_raw_node(
                     Op::MatMul,
-                    vec![a, grad_output],
-                    forward.nodes()[b as usize].ty.clone(),
+                    vec![wide_a, matrix_grad],
+                    TensorType::f32(forward.nodes()[b as usize].ty.shape.clone()),
                 );
                 accumulate_grad(&mut graph, &mut grads, a, grad_a);
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
@@ -731,12 +800,14 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 // C = A @ B^T + D  (A=[M,K], B=[N,K], D=[M,N])
                 // Same as MatMulBT backward + passthrough to D
                 let (a, b, d) = (node.inputs[0], node.inputs[1], node.inputs[2]);
+                let wide_a = matrix_operand(&mut graph, &mut widened, a);
+                let wide_b = matrix_operand(&mut graph, &mut widened, b);
                 let grad_a = graph.add_raw_node(
                     Op::MatMul,
-                    vec![grad_output, b],
-                    forward.nodes()[a as usize].ty.clone(),
+                    vec![matrix_grad, wide_b],
+                    TensorType::f32(forward.nodes()[a as usize].ty.shape.clone()),
                 );
-                let grad_b = graph.matmul_at(grad_output, a);
+                let grad_b = graph.matmul_at(matrix_grad, wide_a);
                 accumulate_grad(&mut graph, &mut grads, a, grad_a);
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
                 accumulate_grad(&mut graph, &mut grads, d, grad_output);
@@ -751,7 +822,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
             Op::Identity => {
                 // Identity/reshape backward: reshape gradient back to input shape
                 let x = node.inputs[0];
-                let x_ty = forward.nodes()[x as usize].ty.clone();
+                let x_ty = TensorType::f32(forward.nodes()[x as usize].ty.shape.clone());
                 let grad_x = graph.add_raw_node(Op::Identity, vec![grad_output], x_ty);
                 accumulate_grad(&mut graph, &mut grads, x, grad_x);
             }
@@ -798,7 +869,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let grad_table = graph.scatter_add(indices, grad_output, vocab_size);
                 accumulate_grad(&mut graph, &mut grads, table, grad_table);
             }
-            Op::ToF16 => {
+            Op::ToF16 | Op::ToBF16 | Op::FromBF16 => {
                 // Straight-through: the f16 round is treated as identity for
                 // the backward, so the f32 master parameter receives the
                 // full f32 gradient (standard mixed-precision).
@@ -820,9 +891,11 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 let kernel = node.inputs[1];
                 let in_size = forward.nodes()[input as usize].ty.num_elements() as u32;
                 let batch = in_size / (in_channels * in_h * in_w);
+                let wide_input = gradient_operand(&mut graph, &mut widened, input);
+                let wide_kernel = gradient_operand(&mut graph, &mut widened, kernel);
                 let grad_input = graph.conv2d_grad_input(
                     grad_output,
-                    kernel,
+                    wide_kernel,
                     batch,
                     in_channels,
                     in_h,
@@ -836,7 +909,7 @@ pub fn differentiate(forward: &Graph) -> Graph {
                 );
                 let grad_kernel = graph.conv2d_grad_weight(
                     grad_output,
-                    input,
+                    wide_input,
                     in_channels,
                     in_h,
                     in_w,
@@ -1546,6 +1619,31 @@ mod tests {
             diff.node(grad_w).op
         );
         assert_eq!(diff.node(grad_w).ty.shape, vec![8, 4]);
+    }
+
+    #[test]
+    fn bf16_backward_widens_each_shared_operand_once() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[4, 8]);
+        let w1 = g.parameter("w1", &[8, 4]);
+        let w2 = g.parameter("w2", &[8, 4]);
+        let y1 = g.matmul(x, w1);
+        let y2 = g.matmul(x, w2);
+        let sum = g.add(y1, y2);
+        let loss = g.mean_all(sum);
+        g.set_outputs(vec![loss]);
+
+        let forward = g.into_bf16_matmuls();
+        let forward_len = forward.nodes().len();
+        let diff = differentiate(&forward);
+        let widenings: Vec<_> = diff.nodes()[forward_len..]
+            .iter()
+            .filter(|node| matches!(node.op, Op::FromBF16))
+            .collect();
+        assert_eq!(widenings.len(), 3, "shared x plus the two weights");
+        let unique: std::collections::HashSet<_> =
+            widenings.iter().map(|node| node.inputs[0]).collect();
+        assert_eq!(unique.len(), widenings.len());
     }
 
     #[test]

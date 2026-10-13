@@ -4,6 +4,7 @@ use crate::schedule::{PointwiseDAG, Pw, ReductionEpilogue, ReductionKernel};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+mod bf16;
 mod params;
 mod softplus;
 mod split_k;
@@ -149,6 +150,10 @@ pub struct CompileOptions {
     /// Enable the experimental reduced-precision cooperative flash
     /// backward kernels.
     pub flash_backward_coop: bool,
+    /// Explicit BF16 forward matrices also use BF16 derivative operands with
+    /// F32 accumulation. No effect on ordinary F32 forward operations.
+    #[serde(default)]
+    pub bf16_matrix_gradients: bool,
     /// Starting workgroup geometry and cross-lane reduction for the K-split
     /// GEMV family, overriding each group's own default.
     ///
@@ -191,6 +196,7 @@ impl Default for CompileOptions {
             knobs: TuningKnobs::default(),
             flash_forward_coop: true,
             flash_backward_coop: false,
+            bf16_matrix_gradients: false,
             gemv_shape: None,
             cached_attention_splits: None,
             conv_weight_splits: None,
@@ -310,6 +316,15 @@ pub enum ShaderEntry {
     RmsNormAdd,
     Embedding,
     ToF16,
+    ToBF16,
+    FromBF16,
+    /// Explicit BF16 operands and F32 accumulation.
+    MatMulBF16 {
+        transpose_a: bool,
+        transpose_b: bool,
+        addend: bool,
+        output_bf16: bool,
+    },
     RoPE,
     RoPEGrad,
     LayerNorm,
@@ -370,6 +385,13 @@ pub enum ShaderEntry {
     Conv2dGemm16,
     /// Generated conv2d forward coop kernel specialized for (kernel_h, kernel_w, stride).
     Conv2dGemmCoopGen(u32, u32, u32),
+    /// Explicit BF16 operands, F32 accumulation and checked partial tiles.
+    Conv2dBF16 {
+        kernel_h: u32,
+        kernel_w: u32,
+        stride: u32,
+        output_bf16: bool,
+    },
     Conv2dGradInputGemm,
     Conv2dGradInputGemmSmall,
     Conv2dGradInputGemm16,
@@ -435,6 +457,7 @@ impl ShaderEntry {
         match *self {
             ShaderEntry::Generated => "pointwise",
             ShaderEntry::MatMul
+            | ShaderEntry::MatMulBF16 { .. }
             | ShaderEntry::MatMulAT
             | ShaderEntry::MatMulBT
             | ShaderEntry::BlockMatMul
@@ -465,6 +488,7 @@ impl ShaderEntry {
             | ShaderEntry::ChunkedRelativeAttention => "attention",
 
             ShaderEntry::Conv2dDw
+            | ShaderEntry::Conv2dBF16 { .. }
             | ShaderEntry::Conv2dGemm
             | ShaderEntry::Conv2dGemmSmall
             | ShaderEntry::Conv2dGemm16
@@ -525,6 +549,8 @@ impl ShaderEntry {
             | ShaderEntry::Transpose
             | ShaderEntry::Embedding
             | ShaderEntry::ToF16
+            | ShaderEntry::ToBF16
+            | ShaderEntry::FromBF16
             | ShaderEntry::Concat
             | ShaderEntry::SplitA
             | ShaderEntry::SplitB
@@ -605,6 +631,19 @@ impl ShaderEntry {
             ShaderEntry::RmsNormAdd => ShaderGroup::RmsNormAdd,
             ShaderEntry::Embedding => ShaderGroup::Embedding,
             ShaderEntry::ToF16 => ShaderGroup::ToF16,
+            ShaderEntry::ToBF16 => ShaderGroup::ToBF16,
+            ShaderEntry::FromBF16 => ShaderGroup::FromBF16,
+            ShaderEntry::MatMulBF16 {
+                transpose_a,
+                transpose_b,
+                addend,
+                output_bf16,
+            } => ShaderGroup::MatMulBF16 {
+                transpose_a,
+                transpose_b,
+                addend,
+                output_bf16,
+            },
             ShaderEntry::RoPE => ShaderGroup::RoPE,
             ShaderEntry::RoPEGrad => ShaderGroup::RoPEGrad,
             ShaderEntry::LayerNorm => ShaderGroup::LayerNorm,
@@ -641,6 +680,17 @@ impl ShaderEntry {
             ShaderEntry::Conv2dDw => ShaderGroup::Conv2dDw,
             ShaderEntry::MulPerChannel => ShaderGroup::MulPerChannel,
             ShaderEntry::Conv2dGemm => ShaderGroup::Conv2dGemm,
+            ShaderEntry::Conv2dBF16 {
+                kernel_h,
+                kernel_w,
+                stride,
+                output_bf16,
+            } => ShaderGroup::Conv2dBF16 {
+                kernel_h,
+                kernel_w,
+                stride,
+                output_bf16,
+            },
             ShaderEntry::Conv2dGemmCoopGen(..) => ShaderGroup::Conv2dGemmCoop,
             ShaderEntry::Conv2dGemmSmall => ShaderGroup::Conv2dGemmSmall,
             ShaderEntry::Conv2dGemm16 => ShaderGroup::Conv2dGemm16,
@@ -716,6 +766,8 @@ impl ShaderEntry {
             ShaderEntry::RmsNormAdd => "main",
             ShaderEntry::Embedding => "main",
             ShaderEntry::ToF16 => "main",
+            ShaderEntry::ToBF16 | ShaderEntry::FromBF16 => "main",
+            ShaderEntry::MatMulBF16 { .. } => "main",
             ShaderEntry::RoPE => "main",
             ShaderEntry::RoPEGrad => "main",
             ShaderEntry::LayerNorm => "main",
@@ -753,6 +805,7 @@ impl ShaderEntry {
             ShaderEntry::Conv2dDw => "main",
             ShaderEntry::MulPerChannel => "main",
             ShaderEntry::Conv2dGemm
+            | ShaderEntry::Conv2dBF16 { .. }
             | ShaderEntry::Conv2dGemmSmall
             | ShaderEntry::Conv2dGemm16
             | ShaderEntry::Conv2dGemmCoopGen(..) => "main",
@@ -1170,6 +1223,10 @@ pub struct Dispatch {
     /// Storage format of the B (weight) input buffer.
     #[serde(default)]
     pub weight_format: WeightFormat,
+    /// Explicit BF16 conversion boundaries folded into a generated pointwise
+    /// kernel. Scalar arithmetic remains F32. Never inferred from a timing.
+    #[serde(default)]
+    pub pointwise_storage: crate::schedule::PointwiseStorage,
 }
 
 /// Mutually exclusive implementations. Bindings and launch geometry live on
@@ -1221,6 +1278,7 @@ impl Dispatch {
             | ShaderEntry::MatMulGemvAdd
             | ShaderEntry::FusedMatMulAdd => Some((a, c, b)),
             ShaderEntry::MatMulAT
+            | ShaderEntry::MatMulBF16 { .. }
             | ShaderEntry::MatMulBT
             | ShaderEntry::MatMulGemvBT
             | ShaderEntry::MatMulGemvBTAdd
@@ -1574,6 +1632,7 @@ impl ExecutionPlan {
             fuse_pointwise_chains(&mut self);
             fuse_reduction_chains(&mut self);
             fuse_row_scaled_scatters(&mut self);
+            bf16::fuse_boundaries(&mut self);
         }
         // RmsNorm+MatMul prologue fusion is applied later in the runtime,
         // after per-dispatch coop selection — the prologue path currently

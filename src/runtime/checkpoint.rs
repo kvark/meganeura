@@ -38,7 +38,7 @@ fn logical_bytes(ty: &TensorType) -> io::Result<usize> {
     elements
         .and_then(|n| match ty.dtype {
             DType::F32 | DType::U32 => n.checked_mul(4),
-            DType::F16 => n.checked_mul(2),
+            DType::F16 | DType::BF16 => n.checked_mul(2),
             DType::Q4_0 => n.div_ceil(32).checked_mul(20),
             DType::Q8_0 => n.div_ceil(32).checked_mul(36),
             // Rounded up to a word, matching `TensorType::size_bytes`.
@@ -94,6 +94,7 @@ fn tensor_layout(ty: &TensorType) -> io::Result<(Dtype, Vec<usize>)> {
     Ok(match ty.dtype {
         DType::F32 => (Dtype::F32, ty.shape.clone()),
         DType::F16 => (Dtype::F16, ty.shape.clone()),
+        DType::BF16 => (Dtype::BF16, ty.shape.clone()),
         DType::U32 => (Dtype::U32, ty.shape.clone()),
         DType::Q4_0
         | DType::Q8_0
