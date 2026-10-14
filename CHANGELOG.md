@@ -10,8 +10,9 @@
 - The Blade update conditionally enables Vulkan memory-model emission for every
   shader on devices that advertise it, including existing F32/F16 kernels. The
   matching Naga fork carries the BF16 cooperative-matrix and corrected Vulkan
-  memory-model emission work pending upstream integration; Meganeura's direct
-  Naga use remains dev-only.
+  memory-model emission work pending upstream integration. Ordinary storage
+  accesses propagate at storage barriers, avoiding redundant per-access fences.
+  Meganeura's direct Naga use remains dev-only and matches Blade's compiler pin.
 - Generated shaders are passed to Blade as WGSL source. Naga remains Blade's
   compiler implementation and a Meganeura dev dependency for shader tests and
   analysis tools, but is no longer part of Meganeura's production API;
@@ -102,7 +103,7 @@
 - Tuning treats disjoint slices of one allocation as separate bindings,
   and the cooperative probe at session start no longer reads mapped
   memory back on the CPU.
-- Blade is pinned to `56f0565`. Vulkan devices with `shaderFloat16` but no
+- Blade is pinned to `96c1dc7`. Vulkan devices with `shaderFloat16` but no
   f16 cooperative matrix (MI300X on RADV, lavapipe) now get the 16-bit
   storage features that f16 shaders declare, and descriptor sets are reused
   across recordings instead of being reallocated. A Vulkan device must now
