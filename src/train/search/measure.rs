@@ -371,7 +371,10 @@ pub(super) fn select(
                 trial.outcome.qualified = true;
                 if let Some((ref mut baseline, ref baseline_state)) = incumbent {
                     if start.elapsed() < options.max_time
-                        && candidate.plan().dispatches == baseline.plan().dispatches
+                        // Dispatch geometry alone does not identify the program:
+                        // shader tuning knobs can change code without changing
+                        // any dispatch. Buffer layouts and constants matter too.
+                        && candidate.plan() == baseline.plan()
                         && submission_chunks == selected_chunks
                     {
                         trial.outcome.decision = TuneDecision::KeepBaseline;
@@ -600,6 +603,87 @@ mod tests {
         changed = plan.clone();
         changed.buffers[weight.0 as usize] += 4;
         assert_eq!(challenger_bytes(&plan, Some(&changed)).unwrap(), bytes);
+    }
+
+    #[test]
+    fn shader_knob_changes_are_measured_with_identical_dispatches() {
+        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
+        let mut graph = crate::Graph::new();
+        let q = graph.input("q", &[128, 64]);
+        let k = graph.input("k", &[128, 64]);
+        let v = graph.input("v", &[128, 64]);
+        let output = graph.full_attention(q, k, v, 1, 1, 64);
+        graph.set_outputs(vec![output]);
+        let mut options = crate::compile::CompileOptions {
+            flash_forward_coop: false,
+            ..Default::default()
+        };
+        options.knobs.flash_ept_cap = 32;
+        options.knobs.flash = crate::codegen::FlashAttentionShape {
+            threads: 256,
+            keys: 8,
+            interleave: false,
+        };
+        let baseline = crate::compile::compile_with(&graph, &options);
+        options.knobs.flash.interleave = true;
+        let alternate = crate::compile::compile_with(&graph, &options);
+        assert_eq!(baseline.dispatches, alternate.dispatches);
+        assert_ne!(baseline.knobs, alternate.knobs);
+        let programs = [baseline.clone(), alternate, baseline].map(|plan| Program {
+            description: format!("interleave={}", plan.knobs.flash.interleave),
+            plan,
+            submission_chunks: Some(1),
+            origin: None,
+        });
+        let (_, report) = select(
+            programs,
+            gpu,
+            SessionOptions {
+                coop: crate::CoopPolicy::Disabled,
+                ..Default::default()
+            },
+            BuildSearchOptions {
+                max_programs: 3,
+                max_submission_chunks: 1,
+                max_plan_bytes: 1 << 20,
+                max_time: Duration::from_secs(30),
+                warmup_runs: 1,
+                warmup_time: Duration::ZERO,
+                // Keep the baseline so the third program is its exact duplicate.
+                min_improvement: 0.99,
+                tuning: TuneOptions {
+                    max_time: Duration::ZERO,
+                    sample_pairs: 4,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            |session, _| {
+                session.set_input("q", &[0.25; 128 * 64]);
+                session.set_input("k", &[0.5; 128 * 64]);
+                session.set_input("v", &[0.75; 128 * 64]);
+                Ok(())
+            },
+            |session| {
+                if session
+                    .read_output(128 * 64)
+                    .iter()
+                    .all(|&v| (v - 0.75).abs() < 1e-5)
+                {
+                    Ok(())
+                } else {
+                    Err("attention mismatch".into())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(report.trials.len(), 3);
+        assert_eq!(report.selected, 0);
+        assert!(report.trials.iter().all(|trial| trial.outcome.qualified));
+        assert_eq!(report.trials[1].outcome.baseline_ms.len(), 4);
+        assert_eq!(report.trials[1].outcome.candidate_ms.len(), 4);
+        assert!(report.trials[2].outcome.baseline_ms.is_empty());
+        assert!(report.trials[2].outcome.candidate_ms.is_empty());
     }
 
     #[test]

@@ -25,7 +25,9 @@
   one-program search returns the fallback. Private probes reserve estimated
   time for warmup, paired timing and qualification within the common deadline.
   Incomplete or late comparisons keep the incumbent. Qualified challengers with
-  unchanged dispatches and submission count skip warmup and paired timing.
+  identical execution plans and submission count skip warmup and paired timing.
+  Plan equality includes shader tuning knobs, buffer layouts and constants;
+  equal dispatch lists alone must not suppress different attention layouts.
   The memory bound counts inherited immutable parameters once across the pair;
   written parameters and persistent-state snapshots remain private.
   `build_measured_with_inputs` refreshes representative inputs before every
