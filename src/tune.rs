@@ -580,6 +580,10 @@ impl TuneClass {
                 | ShaderEntry::Conv2dGradWeightGemmSmall
                 | ShaderEntry::Conv2dGradWeightGemm16
         ) || dispatch.use_coop_compensated()
+            || matches!(
+                dispatch.kernel,
+                crate::compile::Kernel::CooperativeBF16 { .. }
+            )
             || (dispatch.use_coop() && dispatch.weight_format.uses_reduced_storage())
             || dispatch.horizontal_batch >= 2
             || dispatch.matmul_prologue.is_some()

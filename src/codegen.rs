@@ -632,12 +632,6 @@ pub enum ShaderGroup {
     ToF16,
     ToBF16,
     FromBF16,
-    MatMulBF16 {
-        transpose_a: bool,
-        transpose_b: bool,
-        addend: bool,
-        output_bf16: bool,
-    },
     RoPE,
     RoPEGrad,
     LayerNorm,
@@ -781,7 +775,7 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         ShaderGroup::RoPEGrad => ShaderModule::new(
             &include_str!("shaders/rope_grad.wgsl").replace("$PARAMS", ROPE_PARAMS_WGSL),
         ),
-        ShaderGroup::MatMulBF16 { .. } | ShaderGroup::Conv2dBF16 { .. } => bf16::generate(group),
+        ShaderGroup::Conv2dBF16 { output_bf16, .. } => bf16::generate(group, output_bf16),
         ShaderGroup::ToBF16 | ShaderGroup::FromBF16 => {
             let narrowing = group == ShaderGroup::ToBF16;
             let source = preprocess(
@@ -966,6 +960,17 @@ pub(crate) fn coop_shape(group: ShaderGroup) -> Option<(bool, MatMulCoopVariant)
 /// modifier on a dispatch, not a group of its own.
 pub fn generate_module_coop(group: ShaderGroup, config: &CoopConfig) -> ShaderModule {
     generate_module_coop_weighted(group, config, WeightFormat::F32)
+}
+
+/// Cooperative matmul with explicit BF16 operands and F32 accumulation.
+/// The group supplies the usual transpose/addend layout; the kernel supplies
+/// storage precision. Checked scalar stores support arbitrary output tails.
+pub fn generate_module_coop_bf16(group: ShaderGroup, output_bf16: bool) -> ShaderModule {
+    assert!(
+        coop_shape(group).is_some(),
+        "no cooperative form for {group:?}"
+    );
+    bf16::generate(group, output_bf16)
 }
 
 /// [`generate_module_coop`] reading B in `format`: f32, or f16 with f16-input
@@ -4144,7 +4149,6 @@ mod tests {
                 | ShaderEntry::BatchMatMulAT
                 | ShaderEntry::BatchMatMulBT => vec!["matrix_a", "matrix_b", "matrix_c", "params"],
                 ShaderEntry::MatMul
-                | ShaderEntry::MatMulBF16 { addend: false, .. }
                 | ShaderEntry::MatMulAT
                 | ShaderEntry::MatMulBT
                 | ShaderEntry::MatMulGemv
@@ -4155,7 +4159,6 @@ mod tests {
                     vec!["matrix_a", "matrix_b", "matrix_c", "src", "params"]
                 }
                 ShaderEntry::FusedMatMulAdd
-                | ShaderEntry::MatMulBF16 { addend: true, .. }
                 | ShaderEntry::FusedMatMulATAdd
                 | ShaderEntry::FusedMatMulBTAdd => {
                     vec!["matrix_a", "matrix_b", "matrix_c", "src", "params"]

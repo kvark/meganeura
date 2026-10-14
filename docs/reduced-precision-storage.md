@@ -16,6 +16,13 @@ The graph transforms are currently intended for training. Inference would
 convert every F32 parameter to BF16 on each run; persistent BF16 parameter
 storage and direct BF16 model loading are not implemented yet.
 
+Dense BF16 products use the same `MatMul`/`MatMulAT`/`MatMulBT` shader groups,
+addend layouts and bindings as F32/F16 products. `Kernel::CooperativeBF16`
+records explicit operand/output storage and K partitions. Its specialized
+cooperative loop handles partial tiles and nearest-even output rounding;
+split-K partials remain F32 until reduction. Kernel selection and tuning preserve
+this storage contract. BF16 is reported as a cooperative matrix kernel in profiles.
+
 This is not autocast or complete mixed-precision training. BF16 graph inputs,
 parameters, outputs and unsupported operations reject explicitly; only internal
 conversion, pointwise, dense-matrix and convolution storage is supported. Check

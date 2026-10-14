@@ -862,16 +862,27 @@ impl<'a> Compiler<'a> {
                 out_buf
             };
             let dispatch = Dispatch {
-                shader: ShaderEntry::MatMulBF16 {
-                    transpose_a,
-                    transpose_b,
-                    addend,
+                shader: match node.op {
+                    Op::MatMul => ShaderEntry::MatMul,
+                    Op::MatMulAT => ShaderEntry::MatMulAT,
+                    Op::MatMulBT => ShaderEntry::MatMulBT,
+                    Op::FusedMatMulAdd => ShaderEntry::FusedMatMulAdd,
+                    Op::FusedMatMulATAdd => ShaderEntry::FusedMatMulATAdd,
+                    Op::FusedMatMulBTAdd => ShaderEntry::FusedMatMulBTAdd,
+                    _ => unreachable!(),
+                },
+                kernel: super::Kernel::CooperativeBF16 {
                     output_bf16: false,
+                    splits,
                 },
                 workgroups: grid,
                 input_buffers: node.inputs.iter().map(|&id| self.get_buffer(id)).collect(),
                 output_buffer: partial,
-                params: vec![m, n, k, splits],
+                params: if transpose_a || transpose_b {
+                    vec![m, n, k, 0]
+                } else {
+                    vec![m, k, n, 0]
+                },
                 fusion_barrier: true,
                 schedule_locked: true,
                 origin: vec![node.id],

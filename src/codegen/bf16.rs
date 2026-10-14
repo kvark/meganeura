@@ -1,15 +1,15 @@
-use super::{ShaderGroup, ShaderModule, preprocess};
+use super::{MatMulCoopVariant, ShaderGroup, ShaderModule, coop_shape, preprocess};
 
 /// Dense and implicit-GEMM convolutions share the same checked cooperative loop.
-pub(super) fn generate(group: ShaderGroup) -> ShaderModule {
-    let (declaration, dimensions, range, a, b, index, destination, add, output_bf16) = match group {
-        ShaderGroup::MatMulBF16 {
-            transpose_a,
-            transpose_b,
-            addend,
-            output_bf16,
-        } => {
-            assert!(!(transpose_a && transpose_b));
+pub(super) fn generate(group: ShaderGroup, output_bf16: bool) -> ShaderModule {
+    let (declaration, dimensions, range, a, b, index, destination, add) = match group {
+        ShaderGroup::MatMul
+        | ShaderGroup::MatMulAT
+        | ShaderGroup::MatMulBT
+        | ShaderGroup::MatMulAdd
+        | ShaderGroup::MatMulATAdd
+        | ShaderGroup::MatMulBTAdd => {
+            let (addend, variant) = coop_shape(group).unwrap();
             let mut declaration = String::from(
                 "struct Params { m: u32, n: u32, k: u32, splits: u32 }\n\
                  var<storage> matrix_a: array<bf16>;\n\
@@ -29,12 +29,12 @@ pub(super) fn generate(group: ShaderGroup) -> ShaderModule {
                  let first = (group.z * base + min(group.z, extra)) * 32u;\n\
                  let count = base + select(0u, 1u, group.z < extra);\n\
                  let end = min(first + count * 32u, k);",
-                if transpose_a {
+                if variant == MatMulCoopVariant::AT {
                     "matrix_a[ak * m + ar]"
                 } else {
                     "matrix_a[ar * k + ak]"
                 },
-                if transpose_b {
+                if variant == MatMulCoopVariant::BT {
                     "matrix_b[bc * k + bk]"
                 } else {
                     "matrix_b[bk * n + bc]"
@@ -42,14 +42,13 @@ pub(super) fn generate(group: ShaderGroup) -> ShaderModule {
                 "(group.z * m + r) * n + c",
                 "matrix_c",
                 if addend { " + src[index]" } else { "" },
-                output_bf16,
             )
         }
         ShaderGroup::Conv2dBF16 {
             kernel_h,
             kernel_w,
             stride,
-            output_bf16,
+            ..
         } => {
             assert!(kernel_h > 0 && kernel_w > 0 && stride > 0);
             let declaration = format!(
@@ -68,7 +67,6 @@ pub(super) fn generate(group: ShaderGroup) -> ShaderModule {
                 "(group.z * m + r) * n + c",
                 "dst",
                 "",
-                output_bf16,
             )
         }
         _ => unreachable!(),
@@ -109,14 +107,9 @@ mod tests {
                     stride: 2,
                     output_bf16,
                 },
-                ShaderGroup::MatMulBF16 {
-                    transpose_a: false,
-                    transpose_b: true,
-                    addend: true,
-                    output_bf16,
-                },
+                ShaderGroup::MatMulBTAdd,
             ] {
-                let mut module = generate(group);
+                let mut module = generate(group, output_bf16);
                 let mut binding = 0;
                 for (_, global) in module.module.global_variables.iter_mut() {
                     if matches!(

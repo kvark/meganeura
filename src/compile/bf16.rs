@@ -1,6 +1,6 @@
 //! Fold explicit conversion boundaries, never choose a precision policy.
 
-use super::{ExecutionPlan, ShaderEntry};
+use super::{ExecutionPlan, Kernel, ShaderEntry};
 use crate::schedule::PointwiseStorage;
 use std::collections::HashMap;
 
@@ -78,11 +78,14 @@ pub(super) fn fuse_boundaries(plan: &mut ExecutionPlan) {
                     || producer.pointwise_storage != PointwiseStorage::default())
             {
                 producer.pointwise_storage.bf16_output = true;
-            } else if let ShaderEntry::MatMulBF16 {
+            } else if let Kernel::CooperativeBF16 {
                 ref mut output_bf16,
-                ..
-            }
-            | ShaderEntry::Conv2dBF16 {
+                splits: 1,
+            } = producer.kernel
+            {
+                assert!(!*output_bf16);
+                *output_bf16 = true;
+            } else if let ShaderEntry::Conv2dBF16 {
                 ref mut output_bf16,
                 ..
             } = producer.shader

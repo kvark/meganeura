@@ -1,4 +1,8 @@
-use meganeura::{Graph, compile::ShaderEntry, graph::DType};
+use meganeura::{
+    Graph,
+    compile::{Kernel, ShaderEntry},
+    graph::DType,
+};
 
 fn parse_with_bindings(source: &str) -> naga::Module {
     let mut module = naga::front::wgsl::parse_str(source).unwrap();
@@ -123,14 +127,34 @@ fn bf16_storage_rejects_untyped_arithmetic() {
 #[test]
 fn unsupported_device_reports_bf16_requirement_before_shader_validation() {
     let context = crate::support::gpu::gpu();
-    if context.capabilities().shader_bfloat16 {
-        eprintln!("native BF16 storage available; skipping unsupported-device coverage");
+    let caps = context.capabilities();
+    if caps.shader_bfloat16
+        && caps
+            .cooperative_matrix
+            .bf16_f32_shapes
+            .contains(&[16, 16, 16])
+    {
+        eprintln!(
+            "native BF16 storage and matrices available; skipping unsupported-device coverage"
+        );
         return;
     }
     let mut graph = Graph::new();
-    let input = graph.input("x", &[7]);
+    let input = graph.input("x", &[3, 7]);
     let narrow = graph.to_bf16(input);
-    let output = graph.from_bf16(narrow);
+    let (output, expected) = if caps.shader_bfloat16 {
+        let weight = graph.parameter("w", &[7, 5]);
+        let weight = graph.to_bf16(weight);
+        (
+            graph.matmul(narrow, weight),
+            "BF16 matrix products require native 16x16x16 BF16/F32 cooperative matrices",
+        )
+    } else {
+        (
+            graph.from_bf16(narrow),
+            "selected plan requires native BF16 shader support",
+        )
+    };
     graph.set_outputs(vec![output]);
     let plan = meganeura::compile::compile(&graph);
     let panic = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -144,24 +168,22 @@ fn unsupported_device_reports_bf16_requirement_before_shader_validation() {
         .map(String::as_str)
         .or_else(|| panic.downcast_ref::<&str>().copied())
         .unwrap_or("non-string panic");
-    assert!(
-        message.contains("selected plan requires native BF16 shader support"),
-        "unexpected panic: {message}"
-    );
+    assert!(message.contains(expected), "unexpected panic: {message}");
 }
 
 #[test]
 fn bf16_matrix_shaders_validate() {
-    for (transpose_a, transpose_b) in [(false, false), (true, false), (false, true)] {
-        for (addend, output_bf16) in [(false, false), (true, false), (false, true), (true, true)] {
-            let entry = ShaderEntry::MatMulBF16 {
-                transpose_a,
-                transpose_b,
-                addend,
-                output_bf16,
-            };
+    for entry in [
+        ShaderEntry::MatMul,
+        ShaderEntry::MatMulAT,
+        ShaderEntry::MatMulBT,
+        ShaderEntry::FusedMatMulAdd,
+        ShaderEntry::FusedMatMulATAdd,
+        ShaderEntry::FusedMatMulBTAdd,
+    ] {
+        for output_bf16 in [false, true] {
             let shader =
-                meganeura::codegen::generate_module(entry.shader_group(), Default::default());
+                meganeura::codegen::generate_module_coop_bf16(entry.shader_group(), output_bf16);
             let module = parse_with_bindings(&shader.source);
             let info = naga::valid::Validator::new(
                 naga::valid::ValidationFlags::all(),
@@ -249,8 +271,8 @@ fn bf16_connected_plan_cpu() {
     );
     assert!(plan.dispatches.len() < plain.dispatches.len());
     assert!(plan.dispatches.iter().any(|d| matches!(
-        d.shader,
-        ShaderEntry::MatMulBF16 {
+        d.kernel,
+        Kernel::CooperativeBF16 {
             output_bf16: true,
             ..
         }
@@ -584,7 +606,7 @@ fn bf16_matrix_values_and_f32_gradients() {
                 assert!(
                     plan.dispatches
                         .iter()
-                        .any(|d| matches!(d.shader, ShaderEntry::MatMulBF16 { .. }))
+                        .any(|d| matches!(d.kernel, Kernel::CooperativeBF16 { .. }))
                 );
                 let report =
                     meganeura::reference::gpu::check_training(&graph, &feeds, &options).unwrap();
