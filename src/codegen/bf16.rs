@@ -1,7 +1,12 @@
 use super::{MatMulCoopVariant, ShaderGroup, ShaderModule, coop_shape, preprocess};
 
 /// Dense and implicit-GEMM convolutions share the same checked cooperative loop.
-pub(super) fn generate(group: ShaderGroup, output_bf16: bool) -> ShaderModule {
+pub(super) fn generate(group: ShaderGroup, output_bf16: bool, shape: [u32; 3]) -> ShaderModule {
+    assert!(
+        super::bf16_cooperative_shape(&[shape]).is_some(),
+        "unsupported BF16 tile {shape:?}"
+    );
+    let [m, n, k] = shape;
     let (declaration, dimensions, range, a, b, index, destination, add) = match group {
         ShaderGroup::MatMul
         | ShaderGroup::MatMulAT
@@ -85,6 +90,15 @@ pub(super) fn generate(group: ShaderGroup, output_bf16: bool) -> ShaderModule {
             ("$OUT_TYPE", if output_bf16 { "bf16" } else { "f32" }),
             ("$STORE", if output_bf16 { "round_bf16" } else { "f32" }),
             ("$ADD", add),
+            // WGSL names cooperative matrices columns × rows, whereas device
+            // capabilities and the product shape are M × N × K.
+            ("$A_TILE", &format!("coop_mat{k}x{m}<bf16, A>")),
+            ("$B_TILE", &format!("coop_mat{n}x{k}<bf16, B>")),
+            ("$C_TILE", &format!("coop_mat{n}x{m}<f32, C>")),
+            ("$TILES_N", &(32 / n).to_string()),
+            ("$TILES", &(32 / m * (32 / n)).to_string()),
+            ("$TILE_M", &m.to_string()),
+            ("$TILE_N", &n.to_string()),
         ],
     ))
 }
@@ -94,12 +108,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_shape_selection_requires_an_implemented_product() {
+        use crate::codegen::bf16_cooperative_shape as select;
+        assert_eq!(select(&[]), None);
+        assert_eq!(select(&[[16, 8, 16], [8, 8, 8], [8, 16, 32]]), None);
+        assert_eq!(select(&[[8, 16, 16]]), Some([8, 16, 16]));
+        assert_eq!(select(&[[8, 16, 16], [16, 16, 16]]), Some([16, 16, 16]));
+    }
+
+    #[test]
     fn convolution_and_dense_modules_validate_and_emit_spirv() {
         let capabilities = naga::valid::Capabilities::SHADER_BFLOAT16
             | naga::valid::Capabilities::COOPERATIVE_MATRIX
             | naga::valid::Capabilities::COOPERATIVE_MATRIX_BFLOAT16
             | naga::valid::Capabilities::SUBGROUP;
-        for output_bf16 in [false, true] {
+        for (output_bf16, shape) in [false, true]
+            .into_iter()
+            .flat_map(|output| [[16, 16, 16], [8, 16, 16]].map(|shape| (output, shape)))
+        {
             for group in [
                 ShaderGroup::Conv2dBF16 {
                     kernel_h: 2,
@@ -109,7 +135,7 @@ mod tests {
                 },
                 ShaderGroup::MatMulBTAdd,
             ] {
-                let mut module = generate(group, output_bf16);
+                let mut module = generate(group, output_bf16, shape);
                 let mut binding = 0;
                 for (_, global) in module.module.global_variables.iter_mut() {
                     if matches!(

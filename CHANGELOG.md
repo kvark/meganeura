@@ -1,7 +1,7 @@
 # Unreleased
 
 - Native BF16 is available as an explicit graph precision policy on Vulkan
-  devices where Blade reports BF16 storage and 16x16x16 BF16/F32 cooperative
+  devices where Blade reports BF16 storage and 16x16x16 or 8x16x16 BF16/F32 cooperative
   matrices. Conversion and connected pointwise boundaries use two-byte storage;
   dense and convolution products accumulate in F32, preserve F32 master
   parameters and gradients, and split long underfilled products across K.

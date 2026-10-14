@@ -26,8 +26,11 @@ this storage contract. BF16 is reported as a cooperative matrix kernel in profil
 This is not autocast or complete mixed-precision training. BF16 graph inputs,
 parameters, outputs and unsupported operations reject explicitly; only internal
 conversion, pointwise, dense-matrix and convolution storage is supported. Check
-Blade's `shader_bfloat16` and `bf16_f32_shapes`; cooperative products currently
-require `[16,16,16]`. Devices without those features retain the existing
+Blade's `shader_bfloat16` and `bf16_f32_shapes`; cooperative products select
+`[16,16,16]` or `[8,16,16]` in M×N×K order. The latter enables Xe2 (B570):
+eight rectangular tiles cover the same 32×32 output block, with the same
+checked tails and 32-element K partitions. Dense products, fused addends and
+implicit-GEMM convolutions use this shared loop. Devices without those features retain the existing
 F32/F16 paths. No default graph is automatically narrowed. Explicit BF16
 matrix stores and pointwise conversion boundaries fuse: pointwise arithmetic
 widens inside the kernel and rounds once at its store. Shared values needed by

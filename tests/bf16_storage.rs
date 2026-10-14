@@ -129,10 +129,8 @@ fn unsupported_device_reports_bf16_requirement_before_shader_validation() {
     let context = crate::support::gpu::gpu();
     let caps = context.capabilities();
     if caps.shader_bfloat16
-        && caps
-            .cooperative_matrix
-            .bf16_f32_shapes
-            .contains(&[16, 16, 16])
+        && meganeura::codegen::bf16_cooperative_shape(&caps.cooperative_matrix.bf16_f32_shapes)
+            .is_some()
     {
         eprintln!(
             "native BF16 storage and matrices available; skipping unsupported-device coverage"
@@ -147,7 +145,7 @@ fn unsupported_device_reports_bf16_requirement_before_shader_validation() {
         let weight = graph.to_bf16(weight);
         (
             graph.matmul(narrow, weight),
-            "BF16 matrix products require native 16x16x16 BF16/F32 cooperative matrices",
+            "BF16 matrix products require native 16x16x16 or 8x16x16 BF16/F32 cooperative matrices",
         )
     } else {
         (
@@ -371,11 +369,10 @@ fn bf16_pointwise_shaders_validate() {
 #[test]
 fn bf16_connected_forward_backward_and_updates() {
     let context = crate::support::gpu::gpu();
-    if !context
-        .capabilities()
-        .cooperative_matrix
-        .bf16_f32_shapes
-        .contains(&[16, 16, 16])
+    if !meganeura::codegen::bf16_cooperative_shape(
+        &context.capabilities().cooperative_matrix.bf16_f32_shapes,
+    )
+    .is_some()
     {
         eprintln!("native BF16 matrices unavailable; skipping device-specific coverage");
         return;
@@ -432,11 +429,10 @@ fn bf16_connected_forward_backward_and_updates() {
 #[test]
 fn bf16_matrix_reduced_gradients() {
     let context = crate::support::gpu::gpu();
-    if !context
-        .capabilities()
-        .cooperative_matrix
-        .bf16_f32_shapes
-        .contains(&[16, 16, 16])
+    if !meganeura::codegen::bf16_cooperative_shape(
+        &context.capabilities().cooperative_matrix.bf16_f32_shapes,
+    )
+    .is_some()
     {
         eprintln!("native BF16 matrices unavailable; skipping device-specific coverage");
         return;
@@ -501,11 +497,10 @@ fn bf16_matrix_reduced_gradients() {
 #[test]
 fn bf16_selected_dense_graph_gradients() {
     let context = crate::support::gpu::gpu();
-    if !context
-        .capabilities()
-        .cooperative_matrix
-        .bf16_f32_shapes
-        .contains(&[16, 16, 16])
+    if !meganeura::codegen::bf16_cooperative_shape(
+        &context.capabilities().cooperative_matrix.bf16_f32_shapes,
+    )
+    .is_some()
     {
         eprintln!("native BF16 matrices unavailable; skipping device-specific coverage");
         return;
@@ -550,11 +545,10 @@ fn bf16_selected_dense_graph_gradients() {
 #[test]
 fn bf16_matrix_values_and_f32_gradients() {
     let context = crate::support::gpu::gpu();
-    if !context
-        .capabilities()
-        .cooperative_matrix
-        .bf16_f32_shapes
-        .contains(&[16, 16, 16])
+    if !meganeura::codegen::bf16_cooperative_shape(
+        &context.capabilities().cooperative_matrix.bf16_f32_shapes,
+    )
+    .is_some()
     {
         eprintln!(
             "native BF16 cooperative matrices unavailable; skipping device-specific coverage"

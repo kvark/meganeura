@@ -1240,11 +1240,11 @@ fn validate_bf16_plan(gpu: &Gpu, plan: &ExecutionPlan) {
     );
     assert!(
         !cooperative
-            || capabilities
-                .cooperative_matrix
-                .bf16_f32_shapes
-                .contains(&[16, 16, 16]),
-        "BF16 matrix products require native 16x16x16 BF16/F32 cooperative matrices"
+            || crate::codegen::bf16_cooperative_shape(
+                &capabilities.cooperative_matrix.bf16_f32_shapes,
+            )
+            .is_some(),
+        "BF16 matrix products require native 16x16x16 or 8x16x16 BF16/F32 cooperative matrices"
     );
 }
 
@@ -1535,25 +1535,23 @@ impl Pipelines {
             matmul_knobs.unroll_k = shape.unroll_k;
         }
         let group = dispatch.shader.shader_group();
-        if (matches!(key, Variant::CoopBF16(..)) || matches!(group, ShaderGroup::Conv2dBF16 { .. }))
-            && !gpu
-                .capabilities()
-                .cooperative_matrix
-                .bf16_f32_shapes
-                .contains(&[16, 16, 16])
-        {
-            return Err(
-                "BF16 matrix products require native 16x16x16 BF16/F32 cooperative matrices"
-                    .to_owned(),
-            );
-        }
+        let bf16_shape = || {
+            crate::codegen::bf16_cooperative_shape(
+                &gpu.capabilities().cooperative_matrix.bf16_f32_shapes,
+            ).ok_or_else(||
+                "BF16 matrix products require native 16x16x16 or 8x16x16 BF16/F32 cooperative matrices".to_owned())
+        };
         let mut layout = shader_data_layout(&dispatch.shader);
         let mut entry_point = dispatch.shader.entry_point();
         let cooperative =
             || *coop_config.expect("cooperative dispatch needs a qualified device configuration");
         let module = match *key {
             Variant::CoopBF16(_, output_bf16) => {
-                crate::codegen::generate_module_coop_bf16(group, output_bf16)
+                crate::codegen::generate_module_coop_bf16_with_shape(
+                    group,
+                    output_bf16,
+                    bf16_shape()?,
+                )
             }
             Variant::CoopTiled(_, shape, splits, _) => {
                 let config = cooperative();
@@ -1584,7 +1582,16 @@ impl Pipelines {
                     dispatch.matmul_prologue.as_ref(),
                 )
             }
-            Variant::Scalar(_) => crate::codegen::generate_module(group, matmul_knobs),
+            Variant::Scalar(_) => match group {
+                ShaderGroup::Conv2dBF16 { output_bf16, .. } => {
+                    crate::codegen::generate_module_coop_bf16_with_shape(
+                        group,
+                        output_bf16,
+                        bf16_shape()?,
+                    )
+                }
+                _ => crate::codegen::generate_module(group, matmul_knobs),
+            },
             Variant::SmallTile(_) => crate::codegen::generate_module_small(group, matmul_knobs),
             Variant::Weight(_, format) => {
                 crate::codegen::generate_module_weighted(group, format, matmul_knobs)

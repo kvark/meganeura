@@ -181,10 +181,10 @@ fn cooperative_hardware_subtile_forward_and_input_match_f64() {
 fn bf16_convolution_storage_and_master_gradients() {
     let gpu = gpu();
     assert!(
-        gpu.capabilities()
-            .cooperative_matrix
-            .bf16_f32_shapes
-            .contains(&[16, 16, 16])
+        meganeura::codegen::bf16_cooperative_shape(
+            &gpu.capabilities().cooperative_matrix.bf16_f32_shapes
+        )
+        .is_some()
     );
     crate::support::gpu::assert_protocol_headroom(&gpu);
     let shapes = [
