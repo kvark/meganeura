@@ -449,6 +449,8 @@ fn early_physical_cover(baseline: AxisChoice, attention: &[AttentionChoice]) -> 
 struct CoordinateOrder {
     seeds: usize,
     choices: usize,
+    /// Stable choice indices, prioritized around the incumbent's physical axes.
+    choice_order: Vec<usize>,
     tried: collections::HashSet<(usize, usize)>,
     /// Forms that have run with any choice.
     visited_forms: Vec<bool>,
@@ -461,6 +463,7 @@ impl CoordinateOrder {
         Self {
             seeds,
             choices,
+            choice_order: (0..choices).collect(),
             tried: collections::HashSet::new(),
             visited_forms: vec![false; seeds],
             initial: 0,
@@ -481,7 +484,10 @@ impl CoordinateOrder {
             }
         }
         let (form, choice) = incumbent;
-        let physical = (0..self.choices)
+        let physical = self
+            .choice_order
+            .iter()
+            .copied()
             .map(|c| (form, c))
             .find(|entry| !self.tried.contains(entry));
         // Unvisited forms first; once every form has run, revisit them with the
@@ -642,6 +648,20 @@ impl measure::Frontier for Implementations {
                 continue;
             }
             let incumbent = incumbent.map_or((0, 0), |origin| (origin.form, origin.choice));
+            let active = self.choices[incumbent.1];
+            // Test the incumbent attention layout's other fusion setting, then
+            // explore attention with its winning fusion setting. Expanding both
+            // fusion settings for every losing layout spends the bounded search
+            // before it reaches later attention layouts. Keep every combination
+            // available after these coordinate neighbors.
+            self.order.choice_order.sort_by_key(|&index| {
+                let choice = self.choices[index];
+                (
+                    choice.attention != active.attention,
+                    choice.fuse_dispatches != active.fuse_dispatches,
+                    index,
+                )
+            });
             let (seed_index, choice_index) = self.order.next(incumbent)?;
             let seed = &self.seeds[seed_index];
             let AxisChoice {
@@ -842,6 +862,60 @@ mod tests {
                         interleave: false,
                     }
         }));
+        // The B570 winner needs both a narrower lane vector and interleaving.
+        assert!(programs.iter().any(|p| {
+            p.origin.is_some_and(|origin| origin.form == 0)
+                && p.plan.knobs.flash_ept_cap == 16
+                && p.plan.knobs.flash
+                    == crate::codegen::FlashAttentionShape {
+                        threads: 256,
+                        keys: 8,
+                        interleave: true,
+                    }
+        }));
+    }
+
+    #[test]
+    fn attention_exploration_inherits_winning_fusion() {
+        let mut graph = Graph::new();
+        let q = graph.input("q", &[129, 64]);
+        let k = graph.input("k", &[129, 64]);
+        let v = graph.input("v", &[129, 64]);
+        let y = graph.full_attention(q, k, v, 1, 1, 64);
+        graph.set_outputs(vec![y]);
+        let graph = std::sync::Arc::new(graph);
+        let options = compile::CompileOptions::default();
+        let caps = crate::codegen::CoopCaps::default();
+        let plan = compile::compile_with_caps(&graph, &options, caps, 65536);
+        let seeds = (0..16)
+            .map(|index| Seed {
+                graph: graph.clone(),
+                options: options.clone(),
+                plan: plan.clone(),
+                description: format!("graph={index}"),
+            })
+            .collect();
+        let mut frontier = implementations(seeds, caps, 65536, 512 << 20);
+        let choice = frontier
+            .choices
+            .iter()
+            .position(|c| c.attention == (0, None) && !c.fuse_dispatches)
+            .unwrap();
+        let winner = Some(measure::Origin { form: 0, choice });
+        let mut layouts = collections::HashSet::new();
+        // An unfused incumbent must get the same early attention coverage;
+        // ranking every fused combination first would only help one policy.
+        for _ in 0..BuildSearchOptions::default().max_programs / 2 {
+            let Some(program) = measure::Frontier::next(&mut frontier, winner) else {
+                break;
+            };
+            let choice = frontier.choices[program.origin.unwrap().choice];
+            if choice.attention.1.is_some() {
+                assert!(!choice.fuse_dispatches);
+                layouts.insert(choice.attention);
+            }
+        }
+        assert!(layouts.len() >= 8, "too few distinct attention layouts");
     }
 
     #[test]
