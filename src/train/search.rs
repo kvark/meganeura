@@ -116,7 +116,7 @@ pub struct BuildSearchReport {
 /// must win a whole-program comparison to replace it. Every challenger is
 /// qualified after kernel tuning, before it is timed;
 /// one with kernel classes left to probe is also qualified before tuning. A
-/// challenger with identical dispatches and submission count keeps the incumbent
+/// challenger with an identical execution plan and submission count keeps the incumbent
 /// without warmup or paired timing. A winning challenger is qualified again after
 /// measurement. The selected program is checked before returning only if another
 /// challenger ran since its last check. A failing challenger is discarded; a
