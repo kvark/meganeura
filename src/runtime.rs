@@ -959,6 +959,9 @@ fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
 /// implementation once; preparation builds exactly the selected pipeline.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Variant {
+    /// Explicit BF16 operands, with F32 or rounded BF16 output. K partitions
+    /// are uniform data and do not change the pipeline.
+    CoopBF16(ShaderEntry, bool),
     CoopTiled(
         ShaderEntry,
         crate::codegen::CooperativeMatmulShape,
@@ -1069,6 +1072,7 @@ impl Variant {
         match *self {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
             Variant::Attention(ref e, _, _)
+            | Variant::CoopBF16(ref e, _)
             | Variant::CoopTiled(ref e, _, _, _)
             | Variant::SplitMatmul(ref e, _, _, _)
             | Variant::SpecializedConv(ref e, _, _, _)
@@ -1093,6 +1097,10 @@ impl Variant {
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
+            Variant::CoopBF16(ref e, output_bf16) => {
+                let output = if output_bf16 { "bf16" } else { "f32" };
+                format!("{e:?}:cooperative-bf16-{output}-output")
+            }
             Variant::CoopTiled(ref e, shape, splits, ref prologue) => {
                 format!("{e:?}:native-f32-tiled-{shape:?}-split-k-{splits}:{prologue:?}")
             }
@@ -1209,9 +1217,9 @@ fn bf16_requirements(dispatches: &[Dispatch]) -> (bool, bool) {
     let mut cooperative = false;
     for dispatch in dispatches {
         let matrix = matches!(
-            &dispatch.shader,
-            ShaderEntry::MatMulBF16 { .. } | ShaderEntry::Conv2dBF16 { .. }
-        );
+            dispatch.kernel,
+            crate::compile::Kernel::CooperativeBF16 { .. }
+        ) || matches!(dispatch.shader, ShaderEntry::Conv2dBF16 { .. });
         storage |= matrix
             || matches!(
                 &dispatch.shader,
@@ -1242,7 +1250,12 @@ fn validate_bf16_plan(gpu: &Gpu, plan: &ExecutionPlan) {
 
 #[cfg(test)]
 mod bf16_requirement_tests {
-    use super::{Dispatch, ShaderEntry, bf16_requirements};
+    use super::{Dispatch, ShaderEntry, bf16_requirements, select_variants};
+    use crate::{
+        Graph,
+        codegen::CoopConfig,
+        compile::{self, Kernel},
+    };
 
     #[test]
     fn distinguishes_storage_from_cooperative_products() {
@@ -1256,11 +1269,10 @@ mod bf16_requirement_tests {
         );
         assert_eq!(
             bf16_requirements(&[Dispatch {
-                shader: ShaderEntry::MatMulBF16 {
-                    transpose_a: false,
-                    transpose_b: false,
-                    addend: false,
+                shader: ShaderEntry::MatMul,
+                kernel: crate::compile::Kernel::CooperativeBF16 {
                     output_bf16: false,
+                    splits: 1,
                 },
                 ..Default::default()
             }]),
@@ -1269,6 +1281,69 @@ mod bf16_requirement_tests {
         let mut pointwise = Dispatch::default();
         pointwise.pointwise_storage.bf16_output = true;
         assert_eq!(bf16_requirements(&[pointwise]), (true, false));
+    }
+
+    #[test]
+    fn bf16_storage_survives_matrix_selection_and_tuning() {
+        for [m, n, k] in [[3, 7, 5], [128, 256, 2560], [1024, 1024, 64]] {
+            let mut graph = Graph::new();
+            let a = graph.input("a", &[m, k]);
+            let b = graph.parameter("b", &[k, n]);
+            let a = graph.to_bf16(a);
+            let b = graph.to_bf16(b);
+            let product = graph.matmul(a, b);
+            let rounded = graph.to_bf16(product);
+            let output = graph.from_bf16(rounded);
+            graph.set_outputs(vec![output]);
+            let mut plan = compile::compile(&graph);
+            // Storage remains a constraint even if a caller unlocks schedules.
+            for dispatch in &mut plan.dispatches {
+                dispatch.schedule_locked = false;
+            }
+            let product = plan
+                .dispatches
+                .iter()
+                .find(|d| matches!(d.kernel, Kernel::CooperativeBF16 { .. }))
+                .unwrap();
+            assert!(product.use_coop());
+            assert_eq!(product.shader, ShaderEntry::MatMul);
+            assert_eq!(bf16_requirements(&plan.dispatches), (true, true));
+            for config in [
+                None,
+                Some(CoopConfig {
+                    tile_size: 8,
+                    use_f16_input: false,
+                    compensated: false,
+                }),
+                Some(CoopConfig {
+                    tile_size: 16,
+                    use_f16_input: false,
+                    compensated: false,
+                }),
+                Some(CoopConfig {
+                    tile_size: 16,
+                    use_f16_input: true,
+                    compensated: false,
+                }),
+                Some(CoopConfig {
+                    tile_size: 16,
+                    use_f16_input: true,
+                    compensated: true,
+                }),
+            ] {
+                for allow_raw_f16 in [false, true] {
+                    let mut selected = plan.clone();
+                    select_variants(&mut selected, config.as_ref(), true, allow_raw_f16);
+                    assert_eq!(
+                        selected, plan,
+                        "BF16 buffers and kernels must retain their precision"
+                    );
+                    assert!(
+                        crate::tune::TuneClass::from_dispatch(product, config.as_ref()).is_none()
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1460,14 +1535,12 @@ impl Pipelines {
             matmul_knobs.unroll_k = shape.unroll_k;
         }
         let group = dispatch.shader.shader_group();
-        if matches!(
-            group,
-            ShaderGroup::MatMulBF16 { .. } | ShaderGroup::Conv2dBF16 { .. }
-        ) && !gpu
-            .capabilities()
-            .cooperative_matrix
-            .bf16_f32_shapes
-            .contains(&[16, 16, 16])
+        if (matches!(key, Variant::CoopBF16(..)) || matches!(group, ShaderGroup::Conv2dBF16 { .. }))
+            && !gpu
+                .capabilities()
+                .cooperative_matrix
+                .bf16_f32_shapes
+                .contains(&[16, 16, 16])
         {
             return Err(
                 "BF16 matrix products require native 16x16x16 BF16/F32 cooperative matrices"
@@ -1479,6 +1552,9 @@ impl Pipelines {
         let cooperative =
             || *coop_config.expect("cooperative dispatch needs a qualified device configuration");
         let module = match *key {
+            Variant::CoopBF16(_, output_bf16) => {
+                crate::codegen::generate_module_coop_bf16(group, output_bf16)
+            }
             Variant::CoopTiled(_, shape, splits, _) => {
                 let config = cooperative();
                 if config.tile_size != 16 || config.use_f16_input || config.compensated {
@@ -1733,6 +1809,9 @@ impl Pipelines {
     /// which unrelated pipelines happen to have been compiled.
     fn key(dispatch: &Dispatch) -> Variant {
         let entry = dispatch.shader.clone();
+        if let crate::compile::Kernel::CooperativeBF16 { output_bf16, .. } = dispatch.kernel {
+            return Variant::CoopBF16(entry, output_bf16);
+        }
         if let crate::compile::Kernel::CooperativeTiled { shape, splits } = dispatch.kernel {
             return Variant::CoopTiled(
                 entry,
@@ -2107,7 +2186,6 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
             bindings: Vec::new(),
         },
         ShaderEntry::MatMul
-        | ShaderEntry::MatMulBF16 { addend: false, .. }
         | ShaderEntry::MatMulAT
         | ShaderEntry::MatMulBT
         | ShaderEntry::MatMulGemv
@@ -2119,7 +2197,6 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::BatchMatMulAT
         | ShaderEntry::BatchMatMulBT => MatMulData::layout(),
         ShaderEntry::FusedMatMulAdd
-        | ShaderEntry::MatMulBF16 { addend: true, .. }
         | ShaderEntry::FusedMatMulATAdd
         | ShaderEntry::FusedMatMulBTAdd
         | ShaderEntry::MatMulGemvBTAdd
@@ -2310,8 +2387,8 @@ pub(crate) fn select_variants(
     // Apply RmsNorm+MatMul prologue fusion only after per-dispatch coop
     // selection. A coop-capable device can still route small matmuls to a
     // scalar pipeline, which has no prologue implementation. The fusion
-    // pass filters on `use_coop` and records its factor buffers as declared
-    // inputs for scheduling and memory planning. Debug sessions skip it —
+    // pass filters for kernels that support prologues and records factor
+    // buffers as inputs for scheduling and memory planning. Debug sessions skip it —
     // dispatch-level fusion is numerics-neutral, and keeping the RmsNorm
     // output materialized is the point of debug mode.
     if fuse_prologues {
@@ -4726,6 +4803,64 @@ mod variant_tests {
         assert!(matches!(f16, Variant::CoopPrologue(..)));
         assert_ne!(f32, f16, "mixed-storage prologues must not reuse a shader");
         assert_ne!(f32.label(), f16.label());
+    }
+
+    #[test]
+    fn bf16_matmul_pipeline_keys_distinguish_operand_and_output_storage() {
+        use crate::compile::{Kernel, WeightFormat};
+        let mut keys = std::collections::HashSet::new();
+        for entry in [
+            ShaderEntry::MatMul,
+            ShaderEntry::MatMulAT,
+            ShaderEntry::MatMulBT,
+            ShaderEntry::FusedMatMulAdd,
+            ShaderEntry::FusedMatMulATAdd,
+            ShaderEntry::FusedMatMulBTAdd,
+        ] {
+            for (kernel, weight_format) in [
+                (Kernel::Default, WeightFormat::F32),
+                (Kernel::Cooperative, WeightFormat::F32),
+                (Kernel::Cooperative, WeightFormat::F16),
+                (
+                    Kernel::CooperativeBF16 {
+                        output_bf16: false,
+                        splits: 1,
+                    },
+                    WeightFormat::F32,
+                ),
+                (
+                    Kernel::CooperativeBF16 {
+                        output_bf16: true,
+                        splits: 1,
+                    },
+                    WeightFormat::F32,
+                ),
+            ] {
+                let mut dispatch = Dispatch {
+                    shader: entry.clone(),
+                    kernel,
+                    weight_format,
+                    ..Default::default()
+                };
+                let key = Pipelines::key(&dispatch);
+                assert!(
+                    keys.insert(key.clone()),
+                    "different storage must not share a pipeline"
+                );
+                if let Kernel::CooperativeBF16 {
+                    output_bf16: false,
+                    ref mut splits,
+                } = dispatch.kernel
+                {
+                    *splits = 4;
+                    assert_eq!(
+                        Pipelines::key(&dispatch),
+                        key,
+                        "K partitions are uniform data"
+                    );
+                }
+            }
+        }
     }
 
     /// A dispatch whose epilogue ops were folded into the matmul has no

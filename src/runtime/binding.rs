@@ -18,7 +18,7 @@ use super::{
     reduction_is_dynamic,
 };
 use crate::compile::{
-    BufferRef, CachedBlockAttentionParams, Dispatch, DispatchParams, ShaderEntry,
+    BufferRef, CachedBlockAttentionParams, Dispatch, DispatchParams, Kernel, ShaderEntry,
 };
 use crate::kernels::attention_grad::{AttentionGrad, Part as AttentionGradPart};
 
@@ -28,8 +28,8 @@ fn dense_params(dispatch: &Dispatch) -> MatMulParams {
         m,
         n,
         k,
-        _pad: match dispatch.shader {
-            ShaderEntry::MatMulBF16 { .. } => dispatch.params[3],
+        _pad: match dispatch.kernel {
+            Kernel::CooperativeBF16 { splits, .. } => splits,
             _ => dispatch.workgroups[1],
         },
     }
@@ -254,8 +254,7 @@ impl Session {
             | ShaderEntry::MatMulGemv
             | ShaderEntry::MatMulAT
             | ShaderEntry::MatMulBT
-            | ShaderEntry::MatMulGemvBT
-            | ShaderEntry::MatMulBF16 { addend: false, .. } => {
+            | ShaderEntry::MatMulGemvBT => {
                 pc.bind(
                     0,
                     &MatMulData {
@@ -269,7 +268,6 @@ impl Session {
             ShaderEntry::FusedMatMulAdd
             | ShaderEntry::MatMulGemvAdd
             | ShaderEntry::FusedMatMulATAdd
-            | ShaderEntry::MatMulBF16 { addend: true, .. }
             | ShaderEntry::FusedMatMulBTAdd
             | ShaderEntry::MatMulGemvBTAdd => {
                 pc.bind(
@@ -1223,13 +1221,16 @@ mod tests {
         for addend in [false, true] {
             for splits in [1, 4, 16] {
                 let dispatch = Dispatch {
-                    shader: ShaderEntry::MatMulBF16 {
-                        transpose_a: false,
-                        transpose_b: false,
-                        addend,
-                        output_bf16: false,
+                    shader: if addend {
+                        ShaderEntry::FusedMatMulAdd
+                    } else {
+                        ShaderEntry::MatMul
                     },
-                    params: vec![128, 256, 2560, splits],
+                    kernel: Kernel::CooperativeBF16 {
+                        output_bf16: false,
+                        splits,
+                    },
+                    params: vec![128, 2560, 256, 0],
                     workgroups: [4, 8, splits],
                     ..Default::default()
                 };

@@ -1,10 +1,12 @@
 //! Dense matrix products: `C = A·B`, `Aᵀ·B` and `A·Bᵀ`, each optionally
 //! `+ D`.
 //!
-//! The compiler emits each with the 64-wide scalar tile kernel. Session
+//! F32 products start with the 64-wide scalar tile kernel. Session
 //! construction then picks among the paths here, and tuning challenges the
 //! choice by measurement; both ask [`cooperative_geometry`] whether a
 //! cooperative kernel is legal, so the two cannot drift apart.
+//! Explicit BF16 storage fixes a BF16 cooperative implementation of the same
+//! product; F32/F16 candidates cannot replace its storage contract.
 //!
 //! Single-row products (GEMV), block-diagonal and batch-major layouts and
 //! convolutions are separate computations with their own kernels.
@@ -72,7 +74,7 @@ pub(crate) struct Problem {
     /// A fused epilogue that binds buffers of its own, which only the
     /// scalar kernels stage.
     pub epilogue_inputs: bool,
-    /// A measured schedule pinned a scalar or split-K kernel.
+    /// A measured schedule or explicit storage policy fixed the kernel.
     pub pinned: bool,
     /// Workgroups of the compiled 64-wide tiling.
     pub compiled_workgroups: u32,
@@ -121,7 +123,9 @@ impl Problem {
             pinned: dispatch.scalar_matmul().is_some()
                 || matches!(
                     dispatch.kernel,
-                    Kernel::SplitMatmul { .. } | Kernel::CooperativeTiled { .. }
+                    Kernel::SplitMatmul { .. }
+                        | Kernel::CooperativeTiled { .. }
+                        | Kernel::CooperativeBF16 { .. }
                 ),
             compiled_workgroups: dispatch.workgroups.iter().product(),
         })
@@ -172,7 +176,7 @@ impl Family for Path {
                     return Err("no cooperative matrices");
                 };
                 if problem.pinned {
-                    Err("a schedule pinned a scalar kernel")
+                    Err("the kernel is fixed by a schedule or storage policy")
                 } else if problem.layout.transposed_with_addend() && config.use_f16_input {
                     Err("f16 transposed addends are not qualified for automatic promotion")
                 } else if config.use_f16_input
@@ -203,7 +207,7 @@ impl Family for Path {
             }
             Path::SmallTile => {
                 if problem.pinned {
-                    Err("a schedule pinned a scalar kernel")
+                    Err("the kernel is fixed by a schedule or storage policy")
                 } else if problem.reduced_storage {
                     Err("packed weights keep their compiled kernel")
                 } else if problem.layout.transposed_with_addend() {
@@ -361,7 +365,7 @@ mod tests {
                     ..big
                 },
                 F32,
-                "a schedule pinned a scalar kernel",
+                "the kernel is fixed by a schedule or storage policy",
             ),
             (
                 Problem {

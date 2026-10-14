@@ -5,6 +5,8 @@
   matrices. Conversion and connected pointwise boundaries use two-byte storage;
   dense and convolution products accumulate in F32, preserve F32 master
   parameters and gradients, and split long underfilled products across K.
+  Dense BF16 products share the existing matmul groups and bindings, with
+  explicit storage precision carried by their cooperative kernel variant.
   Unsupported devices retain the existing F32/F16 paths because no graph is
   narrowed automatically.
 - The Blade update conditionally enables Vulkan memory-model emission for every

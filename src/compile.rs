@@ -318,13 +318,6 @@ pub enum ShaderEntry {
     ToF16,
     ToBF16,
     FromBF16,
-    /// Explicit BF16 operands and F32 accumulation.
-    MatMulBF16 {
-        transpose_a: bool,
-        transpose_b: bool,
-        addend: bool,
-        output_bf16: bool,
-    },
     RoPE,
     RoPEGrad,
     LayerNorm,
@@ -457,7 +450,6 @@ impl ShaderEntry {
         match *self {
             ShaderEntry::Generated => "pointwise",
             ShaderEntry::MatMul
-            | ShaderEntry::MatMulBF16 { .. }
             | ShaderEntry::MatMulAT
             | ShaderEntry::MatMulBT
             | ShaderEntry::BlockMatMul
@@ -633,17 +625,6 @@ impl ShaderEntry {
             ShaderEntry::ToF16 => ShaderGroup::ToF16,
             ShaderEntry::ToBF16 => ShaderGroup::ToBF16,
             ShaderEntry::FromBF16 => ShaderGroup::FromBF16,
-            ShaderEntry::MatMulBF16 {
-                transpose_a,
-                transpose_b,
-                addend,
-                output_bf16,
-            } => ShaderGroup::MatMulBF16 {
-                transpose_a,
-                transpose_b,
-                addend,
-                output_bf16,
-            },
             ShaderEntry::RoPE => ShaderGroup::RoPE,
             ShaderEntry::RoPEGrad => ShaderGroup::RoPEGrad,
             ShaderEntry::LayerNorm => ShaderGroup::LayerNorm,
@@ -767,7 +748,6 @@ impl ShaderEntry {
             ShaderEntry::Embedding => "main",
             ShaderEntry::ToF16 => "main",
             ShaderEntry::ToBF16 | ShaderEntry::FromBF16 => "main",
-            ShaderEntry::MatMulBF16 { .. } => "main",
             ShaderEntry::RoPE => "main",
             ShaderEntry::RoPEGrad => "main",
             ShaderEntry::LayerNorm => "main",
@@ -1247,6 +1227,13 @@ pub enum Kernel {
         interleave_columns: bool,
     },
     Cooperative,
+    /// Explicit BF16 operands, F32 accumulation and checked partial tiles.
+    /// Multiple K partitions write F32 partials for a following SumRows;
+    /// rounding to BF16 is only legal after that reduction.
+    CooperativeBF16 {
+        output_bf16: bool,
+        splits: u32,
+    },
     /// Four subgroup tiles sharing aligned native-f32 operands. More than
     /// one K partition requires a following SumRows dispatch.
     CooperativeTiled {
@@ -1278,7 +1265,6 @@ impl Dispatch {
             | ShaderEntry::MatMulGemvAdd
             | ShaderEntry::FusedMatMulAdd => Some((a, c, b)),
             ShaderEntry::MatMulAT
-            | ShaderEntry::MatMulBF16 { .. }
             | ShaderEntry::MatMulBT
             | ShaderEntry::MatMulGemvBT
             | ShaderEntry::MatMulGemvBTAdd
@@ -1297,7 +1283,10 @@ impl Dispatch {
     pub fn use_coop(&self) -> bool {
         matches!(
             self.kernel,
-            Kernel::Cooperative | Kernel::CooperativeCompensated | Kernel::CooperativeTiled { .. }
+            Kernel::Cooperative
+                | Kernel::CooperativeBF16 { .. }
+                | Kernel::CooperativeCompensated
+                | Kernel::CooperativeTiled { .. }
         )
     }
 
@@ -2705,18 +2694,18 @@ pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
 
     for (i, d) in plan.dispatches.iter().enumerate() {
         // Find MatMul dispatches whose input_buffers[0] comes from a
-        // single-consumer RmsNorm. The scalar pipeline cannot execute a
-        // matmul prologue, so only transform dispatches that runtime policy
-        // has already selected for cooperative matrices.
-        if !d.use_coop()
-            || !matches!(
-                d.shader,
-                ShaderEntry::MatMul
-                    | ShaderEntry::MatMulAT
-                    | ShaderEntry::FusedMatMulAdd
-                    | ShaderEntry::FusedMatMulATAdd
-            )
-        {
+        // single-consumer RmsNorm. Only the F32/F16 cooperative kernels
+        // support prologues; explicit BF16 staging preserves its conversions.
+        if !matches!(
+            d.kernel,
+            Kernel::Cooperative | Kernel::CooperativeCompensated | Kernel::CooperativeTiled { .. }
+        ) || !matches!(
+            d.shader,
+            ShaderEntry::MatMul
+                | ShaderEntry::MatMulAT
+                | ShaderEntry::FusedMatMulAdd
+                | ShaderEntry::FusedMatMulATAdd
+        ) {
             continue;
         }
         // Skip GEMV variants (M=1) — those use a different kernel path.

@@ -1,4 +1,7 @@
-use meganeura::{Graph, compile::ShaderEntry};
+use meganeura::{
+    Graph,
+    compile::{Kernel, ShaderEntry},
+};
 
 fn graph(m: usize, n: usize, k: usize, layout: usize, add: bool, round: bool) -> Graph {
     let mut graph = Graph::new();
@@ -80,15 +83,29 @@ fn partitions_reduce_before_rounding_and_leave_addends_unsplit() {
             let index = plan
                 .dispatches
                 .iter()
-                .position(|d| matches!(d.shader, ShaderEntry::MatMulBF16 { .. }))
+                .position(|d| matches!(d.kernel, Kernel::CooperativeBF16 { .. }))
                 .unwrap();
             let product = &plan.dispatches[index];
             let splits = if add { 1 } else { 4 };
-            assert_eq!(product.params, [33, 65, 1031, splits]);
+            assert_eq!(product.mnk(), Some((33, 65, 1031)));
             assert_eq!(product.workgroups, [2, 3, splits]);
-            assert!(matches!(product.shader,
-                ShaderEntry::MatMulBF16 { addend, output_bf16, .. }
-                if addend == add && output_bf16 == add));
+            let expected_entry = match (layout, add) {
+                (0, false) => ShaderEntry::MatMul,
+                (0, true) => ShaderEntry::FusedMatMulAdd,
+                (1, false) => ShaderEntry::MatMulAT,
+                (1, true) => ShaderEntry::FusedMatMulATAdd,
+                (2, false) => ShaderEntry::MatMulBT,
+                (2, true) => ShaderEntry::FusedMatMulBTAdd,
+                _ => unreachable!(),
+            };
+            assert_eq!(product.shader, expected_entry);
+            assert_eq!(
+                product.kernel,
+                Kernel::CooperativeBF16 {
+                    output_bf16: add,
+                    splits
+                }
+            );
             if !add {
                 let sum = &plan.dispatches[index + 1];
                 assert_eq!(sum.shader, ShaderEntry::SumRows);
@@ -138,9 +155,12 @@ fn partitions_and_outputs_match_full_f64() {
                     .plan()
                     .dispatches
                     .iter()
-                    .find(|d| matches!(d.shader, ShaderEntry::MatMulBF16 { .. }))
+                    .find(|d| matches!(d.kernel, Kernel::CooperativeBF16 { .. }))
                     .unwrap();
-                let splits = product.params[3] as usize;
+                let Kernel::CooperativeBF16 { splits, .. } = product.kernel else {
+                    unreachable!()
+                };
+                let splits = splits as usize;
                 let partial_buffer = product.output_buffer;
                 assert!(splits > 1);
                 // Change feeds and reuse the same poisoned session, not just fresh allocations.
