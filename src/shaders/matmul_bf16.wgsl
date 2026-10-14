@@ -16,14 +16,14 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     $RANGE
     let row = group.x * 32u;
     let col = group.y * 32u;
-    // Four logical matrix tiles, independent of the device subgroup width.
+    // Cover the 32x32 output block with device-supported matrix tiles.
     // Extra subgroups compute a valid tile but do not store it, keeping the
     // cooperative operations and workgroup barriers in uniform control flow.
-    for (var base = 0u; base < 4u; base += 128u / subgroup_size) {
+    for (var base = 0u; base < $TILESu; base += 128u / subgroup_size) {
         let tile = base + subgroup;
-        let a_offset = ((tile % 4u) / 2u) * 16u * 32u;
-        let b_offset = (tile % 2u) * 16u;
-        var accumulator = coop_mat16x16<f32, C>();
+        let a_offset = ((tile % $TILESu) / $TILES_Nu) * $TILE_Mu * 32u;
+        let b_offset = (tile % $TILES_Nu) * $TILE_Nu;
+        var accumulator = $C_TILE();
         for (var start = first; start < end; start += 32u) {
             for (var index = lane; index < 1024u; index += 128u) {
                 let ar = row + index / 32u;
@@ -38,15 +38,15 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
                 stage_b[index] = b;
             }
             workgroupBarrier();
-            let a0 = coopLoadT<coop_mat16x16<bf16, A>>(&stage_a[a_offset], 32u);
-            let b0 = coopLoadT<coop_mat16x16<bf16, B>>(&stage_b[b_offset], 32u);
+            let a0 = coopLoadT<$A_TILE>(&stage_a[a_offset], 32u);
+            let b0 = coopLoadT<$B_TILE>(&stage_b[b_offset], 32u);
             accumulator = coopMultiplyAdd(a0, b0, accumulator);
-            let a1 = coopLoadT<coop_mat16x16<bf16, A>>(&stage_a[a_offset + 16u], 32u);
-            let b1 = coopLoadT<coop_mat16x16<bf16, B>>(&stage_b[b_offset + 512u], 32u);
+            let a1 = coopLoadT<$A_TILE>(&stage_a[a_offset + 16u], 32u);
+            let b1 = coopLoadT<$B_TILE>(&stage_b[b_offset + 512u], 32u);
             accumulator = coopMultiplyAdd(a1, b1, accumulator);
             workgroupBarrier();
         }
-        if tile < 4u { coopStoreT(accumulator, &result[a_offset + b_offset], 32u); }
+        if tile < $TILESu { coopStoreT(accumulator, &result[a_offset + b_offset], 32u); }
     }
     workgroupBarrier();
     for (var offset = lane; offset < 1024u; offset += 128u) {

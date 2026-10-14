@@ -775,7 +775,9 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         ShaderGroup::RoPEGrad => ShaderModule::new(
             &include_str!("shaders/rope_grad.wgsl").replace("$PARAMS", ROPE_PARAMS_WGSL),
         ),
-        ShaderGroup::Conv2dBF16 { output_bf16, .. } => bf16::generate(group, output_bf16),
+        ShaderGroup::Conv2dBF16 { output_bf16, .. } => {
+            bf16::generate(group, output_bf16, [16, 16, 16])
+        }
         ShaderGroup::ToBF16 | ShaderGroup::FromBF16 => {
             let narrowing = group == ShaderGroup::ToBF16;
             let source = preprocess(
@@ -966,11 +968,29 @@ pub fn generate_module_coop(group: ShaderGroup, config: &CoopConfig) -> ShaderMo
 /// The group supplies the usual transpose/addend layout; the kernel supplies
 /// storage precision. Checked scalar stores support arbitrary output tails.
 pub fn generate_module_coop_bf16(group: ShaderGroup, output_bf16: bool) -> ShaderModule {
+    generate_module_coop_bf16_with_shape(group, output_bf16, [16, 16, 16])
+}
+
+/// Select a supported native BF16/F32 M×N×K tile. Prefer the existing square
+/// path when available; Xe2 exposes a rectangular 8×16×16 product instead.
+/// Both use the same 32×32 output block and whole 32-element K partitions.
+pub fn bf16_cooperative_shape(shapes: &[[u32; 3]]) -> Option<[u32; 3]> {
+    [[16, 16, 16], [8, 16, 16]]
+        .into_iter()
+        .find(|shape| shapes.contains(shape))
+}
+
+/// Generate a dense or implicit-GEMM BF16 product for an advertised device tile.
+pub fn generate_module_coop_bf16_with_shape(
+    group: ShaderGroup,
+    output_bf16: bool,
+    shape: [u32; 3],
+) -> ShaderModule {
     assert!(
-        coop_shape(group).is_some(),
+        coop_shape(group).is_some() || matches!(group, ShaderGroup::Conv2dBF16 { .. }),
         "no cooperative form for {group:?}"
     );
-    bf16::generate(group, output_bf16)
+    bf16::generate(group, output_bf16, shape)
 }
 
 /// [`generate_module_coop`] reading B in `format`: f32, or f16 with f16-input
