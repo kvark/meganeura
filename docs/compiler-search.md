@@ -97,9 +97,11 @@ incumbent. Its tuned version, including memoized decisions, is a separate
 challenger that must win whole-program timing to replace it. Both count toward
 `max_programs`; a one-program search returns only the untuned fallback. Each
 challenger is qualified after kernel tuning, before it is timed, and also before
-tuning when kernel classes remain to be probed. If its dispatches and submission
-count match the incumbent's, it records `KeepBaseline` without warmup or paired
-timing. Qualification still checks the initialized inputs and state, and the
+tuning when kernel classes remain to be probed. If its complete execution plan
+and submission count match the incumbent's, it records `KeepBaseline` without
+warmup or paired timing. Equality includes shader tuning knobs, buffer layouts
+and constants: equal dispatch lists can still generate different shaders.
+Qualification still checks the initialized inputs and state, and the
 trial still counts toward the program and patience bounds. Only a winning
 challenger is qualified again after measurement; the selected program is
 requalified before returning only if another challenger ran since its last
@@ -208,8 +210,11 @@ construction already probes single-pass kernels. This is coverage ordering, not
 a claimed prediction of latency. After the first three graph baselines, the
 frontier alternates new graph forms using the incumbent's physical choice with
 new physical choices on the incumbent's graph. A winner on either axis carries
-over to the other. This reaches distinct attention layouts within a bounded
-budget instead of repeatedly measuring the same few layouts on every graph.
+over to the other. Attention exploration first checks the incumbent layout's
+other fusion setting, then uses the winning fusion setting for new layouts.
+Other combinations remain available after these coordinate neighbors. This
+reaches distinct attention layouts within a bounded budget instead of repeating
+both fusion settings for every losing layout or every layout on every graph.
 Once both axes around the incumbent are exhausted, remaining pairs follow in
 diagonal order. Time and program bounds are unchanged; a bounded run does not
 exhaust every graph/physical interaction.

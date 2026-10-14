@@ -28,6 +28,9 @@
   identical execution plans and submission count skip warmup and paired timing.
   Plan equality includes shader tuning knobs, buffer layouts and constants;
   equal dispatch lists alone must not suppress different attention layouts.
+  Attention exploration inherits the incumbent's fusion setting and probes its
+  alternate setting when a layout wins, before expanding the remaining pairs.
+  This reaches more distinct layouts within the same search bounds.
   The memory bound counts inherited immutable parameters once across the pair;
   written parameters and persistent-state snapshots remain private.
   `build_measured_with_inputs` refreshes representative inputs before every
