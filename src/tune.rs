@@ -55,6 +55,11 @@ pub struct TuneClass {
     /// into the partial buffer, whose size is the output binding's.
     #[serde(default)]
     pub split_k: bool,
+    /// Operand, multiplication and output types of a checked typed product.
+    /// Part of the key: they change the kernel and the bytes behind each
+    /// binding, so no winner transfers between precisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matrix_types: Option<crate::codegen::MatrixTypes>,
     /// Placement of A, B, addend (false if absent), and output, respectively.
     pub device_local: [bool; 4],
     /// Declared bytes for A, B, optional addend, output, in binding order.
@@ -209,6 +214,12 @@ pub enum MatmulTile {
         shape: crate::codegen::CooperativeMatmulShape,
         splits: u32,
     },
+    /// Checked typed cooperative tiles at a K partition count. The class key
+    /// holds the types. More than one partition writes F32 partials that a
+    /// following SumRows adds, which only a split product has.
+    CooperativeChecked {
+        splits: u32,
+    },
     /// A K-split GEMV at one workgroup width and cross-lane reduction.
     ///
     /// Keeps the shader entry and buffer layout. Width and reduction apply
@@ -338,6 +349,9 @@ impl MatmulTile {
                 {
                     Some(Self::CooperativeTiled { shape, splits })
                 }
+                Kernel::CooperativeTyped { splits, .. } => {
+                    Some(Self::CooperativeChecked { splits })
+                }
                 _ => None,
             }
         }
@@ -365,6 +379,14 @@ impl MatmulTile {
     }
 
     pub(crate) fn configure(self, dispatch: &mut Dispatch) {
+        if let Self::CooperativeChecked { splits } = self {
+            // Only the partition count is a candidate; storage stays.
+            let crate::compile::Kernel::CooperativeTyped { types, .. } = dispatch.kernel else {
+                unreachable!("checked partitions apply to typed products")
+            };
+            dispatch.kernel = crate::compile::Kernel::CooperativeTyped { types, splits };
+            return;
+        }
         if let Self::Gemv(shape) = self {
             dispatch.kernel = crate::compile::Kernel::Gemv {
                 shape,
@@ -399,7 +421,7 @@ impl MatmulTile {
                 k_tile,
                 interleave_columns,
             },
-            Self::Gemv(_) => unreachable!(),
+            Self::Gemv(_) | Self::CooperativeChecked { .. } => unreachable!(),
         };
     }
 
@@ -431,6 +453,10 @@ impl MatmulTile {
             Self::CooperativeTiled { shape, splits } => {
                 return [class.m / 64, class.n / shape.columns, splits];
             }
+            // Checked tiles use X for rows, Y for columns, over 32x32 blocks.
+            Self::CooperativeChecked { splits } => {
+                return [class.m.div_ceil(32), class.n.div_ceil(32), splits];
+            }
             Self::CooperativeF32 { .. } => {
                 let tile = self.coop_config().unwrap().matmul_output_tile();
                 // Cooperative tiles use X for rows, Y for columns.
@@ -447,7 +473,29 @@ impl MatmulTile {
     }
 
     pub(crate) fn buffer_sizes(self, class: &TuneClass) -> Option<Vec<usize>> {
-        if class.split_k && !matches!(self, Self::CooperativeTiled { .. }) {
+        if let Some(types) = class.matrix_types {
+            // A typed product keeps its kernel and storage: only its K
+            // partition count is a candidate, and partials are F32.
+            let Self::CooperativeChecked { splits } = self else {
+                return None;
+            };
+            if splits == 0
+                || (splits > 1) != class.split_k
+                || (splits > 1
+                    && (splits > class.k.div_ceil(32)
+                        || class.has_addend()
+                        || types.output != crate::DType::F32))
+            {
+                return None;
+            }
+            let mut sizes = class.buffer_sizes()?;
+            *sizes.last_mut()? = sizes.last()?.checked_mul(splits as usize)?;
+            return crate::compile::workgroups_within_portable_limits(self.workgroups(class))
+                .then_some(sizes);
+        }
+        if matches!(self, Self::CooperativeChecked { .. })
+            || (class.split_k && !matches!(self, Self::CooperativeTiled { .. }))
+        {
             return None;
         }
         if let Self::Scalar(shape) = self {
@@ -580,10 +628,6 @@ impl TuneClass {
                 | ShaderEntry::Conv2dGradWeightGemmSmall
                 | ShaderEntry::Conv2dGradWeightGemm16
         ) || dispatch.use_coop_compensated()
-            || matches!(
-                dispatch.kernel,
-                crate::compile::Kernel::CooperativeTyped { .. }
-            )
             || (dispatch.use_coop() && dispatch.weight_format.uses_reduced_storage())
             || dispatch.horizontal_batch >= 2
             || dispatch.matmul_prologue.is_some()
@@ -596,10 +640,11 @@ impl TuneClass {
         {
             return None;
         }
-        // Tiled products dispatch one Z layer per K partition.
-        let partitions = match dispatch.kernel {
-            crate::compile::Kernel::CooperativeTiled { splits, .. } => splits,
-            _ => 1,
+        // Tiled and typed products dispatch one Z layer per K partition.
+        let (partitions, matrix_types) = match dispatch.kernel {
+            crate::compile::Kernel::CooperativeTiled { splits, .. } => (splits, None),
+            crate::compile::Kernel::CooperativeTyped { types, splits } => (splits, Some(types)),
+            _ => (1, None),
         };
         let shader = match dispatch.shader {
             ShaderEntry::Conv2dGemmSmall | ShaderEntry::Conv2dGemm16 => ShaderEntry::Conv2dGemm,
@@ -691,6 +736,7 @@ impl TuneClass {
                 .map(|rn| rn.eps_bits)
                 .unwrap_or(0),
             split_k: partitions > 1,
+            matrix_types,
             device_local: [false; 4],
             binding_bytes: Vec::new(),
         };
@@ -736,6 +782,23 @@ impl TuneClass {
     /// not just host allocation overflow.
     pub(crate) fn buffer_sizes(&self) -> Option<Vec<usize>> {
         let bytes = |a: u32, b: u32| usize::try_from(a.checked_mul(b)?).ok()?.checked_mul(4);
+        if let Some(types) = self.matrix_types {
+            // Logical extents: an odd count of halfwords is not word-padded.
+            let typed = |a: u32, b: u32, ty| {
+                usize::try_from(a.checked_mul(b)?)
+                    .ok()?
+                    .checked_mul(crate::codegen::MatrixTypes::bytes(ty))
+            };
+            let mut sizes = vec![
+                typed(self.m, self.k, types.a)?,
+                typed(self.k, self.n, types.b)?,
+            ];
+            if self.has_addend() {
+                sizes.push(bytes(self.m, self.n)?);
+            }
+            sizes.push(typed(self.m, self.n, types.output)?);
+            return Some(sizes);
+        }
         if let Some(s) = self.conv2d {
             let [input, weight, upstream] = s.elements()?;
             if self.shader == ShaderEntry::Conv2dGemm {
@@ -849,6 +912,15 @@ impl TuneClass {
                 }
             }
             return out
+                .into_iter()
+                .filter(|&tile| tile != initial && tile.fits(self))
+                .collect();
+        }
+        if let MatmulTile::CooperativeChecked { .. } = initial {
+            // Typed storage fixes the kernel; partition counts must match the
+            // product's SumRows contract and fit its partial buffer.
+            return [1, 2, 4, 8, 16]
+                .map(|splits| MatmulTile::CooperativeChecked { splits })
                 .into_iter()
                 .filter(|&tile| tile != initial && tile.fits(self))
                 .collect();

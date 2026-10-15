@@ -1585,16 +1585,17 @@ mod precision_requirement_tests {
             let rounded = graph.to_bf16(product);
             let output = graph.from_bf16(rounded);
             graph.set_outputs(vec![output]);
-            let mut plan = compile::compile(&graph);
-            // Storage remains a constraint even if a caller unlocks schedules.
-            for dispatch in &mut plan.dispatches {
-                dispatch.schedule_locked = false;
-            }
+            // Storage, not a schedule lock, keeps the typed kernel.
+            let plan = compile::compile(&graph);
+            assert!(plan.dispatches.iter().all(|d| !d.schedule_locked));
             let product = plan
                 .dispatches
                 .iter()
                 .find(|d| matches!(d.kernel, Kernel::CooperativeTyped { .. }))
                 .unwrap();
+            let Kernel::CooperativeTyped { types, splits } = product.kernel else {
+                unreachable!()
+            };
             assert!(product.use_coop());
             assert_eq!(product.shader, ShaderEntry::MatMul);
             assert_eq!(
@@ -1631,9 +1632,22 @@ mod precision_requirement_tests {
                         selected, plan,
                         "BF16 buffers and kernels must retain their precision"
                     );
-                    assert!(
-                        crate::tune::TuneClass::from_dispatch(product, config.as_ref()).is_none()
+                    // Tuning keeps the types in the class key and varies only
+                    // the K partition count.
+                    let class = crate::tune::TuneClass::from_dispatch(product, config.as_ref())
+                        .expect("typed products are tunable");
+                    assert_eq!(class.matrix_types, Some(types));
+                    let initial =
+                        crate::tune::MatmulTile::selected(product, config.as_ref()).unwrap();
+                    assert_eq!(
+                        initial,
+                        crate::tune::MatmulTile::CooperativeChecked { splits }
                     );
+                    let mut class = class;
+                    class.binding_bytes = initial.buffer_sizes(&class).unwrap();
+                    assert!(class.challengers(initial, config.as_ref()).iter().all(
+                        |tile| matches!(tile, crate::tune::MatmulTile::CooperativeChecked { .. })
+                    ));
                 }
             }
         }

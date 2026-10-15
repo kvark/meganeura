@@ -30,7 +30,7 @@ pub struct KernelMemo {
 
 // Bump when kernel generation, qualification or decision semantics change,
 // including changes between package releases. This also versions the memo schema.
-const KERNEL_MEMO_REVISION: u32 = 2;
+const KERNEL_MEMO_REVISION: u32 = 3;
 
 /// What a recorded decision depends on besides its class key.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -349,6 +349,12 @@ pub(super) fn tile_module(
                 entry.shader_group(),
                 &tile.coop_config().expect("cooperative candidate"),
             ),
+            MatmulTile::CooperativeChecked { .. } => {
+                let crate::compile::Kernel::CooperativeTyped { types, .. } = dispatch.kernel else {
+                    unreachable!("checked partitions apply to typed products")
+                };
+                crate::codegen::generate_module_coop_typed(entry.shader_group(), types)
+            }
             MatmulTile::SpecializedConv { .. } | MatmulTile::Gemv(_) | MatmulTile::Scalar(_) => {
                 unreachable!()
             }
@@ -378,12 +384,43 @@ impl SearchClass {
         for &index in &self.members {
             tile.apply(&mut dispatches[index], &self.key);
         }
-        if let MatmulTile::CooperativeTiled { splits, .. } = tile {
+        if let MatmulTile::CooperativeTiled { splits, .. }
+        | MatmulTile::CooperativeChecked { splits } = tile
+        {
             for &index in &self.reductions {
                 dispatches[index].params[0] = splits;
             }
         }
     }
+}
+
+/// Keep the classes tuning can visit: in scope, with at least one challenger
+/// that fits the device's shared memory. A class with nothing to compare can
+/// only keep its incumbent, which is also all a memoized decision for it can
+/// hold, so it must not take a class-limit slot or report pending work, as an
+/// unsplit typed product would. Returns the dispatches left out.
+fn retain_tunable_classes(
+    classes: &mut Vec<SearchClass>,
+    scope: &crate::tune::TuneScope,
+    shared_limit: u32,
+) -> usize {
+    for class in classes.iter_mut() {
+        class.challengers.retain(|tile| match *tile {
+            MatmulTile::CooperativeTiled { shape, .. } => {
+                shared_limit == 0 || shape.shared_bytes() <= shared_limit
+            }
+            _ => true,
+        });
+    }
+    let mut left_out = 0;
+    classes.retain(|class| {
+        let tunable = !class.challengers.is_empty() && scope.includes(&class.key);
+        if !tunable {
+            left_out += class.members.len();
+        }
+        tunable
+    });
+    left_out
 }
 
 struct SelectionSwap {
@@ -510,7 +547,10 @@ fn collect_classes(
         }
         // A split product is tunable together with the SumRows of its partials.
         let reduction = match initial {
-            MatmulTile::CooperativeTiled { splits, .. } if key.split_k => {
+            MatmulTile::CooperativeTiled { splits, .. }
+            | MatmulTile::CooperativeChecked { splits }
+                if key.split_k =>
+            {
                 let Some(reduction) = plan.dispatches.iter().position(|d| {
                     d.shader == ShaderEntry::SumRows
                         && d.input_buffers == [dispatch.output_buffer]
@@ -672,27 +712,12 @@ impl Session {
 
     /// Eligible classes in search order, and the dispatches outside them.
     fn tune_classes(&self, options: &TuneOptions) -> (Vec<SearchClass>, usize) {
-        let (mut classes, mut excluded_dispatches) =
+        let (mut classes, excluded_dispatches) =
             collect_classes(&self.plan, &self.alias, self.coop_config.as_ref());
         // As in pipeline creation, zero means the backend reports no limit.
         let shared_limit = self.gpu.capabilities().max_compute_shared_memory_size;
-        for class in &mut classes {
-            class.challengers.retain(|tile| match *tile {
-                MatmulTile::CooperativeTiled { shape, .. } => {
-                    shared_limit == 0 || shape.shared_bytes() <= shared_limit
-                }
-                _ => true,
-            });
-        }
-        classes.retain(|class| {
-            if options.scope.includes(&class.key) {
-                true
-            } else {
-                excluded_dispatches += class.members.len();
-                false
-            }
-        });
-        (classes, excluded_dispatches)
+        let left_out = retain_tunable_classes(&mut classes, &options.scope, shared_limit);
+        (classes, excluded_dispatches + left_out)
     }
 
     /// Whether tuning can probe or reuse any eligible kernel choices.
@@ -964,10 +989,12 @@ impl Session {
             .candidate
             .buffer_sizes(&class.key)
             .expect("legal challenger");
+        // Halfword extents stay logical in the class; private transfers are
+        // padded to whole words.
         let mut sizes: Vec<_> = baseline_sizes
             .into_iter()
             .zip(candidate_sizes)
-            .map(|(a, b)| a.max(b))
+            .map(|(a, b)| a.max(b).next_multiple_of(4))
             .collect();
         let output_index = sizes.len() - 1;
         let mut dispatch = self.plan.dispatches[class.members[0]].clone();
@@ -994,14 +1021,16 @@ impl Session {
             // live size, and a SumRows adds them into the output.
             let partial = BufferRef(sizes.len() as u32);
             let columns = class.key.m * class.key.n;
-            sizes[output_index] = logical_sizes[output_index];
+            sizes[output_index] = logical_sizes[output_index].next_multiple_of(4);
             sizes.push(class.key.binding_bytes[output_index]);
             for (sequence, tile) in variants
                 .iter_mut()
                 .zip([outcome.initial, outcome.candidate])
             {
-                let MatmulTile::CooperativeTiled { splits, .. } = tile else {
-                    unreachable!("split products only take tiled candidates");
+                let (MatmulTile::CooperativeTiled { splits, .. }
+                | MatmulTile::CooperativeChecked { splits }) = tile
+                else {
+                    unreachable!("split products only take partitioned candidates");
                 };
                 let sum =
                     sequence[0].partial_sum(partial, sequence[0].output_buffer, columns, splits);
@@ -1148,7 +1177,9 @@ impl Session {
             }
             {
                 let _timer = PhaseTimer::new(&mut details.input_preparation);
-                if inputs.is_empty() {
+                if let Some(types) = class.key.matrix_types {
+                    inputs = typed_inputs(&class.key, types, pattern as u32, &sizes);
+                } else if inputs.is_empty() {
                     inputs = prepared_inputs(
                         &logical_sizes,
                         &sizes,
@@ -1180,7 +1211,11 @@ impl Session {
                     scratch.run(&sequences[variant], 1);
                 }
                 let output = scratch.read_output(details);
-                let scale = if pattern == 0 { 1.0 } else { 1.0e-12 };
+                let scale = if pattern == 0 {
+                    1.0
+                } else {
+                    small_pattern_scale(&class.key)
+                };
                 let valid = {
                     let _timer = PhaseTimer::new(&mut details.validation);
                     // The incumbent output has already passed the reference,
@@ -1661,6 +1696,17 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
     }
 
     fn read_output(&mut self, times: &mut TuneQualificationTimes) -> Vec<f32> {
+        if let Some(types) = self.class.matrix_types {
+            let bytes = crate::codegen::MatrixTypes::bytes(types.output);
+            let words = self.read_buffer(
+                self.output_index,
+                (self.output_elements * bytes).div_ceil(4),
+                times,
+            );
+            return (0..self.output_elements)
+                .map(|index| read_typed(&words, index, types.output))
+                .collect();
+        }
         self.read_buffer(self.output_index, self.output_elements, times)
     }
 
@@ -1789,6 +1835,82 @@ fn test_input_value(index: usize, operand: usize) -> f32 {
     bits ^= bits >> 13;
     // Distinct operands and full mantissas, including the addend.
     (bits >> 8) as f32 / 16_777_216.0 - 0.5
+}
+
+/// Magnitude of the small-input pattern's left operand and addend. F16
+/// multiplication cannot represent the ordinary 1e-12 probe.
+fn small_pattern_scale(class: &TuneClass) -> f64 {
+    if class
+        .matrix_types
+        .is_some_and(|types| types.multiply == crate::DType::F16)
+    {
+        1.0 / 1024.0
+    } else {
+        1.0e-12
+    }
+}
+
+/// `value` rounded to `dtype`, as the checked kernel stages it.
+fn round_operand(value: f32, dtype: crate::DType) -> f32 {
+    match dtype {
+        crate::DType::F16 => half::f16::from_f32(value).to_f32(),
+        crate::DType::BF16 => half::bf16::from_f32(value).to_f32(),
+        crate::DType::F32 => value,
+        _ => unreachable!("floating matrix type"),
+    }
+}
+
+/// Element `index` of a buffer of `dtype` values, transferred as words.
+fn read_typed(words: &[f32], index: usize, dtype: crate::DType) -> f32 {
+    if dtype == crate::DType::F32 {
+        return words[index];
+    }
+    let bits = (words[index / 2].to_bits() >> (16 * (index % 2))) as u16;
+    match dtype {
+        crate::DType::F16 => half::f16::from_bits(bits).to_f32(),
+        crate::DType::BF16 => half::bf16::from_bits(bits).to_f32(),
+        _ => unreachable!("floating matrix type"),
+    }
+}
+
+/// Synthetic operands of a typed product in its storage types, packed into
+/// words sized to the scratch buffers. The addend is always F32.
+fn typed_inputs(
+    class: &TuneClass,
+    types: crate::codegen::MatrixTypes,
+    pattern: u32,
+    sizes: &[usize],
+) -> Vec<Vec<f32>> {
+    let (m, n, k) = (class.m as usize, class.n as usize, class.k as usize);
+    let elements = [m * k, k * n, m * n];
+    [types.a, types.b, crate::DType::F32]
+        .into_iter()
+        .take(if class.has_addend() { 3 } else { 2 })
+        .enumerate()
+        .map(|(operand, ty)| {
+            let scale = if operand == 1 || pattern == 0 {
+                1.0
+            } else {
+                small_pattern_scale(class) as f32
+            };
+            let mut words = vec![0.0f32; sizes[operand] / 4];
+            for index in 0..elements[operand] {
+                let value = test_input_value(index, operand) * scale;
+                let bits = match ty {
+                    crate::DType::F32 => {
+                        words[index] = value;
+                        continue;
+                    }
+                    crate::DType::F16 => half::f16::from_f32(value).to_bits(),
+                    crate::DType::BF16 => half::bf16::from_f32(value).to_bits(),
+                    _ => unreachable!("floating matrix type"),
+                };
+                let word = &mut words[index / 2];
+                *word = f32::from_bits(word.to_bits() | u32::from(bits) << (16 * (index % 2)));
+            }
+            words
+        })
+        .collect()
 }
 
 fn update_input_pattern(inputs: &mut [Vec<f32>], logical_sizes: &[usize], pattern: u32) {
@@ -1939,13 +2061,32 @@ fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize)
         } else {
             inner * n + col
         };
-        let mut av = inputs[0][a] as f64;
+        // Typed operands are decoded from their storage and rounded to the
+        // multiplication type, as the checked kernel stages them.
+        let (mut av, bv) = match class.matrix_types {
+            Some(types) => (
+                f64::from(round_operand(
+                    read_typed(&inputs[0], a, types.a),
+                    types.multiply,
+                )),
+                f64::from(round_operand(
+                    read_typed(&inputs[1], b, types.b),
+                    types.multiply,
+                )),
+            ),
+            None => (inputs[0][a] as f64, inputs[1][b] as f64),
+        };
         if let Some(w) = norm_w {
             av *= inv_rms * w[inner] as f64;
         }
-        value += av * inputs[1][b] as f64;
+        value += av * bv;
     }
-    value
+    match class.matrix_types {
+        Some(types) if types.output != crate::DType::F32 => {
+            f64::from(round_operand(value as f32, types.output))
+        }
+        _ => value,
+    }
 }
 
 /// Keep every f16-aligned halfword of a synthetic packed weight finite and in
@@ -3566,6 +3707,133 @@ mod tests {
         let mantissas: std::collections::HashSet<u16> =
             data.iter().map(|v| (v.to_bits() as u16) & 0x03FF).collect();
         assert_eq!(mantissas.len(), 1024, "taming collapsed the mantissa");
+    }
+
+    #[test]
+    fn typed_classes_keep_storage_and_arithmetic_in_the_search_key() {
+        use crate::{DType, codegen::MatrixTypes, compile::Kernel};
+        let mut keys = Vec::new();
+        for multiply in [DType::F32, DType::F16, DType::BF16] {
+            let storages: &[DType] = if multiply == DType::F32 {
+                &[DType::F32]
+            } else {
+                &[DType::F32, multiply]
+            };
+            for &storage in storages {
+                let types = MatrixTypes {
+                    a: storage,
+                    b: storage,
+                    multiply,
+                    output: DType::F32,
+                };
+                let dispatch = Dispatch {
+                    shader: ShaderEntry::MatMulBT,
+                    kernel: Kernel::CooperativeTyped { types, splits: 4 },
+                    input_buffers: vec![BufferRef(0), BufferRef(1)],
+                    output_buffer: BufferRef(2),
+                    params: vec![3, 5, 1031, 0],
+                    workgroups: [1, 1, 4],
+                    ..Default::default()
+                };
+                let mut class = TuneClass::from_dispatch(&dispatch, None).unwrap();
+                assert_eq!(class.matrix_types, Some(types));
+                class.binding_bytes = class.buffer_sizes().unwrap();
+                // The compiled partial buffer holds four partitions.
+                *class.binding_bytes.last_mut().unwrap() *= 4;
+                assert_eq!(
+                    class.challengers(MatmulTile::CooperativeChecked { splits: 4 }, None),
+                    vec![MatmulTile::CooperativeChecked { splits: 2 }]
+                );
+                assert!(!MatmulTile::Tile32.fits(&class));
+                let mut locked = dispatch.clone();
+                locked.schedule_locked = true;
+                assert!(TuneClass::from_dispatch(&locked, None).is_none());
+                for pattern in [0, 1] {
+                    let scratch_sizes: Vec<_> = class
+                        .binding_bytes
+                        .iter()
+                        .map(|bytes| bytes.next_multiple_of(4))
+                        .collect();
+                    let inputs = typed_inputs(&class, types, pattern, &scratch_sizes);
+                    assert_eq!(inputs[0].len() * 4, scratch_sizes[0]);
+                    assert!(read_typed(&inputs[0], 3 * 1031 - 1, storage).is_finite());
+                    let output: Vec<_> = (0..15)
+                        .map(|i| reference_dot(&class, &inputs, i / 5, i % 5) as f32)
+                        .collect();
+                    let scale = if pattern == 0 {
+                        1.0
+                    } else {
+                        small_pattern_scale(&class)
+                    };
+                    assert!(qualify_output(&class, &inputs, &output, scale));
+                    assert!(!qualify_output(&class, &inputs, &[0.0; 15], scale));
+                }
+                assert!(!keys.contains(&class), "{types:?}");
+                keys.push(class);
+            }
+        }
+        // An ordinary product of the same extents is a different class.
+        let mut ordinary = keys[0].clone();
+        ordinary.matrix_types = None;
+        assert!(!keys.contains(&ordinary));
+    }
+
+    /// An unsplit typed product outranks the ordinary one by FLOPs but has no
+    /// partition candidate. A class limit of one must still reach the
+    /// ordinary product.
+    fn mixed_typed_and_ordinary_plan() -> crate::compile::ExecutionPlan {
+        let mut graph = crate::Graph::new();
+        let a = graph.input("a", &[512, 512]);
+        let b = graph.parameter("b", &[512, 512]);
+        let (a, b) = (graph.to_bf16(a), graph.to_bf16(b));
+        let typed = graph.matmul(a, b);
+        let x = graph.input("x", &[33, 17]);
+        let w = graph.parameter("w", &[17, 65]);
+        let ordinary = graph.matmul(x, w);
+        graph.set_outputs(vec![typed, ordinary]);
+        let mut plan = crate::compile::compile(&graph);
+        crate::compile::schedule_dispatches(&mut plan, false, false);
+        plan
+    }
+
+    #[test]
+    fn classes_without_challengers_do_not_take_class_slots() {
+        let plan = mixed_typed_and_ordinary_plan();
+        let alias = crate::memplan::plan_no_alias(&plan, &plan.groups, None);
+        let (mut classes, _) = collect_classes(&plan, &alias, None);
+        assert_eq!(classes.len(), 2);
+        assert!(classes[0].key.matrix_types.is_some());
+        assert!(classes[0].challengers.is_empty());
+        let left_out = retain_tunable_classes(&mut classes, &crate::tune::TuneScope::default(), 0);
+        assert_eq!(left_out, 1);
+        assert_eq!(classes.len(), 1);
+        assert_eq!(classes[0].key.matrix_types, None);
+        assert!(!classes[0].challengers.is_empty());
+    }
+
+    #[test]
+    fn compiled_typed_bindings_keep_logical_halfword_extents() {
+        let mut graph = crate::Graph::new();
+        let a = graph.parameter_f16("a", &[33, 1031]);
+        let b = graph.parameter_f16("b", &[1031, 65]);
+        let y = graph.matmul(a, b);
+        graph.set_outputs(vec![y]);
+        let mut plan = crate::compile::compile(&graph);
+        crate::compile::schedule_dispatches(&mut plan, false, false);
+        let alias = crate::memplan::plan_no_alias(&plan, &plan.groups, None);
+        let (classes, _) = collect_classes(&plan, &alias, None);
+        assert_eq!(classes.len(), 1);
+        // 33 * 1031 halfwords is not a whole number of words.
+        assert_eq!(
+            classes[0].key.binding_bytes[..2],
+            [33 * 1031 * 2, 1031 * 65 * 2]
+        );
+        // The four compiled partitions bound the partial buffer.
+        assert_eq!(
+            classes[0].challengers,
+            [MatmulTile::CooperativeChecked { splits: 2 }]
+        );
+        assert_eq!(classes[0].reductions.len(), 1);
     }
 
     #[test]

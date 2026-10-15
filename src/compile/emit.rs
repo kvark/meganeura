@@ -921,7 +921,10 @@ impl<'a> Compiler<'a> {
                     vec![m, k, n, 0]
                 },
                 fusion_barrier: true,
-                schedule_locked: true,
+                // The typed kernel is fixed by storage, not by a schedule:
+                // kernel selection keeps it, and tuning only varies K
+                // partitions within the partial buffer.
+                schedule_locked: false,
                 origin: vec![node.id],
                 ..Default::default()
             };
