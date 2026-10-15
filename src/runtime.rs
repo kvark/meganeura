@@ -1291,7 +1291,172 @@ fn checked_matrix_unsupported(multiply: crate::DType) -> String {
     )
 }
 
-fn validate_precision_plan(gpu: &Gpu, plan: &ExecutionPlan) {
+const F16_SUBNORMALS_LOST: &str = "F16 matrix products require F16/F32 cooperative matrices that keep subnormal F16 operands; this device flushes them";
+
+/// Whether `gpu` runs explicit checked cooperative products that multiply in
+/// `multiply`: native storage, an implemented tile shape and, for F16, kept
+/// subnormal operands. Session construction rejects such plans otherwise.
+pub fn typed_matrix_supported(gpu: &Arc<Gpu>, multiply: crate::DType) -> bool {
+    let capabilities = gpu.capabilities();
+    let storage = match multiply {
+        crate::DType::BF16 => capabilities.shader_bfloat16,
+        crate::DType::F16 => capabilities.shader_float16,
+        _ => true,
+    };
+    storage
+        && crate::codegen::checked_cooperative_shape(cooperative_shapes(
+            &capabilities.cooperative_matrix,
+            multiply,
+        ))
+        .is_some()
+        && (multiply != crate::DType::F16 || f16_subnormals_qualified(gpu))
+}
+
+/// Whether the checked F16 product keeps subnormal operands on this device,
+/// once per context. The F16 storage contract includes them (2^-24 to 2^-14),
+/// but a listed tile shape does not promise them: some drivers flush them in
+/// cooperative products, as Mesa 26.0.3 does on B570.
+fn f16_subnormals_qualified(gpu: &Arc<Gpu>) -> bool {
+    // A listed `Weak` keeps its context address from being reused.
+    type Probe = (std::sync::Weak<Gpu>, bool);
+    static PROBES: std::sync::Mutex<Vec<Probe>> = std::sync::Mutex::new(Vec::new());
+    let mut probes = PROBES.lock().unwrap();
+    probes.retain(|probe| probe.0.strong_count() != 0);
+    if let Some(probe) = probes
+        .iter()
+        .find(|probe| std::ptr::eq(probe.0.as_ptr(), Arc::as_ptr(gpu)))
+    {
+        return probe.1;
+    }
+    let qualified = test_f16_subnormal_products(gpu);
+    probes.push((Arc::downgrade(gpu), qualified));
+    qualified
+}
+
+/// One 32x32 output block over two K steps. A mixes subnormal (2^-15 and
+/// 3 * 2^-24) and normal (2^-10) F16 values, B holds small integers, and
+/// every product and partial sum is exact in F32, so any accumulation order
+/// must reproduce `expected` exactly. Returns (m, n, k), A, B and `expected`.
+fn f16_subnormal_probe() -> ([usize; 3], Vec<f32>, Vec<f32>, Vec<f32>) {
+    let (m, n, k) = (32, 32, 64);
+    let values = [2.0f32.powi(-15), 3.0 * 2.0f32.powi(-24), 2.0f32.powi(-10)];
+    let a: Vec<f32> = (0..m * k)
+        .map(|i| values[(i / k * 7 + i % k) % 3])
+        .collect();
+    let b: Vec<f32> = (0..k * n)
+        .map(|i| ((i / n + 2 * (i % n)) % 4 + 1) as f32)
+        .collect();
+    let expected = (0..m * n)
+        .map(|index| {
+            let (row, col) = (index / n, index % n);
+            (0..k)
+                .map(|p| f64::from(a[row * k + p]) * f64::from(b[p * n + col]))
+                .sum::<f64>() as f32
+        })
+        .collect();
+    ([m, n, k], a, b, expected)
+}
+
+fn test_f16_subnormal_products(gpu: &Gpu) -> bool {
+    use crate::codegen::{MatrixTypes, ShaderGroup};
+    use blade_graphics as bg;
+
+    let Some(shape) = crate::codegen::checked_cooperative_shape(
+        &gpu.capabilities().cooperative_matrix.f16_f32_shapes,
+    ) else {
+        return false;
+    };
+    let module = crate::codegen::generate_module_coop_typed_with_shape(
+        ShaderGroup::MatMul,
+        MatrixTypes::reduced(crate::DType::F16),
+        shape,
+    );
+    let shader = match create_gen_shader(gpu, module) {
+        Ok(shader) => shader,
+        Err(error) => {
+            log::warn!("typed F16 matmul shader rejected: {error}");
+            return false;
+        }
+    };
+    let layout = shader_data_layout(&ShaderEntry::MatMul);
+    let mut pipeline = create_profiled_pipeline(
+        gpu,
+        "typed_f16_probe".to_string(),
+        &layout,
+        shader.at("main"),
+    );
+    let ([m, n, k], a, b, expected) = f16_subnormal_probe();
+    let half = |values: &[f32]| -> Vec<u16> {
+        values
+            .iter()
+            .map(|&value| half::f16::from_f32(value).to_bits())
+            .collect()
+    };
+    let (a, b) = (half(&a), half(&b));
+    let buffer = |name, bytes: usize| {
+        gpu.create_buffer(bg::BufferDesc {
+            name,
+            size: bytes as u64,
+            memory: bg::Memory::Shared,
+        })
+    };
+    let a_buf = buffer("typed_probe_a", a.len() * 2);
+    let b_buf = buffer("typed_probe_b", b.len() * 2);
+    let c_buf = buffer("typed_probe_c", m * n * 4);
+    // Shared memory can be uncached for the host: fill the inputs, never read
+    // them back. NaN outputs expose a kernel that did not store.
+    unsafe {
+        std::slice::from_raw_parts_mut(a_buf.data() as *mut u16, a.len()).copy_from_slice(&a);
+        std::slice::from_raw_parts_mut(b_buf.data() as *mut u16, b.len()).copy_from_slice(&b);
+        std::slice::from_raw_parts_mut(c_buf.data() as *mut f32, m * n).fill(f32::NAN);
+    }
+    let mut encoder = gpu.create_command_encoder(bg::CommandEncoderDesc {
+        name: "typed_f16_probe",
+        buffer_count: 2,
+        manual_barriers: false,
+    });
+    encoder.start();
+    {
+        let mut pass = encoder.compute("typed_f16_probe");
+        let mut pc = pass.with(&pipeline);
+        pc.bind(
+            0,
+            &MatMulData {
+                matrix_a: a_buf.at(0),
+                matrix_b: b_buf.at(0),
+                matrix_c: c_buf.at(0),
+                // The fourth word is the K partition count.
+                params: MatMulParams {
+                    m: m as u32,
+                    n: n as u32,
+                    k: k as u32,
+                    _pad: 1,
+                },
+            },
+        );
+        pc.dispatch([1, 1, 1]);
+    }
+    let sync = gpu.submit(&mut encoder);
+    // A standalone scratch submission: nothing profiles it.
+    let _ = wait_for_timed_encoder(gpu, &sync, &mut encoder, false);
+    let result = unsafe { std::slice::from_raw_parts(c_buf.data() as *const f32, m * n).to_vec() };
+    gpu.destroy_command_encoder(&mut encoder);
+    gpu.destroy_compute_pipeline(&mut pipeline);
+    gpu.destroy_buffer(a_buf);
+    gpu.destroy_buffer(b_buf);
+    gpu.destroy_buffer(c_buf);
+    let qualified = result == expected;
+    if !qualified {
+        log::warn!(
+            "typed F16 matmul lost subnormal operands: {} instead of {}",
+            result[0],
+            expected[0]
+        );
+    }
+    qualified
+}
+
+fn validate_precision_plan(gpu: &Arc<Gpu>, plan: &ExecutionPlan) {
     let (storage, multiply) = precision_requirements(&plan.dispatches);
     let capabilities = gpu.capabilities();
     for ty in storage {
@@ -1315,6 +1480,10 @@ fn validate_precision_plan(gpu: &Gpu, plan: &ExecutionPlan) {
             "{}",
             checked_matrix_unsupported(ty)
         );
+        // A tile shape does not promise the F16 contract's subnormal operands.
+        if ty == crate::DType::F16 {
+            assert!(f16_subnormals_qualified(gpu), "{F16_SUBNORMALS_LOST}");
+        }
     }
 }
 
@@ -1326,6 +1495,29 @@ mod precision_requirement_tests {
         codegen::{CoopConfig, MatrixTypes},
         compile::{self, Kernel},
     };
+
+    #[test]
+    fn f16_subnormal_probe_is_exact_and_sensitive() {
+        let ([m, n, k], a, b, expected) = super::f16_subnormal_probe();
+        assert_eq!(expected.len(), m * n);
+        let smallest_normal = 2.0f32.powi(-14);
+        for &value in a.iter().chain(&b) {
+            assert_eq!(half::f16::from_f32(value).to_f32(), value);
+        }
+        for (index, &want) in expected.iter().enumerate() {
+            let (row, col) = (index / n, index % n);
+            let term = |p: usize| a[row * k + p] * b[p * n + col];
+            // Any F32 accumulation order reproduces the exact result...
+            assert_eq!((0..k).map(term).sum::<f32>(), want);
+            assert_eq!((0..k).rev().map(term).sum::<f32>(), want);
+            // ...and flushing the subnormal operands changes every output.
+            let flushed: f32 = (0..k)
+                .filter(|&p| a[row * k + p] >= smallest_normal)
+                .map(term)
+                .sum();
+            assert_ne!(flushed, want);
+        }
+    }
 
     #[test]
     fn distinguishes_storage_from_cooperative_products() {

@@ -48,4 +48,5 @@ mod smollm2_correctness;
 mod submission_chunks;
 mod support;
 mod tune;
+mod typed_matmul;
 mod whisper_correctness;

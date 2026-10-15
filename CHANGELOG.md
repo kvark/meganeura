@@ -10,6 +10,13 @@
   output types and K partitions.
   Unsupported devices retain the existing F32/F16 paths because no graph is
   narrowed automatically.
+- Dense products with two explicit F16 operands run on the same typed
+  cooperative kernel, with F16 multiplication and F32 accumulation, on devices
+  with F16 storage and 16x16x16 or 8x16x16 F16/F32 cooperative matrices that
+  keep subnormal F16 operands. A one-time probe per context checks the latter;
+  Mesa 26.0.3 on B570 flushes them and is rejected. Other F16 left operands and
+  reduced addends are rejected at compile time: the ordinary kernels honor
+  reduced storage only in B and read them as F32.
 - The Blade update conditionally enables Vulkan memory-model emission for every
   shader on devices that advertise it, including existing F32/F16 kernels. The
   matching Naga fork carries the BF16 cooperative-matrix and corrected Vulkan
