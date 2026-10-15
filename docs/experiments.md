@@ -43,7 +43,7 @@ All three repositories publish the prototype on `experiment/workgroup-matrix`:
 | Blade | [experiment/workgroup-matrix](https://github.com/kvark/blade/tree/experiment/workgroup-matrix) | `96c1dc731b1d5e133a6c0a8a020014619ff2e434` |
 | Naga/WGPU | [experiment/workgroup-matrix](https://github.com/kvark/wgpu/tree/experiment/workgroup-matrix) | `a97559b6318dc0a857ace502ffc7f3e442951f39` |
 
-Meganeura pins [Blade cf7dd20](https://github.com/kvark/blade/commit/cf7dd20a141661be50aee6e7b5c9654610bec860),
+Meganeura pins [Blade 457e685](https://github.com/kvark/blade/commit/457e68505bfc47fbd56533b011dd69be21784136),
 and both pin [Naga c32067f](https://github.com/kvark/wgpu/commit/c32067f08c27ba70d6da40a08049ba4268052a6f).
 The experiment branches include dependency locks and build without sibling
 checkouts using `--locked`.
@@ -159,11 +159,14 @@ actual operand.
 Blade compacts each selected entry point before choosing its SPIR-V version.
 It validates dimensions, invocation counts, a common device configuration for
 each product, and user plus reserved shared memory after resolving overrides.
+The memory bound includes padding between differently aligned variables and
+32-bit boolean storage, following
+[Vulkan's workgroup storage rules](https://docs.vulkan.org/spec/latest/chapters/shaders.html).
 These device checks live in Blade, which has the queried Vulkan properties.
 Meganeura accepts larger eligible tiles and checks shared-memory arithmetic for
 overflow. Default/Auto selection remains unchanged.
 
-Review validation passes all 411 Naga tests/doctests, 14 Blade tests, 43
+Review validation passes all 411 Naga tests/doctests, 15 Blade tests, 43
 Meganeura codegen tests and six workgroup-related tests; Clippy and formatting
 also pass. `cargo xtask validate spv` passes, as do CLI-generated workgroup,
 BF16 and compacted vertex/compute binaries under `spirv-val --target-env vulkan1.3`.

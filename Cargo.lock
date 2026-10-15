@@ -210,7 +210,7 @@ dependencies = [
 [[package]]
 name = "blade-graphics"
 version = "0.9.0"
-source = "git+https://github.com/kvark/blade?rev=cf7dd20a141661be50aee6e7b5c9654610bec860#cf7dd20a141661be50aee6e7b5c9654610bec860"
+source = "git+https://github.com/kvark/blade?rev=457e68505bfc47fbd56533b011dd69be21784136#457e68505bfc47fbd56533b011dd69be21784136"
 dependencies = [
  "ash",
  "ash-window",
