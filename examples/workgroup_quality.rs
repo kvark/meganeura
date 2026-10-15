@@ -4,15 +4,35 @@ use serde_json::json;
 
 fn main() {
     let gpu = meganeura::reference::gpu::shared_context();
-    let tile = WorkgroupMatmulShape {
-        rows: 64,
-        columns: 64,
-        k_stage: 32,
-        threads: 64,
-    };
+    let large = std::env::args().any(|arg| arg == "--large-tile");
     for bf16 in [false, true] {
+        let tile = if large {
+            WorkgroupMatmulShape {
+                rows: 128,
+                columns: 256,
+                k_stage: if bf16 { 64 } else { 32 },
+                threads: 256,
+            }
+        } else {
+            WorkgroupMatmulShape {
+                rows: 64,
+                columns: 64,
+                k_stage: 32,
+                threads: 64,
+            }
+        };
+        let shapes = if large {
+            [
+                (128, 256, 64),
+                (256, 512, 128),
+                (129, 256, 64),
+                (128, 257, 64),
+            ]
+        } else {
+            [(64, 64, 32), (128, 576, 576), (192, 320, 96), (65, 96, 33)]
+        };
         for layout in ["nn", "at", "bt"] {
-            for (m, n, k) in [(64, 64, 32), (128, 576, 576), (192, 320, 96), (65, 96, 33)] {
+            for (m, n, k) in shapes {
                 let mut graph = Graph::new();
                 let a = graph.input("a", &if layout == "at" { [k, m] } else { [m, k] });
                 let b = graph.parameter("b", &if layout == "bt" { [n, k] } else { [k, n] });

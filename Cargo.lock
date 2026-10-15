@@ -210,7 +210,7 @@ dependencies = [
 [[package]]
 name = "blade-graphics"
 version = "0.9.0"
-source = "git+https://github.com/kvark/blade?rev=c5116fdac5e2b59a4c84421e46fc72bf5edc95e4#c5116fdac5e2b59a4c84421e46fc72bf5edc95e4"
+source = "git+https://github.com/kvark/blade?rev=cf7dd20a141661be50aee6e7b5c9654610bec860#cf7dd20a141661be50aee6e7b5c9654610bec860"
 dependencies = [
  "ash",
  "ash-window",
@@ -1869,7 +1869,7 @@ dependencies = [
 [[package]]
 name = "naga"
 version = "30.0.0"
-source = "git+https://github.com/kvark/wgpu?rev=2f6069d00335489bffd0da0d6fba3afed1822939#2f6069d00335489bffd0da0d6fba3afed1822939"
+source = "git+https://github.com/kvark/wgpu?rev=c32067f08c27ba70d6da40a08049ba4268052a6f#c32067f08c27ba70d6da40a08049ba4268052a6f"
 dependencies = [
  "arrayvec",
  "bit-set",
@@ -1894,7 +1894,7 @@ dependencies = [
 [[package]]
 name = "naga-types"
 version = "30.0.0"
-source = "git+https://github.com/kvark/wgpu?rev=2f6069d00335489bffd0da0d6fba3afed1822939#2f6069d00335489bffd0da0d6fba3afed1822939"
+source = "git+https://github.com/kvark/wgpu?rev=c32067f08c27ba70d6da40a08049ba4268052a6f#c32067f08c27ba70d6da40a08049ba4268052a6f"
 dependencies = [
  "hashbrown 0.17.1",
  "indexmap",

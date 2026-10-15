@@ -43,8 +43,8 @@ All three repositories publish the prototype on `experiment/workgroup-matrix`:
 | Blade | [experiment/workgroup-matrix](https://github.com/kvark/blade/tree/experiment/workgroup-matrix) | `96c1dc731b1d5e133a6c0a8a020014619ff2e434` |
 | Naga/WGPU | [experiment/workgroup-matrix](https://github.com/kvark/wgpu/tree/experiment/workgroup-matrix) | `a97559b6318dc0a857ace502ffc7f3e442951f39` |
 
-Meganeura pins [Blade c5116fd](https://github.com/kvark/blade/commit/c5116fdac5e2b59a4c84421e46fc72bf5edc95e4),
-and both pin [Naga 2f6069d](https://github.com/kvark/wgpu/commit/2f6069d00335489bffd0da0d6fba3afed1822939).
+Meganeura pins [Blade cf7dd20](https://github.com/kvark/blade/commit/cf7dd20a141661be50aee6e7b5c9654610bec860),
+and both pin [Naga c32067f](https://github.com/kvark/wgpu/commit/c32067f08c27ba70d6da40a08049ba4268052a6f).
 The experiment branches include dependency locks and build without sibling
 checkouts using `--locked`.
 
@@ -147,6 +147,41 @@ tests and 42 codegen tests. The rebuilt quality example repeated all 96 cases
 on each GPU, with 36 workgroup selections on RTX and zero on B570, the same
 maximum errors, and no Vulkan validation output.
 
+The PR #3 review follow-up registers the missing SPIR-V capabilities and adds
+WGSL/SPIR-V snapshots, including BF16 128×256 tiles. Matrix dimensions now use
+positive `u32` values instead of a fixed enum ending at 128. Naga rejects
+workgroup load/store addresses and strides that depend on individual lanes,
+tracking scalar locals and function arguments; subgroup operand uniformity
+remains a separate limitation. Store-expression availability has its own
+regression test and follow-up commit. Scope mismatch diagnostics identify the
+actual operand.
+
+Blade compacts each selected entry point before choosing its SPIR-V version.
+It validates dimensions, invocation counts, a common device configuration for
+each product, and user plus reserved shared memory after resolving overrides.
+These device checks live in Blade, which has the queried Vulkan properties.
+Meganeura accepts larger eligible tiles and checks shared-memory arithmetic for
+overflow. Default/Auto selection remains unchanged.
+
+Review validation passes all 411 Naga tests/doctests, 14 Blade tests, 43
+Meganeura codegen tests and six workgroup-related tests; Clippy and formatting
+also pass. `cargo xtask validate spv` passes, as do CLI-generated workgroup,
+BF16 and compacted vertex/compute binaries under `spirv-val --target-env vulkan1.3`.
+The full WGPU run across all local adapters has 2,145 passing and 253 failing
+tests (24 skipped). Its failure set exactly matches the previously tested,
+unchanged `2f6069d` base: 236 OpenGL/player initialization failures, six Intel
+Vulkan, eight NVIDIA Vulkan and three llvmpipe Vulkan failures.
+
+The final quality checks again pass 96 cases on each GPU, with the same maximum
+errors and no Vulkan validation output. Another 96 RTX cases exercise 128×256
+tiles: K=32 for staged F16, K=64 for direct BF16, with 256 invocations. Twenty-four
+records select those large tiles; the rest check strict or ragged fallbacks.
+All 5,514,240 output values pass the rounded-operand F64 oracle, with maximum
+relative L2 error 2.04e-7. This is kernel correctness evidence, not a new speed
+measurement or a model acceptance gate. Logs, exact failed test names, binary
+hashes and summaries are in
+`/x/Code/inferena-results/workgroup-review-20261015/`.
+
 Reproduce from a checkout of the Meganeura experiment branch, one GPU job at a time:
 
 ```sh
@@ -163,6 +198,9 @@ VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json \
 VK_DRIVER_FILES=/usr/share/vulkan/icd.d/intel_icd.json \
   VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
   timeout 300s target/release/examples/workgroup_quality > /tmp/workgroup-quality-b570.jsonl
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json \
+  VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
+  timeout 300s target/release/examples/workgroup_quality --large-tile > /tmp/workgroup-quality-large.jsonl
 ```
 
 The production next step is to admit these shapes into the existing measured

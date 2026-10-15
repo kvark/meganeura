@@ -19,7 +19,7 @@ impl WorkgroupMatmulShape {
         };
         [self.rows, self.columns, self.k_stage]
             .iter()
-            .all(|s| matches!(s, 16 | 32 | 64 | 128))
+            .all(|&s| s > 0 && (bf16 || s.is_multiple_of(4)))
             && matrix.supports(
                 operand,
                 [self.rows, self.columns, self.k_stage],
@@ -27,7 +27,7 @@ impl WorkgroupMatmulShape {
             )
             && self
                 .shared_bytes(bf16)
-                .checked_add(matrix.reserved_shared_memory)
+                .and_then(|bytes| bytes.checked_add(matrix.reserved_shared_memory))
                 .is_some_and(|bytes| bytes <= caps.max_compute_shared_memory_size)
     }
 
@@ -43,11 +43,14 @@ impl WorkgroupMatmulShape {
             && k.is_multiple_of(self.k_stage)
     }
 
-    pub fn shared_bytes(self, bf16: bool) -> u32 {
+    pub fn shared_bytes(self, bf16: bool) -> Option<u32> {
         if bf16 {
-            0
+            Some(0)
         } else {
-            2 * self.k_stage * (self.rows + self.columns)
+            self.rows
+                .checked_add(self.columns)?
+                .checked_mul(self.k_stage)?
+                .checked_mul(2)
         }
     }
 }

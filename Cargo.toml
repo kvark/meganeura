@@ -70,7 +70,7 @@ profiler = ["dep:tracing-subscriber"]
 
 [dependencies]
 # Workgroup cooperative-matrix prototype on experiment/workgroup-matrix.
-blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "c5116fdac5e2b59a4c84421e46fc72bf5edc95e4" }
+blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "cf7dd20a141661be50aee6e7b5c9654610bec860" }
 blade-macros = "0.3"
 # `default-features = false` drops egglog's `bin` stack (clap, mimalloc,
 # env_logger, chrono, graphviz); library builds use the shared rewrite engine.
@@ -96,7 +96,7 @@ tracing-subscriber = { version = "0.3", optional = true, features = ["registry"]
 # downstream crates that just want the inference runtime.
 [dev-dependencies]
 # Shader validation and SPIR-V inspection for tests and developer tools.
-naga = { git = "https://github.com/kvark/wgpu", rev = "2f6069d00335489bffd0da0d6fba3afed1822939", version = "30", default-features = false, features = ["wgsl-in", "spv-out"] }
+naga = { git = "https://github.com/kvark/wgpu", rev = "c32067f08c27ba70d6da40a08049ba4268052a6f", version = "30", default-features = false, features = ["wgsl-in", "spv-out"] }
 # Replay small paired timing differences without lossy f64 JSON parsing.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 env_logger = "0.11"

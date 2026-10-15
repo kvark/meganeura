@@ -105,6 +105,47 @@ mod tests {
     }
 
     #[test]
+    fn large_workgroup_tiles_respect_device_memory_and_dimensions() {
+        let mut device = caps();
+        device.max_compute_shared_memory_size = 49152;
+        device.cooperative_matrix.workgroup.granularities = [
+            blade_graphics::CooperativeMatrixOperand::F16,
+            blade_graphics::CooperativeMatrixOperand::Bf16,
+        ]
+        .map(|operand| blade_graphics::CooperativeMatrixGranularity {
+            operand,
+            size: [16, 16, 16],
+            invocations: 256,
+        })
+        .to_vec();
+        let tile = WorkgroupMatmulShape {
+            rows: 128,
+            columns: 256,
+            k_stage: 32,
+            threads: 256,
+        };
+        assert!(tile.supports(&device, false));
+        let deeper = WorkgroupMatmulShape {
+            k_stage: 64,
+            ..tile
+        };
+        assert!(!deeper.supports(&device, false));
+        assert!(deeper.supports(&device, true));
+        device.cooperative_matrix.workgroup.max_dimension = 128;
+        assert!(!tile.supports(&device, true));
+        assert!(!tile.supports(&device, false));
+
+        let overflow = WorkgroupMatmulShape {
+            rows: u32::MAX - 3,
+            columns: 256,
+            ..tile
+        };
+        device.cooperative_matrix.workgroup.max_dimension = u32::MAX;
+        assert_eq!(overflow.shared_bytes(false), None);
+        assert!(!overflow.supports(&device, false));
+    }
+
+    #[test]
     fn workgroup_selection_respects_precision_device_and_shape() {
         let mut options = SessionOptions {
             coop: CoopPolicy::AllowF16,
