@@ -46,6 +46,31 @@ impl<'a> Compiler<'a> {
                     node.op
                 );
             }
+            // Ordinary dense kernels honor reduced storage only in B, through
+            // its `WeightFormat`. They would read any other operand as F32.
+            if matches!(
+                node.op,
+                Op::MatMul
+                    | Op::MatMulAT
+                    | Op::MatMulBT
+                    | Op::FusedMatMulAdd
+                    | Op::FusedMatMulATAdd
+                    | Op::FusedMatMulBTAdd
+            ) && !node.inputs[..2]
+                .iter()
+                .any(|&id| graph.node(id).ty.dtype == DType::BF16)
+            {
+                let left = graph.node(node.inputs[0]).ty.dtype;
+                assert_eq!(
+                    left,
+                    DType::F32,
+                    "dense matrix products read the left operand as F32, not {left:?}"
+                );
+                if let Some(&addend) = node.inputs.get(2) {
+                    let addend = graph.node(addend).ty.dtype;
+                    assert_eq!(addend, DType::F32, "matrix addends are F32, not {addend:?}");
+                }
+            }
         }
         if let Some(shape) = options.gemv_shape {
             shape.validate();
