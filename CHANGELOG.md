@@ -17,6 +17,13 @@
   Mesa 26.0.3 on B570 flushes them and is rejected. Other F16 left operands and
   reduced addends are rejected at compile time: the ordinary kernels honor
   reduced storage only in B and read them as F32.
+- Typed cooperative products take part in bounded kernel tuning. Their types
+  are part of the class key, and candidates change only the K partition count
+  within the compiled partial buffer, so storage and arithmetic never change.
+  Qualification runs on private scratch in the operands' storage types against
+  references built from operands rounded to the multiplication type. Classes
+  with no applicable challenger are left out before the class limit. The
+  kernel memo revision is now 3.
 - The Blade update conditionally enables Vulkan memory-model emission for every
   shader on devices that advertise it, including existing F32/F16 kernels. The
   matching Naga fork carries the BF16 cooperative-matrix and corrected Vulkan
