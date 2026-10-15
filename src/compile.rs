@@ -1234,6 +1234,11 @@ pub enum Kernel {
         output_bf16: bool,
         splits: u32,
     },
+    /// Aligned workgroup tiles with F16 or BF16 operands and F32 accumulation.
+    CooperativeWorkgroup {
+        shape: crate::codegen::WorkgroupMatmulShape,
+        bf16: bool,
+    },
     /// Four subgroup tiles sharing aligned native-f32 operands. More than
     /// one K partition requires a following SumRows dispatch.
     CooperativeTiled {
@@ -1287,6 +1292,7 @@ impl Dispatch {
                 | Kernel::CooperativeBF16 { .. }
                 | Kernel::CooperativeCompensated
                 | Kernel::CooperativeTiled { .. }
+                | Kernel::CooperativeWorkgroup { .. }
         )
     }
 

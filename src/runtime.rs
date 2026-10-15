@@ -1,3 +1,4 @@
+mod workgroup;
 use crate::compile::{
     AttentionParams, BufferRef, CachedBlockAttentionParams, Dispatch, DispatchParams,
     ExecutionPlan, RoPEParams, ShaderEntry,
@@ -962,6 +963,7 @@ enum Variant {
     /// Explicit BF16 operands, with F32 or rounded BF16 output. K partitions
     /// are uniform data and do not change the pipeline.
     CoopBF16(ShaderEntry, bool),
+    CoopWorkgroup(ShaderEntry, crate::codegen::WorkgroupMatmulShape, bool),
     CoopTiled(
         ShaderEntry,
         crate::codegen::CooperativeMatmulShape,
@@ -1072,6 +1074,7 @@ impl Variant {
         match *self {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
             Variant::Attention(ref e, _, _)
+            | Variant::CoopWorkgroup(ref e, _, _)
             | Variant::CoopBF16(ref e, _)
             | Variant::CoopTiled(ref e, _, _, _)
             | Variant::SplitMatmul(ref e, _, _, _)
@@ -1097,6 +1100,9 @@ impl Variant {
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
+            Variant::CoopWorkgroup(ref e, shape, bf16) => {
+                format!("{e:?}:workgroup-{shape:?}-bf16-{bf16}")
+            }
             Variant::CoopBF16(ref e, output_bf16) => {
                 let output = if output_bf16 { "bf16" } else { "f32" };
                 format!("{e:?}:cooperative-bf16-{output}-output")
@@ -1219,6 +1225,7 @@ fn bf16_requirements(dispatches: &[Dispatch]) -> (bool, bool) {
         let matrix = matches!(
             dispatch.kernel,
             crate::compile::Kernel::CooperativeBF16 { .. }
+                | crate::compile::Kernel::CooperativeWorkgroup { bf16: true, .. }
         ) || matches!(dispatch.shader, ShaderEntry::Conv2dBF16 { .. });
         storage |= matrix
             || matches!(
@@ -1546,6 +1553,14 @@ impl Pipelines {
         let cooperative =
             || *coop_config.expect("cooperative dispatch needs a qualified device configuration");
         let module = match *key {
+            Variant::CoopWorkgroup(_, shape, bf16) => {
+                if !shape.supports(&gpu.capabilities(), bf16)
+                    || !dispatch.mnk().is_some_and(|(m, n, k)| shape.fits(m, n, k))
+                {
+                    return Err("unsupported workgroup cooperative product".to_owned());
+                }
+                crate::codegen::generate_workgroup_matmul(group, shape, bf16)
+            }
             Variant::CoopBF16(_, output_bf16) => {
                 crate::codegen::generate_module_coop_bf16_with_shape(
                     group,
@@ -1816,6 +1831,9 @@ impl Pipelines {
     /// which unrelated pipelines happen to have been compiled.
     fn key(dispatch: &Dispatch) -> Variant {
         let entry = dispatch.shader.clone();
+        if let crate::compile::Kernel::CooperativeWorkgroup { shape, bf16 } = dispatch.kernel {
+            return Variant::CoopWorkgroup(entry, shape, bf16);
+        }
         if let crate::compile::Kernel::CooperativeBF16 { output_bf16, .. } = dispatch.kernel {
             return Variant::CoopBF16(entry, output_bf16);
         }
@@ -2386,6 +2404,7 @@ pub(crate) fn select_variants(
     fuse_prologues: bool,
     allow_raw_f16: bool,
 ) {
+    workgroup::reset(plan);
     select_conv_paths(plan, coop_config, allow_raw_f16);
     select_matmul_paths(plan, coop_config, allow_raw_f16);
 
@@ -2754,6 +2773,8 @@ pub struct SessionOptions {
     pub debug: bool,
     /// Cooperative-matrix policy (see [`CoopPolicy`]).
     pub coop: CoopPolicy,
+    /// Opt-in workgroup matrix prototype; only complete unfused tiles are eligible.
+    pub workgroup_matmul: Option<crate::codegen::WorkgroupMatmulShape>,
     /// The GPU context was created with
     /// [`blade_graphics::ContextDesc::timing`], so its encoders collect pass
     /// timestamps.
@@ -3607,6 +3628,7 @@ impl Session {
             !opts.debug,
             opts.coop == CoopPolicy::AllowF16,
         );
+        workgroup::select(&mut plan, &gpu.capabilities(), &opts);
         if let Some(head_dim) = plan
             .dispatches
             .iter()

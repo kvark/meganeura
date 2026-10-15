@@ -344,6 +344,7 @@ impl SessionOptions {
         Self {
             debug: false,
             coop,
+            workgroup_matmul: None,
             // The context is created from the same variable, so the two
             // agree by construction on this path.
             gpu_timing: GPU_TIMING.bool_or(false),

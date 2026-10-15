@@ -8,7 +8,9 @@ use crate::compile::WeightFormat;
 
 mod bf16;
 mod coop_tiled;
+mod workgroup;
 pub use coop_tiled::{CooperativeMatmulShape, generate_tiled_coop_matmul};
+pub use workgroup::{WorkgroupMatmulShape, generate_workgroup_matmul};
 
 /// Forward attention staging and lane layout, independent of the EPT cap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

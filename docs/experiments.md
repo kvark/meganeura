@@ -26,6 +26,152 @@ on Arc B570 and RTX 5070. Its results are separate from the paper cohort.
 The October 6 continuation adds egglog backward-layout exploration and checks
 its coverage within the existing 60-second training search budget.
 
+## Workgroup cooperative matrices — October 15
+
+The prototype shows useful RTX 5070 gains from
+[`VK_NV_cooperative_matrix2`](https://docs.vulkan.org/features/latest/features/proposals/VK_NV_cooperative_matrix2.html).
+Workgroup scope lets several subgroups participate in one matrix operation;
+flexible dimensions allow larger logical tiles than the existing subgroup
+shapes. The local B570 driver does not expose this extension. This is a candidate
+for measured selection in the accelerated path, not a universal replacement.
+
+All three repositories publish the prototype on `experiment/workgroup-matrix`:
+
+| Repository | Published branch | Base |
+|---|---|---|
+| Meganeura | [experiment/workgroup-matrix](https://github.com/kvark/meganeura/tree/experiment/workgroup-matrix) | `f648a4534a87e29ac29810a88dfa19117f70df9b` |
+| Blade | [experiment/workgroup-matrix](https://github.com/kvark/blade/tree/experiment/workgroup-matrix) | `96c1dc731b1d5e133a6c0a8a020014619ff2e434` |
+| Naga/WGPU | [experiment/workgroup-matrix](https://github.com/kvark/wgpu/tree/experiment/workgroup-matrix) | `a97559b6318dc0a857ace502ffc7f3e442951f39` |
+
+Meganeura pins [Blade c5116fd](https://github.com/kvark/blade/commit/c5116fdac5e2b59a4c84421e46fc72bf5edc95e4),
+and both pin [Naga 2f6069d](https://github.com/kvark/wgpu/commit/2f6069d00335489bffd0da0d6fba3afed1822939).
+The experiment branches include dependency locks and build without sibling
+checkouts using `--locked`.
+
+The measurements below were collected before these commits. Their source is
+frozen as patches, new files, dependency locks and binary hashes in
+`/x/Code/inferena-results/workgroup-matrix-20261015/final-manifest.json`;
+there is no measured Git tag. Publication replaces relative path dependencies
+with exact Git revisions and updates these notes. Kernel code matches the
+frozen prototype; dependency versions are preserved. Raw results remain outside
+Git.
+
+Naga adds an optional scope argument, for example
+`coop_mat64x64<f32, C, workgroup>`, carrying it through validation, IR and
+SPIR-V. Existing syntax retains subgroup scope. Workgroup shaders require
+SPIR-V 1.6 and `SPV_NV_cooperative_matrix2`; unsupported Metal emission is
+rejected. The prototype also fixes expression emission before `coopStore`,
+which previously failed on a dynamic pointer/stride expression.
+
+Blade queries/enables the workgroup-scope and flexible-dimension features,
+records operand types, dimension granularities, required invocation counts
+and reserved shared memory, and selects SPIR-V 1.6 only for workgroup shaders.
+The RTX advertises up to 256 invocations, dimensions up to 1024, and 8192 bytes
+of reserved shared memory. Other matrix2 features, including tensor addressing
+and reductions, are not enabled or implemented here.
+
+Meganeura adds an opt-in kernel variant to the existing MatMul/MatMulBT/MatMulAT
+shader groups. F32 storage is staged through F16 workgroup arrays; BF16 storage
+loads directly; accumulation and output stay F32. Selection requires explicit
+`CoopPolicy::AllowF16` plus `SessionOptions.workgroup_matmul`. Device support,
+shared-memory capacity and complete aligned tiles are checked. Fused, batched,
+split-K, reduced-weight and BF16-output products remain on their existing paths.
+Saved workgroup choices are reset before device selection; the prototype uses
+cache format 32. Default and Auto selection are unchanged.
+
+Measurements use RTX 5070 / NVIDIA 595.91.07, Arc B570 / Mesa
+26.0.3-1ubuntu1, Linux 7.0.0-38-generic and Rust 1.98.0 on the same host.
+A 120-case exploratory sweep tried ten tiles on 512³ and 1024³ products.
+The confirmation uses one fixed tile, M=N=64, K=32, 64 invocations, across
+five shapes, three layouts and two storage modes. Three fresh processes give
+90 records, including 18 records where ragged dimensions retain the baseline.
+The two rectangular shapes and ragged shape were not used to select the tile.
+
+Each process compares sessions with the option disabled/enabled in the same
+binary, with tuning disabled. It warms each variant for 500 ms, then alternates
+ABBA/BAAB to collect 20 samples per variant; the second process reverses the
+starting order. Each sample records 64 session replays, submits and waits,
+then divides wall time by 64. BF16 timings include both explicit input-conversion
+dispatches. Compilation, allocation and correctness readback are outside the
+samples. Ordinary driver caches are retained; clocks are not locked. A 500 ms
+NVIDIA telemetry trace is retained, and no builds or other benchmark jobs ran
+concurrently. Each process has a 300-second watchdog. These are warm execution
+microbenchmarks, not cold-start or whole-model results.
+
+Times are medians of three process medians; speedups are medians of the three
+paired ratios. NN is A×B; BT and AT transpose B and A respectively.
+
+| M × N × K | Operands | Layout | Baseline → workgroup, ms | Paired speedup (range) |
+|---|---|---|---:|---:|
+| 1024 × 1024 × 1024 | F32 storage, F16 multiply | NN | 0.14783 → 0.08379 | 1.760× (1.757–1.764) |
+| 1024 × 1024 × 1024 | F32 storage, F16 multiply | BT | 0.16477 → 0.10732 | 1.536× (1.535–1.537) |
+| 1024 × 1024 × 1024 | F32 storage, F16 multiply | AT | 0.16599 → 0.14031 | 1.183× (1.182–1.183) |
+| 1024 × 1024 × 1024 | BF16 | NN | 0.16281 → 0.12646 | 1.288× (1.287–1.289) |
+| 1024 × 1024 × 1024 | BF16 | BT | 0.38346 → 0.14210 | 2.698× (2.695–2.700) |
+| 1024 × 1024 × 1024 | BF16 | AT | 0.37981 → 0.09658 | 3.932× (3.929–3.942) |
+| 128 × 1536 × 576 | BF16 | AT | 0.06436 → 0.03980 | 1.617× (1.616–1.628) |
+| 128 × 576 × 576 | BF16 | NN | 0.03502 → 0.03924 | 0.897× (0.892–0.908) |
+| 512 × 512 × 512 | F32 storage, F16 multiply | AT | 0.04381 → 0.04591 | 0.957× (0.954–0.958) |
+
+The full 30-case table, pipeline keys and ranges are in the artifact's
+`analysis.json`. Gains depend on shape/layout; the two negative rows above
+correspond to roughly 11.4% and 4.5% slower paired execution. The 128×576×576
+F32-storage baseline selects scalar F32, unlike the other F32-storage rows;
+its gains must not be presented as a comparison at identical multiply precision.
+Ragged cases use identical pipelines, with median ratios 0.999–1.006.
+
+All 120 exploratory and 90 confirmation records pass full-output F64 checks
+with exactly representable inputs; observed error is zero. A separate frozen
+quality binary passes 96 cases per GPU, checking 3,492,096 output values each,
+with Vulkan validation enabled and poisoned allocations. It covers NN/AT/BT,
+aligned/ragged shapes, two feeds, nonrepresentable F32 inputs and BF16 values
+spanning 10⁻⁹ to 10⁹. Its oracle explicitly rounds operands to the selected
+precision, then accumulates in F64. Maximum relative L2 errors against that
+oracle are 7.21e-7 on RTX and 4.33e-7 on B570. Thirty-six RTX records select
+workgroup matrices; none on B570 or under NativeF32 do. This establishes kernel
+arithmetic, not model acceptance against unrounded F32 or training convergence.
+
+Naga scope/version/roundtrip/rejection tests, Blade capability tests, Meganeura
+selection/cache tests and 39 codegen tests pass. Clippy and formatting pass for
+the affected crates. Full `cargo xtask test` runs 1,139 tests: 1,131 pass and
+eight fail, with six skipped. All eight reproduce on the unmodified pinned
+Naga/WGPU fork: the three shader-passthrough tests and five depth/stencil
+zero-initialization tests. Exact names and logs are retained in
+`wgpu-failed-tests.json`, `wgpu-full-test2.log` and `wgpu-control-failures.log`.
+Initial missing nextest/SPIR-V tools were supplied locally; tool-version-only
+SPIRV-Cross snapshot changes were archived and removed from the source diff.
+
+Before publication, rebuilding with the exact Git dependencies and locked
+versions passed the Naga and Blade capability tests, five Meganeura workgroup
+tests and 42 codegen tests. The rebuilt quality example repeated all 96 cases
+on each GPU, with 36 workgroup selections on RTX and zero on B570, the same
+maximum errors, and no Vulkan validation output.
+
+Reproduce from a checkout of the Meganeura experiment branch, one GPU job at a time:
+
+```sh
+cargo build --locked --release --example workgroup_probe --example workgroup_quality
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json TILE=64,64,32,64 \
+  timeout 300s target/release/examples/workgroup_probe > /tmp/workgroup-pair-1.jsonl
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json TILE=64,64,32,64 REVERSE=1 \
+  timeout 300s target/release/examples/workgroup_probe > /tmp/workgroup-pair-2.jsonl
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json TILE=64,64,32,64 \
+  timeout 300s target/release/examples/workgroup_probe > /tmp/workgroup-pair-3.jsonl
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json \
+  VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
+  timeout 300s target/release/examples/workgroup_quality > /tmp/workgroup-quality-rtx.jsonl
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/intel_icd.json \
+  VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
+  timeout 300s target/release/examples/workgroup_quality > /tmp/workgroup-quality-b570.jsonl
+```
+
+The production next step is to admit these shapes into the existing measured
+candidate search with its numerical and speed guards, then run whole-model
+accelerated qualification. The prototype intentionally forces the chosen tile
+when eligible, so it does not discard a slower or model-inaccurate candidate
+automatically. No additional benchmark profile is needed. Fused operations,
+partial tiles, other GPUs and whole-model/training benefits remain unmeasured.
+
 ## Compiler stages — September 10
 
 Source: `experiment/compiler-stages-2026-09-10` in
