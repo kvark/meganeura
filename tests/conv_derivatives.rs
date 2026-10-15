@@ -181,7 +181,7 @@ fn cooperative_hardware_subtile_forward_and_input_match_f64() {
 fn bf16_convolution_storage_and_master_gradients() {
     let gpu = gpu();
     assert!(
-        meganeura::codegen::bf16_cooperative_shape(
+        meganeura::codegen::checked_cooperative_shape(
             &gpu.capabilities().cooperative_matrix.bf16_f32_shapes
         )
         .is_some()

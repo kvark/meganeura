@@ -17,11 +17,13 @@ convert every F32 parameter to BF16 on each run; persistent BF16 parameter
 storage and direct BF16 model loading are not implemented yet.
 
 Dense BF16 products use the same `MatMul`/`MatMulAT`/`MatMulBT` shader groups,
-addend layouts and bindings as F32/F16 products. `Kernel::CooperativeBF16`
-records explicit operand/output storage and K partitions. Its specialized
-cooperative loop handles partial tiles and nearest-even output rounding;
-split-K partials remain F32 until reduction. Kernel selection and tuning preserve
-this storage contract. BF16 is reported as a cooperative matrix kernel in profiles.
+addend layouts and bindings as F32/F16 products. `Kernel::CooperativeTyped`
+records the operand, multiplication and output types (`codegen::MatrixTypes`)
+and K partitions. Its checked cooperative loop stages operands in the
+multiplication type, handles partial tiles and rounds a BF16 output to nearest
+even; split-K partials remain F32 until reduction. Kernel selection and tuning
+preserve this storage contract. Typed products are reported as cooperative
+matrix kernels in profiles.
 
 This is not autocast or complete mixed-precision training. BF16 graph inputs,
 parameters, outputs and unsupported operations reject explicitly; only internal

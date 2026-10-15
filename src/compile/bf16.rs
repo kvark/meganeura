@@ -4,15 +4,6 @@ use super::{ExecutionPlan, Kernel, ShaderEntry};
 use crate::schedule::PointwiseStorage;
 use std::collections::HashMap;
 
-/// Fill a small output grid without making each partition mostly staging work.
-pub(super) fn matrix_splits(m: u32, n: u32, k: u32) -> u32 {
-    let groups = m.div_ceil(32).saturating_mul(n.div_ceil(32)).max(1);
-    if k < 1024 || groups >= 128 {
-        return 1;
-    }
-    128u32.div_ceil(groups).min(k / 256).min(16)
-}
-
 pub(super) fn fuse_boundaries(plan: &mut ExecutionPlan) {
     let protected = plan.externally_visible_buffers();
     loop {
@@ -78,13 +69,13 @@ pub(super) fn fuse_boundaries(plan: &mut ExecutionPlan) {
                     || producer.pointwise_storage != PointwiseStorage::default())
             {
                 producer.pointwise_storage.bf16_output = true;
-            } else if let Kernel::CooperativeBF16 {
-                ref mut output_bf16,
+            } else if let Kernel::CooperativeTyped {
+                ref mut types,
                 splits: 1,
             } = producer.kernel
             {
-                assert!(!*output_bf16);
-                *output_bf16 = true;
+                assert_eq!(types.output, crate::DType::F32);
+                types.output = crate::DType::BF16;
             } else if let ShaderEntry::Conv2dBF16 {
                 ref mut output_bf16,
                 ..
@@ -107,28 +98,6 @@ pub(super) fn fuse_boundaries(plan: &mut ExecutionPlan) {
             }
             None if !changed => break,
             None => (),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn matrix_partitions_keep_short_and_occupied_products_unsplit() {
-        for (m, n, k, expected) in [
-            (8, 256, 1023, 1),
-            (8, 256, 1024, 4),
-            (8, 256, 2048, 8),
-            (8, 256, 4096, 16),
-            (8, 256, 65536, 16),
-            (128, 256, 2560, 4),
-            (512, 256, 2560, 1),
-            (33, 65, 1031, 4),
-            (u32::MAX, u32::MAX, 2048, 1),
-        ] {
-            assert_eq!(matrix_splits(m, n, k), expected, "{m}x{n}x{k}");
         }
     }
 }

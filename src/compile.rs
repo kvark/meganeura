@@ -1227,11 +1227,12 @@ pub enum Kernel {
         interleave_columns: bool,
     },
     Cooperative,
-    /// Explicit BF16 operands, F32 accumulation and checked partial tiles.
-    /// Multiple K partitions write F32 partials for a following SumRows;
-    /// rounding to BF16 is only legal after that reduction.
-    CooperativeBF16 {
-        output_bf16: bool,
+    /// Checked partial tiles with explicit operand, multiplication and output
+    /// types, and F32 accumulation. Multiple K partitions write F32 partials
+    /// for a following SumRows; a reduced output type is only legal after
+    /// that reduction.
+    CooperativeTyped {
+        types: crate::codegen::MatrixTypes,
         splits: u32,
     },
     /// Four subgroup tiles sharing aligned native-f32 operands. More than
@@ -1284,7 +1285,7 @@ impl Dispatch {
         matches!(
             self.kernel,
             Kernel::Cooperative
-                | Kernel::CooperativeBF16 { .. }
+                | Kernel::CooperativeTyped { .. }
                 | Kernel::CooperativeCompensated
                 | Kernel::CooperativeTiled { .. }
         )

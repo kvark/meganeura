@@ -582,7 +582,7 @@ impl TuneClass {
         ) || dispatch.use_coop_compensated()
             || matches!(
                 dispatch.kernel,
-                crate::compile::Kernel::CooperativeBF16 { .. }
+                crate::compile::Kernel::CooperativeTyped { .. }
             )
             || (dispatch.use_coop() && dispatch.weight_format.uses_reduced_storage())
             || dispatch.horizontal_batch >= 2

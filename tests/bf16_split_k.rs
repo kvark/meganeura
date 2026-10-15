@@ -1,5 +1,6 @@
 use meganeura::{
-    Graph,
+    DType, Graph,
+    codegen::MatrixTypes,
     compile::{Kernel, ShaderEntry},
 };
 
@@ -83,7 +84,7 @@ fn partitions_reduce_before_rounding_and_leave_addends_unsplit() {
             let index = plan
                 .dispatches
                 .iter()
-                .position(|d| matches!(d.kernel, Kernel::CooperativeBF16 { .. }))
+                .position(|d| matches!(d.kernel, Kernel::CooperativeTyped { .. }))
                 .unwrap();
             let product = &plan.dispatches[index];
             let splits = if add { 1 } else { 4 };
@@ -101,8 +102,11 @@ fn partitions_reduce_before_rounding_and_leave_addends_unsplit() {
             assert_eq!(product.shader, expected_entry);
             assert_eq!(
                 product.kernel,
-                Kernel::CooperativeBF16 {
-                    output_bf16: add,
+                Kernel::CooperativeTyped {
+                    types: MatrixTypes {
+                        output: if add { DType::BF16 } else { DType::F32 },
+                        ..MatrixTypes::BF16
+                    },
                     splits
                 }
             );
@@ -124,7 +128,7 @@ fn partitions_reduce_before_rounding_and_leave_addends_unsplit() {
 #[test]
 fn partitions_and_outputs_match_full_f64() {
     let gpu = crate::support::gpu::gpu();
-    if !meganeura::codegen::bf16_cooperative_shape(
+    if !meganeura::codegen::checked_cooperative_shape(
         &gpu.capabilities().cooperative_matrix.bf16_f32_shapes,
     )
     .is_some()
@@ -154,9 +158,9 @@ fn partitions_and_outputs_match_full_f64() {
                     .plan()
                     .dispatches
                     .iter()
-                    .find(|d| matches!(d.kernel, Kernel::CooperativeBF16 { .. }))
+                    .find(|d| matches!(d.kernel, Kernel::CooperativeTyped { .. }))
                     .unwrap();
-                let Kernel::CooperativeBF16 { splits, .. } = product.kernel else {
+                let Kernel::CooperativeTyped { splits, .. } = product.kernel else {
                     unreachable!()
                 };
                 let splits = splits as usize;
@@ -225,7 +229,7 @@ fn partitions_and_outputs_match_full_f64() {
 #[test]
 fn long_products_preserve_master_and_reduced_gradients() {
     let gpu = crate::support::gpu::gpu();
-    if !meganeura::codegen::bf16_cooperative_shape(
+    if !meganeura::codegen::checked_cooperative_shape(
         &gpu.capabilities().cooperative_matrix.bf16_f32_shapes,
     )
     .is_some()
