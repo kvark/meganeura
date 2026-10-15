@@ -5029,6 +5029,34 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "dense matrix products read the left operand as F32, not F16")]
+    fn reduced_left_matrix_operands_are_not_read_as_f32() {
+        // Only B carries a `WeightFormat`. The ordinary kernels used to bind
+        // this F16 operand as F32 and return unrelated values.
+        let mut graph = Graph::new();
+        let a = graph.parameter_f16("a", &[4, 8]);
+        let b = graph.parameter("b", &[8, 4]);
+        let y = graph.matmul(a, b);
+        graph.set_outputs(vec![y]);
+        compile(&graph);
+    }
+
+    #[test]
+    #[should_panic(expected = "matrix addends are F32, not F16")]
+    fn reduced_matrix_addends_are_not_read_as_f32() {
+        let mut graph = Graph::new();
+        let a = graph.input("a", &[4, 8]);
+        let b = graph.parameter_f16("b", &[8, 4]);
+        let bias = graph.parameter_f16("bias", &[4, 4]);
+        let y = graph.matmul(a, b);
+        let node = &mut graph.nodes_mut()[y as usize];
+        node.op = Op::FusedMatMulAdd;
+        node.inputs.push(bias);
+        graph.set_outputs(vec![y]);
+        compile(&graph);
+    }
+
+    #[test]
     #[should_panic(expected = "selected native-f32 attention is unsupported")]
     fn extracted_native_attention_cannot_silently_fall_back() {
         let mut graph = Graph::new();
