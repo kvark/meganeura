@@ -25,6 +25,18 @@ even; split-K partials remain F32 until reduction. Kernel selection and tuning
 preserve this storage contract. Typed products are reported as cooperative
 matrix kernels in profiles.
 
+Two explicit F16 operands select the same typed kernel with F16 multiplication,
+F32 accumulation and the same K partitions, given Blade's `shader_float16` and
+an F16/F32 cooperative shape. The F16 contract also includes subnormal operands
+(2^-24 to 2^-14), which a listed shape does not promise: session construction
+runs a one-time exact probe per context and rejects devices that flush them, as
+Mesa 26.0.3 does on B570. `runtime::typed_matrix_supported` reports all three
+requirements. BF16 subnormals lie in F32's range and follow its handling. The
+ordinary dense kernels honor reduced storage
+only in B (`WeightFormat`), so any other F16 left operand, and any reduced
+addend, is rejected at compile time instead of being read as F32. There is no
+F16 widening for derivatives, so these products are forward-only.
+
 This is not autocast or complete mixed-precision training. BF16 graph inputs,
 parameters, outputs and unsupported operations reject explicitly; only internal
 conversion, pointwise, dense-matrix and convolution storage is supported. Check

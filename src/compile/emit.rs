@@ -4,6 +4,31 @@ use super::*;
 use crate::kernels::attention_grad::{self, AttentionGrad, Part};
 use crate::kernels::conv;
 
+/// Storage of an explicit reduced-precision dense product, which runs on the
+/// typed cooperative kernel: any BF16 operand, or two F16 operands. `None`
+/// for ordinary products and other operations.
+fn typed_product_storage(graph: &Graph, node: &Node) -> Option<DType> {
+    if !matches!(
+        node.op,
+        Op::MatMul
+            | Op::MatMulAT
+            | Op::MatMulBT
+            | Op::FusedMatMulAdd
+            | Op::FusedMatMulATAdd
+            | Op::FusedMatMulBTAdd
+    ) {
+        return None;
+    }
+    let [a, b] = [0, 1].map(|i| graph.node(node.inputs[i]).ty.dtype);
+    if a == DType::BF16 || b == DType::BF16 {
+        Some(DType::BF16)
+    } else if a == DType::F16 && b == DType::F16 {
+        Some(DType::F16)
+    } else {
+        None
+    }
+}
+
 impl<'a> Compiler<'a> {
     pub(super) fn new_with_options(
         graph: &'a Graph,
@@ -56,9 +81,7 @@ impl<'a> Compiler<'a> {
                     | Op::FusedMatMulAdd
                     | Op::FusedMatMulATAdd
                     | Op::FusedMatMulBTAdd
-            ) && !node.inputs[..2]
-                .iter()
-                .any(|&id| graph.node(id).ty.dtype == DType::BF16)
+            ) && typed_product_storage(graph, node).is_none()
             {
                 let left = graph.node(node.inputs[0]).ty.dtype;
                 assert_eq!(
@@ -834,23 +857,12 @@ impl<'a> Compiler<'a> {
         let out_buf = self.get_buffer(node.id);
         let dispatch_start = self.plan.dispatches.len();
 
-        if matches!(
-            node.op,
-            Op::MatMul
-                | Op::MatMulAT
-                | Op::MatMulBT
-                | Op::FusedMatMulAdd
-                | Op::FusedMatMulATAdd
-                | Op::FusedMatMulBTAdd
-        ) && node.inputs[..2]
-            .iter()
-            .any(|&id| self.graph.node(id).ty.dtype == DType::BF16)
-        {
+        if let Some(storage) = typed_product_storage(self.graph, node) {
             assert!(
                 node.inputs[..2]
                     .iter()
-                    .all(|&id| self.graph.node(id).ty.dtype == DType::BF16),
-                "BF16 matrix products require two BF16 operands"
+                    .all(|&id| self.graph.node(id).ty.dtype == storage),
+                "{storage:?} matrix products require two {storage:?} operands"
             );
             let a = &self.graph.node(node.inputs[0]).ty.shape;
             let b = &self.graph.node(node.inputs[1]).ty.shape;
@@ -866,11 +878,11 @@ impl<'a> Compiler<'a> {
                 (a[0], a[1])
             };
             let n = if transpose_b { b[0] } else { b[1] };
-            let [m, n, k] =
-                [m, n, k].map(|dimension| u32::try_from(dimension).expect("BF16 matrix dimension"));
+            let [m, n, k] = [m, n, k]
+                .map(|dimension| u32::try_from(dimension).expect("typed matrix dimension"));
             for (rows, columns) in [(m, k), (k, n), (m, n)] {
                 rows.checked_mul(columns)
-                    .expect("BF16 matrix address space");
+                    .expect("typed matrix address space");
             }
             // Leave fused epilogues intact. Partitions must be reduced in F32
             // before any explicit BF16 output conversion.
@@ -897,7 +909,7 @@ impl<'a> Compiler<'a> {
                     _ => unreachable!(),
                 },
                 kernel: super::Kernel::CooperativeTyped {
-                    types: crate::codegen::MatrixTypes::BF16,
+                    types: crate::codegen::MatrixTypes::reduced(storage),
                     splits,
                 },
                 workgroups: grid,
