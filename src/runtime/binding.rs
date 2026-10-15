@@ -29,7 +29,7 @@ fn dense_params(dispatch: &Dispatch) -> MatMulParams {
         n,
         k,
         _pad: match dispatch.kernel {
-            Kernel::CooperativeBF16 { splits, .. } => splits,
+            Kernel::CooperativeTyped { splits, .. } => splits,
             _ => dispatch.workgroups[1],
         },
     }
@@ -1217,7 +1217,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dense_uniforms_distinguish_bf16_splits_from_gemv_columns() {
+    fn dense_uniforms_distinguish_typed_splits_from_gemv_columns() {
         for addend in [false, true] {
             for splits in [1, 4, 16] {
                 let dispatch = Dispatch {
@@ -1226,8 +1226,8 @@ mod tests {
                     } else {
                         ShaderEntry::MatMul
                     },
-                    kernel: Kernel::CooperativeBF16 {
-                        output_bf16: false,
+                    kernel: Kernel::CooperativeTyped {
+                        types: crate::codegen::MatrixTypes::BF16,
                         splits,
                     },
                     params: vec![128, 2560, 256, 0],

@@ -959,9 +959,10 @@ fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
 /// implementation once; preparation builds exactly the selected pipeline.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Variant {
-    /// Explicit BF16 operands, with F32 or rounded BF16 output. K partitions
-    /// are uniform data and do not change the pipeline.
-    CoopBF16(ShaderEntry, bool),
+    /// Checked cooperative product with explicit operand, multiplication and
+    /// output types. K partitions are uniform data and do not change the
+    /// pipeline.
+    CoopTyped(ShaderEntry, crate::codegen::MatrixTypes),
     CoopTiled(
         ShaderEntry,
         crate::codegen::CooperativeMatmulShape,
@@ -1072,7 +1073,7 @@ impl Variant {
         match *self {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
             Variant::Attention(ref e, _, _)
-            | Variant::CoopBF16(ref e, _)
+            | Variant::CoopTyped(ref e, _)
             | Variant::CoopTiled(ref e, _, _, _)
             | Variant::SplitMatmul(ref e, _, _, _)
             | Variant::SpecializedConv(ref e, _, _, _)
@@ -1097,9 +1098,17 @@ impl Variant {
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
-            Variant::CoopBF16(ref e, output_bf16) => {
-                let output = if output_bf16 { "bf16" } else { "f32" };
-                format!("{e:?}:cooperative-bf16-{output}-output")
+            Variant::CoopTyped(ref e, types) => {
+                use crate::codegen::MatrixTypes;
+                let multiply = MatrixTypes::name(types.multiply);
+                let operands = if types.a == types.multiply && types.b == types.multiply {
+                    multiply.to_owned()
+                } else {
+                    let (a, b) = (MatrixTypes::name(types.a), MatrixTypes::name(types.b));
+                    format!("{a}-{b}-as-{multiply}")
+                };
+                let output = MatrixTypes::name(types.output);
+                format!("{e:?}:cooperative-{operands}-{output}-output")
             }
             Variant::CoopTiled(ref e, shape, splits, ref prologue) => {
                 format!("{e:?}:native-f32-tiled-{shape:?}-split-k-{splits}:{prologue:?}")
@@ -1212,75 +1221,164 @@ struct Pipelines {
     dump_dir: Option<String>,
 }
 
-fn bf16_requirements(dispatches: &[Dispatch]) -> (bool, bool) {
-    let mut storage = false;
-    let mut cooperative = false;
-    for dispatch in dispatches {
-        let matrix = matches!(
-            dispatch.kernel,
-            crate::compile::Kernel::CooperativeBF16 { .. }
-        ) || matches!(dispatch.shader, ShaderEntry::Conv2dBF16 { .. });
-        storage |= matrix
-            || matches!(
-                &dispatch.shader,
-                ShaderEntry::ToBF16 | ShaderEntry::FromBF16
-            )
-            || dispatch.pointwise_storage != crate::schedule::PointwiseStorage::default();
-        cooperative |= matrix;
+/// The types of a checked cooperative product: a typed dense kernel or an
+/// explicit BF16 convolution.
+fn checked_matrix_types(dispatch: &Dispatch) -> Option<crate::codegen::MatrixTypes> {
+    use crate::codegen::MatrixTypes;
+    match (&dispatch.kernel, &dispatch.shader) {
+        (&crate::compile::Kernel::CooperativeTyped { types, .. }, _) => Some(types),
+        (_, &ShaderEntry::Conv2dBF16 { output_bf16, .. }) => Some(MatrixTypes {
+            output: if output_bf16 {
+                crate::DType::BF16
+            } else {
+                crate::DType::F32
+            },
+            ..MatrixTypes::BF16
+        }),
+        _ => None,
     }
-    (storage, cooperative)
 }
 
-fn validate_bf16_plan(gpu: &Gpu, plan: &ExecutionPlan) {
-    let (storage, cooperative) = bf16_requirements(&plan.dispatches);
+/// Reduced storage types, and the multiplication types of checked
+/// cooperative products, that a plan needs from the device.
+fn precision_requirements(dispatches: &[Dispatch]) -> (Vec<crate::DType>, Vec<crate::DType>) {
+    use crate::DType;
+    fn add(list: &mut Vec<DType>, ty: DType) {
+        if ty != DType::F32 && !list.contains(&ty) {
+            list.push(ty);
+        }
+    }
+    let mut storage = Vec::new();
+    let mut multiply = Vec::new();
+    for dispatch in dispatches {
+        if let Some(types) = checked_matrix_types(dispatch) {
+            for ty in [types.a, types.b, types.multiply, types.output] {
+                add(&mut storage, ty);
+            }
+            // An F32 multiplication still needs F32 cooperative matrices.
+            if !multiply.contains(&types.multiply) {
+                multiply.push(types.multiply);
+            }
+        }
+        if matches!(
+            &dispatch.shader,
+            ShaderEntry::ToBF16 | ShaderEntry::FromBF16
+        ) || dispatch.pointwise_storage != crate::schedule::PointwiseStorage::default()
+        {
+            add(&mut storage, DType::BF16);
+        }
+    }
+    (storage, multiply)
+}
+
+/// The cooperative M×N×K shapes a device lists for `multiply` operands with
+/// an F32 accumulator.
+fn cooperative_shapes(
+    capabilities: &blade_graphics::CooperativeMatrix,
+    multiply: crate::DType,
+) -> &[[u32; 3]] {
+    match multiply {
+        crate::DType::BF16 => &capabilities.bf16_f32_shapes,
+        crate::DType::F16 => &capabilities.f16_f32_shapes,
+        crate::DType::F32 => &capabilities.f32_shapes,
+        _ => &[],
+    }
+}
+
+fn checked_matrix_unsupported(multiply: crate::DType) -> String {
+    format!(
+        "{multiply:?} matrix products require native 16x16x16 or 8x16x16 {multiply:?}/F32 cooperative matrices"
+    )
+}
+
+fn validate_precision_plan(gpu: &Gpu, plan: &ExecutionPlan) {
+    let (storage, multiply) = precision_requirements(&plan.dispatches);
     let capabilities = gpu.capabilities();
-    assert!(
-        !storage || capabilities.shader_bfloat16,
-        "selected plan requires native BF16 shader support, but this device does not expose it"
-    );
-    assert!(
-        !cooperative
-            || crate::codegen::bf16_cooperative_shape(
-                &capabilities.cooperative_matrix.bf16_f32_shapes,
-            )
+    for ty in storage {
+        let supported = match ty {
+            crate::DType::BF16 => capabilities.shader_bfloat16,
+            crate::DType::F16 => capabilities.shader_float16,
+            _ => true,
+        };
+        assert!(
+            supported,
+            "selected plan requires native {ty:?} shader support, but this device does not expose it"
+        );
+    }
+    for ty in multiply {
+        assert!(
+            crate::codegen::checked_cooperative_shape(cooperative_shapes(
+                &capabilities.cooperative_matrix,
+                ty
+            ))
             .is_some(),
-        "BF16 matrix products require native 16x16x16 or 8x16x16 BF16/F32 cooperative matrices"
-    );
+            "{}",
+            checked_matrix_unsupported(ty)
+        );
+    }
 }
 
 #[cfg(test)]
-mod bf16_requirement_tests {
-    use super::{Dispatch, ShaderEntry, bf16_requirements, select_variants};
+mod precision_requirement_tests {
+    use super::{Dispatch, ShaderEntry, precision_requirements, select_variants};
     use crate::{
-        Graph,
-        codegen::CoopConfig,
+        DType, Graph,
+        codegen::{CoopConfig, MatrixTypes},
         compile::{self, Kernel},
     };
 
     #[test]
     fn distinguishes_storage_from_cooperative_products() {
-        assert_eq!(bf16_requirements(&[Dispatch::default()]), (false, false));
+        let typed = |types| Dispatch {
+            shader: ShaderEntry::MatMul,
+            kernel: Kernel::CooperativeTyped { types, splits: 1 },
+            ..Default::default()
+        };
         assert_eq!(
-            bf16_requirements(&[Dispatch {
+            precision_requirements(&[Dispatch::default()]),
+            (vec![], vec![])
+        );
+        assert_eq!(
+            precision_requirements(&[Dispatch {
                 shader: ShaderEntry::ToBF16,
                 ..Default::default()
             }]),
-            (true, false)
+            (vec![DType::BF16], vec![])
         );
         assert_eq!(
-            bf16_requirements(&[Dispatch {
-                shader: ShaderEntry::MatMul,
-                kernel: crate::compile::Kernel::CooperativeBF16 {
+            precision_requirements(&[typed(MatrixTypes::BF16)]),
+            (vec![DType::BF16], vec![DType::BF16])
+        );
+        assert_eq!(
+            precision_requirements(&[typed(MatrixTypes {
+                output: DType::BF16,
+                ..MatrixTypes::reduced(DType::F16)
+            })]),
+            (vec![DType::F16, DType::BF16], vec![DType::F16])
+        );
+        // F32 storage still needs F32 cooperative matrices.
+        assert_eq!(
+            precision_requirements(&[typed(MatrixTypes::reduced(DType::F32))]),
+            (vec![], vec![DType::F32])
+        );
+        assert_eq!(
+            precision_requirements(&[Dispatch {
+                shader: ShaderEntry::Conv2dBF16 {
+                    kernel_h: 3,
+                    kernel_w: 3,
+                    stride: 1,
                     output_bf16: false,
-                    splits: 1,
                 },
                 ..Default::default()
             }]),
-            (true, true)
+            (vec![DType::BF16], vec![DType::BF16])
         );
         let mut pointwise = Dispatch::default();
         pointwise.pointwise_storage.bf16_output = true;
-        assert_eq!(bf16_requirements(&[pointwise]), (true, false));
+        assert_eq!(
+            precision_requirements(&[pointwise]),
+            (vec![DType::BF16], vec![])
+        );
     }
 
     #[test]
@@ -1303,11 +1401,14 @@ mod bf16_requirement_tests {
             let product = plan
                 .dispatches
                 .iter()
-                .find(|d| matches!(d.kernel, Kernel::CooperativeBF16 { .. }))
+                .find(|d| matches!(d.kernel, Kernel::CooperativeTyped { .. }))
                 .unwrap();
             assert!(product.use_coop());
             assert_eq!(product.shader, ShaderEntry::MatMul);
-            assert_eq!(bf16_requirements(&plan.dispatches), (true, true));
+            assert_eq!(
+                precision_requirements(&plan.dispatches),
+                (vec![DType::BF16], vec![DType::BF16])
+            );
             for config in [
                 None,
                 Some(CoopConfig {
@@ -1386,7 +1487,7 @@ impl Pipelines {
         coop_config: Option<&crate::codegen::CoopConfig>,
         wgsl_dump_dir: Option<&str>,
     ) -> Self {
-        validate_bf16_plan(gpu, plan);
+        validate_precision_plan(gpu, plan);
         let mut pipelines = Self {
             map: HashMap::new(),
             selected: Vec::new(),
@@ -1535,24 +1636,24 @@ impl Pipelines {
             matmul_knobs.unroll_k = shape.unroll_k;
         }
         let group = dispatch.shader.shader_group();
-        let bf16_shape = || {
-            crate::codegen::bf16_cooperative_shape(
-                &gpu.capabilities().cooperative_matrix.bf16_f32_shapes,
-            ).ok_or_else(||
-                "BF16 matrix products require native 16x16x16 or 8x16x16 BF16/F32 cooperative matrices".to_owned())
+        let typed_shape = |multiply| {
+            let capabilities = gpu.capabilities();
+            crate::codegen::checked_cooperative_shape(cooperative_shapes(
+                &capabilities.cooperative_matrix,
+                multiply,
+            ))
+            .ok_or_else(|| checked_matrix_unsupported(multiply))
         };
         let mut layout = shader_data_layout(&dispatch.shader);
         let mut entry_point = dispatch.shader.entry_point();
         let cooperative =
             || *coop_config.expect("cooperative dispatch needs a qualified device configuration");
         let module = match *key {
-            Variant::CoopBF16(_, output_bf16) => {
-                crate::codegen::generate_module_coop_bf16_with_shape(
-                    group,
-                    output_bf16,
-                    bf16_shape()?,
-                )
-            }
+            Variant::CoopTyped(_, types) => crate::codegen::generate_module_coop_typed_with_shape(
+                group,
+                types,
+                typed_shape(types.multiply)?,
+            ),
             Variant::CoopTiled(_, shape, splits, _) => {
                 let config = cooperative();
                 if config.tile_size != 16 || config.use_f16_input || config.compensated {
@@ -1583,11 +1684,12 @@ impl Pipelines {
                 )
             }
             Variant::Scalar(_) => match group {
-                ShaderGroup::Conv2dBF16 { output_bf16, .. } => {
-                    crate::codegen::generate_module_coop_bf16_with_shape(
+                ShaderGroup::Conv2dBF16 { .. } => {
+                    let types = checked_matrix_types(dispatch).expect("BF16 convolution types");
+                    crate::codegen::generate_module_coop_typed_with_shape(
                         group,
-                        output_bf16,
-                        bf16_shape()?,
+                        types,
+                        typed_shape(types.multiply)?,
                     )
                 }
                 _ => crate::codegen::generate_module(group, matmul_knobs),
@@ -1816,8 +1918,8 @@ impl Pipelines {
     /// which unrelated pipelines happen to have been compiled.
     fn key(dispatch: &Dispatch) -> Variant {
         let entry = dispatch.shader.clone();
-        if let crate::compile::Kernel::CooperativeBF16 { output_bf16, .. } = dispatch.kernel {
-            return Variant::CoopBF16(entry, output_bf16);
+        if let crate::compile::Kernel::CooperativeTyped { types, .. } = dispatch.kernel {
+            return Variant::CoopTyped(entry, types);
         }
         if let crate::compile::Kernel::CooperativeTiled { shape, splits } = dispatch.kernel {
             return Variant::CoopTiled(
@@ -4813,7 +4915,8 @@ mod variant_tests {
     }
 
     #[test]
-    fn bf16_matmul_pipeline_keys_distinguish_operand_and_output_storage() {
+    fn typed_matmul_pipeline_keys_distinguish_operand_and_output_storage() {
+        use crate::codegen::MatrixTypes;
         use crate::compile::{Kernel, WeightFormat};
         let mut keys = std::collections::HashSet::new();
         for entry in [
@@ -4829,15 +4932,25 @@ mod variant_tests {
                 (Kernel::Cooperative, WeightFormat::F32),
                 (Kernel::Cooperative, WeightFormat::F16),
                 (
-                    Kernel::CooperativeBF16 {
-                        output_bf16: false,
+                    Kernel::CooperativeTyped {
+                        types: MatrixTypes::BF16,
                         splits: 1,
                     },
                     WeightFormat::F32,
                 ),
                 (
-                    Kernel::CooperativeBF16 {
-                        output_bf16: true,
+                    Kernel::CooperativeTyped {
+                        types: MatrixTypes {
+                            output: crate::DType::BF16,
+                            ..MatrixTypes::BF16
+                        },
+                        splits: 1,
+                    },
+                    WeightFormat::F32,
+                ),
+                (
+                    Kernel::CooperativeTyped {
+                        types: MatrixTypes::reduced(crate::DType::F16),
                         splits: 1,
                     },
                     WeightFormat::F32,
@@ -4854,11 +4967,7 @@ mod variant_tests {
                     keys.insert(key.clone()),
                     "different storage must not share a pipeline"
                 );
-                if let Kernel::CooperativeBF16 {
-                    output_bf16: false,
-                    ref mut splits,
-                } = dispatch.kernel
-                {
+                if let Kernel::CooperativeTyped { ref mut splits, .. } = dispatch.kernel {
                     *splits = 4;
                     assert_eq!(
                         Pipelines::key(&dispatch),

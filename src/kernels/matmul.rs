@@ -5,8 +5,8 @@
 //! construction then picks among the paths here, and tuning challenges the
 //! choice by measurement; both ask [`cooperative_geometry`] whether a
 //! cooperative kernel is legal, so the two cannot drift apart.
-//! Explicit BF16 storage fixes a BF16 cooperative implementation of the same
-//! product; F32/F16 candidates cannot replace its storage contract.
+//! Explicit reduced storage fixes a typed cooperative implementation of the
+//! same product; other candidates cannot replace its storage contract.
 //!
 //! Single-row products (GEMV), block-diagonal and batch-major layouts and
 //! convolutions are separate computations with their own kernels.
@@ -14,6 +14,17 @@
 use super::{Family, Rejection};
 use crate::codegen::{CoopConfig, ShaderGroup};
 use crate::compile::{Dispatch, Kernel};
+
+/// K partitions for a checked typed product: fill a small 32×32 output grid
+/// without making each partition mostly staging work. Storage and
+/// multiplication types do not change the partition contract.
+pub(crate) fn matrix_splits(m: u32, n: u32, k: u32) -> u32 {
+    let groups = m.div_ceil(32).saturating_mul(n.div_ceil(32)).max(1);
+    if k < 1024 || groups >= 128 {
+        return 1;
+    }
+    128u32.div_ceil(groups).min(k / 256).min(16)
+}
 
 /// Which product a dispatch computes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,7 +136,7 @@ impl Problem {
                     dispatch.kernel,
                     Kernel::SplitMatmul { .. }
                         | Kernel::CooperativeTiled { .. }
-                        | Kernel::CooperativeBF16 { .. }
+                        | Kernel::CooperativeTyped { .. }
                 ),
             compiled_workgroups: dispatch.workgroups.iter().product(),
         })
@@ -282,6 +293,23 @@ pub(crate) fn tiled_workgroups(problem: &Problem, tile: u32) -> [u32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matrix_partitions_keep_short_and_occupied_products_unsplit() {
+        for (m, n, k, expected) in [
+            (8, 256, 1023, 1),
+            (8, 256, 1024, 4),
+            (8, 256, 2048, 8),
+            (8, 256, 4096, 16),
+            (8, 256, 65536, 16),
+            (128, 256, 2560, 4),
+            (512, 256, 2560, 1),
+            (33, 65, 1031, 4),
+            (u32::MAX, u32::MAX, 2048, 1),
+        ] {
+            assert_eq!(matrix_splits(m, n, k), expected, "{m}x{n}x{k}");
+        }
+    }
 
     fn product(m: u32, n: u32, k: u32) -> Problem {
         Problem::plain(Layout::Plain, [m, n, k], false)

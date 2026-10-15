@@ -6,9 +6,11 @@
 
 use crate::compile::WeightFormat;
 
-mod bf16;
 mod coop_tiled;
+mod cooperative;
+mod matrix_types;
 pub use coop_tiled::{CooperativeMatmulShape, generate_tiled_coop_matmul};
+pub use matrix_types::MatrixTypes;
 
 /// Forward attention staging and lane layout, independent of the EPT cap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -775,9 +777,18 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         ShaderGroup::RoPEGrad => ShaderModule::new(
             &include_str!("shaders/rope_grad.wgsl").replace("$PARAMS", ROPE_PARAMS_WGSL),
         ),
-        ShaderGroup::Conv2dBF16 { output_bf16, .. } => {
-            bf16::generate(group, output_bf16, [16, 16, 16])
-        }
+        ShaderGroup::Conv2dBF16 { output_bf16, .. } => cooperative::generate(
+            group,
+            MatrixTypes {
+                output: if output_bf16 {
+                    crate::DType::BF16
+                } else {
+                    crate::DType::F32
+                },
+                ..MatrixTypes::BF16
+            },
+            [16, 16, 16],
+        ),
         ShaderGroup::ToBF16 | ShaderGroup::FromBF16 => {
             let narrowing = group == ShaderGroup::ToBF16;
             let source = preprocess(
@@ -964,33 +975,35 @@ pub fn generate_module_coop(group: ShaderGroup, config: &CoopConfig) -> ShaderMo
     generate_module_coop_weighted(group, config, WeightFormat::F32)
 }
 
-/// Cooperative matmul with explicit BF16 operands and F32 accumulation.
-/// The group supplies the usual transpose/addend layout; the kernel supplies
-/// storage precision. Checked scalar stores support arbitrary output tails.
-pub fn generate_module_coop_bf16(group: ShaderGroup, output_bf16: bool) -> ShaderModule {
-    generate_module_coop_bf16_with_shape(group, output_bf16, [16, 16, 16])
+/// Checked cooperative matmul with explicit operand, multiplication and
+/// output types, and F32 accumulation. The group supplies the usual
+/// transpose/addend layout; the kernel supplies the types. Checked scalar
+/// stores support arbitrary output tails.
+pub fn generate_module_coop_typed(group: ShaderGroup, types: MatrixTypes) -> ShaderModule {
+    generate_module_coop_typed_with_shape(group, types, [16, 16, 16])
 }
 
-/// Select a supported native BF16/F32 M×N×K tile. Prefer the existing square
-/// path when available; Xe2 exposes a rectangular 8×16×16 product instead.
-/// Both use the same 32×32 output block and whole 32-element K partitions.
-pub fn bf16_cooperative_shape(shapes: &[[u32; 3]]) -> Option<[u32; 3]> {
+/// Select a supported native M×N×K tile for the checked cooperative product,
+/// from the shapes a device lists for its multiplication type. Prefer the
+/// square tile; Xe2 exposes a rectangular 8×16×16 product instead. Both use
+/// the same 32×32 output block and whole 32-element K partitions.
+pub fn checked_cooperative_shape(shapes: &[[u32; 3]]) -> Option<[u32; 3]> {
     [[16, 16, 16], [8, 16, 16]]
         .into_iter()
         .find(|shape| shapes.contains(shape))
 }
 
-/// Generate a dense or implicit-GEMM BF16 product for an advertised device tile.
-pub fn generate_module_coop_bf16_with_shape(
+/// Generate a dense or implicit-GEMM checked product for an advertised device tile.
+pub fn generate_module_coop_typed_with_shape(
     group: ShaderGroup,
-    output_bf16: bool,
+    types: MatrixTypes,
     shape: [u32; 3],
 ) -> ShaderModule {
     assert!(
         coop_shape(group).is_some() || matches!(group, ShaderGroup::Conv2dBF16 { .. }),
         "no cooperative form for {group:?}"
     );
-    bf16::generate(group, output_bf16, shape)
+    cooperative::generate(group, types, shape)
 }
 
 /// [`generate_module_coop`] reading B in `format`: f32, or f16 with f16-input

@@ -9,6 +9,8 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
+// Version 31 replaces the BF16 cooperative kernel variant with typed checked
+// products that record operand, multiplication and output types.
 // Version 30 uses the ordinary dense matrix entries for BF16, with storage
 // precision and K partition count in the cooperative kernel variant.
 // Version 29 adds BF16 storage, typed pointwise boundaries and the BF16 matrix
@@ -40,7 +42,7 @@ use std::{io, path::Path};
 // Version 13 reduces loss partials into a scalar, lowers LayerNorm to the
 // two-pass kernel, carries RoPE's static offset into the dynamic kernels, and
 // changes which dispatches fusion may merge.
-const CACHE_FORMAT_VERSION: u32 = 30;
+const CACHE_FORMAT_VERSION: u32 = 31;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]

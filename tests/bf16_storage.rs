@@ -1,5 +1,6 @@
 use meganeura::{
     Graph,
+    codegen::MatrixTypes,
     compile::{Kernel, ShaderEntry},
     graph::DType,
 };
@@ -129,7 +130,7 @@ fn unsupported_device_reports_bf16_requirement_before_shader_validation() {
     let context = crate::support::gpu::gpu();
     let caps = context.capabilities();
     if caps.shader_bfloat16
-        && meganeura::codegen::bf16_cooperative_shape(&caps.cooperative_matrix.bf16_f32_shapes)
+        && meganeura::codegen::checked_cooperative_shape(&caps.cooperative_matrix.bf16_f32_shapes)
             .is_some()
     {
         eprintln!(
@@ -180,8 +181,12 @@ fn bf16_matrix_shaders_validate() {
         ShaderEntry::FusedMatMulBTAdd,
     ] {
         for output_bf16 in [false, true] {
+            let types = MatrixTypes {
+                output: if output_bf16 { DType::BF16 } else { DType::F32 },
+                ..MatrixTypes::BF16
+            };
             let shader =
-                meganeura::codegen::generate_module_coop_bf16(entry.shader_group(), output_bf16);
+                meganeura::codegen::generate_module_coop_typed(entry.shader_group(), types);
             let module = parse_with_bindings(&shader.source);
             let info = naga::valid::Validator::new(
                 naga::valid::ValidationFlags::all(),
@@ -270,8 +275,11 @@ fn bf16_connected_plan_cpu() {
     assert!(plan.dispatches.len() < plain.dispatches.len());
     assert!(plan.dispatches.iter().any(|d| matches!(
         d.kernel,
-        Kernel::CooperativeBF16 {
-            output_bf16: true,
+        Kernel::CooperativeTyped {
+            types: MatrixTypes {
+                output: DType::BF16,
+                ..
+            },
             ..
         }
     )));
@@ -369,7 +377,7 @@ fn bf16_pointwise_shaders_validate() {
 #[test]
 fn bf16_connected_forward_backward_and_updates() {
     let context = crate::support::gpu::gpu();
-    if !meganeura::codegen::bf16_cooperative_shape(
+    if !meganeura::codegen::checked_cooperative_shape(
         &context.capabilities().cooperative_matrix.bf16_f32_shapes,
     )
     .is_some()
@@ -429,7 +437,7 @@ fn bf16_connected_forward_backward_and_updates() {
 #[test]
 fn bf16_matrix_reduced_gradients() {
     let context = crate::support::gpu::gpu();
-    if !meganeura::codegen::bf16_cooperative_shape(
+    if !meganeura::codegen::checked_cooperative_shape(
         &context.capabilities().cooperative_matrix.bf16_f32_shapes,
     )
     .is_some()
@@ -497,7 +505,7 @@ fn bf16_matrix_reduced_gradients() {
 #[test]
 fn bf16_selected_dense_graph_gradients() {
     let context = crate::support::gpu::gpu();
-    if !meganeura::codegen::bf16_cooperative_shape(
+    if !meganeura::codegen::checked_cooperative_shape(
         &context.capabilities().cooperative_matrix.bf16_f32_shapes,
     )
     .is_some()
@@ -545,7 +553,7 @@ fn bf16_selected_dense_graph_gradients() {
 #[test]
 fn bf16_matrix_values_and_f32_gradients() {
     let context = crate::support::gpu::gpu();
-    if !meganeura::codegen::bf16_cooperative_shape(
+    if !meganeura::codegen::checked_cooperative_shape(
         &context.capabilities().cooperative_matrix.bf16_f32_shapes,
     )
     .is_some()
@@ -600,7 +608,7 @@ fn bf16_matrix_values_and_f32_gradients() {
                 assert!(
                     plan.dispatches
                         .iter()
-                        .any(|d| matches!(d.kernel, Kernel::CooperativeBF16 { .. }))
+                        .any(|d| matches!(d.kernel, Kernel::CooperativeTyped { .. }))
                 );
                 let report =
                     meganeura::reference::gpu::check_training(&graph, &feeds, &options).unwrap();

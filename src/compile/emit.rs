@@ -877,7 +877,7 @@ impl<'a> Compiler<'a> {
             let splits = if addend {
                 1
             } else {
-                super::bf16::matrix_splits(m, n, k)
+                crate::kernels::matmul::matrix_splits(m, n, k)
             };
             let grid = [m.div_ceil(32), n.div_ceil(32), splits];
             assert!(workgroups_within_portable_limits(grid));
@@ -896,8 +896,8 @@ impl<'a> Compiler<'a> {
                     Op::FusedMatMulBTAdd => ShaderEntry::FusedMatMulBTAdd,
                     _ => unreachable!(),
                 },
-                kernel: super::Kernel::CooperativeBF16 {
-                    output_bf16: false,
+                kernel: super::Kernel::CooperativeTyped {
+                    types: crate::codegen::MatrixTypes::BF16,
                     splits,
                 },
                 workgroups: grid,

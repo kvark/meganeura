@@ -1,0 +1,271 @@
+use super::{MatMulCoopVariant, MatrixTypes, ShaderGroup, ShaderModule, coop_shape, preprocess};
+use crate::DType;
+
+/// Dense and implicit-GEMM convolutions share the same checked cooperative
+/// loop. Operands are staged in the multiplication type; the accumulator is
+/// F32, and so are partials until their reduction.
+pub(super) fn generate(group: ShaderGroup, types: MatrixTypes, shape: [u32; 3]) -> ShaderModule {
+    types.validate();
+    assert!(
+        super::checked_cooperative_shape(&[shape]).is_some(),
+        "unsupported cooperative tile {shape:?}"
+    );
+    let [m, n, k] = shape;
+    let (declaration, dimensions, range, a, b, index, destination, add) = match group {
+        ShaderGroup::MatMul
+        | ShaderGroup::MatMulAT
+        | ShaderGroup::MatMulBT
+        | ShaderGroup::MatMulAdd
+        | ShaderGroup::MatMulATAdd
+        | ShaderGroup::MatMulBTAdd => {
+            let (addend, variant) = coop_shape(group).unwrap();
+            let mut declaration = String::from(
+                "struct Params { m: u32, n: u32, k: u32, splits: u32 }\n\
+                 var<storage> matrix_a: array<$A_TYPE>;\n\
+                 var<storage> matrix_b: array<$B_TYPE>;\n\
+                 var<storage, read_write> matrix_c: array<$OUT_TYPE>;\n\
+                 var<uniform> params: Params;\n",
+            );
+            if addend {
+                declaration.push_str("var<storage> src: array<f32>;\n");
+            }
+            (
+                declaration,
+                "let m = params.m; let n = params.n; let k = params.k;",
+                "let blocks = (k + 31u) / 32u;\n\
+                 let base = blocks / params.splits;\n\
+                 let extra = blocks % params.splits;\n\
+                 let first = (group.z * base + min(group.z, extra)) * 32u;\n\
+                 let count = base + select(0u, 1u, group.z < extra);\n\
+                 let end = min(first + count * 32u, k);",
+                if variant == MatMulCoopVariant::AT {
+                    "matrix_a[ak * m + ar]"
+                } else {
+                    "matrix_a[ar * k + ak]"
+                },
+                if variant == MatMulCoopVariant::BT {
+                    "matrix_b[bc * k + bk]"
+                } else {
+                    "matrix_b[bk * n + bc]"
+                },
+                "(group.z * m + r) * n + c",
+                "matrix_c",
+                if addend { " + src[index]" } else { "" },
+            )
+        }
+        ShaderGroup::Conv2dBF16 {
+            kernel_h,
+            kernel_w,
+            stride,
+            output_bf16,
+        } => {
+            assert!(kernel_h > 0 && kernel_w > 0 && stride > 0);
+            // Convolution operands are BF16; only the result type varies.
+            let output = if output_bf16 { DType::BF16 } else { DType::F32 };
+            assert_eq!(
+                types,
+                MatrixTypes {
+                    output,
+                    ..MatrixTypes::BF16
+                }
+            );
+            let declaration = format!(
+                "{}\n{}\nconst KH: u32 = {kernel_h}u;\nconst KW: u32 = {kernel_w}u;\n\
+                 const STRIDE: u32 = {stride}u;\n{}",
+                include_str!("../shaders/conv2d_params.wgsl"),
+                crate::divisor::SHADER,
+                include_str!("../shaders/conv2d_bf16.wgsl")
+            );
+            (
+                declaration,
+                "let m = params.out_channels; let n = params.out_h * params.out_w; let k = params.in_channels * KH * KW;",
+                "let first = 0u; let end = k;",
+                "weight[ar * k + ak]",
+                "load_pixel(group.z, bk, bc)",
+                "(group.z * m + r) * n + c",
+                "dst",
+                "",
+            )
+        }
+        _ => unreachable!(),
+    };
+    let mut extensions = String::from("enable wgpu_cooperative_matrix;\n");
+    if types.uses(DType::F16) {
+        extensions.push_str("enable f16;\n");
+    }
+    if types.uses(DType::BF16) {
+        extensions.push_str("enable wgpu_bfloat16;\n");
+    }
+    // F32 storage reaches a BF16 multiplication through nearest-even
+    // rounding; every other operand conversion is exact or a plain cast.
+    let cast = |storage| {
+        if types.multiply == DType::BF16 && storage == DType::F32 {
+            "round_bf16"
+        } else {
+            MatrixTypes::name(types.multiply)
+        }
+    };
+    let (a_cast, b_cast) = (cast(types.a), cast(types.b));
+    let rounds = types.output == DType::BF16 || a_cast == "round_bf16" || b_cast == "round_bf16";
+    let multiply = MatrixTypes::name(types.multiply);
+    ShaderModule::new(&preprocess(
+        include_str!("../shaders/matmul_checked.wgsl"),
+        &[
+            ("$EXTENSIONS", &extensions),
+            ("$DECL", &declaration),
+            ("$DIMS", dimensions),
+            ("$RANGE", range),
+            ("$A_LOAD", a),
+            ("$B_LOAD", b),
+            ("$INDEX", index),
+            ("$DEST", destination),
+            (
+                "$ROUND",
+                if rounds {
+                    include_str!("../shaders/bf16_round.wgsl")
+                } else {
+                    ""
+                },
+            ),
+            ("$A_TYPE", MatrixTypes::name(types.a)),
+            ("$B_TYPE", MatrixTypes::name(types.b)),
+            ("$A_CAST", a_cast),
+            ("$B_CAST", b_cast),
+            ("$OUT_TYPE", MatrixTypes::name(types.output)),
+            (
+                "$STORE",
+                if types.output == DType::BF16 {
+                    "round_bf16"
+                } else {
+                    MatrixTypes::name(types.output)
+                },
+            ),
+            ("$ADD", add),
+            // WGSL names cooperative matrices columns × rows, whereas device
+            // capabilities and the product shape are M × N × K.
+            ("$A_TILE", &format!("coop_mat{k}x{m}<{multiply}, A>")),
+            ("$B_TILE", &format!("coop_mat{n}x{k}<{multiply}, B>")),
+            ("$C_TILE", &format!("coop_mat{n}x{m}<f32, C>")),
+            ("$MULTIPLY_TYPE", multiply),
+            ("$TILES_N", &(32 / n).to_string()),
+            ("$TILES", &(32 / m * (32 / n)).to_string()),
+            ("$TILE_M", &m.to_string()),
+            ("$TILE_N", &n.to_string()),
+        ],
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_shape_selection_requires_an_implemented_product() {
+        use crate::codegen::checked_cooperative_shape as select;
+        assert_eq!(select(&[]), None);
+        assert_eq!(select(&[[16, 8, 16], [8, 8, 8], [8, 16, 32]]), None);
+        assert_eq!(select(&[[8, 16, 16]]), Some([8, 16, 16]));
+        assert_eq!(select(&[[8, 16, 16], [16, 16, 16]]), Some([16, 16, 16]));
+    }
+
+    #[test]
+    fn typed_operand_combinations_are_validated() {
+        for types in [
+            MatrixTypes::BF16,
+            MatrixTypes::reduced(DType::F16),
+            MatrixTypes::reduced(DType::F32),
+            MatrixTypes {
+                a: DType::F32,
+                b: DType::F16,
+                multiply: DType::F16,
+                output: DType::BF16,
+            },
+            MatrixTypes {
+                a: DType::BF16,
+                b: DType::F16,
+                multiply: DType::F32,
+                output: DType::F32,
+            },
+        ] {
+            assert!(types.is_valid(), "{types:?}");
+        }
+        for types in [
+            // Neither half-precision format converts exactly to the other.
+            MatrixTypes {
+                b: DType::F16,
+                ..MatrixTypes::BF16
+            },
+            MatrixTypes {
+                output: DType::U32,
+                ..MatrixTypes::BF16
+            },
+        ] {
+            assert!(!types.is_valid(), "{types:?}");
+        }
+    }
+
+    #[test]
+    fn convolution_and_dense_modules_validate_and_emit_spirv() {
+        let capabilities = naga::valid::Capabilities::SHADER_BFLOAT16
+            | naga::valid::Capabilities::SHADER_FLOAT16
+            | naga::valid::Capabilities::COOPERATIVE_MATRIX
+            | naga::valid::Capabilities::COOPERATIVE_MATRIX_BFLOAT16
+            | naga::valid::Capabilities::SUBGROUP;
+        let mut cases = Vec::new();
+        for shape in [[16, 16, 16], [8, 16, 16]] {
+            for output_bf16 in [false, true] {
+                let output = if output_bf16 { DType::BF16 } else { DType::F32 };
+                cases.push((
+                    ShaderGroup::Conv2dBF16 {
+                        kernel_h: 2,
+                        kernel_w: 4,
+                        stride: 2,
+                        output_bf16,
+                    },
+                    MatrixTypes {
+                        output,
+                        ..MatrixTypes::BF16
+                    },
+                    shape,
+                ));
+                for storage in [DType::BF16, DType::F16, DType::F32] {
+                    for multiply in [DType::BF16, DType::F16, DType::F32] {
+                        let types = MatrixTypes {
+                            a: storage,
+                            b: DType::F32,
+                            multiply,
+                            output,
+                        };
+                        if types.is_valid() {
+                            cases.push((ShaderGroup::MatMulBTAdd, types, shape));
+                        }
+                    }
+                }
+            }
+        }
+        for (group, types, shape) in cases {
+            let mut module = generate(group, types, shape);
+            let mut binding = 0;
+            for (_, global) in module.module.global_variables.iter_mut() {
+                if matches!(
+                    global.space,
+                    naga::AddressSpace::Uniform | naga::AddressSpace::Storage { .. }
+                ) {
+                    global.binding = Some(naga::ResourceBinding { group: 0, binding });
+                    binding += 1;
+                }
+            }
+            let info =
+                naga::valid::Validator::new(naga::valid::ValidationFlags::all(), capabilities)
+                    .validate(&module.module)
+                    .unwrap_or_else(|error| panic!("{group:?} {types:?} {shape:?}: {error:?}"));
+            let options = naga::back::spv::Options {
+                lang_version: (1, 3),
+                flags: naga::back::spv::WriterFlags::empty(),
+                ..Default::default()
+            };
+            let words = naga::back::spv::write_vec(&module.module, &info, &options, None).unwrap();
+            assert!(!words.is_empty());
+        }
+    }
+}
