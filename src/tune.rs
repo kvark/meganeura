@@ -1108,8 +1108,8 @@ pub enum TuneCalibration {
     /// No profile: classes keep their structural order, with no time-share cutoff.
     #[default]
     Off,
-    /// Measure the machine within a bounded part of the budget, once per
-    /// context in this process.
+    /// Measure the machine within a bounded part of the budget, reusing the
+    /// context's profile. Larger allowances can fill missing measurements.
     Measure,
     /// Use this profile, measured earlier or supplied by the caller.
     Profile(MachineProfile),
@@ -1138,7 +1138,7 @@ pub struct MachineProfile {
     /// Concurrent 256-invocation workgroups, each with 16 KiB of workgroup
     /// memory, before a fixed-work kernel slows down.
     pub parallel_width: Option<u32>,
-    /// Wall time spent measuring this profile.
+    /// Cumulative wall time spent measuring and completing this profile.
     pub elapsed: Duration,
 }
 
@@ -1190,7 +1190,9 @@ pub struct TuneOptions {
     #[serde(default)]
     pub scope: TuneScope,
     pub max_classes: usize,
-    /// GPU comparison scratch including staging, not pipelines.
+    /// Comparison/calibration buffers including staging and a conservative
+    /// 1 MiB encoder-scratch allowance per command buffer. Excludes pipelines
+    /// and opaque driver command/descriptor allocations.
     pub max_scratch_bytes: usize,
     /// Defaults to Download. Does not alter scratch binding placement,
     /// validation or kernel candidates.
@@ -1479,13 +1481,14 @@ pub struct TuneScratchUsage {
     pub baseline_reused: bool,
 }
 
-/// Private scratch lifetime and peak simultaneous allocation requests in one call.
+/// Private scratch lifetime and peak simultaneous buffer budget in one call.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuneScratchStats {
     pub staging_allocations: usize,
     pub staging_reuses: usize,
     pub staging_releases: usize,
-    /// Binding requests plus the one staging buffer, never pipelines/driver heaps.
+    /// Binding requests, staging and encoder-scratch allowances; excludes
+    /// pipelines and opaque driver allocations. Older reports omit encoders.
     pub peak_bytes: usize,
     /// Must be zero when `tune_with` returns, including bounded/failed searches.
     pub retained_staging_bytes: usize,
@@ -1526,7 +1529,8 @@ pub struct TuneReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_profile: Option<MachineProfile>,
     /// Calibration charged to this call, zero when a supplied/cached profile
-    /// was used. `MachineProfile::elapsed` describes its original measurement.
+    /// was reused without further measurement. `MachineProfile::elapsed`
+    /// describes the cumulative measurement time.
     #[serde(default)]
     pub calibration_time: Duration,
     /// Predicted time of one plan execution, from the machine profile.

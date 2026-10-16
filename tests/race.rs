@@ -103,6 +103,69 @@ fn race_decides_every_challenger_and_keeps_live_outputs() {
 }
 
 #[test]
+fn host_encoder_scratch_is_bounded_and_a_larger_search_can_retry() {
+    let mut session = product(crate::support::gpu::gpu(), false);
+    let before = run(&mut session);
+    // The bindings, staging and shared encoder fit, but the candidate host
+    // encoders do not. This used to run anyway, exceeding the caller's limit.
+    let report = session
+        .tune_with(TuneOptions {
+            max_scratch_bytes: 2 << 20,
+            ..race_options()
+        })
+        .unwrap();
+    assert_eq!(report.races.len(), 1, "{report:#?}");
+    assert!(!report.races[0].complete);
+    assert_eq!(report.races[0].rounds, 0);
+    assert!(
+        report
+            .outcomes
+            .iter()
+            .any(|o| o.decision == TuneDecision::ScratchLimit)
+    );
+    assert_eq!(report.scratch.unwrap().peak_bytes, 0);
+    assert_eq!(run(&mut session), before);
+    let report = session.tune_with(race_options()).unwrap();
+    check_race(&report);
+    // All live candidate encoders plus the upload/qualification encoder.
+    assert!(report.scratch.unwrap().peak_bytes > (report.races[0].candidates + 1) * (1 << 20));
+    assert_eq!(run(&mut session), before);
+}
+
+#[test]
+fn a_later_tuning_call_completes_its_cached_profile() {
+    let gpu = std::sync::Arc::new(
+        meganeura::init_gpu_context_with(meganeura::GpuOptions {
+            timing: false,
+            ..meganeura::GpuOptions::from_env()
+        })
+        .unwrap(),
+    );
+    let mut session = product(gpu, false);
+    let first = session
+        .tune_with(TuneOptions {
+            calibration: TuneCalibration::Measure,
+            max_scratch_bytes: 1 << 20,
+            ..race_options()
+        })
+        .unwrap();
+    assert!(first.machine_profile.unwrap().bandwidth.is_none());
+    assert!(first.calibration_time.is_zero());
+    let second = session
+        .tune_with(TuneOptions {
+            calibration: TuneCalibration::Measure,
+            ..race_options()
+        })
+        .unwrap();
+    assert!(
+        second.machine_profile.as_ref().unwrap().bandwidth.is_some(),
+        "{second:#?}"
+    );
+    assert!(!second.calibration_time.is_zero());
+    check_race(&second);
+}
+
+#[test]
 fn races_use_gpu_timestamps_when_the_context_records_them() {
     let options = meganeura::GpuOptions::from_env();
     let supported = meganeura::init_gpu_context_with(options.clone())
@@ -121,9 +184,17 @@ fn races_use_gpu_timestamps_when_the_context_records_them() {
     );
     let mut session = product(gpu, true);
     let before = run(&mut session);
-    let report = session.tune_with(race_options()).unwrap();
+    // Timestamp rounds share the scratch encoder, so they fit the same small
+    // allowance that cannot accommodate per-candidate host encoders.
+    let report = session
+        .tune_with(TuneOptions {
+            max_scratch_bytes: 2 << 20,
+            ..race_options()
+        })
+        .unwrap();
     check_race(&report);
     assert!(report.races[0].gpu_timestamps);
+    assert!(report.scratch.unwrap().peak_bytes <= 2 << 20);
     assert_eq!(run(&mut session), before, "tuning changed the live program");
 }
 

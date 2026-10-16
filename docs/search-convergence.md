@@ -89,20 +89,30 @@ does not look anything up by device name.
 | Parallel width | Fixed work at doubling workgroup counts, until time grows | Wave quantization |
 
 `tune::MachineProfile` is plain serializable data. Calibration is bounded by a
-fraction of the tuning budget (one tenth, at most 250 ms) and runs once per
-context/timing mode in a process, only when there is new work to probe. It is
-charged to the tuning call, never to a `kernel_probes_pending` query, and
+fraction of the tuning budget (one tenth, at most 250 ms), with measurements
+reused per context/timing mode in a process. It runs only when there is new
+work to probe. It is charged to the tuning call, never to a
+`kernel_probes_pending` query, and
 respects the scratch limit and device headroom. Sub-budgets leave time for
 bandwidth and matmul after overhead/width discovery. Deadlines are soft: an
 in-flight compilation or measurement cannot be preempted, but an expired
 stage does not start more probes.
 
 Partial profiles are cached too, so a short allowance does not repeatedly
-spend every trial's budget without getting to the kernel search. Missing
-measurements leave structural ordering in place. The cache's global lock is
-not held while measuring. A caller can pass a validated, finite profile
-instead; nothing is persisted. `TuneReport::calibration_time` reports cost in
-this call, while `MachineProfile::elapsed` describes the original measurement.
+spend every trial's budget without getting to the kernel search. A later call
+with more time or scratch space can fill missing measurements while retaining
+completed ones. Previously tried resource combinations suppress redundant
+retries; a complete profile is reused even with a larger allowance. Readers
+continue to see the last profile during an upgrade, and another search does
+not wait for calibration already in progress.
+
+Missing bandwidth leaves structural ordering in place; missing matrix
+throughput alone gives a memory-only prediction. The cache's global and
+profile-state locks are not held while measuring. A caller can pass a
+validated, finite profile instead; nothing is persisted.
+`TuneReport::calibration_time` reports measurement cost in this call (zero on
+reuse), while `MachineProfile::elapsed` accumulates measurement time across
+upgrades.
 
 ### Cost model
 
@@ -126,8 +136,15 @@ A class's incumbent and all of its legal challengers are measured together.
    builder's `compile_all` pool. Workers stop starting new jobs at the search
    deadline; skipped jobs are retryable, not shader rejections. Up to eight
    already-running driver calls may overrun it.
-2. Allocate one scratch for the class, sized for its largest candidate, and
-   upload ordinary-magnitude inputs once.
+2. Check the full scratch allowance after compilation, then allocate one
+   scratch for the class, sized for its largest candidate, and upload
+   ordinary-magnitude inputs once. The allowance includes staging, the shared
+   upload/qualification encoder and one host encoder per compiled candidate.
+   Rejected candidates get no encoder. Each single-buffer encoder reserves
+   1 MiB, matching the pinned Blade Vulkan uniform buffer and conservatively
+   charged on other backends. Pipelines and opaque driver command/descriptor
+   allocations are outside this buffer budget. Device headroom is rechecked
+   before allocation. A limit leaves the class retryable.
 3. Run rounds. With GPU timestamps, a round is one submission holding one timed
    pass per candidate. Every rotated round is followed by its reverse, with
    the same candidates, to balance position-dependent drift. Every dispatch
@@ -220,7 +237,7 @@ sequential, uncalibrated search explicitly. This section records what has
 landed on the branch.
 
 - [x] Machine profile and calibration (`runtime/calibration.rs`), cached per
-  context in a process.
+  context in a process, with missing measurements retried on larger allowances.
 - [x] Class races with parallel compilation and finalist-only qualification
   (`runtime/tuning/race.rs`), timed by GPU timestamps when the session's
   context records them.
@@ -234,227 +251,11 @@ landed on the branch.
   `BuildSearchReport::machine_profile` and supplied to every later trial.
 - [ ] Whole-program changes from the next phase.
 
-Historical pre-review lavapipe comparison at `0d02d3e` (CPU emulation, so only
-the search behaviour transfers), 30-second budget, the example's
-SmolLM2-shaped block. This predates synchronized repetitions and balanced
-rounds and is not validation of the revised policy:
-
-| Strategy | Search | Classes | Comparisons | Qualified | Winners |
-|---|---:|---:|---:|---:|---:|
-| Sequential | 30.1 s, budget hit | 2 of 4 | 12 | 12 | 0 |
-| Race, calibrated | 15.2 s | 4 of 4 | 42 | 1 | 1 |
-
-### Review smoke check — RX 7900 XT, October 16
-
-The revised code was checked with the process-local Mesa 26.2.4 build used
-for BF16 experiments, a warm driver cache, and the example's 2-second budget.
-Each policy ran twice in reversed policy order on fresh sessions/contexts;
-the table gives the observed ranges, not confidence intervals. Other users'
-background GPU clients were not stopped. No other review test/build was run
-concurrently with these final measurements. This is a small block, not an
-Inferena cohort or a controlled whole-model performance claim.
-
-| Context timing | Policy | Search (s) | Selected step (ms) |
-|---|---|---:|---:|
-| Host | Sequential | 0.279–0.290 | 0.1442–0.1444 |
-| Host | Race + profile | 0.216–0.222 | 0.1492–0.1525 |
-| Host | Race, no profile | 0.146–0.147 | 0.1490–0.1491 |
-| GPU timestamps | Sequential (host-timed duels) | 0.270–0.271 | 0.1412–0.1413 |
-| GPU timestamps | Race + profile | 0.066–0.069 | 0.1469–0.1474 |
-| GPU timestamps | Race, no profile | 0.120–0.122 | 0.1464–0.1502 |
-
-All runs covered 3/3 eligible classes and 31 challengers. Sequential qualified
-31 candidates, host races 2, and timestamp races 3. Profiling cost 67–70 ms in
-host mode and 30–33 ms with timestamps. It reduced timestamp repetition counts
-enough to repay calibration here, but added cost in host mode. More importantly,
-the raced selections had slightly **worse** post-search step times than sequential
-search. Lower search latency and fewer qualifications do not establish better
-convergence. These observations motivated the investigation below; they are
-not the results of the final default policy.
-
-Reproduce the policy orders with `cargo run --release --all-features --example
-search_race -- 2 sequential race race-uncalibrated race-uncalibrated race
-sequential`; with `MEGANEURA_GPU_TIMING=1`, use `2 race-uncalibrated race
-sequential sequential race race-uncalibrated`. Use the same ICD/device for both.
-
-### AMD regression diagnosis and correction
-
-Two distinct problems explained the regression, without changing warmup or
-numerical qualification:
-
-1. **Host descriptor-cache churn hid a GEMV win.** The same 32-lane GEMV with
-   four column groups measured about 8–10 us in sequential duels but 12–18 us
-   in a shared-encoder host race. Instrumenting encoding and submission/wait
-   exposed the extra cost; Blade's `reset_descriptor_pool` discards layouts
-   unused in the previous recording. Separate reusable host encoders reduced
-   steady-state encoding from roughly 45–55 us to 2–3 us per 16-dispatch batch,
-   and the race found the GEMV improvement. Buffers remain shared, and GPU
-   timestamp races still use one encoder/submission per round.
-2. **Finalists were ranked below the configured resolution.** After fixing
-   host timing, both timing paths preferred eight GEMV column groups over four
-   for only a roughly 1–2% isolated gain. The shared-context experiment swapped
-   just that choice between retained sessions: the approximately 5 us
-   whole-program penalty followed the eight-group choice. With serial dispatch
-   the penalty disappeared (174.8 versus 174.9 us after the swap); per-dispatch
-   profiling also showed near-equal GEMV times. This implicates interaction with
-   overlapping dispatches rather than a slower isolated kernel. The original
-   5% plus noise guard applied only against the original incumbent, not between
-   finalists. Applying it there as well retains the four-group candidate here.
-
-Release recheck on the same RX 7900 XT/private Mesa, 2-second budgets, warm
-driver cache, two visits per policy in reversed order, without concurrent
-review builds/tests (other users' clients remain untouched):
-
-| Context timing | Policy | Search (s) | Post-search step (ms) |
-|---|---|---:|---:|
-| Host | Sequential | 0.275–0.280 | 0.1377–0.1403 |
-| Host | Race + profile | 0.201 | 0.1370–0.1389 |
-| Host | Race, no profile | 0.131–0.134 | 0.1386–0.1393 |
-| GPU timestamps | Sequential (host-timed duels) | 0.270–0.273 | 0.1428 |
-| GPU timestamps | Race + profile | 0.067 | 0.1426–0.1434 |
-| GPU timestamps | Race, no profile | 0.123–0.127 | 0.1443–0.1477 |
-
-The default race qualifies three winners rather than all 31 challengers and
-selects the same dense tiles and four-group GEMV as sequential in these runs.
-The example now also retains all programs and times interleaved held-out steps
-in balanced order, independently of which search last warmed the device.
-Those medians were 144.6–145.9 us sequential versus 146.4–146.9 us calibrated
-race in host mode, and 163.1–165.3 versus 162.6–162.8 us with timestamps. A
-shared-context host pair had identical selections (zero choices to swap) and
-139.6 versus 139.5 us, then 139.8 versus 139.8 us after the swap. This removes
-the reproducible regression above; small differences between fresh contexts
-are not evidence of better kernels. It remains a small-block test, not a claim
-of optimality or a whole-model cohort result.
-
-Set `MEGANEURA_SEARCH_VERBOSE=1` to print every candidate's raw samples and
-decision. `MEGANEURA_SEARCH_SHARED_CONTEXT=1` shares the context/profile across
-fresh sessions; with two strategies it also swaps their selected kernels and
-repeats the held-out comparison. `MEGANEURA_SERIAL_DISPATCH=1` separates the
-effect of overlapping dispatches. Never infer whole-program improvements from
-isolated scratch wins alone: `build_measured` retains its whole-step guard.
-
-### B570 and RTX 5070 validation — October 16
-
-Tested `180946f` against main `12df95c`, with the same Blade `96c1dc7` and
-Naga `a97559b` pins. The host ran Linux `7.0.0-38-generic`, Mesa
-`26.0.3-1ubuntu1` on B570 and NVIDIA `595.91.07` on RTX 5070. GPU jobs ran
-serially with process-tree watchdogs and no concurrent builds. Clocks were
-recorded but not fixed. Kernel memos were private to each search; primary
-driver caches were warm, with separate fresh-cache experiments.
-
-The Inferena runner at `7cecdc6` used 30 seconds of search per session,
-10 seconds of warmup and 20 held-out samples. Five models (SmolLM2-135M,
-Whisper-tiny, SmolVLA, ResNet-50 and the small Stable Diffusion U-Net) ran
-in strict and accelerated profiles on both GPUs: 20 PR configurations.
-Six configurations had fresh main controls; the other 14 used earlier main
-measurements under the same protocol. Reversed-order repeats covered B570
-SD strict and RTX SD accelerated. Forward/backward below excludes optimizer
-updates, and all four rows use fresh main controls.
-
-| GPU / model / profile | Main forward/backward (ms) | Race forward/backward (ms) |
-|---|---:|---:|
-| B570 / SmolLM2-135M / strict | 55.388 | 53.654 |
-| B570 / ResNet-50 / strict | 53.352 | 50.255 |
-| RTX 5070 / ResNet-50 / strict | 27.721 | 25.135 |
-| RTX 5070 / SD / accelerated | 4.960 | 4.594 |
-
-The reversed RTX SD pair was 4.935 versus 4.593 ms. These are useful fast
-paths, not a claim that every selected program improved. In particular,
-RTX ResNet strict latency rose from 2.415 to 2.508 ms in its fresh pair.
-B570 SD strict needs further selection/operating-state investigation:
-
-| B570 SD protocol | Main inference / latency / forward+backward (ms) | Race inference / latency / forward+backward (ms) |
-|---|---:|---:|
-| Normal pair 1 | 4.055 / 4.199 / 11.379 | 4.266 / 4.267 / 11.412 |
-| Reversed normal pair 2 | 4.220 / 4.195 / 11.369 | 4.277 / 5.020 / 11.231 |
-| Separate 30s warmup, 100 samples | 4.931 / 4.327 / 10.914 | 4.989 / 4.439 / 11.061 |
-
-Pair 2 selected a flash-attention latency variant and reached lower clocks
-near the held-out measurement. The 19.7% outlier did not recur in the longer
-warmup pair, but that pair was still 1–3% slower. Plan choice and clock behavior
-are not isolated; do not discard the outlier, average different protocols, or
-claim no performance regressions from these runs.
-
-Shorter search budgets also miss fast paths. Each cell below is one fresh
-search followed by the normal held-out forward/backward measurement:
-
-| GPU / model / profile | 5s search | 10s | 20s | 30s |
-|---|---:|---:|---:|---:|
-| B570 / SmolLM2-135M / strict | 85.823 ms | 85.818 ms | 54.881 ms | 53.654 ms |
-| RTX 5070 / ResNet-50 / strict | 28.626 ms | 28.670 ms | 27.571 ms | 25.135 ms |
-| RTX 5070 / SD / accelerated | 8.804 ms | 8.797 ms | 4.983 ms | 4.594 ms |
-
-Keep 30 seconds per session for this cohort. Faster kernel races do not
-remove construction, qualification and whole-program comparison costs.
-
-Kernel-only scaling used 1, 4, 16 and 64 independent matrix classes, budgets
-of 2 and 10 seconds, and sequential, calibrated-race and uncalibrated-race
-policies. The 64-class results at the 10-second limit were:
-
-| GPU / timing / driver cache | Sequential search / classes visited | Calibrated race / classes visited |
-|---|---:|---:|
-| B570 / host / warm | 10.001s / 53 | 3.608s / 64 |
-| RTX 5070 / host / warm | 6.737s / 64 | 2.703s / 64 |
-| B570 / host / fresh | 10.001s / 55 | 3.672s / 64 |
-| RTX 5070 / host / fresh | 6.745s / 64 | 2.722s / 64 |
-| B570 / timestamps / warm | 10.001s / 51 | 2.380s / 64 |
-| RTX 5070 / timestamps / warm | 6.912s / 64 | 1.680s / 64 |
-
-Construction compiles incumbent pipelines before this tuning timer. A visited
-class can be partial at a deadline; the races above completed all 64. Profile
-startup can outweigh the race gain for a single class. Timestamp experiments
-do not measure whole-model overhead of enabling timestamps on the context.
-The campaign exercises existing candidate lists, up to 24 candidates per
-race, without #261's rectangular candidates or its cumulative budget policy.
-
-**Retain the whole-program gate.** A separate control held two initially
-identical sessions in one context, tuned only one, then warmed them in
-alternating order for 10 seconds and collected 30 balanced pairs. Both
-outputs passed an exact constant-product oracle. On the 64-class graph:
-
-| GPU / policy | Untuned control (ms) | Tuned (ms) | Full-graph change |
-|---|---:|---:|---:|
-| B570 / race | 1.6941 | 1.8016 | +6.34% |
-| B570 / sequential | 1.7003 | 1.7878 | +5.15% |
-| RTX 5070 / race | 0.7023 | 0.7957 | +13.29% |
-| RTX 5070 / sequential | 0.7014 | 0.7948 | +13.32% |
-
-Private kernel wins can lose when composed, with either strategy. These
-percentages compare each tuned session to its untuned control, not race
-against sequential. `Session::tune_with` intentionally does not execute the
-live graph. `build_measured` preserves the ordinary fallback, qualifies each
-challenger and requires paired whole-program timing before replacement.
-Cached choices must pass that same gate. Neither class coverage nor a memo
-hit is a reason to bypass it, and short search-time comparisons do not prove
-performance under every sustained operating state.
-
-The consolidated example reproduces the control and scaling workload:
-
-```sh
-MEGANEURA_SEARCH_CLASSES=64 MEGANEURA_SEARCH_SHARED_CONTEXT=1 \
-  MEGANEURA_SEARCH_WARMUP_SECONDS=10 \
-  cargo run --release --all-features --example search_race -- 10 untuned race
-```
-
-Use `untuned sequential` for the other control and `sequential race
-race-uncalibrated` for coverage comparisons; vary the class count through
-1, 4, 16 and 64. Pick the same ICD/device for each comparison. The example
-also swaps choices between a shared-context pair and repeats the timing.
-Its immediate before/after samples are labelled diagnostic; use the balanced
-held-out samples for comparisons. Search-time correctness gates remain active,
-and every scaling output is checked before and after tuning and after swaps.
-These example controls observe whole-program effects; they do not replace
-`build_measured`'s acceptance decision.
-
-Across the hardware campaign, 119/119 selected-session native qualification
-checks passed in 41 model processes, including controls and budget sweeps.
-All 92 scaling processes completed; 80 independent-matrix cases matched an
-exact output oracle, while 12 SmolLM2-block cases had no extra external
-oracle. Both public-API memo retry probes passed. Library tests (628 passed,
-8 ignored), six race/state tests on each GPU, 20 RTX search tests, library
-Clippy and formatting also passed. No independent PyTorch whole-model oracle
-was rerun. The hardware results above describe `180946f`; subsequent example
-and regression-test cleanup does not change production search behavior.
+Hardware experiments and historical comparisons are in
+[Experiments: kernel search races](experiments.md#kernel-search-races--october-16).
+The reproduction harness remains `examples/search_race.rs`; its scaling and
+untuned controls observe whole-program effects without replacing
+`build_measured`'s acceptance gate.
 
 ## Follow-ups outside the main plan
 
@@ -484,7 +285,8 @@ elapsed time and the selected program's held-out time.
 
 Review regression coverage includes transient failures remaining retryable,
 cached tails restored with no probe slots, non-mutating pending-work checks,
-partial-profile reuse, expired compilation budgets, balanced round order,
+partial-profile upgrades and reuse, encoder scratch limits, expired compilation
+budgets, balanced round order,
 invalid supplied profiles, host/timestamped F16 split sequences, finalist
 margin/noise guards, non-chaining ties, and preservation
 of live training/optimizer state. Broader performance validation still needs repeated
@@ -492,10 +294,5 @@ paired whole-model runs, cold/warm compilation, host/timestamp modes, short
 and long budgets, and shared memo reuse. One small block or CPU-emulated run
 does not establish that the search has converged.
 
-Validation of the reviewed tree: 628 library tests and 174 regressions passed
-on lavapipe (8 and 21 ignored); unsupported native-matrix cases skip there.
-On RX 7900 XT, six race/state tests (including native F16 split-K) and the
-timestamped calibration test passed with Vulkan synchronization validation
-enabled, without synchronization hazards. Formatting, all-target/all-feature
-Clippy with warnings denied, the featureless check, and documentation build
-also passed. These are correctness checks, separate from the smoke timings.
+Recorded hardware results and revision-specific validation are in
+[Experiments: kernel search races](experiments.md#kernel-search-races--october-16).

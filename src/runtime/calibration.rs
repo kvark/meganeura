@@ -11,7 +11,7 @@ use super::{Gpu, Pipelines, Session, create_gen_shader, create_profiled_pipeline
 use crate::compile::{BufferRef, Dispatch, ShaderEntry};
 use crate::tune::{MachineProfile, median};
 use blade_graphics as bg;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 /// `dst = src * a + b` over vec4 elements: one read and one write per element.
@@ -101,7 +101,75 @@ const MAX_MATMUL: usize = 2048;
 /// Largest streaming buffer, per direction.
 const MAX_STREAM_BYTES: usize = 64 << 20;
 
-type ProfileEntry = (Weak<Gpu>, bool, Arc<OnceLock<MachineProfile>>);
+#[derive(Clone, Copy)]
+struct Resources {
+    budget: Duration,
+    scratch_bytes: usize,
+}
+
+impl Resources {
+    fn covers(self, other: Self) -> bool {
+        self.budget >= other.budget && self.scratch_bytes >= other.scratch_bytes
+    }
+}
+
+#[derive(Default)]
+struct ProfileState {
+    profile: Option<MachineProfile>,
+    // Keep the resource frontier, not independent maxima: (long, small) and
+    // (short, large) have not tried the combination (long, large).
+    attempted: Vec<Resources>,
+}
+
+#[derive(Default)]
+struct ProfileCache {
+    state: Mutex<ProfileState>,
+    measuring: Mutex<()>,
+}
+
+impl ProfileCache {
+    fn get(&self) -> Option<MachineProfile> {
+        self.state.lock().unwrap().profile.clone()
+    }
+
+    fn measure(
+        &self,
+        resources: Resources,
+        calibrate: impl FnOnce(&mut MachineProfile),
+    ) -> MachineProfile {
+        // Do not spend this caller's search budget waiting for another search.
+        // Readers keep seeing the last completed profile during an upgrade.
+        let Ok(_measuring) = self.measuring.try_lock() else {
+            return self.get().unwrap_or_default();
+        };
+        let mut state = self.state.lock().unwrap();
+        let mut profile = state.profile.get_or_insert_default().clone();
+        if complete(&profile)
+            || resources.budget.is_zero()
+            || resources.scratch_bytes <= super::tuning::ENCODER_SCRATCH_BYTES
+            || state.attempted.iter().any(|&old| old.covers(resources))
+        {
+            return profile;
+        }
+        state.attempted.retain(|&old| !resources.covers(old));
+        state.attempted.push(resources);
+        drop(state);
+        calibrate(&mut profile);
+        self.state.lock().unwrap().profile = Some(profile.clone());
+        profile
+    }
+}
+
+fn complete(profile: &MachineProfile) -> bool {
+    profile.submit_round_trip.is_some()
+        && (!profile.gpu_timestamps || profile.pass_overhead.is_some())
+        && profile.dispatch_overhead.is_some()
+        && profile.parallel_width.is_some()
+        && profile.bandwidth.is_some()
+        && profile.matmul_flops.is_some()
+}
+
+type ProfileEntry = (Weak<Gpu>, bool, Arc<ProfileCache>);
 static PROFILES: Mutex<Vec<ProfileEntry>> = Mutex::new(Vec::new());
 
 /// Lookup only: callers asking whether probes are pending must not submit GPU
@@ -112,20 +180,21 @@ pub(super) fn cached_profile(gpu: &Arc<Gpu>, timestamps: bool) -> Option<Machine
         .iter()
         .find_map(|&(ref context, timing, ref profile)| {
             (std::ptr::eq(context.as_ptr(), Arc::as_ptr(gpu)) && timing == timestamps)
-                .then(|| profile.get().cloned())
+                .then(|| profile.get())
                 .flatten()
         })
 }
 
-/// Measure once per context/timing mode, within a soft budget. Partial
-/// profiles are cached too: short searches must not repeatedly pay for the
-/// same unfinished calibration. The global lock is not held during GPU work.
+/// Reuse measurements per context/timing mode, within a soft budget. A partial
+/// profile can fill missing measurements with a larger resource allowance;
+/// repeated short searches do not keep paying for the same unfinished work.
+/// Neither the global lock nor the profile-state lock is held during GPU work.
 pub(crate) fn machine_profile(
     gpu: &Arc<Gpu>,
     timestamps: bool,
     budget: Duration,
     max_scratch_bytes: usize,
-) -> MachineProfile {
+) -> (MachineProfile, Duration) {
     // A listed `Weak` keeps its context address from being reused.
     let slot = {
         let mut profiles = PROFILES.lock().unwrap();
@@ -136,17 +205,25 @@ pub(crate) fn machine_profile(
         {
             Arc::clone(&entry.2)
         } else {
-            let slot = Arc::new(OnceLock::new());
+            let slot = Arc::new(ProfileCache::default());
             profiles.push((Arc::downgrade(gpu), timestamps, Arc::clone(&slot)));
             slot
         }
     };
-    slot.get_or_init(|| {
-        let profile = calibrate(gpu, timestamps, budget, max_scratch_bytes);
-        log::info!("machine profile: {profile:?}");
-        profile
-    })
-    .clone()
+    let mut elapsed = Duration::ZERO;
+    let profile = slot.measure(
+        Resources {
+            budget,
+            scratch_bytes: max_scratch_bytes,
+        },
+        |profile| {
+            let start = Instant::now();
+            calibrate(gpu, timestamps, budget, max_scratch_bytes, profile);
+            elapsed = start.elapsed();
+            log::info!("machine profile: {profile:?}");
+        },
+    );
+    (profile, elapsed)
 }
 
 fn calibrate(
@@ -154,30 +231,51 @@ fn calibrate(
     timestamps: bool,
     budget: Duration,
     max_scratch_bytes: usize,
-) -> MachineProfile {
-    if budget.is_zero() || max_scratch_bytes == 0 {
-        return MachineProfile::default();
+    profile: &mut MachineProfile,
+) {
+    let Some(buffer_budget) = max_scratch_bytes.checked_sub(super::tuning::ENCODER_SCRATCH_BYTES)
+    else {
+        return;
+    };
+    if budget.is_zero() || buffer_budget == 0 {
+        return;
+    }
+    let memory = gpu.memory_stats();
+    if memory.budget != 0
+        && super::tuning::ENCODER_SCRATCH_BYTES as u64
+            > super::safe_device_memory_remaining(memory.usage, memory.budget)
+    {
+        return;
     }
     let _span = tracing::info_span!("machine_calibration").entered();
     let start = Instant::now();
     // Reserve time for the useful cost-model measurements. Width discovery
     // must not consume the whole allowance before bandwidth/matmul start.
-    let mut bench = Bench::new(gpu, timestamps, start + budget / 8, max_scratch_bytes);
-    let mut profile = MachineProfile {
-        gpu_timestamps: bench.timestamps,
-        submit_round_trip: Some(Duration::from_secs_f64(bench.round_trip_ms / 1e3)),
-        ..Default::default()
-    };
-    bench.overheads(&mut profile);
+    let mut bench = Bench::new(gpu, timestamps, start + budget / 8, buffer_budget, profile);
+    profile.gpu_timestamps = bench.timestamps;
+    if let Some(round_trip_ms) = bench.round_trip_ms {
+        profile
+            .submit_round_trip
+            .get_or_insert(Duration::from_secs_f64(round_trip_ms / 1e3));
+    }
+    if profile.dispatch_overhead.is_none() || (bench.timestamps && profile.pass_overhead.is_none())
+    {
+        bench.overheads(profile);
+    }
     bench.deadline = start + budget / 4;
-    profile.parallel_width = bench.parallel_width();
+    if profile.parallel_width.is_none() {
+        profile.parallel_width = bench.parallel_width();
+    }
     bench.deadline = start + budget / 2;
-    profile.bandwidth = bench.bandwidth();
+    if profile.bandwidth.is_none() {
+        profile.bandwidth = bench.bandwidth();
+    }
     bench.deadline = start + budget;
-    bench.matmul(&mut profile);
+    if profile.matmul_flops.is_none() {
+        bench.matmul(profile);
+    }
     bench.finish();
-    profile.elapsed = start.elapsed();
-    profile
+    profile.elapsed += start.elapsed();
 }
 
 /// Timing harness: GPU pass timestamps when the context records them, the
@@ -188,7 +286,7 @@ struct Bench<'a> {
     timestamps: bool,
     deadline: Instant,
     /// Empty submit-and-wait, in milliseconds, removed from host timings.
-    round_trip_ms: f64,
+    round_trip_ms: Option<f64>,
     /// Measured timed-pass overhead, in milliseconds, removed from timestamps.
     pass_ms: f64,
     buffers: Vec<bg::Buffer>,
@@ -204,6 +302,7 @@ impl<'a> Bench<'a> {
         timestamps: bool,
         deadline: Instant,
         max_scratch_bytes: usize,
+        profile: &MachineProfile,
     ) -> Self {
         let encoder = gpu.create_command_encoder(bg::CommandEncoderDesc {
             name: "machine_calibration",
@@ -215,13 +314,18 @@ impl<'a> Bench<'a> {
             encoder,
             timestamps: timestamps && gpu.capabilities().timing,
             deadline,
-            round_trip_ms: 0.0,
-            pass_ms: 0.0,
+            round_trip_ms: profile
+                .submit_round_trip
+                .map(|time| time.as_secs_f64() * 1e3),
+            pass_ms: profile.pass_overhead.unwrap_or_default().as_secs_f64() * 1e3,
             buffers: Vec::new(),
             pipelines: Vec::new(),
             stream: None,
             max_scratch_bytes,
         };
+        if profile.submit_round_trip.is_some() {
+            return bench;
+        }
         let mut trips = Vec::new();
         for _ in 0..4 {
             if bench.expired() {
@@ -233,7 +337,7 @@ impl<'a> Bench<'a> {
             let _ = super::wait_for_timed_encoder(bench.gpu, &sync, &mut bench.encoder, false);
             trips.push(start.elapsed().as_secs_f64() * 1e3);
         }
-        bench.round_trip_ms = trips.into_iter().reduce(f64::min).unwrap_or(0.0);
+        bench.round_trip_ms = trips.into_iter().reduce(f64::min);
         bench
     }
 
@@ -338,7 +442,10 @@ impl<'a> Bench<'a> {
             encode(&mut self.encoder, &self.pipelines);
             let sync = self.gpu.submit(&mut self.encoder);
             let _ = super::wait_for_timed_encoder(self.gpu, &sync, &mut self.encoder, false);
-            samples.push((start.elapsed().as_secs_f64() * 1e3 - self.round_trip_ms).max(0.0));
+            samples.push(
+                (start.elapsed().as_secs_f64() * 1e3 - self.round_trip_ms.unwrap_or_default())
+                    .max(0.0),
+            );
         }
         samples
     }
@@ -349,7 +456,7 @@ impl<'a> Bench<'a> {
         if self.timestamps {
             (20.0 * self.pass_ms).clamp(0.25, 8.0)
         } else {
-            (20.0 * self.round_trip_ms).clamp(1.0, 8.0)
+            (20.0 * self.round_trip_ms.unwrap_or_default()).clamp(1.0, 8.0)
         }
     }
 
@@ -397,11 +504,15 @@ impl<'a> Bench<'a> {
         if !single.is_empty() && !batched.is_empty() {
             let single = median(&single);
             if self.timestamps {
-                profile.pass_overhead = Some(Duration::from_secs_f64(single / 1e3));
-                self.pass_ms = single;
+                let overhead = profile
+                    .pass_overhead
+                    .get_or_insert(Duration::from_secs_f64(single / 1e3));
+                self.pass_ms = overhead.as_secs_f64() * 1e3;
             }
             let extra = (median(&batched) - single).max(0.0) / f64::from(DISPATCHES - 1);
-            profile.dispatch_overhead = Some(Duration::from_secs_f64(extra / 1e3));
+            profile
+                .dispatch_overhead
+                .get_or_insert(Duration::from_secs_f64(extra / 1e3));
         }
         self.release(&[src, dst]);
     }
@@ -512,7 +623,7 @@ impl<'a> Bench<'a> {
     }
 
     /// Throughput of the ordinary f32 matmul at the first size worth timing,
-    /// scaled to a fully occupied machine, and the spread of repeated timings.
+    /// scaled to a fully occupied machine.
     fn matmul(&mut self, profile: &mut MachineProfile) {
         let target = self.target_ms();
         let mut size = 64;
@@ -601,7 +712,53 @@ mod tests {
     }
 
     #[test]
-    fn partial_profiles_are_reused_without_recalibrating() {
+    fn partial_profiles_retry_new_resource_combinations_without_repeating_work() {
+        let cache = ProfileCache::default();
+        let resources = |ms, mib: usize| Resources {
+            budget: Duration::from_millis(ms),
+            scratch_bytes: mib << 20,
+        };
+        let unused = |_: &mut MachineProfile| panic!("calibration must be reused");
+        assert!(cache.get().is_none());
+        assert_eq!(
+            cache.measure(resources(0, 64), unused),
+            MachineProfile::default()
+        );
+        assert_eq!(
+            cache.measure(resources(100, 1), unused),
+            MachineProfile::default()
+        );
+        let first = cache.measure(resources(100, 2), |profile| {
+            profile.bandwidth = Some(1e9);
+        });
+        assert_eq!(cache.measure(resources(100, 2), unused), first);
+        assert_eq!(cache.measure(resources(50, 2), unused), first);
+        // More memory with less time is a new opportunity, but must not erase
+        // the previous time allowance from the frontier.
+        let second = cache.measure(resources(50, 4), |profile| {
+            assert_eq!(*profile, first);
+            assert_eq!(cache.get(), Some(first.clone()));
+            // Another search can read or reuse the prior profile during this
+            // upgrade; it neither waits nor starts a concurrent calibration.
+            assert_eq!(cache.measure(resources(1000, 64), unused), first);
+            profile.matmul_flops = Some(2e9);
+        });
+        assert_eq!(cache.measure(resources(100, 2), unused), second);
+        // Independent maxima would incorrectly suppress this combination.
+        let third = cache.measure(resources(100, 4), |profile| {
+            assert_eq!(*profile, second);
+            profile.parallel_width = Some(8);
+        });
+        assert_eq!(cache.measure(resources(100, 4), unused), third);
+        let complete = cache.measure(resources(200, 4), |profile| {
+            profile.submit_round_trip = Some(Duration::from_micros(50));
+            profile.dispatch_overhead = Some(Duration::from_micros(1));
+        });
+        assert_eq!(cache.measure(resources(1000, 64), unused), complete);
+    }
+
+    #[test]
+    fn larger_allowances_fill_missing_measurements_and_preserve_existing_ones() {
         let gpu = Arc::new(
             crate::init_gpu_context_with(crate::GpuOptions {
                 timing: false,
@@ -610,12 +767,37 @@ mod tests {
             .unwrap(),
         );
         assert!(cached_profile(&gpu, false).is_none());
-        // Zero resources cannot submit work or produce a complete profile.
-        let first = machine_profile(&gpu, false, Duration::ZERO, 0);
-        assert_eq!(first, MachineProfile::default());
+        // An expired first slice must not cache an unmeasured zero round trip.
+        let (empty, _) = machine_profile(&gpu, false, Duration::from_nanos(1), 64 << 20);
+        assert!(empty.submit_round_trip.is_none(), "{empty:?}");
+        // Enough for overhead/width and the smallest matmul, but not even the
+        // smallest bandwidth probe after reserving the encoder's scratch.
+        let resources = super::super::tuning::ENCODER_SCRATCH_BYTES + (64 << 10);
+        let (first, _) = machine_profile(&gpu, false, Duration::from_secs(1), resources);
+        assert!(first.bandwidth.is_none(), "{first:?}");
         assert_eq!(cached_profile(&gpu, false), Some(first.clone()));
-        let second = machine_profile(&gpu, false, Duration::from_millis(100), 1 << 20);
-        assert_eq!(second, first);
+        let (same, elapsed) = machine_profile(&gpu, false, Duration::from_secs(1), resources);
+        assert_eq!(same, first);
+        assert!(elapsed.is_zero());
+        let (second, elapsed) = machine_profile(&gpu, false, Duration::from_secs(2), 64 << 20);
+        assert!(complete(&second), "{second:?}");
+        assert!(!elapsed.is_zero());
+        assert!(second.elapsed >= first.elapsed);
+        assert_eq!(cached_profile(&gpu, false), Some(second.clone()));
+        macro_rules! preserved {
+            ($field:ident) => {
+                if first.$field.is_some() {
+                    assert_eq!(second.$field, first.$field);
+                }
+            };
+        }
+        preserved!(submit_round_trip);
+        preserved!(dispatch_overhead);
+        preserved!(parallel_width);
+        preserved!(matmul_flops);
+        let (same, elapsed) = machine_profile(&gpu, false, Duration::from_secs(3), 128 << 20);
+        assert_eq!(same, second);
+        assert!(elapsed.is_zero());
     }
 
     #[test]
@@ -623,7 +805,14 @@ mod tests {
     fn calibration_measures_within_its_budget() {
         let gpu = crate::reference::gpu::shared_context();
         let budget = Duration::from_millis(500);
-        let profile = calibrate(&gpu, crate::GpuOptions::from_env().timing, budget, 64 << 20);
+        let mut profile = MachineProfile::default();
+        calibrate(
+            &gpu,
+            crate::GpuOptions::from_env().timing,
+            budget,
+            64 << 20,
+            &mut profile,
+        );
         eprintln!("{profile:#?}");
         // Calibration is soft-bounded: one in-flight measurement may overrun.
         assert!(profile.elapsed < budget * 4, "{profile:?}");

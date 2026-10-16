@@ -528,7 +528,7 @@ fn tuning_releases_retained_staging_after_a_later_scratch_skip() {
     let report = session
         .tune_with(TuneOptions {
             staging_reuse: TuneStagingReuse::SameSize,
-            max_scratch_bytes: 2 * 1024 * 1024,
+            max_scratch_bytes: 3 * 1024 * 1024,
             max_time: Duration::from_secs(60),
             ..crate::support::sequential_tuning()
         })
@@ -566,7 +566,10 @@ fn tuning_releases_retained_staging_after_a_later_scratch_skip() {
             .input_b_reused
     );
     assert!(qualified_outcomes.all(|o| o.scratch.as_ref().unwrap().input_b_reused));
-    assert_eq!(stats.peak_bytes, 3 * 32 * 4096 * 4 + 32 * 32 * 4);
+    assert_eq!(
+        stats.peak_bytes,
+        3 * 32 * 4096 * 4 + 32 * 32 * 4 + (1 << 20)
+    );
     assert!(report.final_cleanup.is_some());
     let keys = session.dispatch_pipeline_keys();
     let report = session

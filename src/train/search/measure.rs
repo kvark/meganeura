@@ -343,7 +343,7 @@ pub(super) fn select(
                         // budget rather than a share of one trial's kernel
                         // budget, and supply it to every later trial.
                         let budget = (options.max_time / 20).min(Duration::from_millis(250));
-                        let profile = crate::runtime::machine_profile(
+                        let (profile, _) = crate::runtime::machine_profile(
                             &gpu,
                             runtime.gpu_timing,
                             budget,
