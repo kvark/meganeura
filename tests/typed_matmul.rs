@@ -1,4 +1,4 @@
-//! Explicit F16 and BF16 dense products share the checked typed cooperative
+//! Explicit F16 and BF16 dense products share typed cooperative
 //! kernel: the same schedule, F32 accumulation and F32 partials.
 
 use meganeura::{
@@ -11,7 +11,7 @@ const M: usize = 33;
 const N: usize = 65;
 const K: usize = 1031;
 
-/// One nonzero A element per row gives an exact oracle. Exercise indexing,
+/// Positive quarter-grid operands give an exact layout fixture. Exercise indexing,
 /// vector bindings, output tails, addends, rounding and K-partial addressing.
 #[test]
 fn typed_staging_handles_vector_tails_and_split_output() {
@@ -72,11 +72,9 @@ fn typed_staging_handles_vector_tails_and_split_output() {
                         };
                         g.set_outputs(vec![y]);
                         let mut a = vec![0.0; m * k];
-                        let b: Vec<f32> = (0..k * n)
-                            .map(|i| ((i * 31 % 61) as f32 - 30.0) / 4.0)
-                            .collect();
-                        let bias: Vec<f32> =
-                            (0..m * n).map(|i| ((i % 7) as f32 - 3.0) / 4.0).collect();
+                        let b: Vec<f32> =
+                            (0..k * n).map(|i| (i * 31 % 61 + 1) as f32 / 4.0).collect();
+                        let bias: Vec<f32> = (0..m * n).map(|i| (i % 7) as f32 / 4.0).collect();
                         let mut expected = vec![0.0; m * n];
                         for row in 0..m {
                             let inner = (row * 137 + k - 1) % k;
@@ -113,14 +111,8 @@ fn typed_staging_handles_vector_tails_and_split_output() {
                         for (index, (&actual, &expected)) in
                             actual.iter().zip(&expected).enumerate()
                         {
-                            // RADV's experimental WMMA can differ by an F32 ulp
-                            // even for 1*x. Keep the exact-arithmetic tests above
-                            // separate; here the quarter-grid oracle makes this
-                            // bound much smaller than a wrong element or BF16
-                            // rounding step (including after addend cancellation).
-                            let tolerance = 4.0 * f32::EPSILON * expected.abs().max(1.0);
-                            assert!(
-                                actual.is_finite() && (actual - expected).abs() <= tolerance,
+                            assert_eq!(
+                                actual, expected,
                                 "{storage:?} {m}x{n}x{k} layout={layout} add={add} round={round} index={index}: {actual} != {expected}"
                             );
                         }
@@ -185,8 +177,8 @@ fn explicit_storage_selects_the_typed_schedule() {
     }
 }
 
-/// Values on a 1/64 grid are exact in both half formats, and every product
-/// and partial sum is exact in F32, so the result must equal the F64 sum.
+/// Values on a 1/64 grid are exact in both half formats. The oracle has no
+/// rounding error, but native WMMA need not implement scalar F32 FMAs.
 fn values(len: usize, multiplier: usize, modulus: usize) -> Vec<f32> {
     (0..len)
         .map(|i| ((i * multiplier % modulus) as f32 - (modulus / 2) as f32) / 64.0)
@@ -194,45 +186,119 @@ fn values(len: usize, multiplier: usize, modulus: usize) -> Vec<f32> {
 }
 
 #[test]
-fn f16_products_match_f64() {
+fn typed_products_meet_native_accuracy_budget() {
     let gpu = crate::support::gpu::gpu();
-    if !meganeura::runtime::typed_matrix_supported(&gpu, DType::F16) {
-        eprintln!("native F16 matrices unavailable; skipping device-specific coverage");
-        return;
-    }
     crate::support::gpu::assert_protocol_headroom(&gpu);
     let a = values(M * K, 17, 61);
     let b = values(N * K, 31, 59);
-    for layout in 0..3 {
-        let mut config = crate::support::gpu::inference_config();
-        config.tune = false;
-        config.runtime.poison = true;
-        let (mut session, _) = meganeura::build(&graph(DType::F16, layout), config);
-        session.set_parameter("a", &a);
-        session.set_parameter("b", &b);
-        let mut expected = vec![0.0; M * N];
-        for row in 0..M {
-            for col in 0..N {
-                let mut sum = 0.0f64;
-                for inner in 0..K {
-                    let ai = if layout == 1 {
-                        inner * M + row
-                    } else {
-                        row * K + inner
-                    };
-                    let bi = if layout == 2 {
-                        col * K + inner
-                    } else {
-                        inner * N + col
-                    };
-                    sum += f64::from(a[ai]) * f64::from(b[bi]);
+    for storage in [DType::F16, DType::BF16] {
+        if !meganeura::runtime::typed_matrix_supported(&gpu, storage) {
+            eprintln!("native {storage:?} matrices unavailable; skipping device-specific coverage");
+            continue;
+        }
+        for layout in 0..3 {
+            let mut config = crate::support::gpu::inference_config();
+            config.tune = false;
+            config.runtime.poison = true;
+            let (mut session, _) = meganeura::build(&graph(storage, layout), config);
+            session.set_parameter("a", &a);
+            session.set_parameter("b", &b);
+            session.step();
+            session.wait();
+            let actual = session.read_output(M * N);
+            for row in 0..M {
+                for col in 0..N {
+                    let mut sum = 0.0f64;
+                    let mut sum_abs = 0.0f64;
+                    for inner in 0..K {
+                        let ai = if layout == 1 {
+                            inner * M + row
+                        } else {
+                            row * K + inner
+                        };
+                        let bi = if layout == 2 {
+                            col * K + inner
+                        } else {
+                            inner * N + col
+                        };
+                        let term = f64::from(a[ai]) * f64::from(b[bi]);
+                        sum += term;
+                        sum_abs += term.abs();
+                    }
+                    let got = f64::from(actual[row * N + col]);
+                    let bound =
+                        meganeura::reference::native_matrix::error_bound(K, sum_abs).unwrap();
+                    assert!(
+                        got.is_finite() && (got - sum).abs() <= bound,
+                        "{storage:?} layout {layout} ({row},{col}): {got} != {sum}, bound={bound}"
+                    );
                 }
-                expected[row * N + col] = sum as f32;
             }
         }
-        session.step();
-        session.wait();
-        assert_eq!(session.read_output(M * N), expected, "layout {layout}");
+    }
+}
+
+/// A zero-valued product with a negative sign can perturb native WMMA even
+/// though scalar IEEE arithmetic is exact. Exercise checked and staged kernels,
+/// cancellation and scaling without making the regression AMD-specific.
+#[test]
+fn native_signed_products_and_cancellation() {
+    let gpu = crate::support::gpu::gpu();
+    for storage in [DType::F16, DType::BF16] {
+        if !meganeura::runtime::typed_matrix_supported(&gpu, storage) {
+            continue;
+        }
+        for size in [1, 16] {
+            for scale in [2.0f32.powi(-10), 1.0, 2.0f32.powi(10)] {
+                for cancel in [false, true] {
+                    let mut g = Graph::new();
+                    let (a, b) = if storage == DType::F16 {
+                        (
+                            g.parameter_f16("a", &[size, 16]),
+                            g.parameter_f16("b", &[16, size]),
+                        )
+                    } else {
+                        let a = g.parameter("a", &[size, 16]);
+                        let b = g.parameter("b", &[16, size]);
+                        (g.to_bf16(a), g.to_bf16(b))
+                    };
+                    let y = g.matmul(a, b);
+                    g.set_outputs(vec![y]);
+                    let mut av = vec![0.; size * 16];
+                    let mut bv = vec![0.; 16 * size];
+                    for r in 0..size {
+                        av[r * 16] = scale;
+                        av[r * 16 + 1] = -scale;
+                    }
+                    for c in 0..size {
+                        bv[c] = 1.;
+                        bv[size + c] = f32::from(cancel);
+                    }
+                    let mut s = meganeura::Session::with_context_opts(
+                        meganeura::compile::compile(&g),
+                        gpu.clone(),
+                        meganeura::SessionOptions {
+                            poison: true,
+                            ..Default::default()
+                        },
+                    );
+                    s.set_parameter("a", &av);
+                    s.set_parameter("b", &bv);
+                    s.step();
+                    s.wait();
+                    let expected = if cancel { 0. } else { f64::from(scale) };
+                    let sum_abs = f64::from(scale) * if cancel { 2. } else { 1. };
+                    let bound =
+                        meganeura::reference::native_matrix::error_bound(16, sum_abs).unwrap();
+                    for got in s.read_output(size * size) {
+                        assert!(
+                            got.is_finite() && (f64::from(got) - expected).abs() <= bound,
+                            "{storage:?} size={size} scale={scale} cancel={cancel}: {got} != {expected}, bound={bound}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -298,8 +364,10 @@ fn unsupported_device_reports_f16_matrix_requirement() {
 #[test]
 fn typed_partitions_tune_without_changing_precision() {
     let gpu = crate::support::gpu::gpu();
-    let a = values(M * K, 17, 61);
-    let b = values(N * K, 31, 59);
+    // Positive exact fixtures retain a bit-exact partition-equivalence check.
+    // Signed arithmetic and its native error budget are covered separately.
+    let a: Vec<_> = values(M * K, 17, 61).into_iter().map(f32::abs).collect();
+    let b: Vec<_> = values(N * K, 31, 59).into_iter().map(f32::abs).collect();
     let mut probes = 0;
     for storage in [DType::F16, DType::BF16] {
         if !meganeura::runtime::typed_matrix_supported(&gpu, storage) {

@@ -126,7 +126,7 @@ fn partitions_reduce_before_rounding_and_leave_addends_unsplit() {
 }
 
 #[test]
-fn partitions_and_outputs_match_full_f64() {
+fn partitions_and_outputs_meet_native_accuracy_budget() {
     let gpu = crate::support::gpu::gpu();
     if meganeura::codegen::checked_cooperative_shape(
         &gpu.capabilities().cooperative_matrix.bf16_f32_shapes,
@@ -182,9 +182,13 @@ fn partitions_and_outputs_match_full_f64() {
                         for col in 0..n {
                             let index = row * n + col;
                             let mut total = 0.0;
+                            let mut total_abs = 0.0;
                             for split in 0..splits {
                                 let mut expected = 0.0_f64;
-                                for reduce in partition(k, splits, split) {
+                                let mut sum_abs = 0.0;
+                                let range = partition(k, splits, split);
+                                let terms = range.len();
+                                for reduce in range {
                                     let ai = if layout == 1 {
                                         reduce * m + row
                                     } else {
@@ -195,25 +199,57 @@ fn partitions_and_outputs_match_full_f64() {
                                     } else {
                                         reduce * n + col
                                     };
-                                    expected += f64::from(a[ai]) * f64::from(b[bi]);
+                                    let term = f64::from(a[ai]) * f64::from(b[bi]);
+                                    expected += term;
+                                    sum_abs += term.abs();
                                 }
-                                assert_eq!(
-                                    f64::from(partial[split * m * n + index]),
-                                    expected,
-                                    "partial {m}x{n}x{k} layout={layout} split={split} at {index}"
+                                let got = f64::from(partial[split * m * n + index]);
+                                let bound = meganeura::reference::native_matrix::error_bound(
+                                    terms, sum_abs,
+                                )
+                                .unwrap();
+                                assert!(
+                                    got.is_finite() && (got - expected).abs() <= bound,
+                                    "partial {m}x{n}x{k} layout={layout} split={split} at {index}: {got} != {expected}, bound={bound}"
                                 );
                                 total += expected;
+                                total_abs += sum_abs;
                                 checked += 1;
                             }
-                            let expected = if round {
-                                half::bf16::from_f32(total as f32).to_f32()
-                            } else {
-                                total as f32
+                            let bound =
+                                meganeura::reference::native_matrix::error_bound(k, total_abs)
+                                    .unwrap();
+                            // Round the interval, not just its centre: native
+                            // accumulation error can cross a BF16 midpoint.
+                            // Conversion itself remains bit-exactly tested.
+                            let endpoint = |value: f64| {
+                                if round {
+                                    f64::from(half::bf16::from_f32(value as f32).to_f32())
+                                } else {
+                                    value
+                                }
                             };
-                            assert_eq!(
-                                output[index], expected,
-                                "output {m}x{n}x{k} layout={layout} at {index}"
+                            let (lo, hi) = (endpoint(total - bound), endpoint(total + bound));
+                            let got = f64::from(output[index]);
+                            assert!(
+                                got.is_finite() && got >= lo && got <= hi,
+                                "output {m}x{n}x{k} layout={layout} at {index}: {got} outside [{lo}, {hi}]"
                             );
+                            if !round {
+                                // Also check the reduction independently of
+                                // the matrix arithmetic's larger error budget.
+                                let values =
+                                    (0..splits).map(|s| f64::from(partial[s * m * n + index]));
+                                let sum: f64 = values.clone().sum();
+                                let scale: f64 = values.map(f64::abs).sum();
+                                let reduction_bound =
+                                    meganeura::reference::native_matrix::error_bound(splits, scale)
+                                        .unwrap();
+                                assert!(
+                                    (got - sum).abs() <= reduction_bound,
+                                    "partial reduction at {index}"
+                                );
+                            };
                             checked += 1;
                         }
                     }
