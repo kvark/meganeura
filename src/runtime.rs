@@ -1,3 +1,4 @@
+mod workgroup;
 use crate::compile::{
     AttentionParams, BufferRef, CachedBlockAttentionParams, Dispatch, DispatchParams,
     ExecutionPlan, RoPEParams, ShaderEntry,
@@ -969,6 +970,11 @@ enum Variant {
         crate::codegen::MatrixTypes,
         crate::codegen::TypedMatmulLayout,
     ),
+    CoopWorkgroup(
+        ShaderEntry,
+        crate::codegen::WorkgroupMatmulShape,
+        crate::codegen::MatrixTypes,
+    ),
     CoopTiled(
         ShaderEntry,
         crate::codegen::CooperativeMatmulShape,
@@ -1080,6 +1086,7 @@ impl Variant {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
             Variant::Attention(ref e, _, _)
             | Variant::CoopTyped(ref e, _, _)
+            | Variant::CoopWorkgroup(ref e, _, _)
             | Variant::CoopTiled(ref e, _, _, _)
             | Variant::SplitMatmul(ref e, _, _, _)
             | Variant::SpecializedConv(ref e, _, _, _)
@@ -1104,6 +1111,9 @@ impl Variant {
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
+            Variant::CoopWorkgroup(ref e, shape, types) => {
+                format!("{e:?}:workgroup-{shape:?}-{types:?}")
+            }
             Variant::CoopTyped(ref e, types, staging) => {
                 use crate::codegen::MatrixTypes;
                 let multiply = MatrixTypes::name(types.multiply);
@@ -1233,6 +1243,12 @@ fn checked_matrix_types(dispatch: &Dispatch) -> Option<crate::codegen::MatrixTyp
     use crate::codegen::MatrixTypes;
     match (&dispatch.kernel, &dispatch.shader) {
         (&crate::compile::Kernel::CooperativeTyped { types, .. }, _) => Some(types),
+        (
+            &crate::compile::Kernel::CooperativeWorkgroup {
+                types: Some(types), ..
+            },
+            _,
+        ) => Some(types),
         (_, &ShaderEntry::Conv2dBF16 { output_bf16, .. }) => Some(MatrixTypes {
             output: if output_bf16 {
                 crate::DType::BF16
@@ -1663,8 +1679,8 @@ mod precision_requirement_tests {
                         selected, plan,
                         "BF16 buffers and kernels must retain their precision"
                     );
-                    // Tuning keeps the types in the class key and varies only
-                    // the K partition count.
+                    // Tuning keeps the types in the class key while varying
+                    // tile geometry and the K partition count.
                     let class = crate::tune::TuneClass::from_dispatch(product, config.as_ref())
                         .expect("typed products are tunable");
                     assert_eq!(class.matrix_types, Some(types));
@@ -1677,7 +1693,11 @@ mod precision_requirement_tests {
                     let mut class = class;
                     class.binding_bytes = initial.buffer_sizes(&class).unwrap();
                     assert!(class.challengers(initial, config.as_ref()).iter().all(
-                        |tile| matches!(tile, crate::tune::MatmulTile::CooperativeChecked { .. })
+                        |tile| matches!(
+                            tile,
+                            crate::tune::MatmulTile::CooperativeChecked { .. }
+                                | crate::tune::MatmulTile::CooperativeWorkgroup { .. }
+                        )
                     ));
                 }
             }
@@ -1902,6 +1922,14 @@ impl Pipelines {
                     typed_shape(types.multiply)?,
                     staging,
                 )
+            }
+            Variant::CoopWorkgroup(_, shape, types) => {
+                if !shape.supports(&gpu.capabilities(), types)
+                    || !dispatch.mnk().is_some_and(|(m, n, k)| shape.fits(m, n, k))
+                {
+                    return Err("unsupported workgroup cooperative product".to_owned());
+                }
+                crate::codegen::generate_workgroup_matmul(group, shape, types)
             }
             Variant::CoopTiled(_, shape, splits, _) => {
                 let config = cooperative();
@@ -2167,6 +2195,13 @@ impl Pipelines {
     /// which unrelated pipelines happen to have been compiled.
     fn key(dispatch: &Dispatch) -> Variant {
         let entry = dispatch.shader.clone();
+        if let crate::compile::Kernel::CooperativeWorkgroup { shape, types, .. } = dispatch.kernel {
+            return Variant::CoopWorkgroup(
+                entry,
+                shape,
+                types.unwrap_or(crate::codegen::MatrixTypes::F32_AS_F16),
+            );
+        }
         if let crate::compile::Kernel::CooperativeTyped { types, .. } = dispatch.kernel {
             return Variant::CoopTyped(entry, types, typed_matmul_layout(dispatch));
         }
@@ -2737,6 +2772,7 @@ pub(crate) fn select_variants(
     fuse_prologues: bool,
     allow_raw_f16: bool,
 ) {
+    workgroup::reset(plan);
     select_conv_paths(plan, coop_config, allow_raw_f16);
     select_matmul_paths(plan, coop_config, allow_raw_f16);
 
@@ -3105,6 +3141,10 @@ pub struct SessionOptions {
     pub debug: bool,
     /// Cooperative-matrix policy (see [`CoopPolicy`]).
     pub coop: CoopPolicy,
+    /// Diagnostic override for a complete workgroup matrix tile. This forces
+    /// an eligible tile without a speed or model gate. Leave unset for normal
+    /// measured selection through `Session::tune_with` or build search.
+    pub workgroup_matmul: Option<crate::codegen::WorkgroupMatmulShape>,
     /// The GPU context was created with
     /// [`blade_graphics::ContextDesc::timing`], so its encoders collect pass
     /// timestamps.
@@ -3964,6 +4004,7 @@ impl Session {
             !opts.debug,
             opts.coop == CoopPolicy::AllowF16,
         );
+        workgroup::select(&mut plan, &gpu.capabilities(), &opts);
         if let Some(head_dim) = plan
             .dispatches
             .iter()

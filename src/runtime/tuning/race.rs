@@ -873,7 +873,7 @@ fn race_inputs(
     sizes: &[usize],
     pattern: u32,
 ) -> Vec<Vec<f32>> {
-    match class.key.matrix_types {
+    match class.key.effective_matrix_types() {
         Some(types) => typed_inputs(&class.key, types, pattern, sizes),
         None => prepared_inputs(logical_sizes, sizes, pattern, class.key.weight_format),
     }

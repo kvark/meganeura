@@ -92,6 +92,8 @@ pub struct BuildSearchReport {
     pub patience_exhausted: bool,
     /// Stopped early because recent costs predict insufficient comparison time.
     pub deadline_reserved: bool,
+    /// Time spent in kernel tuning calls that permit new comparisons.
+    pub kernel_probe_time: Duration,
     /// Requalification of the selected program after the last trial; zero
     /// when nothing ran after its own check.
     pub final_qualification_time: Duration,
@@ -141,6 +143,9 @@ pub struct BuildSearchReport {
 /// weight-gradient splits, and caller-enabled submission chunk counts. Unlocked
 /// dispatches are kernel-tuned before comparison, reserving estimated time for
 /// whole-program warmup, sampling and qualification within the common deadline.
+/// While further programs remain, new kernel probes share at most half of the
+/// total time budget. Later programs still replay qualified memo decisions;
+/// unfinished kernel tournaments can resume when program exploration ends.
 /// Private kernel wins alone never replace the incumbent. This bounded search
 /// does not promise a global optimum.
 /// After the first layouts, alternate layout exploration with submission probes

@@ -9,8 +9,10 @@ use crate::compile::WeightFormat;
 mod coop_tiled;
 mod cooperative;
 mod matrix_types;
+mod workgroup;
 pub use coop_tiled::{CooperativeMatmulShape, generate_tiled_coop_matmul};
 pub use matrix_types::MatrixTypes;
+pub use workgroup::{WorkgroupMatmulShape, generate_workgroup_matmul};
 
 /// Forward attention staging and lane layout, independent of the EPT cap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

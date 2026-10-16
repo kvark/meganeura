@@ -12,6 +12,13 @@ pub struct MatrixTypes {
 }
 
 impl MatrixTypes {
+    /// Automatic accelerated F32 storage with F16 multiplication.
+    pub const F32_AS_F16: Self = Self {
+        a: DType::F32,
+        b: DType::F32,
+        multiply: DType::F16,
+        output: DType::F32,
+    };
     /// Explicit BF16 operands with an F32 result.
     pub const BF16: Self = Self::reduced(DType::BF16);
 

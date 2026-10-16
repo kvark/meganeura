@@ -35,6 +35,7 @@ mod outline_optimize;
 mod padded_input;
 mod profile_windows;
 mod race;
+mod rectangular_matmul;
 #[cfg(feature = "models")]
 mod resnet_correctness;
 mod rmsnorm_matmul_prologue;

@@ -13,7 +13,7 @@
   candidates allocate no host encoder. Partial machine profiles can fill
   missing measurements when later calls provide more time or scratch space,
   preserving completed measurements without repeating unchanged allowances.
-  Kernel memo revision 6 separates these decisions, including host/GPU timing.
+  Host/GPU timing modes have separate memo decisions.
   `build_measured` measures the profile with its own budget before the first
   trial that probes kernels, reports it, and supplies it to later trials.
   Raced and memoized choices still require whole-program qualification and
@@ -36,12 +36,20 @@
   reduced addends are rejected at compile time: the ordinary kernels honor
   reduced storage only in B and read them as F32.
 - Typed cooperative products take part in bounded kernel tuning. Their types
-  are part of the class key, and candidates change only the K partition count
-  within the compiled partial buffer, so storage and arithmetic never change.
+  are part of the class key. Candidates vary subgroup/workgroup tiles and the
+  K partition count within the compiled partial buffer; storage and arithmetic
+  never change. Supported devices measure square and rectangular workgroup
+  tiles in both orientations, up to 128×256 and 256×128. NN, AT and BT products,
+  fused addends and reduced outputs share this path. The existing automatic
+  F16 path also measures workgroup candidates without narrowing F32 incumbents.
   Qualification runs on private scratch in the operands' storage types against
   references built from operands rounded to the multiplication type. Classes
   with no applicable challenger are left out before the class limit. The
-  kernel memo revision is now 4.
+  kernel memo revision is now 7. Workgroup dimensions, invocations, user and
+  reserved shared memory are checked against the device before compilation;
+  partial tiles, unsupported devices and incompatible fusions keep their
+  existing kernels. Cached automatic choices respect the new session's precision
+  policy, while explicit typed graphs retain their arithmetic.
 - Dense typed F16/BF16 products with native 16x16x16 matrices share the fast
   FP16 generator's vector staging, 2x2 register tiles and direct F32 output
   stores. Whole-vector bindings and whole native output tiles are checked
@@ -64,6 +72,11 @@
   before replacing it. Both count toward the program and memory bounds; a
   one-program search returns the fallback. Private probes reserve estimated
   time for warmup, paired timing and qualification within the common deadline.
+  While more programs remain, new kernel probes share at most half of that
+  deadline across all challengers. Later programs replay qualified kernel
+  decisions without extending their tournaments, leaving time to discover
+  faster graph layouts and submission counts. The reserve is released for
+  the last available program. Reports record probing time and deferred trials.
   Incomplete or late comparisons keep the incumbent. Qualified challengers with
   identical execution plans and submission count skip warmup and paired timing.
   Plan equality includes shader tuning knobs, buffer layouts and constants;
