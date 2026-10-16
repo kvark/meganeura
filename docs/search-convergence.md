@@ -334,6 +334,129 @@ repeats the held-out comparison. `MEGANEURA_SERIAL_DISPATCH=1` separates the
 effect of overlapping dispatches. Never infer whole-program improvements from
 isolated scratch wins alone: `build_measured` retains its whole-step guard.
 
+### B570 and RTX 5070 validation — October 16
+
+Tested `180946f` against main `12df95c`, with the same Blade `96c1dc7` and
+Naga `a97559b` pins. The host ran Linux `7.0.0-38-generic`, Mesa
+`26.0.3-1ubuntu1` on B570 and NVIDIA `595.91.07` on RTX 5070. GPU jobs ran
+serially with process-tree watchdogs and no concurrent builds. Clocks were
+recorded but not fixed. Kernel memos were private to each search; primary
+driver caches were warm, with separate fresh-cache experiments.
+
+The Inferena runner at `7cecdc6` used 30 seconds of search per session,
+10 seconds of warmup and 20 held-out samples. Five models (SmolLM2-135M,
+Whisper-tiny, SmolVLA, ResNet-50 and the small Stable Diffusion U-Net) ran
+in strict and accelerated profiles on both GPUs: 20 PR configurations.
+Six configurations had fresh main controls; the other 14 used earlier main
+measurements under the same protocol. Reversed-order repeats covered B570
+SD strict and RTX SD accelerated. Forward/backward below excludes optimizer
+updates, and all four rows use fresh main controls.
+
+| GPU / model / profile | Main forward/backward (ms) | Race forward/backward (ms) |
+|---|---:|---:|
+| B570 / SmolLM2-135M / strict | 55.388 | 53.654 |
+| B570 / ResNet-50 / strict | 53.352 | 50.255 |
+| RTX 5070 / ResNet-50 / strict | 27.721 | 25.135 |
+| RTX 5070 / SD / accelerated | 4.960 | 4.594 |
+
+The reversed RTX SD pair was 4.935 versus 4.593 ms. These are useful fast
+paths, not a claim that every selected program improved. In particular,
+RTX ResNet strict latency rose from 2.415 to 2.508 ms in its fresh pair.
+B570 SD strict needs further selection/operating-state investigation:
+
+| B570 SD protocol | Main inference / latency / forward+backward (ms) | Race inference / latency / forward+backward (ms) |
+|---|---:|---:|
+| Normal pair 1 | 4.055 / 4.199 / 11.379 | 4.266 / 4.267 / 11.412 |
+| Reversed normal pair 2 | 4.220 / 4.195 / 11.369 | 4.277 / 5.020 / 11.231 |
+| Separate 30s warmup, 100 samples | 4.931 / 4.327 / 10.914 | 4.989 / 4.439 / 11.061 |
+
+Pair 2 selected a flash-attention latency variant and reached lower clocks
+near the held-out measurement. The 19.7% outlier did not recur in the longer
+warmup pair, but that pair was still 1–3% slower. Plan choice and clock behavior
+are not isolated; do not discard the outlier, average different protocols, or
+claim no performance regressions from these runs.
+
+Shorter search budgets also miss fast paths. Each cell below is one fresh
+search followed by the normal held-out forward/backward measurement:
+
+| GPU / model / profile | 5s search | 10s | 20s | 30s |
+|---|---:|---:|---:|---:|
+| B570 / SmolLM2-135M / strict | 85.823 ms | 85.818 ms | 54.881 ms | 53.654 ms |
+| RTX 5070 / ResNet-50 / strict | 28.626 ms | 28.670 ms | 27.571 ms | 25.135 ms |
+| RTX 5070 / SD / accelerated | 8.804 ms | 8.797 ms | 4.983 ms | 4.594 ms |
+
+Keep 30 seconds per session for this cohort. Faster kernel races do not
+remove construction, qualification and whole-program comparison costs.
+
+Kernel-only scaling used 1, 4, 16 and 64 independent matrix classes, budgets
+of 2 and 10 seconds, and sequential, calibrated-race and uncalibrated-race
+policies. The 64-class results at the 10-second limit were:
+
+| GPU / timing / driver cache | Sequential search / classes visited | Calibrated race / classes visited |
+|---|---:|---:|
+| B570 / host / warm | 10.001s / 53 | 3.608s / 64 |
+| RTX 5070 / host / warm | 6.737s / 64 | 2.703s / 64 |
+| B570 / host / fresh | 10.001s / 55 | 3.672s / 64 |
+| RTX 5070 / host / fresh | 6.745s / 64 | 2.722s / 64 |
+| B570 / timestamps / warm | 10.001s / 51 | 2.380s / 64 |
+| RTX 5070 / timestamps / warm | 6.912s / 64 | 1.680s / 64 |
+
+Construction compiles incumbent pipelines before this tuning timer. A visited
+class can be partial at a deadline; the races above completed all 64. Profile
+startup can outweigh the race gain for a single class. Timestamp experiments
+do not measure whole-model overhead of enabling timestamps on the context.
+The campaign exercises existing candidate lists, up to 24 candidates per
+race, without #261's rectangular candidates or its cumulative budget policy.
+
+**Retain the whole-program gate.** A separate control held two initially
+identical sessions in one context, tuned only one, then warmed them in
+alternating order for 10 seconds and collected 30 balanced pairs. Both
+outputs passed an exact constant-product oracle. On the 64-class graph:
+
+| GPU / policy | Untuned control (ms) | Tuned (ms) | Full-graph change |
+|---|---:|---:|---:|
+| B570 / race | 1.6941 | 1.8016 | +6.34% |
+| B570 / sequential | 1.7003 | 1.7878 | +5.15% |
+| RTX 5070 / race | 0.7023 | 0.7957 | +13.29% |
+| RTX 5070 / sequential | 0.7014 | 0.7948 | +13.32% |
+
+Private kernel wins can lose when composed, with either strategy. These
+percentages compare each tuned session to its untuned control, not race
+against sequential. `Session::tune_with` intentionally does not execute the
+live graph. `build_measured` preserves the ordinary fallback, qualifies each
+challenger and requires paired whole-program timing before replacement.
+Cached choices must pass that same gate. Neither class coverage nor a memo
+hit is a reason to bypass it, and short search-time comparisons do not prove
+performance under every sustained operating state.
+
+The consolidated example reproduces the control and scaling workload:
+
+```sh
+MEGANEURA_SEARCH_CLASSES=64 MEGANEURA_SEARCH_SHARED_CONTEXT=1 \
+  MEGANEURA_SEARCH_WARMUP_SECONDS=10 \
+  cargo run --release --all-features --example search_race -- 10 untuned race
+```
+
+Use `untuned sequential` for the other control and `sequential race
+race-uncalibrated` for coverage comparisons; vary the class count through
+1, 4, 16 and 64. Pick the same ICD/device for each comparison. The example
+also swaps choices between a shared-context pair and repeats the timing.
+Its immediate before/after samples are labelled diagnostic; use the balanced
+held-out samples for comparisons. Search-time correctness gates remain active,
+and every scaling output is checked before and after tuning and after swaps.
+These example controls observe whole-program effects; they do not replace
+`build_measured`'s acceptance decision.
+
+Across the hardware campaign, 119/119 selected-session native qualification
+checks passed in 41 model processes, including controls and budget sweeps.
+All 92 scaling processes completed; 80 independent-matrix cases matched an
+exact output oracle, while 12 SmolLM2-block cases had no extra external
+oracle. Both public-API memo retry probes passed. Library tests (628 passed,
+8 ignored), six race/state tests on each GPU, 20 RTX search tests, library
+Clippy and formatting also passed. No independent PyTorch whole-model oracle
+was rerun. The hardware results above describe `180946f`; subsequent example
+and regression-test cleanup does not change production search behavior.
+
 ## Follow-ups outside the main plan
 
 - **Blade pipeline cache.** Blade creates pipelines with a null

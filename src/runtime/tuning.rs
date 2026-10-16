@@ -19,9 +19,11 @@ mod race;
 /// Each decision covers one complete class key and candidate list, measured
 /// in private scratch, so it does not depend on the surrounding program.
 /// Later searches on the same engine, device, driver and decision policy install
-/// the recorded winner and probe only the challengers it has not decided. Their
-/// whole-program qualification still checks every installed winner. A memo used
-/// on another engine version, device, driver or policy starts over instead of
+/// the recorded winner and probe only the challengers it has not decided.
+/// [`crate::train::build_measured`] still requires whole-program qualification
+/// and paired timing before a memoized winner can replace its incumbent; the
+/// private-scratch result alone does not establish a whole-program speedup.
+/// A memo used on another engine version, device, driver or policy starts over instead of
 /// transferring decisions. Share one between searches through
 /// [`crate::train::BuildSearchOptions::kernel_memo`], and between processes
 /// with [`Self::save`] and [`Self::load`].
@@ -772,12 +774,16 @@ impl Session {
     /// deterministic nonzero input patterns (including tiny f32 operands).
     /// Both candidates must agree elementwise; ordinary f32 classes must also
     /// match sampled f64 reference dots. Sequential tuning qualifies every
-    /// pair before timing; opt-in races time first and qualify only finalists.
+    /// pair before timing; races time first and qualify only finalists.
     /// A native-f32 split product runs with
     /// its SumRows and keeps them: candidates vary its tile shape and its
     /// partition count within the allocated partials, and agree within a bound
     /// that follows the largest output, since partitions reorder the sum.
     /// The result is an isolated-kernel choice, not an end-to-end speed claim.
+    /// Interactions between dispatches can make the complete program slower
+    /// even when every installed kernel wins in isolation. Use
+    /// [`crate::train::build_measured`] to retain an untuned fallback and require
+    /// whole-program qualification and paired timing, including for memo reuse.
     ///
     /// Forward MatMul+Add and unpacked NCHW scalar convolution forward/dX/dW are supported;
     /// convolution keys include batch, channels, spatial extents, kernel, stride
@@ -2907,6 +2913,106 @@ mod tests {
         assert!(report.calibration_time.is_zero());
         let actual = &session.plan.dispatches[tail.members[0]];
         assert_eq!(MatmulTile::selected(actual, None), Some(selected));
+    }
+
+    #[test]
+    fn memoized_kernel_winners_still_need_whole_program_timing() {
+        use std::sync::{Arc, Mutex};
+
+        let gpu = crate::reference::gpu::shared_context();
+        let mut graph = crate::Graph::new();
+        let x = graph.input("x", &[33, 17]);
+        let w = graph.parameter("w", &[17, 65]);
+        let y = graph.matmul(x, w);
+        graph.set_outputs(vec![y]);
+        let config = || {
+            let mut cfg = crate::SessionConfig::inference_from_env_on(gpu.clone());
+            cfg.tune = false;
+            cfg.optimize.mode = crate::optimize::OptimizeMode::Off;
+            cfg.runtime.coop = crate::CoopPolicy::Disabled;
+            cfg.runtime.gpu_timing = false;
+            cfg
+        };
+        let (ordinary, _) = crate::build(&graph, config());
+        for strategy in [TuneStrategy::Sequential, TuneStrategy::Race] {
+            let tuning = TuneOptions {
+                strategy,
+                calibration: TuneCalibration::Off,
+                // The only class is completely decided below: replay must not
+                // depend on a hardware-specific private race or any new probe.
+                max_classes: 1,
+                max_time: Duration::from_secs(10),
+                sample_pairs: 4,
+                ..Default::default()
+            };
+            let (classes, _) = ordinary.tune_classes(&tuning);
+            assert_eq!(classes.len(), 1);
+            let class = &classes[0];
+            let selected = class.challengers[0];
+            assert_ne!(selected, class.initial);
+            let mut memo = KernelMemo::default();
+            memo.bind(&gpu, &tuning, false);
+            memo.progress.insert(
+                memo_key(&ordinary.plan, class),
+                KernelProgress {
+                    selected,
+                    next_candidate: class.challengers.len(),
+                },
+            );
+            let memo = Arc::new(Mutex::new(memo));
+            let (mut session, report) = crate::train::build_measured(
+                &graph,
+                config(),
+                crate::train::BuildSearchOptions {
+                    max_graphs: 1,
+                    max_programs: 2,
+                    max_time: Duration::from_secs(30),
+                    // An intentionally unreachable whole-program gain makes
+                    // rejection independent of which valid tile was cached.
+                    min_improvement: 0.999999,
+                    warmup_runs: 1,
+                    warmup_time: Duration::ZERO,
+                    tuning,
+                    kernel_memo: Some(memo.clone()),
+                    ..Default::default()
+                },
+                |s, _| {
+                    s.set_input("x", &[0.25; 33 * 17]);
+                    s.set_parameter("w", &[0.125; 17 * 65]);
+                    Ok(())
+                },
+                |s| {
+                    if s.read_output(33 * 65).iter().all(|&v| v == 17.0 / 32.0) {
+                        Ok(())
+                    } else {
+                        Err("matmul mismatch".into())
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(report.trials.len(), 2);
+            assert!(report.trials[0].kernel_tuning.is_none());
+            let challenger = &report.trials[1];
+            let replay = challenger.kernel_tuning.as_ref().unwrap();
+            assert_eq!(replay.reused_classes, [(class.key.clone(), selected)]);
+            assert!(replay.races.is_empty() && replay.outcomes.is_empty());
+            assert!(challenger.outcome.qualified);
+            assert_eq!(challenger.outcome.baseline_ms.len(), 4);
+            assert_eq!(challenger.outcome.candidate_ms.len(), 4);
+            assert_eq!(challenger.outcome.decision, TuneDecision::KeepBaseline);
+            assert_eq!(report.selected, 0);
+            assert_eq!(session.plan(), ordinary.plan());
+            // Rejecting a whole program does not erase useful private evidence.
+            assert_eq!(memo.lock().unwrap().len(), 1);
+            session.step();
+            session.wait();
+            assert!(
+                session
+                    .read_output(33 * 65)
+                    .iter()
+                    .all(|&v| v == 17.0 / 32.0)
+            );
+        }
     }
 
     #[test]
