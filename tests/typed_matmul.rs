@@ -394,7 +394,7 @@ fn typed_partitions_tune_without_changing_precision() {
                 sample_pairs: 4,
                 dispatches_per_sample: 1,
                 target_sample_time: None,
-                ..Default::default()
+                ..crate::support::sequential_tuning()
             })
             .unwrap();
         assert_eq!(report.eligible_classes, 1);
@@ -450,6 +450,9 @@ fn untunable_typed_classes_leave_the_class_limit_to_others() {
             sample_pairs: 4,
             dispatches_per_sample: 1,
             target_sample_time: None,
+            // The 512-cubed BF16 product dominates the predicted plan, so a
+            // time-share cutoff would rightly skip the small ordinary class.
+            calibration: meganeura::TuneCalibration::Off,
             ..Default::default()
         })
         .unwrap();

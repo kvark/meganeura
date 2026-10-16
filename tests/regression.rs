@@ -34,6 +34,7 @@ mod onnx_exports;
 mod outline_optimize;
 mod padded_input;
 mod profile_windows;
+mod race;
 #[cfg(feature = "models")]
 mod resnet_correctness;
 mod rmsnorm_matmul_prologue;

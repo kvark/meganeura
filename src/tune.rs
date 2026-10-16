@@ -378,6 +378,31 @@ impl MatmulTile {
         dispatch.workgroups = self.workgroups(class);
     }
 
+    /// K partitions a split tile writes for its SumRows; `None` when unsplit.
+    pub(crate) fn partitions(self) -> Option<u32> {
+        match self {
+            Self::CooperativeTiled { splits, .. } | Self::CooperativeChecked { splits } => {
+                Some(splits)
+            }
+            _ => None,
+        }
+    }
+
+    /// Kernels whose measured-to-predicted ratio is shared across classes.
+    pub(crate) fn family(self) -> TileFamily {
+        match self {
+            Self::Tile16
+            | Self::Tile32
+            | Self::Tile64
+            | Self::Scalar(_)
+            | Self::SpecializedConv { .. } => TileFamily::Scalar,
+            Self::CooperativeF32 { .. }
+            | Self::CooperativeTiled { .. }
+            | Self::CooperativeChecked { .. } => TileFamily::Cooperative,
+            Self::Gemv(_) => TileFamily::Gemv,
+        }
+    }
+
     pub(crate) fn configure(self, dispatch: &mut Dispatch) {
         if let Self::CooperativeChecked { splits } = self {
             // Only the partition count is a candidate; storage stays.
@@ -436,7 +461,7 @@ impl MatmulTile {
         conv_tile_entry(entry, tile).unwrap_or_else(|| entry.clone())
     }
 
-    fn workgroups(self, class: &TuneClass) -> [u32; 3] {
+    pub(crate) fn workgroups(self, class: &TuneClass) -> [u32; 3] {
         let tile = match self {
             Self::Gemv(shape) => return class.gemv_workgroups(shape),
             Self::Tile16 => 16,
@@ -778,6 +803,30 @@ impl TuneClass {
         self.m as usize * self.n as usize * self.batch_dispatches() as usize
     }
 
+    /// Predicted milliseconds of one member dispatch running `tile`, scaled by
+    /// a measured-to-predicted `correction` for the tile's family.
+    pub(crate) fn predict_ms(
+        &self,
+        profile: &MachineProfile,
+        tile: MatmulTile,
+        correction: f64,
+    ) -> Option<f64> {
+        let flops = 2.0
+            * f64::from(self.m)
+            * f64::from(self.n)
+            * f64::from(self.k)
+            * f64::from(self.batch_dispatches());
+        let bytes = self.binding_bytes.iter().sum::<usize>() as f64;
+        let workgroups = tile
+            .workgroups(self)
+            .iter()
+            .map(|&count| u64::from(count))
+            .product();
+        profile
+            .predict_ms(flops, bytes, workgroups, None)
+            .map(|ms| ms * correction)
+    }
+
     /// A, B, optional addend, output sizes. Reject u32 shader-index overflow,
     /// not just host allocation overflow.
     pub(crate) fn buffer_sizes(&self) -> Option<Vec<usize>> {
@@ -1030,6 +1079,108 @@ pub enum TuneStagingReuse {
     SameSize,
 }
 
+/// Kernels that share a measured-to-predicted ratio during one search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum TileFamily {
+    Scalar,
+    Cooperative,
+    Gemv,
+}
+
+/// How a class's challengers are compared with its incumbent.
+/// Its default preserves historical reports; new [`TuneOptions`] race.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TuneStrategy {
+    /// One challenger at a time against the latest winner, each qualified
+    /// before it is timed (historical policy).
+    #[default]
+    Sequential,
+    /// Time the incumbent and every challenger together in shared rounds,
+    /// drop challengers that cannot pass the decision rule, and qualify only
+    /// a finalist that would be installed.
+    Race,
+}
+
+/// Where a search's [`MachineProfile`] comes from.
+/// Its default preserves historical reports; new [`TuneOptions`] measure.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub enum TuneCalibration {
+    /// No profile: classes keep their structural order, with no time-share cutoff.
+    #[default]
+    Off,
+    /// Measure the machine within a bounded part of the budget, once per
+    /// context in this process.
+    Measure,
+    /// Use this profile, measured earlier or supplied by the caller.
+    Profile(MachineProfile),
+}
+
+/// General properties of the machine that shape a search: how to time it and
+/// roughly how long work takes there. Measured with Meganeura's own kernels,
+/// never looked up by device. Predictions from it only order and bound work;
+/// measurements still select every winner. `None` marks a measurement the
+/// calibration budget did not reach.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MachineProfile {
+    /// Measured with GPU timestamps rather than the host clock.
+    pub gpu_timestamps: bool,
+    /// Host wall time of an empty submission and wait.
+    pub submit_round_trip: Option<Duration>,
+    /// GPU time a timed compute pass adds around a trivial dispatch.
+    pub pass_overhead: Option<Duration>,
+    /// Time one more trivial dispatch adds inside a pass.
+    pub dispatch_overhead: Option<Duration>,
+    /// Achieved streaming bandwidth, in bytes per second.
+    pub bandwidth: Option<f64>,
+    /// Achieved FLOP/s of the ordinary f32 matmul kernel, scaled to a fully
+    /// occupied machine.
+    pub matmul_flops: Option<f64>,
+    /// Concurrent 256-invocation workgroups, each with 16 KiB of workgroup
+    /// memory, before a fixed-work kernel slows down.
+    pub parallel_width: Option<u32>,
+    /// Median absolute deviation over the median of repeated identical timings.
+    pub timer_noise: Option<f64>,
+    /// Wall time spent measuring this profile.
+    pub elapsed: Duration,
+}
+
+impl MachineProfile {
+    /// Share of the machine a dispatch of `workgroups` keeps busy on average,
+    /// counting the idle slots of its last wave.
+    pub(crate) fn wave_utilization(&self, workgroups: u64) -> f64 {
+        let Some(width) = self.parallel_width.filter(|&width| width != 0) else {
+            return 1.0;
+        };
+        if workgroups == 0 {
+            return 1.0;
+        }
+        let width = u64::from(width);
+        workgroups as f64 / (workgroups.div_ceil(width) * width) as f64
+    }
+
+    /// Roofline estimate of one dispatch in milliseconds: the slower of
+    /// arithmetic at `flops_rate` (the calibrated matmul rate when `None`),
+    /// slowed by idle wave slots, and `bytes` at the calibrated bandwidth,
+    /// plus dispatch overhead. `None` without a bandwidth measurement.
+    pub(crate) fn predict_ms(
+        &self,
+        flops: f64,
+        bytes: f64,
+        workgroups: u64,
+        flops_rate: Option<f64>,
+    ) -> Option<f64> {
+        let traffic = bytes / self.bandwidth.filter(|&rate| rate > 0.0)?;
+        let arithmetic = match flops_rate.or(self.matmul_flops) {
+            Some(rate) if rate > 0.0 && flops > 0.0 => {
+                flops / (rate * self.wave_utilization(workgroups))
+            }
+            _ => 0.0,
+        };
+        let overhead = self.dispatch_overhead.unwrap_or_default().as_secs_f64();
+        Some((traffic.max(arithmetic) + overhead) * 1e3)
+    }
+}
+
 /// Resource bounds and decision policy for [`crate::Session::tune_with`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TuneOptions {
@@ -1067,6 +1218,15 @@ pub struct TuneOptions {
     pub target_sample_time: Option<Duration>,
     /// Required fractional improvement, in addition to a noise margin.
     pub min_improvement: f64,
+    /// Defaults to Race. Both strategies apply the same decision rule and
+    /// qualification; historical missing settings retain Sequential.
+    #[serde(default)]
+    pub strategy: TuneStrategy,
+    /// Defaults to Measure. With a profile, classes are visited in order of
+    /// predicted time, and visiting stops once the classes left are predicted
+    /// to total less than 0.1% of the plan. Historical missing settings retain Off.
+    #[serde(default)]
+    pub calibration: TuneCalibration,
 }
 
 impl Default for TuneOptions {
@@ -1083,6 +1243,8 @@ impl Default for TuneOptions {
             dispatches_per_sample: 16,
             target_sample_time: Some(Duration::from_millis(2)),
             min_improvement: 0.05,
+            strategy: TuneStrategy::Race,
+            calibration: TuneCalibration::Measure,
         }
     }
 }
@@ -1136,6 +1298,9 @@ impl TuneOptions {
 pub enum TuneDecision {
     FasterCandidate,
     KeepBaseline,
+    /// Dropped from a race without qualification: its samples could no
+    /// longer pass the decision rule, or other challengers were faster.
+    Eliminated,
     InvalidOutput,
     InvalidTiming,
     TimeBudget,
@@ -1340,6 +1505,51 @@ pub struct TuneReport {
     pub final_cleanup: Option<Duration>,
     #[serde(default)]
     pub scratch: Option<TuneScratchStats>,
+    /// The profile that ordered this search, if any. Measuring it counts
+    /// toward `elapsed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_profile: Option<MachineProfile>,
+    /// Predicted time of one plan execution, from the machine profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicted_plan_ms: Option<f64>,
+    /// Visiting stopped because the classes left were predicted to total less
+    /// than 0.1% of the plan.
+    #[serde(default)]
+    pub share_cutoff: bool,
+    /// One record per raced class; challengers still report `outcomes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub races: Vec<TuneRace>,
+}
+
+/// One class race: its incumbent and challengers timed together. Durations are
+/// host wall time; per-dispatch times come from GPU timestamps when
+/// `gpu_timestamps` is set and from the host clock otherwise.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TuneRace {
+    pub class: TuneClass,
+    pub dispatches: usize,
+    pub initial: MatmulTile,
+    pub selected: MatmulTile,
+    /// Candidates that compiled and were timed, incumbent included.
+    pub candidates: usize,
+    /// Timed rounds after the warmup round.
+    pub rounds: usize,
+    pub gpu_timestamps: bool,
+    /// Per-dispatch prediction that ordered this class, before correction.
+    pub predicted_ms: Option<f64>,
+    /// Measured median per dispatch of the incumbent.
+    pub incumbent_ms: Option<f64>,
+    /// Every challenger reached a decision; false after the deadline.
+    pub complete: bool,
+    /// Parallel compilation of every candidate's pipelines.
+    pub compile_time: Duration,
+    /// Checks, scratch allocation and input upload, excluding compilation.
+    pub preparation: Duration,
+    /// Warmup and timed rounds.
+    pub racing: Duration,
+    /// Qualification of finalists, if any would be installed.
+    pub qualification: Duration,
+    pub elapsed: Duration,
 }
 
 pub(crate) fn median(values: &[f64]) -> f64 {
@@ -2241,6 +2451,90 @@ mod tests {
         };
         class.binding_bytes = class.buffer_sizes().unwrap();
         class
+    }
+
+    #[test]
+    fn roofline_takes_the_slower_side_and_charges_idle_wave_slots() {
+        let profile = MachineProfile {
+            bandwidth: Some(1e9),
+            matmul_flops: Some(1e12),
+            parallel_width: Some(100),
+            dispatch_overhead: Some(Duration::from_micros(10)),
+            ..Default::default()
+        };
+        // 2 MB at 1 GB/s outweighs 1 GFLOP at 1 TFLOP/s on a full machine.
+        let traffic = profile.predict_ms(1e9, 2e6, 1000, None).unwrap();
+        assert!((traffic - 2.01).abs() < 1e-9, "{traffic}");
+        // A tenth of the machine is busy: arithmetic takes ten times longer.
+        let idle = profile.predict_ms(1e9, 0.0, 10, None).unwrap();
+        assert!((idle - 10.01).abs() < 1e-9, "{idle}");
+        // 150 workgroups fill one wave and half of another.
+        assert!((profile.wave_utilization(150) - 0.75).abs() < 1e-12);
+        assert_eq!(profile.wave_utilization(0), 1.0);
+        // An explicit rate replaces the calibrated matmul rate.
+        let faster = profile.predict_ms(2e9, 0.0, 1000, Some(1e13)).unwrap();
+        assert!((faster - 0.21).abs() < 1e-9, "{faster}");
+        // No bandwidth measurement: no prediction.
+        assert_eq!(
+            MachineProfile::default().predict_ms(1.0, 1.0, 1, None),
+            None
+        );
+    }
+
+    #[test]
+    fn class_predictions_follow_tile_workgroups_and_correction() {
+        let profile = MachineProfile {
+            bandwidth: Some(1e12),
+            matmul_flops: Some(1e12),
+            parallel_width: Some(1024),
+            ..Default::default()
+        };
+        let class = class(512, 512, 512);
+        // Tile64 launches 64 workgroups, Tile32 256: both under one wave.
+        let large = class.predict_ms(&profile, MatmulTile::Tile64, 1.0).unwrap();
+        let small = class.predict_ms(&profile, MatmulTile::Tile32, 1.0).unwrap();
+        assert!(large > small, "{large} vs {small}");
+        let corrected = class.predict_ms(&profile, MatmulTile::Tile64, 2.0).unwrap();
+        assert!((corrected - 2.0 * large).abs() < 1e-12);
+    }
+
+    #[test]
+    fn new_options_race_and_calibrate_but_old_settings_stay_sequential() {
+        let options = TuneOptions::default();
+        assert_eq!(options.strategy, TuneStrategy::Race);
+        assert_eq!(options.calibration, TuneCalibration::Measure);
+        let mut historical = serde_json::to_value(&options).unwrap();
+        let fields = historical.as_object_mut().unwrap();
+        fields.remove("strategy");
+        fields.remove("calibration");
+        let historical: TuneOptions = serde_json::from_value(historical).unwrap();
+        assert_eq!(historical.strategy, TuneStrategy::Sequential);
+        assert_eq!(historical.calibration, TuneCalibration::Off);
+        // A supplied profile round-trips, so it can be measured once and reused.
+        let supplied = TuneCalibration::Profile(MachineProfile {
+            bandwidth: Some(1e11),
+            parallel_width: Some(64),
+            ..Default::default()
+        });
+        let text = serde_json::to_string(&supplied).unwrap();
+        assert_eq!(
+            serde_json::from_str::<TuneCalibration>(&text).unwrap(),
+            supplied
+        );
+    }
+
+    #[test]
+    fn split_tiles_report_partitions_and_families() {
+        assert_eq!(
+            MatmulTile::CooperativeChecked { splits: 4 }.partitions(),
+            Some(4)
+        );
+        assert_eq!(MatmulTile::Tile64.partitions(), None);
+        assert_eq!(MatmulTile::Tile32.family(), TileFamily::Scalar);
+        assert_eq!(
+            MatmulTile::CooperativeF32 { tile_size: 16 }.family(),
+            TileFamily::Cooperative
+        );
     }
 
     #[test]
