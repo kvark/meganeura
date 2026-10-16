@@ -19,6 +19,7 @@ mod attention;
 mod basic;
 pub mod gpu;
 pub mod gradients;
+pub mod native_matrix;
 mod norm;
 mod vision;
 

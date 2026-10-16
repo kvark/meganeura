@@ -2482,6 +2482,10 @@ fn gen_matmul_coop_stored(
 ) -> ShaderModule {
     if let Some((types, layout)) = typed {
         types.validate();
+        assert!(
+            layout.vectorized,
+            "typed scalar bindings use the checked kernel"
+        );
         assert!(config.tile_size == 16 && !config.compensated && copies == 1);
         assert!(prologue.is_none() && epilogue.is_none());
         assert!(!layout.direct_output || (types.output == crate::DType::F32 && !fused_add));
@@ -2568,7 +2572,7 @@ fn gen_matmul_coop_stored(
     // "Transposed" vec4: load along the contiguous global-memory axis, write strided.
     //   B: BT (B[N,K], load along K, write rows-of-shared)
     //   A: AT (A[K,M], load along M, write rows-of-shared)
-    let use_vec4 = tile >= 16 && typed.is_none_or(|(_, layout)| layout.vectorized);
+    let use_vec4 = tile >= 16;
     // All variants use vec4 for both A and B (direct or transposed).
     // Transposed staging writes strided into shared (4 rows × 1 col per thread).
     // `vec4_b` is the "direct" staging that assumes B is [K,N]; it must be

@@ -122,14 +122,83 @@ Blade already exposes statistics through capture-enabled contexts, but does
 not request an explicit subgroup size. No driver installation or device-wide
 settings were changed for this work.
 
-Validation: 449 library tests pass. The AMD regression run passes 147 tests
-with 18 ignored and the same five pre-existing numerical failures (four BF16
-tests and `typed_matmul::f16_products_match_f64`); existing numerical assertions
-were not relaxed. New poisoned-buffer checks cover 126 typed shape/layout/
+Initial staging validation: 449 library tests passed. The AMD regression run
+passed 147 tests with 18 ignored and five numerical failures also present before
+the staging commit (four BF16 tests and this PR's own F16 exactness test).
+That comparison did not resolve the failures: the F16 test's stronger-than-native
+arithmetic assumption is addressed below, not attributed to experimental Mesa.
+New poisoned-buffer checks cover 126 typed shape/layout/
 addend/output combinations, including vector and scalar bindings, K tails,
 checked/direct output stores and split-K. The ignored BF16 convolution test
 also passes. Rectangular code generation is validated through SPIR-V emission;
 it was not measured on a rectangular-matrix GPU here.
+
+## Native matrix numerical contract
+
+Explicit F16/BF16 products opt into native cooperative arithmetic. Operand
+storage and conversion retain their specified format/rounding; accumulators
+and split partials are F32. **F32 accumulator storage is not a promise of
+bit-exact scalar IEEE F32 FMA arithmetic.** The Vulkan specification leaves
+cooperative matrix internal precision and operation order implementation-dependent:
+[Precision and operation of SPIR-V instructions](https://docs.vulkan.org/spec/latest/appendices/spirvenv.html).
+Results need not be bit-identical across devices, tile shapes or partition counts.
+
+On RX 7900 XT, a single native WMMA instruction computing `1*1 + (-1)*0`
+returns `0x3f7fffff` (0.9999999403953552), not `0x3f800000` (1). The same
+behavior occurs with F16 and BF16 operands in standalone HIP and through both
+Meganeura implementations. System Mesa 26.0.3 and private Mesa 26.2.4 produce
+identical F16 results. The original 33x65x1031 exactness fixture has maximum
+absolute error 3.948807716369629e-7. Uploaded inputs and the split reduction
+are correct; the error already exists in matrix partials. This is native
+instruction behavior, not an experimental-Mesa-only issue or accumulation
+ordering. Whether AMD considers it an erratum remains unconfirmed.
+
+Meganeura's finite, non-overflowing/non-underflowing native-matrix validation
+budget is defined by `reference::native_matrix::error_bound`:
+
+```
+u = 2^-24                         # F32 unit roundoff
+q = 2*K + 1
+gamma(q) = q*u / (1 - q*u)        # requires q*u < 1
+allowed = gamma(q) * (sum(abs(a[k] * b[k])) + abs(addend))
+```
+
+The reference uses operands already rounded to the multiplication format.
+This deliberately adopts the conservative serial multiply/add rounding budget
+as an **acceptance policy**, not a theorem about undocumented matrix hardware
+or a bound inferred from one observed error. It uses F32, not F16/BF16 epsilon.
+The sum of absolute products handles cancellation; no absolute or tensor-wide
+floor excuses loss of small results. Each partial is checked with its own K
+range and the final output with the full K (not K times the number of splits).
+An invalid or uninformative budget is rejected. Reduced outputs are checked
+against the rounded endpoints of the allowed interval: native arithmetic can
+cross a BF16 rounding midpoint even when the conversion itself is correct.
+
+This budget applies to primitive native matrix validation, not automatically
+to a whole differentiated graph, nonlinear pipeline, or benchmark. Those have
+separate reference/magnitude checks. Special values and underflow need separate
+coverage. Storage conversion remains bit-exactly tested; positive exact layout
+fixtures retain strict equality; signed/cancellation/scaled fixtures exercise
+the native budget. F16 subnormal-input preservation remains a separate required
+capability, with its existing rejection probe and regression unchanged. The
+probe is not an exhaustive numerical qualification of arbitrary inputs.
+
+`CoopPolicy` controls implicit cooperative selection for ordinary F32 graphs;
+it does not widen explicit typed products into a strict fallback. Callers who
+need to avoid native matrix arithmetic must use F32 operands and
+`CoopPolicy::Disabled`. This does not promise identical reduction order across
+all scalar implementations. No exact-native option or automatic fallback is
+currently provided. Inferena's precision policy and benchmark thresholds are
+unchanged by this contract.
+
+Follow-up validation on RX 7900 XT: all eight typed-matmul tests pass with
+system Mesa (BF16-specific cases skip there); the private Mesa full regression
+run passes 165 tests, ignores 21, and still fails three existing BF16
+connected-graph/reduced-gradient tests. Typed signed arithmetic and split-K
+primitive checks now pass. Those three higher-level failures are not waived
+by this primitive budget and their assertions remain unchanged. All-feature
+library tests pass (609 passed, 7 ignored), as does strict Clippy. RTX 5070 and
+B570 hardware follow-up remains outstanding.
 
 ## Historical F16 weight-storage work
 

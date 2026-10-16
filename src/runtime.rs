@@ -1315,6 +1315,10 @@ const F16_SUBNORMALS_LOST: &str = "F16 matrix products require F16/F32 cooperati
 /// Whether `gpu` runs explicit checked cooperative products that multiply in
 /// `multiply`: native storage, an implemented tile shape and, for F16, kept
 /// subnormal operands. Session construction rejects such plans otherwise.
+/// Native arithmetic uses implementation-dependent internal precision, not
+/// bit-exact scalar F32 FMA semantics. See [`crate::reference::native_matrix`]
+/// for the validation budget; this capability probe is not an exhaustive
+/// numerical qualification for arbitrary inputs.
 pub fn typed_matrix_supported(gpu: &Arc<Gpu>, multiply: crate::DType) -> bool {
     let capabilities = gpu.capabilities();
     let storage = match multiply {
@@ -3149,7 +3153,12 @@ pub struct SessionOptions {
     pub wgsl_dump_dir: Option<String>,
 }
 
-/// How cooperative-matrix hardware may be used.
+/// How cooperative-matrix hardware may be used for ordinary F32 graphs.
+///
+/// Explicit typed F16/BF16 products require their native implementation and
+/// are not widened or disabled by this policy. Native F32 accumulators do not
+/// promise scalar IEEE FMA semantics; see [`crate::reference::native_matrix`].
+/// To avoid native matrix arithmetic, use F32 operands with [`Self::Disabled`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CoopPolicy {
     /// Prefer f32 operands and accumulators. On f16-only devices, enable f16 tiles for
@@ -3162,7 +3171,8 @@ pub enum CoopPolicy {
     /// restriction. Devices with only reduced-input cooperative tiles retain
     /// scalar f32 implementations.
     NativeF32,
-    /// Never use cooperative matrices — force the scalar paths.
+    /// Disable cooperative selection for ordinary products, using scalar paths.
+    /// Explicit typed products still require native cooperative matrices.
     Disabled,
     /// Use f16 tiles without residual compensation, including for
     /// derivative work. Faster than [`Self::Auto`] on f16-only devices,
