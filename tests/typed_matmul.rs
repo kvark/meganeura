@@ -11,6 +11,126 @@ const M: usize = 33;
 const N: usize = 65;
 const K: usize = 1031;
 
+/// One nonzero A element per row gives an exact oracle. Exercise indexing,
+/// vector bindings, output tails, addends, rounding and K-partial addressing.
+#[test]
+fn typed_staging_handles_vector_tails_and_split_output() {
+    let gpu = crate::support::gpu::gpu();
+    for storage in [DType::F16, DType::BF16] {
+        if !meganeura::runtime::typed_matrix_supported(&gpu, storage) {
+            continue;
+        }
+        for (m, n, k) in [
+            (64, 64, 64),
+            (16, 48, 31),
+            (33, 65, 31),
+            (36, 68, 35),
+            (1, 1, 1),
+            (32, 32, 1031),
+            (33, 65, 1031),
+        ] {
+            for layout in 0..3 {
+                for add in [false, true] {
+                    for round in [false, true] {
+                        if round && storage != DType::BF16 {
+                            continue;
+                        }
+                        let mut g = Graph::new();
+                        let a_shape = if layout == 1 { [k, m] } else { [m, k] };
+                        let b_shape = if layout == 2 { [n, k] } else { [k, n] };
+                        let (a_id, b_id) = if storage == DType::F16 {
+                            (
+                                g.parameter_f16("a", &a_shape),
+                                g.parameter_f16("b", &b_shape),
+                            )
+                        } else {
+                            let a = g.parameter("a", &a_shape);
+                            let b = g.parameter("b", &b_shape);
+                            (g.to_bf16(a), g.to_bf16(b))
+                        };
+                        let bias_id = add.then(|| g.parameter("bias", &[m, n]));
+                        let y = match layout {
+                            0 => g.matmul(a_id, b_id),
+                            1 => g.matmul_at(a_id, b_id),
+                            _ => g.matmul_bt(a_id, b_id),
+                        };
+                        if let Some(bias) = bias_id {
+                            let node = &mut g.nodes_mut()[y as usize];
+                            node.op = [
+                                meganeura::graph::Op::FusedMatMulAdd,
+                                meganeura::graph::Op::FusedMatMulATAdd,
+                                meganeura::graph::Op::FusedMatMulBTAdd,
+                            ][layout]
+                                .clone();
+                            node.inputs.push(bias);
+                        }
+                        let y = if round {
+                            let y = g.to_bf16(y);
+                            g.from_bf16(y)
+                        } else {
+                            y
+                        };
+                        g.set_outputs(vec![y]);
+                        let mut a = vec![0.0; m * k];
+                        let b: Vec<f32> = (0..k * n)
+                            .map(|i| ((i * 31 % 61) as f32 - 30.0) / 4.0)
+                            .collect();
+                        let bias: Vec<f32> =
+                            (0..m * n).map(|i| ((i % 7) as f32 - 3.0) / 4.0).collect();
+                        let mut expected = vec![0.0; m * n];
+                        for row in 0..m {
+                            let inner = (row * 137 + k - 1) % k;
+                            a[if layout == 1 {
+                                inner * m + row
+                            } else {
+                                row * k + inner
+                            }] = 1.0;
+                            for col in 0..n {
+                                expected[row * n + col] =
+                                    b[if layout == 2 {
+                                        col * k + inner
+                                    } else {
+                                        inner * n + col
+                                    }] + if add { bias[row * n + col] } else { 0.0 };
+                            }
+                        }
+                        let mut session = meganeura::Session::with_context_opts(
+                            meganeura::compile::compile(&g),
+                            gpu.clone(),
+                            meganeura::SessionOptions {
+                                poison: true,
+                                ..Default::default()
+                            },
+                        );
+                        session.set_parameter("a", &a);
+                        session.set_parameter("b", &b);
+                        if add {
+                            session.set_parameter("bias", &bias);
+                        }
+                        session.step();
+                        session.wait();
+                        let actual = session.read_output(m * n);
+                        for (index, (&actual, &expected)) in
+                            actual.iter().zip(&expected).enumerate()
+                        {
+                            // RADV's experimental WMMA can differ by an F32 ulp
+                            // even for 1*x. Keep the exact-arithmetic tests above
+                            // separate; here the quarter-grid oracle makes this
+                            // bound much smaller than a wrong element or BF16
+                            // rounding step (including after addend cancellation).
+                            let tolerance = 4.0 * f32::EPSILON * expected.abs().max(1.0);
+                            assert!(
+                                actual.is_finite() && (actual - expected).abs() <= tolerance,
+                                "{storage:?} {m}x{n}x{k} layout={layout} add={add} round={round} index={index}: {actual} != {expected}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn graph(storage: DType, layout: usize) -> Graph {
     let mut g = Graph::new();
     let a_shape = if layout == 1 { [K, M] } else { [M, K] };

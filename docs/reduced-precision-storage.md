@@ -19,11 +19,23 @@ storage and direct BF16 model loading are not implemented yet.
 Dense BF16 products use the same `MatMul`/`MatMulAT`/`MatMulBT` shader groups,
 addend layouts and bindings as F32/F16 products. `Kernel::CooperativeTyped`
 records the operand, multiplication and output types (`codegen::MatrixTypes`)
-and K partitions. Its checked cooperative loop stages operands in the
-multiplication type, handles partial tiles and rounds a BF16 output to nearest
-even; split-K partials remain F32 until reduction. Kernel selection and tuning
+and K partitions. Square dense products share the ordinary FP16 generator's
+vector staging and 2x2 register tiles, with operands staged in their
+multiplication type. Vector bindings are used only when both operands contain
+whole vectors; odd strides and K tails use masked per-lane loads. Incomplete
+bindings retain the checked kernel: scalar staging in the fast kernel was
+slower on the tested ragged AMD products. F32 outputs with whole 16x16 tiles use direct
+cooperative stores; output tails, addends and reduced outputs use checked
+stores from shared memory. BF16 outputs round to nearest even; split-K
+partials remain F32 until reduction. Kernel selection and tuning
 preserve this storage contract. Typed products are reported as cooperative
 matrix kernels in profiles.
+
+The staged square kernel and the rectangular/implicit-GEMM fallback share the
+same 32-element K partition boundaries. Pipeline keys include vector-binding
+and direct-output specialization, independently of the uniform partition
+count. The generic code-generation API retains the checked implementation;
+runtime construction specializes from the actual product dimensions.
 
 Two explicit F16 operands select the same typed kernel with F16 multiplication,
 F32 accumulation and the same K partitions, given Blade's `shader_float16` and
@@ -83,6 +95,41 @@ warnings; the known workgroup-layout message remains. CPU checks include 16
 pointwise storage combinations, 12 matrix store/layout/addend combinations,
 protected outputs and aliased BF16 views. This is not a full learner or a
 performance/learning-quality claim.
+
+## Shared dense staging on RX 7900 XT (October 16, 2026)
+
+Release microbenchmarks against PR #257's `9b6b41a`, using process-local
+Mesa 26.2.4 with `RADV_EXPERIMENTAL=bfloat16`, put a 1024-cubed BF16
+multiply at approximately 100 us instead of 350 us. Including the graph's
+F32-to-BF16 conversions, the GPU dispatch sum is approximately 115 us instead
+of 360 us. Explicit F16 reaches the same approximately 100 us kernel range
+as the ordinary promoted-F16 path. These are repeated-input microbenchmarks,
+not whole-model speedups, and clocks were not pinned. Odd-sized bindings keep
+the checked fallback after measuring a scalar-staging regression there.
+
+RADV pipeline statistics for the large typed kernel change from 8192 to 2048
+bytes of LDS and 1204 to 584 instructions, with no spills. The ordinary FP16
+kernel's statistics are unchanged. F16 and BF16 typed kernels have matching
+statistics. Kernel partition tuning remains bounded; the tested challengers
+qualified but kept their original counts.
+
+The AMD capability query lists only 16x16x16, subgroup-scoped cooperative
+matrices: no rectangular or workgroup-scoped tiles. Experimental Mesa exposes
+BF16 types and cooperative matrices, but `shaderBFloat16DotProduct` is false.
+The system Mesa 26.0.3 does not expose BF16. Subgroup-size control (32--64),
+64 KiB workgroup shared memory and pipeline executable statistics are exposed.
+Blade already exposes statistics through capture-enabled contexts, but does
+not request an explicit subgroup size. No driver installation or device-wide
+settings were changed for this work.
+
+Validation: 449 library tests pass. The AMD regression run passes 147 tests
+with 18 ignored and the same five pre-existing numerical failures (four BF16
+tests and `typed_matmul::f16_products_match_f64`); existing numerical assertions
+were not relaxed. New poisoned-buffer checks cover 126 typed shape/layout/
+addend/output combinations, including vector and scalar bindings, K tails,
+checked/direct output stores and split-K. The ignored BF16 convolution test
+also passes. Rectangular code generation is validated through SPIR-V emission;
+it was not measured on a rectangular-matrix GPU here.
 
 ## Historical F16 weight-storage work
 

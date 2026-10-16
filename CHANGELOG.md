@@ -23,7 +23,14 @@
   Qualification runs on private scratch in the operands' storage types against
   references built from operands rounded to the multiplication type. Classes
   with no applicable challenger are left out before the class limit. The
-  kernel memo revision is now 3.
+  kernel memo revision is now 4.
+- Dense typed F16/BF16 products with native 16x16x16 matrices share the fast
+  FP16 generator's vector staging, 2x2 register tiles and direct F32 output
+  stores. Whole-vector bindings and whole native output tiles are checked
+  independently; output tails use checked stores in the same generator.
+  Incomplete vector bindings, rectangular tiles and implicit-GEMM convolutions
+  retain their checked implementation. Pipeline keys include the storage layout,
+  and split-K keeps the existing partition boundaries and F32 partials.
 - The Blade update conditionally enables Vulkan memory-model emission for every
   shader on devices that advertise it, including existing F32/F16 kernels. The
   matching Naga fork carries the BF16 cooperative-matrix and corrected Vulkan

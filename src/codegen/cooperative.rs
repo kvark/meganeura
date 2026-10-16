@@ -1,6 +1,15 @@
 use super::{MatMulCoopVariant, MatrixTypes, ShaderGroup, ShaderModule, coop_shape, preprocess};
 use crate::DType;
 
+// Keep partition boundaries identical for the staged and rectangular kernels.
+// A whole 32-element block is also a whole pair of 16-wide staged K tiles.
+pub(super) const SPLIT_RANGE: &str = "let blocks = (k + 31u) / 32u;\n\
+    let base = blocks / params.splits;\n\
+    let extra = blocks % params.splits;\n\
+    let first = (wgid.z * base + min(wgid.z, extra)) * 32u;\n\
+    let count = base + select(0u, 1u, wgid.z < extra);\n\
+    let end = min(first + count * 32u, k);";
+
 /// Dense and implicit-GEMM convolutions share the same checked cooperative
 /// loop. Operands are staged in the multiplication type; the accumulator is
 /// F32, and so are partials until their reduction.
@@ -11,6 +20,7 @@ pub(super) fn generate(group: ShaderGroup, types: MatrixTypes, shape: [u32; 3]) 
         "unsupported cooperative tile {shape:?}"
     );
     let [m, n, k] = shape;
+    let split_range = SPLIT_RANGE.replace("wgid.", "group.");
     let (declaration, dimensions, range, a, b, index, destination, add) = match group {
         ShaderGroup::MatMul
         | ShaderGroup::MatMulAT
@@ -32,12 +42,7 @@ pub(super) fn generate(group: ShaderGroup, types: MatrixTypes, shape: [u32; 3]) 
             (
                 declaration,
                 "let m = params.m; let n = params.n; let k = params.k;",
-                "let blocks = (k + 31u) / 32u;\n\
-                 let base = blocks / params.splits;\n\
-                 let extra = blocks % params.splits;\n\
-                 let first = (group.z * base + min(group.z, extra)) * 32u;\n\
-                 let count = base + select(0u, 1u, group.z < extra);\n\
-                 let end = min(first + count * 32u, k);",
+                split_range.as_str(),
                 if variant == MatMulCoopVariant::AT {
                     "matrix_a[ak * m + ar]"
                 } else {
@@ -237,35 +242,86 @@ mod tests {
                             output,
                         };
                         if types.is_valid() {
-                            cases.push((ShaderGroup::MatMulBTAdd, types, shape));
+                            for group in [
+                                ShaderGroup::MatMul,
+                                ShaderGroup::MatMulAT,
+                                ShaderGroup::MatMulBT,
+                                ShaderGroup::MatMulAdd,
+                                ShaderGroup::MatMulATAdd,
+                                ShaderGroup::MatMulBTAdd,
+                            ] {
+                                cases.push((group, types, shape));
+                            }
                         }
                     }
                 }
             }
         }
         for (group, types, shape) in cases {
-            let mut module = generate(group, types, shape);
-            let mut binding = 0;
-            for (_, global) in module.module.global_variables.iter_mut() {
-                if matches!(
-                    global.space,
-                    naga::AddressSpace::Uniform | naga::AddressSpace::Storage { .. }
-                ) {
-                    global.binding = Some(naga::ResourceBinding { group: 0, binding });
-                    binding += 1;
+            for layout in [
+                super::super::TypedMatmulLayout::default(),
+                super::super::TypedMatmulLayout {
+                    vectorized: true,
+                    direct_output: false,
+                },
+                super::super::TypedMatmulLayout::for_product(
+                    types,
+                    coop_shape(group).is_some_and(|(addend, _)| addend),
+                    [64, 64, 64],
+                ),
+            ] {
+                let mut module = super::super::generate_module_coop_typed_with_layout(
+                    group, types, shape, layout,
+                );
+                let mut binding = 0;
+                for (_, global) in module.module.global_variables.iter_mut() {
+                    if matches!(
+                        global.space,
+                        naga::AddressSpace::Uniform | naga::AddressSpace::Storage { .. }
+                    ) {
+                        global.binding = Some(naga::ResourceBinding { group: 0, binding });
+                        binding += 1;
+                    }
                 }
+                let info =
+                    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), capabilities)
+                        .validate(&module.module)
+                        .unwrap_or_else(|error| panic!("{group:?} {types:?} {shape:?}: {error:?}"));
+                let options = naga::back::spv::Options {
+                    lang_version: (1, 3),
+                    flags: naga::back::spv::WriterFlags::empty(),
+                    ..Default::default()
+                };
+                let words =
+                    naga::back::spv::write_vec(&module.module, &info, &options, None).unwrap();
+                assert!(!words.is_empty());
             }
-            let info =
-                naga::valid::Validator::new(naga::valid::ValidationFlags::all(), capabilities)
-                    .validate(&module.module)
-                    .unwrap_or_else(|error| panic!("{group:?} {types:?} {shape:?}: {error:?}"));
-            let options = naga::back::spv::Options {
-                lang_version: (1, 3),
-                flags: naga::back::spv::WriterFlags::empty(),
-                ..Default::default()
-            };
-            let words = naga::back::spv::write_vec(&module.module, &info, &options, None).unwrap();
-            assert!(!words.is_empty());
+        }
+    }
+
+    #[test]
+    fn typed_dense_uses_shared_staging_and_register_tiles() {
+        use super::super::{TypedMatmulLayout, generate_module_coop_typed_with_layout};
+        for storage in [DType::F16, DType::BF16] {
+            let types = MatrixTypes::reduced(storage);
+            let layout = TypedMatmulLayout::for_product(types, false, [64, 64, 64]);
+            let module = generate_module_coop_typed_with_layout(
+                ShaderGroup::MatMul,
+                types,
+                [16, 16, 16],
+                layout,
+            );
+            assert!(module.source.contains(&format!(
+                "matrix_a: array<vec4<{}>>",
+                MatrixTypes::name(storage)
+            )));
+            assert!(
+                module
+                    .source
+                    .contains("acc11 = coopMultiplyAdd(a1, b1, acc11)")
+            );
+            assert!(!module.source.contains("var<workgroup> shared_c"));
+            assert!(module.source.contains("wgid.z * m * n"));
         }
     }
 }

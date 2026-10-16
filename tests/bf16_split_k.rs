@@ -128,10 +128,10 @@ fn partitions_reduce_before_rounding_and_leave_addends_unsplit() {
 #[test]
 fn partitions_and_outputs_match_full_f64() {
     let gpu = crate::support::gpu::gpu();
-    if !meganeura::codegen::checked_cooperative_shape(
+    if meganeura::codegen::checked_cooperative_shape(
         &gpu.capabilities().cooperative_matrix.bf16_f32_shapes,
     )
-    .is_some()
+    .is_none()
     {
         eprintln!("native BF16 matrices unavailable; skipping device-specific coverage");
         return;
@@ -229,10 +229,10 @@ fn partitions_and_outputs_match_full_f64() {
 #[test]
 fn long_products_preserve_master_and_reduced_gradients() {
     let gpu = crate::support::gpu::gpu();
-    if !meganeura::codegen::checked_cooperative_shape(
+    if meganeura::codegen::checked_cooperative_shape(
         &gpu.capabilities().cooperative_matrix.bf16_f32_shapes,
     )
-    .is_some()
+    .is_none()
     {
         eprintln!("native BF16 matrices unavailable; skipping device-specific coverage");
         return;

@@ -377,10 +377,10 @@ fn bf16_pointwise_shaders_validate() {
 #[test]
 fn bf16_connected_forward_backward_and_updates() {
     let context = crate::support::gpu::gpu();
-    if !meganeura::codegen::checked_cooperative_shape(
+    if meganeura::codegen::checked_cooperative_shape(
         &context.capabilities().cooperative_matrix.bf16_f32_shapes,
     )
-    .is_some()
+    .is_none()
     {
         eprintln!("native BF16 matrices unavailable; skipping device-specific coverage");
         return;
@@ -437,10 +437,10 @@ fn bf16_connected_forward_backward_and_updates() {
 #[test]
 fn bf16_matrix_reduced_gradients() {
     let context = crate::support::gpu::gpu();
-    if !meganeura::codegen::checked_cooperative_shape(
+    if meganeura::codegen::checked_cooperative_shape(
         &context.capabilities().cooperative_matrix.bf16_f32_shapes,
     )
-    .is_some()
+    .is_none()
     {
         eprintln!("native BF16 matrices unavailable; skipping device-specific coverage");
         return;
@@ -505,10 +505,10 @@ fn bf16_matrix_reduced_gradients() {
 #[test]
 fn bf16_selected_dense_graph_gradients() {
     let context = crate::support::gpu::gpu();
-    if !meganeura::codegen::checked_cooperative_shape(
+    if meganeura::codegen::checked_cooperative_shape(
         &context.capabilities().cooperative_matrix.bf16_f32_shapes,
     )
-    .is_some()
+    .is_none()
     {
         eprintln!("native BF16 matrices unavailable; skipping device-specific coverage");
         return;
@@ -553,10 +553,10 @@ fn bf16_selected_dense_graph_gradients() {
 #[test]
 fn bf16_matrix_values_and_f32_gradients() {
     let context = crate::support::gpu::gpu();
-    if !meganeura::codegen::checked_cooperative_shape(
+    if meganeura::codegen::checked_cooperative_shape(
         &context.capabilities().cooperative_matrix.bf16_f32_shapes,
     )
-    .is_some()
+    .is_none()
     {
         eprintln!(
             "native BF16 cooperative matrices unavailable; skipping device-specific coverage"
