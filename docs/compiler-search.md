@@ -285,6 +285,8 @@ A learned empirical extraction cost is not implemented yet. A useful next step
 would reuse isolated measurements by implementation class
 to order the frontier, retaining the whole-program comparison as the final check.
 Adding uncalibrated FLOP or bandwidth coefficients would not establish that model.
+[Converging measured search](search-convergence.md) describes a prototype that
+calibrates those coefficients on the machine and races kernel classes.
 
 Broader coverage has a CPU cost. On the i5-12400F, four-form warm extraction at
 `1f8d58f` takes 6.66 / 69.04 / 63.46 ms for SmolLM2-135M / SmolVLA / Whisper-tiny
