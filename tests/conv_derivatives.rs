@@ -957,7 +957,7 @@ fn optimizer_updates(measure: bool, tile: u32) {
                 assert_eq!(scratch.staging_reuses, 1);
                 assert_eq!(
                     scratch.peak_bytes,
-                    (ny + nx + nw + 8 * nw) * 4 + (8 * nw * 4).max(ny * 4).max(nx * 4)
+                    (ny + nx + nw + 8 * nw) * 4 + (8 * nw * 4).max(ny * 4).max(nx * 4) + (1 << 20)
                 );
                 assert_eq!(session.dispatch_pipeline_keys(), keys);
                 assert_eq!(session.memory_summary().total_allocated_bytes(), bytes);

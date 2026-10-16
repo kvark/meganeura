@@ -1,4 +1,6 @@
-//! Compare kernel-search strategies on identical, freshly built sessions.
+//! Reproduction and scaling harness for kernel-search experiments.
+//! Compare strategies on identical, freshly built sessions; see
+//! `docs/experiments.md` for the campaigns and their limitations.
 //!
 //! `cargo run --release --example search_race -- [budget_seconds] [strategy...]`
 //!

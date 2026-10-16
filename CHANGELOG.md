@@ -9,6 +9,10 @@
   guard instead of ranking insignificant differences. Historical reports keep
   their sequential, uncalibrated policy. Cached winners no longer consume probe slots;
   memory limits, invalid timings and interrupted races remain retryable.
+  Scratch limits include encoder uniform-buffer allowances, and rejected
+  candidates allocate no host encoder. Partial machine profiles can fill
+  missing measurements when later calls provide more time or scratch space,
+  preserving completed measurements without repeating unchanged allowances.
   Kernel memo revision 6 separates these decisions, including host/GPU timing.
   `build_measured` measures the profile with its own budget before the first
   trial that probes kernels, reports it, and supplies it to later trials.

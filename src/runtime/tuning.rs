@@ -14,6 +14,12 @@ use std::{
 
 mod race;
 
+/// Uniform scratch reserved by each single-buffer encoder in the pinned Blade
+/// Vulkan backend (96c1dc7). Reserve it on every backend, conservatively, until
+/// Blade exposes encoder allocation sizes. Pipelines and opaque driver command
+/// and descriptor allocations are outside this buffer budget.
+pub(super) const ENCODER_SCRATCH_BYTES: usize = 1 << 20;
+
 /// Qualified private-scratch kernel comparisons, resumable by later tuning.
 ///
 /// Each decision covers one complete class key and candidate list, measured
@@ -929,21 +935,20 @@ impl Session {
         let budget = (options.max_time / 10)
             .min(Duration::from_millis(250))
             .min(options.max_time.saturating_sub(start.elapsed()));
-        if profile.is_none()
-            && options.calibration == TuneCalibration::Measure
+        if options.calibration == TuneCalibration::Measure
             && !pending.is_empty()
             && options.max_classes != 0
             && options.max_scratch_bytes != 0
             && !budget.is_zero()
         {
-            let calibration = Instant::now();
-            profile = Some(super::calibration::machine_profile(
+            let (measured, elapsed) = super::calibration::machine_profile(
                 &gpu,
                 self.gpu_timing,
                 budget,
                 options.max_scratch_bytes,
-            ));
-            report.calibration_time = calibration.elapsed();
+            );
+            profile = Some(measured);
+            report.calibration_time = elapsed;
         }
         report.predicted_plan_ms = profile
             .as_ref()
@@ -1736,9 +1741,10 @@ fn weight_reference_dot(
 }
 
 fn scratch_bytes(sizes: &[usize]) -> Option<usize> {
-    sizes
-        .iter()
-        .try_fold(*sizes.iter().max()?, |sum, size| sum.checked_add(*size))
+    sizes.iter().try_fold(
+        sizes.iter().max()?.checked_add(ENCODER_SCRATCH_BYTES)?,
+        |sum, size| sum.checked_add(*size),
+    )
 }
 
 fn reuse_staging(policy: TuneStagingReuse, retained: usize, requested: usize) -> bool {
@@ -3335,7 +3341,7 @@ mod tests {
             allocation.push(partial_bytes);
             assert_eq!(
                 scratch_bytes(&allocation),
-                Some(984 + 656 + 24 + partial_bytes + 984)
+                Some(984 + 656 + 24 + partial_bytes + 984 + ENCODER_SCRATCH_BYTES)
             );
             for pattern in 0..2 {
                 let inputs = test_inputs(&sizes, pattern);
@@ -3380,7 +3386,10 @@ mod tests {
         for splits in [0, 1, 7, u32::MAX] {
             assert!(split_dispatches(&dispatch, &class, splits).is_err());
         }
-        assert_eq!(scratch_bytes(&[4, 8, 12, 128]), Some(280));
+        assert_eq!(
+            scratch_bytes(&[4, 8, 12, 128]),
+            Some(280 + ENCODER_SCRATCH_BYTES)
+        );
     }
 
     #[test]
@@ -3829,7 +3838,7 @@ mod tests {
 
     #[test]
     fn scratch_cap_counts_staging_and_checks_overflow() {
-        assert_eq!(scratch_bytes(&[4, 8, 12]), Some(36));
+        assert_eq!(scratch_bytes(&[4, 8, 12]), Some(36 + ENCODER_SCRATCH_BYTES));
         assert_eq!(scratch_bytes(&[usize::MAX, 4]), None);
         assert!(reuse_staging(TuneStagingReuse::SameSize, 12, 12));
         for (retained, requested) in [(0, 0), (0, 12), (12, 8), (8, 12)] {
