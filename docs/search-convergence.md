@@ -135,10 +135,18 @@ still accepts kernel choices only through whole-step timing.
 ### Class order and memo
 
 Classes are visited in order of predicted time: members times the predicted
-time per dispatch. Visiting stops once the classes left are predicted to total
-less than `min_improvement` of the plan, since even removing them entirely
-could not pass the whole-step bar. Memoized classes install their winners
-without taking a `max_classes` slot. A completed race records its class as
+time per dispatch. When the budget is short, the deadline therefore cuts the
+smallest classes. Otherwise, visiting stops only once the classes left are
+predicted to total less than 0.1% of the plan. That bar is far below
+`min_improvement` for three reasons:
+
+- Kernel winners are accepted together, so wins in small classes add up.
+- A race's cost scales with its class's kernel time, so small classes are cheap.
+- Predictions can be several times off. On lavapipe, a GEMV class predicted at
+  0.4% of the plan took about 1.1% and held the only win. A bar of
+  `min_improvement`, and then of 1%, skipped it.
+
+Memoized classes install their winners without taking a `max_classes` slot. A completed race records its class as
 decided, including challengers that failed to compile or qualify, so later
 searches do not repeat them.
 
@@ -162,12 +170,31 @@ The same ideas apply to `build_measured`:
 
 `TuneOptions::strategy` selects `Race`, the default, or `Sequential`, the
 previous per-challenger duel, so the two can be compared on the same sessions.
-This section records what has landed on the branch.
+`TuneOptions::calibration` selects `Measure`, the default, `Off`, or a supplied
+`Profile`. Suites that use the tuner to qualify every candidate request the
+sequential, uncalibrated search explicitly. This section records what has
+landed on the branch.
 
-- [ ] Machine profile and calibration.
-- [ ] Class races with parallel compilation and finalist-only qualification.
-- [ ] Predicted class order, time-share cutoff and memo changes.
-- [ ] Shared calibration in `build_measured`.
+- [x] Machine profile and calibration (`runtime/calibration.rs`), cached per
+  context in a process.
+- [x] Class races with parallel compilation and finalist-only qualification
+  (`runtime/tuning/race.rs`), timed by GPU timestamps when the session's
+  context records them.
+- [x] Predicted class order with per-family correction, the 0.1% cutoff, and
+  memo changes: decided classes take no slot, and a completed race decides
+  every challenger. Kernel memo revision 5 and the memo scope record the strategy.
+- [x] `examples/search_race.rs` compares strategies on fresh sessions.
+- [ ] Shared calibration in `build_measured`: nested tuning already reuses
+  the per-context profile; the search does not yet measure it up front.
+- [ ] Whole-program changes from the next phase.
+
+First lavapipe comparison (CPU emulation, so only the search behaviour
+transfers), 30-second budget, the example's SmolLM2-shaped block:
+
+| Strategy | Search | Classes | Comparisons | Qualified | Winners |
+|---|---:|---:|---:|---:|---:|
+| Sequential | 30.1 s, budget hit | 2 of 4 | 12 | 12 | 0 |
+| Race, calibrated | 15.2 s | 4 of 4 | 42 | 1 | 1 |
 
 ## Follow-ups outside the main plan
 

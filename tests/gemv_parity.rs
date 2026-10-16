@@ -303,7 +303,7 @@ fn dense_transposed_glu_matches_reference_after_restage() {
                                 max_time: std::time::Duration::from_secs(60),
                                 sample_pairs: 4,
                                 dispatches_per_sample: 1,
-                                ..Default::default()
+                                ..crate::support::sequential_tuning()
                             })
                             .unwrap();
                         assert_eq!(report.eligible_classes, 1);

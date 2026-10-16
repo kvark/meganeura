@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+mod calibration;
 mod checkpoint;
 mod optimizer;
 pub(crate) mod search_state;

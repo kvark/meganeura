@@ -549,11 +549,11 @@ fn run_split(
             for mut options in [
                 meganeura::TuneOptions {
                     max_scratch_bytes: 0,
-                    ..Default::default()
+                    ..crate::support::sequential_tuning()
                 },
                 meganeura::TuneOptions {
                     max_time: std::time::Duration::ZERO,
-                    ..Default::default()
+                    ..crate::support::sequential_tuning()
                 },
             ] {
                 options.scope = meganeura::TuneScope::Convolution;
@@ -567,7 +567,7 @@ fn run_split(
                 .tune_with(meganeura::TuneOptions {
                     scope: meganeura::TuneScope::Convolution,
                     max_time: std::time::Duration::from_secs(60),
-                    ..Default::default()
+                    ..crate::support::sequential_tuning()
                 })
                 .unwrap();
             assert_eq!(report.eligible_classes, 3, "{s:?}: {report:?}");
@@ -895,20 +895,20 @@ fn optimizer_updates(measure: bool, tile: u32) {
                 for options in [
                     meganeura::TuneOptions {
                         max_time: std::time::Duration::ZERO,
-                        ..Default::default()
+                        ..crate::support::sequential_tuning()
                     },
                     meganeura::TuneOptions {
                         max_classes: 0,
-                        ..Default::default()
+                        ..crate::support::sequential_tuning()
                     },
                     meganeura::TuneOptions {
                         max_scratch_bytes: 0,
-                        ..Default::default()
+                        ..crate::support::sequential_tuning()
                     },
                     meganeura::TuneOptions {
                         max_scratch_bytes: (ny + nx + nw + 2 * nw) * 4 + ny.max(nx).max(2 * nw) * 4
                             - 1,
-                        ..Default::default()
+                        ..crate::support::sequential_tuning()
                     },
                 ] {
                     let report = session
@@ -928,7 +928,7 @@ fn optimizer_updates(measure: bool, tile: u32) {
                         &[2, 3, 7, 8],
                         meganeura::TuneOptions {
                             max_time: std::time::Duration::from_secs(60),
-                            ..Default::default()
+                            ..crate::support::sequential_tuning()
                         },
                     )
                     .unwrap();
@@ -981,7 +981,7 @@ fn optimizer_updates(measure: bool, tile: u32) {
                     .tune_with(meganeura::TuneOptions {
                         scope: meganeura::TuneScope::ConvDerivatives,
                         max_time: std::time::Duration::ZERO,
-                        ..Default::default()
+                        ..crate::support::sequential_tuning()
                     })
                     .unwrap();
                 assert_eq!(

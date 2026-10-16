@@ -80,7 +80,7 @@ fn tune_preserves_correctness() {
     let report = s
         .tune_with(TuneOptions {
             max_time: Duration::from_secs(60),
-            ..Default::default()
+            ..crate::support::sequential_tuning()
         })
         .unwrap();
     assert!(!report.outcomes.is_empty());
@@ -221,7 +221,7 @@ fn reduced_storage_tiles_preserve_outputs() {
         let report = session
             .tune_with(TuneOptions {
                 max_time: Duration::from_secs(30),
-                ..Default::default()
+                ..crate::support::sequential_tuning()
             })
             .unwrap();
         assert_eq!(report.eligible_classes, 1);
@@ -322,7 +322,7 @@ fn preserves_training_state(staging: TuneStaging, staging_reuse: TuneStagingReus
             staging,
             staging_reuse,
             max_time: Duration::from_secs(60),
-            ..Default::default()
+            ..crate::support::sequential_tuning()
         })
         .unwrap();
     assert!(report.outcomes.iter().any(|o| o.qualified), "{report:?}");
@@ -388,7 +388,7 @@ fn qualify_scalar_entries(staging: TuneStaging, staging_reuse: TuneStagingReuse)
                     staging,
                     staging_reuse,
                     max_time: Duration::from_secs(60),
-                    ..Default::default()
+                    ..crate::support::sequential_tuning()
                 })
                 .unwrap();
             assert_eq!(
@@ -438,15 +438,15 @@ fn tune_budget_skips_leave_selection_unchanged() {
     for options in [
         TuneOptions {
             max_classes: 0,
-            ..Default::default()
+            ..crate::support::sequential_tuning()
         },
         TuneOptions {
             max_time: Duration::ZERO,
-            ..Default::default()
+            ..crate::support::sequential_tuning()
         },
         TuneOptions {
             max_scratch_bytes: 0,
-            ..Default::default()
+            ..crate::support::sequential_tuning()
         },
     ] {
         let report = session.tune_with(options).unwrap();
@@ -508,7 +508,7 @@ fn tuning_releases_retained_staging_after_a_later_scratch_skip() {
             staging_reuse: TuneStagingReuse::SameSize,
             max_scratch_bytes: 2 * 1024 * 1024,
             max_time: Duration::from_secs(60),
-            ..Default::default()
+            ..crate::support::sequential_tuning()
         })
         .unwrap();
     assert!(!report.time_budget_exhausted);
@@ -551,7 +551,7 @@ fn tuning_releases_retained_staging_after_a_later_scratch_skip() {
         .tune_with(TuneOptions {
             staging_reuse: TuneStagingReuse::SameSize,
             max_time: Duration::ZERO,
-            ..Default::default()
+            ..crate::support::sequential_tuning()
         })
         .unwrap();
     assert_eq!(report.scratch.unwrap(), Default::default());
@@ -592,7 +592,7 @@ fn tune_native_cooperative_f32() {
             let report = session
                 .tune_with(TuneOptions {
                     max_time: Duration::from_secs(60),
-                    ..Default::default()
+                    ..crate::support::sequential_tuning()
                 })
                 .unwrap();
             assert_eq!(report.visited_classes, 1, "{report:?}");
@@ -647,7 +647,7 @@ fn tune_tiled_native_f32() {
         let report = session
             .tune_with(TuneOptions {
                 max_time: Duration::from_secs(60),
-                ..Default::default()
+                ..crate::support::sequential_tuning()
             })
             .unwrap();
         assert_eq!(report.visited_classes, 1, "{report:?}");
@@ -699,7 +699,7 @@ fn tune_split_native_f32_sequences() {
         let report = session
             .tune_with(TuneOptions {
                 max_time: Duration::from_secs(60),
-                ..Default::default()
+                ..crate::support::sequential_tuning()
             })
             .unwrap();
         assert_eq!(report.visited_classes, 1, "{shader:?}: {report:?}");
