@@ -1762,15 +1762,17 @@ impl Pipelines {
                 jobs.push((key, dispatch, coop));
             }
         }
-        let compiled = Self::compile_all(gpu, plan.knobs, wgsl_dump_dir, &jobs);
+        let compiled = Self::compile_all(gpu, plan.knobs, wgsl_dump_dir, &jobs, None);
         for ((key, dispatch, _), pipeline) in jobs.into_iter().zip(compiled) {
-            let pipeline = pipeline.unwrap_or_else(|error| {
-                if optimizer.iter().any(|d| std::ptr::eq(d, dispatch)) {
-                    panic!("optimizer shader was rejected: {error}")
-                } else {
-                    panic!("selected shader was rejected: {error}")
-                }
-            });
+            let pipeline = pipeline
+                .expect("unbounded compilation runs every job")
+                .unwrap_or_else(|error| {
+                    if optimizer.iter().any(|d| std::ptr::eq(d, dispatch)) {
+                        panic!("optimizer shader was rejected: {error}")
+                    } else {
+                        panic!("selected shader was rejected: {error}")
+                    }
+                });
             pipelines.map.insert(key, pipeline);
         }
         pipelines.select(&plan.dispatches);
@@ -1779,15 +1781,22 @@ impl Pipelines {
 
     /// Compile on worker threads. A driver can spend tens of milliseconds on
     /// one pipeline and a plan has hundreds; Blade's context is thread-safe.
+    /// With a search budget, unstarted jobs return None after it expires.
+    /// Already-running driver calls (at most one per worker) must finish.
     #[allow(clippy::type_complexity)]
     fn compile_all(
         gpu: &Arc<Gpu>,
         knobs: crate::compile::TuningKnobs,
         dump_dir: Option<&str>,
         jobs: &[(Variant, &Dispatch, Option<&crate::codegen::CoopConfig>)],
-    ) -> Vec<Result<Arc<SharedPipeline>, String>> {
+        budget: Option<(std::time::Instant, std::time::Duration)>,
+    ) -> Vec<Option<Result<Arc<SharedPipeline>, String>>> {
         let compile = |&(ref key, dispatch, coop): &(Variant, &Dispatch, _)| {
-            Self::compile(gpu, knobs, dump_dir, dispatch, key, coop)
+            if budget.is_some_and(|(start, limit)| start.elapsed() >= limit) {
+                None
+            } else {
+                Some(Self::compile(gpu, knobs, dump_dir, dispatch, key, coop))
+            }
         };
         let workers = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
@@ -1820,11 +1829,11 @@ impl Pipelines {
                     .join()
                     .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                 for (index, result) in compiled {
-                    results[index] = Some(result);
+                    results[index] = result;
                 }
             }
         });
-        results.into_iter().map(Option::unwrap).collect()
+        results
     }
 
     fn prepare(

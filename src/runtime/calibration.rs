@@ -11,7 +11,7 @@ use super::{Gpu, Pipelines, Session, create_gen_shader, create_profiled_pipeline
 use crate::compile::{BufferRef, Dispatch, ShaderEntry};
 use crate::tune::{MachineProfile, median};
 use blade_graphics as bg;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 /// `dst = src * a + b` over vec4 elements: one read and one write per element.
@@ -101,47 +101,79 @@ const MAX_MATMUL: usize = 2048;
 /// Largest streaming buffer, per direction.
 const MAX_STREAM_BYTES: usize = 64 << 20;
 
-/// The profile for `gpu`, measured within `budget` the first time a context
-/// asks. `timestamps` says whether the context records pass timestamps,
-/// which Blade cannot report (see [`super::SessionOptions::gpu_timing`]).
-/// A profile that reached bandwidth and matmul throughput is kept for the
-/// context's lifetime in this process; a shorter one is measured again.
+type ProfileEntry = (Weak<Gpu>, bool, Arc<OnceLock<MachineProfile>>);
+static PROFILES: Mutex<Vec<ProfileEntry>> = Mutex::new(Vec::new());
+
+/// Lookup only: callers asking whether probes are pending must not submit GPU
+/// work, compile pipelines, or wait for an in-progress calibration.
+pub(super) fn cached_profile(gpu: &Arc<Gpu>, timestamps: bool) -> Option<MachineProfile> {
+    let profiles = PROFILES.lock().unwrap();
+    profiles
+        .iter()
+        .find_map(|&(ref context, timing, ref profile)| {
+            (std::ptr::eq(context.as_ptr(), Arc::as_ptr(gpu)) && timing == timestamps)
+                .then(|| profile.get().cloned())
+                .flatten()
+        })
+}
+
+/// Measure once per context/timing mode, within a soft budget. Partial
+/// profiles are cached too: short searches must not repeatedly pay for the
+/// same unfinished calibration. The global lock is not held during GPU work.
 pub(super) fn machine_profile(
     gpu: &Arc<Gpu>,
     timestamps: bool,
     budget: Duration,
+    max_scratch_bytes: usize,
 ) -> MachineProfile {
     // A listed `Weak` keeps its context address from being reused.
-    type Entry = (Weak<Gpu>, MachineProfile);
-    static PROFILES: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
-    // Holding the lock keeps two searches on one context from timing each other.
-    let mut profiles = PROFILES.lock().unwrap();
-    profiles.retain(|entry| entry.0.strong_count() != 0);
-    if let Some(entry) = profiles.iter().find(|entry| {
-        std::ptr::eq(entry.0.as_ptr(), Arc::as_ptr(gpu)) && entry.1.gpu_timestamps == timestamps
-    }) {
-        return entry.1.clone();
-    }
-    let profile = calibrate(gpu, timestamps, budget);
-    log::info!("machine profile: {profile:?}");
-    if profile.bandwidth.is_some() && profile.matmul_flops.is_some() {
-        profiles.push((Arc::downgrade(gpu), profile.clone()));
-    }
-    profile
+    let slot = {
+        let mut profiles = PROFILES.lock().unwrap();
+        profiles.retain(|entry| entry.0.strong_count() != 0);
+        if let Some(entry) = profiles
+            .iter()
+            .find(|entry| std::ptr::eq(entry.0.as_ptr(), Arc::as_ptr(gpu)) && entry.1 == timestamps)
+        {
+            Arc::clone(&entry.2)
+        } else {
+            let slot = Arc::new(OnceLock::new());
+            profiles.push((Arc::downgrade(gpu), timestamps, Arc::clone(&slot)));
+            slot
+        }
+    };
+    slot.get_or_init(|| {
+        let profile = calibrate(gpu, timestamps, budget, max_scratch_bytes);
+        log::info!("machine profile: {profile:?}");
+        profile
+    })
+    .clone()
 }
 
-fn calibrate(gpu: &Arc<Gpu>, timestamps: bool, budget: Duration) -> MachineProfile {
+fn calibrate(
+    gpu: &Arc<Gpu>,
+    timestamps: bool,
+    budget: Duration,
+    max_scratch_bytes: usize,
+) -> MachineProfile {
+    if budget.is_zero() || max_scratch_bytes == 0 {
+        return MachineProfile::default();
+    }
     let _span = tracing::info_span!("machine_calibration").entered();
     let start = Instant::now();
-    let mut bench = Bench::new(gpu, timestamps, start + budget);
+    // Reserve time for the useful cost-model measurements. Width discovery
+    // must not consume the whole allowance before bandwidth/matmul start.
+    let mut bench = Bench::new(gpu, timestamps, start + budget / 8, max_scratch_bytes);
     let mut profile = MachineProfile {
         gpu_timestamps: bench.timestamps,
         submit_round_trip: Some(Duration::from_secs_f64(bench.round_trip_ms / 1e3)),
         ..Default::default()
     };
     bench.overheads(&mut profile);
+    bench.deadline = start + budget / 4;
     profile.parallel_width = bench.parallel_width();
+    bench.deadline = start + budget / 2;
     profile.bandwidth = bench.bandwidth();
+    bench.deadline = start + budget;
     bench.matmul(&mut profile);
     bench.finish();
     profile.elapsed = start.elapsed();
@@ -163,10 +195,16 @@ struct Bench<'a> {
     pipelines: Vec<bg::ComputePipeline>,
     /// Index of the streaming pipeline, compiled on first use.
     stream: Option<usize>,
+    max_scratch_bytes: usize,
 }
 
 impl<'a> Bench<'a> {
-    fn new(gpu: &'a Arc<Gpu>, timestamps: bool, deadline: Instant) -> Self {
+    fn new(
+        gpu: &'a Arc<Gpu>,
+        timestamps: bool,
+        deadline: Instant,
+        max_scratch_bytes: usize,
+    ) -> Self {
         let encoder = gpu.create_command_encoder(bg::CommandEncoderDesc {
             name: "machine_calibration",
             buffer_count: 1,
@@ -182,17 +220,20 @@ impl<'a> Bench<'a> {
             buffers: Vec::new(),
             pipelines: Vec::new(),
             stream: None,
+            max_scratch_bytes,
         };
-        let trips: Vec<f64> = (0..4)
-            .map(|_| {
-                let start = Instant::now();
-                bench.encoder.start();
-                let sync = bench.gpu.submit(&mut bench.encoder);
-                let _ = super::wait_for_timed_encoder(bench.gpu, &sync, &mut bench.encoder, false);
-                start.elapsed().as_secs_f64() * 1e3
-            })
-            .collect();
-        bench.round_trip_ms = trips.iter().copied().fold(f64::INFINITY, f64::min);
+        let mut trips = Vec::new();
+        for _ in 0..4 {
+            if bench.expired() {
+                break;
+            }
+            let start = Instant::now();
+            bench.encoder.start();
+            let sync = bench.gpu.submit(&mut bench.encoder);
+            let _ = super::wait_for_timed_encoder(bench.gpu, &sync, &mut bench.encoder, false);
+            trips.push(start.elapsed().as_secs_f64() * 1e3);
+        }
+        bench.round_trip_ms = trips.into_iter().reduce(f64::min).unwrap_or(0.0);
         bench
     }
 
@@ -232,6 +273,9 @@ impl<'a> Bench<'a> {
     }
 
     fn pipeline<D: bg::ShaderData>(&mut self, name: &str, source: &str) -> Option<usize> {
+        if self.expired() {
+            return None;
+        }
         let module = crate::codegen::ShaderModule::new(source);
         let shader = create_gen_shader(self.gpu, module)
             .map_err(|error| log::warn!("calibration shader {name} rejected: {error}"))
@@ -248,6 +292,9 @@ impl<'a> Bench<'a> {
 
     /// Room for `bytes` more without approaching the device budget.
     fn fits_memory(&self, bytes: usize) -> bool {
+        if bytes > self.max_scratch_bytes {
+            return false;
+        }
         let stats = self.gpu.memory_stats();
         stats.budget == 0
             || (bytes as u64) <= super::safe_device_memory_remaining(stats.usage, stats.budget) / 2
@@ -261,6 +308,9 @@ impl<'a> Bench<'a> {
         count: usize,
         mut encode: impl FnMut(&mut bg::CommandEncoder, &[bg::ComputePipeline]),
     ) -> Vec<f64> {
+        if self.expired() {
+            return Vec::new();
+        }
         if self.timestamps {
             self.encoder.start();
             for _ in 0..count {
@@ -278,16 +328,19 @@ impl<'a> Bench<'a> {
             }
             return Vec::new();
         }
-        (0..count)
-            .map(|_| {
-                let start = Instant::now();
-                self.encoder.start();
-                encode(&mut self.encoder, &self.pipelines);
-                let sync = self.gpu.submit(&mut self.encoder);
-                let _ = super::wait_for_timed_encoder(self.gpu, &sync, &mut self.encoder, false);
-                (start.elapsed().as_secs_f64() * 1e3 - self.round_trip_ms).max(0.0)
-            })
-            .collect()
+        let mut samples = Vec::new();
+        for _ in 0..count {
+            if self.expired() {
+                break;
+            }
+            let start = Instant::now();
+            self.encoder.start();
+            encode(&mut self.encoder, &self.pipelines);
+            let sync = self.gpu.submit(&mut self.encoder);
+            let _ = super::wait_for_timed_encoder(self.gpu, &sync, &mut self.encoder, false);
+            samples.push((start.elapsed().as_secs_f64() * 1e3 - self.round_trip_ms).max(0.0));
+        }
+        samples
     }
 
     /// Duration worth timing: long enough that the clock and submission jitter
@@ -308,6 +361,9 @@ impl<'a> Bench<'a> {
             return;
         };
         let bytes = 256 * 16;
+        if self.expired() || !self.fits_memory(2 * bytes) {
+            return;
+        }
         let (src, dst) = (
             self.buffer("calibration_src", bytes),
             self.buffer("calibration_dst", bytes),
@@ -326,8 +382,11 @@ impl<'a> Bench<'a> {
         let record = |dispatches: u32| {
             move |encoder: &mut bg::CommandEncoder, pipelines: &[bg::ComputePipeline]| {
                 let mut pass = encoder.compute("calibration_overhead");
-                let mut pc = pass.with(&pipelines[stream]);
-                for _ in 0..dispatches {
+                for dispatch in 0..dispatches {
+                    if dispatch != 0 {
+                        pass.barrier();
+                    }
+                    let mut pc = pass.with(&pipelines[stream]);
                     pc.bind(0, data);
                     pc.dispatch([1, 1, 1]);
                 }
@@ -349,7 +408,13 @@ impl<'a> Bench<'a> {
 
     /// Workgroups that run concurrently before a fixed-work kernel slows down.
     fn parallel_width(&mut self) -> Option<u32> {
+        if self.expired() || !self.fits_memory(MAX_WIDTH as usize * 4) {
+            return None;
+        }
         let width = self.pipeline::<WidthData>("calibration_width", WIDTH_SHADER)?;
+        if self.expired() {
+            return None;
+        }
         let dst = self.buffer("calibration_width", MAX_WIDTH as usize * 4);
         let measure = |bench: &mut Self, groups: u32, iterations: u32| {
             let samples = bench.time(3, |encoder, pipelines| {
@@ -371,28 +436,33 @@ impl<'a> Bench<'a> {
             });
             (!samples.is_empty()).then(|| median(&samples))
         };
-        // Lengthen one workgroup's work until it is worth timing.
-        let target = self.target_ms();
-        let mut iterations = 256;
-        let mut single = measure(self, 1, iterations)?;
-        while single < target && iterations < 1 << 22 && !self.expired() {
-            iterations *= 2;
-            single = measure(self, 1, iterations)?;
-        }
-        let mut width = 1;
-        let mut groups = 2;
-        while groups <= MAX_WIDTH && !self.expired() {
-            let elapsed = measure(self, groups, iterations)?;
-            if elapsed <= 1.25 * single {
-                width = groups;
+        let result = (|| {
+            // Lengthen one workgroup's work until it is worth timing.
+            let target = self.target_ms();
+            let mut iterations = 256;
+            let mut single = measure(self, 1, iterations)?;
+            while single < target && iterations < 1 << 22 && !self.expired() {
+                iterations *= 2;
+                single = measure(self, 1, iterations)?;
             }
-            if elapsed > 1.5 * single {
-                break;
+            let mut width = 1;
+            let mut groups = 2;
+            while groups <= MAX_WIDTH && !self.expired() {
+                let elapsed = measure(self, groups, iterations)?;
+                if elapsed <= 1.25 * single {
+                    width = groups;
+                }
+                if elapsed > 1.5 * single {
+                    break;
+                }
+                groups *= 2;
             }
-            groups *= 2;
-        }
+            Some(width)
+        })();
+        // Also release after missing timings or a deadline: the next stage
+        // gets the same scratch allowance, not an additional allocation.
         self.release(&[dst]);
-        Some(width)
+        result
     }
 
     /// Streaming bandwidth at the first size worth timing.
@@ -456,6 +526,9 @@ impl<'a> Bench<'a> {
                     return;
                 }
             };
+            if self.expired() {
+                break;
+            }
             let bytes = size * size * 4;
             let buffers = [
                 self.buffer("calibration_a", bytes),
@@ -545,11 +618,29 @@ mod tests {
     }
 
     #[test]
+    fn partial_profiles_are_reused_without_recalibrating() {
+        let gpu = Arc::new(
+            crate::init_gpu_context_with(crate::GpuOptions {
+                timing: false,
+                ..crate::GpuOptions::from_env()
+            })
+            .unwrap(),
+        );
+        assert!(cached_profile(&gpu, false).is_none());
+        // Zero resources cannot submit work or produce a complete profile.
+        let first = machine_profile(&gpu, false, Duration::ZERO, 0);
+        assert_eq!(first, MachineProfile::default());
+        assert_eq!(cached_profile(&gpu, false), Some(first.clone()));
+        let second = machine_profile(&gpu, false, Duration::from_millis(100), 1 << 20);
+        assert_eq!(second, first);
+    }
+
+    #[test]
     #[ignore = "GPU calibration; run with --ignored to inspect a profile"]
     fn calibration_measures_within_its_budget() {
         let gpu = crate::reference::gpu::shared_context();
         let budget = Duration::from_millis(500);
-        let profile = calibrate(&gpu, crate::GpuOptions::from_env().timing, budget);
+        let profile = calibrate(&gpu, crate::GpuOptions::from_env().timing, budget, 64 << 20);
         eprintln!("{profile:#?}");
         // Calibration is soft-bounded: one in-flight measurement may overrun.
         assert!(profile.elapsed < budget * 4, "{profile:?}");

@@ -218,7 +218,7 @@ pub(super) fn select(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     });
     let kernels = shared.as_deref_mut().unwrap_or(&mut private);
-    kernels.bind(&gpu, &options.tuning);
+    kernels.bind(&gpu, &options.tuning, runtime.gpu_timing);
     // Recent complete comparisons, without their private kernel probes.
     let mut comparison_costs = VecDeque::new();
     // Nothing executed since the incumbent's last qualification.
@@ -1036,7 +1036,10 @@ mod tests {
         let y = graph.matmul(x, w);
         graph.set_outputs(vec![y]);
         let plan = crate::compile::compile(&graph);
-        for kernel_threshold in [0.0, 0.99] {
+        for (kernel_threshold, strategy) in [0.0, 0.99].into_iter().flat_map(|threshold| {
+            [crate::TuneStrategy::Sequential, crate::TuneStrategy::Race]
+                .map(|strategy| (threshold, strategy))
+        }) {
             let memo = Arc::new(std::sync::Mutex::new(crate::runtime::KernelMemo::default()));
             let search = || {
                 select(
@@ -1053,6 +1056,12 @@ mod tests {
                     },
                     BuildSearchOptions {
                         tuning: TuneOptions {
+                            strategy,
+                            calibration: if strategy == crate::TuneStrategy::Race {
+                                crate::TuneCalibration::Measure
+                            } else {
+                                crate::TuneCalibration::Off
+                            },
                             min_improvement: kernel_threshold,
                             max_time: Duration::from_secs(30),
                             sample_pairs: 4,
@@ -1119,6 +1128,18 @@ mod tests {
             let tuning = second.trials[1].kernel_tuning.as_ref().unwrap();
             assert!(tuning.outcomes.is_empty());
             assert_eq!(tuning.reused_classes.len(), 1);
+            assert!(tuning.calibration_time.is_zero());
+            if strategy == crate::TuneStrategy::Race {
+                assert!(tuning.machine_profile.is_some());
+                assert_eq!(
+                    tuning.machine_profile,
+                    first.trials[1]
+                        .kernel_tuning
+                        .as_ref()
+                        .unwrap()
+                        .machine_profile
+                );
+            }
             assert_eq!(second.trials[1].qualifications, 1);
             assert_eq!(
                 second.trials[1].outcome.decision,

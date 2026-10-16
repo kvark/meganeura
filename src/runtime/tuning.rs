@@ -33,7 +33,9 @@ pub struct KernelMemo {
 
 // Bump when kernel generation, qualification or decision semantics change,
 // including changes between package releases. This also versions the memo schema.
-const KERNEL_MEMO_REVISION: u32 = 5;
+// Revision 5 belongs to rectangular candidates (#261). Races change the
+// decision policy independently, including which failures can be persisted.
+const KERNEL_MEMO_REVISION: u32 = 6;
 
 /// Undecided classes predicted to total less than this share of the plan are
 /// not probed. Kernel winners are accepted together, so classes well below
@@ -64,6 +66,9 @@ struct MemoScope {
     /// Races decide from shared rounds; keep their decisions apart.
     #[serde(default)]
     strategy: TuneStrategy,
+    /// GPU and host timings measure different costs and cannot share decisions.
+    #[serde(default)]
+    gpu_timestamps: bool,
 }
 
 impl MemoScope {
@@ -82,6 +87,7 @@ impl MemoScope {
             staging: options.staging,
             staging_reuse: options.staging_reuse,
             strategy: options.strategy,
+            gpu_timestamps: false,
         }
     }
 }
@@ -95,8 +101,11 @@ struct MemoFile {
 impl KernelMemo {
     /// Resume only decisions made on this engine, device and driver under the
     /// decision policy of `options`; budgets and scope do not change a decision.
-    pub(crate) fn bind(&mut self, gpu: &Gpu, options: &TuneOptions) {
-        self.bind_scope(MemoScope::new(gpu.device_information(), options));
+    pub(crate) fn bind(&mut self, gpu: &Gpu, options: &TuneOptions, gpu_timing: bool) {
+        let mut scope = MemoScope::new(gpu.device_information(), options);
+        scope.gpu_timestamps =
+            options.strategy == TuneStrategy::Race && gpu_timing && gpu.capabilities().timing;
+        self.bind_scope(scope);
     }
 
     fn bind_scope(&mut self, scope: MemoScope) {
@@ -762,8 +771,9 @@ impl Session {
     /// Each class uses private scratch with matching memory placement and two
     /// deterministic nonzero input patterns (including tiny f32 operands).
     /// Both candidates must agree elementwise; ordinary f32 classes must also
-    /// match sampled f64 reference dots before alternating, batched
-    /// `encode+submit+wait` measurements. A native-f32 split product runs with
+    /// match sampled f64 reference dots. Sequential tuning qualifies every
+    /// pair before timing; opt-in races time first and qualify only finalists.
+    /// A native-f32 split product runs with
     /// its SumRows and keeps them: candidates vary its tile shape and its
     /// partition count within the allocated partials, and agree within a bound
     /// that follows the largest output, since partitions reorder the sum.
@@ -782,7 +792,10 @@ impl Session {
     /// matrix bindings are never resized. Structural choices are made by
     /// `build_measured` before allocation. Sequential challenger
     /// comparisons per class reuse the latest fully qualified winner as the
-    /// incumbent. A soft deadline may be exceeded by one in-flight operation;
+    /// incumbent. Races compare against the class's original incumbent in
+    /// shared forward/reverse rounds, using GPU timestamps when enabled.
+    /// A soft deadline may be exceeded by in-flight operations (including up
+    /// to eight parallel pipeline compilations);
     /// an incomplete comparison always retains its incumbent.
     pub fn tune_with(&mut self, options: TuneOptions) -> Result<TuneReport, TuneError> {
         self.tune_with_memo(options, None)
@@ -842,17 +855,14 @@ impl Session {
         left >= NEGLIGIBLE_PLAN_SHARE * plan_ms
     }
 
-    /// The profile that orders this search: measured within a tenth of the
-    /// budget (at most 250 ms) once per context, or supplied by the caller.
+    /// Read-only lookup. In particular, kernel_probes_pending must not calibrate
+    /// before build_measured has reserved its remaining comparison budget.
     fn search_profile(&self, options: &TuneOptions) -> Option<MachineProfile> {
         match options.calibration {
             TuneCalibration::Off => None,
             TuneCalibration::Profile(ref profile) => Some(profile.clone()),
             TuneCalibration::Measure => {
-                let budget = (options.max_time / 10).min(Duration::from_millis(250));
-                (!budget.is_zero()).then(|| {
-                    super::calibration::machine_profile(&self.gpu, self.gpu_timing, budget)
-                })
+                super::calibration::cached_profile(&self.gpu, self.gpu_timing)
             }
         }
     }
@@ -864,6 +874,9 @@ impl Session {
     ) -> Result<TuneReport, TuneError> {
         options.validate()?;
         let start = Instant::now();
+        if let Some(memo) = memo.as_deref_mut() {
+            memo.bind(&self.gpu, &options, self.gpu_timing);
+        }
         let (classes, excluded_dispatches) = self.tune_classes(&options);
         let mut report = TuneReport {
             options: options.clone(),
@@ -871,12 +884,65 @@ impl Session {
             excluded_dispatches,
             ..Default::default()
         };
-        let profile = self.search_profile(&options);
+        let gpu = std::sync::Arc::clone(&self.gpu);
+        // Restore ALL recorded winners before spending probe slots or applying
+        // the time-share cutoff. A low-ranked cached class must not be lost just
+        // because an earlier undecided class hits a limit.
+        let mut pending = Vec::new();
+        for (index, class) in classes.iter().enumerate() {
+            let mut incumbent = class.initial;
+            let mut next_candidate = 0;
+            if start.elapsed() < options.max_time
+                && let Some(&progress) = memo
+                    .as_ref()
+                    .and_then(|m| m.progress.get(&memo_key(&self.plan, class)))
+                && progress.applies_to(class)
+                && self
+                    .pipelines
+                    .ensure_tune_tile(
+                        &gpu,
+                        &self.plan.dispatches[class.members[0]],
+                        progress.selected,
+                    )
+                    .is_ok()
+            {
+                class.install(&mut self.plan.dispatches, progress.selected);
+                report
+                    .reused_classes
+                    .push((class.key.clone(), progress.selected));
+                incumbent = progress.selected;
+                next_candidate = progress.next_candidate;
+            }
+            if next_candidate >= class.challengers.len() {
+                report.visited_classes += 1;
+            } else {
+                pending.push((index, incumbent, next_candidate));
+            }
+        }
+        let mut profile = self.search_profile(&options);
+        let budget = (options.max_time / 10)
+            .min(Duration::from_millis(250))
+            .min(options.max_time.saturating_sub(start.elapsed()));
+        if profile.is_none()
+            && options.calibration == TuneCalibration::Measure
+            && !pending.is_empty()
+            && options.max_classes != 0
+            && options.max_scratch_bytes != 0
+            && !budget.is_zero()
+        {
+            let calibration = Instant::now();
+            profile = Some(super::calibration::machine_profile(
+                &gpu,
+                self.gpu_timing,
+                budget,
+                options.max_scratch_bytes,
+            ));
+            report.calibration_time = calibration.elapsed();
+        }
         report.predicted_plan_ms = profile
             .as_ref()
             .and_then(|profile| predicted_plan_ms(&self.plan, &classes, profile));
         report.machine_profile = profile.clone();
-        let gpu = std::sync::Arc::clone(&self.gpu);
         let mut staging = Staging::new(&gpu, options.staging, options.staging_reuse);
         // Measured over predicted time per kernel family: log-ratio sum and count.
         let mut ratios: HashMap<TileFamily, (f64, u32)> = HashMap::new();
@@ -886,15 +952,14 @@ impl Session {
                 .map_or(1.0, |&(sum, count)| (sum / f64::from(count)).exp());
             class_ms(profile.as_ref()?, class, correction)
         };
-        let settled: Vec<bool> = classes
-            .iter()
-            .map(|class| decided(memo.as_deref(), &self.plan, class))
-            .collect();
-        let mut pending: Vec<usize> = (0..classes.len()).collect();
         let mut probed = 0;
         while !pending.is_empty() {
             if start.elapsed() >= options.max_time {
                 report.time_budget_exhausted = true;
+                break;
+            }
+            if probed == options.max_classes {
+                report.class_limit_reached = true;
                 break;
             }
             // The largest predicted class next; structural order without a profile.
@@ -902,46 +967,20 @@ impl Session {
                 let size = |index: usize| predict(&classes[index], &ratios).unwrap_or(0.0);
                 (0..pending.len())
                     .rev()
-                    .max_by(|&a, &b| size(pending[a]).total_cmp(&size(pending[b])))
+                    .max_by(|&a, &b| size(pending[a].0).total_cmp(&size(pending[b].0)))
                     .unwrap_or(0)
             } else {
                 0
             };
-            let index = pending.remove(position);
+            let (index, mut incumbent, mut next_candidate) = pending.remove(position);
             let class = &classes[index];
             let memo_key = memo_key(&self.plan, class);
-            let mut incumbent = class.initial;
-            let mut next_candidate = 0;
-            if let Some(&progress) = memo.as_ref().and_then(|m| m.progress.get(&memo_key)) {
-                let selected = progress.selected;
-                if progress.applies_to(class)
-                    && self
-                        .pipelines
-                        .ensure_tune_tile(&gpu, &self.plan.dispatches[class.members[0]], selected)
-                        .is_ok()
-                {
-                    class.install(&mut self.plan.dispatches, selected);
-                    report.reused_classes.push((class.key.clone(), selected));
-                    incumbent = selected;
-                    next_candidate = progress.next_candidate;
-                }
-            }
-            if next_candidate >= class.challengers.len() {
-                // Decided by an earlier search: no probe, no class slot.
-                report.visited_classes += 1;
-                continue;
-            }
-            if probed == options.max_classes {
-                report.class_limit_reached = true;
-                break;
-            }
             if let (Some(plan_ms), Some(profile)) = (report.predicted_plan_ms, profile.as_ref()) {
                 // Even removing every undecided class left would hardly change
                 // the plan. Shares compare uncorrected predictions on both
                 // sides; corrections only reorder classes.
                 let left: f64 = std::iter::once(index)
-                    .chain(pending.iter().copied())
-                    .filter(|&i| !settled[i])
+                    .chain(pending.iter().map(|entry| entry.0))
                     .filter_map(|i| class_ms(profile, &classes[i], 1.0))
                     .sum();
                 if left < NEGLIGIBLE_PLAN_SHARE * plan_ms {
@@ -951,6 +990,7 @@ impl Session {
             }
             probed += 1;
             report.visited_classes += 1;
+            let measured_tile = incumbent;
             let measured_ms = match options.strategy {
                 TuneStrategy::Race => {
                     let predicted_ms = profile
@@ -1072,11 +1112,11 @@ impl Session {
                 measured_ms,
                 profile
                     .as_ref()
-                    .and_then(|profile| class.key.predict_ms(profile, incumbent, 1.0)),
+                    .and_then(|profile| class.key.predict_ms(profile, measured_tile, 1.0)),
             ) && measured > 0.0
                 && predicted > 0.0
             {
-                let entry = ratios.entry(incumbent.family()).or_insert((0.0, 0));
+                let entry = ratios.entry(measured_tile.family()).or_insert((0.0, 0));
                 entry.0 += (measured / predicted).ln();
                 entry.1 += 1;
             }
@@ -1990,18 +2030,37 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
     }
 
     fn run(&mut self, sequence: &[(&bg::ComputePipeline, &Dispatch)], repeats: u32) -> f64 {
-        let pieces: Vec<bg::BufferPiece> = self.buffers.iter().map(|&b| b.into()).collect();
+        Self::run_on(
+            self.gpu,
+            &self.buffers,
+            &mut self.encoder,
+            sequence,
+            repeats,
+        )
+    }
+
+    /// Host timing with an explicitly owned encoder. Races keep one per
+    /// candidate so cycling through layouts does not evict descriptor caches.
+    fn run_on(
+        gpu: &Gpu,
+        buffers: &[bg::Buffer],
+        encoder: &mut bg::CommandEncoder,
+        sequence: &[(&bg::ComputePipeline, &Dispatch)],
+        repeats: u32,
+    ) -> f64 {
+        let pieces: Vec<bg::BufferPiece> = buffers.iter().map(|&b| b.into()).collect();
         let start = Instant::now();
-        self.encoder.start();
+        encoder.start();
         for _ in 0..repeats {
             for &(pipeline, dispatch) in sequence {
-                let mut pass = self.encoder.compute("tune_kernel");
+                let mut pass = encoder.compute("tune_kernel");
                 let mut pc = pass.with(pipeline);
                 Session::bind_dispatch(&pieces, dispatch, &mut pc);
                 pc.dispatch(dispatch.workgroups);
             }
         }
-        self.submit_wait();
+        let sync = gpu.submit(encoder);
+        let _ = super::wait_for_timed_encoder(gpu, &sync, encoder, false);
         start.elapsed().as_secs_f64() * 1e3
     }
 }
@@ -2543,6 +2602,11 @@ mod memo_tests {
             },
         ));
         assert!(sequential.is_empty());
+        let mut timestamped = KernelMemo::load(&path).unwrap();
+        let mut scope = timestamped.scope.clone().unwrap();
+        scope.gpu_timestamps = true;
+        timestamped.bind_scope(scope);
+        assert!(timestamped.is_empty());
         loaded.bind_scope(MemoScope::new(
             &bg::DeviceInformation::default(),
             &TuneOptions {
@@ -2557,7 +2621,7 @@ mod memo_tests {
     fn discards_incompatible_engines_and_unversioned_files() {
         let directory = TestDirectory::new();
         let path = directory.0.join("memo.json");
-        for change in ["revision", "engine", "unversioned"] {
+        for change in ["revision", "previous_revision", "engine", "unversioned"] {
             let memo = populated_memo();
             memo.save(&path).unwrap();
             let mut file: serde_json::Value =
@@ -2565,6 +2629,7 @@ mod memo_tests {
             let scope = file["scope"].as_object_mut().unwrap();
             match change {
                 "revision" => scope["revision"] = (KERNEL_MEMO_REVISION + 1).into(),
+                "previous_revision" => scope["revision"] = (KERNEL_MEMO_REVISION - 1).into(),
                 "engine" => scope["engine_version"] = "another version".into(),
                 _ => {
                     scope.remove("revision");
@@ -2743,6 +2808,24 @@ mod tests {
             ..Default::default()
         };
         let mut memo = KernelMemo::default();
+        let skipped = create()
+            .tune_with_memo(
+                TuneOptions {
+                    max_scratch_bytes: 0,
+                    ..options.clone()
+                },
+                Some(&mut memo),
+            )
+            .unwrap();
+        assert_eq!(skipped.races.len(), 1);
+        assert!(!skipped.races[0].complete);
+        assert!(
+            skipped
+                .outcomes
+                .iter()
+                .all(|outcome| outcome.decision == TuneDecision::ScratchLimit)
+        );
+        assert!(memo.is_empty(), "a scratch limit is not a kernel decision");
         let first = create()
             .tune_with_memo(options.clone(), Some(&mut memo))
             .unwrap();
@@ -2778,6 +2861,103 @@ mod tests {
         let third = create().tune_with_memo(options, Some(&mut memo)).unwrap();
         assert_eq!(third.reused_classes.len(), 2);
         assert!(third.outcomes.is_empty() && third.races.is_empty());
+    }
+
+    #[test]
+    fn cached_tail_is_restored_even_when_no_new_classes_can_be_probed() {
+        let gpu = crate::reference::gpu::shared_context();
+        let mut graph = crate::Graph::new();
+        let a = graph.input("a", &[32, 32]);
+        let b = graph.parameter("b", &[32, 32]);
+        let c = graph.input("c", &[64, 64]);
+        let d = graph.parameter("d", &[64, 64]);
+        let small = graph.matmul(a, b);
+        let large = graph.matmul(c, d);
+        graph.set_outputs(vec![small, large]);
+        let mut session = Session::with_context_opts(
+            crate::compile::compile(&graph),
+            gpu.clone(),
+            crate::SessionOptions {
+                coop: crate::CoopPolicy::Disabled,
+                ..Default::default()
+            },
+        );
+        let options = TuneOptions {
+            max_classes: 0,
+            calibration: TuneCalibration::Measure,
+            ..Default::default()
+        };
+        let (classes, _) = session.tune_classes(&options);
+        assert_eq!(classes.len(), 2);
+        let tail = classes.last().unwrap();
+        let selected = tail.challengers[0];
+        let mut memo = KernelMemo::default();
+        memo.bind(&gpu, &options, false);
+        memo.progress.insert(
+            memo_key(&session.plan, tail),
+            KernelProgress {
+                selected,
+                next_candidate: tail.challengers.len(),
+            },
+        );
+        let report = session.tune_with_memo(options, Some(&mut memo)).unwrap();
+        assert_eq!(report.reused_classes, [(tail.key.clone(), selected)]);
+        assert!(report.races.is_empty() && report.outcomes.is_empty());
+        assert!(report.class_limit_reached);
+        assert!(report.calibration_time.is_zero());
+        let actual = &session.plan.dispatches[tail.members[0]];
+        assert_eq!(MatmulTile::selected(actual, None), Some(selected));
+    }
+
+    #[test]
+    fn pending_checks_and_disabled_searches_do_not_calibrate() {
+        // A fresh context makes the cache assertions independent of test order.
+        let gpu = std::sync::Arc::new(
+            crate::init_gpu_context_with(crate::GpuOptions {
+                timing: false,
+                ..crate::GpuOptions::from_env()
+            })
+            .unwrap(),
+        );
+        let mut graph = crate::Graph::new();
+        let a = graph.input("a", &[32, 32]);
+        let b = graph.parameter("b", &[32, 32]);
+        let y = graph.matmul(a, b);
+        graph.set_outputs(vec![y]);
+        let mut session = Session::with_context_opts(
+            crate::compile::compile(&graph),
+            gpu.clone(),
+            crate::SessionOptions {
+                coop: crate::CoopPolicy::Disabled,
+                ..Default::default()
+            },
+        );
+        let options = TuneOptions {
+            strategy: TuneStrategy::Race,
+            calibration: TuneCalibration::Measure,
+            ..Default::default()
+        };
+        assert!(session.kernel_probes_pending(&options, None));
+        assert!(super::super::calibration::cached_profile(&gpu, false).is_none());
+        for skip in [
+            TuneOptions {
+                max_classes: 0,
+                ..options.clone()
+            },
+            TuneOptions {
+                max_time: Duration::ZERO,
+                ..options.clone()
+            },
+            TuneOptions {
+                max_scratch_bytes: 0,
+                ..options.clone()
+            },
+        ] {
+            let report = session.tune_with(skip).unwrap();
+            assert!(report.machine_profile.is_none());
+            assert!(report.calibration_time.is_zero());
+            assert!(super::super::calibration::cached_profile(&gpu, false).is_none());
+        }
     }
 
     #[test]

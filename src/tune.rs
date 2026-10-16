@@ -1139,6 +1139,7 @@ pub struct MachineProfile {
     /// memory, before a fixed-work kernel slows down.
     pub parallel_width: Option<u32>,
     /// Median absolute deviation over the median of repeated identical timings.
+    /// Diagnostic only; the decision rule still uses each race's paired noise.
     pub timer_noise: Option<f64>,
     /// Wall time spent measuring this profile.
     pub elapsed: Duration,
@@ -1155,7 +1156,7 @@ impl MachineProfile {
             return 1.0;
         }
         let width = u64::from(width);
-        workgroups as f64 / (workgroups.div_ceil(width) * width) as f64
+        workgroups as f64 / (workgroups.div_ceil(width) as f64 * width as f64)
     }
 
     /// Roofline estimate of one dispatch in milliseconds: the slower of
@@ -1169,15 +1170,19 @@ impl MachineProfile {
         workgroups: u64,
         flops_rate: Option<f64>,
     ) -> Option<f64> {
-        let traffic = bytes / self.bandwidth.filter(|&rate| rate > 0.0)?;
+        let traffic = bytes
+            / self
+                .bandwidth
+                .filter(|&rate| rate.is_finite() && rate > 0.0)?;
         let arithmetic = match flops_rate.or(self.matmul_flops) {
-            Some(rate) if rate > 0.0 && flops > 0.0 => {
+            Some(rate) if rate.is_finite() && rate > 0.0 && flops > 0.0 => {
                 flops / (rate * self.wave_utilization(workgroups))
             }
             _ => 0.0,
         };
         let overhead = self.dispatch_overhead.unwrap_or_default().as_secs_f64();
-        Some((traffic.max(arithmetic) + overhead) * 1e3)
+        let ms = (traffic.max(arithmetic) + overhead) * 1e3;
+        (ms.is_finite() && ms > 0.0).then_some(ms)
     }
 }
 
@@ -1204,7 +1209,8 @@ pub struct TuneOptions {
     /// An in-flight driver call, GPU submission, or validation cannot be preempted.
     pub max_time: Duration,
     pub warmup_runs: u32,
-    /// Complete, alternating baseline/candidate pairs required for a decision.
+    /// Complete baseline/candidate pairs required for a decision. Races use
+    /// shared rounds in paired forward/reverse order.
     pub sample_pairs: usize,
     /// Separate, barrier-delimited dispatches in each timed submission;
     /// complete sequences for split-K and cached-attention measurements.
@@ -1277,6 +1283,21 @@ impl TuneOptions {
         }
         if !self.min_improvement.is_finite() || !(0.0..1.0).contains(&self.min_improvement) {
             return Err(TuneError("min_improvement must be finite and in [0, 1)"));
+        }
+        if let TuneCalibration::Profile(ref profile) = self.calibration {
+            if [profile.bandwidth, profile.matmul_flops]
+                .into_iter()
+                .flatten()
+                .any(|rate| !rate.is_finite() || rate <= 0.0)
+                || profile.parallel_width == Some(0)
+                || profile
+                    .timer_noise
+                    .is_some_and(|noise| !noise.is_finite() || noise < 0.0)
+            {
+                return Err(TuneError(
+                    "machine profile rates/width must be positive and finite, and noise nonnegative",
+                ));
+            }
         }
         Ok(())
     }
@@ -1380,9 +1401,10 @@ pub struct TuneQualificationTimes {
 }
 
 /// Evidence for one candidate comparison within an exact class. Times are
-/// batched scratch wall times per dispatch (per complete sequence when
-/// `candidate_split_k` is present), not GPU
-/// timestamps or whole-step latency.
+/// scratch milliseconds per dispatch (per complete sequence for split-K),
+/// never whole-step latency. Sequential comparisons use batched wall times;
+/// races use GPU timestamps when `TuneRace::gpu_timestamps` is set, otherwise
+/// batched wall times.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TuneOutcome<Class = TuneClass, Choice = MatmulTile> {
     pub class: Class,
@@ -1509,6 +1531,10 @@ pub struct TuneReport {
     /// toward `elapsed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_profile: Option<MachineProfile>,
+    /// Calibration charged to this call, zero when a supplied/cached profile
+    /// was used. `MachineProfile::elapsed` describes its original measurement.
+    #[serde(default)]
+    pub calibration_time: Duration,
     /// Predicted time of one plan execution, from the machine profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predicted_plan_ms: Option<f64>,
@@ -1539,7 +1565,8 @@ pub struct TuneRace {
     pub predicted_ms: Option<f64>,
     /// Measured median per dispatch of the incumbent.
     pub incumbent_ms: Option<f64>,
-    /// Every challenger reached a decision; false after the deadline.
+    /// Every challenger reached a reusable decision. False after a deadline,
+    /// resource limit, invalid timing or failure of the incumbent control.
     pub complete: bool,
     /// Parallel compilation of every candidate's pipelines.
     pub compile_time: Duration,
@@ -2499,7 +2526,26 @@ mod tests {
     }
 
     #[test]
-    fn new_options_race_and_calibrate_but_old_settings_stay_sequential() {
+    fn supplied_profiles_reject_nonfinite_or_nonpositive_rates() {
+        for rate in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let options = TuneOptions {
+                calibration: TuneCalibration::Profile(MachineProfile {
+                    bandwidth: Some(rate),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert!(options.validate().is_err(), "{rate}");
+        }
+        let profile = MachineProfile {
+            parallel_width: Some(100),
+            ..Default::default()
+        };
+        assert!(profile.wave_utilization(u64::MAX).is_finite());
+    }
+
+    #[test]
+    fn new_options_race_but_historical_options_keep_the_original_policy() {
         let options = TuneOptions::default();
         assert_eq!(options.strategy, TuneStrategy::Race);
         assert_eq!(options.calibration, TuneCalibration::Measure);
