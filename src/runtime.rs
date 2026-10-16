@@ -13,6 +13,7 @@ mod optimizer;
 pub(crate) mod search_state;
 mod tuning;
 pub use crate::tune::TuneOutcome;
+pub(crate) use calibration::machine_profile;
 pub use tuning::KernelMemo;
 
 type Gpu = blade_graphics::Context;

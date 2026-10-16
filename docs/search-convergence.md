@@ -230,8 +230,9 @@ landed on the branch.
   every challenger with a reusable decision. Kernel memo revision 6 and the
   memo scope record the strategy and timing mode.
 - [x] `examples/search_race.rs` compares strategies on fresh sessions.
-- [ ] Shared calibration in `build_measured`: nested tuning already reuses
-  the per-context profile; the search does not yet measure it up front.
+- [x] Shared calibration in `build_measured`: measured once with the search's
+  own budget, before the first trial that probes kernels, reported in
+  `BuildSearchReport::machine_profile` and supplied to every later trial.
 - [ ] Whole-program changes from the next phase.
 
 Historical pre-review lavapipe comparison at `0d02d3e` (CPU emulation, so only
