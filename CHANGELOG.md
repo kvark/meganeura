@@ -1,5 +1,15 @@
 # Unreleased
 
+- Kernel tuning defaults to `TuneStrategy::Race`: parallel compilation,
+  shared forward/reverse timing rounds, conservative early elimination and
+  finalist-only qualification. `TuneCalibration::Measure` caches
+  a bounded machine profile per context to order classes and skip a predicted
+  negligible tail. Host races retain an encoder per candidate to avoid
+  descriptor-cache churn; finalist selection respects the improvement/noise
+  guard instead of ranking insignificant differences. Historical reports keep
+  their sequential, uncalibrated policy. Cached winners no longer consume probe slots;
+  memory limits, invalid timings and interrupted races remain retryable.
+  Kernel memo revision 6 separates these decisions, including host/GPU timing.
 - Native BF16 is available as an explicit graph precision policy on Vulkan
   devices where Blade reports BF16 storage and 16x16x16 or 8x16x16 BF16/F32 cooperative
   matrices. Conversion and connected pointwise boundaries use two-byte storage;

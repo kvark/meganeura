@@ -52,7 +52,7 @@ fn check_race(report: &TuneReport) {
     assert_eq!(report.races.len(), 1, "{report:#?}");
     let race = &report.races[0];
     assert!(race.complete, "{race:#?}");
-    assert!(race.rounds >= 3, "{race:#?}");
+    assert!(race.rounds >= 4, "{race:#?}");
     assert!(race.incumbent_ms.is_some_and(|ms| ms > 0.0), "{race:#?}");
     for outcome in &report.outcomes {
         assert!(
@@ -125,6 +125,71 @@ fn races_use_gpu_timestamps_when_the_context_records_them() {
     check_race(&report);
     assert!(report.races[0].gpu_timestamps);
     assert_eq!(run(&mut session), before, "tuning changed the live program");
+}
+
+#[test]
+fn timestamp_races_keep_typed_split_sequences_and_repetitions_ordered() {
+    typed_split_race(true);
+}
+
+#[test]
+fn host_races_keep_typed_split_sequences_and_repetitions_ordered() {
+    typed_split_race(false);
+}
+
+fn typed_split_race(gpu_timing: bool) {
+    let options = meganeura::GpuOptions::from_env();
+    let supported = crate::support::gpu::gpu();
+    if (gpu_timing && !supported.capabilities().timing)
+        || !meganeura::runtime::typed_matrix_supported(&supported, meganeura::DType::F16)
+    {
+        eprintln!("F16 matrices or timestamps unavailable; skipping typed race");
+        return;
+    }
+    let gpu = std::sync::Arc::new(
+        meganeura::init_gpu_context_with(meganeura::GpuOptions {
+            timing: gpu_timing,
+            ..options
+        })
+        .unwrap(),
+    );
+    let mut graph = Graph::new();
+    let a = graph.parameter_f16("a", &[33, 1031]);
+    let b = graph.parameter_f16("b", &[1031, 65]);
+    let y = graph.matmul(a, b);
+    graph.set_outputs(vec![y]);
+    let mut config = meganeura::SessionConfig::inference_from_env_on(gpu);
+    config.tune = false;
+    config.runtime.gpu_timing = gpu_timing;
+    let (mut session, _) = meganeura::build(&graph, config);
+    session.set_parameter("a", &[0.125; 33 * 1031]);
+    session.set_parameter("b", &[0.25; 1031 * 65]);
+    session.step();
+    session.wait();
+    let expected = session.read_output(33 * 65);
+    assert!(expected.iter().all(|&x| x == 1031.0 / 32.0));
+    let report = session
+        .tune_with(TuneOptions {
+            // With no warmup/fixed repeats, exercise barriers between sequences as
+            // well as the producer -> SumRows dependency within each sequence.
+            warmup_runs: 0,
+            dispatches_per_sample: 4,
+            target_sample_time: None,
+            ..race_options()
+        })
+        .unwrap();
+    check_race(&report);
+    assert!(report.races[0].class.split_k, "{report:#?}");
+    assert!(
+        report
+            .outcomes
+            .iter()
+            .all(|o| o.sample_repetitions == Some(4))
+    );
+    assert_eq!(report.races[0].gpu_timestamps, gpu_timing);
+    session.step();
+    session.wait();
+    assert_eq!(session.read_output(33 * 65), expected);
 }
 
 /// With a supplied profile, the classes predicted largest are visited first

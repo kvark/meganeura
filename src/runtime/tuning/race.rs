@@ -1,7 +1,7 @@
 //! Class races: a class's incumbent and challengers timed together.
 //!
 //! Every candidate's pipelines compile in one parallel batch, then all of them
-//! run in shared rounds on one scratch, in rotated order. With GPU timestamps
+//! run in shared forward/reverse rounds on one scratch. With GPU timestamps
 //! a round is one submission with a timed pass per candidate; otherwise each
 //! candidate is a host-timed submission. Challengers that can no longer pass
 //! the decision rule are dropped without qualification, and only a finalist
@@ -22,10 +22,10 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// Rounds every challenger gets before elimination starts.
-const ELIMINATE_AFTER: usize = 3;
+const ELIMINATE_AFTER: usize = 4;
 /// Challengers kept after the first elimination: successive halving's width.
 const FINALISTS: usize = 4;
-/// Largest share of a timed pass that pass overhead may take.
+/// Target share of a timed pass for pass overhead (subject to the repeat cap).
 const PASS_OVERHEAD_SHARE: f64 = 0.02;
 
 pub(super) struct RaceResult {
@@ -35,6 +35,24 @@ pub(super) struct RaceResult {
 }
 
 type Run<'a> = Vec<(&'a bg::ComputePipeline, &'a Dispatch)>;
+
+/// Blade reclaims descriptor caches unused in the previous recording. A
+/// shared host encoder cycling through many layouts would repeatedly measure
+/// allocation/destruction instead of steady-state execution. Keep one encoder
+/// per candidate (still one shared scratch); timestamp rounds already record
+/// every live layout together and need only the scratch encoder.
+struct HostEncoders<'a> {
+    gpu: &'a bg::Context,
+    encoders: Vec<bg::CommandEncoder>,
+}
+
+impl Drop for HostEncoders<'_> {
+    fn drop(&mut self) {
+        for encoder in &mut self.encoders {
+            self.gpu.destroy_command_encoder(encoder);
+        }
+    }
+}
 
 impl Session {
     /// Time `incumbent` and every other challenger of `class` together, and
@@ -77,20 +95,15 @@ impl Session {
             gpu_timestamps: false,
             predicted_ms,
             incumbent_ms: None,
-            complete: false,
+            complete: true,
             compile_time: Duration::ZERO,
             preparation: Duration::ZERO,
             racing: Duration::ZERO,
             qualification: Duration::ZERO,
             elapsed: Duration::ZERO,
         };
-        let conclude = |mut race: TuneRace, mut outcomes: Vec<TuneOutcome>| {
-            for outcome in &mut outcomes {
-                outcome.elapsed = Duration::ZERO;
-            }
-            race.complete = outcomes
-                .iter()
-                .all(|outcome| outcome.decision != TuneDecision::TimeBudget);
+        let conclude = |mut race: TuneRace, outcomes: Vec<TuneOutcome>| {
+            race.complete &= outcomes.iter().all(decided_outcome);
             race.elapsed = race_start.elapsed();
             RaceResult {
                 selected: race.selected,
@@ -194,19 +207,26 @@ impl Session {
             self.pipelines.knobs,
             self.pipelines.dump_dir.as_deref(),
             &jobs,
+            Some((start, options.max_time)),
         );
         let mut rejected: HashMap<Variant, String> = HashMap::new();
+        let mut interrupted = false;
         for ((key, ..), result) in jobs.into_iter().zip(compiled) {
             match result {
-                Ok(pipeline) => {
+                Some(Ok(pipeline)) => {
                     self.pipelines.map.insert(key, pipeline);
                 }
-                Err(error) => {
+                Some(Err(error)) => {
                     rejected.insert(key, error);
                 }
+                None => interrupted = true,
             }
         }
         race.compile_time = compile.elapsed();
+        if interrupted {
+            fail_all(&mut outcomes, TuneDecision::TimeBudget);
+            return conclude(race, outcomes);
+        }
         let mut alive = vec![true; tiles.len()];
         for (index, sequence) in sequences.iter().enumerate() {
             let Some(error) = sequence
@@ -216,6 +236,7 @@ impl Session {
                 continue;
             };
             if index == 0 {
+                race.complete = false;
                 for outcome in &mut outcomes {
                     outcome.decision = TuneDecision::ShaderRejected;
                     outcome.failure = Some(format!("incumbent {incumbent:?}: {error}"));
@@ -228,6 +249,9 @@ impl Session {
             outcome.failure = Some(format!("{:?}: {error}", tiles[index]));
         }
         race.candidates = alive.iter().filter(|&&alive| alive).count();
+        if race.candidates == 1 {
+            return conclude(race, outcomes);
+        }
         if start.elapsed() >= options.max_time {
             for (outcome, &alive) in outcomes.iter_mut().zip(&alive[1..]) {
                 if alive {
@@ -256,6 +280,10 @@ impl Session {
         // Ordinary-magnitude inputs, the bytes qualification ends on as well.
         let inputs = race_inputs(class, &logical_sizes, &sizes, 0);
         for (index, data) in inputs.iter().enumerate() {
+            if start.elapsed() >= options.max_time {
+                fail_all(&mut outcomes, TuneDecision::TimeBudget);
+                return conclude(race, outcomes);
+            }
             if index != 1 || !scratch.input_b_reused {
                 scratch.upload(index, data, None);
             }
@@ -276,34 +304,72 @@ impl Session {
                 })
             })
             .collect();
+        let timestamps = self.gpu_timing && self.gpu.capabilities().timing;
+        race.gpu_timestamps = timestamps;
+        let mut host = HostEncoders {
+            gpu: &self.gpu,
+            encoders: if timestamps {
+                Vec::new()
+            } else {
+                (0..tiles.len())
+                    .map(|_| {
+                        self.gpu.create_command_encoder(bg::CommandEncoderDesc {
+                            name: "tune_race_host",
+                            buffer_count: 1,
+                            manual_barriers: false,
+                        })
+                    })
+                    .collect()
+            },
+        };
         race.preparation = preparation.elapsed().saturating_sub(race.compile_time);
 
         let racing = Instant::now();
-        let timestamps = self.gpu_timing && self.gpu.capabilities().timing;
-        race.gpu_timestamps = timestamps;
-        let live =
-            |alive: &[bool]| -> Vec<usize> { (0..alive.len()).filter(|&i| alive[i]).collect() };
-        let warm_order = live(&alive);
-        let Some(warm) = run_round(&mut scratch, &runs, &warm_order, 1, timestamps) else {
-            fail_all(&mut outcomes, TuneDecision::InvalidTiming);
-            return conclude(race, outcomes);
-        };
-        let fastest = warm
-            .iter()
-            .copied()
-            .filter(|ms| ms.is_finite() && *ms > 0.0)
-            .fold(f64::INFINITY, f64::min);
+        let mut fastest = f64::INFINITY;
+        for round in 0..options.warmup_runs {
+            let order = round_order(&alive, round as usize);
+            let warm = run_round(
+                &mut scratch,
+                &mut host,
+                &runs,
+                &order,
+                1,
+                timestamps,
+                start,
+                options.max_time,
+            );
+            let Some(warm) = warm else {
+                fail_all(
+                    &mut outcomes,
+                    if start.elapsed() >= options.max_time {
+                        TuneDecision::TimeBudget
+                    } else {
+                        TuneDecision::InvalidTiming
+                    },
+                );
+                race.racing = racing.elapsed();
+                return conclude(race, outcomes);
+            };
+            fastest = warm.into_iter().fold(fastest, f64::min);
+        }
         let reps = repetitions(options, profile, timestamps, sequences[0].len(), fastest);
         // samples[candidate][round]: a dropped candidate has no later samples.
         let mut samples: Vec<Vec<Option<f64>>> = vec![Vec::new(); tiles.len()];
-        let max_rounds = ELIMINATE_AFTER + 2 * options.sample_pairs;
+        let max_rounds = options.sample_pairs;
         let mut invalid_timing = false;
         while race.rounds < max_rounds && start.elapsed() < options.max_time {
-            let mut order = live(&alive);
-            let shift = race.rounds % order.len();
-            order.rotate_left(shift);
-            let Some(times) = run_round(&mut scratch, &runs, &order, reps, timestamps) else {
-                invalid_timing = true;
+            let order = round_order(&alive, race.rounds);
+            let Some(times) = run_round(
+                &mut scratch,
+                &mut host,
+                &runs,
+                &order,
+                reps,
+                timestamps,
+                start,
+                options.max_time,
+            ) else {
+                invalid_timing = start.elapsed() < options.max_time;
                 break;
             };
             // A round that only finished after the deadline is not evidence.
@@ -317,7 +383,8 @@ impl Session {
                 *samples[candidate].last_mut().unwrap() = Some(ms);
             }
             race.rounds += 1;
-            if race.rounds >= ELIMINATE_AFTER {
+            // Keep the same candidates for both halves of a forward/reverse pair.
+            if race.rounds >= ELIMINATE_AFTER && race.rounds.is_multiple_of(2) {
                 eliminate(&samples, &mut alive, &mut outcomes, options.min_improvement);
             }
             let challengers: Vec<usize> = (1..tiles.len()).filter(|&i| alive[i]).collect();
@@ -330,6 +397,7 @@ impl Session {
                 break;
             }
         }
+        drop(host);
         race.racing = racing.elapsed();
         let incumbent_samples: Vec<f64> = samples[0].iter().flatten().copied().collect();
         race.incumbent_ms = (!incumbent_samples.is_empty()).then(|| median(&incumbent_samples));
@@ -362,21 +430,15 @@ impl Session {
             outcome.qualified = false;
         }
 
-        // Qualify winners, fastest first, until one passes.
+        // Qualify winners in measured preference order until one passes.
+        // Tiny/noisy differences between finalists must not override the same
+        // improvement guard that protected the original incumbent.
         let qualification = Instant::now();
-        let mut winners: Vec<usize> = (1..tiles.len())
-            .filter(|&i| outcomes[i - 1].decision == TuneDecision::FasterCandidate)
-            .collect();
-        winners.sort_by(|&a, &b| {
-            outcomes[a - 1]
-                .candidate_median_ms
-                .unwrap_or(f64::INFINITY)
-                .total_cmp(&outcomes[b - 1].candidate_median_ms.unwrap_or(f64::INFINITY))
-        });
+        let winners = finalist_order(&outcomes, options);
         let mut reference: [Option<Vec<f32>>; 2] = Default::default();
         let mut incumbent_failed = false;
         for winner in winners {
-            let outcome = &mut outcomes[winner - 1];
+            let outcome = &mut outcomes[winner];
             if race.selected != incumbent || incumbent_failed {
                 // Another finalist was faster, or nothing can be compared.
                 outcome.decision = TuneDecision::Eliminated;
@@ -393,18 +455,31 @@ impl Session {
                 class,
                 &logical_sizes,
                 &sizes,
-                [runs[0].as_ref().unwrap(), runs[winner].as_ref().unwrap()],
+                [
+                    runs[0].as_ref().unwrap(),
+                    runs[winner + 1].as_ref().unwrap(),
+                ],
                 &mut reference,
+                start,
+                options.max_time,
             );
             match checked {
                 Ok(()) => {
                     outcome.qualified = true;
-                    race.selected = tiles[winner];
+                    race.selected = tiles[winner + 1];
                 }
-                Err((by_incumbent, failure)) => {
+                Err(QualificationFailure::Output {
+                    by_incumbent,
+                    failure,
+                }) => {
                     incumbent_failed = by_incumbent;
+                    race.complete &= !by_incumbent;
                     outcome.decision = TuneDecision::InvalidOutput;
                     outcome.failure = Some(failure);
+                    outcome.selected = incumbent;
+                }
+                Err(QualificationFailure::TimeBudget) => {
+                    outcome.decision = TuneDecision::TimeBudget;
                     outcome.selected = incumbent;
                 }
             }
@@ -418,34 +493,25 @@ impl Session {
 
 impl Scratch<'_, '_> {
     /// One submission with one timed pass per entry, repeating the entry's
-    /// sequence `reps` times inside it. A sequence of several dispatches takes
-    /// one pass per dispatch instead, so dependent dispatches stay ordered.
+    /// sequence `reps` times inside it. Explicit barriers order EVERY dispatch:
+    /// repeated output writes need synchronization too, even for identical data.
     /// Returns milliseconds per sequence, or `None` without complete timestamps.
     fn run_timed(
         &mut self,
         entries: &[(&[(&bg::ComputePipeline, &Dispatch)], u32)],
     ) -> Option<Vec<f64>> {
         let pieces: Vec<bg::BufferPiece> = self.buffers.iter().map(|&b| b.into()).collect();
-        let mut owners = Vec::new();
         self.encoder.start();
-        for (entry, &(sequence, reps)) in entries.iter().enumerate() {
-            if let &[(pipeline, dispatch)] = sequence {
-                let mut pass = self.encoder.compute("tune_race");
-                let mut pc = pass.with(pipeline);
-                for _ in 0..reps {
+        for &(sequence, reps) in entries {
+            let mut pass = self.encoder.compute("tune_race");
+            for repetition in 0..reps {
+                for (position, &(pipeline, dispatch)) in sequence.iter().enumerate() {
+                    if repetition != 0 || position != 0 {
+                        pass.barrier();
+                    }
+                    let mut pc = pass.with(pipeline);
                     Session::bind_dispatch(&pieces, dispatch, &mut pc);
                     pc.dispatch(dispatch.workgroups);
-                }
-                owners.push(entry);
-            } else {
-                for _ in 0..reps {
-                    for &(pipeline, dispatch) in sequence {
-                        let mut pass = self.encoder.compute("tune_race");
-                        let mut pc = pass.with(pipeline);
-                        Session::bind_dispatch(&pieces, dispatch, &mut pc);
-                        pc.dispatch(dispatch.workgroups);
-                        owners.push(entry);
-                    }
                 }
             }
         }
@@ -454,31 +520,34 @@ impl Scratch<'_, '_> {
             crate::runtime::wait_for_timed_encoder(self.gpu, &sync, &mut self.encoder, true)
                 .ok()
                 .flatten()?;
-        if timings.passes.len() != owners.len() {
+        if timings.passes.len() != entries.len() {
             return None;
         }
-        let mut totals = vec![0.0; entries.len()];
-        for ((_, duration), &owner) in timings.pass_durations().zip(&owners) {
-            totals[owner] += duration.as_secs_f64() * 1e3;
-        }
         Some(
-            totals
-                .into_iter()
+            timings
+                .pass_durations()
                 .zip(entries)
-                .map(|(total, &(_, reps))| total / f64::from(reps))
+                .map(|((_, duration), &(_, reps))| duration.as_secs_f64() * 1e3 / f64::from(reps))
                 .collect(),
         )
     }
 }
 
 /// Milliseconds per sequence for each candidate in `order`.
+#[allow(clippy::too_many_arguments)]
 fn run_round(
     scratch: &mut Scratch<'_, '_>,
+    host: &mut HostEncoders<'_>,
     runs: &[Option<Run<'_>>],
     order: &[usize],
     reps: u32,
     timestamps: bool,
+    start: Instant,
+    budget: Duration,
 ) -> Option<Vec<f64>> {
+    if start.elapsed() >= budget {
+        return None;
+    }
     let run = |candidate: usize| runs[candidate].as_deref().expect("live candidate compiled");
     let times = if timestamps {
         let entries: Vec<_> = order
@@ -489,13 +558,49 @@ fn run_round(
     } else {
         order
             .iter()
-            .map(|&candidate| scratch.run(run(candidate), reps) / f64::from(reps))
-            .collect()
+            .map(|&candidate| {
+                (start.elapsed() < budget).then(|| {
+                    Scratch::run_on(
+                        scratch.gpu,
+                        &scratch.buffers,
+                        &mut host.encoders[candidate],
+                        run(candidate),
+                        reps,
+                    ) / f64::from(reps)
+                })
+            })
+            .collect::<Option<Vec<_>>>()?
     };
     times
         .iter()
         .all(|ms| ms.is_finite() && *ms > 0.0)
         .then_some(times)
+}
+
+/// Reverse each rotated round before changing its order. A rotation alone
+/// leaves the incumbent at one end for most of a short race, biasing drift.
+fn round_order(alive: &[bool], round: usize) -> Vec<usize> {
+    let mut order: Vec<_> = (0..alive.len()).filter(|&i| alive[i]).collect();
+    let shift = (round / 2) % order.len();
+    order.rotate_left(shift);
+    if round % 2 == 1 {
+        order.reverse();
+    }
+    order
+}
+
+/// Resource pressure and bad clocks are not evidence about a kernel. In
+/// particular, a scratch-limited search must not poison a later, larger one.
+fn decided_outcome(outcome: &TuneOutcome) -> bool {
+    match outcome.decision {
+        TuneDecision::FasterCandidate => outcome.qualified,
+        TuneDecision::KeepBaseline | TuneDecision::Eliminated => !outcome.candidate_ms.is_empty(),
+        TuneDecision::ShaderRejected | TuneDecision::InvalidOutput => true,
+        TuneDecision::TimeBudget
+        | TuneDecision::ScratchLimit
+        | TuneDecision::DeviceMemoryBudget
+        | TuneDecision::InvalidTiming => false,
+    }
 }
 
 /// Repetitions per timed pass (or per host-timed submission), shared by every
@@ -507,7 +612,7 @@ fn repetitions(
     sequence_len: usize,
     fastest_ms: f64,
 ) -> u32 {
-    if !fastest_ms.is_finite() {
+    if options.target_sample_time.is_none() || !fastest_ms.is_finite() {
         return options.dispatches_per_sample;
     }
     match profile.and_then(|profile| profile.pass_overhead) {
@@ -516,7 +621,7 @@ fn repetitions(
             let count = overhead.as_secs_f64() * 1e3 / (PASS_OVERHEAD_SHARE * fastest_ms);
             (count.ceil() as u32).clamp(1, options.dispatches_per_sample)
         }
-        // Sequences already take one pass per dispatch.
+        // Keep split-sequence samples short; each sequence has internal barriers.
         _ if timestamps && sequence_len > 1 => 1,
         _ => options.sample_repetitions([fastest_ms, fastest_ms]),
     }
@@ -531,9 +636,52 @@ fn pairs(samples: &[Vec<Option<f64>>], candidate: usize) -> Vec<(f64, f64)> {
         .collect()
 }
 
-/// Drop challengers whose fastest sample is already slower than the
-/// incumbent's median less `min_improvement`: their median cannot pass the
-/// decision rule. Then keep only the fastest `FINALISTS` by median.
+/// Prefer the earliest candidate the measured fastest cannot beat by the
+/// configured margin plus paired noise. All these candidates have already
+/// beaten the original incumbent. Anchor each tie band to the fastest, not a
+/// chain of near-ties, and recompute it for qualification fallbacks.
+///
+/// An isolated scratch timing is not whole-program latency. In particular,
+/// dispatch overlap can reverse tiny kernel gains. Respecting the caller's
+/// resolution here avoids selecting on differences we would reject in a duel.
+fn finalist_order(outcomes: &[TuneOutcome], options: &TuneOptions) -> Vec<usize> {
+    let mut remaining: Vec<_> = (0..outcomes.len())
+        .filter(|&i| outcomes[i].decision == TuneDecision::FasterCandidate)
+        .collect();
+    let mut ordered = Vec::with_capacity(remaining.len());
+    while !remaining.is_empty() {
+        let fastest = *remaining
+            .iter()
+            .min_by(|&&a, &&b| {
+                outcomes[a]
+                    .candidate_median_ms
+                    .unwrap()
+                    .total_cmp(&outcomes[b].candidate_median_ms.unwrap())
+            })
+            .unwrap();
+        let position = remaining
+            .iter()
+            .position(|&candidate| {
+                let mut comparison = TuneOutcome::new((), 1, candidate, fastest);
+                comparison
+                    .baseline_ms
+                    .clone_from(&outcomes[candidate].candidate_ms);
+                comparison
+                    .candidate_ms
+                    .clone_from(&outcomes[fastest].candidate_ms);
+                comparison.qualified = true; // timing only; qualify before installation
+                decide(&mut comparison, options);
+                comparison.decision != TuneDecision::FasterCandidate
+            })
+            .unwrap();
+        ordered.push(remaining.remove(position));
+    }
+    ordered
+}
+
+/// Drop challengers whose fastest observed sample is already slower than the
+/// incumbent's median less `min_improvement`. This is a heuristic on current
+/// evidence, not a bound on future samples. Keep the fastest `FINALISTS`.
 fn eliminate(
     samples: &[Vec<Option<f64>>],
     alive: &mut [bool],
@@ -576,10 +724,14 @@ fn race_inputs(
     }
 }
 
-/// Qualify `[incumbent, challenger]` on both input patterns with the checks of
-/// a sequential comparison: finite outputs, sampled f64 reference dots, and
-/// agreement with the incumbent. Incumbent outputs are kept in `reference`
-/// across challengers. The error says whether the incumbent failed.
+enum QualificationFailure {
+    TimeBudget,
+    Output { by_incumbent: bool, failure: String },
+}
+
+/// Qualify both patterns with the sequential comparison's numerical checks.
+/// Keep incumbent outputs across finalists; check deadlines between transfers
+/// and dispatches, including after the final validation before installation.
 fn qualify(
     scratch: &mut Scratch<'_, '_>,
     class: &SearchClass,
@@ -587,7 +739,16 @@ fn qualify(
     sizes: &[usize],
     [incumbent, challenger]: [&Run<'_>; 2],
     reference: &mut [Option<Vec<f32>>; 2],
-) -> Result<(), (bool, String)> {
+    start: Instant,
+    budget: Duration,
+) -> Result<(), QualificationFailure> {
+    let check_budget = || {
+        if start.elapsed() < budget {
+            Ok(())
+        } else {
+            Err(QualificationFailure::TimeBudget)
+        }
+    };
     let mut times = TuneQualificationTimes::default();
     let agree = if class.key.split_k {
         reordered_outputs_agree
@@ -596,10 +757,12 @@ fn qualify(
     };
     // Finish on ordinary inputs, as timing used.
     for pattern in [1u32, 0] {
+        check_budget()?;
         let inputs = race_inputs(class, logical_sizes, sizes, pattern);
         for (index, data) in inputs.iter().enumerate() {
             // B is identical across patterns and already resident.
             if index != 1 {
+                check_budget()?;
                 scratch.upload(index, data, Some(&mut times));
             }
         }
@@ -610,19 +773,25 @@ fn qualify(
         };
         let slot = pattern as usize;
         if reference[slot].is_none() {
+            check_budget()?;
             scratch.poison_outputs(sizes, &mut times);
+            check_budget()?;
             scratch.run(incumbent, 1);
+            check_budget()?;
             let output = scratch.read_output(&mut times);
             if !qualify_output(&class.key, &inputs, &output, scale) {
-                return Err((
-                    true,
-                    format!("incumbent, input pattern {pattern}: reference mismatch"),
-                ));
+                return Err(QualificationFailure::Output {
+                    by_incumbent: true,
+                    failure: format!("incumbent, input pattern {pattern}: reference mismatch"),
+                });
             }
             reference[slot] = Some(output);
         }
+        check_budget()?;
         scratch.poison_outputs(sizes, &mut times);
+        check_budget()?;
         scratch.run(challenger, 1);
+        check_budget()?;
         let output = scratch.read_output(&mut times);
         let expected = reference[slot].as_ref().unwrap();
         let identical =
@@ -631,13 +800,13 @@ fn qualify(
             || (qualify_output(&class.key, &inputs, &output, scale)
                 && agree(expected, &output, scale)))
         {
-            return Err((
-                false,
-                format!("input pattern {pattern}: reference or cross-variant mismatch"),
-            ));
+            return Err(QualificationFailure::Output {
+                by_incumbent: false,
+                failure: format!("input pattern {pattern}: reference or cross-variant mismatch"),
+            });
         }
     }
-    Ok(())
+    check_budget()
 }
 
 #[cfg(test)]
@@ -647,6 +816,111 @@ mod tests {
 
     fn outcome(candidate: MatmulTile) -> TuneOutcome {
         TuneOutcome::new(TuneClass::default(), 1, MatmulTile::Tile64, candidate)
+    }
+
+    #[test]
+    fn transient_failures_are_not_memo_decisions() {
+        let mut outcome = outcome(MatmulTile::Tile32);
+        for decision in [
+            TuneDecision::TimeBudget,
+            TuneDecision::ScratchLimit,
+            TuneDecision::DeviceMemoryBudget,
+            TuneDecision::InvalidTiming,
+        ] {
+            outcome.decision = decision;
+            assert!(!decided_outcome(&outcome), "{decision:?}");
+        }
+        // A default, unmeasured outcome is not evidence either.
+        outcome.decision = TuneDecision::KeepBaseline;
+        assert!(!decided_outcome(&outcome));
+        outcome.candidate_ms = vec![1.0; 4];
+        assert!(decided_outcome(&outcome));
+        outcome.decision = TuneDecision::FasterCandidate;
+        assert!(!decided_outcome(&outcome));
+        outcome.qualified = true;
+        assert!(decided_outcome(&outcome));
+    }
+
+    #[test]
+    fn expired_compilation_budget_does_not_start_shader_jobs() {
+        let gpu = crate::reference::gpu::shared_context();
+        let dispatch = Dispatch::default();
+        let jobs = vec![(Pipelines::key(&dispatch), &dispatch, None); 12];
+        let results = Pipelines::compile_all(
+            &gpu,
+            Default::default(),
+            None,
+            &jobs,
+            Some((Instant::now(), Duration::ZERO)),
+        );
+        assert_eq!(results.len(), jobs.len());
+        assert!(results.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn paired_rounds_balance_positions_even_after_elimination() {
+        for alive in [vec![true; 25], vec![true, false, true, true, false]] {
+            for pair in 0..6 {
+                let forward = round_order(&alive, pair * 2);
+                let reverse = round_order(&alive, pair * 2 + 1);
+                assert_eq!(forward, reverse.into_iter().rev().collect::<Vec<_>>());
+                assert!(forward.iter().all(|&i| alive[i]));
+                assert_eq!(forward.len(), alive.iter().filter(|&&v| v).count());
+            }
+        }
+    }
+
+    fn timing_winner(samples: &[f64], options: &TuneOptions) -> TuneOutcome {
+        let mut outcome = outcome(MatmulTile::Tile32);
+        outcome.baseline_ms = vec![100.0; options.sample_pairs];
+        outcome.candidate_ms = samples.to_vec();
+        outcome.qualified = true;
+        decide(&mut outcome, options);
+        assert_eq!(outcome.decision, TuneDecision::FasterCandidate);
+        outcome.qualified = false;
+        outcome
+    }
+
+    #[test]
+    fn finalists_require_a_meaningful_gain_over_each_other() {
+        let options = TuneOptions::default();
+        let winner = |ms| timing_winner(&vec![ms; options.sample_pairs], &options);
+        // Both beat the original incumbent, but 2% is below the requested 5%.
+        assert_eq!(
+            finalist_order(&[winner(10.0), winner(9.8)], &options),
+            [0, 1]
+        );
+        assert_eq!(
+            finalist_order(&[winner(10.0), winner(8.0)], &options),
+            [1, 0]
+        );
+        // The caller can explicitly ask to resolve smaller differences.
+        let precise = TuneOptions {
+            min_improvement: 0.0,
+            ..options.clone()
+        };
+        assert_eq!(
+            finalist_order(&[winner(10.0), winner(9.8)], &precise),
+            [1, 0]
+        );
+    }
+
+    #[test]
+    fn finalist_ties_include_paired_noise_and_do_not_chain() {
+        let options = TuneOptions::default();
+        let winner = |ms| timing_winner(&vec![ms; options.sample_pairs], &options);
+        let noisy = timing_winner(&[8.0, 9.5, 8.0, 9.5, 8.0, 9.5], &options);
+        // Median gain is >5%, but not >5% plus the paired noise margin.
+        assert_eq!(finalist_order(&[winner(10.0), noisy], &options), [0, 1]);
+        // 10.8 ties 10.4, which ties 10.0. Only the last pair is in the
+        // fastest's band. If that candidate fails qualification, re-rank.
+        assert_eq!(
+            finalist_order(&[winner(10.8), winner(10.4), winner(10.0)], &options),
+            [1, 2, 0]
+        );
+        let mut rejected = winner(5.0);
+        rejected.decision = TuneDecision::InvalidOutput;
+        assert_eq!(finalist_order(&[rejected, winner(10.0)], &options), [1]);
     }
 
     #[test]
@@ -718,5 +992,15 @@ mod tests {
             repetitions(&options, Some(&profile), false, 1, 0.5),
             options.sample_repetitions([0.5, 0.5])
         );
+        let fixed = TuneOptions {
+            target_sample_time: None,
+            ..options
+        };
+        for sequence_len in [1, 2] {
+            assert_eq!(
+                repetitions(&fixed, Some(&profile), true, sequence_len, 10.0),
+                fixed.dispatches_per_sample
+            );
+        }
     }
 }

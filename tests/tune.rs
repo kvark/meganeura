@@ -253,12 +253,25 @@ fn reduced_storage_tiles_preserve_outputs() {
 fn tune_preserves_training_parameters_gradients_and_moments() {
     for staging in [TuneStaging::Shared, TuneStaging::Download] {
         for reuse in [TuneStagingReuse::Fresh, TuneStagingReuse::SameSize] {
-            preserves_training_state(staging, reuse);
+            preserves_training_state(staging, reuse, meganeura::TuneStrategy::Sequential);
         }
     }
 }
 
-fn preserves_training_state(staging: TuneStaging, staging_reuse: TuneStagingReuse) {
+#[test]
+fn race_preserves_training_state() {
+    preserves_training_state(
+        TuneStaging::Download,
+        TuneStagingReuse::SameSize,
+        meganeura::TuneStrategy::Race,
+    );
+}
+
+fn preserves_training_state(
+    staging: TuneStaging,
+    staging_reuse: TuneStagingReuse,
+    strategy: meganeura::TuneStrategy,
+) {
     let mut graph = Graph::new();
     let x = graph.input("x", &[33, 17]);
     let weight = graph.parameter("weight", &[17, 65]);
@@ -321,11 +334,20 @@ fn preserves_training_state(staging: TuneStaging, staging_reuse: TuneStagingReus
         .tune_with(TuneOptions {
             staging,
             staging_reuse,
+            strategy,
             max_time: Duration::from_secs(60),
             ..crate::support::sequential_tuning()
         })
         .unwrap();
-    assert!(report.outcomes.iter().any(|o| o.qualified), "{report:?}");
+    match strategy {
+        meganeura::TuneStrategy::Sequential => {
+            assert!(report.outcomes.iter().any(|o| o.qualified), "{report:?}")
+        }
+        meganeura::TuneStrategy::Race => {
+            assert!(!report.races.is_empty(), "{report:?}");
+            assert!(report.races.iter().all(|race| race.complete), "{report:?}");
+        }
+    }
     assert_eq!(before, snapshot(&session));
 
     // Observe hidden accumulator/clip-cadence state through subsequent updates.
