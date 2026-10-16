@@ -1138,9 +1138,6 @@ pub struct MachineProfile {
     /// Concurrent 256-invocation workgroups, each with 16 KiB of workgroup
     /// memory, before a fixed-work kernel slows down.
     pub parallel_width: Option<u32>,
-    /// Median absolute deviation over the median of repeated identical timings.
-    /// Diagnostic only; the decision rule still uses each race's paired noise.
-    pub timer_noise: Option<f64>,
     /// Wall time spent measuring this profile.
     pub elapsed: Duration,
 }
@@ -1290,12 +1287,9 @@ impl TuneOptions {
                 .flatten()
                 .any(|rate| !rate.is_finite() || rate <= 0.0)
                 || profile.parallel_width == Some(0)
-                || profile
-                    .timer_noise
-                    .is_some_and(|noise| !noise.is_finite() || noise < 0.0)
             {
                 return Err(TuneError(
-                    "machine profile rates/width must be positive and finite, and noise nonnegative",
+                    "machine profile rates and width must be positive and finite",
                 ));
             }
         }

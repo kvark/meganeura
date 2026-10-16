@@ -2,8 +2,8 @@
 //!
 //! A short calibration with Meganeura's own kernels, bounded by a slice of the
 //! tuning budget. It measures how to time this machine (submission round
-//! trip, pass and dispatch overhead, timer noise) and roughly how long work
-//! takes there (streaming bandwidth, matmul throughput, parallel width).
+//! trip, pass and dispatch overhead) and roughly how long work takes there
+//! (streaming bandwidth, matmul throughput, parallel width).
 //! Nothing is keyed by device name or persisted; a caller can pass a profile
 //! through [`crate::TuneCalibration::Profile`] instead.
 
@@ -551,23 +551,6 @@ impl<'a> Bench<'a> {
                 let flops = 2.0 * (size as f64).powi(3);
                 profile.matmul_flops =
                     Some(flops / (elapsed / 1e3) / profile.wave_utilization(workgroups));
-                if done && !self.expired() {
-                    let mut repeated = samples;
-                    repeated.extend(self.time(5, |encoder, _| {
-                        let mut pass = encoder.compute("calibration_matmul");
-                        let mut pc = pass.with(&pipeline.raw);
-                        Session::bind_dispatch(&pieces, &dispatch, &mut pc);
-                        pc.dispatch(dispatch.workgroups);
-                    }));
-                    let center = median(&repeated);
-                    let deviations: Vec<f64> = repeated
-                        .iter()
-                        .map(|sample| (sample - center).abs())
-                        .collect();
-                    if center > 0.0 {
-                        profile.timer_noise = Some(median(&deviations) / center);
-                    }
-                }
             }
             self.release(&buffers);
             if done {

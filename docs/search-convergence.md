@@ -87,7 +87,6 @@ does not look anything up by device name.
 | Memory bandwidth | Streaming kernel, grown to a target duration | Cost model |
 | Matrix throughput | Meganeura's own matmul kernels, grown to a target duration | Cost model |
 | Parallel width | Fixed work at doubling workgroup counts, until time grows | Wave quantization |
-| Timer noise | Repeated identical measurements | Diagnostic; adaptive rounds remain future work |
 
 `tune::MachineProfile` is plain serializable data. Calibration is bounded by a
 fraction of the tuning budget (one tenth, at most 250 ms) and runs once per
