@@ -1235,6 +1235,15 @@ pub enum Kernel {
         types: crate::codegen::MatrixTypes,
         splits: u32,
     },
+    /// Aligned workgroup tiles with F16 or BF16 operands and F32 accumulation.
+    CooperativeWorkgroup {
+        shape: crate::codegen::WorkgroupMatmulShape,
+        /// Explicit arithmetic, or the session's permitted F32-as-F16 path.
+        /// Keeping this distinction lets a cached automatic choice fall back
+        /// under a different precision policy without changing typed graphs.
+        types: Option<crate::codegen::MatrixTypes>,
+        splits: u32,
+    },
     /// Four subgroup tiles sharing aligned native-f32 operands. More than
     /// one K partition requires a following SumRows dispatch.
     CooperativeTiled {
@@ -1288,6 +1297,7 @@ impl Dispatch {
                 | Kernel::CooperativeTyped { .. }
                 | Kernel::CooperativeCompensated
                 | Kernel::CooperativeTiled { .. }
+                | Kernel::CooperativeWorkgroup { .. }
         )
     }
 

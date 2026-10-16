@@ -214,7 +214,6 @@ mod tests {
         let capabilities = naga::valid::Capabilities::SHADER_BFLOAT16
             | naga::valid::Capabilities::SHADER_FLOAT16
             | naga::valid::Capabilities::COOPERATIVE_MATRIX
-            | naga::valid::Capabilities::COOPERATIVE_MATRIX_BFLOAT16
             | naga::valid::Capabilities::SUBGROUP;
         let mut cases = Vec::new();
         for shape in [[16, 16, 16], [8, 16, 16]] {

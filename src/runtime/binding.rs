@@ -29,7 +29,8 @@ fn dense_params(dispatch: &Dispatch) -> MatMulParams {
         n,
         k,
         _pad: match dispatch.kernel {
-            Kernel::CooperativeTyped { splits, .. } => splits,
+            Kernel::CooperativeTyped { splits, .. }
+            | Kernel::CooperativeWorkgroup { splits, .. } => splits,
             _ => dispatch.workgroups[1],
         },
     }

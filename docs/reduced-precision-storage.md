@@ -49,16 +49,31 @@ only in B (`WeightFormat`), so any other F16 left operand, and any reduced
 addend, is rejected at compile time instead of being read as F32. There is no
 F16 widening for derivatives, so these products are forward-only.
 
-Typed products are not schedule-locked: kernel selection keeps their kernel
-because the storage contract pins it, and bounded tuning varies only their K
-partition count. A candidate must keep the product's SumRows contract (split
+Typed products are not schedule-locked: kernel selection keeps their arithmetic
+and storage contract, and bounded tuning varies their tile geometry and K
+partition count. On devices with workgroup cooperative matrices, candidates
+include square tiles and both orientations of rectangular tiles through
+128×256 and 256×128, with 32- or 64-element K stages. Matching F16/BF16 operands
+load directly; operands needing conversion stage in shared memory. NN, AT and
+BT products include fused addends and F32/F16/BF16 outputs. Reduced outputs
+round once after accumulation and addition. Device granularity, invocation
+count, shared memory (including driver reservations), alignment and binding
+capacity filter candidates before compilation. Ragged and unsupported forms
+retain the checked subgroup kernel, including B570's 8×16×16 native shape.
+
+A candidate must keep the product's SumRows contract (split
 products stay split) and fit the compiled partial buffer, so tuning can lower
-but not raise a compiled count. An unsplit product, or one compiled with two
-partitions, has no candidate; such classes are left out before the class limit
-and the pending-work checks, so they never take a slot from tunable products.
+but not raise a compiled count. A product without any applicable partition or
+tile candidate is left out before the class limit and pending-work checks.
 Qualification uses private scratch in the operands' storage types and
 references built from operands rounded to the multiplication type; F16
 multiplication uses a 1/1024 small-input probe instead of 1e-12.
+
+Automatic F16 kernels also compare workgroup tiles with identical arithmetic.
+This does not introduce F16 multiplication into an F32 incumbent. Strict F32
+and protected derivative regions retain their existing precision. A kernel
+winner still needs whole-program qualification when used by measured build
+search; isolated kernel correctness and speed are not model acceptance.
 
 This is not autocast or complete mixed-precision training. BF16 graph inputs,
 parameters, outputs and unsupported operations reject explicitly; only internal

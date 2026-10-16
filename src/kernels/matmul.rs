@@ -137,6 +137,7 @@ impl Problem {
                     Kernel::SplitMatmul { .. }
                         | Kernel::CooperativeTiled { .. }
                         | Kernel::CooperativeTyped { .. }
+                        | Kernel::CooperativeWorkgroup { .. }
                 ),
             compiled_workgroups: dispatch.workgroups.iter().product(),
         })

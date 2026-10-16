@@ -203,7 +203,7 @@ decided, including candidate shader rejections and failed candidate outputs.
 Scratch/device-memory limits, invalid timing, an invalid incumbent control,
 and budget interruptions are not permanent decisions. They must be retryable
 with better conditions or larger budgets. Memo scope distinguishes strategy
-and host/GPU timing; revision 6 follows #261's independent revision 5.
+and host/GPU timing; revision 7 includes rectangular workgroup candidates.
 
 The 0.1% cutoff uses **uncorrected** predictions on both sides; measured family
 corrections reorder work only. It is a time-saving heuristic, not a
@@ -243,13 +243,17 @@ landed on the branch.
   context records them.
 - [x] Predicted class order with per-family correction, the 0.1% cutoff, and
   memo changes: decided classes take no slot, and a completed race decides
-  every challenger with a reusable decision. Kernel memo revision 6 and the
+  every challenger with a reusable decision. Kernel memo revision 7 and the
   memo scope record the strategy and timing mode.
 - [x] `examples/search_race.rs` compares strategies on fresh sessions.
 - [x] Shared calibration in `build_measured`: measured once with the search's
   own budget, before the first trial that probes kernels, reported in
   `BuildSearchReport::machine_profile` and supplied to every later trial.
-- [ ] Whole-program changes from the next phase.
+- [x] Reserve half the overall search budget for graph/submission alternatives
+  while they remain. Once the cumulative kernel allowance is spent, later
+  trials restore memoized winners with zero new probe slots; they still pass
+  whole-program qualification and timing. Release the reserve on the last trial.
+- [ ] Remaining whole-program changes from the next phase.
 
 Hardware experiments and historical comparisons are in
 [Experiments: kernel search races](experiments.md#kernel-search-races--october-16).

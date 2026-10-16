@@ -15,7 +15,7 @@ use std::{
 mod race;
 
 /// Uniform scratch reserved by each single-buffer encoder in the pinned Blade
-/// Vulkan backend (96c1dc7). Reserve it on every backend, conservatively, until
+/// Vulkan backend (4845d65). Reserve it on every backend, conservatively, until
 /// Blade exposes encoder allocation sizes. Pipelines and opaque driver command
 /// and descriptor allocations are outside this buffer budget.
 pub(super) const ENCODER_SCRATCH_BYTES: usize = 1 << 20;
@@ -41,9 +41,8 @@ pub struct KernelMemo {
 
 // Bump when kernel generation, qualification or decision semantics change,
 // including changes between package releases. This also versions the memo schema.
-// Revision 5 belongs to rectangular candidates (#261). Races change the
-// decision policy independently, including which failures can be persisted.
-const KERNEL_MEMO_REVISION: u32 = 6;
+// Revision 7 adds workgroup candidates to revision 6's race decisions.
+const KERNEL_MEMO_REVISION: u32 = 7;
 
 /// Undecided classes predicted to total less than this share of the plan are
 /// not probed. Kernel winners are accepted together, so classes well below
@@ -435,20 +434,25 @@ pub(super) fn tile_module(
             MatmulTile::Tile16 | MatmulTile::Tile64 => {
                 crate::codegen::generate_module(entry.shader_group(), knobs)
             }
-            MatmulTile::CooperativeF32 { .. } => crate::codegen::generate_module_coop(
-                entry.shader_group(),
-                &tile.coop_config().expect("cooperative candidate"),
-            ),
+            MatmulTile::CooperativeF32 { .. } | MatmulTile::CooperativeF16 { .. } => {
+                crate::codegen::generate_module_coop(
+                    entry.shader_group(),
+                    &tile.coop_config().expect("cooperative candidate"),
+                )
+            }
             MatmulTile::CooperativeChecked { .. } => {
-                let crate::compile::Kernel::CooperativeTyped { types, .. } = dispatch.kernel else {
-                    unreachable!("checked partitions apply to typed products")
-                };
+                let types = super::checked_matrix_types(dispatch).expect("checked tile types");
                 crate::codegen::generate_module_coop_typed_with_layout(
                     entry.shader_group(),
                     types,
                     [16, 16, 16],
                     super::typed_matmul_layout(dispatch),
                 )
+            }
+            MatmulTile::CooperativeWorkgroup { shape, .. } => {
+                let types = super::checked_matrix_types(dispatch)
+                    .unwrap_or(crate::codegen::MatrixTypes::F32_AS_F16);
+                crate::codegen::generate_workgroup_matmul(entry.shader_group(), shape, types)
             }
             MatmulTile::SpecializedConv { .. } | MatmulTile::Gemv(_) | MatmulTile::Scalar(_) => {
                 unreachable!()
@@ -480,6 +484,7 @@ impl SearchClass {
             tile.apply(&mut dispatches[index], &self.key);
         }
         if let MatmulTile::CooperativeTiled { splits, .. }
+        | MatmulTile::CooperativeWorkgroup { splits, .. }
         | MatmulTile::CooperativeChecked { splits } = tile
         {
             for &index in &self.reductions {
@@ -497,13 +502,18 @@ impl SearchClass {
 fn retain_tunable_classes(
     classes: &mut Vec<SearchClass>,
     scope: &crate::tune::TuneScope,
-    shared_limit: u32,
+    capabilities: &bg::Capabilities,
 ) -> usize {
+    let shared_limit = capabilities.max_compute_shared_memory_size;
     for class in classes.iter_mut() {
         class.challengers.retain(|tile| match *tile {
             MatmulTile::CooperativeTiled { shape, .. } => {
                 shared_limit == 0 || shape.shared_bytes() <= shared_limit
             }
+            MatmulTile::CooperativeWorkgroup { shape, .. } => class
+                .key
+                .effective_matrix_types()
+                .is_some_and(|types| shape.supports(capabilities, types)),
             _ => true,
         });
     }
@@ -643,6 +653,7 @@ fn collect_classes(
         // A split product is tunable together with the SumRows of its partials.
         let reduction = match initial {
             MatmulTile::CooperativeTiled { splits, .. }
+            | MatmulTile::CooperativeWorkgroup { splits, .. }
             | MatmulTile::CooperativeChecked { splits }
                 if key.split_k =>
             {
@@ -771,17 +782,19 @@ impl Session {
             .outcomes
     }
 
-    /// Search scalar tiles and advertised, smoke-tested native-f32 cooperative
-    /// matmul, scalar convolution/GEMV shapes, and cached-attention split counts.
+    /// Search scalar and cooperative matrix tiles, typed K partitions, scalar
+    /// convolution/GEMV shapes, and cached-attention split counts. Matrix
+    /// candidates retain the incumbent's storage and multiplication precision.
     /// Occupancy/large-shape thresholds only
     /// choose the starting implementation; they do not remove challengers.
     ///
     /// Each class uses private scratch with matching memory placement and two
     /// deterministic nonzero input patterns (including tiny f32 operands).
-    /// Both candidates must agree elementwise; ordinary f32 classes must also
-    /// match sampled f64 reference dots. Sequential tuning qualifies every
-    /// pair before timing; races time first and qualify only finalists.
-    /// A native-f32 split product runs with
+    /// Both candidates must agree elementwise and unpacked matrices must also
+    /// match sampled f64 reference dots with operands rounded to the selected
+    /// multiplication type. Sequential tuning qualifies every pair before
+    /// timing; races time first and qualify only finalists. A split product runs
+    /// with
     /// its SumRows and keeps them: candidates vary its tile shape and its
     /// partition count within the allocated partials, and agree within a bound
     /// that follows the largest output, since partitions reorder the sum.
@@ -796,8 +809,10 @@ impl Session {
     /// and padding. Index decomposition uses exact integer arithmetic.
     /// Cooperative convolutions remain excluded.
     /// Scalar tile and GEMV width/reduction candidates include reduced-storage weights.
-    /// Other prologues/epilogues, horizontal packs, f16-input cooperative,
-    /// cooperative reduced-storage and overlapping-binding dispatches are excluded.
+    /// Other prologues/epilogues, horizontal packs, packed cooperative weights
+    /// and overlapping-binding dispatches are excluded. Workgroup tiles need
+    /// complete tiles and advertised dimension, invocation and memory support;
+    /// unsupported shapes keep their existing subgroup or scalar path.
     /// Winners live in this session, not the plan cache.
     /// No live graph execution occurs, including with optimizers or external buffers.
     /// Cooperative padding must fit each binding's declared size; the live
@@ -817,9 +832,8 @@ impl Session {
     fn tune_classes(&self, options: &TuneOptions) -> (Vec<SearchClass>, usize) {
         let (mut classes, excluded_dispatches) =
             collect_classes(&self.plan, &self.alias, self.coop_config.as_ref());
-        // As in pipeline creation, zero means the backend reports no limit.
-        let shared_limit = self.gpu.capabilities().max_compute_shared_memory_size;
-        let left_out = retain_tunable_classes(&mut classes, &options.scope, shared_limit);
+        let capabilities = self.gpu.capabilities();
+        let left_out = retain_tunable_classes(&mut classes, &options.scope, &capabilities);
         (classes, excluded_dispatches + left_out)
     }
 
@@ -1316,6 +1330,7 @@ impl Session {
                 .zip([outcome.initial, outcome.candidate])
             {
                 let (MatmulTile::CooperativeTiled { splits, .. }
+                | MatmulTile::CooperativeWorkgroup { splits, .. }
                 | MatmulTile::CooperativeChecked { splits }) = tile
                 else {
                     unreachable!("split products only take partitioned candidates");
@@ -1465,7 +1480,7 @@ impl Session {
             }
             {
                 let _timer = PhaseTimer::new(&mut details.input_preparation);
-                if let Some(types) = class.key.matrix_types {
+                if let Some(types) = class.key.effective_matrix_types() {
                     inputs = typed_inputs(&class.key, types, pattern as u32, &sizes);
                 } else if inputs.is_empty() {
                     inputs = prepared_inputs(
@@ -2149,7 +2164,7 @@ fn test_input_value(index: usize, operand: usize) -> f32 {
 /// multiplication cannot represent the ordinary 1e-12 probe.
 fn small_pattern_scale(class: &TuneClass) -> f64 {
     if class
-        .matrix_types
+        .effective_matrix_types()
         .is_some_and(|types| types.multiply == crate::DType::F16)
     {
         1.0 / 1024.0
@@ -2371,7 +2386,7 @@ fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize)
         };
         // Typed operands are decoded from their storage and rounded to the
         // multiplication type, as the checked kernel stages them.
-        let (mut av, bv) = match class.matrix_types {
+        let (mut av, bv) = match class.effective_matrix_types() {
             Some(types) => (
                 f64::from(round_operand(
                     read_typed(&inputs[0], a, types.a),
@@ -2715,6 +2730,132 @@ mod memo_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rectangular_candidates_require_matching_precision_and_device_limits() {
+        use crate::DType::{BF16, F16};
+        use crate::codegen::{CoopConfig, MatrixTypes};
+        let reduced = CoopConfig {
+            tile_size: 16,
+            use_f16_input: true,
+            compensated: false,
+        };
+        let native = CoopConfig {
+            use_f16_input: false,
+            ..reduced
+        };
+        for (types, automatic, operand, memory, dimension, m, expected) in [
+            (Some(F16), false, F16, 32768, 1024, 256, true),
+            (Some(BF16), false, F16, 32768, 1024, 256, false),
+            (Some(BF16), false, BF16, 32768, 1024, 256, true),
+            (None, true, F16, 32768, 1024, 256, true),
+            (None, false, F16, 32768, 1024, 256, false),
+            (Some(F16), false, F16, 32768, 16, 256, false),
+            (Some(F16), false, F16, 0, 1024, 256, false),
+            (Some(F16), false, F16, 32768, 1024, 257, false),
+        ] {
+            let mut caps = bg::Capabilities {
+                shader_float16: true,
+                shader_bfloat16: true,
+                max_compute_shared_memory_size: memory,
+                ..Default::default()
+            };
+            caps.cooperative_matrix.workgroup = bg::WorkgroupCooperativeMatrix {
+                granularities: vec![bg::CooperativeMatrixGranularity {
+                    operand: if operand == F16 {
+                        bg::CooperativeMatrixOperand::F16
+                    } else {
+                        bg::CooperativeMatrixOperand::Bf16
+                    },
+                    size: [16, 16, 16],
+                    invocations: 64,
+                }],
+                max_workgroup_size: 256,
+                max_dimension: dimension,
+                reserved_shared_memory: 8192,
+            };
+            let mut key = TuneClass {
+                shader: ShaderEntry::MatMul,
+                m,
+                n: 512,
+                k: 256,
+                matrix_types: types.map(MatrixTypes::reduced),
+                cooperative_f16: automatic,
+                ..Default::default()
+            };
+            key.binding_bytes = key.buffer_sizes().unwrap();
+            let (initial, config) = if types.is_some() {
+                (MatmulTile::CooperativeChecked { splits: 1 }, None)
+            } else if automatic {
+                (MatmulTile::CooperativeF16 { tile_size: 16 }, Some(&reduced))
+            } else {
+                (MatmulTile::CooperativeF32 { tile_size: 16 }, Some(&native))
+            };
+            let challengers = key.challengers(initial, config);
+            let mut classes = vec![SearchClass {
+                key,
+                initial,
+                members: vec![0],
+                reductions: Vec::new(),
+                challengers,
+            }];
+            retain_tunable_classes(&mut classes, &Default::default(), &caps);
+            let offered = classes.iter().any(|class| {
+                class
+                    .challengers
+                    .iter()
+                    .any(|tile| matches!(tile, MatmulTile::CooperativeWorkgroup { .. }))
+            });
+            assert_eq!(
+                offered, expected,
+                "types={types:?} automatic={automatic} operand={operand:?} memory={memory} dimension={dimension} m={m}"
+            );
+        }
+    }
+
+    #[test]
+    fn rectangular_splits_install_and_roll_back_complete_sequences() {
+        use crate::{codegen::WorkgroupMatmulShape, compile::Kernel};
+        let mut graph = crate::Graph::new();
+        let a = graph.parameter_f16("a", &[64, 1024]);
+        let b = graph.parameter_f16("b", &[1024, 128]);
+        let y = graph.matmul(a, b);
+        graph.set_outputs(vec![y]);
+        let mut plan = crate::compile::compile(&graph);
+        let original = plan.clone();
+        let alias = crate::memplan::AliasPlan::identity(&plan.buffers);
+        let (classes, _) = collect_classes(&plan, &alias, None);
+        let class = &classes[0];
+        assert!(class.key.split_k);
+        let shape = WorkgroupMatmulShape {
+            rows: 64,
+            columns: 128,
+            k_stage: 64,
+            threads: 128,
+        };
+        let tile = MatmulTile::CooperativeWorkgroup { shape, splits: 2 };
+        assert!(tile.fits(&class.key));
+        class.install(&mut plan.dispatches, tile);
+        let product = &plan.dispatches[class.members[0]];
+        assert_eq!(product.workgroups, [1, 1, 2]);
+        assert!(matches!(
+            product.kernel,
+            Kernel::CooperativeWorkgroup {
+                splits: 2,
+                types: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(plan.dispatches[class.reductions[0]].params[0], 2);
+        let reloaded = collect_classes(&plan, &alias, None).0;
+        assert_eq!(reloaded[0].key, class.key);
+        assert!(reloaded[0].challengers.contains(&class.initial));
+        class.install(&mut plan.dispatches, class.initial);
+        assert_eq!(plan, original);
+        class.install(&mut plan.dispatches, tile);
+        plan.dispatches[class.reductions[0]].params[0] = 4;
+        assert!(collect_classes(&plan, &alias, None).0.is_empty());
+    }
 
     #[test]
     #[ignore = "GPU qualification of cached incumbent outputs and invalidation"]
@@ -3146,6 +3287,31 @@ mod tests {
             .unwrap();
         assert!(skipped.outcomes.is_empty() && skipped.reused_classes.is_empty());
         assert_eq!(memo.progress.values().next().unwrap().next_candidate, 1);
+        let mut replay = create();
+        let replayed = replay
+            .tune_with_memo(
+                TuneOptions {
+                    max_classes: 0,
+                    ..options.clone()
+                },
+                Some(&mut memo),
+            )
+            .unwrap();
+        assert!(replayed.outcomes.is_empty());
+        assert_eq!(replayed.reused_classes.len(), 1);
+        assert_eq!(replayed.reused_classes[0].1, first.outcomes[0].selected);
+        assert_eq!(memo.progress.values().next().unwrap().next_candidate, 1);
+        assert!(session.kernel_probes_pending(&options, Some(&memo)));
+        replay.set_input("x", &[0.25; 33 * 17]);
+        replay.set_parameter("w", &[0.125; 17 * 65]);
+        replay.step();
+        replay.wait();
+        assert!(
+            replay
+                .read_output(33 * 65)
+                .iter()
+                .all(|&x| x == 17.0 / 32.0)
+        );
         let resumed = session
             .tune_with_memo(options.clone(), Some(&mut memo))
             .unwrap();
@@ -4434,8 +4600,17 @@ mod tests {
         let (mut classes, _) = collect_classes(&plan, &alias, None);
         assert_eq!(classes.len(), 2);
         assert!(classes[0].key.matrix_types.is_some());
-        assert!(classes[0].challengers.is_empty());
-        let left_out = retain_tunable_classes(&mut classes, &crate::tune::TuneScope::default(), 0);
+        assert!(
+            classes[0]
+                .challengers
+                .iter()
+                .all(|tile| matches!(tile, MatmulTile::CooperativeWorkgroup { .. }))
+        );
+        let left_out = retain_tunable_classes(
+            &mut classes,
+            &crate::tune::TuneScope::default(),
+            &Default::default(),
+        );
         assert_eq!(left_out, 1);
         assert_eq!(classes.len(), 1);
         assert_eq!(classes[0].key.matrix_types, None);

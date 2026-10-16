@@ -1,7 +1,8 @@
 //! Bounded, opt-in kernel selection. See [`crate::Session::tune_with`].
 //!
 //! The search space is deliberately small: scalar and native-f32 cooperative
-//! tiles for unpacked dense matmuls, shape-specialized scalar convolutions,
+//! tiles for unpacked dense matmuls, typed subgroup/workgroup tiles and K
+//! partitions, shape-specialized scalar convolutions,
 //! workgroup geometry and cross-lane reduction for the K-split GEMV family, and
 //! cached-attention split/combine sequences. Precision remains unchanged.
 //! Measurements use synthetic, private scratch, not a live training step.
@@ -60,6 +61,10 @@ pub struct TuneClass {
     /// binding, so no winner transfers between precisions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matrix_types: Option<crate::codegen::MatrixTypes>,
+    /// Automatic F32 storage with F16 multiplication, already permitted by
+    /// the session policy. Separate from explicit types for cache fallback.
+    #[serde(default)]
+    pub cooperative_f16: bool,
     /// Placement of A, B, addend (false if absent), and output, respectively.
     pub device_local: [bool; 4],
     /// Declared bytes for A, B, optional addend, output, in binding order.
@@ -207,6 +212,13 @@ pub enum MatmulTile {
     CooperativeF32 {
         tile_size: u32,
     },
+    CooperativeF16 {
+        tile_size: u32,
+    },
+    CooperativeWorkgroup {
+        shape: crate::codegen::WorkgroupMatmulShape,
+        splits: u32,
+    },
     /// Aligned native 16x16 f32 products sharing a larger workgroup tile.
     /// More than one K partition writes partials that a following SumRows
     /// adds, which only a split product has.
@@ -341,7 +353,15 @@ impl MatmulTile {
                     k_tile,
                     interleave_columns,
                 }),
-                Kernel::Cooperative => Self::native_cooperative(config),
+                Kernel::Cooperative => config
+                    .filter(|c| c.use_f16_input && !c.compensated)
+                    .map(|c| Self::CooperativeF16 {
+                        tile_size: c.tile_size,
+                    })
+                    .or_else(|| Self::native_cooperative(config)),
+                Kernel::CooperativeWorkgroup { shape, splits, .. } => {
+                    Some(Self::CooperativeWorkgroup { shape, splits })
+                }
                 Kernel::CooperativeTiled { shape, splits }
                     if config.is_some_and(|c| {
                         c.tile_size == 16 && !c.use_f16_input && !c.compensated
@@ -359,6 +379,11 @@ impl MatmulTile {
 
     pub(crate) fn coop_config(self) -> Option<CoopConfig> {
         match self {
+            Self::CooperativeF16 { tile_size } => Some(CoopConfig {
+                tile_size,
+                use_f16_input: true,
+                compensated: false,
+            }),
             Self::CooperativeTiled { .. } => Some(CoopConfig {
                 tile_size: 16,
                 use_f16_input: false,
@@ -381,9 +406,9 @@ impl MatmulTile {
     /// K partitions a split tile writes for its SumRows; `None` when unsplit.
     pub(crate) fn partitions(self) -> Option<u32> {
         match self {
-            Self::CooperativeTiled { splits, .. } | Self::CooperativeChecked { splits } => {
-                Some(splits)
-            }
+            Self::CooperativeTiled { splits, .. }
+            | Self::CooperativeWorkgroup { splits, .. }
+            | Self::CooperativeChecked { splits } => Some(splits),
             _ => None,
         }
     }
@@ -397,6 +422,8 @@ impl MatmulTile {
             | Self::Scalar(_)
             | Self::SpecializedConv { .. } => TileFamily::Scalar,
             Self::CooperativeF32 { .. }
+            | Self::CooperativeF16 { .. }
+            | Self::CooperativeWorkgroup { .. }
             | Self::CooperativeTiled { .. }
             | Self::CooperativeChecked { .. } => TileFamily::Cooperative,
             Self::Gemv(_) => TileFamily::Gemv,
@@ -404,10 +431,26 @@ impl MatmulTile {
     }
 
     pub(crate) fn configure(self, dispatch: &mut Dispatch) {
+        if let Self::CooperativeWorkgroup { shape, splits } = self {
+            let types = match dispatch.kernel {
+                crate::compile::Kernel::CooperativeTyped { types, .. } => Some(types),
+                crate::compile::Kernel::CooperativeWorkgroup { types, .. } => types,
+                _ => None,
+            };
+            dispatch.kernel = crate::compile::Kernel::CooperativeWorkgroup {
+                shape,
+                types,
+                splits,
+            };
+            return;
+        }
         if let Self::CooperativeChecked { splits } = self {
-            // Only the partition count is a candidate; storage stays.
-            let crate::compile::Kernel::CooperativeTyped { types, .. } = dispatch.kernel else {
-                unreachable!("checked partitions apply to typed products")
+            let types = match dispatch.kernel {
+                crate::compile::Kernel::CooperativeTyped { types, .. }
+                | crate::compile::Kernel::CooperativeWorkgroup {
+                    types: Some(types), ..
+                } => types,
+                _ => unreachable!("checked tiles apply to typed products"),
             };
             dispatch.kernel = crate::compile::Kernel::CooperativeTyped { types, splits };
             return;
@@ -434,7 +477,9 @@ impl MatmulTile {
             }
             Self::Tile32 | Self::Tile64 => crate::compile::Kernel::Default,
             Self::Scalar(shape) => crate::compile::Kernel::ScalarMatmul(shape),
-            Self::CooperativeF32 { .. } => crate::compile::Kernel::Cooperative,
+            Self::CooperativeF32 { .. } | Self::CooperativeF16 { .. } => {
+                crate::compile::Kernel::Cooperative
+            }
             Self::CooperativeTiled { shape, splits } => {
                 crate::compile::Kernel::CooperativeTiled { shape, splits }
             }
@@ -446,7 +491,9 @@ impl MatmulTile {
                 k_tile,
                 interleave_columns,
             },
-            Self::Gemv(_) | Self::CooperativeChecked { .. } => unreachable!(),
+            Self::Gemv(_) | Self::CooperativeChecked { .. } | Self::CooperativeWorkgroup { .. } => {
+                unreachable!()
+            }
         };
     }
 
@@ -478,11 +525,14 @@ impl MatmulTile {
             Self::CooperativeTiled { shape, splits } => {
                 return [class.m / 64, class.n / shape.columns, splits];
             }
+            Self::CooperativeWorkgroup { shape, splits } => {
+                return [class.m / shape.rows, class.n / shape.columns, splits];
+            }
             // Checked tiles use X for rows, Y for columns, over 32x32 blocks.
             Self::CooperativeChecked { splits } => {
                 return [class.m.div_ceil(32), class.n.div_ceil(32), splits];
             }
-            Self::CooperativeF32 { .. } => {
+            Self::CooperativeF32 { .. } | Self::CooperativeF16 { .. } => {
                 let tile = self.coop_config().unwrap().matmul_output_tile();
                 // Cooperative tiles use X for rows, Y for columns.
                 return [class.m.div_ceil(tile), class.n.div_ceil(tile), 1];
@@ -498,9 +548,31 @@ impl MatmulTile {
     }
 
     pub(crate) fn buffer_sizes(self, class: &TuneClass) -> Option<Vec<usize>> {
+        if let Self::CooperativeWorkgroup { shape, splits } = self {
+            let types = class.effective_matrix_types()?;
+            if !matches!(types.multiply, crate::DType::F16 | crate::DType::BF16)
+                || class.conv2d.is_some()
+                || !class.shader.is_matmul()
+                || class.weight_format != crate::compile::WeightFormat::F32
+                || !shape.fits(class.m, class.n, class.k)
+                || splits == 0
+                || splits > class.k / shape.k_stage
+                || (splits > 1) != class.split_k
+                || (splits > 1 && (class.has_addend() || types.output != crate::DType::F32))
+            {
+                return None;
+            }
+            let mut sizes = class.buffer_sizes()?;
+            *sizes.last_mut()? = sizes.last()?.checked_mul(splits as usize)?;
+            return crate::compile::workgroups_within_portable_limits(self.workgroups(class))
+                .then_some(sizes);
+        }
+        if matches!(self, Self::CooperativeF16 { .. }) != class.cooperative_f16 {
+            return None;
+        }
         if let Some(types) = class.matrix_types {
-            // A typed product keeps its kernel and storage: only its K
-            // partition count is a candidate, and partials are F32.
+            // Workgroup candidates were handled above; subgroup candidates
+            // preserve storage too, with F32 partials when split.
             let Self::CooperativeChecked { splits } = self else {
                 return None;
             };
@@ -586,7 +658,7 @@ impl MatmulTile {
             // Each partition writes a whole output of partial sums.
             *sizes.last_mut()? = sizes.last()?.checked_mul(splits as usize)?;
         }
-        if let Self::CooperativeF32 { tile_size } = self {
+        if let Self::CooperativeF32 { tile_size } | Self::CooperativeF16 { tile_size } = self {
             use crate::kernels::matmul;
             if class.conv2d.is_some() || !matches!(tile_size, 8 | 16) {
                 return None;
@@ -622,6 +694,13 @@ impl MatmulTile {
 }
 
 impl TuneClass {
+    pub(crate) fn effective_matrix_types(&self) -> Option<crate::codegen::MatrixTypes> {
+        self.matrix_types.or_else(|| {
+            self.cooperative_f16
+                .then_some(crate::codegen::MatrixTypes::F32_AS_F16)
+        })
+    }
+
     pub(crate) fn from_dispatch(dispatch: &Dispatch, config: Option<&CoopConfig>) -> Option<Self> {
         let addend = matches!(
             dispatch.shader,
@@ -669,6 +748,7 @@ impl TuneClass {
         let (partitions, matrix_types) = match dispatch.kernel {
             crate::compile::Kernel::CooperativeTiled { splits, .. } => (splits, None),
             crate::compile::Kernel::CooperativeTyped { types, splits } => (splits, Some(types)),
+            crate::compile::Kernel::CooperativeWorkgroup { types, splits, .. } => (splits, types),
             _ => (1, None),
         };
         let shader = match dispatch.shader {
@@ -762,6 +842,11 @@ impl TuneClass {
                 .unwrap_or(0),
             split_k: partitions > 1,
             matrix_types,
+            cooperative_f16: matches!(
+                dispatch.kernel,
+                crate::compile::Kernel::CooperativeWorkgroup { types: None, .. }
+            ) || (dispatch.kernel == crate::compile::Kernel::Cooperative
+                && config.is_some_and(|c| c.use_f16_input && !c.compensated)),
             device_local: [false; 4],
             binding_bytes: Vec::new(),
         };
@@ -965,11 +1050,34 @@ impl TuneClass {
                 .filter(|&tile| tile != initial && tile.fits(self))
                 .collect();
         }
-        if let MatmulTile::CooperativeChecked { .. } = initial {
-            // Typed storage fixes the kernel; partition counts must match the
-            // product's SumRows contract and fit its partial buffer.
-            return [1, 2, 4, 8, 16]
-                .map(|splits| MatmulTile::CooperativeChecked { splits })
+        if self.effective_matrix_types().is_some() {
+            let mut candidates = Vec::new();
+            if self.matrix_types.is_some() {
+                candidates.extend(
+                    [1, 2, 4, 8, 16].map(|splits| MatmulTile::CooperativeChecked { splits }),
+                );
+            } else if let Some(config) = config.filter(|c| c.use_f16_input && !c.compensated) {
+                candidates.push(MatmulTile::CooperativeF16 {
+                    tile_size: config.tile_size,
+                });
+            }
+            // Keep the incumbent's partition count first, then explore other
+            // counts only when the complete SumRows/buffer contract permits.
+            let splits = match initial {
+                MatmulTile::CooperativeChecked { splits }
+                | MatmulTile::CooperativeWorkgroup { splits, .. } => splits,
+                _ => 1,
+            };
+            candidates.extend(
+                crate::codegen::WorkgroupMatmulShape::all()
+                    .map(|shape| MatmulTile::CooperativeWorkgroup { shape, splits }),
+            );
+            if let MatmulTile::CooperativeWorkgroup { shape, .. } = initial {
+                candidates.extend(
+                    [2, 4, 8, 16].map(|splits| MatmulTile::CooperativeWorkgroup { shape, splits }),
+                );
+            }
+            return candidates
                 .into_iter()
                 .filter(|&tile| tile != initial && tile.fits(self))
                 .collect();
@@ -1675,6 +1783,96 @@ mod tests {
             output_buffer: crate::compile::BufferRef(2),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn rectangular_choices_preserve_types_geometry_and_binding_capacity() {
+        use crate::{
+            DType,
+            codegen::{MatrixTypes, WorkgroupMatmulShape},
+            compile::Kernel,
+        };
+        for types in [
+            MatrixTypes::BF16,
+            MatrixTypes::reduced(DType::F16),
+            MatrixTypes {
+                output: DType::BF16,
+                ..MatrixTypes::BF16
+            },
+            MatrixTypes {
+                a: DType::F32,
+                ..MatrixTypes::BF16
+            },
+        ] {
+            let mut class = class(256, 512, 256);
+            class.matrix_types = Some(types);
+            class.binding_bytes = class.buffer_sizes().unwrap();
+            let initial = MatmulTile::CooperativeChecked { splits: 1 };
+            let candidates = class.challengers(initial, None);
+            for shape in WorkgroupMatmulShape::all() {
+                let tile = MatmulTile::CooperativeWorkgroup { shape, splits: 1 };
+                assert!(candidates.contains(&tile));
+                let original = Dispatch {
+                    params: vec![256, 256, 512, 0],
+                    kernel: Kernel::CooperativeTyped { types, splits: 1 },
+                    workgroups: [8, 16, 1],
+                    ..dispatch()
+                };
+                let mut chosen = original.clone();
+                tile.apply(&mut chosen, &class);
+                assert_eq!(
+                    chosen.workgroups,
+                    [256 / shape.rows, 512 / shape.columns, 1]
+                );
+                assert_eq!(
+                    chosen.kernel,
+                    Kernel::CooperativeWorkgroup {
+                        shape,
+                        types: Some(types),
+                        splits: 1
+                    }
+                );
+                let saved = ron::to_string(&chosen).unwrap();
+                assert_eq!(ron::from_str::<Dispatch>(&saved).unwrap(), chosen);
+                initial.apply(&mut chosen, &class);
+                assert_eq!(chosen, original);
+                let mut undersized = class.clone();
+                *undersized.binding_bytes.last_mut().unwrap() -= 1;
+                assert!(!tile.fits(&undersized));
+                let mut ragged = class.clone();
+                ragged.n += 1;
+                assert!(!tile.fits(&ragged));
+            }
+        }
+        let mut automatic = class(256, 512, 256);
+        let native = CoopConfig {
+            tile_size: 16,
+            use_f16_input: false,
+            compensated: false,
+        };
+        assert!(
+            automatic
+                .challengers(MatmulTile::Tile64, Some(&native))
+                .iter()
+                .all(|tile| !matches!(
+                    tile,
+                    MatmulTile::CooperativeWorkgroup { .. } | MatmulTile::CooperativeF16 { .. }
+                ))
+        );
+        automatic.cooperative_f16 = true;
+        let reduced = CoopConfig {
+            use_f16_input: true,
+            ..native
+        };
+        let legacy = MatmulTile::CooperativeF16 { tile_size: 16 };
+        assert!(legacy.fits(&automatic));
+        assert!(!MatmulTile::Tile64.fits(&automatic));
+        assert!(
+            automatic
+                .challengers(legacy, Some(&reduced))
+                .iter()
+                .all(|tile| matches!(tile, MatmulTile::CooperativeWorkgroup { .. }))
+        );
     }
 
     #[test]
