@@ -120,7 +120,7 @@ pub(super) fn cached_profile(gpu: &Arc<Gpu>, timestamps: bool) -> Option<Machine
 /// Measure once per context/timing mode, within a soft budget. Partial
 /// profiles are cached too: short searches must not repeatedly pay for the
 /// same unfinished calibration. The global lock is not held during GPU work.
-pub(super) fn machine_profile(
+pub(crate) fn machine_profile(
     gpu: &Arc<Gpu>,
     timestamps: bool,
     budget: Duration,

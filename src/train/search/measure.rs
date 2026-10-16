@@ -219,6 +219,8 @@ pub(super) fn select(
     });
     let kernels = shared.as_deref_mut().unwrap_or(&mut private);
     kernels.bind(&gpu, &options.tuning, runtime.gpu_timing);
+    // Trials' kernel tuning, given the machine profile once it is measured.
+    let mut tuning = options.tuning.clone();
     // Recent complete comparisons, without their private kernel probes.
     let mut comparison_costs = VecDeque::new();
     // Nothing executed since the incumbent's last qualification.
@@ -331,13 +333,27 @@ pub(super) fn select(
                 trial.state_copy_time += copy_start.elapsed();
                 trial.snapshot_bytes = state.bytes();
                 if incumbent.is_some() {
-                    let mut policy = options.tuning.clone();
                     // Do not spend kernel probes on an invalid program.
                     // Memoized winners still need whole-program acceptance.
                     let mut step = incumbent_step;
-                    if !policy.max_time.is_zero()
-                        && candidate.kernel_probes_pending(&policy, Some(kernels))
-                    {
+                    let pending = !tuning.max_time.is_zero()
+                        && candidate.kernel_probes_pending(&tuning, Some(kernels));
+                    if pending && tuning.calibration == crate::tune::TuneCalibration::Measure {
+                        // Measure the machine once, with the search's own
+                        // budget rather than a share of one trial's kernel
+                        // budget, and supply it to every later trial.
+                        let budget = (options.max_time / 20).min(Duration::from_millis(250));
+                        let profile = crate::runtime::machine_profile(
+                            &gpu,
+                            runtime.gpu_timing,
+                            budget,
+                            tuning.max_scratch_bytes,
+                        );
+                        report.machine_profile = Some(profile.clone());
+                        tuning.calibration = crate::tune::TuneCalibration::Profile(profile);
+                    }
+                    let mut policy = tuning.clone();
+                    if pending {
                         step = step.max(validate(
                             &mut candidate,
                             &state,
@@ -1101,6 +1117,13 @@ mod tests {
             assert_eq!(first.trials[0].qualifications, 1);
             let tuning = first.trials[1].kernel_tuning.as_ref().unwrap();
             assert!(!tuning.outcomes.is_empty() && !tuning.time_budget_exhausted);
+            // The search measures the machine itself and supplies the profile.
+            assert_eq!(
+                first.machine_profile.is_some(),
+                strategy == crate::TuneStrategy::Race
+            );
+            assert_eq!(tuning.machine_profile, first.machine_profile);
+            assert!(tuning.calibration_time.is_zero());
             assert_eq!(first.trials[1].qualifications, 2);
             assert_eq!(first.trials[1].outcome.decision, TuneDecision::KeepBaseline);
             if kernel_threshold == 0.99 {

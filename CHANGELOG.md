@@ -10,6 +10,8 @@
   their sequential, uncalibrated policy. Cached winners no longer consume probe slots;
   memory limits, invalid timings and interrupted races remain retryable.
   Kernel memo revision 6 separates these decisions, including host/GPU timing.
+  `build_measured` measures the profile with its own budget before the first
+  trial that probes kernels, reports it, and supplies it to later trials.
 - Native BF16 is available as an explicit graph precision policy on Vulkan
   devices where Blade reports BF16 storage and 16x16x16 or 8x16x16 BF16/F32 cooperative
   matrices. Conversion and connected pointwise boundaries use two-byte storage;

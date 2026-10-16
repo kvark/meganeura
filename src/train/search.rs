@@ -95,6 +95,11 @@ pub struct BuildSearchReport {
     /// Requalification of the selected program after the last trial; zero
     /// when nothing ran after its own check.
     pub final_qualification_time: Duration,
+    /// Measured once, before the first trial that probes kernels, when tuning
+    /// calibrates; every later trial's tuning is given it. Its time is in
+    /// `elapsed`, and a profile cached for the context is reused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_profile: Option<crate::tune::MachineProfile>,
     pub elapsed: Duration,
 }
 
