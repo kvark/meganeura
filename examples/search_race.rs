@@ -4,7 +4,8 @@
 //!
 //! Strategies are `sequential` (one challenger at a time, structural class
 //! order), `race` (shared rounds with a measured machine profile) and
-//! `race-uncalibrated`; the default runs `sequential race`. The graph has
+//! `race-uncalibrated`, or `untuned` as an unchanged control; the default runs
+//! `sequential race`. The graph has
 //! the projections of one SmolLM2-135M block at 128 tokens plus one decode
 //! row. Each strategy gets a new session, so its decisions start from the
 //! compiled plan. Set `MEGANEURA_GPU_TIMING=1` to time races with GPU
@@ -12,7 +13,15 @@
 //! order. Set `MEGANEURA_SEARCH_VERBOSE=1` for raw candidate timings, or
 //! `MEGANEURA_SEARCH_SHARED_CONTEXT=1` to share the context (and calibration).
 //! A two-strategy shared-context run also swaps the selected kernels and
-//! repeats the held-out comparison. This compares search policies, not engines.
+//! repeats the held-out comparison. `MEGANEURA_SEARCH_CLASSES=1..64` instead
+//! builds independent matrix products with an exact output oracle, for scaling
+//! experiments. `MEGANEURA_SEARCH_WARMUP_SECONDS` sets the minimum duration of
+//! each balanced warmup (default 1s; use 10s for sustained comparisons).
+//!
+//! These are private kernel choices: whole-program timing here is observation,
+//! not an acceptance gate. Applications should use `build_measured` to reject
+//! choices that make the full program slower. This compares search policies,
+//! not engines.
 
 use meganeura::{
     Graph, Session, SessionConfig, TuneCalibration, TuneDecision, TuneOptions, TuneReport,
@@ -26,8 +35,27 @@ const INTERMEDIATE: usize = 1536;
 const STEP_WARMUPS: usize = 10;
 const STEP_SAMPLES: usize = 30;
 
-fn graph() -> Graph {
+fn shape(index: usize) -> (usize, usize, usize) {
+    (
+        128 + (index % 4) * 32,
+        256 + (index % 4) * 64,
+        256 + (index / 4) * 32,
+    )
+}
+
+fn graph(classes: Option<usize>) -> Graph {
     let mut g = Graph::new();
+    if let Some(classes) = classes {
+        let mut outputs = Vec::new();
+        for index in 0..classes {
+            let (m, n, k) = shape(index);
+            let x = g.input(&format!("x{index}"), &[m, k]);
+            let w = g.parameter(&format!("w{index}"), &[k, n]);
+            outputs.push(g.matmul(x, w));
+        }
+        g.set_outputs(outputs);
+        return g;
+    }
     let x = g.input("x", &[TOKENS, HIDDEN]);
     let mut outputs = Vec::new();
     for name in ["q", "k", "v", "o"] {
@@ -54,13 +82,25 @@ fn values(len: usize, seed: usize) -> Vec<f32> {
         .collect()
 }
 
-fn session(graph: &Graph, gpu: Option<std::sync::Arc<blade_graphics::Context>>) -> Session {
+fn session(
+    graph: &Graph,
+    gpu: Option<std::sync::Arc<blade_graphics::Context>>,
+    classes: Option<usize>,
+) -> Session {
     let mut config = match gpu {
         Some(gpu) => SessionConfig::inference_from_env_on(gpu),
         None => SessionConfig::inference_from_env(),
     };
     config.tune = false;
     let (mut session, _) = meganeura::build(graph, config);
+    if let Some(classes) = classes {
+        for index in 0..classes {
+            let (m, n, k) = shape(index);
+            session.set_input(&format!("x{index}"), &vec![0.125; m * k]);
+            session.set_parameter(&format!("w{index}"), &vec![0.0625; k * n]);
+        }
+        return session;
+    }
     session.set_input("x", &values(TOKENS * HIDDEN, 7));
     session.set_input("token", &values(HIDDEN, 11));
     for (index, (name, len)) in [
@@ -80,65 +120,107 @@ fn session(graph: &Graph, gpu: Option<std::sync::Arc<blade_graphics::Context>>) 
     session
 }
 
+fn check_outputs(session: &Session, classes: Option<usize>) {
+    if let Some(classes) = classes {
+        for index in 0..classes {
+            let (m, n, k) = shape(index);
+            let mut output = vec![0.0; m * n];
+            session.read_output_by_index(index, &mut output);
+            assert!(
+                output.iter().all(|&x| x == k as f32 / 128.0),
+                "constant-product oracle failed for matrix {index}"
+            );
+        }
+    }
+}
+
+fn step(session: &mut Session) -> f64 {
+    let start = Instant::now();
+    session.step();
+    session.wait();
+    start.elapsed().as_secs_f64() * 1e3
+}
+
+fn median(samples: &[f64]) -> f64 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
+}
+
 /// Median wall time of `step` plus `wait`, after warming up.
 fn step_ms(session: &mut Session) -> f64 {
     for _ in 0..STEP_WARMUPS {
-        session.step();
-        session.wait();
+        step(session);
     }
-    let mut samples: Vec<f64> = (0..STEP_SAMPLES)
-        .map(|_| {
-            let start = Instant::now();
-            session.step();
-            session.wait();
-            start.elapsed().as_secs_f64() * 1e3
-        })
-        .collect();
-    samples.sort_by(f64::total_cmp);
-    samples[samples.len() / 2]
+    let samples: Vec<_> = (0..STEP_SAMPLES).map(|_| step(session)).collect();
+    median(&samples)
 }
 
 /// Revisit retained programs in balanced order, independently of the search
 /// that last warmed the device. Immediate post-search timings are diagnostic,
 /// not a paired comparison of the selected programs.
-fn held_out(strategies: &[String], sessions: &mut [Session]) {
+fn held_out(label: &str, strategies: &[String], sessions: &mut [Session], warmup: Duration) {
     let mut samples = vec![Vec::new(); sessions.len()];
-    for round in 0..STEP_WARMUPS + STEP_SAMPLES {
+    let start = Instant::now();
+    let mut round = 0;
+    let mut measured = 0;
+    while measured < STEP_SAMPLES {
+        let measuring = round >= STEP_WARMUPS && start.elapsed() >= warmup;
+        // Start the measured schedule at a pair boundary, regardless of how
+        // many rounds were needed to reach the warmup duration.
+        let order_round = if measuring { measured } else { round };
         let mut order: Vec<_> = (0..sessions.len()).collect();
-        let shift = (round / 2) % order.len();
+        let shift = (order_round / 2) % order.len();
         order.rotate_left(shift);
-        if round % 2 == 1 {
+        if order_round % 2 == 1 {
             order.reverse();
         }
         for index in order {
-            let start = Instant::now();
-            sessions[index].step();
-            sessions[index].wait();
-            if round >= STEP_WARMUPS {
-                samples[index].push(start.elapsed().as_secs_f64() * 1e3);
+            let ms = step(&mut sessions[index]);
+            if measuring {
+                samples[index].push(ms);
             }
         }
+        round += 1;
+        measured += usize::from(measuring);
     }
-    println!("== held-out interleaved steps");
-    for (name, times) in strategies.iter().zip(&mut samples) {
-        times.sort_by(f64::total_cmp);
-        println!("{name}: {:.4} ms", times[times.len() / 2]);
+    println!("== {label}: interleaved steps after at least {warmup:?} warmup");
+    for (name, times) in strategies.iter().zip(&samples) {
+        println!("{name}: {:.4} ms", median(times));
+        if std::env::var_os("MEGANEURA_SEARCH_VERBOSE").is_some() {
+            println!("  step samples {times:?}");
+        }
     }
 }
 
-fn options(strategy: &str, budget: Duration) -> TuneOptions {
+fn options(strategy: &str, budget: Duration, classes: Option<usize>) -> TuneOptions {
     let (strategy, calibration) = match strategy {
+        "untuned" => {
+            return TuneOptions {
+                max_time: Duration::ZERO,
+                max_classes: 0,
+                calibration: TuneCalibration::Off,
+                ..Default::default()
+            };
+        }
         "sequential" => (TuneStrategy::Sequential, TuneCalibration::Off),
         "race" => (TuneStrategy::Race, TuneCalibration::Measure),
         "race-uncalibrated" => (TuneStrategy::Race, TuneCalibration::Off),
-        other => panic!("unknown strategy {other}; use sequential, race or race-uncalibrated"),
+        other => {
+            panic!("unknown strategy {other}; use untuned, sequential, race or race-uncalibrated")
+        }
     };
-    TuneOptions {
+    let mut options = TuneOptions {
         strategy,
         calibration,
         max_time: budget,
         ..Default::default()
+    };
+    if classes.is_some() {
+        options.max_classes = usize::MAX;
+        options.max_scratch_bytes = 1024 * 1024 * 1024;
     }
+    options
 }
 
 fn summarize(name: &str, report: &TuneReport, before_ms: f64, after_ms: f64, wall: Duration) {
@@ -217,7 +299,7 @@ fn summarize(name: &str, report: &TuneReport, before_ms: f64, after_ms: f64, wal
         println!("predicted plan {ms:.4} ms");
     }
     println!(
-        "step {before_ms:.4} -> {after_ms:.4} ms ({:+.1}%)",
+        "immediate diagnostic step {before_ms:.4} -> {after_ms:.4} ms ({:+.1}%)",
         (after_ms / before_ms - 1.0) * 100.0
     );
 }
@@ -232,25 +314,46 @@ fn main() {
     if strategies.is_empty() {
         strategies = vec!["sequential".to_owned(), "race".to_owned()];
     }
-    let graph = graph();
+    let classes = std::env::var("MEGANEURA_SEARCH_CLASSES").ok().map(|value| {
+        let count: usize = value.parse().expect("matrix class count in 1..=64");
+        assert!((1..=64).contains(&count), "matrix class count in 1..=64");
+        count
+    });
+    let warmup = Duration::from_secs_f64(
+        std::env::var("MEGANEURA_SEARCH_WARMUP_SECONDS")
+            .map_or(1.0, |value| value.parse().expect("warmup in seconds")),
+    );
+    let graph = graph(classes);
     let mut sessions = Vec::new();
     let shared = std::env::var_os("MEGANEURA_SEARCH_SHARED_CONTEXT").is_some();
     let mut gpu = None;
     for name in &strategies {
-        let options = options(name, budget);
-        let mut session = session(&graph, gpu.clone());
+        // Validate all strategies before running any measurements.
+        options(name, budget, classes);
+        let session = session(&graph, gpu.clone(), classes);
         if shared {
             gpu = Some(session.context());
         }
-        let before_ms = step_ms(&mut session);
+        sessions.push(session);
+    }
+    held_out("before tuning", &strategies, &mut sessions, warmup);
+    for session in &sessions {
+        check_outputs(session, classes);
+    }
+    for (name, session) in strategies.iter().zip(&mut sessions) {
+        let options = options(name, budget, classes);
+        let before_ms = step_ms(session);
         let start = Instant::now();
         let report = session.tune_with(options).expect("valid tuning options");
         let wall = start.elapsed();
-        let after_ms = step_ms(&mut session);
+        let after_ms = step_ms(session);
+        check_outputs(session, classes);
         summarize(name, &report, before_ms, after_ms, wall);
-        sessions.push(session);
     }
-    held_out(&strategies, &mut sessions);
+    held_out("after tuning", &strategies, &mut sessions, warmup);
+    for session in &sessions {
+        check_outputs(session, classes);
+    }
     if shared && sessions.len() == 2 {
         let (left, right) = sessions.split_at_mut(1);
         println!(
@@ -258,8 +361,13 @@ fn main() {
             left[0].swap_tuning_with(&mut right[0]).unwrap()
         );
         held_out(
+            "after swapping choices",
             &[strategies[1].clone(), strategies[0].clone()],
             &mut sessions,
+            warmup,
         );
+        for session in &sessions {
+            check_outputs(session, classes);
+        }
     }
 }
