@@ -30,7 +30,7 @@ pub struct KernelMemo {
 
 // Bump when kernel generation, qualification or decision semantics change,
 // including changes between package releases. This also versions the memo schema.
-const KERNEL_MEMO_REVISION: u32 = 3;
+const KERNEL_MEMO_REVISION: u32 = 4;
 
 /// What a recorded decision depends on besides its class key.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -353,7 +353,12 @@ pub(super) fn tile_module(
                 let crate::compile::Kernel::CooperativeTyped { types, .. } = dispatch.kernel else {
                     unreachable!("checked partitions apply to typed products")
                 };
-                crate::codegen::generate_module_coop_typed(entry.shader_group(), types)
+                crate::codegen::generate_module_coop_typed_with_layout(
+                    entry.shader_group(),
+                    types,
+                    [16, 16, 16],
+                    super::typed_matmul_layout(dispatch),
+                )
             }
             MatmulTile::SpecializedConv { .. } | MatmulTile::Gemv(_) | MatmulTile::Scalar(_) => {
                 unreachable!()

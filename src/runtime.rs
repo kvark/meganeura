@@ -962,7 +962,11 @@ enum Variant {
     /// Checked cooperative product with explicit operand, multiplication and
     /// output types. K partitions are uniform data and do not change the
     /// pipeline.
-    CoopTyped(ShaderEntry, crate::codegen::MatrixTypes),
+    CoopTyped(
+        ShaderEntry,
+        crate::codegen::MatrixTypes,
+        crate::codegen::TypedMatmulLayout,
+    ),
     CoopTiled(
         ShaderEntry,
         crate::codegen::CooperativeMatmulShape,
@@ -1073,7 +1077,7 @@ impl Variant {
         match *self {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
             Variant::Attention(ref e, _, _)
-            | Variant::CoopTyped(ref e, _)
+            | Variant::CoopTyped(ref e, _, _)
             | Variant::CoopTiled(ref e, _, _, _)
             | Variant::SplitMatmul(ref e, _, _, _)
             | Variant::SpecializedConv(ref e, _, _, _)
@@ -1098,7 +1102,7 @@ impl Variant {
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
-            Variant::CoopTyped(ref e, types) => {
+            Variant::CoopTyped(ref e, types, staging) => {
                 use crate::codegen::MatrixTypes;
                 let multiply = MatrixTypes::name(types.multiply);
                 let operands = if types.a == types.multiply && types.b == types.multiply {
@@ -1108,7 +1112,7 @@ impl Variant {
                     format!("{a}-{b}-as-{multiply}")
                 };
                 let output = MatrixTypes::name(types.output);
-                format!("{e:?}:cooperative-{operands}-{output}-output")
+                format!("{e:?}:cooperative-{operands}-{output}-output:{staging:?}")
             }
             Variant::CoopTiled(ref e, shape, splits, ref prologue) => {
                 format!("{e:?}:native-f32-tiled-{shape:?}-split-k-{splits}:{prologue:?}")
@@ -1239,6 +1243,21 @@ fn checked_matrix_types(dispatch: &Dispatch) -> Option<crate::codegen::MatrixTyp
     }
 }
 
+fn typed_matmul_layout(dispatch: &Dispatch) -> crate::codegen::TypedMatmulLayout {
+    let types = checked_matrix_types(dispatch).expect("typed matrix product");
+    let (m, n, k) = dispatch.mnk().expect("dense product dimensions");
+    crate::codegen::TypedMatmulLayout::for_product(
+        types,
+        matches!(
+            dispatch.shader,
+            ShaderEntry::FusedMatMulAdd
+                | ShaderEntry::FusedMatMulATAdd
+                | ShaderEntry::FusedMatMulBTAdd
+        ),
+        [m, n, k],
+    )
+}
+
 /// Reduced storage types, and the multiplication types of checked
 /// cooperative products, that a plan needs from the device.
 fn precision_requirements(dispatches: &[Dispatch]) -> (Vec<crate::DType>, Vec<crate::DType>) {
@@ -1366,10 +1385,17 @@ fn test_f16_subnormal_products(gpu: &Gpu) -> bool {
     ) else {
         return false;
     };
-    let module = crate::codegen::generate_module_coop_typed_with_shape(
+    let ([m, n, k], a, b, expected) = f16_subnormal_probe();
+    let types = MatrixTypes::reduced(crate::DType::F16);
+    let module = crate::codegen::generate_module_coop_typed_with_layout(
         ShaderGroup::MatMul,
-        MatrixTypes::reduced(crate::DType::F16),
+        types,
         shape,
+        crate::codegen::TypedMatmulLayout::for_product(
+            types,
+            false,
+            [m as u32, n as u32, k as u32],
+        ),
     );
     let shader = match create_gen_shader(gpu, module) {
         Ok(shader) => shader,
@@ -1385,7 +1411,6 @@ fn test_f16_subnormal_products(gpu: &Gpu) -> bool {
         &layout,
         shader.at("main"),
     );
-    let ([m, n, k], a, b, expected) = f16_subnormal_probe();
     let half = |values: &[f32]| -> Vec<u16> {
         values
             .iter()
@@ -1855,11 +1880,14 @@ impl Pipelines {
         let cooperative =
             || *coop_config.expect("cooperative dispatch needs a qualified device configuration");
         let module = match *key {
-            Variant::CoopTyped(_, types) => crate::codegen::generate_module_coop_typed_with_shape(
-                group,
-                types,
-                typed_shape(types.multiply)?,
-            ),
+            Variant::CoopTyped(_, types, staging) => {
+                crate::codegen::generate_module_coop_typed_with_layout(
+                    group,
+                    types,
+                    typed_shape(types.multiply)?,
+                    staging,
+                )
+            }
             Variant::CoopTiled(_, shape, splits, _) => {
                 let config = cooperative();
                 if config.tile_size != 16 || config.use_f16_input || config.compensated {
@@ -2125,7 +2153,7 @@ impl Pipelines {
     fn key(dispatch: &Dispatch) -> Variant {
         let entry = dispatch.shader.clone();
         if let crate::compile::Kernel::CooperativeTyped { types, .. } = dispatch.kernel {
-            return Variant::CoopTyped(entry, types);
+            return Variant::CoopTyped(entry, types, typed_matmul_layout(dispatch));
         }
         if let crate::compile::Kernel::CooperativeTiled { shape, splits } = dispatch.kernel {
             return Variant::CoopTiled(
@@ -5166,6 +5194,7 @@ mod variant_tests {
                     shader: entry.clone(),
                     kernel,
                     weight_format,
+                    params: vec![32, 32, 32, 0],
                     ..Default::default()
                 };
                 let key = Pipelines::key(&dispatch);
@@ -5183,6 +5212,26 @@ mod variant_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn typed_pipeline_keys_distinguish_staging_and_output_layouts() {
+        let key = |m, n, k| {
+            Pipelines::key(&Dispatch {
+                shader: ShaderEntry::MatMul,
+                kernel: crate::compile::Kernel::CooperativeTyped {
+                    types: crate::codegen::MatrixTypes::BF16,
+                    splits: 1,
+                },
+                params: vec![m, k, n, 0],
+                ..Default::default()
+            })
+        };
+        assert_eq!(key(32, 32, 32), key(64, 64, 1024));
+        assert_ne!(key(32, 32, 32), key(33, 64, 32));
+        assert_ne!(key(33, 64, 32), key(33, 65, 1031));
+        // Odd K is still vectorizable when the full binding is a whole vector.
+        assert_eq!(key(32, 32, 32), key(32, 32, 31));
     }
 
     /// A dispatch whose epilogue ops were folded into the matmul has no

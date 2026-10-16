@@ -13,7 +13,7 @@ struct Params {
     m: u32,
     n: u32,
     k: u32,
-    _pad: u32,
+    $PARTITION_FIELD: u32,
 }
 
 var<storage> matrix_a: $A_STORAGE;
@@ -37,12 +37,13 @@ $ENTRY_SIGNATURE {
     let m = params.m;
     let n = params.n;
     let k = params.k;
+    $K_RANGE
 
     // C offsets for the 4 output tiles
-    let c00 = tile_row * n + tile_col;
-    let c01 = tile_row * n + (tile_col + $TILE_N_U);
-    let c10 = (tile_row + $TILE_M_U) * n + tile_col;
-    let c11 = (tile_row + $TILE_M_U) * n + (tile_col + $TILE_N_U);
+    let c00 = $OUTPUT_OFFSET + tile_row * n + tile_col;
+    let c01 = $OUTPUT_OFFSET + tile_row * n + (tile_col + $TILE_N_U);
+    let c10 = $OUTPUT_OFFSET + (tile_row + $TILE_M_U) * n + tile_col;
+    let c11 = $OUTPUT_OFFSET + (tile_row + $TILE_M_U) * n + (tile_col + $TILE_N_U);
 
     // Validity flags for secondary tiles
     let n1_valid = (tile_col + $TILE_N_U) < n;
@@ -58,9 +59,9 @@ $ENTRY_SIGNATURE {
     // from global into shared memory so the K-loop staging reads are cheap.
     $PROLOGUE_CACHE_INIT
 
-    var t = 0u;
+    var t = $K_START;
     loop {
-        if t >= k { break; }
+        if t >= $K_END { break; }
 
         // Stage sa0: B[t:t+tile, tile_col:tile_col+tile] → shared_a0
         $B_STAGE_0
