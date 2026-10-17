@@ -177,6 +177,17 @@ fn comparison_reserve(
         .saturating_add(qualification.saturating_mul(2))
 }
 
+fn comparison_exceeds_deadline(
+    comparison_costs: &VecDeque<Duration>,
+    elapsed: Duration,
+    max_time: Duration,
+) -> bool {
+    comparison_costs
+        .iter()
+        .min()
+        .is_some_and(|&cost| elapsed + cost > max_time)
+}
+
 pub(super) fn select(
     mut programs: impl Frontier,
     gpu: Arc<blade_graphics::Context>,
@@ -239,11 +250,7 @@ pub(super) fn select(
             break;
         }
         // An incomplete comparison cannot select its program.
-        if comparison_costs
-            .iter()
-            .min()
-            .is_some_and(|&cost| start.elapsed() + cost > options.max_time)
-        {
+        if comparison_exceeds_deadline(&comparison_costs, start.elapsed(), options.max_time) {
             report.truncated = true;
             report.deadline_reserved = true;
             break;
@@ -1400,13 +1407,9 @@ mod tests {
         }
     }
 
-    fn stop_rule_search(
-        options: BuildSearchOptions,
-        delay: Duration,
-    ) -> (Session, BuildSearchReport) {
+    fn stop_rule_search(options: BuildSearchOptions) -> (Session, BuildSearchReport) {
         let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
-        // Compile and run the kernels before the search clock starts, so a cold
-        // pipeline cache does not spend the deadline under test.
+        // Warm the kernels before starting the patience-limited search.
         let mut warm = Session::with_context_opts(
             identical_programs(1).next().unwrap().plan,
             gpu.clone(),
@@ -1435,7 +1438,6 @@ mod tests {
                 ..options
             },
             |s, _| {
-                std::thread::sleep(delay);
                 s.set_input("x", &[1.0, 2.0, 3.0, 4.0]);
                 Ok(())
             },
@@ -1452,14 +1454,11 @@ mod tests {
 
     #[test]
     fn patience_stops_after_trials_without_a_new_incumbent() {
-        let (_, report) = stop_rule_search(
-            BuildSearchOptions {
-                max_time: Duration::from_secs(60),
-                patience: Some(2),
-                ..Default::default()
-            },
-            Duration::ZERO,
-        );
+        let (_, report) = stop_rule_search(BuildSearchOptions {
+            max_time: Duration::from_secs(60),
+            patience: Some(2),
+            ..Default::default()
+        });
         assert_eq!(report.selected, 0);
         assert_eq!(report.trials.len(), 3);
         assert!(report.patience_exhausted && report.truncated);
@@ -1470,22 +1469,28 @@ mod tests {
 
     #[test]
     fn no_comparison_starts_that_cannot_finish() {
-        // A comparison costs at least its 0.4 s initialization, so after two
-        // programs a third could not finish by 1.15 s. The remaining 0.35 s
-        // absorbs execution with warm kernels.
-        let (_, report) = stop_rule_search(
-            BuildSearchOptions {
-                max_time: Duration::from_millis(1150),
-                ..Default::default()
-            },
+        // Test the reservation policy with explicit elapsed times. Sleeping in
+        // a GPU search makes this depend on CI load: a slow comparison can hit
+        // the hard deadline before the next iteration can reserve any time.
+        let budget = Duration::from_millis(1150);
+        let costs = VecDeque::from([
+            Duration::from_millis(600),
             Duration::from_millis(400),
-        );
-        assert!(report.deadline_reserved && report.truncated);
-        assert_eq!(report.trials.len(), 2);
-        assert_eq!(
-            report.trials[1].outcome.decision,
-            TuneDecision::KeepBaseline
-        );
+            Duration::from_millis(800),
+        ]);
+        for (elapsed_ms, must_stop) in [(700, false), (750, false), (751, true), (800, true)] {
+            assert_eq!(
+                comparison_exceeds_deadline(&costs, Duration::from_millis(elapsed_ms), budget),
+                must_stop,
+                "reserve the fastest complete comparison after {elapsed_ms} ms",
+            );
+        }
+        // Without a complete comparison there is no estimate to reserve.
+        assert!(!comparison_exceeds_deadline(
+            &VecDeque::new(),
+            Duration::from_millis(800),
+            budget,
+        ));
     }
 
     #[test]
