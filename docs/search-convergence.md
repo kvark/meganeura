@@ -249,11 +249,7 @@ landed on the branch.
 - [x] Shared calibration in `build_measured`: measured once with the search's
   own budget, before the first trial that probes kernels, reported in
   `BuildSearchReport::machine_profile` and supplied to every later trial.
-- [x] Reserve half the overall search budget for graph/submission alternatives
-  while they remain. Once the cumulative kernel allowance is spent, later
-  trials restore memoized winners with zero new probe slots; they still pass
-  whole-program qualification and timing. Release the reserve on the last trial.
-- [ ] Remaining whole-program changes from the next phase.
+- [ ] Whole-program changes from the next phase.
 
 Hardware experiments and historical comparisons are in
 [Experiments: kernel search races](experiments.md#kernel-search-races--october-16).

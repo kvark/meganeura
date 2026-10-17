@@ -72,11 +72,6 @@
   before replacing it. Both count toward the program and memory bounds; a
   one-program search returns the fallback. Private probes reserve estimated
   time for warmup, paired timing and qualification within the common deadline.
-  While more programs remain, new kernel probes share at most half of that
-  deadline across all challengers. Later programs replay qualified kernel
-  decisions without extending their tournaments, leaving time to discover
-  faster graph layouts and submission counts. The reserve is released for
-  the last available program. Reports record probing time and deferred trials.
   Incomplete or late comparisons keep the incumbent. Qualified challengers with
   identical execution plans and submission count skip warmup and paired timing.
   Plan equality includes shader tuning knobs, buffer layouts and constants;

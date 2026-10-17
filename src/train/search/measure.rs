@@ -67,9 +67,6 @@ pub struct BuildSearchTrial {
     /// Time left for whole-program warmup, paired sampling and qualification
     /// when assigning the private kernel budget. An estimate, not extra time.
     pub comparison_time_reserved: Duration,
-    /// Only replay qualified kernel decisions after the shared probing budget
-    /// is spent; unfinished tournaments remain resumable in the memo.
-    pub kernel_probes_deferred: bool,
     /// Absent for the initial, untuned fallback.
     pub kernel_tuning: Option<TuneReport>,
     pub outcome: TuneOutcome<(), usize>,
@@ -178,23 +175,6 @@ fn comparison_reserve(
         .max(pair.saturating_mul(options.warmup_runs))
         .saturating_add(pair.saturating_mul(options.tuning.sample_pairs as u32))
         .saturating_add(qualification.saturating_mul(2))
-}
-
-fn kernel_probe_budget(
-    total: Duration,
-    spent: Duration,
-    remaining: Duration,
-    alternatives: bool,
-) -> Duration {
-    // One expensive tournament must not consume the time needed to discover
-    // better layouts or submission counts. This is a cumulative allowance,
-    // not a fresh fraction on every challenger. Release the reserve when no
-    // later program can be measured.
-    if alternatives {
-        remaining.min((total / 2).saturating_sub(spent))
-    } else {
-        remaining
-    }
 }
 
 pub(super) fn select(
@@ -318,7 +298,6 @@ pub(super) fn select(
             qualification_time: Duration::ZERO,
             qualifications: 0,
             comparison_time_reserved: Duration::ZERO,
-            kernel_probes_deferred: false,
             kernel_tuning: None,
             outcome: TuneOutcome::new((), program.plan.dispatches.len(), report.selected, index),
         };
@@ -354,21 +333,10 @@ pub(super) fn select(
                 trial.state_copy_time += copy_start.elapsed();
                 trial.snapshot_bytes = state.bytes();
                 if incumbent.is_some() {
-                    let alternatives = index + 1 < options.max_programs
-                        && (programs.may_remain() || !pending_submissions.is_empty());
-                    let probe_budget = kernel_probe_budget(
-                        options.max_time,
-                        report.kernel_probe_time,
-                        options.max_time.saturating_sub(start.elapsed()),
-                        alternatives,
-                    );
-                    trial.kernel_probes_deferred =
-                        !tuning.max_time.is_zero() && probe_budget.is_zero();
                     // Do not spend kernel probes on an invalid program.
                     // Memoized winners still need whole-program acceptance.
                     let mut step = incumbent_step;
-                    let pending = !trial.kernel_probes_deferred
-                        && !tuning.max_time.is_zero()
+                    let pending = !tuning.max_time.is_zero()
                         && candidate.kernel_probes_pending(&tuning, Some(kernels));
                     if pending && tuning.calibration == crate::tune::TuneCalibration::Measure {
                         // Measure the machine once, with the search's own
@@ -403,18 +371,11 @@ pub(super) fn select(
                             .saturating_sub(start.elapsed())
                             .saturating_sub(trial.comparison_time_reserved),
                     );
-                    let tuning = if trial.kernel_probes_deferred {
-                        policy.max_classes = 0;
-                        candidate.tune_with_memo(policy, Some(&mut *kernels))
-                    } else {
-                        policy.max_time = policy.max_time.min(probe_budget);
-                        candidate.tune_with_memo(policy, Some(&mut *kernels))
-                    }
-                    .map_err(|error| error.to_string())?;
-                    if !trial.kernel_probes_deferred && !tuning.options.max_time.is_zero() {
-                        report.kernel_probe_time += tuning.elapsed;
-                    }
-                    trial.kernel_tuning = Some(tuning);
+                    trial.kernel_tuning = Some(
+                        candidate
+                            .tune_with_memo(policy, Some(&mut *kernels))
+                            .map_err(|error| error.to_string())?,
+                    );
                 }
                 let step = validate(
                     &mut candidate,
@@ -597,115 +558,6 @@ mod tests {
     use super::*;
     use crate::TuneOptions;
     use crate::train::BuildSearchOptions;
-
-    #[test]
-    fn kernel_probes_share_one_allowance_across_programs() {
-        let seconds = Duration::from_secs;
-        let budget = |spent, remaining, alternatives| {
-            kernel_probe_budget(
-                seconds(30),
-                seconds(spent),
-                seconds(remaining),
-                alternatives,
-            )
-        };
-        assert_eq!(budget(0, 28, true), seconds(15));
-        assert_eq!(budget(10, 18, true), seconds(5));
-        assert_eq!(budget(15, 12, true), Duration::ZERO);
-        // An in-flight pipeline compilation may overshoot the soft allowance.
-        assert_eq!(budget(16, 11, true), Duration::ZERO);
-        // The whole-program deadline still bounds the last tournament.
-        assert_eq!(budget(10, 2, true), seconds(2));
-        assert_eq!(budget(16, 11, false), seconds(11));
-        assert_eq!(budget(0, 0, false), Duration::ZERO);
-    }
-
-    #[test]
-    fn deferred_kernel_probes_still_replay_and_qualify_programs() {
-        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
-        let mut graph = crate::Graph::new();
-        let x = graph.input("x", &[33, 17]);
-        let w = graph.parameter("w", &[17, 65]);
-        let y = graph.matmul(x, w);
-        graph.set_outputs(vec![y]);
-        let plan = crate::compile::compile(&graph);
-        let invalid = graph.neg(y);
-        graph.set_outputs(vec![invalid]);
-        let invalid = crate::compile::compile(&graph);
-        let runtime = SessionOptions {
-            coop: crate::CoopPolicy::Disabled,
-            ..Default::default()
-        };
-        let tuning = TuneOptions {
-            max_time: Duration::from_secs(30),
-            sample_pairs: 4,
-            target_sample_time: Some(Duration::from_nanos(1)),
-            ..Default::default()
-        };
-        let mut memo = crate::runtime::KernelMemo::default();
-        memo.bind(&gpu, &tuning, false);
-        let seeded = Session::with_context_opts(plan.clone(), gpu.clone(), runtime.clone())
-            .tune_with_memo(tuning.clone(), Some(&mut memo))
-            .unwrap();
-        assert!(!seeded.outcomes.is_empty() && !memo.is_empty());
-        // Charge the shared allowance without a GPU-speed-dependent sleep.
-        // The remaining wall time belongs to program exploration and replay.
-        let spent = Duration::from_secs(15);
-        let programs = [plan.clone(), invalid, plan].map(|plan| Program {
-            description: "replay qualification".into(),
-            plan,
-            submission_chunks: Some(1),
-            origin: None,
-        });
-        let (_, report) = super::select(
-            programs.into_iter().fuse(),
-            gpu,
-            runtime,
-            BuildSearchReport {
-                options: BuildSearchOptions {
-                    tuning,
-                    max_time: Duration::from_secs(30),
-                    max_programs: 4,
-                    max_plan_bytes: 1 << 20,
-                    warmup_time: Duration::ZERO,
-                    min_improvement: 0.99,
-                    kernel_memo: Some(Arc::new(std::sync::Mutex::new(memo))),
-                    ..Default::default()
-                },
-                kernel_probe_time: spent,
-                ..Default::default()
-            },
-            Instant::now() - spent,
-            (
-                |session: &mut Session, _: Option<&mut Session>| {
-                    session.set_input("x", &[0.25; 33 * 17]);
-                    session.set_parameter("w", &[0.125; 17 * 65]);
-                    Ok(())
-                },
-                |_: &mut Session| Ok(()),
-                |session: &Session| {
-                    session
-                        .read_output(33 * 65)
-                        .iter()
-                        .all(|&v| v == 17.0 / 32.0)
-                        .then_some(())
-                        .ok_or_else(|| "incorrect program".into())
-                },
-            ),
-        )
-        .unwrap();
-        assert_eq!(report.trials.len(), 4);
-        let replay = &report.trials[1];
-        assert!(replay.kernel_probes_deferred && replay.outcome.qualified);
-        assert_eq!(replay.qualifications, 1);
-        let tuning = replay.kernel_tuning.as_ref().unwrap();
-        assert!(tuning.outcomes.is_empty());
-        assert_eq!(tuning.reused_classes.len(), 1);
-        let invalid = &report.trials[2];
-        assert!(invalid.kernel_probes_deferred && !invalid.outcome.qualified);
-        assert_eq!(invalid.outcome.decision, TuneDecision::InvalidOutput);
-        assert!(report.trials[report.selected].outcome.qualified);
-    }
 
     fn select(
         programs: impl IntoIterator<Item = Program>,
