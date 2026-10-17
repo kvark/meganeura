@@ -39,7 +39,7 @@ These are pre-#257 measurements, not performance claims for the current branch.
 In particular, the BF16 baseline used scalar checked staging. #257 replaced it
 with the shared vectorized kernel on native 16×16×16 devices. The historical
 2.7×/3.9× BT/AT ratios below must not be quoted as gains over current main;
-fresh paired RTX 5070 measurements against the new incumbent are still pending.
+the October 16 measurements below use the new incumbent and normal race search.
 
 All three repositories publish the prototype on `experiment/workgroup-matrix`:
 
@@ -267,8 +267,215 @@ is rejected when its complete program does not improve. B570 never selects the
 unsupported extension and retains its existing subgroup/scalar paths.
 
 These device runs predate the shared typed-staging baseline from #257. They
-remain historical correctness evidence, not validation or speed measurements
-of the rebased integration. RTX 5070/B570 reruns remain outstanding.
+remain historical correctness evidence. The following rerun tests the rebased
+integration against the current baseline.
+
+#### After #257 and #262
+
+The integration is rebased onto `41a15d3`, including #257's vectorized typed
+staging and #262's race search. Workgroup tiles participate in race family and
+partition handling. Both race and sequential qualification use the effective
+matrix types, including implicit F32-storage/F16 multiplication; the small-input
+probe must remain representable in the selected multiplication type. A race
+qualifies its finalists, and the complete program still needs output/gradient
+qualification and paired timing before replacing the incumbent. The final
+integration preserves main's search driver, including its whole-program timing
+reservation, without adding a separate kernel-budget limit.
+
+The first measured candidate is `fee1c1e`; the baseline is `41a15d3`. The final
+candidate `26c1378` removes a budget cap inherited from the sequential prototype,
+restoring `train/search.rs` and `train/search/measure.rs` exactly to main. Its
+matrix kernels, qualification and race integration are unchanged. The artifact at
+`/x/Code/inferena-results/pr261-race-20261016/` retains source patches, exact
+dependency locks, binary hashes, protocol receipts, samples and telemetry.
+Both builds use the same crates.io versions; the PR updates the Blade/Naga
+pins listed above. Devices and drivers are RTX 5070 / NVIDIA 595.91.07 and
+B570 / Mesa 26.0.3-1ubuntu1, Linux 7.0.0-38-generic. GPU jobs run serially,
+without concurrent builds; driver caches are retained and clocks are not locked.
+
+The kernel experiment compares the ordinary untuned path with automatic race
+selection in the same binary, without forcing a tile. It uses five shapes,
+three layouts and two storage modes, three fresh RTX processes and one B570
+process. Each variant warms for 500 ms, followed by 20 balanced ABBA/BAAB samples
+of 64 replays; the middle RTX process reverses the starting order. The table
+shows medians of process medians and medians of paired ratios. BF16 includes
+both explicit input conversions.
+
+| M × N × K | Operands | Layout | Untuned → searched, ms | Paired speedup |
+|---|---|---|---:|---:|
+| 1024 × 1024 × 1024 | F32 storage, F16 multiply | NN | 0.14792 → 0.08141 | 1.819× |
+| 1024 × 1024 × 1024 | F32 storage, F16 multiply | BT | 0.16590 → 0.09423 | 1.760× |
+| 1024 × 1024 × 1024 | F32 storage, F16 multiply | AT | 0.16627 → 0.11550 | 1.441× |
+| 1024 × 1024 × 1024 | BF16 | NN | 0.14221 → 0.11545 | 1.233× |
+| 1024 × 1024 × 1024 | BF16 | BT | 0.15747 → 0.14237 | 1.104× |
+| 1024 × 1024 × 1024 | BF16 | AT | 0.16257 → 0.09792 | 1.661× |
+
+All six select workgroup kernels. The 128×1536×576 products improve by
+1.21–1.29× for F32-storage/F16 multiplication and 1.18–1.32× for BF16.
+The ragged 257×512×65 products retain existing paths. Across the 30-case
+matrix, the worst median searched/untuned slowdown is 1.0% on RTX and 2.5%
+on B570. B570 offers no workgroup candidates; its scalar tuning gains are
+preexisting behavior, not gains from this PR. The 1024³ searches take
+0.15–0.23 seconds after earlier cases warm the context and pipelines; these
+are not cold compilation measurements.
+
+The fixed historical 64×64, K=32, 64-invocation tile was also rerun in three
+fresh RTX processes. Its BF16 NN/BT/AT speedups are now 1.122×/1.105×/1.649×.
+This confirms the review's concern: the old 2.7×/3.9× ratios depended on the
+slower pre-#257 baseline. Automatic search still finds useful gains against
+the improved kernel.
+
+The whole-program gate still matters. In RTX Stable Diffusion accelerated,
+three private kernel races find workgroup winners, but the final programs use
+none. Two initially accepted inference programs are superseded by better graph
+choices. The training program's 8.856 → 8.800 ms comparison does not clear the
+improvement/noise guard, so its isolated kernel win is not installed. Kernel
+speedups alone therefore do not establish a model speedup.
+
+The first candidate passes formatting, Clippy for all targets/features with
+warnings denied, documentation with warnings denied, and a featureless build.
+Each GPU passes 639 library tests (8 ignored), 178 regression tests (21 ignored),
+and all four calibration tests including the normally ignored cases. Tests
+retain existing unsupported-feature early returns. Codegen covers 2,304 Naga
+validation/SPIR-V emission variants. Independent full-output kernel checks pass
+288 cases and 12,498,432 values against an F64 oracle that rounds operands to the
+selected arithmetic, including poisoned allocations and large 128×256 tiles.
+Maximum relative L2 error is 7.21e-7. All 288 cases also pass with
+`VK_LAYER_KHRONOS_validation` explicitly enabled. Loader traces confirm that the
+layer was inserted on both devices; there are no validation errors. This
+establishes arithmetic for the selected precision, not acceptance against
+unrounded F32 or training convergence.
+
+#### Full-model comparisons — October 16–17
+
+Inferena `7cecdc6` compares main and the PR on five models, strict/accelerated
+profiles and both GPUs: 40 primary processes on `fee1c1e`. Every build search starts with a
+fresh in-process kernel memo, shared across its program alternatives; persisted
+memo files are disabled. The budget is 30 seconds per search, with 10 seconds
+of phase warmup and 20 timing samples. Process order is balanced across profiles;
+processes have 600-second watchdogs. The harness records pipeline keys in both
+builds. Training timing means forward, loss and backward, without an optimizer
+update. These runs retain the existing full-tensor output/gradient gates against
+the first checked program; they are not a new independent PyTorch cohort.
+
+All 112 selected programs pass qualification. Seven workgroup candidates win
+private races and 87 are eliminated; none report shader or correctness failures.
+Only RTX SmolLM2 accelerated retains workgroup kernels in its final programs:
+one inference dispatch and 31 training dispatches. Its inference/backward times
+improve by 1.6%/0.7% in this pair. It uses 64×128 in inference and 32×64/128×64 in
+training. Kernel probing takes 0.87 seconds for inference and 1.73 seconds for
+training, within the existing budget. Both builds reject the same 55 inference
+and 12 training graph alternatives under the output bounds. The other workloads
+and strict profiles select no workgroup kernels; their small differences must
+not be attributed to workgroup acceleration.
+
+The table retains every primary result, including outliers investigated below.
+Positive deltas mean slower. Each row is one fresh process per arm, so small
+differences are not evidence of a repeatable model speedup.
+
+| GPU | Model / profile | Preparation Δ | Inference Δ | Latency Δ | Backward Δ |
+|---|---|---:|---:|---:|---:|
+| B570 | StableDiffusion / strict | +0.4% | -0.1% | +0.4% | -4.4% |
+| B570 | StableDiffusion / accelerated | +0.2% | +25.3% | -3.6% | +2.6% |
+| B570 | ResNet-50 / strict | -0.5% | +0.8% | +3.2% | +1.3% |
+| B570 | ResNet-50 / accelerated | -1.2% | -0.0% | -2.6% | -3.1% |
+| B570 | SmolLM2-135M / strict | +0.2% | +0.6% | -3.1% | +0.1% |
+| B570 | SmolLM2-135M / accelerated | +0.1% | -0.2% | +2.0% | +0.1% |
+| B570 | Whisper-tiny / strict | -0.8% | -3.1% | -3.4% | -0.9% |
+| B570 | Whisper-tiny / accelerated | +0.4% | -1.7% | -0.2% | +0.2% |
+| B570 | SmolVLA / strict | -2.3% | -5.1% | -2.6% | -0.7% |
+| B570 | SmolVLA / accelerated | +0.2% | +0.2% | +3.2% | +1.4% |
+| RTX 5070 | StableDiffusion / strict | -2.9% | +1.9% | -0.5% | -0.6% |
+| RTX 5070 | StableDiffusion / accelerated | +0.5% | +0.8% | -0.4% | -0.3% |
+| RTX 5070 | ResNet-50 / strict | +3.7% | -1.9% | +0.6% | +1.3% |
+| RTX 5070 | ResNet-50 / accelerated | +3.1% | -0.4% | -1.2% | +2.5% |
+| RTX 5070 | SmolLM2-135M / strict | +0.2% | +1.3% | -4.8% | +2.3% |
+| RTX 5070 | SmolLM2-135M / accelerated | +0.5% | -1.6% | -1.0% | -0.7% |
+| RTX 5070 | Whisper-tiny / strict | +0.2% | +0.6% | +1.9% | -1.4% |
+| RTX 5070 | Whisper-tiny / accelerated | +0.0% | -0.2% | -0.1% | -0.4% |
+| RTX 5070 | SmolVLA / strict | +0.0% | -0.1% | -0.1% | -0.5% |
+| RTX 5070 | SmolVLA / accelerated | -0.0% | -0.6% | +8.6% | -1.9% |
+
+B570 Stable Diffusion accelerated inference's initial +25.3% changes to −6.1%
+with reversed process order and −0.4% with 30-second warmup/100 samples. Main
+itself varies from 3.892 to 4.712 ms in those pairs. Those two followups do not
+reproduce the large inference loss, but the final-candidate pair below does.
+Backward is 2.5–3.1% slower across the three initial pairs. The longer
+pair selects the same graph and differs in one of 886 pipeline keys. A separate
+untuned control with 30-second warmup/100 samples uses identical pipeline keys
+in both builds and gives +0.9% inference, −1.3% latency and −0.5% backward.
+That control does not reproduce a general ordinary-path slowdown, but it does
+not erase the searched backward gap. No workgroup candidate is offered on B570,
+and its kernel probing stays below the reserved budget.
+
+RTX SmolLM2 strict backward's +2.3% accompanies a different search choice:
+main selects 16 submission chunks, while the PR keeps eight. The 16-chunk
+comparison and a later attention alternative miss the PR run's existing
+improvement/noise guard. The gate is retained, rather than weakened to force a
+particular result.
+
+RTX SmolVLA accelerated latency's +8.6% primary result uses identical final
+pipeline keys, graph and submission count, and the same sampled GPU clocks.
+A reversed process-order repeat with 30-second warmup/100 samples gives +4.5%
+inference, +1.9% latency and +0.9% backward. Main's latency changes from 1.011
+to 1.085 ms while the PR changes from 1.098 to 1.106 ms. The large primary
+latency loss does not repeat; these results do not establish zero regression.
+
+The initial candidate's inherited half-budget cap binds only in RTX ResNet
+training: 15.04/15.00 seconds of kernel probing defer 12/9 later trials in
+strict/accelerated mode. Neither case offers workgroup candidates. The final
+candidate removes that unrelated policy change instead of changing the timing
+guard or numerical thresholds. Main's existing reservation still leaves time
+to qualify and time a kernel-tuned program. Fresh comparisons below cover the
+affected ResNet cases, workgroup-selecting SmolLM2, and the B570 backward gap;
+the other primary searches never reach the removed allowance.
+
+The final candidate passes the same static checks and, on each GPU, 637 library
+tests (8 ignored) and 178 regression tests (21 ignored). The two removed library
+tests exercised the deleted budget cap. A fresh eight-process comparison
+qualifies all 24 selected programs:
+
+| GPU | Model / profile | Preparation Δ | Inference Δ | Latency Δ | Backward Δ |
+|---|---|---:|---:|---:|---:|
+| B570 | StableDiffusion / accelerated | -0.1% | +18.6% | +4.6% | +5.6% |
+| RTX 5070 | ResNet-50 / strict | +6.5% | -0.6% | +0.4% | -1.1% |
+| RTX 5070 | ResNet-50 / accelerated | +3.7% | +1.1% | +0.1% | +2.0% |
+| RTX 5070 | SmolLM2-135M / accelerated | +1.2% | -1.7% | +4.9% | -2.4% |
+
+These runs use the same protocol, except B570 Stable Diffusion uses 30-second
+warmup and 100 samples. SmolLM2's modest inference gain repeats; individual
+model phases still have losses. ResNet's execution differences remain small,
+but its 3.7–6.5% preparation increase remains visible after removing the cap.
+
+The final B570 pair is 4.293 → 5.090 ms for inference and 10.765 → 11.365 ms
+for backward. Both builds select graph 1 for inference and graph 13 for
+training. Only one of 300 inference pipeline keys and two of 886 training
+keys differ. The inference samples have somewhat lower GPU clocks in the PR
+run; backward clocks overlap at 2250–2300 MHz. This does not establish a cause.
+The budget cap never bound in this workload, so removing it does not explain
+or fix the loss. These results do **not** establish regression-free behavior.
+
+A dependency-only control uses main plus the same Blade/Naga pins, with no
+rectangular-matrix or search changes (`ccf65e0`). Two fresh pairs, ordered
+updated-backend/main/main/updated-backend, use the same 30-second warmup and
+100 samples. Inference changes by −15.5% and +13.4%; backward by +0.4% and +1.2%.
+All 12 selected programs qualify. The large inference difference changes sign,
+and the smaller backward difference does not reproduce the full PR gap. This
+control does not establish a dependency regression or clear the PR's slowdown.
+
+A final diagnostic pair enables context timestamps and retains ten per-dispatch
+GPU profiles after each phase, again with 30-second benchmark warmup and 100
+samples. The normal grouped-step timings in this mode are −6.0% inference,
++7.4% latency and −2.7% backward. The profiled backward GPU sum is
+13.416 → 13.434 ms (+0.13%); changed pipeline keys account for +0.016 ms of
+summed dispatch medians. There is no dominant changed kernel in that profile.
+All six selected programs qualify. Profiling expands backward wall time to
+about 22.44 ms, and enabling context timestamps changes the execution mode;
+this diagnostic cannot replace the uninstrumented comparisons or clear them.
+The cause of the earlier loss remains unresolved. A clean no-regression claim
+needs fixed-program replay under controlled operating conditions; weakening
+the acceptance gate or changing unrelated kernel heuristics is not justified
+by these measurements.
 
 To measure normal search against the untuned session, without forcing a tile:
 
@@ -916,7 +1123,8 @@ class can be partial at a deadline; the races above completed all 64. Profile
 startup can outweigh the race gain for a single class. Timestamp experiments
 do not measure whole-model overhead of enabling timestamps on the context.
 The campaign exercises existing candidate lists, up to 24 candidates per
-race, without #261's rectangular candidates or its cumulative budget policy.
+race, without #261's rectangular candidates or the cumulative budget cap
+from its earlier prototype.
 
 **Retain the whole-program gate.** A separate control held two initially
 identical sessions in one context, tuned only one, then warmed them in

@@ -5,9 +5,8 @@ New tuning options default to racing and measured calibration; explicit
 sequential/uncalibrated options retain the comparison path. This distinguishes
 implemented heuristics from guarantees; the cost model is not an acceptance oracle.
 It changes how candidates are measured and ordered, not what is legal or how
-results are qualified. Kernel families that arrive later, such as #261's
-rectangular workgroup tiles, become additional candidates in the same
-machinery.
+results are qualified. Kernel families added later, including #261's
+rectangular workgroup tiles, use the same machinery.
 
 ## Problem
 
