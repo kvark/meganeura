@@ -1,5 +1,3 @@
-# Meganeura
-
 [![CI](https://github.com/kvark/meganeura/actions/workflows/ci.yml/badge.svg)](https://github.com/kvark/meganeura/actions/workflows/ci.yml)
 [![Docs](https://docs.rs/meganeura/badge.svg)](https://docs.rs/meganeura)
 [![Crates.io](https://img.shields.io/crates/v/meganeura.svg?label=meganeura)](https://crates.io/crates/meganeura)
@@ -7,9 +5,7 @@
 
 **Portable neural-network training and inference in Rust.** Look, ma, no CUDA!
 
-[![logo](https://github.com/kvark/meganeura/raw/main/etc/logo.png)](/kvark/meganeura/blob/main/etc/logo.png)
-
-**Warning:** project is actively developed. Mostly optimization work, expanding the ops coverage, but with occasional fixes in correctness.
+![logo](etc/logo.png)
 
 ## Example
 
