@@ -209,5 +209,5 @@ fn check_candidates(strategy: TuneStrategy) {
             }
         }
     }
-    println!("rectangular_workgroup_candidates_qualified={probes}");
+    println!("rectangular_workgroup_candidates_reported={probes}");
 }
