@@ -477,6 +477,117 @@ needs fixed-program replay under controlled operating conditions; weakening
 the acceptance gate or changing unrelated kernel heuristics is not justified
 by these measurements.
 
+#### Matched-input and CPU-affinity controls — October 17
+
+The follow-up keeps main `41a15d3` and runtime candidate `26c1378` (documentation
+head `de90b90`) fixed. It corrects one Inferena protocol mismatch: search used
+the initialization callback once, whereas benchmark execution uploaded inputs
+before every step. Both arms now use `build_measured_with_inputs`, refreshing
+inputs before qualification, warmup and each sample. Uploads remain outside the
+execution timer but consume the same 30-second search budget. The production
+fix is [Inferena #67](https://github.com/kvark/inferena/pull/67); these diagnostic
+runs retain the earlier harness/model definitions for a matched comparison.
+
+Each paired run holds two processes resident and executes them serially. After
+20 seconds of balanced phase warmup, 20 ABBA/BAAB rounds collect 32 executions
+per block: 1,280 samples per arm and phase. Inputs are uploaded before each
+execution; ordinary grouped submission and host wall timing stay enabled.
+Context timestamps and per-dispatch profiling stay disabled. Compilation,
+search and GPU work are serial between processes. No builds run alongside
+measurements. The watchdog is 1,800 seconds per pair. Ordinary driver caches
+are retained, GPU clocks are unlocked, and the CPU governor is `powersave`.
+These are diagnostic comparisons, not standalone cohort records.
+
+The B570 control replays frozen selected plans and requires exact execution-plan,
+pipeline-key, barrier-group and full-output/gradient hashes before timing.
+Positive deltas mean slower; ratios are paired medians across rounds.
+
+| B570 Stable Diffusion accelerated comparison | Inference Δ | Latency Δ | Backward Δ |
+|---|---:|---:|---:|
+| Fresh independent selections, unrestricted CPU | +4.87% | +5.18% | -0.01% |
+| Same main-selected plan on main/PR, unrestricted CPU | -1.62% | +0.18% | -0.99% |
+| Same main binary and plan twice, unrestricted CPU | +0.19% | +3.36% | +0.21% |
+| Same main-selected plan on main/PR, CPU 2 | -0.11% | +0.07% | -0.47% |
+| Each build's own selected plan, CPU 2 | +0.04% | +0.13% | -0.01% |
+| Same main binary and plan twice, CPU 2 | +0.03% | +0.14% | -0.15% |
+
+An approximately 0.16 ms CPU-encoding gap reproduces between two copies of main
+and disappears when both run on the same core. Each build's own selected-plan
+differences then lie within the identical-binary control's variation. This
+isolates the earlier B570 loss to measurement/operating conditions rather than
+a changed kernel. It does not assert that a fresh noisy search always selects
+identical programs.
+
+RTX SmolLM2 accelerated with matched inputs improves inference/latency/backward
+by 2.37%/2.02%/2.57% in one fresh paired search. The earlier latency loss does
+not reproduce. Unrestricted RTX ResNet pairs still show backward differences
+of +1.81% accelerated and +2.57% strict. Both head searches reject the
+`conv_dw_splits=8` challenger under the unchanged noise gate, where main accepts
+it. RTX SmolVLA backward is +1.64%, accompanied by higher CPU encoding time.
+Fresh searches with CPU affinity applied only during final timing investigate
+those differences without reducing parallel shader compilation.
+
+| RTX 5070 fresh search, CPU 2 during timing | Inference Δ | Latency Δ | Backward Δ |
+|---|---:|---:|---:|
+| ResNet-50 / accelerated | +0.20% | +0.13% | -2.59% |
+| ResNet-50 / strict | -0.71% | +0.33% | -1.06% |
+| SmolVLA / accelerated | +0.00% | -0.10% | -0.09% |
+
+All 18 selected programs qualify. In the accelerated ResNet repeat, main now
+rejects `conv_dw_splits=8` while the PR accepts it, reversing the earlier choice
+and training difference. SmolVLA's encoding times become 3.4021/3.4024 ms and its
+training gap disappears. These controls do not reproduce a consistent runtime
+regression: the largest remaining positive delta is 0.33%. They retain the
+original negative results above and do not guarantee identical outcomes for
+every future 30-second search. A bounded resampling prototype is retained on
+local branch `experiment/whole-program-refinement`; it is not adopted, since
+the current evidence does not justify changing the search policy for this PR.
+
+A separate construction diagnostic records the generated SPIR-V and time in
+`vkCreateComputePipelines`, using one CPU core to make compiler time attributable.
+All 122 untuned ResNet shader binaries match byte for byte between main and PR.
+The searched control has 794 common source/entry-point combinations, also all
+byte-identical. Aggregate driver compiler time is 31.772 seconds for main and
+28.834 seconds for PR; process wall time is 65.75/63.34 seconds. These are
+instrumented, single-worker diagnostics, not normal preparation benchmarks.
+Repeated untuned construction also varies within one binary. The earlier
+preparation increase is concentrated in driver compilation, and this control
+does not reproduce a systematic cost increase from the new Blade/Naga code.
+
+A final uninstrumented preparation control uses separate, initially empty
+NVIDIA shader-cache directories for each arm, with a 1 GiB limit. Both runs
+create cache files there, confirming the override is effective. Run order is
+main cold, PR cold, PR warm, main warm; only those private directories are
+reused. Kernel-decision memos remain fresh. Normal parallel compilation is
+retained. Each phase executes one diagnostic step after search, so its
+execution samples are not used as performance evidence.
+
+| ResNet strict preparation | Main | PR | Δ |
+|---|---:|---:|---:|
+| Cold shader cache, reported preparation | 53.698 s | 53.220 s | -0.89% |
+| Warm shader cache, reported preparation | 49.832 s | 50.013 s | +0.36% |
+| Cold cache, total trial construction | 2.257 s | 2.229 s | -1.22% |
+| Warm cache, total trial construction | 1.162 s | 1.114 s | -4.12% |
+
+All 12 selected programs qualify. Cold/warm shader-cache state accounts for
+several seconds of preparation in either binary; controlling it removes the
+earlier multi-percent setup penalty. Across all eight fresh paired comparisons
+and these four preparation processes, all 60 selected programs qualify. The
+largest remaining positive execution delta in the final targeted controls is
+0.33%, and preparation is within 0.4% with equal cache warmth. These bounds
+describe the observed controls, not a guarantee that every independent search
+returns the same kernel choices. The unchanged correctness and whole-program
+performance gates remain the acceptance policy.
+
+The paired controller, exact-plan replay and cache protocol are published on
+[Inferena's measurement-control branch](https://github.com/kvark/inferena/tree/experiment/pr261-measurement-controls)
+at `0bb365c`. Raw records, frozen plans, exact shader binaries, original patches,
+dependency locks, binary hashes, CPU profiles and telemetry are retained
+outside Git under `/x/Code/inferena-results/pr261-noloss-20261017/`. The source
+checkpoint postdates these runs; their original source/lock/hash snapshots
+remain in that artifact. No numerical or performance acceptance threshold is
+loosened for these controls.
+
 To measure normal search against the untuned session, without forcing a tile:
 
 ```sh
