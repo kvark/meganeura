@@ -62,24 +62,29 @@ pub(super) fn generate(group: ShaderGroup, types: MatrixTypes, shape: [u32; 3]) 
             kernel_h,
             kernel_w,
             stride,
-            output_bf16,
+            ..
+        }
+        | ShaderGroup::Conv2dChecked {
+            kernel_h,
+            kernel_w,
+            stride,
         } => {
             assert!(kernel_h > 0 && kernel_w > 0 && stride > 0);
-            // Convolution operands are BF16; only the result type varies.
-            let output = if output_bf16 { DType::BF16 } else { DType::F32 };
-            assert_eq!(
-                types,
-                MatrixTypes {
-                    output,
-                    ..MatrixTypes::BF16
-                }
-            );
+            if let ShaderGroup::Conv2dBF16 { output_bf16, .. } = group {
+                assert_eq!(
+                    types,
+                    MatrixTypes {
+                        output: if output_bf16 { DType::BF16 } else { DType::F32 },
+                        ..MatrixTypes::BF16
+                    }
+                );
+            }
             let declaration = format!(
                 "{}\n{}\nconst KH: u32 = {kernel_h}u;\nconst KW: u32 = {kernel_w}u;\n\
                  const STRIDE: u32 = {stride}u;\n{}",
                 include_str!("../shaders/conv2d_params.wgsl"),
                 crate::divisor::SHADER,
-                include_str!("../shaders/conv2d_bf16.wgsl")
+                include_str!("../shaders/conv2d_checked.wgsl")
             );
             (
                 declaration,
@@ -242,6 +247,11 @@ mod tests {
                         };
                         if types.is_valid() {
                             for group in [
+                                ShaderGroup::Conv2dChecked {
+                                    kernel_h: 2,
+                                    kernel_w: 4,
+                                    stride: 2,
+                                },
                                 ShaderGroup::MatMul,
                                 ShaderGroup::MatMulAT,
                                 ShaderGroup::MatMulBT,

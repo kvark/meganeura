@@ -673,6 +673,12 @@ pub enum ShaderGroup {
     /// Used by EfficientNet Squeeze-and-Excitation.
     MulPerChannel,
     Conv2dGemm,
+    /// Checked implicit GEMM with types supplied by the pipeline.
+    Conv2dChecked {
+        kernel_h: u32,
+        kernel_w: u32,
+        stride: u32,
+    },
     Conv2dBF16 {
         kernel_h: u32,
         kernel_w: u32,
@@ -779,6 +785,9 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         ShaderGroup::RoPEGrad => ShaderModule::new(
             &include_str!("shaders/rope_grad.wgsl").replace("$PARAMS", ROPE_PARAMS_WGSL),
         ),
+        ShaderGroup::Conv2dChecked { .. } => {
+            panic!("checked convolution requires explicit matrix types")
+        }
         ShaderGroup::Conv2dBF16 { output_bf16, .. } => cooperative::generate(
             group,
             MatrixTypes {
@@ -1035,7 +1044,11 @@ pub fn generate_module_coop_typed_with_layout(
     layout: TypedMatmulLayout,
 ) -> ShaderModule {
     assert!(
-        coop_shape(group).is_some() || matches!(group, ShaderGroup::Conv2dBF16 { .. }),
+        coop_shape(group).is_some()
+            || matches!(
+                group,
+                ShaderGroup::Conv2dBF16 { .. } | ShaderGroup::Conv2dChecked { .. }
+            ),
         "no cooperative form for {group:?}"
     );
     if let Some((addend, variant)) = coop_shape(group)

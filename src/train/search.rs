@@ -18,6 +18,11 @@ const INITIAL_LAYOUTS: usize = 3;
 
 #[derive(Clone, Serialize)]
 pub struct BuildSearchOptions {
+    /// Optional reduced multiplication types for dense products and forward convolutions.
+    /// Storage, outputs and precision-protected derivatives remain F32. Each
+    /// complete program must pass the caller's accuracy and timing gates.
+    /// Unsupported device types are omitted; the ordinary program stays first.
+    pub matrix_inputs: Vec<crate::DType>,
     /// Fresh executions checked at each qualification checkpoint, outside
     /// timing. More than one lets a caller verify a program's repeatability
     /// independently of numerical differences between candidate programs.
@@ -68,6 +73,7 @@ pub struct BuildSearchOptions {
 impl Default for BuildSearchOptions {
     fn default() -> Self {
         Self {
+            matrix_inputs: Vec::new(),
             qualification_runs: 1,
             max_graphs: 16,
             tuning: TuneOptions::default(),
@@ -91,6 +97,8 @@ pub struct BuildSearchReport {
     pub graphs: Vec<String>,
     pub extraction_truncated: bool,
     pub skipped_regions: Vec<String>,
+    /// Requested arithmetic rejected by the device capability/numerical probe.
+    pub unsupported_matrix_inputs: Vec<crate::DType>,
     pub preparation_time: Duration,
     pub selected: usize,
     pub trials: Vec<BuildSearchTrial>,
@@ -198,6 +206,20 @@ pub fn build_measured_with_inputs(
 ) -> Result<(Session, BuildSearchReport), String> {
     let start = Instant::now();
     let _span = tracing::info_span!("build_measured").entered();
+    if options
+        .matrix_inputs
+        .iter()
+        .any(|ty| !matches!(ty, crate::DType::F16 | crate::DType::BF16))
+        || (!options.matrix_inputs.is_empty()
+            && !matches!(
+                cfg.runtime.coop,
+                crate::CoopPolicy::Auto | crate::CoopPolicy::AllowF16
+            ))
+    {
+        return Err(
+            "reduced matrix candidates require F16/BF16 and a permissive cooperative policy".into(),
+        );
+    }
     if cfg.cache.is_some() {
         return Err("measured construction does not use the ordinary build-plan cache".into());
     }
@@ -345,8 +367,14 @@ pub fn build_measured_with_inputs(
             });
         }
     }
+    let (matrix_inputs, unsupported_matrix_inputs): (Vec<_>, Vec<_>) = options
+        .matrix_inputs
+        .iter()
+        .copied()
+        .partition(|&ty| runtime::typed_matrix_supported(&gpu, ty));
+    let mut programs = implementations(seeds, caps, shared_memory_bytes, options.max_plan_bytes);
+    programs.enable_matrix_inputs(&matrix_inputs, &gpu.capabilities());
     let preparation_time = start.elapsed();
-    let programs = implementations(seeds, caps, shared_memory_bytes, options.max_plan_bytes);
     measure::select(
         programs,
         gpu,
@@ -356,6 +384,7 @@ pub fn build_measured_with_inputs(
             graphs: expressions,
             extraction_truncated,
             skipped_regions,
+            unsupported_matrix_inputs,
             preparation_time,
             ..Default::default()
         },
@@ -443,6 +472,7 @@ type AttentionChoice = (u32, Option<(u32, crate::codegen::FlashAttentionShape)>)
 struct AxisChoice {
     attention: AttentionChoice,
     fuse_dispatches: bool,
+    matrix_inputs: Option<crate::DType>,
 }
 
 fn early_physical_cover(baseline: AxisChoice, attention: &[AttentionChoice]) -> Vec<AxisChoice> {
@@ -487,6 +517,7 @@ struct CoordinateOrder {
     visited_forms: Vec<bool>,
     initial: usize,
     physical_next: bool,
+    priority_choices: collections::VecDeque<usize>,
 }
 
 impl CoordinateOrder {
@@ -500,6 +531,7 @@ impl CoordinateOrder {
             visited_forms: vec![false; seeds],
             initial: 0,
             physical_next: false,
+            priority_choices: collections::VecDeque::new(),
         }
     }
 
@@ -507,6 +539,16 @@ impl CoordinateOrder {
     fn next(&mut self, incumbent: (usize, usize)) -> Option<(usize, usize)> {
         if self.seeds == 0 || self.choices == 0 {
             return None;
+        }
+        // Preserve the ordinary initial layout cover, then try arithmetic on
+        // its winner before spending the deadline on later layouts.
+        if self.initial == self.seeds.min(INITIAL_LAYOUTS) {
+            while let Some(choice) = self.priority_choices.pop_front() {
+                let entry = (incumbent.0, choice);
+                if self.mark(entry) {
+                    return Some(entry);
+                }
+            }
         }
         while self.initial < self.seeds.min(INITIAL_LAYOUTS) {
             let entry = (self.initial, 0);
@@ -617,6 +659,7 @@ fn implementations(
     }
     let baseline = AxisChoice {
         attention: (0, None),
+        matrix_inputs: None,
         fuse_dispatches: seeds
             .first()
             .is_some_and(|seed| seed.options.fuse_dispatches),
@@ -636,6 +679,7 @@ fn implementations(
             fusion.iter().map(move |&fuse_dispatches| AxisChoice {
                 attention,
                 fuse_dispatches,
+                matrix_inputs: None,
             })
         })
         .filter(|&choice| seen.insert(choice))
@@ -665,6 +709,111 @@ struct Implementations {
     max_partial_bytes: usize,
     split_plans: Vec<measure::Program>,
     queued_splits: bool,
+}
+
+impl Implementations {
+    fn enable_matrix_inputs(
+        &mut self,
+        inputs: &[crate::DType],
+        caps: &blade_graphics::Capabilities,
+    ) {
+        let ordinary = self.choices.clone();
+        let mut seen = collections::HashSet::new();
+        for &multiply in inputs {
+            let shapes = match multiply {
+                crate::DType::F16 if caps.shader_float16 => &caps.cooperative_matrix.f16_f32_shapes,
+                crate::DType::BF16 if caps.shader_bfloat16 => {
+                    &caps.cooperative_matrix.bf16_f32_shapes
+                }
+                _ => continue,
+            };
+            if !seen.insert(multiply)
+                || crate::codegen::checked_cooperative_shape(shapes).is_none()
+                || !self
+                    .seeds
+                    .iter()
+                    .any(|s| matrix_candidates(&mut s.plan.clone(), multiply) > 0)
+            {
+                continue;
+            }
+            self.order.priority_choices.push_back(self.choices.len());
+            self.choices
+                .extend(ordinary.iter().map(|choice| AxisChoice {
+                    matrix_inputs: Some(multiply),
+                    ..*choice
+                }));
+        }
+        self.order.choices = self.choices.len();
+        self.order.choice_order = (0..self.choices.len()).collect();
+    }
+}
+
+/// Checked typed products preserve the F32 binding contract, including tails.
+/// Conversion happens inside each timed dispatch. This also reaches rectangular
+/// subgroup shapes and workgroup tuning without the legacy square-tile heuristic.
+fn matrix_candidates(plan: &mut ExecutionPlan, multiply: crate::DType) -> usize {
+    let mut count = 0;
+    for d in &mut plan.dispatches {
+        if matches!(
+            d.shader,
+            compile::ShaderEntry::Conv2dGemm
+                | compile::ShaderEntry::Conv2dGemmSmall
+                | compile::ShaderEntry::Conv2dGemm16
+        ) && !d.requires_full_precision
+            && !d.schedule_locked
+            && d.matmul_epilogue.is_none()
+            && d.extra_outputs.is_empty()
+            && d.weight_format == compile::WeightFormat::F32
+        {
+            let p = &d.params;
+            d.shader = compile::ShaderEntry::Conv2dGemmCoopGen(p[5], p[6], p[7]);
+            d.kernel = compile::Kernel::CooperativeTyped {
+                types: crate::codegen::MatrixTypes {
+                    multiply,
+                    ..crate::codegen::MatrixTypes::F32_AS_F16
+                },
+                splits: 1,
+            };
+            d.workgroups = [p[4].div_ceil(32), (p[9] * p[10]).div_ceil(32), p[0]];
+            count += 1;
+            continue;
+        }
+
+        if !matches!(
+            d.shader,
+            compile::ShaderEntry::MatMul
+                | compile::ShaderEntry::MatMulAT
+                | compile::ShaderEntry::MatMulBT
+                | compile::ShaderEntry::FusedMatMulAdd
+                | compile::ShaderEntry::FusedMatMulATAdd
+                | compile::ShaderEntry::FusedMatMulBTAdd
+        ) || !matches!(
+            d.kernel,
+            compile::Kernel::Default | compile::Kernel::SmallTile
+        ) || d.requires_full_precision
+            || d.schedule_locked
+            || d.horizontal_batch > 1
+            || d.weight_format != compile::WeightFormat::F32
+            || d.matmul_prologue.is_some()
+            || d.matmul_epilogue.is_some()
+        {
+            continue;
+        }
+        let Some((m, n, k)) = d.mnk() else { continue };
+        if m <= 1 || n == 0 || k == 0 {
+            continue;
+        }
+        d.kernel = compile::Kernel::CooperativeTyped {
+            types: crate::codegen::MatrixTypes {
+                multiply,
+                ..crate::codegen::MatrixTypes::F32_AS_F16
+            },
+            splits: 1,
+        };
+        d.workgroups = [m.div_ceil(32), n.div_ceil(32), 1];
+        count += 1;
+    }
+    count
 }
 
 impl measure::Frontier for Implementations {
@@ -701,6 +850,7 @@ impl measure::Frontier for Implementations {
             self.order.choice_order.sort_by_key(|&index| {
                 let choice = self.choices[index];
                 (
+                    choice.matrix_inputs != active.matrix_inputs,
                     choice.attention != active.attention,
                     choice.fuse_dispatches != active.fuse_dispatches,
                     index,
@@ -711,8 +861,9 @@ impl measure::Frontier for Implementations {
             let AxisChoice {
                 attention: (splits, flash),
                 fuse_dispatches,
+                matrix_inputs,
             } = self.choices[choice_index];
-            let plan = if splits == 0
+            let mut plan = if splits == 0
                 && flash.is_none()
                 && fuse_dispatches == seed.options.fuse_dispatches
             {
@@ -745,11 +896,20 @@ impl measure::Frontier for Implementations {
                 }
                 plan
             };
+            if let Some(multiply) = matrix_inputs {
+                if matrix_candidates(&mut plan, multiply) == 0 {
+                    continue;
+                }
+            }
+            let mut description = format!(
+                "{}, dispatch_fusion={fuse_dispatches}, attention_splits={splits}, flash={flash:?}",
+                seed.description
+            );
+            if let Some(dtype) = matrix_inputs {
+                description.push_str(&format!(", matrix_inputs={dtype:?}"));
+            }
             return Some(measure::Program {
-                description: format!(
-                    "{}, dispatch_fusion={fuse_dispatches}, attention_splits={splits}, flash={flash:?}",
-                    seed.description
-                ),
+                description,
                 plan,
                 submission_chunks: None,
                 origin: Some(measure::Origin {
@@ -827,6 +987,236 @@ fn low_occupancy_weight_splits(
 mod tests {
     use super::*;
 
+    fn matrix_frontier() -> Implementations {
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[32, 32]);
+        let w = graph.parameter("w", &[32, 32]);
+        let y = graph.matmul(x, w);
+        graph.set_outputs(vec![y]);
+        let options = compile::CompileOptions::default();
+        let caps = crate::codegen::CoopCaps::default();
+        let plan = compile::compile_with_caps(&graph, &options, caps, 65536);
+        implementations(
+            vec![Seed {
+                graph: std::sync::Arc::new(graph),
+                options,
+                plan,
+                description: "graph=0".into(),
+                backward_rank: 0,
+            }],
+            caps,
+            65536,
+            512 << 20,
+        )
+    }
+
+    #[test]
+    fn rectangular_matrix_candidates_require_advertised_arithmetic() {
+        let mut frontier = matrix_frontier();
+        let mut caps = blade_graphics::Capabilities {
+            shader_float16: true,
+            ..Default::default()
+        };
+        caps.cooperative_matrix.f16_f32_shapes.push([8, 16, 16]);
+        frontier.enable_matrix_inputs(&[crate::DType::F16, crate::DType::BF16], &caps);
+        let mut visited = Vec::new();
+        while let Some(program) = measure::Frontier::next(&mut frontier, None) {
+            visited.push(program);
+        }
+        assert!(!visited[0].description.contains("matrix_inputs="));
+        assert!(visited[1].description.contains("matrix_inputs=F16"));
+        assert!(visited.iter().all(|p| !p.description.contains("BF16")));
+        let mut plan = visited[0].plan.clone();
+        for d in &mut plan.dispatches {
+            d.requires_full_precision = true;
+        }
+        assert_eq!(matrix_candidates(&mut plan, crate::DType::F16), 0);
+    }
+
+    #[test]
+    fn bf16_candidate_survives_fp16_overflow_without_relaxing_the_gate() {
+        let gpu = crate::reference::gpu::shared_context();
+        if !gpu.capabilities().shader_bfloat16 {
+            return;
+        }
+        let f16_supported = runtime::typed_matrix_supported(&gpu, crate::DType::F16);
+        let frontier = matrix_frontier();
+        let graph = &frontier.seeds[0].graph;
+        let (_, report) = build_measured(
+            graph,
+            SessionConfig {
+                gpu: Some(gpu),
+                mode: crate::Mode::Inference,
+                ..Default::default()
+            },
+            BuildSearchOptions {
+                matrix_inputs: vec![crate::DType::F16, crate::DType::BF16],
+                max_graphs: 1,
+                max_programs: 8,
+                max_time: Duration::from_secs(15),
+                warmup_runs: 1,
+                warmup_time: Duration::ZERO,
+                tuning: TuneOptions {
+                    max_time: Duration::from_millis(100),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            |s, _| {
+                s.set_input("x", &[65536.0; 1024]);
+                s.set_parameter("w", &[1.0 / 65536.0; 1024]);
+                Ok(())
+            },
+            |s| {
+                if s.read_output(1024)
+                    .iter()
+                    .all(|&x| x.is_finite() && (x - 32.0).abs() < 1e-5)
+                {
+                    Ok(())
+                } else {
+                    Err("matrix output differs from exact F32 reference".into())
+                }
+            },
+        )
+        .unwrap();
+        if f16_supported {
+            assert!(
+                report
+                    .trials
+                    .iter()
+                    .any(|t| t.description.contains("matrix_inputs=F16") && !t.outcome.qualified)
+            );
+        } else {
+            assert!(
+                report
+                    .unsupported_matrix_inputs
+                    .contains(&crate::DType::F16)
+            );
+        }
+        assert!(
+            report
+                .trials
+                .iter()
+                .any(|t| t.description.contains("matrix_inputs=BF16") && t.outcome.qualified)
+        );
+    }
+
+    #[test]
+    fn checked_convolution_candidates_keep_batch_padding_and_partial_tiles() {
+        let gpu = crate::reference::gpu::shared_context();
+        let types: Vec<_> = [crate::DType::F16, crate::DType::BF16]
+            .into_iter()
+            .filter(|&ty| runtime::typed_matrix_supported(&gpu, ty))
+            .collect();
+        if types.is_empty() {
+            return;
+        }
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[2 * 3 * 7 * 9]);
+        let w = graph.parameter("w", &[5 * 3 * 3 * 3]);
+        let y = graph.conv2d(x, w, 2, 3, 7, 9, 5, 3, 3, 2, 1);
+        graph.set_outputs(vec![y]);
+        let input: Vec<f32> = (0..2 * 3 * 7 * 9).map(|i| (i % 11) as f32 / 16.0).collect();
+        let weights: Vec<f32> = (0..5 * 3 * 3 * 3).map(|i| (i % 5) as f32 / 16.0).collect();
+        let mut expected = Vec::new();
+        for batch in 0..2 {
+            for channel in 0..5 {
+                for oh in 0..4 {
+                    for ow in 0..5 {
+                        let mut total = 0.0;
+                        for ic in 0..3 {
+                            for kh in 0..3 {
+                                for kw in 0..3 {
+                                    let ih = oh * 2 + kh - 1i32;
+                                    let iw = ow * 2 + kw - 1i32;
+                                    if (0..7).contains(&ih) && (0..9).contains(&iw) {
+                                        total += input[((batch * 3 + ic) * 7 + ih as usize) * 9
+                                            + iw as usize]
+                                            * weights[((channel * 3 + ic) * 3 + kh as usize) * 3
+                                                + kw as usize];
+                                    }
+                                }
+                            }
+                        }
+                        expected.push(total);
+                    }
+                }
+            }
+        }
+        let (_, report) = build_measured(
+            &graph,
+            SessionConfig {
+                gpu: Some(gpu),
+                mode: crate::Mode::Inference,
+                ..Default::default()
+            },
+            BuildSearchOptions {
+                matrix_inputs: types.clone(),
+                max_graphs: 1,
+                max_programs: 8,
+                max_time: Duration::from_secs(15),
+                warmup_runs: 1,
+                warmup_time: Duration::ZERO,
+                tuning: TuneOptions {
+                    max_time: Duration::from_millis(100),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            |s, _| {
+                s.set_input("x", &input);
+                s.set_parameter("w", &weights);
+                Ok(())
+            },
+            |s| {
+                let actual = s.read_output(expected.len());
+                if actual == expected {
+                    Ok(())
+                } else {
+                    Err("checked convolution differs from exact CPU result".into())
+                }
+            },
+        )
+        .unwrap();
+        for ty in types {
+            assert!(
+                report
+                    .trials
+                    .iter()
+                    .any(|t| t.description.contains(&format!("matrix_inputs={ty:?}"))
+                        && t.outcome.qualified)
+            );
+        }
+    }
+
+    #[test]
+    fn reduced_candidates_cannot_bypass_a_strict_runtime_policy() {
+        for coop in [crate::CoopPolicy::Disabled, crate::CoopPolicy::NativeF32] {
+            let result = build_measured(
+                &Graph::new(),
+                SessionConfig {
+                    runtime: crate::SessionOptions {
+                        coop,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                BuildSearchOptions {
+                    matrix_inputs: vec![crate::DType::BF16],
+                    ..Default::default()
+                },
+                |_, _| panic!("invalid arithmetic must fail before initialization"),
+                |_| panic!("invalid arithmetic must fail before execution"),
+            );
+            assert!(
+                result
+                    .err()
+                    .unwrap()
+                    .contains("permissive cooperative policy")
+            );
+        }
+    }
+
     #[test]
     fn qualification_cannot_be_disabled() {
         let result = build_measured(
@@ -852,6 +1242,7 @@ mod tests {
         let baseline = AxisChoice {
             attention: (0, None),
             fuse_dispatches: true,
+            matrix_inputs: None,
         };
         let unfused = AxisChoice {
             fuse_dispatches: false,
@@ -997,6 +1388,20 @@ mod tests {
             "{choices} choices on form 0"
         );
         assert!((0..12).all(|form| visits.contains(&(form, 0))));
+    }
+
+    #[test]
+    fn arithmetic_cover_preserves_initial_layouts_and_uses_their_winner() {
+        let mut order = CoordinateOrder::new(8, 6);
+        order.priority_choices.extend([4, 5]);
+        for form in 0..INITIAL_LAYOUTS {
+            assert_eq!(order.next((0, 0)), Some((form, 0)));
+        }
+        assert_eq!(order.next((1, 0)), Some((1, 4)));
+        assert_eq!(order.next((1, 4)), Some((1, 5)));
+        let rest: Vec<_> = std::iter::from_fn(|| order.next((1, 0))).collect();
+        assert_eq!(rest.len() + INITIAL_LAYOUTS + 2, 8 * 6);
+        assert!(order.exhausted());
     }
 
     #[test]
@@ -1317,6 +1722,7 @@ mod tests {
                 BuildSearchOptions {
                     max_graphs: 4,
                     qualification_runs: 1,
+                    matrix_inputs: Vec::new(),
                     tuning: TuneOptions {
                         max_time: Duration::from_secs(1),
                         sample_pairs: 4,
