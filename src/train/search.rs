@@ -18,6 +18,11 @@ const INITIAL_LAYOUTS: usize = 3;
 
 #[derive(Clone, Serialize)]
 pub struct BuildSearchOptions {
+    /// Fresh executions checked at each qualification checkpoint, outside
+    /// timing. More than one lets a caller verify a program's repeatability
+    /// independently of numerical differences between candidate programs.
+    /// Persistent writes and representative inputs are reset before each run.
+    pub qualification_runs: u32,
     /// Bound on graph/implementation forms, including ordinary extraction.
     pub max_graphs: usize,
     /// Per-challenger kernel tuning and shared paired sampling policy.
@@ -62,6 +67,7 @@ pub struct BuildSearchOptions {
 impl Default for BuildSearchOptions {
     fn default() -> Self {
         Self {
+            qualification_runs: 1,
             max_graphs: 16,
             tuning: TuneOptions::default(),
             min_improvement: 0.05,
@@ -114,14 +120,19 @@ pub struct BuildSearchReport {
 /// remain private. Configure runtime optimizers, accumulation and external
 /// bindings after construction, not inside either callback.
 ///
-/// The runner executes one step before each read-only `qualify` call. Check every
+/// The runner executes one step before each read-only `qualify` call, repeating
+/// each checkpoint `options.qualification_runs` times. Check every
 /// observable output, gradient and persistent update against your numerical
 /// contract. The ordinary untuned program is qualified first and retained as
 /// the initial incumbent. Its tuned version, including memoized decisions,
 /// must win a whole-program comparison to replace it. Every challenger is
 /// qualified after kernel tuning, before it is timed;
-/// one with kernel classes left to probe is also qualified before tuning. A
-/// challenger with an identical execution plan and submission count keeps the incumbent
+/// one with kernel classes left to probe is also qualified before tuning.
+/// Repeatability checks should compare executions of the same complete plan;
+/// different plans can use different arithmetic and must each satisfy the
+/// caller's independent numerical contract. Kernel tuning can change the plan
+/// between the pre-tuning and post-tuning checkpoints.
+/// A challenger with an identical execution plan and submission count keeps the incumbent
 /// without warmup or paired timing. A winning challenger is qualified again after
 /// measurement. The selected program is checked before returning only if another
 /// challenger ran since its last check. A failing challenger is discarded; a
@@ -197,6 +208,9 @@ pub fn build_measured_with_inputs(
         return Err("whole-program min_improvement must be finite and in [0, 1)".into());
     }
     options.tuning.validate().map_err(|e| e.to_string())?;
+    if options.qualification_runs == 0 {
+        return Err("measured construction needs positive qualification runs".into());
+    }
     if cfg.runtime.debug {
         cfg.options.fuse_dispatches = false;
     }
@@ -789,6 +803,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn qualification_cannot_be_disabled() {
+        let result = build_measured(
+            &Graph::new(),
+            SessionConfig::default(),
+            BuildSearchOptions {
+                qualification_runs: 0,
+                ..Default::default()
+            },
+            |_, _| panic!("invalid options must fail before initialization"),
+            |_| panic!("invalid options must fail before execution"),
+        );
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .contains("positive qualification runs")
+        );
+    }
+
+    #[test]
     fn fusion_alternatives_lead_the_physical_cover() {
         let baseline = AxisChoice {
             attention: (0, None),
@@ -1247,6 +1281,7 @@ mod tests {
                 },
                 BuildSearchOptions {
                     max_graphs: 4,
+                    qualification_runs: 1,
                     tuning: TuneOptions {
                         max_time: Duration::from_secs(1),
                         sample_pairs: 4,

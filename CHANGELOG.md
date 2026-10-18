@@ -1,5 +1,9 @@
 # Unreleased
 
+- Measured construction accepts `BuildSearchOptions::qualification_runs` to
+  check repeated executions of each candidate outside timing. Persistent
+  writes and representative inputs are restored before every qualification
+  run, including final incumbent checks. The default remains one run.
 - Kernel tuning defaults to `TuneStrategy::Race`: parallel compilation,
   shared forward/reverse timing rounds, conservative early elimination and
   finalist-only qualification. `TuneCalibration::Measure` caches
