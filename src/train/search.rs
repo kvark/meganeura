@@ -767,6 +767,7 @@ fn matrix_candidates(plan: &mut ExecutionPlan, multiply: crate::DType) -> usize 
             compile::ShaderEntry::Conv2dGemm
                 | compile::ShaderEntry::Conv2dGemmSmall
                 | compile::ShaderEntry::Conv2dGemm16
+                | compile::ShaderEntry::Conv2dGemmCoopGen(..)
         ) && !d.requires_full_precision
             && !d.schedule_locked
             && d.matmul_epilogue.is_none()
@@ -797,7 +798,7 @@ fn matrix_candidates(plan: &mut ExecutionPlan, multiply: crate::DType) -> usize 
                 | compile::ShaderEntry::FusedMatMulBTAdd
         ) || !matches!(
             d.kernel,
-            compile::Kernel::Default | compile::Kernel::SmallTile
+            compile::Kernel::Default | compile::Kernel::SmallTile | compile::Kernel::Cooperative
         ) || d.requires_full_precision
             || d.schedule_locked
             || d.horizontal_batch > 1
@@ -1039,6 +1040,26 @@ mod tests {
             d.requires_full_precision = true;
         }
         assert_eq!(matrix_candidates(&mut plan, crate::DType::F16), 0);
+    }
+
+    #[test]
+    fn matrix_candidates_replace_automatic_cooperative_arithmetic() {
+        let frontier = matrix_frontier();
+        let mut plan = frontier.seeds[0].plan.clone();
+        let index = plan
+            .dispatches
+            .iter()
+            .position(|d| d.mnk().is_some())
+            .unwrap();
+        plan.dispatches[index].kernel = compile::Kernel::Cooperative;
+        let mut protected = plan.clone();
+        protected.dispatches[index].requires_full_precision = true;
+        assert_eq!(matrix_candidates(&mut protected, crate::DType::BF16), 0);
+        assert_eq!(matrix_candidates(&mut plan, crate::DType::BF16), 1);
+        assert!(matches!(plan.dispatches[index].kernel,
+            compile::Kernel::CooperativeTyped { types, splits: 1 }
+                if types.multiply == crate::DType::BF16 && types.a == crate::DType::F32
+                    && types.b == crate::DType::F32 && types.output == crate::DType::F32));
     }
 
     #[test]
