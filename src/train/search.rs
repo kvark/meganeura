@@ -15,6 +15,7 @@ use std::{
 };
 
 const INITIAL_LAYOUTS: usize = 3;
+const ARITHMETIC_LAYOUTS: usize = 5;
 
 #[derive(Clone, Serialize)]
 pub struct BuildSearchOptions {
@@ -540,9 +541,16 @@ impl CoordinateOrder {
         if self.seeds == 0 || self.choices == 0 {
             return None;
         }
-        // Preserve the ordinary initial layout cover, then try arithmetic on
-        // its winner before spending the deadline on later layouts.
-        if self.initial == self.seeds.min(INITIAL_LAYOUTS) {
+        // Reach several ordinary graph/derivative combinations before paying
+        // for another arithmetic family. Its tuning and full-gradient checks
+        // can otherwise displace a larger layout win under the same deadline.
+        if self
+            .visited_forms
+            .iter()
+            .filter(|&&visited| visited)
+            .count()
+            >= self.seeds.min(ARITHMETIC_LAYOUTS)
+        {
             while let Some(choice) = self.priority_choices.pop_front() {
                 let entry = (incumbent.0, choice);
                 if self.mark(entry) {
@@ -1397,10 +1405,16 @@ mod tests {
         for form in 0..INITIAL_LAYOUTS {
             assert_eq!(order.next((0, 0)), Some((form, 0)));
         }
+        let mut visits = INITIAL_LAYOUTS;
+        while order.visited_forms.iter().filter(|&&v| v).count() < ARITHMETIC_LAYOUTS {
+            let (_, choice) = order.next((1, 0)).unwrap();
+            assert!(choice < 4, "arithmetic displaced ordinary layout coverage");
+            visits += 1;
+        }
         assert_eq!(order.next((1, 0)), Some((1, 4)));
         assert_eq!(order.next((1, 4)), Some((1, 5)));
         let rest: Vec<_> = std::iter::from_fn(|| order.next((1, 0))).collect();
-        assert_eq!(rest.len() + INITIAL_LAYOUTS + 2, 8 * 6);
+        assert_eq!(rest.len() + visits + 2, 8 * 6);
         assert!(order.exhausted());
     }
 
