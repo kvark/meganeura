@@ -2736,6 +2736,7 @@ fn record_groups(
         start = end;
         chunk_index += 1;
         if start < total {
+            log::debug!(target: "meganeura::submission", "submit chunk {chunk_index}/{chunk_count}, groups {}..{end}", end - per_chunk);
             let sync = gpu.submit(encoder);
             if timing {
                 // The next start reuses the timestamp queries. Harvest them
@@ -3966,6 +3967,7 @@ impl Session {
             );
             source.wait();
         }
+        log::debug!(target: "meganeura::submission", "session build begin, {} dispatches", plan.dispatches.len());
         let _session_span = tracing::info_span!(
             "session_init",
             dispatches = plan.dispatches.len(),
@@ -6154,11 +6156,13 @@ impl Session {
             let _ = self.gpu.wait_for(&sp, !0);
         }
         if let Some(sp) = self.sync_point.take() {
+            log::debug!(target: "meganeura::submission", "wait begin");
             let _span = tracing::info_span!("wait").entered();
             self.last_gpu_timings =
                 wait_for_timed_encoder(&self.gpu, &sp, &mut self.encoder, self.gpu_timing)
                     .ok()
                     .flatten();
+            log::debug!(target: "meganeura::submission", "wait complete");
         }
     }
 
@@ -6176,6 +6180,7 @@ impl Session {
         self.encoder.start();
         self.profiled_pass_map.clear();
         self.encode_step(self.submission_chunks, self.profile_window.clone());
+        log::debug!(target: "meganeura::submission", "submit final chunk, {} dispatches", self.plan.dispatches.len());
         self.sync_point = Some(self.gpu.submit(&mut self.encoder));
     }
 
