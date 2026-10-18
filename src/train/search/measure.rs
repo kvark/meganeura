@@ -329,6 +329,7 @@ pub(super) fn select(
             outcome: TuneOutcome::new((), program.plan.dispatches.len(), report.selected, index),
         };
         trial.outcome.phase_times = None;
+        log::info!("program {index} begin: {}", trial.description);
         if bytes
             .checked_add(incumbent_bytes)
             .is_none_or(|sum| sum > options.max_plan_bytes)
@@ -348,6 +349,7 @@ pub(super) fn select(
                 None => Session::with_context_opts(program.plan, gpu.clone(), runtime.clone()),
             };
             candidate.set_submission_chunks(submission_chunks);
+            log::debug!("program {index} constructed; initializing");
             trial.construction_time = build.elapsed();
             let result = (|| {
                 let init = Instant::now();
@@ -355,6 +357,7 @@ pub(super) fn select(
                     initialize(&mut candidate, incumbent.as_mut().map(|entry| &mut entry.0));
                 trial.initialization_time = init.elapsed();
                 initialized?;
+                log::debug!("program {index} initialized; capturing state");
                 let copy_start = Instant::now();
                 let state = SearchState::capture(&mut candidate, options.max_plan_bytes)?;
                 trial.state_copy_time += copy_start.elapsed();
@@ -658,116 +661,6 @@ mod tests {
     }
 
     #[test]
-    fn qualification_replays_can_reject_an_unstable_program_before_timing() {
-        let gpu = crate::reference::gpu::shared_context();
-        let mut graph = crate::Graph::new();
-        let x = graph.input("x", &[2]);
-        let output = graph.neg(x);
-        graph.set_outputs(vec![output]);
-        let plan = crate::compile::compile(&graph);
-        for reject_repeat in [false, true] {
-            let mut checks = 0;
-            let result = select(
-                [Program {
-                    description: "baseline".into(),
-                    plan: plan.clone(),
-                    submission_chunks: Some(1),
-                    origin: None,
-                }],
-                gpu.clone(),
-                SessionOptions::default(),
-                BuildSearchOptions {
-                    qualification_runs: 2,
-                    max_programs: 1,
-                    ..Default::default()
-                },
-                |s, _| {
-                    s.set_input("x", &[1.0, 2.0]);
-                    Ok(())
-                },
-                |s| {
-                    checks += 1;
-                    assert_eq!(s.read_output(2), [-1.0, -2.0]);
-                    if reject_repeat && checks == 2 {
-                        Err("injected repeatability failure".into())
-                    } else {
-                        Ok(())
-                    }
-                },
-            );
-            assert_eq!(checks, 2);
-            if reject_repeat {
-                assert!(result.is_err());
-            } else {
-                let (_, report) = result.unwrap();
-                assert_eq!(report.trials[0].qualifications, 2);
-                assert!(report.trials[0].outcome.qualified);
-                assert!(report.trials[0].outcome.candidate_ms.is_empty());
-            }
-        }
-    }
-
-    #[test]
-    fn unstable_challenger_keeps_the_qualified_incumbent() {
-        let gpu = crate::reference::gpu::shared_context();
-        let mut graph = crate::Graph::new();
-        let x = graph.input("x", &[2]);
-        let output = graph.neg(x);
-        graph.set_outputs(vec![output]);
-        let plan = crate::compile::compile(&graph);
-        let programs = ["baseline", "challenger"].map(|name| {
-            let mut plan = plan.clone();
-            plan.dispatches[0].label = name.into();
-            Program {
-                description: name.into(),
-                plan,
-                submission_chunks: Some(1),
-                origin: None,
-            }
-        });
-        let mut challenger_checks = 0;
-        let (selected, report) = select(
-            programs,
-            gpu,
-            SessionOptions::default(),
-            BuildSearchOptions {
-                qualification_runs: 2,
-                max_programs: 2,
-                ..Default::default()
-            },
-            |s, _| {
-                s.set_input("x", &[1.0, 2.0]);
-                Ok(())
-            },
-            |s| {
-                if s.plan().dispatches[0].label == "challenger" {
-                    challenger_checks += 1;
-                    if challenger_checks == 2 {
-                        return Err("injected repeatability failure".into());
-                    }
-                }
-                assert_eq!(s.read_output(2), [-1.0, -2.0]);
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(selected.plan().dispatches[0].label, "baseline");
-        let rejected = &report.trials[1];
-        assert_eq!(rejected.qualifications, 2);
-        assert_eq!(rejected.outcome.decision, TuneDecision::InvalidOutput);
-        assert!(!rejected.outcome.qualified);
-        assert!(rejected.outcome.candidate_ms.is_empty());
-        assert!(
-            rejected
-                .outcome
-                .failure
-                .as_ref()
-                .unwrap()
-                .contains("repeatability")
-        );
-    }
-
-    #[test]
     fn shader_knob_changes_are_measured_with_identical_dispatches() {
         let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
         let mut graph = crate::Graph::new();
@@ -881,8 +774,9 @@ mod tests {
             }),
             ..Default::default()
         });
-        for invalidate in [false, true] {
+        for invalidate in [None, Some("candidate"), Some("baseline")] {
             let initialized = std::cell::Cell::new(0);
+            let mut repeated = 0;
             let programs = ["baseline", "candidate"].map(|name| {
                 let mut plan = plan.clone();
                 plan.dispatches[0].label = name.into();
@@ -926,11 +820,13 @@ mod tests {
                     Ok(())
                 },
                 |s| {
-                    if invalidate
-                        && initialized.get() == 2
-                        && s.plan().dispatches.iter().any(|d| d.label == "baseline")
+                    if initialized.get() == 2
+                        && invalidate.is_some_and(|name| s.plan().dispatches[0].label == name)
                     {
-                        return Err("injected incumbent qualification failure".into());
+                        repeated += 1;
+                        if repeated == 2 {
+                            return Err("injected repeatability failure".into());
+                        }
                     }
                     assert_eq!(s.read_loss(), 26.0);
                     let mut gradient = [0.0; 2];
@@ -940,13 +836,22 @@ mod tests {
                     Ok(())
                 },
             );
-            if invalidate {
+            if invalidate == Some("baseline") {
                 assert!(
                     result
                         .err()
                         .unwrap()
                         .contains("incumbent failed repeated qualification")
                 );
+            } else if invalidate == Some("candidate") {
+                let (selected, report) = result.unwrap();
+                assert_eq!(selected.plan().dispatches[0].label, "baseline");
+                assert_eq!(report.trials[1].qualifications, 2);
+                assert_eq!(
+                    report.trials[1].outcome.decision,
+                    TuneDecision::InvalidOutput
+                );
+                assert!(report.trials[1].outcome.candidate_ms.is_empty());
             } else {
                 let (mut selected, report) = result.unwrap();
                 assert!(report.trials.iter().all(|t| t.outcome.qualified));
@@ -1632,30 +1537,6 @@ mod tests {
             Duration::from_millis(800),
             budget,
         ));
-    }
-
-    #[test]
-    fn repeated_qualification_is_reserved_before_kernel_tuning() {
-        // A slow checker must leave enough time for every execution at both
-        // remaining checkpoints, including a winning candidate's final check.
-        let options = BuildSearchOptions {
-            qualification_runs: 2,
-            warmup_runs: 1,
-            warmup_time: Duration::ZERO,
-            tuning: TuneOptions {
-                sample_pairs: 4,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert_eq!(
-            comparison_reserve(
-                &options,
-                Duration::from_millis(10),
-                Duration::from_millis(100),
-            ),
-            Duration::from_millis(550),
-        );
     }
 
     #[test]

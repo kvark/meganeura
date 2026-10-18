@@ -304,6 +304,7 @@ pub fn build_measured_with_inputs(
             }
         }
     }
+    let mut backward_ranks = vec![0; graphs.len()];
     if cfg.mode == crate::Mode::Training
         && cfg.optimize.mode != optimize::OptimizeMode::Off
         && options.max_graphs > 1
@@ -315,6 +316,7 @@ pub fn build_measured_with_inputs(
             options.max_graphs,
             start + options.max_time,
             &mut skipped_regions,
+            &mut backward_ranks,
         );
         graphs = space.candidates;
         extraction_truncated |= space.truncated;
@@ -332,6 +334,7 @@ pub fn build_measured_with_inputs(
         let plan = compile::compile_with_caps(&graph, &cfg.options, caps, shared_memory_bytes);
         if !seeds.iter().any(|seed| seed.plan == plan) {
             seeds.push(Seed {
+                backward_rank: backward_ranks[index],
                 description: format!("graph={index}"),
                 plan,
                 graph,
@@ -367,7 +370,9 @@ fn backward_layouts(
     limit: usize,
     deadline: Instant,
     skipped: &mut Vec<String>,
+    ranks: &mut Vec<usize>,
 ) -> optimize::search::SearchSpace {
+    ranks.clear();
     let mut layouts: Vec<Option<collections::VecDeque<optimize::search::Candidate>>> =
         (0..graphs.len()).map(|_| None).collect();
     let mut candidates = Vec::new();
@@ -388,6 +393,7 @@ fn backward_layouts(
         }
         let graph = &graphs[index];
         if layout == 0 {
+            ranks.push(layout);
             candidates.push(optimize::search::Candidate {
                 graph: graph.graph.deep_clone(),
                 expression: graph.expression.clone(),
@@ -407,6 +413,7 @@ fn backward_layouts(
             }
         });
         if let Some(form) = pending.pop_front() {
+            ranks.push(layout);
             candidates.push(optimize::search::Candidate {
                 graph: form.graph,
                 expression: format!("{}; backward={}", graph.expression, form.expression),
@@ -420,6 +427,7 @@ fn backward_layouts(
 }
 
 struct Seed {
+    backward_rank: usize,
     graph: std::sync::Arc<Graph>,
     options: compile::CompileOptions,
     plan: ExecutionPlan,
@@ -470,6 +478,7 @@ struct CoordinateOrder {
     choices: usize,
     /// Stable choice indices, prioritized around the incumbent's physical axes.
     choice_order: Vec<usize>,
+    form_order: Vec<usize>,
     tried: collections::HashSet<(usize, usize)>,
     /// Forms that have run with any choice.
     visited_forms: Vec<bool>,
@@ -483,6 +492,7 @@ impl CoordinateOrder {
             seeds,
             choices,
             choice_order: (0..choices).collect(),
+            form_order: (0..seeds).collect(),
             tried: collections::HashSet::new(),
             visited_forms: vec![false; seeds],
             initial: 0,
@@ -511,7 +521,10 @@ impl CoordinateOrder {
             .find(|entry| !self.tried.contains(entry));
         // Unvisited forms first; once every form has run, revisit them with the
         // incumbent's choice.
-        let graph = (0..self.seeds)
+        let graph = self
+            .form_order
+            .iter()
+            .copied()
             .find(|&s| !self.visited_forms[s])
             .map(|s| (s, choice))
             .filter(|entry| !self.tried.contains(entry))
@@ -667,6 +680,15 @@ impl measure::Frontier for Implementations {
                 continue;
             }
             let incumbent = incumbent.map_or((0, 0), |origin| (origin.form, origin.choice));
+            // Forward forms and derivative layouts are separate coordinates.
+            // Try the incumbent's derivative rank on other forward forms before
+            // spending the deadline on more derivative variants of early forms.
+            // This is only an ordering hint: every form remains reachable and
+            // must pass qualification and the whole-program timing gate.
+            let backward_rank = self.seeds.get(incumbent.0)?.backward_rank;
+            self.order
+                .form_order
+                .sort_by_key(|&index| (self.seeds[index].backward_rank != backward_rank, index));
             let active = self.choices[incumbent.1];
             // Test the incumbent attention layout's other fusion setting, then
             // explore attention with its winning fusion setting. Expanding both
@@ -868,6 +890,7 @@ mod tests {
         let plan = compile::compile_with_caps(&graph, &options, caps, 65536);
         let seeds = (0..16)
             .map(|index| Seed {
+                backward_rank: 0,
                 graph: graph.clone(),
                 options: options.clone(),
                 plan: plan.clone(),
@@ -928,6 +951,7 @@ mod tests {
         let plan = compile::compile_with_caps(&graph, &options, caps, 65536);
         let seeds = (0..16)
             .map(|index| Seed {
+                backward_rank: 0,
                 graph: graph.clone(),
                 options: options.clone(),
                 plan: plan.clone(),
@@ -988,6 +1012,13 @@ mod tests {
             .find(|&(form, _)| form == 3)
             .unwrap();
         assert_eq!(next, (3, 0));
+        // Graph priority can carry a winning derivative layout to a later
+        // forward form without changing the initial cover or physical axis.
+        order.form_order.reverse();
+        let next = std::iter::from_fn(|| order.next((3, 3)))
+            .find(|&(form, _)| form > 3)
+            .unwrap();
+        assert_eq!(next, (5, 3));
     }
 
     #[test]
@@ -1001,6 +1032,7 @@ mod tests {
                     assert!(entry.0 < seeds && entry.1 < choices);
                     assert!(visited.insert(entry));
                     if visited.len().is_multiple_of(3) {
+                        order.form_order.reverse();
                         incumbent = entry;
                     }
                 }
