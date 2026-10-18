@@ -1237,8 +1237,8 @@ struct Pipelines {
     dump_dir: Option<String>,
 }
 
-/// The types of a checked cooperative product: a typed dense kernel or an
-/// explicit BF16 convolution.
+/// Types of checked dense and convolution kernels, including explicit BF16
+/// convolution storage.
 fn checked_matrix_types(dispatch: &Dispatch) -> Option<crate::codegen::MatrixTypes> {
     use crate::codegen::MatrixTypes;
     match (&dispatch.kernel, &dispatch.shader) {
@@ -1263,7 +1263,13 @@ fn checked_matrix_types(dispatch: &Dispatch) -> Option<crate::codegen::MatrixTyp
 
 fn typed_matmul_layout(dispatch: &Dispatch) -> crate::codegen::TypedMatmulLayout {
     let types = checked_matrix_types(dispatch).expect("typed matrix product");
-    let (m, n, k) = dispatch.mnk().expect("dense product dimensions");
+    let Some((m, n, k)) = dispatch.mnk() else {
+        assert!(matches!(
+            dispatch.shader,
+            ShaderEntry::Conv2dGemmCoopGen(..)
+        ));
+        return crate::codegen::TypedMatmulLayout::default();
+    };
     crate::codegen::TypedMatmulLayout::for_product(
         types,
         matches!(
@@ -1915,7 +1921,17 @@ impl Pipelines {
         let cooperative =
             || *coop_config.expect("cooperative dispatch needs a qualified device configuration");
         let module = match *key {
-            Variant::CoopTyped(_, types, staging) => {
+            Variant::CoopTyped(ref entry, types, staging) => {
+                let group = match *entry {
+                    ShaderEntry::Conv2dGemmCoopGen(kernel_h, kernel_w, stride) => {
+                        ShaderGroup::Conv2dChecked {
+                            kernel_h,
+                            kernel_w,
+                            stride,
+                        }
+                    }
+                    _ => group,
+                };
                 crate::codegen::generate_module_coop_typed_with_layout(
                     group,
                     types,
@@ -3995,8 +4011,8 @@ impl Session {
             );
         } else {
             let info = gpu.device_information();
-            log::warn!(
-                "cooperative matrix not available on {} ({}) (f32_tile={}, f16_tile={}); using naive matmul",
+            log::info!(
+                "no ordinary square cooperative path on {} ({}) (f32_tile={}, f16_tile={}); checked typed paths remain device-qualified",
                 info.device_name,
                 info.driver_name,
                 coop_caps.f32_tile,
