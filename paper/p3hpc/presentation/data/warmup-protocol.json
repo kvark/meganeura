@@ -1,0 +1,27 @@
+{
+  "model": "SmolLM2-135M",
+  "framework": "meganeura",
+  "profile": "accelerated",
+  "gpu_devices": {
+    "b570": "0xe20c",
+    "rtx5070": "0x2f04"
+  },
+  "replicates": 2,
+  "checkpoints_seconds": [
+    5,
+    15,
+    30,
+    60
+  ],
+  "samples_per_checkpoint": 20,
+  "search_seconds": 30,
+  "kernel_memo": false,
+  "policy": "cumulative-selected-program-warmup-v1",
+  "phase_exposure": "elapsed wall time since phase start, including earlier 20-sample windows; matched input refresh before every step",
+  "controls": "same selected program throughout each phase; fresh search per process; no concurrent GPU jobs/builds; no changes to clocks or power limits",
+  "limitations": "Not independent cold starts at each duration; search and compilation already exercise the GPU. Two process replicates; within-window samples are not independent processes. Final outputs and gradients checked; intermediate windows use the same unchanged program and inputs.",
+  "inferena_base": "9eb99281a35990c6d3a9118aaf76388cc01a3107",
+  "study_revision": "b110188acb29a182741727d6e716cca6f4e99cdc",
+  "meganeura_revision": "c19cb1caedd90be7abc61de61f6197018711398e",
+  "binary_sha256": "771612983501529eac0aa4f9bf947426860a959155a7dadbf57a13bf5ea67237"
+}
