@@ -261,7 +261,14 @@ pub(super) fn select(
     let mut incumbent_checked = false;
     let mut incumbent_origin = None;
     for index in 0..options.max_programs {
-        if start.elapsed() >= options.max_time {
+        // Preserve room for mandatory final checks without spending it on
+        // losing candidates. The first trial supplies the cost estimate.
+        let search_time = options.max_time.saturating_sub(
+            incumbent_qualification
+                .max(incumbent_step)
+                .saturating_mul(options.final_qualification_runs),
+        );
+        if start.elapsed() >= search_time {
             report.truncated = true;
             break;
         }
@@ -273,7 +280,7 @@ pub(super) fn select(
             break;
         }
         // An incomplete comparison cannot select its program.
-        if comparison_exceeds_deadline(&comparison_costs, start.elapsed(), options.max_time) {
+        if comparison_exceeds_deadline(&comparison_costs, start.elapsed(), search_time) {
             report.truncated = true;
             report.deadline_reserved = true;
             break;
@@ -303,7 +310,7 @@ pub(super) fn select(
         };
         probe_submission = program.submission_chunks.is_none();
         let lowering_time = lowering.elapsed();
-        if start.elapsed() >= options.max_time {
+        if start.elapsed() >= search_time {
             report.truncated = true;
             break;
         }
@@ -401,8 +408,7 @@ pub(super) fn select(
                     trial.comparison_time_reserved =
                         comparison_reserve(&options, step, qualification);
                     policy.max_time = policy.max_time.min(
-                        options
-                            .max_time
+                        search_time
                             .saturating_sub(start.elapsed())
                             .saturating_sub(trial.comparison_time_reserved),
                     );
@@ -422,7 +428,7 @@ pub(super) fn select(
                 )?;
                 trial.outcome.qualified = true;
                 if let Some((ref mut baseline, ref baseline_state)) = incumbent {
-                    if start.elapsed() < options.max_time
+                    if start.elapsed() < search_time
                         // Dispatch geometry alone does not identify the program:
                         // shader tuning knobs can change code without changing
                         // any dispatch. Buffer layouts and constants matter too.
@@ -437,7 +443,7 @@ pub(super) fn select(
                     while warmed < options.warmup_runs
                         || warmup_start.elapsed() < options.warmup_time
                     {
-                        if start.elapsed() >= options.max_time {
+                        if start.elapsed() >= search_time {
                             break;
                         }
                         run(baseline, baseline_state, &mut trial, &mut refresh_inputs)?;
@@ -447,7 +453,7 @@ pub(super) fn select(
                     let mut failure = None;
                     (trial.outcome.baseline_ms, trial.outcome.candidate_ms) =
                         measure_pairs(options.tuning.sample_pairs, |alternative| {
-                            if start.elapsed() >= options.max_time {
+                            if start.elapsed() >= search_time {
                                 return None;
                             }
                             let result = if alternative {
@@ -456,7 +462,7 @@ pub(super) fn select(
                                 run(baseline, baseline_state, &mut trial, &mut refresh_inputs)
                             };
                             match result {
-                                Ok(ms) if start.elapsed() < options.max_time => Some(ms),
+                                Ok(ms) if start.elapsed() < search_time => Some(ms),
                                 Ok(_) => None,
                                 Err(error) => {
                                     failure = Some(error);
@@ -574,16 +580,22 @@ pub(super) fn select(
     // Requalify an incumbent that challengers ran beside since its own check.
     // A failing incumbent invalidates the search: it must not survive as the
     // supposedly safe fallback. A replaced one was discarded already.
-    if !incumbent_checked {
+    let final_runs = options.final_qualification_runs.max(if incumbent_checked {
+        0
+    } else {
+        options.qualification_runs
+    });
+    if final_runs != 0 {
         let check = Instant::now();
         let result = (|| {
-            for _ in 0..options.qualification_runs {
+            for _ in 0..final_runs {
                 state.restore(&mut session)?;
                 refresh_inputs(&mut session)
                     .map_err(|error| format!("incumbent input refresh failed: {error}"))?;
                 session.step();
                 session.wait();
                 qualify(&session)?;
+                report.final_qualifications += 1;
             }
             Ok::<_, String>(())
         })();
@@ -777,7 +789,15 @@ mod tests {
             }),
             ..Default::default()
         });
-        for invalidate in [None, Some("candidate"), Some("baseline")] {
+        for (checkpoint_runs, final_runs, max_programs, invalidate) in [
+            (2, 0, 2, None),
+            (2, 0, 2, Some("candidate")),
+            (2, 0, 2, Some("baseline")),
+            (1, 2, 1, None),
+            (1, 2, 1, Some("baseline")),
+            (1, 2, 2, None),
+            (1, 2, 2, Some("baseline")),
+        ] {
             let initialized = std::cell::Cell::new(0);
             let mut repeated = 0;
             let programs = ["baseline", "candidate"].map(|name| {
@@ -795,7 +815,8 @@ mod tests {
                 gpu.clone(),
                 SessionOptions::default(),
                 BuildSearchOptions {
-                    qualification_runs: 2,
+                    qualification_runs: checkpoint_runs,
+                    final_qualification_runs: final_runs,
                     tuning: TuneOptions {
                         max_time: Duration::ZERO,
                         sample_pairs: 4,
@@ -807,7 +828,7 @@ mod tests {
                     warmup_runs: 2,
                     warmup_time: Duration::from_millis(1),
                     max_time: Duration::from_secs(30),
-                    max_programs: 2,
+                    max_programs,
                     max_submission_chunks: 2,
                     max_plan_bytes: 1 << 20,
                     ..Default::default()
@@ -823,11 +844,11 @@ mod tests {
                     Ok(())
                 },
                 |s| {
-                    if initialized.get() == 2
+                    if initialized.get() == max_programs
                         && invalidate.is_some_and(|name| s.plan().dispatches[0].label == name)
                     {
                         repeated += 1;
-                        if repeated == 2 {
+                        if repeated == if max_programs == 1 { 3 } else { 2 } {
                             return Err("injected repeatability failure".into());
                         }
                     }
@@ -858,9 +879,16 @@ mod tests {
             } else {
                 let (mut selected, report) = result.unwrap();
                 assert!(report.trials.iter().all(|t| t.outcome.qualified));
-                // Nothing to probe, and the challenger lost: two checks each,
-                // with the in-program parameter update reset before every run.
-                assert!(report.trials.iter().all(|t| t.qualifications == 2));
+                // Single-check exploration still checks the final program twice,
+                // including the untuned fallback, with its update reset each time.
+                assert!(
+                    report
+                        .trials
+                        .iter()
+                        .all(|t| t.qualifications == checkpoint_runs)
+                );
+                assert_eq!(report.final_qualifications, 2);
+                assert_eq!(report.trials.len(), max_programs);
                 assert!(
                     report
                         .trials
