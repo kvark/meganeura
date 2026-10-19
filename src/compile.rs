@@ -580,6 +580,17 @@ impl ShaderEntry {
         )
     }
 
+    /// Forward implicit-GEMM convolutions sharing the same parameter layout.
+    pub const fn is_conv2d_gemm(&self) -> bool {
+        matches!(
+            self,
+            Self::Conv2dGemm
+                | Self::Conv2dGemmSmall
+                | Self::Conv2dGemm16
+                | Self::Conv2dGemmCoopGen(..)
+        )
+    }
+
     pub const fn is_attention(&self) -> bool {
         matches!(
             self,

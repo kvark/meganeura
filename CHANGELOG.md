@@ -1,10 +1,10 @@
 # Unreleased
 
-- Measured construction can opt into device-qualified F16/BF16 multiplication
-  candidates for dense products and forward convolutions, with F32 storage and
-  outputs. Checked rectangular subgroup tiles and dense workgroup tuning remain
+- Measured construction automatically considers device-qualified BF16
+  multiplication for eligible dense products and forward convolutions under
+  `CoopPolicy::Auto`, with F32 storage and outputs. Checked rectangular subgroup tiles and dense workgroup tuning remain
   subject to whole-program accuracy and timing gates. Unsupported arithmetic is
-  reported and omitted before construction; strict policies reject the opt-in.
+  reported and omitted before construction; strict policies keep their F32 paths.
 
 - Measured construction accepts `BuildSearchOptions::qualification_runs` to
   check repeated executions of each candidate outside timing. Persistent

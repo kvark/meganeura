@@ -3239,7 +3239,9 @@ pub struct SessionOptions {
 pub enum CoopPolicy {
     /// Prefer f32 operands and accumulators. On f16-only devices, enable f16 tiles for
     /// work that permits reduced input precision; `requires_full_precision`
-    /// dispatches retain scalar f32 operands.
+    /// dispatches retain scalar f32 operands. Measured search also considers
+    /// device-qualified BF16 multiplication for eligible forward products,
+    /// subject to the caller's whole-program accuracy and timing gates.
     #[default]
     Auto,
     /// Allow only f32 cooperative operands and accumulators, without f16
@@ -3252,7 +3254,9 @@ pub enum CoopPolicy {
     Disabled,
     /// Use f16 tiles without residual compensation, including for
     /// derivative work. Faster than [`Self::Auto`] on f16-only devices,
-    /// and can overflow or lose gradient range.
+    /// and can overflow or lose gradient range. Measured search also considers
+    /// device-qualified typed F16 candidates for eligible forward products,
+    /// subject to the caller's whole-program accuracy and timing gates.
     AllowF16,
 }
 
