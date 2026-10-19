@@ -303,7 +303,7 @@ fn native_signed_products_and_cancellation() {
 }
 
 /// The F16 storage contract includes subnormal operands. This is the 2^-15
-/// case that Mesa 26.0.3 flushes to zero on B570.
+/// case that B570 flushes without SPIR-V denormal preservation.
 #[test]
 fn f16_products_keep_subnormal_operands() {
     let gpu = crate::support::gpu::gpu();
