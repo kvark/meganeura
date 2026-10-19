@@ -229,6 +229,9 @@ pub(super) fn select(
     if options.max_programs == 0 || options.max_time.is_zero() {
         return Err("program search needs a positive program and time budget".into());
     }
+    if options.qualification_runs == 0 {
+        return Err("program search needs at least one qualification run".into());
+    }
     let mut selection = options.tuning.clone();
     selection.min_improvement = options.min_improvement;
     selection.validate().map_err(|error| error.to_string())?;
@@ -1234,6 +1237,22 @@ mod tests {
     #[test]
     fn untuned_fallback_survives_bounds_and_failed_tuning() {
         let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
+        assert!(
+            select(
+                [],
+                gpu.clone(),
+                SessionOptions::default(),
+                BuildSearchOptions {
+                    qualification_runs: 0,
+                    ..Default::default()
+                },
+                |_, _| panic!("invalid options must fail before initialization"),
+                |_| panic!("invalid options must fail before qualification"),
+            )
+            .err()
+            .unwrap()
+            .contains("at least one qualification run")
+        );
         let mut graph = crate::Graph::new();
         let x = graph.input("x", &[33, 17]);
         let w = graph.parameter("w", &[17, 65]);

@@ -22,6 +22,7 @@ pub struct BuildSearchOptions {
     /// timing. More than one lets a caller verify a program's repeatability
     /// independently of numerical differences between candidate programs.
     /// Persistent writes and representative inputs are reset before each run.
+    /// Repeated checks require `refresh_inputs` to upload identical data.
     pub qualification_runs: u32,
     /// Bound on graph/implementation forms, including ordinary extraction.
     pub max_graphs: usize,
@@ -185,6 +186,8 @@ pub fn build_measured(
 ///
 /// Match how the application feeds inputs: host uploads can change subsequent
 /// execution costs even when the upload itself is outside the step timer.
+/// `refresh_inputs` must upload identical representative data on every call,
+/// including repeated qualification runs; it must not advance through a dataset.
 pub fn build_measured_with_inputs(
     forward_graph: &Graph,
     mut cfg: SessionConfig<'_>,
