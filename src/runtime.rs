@@ -1362,7 +1362,7 @@ pub fn typed_matrix_supported(gpu: &Arc<Gpu>, multiply: crate::DType) -> bool {
 /// Whether the checked F16 product keeps subnormal operands on this device,
 /// once per context. The F16 storage contract includes them (2^-24 to 2^-14),
 /// but a listed tile shape does not promise them: some drivers flush them in
-/// cooperative products, as Mesa 26.0.3 does on B570.
+/// cooperative products unless the shader requests denormal preservation.
 fn f16_subnormals_qualified(gpu: &Arc<Gpu>) -> bool {
     // A listed `Weak` keeps its context address from being reused.
     type Probe = (std::sync::Weak<Gpu>, bool);
@@ -3240,7 +3240,7 @@ pub enum CoopPolicy {
     /// Prefer f32 operands and accumulators. On f16-only devices, enable f16 tiles for
     /// work that permits reduced input precision; `requires_full_precision`
     /// dispatches retain scalar f32 operands. Measured search also considers
-    /// device-qualified BF16 multiplication for eligible forward products,
+    /// device-qualified BF16 and rectangular F16 multiplication for forward products,
     /// subject to the caller's whole-program accuracy and timing gates.
     #[default]
     Auto,

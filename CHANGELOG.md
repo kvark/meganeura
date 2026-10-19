@@ -1,6 +1,6 @@
 # Unreleased
 
-- Measured construction automatically considers device-qualified BF16
+- Measured construction automatically considers device-qualified BF16 and rectangular F16
   multiplication for eligible dense products and forward convolutions under
   `CoopPolicy::Auto`, with F32 storage and outputs. Checked rectangular subgroup tiles and dense workgroup tuning remain
   subject to whole-program accuracy and timing gates. Unsupported arithmetic is
@@ -46,7 +46,7 @@
   cooperative kernel, with F16 multiplication and F32 accumulation, on devices
   with F16 storage and 16x16x16 or 8x16x16 F16/F32 cooperative matrices that
   keep subnormal F16 operands. A one-time probe per context checks the latter;
-  Mesa 26.0.3 on B570 flushes them and is rejected. Other F16 left operands and
+  Blade requests SPIR-V denormal preservation where supported. Other F16 left operands and
   reduced addends are rejected at compile time: the ordinary kernels honor
   reduced storage only in B and read them as F32.
 - Typed cooperative products take part in bounded kernel tuning. Their types
@@ -59,7 +59,7 @@
   Qualification runs on private scratch in the operands' storage types against
   references built from operands rounded to the multiplication type. Classes
   with no applicable challenger are left out before the class limit. The
-  kernel memo revision is now 7. Workgroup dimensions, invocations, user and
+  kernel memo revision is now 8. Workgroup dimensions, invocations, user and
   reserved shared memory are checked against the device before compilation;
   partial tiles, unsupported devices and incompatible fusions keep their
   existing kernels. Cached automatic choices respect the new session's precision
@@ -71,6 +71,12 @@
   Incomplete vector bindings, rectangular tiles and implicit-GEMM convolutions
   retain their checked implementation. Pipeline keys include the storage layout,
   and split-K keeps the existing partition boundaries and F32 partials.
+- Checked 8x16x16 products keep two accumulators per logical 16x16 tile,
+  sharing operand staging and barriers across both halves. This avoids
+  repeating the K loop on devices with 32-lane subgroups.
+- Measured arithmetic search can replace scalar layouts extracted during the
+  same search, retaining split-K partial buffers and reductions. Caller-supplied
+  layouts and precision-protected products remain fixed.
 - The Blade update conditionally enables Vulkan memory-model emission for every
   shader on devices that advertise it, including existing F32/F16 kernels. The
   matching Naga fork carries the BF16 cooperative-matrix and corrected Vulkan

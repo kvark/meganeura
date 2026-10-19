@@ -69,8 +69,8 @@ hf-hub = ["dep:hf-hub"]
 profiler = ["dep:tracing-subscriber"]
 
 [dependencies]
-# Merged workgroup matrices, per-entry validation, and unified BF16 capability.
-blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "4845d6529c38b07718a624bf3c4f2ab4317c9bf4" }
+# FP16 denormal preservation: https://github.com/kvark/blade/pull/416.
+blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "eae0c6f7aa3167c79d1135050cf8e17c17fabd0a" }
 blade-macros = "0.3"
 # `default-features = false` drops egglog's `bin` stack (clap, mimalloc,
 # env_logger, chrono, graphviz); library builds use the shared rewrite engine.
@@ -96,7 +96,7 @@ tracing-subscriber = { version = "0.3", optional = true, features = ["registry"]
 # downstream crates that just want the inference runtime.
 [dev-dependencies]
 # Shader validation and SPIR-V inspection for tests and developer tools.
-naga = { git = "https://github.com/kvark/wgpu", rev = "13f582ddd2792befb46952498010248bd65818e6", version = "30", default-features = false, features = ["wgsl-in", "spv-out"] }
+naga = { git = "https://github.com/kvark/wgpu", rev = "a489554c96f87cbc5252ee00350730f6e93869f9", version = "30", default-features = false, features = ["wgsl-in", "spv-out"] }
 # Replay small paired timing differences without lossy f64 JSON parsing.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 env_logger = "0.11"

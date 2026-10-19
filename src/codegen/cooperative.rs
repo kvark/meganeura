@@ -157,10 +157,7 @@ pub(super) fn generate(group: ShaderGroup, types: MatrixTypes, shape: [u32; 3]) 
             ("$B_TILE", &format!("coop_mat{n}x{k}<{multiply}, B>")),
             ("$C_TILE", &format!("coop_mat{n}x{m}<f32, C>")),
             ("$MULTIPLY_TYPE", multiply),
-            ("$TILES_N", &(32 / n).to_string()),
-            ("$TILES", &(32 / m * (32 / n)).to_string()),
             ("$TILE_M", &m.to_string()),
-            ("$TILE_N", &n.to_string()),
         ],
     ))
 }

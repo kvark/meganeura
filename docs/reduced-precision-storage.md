@@ -41,8 +41,9 @@ Two explicit F16 operands select the same typed kernel with F16 multiplication,
 F32 accumulation and the same K partitions, given Blade's `shader_float16` and
 an F16/F32 cooperative shape. The F16 contract also includes subnormal operands
 (2^-24 to 2^-14), which a listed shape does not promise: session construction
-runs a one-time exact probe per context and rejects devices that flush them, as
-Mesa 26.0.3 does on B570. `runtime::typed_matrix_supported` reports all three
+runs a one-time exact probe per context and rejects devices that flush them.
+Blade requests SPIR-V `DenormPreserve 16` where supported, which lets B570
+preserve these values. `runtime::typed_matrix_supported` reports all three
 requirements. BF16 subnormals lie in F32's range and follow its handling. The
 ordinary dense kernels honor reduced storage
 only in B (`WeightFormat`), so any other F16 left operand, and any reduced
@@ -76,7 +77,9 @@ winner still needs whole-program qualification when used by measured build
 search; isolated kernel correctness and speed are not model acceptance.
 
 Measured construction automatically considers BF16 multiplication under
-`CoopPolicy::Auto`, alongside its existing F32/F16 paths.
+`CoopPolicy::Auto`, alongside its existing F32/F16 paths. Devices whose F16
+tiles are rectangular also consider typed F16 candidates, since the ordinary
+F16 path requires square tiles.
 `NativeF32` and `Disabled` retain their ordinary precision/selection restrictions;
 `AllowF16` adds typed F16 candidates alongside its existing F16 paths.
 There is no separate BF16 opt-in. `BuildSearchReport::matrix_inputs` records the
@@ -89,14 +92,19 @@ remains the first fallback. Arithmetic alternatives enter under the existing
 time/program bounds and require the caller's full-program accuracy and timing
 gates. Smaller scalar incumbents can expose workgroup tiles through these typed
 alternatives. Permitting BF16 is not a claim that it is selected or faster.
+Arithmetic alternatives may replace scalar layouts extracted during the same
+search, preserving split-K partial buffers and reductions. Graphs with
+caller-supplied matrix layouts keep those layouts; protected derivatives and
+unsupported fusions are also left unchanged.
 
 This is not autocast or complete mixed-precision training. BF16 graph inputs,
 parameters, outputs and unsupported operations reject explicitly; only internal
 conversion, pointwise, dense-matrix and convolution storage is supported. Check
 Blade's `shader_bfloat16` and `bf16_f32_shapes`; cooperative products select
 `[16,16,16]` or `[8,16,16]` in M×N×K order. The latter enables Xe2 (B570):
-eight rectangular tiles cover the same 32×32 output block, with the same
-checked tails and 32-element K partitions. Dense products, fused addends and
+with 32-lane subgroups, four logical 16×16 tiles each keep two accumulators, sharing
+staging and barriers across both halves. They cover the same 32×32 output
+block, with checked tails and 32-element K partitions. Dense products, fused addends and
 implicit-GEMM convolutions use this shared loop. Devices without those features retain the existing
 F32/F16 paths. No default graph is automatically narrowed. Explicit BF16
 matrix stores and pointwise conversion boundaries fuse: pointwise arithmetic

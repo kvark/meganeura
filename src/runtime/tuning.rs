@@ -41,8 +41,7 @@ pub struct KernelMemo {
 
 // Bump when kernel generation, qualification or decision semantics change,
 // including changes between package releases. This also versions the memo schema.
-// Revision 7 adds workgroup candidates to revision 6's race decisions.
-const KERNEL_MEMO_REVISION: u32 = 7;
+const KERNEL_MEMO_REVISION: u32 = 8;
 
 /// Undecided classes predicted to total less than this share of the plan are
 /// not probed. Kernel winners are accepted together, so classes well below
