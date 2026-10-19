@@ -75,18 +75,20 @@ and protected derivative regions retain their existing precision. A kernel
 winner still needs whole-program qualification when used by measured build
 search; isolated kernel correctness and speed are not model acceptance.
 
-Measured construction can opt into additional arithmetic with
-`BuildSearchOptions::matrix_inputs = vec![DType::F16, DType::BF16]` under
-`CoopPolicy::Auto` or `AllowF16`. The default is empty. Each type creates
-whole-program alternatives for eligible forward dense products and convolutions,
-keeping F32 storage, output and protected derivatives. Device probes filter
-unsupported types before constructing candidates and report the omissions in
-`unsupported_matrix_inputs`; this avoids an F16 construction panic on B570.
-The ordinary program remains the first fallback. Arithmetic alternatives enter
-early under the existing time/program bounds and still require the caller's
-full-program accuracy and timing gates. Smaller scalar incumbents can now expose
-workgroup tiles through these typed alternatives. Permitting BF16 is not a claim
-that it is selected or faster.
+Measured construction automatically considers BF16 multiplication under
+`CoopPolicy::Auto`, alongside its existing F32/F16 paths.
+`NativeF32` and `Disabled` retain their ordinary precision/selection restrictions;
+`AllowF16` adds typed F16 candidates alongside its existing F16 paths.
+There is no separate BF16 opt-in. `BuildSearchReport::matrix_inputs` records the
+additional arithmetic allowed by the runtime policy. Device probes filter
+unsupported types and report them in `unsupported_matrix_inputs`.
+
+BF16 alternatives cover eligible forward dense products and convolutions,
+keeping F32 storage, output and protected derivatives. The ordinary program
+remains the first fallback. Arithmetic alternatives enter under the existing
+time/program bounds and require the caller's full-program accuracy and timing
+gates. Smaller scalar incumbents can expose workgroup tiles through these typed
+alternatives. Permitting BF16 is not a claim that it is selected or faster.
 
 This is not autocast or complete mixed-precision training. BF16 graph inputs,
 parameters, outputs and unsupported operations reject explicitly; only internal

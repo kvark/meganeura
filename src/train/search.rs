@@ -19,11 +19,6 @@ const ARITHMETIC_LAYOUTS: usize = 5;
 
 #[derive(Clone, Serialize)]
 pub struct BuildSearchOptions {
-    /// Optional reduced multiplication types for dense products and forward convolutions.
-    /// Storage, outputs and precision-protected derivatives remain F32. Each
-    /// complete program must pass the caller's accuracy and timing gates.
-    /// Unsupported device types are omitted; the ordinary program stays first.
-    pub matrix_inputs: Vec<crate::DType>,
     /// Fresh executions checked at each qualification checkpoint, outside
     /// timing. More than one lets a caller verify a program's repeatability
     /// independently of numerical differences between candidate programs.
@@ -74,7 +69,6 @@ pub struct BuildSearchOptions {
 impl Default for BuildSearchOptions {
     fn default() -> Self {
         Self {
-            matrix_inputs: Vec::new(),
             qualification_runs: 1,
             max_graphs: 16,
             tuning: TuneOptions::default(),
@@ -94,6 +88,9 @@ impl Default for BuildSearchOptions {
 #[derive(Default, Serialize)]
 pub struct BuildSearchReport {
     pub options: BuildSearchOptions,
+    /// Additional arithmetic candidates allowed by the runtime cooperative policy.
+    /// Unsupported device types are listed separately below.
+    pub matrix_inputs: Vec<crate::DType>,
     /// Extracted forms, indexed by the `graph=N` trial descriptions.
     pub graphs: Vec<String>,
     pub extraction_truncated: bool,
@@ -207,20 +204,6 @@ pub fn build_measured_with_inputs(
 ) -> Result<(Session, BuildSearchReport), String> {
     let start = Instant::now();
     let _span = tracing::info_span!("build_measured").entered();
-    if options
-        .matrix_inputs
-        .iter()
-        .any(|ty| !matches!(ty, crate::DType::F16 | crate::DType::BF16))
-        || (!options.matrix_inputs.is_empty()
-            && !matches!(
-                cfg.runtime.coop,
-                crate::CoopPolicy::Auto | crate::CoopPolicy::AllowF16
-            ))
-    {
-        return Err(
-            "reduced matrix candidates require F16/BF16 and a permissive cooperative policy".into(),
-        );
-    }
     if cfg.cache.is_some() {
         return Err("measured construction does not use the ordinary build-plan cache".into());
     }
@@ -335,15 +318,15 @@ pub fn build_measured_with_inputs(
         && cfg.optimize.mode != optimize::OptimizeMode::Off
         && options.max_graphs > 1
     {
-        let space = backward_layouts(
+        let (space, ranks) = backward_layouts(
             graphs,
             cfg.optimize,
             target,
             options.max_graphs,
             start + options.max_time,
             &mut skipped_regions,
-            &mut backward_ranks,
         );
+        backward_ranks = ranks;
         graphs = space.candidates;
         extraction_truncated |= space.truncated;
     }
@@ -368,13 +351,19 @@ pub fn build_measured_with_inputs(
             });
         }
     }
-    let (matrix_inputs, unsupported_matrix_inputs): (Vec<_>, Vec<_>) = options
-        .matrix_inputs
+    // Arithmetic permission belongs to the runtime policy, not a second opt-in.
+    // Existing Auto F16 paths remain ordinary candidates; add the missing BF16 axis.
+    let matrix_inputs = match cfg.runtime.coop {
+        crate::CoopPolicy::Auto => vec![crate::DType::BF16],
+        crate::CoopPolicy::AllowF16 => vec![crate::DType::F16],
+        crate::CoopPolicy::NativeF32 | crate::CoopPolicy::Disabled => Vec::new(),
+    };
+    let (supported, unsupported_matrix_inputs): (Vec<_>, Vec<_>) = matrix_inputs
         .iter()
         .copied()
         .partition(|&ty| runtime::typed_matrix_supported(&gpu, ty));
     let mut programs = implementations(seeds, caps, shared_memory_bytes, options.max_plan_bytes);
-    programs.enable_matrix_inputs(&matrix_inputs, &gpu.capabilities());
+    programs.enable_matrix_inputs(&supported, &gpu.capabilities());
     let preparation_time = start.elapsed();
     measure::select(
         programs,
@@ -385,6 +374,7 @@ pub fn build_measured_with_inputs(
             graphs: expressions,
             extraction_truncated,
             skipped_regions,
+            matrix_inputs,
             unsupported_matrix_inputs,
             preparation_time,
             ..Default::default()
@@ -403,9 +393,8 @@ fn backward_layouts(
     limit: usize,
     deadline: Instant,
     skipped: &mut Vec<String>,
-    ranks: &mut Vec<usize>,
-) -> optimize::search::SearchSpace {
-    ranks.clear();
+) -> (optimize::search::SearchSpace, Vec<usize>) {
+    let mut ranks = Vec::new();
     let mut layouts: Vec<Option<collections::VecDeque<optimize::search::Candidate>>> =
         (0..graphs.len()).map(|_| None).collect();
     let mut candidates = Vec::new();
@@ -419,10 +408,13 @@ fn backward_layouts(
             continue;
         }
         if candidates.len() == limit || Instant::now() >= deadline {
-            return optimize::search::SearchSpace {
-                candidates,
-                truncated: true,
-            };
+            return (
+                optimize::search::SearchSpace {
+                    candidates,
+                    truncated: true,
+                },
+                ranks,
+            );
         }
         let graph = &graphs[index];
         if layout == 0 {
@@ -453,10 +445,13 @@ fn backward_layouts(
             });
         }
     }
-    optimize::search::SearchSpace {
-        candidates,
-        truncated: truncated || layouts.iter().flatten().any(|pending| !pending.is_empty()),
-    }
+    (
+        optimize::search::SearchSpace {
+            candidates,
+            truncated: truncated || layouts.iter().flatten().any(|pending| !pending.is_empty()),
+        },
+        ranks,
+    )
 }
 
 struct Seed {
@@ -740,7 +735,7 @@ impl Implementations {
                 || !self
                     .seeds
                     .iter()
-                    .any(|s| matrix_candidates(&mut s.plan.clone(), multiply) > 0)
+                    .any(|s| fill_matrix_candidates(&mut s.plan.clone(), multiply) > 0)
             {
                 continue;
             }
@@ -759,22 +754,24 @@ impl Implementations {
 /// Checked typed products preserve the F32 binding contract, including tails.
 /// Conversion happens inside each timed dispatch. This also reaches rectangular
 /// subgroup shapes and workgroup tuning without the legacy square-tile heuristic.
-fn matrix_candidates(plan: &mut ExecutionPlan, multiply: crate::DType) -> usize {
+fn fill_matrix_candidates(plan: &mut ExecutionPlan, multiply: crate::DType) -> usize {
     let mut count = 0;
     for d in &mut plan.dispatches {
-        if matches!(
-            d.shader,
-            compile::ShaderEntry::Conv2dGemm
-                | compile::ShaderEntry::Conv2dGemmSmall
-                | compile::ShaderEntry::Conv2dGemm16
-                | compile::ShaderEntry::Conv2dGemmCoopGen(..)
-        ) && !d.requires_full_precision
+        if d.shader.is_conv2d_gemm()
+            && !d.requires_full_precision
             && !d.schedule_locked
             && d.matmul_epilogue.is_none()
             && d.extra_outputs.is_empty()
             && d.weight_format == compile::WeightFormat::F32
         {
             let p = &d.params;
+            let Some(positions) = p[9].checked_mul(p[10]) else {
+                continue;
+            };
+            let grid = [p[4].div_ceil(32), positions.div_ceil(32), p[0]];
+            if !compile::workgroups_within_portable_limits(grid) {
+                continue;
+            }
             d.shader = compile::ShaderEntry::Conv2dGemmCoopGen(p[5], p[6], p[7]);
             d.kernel = compile::Kernel::CooperativeTyped {
                 types: crate::codegen::MatrixTypes {
@@ -783,23 +780,19 @@ fn matrix_candidates(plan: &mut ExecutionPlan, multiply: crate::DType) -> usize 
                 },
                 splits: 1,
             };
-            d.workgroups = [p[4].div_ceil(32), (p[9] * p[10]).div_ceil(32), p[0]];
+            d.workgroups = grid;
             count += 1;
             continue;
         }
 
-        if !matches!(
-            d.shader,
-            compile::ShaderEntry::MatMul
-                | compile::ShaderEntry::MatMulAT
-                | compile::ShaderEntry::MatMulBT
-                | compile::ShaderEntry::FusedMatMulAdd
-                | compile::ShaderEntry::FusedMatMulATAdd
-                | compile::ShaderEntry::FusedMatMulBTAdd
-        ) || !matches!(
-            d.kernel,
-            compile::Kernel::Default | compile::Kernel::SmallTile | compile::Kernel::Cooperative
-        ) || d.requires_full_precision
+        if !d.shader.is_matmul()
+            || !matches!(
+                d.kernel,
+                compile::Kernel::Default
+                    | compile::Kernel::SmallTile
+                    | compile::Kernel::Cooperative
+            )
+            || d.requires_full_precision
             || d.schedule_locked
             || d.horizontal_batch > 1
             || d.weight_format != compile::WeightFormat::F32
@@ -812,6 +805,10 @@ fn matrix_candidates(plan: &mut ExecutionPlan, multiply: crate::DType) -> usize 
         if m <= 1 || n == 0 || k == 0 {
             continue;
         }
+        let grid = [m.div_ceil(32), n.div_ceil(32), 1];
+        if !compile::workgroups_within_portable_limits(grid) {
+            continue;
+        }
         d.kernel = compile::Kernel::CooperativeTyped {
             types: crate::codegen::MatrixTypes {
                 multiply,
@@ -819,7 +816,7 @@ fn matrix_candidates(plan: &mut ExecutionPlan, multiply: crate::DType) -> usize 
             },
             splits: 1,
         };
-        d.workgroups = [m.div_ceil(32), n.div_ceil(32), 1];
+        d.workgroups = grid;
         count += 1;
     }
     count
@@ -906,7 +903,7 @@ impl measure::Frontier for Implementations {
                 plan
             };
             if let Some(multiply) = matrix_inputs {
-                if matrix_candidates(&mut plan, multiply) == 0 {
+                if fill_matrix_candidates(&mut plan, multiply) == 0 {
                     continue;
                 }
             }
@@ -1039,7 +1036,7 @@ mod tests {
         for d in &mut plan.dispatches {
             d.requires_full_precision = true;
         }
-        assert_eq!(matrix_candidates(&mut plan, crate::DType::F16), 0);
+        assert_eq!(fill_matrix_candidates(&mut plan, crate::DType::F16), 0);
     }
 
     #[test]
@@ -1054,8 +1051,11 @@ mod tests {
         plan.dispatches[index].kernel = compile::Kernel::Cooperative;
         let mut protected = plan.clone();
         protected.dispatches[index].requires_full_precision = true;
-        assert_eq!(matrix_candidates(&mut protected, crate::DType::BF16), 0);
-        assert_eq!(matrix_candidates(&mut plan, crate::DType::BF16), 1);
+        assert_eq!(
+            fill_matrix_candidates(&mut protected, crate::DType::BF16),
+            0
+        );
+        assert_eq!(fill_matrix_candidates(&mut plan, crate::DType::BF16), 1);
         assert!(matches!(plan.dispatches[index].kernel,
             compile::Kernel::CooperativeTyped { types, splits: 1 }
                 if types.multiply == crate::DType::BF16 && types.a == crate::DType::F32
@@ -1063,12 +1063,51 @@ mod tests {
     }
 
     #[test]
-    fn bf16_candidate_survives_fp16_overflow_without_relaxing_the_gate() {
+    fn matrix_candidates_preserve_dispatches_outside_portable_limits() {
+        let frontier = matrix_frontier();
+        for convolution in [false, true] {
+            for (extent, valid) in [(0, false), (65_535 * 32, true), (65_535 * 32 + 1, false)] {
+                let mut plan = frontier.seeds[0].plan.clone();
+                let dispatch = plan
+                    .dispatches
+                    .iter_mut()
+                    .find(|d| d.mnk().is_some())
+                    .unwrap();
+                if convolution {
+                    dispatch.shader = compile::ShaderEntry::Conv2dGemm;
+                    dispatch.params = vec![1, 1, 1, 1, 32, 1, 1, 1, 0, extent, 1];
+                } else {
+                    dispatch.params[0] = extent;
+                }
+                let original = plan.dispatches.clone();
+                assert_eq!(
+                    fill_matrix_candidates(&mut plan, crate::DType::BF16),
+                    usize::from(valid)
+                );
+                if !valid {
+                    assert_eq!(plan.dispatches, original);
+                }
+            }
+        }
+        let mut plan = frontier.seeds[0].plan.clone();
+        let dispatch = plan
+            .dispatches
+            .iter_mut()
+            .find(|d| d.mnk().is_some())
+            .unwrap();
+        dispatch.shader = compile::ShaderEntry::Conv2dGemm;
+        dispatch.params = vec![1, 1, 1, 1, 32, 1, 1, 1, 0, u32::MAX, 2];
+        let original = plan.dispatches.clone();
+        assert_eq!(fill_matrix_candidates(&mut plan, crate::DType::BF16), 0);
+        assert_eq!(plan.dispatches, original);
+    }
+
+    #[test]
+    fn auto_searches_bf16_beyond_fp16_range_without_relaxing_the_gate() {
         let gpu = crate::reference::gpu::shared_context();
         if !gpu.capabilities().shader_bfloat16 {
             return;
         }
-        let f16_supported = runtime::typed_matrix_supported(&gpu, crate::DType::F16);
         let frontier = matrix_frontier();
         let graph = &frontier.seeds[0].graph;
         let (_, report) = build_measured(
@@ -1079,7 +1118,6 @@ mod tests {
                 ..Default::default()
             },
             BuildSearchOptions {
-                matrix_inputs: vec![crate::DType::F16, crate::DType::BF16],
                 max_graphs: 1,
                 max_programs: 8,
                 max_time: Duration::from_secs(15),
@@ -1108,20 +1146,7 @@ mod tests {
             },
         )
         .unwrap();
-        if f16_supported {
-            assert!(
-                report
-                    .trials
-                    .iter()
-                    .any(|t| t.description.contains("matrix_inputs=F16") && !t.outcome.qualified)
-            );
-        } else {
-            assert!(
-                report
-                    .unsupported_matrix_inputs
-                    .contains(&crate::DType::F16)
-            );
-        }
+        assert_eq!(report.matrix_inputs, [crate::DType::BF16]);
         assert!(
             report
                 .trials
@@ -1133,11 +1158,7 @@ mod tests {
     #[test]
     fn checked_convolution_candidates_keep_batch_padding_and_partial_tiles() {
         let gpu = crate::reference::gpu::shared_context();
-        let types: Vec<_> = [crate::DType::F16, crate::DType::BF16]
-            .into_iter()
-            .filter(|&ty| runtime::typed_matrix_supported(&gpu, ty))
-            .collect();
-        if types.is_empty() {
+        if !runtime::typed_matrix_supported(&gpu, crate::DType::BF16) {
             return;
         }
         let mut graph = Graph::new();
@@ -1147,31 +1168,18 @@ mod tests {
         graph.set_outputs(vec![y]);
         let input: Vec<f32> = (0..2 * 3 * 7 * 9).map(|i| (i % 11) as f32 / 16.0).collect();
         let weights: Vec<f32> = (0..5 * 3 * 3 * 3).map(|i| (i % 5) as f32 / 16.0).collect();
-        let mut expected = Vec::new();
-        for batch in 0..2 {
-            for channel in 0..5 {
-                for oh in 0..4 {
-                    for ow in 0..5 {
-                        let mut total = 0.0;
-                        for ic in 0..3 {
-                            for kh in 0..3 {
-                                for kw in 0..3 {
-                                    let ih = oh * 2 + kh - 1i32;
-                                    let iw = ow * 2 + kw - 1i32;
-                                    if (0..7).contains(&ih) && (0..9).contains(&iw) {
-                                        total += input[((batch * 3 + ic) * 7 + ih as usize) * 9
-                                            + iw as usize]
-                                            * weights[((channel * 3 + ic) * 3 + kh as usize) * 3
-                                                + kw as usize];
-                                    }
-                                }
-                            }
-                        }
-                        expected.push(total);
-                    }
-                }
-            }
-        }
+        let expected: Vec<f32> = crate::reference::evaluate_outputs(
+            &graph,
+            crate::reference::Feeds::new()
+                .set("x", &input)
+                .set("w", &weights),
+        )
+        .unwrap()
+        .remove(0)
+        .data
+        .into_iter()
+        .map(|v| v as f32)
+        .collect();
         let (_, report) = build_measured(
             &graph,
             SessionConfig {
@@ -1180,7 +1188,6 @@ mod tests {
                 ..Default::default()
             },
             BuildSearchOptions {
-                matrix_inputs: types.clone(),
                 max_graphs: 1,
                 max_programs: 8,
                 max_time: Duration::from_secs(15),
@@ -1207,23 +1214,28 @@ mod tests {
             },
         )
         .unwrap();
-        for ty in types {
-            assert!(
-                report
-                    .trials
-                    .iter()
-                    .any(|t| t.description.contains(&format!("matrix_inputs={ty:?}"))
-                        && t.outcome.qualified)
-            );
-        }
+        assert!(
+            report
+                .trials
+                .iter()
+                .any(|t| t.description.contains("matrix_inputs=BF16") && t.outcome.qualified)
+        );
     }
 
     #[test]
-    fn reduced_candidates_cannot_bypass_a_strict_runtime_policy() {
-        for coop in [crate::CoopPolicy::Disabled, crate::CoopPolicy::NativeF32] {
-            let result = build_measured(
-                &Graph::new(),
+    fn explicit_policies_search_only_their_allowed_arithmetic() {
+        let gpu = crate::reference::gpu::shared_context();
+        let frontier = matrix_frontier();
+        for coop in [
+            crate::CoopPolicy::Disabled,
+            crate::CoopPolicy::NativeF32,
+            crate::CoopPolicy::AllowF16,
+        ] {
+            let (_, report) = build_measured(
+                &frontier.seeds[0].graph,
                 SessionConfig {
+                    gpu: Some(gpu.clone()),
+                    mode: crate::Mode::Inference,
                     runtime: crate::SessionOptions {
                         coop,
                         ..Default::default()
@@ -1231,17 +1243,58 @@ mod tests {
                     ..Default::default()
                 },
                 BuildSearchOptions {
-                    matrix_inputs: vec![crate::DType::BF16],
+                    max_programs: 8,
+                    max_graphs: 1,
+                    warmup_runs: 1,
+                    warmup_time: Duration::ZERO,
+                    tuning: TuneOptions {
+                        max_time: Duration::from_millis(100),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                |_, _| panic!("invalid arithmetic must fail before initialization"),
-                |_| panic!("invalid arithmetic must fail before execution"),
-            );
+                |s, _| {
+                    s.set_input("x", &[0.25; 1024]);
+                    s.set_parameter("w", &[0.5; 1024]);
+                    Ok(())
+                },
+                |s| {
+                    assert_eq!(s.read_output(1024), [4.0; 1024]);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            if coop == crate::CoopPolicy::AllowF16 {
+                assert_eq!(report.matrix_inputs, [crate::DType::F16]);
+                if runtime::typed_matrix_supported(&gpu, crate::DType::F16) {
+                    assert!(report.unsupported_matrix_inputs.is_empty());
+                    assert!(report.trials.iter().any(|t| {
+                        t.description.contains("matrix_inputs=F16") && t.outcome.qualified
+                    }));
+                } else {
+                    assert_eq!(report.unsupported_matrix_inputs, [crate::DType::F16]);
+                    assert!(
+                        report
+                            .trials
+                            .iter()
+                            .all(|t| !t.description.contains("matrix_inputs="))
+                    );
+                }
+            } else {
+                assert!(report.matrix_inputs.is_empty());
+                assert!(report.unsupported_matrix_inputs.is_empty());
+                assert!(
+                    report
+                        .trials
+                        .iter()
+                        .all(|t| !t.description.contains("matrix_inputs="))
+                );
+            }
             assert!(
-                result
-                    .err()
-                    .unwrap()
-                    .contains("permissive cooperative policy")
+                report
+                    .trials
+                    .iter()
+                    .all(|t| !t.description.contains("matrix_inputs=BF16"))
             );
         }
     }
@@ -1757,7 +1810,6 @@ mod tests {
                 BuildSearchOptions {
                     max_graphs: 4,
                     qualification_runs: 1,
-                    matrix_inputs: Vec::new(),
                     tuning: TuneOptions {
                         max_time: Duration::from_secs(1),
                         sample_pairs: 4,
