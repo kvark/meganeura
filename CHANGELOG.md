@@ -10,6 +10,10 @@
   check repeated executions of each candidate outside timing. Persistent
   writes and representative inputs are restored before every qualification
   run, including final incumbent checks. The default remains one run.
+  `final_qualification_runs` independently requests fresh checks of the final
+  selected program, with estimated time reserved inside the soft search budget
+  and the completed count recorded as `final_qualifications`. Its default of
+  zero preserves the existing conditional incumbent recheck.
 - Kernel tuning defaults to `TuneStrategy::Race`: parallel compilation,
   shared forward/reverse timing rounds, conservative early elimination and
   finalist-only qualification. `TuneCalibration::Measure` caches

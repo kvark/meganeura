@@ -25,6 +25,12 @@ pub struct BuildSearchOptions {
     /// Persistent writes and representative inputs are reset before each run.
     /// Repeated checks require `refresh_inputs` to upload identical data.
     pub qualification_runs: u32,
+    /// Fresh qualification executions required after search selects its final
+    /// program, even when that program was just checked. Zero (the default)
+    /// adds no checks beyond requalifying an incumbent disturbed by challengers.
+    /// State and identical representative inputs are restored for every run.
+    /// Estimated cost is reserved within the soft search deadline.
+    pub final_qualification_runs: u32,
     /// Bound on graph/implementation forms, including ordinary extraction.
     pub max_graphs: usize,
     /// Per-challenger kernel tuning and shared paired sampling policy.
@@ -70,6 +76,7 @@ impl Default for BuildSearchOptions {
     fn default() -> Self {
         Self {
             qualification_runs: 1,
+            final_qualification_runs: 0,
             max_graphs: 16,
             tuning: TuneOptions::default(),
             min_improvement: 0.05,
@@ -106,8 +113,10 @@ pub struct BuildSearchReport {
     /// Stopped early because recent costs predict insufficient comparison time.
     pub deadline_reserved: bool,
     /// Requalification of the selected program after the last trial; zero
-    /// when nothing ran after its own check.
+    /// when nothing ran after its own check and no final checks were requested.
     pub final_qualification_time: Duration,
+    /// Successful fresh executions checked after selection, before returning.
+    pub final_qualifications: u32,
     /// Measured once, before the first trial that probes kernels, when tuning
     /// calibrates; every later trial's tuning is given it. Its time is in
     /// `elapsed`, and a profile cached for the context is reused.
@@ -141,8 +150,8 @@ pub struct BuildSearchReport {
 /// between the pre-tuning and post-tuning checkpoints.
 /// A challenger with an identical execution plan and submission count keeps the incumbent
 /// without warmup or paired timing. A winning challenger is qualified again after
-/// measurement. The selected program is checked before returning only if another
-/// challenger ran since its last check. A failing challenger is discarded; a
+/// measurement. The selected program is checked before returning if another
+/// challenger ran since its last check or `final_qualification_runs` requests it. A failing challenger is discarded; a
 /// failing final incumbent aborts construction.
 /// Written inputs, parameters and constants are reset before each step, outside
 /// timing. The returned session retains its initialized persistent state; outputs
@@ -1810,6 +1819,7 @@ mod tests {
                 BuildSearchOptions {
                     max_graphs: 4,
                     qualification_runs: 1,
+                    final_qualification_runs: 0,
                     tuning: TuneOptions {
                         max_time: Duration::from_secs(1),
                         sample_pairs: 4,
