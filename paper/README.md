@@ -31,6 +31,27 @@ the native-only search ablation against the cohort's PyTorch outputs and
 writes the ninth, `ablation.tex`. Both also emit CSV/JSON summaries. See the
 [artifact README](p3hpc/artifact/README.md) for details.
 
+### Presentation
+
+The main [talk](p3hpc/presentation/slides.md) combines the graphics-API argument,
+the compiler architecture, hardware access and limits, and measured results.
+It has 19 main slides (19:15 of suggested speaking time) and 11 backups.
+The alternative decks remain local references and are not part of this commit.
+
+The talk uses the later October 19 cohort: Inferena `add19182`, Meganeura
+`c19cb1c`, and PyTorch 2.13.0 at `cf30153c`. Its versioned chart inputs are
+independent of the submitted-paper tags and of the ongoing paper revision.
+See its [README](p3hpc/presentation/README.md) for exact pins and evidence scope.
+
+```sh
+bash paper/p3hpc/presentation/build.sh
+```
+
+This regenerates the figures with Matplotlib 3.11.2 via `uv` and the deck with
+Marp CLI 4.5.1 via `npx` (Node and a Chromium-compatible browser required).
+Generated SVGs, HTML, PDF and notes are ignored; only source and chart inputs
+are committed. No GPU or raw benchmark archive is needed for this build.
+
 ### Template and build
 
 The [workshop instructions](https://p3hpc.org/workshop/2026/submissions/)
