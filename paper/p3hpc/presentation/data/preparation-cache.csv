@@ -1,0 +1,8 @@
+device,first_count,first_seconds,reused_count,reused_seconds
+RTX 5070,10,63.55,20,61.00
+H100,10,65.72,20,64.49
+RTX 3050,10,68.78,20,67.13
+RX 7900 XT,10,59.28,20,58.67
+MI300X,10,63.09,20,61.30
+Arc B570,10,74.18,20,73.43
+Apple M3,10,69.89,20,67.34
