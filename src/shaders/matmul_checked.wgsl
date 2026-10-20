@@ -14,12 +14,17 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     $RANGE
     let row = group.x * 32u;
     let col = group.y * 32u;
-    // Four 16x16 output tiles; rectangular hardware tiles keep two accumulators.
+    // Pair rectangular tiles only when there are too few subgroups to cover
+    // all eight hardware tiles in one pass.
+    let subgroups = 128u / subgroup_size;
+    let paired = $TILE_Mu == 8u && subgroups < 8u;
+    let tile_rows = select($TILE_Mu, 16u, paired);
+    let tile_count = 64u / tile_rows;
     // Extra subgroups compute a valid tile but do not store it, keeping the
     // cooperative operations and workgroup barriers in uniform control flow.
-    for (var base = 0u; base < 4u; base += 128u / subgroup_size) {
+    for (var base = 0u; base < tile_count; base += subgroups) {
         let tile = base + subgroup;
-        let a_offset = ((tile % 4u) / 2u) * 16u * 32u;
+        let a_offset = ((tile % tile_count) / 2u) * tile_rows * 32u;
         let b_offset = (tile % 2u) * 16u;
         var accumulator = $C_TILE();
         var lower = $C_TILE();
@@ -43,7 +48,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
             let a1 = coopLoadT<$A_TILE>(&stage_a[a_offset + 16u], 32u);
             let b1 = coopLoadT<$B_TILE>(&stage_b[b_offset + 512u], 32u);
             accumulator = coopMultiplyAdd(a1, b1, accumulator);
-            if $TILE_Mu == 8u {
+            // A loop avoids Naga's conservative subgroup-size conditional check.
+            for (var lower_row = $TILE_Mu; lower_row < tile_rows; lower_row += $TILE_Mu) {
                 let a2 = coopLoadT<$A_TILE>(&stage_a[a_offset + 256u], 32u);
                 let a3 = coopLoadT<$A_TILE>(&stage_a[a_offset + 272u], 32u);
                 lower = coopMultiplyAdd(a2, b0, lower);
@@ -51,9 +57,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
             }
             workgroupBarrier();
         }
-        if tile < 4u {
+        if tile < tile_count {
             coopStoreT(accumulator, &result[a_offset + b_offset], 32u);
-            if $TILE_Mu == 8u {
+            if paired {
                 coopStoreT(lower, &result[a_offset + b_offset + 256u], 32u);
             }
         }
