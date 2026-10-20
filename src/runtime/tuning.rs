@@ -41,7 +41,7 @@ pub struct KernelMemo {
 
 // Bump when kernel generation, qualification or decision semantics change,
 // including changes between package releases. This also versions the memo schema.
-const KERNEL_MEMO_REVISION: u32 = 9;
+const KERNEL_MEMO_REVISION: u32 = 10;
 
 /// Undecided classes predicted to total less than this share of the plan are
 /// not probed. Kernel winners are accepted together, so classes well below
@@ -791,10 +791,11 @@ impl Session {
     /// deterministic nonzero input patterns (including tiny f32 operands).
     /// Both candidates must agree elementwise and unpacked matrices must also
     /// match sampled f64 reference dots with operands rounded to the selected
-    /// multiplication type. Sequential tuning qualifies every pair before
-    /// timing; races time first and qualify only finalists. A split product runs
-    /// with
-    /// its SumRows and keeps them: candidates vary its tile shape and its
+    /// multiplication type. Reference checks use maximum and
+    /// relative L2 bounds across samples to handle cancellation in long sums.
+    /// Sequential tuning qualifies every pair before timing; races time first
+    /// and qualify only finalists. A split product runs with its SumRows and
+    /// keeps them: candidates vary its tile shape and its
     /// partition count within the allocated partials, and agree within a bound
     /// that follows the largest output, since partitions reorder the sum.
     /// The result is an isolated-kernel choice, not an end-to-end speed claim.
@@ -1525,7 +1526,7 @@ impl Session {
                     let identical = variant == 1
                         && bytemuck::cast_slice::<f32, u8>(&baseline_outputs[pattern])
                             == bytemuck::cast_slice::<f32, u8>(&output);
-                    let agree = if class.key.split_k {
+                    let agree = if class.key.split_k || outcome.candidate_split_k.is_some() {
                         reordered_outputs_agree
                     } else {
                         outputs_agree
@@ -1684,31 +1685,19 @@ fn qualify_weight_range(
     if output.len() != class.output_elements() {
         return Err("incorrect output length".into());
     }
-    let mut error = 0.0;
-    let mut norm = 0.0;
-    for (index, &actual) in output.iter().enumerate() {
-        let reference = weight_reference_dot(
-            class,
-            inputs,
-            index / class.n as usize,
-            index % class.n as usize,
-            range.clone(),
-        );
-        if !reference.is_finite() || !close(reference, actual, scale) {
-            return Err(format!(
-                "element {index}: {actual:e}, f64 reference {reference:e}"
-            ));
-        }
-        error += (f64::from(actual) - reference).powi(2);
-        norm += reference * reference;
-    }
-    if !(norm > 0.0 && (error / norm).sqrt() <= 2e-4) {
-        return Err(format!(
-            "reference norm {norm:e}, relative L2 {}",
-            (error / norm).sqrt()
-        ));
-    }
-    Ok(())
+    qualify_reference(
+        output.iter().enumerate().map(|(index, &actual)| {
+            let reference = weight_reference_dot(
+                class,
+                inputs,
+                index / class.n as usize,
+                index % class.n as usize,
+                range.clone(),
+            );
+            (reference, actual)
+        }),
+        scale,
+    )
 }
 
 fn weight_reference_dot(
@@ -2447,7 +2436,7 @@ fn qualify_output(class: &TuneClass, inputs: &[Vec<f32>], output: &[f32], scale:
     let (m, n) = (class.m as usize, class.n as usize);
     // Explicit tile boundaries and last row/column, then scattered dots.
     let edges = [0, 1, 7, 8, 15, 16, 31, 32, 63, 64, usize::MAX];
-    for i in 0..32 {
+    let samples = (0..32).map(|i| {
         let row = if i == edges.len() {
             m - 1
         } else if i == edges.len() + 1 {
@@ -2479,15 +2468,50 @@ fn qualify_output(class: &TuneClass, inputs: &[Vec<f32>], output: &[f32], scale:
         } else {
             row
         };
-        if !close(
+        (
             reference_dot(class, inputs, row, col),
             output[row * n + col],
-            scale,
-        ) {
-            return false;
+        )
+    });
+    qualify_reference(samples, scale).is_ok()
+}
+
+/// Reduction outputs can cancel to almost zero. Bound maximum error relative
+/// to the largest reference and relative L2 error across the checked outputs,
+/// with an absolute floor scaled to the input pattern. Stream full split-K
+/// references so checking every partial does not need another output buffer.
+fn qualify_reference(
+    samples: impl ExactSizeIterator<Item = (f64, f32)>,
+    scale: f64,
+) -> Result<(), String> {
+    let count = samples.len();
+    let absolute = scale * 1e-5;
+    let mut largest = 0.0f64;
+    let mut maximum_error = 0.0f64;
+    let mut error = 0.0;
+    let mut norm = 0.0;
+    for (index, (expected, got)) in samples.enumerate() {
+        if !expected.is_finite() || !got.is_finite() {
+            return Err(format!(
+                "element {index}: {got:e}, f64 reference {expected:e}"
+            ));
         }
+        let delta = expected - f64::from(got);
+        largest = largest.max(expected.abs());
+        maximum_error = maximum_error.max(delta.abs());
+        error += delta * delta;
+        norm += expected * expected;
     }
-    true
+    let maximum_limit = absolute + largest * 2e-4;
+    let error_limit = norm * (2e-4f64).powi(2) + count as f64 * absolute.powi(2);
+    if maximum_error <= maximum_limit && error <= error_limit {
+        Ok(())
+    } else {
+        Err(format!(
+            "maximum error {maximum_error:e} (limit {maximum_limit:e}), \
+             squared error {error:e} (limit {error_limit:e})"
+        ))
+    }
 }
 
 /// One challenger at a time in structural class order, qualifying every
@@ -4639,6 +4663,94 @@ mod tests {
             [MatmulTile::CooperativeChecked { splits: 2 }]
         );
         assert_eq!(classes[0].reductions.len(), 1);
+    }
+
+    #[test]
+    fn reduction_cancellation_keeps_tiny_gradients_and_error_bounds() {
+        // A 12,544-term ResNet dW dot on B570 and RTX 5070. Its individual
+        // relative error is 4.6e-4 despite a sampled relative L2 error of 2.2e-6.
+        for scale in [1.0, 1e-12] {
+            let reference = [10.0 * scale, 0.18024646321934412 * scale];
+            let actual = [(10.0 * scale) as f32, (0.18016386032104492 * scale) as f32];
+            let agrees = |actual: [f32; 2]| {
+                qualify_reference(reference.into_iter().zip(actual), scale).is_ok()
+            };
+            assert!(!close(reference[1], actual[1], scale));
+            assert!(agrees(actual));
+            assert!(!agrees([0.0; 2]));
+            assert!(!agrees([actual[1], actual[0]]));
+            assert!(!agrees([(10.01 * scale) as f32, actual[1]]));
+            assert!(!agrees([f32::NAN, actual[1]]));
+            // Each error passes the maximum bound, but together they exceed L2.
+            assert!(!agrees([
+                actual[0] + (0.0018 * scale) as f32,
+                actual[1] + (0.0018 * scale) as f32,
+            ]));
+        }
+    }
+
+    #[test]
+    fn matrix_and_split_weight_references_accept_f32_cancellation() {
+        let k = 8192;
+        for convolution in [false, true] {
+            let dispatch = Dispatch {
+                workgroups: [1, 1, 1],
+                shader: if convolution {
+                    ShaderEntry::Conv2dGradWeightGemm
+                } else {
+                    ShaderEntry::MatMulAT
+                },
+                input_buffers: vec![BufferRef(0), BufferRef(1)],
+                output_buffer: BufferRef(2),
+                params: if convolution {
+                    vec![1, 2, 1, k as u32, 1, 1, 1, 1, 0, 1, k as u32, 0]
+                } else {
+                    vec![1, 2, k as u32, 0]
+                },
+                ..Default::default()
+            };
+            let class = TuneClass::from_dispatch(&dispatch, None).unwrap();
+            let offset = |inner, col| {
+                if convolution {
+                    col * k + inner
+                } else {
+                    inner * 2 + col
+                }
+            };
+            for scale in [1.0, 1e-12] {
+                let mut inputs = vec![vec![scale as f32; k], vec![0.0; 2 * k]];
+                for inner in 0..k {
+                    let position = inner % (k / 2);
+                    inputs[1][offset(inner, 0)] = if position == 0 { 10.0 } else { 0.0 };
+                    inputs[1][offset(inner, 1)] = match position {
+                        0 => 1.0,
+                        last if last == k / 2 - 1 => -1.0,
+                        _ => 1e-6,
+                    };
+                }
+                for range in [0..k, 0..k / 2, k / 2..k] {
+                    let mut actual = [0.0f32; 2];
+                    for inner in range.clone() {
+                        for col in 0..2 {
+                            actual[col] += inputs[0][inner] * inputs[1][offset(inner, col)];
+                        }
+                    }
+                    if range == (0..k) {
+                        assert!(!close(
+                            reference_dot(&class, &inputs, 0, 1),
+                            actual[1],
+                            scale
+                        ));
+                        assert!(qualify_output(&class, &inputs, &actual, scale));
+                    }
+                    if convolution {
+                        assert!(
+                            qualify_weight_range(&class, &inputs, &actual, scale, range).is_ok()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
