@@ -985,6 +985,25 @@ fn group_norm_autodiff() {
     failures.assert_none();
 }
 
+/// Statistics belong to a grouping, even when the tensor and epsilon match.
+#[test]
+fn group_norm_shared_input_different_groups() {
+    let mut g = Graph::new();
+    let x = g.parameter("x", &[2 * 8 * 7]);
+    let w = g.parameter("w", &[8]);
+    let b = g.parameter("b", &[8]);
+    let a = g.group_norm(x, w, b, 2, 8, 7, 2, 1e-3);
+    let b = g.group_norm(x, w, b, 2, 8, 7, 4, 1e-3);
+    let y = g.add(a, b);
+    let loss = gradients::weighted_loss(&mut g, y, 1420, 0.9);
+    g.set_outputs(vec![loss]);
+    let mut feeds = Feeds::new();
+    feeds.fill_random(&g, 1421, 1.0);
+    let mut failures = Failures::default();
+    autodiff(&mut failures, "group norms sharing input", &g, &feeds);
+    failures.assert_none();
+}
+
 /// Conv → GroupNorm → ReLU → MaxPool → Conv: each op's backward consumes
 /// another op's gradient, with batch 2.
 #[test]

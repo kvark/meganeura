@@ -216,8 +216,6 @@ impl<'a> Compiler<'a> {
         });
     }
 
-    /// Buffer already allocated for a `CrossEntropyLogitsGrad` on the same
-    /// `(logits, labels)` pair. Present only on training graphs.
     /// The (mean, inv_std) buffer for GroupNorm backward over `input`,
     /// emitting its dispatch the first time either gradient asks for it.
     pub(super) fn group_norm_grad_stats(
@@ -226,7 +224,7 @@ impl<'a> Compiler<'a> {
         [batch, channels, spatial, num_groups]: [u32; 4],
         eps: f32,
     ) -> BufferRef {
-        let key = (input, eps.to_bits());
+        let key = (input, [batch, channels, spatial, num_groups], eps.to_bits());
         if let Some(&stats) = self.group_norm_grad_stats.get(&key) {
             return stats;
         }
@@ -246,6 +244,8 @@ impl<'a> Compiler<'a> {
         stats
     }
 
+    /// Buffer already allocated for a `CrossEntropyLogitsGrad` on the same
+    /// `(logits, labels)` pair. Present only on training graphs.
     pub(super) fn ce_logits_grad_buffer(
         &self,
         logits: NodeId,
