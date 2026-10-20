@@ -1184,7 +1184,7 @@ impl SharedPipelines {
 struct Pipelines {
     map: HashMap<Variant, Arc<SharedPipeline>>,
     /// Resolved after compilation or tuning, never while recording a step.
-    selected: Vec<Variant>,
+    selected: Vec<Arc<SharedPipeline>>,
     /// Codegen knobs the plan was compiled with.
     knobs: crate::compile::TuningKnobs,
     /// Where to write every WGSL the pipeline layer compiles — [`SessionOptions::wgsl_dump_dir`].
@@ -2299,17 +2299,17 @@ impl Pipelines {
             .iter()
             .map(|dispatch| {
                 let key = Self::key(dispatch);
-                assert!(
-                    self.map.contains_key(&key),
-                    "no pipeline was compiled for {dispatch:?}"
-                );
-                key
+                Arc::clone(
+                    self.map
+                        .get(&key)
+                        .unwrap_or_else(|| panic!("no pipeline was compiled for {dispatch:?}")),
+                )
             })
             .collect();
     }
 
     fn get(&self, dispatch_index: usize) -> &blade_graphics::ComputePipeline {
-        &self.map[&self.selected[dispatch_index]].raw
+        &self.selected[dispatch_index].raw
     }
 
     fn all_pipelines(&self) -> Vec<(&str, &blade_graphics::ComputePipeline)> {
@@ -4964,7 +4964,11 @@ impl Session {
     /// fused RmsNorm, fused epilogue or prologue, attention width, or a
     /// generated pointwise/reduction kernel.
     pub fn dispatch_pipeline_keys(&self) -> Vec<String> {
-        self.pipelines.selected.iter().map(Variant::label).collect()
+        self.plan
+            .dispatches
+            .iter()
+            .map(|dispatch| Pipelines::key(dispatch).label())
+            .collect()
     }
 
     /// Shared handle to the underlying Blade GPU context.
@@ -5433,7 +5437,7 @@ mod variant_tests {
         }
         let pipelines: Vec<_> = first.pipelines.map.values().map(Arc::downgrade).collect();
         drop(first);
-        assert!(pipelines.iter().all(|p| p.strong_count() == 1));
+        assert!(pipelines.iter().all(|p| p.strong_count() != 0));
         drop(second);
         assert!(pipelines.iter().all(|p| p.strong_count() == 0));
         let other = super::Session::with_context(
@@ -6836,6 +6840,7 @@ impl Drop for Session {
         if let Some(staging) = self.readback.get_mut().staging.take() {
             self.gpu.destroy_buffer(staging.buffer);
         }
+        self.pipelines.selected.clear();
         self.pipelines.map.clear();
         // `buffers` holds aliased copies of these handles; destroy each
         // physical allocation exactly once.
