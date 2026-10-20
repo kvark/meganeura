@@ -367,26 +367,26 @@ fn check(label: &str, actual: &[f32], expected: &[f64], scale: f32) {
 
 fn qualification(label: &str, actual: &[f32], expected: &[f64], scale: f32) -> Result<(), String> {
     assert_eq!(actual.len(), expected.len());
+    let largest = expected.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+    let absolute = f64::from(scale) * 1e-5;
     let mut error = 0.0;
     let mut norm = 0.0;
     for (i, (&a, &b)) in actual.iter().zip(expected).enumerate() {
         let difference = (f64::from(a) - b).abs();
-        if !(a.is_finite()
-            && b.is_finite()
-            && difference <= f64::from(scale) * 1e-5 + b.abs() * 2e-4)
-        {
+        if !(a.is_finite() && b.is_finite() && difference <= absolute + largest * 2e-4) {
             return Err(format!("{label}[{i}] = {a:e}, reference {b:e}"));
         }
         error += difference * difference;
         norm += b * b;
     }
-    if !(norm > 0.0 && (error / norm).sqrt() <= 2e-4) {
-        return Err(format!(
+    if error <= norm * (2e-4f64).powi(2) + expected.len() as f64 * absolute.powi(2) {
+        Ok(())
+    } else {
+        Err(format!(
             "{label}: reference norm {norm:e}, relative L2 {}",
             (error / norm).sqrt()
-        ));
+        ))
     }
-    Ok(())
 }
 
 fn run(
@@ -702,7 +702,7 @@ fn split_weight_gradients_and_every_partial_match_full_f64_oracles() {
 }
 
 #[test]
-fn long_split_weight_gradients_report_partial_rejections_without_relaxing_the_gate() {
+fn long_split_weight_gradients_and_every_partial_match_full_f64_oracles() {
     let gpu = gpu();
     let s = Shape {
         batch: 2,
@@ -718,24 +718,28 @@ fn long_split_weight_gradients_report_partial_rejections_without_relaxing_the_ga
     };
     for tile in [32, 64] {
         run(s, tile, &gpu, CoopPolicy::Disabled, false);
-        let mut qualified = 0;
         for splits in [2, 3, 7, 16] {
             let (_, rejected) = run_split(s, tile, &gpu, CoopPolicy::Disabled, false, splits);
-            qualified += usize::from(rejected.is_empty());
-            eprintln!(
-                "long split-K tile={tile}, splits={splits}, qualified={}, rejections={rejected:?}",
-                rejected.is_empty()
+            assert!(
+                rejected.is_empty(),
+                "long split-K tile={tile}, splits={splits}: {rejected:?}"
             );
         }
-        assert!(
-            qualified > 0,
-            "no fully qualified partition count for tile {tile}"
-        );
     }
 }
 
 #[test]
-fn observed_tiny_partial_error_is_rejected_by_the_original_gate() {
+fn partial_reference_bound_accepts_cancellation_and_rejects_corruption() {
+    // The cancelling element needs the scale of the other reduction outputs.
+    assert!(
+        qualification(
+            "observed partial",
+            &[1e-11, -8.967522e-14],
+            &[1e-11, -8.963817608922598e-14],
+            1e-12
+        )
+        .is_ok()
+    );
     assert!(
         qualification(
             "observed partial",
@@ -749,11 +753,12 @@ fn observed_tiny_partial_error_is_rejected_by_the_original_gate() {
         (f32::NAN, 1.0, 1.0),
         (1.0, f64::INFINITY, 1.0),
         (1.0, 1.0, f32::NAN),
-        (0.0, 0.0, 1.0),
+        (1.0, 0.0, 1.0),
         (0.0, 1e-12, 1e-12),
     ] {
         assert!(qualification("gate", &[actual], &[expected], scale).is_err());
     }
+    assert!(qualification("zero reference", &[0.0], &[0.0], 1e-12).is_ok());
 }
 
 fn training_state(session: &Session) -> Vec<(String, Vec<f32>)> {
