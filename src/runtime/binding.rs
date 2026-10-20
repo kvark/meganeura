@@ -14,8 +14,8 @@ use super::{
     ReductionParams, ReductionPass1Data, ReductionPass2RowData, RmsNormAddData, RmsNormData,
     RoPEData, RoPEDynamicData, RoPEDynamicFactorsData, RoPEParams, ScatterAddAtomicData,
     ScatterAddData, ScatterAddParams, Session, SoftmaxParams, TernaryData, TransposeData,
-    TransposeParams, UnaryData, UnaryParams, WinogradTransformData, WinogradTransformParams,
-    reduction_is_dynamic,
+    TransposeParams, UnaryData, UnaryParams, WinogradTransformAddData, WinogradTransformData,
+    WinogradTransformParams, reduction_is_dynamic,
 };
 use crate::compile::{
     BufferRef, CachedBlockAttentionParams, Dispatch, DispatchParams, Kernel, ShaderEntry,
@@ -1175,23 +1175,36 @@ impl Session {
             | ShaderEntry::WinogradOutputTransform
             | ShaderEntry::WinogradWeightTransform => {
                 let p = &dispatch.params;
-                pc.bind(
-                    0,
-                    &WinogradTransformData {
-                        src: buf(dispatch.input_buffers[0]),
-                        dst: buf(dispatch.output_buffer),
-                        params: WinogradTransformParams {
-                            p0: p[0],
-                            p1: p[1],
-                            p2: p[2],
-                            p3: p[3],
-                            p4: p[4],
-                            p5: p[5],
-                            p6: p[6],
-                            p7: p[7],
+                let params = WinogradTransformParams {
+                    p0: p[0],
+                    p1: p[1],
+                    p2: p[2],
+                    p3: p[3],
+                    p4: p[4],
+                    p5: p[5],
+                    p6: p[6],
+                    p7: p[7],
+                };
+                if matches!(dispatch.kernel, Kernel::WinogradOutputAdd) {
+                    pc.bind(
+                        0,
+                        &WinogradTransformAddData {
+                            src: buf(dispatch.input_buffers[0]),
+                            dst: buf(dispatch.output_buffer),
+                            params,
+                            residual: buf(dispatch.input_buffers[1]),
                         },
-                    },
-                );
+                    );
+                } else {
+                    pc.bind(
+                        0,
+                        &WinogradTransformData {
+                            src: buf(dispatch.input_buffers[0]),
+                            dst: buf(dispatch.output_buffer),
+                            params,
+                        },
+                    );
+                }
             }
             ShaderEntry::WinogradBatchedMatMul => {
                 pc.bind(

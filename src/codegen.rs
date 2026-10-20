@@ -262,6 +262,23 @@ impl ShaderModule {
     }
 }
 
+pub(crate) fn generate_winograd_output(add: bool) -> ShaderModule {
+    ShaderModule::new(&preprocess(
+        include_str!("shaders/winograd_output_transform.wgsl"),
+        &[
+            (
+                "$ADD_DECL",
+                if add {
+                    "var<storage> residual: array<f32>;"
+                } else {
+                    ""
+                },
+            ),
+            ("$ADD", if add { " + residual[index]" } else { "" }),
+        ],
+    ))
+}
+
 #[cfg(test)]
 fn parse_source(source: &str) -> Result<naga::Module, naga::front::wgsl::ParseError> {
     naga::front::wgsl::parse_str(source)
@@ -473,6 +490,11 @@ pub fn generate_matmul_with_epilogue(
     epilogue: Option<&crate::compile::MatMulEpilogue>,
     options: MatMulOptions,
 ) -> ShaderModule {
+    if group == ShaderGroup::WinogradBatchedMatMul {
+        assert!(epilogue.is_none());
+        assert_eq!(options.format, WeightFormat::F32);
+        return gen_block_matmul(ShaderGroup::BatchMatMul, options);
+    }
     generate_partitioned_matmul(group, epilogue, options, 1, 1)
 }
 
@@ -764,7 +786,7 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         | ShaderGroup::BlockMatMulBT
         | ShaderGroup::BatchMatMul
         | ShaderGroup::BatchMatMulAT
-        | ShaderGroup::BatchMatMulBT => gen_block_matmul(group, MatMulTile::Large),
+        | ShaderGroup::BatchMatMulBT => gen_block_matmul(group, MatMulOptions::default()),
         ShaderGroup::MatMulGemv
         | ShaderGroup::MatMulGemvAdd
         | ShaderGroup::MatMulGemvBT
@@ -883,9 +905,7 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         ShaderGroup::WinogradInputTransform => {
             ShaderModule::new(include_str!("shaders/winograd_input_transform.wgsl"))
         }
-        ShaderGroup::WinogradOutputTransform => {
-            ShaderModule::new(include_str!("shaders/winograd_output_transform.wgsl"))
-        }
+        ShaderGroup::WinogradOutputTransform => generate_winograd_output(false),
         ShaderGroup::WinogradBatchedMatMul => {
             ShaderModule::new(include_str!("shaders/winograd_matmul.wgsl"))
         }
@@ -1953,7 +1973,13 @@ pub fn generate_module_small(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderMo
         | ShaderGroup::BlockMatMulBT
         | ShaderGroup::BatchMatMul
         | ShaderGroup::BatchMatMulAT
-        | ShaderGroup::BatchMatMulBT => gen_block_matmul(group, MatMulTile::Small),
+        | ShaderGroup::BatchMatMulBT => gen_block_matmul(
+            group,
+            MatMulOptions {
+                tile: MatMulTile::Small,
+                ..Default::default()
+            },
+        ),
         ShaderGroup::MatMul
         | ShaderGroup::MatMulAdd
         | ShaderGroup::MatMulAT
@@ -1970,7 +1996,7 @@ pub fn generate_module_small(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderMo
     }
 }
 
-fn gen_block_matmul(group: ShaderGroup, tile: MatMulTile) -> ShaderModule {
+fn gen_block_matmul(group: ShaderGroup, options: MatMulOptions) -> ShaderModule {
     let (ordinary, a_idx, b_idx, c_idx) = match group {
         ShaderGroup::BlockMatMul => (
             ShaderGroup::MatMul,
@@ -2027,11 +2053,7 @@ fn gen_block_matmul(group: ShaderGroup, tile: MatMulTile) -> ShaderModule {
         "",
         "",
         "",
-        MatMulOptions {
-            format: WeightFormat::F32,
-            tile,
-            ..Default::default()
-        },
+        options,
         1,
         1,
     )

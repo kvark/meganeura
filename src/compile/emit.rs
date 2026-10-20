@@ -2900,14 +2900,30 @@ impl<'a> Compiler<'a> {
 
                 // Dispatch 2: Batched matmul
                 // weight_xform[16, Co, Ci] × input_xform[16, Ci, P] → mm_out[16, Co, P]
+                // Small images use only a fraction of a 64-column tile.
+                let narrow = total_tiles <= 16;
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::WinogradBatchedMatMul,
-                    workgroups: [total_tiles.div_ceil(64), out_channels.div_ceil(64), 16],
+                    workgroups: [
+                        total_tiles.div_ceil(if narrow { 16 } else { 64 }),
+                        out_channels.div_ceil(if narrow { 32 } else { 64 }),
+                        16,
+                    ],
                     input_buffers: vec![weight_xform, input_xform_buf],
                     output_buffer: mm_out_buf,
                     extra_outputs: vec![],
                     params: vec![out_channels, total_tiles, in_channels, 0],
-
+                    kernel: if narrow {
+                        Kernel::ScalarMatmul(crate::codegen::ScalarMatmulShape {
+                            tile_size: 32,
+                            tile_n: 16,
+                            k_stage: 32,
+                            interleave_columns: false,
+                            unroll_k: false,
+                        })
+                    } else {
+                        Kernel::Default
+                    },
                     ..Default::default()
                 });
 

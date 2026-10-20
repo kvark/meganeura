@@ -1224,6 +1224,8 @@ pub struct Dispatch {
 /// the dispatch; shader-specific configuration lives only in its variant.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kernel {
+    /// Winograd output transform with an elementwise residual addition.
+    WinogradOutputAdd,
     #[default]
     Default,
     SmallTile,
@@ -1641,6 +1643,7 @@ impl ExecutionPlan {
             fuse_epilogues(&mut self);
             fold_uniform_constants(&mut self);
             fuse_pointwise_chains(&mut self);
+            fuse_winograd_add(&mut self);
             fuse_reduction_chains(&mut self);
             fuse_row_scaled_scatters(&mut self);
             bf16::fuse_boundaries(&mut self);
@@ -2898,6 +2901,60 @@ pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
             "fuse_rmsnorm_prologues: fused {} RmsNorm+MatMul pairs",
             to_fuse.len()
         );
+    }
+}
+
+/// Fuse a residual addition into the Winograd output transform. Keep the
+/// fused operation at the add's position: its other input may be produced
+/// after the transform in the original schedule.
+fn fuse_winograd_add(plan: &mut ExecutionPlan) {
+    let protected = plan.externally_visible_buffers();
+    let mut producers = HashMap::new();
+    let mut reads = HashMap::<_, usize>::new();
+    for (index, dispatch) in plan.dispatches.iter().enumerate() {
+        producers.insert(dispatch.output_buffer, index);
+        for &buffer in &dispatch.input_buffers {
+            *reads.entry(buffer).or_default() += 1;
+        }
+    }
+    let add = pointwise(2, [Pw::Add(0, 1)]);
+    let mut remove = Vec::new();
+    for ci in 0..plan.dispatches.len() {
+        let consumer = &plan.dispatches[ci];
+        if consumer.pointwise() != Some(&add)
+            || consumer.fusion_barrier
+            || consumer.pointwise_storage != crate::schedule::PointwiseStorage::default()
+        {
+            continue;
+        }
+        for (side, &buffer) in consumer.input_buffers.iter().enumerate() {
+            let Some(&pi) = producers.get(&buffer) else {
+                continue;
+            };
+            let producer = &plan.dispatches[pi];
+            if pi >= ci
+                || producer.shader != ShaderEntry::WinogradOutputTransform
+                || producer.kernel != Kernel::Default
+                || producer.fusion_barrier
+                || protected.contains(&buffer)
+                || reads[&buffer] != 1
+            {
+                continue;
+            }
+            let mut fused = producer.clone();
+            fused.kernel = Kernel::WinogradOutputAdd;
+            fused.input_buffers.push(consumer.input_buffers[1 - side]);
+            fused.output_buffer = consumer.output_buffer;
+            fused.origin.extend_from_slice(&consumer.origin);
+            fused.requires_full_precision |= consumer.requires_full_precision;
+            plan.dispatches[ci] = fused;
+            remove.push(pi);
+            break;
+        }
+    }
+    remove.sort_unstable();
+    for index in remove.into_iter().rev() {
+        plan.dispatches.remove(index);
     }
 }
 

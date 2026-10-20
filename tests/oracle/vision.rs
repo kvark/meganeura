@@ -294,6 +294,8 @@ fn conv2d_winograd() {
     let cases = [
         // Aligned channels, even output (whole 2×2 tiles).
         Conv::new(2, 64, (8, 8), 64, (3, 3), 1, (1, 1)),
+        // Sixteen image tiles, with partial channel and K tiles.
+        Conv::new(1, 67, (7, 7), 63, (3, 3), 1, (1, 1)),
         // Odd output extents (partial tiles), no padding, batch 3,
         // channels off every tile width; 67 · 63 = 4221.
         Conv::new(3, 67, (7, 9), 63, (3, 3), 1, (0, 0)),
@@ -414,6 +416,57 @@ fn conv2d_winograd_training() {
         }
         let report = gpu::check_training(&g, &feeds, &options).unwrap();
         failures.report(&format!("{c:?} winograd training"), &report);
+    }
+    failures.assert_none();
+}
+
+#[test]
+fn conv2d_winograd_residual() {
+    let c = Conv::new(2, 67, (7, 9), 63, (3, 3), 1, (1, 1));
+    let mut failures = Failures::default();
+    for protected in [false, true] {
+        for reversed in [false, true] {
+            let mut g = Graph::new();
+            let x = g.parameter("x", &[c.x_len()]);
+            let w = g.parameter("w", &[c.w_len()]);
+            let residual = g.parameter("residual", &[c.y_len()]);
+            let conv = c.conv(&mut g, x, w);
+            let y = if reversed {
+                g.add(residual, conv)
+            } else {
+                g.add(conv, residual)
+            };
+            g.set_outputs(if protected { vec![y, conv] } else { vec![y] });
+            let mut feeds = Feeds::new();
+            feeds.fill_random(&g, 1270, 0.5);
+            let mut config = SessionConfig::from_env();
+            config.mode = Mode::Inference;
+            config.optimize.no_winograd = false;
+            config.runtime.coop = CoopPolicy::Disabled;
+            let (session, _) = meganeura::build(&g, config);
+            assert_eq!(
+                session
+                    .plan()
+                    .dispatches
+                    .iter()
+                    .any(|d| d.kernel == Kernel::WinogradOutputAdd),
+                !protected,
+            );
+            drop(session);
+            let mut options = gpu::Options::default();
+            options.optimize.no_winograd = false;
+            let report = gpu::check_inference(&g, &feeds, &options).unwrap();
+            failures.report(
+                &format!("residual protected={protected} reversed={reversed}"),
+                &report,
+            );
+            if !protected {
+                let loss = gradients::weighted_loss(&mut g, y, 1271, 0.7);
+                g.set_outputs(vec![loss]);
+                let report = gpu::check_training(&g, &feeds, &options).unwrap();
+                failures.report(&format!("residual training reversed={reversed}"), &report);
+            }
+        }
     }
     failures.assert_none();
 }
