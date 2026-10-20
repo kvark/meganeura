@@ -16,6 +16,7 @@ struct Params {
 var<storage> src: array<f32>;              // M [16, Co, P]
 var<storage, read_write> dst: array<f32>;  // output [N, Co, oH, oW]
 var<uniform> params: Params;
+$ADD_DECL
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -68,15 +69,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                  + co * params.out_h * params.out_w;
 
     if oh_base < params.out_h && ow_base < params.out_w {
-        dst[out_base + oh_base * params.out_w + ow_base] = y00;
+        let index = out_base + oh_base * params.out_w + ow_base;
+        dst[index] = y00$ADD;
     }
     if oh_base < params.out_h && (ow_base + 1u) < params.out_w {
-        dst[out_base + oh_base * params.out_w + ow_base + 1u] = y01;
+        let index = out_base + oh_base * params.out_w + ow_base + 1u;
+        dst[index] = y01$ADD;
     }
     if (oh_base + 1u) < params.out_h && ow_base < params.out_w {
-        dst[out_base + (oh_base + 1u) * params.out_w + ow_base] = y10;
+        let index = out_base + (oh_base + 1u) * params.out_w + ow_base;
+        dst[index] = y10$ADD;
     }
     if (oh_base + 1u) < params.out_h && (ow_base + 1u) < params.out_w {
-        dst[out_base + (oh_base + 1u) * params.out_w + ow_base + 1u] = y11;
+        let index = out_base + (oh_base + 1u) * params.out_w + ow_base + 1u;
+        dst[index] = y11$ADD;
     }
 }
