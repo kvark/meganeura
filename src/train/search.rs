@@ -533,6 +533,7 @@ struct CoordinateOrder {
     initial: usize,
     physical_next: bool,
     priority_choices: collections::VecDeque<usize>,
+    deferred: collections::HashSet<(usize, usize)>,
 }
 
 impl CoordinateOrder {
@@ -547,6 +548,7 @@ impl CoordinateOrder {
             initial: 0,
             physical_next: false,
             priority_choices: collections::VecDeque::new(),
+            deferred: collections::HashSet::new(),
         }
     }
 
@@ -567,6 +569,9 @@ impl CoordinateOrder {
         {
             while let Some(choice) = self.priority_choices.pop_front() {
                 let entry = (incumbent.0, choice);
+                if self.deferred.contains(&entry) {
+                    continue;
+                }
                 if self.mark(entry) {
                     return Some(entry);
                 }
@@ -580,39 +585,41 @@ impl CoordinateOrder {
             }
         }
         let (form, choice) = incumbent;
+        let available =
+            |entry: &(usize, usize)| !self.tried.contains(entry) && !self.deferred.contains(entry);
         let physical = self
             .choice_order
             .iter()
             .copied()
             .map(|c| (form, c))
-            .find(|entry| !self.tried.contains(entry));
+            .find(available);
         // Unvisited forms first; once every form has run, revisit them with the
         // incumbent's choice.
         let graph = self
             .form_order
             .iter()
             .copied()
-            .find(|&s| !self.visited_forms[s])
             .map(|s| (s, choice))
-            .filter(|entry| !self.tried.contains(entry))
-            .or_else(|| {
-                (0..self.seeds)
-                    .map(|s| (s, choice))
-                    .find(|entry| !self.tried.contains(entry))
-            });
+            .find(|entry| !self.visited_forms[entry.0] && available(entry))
+            .or_else(|| (0..self.seeds).map(|s| (s, choice)).find(available));
         // Both axes exhausted around the incumbent: the remaining pairs,
         // diagonally, for budgets large enough to cover them.
-        let rest = || {
+        let rest = |include_deferred| {
             (0..self.seeds + self.choices - 1)
                 .flat_map(|rank| (0..self.choices.min(rank + 1)).map(move |c| (rank - c, c)))
-                .find(|&(s, c)| s < self.seeds && !self.tried.contains(&(s, c)))
+                .find(|&(s, c)| {
+                    s < self.seeds
+                        && !self.tried.contains(&(s, c))
+                        && (include_deferred || available(&(s, c)))
+                })
         };
         let entry = if self.physical_next {
             physical.or(graph)
         } else {
             graph.or(physical)
         }
-        .or_else(rest)?;
+        .or_else(|| rest(false))
+        .or_else(|| rest(true))?;
         self.physical_next = !self.physical_next;
         self.mark(entry);
         Some(entry)
@@ -719,6 +726,7 @@ fn implementations(
         split_plans,
         queued_splits: false,
         replace_extracted_matrices: false,
+        defer_bf16: false,
     }
 }
 
@@ -733,6 +741,7 @@ struct Implementations {
     split_plans: Vec<measure::Program>,
     queued_splits: bool,
     replace_extracted_matrices: bool,
+    defer_bf16: bool,
 }
 
 impl Implementations {
@@ -741,6 +750,16 @@ impl Implementations {
         inputs: &[crate::DType],
         caps: &blade_graphics::Capabilities,
     ) {
+        // Rectangular subgroup kernels share their tile/layout choices. BF16
+        // stays reachable, but need not interrupt layout search after F16
+        // qualified on the same form and physical choice.
+        self.defer_bf16 =
+            crate::codegen::checked_cooperative_shape(&caps.cooperative_matrix.f16_f32_shapes)
+                == Some([8, 16, 16])
+                && crate::codegen::checked_cooperative_shape(
+                    &caps.cooperative_matrix.bf16_f32_shapes,
+                ) == Some([8, 16, 16])
+                && caps.cooperative_matrix.workgroup.granularities.is_empty();
         let ordinary = self.choices.clone();
         let mut seen = collections::HashSet::new();
         for &multiply in inputs {
@@ -863,6 +882,25 @@ fn fill_matrix_candidates(
 }
 
 impl measure::Frontier for Implementations {
+    fn observe(&mut self, origin: measure::Origin, qualified: bool) {
+        let choice = self.choices[origin.choice];
+        if !self.defer_bf16 || choice.matrix_inputs != Some(crate::DType::F16) {
+            return;
+        }
+        let bf16 = AxisChoice {
+            matrix_inputs: Some(crate::DType::BF16),
+            ..choice
+        };
+        if let Some(index) = self.choices.iter().position(|&c| c == bf16) {
+            let entry = (origin.form, index);
+            if qualified {
+                self.order.deferred.insert(entry);
+            } else {
+                self.order.deferred.remove(&entry);
+            }
+        }
+    }
+
     fn next(&mut self, incumbent: Option<measure::Origin>) -> Option<measure::Program> {
         loop {
             if let Some(plan) = self.split_plans.pop() {
@@ -1081,6 +1119,54 @@ mod tests {
             fill_matrix_candidates(&mut plan, crate::DType::F16, false),
             0
         );
+    }
+
+    #[test]
+    fn qualified_rectangular_f16_defers_only_its_matching_bf16_candidate() {
+        use measure::Frontier as _;
+        for (f16_rows, bf16_rows, qualified, form, deferred) in [
+            (8, 8, true, 0, true),
+            (8, 8, false, 0, false),
+            (8, 8, true, 1, false),
+            (16, 16, true, 0, false),
+            (8, 16, true, 0, false),
+        ] {
+            let mut frontier = matrix_frontier();
+            frontier.seeds.push(matrix_frontier().seeds.pop().unwrap());
+            frontier.order = CoordinateOrder::new(2, frontier.choices.len());
+            let mut caps = blade_graphics::Capabilities {
+                shader_float16: true,
+                shader_bfloat16: true,
+                ..Default::default()
+            };
+            caps.cooperative_matrix
+                .f16_f32_shapes
+                .push([f16_rows, 16, 16]);
+            caps.cooperative_matrix
+                .bf16_f32_shapes
+                .push([bf16_rows, 16, 16]);
+            frontier.enable_matrix_inputs(&[crate::DType::F16, crate::DType::BF16], &caps);
+            let f16 = std::iter::from_fn(|| frontier.next(None))
+                .find(|p| p.description.contains("matrix_inputs=F16"))
+                .unwrap();
+            frontier.observe(f16.origin.unwrap(), qualified);
+            // F16 need not win: qualification alone can defer the duplicate
+            // arithmetic candidate, and only on the form that actually ran it.
+            let incumbent = Some(measure::Origin { form, choice: 0 });
+            let next = frontier.next(incumbent).unwrap();
+            assert_eq!(
+                next.description.contains("matrix_inputs=BF16"),
+                !deferred,
+                "F16 rows={f16_rows}, BF16 rows={bf16_rows}, qualified={qualified}, form={form}"
+            );
+            if deferred {
+                assert!(
+                    std::iter::from_fn(|| frontier.next(incumbent))
+                        .any(|p| p.description.contains("matrix_inputs=BF16")),
+                    "deferral must leave BF16 reachable"
+                );
+            }
+        }
     }
 
     #[test]
