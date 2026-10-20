@@ -24,8 +24,16 @@ fn sum_rows(
         let col = wgid.x * 256u + lid.y * 32u + lid.x;
         if col < params.n {
             var acc = 0.0;
-            for (var row = 0u; row < params.m; row += 1u) {
-                acc += src[row * params.n + col];
+            // Split-K matrix products commonly leave eight partial rows.
+            // A fixed bound lets the driver unroll this short reduction.
+            if params.m == 8u {
+                for (var row = 0u; row < 8u; row += 1u) {
+                    acc += src[row * params.n + col];
+                }
+            } else {
+                for (var row = 0u; row < params.m; row += 1u) {
+                    acc += src[row * params.n + col];
+                }
             }
             dst[col] = acc;
         }
