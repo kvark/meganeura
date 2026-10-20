@@ -40,24 +40,23 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     var j = tid;
     loop {
         if j >= group_size { break; }
-        let c_local = j / params.spatial;
-        let hw = j % params.spatial;
-        let c = c_start + c_local;
-        let idx = ((n * params.channels + c) * params.spatial) + hw;
+        let idx = (n * params.channels + c_start) * params.spatial + j;
         sum_val += src[idx];
         j += 256u;
     }
     wg_data[tid] = sum_val;
     workgroupBarrier();
 
-    var stride = 128u;
+    // Fold two binary-tree levels per barrier, preserving addition order.
+    var stride = 64u;
     loop {
         if stride == 0u { break; }
         if tid < stride {
-            wg_data[tid] += wg_data[tid + stride];
+            wg_data[tid] = (wg_data[tid] + wg_data[tid + 2u * stride])
+                + (wg_data[tid + stride] + wg_data[tid + 3u * stride]);
         }
         workgroupBarrier();
-        stride >>= 1u;
+        stride >>= 2u;
     }
     let mean = wg_data[0] / f32(group_size);
     workgroupBarrier();
@@ -67,10 +66,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     j = tid;
     loop {
         if j >= group_size { break; }
-        let c_local = j / params.spatial;
-        let hw = j % params.spatial;
-        let c = c_start + c_local;
-        let idx = ((n * params.channels + c) * params.spatial) + hw;
+        let idx = (n * params.channels + c_start) * params.spatial + j;
         let d = src[idx] - mean;
         var_val += d * d;
         j += 256u;
@@ -78,14 +74,15 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     wg_data[tid] = var_val;
     workgroupBarrier();
 
-    stride = 128u;
+    stride = 64u;
     loop {
         if stride == 0u { break; }
         if tid < stride {
-            wg_data[tid] += wg_data[tid + stride];
+            wg_data[tid] = (wg_data[tid] + wg_data[tid + 2u * stride])
+                + (wg_data[tid + stride] + wg_data[tid + 3u * stride]);
         }
         workgroupBarrier();
-        stride >>= 1u;
+        stride >>= 2u;
     }
     let variance = wg_data[0] / f32(group_size);
     let inv_std = inverseSqrt(variance + eps);
@@ -94,10 +91,8 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     j = tid;
     loop {
         if j >= group_size { break; }
-        let c_local = j / params.spatial;
-        let hw = j % params.spatial;
-        let c = c_start + c_local;
-        let idx = ((n * params.channels + c) * params.spatial) + hw;
+        let c = c_start + j / params.spatial;
+        let idx = (n * params.channels + c_start) * params.spatial + j;
         let normalized = (src[idx] - mean) * inv_std;
         let x = normalized * src_b[c] + bias[c];
         dst[idx] = x / (1.0 + exp(-x));  // SiLU
