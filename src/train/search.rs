@@ -361,12 +361,13 @@ pub fn build_measured_with_inputs(
         }
     }
     // Arithmetic permission belongs to the runtime policy, not a second opt-in.
-    // Rectangular F16 tiles have no ordinary square-tile candidate.
+    // Checked F16 reaches rectangular tiles and extracted scalar layouts that
+    // the ordinary square-tile heuristic leaves alone.
     let matrix_inputs = match cfg.runtime.coop {
         crate::CoopPolicy::Auto if caps.f16_tile == 0 => {
             vec![crate::DType::F16, crate::DType::BF16]
         }
-        crate::CoopPolicy::Auto => vec![crate::DType::BF16],
+        crate::CoopPolicy::Auto => vec![crate::DType::BF16, crate::DType::F16],
         crate::CoopPolicy::AllowF16 => vec![crate::DType::F16],
         crate::CoopPolicy::NativeF32 | crate::CoopPolicy::Disabled => Vec::new(),
     };
@@ -1247,7 +1248,7 @@ mod tests {
         let expected_inputs = if runtime::auto_tune(&gpu, 0).coop_caps.f16_tile == 0 {
             vec![crate::DType::F16, crate::DType::BF16]
         } else {
-            vec![crate::DType::BF16]
+            vec![crate::DType::BF16, crate::DType::F16]
         };
         let frontier = matrix_frontier();
         let graph = &frontier.seeds[0].graph;

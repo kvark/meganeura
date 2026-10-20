@@ -3240,7 +3240,7 @@ pub enum CoopPolicy {
     /// Prefer f32 operands and accumulators. On f16-only devices, enable f16 tiles for
     /// work that permits reduced input precision; `requires_full_precision`
     /// dispatches retain scalar f32 operands. Measured search also considers
-    /// device-qualified BF16 and rectangular F16 multiplication for forward products,
+    /// device-qualified F16 and BF16 multiplication for forward products,
     /// subject to the caller's whole-program accuracy and timing gates.
     #[default]
     Auto,
