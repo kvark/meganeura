@@ -34,6 +34,8 @@ pub(super) struct Origin {
 pub(super) trait Frontier {
     /// The next program to measure; `incumbent` is the selected program's origin.
     fn next(&mut self, incumbent: Option<Origin>) -> Option<Program>;
+    /// Whole-program qualification, including candidates that did not win.
+    fn observe(&mut self, _origin: Origin, _qualified: bool) {}
     /// Whether a later call could still return a program.
     fn may_remain(&self) -> bool;
 }
@@ -567,6 +569,9 @@ pub(super) fn select(
             trial.outcome.baseline_median_ms,
             trial.outcome.candidate_median_ms
         );
+        if let Some(origin) = program.origin {
+            programs.observe(origin, trial.outcome.qualified);
+        }
         report.trials.push(trial);
     }
     // Do not lower one more program just to discover whether a bounded search
