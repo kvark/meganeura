@@ -57,16 +57,21 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         }
         tree_reduce_8(tid);
 
+        var tile_max = max_score;
+        for (var i = 0u; i < 8u; i++) {
+            tile_max = max(tile_max, wg_scores[i * $HEAD_DIMu] * scale);
+        }
+        let correction = exp(max_score - tile_max);
+        sum_exp *= correction;
+        my_out *= correction;
         for (var i = 0u; i < 8u; i++) {
             let score = wg_scores[i * $HEAD_DIMu] * scale;
-            let new_max = max(max_score, score);
-            let correction = exp(max_score - new_max);
-            let weight = exp(score - new_max);
-            sum_exp = sum_exp * correction + weight;
+            let weight = exp(score - tile_max);
+            sum_exp += weight;
             let v_base = (t + i) * kv_dim + kv_head_off;
-            my_out = my_out * correction + weight * bias[v_base + d];
-            max_score = new_max;
+            my_out += weight * bias[v_base + d];
         }
+        max_score = tile_max;
         // Every lane must consume the reduced value before scratch is reused.
         workgroupBarrier();
     }

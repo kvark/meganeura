@@ -753,7 +753,7 @@ type Norm = (u32, u32, u32, u32);
 /// Single-pass kernels (`group_norm_chunks == 1`) and the two-pass
 /// statistics + apply path, including a group size the first chunk count
 /// does not divide (8084 = 4 · 2021: 3 chunks by work, lowered to 2).
-const NORMS: [(Norm, u32); 7] = [
+const NORMS: [(Norm, u32); 9] = [
     ((2, 6, 35, 3), 1),
     // One group (layer-norm-like), strided loops over 256 threads.
     ((1, 5, 300, 1), 1),
@@ -764,6 +764,9 @@ const NORMS: [(Norm, u32); 7] = [
     ((1, 8, 43 * 47, 2), 2),
     // Group size exactly at the chunking threshold.
     ((1, 4, 1024, 1), 2),
+    // Non-power-of-two partial count and the shared-memory fallback.
+    ((1, 12, 1024, 2), 3),
+    ((1, 8, 8192, 2), 16),
 ];
 
 fn group_norm_graph(norm: Norm, eps: f32, silu: bool) -> Graph {

@@ -43,25 +43,23 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     var j = tid;
     loop {
         if j >= group_size { break; }
-        let c_local = j / params.spatial;
-        let hw = j % params.spatial;
-        let c = c_start + c_local;
-        let idx = ((n * params.channels + c) * params.spatial) + hw;
+        let idx = (n * params.channels + c_start) * params.spatial + j;
         sum_val += src[idx];
         j += 256u;
     }
     wg_data[tid] = sum_val;
     workgroupBarrier();
 
-    // Tree reduction for mean
-    var stride = 128u;
+    // Fold two binary-tree levels per barrier, preserving addition order.
+    var stride = 64u;
     loop {
         if stride == 0u { break; }
         if tid < stride {
-            wg_data[tid] += wg_data[tid + stride];
+            wg_data[tid] = (wg_data[tid] + wg_data[tid + 2u * stride])
+                + (wg_data[tid + stride] + wg_data[tid + 3u * stride]);
         }
         workgroupBarrier();
-        stride >>= 1u;
+        stride >>= 2u;
     }
     let mean = wg_data[0] / f32(group_size);
     workgroupBarrier();
@@ -71,10 +69,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     j = tid;
     loop {
         if j >= group_size { break; }
-        let c_local = j / params.spatial;
-        let hw = j % params.spatial;
-        let c = c_start + c_local;
-        let idx = ((n * params.channels + c) * params.spatial) + hw;
+        let idx = (n * params.channels + c_start) * params.spatial + j;
         let d = src[idx] - mean;
         var_val += d * d;
         j += 256u;
@@ -82,14 +77,15 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     wg_data[tid] = var_val;
     workgroupBarrier();
 
-    stride = 128u;
+    stride = 64u;
     loop {
         if stride == 0u { break; }
         if tid < stride {
-            wg_data[tid] += wg_data[tid + stride];
+            wg_data[tid] = (wg_data[tid] + wg_data[tid + 2u * stride])
+                + (wg_data[tid + stride] + wg_data[tid + 3u * stride]);
         }
         workgroupBarrier();
-        stride >>= 1u;
+        stride >>= 2u;
     }
     let variance = wg_data[0] / f32(group_size);
     let inv_std = inverseSqrt(variance + eps);
@@ -98,10 +94,8 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     j = tid;
     loop {
         if j >= group_size { break; }
-        let c_local = j / params.spatial;
-        let hw = j % params.spatial;
-        let c = c_start + c_local;
-        let idx = ((n * params.channels + c) * params.spatial) + hw;
+        let c = c_start + j / params.spatial;
+        let idx = (n * params.channels + c_start) * params.spatial + j;
         let normalized = (src[idx] - mean) * inv_std;
         dst[idx] = normalized * src_b[c] + bias[c];
         j += 256u;
@@ -137,14 +131,15 @@ fn stats(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) l
     }
     wg_data[tid] = s;
     workgroupBarrier();
-    var stride = 128u;
+    var stride = 64u;
     loop {
         if stride == 0u { break; }
         if tid < stride {
-            wg_data[tid] += wg_data[tid + stride];
+            wg_data[tid] = (wg_data[tid] + wg_data[tid + 2u * stride])
+                + (wg_data[tid + stride] + wg_data[tid + 3u * stride]);
         }
         workgroupBarrier();
-        stride >>= 1u;
+        stride >>= 2u;
     }
     let sum = wg_data[0];
     let mean = sum / f32(chunk_size);
@@ -160,19 +155,27 @@ fn stats(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) l
     }
     wg_data[tid] = m2;
     workgroupBarrier();
-    stride = 128u;
+    stride = 64u;
     loop {
         if stride == 0u { break; }
         if tid < stride {
-            wg_data[tid] += wg_data[tid + stride];
+            wg_data[tid] = (wg_data[tid] + wg_data[tid + 2u * stride])
+                + (wg_data[tid + stride] + wg_data[tid + 3u * stride]);
         }
         workgroupBarrier();
-        stride >>= 1u;
+        stride >>= 2u;
     }
     if tid == 0u {
         dst[wgid.x * 2u] = sum;
         dst[wgid.x * 2u + 1u] = wg_data[0];
     }
+}
+
+// The nonzero leaves of the 256-lane binary tree when there are at most
+// eight partials. Keep the grouping to match its floating-point additions.
+fn sum_eight(v: array<f32, 8>) -> f32 {
+    return ((v[0] + v[4]) + (v[2] + v[6]))
+         + ((v[1] + v[5]) + (v[3] + v[7]));
 }
 
 // Parallel-image GroupNorm, second of two passes. Each workgroup combines
@@ -197,50 +200,71 @@ fn apply(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) l
     let c_start = group * channels_per_group;
 
     let chunk_size = group_size / chunks;
-    var sum_val = 0.0;
-    var p = tid;
-    loop {
-        if p >= chunks { break; }
-        sum_val += partials[(ng * chunks + p) * 2u];
-        p += 256u;
-    }
-    wg_data[tid] = sum_val;
-    workgroupBarrier();
-    var stride = 128u;
-    loop {
-        if stride == 0u { break; }
-        if tid < stride {
-            wg_data[tid] += wg_data[tid + stride];
+    var mean = 0.0;
+    var variance = 0.0;
+    if chunks <= 8u {
+        // The small partial array is uniform within a workgroup. Combine it
+        // in registers, in the same order as the shared-memory tree below.
+        var sums: array<f32, 8>;
+        var m2: array<f32, 8>;
+        for (var p = 0u; p < chunks; p++) {
+            sums[p] = partials[(ng * chunks + p) * 2u];
+            m2[p] = partials[(ng * chunks + p) * 2u + 1u];
         }
-        workgroupBarrier();
-        stride >>= 1u;
-    }
-    let count = f32(group_size);
-    let mean = wg_data[0] / count;
-    workgroupBarrier();
-
-    var m2_val = 0.0;
-    p = tid;
-    loop {
-        if p >= chunks { break; }
-        let chunk_mean = partials[(ng * chunks + p) * 2u] / f32(chunk_size);
-        let d = chunk_mean - mean;
-        m2_val += partials[(ng * chunks + p) * 2u + 1u] + f32(chunk_size) * d * d;
-        p += 256u;
-    }
-    wg_data_sq[tid] = m2_val;
-    workgroupBarrier();
-    stride = 128u;
-    loop {
-        if stride == 0u { break; }
-        if tid < stride {
-            wg_data_sq[tid] += wg_data_sq[tid + stride];
+        mean = sum_eight(sums) / f32(group_size);
+        for (var p = 0u; p < chunks; p++) {
+            let d = sums[p] / f32(chunk_size) - mean;
+            m2[p] += f32(chunk_size) * d * d;
         }
+        variance = sum_eight(m2) / f32(group_size);
+    } else {
+        var sum_val = 0.0;
+        var p = tid;
+        loop {
+            if p >= chunks { break; }
+            sum_val += partials[(ng * chunks + p) * 2u];
+            p += 256u;
+        }
+        wg_data[tid] = sum_val;
         workgroupBarrier();
-        stride >>= 1u;
-    }
+        var stride = 64u;
+        loop {
+            if stride == 0u { break; }
+            if tid < stride {
+                wg_data[tid] = (wg_data[tid] + wg_data[tid + 2u * stride])
+                    + (wg_data[tid + stride] + wg_data[tid + 3u * stride]);
+            }
+            workgroupBarrier();
+            stride >>= 2u;
+        }
+        let count = f32(group_size);
+        mean = wg_data[0] / count;
+        workgroupBarrier();
 
-    let variance = wg_data_sq[0] / count;
+        var m2_val = 0.0;
+        p = tid;
+        loop {
+            if p >= chunks { break; }
+            let chunk_mean = partials[(ng * chunks + p) * 2u] / f32(chunk_size);
+            let d = chunk_mean - mean;
+            m2_val += partials[(ng * chunks + p) * 2u + 1u] + f32(chunk_size) * d * d;
+            p += 256u;
+        }
+        wg_data_sq[tid] = m2_val;
+        workgroupBarrier();
+        stride = 64u;
+        loop {
+            if stride == 0u { break; }
+            if tid < stride {
+                wg_data_sq[tid] = (wg_data_sq[tid] + wg_data_sq[tid + 2u * stride])
+                    + (wg_data_sq[tid + stride] + wg_data_sq[tid + 3u * stride]);
+            }
+            workgroupBarrier();
+            stride >>= 2u;
+        }
+
+        variance = wg_data_sq[0] / count;
+    }
     let inv_std = inverseSqrt(variance + eps);
 
     let begin = chunk * chunk_size;
@@ -248,10 +272,8 @@ fn apply(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) l
     var j = begin + tid;
     loop {
         if j >= end { break; }
-        let c_local = j / params.spatial;
-        let hw = j % params.spatial;
-        let c = c_start + c_local;
-        let idx = ((n * params.channels + c) * params.spatial) + hw;
+        let c = c_start + j / params.spatial;
+        let idx = (n * params.channels + c_start) * params.spatial + j;
         var v = (src[idx] - mean) * inv_std * src_b[c] + bias[c];
         if params.apply_silu != 0u {
             v = v / (1.0 + exp(-v));

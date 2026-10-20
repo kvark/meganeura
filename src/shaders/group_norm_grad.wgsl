@@ -57,14 +57,16 @@ fn grad_stats(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_
     }
     wg_data[tid] = sum_val;
     workgroupBarrier();
-    var stride = 128u;
+    // Fold two binary-tree levels per barrier, preserving addition order.
+    var stride = 64u;
     loop {
         if stride == 0u { break; }
         if tid < stride {
-            wg_data[tid] += wg_data[tid + stride];
+            wg_data[tid] = (wg_data[tid] + wg_data[tid + 2u * stride])
+                + (wg_data[tid + stride] + wg_data[tid + 3u * stride]);
         }
         workgroupBarrier();
-        stride >>= 1u;
+        stride >>= 2u;
     }
     let mean = wg_data[0] / f32(group_size);
     workgroupBarrier();
@@ -79,14 +81,15 @@ fn grad_stats(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_
     }
     wg_data[tid] = var_val;
     workgroupBarrier();
-    stride = 128u;
+    stride = 64u;
     loop {
         if stride == 0u { break; }
         if tid < stride {
-            wg_data[tid] += wg_data[tid + stride];
+            wg_data[tid] = (wg_data[tid] + wg_data[tid + 2u * stride])
+                + (wg_data[tid + stride] + wg_data[tid + 3u * stride]);
         }
         workgroupBarrier();
-        stride >>= 1u;
+        stride >>= 2u;
     }
     if tid == 0u {
         dst[ng * 2u] = mean;
@@ -119,10 +122,8 @@ fn grad_input(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_
     var j = tid;
     loop {
         if j >= group_size { break; }
-        let c_local = j / params.spatial;
-        let hw = j % params.spatial;
-        let c = c_start + c_local;
-        let idx = ((n * params.channels + c) * params.spatial) + hw;
+        let c = c_start + j / params.spatial;
+        let idx = (n * params.channels + c_start) * params.spatial + j;
         let dy = src_a[idx];
         let w = bias[c];
         let xhat = (src_b[idx] - mean) * inv_std;
@@ -134,15 +135,17 @@ fn grad_input(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_
     wg_data2[tid] = sum_wdy_xhat;
     workgroupBarrier();
 
-    var stride = 128u;
+    var stride = 64u;
     loop {
         if stride == 0u { break; }
         if tid < stride {
-            wg_data[tid] += wg_data[tid + stride];
-            wg_data2[tid] += wg_data2[tid + stride];
+            wg_data[tid] = (wg_data[tid] + wg_data[tid + 2u * stride])
+                + (wg_data[tid + stride] + wg_data[tid + 3u * stride]);
+            wg_data2[tid] = (wg_data2[tid] + wg_data2[tid + 2u * stride])
+                + (wg_data2[tid + stride] + wg_data2[tid + 3u * stride]);
         }
         workgroupBarrier();
-        stride >>= 1u;
+        stride >>= 2u;
     }
     let mean_wdy = wg_data[0] / f32(group_size);
     let mean_wdy_xhat = wg_data2[0] / f32(group_size);
@@ -151,10 +154,8 @@ fn grad_input(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_
     j = tid;
     loop {
         if j >= group_size { break; }
-        let c_local = j / params.spatial;
-        let hw = j % params.spatial;
-        let c = c_start + c_local;
-        let idx = ((n * params.channels + c) * params.spatial) + hw;
+        let c = c_start + j / params.spatial;
+        let idx = (n * params.channels + c_start) * params.spatial + j;
         let dy = src_a[idx];
         let w = bias[c];
         let xhat = (src_b[idx] - mean) * inv_std;
@@ -199,15 +200,17 @@ fn grad_weight_bias(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invoc
     wg_data2[tid] = local_db;
     workgroupBarrier();
 
-    var stride = 128u;
+    var stride = 64u;
     loop {
         if stride == 0u { break; }
         if tid < stride {
-            wg_data[tid] += wg_data[tid + stride];
-            wg_data2[tid] += wg_data2[tid + stride];
+            wg_data[tid] = (wg_data[tid] + wg_data[tid + 2u * stride])
+                + (wg_data[tid + stride] + wg_data[tid + 3u * stride]);
+            wg_data2[tid] = (wg_data2[tid] + wg_data2[tid + 2u * stride])
+                + (wg_data2[tid + stride] + wg_data2[tid + 3u * stride]);
         }
         workgroupBarrier();
-        stride >>= 1u;
+        stride >>= 2u;
     }
 
     if tid == 0u {
