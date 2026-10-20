@@ -8,6 +8,7 @@ use crate::{
 use serde::Serialize;
 
 mod measure;
+mod winograd;
 pub use measure::BuildSearchTrial;
 use std::{
     collections,
@@ -489,6 +490,7 @@ struct AxisChoice {
     fuse_dispatches: bool,
     matrix_inputs: Option<crate::DType>,
     vector_convolutions_only: bool,
+    winograd: bool,
 }
 
 fn early_physical_cover(baseline: AxisChoice, attention: &[AttentionChoice]) -> Vec<AxisChoice> {
@@ -691,6 +693,7 @@ fn implementations(
         attention: (0, None),
         matrix_inputs: None,
         vector_convolutions_only: false,
+        winograd: false,
         fuse_dispatches: seeds
             .first()
             .is_some_and(|seed| seed.options.fuse_dispatches),
@@ -712,6 +715,7 @@ fn implementations(
                 fuse_dispatches,
                 matrix_inputs: None,
                 vector_convolutions_only: false,
+                winograd: false,
             })
         })
         .filter(|&choice| seen.insert(choice))
@@ -730,6 +734,7 @@ fn implementations(
         queued_splits: false,
         replace_extracted_matrices: false,
         defer_bf16: false,
+        matrix_shapes: collections::HashMap::new(),
     }
 }
 
@@ -745,6 +750,7 @@ struct Implementations {
     queued_splits: bool,
     replace_extracted_matrices: bool,
     defer_bf16: bool,
+    matrix_shapes: collections::HashMap<crate::DType, ([u32; 3], u32)>,
 }
 
 impl Implementations {
@@ -773,52 +779,52 @@ impl Implementations {
                 }
                 _ => continue,
             };
-            if !seen.insert(multiply)
-                || crate::codegen::checked_cooperative_shape(shapes).is_none()
-                || !self.seeds.iter().any(|s| {
-                    fill_matrix_candidates(
-                        &mut s.plan.clone(),
-                        multiply,
-                        self.replace_extracted_matrices,
-                    ) > 0
-                })
-            {
+            let Some(shape) = crate::codegen::checked_cooperative_shape(shapes) else {
+                continue;
+            };
+            if !seen.insert(multiply) {
                 continue;
             }
-            // Keep the vectorized 1x1 products reachable without forcing
-            // unrelated gathers to use the checked cooperative loop as well.
-            // The complete-convolution choice remains in the same frontier.
-            let mixed = self.seeds.iter().any(|seed| {
-                let vector = fill_matrix_candidates_scoped(
-                    &mut seed.plan.clone(),
-                    multiply,
-                    self.replace_extracted_matrices,
-                    true,
-                );
-                vector > 0
-                    && vector
-                        < fill_matrix_candidates(
-                            &mut seed.plan.clone(),
+            self.matrix_shapes
+                .insert(multiply, (shape, caps.subgroup_size));
+            // Private Winograd operands are a separate candidate: selecting them
+            // must not also force slower reduced direct convolutions.
+            for winograd in [true, false] {
+                if !self.seeds.iter().any(|s| {
+                    if winograd {
+                        winograd::fill(&mut s.plan.clone(), multiply, shape, caps.subgroup_size) > 0
+                    } else {
+                        fill_matrix_candidates(
+                            &mut s.plan.clone(),
                             multiply,
                             self.replace_extracted_matrices,
-                        )
-            });
-            if mixed {
+                        ) > 0
+                    }
+                }) {
+                    continue;
+                }
                 self.order.priority_choices.push_back(self.choices.len());
                 self.choices
                     .extend(ordinary.iter().map(|choice| AxisChoice {
                         matrix_inputs: Some(multiply),
-                        vector_convolutions_only: true,
+                        winograd,
                         ..*choice
                     }));
             }
-            self.order.priority_choices.push_back(self.choices.len());
-            self.choices
-                .extend(ordinary.iter().map(|choice| AxisChoice {
-                    matrix_inputs: Some(multiply),
-                    ..*choice
-                }));
         }
+
+        // Winograd's transforms amplify rounding error. Prefer F16's extra
+        // mantissa bits here, independently of the dense-product type order.
+        self.order
+            .priority_choices
+            .make_contiguous()
+            .sort_by_key(|&index| {
+                let choice = self.choices[index];
+                (
+                    !choice.winograd,
+                    choice.winograd && choice.matrix_inputs != Some(crate::DType::F16),
+                )
+            });
         self.order.choices = self.choices.len();
         self.order.choice_order = (0..self.choices.len()).collect();
     }
@@ -977,6 +983,7 @@ impl measure::Frontier for Implementations {
                 (
                     choice.matrix_inputs != active.matrix_inputs,
                     choice.vector_convolutions_only != active.vector_convolutions_only,
+                    choice.winograd != active.winograd,
                     choice.attention != active.attention,
                     choice.fuse_dispatches != active.fuse_dispatches,
                     index,
@@ -989,6 +996,7 @@ impl measure::Frontier for Implementations {
                 fuse_dispatches,
                 matrix_inputs,
                 vector_convolutions_only,
+                winograd,
             } = self.choices[choice_index];
             let mut plan = if splits == 0
                 && flash.is_none()
@@ -1024,13 +1032,13 @@ impl measure::Frontier for Implementations {
                 plan
             };
             if let Some(multiply) = matrix_inputs {
-                if fill_matrix_candidates_scoped(
-                    &mut plan,
-                    multiply,
-                    self.replace_extracted_matrices,
-                    vector_convolutions_only,
-                ) == 0
-                {
+                let count = if winograd {
+                    let (shape, subgroup) = self.matrix_shapes[&multiply];
+                    winograd::fill(&mut plan, multiply, shape, subgroup)
+                } else {
+                    fill_matrix_candidates(&mut plan, multiply, self.replace_extracted_matrices)
+                };
+                if count == 0 {
                     continue;
                 }
             }
@@ -1039,10 +1047,7 @@ impl measure::Frontier for Implementations {
                 seed.description
             );
             if let Some(dtype) = matrix_inputs {
-                description.push_str(&format!(", matrix_inputs={dtype:?}"));
-                if vector_convolutions_only {
-                    description.push_str(", vector_convolutions_only=true");
-                }
+                description.push_str(&format!(", matrix_inputs={dtype:?}, winograd={winograd}"));
             }
             return Some(measure::Program {
                 description,
@@ -1725,6 +1730,7 @@ mod tests {
             fuse_dispatches: true,
             matrix_inputs: None,
             vector_convolutions_only: false,
+            winograd: false,
         };
         let unfused = AxisChoice {
             fuse_dispatches: false,

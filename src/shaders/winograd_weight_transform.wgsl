@@ -1,3 +1,4 @@
+$EXTENSIONS
 // Winograd F(2,3) weight transform: weight[Co, Ci, 3, 3] → U[16, Co, Ci]
 // U = G × w × G^T where G = [[1,0,0],[1/2,1/2,1/2],[1/2,-1/2,1/2],[0,0,1]]
 // Each thread handles one (co, ci) pair.
@@ -19,7 +20,7 @@ struct Params {
 }
 
 var<storage> src: array<f32>;              // weight [Co, Ci, 3, 3] = [Co*Ci*9]
-var<storage, read_write> dst: array<f32>;  // U [16, Co, Ci] = [16*Co*Ci]
+var<storage, read_write> dst: array<$OUTPUT>;  // U [16, Co, Ci] = [16*Co*Ci]
 var<uniform> params: Params;
 
 fn tap(base: u32, i: u32) -> f32 {
@@ -57,12 +58,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Write U[alpha, co, ci] for alpha=0..15
     let co_ci = params.out_channels * params.in_channels;
     let out_base = co * params.in_channels + ci;
-    dst[0u * co_ci + out_base] = u00;  dst[1u * co_ci + out_base] = u01;
-    dst[2u * co_ci + out_base] = u02;  dst[3u * co_ci + out_base] = u03;
-    dst[4u * co_ci + out_base] = u10;  dst[5u * co_ci + out_base] = u11;
-    dst[6u * co_ci + out_base] = u12;  dst[7u * co_ci + out_base] = u13;
-    dst[8u * co_ci + out_base] = u20;  dst[9u * co_ci + out_base] = u21;
-    dst[10u * co_ci + out_base] = u22; dst[11u * co_ci + out_base] = u23;
-    dst[12u * co_ci + out_base] = u30; dst[13u * co_ci + out_base] = u31;
-    dst[14u * co_ci + out_base] = u32_; dst[15u * co_ci + out_base] = u33;
+    dst[0u * co_ci + out_base] = $STORE(u00);  dst[1u * co_ci + out_base] = $STORE(u01);
+    dst[2u * co_ci + out_base] = $STORE(u02);  dst[3u * co_ci + out_base] = $STORE(u03);
+    dst[4u * co_ci + out_base] = $STORE(u10);  dst[5u * co_ci + out_base] = $STORE(u11);
+    dst[6u * co_ci + out_base] = $STORE(u12);  dst[7u * co_ci + out_base] = $STORE(u13);
+    dst[8u * co_ci + out_base] = $STORE(u20);  dst[9u * co_ci + out_base] = $STORE(u21);
+    dst[10u * co_ci + out_base] = $STORE(u22); dst[11u * co_ci + out_base] = $STORE(u23);
+    dst[12u * co_ci + out_base] = $STORE(u30); dst[13u * co_ci + out_base] = $STORE(u31);
+    dst[14u * co_ci + out_base] = $STORE(u32_); dst[15u * co_ci + out_base] = $STORE(u33);
 }

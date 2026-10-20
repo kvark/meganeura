@@ -1232,6 +1232,13 @@ pub struct Dispatch {
 /// the dispatch; shader-specific configuration lives only in its variant.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kernel {
+    /// F32 transform arithmetic, narrowed only when writing private scratch.
+    WinogradTransform(crate::DType),
+    /// Aligned native half operands with F32 accumulation and output.
+    WinogradMatmul {
+        storage: crate::DType,
+        tile: [u32; 2],
+    },
     #[default]
     Default,
     SmallTile,
@@ -1313,6 +1320,7 @@ impl Dispatch {
         matches!(
             self.kernel,
             Kernel::Cooperative
+                | Kernel::WinogradMatmul { .. }
                 | Kernel::CooperativeTyped { .. }
                 | Kernel::CooperativeCompensated
                 | Kernel::CooperativeTiled { .. }
