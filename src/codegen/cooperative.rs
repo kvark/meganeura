@@ -174,11 +174,20 @@ pub(super) fn generate_with_params(
     let rounds = types.output == DType::BF16
         || (types.multiply == DType::BF16 && (types.a == DType::F32 || types.b == DType::F32));
     let multiply = MatrixTypes::name(types.multiply);
+    let convolution = matches!(
+        group,
+        ShaderGroup::Conv2dBF16 { .. } | ShaderGroup::Conv2dChecked { .. }
+    );
     ShaderModule::new(&preprocess(
         include_str!("../shaders/matmul_checked.wgsl"),
         &[
             ("$STAGE", stage),
-            ("$THREADS", "128"),
+            // Rectangular convolutions benefit from one 32-lane subgroup per
+            // 8x16 tile, reducing register pressure in the implicit-GEMM loads.
+            (
+                "$THREADS",
+                if m == 8 && convolution { "256" } else { "128" },
+            ),
             ("$A_VECTOR", &convert("v", types.a)),
             ("$B_VECTOR", &convert("v", types.b)),
             ("$EXTENSIONS", &extensions),
