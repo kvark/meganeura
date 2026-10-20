@@ -3160,9 +3160,9 @@ struct Compiler<'a> {
     /// it. GradK writes both gradients; GradV emits no separate dispatch.
     pending_grad_v_buffers: HashMap<NodeId, BufferRef>,
     attention_row_dots: HashMap<(BufferRef, BufferRef, u32, u32), BufferRef>,
-    /// GroupNorm backward statistics per (input node, eps bits), computed
-    /// once for the input and weight/bias gradients.
-    group_norm_grad_stats: HashMap<(NodeId, u32), BufferRef>,
+    /// GroupNorm backward statistics per input, grouping and epsilon,
+    /// shared by the input and weight/bias gradients.
+    group_norm_grad_stats: HashMap<(NodeId, [u32; 4], u32), BufferRef>,
 }
 
 // The emitter lives in `compile/emit.rs`: graph traversal that turns nodes
