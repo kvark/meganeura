@@ -5,6 +5,7 @@
 """Figures from the final cohort CSV and the separately versioned warmup study."""
 import ast
 import csv
+import math
 from pathlib import Path
 import statistics
 from collections import defaultdict
@@ -12,14 +13,17 @@ from collections import defaultdict
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import to_rgb
+from matplotlib.patches import Patch, Rectangle
 
 HERE = Path(__file__).resolve().parent
 INPUT = HERE / "data"
 OUTPUT = HERE / "figures"
-INK, TEAL, ORANGE, CANVAS = "#23343b", "#006b70", "#a44616", "#faf9f6"
+INK, TEAL, ORANGE, CANVAS, MUTED = "#23343b", "#006b70", "#a44616", "#faf9f6", "#637679"
 DEVICES = {"nvidia-5070": "RTX 5070", "nvidia-h100": "H100", "nvidia-3050": "RTX 3050",
            "amd-7900xt": "RX 7900 XT", "amd-mi300": "MI300X", "intel-b570": "Arc B570", "apple-m3": "Apple M3"}
 MODELS = ["SmolLM2-135M", "SmolVLA", "StableDiffusion", "ResNet-50", "Whisper-tiny"]
+SHORT = ["SmolLM2", "SmolVLA", "U-Net", "ResNet", "Whisper"]
 PHASES = ["inference", "latency", "training"]
 plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 14, "text.color": INK,
     "axes.labelcolor": INK, "xtick.color": INK, "ytick.color": INK,
@@ -43,58 +47,101 @@ def clean(ax):
     ax.set_axisbelow(True)
 
 
-def combined_results(profile):
-    """One cell per GPU/model: inference ratio, then training in parentheses."""
+def ratio(device, model, profile, phase):
+    raw = DATA[device, model, profile, phase]["ratio"]
+    return float(raw) if raw else None
+
+
+def shade(value):
+    """Teal below parity, brown above, deeper with distance from 1 (capped at 4×)."""
+    if value is None:
+        return to_rgb("#e9ebe8"), MUTED
+    amount = .12 + .6 * min(abs(math.log2(value)) / 2, 1)
+    base = to_rgb(TEAL if value < 1 else ORANGE)
+    fill = tuple(1 - amount + amount * c for c in base)
+    return fill, "#ffffff" if amount > .5 else INK
+
+
+def ratio_panels(profile):
+    """Every core comparison of one profile: one panel per phase, one cell per GPU and model."""
     fig = plt.figure(figsize=(11.56, 4.38))
-    ax = fig.add_axes((.16, .18, .835, .65))
-    ax.set(xlim=(-.5, 4.5), ylim=(6.5, -.5))
-    for i, device in enumerate(DEVICES):
-        for j, model in enumerate(MODELS):
-            for phase in ("inference", "training"):
-                raw = DATA[device, model, profile, phase]["ratio"]
-                value = float(raw) if raw else None
-                label = "—" if value is None else f"{value:.2f}"
-                if phase == "training":
-                    label = f"({label})"
-                ax.text(j + (-.03 if phase == "inference" else .03), i, label,
-                        ha="right" if phase == "inference" else "left", va="center",
-                        fontsize=15 if phase == "inference" else 14,
-                        weight="bold" if phase == "inference" else "normal",
-                        color=INK if value is None else TEAL if value < 1 else ORANGE)
-    ax.set_xticks(range(5), ["SmolLM2\n135M", "SmolVLA\nexpert", "SD U-Net", "ResNet-50", "Whisper\nencoder"])
-    ax.set_yticks(range(7), list(DEVICES.values()))
-    ax.xaxis.tick_top()
-    ax.tick_params(axis="both", length=0, pad=8, labelsize=13)
-    ax.set_yticks([y - .5 for y in range(8)], minor=True)
-    ax.grid(which="minor", axis="y", color="#d1dad8", linewidth=.7)
-    ax.tick_params(which="minor", length=0)
-    for spine in ax.spines.values(): spine.set_visible(False)
-    fig.text(.16, .105, "Inference (training) · Meganeura / PyTorch time · lower is better", fontsize=12, weight="bold")
-    fig.text(.16, .055, "Training = forward + loss + backward. Green < 1; brown > 1. Ratios, not milliseconds.", fontsize=10)
-    fig.text(.16, .012, "— No qualified paired ratio. M3: large process variation; near-ties are inconclusive.", fontsize=10, color="#637679")
-    save(fig, f"{profile}-combined.svg")
+    left, width, gap = .095, .285, .012
+    for panel, (phase, title) in enumerate(zip(PHASES, ["Inference", "Minimal shape", "Training"])):
+        ax = fig.add_axes((left + panel * (width + gap), .17, width, .64))
+        for row, device in enumerate(DEVICES):
+            for col, model in enumerate(MODELS):
+                value = ratio(device, model, profile, phase)
+                fill, ink = shade(value)
+                ax.add_patch(Rectangle((col + .04, row + .06), .92, .88, facecolor=fill, linewidth=0))
+                ax.text(col + .5, row + .5, "—" if value is None else f"{value:.2f}",
+                        ha="center", va="center", fontsize=12.5, color=ink)
+        ax.set(xlim=(0, 5), ylim=(7, 0))
+        ax.set_xticks([c + .5 for c in range(5)], SHORT, fontsize=9.5)
+        ax.xaxis.tick_top()
+        ax.set_yticks([r + .5 for r in range(7)], list(DEVICES.values()) if panel == 0 else [""] * 7, fontsize=12)
+        ax.tick_params(length=0, pad=4)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        ax.set_title(title, loc="left", fontsize=14, weight="bold", pad=24)
+    fig.text(left, .085, "Meganeura time ÷ PyTorch time.  Teal: Meganeura faster.  —: PyTorch did not pass its checks.",
+             fontsize=11.5, weight="bold")
+    fig.text(left, .03, "Minimal shape: one token, action or image. Training: forward, loss and backward. "
+             "Apple M3 times vary by a median 34% between processes.", fontsize=10, color=MUTED)
+    save(fig, f"{profile}-ratios.svg")
+
+
+def precision_gain():
+    """How much faster each engine gets when reduced precision is allowed."""
+    fig, axes = plt.subplots(1, 2, figsize=(11.56, 4.38), sharey=True)
+    fig.subplots_adjust(left=.105, right=.985, top=.84, bottom=.2, wspace=.06)
+    for ax, (phase, title) in zip(axes, [("inference", "Inference"), ("training", "Training")]):
+        for i, device in enumerate(DEVICES):
+            # Same workloads for both engines: both profiles passed for each.
+            models = [m for m in MODELS if all(DATA[device, m, p, phase][k]
+                      for p in ("strict", "accelerated") for k in ("native_ms", "reference_ms"))]
+            for offset, key, color in ((-.2, "reference_ms", ORANGE), (.2, "native_ms", TEAL)):
+                value = statistics.median(float(DATA[device, m, "strict", phase][key])
+                                          / float(DATA[device, m, "accelerated", phase][key]) for m in models)
+                ax.barh(i + offset, value, height=.38, color=color)
+                ax.text(value + .04, i + offset, f"{value:.2f}×", va="center", fontsize=10.5, color=color)
+        ax.axvline(1, color=MUTED, linestyle="--", linewidth=1)
+        ax.set_xlim(0, 3.75)
+        ax.set_xticks([0, 1, 2, 3], ["0", "1×", "2×", "3×"], fontsize=11)
+        ax.set_title(title, loc="left", weight="bold", fontsize=14)
+        ax.spines[["top", "right"]].set_visible(False)
+    axes[0].set_yticks(range(7), list(DEVICES.values()), fontsize=12)
+    axes[0].invert_yaxis()
+    axes[0].tick_params(axis="y", length=0)
+    fig.legend(handles=[Patch(color=ORANGE, label="PyTorch"), Patch(color=TEAL, label="Meganeura")],
+               loc="upper left", bbox_to_anchor=(.098, 1), ncol=2, frameon=False, fontsize=12.5)
+    fig.text(.45, .95, "Speedup when reduced precision is allowed. Right of the dashed line: faster.", fontsize=12, va="center")
+    fig.text(.105, .075, "Strict time ÷ accelerated time, median over the workloads where both engines passed in both profiles.",
+             fontsize=10.5)
+    fig.text(.105, .03, "Five workloads per GPU, except H100 (four), RX 7900 XT training (four) and MI300X (three; two for training).",
+             fontsize=10, color=MUTED)
+    save(fig, "precision-gain.svg")
 
 
 def scaling():
     fig, axes = plt.subplots(1, 2, figsize=(11.56, 4.38))
     fig.subplots_adjust(left=.08, right=.98, top=.83, bottom=.25, wspace=.28)
     for ax, d in zip(axes, ["nvidia-h100", "amd-mi300"]):
-        for phase, title, color in [("inference", "Prefill", TEAL), ("training", "F+L+B", ORANGE)]:
+        for phase, title, color, lift in [("inference", "Prefill", TEAL, -17), ("training", "Training", ORANGE, 8)]:
             rs = [DATA[d if size == "135M" else d + "-large", "SmolLM2-" + size, "strict", phase] for size in ["135M", "360M", "1.7B"]]
             vals = [float(r["ratio"]) for r in rs]
             ax.plot(range(3), vals, "o-", color=color, label=title, linewidth=2)
             for i, (r, v) in enumerate(zip(rs, vals)):
                 spread = ast.literal_eval(r["paired_ratios"])
                 ax.vlines(i, min(spread), max(spread), color=color, linewidth=3)
-                ax.annotate(f"{v:.2f}", (i, v), xytext=(0, 8), textcoords="offset points", ha="center", color=color, fontsize=12)
+                ax.annotate(f"{v:.2f}", (i, v), xytext=(0, lift), textcoords="offset points", ha="center", color=color, fontsize=12)
         ax.set_title(DEVICES[d], loc="left", weight="bold")
         ax.set_xticks(range(3), ["135M", "360M", "1.7B"])
         ax.set_ylim(.9, 4.3)
-        ax.axhline(1, color="#637679", linestyle="--", linewidth=1)
+        ax.axhline(1, color=MUTED, linestyle="--", linewidth=1)
         clean(ax)
     axes[0].set_ylabel("Strict time ratio · lower is better")
     axes[1].legend(frameon=False, loc="upper left")
-    fig.text(.08, .07, "Dots: ratio of median process times. Lines at each dot: paired-process range, not a confidence interval.", fontsize=11)
+    fig.text(.08, .07, "Dots: Meganeura time ÷ PyTorch time. Bars: range over the three process pairs.", fontsize=11)
     save(fig, "scaling.svg")
 
 
@@ -135,15 +182,15 @@ def preparation_models():
     ax.invert_yaxis(); ax.set_xlim(0, 80)
     ax.set_xlabel("Seconds per workload process · strict f32")
     ax.spines[["top", "right"]].set_visible(False)
-    fig.text(.20, .95, "Meganeura: preparation, including search + checks", color=TEAL, fontsize=13, weight="bold")
-    fig.text(.20, .89, "PyTorch: compilation + first calls; checks/capture extra", color=ORANGE, fontsize=13, weight="bold")
-    fig.text(.20, .065, "Median across GPUs of 3-process medians. Same complete pairs: 7 GPUs; ResNet / Whisper: 6.", fontsize=10)
-    fig.text(.20, .018, "Recorded cache states retained. These columns include different work; budgets are not matched.", fontsize=10)
+    fig.text(.20, .95, "Meganeura: all preparation, almost all of it search", color=TEAL, fontsize=13, weight="bold")
+    fig.text(.20, .89, "PyTorch: compilation and first calls", color=ORANGE, fontsize=13, weight="bold")
+    fig.text(.20, .065, "Median across GPUs of three-process medians. ResNet and Whisper: 6 GPUs with complete PyTorch results.", fontsize=10)
+    fig.text(.20, .018, "The columns cover different work under different limits.", fontsize=10)
     save(fig, "preparation-models.svg")
 
 
 def compiler_map():
-    """One numbered route, including the design checkpoints from the story draft."""
+    """The compiler's route, top row left to right, then the bottom row back."""
     fig, ax = plt.subplots(figsize=(11.56, 4.38))
     fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
     ax.set(xlim=(0, 1156), ylim=(438, 0)); ax.axis("off")
@@ -155,7 +202,7 @@ def compiler_map():
         ("Plan", "Lower + fuse operators", "Order dispatches", "Reuse buffers by lifetime"),
         ("Specialize", "Shape + device + precision", "Scalar, subgroup or", "workgroup matrix kernels"),
         ("Compile", "WGSL → Naga → Blade", "Vulkan / Metal pipelines", "on the target device"),
-        ("Qualify + time", "Initialize → check → tune", "Race complete programs", "Keep a qualified winner"),
+        ("Check + time", "Initialize → check → tune", "Race complete programs", "Keep the fastest that passes"),
         ("Execute", "Static plan, resident tensors", "Record → submit → wait", "Share the application's queue"),
     ]
     points = [(20+285*i, 25) for i in range(4)] + [(20+285*i, 219) for i in reversed(range(4))]
@@ -176,7 +223,7 @@ def compiler_map():
             continue
         ax.annotate("", xy=b, xytext=a, arrowprops=dict(arrowstyle="->", color=TEAL, lw=2))
     ax.text(578, 194, "Search repeats 02–07: layouts, kernels, fusion and submission count", ha="center", fontsize=11, color=ORANGE)
-    ax.text(20, 396, "Compiler tests: CPU f64 oracle + finite differences", fontsize=12, weight="bold")
+    ax.text(20, 396, "Compiler tests: CPU f64 interpreter + finite differences", fontsize=12, weight="bold")
     ax.text(20, 426, "Benchmark harness: Inferena checks both engines, then warms up and times the selected programs", fontsize=11)
     save(fig, "compiler-map.svg")
 
@@ -221,6 +268,7 @@ def warmup():
 
 
 if __name__ == "__main__":
-    combined_results("accelerated")
-    combined_results("strict")
+    ratio_panels("strict")
+    ratio_panels("accelerated")
+    precision_gain()
     scaling();preparation();preparation_models();compiler_map();timing_spread();warmup()

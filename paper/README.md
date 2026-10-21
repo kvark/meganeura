@@ -35,7 +35,7 @@ writes the ninth, `ablation.tex`. Both also emit CSV/JSON summaries. See the
 
 The main [talk](p3hpc/presentation/slides.md) combines the graphics-API argument,
 the compiler architecture, hardware access and limits, and measured results.
-It has 19 main slides (19:15 of suggested speaking time) and 11 backups.
+It has 22 main slides (18:00 of suggested speaking time) and 15 backups.
 The alternative decks remain local references and are not part of this commit.
 
 The talk uses the later October 19 cohort: Inferena `add19182`, Meganeura
