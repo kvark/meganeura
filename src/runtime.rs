@@ -2097,6 +2097,18 @@ impl Pipelines {
                     }
                     crate::codegen::generate_flash_attention_coop_f32_module(hd)
                 }
+                ShaderGroup::AttentionGrad(kernel)
+                    if kernel.path
+                        == crate::kernels::attention_grad::Path::Cooperative(
+                            crate::kernels::attention_grad::Operands::F16,
+                        ) =>
+                {
+                    let rows = auto_tune(gpu, 0).coop_caps.f16_attention_rows;
+                    if rows == 0 {
+                        return Err("scaled attention requires native F16 matrices".into());
+                    }
+                    crate::codegen::generate_flash_grad_f16_module(kernel.part, hd, rows)
+                }
                 ShaderGroup::AttentionGrad(kernel) => {
                     let tile = if kernel.path
                         == crate::kernels::attention_grad::Path::Cooperative(
@@ -3249,8 +3261,8 @@ pub enum CoopPolicy {
     /// Prefer f32 operands and accumulators. On f16-only devices, enable f16 tiles for
     /// work that permits reduced input precision; `requires_full_precision`
     /// dispatches retain scalar f32 operands. Measured search also considers
-    /// device-qualified F16 and BF16 multiplication for forward products,
-    /// subject to the caller's whole-program accuracy and timing gates.
+    /// device-qualified F16/BF16 forward products and mixed-precision attention
+    /// derivatives, subject to the caller's whole-program accuracy and timing gates.
     #[default]
     Auto,
     /// Allow only f32 cooperative operands and accumulators, without f16
@@ -3276,8 +3288,11 @@ impl CoopPolicy {
     ) -> crate::codegen::CoopCaps {
         match self {
             Self::Disabled => caps = crate::codegen::CoopCaps::default(),
-            Self::NativeF32 => caps.f16_tile = 0,
-            Self::Auto | Self::AllowF16 => {}
+            Self::NativeF32 => {
+                caps.f16_tile = 0;
+                caps.f16_attention_rows = 0;
+            }
+            Self::AllowF16 | Self::Auto => {}
         }
         caps
     }
@@ -3744,10 +3759,7 @@ impl Session {
             log::warn!("cooperative matrices disabled by policy — forcing scalar matmul");
             return None;
         }
-        let caps = policy.filter_caps(crate::codegen::CoopCaps {
-            f16_tile: caps.f16_tile,
-            f32_tile: caps.f32_tile,
-        });
+        let caps = policy.filter_caps(*caps);
         log::info!(
             "coop caps: f16_tile={}, f32_tile={}",
             caps.f16_tile,
@@ -6155,7 +6167,8 @@ pub struct AutoTuneResult {
 /// no shared global to install — everything that reaches the compiler
 /// or the pipeline layer takes it as a parameter.
 pub fn auto_tune(gpu: &blade_graphics::Context, _head_dim: u32) -> AutoTuneResult {
-    let cm = gpu.capabilities().cooperative_matrix;
+    let capabilities = gpu.capabilities();
+    let cm = &capabilities.cooperative_matrix;
     let square = |shapes: &[[u32; 3]]| {
         [8, 16]
             .into_iter()
@@ -6166,6 +6179,14 @@ pub fn auto_tune(gpu: &blade_graphics::Context, _head_dim: u32) -> AutoTuneResul
         coop_caps: crate::codegen::CoopCaps {
             f16_tile: square(&cm.f16_f32_shapes),
             f32_tile: square(&cm.f32_shapes),
+            f16_attention_rows: if capabilities.shader_float16 {
+                [16, 8]
+                    .into_iter()
+                    .find(|&rows| cm.f16_f32_shapes.contains(&[rows, 16, 16]))
+                    .unwrap_or(0)
+            } else {
+                0
+            },
         },
     }
 }

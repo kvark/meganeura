@@ -659,6 +659,7 @@ mod tests {
                 caps: CoopCaps {
                     f32_tile: 16,
                     f16_tile: 16,
+                    f16_attention_rows: 0,
                 },
                 shared_memory_bytes: 32768,
                 forward_coop: true,
@@ -779,6 +780,7 @@ mod tests {
                 caps: CoopCaps {
                     f32_tile: tile,
                     f16_tile: 16,
+                    f16_attention_rows: 0,
                 },
                 shared_memory_bytes: bytes,
                 forward_coop: enabled,
@@ -832,6 +834,7 @@ mod tests {
                 caps: CoopCaps {
                     f32_tile: tile,
                     f16_tile: 16,
+                    f16_attention_rows: 0,
                 },
                 shared_memory_bytes: bytes,
                 forward_coop: true,

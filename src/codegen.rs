@@ -3449,11 +3449,15 @@ pub enum MatMulCoopVariant {
 pub struct CoopCaps {
     pub f16_tile: u32,
     pub f32_tile: u32,
+    /// Native F16 shape `[rows, 16, 16]` for scaled attention gradients,
+    /// or zero when unavailable.
+    #[serde(default)]
+    pub f16_attention_rows: u32,
 }
 
 impl CoopCaps {
     pub fn is_supported(&self) -> bool {
-        self.f16_tile > 0 || self.f32_tile > 0
+        self.f16_tile > 0 || self.f32_tile > 0 || self.f16_attention_rows > 0
     }
     /// True when the kernels that hardcode `coop_mat16x16<f16, ...>`
     /// can run (NVIDIA, RDNA3, Xe-HPG). False on Apple's 8x8 f32 path
@@ -3471,8 +3475,16 @@ mod coop_caps_tests {
     fn cooperative_caps_respect_tile_and_precision_requirements() {
         assert!(
             CoopCaps {
+                f16_attention_rows: 8,
+                ..Default::default()
+            }
+            .is_supported()
+        );
+        assert!(
+            CoopCaps {
                 f16_tile: 16,
                 f32_tile: 0,
+                f16_attention_rows: 0,
             }
             .supports_16x16_f16()
         );
@@ -3481,6 +3493,7 @@ mod coop_caps_tests {
                 !CoopCaps {
                     f16_tile: tile,
                     f32_tile: 0,
+                    f16_attention_rows: 0,
                 }
                 .supports_16x16_f16(),
                 "hard-coded 16x16 shaders must reject tile {tile}",
@@ -3491,14 +3504,18 @@ mod coop_caps_tests {
             let caps = CoopCaps {
                 f16_tile: 16,
                 f32_tile,
+                f16_attention_rows: 16,
             };
             let strict = CoopPolicy::NativeF32.filter_caps(caps);
             assert_eq!(strict.f32_tile, f32_tile);
             assert!(!strict.supports_16x16_f16());
+            assert_eq!(strict.f16_attention_rows, 0);
             assert_eq!(strict.is_supported(), f32_tile != 0);
             assert_eq!(CoopPolicy::Disabled.filter_caps(caps), CoopCaps::default());
             assert_eq!(CoopPolicy::Auto.filter_caps(caps), caps);
-            assert_eq!(CoopPolicy::AllowF16.filter_caps(caps), caps);
+            let f16_only = CoopPolicy::AllowF16.filter_caps(caps);
+            assert_eq!(f16_only.f16_tile, caps.f16_tile);
+            assert_eq!(f16_only.f16_attention_rows, caps.f16_attention_rows);
         }
     }
 }
@@ -3787,12 +3804,22 @@ mod tests {
                 (
                     ShaderGroup::AttentionGrad(AttentionGrad::new(Part::Q, COOP_F16)),
                     generate_flash_grad_q_coop_f16_module(head_dim),
-                    &["shared_k"][..],
+                    &[
+                        "shared_result",
+                        "shared_score",
+                        "shared_dp",
+                        "shared_anchor",
+                    ][..],
                 ),
                 (
                     ShaderGroup::AttentionGrad(AttentionGrad::new(Part::KV, COOP_F16)),
                     generate_flash_grad_kv_coop_f16_module(head_dim),
-                    &["shared_q", "shared_do"][..],
+                    &[
+                        "shared_result",
+                        "shared_score",
+                        "shared_dp",
+                        "shared_anchor",
+                    ][..],
                 ),
             ] {
                 for &name in scalar_arrays {
