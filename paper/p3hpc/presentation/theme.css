@@ -220,3 +220,33 @@ section.since-paper table { font-size: 23px; }
 section.since-paper th, section.since-paper td { padding: 11px 13px; }
 section.since-paper p { font-size: 24px; }
 section.api-code pre { font-size: 21px; line-height: 1.45; }
+
+/* Ratio colors match the charts: teal when Meganeura is faster, brown when slower. */
+.slower { color: #a44616; font-weight: 700; }
+.faster { color: #006b70; font-weight: 700; }
+/* Engine identity colors, as in the charts. */
+.mega { color: #006b70; font-weight: 700; }
+.torch { color: #a44616; font-weight: 700; }
+.stack-columns > div:not(.layers) { border-top: 0; padding-top: 4px; }
+
+section.results img { height: 432px; }
+section.results > p:last-of-type { font-size: 22px; line-height: 1.3; }
+
+section.measure { font-size: 24px; }
+section.measure h1 { margin-bottom: 16px; }
+section.measure .experiment li { margin: 4px 0; }
+section.measure .experiment h3 { margin-bottom: 6px; }
+section.measure > p { margin: 12px 0 0; font-size: 23px; }
+
+section.mi300 .mi300-columns { grid-template-columns: 1.35fr 1fr; gap: 46px; }
+section.mi300 li { font-size: 25px; margin: 14px 0; }
+section.mi300 p { font-size: 22px; }
+.big-number { margin: 8px 0 26px; }
+.big-number strong { display: block; font-size: 104px; letter-spacing: -4px; line-height: 1.05; }
+.big-number span { display: block; font-size: 25px; margin-top: 6px; }
+
+section.since-paper td:not(:first-child), section.since-paper th:not(:first-child) { text-align: right; }
+section.since-paper td:last-child { font-weight: 700; color: #12363d; }
+
+section.stages table { font-size: 21px; }
+section.stages th, section.stages td { padding: 10px 12px; }
