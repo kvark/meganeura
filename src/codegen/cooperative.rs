@@ -306,6 +306,63 @@ mod tests {
     }
 
     #[test]
+    fn checked_predicates_are_eager_but_storage_reads_stay_conditional() {
+        for a in [DType::F32, DType::F16, DType::BF16] {
+            for b in [DType::F32, DType::F16, DType::BF16] {
+                for multiply in [DType::F32, DType::F16, DType::BF16] {
+                    for output in [DType::F32, DType::F16, DType::BF16] {
+                        let types = MatrixTypes {
+                            a,
+                            b,
+                            multiply,
+                            output,
+                        };
+                        if !types.is_valid() {
+                            continue;
+                        }
+                        for shape in [[16, 16, 16], [8, 16, 16]] {
+                            for group in [
+                                ShaderGroup::MatMul,
+                                ShaderGroup::MatMulAT,
+                                ShaderGroup::MatMulBT,
+                                ShaderGroup::MatMulAdd,
+                                ShaderGroup::MatMulATAdd,
+                                ShaderGroup::MatMulBTAdd,
+                                ShaderGroup::Conv2dChecked {
+                                    kernel_h: 2,
+                                    kernel_w: 4,
+                                    stride: 2,
+                                },
+                            ] {
+                                let module = generate(group, types, shape);
+                                assert!(
+                                    module
+                                        .source
+                                        .contains("if all(vec2<bool>((ar < m), (ak < k))) { a =")
+                                );
+                                assert!(
+                                    module
+                                        .source
+                                        .contains("if all(vec2<bool>((bk < k), (bc < n))) { b =")
+                                );
+                                // Output handling and memory access remain guarded; only
+                                // comparisons, never the storage reads, become eager.
+                                assert!(module.source.contains("if r < m && c < n {"));
+                                if matches!(group, ShaderGroup::Conv2dChecked { .. }) {
+                                    assert!(module.source.contains("if any(vec4<bool>((ih < 0), (iw < 0), (ih >= i32(params.in_h)), (iw >= i32(params.in_w)))) {"));
+                                    assert!(module.source.contains(
+                                        "return src[((image * params.in_channels + channel)"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn typed_dense_uses_shared_staging_and_register_tiles() {
         use super::super::{TypedMatmulLayout, generate_module_coop_typed_with_layout};
         for storage in [DType::F16, DType::BF16] {
