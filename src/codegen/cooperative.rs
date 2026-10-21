@@ -13,8 +13,13 @@ pub(super) const SPLIT_RANGE: &str = "let blocks = (k + 31u) / 32u;\n\
 /// Dense and implicit-GEMM convolutions share the same checked cooperative
 /// loop. Operands are staged in the multiplication type; the accumulator is
 /// F32, and so are partials until their reduction.
-pub(super) fn generate(group: ShaderGroup, types: MatrixTypes, shape: [u32; 3]) -> ShaderModule {
-    generate_with_params(group, types, shape, None)
+pub(super) fn generate(
+    group: ShaderGroup,
+    types: MatrixTypes,
+    shape: [u32; 3],
+    subgroup: u32,
+) -> ShaderModule {
+    generate_with_params(group, types, shape, None, subgroup)
 }
 
 pub(super) fn generate_with_params(
@@ -22,6 +27,7 @@ pub(super) fn generate_with_params(
     types: MatrixTypes,
     shape: [u32; 3],
     params: Option<&Params>,
+    subgroup: u32,
 ) -> ShaderModule {
     types.validate();
     assert!(
@@ -178,16 +184,22 @@ pub(super) fn generate_with_params(
         group,
         ShaderGroup::Conv2dBF16 { .. } | ShaderGroup::Conv2dChecked { .. }
     );
+    // Use one subgroup per rectangular convolution tile where possible. The
+    // runtime width may differ, so the shader still pairs or loops over tiles.
+    let threads = if m == 8 && convolution {
+        if subgroup == 0 {
+            256
+        } else {
+            (8 * subgroup).clamp(128, 256)
+        }
+    } else {
+        128
+    };
     ShaderModule::new(&preprocess(
         include_str!("../shaders/matmul_checked.wgsl"),
         &[
             ("$STAGE", stage),
-            // Rectangular convolutions benefit from one 32-lane subgroup per
-            // 8x16 tile, reducing register pressure in the implicit-GEMM loads.
-            (
-                "$THREADS",
-                if m == 8 && convolution { "256" } else { "128" },
-            ),
+            ("$THREADS", &threads.to_string()),
             ("$A_VECTOR", &convert("v", types.a)),
             ("$B_VECTOR", &convert("v", types.b)),
             ("$EXTENSIONS", &extensions),
@@ -345,9 +357,21 @@ mod tests {
                     [64, 64, 64],
                 ),
             ] {
-                let mut module = super::super::generate_module_coop_typed_with_layout(
-                    group, types, shape, layout,
+                let subgroup = if layout.vectorized { 16 } else { 32 };
+                let mut module = super::super::generate_module_coop_typed_with_subgroup(
+                    group, types, shape, layout, subgroup,
                 );
+                if shape[0] == 8
+                    && matches!(
+                        group,
+                        ShaderGroup::Conv2dBF16 { .. } | ShaderGroup::Conv2dChecked { .. }
+                    )
+                {
+                    assert_eq!(
+                        module.module.entry_points[0].workgroup_size,
+                        [8 * subgroup, 1, 1]
+                    );
+                }
                 let mut binding = 0;
                 for (_, global) in module.module.global_variables.iter_mut() {
                     if matches!(
@@ -405,42 +429,49 @@ mod tests {
                         column_width_multiplier: 0,
                         output_spatial_multiplier: 0,
                     };
-                    let mut module = generate_with_params(
-                        ShaderGroup::Conv2dChecked {
-                            kernel_h: kh,
-                            kernel_w: kw,
-                            stride,
-                        },
-                        MatrixTypes {
-                            multiply,
-                            ..MatrixTypes::F32_AS_F16
-                        },
-                        shape,
-                        Some(&params),
-                    );
-                    let mut binding = 0;
-                    for (_, global) in module.module.global_variables.iter_mut() {
-                        if matches!(
-                            global.space,
-                            naga::AddressSpace::Uniform | naga::AddressSpace::Storage { .. }
-                        ) {
-                            global.binding = Some(naga::ResourceBinding { group: 0, binding });
-                            binding += 1;
+                    for (subgroup, threads) in [(0, 256), (16, 128), (32, 256)] {
+                        let mut module = generate_with_params(
+                            ShaderGroup::Conv2dChecked {
+                                kernel_h: kh,
+                                kernel_w: kw,
+                                stride,
+                            },
+                            MatrixTypes {
+                                multiply,
+                                ..MatrixTypes::F32_AS_F16
+                            },
+                            shape,
+                            Some(&params),
+                            subgroup,
+                        );
+                        assert_eq!(
+                            module.module.entry_points[0].workgroup_size,
+                            [if shape[0] == 8 { threads } else { 128 }, 1, 1],
+                        );
+                        let mut binding = 0;
+                        for (_, global) in module.module.global_variables.iter_mut() {
+                            if matches!(
+                                global.space,
+                                naga::AddressSpace::Uniform | naga::AddressSpace::Storage { .. }
+                            ) {
+                                global.binding = Some(naga::ResourceBinding { group: 0, binding });
+                                binding += 1;
+                            }
                         }
+                        let info = naga::valid::Validator::new(
+                            naga::valid::ValidationFlags::all(),
+                            capabilities,
+                        )
+                        .validate(&module.module)
+                        .unwrap();
+                        naga::back::spv::write_vec(
+                            &module.module,
+                            &info,
+                            &naga::back::spv::Options::default(),
+                            None,
+                        )
+                        .unwrap();
                     }
-                    let info = naga::valid::Validator::new(
-                        naga::valid::ValidationFlags::all(),
-                        capabilities,
-                    )
-                    .validate(&module.module)
-                    .unwrap();
-                    naga::back::spv::write_vec(
-                        &module.module,
-                        &info,
-                        &naga::back::spv::Options::default(),
-                        None,
-                    )
-                    .unwrap();
                 }
             }
         }

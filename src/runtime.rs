@@ -1195,7 +1195,7 @@ impl SharedPipelines {
 struct Pipelines {
     map: HashMap<Variant, Arc<SharedPipeline>>,
     /// Resolved after compilation or tuning, never while recording a step.
-    selected: Vec<Arc<SharedPipeline>>,
+    selected: Vec<(Variant, Arc<SharedPipeline>)>,
     /// Codegen knobs the plan was compiled with.
     knobs: crate::compile::TuningKnobs,
     /// Where to write every WGSL the pipeline layer compiles — [`SessionOptions::wgsl_dump_dir`].
@@ -1903,14 +1903,16 @@ impl Pipelines {
                     types,
                     typed_shape(types.multiply)?,
                     params,
+                    gpu.capabilities().subgroup_size,
                 )
             }
             Variant::CoopTyped(_, types, staging) => {
-                crate::codegen::generate_module_coop_typed_with_layout(
+                crate::codegen::generate_module_coop_typed_with_subgroup(
                     group,
                     types,
                     typed_shape(types.multiply)?,
                     staging,
+                    gpu.capabilities().subgroup_size,
                 )
             }
             Variant::CoopWorkgroup(_, shape, types) => {
@@ -1953,10 +1955,12 @@ impl Pipelines {
             Variant::Scalar(_) => match group {
                 ShaderGroup::Conv2dBF16 { .. } => {
                     let types = checked_matrix_types(dispatch).expect("BF16 convolution types");
-                    crate::codegen::generate_module_coop_typed_with_shape(
+                    crate::codegen::generate_module_coop_typed_with_subgroup(
                         group,
                         types,
                         typed_shape(types.multiply)?,
+                        Default::default(),
+                        gpu.capabilities().subgroup_size,
                     )
                 }
                 _ => crate::codegen::generate_module(group, matmul_knobs),
@@ -2318,17 +2322,18 @@ impl Pipelines {
             .iter()
             .map(|dispatch| {
                 let key = Self::key(dispatch);
-                Arc::clone(
+                let pipeline = Arc::clone(
                     self.map
                         .get(&key)
                         .unwrap_or_else(|| panic!("no pipeline was compiled for {dispatch:?}")),
-                )
+                );
+                (key, pipeline)
             })
             .collect();
     }
 
     fn get(&self, dispatch_index: usize) -> &blade_graphics::ComputePipeline {
-        &self.selected[dispatch_index].raw
+        &self.selected[dispatch_index].1.raw
     }
 
     fn all_pipelines(&self) -> Vec<(&str, &blade_graphics::ComputePipeline)> {
@@ -4983,10 +4988,10 @@ impl Session {
     /// fused RmsNorm, fused epilogue or prologue, attention width, or a
     /// generated pointwise/reduction kernel.
     pub fn dispatch_pipeline_keys(&self) -> Vec<String> {
-        self.plan
-            .dispatches
+        self.pipelines
+            .selected
             .iter()
-            .map(|dispatch| Pipelines::key(dispatch).label())
+            .map(|selected| selected.0.label())
             .collect()
     }
 
