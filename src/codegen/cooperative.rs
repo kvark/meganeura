@@ -35,6 +35,7 @@ pub(super) fn generate_with_params(
         "unsupported cooperative tile {shape:?}"
     );
     let [m, n, k] = shape;
+    let variant = coop_shape(group).map(|(_, variant)| variant);
     let split_range = SPLIT_RANGE.replace("wgid.", "group.");
     let vector_conv = params.is_some_and(Params::vectorized_forward);
     let (declaration, dimensions, range, a, b, index, destination, add) = match group {
@@ -196,6 +197,22 @@ pub(super) fn generate_with_params(
         &[
             ("$STAGE", stage),
             ("$THREADS", &threads.to_string()),
+            (
+                "$TRANSPOSE_A",
+                if variant == Some(MatMulCoopVariant::AT) {
+                    "true"
+                } else {
+                    "false"
+                },
+            ),
+            (
+                "$TRANSPOSE_B",
+                if variant == Some(MatMulCoopVariant::BT) {
+                    "true"
+                } else {
+                    "false"
+                },
+            ),
             ("$A_VECTOR", &convert("v", types.a)),
             ("$B_VECTOR", &convert("v", types.b)),
             ("$EXTENSIONS", &extensions),
