@@ -22,8 +22,8 @@ Dzmitry Malyshau · Independent Researcher
 [github.com/kvark/meganeura](https://github.com/kvark/meganeura)
 
 <!--
-Time: 0:20. Target: about 19:15 of material in a 20-minute speaking slot.
-Nineteen main slides; eleven backups outside the speaking slot.
+Time: 0:20. Target: 18:50 of material in a 20-minute speaking slot.
+22 main slides; 14 backups outside the speaking slot.
 
 The long-term motivation is continual reinforcement learning in an embodied
 agent. If learning stays on the device, the machine must run both the policy
@@ -34,7 +34,7 @@ All framework performance claims use the final paired-v33 / Android-v15
 cohort: Inferena add19182, Meganeura c19cb1c, PyTorch 2.13.0 at cf30153c.
 The paper and this deck use the same final data. DinoVision remains a
 separately versioned application study. Source: data/summary.json and
-../RESULTS.md. The eleven backup slides are outside the main talk.
+../RESULTS.md. The backup slides are outside the main talk.
 -->
 
 ---
@@ -44,72 +44,74 @@ separately versioned application study. Source: data/summary.json and
 
 # One GPU
 
+<div class="game-intro"><div>
+
 GPUs grew up rendering games.
 
 > Why does learning need a separate software stack?
 
-The application already has a GPU, a driver, buffers and a queue.
-
 **Can Vulkan + Metal carry inference and training too?**
 
-<!--
-Time: 0:45.
-Open with the deployment problem. A game, robot or headset already uses a
-graphics API. Adding learning often brings another runtime, compiler and
-vendor-specific set of libraries. Those stacks offer powerful features and
-tuned kernels; the question is how much of that work the existing graphics
-stack can do, and what performance we give up.
-The continual-RL motivation can be one spoken sentence here; its loop stays
-in backup. This experiment measures runtime capability, not an RL algorithm.
--->
+</div><figure>
+<img src="assets/unreal-tournament.jpg" alt="Unreal Tournament gameplay: a first-person arena fight">
+<figcaption>Unreal Tournament (1999) · Epic Games / Digital Extremes<br>Screenshot from the Steam store</figcaption>
+</figure></div>
 
+<!--
+Time: 0:40.
+A game, robot or headset already has a GPU, a driver, buffers and a queue.
+Adding learning often brings another runtime, compiler and vendor-specific
+libraries. How much can the application's existing graphics stack do?
+Continual RL is the long-term motivation; the study measures inference and
+training infrastructure, not an RL algorithm. Its loop stays in backup.
+The screenshot illustrates the graphics origin, not a Meganeura integration.
+Image: https://store.steampowered.com/app/13240/
+Source image URL and attribution: assets/README.md.
+-->
 
 ---
 
 <!-- _header: 06 + 08 · native GPU access -->
-<!-- _class: blade -->
+<!-- _class: stack -->
 
-# Blade
+# Reaching the GPU
 
-**A rendering library supplies the compute runtime.**
+**Blade supplies the compute half of a rendering library.**
 
-| Backend | Native platforms | GPU families |
-|---|---|---|
-| Vulkan | Linux · Windows · Android | NVIDIA · AMD · Intel · Qualcomm · others |
-| Metal | macOS · iOS · tvOS | Apple devices |
+<div class="columns stack-columns"><div class="layers">
+<div><b>Meganeura</b><span>Graph, kernels, memory and dispatch plan</span></div>
+<div><b>Naga</b><span>WGSL → SPIR-V / Metal Shading Language</span></div>
+<div><b>Blade</b><span>Device, buffers, pipelines, passes, timestamps</span></div>
+<div><b>Driver</b><span>NVIDIA · RADV · ANV · Adreno · Apple</span></div>
+</div><div>
 
-Vulkan + Metal cover the major modern native platforms. Device features and driver support set the floor.
+### Thin on purpose
 
-**WGSL → Naga → SPIR-V / MSL → driver**
+- Bind shader data by field name
+- Global barriers between passes
+- Use the API's validation layers
+- Share the renderer's context and queue
 
-One Blade context can own the ML buffers, compute pipelines and renderer.
+</div></div>
 
-<small>Naga is the shader compiler; wgpu's runtime is not used. Some matrix/BF16 features are carried in our Naga fork and are not all upstream at the measured revision.</small>
+**Vulkan:** Linux · Windows · Android &nbsp; **Metal:** macOS · iOS · tvOS
+
+<small>Modern native platforms; device features set the floor. Naga fork: some matrix / BF16 features are outside upstream at the measured revision.</small>
 
 <!--
-Time: 1:00.
-Blade is a thin Rust GPU abstraction used for both rendering and compute.
-It handles buffers, pipelines, command recording and synchronization.
-Bindings follow named Rust shader-data fields; pass-level barriers avoid a
-per-resource state tracker. Meganeura keeps the model graph and scheduling
-policy above this layer. No CUDA/HIP/XPU runtime is linked into the native runner.
-
-This is API/platform reach, not a claim that every device on those platforms
-was tested. Modern native systems are broadly covered; very old GPUs and
-drivers without the required compute features are outside the target.
-Apple mobile platforms are Blade targets, not additional measured platforms
-in this cohort. Experimental MI300X support required Mesa and kernel changes.
-
-The measured pins are Blade 4845d6529c38b07718a624bf3c4f2ab4317c9bf4 and
-Naga 13f582ddd2792befb46952498010248bd65818e6. The fork includes rectangular
-cooperative matrices, BF16 and workgroup-scope matrices. Vulkan goes through
-SPIR-V; Metal through MSL, including simdgroup matrices where available.
-Sources:
-https://github.com/kvark/blade/blob/4845d6529c38b07718a624bf3c4f2ab4317c9bf4/docs/README.md
-https://github.com/kvark/wgpu/commit/13f582ddd2792befb46952498010248bd65818e6
+Time: 0:55.
+Blade was written for rendering. Its compute interface gives Meganeura native
+GPU access without bringing in a vendor compute SDK. Naga translates WGSL;
+we do not use the wgpu runtime. Named bindings avoid manually assigned shader
+binding numbers. Blade uses global pass barriers rather than tracking each
+resource's state and relies on native validation layers.
+Vulkan and Metal cover the major modern native platforms, not literally every
+GPU ever made. Features, drivers and OS versions still constrain support.
+The frozen cohort uses Blade 4845d65 and Naga 13f582d (README pins). Backend
+line counts from the older story deck are deliberately omitted.
+Sources: Blade blade-graphics/etc/motivation.md; ../main.tex, How Meganeura Works;
 https://github.com/kvark/inferena/blob/add19182e5479e3f7549894c524ac6691d3dc363/Cargo.lock
 -->
-
 
 ---
 
@@ -123,7 +125,7 @@ https://github.com/kvark/inferena/blob/add19182e5479e3f7549894c524ac6691d3dc363/
 One compiler path for inference and training. **Measured search revisits the choices on the target GPU.**
 
 <!--
-Time: 1:35.
+Time: 1:05.
 Follow the numbered track across the top, then right to left along the bottom.
 The route connects graph semantics, GPU kernels and application execution.
 
@@ -159,6 +161,85 @@ Inferena qualifies the selected programs and the PyTorch baseline before
 held-out timing. The numbered headers return to these checkpoints later.
 Source: ../main.tex, How Meganeura Works; ../../../src/graph/composite.rs;
 ../../../docs/testing.md. Measured engine: c19cb1c.
+-->
+
+---
+
+<!-- _header: 01 · describe -->
+<!-- _class: models -->
+
+# Models
+
+**A static graph of typed operations.** New models compose existing ops.
+
+<div class="factors model-classes">
+<div><h3>Primitive</h3><p>GPU lowering, CPU f64 semantics and a gradient rule.</p><small>MatMul · Add · Exp<br>Conv2d · Embedding</small></div>
+<div><h3>Composite</h3><p>A named operation with a decomposition into primitives.</p><small>Softmax · RmsNorm<br>Gelu · CausalAttention</small></div>
+<div><h3>Private</h3><p>Forms introduced by optimization and differentiation.</p><small>FusedMatMulAdd<br>WinogradConv2d<br>Conv2dGradWeight</small></div>
+</div>
+
+**Softmax(x) ⇄ exp(x − max x) / Σ exp(x − max x)**
+
+<small>Decompose to define and check; recognize the pattern to run a fused kernel.<br>Rust builders, ONNX, NNEF and GGUF feed the same graph.</small>
+
+<!--
+Time: 1:00.
+The graph has static shapes and storage types. Primitive semantics follow
+StableHLO where applicable; nondifferentiable inputs do not acquire gradients.
+Composites supply a decomposition, so the compiler can recognize and fuse
+familiar patterns without making every model depend on bespoke kernels.
+Private forms are created by compiler passes, not by the public model builder.
+Unlike the old variant, this slide does not freeze stale counts of op classes.
+Sources: src/graph/composite.rs, src/graph/decompose.rs and the importers.
+-->
+
+---
+
+<!-- _header: 05 + 06 · specialize and compile -->
+<!-- _class: kernels -->
+
+# Kernels
+
+**WGSL source, specialized for shape, device and precision.**
+
+<div class="columns kernel-columns"><div>
+
+```wgsl
+// Matrix-vector template, abridged
+var<storage> matrix_b: $B_STORAGE;
+const LANES: u32 = $LANESu;
+
+// Filled by the generator:
+$NORM_PROLOGUE
+$WEIGHT_LOAD
+$REDUCTION
+```
+
+</div><div>
+
+### Three ways to compose
+
+**Templates:** sections and substitutions for storage, loads and reductions.
+
+**Pointwise chains:** one kernel, or a matrix product's epilogue.
+
+**Matrix and attention generators:** code for the device's tile shapes.
+
+</div></div>
+
+<small>Naga validates and translates the generated WGSL; the driver builds the GPU pipeline.</small>
+
+<!--
+Time: 1:00.
+The example illustrates source generation; it is not standalone valid WGSL.
+Templates cover reusable kernel structure. Pointwise operations are emitted
+as a chain or fused into an epilogue. Matrix and attention generators handle
+specialized tiling and data movement. Device limits are checked before pipeline
+creation. Different graph forms can produce different kernels.
+The old story draft's compile-stage timings and source line counts describe a
+separate September experiment; they are not reused as October measurements.
+Sources: src/shaders/matmul_gemv.wgsl; docs/shader-generation.md;
+src/codegen/ and src/compile/.
 -->
 
 ---
@@ -199,7 +280,7 @@ More parallel work; an extra reduction.
 Time both forms, including the reduction. Keep a faster candidate only after numerical checks.
 
 <!--
-Time: 1:05.
+Time: 0:50.
 
 Give the concrete example before explaining the policy: three attention
 projections can remain independent or become one packed matrix product.
@@ -226,48 +307,78 @@ Source: ../main.tex, How Meganeura Works and Compile-Time Search.
 
 ---
 
-<!-- _header: 05–06 · what the API and compiler expose -->
+<!-- _header: Across the compiler · semantic checks -->
+<!-- _class: correctness -->
+
+# Correctness
+
+**A CPU f64 interpreter defines the reference, separately from GPU lowering.**
+
+| What can go wrong? | Check |
+|---|---|
+| Derivative rule | Symbolic gradients against finite differences, under a weighted loss |
+| GPU kernel | Every output element against the interpreter, including tile edges |
+| Compiler transformation | Composed and random graphs through rewrites, fusion and memory reuse |
+
+Buffers start as **NaN**, so missing writes show up. Error bounds account for reduction length and cancellation.
+
+<small>These are compiler tests. Benchmark qualification checks each selected program separately.</small>
+
+<!--
+Time: 1:00.
+Two engines agreeing is useful evidence, but cannot establish which one is
+right when they differ. The naive f64 interpreter supplies an independent
+arithmetic implementation. Shapes and metadata are shared; lowering and
+shader arithmetic are not. Weighted losses avoid testing only an all-ones
+upstream derivative. Composed tests exercise the whole compiler rather than
+just individual ops. These checks found dropped parameter gradients, loss
+reduction mistakes, cancellation in norms and a headset layout bug whose
+images still looked plausible. They are test coverage, not a proof over all
+inputs. Sources: ../main.tex, Checking the Compiler and Its Kernels;
+docs/testing.md; src/reference/ and tests/oracle/.
+-->
+
+---
+
+<!-- _header: Hardware · operations and control -->
 <!-- _class: hardware -->
 
 # Hardware access
 
-| Hardware feature | Vulkan route¹ | Measured stack |
+| Hardware operation | Vulkan / Metal route | Reach of this stack |
 |---|---|---|
-| Matrix multiply | KHR cooperative_matrix | Used on NVIDIA + AMD |
-| BF16 matrices | KHR shader_bfloat16 | NVIDIA / Intel expose it; RADV here does not |
-| Workgroup-wide tiles | NV cooperative_matrix2 | Used on NVIDIA |
-| Tensor loads + matrix reductions | NV cooperative_matrix2 | RTX 5070 driver supports them; compiler does not |
-| FP8 matrices | EXT shader_float8 | RTX 5070 driver supports them; compiler does not |
+| Matrix multiply | Cooperative / simdgroup matrices | Query supported types and tile shapes |
+| Workgroup-wide products | `NV_cooperative_matrix2` | Used on NVIDIA, including H100 |
+| Hopper's async warpgroup MMA | CUDA/PTX `wgmma` controls | No direct instruction or scheduling control in our shaders |
+| Cross-block shared memory | CUDA thread-block clusters | No equivalent in our Vulkan / Metal path |
 
-<small>¹ Extension names omit VK_. FP16 scalars, subgroup operations and packed int8 dots are also available where supported.</small>
+**The driver chooses the matrix instructions.**
+
+<small>Workgroup-wide products do not prove WGMMA use; the H100 binary was not inspected.</small>
 
 <!--
 Time: 1:15.
-Separate four questions: can the hardware do it, does the driver expose it,
-does our compiler support it, and did search choose it? They are not equivalent.
-KHR cooperative matrices give Vulkan a portable abstraction for matrix units.
-The measured compiler handles f16, f32 and BF16 tiles as advertised, including
-Intel's rectangular 8x16x16 shape. Intel's selected-program result follows later.
-NVIDIA workgroup-scope matrices and flexible dimensions are implemented and
-selected. Blade enables those two matrix2 features, not tensor addressing,
-block loads, matrix reductions or accumulator conversions. The October 15
-read-only RTX 5070 driver query reports those features and FP8 support.
-They are concrete compiler opportunities, not missing Vulkan extensions.
-RADV on the measured RX 7900 XT and MI300X exposes no BF16 cooperative shape.
-
-Do not use TF32 as an explanation for this cohort's gap. It is prohibited by
-the strict policy and disabled for the accelerated baseline's remaining f32
-operations. Faster lower-precision types are already used in accelerated.
-Its possible role is an intermediate accuracy/range choice, discussed in backup.
-No one-to-one hardware instruction match is established by these API queries.
-
-Sources: data/hardware.json; Blade 4845d65 vulkan/init.rs:1373–1384;
-https://docs.vulkan.org/features/latest/features/proposals/VK_KHR_cooperative_matrix.html
-https://docs.vulkan.org/refpages/latest/refpages/source/VK_KHR_shader_bfloat16.html
-https://docs.vulkan.org/refpages/latest/refpages/source/VK_NV_cooperative_matrix2.html
-https://docs.vulkan.org/refpages/latest/refpages/source/VK_EXT_shader_float8.html
+Do not list AMD BF16 as a fundamental API gap: its absence in this particular
+RADV snapshot is a driver-version detail. Vulkan has BF16 shader and matrix
+support and Metal has simdgroup matrix operations.
+Likewise, it would be incorrect to say all wide products are missing on H100:
+selected cohort programs already use CooperativeWorkgroup kernels. Vulkan's
+opaque matrix operation leaves native instruction selection to the driver.
+We have no H100 SASS audit proving whether it chooses WGMMA, so this slide
+claims a lack of explicit shader control, not proven absence of the hardware
+instruction. PTX exposes asynchronous warpgroup MMA and its synchronization;
+our WGSL/SPIR-V path does not expose these controls directly.
+Hopper thread-block clusters can access shared memory across blocks. The
+Vulkan/Metal path used in the study has no equivalent address space or cluster
+launch interface. That is distinct from ordinary workgroup shared memory.
+Tensor addressing/reductions are advertised on 5070 but not used by this
+compiler; they are implementation work, not fundamentally absent features.
+Sources: data/hardware.json; data/summary.json accelerated_selection;
+https://docs.vulkan.org/features/latest/features/proposals/VK_NV_cooperative_matrix2.html
+https://docs.vulkan.org/spec/latest/chapters/shaders.html#shaders-cooperative-matrices
+https://docs.nvidia.com/cuda/archive/13.0.3/hopper-tuning-guide/index.html
+https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-instructions
 -->
-
 
 ---
 
@@ -290,7 +401,7 @@ Both API pairs allow **1,024 threads** per workgroup.
 <small>NVIDIA 595.91.07 · Intel Mesa 26.0.3 / Level Zero 1.14.37020. Reported limits alone do not explain the timing gap.</small>
 
 <!--
-Time: 0:50.
+Time: 0:40.
 The CUDA number is the opt-in maximum, not its default 48 KiB allocation.
 101,376 bytes is 99 KiB; Vulkan reports 49,152 bytes. B570 reports 131,072
 bytes through PyTorch XPU's Level Zero backend and 49,152 through Vulkan.
@@ -386,7 +497,7 @@ Intel RPL-U · Quest 3S / Adreno 740
 **PyTorch 2.13:** default `torch.compile`; CUDA / HIP / XPU graph replay. MPS uses compiled calls. **Two profiles: strict and accelerated.**
 
 <!--
-Time: 0:55.
+Time: 0:50.
 The baseline avoids per-operator Python dispatch where graph replay is available.
 Max-autotune is off; compilation has a supervised 120-second limit. Native
 search has 30 seconds per session, so this is not an equal-preparation-budget
@@ -400,11 +511,14 @@ four vendors. Source: ../main.tex, Methodology; ../tables/devices.tex.
 
 ---
 
+<!-- _class: protocol -->
 <!-- _header: 07 · correctness, then Inferena timing -->
 
 # Check, then time
 
-**Qualify → 10 s warmup → 20 synchronized samples → 3 process pairs**
+**Check → warm up for 10 s → time 20 calls → repeat in 3 fresh runs**
+
+<small>Each timed call waits for GPU completion. Each repeat runs both engines in separate processes, alternating which goes first.</small>
 
 - Meganeura: full outputs and gradients against its original **strict-f32 graph**.
 - PyTorch AMP: f32 forward fidelity, repeatability, and **matched SGD trajectories**.
@@ -415,8 +529,13 @@ four vendors. Source: ../main.tex, Methodology; ../tables/devices.tex.
 <small>Timed training = forward + loss + backward. No optimizer update. Native selected programs do not undergo PyTorch's 256-step real-text gate.</small>
 
 <!--
-Time: 1:05.
-Report the median of three process medians, alternating engine order. Warmup
+Time: 0:45.
+A sample is one host-wall timing of a model call, including GPU completion,
+not merely queue submission. A process pair means a fresh Meganeura process
+and a fresh PyTorch process for the same device, workload and contract;
+the engines run sequentially, not concurrently. There are three such pairs.
+Take the median of 20 samples in each process, then the median of those three
+medians per engine; divide Meganeura by PyTorch. Engine order alternates. Warmup
 is at least five calls and ten seconds; Android correctness-only runs use two
 seconds and one sample, with no published timing. Upload/readback are untimed.
 Native candidates are checked before selection and the selected program has
@@ -433,89 +552,64 @@ we have no tolerance-sensitivity experiment. Source: ../main.tex, Numerical gate
 
 ---
 
-<!-- _header: Performance · strict f32 inference -->
-<!-- _class: chart -->
-
-# Inference by GPU
-
-![Strict inference time ratios for seven GPUs and five workloads](figures/strict-inference.svg)
-
-**Median 1.35×.** MI300X uses patched Vulkan support. B570 SD U-Net: **5.89 / 1.08 ms**; its native timing varies.
-
-<!--
-Time: 1:10.
-Teal means a ratio below one, orange above one; colors are categorical,
-not a continuous scale. RX 7900 XT SmolLM2 prefill is 5.56 versus 9.17 ms,
-a 0.61 ratio. RTX 5070 SmolLM2 is near parity at 1.04. B570 loses all core
-paired phases. Its rectangular matrix tiles are supported, but selected
-B570 programs have no cooperative dispatches. SD U-Net strict inference
-retains all three native process medians: 5.894, 6.128 and 4.883 ms; Torch
-is 1.082, 1.082 and 1.084 ms. The 5.45 ratio is present in the raw receipts,
-not a plotting error. Search timings and held-out timings differ substantially;
-this is a performance issue to investigate, not a reason to replace the result.
-An October 19 follow-up kept one selected strict SD U-Net program fixed:
-inference took 4.438 / 5.472 / 5.786 / 5.766 ms after 5 / 15 / 30 / 60 seconds,
-while sampled GT clocks fell from 1750 to 1400 to 1300 MHz. All checkpoints
-use the same plan hash and one submission; no throttle flag was set near the
-sample windows. This points to clock policy as a factor, not solely search
-selection. It does not prove why clocks changed or explain the full historical
-regression. One diagnostic process, core c19cb1c, study runner b110188; it
-passes the original-f32 full-tensor gates and does not replace cohort values.
-M3 has substantial variation in both engines, so a ratio near one is inconclusive.
-Source: data/results.csv; data/summary.json.
--->
-
----
-
-<!-- _header: Performance · strict f32 forward + loss + backward -->
-<!-- _class: chart -->
-
-# Training by GPU
-
-![Strict training time ratios; two unqualified reference cells are marked with dashes](figures/strict-training.svg)
-
-**Median 1.61×; 4 / 33 nominal native wins.** A numerical rejection supplies no speed ratio.
-
-<!--
-Time: 0:50.
-There are four nominal native wins out of 33 comparisons. Missing strict
-Whisper on RX 7900 XT and ResNet on MI300X are PyTorch repeatability-gate
-failures. Native remains independently qualified. These failures do not
-prove a vendor bug or unusable accuracy under another application's policy.
-The higher-level training work is forward, loss and backward only: no
-optimizer update in the timing. Host-wall times include recording,
-submission, synchronization and kernels; these ratios do not separate them.
-Source: data/results.csv; ../RESULTS.md.
--->
-
----
-
-<!-- _header: 05 · arithmetic choices -->
+<!-- _header: Performance · accelerated contract -->
+<!-- _class: contracts -->
 
 # Accelerated arithmetic
 
-| Core median time ratio | Strict f32 | Accelerated |
-|---|---:|---:|
-| Inference | **1.35×** · 35 pairs | **2.06×** · 32 pairs |
-| Forward + loss + backward | **1.61×** · 33 pairs | **2.21×** · 32 pairs |
+**Let each engine use reduced precision, then check the result.**
 
-**PyTorch:** BF16 autocast on CUDA / HIP / XPU; FP16 on MPS. Backward included.
-**Meganeura:** qualified f32 / f16 / BF16 matrix choices where supported; f32 storage and derivatives.
+| | PyTorch | Meganeura |
+|---|---|---|
+| Arithmetic | BF16 on CUDA / HIP / XPU; FP16 on MPS | F16 / BF16 matrix inputs where selected; f32 accumulation |
+| Training | Autocast also affects backward | Derivative regions remain full precision |
+| Selection | Compiled vendor stack | Qualify candidates and time complete programs |
 
-<small>TF32 is disabled. The profiles have different qualified subsets and arithmetic paths; their gaps do not isolate matrix-instruction efficiency.</small>
+**TF32 is disabled.** Strict f32 is the controlled comparison in backup.
+
+<small>Framework results: frozen October 19 cohort. The two numerical gates have different scopes; passing does not imply identical arithmetic.</small>
 
 <!--
-Time: 1:00.
-Only two profiles. CUDA/HIP/XPU auto selects BF16 when hardware-supported,
-otherwise FP16; MPS selects FP16. SmolLM2-135M one-token latency is a declared
-f32 exception. Larger language models retain autocast. No dtype retry follows
-numerical rejection. Remaining f32 matmuls have TF32 disabled in this cohort.
-FP16 GradScaler housekeeping is timed, with no optimizer update. Meganeura
-keeps f32 tensors and derivative regions; conversions happen inside each step.
-On RTX 5070, SmolLM2 prefill is 6.28/6.07 ms native/Torch strict and 5.55/2.96
-accelerated. Native improves but Torch improves more. Missing references mean
-the aggregate strict/accelerated sets differ; do not present their ratio as
-a matched precision speedup. Source: ../main.tex, Arithmetic contracts.
+Time: 0:40.
+Lead with the accelerated profile because it is the practical use case for
+this audience. PyTorch uses autocast, BF16 on CUDA/HIP/XPU or FP16 on MPS;
+MPS applies loss scaling for training. Both PyTorch matmul and cuDNN TF32
+switches are disabled. Meganeura retains f32 graph storage in these runs and
+may use f16/BF16 matrix inputs with f32 accumulation in eligible forward work.
+Its derivative regions remain full precision. The policies therefore do not
+produce identical arithmetic, particularly in backward. Explain these scopes
+before showing the combined table. Strict f32 disables reduced-input matrix
+arithmetic and remains available for comparison in backup.
+Source: ../NUMERICAL-POLICY.txt; final-cohort runtime numerical-policy receipts.
+-->
+
+---
+
+<!-- _header: Performance · October 19 cohort -->
+<!-- _class: chart -->
+
+# Accelerated results
+
+![Accelerated inference ratios, with training ratios in parentheses, for seven GPUs and five models](figures/accelerated-combined.svg)
+
+Median ratios: **2.06× inference · 2.21× training**. Four native wins in each, out of 32 qualified comparisons.
+
+<!--
+Time: 1:15.
+Each cell is a pair of dimensionless time ratios: inference, with training
+in parentheses. Training means forward + loss + backward, excluding optimizer
+updates. Both numbers are Meganeura / PyTorch; a value below one is faster
+for Meganeura. Do not read the parentheses as an uncertainty interval.
+Take each engine's median of three process medians, then form the ratio.
+The aggregate is the median across qualified GPU/workload cells. Each phase
+has 32 qualified cells out of 35 possible; absent references stay missing.
+No result from a different revision fills a gap. M3 has substantial process
+variation, retained in the table, so near ties do not establish a winner.
+The strict f32 inference/training medians are 1.35/1.61 on 35/33 cells.
+Accelerated arithmetic benefits PyTorch more overall under these policies.
+This does not make strict and accelerated a matched-set ablation, nor assign
+the gap to the API alone. Selected paths and a local Intel follow-up come next.
+Sources: data/results.csv; data/summary.json.
 -->
 
 ---
@@ -523,29 +617,42 @@ a matched precision speedup. Source: ../main.tex, Arithmetic contracts.
 <!-- _header: 05 + 07 · capability versus selection -->
 <!-- _class: paths -->
 
-# Selected paths
+# Paths by GPU
 
 | GPU | Selected kernels | Matrix sessions¹ |
 |---|---|---:|
 | RTX 5070 / H100 / RTX 3050 | Scalar/vector + workgroup matrices | **24 / 21 / 24** |
 | RX 7900 XT | Scalar/vector + f16 matrices | **22** |
 | MI300X | Scalar/vector + matrix tiles | **30** |
-| Arc B570 | Scalar/vector only | **0** |
+| Arc B570 | Scalar/vector in this cohort | **0** |
 | Apple M3 | Scalar/vector + simdgroup matrices | **30** |
 
-NVIDIA selects f16 workgroup kernels. **B570's rectangular f16/BF16 path is available but never selected here.**
+**B570 follow-up:** F16 Winograd matrix kernels now qualify and win local U-Net searches. The table is the October 19 cohort.
 
 <small>¹ Out of 42 accelerated core sessions per GPU. BF16 selected in 3 sessions each on 5070 and 3050, zero elsewhere. Programs can mix kernel families.</small>
 
 <!--
-Time: 1:00.
+Time: 0:50.
 Each device has 42 accelerated sessions: three repeats times three sessions
 for four models and two for Whisper. The count means a selected program
 contains at least one cooperative dispatch; it is not the fraction of FLOPs
 or time on matrix units. The remaining programs use ordinary scalar/vector
 and subgroup kernels. Within one selected program, both paths can coexist.
 
-This table pairs advertised capability with selected-program evidence. It
+The zero is not evidence that Intel lacks matrix hardware. The B570 exposes
+rectangular 8×16×16 cooperative shapes, and the whole-program policy in this
+cohort selected none. Availability alone does not guarantee qualification or
+a profitable graph: transformations, input precision and full-gradient checks
+matter. Latest main at a75c38e contains the rectangular and checked-precision
+unlocks; the separate #273/#274 U-Net work adds F16/BF16 Winograd products.
+At reviewed #274 revision a0cd01b, fresh B570 inference and training searches
+select winograd=F16; combined dense-F16 + Winograd candidates qualify but lose
+the timing race. This is an implementation/search issue, not an extension
+without hardware. Those October 21 local results are not cohort replacements.
+Receipt: /x/Code/inferena-results/pr273-274-review-20261021/review-summary.json;
+https://github.com/kvark/meganeura/pull/273
+https://github.com/kvark/meganeura/pull/274
+This table uses selected-program evidence from the frozen cohort. It
 does not assign every dispatch to a dtype without inspecting the program.
 MI300X has f32 and f16 shapes. M3 reports f32/f16 and BF16 capabilities, but
 these selected sessions have zero BF16 dispatches. B570's general f16 tile
@@ -571,7 +678,7 @@ final-cohort selected-session and kernel-memo receipts, pinned c19cb1c.
 At 1.7B: native strict training **135.85 ms on H100**, **35.88 ms on MI300X**. Accelerated 1.7B has no qualified PyTorch ratio.
 
 <!--
-Time: 1:00.
+Time: 0:40.
 The H100 strict training gap grows from 1.90 at 135M to 3.79 at 1.7B;
 MI300X's narrows from 2.29 to 1.65. Each server's sizes share
 recorded GPU identity, driver and host kernel. The chart's range
@@ -597,7 +704,7 @@ would violate the protocol. Source: ../tables/scaling.tex; ../RESULTS.md.
 Search uses most of Meganeura's setup time. **PyTorch's compilation has a separate 120 s limit.**
 
 <!--
-Time: 0:55.
+Time: 0:45.
 These are seconds per workload process, across its requested phases.
 Use strict f32 and the same fully completed three-process pairs for each
 engine: seven GPUs for SmolLM2, SmolVLA and SD U-Net; six for ResNet and
@@ -625,90 +732,76 @@ the final archive records by ../artifact/final_cohort.py.
 
 ---
 
-<!-- _header: 08 · execution in an application -->
+<!-- _header: 08 · inference inside a mobile application -->
 <!-- _class: deployment -->
 
-# Sharing the GPU
+# On the headset
 
-![bg right:32% contain](../../figures/dinovision-quest3s.jpg)
+![bg right:36% contain](../../figures/dinovision-quest3s.jpg)
 
 **DinoVision · Quest 3S · Android / Adreno**
 
+Desktop Vulkan: train a **2.01M-parameter decoder with Adam**, then save the weights.
 
-Two eye workers + renderer, **one context and queue**.
+Headset: load the encoder + decoder and reconstruct camera frames for both eyes.
 
-| Measurement | 1 chunk | 2 chunks |
-|---|---:|---:|
-| ML alone · ms/pass | 96.78 | 100.79 |
-| Live · render submissions/s | 10.83 | 12.87 |
-| Live · worker latency, ms | 149.51 | 119.25 |
+**Inference and OpenXR rendering share one Blade context and queue.**
 
-Two chunks cost more alone. In the live run, worker latency was lower; **the cause was not traced**.
-
-<small>Live test: 90 seconds per setting. Render submissions/s is the app's submission rate, not display FPS. Image: headset reconstruction.</small>
+<small>Deployed graph: 2.359 billion multiply-accumulates per pass.<br>Image: headset reconstruction. This is deployment inference; training runs on the desktop.</small>
 
 <!--
-Time: 1:25.
+Time: 0:55.
+This is the reason to put ML on the application's graphics stack: a mobile
+headset can render and execute a learned model without a second GPU runtime.
+The DINOv3 encoder feeds a decoder trained with Adam on desktop Vulkan. The
+application serializes its weights, loads them on the headset and runs a joined
+encoder/decoder graph. Two asynchronous eye workers share Blade's Vulkan
+context and queue with the OpenXR renderer. This is a full train/save/load/
+infer example, not a claim of training on the headset.
+The deployment also has a numerical parity check: with the same public RGB
+frame and weights, preprocessed patches are bit-exact. Encoder/reconstruction
+relative L2 differences are 0.001059/0.000457. The displayed reconstruction is
+not an input/output quality comparison. The detailed chunking measurements
+remain in backup for scheduling questions; they are not this slide's message.
+Source: ../../dinovision-section.tex; ../../figures/dinovision-quest3s.jpg;
+https://github.com/kvark/dinovision/blob/dc35cdf1c7c910cdd93c5b5362846842ae469a21/REPORT.md
+-->
 
-Return to the motivating application. A DINOv3 encoder feeds a decoder
-trained with Adam on a desktop GPU. The headset runs a joined encoder/decoder
-graph, with two asynchronous eye sessions sharing Blade's Vulkan context
-and queue with the OpenXR renderer. The decoder has 2.01 million parameters;
-the deployed graph performs 2.359 billion multiply-accumulates.
+---
 
-This is a numerical deployment check as well as an integration story. With
-one fixed public RGB frame and identical weights, preprocessed patches are
-bit-exact. The encoder and reconstruction relative L2 differences are
-0.001059 and 0.000457. The displayed image is the reconstruction, not an
-input/output quality comparison.
+<!-- _header: What changed in the evidence -->
+<!-- _class: since-paper -->
 
-In isolation, one submission takes 96.78 ms. Two chunks cost 4.1 percent.
-Here isolation means the joined ML graph in the native benchmark, without
-the renderer and the other eye worker sharing its queue. The unit is synchronized
-milliseconds per inference pass. The one-chunk baseline is 96.78 ms; two
-chunks take 100.79 ms.
+# Since the paper
 
-The live test is a separate 90-second run per setting. Relative to its
-one-chunk baseline, application render submissions rise from 10.83 to 12.87
-per second and median worker latency falls from 149.51 to 119.25 ms. Worker
-latency starts after the worker receives a frame and includes input upload,
-step recording/submission, GPU wait, output readback and CPU planar-to-RGB
-conversion. It excludes time before the worker receives the frame and
-presentation afterward; it is not camera-to-display latency. All
-percentage changes use the one-chunk value from the same test as denominator.
-Inside a ninety-second live stereo session, two chunks improve render
-submission count, slower-eye update rate (8.7 percent), and median worker
-latency. Do not relabel render submissions as displayed frame rate. Larger
-chunk counts help less and unevenly. The observed application result differs
-from the isolated graph result.
+| | Submitted paper · September 25 | This cohort · October 19 |
+|---|---|---|
+| MI300X | No qualified Vulkan path | All five models pass; patched Mesa + AMDGPU |
+| Accelerated PyTorch | TF32 permitted | BF16 / FP16 autocast; TF32 disabled |
+| Search budget | 60 s per session | 30 s per session |
+| Numerical gates | Sampled cross-engine checks + PyTorch repeatability | Also full native candidate checks and AMP training trajectories |
 
-Why can this matter with one shared queue? Sharing a context avoids context
-switching but does not eliminate queueing or resource contention. The pinned
-Meganeura step records chunk A, submits it, then records and submits B. Blade
-holds its queue mutex only during each submit, so a renderer or another eye
-can submit between them. Blade also emits conservative command-buffer-boundary
-barriers. A renderer queued after a long compute submission can therefore wait
-behind that work even though it shares the context.
+**After the cohort:** matrix-path unlocks on NVIDIA and Intel; local F16 Winograd work for U-Net.
 
-This is an opportunity to change order, not a deliberate yield: there is no
-wait between chunks and no guarantee another thread submits in between. If
-all chunks are queued consecutively, splitting alone need not improve latency.
-The archive has aggregate timing and device-state windows, not a queue/GPU
-trace. It does not establish whether interleaving, CPU/GPU overlap, readback
-queueing or another scheduling effect caused the 20.2% worker-latency change.
-Do not turn that observation into a causal claim or a general recommendation. This is deployment inference, not headset training
-or a comparison against PyTorch on Android.
+<small>Changed arithmetic and gates mean the old and new aggregate ratios are not a before/after speedup measurement.</small>
 
-Source: ../main.tex, Deployment Beyond the Matrix; exact absolute values
-from ../../dinovision-section.tex, submission-chunking table;
-../../figures/dinovision-quest3s.jpg. The paper links the pinned public
-DinoVision source and evidence archive. Source inspection: DinoVision
-dc35cdf/src/inference.rs:302–352; Meganeura d44803d/src/runtime.rs:3989–4049;
-Blade 60c2eeb/blade-graphics/src/vulkan/mod.rs:676 and command.rs:355.
-Pinned links:
-https://github.com/kvark/dinovision/blob/dc35cdf1c7c910cdd93c5b5362846842ae469a21/src/inference.rs#L302
-https://github.com/kvark/meganeura/blob/d44803d77e6f8bf777a6540c0128a314dfbf60a9/src/runtime.rs#L3989
-https://github.com/kvark/blade/blob/60c2eeb8d6180ff2db5167e304d55b78a18dfee2/blade-graphics/src/vulkan/mod.rs#L676
+<!--
+Time: 0:45.
+This is the one deliberate historical slide. The submitted manuscript is
+paper-p3hpc-work (c62a8ec); its measured engine is paper-p3hpc-2026-final
+(0dbfcc0), Inferena 7b8fcb7. Do not use the RESULTS.md embedded at the engine
+tag: that file predates the final submitted collection.
+The October 19 data pins are in README.md. The new cohort demonstrates the
+MI300X path that was inaccessible in the paper. Its numerical policy also
+changes substantially: PyTorch autocast and trajectory checks, native full
+candidate checks, and a shorter search budget. Submission count is searched
+in this cohort; the interim single-submission experiment is not the current
+policy. No overall speedup is attributed to these simultaneous changes.
+The final line refers to later local work. Main a75c38e contains rectangular
+and checked matrix unlocks; #273/#274 add convolution changes and native-half
+Winograd kernels. Those results are separate from this seven-GPU table.
+Sources: git show paper-p3hpc-work:paper/p3hpc/main.tex;
+data/summary.json; ../NUMERICAL-POLICY.txt; README pins; PRs #268–274.
 -->
 
 ---
@@ -719,36 +812,30 @@ https://github.com/kvark/blade/blob/60c2eeb8d6180ff2db5167e304d55b78a18dfee2/bla
 # Why the gap?
 
 <div class="factors">
-<div><h3>API access</h3><p>Smaller workgroup storage on NVIDIA + Intel.</p><p>BF16 absent from the measured RADV matrix path.</p></div>
-<div><h3>Our implementation</h3><p>Most tuning effort: AMD + NVIDIA, especially inference.</p><p>Intel arrived late; server access is scarce. Training has had less attention.</p></div>
-<div><h3>Vendor software</h3><p>Compute libraries, shader compilers and drivers all affect the result.</p><p>MI300X needed driver patches. Exposed features can remain unused.</p></div>
+<div><h3>API limits</h3><p>Less shared memory through Vulkan on our NVIDIA and Intel GPUs.</p><p>No cross-block shared-memory path; less control over async matrix scheduling.</p></div>
+<div><h3>Kernel coverage</h3><p>Most tuning effort went to AMD + NVIDIA inference.</p><p>Intel arrived late. Server access is scarce. Backward kernels need more work.</p></div>
+<div><h3>Vendor stack</h3><p>Library kernels, shader compilers and driver overhead all contribute.</p><p>MI300X needed driver patches to run this study at all.</p></div>
 </div>
 
-**Next targets:** use the available matrix features, improve backward kernels, and profile the driver path.
+**Priorities:** matrix data movement, convolution and backward kernels, and faster selection of good programs.
 
-<small>Development effort is author context. The cohort measures whole stacks; it does not apportion the gap among these factors.</small>
+<small>These are engineering constraints and targets. The whole-stack comparison does not measure each factor's share of the gap.</small>
 
 <!--
-Time: 1:00.
-Offer an explanation of the engineering problem, without pretending the
-benchmark decomposes causes. API limits are measured facts. The distribution
-of development effort is the author's account: AMD and NVIDIA consumer
-hardware were available throughout; Intel came later, servers were intermittent,
-and inference received more tuning than backward/optimizer work. This makes
-untuned kernels a plausible factor, not an experimentally measured fraction.
-
-The comparison includes Inductor and vendor libraries on one side, our
-compiler and Vulkan/Metal drivers on the other. Driver code generation and
-recording costs can matter, as can vendor libraries' kernel coverage. A slow
-ratio alone cannot identify a driver fault. MI300X's patched Mesa/AMDGPU setup
-establishes access; it does not isolate a driver performance contribution.
-Similarly, B570's zero selected matrix sessions is a concrete implementation
-target. NVIDIA tensor loads and matrix reductions are available but not used.
-M3 timing variation and different numerical gates further limit attribution.
-Sources: data/hardware.json, data/summary.json, cohort receipts;
-author's development history; measured stack pins in README.md.
+Time: 0:45.
+Explain the observed gap without pretending the benchmark decomposes causes.
+The shared-memory limits are queried facts; the distribution of development
+effort is the author's account. AMD and NVIDIA consumer devices were available
+throughout, Intel came later, server access was intermittent, and inference
+received more tuning than backward/optimizer work.
+PyTorch/Inductor and vendor libraries are compared with our compiler and the
+Vulkan/Metal drivers. A slow ratio alone cannot isolate a driver fault or an
+API cost. B570's F16 Winograd follow-up shows useful work remains in our own
+kernel and search coverage. Numerical policies also differ, especially in
+backward, and M3 variation limits attribution. There is no claim that fixing
+one missing extension would close the whole gap.
+Sources: data/hardware.json; data/summary.json; author's development history.
 -->
-
 
 ---
 
@@ -768,7 +855,7 @@ author's development history; measured stack pins in README.md.
 [github.com/kvark/meganeura](https://github.com/kvark/meganeura)
 
 <!--
-Time: 1:10.
+Time: 1:00.
 Answer the opening question. A separate vendor compute stack is not required
 for this demonstrated training and deployment workflow. One compiler handles
 the graph, derivatives, memory plan and device-specific kernels. Blade keeps
@@ -798,6 +885,92 @@ Sources: data/summary.json, data/hardware.json;
 https://github.com/kvark/dinovision/blob/dc35cdf1c7c910cdd93c5b5362846842ae469a21/REPORT.md
 -->
 
+
+---
+
+<!-- _header: Backup · strict f32 -->
+<!-- _class: chart -->
+
+# Strict results
+
+![Strict f32 inference ratios, with training ratios in parentheses, for seven GPUs and five models](figures/strict-combined.svg)
+
+Median ratios: **1.35× inference · 1.61× training**. Same ratio direction as the accelerated table.
+
+<!--
+Backup. Strict disables TF32 and reduced-input matrix products. The phases
+have 35/33 qualified pairs; nominal native wins are 10/4. Missing training
+references are RX 7900 XT Whisper and MI300X ResNet. Keep M3 uncertainty.
+Strict fixes arithmetic width, not reduction order. These are October 19
+cohort measurements, before the local October 21 U-Net work.
+Source: data/results.csv and data/summary.json.
+-->
+
+---
+
+<!-- _header: Backup · model construction -->
+<!-- _class: api-code -->
+
+# The API
+
+**Plain Rust builders. Shapes and storage types are checked as nodes are added.**
+
+```rust
+let mut g = Graph::new();
+let x = g.input("x", &[32, 784]);
+let labels = g.input_u32("labels", &[32]);
+let fc1 = nn::Linear::new(&mut g, "fc1", 784, 128);
+let h = fc1.forward(&mut g, x);
+let h = g.relu(h);
+let fc2 = nn::Linear::new(&mut g, "fc2", 128, 10);
+let logits = fc2.forward(&mut g, h);
+let loss = g.cross_entropy_loss_indices(logits, labels);
+g.set_outputs(vec![loss]);
+```
+
+<small>Names survive compilation, profiling and readback.</small>
+
+<!--
+Backup. This is the graph-building portion of the story variant's compiled
+api_demo.rs example (Meganeura 3102683). Public builders return node handles;
+layers are thin wrappers over them. Shape validation happens before GPU work,
+with track_caller pointing to the model's line on an error. Building the
+session then performs differentiation, optimization and pipeline construction;
+a Trainer supplies the optimizer. Omit the old variant's partial build_session
+wrapper here so the code does not suggest that helper is a public API.
+Sources: src/graph.rs, src/nn.rs, src/train.rs; presentation-story/api_demo.rs.
+-->
+
+---
+
+<!-- _header: Backup · training -->
+
+# Gradients
+
+**Reverse-mode autodiff appends backward work to the same graph.**
+
+<div class="pipeline">
+<div><strong>Differentiate</strong><span>Model + loss → gradient ops</span></div><b>→</b>
+<div><strong>Optimize</strong><span>Rewrites, kernels, buffer lifetimes</span></div><b>→</b>
+<div><strong>Execute</strong><span>Forward + loss + backward</span></div>
+</div>
+
+- Composite gradients follow their primitive decompositions.
+- Derivative regions retain full precision in the measured contract.
+- Packed parameter and gradient arenas let one optimizer dispatch update many tensors.
+
+<small>The framework benchmark stops before the optimizer. DinoVision exercises the full Adam training cycle.</small>
+
+<!--
+Backup. Training uses the same compiler infrastructure as inference, with a
+larger graph. Forward alternatives are differentiated and backward layouts
+are explored as well. A mixed-precision forward does not automatically grant
+permission to reduce derivative precision. The numerical gate includes full
+gradients, which can expose underflow hidden by reasonable-looking outputs.
+No dispatch/allocation counts are copied from the older story variant: they
+depend on graph revision and selected plan. Source: src/autodiff.rs,
+src/memplan.rs, src/train.rs; ../main.tex, How Meganeura Works.
+-->
 
 ---
 
@@ -1050,22 +1223,90 @@ Source: data/warmup-protocol.json and data/warmup.csv.
 
 ---
 
-<!-- _header: Backup · accelerated training -->
-<!-- _class: chart backup -->
+<!-- _header: Backup · headset scheduling -->
+<!-- _class: deployment -->
 
-# Accelerated training
+# Queue measurements
 
-![Accelerated training time ratios for seven GPUs, with unqualified reference cells left empty](figures/accelerated-training.svg)
+![bg right:32% contain](../../figures/dinovision-quest3s.jpg)
 
-Median **2.21×** across **32 qualified pairs**. Numerical failures are visible gaps, not evidence that the rejected paths are slower.
+**DinoVision · Quest 3S · Android / Adreno**
+
+
+Two eye workers + renderer, **one context and queue**.
+
+| Measurement | 1 chunk | 2 chunks |
+|---|---:|---:|
+| ML alone · ms/pass | 96.78 | 100.79 |
+| Live · render submissions/s | 10.83 | 12.87 |
+| Live · worker latency, ms | 149.51 | 119.25 |
+
+**One queue can contain work from several producers.** Submission boundaries allow the renderer and eye workers to interleave.
+
+<small>Live test: 90 seconds per setting. Render submissions/s is the app's submission rate, not display FPS. Image: headset reconstruction.</small>
 
 <!--
-Backup. CUDA/HIP/XPU use capability-selected BF16 here, MPS FP16. Native
-retains f32 derivative regions. H100's SmolLM2 training is 17.49/4.77 ms;
-B570's is 50.83/12.59 ms. These gaps coexist with native correctness and
-broad coverage. Missing H100 diffusion and MI300X diffusion/Whisper are
-contract failures. M3 retains all repeats and substantial uncertainty.
-Source: data/results.csv; ../main.tex, Performance and Arithmetic contracts.
+Backup. These are aggregate observations, not a causal scheduling experiment.
+
+Return to the motivating application. A DINOv3 encoder feeds a decoder
+trained with Adam on a desktop GPU. The headset runs a joined encoder/decoder
+graph, with two asynchronous eye sessions sharing Blade's Vulkan context
+and queue with the OpenXR renderer. The decoder has 2.01 million parameters;
+the deployed graph performs 2.359 billion multiply-accumulates.
+
+This is a numerical deployment check as well as an integration story. With
+one fixed public RGB frame and identical weights, preprocessed patches are
+bit-exact. The encoder and reconstruction relative L2 differences are
+0.001059 and 0.000457. The displayed image is the reconstruction, not an
+input/output quality comparison.
+
+In isolation, one submission takes 96.78 ms. Two chunks cost 4.1 percent.
+Here isolation means the joined ML graph in the native benchmark, without
+the renderer and the other eye worker sharing its queue. The unit is synchronized
+milliseconds per inference pass. The one-chunk baseline is 96.78 ms; two
+chunks take 100.79 ms.
+
+The live test is a separate 90-second run per setting. Relative to its
+one-chunk baseline, application render submissions rise from 10.83 to 12.87
+per second and median worker latency falls from 149.51 to 119.25 ms. Worker
+latency starts after the worker receives a frame and includes input upload,
+step recording/submission, GPU wait, output readback and CPU planar-to-RGB
+conversion. It excludes time before the worker receives the frame and
+presentation afterward; it is not camera-to-display latency. All
+percentage changes use the one-chunk value from the same test as denominator.
+Inside a ninety-second live stereo session, two chunks improve render
+submission count, slower-eye update rate (8.7 percent), and median worker
+latency. Do not relabel render submissions as displayed frame rate. Larger
+chunk counts help less and unevenly. The observed application result differs
+from the isolated graph result.
+
+Why can this matter with one shared queue? Sharing a context avoids context
+switching but does not eliminate queueing or resource contention. The pinned
+Meganeura step records chunk A, submits it, then records and submits B. Blade
+holds its queue mutex only during each submit, so a renderer or another eye
+can submit between them. Blade also emits conservative command-buffer-boundary
+barriers. A renderer queued after a long compute submission can therefore wait
+behind that work even though it shares the context.
+
+This is an opportunity to change order, not a deliberate yield: there is no
+wait between chunks and no guarantee another thread submits in between. If
+all chunks are queued consecutively, splitting alone need not improve latency.
+The archive has aggregate timing and device-state windows, not a queue/GPU
+trace. It does not establish whether interleaving, CPU/GPU overlap, readback
+queueing or another scheduling effect caused the 20.2% worker-latency change.
+Do not turn that observation into a causal claim or a general recommendation. This is deployment inference, not headset training
+or a comparison against PyTorch on Android.
+
+Source: ../main.tex, Deployment Beyond the Matrix; exact absolute values
+from ../../dinovision-section.tex, submission-chunking table;
+../../figures/dinovision-quest3s.jpg. The paper links the pinned public
+DinoVision source and evidence archive. Source inspection: DinoVision
+dc35cdf/src/inference.rs:302–352; Meganeura d44803d/src/runtime.rs:3989–4049;
+Blade 60c2eeb/blade-graphics/src/vulkan/mod.rs:676 and command.rs:355.
+Pinned links:
+https://github.com/kvark/dinovision/blob/dc35cdf1c7c910cdd93c5b5362846842ae469a21/src/inference.rs#L302
+https://github.com/kvark/meganeura/blob/d44803d77e6f8bf777a6540c0128a314dfbf60a9/src/runtime.rs#L3989
+https://github.com/kvark/blade/blob/60c2eeb8d6180ff2db5167e304d55b78a18dfee2/blade-graphics/src/vulkan/mod.rs#L676
 -->
 
 ---
