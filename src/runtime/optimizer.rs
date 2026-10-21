@@ -220,7 +220,10 @@ struct AdamParams {
     grad_group_size: u32,
     grouped_index: u32,
     algorithm: u32,
-    _pad0: u32,
+    // Independent uniforms prevent fast-math factoring beta*x + (1-beta)*y
+    // into beta*(x-y)+y, which loses small updates and changes Inf handling.
+    one_minus_beta1: f32,
+    one_minus_beta2: f32,
 }
 
 /// Gradient accumulation, global clip norm and global clip scale share one
@@ -537,7 +540,8 @@ impl Session {
                                 grad_group_size,
                                 grouped_index,
                                 algorithm: algorithm as u32,
-                                _pad0: 0,
+                                one_minus_beta1: 1.0 - beta1,
+                                one_minus_beta2: 1.0 - beta2,
                             },
                         },
                     );
@@ -728,7 +732,7 @@ mod tests {
     fn adam_params_layout_matches_the_shader_uniform() {
         // Thirteen 4-byte fields, every one of them a scalar, so the struct
         // is exactly 52 bytes with no tail padding for `Pod` to hide.
-        assert_eq!(std::mem::size_of::<AdamParams>(), 52);
+        assert_eq!(std::mem::size_of::<AdamParams>(), 56);
         assert_eq!(std::mem::align_of::<AdamParams>(), 4);
         // `count` and `groups` are the only u32s before the f32 block.
         let params = AdamParams::zeroed();
@@ -813,10 +817,14 @@ mod tests {
         let mut params = AdamParams::zeroed();
         params.bias_correction1 = 0.5;
         params.bias_correction2 = 0.25;
+        params.one_minus_beta1 = 1.0 - 0.9;
+        params.one_minus_beta2 = 1.0 - 0.999;
         let bytes = bytemuck::bytes_of(&params);
         let read =
             |offset: usize| f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
         assert_eq!(read(24), 0.5, "bias_correction1 moved");
         assert_eq!(read(28), 0.25, "bias_correction2 moved");
+        assert_eq!(read(48), 1.0 - 0.9, "one_minus_beta1 moved");
+        assert_eq!(read(52), 1.0 - 0.999, "one_minus_beta2 moved");
     }
 }

@@ -18,7 +18,8 @@ struct Params {
     // Pair index whose grouped gradient norms are collected.
     grouped_index: u32,
     algorithm: u32,
-    _pad0: u32,
+    one_minus_beta1: f32,
+    one_minus_beta2: f32,
 }
 
 var<storage, read_write> param: array<f32>;
@@ -56,12 +57,12 @@ fn variance_and_rms(old: f32, gradient: f32) -> vec2<f32> {
     if abs(gradient) < 0x1p-32f && bitcast<u32>(history) < 0x1f800000u {
         let scaled_gradient = gradient * 0x1p32f;
         let scaled = params.beta2 * variance_scaled(history)
-            + (1.0 - params.beta2) * scaled_gradient * scaled_gradient;
+            + params.one_minus_beta2 * scaled_gradient * scaled_gradient;
         let stored = variance_unscaled(scaled);
         let rms = sqrt(variance_scaled(stored) * params.bias_correction2) * 0x1p-32f;
         return vec2<f32>(stored, rms);
     }
-    let stored = params.beta2 * old + (1.0 - params.beta2) * gradient * gradient;
+    let stored = params.beta2 * old + params.one_minus_beta2 * gradient * gradient;
     return vec2<f32>(stored, sqrt(stored * params.bias_correction2));
 }
 
@@ -92,7 +93,7 @@ fn update(s: Segment, i: u32) {
     if params.algorithm == ADAM_ALGORITHM_LAPROP {
         moment_input = g / (rms + params.eps);
     }
-    let m_new = params.beta1 * m[e] + (1.0 - params.beta1) * moment_input;
+    let m_new = params.beta1 * m[e] + params.one_minus_beta1 * moment_input;
     m[e] = m_new;
     let m_hat = m_new * params.bias_correction1;
 
