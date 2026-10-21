@@ -41,24 +41,22 @@ kvark@fastmail.com \quad ORCID: 0009-0005-6410-4276}}
 \thispagestyle{plain}
 
 \begin{abstract}
-Can graphics APIs carry machine-learning training and inference across
-consumer and server GPUs? \system{} lowers tensor graphs and their gradients
-to Vulkan and Metal, selecting graph forms and kernel schedules by measurement.
-We evaluate five workloads under strict-f32 and accelerated contracts on eleven
-GPUs from five vendors. All 330 core native qualification cells pass; seven
-GPUs supply replicated performance measurements. Including larger language
-models, 246 native performance cells qualify and 226 admit a paired comparison
-with compiled PyTorch~2.13. On the core matrix, median native/PyTorch time
-ratios are 1.35 for inference and 1.61 for forward--loss--backward under strict
-f32, and 2.06 and 2.21 accelerated. These aggregates are conditional on both
-engines passing the declared numerical gates; loosening the gates could change
-both eligibility and the kernels selected by search. Experimental Mesa and
-AMDGPU patches enable MI300X Vulkan execution up to 1.7B parameters. Three
-integrated GPUs and a Quest~3S supply correctness-only evidence, while a
-separate XR deployment shares its Vulkan queue with rendering. Coverage is
-broad, but matrix features alone do not close the performance gap; arithmetic
-policy, driver support, preparation cost, and timing variability remain limits.
-
+Vulkan and Metal already run on nearly every consumer GPU. Can they also
+carry machine-learning training and inference? \system{} is a compact
+compiler and runtime, about 52k lines of Rust in a 19\,MiB executable,
+that lowers tensor graphs and their gradients to Vulkan and Metal. It keeps
+graph rewrites and matrix schedules in an e-graph and picks among them by
+timing them on the device. We compare it with PyTorch~2.13 under
+\code{torch.compile} with CUDA, HIP, and XPU graph replay on seven GPUs from
+four vendors, including an MI300X reached through experimental driver
+patches, and check every result numerically. In strict 32-bit floating
+point, \system{}'s median time is $1.35\times$ PyTorch's for inference and
+$1.61\times$ for training. It wins most comparisons on an AMD RX~7900~XT and
+loses all of them on an Intel Arc~B570. Allowing reduced precision widens the
+gap to $2.06\times$ and $2.21\times$: PyTorch's own times fall by a median
+factor of 1.5 to 1.6, \system{}'s by 1--3\%. The same checks pass on three
+integrated GPUs and a Quest~3S headset, and \system{} runs inside an Android
+XR application, sharing the Vulkan queue with rendering.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -80,14 +78,17 @@ second GPU stack. This paper measures what that choice gains in hardware
 coverage and what it costs in speed.
 
 \system{} is our test of the idea. It is a native compiler and runtime,
-implemented in Rust with WGSL shaders. It lowers a typed
+about 52k lines of Rust and 6.5k lines of WGSL shader code. It lowers a typed
 tensor graph, and the training graph that automatic differentiation derives
 from it, to generated compute kernels. It runs them through Blade, a thin
 Vulkan and Metal layer \cite{malyshau2026barriers}. Training and inference
-share the compiler, checkpoint format, and runtime on every device.
-Compilation can also time alternative graphs and kernels on the target GPU
-before committing to a plan. That search is optional; the main measurements
-enable it with a soft 30-second budget per session.
+share the compiler, checkpoint format, and runtime on every device. The
+benchmark runner that embeds all of this is a 19.1\,MiB executable
+(14.6\,MiB stripped) that links only the C runtime, while the CUDA build of
+PyTorch we compare against installs 4.42\,GiB of packages. Compilation can
+also time alternative graphs and kernels on the target GPU before committing
+to a plan. That search is optional; the main measurements enable it with a
+30-second budget per session.
 
 We compare \system{} with PyTorch~2.13 \cite{paszke2019pytorch}, compiled
 with \code{torch.compile} and replayed as whole-phase CUDA, HIP, or XPU graphs
@@ -95,24 +96,21 @@ where the backend allows it. The baseline therefore avoids per-operator Python
 overhead, and vendor libraries do much of its work. The main comparison
 covers seven GPUs from NVIDIA, AMD, Intel, and Apple, on Linux, Windows, and
 macOS, with five workloads under two arithmetic contracts. Every timed result
-must first pass numerical checks. Three additional integrated GPUs use CPU
-f32 references, and an Android Quest~3S uses a full-tensor CPU f64 oracle.
-These four platforms contribute correctness evidence, not performance ratios.
+must first pass numerical checks. Three more integrated GPUs and the Adreno
+GPU of an Android Quest~3S headset are checked against CPU references without
+timing, and an Android XR application on the same headset tests deployment.
+All of it comes from one collection in October 2026, at frozen compiler and
+harness revisions.
 
-The final collection, completed in October 2026, uses one frozen compiler
-and harness revision. MI300X runs the same native engine as the consumer
-GPUs, through experimental Mesa and AMDGPU patches. This establishes a
-working Vulkan compute path on the tested accelerator, not Vulkan conformance
-or stock-driver support. The core matrix covers eleven GPUs from five
-vendors; the timed comparison covers seven GPUs from four vendors.
-
-PyTorch remains faster in most paired comparisons. \system{} performs well
-on the RX~7900~XT and loses every paired core phase on the Arc~B570.
-Rectangular tiles, BF16 matrix candidates, and NVIDIA workgroup-scope
-cooperative matrices are enabled in this revision. Their availability does
-not imply that search selects them, nor that a selected kernel matches a
-vendor library. We report missing references and timing ranges alongside
-speed, and distinguish numerical-policy failures from execution failures.
+PyTorch is faster in most comparisons, but the spread across platforms is
+large. In strict f32, \system{} is faster in 11 of 13 comparisons on the
+RX~7900~XT and in none on the Arc~B570. Reduced precision helps PyTorch far
+more than \system{}: autocast moves PyTorch's forward and backward matrix
+work onto the GPUs' matrix units, while \system{}'s search seldom selects
+matrix kernels on NVIDIA and never on the B570, and its derivatives stay in
+f32. No shipping Vulkan driver supports the MI300X; it runs the same engine
+through our experimental patches to Mesa's RADV driver and to the AMDGPU
+kernel driver.
 
 Our contributions are:
 \begin{itemize}
@@ -120,17 +118,15 @@ Our contributions are:
         with compiled PyTorch on seven GPUs from four vendors, including the
         points where each stack fails (Sections~\ref{sec:method}
         and~\ref{sec:results}).
-  \item A qualified Vulkan compute path on MI300X, with recorded driver
-        patches, arithmetic capabilities, and reference workarounds
-        (Section~\ref{sec:availability}).
-  \item Measurements of compile-time graph and kernel search: the alternatives
-        it selects, numerical rejections, and preparation costs
+  \item A working Vulkan compute path on MI300X through experimental Mesa
+        and AMDGPU patches (Section~\ref{sec:availability}).
+  \item Measurements of compile-time graph and kernel search: what it
+        explores, which alternatives it selects, and what it costs
         (Section~\ref{sec:search}).
-
   \item Deployment evidence beyond the main matrix: Vulkan qualification on
-        three integrated GPUs and a Quest~3S, models up to 1.7 billion parameters, and an
-        Android XR application sharing its Vulkan queue with rendering
-        (Sections~\ref{sec:results} and~\ref{sec:edge}).
+        three integrated GPUs and a Quest~3S, models up to 1.7 billion
+        parameters, and an Android XR application sharing its Vulkan queue
+        with rendering (Sections~\ref{sec:results} and~\ref{sec:edge}).
 \end{itemize}
 We do not measure production-scale language-model training, optimizer
 updates in the timed step, distributed execution, or scientific simulation.
@@ -245,19 +241,17 @@ ordinary build, tunes its kernels, and then races complete programs with fresh
 command recording and submission. A challenger replaces the incumbent only
 if it passes the numerical checks and beats it by more than the measured
 noise, so graph forms compete after tuning instead of being discarded by the
-cost estimate. Dispatch fusion and attention and convolution splits vary as
-well, including up to 64 submission chunks per step. The policy measured here allows at
-most 16 graph and schedule forms and 64 candidate programs in total per
-session, within a soft 30-second deadline and 1\,GiB of scratch memory for
-kernel probes.
+cost estimate. Dispatch fusion, attention and convolution splits, and the
+number of submission chunks, up to 64 per step, vary as well. The policy
+measured here allows at most 16 graph and schedule forms and 64 candidate
+programs in total per session, within a soft 30-second deadline and 1\,GiB
+of scratch memory for kernel probes.
 
-Kernel alternatives are raced together, with a 5\% kernel improvement
-threshold; a whole-program challenger must improve by at least 1\% and
-clear the timing-noise margin. Candidate qualification is followed by two
-final executions of the selected program. Persisted kernel-class decisions
-are shared within each campaign/model/profile, while whole-program search
-runs afresh. Thus later processes can reuse kernel decisions without hiding
-that state in an ostensibly cold preparation measurement.
+Kernel alternatives race each other, and a replacement kernel must be 5\%
+faster; a whole-program challenger must be 1\% faster and clear the measured
+noise. The selected program then runs and is checked twice more. Kernel
+decisions persist within each campaign, model, and profile, so later
+processes can reuse them, but every process searches whole programs afresh.
 
 \section{Checking the Compiler and Its Kernels}
 \label{sec:validation}
@@ -307,8 +301,8 @@ It supplies kernels to neither engine.
 \subsection{Revisions and reference policy}
 \label{sec:reference-policy}
 
-All runs use \inferena{} \code{add19182}, \system{} \code{c19cb1c}, and
-Blade \code{4845d65}. Every PyTorch wheel reports version 2.13.0 at source
+All runs use \inferena{} \code{add19182}, \system{} \code{c19cb1c}, Blade
+\code{4845d65}, and Naga \code{13f582d}. Every PyTorch wheel reports version 2.13.0 at source
 commit \code{cf30153}, with Python 3.13.13: \code{+cu130} for NVIDIA,
 \code{+rocm7.2} for AMD, \code{+xpu} for Arc, and the macOS wheel with MPS
 for Apple. Drivers, host CPUs, and vendor libraries still differ between
@@ -392,88 +386,76 @@ missing one.
 \subsection{Arithmetic contracts}
 \label{sec:contracts}
 
-There are two profiles, not separate benchmark columns for each dtype.
-Strict f32 disables TF32 and reduced-input-precision matrix operations.
-Native f32 cooperative tiles remain legal: M3 exposes $8\times8\times8$
-and MI300X $16\times16\times16$ tiles. Strict fixes arithmetic width,
-not reduction order.
+Strict f32 disables TensorFloat-32 (TF32) in PyTorch and reduced-precision
+matrix inputs in both engines. Storage, accumulation, and outputs stay f32.
+Matrix tiles with f32 inputs and f32 accumulation remain allowed, because
+they keep the arithmetic width, though not the reduction order. The M3
+exposes such $8\times8\times8$ tiles and the MI300X $16\times16\times16$
+ones; the other Vulkan GPUs expose none.
 
-Accelerated permits reduced precision subject to qualification. PyTorch's
-\code{auto} policy chooses BF16 on CUDA/HIP/XPU when the backend reports
-hardware support, otherwise FP16; MPS uses FP16. This choice precedes
-compilation and qualification, with no numerical-failure or timing-based
-dtype retry. A declared exception keeps SmolLM2-135M's one-token phase in
-f32; the larger models retain autocast there. Parameters remain f32, while
-autocast chooses activation and operator types. FP16 training includes
-GradScaler's scaling, unscaling, finite checks, and scale update inside the
-timed step, but no parameter update. Remaining f32 operations have TF32
-disabled in these runs.
-
-\system{} retains f32 tensors and accumulation, with conversions inside
-each timed step. Search may use f16 cooperative forward kernels or explicit
-BF16 matrix-input candidates, as well as retain the f32 baseline. Derivative
-regions remain f32. This is not the same computation as PyTorch's autocast
-forward and backward. Rectangular subgroup shapes and NVIDIA workgroup-scope
-tiles are legal where the recorded device capabilities permit them.
+The accelerated contract runs PyTorch under autocast, with BF16 on every
+CUDA, HIP, and XPU GPU here and FP16 on MPS. The dtype is fixed per model and
+backend before compilation and is not retried after a numerical failure.
+One declared exception keeps SmolLM2-135M's one-token phase in f32; the
+larger models use autocast there too. Parameters stay f32, operations left in
+f32 keep TF32 off, and FP16 training includes GradScaler's scaling,
+unscaling, finite checks, and scale update in the timed step. \system{}
+keeps tensors and accumulation in f32 and converts inside each step. Its
+search may choose f16 matrix kernels or BF16 matrix inputs for forward
+regions, including rectangular subgroup tiles and NVIDIA's workgroup-scope
+tiles where the device exposes them, or keep the f32 program. Derivative
+regions stay f32, whereas PyTorch's autocast also covers the backward pass,
+so the two engines do different arithmetic under this contract.
 
 \subsection{Numerical gates}
 \label{sec:gates}
 
-The gates define the eligible implementations. Relaxing them could admit
-faster kernels, tile shapes, reduction orders, or lower precision in either
-engine, including programs rejected during \system{} search. These are
-performance results under a frozen policy, not a tolerance-independent
-ranking or an accuracy--performance frontier. We did not measure sensitivity
-to wider gates. A common profile does not make the qualification procedures
-identical.
+The gates decide which implementations are eligible, in both engines and
+during \system{}'s search, so wider bounds could admit faster programs. We
+did not measure that sensitivity, and the two engines' procedures differ.
 
 \emph{Native fidelity.} Before precision conversion or search, an untuned
-build of the original graph supplies a strict-f32 full-tensor oracle.
-Strict candidates must satisfy maximum- and RMS-error bounds
+build of the original graph supplies a strict-f32 full-tensor reference.
+Strict candidates must satisfy maximum- and RMS-error bounds of
 $10^{-6}+10^{-4}r$, where $r$ is the corresponding reference scale.
-Accelerated non-language-model outputs use coefficient 0.02, and the full
-training-gradient vector uses 0.01. Accelerated language-model inference
-instead gates the output distribution: mean token KL divergence at most
-$\log(1.01)$, worst-token KL at most $\log(1.10)$, and mean loss deviation
-at most $10^{-6}+0.02|L_{\rm ref}|$. Final selected-program executions must
-also repeat within the declared bounds. Search cannot replace a qualified
-incumbent with a rejected candidate.
+Accelerated outputs of the non-language models use a coefficient of 0.02, and
+the full training-gradient vector 0.01. Accelerated language-model inference
+is gated on the output distribution instead: mean token KL divergence at most
+$\log(1.01)$, worst-token KL at most $\log(1.10)$, and mean loss deviation at
+most $10^{-6}+0.02|L_{\rm ref}|$. The two final executions of the selected
+program must repeat within the same bounds, and a rejected candidate never
+replaces a qualified incumbent.
 
-\emph{PyTorch fidelity and training.} Accelerated forward uses an eager
-strict-f32 oracle with the same non-LM output or LM distribution bounds.
-Training additionally uses matched SGD trajectories: 256 updates on frozen,
+\emph{PyTorch fidelity and training.} The accelerated forward pass is checked
+against an eager strict-f32 run with the same output or distribution bounds.
+Training must also follow a matched SGD trajectory: 256 updates on frozen,
 varying real-text batches for every SmolLM2 size, with probe and held-out
-checkpoints, or 32 repeated-input updates for the other models. The loss
-bounds are 2\% plus $10^{-6}$; all requested updates must complete with
-finite values. All trainable parameters update; a named parameter is also
-checked as a sentinel. These untimed checks restore state before timing.
-\system{}'s cohort gate checks full single-step gradients, not the same
-256-step trajectory for every selected program. Neither procedure establishes
-equal learning quality or substitutes for the other.
+checkpoints, or 32 repeated-input updates for the other models. Losses must
+stay within 2\% plus $10^{-6}$, and every update must finish with finite
+values. These checks are untimed and restore state before timing. \system{}'s
+gate checks full single-step gradients instead of the same 256-step
+trajectory, so neither gate substitutes for the other.
 
 \emph{Repeatability.} PyTorch compares all output and gradient elements
-across two uncaptured calls (eight for accelerated training), and two graph
-replays when capture is used. Output and strict-gradient bounds use
+across two uncaptured calls (eight for accelerated training), and across two
+graph replays when capture is used. Output and strict-gradient bounds are
 $10^{-6}+10^{-4}r$; accelerated gradients use a whole-vector coefficient of
-0.01. Repeating a value does not independently establish its correctness.
+0.01.
 
-\emph{Cross-engine comparison.} Sampled outputs (256 positions) and loss
-must agree within 1\%, and total gradient norm and the vector of parameter
-norms within 5\% for strict. Accelerated allows 10\% per process but requires
-the three-process median below 5\%. Packed gradients are restored to
-checkpoint coordinates. Accelerated comparisons use preserved original
-strict-f32 snapshots from both engines, not rejected AMP outputs as ground
-truth; each measured candidate separately passes its fidelity gate. Samples
-and norms can miss local or sign errors, motivating the full native checks.
+\emph{Cross-engine comparison.} Sampled outputs (256 positions) and the loss
+must agree within 1\%, and the total gradient norm and the vector of
+parameter norms within 5\% for strict. Accelerated allows 10\% per process
+but requires the three-process median below 5\%. Packed gradients are
+restored to checkpoint coordinates, and accelerated comparisons use the
+strict-f32 snapshots that both engines preserve. Samples and norms can miss
+local or sign errors, which is why the full native checks exist.
 
-A failed compiled reference supplies no timing ratio. Preserved f32
-snapshots or checked eager diagnostics can independently qualify native
-results, without replacing compiled timing. Numerical rejection means
-failure of the declared contract, not a vendor defect or unusable application
-accuracy. \system{} searches qualified alternatives; PyTorch uses a fixed
-model/backend dtype policy. Coverage therefore also reflects different
-preparation policies, not the best qualified implementation each stack could
-possibly supply.
+When a compiled reference fails, its phase has no ratio, although the
+preserved snapshots or a checked eager diagnostic can still qualify the
+native result. A rejection means that the declared contract failed; it does
+not by itself show a defect in a vendor stack. Because \system{} searches
+among qualified alternatives while PyTorch uses one fixed dtype policy,
+coverage also reflects the two preparation policies.
 
 \subsection{Machines and coverage}
 
@@ -488,34 +470,31 @@ Section~\ref{sec:availability}.}
 \input{tables/devices}
 \end{table*}
 
-Table~\ref{tab:devices} lists the seven measured platforms. A cell is one
-model, profile, and phase, aggregated across the requested processes. All
-210 core native performance cells qualify; 197 have three qualified PyTorch
-pairs. Completed larger-model runs add 36 native cells and 29 paired cells.
-Thus 246 native performance cells qualify, 226 admit ratios, and 20 retain
-native timing without a qualified reference. Six additional requested B570
-360M cells are incomplete and excluded. The RTX~5070 and B570 share a host;
-the B570's PCIe~3.0 $\times$1 link remains part of host-wall submission and
-synchronization timing.
+Table~\ref{tab:devices} lists the seven timed platforms. A cell is one model,
+profile, and phase, aggregated over three processes. All 210 core native
+cells qualify, and 197 also have three qualified PyTorch pairs. The larger
+models add 36 native cells and 29 paired ones, for 246 native cells and 226
+ratios; the other 20 keep their native timing without a ratio. A B570
+SmolLM2-360M campaign stopped at its first condition and contributes none of
+its six requested cells. The RTX~5070 and B570 share a host, where the
+B570's PCIe~3.0 $\times$1 link is part of the submission and synchronization
+time.
 
-The four correctness-only platforms each pass 30 phase cells, yielding
-330/330 core native cells across eleven GPUs. Each uses one process per
-model/profile and one measured sample per phase, with no publication timing.
-Desktop warmup is ten seconds; Android qualification uses two. All sixteen
-archives share the pinned revisions and input hashes. Their recorded
-campaign durations sum to 15.16 device-hours, excluding external setup and
-downloads. The offline audit rechecks 277 desktop native receipts, 769 valid
-paired phase receipts, and ten Android full-tensor comparison receipts.
+The four correctness-only platforms pass 30 cells each, for 330 of 330 core
+native cells across eleven GPUs. They run one process per model and profile
+and one sample per phase. Desktop warmup is ten seconds and Android warmup
+two. All sixteen archives share the pinned revisions and input hashes, and
+their campaigns took 15.16 device-hours, without setup and downloads. An
+offline replay rechecks 277 desktop native receipts, 769 paired phase
+receipts, and ten Android full-tensor comparison receipts.
 
 \section{Results}
 \label{sec:results}
 
 \begin{table*}[t]
-\caption{\system{}/PyTorch time ratios, using each engine's median of three
-process medians. Below one (bold), \system{} is faster.
-$^\dagger$The independently qualified native time is shown in ms where no
-qualified PyTorch ratio is available. Failed or unreached reference phases
-are not speed wins.}
+\caption{\system{}/PyTorch time ratios, median of three process medians.
+Below one (bold), \system{} is faster. $^\dagger$No qualified PyTorch time;
+the entry is \system{}'s time, qualified by its own checks.}
 \label{tab:performance}
 \centering
 \small
@@ -527,74 +506,84 @@ are not speed wins.}
 \centering
 \resizebox{\textwidth}{!}{\input{tables/ratio-plot}}
 \caption{Strict \system{}/PyTorch time ratios from Table~\ref{tab:performance}
-on a log scale. Left of the dark line, \system{} is faster. Thin lines span the three paired-process ratios, not confidence intervals.
-Missing markers are unqualified PyTorch comparisons (RX~7900~XT Whisper
-and MI300X ResNet minimal/F+L+B). M3 has substantial process variation.}
+on a log scale. Left of the dark line, \system{} is faster. Thin lines span
+the three paired-process ratios. RX~7900~XT Whisper and MI300X ResNet have no
+minimal or F+L+B markers because compiled PyTorch produced no qualified time.}
 \label{fig:ratios}
 \end{figure*}
 
 \subsection{Performance}
 \label{sec:performance}
 
-Table~\ref{tab:performance} gives every core ratio. Across seven platforms,
-strict median ratios are 1.35 for inference (35 pairs), 1.03 for minimal shape
-(33), and 1.61 for training (33). Nominal native wins are 10, 15, and 4,
-respectively. Accelerated medians are 2.06, 1.49, and 2.21, each over 32
-qualified pairs, with 4, 13, and 4 nominal wins. The sets differ: these
-aggregates do not by themselves measure the effect of changing precision.
-Wins describe median ordering, not statistical significance.
+Table~\ref{tab:performance} gives every ratio, and Fig.~\ref{fig:ratios}
+plots the strict ones. Across the seven platforms, the median strict ratio is
+1.35 for inference, 1.03 for the minimal shape, and 1.61 for training.
+\system{} is faster in 10 of 35, 15 of 33, and 4 of 33 comparisons. Four of
+the fifteen minimal-shape wins repeat inference wins, because diffusion's and
+Whisper's shapes coincide. Under the accelerated contract, the medians are
+2.06, 1.49, and 2.21, with 4, 13, and 4 wins out of 32 each.
 
-RX~7900~XT remains strong under strict f32: SmolLM2 prefill, one-token
-forward, and training ratios are 0.61, 0.19, and 0.67. B570 loses every core
-paired phase under both profiles; its SmolLM2 training takes 50.83\,ms
-against PyTorch's 17.40\,ms strict and 12.59\,ms accelerated. On RTX~5070,
-SmolLM2 prefill takes 6.28 versus 6.07\,ms strict, and 5.55 versus 2.96\,ms
-accelerated. Native improvements therefore coexist with a larger gap to AMP.
+The platforms differ more than these medians suggest. On the RX~7900~XT,
+\system{} is faster in 11 of 13 strict comparisons; SmolLM2's prefill,
+one-token forward, and training take 0.61, 0.19, and 0.67 of PyTorch's time.
+On the Arc~B570, PyTorch wins every phase under both contracts, with strict
+inference ratios of 1.62--5.45 and training ratios of 1.86--3.50; SmolLM2
+training takes 50.83\,ms against PyTorch's 17.40\,ms strict and 12.59\,ms
+accelerated. On the RTX~5070, strict inference ratios span 0.74--1.56 and
+training ratios 1.24--1.95, and the Windows RTX~3050 is similar, at
+0.97--1.51 and 1.29--1.69. The H100 spans 0.94--2.24 and 1.27--2.94, and the
+MI300X 1.72--3.14 and 1.99--3.25.
 
-MI300X's strict 135M prefill and training ratios are 1.90 and 2.29. Its
-native-f32 matrix support enables a different kernel path without changing
-the strict contract; it does not establish whole-program parity with ROCm.
-On H100, accelerated 135M training is 17.49 versus 4.77\,ms. The remaining
-gap is real even where other PyTorch conditions fail qualification.
+The accelerated contract helps PyTorch far more than \system{}. Over the
+cells where each engine qualified under both contracts, it cuts PyTorch's
+median time by a factor of 1.50 for inference and 1.56 for training, and
+\system{}'s by 1.03 and 1.01. Per GPU, over the workloads where both engines
+qualified, PyTorch's median gain is 1.22--3.12 on the NVIDIA GPUs, the
+RX~7900~XT, and the B570, where autocast moves its matrix work in both
+directions onto the matrix units. On the H100, accelerated SmolLM2 training
+takes 17.49\,ms in \system{} and 4.77\,ms in PyTorch. On the MI300X and M3,
+PyTorch gains little or slows down, with median gains of 0.76 and 1.08 for
+inference and 0.85 and 0.69 for training. \system{} already uses f32 matrix
+tiles there under the strict contract, so these two GPUs' ratios improve.
 
-We retain every process and sample. Define process spread as
-$(\max t-\min t)/\operatorname{median}(t)$ over process medians. M3's median
-spread across the two engines is 33.84\%, with 59 of 60 phase groups above
-10\%, despite sleep prevention. No clock/power trace establishes the cause;
-small M3 wins are not robust conclusions. Seven of 60 B570 groups exceed
-10\%. H100 has one isolated native accelerated diffusion minimal-shape
-outlier: 1.773, 5.310, and 1.772\,ms, with the same selected graph and chunk
-count. Its PyTorch comparison is already unavailable. The accompanying CSV
-preserves all process medians and paired-ratio ranges; none is discarded.
+We keep every process and sample. The spread of an engine's three process
+medians, $(\max t-\min t)/\operatorname{median}(t)$, has a median of at most
+2.1\% on every GPU but the M3. There it is 33.8\%, and 59 of 60 phase groups
+exceed 10\% despite sleep prevention. We have no clock or power trace to
+explain it, so the M3 ratios support only broad conclusions. Seven of 60 B570
+groups exceed 10\%, up to 27.1\%, all of them \system{}'s, and two of 58 on
+the RX~7900~XT, both PyTorch's. On the H100, one native accelerated diffusion
+minimal-shape process took 5.310\,ms against 1.773 and 1.772\,ms for the
+other two, with the same selected program; that phase has no PyTorch
+comparison anyway. The CSV keeps every process median.
 
 \subsection{Where the time goes}
 \label{sec:gaps}
 
 Host-wall time includes command recording, submission, waiting, and GPU
-execution. Neither a near-parity minimal-shape ratio nor a larger-model
-speedup gives an upper bound on barrier or submission overhead. Separating
-those costs requires a controlled execution experiment or a device timeline.
+execution, and this collection has no device timeline to divide a gap among
+them. The search receipts do show how much matrix work each selected program
+has. Under the strict contract, only the M3 and MI300X programs use matrix
+tiles, in up to 513 and 543 dispatches per program. Under the accelerated
+contract, the selected NVIDIA programs use matrix kernels in at most 19
+dispatches, all in forward regions. Six of 42 sessions on each NVIDIA GPU
+reuse workgroup-scope kernel decisions through
+\code{VK\_NV\_cooperative\_matrix2} \cite{khronos2024cooperative2}, and BF16
+is selected in three sessions each on the RTX~5070 and RTX~3050 and in none
+on the H100. The B570 advertises rectangular $8\times16\times16$ f16 and
+BF16 tiles, which the compiler accepts, yet none of its 42 accelerated
+sessions selects a matrix dispatch. The MI300X's Vulkan driver exposes f16
+and f32 tiles but no BF16, while ROCm PyTorch uses BF16. So the matrix
+extensions that the H100 and B570 do expose are rarely used: the search
+seldom selects the matrix kernels it has, and derivatives never use them.
 
-The measured stack supports \code{VK\_NV\_cooperative\_matrix2}
-\cite{khronos2024cooperative2}. Selected accelerated SmolLM2 programs on
-both RTX~5070 and H100 reuse f16 workgroup-cooperative kernel choices, so
-the H100 gap cannot simply be attributed to a missing extension. Yet the
-native program keeps tensors and backward regions in f32, whereas PyTorch
-uses AMP. Equal hardware support does not imply equal instructions,
-conversion traffic, occupancy, fusion, or matrix coverage. The collection
-contains no matched-kernel disassembly or feature-off ablation that isolates
-these factors.
-
-B570 advertises rectangular $8\times16\times16$ f16/f32 and BF16/f32
-shapes, and the measured compiler accepts them. Nevertheless, its 42
-accelerated core sessions select no cooperative dispatches. RTX~5070 selects
-BF16 matrix dispatches in three of 42 accelerated sessions; H100 selects
-none. MI300X's Vulkan driver advertises no BF16 capability, although ROCm
-PyTorch uses BF16. Thus BF16 permission, device exposure, candidate
-qualification, and final selection are distinct. These records demonstrate
-limited use of the new paths, not a general performance benefit from enabling
-them. A tolerance sweep would require rerunning search for both engines;
-reclassifying stored rejections cannot supply that experiment.
+Other hardware paths stay out of reach of Vulkan shaders altogether. Hopper's CUDA
+path issues asynchronous matrix operations across a 128-thread warpgroup
+(\code{wgmma}) \cite{nvidia2026wgmma}; these, thread-block clusters, and
+TF32 matrix inputs are all unavailable through this stack. Equal extension
+support would still not imply equal instructions, conversion traffic,
+occupancy, or fusion. Separating these factors would take matched-kernel
+inspection or feature-off runs, which this collection does not include.
 
 \subsection{Larger models}
 \label{sec:scaling}
@@ -609,25 +598,26 @@ ratio to PyTorch. S: strict, A: accelerated; -- means no qualified ratio.}
 \input{tables/scaling}
 \end{table}
 
-Table~\ref{tab:scaling} includes 360M on RTX~5070, RX~7900~XT, H100, and
-MI300X, and 1.7B on the two servers. Within each server's final collection,
-the sizes share recorded GPU identity, driver, and host kernel. All 36
-completed native cells qualify; 29 have complete paired comparisons.
+Table~\ref{tab:scaling} adds SmolLM2-360M on the RTX~5070, RX~7900~XT, H100,
+and MI300X, and 1.7B on the two servers. On each server, all sizes ran with
+the same GPU model, driver, and host kernel. All 36 native cells qualify,
+and 29 have ratios.
 
-MI300X strict prefill ratios fall from 1.90 at 135M to 1.66 at 360M and
-1.59 at 1.7B; training falls from 2.29 to 2.09 to 1.65. At 1.7B native
-prefill is 11.92\,ms and training 35.88\,ms. H100 instead reaches a strict
-training ratio of 3.79 at 1.7B (135.85 versus 35.84\,ms), up from 1.90 at
-135M. Larger models do not uniformly amortize the native gap.
+The two servers diverge as the model grows. On the MI300X, strict prefill
+ratios fall from 1.90 at 135M to 1.66 at 360M and 1.59 at 1.7B, and training
+ratios from 2.29 to 2.09 to 1.65; at 1.7B, native prefill takes 11.92\,ms
+and training 35.88\,ms. On the H100, the strict training ratio instead grows
+from 1.90 at 135M to 3.79 at 1.7B (135.85 against 35.84\,ms), so larger
+models do not uniformly amortize the native gap. The RX~7900~XT stays below
+one at 360M: 0.68 for prefill, 0.24 for one token, and 0.73 for training.
 
-Accelerated 1.7B has no PyTorch ratio on either server: worst-token KL
-fails the declared distribution gate, although mean KL passes. The native
-timings remain independently qualified. RTX~5070 accelerated 360M training
-also lacks a ratio: two of three PyTorch real-text trajectories fail, even
-though their held-out checkpoints pass. Keeping the successful repeat alone
-would violate the replication policy. RX~7900~XT strict 360M ratios remain
-below one: 0.68 prefill, 0.24 one token, and 0.73 training. These are batch-one,
-short-context results, without optimizer updates or communication.
+Accelerated 1.7B has no ratio on either server: PyTorch's worst-token KL
+fails the distribution gate, although its mean KL passes. RTX~5070
+accelerated 360M training lacks one too, because two of three PyTorch
+real-text trajectories fail although their held-out checkpoints pass, and
+the replication policy does not keep the remaining one alone. These are
+batch-one, short-context results, without optimizer updates or
+communication.
 
 \subsection{Availability}
 \label{sec:availability}
@@ -642,64 +632,59 @@ Each cell is one model/profile/phase, with one process per condition.}
 \input{tables/qualification}
 \end{table}
 
-The three integrated GPUs and Adreno~740 pass all core native cells
-(Table~\ref{tab:qualification}). Prior bring-up found ROCm launch/process
-failures on the AMD iGPUs and no usable XPU device on RPL-U. Those are
-configuration-specific observations, not new paired GPU timings or universal
-vendor-support claims. The Quest~3S archive contains full-output and
-full-gradient comparison receipts against a host CPU f64 oracle. Raw NPZ
-tensors are omitted; the offline audit validates manifest hashes and complete
-comparison receipts, not the original elementwise arithmetic.
+Performance portability requires the code to run first. The three
+integrated GPUs and the Quest~3S's Adreno~740 pass all 30 cells each against
+CPU references (Table~\ref{tab:qualification}). In earlier bring-up, our
+ROCm setups failed on both Radeon iGPUs, and the pinned PyTorch found no XPU
+device on RPL-U, so these platforms have no GPU reference here. The Quest~3S
+archive holds full-output and full-gradient comparison receipts against a
+CPU f64 oracle. Its raw tensors are omitted, so the offline replay can check
+only the receipts and their hashes.
 
-The missing performance references have distinct causes. RX~7900~XT
+The missing PyTorch references have different causes. On the RX~7900~XT,
 strict Whisper fails training-output repeatability in all three processes;
-MI300X strict ResNet fails gradient repeatability. Their later minimal-shape
-phases are not attempted. MI300X accelerated diffusion and Whisper fail
-repeatability or forward fidelity. H100 accelerated diffusion exceeds the
-maximum forward-error bound (0.02255 versus 0.02085), while RMS passes.
-H100 and MI300X accelerated 1.7B exceed worst-token KL (about 0.1073 and
-0.1030 versus $\log(1.10)\simeq0.09531$), while mean KL passes. These are
-contract rejections, not demonstrated driver defects. Unreached phases are
-coverage gaps, not additional observed numerical failures.
+on the MI300X, strict ResNet fails gradient repeatability. The minimal-shape
+phase, which runs after training, is then not attempted. MI300X accelerated
+diffusion and Whisper fail repeatability or forward fidelity. H100
+accelerated diffusion exceeds the maximum forward-error bound (0.02255
+against 0.02085) while its RMS error passes. H100 and MI300X accelerated
+1.7B exceed the worst-token KL bound (about 0.1073 and 0.1030 against
+$\log(1.10)\simeq0.09531$) while mean KL passes. These are failures of the
+declared contract; we have not traced them to driver or library defects.
 
-B570 360M is different: the first strict PyTorch process throws
-``wait method cannot be used for an event associated with a command graph''
-during compiled backward capture. The stack places the wait below an
-Inductor-generated operator in the XPU/SYCL path. This supports a captured
-execution compatibility failure, not a diagnosis of a specific driver bug.
-The harness also fails to classify it as recoverable and stops the campaign.
-Native execution completes its internal checks, but has no independent
-reference, no accelerated process, and no three-process replication. All
-six requested cells are excluded from qualified results. Earlier uncaptured
-diagnostics are not substituted. The small-model XPU path retains its
-recorded math-SDPA and equivalent embedding-backward accommodations.
+The B570 360M campaign failed differently. In the first strict PyTorch
+process, compiled backward capture throws ``wait method cannot be used for
+an event associated with a command graph'' from below an Inductor-generated
+operator in the XPU/SYCL path. Our harness does not classify this message as
+recoverable, so it stopped the campaign. \system{} completed the condition
+and its internal checks, but without a reference or replication its six
+cells are excluded, and no earlier uncaptured diagnostic replaces them. The
+small-model XPU path keeps its math-SDPA and embedding-backward
+accommodations.
 
-MI300X supplies a qualified accelerator path. Its
-Vulkan path now passes every main and larger-model condition, using the
-same unmodified \system{} and \inferena{} revisions as the other platforms.
-The recorded device is \emph{AMD Instinct MI300X VF (RADV GFX940)}, with
-304 compute units and about 192\,GiB of device memory. Mesa's experimental
-CDNA path and our driver changes provide buffer-based compute and cooperative
-matrices \cite{mesa2025cdna,malyshau2026mi300}; general image support and
-Vulkan conformance are outside this result.
+The MI300X is a compute-only accelerator, and Mesa's RADV driver supports
+only graphics-capable AMD GPUs \cite{mesa2026radv}. Building on Mesa's
+experimental CDNA work \cite{mesa2025cdna}, we extended RADV with
+buffer-based compute and cooperative matrices, and patched the AMDGPU kernel
+driver with an interface through which RADV coordinates work across the
+GPU's eight XCC compute dies. With these patches, the same \system{} and
+\inferena{} revisions as on the other platforms qualify all 42 native cells,
+up to SmolLM2-1.7B. The recorded device is \emph{AMD Instinct MI300X VF (RADV
+GFX940)}, with 304 compute units and about 192\,GiB of memory. General image
+support and Vulkan conformance are outside this work.
 
-The setup requires both user-space and kernel changes. The measured Mesa
-source and build string identify \code{8c7f5fdd}. The AMDGPU patch targets vendor source
-\code{amdgpu-6.19.14-2364437.24.04}, built for Linux
-\code{6.8.0-146-generic}. A native interface coordinates work across the
-eight XCC compute dies; \code{mi300\_xcc\_gang=1} enables it.
-The archives retain the patch series, build and module identity, launcher,
-and a finite 60-second compute watchdog setting. These are experimental
-driver requirements, not features of an unmodified distribution.
-
-The reference also needs a recorded accommodation:
-\path{MIOPEN_DEBUG_CONV_IMPLICIT_GEMM_ASM_FWD_GTC_XDLOPS_NHWC=0}
-excludes a previously problematic convolution solver. This override is in
-the MI300 provenance files, although the collector's generic
-\code{runtime\_overrides} field is empty. The official collector, numerical
-thresholds, compilation policy, and timing samples are unchanged. The passing
-comparisons establish a working pair of explicitly configured stacks; they do not show that either stock installation works
-without intervention.
+The runs load Mesa built from commit \code{8c7f5fdd}, the head of a draft
+merge request \cite{malyshau2026mi300}, on Linux \code{6.8.0-146-generic}.
+The kernel patch applies to AMD's vendor driver source
+\code{amdgpu-6.19.14-2364437.24.04}, and the module is loaded with
+\code{mi300\_xcc\_gang=1} and a 60-second compute lockup timeout. The
+reference needs one accommodation as well:
+\path{MIOPEN_DEBUG_CONV_IMPLICIT_GEMM_ASM_FWD_GTC_XDLOPS_NHWC=0} excludes a
+convolution solver that had failed earlier. The kernel settings and this
+override are recorded in the provenance of earlier runs on the same machine
+with the same Mesa build; the final archives record only the Mesa build and
+the host kernel. Both stacks are thus explicitly configured, and neither
+stock installation is shown to work without intervention.
 
 \subsection{Performance portability}
 
@@ -725,21 +710,24 @@ P_{i,a,q}=\begin{cases}
 \end{cases}
 \end{equation}
 PyTorch's missing RX~7900~XT Whisper and MI300X ResNet phases score zero,
-and \system{} has efficiency one there as the sole qualified engine.
-Workload means for \system{}/PyTorch are 0.62/0.87 for inference,
-0.73/0.39 for minimal shape, and 0.57/0.54 for training. The latter rankings
-are strongly affected by reference coverage; they are not paired speed
-advantages over the rejected paths. Numerical bounds and the platform set
-both affect this metric. The four correctness-only devices provide no
-replicated GPU-reference timings and are not added to this table.
+and \system{}'s efficiency there is one because it is the only qualified
+engine. The workload means for \system{} and PyTorch are 0.62 and 0.87 for
+inference, 0.73 and 0.39 for the minimal shape, and 0.57 and 0.54 for
+training. Over the three workloads that both engines qualify on every
+platform, the minimal-shape means are 0.77 and 0.65, so \system{}'s lead
+there does not rest on PyTorch's failures. The training means are 0.60 and
+0.91, so its narrow overall lead in training does. The four
+correctness-only GPUs have no timings and are not in this table.
 
 \section{Compile-Time Search}
 \label{sec:search}
 
 \begin{table}[t]
-\caption{Search in 210 core native processes, both profiles. Trials include
-baselines and chunk variants. Invalid: numerical rejection; Scratch: probe
-resource limit.}
+\caption{Search in the 210 core native processes, both contracts. Trials
+include baselines and chunk variants. Trunc.: sessions whose deadline ended
+the program search; Graph $\ne0$: sessions that chose a graph other than the
+extracted one; Invalid: numerical rejections; Scratch: trials stopped by the
+kernel-probe scratch limit.}
 \label{tab:search}
 \centering\footnotesize
 \setlength{\tabcolsep}{2.5pt}
@@ -748,56 +736,61 @@ resource limit.}
 
 \subsection{What it explores}
 
-The 588 core sessions record 23,669 whole-program trials, 13 numerical
-rejections, and 34 scratch-limit outcomes (Table~\ref{tab:search}). Resource
-limits are not numerical failures; these are neither counts of independent
-algorithms nor kernel-probe rejection counts. Whole-program timing remains the final
-selection gate after kernel tuning. The search includes graph layouts,
-fusion, attention splits, matrix inputs, and submission chunking. Device
-features only supply candidates: the B570 and BF16 selection results in
-Section~\ref{sec:gaps} show why capability exposure alone is insufficient.
+The 588 core sessions measured 23,669 whole programs, an average of 40 per
+session against a limit of 64 (Table~\ref{tab:search}). In 306 sessions
+(52\%), the chosen graph or schedule differs from ordinary extraction, so the
+retained alternatives do get used. The search is budget-bound: in 428
+sessions (73\%), the deadline arrived before every program was measured.
+Thirteen programs were rejected for numerical mismatch, and 34 trials stopped
+at the probe scratch limit; a rejected candidate never replaces the checked
+incumbent. The M3 kept the extracted graph in 63 of its 84 sessions, which is
+consistent with its noisy timing, since a challenger must beat the incumbent
+by more than the measured noise. Device features only supply candidates, as
+the B570 and BF16 selections in Section~\ref{sec:gaps} show.
 
-The 30-second budget is per session, with at most 16 graph forms and 64
-programs, and a 1\,GiB kernel-probe scratch limit. A workload builds three
-sessions, or two for Whisper. The deadline is soft; original-f32 oracle
-preparation lies outside it but inside native preparation time. The main
-cohort has no feature-off, search-off, or alternate-budget arm. Historical
-search studies use different revisions and policies and do not establish
-the gain of this final configuration.
+A workload builds three sessions, or two for Whisper. The 30-second deadline
+is soft, and preparing the original-f32 reference falls outside it but inside
+the native preparation time. This cohort has no search-off, feature-off, or
+alternate-budget arm, so it does not measure what the search gains.
+Historical search studies used other revisions and policies.
 
 \subsection{What it costs}
 
 \begin{table}[t]
-\caption{Native preparation by persisted kernel-decision state, core matrix,
-both profiles. Cold: the process's first session misses the memo; warm:
-it loads previous decisions. These are not controlled driver-cache states.}
+\caption{Native preparation by the state of persisted kernel decisions, core
+matrix, both contracts. Cold: the process starts without saved decisions;
+warm: it loads earlier ones. Driver caches were not controlled.}
 \label{tab:preparation}
 \centering\footnotesize
 \setlength{\tabcolsep}{3pt}
 \input{tables/preparation}
 \end{table}
 
-Native preparation includes graph construction, differentiation, pipeline
-creation, initialization, full-tensor qualification, and search, but excludes
-process startup and file loading. Core search receipts sum to 212.21 minutes.
-Table~\ref{tab:preparation} separates the 70 first-process cold memo states
-from 140 subsequent warm states. Across all campaigns, including
-qualification and the incomplete B570 attempt, there are 123 cold-first-session
-and 164 warm-decision processes. Reuse is scoped to campaign/model/profile;
-whole-program plans are searched again. Fresh processes therefore do not mean
-fresh search knowledge. Within-process later sessions may also reuse decisions.
-The modest separation in preparation medians is descriptive, not a
-randomized cache ablation. PyTorch compilation has its separate 120-second
-supervised policy; the preparation budgets are not matched.
+\system{}'s preparation covers graph construction, differentiation,
+pipeline creation, initialization, full-tensor qualification, and search,
+for each session a workload needs. PyTorch's covers compilation and the
+first call of each phase, with graph capture and replay checks counted
+separately. Neither includes file loading or process start-up. Almost all of
+\system{}'s preparation is search: the rest takes a median of 1.1\,s per
+process (0.18--10.1\,s). Under the strict contract, across the GPUs where
+PyTorch completed every phase, the median of each workload's three-process
+medians is 49--68\,s for \system{} and 12--54\,s for PyTorch, whose longest
+compilation took 103 of its 120~seconds. The search receipts of the 210 core processes sum to 212
+minutes.
 
-A separate diagnostic on SmolLM2-135M accelerated compared cumulative 5,
-15, 30, and 60 seconds of post-search warmup on RTX~5070 and B570, with two
-processes per GPU and unchanged selected programs. B570 checkpoints stayed
-within 0.91\% of their own 60-second result; RTX~5070 prefill was 0.67\%
-and 3.04\% slower at 60 than at five seconds. This small study found no
-benefit from longer warmup. It is neither a cold-start experiment nor
-validation for every workload; earlier measurement windows add elapsed heat,
-and the cohort's ten-second checkpoint was not sampled directly.
+Table~\ref{tab:preparation} separates the 70 processes that start without
+saved kernel decisions from the 140 that load them. Loading them shortens the
+median preparation by only 0.6--2.6\,s per GPU, and this is not a controlled
+cache experiment. Across all campaigns, including the correctness-only ones
+and the incomplete B570 attempt, there are 123 cold and 164 warm processes.
+
+A separate diagnostic on accelerated SmolLM2-135M compared cumulative 5, 15,
+30, and 60 seconds of warmup after search on the RTX~5070 and B570, with two
+processes per GPU and unchanged selected programs. The B570 stayed within
+0.91\% of its 60-second result, and RTX~5070 prefill was 0.67\% and 3.04\%
+slower at 60 seconds than at five. Longer warmup did not help in this small
+study, which is not a cold-start experiment and did not sample the cohort's
+ten-second point directly.
 
 \section{Deployment Beyond the Matrix}
 \label{sec:edge}
@@ -810,8 +803,7 @@ and the cohort's ten-second checkpoint was not sampled directly.
   \label{fig:dinovision}
 \end{figure}
 
-The separately versioned application study below predates the final cohort;
-its samples do not enter framework ratios. The case that motivates a graphics-API ML stack is an application that
+The case that motivates a graphics-API ML stack is an application that
 already renders. DinoVision is one such application. It runs on the
 Qualcomm Adreno GPU of a Meta Quest~3S under Android and reconstructs the
 headset cameras' images from features of a DINOv3 vision encoder
@@ -835,7 +827,8 @@ median worker latency by 20.2\%. Larger chunk counts help less, and
 unevenly. The best plan for the renderer is not the best in isolation, and
 one shared graphics stack lets the application choose it. This is a
 deployment check, not an on-device training or PyTorch-on-Android
-comparison. The weights, raw samples, manifests, and full-resolution media
+comparison, and it predates the framework cohort with its own pinned
+revisions. The weights, raw samples, manifests, and full-resolution media
 are in the public
 \href{https://huggingface.co/mad-bot/dinovision/tree/2c3f9017fe74c41482b165890c14737a2ccd4b6a}{DinoVision evidence archive},
 and its \href{https://github.com/kvark/dinovision/tree/dc35cdf1c7c910cdd93c5b5362846842ae469a21}{source code}
@@ -897,21 +890,20 @@ framework with compute and graphics backends, autodiff, and fusion
 compact graphics-API stack for both training and inference against compiled
 PyTorch across vendors, including its failures, preparation cost, and a
 deployment. \inferena{} can drive several of these frameworks, but we compare
-only against PyTorch, which supplies the mainstream vendor-specific training stacks in the
-performance comparison.
+only against PyTorch, which trains on the GPUs of all four vendors in the
+timed comparison.
 
 \section{Threats to Validity}
 
 \emph{Platforms.} A common PyTorch revision does not equalize vendor
 libraries, drivers, host CPUs, or operating systems. The XPU accommodations
-and MI300X MIOpen solver exclusion change the reference paths. MI300X also
-requires experimental Mesa and AMDGPU patches, and MPS has no whole-phase
-replay. Results apply to those recorded configurations.
+and the MI300X solver exclusion change the reference paths, the MI300X
+native path needs experimental driver patches, and MPS has no whole-phase
+replay. The results apply to these recorded configurations.
 
 \emph{Budgets.} The engines prepare under different policies and limits, so
-we claim neither equal startup cost nor the fastest possible implementation.
-The submitted search ablation used an older compiler and allowed submission
-chunking. It does not supply a control arm for the present cohort.
+we claim neither equal startup cost nor the fastest possible implementation
+of either.
 
 \emph{Replication.} Three processes per condition do not characterize a
 population of machines. CPU power management, cloud co-tenancy, thermals,
@@ -920,17 +912,14 @@ TorchInductor caches but keep whatever driver state the machine had. We
 report warmed short-window latency rather than sustained throughput and
 remove no outliers.
 
-\emph{Numerics.} Strict f32 fixes width, not operation order. Native full
-gradient fidelity, PyTorch's trajectory gate, and cross-engine snapshots
-have different scopes (Section~\ref{sec:gates}); they do not establish
-equivalent learning quality. PyTorch's fixed dtype choice and native search
-also have different opportunities to retain a qualified implementation.
-Relaxing a bound could change native kernel and tiling selection as well as
-PyTorch eligibility. No tolerance-sensitivity study was collected, and
-relabeling archived failures would not reconstruct one. Aggregates are
-conditional on both engines passing; absent references are not speed wins.
-The performance-portability metric deliberately mixes coverage with speed,
-so its ranking inherits the numerical policy.
+\emph{Numerics.} Strict f32 fixes arithmetic width, not operation order.
+Native full-gradient checks, PyTorch's trajectory gate, and the cross-engine
+snapshots have different scopes (Section~\ref{sec:gates}), and none
+establishes equal learning quality. The gates also select: wider bounds could
+change native kernel selection as well as PyTorch's eligibility, and
+relabeling archived failures cannot reconstruct that experiment. Aggregates
+cover only the cells where both engines qualified, and the portability
+metric, which mixes coverage with speed, inherits the numerical policy.
 
 \emph{Scope.} The larger models run at batch one with short contexts and no
 key/value cache. The timed step excludes optimizer updates and communication,
@@ -941,34 +930,35 @@ separate its architecture from the engineering effort behind it.
 
 \section{Future Work}
 
-The next experiments should isolate the effects of search budget, kernel
-memo reuse, matrix features, and numerical bounds, with the same workload
-and repeated timing of selected programs. Native trajectory checks would
-close an important qualification asymmetry. B570 needs efficient qualified
-rectangular kernels, while H100 needs matched-precision kernel and memory
-analysis; enabling the features has not closed these gaps. MI300X requires
-further driver validation and integration. Persistent megakernels could
-move dependency scheduling onto the GPU, as MPK does for CUDA task graphs
+The gaps point at the compiler's next steps: matrix kernels for backward
+passes and convolutions, broader BF16 coverage, and a cheaper search. The
+B570 needs rectangular matrix kernels that win, and the H100 needs
+matched-precision kernel and memory analysis, since enabling the features
+has not closed either gap. The next experiments should isolate the effects
+of search budget, kernel-decision reuse, matrix features, and numerical
+bounds on the same workloads, and native trajectory checks would remove an
+asymmetry in qualification. The MI300X driver work needs further validation
+and upstream review. Further out, persistent megakernels could move
+dependency scheduling onto the GPU, as MPK does for CUDA task graphs
 \cite{cheng2026mpk}, subject to graphics-API forward-progress and
 synchronization constraints.
 
 \section{Conclusion}
 
-One compiler and runtime qualifies all five core workloads under both
-profiles on eleven GPUs, including integrated and mobile devices and a
-compute-only MI300X with experimental driver patches. Seven platforms
-provide replicated performance, with 246 independently qualified native
-cells including larger models and 226 qualified paired comparisons.
-
-Coverage does not imply speed parity. Core strict median time ratios are
-1.35 for inference and 1.61 for training; accelerated ratios are 2.06 and
-2.21 over different qualified subsets. MI300X's strict training ratio
-narrows to 1.65 at 1.7B, whereas H100's grows to 3.79. Workgroup matrix
-operations are selected on NVIDIA, but BF16 and rectangular support do not
-automatically produce winning programs. Numerical policy, reference coverage,
-and M3 timing variation constrain interpretation. Graphics APIs provide a
-viable common compute interface; competitive performance still requires
-compiler, runtime, and driver engineering.
+Graphics APIs are a workable path for ML deployment. \system{}, about 52k
+lines of Rust in a 19\,MiB executable, trains and runs five workloads on
+eleven GPUs from five vendors under Linux, Windows, macOS, and Android,
+including an MI300X with experimental driver patches, and runs inside an
+Android XR application next to its renderer. PyTorch is still faster in most
+comparisons. \system{}'s median strict time is $1.35\times$ PyTorch's for
+inference and $1.61\times$ for training, with wins on the RX~7900~XT and
+losses everywhere on the Arc~B570. Reduced precision widens the gap to
+$2.06\times$ and $2.21\times$, because PyTorch moves its matrix work in both
+directions onto matrix units, while \system{} seldom selects matrix kernels
+and keeps derivatives in f32. Larger models do not settle the question:
+MI300X's strict training ratio narrows to 1.65 at 1.7B, while H100's grows
+to 3.79. Both stacks also have coverage gaps, so availability belongs beside
+speed when judging portability.
 
 \section*{Acknowledgments}
 

@@ -1,10 +1,10 @@
-The final paper and original presentation now incorporate this policy.
+The paper and the presentation incorporate this policy.
 This file remains a detailed protocol reference; see main.tex for publication prose.
 
 Numerical-policy disclosure for the October 19 P3HPC cohort update
 
-Evidence: Inferena add19182, Meganeura c19cb1c, paired campaign v33; see the
-offline audit artifact final-cohort-audit-20261019. No gates or measurements changed.
+Evidence: Inferena add19182, Meganeura c19cb1c, paired campaign v33;
+artifact/final_cohort.py replays the audit. No gates or measurements changed.
 
 The paper states that the gates are part of the optimization objective.
 Wider bounds could admit faster kernels, tiles, reduction orders or arithmetic

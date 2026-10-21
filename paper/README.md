@@ -10,7 +10,7 @@ The older `paper-p3hpc-2026-final` tags do **not** identify this collection.
 No earlier result fills a missing cell.
 
 [RESULTS.md](p3hpc/RESULTS.md) records the audit, failures, numerical-policy
-limits and timing uncertainty. [QUALIFICATION.md](p3hpc/QUALIFICATION.md)
+limits, timing uncertainty, footprint and MI300X driver provenance. [QUALIFICATION.md](p3hpc/QUALIFICATION.md)
 separates the four correctness-only platforms from the seven timed GPUs.
 All 330 core native cells pass; core plus completed large-model runs supply
 246 native performance cells and 226 qualified paired comparisons.
@@ -23,10 +23,10 @@ the compiler architecture, hardware access and limits, and measured results.
 It has 22 main slides (18:00 of suggested speaking time) and 15 backups.
 The alternative decks remain local references and are not part of this commit.
 
-The talk uses the later October 19 cohort: Inferena `add19182`, Meganeura
-`c19cb1c`, and PyTorch 2.13.0 at `cf30153c`. Its versioned chart inputs are
-independent of the submitted-paper tags and of the ongoing paper revision.
-See its [README](p3hpc/presentation/README.md) for exact pins and evidence scope.
+The talk uses the same October 19 cohort as the paper. Its chart inputs in
+`presentation/data/` are separately versioned copies of the analyzer outputs in
+`p3hpc/tables/`, with LF line endings. See its
+[README](p3hpc/presentation/README.md) for exact pins and evidence scope.
 
 ```sh
 bash paper/p3hpc/presentation/build.sh
@@ -57,8 +57,9 @@ setup, search and reference compilation with their recorded cache states.
 Additional audit JSON is written only to the output directory.
 The ratio convention is **Meganeura / PyTorch time**, below one favors Meganeura.
 See the [artifact README](p3hpc/artifact/README.md) for qualification and
-packaging limits. The old `cohort.py`, `search_ablation.py` and `ablation.tex`
-belong to historical studies and are not inputs to the final results.
+packaging limits. `final_cohort.py` reuses only the plot layout of the
+historical `cohort.py`; `cohort.py`, `search_ablation.py` and `ablation.tex`
+otherwise belong to earlier studies and are not inputs to the final results.
 
 ### Template and build
 
@@ -108,10 +109,12 @@ and sits at the archive root with the sixteen original campaign archives,
 the final analyzer and generated inputs, and a `MANIFEST.sha256`. The compact
 warmup summary and its distinct protocol are included separately.
 
-The first-page copyright block follows the
+The camera-ready PDF (tag `paper-p3hpc-work`) carries the first-page
+copyright block of the
 [SC26 Instructions for Workshop Authors](https://submissions.supercomputing.org/static_resources/SC26_Instructions_for_Workshop_Authors.pdf)
-(Step 3a) with SC's `fancyhdr.sty`. The camera-ready PDF must also pass IEEE
-PDF eXpress (conference ID 72768X) and stay under 4 MB. Do not use the legacy
+(Step 3a), set with SC's `fancyhdr.sty`; the current revision leaves it out.
+A camera-ready PDF must also pass IEEE PDF eXpress (conference ID 72768X) and
+stay under 4 MB. Do not use the legacy
 packager below for the current cohort.
 
 ## Original arXiv report
