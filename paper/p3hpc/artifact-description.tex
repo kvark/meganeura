@@ -73,8 +73,9 @@ required to regenerate the paper's results.
 A CPU and several GiB of temporary disk suffice for offline replay.
 Performance devices are RTX~5070, RTX~3050, H100, RX~7900~XT, MI300X,
 Arc~B570, and M3. Radeon~780M, Ryzen~9600X iGPU, RPL-U, and Quest~3S
-supply qualification only. Device and driver identities are in the manifests;
-MI300X requires the documented experimental Mesa and AMDGPU patches.
+supply qualification only. Device and driver identities are in the manifests.
+MI300X needs the experimental Mesa and AMDGPU patches of
+Section~\ref{sec:availability}; the Mesa source is public as a draft merge request.
 
 \artinpart{Software}
 The analyzer uses Python 3.12+ and a clean checkout of Inferena
@@ -122,8 +123,9 @@ identity and invokes the frozen collector's validators before generating
 results. The CSV retains each process median and the three paired ratios;
 the headline statistic remains the ratio of median process times. No outliers
 are removed, and correctness-only times never enter performance aggregates.
-The old \path{cohort.py} and \path{search_ablation.py} are historical analyzers,
-not commands for this collection.
+The historical \path{cohort.py} supplies only the plot layout, and
+\path{search_ablation.py} belongs to an earlier study; neither replays this
+collection.
 
 Numerical rejection is not evidence of a vendor defect or a speed win.
 Native single-step gradient fidelity and PyTorch's trajectory gate are

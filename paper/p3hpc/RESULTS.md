@@ -24,7 +24,7 @@ receipts were checked offline with the current collectors. No discrepancies. Loc
 checks pass for desktop runs; completed desktop campaigns also have passing final checks. Preserved
 oracle comparisons are bound by hashes to the measured records. Android captured-tensor manifest hashes
 and complete comparison coverage pass; raw NPZ tensor files are omitted from these archives, so this
-audit rechecks receipts, not the original elementwise arithmetic. The archive SHA-256 inventory is archives.json.
+audit rechecks receipts, not the original elementwise arithmetic. artifact/final-cohort.sha256 lists the archive hashes.
 
 Coverage (one cell = model x arithmetic profile x phase, aggregated across requested repeats)
 All 330 core qualification cells pass across all 11 GPUs (5 models x 2 profiles x 3 phases).
@@ -134,6 +134,37 @@ but a separate Inferena study revision. Two processes per GPU follow the same
 selected program through cumulative 5/15/30/60-second checkpoints. It found no
 benefit from longer warmup and does not validate all workloads or cold starts.
 
-Earlier footprint, search-ablation, and compiler-stage measurements remain
-historical evidence. They are not final-cohort measurements. DinoVision is
-also separately versioned; its queue-sharing results remain unchanged.
+## Footprint
+
+Measured on October 21, 2026 with [footprint.py](artifact/footprint.py), which
+reproduces the earlier figures (41,617 Rust and 4,713 WGSL lines at `0dbfcc00`):
+
+- Meganeura `c19cb1c` `src/`: 52,175 Rust lines and 6,481 WGSL lines in 106
+  shader files, excluding blank lines, comments and `#[cfg(test)]` modules.
+- The measured RTX 5070 / B570 native runner (Inferena `add19182`, SHA-256
+  `b8d25fac4992dd3c...`): 20,072,584 bytes (19.1 MiB) as built and 15,348,088
+  bytes (14.6 MiB) stripped. It links only libc, libm and libgcc_s and was
+  built with rustc 1.98.0.
+- PyTorch 2.13.0+cu130 in the measured environment, whose 55 package versions
+  match the campaign record: torch's dependency closure is 29 distributions,
+  4.42 GiB; torch plus triton are 1.69 GiB.
+
+## MI300X driver provenance
+
+The final MI300X archives record the device, the Mesa build string
+(`git-8c7f5fdd60`, loaded from `/opt/mi300-45239`) and the host kernel
+(`6.8.0-146-generic`). Commit `8c7f5fdd` is the head of draft
+[Mesa MR 45239](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45239).
+The rest comes from earlier MI300X evidence with the same Mesa source: the
+AMDGPU patch for vendor source `amdgpu-6.19.14-2364437.24.04`, the module
+identity and parameters (`mi300_xcc_gang=1`, `lockup_timeout=0,60000,0,0`),
+and the MIOpen override
+`MIOPEN_DEBUG_CONV_IMPLICIT_GEMM_ASM_FWD_GTC_XDLOPS_NHWC=0`. They are in
+`mi300-provenance/` of the October 10 `amd-mi300.tgz` (SHA-256 `82472b2b...`)
+and in `mi300-driver-patches-20261008.tgz` (`40b1f241...`), both listed in the
+historical [cohort.sha256](artifact/cohort.sha256). Neither archive is part of
+the final supplement.
+
+Compiler-stage and search-ablation measurements remain historical evidence
+from earlier revisions. DinoVision is separately versioned; its queue-sharing
+results remain unchanged.
