@@ -155,10 +155,12 @@ The final MI300X archives record the device, the Mesa build string
 (`git-8c7f5fdd60`, loaded from `/opt/mi300-45239`) and the host kernel
 (`6.8.0-146-generic`). Commit `8c7f5fdd` is the head of draft
 [Mesa MR 45239](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45239).
-The rest comes from earlier MI300X evidence with the same Mesa source: the
-AMDGPU patch for vendor source `amdgpu-6.19.14-2364437.24.04`, the module
-identity and parameters (`mi300_xcc_gang=1`, `lockup_timeout=0,60000,0,0`),
-and the MIOpen override
+The AMDGPU patch for vendor source `amdgpu-6.19.14-2364437.24.04` is attached
+to the MR description as `mi300-kernel-xcc-gang-20261008.tgz`; its
+`kernel-xcc-gang-guarded.patch` (SHA-256 `02d37b7a82622c0b...`) is identical to
+the copy in `mi300-driver-patches-20261008.tgz`. The rest comes from earlier
+MI300X evidence with the same Mesa source: the module identity and parameters
+(`mi300_xcc_gang=1`, `lockup_timeout=0,60000,0,0`) and the MIOpen override
 `MIOPEN_DEBUG_CONV_IMPLICIT_GEMM_ASM_FWD_GTC_XDLOPS_NHWC=0`. They are in
 `mi300-provenance/` of the October 10 `amd-mi300.tgz` (SHA-256 `82472b2b...`)
 and in `mi300-driver-patches-20261008.tgz` (`40b1f241...`), both listed in the
