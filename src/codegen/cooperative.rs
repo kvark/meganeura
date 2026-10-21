@@ -18,8 +18,9 @@ pub(super) fn generate(
     types: MatrixTypes,
     shape: [u32; 3],
     subgroup: u32,
+    vectorized: bool,
 ) -> ShaderModule {
-    generate_with_params(group, types, shape, None, subgroup)
+    generate_with_params(group, types, shape, None, subgroup, vectorized)
 }
 
 pub(super) fn generate_with_params(
@@ -28,6 +29,7 @@ pub(super) fn generate_with_params(
     shape: [u32; 3],
     params: Option<&Params>,
     subgroup: u32,
+    vectorized: bool,
 ) -> ShaderModule {
     types.validate();
     assert!(
@@ -38,6 +40,7 @@ pub(super) fn generate_with_params(
     let variant = coop_shape(group).map(|(_, variant)| variant);
     let split_range = SPLIT_RANGE.replace("wgid.", "group.");
     let vector_conv = params.is_some_and(Params::vectorized_forward);
+    let vector_dense = vectorized && coop_shape(group).is_some();
     let (declaration, dimensions, range, a, b, index, destination, add) = match group {
         ShaderGroup::MatMul
         | ShaderGroup::MatMulAT
@@ -56,19 +59,24 @@ pub(super) fn generate_with_params(
             if addend {
                 declaration.push_str("var<storage> src: array<f32>;\n");
             }
+            if vector_dense {
+                declaration = declaration
+                    .replace("array<$A_TYPE>", "array<vec4<$A_TYPE>>")
+                    .replace("array<$B_TYPE>", "array<vec4<$B_TYPE>>");
+            }
             (
                 declaration,
                 "let m = params.m; let n = params.n; let k = params.k;",
                 split_range.as_str(),
                 if variant == MatMulCoopVariant::AT {
-                    "matrix_a[ak * m + ar]"
+                    "$DENSE_A_AT"
                 } else {
-                    "matrix_a[ar * k + ak]"
+                    "$DENSE_A_NN"
                 },
                 if variant == MatMulCoopVariant::BT {
-                    "matrix_b[bc * k + bk]"
+                    "$DENSE_B_BT"
                 } else {
-                    "matrix_b[bk * n + bc]"
+                    "$DENSE_B_NN"
                 },
                 "(group.z * m + r) * n + c",
                 "matrix_c",
@@ -173,7 +181,9 @@ pub(super) fn generate_with_params(
             format!("vec4<{cast}>({value})")
         }
     };
-    let stage = if vector_conv {
+    let stage = if vector_dense {
+        include_str!("../shaders/matmul_checked_vector.wgsl")
+    } else if vector_conv {
         include_str!("../shaders/conv2d_checked_vector.wgsl")
     } else {
         include_str!("../shaders/matmul_checked_stage.wgsl")
@@ -221,6 +231,38 @@ pub(super) fn generate_with_params(
             ("$RANGE", range),
             ("$A_LOAD", a),
             ("$B_LOAD", b),
+            (
+                "$DENSE_A_AT",
+                if vector_dense {
+                    "matrix_a[(ak * m + ar) / 4u][(ak * m + ar) % 4u]"
+                } else {
+                    "matrix_a[ak * m + ar]"
+                },
+            ),
+            (
+                "$DENSE_A_NN",
+                if vector_dense {
+                    "matrix_a[(ar * k + ak) / 4u][(ar * k + ak) % 4u]"
+                } else {
+                    "matrix_a[ar * k + ak]"
+                },
+            ),
+            (
+                "$DENSE_B_BT",
+                if vector_dense {
+                    "matrix_b[(bc * k + bk) / 4u][(bc * k + bk) % 4u]"
+                } else {
+                    "matrix_b[bc * k + bk]"
+                },
+            ),
+            (
+                "$DENSE_B_NN",
+                if vector_dense {
+                    "matrix_b[(bk * n + bc) / 4u][(bk * n + bc) % 4u]"
+                } else {
+                    "matrix_b[bk * n + bc]"
+                },
+            ),
             ("$INDEX", index),
             ("$DEST", destination),
             (
@@ -455,6 +497,7 @@ mod tests {
                             shape,
                             Some(&params),
                             subgroup,
+                            false,
                         );
                         assert_eq!(
                             module.module.entry_points[0].workgroup_size,

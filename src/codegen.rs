@@ -824,6 +824,7 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
             },
             [16, 16, 16],
             0,
+            false,
         ),
         ShaderGroup::ToBF16 | ShaderGroup::FromBF16 => {
             let narrowing = group == ShaderGroup::ToBF16;
@@ -1103,7 +1104,7 @@ pub(crate) fn generate_module_coop_typed_with_subgroup(
             Some((types, layout)),
         );
     }
-    cooperative::generate(group, types, shape, subgroup)
+    cooperative::generate(group, types, shape, subgroup, layout.vectorized)
 }
 
 pub(crate) fn generate_checked_conv(
@@ -1113,7 +1114,7 @@ pub(crate) fn generate_checked_conv(
     params: &crate::kernels::conv::Params,
     subgroup: u32,
 ) -> ShaderModule {
-    cooperative::generate_with_params(group, types, shape, Some(params), subgroup)
+    cooperative::generate_with_params(group, types, shape, Some(params), subgroup, false)
 }
 
 /// [`generate_module_coop`] reading B in `format`: f32, or f16 with f16-input
