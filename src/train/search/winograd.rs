@@ -180,4 +180,79 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn native_products_match_exact_convolution_with_updated_weights() {
+        let gpu = crate::reference::gpu::shared_context();
+        let caps = gpu.capabilities();
+        for (h, w) in [(3, 7), (7, 15)] {
+            let mut graph = crate::Graph::new();
+            let x = graph.input("x", &[2 * 64 * h * w]);
+            let weight = graph.parameter("w", &[64 * 64 * 9]);
+            let y = graph.conv2d(x, weight, 2, 64, h as u32, w as u32, 64, 3, 3, 1, 1);
+            graph.set_outputs(vec![y]);
+            // These dyadic values and their transforms are exact in both half
+            // formats. Include batches, padding and partial spatial tiles.
+            let input: Vec<f32> = (0..2 * 64 * h * w)
+                .map(|i| (i % 5) as f32 / 32.0 - 0.0625)
+                .collect();
+            let weights: Vec<f32> = (0..64 * 64 * 9)
+                .map(|i| (i % 7) as f32 / 64.0 - 0.046875)
+                .collect();
+            let expected = crate::reference::evaluate_outputs(
+                &graph,
+                crate::reference::Feeds::new()
+                    .set("x", &input)
+                    .set("w", &weights),
+            )
+            .unwrap()
+            .remove(0)
+            .data;
+            crate::optimize::apply_winograd_conv_fusions(
+                &mut graph,
+                &mut Vec::new(),
+                &Default::default(),
+            );
+            for storage in [DType::F16, DType::BF16] {
+                if !crate::runtime::typed_matrix_supported(&gpu, storage) {
+                    continue;
+                }
+                let shapes = if storage == DType::F16 {
+                    &caps.cooperative_matrix.f16_f32_shapes
+                } else {
+                    &caps.cooperative_matrix.bf16_f32_shapes
+                };
+                let shape = crate::codegen::checked_cooperative_shape(shapes).unwrap();
+                let mut plan = crate::compile::compile(&graph);
+                assert_eq!(fill(&mut plan, storage, shape, caps.subgroup_size), 1);
+                let mut session = crate::Session::with_context_opts(
+                    plan,
+                    gpu.clone(),
+                    crate::SessionOptions {
+                        poison: true,
+                        ..Default::default()
+                    },
+                );
+                session.set_input("x", &input);
+                for sign in [1.0, -1.0] {
+                    session
+                        .set_parameter("w", &weights.iter().map(|v| v * sign).collect::<Vec<_>>());
+                    session.step();
+                    session.wait();
+                    for (i, (actual, expected)) in session
+                        .read_output(expected.len())
+                        .into_iter()
+                        .zip(&expected)
+                        .enumerate()
+                    {
+                        assert_eq!(
+                            f64::from(actual),
+                            expected * f64::from(sign),
+                            "{storage:?}, {h}x{w}, sign={sign}, output={i}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
