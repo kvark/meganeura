@@ -12,6 +12,22 @@ use super::{Family, Rejection};
 use crate::codegen::{CoopConfig, ShaderGroup};
 use crate::compile::{Dispatch, Kernel, ShaderEntry};
 
+/// A 1x1 gather is a contiguous matrix when it preserves both spatial axes.
+/// Whole four-element rows let the checked kernel vectorize both operands
+/// without reading across a channel boundary or outside a binding.
+pub(crate) fn vectorized_forward(p: &[u32]) -> bool {
+    p.len() >= 12
+        && p[5..9] == [1, 1, 1, 0]
+        && p[11] == 0
+        && p[2] == p[9]
+        && p[3] == p[10]
+        && p[1] != 0
+        && p[1].is_multiple_of(4)
+        && p[9]
+            .checked_mul(p[10])
+            .is_some_and(|n| n != 0 && n.is_multiple_of(4))
+}
+
 /// Which product a dispatch computes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {

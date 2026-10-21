@@ -14,6 +14,15 @@ pub(super) const SPLIT_RANGE: &str = "let blocks = (k + 31u) / 32u;\n\
 /// loop. Operands are staged in the multiplication type; the accumulator is
 /// F32, and so are partials until their reduction.
 pub(super) fn generate(group: ShaderGroup, types: MatrixTypes, shape: [u32; 3]) -> ShaderModule {
+    generate_with_params(group, types, shape, None)
+}
+
+pub(super) fn generate_with_params(
+    group: ShaderGroup,
+    types: MatrixTypes,
+    shape: [u32; 3],
+    params: Option<&[u32]>,
+) -> ShaderModule {
     types.validate();
     assert!(
         super::checked_cooperative_shape(&[shape]).is_some(),
@@ -21,6 +30,7 @@ pub(super) fn generate(group: ShaderGroup, types: MatrixTypes, shape: [u32; 3]) 
     );
     let [m, n, k] = shape;
     let split_range = SPLIT_RANGE.replace("wgid.", "group.");
+    let vector_conv = params.is_some_and(crate::kernels::conv::vectorized_forward);
     let (declaration, dimensions, range, a, b, index, destination, add) = match group {
         ShaderGroup::MatMul
         | ShaderGroup::MatMulAT
@@ -79,13 +89,29 @@ pub(super) fn generate(group: ShaderGroup, types: MatrixTypes, shape: [u32; 3]) 
                     }
                 );
             }
-            let declaration = format!(
+            let mut declaration = format!(
                 "{}\n{}\nconst KH: u32 = {kernel_h}u;\nconst KW: u32 = {kernel_w}u;\n\
                  const STRIDE: u32 = {stride}u;\n{}",
                 include_str!("../shaders/conv2d_params.wgsl"),
-                crate::divisor::SHADER,
-                include_str!("../shaders/conv2d_checked.wgsl")
+                if params.is_some() {
+                    crate::divisor::NATIVE_SHADER
+                } else {
+                    crate::divisor::SHADER
+                },
+                if vector_conv {
+                    "var<storage> src: array<vec4<$B_TYPE>>;\nvar<storage> weight: array<vec4<$A_TYPE>>;\nvar<storage, read_write> dst: array<$OUT_TYPE>;\nvar<uniform> params: Params;"
+                } else {
+                    include_str!("../shaders/conv2d_checked.wgsl")
+                }
             );
+            if let Some(values) = params {
+                assert_eq!(values.len(), 16);
+                let arguments = values.iter().map(|v| format!("{v}u")).collect::<Vec<_>>();
+                declaration = declaration.replace(
+                    "var<uniform> params: Params;",
+                    &format!("const params = Params({});", arguments.join(", ")),
+                );
+            }
             (
                 declaration,
                 "let m = params.out_channels; let n = params.out_h * params.out_w; let k = params.in_channels * KH * KW;",
@@ -116,11 +142,28 @@ pub(super) fn generate(group: ShaderGroup, types: MatrixTypes, shape: [u32; 3]) 
         }
     };
     let (a_cast, b_cast) = (cast(types.a), cast(types.b));
+    let convert = |value: &str, cast: &str| {
+        if cast == "round_bf16" {
+            format!(
+                "vec4<bf16>(round_bf16({value}.x), round_bf16({value}.y), round_bf16({value}.z), round_bf16({value}.w))"
+            )
+        } else {
+            format!("vec4<{}>({value})", MatrixTypes::name(types.multiply))
+        }
+    };
+    let stage = if vector_conv {
+        include_str!("../shaders/conv2d_checked_vector.wgsl")
+    } else {
+        include_str!("../shaders/matmul_checked_stage.wgsl")
+    };
     let rounds = types.output == DType::BF16 || a_cast == "round_bf16" || b_cast == "round_bf16";
     let multiply = MatrixTypes::name(types.multiply);
     ShaderModule::new(&preprocess(
         include_str!("../shaders/matmul_checked.wgsl"),
         &[
+            ("$STAGE", stage),
+            ("$A_VECTOR", &convert("v", a_cast)),
+            ("$B_VECTOR", &convert("v", b_cast)),
             ("$EXTENSIONS", &extensions),
             ("$DECL", &declaration),
             ("$DIMS", dimensions),
@@ -301,6 +344,78 @@ mod tests {
                 let words =
                     naga::back::spv::write_vec(&module.module, &info, &options, None).unwrap();
                 assert!(!words.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn specialized_convolutions_validate() {
+        let capabilities = naga::valid::Capabilities::SHADER_BFLOAT16
+            | naga::valid::Capabilities::SHADER_FLOAT16
+            | naga::valid::Capabilities::COOPERATIVE_MATRIX
+            | naga::valid::Capabilities::SUBGROUP;
+        for shape in [[16, 16, 16], [8, 16, 16]] {
+            for multiply in [DType::F16, DType::BF16] {
+                for (h, w, ci, kh, kw, stride, pad) in [
+                    (14, 14, 64, 1, 1, 1, 0),
+                    (7, 7, 64, 1, 1, 1, 0),
+                    (11, 13, 3, 3, 3, 2, 1),
+                ] {
+                    let params = [
+                        2,
+                        ci,
+                        h,
+                        w,
+                        65,
+                        kh,
+                        kw,
+                        stride,
+                        pad,
+                        (h + 2 * pad - kh) / stride + 1,
+                        (w + 2 * pad - kw) / stride + 1,
+                        pad,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ];
+                    let mut module = generate_with_params(
+                        ShaderGroup::Conv2dChecked {
+                            kernel_h: kh,
+                            kernel_w: kw,
+                            stride,
+                        },
+                        MatrixTypes {
+                            multiply,
+                            ..MatrixTypes::F32_AS_F16
+                        },
+                        shape,
+                        Some(&params),
+                    );
+                    let mut binding = 0;
+                    for (_, global) in module.module.global_variables.iter_mut() {
+                        if matches!(
+                            global.space,
+                            naga::AddressSpace::Uniform | naga::AddressSpace::Storage { .. }
+                        ) {
+                            global.binding = Some(naga::ResourceBinding { group: 0, binding });
+                            binding += 1;
+                        }
+                    }
+                    let info = naga::valid::Validator::new(
+                        naga::valid::ValidationFlags::all(),
+                        capabilities,
+                    )
+                    .validate(&module.module)
+                    .unwrap();
+                    naga::back::spv::write_vec(
+                        &module.module,
+                        &info,
+                        &naga::back::spv::Options::default(),
+                        None,
+                    )
+                    .unwrap();
+                }
             }
         }
     }

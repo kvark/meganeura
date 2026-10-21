@@ -1073,6 +1073,15 @@ pub fn generate_module_coop_typed_with_layout(
     cooperative::generate(group, types, shape)
 }
 
+pub(crate) fn generate_checked_conv(
+    group: ShaderGroup,
+    types: MatrixTypes,
+    shape: [u32; 3],
+    params: &[u32],
+) -> ShaderModule {
+    cooperative::generate_with_params(group, types, shape, Some(params))
+}
+
 /// [`generate_module_coop`] reading B in `format`: f32, or f16 with f16-input
 /// tiles, where staging loads the stored half values without a conversion.
 pub fn generate_module_coop_weighted(

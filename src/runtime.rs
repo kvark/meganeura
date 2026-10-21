@@ -970,6 +970,7 @@ enum Variant {
         crate::codegen::MatrixTypes,
         crate::codegen::TypedMatmulLayout,
     ),
+    CoopConv(ShaderEntry, crate::codegen::MatrixTypes, Vec<u32>),
     CoopWorkgroup(
         ShaderEntry,
         crate::codegen::WorkgroupMatmulShape,
@@ -1086,6 +1087,7 @@ impl Variant {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
             Variant::Attention(ref e, _, _)
             | Variant::CoopTyped(ref e, _, _)
+            | Variant::CoopConv(ref e, _, _)
             | Variant::CoopWorkgroup(ref e, _, _)
             | Variant::CoopTiled(ref e, _, _, _)
             | Variant::SplitMatmul(ref e, _, _, _)
@@ -1111,6 +1113,9 @@ impl Variant {
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
+            Variant::CoopConv(ref e, types, ref params) => {
+                format!("{e:?}:checked-{types:?}-fixed-{params:?}")
+            }
             Variant::CoopWorkgroup(ref e, shape, types) => {
                 format!("{e:?}:workgroup-{shape:?}-{types:?}")
             }
@@ -1921,6 +1926,21 @@ impl Pipelines {
         let cooperative =
             || *coop_config.expect("cooperative dispatch needs a qualified device configuration");
         let module = match *key {
+            Variant::CoopConv(ref entry, types, ref params) => {
+                let ShaderEntry::Conv2dGemmCoopGen(kernel_h, kernel_w, stride) = *entry else {
+                    unreachable!()
+                };
+                crate::codegen::generate_checked_conv(
+                    ShaderGroup::Conv2dChecked {
+                        kernel_h,
+                        kernel_w,
+                        stride,
+                    },
+                    types,
+                    typed_shape(types.multiply)?,
+                    params,
+                )
+            }
             Variant::CoopTyped(ref entry, types, staging) => {
                 let group = match *entry {
                     ShaderEntry::Conv2dGemmCoopGen(kernel_h, kernel_w, stride) => {
@@ -2219,6 +2239,14 @@ impl Pipelines {
             );
         }
         if let crate::compile::Kernel::CooperativeTyped { types, .. } = dispatch.kernel {
+            if matches!(entry, ShaderEntry::Conv2dGemmCoopGen(..)) {
+                return Variant::CoopConv(
+                    entry,
+                    types,
+                    bytemuck::cast_slice(std::slice::from_ref(&Conv2dParams::from(dispatch)))
+                        .to_vec(),
+                );
+            }
             return Variant::CoopTyped(entry, types, typed_matmul_layout(dispatch));
         }
         if let crate::compile::Kernel::CooperativeTiled { shape, splits } = dispatch.kernel {

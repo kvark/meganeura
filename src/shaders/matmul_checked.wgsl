@@ -29,18 +29,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         var accumulator = $C_TILE();
         var lower = $C_TILE();
         for (var start = first; start < end; start += 32u) {
-            for (var index = lane; index < 1024u; index += 128u) {
-                let ar = row + index / 32u;
-                let ak = start + index % 32u;
-                let bk = start + index / 32u;
-                let bc = col + index % 32u;
-                var a = $MULTIPLY_TYPE(0.0f);
-                var b = $MULTIPLY_TYPE(0.0f);
-                if all(vec2<bool>((ar < m), (ak < k))) { a = $A_CAST($A_LOAD); }
-                if all(vec2<bool>((bk < k), (bc < n))) { b = $B_CAST($B_LOAD); }
-                stage_a[index] = a;
-                stage_b[index] = b;
-            }
+            $STAGE
             workgroupBarrier();
             let a0 = coopLoadT<$A_TILE>(&stage_a[a_offset], 32u);
             let b0 = coopLoadT<$B_TILE>(&stage_b[b_offset], 32u);
