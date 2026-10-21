@@ -2,34 +2,19 @@
 
 ## P3HPC (SC26 workshop)
 
-The current paper is [p3hpc/main.tex](p3hpc/main.tex). Its framework comparisons
-use only the September 25 v14 cohort: Inferena `7b8fcb72`, Meganeura
-`0dbfcc00`, and PyTorch 2.13.0 at source `cf30153c`. Both measured repositories
-are tagged `paper-p3hpc-2026-final`. No earlier benchmark fills a missing cell.
+The current paper is [p3hpc/main.tex](p3hpc/main.tex). It and the
+[presentation](p3hpc/presentation/slides.md) use the final October 2026 cohort:
+Inferena `add19182e5479e3f7549894c524ac6691d3dc363`, Meganeura
+`c19cb1caedd90be7abc61de61f6197018711398e`, and PyTorch 2.13.0 at `cf30153c`.
+The older `paper-p3hpc-2026-final` tags do **not** identify this collection.
+No earlier result fills a missing cell.
 
-[RESULTS.md](p3hpc/RESULTS.md) records the audit, failures, timing caveats,
-the same-revision search ablation, footprint figures and conclusions.
-[QUALIFICATION.md](p3hpc/QUALIFICATION.md) describes the native-only GPU
-qualifications, which do not supply CPU-versus-GPU speed comparisons.
-Raw data, PDFs and ZIPs stay outside Git.
-
-Replay the evidence without a GPU, from the repository root (Python 3.11+):
-
-```sh
-python3 paper/p3hpc/artifact/cohort.py "$HOME/Downloads/p3hpc" \
-  --check paper/p3hpc/tables --output target/p3hpc-20260925
-python3 paper/p3hpc/artifact/search_ablation.py "$HOME/Downloads/p3hpc" \
-  "$HOME/Downloads/p3hpc/search-ablation.tgz" \
-  --check paper/p3hpc/tables --output target/p3hpc-20260925
-python3 -m unittest discover -s paper/p3hpc/artifact -p 'test_*.py'
-```
-
-`cohort.py` validates the fourteen archives and two crash logs identified by
-[cohort.sha256](p3hpc/artifact/cohort.sha256) and regenerates eight LaTeX
-fragments, including the strict ratio figure. `search_ablation.py` validates
-the native-only search ablation against the cohort's PyTorch outputs and
-writes the ninth, `ablation.tex`. Both also emit CSV/JSON summaries. See the
-[artifact README](p3hpc/artifact/README.md) for details.
+[RESULTS.md](p3hpc/RESULTS.md) records the audit, failures, numerical-policy
+limits and timing uncertainty. [QUALIFICATION.md](p3hpc/QUALIFICATION.md)
+separates the four correctness-only platforms from the seven timed GPUs.
+All 330 core native cells pass; core plus completed large-model runs supply
+246 native performance cells and 226 qualified paired comparisons.
+Raw archives, PDFs and ZIPs stay outside Git.
 
 ### Presentation
 
@@ -51,6 +36,29 @@ This regenerates the figures with Matplotlib 3.11.2 via `uv` and the deck with
 Marp CLI 4.5.1 via `npx` (Node and a Chromium-compatible browser required).
 Generated SVGs, HTML, PDF and notes are ignored; only source and chart inputs
 are committed. No GPU or raw benchmark archive is needed for this build.
+
+### Replaying the final evidence
+
+Use standard-library Python 3.12+ and a clean Inferena checkout at the exact
+revision above. No GPU, PyTorch installation, model downloads or new measurements
+are needed for replay:
+
+```sh
+python3 paper/p3hpc/artifact/final_cohort.py "$HOME/Downloads/p3hpc" \
+  --inferena /path/to/frozen/inferena \
+  --check paper/p3hpc/tables --output target/p3hpc-final
+```
+
+The analyzer verifies all sixteen archive hashes, imports the frozen
+collector's qualification routines, and regenerates eight TeX fragments,
+`summary.json`, `results.csv` and `preparation.csv`. The result CSV includes all
+retained process medians and paired ratios; the preparation CSV retains native
+setup, search and reference compilation with their recorded cache states.
+Additional audit JSON is written only to the output directory.
+The ratio convention is **Meganeura / PyTorch time**, below one favors Meganeura.
+See the [artifact README](p3hpc/artifact/README.md) for qualification and
+packaging limits. The old `cohort.py`, `search_ablation.py` and `ablation.tex`
+belong to historical studies and are not inputs to the final results.
 
 ### Template and build
 
@@ -87,6 +95,7 @@ After building the PDF, package the source and supplementary ZIPs together:
 
 ```sh
 python3 paper/p3hpc/artifact/submission.py "$HOME/Downloads/p3hpc" \
+  --inferena /path/to/frozen/inferena \
   --pdf paper/p3hpc/main.pdf --output paper/p3hpc/submission \
   --submission-id <SC submission number>
 ```
@@ -95,8 +104,9 @@ The source ZIP carries both bibliography files, `main.bbl`, the class/style,
 SC's `fancyhdr.sty`, the AD, figures and tables with their relative paths.
 SC26 wants auxiliary materials as one `<SC submission number>aux.zip` with a
 short `readme.txt`; ours is [artifact/SUPPLEMENT.md](p3hpc/artifact/SUPPLEMENT.md)
-and sits at the archive root with a regenerated `records.jsonl.xz`, the
-ablation archive, the analyzers and a `MANIFEST.sha256`.
+and sits at the archive root with the sixteen original campaign archives,
+the final analyzer and generated inputs, and a `MANIFEST.sha256`. The compact
+warmup summary and its distinct protocol are included separately.
 
 The first-page copyright block follows the
 [SC26 Instructions for Workshop Authors](https://submissions.supercomputing.org/static_resources/SC26_Instructions_for_Workshop_Authors.pdf)

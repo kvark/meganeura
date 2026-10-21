@@ -4,18 +4,17 @@
 Run from anywhere after building `paper/p3hpc/main.pdf`:
 
     python3 paper/p3hpc/artifact/submission.py "$HOME/Downloads/p3hpc" \\
+        --inferena /path/to/frozen/inferena \\
         --pdf paper/p3hpc/main.pdf --output paper/p3hpc/submission \\
         --submission-id <SC submission number>
 
 SC26 requires auxiliary materials as one `<SC submission number>aux.zip` with a
-short `readme.txt`; files sit at the archive root. The records stream is
-regenerated from the campaign archives with `cohort.py --bundle`, so the
-supplement never mixes checkers and records.
+short `readme.txt`. Validate the original archives with the frozen Inferena
+qualification code before packaging; never mix final tables with older data.
 """
 
 import argparse
 import hashlib
-import io
 from pathlib import Path
 import shutil
 import subprocess
@@ -28,7 +27,7 @@ P3HPC = HERE.parent
 PAPER = P3HPC.parent
 ZIP_TIME = (1980, 1, 1, 0, 0, 0)
 TABLES = ("devices", "qualification", "ratios", "preparation", "search", "scaling",
-          "portability", "ratio-plot", "ablation")
+          "portability", "ratio-plot")
 SOURCE_README = """# Meganeura P3HPC paper sources
 
 Build from `paper/p3hpc` with a TeX Live installation that has the
@@ -54,7 +53,8 @@ def write(archive, name, data):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("archives", type=Path, help="directory holding the campaign archives and search-ablation.tgz")
+    parser.add_argument("archives", type=Path, help="directory holding the sixteen final campaign archives")
+    parser.add_argument("--inferena", type=Path, required=True, help="clean checkout of measured Inferena add19182")
     parser.add_argument("--pdf", type=Path, required=True, help="built paper PDF to copy beside the ZIPs")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--submission-id", help="SC submission number; names the auxiliary ZIP <id>aux.zip")
@@ -63,6 +63,11 @@ def main():
     bbl = args.pdf.with_suffix(".bbl")
     if not bbl.exists():
         sys.exit(f"missing {bbl}; build the PDF with BibTeX first")
+
+    with tempfile.TemporaryDirectory() as directory:
+        subprocess.run([sys.executable, str(HERE / "final_cohort.py"), str(args.archives),
+                        "--inferena", str(args.inferena), "--check", str(P3HPC / "tables"),
+                        "--output", directory], check=True, stdout=subprocess.DEVNULL)
 
     files = {}
     for name in ("main.tex", "artifact-description.tex", "sc26repro.sty", "fancyhdr.sty",
@@ -78,17 +83,20 @@ def main():
         for name, data in sorted(files.items()):
             write(archive, name, data)
 
-    with tempfile.TemporaryDirectory() as directory:
-        bundle = Path(directory) / "records.jsonl.xz"
-        subprocess.run([sys.executable, str(HERE / "cohort.py"), str(args.archives), "--bundle", str(bundle)],
-                       check=True, stdout=subprocess.DEVNULL)
-        files = {"readme.txt": (HERE / "SUPPLEMENT.md").read_bytes(),
-                 "records.jsonl.xz": bundle.read_bytes(),
-                 "search-ablation.tgz": (args.archives / "search-ablation.tgz").read_bytes()}
-    for name in ("cohort.py", "search_ablation.py", "footprint.py", "cohort.sha256", "search-ablation.sha256"):
+    files = {"readme.txt": (HERE / "SUPPLEMENT.md").read_bytes()}
+    for line in (HERE / "final-cohort.sha256").read_text().splitlines():
+        _, name = line.split("  ", 1)
+        files["archives/" + name] = (args.archives / name).read_bytes()
+    for name in ("final_cohort.py", "cohort.py", "final-cohort.sha256"):
         files[name] = (HERE / name).read_bytes()
     for table in TABLES:
         files[f"tables/{table}.tex"] = (P3HPC / "tables" / f"{table}.tex").read_bytes()
+    for name in ("results.csv", "preparation.csv", "summary.json"):
+        files[f"tables/{name}"] = (P3HPC / "tables" / name).read_bytes()
+    for name in ("summary.csv", "protocol.json"):
+        files[f"warmup/{name}"] = (HERE / "warmup" / name).read_bytes()
+    for name in ("RESULTS.md", "QUALIFICATION.md"):
+        files[name] = (P3HPC / name).read_bytes()
     manifest = "".join(f"{hashlib.sha256(data).hexdigest()}  {name}\n" for name, data in sorted(files.items()))
     files["MANIFEST.sha256"] = manifest.encode()
     auxiliary = f"{args.submission_id}aux.zip" if args.submission_id else "meganeura-p3hpc-aux.zip"

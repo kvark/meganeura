@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit the final campaign archives and regenerate camera-ready tables (no GPU)."""
+"""Audit the October 9–10 v15 campaign archives and regenerate tables (no GPU)."""
 
 import argparse
 from collections import Counter, defaultdict
@@ -15,8 +15,8 @@ import tarfile
 
 
 HERE = Path(__file__).resolve().parent
-INFERENA = "7b8fcb72e55410d8e33bbe948f89be50c691fcf7"
-MEGANEURA = "0dbfcc0029bf98b33a03fc792e1f4e90ead17f23"
+INFERENA = "0ad1a5198e81a8da150148ee2cec4291f157eb80"
+MEGANEURA = "3102683311f3376026928364928a4aa966102311"
 TORCH = "cf30153c4c131c8164ee7798e5022d810682e2cb"
 MODELS = ("SmolLM2-135M", "SmolVLA", "StableDiffusion", "ResNet-50", "Whisper-tiny")
 PHASES = ("inference", "latency", "training")
@@ -25,6 +25,7 @@ DEVICES = {
     "nvidia-h100": "H100",
     "nvidia-3050": "RTX 3050",
     "amd-7900xt": "RX 7900 XT",
+    "amd-mi300": "MI300X",
     "intel-b570": "Arc B570",
     "apple-m3": "Apple M3",
 }
@@ -93,7 +94,8 @@ def audit_search(session):
         rejections += outcome["decision"] == "InvalidOutput"
         for field in ("construction_time", "initialization_time", "lowering_time", "qualification_time", "state_copy_time"):
             phases[field] += seconds(trial[field])
-        phases["program_elapsed"] += seconds(outcome["elapsed"])
+        phases["trial_elapsed"] += seconds(outcome["elapsed"])
+        phases["paired_samples"] += sum(outcome["baseline_ms"] + outcome["candidate_ms"]) / 1000
         if kernel is None:
             continue
         k = kernel["options"]
@@ -117,7 +119,8 @@ def audit_search(session):
             "extraction_truncated": search["extraction_truncated"], "skipped_regions": search["skipped_regions"],
             "visited_classes": visited, "eligible_classes": eligible, "decisions": dict(decisions),
             "program_rejections": rejections, "selected_graph": int(selected["description"].split(",")[0].split("=")[1]),
-            "selected_description": selected["description"], "phase_seconds": dict(phases)}
+            "selected_description": selected["description"], "phase_seconds": dict(phases),
+            "preparation_seconds": seconds(search["preparation_time"])}
 
 
 def relative_l2(actual, reference):
@@ -137,10 +140,8 @@ def audit_replay(validation, training, accelerated, capture):
         require(len(tensors) == count, "missing replay evidence")
         for sample in tensors:
             require(sample.keys() == anchor.keys(), "replay tensor inventory changed")
-            require({name for name in sample if not name.startswith("gradient ")}
-                    == ({"output 0", "output 1"} if training else {"output 0"}), "missing output evidence")
-            require(sum(name.startswith("gradient ") for name in sample) == validation["gradient_tensors"],
-                    "gradient inventory differs in replay")
+            require(set(sample) == ({"output 0", "output 1"} if training else {"output 0"}),
+                    "missing output evidence")
             for name, row in sample.items():
                 require(all(row[key] == anchor[name][key] for key in ("elements", "max_abs_reference", "rms_reference")),
                         "replay reference changed between calls")
@@ -149,22 +150,21 @@ def audit_replay(validation, training, accelerated, capture):
                 for metric in ("max_abs", "rms"):
                     require(math.isclose(row[metric + "_bound"], 1e-6 + 1e-4 * row[metric + "_reference"],
                                          rel_tol=1e-12), "per-tensor bound changed")
-                if not (name.startswith("gradient ") and accelerated):
-                    require(row["rms_error"] <= row["rms_bound"] and row["max_abs_error"] <= row["max_abs_bound"],
-                            "tensor replay failed")
+                require(row["rms_error"] <= row["rms_bound"] and row["max_abs_error"] <= row["max_abs_bound"],
+                        "tensor replay failed")
         totals = validation["full_gradient"][stage]
         require(len(totals) == (count if training else 0), "missing whole-gradient evidence")
-        for sample, total in zip(tensors, totals):
-            gradients = [row for name, row in sample.items() if name.startswith("gradient ")]
-            elements = sum(row["elements"] for row in gradients)
-            require(elements == total["elements"] > 0, "whole-gradient element count differs")
+        # v15 retains full-gradient summaries; per-parameter repeatability
+        # checks still run, but their individual reports are not archived.
+        for total in totals:
+            reference = validation["full_gradient"]["uncaptured"][0]
+            require(total["elements"] > 0 and validation["gradient_tensors"] > 0
+                    and all(math.isfinite(x) and x >= 0 for x in total.values()), "invalid full-gradient evidence")
+            require(all(total[key] == reference[key] for key in ("elements", "max_abs_reference", "rms_reference")),
+                    "whole-gradient reference changed")
             rtol = 0.01 if accelerated else 1e-4
+            require(total["rtol"] == rtol, "gradient bound changed")
             for metric in ("rms", "max_abs"):
-                for part in ("error", "reference"):
-                    key = metric + "_" + part
-                    value = (math.sqrt(sum(row[key] ** 2 * row["elements"] for row in gradients) / elements)
-                             if metric == "rms" else max(row[key] for row in gradients))
-                    require(math.isclose(value, total[key], rel_tol=1e-12, abs_tol=1e-12), "whole-gradient summary differs")
                 bound = 1e-6 + rtol * total[metric + "_reference"]
                 require(total[metric + "_error"] <= bound and math.isclose(bound, total[metric + "_bound"]),
                         "whole-gradient replay failed")
@@ -212,6 +212,8 @@ def audit_pair(pair, campaign, run, phases=PHASES, oracle=False):
         require(pt["environment"]["triton_backend"] == {"cuda": "nvidia", "rocm": "amd", "xpu": "intel"}[backend],
                 "wrong reference compiler backend")
         require(pt["device"] == pt["gpu_name"] and pt["device"].lower() != "cpu", "CPU fallback")
+    elif backend == "cpu":
+        require(pt["device"].lower() == "cpu", "qualification reference is not CPU")
     require(mg["optimizer"].get("measured_construction") is True,
             "native search disabled")
     require(mg["optimizer"]["mode"] == "egglog-outlined", "wrong graph optimizer")
@@ -227,7 +229,7 @@ def audit_pair(pair, campaign, run, phases=PHASES, oracle=False):
     for session in sessions:
         require(session["cooperative_matrix_policy"] == ("NativeF32" if strict else "Auto"), "session arithmetic changed")
     execution = pt["execution"]
-    mode = "default" if campaign["args"]["collect"] and not oracle else "eager"
+    mode = "eager" if oracle else "default"
     require(execution["requested_mode"] == mode and (oracle or run["mode"] == mode)
             and execution["compiled"] == (mode == "default"), "compiler fallback")
     require(execution["compile_budget_seconds"] == 120.0 and execution["compile_budget_enforced"], "watchdog missing")
@@ -255,6 +257,11 @@ def audit_pair(pair, campaign, run, phases=PHASES, oracle=False):
                 and v["uncaptured_calls"] == repeats + 1 and v["consecutive_replays"] == (2 if capture else 0),
                 "replay validation policy changed")
         audit_replay(v, phase == "training", phase == "training" and pt["precision"]["reduced_precision_allowed"], capture)
+        if phase == "training":
+            native = next(s["qualification"] for s in sessions if s["mode"] == "Training")
+            require(v["gradient_tensors"] == native["gradient_tensors"]
+                    and v["full_gradient"]["uncaptured"][0]["elements"] == native["gradient_elements"],
+                    "native/reference gradient inventory differs")
     a, b = mg["outputs"], pt["outputs"]
     require(a["output_shape"] == b["output_shape"], "output shape mismatch")
     require(len(a["logits_sample"]) == len(b["logits_sample"]) == 256, "sample inventory differs")
@@ -288,7 +295,8 @@ def archive_records(path):
         return
     with tarfile.open(path, mode="r|gz") as archive:
         for member in archive:
-            if member.isfile() and member.name.endswith((".json", ".log", ".txt")):
+            if member.isfile() and (member.name.endswith((".json", ".log", ".txt", ".jsonl", ".patch", ".sh", ".py", ".lock"))
+                                    or PurePosixPath(member.name).name in ("SHA256SUMS", "series")):
                 data = archive.extractfile(member).read().decode("utf-8")
                 yield member.name, json.loads(data) if member.name.endswith(".json") else data
 
@@ -321,7 +329,7 @@ def load_campaign(path, records):
     require(campaign["source"] == INFERENA and campaign["meganeura"]["rev"] == MEGANEURA,
             "campaign revision mismatch")
     require(campaign["torch"]["git_version"] == TORCH, "campaign PyTorch mismatch")
-    require(campaign["protocol"] == "p3hpc-paired-campaign-v14"
+    require(campaign["protocol"] == "p3hpc-paired-campaign-v15"
             and campaign["synthetic_parameter_init"] == "name-index-uniform-v1",
             "campaign protocol mismatch")
     require(campaign["args"]["replicates"] == 3, "replicate policy changed")
@@ -330,14 +338,15 @@ def load_campaign(path, records):
             and campaign["failure_policy"] == {"recoverable": ["numerical", "capture", "cross-engine-mismatch"],
                 "eager_diagnostic_attempts": 1, "eager_sdpa": "math", "timing_substitution": False,
                 "retry_failed_primary": False}, "preparation or failure policy changed")
-    expected_models = (["SmolLM2-360M", "SmolLM2-1.7B"] if path.stem == "nvidia-h100-large"
+    expected_models = (["SmolLM2-360M", "SmolLM2-1.7B"] if path.stem in ("nvidia-h100-large", "amd-mi300-large")
                        else ["SmolLM2-360M"] if "large" in path.stem else list(MODELS))
     require(campaign["args"]["models"] == expected_models
             and campaign["args"]["precisions"] == ["strict", "accelerated"], "campaign workload coverage changed")
     policy = {"scope": "All", "class_limit": None, "max_scratch_bytes": 1024**3,
               "search_seconds_per_session": 60.0, "strict_coop": "NativeF32"}
     policy.update({
-        "measured_construction": True, "optimizer": "egglog-outlined", "kernel_seconds_per_program": 60.0,
+        "measured_construction": True, "optimizer": "egglog-outlined", "submissions_per_step": 1,
+        "kernel_seconds_per_program": 60.0,
         "max_graphs": 16, "max_programs": 64, "plan_fraction_of_available": 0.75,
         "warmup_pairs": 2, "warmup_seconds": 0.25,
         "qualification": "fixed-full-tensor-v4"})
@@ -559,6 +568,8 @@ def label(model):
 
 
 def driver_label(device, campaign):
+    if device == "amd-mi300":
+        return "patched RADV"
     info = campaign["native_device"]["driver_info"].split("-")[0]
     if not info:
         return "built-in"
@@ -645,10 +656,9 @@ def tables(campaigns, rows, groups):
     for device, name in QUALIFICATIONS.items():
         conditions = len(groups[device])
         reference = {"intel-rplu-qualify": r"no XPU device$^\dagger$",
-                     "amd-9600x-qualify": r"ROCm crash, wrong output$^\dagger$",
+                     "amd-9600x-qualify": "ROCm process failure",
                      "amd-780m-qualify": "HIP launch failure"}[device]
         lines.append([name, f"Vulkan {conditions}/10", reference])
-    lines.append([r"MI300X$^\dagger$", "no Vulkan driver", "strict 135M ran"])
     output["qualification.tex"] = tex_table("lll", "GPU & Meganeura & PyTorch GPU path", lines)
     lines = []
     for device, name in paired_devices.items():
@@ -688,12 +698,12 @@ def tables(campaigns, rows, groups):
                       str(sum(s["selected_graph"] != 0 for s in searches)),
                       str(sum(s["program_rejections"] for s in searches))])
     output["search.tex"] = tex_table("lrrrrr",
-        r"GPU & Sessions & Programs & Out of time & Changed graph & Rejected", lines)
+        r"GPU & Sessions & Programs & Truncated & Changed graph & Rejected", lines)
     lines = []
-    for device in ("nvidia-5070", "amd-7900xt", "nvidia-h100"):
+    for device in ("nvidia-5070", "amd-7900xt", "nvidia-h100", "amd-mi300"):
         first = True
         for model in ("SmolLM2-135M", "SmolLM2-360M", "SmolLM2-1.7B"):
-            if model.endswith("1.7B") and device != "nvidia-h100":
+            if model.endswith("1.7B") and device not in ("nvidia-h100", "amd-mi300"):
                 continue
             for precision in ("strict", "accelerated"):
                 source = device if model.endswith("135M") else device + "-large"
@@ -759,7 +769,7 @@ def main():
             log_count += sum(isinstance(value, str) for value in records.values())
             if bundle:
                 bundle.write("null\n")
-            if name.endswith(".txt"):
+            if name.endswith(".txt") or name.startswith("mi300-driver-patches-"):
                 continue
             c, groups, failed = load_campaign(path, records)
             for name, digest in c["sha256"].items():
