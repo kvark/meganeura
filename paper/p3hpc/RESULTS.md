@@ -165,7 +165,17 @@ MI300X evidence with the same Mesa source: the module identity and parameters
 `mi300-provenance/` of the October 10 `amd-mi300.tgz` (SHA-256 `82472b2b...`)
 and in `mi300-driver-patches-20261008.tgz` (`40b1f241...`), both listed in the
 historical [cohort.sha256](artifact/cohort.sha256). Neither archive is part of
-the final supplement.
+the final supplement. The October 10 campaign reports Mesa build
+`git-d0299158d0` while its provenance names source `8c7f5fdd`; its setup
+verification records `kernel_all_xcc: Y`.
+
+The final archives do not record the module parameter, so all-XCC execution
+on October 19 rests on timing. Against the October 10 run, no final native
+median is more than 6% slower (SmolLM2-1.7B: 0.99-1.05x; most core cells are
+faster after compiler changes), whereas one XCC has an eighth of the compute
+units. Strict 1.7B training, about 6 x 1.71e9 x 128 = 1.3 TFLOP per step in
+35.88 ms, sustains about 37 TFLOP/s, against roughly 20 TFLOP/s of f32 peak
+for one XCC (163.4 TFLOP/s / 8).
 
 Compiler-stage and search-ablation measurements remain historical evidence
 from earlier revisions. DinoVision is separately versioned; its queue-sharing
