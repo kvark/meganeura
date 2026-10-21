@@ -95,7 +95,7 @@ If asked:
 
 </div></div>
 
-**Measured here:** Vulkan on Linux and Android · Metal on macOS
+**Measured here:** Vulkan on Linux, Windows and Android · Metal on macOS
 
 <!--
 Time: 0:55.
@@ -114,8 +114,8 @@ Because Blade also renders, an application can draw and run its models on one
 device and one queue. That is where this talk ends.
 
 If asked:
-- Blade also runs on Windows and iOS; this study measured Linux, Android and
-  macOS.
+- Blade also runs on iOS; this study measured Linux, Windows (the RTX 3050),
+  Android and macOS.
 - Pins: Blade 4845d65 and a Naga fork, kvark/wgpu 13f582d, which carries some
   matrix and BF16 features that were not upstream yet.
 
