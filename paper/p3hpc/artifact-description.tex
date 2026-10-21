@@ -8,29 +8,25 @@
 \section{Overview of Contributions and Artifacts}
 
 \subsection{Paper's Main Contributions}
-
 \begin{description}
-\item[$C_1$] A numerically checked comparison of a compact Vulkan/Metal
-training and inference stack with compiled PyTorch on six GPUs from four
-vendors, including failures and models up to 1.7B parameters.
-\item[$C_2$] Measurements of compile-time graph and kernel search: what it
-explores, what it costs, and what it gains over no search and a two-second
-tuner at the same revision.
-\item[$C_3$] Deployment evidence: Vulkan qualification on three integrated
-GPUs, and an Android XR application that shares its Vulkan queue with
-rendering.
+\item[$C_1$] A numerically qualified Vulkan/Metal training and inference
+comparison with compiled PyTorch on seven GPUs, including models up to 1.7B.
+\item[$C_2$] Search selection and preparation measurements, with explicit
+kernel-decision cache states and numerical-policy limitations.
+\item[$C_3$] Additional qualification on three integrated GPUs and Quest~3S,
+experimental MI300X Vulkan support, and an XR queue-sharing application.
 \end{description}
 
 \subsection{Computational Artifacts}
-
 \begin{description}
-\item[$A_1$] The public
-\href{https://github.com/kvark/meganeura/tree/0dbfcc0029bf98b33a03fc792e1f4e90ead17f23}{Meganeura}
-and \href{https://github.com/kvark/inferena/tree/7b8fcb72e55410d8e33bbe948f89be50c691fcf7}{Inferena}
-sources, both tagged \code{paper-p3hpc-2026-final}, and the paper's
-supplement: all campaign and search-ablation records, the ablation runner
-patch, and CPU-only analyzers. No DOI has been assigned.
-\item[$A_2$] The public
+\item[$A_1$] Public
+\href{https://github.com/kvark/meganeura/tree/c19cb1caedd90be7abc61de61f6197018711398e}{Meganeura}
+and \href{https://github.com/kvark/inferena/tree/add19182e5479e3f7549894c524ac6691d3dc363}{Inferena}
+sources at the measured commits; sixteen campaign archives and an offline
+analyzer. The older \code{paper-p3hpc-2026-final} tags do not identify these
+runs. The separate warmup diagnostic has its own recorded revision.
+No DOI has been assigned.
+\item[$A_2$] Public
 \href{https://github.com/kvark/dinovision/tree/dc35cdf1c7c910cdd93c5b5362846842ae469a21}{DinoVision source}
 and \href{https://huggingface.co/mad-bot/dinovision/tree/2c3f9017fe74c41482b165890c14737a2ccd4b6a}{evidence archive}.
 No DOI has been assigned.
@@ -39,7 +35,7 @@ No DOI has been assigned.
 \begin{center}
 \begin{tabular}{lll}
 \toprule
-Artifact & Contributions & Related paper elements\\
+Artifact & Contributions & Paper elements\\
 \midrule
 $A_1$ & $C_1$, $C_2$, $C_3$ & Tables~\ref{tab:devices}--\ref{tab:preparation}, Fig.~\ref{fig:ratios}\\
 $A_2$ & $C_3$ & Section~\ref{sec:edge}, Fig.~\ref{fig:dinovision}\\
@@ -48,115 +44,93 @@ $A_2$ & $C_3$ & Section~\ref{sec:edge}, Fig.~\ref{fig:dinovision}\\
 \end{center}
 
 \section{Artifact Identification}
-
 \newartifact
-
 \artrel
-The sources implement the compiler, validation tools and paired collection.
-The supplement preserves the campaigns used in every framework timing table and
-in Fig.~\ref{fig:ratios}, and the native-only search ablation. Separate
-driver bring-up notes document availability limits; they supply no timing.
+The source implements the compiler and paired collection. The sixteen
+archives are the sole inputs to the final framework performance and coverage
+results. Historical search ablations and the separately versioned application
+are not substituted for missing final-cohort measurements.
 
 \artexp
-Offline analysis should reproduce the generated tables and figure exactly.
-It checks 198 complete GPU pairs, six inference-only pairs with separate
-eager diagnostics, 30 CPU-oracle qualifications, and 60 ablation processes
-against the main campaigns' PyTorch outputs. Two hard-failed campaigns are retained,
-not replaced by successful retries. Fresh runs reproduce the procedure, not
-the original timing noise or the exact driver-dependent failures.
+Offline replay regenerates eight TeX fragments, a CSV with all process medians
+and paired-ratio ranges, and coverage/search summaries. It rechecks 277
+desktop native receipts, 769 valid paired-phase receipts, and ten Android
+full-tensor comparison receipts. All 330 core native cells qualify, as do
+246 completed measured native cells including larger models; 226 have ratios.
+The incomplete B570 360M campaign and all rejected references remain visible.
+Android archives omit the raw NPZ tensors: replay verifies hashes and
+comparison receipts, not the original elementwise arithmetic. Fresh runs
+reproduce the procedure, not the exact timing noise or driver failures.
 
 \arttime
-Offline setup and analysis each take about 1--5 minutes on an ordinary
-workstation; no GPU is needed. For fresh collection, allow roughly
-10--30 minutes for setup plus downloads, and 120--240 minutes per GPU
-campaign. The search ablation took about 20 minutes for two GPUs. These are
-planning estimates, not measured end-to-end costs. Large models and
-CPU-oracle qualification can take longer. Repeating all platforms requires
-separate machines; it is not a single short run.
+Offline analysis takes minutes and needs no GPU. The recorded campaigns sum
+to 15.16 device-hours; setup, downloads, and unarchived bring-up are excluded.
+A fresh full collection needs access to all eleven devices. It is not
+required to regenerate the paper's results.
 
 \artin
-
 \artinpart{Hardware}
-Offline replay needs only a CPU and enough disk for the supplied records.
-Fresh collection needs the relevant Vulkan or Metal GPU plus its
-PyTorch backend. The primary systems are RTX~5070, RTX~3050, H100,
-RX~7900~XT, Arc~B570 and Apple~M3. The qualification-only GPUs are
-Radeon~780M, Ryzen~9600X's integrated Radeon and Intel RPL-U.
-H100 has 80\,GB device memory for the 1.7B extension.
-Drivers and replay differences are in Table~\ref{tab:devices}
-and the campaign manifests.
+A CPU and several GiB of temporary disk suffice for offline replay.
+Performance devices are RTX~5070, RTX~3050, H100, RX~7900~XT, MI300X,
+Arc~B570, and M3. Radeon~780M, Ryzen~9600X iGPU, RPL-U, and Quest~3S
+supply qualification only. Device and driver identities are in the manifests;
+MI300X requires the documented experimental Mesa and AMDGPU patches.
 
 \artinpart{Software}
-Analysis uses standard-library Python 3.11 or later.
-Collection uses Python 3.13.13 and PyTorch 2.13.0, source
-\code{cf30153c4c131c8164ee7798e5022d810682e2cb}, from the
-\href{https://download.pytorch.org/whl/}{PyTorch wheel index}.
-Inferena pins Meganeura \code{0dbfcc00}, Blade \code{fbb4f28},
-the Rust dependency lockfile, and platform-specific Python requirements.
-The measured Inferena revision is \code{7b8fcb72}; the search ablation adds a
-runner patch that only exposes two existing library options.
-The pinned \href{https://github.com/kvark/inferena/blob/7b8fcb72e55410d8e33bbe948f89be50c691fcf7/EXPERIMENT.md}{collection instructions}
-cover Linux, Windows and macOS, including the Windows Rust build toolchain.
-Manifests retain package versions and PyTorch build configuration.
-Rust compiler versions were not retained in every campaign receipt;
-this limits exact reconstruction of native builds.
+The analyzer uses Python 3.12+ and a clean checkout of Inferena
+\code{add19182e5479e3f7549894c524ac6691d3dc363}. It imports that checkout's
+qualification routines, avoiding a separate implementation of numerical gates.
+No PyTorch installation is needed for offline replay. Collection uses Python
+3.13.13 and PyTorch 2.13.0 at \code{cf30153c4c131c8164ee7798e5022d810682e2cb}.
+The lockfile pins Meganeura \code{c19cb1c}, Blade \code{4845d65}, and Naga
+\code{13f582d}. Desktop paired protocol is v33; Android protocol is v15.
 
 \artinpart{Datasets / Inputs}
-Inputs are synthetic and deterministic. Non-language-model weights use
-\code{name-index-uniform-v1}. The setup downloads SmolLM2 checkpoints
-from \href{https://huggingface.co/HuggingFaceTB}{HuggingFaceTB} at pinned
-model revisions; the manifest records their hashes.
-The supplement contains all retained JSON values and 244 text logs from
-fourteen campaign archives and two standalone crash logs, compressed
-as \path{records.jsonl.xz}, and \path{search-ablation.tgz} with the 60
-ablation records, their logs, driver script, runner patch and kernel-level
-tile study. It excludes weights, executables and caches.
-Archive hashes establish provenance; the supplement's own manifest
-protects the packaged files.
+The archives preserve manifests, samples, qualification reports, logs,
+compiler/search receipts, and environment data. SHA-256 hashes in
+\path{final-cohort.sha256} identify the exact sixteen inputs. Shared lockfile,
+checkpoint, and text-corpus hashes agree across campaigns. SmolLM2 uses pinned
+public checkpoints; the other workloads use deterministic synthetic weights.
+Timed inputs are deterministic; PyTorch's untimed language-model training gate
+uses 256 matched real-text SGD updates. The warmup diagnostic's summary and
+protocol are separate inputs, not a new main-cohort condition.
 
 \artinpart{Installation and Deployment}
-For offline analysis, unpack the supplement and use its README.
-For fresh collection, check out the Inferena tag above, install Rust
-and \href{https://docs.astral.sh/uv/}{uv}, and run the platform setup
-script with \code{cu130}, \code{rocm7.2}, \code{xpu}, \code{mps} or
-\code{cpu}. It creates an isolated environment with managed Python.
-Use the Windows setup script on Windows.
-The collector builds the native runner and prepares pinned models.
-Driver installation remains a platform prerequisite, not a Python
-environment operation.
+For offline replay, unpack the archives and check out the exact Inferena
+commit above. Follow the supplement README; no GPU setup or model download
+is needed. For fresh measurements, use that checkout's \path{EXPERIMENT.md}
+and platform setup scripts. Driver installation remains a separate
+prerequisite. The experiment requires the recorded explicit backend settings,
+not merely the newest available software.
 
 \artcomp
-Setup precedes device selection and collection; collection produces
-manifests and per-process records; CPU-only analysis validates those
-records and generates the tables.
-Run \code{python scripts/p3hpc.py} in the managed environment for the
-five-model matrix. It uses three fresh process pairs per condition,
-both arithmetic contracts, at least five warmups and two seconds per
-phase, then twenty samples. Native search has a shared soft 60-second
-deadline per session; default PyTorch compilation has a supervised
-120-second deadline. CUDA/HIP/XPU use checked replay; MPS compiles
-without a public equivalent.
-Use \code{--models SmolLM2-360M} for the desktop extension and add
-\code{SmolLM2-1.7B} on H100. CPU-oracle qualification uses
-\code{--backend cpu --qualify-only --eager}, never a CPU/GPU speed ratio.
-\code{--gpu} selects the native GPU on multi-GPU hosts.
-Copy or rename \code{latest.tgz} before another campaign replaces it.
-For the search ablation, apply \path{ablation-runner.patch} to Inferena
-\code{7b8fcb72} and run \path{ablation.py} from the archive on the GPU host.
+Collection uses three fresh processes per measured condition, both profiles,
+20 synchronized samples after at least five calls and ten seconds of warmup.
+Correctness-only runs use one process and one sample; Android warmup is two
+seconds. Native search uses 30 seconds per session, with persisted kernel
+choices scoped to campaign/model/profile. First-session misses and later
+warm decisions are reported separately, not labeled as controlled driver-cache
+cold starts. PyTorch compilation has a separate supervised 120-second limit.
+Timing excludes optimizer updates; FP16 scaling housekeeping remains included.
+The original binary is hash-checked before and after desktop runs.
 
 \artout
-Run \code{python cohort.py records.jsonl.xz --check tables --output regenerated},
-then \code{python search\_ablation.py records.jsonl.xz search-ablation.tgz --check tables --output regenerated}.
-The first analyzer checks source identity, raw/joined agreement, numerical
-gates, preparation and replay policies, and phase-level replication; the
-second checks every ablation record's identity and policy and validates its
-outputs against the main campaigns' PyTorch outputs. Together they regenerate nine
-LaTeX fragments, including the ratio figure, plus per-condition CSV medians
-and ranges, failure records and search summaries. Failed PyTorch phases
-remain absent; independently qualified native timings remain available.
-Eager diagnostics never replace compiled timing. The supplement README
-explains the M3 timing sensitivity and the six-platform portability scores.
-The artifact has not undergone independent artifact evaluation.
+Run \path{final_cohort.py} with the archive directory, \code{--inferena}
+pointing to the frozen checkout, \code{--check} pointing to the supplied
+tables, and \code{--output} pointing to a new directory. It verifies archive
+identity and invokes the frozen collector's validators before generating
+results. The CSV retains each process median and the three paired ratios;
+the headline statistic remains the ratio of median process times. No outliers
+are removed, and correctness-only times never enter performance aggregates.
+The old \path{cohort.py} and \path{search_ablation.py} are historical analyzers,
+not commands for this collection.
+
+Numerical rejection is not evidence of a vendor defect or a speed win.
+Native single-step gradient fidelity and PyTorch's trajectory gate are
+explicitly different. Offline changes to thresholds cannot reconstruct
+kernels a new search might select; a tolerance study would require a separate,
+versioned experiment for both engines. The artifact has not undergone
+independent artifact evaluation.
 
 \newartifact
 
