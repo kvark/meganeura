@@ -681,9 +681,11 @@ driver source \code{amdgpu-6.19.14-2364437.24.04}; the module is loaded with
 reference needs one accommodation as well:
 \path{MIOPEN_DEBUG_CONV_IMPLICIT_GEMM_ASM_FWD_GTC_XDLOPS_NHWC=0} excludes a
 convolution solver that had failed earlier. The kernel settings and this
-override are recorded in the provenance of earlier runs on the same machine
-with the same Mesa build; the final archives record only the Mesa build and
-the host kernel. Both stacks are thus explicitly configured, and neither
+override are recorded in the provenance of October~10 runs with the same Mesa
+source and kernel, which verified all eight XCCs; the final archives record
+only the Mesa build and the host kernel. No final native time is more than
+6\% slower than in those runs, and strict 1.7B training sustains about
+37\,TFLOP/s, nearly twice the f32 peak of one XCC. Both stacks are thus explicitly configured, and neither
 stock installation is shown to work without intervention.
 
 \subsection{Performance portability}
