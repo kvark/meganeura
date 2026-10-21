@@ -1,10 +1,10 @@
 \begin{tabular}{lll}
 \toprule
-GPU & Meganeura & PyTorch GPU path \\
+GPU & Native cells & Reference \\
 \midrule
-Radeon 780M & Vulkan 10/10 & HIP launch failure \\
-Ryzen 9600X iGPU & Vulkan 10/10 & ROCm crash, wrong output$^\dagger$ \\
-Intel RPL-U & Vulkan 10/10 & no XPU device$^\dagger$ \\
-MI300X$^\dagger$ & no Vulkan driver & strict 135M ran \\
+Radeon 780M & 30/30 & CPU f32 \\
+Ryzen 9600X iGPU & 30/30 & CPU f32 \\
+Intel RPL-U & 30/30 & CPU f32 \\
+Quest 3S / Adreno 740 & 30/30 & CPU f64 \\
 \bottomrule
 \end{tabular}
