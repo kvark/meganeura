@@ -190,3 +190,33 @@ section.conclusions > p { margin: 0 0 23px; }
 section.conclusions > p:last-of-type { margin-top: 0; font-size: 22px; }
 section.precision { font-size: 23px; }
 section.precision table { font-size: 21px; }
+
+.game-intro { display: grid; grid-template-columns: 1fr 1.1fr; gap: 38px; align-items: center; }
+.game-intro blockquote { font-size: 33px; margin: 20px 0 25px; padding: 5px 18px; }
+.game-intro figure { margin: 0; }
+.game-intro img { display: block; width: 100%; }
+.game-intro figcaption { font-size: 16px; color: #637679; margin-top: 10px; }
+.stack-columns { grid-template-columns: 1.15fr 1fr; gap: 35px; }
+.stack-columns > .layers { border: 0; padding: 0; }
+.layers > div { background: #e7eeeb; border-left: 4px solid #006b70; padding: 9px 15px; margin-bottom: 8px; }
+.layers b { display: block; font-size: 24px; color: #006b70; }
+.layers span { display: block; font-size: 19px; }
+section.stack { font-size: 24px; }
+section.stack h1 { margin-bottom: 20px; }
+section.stack li { margin: 14px 0; font-size: 24px; }
+section.stack small { font-size: 18px; }
+.model-classes { margin: 20px 0; }
+.model-classes p { font-size: 25px; }
+.model-classes small { font-size: 21px; }
+.kernel-columns { grid-template-columns: 1fr 1fr; margin-top: 24px; }
+.kernel-columns pre { font-size: 21px; line-height: 1.5; padding: 16px; }
+.kernel-columns p { font-size: 24px; }
+section.correctness { font-size: 25px; }
+section.correctness table { font-size: 23px; }
+section.protocol { font-size: 25px; }
+section.protocol li { margin: 12px 0; }
+section.contracts table { font-size: 23px; }
+section.since-paper table { font-size: 23px; }
+section.since-paper th, section.since-paper td { padding: 11px 13px; }
+section.since-paper p { font-size: 24px; }
+section.api-code pre { font-size: 21px; line-height: 1.45; }

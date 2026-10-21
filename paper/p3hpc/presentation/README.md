@@ -1,10 +1,10 @@
 # P3HPC presentation
 
-This is the main 20-minute talk: 19 main slides with 19:15 of suggested
-speaking time, followed by 11 backups. It combines the graphics-API argument,
+This is the main 20-minute talk: 22 main slides with 18:50 of suggested
+speaking time, followed by 14 backups. It combines the graphics-API argument,
 the compiler's design, hardware access and limits, measured results, and
 train-to-deploy conclusions. The `presentation-alt`, `presentation-api` and
-`presentation-story` siblings remain local reference drafts, outside this commit.
+`presentation-story` siblings remain intact as local reference drafts.
 
 From the repository root:
 
@@ -16,15 +16,19 @@ The build needs `uv`, Node/npm and a Chromium-compatible browser. It pins
 Matplotlib 3.11.2 and Marp CLI 4.5.1. `--figures` remains accepted for existing
 commands; every build regenerates the figures. Outputs are ignored by Git:
 `figures/*.svg`, `slides.html`, `slides.pdf` and `slides-notes.txt`.
-The HTML needs its adjacent figures and `../../figures/dinovision-quest3s.jpg`;
+The HTML needs its adjacent `figures/`, `assets/`, and `../../figures/dinovision-quest3s.jpg`;
 the PDF embeds them. Markdown, CSS, Python, the build script and the compact
 data inputs are the sources. No GPU or full benchmark archive is needed to build.
 
-The main sequence is: shared graphics stack → Blade → compiler map and graph
-choices → hardware access and API limits → measured search → comparison and
-qualification → inference/training/accelerated results → selected paths →
-large models → preparation → headset integration → remaining gaps → what works.
-Detailed coverage, variability, numerical controls and TF32 belong to backup.
+The main sequence is: game graphics → reaching the GPU → compiler map → models,
+kernels and graph choices → compiler correctness → hardware access and API
+limits → measured search → comparison and qualification → accelerated arithmetic
+and results → selected paths → large models → preparation → headset integration
+→ changes since submission → remaining gaps → what works.
+Accelerated inference and training share a table: each cell shows the inference
+time ratio, with training in parentheses. Strict results, the Rust API example,
+gradients, detailed coverage, variability, numerical controls, TF32 and headset
+queue measurements belong to backup. The CUDA/Vulkan limits stay in the main talk.
 Notes provide sources and qualifications beyond the short text on each slide.
 
 The framework results use the final October 19, 2026 cohort:
@@ -59,9 +63,29 @@ timing uncertainty. Matrix-capability tables distinguish driver exposure from
 compiler support and selected programs. Development effort is author context,
 not a measured allocation of the performance gap.
 
+A synchronized sample means one host-wall timing of a model call, ending after
+GPU completion. A process pair means fresh Meganeura and PyTorch processes for
+the same condition, run sequentially. Each process takes 20 samples after warmup;
+the reported engine time is the median of three process medians. Engine order
+alternates between pairs. These definitions are also in the timing slide notes.
+
+The B570's zero selected matrix sessions belongs to the frozen cohort, not a
+claim that its matrix extension lacks hardware support. The October 21 local
+follow-up at PR #274 revision `a0cd01b806363bd30ea81ef75510882883fc3394` selects
+F16 Winograd kernels for U-Net inference and training. This is identified as
+separate work; the table is not patched with those timings. Local receipt:
+`/x/Code/inferena-results/pr273-274-review-20261021/review-summary.json`.
+The “Since the paper” slide compares the submitted manuscript at
+`paper-p3hpc-work` (`c62a8ec`) with the October cohort, and labels later kernel work
+separately. Changed numerical policies prevent treating aggregate changes as a
+controlled compiler speedup.
+
+The opening uses a real Unreal Tournament screenshot. Its source and attribution
+are in [assets/README.md](assets/README.md).
+
 The headset and full training-cycle evidence comes from the separately pinned
 [DinoVision study](https://github.com/kvark/dinovision/blob/dc35cdf1c7c910cdd93c5b5362846842ae469a21/REPORT.md).
 It trains with Adam on a desktop Vulkan GPU and deploys on Quest; the framework
-training timings exclude optimizer updates. The headset scheduling result is
-an observation: source inspection permits queue interleaving, but the archive
-has no trace establishing the cause of the lower worker latency.
+training timings exclude optimizer updates. The main headset slide demonstrates
+mobile inference sharing a graphics context and queue with OpenXR rendering.
+Scheduling measurements and their interpretation remain in backup notes.
