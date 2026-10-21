@@ -12,7 +12,6 @@ from collections import defaultdict
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.colors import to_rgb
 
 HERE = Path(__file__).resolve().parent
 INPUT = HERE / "data"
@@ -44,28 +43,36 @@ def clean(ax):
     ax.set_axisbelow(True)
 
 
-def heatmap(phase, profile, filename):
+def combined_results(profile):
+    """One cell per GPU/model: inference ratio, then training in parentheses."""
     fig = plt.figure(figsize=(11.56, 4.38))
-    ax = fig.add_axes((.16, .16, .835, .68))
-    values = [[float(r["ratio"]) if (r := DATA[d, m, profile, phase])["ratio"] else None for m in MODELS] for d in DEVICES]
-    colors = [[to_rgb("#e2e6e3" if v is None else "#dcece6" if v < 1 else "#f3e2d6") for v in row] for row in values]
-    ax.imshow(colors, aspect="auto")
-    for i, row in enumerate(values):
-        for j, v in enumerate(row):
-            ax.text(j, i, "—" if v is None else f"{v:.2f}", ha="center", va="center", fontsize=17, weight="bold",
-                    color=INK if v is None else TEAL if v < 1 else ORANGE)
+    ax = fig.add_axes((.16, .18, .835, .65))
+    ax.set(xlim=(-.5, 4.5), ylim=(6.5, -.5))
+    for i, device in enumerate(DEVICES):
+        for j, model in enumerate(MODELS):
+            for phase in ("inference", "training"):
+                raw = DATA[device, model, profile, phase]["ratio"]
+                value = float(raw) if raw else None
+                label = "—" if value is None else f"{value:.2f}"
+                if phase == "training":
+                    label = f"({label})"
+                ax.text(j + (-.03 if phase == "inference" else .03), i, label,
+                        ha="right" if phase == "inference" else "left", va="center",
+                        fontsize=15 if phase == "inference" else 14,
+                        weight="bold" if phase == "inference" else "normal",
+                        color=INK if value is None else TEAL if value < 1 else ORANGE)
     ax.set_xticks(range(5), ["SmolLM2\n135M", "SmolVLA\nexpert", "SD U-Net", "ResNet-50", "Whisper\nencoder"])
     ax.set_yticks(range(7), list(DEVICES.values()))
     ax.xaxis.tick_top()
     ax.tick_params(axis="both", length=0, pad=8, labelsize=13)
-    ax.set_xticks([x - .5 for x in range(6)], minor=True)
     ax.set_yticks([y - .5 for y in range(8)], minor=True)
-    ax.grid(which="minor", color=CANVAS, linewidth=4)
+    ax.grid(which="minor", axis="y", color="#d1dad8", linewidth=.7)
     ax.tick_params(which="minor", length=0)
     for spine in ax.spines.values(): spine.set_visible(False)
-    fig.text(.16, .085, "Meganeura / PyTorch time · lower is better", fontsize=13, weight="bold")
-    fig.text(.16, .025, "— No qualified paired ratio. M3: large process variation; near-ties are inconclusive.", fontsize=11, color="#637679")
-    save(fig, filename)
+    fig.text(.16, .105, "Inference (training) · Meganeura / PyTorch time · lower is better", fontsize=12, weight="bold")
+    fig.text(.16, .055, "Training = forward + loss + backward. Green < 1; brown > 1. Ratios, not milliseconds.", fontsize=10)
+    fig.text(.16, .012, "— No qualified paired ratio. M3: large process variation; near-ties are inconclusive.", fontsize=10, color="#637679")
+    save(fig, f"{profile}-combined.svg")
 
 
 def scaling():
@@ -214,7 +221,6 @@ def warmup():
 
 
 if __name__ == "__main__":
-    heatmap("inference", "strict", "strict-inference.svg")
-    heatmap("training", "strict", "strict-training.svg")
-    heatmap("training", "accelerated", "accelerated-training.svg")
+    combined_results("accelerated")
+    combined_results("strict")
     scaling();preparation();preparation_models();compiler_map();timing_spread();warmup()
