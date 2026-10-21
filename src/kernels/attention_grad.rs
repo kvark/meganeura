@@ -3,9 +3,8 @@
 //! Every path of a part reads the same buffers through the same binding
 //! layout and parameters (`[q_seq, kv_seq, heads << 16 | kv_heads,
 //! head_dim, window]`), so the paths differ only in geometry, module and
-//! what they admit. The one exception is the last input: most paths read
-//! `dot(dO, O)` per query row, reduced once before the dispatch, and the
-//! f16 cooperative path reads `O` itself.
+//! what they admit. All paths read `dot(dO, O)` per query row, reduced once
+//! in F32 before the dispatch.
 
 use super::{Family, Rejection};
 use crate::codegen::{ShaderModule, attention_lanes};
@@ -25,15 +24,14 @@ pub enum Part {
 pub enum Operands {
     /// Native f32 matrices: full precision, so preferred wherever they run.
     F32,
-    /// 16×16 f16 matrices. Rounding dO to f16 loses small derivatives, so
-    /// this is an opt-in.
+    /// F16 matrices with binary-scaled derivative operands and F32 accumulation.
     F16,
 }
 
 /// How a dispatch computes it, most preferred first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Path {
-    /// Cooperative-matrix products over 16-row tiles.
+    /// Cooperative-matrix products over tiles of query or key rows.
     Cooperative(Operands),
     /// Flash tiling: several rows per workgroup sharing their K/V (or Q/dO)
     /// staging.
@@ -89,7 +87,7 @@ pub(crate) struct Problem {
 /// What the device and compile options allow.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Target {
-    /// 16×16 f16 cooperative matrices.
+    /// Native F16 `[rows, 16, 16]` cooperative matrices.
     pub cooperative_f16: bool,
     /// Native 8×8 or 16×16 f32 cooperative matrices.
     pub cooperative_f32: bool,
@@ -164,11 +162,9 @@ impl Path {
                 } else if !target.reduced_precision {
                     Err("reduced-precision backward is not enabled")
                 } else if !target.cooperative_f16 {
-                    Err("no 16x16 f16 cooperative matrices")
+                    Err("no supported f16 cooperative matrices")
                 } else if head_dim < TILE || !head_dim.is_power_of_two() {
                     Err("head width is not a power of two of at least 16")
-                } else if problem.rows < TILE {
-                    Err("fewer rows than one tile")
                 } else if kernel.shared_bytes(head_dim) > u64::from(target.shared_memory_bytes) {
                     Err("tiles exceed workgroup memory")
                 } else {
@@ -227,16 +223,12 @@ impl AttentionGrad {
     /// Workgroups covering `problem`.
     pub(crate) fn workgroups(self, problem: &Problem) -> [u32; 3] {
         let per_group = match self.path {
-            Path::Cooperative(_) => TILE,
+            Path::Cooperative(Operands::F16) => 32,
+            Path::Cooperative(Operands::F32) => TILE,
             Path::Flash => flash_rows(problem.head_dim, problem.ept_cap),
             Path::Rowwise => 1,
         };
         [problem.rows.div_ceil(per_group), problem.heads, 1]
-    }
-
-    /// Whether the last input is `dot(dO, O)` per query row rather than `O`.
-    pub(crate) fn reads_row_dot(self) -> bool {
-        self.path != Path::Cooperative(Operands::F16)
     }
 
     /// Whether the scalar layout's elements per thread shape the module,
@@ -256,8 +248,8 @@ impl AttentionGrad {
             (Path::Cooperative(Operands::F32), _) => {
                 return u64::from(crate::codegen::FLASH_GRAD_COOP_F32_SHARED_BYTES);
             }
-            (Path::Cooperative(Operands::F16), Part::Q) => (192u64, 3264),
-            (Path::Cooperative(Operands::F16), Part::KV) => (256, 4544),
+            (Path::Cooperative(Operands::F16), Part::Q) => (324u64, 5888),
+            (Path::Cooperative(Operands::F16), Part::KV) => (324, 6656),
             (Path::Flash | Path::Rowwise, _) => (0, 0),
         };
         per_dim * u64::from(head_dim) + fixed
@@ -278,6 +270,8 @@ impl AttentionGrad {
 
     /// The module for `head_dim`, with `ept_cap` elements per thread on
     /// the flash path (the knobs' default when `None`).
+    /// Uses 8-row F32 and 16-row F16 matrices; runtime generation selects
+    /// the native F16 shape through `generate_flash_grad_f16_module`.
     pub fn generate(
         self,
         head_dim: u32,
@@ -416,7 +410,7 @@ mod tests {
         const F16: Path = Path::Cooperative(Operands::F16);
         let p = problem(Part::KV, 64, 64);
         assert_eq!(F16.admits(&p, &ROOMY), Ok(()));
-        let cases: [(Problem, Target, Rejection); 6] = [
+        let cases: [(Problem, Target, Rejection); 5] = [
             (
                 Problem { pinned: true, ..p },
                 ROOMY,
@@ -436,14 +430,13 @@ mod tests {
                     cooperative_f16: false,
                     ..ROOMY
                 },
-                "no 16x16 f16 cooperative matrices",
+                "no supported f16 cooperative matrices",
             ),
             (
                 problem(Part::KV, 64, 48),
                 ROOMY,
                 "head width is not a power of two of at least 16",
             ),
-            (problem(Part::KV, 15, 64), ROOMY, "fewer rows than one tile"),
             (
                 p,
                 Target {

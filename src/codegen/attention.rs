@@ -296,22 +296,14 @@ fn generate_flash_attention_coop(head_dim: u32, use_f16: bool) -> ShaderModule {
     generate_coop_attention(&source, head_dim, "flash_attention_coop")
 }
 
-/// F16-input cooperative dQ: dispatch `[ceil(q_seq/16), num_heads, 1]`.
+/// Scaled F16 cooperative dQ, with 32 query rows per workgroup.
 pub fn generate_flash_grad_q_coop_f16_module(head_dim: u32) -> ShaderModule {
-    generate_coop_attention(
-        include_str!("../shaders/flash_grad_q_coop_f16.wgsl"),
-        head_dim,
-        "flash_grad_q_coop_f16",
-    )
+    generate_flash_grad_f16_module(crate::kernels::attention_grad::Part::Q, head_dim, 16)
 }
 
-/// F16-input cooperative dK/dV: dispatch `[ceil(dispatch_kv/16), num_kv_heads, 1]`.
+/// Scaled F16 cooperative dK/dV, with 32 key rows per workgroup.
 pub fn generate_flash_grad_kv_coop_f16_module(head_dim: u32) -> ShaderModule {
-    generate_coop_attention(
-        include_str!("../shaders/flash_grad_kv_coop_f16.wgsl"),
-        head_dim,
-        "flash_grad_kv_coop_f16",
-    )
+    generate_flash_grad_f16_module(crate::kernels::attention_grad::Part::KV, head_dim, 16)
 }
 
 /// F32 cooperative dK/dV, with 16-key tiles and full-precision matrix products.
@@ -411,6 +403,29 @@ pub fn generate_flash_grad_q_coop_f32_module_with_tile(head_dim: u32, tile: u32)
         ),
         "flash_grad_q_coop_f32",
     )
+}
+
+/// Binary-scaled F16 gradient products, with F32 accumulation.
+/// Dispatch 32 query rows (dQ) or key rows (dK/dV) per workgroup.
+pub fn generate_flash_grad_f16_module(
+    part: crate::kernels::attention_grad::Part,
+    head_dim: u32,
+    native_rows: u32,
+) -> ShaderModule {
+    use crate::kernels::attention_grad::Part;
+    assert!(matches!(native_rows, 8 | 16));
+    let template = match part {
+        Part::Q => include_str!("../shaders/flash_grad_q_coop_f16.wgsl"),
+        Part::KV => include_str!("../shaders/flash_grad_kv_coop_f16.wgsl"),
+    };
+    let source = preprocess(
+        template,
+        &[
+            ("$M", &native_rows.to_string()),
+            ("$SCALE", include_str!("../shaders/attention_scale.wgsl")),
+        ],
+    );
+    generate_coop_attention(&source, head_dim, "flash_grad_scaled_f16")
 }
 
 fn generate_coop_attention(template: &str, head_dim: u32, hint: &'static str) -> ShaderModule {

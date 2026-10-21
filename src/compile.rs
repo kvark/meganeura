@@ -188,6 +188,8 @@ pub struct CompileOptions {
     /// An attention backward path to try before the usual order wherever
     /// it admits the problem, so a test or benchmark can run each path in
     /// turn. Paths that decline fall back to the usual choice.
+    /// Reduced-precision paths require `flash_backward_coop`; explicit
+    /// full-precision regions and pinned scalar layouts remain protected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefer_attention_grad: Option<crate::kernels::attention_grad::Path>,
 }
@@ -3222,7 +3224,7 @@ struct Compiler<'a> {
     /// so this must be the eventual session's target rather than global state.
     coop_caps: crate::codegen::CoopCaps,
     shared_memory_bytes: u32,
-    /// Experimental f16-input attention backward is deliberately separate
+    /// Reduced-input attention backward is deliberately separate
     /// from device capability: availability does not imply adequate gradient
     /// accuracy.
     allow_reduced_precision_attention_backward: bool,
@@ -3251,6 +3253,56 @@ mod tests {
 
     fn grad(part: Part, path: Path) -> ShaderEntry {
         ShaderEntry::AttentionGrad(AttentionGrad::new(part, path))
+    }
+
+    #[test]
+    fn f16_attention_respects_explicit_full_precision_forward() {
+        let path = Path::Cooperative(Operands::F16);
+        for (protected, prefer_f16) in [(false, true), (true, true), (false, false), (true, false)]
+        {
+            let mut graph = Graph::new();
+            let q = graph.parameter("q", &[33, 64]);
+            let k = graph.parameter("k", &[33, 64]);
+            let v = graph.parameter("v", &[33, 64]);
+            let qw = graph.parameter("qw", &[33, 256]);
+            let kw = graph.parameter("kw", &[33, 256]);
+            let vw = graph.parameter("vw", &[33, 256]);
+            if protected {
+                graph.begin_full_precision_region();
+            }
+            let y = graph.multi_head_attn(q, k, v, 1, 1, 64, false);
+            let wide = graph.multi_head_attn(qw, kw, vw, 1, 1, 256, false);
+            let loss = graph.mean_all(y);
+            let wide_loss = graph.mean_all(wide);
+            let loss = graph.add(loss, wide_loss);
+            graph.set_outputs(vec![loss]);
+            let graph = crate::autodiff::differentiate(&graph).into_toposort();
+            let plan = compile_with_caps(
+                &graph,
+                &CompileOptions {
+                    prefer_attention_grad: Some(if prefer_f16 { path } else { Path::Flash }),
+                    flash_backward_coop: prefer_f16,
+                    ..Default::default()
+                },
+                crate::CoopCaps {
+                    f16_tile: 16,
+                    f16_attention_rows: 16,
+                    ..Default::default()
+                },
+                49_152,
+            );
+            let count = plan.dispatches.iter().filter(|d| {
+                matches!(d.shader, ShaderEntry::AttentionGrad(kernel) if kernel.path == path)
+            }).count();
+            assert_eq!(count, if protected || !prefer_f16 { 0 } else { 2 });
+            // Head 256 exceeds this memory budget and retains F32 derivatives.
+            let wide = plan.dispatches.iter().filter(|d| {
+                matches!(d.shader, ShaderEntry::AttentionGrad(_)) && d.params[3] == 256
+            });
+            assert!(wide.into_iter().all(|d| {
+                !matches!(d.shader, ShaderEntry::AttentionGrad(kernel) if kernel.path == path)
+            }));
+        }
     }
 
     /// `Dispatch::mnk` must agree with the order each contraction shader's
@@ -4177,6 +4229,7 @@ mod tests {
         let native = crate::codegen::CoopCaps {
             f32_tile: 16,
             f16_tile: 16,
+            f16_attention_rows: 0,
         };
         let groups = |k: usize, n: usize, add: bool, f16: bool, caps| {
             let mut graph = Graph::new();
@@ -4702,6 +4755,7 @@ mod tests {
         let f16_only = crate::codegen::CoopCaps {
             f16_tile: 16,
             f32_tile: 0,
+            f16_attention_rows: 0,
         };
         let safe = compile_with_caps_policy(
             &differentiated,
@@ -4882,6 +4936,7 @@ mod tests {
                 crate::codegen::CoopCaps {
                     f16_tile: 16,
                     f32_tile: 0,
+                    f16_attention_rows: 0,
                 },
                 65_536,
                 true,
@@ -4890,6 +4945,7 @@ mod tests {
                 crate::codegen::CoopCaps {
                     f16_tile: 0,
                     f32_tile: 8,
+                    f16_attention_rows: 0,
                 },
                 32_768,
                 false,
@@ -5138,6 +5194,7 @@ mod tests {
             crate::codegen::CoopCaps {
                 f16_tile: 16,
                 f32_tile: 0,
+                f16_attention_rows: 0,
             },
             49_152,
             true,
@@ -5185,6 +5242,7 @@ mod tests {
                 crate::codegen::CoopCaps {
                     f16_tile: 0,
                     f32_tile: tile,
+                    f16_attention_rows: 0,
                 },
                 bytes,
             );
@@ -5271,6 +5329,7 @@ mod tests {
                 crate::codegen::CoopCaps {
                     f16_tile: 0,
                     f32_tile: 8,
+                    f16_attention_rows: 0,
                 },
                 32_768,
             );
@@ -5303,6 +5362,7 @@ mod tests {
         let caps = crate::codegen::CoopCaps {
             f16_tile: 16,
             f32_tile: 0,
+            f16_attention_rows: 0,
         };
         let options = CompileOptions {
             flash_backward_coop: true,
@@ -5310,12 +5370,14 @@ mod tests {
         };
         for (head_dim, bytes, expected) in [
             (64, 0, [false, false, false]),
-            (64, 16_384, [true, true, false]),
-            (128, 32_768, [true, true, false]),
-            (256, 49_152, [true, false, false]),
-            (256, 52_415, [true, false, false]),
-            (256, 52_416, [true, true, false]),
-            (256, 70_080, [true, true, true]),
+            (64, 26_623, [true, false, false]),
+            (64, 26_624, [true, true, false]),
+            (64, 27_392, [true, true, true]),
+            (128, 47_359, [true, false, false]),
+            (128, 47_360, [true, true, false]),
+            (128, 48_128, [true, true, true]),
+            (128, 49_152, [true, true, true]),
+            (256, 89_600, [true, true, true]),
             (512, 65_536, [false, false, false]),
         ] {
             let mut graph = Graph::new();

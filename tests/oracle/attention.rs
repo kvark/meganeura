@@ -406,8 +406,8 @@ fn every_backward_path_against_the_reference() {
         }
     }
 
-    // The f16 path rounds dO, so without the opt-in it must not run even
-    // when preferred.
+    // F16 still rounds operands, so without the opt-in it must not run
+    // even when preferred.
     let g = backward_graph(Kind::Causal, shape(17, 17, 2, 2, 16));
     let mut strict = defaults.clone();
     strict.compile.prefer_attention_grad = Some(Path::Cooperative(Operands::F16));
@@ -459,7 +459,7 @@ fn required_backward_paths(caps: CoopCaps, shared_memory_bytes: u32) -> BTreeSet
     if caps.f32_tile == 8 && fits(f32, 64) {
         paths.push(f32);
     }
-    if caps.f16_tile == 16 && fits(f16, 16) {
+    if (caps.f16_attention_rows != 0 || caps.f16_tile == 16) && fits(f16, 16) {
         paths.push(f16);
     }
     paths
@@ -477,6 +477,7 @@ fn required_backward_paths_respect_workgroup_memory() {
     let f32 = CoopCaps {
         f16_tile: 0,
         f32_tile: 8,
+        f16_attention_rows: 0,
     };
     let scalar = ["dQ-flash", "dQ-rowwise", "dKV-flash", "dKV-rowwise"];
     let short = required_backward_paths(f32, 18_623);
@@ -485,13 +486,14 @@ fn required_backward_paths_respect_workgroup_memory() {
     let enough = required_backward_paths(f32, 18_624);
     assert!(enough.contains("dQ-cooperative-f32") && enough.contains("dKV-cooperative-f32"));
 
-    // The f16 dK/dV tiles for a 16-wide head take 256·16 + 4544 bytes.
+    // The scaled F16 dK/dV tiles for a 16-wide head take 324·16 + 6656 bytes.
     let f16 = CoopCaps {
         f16_tile: 16,
         f32_tile: 0,
+        f16_attention_rows: 0,
     };
-    assert!(!required_backward_paths(f16, 8_639).contains("dKV-cooperative-f16"));
-    assert!(required_backward_paths(f16, 8_640).contains("dQ-cooperative-f16"));
+    assert!(!required_backward_paths(f16, 11_839).contains("dKV-cooperative-f16"));
+    assert!(required_backward_paths(f16, 11_840).contains("dQ-cooperative-f16"));
     assert!(required_backward_paths(CoopCaps::default(), 1 << 20).len() == 4);
 }
 
@@ -510,6 +512,7 @@ fn session_caps(options: &gpu::Options) -> CoopCaps {
         CoopPolicy::Disabled => CoopCaps::default(),
         CoopPolicy::NativeF32 => CoopCaps {
             f16_tile: 0,
+            f16_attention_rows: 0,
             ..caps
         },
         _ => caps,

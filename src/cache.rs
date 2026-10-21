@@ -9,6 +9,8 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
+// Version 36 changes F16 attention backward to 32-row workgroups and a
+// precomputed F32 row-dot input instead of the forward output.
 // Version 35 adds typed Winograd transforms and native half-storage products.
 // Version 34 separates GroupNorm statistics by grouping and adds fused
 // Winograd residuals and narrow scalar products.
@@ -47,7 +49,7 @@ use std::{io, path::Path};
 // Version 13 reduces loss partials into a scalar, lowers LayerNorm to the
 // two-pass kernel, carries RoPE's static offset into the dynamic kernels, and
 // changes which dispatches fusion may merge.
-const CACHE_FORMAT_VERSION: u32 = 35;
+const CACHE_FORMAT_VERSION: u32 = 36;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]
@@ -462,6 +464,7 @@ mod tests {
                 CoopCaps {
                     f16_tile: 16,
                     f32_tile: 0,
+                    f16_attention_rows: 0,
                 },
                 49_152,
             ),

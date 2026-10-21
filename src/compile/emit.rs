@@ -351,8 +351,18 @@ impl<'a> Compiler<'a> {
             ept_cap: node.attention_ept_cap.unwrap_or(default_ept),
             pinned: node.attention_ept_cap.is_some(),
         };
+        // Explicit full-precision forward regions retain F32 derivatives.
+        let reduced_precision = match node.op {
+            Op::MultiHeadAttnGradQ { fwd_node, .. }
+            | Op::MultiHeadAttnGradK { fwd_node, .. }
+            | Op::MultiHeadAttnGradV { fwd_node, .. } => {
+                !self.graph.node(fwd_node).requires_full_precision
+            }
+            _ => false,
+        };
         let target = attention_grad::Target {
-            cooperative_f16: self.coop_caps.supports_16x16_f16(),
+            cooperative_f16: self.coop_caps.f16_attention_rows != 0
+                || self.coop_caps.supports_16x16_f16(),
             // Native8 retains its established default. Native16 is an
             // explicitly extracted implementation, chosen by measurement.
             cooperative_f32: self.coop_caps.f32_tile == 8
@@ -363,10 +373,7 @@ impl<'a> Compiler<'a> {
                                 attention_grad::Operands::F32,
                             )))),
             shared_memory_bytes: self.shared_memory_bytes,
-            // Rounding dO to f16 loses small derivatives, so the f16 path is
-            // an explicit opt-in rather than following from the device
-            // advertising f16 matrices.
-            reduced_precision: self.allow_reduced_precision_attention_backward,
+            reduced_precision: reduced_precision && self.allow_reduced_precision_attention_backward,
             prefer: self.options.prefer_attention_grad,
         };
         let kernel = if node.attention_impl == Some(crate::graph::AttentionImpl::CooperativeF32) {
@@ -3616,11 +3623,8 @@ impl<'a> Compiler<'a> {
                     num_heads,
                     head_dim,
                 );
-                let row_source = if kernel.reads_row_dot() {
-                    self.emit_attention_row_dot(d_out, fwd_o, q_seq * num_heads, head_dim)
-                } else {
-                    fwd_o
-                };
+                let row_source =
+                    self.emit_attention_row_dot(d_out, fwd_o, q_seq * num_heads, head_dim);
                 self.plan.dispatches.push(Dispatch {
                     kernel: if kernel.takes_ept_cap() {
                         Kernel::AttentionBackward { ept_cap }
@@ -3705,14 +3709,11 @@ impl<'a> Compiler<'a> {
                     num_kv_heads,
                     head_dim,
                 );
-                // Most dK/dV kernels need dot(dO, O) for every query row.
+                // Every dK/dV kernel needs dot(dO, O) for every query row.
                 // Reduce it once here; recomputing it in every KV workgroup
                 // read O and spent a third of the inner loop's products on it.
-                let row_source = if kernel.reads_row_dot() {
-                    self.emit_attention_row_dot(d_out, fwd_o, q_seq * num_heads, head_dim)
-                } else {
-                    fwd_o
-                };
+                let row_source =
+                    self.emit_attention_row_dot(d_out, fwd_o, q_seq * num_heads, head_dim);
                 self.plan.dispatches.push(Dispatch {
                     kernel: if kernel.takes_ept_cap() {
                         Kernel::AttentionBackward { ept_cap }

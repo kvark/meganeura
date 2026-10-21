@@ -377,6 +377,10 @@ pub fn build_measured_with_inputs(
         .nodes()
         .iter()
         .all(|n| n.matmul_impl.is_none());
+    programs.replace_extracted_attention = forward_graph
+        .nodes()
+        .iter()
+        .all(|n| n.attention_ept_cap.is_none() && n.attention_impl.is_none());
     programs.enable_matrix_inputs(&supported, &gpu.capabilities());
     let preparation_time = start.elapsed();
     measure::select(
@@ -501,6 +505,7 @@ struct AxisChoice {
     matrix_inputs: Option<crate::DType>,
     vector_convolutions_only: bool,
     winograd: Option<crate::DType>,
+    f16_attention: bool,
 }
 
 fn early_physical_cover(baseline: AxisChoice, attention: &[AttentionChoice]) -> Vec<AxisChoice> {
@@ -550,6 +555,7 @@ struct CoordinateOrder {
     /// Forms to cover before the first arithmetic alternatives. Eight-wide
     /// products need early coverage of arithmetic, not just scalar layouts.
     arithmetic_layouts: usize,
+    priority_attention: Option<usize>,
     deferred: collections::HashSet<(usize, usize)>,
 }
 
@@ -566,6 +572,7 @@ impl CoordinateOrder {
             physical_next: false,
             priority_choices: collections::VecDeque::new(),
             arithmetic_layouts: ARITHMETIC_LAYOUTS,
+            priority_attention: None,
             deferred: collections::HashSet::new(),
         }
     }
@@ -585,6 +592,14 @@ impl CoordinateOrder {
             .count()
             >= self.seeds.min(self.arithmetic_layouts)
         {
+            // Keep the ordinary graph cover ahead of reduced attention too:
+            // an early kernel win can hide a larger graph-layout improvement.
+            if let Some(choice) = self.priority_attention.take() {
+                let entry = (incumbent.0, choice);
+                if self.mark(entry) {
+                    return Some(entry);
+                }
+            }
             while let Some(choice) = self.priority_choices.pop_front() {
                 let entry = (incumbent.0, choice);
                 if self.deferred.contains(&entry) {
@@ -709,6 +724,7 @@ fn implementations(
         matrix_inputs: None,
         vector_convolutions_only: false,
         winograd: None,
+        f16_attention: false,
         fuse_dispatches: seeds
             .first()
             .is_some_and(|seed| seed.options.fuse_dispatches),
@@ -731,12 +747,31 @@ fn implementations(
                 matrix_inputs: None,
                 vector_convolutions_only: false,
                 winograd: None,
+                f16_attention: false,
             })
         })
         .filter(|&choice| seen.insert(choice))
         .collect();
-    let choices: Vec<_> = std::iter::once(baseline).chain(cover).chain(tail).collect();
-    let order = CoordinateOrder::new(seeds.len(), choices.len());
+    let mut choices: Vec<_> = std::iter::once(baseline).chain(cover).chain(tail).collect();
+    let f16_attention = caps.f16_attention_rows != 0
+        && seeds.iter().any(|seed| {
+            seed.plan
+                .dispatches
+                .iter()
+                .any(|d| matches!(d.shader, compile::ShaderEntry::AttentionGrad(_)))
+        });
+    let first_choice = choices.len();
+    if f16_attention {
+        let ordinary = choices.clone();
+        choices.extend(ordinary.into_iter().map(|choice| AxisChoice {
+            f16_attention: true,
+            ..choice
+        }));
+    }
+    let mut order = CoordinateOrder::new(seeds.len(), choices.len());
+    if f16_attention {
+        order.priority_attention = Some(first_choice);
+    }
     let split_plans = Vec::new();
     Implementations {
         order,
@@ -748,6 +783,7 @@ fn implementations(
         split_plans,
         queued_splits: false,
         replace_extracted_matrices: false,
+        replace_extracted_attention: false,
         defer_bf16: false,
         matrix_shapes: collections::HashMap::new(),
     }
@@ -764,6 +800,7 @@ struct Implementations {
     split_plans: Vec<measure::Program>,
     queued_splits: bool,
     replace_extracted_matrices: bool,
+    replace_extracted_attention: bool,
     defer_bf16: bool,
     matrix_shapes: collections::HashMap<crate::DType, ([u32; 3], u32)>,
 }
@@ -1050,6 +1087,19 @@ impl measure::Frontier for Implementations {
                 .form_order
                 .sort_by_key(|&index| (self.seeds[index].backward_rank != backward_rank, index));
             let active = self.choices[incumbent.1];
+            // Carry the winning attention choice into arithmetic trials.
+            for index in &mut self.order.priority_choices {
+                let arithmetic = self.choices[*index];
+                let neighbor = AxisChoice {
+                    matrix_inputs: arithmetic.matrix_inputs,
+                    vector_convolutions_only: arithmetic.vector_convolutions_only,
+                    winograd: arithmetic.winograd,
+                    ..active
+                };
+                if let Some(next) = self.choices.iter().position(|&choice| choice == neighbor) {
+                    *index = next;
+                }
+            }
             // Try the other arithmetic family on top of a winning family
             // before spending the remaining deadline on attention layouts.
             let combined: Vec<_> = self
@@ -1095,6 +1145,7 @@ impl measure::Frontier for Implementations {
                         (choice.matrix_inputs, choice.vector_convolutions_only)
                             != (active.matrix_inputs, active.vector_convolutions_only),
                     ) + usize::from(choice.winograd != active.winograd),
+                    choice.f16_attention != active.f16_attention,
                     choice.attention != active.attention,
                     choice.fuse_dispatches != active.fuse_dispatches,
                     index,
@@ -1108,8 +1159,10 @@ impl measure::Frontier for Implementations {
                 matrix_inputs,
                 vector_convolutions_only,
                 winograd,
+                f16_attention,
             } = self.choices[choice_index];
             let mut plan = if splits == 0
+                && !f16_attention
                 && flash.is_none()
                 && fuse_dispatches == seed.options.fuse_dispatches
             {
@@ -1117,6 +1170,13 @@ impl measure::Frontier for Implementations {
             } else {
                 let mut options = seed.options.clone();
                 options.fuse_dispatches = fuse_dispatches;
+                if f16_attention {
+                    options.flash_backward_coop = true;
+                    options.prefer_attention_grad =
+                        Some(crate::kernels::attention_grad::Path::Cooperative(
+                            crate::kernels::attention_grad::Operands::F16,
+                        ));
+                }
                 if splits != 0 {
                     options.cached_attention_splits = Some(splits);
                 }
@@ -1125,13 +1185,37 @@ impl measure::Frontier for Implementations {
                     options.knobs.flash = shape;
                     options.flash_forward_coop = false;
                 }
+                let mut attention_graph;
+                let graph = if f16_attention && self.replace_extracted_attention {
+                    attention_graph = seed.graph.deep_clone();
+                    for node in attention_graph.nodes_mut() {
+                        if matches!(
+                            node.op,
+                            crate::graph::Op::MultiHeadAttnGradQ { .. }
+                                | crate::graph::Op::MultiHeadAttnGradK { .. }
+                                | crate::graph::Op::MultiHeadAttnGradV { .. }
+                        ) {
+                            node.attention_ept_cap = None;
+                            node.attention_impl = None;
+                        }
+                    }
+                    &attention_graph
+                } else {
+                    &seed.graph
+                };
                 let plan = compile::compile_with_caps(
-                    &seed.graph,
+                    graph,
                     &options,
                     self.caps,
                     self.shared_memory_bytes,
                 );
                 if plan == seed.plan
+                    || (f16_attention
+                        && !plan.dispatches.iter().any(|d| {
+                            matches!(d.shader, compile::ShaderEntry::AttentionGrad(kernel)
+                            if kernel.path == crate::kernels::attention_grad::Path::Cooperative(
+                                crate::kernels::attention_grad::Operands::F16))
+                        }))
                     || (flash.is_some()
                         && !plan
                             .dispatches
@@ -1163,6 +1247,9 @@ impl measure::Frontier for Implementations {
                 "{}, dispatch_fusion={fuse_dispatches}, attention_splits={splits}, flash={flash:?}",
                 seed.description
             );
+            if f16_attention {
+                description.push_str(", f16_attention=true");
+            }
             if let Some(dtype) = matrix_inputs {
                 description.push_str(&format!(", matrix_inputs={dtype:?}"));
                 if vector_convolutions_only {
@@ -1367,13 +1454,38 @@ mod tests {
         let vector_weights = graph.parameter("vector_weights", &[64 * 64]);
         let vector = graph.conv2d(x, vector_weights, 1, 64, 8, 8, 64, 1, 1, 1, 0);
         let gather = graph.conv2d(x, w, 1, 64, 8, 8, 64, 3, 3, 2, 1);
-        graph.set_outputs(vec![conv, dense, vector, gather]);
+        let q = graph.input("q", &[33, 16]);
+        let k = graph.input("k", &[33, 16]);
+        let v = graph.input("v", &[33, 16]);
+        let dy = graph.input("dy", &[33, 16]);
+        let forward = graph.multi_head_attn(q, k, v, 1, 1, 16, true);
+        let dq = graph.add_raw_node(
+            crate::graph::Op::MultiHeadAttnGradQ {
+                fwd_node: forward,
+                num_heads: 1,
+                num_kv_heads: 1,
+                head_dim: 16,
+                is_cross: true,
+            },
+            vec![dy, q, k, v],
+            graph.node(q).ty.clone(),
+        );
+        graph.set_outputs(vec![conv, dense, vector, gather, dq]);
         crate::optimize::apply_winograd_conv_fusions(
             &mut graph,
             &mut Vec::new(),
             &Default::default(),
         );
-        let mut frontier = graph_frontier(graph);
+        let frontier = graph_frontier(graph);
+        let mut frontier = implementations(
+            frontier.seeds,
+            crate::CoopCaps {
+                f16_attention_rows: 8,
+                ..Default::default()
+            },
+            65536,
+            512 << 20,
+        );
         let mut caps = blade_graphics::Capabilities {
             shader_float16: true,
             shader_bfloat16: true,
@@ -1391,19 +1503,29 @@ mod tests {
             if choice.matrix_inputs.is_some()
                 && !reached
                     .iter()
-                    .any(|&(dense, _, _)| matches!(dense, Some(_)))
+                    .any(|&(dense, _, _, _)| matches!(dense, Some(_)))
             {
                 assert_eq!(
                     choice.winograd,
                     Some(F16),
                     "retain the incumbent for the first dense trial"
                 );
+                assert!(choice.f16_attention, "retain winning attention arithmetic");
             }
             reached.insert((
                 choice.matrix_inputs,
                 choice.vector_convolutions_only,
                 choice.winograd,
+                choice.f16_attention,
             ));
+            assert_eq!(
+                program.plan.dispatches.iter().any(|d| {
+                    matches!(d.shader, compile::ShaderEntry::AttentionGrad(kernel)
+                        if kernel.path == crate::kernels::attention_grad::Path::Cooperative(
+                            crate::kernels::attention_grad::Operands::F16))
+                }),
+                choice.f16_attention,
+            );
             let gather = program
                 .plan
                 .dispatches
@@ -1426,7 +1548,7 @@ mod tests {
             frontier.observe(origin, true);
             // A winning Winograd family must still reach both dense families,
             // even when qualified F16 defers the matching BF16 combination.
-            if choice.winograd == Some(F16) {
+            if choice.f16_attention && (incumbent.is_none() || choice.winograd == Some(F16)) {
                 incumbent = Some(origin);
             }
         }
@@ -1437,10 +1559,12 @@ mod tests {
                         .into_iter()
                         .take(if dense.is_some() { 2 } else { 1 })
                 {
-                    assert!(
-                        reached.contains(&(dense, vector_only, winograd)),
-                        "{dense:?}, vector_only={vector_only}, {winograd:?}"
-                    );
+                    for f16_attention in [false, true] {
+                        assert!(
+                            reached.contains(&(dense, vector_only, winograd, f16_attention)),
+                            "{dense:?}, vector_only={vector_only}, {winograd:?}, f16_attention={f16_attention}"
+                        );
+                    }
                 }
             }
         }
@@ -2030,6 +2154,7 @@ mod tests {
             matrix_inputs: None,
             vector_convolutions_only: false,
             winograd: None,
+            f16_attention: false,
         };
         let unfused = AxisChoice {
             fuse_dispatches: false,
@@ -2180,7 +2305,8 @@ mod tests {
     #[test]
     fn arithmetic_cover_preserves_initial_layouts_and_uses_their_winner() {
         let mut order = CoordinateOrder::new(8, 6);
-        order.priority_choices.extend([4, 5]);
+        order.priority_choices.push_back(5);
+        order.priority_attention = Some(4);
         for form in 0..INITIAL_LAYOUTS {
             assert_eq!(order.next((0, 0)), Some((form, 0)));
         }
@@ -2227,6 +2353,9 @@ mod tests {
         for seeds in 0..8 {
             for choices in 0..12 {
                 let mut order = CoordinateOrder::new(seeds, choices);
+                if choices > 1 {
+                    order.priority_attention = Some(1);
+                }
                 let mut incumbent = (0, 0);
                 let mut visited = collections::HashSet::new();
                 while let Some(entry) = order.next(incumbent) {
