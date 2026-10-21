@@ -675,8 +675,8 @@ support and Vulkan conformance are outside this work.
 
 The runs load Mesa built from commit \code{8c7f5fdd}, the head of a draft
 merge request \cite{malyshau2026mi300}, on Linux \code{6.8.0-146-generic}.
-The kernel patch applies to AMD's vendor driver source
-\code{amdgpu-6.19.14-2364437.24.04}, and the module is loaded with
+The kernel patch, attached to the same request, applies to AMD's vendor
+driver source \code{amdgpu-6.19.14-2364437.24.04}; the module is loaded with
 \code{mi300\_xcc\_gang=1} and a 60-second compute lockup timeout. The
 reference needs one accommodation as well:
 \path{MIOPEN_DEBUG_CONV_IMPLICIT_GEMM_ASM_FWD_GTC_XDLOPS_NHWC=0} excludes a
