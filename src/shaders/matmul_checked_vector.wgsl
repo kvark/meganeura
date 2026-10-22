@@ -1,4 +1,4 @@
-            for (var index = lane; index < 256u; index += 128u) {
+            for (var index = lane; index < 256u; index += $THREADSu) {
                 let ar0 = row + select(index / 8u, (index % 8u) * 4u, $TRANSPOSE_A);
                 let ak0 = start + select((index % 8u) * 4u, index / 8u, $TRANSPOSE_A);
                 let bk0 = start + select(index / 8u, (index % 8u) * 4u, $TRANSPOSE_B);
