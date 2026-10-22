@@ -36,8 +36,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
                 let bc = col + index % 32u;
                 var a = $MULTIPLY_TYPE(0.0f);
                 var b = $MULTIPLY_TYPE(0.0f);
-                if ar < m && ak < k { a = $A_CAST($A_LOAD); }
-                if bk < k && bc < n { b = $B_CAST($B_LOAD); }
+                if all(vec2<bool>((ar < m), (ak < k))) { a = $A_CAST($A_LOAD); }
+                if all(vec2<bool>((bk < k), (bc < n))) { b = $B_CAST($B_LOAD); }
                 stage_a[index] = a;
                 stage_b[index] = b;
             }
