@@ -162,6 +162,7 @@ pub(super) fn generate_with_params(
         include_str!("../shaders/matmul_checked.wgsl"),
         &[
             ("$STAGE", stage),
+            ("$THREADS", "128"),
             ("$A_VECTOR", &convert("v", a_cast)),
             ("$B_VECTOR", &convert("v", b_cast)),
             ("$EXTENSIONS", &extensions),

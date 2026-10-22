@@ -1941,17 +1941,7 @@ impl Pipelines {
                     params,
                 )
             }
-            Variant::CoopTyped(ref entry, types, staging) => {
-                let group = match *entry {
-                    ShaderEntry::Conv2dGemmCoopGen(kernel_h, kernel_w, stride) => {
-                        ShaderGroup::Conv2dChecked {
-                            kernel_h,
-                            kernel_w,
-                            stride,
-                        }
-                    }
-                    _ => group,
-                };
+            Variant::CoopTyped(_, types, staging) => {
                 crate::codegen::generate_module_coop_typed_with_layout(
                     group,
                     types,

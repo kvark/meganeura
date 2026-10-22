@@ -1,4 +1,4 @@
-for (var index = lane; index < 256u; index += 128u) {
+for (var index = lane; index < 256u; index += $THREADSu) {
                 let ar = row + index / 8u;
                 let ak = start + (index % 8u) * 4u;
                 let bk = start + index / 8u;

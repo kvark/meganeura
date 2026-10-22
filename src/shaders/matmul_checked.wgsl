@@ -5,7 +5,7 @@ var<workgroup> stage_b: array<$MULTIPLY_TYPE, 1024>;
 var<workgroup> result: array<f32, 1024>;
 $ROUND
 
-@compute @workgroup_size(128)
+@compute @workgroup_size($THREADS)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_index) lane: u32,
         @builtin(subgroup_id) subgroup: u32,
@@ -16,7 +16,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     let col = group.y * 32u;
     // Pair rectangular tiles only when there are too few subgroups to cover
     // all eight hardware tiles in one pass.
-    let subgroups = 128u / subgroup_size;
+    let subgroups = $THREADSu / subgroup_size;
     let paired = $TILE_Mu == 8u && subgroups < 8u;
     let tile_rows = select($TILE_Mu, 16u, paired);
     let tile_count = 64u / tile_rows;
@@ -54,7 +54,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         }
     }
     workgroupBarrier();
-    for (var offset = lane; offset < 1024u; offset += 128u) {
+    for (var offset = lane; offset < 1024u; offset += $THREADSu) {
         let r = row + offset / 32u;
         let c = col + offset % 32u;
         if r < m && c < n {

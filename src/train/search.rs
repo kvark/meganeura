@@ -789,18 +789,19 @@ impl Implementations {
             // unrelated gathers to use the checked cooperative loop as well.
             // The complete-convolution choice remains in the same frontier.
             let mixed = self.seeds.iter().any(|seed| {
-                let mut vector = false;
-                let mut gather = false;
-                for d in &seed.plan.dispatches {
-                    if d.shader.is_conv2d_gemm() && !d.requires_full_precision {
-                        if crate::kernels::conv::vectorized_forward(&d.params) {
-                            vector = true;
-                        } else {
-                            gather = true;
-                        }
-                    }
-                }
-                vector && gather
+                let vector = fill_matrix_candidates_scoped(
+                    &mut seed.plan.clone(),
+                    multiply,
+                    self.replace_extracted_matrices,
+                    true,
+                );
+                vector > 0
+                    && vector
+                        < fill_matrix_candidates(
+                            &mut seed.plan.clone(),
+                            multiply,
+                            self.replace_extracted_matrices,
+                        )
             });
             if mixed {
                 self.order.priority_choices.push_back(self.choices.len());
@@ -1520,27 +1521,46 @@ mod tests {
         let a = graph.conv2d(x, w1, 2, 4, 7, 4, 5, 1, 1, 1, 0);
         let b = graph.conv2d(x, w3, 2, 4, 7, 4, 5, 3, 3, 1, 1);
         graph.set_outputs(vec![a, b]);
-        let mut frontier = matrix_frontier();
-        frontier.seeds[0].plan = compile::compile(&graph);
-        frontier.seeds[0].graph = std::sync::Arc::new(graph);
         let mut caps = blade_graphics::Capabilities {
             shader_float16: true,
             ..Default::default()
         };
         caps.cooperative_matrix.f16_f32_shapes.push([8, 16, 16]);
-        frontier.enable_matrix_inputs(&[crate::DType::F16], &caps);
-        let mut counts = std::collections::HashSet::new();
-        while let Some(program) = frontier.next(None) {
-            counts.insert(
-                program
-                    .plan
-                    .dispatches
-                    .iter()
-                    .filter(|d| matches!(d.kernel, compile::Kernel::CooperativeTyped { .. }))
-                    .count(),
+        for lock_gather in [false, true] {
+            let mut frontier = matrix_frontier();
+            frontier.seeds[0].plan = compile::compile(&graph);
+            frontier.seeds[0].graph = std::sync::Arc::new(graph.deep_clone());
+            if lock_gather {
+                for d in &mut frontier.seeds[0].plan.dispatches {
+                    if d.shader.is_conv2d_gemm()
+                        && !crate::kernels::conv::vectorized_forward(&d.params)
+                    {
+                        d.schedule_locked = true;
+                    }
+                }
+            }
+            frontier.enable_matrix_inputs(&[crate::DType::F16], &caps);
+            assert_eq!(
+                frontier.choices.iter().any(|c| c.vector_convolutions_only),
+                !lock_gather,
+                "an ineligible gather must not create a duplicate mixed family"
             );
+            if lock_gather {
+                continue;
+            }
+            let mut counts = std::collections::HashSet::new();
+            while let Some(program) = frontier.next(None) {
+                counts.insert(
+                    program
+                        .plan
+                        .dispatches
+                        .iter()
+                        .filter(|d| matches!(d.kernel, compile::Kernel::CooperativeTyped { .. }))
+                        .count(),
+                );
+            }
+            assert_eq!(counts, std::collections::HashSet::from([0, 1, 2]));
         }
-        assert_eq!(counts, std::collections::HashSet::from([0, 1, 2]));
     }
 
     #[test]

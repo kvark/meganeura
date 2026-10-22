@@ -1,4 +1,4 @@
-            for (var index = lane; index < 1024u; index += 128u) {
+            for (var index = lane; index < 1024u; index += $THREADSu) {
                 let ar = row + index / 32u;
                 let ak = start + index % 32u;
                 let bk = start + index / 32u;
