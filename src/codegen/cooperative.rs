@@ -1,5 +1,5 @@
 use super::{MatMulCoopVariant, MatrixTypes, ShaderGroup, ShaderModule, coop_shape, preprocess};
-use crate::DType;
+use crate::{DType, kernels::conv::Params};
 
 // Keep partition boundaries identical for the staged and rectangular kernels.
 // A whole 32-element block is also a whole pair of 16-wide staged K tiles.
@@ -21,7 +21,7 @@ pub(super) fn generate_with_params(
     group: ShaderGroup,
     types: MatrixTypes,
     shape: [u32; 3],
-    params: Option<&[u32]>,
+    params: Option<&Params>,
 ) -> ShaderModule {
     types.validate();
     assert!(
@@ -30,7 +30,7 @@ pub(super) fn generate_with_params(
     );
     let [m, n, k] = shape;
     let split_range = SPLIT_RANGE.replace("wgid.", "group.");
-    let vector_conv = params.is_some_and(crate::kernels::conv::vectorized_forward);
+    let vector_conv = params.is_some_and(Params::vectorized_forward);
     let (declaration, dimensions, range, a, b, index, destination, add) = match group {
         ShaderGroup::MatMul
         | ShaderGroup::MatMulAT
@@ -89,7 +89,7 @@ pub(super) fn generate_with_params(
                     }
                 );
             }
-            let mut declaration = format!(
+            let declaration = format!(
                 "{}\n{}\nconst KH: u32 = {kernel_h}u;\nconst KW: u32 = {kernel_w}u;\n\
                  const STRIDE: u32 = {stride}u;\n{}",
                 include_str!("../shaders/conv2d_params.wgsl"),
@@ -99,21 +99,35 @@ pub(super) fn generate_with_params(
                     crate::divisor::SHADER
                 },
                 if vector_conv {
-                    "var<storage> src: array<vec4<$B_TYPE>>;\nvar<storage> weight: array<vec4<$A_TYPE>>;\nvar<storage, read_write> dst: array<$OUT_TYPE>;\nvar<uniform> params: Params;"
+                    "var<storage> src: array<vec4<$B_TYPE>>;\nvar<storage> weight: array<vec4<$A_TYPE>>;\nvar<storage, read_write> dst: array<$OUT_TYPE>;"
                 } else {
                     include_str!("../shaders/conv2d_checked.wgsl")
                 }
             );
-            if let Some(values) = params {
-                assert_eq!(values.len(), 16);
-                let arguments = values.iter().map(|v| format!("{v}u")).collect::<Vec<_>>();
-                declaration = declaration.replace(
-                    "var<uniform> params: Params;",
-                    &format!("const params = Params({});", arguments.join(", ")),
-                );
-            }
+            let params_decl = match params {
+                Some(p) => format!(
+                    "const params = Params({}u, {}u, {}u, {}u, {}u, {}u, {}u, {}u, {}u, {}u, {}u, {}u, {}u, {}u, {}u, {}u);",
+                    p.batch,
+                    p.in_channels,
+                    p.in_h,
+                    p.in_w,
+                    p.out_channels,
+                    p.kernel_h,
+                    p.kernel_w,
+                    p.stride,
+                    p.padding_h,
+                    p.out_h,
+                    p.out_w,
+                    p.padding_w,
+                    p.kernel_w_multiplier,
+                    p.kernel_hw_multiplier,
+                    p.column_width_multiplier,
+                    p.output_spatial_multiplier,
+                ),
+                None => "var<uniform> params: Params;".to_owned(),
+            };
             (
-                declaration,
+                format!("{declaration}\n{params_decl}"),
                 "let m = params.out_channels; let n = params.out_h * params.out_w; let k = params.in_channels * KH * KW;",
                 "let first = 0u; let end = k;",
                 "weight[ar * k + ak]",
@@ -142,13 +156,14 @@ pub(super) fn generate_with_params(
         }
     };
     let (a_cast, b_cast) = (cast(types.a), cast(types.b));
-    let convert = |value: &str, cast: &str| {
-        if cast == "round_bf16" {
+    let convert = |value: &str, storage| {
+        let cast = cast(storage);
+        if types.multiply == DType::BF16 && storage == DType::F32 {
             format!(
-                "vec4<bf16>(round_bf16({value}.x), round_bf16({value}.y), round_bf16({value}.z), round_bf16({value}.w))"
+                "vec4<bf16>({cast}({value}.x), {cast}({value}.y), {cast}({value}.z), {cast}({value}.w))"
             )
         } else {
-            format!("vec4<{}>({value})", MatrixTypes::name(types.multiply))
+            format!("vec4<{cast}>({value})")
         }
     };
     let stage = if vector_conv {
@@ -156,15 +171,16 @@ pub(super) fn generate_with_params(
     } else {
         include_str!("../shaders/matmul_checked_stage.wgsl")
     };
-    let rounds = types.output == DType::BF16 || a_cast == "round_bf16" || b_cast == "round_bf16";
+    let rounds = types.output == DType::BF16
+        || (types.multiply == DType::BF16 && (types.a == DType::F32 || types.b == DType::F32));
     let multiply = MatrixTypes::name(types.multiply);
     ShaderModule::new(&preprocess(
         include_str!("../shaders/matmul_checked.wgsl"),
         &[
             ("$STAGE", stage),
             ("$THREADS", "128"),
-            ("$A_VECTOR", &convert("v", a_cast)),
-            ("$B_VECTOR", &convert("v", b_cast)),
+            ("$A_VECTOR", &convert("v", types.a)),
+            ("$B_VECTOR", &convert("v", types.b)),
             ("$EXTENSIONS", &extensions),
             ("$DECL", &declaration),
             ("$DIMS", dimensions),
@@ -362,24 +378,24 @@ mod tests {
                     (7, 7, 64, 1, 1, 1, 0),
                     (11, 13, 3, 3, 3, 2, 1),
                 ] {
-                    let params = [
-                        2,
-                        ci,
-                        h,
-                        w,
-                        65,
-                        kh,
-                        kw,
+                    let params = Params {
+                        batch: 2,
+                        in_channels: ci,
+                        in_h: h,
+                        in_w: w,
+                        out_channels: 65,
+                        kernel_h: kh,
+                        kernel_w: kw,
                         stride,
-                        pad,
-                        (h + 2 * pad - kh) / stride + 1,
-                        (w + 2 * pad - kw) / stride + 1,
-                        pad,
-                        0,
-                        0,
-                        0,
-                        0,
-                    ];
+                        padding_h: pad,
+                        out_h: (h + 2 * pad - kh) / stride + 1,
+                        out_w: (w + 2 * pad - kw) / stride + 1,
+                        padding_w: pad,
+                        kernel_w_multiplier: 0,
+                        kernel_hw_multiplier: 0,
+                        column_width_multiplier: 0,
+                        output_spatial_multiplier: 0,
+                    };
                     let mut module = generate_with_params(
                         ShaderGroup::Conv2dChecked {
                             kernel_h: kh,

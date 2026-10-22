@@ -1077,7 +1077,7 @@ pub(crate) fn generate_checked_conv(
     group: ShaderGroup,
     types: MatrixTypes,
     shape: [u32; 3],
-    params: &[u32],
+    params: &crate::kernels::conv::Params,
 ) -> ShaderModule {
     cooperative::generate_with_params(group, types, shape, Some(params))
 }

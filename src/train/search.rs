@@ -844,7 +844,8 @@ fn fill_matrix_candidates_scoped(
     let mut count = 0;
     for d in &mut plan.dispatches {
         if d.shader.is_conv2d_gemm()
-            && (!vector_convolutions_only || crate::kernels::conv::vectorized_forward(&d.params))
+            && (!vector_convolutions_only
+                || crate::kernels::conv::Params::from(&*d).vectorized_forward())
             && !d.requires_full_precision
             && !d.schedule_locked
             && d.matmul_epilogue.is_none()
@@ -1533,7 +1534,7 @@ mod tests {
             if lock_gather {
                 for d in &mut frontier.seeds[0].plan.dispatches {
                     if d.shader.is_conv2d_gemm()
-                        && !crate::kernels::conv::vectorized_forward(&d.params)
+                        && !crate::kernels::conv::Params::from(&*d).vectorized_forward()
                     {
                         d.schedule_locked = true;
                     }
