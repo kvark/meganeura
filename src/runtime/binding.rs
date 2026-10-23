@@ -14,11 +14,12 @@ use super::{
     ReductionParams, ReductionPass1Data, ReductionPass2RowData, RmsNormAddData, RmsNormData,
     RoPEData, RoPEDynamicData, RoPEDynamicFactorsData, RoPEParams, ScatterAddAtomicData,
     ScatterAddData, ScatterAddParams, Session, SoftmaxParams, TernaryData, TransposeData,
-    TransposeParams, UnaryData, UnaryParams, WinogradTransformAddData, WinogradTransformData,
-    WinogradTransformParams, reduction_is_dynamic,
+    TransposeParams, UnaryData, UnaryParams, WinogradInputData, WinogradOutputAddData,
+    WinogradOutputData, WinogradWeightData, reduction_is_dynamic,
 };
 use crate::compile::{
     BufferRef, CachedBlockAttentionParams, Dispatch, DispatchParams, Kernel, ShaderEntry,
+    WinogradInputParams, WinogradOutputParams, WinogradWeightParams,
 };
 use crate::kernels::attention_grad::{AttentionGrad, Part as AttentionGradPart};
 
@@ -1171,24 +1172,35 @@ impl Session {
                     },
                 );
             }
-            ShaderEntry::WinogradInputTransform
-            | ShaderEntry::WinogradOutputTransform
-            | ShaderEntry::WinogradWeightTransform => {
-                let p = &dispatch.params;
-                let params = WinogradTransformParams {
-                    p0: p[0],
-                    p1: p[1],
-                    p2: p[2],
-                    p3: p[3],
-                    p4: p[4],
-                    p5: p[5],
-                    p6: p[6],
-                    p7: p[7],
-                };
-                if matches!(dispatch.kernel, Kernel::WinogradOutputAdd) {
+            ShaderEntry::WinogradInputTransform => {
+                pc.bind(
+                    0,
+                    &WinogradInputData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: WinogradInputParams::from_words(&dispatch.params)
+                            .expect("Winograd input transform parameters"),
+                    },
+                );
+            }
+            ShaderEntry::WinogradWeightTransform => {
+                pc.bind(
+                    0,
+                    &WinogradWeightData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: WinogradWeightParams::from_words(&dispatch.params)
+                            .expect("Winograd weight transform parameters"),
+                    },
+                );
+            }
+            ShaderEntry::WinogradOutputTransform { fused } => {
+                let params = WinogradOutputParams::from_words(&dispatch.params)
+                    .expect("Winograd output transform parameters");
+                if fused {
                     pc.bind(
                         0,
-                        &WinogradTransformAddData {
+                        &WinogradOutputAddData {
                             src: buf(dispatch.input_buffers[0]),
                             dst: buf(dispatch.output_buffer),
                             params,
@@ -1198,7 +1210,7 @@ impl Session {
                 } else {
                     pc.bind(
                         0,
-                        &WinogradTransformData {
+                        &WinogradOutputData {
                             src: buf(dispatch.input_buffers[0]),
                             dst: buf(dispatch.output_buffer),
                             params,

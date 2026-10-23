@@ -81,6 +81,39 @@ params!(CachedBlockAttentionParams {
     _pad: u32,
 });
 
+params!(WinogradInputParams {
+    batch: u32,
+    in_channels: u32,
+    in_h: u32,
+    in_w: u32,
+    padding: u32,
+    tiles_h: u32,
+    tiles_w: u32,
+    total_tiles: u32,
+});
+
+params!(WinogradOutputParams {
+    batch: u32,
+    out_channels: u32,
+    out_h: u32,
+    out_w: u32,
+    tiles_h: u32,
+    tiles_w: u32,
+    total_tiles: u32,
+    _pad: u32,
+});
+
+params!(WinogradWeightParams {
+    out_channels: u32,
+    in_channels: u32,
+    adjoint: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+    _pad4: u32,
+    _pad5: u32,
+});
+
 #[cfg(test)]
 mod tests {
     use super::*;
