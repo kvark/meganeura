@@ -9,6 +9,7 @@ use crate::compile::WeightFormat;
 mod coop_tiled;
 mod cooperative;
 mod matrix_types;
+pub(crate) mod winograd;
 mod workgroup;
 pub use coop_tiled::{CooperativeMatmulShape, generate_tiled_coop_matmul};
 pub use matrix_types::MatrixTypes;
@@ -905,14 +906,14 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
             ShaderModule::new(include_str!("shaders/group_norm_silu.wgsl"))
         }
         ShaderGroup::WinogradInputTransform => {
-            ShaderModule::new(include_str!("shaders/winograd_input_transform.wgsl"))
+            winograd::transform(ShaderGroup::WinogradInputTransform, crate::DType::F32)
         }
         ShaderGroup::WinogradOutputTransform { fused } => generate_winograd_output(fused),
         ShaderGroup::WinogradBatchedMatMul => {
             ShaderModule::new(include_str!("shaders/winograd_matmul.wgsl"))
         }
         ShaderGroup::WinogradWeightTransform => {
-            ShaderModule::new(include_str!("shaders/winograd_weight_transform.wgsl"))
+            winograd::transform(ShaderGroup::WinogradWeightTransform, crate::DType::F32)
         }
         ShaderGroup::Conv2dGradWeightGemm => {
             conv_grad_weight_tiled(MatMulTile::Large, false, 16, false, None)

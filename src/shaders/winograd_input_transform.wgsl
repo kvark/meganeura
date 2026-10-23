@@ -1,3 +1,4 @@
+$EXTENSIONS
 // Winograd F(2,3) input transform: input[N, Ci, H, W] → V[16, Ci, P]
 // where P = batch * tiles_h * tiles_w, tiles_h = ceil(out_h/2), tiles_w = ceil(out_w/2).
 // Each thread handles one (tile_idx, ci) pair, computing 16 transform coefficients.
@@ -15,7 +16,7 @@ struct Params {
 }
 
 var<storage> src: array<f32>;              // input [N, Ci, H, W]
-var<storage, read_write> dst: array<f32>;  // V [16, Ci, P]
+var<storage, read_write> dst: array<$OUTPUT>;  // V [16, Ci, P]
 var<uniform> params: Params;
 
 @compute @workgroup_size(256)
@@ -78,12 +79,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Layout: V[alpha * Ci * P + ci * P + tile_idx]
     let ci_p = params.in_channels * params.total_tiles;
     let base = ci * params.total_tiles + tile_idx;
-    dst[0u * ci_p + base] = v00;  dst[1u * ci_p + base] = v01;
-    dst[2u * ci_p + base] = v02;  dst[3u * ci_p + base] = v03;
-    dst[4u * ci_p + base] = v04;  dst[5u * ci_p + base] = v05;
-    dst[6u * ci_p + base] = v06;  dst[7u * ci_p + base] = v07;
-    dst[8u * ci_p + base] = v08;  dst[9u * ci_p + base] = v09;
-    dst[10u * ci_p + base] = v10; dst[11u * ci_p + base] = v11;
-    dst[12u * ci_p + base] = v12; dst[13u * ci_p + base] = v13;
-    dst[14u * ci_p + base] = v14; dst[15u * ci_p + base] = v15;
+    dst[0u * ci_p + base] = $STORE(v00);  dst[1u * ci_p + base] = $STORE(v01);
+    dst[2u * ci_p + base] = $STORE(v02);  dst[3u * ci_p + base] = $STORE(v03);
+    dst[4u * ci_p + base] = $STORE(v04);  dst[5u * ci_p + base] = $STORE(v05);
+    dst[6u * ci_p + base] = $STORE(v06);  dst[7u * ci_p + base] = $STORE(v07);
+    dst[8u * ci_p + base] = $STORE(v08);  dst[9u * ci_p + base] = $STORE(v09);
+    dst[10u * ci_p + base] = $STORE(v10); dst[11u * ci_p + base] = $STORE(v11);
+    dst[12u * ci_p + base] = $STORE(v12); dst[13u * ci_p + base] = $STORE(v13);
+    dst[14u * ci_p + base] = $STORE(v14); dst[15u * ci_p + base] = $STORE(v15);
 }

@@ -8,6 +8,7 @@ use crate::{
 use serde::Serialize;
 
 mod measure;
+mod winograd;
 pub use measure::BuildSearchTrial;
 use std::{
     collections,
@@ -489,6 +490,7 @@ struct AxisChoice {
     fuse_dispatches: bool,
     matrix_inputs: Option<crate::DType>,
     vector_convolutions_only: bool,
+    winograd: Option<crate::DType>,
 }
 
 fn early_physical_cover(baseline: AxisChoice, attention: &[AttentionChoice]) -> Vec<AxisChoice> {
@@ -691,6 +693,7 @@ fn implementations(
         attention: (0, None),
         matrix_inputs: None,
         vector_convolutions_only: false,
+        winograd: None,
         fuse_dispatches: seeds
             .first()
             .is_some_and(|seed| seed.options.fuse_dispatches),
@@ -712,6 +715,7 @@ fn implementations(
                 fuse_dispatches,
                 matrix_inputs: None,
                 vector_convolutions_only: false,
+                winograd: None,
             })
         })
         .filter(|&choice| seen.insert(choice))
@@ -730,6 +734,7 @@ fn implementations(
         queued_splits: false,
         replace_extracted_matrices: false,
         defer_bf16: false,
+        matrix_shapes: collections::HashMap::new(),
     }
 }
 
@@ -745,6 +750,7 @@ struct Implementations {
     queued_splits: bool,
     replace_extracted_matrices: bool,
     defer_bf16: bool,
+    matrix_shapes: collections::HashMap<crate::DType, ([u32; 3], u32)>,
 }
 
 impl Implementations {
@@ -764,7 +770,8 @@ impl Implementations {
                 ) == Some([8, 16, 16])
                 && caps.cooperative_matrix.workgroup.granularities.is_empty();
         let ordinary = self.choices.clone();
-        let mut seen = collections::HashSet::new();
+        let mut dense = vec![(None, false)];
+        let mut winograd = vec![None];
         for &multiply in inputs {
             let shapes = match multiply {
                 crate::DType::F16 if caps.shader_float16 => &caps.cooperative_matrix.f16_f32_shapes,
@@ -773,52 +780,80 @@ impl Implementations {
                 }
                 _ => continue,
             };
-            if !seen.insert(multiply)
-                || crate::codegen::checked_cooperative_shape(shapes).is_none()
-                || !self.seeds.iter().any(|s| {
-                    fill_matrix_candidates(
-                        &mut s.plan.clone(),
-                        multiply,
-                        self.replace_extracted_matrices,
-                    ) > 0
-                })
+            let Some(shape) = crate::codegen::checked_cooperative_shape(shapes) else {
+                continue;
+            };
+            if self
+                .matrix_shapes
+                .insert(multiply, (shape, caps.subgroup_size))
+                .is_some()
             {
                 continue;
             }
-            // Keep the vectorized 1x1 products reachable without forcing
-            // unrelated gathers to use the checked cooperative loop as well.
-            // The complete-convolution choice remains in the same frontier.
-            let mixed = self.seeds.iter().any(|seed| {
-                let vector = fill_matrix_candidates_scoped(
-                    &mut seed.plan.clone(),
+            if self.seeds.iter().any(|s| {
+                winograd::fill(&mut s.plan.clone(), multiply, shape, caps.subgroup_size) > 0
+            }) {
+                winograd.push(Some(multiply));
+            }
+            if self.seeds.iter().any(|s| {
+                fill_matrix_candidates(
+                    &mut s.plan.clone(),
                     multiply,
                     self.replace_extracted_matrices,
-                    true,
-                );
-                vector > 0
-                    && vector
-                        < fill_matrix_candidates(
-                            &mut seed.plan.clone(),
-                            multiply,
-                            self.replace_extracted_matrices,
-                        )
-            });
-            if mixed {
-                self.order.priority_choices.push_back(self.choices.len());
+                ) > 0
+            }) {
+                let mixed = self.seeds.iter().any(|seed| {
+                    let vector = fill_matrix_candidates_scoped(
+                        &mut seed.plan.clone(),
+                        multiply,
+                        self.replace_extracted_matrices,
+                        true,
+                    );
+                    vector > 0
+                        && vector
+                            < fill_matrix_candidates(
+                                &mut seed.plan.clone(),
+                                multiply,
+                                self.replace_extracted_matrices,
+                            )
+                });
+                if mixed {
+                    dense.push((Some(multiply), true));
+                }
+                dense.push((Some(multiply), false));
+            }
+        }
+        // Independent precision coordinates keep both single-family candidates
+        // and their combinations reachable, including mixed F16/BF16 programs.
+        for &(matrix_inputs, vector_convolutions_only) in &dense {
+            for &winograd in &winograd {
+                if matrix_inputs.is_none() && winograd.is_none() {
+                    continue;
+                }
+                if matrix_inputs.is_none() || winograd.is_none() {
+                    self.order.priority_choices.push_back(self.choices.len());
+                }
                 self.choices
                     .extend(ordinary.iter().map(|choice| AxisChoice {
-                        matrix_inputs: Some(multiply),
-                        vector_convolutions_only: true,
+                        matrix_inputs,
+                        vector_convolutions_only,
+                        winograd,
                         ..*choice
                     }));
             }
-            self.order.priority_choices.push_back(self.choices.len());
-            self.choices
-                .extend(ordinary.iter().map(|choice| AxisChoice {
-                    matrix_inputs: Some(multiply),
-                    ..*choice
-                }));
         }
+        // Winograd's transforms amplify rounding error. Prefer F16's extra
+        // mantissa bits here, independently of the dense-product type order.
+        self.order
+            .priority_choices
+            .make_contiguous()
+            .sort_by_key(|&index| {
+                let choice = self.choices[index];
+                (
+                    choice.winograd.is_none(),
+                    choice.winograd == Some(crate::DType::BF16),
+                )
+            });
         self.order.choices = self.choices.len();
         self.order.choice_order = (0..self.choices.len()).collect();
     }
@@ -925,19 +960,31 @@ fn fill_matrix_candidates_scoped(
 impl measure::Frontier for Implementations {
     fn observe(&mut self, origin: measure::Origin, qualified: bool) {
         let choice = self.choices[origin.choice];
-        if !self.defer_bf16 || choice.matrix_inputs != Some(crate::DType::F16) {
+        if !self.defer_bf16 {
             return;
         }
-        let bf16 = AxisChoice {
-            matrix_inputs: Some(crate::DType::BF16),
-            ..choice
-        };
-        if let Some(index) = self.choices.iter().position(|&c| c == bf16) {
-            let entry = (origin.form, index);
-            if qualified {
-                self.order.deferred.insert(entry);
+        for winograd in [false, true] {
+            let dtype = if winograd {
+                choice.winograd
             } else {
-                self.order.deferred.remove(&entry);
+                choice.matrix_inputs
+            };
+            if dtype != Some(crate::DType::F16) {
+                continue;
+            }
+            let mut bf16 = choice;
+            if winograd {
+                bf16.winograd = Some(crate::DType::BF16);
+            } else {
+                bf16.matrix_inputs = Some(crate::DType::BF16);
+            }
+            if let Some(index) = self.choices.iter().position(|&c| c == bf16) {
+                let entry = (origin.form, index);
+                if qualified {
+                    self.order.deferred.insert(entry);
+                } else {
+                    self.order.deferred.remove(&entry);
+                }
             }
         }
     }
@@ -967,6 +1014,39 @@ impl measure::Frontier for Implementations {
                 .form_order
                 .sort_by_key(|&index| (self.seeds[index].backward_rank != backward_rank, index));
             let active = self.choices[incumbent.1];
+            // Try the other arithmetic family on top of a winning family
+            // before spending the remaining deadline on attention layouts.
+            let combined: Vec<_> = self
+                .order
+                .priority_choices
+                .iter()
+                .filter_map(|&index| {
+                    let trial = self.choices[index];
+                    if trial.matrix_inputs.is_some() == trial.winograd.is_some() {
+                        return None;
+                    }
+                    let choice = AxisChoice {
+                        matrix_inputs: trial.matrix_inputs.or(active.matrix_inputs),
+                        vector_convolutions_only: if trial.matrix_inputs.is_some() {
+                            trial.vector_convolutions_only
+                        } else {
+                            active.vector_convolutions_only
+                        },
+                        winograd: trial.winograd.or(active.winograd),
+                        ..active
+                    };
+                    self.choices.iter().position(|&c| c == choice)
+                })
+                .collect();
+            for index in combined.into_iter().rev() {
+                let entry = (incumbent.0, index);
+                if !self.order.tried.contains(&entry)
+                    && !self.order.deferred.contains(&entry)
+                    && !self.order.priority_choices.contains(&index)
+                {
+                    self.order.priority_choices.push_front(index);
+                }
+            }
             // Test the incumbent attention layout's other fusion setting, then
             // explore attention with its winning fusion setting. Expanding both
             // fusion settings for every losing layout spends the bounded search
@@ -975,8 +1055,10 @@ impl measure::Frontier for Implementations {
             self.order.choice_order.sort_by_key(|&index| {
                 let choice = self.choices[index];
                 (
-                    choice.matrix_inputs != active.matrix_inputs,
-                    choice.vector_convolutions_only != active.vector_convolutions_only,
+                    usize::from(
+                        (choice.matrix_inputs, choice.vector_convolutions_only)
+                            != (active.matrix_inputs, active.vector_convolutions_only),
+                    ) + usize::from(choice.winograd != active.winograd),
                     choice.attention != active.attention,
                     choice.fuse_dispatches != active.fuse_dispatches,
                     index,
@@ -989,6 +1071,7 @@ impl measure::Frontier for Implementations {
                 fuse_dispatches,
                 matrix_inputs,
                 vector_convolutions_only,
+                winograd,
             } = self.choices[choice_index];
             let mut plan = if splits == 0
                 && flash.is_none()
@@ -1034,6 +1117,12 @@ impl measure::Frontier for Implementations {
                     continue;
                 }
             }
+            if let Some(storage) = winograd {
+                let (shape, subgroup) = self.matrix_shapes[&storage];
+                if winograd::fill(&mut plan, storage, shape, subgroup) == 0 {
+                    continue;
+                }
+            }
             let mut description = format!(
                 "{}, dispatch_fusion={fuse_dispatches}, attention_splits={splits}, flash={flash:?}",
                 seed.description
@@ -1043,6 +1132,9 @@ impl measure::Frontier for Implementations {
                 if vector_convolutions_only {
                     description.push_str(", vector_convolutions_only=true");
                 }
+            }
+            if let Some(dtype) = winograd {
+                description.push_str(&format!(", winograd={dtype:?}"));
             }
             return Some(measure::Program {
                 description,
@@ -1129,6 +1221,10 @@ mod tests {
         let w = graph.parameter("w", &[32, 32]);
         let y = graph.matmul(x, w);
         graph.set_outputs(vec![y]);
+        graph_frontier(graph)
+    }
+
+    fn graph_frontier(graph: Graph) -> Implementations {
         let options = compile::CompileOptions::default();
         let caps = crate::codegen::CoopCaps::default();
         let plan = compile::compile_with_caps(&graph, &options, caps, 65536);
@@ -1144,6 +1240,99 @@ mod tests {
             65536,
             512 << 20,
         )
+    }
+
+    #[test]
+    fn winograd_and_dense_precision_choices_compose_and_qualify_independently() {
+        use crate::DType::{BF16, F16};
+        use measure::Frontier as _;
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[64 * 8 * 8]);
+        let w = graph.parameter("w", &[64 * 64 * 9]);
+        let conv = graph.conv2d(x, w, 1, 64, 8, 8, 64, 3, 3, 1, 1);
+        let a = graph.input("a", &[32, 32]);
+        let b = graph.parameter("b", &[32, 32]);
+        let dense = graph.matmul(a, b);
+        let vector_weights = graph.parameter("vector_weights", &[64 * 64]);
+        let vector = graph.conv2d(x, vector_weights, 1, 64, 8, 8, 64, 1, 1, 1, 0);
+        let gather = graph.conv2d(x, w, 1, 64, 8, 8, 64, 3, 3, 2, 1);
+        graph.set_outputs(vec![conv, dense, vector, gather]);
+        crate::optimize::apply_winograd_conv_fusions(
+            &mut graph,
+            &mut Vec::new(),
+            &Default::default(),
+        );
+        let mut frontier = graph_frontier(graph);
+        let mut caps = blade_graphics::Capabilities {
+            shader_float16: true,
+            shader_bfloat16: true,
+            subgroup_size: 32,
+            ..Default::default()
+        };
+        caps.cooperative_matrix.f16_f32_shapes.push([8, 16, 16]);
+        caps.cooperative_matrix.bf16_f32_shapes.push([8, 16, 16]);
+        frontier.enable_matrix_inputs(&[BF16, F16], &caps);
+        let mut incumbent = None;
+        let mut reached = collections::HashSet::new();
+        while let Some(program) = frontier.next(incumbent) {
+            let origin = program.origin.unwrap();
+            let choice = frontier.choices[origin.choice];
+            if choice.matrix_inputs.is_some()
+                && !reached
+                    .iter()
+                    .any(|&(dense, _, _)| matches!(dense, Some(_)))
+            {
+                assert_eq!(
+                    choice.winograd,
+                    Some(F16),
+                    "retain the incumbent for the first dense trial"
+                );
+            }
+            reached.insert((
+                choice.matrix_inputs,
+                choice.vector_convolutions_only,
+                choice.winograd,
+            ));
+            let gather = program
+                .plan
+                .dispatches
+                .iter()
+                .find(|d| d.origin.contains(&gather))
+                .unwrap();
+            assert_eq!(
+                matches!(gather.kernel, compile::Kernel::CooperativeTyped { .. }),
+                choice.matrix_inputs.is_some() && !choice.vector_convolutions_only,
+            );
+            let dense = program.plan.dispatches.iter().find_map(|d| match d.kernel {
+                compile::Kernel::CooperativeTyped { types, .. } => Some(types.multiply),
+                _ => None,
+            });
+            let winograd = program.plan.dispatches.iter().find_map(|d| match d.kernel {
+                compile::Kernel::WinogradMatmul { storage, .. } => Some(storage),
+                _ => None,
+            });
+            assert_eq!((dense, winograd), (choice.matrix_inputs, choice.winograd));
+            frontier.observe(origin, true);
+            // A winning Winograd family must still reach both dense families,
+            // even when qualified F16 defers the matching BF16 combination.
+            if choice.winograd == Some(F16) {
+                incumbent = Some(origin);
+            }
+        }
+        for dense in [None, Some(F16), Some(BF16)] {
+            for winograd in [None, Some(F16), Some(BF16)] {
+                for vector_only in
+                    [false, true]
+                        .into_iter()
+                        .take(if dense.is_some() { 2 } else { 1 })
+                {
+                    assert!(
+                        reached.contains(&(dense, vector_only, winograd)),
+                        "{dense:?}, vector_only={vector_only}, {winograd:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1725,6 +1914,7 @@ mod tests {
             fuse_dispatches: true,
             matrix_inputs: None,
             vector_convolutions_only: false,
+            winograd: None,
         };
         let unfused = AxisChoice {
             fuse_dispatches: false,

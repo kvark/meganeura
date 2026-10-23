@@ -920,6 +920,8 @@ fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
 /// implementation once; preparation builds exactly the selected pipeline.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Variant {
+    WinogradTransform(ShaderEntry, crate::DType),
+    WinogradMatmul(ShaderEntry, crate::DType, [u32; 2]),
     /// Checked cooperative product with explicit operand, multiplication and
     /// output types. K partitions are uniform data and do not change the
     /// pipeline.
@@ -1043,7 +1045,9 @@ impl Variant {
     fn entry(&self) -> Option<&ShaderEntry> {
         match *self {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
-            Variant::Attention(ref e, _, _)
+            Variant::WinogradTransform(ref e, _)
+            | Variant::WinogradMatmul(ref e, _, _)
+            | Variant::Attention(ref e, _, _)
             | Variant::CoopTyped(ref e, _, _)
             | Variant::CoopConv(ref e, _, _)
             | Variant::CoopWorkgroup(ref e, _, _)
@@ -1073,6 +1077,10 @@ impl Variant {
         match *self {
             Variant::CoopConv(ref e, types, ref params) => {
                 format!("{e:?}:checked-{types:?}-fixed-{params:?}")
+            }
+            Variant::WinogradTransform(ref entry, storage) => format!("{entry:?}:{storage:?}"),
+            Variant::WinogradMatmul(ref entry, storage, tile) => {
+                format!("{entry:?}:{storage:?}-{tile:?}")
             }
             Variant::CoopWorkgroup(ref e, shape, types) => {
                 format!("{e:?}:workgroup-{shape:?}-{types:?}")
@@ -1205,6 +1213,9 @@ struct Pipelines {
 fn checked_matrix_types(dispatch: &Dispatch) -> Option<crate::codegen::MatrixTypes> {
     use crate::codegen::MatrixTypes;
     match (&dispatch.kernel, &dispatch.shader) {
+        (&crate::compile::Kernel::WinogradMatmul { storage, .. }, _) => {
+            Some(MatrixTypes::reduced(storage))
+        }
         (&crate::compile::Kernel::CooperativeTyped { types, .. }, _) => Some(types),
         (
             &crate::compile::Kernel::CooperativeWorkgroup {
@@ -1265,6 +1276,9 @@ fn precision_requirements(dispatches: &[Dispatch]) -> (Vec<crate::DType>, Vec<cr
             if !multiply.contains(&types.multiply) {
                 multiply.push(types.multiply);
             }
+        }
+        if let crate::compile::Kernel::WinogradTransform(ty) = dispatch.kernel {
+            add(&mut storage, ty);
         }
         if matches!(
             &dispatch.shader,
@@ -1884,6 +1898,15 @@ impl Pipelines {
         let cooperative =
             || *coop_config.expect("cooperative dispatch needs a qualified device configuration");
         let module = match *key {
+            Variant::WinogradTransform(_, storage) => {
+                crate::codegen::winograd::transform(group, storage)
+            }
+            Variant::WinogradMatmul(_, storage, tile) => crate::codegen::winograd::matmul(
+                storage,
+                typed_shape(storage)?,
+                tile,
+                gpu.capabilities().subgroup_size,
+            ),
             Variant::CoopConv(ref entry, types, ref params) => {
                 let ShaderEntry::Conv2dGemmCoopGen(kernel_h, kernel_w, stride) = *entry else {
                     unreachable!()
@@ -2183,6 +2206,15 @@ impl Pipelines {
     /// which unrelated pipelines happen to have been compiled.
     fn key(dispatch: &Dispatch) -> Variant {
         let entry = dispatch.shader.clone();
+        match dispatch.kernel {
+            crate::compile::Kernel::WinogradTransform(storage) => {
+                return Variant::WinogradTransform(entry, storage);
+            }
+            crate::compile::Kernel::WinogradMatmul { storage, tile } => {
+                return Variant::WinogradMatmul(entry, storage, tile);
+            }
+            _ => {}
+        }
         if let crate::compile::Kernel::CooperativeWorkgroup { shape, types, .. } = dispatch.kernel {
             return Variant::CoopWorkgroup(
                 entry,

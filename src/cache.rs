@@ -9,6 +9,7 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
+// Version 35 adds typed Winograd transforms and native half-storage products.
 // Version 34 separates GroupNorm statistics by grouping and adds fused
 // Winograd residuals and narrow scalar products.
 // Version 33 integrates typed workgroup cooperative tile decisions.
@@ -46,7 +47,7 @@ use std::{io, path::Path};
 // Version 13 reduces loss partials into a scalar, lowers LayerNorm to the
 // two-pass kernel, carries RoPE's static offset into the dynamic kernels, and
 // changes which dispatches fusion may merge.
-const CACHE_FORMAT_VERSION: u32 = 34;
+const CACHE_FORMAT_VERSION: u32 = 35;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]

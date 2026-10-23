@@ -1281,6 +1281,13 @@ pub enum Kernel {
     AttentionBackward {
         ept_cap: u32,
     },
+    /// F32 transform arithmetic, narrowed only when writing private scratch.
+    WinogradTransform(crate::DType),
+    /// Aligned native half operands with F32 accumulation and output.
+    WinogradMatmul {
+        storage: crate::DType,
+        tile: [u32; 2],
+    },
 }
 
 impl Dispatch {
@@ -1313,6 +1320,7 @@ impl Dispatch {
         matches!(
             self.kernel,
             Kernel::Cooperative
+                | Kernel::WinogradMatmul { .. }
                 | Kernel::CooperativeTyped { .. }
                 | Kernel::CooperativeCompensated
                 | Kernel::CooperativeTiled { .. }
