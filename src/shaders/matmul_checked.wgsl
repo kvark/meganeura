@@ -14,8 +14,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     $RANGE
     let row = group.x * 32u;
     let col = group.y * 32u;
-    // Pair rectangular tiles only when there are too few subgroups to cover
-    // all eight hardware tiles in one pass.
+    // Pair eight-row tiles when there are too few subgroups to cover all
+    // row blocks in one pass. Eight-column tiles also compute the right half.
     let subgroups = $THREADSu / subgroup_size;
     let paired = $TILE_Mu == 8u && subgroups < 8u;
     let tile_rows = select($TILE_Mu, 16u, paired);
@@ -28,21 +28,29 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         let b_offset = (tile % 2u) * 16u;
         var accumulator = $C_TILE();
         var lower = $C_TILE();
+        var right = $C_TILE();
+        var lower_right = $C_TILE();
         for (var start = first; start < end; start += 32u) {
             $STAGE
             workgroupBarrier();
-            let a0 = coopLoadT<$A_TILE>(&stage_a[a_offset], 32u);
-            let b0 = coopLoadT<$B_TILE>(&stage_b[b_offset], 32u);
-            accumulator = coopMultiplyAdd(a0, b0, accumulator);
-            let a1 = coopLoadT<$A_TILE>(&stage_a[a_offset + 16u], 32u);
-            let b1 = coopLoadT<$B_TILE>(&stage_b[b_offset + 512u], 32u);
-            accumulator = coopMultiplyAdd(a1, b1, accumulator);
-            // A loop avoids Naga's conservative subgroup-size conditional check.
-            for (var lower_row = $TILE_Mu; lower_row < tile_rows; lower_row += $TILE_Mu) {
-                let a2 = coopLoadT<$A_TILE>(&stage_a[a_offset + 256u], 32u);
-                let a3 = coopLoadT<$A_TILE>(&stage_a[a_offset + 272u], 32u);
-                lower = coopMultiplyAdd(a2, b0, lower);
-                lower = coopMultiplyAdd(a3, b1, lower);
+            for (var inner = 0u; inner < 32u; inner += $TILE_Ku) {
+                let a = coopLoadT<$A_TILE>(&stage_a[a_offset + inner], 32u);
+                let b = coopLoadT<$B_TILE>(&stage_b[b_offset + inner * 32u], 32u);
+                accumulator = coopMultiplyAdd(a, b, accumulator);
+                var a_lower = a;
+                // Loops keep cooperative operations in uniform control flow
+                // despite Naga's conservative subgroup-size conditional check.
+                for (var lower_row = $TILE_Mu; lower_row < tile_rows; lower_row += $TILE_Mu) {
+                    a_lower = coopLoadT<$A_TILE>(&stage_a[a_offset + lower_row * 32u + inner], 32u);
+                    lower = coopMultiplyAdd(a_lower, b, lower);
+                }
+                for (var right_col = $TILE_Nu; right_col < 16u; right_col += $TILE_Nu) {
+                    let b_right = coopLoadT<$B_TILE>(&stage_b[b_offset + inner * 32u + right_col], 32u);
+                    right = coopMultiplyAdd(a, b_right, right);
+                    for (var lower_row = $TILE_Mu; lower_row < tile_rows; lower_row += $TILE_Mu) {
+                        lower_right = coopMultiplyAdd(a_lower, b_right, lower_right);
+                    }
+                }
             }
             workgroupBarrier();
         }
@@ -50,6 +58,12 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
             coopStoreT(accumulator, &result[a_offset + b_offset], 32u);
             if paired {
                 coopStoreT(lower, &result[a_offset + b_offset + 256u], 32u);
+            }
+            if $TILE_Nu == 8u {
+                coopStoreT(right, &result[a_offset + b_offset + 8u], 32u);
+                if paired {
+                    coopStoreT(lower_right, &result[a_offset + b_offset + 264u], 32u);
+                }
             }
         }
     }

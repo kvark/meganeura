@@ -146,7 +146,7 @@ fn unsupported_device_reports_bf16_requirement_before_shader_validation() {
         let weight = graph.to_bf16(weight);
         (
             graph.matmul(narrow, weight),
-            "BF16 matrix products require native 16x16x16 or 8x16x16 BF16/F32 cooperative matrices",
+            "BF16 matrix products require native 16x16x16, 8x16x16 or 8x8x8 BF16/F32 cooperative matrices",
         )
     } else {
         (

@@ -1,8 +1,8 @@
 use super::{MatMulCoopVariant, MatrixTypes, ShaderGroup, ShaderModule, coop_shape, preprocess};
 use crate::{DType, kernels::conv::Params};
 
-// Keep partition boundaries identical for the staged and rectangular kernels.
-// A whole 32-element block is also a whole pair of 16-wide staged K tiles.
+// Keep partition boundaries identical across native tile shapes.
+// A 32-element block contains whole 8-wide or 16-wide K tiles.
 pub(super) const SPLIT_RANGE: &str = "let blocks = (k + 31u) / 32u;\n\
     let base = blocks / params.splits;\n\
     let extra = blocks % params.splits;\n\
@@ -252,6 +252,8 @@ pub(super) fn generate_with_params(
             ("$C_TILE", &format!("coop_mat{n}x{m}<f32, C>")),
             ("$MULTIPLY_TYPE", multiply),
             ("$TILE_M", &m.to_string()),
+            ("$TILE_N", &n.to_string()),
+            ("$TILE_K", &k.to_string()),
         ],
     ))
 }
@@ -264,8 +266,10 @@ mod tests {
     fn native_shape_selection_requires_an_implemented_product() {
         use crate::codegen::checked_cooperative_shape as select;
         assert_eq!(select(&[]), None);
-        assert_eq!(select(&[[16, 8, 16], [8, 8, 8], [8, 16, 32]]), None);
+        assert_eq!(select(&[[16, 8, 16], [8, 16, 32]]), None);
+        assert_eq!(select(&[[8, 8, 8]]), Some([8, 8, 8]));
         assert_eq!(select(&[[8, 16, 16]]), Some([8, 16, 16]));
+        assert_eq!(select(&[[8, 8, 8], [8, 16, 16]]), Some([8, 16, 16]));
         assert_eq!(select(&[[8, 16, 16], [16, 16, 16]]), Some([16, 16, 16]));
     }
 
@@ -312,7 +316,7 @@ mod tests {
             | naga::valid::Capabilities::COOPERATIVE_MATRIX
             | naga::valid::Capabilities::SUBGROUP;
         let mut cases = Vec::new();
-        for shape in [[16, 16, 16], [8, 16, 16]] {
+        for shape in [[16, 16, 16], [8, 16, 16], [8, 8, 8]] {
             for output_bf16 in [false, true] {
                 let output = if output_bf16 { DType::BF16 } else { DType::F32 };
                 cases.push((
@@ -412,7 +416,7 @@ mod tests {
             | naga::valid::Capabilities::SHADER_FLOAT16
             | naga::valid::Capabilities::COOPERATIVE_MATRIX
             | naga::valid::Capabilities::SUBGROUP;
-        for shape in [[16, 16, 16], [8, 16, 16]] {
+        for shape in [[16, 16, 16], [8, 16, 16], [8, 8, 8]] {
             for multiply in [DType::F16, DType::BF16] {
                 for (h, w, ci, kh, kw, stride, pad) in [
                     (14, 14, 64, 1, 1, 1, 0),

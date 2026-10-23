@@ -1293,7 +1293,7 @@ fn cooperative_shapes(
 
 fn checked_matrix_unsupported(multiply: crate::DType) -> String {
     format!(
-        "{multiply:?} matrix products require native 16x16x16 or 8x16x16 {multiply:?}/F32 cooperative matrices"
+        "{multiply:?} matrix products require native 16x16x16, 8x16x16 or 8x8x8 {multiply:?}/F32 cooperative matrices"
     )
 }
 

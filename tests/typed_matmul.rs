@@ -342,7 +342,7 @@ fn unsupported_device_reports_f16_matrix_requirement() {
     } else if meganeura::codegen::checked_cooperative_shape(&caps.cooperative_matrix.f16_f32_shapes)
         .is_none()
     {
-        "F16 matrix products require native 16x16x16 or 8x16x16 F16/F32 cooperative matrices"
+        "F16 matrix products require native 16x16x16, 8x16x16 or 8x8x8 F16/F32 cooperative matrices"
     } else {
         "keep subnormal F16 operands"
     };

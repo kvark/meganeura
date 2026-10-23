@@ -77,9 +77,9 @@ winner still needs whole-program qualification when used by measured build
 search; isolated kernel correctness and speed are not model acceptance.
 
 Measured construction automatically considers BF16 multiplication under
-`CoopPolicy::Auto`, alongside its existing F32/F16 paths. Devices whose F16
-tiles are rectangular also consider typed F16 candidates, since the ordinary
-F16 path requires square tiles.
+`CoopPolicy::Auto`, alongside its existing F32/F16 paths. Checked F16 candidates
+also reach layouts left scalar by the ordinary path, on devices with square
+or rectangular native tiles.
 `NativeF32` and `Disabled` retain their ordinary precision/selection restrictions;
 `AllowF16` adds typed F16 candidates alongside its existing F16 paths.
 There is no separate BF16 opt-in. `BuildSearchReport::matrix_inputs` records the
@@ -101,9 +101,10 @@ This is not autocast or complete mixed-precision training. BF16 graph inputs,
 parameters, outputs and unsupported operations reject explicitly; only internal
 conversion, pointwise, dense-matrix and convolution storage is supported. Check
 Blade's `shader_bfloat16` and `bf16_f32_shapes`; cooperative products select
-`[16,16,16]` or `[8,16,16]` in M×N×K order. The latter enables Xe2 (B570):
+`[16,16,16]`, `[8,16,16]` or `[8,8,8]` in M×N×K order. The rectangular tile enables Xe2 (B570):
 with 32-lane subgroups, four logical 16×16 tiles each keep two accumulators, sharing
-staging and barriers across both halves. They cover the same 32×32 output
+staging and barriers across both halves. Apple's 8×8×8 products additionally
+keep two column accumulators and advance K in eight-element steps. They cover the same 32×32 output
 block, with checked tails and 32-element K partitions. Dense products, fused addends and
 implicit-GEMM convolutions use this shared loop. Devices without those features retain the existing
 F32/F16 paths. No default graph is automatically narrowed. Explicit BF16
@@ -133,6 +134,38 @@ warnings; the known workgroup-layout message remains. CPU checks include 16
 pointwise storage combinations, 12 matrix store/layout/addend combinations,
 protected outputs and aliased BF16 views. This is not a full learner or a
 performance/learning-quality claim.
+
+## M3 checked cooperative search (October 22, 2026)
+
+The shared checked kernel accepts Apple's native 8×8×8 tile for F32, F16/F32
+and BF16/F32. Each 16×16 logical quadrant uses four native accumulators on the
+M3's 32-lane subgroups; staging, F32 accumulation, checked stores, convolutions
+and 32-element K partition boundaries remain shared with the wider tiles.
+Existing Blade/Naga pins supply the Metal capabilities and native BF16 shader
+support. Kernel memo revision 12 discards decisions from the older generator.
+
+Inferena's five-model native diagnostic passes all 14 session qualifications,
+including full outputs/gradients and final repeatability. Neither reduced
+format is reported unsupported; 36 BF16 candidate programs qualify. Twelve
+selected programs use cooperative matrices (the two small latency sessions
+keep scalar kernels). BF16 improves ResNet inference from 42.00 to 36.72 ms
+in paired search, before F16 improves further to 34.53 ms and wins. None of
+the final selected programs use BF16. This establishes usable search coverage
+and a selective improvement over F32, not a BF16 advantage over F16 or a new
+P3HPC publication cohort. Fresh compiled PyTorch qualification and independent
+F32-oracle comparisons also pass for all five models' outputs and gradients.
+Separate-process timings were variable.
+
+BF16 remains useful when range disqualifies F16: the existing Auto-search
+regression multiplies 65536-valued operands by 1/65536, producing exact 32s.
+The F16 candidate fails the unchanged gate, while BF16 qualifies on this M3.
+Both formats retain their own storage and arithmetic contracts; neither is
+silently substituted for the other.
+
+Source archives, executable hashes, raw samples and search/qualification
+receipts are preserved outside Git under Inferena's
+`inferena-results/m3-coopmat-20261022-{initial,models,reference}`. See Inferena's
+`EXPERIMENT.md` for reproduction and the comparison scope.
 
 ## Shared dense staging on RX 7900 XT (October 16, 2026)
 
