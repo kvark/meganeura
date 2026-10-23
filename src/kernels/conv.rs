@@ -12,6 +12,78 @@ use super::{Family, Rejection};
 use crate::codegen::{CoopConfig, ShaderGroup};
 use crate::compile::{Dispatch, Kernel, ShaderEntry};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+pub(crate) struct Params {
+    pub batch: u32,
+    pub in_channels: u32,
+    pub in_h: u32,
+    pub in_w: u32,
+    pub out_channels: u32,
+    pub kernel_h: u32,
+    pub kernel_w: u32,
+    pub stride: u32,
+    pub padding_h: u32,
+    pub out_h: u32,
+    pub out_w: u32,
+    pub padding_w: u32,
+    pub kernel_w_multiplier: u32,
+    pub kernel_hw_multiplier: u32,
+    pub column_width_multiplier: u32,
+    pub output_spatial_multiplier: u32,
+}
+
+impl From<&Dispatch> for Params {
+    fn from(dispatch: &Dispatch) -> Self {
+        let p = &dispatch.params;
+        let column_width = match dispatch.shader {
+            ShaderEntry::Conv2dGradInputGemm
+            | ShaderEntry::Conv2dGradInputGemmSmall
+            | ShaderEntry::Conv2dGradInputGemm16
+            | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => p[3],
+            _ => p[10],
+        };
+        Self {
+            batch: p[0],
+            in_channels: p[1],
+            in_h: p[2],
+            in_w: p[3],
+            out_channels: p[4],
+            kernel_h: p[5],
+            kernel_w: p[6],
+            stride: p[7],
+            padding_h: p[8],
+            out_h: p[9],
+            out_w: p[10],
+            padding_w: p[11],
+            kernel_w_multiplier: crate::divisor::multiplier(p[6]),
+            kernel_hw_multiplier: crate::divisor::multiplier(p[5] * p[6]),
+            column_width_multiplier: crate::divisor::multiplier(column_width),
+            output_spatial_multiplier: crate::divisor::multiplier(p[9] * p[10]),
+        }
+    }
+}
+
+impl Params {
+    /// A 1×1 gather is contiguous when it preserves both spatial axes.
+    /// Complete four-element rows keep vector loads inside each binding.
+    pub(crate) fn vectorized_forward(&self) -> bool {
+        self.kernel_h == 1
+            && self.kernel_w == 1
+            && self.stride == 1
+            && self.padding_h == 0
+            && self.padding_w == 0
+            && self.in_h == self.out_h
+            && self.in_w == self.out_w
+            && self.in_channels != 0
+            && self.in_channels.is_multiple_of(4)
+            && self
+                .out_h
+                .checked_mul(self.out_w)
+                .is_some_and(|n| n != 0 && n.is_multiple_of(4))
+    }
+}
+
 /// Which product a dispatch computes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {

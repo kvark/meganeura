@@ -488,6 +488,7 @@ struct AxisChoice {
     attention: AttentionChoice,
     fuse_dispatches: bool,
     matrix_inputs: Option<crate::DType>,
+    vector_convolutions_only: bool,
 }
 
 fn early_physical_cover(baseline: AxisChoice, attention: &[AttentionChoice]) -> Vec<AxisChoice> {
@@ -689,6 +690,7 @@ fn implementations(
     let baseline = AxisChoice {
         attention: (0, None),
         matrix_inputs: None,
+        vector_convolutions_only: false,
         fuse_dispatches: seeds
             .first()
             .is_some_and(|seed| seed.options.fuse_dispatches),
@@ -709,6 +711,7 @@ fn implementations(
                 attention,
                 fuse_dispatches,
                 matrix_inputs: None,
+                vector_convolutions_only: false,
             })
         })
         .filter(|&choice| seen.insert(choice))
@@ -782,6 +785,33 @@ impl Implementations {
             {
                 continue;
             }
+            // Keep the vectorized 1x1 products reachable without forcing
+            // unrelated gathers to use the checked cooperative loop as well.
+            // The complete-convolution choice remains in the same frontier.
+            let mixed = self.seeds.iter().any(|seed| {
+                let vector = fill_matrix_candidates_scoped(
+                    &mut seed.plan.clone(),
+                    multiply,
+                    self.replace_extracted_matrices,
+                    true,
+                );
+                vector > 0
+                    && vector
+                        < fill_matrix_candidates(
+                            &mut seed.plan.clone(),
+                            multiply,
+                            self.replace_extracted_matrices,
+                        )
+            });
+            if mixed {
+                self.order.priority_choices.push_back(self.choices.len());
+                self.choices
+                    .extend(ordinary.iter().map(|choice| AxisChoice {
+                        matrix_inputs: Some(multiply),
+                        vector_convolutions_only: true,
+                        ..*choice
+                    }));
+            }
             self.order.priority_choices.push_back(self.choices.len());
             self.choices
                 .extend(ordinary.iter().map(|choice| AxisChoice {
@@ -802,9 +832,20 @@ fn fill_matrix_candidates(
     multiply: crate::DType,
     replace_extracted: bool,
 ) -> usize {
+    fill_matrix_candidates_scoped(plan, multiply, replace_extracted, false)
+}
+
+fn fill_matrix_candidates_scoped(
+    plan: &mut ExecutionPlan,
+    multiply: crate::DType,
+    replace_extracted: bool,
+    vector_convolutions_only: bool,
+) -> usize {
     let mut count = 0;
     for d in &mut plan.dispatches {
         if d.shader.is_conv2d_gemm()
+            && (!vector_convolutions_only
+                || crate::kernels::conv::Params::from(&*d).vectorized_forward())
             && !d.requires_full_precision
             && !d.schedule_locked
             && d.matmul_epilogue.is_none()
@@ -935,6 +976,7 @@ impl measure::Frontier for Implementations {
                 let choice = self.choices[index];
                 (
                     choice.matrix_inputs != active.matrix_inputs,
+                    choice.vector_convolutions_only != active.vector_convolutions_only,
                     choice.attention != active.attention,
                     choice.fuse_dispatches != active.fuse_dispatches,
                     index,
@@ -946,6 +988,7 @@ impl measure::Frontier for Implementations {
                 attention: (splits, flash),
                 fuse_dispatches,
                 matrix_inputs,
+                vector_convolutions_only,
             } = self.choices[choice_index];
             let mut plan = if splits == 0
                 && flash.is_none()
@@ -981,7 +1024,12 @@ impl measure::Frontier for Implementations {
                 plan
             };
             if let Some(multiply) = matrix_inputs {
-                if fill_matrix_candidates(&mut plan, multiply, self.replace_extracted_matrices) == 0
+                if fill_matrix_candidates_scoped(
+                    &mut plan,
+                    multiply,
+                    self.replace_extracted_matrices,
+                    vector_convolutions_only,
+                ) == 0
                 {
                     continue;
                 }
@@ -992,6 +1040,9 @@ impl measure::Frontier for Implementations {
             );
             if let Some(dtype) = matrix_inputs {
                 description.push_str(&format!(", matrix_inputs={dtype:?}"));
+                if vector_convolutions_only {
+                    description.push_str(", vector_convolutions_only=true");
+                }
             }
             return Some(measure::Program {
                 description,
@@ -1462,6 +1513,115 @@ mod tests {
     }
 
     #[test]
+    fn matrix_search_keeps_mixed_and_complete_convolution_choices() {
+        use measure::Frontier as _;
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[2 * 4 * 7 * 4]);
+        let w1 = graph.parameter("w1", &[5 * 4]);
+        let w3 = graph.parameter("w3", &[5 * 4 * 3 * 3]);
+        let a = graph.conv2d(x, w1, 2, 4, 7, 4, 5, 1, 1, 1, 0);
+        let b = graph.conv2d(x, w3, 2, 4, 7, 4, 5, 3, 3, 1, 1);
+        graph.set_outputs(vec![a, b]);
+        let mut caps = blade_graphics::Capabilities {
+            shader_float16: true,
+            ..Default::default()
+        };
+        caps.cooperative_matrix.f16_f32_shapes.push([8, 16, 16]);
+        for lock_gather in [false, true] {
+            let mut frontier = matrix_frontier();
+            frontier.seeds[0].plan = compile::compile(&graph);
+            frontier.seeds[0].graph = std::sync::Arc::new(graph.deep_clone());
+            if lock_gather {
+                for d in &mut frontier.seeds[0].plan.dispatches {
+                    if d.shader.is_conv2d_gemm()
+                        && !crate::kernels::conv::Params::from(&*d).vectorized_forward()
+                    {
+                        d.schedule_locked = true;
+                    }
+                }
+            }
+            frontier.enable_matrix_inputs(&[crate::DType::F16], &caps);
+            assert_eq!(
+                frontier.choices.iter().any(|c| c.vector_convolutions_only),
+                !lock_gather,
+                "an ineligible gather must not create a duplicate mixed family"
+            );
+            if lock_gather {
+                continue;
+            }
+            let mut counts = std::collections::HashSet::new();
+            while let Some(program) = frontier.next(None) {
+                counts.insert(
+                    program
+                        .plan
+                        .dispatches
+                        .iter()
+                        .filter(|d| matches!(d.kernel, compile::Kernel::CooperativeTyped { .. }))
+                        .count(),
+                );
+            }
+            assert_eq!(counts, std::collections::HashSet::from([0, 1, 2]));
+        }
+    }
+
+    #[test]
+    fn vector_convolution_keeps_batch_channel_and_tile_tails() {
+        let gpu = crate::reference::gpu::shared_context();
+        for dtype in [crate::DType::F16, crate::DType::BF16] {
+            if !runtime::typed_matrix_supported(&gpu, dtype) {
+                continue;
+            }
+            for (ci, co, h, w) in [(12, 35, 7, 4), (4, 17, 5, 4)] {
+                let mut graph = Graph::new();
+                let x = graph.input("x", &[2 * ci * h * w]);
+                let weight = graph.parameter("w", &[co * ci]);
+                let output = graph.conv2d(
+                    x, weight, 2, ci as u32, h as u32, w as u32, co as u32, 1, 1, 1, 0,
+                );
+                graph.set_outputs(vec![output]);
+                let input: Vec<f32> = (0..2 * ci * h * w)
+                    .map(|i| ((i % 17) as f32 - 8.0) / 32.0)
+                    .collect();
+                let weights: Vec<f32> = (0..co * ci)
+                    .map(|i| ((i % 11) as f32 - 5.0) / 16.0)
+                    .collect();
+                let expected: Vec<f32> = crate::reference::evaluate_outputs(
+                    &graph,
+                    crate::reference::Feeds::new()
+                        .set("x", &input)
+                        .set("w", &weights),
+                )
+                .unwrap()
+                .remove(0)
+                .data
+                .into_iter()
+                .map(|v| v as f32)
+                .collect();
+                let mut plan = compile::compile(&graph);
+                assert_eq!(
+                    fill_matrix_candidates_scoped(&mut plan, dtype, false, true),
+                    1
+                );
+                let mut session = Session::with_context(plan, gpu.clone());
+                session.set_input("x", &input);
+                session.set_parameter("w", &weights);
+                for scale in [1.0, 2.0f32.powi(-15)] {
+                    let scaled: Vec<_> = input.iter().map(|x| x * scale).collect();
+                    session.set_input("x", &scaled);
+                    session.step();
+                    session.wait();
+                    let want: Vec<_> = expected.iter().map(|x| x * scale).collect();
+                    assert_eq!(
+                        session.read_output(want.len()),
+                        want,
+                        "{dtype:?} {ci} {co} {h} {w} {scale}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn explicit_policies_search_only_their_allowed_arithmetic() {
         let gpu = crate::reference::gpu::shared_context();
         let frontier = matrix_frontier();
@@ -1564,6 +1724,7 @@ mod tests {
             attention: (0, None),
             fuse_dispatches: true,
             matrix_inputs: None,
+            vector_convolutions_only: false,
         };
         let unfused = AxisChoice {
             fuse_dispatches: false,

@@ -1,3 +1,4 @@
+use crate::kernels::conv::Params as Conv2dParams;
 mod workgroup;
 use crate::compile::{
     AttentionParams, BufferRef, CachedBlockAttentionParams, Dispatch, DispatchParams,
@@ -627,58 +628,6 @@ struct Conv2dGradWeightData {
     params: Conv2dParams,
 }
 
-#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
-#[repr(C)]
-struct Conv2dParams {
-    batch: u32,
-    in_channels: u32,
-    in_h: u32,
-    in_w: u32,
-    out_channels: u32,
-    kernel_h: u32,
-    kernel_w: u32,
-    stride: u32,
-    padding_h: u32,
-    out_h: u32,
-    out_w: u32,
-    padding_w: u32,
-    kernel_w_multiplier: u32,
-    kernel_hw_multiplier: u32,
-    column_width_multiplier: u32,
-    output_spatial_multiplier: u32,
-}
-
-impl From<&Dispatch> for Conv2dParams {
-    fn from(dispatch: &Dispatch) -> Self {
-        let p = &dispatch.params;
-        let column_width = match dispatch.shader {
-            ShaderEntry::Conv2dGradInputGemm
-            | ShaderEntry::Conv2dGradInputGemmSmall
-            | ShaderEntry::Conv2dGradInputGemm16
-            | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => p[3],
-            _ => p[10],
-        };
-        Self {
-            batch: p[0],
-            in_channels: p[1],
-            in_h: p[2],
-            in_w: p[3],
-            out_channels: p[4],
-            kernel_h: p[5],
-            kernel_w: p[6],
-            stride: p[7],
-            padding_h: p[8],
-            out_h: p[9],
-            out_w: p[10],
-            padding_w: p[11],
-            kernel_w_multiplier: crate::divisor::multiplier(p[6]),
-            kernel_hw_multiplier: crate::divisor::multiplier(p[5] * p[6]),
-            column_width_multiplier: crate::divisor::multiplier(column_width),
-            output_spatial_multiplier: crate::divisor::multiplier(p[9] * p[10]),
-        }
-    }
-}
-
 // conv2d_dw: var src, weight, dst, params (depthwise, no in/out channels split)
 #[derive(blade_macros::ShaderData)]
 struct Conv2dDwData {
@@ -970,6 +919,7 @@ enum Variant {
         crate::codegen::MatrixTypes,
         crate::codegen::TypedMatmulLayout,
     ),
+    CoopConv(ShaderEntry, crate::codegen::MatrixTypes, Conv2dParams),
     CoopWorkgroup(
         ShaderEntry,
         crate::codegen::WorkgroupMatmulShape,
@@ -1086,6 +1036,7 @@ impl Variant {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
             Variant::Attention(ref e, _, _)
             | Variant::CoopTyped(ref e, _, _)
+            | Variant::CoopConv(ref e, _, _)
             | Variant::CoopWorkgroup(ref e, _, _)
             | Variant::CoopTiled(ref e, _, _, _)
             | Variant::SplitMatmul(ref e, _, _, _)
@@ -1111,6 +1062,9 @@ impl Variant {
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
+            Variant::CoopConv(ref e, types, ref params) => {
+                format!("{e:?}:checked-{types:?}-fixed-{params:?}")
+            }
             Variant::CoopWorkgroup(ref e, shape, types) => {
                 format!("{e:?}:workgroup-{shape:?}-{types:?}")
             }
@@ -1921,17 +1875,22 @@ impl Pipelines {
         let cooperative =
             || *coop_config.expect("cooperative dispatch needs a qualified device configuration");
         let module = match *key {
-            Variant::CoopTyped(ref entry, types, staging) => {
-                let group = match *entry {
-                    ShaderEntry::Conv2dGemmCoopGen(kernel_h, kernel_w, stride) => {
-                        ShaderGroup::Conv2dChecked {
-                            kernel_h,
-                            kernel_w,
-                            stride,
-                        }
-                    }
-                    _ => group,
+            Variant::CoopConv(ref entry, types, ref params) => {
+                let ShaderEntry::Conv2dGemmCoopGen(kernel_h, kernel_w, stride) = *entry else {
+                    unreachable!()
                 };
+                crate::codegen::generate_checked_conv(
+                    ShaderGroup::Conv2dChecked {
+                        kernel_h,
+                        kernel_w,
+                        stride,
+                    },
+                    types,
+                    typed_shape(types.multiply)?,
+                    params,
+                )
+            }
+            Variant::CoopTyped(_, types, staging) => {
                 crate::codegen::generate_module_coop_typed_with_layout(
                     group,
                     types,
@@ -2219,6 +2178,9 @@ impl Pipelines {
             );
         }
         if let crate::compile::Kernel::CooperativeTyped { types, .. } = dispatch.kernel {
+            if matches!(entry, ShaderEntry::Conv2dGemmCoopGen(..)) {
+                return Variant::CoopConv(entry, types, Conv2dParams::from(dispatch));
+            }
             return Variant::CoopTyped(entry, types, typed_matmul_layout(dispatch));
         }
         if let crate::compile::Kernel::CooperativeTiled { shape, splits } = dispatch.kernel {

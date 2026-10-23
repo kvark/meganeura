@@ -1,5 +1,5 @@
 use super::{MatMulCoopVariant, MatrixTypes, ShaderGroup, ShaderModule, coop_shape, preprocess};
-use crate::DType;
+use crate::{DType, kernels::conv::Params};
 
 // Keep partition boundaries identical for the staged and rectangular kernels.
 // A whole 32-element block is also a whole pair of 16-wide staged K tiles.
@@ -14,6 +14,15 @@ pub(super) const SPLIT_RANGE: &str = "let blocks = (k + 31u) / 32u;\n\
 /// loop. Operands are staged in the multiplication type; the accumulator is
 /// F32, and so are partials until their reduction.
 pub(super) fn generate(group: ShaderGroup, types: MatrixTypes, shape: [u32; 3]) -> ShaderModule {
+    generate_with_params(group, types, shape, None)
+}
+
+pub(super) fn generate_with_params(
+    group: ShaderGroup,
+    types: MatrixTypes,
+    shape: [u32; 3],
+    params: Option<&Params>,
+) -> ShaderModule {
     types.validate();
     assert!(
         super::checked_cooperative_shape(&[shape]).is_some(),
@@ -21,6 +30,7 @@ pub(super) fn generate(group: ShaderGroup, types: MatrixTypes, shape: [u32; 3]) 
     );
     let [m, n, k] = shape;
     let split_range = SPLIT_RANGE.replace("wgid.", "group.");
+    let vector_conv = params.is_some_and(Params::vectorized_forward);
     let (declaration, dimensions, range, a, b, index, destination, add) = match group {
         ShaderGroup::MatMul
         | ShaderGroup::MatMulAT
@@ -83,11 +93,41 @@ pub(super) fn generate(group: ShaderGroup, types: MatrixTypes, shape: [u32; 3]) 
                 "{}\n{}\nconst KH: u32 = {kernel_h}u;\nconst KW: u32 = {kernel_w}u;\n\
                  const STRIDE: u32 = {stride}u;\n{}",
                 include_str!("../shaders/conv2d_params.wgsl"),
-                crate::divisor::SHADER,
-                include_str!("../shaders/conv2d_checked.wgsl")
+                if params.is_some() {
+                    crate::divisor::NATIVE_SHADER
+                } else {
+                    crate::divisor::SHADER
+                },
+                if vector_conv {
+                    "var<storage> src: array<vec4<$B_TYPE>>;\nvar<storage> weight: array<vec4<$A_TYPE>>;\nvar<storage, read_write> dst: array<$OUT_TYPE>;"
+                } else {
+                    include_str!("../shaders/conv2d_checked.wgsl")
+                }
             );
+            let params_decl = match params {
+                Some(p) => format!(
+                    "const params = Params({}u, {}u, {}u, {}u, {}u, {}u, {}u, {}u, {}u, {}u, {}u, {}u, {}u, {}u, {}u, {}u);",
+                    p.batch,
+                    p.in_channels,
+                    p.in_h,
+                    p.in_w,
+                    p.out_channels,
+                    p.kernel_h,
+                    p.kernel_w,
+                    p.stride,
+                    p.padding_h,
+                    p.out_h,
+                    p.out_w,
+                    p.padding_w,
+                    p.kernel_w_multiplier,
+                    p.kernel_hw_multiplier,
+                    p.column_width_multiplier,
+                    p.output_spatial_multiplier,
+                ),
+                None => "var<uniform> params: Params;".to_owned(),
+            };
             (
-                declaration,
+                format!("{declaration}\n{params_decl}"),
                 "let m = params.out_channels; let n = params.out_h * params.out_w; let k = params.in_channels * KH * KW;",
                 "let first = 0u; let end = k;",
                 "weight[ar * k + ak]",
@@ -116,11 +156,31 @@ pub(super) fn generate(group: ShaderGroup, types: MatrixTypes, shape: [u32; 3]) 
         }
     };
     let (a_cast, b_cast) = (cast(types.a), cast(types.b));
-    let rounds = types.output == DType::BF16 || a_cast == "round_bf16" || b_cast == "round_bf16";
+    let convert = |value: &str, storage| {
+        let cast = cast(storage);
+        if types.multiply == DType::BF16 && storage == DType::F32 {
+            format!(
+                "vec4<bf16>({cast}({value}.x), {cast}({value}.y), {cast}({value}.z), {cast}({value}.w))"
+            )
+        } else {
+            format!("vec4<{cast}>({value})")
+        }
+    };
+    let stage = if vector_conv {
+        include_str!("../shaders/conv2d_checked_vector.wgsl")
+    } else {
+        include_str!("../shaders/matmul_checked_stage.wgsl")
+    };
+    let rounds = types.output == DType::BF16
+        || (types.multiply == DType::BF16 && (types.a == DType::F32 || types.b == DType::F32));
     let multiply = MatrixTypes::name(types.multiply);
     ShaderModule::new(&preprocess(
         include_str!("../shaders/matmul_checked.wgsl"),
         &[
+            ("$STAGE", stage),
+            ("$THREADS", "128"),
+            ("$A_VECTOR", &convert("v", types.a)),
+            ("$B_VECTOR", &convert("v", types.b)),
             ("$EXTENSIONS", &extensions),
             ("$DECL", &declaration),
             ("$DIMS", dimensions),
@@ -301,6 +361,78 @@ mod tests {
                 let words =
                     naga::back::spv::write_vec(&module.module, &info, &options, None).unwrap();
                 assert!(!words.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn specialized_convolutions_validate() {
+        let capabilities = naga::valid::Capabilities::SHADER_BFLOAT16
+            | naga::valid::Capabilities::SHADER_FLOAT16
+            | naga::valid::Capabilities::COOPERATIVE_MATRIX
+            | naga::valid::Capabilities::SUBGROUP;
+        for shape in [[16, 16, 16], [8, 16, 16]] {
+            for multiply in [DType::F16, DType::BF16] {
+                for (h, w, ci, kh, kw, stride, pad) in [
+                    (14, 14, 64, 1, 1, 1, 0),
+                    (7, 7, 64, 1, 1, 1, 0),
+                    (11, 13, 3, 3, 3, 2, 1),
+                ] {
+                    let params = Params {
+                        batch: 2,
+                        in_channels: ci,
+                        in_h: h,
+                        in_w: w,
+                        out_channels: 65,
+                        kernel_h: kh,
+                        kernel_w: kw,
+                        stride,
+                        padding_h: pad,
+                        out_h: (h + 2 * pad - kh) / stride + 1,
+                        out_w: (w + 2 * pad - kw) / stride + 1,
+                        padding_w: pad,
+                        kernel_w_multiplier: 0,
+                        kernel_hw_multiplier: 0,
+                        column_width_multiplier: 0,
+                        output_spatial_multiplier: 0,
+                    };
+                    let mut module = generate_with_params(
+                        ShaderGroup::Conv2dChecked {
+                            kernel_h: kh,
+                            kernel_w: kw,
+                            stride,
+                        },
+                        MatrixTypes {
+                            multiply,
+                            ..MatrixTypes::F32_AS_F16
+                        },
+                        shape,
+                        Some(&params),
+                    );
+                    let mut binding = 0;
+                    for (_, global) in module.module.global_variables.iter_mut() {
+                        if matches!(
+                            global.space,
+                            naga::AddressSpace::Uniform | naga::AddressSpace::Storage { .. }
+                        ) {
+                            global.binding = Some(naga::ResourceBinding { group: 0, binding });
+                            binding += 1;
+                        }
+                    }
+                    let info = naga::valid::Validator::new(
+                        naga::valid::ValidationFlags::all(),
+                        capabilities,
+                    )
+                    .validate(&module.module)
+                    .unwrap();
+                    naga::back::spv::write_vec(
+                        &module.module,
+                        &info,
+                        &naga::back::spv::Options::default(),
+                        None,
+                    )
+                    .unwrap();
+                }
             }
         }
     }

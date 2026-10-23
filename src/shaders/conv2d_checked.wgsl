@@ -1,7 +1,6 @@
 var<storage> src: array<$B_TYPE>;
 var<storage> weight: array<$A_TYPE>;
 var<storage, read_write> dst: array<$OUT_TYPE>;
-var<uniform> params: Params;
 
 fn load_pixel(image: u32, reduction: u32, column: u32) -> $B_TYPE {
     let channel = reduction / (KH * KW);

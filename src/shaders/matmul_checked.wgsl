@@ -5,7 +5,7 @@ var<workgroup> stage_b: array<$MULTIPLY_TYPE, 1024>;
 var<workgroup> result: array<f32, 1024>;
 $ROUND
 
-@compute @workgroup_size(128)
+@compute @workgroup_size($THREADS)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_index) lane: u32,
         @builtin(subgroup_id) subgroup: u32,
@@ -16,7 +16,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     let col = group.y * 32u;
     // Pair rectangular tiles only when there are too few subgroups to cover
     // all eight hardware tiles in one pass.
-    let subgroups = 128u / subgroup_size;
+    let subgroups = $THREADSu / subgroup_size;
     let paired = $TILE_Mu == 8u && subgroups < 8u;
     let tile_rows = select($TILE_Mu, 16u, paired);
     let tile_count = 64u / tile_rows;
@@ -29,18 +29,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         var accumulator = $C_TILE();
         var lower = $C_TILE();
         for (var start = first; start < end; start += 32u) {
-            for (var index = lane; index < 1024u; index += 128u) {
-                let ar = row + index / 32u;
-                let ak = start + index % 32u;
-                let bk = start + index / 32u;
-                let bc = col + index % 32u;
-                var a = $MULTIPLY_TYPE(0.0f);
-                var b = $MULTIPLY_TYPE(0.0f);
-                if all(vec2<bool>((ar < m), (ak < k))) { a = $A_CAST($A_LOAD); }
-                if all(vec2<bool>((bk < k), (bc < n))) { b = $B_CAST($B_LOAD); }
-                stage_a[index] = a;
-                stage_b[index] = b;
-            }
+            $STAGE
             workgroupBarrier();
             let a0 = coopLoadT<$A_TILE>(&stage_a[a_offset], 32u);
             let b0 = coopLoadT<$B_TILE>(&stage_b[b_offset], 32u);
@@ -65,7 +54,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         }
     }
     workgroupBarrier();
-    for (var offset = lane; offset < 1024u; offset += 128u) {
+    for (var offset = lane; offset < 1024u; offset += $THREADSu) {
         let r = row + offset / 32u;
         let c = col + offset % 32u;
         if r < m && c < n {
