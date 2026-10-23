@@ -13,10 +13,6 @@ for (var index = lane; index < 256u; index += $THREADSu) {
                     let v = src[((group.z * k + bk) * n + bc) / 4u];
                     b = $B_VECTOR;
                 }
-                // Keep scalar pointers for coopLoadT: Naga's Metal helper
-                // does not yet convert vector pointers or their row strides.
-                stage_a[index*4u] = a.x; stage_a[index*4u+1u] = a.y;
-                stage_a[index*4u+2u] = a.z; stage_a[index*4u+3u] = a.w;
-                stage_b[index*4u] = b.x; stage_b[index*4u+1u] = b.y;
-                stage_b[index*4u+2u] = b.z; stage_b[index*4u+3u] = b.w;
+                stage_a[index] = a;
+                stage_b[index] = b;
             }

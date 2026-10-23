@@ -191,10 +191,18 @@ pub(super) fn generate_with_params(
     } else {
         128
     };
+    let shared_type = if vector_conv {
+        format!("vec4<{multiply}>")
+    } else {
+        multiply.to_owned()
+    };
     ShaderModule::new(&preprocess(
         include_str!("../shaders/matmul_checked.wgsl"),
         &[
             ("$STAGE", stage),
+            ("$SHARED_TYPE", &shared_type),
+            ("$SHARED_COUNT", if vector_conv { "256" } else { "1024" }),
+            ("$PACK", if vector_conv { "4" } else { "1" }),
             ("$THREADS", &threads.to_string()),
             ("$A_VECTOR", &convert("v", types.a)),
             ("$B_VECTOR", &convert("v", types.b)),
@@ -460,6 +468,16 @@ mod tests {
                             &info,
                             &naga::back::spv::Options::default(),
                             None,
+                        )
+                        .unwrap();
+                        naga::back::msl::write_string(
+                            &module.module,
+                            &info,
+                            &naga::back::msl::Options {
+                                lang_version: (3, 2),
+                                ..Default::default()
+                            },
+                            &naga::back::msl::PipelineOptions::default(),
                         )
                         .unwrap();
                     }

@@ -1,7 +1,7 @@
 $EXTENSIONS
 $DECL
-var<workgroup> stage_a: array<$MULTIPLY_TYPE, 1024>;
-var<workgroup> stage_b: array<$MULTIPLY_TYPE, 1024>;
+var<workgroup> stage_a: array<$SHARED_TYPE, $SHARED_COUNT>;
+var<workgroup> stage_b: array<$SHARED_TYPE, $SHARED_COUNT>;
 var<workgroup> result: array<f32, 1024>;
 $ROUND
 
@@ -31,16 +31,16 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         for (var start = first; start < end; start += 32u) {
             $STAGE
             workgroupBarrier();
-            let a0 = coopLoadT<$A_TILE>(&stage_a[a_offset], 32u);
-            let b0 = coopLoadT<$B_TILE>(&stage_b[b_offset], 32u);
+            let a0 = coopLoadT<$A_TILE>(&stage_a[(a_offset) / $PACKu], 32u / $PACKu);
+            let b0 = coopLoadT<$B_TILE>(&stage_b[(b_offset) / $PACKu], 32u / $PACKu);
             accumulator = coopMultiplyAdd(a0, b0, accumulator);
-            let a1 = coopLoadT<$A_TILE>(&stage_a[a_offset + 16u], 32u);
-            let b1 = coopLoadT<$B_TILE>(&stage_b[b_offset + 512u], 32u);
+            let a1 = coopLoadT<$A_TILE>(&stage_a[(a_offset + 16u) / $PACKu], 32u / $PACKu);
+            let b1 = coopLoadT<$B_TILE>(&stage_b[(b_offset + 512u) / $PACKu], 32u / $PACKu);
             accumulator = coopMultiplyAdd(a1, b1, accumulator);
             // A loop avoids Naga's conservative subgroup-size conditional check.
             for (var lower_row = $TILE_Mu; lower_row < tile_rows; lower_row += $TILE_Mu) {
-                let a2 = coopLoadT<$A_TILE>(&stage_a[a_offset + 256u], 32u);
-                let a3 = coopLoadT<$A_TILE>(&stage_a[a_offset + 272u], 32u);
+                let a2 = coopLoadT<$A_TILE>(&stage_a[(a_offset + 256u) / $PACKu], 32u / $PACKu);
+                let a3 = coopLoadT<$A_TILE>(&stage_a[(a_offset + 272u) / $PACKu], 32u / $PACKu);
                 lower = coopMultiplyAdd(a2, b0, lower);
                 lower = coopMultiplyAdd(a3, b1, lower);
             }
