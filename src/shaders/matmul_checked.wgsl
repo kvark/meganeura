@@ -37,17 +37,17 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
                 let a = coopLoadT<$A_TILE>(&stage_a[a_offset + inner], 32u);
                 let b = coopLoadT<$B_TILE>(&stage_b[b_offset + inner * 32u], 32u);
                 accumulator = coopMultiplyAdd(a, b, accumulator);
+                var a_lower = a;
                 // Loops keep cooperative operations in uniform control flow
                 // despite Naga's conservative subgroup-size conditional check.
                 for (var lower_row = $TILE_Mu; lower_row < tile_rows; lower_row += $TILE_Mu) {
-                    let a_lower = coopLoadT<$A_TILE>(&stage_a[a_offset + lower_row * 32u + inner], 32u);
+                    a_lower = coopLoadT<$A_TILE>(&stage_a[a_offset + lower_row * 32u + inner], 32u);
                     lower = coopMultiplyAdd(a_lower, b, lower);
                 }
                 for (var right_col = $TILE_Nu; right_col < 16u; right_col += $TILE_Nu) {
                     let b_right = coopLoadT<$B_TILE>(&stage_b[b_offset + inner * 32u + right_col], 32u);
                     right = coopMultiplyAdd(a, b_right, right);
                     for (var lower_row = $TILE_Mu; lower_row < tile_rows; lower_row += $TILE_Mu) {
-                        let a_lower = coopLoadT<$A_TILE>(&stage_a[a_offset + lower_row * 32u + inner], 32u);
                         lower_right = coopMultiplyAdd(a_lower, b_right, lower_right);
                     }
                 }

@@ -142,7 +142,7 @@ and BF16/F32. Each 16×16 logical quadrant uses four native accumulators on the
 M3's 32-lane subgroups; staging, F32 accumulation, checked stores, convolutions
 and 32-element K partition boundaries remain shared with the wider tiles.
 Existing Blade/Naga pins supply the Metal capabilities and native BF16 shader
-support. Kernel memo revision 11 discards decisions from the older generator.
+support. Kernel memo revision 12 discards decisions from the older generator.
 
 Inferena's five-model native diagnostic passes all 14 session qualifications,
 including full outputs/gradients and final repeatability. Neither reduced
