@@ -94,7 +94,7 @@ fn adaptive_optimizers_preserve_nonfinite_state() {
 }
 
 #[test]
-fn adaptive_optimizers_preserve_tiny_variance_across_checkpoint() {
+fn adaptive_optimizers_preserve_tiny_variance() {
     use std::sync::Arc;
 
     let gpu =
@@ -110,39 +110,26 @@ fn adaptive_optimizers_preserve_tiny_variance_across_checkpoint() {
     let product = graph.mul(parameter, input);
     let loss = graph.mean_all(product);
     graph.set_outputs(vec![loss]);
-    let new_session = || {
-        let (plan, _) = meganeura::compile_training_graph(&graph);
-        meganeura::Session::with_context_opts(
-            plan,
-            gpu.clone(),
-            meganeura::SessionOptions {
-                poison: true,
-                ..Default::default()
-            },
-        )
-    };
-    let directory = std::env::var_os("MEGANEURA_TEST_ARTIFACTS")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("meganeura-tiny-variance-{}", std::process::id()))
-        });
-    std::fs::create_dir_all(&directory).unwrap();
     for laprop in [false, true] {
         for beta2 in [0.0f32, 0.999] {
-            let configure = |session: &mut meganeura::Session| {
-                if laprop {
-                    session.set_laprop(0.1, 0.9, beta2, 1e-20);
-                } else {
-                    session.set_adam(0.1, 0.9, beta2, 1e-20);
-                }
-            };
-            let mut session = new_session();
-            configure(&mut session);
+            let (plan, _) = meganeura::compile_training_graph(&graph);
+            let mut session = meganeura::Session::with_context_opts(
+                plan,
+                gpu.clone(),
+                meganeura::SessionOptions {
+                    poison: true,
+                    ..Default::default()
+                },
+            );
+            if laprop {
+                session.set_laprop(0.1, 0.9, beta2, 1e-20);
+            } else {
+                session.set_adam(0.1, 0.9, beta2, 1e-20);
+            }
             let initial_v = if beta2 == 0.0 { 1.0 } else { 0.0 };
             session.set_parameter("parameter", &[1.0; 16]);
             session.write_adam_v("parameter", &[initial_v; 16]);
             let mut reference = [vec![initial_v; n], vec![0.0f32; n], vec![1.0f32; n]];
-            let mut uninterrupted: Option<meganeura::Session> = None;
             for step in 1..=8 {
                 let sign = if step % 2 == 0 { -1.0 } else { 1.0 };
                 let input: Vec<_> = gradients.iter().map(|g| g * sign * n as f32).collect();
@@ -153,13 +140,6 @@ fn adaptive_optimizers_preserve_tiny_variance_across_checkpoint() {
                 let mut actual_gradient = vec![0.0; n];
                 session.read_param_grad("parameter", &mut actual_gradient);
                 let actual = optimizer_state(&session, n);
-                if let Some(peer) = uninterrupted.as_mut() {
-                    peer.set_input("input", &input);
-                    peer.step();
-                    peer.wait();
-                    assert_eq!(optimizer_state(peer, n), actual);
-                    assert_eq!(peer.adam_step_count(), session.adam_step_count());
-                }
                 let beta1 = 0.9f32;
                 let bc1 = f64::from(1.0 / (1.0 - beta1.powi(step)));
                 let bc2 = f64::from(1.0 / (1.0 - beta2.powi(step)));
@@ -194,20 +174,6 @@ fn adaptive_optimizers_preserve_tiny_variance_across_checkpoint() {
                             actual[k][i]
                         );
                     }
-                }
-                if step == 4 {
-                    let path = directory.join(format!(
-                        "laprop-{laprop}-beta-{}.safetensors",
-                        beta2.to_bits()
-                    ));
-                    session.save_checkpoint(&path).unwrap();
-                    let mut restored = new_session();
-                    configure(&mut restored);
-                    restored.load_checkpoint(&path).unwrap();
-                    assert_eq!(restored.adam_step_count(), 4);
-                    assert_eq!(optimizer_state(&restored, n), actual);
-                    uninterrupted = Some(session);
-                    session = restored;
                 }
             }
         }

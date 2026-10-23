@@ -730,8 +730,8 @@ mod tests {
     /// layout rather than trusting the two files to stay in step.
     #[test]
     fn adam_params_layout_matches_the_shader_uniform() {
-        // Thirteen 4-byte fields, every one of them a scalar, so the struct
-        // is exactly 52 bytes with no tail padding for `Pod` to hide.
+        // Fourteen 4-byte fields, every one of them a scalar, so the struct
+        // is exactly 56 bytes with no tail padding for `Pod` to hide.
         assert_eq!(std::mem::size_of::<AdamParams>(), 56);
         assert_eq!(std::mem::align_of::<AdamParams>(), 4);
         // `count` and `groups` are the only u32s before the f32 block.

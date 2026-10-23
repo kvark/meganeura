@@ -55,6 +55,7 @@ fn variance_and_rms(old: f32, gradient: f32) -> vec2<f32> {
     let finite_history = (bitcast<u32>(old) & 0x7fffffffu) < 0x7f800000u;
     let history = select(old, 0.0, params.beta2 == 0.0 && finite_history);
     if abs(gradient) < 0x1p-32f && bitcast<u32>(history) < 0x1f800000u {
+        // Metal fast math may reassociate these scales; the tiny-variance test guards against it.
         let scaled_gradient = gradient * 0x1p32f;
         let scaled = params.beta2 * variance_scaled(history)
             + params.one_minus_beta2 * scaled_gradient * scaled_gradient;
