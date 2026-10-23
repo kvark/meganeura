@@ -2,7 +2,8 @@ use crate::kernels::conv::Params as Conv2dParams;
 mod workgroup;
 use crate::compile::{
     AttentionParams, BufferRef, CachedBlockAttentionParams, Dispatch, DispatchParams,
-    ExecutionPlan, RoPEParams, ShaderEntry,
+    ExecutionPlan, RoPEParams, ShaderEntry, WinogradInputParams, WinogradOutputParams,
+    WinogradWeightParams,
 };
 use crate::kernels::attention_grad::Part as AttentionGradPart;
 use std::cell::RefCell;
@@ -580,33 +581,33 @@ struct GroupNormGradData {
 
 // upsample: var src, dst, params (reuses UnaryData layout)
 
-// winograd transform: var src, dst, params (8 u32s)
-#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
-#[repr(C)]
-struct WinogradTransformParams {
-    p0: u32,
-    p1: u32,
-    p2: u32,
-    p3: u32,
-    p4: u32,
-    p5: u32,
-    p6: u32,
-    p7: u32,
+#[derive(blade_macros::ShaderData)]
+struct WinogradInputData {
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: WinogradInputParams,
 }
 
 #[derive(blade_macros::ShaderData)]
-struct WinogradTransformData {
+struct WinogradOutputData {
     src: blade_graphics::BufferPiece,
     dst: blade_graphics::BufferPiece,
-    params: WinogradTransformParams,
+    params: WinogradOutputParams,
 }
 
 #[derive(blade_macros::ShaderData)]
-struct WinogradTransformAddData {
+struct WinogradOutputAddData {
     src: blade_graphics::BufferPiece,
     dst: blade_graphics::BufferPiece,
-    params: WinogradTransformParams,
+    params: WinogradOutputParams,
     residual: blade_graphics::BufferPiece,
+}
+
+#[derive(blade_macros::ShaderData)]
+struct WinogradWeightData {
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: WinogradWeightParams,
 }
 
 // conv2d: var src, weight, dst, params (12 u32s = 3 uniform vec4s)
@@ -919,7 +920,6 @@ fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
 /// implementation once; preparation builds exactly the selected pipeline.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Variant {
-    WinogradOutputAdd(ShaderEntry),
     /// Checked cooperative product with explicit operand, multiplication and
     /// output types. K partitions are uniform data and do not change the
     /// pipeline.
@@ -1043,8 +1043,7 @@ impl Variant {
     fn entry(&self) -> Option<&ShaderEntry> {
         match *self {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
-            Variant::WinogradOutputAdd(ref e)
-            | Variant::Attention(ref e, _, _)
+            Variant::Attention(ref e, _, _)
             | Variant::CoopTyped(ref e, _, _)
             | Variant::CoopConv(ref e, _, _)
             | Variant::CoopWorkgroup(ref e, _, _)
@@ -1075,7 +1074,6 @@ impl Variant {
             Variant::CoopConv(ref e, types, ref params) => {
                 format!("{e:?}:checked-{types:?}-fixed-{params:?}")
             }
-            Variant::WinogradOutputAdd(ref entry) => format!("{entry:?}:add"),
             Variant::CoopWorkgroup(ref e, shape, types) => {
                 format!("{e:?}:workgroup-{shape:?}-{types:?}")
             }
@@ -1886,10 +1884,6 @@ impl Pipelines {
         let cooperative =
             || *coop_config.expect("cooperative dispatch needs a qualified device configuration");
         let module = match *key {
-            Variant::WinogradOutputAdd(_) => {
-                layout = <WinogradTransformAddData as blade_graphics::ShaderData>::layout();
-                crate::codegen::generate_winograd_output(true)
-            }
             Variant::CoopConv(ref entry, types, ref params) => {
                 let ShaderEntry::Conv2dGemmCoopGen(kernel_h, kernel_w, stride) = *entry else {
                     unreachable!()
@@ -2189,10 +2183,6 @@ impl Pipelines {
     /// which unrelated pipelines happen to have been compiled.
     fn key(dispatch: &Dispatch) -> Variant {
         let entry = dispatch.shader.clone();
-        if matches!(dispatch.kernel, crate::compile::Kernel::WinogradOutputAdd) {
-            assert_eq!(entry, ShaderEntry::WinogradOutputTransform);
-            return Variant::WinogradOutputAdd(entry);
-        }
         if let crate::compile::Kernel::CooperativeWorkgroup { shape, types, .. } = dispatch.kernel {
             return Variant::CoopWorkgroup(
                 entry,
@@ -2678,9 +2668,10 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::MaxPool2dGrad => MaxPool2dGradData::layout(),
         ShaderEntry::GlobalAvgPool => GlobalAvgPoolData::layout(),
         ShaderEntry::GlobalAvgPoolGrad => UnaryData::layout(),
-        ShaderEntry::WinogradInputTransform
-        | ShaderEntry::WinogradOutputTransform
-        | ShaderEntry::WinogradWeightTransform => WinogradTransformData::layout(),
+        ShaderEntry::WinogradInputTransform => WinogradInputData::layout(),
+        ShaderEntry::WinogradOutputTransform { fused: false } => WinogradOutputData::layout(),
+        ShaderEntry::WinogradOutputTransform { fused: true } => WinogradOutputAddData::layout(),
+        ShaderEntry::WinogradWeightTransform => WinogradWeightData::layout(),
         ShaderEntry::WinogradBatchedMatMul => MatMulData::layout(),
         ShaderEntry::GradClipNormSq | ShaderEntry::GradClipScale | ShaderEntry::GradAccum => {
             optimizer::GradPassData::layout()

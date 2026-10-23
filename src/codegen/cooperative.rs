@@ -180,13 +180,9 @@ pub(super) fn generate_with_params(
     let rounds = types.output == DType::BF16
         || (types.multiply == DType::BF16 && (types.a == DType::F32 || types.b == DType::F32));
     let multiply = MatrixTypes::name(types.multiply);
-    let convolution = matches!(
-        group,
-        ShaderGroup::Conv2dBF16 { .. } | ShaderGroup::Conv2dChecked { .. }
-    );
     // Use one subgroup per rectangular convolution tile where possible. The
     // runtime width may differ, so the shader still pairs or loops over tiles.
-    let threads = if m == 8 && convolution {
+    let threads = if m == 8 && group.is_checked_convolution() {
         if subgroup == 0 {
             256
         } else {
@@ -361,12 +357,7 @@ mod tests {
                 let mut module = super::super::generate_module_coop_typed_with_subgroup(
                     group, types, shape, layout, subgroup,
                 );
-                if shape[0] == 8
-                    && matches!(
-                        group,
-                        ShaderGroup::Conv2dBF16 { .. } | ShaderGroup::Conv2dChecked { .. }
-                    )
-                {
+                if shape[0] == 8 && group.is_checked_convolution() {
                     assert_eq!(
                         module.module.entry_points[0].workgroup_size,
                         [8 * subgroup, 1, 1]

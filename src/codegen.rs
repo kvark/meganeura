@@ -490,11 +490,6 @@ pub fn generate_matmul_with_epilogue(
     epilogue: Option<&crate::compile::MatMulEpilogue>,
     options: MatMulOptions,
 ) -> ShaderModule {
-    if group == ShaderGroup::WinogradBatchedMatMul {
-        assert!(epilogue.is_none());
-        assert_eq!(options.format, WeightFormat::F32);
-        return gen_block_matmul(ShaderGroup::BatchMatMul, options);
-    }
     generate_partitioned_matmul(group, epilogue, options, 1, 1)
 }
 
@@ -716,7 +711,9 @@ pub enum ShaderGroup {
     Conv2dGradInputGemmCoop,
     GroupNormSilu,
     WinogradInputTransform,
-    WinogradOutputTransform,
+    WinogradOutputTransform {
+        fused: bool,
+    },
     WinogradBatchedMatMul,
     WinogradWeightTransform,
     Conv2dGradWeightGemm,
@@ -746,6 +743,10 @@ pub enum ShaderGroup {
 }
 
 impl ShaderGroup {
+    pub(crate) fn is_checked_convolution(self) -> bool {
+        matches!(self, Self::Conv2dBF16 { .. } | Self::Conv2dChecked { .. })
+    }
+
     pub const fn is_matmul(&self) -> bool {
         matches!(
             self,
@@ -906,7 +907,7 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         ShaderGroup::WinogradInputTransform => {
             ShaderModule::new(include_str!("shaders/winograd_input_transform.wgsl"))
         }
-        ShaderGroup::WinogradOutputTransform => generate_winograd_output(false),
+        ShaderGroup::WinogradOutputTransform { fused } => generate_winograd_output(fused),
         ShaderGroup::WinogradBatchedMatMul => {
             ShaderModule::new(include_str!("shaders/winograd_matmul.wgsl"))
         }
@@ -2008,7 +2009,7 @@ pub fn generate_module_small(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderMo
     }
 }
 
-fn gen_block_matmul(group: ShaderGroup, options: MatMulOptions) -> ShaderModule {
+pub(crate) fn gen_block_matmul(group: ShaderGroup, options: MatMulOptions) -> ShaderModule {
     let (ordinary, a_idx, b_idx, c_idx) = match group {
         ShaderGroup::BlockMatMul => (
             ShaderGroup::MatMul,
@@ -2029,7 +2030,7 @@ fn gen_block_matmul(group: ShaderGroup, options: MatMulOptions) -> ShaderModule 
             "(row * params._pad + wgid.z) * params.n + col",
         ),
         // Batch-major: one whole matrix per `wgid.z`.
-        ShaderGroup::BatchMatMul => (
+        ShaderGroup::BatchMatMul | ShaderGroup::WinogradBatchedMatMul => (
             ShaderGroup::MatMul,
             "(wgid.z * params.m + a_row) * params.k + a_col",
             "(wgid.z * params.k + b_row) * params.n + b_col",
@@ -4406,6 +4407,7 @@ mod tests {
     fn shader_globals_match_runtime_bindings() {
         use crate::compile::{
             AttentionParams, CachedBlockAttentionParams, RoPEParams, ShaderEntry,
+            WinogradInputParams, WinogradOutputParams, WinogradWeightParams,
         };
         use std::collections::HashSet;
 
@@ -4576,8 +4578,12 @@ mod tests {
                 ShaderEntry::PairwiseGrad => {
                     vec!["src_a", "src_b", "src_c", "dst", "params"]
                 }
-                ShaderEntry::WinogradInputTransform | ShaderEntry::WinogradOutputTransform => {
+                ShaderEntry::WinogradInputTransform
+                | ShaderEntry::WinogradOutputTransform { fused: false } => {
                     vec!["src", "dst", "params"]
+                }
+                ShaderEntry::WinogradOutputTransform { fused: true } => {
+                    vec!["src", "dst", "params", "residual"]
                 }
                 ShaderEntry::WinogradBatchedMatMul => {
                     vec!["matrix_a", "matrix_b", "matrix_c", "params"]
@@ -4673,8 +4679,10 @@ mod tests {
             ShaderEntry::Conv2dGradWeightGemmSplitSmall,
             ShaderEntry::Conv2dGradWeightGemmSplit16,
             ShaderEntry::WinogradInputTransform,
-            ShaderEntry::WinogradOutputTransform,
+            ShaderEntry::WinogradOutputTransform { fused: false },
+            ShaderEntry::WinogradOutputTransform { fused: true },
             ShaderEntry::WinogradBatchedMatMul,
+            ShaderEntry::WinogradWeightTransform,
             ShaderEntry::CacheWrite,
             ShaderEntry::CacheWritePrefix,
             ShaderEntry::CachedAttention,
@@ -4722,6 +4730,15 @@ mod tests {
                 | ShaderEntry::CachedBlockAttentionSplit
                 | ShaderEntry::CachedBlockAttentionCombine => {
                     assert_params_layout::<CachedBlockAttentionParams>(&sm.module);
+                }
+                ShaderEntry::WinogradInputTransform => {
+                    assert_params_layout::<WinogradInputParams>(&sm.module)
+                }
+                ShaderEntry::WinogradOutputTransform { .. } => {
+                    assert_params_layout::<WinogradOutputParams>(&sm.module)
+                }
+                ShaderEntry::WinogradWeightTransform => {
+                    assert_params_layout::<WinogradWeightParams>(&sm.module)
                 }
                 _ => {}
             }

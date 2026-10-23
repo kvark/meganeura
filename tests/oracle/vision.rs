@@ -319,7 +319,7 @@ fn conv2d_winograd() {
                 ShaderEntry::WinogradWeightTransform,
                 ShaderEntry::WinogradInputTransform,
                 ShaderEntry::WinogradBatchedMatMul,
-                ShaderEntry::WinogradOutputTransform,
+                ShaderEntry::WinogradOutputTransform { fused: false },
             ],
         );
         options.optimize.no_winograd = true;
@@ -449,7 +449,7 @@ fn conv2d_winograd_residual() {
                     .plan()
                     .dispatches
                     .iter()
-                    .any(|d| d.kernel == Kernel::WinogradOutputAdd),
+                    .any(|d| d.shader == (ShaderEntry::WinogradOutputTransform { fused: true })),
                 !protected,
             );
             drop(session);

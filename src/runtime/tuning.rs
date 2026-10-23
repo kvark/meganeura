@@ -345,20 +345,21 @@ pub(super) fn tile_module(
 ) -> crate::codegen::ShaderModule {
     let entry = &dispatch.shader;
     if let MatmulTile::Scalar(shape) = tile {
-        return crate::codegen::generate_matmul_with_epilogue(
-            entry.shader_group(),
-            None,
-            crate::codegen::MatMulOptions {
-                format: dispatch.weight_format,
-                tile: shape.geometry(),
-                knobs: crate::codegen::MatmulKnobs {
-                    k_stage: shape.k_stage,
-                    interleave_columns: shape.interleave_columns,
-                    unroll_k: shape.unroll_k,
-                    ..knobs
-                },
+        let options = crate::codegen::MatMulOptions {
+            format: dispatch.weight_format,
+            tile: shape.geometry(),
+            knobs: crate::codegen::MatmulKnobs {
+                k_stage: shape.k_stage,
+                interleave_columns: shape.interleave_columns,
+                unroll_k: shape.unroll_k,
+                ..knobs
             },
-        );
+        };
+        return if *entry == ShaderEntry::WinogradBatchedMatMul {
+            crate::codegen::gen_block_matmul(entry.shader_group(), options)
+        } else {
+            crate::codegen::generate_matmul_with_epilogue(entry.shader_group(), None, options)
+        };
     }
     if let MatmulTile::Gemv(shape) = tile {
         // The int-dot kernel is a different computation, not a different

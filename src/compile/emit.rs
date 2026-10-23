@@ -2872,7 +2872,17 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![weight],
                     output_buffer: weight_xform,
                     extra_outputs: vec![],
-                    params: vec![out_channels, in_channels, u32::from(adjoint), 0, 0, 0, 0, 0],
+                    params: WinogradWeightParams {
+                        out_channels,
+                        in_channels,
+                        adjoint: u32::from(adjoint),
+                        _pad1: 0,
+                        _pad2: 0,
+                        _pad3: 0,
+                        _pad4: 0,
+                        _pad5: 0,
+                    }
+                    .to_words(),
 
                     ..Default::default()
                 });
@@ -2884,8 +2894,8 @@ impl<'a> Compiler<'a> {
                     input_buffers: vec![input],
                     output_buffer: input_xform_buf,
                     extra_outputs: vec![],
-                    params: vec![
-                        batch_size,
+                    params: WinogradInputParams {
+                        batch: batch_size,
                         in_channels,
                         in_h,
                         in_w,
@@ -2893,7 +2903,8 @@ impl<'a> Compiler<'a> {
                         tiles_h,
                         tiles_w,
                         total_tiles,
-                    ],
+                    }
+                    .to_words(),
 
                     ..Default::default()
                 });
@@ -2929,21 +2940,22 @@ impl<'a> Compiler<'a> {
 
                 // Dispatch 3: Output transform
                 self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::WinogradOutputTransform,
+                    shader: ShaderEntry::WinogradOutputTransform { fused: false },
                     workgroups: [(total_tiles * out_channels).div_ceil(256), 1, 1],
                     input_buffers: vec![mm_out_buf],
                     output_buffer: out_buf,
                     extra_outputs: vec![],
-                    params: vec![
-                        batch_size,
+                    params: WinogradOutputParams {
+                        batch: batch_size,
                         out_channels,
                         out_h,
                         out_w,
                         tiles_h,
                         tiles_w,
                         total_tiles,
-                        0,
-                    ],
+                        _pad: 0,
+                    }
+                    .to_words(),
 
                     ..Default::default()
                 });

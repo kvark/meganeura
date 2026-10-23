@@ -8,7 +8,10 @@ mod bf16;
 mod params;
 mod softplus;
 mod split_k;
-pub(crate) use params::{AttentionParams, CachedBlockAttentionParams, DispatchParams, RoPEParams};
+pub(crate) use params::{
+    AttentionParams, CachedBlockAttentionParams, DispatchParams, RoPEParams, WinogradInputParams,
+    WinogradOutputParams, WinogradWeightParams,
+};
 
 /// Weight storage format for matmul B operands.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -421,7 +424,10 @@ pub enum ShaderEntry {
     GlobalAvgPoolGrad,
     PairwiseGrad,
     WinogradInputTransform,
-    WinogradOutputTransform,
+    WinogradOutputTransform {
+        /// Add the residual input while storing the transformed output.
+        fused: bool,
+    },
     WinogradBatchedMatMul,
     WinogradWeightTransform,
     /// Squared-gradient partial sums, one slot per workgroup, then a
@@ -500,7 +506,7 @@ impl ShaderEntry {
             | ShaderEntry::MaxPool2d
             | ShaderEntry::MaxPool2dGrad
             | ShaderEntry::WinogradInputTransform
-            | ShaderEntry::WinogradOutputTransform
+            | ShaderEntry::WinogradOutputTransform { .. }
             | ShaderEntry::WinogradBatchedMatMul
             | ShaderEntry::WinogradWeightTransform => "convolution_spatial",
 
@@ -716,7 +722,9 @@ impl ShaderEntry {
             ShaderEntry::GlobalAvgPoolGrad => ShaderGroup::GlobalAvgPoolGrad,
             ShaderEntry::PairwiseGrad => ShaderGroup::PairwiseGrad,
             ShaderEntry::WinogradInputTransform => ShaderGroup::WinogradInputTransform,
-            ShaderEntry::WinogradOutputTransform => ShaderGroup::WinogradOutputTransform,
+            ShaderEntry::WinogradOutputTransform { fused } => {
+                ShaderGroup::WinogradOutputTransform { fused }
+            }
             ShaderEntry::WinogradBatchedMatMul => ShaderGroup::WinogradBatchedMatMul,
             ShaderEntry::WinogradWeightTransform => ShaderGroup::WinogradWeightTransform,
             ShaderEntry::GradClipNormSq => ShaderGroup::GradClipNormSq,
@@ -830,7 +838,7 @@ impl ShaderEntry {
             ShaderEntry::GlobalAvgPoolGrad => "main",
             ShaderEntry::PairwiseGrad => "main",
             ShaderEntry::WinogradInputTransform
-            | ShaderEntry::WinogradOutputTransform
+            | ShaderEntry::WinogradOutputTransform { .. }
             | ShaderEntry::WinogradBatchedMatMul
             | ShaderEntry::WinogradWeightTransform => "main",
             ShaderEntry::GradClipNormSq
@@ -1224,8 +1232,6 @@ pub struct Dispatch {
 /// the dispatch; shader-specific configuration lives only in its variant.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kernel {
-    /// Winograd output transform with an elementwise residual addition.
-    WinogradOutputAdd,
     #[default]
     Default,
     SmallTile,
@@ -2933,7 +2939,7 @@ fn fuse_winograd_add(plan: &mut ExecutionPlan) {
             };
             let producer = &plan.dispatches[pi];
             if pi >= ci
-                || producer.shader != ShaderEntry::WinogradOutputTransform
+                || producer.shader != (ShaderEntry::WinogradOutputTransform { fused: false })
                 || producer.kernel != Kernel::Default
                 || producer.fusion_barrier
                 || protected.contains(&buffer)
@@ -2942,7 +2948,7 @@ fn fuse_winograd_add(plan: &mut ExecutionPlan) {
                 continue;
             }
             let mut fused = producer.clone();
-            fused.kernel = Kernel::WinogradOutputAdd;
+            fused.shader = ShaderEntry::WinogradOutputTransform { fused: true };
             fused.input_buffers.push(consumer.input_buffers[1 - side]);
             fused.output_buffer = consumer.output_buffer;
             fused.origin.extend_from_slice(&consumer.origin);
