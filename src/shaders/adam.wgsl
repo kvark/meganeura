@@ -18,7 +18,8 @@ struct Params {
     // Pair index whose grouped gradient norms are collected.
     grouped_index: u32,
     algorithm: u32,
-    _pad0: u32,
+    one_minus_beta1: f32,
+    one_minus_beta2: f32,
 }
 
 var<storage, read_write> param: array<f32>;
@@ -29,6 +30,42 @@ var<storage, read_write> grouped_grad_norm: array<f32>;
 var<uniform> params: Params;
 
 const ADAM_ALGORITHM_LAPROP: u32 = 1u;
+
+// Keep tiny variance arithmetic normal even when the device flushes F32 denormals.
+fn variance_scaled(value: f32) -> f32 {
+    let bits = bitcast<u32>(value);
+    if bits < 0x00800000u {
+        return f32(bits) * 0x1p-85f;
+    }
+    return value * 0x1p64f;
+}
+
+fn variance_unscaled(value: f32) -> f32 {
+    if value < 0x1p-62f {
+        let mantissa = value * 0x1p85f;
+        let lower = u32(mantissa);
+        let fraction = mantissa - f32(lower);
+        let up = fraction > 0.5 || (fraction == 0.5 && (lower & 1u) != 0u);
+        return bitcast<f32>(lower + select(0u, 1u, up));
+    }
+    return value * 0x1p-64f;
+}
+
+fn variance_and_rms(old: f32, gradient: f32) -> vec2<f32> {
+    let finite_history = (bitcast<u32>(old) & 0x7fffffffu) < 0x7f800000u;
+    let history = select(old, 0.0, params.beta2 == 0.0 && finite_history);
+    if abs(gradient) < 0x1p-32f && bitcast<u32>(history) < 0x1f800000u {
+        // Metal fast math may reassociate these scales; the tiny-variance test guards against it.
+        let scaled_gradient = gradient * 0x1p32f;
+        let scaled = params.beta2 * variance_scaled(history)
+            + params.one_minus_beta2 * scaled_gradient * scaled_gradient;
+        let stored = variance_unscaled(scaled);
+        let rms = sqrt(variance_scaled(stored) * params.bias_correction2) * 0x1p-32f;
+        return vec2<f32>(stored, rms);
+    }
+    let stored = params.beta2 * old + params.one_minus_beta2 * gradient * gradient;
+    return vec2<f32>(stored, sqrt(stored * params.bias_correction2));
+}
 
 fn update(s: Segment, i: u32) {
     let e = s.offset + i;
@@ -46,22 +83,22 @@ fn update(s: Segment, i: u32) {
     }
 
     // Update biased second moment
-    let v_new = params.beta2 * v[e] + (1.0 - params.beta2) * g * g;
-    v[e] = v_new;
-    let v_hat = v_new * params.bias_correction2;
+    let variance_rms = variance_and_rms(v[e], g);
+    v[e] = variance_rms.x;
+    let rms = variance_rms.y;
 
     // Adam accumulates momentum on raw gradients and normalizes the result.
     // LaProp normalizes each gradient first and then accumulates
     // momentum, matching DreamerV3's RMS -> momentum optimizer chain.
     var moment_input = g;
     if params.algorithm == ADAM_ALGORITHM_LAPROP {
-        moment_input = g / (sqrt(v_hat) + params.eps);
+        moment_input = g / (rms + params.eps);
     }
-    let m_new = params.beta1 * m[e] + (1.0 - params.beta1) * moment_input;
+    let m_new = params.beta1 * m[e] + params.one_minus_beta1 * moment_input;
     m[e] = m_new;
     let m_hat = m_new * params.bias_correction1;
 
-    var step = m_hat / (sqrt(v_hat) + params.eps);
+    var step = m_hat / (rms + params.eps);
     if params.algorithm == ADAM_ALGORITHM_LAPROP {
         step = m_hat;
     }
