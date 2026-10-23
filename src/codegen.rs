@@ -996,10 +996,10 @@ pub fn generate_module_coop_typed(group: ShaderGroup, types: MatrixTypes) -> Sha
 
 /// Select a supported native M×N×K tile for the checked cooperative product,
 /// from the shapes a device lists for its multiplication type. Prefer the
-/// square tile; Xe2 exposes a rectangular 8×16×16 product instead. Both use
-/// the same 32×32 output block and whole 32-element K partitions.
+/// 16-wide square tile, then Xe2's rectangular product, then Apple's 8-wide
+/// square tile. All use a 32×32 output block and whole 32-element K partitions.
 pub fn checked_cooperative_shape(shapes: &[[u32; 3]]) -> Option<[u32; 3]> {
-    [[16, 16, 16], [8, 16, 16]]
+    [[16, 16, 16], [8, 16, 16], [8, 8, 8]]
         .into_iter()
         .find(|shape| shapes.contains(shape))
 }

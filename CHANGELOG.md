@@ -1,5 +1,9 @@
 # Unreleased
 
+- Checked cooperative dense products and convolutions also support native
+  8x8x8 F32, F16/F32 and BF16/F32 tiles on Metal. Auto search can qualify these
+  reduced multiplication paths on Apple GPUs with F32 storage and outputs.
+
 - Measured construction automatically considers device-qualified BF16 and rectangular F16
   multiplication for eligible dense products and forward convolutions under
   `CoopPolicy::Auto`, with F32 storage and outputs. Checked rectangular subgroup tiles and dense workgroup tuning remain
@@ -32,9 +36,9 @@
   trial that probes kernels, reports it, and supplies it to later trials.
   Raced and memoized choices still require whole-program qualification and
   paired timing in `build_measured`; isolated wins do not bypass that gate.
-- Native BF16 is available as an explicit graph precision policy on Vulkan
-  devices where Blade reports BF16 storage and 16x16x16 or 8x16x16 BF16/F32 cooperative
-  matrices. Conversion and connected pointwise boundaries use two-byte storage;
+- Native BF16 is available as an explicit graph precision policy on Vulkan and
+  Metal devices where Blade reports BF16 storage and 16x16x16, 8x16x16 or 8x8x8
+  BF16/F32 cooperative matrices. Conversion and connected pointwise boundaries use two-byte storage;
   dense and convolution products accumulate in F32, preserve F32 master
   parameters and gradients, and split long underfilled products across K.
   Dense BF16 products share the existing matmul groups and bindings. A typed
@@ -44,8 +48,8 @@
   narrowed automatically.
 - Dense products with two explicit F16 operands run on the same typed
   cooperative kernel, with F16 multiplication and F32 accumulation, on devices
-  with F16 storage and 16x16x16 or 8x16x16 F16/F32 cooperative matrices that
-  keep subnormal F16 operands. A one-time probe per context checks the latter;
+  with F16 storage and 16x16x16, 8x16x16 or 8x8x8 F16/F32 cooperative matrices
+  that keep subnormal F16 operands. A one-time probe per context checks the latter;
   Blade requests SPIR-V denormal preservation where supported. Other F16 left operands and
   reduced addends are rejected at compile time: the ordinary kernels honor
   reduced storage only in B and read them as F32.
