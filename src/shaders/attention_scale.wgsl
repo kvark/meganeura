@@ -31,6 +31,8 @@ fn scale_power(value: f32, exponent: i32) -> f32 {
     return ((value * a) * b) * c;
 }
 
+// The caller must reach a workgroup barrier before calling this again,
+// so all reads of scale_maxima finish before another reduction overwrites it.
 fn block_exponents(local: vec2<f32>, subgroup: u32, subgroup_width: u32, subgroup_lane: u32) -> vec2<i32> {
     let largest = subgroupMax(local);
     if subgroup_lane == 0u {
@@ -41,7 +43,5 @@ fn block_exponents(local: vec2<f32>, subgroup: u32, subgroup_width: u32, subgrou
     for (var group = 0u; group < 128u / subgroup_width; group++) {
         maximum = max(maximum, scale_maxima[group]);
     }
-    let result = vec2<i32>(exponent_for(maximum.x), exponent_for(maximum.y));
-    workgroupBarrier();
-    return result;
+    return vec2<i32>(exponent_for(maximum.x), exponent_for(maximum.y));
 }
