@@ -70,7 +70,7 @@ profiler = ["dep:tracing-subscriber"]
 
 [dependencies]
 # FP16 denormal preservation: https://github.com/kvark/blade/pull/416.
-blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "eae0c6f7aa3167c79d1135050cf8e17c17fabd0a" }
+blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "6af8c5783becd798ceaad25f3101935040241f31" }
 blade-macros = "0.3"
 # `default-features = false` drops egglog's `bin` stack (clap, mimalloc,
 # env_logger, chrono, graphviz); library builds use the shared rewrite engine.

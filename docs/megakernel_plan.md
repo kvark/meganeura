@@ -67,6 +67,14 @@ Implementation evidence:
   This preparation still uses single-operation regions. All six profiling
   tests passed in ordinary and persistent configurations, alongside the
   focused Session checks and all-target/all-feature Clippy.
+- Blade is pinned to `6af8c5783becd798ceaad25f3101935040241f31`
+  ([dependency branch](https://github.com/kvark/blade/tree/meganeura-compute-limits)).
+  Its Vulkan capabilities now report storage-buffer counts, bound group counts
+  and storage binding ranges for resource-aware region composition. Other
+  backends explicitly report that these limits are unavailable. Blade's 20
+  unit tests passed (one ignored), Clippy passed, and enumeration was checked
+  on NVIDIA and lavapipe. The updated Meganeura pin passed all-target checking
+  and both focused Session tests. Naga remains at the original revision.
 
 The objective is to run Meganeura graphs through persistent GPU workers using
 the ordinary `Graph` / `build` / `Session` interface, and qualify them with the
