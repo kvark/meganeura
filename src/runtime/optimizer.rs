@@ -662,6 +662,7 @@ impl Session {
 
     /// Run `update` now, in a submission of its own.
     pub(super) fn run_optimizer(&mut self, update: Update) {
+        self.require_ordinary_optimizer();
         self.wait();
         self.encoder.start();
         self.encode_optimizer(Some(update), false);

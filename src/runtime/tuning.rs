@@ -766,6 +766,8 @@ impl Session {
         }
         self.pipelines.select(&self.plan.dispatches);
         other.pipelines.select(&other.plan.dispatches);
+        self.refresh_persistent();
+        other.refresh_persistent();
         Ok(swaps.len())
     }
 
@@ -1162,6 +1164,7 @@ impl Session {
         }
         self.pipelines.select(&self.plan.dispatches);
         report.scratch = Some(staging.stats);
+        self.refresh_persistent();
         report.elapsed = start.elapsed();
         report.time_budget_exhausted |= report.elapsed >= options.max_time;
         log::info!(

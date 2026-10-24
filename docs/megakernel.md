@@ -4,12 +4,58 @@ The [integration and Naga plan](megakernel_plan.md) records the next milestones:
 persistent regions through `Session`, followed by investigation of the fork's
 memory/atomic semantics for device-scheduled graphs.
 
+## Session integration
+
+Generated pointwise and reduction operations can now execute through persistent
+tile queues using the ordinary `Graph` / `build` / `Session` path:
+
+```rust,no_run
+# let graph = meganeura::Graph::new();
+let mut config = meganeura::SessionConfig::from_env();
+config.runtime.persistent = Some(meganeura::PersistentOptions {
+    workers: 64,
+    allow_fallback: true,
+});
+let (mut session, _) = meganeura::build(&graph, config);
+let coverage = session.execution_report();
+session.step();
+session.wait();
+```
+
+This first integration retains one physical launch per compiled operation and
+the original dispatch barriers. Each launch drains logical tiles using its
+kernel's existing workgroup size. It establishes a shared execution and test
+path; it does not yet combine operations or claim a launch-count improvement.
+The ordinary backend remains the default.
+
+Session buffers are bound directly, including current parameter sharing and
+external rebindings. Intermediate lifetime aliasing is disabled in this mode.
+Queue counters are allocated once, included in `MemorySummary.scheduler_bytes`,
+and reset by a GPU transfer at every step, including externally recorded steps.
+Tensor data and training/cache state are not reset. Profiling reserves a slot
+for queue reset, and tuning rebuilds the persistent pipelines after selection.
+
+`execution_report()` lists operation provenance, logical tiles, worker geometry,
+physical graph launches, fallback reasons, and configured appended optimizer,
+clipping, or accumulation work. `allow_fallback: false` rejects unsupported
+graph operations and execution of ordinary optimizer/accumulation passes.
+A passthrough graph can have zero tasks; qualification must assert nonzero
+persistent coverage for cases intended to exercise this path.
+
+Harnesses using environment configuration can select the path with
+`MEGANEURA_PERSISTENT_WORKERS=64`, and reject fallbacks with
+`MEGANEURA_PERSISTENT_STRICT=1`. `reference::gpu::Options.persistent` provides
+the same explicit selection for oracle checks. The plan tracks the remaining
+harness audit, region composition, and production benchmark qualification.
+
+## Standalone prototype
+
 `meganeura::megakernel` experiments with a fixed pool of 64-thread workgroups
 that stay alive and dispatch work inside a single GPU launch. Each worker
 atomically claims a job, interprets its operations, and returns to the queue
 until the finite batch is exhausted. The worker count is configurable and
-independent of the number of jobs. The normal graph compiler/runtime is
-unchanged; this is an explicit experimental API.
+independent of the number of jobs. This remains a separate experimental API
+for scheduling diagnostics.
 
 ```sh
 # Arguments: workers, jobs, vector width, residual MLP layers, timing pairs.

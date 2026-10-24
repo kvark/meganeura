@@ -244,17 +244,18 @@ fn windowed_capture_times_every_dispatch_and_preserves_the_result() {
     )
     .expect("windowed capture");
 
-    let expected_windows = dispatch_count.div_ceil(3);
+    let timed_per_window = 3 - usize::from(session.execution_report().scheduler_bytes != 0);
+    let expected_windows = dispatch_count.div_ceil(timed_per_window);
     assert_eq!(
         profile.measurement.window_count, expected_windows,
-        "{dispatch_count} dispatches at three per replay"
+        "{dispatch_count} dispatches at {timed_per_window} per replay"
     );
     assert!(
         profile.measurement.window_count > 1,
         "this test is only meaningful with more than one window"
     );
     assert!(
-        profile.measurement.max_window_dispatches <= 3,
+        profile.measurement.max_window_dispatches <= timed_per_window,
         "a window exceeded the requested budget: {}",
         profile.measurement.max_window_dispatches
     );

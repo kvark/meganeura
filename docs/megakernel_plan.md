@@ -2,8 +2,8 @@
 
 Agreed direction, October 24, 2026. Implementation starts with **Milestone 1**,
 then proceeds to the **Naga investigation in Milestone 2**. The existing
-[prototype and measurements](megakernel.md) are the starting evidence; the
-integration and compiler work below are not implemented yet.
+[prototype and measurements](megakernel.md) are the starting evidence.
+Session integration is in progress; the compiler investigation follows it.
 
 Implementation is delivered in separate testable commits. The standalone
 prototype is the baseline; subsequent commits update the milestone checklist
@@ -12,12 +12,27 @@ only when the corresponding implementation and checks are present.
 Implementation evidence:
 
 - `d94fce7`: committed the standalone prototype and this integration plan.
-- Shared tile-body refactor: ordinary pointwise and reduction entry points
+- `9a341e5`: ordinary pointwise and reduction entry points
   now call reusable bodies with explicit logical workgroup IDs. Persistent
   entry points follow in the Session integration. The kernel memo revision
   was bumped. Validation: 27 schedule unit tests and all 167 oracle tests
   passed on NVIDIA with Vulkan synchronization validation; library Clippy
   passed with all features.
+- Initial Session path: eligible operations now use persistent tile queues
+  with ordinary operation boundaries, direct Session bindings, GPU queue
+  reset, explicit coverage/fallback reports, and strict rejection. This step
+  retains one launch per operation; combining operations into regions remains
+  below. Both ordinary and persistent paths passed all 167 oracle tests on
+  NVIDIA with Vulkan synchronization validation. Focused Session checks cover
+  worker pools 1/3/64/256, ragged pointwise/reduction tiles, changed inputs,
+  repeated steps, chunking, profiling execution, and repeated external records.
+  With the environment selector set to three workers, 68 smoke tests passed
+  (two ignored). The regression run passed 181 tests and identified one
+  profiling expectation needing the reset's timestamp slot; all six profiling
+  tests passed after correcting it (21 regression tests were ignored).
+  The focused Session tests also passed on lavapipe. All 505 unit tests and
+  all-target/all-feature Clippy passed. Tests with explicit default sessions
+  still need the harness audit below before claiming complete backend coverage.
 
 The objective is to run Meganeura graphs through persistent GPU workers using
 the ordinary `Graph` / `build` / `Session` interface, and qualify them with the
@@ -61,7 +76,7 @@ logical workgroup/tile range, parameters, and session buffer references.
 
 ### 1.1 Execution selection and reporting
 
-- [ ] Add typed execution options through `SessionConfig.runtime` /
+- [x] Add typed execution options through `SessionConfig.runtime` /
   `SessionOptions`; keep the exact API small and decide names during implementation.
 - [ ] Add a construction report with selected execution mode, persistent
   regions, logical tasks, physical dispatches, worker configuration, and
@@ -86,16 +101,16 @@ logical workgroup/tile range, parameters, and session buffer references.
   storage layout is known. Respect binding-count/range limits, mixed storage
   types, shared parameters, and external buffer rebinding. Split a region or
   report fallback when its binding contract cannot be represented.
-- [ ] Start without intermediate lifetime aliasing for persistent sessions.
+- [x] Start without intermediate lifetime aliasing for persistent sessions.
   Preserve user-visible sharing and state. Restore lifetime reuse only with
   a proof that region scheduling and physical reuse are ordered consistently.
-- [ ] Allocate descriptors, queue state, and scratch once. Per-step recording
+- [x] Allocate descriptors, queue state, and scratch once. Per-step recording
   resets scheduler state on the GPU; it does not rebuild tasks or copy live
   tensor arenas through the host. Include these allocations in memory reports.
 
 ### 1.3 Reusable pointwise and reduction handlers
 
-- [ ] Refactor generated pointwise and reduction kernels into callable tile
+- [x] Refactor generated pointwise and reduction kernels into callable tile
   bodies shared by ordinary and persistent entry points. Preserve the
   existing schedule representation instead of adding a second operator list.
 - [ ] Pass logical dispatch geometry explicitly. Audit early returns, uniform

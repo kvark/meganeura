@@ -171,6 +171,8 @@ an uninitialized model. See [compiler search](docs/compiler-search.md).
 | `MEGANEURA_FLASH_FWD_COOP=0` | Disable only cooperative flash-attention forward. |
 | `MEGANEURA_FLASH_BWD_COOP` | Enable the experimental reduced-precision flash backward. |
 | `MEGANEURA_NO_ALIAS` | Disable buffer lifetime aliasing (every value gets its own allocation). |
+| `MEGANEURA_PERSISTENT_WORKERS` | Opt in to persistent pointwise/reduction tile queues with 1–65535 workgroups per dispatch. Preserves operation boundaries and disables intermediate aliasing. |
+| `MEGANEURA_PERSISTENT_STRICT` | Reject ordinary fallback when persistent execution is selected. |
 | `MEGANEURA_NO_DEVICE_LOCAL` | Keep all buffers host-visible. |
 | `MEGANEURA_POISON` | Fill non-parameter buffers with NaN at session build, so reads of memory nothing wrote show up. |
 | `MEGANEURA_SERIAL_DISPATCH` | One compute pass per dispatch — serial execution for bisection. |

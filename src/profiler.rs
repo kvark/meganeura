@@ -288,7 +288,8 @@ pub struct CaptureOptions {
     /// windows — each replay then perturbs the schedule less, at the cost of
     /// more replays.
     ///
-    /// Clamped to `3 ..= blade_graphics::limits::PASS_COUNT`: two slots
+    /// Clamped to `3 ..= blade_graphics::limits::PASS_COUNT` (minimum four
+    /// with a persistent queue reset): two slots
     /// always go to the untimed passes around the window, and raising the
     /// bound past the backend's own limit would only build a window whose
     /// timestamps the backend drops.
@@ -561,10 +562,12 @@ fn capture_windows(
     // `PASS_COUNT` — it just asks for one oversized window, which then
     // recovers nothing and fails the capture instead of taking the windowed
     // route that works.
+    let overhead = session.profiling_overhead_passes();
     let pass_limit = options
         .max_timed_passes_per_replay
         .unwrap_or(blade_graphics::limits::PASS_COUNT)
-        .clamp(3, blade_graphics::limits::PASS_COUNT);
+        .clamp(3 + overhead, blade_graphics::limits::PASS_COUNT)
+        - overhead;
     let windows = profile_windows(dispatch_count, pass_limit);
     let window_count = windows.len();
     let mut timing_samples = vec![Vec::with_capacity(options.samples); dispatch_count];

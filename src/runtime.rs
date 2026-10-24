@@ -13,10 +13,12 @@ use std::sync::Arc;
 mod calibration;
 mod checkpoint;
 mod optimizer;
+mod persistent;
 pub(crate) mod search_state;
 mod tuning;
 pub use crate::tune::TuneOutcome;
 pub(crate) use calibration::machine_profile;
+pub use persistent::{ExecutionRegion, ExecutionReport, PersistentOptions};
 pub use tuning::KernelMemo;
 
 type Gpu = blade_graphics::Context;
@@ -190,6 +192,8 @@ pub struct MemorySummary {
     pub grad_accumulator_bytes: usize,
     /// Clip scalar and optional grouped-gradient diagnostic storage.
     pub optimizer_aux_bytes: usize,
+    /// Persistent execution queues, excluding driver pipeline objects.
+    pub scheduler_bytes: usize,
     pub num_buffers: usize,
     pub largest_buffer_bytes: usize,
     /// Bytes actually allocated on the GPU after lifetime-based buffer
@@ -211,6 +215,7 @@ impl MemorySummary {
             + self.adam_state_bytes
             + self.grad_accumulator_bytes
             + self.optimizer_aux_bytes
+            + self.scheduler_bytes
     }
 }
 
@@ -2727,6 +2732,7 @@ fn record_groups(
     plan: &ExecutionPlan,
     groups: &[std::ops::Range<usize>],
     pipelines: &Pipelines,
+    persistent: Option<&persistent::State>,
     buffers: &[blade_graphics::BufferPiece],
     chunks: usize,
     timing: bool,
@@ -2751,6 +2757,10 @@ fn record_groups(
                 }
                 for i in group.clone() {
                     let dispatch = &plan.dispatches[i];
+                    if persistent.is_some_and(|state| state.record(i, dispatch, buffers, &mut pass))
+                    {
+                        continue;
+                    }
                     let pipeline = pipelines.get(i);
                     let mut pc = pass.with(pipeline);
                     Session::bind_dispatch(buffers, dispatch, &mut pc);
@@ -3167,6 +3177,8 @@ mod coop_precision_tests {
 /// Options for session construction beyond the plan itself.
 #[derive(Clone, Debug, Default)]
 pub struct SessionOptions {
+    /// Persistent tile execution; ordinary dispatches remain the default.
+    pub persistent: Option<PersistentOptions>,
     /// Debug session: disable buffer aliasing and device-local placement so
     /// materialized values stay host-visible and readable via
     /// [`Session::read_node`] after a completed step. `build` also disables
@@ -3409,6 +3421,7 @@ impl DebugStepReport {
 }
 
 pub struct Session {
+    persistent: Option<persistent::State>,
     gpu: Arc<Gpu>,
     /// Per-logical-buffer view: `buffers[i]` backs `BufferRef(i)`, at its
     /// offset within its physical allocation. Aliased logical buffers share
@@ -4079,17 +4092,21 @@ impl Session {
         );
         drop(schedule_span);
 
+        let persistent = opts.persistent.map(|options| {
+            persistent::State::new(&gpu, &plan, options, opts.wgsl_dump_dir.as_deref())
+        });
+
         // Lifetime-based buffer aliasing: step-local intermediates with
         // disjoint live ranges (at barrier-group granularity) share one
         // physical allocation. See `memplan` for the safety argument.
         // Debug sessions keep every logical buffer distinct and
         // host-visible so any node's value can be read back after a step.
         let memory_plan_span = tracing::info_span!("memory_plan").entered();
-        let mut alias = if opts.debug || opts.no_alias {
+        let mut alias = if opts.debug || opts.no_alias || opts.persistent.is_some() {
             if opts.debug {
                 log::info!("debug session: buffer aliasing disabled");
             } else {
-                log::info!("MEGANEURA_NO_ALIAS: buffer aliasing disabled");
+                log::info!("session execution policy: buffer aliasing disabled");
             }
             crate::memplan::plan_no_alias(&plan, &groups, opts.pin_buffers.as_deref())
         } else {
@@ -4551,6 +4568,7 @@ impl Session {
 
         Self {
             gpu,
+            persistent,
             buffers,
             physical_buffers,
             alias,
@@ -6302,6 +6320,20 @@ impl Session {
     /// must be started. `chunks` above one submits all but the last chunk;
     /// with a `profile_window`, the dispatches in it get passes of their own.
     fn encode_step(&mut self, chunks: usize, profile_window: Option<std::ops::Range<usize>>) {
+        if self.grad_accum_scale.is_some()
+            || self.pending_lr.is_some()
+            || self.pending_adam.is_some()
+        {
+            self.require_ordinary_optimizer();
+        }
+        if self
+            .persistent
+            .as_ref()
+            .is_some_and(|state| state.reset(&mut self.encoder))
+            && profile_window.is_some()
+        {
+            self.profiled_pass_map.push(None);
+        }
         if let Some(window) = profile_window {
             // Multi-pass mode: one compute pass per dispatch in the window,
             // with per-pass barriers and GPU timestamps. Enables
@@ -6311,11 +6343,14 @@ impl Session {
                 match encoded {
                     ProfilePass::Timed(i) => {
                         let dispatch = &self.plan.dispatches[i];
-                        let pipeline = self.pipelines.get(i);
                         let mut pass = self.encoder.compute(&dispatch.label);
-                        let mut pc = pass.with(pipeline);
-                        Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
-                        pc.dispatch(dispatch.workgroups);
+                        if !self.persistent.as_ref().is_some_and(|state| {
+                            state.record(i, dispatch, &self.buffers, &mut pass)
+                        }) {
+                            let mut pc = pass.with(self.pipelines.get(i));
+                            Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
+                            pc.dispatch(dispatch.workgroups);
+                        }
                         self.profiled_pass_map.push(Some(i));
                     }
                     ProfilePass::Untimed(spans) => {
@@ -6328,6 +6363,11 @@ impl Session {
                             }
                             for i in span {
                                 let dispatch = &self.plan.dispatches[i];
+                                if self.persistent.as_ref().is_some_and(|state| {
+                                    state.record(i, dispatch, &self.buffers, &mut pass)
+                                }) {
+                                    continue;
+                                }
                                 let pipeline = self.pipelines.get(i);
                                 let mut pc = pass.with(pipeline);
                                 Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
@@ -6356,6 +6396,7 @@ impl Session {
                 &self.plan,
                 &self.groups,
                 &self.pipelines,
+                self.persistent.as_ref(),
                 &self.buffers,
                 chunks,
                 self.gpu_timing,
@@ -6591,6 +6632,7 @@ impl Session {
 
     /// CPU-fallback SGD update.
     pub fn sgd_step_cpu(&mut self, learning_rate: f32) {
+        self.require_ordinary_optimizer();
         let _span = tracing::info_span!("sgd_step_cpu").entered();
         self.wait();
         for &(param_buf, grad_buf) in &self.plan.param_grad_pairs {
@@ -6821,6 +6863,10 @@ impl Session {
             adam_state_bytes: adam_bytes,
             grad_accumulator_bytes,
             optimizer_aux_bytes,
+            scheduler_bytes: self
+                .persistent
+                .as_ref()
+                .map_or(0, |state| state.report.scheduler_bytes),
             num_buffers: self.plan.buffers.len(),
             largest_buffer_bytes: largest,
             allocated_buffer_bytes: self.alias.sizes.iter().map(|&size| size.max(4)).sum(),
@@ -6832,6 +6878,10 @@ impl Session {
                 .zip(&self.alias.device_local)
                 .filter_map(|(&size, &device)| device.then_some(size.max(4)))
                 .sum::<usize>()
+                + self
+                    .persistent
+                    .as_ref()
+                    .map_or(0, |state| state.report.scheduler_bytes)
                 + if self.optimizer_device {
                     adam_bytes + grad_accumulator_bytes + clip_bytes
                 } else {

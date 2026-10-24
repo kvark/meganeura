@@ -150,6 +150,10 @@ registry! {
         "Enable the experimental reduced-precision cooperative flash backward.";
     NO_ALIAS: "MEGANEURA_NO_ALIAS", Bool, Diagnostic,
         "Disable buffer lifetime aliasing; every logical buffer gets its own allocation.";
+    PERSISTENT_WORKERS: "MEGANEURA_PERSISTENT_WORKERS", U32, Diagnostic,
+        "Opt in to persistent pointwise/reduction tile queues with this many workgroups per dispatch (1..=65535).";
+    PERSISTENT_STRICT: "MEGANEURA_PERSISTENT_STRICT", Bool, Diagnostic,
+        "Reject ordinary fallback when persistent execution is selected.";
     POISON: "MEGANEURA_POISON", Bool, Diagnostic,
         "Fill every non-parameter buffer with NaN at session build, so a kernel that reads memory nothing wrote produces NaN instead of a plausible zero.";
     NO_DEVICE_LOCAL: "MEGANEURA_NO_DEVICE_LOCAL", Bool, Diagnostic,
@@ -343,6 +347,12 @@ impl SessionOptions {
         };
         Self {
             debug: false,
+            persistent: PERSISTENT_WORKERS
+                .u32_value()
+                .map(|workers| crate::PersistentOptions {
+                    workers,
+                    allow_fallback: !PERSISTENT_STRICT.bool_or(false),
+                }),
             coop,
             workgroup_matmul: None,
             // The context is created from the same variable, so the two

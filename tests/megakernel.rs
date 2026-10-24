@@ -1,5 +1,125 @@
 use meganeura::megakernel::{Execution, Executor, Instruction, Job, Options};
 
+#[test]
+fn session_persistent_tiles_use_normal_graph_storage_and_reset() {
+    let gpu = crate::support::gpu::gpu();
+    let mut graph = meganeura::Graph::new();
+    let x = graph.input("x", &[37, 259]);
+    let relu = graph.relu(x);
+    let square = graph.mul(relu, relu);
+    let sum = graph.sum_inner(square);
+    graph.set_outputs(vec![relu, sum]);
+    for workers in [1, 3, 64, 256] {
+        let mut config = meganeura::SessionConfig::inference_from_env_on(gpu.clone());
+        config.optimize.mode = meganeura::OptimizeMode::Off;
+        config.options.fuse_dispatches = false;
+        config.runtime.poison = true;
+        config.runtime.persistent = Some(meganeura::PersistentOptions {
+            workers,
+            allow_fallback: false,
+        });
+        let mut session = meganeura::build(&graph, config).0;
+        let report = session.execution_report();
+        assert!(report.persistent_tasks > 0);
+        assert_eq!(report.graph_dispatches, session.plan().dispatches.len());
+        assert!(
+            report
+                .regions
+                .iter()
+                .all(|r| r.workers == workers && r.fallback_reason.is_none())
+        );
+        assert_eq!(
+            session.memory_summary().scheduler_bytes,
+            report.scheduler_bytes
+        );
+        assert!(report.regions.iter().any(|r| r.logical_tasks > 1));
+        for iteration in 0..3 {
+            let input: Vec<_> = (0..37 * 259)
+                .map(|i| ((i * 17 + iteration * 23) % 101) as f32 / 32.0 - 1.0)
+                .collect();
+            session.set_input("x", &input);
+            if iteration == 0 {
+                session.set_submission_chunks(3);
+                session.step();
+                session.wait();
+            } else if iteration == 1 {
+                session.set_profiling(true);
+                session.step();
+                session.wait();
+                session.set_profiling(false);
+            } else {
+                let mut encoder = gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
+                    name: "persistent repeated records",
+                    buffer_count: 1,
+                    manual_barriers: false,
+                });
+                encoder.start();
+                session.record(&mut encoder).unwrap();
+                session.record(&mut encoder).unwrap();
+                let sync = gpu.submit(&mut encoder);
+                session.track_submission(sync);
+                session.wait();
+                gpu.destroy_command_encoder(&mut encoder);
+            }
+            let mut actual = vec![f32::NAN; input.len()];
+            session.read_output_by_index(0, &mut actual);
+            for (&value, &input) in actual.iter().zip(&input) {
+                assert_eq!(value, input.max(0.0));
+            }
+            let mut reduced = vec![f32::NAN; 37];
+            session.read_output_by_index(1, &mut reduced);
+            for (&value, row) in reduced.iter().zip(input.as_chunks::<259>().0) {
+                let expected: f64 = row.iter().map(|&x| f64::from(x.max(0.0)).powi(2)).sum();
+                assert!(
+                    (f64::from(value) - expected).abs() <= 2e-5 * expected.max(1.0),
+                    "{value} vs {expected}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn session_persistent_fallback_is_explicit_and_strict_rejects_it() {
+    let mut graph = meganeura::Graph::new();
+    let x = graph.input("x", &[2, 3]);
+    let w = graph.parameter("w", &[3, 5]);
+    let product = graph.matmul(x, w);
+    let out = graph.relu(product);
+    graph.set_outputs(vec![out]);
+    let config = |allow_fallback| {
+        let mut config = crate::support::gpu::inference_config();
+        config.optimize.mode = meganeura::OptimizeMode::Off;
+        config.options.fuse_dispatches = false;
+        config.runtime.persistent = Some(meganeura::PersistentOptions {
+            allow_fallback,
+            ..Default::default()
+        });
+        config
+    };
+    let mut session = meganeura::build(&graph, config(true)).0;
+    let report = session.execution_report();
+    assert!(
+        report
+            .regions
+            .iter()
+            .any(|r| r.workers == 0 && r.fallback_reason.is_some())
+    );
+    assert!(report.persistent_tasks > 0);
+    session.set_input("x", &[1.0; 6]);
+    session.set_parameter("w", &[2.0; 15]);
+    session.step();
+    session.wait();
+    assert_eq!(session.read_output(10), vec![6.0; 10]);
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        meganeura::build(&graph, config(false))
+    }));
+    assert!(
+        failure.is_err(),
+        "strict execution silently accepted a matrix fallback"
+    );
+}
+
 fn reference(job: &Job, weights: &[f32]) -> Vec<f64> {
     let mut data: Vec<f64> = job.data.iter().map(|&x| f64::from(x)).collect();
     for instruction in &job.instructions {

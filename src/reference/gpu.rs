@@ -18,6 +18,8 @@ pub struct Options {
     pub optimize: crate::OptimizeConfig,
     /// Cooperative-matrix policy for the session under test.
     pub coop: crate::CoopPolicy,
+    /// Persistent execution and fallback policy for this check.
+    pub persistent: Option<crate::PersistentOptions>,
 }
 
 impl Default for Options {
@@ -29,6 +31,7 @@ impl Default for Options {
             compile: env.options,
             optimize: env.optimize,
             coop: env.runtime.coop,
+            persistent: env.runtime.persistent,
         }
     }
 }
@@ -50,6 +53,7 @@ impl Options {
         config.options = self.compile.clone();
         config.optimize = self.optimize;
         config.runtime.coop = self.coop;
+        config.runtime.persistent = self.persistent;
         config.runtime.poison = self.poison;
         config.gpu = Some(shared_context());
         config
