@@ -70,7 +70,13 @@ report these limits; unreported backend limits produce explicit fallback or stri
 rejection. Session buffers are bound directly, including parameter sharing and
 external rebindings. Rebinding rebuilds the regions. Sessions with imported
 storage retain one operation per launch because separate imported handles may
-alias an allocation. Intermediate lifetime aliasing is disabled in this mode.
+alias an allocation. Intermediate lifetime reuse follows the ordinary liveness
+plan unless debug mode or `SessionOptions::no_alias` disables it. Region planning
+then orders every physical RAW/WAR/WAW overlap, including distinct logical
+buffers sharing a reused allocation. Native regions add whole-operation edges;
+portable regions retain dispatch barriers, and worker-owned chains reject
+overlapping distinct logical references. Thus a new tenant cannot overwrite
+an old tenant until all of its readers and writers have completed.
 Queue counters are allocated once, included in `MemorySummary.scheduler_bytes`,
 and reset by a GPU transfer at every step, including externally recorded steps.
 Tensor data and training/cache state are not reset. Profiling reserves a slot

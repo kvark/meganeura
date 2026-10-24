@@ -171,7 +171,7 @@ an uninitialized model. See [compiler search](docs/compiler-search.md).
 | `MEGANEURA_FLASH_FWD_COOP=0` | Disable only cooperative flash-attention forward. |
 | `MEGANEURA_FLASH_BWD_COOP` | Enable the experimental reduced-precision flash backward. |
 | `MEGANEURA_NO_ALIAS` | Disable buffer lifetime aliasing (every value gets its own allocation). |
-| `MEGANEURA_PERSISTENT_WORKERS` | Opt in to persistent compute regions with 1–65535 workgroups per dispatch. Reports ordinary fallback and disables intermediate lifetime aliasing. |
+| `MEGANEURA_PERSISTENT_WORKERS` | Opt in to persistent compute regions with 1–65535 workgroups per dispatch. Reports ordinary fallback and orders physical allocation reuse. |
 | `MEGANEURA_PERSISTENT_STRICT` | Reject ordinary fallback when persistent execution is selected. |
 | `MEGANEURA_DEVICE_SCHEDULING` | Use qualified Vulkan fences to schedule whole-operation dependencies inside persistent regions. Requires `MEGANEURA_PERSISTENT_WORKERS`; other backends report fallback or reject strict selection. |
 | `MEGANEURA_NO_DEVICE_LOCAL` | Keep all buffers host-visible. |

@@ -1,13 +1,17 @@
 //! Lifetime-based buffer aliasing for the execution plan.
 //!
 //! The dispatch sequence is static and partitioned into barrier groups
-//! (one compute pass each, with a full barrier between groups), so
+//! (with a full barrier between groups in ordinary execution), so
 //! buffer reuse is classic linear-scan allocation: two logical buffers
 //! may share one physical GPU allocation when their live intervals are
 //! disjoint at *barrier-group* granularity. Dispatches inside a group
 //! run concurrently, so disjointness must be strict — the old tenant's
 //! last use group must come strictly before the new tenant's first
 //! write group, guaranteeing a barrier separates them.
+//! Persistent regions may merge those groups, but are planned after allocation:
+//! their physical RAW/WAR/WAW checks preserve reuse order through device edges
+//! or dispatch boundaries. Worker-owned chains reject overlapping distinct
+//! logical buffers, since their index-to-worker mapping has not been proved.
 //!
 //! Coop-padding safety: only matmul output and addend buffers are
 //! padded for full-tile cooperative stores, and those stores write the

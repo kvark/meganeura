@@ -6,7 +6,7 @@ then proceeds to the **Naga investigation in Milestone 2**. The existing
 Milestone 1 is complete with explicit fallback and measured regressions.
 Milestone 2 qualifies the existing fence interface on Vulkan. Session device
 scheduling now covers compatible regions of selected kernels; optimizer
-integration and lifetime reuse remain.
+integration remains.
 
 Implementation is delivered in separate testable commits. The standalone
 prototype is the baseline; subsequent commits update the milestone checklist
@@ -487,6 +487,23 @@ forward/training, with large training tails retained. Construction also costs
 more. Ordinary remains the default; [complete records](megakernel_device_results.md#selected-kernel-tiles)
 include distributions, memory, coverage, worker activity and raw-file identities.
 
+Lifetime reuse now follows the ordinary allocation plan. Regions are planned
+after allocation; pairwise physical RAW/WAR/WAW edges order old-tenant accesses
+before new-tenant writes inside native regions. Dispatch barriers preserve that
+order between regions. Portable independent regions reject those overlaps, and
+worker-owned chains reject overlapping distinct logical references. This
+preserves the original liveness proof when hardware barrier groups are merged.
+Debug and explicit `no_alias` controls remain available. The convolution
+optimizer reuse control now runs on the selected backend. A focused fixture
+checks reduced allocations and a native WAR edge absent from the logical graph,
+with 1/3/64/4096 workers, changed inputs, chunking and repeated external records.
+Validation passes all 168 oracle tests in each strict portable/device selection
+and 22 GGUF tests in strict device selection on NVIDIA with synchronization
+validation. Device selection also passes 182 regression and 74 smoke tests
+(21 regression and two smoke tests ignored). All seven focused Session checks
+pass on NVIDIA and lavapipe. Strict all-target/all-feature Clippy, formatting,
+documentation and core/models/GGUF/profiler Metal-target compilation pass.
+
 The device queue uses the same Session work descriptors, tracking ready tasks,
 predecessor counts, unfinished work and successor edges on the GPU. It releases
 consumers after whole-operation completion; measure whether tile-level
@@ -494,11 +511,11 @@ dependencies are useful before complicating that protocol.
 Never occupy workers waiting on a particular unready graph node when ready
 work can be executed instead.
 
-Broaden handlers to matrix products, attention, convolution, data movement,
-quantized/reduced storage, and their derivatives. Include optimizer, clipping,
-and accumulation work currently recorded outside `ExecutionPlan`. Reintroduce
-aliasing with explicit physical reuse dependencies. Reuse the Milestone 1
-backend matrix and reports rather than building another application harness.
+Selected-kernel conversion now covers the tested matrix products, attention,
+convolution, data movement, quantized/reduced storage and derivative paths.
+Remaining integration includes optimizer, clipping and accumulation work
+currently recorded outside `ExecutionPlan`. Reuse the Milestone 1 backend matrix
+and reports rather than building another application harness.
 
 Full graph coverage requires strict execution of all currently supported
 operator/dtype/state combinations on each claimed target, with remaining

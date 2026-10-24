@@ -824,11 +824,6 @@ fn optimizer_updates(measure: bool, tile: u32) {
                 let mut options = SessionOptions::from_env();
                 options.coop = CoopPolicy::Disabled;
                 options.no_alias = no_alias;
-                if !no_alias {
-                    // This control must actually reuse allocations; persistent
-                    // sessions currently disable intermediate lifetime aliasing.
-                    options.persistent = None;
-                }
                 let mut session =
                     Session::with_context_opts(plan(s, tile, splits).0, Arc::clone(&gpu), options);
                 session.set_parameter("x", &data(nx, 7, 1.0));

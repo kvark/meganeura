@@ -59,10 +59,11 @@ remain physical dispatches. `validate_persistent_completion()` waits and checks
 unfinished tasks, counters and diagnostics after a step; it performs a readback,
 so correctness checks call it outside timed intervals. The reference harness and
 paired benchmark do this automatically. Ordinary execution remains the default.
-The convolution optimizer test keeps its allocation-reuse control explicitly
-ordinary: persistent sessions currently disable lifetime aliasing. Its other
-sessions exercise the selected backend, and the memory-reduction assertion
-remains active for the ordinary control.
+The convolution optimizer test checks allocation reuse on the selected backend.
+A strict Session fixture verifies reduced allocation count/bytes and a physical
+WAR edge absent from the logical graph, with 1/3/64/4096 workers, portable/native
+queues, changed inputs, chunking and repeated external records. `no_alias` and
+debug mode still retain distinct intermediate allocations.
 Profile schema 4 includes that execution report and records one timing per
 physical launch. Profiling windows use execution-region indices. Each timed
 row lists its untimed source operations in `members`; `logical_workgroups`

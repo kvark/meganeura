@@ -4134,7 +4134,7 @@ impl Session {
         // Debug sessions keep every logical buffer distinct and
         // host-visible so any node's value can be read back after a step.
         let memory_plan_span = tracing::info_span!("memory_plan").entered();
-        let mut alias = if opts.debug || opts.no_alias || opts.persistent.is_some() {
+        let mut alias = if opts.debug || opts.no_alias {
             if opts.debug {
                 log::info!("debug session: buffer aliasing disabled");
             } else {

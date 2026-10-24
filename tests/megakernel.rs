@@ -625,6 +625,108 @@ fn session_persistent_regions_combine_independent_ragged_tasks() {
 }
 
 #[test]
+fn session_persistent_lifetime_reuse_orders_physical_dependencies() {
+    let gpu = crate::support::gpu::gpu();
+    let mut graph = meganeura::Graph::new();
+    let x = graph.input("x", &[8193]);
+    let a = graph.neg(x);
+    let e = graph.relu(x);
+    let extra = graph.abs(x);
+    let b = graph.neg(a);
+    let f = graph.neg(e);
+    let c = graph.neg(f);
+    let h = graph.neg(c);
+    graph.set_outputs(vec![e, extra, b, h]);
+    let plan = meganeura::compile::compile_with(
+        &graph,
+        &meganeura::CompileOptions {
+            fuse_dispatches: false,
+            ..Default::default()
+        },
+    );
+    let options = meganeura::SessionOptions {
+        persistent: None,
+        no_alias: true,
+        poison: true,
+        ..meganeura::SessionOptions::from_env()
+    };
+    let mut ordinary =
+        meganeura::Session::with_context_opts(plan.clone(), gpu.clone(), options.clone());
+    for device_scheduling in [false, true] {
+        if device_scheduling && !gpu.capabilities().device_memory_fence {
+            continue;
+        }
+        for workers in [1, 3, 64, 4096] {
+            let mut session = meganeura::Session::with_context_opts(
+                plan.clone(),
+                gpu.clone(),
+                meganeura::SessionOptions {
+                    no_alias: false,
+                    persistent: Some(meganeura::PersistentOptions {
+                        workers,
+                        device_scheduling,
+                        allow_fallback: false,
+                        track_workers: true,
+                    }),
+                    ..options.clone()
+                },
+            );
+            assert!(
+                session.memory_summary().allocated_buffer_bytes
+                    < ordinary.memory_summary().allocated_buffer_bytes
+            );
+            assert!(
+                session.memory_summary().num_allocations
+                    < ordinary.memory_summary().num_allocations
+            );
+            if device_scheduling {
+                // C reuses A's allocation while B reads A. There is no logical
+                // edge B -> C; the native region must add that physical WAR edge.
+                assert!(session.execution_report().regions.iter().any(|region| {
+                    region.device_scheduled
+                        && region.origin.contains(&b)
+                        && region.origin.contains(&c)
+                }));
+            }
+            session.set_submission_chunks(3);
+            for replay in 0..3 {
+                let input: Vec<_> = (0..8193)
+                    .map(|i| ((i * 17 + replay * 31) % 101) as f32 - 50.0)
+                    .collect();
+                ordinary.set_input("x", &input);
+                ordinary.step();
+                session.set_input("x", &input);
+                if replay < 2 {
+                    session.step();
+                } else {
+                    let mut encoder =
+                        gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
+                            name: "persistent allocation reuse replay",
+                            buffer_count: 1,
+                            manual_barriers: false,
+                        });
+                    encoder.start();
+                    session.record(&mut encoder).unwrap();
+                    session.record(&mut encoder).unwrap();
+                    let sync = gpu.submit(&mut encoder);
+                    session.track_submission(sync);
+                    session.wait();
+                    gpu.destroy_command_encoder(&mut encoder);
+                }
+                check_worker_tasks(&mut session);
+                for index in 0..4 {
+                    let mut expected = vec![f32::NAN; input.len()];
+                    let mut actual = expected.clone();
+                    ordinary.read_output_by_index(index, &mut expected);
+                    session.read_output_by_index(index, &mut actual);
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn session_persistent_owned_chains_keep_tile_dependencies_local() {
     let gpu = crate::support::gpu::gpu();
     let mut graph = meganeura::Graph::new();
