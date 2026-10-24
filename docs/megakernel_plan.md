@@ -423,9 +423,13 @@ dependent handoffs an opportunity to retain workers while preserving bounded
 execution without a residency assumption. All five focused Session checks pass
 on NVIDIA and lavapipe, including 4,096 workers. NVIDIA again passes 168 oracle,
 182 regression, 72 smoke and 22 GGUF tests (21 regression and two smoke tests
-ignored); strict all-target Clippy and formatting pass. Model measurements will
-check worker utilization and completed latency; CI has no native device regions
-and its execution path is unchanged.
+ignored); strict all-target Clippy and formatting pass. At clean `a2dc351`, 50
+model pairs passed exact full-state comparisons. Median paired ratios were
+1.091 forward and 1.139 training, with substantial training outliers retained.
+Separate diagnostics show the 194-task native region using 60 workers instead
+of three. Ordinary remains faster; [results](megakernel_device_results.md#bounded-idle-retries)
+record the distributions. CI has no native regions and its unchanged execution
+path was not remeasured.
 
 The device queue uses the same Session work descriptors, tracking ready tasks,
 predecessor counts, unfinished work and successor edges on the GPU. It releases

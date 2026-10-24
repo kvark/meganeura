@@ -23,7 +23,7 @@ The CI boundary includes upload, completed execution and output/loss readback;
 SmolVLA measures completed execution with uploads and readback outside timing.
 The model is the same deterministic random-weight, 16-layer base action expert
 used in [Milestone 1](megakernel_session_results.md), with action length 50 and
-VLM sequence length 16. Training includes SGD at learning rate 0.001.
+VLM sequence length 16. SGD learning rates are 0.001 for CI and 1e-5 for SmolVLA.
 
 | Case | Ordinary median ms | Device median ms | Median paired ratio | Ordinary/device p95 ms | Graph launches |
 |---|---:|---:|---:|---:|---:|
@@ -157,3 +157,37 @@ identity, full distributions, coverage and diagnostics:
 | `device-selective-smolvla-paired.json` | `0a05cb542b296bd03e260d2c487ae46e8bb5a0685b024febc49859eabf5dd139` |
 | `device-selective-ci-diagnostic.json` | `5914316fff5c6fca71a6ed3532ef1e123f8cf8239189b56bc2eadd88308fe33c` |
 | `device-selective-smolvla-diagnostic.json` | `f58229e054a3f0a33d4c6d57ab9057e4e00e060e1dba672be649f79a3f3cf30e` |
+
+## Bounded idle retries
+
+Clean commit `a2dc351` permits 64 unsuccessful ready scans before retirement,
+with earlier exit when no tasks remain. The same 50-pair model procedure and
+separate ten-pair diagnostics were repeated. CI was not repeated because it
+contains no native regions and its execution path is unchanged. All full
+output, gradient, updated-parameter and queue-completion checks passed exactly.
+Coverage, launch boundaries and primary residency are unchanged.
+
+| Case | Ordinary median ms | Selected-path median ms | Median paired ratio | Ordinary/selected p95 ms |
+|---|---:|---:|---:|---:|
+| SmolVLA forward | 4.40998 | 4.85037 | 1.091 | 4.85238 / 5.27048 |
+| SmolVLA forward/backward/SGD | 15.40930 | 17.55240 | 1.139 | 80.09333 / 85.00842 |
+
+Forward IQRs were 3.74203–4.50464 ms ordinary and 4.08145–4.99782 ms selected.
+Training IQRs were 12.98529–74.05009 and 17.17648–81.35342 ms; its paired-ratio
+IQR was 1.063–1.365, with p95 6.968. These large timing outliers limit conclusions
+about the training improvement relative to the previous run. Construction was
+55.60/112.76 ms forward and 75.84/123.46 ms training, subject to the same
+shared-context and cache caveat.
+
+Diagnostic median GPU intervals were 3.46770/3.79272 ms forward and
+14.36165/16.42907 ms training. In each final diagnostic step the 194-task
+bias/bias/RMSNorm region used 60 workers, compared with three before retries.
+The smaller native regions used 12 forward workers and five/16 training workers;
+every histogram total matched its task count. This supports retaining bounded
+retries to improve task distribution, while ordinary execution remains faster
+and remains the default. Broader operator coverage is the next step.
+
+| Record | SHA-256 |
+|---|---|
+| `device-retry-smolvla-paired.json` | `7803fd294005d70718012097be4c975d37103e89e45d786708f9ca7f49d47ddc` |
+| `device-retry-smolvla-diagnostic.json` | `feab04019b2df8068751ae9279a2f68f3b99408f84cb8a6cbc8342f229eac7c1` |
