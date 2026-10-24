@@ -1877,6 +1877,46 @@ impl Pipelines {
         key: &Variant,
         coop_config: Option<&crate::codegen::CoopConfig>,
     ) -> Result<Arc<SharedPipeline>, String> {
+        let (module, layout, entry_point) = Self::generate(gpu, knobs, dispatch, key, coop_config)?;
+        // Every module a session compiles — the standard, coop, weighted,
+        // epilogue-fused and scheduled forms alike — passes through here, so
+        // the dump sees exactly what a plan would run, shared or not.
+        if let Some(dir) = dump_dir {
+            module.dump(dir);
+        }
+        let shared_key = SharedPipelineKey {
+            context: Arc::as_ptr(gpu) as usize,
+            entry_point,
+            layout: format!("{:?}", layout.bindings),
+            source: module.source.clone(),
+        };
+        if let Some(pipeline) = SharedPipelines::get(&shared_key) {
+            return Ok(pipeline);
+        }
+        let shader = create_gen_shader(gpu, module)?;
+        let pipeline = Arc::new(SharedPipeline {
+            gpu: Arc::clone(gpu),
+            raw: create_profiled_pipeline(gpu, key.label(), &layout, shader.at(entry_point)),
+        });
+        SharedPipelines::insert(shared_key, &pipeline);
+        Ok(pipeline)
+    }
+
+    /// One implementation selector supplies both ordinary and persistent code.
+    fn generate(
+        gpu: &Gpu,
+        knobs: crate::compile::TuningKnobs,
+        dispatch: &Dispatch,
+        key: &Variant,
+        coop_config: Option<&crate::codegen::CoopConfig>,
+    ) -> Result<
+        (
+            crate::codegen::ShaderModule,
+            blade_graphics::ShaderDataLayout,
+            &'static str,
+        ),
+        String,
+    > {
         use crate::codegen::ShaderGroup;
         let mut matmul_knobs = crate::codegen::MatmulKnobs {
             k_stage: knobs.matmul_k_stage,
@@ -2161,28 +2201,7 @@ impl Pipelines {
                 crate::codegen::generate_horizontal_matmul(group, count, coop.as_ref())
             }
         };
-        // Every module a session compiles — the standard, coop, weighted,
-        // epilogue-fused and scheduled forms alike — passes through here, so
-        // the dump sees exactly what a plan would run, shared or not.
-        if let Some(dir) = dump_dir {
-            module.dump(dir);
-        }
-        let shared_key = SharedPipelineKey {
-            context: Arc::as_ptr(gpu) as usize,
-            entry_point,
-            layout: format!("{:?}", layout.bindings),
-            source: module.source.clone(),
-        };
-        if let Some(pipeline) = SharedPipelines::get(&shared_key) {
-            return Ok(pipeline);
-        }
-        let shader = create_gen_shader(gpu, module)?;
-        let pipeline = Arc::new(SharedPipeline {
-            gpu: Arc::clone(gpu),
-            raw: create_profiled_pipeline(gpu, key.label(), &layout, shader.at(entry_point)),
-        });
-        SharedPipelines::insert(shared_key, &pipeline);
-        Ok(pipeline)
+        Ok((module, layout, entry_point))
     }
 
     fn attention_head_dim(dispatch: &Dispatch) -> Option<u32> {

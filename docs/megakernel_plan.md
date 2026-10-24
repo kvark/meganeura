@@ -431,6 +431,13 @@ of three. Ordinary remains faster; [results](megakernel_device_results.md#bounde
 record the distributions. CI has no native regions and its unchanged execution
 path was not remeasured.
 
+Handler-coverage preparation separates the existing implementation generator
+from pipeline creation and routes ordinary and persistent bindings through the
+same function with an explicit group index. Selection, arithmetic and coverage
+are unchanged. NVIDIA passes 168 oracle and 72 smoke tests (two ignored), plus
+the five focused Session checks after routing persistent bindings through the
+shared function. Strict all-target Clippy and formatting pass.
+
 The device queue uses the same Session work descriptors, tracking ready tasks,
 predecessor counts, unfinished work and successor edges on the GPU. It releases
 consumers after whole-operation completion; measure whether tile-level

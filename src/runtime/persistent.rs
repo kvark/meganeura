@@ -779,12 +779,7 @@ impl State {
         let mut pc = pass.with(&pipeline.raw);
         let region = &self.report.regions[index];
         for (slot, operation) in region.dispatches.clone().enumerate() {
-            assert!(Session::bind_generated_dispatch(
-                buffers,
-                &plan.dispatches[operation],
-                &mut pc,
-                slot as u32
-            ));
+            Session::bind_dispatch_at(buffers, &plan.dispatches[operation], &mut pc, slot as u32);
         }
         pc.bind(
             region.dispatches.len() as u32,

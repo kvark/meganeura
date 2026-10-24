@@ -170,6 +170,16 @@ impl Session {
         dispatch: &Dispatch,
         pc: &mut impl blade_graphics::traits::PipelineEncoder,
     ) {
+        Self::bind_dispatch_at(buffers, dispatch, pc, 0);
+    }
+
+    /// Preserve the ordinary binding contract at any region's data-group slot.
+    pub(super) fn bind_dispatch_at(
+        buffers: &[blade_graphics::BufferPiece],
+        dispatch: &Dispatch,
+        pc: &mut impl blade_graphics::traits::PipelineEncoder,
+        group: u32,
+    ) {
         let buf = |r: BufferRef| buffers[r.0 as usize];
         let mnk = || {
             dispatch
@@ -186,7 +196,7 @@ impl Session {
             pieces.extend(dispatch.extra_outputs.iter().map(|&r| buf(r)));
             let (m, n, k) = mnk();
             pc.bind(
-                0,
+                group,
                 &HorizMatMulData {
                     buffers: pieces,
                     params: MatMulParams { m, n, k, _pad: 0 },
@@ -199,7 +209,7 @@ impl Session {
         if let Some(ref rn) = dispatch.gemv_rmsnorm {
             let (m, n, k) = mnk();
             pc.bind(
-                0,
+                group,
                 &MatMulRmsNormData {
                     matrix_a: buf(dispatch.input_buffers[0]),
                     norm_w: buf(rn.weight),
@@ -215,7 +225,7 @@ impl Session {
             );
             return;
         }
-        if Self::bind_generated_dispatch(buffers, dispatch, pc, 0) {
+        if Self::bind_generated_dispatch(buffers, dispatch, pc, group) {
             return;
         }
         // Prologue-fused coop matmul: 2-factor prologue (RmsNorm rsqrt + w_norm).
@@ -226,7 +236,7 @@ impl Session {
                     .mnk()
                     .expect("a fused prologue is attached to a contraction");
                 pc.bind(
-                    0,
+                    group,
                     &MatMulPrologue2Data {
                         matrix_a: buf(dispatch.input_buffers[0]),
                         matrix_b: buf(dispatch.input_buffers[1]),
@@ -252,7 +262,7 @@ impl Session {
             | ShaderEntry::BatchMatMulBT => {
                 let (m, n, k) = mnk();
                 pc.bind(
-                    0,
+                    group,
                     &MatMulData {
                         matrix_a: buf(dispatch.input_buffers[0]),
                         matrix_b: buf(dispatch.input_buffers[1]),
@@ -272,7 +282,7 @@ impl Session {
             | ShaderEntry::MatMulBT
             | ShaderEntry::MatMulGemvBT => {
                 pc.bind(
-                    0,
+                    group,
                     &MatMulData {
                         matrix_a: buf(dispatch.input_buffers[0]),
                         matrix_b: buf(dispatch.input_buffers[1]),
@@ -287,7 +297,7 @@ impl Session {
             | ShaderEntry::FusedMatMulBTAdd
             | ShaderEntry::MatMulGemvBTAdd => {
                 pc.bind(
-                    0,
+                    group,
                     &FusedMatMulAddData {
                         matrix_a: buf(dispatch.input_buffers[0]),
                         matrix_b: buf(dispatch.input_buffers[1]),
@@ -299,7 +309,7 @@ impl Session {
             }
             ShaderEntry::ToF16 | ShaderEntry::ToBF16 | ShaderEntry::FromBF16 => {
                 pc.bind(
-                    0,
+                    group,
                     &UnaryData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
@@ -317,7 +327,7 @@ impl Session {
             | ShaderEntry::GeGLUConcat
             | ShaderEntry::GeGLUConcatGrad => {
                 pc.bind(
-                    0,
+                    group,
                     &BinaryData {
                         src_a: buf(dispatch.input_buffers[0]),
                         src_b: buf(dispatch.input_buffers[1]),
@@ -333,7 +343,7 @@ impl Session {
             }
             ShaderEntry::PairwiseGrad => {
                 pc.bind(
-                    0,
+                    group,
                     &TernaryData {
                         src_a: buf(dispatch.input_buffers[0]),
                         src_b: buf(dispatch.input_buffers[1]),
@@ -350,7 +360,7 @@ impl Session {
             }
             ShaderEntry::SumAll | ShaderEntry::MeanAll => {
                 pc.bind(
-                    0,
+                    group,
                     &UnaryData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
@@ -366,7 +376,7 @@ impl Session {
             ShaderEntry::SumRows => {
                 // Rows, columns, and optional serial-row layout.
                 pc.bind(
-                    0,
+                    group,
                     &UnaryData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
@@ -386,7 +396,7 @@ impl Session {
                     .copied()
                     .unwrap_or(dispatch.output_buffer);
                 pc.bind(
-                    0,
+                    group,
                     &CrossEntropyData {
                         logits: buf(dispatch.input_buffers[0]),
                         labels: buf(dispatch.input_buffers[1]),
@@ -403,7 +413,7 @@ impl Session {
             }
             ShaderEntry::BceLoss => {
                 pc.bind(
-                    0,
+                    group,
                     &BceData {
                         pred: buf(dispatch.input_buffers[0]),
                         labels: buf(dispatch.input_buffers[1]),
@@ -419,7 +429,7 @@ impl Session {
             }
             ShaderEntry::Transpose => {
                 pc.bind(
-                    0,
+                    group,
                     &TransposeData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
@@ -434,7 +444,7 @@ impl Session {
             }
             ShaderEntry::RmsNormAdd => {
                 pc.bind(
-                    0,
+                    group,
                     &RmsNormAddData {
                         src: buf(dispatch.input_buffers[0]),
                         bias: buf(dispatch.input_buffers[1]),
@@ -451,7 +461,7 @@ impl Session {
             }
             ShaderEntry::Embedding => {
                 pc.bind(
-                    0,
+                    group,
                     &EmbeddingData {
                         indices: buf(dispatch.input_buffers[0]),
                         src: buf(dispatch.input_buffers[1]),
@@ -467,7 +477,7 @@ impl Session {
             }
             ShaderEntry::RoPE | ShaderEntry::RoPEGrad => {
                 pc.bind(
-                    0,
+                    group,
                     &RoPEData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
@@ -478,7 +488,7 @@ impl Session {
             }
             ShaderEntry::LayerNorm => {
                 pc.bind(
-                    0,
+                    group,
                     &LayerNormData {
                         src: buf(dispatch.input_buffers[0]),
                         src_b: buf(dispatch.input_buffers[1]),
@@ -498,7 +508,7 @@ impl Session {
             | ShaderEntry::FlashAttentionCoop
             | ShaderEntry::FlashAttentionCoopF32 => {
                 pc.bind(
-                    0,
+                    group,
                     &MultiHeadAttnData {
                         src_a: buf(dispatch.input_buffers[0]),
                         src_b: buf(dispatch.input_buffers[1]),
@@ -515,7 +525,7 @@ impl Session {
                 ..
             }) => {
                 pc.bind(
-                    0,
+                    group,
                     &MultiHeadAttnGradKVData {
                         d_out: buf(dispatch.input_buffers[0]),
                         src_a: buf(dispatch.input_buffers[1]),
@@ -535,7 +545,7 @@ impl Session {
                 ..
             }) => {
                 pc.bind(
-                    0,
+                    group,
                     &MultiHeadAttnGradData {
                         d_out: buf(dispatch.input_buffers[0]),
                         src_a: buf(dispatch.input_buffers[1]),
@@ -551,7 +561,7 @@ impl Session {
             }
             ShaderEntry::SwiGLUGradGate => {
                 pc.bind(
-                    0,
+                    group,
                     &TernaryData {
                         src_a: buf(dispatch.input_buffers[0]), // grad_out
                         src_b: buf(dispatch.input_buffers[1]), // gate
@@ -568,7 +578,7 @@ impl Session {
             }
             ShaderEntry::SwiGLUGradUp => {
                 pc.bind(
-                    0,
+                    group,
                     &BinaryData {
                         src_a: buf(dispatch.input_buffers[0]), // grad_out
                         src_b: buf(dispatch.input_buffers[1]), // gate
@@ -584,7 +594,7 @@ impl Session {
             }
             ShaderEntry::SiluGrad => {
                 pc.bind(
-                    0,
+                    group,
                     &BinaryData {
                         src_a: buf(dispatch.input_buffers[0]), // grad_out
                         src_b: buf(dispatch.input_buffers[1]), // x
@@ -602,7 +612,7 @@ impl Session {
             | ShaderEntry::RmsNormGradWRowPar
             | ShaderEntry::RmsNormGradX => {
                 pc.bind(
-                    0,
+                    group,
                     &FourBufData {
                         src_a: buf(dispatch.input_buffers[0]), // dy
                         src_b: buf(dispatch.input_buffers[1]), // x
@@ -619,7 +629,7 @@ impl Session {
             }
             ShaderEntry::LayerNormGradWB | ShaderEntry::LayerNormGradX => {
                 pc.bind(
-                    0,
+                    group,
                     &FourBufData {
                         src_a: buf(dispatch.input_buffers[0]), // dy
                         src_b: buf(dispatch.input_buffers[1]), // x
@@ -637,7 +647,7 @@ impl Session {
             ShaderEntry::RmsNormRsqrt => {
                 // bindings: src=X, dst=rsqrt, params=(rows, cols, eps_bits, _pad)
                 pc.bind(
-                    0,
+                    group,
                     &UnaryData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
@@ -664,7 +674,7 @@ impl Session {
             }
             ShaderEntry::ScatterAdd => {
                 pc.bind(
-                    0,
+                    group,
                     &ScatterAddData {
                         indices: buf(dispatch.input_buffers[0]),
                         src: buf(dispatch.input_buffers[1]),
@@ -680,7 +690,7 @@ impl Session {
             }
             ShaderEntry::ScatterAddAtomic => {
                 pc.bind(
-                    0,
+                    group,
                     &ScatterAddAtomicData {
                         indices: buf(dispatch.input_buffers[0]),
                         src: buf(dispatch.input_buffers[1]),
@@ -702,7 +712,7 @@ impl Session {
             ShaderEntry::GroupNorm | ShaderEntry::GroupNormSilu => {
                 let p = &dispatch.params;
                 pc.bind(
-                    0,
+                    group,
                     &GroupNormData {
                         src: buf(dispatch.input_buffers[0]),
                         src_b: buf(dispatch.input_buffers[1]),
@@ -724,7 +734,7 @@ impl Session {
             ShaderEntry::GroupNormStats => {
                 let p = &dispatch.params;
                 pc.bind(
-                    0,
+                    group,
                     &GroupNormStatsData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
@@ -744,7 +754,7 @@ impl Session {
             ShaderEntry::GroupNormApply => {
                 let p = &dispatch.params;
                 pc.bind(
-                    0,
+                    group,
                     &GroupNormApplyData {
                         src: buf(dispatch.input_buffers[0]),
                         src_b: buf(dispatch.input_buffers[2]),
@@ -778,7 +788,7 @@ impl Session {
                     _ => (inputs[0], inputs[0], inputs[0], inputs[0]),
                 };
                 pc.bind(
-                    0,
+                    group,
                     &GroupNormGradData {
                         src_a: buf(src_a),
                         src_b: buf(src_b),
@@ -801,7 +811,7 @@ impl Session {
             ShaderEntry::Concat => {
                 let p = &dispatch.params;
                 pc.bind(
-                    0,
+                    group,
                     &BinaryData {
                         src_a: buf(dispatch.input_buffers[0]),
                         src_b: buf(dispatch.input_buffers[1]),
@@ -819,7 +829,7 @@ impl Session {
                 let p = &dispatch.params;
                 let input = |i: usize| buf(dispatch.input_buffers[i]);
                 pc.bind(
-                    0,
+                    group,
                     &super::BiasedAttentionData {
                         q: input(0),
                         k: input(1),
@@ -834,7 +844,7 @@ impl Session {
             ShaderEntry::Permute => {
                 let p = &dispatch.params;
                 pc.bind(
-                    0,
+                    group,
                     &super::PermuteData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
@@ -849,7 +859,7 @@ impl Session {
             ShaderEntry::SplitA | ShaderEntry::SplitB => {
                 let p = &dispatch.params;
                 pc.bind(
-                    0,
+                    group,
                     &UnaryData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
@@ -865,7 +875,7 @@ impl Session {
             ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => {
                 let p = &dispatch.params;
                 pc.bind(
-                    0,
+                    group,
                     &UnaryData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
@@ -881,7 +891,7 @@ impl Session {
             ShaderEntry::MulPerChannel => {
                 let p = &dispatch.params;
                 pc.bind(
-                    0,
+                    group,
                     &MulPerChannelData {
                         src: buf(dispatch.input_buffers[0]),
                         gate: buf(dispatch.input_buffers[1]),
@@ -898,7 +908,7 @@ impl Session {
             ShaderEntry::Conv2dDw => {
                 let p = &dispatch.params;
                 pc.bind(
-                    0,
+                    group,
                     &Conv2dDwData {
                         src: buf(dispatch.input_buffers[0]),
                         weight: buf(dispatch.input_buffers[1]),
@@ -926,7 +936,7 @@ impl Session {
             | ShaderEntry::Conv2dGemm16
             | ShaderEntry::Conv2dGemmCoopGen(..) => {
                 pc.bind(
-                    0,
+                    group,
                     &Conv2dData {
                         src: buf(dispatch.input_buffers[0]),
                         weight: buf(dispatch.input_buffers[1]),
@@ -940,7 +950,7 @@ impl Session {
             | ShaderEntry::Conv2dGradInputGemm16
             | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => {
                 pc.bind(
-                    0,
+                    group,
                     &Conv2dGradInputData {
                         grad_out: buf(dispatch.input_buffers[0]),
                         weight: buf(dispatch.input_buffers[1]),
@@ -956,7 +966,7 @@ impl Session {
             | ShaderEntry::Conv2dGradWeightGemmSplitSmall
             | ShaderEntry::Conv2dGradWeightGemmSplit16 => {
                 pc.bind(
-                    0,
+                    group,
                     &Conv2dGradWeightData {
                         grad_out: buf(dispatch.input_buffers[0]),
                         src: buf(dispatch.input_buffers[1]),
@@ -967,7 +977,7 @@ impl Session {
             }
             ShaderEntry::RoPEDynamicFactors => {
                 pc.bind(
-                    0,
+                    group,
                     &RoPEDynamicFactorsData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
@@ -980,7 +990,7 @@ impl Session {
             }
             ShaderEntry::RoPEDynamic | ShaderEntry::RoPEPositions | ShaderEntry::AxialRoPE => {
                 pc.bind(
-                    0,
+                    group,
                     &RoPEDynamicData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
@@ -992,7 +1002,7 @@ impl Session {
             }
             ShaderEntry::CacheWrite => {
                 pc.bind(
-                    0,
+                    group,
                     &CacheWriteData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
@@ -1008,7 +1018,7 @@ impl Session {
             }
             ShaderEntry::CacheWritePrefix => {
                 pc.bind(
-                    0,
+                    group,
                     &CacheWritePrefixData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
@@ -1025,7 +1035,7 @@ impl Session {
             }
             ShaderEntry::CachedAttention | ShaderEntry::CachedQueryAttention => {
                 pc.bind(
-                    0,
+                    group,
                     &CachedAttentionData {
                         src_a: buf(dispatch.input_buffers[0]),      // Q
                         src_b: buf(dispatch.input_buffers[1]),      // K cache
@@ -1045,7 +1055,7 @@ impl Session {
             }
             ShaderEntry::CachedBlockAttention | ShaderEntry::CachedBlockAttentionSplit => {
                 pc.bind(
-                    0,
+                    group,
                     &CachedBlockAttentionData {
                         src_a: buf(dispatch.input_buffers[0]),
                         src_b: buf(dispatch.input_buffers[1]),
@@ -1060,7 +1070,7 @@ impl Session {
             }
             ShaderEntry::CachedBlockAttentionCombine => {
                 pc.bind(
-                    0,
+                    group,
                     &CachedBlockAttentionCombineData {
                         partials: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
@@ -1071,7 +1081,7 @@ impl Session {
             }
             ShaderEntry::ChunkedRelativeAttention => {
                 pc.bind(
-                    0,
+                    group,
                     &ChunkedRelativeAttentionData {
                         src_a: buf(dispatch.input_buffers[0]),
                         src_b: buf(dispatch.input_buffers[1]),
@@ -1093,7 +1103,7 @@ impl Session {
             }
             ShaderEntry::PrefixLast => {
                 pc.bind(
-                    0,
+                    group,
                     &PrefixLastData {
                         src: buf(dispatch.input_buffers[0]),
                         valid_len_buf: buf(dispatch.input_buffers[1]),
@@ -1109,7 +1119,7 @@ impl Session {
             }
             ShaderEntry::MaxPool2d => {
                 pc.bind(
-                    0,
+                    group,
                     &MaxPool2dData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
@@ -1133,7 +1143,7 @@ impl Session {
             ShaderEntry::MaxPool2dGrad => {
                 let p = &dispatch.params;
                 pc.bind(
-                    0,
+                    group,
                     &MaxPool2dGradData {
                         grad_out: buf(dispatch.input_buffers[0]),
                         src: buf(dispatch.input_buffers[1]),
@@ -1157,7 +1167,7 @@ impl Session {
             }
             ShaderEntry::GlobalAvgPool => {
                 pc.bind(
-                    0,
+                    group,
                     &GlobalAvgPoolData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
@@ -1173,7 +1183,7 @@ impl Session {
             ShaderEntry::GlobalAvgPoolGrad => {
                 let p = &dispatch.params;
                 pc.bind(
-                    0,
+                    group,
                     &UnaryData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
@@ -1188,7 +1198,7 @@ impl Session {
             }
             ShaderEntry::WinogradInputTransform => {
                 pc.bind(
-                    0,
+                    group,
                     &WinogradInputData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
@@ -1199,7 +1209,7 @@ impl Session {
             }
             ShaderEntry::WinogradWeightTransform => {
                 pc.bind(
-                    0,
+                    group,
                     &WinogradWeightData {
                         src: buf(dispatch.input_buffers[0]),
                         dst: buf(dispatch.output_buffer),
@@ -1213,7 +1223,7 @@ impl Session {
                     .expect("Winograd output transform parameters");
                 if fused {
                     pc.bind(
-                        0,
+                        group,
                         &WinogradOutputAddData {
                             src: buf(dispatch.input_buffers[0]),
                             dst: buf(dispatch.output_buffer),
@@ -1223,7 +1233,7 @@ impl Session {
                     );
                 } else {
                     pc.bind(
-                        0,
+                        group,
                         &WinogradOutputData {
                             src: buf(dispatch.input_buffers[0]),
                             dst: buf(dispatch.output_buffer),
@@ -1234,7 +1244,7 @@ impl Session {
             }
             ShaderEntry::WinogradBatchedMatMul => {
                 pc.bind(
-                    0,
+                    group,
                     &MatMulData {
                         matrix_a: buf(dispatch.input_buffers[0]),
                         matrix_b: buf(dispatch.input_buffers[1]),
