@@ -190,6 +190,7 @@ fn check_resources(
         return Err("region exceeds device bind-group limit".into());
     }
     let mut storage = 1;
+    let mut buffer_bindings = 2;
     let mut plain = std::mem::size_of::<Params>() as u32;
     let mut shared = 4u64;
     let mut tasks = 0u64;
@@ -199,8 +200,14 @@ fn check_resources(
         }
         for entry in &handler.layout.bindings {
             match entry.1 {
-                bg::ShaderBinding::Buffer => storage += 1,
-                bg::ShaderBinding::Plain { size } => plain += size,
+                bg::ShaderBinding::Buffer => {
+                    storage += 1;
+                    buffer_bindings += 1;
+                }
+                bg::ShaderBinding::Plain { size } => {
+                    plain += size;
+                    buffer_bindings += 1;
+                }
                 _ => return Err("handler has an unsupported resource binding".into()),
             }
         }
@@ -217,7 +224,10 @@ fn check_resources(
             }
         }
     }
-    if storage > limits.max_storage_buffers || plain > bg::limits::PLAIN_DATA_SIZE {
+    if storage > limits.max_storage_buffers
+        || plain > bg::limits::PLAIN_DATA_SIZE
+        || buffer_bindings > limits.max_buffer_bindings
+    {
         return Err("region exceeds buffer or plain-data binding limit".into());
     }
     if shared > u64::from(caps.max_compute_shared_memory_size) {

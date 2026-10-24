@@ -41,8 +41,8 @@ dispatch selection disables chaining. This needs no device-wide fence,
 spinning wait, or assumption about simultaneous worker residency.
 
 Regions are planned after storage allocation, with checks for device binding
-limits, binding ranges, shared-memory use, and physical overlap. Vulkan reports
-these limits; unreported backend limits produce explicit fallback or strict
+limits, binding ranges, shared-memory use, and physical overlap. Vulkan and Metal
+report these limits; unreported backend limits produce explicit fallback or strict
 rejection. Session buffers are bound directly, including parameter sharing and
 external rebindings. Rebinding rebuilds the regions. Sessions with imported
 storage retain one operation per launch because separate imported handles may

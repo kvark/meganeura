@@ -67,7 +67,7 @@ Implementation evidence:
   This preparation still uses single-operation regions. All six profiling
   tests passed in ordinary and persistent configurations, alongside the
   focused Session checks and all-target/all-feature Clippy.
-- Blade is pinned to `6af8c5783becd798ceaad25f3101935040241f31`
+- Blade was first pinned to `6af8c5783becd798ceaad25f3101935040241f31`
   ([dependency branch](https://github.com/kvark/blade/tree/meganeura-compute-limits)).
   Its Vulkan capabilities now report storage-buffer counts, bound group counts
   and storage binding ranges for resource-aware region composition. Other
@@ -101,6 +101,15 @@ Implementation evidence:
   182 regression, 70 smoke and 22 GGUF tests (21 regression/two smoke ignored);
   all four focused Session checks also passed on lavapipe. All-target/all-feature
   Clippy passed. Paired production benchmarking is the remaining Milestone 1 gate.
+- Blade now uses `7a20f25eb0d63591611c9622cb8391b5f88f88a4`. Metal reports
+  its buffer capacity with a slot reserved for Blade's size table, including
+  the combined storage/plain-data budget now checked by region planning.
+  Blade's unit tests/Clippy and Apple-target compilation passed; Meganeura's
+  core/models/GGUF/profiler library also passed Apple-target compilation.
+  Full all-target/all-feature cross-compilation hit C dependencies requiring
+  an Apple toolchain/SDK. Metal GPU execution is not qualified by these checks.
+  All four focused Session tests passed on NVIDIA with the new pin, alongside
+  all-target/all-feature Clippy. Naga is unchanged.
 
 The objective is to run Meganeura graphs through persistent GPU workers using
 the ordinary `Graph` / `build` / `Session` interface, and qualify them with the
@@ -229,7 +238,9 @@ or a blanket strengthening of all atomics.
 
 At the current pins, Meganeura and Blade both use Naga
 `a489554c96f87cbc5252ee00350730f6e93869f9`; Blade is
-`eae0c6f7aa3167c79d1135050cf8e17c17fabd0a`. Source inspection already shows:
+`7a20f25eb0d63591611c9622cb8391b5f88f88a4`. The initial source inspection
+used Blade `eae0c6f7aa3167c79d1135050cf8e17c17fabd0a`; the intervening changes
+only expose compute resource limits. Source inspection already shows:
 
 - The WGSL frontend accepts `enable wgpu_memory_fence;` and lowers
   `storageFence()` / `workgroupFence()` to `Statement::MemoryBarrier`.
