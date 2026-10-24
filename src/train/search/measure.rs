@@ -38,6 +38,13 @@ pub(super) trait Frontier {
     fn observe(&mut self, _origin: Origin, _qualified: bool) {}
     /// Whether a later call could still return a program.
     fn may_remain(&self) -> bool;
+    /// Arithmetic alternatives that should get a comparison opportunity before
+    /// spending the deadline on layout/submission exploration. Zero preserves
+    /// the ordinary tuning allocation. This is a reservation, not a guarantee:
+    /// construction and in-flight GPU work cannot be preempted.
+    fn early_programs_remaining(&self, _incumbent: Option<Origin>) -> usize {
+        0
+    }
 }
 
 impl<I: Iterator<Item = Program>> Frontier for std::iter::Fuse<I> {
@@ -69,6 +76,9 @@ pub struct BuildSearchTrial {
     /// Time left for whole-program warmup, paired sampling and qualification
     /// when assigning the private kernel budget. An estimate, not extra time.
     pub comparison_time_reserved: Duration,
+    /// Pending early arithmetic programs sharing this trial's private kernel
+    /// budget. Capped by the remaining program slots; all must still qualify.
+    pub early_programs_reserved: usize,
     /// Absent for the initial, untuned fallback.
     pub kernel_tuning: Option<TuneReport>,
     pub outcome: TuneOutcome<(), usize>,
@@ -210,6 +220,18 @@ fn comparison_exceeds_deadline(
         .is_some_and(|&cost| elapsed + cost > max_time)
 }
 
+fn kernel_probe_budget(
+    available: Duration,
+    comparison: Duration,
+    early_programs: usize,
+) -> Duration {
+    let slots = early_programs.saturating_add(1).min(u32::MAX as usize) as u32;
+    // Keep comparison time for this trial and each early alternative, then
+    // share only the remaining private-probe time. The final qualification
+    // reservation has already been subtracted from `available` by the caller.
+    available.saturating_sub(comparison.saturating_mul(slots)) / slots
+}
+
 pub(super) fn select(
     mut programs: impl Frontier,
     gpu: Arc<blade_graphics::Context>,
@@ -288,10 +310,11 @@ pub(super) fn select(
             break;
         }
         let lowering = Instant::now();
-        // Cover the first layouts, then alternate the two frontiers so submission
-        // probes cannot consume the program budget before useful layouts arrive.
+        // Cover early arithmetic and the first layouts, then alternate so
+        // submission probes cannot consume the budget before useful layouts arrive.
         let program = pending_tuned.take().or_else(|| {
-            (index < super::INITIAL_LAYOUTS + usize::from(initial_tuning_queued)
+            (programs.early_programs_remaining(incumbent_origin) > 0
+                || index < super::INITIAL_LAYOUTS + usize::from(initial_tuning_queued)
                 || !probe_submission)
                 .then(|| programs.next(incumbent_origin))
                 .flatten()
@@ -337,6 +360,7 @@ pub(super) fn select(
             qualification_time: Duration::ZERO,
             qualifications: 0,
             comparison_time_reserved: Duration::ZERO,
+            early_programs_reserved: 0,
             kernel_tuning: None,
             outcome: TuneOutcome::new((), program.plan.dispatches.len(), report.selected, index),
         };
@@ -409,11 +433,14 @@ pub(super) fn select(
                         .max(trial.qualification_time / trial.qualifications.max(1));
                     trial.comparison_time_reserved =
                         comparison_reserve(&options, step, qualification);
-                    policy.max_time = policy.max_time.min(
-                        search_time
-                            .saturating_sub(start.elapsed())
-                            .saturating_sub(trial.comparison_time_reserved),
-                    );
+                    trial.early_programs_reserved = programs
+                        .early_programs_remaining(incumbent_origin)
+                        .min(options.max_programs - index - 1);
+                    policy.max_time = policy.max_time.min(kernel_probe_budget(
+                        search_time.saturating_sub(start.elapsed()),
+                        trial.comparison_time_reserved,
+                        trial.early_programs_reserved,
+                    ));
                     trial.kernel_tuning = Some(
                         candidate
                             .tune_with_memo(policy, Some(&mut *kernels))
@@ -1589,6 +1616,29 @@ mod tests {
             Duration::from_millis(800),
             budget,
         ));
+    }
+
+    #[test]
+    fn early_arithmetic_shares_probe_time_and_reserves_its_comparisons() {
+        let seconds = Duration::from_secs;
+        assert_eq!(kernel_probe_budget(seconds(30), seconds(2), 0), seconds(28));
+        assert_eq!(kernel_probe_budget(seconds(30), seconds(2), 2), seconds(8));
+        assert_eq!(
+            kernel_probe_budget(seconds(5), seconds(2), 2),
+            Duration::ZERO
+        );
+        assert_eq!(
+            kernel_probe_budget(seconds(30), Duration::ZERO, 2),
+            seconds(10)
+        );
+        assert_eq!(
+            kernel_probe_budget(Duration::ZERO, seconds(2), 2),
+            Duration::ZERO
+        );
+        assert_eq!(
+            kernel_probe_budget(seconds(30), seconds(2), usize::MAX),
+            Duration::ZERO
+        );
     }
 
     #[test]

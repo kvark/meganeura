@@ -12,13 +12,28 @@ pub(super) fn fill(
     native: [u32; 3],
     subgroup: u32,
 ) -> usize {
-    if subgroup == 0 || subgroup > 128 {
+    if subgroup == 0
+        || subgroup > 128
+        || !plan
+            .dispatches
+            .iter()
+            .any(|d| d.shader == ShaderEntry::WinogradBatchedMatMul)
+    {
         return 0;
     }
     let mut protected = plan.externally_visible_buffers();
     protected.extend(plan.node_buffers.iter().map(|&(_, buffer)| buffer));
     let mut uses = std::collections::HashMap::new();
-    for d in &plan.dispatches {
+    let mut writers = std::collections::HashMap::new();
+    for (index, d) in plan.dispatches.iter().enumerate() {
+        // Remember ambiguity, not just the last writer. Narrowing a shared
+        // buffer would change every producer's storage contract. Dispatch
+        // outputs and input lists stay fixed throughout this pass, so this
+        // index remains valid while kernels and buffer sizes change below.
+        writers
+            .entry(d.output_buffer)
+            .and_modify(|writer| *writer = None)
+            .or_insert(Some(index));
         for buffer in &d.input_buffers {
             *uses.entry(*buffer).or_insert(0) += 1;
         }
@@ -62,13 +77,10 @@ pub(super) fn fill(
             if protected.contains(&buffer) || uses.get(&buffer) != Some(&1) {
                 break;
             }
-            let writers: Vec<_> = plan
-                .dispatches
-                .iter()
-                .enumerate()
-                .filter(|&(_, p)| p.output_buffer == buffer)
-                .collect();
-            let [(index, p)] = writers[..] else { break };
+            let Some(&Some(index)) = writers.get(&buffer) else {
+                break;
+            };
+            let p = &plan.dispatches[index];
             if index >= i
                 || p.shader != shader
                 || p.kernel != Kernel::Default
@@ -178,6 +190,56 @@ mod tests {
                     assert_eq!(p.buffers, sizes);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn narrowing_requires_one_earlier_writer_for_each_operand() {
+        for input in [0, 1] {
+            for mutation in 0..3 {
+                let mut p = plan(64, 16, 64);
+                match mutation {
+                    // Even a later writer makes the storage ambiguous.
+                    0 => p.dispatches.push(p.dispatches[input].clone()),
+                    1 => {
+                        p.dispatches.remove(input);
+                    }
+                    // A unique writer must still precede its consumer.
+                    _ => {
+                        let producer = p.dispatches.remove(input);
+                        p.dispatches.push(producer);
+                    }
+                }
+                let original = p.clone();
+                assert_eq!(fill(&mut p, DType::F16, [8, 8, 8], 32), 0);
+                assert_eq!(p, original, "input={input}, mutation={mutation}");
+            }
+        }
+    }
+
+    #[test]
+    fn writer_index_survives_narrowing_multiple_independent_products() {
+        let mut p = plan(64, 16, 64);
+        let mut second = p.clone();
+        for d in &mut second.dispatches {
+            d.output_buffer.0 += 3;
+            for buffer in &mut d.input_buffers {
+                buffer.0 += 3;
+            }
+        }
+        p.buffers.extend(second.buffers);
+        p.dispatches.extend(second.dispatches);
+        let sizes = p.buffers.clone();
+        assert_eq!(fill(&mut p, DType::BF16, [8, 8, 8], 32), 2);
+        for index in 0..6 {
+            assert_eq!(
+                p.buffers[index],
+                if index % 3 == 2 {
+                    sizes[index]
+                } else {
+                    sizes[index] / 2
+                }
+            );
         }
     }
 

@@ -171,9 +171,10 @@ pub struct BuildSearchReport {
 /// whole-program warmup, sampling and qualification within the common deadline.
 /// Private kernel wins alone never replace the incumbent. This bounded search
 /// does not promise a global optimum.
-/// After the first layouts, alternate layout exploration with submission probes
-/// on the incumbent. A winning layout reopens those probes; later layouts inherit
-/// its measured count rather than expanding a layout/submission cross product.
+/// After initial layout/arithmetic coverage, alternate layout exploration with
+/// submission probes on the incumbent. A winning layout reopens those probes;
+/// later layouts inherit its measured count rather than expanding a
+/// layout/submission cross product.
 ///
 /// `options.tuning` replaces `cfg.tune`. Build-plan caching is not yet supported:
 /// calibration data and measured policy are not part of the ordinary cache key.
@@ -364,14 +365,7 @@ pub fn build_measured_with_inputs(
     // Arithmetic permission belongs to the runtime policy, not a second opt-in.
     // Checked F16 reaches rectangular tiles and extracted scalar layouts that
     // the ordinary square-tile heuristic leaves alone.
-    let matrix_inputs = match cfg.runtime.coop {
-        crate::CoopPolicy::Auto if caps.f16_tile == 0 => {
-            vec![crate::DType::F16, crate::DType::BF16]
-        }
-        crate::CoopPolicy::Auto => vec![crate::DType::BF16, crate::DType::F16],
-        crate::CoopPolicy::AllowF16 => vec![crate::DType::F16],
-        crate::CoopPolicy::NativeF32 | crate::CoopPolicy::Disabled => Vec::new(),
-    };
+    let matrix_inputs = matrix_input_order(cfg.runtime.coop, caps);
     let (supported, unsupported_matrix_inputs): (Vec<_>, Vec<_>) = matrix_inputs
         .iter()
         .copied()
@@ -402,6 +396,22 @@ pub fn build_measured_with_inputs(
         start,
         (initialize, refresh_inputs, qualify),
     )
+}
+
+fn matrix_input_order(
+    policy: crate::CoopPolicy,
+    caps: crate::codegen::CoopCaps,
+) -> Vec<crate::DType> {
+    use crate::{CoopPolicy, DType};
+    match policy {
+        // Rectangular and eight-wide checked products can improve the ordinary
+        // F32/compensated/scalar path. Prefer F16's mantissa first, but retain BF16
+        // as an independent candidate, including when F16 fails qualification.
+        CoopPolicy::Auto if matches!(caps.f16_tile, 0 | 8) => vec![DType::F16, DType::BF16],
+        CoopPolicy::Auto => vec![DType::BF16, DType::F16],
+        CoopPolicy::AllowF16 => vec![DType::F16],
+        CoopPolicy::NativeF32 | CoopPolicy::Disabled => Vec::new(),
+    }
 }
 
 /// Cover one backward layout and one joint graph/layout choice early, then
@@ -511,7 +521,8 @@ fn early_physical_cover(baseline: AxisChoice, attention: &[AttentionChoice]) -> 
 }
 
 /// Coordinate order over graph forms and physical choices (indices into the
-/// seed and choice lists). The first layouts run with the baseline choice.
+/// seed and choice lists). The first layouts run with the baseline choice,
+/// except when early arithmetic coverage is requested after the first form.
 /// After that, steps alternate between the next untried graph form, run with
 /// the incumbent's physical choice, and the next untried physical choice on
 /// the incumbent's form. A winner on either axis carries over to the other:
@@ -536,6 +547,9 @@ struct CoordinateOrder {
     initial: usize,
     physical_next: bool,
     priority_choices: collections::VecDeque<usize>,
+    /// Forms to cover before the first arithmetic alternatives. Eight-wide
+    /// products need early coverage of arithmetic, not just scalar layouts.
+    arithmetic_layouts: usize,
     deferred: collections::HashSet<(usize, usize)>,
 }
 
@@ -551,6 +565,7 @@ impl CoordinateOrder {
             initial: 0,
             physical_next: false,
             priority_choices: collections::VecDeque::new(),
+            arithmetic_layouts: ARITHMETIC_LAYOUTS,
             deferred: collections::HashSet::new(),
         }
     }
@@ -560,15 +575,15 @@ impl CoordinateOrder {
         if self.seeds == 0 || self.choices == 0 {
             return None;
         }
-        // Reach several ordinary graph/derivative combinations before paying
-        // for another arithmetic family. Its tuning and full-gradient checks
-        // can otherwise displace a larger layout win under the same deadline.
+        // Retain ordinary graph/derivative coverage on the existing targets.
+        // Eight-wide products cover arithmetic after the ordinary fallback,
+        // before layout and low-occupancy split exploration spend the deadline.
         if self
             .visited_forms
             .iter()
             .filter(|&&visited| visited)
             .count()
-            >= self.seeds.min(ARITHMETIC_LAYOUTS)
+            >= self.seeds.min(self.arithmetic_layouts)
         {
             while let Some(choice) = self.priority_choices.pop_front() {
                 let entry = (incumbent.0, choice);
@@ -783,6 +798,9 @@ impl Implementations {
             let Some(shape) = crate::codegen::checked_cooperative_shape(shapes) else {
                 continue;
             };
+            if shape == [8, 8, 8] {
+                self.order.arithmetic_layouts = 1;
+            }
             if self
                 .matrix_shapes
                 .insert(multiply, (shape, caps.subgroup_size))
@@ -958,6 +976,21 @@ fn fill_matrix_candidates_scoped(
 }
 
 impl measure::Frontier for Implementations {
+    fn early_programs_remaining(&self, incumbent: Option<measure::Origin>) -> usize {
+        if self.order.arithmetic_layouts != 1 {
+            return 0;
+        }
+        let form = incumbent.map_or(0, |origin| origin.form);
+        self.order
+            .priority_choices
+            .iter()
+            .filter(|&&choice| {
+                !self.order.tried.contains(&(form, choice))
+                    && !self.order.deferred.contains(&(form, choice))
+            })
+            .count()
+    }
+
     fn observe(&mut self, origin: measure::Origin, qualified: bool) {
         let choice = self.choices[origin.choice];
         if !self.defer_bf16 {
@@ -994,10 +1027,13 @@ impl measure::Frontier for Implementations {
             if let Some(plan) = self.split_plans.pop() {
                 return Some(plan);
             }
-            if !self.queued_splits && !self.order.tried.is_empty() {
+            if !self.queued_splits
+                && !self.order.tried.is_empty()
+                && self.early_programs_remaining(incumbent) == 0
+            {
                 self.queued_splits = true;
-                // After the ordinary incumbent. Popped in reverse, so 4 splits
-                // is measured before 8.
+                // After the ordinary incumbent and any early arithmetic cover.
+                // Popped in reverse, so 4 splits is measured before 8.
                 self.split_plans =
                     low_occupancy_weight_splits(self.seeds.first(), self.max_partial_bytes);
                 self.split_plans.reverse();
@@ -1224,6 +1260,81 @@ mod tests {
         graph_frontier(graph)
     }
 
+    #[test]
+    fn matrix_arithmetic_order_preserves_policy_and_bf16_range_fallback() {
+        use crate::{CoopPolicy, DType};
+        for f16_tile in [0, 8, 16] {
+            let caps = crate::codegen::CoopCaps {
+                f16_tile,
+                ..Default::default()
+            };
+            let expected = if f16_tile == 16 {
+                [DType::BF16, DType::F16]
+            } else {
+                [DType::F16, DType::BF16]
+            };
+            assert_eq!(matrix_input_order(CoopPolicy::Auto, caps), expected);
+            assert_eq!(matrix_input_order(CoopPolicy::AllowF16, caps), [DType::F16]);
+            for policy in [CoopPolicy::NativeF32, CoopPolicy::Disabled] {
+                assert!(matrix_input_order(policy, caps).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn eight_wide_arithmetic_precedes_layout_and_weight_split_exploration() {
+        use measure::Frontier as _;
+        for qualified in [false, true] {
+            let mut graph = Graph::new();
+            let x = graph.input("x", &[16 * 8 * 8]);
+            let w = graph.parameter("w", &[32 * 16 * 9]);
+            let conv = graph.conv2d(x, w, 1, 16, 8, 8, 32, 3, 3, 1, 1);
+            let loss = graph.mean_all(conv);
+            graph.set_outputs(vec![loss]);
+            let mut frontier = graph_frontier(crate::autodiff::differentiate(&graph));
+            assert!(!low_occupancy_weight_splits(frontier.seeds.first(), 512 << 20).is_empty());
+            for index in 1..8 {
+                let seed = &frontier.seeds[0];
+                frontier.seeds.push(Seed {
+                    graph: seed.graph.clone(),
+                    options: seed.options.clone(),
+                    plan: seed.plan.clone(),
+                    description: format!("graph={index}"),
+                    backward_rank: 0,
+                });
+            }
+            frontier.order = CoordinateOrder::new(frontier.seeds.len(), frontier.choices.len());
+            let mut caps = blade_graphics::Capabilities {
+                shader_float16: true,
+                shader_bfloat16: true,
+                subgroup_size: 32,
+                ..Default::default()
+            };
+            caps.cooperative_matrix.f16_f32_shapes.push([8, 8, 8]);
+            caps.cooperative_matrix.bf16_f32_shapes.push([8, 8, 8]);
+            frontier.enable_matrix_inputs(&[crate::DType::F16, crate::DType::BF16], &caps);
+            let first = frontier.next(None).unwrap();
+            assert!(!first.description.contains("matrix_inputs="));
+            let incumbent = first.origin;
+            assert_eq!(frontier.early_programs_remaining(incumbent), 2);
+            let f16 = frontier.next(incumbent).unwrap();
+            assert!(f16.description.starts_with("graph=0,"));
+            assert!(f16.description.contains("matrix_inputs=F16"));
+            frontier.observe(f16.origin.unwrap(), qualified);
+            assert_eq!(frontier.early_programs_remaining(incumbent), 1);
+            let bf16 = frontier.next(incumbent).unwrap();
+            assert!(bf16.description.contains("matrix_inputs=BF16"));
+            assert_eq!(frontier.early_programs_remaining(incumbent), 0);
+            let split = frontier.next(incumbent).unwrap();
+            assert!(split.description.contains("conv_dw_splits=4"));
+            // Early arithmetic must not remove ordinary graph/layout choices.
+            assert!(
+                std::iter::from_fn(|| frontier.next(incumbent))
+                    .any(|p| p.description.starts_with("graph=1,"))
+            );
+        }
+    }
+
     fn graph_frontier(graph: Graph) -> Implementations {
         let options = compile::CompileOptions::default();
         let caps = crate::codegen::CoopCaps::default();
@@ -1344,6 +1455,10 @@ mod tests {
         };
         caps.cooperative_matrix.f16_f32_shapes.push([8, 16, 16]);
         frontier.enable_matrix_inputs(&[crate::DType::F16, crate::DType::BF16], &caps);
+        assert_eq!(
+            measure::Frontier::early_programs_remaining(&frontier, None),
+            0
+        );
         let mut visited = Vec::new();
         while let Some(program) = measure::Frontier::next(&mut frontier, None) {
             visited.push(program);
@@ -1571,7 +1686,7 @@ mod tests {
         if !gpu.capabilities().shader_bfloat16 {
             return;
         }
-        let expected_inputs = if runtime::auto_tune(&gpu, 0).coop_caps.f16_tile == 0 {
+        let expected_inputs = if matches!(runtime::auto_tune(&gpu, 0).coop_caps.f16_tile, 0 | 8) {
             vec![crate::DType::F16, crate::DType::BF16]
         } else {
             vec![crate::DType::BF16, crate::DType::F16]
@@ -2125,6 +2240,28 @@ mod tests {
                 assert_eq!(visited.len(), seeds * choices);
                 assert!(order.exhausted());
                 assert!(order.next(incumbent).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn early_arithmetic_order_exhausts_each_pair_as_winners_change() {
+        for seeds in 0..5 {
+            for choices in 0..8 {
+                let mut order = CoordinateOrder::new(seeds, choices);
+                order.arithmetic_layouts = 1;
+                order.priority_choices.extend((1..choices).rev());
+                let mut incumbent = (0, 0);
+                let mut visited = collections::HashSet::new();
+                while let Some(entry) = order.next(incumbent) {
+                    assert!(entry.0 < seeds && entry.1 < choices);
+                    assert!(visited.insert(entry));
+                    if visited.len().is_multiple_of(3) {
+                        incumbent = entry;
+                    }
+                }
+                assert_eq!(visited.len(), seeds * choices);
+                assert!(order.exhausted());
             }
         }
     }
