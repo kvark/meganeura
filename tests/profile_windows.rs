@@ -356,6 +356,72 @@ fn a_plan_within_the_budget_is_captured_in_one_replay() {
         assert_eq!(dispatch.timing_samples_ms.len(), 1);
         assert_eq!(dispatch.timestamp_label, dispatch.label);
     }
+    let mut graph = Graph::new();
+    let mut outputs = Vec::new();
+    for index in 0..5 {
+        let input = graph.input(&format!("x{index}"), &[513]);
+        outputs.push(graph.relu(input));
+    }
+    graph.set_outputs(outputs);
+    let mut config = SessionConfig::inference_from_env_on(session.context());
+    config.optimize.mode = meganeura::OptimizeMode::Off;
+    config.options.fuse_dispatches = false;
+    config.runtime.gpu_timing = true;
+    config.runtime.persistent = Some(meganeura::PersistentOptions {
+        workers: 3,
+        allow_fallback: false,
+    });
+    let mut merged = meganeura::build(&graph, config).0;
+    assert_eq!(merged.plan().dispatches.len(), 5);
+    assert_eq!(merged.execution_dispatch_count(), 2);
+    let profile = capture_session_profile(
+        &mut merged,
+        |session| {
+            for index in 0..5 {
+                session.set_input(&format!("x{index}"), &[1.0; 513]);
+            }
+        },
+        CaptureOptions {
+            samples: 2,
+            include_pipeline_statistics: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(profile.dispatches.len(), 2);
+    assert_eq!(
+        profile
+            .dispatches
+            .iter()
+            .map(|dispatch| dispatch.members.len())
+            .sum::<usize>(),
+        5
+    );
+    for dispatch in &profile.dispatches {
+        assert_eq!(dispatch.logical_workgroups, None);
+        assert_eq!(dispatch.timing_samples_ms.len(), 2);
+        assert_eq!(dispatch.timestamp_label, dispatch.label);
+        assert_eq!(dispatch.workgroups, [3, 1, 1]);
+        assert!(
+            dispatch
+                .timing_samples_ms
+                .iter()
+                .all(|value| value.is_finite())
+        );
+    }
+    for statistic in &profile.pipeline_statistics {
+        assert!(
+            profile
+                .dispatches
+                .iter()
+                .any(|dispatch| dispatch.pipeline == statistic.pipeline)
+        );
+    }
+    for index in 0..5 {
+        let mut output = [f32::NAN; 513];
+        merged.read_output_by_index(index, &mut output);
+        assert_eq!(output, [1.0; 513]);
+    }
 }
 
 #[test]

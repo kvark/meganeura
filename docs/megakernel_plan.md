@@ -75,6 +75,22 @@ Implementation evidence:
   unit tests passed (one ignored), Clippy passed, and enumeration was checked
   on NVIDIA and lavapipe. The updated Meganeura pin passed all-target checking
   and both focused Session tests. Naga remains at the original revision.
+- Independent compatible generated operations now share persistent regions
+  of up to three handlers. Planning follows physical allocation, checks
+  resource limits and overlapping tensor ranges, and rebuilds after sharing or
+  external rebinding. Imported storage conservatively keeps singleton regions;
+  BF16 module declarations also remain singleton-only. Every region boundary
+  has a hardware barrier. Strict checks cover mixed/ragged pointwise and
+  reduction tiles, empty work, fan-out/fan-in, pools 1/3/256, repeated records,
+  and physical dependencies introduced by rebinding. A ten-operation fixture
+  executes in four launches, and a five-operation profile records two timings
+  with five untimed source members. Worker-owned dependent chains remain next.
+  Validation: 506 unit tests (seven ignored); NVIDIA persistent runs passed
+  168 oracle, 182 regression, 69 smoke and 22 GGUF tests (21 regression and two
+  smoke tests ignored). Extended profiling checks passed in both selections;
+  focused region/rebinding checks also passed on lavapipe. Clippy, documentation
+  and formatting checks passed. These checks establish correctness and launch
+  reduction, not a production performance improvement.
 
 The objective is to run Meganeura graphs through persistent GPU workers using
 the ordinary `Graph` / `build` / `Session` interface, and qualify them with the
@@ -133,13 +149,13 @@ logical workgroup/tile range, parameters, and session buffer references.
 
 ### 1.2 Region planning and session storage
 
-- [ ] Partition the compiled dispatch plan using existing access and barrier
+- [x] Partition the compiled dispatch plan using existing access and barrier
   information. Begin with conservative boundaries and compatible kernels.
 - [ ] Admit independent tasks and chains whose dependencies are wholly owned
   by one worker. Preserve hardware dispatch barriers wherever a result must
   become visible to another worker. Multi-stage/global reductions retain
   those boundaries.
-- [ ] Resolve descriptors against session allocations and offsets after
+- [x] Resolve descriptors against session allocations and offsets after
   storage layout is known. Respect binding-count/range limits, mixed storage
   types, shared parameters, and external buffer rebinding. Split a region or
   report fallback when its binding contract cannot be represented.

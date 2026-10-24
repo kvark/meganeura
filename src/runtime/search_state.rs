@@ -75,6 +75,7 @@ impl SearchState {
                     let size = session.alias.sizes[p].max(4);
                     let saved = PhysicalBuffer {
                         gpu: session.gpu.clone(),
+                        external: false,
                         handle: session.gpu.create_buffer(bg::BufferDesc {
                             name: "program_search_state",
                             size: size as u64,

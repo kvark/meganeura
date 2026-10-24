@@ -128,6 +128,244 @@ fn session_persistent_tiles_use_normal_graph_storage_and_reset() {
 }
 
 #[test]
+fn session_persistent_regions_combine_independent_ragged_tasks() {
+    let gpu = crate::support::gpu::gpu();
+    let mut graph = meganeura::Graph::new();
+    let lengths = [1, 17, 513, 4097, 7939];
+    let mut outputs = Vec::new();
+    for (index, &length) in lengths.iter().enumerate() {
+        let input = graph.input(&format!("x{index}"), &[length]);
+        let positive = graph.relu(input);
+        let negative = graph.neg(positive);
+        outputs.extend([positive, negative]);
+    }
+    graph.set_outputs(outputs);
+    for workers in [1, 3, 256] {
+        let mut config = meganeura::SessionConfig::inference_from_env_on(gpu.clone());
+        config.optimize.mode = meganeura::OptimizeMode::Off;
+        config.options.fuse_dispatches = false;
+        config.runtime.persistent = Some(meganeura::PersistentOptions {
+            workers,
+            allow_fallback: false,
+        });
+        let mut session = meganeura::build(&graph, config).0;
+        let report = session.execution_report();
+        assert_eq!(session.plan().dispatches.len(), 10);
+        assert_eq!(report.graph_dispatches, 4);
+        assert_eq!(session.execution_dispatch_count(), 4);
+        let keys = session.dispatch_pipeline_keys();
+        assert!(
+            report
+                .regions
+                .iter()
+                .all(|region| region.workers == workers && region.fallback_reason.is_none())
+        );
+        assert_eq!(
+            report
+                .regions
+                .iter()
+                .map(|region| region.dispatches.len())
+                .sum::<usize>(),
+            10
+        );
+        for region in &report.regions {
+            assert!((2..=3).contains(&region.dispatches.len()));
+            assert!(
+                region
+                    .dispatches
+                    .clone()
+                    .all(|index| keys[index] == keys[region.dispatches.start])
+            );
+        }
+        for replay in 0..3 {
+            let inputs: Vec<Vec<f32>> = lengths
+                .iter()
+                .enumerate()
+                .map(|(index, &length)| {
+                    (0..length)
+                        .map(|i| ((i * 17 + index * 31 + replay * 13) % 53) as f32 - 26.0)
+                        .collect()
+                })
+                .collect();
+            for (index, input) in inputs.iter().enumerate() {
+                session.set_input(&format!("x{index}"), input);
+            }
+            session.set_profiling(replay == 1);
+            session.set_submission_chunks(3);
+            if replay < 2 {
+                session.step();
+                session.wait();
+            } else {
+                let mut encoder = gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
+                    name: "merged region replay",
+                    buffer_count: 1,
+                    manual_barriers: false,
+                });
+                encoder.start();
+                session.record(&mut encoder).unwrap();
+                session.record(&mut encoder).unwrap();
+                let sync = gpu.submit(&mut encoder);
+                session.track_submission(sync);
+                session.wait();
+                gpu.destroy_command_encoder(&mut encoder);
+            }
+            for (index, input) in inputs.iter().enumerate() {
+                let mut output = vec![f32::NAN; input.len()];
+                session.read_output_by_index(2 * index, &mut output);
+                assert_eq!(
+                    output,
+                    input.iter().map(|value| value.max(0.0)).collect::<Vec<_>>()
+                );
+                session.read_output_by_index(2 * index + 1, &mut output);
+                assert_eq!(
+                    output,
+                    input
+                        .iter()
+                        .map(|value| -value.max(0.0))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+    let mut graph = meganeura::Graph::new();
+    let shapes = [[37, 259], [9, 513], [17, 1025]];
+    let outputs = shapes
+        .iter()
+        .enumerate()
+        .map(|(index, shape)| {
+            let input = graph.input(&format!("x{index}"), shape);
+            graph.sum_inner(input)
+        })
+        .collect();
+    graph.set_outputs(outputs);
+    let config = || {
+        let mut config = meganeura::SessionConfig::inference_from_env_on(gpu.clone());
+        config.optimize.mode = meganeura::OptimizeMode::Off;
+        config.options.fuse_dispatches = false;
+        config.runtime.persistent = Some(meganeura::PersistentOptions {
+            workers: 3,
+            allow_fallback: false,
+        });
+        config
+    };
+    let mut session = meganeura::build(&graph, config()).0;
+    assert!(
+        session
+            .execution_report()
+            .regions
+            .iter()
+            .any(|region| region.dispatches.len() > 1)
+    );
+    for replay in 0..3 {
+        for (index, shape) in shapes.iter().enumerate() {
+            let input: Vec<_> = (0..shape[0] * shape[1])
+                .map(|i| ((i * 7 + replay * 13) % 53) as f32 / 16.0 - 1.0)
+                .collect();
+            session.set_input(&format!("x{index}"), &input);
+        }
+        session.step();
+        session.wait();
+        for (index, shape) in shapes.iter().enumerate() {
+            let mut output = vec![f32::NAN; shape[0]];
+            session.read_output_by_index(index, &mut output);
+            for (row, value) in output.into_iter().enumerate() {
+                let expected: f64 = (row * shape[1]..(row + 1) * shape[1])
+                    .map(|i| ((i * 7 + replay * 13) % 53) as f64 / 16.0 - 1.0)
+                    .sum();
+                assert!((f64::from(value) - expected).abs() < 1e-4);
+            }
+        }
+    }
+    let mut diamond = meganeura::Graph::new();
+    let input = diamond.input("x", &[513]);
+    let positive = diamond.relu(input);
+    let negative = diamond.neg(input);
+    let joined = diamond.add(positive, negative);
+    diamond.set_outputs(vec![positive, negative, joined]);
+    let mut session = meganeura::build(&diamond, config()).0;
+    assert_eq!(session.execution_dispatch_count(), 2);
+    assert_eq!(session.execution_report().regions[0].dispatches.len(), 2);
+    let input: Vec<_> = (0..513).map(|i| (i % 17) as f32 - 8.0).collect();
+    session.set_input("x", &input);
+    session.step();
+    session.wait();
+    let mut output = vec![f32::NAN; input.len()];
+    session.read_output_by_index(2, &mut output);
+    assert_eq!(
+        output,
+        input
+            .iter()
+            .map(|value| (-value).max(0.0))
+            .collect::<Vec<_>>()
+    );
+    let mut empty = meganeura::Graph::new();
+    let input = empty.input("x", &[0]);
+    let output = empty.relu(input);
+    empty.set_outputs(vec![output]);
+    let mut session = meganeura::build(&empty, config()).0;
+    assert_eq!(session.execution_report().persistent_tasks, 0);
+    session.step();
+    session.wait();
+    session.step();
+    session.wait();
+    // Rebinding can introduce a physical dependency between distinct logical
+    // parameters. The queue must be rebuilt before those tasks execute.
+    let mut source_graph = meganeura::Graph::new();
+    let a = source_graph.parameter("a", &[513]);
+    let b = source_graph.parameter("b", &[513]);
+    source_graph.set_outputs(vec![a, b]);
+    let mut source_plan = meganeura::compile::compile_with(&source_graph, &Default::default());
+    source_plan.param_buffers[1].1 = source_plan.param_buffers[0].1;
+    let mut source_options = meganeura::SessionOptions::from_env();
+    source_options.persistent = None;
+    let mut source =
+        meganeura::Session::with_context_opts(source_plan, gpu.clone(), source_options);
+    let mut graph = meganeura::Graph::new();
+    let a = graph.parameter("a", &[513]);
+    let b = graph.parameter("b", &[513]);
+    let positive = graph.relu(a);
+    let negative = graph.neg(b);
+    graph.set_outputs(vec![positive, negative]);
+    let mut plan = meganeura::compile::compile_with(
+        &graph,
+        &meganeura::CompileOptions {
+            fuse_dispatches: false,
+            ..Default::default()
+        },
+    );
+    let a_buffer = plan.param_buffers[0].1;
+    assert_eq!(plan.dispatches[0].input_buffers[0], a_buffer);
+    plan.dispatches[0].output_buffer = a_buffer;
+    plan.output_buffers[0] = a_buffer;
+    plan.node_buffers[positive as usize].1 = a_buffer;
+    for workers in [1, 64] {
+        let mut options = meganeura::SessionOptions::from_env();
+        options.persistent = Some(meganeura::PersistentOptions {
+            workers,
+            allow_fallback: false,
+        });
+        let mut session = meganeura::Session::with_context_opts(plan.clone(), gpu.clone(), options);
+        assert_eq!(session.execution_dispatch_count(), 1);
+        session.share_parameter_from(&mut source, "a").unwrap();
+        session.share_parameter_from(&mut source, "b").unwrap();
+        assert_eq!(session.execution_dispatch_count(), 2);
+        let input: Vec<_> = (0..513).map(|i| (i % 17) as f32 - 8.0).collect();
+        source.set_parameter("a", &input);
+        session.step();
+        session.wait();
+        let mut output = vec![f32::NAN; input.len()];
+        session.read_output_by_index(1, &mut output);
+        assert_eq!(
+            output,
+            input
+                .iter()
+                .map(|value| -value.max(0.0))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
 fn session_persistent_fallback_is_explicit_and_strict_rejects_it() {
     let mut graph = meganeura::Graph::new();
     let x = graph.input("x", &[2, 3]);

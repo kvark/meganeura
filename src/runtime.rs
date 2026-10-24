@@ -3380,6 +3380,7 @@ pub struct DebugStepReport {
 struct PhysicalBuffer {
     gpu: Arc<Gpu>,
     handle: blade_graphics::Buffer,
+    external: bool,
 }
 
 impl Drop for PhysicalBuffer {
@@ -4104,9 +4105,9 @@ impl Session {
         );
         drop(schedule_span);
 
-        let persistent = opts.persistent.map(|options| {
-            persistent::State::new(&gpu, &plan, options, &groups, opts.wgsl_dump_dir.as_deref())
-        });
+        if opts.persistent.is_some() {
+            validate_precision_plan(&gpu, &plan);
+        }
 
         // Lifetime-based buffer aliasing: step-local intermediates with
         // disjoint live ranges (at barrier-group granularity) share one
@@ -4360,6 +4361,7 @@ impl Session {
                     slots[i] = Some(Arc::new(PhysicalBuffer {
                         gpu: Arc::clone(&gpu),
                         handle,
+                        external: false,
                     }));
                 }
             };
@@ -4578,6 +4580,18 @@ impl Session {
             written[b.0 as usize] = true;
         }
 
+        let persistent = opts.persistent.map(|options| {
+            persistent::State::new(
+                &gpu,
+                &plan,
+                options,
+                &groups,
+                &buffers,
+                physical_buffers.iter().any(|buffer| buffer.external),
+                opts.wgsl_dump_dir.as_deref(),
+            )
+        });
+
         Self {
             gpu,
             persistent,
@@ -4733,6 +4747,7 @@ impl Session {
         let physical = Arc::new(PhysicalBuffer {
             gpu: Arc::clone(&self.gpu),
             handle: imported,
+            external: true,
         });
         self.rebind_logical(buf_ref.0 as usize, physical, 0, device_local);
         Ok(())
@@ -4808,6 +4823,7 @@ impl Session {
         } else {
             self.physical_buffers[target] = physical;
         }
+        self.refresh_persistent();
     }
 
     /// Whether this session's parameter `name` is the same storage as
@@ -5048,15 +5064,10 @@ impl Session {
             .enumerate()
             .map(|(index, selected)| {
                 let key = selected.0.label();
-                if self
-                    .persistent
+                self.persistent
                     .as_ref()
-                    .is_some_and(|state| state.pipeline(index).is_some())
-                {
-                    format!("persistent:{key}")
-                } else {
-                    key
-                }
+                    .and_then(|state| state.pipeline_key(index))
+                    .map_or(key, str::to_owned)
             })
             .collect()
     }

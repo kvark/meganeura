@@ -1,6 +1,7 @@
 struct PersistentParams {
-    grid: vec3<u32>,
-    count: u32,
+    grids: array<vec4<u32>, 3>,
+    starts: vec4<u32>,
+    ends: vec4<u32>,
 }
 var<storage, read_write> persistent_queue: array<atomic<u32>>;
 var<uniform> persistent_params: PersistentParams;
@@ -13,15 +14,11 @@ fn persistent_main(@builtin(local_invocation_id) lid: vec3<u32>) {
             persistent_ticket = atomicAdd(&persistent_queue[0], 1u);
         }
         let ticket = workgroupUniformLoad(&persistent_ticket);
-        if ticket >= persistent_params.count {
+        if ticket >= persistent_params.ends.w {
             break;
         }
-        let grid = persistent_params.grid;
-        let logical = vec3<u32>(ticket % grid.x, (ticket / grid.x) % grid.y,
-                                ticket / (grid.x * grid.y));
-        execute_tile(logical, lid);
-        // Every invocation finishes the body before the next ticket or reuse
-        // of reduction scratch. No tensor is published to another worker.
+        $HANDLERS
+        // Finish the body before another ticket or reuse of reduction scratch.
         workgroupBarrier();
     }
 }

@@ -22,18 +22,25 @@ session.step();
 session.wait();
 ```
 
-This first integration retains one physical launch per compiled operation and
-the original dispatch barriers. Each launch drains logical tiles using its
-kernel's existing workgroup size. It establishes a shared execution and test
-path; it does not yet combine operations or claim a launch-count improvement.
-The ordinary backend remains the default.
+Compatible independent operations now share a persistent launch, with up to
+three generated handlers per region. Each launch drains logical tiles using
+the handlers' existing workgroup size. Region boundaries retain hardware
+barriers; dependent chains and global reductions still cross those boundaries.
+The ordinary backend remains the default. BF16 handlers currently stay in
+single-operation regions because their module-wide declarations are shared.
 
-Session buffers are bound directly, including current parameter sharing and
-external rebindings. Intermediate lifetime aliasing is disabled in this mode.
+Regions are planned after storage allocation, with checks for device binding
+limits, binding ranges, shared-memory use, and physical overlap. Vulkan reports
+these limits; unreported backend limits produce explicit fallback or strict
+rejection. Session buffers are bound directly, including parameter sharing and
+external rebindings. Rebinding rebuilds the regions. Sessions with imported
+storage retain one operation per launch because separate imported handles may
+alias an allocation. Intermediate lifetime aliasing is disabled in this mode.
 Queue counters are allocated once, included in `MemorySummary.scheduler_bytes`,
 and reset by a GPU transfer at every step, including externally recorded steps.
 Tensor data and training/cache state are not reset. Profiling reserves a slot
-for queue reset, and tuning rebuilds the persistent pipelines after selection.
+for queue reset and reports one timing per physical launch, with untimed source
+operations attached. Tuning rebuilds the persistent pipelines after selection.
 
 `execution_report()` lists operation provenance, logical tiles, worker geometry,
 physical graph launches, fallback reasons, and configured appended optimizer,
@@ -45,8 +52,8 @@ persistent coverage for cases intended to exercise this path.
 Harnesses using environment configuration can select the path with
 `MEGANEURA_PERSISTENT_WORKERS=64`, and reject fallbacks with
 `MEGANEURA_PERSISTENT_STRICT=1`. `reference::gpu::Options.persistent` provides
-the same explicit selection for oracle checks. The plan tracks the remaining
-harness audit, region composition, and production benchmark qualification.
+the same explicit selection for oracle checks. The plan tracks worker-owned
+chains, production benchmark qualification, and later device scheduling.
 
 ## Standalone prototype
 
