@@ -191,3 +191,72 @@ and remains the default. Broader operator coverage is the next step.
 |---|---|
 | `device-retry-smolvla-paired.json` | `7803fd294005d70718012097be4c975d37103e89e45d786708f9ca7f49d47ddc` |
 | `device-retry-smolvla-diagnostic.json` | `feab04019b2df8068751ae9279a2f68f3b99408f84cb8a6cbc8342f229eac7c1` |
+
+## Selected kernel tiles
+
+Clean commit `55fb598aac3d9ad7baac1bae51e9f54fc3468169` converts the selected
+ordinary compute implementations into callable tiles. Blade is `5011dea` and
+Naga remains `f09d62e`. Measurements on October 24 use the same RTX 5080,
+driver 595.91.07, Rust 1.98 and benchmark boundaries described above. The GPU
+was idle before the sequential runs; no other test or build ran during timed
+measurement. Clocks were not locked. Each primary case has 50 alternating pairs
+after at least ten pairs and one second of warmup; separate diagnostics use ten
+pairs after at least five pairs and 500 ms. Both compiled plans and selected
+arithmetic implementation keys match. All outputs, gradients, updated parameters
+and queue-completion checks are exact in both primary and diagnostic runs.
+
+| Case | Ordinary median ms | Selected median ms | Median paired ratio | Ordinary/selected p95 ms | Graph launches |
+|---|---:|---:|---:|---:|---:|
+| CI inference | 0.04920 | 0.05468 | 1.108 | 0.05549 / 0.06006 | 5 → 5 |
+| CI forward/backward | 0.06550 | 0.08386 | 1.283 | 0.06968 / 0.08834 | 18 → 13 |
+| CI forward/backward/SGD | 0.06814 | 0.08682 | 1.274 | 0.07251 / 0.09226 | 18 → 13 |
+| SmolVLA forward | 4.46189 | 8.63320 | 1.930 | 4.88305 / 8.97097 | 154 → 136 |
+| SmolVLA forward/backward/SGD | 15.10691 | 24.75937 | 1.643 | 77.49349 / 103.67405 | 523 → 363 |
+
+All compiled operations are covered in these cases: 5/5 and 18/18 for CI,
+154/154 and 523/523 for SmolVLA. There are no ordinary graph fallbacks. CI has
+five portable regions forward and 12 portable plus one native region training.
+SmolVLA has 132 portable plus four native regions forward, and 349 portable plus
+14 native regions training. **Appended SGD remains ordinary fallback** and is
+included in completed training latency but excluded from graph launch counts.
+This is broader graph coverage, not complete persistent training-state coverage.
+
+Forward model IQRs are 4.43168–4.79281 ms ordinary and 8.59069–8.91568 ms selected;
+the paired-ratio IQR is 1.884–1.961. Training IQRs are 12.23420–15.47590 and
+24.39593–86.99833 ms, with paired-ratio IQR 1.600–5.532 and p95 8.627. The large
+training outliers remain in the raw records. Reduced launches do not compensate
+for tile execution overhead here; ordinary execution remains the default.
+
+| Case | Resident MiB ordinary → selected | Scheduler bytes | Construction ms ordinary / selected |
+|---|---:|---:|---:|
+| CI inference | 0.06995 → 0.08289 | 1,280 | 0.86 / 50.13 |
+| CI training | 0.13229 → 0.17171 | 6,656 | 10.26 / 183.32 |
+| SmolVLA forward | 563.42498 → 599.87085 | 69,632 | 62.96 / 852.25 |
+| SmolVLA training | 982.08075 → 1027.66156 | 185,856 | 80.38 / 1872.68 |
+
+Lifetime aliasing remains disabled for persistent sessions. Construction uses a
+shared context, ordinary sessions first and shader-cache reuse, so these are
+observed costs rather than matched cold-start measurements. Runtime shader
+conversion/composition introduces substantial construction cost in this version.
+
+Diagnostic median GPU pass intervals, ordinary/selected in ms, are
+0.01330/0.01920, 0.02792/0.04781 and 0.03061/0.05171 for the three CI cases;
+4.08541/8.20472 for model forward and 14.35851/21.86987 for model training.
+These are instrumented completed-pass intervals, not primary wall timings or
+individual handler timings. Every worker histogram sums to its logical task
+count. Native model regions use 9–64 active workers forward and 12–64 training;
+portable model regions use 40–64 and 1–64 respectively. This does not measure
+hardware occupancy. Model persistent executable register counts range from
+16–125 forward and 16–172 training; shared bytes range from 16–33,552 and
+16–42,000. The implausible 64 GiB local-memory statistic is retained raw and
+excluded from resource conclusions.
+
+The reproduction commands above are unchanged. All four records are retained
+under `target/megakernel-results/`, outside Git, with matching `.log` files:
+
+| Record | SHA-256 |
+|---|---|
+| `generic-tile-ci-paired.json` | `ac0161bb402996a35a14565ac23dc7bda08eea6610e4e5575bc4d986b49a0779` |
+| `generic-tile-smolvla-paired.json` | `7eeb8085b29b3fda08a8f8f076a419772a58825484e5f18b6a583552882200b9` |
+| `generic-tile-ci-diagnostic.json` | `548ed54f817b3b068cda9ea5dc6f862546eb8d069d1410230029c8aad871f47c` |
+| `generic-tile-smolvla-diagnostic.json` | `e814251cf7517bdc95a6021c9d3b91a7940a764cf702564eeaad7f2bec2275d3` |

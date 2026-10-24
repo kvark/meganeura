@@ -475,8 +475,17 @@ reuse. Both rectangular-matrix tuning checks pass after adding the workgroup
 matrix reservation to the resource bound.
 All 663 library tests pass (eight ignored); strict all-target/all-feature Clippy,
 formatting, documentation and core/models/GGUF/profiler Metal-target compilation
-pass. Metal GPU execution remains unqualified. Production measurements follow
-from a clean implementation commit.
+pass. Metal GPU execution remains unqualified.
+
+At clean `55fb598`, 50-pair CI and SmolVLA measurements plus separate ten-pair
+diagnostics pass exact full-state comparisons. These workloads have no ordinary
+graph fallback: 5/5 and 18/18 CI operations, 154/154 and 523/523 model operations
+use persistent tiles. Graph launches are 5/13 for CI and 136/363 for model
+forward/training. Appended SGD remains ordinary. Median paired ratios are
+1.108/1.283/1.274 for CI inference/backward/SGD and 1.930/1.643 for model
+forward/training, with large training tails retained. Construction also costs
+more. Ordinary remains the default; [complete records](megakernel_device_results.md#selected-kernel-tiles)
+include distributions, memory, coverage, worker activity and raw-file identities.
 
 The device queue uses the same Session work descriptors, tracking ready tasks,
 predecessor counts, unfinished work and successor edges on the GPU. It releases
