@@ -15,6 +15,7 @@ pub struct Options {
     pub runs: usize,
     pub warmup_ms: u64,
     pub diagnostics: bool,
+    pub device_scheduling: bool,
 }
 
 impl Default for Options {
@@ -26,6 +27,7 @@ impl Default for Options {
             runs: 50,
             warmup_ms: 1000,
             diagnostics: false,
+            device_scheduling: false,
         }
     }
 }
@@ -41,6 +43,10 @@ impl Options {
                 self.warmup_ms = args.next().expect("--warmup-ms value").parse().unwrap()
             }
             "--diagnostics" => self.diagnostics = true,
+            "--device-scheduling" => {
+                self.enabled = true;
+                self.device_scheduling = true;
+            }
             _ => return false,
         }
         true
@@ -77,6 +83,7 @@ impl Options {
             workers: self.workers,
             allow_fallback: true,
             track_workers: self.diagnostics,
+            device_scheduling: self.device_scheduling,
         });
         config
     }
@@ -180,6 +187,7 @@ pub fn measure(
         for session in [&mut *ordinary, &mut *persistent] {
             prepare(session);
             execute(session);
+            session.validate_persistent_completion().unwrap();
         }
         warmed += 1;
     }
@@ -205,6 +213,7 @@ pub fn measure(
             let start = Instant::now();
             execute(session);
             samples[index].push(start.elapsed().as_secs_f64() * 1000.0);
+            session.validate_persistent_completion().unwrap();
             if options.diagnostics {
                 let times = session.gpu_timings();
                 assert!(

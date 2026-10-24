@@ -29,6 +29,10 @@ precision, poisoning, and feature settings identical to the ordinary run:
 ```sh
 MEGANEURA_PERSISTENT_WORKERS=64 cargo test --test oracle --test smoke \
   --test regression --test gguf_model --all-features -- --test-threads=1
+# Qualified Vulkan device dependencies within compatible regions:
+MEGANEURA_PERSISTENT_WORKERS=64 MEGANEURA_DEVICE_SCHEDULING=1 \
+  cargo test --test oracle --test smoke --test regression --test gguf_model \
+  --all-features -- --test-threads=1
 # This targeted oracle case explicitly checks ordinary and strict persistent
 # execution, numerical results, and nonzero persistent coverage.
 cargo test --test oracle smoke::persistent_execution_reports_actual_coverage
@@ -42,6 +46,14 @@ chunking and external records, while the existing tests retain their training,
 checkpoint, shared storage, cache, and precision assertions. Test constructors
 use the shared environment configuration even when they override another
 runtime option.
+`PersistentOptions::device_scheduling` selects the native-fence protocol.
+`ExecutionRegion::device_scheduled` identifies those launches. Regions currently
+hold up to three compatible generated handlers and release successors only after
+all predecessor tiles finish. Resource, geometry and unsupported-handler boundaries
+remain physical dispatches. `validate_persistent_completion()` waits and checks
+unfinished tasks, counters and diagnostics after a step; it performs a readback,
+so correctness checks call it outside timed intervals. The reference harness and
+paired benchmark do this automatically. Ordinary execution remains the default.
 The convolution optimizer test keeps its allocation-reuse control explicitly
 ordinary: persistent sessions currently disable lifetime aliasing. Its other
 sessions exercise the selected backend, and the memory-reduction assertion
@@ -64,6 +76,8 @@ For a production comparison, both existing benchmarks accept `--paired`:
 ```sh
 cargo run --release --example bench_ci_latency -- --paired
 cargo run --release --example bench_smolvla_train --features models -- --paired
+# Same paired harness, selecting device dependencies for the persistent side:
+cargo run --release --example bench_ci_latency -- --device-scheduling
 # Separate instrumented run: GPU pass intervals, worker task histograms.
 MEGANEURA_GPU_CAPTURE=1 cargo run --release --example bench_smolvla_train --features models -- \
   --paired --diagnostics --warmup 5 --warmup-ms 500 --runs 10

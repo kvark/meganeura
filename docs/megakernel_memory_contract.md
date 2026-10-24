@@ -2,7 +2,8 @@
 
 Milestone 1 is complete. Milestone 2 selects the existing native fence extension
 for the bounded protocol below. Compiler-output checks and device tests qualify
-the Vulkan path; integration into Session and performance qualification follow.
+the Vulkan path. Session now applies it to compatible generated pointwise and
+reduction regions; broader coverage and performance qualification follow.
 
 ## Smallest candidate interface
 

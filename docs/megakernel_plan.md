@@ -4,8 +4,8 @@ Agreed direction, October 24, 2026. Implementation starts with **Milestone 1**,
 then proceeds to the **Naga investigation in Milestone 2**. The existing
 [prototype and measurements](megakernel.md) are the starting evidence.
 Milestone 1 is complete with explicit fallback and measured regressions.
-Milestone 2 qualifies the existing fence interface on Vulkan; Session device
-scheduling is the next implementation step.
+Milestone 2 qualifies the existing fence interface on Vulkan. Session device
+scheduling now covers compatible generated regions; broader coverage remains.
 
 Implementation is delivered in separate testable commits. The standalone
 prototype is the baseline; subsequent commits update the milestone checklist
@@ -380,10 +380,29 @@ is also a valid outcome.
 
 ## Follow-through — device-scheduled graphs
 
-After Milestone 2, apply its synchronization contract to the same Session work
-descriptors. Maintain ready tasks, predecessor counts, in-flight work, and
-successor edges on the GPU. Start with whole-operation completion before
-releasing consumers, then measure whether tile-level dependencies are useful.
+The first implementation applies the qualified protocol to compatible generated
+pointwise/reduction regions of up to three handlers. Typed configuration and the
+shared environment selector expose it; the existing paired benchmark accepts
+`--device-scheduling`. Physical RAW/WAR/WAW dependencies, all-lane fences,
+coherent aliases, bounded scans, immutable reset images and completion readback
+are integrated. Profiling, external records, chunking, serial selection and
+rebinding retain their Session contracts. Initial lifetime aliasing remains off.
+
+NVIDIA device-mode qualification passed 168 oracle, 182 regression, 72 smoke and
+22 GGUF tests (21 regression and two smoke tests ignored). The oracle harness
+also checks queue completion. Focused checks cover fan-in, cross-tile reductions,
+empty work among live tasks, 1/3/64/4096 workers, serial boundaries, physical
+RAW/WAR/WAW aliases, parameter rebinding and repeated external reset/recording.
+All 506 unit checks pass after documenting the new environment selector; strict
+Clippy, formatting and documentation pass. All five focused Session checks pass
+on NVIDIA and lavapipe; ordinary-mode smoke also passes 72 tests (two ignored).
+Paired production results follow this implementation
+commit and must not be inferred from launch reduction alone.
+
+The device queue uses the same Session work descriptors, tracking ready tasks,
+predecessor counts, unfinished work and successor edges on the GPU. It releases
+consumers after whole-operation completion; measure whether tile-level
+dependencies are useful before complicating that protocol.
 Never occupy workers waiting on a particular unready graph node when ready
 work can be executed instead.
 

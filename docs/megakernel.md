@@ -1,8 +1,8 @@
 # Persistent megakernel prototype
 
-The [integration and Naga plan](megakernel_plan.md) records the next milestones:
-persistent regions through `Session`, followed by investigation of the fork's
-memory/atomic semantics for device-scheduled graphs.
+The [integration and Naga plan](megakernel_plan.md) records the completed
+portable-region and compiler milestones, followed by device-scheduled Session
+regions and the remaining operator coverage work.
 
 ## Session integration
 
@@ -73,8 +73,38 @@ persistent coverage for cases intended to exercise this path.
 Harnesses using environment configuration can select the path with
 `MEGANEURA_PERSISTENT_WORKERS=64`, and reject fallbacks with
 `MEGANEURA_PERSISTENT_STRICT=1`. `reference::gpu::Options.persistent` provides
-the same explicit selection for oracle checks. The plan tracks production
-benchmark qualification and later device scheduling.
+the same explicit selection for oracle checks.
+
+### Device dependencies inside Session regions
+
+`PersistentOptions::device_scheduling = true` (or
+`MEGANEURA_DEVICE_SCHEDULING=1` alongside the worker selector) enables the
+[qualified Vulkan fence contract](megakernel_memory_contract.md). The same
+generated pointwise/reduction bodies then use a bounded ready bitmap and
+whole-operation completion counters. Compatible dependent operations can share
+one launch even when consumers read tiles produced by other workers. The planner
+orders physical RAW/WAR/WAW hazards, including rebinding, and annotates aliased
+read-only inputs as coherent. Immutable inputs keep their ordinary accesses.
+
+Regions still contain at most three compatible handlers. Different workgroup
+geometry, resource limits, imported storage and unsupported kernels retain
+physical dispatch boundaries or explicit fallback. Serial selection retains one
+operation per launch. BF16 handlers remain singleton-only. This is device
+scheduling within reported regions, not full graph coverage or a promise of one
+launch for every graph.
+
+The queue and immutable reset image are allocated once and included in scheduler
+residency. A GPU copy restores counters and root readiness at each step; tensor,
+optimizer and cache data are untouched. Every worker scan and task loop is
+bounded. `ExecutionRegion::device_scheduled` identifies the selected protocol.
+After a completed step, `Session::validate_persistent_completion()` checks that
+tasks, dependency/tile counters, ready bits and error flags have drained. This
+downloads queue state and belongs outside timing; oracle checks and the paired
+benchmark call it automatically. Worker-counter readback checks completion too.
+
+The existing paired benchmarks select this path with `--device-scheduling`.
+The ordinary backend remains the default while correctness and completed-step
+measurements qualify each expansion in scope.
 
 ## Standalone prototype
 

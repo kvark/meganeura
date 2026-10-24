@@ -2,6 +2,7 @@ struct PersistentParams {
     grids: array<vec4<u32>, 3>,
     starts: vec4<u32>,
     ends: vec4<u32>,
+    successors: vec4<u32>,
 }
 var<storage, read_write> persistent_queue: array<atomic<u32>>;
 var<uniform> persistent_params: PersistentParams;

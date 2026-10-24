@@ -154,6 +154,9 @@ pub fn check_inference_against(
     upload(&mut session, graph, feeds)?;
     session.step();
     session.wait();
+    session
+        .validate_persistent_completion()
+        .expect("device graph completion");
     let mut report = Report {
         shaders: dispatched(&session),
         execution: Some(session.execution_report()),
@@ -190,6 +193,9 @@ pub fn check_training(graph: &Graph, feeds: &Feeds, options: &Options) -> Result
     upload(&mut session, graph, feeds)?;
     session.step();
     session.wait();
+    session
+        .validate_persistent_completion()
+        .expect("device graph completion");
 
     let mut report = Report {
         shaders: dispatched(&session),

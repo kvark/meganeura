@@ -154,6 +154,8 @@ registry! {
         "Opt in to persistent pointwise/reduction tile queues with this many workgroups per dispatch (1..=65535).";
     PERSISTENT_STRICT: "MEGANEURA_PERSISTENT_STRICT", Bool, Diagnostic,
         "Reject ordinary fallback when persistent execution is selected.";
+    DEVICE_SCHEDULING: "MEGANEURA_DEVICE_SCHEDULING", Bool, Diagnostic,
+        "Use qualified native fences to schedule dependencies inside persistent regions.";
     POISON: "MEGANEURA_POISON", Bool, Diagnostic,
         "Fill every non-parameter buffer with NaN at session build, so a kernel that reads memory nothing wrote produces NaN instead of a plausible zero.";
     NO_DEVICE_LOCAL: "MEGANEURA_NO_DEVICE_LOCAL", Bool, Diagnostic,
@@ -352,6 +354,7 @@ impl SessionOptions {
                 .map(|workers| crate::PersistentOptions {
                     workers,
                     allow_fallback: !PERSISTENT_STRICT.bool_or(false),
+                    device_scheduling: DEVICE_SCHEDULING.bool_or(false),
                     ..Default::default()
                 }),
             coop,

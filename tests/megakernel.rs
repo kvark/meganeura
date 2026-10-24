@@ -1,6 +1,7 @@
 use meganeura::megakernel::{Execution, Executor, Instruction, Job, Options};
 
 fn check_worker_tasks(session: &mut meganeura::Session) {
+    session.validate_persistent_completion().unwrap();
     let report = session.execution_report();
     let enabled = report
         .persistent
@@ -23,6 +24,190 @@ fn check_worker_tasks(session: &mut meganeura::Session) {
 }
 
 #[test]
+fn session_device_graphs_release_dependencies_across_worker_tiles() {
+    let gpu = crate::support::gpu::gpu();
+    if !gpu.capabilities().device_memory_fence {
+        eprintln!("device graph fences are unsupported on this backend");
+        return;
+    }
+    for case in 0..4 {
+        let mut graph = meganeura::Graph::new();
+        let shape = if case == 2 { [0, 259] } else { [37, 259] };
+        let x = graph.input("x", &shape);
+        let positive = graph.relu(x);
+        if case == 0 {
+            let negative = graph.neg(x);
+            let sum = graph.add(positive, negative);
+            graph.set_outputs(vec![positive, negative, sum]);
+        } else if case == 1 {
+            let sum = graph.sum_inner(positive);
+            let negative = graph.neg(sum);
+            graph.set_outputs(vec![positive, sum, negative]);
+        } else if case == 2 {
+            graph.set_outputs(vec![positive]);
+        } else {
+            let empty = graph.input("empty", &[0]);
+            let empty = graph.relu(empty);
+            let negative = graph.neg(positive);
+            graph.set_outputs(vec![positive, empty, negative]);
+        }
+        for (workers, serial) in [
+            (1, false),
+            (3, false),
+            (64, false),
+            (4096, false),
+            (3, true),
+        ] {
+            let mut config = meganeura::SessionConfig::inference_from_env_on(gpu.clone());
+            config.optimize.mode = meganeura::OptimizeMode::Off;
+            config.options.fuse_dispatches = false;
+            config.runtime.poison = true;
+            config.runtime.serial_dispatch = serial;
+            config.runtime.persistent = Some(meganeura::PersistentOptions {
+                workers,
+                track_workers: workers == 3,
+                allow_fallback: false,
+                device_scheduling: true,
+            });
+            let mut session = meganeura::build(&graph, config).0;
+            let report = session.execution_report();
+            assert_eq!(
+                report.graph_dispatches,
+                if serial && case != 2 { 3 } else { 1 }
+            );
+            assert!(
+                report
+                    .regions
+                    .iter()
+                    .all(|region| region.device_scheduled && !region.worker_owned_chain)
+            );
+            assert_eq!(
+                report
+                    .regions
+                    .iter()
+                    .map(|region| region.dispatches.len())
+                    .sum::<usize>(),
+                if case == 2 { 1 } else { 3 }
+            );
+            assert_eq!(
+                session.memory_summary().scheduler_bytes,
+                report.scheduler_bytes
+            );
+            for replay in 0..3 {
+                let input: Vec<_> = (0..shape[0] * shape[1])
+                    .map(|i| ((i * 17 + replay * 23) % 101) as f32 / 32.0 - 1.0)
+                    .collect();
+                let positive: Vec<_> = input.iter().map(|value| value.max(0.0)).collect();
+                let expected = if case == 0 {
+                    vec![
+                        positive,
+                        input.iter().map(|value| -value).collect(),
+                        input.iter().map(|value| (-value).max(0.0)).collect(),
+                    ]
+                } else if case == 1 {
+                    let sums: Vec<f32> = positive.chunks(259).map(|row| row.iter().sum()).collect();
+                    let negative = sums.iter().map(|value| -value).collect();
+                    vec![positive, sums, negative]
+                } else if case == 2 {
+                    vec![positive]
+                } else {
+                    let negative = positive.iter().map(|value| -value).collect();
+                    vec![positive, Vec::new(), negative]
+                };
+                session.set_input("x", &input);
+                if case == 3 {
+                    session.set_input("empty", &[]);
+                }
+                session.set_submission_chunks(3);
+                session.set_profiling(replay == 1);
+                if replay < 2 {
+                    session.step();
+                    session.wait();
+                } else {
+                    let mut encoder =
+                        gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
+                            name: "device region reset epochs",
+                            buffer_count: 1,
+                            manual_barriers: false,
+                        });
+                    encoder.start();
+                    session.record(&mut encoder).unwrap();
+                    session.record(&mut encoder).unwrap();
+                    let sync = gpu.submit(&mut encoder);
+                    session.track_submission(sync);
+                    session.wait();
+                    gpu.destroy_command_encoder(&mut encoder);
+                }
+                check_worker_tasks(&mut session);
+                for (index, expected) in expected.into_iter().enumerate() {
+                    let mut actual = vec![f32::NAN; expected.len()];
+                    session.read_output_by_index(index, &mut actual);
+                    assert_eq!(
+                        actual, expected,
+                        "case={case}, workers={workers}, replay={replay}"
+                    );
+                }
+            }
+        }
+    }
+    let mut graph = meganeura::Graph::new();
+    let x = graph.input("x", &[1025]);
+    let positive = graph.relu(x);
+    let negative = graph.neg(x);
+    let sum = graph.add(positive, negative);
+    graph.set_outputs(vec![positive, negative, sum]);
+    let mut plan = meganeura::compile::compile_with(
+        &graph,
+        &meganeura::CompileOptions {
+            fuse_dispatches: false,
+            ..Default::default()
+        },
+    );
+    assert_eq!(plan.dispatches.len(), 3);
+    let input = plan.input_buffers[0].1;
+    assert_eq!(
+        plan.dispatches[2].input_buffers[1],
+        plan.dispatches[1].output_buffer
+    );
+    // Reuse the input for the second and third writes: RAW, WAR and WAW
+    // edges must all follow physical accesses, including the in-place read.
+    plan.dispatches[1].output_buffer = input;
+    plan.dispatches[2].input_buffers[1] = input;
+    plan.dispatches[2].output_buffer = input;
+    plan.output_buffers[1] = input;
+    plan.output_buffers[2] = input;
+    for workers in [1, 3, 4096] {
+        let options = meganeura::SessionOptions {
+            persistent: Some(meganeura::PersistentOptions {
+                workers,
+                device_scheduling: true,
+                allow_fallback: false,
+                track_workers: true,
+            }),
+            ..meganeura::SessionOptions::from_env()
+        };
+        let mut session = meganeura::Session::with_context_opts(plan.clone(), gpu.clone(), options);
+        assert_eq!(session.execution_dispatch_count(), 1);
+        for seed in 0..8 {
+            let input: Vec<_> = (0..1025)
+                .map(|i| ((i * 19 + seed * 17) % 101) as f32 - 50.0)
+                .collect();
+            session.set_input("x", &input);
+            session.step();
+            check_worker_tasks(&mut session);
+            let mut actual = vec![f32::NAN; input.len()];
+            session.read_output_by_index(0, &mut actual);
+            assert_eq!(actual, input.iter().map(|x| x.max(0.0)).collect::<Vec<_>>());
+            session.read_output_by_index(2, &mut actual);
+            assert_eq!(
+                actual,
+                input.iter().map(|x| (-x).max(0.0)).collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+#[test]
 fn session_persistent_tiles_use_normal_graph_storage_and_reset() {
     let gpu = crate::support::gpu::gpu();
     let mut graph = meganeura::Graph::new();
@@ -39,6 +224,7 @@ fn session_persistent_tiles_use_normal_graph_storage_and_reset() {
         config.runtime.persistent = Some(meganeura::PersistentOptions {
             workers,
             track_workers: workers == 3,
+            device_scheduling: false,
             allow_fallback: false,
         });
         let mut session = meganeura::build(&graph, config).0;
@@ -132,11 +318,15 @@ fn session_persistent_tiles_use_normal_graph_storage_and_reset() {
     plan.dispatches[1].input_buffers[0] = input_buffer;
     plan.output_buffers[0] = input_buffer;
     plan.node_buffers[mapped as usize].1 = input_buffer;
-    for workers in [1, 64] {
+    for (workers, device_scheduling) in [(1, false), (64, false), (1, true), (64, true)] {
+        if device_scheduling && !gpu.capabilities().device_memory_fence {
+            continue;
+        }
         let mut options = meganeura::SessionOptions::from_env();
         options.persistent = Some(meganeura::PersistentOptions {
             workers,
             track_workers: workers == 3,
+            device_scheduling,
             allow_fallback: false,
         });
         let mut session = meganeura::Session::with_context_opts(plan.clone(), gpu.clone(), options);
@@ -181,6 +371,7 @@ fn session_persistent_regions_combine_independent_ragged_tasks() {
         config.runtime.persistent = Some(meganeura::PersistentOptions {
             workers,
             track_workers: workers == 3,
+            device_scheduling: false,
             allow_fallback: false,
         });
         let mut session = meganeura::build(&graph, config).0;
@@ -282,6 +473,7 @@ fn session_persistent_regions_combine_independent_ragged_tasks() {
         config.runtime.persistent = Some(meganeura::PersistentOptions {
             workers: 3,
             track_workers: true,
+            device_scheduling: false,
             allow_fallback: false,
         });
         config
@@ -380,18 +572,25 @@ fn session_persistent_regions_combine_independent_ragged_tasks() {
     plan.dispatches[0].output_buffer = a_buffer;
     plan.output_buffers[0] = a_buffer;
     plan.node_buffers[positive as usize].1 = a_buffer;
-    for workers in [1, 64] {
+    for (workers, device_scheduling) in [(1, false), (64, false), (1, true), (64, true)] {
+        if device_scheduling && !gpu.capabilities().device_memory_fence {
+            continue;
+        }
         let mut options = meganeura::SessionOptions::from_env();
         options.persistent = Some(meganeura::PersistentOptions {
             workers,
             track_workers: workers == 3,
+            device_scheduling,
             allow_fallback: false,
         });
         let mut session = meganeura::Session::with_context_opts(plan.clone(), gpu.clone(), options);
         assert_eq!(session.execution_dispatch_count(), 1);
         session.share_parameter_from(&mut source, "a").unwrap();
         session.share_parameter_from(&mut source, "b").unwrap();
-        assert_eq!(session.execution_dispatch_count(), 2);
+        assert_eq!(
+            session.execution_dispatch_count(),
+            if device_scheduling { 1 } else { 2 }
+        );
         let input: Vec<_> = (0..513).map(|i| (i % 17) as f32 - 8.0).collect();
         source.set_parameter("a", &input);
         session.step();
@@ -434,6 +633,7 @@ fn session_persistent_owned_chains_keep_tile_dependencies_local() {
         options.persistent = Some(meganeura::PersistentOptions {
             workers,
             track_workers: workers == 3,
+            device_scheduling: false,
             allow_fallback: false,
         });
         let mut session = meganeura::Session::with_context_opts(plan.clone(), gpu.clone(), options);
@@ -512,6 +712,7 @@ fn session_persistent_fallback_is_explicit_and_strict_rejects_it() {
         config.runtime.persistent = Some(meganeura::PersistentOptions {
             allow_fallback,
             track_workers: true,
+            device_scheduling: false,
             ..Default::default()
         });
         config

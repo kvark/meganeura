@@ -8,8 +8,8 @@ use std::{
 };
 
 /// Opt-in persistent execution of generated pointwise and reduction tiles.
-/// Independent compatible operations share a queue; dependent regions retain
-/// hardware dispatch barriers.
+/// Compatible operations share a queue. Device scheduling additionally orders
+/// whole-operation dependencies inside each supported Vulkan region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct PersistentOptions {
     /// Physical workgroups per eligible dispatch, independent of its tile count.
@@ -19,6 +19,9 @@ pub struct PersistentOptions {
     pub allow_fallback: bool,
     /// Diagnostic per-worker task counters. Adds a queue atomic per claimed task.
     pub track_workers: bool,
+    /// Schedule dependent operations using native device memory fences.
+    /// Requires the qualified Vulkan memory-model path; opt-in during qualification.
+    pub device_scheduling: bool,
 }
 
 impl Default for PersistentOptions {
@@ -27,18 +30,23 @@ impl Default for PersistentOptions {
             workers: 64,
             allow_fallback: true,
             track_workers: false,
+            device_scheduling: false,
         }
     }
 }
 
 impl PersistentOptions {
-    fn queue_stride(self) -> usize {
-        let bytes = if self.track_workers {
-            (self.workers as usize + 1) * 4
+    fn queue_stride(self, tasks: u32) -> usize {
+        let words = if self.device_scheduling {
+            8 + tasks.div_ceil(32) as usize
         } else {
-            4
+            1
+        } + if self.track_workers {
+            self.workers as usize
+        } else {
+            0
         };
-        bytes.next_multiple_of(crate::memplan::ARENA_ALIGNMENT)
+        (words * 4).next_multiple_of(crate::memplan::ARENA_ALIGNMENT)
     }
 }
 
@@ -52,6 +60,8 @@ pub struct ExecutionRegion {
     /// Queue claims: a tile, or a matching tile through a worker-owned chain.
     pub logical_tasks: u64,
     pub worker_owned_chain: bool,
+    /// Whole-operation dependencies are released by the device queue.
+    pub device_scheduled: bool,
     /// Zero denotes ordinary execution.
     pub workers: u32,
     pub workgroup_size: Option<u32>,
@@ -76,6 +86,7 @@ struct Params {
     grids: [[u32; 4]; 3],
     starts: [u32; 4],
     ends: [u32; 4],
+    successors: [u32; 4],
 }
 
 #[derive(blade_macros::ShaderData)]
@@ -94,7 +105,8 @@ pub(super) struct State {
     params: Vec<Params>,
     dispatch_regions: Vec<usize>,
     queue: Option<bg::Buffer>,
-    queue_stride: usize,
+    initial_queue: Option<bg::Buffer>,
+    queue_offsets: Vec<usize>,
     pub groups: Vec<std::ops::Range<usize>>,
 }
 
@@ -198,6 +210,9 @@ fn check_resources(
     options: PersistentOptions,
     chain: bool,
 ) -> Result<u32, String> {
+    if options.device_scheduling && !caps.device_memory_fence {
+        return Err("backend does not support the device memory-fence contract".into());
+    }
     let limits = caps
         .compute_binding_limits
         .ok_or("backend does not report compute binding limits")?;
@@ -252,9 +267,10 @@ fn check_resources(
         ));
     }
     // Blade binds the remaining allocation, not an explicitly sized subrange.
-    if plan.dispatches.len() as u64 * options.queue_stride() as u64
-        > limits.max_storage_buffer_range
-    {
+    let queue_bound = plan.dispatches.iter().try_fold(0usize, |bytes, dispatch| {
+        bytes.checked_add(options.queue_stride(u32::try_from(count(dispatch)).unwrap_or(u32::MAX)))
+    });
+    if queue_bound.is_none_or(|bytes| bytes as u64 > limits.max_storage_buffer_range) {
         return Err("queue allocation exceeds device storage-buffer range".into());
     }
     if chain {
@@ -296,6 +312,26 @@ fn binding_name(slot: usize, name: &str) -> &'static str {
 }
 
 impl State {
+    fn check_completion(&self, words: &[u32]) -> Result<(), String> {
+        for (index, region) in self.report.regions.iter().enumerate() {
+            if !region.device_scheduled {
+                continue;
+            }
+            let base = self.queue_offsets[index] / 4;
+            let end = base + self.params[index].starts[3] as usize;
+            if words[base..end].iter().any(|&word| word != 0) {
+                return Err(format!(
+                    "device region {index} ({}) incomplete: remaining={}, diagnostic={}, counters={:?}",
+                    region.label,
+                    words[base],
+                    words[base + 1],
+                    &words[base + 2..base + 8]
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn pipeline(&self, index: usize) -> Option<&bg::ComputePipeline> {
         self.pipelines[self.dispatch_regions[index]]
             .as_ref()
@@ -323,7 +359,8 @@ impl State {
             "persistent workers must be in 1..=65535"
         );
         let caps = gpu.capabilities();
-        let queue_stride = options.queue_stride();
+        let mut queue_offsets = Vec::new();
+        let mut queue_bytes = 0;
         let mut pipelines = Vec::new();
         let mut params = Vec::new();
         let mut keys = Vec::new();
@@ -350,6 +387,7 @@ impl State {
                 label: dispatch.label.clone(),
                 logical_tasks: count(dispatch),
                 worker_owned_chain: false,
+                device_scheduled: false,
                 workers: 0,
                 workgroup_size: None,
                 fallback_reason: None,
@@ -370,19 +408,25 @@ impl State {
                 grids: [[0; 4]; 3],
                 starts: [0; 4],
                 ends: [0; 4],
+                successors: [0; 4],
             };
             match generated {
                 Ok(first) => {
                     let workgroup_size = first.body.workgroup_size;
                     let mut handlers = vec![first];
-                    let chain = allow_chains
+                    let chain = !options.device_scheduling
+                        && allow_chains
                         && groups[group_index].len() == 1
                         && dispatch.pointwise().is_some();
                     index += 1;
                     // Whole independent operations can be shuffled across workers.
                     // BF16's module-wide helper/preamble is currently singleton-only.
                     while !external && handlers.len() < 3 && index < plan.dispatches.len() {
-                        if chain {
+                        if options.device_scheduling {
+                            if !allow_chains {
+                                break;
+                            }
+                        } else if chain {
                             let next_group = &groups[group_index + handlers.len()];
                             if next_group.start != index || next_group.len() != 1 {
                                 break;
@@ -395,18 +439,24 @@ impl State {
                             != crate::schedule::PointwiseStorage::default()
                             || dispatch.pointwise_storage
                                 != crate::schedule::PointwiseStorage::default()
-                            || !(start..index).all(|prior| {
-                                if chain {
-                                    chain_compatible(
-                                        plan,
-                                        buffers,
-                                        &plan.dispatches[prior],
-                                        candidate,
-                                    )
-                                } else {
-                                    independent(plan, buffers, &plan.dispatches[prior], candidate)
-                                }
-                            })
+                            || (!options.device_scheduling
+                                && !(start..index).all(|prior| {
+                                    if chain {
+                                        chain_compatible(
+                                            plan,
+                                            buffers,
+                                            &plan.dispatches[prior],
+                                            candidate,
+                                        )
+                                    } else {
+                                        independent(
+                                            plan,
+                                            buffers,
+                                            &plan.dispatches[prior],
+                                            candidate,
+                                        )
+                                    }
+                                }))
                         {
                             break;
                         }
@@ -434,6 +484,7 @@ impl State {
                         index += 1;
                     }
                     region.worker_owned_chain = chain && handlers.len() > 1;
+                    region.device_scheduled = options.device_scheduling;
                     region.dispatches.end = index;
                     region.logical_tasks = 0;
                     region.workers = options.workers;
@@ -449,12 +500,40 @@ impl State {
                             " | "
                         });
                     let mut source = String::new();
+                    if region.device_scheduled {
+                        source.push_str("enable wgpu_memory_fence;\n");
+                    }
                     let mut calls = String::new();
                     let mut layouts = Vec::new();
                     for (slot, handler) in handlers.into_iter().enumerate() {
                         let operation = &plan.dispatches[start + slot];
                         region.origin.extend_from_slice(&operation.origin);
-                        source.push_str(&handler.body.source(&format!("h{slot}_")));
+                        let mut body = handler.body.source(&format!("h{slot}_"));
+                        if region.device_scheduled {
+                            let names: Vec<_> = handler
+                                .layout
+                                .bindings
+                                .iter()
+                                .filter(|entry| {
+                                    entry.0 != "dst" && matches!(entry.1, bg::ShaderBinding::Buffer)
+                                })
+                                .map(|entry| entry.0)
+                                .collect();
+                            assert_eq!(names.len(), operation.input_buffers.len());
+                            for (name, &input) in names.into_iter().zip(&operation.input_buffers) {
+                                if plan.dispatches[start..index].iter().any(|writer| {
+                                    writer
+                                        .written_buffers()
+                                        .any(|output| overlaps(plan, buffers, input, output))
+                                }) {
+                                    let declaration = format!("var<storage> h{slot}_{name}:");
+                                    assert!(body.contains(&declaration));
+                                    body = body
+                                        .replace(&declaration, &format!("@coherent {declaration}"));
+                                }
+                            }
+                        }
+                        source.push_str(&body);
                         calls.push_str(
                             &include_str!("../shaders/persistent_handler.wgsl")
                                 .replace("$SLOT", &slot.to_string())
@@ -488,9 +567,34 @@ impl State {
                     region.origin.sort_unstable();
                     region.origin.dedup();
                     region_params.ends[3] = region.logical_tasks as u32;
+                    if region.device_scheduled {
+                        region_params.successors[3] = (region.logical_tasks as u32).div_ceil(32);
+                        region_params.starts[3] = 8 + region_params.successors[3];
+                        for left in start..index {
+                            for right in left + 1..index {
+                                if count(&plan.dispatches[left]) != 0
+                                    && count(&plan.dispatches[right]) != 0
+                                    && !independent(
+                                        plan,
+                                        buffers,
+                                        &plan.dispatches[left],
+                                        &plan.dispatches[right],
+                                    )
+                                {
+                                    region_params.successors[left - start] |= 1 << (right - start);
+                                    region_params.grids[right - start][3] += 1;
+                                }
+                            }
+                        }
+                    }
                     report.persistent_tasks += region.logical_tasks;
+                    let entry = if region.device_scheduled {
+                        include_str!("../shaders/persistent_device.wgsl")
+                    } else {
+                        include_str!("../shaders/persistent_tile.wgsl")
+                    };
                     source.push_str(
-                        &include_str!("../shaders/persistent_tile.wgsl")
+                        &entry
                             .replace("$WORKGROUP", &workgroup_size.to_string())
                             .replace("$HANDLERS", &calls)
                             .replace(
@@ -546,20 +650,64 @@ impl State {
                 }
             }
             dispatch_regions[start..index].fill(report.regions.len());
+            queue_offsets.push(queue_bytes);
+            queue_bytes += options.queue_stride(if region.workers == 0 {
+                0
+            } else {
+                region.logical_tasks as u32
+            });
             report.regions.push(region);
             params.push(region_params);
         }
         report.graph_dispatches = report.regions.len();
-        let queue = if pipelines.iter().any(Option::is_some) {
-            report.scheduler_bytes = report.regions.len() * queue_stride;
+        let (queue, initial_queue) = if pipelines.iter().any(Option::is_some) {
+            report.scheduler_bytes = queue_bytes * if options.device_scheduling { 2 } else { 1 };
             super::ensure_device_memory_budget(gpu, report.scheduler_bytes, "persistent queues");
-            Some(gpu.create_buffer(bg::BufferDesc {
+            let queue = gpu.create_buffer(bg::BufferDesc {
                 name: "persistent queues",
-                size: report.scheduler_bytes as u64,
+                size: queue_bytes as u64,
                 memory: bg::Memory::Device,
-            }))
+            });
+            let initial_queue = options.device_scheduling.then(|| {
+                let mut initial = vec![0u32; queue_bytes / 4];
+                for (index, region) in report.regions.iter().enumerate() {
+                    if !region.device_scheduled {
+                        continue;
+                    }
+                    let base = queue_offsets[index] / 4;
+                    let params = &params[index];
+                    initial[base] = region.logical_tasks as u32;
+                    for slot in 0..region.dispatches.len() {
+                        initial[base + 2 + slot] = params.ends[slot] - params.starts[slot];
+                        initial[base + 5 + slot] = params.grids[slot][3];
+                        if params.grids[slot][3] == 0 {
+                            for word in params.starts[slot] / 32..params.ends[slot].div_ceil(32) {
+                                let lo = params.starts[slot].saturating_sub(word * 32);
+                                let hi = (params.ends[slot] - word * 32).min(32);
+                                let mask = if hi == 32 { u32::MAX } else { (1 << hi) - 1 };
+                                initial[base + 8 + word as usize] |= mask & (u32::MAX << lo);
+                            }
+                        }
+                    }
+                }
+                let reset = gpu.create_buffer(bg::BufferDesc {
+                    name: "initial device queues",
+                    size: queue_bytes as u64,
+                    memory: bg::Memory::Upload,
+                });
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        initial.as_ptr(),
+                        reset.data().cast(),
+                        initial.len(),
+                    );
+                }
+                gpu.sync_buffer(reset.into(), queue_bytes as u64, bg::BufferTarget::Data);
+                reset
+            });
+            (Some(queue), initial_queue)
         } else {
-            None
+            (None, None)
         };
         // Conservative physical barriers also order distinct imported handles
         // that may alias the same allocation and whose overlap is unknowable.
@@ -581,18 +729,20 @@ impl State {
             params,
             dispatch_regions,
             queue,
-            queue_stride,
+            initial_queue,
+            queue_offsets,
             groups,
         }
     }
 
     pub fn reset(&self, encoder: &mut bg::CommandEncoder) -> bool {
         if let Some(queue) = self.queue {
-            encoder.transfer("reset persistent queues").fill_buffer(
-                queue.at(0),
-                self.report.scheduler_bytes as u64,
-                0,
-            );
+            let mut transfer = encoder.transfer("reset persistent queues");
+            if let Some(initial) = self.initial_queue {
+                transfer.copy_buffer_to_buffer(initial.into(), queue.into(), queue.size());
+            } else {
+                transfer.fill_buffer(queue.into(), queue.size(), 0);
+            }
             true
         } else {
             false
@@ -622,7 +772,7 @@ impl State {
         pc.bind(
             region.dispatches.len() as u32,
             &QueueData {
-                persistent_queue: self.queue.unwrap().at((index * self.queue_stride) as u64),
+                persistent_queue: self.queue.unwrap().at(self.queue_offsets[index] as u64),
                 persistent_params: self.params[index],
             },
         );
@@ -636,10 +786,38 @@ impl Drop for State {
         if let Some(queue) = self.queue {
             self.gpu.destroy_buffer(queue);
         }
+        if let Some(initial) = self.initial_queue {
+            self.gpu.destroy_buffer(initial);
+        }
     }
 }
 
 impl Session {
+    /// Validate device-scheduled queues after an executed step. Waits for tracked
+    /// submissions and downloads queue state, so call outside timed intervals.
+    /// External records must first be submitted and tracked with the Session.
+    /// Returns an error for unfinished tasks, undrained counters or diagnostics.
+    /// Ordinary and portable persistent regions have no device completion state.
+    pub fn validate_persistent_completion(&mut self) -> Result<(), String> {
+        self.wait();
+        let Some(ref state) = self.persistent else {
+            return Ok(());
+        };
+        if !state.options.device_scheduling {
+            return Ok(());
+        }
+        let Some(queue) = state.queue else {
+            return Ok(());
+        };
+        let mut words = vec![0u32; queue.size() as usize / 4];
+        self.read_staged_f32(
+            queue.into(),
+            bytemuck::cast_slice_mut(&mut words),
+            &mut self.readback.borrow_mut(),
+        );
+        state.check_completion(&words)
+    }
+
     /// Number of physical graph launches. Persistent regions may implement
     /// several compiled operations; runtime-appended work is separate.
     pub fn execution_dispatch_count(&self) -> usize {
@@ -696,13 +874,16 @@ impl Session {
             return None;
         }
         let queue = state.queue?;
-        let mut words = vec![0u32; state.report.scheduler_bytes / 4];
+        let mut words = vec![0u32; queue.size() as usize / 4];
         // The staging helper copies raw words without floating-point operations.
         self.read_staged_f32(
             queue.at(0),
             bytemuck::cast_slice_mut(&mut words),
             &mut self.readback.borrow_mut(),
         );
+        state
+            .check_completion(&words)
+            .expect("persistent task completion");
         Some(
             state
                 .report
@@ -710,7 +891,12 @@ impl Session {
                 .iter()
                 .enumerate()
                 .map(|(index, region)| {
-                    let start = index * state.queue_stride / 4 + 1;
+                    let start = state.queue_offsets[index] / 4
+                        + if region.device_scheduled {
+                            state.params[index].starts[3] as usize
+                        } else {
+                            1
+                        };
                     words[start..start + region.workers as usize].to_vec()
                 })
                 .collect(),
@@ -733,6 +919,7 @@ impl Session {
                         label: d.label.clone(),
                         logical_tasks: d.workgroups.into_iter().map(u64::from).product(),
                         worker_owned_chain: false,
+                        device_scheduled: false,
                         workers: 0,
                         workgroup_size: None,
                         fallback_reason: None,

@@ -133,7 +133,18 @@ fn persistent_execution_reports_actual_coverage() {
             allow_fallback: false,
             ..Default::default()
         }),
+        Some(meganeura::PersistentOptions {
+            workers: 3,
+            allow_fallback: false,
+            device_scheduling: true,
+            ..Default::default()
+        }),
     ] {
+        if persistent.is_some_and(|options| options.device_scheduling)
+            && !gpu::shared_context().capabilities().device_memory_fence
+        {
+            continue;
+        }
         let options = gpu::Options {
             persistent,
             ..Default::default()
@@ -142,6 +153,13 @@ fn persistent_execution_reports_actual_coverage() {
         report.assert_passed("persistent coverage");
         let execution = report.execution.unwrap();
         assert_eq!(execution.persistent, persistent);
+        assert_eq!(
+            execution
+                .regions
+                .iter()
+                .all(|region| region.device_scheduled),
+            persistent.is_some_and(|options| options.device_scheduling)
+        );
         assert!(!execution.regions.is_empty());
         assert_eq!(execution.persistent_tasks > 0, persistent.is_some());
         assert!(
