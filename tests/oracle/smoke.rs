@@ -116,3 +116,42 @@ fn poison_reaches_unwritten_memory() {
     session.read_output_by_index(0, &mut out);
     assert!(out.iter().all(|v| v.is_nan()), "{:?}", &out[..4]);
 }
+
+#[test]
+fn persistent_execution_reports_actual_coverage() {
+    let mut graph = Graph::new();
+    let input = graph.input("x", &[3, 259]);
+    let mapped = graph.silu(input);
+    let reduced = graph.sum_inner(mapped);
+    graph.set_outputs(vec![mapped, reduced]);
+    let mut feeds = Feeds::new();
+    feeds.fill_random(&graph, 421, 1.0);
+    for persistent in [
+        None,
+        Some(meganeura::PersistentOptions {
+            workers: 3,
+            allow_fallback: false,
+        }),
+    ] {
+        let options = gpu::Options {
+            persistent,
+            ..Default::default()
+        };
+        let report = gpu::check_inference(&graph, &feeds, &options).unwrap();
+        report.assert_passed("persistent coverage");
+        let execution = report.execution.unwrap();
+        assert_eq!(execution.persistent, persistent);
+        assert!(!execution.regions.is_empty());
+        assert_eq!(execution.persistent_tasks > 0, persistent.is_some());
+        assert!(
+            execution
+                .regions
+                .iter()
+                .all(|region| region.fallback_reason.is_none())
+        );
+        assert_eq!(
+            execution.regions.iter().all(|region| region.workers > 0),
+            persistent.is_some()
+        );
+    }
+}

@@ -24,7 +24,7 @@ fn config(mode: Mode, coop: bool) -> SessionConfig<'static> {
             } else {
                 CoopPolicy::Disabled
             },
-            ..SessionOptions::default()
+            ..meganeura::SessionOptions::from_env()
         },
         ..crate::support::gpu::config()
     }

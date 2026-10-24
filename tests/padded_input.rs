@@ -15,7 +15,7 @@ fn logical_input_uploads_clear_padding_and_reject_wrong_shapes() {
         crate::support::gpu::gpu().clone(),
         SessionOptions {
             coop: CoopPolicy::Disabled,
-            ..Default::default()
+            ..meganeura::SessionOptions::from_env()
         },
     );
     // Retain full-slot uploads for callers already supplying their own padding.

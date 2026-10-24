@@ -59,9 +59,9 @@ fn tune_preserves_correctness() {
             mode: Mode::Inference,
             runtime: SessionOptions {
                 coop: CoopPolicy::Disabled,
-                ..Default::default()
+                ..meganeura::SessionOptions::from_env()
             },
-            ..Default::default()
+            ..crate::support::gpu::config()
         },
     );
 
@@ -284,9 +284,9 @@ fn preserves_training_state(
             runtime: SessionOptions {
                 debug: true,
                 coop: CoopPolicy::Disabled,
-                ..Default::default()
+                ..meganeura::SessionOptions::from_env()
             },
-            ..Default::default()
+            ..crate::support::gpu::config()
         },
     );
     session.set_input("x", &vec![0.25; 33 * 17]);
@@ -302,9 +302,9 @@ fn preserves_training_state(
             runtime: SessionOptions {
                 debug: true,
                 coop: CoopPolicy::Disabled,
-                ..Default::default()
+                ..meganeura::SessionOptions::from_env()
             },
-            ..Default::default()
+            ..crate::support::gpu::config()
         },
     );
     control.set_input("x", &vec![0.25; 33 * 17]);
@@ -400,9 +400,9 @@ fn qualify_scalar_entries(staging: TuneStaging, staging_reuse: TuneStagingReuse)
                     mode: Mode::Inference,
                     runtime: SessionOptions {
                         coop: CoopPolicy::Disabled,
-                        ..Default::default()
+                        ..meganeura::SessionOptions::from_env()
                     },
-                    ..Default::default()
+                    ..crate::support::gpu::config()
                 },
             );
             let report = session
@@ -451,9 +451,9 @@ fn tune_budget_skips_leave_selection_unchanged() {
             mode: Mode::Inference,
             runtime: SessionOptions {
                 coop: CoopPolicy::Disabled,
-                ..Default::default()
+                ..meganeura::SessionOptions::from_env()
             },
-            ..Default::default()
+            ..crate::support::gpu::config()
         },
     );
     let before = session.dispatch_pipeline_keys();
@@ -520,9 +520,9 @@ fn tuning_releases_retained_staging_after_a_later_scratch_skip() {
             )),
             runtime: SessionOptions {
                 coop: CoopPolicy::Disabled,
-                ..Default::default()
+                ..meganeura::SessionOptions::from_env()
             },
-            ..Default::default()
+            ..crate::support::gpu::config()
         },
     );
     let report = session
@@ -611,7 +611,7 @@ fn tune_native_cooperative_f32() {
                 SessionConfig {
                     gpu: Some(std::sync::Arc::clone(&gpu)),
                     mode: Mode::Inference,
-                    ..Default::default()
+                    ..crate::support::gpu::config()
                 },
             );
             let report = session
@@ -664,9 +664,9 @@ fn tune_tiled_native_f32() {
                 tune: false,
                 runtime: SessionOptions {
                     coop: CoopPolicy::NativeF32,
-                    ..Default::default()
+                    ..meganeura::SessionOptions::from_env()
                 },
-                ..Default::default()
+                ..crate::support::gpu::config()
             },
         );
         let report = session
@@ -716,9 +716,9 @@ fn tune_split_native_f32_sequences() {
                 tune: false,
                 runtime: SessionOptions {
                     coop: CoopPolicy::NativeF32,
-                    ..Default::default()
+                    ..meganeura::SessionOptions::from_env()
                 },
-                ..Default::default()
+                ..crate::support::gpu::config()
             },
         );
         let report = session

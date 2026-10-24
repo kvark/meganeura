@@ -5032,7 +5032,19 @@ impl Session {
         self.pipelines
             .selected
             .iter()
-            .map(|selected| selected.0.label())
+            .enumerate()
+            .map(|(index, selected)| {
+                let key = selected.0.label();
+                if self
+                    .persistent
+                    .as_ref()
+                    .is_some_and(|state| state.pipeline(index).is_some())
+                {
+                    format!("persistent:{key}")
+                } else {
+                    key
+                }
+            })
             .collect()
     }
 
@@ -5056,7 +5068,7 @@ impl Session {
     pub fn get_pipeline_statistics(
         &self,
     ) -> Vec<(String, Vec<blade_graphics::PipelineExecutableInfo>)> {
-        let mut result = Vec::new();
+        let mut result = self.persistent_pipeline_statistics();
         for (name, pipeline) in self.pipelines.all_pipelines() {
             let stats = self.gpu.get_pipeline_statistics(pipeline);
             if !stats.is_empty() {
@@ -5069,7 +5081,7 @@ impl Session {
     pub(crate) fn get_profile_pipeline_statistics(
         &self,
     ) -> Vec<(String, Vec<blade_graphics::PipelineExecutableInfo>)> {
-        let mut result = Vec::new();
+        let mut result = self.persistent_pipeline_statistics();
         for (name, pipeline) in self.pipelines.all_profile_pipelines() {
             let stats = self.gpu.get_pipeline_statistics(pipeline);
             if !stats.is_empty() {
@@ -5077,6 +5089,26 @@ impl Session {
             }
         }
         result.sort_by(|a, b| a.0.cmp(&b.0));
+        result
+    }
+
+    fn persistent_pipeline_statistics(
+        &self,
+    ) -> Vec<(String, Vec<blade_graphics::PipelineExecutableInfo>)> {
+        let mut result = Vec::new();
+        if let Some(ref state) = self.persistent {
+            let mut seen = std::collections::HashSet::new();
+            for (index, key) in self.dispatch_pipeline_keys().into_iter().enumerate() {
+                if let Some(pipeline) = state.pipeline(index) {
+                    if seen.insert(key.clone()) {
+                        let stats = self.gpu.get_pipeline_statistics(pipeline);
+                        if !stats.is_empty() {
+                            result.push((key, stats));
+                        }
+                    }
+                }
+            }
+        }
         result
     }
 }

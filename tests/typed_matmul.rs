@@ -97,7 +97,7 @@ fn typed_staging_handles_vector_tails_and_split_output() {
                             gpu.clone(),
                             meganeura::SessionOptions {
                                 poison: true,
-                                ..Default::default()
+                                ..meganeura::SessionOptions::from_env()
                             },
                         );
                         session.set_parameter("a", &a);
@@ -279,7 +279,7 @@ fn native_signed_products_and_cancellation() {
                         gpu.clone(),
                         meganeura::SessionOptions {
                             poison: true,
-                            ..Default::default()
+                            ..meganeura::SessionOptions::from_env()
                         },
                     );
                     s.set_parameter("a", &av);
@@ -348,7 +348,7 @@ fn unsupported_device_reports_f16_matrix_requirement() {
     };
     let plan = meganeura::compile::compile(&graph(DType::F16, 0));
     let panic = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        meganeura::Session::with_context(plan, context)
+        meganeura::Session::with_context_opts(plan, context, meganeura::SessionOptions::from_env())
     })) {
         Ok(_) => panic!("unsupported device accepted an F16 matrix plan"),
         Err(panic) => panic,

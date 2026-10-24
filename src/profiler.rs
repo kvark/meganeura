@@ -318,6 +318,7 @@ pub struct SessionProfile {
     pub families: Vec<FamilyProfile>,
     pub dispatches: Vec<DispatchProfile>,
     pub pipeline_statistics: Vec<PipelineProfile>,
+    pub execution: crate::ExecutionReport,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -342,6 +343,7 @@ pub struct ProfilePlan {
     pub adam_state_bytes: usize,
     pub grad_accumulator_bytes: usize,
     pub optimizer_aux_bytes: usize,
+    pub scheduler_bytes: usize,
     pub device_local_bytes: usize,
     pub physical_allocation_count: usize,
 }
@@ -396,7 +398,9 @@ pub struct DispatchProfile {
     pub origin: Vec<u32>,
     pub timestamp_label: String,
     pub pipeline: String,
+    /// Actual launch geometry, including persistent worker pools.
     pub workgroups: [u32; 3],
+    pub logical_workgroups: [u32; 3],
     pub workgroup_count: u64,
     pub input_buffer_bytes: usize,
     pub output_buffer_bytes: usize,
@@ -625,6 +629,7 @@ fn capture_windows(
 
     let plan = session.plan();
     let pipeline_keys = session.dispatch_pipeline_keys();
+    let execution = session.execution_report();
     let loss_dispatch = plan.loss_buffer.and_then(|loss| {
         plan.dispatches.iter().rposition(|dispatch| {
             dispatch.output_buffer == loss || dispatch.extra_outputs.contains(&loss)
@@ -668,6 +673,12 @@ fn capture_windows(
                 .map(|buffer| plan.buffers[buffer.0 as usize])
                 .sum::<usize>();
         let median_ms = dispatch_medians[index];
+        let workers = execution.regions[index].workers;
+        let workgroups = if workers != 0 {
+            [workers, 1, 1]
+        } else {
+            dispatch.workgroups
+        };
         dispatches.push(DispatchProfile {
             index,
             phase: phases[index].to_string(),
@@ -677,12 +688,9 @@ fn capture_windows(
             origin: dispatch.origin.clone(),
             timestamp_label: timestamp_labels[index].clone(),
             pipeline: pipeline_keys[index].clone(),
-            workgroups: dispatch.workgroups,
-            workgroup_count: dispatch
-                .workgroups
-                .iter()
-                .map(|&value| u64::from(value))
-                .product(),
+            workgroups,
+            logical_workgroups: dispatch.workgroups,
+            workgroup_count: workgroups.iter().map(|&value| u64::from(value)).product(),
             input_buffer_bytes,
             output_buffer_bytes,
             cooperative: dispatch.use_coop(),
@@ -771,7 +779,7 @@ fn capture_windows(
     let timing_contract = "Blade calibrated pass-start timestamps on the process monotonic clock; each interval ends at the next pass start or final submission completion; one compute pass per timed plan dispatch, with the dispatches outside the replay's window batched into one untimed pass per side";
 
     Ok(SessionProfile {
-        schema_version: 2,
+        schema_version: 3,
         timing_contract: timing_contract.to_string(),
         device: ProfileDevice {
             backend: if device.driver_name == "Metal" {
@@ -795,6 +803,7 @@ fn capture_windows(
             adam_state_bytes: memory.adam_state_bytes,
             grad_accumulator_bytes: memory.grad_accumulator_bytes,
             optimizer_aux_bytes: memory.optimizer_aux_bytes,
+            scheduler_bytes: memory.scheduler_bytes,
             device_local_bytes: memory.device_local_bytes,
             physical_allocation_count: memory.num_allocations,
         },
@@ -819,6 +828,7 @@ fn capture_windows(
         families,
         dispatches,
         pipeline_statistics,
+        execution,
     })
 }
 

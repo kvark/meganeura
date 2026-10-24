@@ -18,7 +18,7 @@ Implementation evidence:
   was bumped. Validation: 27 schedule unit tests and all 167 oracle tests
   passed on NVIDIA with Vulkan synchronization validation; library Clippy
   passed with all features.
-- Initial Session path: eligible operations now use persistent tile queues
+- `e1e4594`: eligible operations now use persistent tile queues
   with ordinary operation boundaries, direct Session bindings, GPU queue
   reset, explicit coverage/fallback reports, and strict rejection. This step
   retains one launch per operation; combining operations into regions remains
@@ -31,8 +31,19 @@ Implementation evidence:
   profiling expectation needing the reset's timestamp slot; all six profiling
   tests passed after correcting it (21 regression tests were ignored).
   The focused Session tests also passed on lavapipe. All 505 unit tests and
-  all-target/all-feature Clippy passed. Tests with explicit default sessions
-  still need the harness audit below before claiming complete backend coverage.
+  all-target/all-feature Clippy passed.
+- Harness audit: replaced default-only test session construction with shared
+  environment configuration; the allocation-reuse control remains explicitly
+  ordinary. Oracle reports now carry execution coverage, and an eligible
+  oracle case asserts strict persistent coverage as well as numerical results.
+  Ordinary and persistent-with-fallback runs both passed 168 oracle,
+  182 regression, 68 smoke, and 22 GGUF tests on NVIDIA (21 regression and two
+  smoke tests ignored). Lavapipe verified the unsupported F16/BF16 capability
+  errors. Strict checks reject runtime optimizer fallback before any update.
+  The CI latency example ran in both modes and records raw samples, coverage,
+  memory, and construction times. It retains its existing forward/backward
+  metric and adds a separate SGD metric with a parameter-update assertion.
+  These short, unpaired CI runs do not satisfy the production measurement gate.
 
 The objective is to run Meganeura graphs through persistent GPU workers using
 the ordinary `Graph` / `build` / `Session` interface, and qualify them with the
@@ -78,15 +89,15 @@ logical workgroup/tile range, parameters, and session buffer references.
 
 - [x] Add typed execution options through `SessionConfig.runtime` /
   `SessionOptions`; keep the exact API small and decide names during implementation.
-- [ ] Add a construction report with selected execution mode, persistent
+- [x] Add a construction report with selected execution mode, persistent
   regions, logical tasks, physical dispatches, worker configuration, and
   fallback spans/reasons. Preserve origin node IDs for diagnostics.
-- [ ] Integrate both `step()` and externally recorded execution, including
+- [x] Integrate both `step()` and externally recorded execution, including
   waiting, destruction, repeated steps, and submission chunk boundaries.
-- [ ] Specify profiling and tuning behavior for regions. Report region-level
+- [x] Specify profiling and tuning behavior for regions. Report region-level
   timings honestly; do not invent individual kernel timings inside one launch.
   Rebuild or invalidate region plans when tuning changes their kernels.
-- [ ] Include execution mode, handler/configuration identity, and relevant
+- [x] Include execution mode, handler/configuration identity, and relevant
   compiler/backend capabilities in affected cache keys.
 
 ### 1.2 Region planning and session storage
@@ -113,29 +124,29 @@ logical workgroup/tile range, parameters, and session buffer references.
 - [x] Refactor generated pointwise and reduction kernels into callable tile
   bodies shared by ordinary and persistent entry points. Preserve the
   existing schedule representation instead of adding a second operator list.
-- [ ] Pass logical dispatch geometry explicitly. Audit early returns, uniform
+- [x] Pass logical dispatch geometry explicitly. Audit early returns, uniform
   control flow, subgroup assumptions, barrier placement, and reused scratch.
 - [ ] Group handlers by compatible workgroup/resource requirements. Do not
   force existing 32/128/256-thread or cooperative kernels into the prototype's
   64-thread geometry. Account for combined register/shared-memory occupancy.
-- [ ] Keep unsupported operators, variants, and dtype combinations as
+- [x] Keep unsupported operators, variants, and dtype combinations as
   explicit ordinary spans. Matrix/attention/convolution kernels can be added
   after this first generated-handler path is qualified.
 
 ### 1.4 Existing harness integration
 
-- [ ] Thread execution selection through `reference::gpu::Options`, its
+- [x] Thread execution selection through `reference::gpu::Options`, its
   lowering variants, shared test helpers, and benchmark session construction.
   Audit tests that construct default sessions directly so the requested
   backend is actually exercised.
-- [ ] Run existing oracle, smoke, regression, and available model tests under
+- [x] Run existing oracle, smoke, regression, and available model tests under
   ordinary and persistent-with-fallback configurations. Keep existing
   tolerances, precision policies, poisoning, and hardware capability gates.
 - [ ] Run eligible pointwise/reduction cases in strict mode and assert both
   numerical results and actual persistent coverage. Cover partial tiles,
   mixed task lengths, fan-out/fan-in boundaries, empty work, in-place accesses,
   repeated resets, and pools smaller/larger than the task count.
-- [ ] Check repeated inference, training state updates, gradient accumulation,
+- [x] Check repeated inference, training state updates, gradient accumulation,
   clipping, KV-cache mutation, checkpoint restore, sharing/rebinding, and
   external submission behavior through their existing tests. In this phase,
   optimizer/clipping/accumulation may remain ordinary spans and must be reported.

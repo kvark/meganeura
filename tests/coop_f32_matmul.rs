@@ -108,7 +108,7 @@ fn native_f32_staging_preserves_split_reduction_order() {
                             gpu.clone(),
                             SessionOptions {
                                 coop: CoopPolicy::NativeF32,
-                                ..Default::default()
+                                ..meganeura::SessionOptions::from_env()
                             },
                         );
                         session.set_input("a", &a);

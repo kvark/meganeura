@@ -52,7 +52,7 @@ fn adaptive_optimizers_preserve_tiny_variance_and_nonfinite_state() {
                 gpu.clone(),
                 meganeura::SessionOptions {
                     poison: true,
-                    ..Default::default()
+                    ..meganeura::SessionOptions::from_env()
                 },
             );
             if laprop {

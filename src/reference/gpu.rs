@@ -156,6 +156,7 @@ pub fn check_inference_against(
     session.wait();
     let mut report = Report {
         shaders: dispatched(&session),
+        execution: Some(session.execution_report()),
         ..Report::default()
     };
     for (index, &id) in graph.outputs().iter().enumerate() {
@@ -192,6 +193,7 @@ pub fn check_training(graph: &Graph, feeds: &Feeds, options: &Options) -> Result
 
     let mut report = Report {
         shaders: dispatched(&session),
+        execution: Some(session.execution_report()),
         ..Report::default()
     };
     let loss_id = backward.outputs()[0];

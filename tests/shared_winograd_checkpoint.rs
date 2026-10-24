@@ -46,7 +46,7 @@ fn portable_checkpoint_roundtrips_between_direct_and_shared_winograd() {
                     no_winograd: direct,
                     ..Default::default()
                 },
-                ..Default::default()
+                ..crate::support::gpu::config()
             },
         )
         .0

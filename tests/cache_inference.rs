@@ -4,7 +4,6 @@
 /// Pipeline: build graph → optimize → compile → save plan →
 ///           load plan → verify structure → infer from loaded plan.
 use meganeura::compile::ExecutionPlan;
-use meganeura::runtime::Session;
 use meganeura::{Graph, cache, compile, optimize};
 
 fn build_graph() -> Graph {
@@ -90,7 +89,7 @@ fn infer_from_loaded_plan() {
         .expect("cache should hit");
 
     // Build a GPU session from the loaded plan and run inference
-    let mut session = Session::new(loaded);
+    let mut session = crate::support::gpu::from_plan(loaded);
 
     session.set_parameter("w1", &[0.1_f32; 8 * 5]);
     session.set_parameter("b1", &[0.01_f32; 5]);

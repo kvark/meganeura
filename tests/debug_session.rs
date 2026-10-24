@@ -28,7 +28,7 @@ fn read_node_by_name_matches_cpu() {
             mode: Mode::Inference,
             runtime: SessionOptions {
                 debug: true,
-                ..Default::default()
+                ..meganeura::SessionOptions::from_env()
             },
             ..crate::support::gpu::config()
         },
@@ -90,7 +90,7 @@ fn step_debug_attributes_first_nan() {
             mode: Mode::Inference,
             runtime: SessionOptions {
                 debug: true,
-                ..Default::default()
+                ..meganeura::SessionOptions::from_env()
             },
             ..crate::support::gpu::config()
         },

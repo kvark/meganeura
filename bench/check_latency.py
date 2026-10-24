@@ -18,7 +18,8 @@ THRESHOLD = 0.20
 
 METRICS = [
     ("forward_median_ms", "Forward median"),
-    ("train_step_median_ms", "Train step median"),
+    ("train_step_median_ms", "Forward/backward median"),
+    ("train_update_median_ms", "With SGD median"),
 ]
 
 

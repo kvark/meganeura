@@ -113,7 +113,7 @@ fn cooperative_hardware_subtile_forward_and_input_match_f64() {
                 Arc::clone(&gpu),
                 SessionOptions {
                     coop: policy,
-                    ..Default::default()
+                    ..meganeura::SessionOptions::from_env()
                 },
             );
             let selected = session
@@ -275,7 +275,7 @@ fn bf16_convolution_storage_and_master_gradients() {
                     Arc::clone(&gpu),
                     SessionOptions {
                         coop: CoopPolicy::NativeF32,
-                        ..Default::default()
+                        ..meganeura::SessionOptions::from_env()
                     },
                 );
                 assert!(session.plan().dispatches.iter().any(|d| matches!(d.shader,
@@ -495,7 +495,7 @@ fn run_split(
         SessionOptions {
             coop: policy,
             no_alias: true, // Keep forward output available for the independent full oracle.
-            ..Default::default()
+            ..meganeura::SessionOptions::from_env()
         },
     );
     let cooperative = policy != CoopPolicy::Disabled;
@@ -821,15 +821,16 @@ fn optimizer_updates(measure: bool, tile: u32) {
         let mut sessions: Vec<_> = [(1, true), (3, true), (3, false)]
             .into_iter()
             .map(|(splits, no_alias)| {
-                let mut session = Session::with_context_opts(
-                    plan(s, tile, splits).0,
-                    Arc::clone(&gpu),
-                    SessionOptions {
-                        coop: CoopPolicy::Disabled,
-                        no_alias,
-                        ..Default::default()
-                    },
-                );
+                let mut options = SessionOptions::from_env();
+                options.coop = CoopPolicy::Disabled;
+                options.no_alias = no_alias;
+                if !no_alias {
+                    // This control must actually reuse allocations; persistent
+                    // sessions currently disable intermediate lifetime aliasing.
+                    options.persistent = None;
+                }
+                let mut session =
+                    Session::with_context_opts(plan(s, tile, splits).0, Arc::clone(&gpu), options);
                 session.set_parameter("x", &data(nx, 7, 1.0));
                 session.set_parameter("w", &data(nw, 19, 1.0));
                 if adam {

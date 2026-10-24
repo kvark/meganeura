@@ -275,6 +275,20 @@ fn windowed_capture_times_every_dispatch_and_preserves_the_result() {
     assert_eq!(profile.dispatches.len(), dispatch_count);
     for (index, dispatch) in profile.dispatches.iter().enumerate() {
         assert_eq!(dispatch.index, index);
+        let workers = profile.execution.regions[index].workers;
+        assert_eq!(dispatch.pipeline.starts_with("persistent:"), workers != 0);
+        assert_eq!(
+            dispatch.logical_workgroups,
+            session.plan().dispatches[index].workgroups
+        );
+        assert_eq!(
+            dispatch.workgroups,
+            if workers != 0 {
+                [workers, 1, 1]
+            } else {
+                dispatch.logical_workgroups
+            }
+        );
         assert_eq!(
             dispatch.timing_samples_ms.len(),
             SAMPLES,
@@ -316,7 +330,7 @@ fn a_plan_within_the_budget_is_captured_in_one_replay() {
         |session| session.set_input("x", &input()),
         CaptureOptions {
             samples: 1,
-            include_pipeline_statistics: false,
+            include_pipeline_statistics: true,
             ..CaptureOptions::default()
         },
     )

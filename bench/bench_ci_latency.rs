@@ -20,7 +20,7 @@ fn main() {
 
     // ── Build & compile (not timed) ──
 
-    // Training graph (forward + backward + SGD)
+    // Training graph, measured both with and without an SGD update.
     let mut g = Graph::new();
     let x = g.input("x", &[batch, input_dim]);
     let labels = g.input("labels", &[batch, classes]);
@@ -38,7 +38,9 @@ fn main() {
     let out = g.matmul(h2, w3);
     let loss = g.cross_entropy_loss(out, labels);
     g.set_outputs(vec![loss]);
+    let construction = Instant::now();
     let mut train_session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
+    let train_construction_ms = construction.elapsed().as_secs_f64() * 1000.0;
 
     // Inference graph (forward only, logits output)
     let mut g_inf = Graph::new();
@@ -56,8 +58,10 @@ fn main() {
     let w3i = g_inf.parameter("w3", &[hidden, classes]);
     let logits = g_inf.matmul(h2i, w3i);
     g_inf.set_outputs(vec![logits]);
+    let construction = Instant::now();
     let mut inf_session =
         meganeura::build(&g_inf, meganeura::SessionConfig::inference_from_env()).0;
+    let forward_construction_ms = construction.elapsed().as_secs_f64() * 1000.0;
 
     // Load weights (not timed)
     let w1_data = vec![0.01_f32; input_dim * hidden];
@@ -114,7 +118,7 @@ fn main() {
         fwd_times.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
 
-    // Training step (forward + backward + SGD)
+    // Forward + backward: preserve the existing CI metric and its baseline.
     let mut train_times = Vec::with_capacity(runs);
     for _ in 0..runs {
         let t0 = Instant::now();
@@ -126,28 +130,76 @@ fn main() {
         train_times.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
 
+    let train_execution = train_session.execution_report();
+    let loss_before_updates = train_session.read_loss();
+    train_session.set_learning_rate(0.001);
+    for _ in 0..warmup {
+        train_session.set_input("x", &x_data);
+        train_session.set_input("labels", &labels_data);
+        train_session.step();
+        train_session.wait();
+        let _ = train_session.read_loss();
+    }
+    let mut update_times = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let t0 = Instant::now();
+        train_session.set_input("x", &x_data);
+        train_session.set_input("labels", &labels_data);
+        train_session.step();
+        train_session.wait();
+        let _ = train_session.read_loss();
+        update_times.push(t0.elapsed().as_secs_f64() * 1000.0);
+    }
+
     // ── Statistics ──
     let fwd_avg = fwd_times.iter().sum::<f64>() / runs as f64;
-    let fwd_med = median(&mut fwd_times);
+    let fwd_med = median(&fwd_times);
     let train_avg = train_times.iter().sum::<f64>() / runs as f64;
-    let train_med = median(&mut train_times);
+    let train_med = median(&train_times);
     let loss_val = train_session.read_loss();
     assert!(loss_val.is_finite(), "loss not finite: {}", loss_val);
+    let mut trained = vec![0.0; w3_data.len()];
+    train_session.read_param("w3", &mut trained);
+    assert!(trained.iter().all(|x| x.is_finite()));
+    assert_ne!(
+        trained, w3_data,
+        "the training benchmark did not update parameters"
+    );
 
     // ── JSON output ──
-    println!("{{");
-    println!("  \"benchmark\": \"ci_latency\",");
-    println!("  \"forward_avg_ms\": {:.2},", fwd_avg);
-    println!("  \"forward_median_ms\": {:.2},", fwd_med);
-    println!("  \"train_step_avg_ms\": {:.2},", train_avg);
-    println!("  \"train_step_median_ms\": {:.2},", train_med);
-    println!("  \"loss\": {:.6},", loss_val);
-    println!("  \"runs\": {},", runs);
-    println!("  \"warmup\": {}", warmup);
-    println!("}}");
+    println!(
+        "{}",
+        serde_json::json!({
+            "benchmark": "ci_latency",
+            "forward_avg_ms": fwd_avg,
+            "forward_median_ms": fwd_med,
+            "train_step_avg_ms": train_avg,
+            "train_step_median_ms": train_med,
+            "forward_samples_ms": fwd_times,
+            "train_step_samples_ms": train_times,
+            "train_update_avg_ms": update_times.iter().sum::<f64>() / runs as f64,
+            "train_update_median_ms": median(&update_times),
+            "train_update_samples_ms": update_times,
+            "forward_construction_ms": forward_construction_ms,
+            "train_construction_ms": train_construction_ms,
+            "forward_resident_bytes": inf_session.memory_summary().total_allocated_bytes(),
+            "train_resident_bytes": train_session.memory_summary().total_allocated_bytes(),
+            "forward_execution": inf_session.execution_report(),
+            "train_execution": train_execution,
+            "train_update_execution": train_session.execution_report(),
+            "device": inf_session.device_information().device_name,
+            "driver": inf_session.device_information().driver_name,
+            "loss": loss_before_updates,
+            "loss_after_updates": loss_val,
+            "learning_rate": 0.001,
+            "runs": runs,
+            "warmup": warmup,
+        })
+    );
 }
 
-fn median(v: &mut [f64]) -> f64 {
+fn median(values: &[f64]) -> f64 {
+    let mut v = values.to_vec();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     v[v.len() / 2]
 }

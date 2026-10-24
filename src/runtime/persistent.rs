@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 /// Opt-in persistent execution of generated pointwise and reduction tiles.
 /// Operation boundaries remain hardware barriers in this first integration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct PersistentOptions {
     /// Physical workgroups per eligible dispatch, independent of its tile count.
     pub workers: u32,
@@ -26,7 +26,7 @@ impl Default for PersistentOptions {
 
 /// How one compiled graph operation executes. A zero-tile operation still has
 /// a physical launch, but contributes no persistent tasks.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct ExecutionRegion {
     pub dispatches: std::ops::Range<usize>,
     pub origin: Vec<crate::NodeId>,
@@ -39,7 +39,7 @@ pub struct ExecutionRegion {
 }
 
 /// Current graph coverage and runtime work appended to each step.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct ExecutionReport {
     pub persistent: Option<PersistentOptions>,
     pub regions: Vec<ExecutionRegion>,
@@ -102,6 +102,10 @@ fn tile(
 }
 
 impl State {
+    pub fn pipeline(&self, index: usize) -> Option<&bg::ComputePipeline> {
+        self.pipelines[index].as_ref().map(|pipeline| &pipeline.raw)
+    }
+
     pub fn new(
         gpu: &Arc<Gpu>,
         plan: &ExecutionPlan,
@@ -109,6 +113,7 @@ impl State {
         dump_dir: Option<&str>,
     ) -> Self {
         use bg::ShaderData;
+        super::validate_precision_plan(gpu, plan);
         assert!(
             (1..=65535).contains(&options.workers),
             "persistent workers must be in 1..=65535"

@@ -705,6 +705,8 @@ pub struct Report {
     /// The shader of every dispatch the session under test ran, so a check
     /// can confirm which kernels it exercised.
     pub shaders: Vec<crate::compile::ShaderEntry>,
+    /// Selected GPU execution paths and fallback coverage; absent for CPU checks.
+    pub execution: Option<crate::ExecutionReport>,
 }
 
 impl Report {

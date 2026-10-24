@@ -195,7 +195,7 @@ fn construction_donates_into_a_training_arena() {
     reader.set_parameter("weight", &weight);
     let config = SessionConfig {
         share_parameters_from: Some(&mut reader),
-        ..Default::default()
+        ..crate::support::gpu::config()
     };
     let mut trainer = meganeura::build(&training_graph(), config).0;
     assert!(trainer.shares_parameter(&reader, "weight"));
@@ -227,7 +227,7 @@ fn construction_donates_a_whole_training_arena() {
     let unshared = donor.memory_summary().allocated_buffer_bytes;
     let config = SessionConfig {
         share_parameters_from: Some(&mut donor),
-        ..Default::default()
+        ..crate::support::gpu::config()
     };
     let mut trainer = meganeura::build(&training_graph(), config).0;
     assert!(trainer.memory_summary().allocated_buffer_bytes < unshared);

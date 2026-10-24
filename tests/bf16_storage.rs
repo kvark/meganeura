@@ -157,7 +157,7 @@ fn unsupported_device_reports_bf16_requirement_before_shader_validation() {
     graph.set_outputs(vec![output]);
     let plan = meganeura::compile::compile(&graph);
     let panic = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        meganeura::Session::with_context(plan, context)
+        meganeura::Session::with_context_opts(plan, context, meganeura::SessionOptions::from_env())
     })) {
         Ok(_) => panic!("unsupported device accepted a BF16 plan"),
         Err(panic) => panic,

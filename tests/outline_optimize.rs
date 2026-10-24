@@ -5,9 +5,7 @@
 //! numbers as a completely unoptimized one.
 
 use meganeura::graph::Op;
-use meganeura::{
-    Graph, OptimizeConfig, OptimizeMode, autodiff, compile, optimize, runtime::Session,
-};
+use meganeura::{Graph, OptimizeConfig, OptimizeMode, autodiff, compile, optimize};
 
 /// Residual MLP with a decomposed-Silu activation. Each layer carries
 /// two fusible patterns: Add(MatMul(h, w), h) → FusedMatMulAdd and
@@ -117,7 +115,7 @@ fn production_optimization_preserves_outputs() {
     let sorted = g.toposort();
     let full = autodiff::differentiate(&sorted);
     let plan = compile::compile(&full);
-    let mut raw_session = Session::new(plan);
+    let mut raw_session = crate::support::gpu::from_plan(plan);
 
     let x: Vec<f32> = (0..batch * dim).map(|i| 0.1 + 0.01 * i as f32).collect();
     let target = vec![0.0f32; batch * dim];

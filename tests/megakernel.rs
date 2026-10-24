@@ -118,6 +118,26 @@ fn session_persistent_fallback_is_explicit_and_strict_rejects_it() {
         failure.is_err(),
         "strict execution silently accepted a matrix fallback"
     );
+
+    let mut training = meganeura::Graph::new();
+    let parameter = training.parameter("p", &[1]);
+    let loss = training.relu(parameter);
+    training.set_outputs(vec![loss]);
+    let mut training_config = config(false);
+    training_config.mode = meganeura::Mode::Training;
+    let mut session = meganeura::build(&training, training_config).0;
+    session.set_parameter("p", &[1.0]);
+    session.step();
+    session.wait();
+    session.set_learning_rate(0.1);
+    assert_eq!(
+        session.execution_report().appended_fallback,
+        ["optimizer update"]
+    );
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.step())).is_err());
+    let mut parameter = [0.0];
+    session.read_param("p", &mut parameter);
+    assert_eq!(parameter, [1.0], "strict rejection must precede the update");
 }
 
 fn reference(job: &Job, weights: &[f32]) -> Vec<f64> {

@@ -1101,7 +1101,7 @@ fn check_plan(graph: &Graph, feeds: &Feeds, plan: ExecutionPlan) -> Report {
         SessionOptions {
             poison: true,
             coop: CoopPolicy::Disabled,
-            ..Default::default()
+            ..meganeura::SessionOptions::from_env()
         },
     );
     for node in graph.nodes() {

@@ -21,6 +21,44 @@ cargo test --tests -- --test-threads=1
 cargo test --tests --all-features -- --test-threads=1
 ```
 
+## Persistent Session execution
+
+The same GPU suites accept the persistent tile selector. Keep adapter,
+precision, poisoning, and feature settings identical to the ordinary run:
+
+```sh
+MEGANEURA_PERSISTENT_WORKERS=64 cargo test --test oracle --test smoke \
+  --test regression --test gguf_model --all-features -- --test-threads=1
+# This targeted oracle case explicitly checks ordinary and strict persistent
+# execution, numerical results, and nonzero persistent coverage.
+cargo test --test oracle smoke::persistent_execution_reports_actual_coverage
+```
+
+`reference::Report.execution` and `Session::execution_report()` expose actual
+coverage and fallback reasons. The full suite allows ordinary fallback for
+operators outside the generated pointwise/reduction scope; passing it does not
+mean all graph operations are persistent. Session tests cover queue reset,
+chunking and external records, while the existing tests retain their training,
+checkpoint, shared storage, cache, and precision assertions. Test constructors
+use the shared environment configuration even when they override another
+runtime option.
+The convolution optimizer test keeps its allocation-reuse control explicitly
+ordinary: persistent sessions currently disable lifetime aliasing. Its other
+sessions exercise the selected backend, and the memory-reduction assertion
+remains active for the ordinary control.
+Profile schema 3 includes that execution report and records physical worker
+grids separately from logical tile grids. Pipeline statistics use the selected
+persistent pipeline where applicable.
+
+`bench_ci_latency` accepts the same selector and emits execution coverage,
+resident bytes, construction times, adapter/driver information, and raw samples.
+The existing `train_step_*` metrics measure forward/backward, preserving the
+CI baseline. The additional `train_update_*` metrics include SGD and assert
+that parameters changed; the earlier benchmark's comment claimed an update
+without configuring one. Update timings need their own baseline.
+The benchmark's ordinary single-mode run retains its short CI warmup;
+paired production qualification is tracked in [the integration plan](megakernel_plan.md).
+
 ## Android / Quest 3S
 
 Quest 3S qualification uses Vulkan on Adreno 740, Android 14 (API 34).
