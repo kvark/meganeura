@@ -3,7 +3,8 @@
 Agreed direction, October 24, 2026. Implementation starts with **Milestone 1**,
 then proceeds to the **Naga investigation in Milestone 2**. The existing
 [prototype and measurements](megakernel.md) are the starting evidence.
-Session integration is in progress; the compiler investigation follows it.
+Milestone 1 is complete with explicit fallback and measured regressions;
+the compiler investigation follows it.
 
 Implementation is delivered in separate testable commits. The standalone
 prototype is the baseline; subsequent commits update the milestone checklist
@@ -125,6 +126,14 @@ Implementation evidence:
   statistics and worker task histograms. Short ordinary/paired/diagnostic
   runs passed, including full SmolVLA state parity; all-target/all-feature
   Clippy and formatting passed. Longer production measurements follow.
+- `d3b167b`: production qualification completed with 50 alternating pairs
+  per case and separate ten-pair diagnostic runs. All full output/gradient/
+  parameter comparisons were exact. Persistent execution regressed on the
+  production MLP and SmolVLA workloads and remains opt-in. SmolVLA training
+  reduced 523 graph launches to 522; 435 launches and optimizer work remain
+  ordinary fallback. [Results, raw-record identities and reproduction](megakernel_session_results.md)
+  record timings, variation, construction, memory, worker activity and scope.
+  This completes Milestone 1 and permits the Naga investigation to start.
 
 The objective is to run Meganeura graphs through persistent GPU workers using
 the ordinary `Graph` / `build` / `Session` interface, and qualify them with the
@@ -231,7 +240,7 @@ logical workgroup/tile range, parameters, and session buffer references.
   clipping, KV-cache mutation, checkpoint restore, sharing/rebinding, and
   external submission behavior through their existing tests. In this phase,
   optimizer/clipping/accumulation may remain ordinary spans and must be reported.
-- [ ] Run the existing latency and model benchmarks with identical inputs,
+- [x] Run the existing latency and model benchmarks with identical inputs,
   parameters, precision, tuning budgets, and measurement boundaries. Retain
   the standalone prototype as a scheduling diagnostic.
 

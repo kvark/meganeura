@@ -65,7 +65,7 @@ For a production comparison, both existing benchmarks accept `--paired`:
 cargo run --release --example bench_ci_latency -- --paired
 cargo run --release --example bench_smolvla_train --features models -- --paired
 # Separate instrumented run: GPU pass intervals, worker task histograms.
-cargo run --release --example bench_smolvla_train --features models -- \
+MEGANEURA_GPU_CAPTURE=1 cargo run --release --example bench_smolvla_train --features models -- \
   --paired --diagnostics --warmup 5 --warmup-ms 500 --runs 10
 ```
 
@@ -90,7 +90,8 @@ device identity, coverage, selected pipelines, residency and observed build
 times. Construction shares one GPU context and builds ordinary sessions
 first, so these are not matched cold-cache construction measurements.
 Primary runs have no timing/counter instrumentation. `--diagnostics` enables
-GPU pass intervals and per-worker task counts; keep those results separate
+GPU pass intervals and per-worker task counts; `MEGANEURA_GPU_CAPTURE=1` also
+requests native pipeline statistics. Keep those results separate
 from primary wall times. GPU intervals cover pass starts through submission
 completion, excluding separate upload/readback submissions. Generated JSON
 and logs belong under `target/`, with conclusions and reproduction commands
