@@ -285,6 +285,12 @@ Recheck these against the fork revision used when the investigation starts.
 
 ### 2.1 Define the required protocol before choosing an API
 
+The [candidate memory contract](megakernel_memory_contract.md) spells out
+all-lane publication/acquisition, RMW fan-in and a bounded bitmap ready queue.
+It reuses the existing fence extension and avoids both global waiting and
+Vulkan availability/visibility chains. Compiler and device qualification remain
+required before accepting the design.
+
 - [ ] Write the happens-before argument for tensor publication and queue-slot
   publication, consumer acquisition, dependency-counter fan-in, and slot reuse.
   Cover writes from **every producer lane** and reads by **every consumer lane**,
