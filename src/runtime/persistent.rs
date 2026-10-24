@@ -237,16 +237,12 @@ fn chain_compatible(
         .all(|b| left.read_buffers().all(|a| owned(a, b)))
 }
 
-fn check_resources(
+fn check_handler_resources(
     caps: &bg::Capabilities,
-    plan: &ExecutionPlan,
-    buffers: &[bg::BufferPiece],
-    dispatches: std::ops::Range<usize>,
     handlers: &[Handler],
-    options: PersistentOptions,
-    chain: bool,
-) -> Result<u32, String> {
-    if options.device_scheduling && !caps.device_memory_fence {
+    device_scheduling: bool,
+) -> Result<(), String> {
+    if device_scheduling && !caps.device_memory_fence {
         return Err("backend does not support the device memory-fence contract".into());
     }
     let limits = caps
@@ -272,8 +268,7 @@ fn check_resources(
     {
         shared += u64::from(caps.cooperative_matrix.workgroup.reserved_shared_memory);
     }
-    let mut tasks = 0u64;
-    for (index, handler) in dispatches.clone().zip(handlers) {
+    for handler in handlers {
         if handler.layout.bindings.len() > bg::limits::RESOURCES_IN_GROUP as usize {
             return Err("handler exceeds Blade's resources-per-group limit".into());
         }
@@ -290,15 +285,7 @@ fn check_resources(
                 _ => return Err("handler has an unsupported resource binding".into()),
             }
         }
-        let dispatch = &plan.dispatches[index];
-        tasks = tasks.saturating_add(count(dispatch));
         shared += handler.body.shared_bytes;
-        for buffer in dispatch.read_buffers().chain(dispatch.written_buffers()) {
-            let piece = buffers[buffer.0 as usize];
-            if piece.buffer.size() - piece.offset > limits.max_storage_buffer_range {
-                return Err("tensor binding exceeds device storage-buffer range".into());
-            }
-        }
     }
     if storage > limits.max_storage_buffers
         || plain > bg::limits::PLAIN_DATA_SIZE
@@ -311,6 +298,31 @@ fn check_resources(
             "region needs {shared} shared bytes; device limit is {}",
             caps.max_compute_shared_memory_size
         ));
+    }
+    Ok(())
+}
+
+fn check_resources(
+    caps: &bg::Capabilities,
+    plan: &ExecutionPlan,
+    buffers: &[bg::BufferPiece],
+    dispatches: std::ops::Range<usize>,
+    handlers: &[Handler],
+    options: PersistentOptions,
+    chain: bool,
+) -> Result<u32, String> {
+    check_handler_resources(caps, handlers, options.device_scheduling)?;
+    let limits = caps.compute_binding_limits.unwrap();
+    let mut tasks = 0u64;
+    for index in dispatches.clone() {
+        let dispatch = &plan.dispatches[index];
+        tasks = tasks.saturating_add(count(dispatch));
+        for buffer in dispatch.read_buffers().chain(dispatch.written_buffers()) {
+            let piece = buffers[buffer.0 as usize];
+            if piece.buffer.size() - piece.offset > limits.max_storage_buffer_range {
+                return Err("tensor binding exceeds device storage-buffer range".into());
+            }
+        }
     }
     // Blade binds the remaining allocation, not an explicitly sized subrange.
     let queue_bound = plan.dispatches.iter().try_fold(0usize, |bytes, dispatch| {
@@ -338,6 +350,119 @@ fn binding_name(slot: usize, name: &'static str) -> &'static str {
     names
         .entry((slot, name))
         .or_insert_with(|| Box::leak(format!("h{slot}_{name}").into_boxed_str()))
+}
+
+fn compile_region(
+    gpu: &Arc<Gpu>,
+    handlers: Vec<Handler>,
+    options: PersistentOptions,
+    chain: bool,
+    dump_dir: Option<&str>,
+) -> Result<(Arc<SharedPipeline>, String), String> {
+    use bg::ShaderData;
+    let workgroup_size = handlers[0].body.workgroup_size;
+    let mut source = String::new();
+    if options.device_scheduling {
+        source.push_str("enable wgpu_memory_fence;\n");
+    }
+    let mut calls = String::new();
+    let mut layouts = Vec::new();
+    let subgroups = handlers.iter().any(|handler| handler.body.subgroups);
+    for (slot, handler) in handlers.into_iter().enumerate() {
+        let body = handler.body.source.replace("$PREFIX", &format!("h{slot}_"));
+        source.push_str(&body);
+        calls.push_str(
+            &include_str!("../shaders/persistent_handler.wgsl")
+                .replace("$SLOT", &slot.to_string())
+                .replace(
+                    "$CALL",
+                    &handler.body.call.replace("$PREFIX", &format!("h{slot}_")),
+                )
+                .replace("$CHAIN", if chain { "true" } else { "false" }),
+        );
+        layouts.push(bg::ShaderDataLayout {
+            bindings: handler
+                .layout
+                .bindings
+                .into_iter()
+                .map(|(name, binding)| (binding_name(slot, name), binding))
+                .collect(),
+        });
+    }
+    let entry = if options.device_scheduling {
+        include_str!("../shaders/persistent_device.wgsl")
+    } else {
+        include_str!("../shaders/persistent_tile.wgsl")
+    };
+    source.push_str(
+        &entry
+            .replace(
+                "$WORKGROUP",
+                &workgroup_size.map(|axis| axis.to_string()).join(", "),
+            )
+            .replace(
+                "$SUBGROUPS",
+                if subgroups {
+                    include_str!("../shaders/persistent_subgroups.wgsl")
+                } else {
+                    ""
+                },
+            )
+            .replace("$HANDLERS", &calls)
+            .replace(
+                "$TRACK_WORKERS",
+                if options.track_workers {
+                    "true"
+                } else {
+                    "false"
+                },
+            ),
+    );
+    let mut enables = std::collections::BTreeSet::new();
+    let body = source
+        .lines()
+        .filter(|line| {
+            if line.trim_start().starts_with("enable ") {
+                enables.insert(line.trim().to_owned());
+                false
+            } else {
+                true
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let source = enables.into_iter().collect::<Vec<_>>().join("\n") + "\n" + &body;
+    let module = crate::codegen::ShaderModule::with_hint(source, "persistent");
+    if let Some(dir) = dump_dir {
+        module.dump(dir);
+    }
+    layouts.push(QueueData::layout());
+    let key = SharedPipelineKey {
+        context: Arc::as_ptr(gpu) as usize,
+        entry_point: "persistent_main",
+        layout: format!("{layouts:?}"),
+        source: module.source.clone(),
+    };
+    let mut hasher = DefaultHasher::new();
+    key.source.hash(&mut hasher);
+    key.layout.hash(&mut hasher);
+    let pipeline_key = format!("persistent:{:016x}", hasher.finish());
+    let pipeline = if let Some(pipeline) = SharedPipelines::get(&key) {
+        pipeline
+    } else {
+        let shader = super::create_gen_shader(gpu, module)?;
+        let pipeline = Arc::new(SharedPipeline {
+            gpu: Arc::clone(gpu),
+            raw: gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+                name: "persistent region",
+                data_layouts: &layouts.iter().collect::<Vec<_>>(),
+                compute: shader.at("persistent_main"),
+            }),
+        });
+        SharedPipelines::insert(key, &pipeline);
+        pipeline
+    };
+    Ok((pipeline, pipeline_key))
 }
 
 impl State {
@@ -382,7 +507,6 @@ impl State {
         dump_dir: Option<&str>,
         coop_config: Option<&crate::codegen::CoopConfig>,
     ) -> Self {
-        use bg::ShaderData;
         super::validate_precision_plan(gpu, plan);
         assert!(
             (1..=65535).contains(&options.workers),
@@ -543,17 +667,10 @@ impl State {
                         } else {
                             " | "
                         });
-                    let mut source = String::new();
-                    if region.device_scheduled {
-                        source.push_str("enable wgpu_memory_fence;\n");
-                    }
-                    let mut calls = String::new();
-                    let mut layouts = Vec::new();
-                    let subgroups = handlers.iter().any(|handler| handler.body.subgroups);
-                    for (slot, handler) in handlers.into_iter().enumerate() {
+                    for (slot, handler) in handlers.iter_mut().enumerate() {
                         let operation = &plan.dispatches[start + slot];
                         region.origin.extend_from_slice(&operation.origin);
-                        let mut body = handler.body.source.replace("$PREFIX", &format!("h{slot}_"));
+                        let mut body = handler.body.source.clone();
                         if region.device_scheduled && !handler.generated {
                             // Preserve all aliases conservatively for ordinary implementations.
                             body = body.replace("var<storage", "@coherent var<storage");
@@ -574,38 +691,14 @@ impl State {
                                         .written_buffers()
                                         .any(|output| overlaps(plan, buffers, input, output))
                                 }) {
-                                    let declaration = format!("var<storage> h{slot}_{name}:");
+                                    let declaration = format!("var<storage> $PREFIX{name}:");
                                     assert!(body.contains(&declaration));
                                     body = body
                                         .replace(&declaration, &format!("@coherent {declaration}"));
                                 }
                             }
                         }
-                        source.push_str(&body);
-                        calls.push_str(
-                            &include_str!("../shaders/persistent_handler.wgsl")
-                                .replace("$SLOT", &slot.to_string())
-                                .replace(
-                                    "$CALL",
-                                    &handler.body.call.replace("$PREFIX", &format!("h{slot}_")),
-                                )
-                                .replace(
-                                    "$CHAIN",
-                                    if region.worker_owned_chain {
-                                        "true"
-                                    } else {
-                                        "false"
-                                    },
-                                ),
-                        );
-                        layouts.push(bg::ShaderDataLayout {
-                            bindings: handler
-                                .layout
-                                .bindings
-                                .into_iter()
-                                .map(|(name, binding)| (binding_name(slot, name), binding))
-                                .collect(),
-                        });
+                        handler.body.source = body;
                         if region.worker_owned_chain {
                             region_params.starts[slot] = 0;
                             region.logical_tasks = count(operation);
@@ -640,78 +733,18 @@ impl State {
                         }
                     }
                     report.persistent_tasks += region.logical_tasks;
-                    let entry = if region.device_scheduled {
-                        include_str!("../shaders/persistent_device.wgsl")
-                    } else {
-                        include_str!("../shaders/persistent_tile.wgsl")
-                    };
-                    source.push_str(
-                        &entry
-                            .replace(
-                                "$WORKGROUP",
-                                &workgroup_size.map(|axis| axis.to_string()).join(", "),
-                            )
-                            .replace(
-                                "$SUBGROUPS",
-                                if subgroups {
-                                    include_str!("../shaders/persistent_subgroups.wgsl")
-                                } else {
-                                    ""
-                                },
-                            )
-                            .replace("$HANDLERS", &calls)
-                            .replace(
-                                "$TRACK_WORKERS",
-                                if options.track_workers {
-                                    "true"
-                                } else {
-                                    "false"
-                                },
-                            ),
-                    );
-                    let mut enables = std::collections::BTreeSet::new();
-                    let body = source
-                        .lines()
-                        .filter(|line| {
-                            if line.trim_start().starts_with("enable ") {
-                                enables.insert(line.trim().to_owned());
-                                false
-                            } else {
-                                true
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let source = enables.into_iter().collect::<Vec<_>>().join("\n") + "\n" + &body;
-                    let module = crate::codegen::ShaderModule::with_hint(source, "persistent");
-                    if let Some(dir) = dump_dir {
-                        module.dump(dir);
-                    }
-                    layouts.push(QueueData::layout());
-                    let key = SharedPipelineKey {
-                        context: Arc::as_ptr(gpu) as usize,
-                        entry_point: "persistent_main",
-                        layout: format!("{layouts:?}"),
-                        source: module.source.clone(),
-                    };
-                    let mut hasher = DefaultHasher::new();
-                    key.source.hash(&mut hasher);
-                    key.layout.hash(&mut hasher);
-                    keys.push(Some(format!("persistent:{:016x}", hasher.finish())));
-                    let pipeline = SharedPipelines::get(&key).unwrap_or_else(|| {
-                        let shader = super::create_gen_shader(gpu, module)
-                            .expect("persistent shader validation");
-                        let pipeline = Arc::new(SharedPipeline {
-                            gpu: Arc::clone(gpu),
-                            raw: gpu.create_compute_pipeline(bg::ComputePipelineDesc {
-                                name: "persistent region",
-                                data_layouts: &layouts.iter().collect::<Vec<_>>(),
-                                compute: shader.at("persistent_main"),
-                            }),
-                        });
-                        SharedPipelines::insert(key, &pipeline);
-                        pipeline
-                    });
+                    let (pipeline, key) = compile_region(
+                        gpu,
+                        handlers,
+                        PersistentOptions {
+                            device_scheduling: region.device_scheduled,
+                            ..options
+                        },
+                        region.worker_owned_chain,
+                        dump_dir,
+                    )
+                    .expect("persistent shader validation");
+                    keys.push(Some(key));
                     pipelines.push(Some(pipeline));
                 }
                 Err(reason) => {

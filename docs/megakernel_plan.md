@@ -512,6 +512,14 @@ are 1.094/1.289/1.275 for CI and 1.899/1.665 for model forward/training. Ordinar
 remains the default; [measurements](megakernel_device_results.md#restored-lifetime-reuse)
 retain construction, distributions, diagnostics and raw identities.
 
+Appended-pass preparation extracts the existing region compiler and handler
+resource checks from graph planning. Graph-specific alias decoration and queue
+dependencies remain in the planner. All seven focused checks pass on NVIDIA
+and lavapipe; strict all-target/all-feature Clippy and formatting pass. Short
+CI and SmolVLA paired checks have exact numerical results and identical physical
+pipeline keys, implementation keys and execution reports to `23642ba`. This
+preparation does not yet change appended optimizer coverage.
+
 The device queue uses the same Session work descriptors, tracking ready tasks,
 predecessor counts, unfinished work and successor edges on the GPU. It releases
 consumers after whole-operation completion; measure whether tile-level
