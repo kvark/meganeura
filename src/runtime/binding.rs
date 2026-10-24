@@ -38,6 +38,133 @@ fn dense_params(dispatch: &Dispatch) -> MatMulParams {
 }
 
 impl Session {
+    /// Generated bodies retain the same operand order in every region slot.
+    pub(super) fn bind_generated_dispatch(
+        buffers: &[blade_graphics::BufferPiece],
+        dispatch: &Dispatch,
+        pc: &mut impl blade_graphics::traits::PipelineEncoder,
+        group: u32,
+    ) -> bool {
+        let buf = |r: BufferRef| buffers[r.0 as usize];
+        // Schedule-template reduction dispatches have priority and route
+        // by kernel arity (n_per_elem, n_per_row, n_per_col).
+        if let Some(k) = dispatch.reduction() {
+            let params = ReductionParams {
+                outer: dispatch.params[0],
+                inner: dispatch.params[1],
+                round_one_bits: dispatch.params.get(2).copied().unwrap_or(0),
+                table_rows: dispatch.params.get(3).copied().unwrap_or(0),
+            };
+            if reduction_is_dynamic(k) {
+                // Buffers in binding order: each input stream (gather idx
+                // buffers are already interleaved into `input_buffers` by
+                // the fusion pass, right after their table stream), then
+                // `dst`. `params` is bound last by `fill`.
+                let mut buffers: Vec<blade_graphics::BufferPiece> =
+                    dispatch.input_buffers.iter().map(|&r| buf(r)).collect();
+                buffers.push(buf(dispatch.output_buffer));
+                pc.bind(group, &DynReductionData { buffers, params });
+                return true;
+            }
+            let n_per_col = k.epilogue.as_ref().map_or(0, |e| e.n_per_col_inputs);
+            match (k.n_per_elem, k.n_per_row, n_per_col) {
+                (1, 0, 0) => {
+                    pc.bind(
+                        group,
+                        &ReductionPass1Data {
+                            src: buf(dispatch.input_buffers[0]),
+                            dst: buf(dispatch.output_buffer),
+                            params,
+                        },
+                    );
+                }
+                (1, 1, 0) => {
+                    pc.bind(
+                        group,
+                        &ReductionPass2RowData {
+                            src: buf(dispatch.input_buffers[0]),
+                            per_row_src: buf(dispatch.input_buffers[1]),
+                            dst: buf(dispatch.output_buffer),
+                            params,
+                        },
+                    );
+                }
+                (1, 0, 1) => {
+                    pc.bind(
+                        group,
+                        &RmsNormData {
+                            src: buf(dispatch.input_buffers[0]),
+                            bias: buf(dispatch.input_buffers[1]),
+                            dst: buf(dispatch.output_buffer),
+                            params: BiasAddParams {
+                                len: params.outer,
+                                bias_len: params.inner,
+                                _pad0: 0,
+                                _pad1: 0,
+                            },
+                        },
+                    );
+                }
+                other => {
+                    panic!(
+                        "reduction kernel with arity {:?} has no runtime binding layout",
+                        other
+                    )
+                }
+            }
+            return true;
+        }
+        // Schedule-template pointwise dispatches route by DAG arity, not
+        // by the dummy `shader` entry — arity may be 3 after fusion, which
+        // no ShaderEntry variant represents.
+        if let Some(dag) = dispatch.pointwise() {
+            let params = UnaryParams {
+                len: dispatch.params[0],
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            };
+            match dag.n_inputs {
+                1 => {
+                    pc.bind(
+                        group,
+                        &UnaryData {
+                            src: buf(dispatch.input_buffers[0]),
+                            dst: buf(dispatch.output_buffer),
+                            params,
+                        },
+                    );
+                }
+                2 => {
+                    pc.bind(
+                        group,
+                        &BinaryData {
+                            src_a: buf(dispatch.input_buffers[0]),
+                            src_b: buf(dispatch.input_buffers[1]),
+                            dst: buf(dispatch.output_buffer),
+                            params,
+                        },
+                    );
+                }
+                3 => {
+                    pc.bind(
+                        group,
+                        &TernaryData {
+                            src_a: buf(dispatch.input_buffers[0]),
+                            src_b: buf(dispatch.input_buffers[1]),
+                            src_c: buf(dispatch.input_buffers[2]),
+                            dst: buf(dispatch.output_buffer),
+                            params,
+                        },
+                    );
+                }
+                n => panic!("pointwise arity {} has no runtime data layout", n),
+            }
+            return true;
+        }
+        false
+    }
+
     pub(super) fn bind_dispatch(
         buffers: &[blade_graphics::BufferPiece],
         dispatch: &Dispatch,
@@ -88,120 +215,7 @@ impl Session {
             );
             return;
         }
-        // Schedule-template reduction dispatches have priority and route
-        // by kernel arity (n_per_elem, n_per_row, n_per_col).
-        if let Some(k) = dispatch.reduction() {
-            let params = ReductionParams {
-                outer: dispatch.params[0],
-                inner: dispatch.params[1],
-                round_one_bits: dispatch.params.get(2).copied().unwrap_or(0),
-                table_rows: dispatch.params.get(3).copied().unwrap_or(0),
-            };
-            if reduction_is_dynamic(k) {
-                // Buffers in binding order: each input stream (gather idx
-                // buffers are already interleaved into `input_buffers` by
-                // the fusion pass, right after their table stream), then
-                // `dst`. `params` is bound last by `fill`.
-                let mut buffers: Vec<blade_graphics::BufferPiece> =
-                    dispatch.input_buffers.iter().map(|&r| buf(r)).collect();
-                buffers.push(buf(dispatch.output_buffer));
-                pc.bind(0, &DynReductionData { buffers, params });
-                return;
-            }
-            let n_per_col = k.epilogue.as_ref().map_or(0, |e| e.n_per_col_inputs);
-            match (k.n_per_elem, k.n_per_row, n_per_col) {
-                (1, 0, 0) => {
-                    pc.bind(
-                        0,
-                        &ReductionPass1Data {
-                            src: buf(dispatch.input_buffers[0]),
-                            dst: buf(dispatch.output_buffer),
-                            params,
-                        },
-                    );
-                }
-                (1, 1, 0) => {
-                    pc.bind(
-                        0,
-                        &ReductionPass2RowData {
-                            src: buf(dispatch.input_buffers[0]),
-                            per_row_src: buf(dispatch.input_buffers[1]),
-                            dst: buf(dispatch.output_buffer),
-                            params,
-                        },
-                    );
-                }
-                (1, 0, 1) => {
-                    pc.bind(
-                        0,
-                        &RmsNormData {
-                            src: buf(dispatch.input_buffers[0]),
-                            bias: buf(dispatch.input_buffers[1]),
-                            dst: buf(dispatch.output_buffer),
-                            params: BiasAddParams {
-                                len: params.outer,
-                                bias_len: params.inner,
-                                _pad0: 0,
-                                _pad1: 0,
-                            },
-                        },
-                    );
-                }
-                other => {
-                    panic!(
-                        "reduction kernel with arity {:?} has no runtime binding layout",
-                        other
-                    )
-                }
-            }
-            return;
-        }
-        // Schedule-template pointwise dispatches route by DAG arity, not
-        // by the dummy `shader` entry — arity may be 3 after fusion, which
-        // no ShaderEntry variant represents.
-        if let Some(dag) = dispatch.pointwise() {
-            let params = UnaryParams {
-                len: dispatch.params[0],
-                _pad0: 0,
-                _pad1: 0,
-                _pad2: 0,
-            };
-            match dag.n_inputs {
-                1 => {
-                    pc.bind(
-                        0,
-                        &UnaryData {
-                            src: buf(dispatch.input_buffers[0]),
-                            dst: buf(dispatch.output_buffer),
-                            params,
-                        },
-                    );
-                }
-                2 => {
-                    pc.bind(
-                        0,
-                        &BinaryData {
-                            src_a: buf(dispatch.input_buffers[0]),
-                            src_b: buf(dispatch.input_buffers[1]),
-                            dst: buf(dispatch.output_buffer),
-                            params,
-                        },
-                    );
-                }
-                3 => {
-                    pc.bind(
-                        0,
-                        &TernaryData {
-                            src_a: buf(dispatch.input_buffers[0]),
-                            src_b: buf(dispatch.input_buffers[1]),
-                            src_c: buf(dispatch.input_buffers[2]),
-                            dst: buf(dispatch.output_buffer),
-                            params,
-                        },
-                    );
-                }
-                n => panic!("pointwise arity {} has no runtime data layout", n),
-            }
+        if Self::bind_generated_dispatch(buffers, dispatch, pc, 0) {
             return;
         }
         // Prologue-fused coop matmul: 2-factor prologue (RmsNorm rsqrt + w_norm).
