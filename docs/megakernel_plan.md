@@ -32,7 +32,7 @@ Implementation evidence:
   tests passed after correcting it (21 regression tests were ignored).
   The focused Session tests also passed on lavapipe. All 505 unit tests and
   all-target/all-feature Clippy passed.
-- Harness audit: replaced default-only test session construction with shared
+- `dc2e107`: replaced default-only test session construction with shared
   environment configuration; the allocation-reuse control remains explicitly
   ordinary. Oracle reports now carry execution coverage, and an eligible
   oracle case asserts strict persistent coverage as well as numerical results.
@@ -44,6 +44,12 @@ Implementation evidence:
   memory, and construction times. It retains its existing forward/backward
   metric and adds a separate SGD metric with a parameter-update assertion.
   These short, unpaired CI runs do not satisfy the production measurement gate.
+- Handler composition preparation: generated tile templates now have explicit
+  namespace slots for bindings, parameter types, scratch and callable bodies.
+  Empty namespaces preserve the existing entry-point contracts. The 27 schedule
+  tests include Naga validation of two independently namespaced bodies in one
+  module; focused strict Session checks still pass. Region planning and launch
+  reduction remain the next step.
 
 The objective is to run Meganeura graphs through persistent GPU workers using
 the ordinary `Graph` / `build` / `Session` interface, and qualify them with the

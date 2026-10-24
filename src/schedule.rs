@@ -608,16 +608,22 @@ pub const ATTENTION_ENTRY: &str = "main";
 /// One cooperative tile body, with resources but without an entry point.
 /// Both launch paths use the same body and its original workgroup geometry.
 pub(crate) struct TileKernel {
-    pub source: String,
+    template: String,
     pub workgroup_size: u32,
     hint: &'static str,
 }
 
 impl TileKernel {
+    /// Namespace module-level resources, scratch, types and the callable body.
+    /// An empty prefix retains the ordinary kernel binding contract.
+    pub fn source(&self, prefix: &str) -> String {
+        self.template.replace("$PREFIX", prefix)
+    }
+
     fn into_module(self) -> ShaderModule {
         let entry = include_str!("shaders/dispatch_tile.wgsl")
             .replace("$WORKGROUP", &self.workgroup_size.to_string());
-        ShaderModule::with_hint(self.source + &entry, self.hint)
+        ShaderModule::with_hint(self.source("") + &entry, self.hint)
     }
 }
 
@@ -700,7 +706,10 @@ pub(crate) fn lower_pointwise_tile(
         "PointwiseDAG.output is out of range"
     );
 
-    let input_names = PointwiseDAG::input_binding_names(dag.n_inputs);
+    let input_names: Vec<_> = PointwiseDAG::input_binding_names(dag.n_inputs)
+        .into_iter()
+        .map(|name| format!("$PREFIX{name}"))
+        .collect();
 
     let mut src = String::new();
     if storage != PointwiseStorage::default() {
@@ -708,7 +717,7 @@ pub(crate) fn lower_pointwise_tile(
         src.push_str(include_str!("shaders/bf16_round.wgsl"));
     }
     src.push_str(
-        "struct Params {\n    len: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n",
+        "struct $PREFIXParams {\n    len: u32,\n    _pad0: u32,\n    _pad1: u32,\n    _pad2: u32,\n}\n\n",
     );
     for (i, name) in input_names.iter().enumerate() {
         let ty = if storage.bf16_inputs & (1 << i) != 0 {
@@ -719,15 +728,15 @@ pub(crate) fn lower_pointwise_tile(
         let _ = writeln!(src, "var<storage> {name}: array<{ty}>;");
     }
     let ty = if storage.bf16_output { "bf16" } else { "f32" };
-    let _ = writeln!(src, "var<storage, read_write> dst: array<{ty}>;");
-    src.push_str("var<uniform> params: Params;\n\n");
-    src.push_str("fn execute_tile(wgid: vec3<u32>, lid: vec3<u32>) {\n");
+    let _ = writeln!(src, "var<storage, read_write> $PREFIXdst: array<{ty}>;");
+    src.push_str("var<uniform> $PREFIXparams: $PREFIXParams;\n\n");
+    src.push_str("fn $PREFIXexecute_tile(wgid: vec3<u32>, lid: vec3<u32>) {\n");
     let _ = writeln!(
         src,
         "    let i = wgid.x * {}u + lid.x;",
         grid.workgroup_size
     );
-    src.push_str("    if i >= params.len { return; }\n");
+    src.push_str("    if i >= $PREFIXparams.len { return; }\n");
     let load = |idx: u8, index: String| {
         let value = format!("{}[{index}]", input_names[idx as usize]);
         if storage.bf16_inputs & (1 << idx) != 0 {
@@ -741,14 +750,14 @@ pub(crate) fn lower_pointwise_tile(
         |idx, divisor, modulus| load(idx, format!("(i / {divisor}u) % {modulus}u")),
     ));
     if storage.bf16_output {
-        let _ = writeln!(src, "    dst[i] = round_bf16(v{});", dag.output);
+        let _ = writeln!(src, "    $PREFIXdst[i] = round_bf16(v{});", dag.output);
     } else {
-        let _ = writeln!(src, "    dst[i] = v{};", dag.output);
+        let _ = writeln!(src, "    $PREFIXdst[i] = v{};", dag.output);
     }
     src.push_str("}\n");
 
     TileKernel {
-        source: src,
+        template: src,
         workgroup_size: grid.workgroup_size,
         hint: "pointwise",
     }
@@ -833,10 +842,21 @@ fn lower_reduction(
         );
     }
 
-    let per_elem_names = PointwiseDAG::input_binding_names(n_per_elem);
-    let per_row_names = per_row_binding_names(n_per_row);
+    let per_elem_names: Vec<_> = PointwiseDAG::input_binding_names(n_per_elem)
+        .into_iter()
+        .map(|name| format!("$PREFIX{name}"))
+        .collect();
+    let per_row_names: Vec<_> = per_row_binding_names(n_per_row)
+        .into_iter()
+        .map(|name| format!("$PREFIX{name}"))
+        .collect();
     let per_col_names: Vec<String> = epilogue
-        .map(|epi| per_col_binding_names(epi.n_per_col_inputs))
+        .map(|epi| {
+            per_col_binding_names(epi.n_per_col_inputs)
+                .into_iter()
+                .map(|name| format!("$PREFIX{name}"))
+                .collect()
+        })
         .unwrap_or_default();
 
     // Builds the `load(idx)` expression for a given DAG input index,
@@ -860,14 +880,14 @@ fn lower_reduction(
                 // gathered axis IS the reduced axis (table stride == inner).
                 // An index past the table reads its last row.
                 format!(
-                    "{0}[min({0}_idx[{1}], params.table_rows - 1u) * params.inner + {2}]",
+                    "{0}[min({0}_idx[{1}], $PREFIXparams.table_rows - 1u) * $PREFIXparams.inner + {2}]",
                     per_elem_names[i], source_row, col_var
                 )
             } else if repeat == 1 {
                 format!("{}[row_offset + {}]", per_elem_names[i], col_var)
             } else {
                 format!(
-                    "{}[(row / {repeat}u) * params.inner + {}]",
+                    "{}[(row / {repeat}u) * $PREFIXparams.inner + {}]",
                     per_elem_names[i], col_var
                 )
             }
@@ -887,7 +907,7 @@ fn lower_reduction(
 
     let mut src = String::new();
     src.push_str(
-        "struct Params {\n    outer: u32,\n    inner: u32,\n    round_one_bits: u32,\n    table_rows: u32,\n}\n\n",
+        "struct $PREFIXParams {\n    outer: u32,\n    inner: u32,\n    round_one_bits: u32,\n    table_rows: u32,\n}\n\n",
     );
     for (i, name) in per_elem_names.iter().enumerate() {
         let _ = writeln!(src, "var<storage> {}: array<f32>;", name);
@@ -902,15 +922,15 @@ fn lower_reduction(
     for name in &per_col_names {
         let _ = writeln!(src, "var<storage> {}: array<f32>;", name);
     }
-    src.push_str("var<storage, read_write> dst: array<f32>;\n");
-    src.push_str("var<uniform> params: Params;\n");
+    src.push_str("var<storage, read_write> $PREFIXdst: array<f32>;\n");
+    src.push_str("var<uniform> $PREFIXparams: $PREFIXParams;\n");
     let wg = grid.workgroup_size;
     let lanes_per_row = wg / rows_per_workgroup;
     for k in 0..n_reduced {
-        let _ = writeln!(src, "var<workgroup> wg_data_{k}: array<f32, {wg}>;");
+        let _ = writeln!(src, "var<workgroup> $PREFIXwg_data_{k}: array<f32, {wg}>;");
     }
     src.push('\n');
-    src.push_str("fn execute_tile(wgid: vec3<u32>, lid: vec3<u32>) {\n");
+    src.push_str("fn $PREFIXexecute_tile(wgid: vec3<u32>, lid: vec3<u32>) {\n");
     src.push_str("    let tid = lid.x;\n");
     let _ = writeln!(src, "    let row_slot = tid / {}u;", lanes_per_row);
     let _ = writeln!(src, "    let lane = tid % {}u;", lanes_per_row);
@@ -919,15 +939,15 @@ fn lower_reduction(
         "    let row = wgid.x * {}u + row_slot;",
         rows_per_workgroup
     );
-    src.push_str("    let row_valid = row < params.outer;\n");
-    src.push_str("    let row_offset = row * params.inner;\n");
+    src.push_str("    let row_valid = row < $PREFIXparams.outer;\n");
+    src.push_str("    let row_offset = row * $PREFIXparams.inner;\n");
     for k in 0..n_reduced {
         let _ = writeln!(src, "    var acc_{k}: f32 = {};", op.identity_wgsl());
     }
     src.push_str("    var col = lane;\n");
     src.push_str("    if row_valid {\n");
     src.push_str("        loop {\n");
-    src.push_str("            if col >= params.inner { break; }\n");
+    src.push_str("            if col >= $PREFIXparams.inner { break; }\n");
     // Prologue bodies: `col` is the per-element index variable. Each
     // accumulator's DAG is evaluated in its own block so the `let vN`
     // value names don't collide.
@@ -947,7 +967,10 @@ fn lower_reduction(
             // multiply from contracting with the reduction add. This keeps
             // the fused packed path bit-identical to materializing the
             // producer without a global-memory round trip.
-            format!("v{} * bitcast<f32>(params.round_one_bits)", dag.output)
+            format!(
+                "v{} * bitcast<f32>($PREFIXparams.round_one_bits)",
+                dag.output
+            )
         } else {
             format!("v{}", dag.output)
         };
@@ -962,7 +985,7 @@ fn lower_reduction(
     src.push_str("        }\n");
     src.push_str("    }\n");
     for k in 0..n_reduced {
-        let _ = writeln!(src, "    wg_data_{k}[tid] = acc_{k};");
+        let _ = writeln!(src, "    $PREFIXwg_data_{k}[tid] = acc_{k};");
     }
     src.push_str("    workgroupBarrier();\n");
     // Independent tree reductions within each packed row's lane group.
@@ -972,8 +995,8 @@ fn lower_reduction(
         let _ = writeln!(src, "    if lane < {}u {{", stride);
         for k in 0..n_reduced {
             let combined = op.combine_wgsl(
-                &format!("wg_data_{k}[tid]"),
-                &format!("wg_data_{k}[tid + {}u]", stride),
+                &format!("$PREFIXwg_data_{k}[tid]"),
+                &format!("$PREFIXwg_data_{k}[tid + {}u]", stride),
             );
             let _ = writeln!(src, "        {}", combined);
         }
@@ -987,11 +1010,11 @@ fn lower_reduction(
             src.push_str("    if lane == 0u && row_valid {\n");
             for k in 0..n_reduced {
                 if n_reduced == 1 {
-                    let _ = writeln!(src, "        dst[row] = wg_data_{k}[tid];");
+                    let _ = writeln!(src, "        $PREFIXdst[row] = $PREFIXwg_data_{k}[tid];");
                 } else {
                     let _ = writeln!(
                         src,
-                        "        dst[row * {n_reduced}u + {k}u] = wg_data_{k}[tid];"
+                        "        $PREFIXdst[row * {n_reduced}u + {k}u] = $PREFIXwg_data_{k}[tid];"
                     );
                 }
             }
@@ -1003,13 +1026,13 @@ fn lower_reduction(
             for k in 0..n_reduced {
                 let _ = writeln!(
                     src,
-                    "    let reduced_{k} = wg_data_{k}[row_slot * {lanes_per_row}u];"
+                    "    let reduced_{k} = $PREFIXwg_data_{k}[row_slot * {lanes_per_row}u];"
                 );
             }
             src.push_str("    var wcol = lane;\n");
             src.push_str("    if row_valid {\n");
             src.push_str("        loop {\n");
-            src.push_str("            if wcol >= params.inner { break; }\n");
+            src.push_str("            if wcol >= $PREFIXparams.inner { break; }\n");
             let body = epi.dag.emit_body(|idx| load_expr(idx, "wcol", true));
             for line in body.lines() {
                 src.push_str("            ");
@@ -1018,7 +1041,7 @@ fn lower_reduction(
             }
             let _ = writeln!(
                 src,
-                "            dst[row_offset + wcol] = v{};",
+                "            $PREFIXdst[row_offset + wcol] = v{};",
                 epi.dag.output
             );
             let _ = writeln!(src, "            wcol += {}u;", lanes_per_row);
@@ -1029,7 +1052,7 @@ fn lower_reduction(
     src.push_str("}\n");
 
     TileKernel {
-        source: src,
+        template: src,
         workgroup_size: wg,
         hint: "reduction",
     }
@@ -1591,7 +1614,7 @@ mod tests {
             (ReduceOp::Sum, square_prologue()),
             (ReduceOp::Max, identity_prologue()),
         ] {
-            let sm = lower(&KernelTemplate::Reduction {
+            let template = KernelTemplate::Reduction {
                 op,
                 prologue,
                 extra_prologues: vec![],
@@ -1602,10 +1625,14 @@ mod tests {
                 input_row_repeats: Vec::new(),
                 rows_per_workgroup: 1,
                 grid: GridShape::default(),
-            });
+            };
+            let sm = lower(&template);
             v.validate(&sm.module).unwrap_or_else(|e| {
                 panic!("reduction naga validation failed: {:?}\n{}", e, sm.source);
             });
+            let second = lower_tile(&template).unwrap().source("second_");
+            let composed = ShaderModule::with_hint(sm.source + &second, "two_reductions");
+            v.validate(&composed.module).unwrap();
         }
     }
 
@@ -1913,13 +1940,17 @@ mod tests {
         let mut v = Validator::new(flags, Capabilities::all());
 
         for dag in [relu_dag(), add_dag(), swiglu_dag()] {
-            let sm = lower(&KernelTemplate::Pointwise {
+            let template = KernelTemplate::Pointwise {
                 dag,
                 grid: GridShape::default(),
-            });
+            };
+            let sm = lower(&template);
             v.validate(&sm.module).unwrap_or_else(|e| {
                 panic!("naga validation failed: {:?}\n{}", e, sm.source);
             });
+            let second = lower_tile(&template).unwrap().source("second_");
+            let composed = ShaderModule::with_hint(sm.source + &second, "two_pointwise");
+            v.validate(&composed.module).unwrap();
         }
     }
 }

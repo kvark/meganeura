@@ -157,8 +157,10 @@ impl State {
                     report.persistent_tasks += count;
                     let entry = include_str!("../shaders/persistent_tile.wgsl")
                         .replace("$WORKGROUP", &tile.workgroup_size.to_string());
-                    let module =
-                        crate::codegen::ShaderModule::with_hint(tile.source + &entry, "persistent");
+                    let module = crate::codegen::ShaderModule::with_hint(
+                        tile.source("") + &entry,
+                        "persistent",
+                    );
                     if let Some(dir) = dump_dir {
                         module.dump(dir);
                     }
