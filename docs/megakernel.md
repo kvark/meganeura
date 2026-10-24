@@ -98,9 +98,10 @@ launch for every graph.
 The queues and any immutable reset image are allocated once and included in
 scheduler residency. Sessions with device regions use a GPU copy to restore
 counters and root readiness at each step; other sessions retain zero-fill reset.
-Tensor,
-optimizer and cache data are untouched. Every worker scan and task loop is
-bounded. `ExecutionRegion::device_scheduled` identifies the selected protocol.
+Tensor, optimizer and cache data are untouched. Every worker scan and task loop
+is bounded. A device worker retries at most 64 idle scans so it can claim newly
+released tasks before retiring; a zero unfinished-task count permits immediate
+retirement. `ExecutionRegion::device_scheduled` identifies the selected protocol.
 After a completed step, `Session::validate_persistent_completion()` checks that
 tasks, dependency/tile counters, ready bits and error flags have drained. This
 downloads queue state and belongs outside timing; oracle checks and the paired

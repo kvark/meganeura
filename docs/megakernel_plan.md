@@ -417,6 +417,16 @@ model forward/training. All comparisons remain exact. Native model regions
 still use only one to three workers in the diagnostic samples; see the retained
 [selective-queue evidence](megakernel_device_results.md#selective-device-queues).
 
+Device workers now retry at most 64 unsuccessful ready scans before retiring,
+and exit earlier when the unfinished-task count reaches zero. This gives short
+dependent handoffs an opportunity to retain workers while preserving bounded
+execution without a residency assumption. All five focused Session checks pass
+on NVIDIA and lavapipe, including 4,096 workers. NVIDIA again passes 168 oracle,
+182 regression, 72 smoke and 22 GGUF tests (21 regression and two smoke tests
+ignored); strict all-target Clippy and formatting pass. Model measurements will
+check worker utilization and completed latency; CI has no native device regions
+and its execution path is unchanged.
+
 The device queue uses the same Session work descriptors, tracking ready tasks,
 predecessor counts, unfinished work and successor edges on the GPU. It releases
 consumers after whole-operation completion; measure whether tile-level

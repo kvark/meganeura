@@ -98,7 +98,13 @@ purposes and must not be conflated.
 ## Progress, completion and reuse
 
 A worker searches the finite bitmap for any ready task. It never waits for a
-particular predecessor or slot. A worker that finds no claimable work may retire;
+particular predecessor or slot. Session workers make at most 64 unsuccessful
+scan rounds before retiring, allowing short producer/consumer handoffs to retain
+workers. A zero total-remaining count permits an earlier exit. Each round uses a
+uniform broadcast, so every lane agrees on the claim or retirement. These fixed
+retries extend the initial protocol's single scan; they do not wait indefinitely
+for another workgroup or require simultaneous residency.
+A worker that finds no claimable work may retire;
 an empty observation is **not** global completion. A completing worker publishes
 successors before it searches again. If another worker takes its newly published
 work, that worker continues the chain. Otherwise the publisher can claim it

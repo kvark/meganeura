@@ -8,29 +8,43 @@ var<storage, read_write> persistent_queue: array<atomic<u32>>;
 var<uniform> persistent_params: PersistentParams;
 var<workgroup> persistent_ticket: u32;
 
-@compute @workgroup_size($WORKGROUP)
-fn persistent_main(@builtin(local_invocation_id) lid: vec3<u32>,
-                   @builtin(workgroup_id) worker: vec3<u32>) {
-    for (var iteration = 0u; iteration <= persistent_params.ends.w; iteration += 1u) {
-        if lid.x == 0u {
+fn persistent_claim(worker: u32, lane: u32) -> u32 {
+    for (var retry = 0u; retry < 64u; retry += 1u) {
+        if lane == 0u {
             persistent_ticket = 0xffffffffu;
-            for (var probe = 0u; probe < persistent_params.successors.w; probe += 1u) {
-                let word = (worker.x + probe) % persistent_params.successors.w;
-                let bits = atomicLoad(&persistent_queue[8u + word]);
-                if bits != 0u {
-                    let bit = firstTrailingBit(bits);
-                    let mask = 1u << bit;
-                    let old = atomicAnd(&persistent_queue[8u + word], ~mask);
-                    if (old & mask) != 0u {
-                        persistent_ticket = word * 32u + bit;
-                        storageFence();
-                        break;
+            if atomicLoad(&persistent_queue[0]) == 0u {
+                persistent_ticket = 0xfffffffeu;
+            } else {
+                for (var probe = 0u; probe < persistent_params.successors.w; probe += 1u) {
+                    let word = (worker + probe) % persistent_params.successors.w;
+                    let bits = atomicLoad(&persistent_queue[8u + word]);
+                    if bits != 0u {
+                        let bit = firstTrailingBit(bits);
+                        let mask = 1u << bit;
+                        let old = atomicAnd(&persistent_queue[8u + word], ~mask);
+                        if (old & mask) != 0u {
+                            persistent_ticket = word * 32u + bit;
+                            storageFence();
+                            break;
+                        }
                     }
                 }
             }
         }
         let ticket = workgroupUniformLoad(&persistent_ticket);
-        if ticket == 0xffffffffu {
+        if ticket != 0xffffffffu {
+            return ticket;
+        }
+    }
+    return 0xffffffffu;
+}
+
+@compute @workgroup_size($WORKGROUP)
+fn persistent_main(@builtin(local_invocation_id) lid: vec3<u32>,
+                   @builtin(workgroup_id) worker: vec3<u32>) {
+    for (var iteration = 0u; iteration <= persistent_params.ends.w; iteration += 1u) {
+        let ticket = persistent_claim(worker.x, lid.x);
+        if ticket >= 0xfffffffeu {
             return;
         }
         if ticket >= persistent_params.ends.w {
