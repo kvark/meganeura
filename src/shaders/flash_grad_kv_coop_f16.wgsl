@@ -102,28 +102,21 @@ fn main(
         let tile_end = first_q + ((last_q - first_q) / 16u) * 16u;
         var t = first_q;
         for (; t < tile_end; t = t + 16u) {
-            var maximum_qdo = vec2<f32>(0.0);
-            for (var i = lid.x; i < $TILE_ELEMENTSu; i = i + 128u) {
-                let qi = i / $HEAD_DIMu;
+            let maximum_qdo = row_maxima(t, 16u, q_head);
+            let exponent_qdo = vec2<i32>(exponent_for(maximum_qdo.x), exponent_for(maximum_qdo.y));
+            for (var i = lid.x; i < $TILE_ELEMENTSu; i += 128u) {
+                let qp = t + i / $HEAD_DIMu;
                 let d = i % $HEAD_DIMu;
-                let qp = t + qi;
+                let index = d * 16u + i / $HEAD_DIMu;
+                var qv = 0.0;
+                var dov = 0.0;
                 if qp < q_seq {
                     let q_off = qp * q_dim + q_head * head_dim + d;
-                    let qv = src_a[q_off];
-                    let dov = d_out[q_off];
-                    shared_result[i] = qv;
-                    shared_result[$TILE_ELEMENTSu + i] = dov;
-                    maximum_qdo = max(maximum_qdo, abs(vec2<f32>(qv, dov)));
-                } else {
-                    shared_result[i] = 0.0;
-                    shared_result[$TILE_ELEMENTSu + i] = 0.0;
+                    qv = src_a[q_off];
+                    dov = d_out[q_off];
                 }
-            }
-            let exponent_qdo = block_exponents(maximum_qdo, sg, subgroup_size, subgroup_lane);
-            for (var i = lid.x; i < $TILE_ELEMENTSu; i += 128u) {
-                let index = (i % $HEAD_DIMu) * 16u + i / $HEAD_DIMu;
-                shared_q_t[index] = f16(scale_power(shared_result[i], exponent_qdo.x));
-                shared_do_t[index] = f16(scale_power(shared_result[$TILE_ELEMENTSu + i], exponent_qdo.y));
+                shared_q_t[index] = f16(scale_power(qv, exponent_qdo.x));
+                shared_do_t[index] = f16(scale_power(dov, exponent_qdo.y));
             }
 
             if lid.x < 16u {

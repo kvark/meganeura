@@ -535,6 +535,23 @@ impl Session {
                     },
                 );
             }
+            ShaderEntry::AttentionRowStats => {
+                pc.bind(
+                    0,
+                    &TernaryData {
+                        src_a: buf(dispatch.input_buffers[0]),
+                        src_b: buf(dispatch.input_buffers[1]),
+                        src_c: buf(dispatch.input_buffers[2]),
+                        dst: buf(dispatch.output_buffer),
+                        params: UnaryParams {
+                            len: dispatch.params[0],
+                            _pad0: dispatch.params[1],
+                            _pad1: dispatch.params[2],
+                            _pad2: 0,
+                        },
+                    },
+                );
+            }
             ShaderEntry::SwiGLUGradGate => {
                 pc.bind(
                     0,

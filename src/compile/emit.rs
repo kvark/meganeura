@@ -547,21 +547,70 @@ impl<'a> Compiler<'a> {
     /// D[row] = dot(d_out[row], o[row]) over `head_dim`-wide rows, for the
     /// attention backward kernels. Sharing D keeps dQ and dK/dV ready at the
     /// same dependency level, preserving overlap and projection-gradient batching.
+    /// When requested, append Q/dO maxima per 16-row tile and head.
     pub(super) fn emit_attention_row_dot(
         &mut self,
         d_out: BufferRef,
         o: BufferRef,
+        q: (BufferRef, u32),
         rows: u32,
         head_dim: u32,
+        maxima: bool,
     ) -> BufferRef {
         use crate::schedule::ReduceOp;
 
-        let key = (d_out, o, rows, head_dim);
-        if let Some(&row_dot) = self.attention_row_dots.get(&key) {
-            return row_dot;
+        let key = AttentionRowDotKey {
+            d_out,
+            output: o,
+            query: q,
+            rows,
+            head_dim,
+        };
+        let cached = self.attention_row_dots.get(&key).copied();
+        if let Some(row_dot) = cached {
+            let producer = self
+                .plan
+                .dispatches
+                .iter()
+                .find(|d| d.output_buffer == row_dot)
+                .unwrap();
+            if !maxima || producer.shader == ShaderEntry::AttentionRowStats {
+                return row_dot;
+            }
         }
         const WORKGROUP_SIZE: u32 = 256;
         let lanes = head_dim.next_power_of_two().clamp(2, WORKGROUP_SIZE);
+        // F16 reuses a pair of operand maxima per 16-row tile. F32 paths
+        // keep the original dot-only reduction, buffer size and input reads.
+        if maxima {
+            let (q, heads) = q;
+            let q_seq = rows / heads;
+            let elements = rows + 2 * q_seq.div_ceil(16) * heads;
+            let row_dot = cached.unwrap_or_else(|| self.alloc_buffer(elements as usize * 4));
+            self.plan.buffers[row_dot.0 as usize] = elements as usize * 4;
+            let dispatch = Dispatch {
+                shader: ShaderEntry::AttentionRowStats,
+                workgroups: [q_seq.div_ceil(16), heads, 1],
+                input_buffers: vec![d_out, o, q],
+                output_buffer: row_dot,
+                params: vec![q_seq, heads, head_dim, 0],
+                ..Default::default()
+            };
+            if cached.is_some() {
+                // A scalar part may have asked for D first. Upgrade its
+                // producer in place: its existing consumer still reads D.
+                *self
+                    .plan
+                    .dispatches
+                    .iter_mut()
+                    .find(|d| d.output_buffer == row_dot)
+                    .unwrap() = dispatch;
+            } else {
+                self.plan.dispatches.push(dispatch);
+            }
+            self.attention_row_dots.insert(key, row_dot);
+            return row_dot;
+        }
         let row_dot = self.alloc_buffer(rows as usize * 4);
         self.plan.dispatches.push(Dispatch {
             shader: ShaderEntry::Generated,
@@ -3623,8 +3672,14 @@ impl<'a> Compiler<'a> {
                     num_heads,
                     head_dim,
                 );
-                let row_source =
-                    self.emit_attention_row_dot(d_out, fwd_o, q_seq * num_heads, head_dim);
+                let row_source = self.emit_attention_row_dot(
+                    d_out,
+                    fwd_o,
+                    (q, num_heads),
+                    q_seq * num_heads,
+                    head_dim,
+                    kernel.path == attention_grad::Path::Cooperative(attention_grad::Operands::F16),
+                );
                 self.plan.dispatches.push(Dispatch {
                     kernel: if kernel.takes_ept_cap() {
                         Kernel::AttentionBackward { ept_cap }
@@ -3712,8 +3767,14 @@ impl<'a> Compiler<'a> {
                 // Every dK/dV kernel needs dot(dO, O) for every query row.
                 // Reduce it once here; recomputing it in every KV workgroup
                 // read O and spent a third of the inner loop's products on it.
-                let row_source =
-                    self.emit_attention_row_dot(d_out, fwd_o, q_seq * num_heads, head_dim);
+                let row_source = self.emit_attention_row_dot(
+                    d_out,
+                    fwd_o,
+                    (q, num_heads),
+                    q_seq * num_heads,
+                    head_dim,
+                    kernel.path == attention_grad::Path::Cooperative(attention_grad::Operands::F16),
+                );
                 self.plan.dispatches.push(Dispatch {
                     kernel: if kernel.takes_ept_cap() {
                         Kernel::AttentionBackward { ept_cap }
