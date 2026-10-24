@@ -396,8 +396,12 @@ RAW/WAR/WAW aliases, parameter rebinding and repeated external reset/recording.
 All 506 unit checks pass after documenting the new environment selector; strict
 Clippy, formatting and documentation pass. All five focused Session checks pass
 on NVIDIA and lavapipe; ordinary-mode smoke also passes 72 tests (two ignored).
-Paired production results follow this implementation
-commit and must not be inferred from launch reduction alone.
+At `275456d`, [paired production results](megakernel_device_results.md) show exact
+state/output comparisons but regressions of 28–65%. Model graph launches fall
+from 154 to 151 forward and 523 to 518 training; coverage is unchanged and
+optimizer work remains ordinary. The first implementation also uses device
+queues for singleton regions. Measurements justify retaining portable queues
+where no inter-operation dependency needs the native protocol.
 
 The device queue uses the same Session work descriptors, tracking ready tasks,
 predecessor counts, unfinished work and successor edges on the GPU. It releases
