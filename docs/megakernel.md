@@ -80,8 +80,10 @@ the same explicit selection for oracle checks.
 `PersistentOptions::device_scheduling = true` (or
 `MEGANEURA_DEVICE_SCHEDULING=1` alongside the worker selector) enables the
 [qualified Vulkan fence contract](megakernel_memory_contract.md). The same
-generated pointwise/reduction bodies then use a bounded ready bitmap and
-whole-operation completion counters. Compatible dependent operations can share
+generated pointwise/reduction bodies use a bounded ready bitmap and
+whole-operation completion counters when a region contains dependencies.
+Independent and singleton regions retain the portable queue, with no native
+fences or bitmap scans. Compatible dependent operations can share
 one launch even when consumers read tiles produced by other workers. The planner
 orders physical RAW/WAR/WAW hazards, including rebinding, and annotates aliased
 read-only inputs as coherent. Immutable inputs keep their ordinary accesses.
@@ -93,8 +95,10 @@ operation per launch. BF16 handlers remain singleton-only. This is device
 scheduling within reported regions, not full graph coverage or a promise of one
 launch for every graph.
 
-The queue and immutable reset image are allocated once and included in scheduler
-residency. A GPU copy restores counters and root readiness at each step; tensor,
+The queues and any immutable reset image are allocated once and included in
+scheduler residency. Sessions with device regions use a GPU copy to restore
+counters and root readiness at each step; other sessions retain zero-fill reset.
+Tensor,
 optimizer and cache data are untouched. Every worker scan and task loop is
 bounded. `ExecutionRegion::device_scheduled` identifies the selected protocol.
 After a completed step, `Session::validate_persistent_completion()` checks that

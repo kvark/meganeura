@@ -484,7 +484,19 @@ impl State {
                         index += 1;
                     }
                     region.worker_owned_chain = chain && handlers.len() > 1;
-                    region.device_scheduled = options.device_scheduling;
+                    region.device_scheduled = options.device_scheduling
+                        && (start..index).any(|left| {
+                            count(&plan.dispatches[left]) != 0
+                                && (left + 1..index).any(|right| {
+                                    count(&plan.dispatches[right]) != 0
+                                        && !independent(
+                                            plan,
+                                            buffers,
+                                            &plan.dispatches[left],
+                                            &plan.dispatches[right],
+                                        )
+                                })
+                        });
                     region.dispatches.end = index;
                     region.logical_tasks = 0;
                     region.workers = options.workers;
@@ -651,7 +663,11 @@ impl State {
             }
             dispatch_regions[start..index].fill(report.regions.len());
             queue_offsets.push(queue_bytes);
-            queue_bytes += options.queue_stride(if region.workers == 0 {
+            let queue_options = PersistentOptions {
+                device_scheduling: region.device_scheduled,
+                ..options
+            };
+            queue_bytes += queue_options.queue_stride(if region.workers == 0 {
                 0
             } else {
                 region.logical_tasks as u32
@@ -661,14 +677,15 @@ impl State {
         }
         report.graph_dispatches = report.regions.len();
         let (queue, initial_queue) = if pipelines.iter().any(Option::is_some) {
-            report.scheduler_bytes = queue_bytes * if options.device_scheduling { 2 } else { 1 };
+            let needs_reset_image = report.regions.iter().any(|region| region.device_scheduled);
+            report.scheduler_bytes = queue_bytes * if needs_reset_image { 2 } else { 1 };
             super::ensure_device_memory_budget(gpu, report.scheduler_bytes, "persistent queues");
             let queue = gpu.create_buffer(bg::BufferDesc {
                 name: "persistent queues",
                 size: queue_bytes as u64,
                 memory: bg::Memory::Device,
             });
-            let initial_queue = options.device_scheduling.then(|| {
+            let initial_queue = needs_reset_image.then(|| {
                 let mut initial = vec![0u32; queue_bytes / 4];
                 for (index, region) in report.regions.iter().enumerate() {
                     if !region.device_scheduled {
@@ -803,7 +820,7 @@ impl Session {
         let Some(ref state) = self.persistent else {
             return Ok(());
         };
-        if !state.options.device_scheduling {
+        if state.initial_queue.is_none() {
             return Ok(());
         }
         let Some(queue) = state.queue else {

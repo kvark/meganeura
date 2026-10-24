@@ -30,15 +30,19 @@ fn session_device_graphs_release_dependencies_across_worker_tiles() {
         eprintln!("device graph fences are unsupported on this backend");
         return;
     }
-    for case in 0..4 {
+    for case in 0..5 {
         let mut graph = meganeura::Graph::new();
         let shape = if case == 2 { [0, 259] } else { [37, 259] };
         let x = graph.input("x", &shape);
         let positive = graph.relu(x);
-        if case == 0 {
+        if case == 0 || case == 4 {
             let negative = graph.neg(x);
             let sum = graph.add(positive, negative);
-            graph.set_outputs(vec![positive, negative, sum]);
+            let mut outputs = vec![positive, negative, sum];
+            if case == 4 {
+                outputs.push(graph.neg(sum));
+            }
+            graph.set_outputs(outputs);
         } else if case == 1 {
             let sum = graph.sum_inner(positive);
             let negative = graph.neg(sum);
@@ -71,23 +75,31 @@ fn session_device_graphs_release_dependencies_across_worker_tiles() {
             });
             let mut session = meganeura::build(&graph, config).0;
             let report = session.execution_report();
+            let operations: usize = if case == 2 {
+                1
+            } else if case == 4 {
+                4
+            } else {
+                3
+            };
             assert_eq!(
                 report.graph_dispatches,
-                if serial && case != 2 { 3 } else { 1 }
+                if serial {
+                    operations
+                } else {
+                    operations.div_ceil(3)
+                }
             );
-            assert!(
-                report
-                    .regions
-                    .iter()
-                    .all(|region| region.device_scheduled && !region.worker_owned_chain)
-            );
+            assert!(report.regions.iter().all(|region| region.device_scheduled
+                == (region.dispatches.len() > 1 && case != 2)
+                && !region.worker_owned_chain));
             assert_eq!(
                 report
                     .regions
                     .iter()
                     .map(|region| region.dispatches.len())
                     .sum::<usize>(),
-                if case == 2 { 1 } else { 3 }
+                operations
             );
             assert_eq!(
                 session.memory_summary().scheduler_bytes,
@@ -98,12 +110,16 @@ fn session_device_graphs_release_dependencies_across_worker_tiles() {
                     .map(|i| ((i * 17 + replay * 23) % 101) as f32 / 32.0 - 1.0)
                     .collect();
                 let positive: Vec<_> = input.iter().map(|value| value.max(0.0)).collect();
-                let expected = if case == 0 {
-                    vec![
+                let expected = if case == 0 || case == 4 {
+                    let mut values = vec![
                         positive,
                         input.iter().map(|value| -value).collect(),
                         input.iter().map(|value| (-value).max(0.0)).collect(),
-                    ]
+                    ];
+                    if case == 4 {
+                        values.push(values[2].iter().map(|value| -value).collect());
+                    }
+                    values
                 } else if case == 1 {
                     let sums: Vec<f32> = positive.chunks(259).map(|row| row.iter().sum()).collect();
                     let negative = sums.iter().map(|value| -value).collect();

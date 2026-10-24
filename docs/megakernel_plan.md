@@ -403,6 +403,15 @@ optimizer work remains ordinary. The first implementation also uses device
 queues for singleton regions. Measurements justify retaining portable queues
 where no inter-operation dependency needs the native protocol.
 
+The measured follow-up retains portable queues for independent and singleton
+regions, allocating a reset image only when the Session contains a device queue.
+Coverage and physical launch boundaries are unchanged. Mixed portable/device
+queues pass the focused tests on NVIDIA and lavapipe, including repeated resets
+and worker totals. The full NVIDIA device selection again passes 168 oracle,
+182 regression, 72 smoke and 22 GGUF tests; strict Clippy, formatting and
+core/models/GGUF/profiler Metal-target compilation pass. Metal device scheduling
+remains unsupported. Updated paired measurements follow this change.
+
 The device queue uses the same Session work descriptors, tracking ready tasks,
 predecessor counts, unfinished work and successor edges on the GPU. It releases
 consumers after whole-operation completion; measure whether tile-level

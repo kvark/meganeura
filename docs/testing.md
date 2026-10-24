@@ -49,7 +49,8 @@ runtime option.
 `PersistentOptions::device_scheduling` selects the native-fence protocol.
 `ExecutionRegion::device_scheduled` identifies those launches. Regions currently
 hold up to three compatible generated handlers and release successors only after
-all predecessor tiles finish. Resource, geometry and unsupported-handler boundaries
+all predecessor tiles finish. Independent/singleton regions retain the portable
+queue and report `device_scheduled: false`. Resource, geometry and unsupported-handler boundaries
 remain physical dispatches. `validate_persistent_completion()` waits and checks
 unfinished tasks, counters and diagnostics after a step; it performs a readback,
 so correctness checks call it outside timed intervals. The reference harness and
