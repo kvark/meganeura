@@ -86,6 +86,16 @@ There is no separate BF16 opt-in. `BuildSearchReport::matrix_inputs` records the
 additional arithmetic allowed by the runtime policy. Device probes filter
 unsupported types and report them in `unsupported_matrix_inputs`.
 
+For native 8×8×8 products, the ordinary fallback and its tuned challenger still
+lead search, followed by the early F16/BF16 arithmetic alternatives before
+graph/layout, convolution weight-split and submission probes. Pending early
+alternatives share private kernel-probe time and reserve estimated comparison
+time inside the existing deadline; `early_programs_reserved` records that count
+per trial. This is not a hard guarantee of coverage: construction, GPU work and
+qualification cannot be preempted. On devices with eight-wide F16 tiles, F16 is
+considered first, but BF16 remains independently reachable whether F16 qualifies or fails. Existing
+rectangular and 16-wide layout ordering is unchanged.
+
 BF16 alternatives cover eligible forward dense products and convolutions,
 keeping F32 storage, output and protected derivatives. The ordinary program
 remains the first fallback. Arithmetic alternatives enter under the existing
