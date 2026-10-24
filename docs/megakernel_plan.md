@@ -411,6 +411,11 @@ and worker totals. The full NVIDIA device selection again passes 168 oracle,
 182 regression, 72 smoke and 22 GGUF tests; strict Clippy, formatting and
 core/models/GGUF/profiler Metal-target compilation pass. Metal device scheduling
 remains unsupported. Updated paired measurements follow this change.
+At clean `b8a1905`, the repeated 50-pair measurements reduce median paired
+ratios to 1.034/1.244/1.232 for CI inference/backward/SGD and 1.214/1.170 for
+model forward/training. All comparisons remain exact. Native model regions
+still use only one to three workers in the diagnostic samples; see the retained
+[selective-queue evidence](megakernel_device_results.md#selective-device-queues).
 
 The device queue uses the same Session work descriptors, tracking ready tasks,
 predecessor counts, unfinished work and successor edges on the GPU. It releases

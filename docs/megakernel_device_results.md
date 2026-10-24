@@ -107,3 +107,53 @@ Raw JSON and corresponding logs remain in ignored `target/megakernel-results/`:
 | `device-smolvla-paired.json` | `e5adc7f74649df7456d4627497cc80ddfd267290e6fec1c65297eb817aac1385` |
 | `device-ci-diagnostic.json` | `5cd098f41b976129627761c5cde135a6e81b29658a3332357cf0247e50aab85e` |
 | `device-smolvla-diagnostic.json` | `36430c131d9ec4693aef33492bcb6bad311e7dc73810e09c2d29b776353767bb` |
+
+## Selective device queues
+
+Clean commit `b8a1905` retains portable queues for independent and singleton
+regions. The same 50-pair primary and ten-pair diagnostic procedure was repeated,
+with unchanged graph launch counts and operator coverage. Every numerical and
+queue-completion comparison still passed exactly.
+
+| Case | Ordinary median ms | Selected-path median ms | Median paired ratio | Ordinary/selected p95 ms |
+|---|---:|---:|---:|---:|
+| CI inference | 0.05212 | 0.05369 | 1.034 | 0.05545 / 0.05944 |
+| CI forward/backward | 0.06544 | 0.08108 | 1.244 | 0.06974 / 0.08535 |
+| CI forward/backward/SGD | 0.06728 | 0.08235 | 1.232 | 0.07166 / 0.08740 |
+| SmolVLA forward | 4.43738 | 5.39863 | 1.214 | 4.85093 / 5.78077 |
+| SmolVLA forward/backward/SGD | 15.42334 | 18.03511 | 1.170 | 79.22423 / 85.18203 |
+
+The CI cases now use zero native device regions. Model forward uses two native
+regions and 16 portable regions; training uses three native and 80 portable
+regions. Ordinary graph fallback remains 133 and 435 launches respectively.
+Forward IQRs were 4.16525–4.71502 ms ordinary and 5.03162–5.74027 ms selected;
+training IQRs were 15.06895–15.51092 and 14.90072–18.10892 ms. Retain the training
+variation and tail outliers when interpreting its median ratio.
+
+CI queue residency falls to 1,280 bytes for inference and 4,608 for training
+because those sessions need no reset image. Model residency remains 599.878 MiB
+forward and 1027.737 MiB training, including 77,312 and 265,216 scheduler bytes.
+Observed ordinary/selected construction ms were 0.85/13.54, 11.45/17.11,
+55.71/78.42 and 75.17/92.43 for CI inference/training and model forward/training.
+The same shared-context/cache caveat applies.
+
+Diagnostic median GPU pass intervals, ordinary/selected in ms, were
+0.01346/0.01638, 0.02656/0.03960 and 0.03066/0.04354 for the three CI cases;
+3.46357/4.25846 for model forward and 14.37938/16.89542 for model training.
+All worker totals matched. Native model regions used only one to three active
+workers in the final samples, processing 208 forward and 221 training tasks.
+Portable regions used up to 50 and 64 workers, processing 753 and 9,077 tasks.
+This is consistent with idle workers retiring before downstream fan-out becomes
+ready; bounded idle retries are a possible next scheduler improvement, without
+requiring a global rendezvous or a residency assumption.
+
+The narrower selection reduces overhead but still loses to ordinary execution.
+It remains opt-in. Raw records retain the same arguments, boundaries, source
+identity, full distributions, coverage and diagnostics:
+
+| Record | SHA-256 |
+|---|---|
+| `device-selective-ci-paired.json` | `45a3dfb4808225935e3d041165ee24df0b94823d6ce6f3de3f1d4952ff136f14` |
+| `device-selective-smolvla-paired.json` | `0a05cb542b296bd03e260d2c487ae46e8bb5a0685b024febc49859eabf5dd139` |
+| `device-selective-ci-diagnostic.json` | `5914316fff5c6fca71a6ed3532ef1e123f8cf8239189b56bc2eadd88308fe33c` |
+| `device-selective-smolvla-diagnostic.json` | `f58229e054a3f0a33d4c6d57ab9057e4e00e060e1dba672be649f79a3f3cf30e` |
