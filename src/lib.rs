@@ -23,6 +23,7 @@ pub mod eager;
 pub mod graph;
 pub mod kernels;
 pub mod load;
+pub mod megakernel;
 #[doc(hidden)]
 pub mod memplan;
 #[cfg(feature = "models")]

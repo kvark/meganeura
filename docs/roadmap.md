@@ -92,7 +92,10 @@ Remaining work:
   when profiles justify the extra compiler and kernel surface.
 - Treat persistent decode kernels as research. Vulkan/WGSL forward-progress and
   synchronization constraints need an explicit design; compare with existing
-  fusion before expanding the runtime around them.
+  fusion before expanding the runtime around them. The
+  [megakernel plan](megakernel_plan.md) starts with persistent regions inside
+  `Session` and shared qualification, then investigates the minimally intrusive
+  Naga memory/atomic interface needed for device-scheduled graphs.
 
 ## Measured selection
 

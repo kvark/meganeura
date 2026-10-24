@@ -45,6 +45,8 @@ gradient read these indices directly. Use
 For local iteration see [testing and coverage](docs/testing.md) and [debugging the stack](#debugging).
 The [shader generation investigation](docs/shader-generation.md) compares WGSL,
 synaga and other shader construction approaches.
+The experimental [persistent megakernel](docs/megakernel.md) runs a device-side
+work queue with a fixed pool of workgroups and an instruction interpreter.
 
 ## Why Meganeura
 
