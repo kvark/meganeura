@@ -503,6 +503,14 @@ validation. Device selection also passes 182 regression and 74 smoke tests
 (21 regression and two smoke tests ignored). All seven focused Session checks
 pass on NVIDIA and lavapipe. Strict all-target/all-feature Clippy, formatting,
 documentation and core/models/GGUF/profiler Metal-target compilation pass.
+At clean `23642ba`, repeated 50-pair primary and ten-pair diagnostic comparisons
+remain exact. Selected residency equals ordinary residency plus scheduler bytes:
+563.491 MiB model forward and 982.258 MiB training, reductions of 36.38/45.40 MiB
+from the preceding implementation. Coverage and launch counts are unchanged;
+one additional model training region uses native ordering. Median paired ratios
+are 1.094/1.289/1.275 for CI and 1.899/1.665 for model forward/training. Ordinary
+remains the default; [measurements](megakernel_device_results.md#restored-lifetime-reuse)
+retain construction, distributions, diagnostics and raw identities.
 
 The device queue uses the same Session work descriptors, tracking ready tasks,
 predecessor counts, unfinished work and successor edges on the GPU. It releases

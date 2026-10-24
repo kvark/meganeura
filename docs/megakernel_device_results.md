@@ -260,3 +260,65 @@ under `target/megakernel-results/`, outside Git, with matching `.log` files:
 | `generic-tile-smolvla-paired.json` | `7eeb8085b29b3fda08a8f8f076a419772a58825484e5f18b6a583552882200b9` |
 | `generic-tile-ci-diagnostic.json` | `548ed54f817b3b068cda9ea5dc6f862546eb8d069d1410230029c8aad871f47c` |
 | `generic-tile-smolvla-diagnostic.json` | `e814251cf7517bdc95a6021c9d3b91a7940a764cf702564eeaad7f2bec2275d3` |
+
+## Restored lifetime reuse
+
+Clean commit `23642badb691522a04ddbb64f3e5b5b2ea20859b` restores the ordinary
+liveness allocation plan while retaining physical RAW/WAR/WAW ordering in
+persistent regions. The same hardware, dependencies, state restoration,
+50-pair primary procedure and ten-pair diagnostic procedure were repeated
+sequentially on an initially idle GPU. All output, gradient, updated-parameter
+and queue comparisons remain exact. Both strict oracle selections pass 168
+tests; device selection passes 22 strict GGUF, 182 regression and 74 smoke tests.
+Seven focused Session checks pass on NVIDIA and lavapipe, including actual
+allocation reuse across a physical WAR edge absent from the logical graph.
+
+| Case | Ordinary median ms | Selected median ms | Median paired ratio | Ordinary/selected p95 ms |
+|---|---:|---:|---:|---:|
+| CI inference | 0.05722 | 0.06264 | 1.094 | 0.06194 / 0.06528 |
+| CI forward/backward | 0.06606 | 0.08447 | 1.289 | 0.07022 / 0.08961 |
+| CI forward/backward/SGD | 0.06740 | 0.08576 | 1.275 | 0.07208 / 0.08906 |
+| SmolVLA forward | 4.47562 | 8.47641 | 1.899 | 4.87196 / 8.84898 |
+| SmolVLA forward/backward/SGD | 15.09775 | 24.68596 | 1.665 | 79.43328 / 102.86277 |
+
+Model forward IQRs are 4.43748–4.51358 ms ordinary and 8.45524–8.79207 ms
+selected; paired-ratio IQR is 1.853–1.913. Training IQRs are 12.03363–15.44797
+and 24.33560–24.85045 ms, with paired-ratio IQR 1.596–2.065 and p95 8.432.
+Outliers remain in the raw records. These results continue to favor ordinary
+execution; the reuse change is retained for its qualified memory reduction.
+
+All graph operations remain covered and launch counts remain 5/13 for CI and
+136/363 for model forward/training. Model training now uses 15 native and 348
+portable regions: one additional region needs physical reuse ordering. Other
+region counts are unchanged. Appended SGD remains ordinary fallback.
+
+| Case | Resident MiB ordinary → selected | Scheduler bytes | Construction ms ordinary / selected |
+|---|---:|---:|---:|
+| CI inference | 0.06995 → 0.07117 | 1,280 | 0.89 / 3.97 |
+| CI training | 0.13229 → 0.13863 | 6,656 | 11.82 / 13.76 |
+| SmolVLA forward | 563.42498 → 563.49138 | 69,632 | 55.17 / 252.03 |
+| SmolVLA training | 982.08075 → 982.25800 | 185,856 | 75.24 / 573.37 |
+
+Selected buffer residency now equals ordinary residency plus scheduler bytes
+in all four cases. Model residency falls by 36.38 MiB forward and 45.40 MiB
+training relative to `55fb598`. Construction remains a shared-context,
+ordinary-first observation with unmatched shader-cache state; its decrease
+cannot be attributed to lifetime reuse from these runs.
+
+Diagnostic median GPU intervals, ordinary/selected in ms, are 0.01331/0.01944,
+0.02744/0.04782 and 0.03189/0.05174 for CI; 3.47000/6.85094 forward and
+14.36854/23.71771 training for SmolVLA. Every histogram matches its logical
+task total. Native model regions use 11–64 active workers forward and 9–64
+training; portable regions use 40–64 and 1–64. Executable register/shared-memory
+ranges match the preceding measurements. Hardware occupancy and the driver's
+implausible local-memory values remain outside the conclusions.
+
+The same reproduction commands apply. Raw records and matching logs remain
+under `target/megakernel-results/`, outside Git:
+
+| Record | SHA-256 |
+|---|---|
+| `lifetime-reuse-ci-paired.json` | `813c745fe42b5bf8f16661ab2ef43a093f942552d8cf59c2d6d81daa7d651b6d` |
+| `lifetime-reuse-smolvla-paired.json` | `2fcd70d24dad2be2c4904f1d516cbdb7df02281cd089e8808cd20b78c409e940` |
+| `lifetime-reuse-ci-diagnostic.json` | `c3dce1c31373e18e236761223d8d23c3468b2bec2f7b0ba70eeea4b667931efc` |
+| `lifetime-reuse-smolvla-diagnostic.json` | `8c7cf527e5fe5a484d83d839603a9219fc0710e5a095c873a7a9d8913d72c3ee` |
