@@ -338,6 +338,8 @@ pub enum ShaderEntry {
     FlashAttentionCoopF32,
     /// Attention backward; the kernel family says which part and path.
     AttentionGrad(crate::kernels::attention_grad::AttentionGrad),
+    /// F32 row dots and reusable Q/dO maxima for scaled attention backward.
+    AttentionRowStats,
     SwiGLUGradGate,
     SwiGLUGradUp,
     SiluGrad,
@@ -478,6 +480,7 @@ impl ShaderEntry {
             | ShaderEntry::FlashAttention
             | ShaderEntry::FlashAttentionCoop
             | ShaderEntry::FlashAttentionCoopF32
+            | ShaderEntry::AttentionRowStats
             | ShaderEntry::AttentionGrad(_)
             | ShaderEntry::CachedAttention
             | ShaderEntry::BiasedAttention
@@ -651,6 +654,7 @@ impl ShaderEntry {
             ShaderEntry::FlashAttention => ShaderGroup::FlashAttention,
             ShaderEntry::FlashAttentionCoop => ShaderGroup::FlashAttentionCoop,
             ShaderEntry::FlashAttentionCoopF32 => ShaderGroup::FlashAttentionCoopF32,
+            ShaderEntry::AttentionRowStats => ShaderGroup::AttentionRowStats,
             ShaderEntry::AttentionGrad(kernel) => ShaderGroup::AttentionGrad(kernel),
             ShaderEntry::SwiGLUGradGate | ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => {
                 ShaderGroup::SwiGLUGrad
@@ -776,7 +780,8 @@ impl ShaderEntry {
             | ShaderEntry::FlashAttention
             | ShaderEntry::FlashAttentionCoop
             | ShaderEntry::FlashAttentionCoopF32
-            | ShaderEntry::AttentionGrad(_) => "main",
+            | ShaderEntry::AttentionGrad(_)
+            | ShaderEntry::AttentionRowStats => "main",
             ShaderEntry::SwiGLUGradGate => "swiglu_grad_gate",
             ShaderEntry::SwiGLUGradUp => "swiglu_grad_up",
             ShaderEntry::SiluGrad => "silu_grad",
@@ -3213,6 +3218,15 @@ mod row_reduction {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct AttentionRowDotKey {
+    d_out: BufferRef,
+    output: BufferRef,
+    query: (BufferRef, u32),
+    rows: u32,
+    head_dim: u32,
+}
+
 struct Compiler<'a> {
     graph: &'a Graph,
     plan: ExecutionPlan,
@@ -3232,7 +3246,7 @@ struct Compiler<'a> {
     /// Allocate GradV's destination before any Identity/reshape views alias
     /// it. GradK writes both gradients; GradV emits no separate dispatch.
     pending_grad_v_buffers: HashMap<NodeId, BufferRef>,
-    attention_row_dots: HashMap<(BufferRef, BufferRef, u32, u32), BufferRef>,
+    attention_row_dots: HashMap<AttentionRowDotKey, BufferRef>,
     /// GroupNorm backward statistics per input, grouping and epsilon,
     /// shared by the input and weight/bias gradients.
     group_norm_grad_stats: HashMap<(NodeId, [u32; 4], u32), BufferRef>,
@@ -3258,19 +3272,26 @@ mod tests {
     #[test]
     fn f16_attention_respects_explicit_full_precision_forward() {
         let path = Path::Cooperative(Operands::F16);
-        for (protected, prefer_f16) in [(false, true), (true, true), (false, false), (true, false)]
-        {
+        // At 48,000 bytes only dQ fits at head 128. Its scalar dK/dV
+        // sibling must share the extended D buffer instead of adding a pass.
+        for (protected, prefer_f16, head_dim, shared_bytes, reduced_parts) in [
+            (false, true, 64, 49_152, 2),
+            (true, true, 64, 49_152, 0),
+            (false, false, 64, 49_152, 0),
+            (true, false, 64, 49_152, 0),
+            (false, true, 128, 48_000, 1),
+        ] {
             let mut graph = Graph::new();
-            let q = graph.parameter("q", &[33, 64]);
-            let k = graph.parameter("k", &[33, 64]);
-            let v = graph.parameter("v", &[33, 64]);
+            let q = graph.parameter("q", &[33, head_dim]);
+            let k = graph.parameter("k", &[33, head_dim]);
+            let v = graph.parameter("v", &[33, head_dim]);
             let qw = graph.parameter("qw", &[33, 256]);
             let kw = graph.parameter("kw", &[33, 256]);
             let vw = graph.parameter("vw", &[33, 256]);
             if protected {
                 graph.begin_full_precision_region();
             }
-            let y = graph.multi_head_attn(q, k, v, 1, 1, 64, false);
+            let y = graph.multi_head_attn(q, k, v, 1, 1, head_dim as u32, false);
             let wide = graph.multi_head_attn(qw, kw, vw, 1, 1, 256, false);
             let loss = graph.mean_all(y);
             let wide_loss = graph.mean_all(wide);
@@ -3289,12 +3310,35 @@ mod tests {
                     f16_attention_rows: 16,
                     ..Default::default()
                 },
-                49_152,
+                shared_bytes,
             );
             let count = plan.dispatches.iter().filter(|d| {
-                matches!(d.shader, ShaderEntry::AttentionGrad(kernel) if kernel.path == path)
-            }).count();
-            assert_eq!(count, if protected || !prefer_f16 { 0 } else { 2 });
+            matches!(d.shader, ShaderEntry::AttentionGrad(kernel) if kernel.path == path)
+        }).count();
+            assert_eq!(count, reduced_parts);
+            let stats: Vec<_> = plan
+                .dispatches
+                .iter()
+                .filter(|d| d.shader == ShaderEntry::AttentionRowStats)
+                .collect();
+            assert_eq!(stats.len(), usize::from(!protected && prefer_f16));
+            if let Some(stats) = stats.first() {
+                assert_eq!(
+                    plan.buffers[stats.output_buffer.0 as usize],
+                    ((stats.params[0] + 2 * stats.params[0].div_ceil(16)) * stats.params[1])
+                        as usize
+                        * 4
+                );
+                assert!(
+                    plan.dispatches
+                        .iter()
+                        .filter(|d| {
+                            matches!(d.shader, ShaderEntry::AttentionGrad(_))
+                                && d.params[3] == head_dim as u32
+                        })
+                        .all(|d| d.input_buffers[5] == stats.output_buffer)
+                );
+            }
             // Head 256 exceeds this memory budget and retains F32 derivatives.
             let wide = plan.dispatches.iter().filter(|d| {
                 matches!(d.shader, ShaderEntry::AttentionGrad(_)) && d.params[3] == 256

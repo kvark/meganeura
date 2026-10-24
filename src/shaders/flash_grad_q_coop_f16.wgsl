@@ -59,7 +59,7 @@ fn main(
     for (var d = lid.x; d < $HEAD_DIMu; d += 128u) {
         shared_anchor[d] = src_b[min_kv_start * kv_dim + kv_head_off + d];
     }
-    var maximum_do = 0.0;
+    let exponent_do = exponent_for(row_maxima(pos_base, 32u, head).y);
     for (var i = lid.x; i < (32u * $HEAD_DIMu); i = i + 128u) {
         let r = i / $HEAD_DIMu;
         let col = i % $HEAD_DIMu;
@@ -67,18 +67,13 @@ fn main(
         if qp < q_seq {
             let qi = qp * (num_heads * head_dim) + head * head_dim + col;
             shared_q[i] = f16(src_a[qi]);
-            let value = d_out[qi];
-            shared_result[i] = value;
-            maximum_do = max(maximum_do, abs(value));
+            shared_do[i] = f16(scale_power(d_out[qi], exponent_do));
         } else {
             shared_q[i] = f16(0.0);
-            shared_result[i] = 0.0;
+            shared_do[i] = f16(0.0);
         }
     }
-    let exponent_do = block_exponents(vec2<f32>(maximum_do, 0.0), sg, subgroup_size, subgroup_lane).x;
-    for (var i = lid.x; i < 32u * $HEAD_DIMu; i += 128u) {
-        shared_do[i] = f16(scale_power(shared_result[i], exponent_do));
-    }
+    workgroupBarrier(); // Publish the anchor before its dot products.
 
     if lid.x < 32u {
         let r = lid.x;

@@ -41,7 +41,20 @@ fn block_exponents(local: vec2<f32>, subgroup: u32, subgroup_width: u32, subgrou
     for (var group = 0u; group < 128u / subgroup_width; group++) {
         maximum = max(maximum, scale_maxima[group]);
     }
-    let result = vec2<i32>(exponent_for(maximum.x), exponent_for(maximum.y));
-    workgroupBarrier();
-    return result;
+    // Every caller reaches a workgroup barrier before its next reduction.
+    // That also finishes these reads before scale_maxima can be overwritten.
+    return vec2<i32>(exponent_for(maximum.x), exponent_for(maximum.y));
+}
+
+// The row-stat dispatch stores D first, then interleaved Q/dO maxima for
+// each 16-row tile and head. Both callers start on 16-row boundaries and
+// request 16 or 32 rows, retaining exactly the original reduction blocks.
+fn row_maxima(first: u32, count: u32, head: u32) -> vec2<f32> {
+    let heads = params.packed_heads >> 16u;
+    var maximum = vec2<f32>(0.0);
+    for (var row = first; row < min(first + count, params.q_seq); row += 16u) {
+        let index = params.q_seq * heads + 2u * ((row / 16u) * heads + head);
+        maximum = max(maximum, vec2<f32>(fwd_dst[index], fwd_dst[index + 1u]));
+    }
+    return maximum;
 }

@@ -2658,7 +2658,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
             AttentionGradPart::Q => MultiHeadAttnGradData::layout(),
             AttentionGradPart::KV => MultiHeadAttnGradKVData::layout(),
         },
-        ShaderEntry::SwiGLUGradGate => TernaryData::layout(),
+        ShaderEntry::SwiGLUGradGate | ShaderEntry::AttentionRowStats => TernaryData::layout(),
         ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => BinaryData::layout(),
         ShaderEntry::RmsNormGradW | ShaderEntry::RmsNormGradWRowPar | ShaderEntry::RmsNormGradX => {
             FourBufData::layout()
