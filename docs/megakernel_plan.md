@@ -3,8 +3,9 @@
 Agreed direction, October 24, 2026. Implementation starts with **Milestone 1**,
 then proceeds to the **Naga investigation in Milestone 2**. The existing
 [prototype and measurements](megakernel.md) are the starting evidence.
-Milestone 1 is complete with explicit fallback and measured regressions;
-the compiler investigation follows it.
+Milestone 1 is complete with explicit fallback and measured regressions.
+Milestone 2 qualifies the existing fence interface on Vulkan; Session device
+scheduling is the next implementation step.
 
 Implementation is delivered in separate testable commits. The standalone
 prototype is the baseline; subsequent commits update the milestone checklist
@@ -134,6 +135,26 @@ Implementation evidence:
   ordinary fallback. [Results, raw-record identities and reproduction](megakernel_session_results.md)
   record timings, variation, construction, memory, worker activity and scope.
   This completes Milestone 1 and permits the Naga investigation to start.
+- Milestone 2 selects the existing native fence extension and coherent aliases;
+  ordinary atomics remain relaxed. Naga `f09d62e54d743f89879e4e8dfb32e717146f2670`
+  adds IR capability enforcement, explicit unsupported Metal rejection and
+  rejection of SPIR-V access operands that import cannot preserve. Its compiler
+  suite passed 144 unit, 267 integration and six documentation tests (24 ignored),
+  strict Clippy, formatting and SPIR-V validation. The full wgpu workspace has
+  exactly the same 244 failures as its unchanged baseline; the
+  [memory contract](megakernel_memory_contract.md) records their classes and logs.
+  Blade `63fb651a3d0c7bad6964dba9b2585f794641862f` exposes the capability only for
+  its Vulkan memory-model path and uses that Naga revision. Blade passed 20 unit
+  tests (one ignored), strict Clippy and Metal-target compilation (warnings;
+  no Metal hardware run). Both dependency branches are pushed. Bounded protocol
+  checks passed on NVIDIA and lavapipe across four DAG shapes, 1/3/64/4096 workers
+  and 16 reset epochs, verifying all-lane data, exactly-once tasks and completion.
+  With the published pins, Meganeura passed 506 unit tests (seven ignored),
+  71 smoke tests in each ordinary/persistent selection (two ignored), all-target
+  strict Clippy, formatting and the lavapipe protocol check. Cargo confirms one
+  shared Naga dependency identity.
+  This qualifies the synchronization contract; it does not yet enable Session
+  device scheduling or establish a performance improvement.
 
 The objective is to run Meganeura graphs through persistent GPU workers using
 the ordinary `Graph` / `build` / `Session` interface, and qualify them with the
@@ -260,8 +281,8 @@ or a blanket strengthening of all atomics.
 
 ### Baseline to inspect first
 
-At the current pins, Meganeura and Blade both use Naga
-`a489554c96f87cbc5252ee00350730f6e93869f9`; Blade is
+At the start of this investigation, Meganeura and Blade both used Naga
+`a489554c96f87cbc5252ee00350730f6e93869f9`; Blade was
 `7a20f25eb0d63591611c9622cb8391b5f88f88a4`. The initial source inspection
 used Blade `eae0c6f7aa3167c79d1135050cf8e17c17fabd0a`; the intervening changes
 only expose compute resource limits. Source inspection already shows:
@@ -285,20 +306,20 @@ Recheck these against the fork revision used when the investigation starts.
 
 ### 2.1 Define the required protocol before choosing an API
 
-The [candidate memory contract](megakernel_memory_contract.md) spells out
+The [qualified memory contract](megakernel_memory_contract.md) spells out
 all-lane publication/acquisition, RMW fan-in and a bounded bitmap ready queue.
 It reuses the existing fence extension and avoids both global waiting and
-Vulkan availability/visibility chains. Compiler and device qualification remain
-required before accepting the design.
+Vulkan availability/visibility chains. The document records the compiler,
+backend and device evidence, including the remaining qualification limits.
 
-- [ ] Write the happens-before argument for tensor publication and queue-slot
+- [x] Write the happens-before argument for tensor publication and queue-slot
   publication, consumer acquisition, dependency-counter fan-in, and slot reuse.
   Cover writes from **every producer lane** and reads by **every consumer lane**,
   not just the leaders performing queue atomics.
-- [ ] Identify required memory scope, storage classes, availability/visibility,
+- [x] Identify required memory scope, storage classes, availability/visibility,
   fence ordering, and any per-operation ordering. Specify compare-exchange
   success/failure semantics and legal combinations if the protocol needs them.
-- [ ] Separate memory ordering from execution progress. Specify bounded queue
+- [x] Separate memory ordering from execution progress. Specify bounded queue
   capacity, publication without blocking all producers, exactly-once release
   of ready tasks, counter/sequence wrap, and completion with work in flight.
   An empty ready queue alone is not completion. Do not introduce a global
@@ -318,36 +339,36 @@ including the enabled features and emitted SPIR-V, before deciding it is suffici
 | Explicit ordering/scope on memory fences | If the existing fences are too broad or incomplete, can a small extension to their representation cover the requirements? |
 | Explicit ordering/scope on atomic operations | Is per-operation control necessary or materially simpler/faster, and how should loads, stores, RMW, and CAS represent it consistently? |
 
-- [ ] Compare changes to parsing, IR, validation, transformations, reflection,
+- [x] Compare changes to parsing, IR, validation, transformations, reflection,
   serialization, and each writer/reader. Account for optimizer movement or
   elimination of accesses across fences and ordered atomic operations.
-- [ ] Preserve standard WGSL behavior. Gate native extensions explicitly;
+- [x] Preserve standard WGSL behavior. Gate native extensions explicitly;
   follow the fork's existing extension conventions and return clear errors
   on unsupported targets. Do not use backend-wide switches to silently alter
   every ordinary atomic operation.
-- [ ] Audit Vulkan/SPIR-V first and Metal separately. A workgroup rendezvous
+- [x] Audit Vulkan/SPIR-V first and Metal separately. A workgroup rendezvous
   is not an equivalent implementation of a device memory fence. Document
   every backend's supported semantics or rejection path.
-- [ ] Record a short decision with competing designs, protocol proof,
+- [x] Record a short decision with competing designs, protocol proof,
   compatibility costs, emitted code, and measurements. Prefer reuse of the
   existing path if it satisfies the contract; add only demonstrated gaps.
 
 ### 2.3 Compiler and device qualification
 
-- [ ] Add focused parser/validator and backend-output coverage in the Naga
+- [x] Add focused parser/validator and backend-output coverage in the Naga
   fork, following its existing test layout. Check unsupported order/scope
   combinations and that ordinary atomic output/behavior stays unchanged.
-- [ ] Inspect/disassemble generated SPIR-V and validate its scopes, memory
+- [x] Inspect/disassemble generated SPIR-V and validate its scopes, memory
   model, semantics, storage classes, and capability declarations with
   `spirv-val`. Exercise enabled and unsupported feature configurations.
-- [ ] Run repeated GPU litmus/protocol tests for message passing, all-lane
+- [x] Run repeated GPU litmus/protocol tests for message passing, all-lane
   payloads, multi-producer fan-in, queue publication/reuse, and termination.
   Vary scheduling pressure, worker counts, and graph shape. Use bounded
   observations/watchdogs so a progress failure is diagnosable.
-- [ ] Combine specification reasoning, compiler inspection, and hardware
+- [x] Combine specification reasoning, compiler inspection, and hardware
   evidence. A passing stress test or validation layer alone is not a memory
   ordering/progress proof. Do not claim Metal qualification from a Vulkan run.
-- [ ] Update Blade/Naga pins together when changes are needed; retain one
+- [x] Update Blade/Naga pins together when changes are needed; retain one
   Naga type/version identity across Blade and Meganeura's developer tools.
 
 **Exit evidence:** a documented choice establishes the least intrusive

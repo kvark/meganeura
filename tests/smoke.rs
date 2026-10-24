@@ -3,6 +3,7 @@
 mod cache_inference;
 mod checkpoint_validation;
 mod debug_session;
+mod device_protocol;
 mod gpu_smoke;
 mod harness_manifest;
 mod megakernel;

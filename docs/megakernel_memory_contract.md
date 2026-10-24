@@ -1,20 +1,21 @@
-# Device graph memory contract — investigation
+# Device graph memory contract
 
-Milestone 1 is complete. This is the candidate protocol for Milestone 2;
-compiler-output checks and bounded device tests must qualify it before Session
-uses it. The initial target is Vulkan with its memory model enabled.
+Milestone 1 is complete. Milestone 2 selects the existing native fence extension
+for the bounded protocol below. Compiler-output checks and device tests qualify
+the Vulkan path; integration into Session and performance qualification follow.
 
 ## Smallest candidate interface
 
-Retain the fork's existing `enable wgpu_memory_fence;`, `storageFence()` and
-`workgroupFence()`. Leave ordinary WGSL atomics relaxed. No new ordering enum,
+Retain the fork's existing `enable wgpu_memory_fence;`, `storageFence()`,
+`workgroupFence()` and `@coherent` storage decoration. Leave ordinary WGSL
+atomics relaxed. No new ordering enum,
 scope argument, atomic expression or compare-exchange semantics is needed by
 the protocol below. Directional fences or ordered atomics remain alternatives
 only if measurements demonstrate a useful improvement.
 
 At Naga `a489554`, `storageFence()` emits a QueueFamily-scope acquire/release
 memory barrier with UniformMemory, MakeAvailable and MakeVisible under the
-Vulkan memory model. Storage accesses carry NonPrivatePointer. The barrier
+Vulkan memory model. Participating storage accesses must carry NonPrivatePointer. The barrier
 does not wait for other workgroups. This scope covers a single dispatch.
 Standard WGSL synchronization remains workgroup-scoped and its atomics remain
 relaxed ([WGSL memory model](https://gpuweb.github.io/gpuweb/wgsl/#memory-model)).
@@ -25,6 +26,16 @@ workgroup. These are rules in the
 [Vulkan memory model](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html#memory-model-synchronizes-with).
 Availability and visibility are handled explicitly by **every payload lane**;
 ordering a leader's atomics alone is insufficient.
+
+The SPIR-V writer keeps accesses private when it sees no writes to their global
+variable. Read-only handler bindings that alias another binding's mutable output
+therefore need `@coherent`; declaring them `read_write` alone is insufficient
+because the optimization uses actual writes. This existing annotation prevents
+private-access elision and adds queue-family per-access visibility/availability.
+Decorate every such cross-binding communication path, retaining plain read-only
+bindings for immutable weights/inputs. Pointer parameters currently lose global
+decoration provenance, so the initial handlers access those globals directly.
+Compiler tests must cover the aliased read-only case explicitly.
 
 ## Publication by all lanes
 
@@ -117,17 +128,21 @@ ring would require another protocol and is outside this initial contract.
 
 ## Compiler and backend audit
 
-- Parsing already requires the native extension and can reject it using frontend
-  capabilities. IR validation currently does not enforce MEMORY_FENCE for
-  `Statement::MemoryBarrier`; clients that parse with permissive frontend options
-  can miss the backend restriction. Add the corresponding validator check.
+- Parsing requires the native extension and can reject it using frontend
+  capabilities. IR validation now also enforces MEMORY_FENCE for
+  `Statement::MemoryBarrier`, including clients that parse with permissive
+  frontend options.
 - SPIR-V has distinct memory/control barriers and relaxed load/store/RMW/CAS
   paths. Check generated scopes, semantics and NonPrivatePointer operands with
   SPIRV-Tools, including the original ordinary-atomic fixture. Preserve these
-  operations through WGSL round trips, SPIR-V import and transformations.
-- MSL currently routes memory and control barriers through the same writer,
-  despite not advertising MEMORY_FENCE. Reject unsupported memory fences
-  explicitly instead of silently inserting a workgroup rendezvous.
+  operations through WGSL round trips and transformations. The SPIR-V importer
+  cannot preserve NonPrivatePointer/MakePointerAvailable/MakePointerVisible
+  operands; it now rejects those accesses explicitly. Basic Vulkan-model
+  atomic-only inputs remain accepted. Import of arbitrary scope/ordered-atomic
+  semantics is not qualified; the scheduler uses WGSL-to-SPIR-V export.
+- MSL previously routed memory and control barriers through the same writer,
+  despite not advertising MEMORY_FENCE. It now rejects memory fences explicitly
+  instead of silently inserting a workgroup rendezvous.
 - The June 2026 [Metal language specification](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf),
   section 6.16.3, describes `atomic_thread_fence` on Apple silicon with MSL 3.2+.
   That is a plausible later implementation of the existing fence API, requiring
@@ -135,11 +150,114 @@ ring would require another protocol and is outside this initial contract.
   atomic syntax. Older targets need a clear rejection.
 - GLSL/HLSL retain their existing fence writers; their cross-workgroup resource
   coherency requirements and execution behavior are not qualified here. Blade
-  must expose this device-graph contract only for a supported Vulkan memory-model
-  path, with unsupported backends rejected before graph execution.
+  exposes `device_memory_fence` only for its Vulkan memory-model path. This gates
+  native fence/coherent validation capabilities; other backends reject shaders
+  requiring them before execution.
 
-The existing interface requires no parser/IR serialization expansion and no
-blanket change to atomic ordering. The next evidence is compiler tests followed
-by all-lane message passing, counter fan-in, bitmap publication/claim, repeated
-resets and bounded termination under scheduling pressure. Stress success alone
-will not replace this ordering and progress argument.
+## Interface decision and compatibility
+
+| Interface | Required changes | Decision |
+|---|---|---|
+| Existing fences, coherent bindings and relaxed atomics | Capability validation, honest backend rejection, explicit alias decoration and protocol checks | Sufficient for this protocol; selected |
+| Directional/scoped fences | New WGSL arguments or builtins, IR representation, validation of order/scope/storage combinations, updates to serialization and every reader/writer | Potentially cheaper than acquire/release at every fence, but no demonstrated requirement yet |
+| Ordered/scoped atomics | Changes across atomic loads, stores, RMW and compare-exchange, including separate CAS failure constraints; equivalent reader/writer and serialization work | Does not remove the need to publish/acquire every lane's non-atomic payload; defer until a measured benefit justifies it |
+
+There is no new parser grammar, IR variant, reflection field or serialized field.
+Ordinary atomic load/store/RMW/CAS semantics remain relaxed, including both CAS
+outcomes. The queue uses OR/AND and decrements, so it needs no CAS ordering API.
+Naga compaction retains fence statements and their order; constant evaluation
+does not evaluate atomic operations. Tests cover compaction followed by a WGSL
+round trip and inspect the resulting SPIR-V. No new optimization pass moves
+loads/stores across fences. Read-only aliases must remain decorated through
+shader composition, and pointer-argument decoration propagation is outside the
+qualified path.
+
+The compatibility changes are deliberate errors for previously unqualified
+paths: IR without the fence capability, Metal fence emission, and SPIR-V import
+that would discard the required access operands. Vulkan WGSL export keeps the
+existing emitted fence and atomic instructions. Unsupported targets can still
+run ordinary Session execution or the portable Milestone 1 regions.
+
+The existing fences are broad acquire/release operations. This investigation
+establishes sufficiency, not an optimal fence count or a speedup. Milestone 1's
+[paired production measurements](megakernel_session_results.md) already show
+regressions; ordinary execution stays the default. The same paired harness must
+measure actual Session device scheduling before any adoption decision. The
+protocol stress runs below are correctness checks, not comparative benchmarks.
+
+## Qualification evidence
+
+The qualified pins are Naga
+[`f09d62e`](https://github.com/kvark/wgpu/commit/f09d62e54d743f89879e4e8dfb32e717146f2670)
+and Blade
+[`63fb651`](https://github.com/kvark/blade/commit/63fb651a3d0c7bad6964dba9b2585f794641862f).
+Meganeura's developer tools and Blade share that single Naga identity.
+The published pins pass 506 Meganeura unit tests (seven ignored), 71 smoke tests
+in each ordinary/persistent selection (two ignored), strict all-target Clippy,
+formatting and the lavapipe protocol check. Blade passes 20 unit tests (one
+ignored), strict Clippy and Metal-target compilation, with existing target
+warnings and no Metal GPU qualification.
+
+The compiler fixture emits SPIR-V 1.3 with the Vulkan memory model. `spirv-as`
+and `spirv-val --target-env vulkan1.2` accept it. The inspected output has:
+
+- QueueFamily scope (5), acquire/release + UniformMemory + MakeAvailable +
+  MakeVisible semantics (24648) for storage fences;
+- relaxed atomic load/store/RMW and CAS success/failure semantics (0), with
+  QueueFamily storage scope and Workgroup workgroup scope;
+- NonPrivatePointer on mutable storage accesses and queue-family
+  MakePointerVisible on the coherent read-only alias;
+- VulkanMemoryModel capability, without VulkanMemoryModelDeviceScope.
+
+The GPU check is [device_protocol.rs](../tests/device_protocol.rs), with its
+[WGSL protocol](../tests/shaders/device_protocol.wgsl). Both NVIDIA RTX 5080
+(595.91.07) and lavapipe passed 256 bounded dispatches: empty work, a 64-node
+chain with ragged tiles, 65-way fan-in followed by fan-out, and eight fully
+connected layers. Each uses 1/3/64/4096 workers and 16 reset epochs with changing
+inputs. The test compares every lane's payload against an independent integer
+reference, checks every task executes once, all readiness/dependency/tile
+counters drain, and worker totals match. The empty dispatch intentionally
+exercises worker retirement; production empty graphs need no launch. Each wait
+has a 30-second timeout and the shader's scan/task loops have finite bounds.
+Vulkan synchronization validation was enabled. No Metal execution was performed.
+
+The checks supplement the ordering and progress argument above; successful
+stress runs or validation layers alone do not establish that argument.
+
+Naga's focused compiler suite passed 144 unit tests, 267 integration tests and
+six documentation tests (24 ignored). Pinned-toolchain Clippy and formatting
+passed. The required `cargo xtask test` workspace run executed 1,568 tests:
+1,324 passed, 244 failed and 12 were skipped. All 244 failed test identities
+reproduced on the unchanged `a489554` baseline, with no additional failures:
+
+- 235 OpenGL tests encounter GLSL 330 capability errors;
+- three Vulkan passthrough tests require the unavailable `dxc` executable;
+- five Vulkan depth/stencil initialization tests fail;
+- `player::player tests::test_api` fails.
+
+The complete failure identities and logs are retained locally under
+`target/megakernel-results/`: `wgpu-failed-tests.json`,
+`naga-fences-baseline-failures.log`, and `naga-fences-workspace-qualified.log`.
+The five depth/stencil failures are
+`discarding_both_depth_and_stencil_with_diverging_load_ops`,
+`discarding_depth_target_at_nonzero_mip_and_layer_depth32float_stencil8`,
+`discarding_either_depth_or_stencil_aspect_at_nonzero_mip_and_layer`,
+`discarding_depth_target_at_nonzero_mip_and_layer`, and
+`render_pass_store_inits_only_target_depth_stencil_subresource`.
+No CTS run was requested or performed. SPIRV-Cross tool-version differences
+regenerated five unrelated GLSL snapshots; these were restored, and only the new
+publication fixture's output was retained.
+
+GPU protocol logs are `device-protocol-nvidia.log` and
+`device-protocol-lavapipe.log` in the same ignored results directory. Reproduce
+the protocol with the normal pinned dependencies:
+
+```sh
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json \
+VK_LAYER_VALIDATE_SYNC=1 \
+systemd-run --user --scope --slice=ml.slice \
+  cargo test --test smoke device_protocol --all-features -- --nocapture --test-threads=1
+```
+
+Use `lvp_icd.json` for lavapipe. An unsupported capability is reported explicitly
+by this test, so its exit status alone is not evidence of backend qualification.
