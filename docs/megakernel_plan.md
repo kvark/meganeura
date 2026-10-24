@@ -91,6 +91,16 @@ Implementation evidence:
   focused region/rebinding checks also passed on lavapipe. Clippy, documentation
   and formatting checks passed. These checks establish correctness and launch
   reduction, not a production performance improvement.
+- Worker-owned pointwise chains now cross consecutive singleton dependency
+  groups when their grids/extents match, reads are per-element, and aliases
+  preserve the same logical index mapping. Workgroup storage barriers separate
+  bodies; device-wide dependencies keep dispatch boundaries. Serial selection
+  disables chaining. An eight-operation strict fixture runs in three launches
+  with pools 1/3/256; its serial control retains eight. A same-grid broadcast
+  fixture correctly retains the necessary boundary. NVIDIA passed 168 oracle,
+  182 regression, 70 smoke and 22 GGUF tests (21 regression/two smoke ignored);
+  all four focused Session checks also passed on lavapipe. All-target/all-feature
+  Clippy passed. Paired production benchmarking is the remaining Milestone 1 gate.
 
 The objective is to run Meganeura graphs through persistent GPU workers using
 the ordinary `Graph` / `build` / `Session` interface, and qualify them with the
@@ -151,7 +161,7 @@ logical workgroup/tile range, parameters, and session buffer references.
 
 - [x] Partition the compiled dispatch plan using existing access and barrier
   information. Begin with conservative boundaries and compatible kernels.
-- [ ] Admit independent tasks and chains whose dependencies are wholly owned
+- [x] Admit independent tasks and chains whose dependencies are wholly owned
   by one worker. Preserve hardware dispatch barriers wherever a result must
   become visible to another worker. Multi-stage/global reductions retain
   those boundaries.
@@ -173,7 +183,7 @@ logical workgroup/tile range, parameters, and session buffer references.
   existing schedule representation instead of adding a second operator list.
 - [x] Pass logical dispatch geometry explicitly. Audit early returns, uniform
   control flow, subgroup assumptions, barrier placement, and reused scratch.
-- [ ] Group handlers by compatible workgroup/resource requirements. Do not
+- [x] Group handlers by compatible workgroup/resource requirements. Do not
   force existing 32/128/256-thread or cooperative kernels into the prototype's
   64-thread geometry. Account for combined register/shared-memory occupancy.
 - [x] Keep unsupported operators, variants, and dtype combinations as
@@ -189,7 +199,7 @@ logical workgroup/tile range, parameters, and session buffer references.
 - [x] Run existing oracle, smoke, regression, and available model tests under
   ordinary and persistent-with-fallback configurations. Keep existing
   tolerances, precision policies, poisoning, and hardware capability gates.
-- [ ] Run eligible pointwise/reduction cases in strict mode and assert both
+- [x] Run eligible pointwise/reduction cases in strict mode and assert both
   numerical results and actual persistent coverage. Cover partial tiles,
   mixed task lengths, fan-out/fan-in boundaries, empty work, in-place accesses,
   repeated resets, and pools smaller/larger than the task count.

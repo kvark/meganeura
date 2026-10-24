@@ -4,4 +4,9 @@ if ticket >= persistent_params.starts[$SLOT] && ticket < persistent_params.ends[
     let logical = vec3<u32>(local_ticket % grid.x, (local_ticket / grid.x) % grid.y,
                             local_ticket / (grid.x * grid.y));
     h$SLOT_execute_tile(logical, lid);
+    if $CHAIN {
+        // Each producer and consumer of this tile belongs to this workgroup.
+        // No workgroup reads another workgroup's output inside the chain.
+        storageBarrier();
+    }
 }

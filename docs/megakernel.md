@@ -25,9 +25,20 @@ session.wait();
 Compatible independent operations now share a persistent launch, with up to
 three generated handlers per region. Each launch drains logical tiles using
 the handlers' existing workgroup size. Region boundaries retain hardware
-barriers; dependent chains and global reductions still cross those boundaries.
+barriers. Matching pointwise tiles can also form a worker-owned chain; global
+reductions and dependencies crossing workers retain dispatch boundaries.
 The ordinary backend remains the default. BF16 handlers currently stay in
 single-operation regions because their module-wide declarations are shared.
+
+A chain contains only flat pointwise bodies with identical extent and logical
+grid, no broadcast reads, and consistent logical references wherever physical
+storage overlaps. Each queue claim owns the same index range through every
+body. All lanes finish a body and execute `storageBarrier()` before advancing
+to the next one; no other worker reads or writes that index range inside the
+region. External consumers run after the region's dispatch barrier. Chains
+only cross consecutive singleton dependency groups, and explicit serial
+dispatch selection disables chaining. This needs no device-wide fence,
+spinning wait, or assumption about simultaneous worker residency.
 
 Regions are planned after storage allocation, with checks for device binding
 limits, binding ranges, shared-memory use, and physical overlap. Vulkan reports
@@ -42,18 +53,21 @@ Tensor data and training/cache state are not reset. Profiling reserves a slot
 for queue reset and reports one timing per physical launch, with untimed source
 operations attached. Tuning rebuilds the persistent pipelines after selection.
 
-`execution_report()` lists operation provenance, logical tiles, worker geometry,
+`execution_report()` lists operation provenance, logical queue tasks, worker geometry,
 physical graph launches, fallback reasons, and configured appended optimizer,
 clipping, or accumulation work. `allow_fallback: false` rejects unsupported
 graph operations and execution of ordinary optimizer/accumulation passes.
+A queue task represents one tile or one matching tile through a chain;
+`worker_owned_chain` identifies the latter and the region retains all source
+operation indices.
 A passthrough graph can have zero tasks; qualification must assert nonzero
 persistent coverage for cases intended to exercise this path.
 
 Harnesses using environment configuration can select the path with
 `MEGANEURA_PERSISTENT_WORKERS=64`, and reject fallbacks with
 `MEGANEURA_PERSISTENT_STRICT=1`. `reference::gpu::Options.persistent` provides
-the same explicit selection for oracle checks. The plan tracks worker-owned
-chains, production benchmark qualification, and later device scheduling.
+the same explicit selection for oracle checks. The plan tracks production
+benchmark qualification and later device scheduling.
 
 ## Standalone prototype
 

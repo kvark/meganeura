@@ -4588,6 +4588,7 @@ impl Session {
                 &groups,
                 &buffers,
                 physical_buffers.iter().any(|buffer| buffer.external),
+                !opts.serial_dispatch,
                 opts.wgsl_dump_dir.as_deref(),
             )
         });

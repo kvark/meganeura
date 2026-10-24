@@ -35,7 +35,9 @@ pub struct ExecutionRegion {
     pub dispatches: std::ops::Range<usize>,
     pub origin: Vec<crate::NodeId>,
     pub label: String,
+    /// Queue claims: a tile, or a matching tile through a worker-owned chain.
     pub logical_tasks: u64,
+    pub worker_owned_chain: bool,
     /// Zero denotes ordinary execution.
     pub workers: u32,
     pub workgroup_size: Option<u32>,
@@ -71,6 +73,7 @@ struct QueueData {
 pub(super) struct State {
     gpu: Arc<Gpu>,
     pub options: PersistentOptions,
+    allow_chains: bool,
     pub report: ExecutionReport,
     pipelines: Vec<Option<Arc<SharedPipeline>>>,
     keys: Vec<Option<String>>,
@@ -143,6 +146,34 @@ fn independent(
         .any(|b| left.read_buffers().any(|a| overlaps(plan, buffers, a, b)))
 }
 
+fn chain_compatible(
+    plan: &ExecutionPlan,
+    buffers: &[bg::BufferPiece],
+    left: &Dispatch,
+    right: &Dispatch,
+) -> bool {
+    let per_element =
+        |dispatch: &Dispatch| dispatch.pointwise().is_some_and(|dag| !dag.has_broadcast());
+    if !per_element(left)
+        || !per_element(right)
+        || left.params[0] != right.params[0]
+        || left.workgroups != right.workgroups
+    {
+        return false;
+    }
+    // Identical logical references preserve the index-to-worker mapping.
+    // Aliases between distinct logical references may shift that mapping.
+    let owned = |a, b| a == b || !overlaps(plan, buffers, a, b);
+    left.written_buffers().all(|a| {
+        right
+            .read_buffers()
+            .chain(right.written_buffers())
+            .all(|b| owned(a, b))
+    }) && right
+        .written_buffers()
+        .all(|b| left.read_buffers().all(|a| owned(a, b)))
+}
+
 fn check_resources(
     caps: &bg::Capabilities,
     plan: &ExecutionPlan,
@@ -150,6 +181,7 @@ fn check_resources(
     dispatches: std::ops::Range<usize>,
     handlers: &[Handler],
     workers: u32,
+    chain: bool,
 ) -> Result<u32, String> {
     let limits = caps
         .compute_binding_limits
@@ -199,6 +231,9 @@ fn check_resources(
         > limits.max_storage_buffer_range
     {
         return Err("queue allocation exceeds device storage-buffer range".into());
+    }
+    if chain {
+        tasks = count(&plan.dispatches[dispatches.start]);
     }
     u32::try_from(tasks)
         .ok()
@@ -253,6 +288,7 @@ impl State {
         groups: &[std::ops::Range<usize>],
         buffers: &[bg::BufferPiece],
         external: bool,
+        allow_chains: bool,
         dump_dir: Option<&str>,
     ) -> Self {
         use bg::ShaderData;
@@ -287,6 +323,7 @@ impl State {
                 origin: dispatch.origin.clone(),
                 label: dispatch.label.clone(),
                 logical_tasks: count(dispatch),
+                worker_owned_chain: false,
                 workers: 0,
                 workgroup_size: None,
                 fallback_reason: None,
@@ -299,6 +336,7 @@ impl State {
                     index..index + 1,
                     std::slice::from_ref(&handler),
                     options.workers,
+                    false,
                 )?;
                 Ok(handler)
             });
@@ -311,17 +349,37 @@ impl State {
                 Ok(first) => {
                     let workgroup_size = first.body.workgroup_size;
                     let mut handlers = vec![first];
+                    let chain = allow_chains
+                        && groups[group_index].len() == 1
+                        && dispatch.pointwise().is_some();
                     index += 1;
                     // Whole independent operations can be shuffled across workers.
                     // BF16's module-wide helper/preamble is currently singleton-only.
-                    while !external && handlers.len() < 3 && index < groups[group_index].end {
+                    while !external && handlers.len() < 3 && index < plan.dispatches.len() {
+                        if chain {
+                            let next_group = &groups[group_index + handlers.len()];
+                            if next_group.start != index || next_group.len() != 1 {
+                                break;
+                            }
+                        } else if index >= groups[group_index].end {
+                            break;
+                        }
                         let candidate = &plan.dispatches[index];
                         if candidate.pointwise_storage
                             != crate::schedule::PointwiseStorage::default()
                             || dispatch.pointwise_storage
                                 != crate::schedule::PointwiseStorage::default()
                             || !(start..index).all(|prior| {
-                                independent(plan, buffers, &plan.dispatches[prior], candidate)
+                                if chain {
+                                    chain_compatible(
+                                        plan,
+                                        buffers,
+                                        &plan.dispatches[prior],
+                                        candidate,
+                                    )
+                                } else {
+                                    independent(plan, buffers, &plan.dispatches[prior], candidate)
+                                }
                             })
                         {
                             break;
@@ -340,6 +398,7 @@ impl State {
                             start..index + 1,
                             &handlers,
                             options.workers,
+                            chain,
                         )
                         .is_err()
                         {
@@ -348,6 +407,7 @@ impl State {
                         }
                         index += 1;
                     }
+                    region.worker_owned_chain = chain && handlers.len() > 1;
                     region.dispatches.end = index;
                     region.logical_tasks = 0;
                     region.workers = options.workers;
@@ -357,7 +417,11 @@ impl State {
                         .iter()
                         .map(|dispatch| dispatch.label.as_str())
                         .collect::<Vec<_>>()
-                        .join(" | ");
+                        .join(if region.worker_owned_chain {
+                            " → "
+                        } else {
+                            " | "
+                        });
                     let mut source = String::new();
                     let mut calls = String::new();
                     let mut layouts = Vec::new();
@@ -367,7 +431,15 @@ impl State {
                         source.push_str(&handler.body.source(&format!("h{slot}_")));
                         calls.push_str(
                             &include_str!("../shaders/persistent_handler.wgsl")
-                                .replace("$SLOT", &slot.to_string()),
+                                .replace("$SLOT", &slot.to_string())
+                                .replace(
+                                    "$CHAIN",
+                                    if region.worker_owned_chain {
+                                        "true"
+                                    } else {
+                                        "false"
+                                    },
+                                ),
                         );
                         layouts.push(bg::ShaderDataLayout {
                             bindings: handler
@@ -377,8 +449,13 @@ impl State {
                                 .map(|(name, binding)| (binding_name(slot, name), binding))
                                 .collect(),
                         });
-                        region_params.starts[slot] = region.logical_tasks as u32;
-                        region.logical_tasks += count(operation);
+                        if region.worker_owned_chain {
+                            region_params.starts[slot] = 0;
+                            region.logical_tasks = count(operation);
+                        } else {
+                            region_params.starts[slot] = region.logical_tasks as u32;
+                            region.logical_tasks += count(operation);
+                        }
                         region_params.ends[slot] = region.logical_tasks as u32;
                         region_params.grids[slot][..3].copy_from_slice(&operation.workgroups);
                     }
@@ -463,6 +540,7 @@ impl State {
         Self {
             gpu: Arc::clone(gpu),
             options,
+            allow_chains,
             report,
             pipelines,
             keys,
@@ -556,6 +634,7 @@ impl Session {
     pub(super) fn refresh_persistent(&mut self) {
         if let Some(ref state) = self.persistent {
             let options = state.options;
+            let allow_chains = state.allow_chains;
             self.wait();
             self.persistent = Some(State::new(
                 &self.gpu,
@@ -564,6 +643,7 @@ impl Session {
                 &self.groups,
                 &self.buffers,
                 self.physical_buffers.iter().any(|buffer| buffer.external),
+                allow_chains,
                 self.pipelines.dump_dir.as_deref(),
             ));
         }
@@ -584,6 +664,7 @@ impl Session {
                         origin: d.origin.clone(),
                         label: d.label.clone(),
                         logical_tasks: d.workgroups.into_iter().map(u64::from).product(),
+                        worker_owned_chain: false,
                         workers: 0,
                         workgroup_size: None,
                         fallback_reason: None,

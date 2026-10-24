@@ -21,7 +21,13 @@ fn session_persistent_tiles_use_normal_graph_storage_and_reset() {
         let mut session = meganeura::build(&graph, config).0;
         let report = session.execution_report();
         assert!(report.persistent_tasks > 0);
-        assert_eq!(report.graph_dispatches, session.plan().dispatches.len());
+        assert!(report.graph_dispatches < session.plan().dispatches.len());
+        assert!(
+            report
+                .regions
+                .iter()
+                .any(|region| region.worker_owned_chain)
+        );
         assert!(
             report
                 .regions
@@ -362,6 +368,90 @@ fn session_persistent_regions_combine_independent_ragged_tasks() {
                 .map(|value| -value.max(0.0))
                 .collect::<Vec<_>>()
         );
+    }
+}
+
+#[test]
+fn session_persistent_owned_chains_keep_tile_dependencies_local() {
+    let gpu = crate::support::gpu::gpu();
+    let mut graph = meganeura::Graph::new();
+    let mut node = graph.input("x", &[513]);
+    let mut outputs = Vec::new();
+    for _ in 0..8 {
+        node = graph.neg(node);
+        outputs.push(node);
+    }
+    graph.set_outputs(outputs);
+    let plan = meganeura::compile::compile_with(
+        &graph,
+        &meganeura::CompileOptions {
+            fuse_dispatches: false,
+            ..Default::default()
+        },
+    );
+    assert_eq!(plan.dispatches.len(), 8);
+    for (workers, serial) in [(1, false), (3, false), (256, false), (3, true)] {
+        let mut options = meganeura::SessionOptions::from_env();
+        options.serial_dispatch = serial;
+        options.persistent = Some(meganeura::PersistentOptions {
+            workers,
+            allow_fallback: false,
+        });
+        let mut session = meganeura::Session::with_context_opts(plan.clone(), gpu.clone(), options);
+        let report = session.execution_report();
+        assert_eq!(report.graph_dispatches, if serial { 8 } else { 3 });
+        assert!(
+            report
+                .regions
+                .iter()
+                .all(|region| region.worker_owned_chain != serial)
+        );
+        for replay in 0..3 {
+            let input: Vec<_> = (0..513).map(|i| (i % 17) as f32 - replay as f32).collect();
+            session.set_input("x", &input);
+            session.step();
+            session.wait();
+            for index in 0..8 {
+                let mut output = vec![f32::NAN; input.len()];
+                session.read_output_by_index(index, &mut output);
+                let sign = if index % 2 == 0 { -1.0 } else { 1.0 };
+                assert_eq!(
+                    output,
+                    input.iter().map(|value| sign * value).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+    // Same grid and extent alone do not prove locality: every tile below
+    // reads element zero from the preceding operation, owned by another tile.
+    let mut broadcast = plan;
+    if let meganeura::compile::Kernel::Pointwise(ref mut dag) = broadcast.dispatches[1].kernel {
+        dag.ops[0] = meganeura::schedule::Pw::LoadBroadcast {
+            input: 0,
+            divisor: 1,
+            modulus: 1,
+        };
+    } else {
+        panic!("expected generated pointwise consumer");
+    }
+    let mut options = meganeura::SessionOptions::from_env();
+    options.persistent = Some(meganeura::PersistentOptions {
+        workers: 64,
+        allow_fallback: false,
+    });
+    let mut session = meganeura::Session::with_context_opts(broadcast, gpu, options);
+    let report = session.execution_report();
+    assert_eq!(report.regions[0].dispatches, 0..1);
+    assert_eq!(report.regions[1].dispatches, 1..2);
+    for value in [7.0, -3.0, 11.0] {
+        let mut input = vec![-19.0; 513];
+        input[0] = value;
+        session.set_input("x", &input);
+        session.step();
+        session.wait();
+        let mut output = vec![f32::NAN; 513];
+        session.read_output_by_index(7, &mut output);
+        assert_eq!(output, vec![value; 513]);
     }
 }
 
