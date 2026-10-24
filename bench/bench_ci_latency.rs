@@ -10,8 +10,19 @@ use std::time::Instant;
 
 use meganeura::Graph;
 
+mod paired;
+
 fn main() {
     env_logger::init();
+    let mut paired_options = paired::Options::default();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        assert!(
+            paired_options.argument(&arg, &mut args),
+            "unknown argument {arg}"
+        );
+    }
+    let paired_gpu = paired_options.enabled.then(|| paired_options.context());
 
     let batch = 16;
     let input_dim = 128;
@@ -38,9 +49,13 @@ fn main() {
     let out = g.matmul(h2, w3);
     let loss = g.cross_entropy_loss(out, labels);
     g.set_outputs(vec![loss]);
-    let construction = Instant::now();
-    let mut train_session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
-    let train_construction_ms = construction.elapsed().as_secs_f64() * 1000.0;
+    let (mut train_session, train_construction_ms) = if let Some(ref gpu) = paired_gpu {
+        paired_options.build(&g, gpu.clone(), true, false)
+    } else {
+        let construction = Instant::now();
+        let session = meganeura::build(&g, meganeura::SessionConfig::from_env()).0;
+        (session, construction.elapsed().as_secs_f64() * 1000.0)
+    };
 
     // Inference graph (forward only, logits output)
     let mut g_inf = Graph::new();
@@ -58,10 +73,13 @@ fn main() {
     let w3i = g_inf.parameter("w3", &[hidden, classes]);
     let logits = g_inf.matmul(h2i, w3i);
     g_inf.set_outputs(vec![logits]);
-    let construction = Instant::now();
-    let mut inf_session =
-        meganeura::build(&g_inf, meganeura::SessionConfig::inference_from_env()).0;
-    let forward_construction_ms = construction.elapsed().as_secs_f64() * 1000.0;
+    let (mut inf_session, forward_construction_ms) = if let Some(ref gpu) = paired_gpu {
+        paired_options.build(&g_inf, gpu.clone(), false, false)
+    } else {
+        let construction = Instant::now();
+        let session = meganeura::build(&g_inf, meganeura::SessionConfig::inference_from_env()).0;
+        (session, construction.elapsed().as_secs_f64() * 1000.0)
+    };
 
     // Load weights (not timed)
     let w1_data = vec![0.01_f32; input_dim * hidden];
@@ -69,16 +87,15 @@ fn main() {
     let w2_data = vec![0.01_f32; hidden * hidden];
     let b2_data = vec![0.0_f32; hidden];
     let w3_data = vec![0.01_f32; hidden * classes];
-    for s in [
-        &mut train_session as &mut meganeura::Session,
-        &mut inf_session,
-    ] {
+    let initialize = |s: &mut meganeura::Session| {
         s.set_parameter("w1", &w1_data);
         s.set_parameter("b1", &b1_data);
         s.set_parameter("w2", &w2_data);
         s.set_parameter("b2", &b2_data);
         s.set_parameter("w3", &w3_data);
-    }
+    };
+    initialize(&mut train_session);
+    initialize(&mut inf_session);
 
     let x_data: Vec<f32> = (0..batch * input_dim)
         .map(|i| ((i * 7 + 13) % 256) as f32 / 255.0)
@@ -86,6 +103,90 @@ fn main() {
     let mut labels_data = vec![0.0_f32; batch * classes];
     for b in 0..batch {
         labels_data[b * classes + (b % classes)] = 1.0;
+    }
+
+    if let Some(gpu) = paired_gpu {
+        let (mut candidate_inf, candidate_forward_ms) =
+            paired_options.build(&g_inf, gpu.clone(), false, true);
+        let (mut candidate_train, candidate_training_ms) =
+            paired_options.build(&g, gpu, true, true);
+        let forward = paired::measure(
+            "inference",
+            &mut inf_session,
+            &mut candidate_inf,
+            [forward_construction_ms, candidate_forward_ms],
+            paired_options,
+            initialize,
+            |session| {
+                session.set_input("x", &x_data);
+                session.step();
+                session.wait();
+                let _ = session.read_output(batch * classes);
+            },
+            |session| session.read_output(batch * classes),
+        );
+        let execute_training = |session: &mut meganeura::Session| {
+            session.set_input("x", &x_data);
+            session.set_input("labels", &labels_data);
+            session.step();
+            session.wait();
+            let _ = session.read_loss();
+        };
+        let observe_training = |session: &mut meganeura::Session, update: bool| {
+            let mut values = vec![session.read_loss()];
+            let mut changed = false;
+            for (name, initial) in [
+                ("w1", &w1_data),
+                ("b1", &b1_data),
+                ("w2", &w2_data),
+                ("b2", &b2_data),
+                ("w3", &w3_data),
+            ] {
+                let mut value = vec![0.0; initial.len()];
+                session.read_param_grad(name, &mut value);
+                values.extend_from_slice(&value);
+                session.read_param(name, &mut value);
+                changed |= &value != initial;
+                values.extend_from_slice(&value);
+            }
+            assert!(
+                !update || changed,
+                "SGD benchmark did not update parameters"
+            );
+            values
+        };
+        let training = paired::measure(
+            "forward_backward",
+            &mut train_session,
+            &mut candidate_train,
+            [train_construction_ms, candidate_training_ms],
+            paired_options,
+            initialize,
+            execute_training,
+            |session| observe_training(session, false),
+        );
+        train_session.set_learning_rate(0.001);
+        candidate_train.set_learning_rate(0.001);
+        let update = paired::measure(
+            "forward_backward_sgd",
+            &mut train_session,
+            &mut candidate_train,
+            [train_construction_ms, candidate_training_ms],
+            paired_options,
+            initialize,
+            execute_training,
+            |session| observe_training(session, true),
+        );
+        println!(
+            "{}",
+            serde_json::json!({
+                "benchmark": "ci_latency_paired", "boundary": "input upload + completed step + output/loss readback",
+                "state": "identical initial parameters restored before each execution outside timing; fixed SGD learning rate 0.001",
+                "qualification": "full logits or loss, every parameter gradient, and every parameter after each sample",
+                "cases": [forward, training, update],
+            })
+        );
+        return;
     }
 
     // ── Warmup (not timed) ──

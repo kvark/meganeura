@@ -8,9 +8,11 @@
 ///
 /// Usage:
 ///   cargo run --release --example bench_smolvla_train [-- --warmup 3 --runs 5]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use meganeura::{compile_training_graph, models::smolvla};
+
+mod paired;
 
 fn check_bench_preconditions(abort_on_warn: bool) {
     #[cfg(not(target_os = "linux"))]
@@ -103,6 +105,7 @@ fn main() {
         meganeura::profiler::init();
     }
 
+    let mut paired_options = paired::Options::default();
     let mut args = std::env::args().skip(1);
     let mut warmup: usize = 3;
     let mut runs: usize = 5;
@@ -112,20 +115,33 @@ fn main() {
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--warmup" => warmup = args.next().expect("--warmup value").parse().unwrap(),
-            "--runs" => runs = args.next().expect("--runs value").parse().unwrap(),
+            "--warmup" => {
+                warmup = args.next().expect("--warmup value").parse().unwrap();
+                paired_options.warmup = warmup;
+            }
+            "--runs" => {
+                runs = args.next().expect("--runs value").parse().unwrap();
+                paired_options.runs = runs;
+            }
             "--chunk-size" => {
                 chunk_override = Some(args.next().expect("--chunk-size value").parse().unwrap())
             }
             "--force" => force = true,
             "--profile" => profile = true,
             _ => {
-                eprintln!("unknown arg: {}", arg);
-                std::process::exit(1);
+                if !paired_options.argument(&arg, &mut args) {
+                    eprintln!("unknown arg: {}", arg);
+                    std::process::exit(1);
+                }
             }
         }
     }
 
+    assert!(
+        !paired_options.enabled || !profile,
+        "use --diagnostics for paired GPU intervals and worker counters"
+    );
+    let paired_gpu = paired_options.enabled.then(|| paired_options.context());
     eprintln!("checking preconditions...");
     check_bench_preconditions(!force);
 
@@ -146,20 +162,27 @@ fn main() {
     eprintln!("building training graph...");
     let training_g = smolvla::build_action_expert_training(&config, action_seq_len, vlm_seq_len);
 
-    // --- Measure compile time (autodiff + e-graph + plan, no GPU init) ---
-    eprintln!("measuring compile time (autodiff + e-graph + compile)...");
-    let compile_t0 = Instant::now();
-    let _ = compile_training_graph(&training_g);
-    let compile_time = compile_t0.elapsed();
-    eprintln!(
-        "  compile time: {:.0}ms",
-        compile_time.as_secs_f64() * 1000.0
-    );
+    // The legacy report measures compilation separately; paired construction
+    // records the complete build for every session instead.
+    let compile_time = if paired_options.enabled {
+        Duration::ZERO
+    } else {
+        eprintln!("measuring compile time (autodiff + e-graph + compile)...");
+        let start = Instant::now();
+        let _ = compile_training_graph(&training_g);
+        start.elapsed()
+    };
 
     // --- Build sessions ---
     eprintln!("compiling inference session (forward only)...");
-    let mut infer_session =
-        meganeura::build(&training_g, meganeura::SessionConfig::inference_from_env()).0;
+    let (mut infer_session, forward_construction_ms) = if let Some(ref gpu) = paired_gpu {
+        paired_options.build(&training_g, gpu.clone(), false, false)
+    } else {
+        let start = Instant::now();
+        let session =
+            meganeura::build(&training_g, meganeura::SessionConfig::inference_from_env()).0;
+        (session, start.elapsed().as_secs_f64() * 1000.0)
+    };
     eprintln!(
         "  infer: {} buffers, {} dispatches, {} barrier groups",
         infer_session.plan().buffers.len(),
@@ -168,7 +191,13 @@ fn main() {
     );
 
     eprintln!("compiling training session (fwd + bwd + SGD)...");
-    let mut train_session = meganeura::build(&training_g, meganeura::SessionConfig::from_env()).0;
+    let (mut train_session, training_construction_ms) = if let Some(ref gpu) = paired_gpu {
+        paired_options.build(&training_g, gpu.clone(), true, false)
+    } else {
+        let start = Instant::now();
+        let session = meganeura::build(&training_g, meganeura::SessionConfig::from_env()).0;
+        (session, start.elapsed().as_secs_f64() * 1000.0)
+    };
     eprintln!(
         "  train: {} buffers, {} dispatches, {} barrier groups",
         train_session.plan().buffers.len(),
@@ -183,14 +212,17 @@ fn main() {
 
     // --- Initialize parameters with deterministic random values ---
     eprintln!("initializing parameters...");
-    for (name, buf_ref) in train_session.plan().param_buffers.clone() {
-        let size_bytes = train_session.plan().buffers[buf_ref.0 as usize];
-        let n = size_bytes / 4; // f32
+    let mut parameter_seed = Vec::new();
+    for (name, _) in train_session.plan().param_buffers.clone() {
+        let n = train_session.param_size(&name).unwrap();
         let data: Vec<f32> = (0..n)
             .map(|i| (i as f32 * 0.01 + 1.0).sin() * 0.1)
             .collect();
         train_session.set_parameter(&name, &data);
         infer_session.set_parameter(&name, &data);
+        if paired_options.enabled {
+            parameter_seed.push((name, data));
+        }
     }
 
     // --- Prepare synthetic inputs ---
@@ -218,6 +250,87 @@ fn main() {
         }
         session.set_input("target_actions", &target_actions);
     };
+
+    if let Some(gpu) = paired_gpu {
+        let (mut candidate_infer, candidate_forward_ms) =
+            paired_options.build(&training_g, gpu.clone(), false, true);
+        let (mut candidate_train, candidate_training_ms) =
+            paired_options.build(&training_g, gpu, true, true);
+        let prepare = |session: &mut meganeura::Session| {
+            for (name, values) in &parameter_seed {
+                session.set_parameter(name, values);
+            }
+            set_inputs(session);
+        };
+        let execute = |session: &mut meganeura::Session| {
+            session.step();
+            session.wait();
+        };
+        let forward = paired::measure(
+            "smolvla_forward",
+            &mut infer_session,
+            &mut candidate_infer,
+            [forward_construction_ms, candidate_forward_ms],
+            paired_options,
+            prepare,
+            execute,
+            |session| session.read_output(1),
+        );
+        train_session.set_learning_rate(1e-5);
+        candidate_train.set_learning_rate(1e-5);
+        let training = paired::measure(
+            "smolvla_forward_backward_sgd",
+            &mut train_session,
+            &mut candidate_train,
+            [training_construction_ms, candidate_training_ms],
+            paired_options,
+            prepare,
+            execute,
+            |session| {
+                let mut values = vec![session.read_loss()];
+                let mut changed = false;
+                let mut requests = Vec::new();
+                for (index, (name, initial)) in parameter_seed.iter().enumerate() {
+                    let parameter = session.param_buffer(name).unwrap();
+                    requests.push((parameter, initial.len(), Some(index)));
+                    if let Some(&(_, gradient)) = session
+                        .plan()
+                        .param_grad_pairs
+                        .iter()
+                        .find(|entry| entry.0 == parameter)
+                    {
+                        requests.push((gradient, initial.len(), None));
+                    }
+                }
+                let buffers: Vec<_> = requests.iter().map(|entry| entry.0).collect();
+                // Stage the complete state once. Probing mapped parameter
+                // reads individually is prohibitively slow on discrete GPUs.
+                for (value, &(_, len, parameter)) in
+                    session.read_buffers(&buffers).into_iter().zip(&requests)
+                {
+                    let logical = &value[..len];
+                    if let Some(index) = parameter {
+                        changed |= logical != parameter_seed[index].1;
+                    }
+                    values.extend_from_slice(logical);
+                }
+                assert!(changed, "SmolVLA SGD benchmark did not update parameters");
+                values
+            },
+        );
+        println!(
+            "{}",
+            serde_json::json!({
+                "benchmark": "smolvla_paired", "model": "smolvla_action_expert",
+                "chunk_size": action_seq_len, "vlm_seq_len": vlm_seq_len, "num_layers": config.expert.num_layers,
+                "boundary": "completed step; parameter restore, input upload, and output/state qualification excluded",
+                "state": "identical deterministic initial parameters restored before every execution; fixed SGD learning rate 1e-5",
+                "qualification": "full scalar forward loss; training loss, every available parameter gradient and every parameter after each sample",
+                "cases": [forward, training],
+            })
+        );
+        return;
+    }
 
     // --- Warmup ---
     eprintln!("warming up ({} runs)...", warmup);
@@ -276,8 +389,7 @@ fn main() {
             "\n=== Training step GPU timings ({} dispatches) ===",
             train_session.plan().dispatches.len()
         );
-        // Skip sgd_step during profiling so this captures forward+backward
-        // timings rather than SGD update timings.
+        // The configured SGD update is included in these pass intervals.
         set_inputs(&mut train_session);
         train_session.step();
         train_session.wait();

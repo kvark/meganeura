@@ -118,6 +118,13 @@ Implementation evidence:
   checks verify histogram totals against actual logical tasks. All four
   focused Session tests passed on NVIDIA and lavapipe; Clippy and docs passed.
   Primary benchmark runs keep this instrumentation off.
+- Existing CI latency and SmolVLA training benchmarks now share alternating
+  paired measurement, exact compiled-plan matching, fixed-state restoration,
+  full output/gradient/parameter comparison, raw samples, coverage and memory
+  reports. Diagnostic runs separately collect GPU intervals, pipeline
+  statistics and worker task histograms. Short ordinary/paired/diagnostic
+  runs passed, including full SmolVLA state parity; all-target/all-feature
+  Clippy and formatting passed. Longer production measurements follow.
 
 The objective is to run Meganeura graphs through persistent GPU workers using
 the ordinary `Graph` / `build` / `Session` interface, and qualify them with the

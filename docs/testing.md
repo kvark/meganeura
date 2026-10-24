@@ -58,8 +58,43 @@ The existing `train_step_*` metrics measure forward/backward, preserving the
 CI baseline. The additional `train_update_*` metrics include SGD and assert
 that parameters changed; the earlier benchmark's comment claimed an update
 without configuring one. Update timings need their own baseline.
-The benchmark's ordinary single-mode run retains its short CI warmup;
-paired production qualification is tracked in [the integration plan](megakernel_plan.md).
+The benchmark's ordinary single-mode run retains its short CI warmup.
+For a production comparison, both existing benchmarks accept `--paired`:
+
+```sh
+cargo run --release --example bench_ci_latency -- --paired
+cargo run --release --example bench_smolvla_train --features models -- --paired
+# Separate instrumented run: GPU pass intervals, worker task histograms.
+cargo run --release --example bench_smolvla_train --features models -- \
+  --paired --diagnostics --warmup 5 --warmup-ms 500 --runs 10
+```
+
+Select the same adapter and configuration for every run. Defaults are 64
+persistent workers, at least 10 warmup pairs and one second of warmup, then
+50 alternating ordinary/persistent sample pairs. Override these with
+`--workers`, `--warmup`, `--warmup-ms`, and `--runs`. Both sessions explicitly
+disable kernel search and must have identical compiled execution plans.
+The ordinary/persistent selection overrides the environment selector.
+
+Each execution restores identical parameters outside timing; SGD uses a
+fixed learning rate and must change parameters. The CI boundary includes
+input upload, completed execution and output/loss readback. SmolVLA retains
+its existing completed-step boundary, with upload/readback outside timing.
+Every sample compares full logits or loss; training also compares every
+available parameter gradient and updated parameter. SmolVLA stages those
+reads together and excludes allocation padding from comparison. These checks
+supplement the f64 oracle suite without changing its tolerances.
+
+JSON reports retain raw times, quantiles, paired ratios, source/toolchain and
+device identity, coverage, selected pipelines, residency and observed build
+times. Construction shares one GPU context and builds ordinary sessions
+first, so these are not matched cold-cache construction measurements.
+Primary runs have no timing/counter instrumentation. `--diagnostics` enables
+GPU pass intervals and per-worker task counts; keep those results separate
+from primary wall times. GPU intervals cover pass starts through submission
+completion, excluding separate upload/readback submissions. Generated JSON
+and logs belong under `target/`, with conclusions and reproduction commands
+recorded in [the integration plan](megakernel_plan.md).
 
 ## Android / Quest 3S
 
