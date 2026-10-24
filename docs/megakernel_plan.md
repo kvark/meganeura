@@ -58,6 +58,15 @@ Implementation evidence:
   All 506 unit tests passed (seven ignored). Ordinary and persistent runs each
   passed 168 oracle, 182 regression, 68 smoke and 22 GGUF tests on NVIDIA with
   Vulkan synchronization validation; all-target/all-feature Clippy passed.
+- `0bc2a28`: shared generated bindings now accept a shader data group index,
+  preserving the ordinary operand and uniform contracts for region slots.
+  Both focused Session checks and all-target/all-feature Clippy passed.
+- Recording and profiling now use execution-region indices independently of
+  compiled-operation indices. Profile schema 4 retains the untimed source
+  operations for each physical launch and supports mixed-phase/family rows.
+  This preparation still uses single-operation regions. All six profiling
+  tests passed in ordinary and persistent configurations, alongside the
+  focused Session checks and all-target/all-feature Clippy.
 
 The objective is to run Meganeura graphs through persistent GPU workers using
 the ordinary `Graph` / `build` / `Session` interface, and qualify them with the

@@ -69,6 +69,7 @@ pub(super) struct State {
     pub report: ExecutionReport,
     pipelines: Vec<Option<Arc<SharedPipeline>>>,
     queue: Option<bg::Buffer>,
+    pub groups: Vec<std::ops::Range<usize>>,
 }
 
 fn tile(
@@ -110,6 +111,7 @@ impl State {
         gpu: &Arc<Gpu>,
         plan: &ExecutionPlan,
         options: PersistentOptions,
+        groups: &[std::ops::Range<usize>],
         dump_dir: Option<&str>,
     ) -> Self {
         use bg::ShaderData;
@@ -224,6 +226,7 @@ impl State {
             report,
             pipelines,
             queue,
+            groups: groups.to_vec(),
         }
     }
 
@@ -244,13 +247,14 @@ impl State {
     pub fn record(
         &self,
         index: usize,
-        dispatch: &Dispatch,
+        plan: &ExecutionPlan,
         buffers: &[bg::BufferPiece],
         pass: &mut bg::ComputeCommandEncoder<'_>,
     ) -> bool {
         let Some(ref pipeline) = self.pipelines[index] else {
             return false;
         };
+        let dispatch = &plan.dispatches[self.report.regions[index].dispatches.start];
         let mut pc = pass.with(&pipeline.raw);
         Session::bind_dispatch(buffers, dispatch, &mut pc);
         pc.bind(
@@ -280,6 +284,22 @@ impl Drop for State {
 }
 
 impl Session {
+    /// Number of physical graph launches. Persistent regions may implement
+    /// several compiled operations; runtime-appended work is separate.
+    pub fn execution_dispatch_count(&self) -> usize {
+        self.persistent
+            .as_ref()
+            .map_or(self.plan.dispatches.len(), |state| {
+                state.report.regions.len()
+            })
+    }
+
+    pub(crate) fn execution_groups(&self) -> &[std::ops::Range<usize>] {
+        self.persistent
+            .as_ref()
+            .map_or(&self.groups, |state| &state.groups)
+    }
+
     pub(crate) fn profiling_overhead_passes(&self) -> usize {
         usize::from(
             self.persistent
@@ -295,6 +315,7 @@ impl Session {
                 &self.gpu,
                 &self.plan,
                 options,
+                &self.groups,
                 self.pipelines.dump_dir.as_deref(),
             ));
         }

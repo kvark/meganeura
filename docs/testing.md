@@ -46,9 +46,11 @@ The convolution optimizer test keeps its allocation-reuse control explicitly
 ordinary: persistent sessions currently disable lifetime aliasing. Its other
 sessions exercise the selected backend, and the memory-reduction assertion
 remains active for the ordinary control.
-Profile schema 3 includes that execution report and records physical worker
-grids separately from logical tile grids. Pipeline statistics use the selected
-persistent pipeline where applicable.
+Profile schema 4 includes that execution report and records one timing per
+physical launch. Profiling windows use execution-region indices. Each timed
+row lists its untimed source operations in `members`; `logical_workgroups`
+is only populated for a single-operation launch. Physical worker grids and
+selected-pipeline statistics describe the actual launch.
 
 `bench_ci_latency` accepts the same selector and emits execution coverage,
 resident bytes, construction times, adapter/driver information, and raw samples.

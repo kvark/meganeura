@@ -2724,6 +2724,26 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
 // how many dispatches a plan has, so the groups cannot be computed apart from
 // it. Recording them is all that is left here.
 
+/// Record one physical launch, retaining its compiled-operation provenance.
+fn record_execution_region(
+    index: usize,
+    plan: &ExecutionPlan,
+    pipelines: &Pipelines,
+    persistent: Option<&persistent::State>,
+    buffers: &[blade_graphics::BufferPiece],
+    pass: &mut blade_graphics::ComputeCommandEncoder<'_>,
+) {
+    if persistent.is_some_and(|state| state.record(index, plan, buffers, pass)) {
+        return;
+    }
+    let dispatch_index =
+        persistent.map_or(index, |state| state.report.regions[index].dispatches.start);
+    let dispatch = &plan.dispatches[dispatch_index];
+    let mut pc = pass.with(pipelines.get(dispatch_index));
+    Session::bind_dispatch(buffers, dispatch, &mut pc);
+    pc.dispatch(dispatch.workgroups);
+}
+
 /// Record the compiled graph, leaving the last chunk open for appended work.
 fn record_groups(
     gpu: &Gpu,
@@ -2756,15 +2776,7 @@ fn record_groups(
                     pass.barrier();
                 }
                 for i in group.clone() {
-                    let dispatch = &plan.dispatches[i];
-                    if persistent.is_some_and(|state| state.record(i, dispatch, buffers, &mut pass))
-                    {
-                        continue;
-                    }
-                    let pipeline = pipelines.get(i);
-                    let mut pc = pass.with(pipeline);
-                    Session::bind_dispatch(buffers, dispatch, &mut pc);
-                    pc.dispatch(dispatch.workgroups);
+                    record_execution_region(i, plan, pipelines, persistent, buffers, &mut pass);
                 }
             }
         }
@@ -4093,7 +4105,7 @@ impl Session {
         drop(schedule_span);
 
         let persistent = opts.persistent.map(|options| {
-            persistent::State::new(&gpu, &plan, options, opts.wgsl_dump_dir.as_deref())
+            persistent::State::new(&gpu, &plan, options, &groups, opts.wgsl_dump_dir.as_deref())
         });
 
         // Lifetime-based buffer aliasing: step-local intermediates with
@@ -4944,10 +4956,11 @@ impl Session {
     /// per submission and silently drops the rest, so plans larger than that
     /// need [`Session::set_profiling_window`] to be measured in slices.
     pub fn set_profiling(&mut self, enabled: bool) {
-        self.profile_window = enabled.then_some(0..self.plan.dispatches.len());
+        self.profile_window = enabled.then_some(0..self.execution_dispatch_count());
     }
 
-    /// Timestamp only `window`, a range of plan dispatch indices.
+    /// Timestamp only `window`, a range of execution-region indices.
+    /// Persistent regions receive one timing for their entire physical launch.
     ///
     /// Each dispatch inside the window gets its own compute pass and
     /// timestamp. The dispatches outside it still execute — the step remains
@@ -4996,7 +5009,7 @@ impl Session {
 
     /// Per-dispatch timings from the most recent profiled [`Session::step`].
     ///
-    /// Yields `(plan dispatch index, pass label, duration)` for every dispatch
+    /// Yields `(execution-region index, pass label, duration)` for every dispatch
     /// the active profiling window timestamped on its own, in pass order. The
     /// grouped passes carrying the dispatches outside the window are dropped:
     /// their timestamps cover many dispatches at once and attributing them to
@@ -5045,6 +5058,15 @@ impl Session {
                     key
                 }
             })
+            .collect()
+    }
+
+    pub(crate) fn execution_pipeline_keys(&self) -> Vec<String> {
+        let keys = self.dispatch_pipeline_keys();
+        self.execution_report()
+            .regions
+            .iter()
+            .map(|region| keys[region.dispatches.start].clone())
             .collect()
     }
 
@@ -6370,19 +6392,29 @@ impl Session {
             // Multi-pass mode: one compute pass per dispatch in the window,
             // with per-pass barriers and GPU timestamps. Enables
             // dump_gpu_timings() and profiled_dispatch_timings() after wait().
-            let passes = profile_pass_plan(&self.groups, self.plan.dispatches.len(), window);
+            let passes = profile_pass_plan(
+                self.execution_groups(),
+                self.execution_dispatch_count(),
+                window,
+            );
             for encoded in passes {
                 match encoded {
                     ProfilePass::Timed(i) => {
-                        let dispatch = &self.plan.dispatches[i];
-                        let mut pass = self.encoder.compute(&dispatch.label);
-                        if !self.persistent.as_ref().is_some_and(|state| {
-                            state.record(i, dispatch, &self.buffers, &mut pass)
-                        }) {
-                            let mut pc = pass.with(self.pipelines.get(i));
-                            Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
-                            pc.dispatch(dispatch.workgroups);
-                        }
+                        let label = self
+                            .persistent
+                            .as_ref()
+                            .map_or(self.plan.dispatches[i].label.as_str(), |state| {
+                                state.report.regions[i].label.as_str()
+                            });
+                        let mut pass = self.encoder.compute(label);
+                        record_execution_region(
+                            i,
+                            &self.plan,
+                            &self.pipelines,
+                            self.persistent.as_ref(),
+                            &self.buffers,
+                            &mut pass,
+                        );
                         self.profiled_pass_map.push(Some(i));
                     }
                     ProfilePass::Untimed(spans) => {
@@ -6394,16 +6426,14 @@ impl Session {
                                 pass.barrier();
                             }
                             for i in span {
-                                let dispatch = &self.plan.dispatches[i];
-                                if self.persistent.as_ref().is_some_and(|state| {
-                                    state.record(i, dispatch, &self.buffers, &mut pass)
-                                }) {
-                                    continue;
-                                }
-                                let pipeline = self.pipelines.get(i);
-                                let mut pc = pass.with(pipeline);
-                                Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
-                                pc.dispatch(dispatch.workgroups);
+                                record_execution_region(
+                                    i,
+                                    &self.plan,
+                                    &self.pipelines,
+                                    self.persistent.as_ref(),
+                                    &self.buffers,
+                                    &mut pass,
+                                );
                             }
                         }
                         self.profiled_pass_map.push(None);
@@ -6426,7 +6456,9 @@ impl Session {
                 &mut self.encoder,
                 &mut self.sync_point,
                 &self.plan,
-                &self.groups,
+                self.persistent
+                    .as_ref()
+                    .map_or(&self.groups, |state| &state.groups),
                 &self.pipelines,
                 self.persistent.as_ref(),
                 &self.buffers,
@@ -6947,7 +6979,7 @@ impl Session {
 
     /// Number of barrier groups (compute passes) in the dispatch sequence.
     pub fn num_groups(&self) -> usize {
-        self.groups.len()
+        self.execution_groups().len()
     }
 
     /// GPU device and driver name.

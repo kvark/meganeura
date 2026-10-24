@@ -163,7 +163,7 @@ fn a_windowed_step_is_a_complete_replay() {
     sanity_check_reference();
     let mut reference_session = build_session();
     let mut session = build_session();
-    let dispatch_count = session.plan().dispatches.len();
+    let dispatch_count = session.execution_dispatch_count();
     let mut out = vec![0.0f32; ROWS * DIM];
     let mut reference = vec![0.0f32; ROWS * DIM];
 
@@ -224,7 +224,7 @@ fn windowed_capture_times_every_dispatch_and_preserves_the_result() {
         return;
     };
     let reference = sanity_check_reference();
-    let dispatch_count = session.plan().dispatches.len();
+    let dispatch_count = session.execution_dispatch_count();
     assert!(
         dispatch_count > 8,
         "the chain compiled to only {dispatch_count} dispatches; \
@@ -277,16 +277,26 @@ fn windowed_capture_times_every_dispatch_and_preserves_the_result() {
         assert_eq!(dispatch.index, index);
         let workers = profile.execution.regions[index].workers;
         assert_eq!(dispatch.pipeline.starts_with("persistent:"), workers != 0);
+        let region = &profile.execution.regions[index];
+        assert_eq!(dispatch.members.len(), region.dispatches.len());
+        for member in &dispatch.members {
+            assert!(region.dispatches.contains(&member.index));
+            assert_eq!(
+                member.workgroups,
+                session.plan().dispatches[member.index].workgroups
+            );
+            assert_eq!(member.label, session.plan().dispatches[member.index].label);
+        }
         assert_eq!(
             dispatch.logical_workgroups,
-            session.plan().dispatches[index].workgroups
+            (dispatch.members.len() == 1).then_some(dispatch.members[0].workgroups)
         );
         assert_eq!(
             dispatch.workgroups,
             if workers != 0 {
                 [workers, 1, 1]
             } else {
-                dispatch.logical_workgroups
+                dispatch.logical_workgroups.unwrap()
             }
         );
         assert_eq!(
@@ -323,7 +333,7 @@ fn a_plan_within_the_budget_is_captured_in_one_replay() {
         eprintln!("SKIP: selected device cannot timestamp GPU passes");
         return;
     };
-    let dispatch_count = session.plan().dispatches.len();
+    let dispatch_count = session.execution_dispatch_count();
 
     let profile = capture_session_profile(
         &mut session,

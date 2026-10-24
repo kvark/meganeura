@@ -335,6 +335,7 @@ pub struct ProfilePlan {
     pub dispatch_count: usize,
     pub forward_dispatch_count: usize,
     pub backward_dispatch_count: usize,
+    pub mixed_dispatch_count: usize,
     pub barrier_group_count: usize,
     pub logical_buffer_bytes: usize,
     pub allocated_buffer_bytes: usize,
@@ -387,7 +388,10 @@ pub struct FamilyProfile {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct DispatchProfile {
+    /// Physical launch / execution-region index, not a compiled-operation index.
     pub index: usize,
+    /// Source operations implemented by this launch, without invented timings.
+    pub members: Vec<DispatchMember>,
     pub phase: String,
     pub family: String,
     pub shader: String,
@@ -400,7 +404,9 @@ pub struct DispatchProfile {
     pub pipeline: String,
     /// Actual launch geometry, including persistent worker pools.
     pub workgroups: [u32; 3],
-    pub logical_workgroups: [u32; 3],
+    /// Available for a single-operation launch. Multi-operation launches carry
+    /// each logical grid in `members` instead.
+    pub logical_workgroups: Option<[u32; 3]>,
     pub workgroup_count: u64,
     pub input_buffer_bytes: usize,
     pub output_buffer_bytes: usize,
@@ -415,6 +421,21 @@ pub struct DispatchProfile {
     pub p25_ms: f64,
     pub p75_ms: f64,
     pub share_of_dispatch_median_sum_pct: f64,
+}
+
+/// Untimed source-operation metadata inside a physical launch.
+#[derive(Clone, Debug, Serialize)]
+pub struct DispatchMember {
+    pub index: usize,
+    pub family: String,
+    pub shader: String,
+    pub label: String,
+    pub origin: Vec<u32>,
+    pub workgroups: [u32; 3],
+    pub input_buffers: Vec<u32>,
+    pub output_buffers: Vec<u32>,
+    pub weight_format: String,
+    pub requires_full_precision: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -560,7 +581,7 @@ fn capture_windows(
         return Err(ProfileError::ZeroSamples);
     }
 
-    let dispatch_count = session.plan().dispatches.len();
+    let dispatch_count = session.execution_dispatch_count();
     // Clamped to the backend's own limit at both ends. An override above it
     // does not raise anything — Blade still stops writing timestamps at
     // `PASS_COUNT` — it just asks for one oversized window, which then
@@ -628,7 +649,7 @@ fn capture_windows(
     }
 
     let plan = session.plan();
-    let pipeline_keys = session.dispatch_pipeline_keys();
+    let pipeline_keys = session.execution_pipeline_keys();
     let execution = session.execution_report();
     let loss_dispatch = plan.loss_buffer.and_then(|loss| {
         plan.dispatches.iter().rposition(|dispatch| {
@@ -637,18 +658,22 @@ fn capture_windows(
     });
     let has_backward = !plan.param_grad_pairs.is_empty();
 
-    let phases: Vec<&'static str> = (0..dispatch_count)
-        .map(|index| {
-            if !has_backward
-                || loss_dispatch
-                    .map(|last| index <= last)
-                    // A differentiated plan should always identify its loss.
-                    // If it does not, avoid inventing a backward boundary.
-                    .unwrap_or(true)
-            {
-                "forward"
+    let phase = |index: usize| {
+        if !has_backward || loss_dispatch.is_none_or(|last| index <= last) {
+            "forward"
+        } else {
+            "backward"
+        }
+    };
+    let phases: Vec<&'static str> = execution
+        .regions
+        .iter()
+        .map(|region| {
+            let first = phase(region.dispatches.start);
+            if region.dispatches.clone().all(|index| phase(index) == first) {
+                first
             } else {
-                "backward"
+                "mixed"
             }
         })
         .collect();
@@ -660,45 +685,95 @@ fn capture_windows(
     let dispatch_median_total: f64 = dispatch_medians.iter().sum();
 
     let mut dispatches = Vec::with_capacity(dispatch_count);
-    for (index, dispatch) in plan.dispatches.iter().enumerate() {
-        let input_buffer_bytes = dispatch
-            .input_buffers
-            .iter()
-            .map(|buffer| plan.buffers[buffer.0 as usize])
-            .sum();
-        let output_buffer_bytes = plan.buffers[dispatch.output_buffer.0 as usize]
-            + dispatch
-                .extra_outputs
+    for (index, region) in execution.regions.iter().enumerate() {
+        let operations = &plan.dispatches[region.dispatches.clone()];
+        let first = &operations[0];
+        let buffers_bytes = |buffers: BTreeSet<u32>| {
+            buffers
+                .into_iter()
+                .map(|buffer| plan.buffers[buffer as usize])
+                .sum()
+        };
+        let input_buffer_bytes = buffers_bytes(
+            operations
                 .iter()
-                .map(|buffer| plan.buffers[buffer.0 as usize])
-                .sum::<usize>();
-        let median_ms = dispatch_medians[index];
-        let workers = execution.regions[index].workers;
-        let workgroups = if workers != 0 {
-            [workers, 1, 1]
+                .flat_map(|dispatch| dispatch.read_buffers().map(|buffer| buffer.0))
+                .collect(),
+        );
+        let output_buffer_bytes = buffers_bytes(
+            operations
+                .iter()
+                .flat_map(|dispatch| dispatch.written_buffers().map(|buffer| buffer.0))
+                .collect(),
+        );
+        let family = if operations
+            .iter()
+            .all(|dispatch| dispatch.profile_family() == first.profile_family())
+        {
+            first.profile_family()
         } else {
-            dispatch.workgroups
+            "mixed"
+        };
+        let members = operations
+            .iter()
+            .enumerate()
+            .map(|(offset, dispatch)| DispatchMember {
+                index: region.dispatches.start + offset,
+                family: dispatch.profile_family().to_string(),
+                shader: format!("{:?}", dispatch.shader),
+                label: dispatch.label.clone(),
+                origin: dispatch.origin.clone(),
+                workgroups: dispatch.workgroups,
+                input_buffers: dispatch.read_buffers().map(|buffer| buffer.0).collect(),
+                output_buffers: dispatch.written_buffers().map(|buffer| buffer.0).collect(),
+                weight_format: format!("{:?}", dispatch.weight_format),
+                requires_full_precision: dispatch.requires_full_precision,
+            })
+            .collect();
+        let median_ms = dispatch_medians[index];
+        let workgroups = if region.workers != 0 {
+            [region.workers, 1, 1]
+        } else {
+            first.workgroups
         };
         dispatches.push(DispatchProfile {
             index,
+            members,
             phase: phases[index].to_string(),
-            family: dispatch.profile_family().to_string(),
-            shader: format!("{:?}", dispatch.shader),
-            label: dispatch.label.clone(),
-            origin: dispatch.origin.clone(),
+            family: family.to_string(),
+            shader: if operations.len() == 1 {
+                format!("{:?}", first.shader)
+            } else {
+                "persistent_region".to_string()
+            },
+            label: region.label.clone(),
+            origin: region.origin.clone(),
             timestamp_label: timestamp_labels[index].clone(),
             pipeline: pipeline_keys[index].clone(),
             workgroups,
-            logical_workgroups: dispatch.workgroups,
+            logical_workgroups: (operations.len() == 1).then_some(first.workgroups),
             workgroup_count: workgroups.iter().map(|&value| u64::from(value)).product(),
             input_buffer_bytes,
             output_buffer_bytes,
-            cooperative: dispatch.use_coop(),
-            small_tile: dispatch.use_small_tiles(),
-            requires_full_precision: dispatch.requires_full_precision,
-            weight_format: format!("{:?}", dispatch.weight_format),
-            has_prologue: dispatch.matmul_prologue.is_some(),
-            has_epilogue: dispatch.matmul_epilogue.is_some(),
+            cooperative: operations.iter().any(|dispatch| dispatch.use_coop()),
+            small_tile: operations.iter().any(|dispatch| dispatch.use_small_tiles()),
+            requires_full_precision: operations
+                .iter()
+                .any(|dispatch| dispatch.requires_full_precision),
+            weight_format: if operations
+                .iter()
+                .all(|dispatch| dispatch.weight_format == first.weight_format)
+            {
+                format!("{:?}", first.weight_format)
+            } else {
+                "mixed".to_string()
+            },
+            has_prologue: operations
+                .iter()
+                .any(|dispatch| dispatch.matmul_prologue.is_some()),
+            has_epilogue: operations
+                .iter()
+                .any(|dispatch| dispatch.matmul_epilogue.is_some()),
             timing_samples_ms: timing_samples[index].clone(),
             median_ms,
             p25_ms: quantile(&timing_samples[index], 0.25),
@@ -773,13 +848,14 @@ fn capture_windows(
     let device = session.device_information();
     let memory = session.memory_summary();
     let forward_dispatch_count = phases.iter().filter(|&&phase| phase == "forward").count();
-    let backward_dispatch_count = dispatch_count - forward_dispatch_count;
+    let backward_dispatch_count = phases.iter().filter(|&&phase| phase == "backward").count();
+    let mixed_dispatch_count = phases.iter().filter(|&&phase| phase == "mixed").count();
     let profiled_wall_median_ms = quantile(&profiled_wall_samples_ms, 0.5);
     let gpu_total_median_ms = quantile(&gpu_total_samples_ms, 0.5);
-    let timing_contract = "Blade calibrated pass-start timestamps on the process monotonic clock; each interval ends at the next pass start or final submission completion; one compute pass per timed plan dispatch, with the dispatches outside the replay's window batched into one untimed pass per side";
+    let timing_contract = "Blade calibrated pass-start timestamps on the process monotonic clock; each interval ends at the next pass start or final submission completion; one compute pass per timed execution region (physical launch), with the dispatches outside the replay's window batched into one untimed pass per side";
 
     Ok(SessionProfile {
-        schema_version: 3,
+        schema_version: 4,
         timing_contract: timing_contract.to_string(),
         device: ProfileDevice {
             backend: if device.driver_name == "Metal" {
@@ -796,6 +872,7 @@ fn capture_windows(
             dispatch_count,
             forward_dispatch_count,
             backward_dispatch_count,
+            mixed_dispatch_count,
             barrier_group_count: session.num_groups(),
             logical_buffer_bytes: memory.total_buffer_bytes,
             allocated_buffer_bytes: memory.allocated_buffer_bytes,
