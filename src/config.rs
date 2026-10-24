@@ -151,7 +151,7 @@ registry! {
     NO_ALIAS: "MEGANEURA_NO_ALIAS", Bool, Diagnostic,
         "Disable buffer lifetime aliasing; every logical buffer gets its own allocation.";
     PERSISTENT_WORKERS: "MEGANEURA_PERSISTENT_WORKERS", U32, Diagnostic,
-        "Opt in to persistent pointwise/reduction tile queues with this many workgroups per dispatch (1..=65535).";
+        "Opt in to persistent compute tile queues with this many workgroups per dispatch (1..=65535).";
     PERSISTENT_STRICT: "MEGANEURA_PERSISTENT_STRICT", Bool, Diagnostic,
         "Reject ordinary fallback when persistent execution is selected.";
     DEVICE_SCHEDULING: "MEGANEURA_DEVICE_SCHEDULING", Bool, Diagnostic,

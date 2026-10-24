@@ -4609,6 +4609,7 @@ impl Session {
                 physical_buffers.iter().any(|buffer| buffer.external),
                 !opts.serial_dispatch,
                 opts.wgsl_dump_dir.as_deref(),
+                coop_config.as_ref(),
             )
         });
 
@@ -5070,13 +5071,10 @@ impl Session {
             .collect()
     }
 
-    /// Stable descriptive key for the pipeline selected by each plan
-    /// dispatch, in dispatch order.
-    ///
-    /// One key per internal pipeline variant, so the key names what will
-    /// actually run: scalar, cooperative, small-tile, reduced-weight,
-    /// fused RmsNorm, fused epilogue or prologue, attention width, or a
-    /// generated pointwise/reduction kernel.
+    /// Physical pipeline identity for each compiled operation, in plan order.
+    /// Operations combined into one persistent region share its pipeline key.
+    /// See [`Session::dispatch_implementation_keys`] for their individual
+    /// arithmetic implementations.
     pub fn dispatch_pipeline_keys(&self) -> Vec<String> {
         self.pipelines
             .selected
@@ -5089,6 +5087,18 @@ impl Session {
                     .and_then(|state| state.pipeline_key(index))
                     .map_or(key, str::to_owned)
             })
+            .collect()
+    }
+
+    /// Selected arithmetic implementation for each compiled operation,
+    /// independent of persistent region composition. Physical pipeline keys
+    /// may be shared by several operations in a region; these retain each
+    /// handler's dtype, specialization and fusion identity.
+    pub fn dispatch_implementation_keys(&self) -> Vec<String> {
+        self.pipelines
+            .selected
+            .iter()
+            .map(|selected| selected.0.label())
             .collect()
     }
 

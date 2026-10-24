@@ -714,6 +714,120 @@ fn session_persistent_owned_chains_keep_tile_dependencies_local() {
 }
 
 #[test]
+fn session_persistent_selected_kernels_preserve_geometry_and_scratch() {
+    let gpu = crate::support::gpu::gpu();
+    for attention in [false, true] {
+        let (x_shape, a_shape, b_shape, output_lengths) = if attention {
+            ([33, 64], [33, 32], [33, 32], [33 * 64; 3])
+        } else {
+            ([37, 19], [19, 41], [41, 23], [37 * 41, 37 * 23, 23 * 37])
+        };
+        let mut graph = meganeura::Graph::new();
+        let x = graph.input("x", &x_shape);
+        let a = graph.parameter("a", &a_shape);
+        let b = graph.parameter("b", &b_shape);
+        let first = if attention {
+            graph.causal_attention(x, a, b, 2, 1, 32)
+        } else {
+            graph.matmul(x, a)
+        };
+        let second = if attention {
+            graph.full_attention(first, a, b, 2, 1, 32)
+        } else {
+            graph.matmul(first, b)
+        };
+        let transposed = graph.transpose(second);
+        let output = graph.relu(transposed);
+        graph.set_outputs(vec![first, second, output]);
+        let plan = meganeura::compile::compile_with(
+            &graph,
+            &meganeura::CompileOptions {
+                fuse_dispatches: false,
+                flash_forward_coop: attention,
+                ..Default::default()
+            },
+        );
+        let ordinary_options = meganeura::SessionOptions {
+            persistent: None,
+            coop: if attention {
+                meganeura::CoopPolicy::default()
+            } else {
+                meganeura::CoopPolicy::Disabled
+            },
+            poison: true,
+            ..meganeura::SessionOptions::from_env()
+        };
+        let mut ordinary = meganeura::Session::with_context_opts(
+            plan.clone(),
+            gpu.clone(),
+            ordinary_options.clone(),
+        );
+        for device_scheduling in [false, true] {
+            if device_scheduling && !gpu.capabilities().device_memory_fence {
+                continue;
+            }
+            for workers in [1, 3, 64, 4096] {
+                let mut session = meganeura::Session::with_context_opts(
+                    plan.clone(),
+                    gpu.clone(),
+                    meganeura::SessionOptions {
+                        persistent: Some(meganeura::PersistentOptions {
+                            workers,
+                            device_scheduling,
+                            allow_fallback: false,
+                            track_workers: true,
+                        }),
+                        ..ordinary_options.clone()
+                    },
+                );
+                let report = session.execution_report();
+                assert!(
+                    report
+                        .regions
+                        .iter()
+                        .all(|region| region.workers == workers && region.fallback_reason.is_none())
+                );
+                assert!(
+                    report
+                        .regions
+                        .iter()
+                        .any(|region| region.workgroup_shape == Some([16, 16, 1]))
+                );
+                assert_eq!(
+                    report.regions.iter().any(|region| region.device_scheduled),
+                    device_scheduling
+                );
+                for replay in 0..3 {
+                    let values = |len| {
+                        (0..len)
+                            .map(|i| (((i * 17 + replay * 23) % 61) as f32 - 30.0) / 32.0)
+                            .collect::<Vec<_>>()
+                    };
+                    let input = values(x_shape.into_iter().product());
+                    let a = values(a_shape.into_iter().product());
+                    let b = values(b_shape.into_iter().product());
+                    for current in [&mut ordinary, &mut session] {
+                        current.set_input("x", &input);
+                        current.set_parameter("a", &a);
+                        current.set_parameter("b", &b);
+                        current.step();
+                        current.wait();
+                        check_worker_tasks(current);
+                    }
+                    for (index, len) in output_lengths.into_iter().enumerate() {
+                        let mut expected = vec![f32::NAN; len];
+                        let mut actual = expected.clone();
+                        ordinary.read_output_by_index(index, &mut expected);
+                        session.read_output_by_index(index, &mut actual);
+                        assert_eq!(actual, expected);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn session_persistent_fallback_is_explicit_and_strict_rejects_it() {
     let mut graph = meganeura::Graph::new();
     let x = graph.input("x", &[2, 3]);
@@ -733,13 +847,13 @@ fn session_persistent_fallback_is_explicit_and_strict_rejects_it() {
         });
         config
     };
-    let mut session = meganeura::build(&graph, config(true)).0;
+    let mut session = meganeura::build(&graph, config(false)).0;
     let report = session.execution_report();
     assert!(
         report
             .regions
             .iter()
-            .any(|r| r.workers == 0 && r.fallback_reason.is_some())
+            .all(|r| r.workers != 0 && r.fallback_reason.is_none())
     );
     assert!(report.persistent_tasks > 0);
     session.set_input("x", &[1.0; 6]);
@@ -748,12 +862,32 @@ fn session_persistent_fallback_is_explicit_and_strict_rejects_it() {
     session.wait();
     check_worker_tasks(&mut session);
     assert_eq!(session.read_output(10), vec![6.0; 10]);
+    // Construction-only limit check: this grid cannot fit the persistent
+    // counter. Do not submit this deliberately oversized ordinary fallback.
+    let mut oversized = session.plan().clone();
+    oversized.dispatches[0].workgroups = [u32::MAX, 1, 1];
+    let fallback = meganeura::Session::with_context_opts(
+        oversized.clone(),
+        crate::support::gpu::gpu(),
+        config(true).runtime,
+    );
+    assert!(
+        fallback
+            .execution_report()
+            .regions
+            .iter()
+            .any(|region| region.workers == 0 && region.fallback_reason.is_some())
+    );
     let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        meganeura::build(&graph, config(false))
+        meganeura::Session::with_context_opts(
+            oversized,
+            crate::support::gpu::gpu(),
+            config(false).runtime,
+        )
     }));
     assert!(
         failure.is_err(),
-        "strict execution silently accepted a matrix fallback"
+        "strict execution silently accepted a queue-capacity fallback"
     );
 
     let mut training = meganeura::Graph::new();

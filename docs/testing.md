@@ -33,6 +33,10 @@ MEGANEURA_PERSISTENT_WORKERS=64 cargo test --test oracle --test smoke \
 MEGANEURA_PERSISTENT_WORKERS=64 MEGANEURA_DEVICE_SCHEDULING=1 \
   cargo test --test oracle --test smoke --test regression --test gguf_model \
   --all-features -- --test-threads=1
+# Reject graph fallback in the operator and GGUF gates:
+MEGANEURA_PERSISTENT_WORKERS=64 MEGANEURA_DEVICE_SCHEDULING=1 \
+  MEGANEURA_PERSISTENT_STRICT=1 cargo test --test oracle --test gguf_model \
+  --all-features -- --test-threads=1
 # This targeted oracle case explicitly checks ordinary and strict persistent
 # execution, numerical results, and nonzero persistent coverage.
 cargo test --test oracle smoke::persistent_execution_reports_actual_coverage
@@ -40,15 +44,15 @@ cargo test --test oracle smoke::persistent_execution_reports_actual_coverage
 
 `reference::Report.execution` and `Session::execution_report()` expose actual
 coverage and fallback reasons. The full suite allows ordinary fallback for
-operators outside the generated pointwise/reduction scope; passing it does not
-mean all graph operations are persistent. Session tests cover queue reset,
+operators outside the supported tile conversion/resource contract; passing it
+does not mean all graph operations are persistent. Session tests cover queue reset,
 chunking and external records, while the existing tests retain their training,
 checkpoint, shared storage, cache, and precision assertions. Test constructors
 use the shared environment configuration even when they override another
 runtime option.
 `PersistentOptions::device_scheduling` selects the native-fence protocol.
 `ExecutionRegion::device_scheduled` identifies those launches. Regions currently
-hold up to three compatible generated handlers and release successors only after
+hold up to three compatible handlers and release successors only after
 all predecessor tiles finish. Independent/singleton regions retain the portable
 queue and report `device_scheduled: false`. Resource, geometry and unsupported-handler boundaries
 remain physical dispatches. `validate_persistent_completion()` waits and checks

@@ -9,6 +9,7 @@ use crate::compile::WeightFormat;
 mod coop_tiled;
 mod cooperative;
 mod matrix_types;
+pub(crate) mod tile;
 pub(crate) mod winograd;
 mod workgroup;
 pub use coop_tiled::{CooperativeMatmulShape, generate_tiled_coop_matmul};

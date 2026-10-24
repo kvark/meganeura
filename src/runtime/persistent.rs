@@ -3,11 +3,12 @@ use super::{
 };
 use blade_graphics as bg;
 use std::{
+    collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
-    sync::Arc,
+    sync::{Arc, LazyLock, Mutex},
 };
 
-/// Opt-in persistent execution of generated pointwise and reduction tiles.
+/// Opt-in persistent execution of selected compute implementations as tiles.
 /// Compatible operations share a queue. Device scheduling additionally orders
 /// whole-operation dependencies inside each supported Vulkan region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -64,7 +65,10 @@ pub struct ExecutionRegion {
     pub device_scheduled: bool,
     /// Zero denotes ordinary execution.
     pub workers: u32,
+    /// Total invocations per physical workgroup.
     pub workgroup_size: Option<u32>,
+    /// Exact local geometry retained from the selected compute implementation.
+    pub workgroup_shape: Option<[u32; 3]>,
     pub fallback_reason: Option<String>,
 }
 
@@ -111,11 +115,17 @@ pub(super) struct State {
 }
 
 struct Handler {
-    body: crate::schedule::TileKernel,
+    body: crate::codegen::tile::Tile,
+    generated: bool,
     layout: bg::ShaderDataLayout,
 }
 
-fn tile(dispatch: &Dispatch) -> Result<Handler, String> {
+fn tile(
+    gpu: &Gpu,
+    plan: &ExecutionPlan,
+    dispatch: &Dispatch,
+    coop_config: Option<&crate::codegen::CoopConfig>,
+) -> Result<Handler, String> {
     let (body, layout) = if let Some(dag) = dispatch.pointwise() {
         (
             crate::schedule::lower_pointwise_tile(
@@ -131,9 +141,35 @@ fn tile(dispatch: &Dispatch) -> Result<Handler, String> {
             super::reduction_data_layout(kernel),
         )
     } else {
-        return Err(format!("{:?} has no reusable tile body", dispatch.shader));
+        let (module, layout, entry) = super::Pipelines::generate(
+            gpu,
+            plan.knobs,
+            dispatch,
+            &super::Pipelines::key(dispatch),
+            coop_config,
+        )?;
+        return Ok(Handler {
+            body: crate::codegen::tile::from_module(&module.source, entry)?,
+            layout,
+            generated: false,
+        });
     };
-    Ok(Handler { body, layout })
+    let shared_bytes = dispatch.reduction().map_or(0, |kernel| {
+        (1 + kernel.extra_prologues.len() as u64) * u64::from(kernel.workgroup_size) * 4
+    });
+    Ok(Handler {
+        body: crate::codegen::tile::Tile {
+            source: body.source("$PREFIX"),
+            call: "$PREFIXexecute_tile(logical, lid)".into(),
+            workgroup_size: [body.workgroup_size, 1, 1],
+            shared_bytes,
+            subgroups: false,
+            cooperative: None,
+            shared_aligned: shared_bytes.is_multiple_of(16),
+        },
+        layout,
+        generated: true,
+    })
 }
 
 fn count(dispatch: &Dispatch) -> u64 {
@@ -219,10 +255,23 @@ fn check_resources(
     if handlers.len() + 1 > limits.max_bind_groups as usize {
         return Err("region exceeds device bind-group limit".into());
     }
+    if handlers
+        .iter()
+        .any(|handler| handler.body.cooperative.is_some())
+        && handlers.iter().any(|handler| !handler.body.shared_aligned)
+    {
+        return Err("cooperative region requires shared allocations in 16-byte multiples".into());
+    }
     let mut storage = 1;
     let mut buffer_bindings = 2;
     let mut plain = std::mem::size_of::<Params>() as u32;
-    let mut shared = 4u64;
+    let mut shared = 16u64;
+    if handlers
+        .iter()
+        .any(|handler| handler.body.cooperative == Some(naga::CooperativeScope::Workgroup))
+    {
+        shared += u64::from(caps.cooperative_matrix.workgroup.reserved_shared_memory);
+    }
     let mut tasks = 0u64;
     for (index, handler) in dispatches.clone().zip(handlers) {
         if handler.layout.bindings.len() > bg::limits::RESOURCES_IN_GROUP as usize {
@@ -243,10 +292,7 @@ fn check_resources(
         }
         let dispatch = &plan.dispatches[index];
         tasks = tasks.saturating_add(count(dispatch));
-        if let Some(kernel) = dispatch.reduction() {
-            shared +=
-                (1 + kernel.extra_prologues.len() as u64) * u64::from(kernel.workgroup_size) * 4;
-        }
+        shared += handler.body.shared_bytes;
         for buffer in dispatch.read_buffers().chain(dispatch.written_buffers()) {
             let piece = buffers[buffer.0 as usize];
             if piece.buffer.size() - piece.offset > limits.max_storage_buffer_range {
@@ -282,33 +328,16 @@ fn check_resources(
         .ok_or_else(|| "queue counter would overflow u32".to_string())
 }
 
-fn binding_name(slot: usize, name: &str) -> &'static str {
-    // Blade layouts require static names. This bounded vocabulary avoids
-    // leaking dynamically allocated names for every constructed session.
-    macro_rules! names {
-        ($($name:literal),*) => { match name {
-            $($name => [concat!("h0_", $name), concat!("h1_", $name), concat!("h2_", $name)][slot],)*
-            _ => panic!("unknown generated binding {name}"),
-        } };
-    }
-    names!(
-        "src",
-        "src_a",
-        "src_b",
-        "src_c",
-        "src_idx",
-        "src_a_idx",
-        "src_b_idx",
-        "src_c_idx",
-        "per_row_src",
-        "per_row_src_a",
-        "per_row_src_b",
-        "bias",
-        "bias_a",
-        "bias_b",
-        "dst",
-        "params"
-    )
+fn binding_name(slot: usize, name: &'static str) -> &'static str {
+    // Layout names are a finite vocabulary supplied by the selected kernels,
+    // never graph labels. Intern each of the three slot names once per process.
+    static NAMES: LazyLock<Mutex<HashMap<(usize, &'static str), &'static str>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    assert!(slot < 3);
+    let mut names = NAMES.lock().unwrap();
+    names
+        .entry((slot, name))
+        .or_insert_with(|| Box::leak(format!("h{slot}_{name}").into_boxed_str()))
 }
 
 impl State {
@@ -351,6 +380,7 @@ impl State {
         external: bool,
         allow_chains: bool,
         dump_dir: Option<&str>,
+        coop_config: Option<&crate::codegen::CoopConfig>,
     ) -> Self {
         use bg::ShaderData;
         super::validate_precision_plan(gpu, plan);
@@ -390,9 +420,10 @@ impl State {
                 device_scheduled: false,
                 workers: 0,
                 workgroup_size: None,
+                workgroup_shape: None,
                 fallback_reason: None,
             };
-            let generated = tile(dispatch).and_then(|handler| {
+            let generated = tile(gpu, plan, dispatch, coop_config).and_then(|handler| {
                 check_resources(
                     &caps,
                     plan,
@@ -460,7 +491,7 @@ impl State {
                         {
                             break;
                         }
-                        let Ok(handler) = tile(candidate) else {
+                        let Ok(handler) = tile(gpu, plan, candidate, coop_config) else {
                             break;
                         };
                         if handler.body.workgroup_size != workgroup_size {
@@ -500,7 +531,8 @@ impl State {
                     region.dispatches.end = index;
                     region.logical_tasks = 0;
                     region.workers = options.workers;
-                    region.workgroup_size = Some(workgroup_size);
+                    region.workgroup_size = Some(workgroup_size.into_iter().product());
+                    region.workgroup_shape = Some(workgroup_size);
                     region.origin.clear();
                     region.label = plan.dispatches[start..index]
                         .iter()
@@ -517,11 +549,15 @@ impl State {
                     }
                     let mut calls = String::new();
                     let mut layouts = Vec::new();
+                    let subgroups = handlers.iter().any(|handler| handler.body.subgroups);
                     for (slot, handler) in handlers.into_iter().enumerate() {
                         let operation = &plan.dispatches[start + slot];
                         region.origin.extend_from_slice(&operation.origin);
-                        let mut body = handler.body.source(&format!("h{slot}_"));
-                        if region.device_scheduled {
+                        let mut body = handler.body.source.replace("$PREFIX", &format!("h{slot}_"));
+                        if region.device_scheduled && !handler.generated {
+                            // Preserve all aliases conservatively for ordinary implementations.
+                            body = body.replace("var<storage", "@coherent var<storage");
+                        } else if region.device_scheduled {
                             let names: Vec<_> = handler
                                 .layout
                                 .bindings
@@ -549,6 +585,10 @@ impl State {
                         calls.push_str(
                             &include_str!("../shaders/persistent_handler.wgsl")
                                 .replace("$SLOT", &slot.to_string())
+                                .replace(
+                                    "$CALL",
+                                    &handler.body.call.replace("$PREFIX", &format!("h{slot}_")),
+                                )
                                 .replace(
                                     "$CHAIN",
                                     if region.worker_owned_chain {
@@ -607,7 +647,18 @@ impl State {
                     };
                     source.push_str(
                         &entry
-                            .replace("$WORKGROUP", &workgroup_size.to_string())
+                            .replace(
+                                "$WORKGROUP",
+                                &workgroup_size.map(|axis| axis.to_string()).join(", "),
+                            )
+                            .replace(
+                                "$SUBGROUPS",
+                                if subgroups {
+                                    include_str!("../shaders/persistent_subgroups.wgsl")
+                                } else {
+                                    ""
+                                },
+                            )
                             .replace("$HANDLERS", &calls)
                             .replace(
                                 "$TRACK_WORKERS",
@@ -618,6 +669,20 @@ impl State {
                                 },
                             ),
                     );
+                    let mut enables = std::collections::BTreeSet::new();
+                    let body = source
+                        .lines()
+                        .filter(|line| {
+                            if line.trim_start().starts_with("enable ") {
+                                enables.insert(line.trim().to_owned());
+                                false
+                            } else {
+                                true
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let source = enables.into_iter().collect::<Vec<_>>().join("\n") + "\n" + &body;
                     let module = crate::codegen::ShaderModule::with_hint(source, "persistent");
                     if let Some(dir) = dump_dir {
                         module.dump(dir);
@@ -867,6 +932,7 @@ impl Session {
                 self.physical_buffers.iter().any(|buffer| buffer.external),
                 allow_chains,
                 self.pipelines.dump_dir.as_deref(),
+                self.coop_config.as_ref(),
             ));
         }
     }
@@ -934,6 +1000,7 @@ impl Session {
                         device_scheduled: false,
                         workers: 0,
                         workgroup_size: None,
+                        workgroup_shape: None,
                         fallback_reason: None,
                     })
                     .collect(),

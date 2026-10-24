@@ -5,7 +5,8 @@ then proceeds to the **Naga investigation in Milestone 2**. The existing
 [prototype and measurements](megakernel.md) are the starting evidence.
 Milestone 1 is complete with explicit fallback and measured regressions.
 Milestone 2 qualifies the existing fence interface on Vulkan. Session device
-scheduling now covers compatible generated regions; broader coverage remains.
+scheduling now covers compatible regions of selected kernels; optimizer
+integration and lifetime reuse remain.
 
 Implementation is delivered in separate testable commits. The standalone
 prototype is the baseline; subsequent commits update the milestone checklist
@@ -437,6 +438,45 @@ same function with an explicit group index. Selection, arithmetic and coverage
 are unchanged. NVIDIA passes 168 oracle and 72 smoke tests (two ignored), plus
 the five focused Session checks after routing persistent bindings through the
 shared function. Strict all-target Clippy and formatting pass.
+
+Coverage now extends through the selected ordinary implementation instead of a
+second operator registry. Naga converts its compute entry into a namespaced
+callable tile, maps logical IDs and grid dimensions, and resets shared scratch
+on every invocation. Exact three-dimensional workgroup geometry and subgroup
+inputs are preserved. Pointwise/reduction handlers retain their existing shared
+bodies. Unsupported conversion contracts produce explicit fallback. Physical
+pipeline keys identify composed regions; separate implementation keys preserve
+each operation's arithmetic selection and are checked by the paired harness.
+
+Cooperative handlers require 16-byte shared allocation multiples, including a
+padded scheduler ticket: a four-byte ticket disturbed cooperative scratch
+placement and failed attention/convolution checks on NVIDIA. Region resource
+checks include this padding and the device's reservation for workgroup-scope
+matrices, and split incompatible handlers. Boolean scratch is rejected until
+backend-specific layout accounting is shared. Blade
+`5011dea27d0df487196ab279ef53a93aaef2607b` corrects its unused eight-binding ceiling
+to the actual 64-bit Vulkan mask capacity and asserts that capacity before
+creating a descriptor layout. Device buffer limits still constrain composition.
+This admits nine-binding attention-gradient layouts already supported by
+ordinary execution. Naga remains `f09d62e`; there is no new atomic interface.
+Blade passes 20 unit tests (one ignored), strict Clippy, formatting and
+Metal-target compilation. Its dependency branch is pushed.
+
+The expanded path passes all 168 oracle and 22 GGUF tests on NVIDIA with strict
+device selection, synchronization validation and no graph fallback. All 182
+regression tests pass with appended optimizer fallback allowed (21 ignored).
+The portable strict selection also passes all 168 oracle tests.
+Device selection passes 73 smoke tests (two ignored); a strict attention
+backward case also passes on lavapipe.
+All six focused Session checks pass on NVIDIA and lavapipe. The new matrix and
+attention fixture checks exact ordinary outputs across 1/3/64/4096 workers,
+repeated changed inputs, preserved two-dimensional local geometry and scratch
+reuse. Both rectangular-matrix tuning checks pass after adding the workgroup
+matrix reservation to the resource bound.
+All 663 library tests pass (eight ignored); strict all-target/all-feature Clippy,
+formatting, documentation and core/models/GGUF/profiler Metal-target compilation
+pass. Metal GPU execution remains unqualified. Production measurements follow
+from a clean implementation commit.
 
 The device queue uses the same Session work descriptors, tracking ready tasks,
 predecessor counts, unfinished work and successor edges on the GPU. It releases

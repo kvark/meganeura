@@ -154,6 +154,7 @@ fn metadata(session: &mut Session, construction_ms: f64) -> serde_json::Value {
         "construction_ms": construction_ms, "execution": execution,
         "compiled_operations": session.plan().dispatches.len(),
         "selected_pipeline_keys": session.dispatch_pipeline_keys(), "weight_formats": formats,
+        "selected_implementation_keys": session.dispatch_implementation_keys(),
         "logical_buffer_bytes": memory.total_buffer_bytes, "allocated_buffer_bytes": memory.allocated_buffer_bytes,
         "resident_buffer_bytes": memory.total_allocated_bytes(), "scheduler_bytes": memory.scheduler_bytes,
         "worker_tasks_last_step": workers, "compiled_pipeline_statistics": statistics,
@@ -178,6 +179,11 @@ pub fn measure(
         ordinary.plan(),
         persistent.plan(),
         "paired sessions must use identical compiled arithmetic and precision"
+    );
+    assert_eq!(
+        ordinary.dispatch_implementation_keys(),
+        persistent.dispatch_implementation_keys(),
+        "paired sessions must select identical arithmetic implementations"
     );
     let warmup_start = Instant::now();
     let mut warmed = 0;

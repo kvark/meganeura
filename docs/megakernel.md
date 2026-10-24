@@ -6,8 +6,8 @@ regions and the remaining operator coverage work.
 
 ## Session integration
 
-Generated pointwise and reduction operations can now execute through persistent
-tile queues using the ordinary `Graph` / `build` / `Session` path:
+Selected compute implementations can execute through persistent tile queues
+using the ordinary `Graph` / `build` / `Session` path:
 
 ```rust,no_run
 # let graph = meganeura::Graph::new();
@@ -24,12 +24,35 @@ session.wait();
 ```
 
 Compatible independent operations now share a persistent launch, with up to
-three generated handlers per region. Each launch drains logical tiles using
-the handlers' existing workgroup size. Region boundaries retain hardware
+three handlers per region. Each launch drains logical tiles using
+the handlers' existing three-dimensional workgroup geometry. Region boundaries retain hardware
 barriers. Matching pointwise tiles can also form a worker-owned chain; global
 reductions and dependencies crossing workers retain dispatch boundaries.
-The ordinary backend remains the default. BF16 handlers currently stay in
-single-operation regions because their module-wide declarations are shared.
+The ordinary backend remains the default. Generated BF16 pointwise handlers
+currently stay in single-operation regions because their module-wide
+declarations are shared.
+
+Pointwise and reduction handlers retain their shared generated bodies. Other
+handlers reuse the ordinary selected shader through Naga IR: keep its selected
+entry, convert that entry to a function, namespace module declarations, and map
+logical workgroup/global IDs and grid dimensions at the call. Local and subgroup
+IDs retain the physical workgroup's geometry. Each tile clears scalar or flat
+array workgroup scratch cooperatively before invoking the body. Private globals,
+overrides, storage-pointer helper arguments, boolean or nested scratch and entry
+arguments produce explicit fallback. The ordinary binding function supplies
+every handler's buffers and uniforms at its region slot. This expands the
+conversion mechanism; qualification still depends on the reported coverage and
+operator/state tests.
+
+Cooperative regions keep the shared ticket in a 16-byte allocation and require
+each handler's shared allocations to have sizes divisible by 16. Adding a
+four-byte ticket otherwise changed cooperative scratch placement on NVIDIA and
+produced incorrect attention and convolution results. The planner splits
+incompatible combinations and includes the padded ticket in its shared-memory
+budget, together with the device's reservation for workgroup-scope matrices
+when present. The [Vulkan cooperative-matrix alignment rule](https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-RuntimeSpirv-OpCooperativeMatrixLoadKHR-08986)
+requires suitable pointer and stride alignment; the selected ordinary bodies
+retain their qualified element offsets and strides.
 
 A chain contains only flat pointwise bodies with identical extent and logical
 grid, no broadcast reads, and consistent logical references wherever physical
@@ -80,18 +103,21 @@ the same explicit selection for oracle checks.
 `PersistentOptions::device_scheduling = true` (or
 `MEGANEURA_DEVICE_SCHEDULING=1` alongside the worker selector) enables the
 [qualified Vulkan fence contract](megakernel_memory_contract.md). The same
-generated pointwise/reduction bodies use a bounded ready bitmap and
+tile bodies use a bounded ready bitmap and
 whole-operation completion counters when a region contains dependencies.
 Independent and singleton regions retain the portable queue, with no native
 fences or bitmap scans. Compatible dependent operations can share
 one launch even when consumers read tiles produced by other workers. The planner
 orders physical RAW/WAR/WAW hazards, including rebinding, and annotates aliased
-read-only inputs as coherent. Immutable inputs keep their ordinary accesses.
+read-only inputs as coherent. Generated pointwise/reduction handlers preserve
+plain accesses for immutable inputs. Converted ordinary implementations
+conservatively mark all storage bindings coherent in a native region, including
+immutable inputs; more precise alias decoration remains a possible optimization.
 
 Regions still contain at most three compatible handlers. Different workgroup
 geometry, resource limits, imported storage and unsupported kernels retain
 physical dispatch boundaries or explicit fallback. Serial selection retains one
-operation per launch. BF16 handlers remain singleton-only. This is device
+operation per launch. Generated BF16 pointwise handlers remain singleton-only. This is device
 scheduling within reported regions, not full graph coverage or a promise of one
 launch for every graph.
 

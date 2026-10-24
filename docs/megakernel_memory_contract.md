@@ -2,8 +2,8 @@
 
 Milestone 1 is complete. Milestone 2 selects the existing native fence extension
 for the bounded protocol below. Compiler-output checks and device tests qualify
-the Vulkan path. Session now applies it to compatible generated pointwise and
-reduction regions; broader coverage and performance qualification follow.
+the Vulkan path. Session applies it to compatible tile regions; operator coverage
+and performance qualification are recorded separately in the implementation plan.
 
 ## Smallest candidate interface
 
@@ -33,9 +33,13 @@ variable. Read-only handler bindings that alias another binding's mutable output
 therefore need `@coherent`; declaring them `read_write` alone is insufficient
 because the optimization uses actual writes. This existing annotation prevents
 private-access elision and adds queue-family per-access visibility/availability.
-Decorate every such cross-binding communication path, retaining plain read-only
-bindings for immutable weights/inputs. Pointer parameters currently lose global
-decoration provenance, so the initial handlers access those globals directly.
+Decorate every such cross-binding communication path. Generated pointwise and
+reduction bodies retain plain bindings for immutable weights/inputs. Converted
+ordinary implementations conservatively decorate all storage globals in native
+regions until their exact binding-to-alias metadata is shared with the planner.
+Pointer parameters currently lose global decoration provenance, so the converter
+rejects storage-pointer helper types and the qualified bodies access globals
+directly.
 Compiler tests must cover the aliased read-only case explicitly.
 
 ## Publication by all lanes
@@ -198,7 +202,11 @@ The qualified pins are Naga
 [`f09d62e`](https://github.com/kvark/wgpu/commit/f09d62e54d743f89879e4e8dfb32e717146f2670)
 and Blade
 [`63fb651`](https://github.com/kvark/blade/commit/63fb651a3d0c7bad6964dba9b2585f794641862f).
-Meganeura's developer tools and Blade share that single Naga identity.
+Meganeura's runtime tile conversion, developer tools and Blade share that single
+Naga identity.
+The subsequent Blade pin `5011dea27d0df487196ab279ef53a93aaef2607b` corrects the
+binding-group ceiling for broader handler coverage; its memory-fence capability
+and Naga dependency are unchanged.
 The published pins pass 506 Meganeura unit tests (seven ignored), 71 smoke tests
 in each ordinary/persistent selection (two ignored), strict all-target Clippy,
 formatting and the lavapipe protocol check. Blade passes 20 unit tests (one

@@ -102,7 +102,7 @@ fn coop_matmul_reads_f16_weights() {
                 session.dispatch_pipeline_keys()
             );
             assert_eq!(
-                session.dispatch_pipeline_keys()[0].contains("cooperative"),
+                session.dispatch_implementation_keys()[0].contains("cooperative"),
                 cooperative,
                 "the selected pipeline must implement the plan's kernel"
             );
@@ -157,7 +157,7 @@ fn mixed_storage_rmsnorm_prologues_use_distinct_pipelines() {
     let mut scalar = create(CoopPolicy::Disabled);
     let mut candidate = create(CoopPolicy::AllowF16);
     if expects_cooperative_f16_weights(&candidate) {
-        let keys = candidate.dispatch_pipeline_keys();
+        let keys = candidate.dispatch_implementation_keys();
         let prologue_keys: Vec<_> = candidate
             .plan()
             .dispatches
