@@ -605,10 +605,43 @@ pub const POINTWISE_ENTRY: &str = "main";
 pub const REDUCTION_ENTRY: &str = "main";
 pub const ATTENTION_ENTRY: &str = "main";
 
+/// One cooperative tile body, with resources but without an entry point.
+/// Both launch paths use the same body and its original workgroup geometry.
+pub(crate) struct TileKernel {
+    pub source: String,
+    pub workgroup_size: u32,
+    hint: &'static str,
+}
+
+impl TileKernel {
+    fn into_module(self) -> ShaderModule {
+        let entry = include_str!("shaders/dispatch_tile.wgsl")
+            .replace("$WORKGROUP", &self.workgroup_size.to_string());
+        ShaderModule::with_hint(self.source + &entry, self.hint)
+    }
+}
+
 /// Lower a [`KernelTemplate`] to WGSL source.
 pub fn lower(t: &KernelTemplate) -> ShaderModule {
+    if let Some(tile) = lower_tile(t) {
+        return tile.into_module();
+    }
     match *t {
-        KernelTemplate::Pointwise { ref dag, grid } => lower_pointwise(dag, grid),
+        KernelTemplate::Attention {
+            mask,
+            head_dim,
+            output_lse,
+        } => lower_attention(mask, head_dim, output_lse),
+        _ => unreachable!("tile templates were lowered above"),
+    }
+}
+
+/// Keep cooperative bodies independent of how logical tiles are dispatched.
+pub(crate) fn lower_tile(t: &KernelTemplate) -> Option<TileKernel> {
+    match *t {
+        KernelTemplate::Pointwise { ref dag, grid } => {
+            Some(lower_pointwise_tile(dag, grid, PointwiseStorage::default()))
+        }
         KernelTemplate::Reduction {
             op,
             ref prologue,
@@ -620,7 +653,7 @@ pub fn lower(t: &KernelTemplate) -> ShaderModule {
             ref input_row_repeats,
             rows_per_workgroup,
             grid,
-        } => lower_reduction(
+        } => Some(lower_reduction(
             op,
             prologue,
             extra_prologues,
@@ -631,12 +664,8 @@ pub fn lower(t: &KernelTemplate) -> ShaderModule {
             input_row_repeats,
             rows_per_workgroup,
             grid,
-        ),
-        KernelTemplate::Attention {
-            mask,
-            head_dim,
-            output_lse,
-        } => lower_attention(mask, head_dim, output_lse),
+        )),
+        KernelTemplate::Attention { .. } => None,
     }
 }
 
@@ -648,15 +677,19 @@ pub struct PointwiseStorage {
     pub bf16_output: bool,
 }
 
-fn lower_pointwise(dag: &PointwiseDAG, grid: GridShape) -> ShaderModule {
-    lower_pointwise_storage(dag, grid, PointwiseStorage::default())
-}
-
 pub fn lower_pointwise_storage(
     dag: &PointwiseDAG,
     grid: GridShape,
     storage: PointwiseStorage,
 ) -> ShaderModule {
+    lower_pointwise_tile(dag, grid, storage).into_module()
+}
+
+pub(crate) fn lower_pointwise_tile(
+    dag: &PointwiseDAG,
+    grid: GridShape,
+    storage: PointwiseStorage,
+) -> TileKernel {
     assert_eq!(storage.bf16_inputs >> dag.n_inputs, 0);
     assert!(
         dag.n_inputs >= 1,
@@ -688,13 +721,12 @@ pub fn lower_pointwise_storage(
     let ty = if storage.bf16_output { "bf16" } else { "f32" };
     let _ = writeln!(src, "var<storage, read_write> dst: array<{ty}>;");
     src.push_str("var<uniform> params: Params;\n\n");
-    let _ = writeln!(src, "@compute @workgroup_size({})", grid.workgroup_size);
+    src.push_str("fn execute_tile(wgid: vec3<u32>, lid: vec3<u32>) {\n");
     let _ = writeln!(
         src,
-        "fn {}(@builtin(global_invocation_id) gid: vec3<u32>) {{",
-        POINTWISE_ENTRY
+        "    let i = wgid.x * {}u + lid.x;",
+        grid.workgroup_size
     );
-    src.push_str("    let i = gid.x;\n");
     src.push_str("    if i >= params.len { return; }\n");
     let load = |idx: u8, index: String| {
         let value = format!("{}[{index}]", input_names[idx as usize]);
@@ -715,7 +747,11 @@ pub fn lower_pointwise_storage(
     }
     src.push_str("}\n");
 
-    ShaderModule::with_hint(src, "pointwise")
+    TileKernel {
+        source: src,
+        workgroup_size: grid.workgroup_size,
+        hint: "pointwise",
+    }
 }
 
 fn lower_reduction(
@@ -729,7 +765,7 @@ fn lower_reduction(
     input_row_repeats: &[u32],
     rows_per_workgroup: u32,
     grid: GridShape,
-) -> ShaderModule {
+) -> TileKernel {
     assert!(
         n_per_elem >= 1,
         "reduction must have at least one per-element input stream"
@@ -874,12 +910,7 @@ fn lower_reduction(
         let _ = writeln!(src, "var<workgroup> wg_data_{k}: array<f32, {wg}>;");
     }
     src.push('\n');
-    let _ = writeln!(src, "@compute @workgroup_size({})", wg);
-    let _ = writeln!(
-        src,
-        "fn {}(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{",
-        REDUCTION_ENTRY
-    );
+    src.push_str("fn execute_tile(wgid: vec3<u32>, lid: vec3<u32>) {\n");
     src.push_str("    let tid = lid.x;\n");
     let _ = writeln!(src, "    let row_slot = tid / {}u;", lanes_per_row);
     let _ = writeln!(src, "    let lane = tid % {}u;", lanes_per_row);
@@ -997,7 +1028,11 @@ fn lower_reduction(
     }
     src.push_str("}\n");
 
-    ShaderModule::with_hint(src, "reduction")
+    TileKernel {
+        source: src,
+        workgroup_size: wg,
+        hint: "reduction",
+    }
 }
 
 /// Binding names for per-row broadcast inputs used by the reduction

@@ -9,6 +9,16 @@ Implementation is delivered in separate testable commits. The standalone
 prototype is the baseline; subsequent commits update the milestone checklist
 only when the corresponding implementation and checks are present.
 
+Implementation evidence:
+
+- `d94fce7`: committed the standalone prototype and this integration plan.
+- Shared tile-body refactor: ordinary pointwise and reduction entry points
+  now call reusable bodies with explicit logical workgroup IDs. Persistent
+  entry points follow in the Session integration. The kernel memo revision
+  was bumped. Validation: 27 schedule unit tests and all 167 oracle tests
+  passed on NVIDIA with Vulkan synchronization validation; library Clippy
+  passed with all features.
+
 The objective is to run Meganeura graphs through persistent GPU workers using
 the ordinary `Graph` / `build` / `Session` interface, and qualify them with the
 same correctness and performance machinery as ordinary execution. Coverage
