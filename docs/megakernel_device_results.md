@@ -322,3 +322,89 @@ under `target/megakernel-results/`, outside Git:
 | `lifetime-reuse-smolvla-paired.json` | `2fcd70d24dad2be2c4904f1d516cbdb7df02281cd089e8808cd20b78c409e940` |
 | `lifetime-reuse-ci-diagnostic.json` | `c3dce1c31373e18e236761223d8d23c3468b2bec2f7b0ba70eeea4b667931efc` |
 | `lifetime-reuse-smolvla-diagnostic.json` | `8c7cf527e5fe5a484d83d839603a9219fc0710e5a095c873a7a9d8913d72c3ee` |
+
+## Persistent appended training phases
+
+Clean commit `d2c504d46abdb479adcb2255585257705ceea280` routes SGD,
+Adam/LaProp, clipping and accumulation through portable persistent tiles while
+preserving existing phase boundaries. The same RTX 5080, driver 595.91.07,
+Rust 1.98, Blade `5011dea` and Naga `f09d62e` were used on October 24, 2026.
+Both benchmark sets started with an idle GPU and ran sequentially without
+competing builds or GPU work. Primary measurements retain 64 workers, at least
+ten warmup pairs/one second, and 50 alternating pairs. The separate diagnostic
+runs retain ten pairs after at least five warmup pairs/500 ms. State restoration,
+arithmetic selection and application timing boundaries are unchanged.
+
+Every comparison is exact: outputs/losses, all gradients and updated parameters.
+Graph completion and appended queue claim counts pass outside timing; diagnostic
+worker histograms also sum to their logical task totals. **There is no graph or
+appended SGD fallback in these workloads.** Correctness qualification separately
+passes 168 oracle, 182 regression, 75 smoke and 22 GGUF tests with strict device
+selection on NVIDIA. Ordinary smoke passes 75 tests, library checks pass 663,
+and all eight focused Session checks pass on NVIDIA and lavapipe. The training
+fixture additionally compares Adam/LaProp moments, grouped norms and step counts
+through clipping and accumulation with both portable and native graph selection.
+Ignored counts remain eight library, 21 regression and two smoke tests.
+
+| Case | Ordinary median ms | Selected median ms | Median paired ratio | Ordinary/selected p95 ms | Total compute launches |
+|---|---:|---:|---:|---:|---:|
+| CI inference | 0.05209 | 0.05667 | 1.095 | 0.05787 / 0.06216 | 5 → 5 |
+| CI forward/backward | 0.06609 | 0.08506 | 1.289 | 0.07014 / 0.09113 | 18 → 13 |
+| CI forward/backward/SGD | 0.06807 | 0.08808 | 1.301 | 0.07416 / 0.09276 | 19 → 14 |
+| SmolVLA forward | 4.44990 | 8.48563 | 1.904 | 4.82673 / 8.84739 | 154 → 136 |
+| SmolVLA forward/backward/SGD | 15.16902 | 24.70617 | 1.615 | 79.08686 / 103.26147 | 527 → 367 |
+
+Unlike preceding tables, launch counts here include appended compute dispatches:
+one SGD dispatch in CI and four parameter-arena chunks in model training. Queue
+reset transfers are excluded. Graph launch counts remain 5/13 for CI and
+136/363 for model forward/training. All 5/18 and 154/523 source operations use
+persistent tiles. Model graph regions remain four native/132 portable forward
+and 15 native/348 portable training. Appended queues are portable singleton
+regions and retain one dispatch per original unit; these are not single-launch
+device-scheduled training steps.
+
+Model forward IQRs are 4.41774–4.51221 ms ordinary and 8.43154–8.79787 ms
+selected; paired-ratio IQR is 1.845–1.954. Training IQRs are 15.05451–15.50412
+and 24.44346–24.91345 ms, with paired-ratio IQR 1.415–1.654 and p95 8.339.
+All outliers and regressions remain in the raw records. Broader persistent
+coverage does not improve whole-step performance here; ordinary remains the
+default. Differences from earlier runs do not isolate the optimizer change's
+performance effect.
+
+| Case | Resident MiB ordinary → selected | Scheduler bytes | Construction ms ordinary / selected |
+|---|---:|---:|---:|
+| CI inference | 0.06995 → 0.07117 | 1,280 | 0.86 / 3.83 |
+| CI training | 0.13229 → 0.14474 | 13,056 | 8.13 / 112.74 |
+| SmolVLA forward | 563.42498 → 563.49138 | 69,632 | 77.95 / 162.15 |
+| SmolVLA training | 982.08075 → 982.42401 | 359,936 | 76.58 / 455.41 |
+
+Selected residency still equals ordinary residency plus scheduler storage.
+The appended queue reserves five slots per parameter pair, adding 6,400 bytes
+for CI training and 174,080 bytes for model training even before an optimizer is
+configured. Construction includes all six appended implementation families.
+These remain shared-context, ordinary-first observations with unmatched shader
+cache state, not matched cold-start comparisons.
+
+Diagnostic median GPU pass intervals, ordinary/selected in ms, are
+0.01325/0.01934, 0.02795/0.04787 and 0.03221/0.05389 for CI;
+3.47109/6.84723 forward and 14.37997/23.78346 training for SmolVLA. These are
+instrumented pass intervals, not individual handler timings. The CI SGD queue
+uses 15 active workers; all four model SGD queues use 64. Native model regions
+use 11–64 active workers forward and 12–64 training; portable graph regions use
+40–64 and 1–64 respectively. These counts do not measure hardware occupancy.
+Persistent executable register counts range from 16–125 forward and 16–172
+training; shared memory ranges from 16–33,552 and 16–42,000 bytes respectively.
+Implausible driver local-memory
+statistics remain raw and excluded from resource conclusions.
+
+The same reproduction commands apply. The paired harness now records actual
+appended implementation keys, worker geometry and separate worker histograms.
+All four files and matching logs remain under `target/megakernel-results/`,
+outside Git:
+
+| Record | SHA-256 |
+|---|---|
+| `appended-ci-paired.json` | `6f2eb28159bce3b15e4abd5d3af0afad7ae89c08e413057ce0b5e0cda6a91f60` |
+| `appended-smolvla-paired.json` | `efd9e053944fd598dc6d21bf7c345f72ac592eb543cdcff84a326be1048a1032` |
+| `appended-ci-diagnostic.json` | `76fc669cec82c9d62998d3e0cb31eff42b0b0cfeb4f922fa7be8c21c0dd98de1` |
+| `appended-smolvla-diagnostic.json` | `fe4984b4564d27881fc7c27c4d96205cddd90ac46bfc76bba88adb6f6ceeac80` |

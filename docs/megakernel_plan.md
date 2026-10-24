@@ -553,6 +553,18 @@ separate GPU optimizer call. General model-training checks now exercise GPU
 SGD; only the allocation-padding fixture's explicit CPU-update case selects an
 ordinary control. Metal GPU execution remains unqualified.
 
+At clean `d2c504d`, 50-pair CI and SmolVLA runs and separate ten-pair diagnostics
+remain exact, now with no graph or appended SGD fallback. Total compute launches
+including updates are 19→14 for CI training and 527→367 for model training;
+graph boundaries remain unchanged. Appended queue reservations add 6,400 and
+174,080 bytes respectively, and every recorded queue completes. Median paired
+ratios are 1.095/1.289/1.301 for CI and 1.904/1.615 for model forward/training.
+Ordinary remains the default. [Complete measurements](megakernel_device_results.md#persistent-appended-training-phases)
+retain distributions, construction costs, memory, actual appended coverage,
+worker diagnostics and raw-file identities. This completes the planned
+integration and qualification on the declared Vulkan targets; it does not claim
+single-launch execution of every graph, Metal GPU qualification or a speedup.
+
 The device queue uses the same Session work descriptors, tracking ready tasks,
 predecessor counts, unfinished work and successor edges on the GPU. It releases
 consumers after whole-operation completion; measure whether tile-level
