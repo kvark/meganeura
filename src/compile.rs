@@ -850,6 +850,47 @@ impl ShaderEntry {
 }
 
 impl Dispatch {
+    /// Logical reads, including fused operands and preserved output contents.
+    /// Runtime-appended optimizer work has its own binding contract.
+    pub fn read_buffers(&self) -> impl Iterator<Item = BufferRef> + '_ {
+        self.input_buffers
+            .iter()
+            .copied()
+            .chain(
+                self.matmul_epilogue
+                    .iter()
+                    .flat_map(|epilogue| epilogue.inputs.iter().map(|entry| entry.0)),
+            )
+            .chain(
+                self.matmul_prologue
+                    .iter()
+                    .flat_map(|prologue| prologue.factors.iter().map(|entry| entry.0)),
+            )
+            .chain(self.gemv_rmsnorm.iter().map(|norm| norm.weight))
+            .chain(
+                matches!(
+                    self.shader,
+                    ShaderEntry::ScatterAdd
+                        | ShaderEntry::ScatterAddAtomic
+                        | ShaderEntry::CacheWrite
+                        | ShaderEntry::CacheWritePrefix
+                )
+                .then_some(self.output_buffer),
+            )
+    }
+
+    /// Primary and additional logical outputs of the dispatch.
+    pub fn written_buffers(&self) -> impl Iterator<Item = BufferRef> + '_ {
+        std::iter::once(self.output_buffer).chain(self.extra_outputs.iter().copied())
+    }
+
+    fn conflicts_with(&self, read: &HashSet<BufferRef>, written: &HashSet<BufferRef>) -> bool {
+        self.read_buffers().any(|buffer| written.contains(&buffer))
+            || self
+                .written_buffers()
+                .any(|buffer| read.contains(&buffer) || written.contains(&buffer))
+    }
+
     /// Coarse workload family for this concrete dispatch.
     ///
     /// Generated schedule kernels retain a legacy `shader` entry for binding
@@ -1003,21 +1044,32 @@ fn reorder_by_level(dispatches: &mut Vec<Dispatch>) {
     if n == 0 {
         return;
     }
-    // Map: buffer id → index of the dispatch that writes it.
-    let mut producer: HashMap<u32, usize> = HashMap::new();
+    let mut writers = HashMap::<BufferRef, u32>::new();
+    let mut readers = HashMap::<BufferRef, u32>::new();
     let mut levels = vec![0u32; n];
     for (i, dispatch) in dispatches.iter().enumerate() {
         let level = dispatch
-            .input_buffers
-            .iter()
-            .filter_map(|b| producer.get(&b.0))
-            .map(|&pred| levels[pred] + 1)
+            .read_buffers()
+            .filter_map(|buffer| writers.get(&buffer).copied())
+            .chain(dispatch.written_buffers().flat_map(|buffer| {
+                writers
+                    .get(&buffer)
+                    .copied()
+                    .into_iter()
+                    .chain(readers.get(&buffer).copied())
+            }))
             .max()
-            .unwrap_or(0);
+            .map_or(0, |previous| previous + 1);
         levels[i] = level;
-        producer.insert(dispatch.output_buffer.0, i);
-        for &extra in &dispatch.extra_outputs {
-            producer.insert(extra.0, i);
+        for buffer in dispatch.read_buffers() {
+            readers
+                .entry(buffer)
+                .and_modify(|previous| *previous = (*previous).max(level))
+                .or_insert(level);
+        }
+        for buffer in dispatch.written_buffers() {
+            writers.insert(buffer, level);
+            readers.remove(&buffer);
         }
     }
     // Stable sort by level keeps topological order within a level.
@@ -1027,21 +1079,21 @@ fn reorder_by_level(dispatches: &mut Vec<Dispatch>) {
     *dispatches = order.iter().map(|&i| old[i].clone()).collect();
 }
 
-/// Start a new compute pass when a dispatch reads an earlier write.
+/// Start a new group at any read/write, write/read or write/write hazard.
 fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
     let mut groups = Vec::new();
-    let mut dirty = HashSet::<u32>::new();
+    let mut written = HashSet::new();
+    let mut read = HashSet::new();
     let mut start = 0;
     for (i, dispatch) in dispatches.iter().enumerate() {
-        if dispatch.input_buffers.iter().any(|b| dirty.contains(&b.0)) {
+        if dispatch.conflicts_with(&read, &written) {
             groups.push(start..i);
             start = i;
-            dirty.clear();
+            written.clear();
+            read.clear();
         }
-        dirty.insert(dispatch.output_buffer.0);
-        for &extra in &dispatch.extra_outputs {
-            dirty.insert(extra.0);
-        }
+        written.extend(dispatch.written_buffers());
+        read.extend(dispatch.read_buffers());
     }
     if !dispatches.is_empty() {
         groups.push(start..dispatches.len());
@@ -1052,23 +1104,18 @@ fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
 /// Diagnose missing barriers after horizontal fusion.
 fn warn_on_hazards(dispatches: &[Dispatch], groups: &[std::ops::Range<usize>]) {
     for group in groups {
-        let mut written = HashSet::<u32>::new();
+        let mut written = HashSet::new();
+        let mut read = HashSet::new();
         for i in group.clone() {
             let d = &dispatches[i];
-            for ib in &d.input_buffers {
-                if written.contains(&ib.0) {
-                    log::warn!(
-                        "RAW hazard in group: dispatch {} ({:?}) reads buf {} written earlier in same group",
-                        i,
-                        d.shader,
-                        ib.0
-                    );
-                }
+            if d.conflicts_with(&read, &written) {
+                log::warn!(
+                    "unordered buffer access in group: dispatch {i} ({:?})",
+                    d.shader
+                );
             }
-            written.insert(d.output_buffer.0);
-            for &extra in &d.extra_outputs {
-                written.insert(extra.0);
-            }
+            written.extend(d.written_buffers());
+            read.extend(d.read_buffers());
         }
     }
 }
@@ -4072,6 +4119,128 @@ mod tests {
         assert_eq!(dispatches[0].extra_outputs.len(), 2);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0], 0..1);
+    }
+
+    #[test]
+    fn scheduling_orders_reads_writes_and_fused_operands() {
+        let operation = |origin, inputs: &[u32], output| Dispatch {
+            origin: vec![origin],
+            input_buffers: inputs.iter().copied().map(BufferRef).collect(),
+            output_buffer: BufferRef(output),
+            ..Default::default()
+        };
+        // The live-in read of 0 must finish before the later write to 0,
+        // even though that write has no read-after-write predecessor.
+        let mut dispatches = vec![
+            operation(0, &[2], 3),
+            operation(1, &[3, 0], 4),
+            operation(2, &[5], 0),
+        ];
+        reorder_by_level(&mut dispatches);
+        assert_eq!(
+            dispatches.iter().map(|d| d.origin[0]).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert_eq!(compute_groups(&dispatches), [0..1, 1..2, 2..3]);
+        assert_eq!(
+            compute_groups(&[operation(0, &[2], 0), operation(1, &[3], 0)]),
+            [0..1, 1..2]
+        );
+        let independent = compute_groups(&[operation(0, &[2], 0), operation(1, &[2], 1)]);
+        assert_eq!(independent.len(), 1);
+        assert_eq!(independent[0], 0..2);
+
+        for field in 0..3 {
+            let mut consumer = operation(1, &[0], 1);
+            match field {
+                0 => {
+                    consumer.matmul_prologue = Some(MatMulPrologue {
+                        factors: vec![(BufferRef(3), PrologueLoadKind::PerRow)],
+                    })
+                }
+                1 => {
+                    consumer.matmul_epilogue = Some(MatMulEpilogue {
+                        dag: PointwiseDAG {
+                            n_inputs: 2,
+                            ops: vec![Pw::LoadInput(1)],
+                            output: 0,
+                        },
+                        inputs: vec![(BufferRef(3), EpilogueLoadKind::PerElement)],
+                    })
+                }
+                _ => {
+                    consumer.gemv_rmsnorm = Some(GemvRmsNorm {
+                        weight: BufferRef(3),
+                        eps_bits: 0,
+                    })
+                }
+            }
+            let mut producer = operation(0, &[4], 2);
+            producer.extra_outputs.push(BufferRef(3));
+            let mut dispatches = vec![producer, consumer, operation(2, &[4], 3)];
+            reorder_by_level(&mut dispatches);
+            assert_eq!(
+                dispatches.iter().map(|d| d.origin[0]).collect::<Vec<_>>(),
+                [0, 1, 2]
+            );
+            assert_eq!(compute_groups(&dispatches), [0..1, 1..2, 2..3]);
+        }
+        for shader in [
+            ShaderEntry::ScatterAdd,
+            ShaderEntry::ScatterAddAtomic,
+            ShaderEntry::CacheWrite,
+            ShaderEntry::CacheWritePrefix,
+        ] {
+            let mut dispatch = operation(0, &[1], 2);
+            dispatch.shader = shader;
+            assert!(dispatch.read_buffers().any(|buffer| buffer == BufferRef(2)));
+        }
+
+        // Compare sequential execution with reordered barrier groups whose
+        // independent members finish in the opposite order. Values include
+        // live-ins, repeated writes and additional outputs.
+        let execute = |dispatches: &[Dispatch]| {
+            let mut memory = std::array::from_fn::<u64, 8, _>(|i| i as u64);
+            for dispatch in dispatches {
+                let value = dispatch
+                    .input_buffers
+                    .iter()
+                    .fold(u64::from(dispatch.origin[0]) + 1, |value, buffer| {
+                        value.wrapping_add(memory[buffer.0 as usize])
+                    });
+                memory[dispatch.output_buffer.0 as usize] = value;
+                for buffer in &dispatch.extra_outputs {
+                    memory[buffer.0 as usize] = value.wrapping_add(1);
+                }
+            }
+            memory
+        };
+        for seed in 1u64..=128 {
+            let mut bits = seed;
+            let mut buffer = || {
+                bits ^= bits << 13;
+                bits ^= bits >> 7;
+                bits ^= bits << 17;
+                (bits % 8) as u32
+            };
+            let mut dispatches: Vec<_> = (0..32)
+                .map(|i| {
+                    let mut dispatch = operation(i, &[buffer(), buffer()], buffer());
+                    if i % 3 == 0 {
+                        dispatch
+                            .extra_outputs
+                            .push(BufferRef((dispatch.output_buffer.0 + 1) % 8));
+                    }
+                    dispatch
+                })
+                .collect();
+            let expected = execute(&dispatches);
+            reorder_by_level(&mut dispatches);
+            for group in compute_groups(&dispatches) {
+                dispatches[group].reverse();
+            }
+            assert_eq!(execute(&dispatches), expected, "seed {seed}");
+        }
     }
 
     fn mm_dispatch(a: u32, b: u32, c: u32, wgz: u32, n: u32) -> Dispatch {

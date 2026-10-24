@@ -570,31 +570,17 @@ fn compute_pinned(
     let mut uses = vec![BufferUse::default(); n];
     for (i, d) in plan.dispatches.iter().enumerate() {
         let g = group_of[i];
-        for b in &d.input_buffers {
+        for b in d.read_buffers() {
             uses[b.0 as usize].read(g);
         }
-        if let Some(epi) = d.matmul_epilogue.as_ref() {
-            for &(b, _) in &epi.inputs {
-                uses[b.0 as usize].read(g);
-            }
-        }
-        if let Some(pro) = d.matmul_prologue.as_ref() {
-            for &(b, _) in &pro.factors {
-                uses[b.0 as usize].read(g);
-            }
-        }
-        uses[d.output_buffer.0 as usize].write(g);
-        for b in &d.extra_outputs {
+        for b in d.written_buffers() {
             uses[b.0 as usize].write(g);
         }
-        match d.shader {
-            // KV caches persist across steps.
-            ShaderEntry::CacheWrite => pinned[d.output_buffer.0 as usize] = true,
-            // Read-modify-write accumulation into the output.
-            ShaderEntry::ScatterAdd | ShaderEntry::ScatterAddAtomic => {
-                uses[d.output_buffer.0 as usize].read(g);
-            }
-            _ => {}
+        if matches!(
+            d.shader,
+            ShaderEntry::CacheWrite | ShaderEntry::CacheWritePrefix
+        ) {
+            pinned[d.output_buffer.0 as usize] = true;
         }
     }
     // Keep an attention operation's external bindings live across its whole

@@ -77,6 +77,54 @@ fn session_persistent_tiles_use_normal_graph_storage_and_reset() {
             }
         }
     }
+
+    // Explicit in-place storage is separate from lifetime allocation reuse.
+    // Keep the intermediate as a graph output so compilation retains both ops.
+    let mut graph = meganeura::Graph::new();
+    let input = graph.input("x", &[513]);
+    let mapped = graph.relu(input);
+    let output = graph.neg(mapped);
+    graph.set_outputs(vec![mapped, output]);
+    let mut plan = meganeura::compile::compile_with(
+        &graph,
+        &meganeura::CompileOptions {
+            fuse_dispatches: false,
+            ..Default::default()
+        },
+    );
+    assert_eq!(plan.dispatches.len(), 2);
+    let input_buffer = plan.input_buffers[0].1;
+    let intermediate = plan.dispatches[0].output_buffer;
+    plan.dispatches[0].output_buffer = input_buffer;
+    assert_eq!(plan.dispatches[1].input_buffers[0], intermediate);
+    plan.dispatches[1].input_buffers[0] = input_buffer;
+    plan.output_buffers[0] = input_buffer;
+    plan.node_buffers[mapped as usize].1 = input_buffer;
+    for workers in [1, 64] {
+        let mut options = meganeura::SessionOptions::from_env();
+        options.persistent = Some(meganeura::PersistentOptions {
+            workers,
+            allow_fallback: false,
+        });
+        let mut session = meganeura::Session::with_context_opts(plan.clone(), gpu.clone(), options);
+        let input: Vec<_> = (0..513).map(|i| (i % 17) as f32 - 8.0).collect();
+        session.set_input("x", &input);
+        session.step();
+        session.wait();
+        let mut mapped = vec![f32::NAN; 513];
+        session.read_output_by_index(0, &mut mapped);
+        let mut output = vec![f32::NAN; 513];
+        session.read_output_by_index(1, &mut output);
+        assert_eq!(mapped, input.iter().map(|x| x.max(0.0)).collect::<Vec<_>>());
+        assert_eq!(output, mapped.iter().map(|x| -x).collect::<Vec<_>>());
+        assert!(
+            session
+                .execution_report()
+                .regions
+                .iter()
+                .all(|region| region.workers == workers)
+        );
+    }
 }
 
 #[test]

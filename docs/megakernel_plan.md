@@ -50,6 +50,14 @@ Implementation evidence:
   tests include Naga validation of two independently namespaced bodies in one
   module; focused strict Session checks still pass. Region planning and launch
   reduction remain the next step.
+- Access scheduling now orders RAW, WAR and WAW hazards, including fused
+  operands, additional outputs and preserved partial outputs. Lifetime pinning
+  uses the same access metadata. A deterministic randomized schedule check
+  compares reordered execution with sequential execution over mutable buffers;
+  the GPU check covers explicit in-place pointwise storage with 1/64 workers.
+  All 506 unit tests passed (seven ignored). Ordinary and persistent runs each
+  passed 168 oracle, 182 regression, 68 smoke and 22 GGUF tests on NVIDIA with
+  Vulkan synchronization validation; all-target/all-feature Clippy passed.
 
 The objective is to run Meganeura graphs through persistent GPU workers using
 the ordinary `Graph` / `build` / `Session` interface, and qualify them with the
