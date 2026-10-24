@@ -1,5 +1,27 @@
 use meganeura::megakernel::{Execution, Executor, Instruction, Job, Options};
 
+fn check_worker_tasks(session: &mut meganeura::Session) {
+    let report = session.execution_report();
+    let enabled = report
+        .persistent
+        .is_some_and(|options| options.track_workers)
+        && report.regions.iter().any(|region| region.workers != 0);
+    let rows = session.read_persistent_worker_tasks();
+    assert_eq!(rows.is_some(), enabled);
+    if let Some(rows) = rows {
+        assert_eq!(rows.len(), report.regions.len());
+        for (row, region) in rows.iter().zip(&report.regions) {
+            assert_eq!(row.len(), region.workers as usize);
+            if region.workers != 0 {
+                assert_eq!(
+                    row.iter().map(|&count| u64::from(count)).sum::<u64>(),
+                    region.logical_tasks
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn session_persistent_tiles_use_normal_graph_storage_and_reset() {
     let gpu = crate::support::gpu::gpu();
@@ -16,6 +38,7 @@ fn session_persistent_tiles_use_normal_graph_storage_and_reset() {
         config.runtime.poison = true;
         config.runtime.persistent = Some(meganeura::PersistentOptions {
             workers,
+            track_workers: workers == 3,
             allow_fallback: false,
         });
         let mut session = meganeura::build(&graph, config).0;
@@ -48,10 +71,12 @@ fn session_persistent_tiles_use_normal_graph_storage_and_reset() {
                 session.set_submission_chunks(3);
                 session.step();
                 session.wait();
+                check_worker_tasks(&mut session);
             } else if iteration == 1 {
                 session.set_profiling(true);
                 session.step();
                 session.wait();
+                check_worker_tasks(&mut session);
                 session.set_profiling(false);
             } else {
                 let mut encoder = gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
@@ -65,6 +90,7 @@ fn session_persistent_tiles_use_normal_graph_storage_and_reset() {
                 let sync = gpu.submit(&mut encoder);
                 session.track_submission(sync);
                 session.wait();
+                check_worker_tasks(&mut session);
                 gpu.destroy_command_encoder(&mut encoder);
             }
             let mut actual = vec![f32::NAN; input.len()];
@@ -110,6 +136,7 @@ fn session_persistent_tiles_use_normal_graph_storage_and_reset() {
         let mut options = meganeura::SessionOptions::from_env();
         options.persistent = Some(meganeura::PersistentOptions {
             workers,
+            track_workers: workers == 3,
             allow_fallback: false,
         });
         let mut session = meganeura::Session::with_context_opts(plan.clone(), gpu.clone(), options);
@@ -117,6 +144,7 @@ fn session_persistent_tiles_use_normal_graph_storage_and_reset() {
         session.set_input("x", &input);
         session.step();
         session.wait();
+        check_worker_tasks(&mut session);
         let mut mapped = vec![f32::NAN; 513];
         session.read_output_by_index(0, &mut mapped);
         let mut output = vec![f32::NAN; 513];
@@ -152,6 +180,7 @@ fn session_persistent_regions_combine_independent_ragged_tasks() {
         config.options.fuse_dispatches = false;
         config.runtime.persistent = Some(meganeura::PersistentOptions {
             workers,
+            track_workers: workers == 3,
             allow_fallback: false,
         });
         let mut session = meganeura::build(&graph, config).0;
@@ -201,6 +230,7 @@ fn session_persistent_regions_combine_independent_ragged_tasks() {
             if replay < 2 {
                 session.step();
                 session.wait();
+                check_worker_tasks(&mut session);
             } else {
                 let mut encoder = gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
                     name: "merged region replay",
@@ -213,6 +243,7 @@ fn session_persistent_regions_combine_independent_ragged_tasks() {
                 let sync = gpu.submit(&mut encoder);
                 session.track_submission(sync);
                 session.wait();
+                check_worker_tasks(&mut session);
                 gpu.destroy_command_encoder(&mut encoder);
             }
             for (index, input) in inputs.iter().enumerate() {
@@ -250,6 +281,7 @@ fn session_persistent_regions_combine_independent_ragged_tasks() {
         config.options.fuse_dispatches = false;
         config.runtime.persistent = Some(meganeura::PersistentOptions {
             workers: 3,
+            track_workers: true,
             allow_fallback: false,
         });
         config
@@ -271,6 +303,7 @@ fn session_persistent_regions_combine_independent_ragged_tasks() {
         }
         session.step();
         session.wait();
+        check_worker_tasks(&mut session);
         for (index, shape) in shapes.iter().enumerate() {
             let mut output = vec![f32::NAN; shape[0]];
             session.read_output_by_index(index, &mut output);
@@ -295,6 +328,7 @@ fn session_persistent_regions_combine_independent_ragged_tasks() {
     session.set_input("x", &input);
     session.step();
     session.wait();
+    check_worker_tasks(&mut session);
     let mut output = vec![f32::NAN; input.len()];
     session.read_output_by_index(2, &mut output);
     assert_eq!(
@@ -312,8 +346,10 @@ fn session_persistent_regions_combine_independent_ragged_tasks() {
     assert_eq!(session.execution_report().persistent_tasks, 0);
     session.step();
     session.wait();
+    check_worker_tasks(&mut session);
     session.step();
     session.wait();
+    check_worker_tasks(&mut session);
     // Rebinding can introduce a physical dependency between distinct logical
     // parameters. The queue must be rebuilt before those tasks execute.
     let mut source_graph = meganeura::Graph::new();
@@ -348,6 +384,7 @@ fn session_persistent_regions_combine_independent_ragged_tasks() {
         let mut options = meganeura::SessionOptions::from_env();
         options.persistent = Some(meganeura::PersistentOptions {
             workers,
+            track_workers: workers == 3,
             allow_fallback: false,
         });
         let mut session = meganeura::Session::with_context_opts(plan.clone(), gpu.clone(), options);
@@ -359,6 +396,7 @@ fn session_persistent_regions_combine_independent_ragged_tasks() {
         source.set_parameter("a", &input);
         session.step();
         session.wait();
+        check_worker_tasks(&mut session);
         let mut output = vec![f32::NAN; input.len()];
         session.read_output_by_index(1, &mut output);
         assert_eq!(
@@ -395,6 +433,7 @@ fn session_persistent_owned_chains_keep_tile_dependencies_local() {
         options.serial_dispatch = serial;
         options.persistent = Some(meganeura::PersistentOptions {
             workers,
+            track_workers: workers == 3,
             allow_fallback: false,
         });
         let mut session = meganeura::Session::with_context_opts(plan.clone(), gpu.clone(), options);
@@ -411,6 +450,7 @@ fn session_persistent_owned_chains_keep_tile_dependencies_local() {
             session.set_input("x", &input);
             session.step();
             session.wait();
+            check_worker_tasks(&mut session);
             for index in 0..8 {
                 let mut output = vec![f32::NAN; input.len()];
                 session.read_output_by_index(index, &mut output);
@@ -438,6 +478,7 @@ fn session_persistent_owned_chains_keep_tile_dependencies_local() {
     options.persistent = Some(meganeura::PersistentOptions {
         workers: 64,
         allow_fallback: false,
+        ..Default::default()
     });
     let mut session = meganeura::Session::with_context_opts(broadcast, gpu, options);
     let report = session.execution_report();
@@ -449,6 +490,7 @@ fn session_persistent_owned_chains_keep_tile_dependencies_local() {
         session.set_input("x", &input);
         session.step();
         session.wait();
+        check_worker_tasks(&mut session);
         let mut output = vec![f32::NAN; 513];
         session.read_output_by_index(7, &mut output);
         assert_eq!(output, vec![value; 513]);
@@ -469,6 +511,7 @@ fn session_persistent_fallback_is_explicit_and_strict_rejects_it() {
         config.options.fuse_dispatches = false;
         config.runtime.persistent = Some(meganeura::PersistentOptions {
             allow_fallback,
+            track_workers: true,
             ..Default::default()
         });
         config
@@ -486,6 +529,7 @@ fn session_persistent_fallback_is_explicit_and_strict_rejects_it() {
     session.set_parameter("w", &[2.0; 15]);
     session.step();
     session.wait();
+    check_worker_tasks(&mut session);
     assert_eq!(session.read_output(10), vec![6.0; 10]);
     let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         meganeura::build(&graph, config(false))
@@ -505,6 +549,7 @@ fn session_persistent_fallback_is_explicit_and_strict_rejects_it() {
     session.set_parameter("p", &[1.0]);
     session.step();
     session.wait();
+    check_worker_tasks(&mut session);
     session.set_learning_rate(0.1);
     assert_eq!(
         session.execution_report().appended_fallback,

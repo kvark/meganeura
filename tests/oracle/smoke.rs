@@ -131,6 +131,7 @@ fn persistent_execution_reports_actual_coverage() {
         Some(meganeura::PersistentOptions {
             workers: 3,
             allow_fallback: false,
+            ..Default::default()
         }),
     ] {
         let options = gpu::Options {

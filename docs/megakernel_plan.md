@@ -110,6 +110,14 @@ Implementation evidence:
   an Apple toolchain/SDK. Metal GPU execution is not qualified by these checks.
   All four focused Session tests passed on NVIDIA with the new pin, alongside
   all-target/all-feature Clippy. Naga is unchanged.
+- Optional `PersistentOptions::track_workers` counters now support diagnostic
+  utilization measurements. They are off by default, use the existing GPU
+  reset, and are included in scheduler residency/range checks. The readback API
+  waits for tracked work and returns one task-count row per execution region.
+  Repeated/chunked/external, empty, fallback, independent, chain and rebinding
+  checks verify histogram totals against actual logical tasks. All four
+  focused Session tests passed on NVIDIA and lavapipe; Clippy and docs passed.
+  Primary benchmark runs keep this instrumentation off.
 
 The objective is to run Meganeura graphs through persistent GPU workers using
 the ordinary `Graph` / `build` / `Session` interface, and qualify them with the

@@ -352,6 +352,7 @@ impl SessionOptions {
                 .map(|workers| crate::PersistentOptions {
                     workers,
                     allow_fallback: !PERSISTENT_STRICT.bool_or(false),
+                    ..Default::default()
                 }),
             coop,
             workgroup_matmul: None,

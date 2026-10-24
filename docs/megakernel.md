@@ -15,6 +15,7 @@ let mut config = meganeura::SessionConfig::from_env();
 config.runtime.persistent = Some(meganeura::PersistentOptions {
     workers: 64,
     allow_fallback: true,
+    ..Default::default()
 });
 let (mut session, _) = meganeura::build(&graph, config);
 let coverage = session.execution_report();
@@ -60,6 +61,12 @@ graph operations and execution of ordinary optimizer/accumulation passes.
 A queue task represents one tile or one matching tile through a chain;
 `worker_owned_chain` identifies the latter and the region retains all source
 operation indices.
+For a separate diagnostic run, `PersistentOptions::track_workers` enables
+per-worker task counters. After a completed step,
+`Session::read_persistent_worker_tasks()` downloads one row per region, with
+empty rows for ordinary fallback. The counts reset each step and sum to the
+region's logical tasks. This adds an atomic per claimed task and increases
+scheduler storage, so keep it disabled in primary latency comparisons.
 A passthrough graph can have zero tasks; qualification must assert nonzero
 persistent coverage for cases intended to exercise this path.
 

@@ -17,6 +17,8 @@ pub struct PersistentOptions {
     /// Permit explicitly reported ordinary dispatches and optimizer work.
     /// False rejects unsupported work instead of claiming persistent coverage.
     pub allow_fallback: bool,
+    /// Diagnostic per-worker task counters. Adds a queue atomic per claimed task.
+    pub track_workers: bool,
 }
 
 impl Default for PersistentOptions {
@@ -24,7 +26,19 @@ impl Default for PersistentOptions {
         Self {
             workers: 64,
             allow_fallback: true,
+            track_workers: false,
         }
+    }
+}
+
+impl PersistentOptions {
+    fn queue_stride(self) -> usize {
+        let bytes = if self.track_workers {
+            (self.workers as usize + 1) * 4
+        } else {
+            4
+        };
+        bytes.next_multiple_of(crate::memplan::ARENA_ALIGNMENT)
     }
 }
 
@@ -80,6 +94,7 @@ pub(super) struct State {
     params: Vec<Params>,
     dispatch_regions: Vec<usize>,
     queue: Option<bg::Buffer>,
+    queue_stride: usize,
     pub groups: Vec<std::ops::Range<usize>>,
 }
 
@@ -180,7 +195,7 @@ fn check_resources(
     buffers: &[bg::BufferPiece],
     dispatches: std::ops::Range<usize>,
     handlers: &[Handler],
-    workers: u32,
+    options: PersistentOptions,
     chain: bool,
 ) -> Result<u32, String> {
     let limits = caps
@@ -237,7 +252,7 @@ fn check_resources(
         ));
     }
     // Blade binds the remaining allocation, not an explicitly sized subrange.
-    if plan.dispatches.len() as u64 * crate::memplan::ARENA_ALIGNMENT as u64
+    if plan.dispatches.len() as u64 * options.queue_stride() as u64
         > limits.max_storage_buffer_range
     {
         return Err("queue allocation exceeds device storage-buffer range".into());
@@ -247,7 +262,7 @@ fn check_resources(
     }
     u32::try_from(tasks)
         .ok()
-        .filter(|count| count.checked_add(workers).is_some())
+        .filter(|count| count.checked_add(options.workers).is_some())
         .ok_or_else(|| "queue counter would overflow u32".to_string())
 }
 
@@ -308,6 +323,7 @@ impl State {
             "persistent workers must be in 1..=65535"
         );
         let caps = gpu.capabilities();
+        let queue_stride = options.queue_stride();
         let mut pipelines = Vec::new();
         let mut params = Vec::new();
         let mut keys = Vec::new();
@@ -345,7 +361,7 @@ impl State {
                     buffers,
                     index..index + 1,
                     std::slice::from_ref(&handler),
-                    options.workers,
+                    options,
                     false,
                 )?;
                 Ok(handler)
@@ -407,7 +423,7 @@ impl State {
                             buffers,
                             start..index + 1,
                             &handlers,
-                            options.workers,
+                            options,
                             chain,
                         )
                         .is_err()
@@ -476,7 +492,15 @@ impl State {
                     source.push_str(
                         &include_str!("../shaders/persistent_tile.wgsl")
                             .replace("$WORKGROUP", &workgroup_size.to_string())
-                            .replace("$HANDLERS", &calls),
+                            .replace("$HANDLERS", &calls)
+                            .replace(
+                                "$TRACK_WORKERS",
+                                if options.track_workers {
+                                    "true"
+                                } else {
+                                    "false"
+                                },
+                            ),
                     );
                     let module = crate::codegen::ShaderModule::with_hint(source, "persistent");
                     if let Some(dir) = dump_dir {
@@ -527,7 +551,7 @@ impl State {
         }
         report.graph_dispatches = report.regions.len();
         let queue = if pipelines.iter().any(Option::is_some) {
-            report.scheduler_bytes = report.regions.len() * crate::memplan::ARENA_ALIGNMENT;
+            report.scheduler_bytes = report.regions.len() * queue_stride;
             super::ensure_device_memory_budget(gpu, report.scheduler_bytes, "persistent queues");
             Some(gpu.create_buffer(bg::BufferDesc {
                 name: "persistent queues",
@@ -557,6 +581,7 @@ impl State {
             params,
             dispatch_regions,
             queue,
+            queue_stride,
             groups,
         }
     }
@@ -597,10 +622,7 @@ impl State {
         pc.bind(
             region.dispatches.len() as u32,
             &QueueData {
-                persistent_queue: self
-                    .queue
-                    .unwrap()
-                    .at((index * crate::memplan::ARENA_ALIGNMENT) as u64),
+                persistent_queue: self.queue.unwrap().at((index * self.queue_stride) as u64),
                 persistent_params: self.params[index],
             },
         );
@@ -657,6 +679,42 @@ impl Session {
                 self.pipelines.dump_dir.as_deref(),
             ));
         }
+    }
+
+    /// Per-worker queue tasks from the most recently completed step, grouped
+    /// by execution region. Ordinary regions have empty rows. Returns `None`
+    /// when `PersistentOptions::track_workers` is off or no persistent work
+    /// is selected. A task is a tile or a tile through a worker-owned chain.
+    ///
+    /// Call after executing a step. External records must first be submitted
+    /// and registered with [`Session::track_submission`]. This waits for tracked
+    /// work and downloads counters; use it outside performance measurements.
+    pub fn read_persistent_worker_tasks(&mut self) -> Option<Vec<Vec<u32>>> {
+        self.wait();
+        let state = self.persistent.as_ref()?;
+        if !state.options.track_workers {
+            return None;
+        }
+        let queue = state.queue?;
+        let mut words = vec![0u32; state.report.scheduler_bytes / 4];
+        // The staging helper copies raw words without floating-point operations.
+        self.read_staged_f32(
+            queue.at(0),
+            bytemuck::cast_slice_mut(&mut words),
+            &mut self.readback.borrow_mut(),
+        );
+        Some(
+            state
+                .report
+                .regions
+                .iter()
+                .enumerate()
+                .map(|(index, region)| {
+                    let start = index * state.queue_stride / 4 + 1;
+                    words[start..start + region.workers as usize].to_vec()
+                })
+                .collect(),
+        )
     }
 
     /// Report actual selected graph paths and configured appended work.

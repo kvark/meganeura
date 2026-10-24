@@ -370,6 +370,7 @@ fn a_plan_within_the_budget_is_captured_in_one_replay() {
     config.runtime.persistent = Some(meganeura::PersistentOptions {
         workers: 3,
         allow_fallback: false,
+        ..Default::default()
     });
     let mut merged = meganeura::build(&graph, config).0;
     assert_eq!(merged.plan().dispatches.len(), 5);
