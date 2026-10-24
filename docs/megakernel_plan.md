@@ -5,8 +5,9 @@ then proceeds to the **Naga investigation in Milestone 2**. The existing
 [prototype and measurements](megakernel.md) are the starting evidence.
 Milestone 1 is complete with explicit fallback and measured regressions.
 Milestone 2 qualifies the existing fence interface on Vulkan. Session device
-scheduling now covers compatible regions of selected kernels; optimizer
-integration remains.
+scheduling covers compatible regions of selected kernels. Appended optimizer,
+clipping and accumulation phases use portable persistent queues with their
+existing dispatch and submission boundaries.
 
 Implementation is delivered in separate testable commits. The standalone
 prototype is the baseline; subsequent commits update the milestone checklist
@@ -520,6 +521,38 @@ CI and SmolVLA paired checks have exact numerical results and identical physical
 pipeline keys, implementation keys and execution reports to `23642ba`. This
 preparation does not yet change appended optimizer coverage.
 
+Appended runtime work now uses that shared compiler and the exact ordinary
+SGD, Adam/LaProp, global/adaptive clipping and accumulation implementations.
+Each existing dispatch becomes a portable singleton queue; phase barriers,
+parameter-arena chunks, bindings and the accumulation submit/wait boundary are
+preserved. Up to five queue slots per parameter pair retain separate completion
+counters and optional worker histograms for every dispatch in the last recorded
+step. Reset touches scheduler storage only. Explicit GPU optimizer calls reset
+their queues without erasing graph completion state. Conversion/resource
+failures are reported, and strict execution rejects them before graph/update
+work. The explicitly requested CPU SGD helper remains outside strict scope.
+
+`execution_report().appended` records actual runtime labels, implementation and
+physical pipeline keys, logical grids and worker geometry, separately from
+graph regions and configured fallback. The paired harness checks matching
+ordinary/selected appended arithmetic and geometry, completion and worker
+totals outside the measured interval. Appended phases report no native device
+scheduling and do not reduce physical launch counts.
+
+On NVIDIA with synchronization validation, strict device selection passes all
+168 oracle, 182 regression, 75 smoke and 22 GGUF tests (21 regression and two
+smoke tests ignored). Ordinary smoke also passes 75 tests. All 663 library
+checks pass (eight ignored), as do strict all-target/all-feature Clippy,
+formatting, documentation and core/models/GGUF/profiler Metal-target compilation.
+All eight focused Session checks pass on NVIDIA and lavapipe. The new training
+fixture compares exact parameters, gradients, Adam/LaProp moments, step counters
+and grouped norms across 1/3/64/4096 workers with both portable and native graph
+selection. It covers arena chunks, repeated external records, global/adaptive
+clipping, accumulation-only steps, accumulation followed by an update, and a
+separate GPU optimizer call. General model-training checks now exercise GPU
+SGD; only the allocation-padding fixture's explicit CPU-update case selects an
+ordinary control. Metal GPU execution remains unqualified.
+
 The device queue uses the same Session work descriptors, tracking ready tasks,
 predecessor counts, unfinished work and successor edges on the GPU. It releases
 consumers after whole-operation completion; measure whether tile-level
@@ -529,9 +562,9 @@ work can be executed instead.
 
 Selected-kernel conversion now covers the tested matrix products, attention,
 convolution, data movement, quantized/reduced storage and derivative paths.
-Remaining integration includes optimizer, clipping and accumulation work
-currently recorded outside `ExecutionPlan`. Reuse the Milestone 1 backend matrix
-and reports rather than building another application harness.
+Optimizer, clipping and accumulation work recorded outside `ExecutionPlan` now
+uses the same conversion, resource checks and pipeline compiler. Qualification
+continues through the Milestone 1 backend matrix and reports.
 
 Full graph coverage requires strict execution of all currently supported
 operator/dtype/state combinations on each claimed target, with remaining

@@ -121,12 +121,24 @@ fn metadata(session: &mut Session, construction_ms: f64) -> serde_json::Value {
     let memory = session.memory_summary();
     let execution = session.execution_report();
     let workers = session.read_persistent_worker_tasks();
+    let appended_workers = session.read_persistent_appended_worker_tasks();
     if let Some(ref rows) = workers {
         for (row, region) in rows.iter().zip(&execution.regions) {
             if region.workers != 0 {
                 assert_eq!(
                     row.iter().map(|&count| u64::from(count)).sum::<u64>(),
                     region.logical_tasks
+                );
+            }
+        }
+    }
+    if let Some(ref rows) = appended_workers {
+        assert_eq!(rows.len(), execution.appended.len());
+        for (row, dispatch) in rows.iter().zip(&execution.appended) {
+            if dispatch.workers != 0 {
+                assert_eq!(
+                    row.iter().map(|&count| u64::from(count)).sum::<u64>(),
+                    dispatch.logical_tasks
                 );
             }
         }
@@ -158,6 +170,7 @@ fn metadata(session: &mut Session, construction_ms: f64) -> serde_json::Value {
         "logical_buffer_bytes": memory.total_buffer_bytes, "allocated_buffer_bytes": memory.allocated_buffer_bytes,
         "resident_buffer_bytes": memory.total_allocated_bytes(), "scheduler_bytes": memory.scheduler_bytes,
         "worker_tasks_last_step": workers, "compiled_pipeline_statistics": statistics,
+        "appended_worker_tasks_last_step": appended_workers,
     })
 }
 
@@ -266,6 +279,16 @@ pub fn measure(
         .zip(&samples[1])
         .map(|(a, b)| b / a)
         .collect();
+    let ordinary_appended = ordinary.execution_report().appended;
+    let persistent_appended = persistent.execution_report().appended;
+    assert_eq!(ordinary_appended.len(), persistent_appended.len());
+    for (a, b) in ordinary_appended.iter().zip(&persistent_appended) {
+        assert_eq!(
+            (a.label, &a.implementation_key, a.workgroups),
+            (b.label, &b.implementation_key, b.workgroups),
+            "paired appended arithmetic and dispatch geometry must match"
+        );
+    }
     let command_output = |program: &str, arguments: &[&str]| {
         Command::new(program)
             .args(arguments)

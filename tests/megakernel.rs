@@ -21,6 +21,190 @@ fn check_worker_tasks(session: &mut meganeura::Session) {
             }
         }
     }
+    let appended = session.read_persistent_appended_worker_tasks();
+    assert_eq!(
+        appended.is_some(),
+        report
+            .persistent
+            .is_some_and(|options| options.track_workers)
+            && report.appended.iter().any(|row| row.workers != 0)
+    );
+    if let Some(rows) = appended {
+        assert_eq!(rows.len(), report.appended.len());
+        for (row, dispatch) in rows.iter().zip(&report.appended) {
+            assert_eq!(row.len(), dispatch.workers as usize);
+            assert_eq!(
+                row.iter().map(|&count| u64::from(count)).sum::<u64>(),
+                dispatch.logical_tasks
+            );
+        }
+    }
+}
+
+#[test]
+fn session_persistent_optimizer_tiles_preserve_training_state() {
+    let gpu = crate::support::gpu::gpu();
+    let parameters = [("a", "x", 8193), ("b", "y", 1031), ("c", "z", 33)];
+    let names = ["a", "b", "c"];
+    let mut graph = meganeura::Graph::new();
+    let mut losses = Vec::new();
+    for (name, input, len) in parameters {
+        let param = graph.parameter(name, &[1, len]);
+        let target = graph.input(input, &[1, len]);
+        losses.push(graph.mse_loss(param, target));
+    }
+    let sum = graph.add(losses[0], losses[1]);
+    let loss = graph.add(sum, losses[2]);
+    graph.set_outputs(vec![loss]);
+    for device_scheduling in [false, true] {
+        if device_scheduling && !gpu.capabilities().device_memory_fence {
+            continue;
+        }
+        for workers in [1, 3, 64, 4096] {
+            let mut sessions: Vec<_> = [false, true]
+                .into_iter()
+                .map(|persistent| {
+                    let mut config = crate::support::gpu::config();
+                    config.runtime.coop = meganeura::CoopPolicy::Disabled;
+                    config.runtime.poison = true;
+                    config.runtime.arena_chunk_bytes = Some(1024);
+                    config.runtime.persistent =
+                        persistent.then_some(meganeura::PersistentOptions {
+                            workers,
+                            track_workers: true,
+                            allow_fallback: false,
+                            device_scheduling,
+                        });
+                    let mut session = meganeura::build(&graph, config).0;
+                    for (name, _, len) in parameters {
+                        let values: Vec<_> =
+                            (0..len).map(|i| (i % 31) as f32 / 16.0 - 0.75).collect();
+                        session.set_parameter(name, &values);
+                    }
+                    session.set_adam_grouped_grad_norm("c", 3);
+                    session.set_submission_chunks(3);
+                    session
+                })
+                .collect();
+            for stage in 0..8 {
+                for session in &mut sessions {
+                    for (_, input, len) in parameters {
+                        let values: Vec<_> = (0..len)
+                            .map(|i| ((i * 7 + stage * 19) % 53) as f32 / 32.0 - 0.5)
+                            .collect();
+                        session.set_input(input, &values);
+                    }
+                    match stage {
+                        0 => {
+                            session.set_learning_rate(0.01);
+                            session.set_grad_clip_norm(0.02);
+                        }
+                        2 => {
+                            session.set_adam(0.001, 0.9, 0.99, 1e-8);
+                            session.set_adaptive_grad_clip(0.001, 0.01);
+                        }
+                        4 => {
+                            session.set_laprop(0.001, 0.9, 0.99, 1e-8);
+                            session.set_grad_clip_norm(0.02);
+                        }
+                        5 => {
+                            session.set_grad_accumulate(2);
+                            session.zero_grad();
+                            session.clear_optimizer();
+                        }
+                        6 => {
+                            session.set_adam(0.001, 0.9, 0.99, 1e-8);
+                            session.set_adaptive_grad_clip(0.001, 0.01);
+                        }
+                        7 => {
+                            session.clear_grad_accumulate();
+                            session.clear_optimizer();
+                            session.disable_grad_clip();
+                        }
+                        _ => {}
+                    }
+                    session.set_profiling(stage == 3);
+                    if stage == 1 {
+                        let mut encoder =
+                            gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
+                                name: "persistent training reset epochs",
+                                buffer_count: 1,
+                                manual_barriers: false,
+                            });
+                        encoder.start();
+                        session.record(&mut encoder).unwrap();
+                        session.record(&mut encoder).unwrap();
+                        let sync = gpu.submit(&mut encoder);
+                        session.track_submission(sync);
+                        session.wait();
+                        gpu.destroy_command_encoder(&mut encoder);
+                    } else {
+                        session.step();
+                        session.wait();
+                    }
+                    if stage == 7 {
+                        session.sgd_step(0.01);
+                    }
+                    check_worker_tasks(session);
+                }
+                let ordinary = &sessions[0];
+                let selected = &sessions[1];
+                let report = selected.execution_report();
+                assert!(report.appended_fallback.is_empty());
+                assert!(
+                    report
+                        .appended
+                        .iter()
+                        .all(|row| row.workers == workers && row.fallback_reason.is_none())
+                );
+                assert_eq!(
+                    report.appended.len(),
+                    match stage {
+                        0 | 1 | 4 => 10,
+                        2 | 3 => 12,
+                        6 => 15,
+                        _ => 3,
+                    }
+                );
+                let reference = ordinary.execution_report();
+                for (row, expected) in report.appended.iter().zip(&reference.appended) {
+                    assert_eq!(
+                        (&row.label, &row.implementation_key, row.workgroups),
+                        (
+                            &expected.label,
+                            &expected.implementation_key,
+                            expected.workgroups
+                        )
+                    );
+                }
+                for (name, _, len) in parameters {
+                    let mut expected = vec![0.0; len];
+                    let mut actual = vec![0.0; len];
+                    ordinary.read_param(name, &mut expected);
+                    selected.read_param(name, &mut actual);
+                    assert_eq!(
+                        actual, expected,
+                        "parameter {name}, stage={stage}, workers={workers}"
+                    );
+                    ordinary.read_param_grad(name, &mut expected);
+                    selected.read_param_grad(name, &mut actual);
+                    assert_eq!(
+                        actual, expected,
+                        "gradient {name}, stage={stage}, workers={workers}"
+                    );
+                }
+                assert_eq!(
+                    selected.read_adam_states(&names),
+                    ordinary.read_adam_states(&names)
+                );
+                assert_eq!(selected.adam_step_count(), ordinary.adam_step_count());
+                assert_eq!(
+                    selected.read_adam_grouped_grad_norm("c"),
+                    ordinary.read_adam_grouped_grad_norm("c")
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -1004,14 +1188,29 @@ fn session_persistent_fallback_is_explicit_and_strict_rejects_it() {
     session.wait();
     check_worker_tasks(&mut session);
     session.set_learning_rate(0.1);
-    assert_eq!(
-        session.execution_report().appended_fallback,
-        ["optimizer update"]
+    assert!(session.execution_report().appended_fallback.is_empty());
+    session.step();
+    check_worker_tasks(&mut session);
+    assert!(
+        session
+            .execution_report()
+            .appended
+            .iter()
+            .all(|row| row.workers != 0 && row.fallback_reason.is_none())
     );
-    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.step())).is_err());
     let mut parameter = [0.0];
     session.read_param("p", &mut parameter);
-    assert_eq!(parameter, [1.0], "strict rejection must precede the update");
+    assert_eq!(parameter, [0.9]);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.sgd_step_cpu(0.1)))
+            .is_err()
+    );
+    session.read_param("p", &mut parameter);
+    assert_eq!(
+        parameter,
+        [0.9],
+        "strict CPU rejection must precede the update"
+    );
 }
 
 fn reference(job: &Job, weights: &[f32]) -> Vec<f64> {

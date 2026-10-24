@@ -52,10 +52,10 @@ pub use load::nnef::{NnefError, NnefModel, load_nnef};
 pub use load::onnx::{OnnxError, OnnxModel, load_onnx, load_onnx_bytes};
 pub use optimize::{ExtractionCost, OptimizeConfig, OptimizeMode, OptimizeReport};
 pub use runtime::{
-    CoopPolicy, DebugStepReport, DeviceMemoryStats, DispatchAnomaly, ExecutionRegion,
-    ExecutionReport, ExternalBindError, ExternalSlot, GpuOptions, MemorySummary, PersistentOptions,
-    ReadNodeError, RecordError, Session, SessionOptions, ShareParameterError, TuneOutcome,
-    init_gpu_context, init_gpu_context_with,
+    AppendedDispatch, CoopPolicy, DebugStepReport, DeviceMemoryStats, DispatchAnomaly,
+    ExecutionRegion, ExecutionReport, ExternalBindError, ExternalSlot, GpuOptions, MemorySummary,
+    PersistentOptions, ReadNodeError, RecordError, Session, SessionOptions, ShareParameterError,
+    TuneOutcome, init_gpu_context, init_gpu_context_with,
 };
 pub use train::{
     EpochStats, LossHistory, MetricCallback, Mode, Optimizer, SessionConfig, StepMetrics,

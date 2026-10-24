@@ -84,9 +84,23 @@ for queue reset and reports one timing per physical launch, with untimed source
 operations attached. Tuning rebuilds the persistent pipelines after selection.
 
 `execution_report()` lists operation provenance, logical queue tasks, worker geometry,
-physical graph launches, fallback reasons, and configured appended optimizer,
-clipping, or accumulation work. `allow_fallback: false` rejects unsupported
-graph operations and execution of ordinary optimizer/accumulation passes.
+physical graph launches and fallback reasons. Its `appended` rows describe
+actual optimizer, clipping and accumulation dispatches from the most recently
+recorded step or explicit GPU optimizer call. Each row preserves the ordinary
+implementation key and logical grid, and identifies its physical pipeline and
+worker geometry. `allow_fallback: false` rejects unsupported graph or appended
+GPU work before execution, and rejects the explicit CPU SGD helper.
+
+Appended kernels use the same selected-kernel converter and portable singleton
+queues. SGD, Adam/LaProp, global/adaptive clipping and gradient accumulation
+retain their existing phase boundaries, bindings and parameter-arena chunks;
+the accumulation submit/wait boundary also remains. These rows report
+`device_scheduled: false`: they do not form one device-scheduled training launch.
+There are at most five queue slots per parameter pair, covering accumulation,
+three clipping phases and an update. Only scheduler storage is reset, preserving
+parameters, moments, grouped-norm diagnostics and accumulators. The explicit
+optimizer API resets these slots without resetting graph completion state.
+Unsupported conversion/resource contracts produce explicit appended fallback.
 A queue task represents one tile or one matching tile through a chain;
 `worker_owned_chain` identifies the latter and the region retains all source
 operation indices.
@@ -96,6 +110,10 @@ per-worker task counters. After a completed step,
 empty rows for ordinary fallback. The counts reset each step and sum to the
 region's logical tasks. This adds an atomic per claimed task and increases
 scheduler storage, so keep it disabled in primary latency comparisons.
+`read_persistent_appended_worker_tasks()` similarly returns one row for each
+appended dispatch. Completion validation checks each appended queue's total
+claims even when worker tracking is disabled. Multiple externally recorded
+steps reset counters between steps; reports and counters describe the last one.
 A passthrough graph can have zero tasks; qualification must assert nonzero
 persistent coverage for cases intended to exercise this path.
 

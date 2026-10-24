@@ -8,6 +8,8 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
+mod appended;
+
 /// Opt-in persistent execution of selected compute implementations as tiles.
 /// Compatible operations share a queue. Device scheduling additionally orders
 /// whole-operation dependencies inside each supported Vulkan region.
@@ -72,6 +74,45 @@ pub struct ExecutionRegion {
     pub fallback_reason: Option<String>,
 }
 
+/// One runtime dispatch recorded after the compiled graph. Rows describe the
+/// most recently recorded step or explicit optimizer call, including clipping
+/// cadence and arena chunks; they do not imply individual GPU timings.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct AppendedDispatch {
+    pub label: &'static str,
+    pub implementation_key: String,
+    pub pipeline_key: String,
+    pub workgroups: [u32; 3],
+    pub logical_tasks: u64,
+    /// Zero denotes an ordinary dispatch.
+    pub workers: u32,
+    /// Appended phases currently retain hardware boundaries and portable queues.
+    pub device_scheduled: bool,
+    pub workgroup_shape: Option<[u32; 3]>,
+    pub fallback_reason: Option<String>,
+}
+
+impl AppendedDispatch {
+    pub(super) fn ordinary(
+        entry: &crate::compile::ShaderEntry,
+        label: &'static str,
+        grid: [u32; 3],
+    ) -> Self {
+        let key = super::Variant::Scalar(entry.clone()).label();
+        Self {
+            label,
+            implementation_key: key.clone(),
+            pipeline_key: key,
+            workgroups: grid,
+            logical_tasks: grid.into_iter().map(u64::from).product(),
+            workers: 0,
+            device_scheduled: false,
+            workgroup_shape: None,
+            fallback_reason: None,
+        }
+    }
+}
+
 /// Current graph coverage and runtime work appended to each step.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ExecutionReport {
@@ -81,6 +122,8 @@ pub struct ExecutionReport {
     pub graph_dispatches: usize,
     pub persistent_tasks: u64,
     pub scheduler_bytes: usize,
+    pub appended: Vec<AppendedDispatch>,
+    /// Configured runtime work whose persistent implementation is unavailable.
     pub appended_fallback: Vec<&'static str>,
 }
 
@@ -112,6 +155,7 @@ pub(super) struct State {
     initial_queue: Option<bg::Buffer>,
     queue_offsets: Vec<usize>,
     pub groups: Vec<std::ops::Range<usize>>,
+    pub appended: Option<appended::Appended>,
 }
 
 struct Handler {
@@ -525,6 +569,7 @@ impl State {
             graph_dispatches: 0,
             persistent_tasks: 0,
             scheduler_bytes: 0,
+            appended: Vec::new(),
             appended_fallback: Vec::new(),
         };
         let mut index = 0;
@@ -827,6 +872,9 @@ impl State {
         // Conservative physical barriers also order distinct imported handles
         // that may alias the same allocation and whose overlap is unknowable.
         let groups = (0..report.regions.len()).map(|i| i..i + 1).collect();
+        let appended = (!plan.param_grad_pairs.is_empty())
+            .then(|| appended::Appended::new(gpu, plan, options, dump_dir));
+        report.scheduler_bytes += appended.as_ref().map_or(0, appended::Appended::bytes);
         log::info!(
             "persistent execution: {} compiled operations, {} physical graph launches, {} tasks, {} workers",
             plan.dispatches.len(),
@@ -847,20 +895,38 @@ impl State {
             initial_queue,
             queue_offsets,
             groups,
+            appended,
         }
     }
 
-    pub fn reset(&self, encoder: &mut bg::CommandEncoder) -> bool {
+    pub fn reset(&self, encoder: &mut bg::CommandEncoder, optimizer: bool) -> bool {
+        let appended = self
+            .appended
+            .as_ref()
+            .filter(|_| optimizer)
+            .and_then(appended::Appended::queue);
+        if self.queue.is_none() && appended.is_none() {
+            return false;
+        }
+        let mut transfer = encoder.transfer("reset persistent queues");
         if let Some(queue) = self.queue {
-            let mut transfer = encoder.transfer("reset persistent queues");
             if let Some(initial) = self.initial_queue {
                 transfer.copy_buffer_to_buffer(initial.into(), queue.into(), queue.size());
             } else {
                 transfer.fill_buffer(queue.into(), queue.size(), 0);
             }
-            true
-        } else {
-            false
+        }
+        if let Some(queue) = appended {
+            transfer.fill_buffer(queue.into(), queue.size(), 0);
+        }
+        true
+    }
+
+    pub fn reset_appended(&self, encoder: &mut bg::CommandEncoder) {
+        if let Some(queue) = self.appended.as_ref().and_then(appended::Appended::queue) {
+            encoder
+                .transfer("reset optimizer queues")
+                .fill_buffer(queue.into(), queue.size(), 0);
         }
     }
 
@@ -907,25 +973,36 @@ impl Session {
     /// submissions and downloads queue state, so call outside timed intervals.
     /// External records must first be submitted and tracked with the Session.
     /// Returns an error for unfinished tasks, undrained counters or diagnostics.
-    /// Ordinary and portable persistent regions have no device completion state.
+    /// Also checks claim counts for persistent appended dispatches.
     pub fn validate_persistent_completion(&mut self) -> Result<(), String> {
         self.wait();
         let Some(ref state) = self.persistent else {
             return Ok(());
         };
-        if state.initial_queue.is_none() {
-            return Ok(());
+        if state.initial_queue.is_some() {
+            let queue = state.queue.expect("device graph queue");
+            let mut words = vec![0u32; queue.size() as usize / 4];
+            self.read_staged_f32(
+                queue.into(),
+                bytemuck::cast_slice_mut(&mut words),
+                &mut self.readback.borrow_mut(),
+            );
+            state.check_completion(&words)?;
         }
-        let Some(queue) = state.queue else {
-            return Ok(());
-        };
-        let mut words = vec![0u32; queue.size() as usize / 4];
-        self.read_staged_f32(
-            queue.into(),
-            bytemuck::cast_slice_mut(&mut words),
-            &mut self.readback.borrow_mut(),
-        );
-        state.check_completion(&words)
+        if !self.optimizer_records.is_empty() {
+            if let Some(ref appended) = state.appended {
+                if let Some(queue) = appended.queue() {
+                    let mut words = vec![0u32; queue.size() as usize / 4];
+                    self.read_staged_f32(
+                        queue.into(),
+                        bytemuck::cast_slice_mut(&mut words),
+                        &mut self.readback.borrow_mut(),
+                    );
+                    appended.check_completion(&words, &self.optimizer_records)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Number of physical graph launches. Persistent regions may implement
@@ -945,17 +1022,20 @@ impl Session {
     }
 
     pub(crate) fn profiling_overhead_passes(&self) -> usize {
-        usize::from(
-            self.persistent
-                .as_ref()
-                .is_some_and(|state| state.queue.is_some()),
-        )
+        usize::from(self.persistent.as_ref().is_some_and(|state| {
+            state.queue.is_some()
+                || (state.appended.as_ref().is_some_and(|a| a.queue().is_some())
+                    && (self.grad_accum_scale.is_some()
+                        || self.pending_lr.is_some()
+                        || self.pending_adam.is_some()))
+        }))
     }
     pub(super) fn refresh_persistent(&mut self) {
         if let Some(ref state) = self.persistent {
             let options = state.options;
             let allow_chains = state.allow_chains;
             self.wait();
+            self.optimizer_records.clear();
             self.persistent = Some(State::new(
                 &self.gpu,
                 &self.plan,
@@ -1014,7 +1094,8 @@ impl Session {
         )
     }
 
-    /// Report actual selected graph paths and configured appended work.
+    /// Report selected graph paths, the last recorded appended dispatches and
+    /// any configured appended work that requires ordinary fallback.
     pub fn execution_report(&self) -> ExecutionReport {
         let mut report = self.persistent.as_ref().map_or_else(
             || ExecutionReport {
@@ -1040,11 +1121,19 @@ impl Session {
                 graph_dispatches: self.plan.dispatches.len(),
                 persistent_tasks: 0,
                 scheduler_bytes: 0,
+                appended: Vec::new(),
                 appended_fallback: Vec::new(),
             },
             |state| state.report.clone(),
         );
-        if self.persistent.is_some() && !self.plan.param_grad_pairs.is_empty() {
+        report.appended = self.optimizer_records.clone();
+        if self.persistent.as_ref().is_some_and(|state| {
+            state
+                .appended
+                .as_ref()
+                .is_some_and(|appended| appended.error().is_some())
+        }) && !self.plan.param_grad_pairs.is_empty()
+        {
             if self.grad_accum_scale.is_some() {
                 report.appended_fallback.push("gradient accumulation");
             }
@@ -1064,7 +1153,42 @@ impl Session {
                 .as_ref()
                 .is_none_or(|state| state.options.allow_fallback)
                 || self.plan.param_grad_pairs.is_empty(),
-            "strict persistent execution does not support optimizer, clipping or accumulation passes"
+            "strict persistent execution rejects the explicit CPU optimizer"
         );
+    }
+
+    pub(super) fn require_optimizer_execution(&self) {
+        if let Some(ref state) = self.persistent {
+            if !state.options.allow_fallback && !self.plan.param_grad_pairs.is_empty() {
+                let appended = state.appended.as_ref().expect("optimizer queue admission");
+                assert!(
+                    appended.error().is_none(),
+                    "strict persistent optimizer rejected: {}",
+                    appended.error().unwrap_or("")
+                );
+            }
+        }
+    }
+
+    /// Per-worker claims for the appended rows in [`Session::execution_report`].
+    /// Waits and reads back the most recently recorded GPU optimizer work.
+    pub fn read_persistent_appended_worker_tasks(&mut self) -> Option<Vec<Vec<u32>>> {
+        self.wait();
+        let state = self.persistent.as_ref()?;
+        if !state.options.track_workers || self.optimizer_records.is_empty() {
+            return None;
+        }
+        let appended = state.appended.as_ref()?;
+        let queue = appended.queue()?;
+        let mut words = vec![0u32; queue.size() as usize / 4];
+        self.read_staged_f32(
+            queue.into(),
+            bytemuck::cast_slice_mut(&mut words),
+            &mut self.readback.borrow_mut(),
+        );
+        appended
+            .check_completion(&words, &self.optimizer_records)
+            .expect("appended task completion");
+        Some(appended.worker_tasks(&words, &self.optimizer_records))
     }
 }

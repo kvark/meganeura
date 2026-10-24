@@ -57,7 +57,7 @@ fn simple_sgd_decreases_loss() {
     let initial_loss = session.read_loss();
     assert!(initial_loss.is_finite());
 
-    session.sgd_step_cpu(0.1);
+    session.sgd_step(0.1);
     session.set_input("x", &[1.0_f32; 4 * 8]);
     session.step();
     session.wait();
@@ -150,7 +150,7 @@ fn smolvla_training_backprop_smoke() {
     // Steps 2-5 — train with SGD
     let lr = 0.01;
     for _ in 0..4 {
-        session.sgd_step_cpu(lr);
+        session.sgd_step(lr);
         set_inputs(&mut session);
         session.step();
         session.wait();

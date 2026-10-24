@@ -18,7 +18,7 @@ pub(crate) mod search_state;
 mod tuning;
 pub use crate::tune::TuneOutcome;
 pub(crate) use calibration::machine_profile;
-pub use persistent::{ExecutionRegion, ExecutionReport, PersistentOptions};
+pub use persistent::{AppendedDispatch, ExecutionRegion, ExecutionReport, PersistentOptions};
 pub use tuning::KernelMemo;
 
 type Gpu = blade_graphics::Context;
@@ -1742,20 +1742,13 @@ impl Pipelines {
         let optimizer: Vec<Dispatch> = if plan.param_grad_pairs.is_empty() {
             Vec::new()
         } else {
-            [
-                ShaderEntry::SgdUpdate,
-                ShaderEntry::AdamUpdate,
-                ShaderEntry::GradClipNormSq,
-                ShaderEntry::GradClipScale,
-                ShaderEntry::AdaptiveGradClip,
-                ShaderEntry::GradAccum,
-            ]
-            .into_iter()
-            .map(|shader| Dispatch {
-                shader,
-                ..Default::default()
-            })
-            .collect()
+            optimizer::ENTRIES
+                .into_iter()
+                .map(|shader| Dispatch {
+                    shader,
+                    ..Default::default()
+                })
+                .collect()
         };
         // One job per distinct implementation, in plan order.
         let mut jobs = Vec::new();
@@ -3454,6 +3447,7 @@ impl DebugStepReport {
 
 pub struct Session {
     persistent: Option<persistent::State>,
+    optimizer_records: Vec<AppendedDispatch>,
     gpu: Arc<Gpu>,
     /// Per-logical-buffer view: `buffers[i]` backs `BufferRef(i)`, at its
     /// offset within its physical allocation. Aliased logical buffers share
@@ -4616,6 +4610,7 @@ impl Session {
         Self {
             gpu,
             persistent,
+            optimizer_records: Vec::new(),
             buffers,
             physical_buffers,
             alias,
@@ -5167,6 +5162,16 @@ impl Session {
                         let stats = self.gpu.get_pipeline_statistics(pipeline);
                         if !stats.is_empty() {
                             result.push((key, stats));
+                        }
+                    }
+                }
+            }
+            if let Some(ref appended) = state.appended {
+                for (key, pipeline) in appended.pipelines() {
+                    if seen.insert(key.to_owned()) {
+                        let stats = self.gpu.get_pipeline_statistics(pipeline);
+                        if !stats.is_empty() {
+                            result.push((key.to_owned(), stats));
                         }
                     }
                 }
@@ -6419,13 +6424,17 @@ impl Session {
             || self.pending_lr.is_some()
             || self.pending_adam.is_some()
         {
-            self.require_ordinary_optimizer();
+            self.require_optimizer_execution();
         }
-        if self
-            .persistent
-            .as_ref()
-            .is_some_and(|state| state.reset(&mut self.encoder))
-            && profile_window.is_some()
+        self.optimizer_records.clear();
+        if self.persistent.as_ref().is_some_and(|state| {
+            state.reset(
+                &mut self.encoder,
+                self.grad_accum_scale.is_some()
+                    || self.pending_lr.is_some()
+                    || self.pending_adam.is_some(),
+            )
+        }) && profile_window.is_some()
         {
             self.profiled_pass_map.push(None);
         }
@@ -6576,18 +6585,12 @@ impl Session {
         self.pending_adam = None;
     }
 
-    /// Enable global gradient-norm clipping for `step()`. When set,
-    /// `step()` reads all `param_grad_pairs` to CPU after backward,
-    /// computes the concatenated L2 norm, and scales every gradient
-    /// buffer by `min(1, max_norm / total_norm)` before the SGD/Adam
-    /// optimizer pass runs. Mirrors PyTorch's
+    /// Enable global gradient-norm clipping for `step()`. GPU passes after
+    /// backward compute the concatenated L2 norm and scale every gradient
+    /// by `min(1, max_norm / total_norm)` before the SGD/Adam update.
+    /// With temporal accumulation, they scale the accumulated gradients.
+    /// Mirrors PyTorch's
     /// `clip_grad_norm_(parameters, max_norm)`.
-    ///
-    /// Cost: one extra CPU readback + upload of all gradient buffers
-    /// per `step()` (~1-10 ms typical, depending on parameter count).
-    /// Use this on tasks where Adam's per-parameter variance estimate
-    /// drives the per-step update unbounded — sparse-reward visual
-    /// training (Atari) without it eventually NaN-collapses.
     ///
     /// Pass `0.0` or call `disable_grad_clip()` to disable.
     /// Persistent: stays on across `step()` calls until cleared.
@@ -6625,8 +6628,8 @@ impl Session {
     }
 
     /// Set clip cadence. `every=1` clips every step (PyTorch default).
-    /// `every=5` clips every 5th step and amortizes the extra
-    /// submit/readback overhead 5x. The NaN-collapse failure mode
+    /// `every=5` clips every 5th step and reduces clipping dispatches.
+    /// The NaN-collapse failure mode
     /// accumulates over thousands of steps, so values up to ~10 are
     /// usually fine; higher cadences trade away clipping precision.
     pub fn set_grad_clip_every(&mut self, every: u32) {

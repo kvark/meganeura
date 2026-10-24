@@ -14,15 +14,57 @@
 use super::{Session, create_optimizer_buffer, wait_for_timed_encoder};
 use crate::compile::{ExecutionPlan, ShaderEntry};
 use crate::memplan::{ARENA_ALIGNMENT, AliasPlan};
-use blade_graphics::{Buffer, BufferPiece};
+use blade_graphics::{self as bg, Buffer, BufferPiece};
 use bytemuck::Zeroable;
 
 /// Elements one workgroup covers; must match `TILE` in
 /// `optimizer_segments.wgsl`.
 pub(super) const TILE: u32 = 1024;
 
+pub(super) const ENTRIES: [ShaderEntry; 6] = [
+    ShaderEntry::SgdUpdate,
+    ShaderEntry::AdamUpdate,
+    ShaderEntry::GradClipNormSq,
+    ShaderEntry::GradClipScale,
+    ShaderEntry::AdaptiveGradClip,
+    ShaderEntry::GradAccum,
+];
+
 /// Workgroups in x before a grid wraps into y.
 const GRID_WIDTH: u32 = 32768;
+
+fn record_dispatch<D: bg::ShaderData>(
+    pipelines: &super::Pipelines,
+    persistent: Option<&super::persistent::State>,
+    records: &mut Vec<super::AppendedDispatch>,
+    entry: ShaderEntry,
+    label: &'static str,
+    grid: [u32; 3],
+    data: &D,
+    pass: &mut bg::ComputeCommandEncoder<'_>,
+) {
+    let appended = persistent.and_then(|state| state.appended.as_ref());
+    let record = appended.map_or_else(
+        || super::AppendedDispatch::ordinary(&entry, label, grid),
+        |appended| appended.describe(&entry, label, grid),
+    );
+    if record.workers != 0 {
+        appended
+            .unwrap()
+            .record(&entry, records.len(), grid, data, pass);
+    } else {
+        assert!(
+            record.fallback_reason.is_none() || persistent.unwrap().options.allow_fallback,
+            "strict persistent optimizer rejects {}: {:?}",
+            label,
+            record.fallback_reason
+        );
+        let mut pc = pass.with(pipelines.scalar(entry));
+        pc.bind(0, data);
+        pc.dispatch(grid);
+    }
+    records.push(record);
+}
 
 /// `1 / (1 - beta^step)`, computed once per step for the shader to multiply
 /// into each biased moment.
@@ -429,12 +471,15 @@ impl Session {
         // will read.
         if let Some(scale) = self.grad_accum_scale {
             {
-                let pipeline = self.pipelines.scalar(ShaderEntry::GradAccum);
                 let mut pass = self.encoder.compute("grad_accum");
                 for unit in &units {
-                    let mut pc = pass.with(pipeline);
-                    pc.bind(
-                        0,
+                    record_dispatch(
+                        &self.pipelines,
+                        self.persistent.as_ref(),
+                        &mut self.optimizer_records,
+                        ShaderEntry::GradAccum,
+                        "grad_accum",
+                        unit.grid(),
                         &GradPassData {
                             segments: unit.segments,
                             grad: unit.grad,
@@ -446,8 +491,8 @@ impl Session {
                                 square: 0,
                             },
                         },
+                        &mut pass,
                     );
-                    pc.dispatch(unit.grid());
                 }
             }
             // Submit + wait so the accumulator this pass wrote is fully
@@ -470,12 +515,15 @@ impl Session {
         match update {
             None => {}
             Some(Update::Sgd { lr }) => {
-                let pipeline = self.pipelines.scalar(ShaderEntry::SgdUpdate);
                 let mut pass = self.encoder.compute("sgd_update");
                 for unit in &units {
-                    let mut pc = pass.with(pipeline);
-                    pc.bind(
-                        0,
+                    record_dispatch(
+                        &self.pipelines,
+                        self.persistent.as_ref(),
+                        &mut self.optimizer_records,
+                        ShaderEntry::SgdUpdate,
+                        "sgd_update",
+                        unit.grid(),
                         &SgdData {
                             segments: unit.segments,
                             param: unit.param,
@@ -487,8 +535,8 @@ impl Session {
                                 _pad0: 0,
                             },
                         },
+                        &mut pass,
                     );
-                    pc.dispatch(unit.grid());
                 }
             }
             Some(Update::Adam {
@@ -514,12 +562,16 @@ impl Session {
                             u32::MAX,
                         ),
                     };
-                let pipeline = self.pipelines.scalar(ShaderEntry::AdamUpdate);
+
                 let mut pass = self.encoder.compute("adam_update");
                 for unit in &units {
-                    let mut pc = pass.with(pipeline);
-                    pc.bind(
-                        0,
+                    record_dispatch(
+                        &self.pipelines,
+                        self.persistent.as_ref(),
+                        &mut self.optimizer_records,
+                        ShaderEntry::AdamUpdate,
+                        "adam_update",
+                        unit.grid(),
                         &AdamData {
                             segments: unit.segments,
                             param: unit.param,
@@ -544,8 +596,8 @@ impl Session {
                                 one_minus_beta2: 1.0 - beta2,
                             },
                         },
+                        &mut pass,
                     );
-                    pc.dispatch(unit.grid());
                 }
             }
         }
@@ -557,14 +609,18 @@ impl Session {
     fn encode_global_clip(&mut self, units: &[Unit], max_norm: f32) {
         let acc = self.grad_clip_acc.expect("optimizer scratch");
         let partials = self.grad_clip_partials.expect("optimizer scratch");
-        let pipeline = self.pipelines.scalar(ShaderEntry::GradClipNormSq);
+
         let slots: u32 = units.iter().map(|unit| unit.groups).sum();
         {
             let mut pass = self.encoder.compute("grad_clip_norm_sq");
             for unit in units {
-                let mut pc = pass.with(pipeline);
-                pc.bind(
-                    0,
+                record_dispatch(
+                    &self.pipelines,
+                    self.persistent.as_ref(),
+                    &mut self.optimizer_records,
+                    ShaderEntry::GradClipNormSq,
+                    "grad_clip_norm_sq",
+                    unit.grid(),
                     &GradPassData {
                         segments: unit.segments,
                         grad: unit.source,
@@ -576,15 +632,19 @@ impl Session {
                             square: 1,
                         },
                     },
+                    &mut pass,
                 );
-                pc.dispatch(unit.grid());
             }
         }
         {
             let mut pass = self.encoder.compute("grad_clip_norm_total");
-            let mut pc = pass.with(pipeline);
-            pc.bind(
-                0,
+            record_dispatch(
+                &self.pipelines,
+                self.persistent.as_ref(),
+                &mut self.optimizer_records,
+                ShaderEntry::GradClipNormSq,
+                "grad_clip_norm_total",
+                [1, 1, 1],
                 &GradPassData {
                     segments: units[0].segments,
                     grad: partials.at(0),
@@ -596,15 +656,19 @@ impl Session {
                         square: 0,
                     },
                 },
+                &mut pass,
             );
-            pc.dispatch([1, 1, 1]);
         }
-        let pipeline = self.pipelines.scalar(ShaderEntry::GradClipScale);
+
         let mut pass = self.encoder.compute("grad_clip_scale");
         for unit in units {
-            let mut pc = pass.with(pipeline);
-            pc.bind(
-                0,
+            record_dispatch(
+                &self.pipelines,
+                self.persistent.as_ref(),
+                &mut self.optimizer_records,
+                ShaderEntry::GradClipScale,
+                "grad_clip_scale",
+                unit.grid(),
                 &GradPassData {
                     segments: unit.segments,
                     grad: unit.source,
@@ -616,8 +680,8 @@ impl Session {
                         square: 0,
                     },
                 },
+                &mut pass,
             );
-            pc.dispatch(unit.grid());
         }
     }
 
@@ -626,13 +690,21 @@ impl Session {
     fn encode_adaptive_clip(&mut self, units: &[Unit], clip: f32, pmin: f32) {
         let partials = self.grad_clip_partials.expect("optimizer scratch");
         let scales = self.agc_scales.expect("optimizer scratch");
-        let pipeline = self.pipelines.scalar(ShaderEntry::AdaptiveGradClip);
+
         for (mode, label) in [(0u32, "agc_norms"), (1, "agc_factor"), (2, "agc_apply")] {
             let mut pass = self.encoder.compute(label);
             for unit in units {
-                let mut pc = pass.with(pipeline);
-                pc.bind(
-                    0,
+                record_dispatch(
+                    &self.pipelines,
+                    self.persistent.as_ref(),
+                    &mut self.optimizer_records,
+                    ShaderEntry::AdaptiveGradClip,
+                    label,
+                    if mode == 1 {
+                        grid(unit.count)
+                    } else {
+                        unit.grid()
+                    },
                     &AdaptiveGradClipData {
                         segments: unit.segments,
                         param: unit.param,
@@ -650,21 +722,21 @@ impl Session {
                             _pad1: 0,
                         },
                     },
+                    &mut pass,
                 );
-                pc.dispatch(if mode == 1 {
-                    grid(unit.count)
-                } else {
-                    unit.grid()
-                });
             }
         }
     }
 
     /// Run `update` now, in a submission of its own.
     pub(super) fn run_optimizer(&mut self, update: Update) {
-        self.require_ordinary_optimizer();
+        self.require_optimizer_execution();
         self.wait();
+        self.optimizer_records.clear();
         self.encoder.start();
+        if let Some(ref state) = self.persistent {
+            state.reset_appended(&mut self.encoder);
+        }
         self.encode_optimizer(Some(update), false);
         self.sync_point = Some(self.gpu.submit(&mut self.encoder));
     }

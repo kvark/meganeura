@@ -33,19 +33,20 @@ MEGANEURA_PERSISTENT_WORKERS=64 cargo test --test oracle --test smoke \
 MEGANEURA_PERSISTENT_WORKERS=64 MEGANEURA_DEVICE_SCHEDULING=1 \
   cargo test --test oracle --test smoke --test regression --test gguf_model \
   --all-features -- --test-threads=1
-# Reject graph fallback in the operator and GGUF gates:
+# Reject graph and appended GPU fallback throughout the shared suites:
 MEGANEURA_PERSISTENT_WORKERS=64 MEGANEURA_DEVICE_SCHEDULING=1 \
-  MEGANEURA_PERSISTENT_STRICT=1 cargo test --test oracle --test gguf_model \
-  --all-features -- --test-threads=1
+  MEGANEURA_PERSISTENT_STRICT=1 cargo test --test oracle --test smoke \
+  --test regression --test gguf_model --all-features -- --test-threads=1
 # This targeted oracle case explicitly checks ordinary and strict persistent
 # execution, numerical results, and nonzero persistent coverage.
 cargo test --test oracle smoke::persistent_execution_reports_actual_coverage
 ```
 
 `reference::Report.execution` and `Session::execution_report()` expose actual
-coverage and fallback reasons. The full suite allows ordinary fallback for
-operators outside the supported tile conversion/resource contract; passing it
-does not mean all graph operations are persistent. Session tests cover queue reset,
+coverage and fallback reasons. Without strict selection, the suites allow
+ordinary fallback outside the supported tile conversion/resource contract;
+passing them does not mean all graph operations are persistent. Strict selection
+rejects that fallback. Session tests cover queue reset,
 chunking and external records, while the existing tests retain their training,
 checkpoint, shared storage, cache, and precision assertions. Test constructors
 use the shared environment configuration even when they override another
@@ -60,6 +61,14 @@ unfinished tasks, counters and diagnostics after a step; it performs a readback,
 so correctness checks call it outside timed intervals. The reference harness and
 paired benchmark do this automatically. Ordinary execution remains the default.
 The convolution optimizer test checks allocation reuse on the selected backend.
+GPU training checks use the selected optimizer path. The allocation-padding
+fixture's explicit CPU SGD case remains an ordinary control; strict persistent
+selection separately checks rejection of that CPU helper. The appended-pass
+fixture compares exact parameters, gradients, Adam/LaProp moments, step counters
+and grouped norms with ordinary execution across 1/3/64/4096 workers. It includes
+global/adaptive clipping, multiple arena chunks, temporal accumulation, repeated
+external records and a separate GPU optimizer call. Appended completion and
+worker totals are checked separately from graph coverage.
 A strict Session fixture verifies reduced allocation count/bytes and a physical
 WAR edge absent from the logical graph, with 1/3/64/4096 workers, portable/native
 queues, changed inputs, chunking and repeated external records. `no_alias` and

@@ -198,13 +198,19 @@ fn optimizer_clipping_and_diagnostics_ignore_poisoned_allocation_padding() {
                 let poison = vec![1000.0f32; (24 + grad_padding) / 4];
                 plan.constant_buffers
                     .push((gradient, bytemuck::cast_slice(&poison).to_vec()));
+                let mut options = meganeura::SessionOptions::from_env();
+                // This case explicitly tests the CPU updater. The other five
+                // cases qualify GPU updates on the selected execution path.
+                if mode == 4 {
+                    options.persistent = None;
+                }
                 let mut s = meganeura::Session::with_context_opts(
                     plan,
                     crate::support::gpu::gpu(),
                     SessionOptions {
                         debug,
                         coop: CoopPolicy::Disabled,
-                        ..meganeura::SessionOptions::from_env()
+                        ..options
                     },
                 );
                 let mut weights = vec![1000.0f32; (24 + param_padding) / 4];

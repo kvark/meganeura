@@ -39,7 +39,7 @@ fn verify_training_decreases_loss(
 
     // Train with SGD
     for i in 0..steps {
-        session.sgd_step_cpu(lr);
+        session.sgd_step(lr);
         set_inputs(&mut session);
         session.step();
         session.wait();
