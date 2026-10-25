@@ -1,4 +1,7 @@
-use super::{MatMulCoopVariant, MatrixTypes, ShaderGroup, ShaderModule, coop_shape, preprocess};
+use super::{
+    MatMulCoopVariant, MatrixTypes, ShaderGroup, ShaderModule, TypedMatmulLayout, coop_shape,
+    preprocess,
+};
 use crate::{DType, kernels::conv::Params};
 
 // Keep partition boundaries identical across native tile shapes.
@@ -18,9 +21,9 @@ pub(super) fn generate(
     types: MatrixTypes,
     shape: [u32; 3],
     subgroup: u32,
-    vectorized: bool,
+    layout: TypedMatmulLayout,
 ) -> ShaderModule {
-    generate_with_params(group, types, shape, None, subgroup, vectorized)
+    generate_with_params(group, types, shape, None, subgroup, layout)
 }
 
 pub(super) fn generate_with_params(
@@ -29,7 +32,7 @@ pub(super) fn generate_with_params(
     shape: [u32; 3],
     params: Option<&Params>,
     subgroup: u32,
-    vectorized: bool,
+    layout: TypedMatmulLayout,
 ) -> ShaderModule {
     types.validate();
     assert!(
@@ -40,7 +43,7 @@ pub(super) fn generate_with_params(
     let variant = coop_shape(group).map(|(_, variant)| variant);
     let split_range = SPLIT_RANGE.replace("wgid.", "group.");
     let vector_conv = params.is_some_and(Params::vectorized_forward);
-    let vector_dense = vectorized && coop_shape(group).is_some();
+    let vector_dense = layout.vectorized && coop_shape(group).is_some();
     let (declaration, dimensions, range, a, b, index, destination, add) = match group {
         ShaderGroup::MatMul
         | ShaderGroup::MatMulAT
@@ -154,6 +157,20 @@ pub(super) fn generate_with_params(
         }
         _ => unreachable!(),
     };
+    let direct_output = layout.direct_output && types.output == DType::F32 && add.is_empty();
+    // Callers select this only for whole native output tiles. Partial 32x32
+    // workgroups still guard each subgroup's tile before the global store.
+    let result_pointer = |rows: u32, columns: u32| {
+        if direct_output {
+            format!(
+                "&{destination}[(group.z * m + row + a_offset / 32u + {rows}u) * n + col + b_offset + {columns}u]"
+            )
+        } else {
+            format!("&result[a_offset + b_offset + {}u]", rows * 32 + columns)
+        }
+    };
+    let template = include_str!("../shaders/matmul_checked.wgsl");
+    let scatter = super::template_section(template, "scatter");
     let mut extensions = String::from("enable wgpu_cooperative_matrix;\n");
     if types.uses(DType::F16) {
         extensions.push_str("enable f16;\n");
@@ -203,9 +220,31 @@ pub(super) fn generate_with_params(
         128
     };
     ShaderModule::new(&preprocess(
-        include_str!("../shaders/matmul_checked.wgsl"),
+        super::template_section(template, "main"),
         &[
             ("$STAGE", stage),
+            (
+                "$RESULT_DECL",
+                if direct_output {
+                    ""
+                } else {
+                    "var<workgroup> result: array<f32, 1024>;"
+                },
+            ),
+            ("$RESULT_SCATTER", if direct_output { "" } else { scatter }),
+            (
+                "$STORE_VALID",
+                if direct_output {
+                    " && row + a_offset / 32u < m && col + b_offset < n"
+                } else {
+                    ""
+                },
+            ),
+            ("$RESULT_STRIDE", if direct_output { "n" } else { "32u" }),
+            ("$C_LOWER_RIGHT", &result_pointer(8, 8)),
+            ("$C_LOWER", &result_pointer(8, 0)),
+            ("$C_RIGHT", &result_pointer(0, 8)),
+            ("$C_BASE", &result_pointer(0, 0)),
             ("$THREADS", &threads.to_string()),
             (
                 "$TRANSPOSE_A",
@@ -497,7 +536,7 @@ mod tests {
                             shape,
                             Some(&params),
                             subgroup,
-                            false,
+                            TypedMatmulLayout::default(),
                         );
                         assert_eq!(
                             module.module.entry_points[0].workgroup_size,

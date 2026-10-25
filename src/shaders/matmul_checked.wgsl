@@ -1,8 +1,9 @@
+// @section main
 $EXTENSIONS
 $DECL
 var<workgroup> stage_a: array<$MULTIPLY_TYPE, 1024>;
 var<workgroup> stage_b: array<$MULTIPLY_TYPE, 1024>;
-var<workgroup> result: array<f32, 1024>;
+$RESULT_DECL
 $ROUND
 
 @compute @workgroup_size($THREADS)
@@ -54,20 +55,24 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
             }
             workgroupBarrier();
         }
-        if tile < tile_count {
-            coopStoreT(accumulator, &result[a_offset + b_offset], 32u);
+        if tile < tile_count$STORE_VALID {
+            coopStoreT(accumulator, $C_BASE, $RESULT_STRIDE);
             if paired {
-                coopStoreT(lower, &result[a_offset + b_offset + 256u], 32u);
+                coopStoreT(lower, $C_LOWER, $RESULT_STRIDE);
             }
             if $TILE_Nu == 8u {
-                coopStoreT(right, &result[a_offset + b_offset + 8u], 32u);
+                coopStoreT(right, $C_RIGHT, $RESULT_STRIDE);
                 if paired {
-                    coopStoreT(lower_right, &result[a_offset + b_offset + 264u], 32u);
+                    coopStoreT(lower_right, $C_LOWER_RIGHT, $RESULT_STRIDE);
                 }
             }
         }
     }
-    workgroupBarrier();
+    $RESULT_SCATTER
+}
+
+// @section scatter
+workgroupBarrier();
     for (var offset = lane; offset < 1024u; offset += $THREADSu) {
         let r = row + offset / 32u;
         let c = col + offset % 32u;
@@ -76,4 +81,3 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
             $DEST[index] = $STORE(result[offset]$ADD);
         }
     }
-}
