@@ -36,8 +36,13 @@ the qualified memory-ordering contract remains unchanged.
   compute dispatches separately from logical optimizer phases.
 - [x] Pass all 168 oracle tests with strict whole-graph selection, the six focused
   queue/replay/optimizer tests, and broader ordinary-path regression checks.
-- [ ] Record fresh paired model benchmarks and the remaining cost with the
-  NVIDIA SDK. Keep this opt-in until performance justifies a default change.
+- [x] Record 350 paired comparisons and qualified NVIDIA SDK captures. Every
+  selected case uses one dispatch; SmolVLA at 256 workers regresses by
+  2.300× forward and 1.886× with SGD. Counter evidence identifies fourfold
+  duplicated tensor calculations in the current lane adapter.
+- [ ] Remove duplicated tile calculations, then isolate queue/indexing/resource
+  costs and repeat qualification. Keep this opt-in until performance justifies
+  a default change.
 
 The Blade extension exposes binding inspection and runtime buffer-array binding
 in [commit 1bb5aef](https://github.com/kvark/blade/commit/1bb5aef0fea5fbc4249fdc40a7f1398f5c3ac012).

@@ -107,7 +107,8 @@ On RTX 5080, strict whole-graph selection passes all **168 oracle tests**,
 including attention, convolution, reduced-precision storage, scatter, fusion and
 backward cases. Queue completion is checked by the shared reference harness.
 The ordinary-path integration run passes **664 library, 168 oracle, 182
-regression and 22 GGUF tests** (8 library and 21 regression tests remain ignored).
+regression, 81 smoke and 22 GGUF tests** (8 library, 21 regression and 2 smoke
+tests remain ignored).
 Formatting, all-target Clippy, bare/all-feature checks and documentation pass.
 The Metal library cross-check passes with `models,gguf`; all-feature cross-checking
 is blocked by the Linux C compiler's unsupported Apple flags in `ring`.
@@ -120,5 +121,125 @@ MEGANEURA_WHOLE_GRAPH=1 MEGANEURA_PERSISTENT_STRICT=1 \
 cargo test --test oracle --all-features -- --test-threads=1
 ```
 
-Logs remain on local storage under `target/whole-graph-*.log`. Fresh completed-step
-measurements and the SDK capture follow this implementation checkpoint.
+Logs remain on local storage under `target/whole-graph-*.log`.
+
+## Completed-step benchmark
+
+Clean implementation `96e57613f5e2feaba79755f8b30a9197c592d52e`, RTX 5080
+(GB203), NVIDIA 595.91.07. Each row uses 50 alternating ordinary/selected pairs
+after at least ten warmup pairs and one second of warmup. Parameters are restored
+outside timing; each sample waits for completion and checks outputs, gradients
+and updated parameters. SDK sampling, GPU timestamps, worker counters, builds
+and artifact copies are disabled during primary measurements.
+SmolVLA times `step()` plus completion wait; the CI boundary also includes input
+upload and output/loss readback. Combined pipelines compile lazily on first use
+and are warmed before timing. The harness's `construction_ms` field measures
+Session construction and therefore excludes that first-use compilation; it is
+not a complete cold-start metric for this backend.
+
+| Workload | Workers | Ordinary median, ms | Whole-graph median, ms | Median paired ratio | 95% bootstrap interval |
+|---|---:|---:|---:|---:|---:|
+| SmolVLA forward | 64 | 4.436 | 13.241 | 2.989 | 2.972–3.016 |
+| SmolVLA forward/backward/SGD | 64 | 12.302 | 45.257 | 3.495 | 3.000–3.509 |
+| SmolVLA forward | 256 | 4.398 | 10.103 | 2.300 | 2.294–2.313 |
+| SmolVLA forward/backward/SGD | 256 | 15.134 | 28.536 | 1.886 | 1.851–1.913 |
+| CI inference | 256 | 0.0573 | 0.0757 | 1.323 | 1.318–1.332 |
+| CI forward/backward | 256 | 0.0655 | 0.0994 | 1.523 | 1.508–1.533 |
+| CI forward/backward/SGD | 256 | 0.0677 | 0.1054 | 1.570 | 1.551–1.582 |
+
+All **350 comparisons** pass. SmolVLA forward and all CI cases are bitwise
+equal; SmolVLA training's maximum absolute difference is `4.6566128730773926e-9`,
+within the existing comparator tolerance. Both paths have identical compiled
+plans and selected implementation keys. Every whole-graph case reports exactly
+**one physical compute dispatch**, with no fallback. SmolVLA's ordinary path
+has 154 forward dispatches and 527 forward/backward/SGD dispatches. The four SGD
+rows in the whole-graph report are logical nodes in its single dispatch.
+
+The uninstrumented scheduler allocations are 51,904 bytes for SmolVLA forward
+and 98,668 bytes for training. These include metadata, immutable parameters and
+both queue/reset buffers. Separate outstanding external recordings retain
+additional snapshots until their submissions complete.
+
+Intervals bootstrap each row's paired ratios 10,000 times using seed `20261025`
+in table order. They describe within-run sampling uncertainty. The 64-worker
+training distribution is broad, and ordinary training medians differ between
+runs; a median paired ratio need not equal a ratio of marginal medians. These
+data establish correctness and a regression, not a portable optimum or speedup.
+
+## NVIDIA counter diagnosis
+
+The Perf SDK 2026.3 forward captures use the same ten-second resident replay,
+three-second monitor and 20 ms sampling interval as the
+[regional investigation](megakernel_performance_analysis.md). Each capture has
+146 samples after discarding the first five, successful target/monitor exits and
+no SDK warnings. Ordinary, 64-worker and 256-worker captures have identical
+implementation keys and bitwise-identical state, SHA-256
+`4e5d66e6ce5e95142b848651d316b4df64855a9d85669499cabc3a81089be629`.
+
+| Forward metric | Ordinary | Whole graph, 64 | Whole graph, 256 |
+|---|---:|---:|---:|
+| Diagnostic replay median, ms | 3.789 | 12.633 | 9.857 |
+| SM active, % | 61.36 | 75.38 | 98.60 |
+| Active compute warp slots, % of peak | 9.55 | 12.56 | 32.87 |
+| Tensor pipe activity, % of peak | 2.66 | 3.19 | 4.14 |
+| DRAM read throughput, % of peak | 11.12 | 3.35 | 4.30 |
+| L2 texture-sector hit rate, % | 69.97 | 93.18 | 93.17 |
+| Launched workgroups per second | 4,404,327 | 5,129 | 26,301 |
+| GPC clock, GHz | 2.842 | 2.845 | 2.834 |
+
+The lane adapter has a concrete avoidable cost: a logical 64-invocation tensor
+tile executes in a physical 256-invocation workgroup. Extra subgroup lanes
+repeat the tile's calculations and cooperative matrix instructions, while their
+stores are masked. That preserves barrier participation and arithmetic but
+performs four copies of this calculation. The product of tensor activity and
+replay duration is **4.00× / 4.05×** ordinary for 64/256 workers. This is an
+aggregate activity-time estimate, not an exact per-kernel instruction count;
+its agreement with the explicit fourfold duplication is strong evidence for
+this cost. More active warp slots do not imply more useful graph work.
+
+Multiplying workgroup launch rate by replay duration estimates about 65 and 259
+workgroups per step, close to the selected fixed pools of 64 and 256. This
+independently supports the change in launch behavior. The ordinary estimate is
+16,689, close to its 16,538 logical workgroups. Clocks are nearly unchanged and
+DRAM throughput is far below peak, so clock throttling and aggregate bandwidth
+saturation do not explain this regression.
+
+Separate five-pair timestamp/statistics runs report **98 registers/thread and
+26,112 shared bytes/workgroup** for the combined forward shader; training uses
+**91 registers/thread and 26,128 shared bytes/workgroup**. Every operation pays
+the combined pipeline's resource footprint. Ready-queue polling, dynamic
+descriptor/parameter indexing, conservative allocation dependencies and coherent
+accesses/fences add costs, but these captures do not isolate their individual
+latencies. The driver's implausible approximately 64 GiB local-memory statistic
+is excluded from spill claims. The timestamp training run contains a 90 ms
+outlier; the table above uses the separate primary measurements.
+
+The next performance step is to avoid repeated tensor calculations when adapting
+logical workgroups, while preserving barrier uniformity and per-tile scratch.
+Then measure narrower physical dependencies, parameter indexing and queue
+contention independently. Retain the existing memory contract and repeat full
+state qualification before considering a default change.
+
+## Reproduction and artifact identities
+
+All records remain on local storage at
+`target/megakernel-results/whole-graph-20261025/`. The measured SmolVLA executable
+has SHA-256 `fd52b1400a974c8c7a326afcc40b071310aecb61aa4cba9c5a19a64de6398637`.
+
+```sh
+cargo build --release --features models --example bench_smolvla_train --example bench_ci_latency
+target/release/examples/bench_smolvla_train --whole-graph --workers 256 --warmup 10 --runs 50 --warmup-ms 1000
+target/release/examples/bench_ci_latency --whole-graph --workers 256 --warmup 10 --runs 50 --warmup-ms 1000
+python3 scripts/profile_smolvla_sdk.py --sdk /x/Tools/nsight-perf-sdk-2026.3 \
+  --output target/new-whole-graph-capture --phase forward --workers 64 256 --whole-graph
+```
+
+| Record | SHA-256 |
+|---|---|
+| `smolvla-64.json` | `24a0aaa2065745d13eeeb6fba2b8f05e9ff32884c791b2dac8513b47146a9d0c` |
+| `smolvla-256.json` | `69944be71d04a4c609a844c6538c2463d11b88eff3882b4d6f8799d5c53eaf3d` |
+| `ci-256.json` | `e8c5e06ca134e7b6cd3a1ba157fe2fbd32c425fde3e7eef084c294257bab35c1` |
+| `smolvla-256-diagnostics.json` | `0d650e390fc5843e818bef26d185e75f3cb8bdc0f703d282bb0e4c1616adeeaa` |
+| `sdk-forward/ordinary-receipt.json` | `e209faec2241740d5c13306595bab3fb8defb3407b83d5563e61a05ed2ec28a1` |
+| `sdk-forward/whole-64-receipt.json` | `d280ce9059afbe6f73229c35f6fb6605b5e7906f9af305593850effcf359eb35` |
+| `sdk-forward/whole-256-receipt.json` | `a996d1fc0fc624c1502cdbc7e14074d6a0a028cffa3fadb3f9fb8c33870ca618` |

@@ -1,5 +1,11 @@
 # Persistent graph performance: NVIDIA counter diagnosis
 
+This investigation measures the earlier **regional** backend. The newer
+[single-dispatch graph results](megakernel_whole_graph.md#nvidia-counter-diagnosis)
+have a different regression: the current lane adapter repeats 64-lane tensor
+calculations across a 256-lane physical workgroup. SDK activity-time estimates
+show approximately four times the tensor work per completed forward step.
+
 The principal SmolVLA regression comes from the fixed worker pool. At 64
 workers, large tiled kernels lose parallelism; increasing the pool restores
 their performance but adds overhead to kernels with few tiles. The dominant
