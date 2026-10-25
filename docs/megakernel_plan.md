@@ -141,10 +141,18 @@ the descriptor-reference repair requires fresh measurements.
 - [x] Require matching benchmark/SDK adapters and collected shader activity.
   Exclude a RADV-target/NVIDIA-monitor capture and audit the primary NVIDIA
   captures; record device identity and explicit capture validity in receipts.
-- [ ] Compare isolated matrix handlers with the same handlers inside a combined
-  shader, separating descriptor addressing from the shared resource footprint.
-  Retain both model phases and all CI gates; baseline parity and spill
-  attribution remain open.
+- [x] Compare an isolated matrix handler with unused forward/training handlers
+  compiled into the same shader, keeping actual graph work fixed. Sweep worker
+  counts and measure failed claims. Larger resource footprints can improve this
+  narrow workload; register count alone does not explain its slowdown.
+- [x] Test a bounded claim-priority window based on worker start order. Failed
+  claims decrease, but full training regresses against fresh controls. Preserve
+  560 normal comparisons and twelve diagnostics across these experiments;
+  revert the temporary runtime and benchmark API changes.
+- [ ] Isolate descriptor/address calculations at a fixed worker count in the
+  matrix fixture before proposing further whole-model changes. Retain both
+  model phases and all CI gates; baseline parity and spill attribution remain
+  open.
 
 The Blade extension exposes binding inspection and runtime buffer-array binding
 in [commit 1bb5aef](https://github.com/kvark/blade/commit/1bb5aef0fea5fbc4249fdc40a7f1398f5c3ac012).

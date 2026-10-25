@@ -1115,6 +1115,90 @@ the combined manifest is `target/megakernel-results/queue-followups/summary.json
 All workloads used verified bounded cgroups, serialized GPU jobs and local
 storage. Builds and analysis did not overlap timing. Parity remains unmet.
 
+## Matrix resource isolation and claim priority
+
+A temporary fixture repeats the selected `FusedMatMulAdd[50x720x2048]`
+SmallTile operation 32 times, with its original `[23, 2, 1]` logical grid.
+Every operation writes the same output, creating a strict WAW chain with
+1,472 logical tasks. Both modes use identical operands, model-buffer sizes and
+selected arithmetic; each comparison checks the full 36,000-element output.
+The operands remain hot across repeated operations. This fixture diagnoses
+matrix execution and does not replace the complete-model acceptance gate.
+
+Three persistent variants compile only the active handler, or also compile
+the original SmolVLA forward/training handlers without scheduling additional
+nodes. The extra handlers affect code, shared scratch and parameter capacity.
+Separate pipeline captures report the following resources:
+
+| Shader | Registers | Shared bytes |
+|---|---:|---:|
+| Ordinary matrix | 48 | 8,448 |
+| Isolated persistent matrix | 48 | 9,584 |
+| With unused forward handlers | 112 | 29,200 |
+| With unused training handlers | 105 | 29,232 |
+
+Twenty paired completed-step samples per case give these persistent medians.
+Ordinary medians range from 1.673 to 1.729 ms across the same runs.
+
+| Workers | Isolated ms | With forward handlers ms | With training handlers ms |
+|---|---:|---:|---:|
+| 32 | 4.125 | 3.725 | 3.712 |
+| 64 | 2.109 | 1.942 | 1.944 |
+| 84 | 2.123 | 1.934 | 1.936 |
+| 128 | 2.772 | 2.946 | 2.951 |
+| 256 | 4.179 | 2.948 | 2.931 |
+
+Adding unused handlers increases resource use yet improves the 256-worker
+case. The best sampled pools are 64–84 workers; padded variants still take
+about 1.15 times ordinary latency. Thus register count alone does not explain
+the slowdown. The results are consistent with worker residency and contention
+affecting this narrow workload; they do not isolate either as the sole cause.
+The driver's implausible Local Memory Size statistic remains excluded.
+
+Reading existing tile counters after separate diagnostic steps requires no
+new shader instrumentation. At 256 workers, unsuccessful claims total 6,701
+for the isolated shader and 3,885/3,884 for the padded shaders. At 64 workers,
+all three total 576. Each count is one final-step diagnostic sample.
+
+A temporary priority window obtains each worker's rank from an atomic start
+counter. During the first four unsuccessful scans of a completion epoch,
+workers whose rank exceeds a node's claim count skip that node. All workers
+become eligible after those bounded scans; wide nodes remain available
+throughout. The hint does not assume workgroup launch order or simultaneous
+residency. Existing publication fences, failed-claim helping and ready-bit
+clearing remain intact, and completion verifies every requested worker started.
+
+The window reduces the 256-worker diagnostic failed-claim totals to
+3,307/1,622/1,653. Normal isolated-matrix latency falls to 3.657 ms, but the
+padded cases remain 2.954/2.935 ms. Registers are 48/116/108 respectively,
+with unchanged shared storage. Full-step comparisons against fresh controls
+show no useful overall gain:
+
+| Case | Existing scheduler ms | Priority window ms | Existing / priority paired ratios |
+|---|---:|---:|---:|
+| CI inference | 0.07071 | 0.07469 | 1.350 / 1.344 |
+| CI forward/backward | 0.10293 | 0.10341 | 1.545 / 1.597 |
+| CI forward/backward/SGD | 0.10246 | 0.10989 | 1.507 / 1.574 |
+| SmolVLA forward | 6.408 | 6.281 | 1.513 / 1.621 |
+| SmolVLA forward/backward/SGD | 20.953 | 21.644 | 1.391 / 1.432 |
+
+Each ratio compares persistent execution with its own paired ordinary control;
+ordinary forward latency varies between runs. Reducing failed atomic claims
+alone does not recover the performance gap. The next controlled comparison
+holds the worker pool fixed while isolating descriptor/address calculations.
+
+All **560 normal comparisons and twelve diagnostics** pass with one persistent
+dispatch, identical selected arithmetic and no fallback. Matrix, CI and model
+forward outputs are exact; maximum model-training error is 4.66e-9. The
+temporary handler-padding API, claim dump and priority scheduler are reverted.
+Runtime source matches `ed81459`, and the ordinary release benchmark examples
+are rebuilt. No new Naga or Blade change is retained. All jobs use verified
+bounded cgroups, serialized GPU work and local `/x` storage; builds and
+analysis do not overlap measurements. Raw samples, source patches, binaries
+and the priority proof remain in `target/{matrix-handler-probe,claim-priority-probe}/`.
+The checked manifest and hashes are in
+`target/megakernel-results/matrix-followups/summary.json`. Parity remains unmet.
+
 ## Earlier artifact identities
 
 All records remain on local storage at
