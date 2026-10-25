@@ -1036,10 +1036,12 @@ fn process_segment(
                 match extraction {
                     Ok(Some((cost, term_id))) => {
                         log::debug!(
-                            "extracted $n{} (cost {}): {}",
+                            "extracted $n{} (cost {}, term {}, {} DAG terms): {:?}",
                             root,
                             cost,
-                            dag.to_string(term_id)
+                            term_id,
+                            dag.size(),
+                            dag.get(term_id)
                         );
                         terms.push((root, term_id));
                     }
