@@ -412,15 +412,37 @@ fresh-execution counts.
   fusion without adding redundant widening/narrowing dispatches.
 - [ ] Cover additional NN/AT/BT, batched/block and split-reduction forms where
   profiles justify the generator and qualification work.
-- [ ] Investigate cooperative matrix conversions for direct reduced result
-  stores, avoiding an F32 shared-memory round trip. Both queried GPUs expose
-  F16 accumulator/result matrices, so test F32 accumulation followed by a
-  same-role F16 conversion and direct store. This does not require doing the
-  reduction in F16. [Standard KHR matrix conversions](https://github.com/KhronosGroup/SPIRV-Registry/blob/main/extensions/KHR/SPV_KHR_cooperative_matrix.asciidoc#34211-conversion-instructions)
-  preserve scope, dimensions and use; NV2's accumulator-to-operand conversions
-  are separate. Naga currently rejects matrix casts. Each intermediate matrix
-  type still needs device support; require qualified model gains before adding
-  compiler/capability APIs.
+- [x] Prototype same-role cooperative conversion for direct F16 result stores,
+  retaining F32 accumulation. A four-site Naga diagnostic accepts narrowing
+  and widening round trips and rejects role/shape changes, integer targets and
+  bitcasts. All 24 generated direct/fallback shaders pass `spirv-val` for
+  Vulkan 1.3; all 24 two-GPU cases pass an independent F64 check. This is a
+  [standard KHR conversion](https://github.com/KhronosGroup/SPIRV-Registry/blob/main/extensions/KHR/SPV_KHR_cooperative_matrix.asciidoc#34211-conversion-instructions),
+  separate from NV2's accumulator-to-operand role conversion.
+
+  Eliminating the shared F32 result and scalar F16 scatter is not uniformly
+  faster. At 128x576x576, fully native NN regresses about 35% on Intel and 34%
+  on NVIDIA; Intel BT improves 21%, whereas mixed native/F32 BT regresses 11%.
+  Tiny 16x16x32 products improve 13–17%. Input loads, F32 accumulators, output
+  dtype and workgroups match. Timings are 16-dispatch GPU batches including
+  inter-dispatch barriers; host times remain separate. Intel's NN shaders both
+  use SIMD32 without spills: direct stores have 289 instructions / 31 sends
+  versus 284 / 39 for the shared-result path, and 34 versus 26 non-SSA
+  registers. These statistics do not by themselves explain the timing loss.
+
+  Thirteen saved model winners contain no F16 matrix outputs, including the
+  selected reduced-storage SmolLM2 inference plan: pointwise/gated producers
+  narrow their outputs, but their inputs and matrix results remain F32. Thus
+  this store path cannot improve those plans without broader storage chains.
+  Keep the compiler prototype outside production and add no capability API
+  without a qualified model win. Evidence: `direct-f16-result-probes-*`,
+  `direct-f16-result-spv-validation.json`, `direct-f16-result-model-inventory.json`,
+  `direct-f16-result-assembly` and `coop-convert-compiler-checks`.
+- [ ] Prototype backward propagation of private F16 storage through pointwise
+  and gated consumers. Decode inputs into F32 expressions; retain F32
+  reductions, explicit pins, visible buffers and unmatched readers. Compare
+  whole models with the existing narrow-producer candidate before admitting
+  any additional rounding boundary or revisiting direct result stores.
 - [ ] Consider immutable reduced weight caches only with upload, sharing,
   checkpoint, external-buffer and optimizer-update invalidation defined and
   tested. Inference parameters are still mutable through these interfaces.
