@@ -837,10 +837,9 @@ local traffic above comes from the SDK counters.
 
 The measured gap still includes substantial extra integer/addressing and worker
 coordination work, with waiting workers contributing to barrier stalls. These
-counters do not isolate each handler's elapsed cost. The immutable-allocation
-experiments below did not improve both phases. The next diagnostic should
-localize register spills and worker placement before changing scheduling or
-resource access again. Retained changes must pass both phases' existing gates.
+counters do not isolate each handler's elapsed cost. The follow-ups below do
+not improve both phases. Worker placement is now measured, while spill
+attribution remains open. Retained changes must pass both phases' existing gates.
 
 Primary binaries, commands, hashes, cgroup identities, receipts and raw samples
 are in `target/megakernel-results/canonical-descriptors-paired/`; SDK records are
@@ -904,6 +903,81 @@ the next GPU job. Builds and analysis did not overlap measurements. The
 published runtime and compiler pins remain the qualified canonical-descriptor
 implementation above; the rejected probes did not proceed to its full
 library/oracle/CI acceptance gate.
+
+## Worker placement and compiler follow-ups
+
+Temporary instrumentation based on
+[`VK_NV_shader_sm_builtins`](https://docs.vulkan.org/refpages/latest/refpages/source/VK_NV_shader_sm_builtins.html)
+records the leader's SM ID at entry and exit alongside per-node worker counts.
+Both instrumented SPIR-V modules pass Vulkan 1.3 validation before pipeline
+creation. In the 256-worker capture, **168 workers perform tasks on 84 SMs,
+exactly two per SM**. Every leader's entry and exit IDs match. The first
+46-tile matrix node uses only 23 SMs; sixteen `FusedMatMulAdd[50x720x2048]`
+nodes use a median of 33 SMs. With 84 workers, every active worker has its own
+SM. These are observations on this device/driver, not a portable placement rule.
+
+A probe elects one worker per SM for nodes with at most 84 claims, allowing all
+workers to handle larger nodes. It raises the narrow fused-matrix family's
+median SM count from 33 to 46, but does not improve the matching instrumented
+control. Both use 116 forward / 115 training registers. With 20 alternating
+pairs per phase, control persistent medians are **7.118 / 22.511 ms** and owner
+medians are **7.214 / 23.014 ms**. The SM instrumentation and capture settings
+affect compilation; these timings do not replace the uninstrumented primary
+results. The owner policy is reverted. Clustering alone does not establish the
+cause of the elapsed-time gap.
+
+The driver's pipeline-executable query returns **zero internal representations**
+for both combined shaders, so this route supplies no ISA or spill locations.
+Further compiler probes retain the selected arithmetic and memory protocol:
+
+- An SPIR-V `Inline` hint leaves 112 registers and executable sizes unchanged.
+- Actual inlining, after dead-branch elimination and return merging, produces
+  one function with no calls in each module. Validation and state comparisons
+  pass, but registers remain 112 and code grows to 115,968 / 274,688 bytes.
+  Normal 20-pair medians are 6.571 / 21.069 ms, with ratios 1.492 / 1.411.
+- A descriptor-uniformity probe removes 102 / 200 `NonUniform` decorations,
+  restricted to accesses rooted at the canonical payload binding. The builder
+  supplies every descriptor index through `workgroupUniformLoad`, and Vulkan
+  permits [dynamically uniform descriptor indexing within a workgroup](https://docs.vulkan.org/guide/latest/extensions/VK_EXT_descriptor_indexing.html).
+  The corresponding core feature/capability is enabled; alias decorations and
+  memory-access semantics remain intact. Validation and state comparisons pass,
+  but registers and executable sizes are unchanged. Normal 20-pair medians are
+  6.564 / 20.948 ms, with ratios 1.490 / 1.413.
+
+Neither compiler probe shows a useful gain, and neither is retained. The initial
+inliner warned that early returns prevented complete inlining; return merging
+then rejected unreachable blocks. Removing dead branches first resolved that
+precondition. Failed/preliminary outputs are preserved separately.
+
+A 50-pair sweep with the preserved canonical CI executable also fails to close
+the gap, despite these graphs having only 1–16 logical tiles per node:
+
+| Workers | Inference persistent ms / ratio | Backward persistent ms / ratio | SGD persistent ms / ratio |
+|---:|---:|---:|---:|
+| 1 | 0.09433 / 1.810 | 0.27334 / 4.197 | 0.32322 / 4.808 |
+| 4 | 0.07043 / 1.352 | 0.11261 / 1.725 | 0.13058 / 1.942 |
+| 16 | 0.07112 / 1.339 | 0.09831 / 1.496 | 0.09868 / 1.461 |
+| 64 | 0.07419 / 1.292 | 0.09658 / 1.482 | 0.09623 / 1.444 |
+
+All **760 comparisons** across the ownership/control, compiler and CI pool
+trials pass. CI and forward state are exact; maximum training error is 4.66e-9.
+Every persistent step has one compute dispatch and matched selected arithmetic.
+All runs use separate bounded cgroups, serialize GPU work and keep builds and
+analysis outside measurements. No runtime change from these trials is retained.
+
+Finally, a separate timestamp capture disables worker histograms while retaining
+GPU timing, so the reset image has its normal size. Twenty pairs per workload
+pass. Median pass intervals for `reset whole-graph queue` are **2.432 µs** for
+each CI case, **3.920 µs** for SmolVLA forward and **5.136 µs** for training.
+These include the transfer pass boundary, not just DMA time. They are too small
+to explain the gap, and no more complex reset protocol is added. The next probe
+will isolate intra-workgroup scheduling from cross-workgroup coordination;
+larger-model performance and all shared acceptance gates remain in scope.
+
+Raw records are in `target/{sm-placement,shader-isa,inline-probe,spirv-opt-probe,
+uniform-descriptor-probe,ci-worker-sweep,queue-reset-timing}/`. The combined
+manifest, hashes and placement checks are in
+`target/megakernel-results/placement-compiler-followups/summary.json`.
 
 ## Earlier artifact identities
 

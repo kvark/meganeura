@@ -119,9 +119,18 @@ the descriptor-reference repair requires fresh measurements.
   Handler variants improve forward but regress training; conservative shared
   bindings show no useful gain. Preserve 200 exploratory paired comparisons,
   register diagnostics and worker-count controls, and revert the probes.
-- [ ] Localize register spills and worker placement to distinguish handler
-  costs from occupancy and idle-worker interference before the next runtime
-  change. Keep compiler validation and both phases' acceptance gates intact.
+- [x] Measure worker placement with a temporary NVIDIA SM-ID probe. Narrow
+  matrix nodes cluster, but electing one worker per SM does not improve the
+  matching instrumented control. Check compiler inlining, descriptor uniformity
+  and smaller CI worker pools; 760 comparisons pass without closing the gap.
+  Restore the qualified runtime and preserve the failed/preliminary attempts.
+- [x] Time queue reset separately with worker histograms disabled. Its median
+  interval is 2.4 microseconds for CI and 3.9–5.1 microseconds for SmolVLA, too
+  small to explain the gap. Do not add a reset protocol on that hypothesis.
+- [ ] Separate scheduler/fence overhead from handler work, starting with a
+  single-worker specialization that needs no cross-workgroup coordination.
+  Continue larger-graph optimization and retain both model phases and all CI
+  acceptance gates; baseline parity and spill attribution remain open.
 
 The Blade extension exposes binding inspection and runtime buffer-array binding
 in [commit 1bb5aef](https://github.com/kvark/blade/commit/1bb5aef0fea5fbc4249fdc40a7f1398f5c3ac012).
