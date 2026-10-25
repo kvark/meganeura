@@ -219,9 +219,24 @@ SmolLM2 (128×576×49,152, retaining 48 split partitions). Plain F16 fails the
 unchanged gradient gate on both cards: RMS error is about 7.3e-5 against a
 3.68e-5 limit. Consequently, extending the passing AT/BT candidate to every
 derivative product is not valid. BF16 qualifies before/after timing at fixed weights
-and changes complete-step time by -3.23% on Intel and -0.27% on NVIDIA; its
-trajectory and combination with F16 AT/BT still need checking. Keep the NN
-scope separate from the AT/BT gains in the table above.
+and changes complete-step time by -3.23% on Intel and -0.27% on NVIDIA.
+Combining BF16 NN with the qualified F16 AT/BT plan improves another 3.72% on
+Intel and 0.36% on NVIDIA. Both combined plans pass the unchanged 256-update
+real-text training/probe/held-out checks against native and PyTorch F32.
+Keep the NN scope separate from the AT/BT gains in the table above.
+
+A diagnostic fixed-scale F16 NN alternative multiplies both inputs by 2^8
+before conversion, retains F32 accumulation and restores the result once at
+the existing F32 store. It improves the same F16 AT/BT baseline by 3.99% on
+Intel and 0.93% on NVIDIA; both 256-update trajectories pass the same frozen
+checks. Powers 8 and 12 give similar timings. These are separate controls,
+not a paired BF16-versus-scaled comparison. The diagnostic uses the generic
+cooperative generator on both cards (including NVIDIA) and requires its
+matching engine/environment; its saved plans are not production artifacts.
+Before choosing an additional NN policy, test Whisper's rejected plain-F16
+products and overflow/mixed-range cases, and serialize any admitted scaling
+as part of kernel identity. Raw controls and trajectories are archived in
+`static-dense-model-controls` and `static-dense-real-text` beside the survey.
 
 - [x] Separate automatic derivative protection from explicit precision pins:
   [PR #294](https://github.com/kvark/meganeura/pull/294). Ordinary construction
@@ -339,6 +354,12 @@ fresh-execution counts.
 - Scaled F16 backward GEMMs: preserve very small derivatives and dynamic
   range explicitly, as the existing attention derivative path does. Do not
   clear full-precision protection merely to reach matrix hardware.
+  Before another per-K32 scan, test a fixed power-of-two operand scale that is
+  constant over the whole split partition. Restore the F32 accumulator once
+  before its existing store, retaining F32 bindings/partials and avoiding
+  per-block scans/restoration. Compare NN/Whisper cases that plain F16 rejects
+  against BF16, and keep overflow/mixed-range failures and frozen trajectory
+  checks. This is a bounded measured candidate, not a universal loss scale.
 - NVIDIA's raw NV2 query also advertises reductions, per-element operations
   and conversions. Survey Blade/Naga support before exploring softmax on
   cooperative fragments or accumulator-to-operand conversion; these might
