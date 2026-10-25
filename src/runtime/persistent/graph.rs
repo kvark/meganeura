@@ -119,7 +119,7 @@ struct Frame {
     parameters: Allocation,
     initial_queue: Allocation,
     queue: Allocation,
-    views: Vec<Vec<bg::BufferPiece>>,
+    buffers: Vec<bg::BufferPiece>,
     config: Config,
     tasks: Vec<u32>,
     graph_nodes: usize,
@@ -142,9 +142,7 @@ impl bg::ShaderData for Frame {
         self.parameters.buffer.at(0).bind_to(&mut context, 2);
         self.queue.buffer.at(0).bind_to(&mut context, 3);
         self.config.bind_to(&mut context, 4);
-        for (index, pieces) in self.views.iter().enumerate() {
-            context.bind_buffer_array(5 + index as u32, pieces);
-        }
+        context.bind_buffer_array(5, &self.buffers);
     }
 }
 
@@ -388,7 +386,7 @@ impl Graph {
                         let base = node * self.builder.parameter_words.max(4);
                         for (slot, bytes) in bindings.plain.iter().enumerate() {
                             if let Some(ref bytes) = *bytes {
-                                let offset = base + frame.parameter_words[base + slot] as usize;
+                                let offset = base + frame.parameter_words[base + 2 * slot] as usize;
                                 let target = bytemuck::cast_slice_mut::<u32, u8>(
                                     &mut frame.parameter_words[offset..],
                                 );
@@ -449,7 +447,7 @@ impl Graph {
         queue[0] = nodes;
         let mut parameters = Vec::new();
         let mut metadata = Vec::new();
-        let mut views: Vec<Vec<bg::BufferPiece>> = vec![Vec::new(); self.builder.views.len()];
+        let mut buffers: Vec<bg::BufferPiece> = Vec::new();
         let mut accesses: Vec<Vec<(bg::BufferPiece, bool)>> = Vec::new();
         let mut ancestors: Vec<Vec<u64>> = Vec::new();
         let mut successors = vec![Vec::new(); nodes as usize];
@@ -472,10 +470,10 @@ impl Graph {
             tasks.push(count);
             let base = u32::try_from(parameters.len()).map_err(|_| "parameter offset overflow")?;
             let layout = &self.layouts[handler];
-            let mut words = vec![0; layout.bindings.len()];
+            let mut words = vec![0; 2 * layout.bindings.len()];
             for (slot, bytes) in bindings.plain.iter().enumerate() {
                 if let Some(ref bytes) = *bytes {
-                    words[slot] = words.len() as u32;
+                    words[2 * slot] = words.len() as u32;
                     for chunk in bytes.chunks(4) {
                         let mut word = [0u8; 4];
                         word[..chunk.len()].copy_from_slice(chunk);
@@ -486,16 +484,25 @@ impl Graph {
             let mut node_accesses = Vec::new();
             for binding in &self.kernels[handler].buffers {
                 let piece = bindings.buffers[binding.slot].ok_or("missing node buffer")?;
-                let table = &mut views[binding.view];
-                let index = table
+                if piece.offset >= piece.buffer.size()
+                    || !piece.offset.is_multiple_of(u64::from(binding.stride))
+                {
+                    return Err(
+                        "graph buffer offset is out of range or not a whole storage element".into(),
+                    );
+                }
+                let index = buffers
                     .iter()
-                    .position(|p| p.buffer == piece.buffer && p.offset == piece.offset)
+                    .position(|p| p.buffer == piece.buffer)
                     .unwrap_or_else(|| {
-                        let index = table.len();
-                        table.push(piece);
+                        let index = buffers.len();
+                        buffers.push(piece.buffer.at(0));
                         index
                     });
-                words[binding.slot] = index as u32;
+                words[2 * binding.slot] = index as u32;
+                words[2 * binding.slot + 1] =
+                    u32::try_from(piece.offset / u64::from(binding.stride))
+                        .map_err(|_| "graph buffer element offset exceeds u32")?;
                 node_accesses.push((piece, binding.write));
             }
             if words.len() > self.builder.parameter_words {
@@ -576,25 +583,17 @@ impl Graph {
             metadata[node * 8 + 7] = next.len() as u32;
             edges.extend(next);
         }
-        let dummy = views
-            .iter()
-            .flatten()
-            .next()
-            .copied()
-            .ok_or("graph has no buffers")?;
-        for view in &mut views {
-            if view.is_empty() {
-                view.push(dummy);
-            }
+        if buffers.is_empty() {
+            return Err("graph has no buffers".into());
         }
         let caps = self.gpu.capabilities();
         let limits = caps
             .compute_binding_limits
             .ok_or("device has no binding limits")?;
-        let storage = 4 + views.iter().map(Vec::len).sum::<usize>();
+        let storage = 4 + buffers.len();
         if storage > limits.max_storage_buffers as usize
             || storage + 1 > limits.max_buffer_bindings as usize
-            || views.len() + 5 > bg::limits::RESOURCES_IN_GROUP as usize
+            || self.builder.views.len() + 5 > bg::limits::RESOURCES_IN_GROUP as usize
         {
             return Err(format!(
                 "whole graph needs {storage} storage descriptors; device limits {limits:?}"
@@ -617,7 +616,7 @@ impl Graph {
                 return Err("graph metadata exceeds storage range".into());
             }
         }
-        for piece in views.iter().flatten() {
+        for piece in &buffers {
             if piece.buffer.size() - piece.offset > limits.max_storage_buffer_range {
                 return Err("graph buffer exceeds storage range".into());
             }
@@ -636,18 +635,19 @@ impl Graph {
                 ),
             ],
         };
-        for (view, pieces) in self.builder.views.iter().zip(&views) {
+        for (index, view) in self.builder.views.iter().enumerate() {
             layout.bindings.push((
                 binding_name(&view.name),
-                bg::ShaderBinding::BufferArray {
-                    count: pieces.len() as u32,
+                if index == 0 {
+                    bg::ShaderBinding::BufferArray {
+                        count: buffers.len() as u32,
+                    }
+                } else {
+                    bg::ShaderBinding::BufferAlias { binding: 5 }
                 },
             ));
         }
-        let source = self.builder.source(
-            &self.kernels,
-            &views.iter().map(Vec::len).collect::<Vec<_>>(),
-        );
+        let source = self.builder.source(&self.kernels, buffers.len());
         let key = SharedPipelineKey {
             context: Arc::as_ptr(&self.gpu) as usize,
             entry_point: "graph_main",
@@ -685,7 +685,7 @@ impl Graph {
             parameters: Allocation::new(&self.gpu, "graph parameters", &parameters, false),
             initial_queue: Allocation::new(&self.gpu, "graph reset", &queue, false),
             queue: Allocation::new(&self.gpu, "graph queue", &queue, true),
-            views,
+            buffers,
             config,
             tasks,
             graph_nodes,

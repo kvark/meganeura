@@ -1,9 +1,41 @@
 # Device graph memory contract
 
 Milestone 1 is complete. Milestone 2 selects the existing native fence extension
-for the bounded protocol below. Compiler-output checks and device tests qualify
-the Vulkan path. Session applies it to compatible tile regions; operator coverage
-and performance qualification are recorded separately in the implementation plan.
+for the bounded protocol below. The whole-graph path now preserves descriptor
+identity across types and slices; the regional path still needs that repair.
+Passing device tests alone does not establish the memory-model contract: the
+publication argument also requires the shared-reference condition below.
+
+## Descriptor-reference audit and repair
+
+The Vulkan [reference definition](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html#memory-model-reference)
+identifies a storage-buffer reference with its descriptor, including the array
+element. Shader-only write/read and write/write
+[location ordering](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html#memory-model-location-ordered)
+requires the same reference. Distinct descriptors pointing into the same physical
+buffer do not satisfy that condition. Coherent accesses and shader fences alone
+do not repair it; ordering through the device domain requires API synchronization.
+
+At `c4a9cc0`, whole-graph tables deduplicate `(buffer, offset)` independently for
+each storage type. A SmolVLA audit observes one buffer shared across typed tables
+in forward execution; training has 37 cross-table occurrences and 282 occurrences
+of a buffer already present at a different offset. These counts identify possible
+reference aliases, not exact overlapping access ranges. Regional scheduling also
+needs review because handlers can have distinct descriptors for shared storage.
+
+The repair uses one descriptor at offset zero per backing buffer. Node offsets
+become shader parameters, and typed declarations map to the same descriptor
+binding and array index. Vulkan explicitly permits these
+[typed binding aliases](https://docs.vulkan.org/spec/latest/chapters/interfaces.html#interfaces-resources-setandbinding).
+Their SPIR-V declarations need `Aliased`; Naga's access analysis must account for
+writes through every declaration mapped to the same descriptor. Ordinary WGSL
+validation remains intact: aliasing is an explicit native backend mapping.
+
+Historical measurements remain hardware observations, not portable correctness
+qualification, even after the repaired implementation passes new tests. In
+particular, read-only and visibility-removal prototypes are not eligible for
+acceptance based on their timings. Their coherent cross-binding treatment is
+superseded by the shared-reference requirement.
 
 ## Smallest candidate interface
 
@@ -28,29 +60,29 @@ workgroup. These are rules in the
 Availability and visibility are handled explicitly by **every payload lane**;
 ordering a leader's atomics alone is insufficient.
 
-The SPIR-V writer keeps accesses private when it sees no writes to their global
-variable. Read-only handler bindings that alias another binding's mutable output
-therefore need `@coherent`; declaring them `read_write` alone is insufficient
-because the optimization uses actual writes. This existing annotation prevents
-private-access elision and adds queue-family per-access visibility/availability.
-Decorate every such cross-binding communication path. Generated pointwise and
-reduction bodies retain plain bindings for immutable weights/inputs. Converted
-ordinary implementations conservatively decorate all storage globals in native
-regions until their exact binding-to-alias metadata is shared with the planner.
-Pointer parameters currently lose global decoration provenance, so the converter
-rejects storage-pointer helper types and the qualified bodies access globals
-directly.
-Compiler tests must cover the aliased read-only case explicitly.
+The repaired SPIR-V writer groups storage globals by their final mapped
+descriptor set and binding. Multiple declarations in a group receive `Aliased`.
+Declared access flags and actual write/atomic uses are combined across the
+reachable declarations. This prevents a read-only declaration from acquiring
+`NonWritable` or private-access assumptions when another declaration writes the
+same descriptor. An entry point that has no such writes retains the immutable
+optimization. Ordinary IR binding validation is unchanged; native remapping is
+explicit in the existing backend binding map.
 
-Whole-graph descriptor tables share one global across handlers of the same
-storage type. If reachable handlers write that global, Naga already retains
-NonPrivatePointer on all its accesses. These tables omit `@coherent` and use the
-lane-level fences below for availability/visibility, avoiding redundant per-access
-propagation. A read-only typed alias may still alias another table's writes;
-it retains `@coherent`. Code generation uses Naga's global-use analysis to make
-this distinction, and its SPIR-V test checks NonPrivatePointer and per-access
-operands for both table classes. No fence or ordering edge in the protocol is
-removed by this optimization; transitive graph edges retain the same reachability.
+Whole-graph typed tables map to one Blade buffer-array binding. Every backing
+buffer appears exactly once at offset zero; all views use its canonical array
+index. Original binding offsets are converted to element offsets and passed with
+that index through uniformly loaded node parameters. The converter requires
+directly indexed storage arrays and checks offset alignment and representability.
+Tensor accesses retain `NonPrivatePointer` when any reachable alias is written,
+and use the lane-level fences below for availability and visibility. They do
+not need redundant per-access propagation. Storage-pointer helpers remain
+rejected because pointer provenance is not preserved by the current converter.
+
+The regional backend still uses distinct handler bindings and coherent accesses.
+Its cross-descriptor publication remains unqualified; those annotations do not
+satisfy the same-reference requirement. The repaired whole-graph contract must
+not be attributed to that older path.
 
 ## Publication by all lanes
 
@@ -186,7 +218,7 @@ ring would require another protocol and is outside this initial contract.
 
 | Interface | Required changes | Decision |
 |---|---|---|
-| Existing fences, coherent bindings and relaxed atomics | Capability validation, honest backend rejection, explicit alias decoration and protocol checks | Sufficient for this protocol; selected |
+| Existing fences and relaxed atomics | Canonical descriptor references, alias-aware access flags, capability validation and protocol checks | Selected for the repaired whole-graph path |
 | Directional/scoped fences | New WGSL arguments or builtins, IR representation, validation of order/scope/storage combinations, updates to serialization and every reader/writer | Potentially cheaper than acquire/release at every fence, but no demonstrated requirement yet |
 | Ordered/scoped atomics | Changes across atomic loads, stores, RMW and compare-exchange, including separate CAS failure constraints; equivalent reader/writer and serialization work | Does not remove the need to publish/acquire every lane's non-atomic payload; defer until a measured benefit justifies it |
 
@@ -196,9 +228,9 @@ outcomes. The queue uses OR/AND and decrements, so it needs no CAS ordering API.
 Naga compaction retains fence statements and their order; constant evaluation
 does not evaluate atomic operations. Tests cover compaction followed by a WGSL
 round trip and inspect the resulting SPIR-V. No new optimization pass moves
-loads/stores across fences. Read-only aliases must remain decorated through
-shader composition, and pointer-argument decoration propagation is outside the
-qualified path.
+loads/stores across fences. Typed aliases retain descriptor identity and their
+shared access analysis through shader composition; storage-pointer helpers
+remain outside the accepted path.
 
 The compatibility changes are deliberate errors for previously unqualified
 paths: IR without the fence capability, Metal fence emission, and SPIR-V import
@@ -213,9 +245,50 @@ regressions; ordinary execution stays the default. The same paired harness must
 measure actual Session device scheduling before any adoption decision. The
 protocol stress runs below are correctness checks, not comparative benchmarks.
 
-## Qualification evidence
+## Descriptor repair validation, October 25
 
-The qualified pins are Naga
+The repair uses Naga
+[`bc7b70b`](https://github.com/kvark/wgpu/commit/bc7b70bc5d283202e1ec904dd244489f2fe0366a)
+and Blade
+[`c09c89f`](https://github.com/kvark/blade/commit/c09c89f79681f879ef37b28125b914be45fc1726).
+Blade's `BufferAlias` explicitly names an earlier buffer or buffer-array binding;
+aliases share its descriptor count and update storage. Invalid targets and alias
+chains are rejected. Other backends do not implement this native layout option.
+
+- Naga passes 144 unit, 269 integration and six documentation tests (24 ignored),
+  plus strict Clippy. The alias fixture checks combined and selected entry points,
+  private-access preservation for immutable inputs, `Aliased`/`NonWritable`, and
+  NonPrivatePointer. All six generated variants pass Vulkan 1.3 `spirv-val`.
+- Blade passes 21 unit tests (one ignored) and strict Clippy. Meganeura passes
+  665 library tests (eight ignored), all 168 strict whole-graph oracle tests,
+  eight focused GPU tests, and strict all-feature/all-target Clippy.
+- The GPU protocol fixture now reads `vec4<u32>` through a typed alias of its
+  scalar payload binding. Its 256 dispatches cover every lane, fan-in/fan-out,
+  ragged tiles, reset epochs and 1/3/64/4096 workers. The whole-graph optimizer
+  fixture covers nonzero arena offsets, large and small chunks sharing handlers,
+  and repeated recorded steps.
+- The required full Vulkan workspace run executes 1,152 tests: 1,144 pass,
+  eight fail, and six are skipped. All eight failure identities match the saved
+  pre-change baseline: three passthrough tests need `dxc`, and five depth/stencil
+  initialization tests fail. No new failure identities appear. This run selects
+  the NVIDIA Vulkan ICD and serializes tests.
+
+The initial Naga suite invocation lacked validation tools on `PATH`; rerunning
+with the installed tools passes. Its SPIRV-Cross version changes five generated
+GLSL snapshots, including integer-dot translation errors; the corresponding
+SPIR-V assembly is unchanged and those generated GLSL changes are discarded.
+The initial new fixture omitted `enable wgpu_binding_array`; that error and
+compile errors in tests referring to the removed view-write field were fixed
+before the successful runs above.
+
+Logs and the comparison of workspace failures are local under `target/alias-*`.
+Every build, test and analysis job uses the verified bounded cgroup launcher.
+These checks qualify the repaired whole-graph implementation on the tested
+device; they do not qualify the regional backend or the old timing prototypes.
+
+## Historical qualification evidence (descriptor audit supersedes the proof)
+
+The original tested pins were Naga
 [`f09d62e`](https://github.com/kvark/wgpu/commit/f09d62e54d743f89879e4e8dfb32e717146f2670)
 and Blade
 [`63fb651`](https://github.com/kvark/blade/commit/63fb651a3d0c7bad6964dba9b2585f794641862f).

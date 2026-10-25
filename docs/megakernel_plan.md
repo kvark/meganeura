@@ -4,7 +4,9 @@ Agreed direction, October 24, 2026. Implementation starts with **Milestone 1**,
 then proceeds to the **Naga investigation in Milestone 2**. The existing
 [prototype and measurements](megakernel.md) are the starting evidence.
 Milestone 1 is complete with explicit fallback and measured regressions.
-Milestone 2 qualifies the existing fence interface on Vulkan. The regional
+Milestone 2's descriptor-reference audit has been repaired for whole-graph
+execution; regional publication still needs review, as documented in the
+[memory contract](megakernel_memory_contract.md). The regional
 backend remains available for comparison. The next milestone now implements
 **one persistent worker pool for the entire graph**, including optimizer,
 clipping and accumulation nodes, in a single compute dispatch. This is selected
@@ -15,9 +17,15 @@ The [NVIDIA counter investigation](megakernel_performance_analysis.md) identifie
 fixed worker sizing and portable queue overhead as the leading SmolVLA costs.
 Those measurements describe the regional implementation. Whole-graph execution
 has a different resource and scheduling cost and needs its own measurements;
-the qualified memory-ordering contract remains unchanged.
+the descriptor-reference repair requires fresh measurements.
 
 ## Whole-graph milestone
+
+- [x] Canonicalize backing-buffer descriptors across typed views and offsets;
+  add explicit native binding aliases and alias-aware SPIR-V access analysis.
+  Recheck cross-type publication, slices and optimizer chunks before accepting
+  more performance changes.
+- [ ] Audit and repair descriptor identity in the regional device-scheduled path.
 
 - [x] Reuse and deduplicate the selected ordinary tile implementations, preserving
   their arithmetic and logical geometry. Adapt smaller workgroups without

@@ -20,15 +20,25 @@ Ordinary execution remains the default. The older region implementation remains
 available by leaving `whole_graph` off. Its earlier counter results do not
 describe the costs of this combined shader.
 
+On this Linux profiling host, launch GPU tests and measurements with
+`python3 scripts/run_bounded_job.py LABEL --gpu -- COMMAND ...`. Each job gets a
+separate verified cgroup (16 GiB soft memory limit, 20 GiB hard limit, 1 GiB swap).
+The GPU flag holds a shared file lock across command execution, so marked jobs
+cannot overlap. Library tests also use the GPU and need this flag. Builds use
+the same launcher without the GPU flag; finish them before primary measurements.
+
 ## Resource and arithmetic contract
 
 The same implementation selector and binding function supply ordinary and
 whole-graph execution. A Blade visitor captures buffers and plain parameter
 bytes, including the optimizer's existing segmented arena bindings. Kernels are
-deduplicated by source, call and layout. Per-type descriptor arrays replace a
-bind group for every operation. Node parameter records select descriptors and
-carry the original uniform bytes. Uniform word offsets are fixed by each
-handler's layout; descriptor indices are passed by value through its helpers.
+deduplicated by source, call and layout. Typed declarations alias one descriptor
+array, with exactly one descriptor at offset zero per backing buffer. Node
+parameters select its canonical array index and carry the original binding's
+element offset and uniform bytes. This preserves descriptor identity across
+types, slices and optimizer chunks, as required by shader-only synchronization.
+Uniform word offsets are fixed by each handler's layout; descriptor indices and
+element offsets are passed by value through its helpers.
 
 One physical workgroup is at least 256 invocations and must be a multiple of
 each selected logical workgroup. Eligible smaller tiles share the worker in
@@ -76,8 +86,10 @@ are rejected because distinct handles may alias without a provable relationship.
 Workgroup cooperative tiles must already match the physical workgroup size;
 atomic side effects currently require matching geometry as well. Unsupported
 resources reject whole-graph selection even when regional fallback is enabled.
-This is an opt-in Vulkan path, qualified on the RTX 5080; it is not unrestricted
-support for arbitrary shaders or hardware.
+Storage arrays must be directly indexed and binding offsets must be divisible
+by their element stride. This is an opt-in Vulkan path tested on the RTX 5080;
+the [descriptor-reference audit](megakernel_memory_contract.md) supersedes earlier
+qualification claims. It is not unrestricted support for arbitrary shaders or hardware.
 
 ## Dependencies and completion
 
@@ -93,9 +105,10 @@ backing allocation create RAW/WAR/WAW edges, covering arena slices and lifetime
 reuse. The initial implementation conservatively orders the entire allocation,
 which can serialize independent slices. Transitive dependency edges are omitted
 without changing reachability. Producer and consumer lanes use the existing
-[native fence protocol](megakernel_memory_contract.md). Written descriptor tables
-use NonPrivatePointer accesses and tile-boundary fences; read-only typed aliases
-retain their explicit coherent annotation.
+[native fence protocol](megakernel_memory_contract.md). Naga combines writes
+across all declarations mapped to the same descriptor binding, preserving
+NonPrivatePointer accesses through typed aliases. Tile-boundary fences provide
+availability and visibility, with explicit SPIR-V `Aliased` decorations.
 The ready load, tile-completion RMWs and predecessor RMWs carry the ordering
 chain; every consumer lane performs its own storage visibility operation.
 

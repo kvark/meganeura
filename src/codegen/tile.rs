@@ -263,7 +263,10 @@ pub(crate) fn lift_uniforms(mut tile: Tile) -> Result<Tile, String> {
     let index_ty = module.types.insert(
         Type {
             name: None,
-            inner: TypeInner::Scalar(Scalar::U32),
+            inner: TypeInner::Vector {
+                size: naga::VectorSize::Bi,
+                scalar: Scalar::U32,
+            },
         },
         Span::UNDEFINED,
     );

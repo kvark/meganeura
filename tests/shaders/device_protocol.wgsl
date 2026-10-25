@@ -10,7 +10,7 @@ struct Params {
     workers_offset: u32, worker_count: u32, padding0: u32, padding1: u32,
 }
 var<storage, read_write> payload: array<u32>;
-@coherent var<storage, read> incoming: array<u32>;
+var<storage, read> incoming: array<vec4<u32>>;
 var<storage, read> nodes: array<Node>;
 var<storage, read> edges: array<u32>;
 var<storage, read> tasks: array<vec2<u32>>;
@@ -56,7 +56,8 @@ fn main(@builtin(workgroup_id) worker: vec3<u32>, @builtin(local_invocation_inde
             for (var p = 0u; p < node.pred_count; p += 1u) {
                 let predecessor = nodes[edges[node.first_pred + p]];
                 let source = (index * 17u + node_id * 13u + params.seed) % predecessor.extent;
-                value += incoming[predecessor.data_offset + source];
+                let offset = predecessor.data_offset + source;
+                value += incoming[offset / 4u][offset % 4u];
             }
             for (var delay = 0u; delay < (node_id % 5u) * 3u; delay += 1u) {
                 value = value * 1664525u + 1013904223u;

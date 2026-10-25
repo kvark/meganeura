@@ -9,7 +9,7 @@ use std::{
 
 pub(crate) struct BufferBinding {
     pub slot: usize,
-    pub view: usize,
+    pub stride: u32,
     pub write: bool,
 }
 
@@ -47,7 +47,6 @@ impl Kernel {
 pub(crate) struct View {
     pub name: String,
     ty: String,
-    written: bool,
 }
 
 struct Scratch {
@@ -133,10 +132,7 @@ impl Builder {
                 else {
                     continue;
                 };
-                let mut source = candidate.source(
-                    std::slice::from_ref(&kernel),
-                    &vec![1; candidate.views.len()],
-                );
+                let mut source = candidate.source(std::slice::from_ref(&kernel), 1);
                 // Admission only: apply the scope-aware cooperative checker
                 // to barrier control, including helper arguments and locals.
                 for barrier in [
@@ -182,7 +178,7 @@ impl Builder {
         let body = tile::mask_extra_lanes(body, self.threads)?;
         let body = tile::lift_uniforms(body)?;
         self.parameter_words = self.parameter_words.max(
-            layout.bindings.len()
+            2 * layout.bindings.len()
                 + layout
                     .bindings
                     .iter()
@@ -197,7 +193,7 @@ impl Builder {
         let source = body.source.replace("$PREFIX", &prefix);
         let module =
             naga::front::wgsl::parse_str(&source).map_err(|e| e.emit_to_string(&source))?;
-        let info = tile::validate(&module)?;
+        tile::validate(&module)?;
         let mut layouter = naga::proc::Layouter::default();
         layouter
             .update(module.to_ctx())
@@ -208,6 +204,7 @@ impl Builder {
         let mut parameters = String::new();
         let mut shared_slots = HashMap::new();
         let mut shared_offsets = HashMap::new();
+        let mut buffer_offsets = HashMap::new();
         for (handle, global) in module.global_variables.iter() {
             let name = global.name.as_deref().ok_or("unnamed graph global")?;
             let range = module
@@ -226,6 +223,14 @@ impl Builder {
                         .position(|b| b.0 == original)
                         .ok_or_else(|| format!("missing binding {original}"))?;
                     let ty = type_name(&module.types, global.ty)?;
+                    let stride = match module.types[global.ty].inner {
+                        TypeInner::Array { stride, .. } => stride,
+                        _ => {
+                            return Err(
+                                "whole-graph storage requires directly indexed arrays".into()
+                            );
+                        }
+                    };
                     let view = self
                         .views
                         .iter()
@@ -235,23 +240,21 @@ impl Builder {
                             self.views.push(View {
                                 name: format!("graph_buffers_{i}"),
                                 ty,
-                                written: false,
                             });
                             i
                         });
-                    self.views[view].written |= module.functions.iter().any(|(function, _)| {
-                        info[function][handle].contains(naga::valid::GlobalUse::WRITE)
-                    });
                     names.insert(
                         name.to_owned(),
                         format!(
-                            "{}[{name}_binding_index_argument].data",
+                            "{}[{name}_binding_index_argument.x].data",
                             self.views[view].name
                         ),
                     );
+                    buffer_offsets
+                        .insert(name.to_owned(), format!("{name}_binding_index_argument.y"));
                     buffers.push(BufferBinding {
                         slot,
-                        view,
+                        stride,
                         write: access.contains(naga::StorageAccess::STORE),
                     });
                     replacements.push((range, String::new()));
@@ -267,7 +270,7 @@ impl Builder {
                         .position(|b| b.0 == binding_index.unwrap_or(original))
                         .ok_or_else(|| format!("missing uniform {original}"))?;
                     let ty = type_name(&module.types, global.ty)?;
-                    let base = layout.bindings.len()
+                    let base = 2 * layout.bindings.len()
                         + layout.bindings[..slot]
                             .iter()
                             .map(|b| match b.1 {
@@ -276,7 +279,11 @@ impl Builder {
                             })
                             .sum::<usize>();
                     let value = if binding_index.is_some() {
-                        format!("graph_parameter_values[{slot}u]")
+                        format!(
+                            "vec2<u32>(graph_parameter_values[{}u], graph_parameter_values[{}u])",
+                            2 * slot,
+                            2 * slot + 1
+                        )
                     } else {
                         uniform_value(&module.types, global.ty, base, 0)?
                     };
@@ -351,6 +358,7 @@ impl Builder {
                 .to_range()
                 .ok_or("missing graph function span")?;
             let mut local_names = names.clone();
+            let mut local_offsets = buffer_offsets.clone();
             let mut function_source = source[range.clone()].to_owned();
             if packing_size > 1 {
                 let argument = function
@@ -378,7 +386,10 @@ impl Builder {
                     .ok_or("missing descriptor argument")?;
                 let replacement = local_names.get_mut(name).unwrap();
                 *replacement = replacement.replace(&prefix, argument);
+                let offset = local_offsets.get_mut(name).unwrap();
+                *offset = offset.replace(&prefix, argument);
             }
+            function_source = offset_arrays(&function_source, &local_offsets)?;
             replacements.push((
                 range.clone(),
                 tile::rename_tokens(&function_source, &local_names),
@@ -491,8 +502,8 @@ impl Builder {
         })
     }
 
-    pub fn source(&self, kernels: &[Kernel], view_counts: &[usize]) -> String {
-        assert_eq!(view_counts.len(), self.views.len());
+    pub fn source(&self, kernels: &[Kernel], count: usize) -> String {
+        assert!(count > 0);
         let mut enables = BTreeSet::new();
         let mut handlers = String::new();
         for kernel in kernels {
@@ -507,14 +518,11 @@ impl Builder {
             }
         }
         let mut buffers = String::new();
-        for (i, (view, &count)) in self.views.iter().zip(view_counts).enumerate() {
-            assert!(count > 0);
-            // Written globals retain NonPrivatePointer on every access. Their
-            // availability/visibility is supplied by the tile-boundary fences.
-            // Read-only typed aliases still need the explicit decoration to
-            // prevent Naga's immutable-global private-access optimization.
-            let decoration = if view.written { "" } else { "@coherent " };
-            writeln!(buffers, "struct GraphBuffer{i} {{ data: {} }}\n{decoration}var<storage, read_write> {}: binding_array<GraphBuffer{i}, {count}>;", view.ty, view.name).unwrap();
+        for (i, view) in self.views.iter().enumerate() {
+            // All typed views map to the same descriptor binding. The backend
+            // preserves NonPrivatePointer when any of those aliases is written.
+            // Availability/visibility comes from the tile-boundary fences.
+            writeln!(buffers, "struct GraphBuffer{i} {{ data: {} }}\nvar<storage, read_write> {}: binding_array<GraphBuffer{i}, {count}>;", view.ty, view.name).unwrap();
         }
         let mut shared = String::new();
         for (i, s) in self.scratch.iter().enumerate() {
@@ -584,9 +592,17 @@ fn offset_scratch(
     arrays: &HashMap<String, u32>,
     group: &str,
 ) -> Result<String, String> {
+    let offsets = arrays
+        .iter()
+        .map(|(name, count)| (name.clone(), format!("{count}u * {group}")))
+        .collect();
+    offset_arrays(source, &offsets)
+}
+
+fn offset_arrays(source: &str, arrays: &HashMap<String, String>) -> Result<String, String> {
     let mut insertions = Vec::new();
     let identifier = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
-    for (name, &count) in arrays {
+    for (name, offset) in arrays {
         for (start, _) in source.match_indices(name) {
             let end = start + name.len();
             if start != 0 && identifier(source.as_bytes()[start - 1])
@@ -596,7 +612,7 @@ fn offset_scratch(
             }
             let opening = end + source[end..].len() - source[end..].trim_start().len();
             if source.as_bytes().get(opening) != Some(&b'[') {
-                return Err("packed scratch arrays must be directly indexed".into());
+                return Err(format!("graph array {name} must be directly indexed"));
             }
             let mut depth = 0;
             let closing = source[opening..]
@@ -609,8 +625,8 @@ fn offset_scratch(
                     }
                     (depth == 0).then_some(opening + i)
                 })
-                .ok_or("unterminated scratch index")?;
-            insertions.push((opening + 1, format!("{count}u * {group} + (")));
+                .ok_or("unterminated array index")?;
+            insertions.push((opening + 1, format!("{offset} + u32(")));
             insertions.push((closing, ")".to_owned()));
         }
     }
@@ -771,14 +787,40 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(kernels.last().unwrap().batch_size, 4);
-        assert!(builder.views.iter().any(|view| view.written));
-        assert!(builder.views.iter().any(|view| !view.written));
-        let source = builder.source(&kernels, &vec![6; builder.views.len()]);
+        assert!(builder.views.len() > 1);
+        let source = builder.source(&kernels, 6);
         assert!(!source.contains("graph_packing_sync_probe"));
-        let module = naga::front::wgsl::parse_str(&source)
+        let mut module = naga::front::wgsl::parse_str(&source)
             .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));
+        let mut binding_map = naga::back::spv::BindingMap::default();
+        for (handle, global) in module.global_variables.iter_mut() {
+            if matches!(
+                global.space,
+                naga::AddressSpace::Storage { .. } | naga::AddressSpace::Uniform
+            ) {
+                let binding = naga::ResourceBinding {
+                    group: 0,
+                    binding: handle.index() as u32,
+                };
+                global.binding = Some(binding);
+                if builder
+                    .views
+                    .iter()
+                    .any(|view| global.name.as_deref() == Some(&view.name))
+                {
+                    binding_map.insert(
+                        binding,
+                        naga::back::spv::BindingInfo {
+                            descriptor_set: 0,
+                            binding: 999,
+                            binding_array_size: Some(6),
+                        },
+                    );
+                }
+            }
+        }
         let info = naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all() - naga::valid::ValidationFlags::BINDINGS,
+            naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::all(),
         )
         .validate(&module)
@@ -792,6 +834,7 @@ mod tests {
                 lang_version: (1, 6),
                 flags: naga::back::spv::WriterFlags::DEBUG,
                 use_vulkan_memory_model: true,
+                binding_map,
                 ..Default::default()
             },
             None,
@@ -799,14 +842,16 @@ mod tests {
         .unwrap();
         let mut roots = std::collections::HashMap::new();
         let mut names = std::collections::HashMap::new();
-        let mut loads = [0; 2];
+        let mut loads = std::collections::HashMap::<String, usize>::new();
         let mut stores = 0;
+        let mut aliases = 0;
         let mut cursor = 5;
         while cursor < words.len() {
             let count = (words[cursor] >> 16) as usize;
             let opcode = words[cursor] & 0xffff;
             let operands = &words[cursor + 1..cursor + count];
             match opcode {
+                71 if operands[1] == 20 => aliases += 1, // OpDecorate Aliased
                 5 => {
                     // OpName
                     let bytes = operands[1..]
@@ -837,13 +882,9 @@ mod tests {
                             0,
                             "every tensor access must be NonPrivatePointer"
                         );
-                        assert_eq!(
-                            access & 24 != 0,
-                            !view.written,
-                            "only immutable typed aliases need per-access propagation"
-                        );
+                        assert_eq!(access & 24, 0, "typed aliases use the publication fences");
                         if opcode == 61 {
-                            loads[usize::from(view.written)] += 1;
+                            *loads.entry(view.name.clone()).or_default() += 1;
                         } else {
                             stores += 1;
                         }
@@ -853,6 +894,13 @@ mod tests {
             }
             cursor += count;
         }
-        assert!(loads.iter().all(|&count| count > 0) && stores > 0);
+        assert!(
+            builder
+                .views
+                .iter()
+                .all(|view| loads.contains_key(&view.name))
+                && stores > 0
+        );
+        assert_eq!(aliases, builder.views.len());
     }
 }

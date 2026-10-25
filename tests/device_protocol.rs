@@ -32,7 +32,6 @@ struct Params {
 #[derive(blade_macros::ShaderData)]
 struct Bindings {
     payload: bg::BufferPiece,
-    incoming: bg::BufferPiece,
     nodes: bg::BufferPiece,
     edges: bg::BufferPiece,
     tasks: bg::BufferPiece,
@@ -75,7 +74,7 @@ fn check_graph(gpu: &bg::Context, pipeline: &bg::ComputePipeline, graph: &[(u32,
         buffers.push(buffer);
         buffer
     };
-    let payload_bytes = u64::from(data_len.max(1)) * 4;
+    let payload_bytes = u64::from(data_len.max(1).next_multiple_of(4)) * 4;
     let payload = allocate("protocol payload", payload_bytes, bg::Memory::Device);
     let mut metadata = Vec::new();
     for bytes in [
@@ -151,7 +150,6 @@ fn check_graph(gpu: &bg::Context, pipeline: &bg::ComputePipeline, graph: &[(u32,
             }
             let bindings = Bindings {
                 payload: payload.into(),
-                incoming: payload.into(),
                 nodes: metadata[0].into(),
                 edges: metadata[1].into(),
                 tasks: metadata[2].into(),
@@ -242,7 +240,10 @@ fn all_lane_fences_publish_device_graphs_and_reuse_ready_slots() {
             naga_module: None,
         })
         .unwrap();
-    let layout = <Bindings as bg::ShaderData>::layout();
+    let mut layout = <Bindings as bg::ShaderData>::layout();
+    layout
+        .bindings
+        .push(("incoming", bg::ShaderBinding::BufferAlias { binding: 0 }));
     let mut pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
         name: "device graph protocol",
         data_layouts: &[&layout],

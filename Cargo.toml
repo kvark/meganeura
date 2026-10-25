@@ -70,10 +70,10 @@ profiler = ["dep:tracing-subscriber"]
 
 [dependencies]
 # FP16 denormal preservation: https://github.com/kvark/blade/pull/416.
-blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "fd04c27dff43ab02894186d26078afeb833c9631" }
-blade-macros = { version = "0.3", git = "https://github.com/kvark/blade", rev = "fd04c27dff43ab02894186d26078afeb833c9631" }
+blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "c09c89f79681f879ef37b28125b914be45fc1726" }
+blade-macros = { version = "0.3", git = "https://github.com/kvark/blade", rev = "c09c89f79681f879ef37b28125b914be45fc1726" }
 # Reuse selected compute implementations as persistent callable tiles.
-naga = { git = "https://github.com/kvark/wgpu", rev = "f4fe7e85790d44f46c7107675ca075a3471d6163", version = "30", default-features = false, features = ["wgsl-in", "wgsl-out"] }
+naga = { git = "https://github.com/kvark/wgpu", rev = "bc7b70bc5d283202e1ec904dd244489f2fe0366a", version = "30", default-features = false, features = ["wgsl-in", "wgsl-out"] }
 # `default-features = false` drops egglog's `bin` stack (clap, mimalloc,
 # env_logger, chrono, graphviz); library builds use the shared rewrite engine.
 egglog = { version = "3.0", default-features = false }
@@ -98,7 +98,7 @@ tracing-subscriber = { version = "0.3", optional = true, features = ["registry"]
 # downstream crates that just want the inference runtime.
 [dev-dependencies]
 # SPIR-V inspection for tests and developer tools.
-naga = { git = "https://github.com/kvark/wgpu", rev = "f4fe7e85790d44f46c7107675ca075a3471d6163", version = "30", default-features = false, features = ["spv-out"] }
+naga = { git = "https://github.com/kvark/wgpu", rev = "bc7b70bc5d283202e1ec904dd244489f2fe0366a", version = "30", default-features = false, features = ["spv-out"] }
 # Replay small paired timing differences without lossy f64 JSON parsing.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 env_logger = "0.11"
