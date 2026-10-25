@@ -16,6 +16,8 @@ use std::{
 };
 
 pub(super) struct Program {
+    /// Final physical kernels: preserve them during construction and skip private tuning.
+    pub prepared: bool,
     pub description: String,
     pub plan: ExecutionPlan,
     /// Unspecified candidates retain the incumbent's measured submission choice.
@@ -24,7 +26,7 @@ pub(super) struct Program {
     pub origin: Option<Origin>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct Origin {
     pub form: usize,
     pub choice: usize,
@@ -36,6 +38,8 @@ pub(super) trait Frontier {
     fn next(&mut self, incumbent: Option<Origin>) -> Option<Program>;
     /// Whole-program qualification, including candidates that did not win.
     fn observe(&mut self, _origin: Origin, _qualified: bool) {}
+    /// A qualified winner, including its actual tuned kernels, for local neighbors.
+    fn selected(&mut self, _origin: Option<Origin>, _plan: &ExecutionPlan) {}
     /// Whether a later call could still return a program.
     fn may_remain(&self) -> bool;
     /// Arithmetic alternatives that should get a comparison opportunity before
@@ -79,7 +83,7 @@ pub struct BuildSearchTrial {
     /// Pending early arithmetic programs sharing this trial's private kernel
     /// budget. Capped by the remaining program slots; all must still qualify.
     pub early_programs_reserved: usize,
-    /// Absent for the initial, untuned fallback.
+    /// Absent for the initial fallback and prepared, fixed-kernel neighbors.
     pub kernel_tuning: Option<TuneReport>,
     pub outcome: TuneOutcome<(), usize>,
 }
@@ -264,6 +268,7 @@ pub(super) fn select(
     let mut selected_chunks = 1;
     let mut selected_description = String::new();
     let mut selected_plan: Option<ExecutionPlan> = None;
+    let mut selected_prepared = false;
     let mut pending_submissions = VecDeque::new();
     let mut pending_tuned = None;
     let mut initial_tuning_queued = false;
@@ -322,6 +327,7 @@ pub(super) fn select(
                     pending_submissions
                         .pop_front()
                         .map(|submission_chunks| Program {
+                            prepared: selected_prepared,
                             description: selected_description.clone(),
                             plan: selected_plan.as_ref().unwrap().clone(),
                             submission_chunks: Some(submission_chunks),
@@ -375,15 +381,16 @@ pub(super) fn select(
             let build = Instant::now();
             // Preserve the original kernel candidates for memo reuse by submission probes.
             let original_plan = program.plan.clone();
-            let mut candidate = match incumbent {
-                Some((ref mut baseline, _)) => Session::with_context_opts_inheriting(
-                    program.plan,
-                    gpu.clone(),
-                    runtime.clone(),
-                    baseline,
-                ),
-                None => Session::with_context_opts(program.plan, gpu.clone(), runtime.clone()),
-            };
+            let mut candidate = Session::with_search_plan(
+                program.plan,
+                gpu.clone(),
+                runtime.clone(),
+                incumbent.as_mut().map(|entry| &mut entry.0),
+                program.prepared,
+            );
+            if program.prepared && candidate.plan() != &original_plan {
+                return Err("prepared search plan changed during construction".into());
+            }
             candidate.set_submission_chunks(submission_chunks);
             log::debug!("program {index} constructed; initializing");
             trial.construction_time = build.elapsed();
@@ -398,7 +405,7 @@ pub(super) fn select(
                 let state = SearchState::capture(&mut candidate, options.max_plan_bytes)?;
                 trial.state_copy_time += copy_start.elapsed();
                 trial.snapshot_bytes = state.bytes();
-                if incumbent.is_some() {
+                if incumbent.is_some() && !program.prepared {
                     // Do not spend kernel probes on an invalid program.
                     // Memoized winners still need whole-program acceptance.
                     let mut step = incumbent_step;
@@ -529,8 +536,12 @@ pub(super) fn select(
                     // The first program is a qualified ordinary fallback.
                     // Tuning it, including memo reuse, is a separate challenger
                     // charged to the same program, time and memory bounds.
-                    if incumbent.is_none() && candidate.has_tunable_kernels(&options.tuning) {
+                    if incumbent.is_none()
+                        && !program.prepared
+                        && candidate.has_tunable_kernels(&options.tuning)
+                    {
                         pending_tuned = Some(Program {
+                            prepared: false,
                             description: program.description.clone(),
                             plan: original_plan.clone(),
                             submission_chunks: program.submission_chunks,
@@ -543,10 +554,12 @@ pub(super) fn select(
                     // Its last execution was its qualification.
                     incumbent_checked = true;
                     incumbent_bytes = plan_bytes(candidate.plan())?;
+                    programs.selected(program.origin.or(incumbent_origin), candidate.plan());
                     incumbent = Some((candidate, state));
                     selected_chunks = submission_chunks;
                     selected_description = program.description;
                     selected_plan = Some(original_plan);
+                    selected_prepared = program.prepared;
                     // A program without an origin keeps the coordinate frontier
                     // where it was.
                     incumbent_origin = program.origin.or(incumbent_origin);
@@ -732,6 +745,7 @@ mod tests {
         assert_eq!(baseline.dispatches, alternate.dispatches);
         assert_ne!(baseline.knobs, alternate.knobs);
         let programs = [baseline.clone(), alternate, baseline].map(|plan| Program {
+            prepared: false,
             description: format!("interleave={}", plan.knobs.flash.interleave),
             plan,
             submission_chunks: Some(1),
@@ -836,6 +850,7 @@ mod tests {
                 let mut plan = plan.clone();
                 plan.dispatches[0].label = name.into();
                 Program {
+                    prepared: false,
                     description: name.into(),
                     plan,
                     submission_chunks: (name == "baseline").then_some(2),
@@ -977,6 +992,7 @@ mod tests {
             })
             .collect();
         let programs = (0..3).map(|index| Program {
+            prepared: false,
             description: index.to_string(),
             plan: plan.clone(),
             submission_chunks: Some(1),
@@ -1075,6 +1091,7 @@ mod tests {
                 let initialized = std::cell::Cell::new(0);
                 let skipped = std::cell::Cell::new(0);
                 let programs = (0..3).map(|index| Program {
+                    prepared: false,
                     description: index.to_string(),
                     plan: plan.clone(),
                     submission_chunks: Some(1),
@@ -1176,6 +1193,7 @@ mod tests {
             let search = || {
                 select(
                     [1, 2].map(|chunks| Program {
+                        prepared: false,
                         description: "ordinary".into(),
                         plan: plan.clone(),
                         submission_chunks: Some(chunks),
@@ -1334,6 +1352,7 @@ mod tests {
             let mut untuned = Vec::new();
             let (mut session, report) = select(
                 [Program {
+                    prepared: false,
                     description: "ordinary".into(),
                     plan: plan.clone(),
                     submission_chunks: Some(1),
@@ -1439,6 +1458,7 @@ mod tests {
         graph.set_outputs(vec![y]);
         let plan = crate::compile::compile(&graph);
         (0..count).map(move |index| Program {
+            prepared: false,
             description: index.to_string(),
             plan: plan.clone(),
             submission_chunks: Some(1),
@@ -1707,6 +1727,7 @@ mod tests {
                     },
                 );
                 Program {
+                    prepared: false,
                     description: splits.to_string(),
                     plan,
                     submission_chunks: Some(splits as usize),

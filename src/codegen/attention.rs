@@ -12,12 +12,17 @@ pub(crate) fn attention_coop_shared_bytes(group: ShaderGroup, head_dim: u32) -> 
         ShaderGroup::FlashAttentionCoop => (128u64, 1024),
         ShaderGroup::FlashAttentionCoopF32 => (192, 1024),
         ShaderGroup::FlashAttentionProducts => {
-            return 160 * u64::from(head_dim).next_multiple_of(16) + 1536;
+            return attention_product_shared_bytes(head_dim, 16);
         }
         ShaderGroup::AttentionGrad(kernel) => return kernel.shared_bytes(head_dim),
         _ => unreachable!("shared-memory accounting requires cooperative attention"),
     };
     per_dim * u64::from(head_dim) + fixed
+}
+
+/// Shared Q/K/V, scores, probabilities and F32 PV results for a 16-query block.
+pub(crate) fn attention_product_shared_bytes(head_dim: u32, keys: u32) -> u64 {
+    (96 + 4 * u64::from(keys)) * u64::from(head_dim).next_multiple_of(16) + 96 * u64::from(keys)
 }
 
 /// Split a head into power-of-two thread groups, with `ept * tpq = head_dim`.
@@ -282,13 +287,36 @@ fn generate_flash_attention(
 /// The fixed query block is 16 rows; `rows` selects an advertised 8x16 or
 /// 16x16 native product. Padding keeps head/key/query tails inside scratch.
 pub fn generate_flash_attention_product_module(head_dim: u32, rows: u32) -> ShaderModule {
+    generate_flash_attention_product_module_with_keys(head_dim, rows, 16)
+}
+
+pub fn generate_flash_attention_product_module_with_keys(
+    head_dim: u32,
+    rows: u32,
+    keys: u32,
+) -> ShaderModule {
     assert!(head_dim > 0 && matches!(rows, 8 | 16));
     let padded = head_dim.next_multiple_of(16);
+    assert!(matches!(keys, 16 | 32 | 64));
+    let template = include_str!("../shaders/flash_attention_products.wgsl");
     attention_module(
         preprocess(
-            include_str!("../shaders/flash_attention_products.wgsl"),
+            template_section(template, "main"),
             &[
+                (
+                    "$QK_BODY",
+                    template_section(template, if keys == 16 { "qk16" } else { "qk_wide" }),
+                ),
+                (
+                    "$PV_BODY",
+                    template_section(template, if keys == 16 { "pv16" } else { "pv_wide" }),
+                ),
                 ("$PARAMS", ATTENTION_PARAMS_WGSL),
+                ("$QK_TILES_", &((16 / rows) * (keys / 16)).to_string()),
+                ("$KEY_TILES_", &(keys / 16).to_string()),
+                ("$KV_ELEMENTS", &(keys * padded).to_string()),
+                ("$SCORE_ELEMENTS", &(16 * keys).to_string()),
+                ("$KEYS", &keys.to_string()),
                 ("$PV_TILES_", &((16 / rows) * (padded / 16)).to_string()),
                 ("$HEAD_TILES_", &(padded / 16).to_string()),
                 ("$ELEMENTS", &(16 * padded).to_string()),
@@ -1423,9 +1451,13 @@ mod product_tests {
         let caps = naga::valid::Capabilities::SHADER_FLOAT16
             | naga::valid::Capabilities::COOPERATIVE_MATRIX
             | naga::valid::Capabilities::SUBGROUP;
-        for rows in [8, 16] {
+        for (rows, keys) in [8, 16]
+            .into_iter()
+            .flat_map(|rows| [16, 32, 64].map(|keys| (rows, keys)))
+        {
             for head_dim in [1, 5, 16, 48, 64, 80, 128, 256] {
-                let mut module = generate_flash_attention_product_module(head_dim, rows);
+                let mut module =
+                    generate_flash_attention_product_module_with_keys(head_dim, rows, keys);
                 let mut binding = 0;
                 for (_, global) in module.module.global_variables.iter_mut() {
                     if matches!(
@@ -1438,7 +1470,7 @@ mod product_tests {
                 }
                 let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), caps)
                     .validate(&module.module)
-                    .unwrap_or_else(|e| panic!("rows={rows} head={head_dim}: {e:?}"));
+                    .unwrap_or_else(|e| panic!("rows={rows} head={head_dim} keys={keys}: {e:?}"));
                 naga::back::spv::write_vec(
                     &module.module,
                     &info,

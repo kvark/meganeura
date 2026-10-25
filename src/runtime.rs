@@ -961,7 +961,7 @@ enum Variant {
     Reduction(u64),
     Pointwise(u64),
     /// Attention specialization includes the head width and the scalar
-    /// backward EPT cap. Both can differ between dispatches in one plan.
+    /// backward EPT cap or QK/PV key tile. These can differ within one plan.
     Attention(ShaderEntry, u32, Option<u32>),
     /// Epilogue-fused matmuls, keyed by their actual DAG. The cooperative form
     /// uses workgroup memory to expose accumulator lanes to the epilogue.
@@ -1114,6 +1114,12 @@ impl Variant {
             }
             Variant::Reduction(hash) => format!("generated-reduction:{hash:016x}"),
             Variant::Pointwise(hash) => format!("generated-pointwise:{hash:016x}"),
+            Variant::Attention(ShaderEntry::FlashAttentionProducts, head_dim, keys) => {
+                format!(
+                    "FlashAttentionProducts:head-dim-{head_dim}:keys-{}",
+                    keys.unwrap_or(16)
+                )
+            }
             Variant::Attention(ref e, head_dim, ept) => {
                 format!("{e:?}:head-dim-{head_dim}:ept-{ept:?}")
             }
@@ -2107,7 +2113,16 @@ impl Pipelines {
                     {
                         return Err("attention products require native 8/16x16 F16 matrices".into());
                     }
-                    crate::codegen::generate_flash_attention_product_module(hd, rows)
+                    let keys = ept.unwrap_or(16);
+                    if !matches!(keys, 16 | 32 | 64)
+                        || crate::codegen::attention_product_shared_bytes(hd, keys)
+                            > u64::from(gpu.capabilities().max_compute_shared_memory_size)
+                    {
+                        return Err("unsupported attention product key block".into());
+                    }
+                    crate::codegen::generate_flash_attention_product_module_with_keys(
+                        hd, rows, keys,
+                    )
                 }
                 ShaderGroup::FlashAttentionCoopF32 => {
                     let config = cooperative();
@@ -2349,6 +2364,11 @@ impl Pipelines {
         if let Some(dim) = Self::attention_head_dim(dispatch) {
             let ept = match dispatch.kernel {
                 crate::compile::Kernel::AttentionBackward { ept_cap } => Some(ept_cap),
+                crate::compile::Kernel::AttentionProducts { keys }
+                    if entry == ShaderEntry::FlashAttentionProducts =>
+                {
+                    Some(keys)
+                }
                 _ => None,
             };
             return Variant::Attention(entry, dim, ept);
@@ -4002,7 +4022,7 @@ impl Session {
     /// with explicit session options. [`Session::with_context`] is the
     /// defaults-taking shorthand.
     pub fn with_context_opts(plan: ExecutionPlan, gpu: Arc<Gpu>, opts: SessionOptions) -> Self {
-        Self::build_session_impl(plan, gpu, opts, None, false)
+        Self::build_session_impl(plan, gpu, opts, None, false, false)
     }
 
     pub(crate) fn with_context_opts_sharing(
@@ -4011,19 +4031,20 @@ impl Session {
         opts: SessionOptions,
         parameter_source: Option<&mut Session>,
     ) -> Self {
-        Self::build_session_impl(plan, gpu, opts, parameter_source, false)
+        Self::build_session_impl(plan, gpu, opts, parameter_source, false, false)
     }
 
     /// A measured-search challenger, constructed on the idle incumbent's
     /// identically stored parameters that neither program writes. Written
     /// parameters are search state, reset between trials, so they stay private.
-    pub(crate) fn with_context_opts_inheriting(
+    pub(crate) fn with_search_plan(
         plan: ExecutionPlan,
         gpu: Arc<Gpu>,
         opts: SessionOptions,
-        incumbent: &mut Session,
+        incumbent: Option<&mut Session>,
+        prepared: bool,
     ) -> Self {
-        Self::build_session_impl(plan, gpu, opts, Some(incumbent), true)
+        Self::build_session_impl(plan, gpu, opts, incumbent, true, prepared)
     }
 
     /// Create a session that reuses an externally-owned Blade GPU context.
@@ -4035,7 +4056,7 @@ impl Session {
     /// pipelines, the command encoder — on drop; the context is released
     /// once the last `Arc` clone is dropped.
     pub fn with_context(plan: ExecutionPlan, gpu: Arc<Gpu>) -> Self {
-        Self::build_session_impl(plan, gpu, SessionOptions::default(), None, false)
+        Self::build_session_impl(plan, gpu, SessionOptions::default(), None, false, false)
     }
 
     fn build_session_impl(
@@ -4044,6 +4065,7 @@ impl Session {
         opts: SessionOptions,
         mut parameter_source: Option<&mut Session>,
         immutable_only: bool,
+        prepared: bool,
     ) -> Self {
         if let Some(source) = parameter_source.as_deref_mut() {
             assert!(
@@ -4092,28 +4114,30 @@ impl Session {
         let mut plan = plan;
         let schedule_span = tracing::info_span!("schedule").entered();
 
-        // Per-dispatch kernel-variant selection: one pass, one owner.
-        select_variants(
-            &mut plan,
-            coop_config.as_ref(),
-            !opts.debug,
-            opts.coop == CoopPolicy::AllowF16,
-        );
-        workgroup::select(&mut plan, &gpu.capabilities(), &opts);
-        if let Some(head_dim) = plan
-            .dispatches
-            .iter()
-            .filter(|dispatch| dispatch.shader == ShaderEntry::FlashAttention)
-            .map(|dispatch| {
-                AttentionParams::from_words(&dispatch.params)
-                    .expect("invalid attention parameters")
-                    .head_dim
-            })
-            .max()
-        {
-            plan.knobs
-                .flash
-                .fit_shared_memory(head_dim, gpu.capabilities().max_compute_shared_memory_size);
+        if !prepared {
+            // Per-dispatch kernel-variant selection: one pass, one owner.
+            select_variants(
+                &mut plan,
+                coop_config.as_ref(),
+                !opts.debug,
+                opts.coop == CoopPolicy::AllowF16,
+            );
+            workgroup::select(&mut plan, &gpu.capabilities(), &opts);
+            if let Some(head_dim) = plan
+                .dispatches
+                .iter()
+                .filter(|dispatch| dispatch.shader == ShaderEntry::FlashAttention)
+                .map(|dispatch| {
+                    AttentionParams::from_words(&dispatch.params)
+                        .expect("invalid attention parameters")
+                        .head_dim
+                })
+                .max()
+            {
+                plan.knobs
+                    .flash
+                    .fit_shared_memory(head_dim, gpu.capabilities().max_compute_shared_memory_size);
+            }
         }
 
         // Order the dispatches into barrier groups. The compiler owns this because
@@ -4122,12 +4146,21 @@ impl Session {
         if opts.serial_dispatch {
             log::info!("MEGANEURA_SERIAL_DISPATCH: forcing one dispatch per pass");
         }
-        crate::compile::schedule_dispatches(
-            &mut plan,
-            opts.serial_dispatch,
-            !opts.serial_dispatch && !opts.debug,
-        );
-        let groups = std::mem::take(&mut plan.groups);
+        let groups = if prepared {
+            // The plan already owns its measured dispatch order and fusion.
+            if opts.serial_dispatch {
+                (0..plan.dispatches.len()).map(|i| i..i + 1).collect()
+            } else {
+                crate::compile::compute_groups(&plan.dispatches)
+            }
+        } else {
+            crate::compile::schedule_dispatches(
+                &mut plan,
+                opts.serial_dispatch,
+                !opts.serial_dispatch && !opts.debug,
+            );
+            std::mem::take(&mut plan.groups)
+        };
         log::info!(
             "{} dispatches → {} barrier groups",
             plan.dispatches.len(),
@@ -5239,6 +5272,50 @@ mod variant_tests {
         Dispatch, HorizMatMulKind, Pipelines, ShaderEntry, Variant, epilogue_pipeline_key,
         epilogue_tile, select_variants,
     };
+
+    #[test]
+    fn attention_product_tiles_have_distinct_pipeline_keys() {
+        let mut dispatch = Dispatch {
+            shader: ShaderEntry::FlashAttentionProducts,
+            params: vec![128, 128, (4 << 16) | 2, 64, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        let ordinary = Pipelines::key(&dispatch);
+        let mut keys = std::collections::HashSet::from([ordinary.clone()]);
+        for tile in [32, 64] {
+            dispatch.kernel = crate::compile::Kernel::AttentionProducts { keys: tile };
+            assert!(keys.insert(Pipelines::key(&dispatch)));
+        }
+        dispatch.kernel = crate::compile::Kernel::Default;
+        assert_eq!(Pipelines::key(&dispatch), ordinary);
+    }
+
+    #[test]
+    fn prepared_search_session_preserves_its_physical_plan() {
+        let mut graph = crate::Graph::new();
+        let x = graph.input("x", &[32, 64]);
+        let w = graph.parameter("w", &[64, 32]);
+        let y = graph.matmul(x, w);
+        graph.set_outputs(vec![y]);
+        let gpu = std::sync::Arc::new(
+            crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap(),
+        );
+        let opts = super::SessionOptions {
+            coop: crate::CoopPolicy::Disabled,
+            ..Default::default()
+        };
+        let mut source = super::Session::with_context_opts(
+            crate::compile::compile(&graph),
+            gpu.clone(),
+            opts.clone(),
+        );
+        source.set_parameter("w", &vec![0.125; 64 * 32]);
+        let plan = source.plan().clone();
+        let next =
+            super::Session::with_search_plan(plan.clone(), gpu, opts, Some(&mut source), true);
+        assert_eq!(next.plan(), &plan);
+        assert!(next.inherits_parameter(&source, "w"));
+    }
 
     fn relu_epilogue() -> crate::compile::MatMulEpilogue {
         crate::compile::MatMulEpilogue {

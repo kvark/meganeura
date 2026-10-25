@@ -461,9 +461,38 @@ fresh-execution counts.
   `attention-key-block-*`, including model/followup/profile/assembly assessments
   and `attention-key-block-source-v2-serialized` with hashes and external app
   modules. No training trajectory or bounded-search admission is claimed.
-- [ ] Evaluate class-local measured key-block selection, retaining 16 keys and
-  unchanged training admission. Confirm the SmolLM2 gain through bounded search
-  and independent holdouts before adding a production choice.
+- [x] Implement inference-only class-local measured key-block selection,
+  retaining 16 keys and unchanged training admission. The implementation on
+  `experiment/measured-attention-blocks` reaches 32 keys on Intel and 64 on
+  NVIDIA within fresh 30-second searches. Independent 100-sample holdouts at
+  matched counts improve SmolLM2 7.825→7.685 ms (-1.79%) and 3.645→3.592 ms
+  (-1.46%). Intel's plans differ only in key size. NVIDIA also selects a
+  different vocabulary-matmul tile; its separate key-only holdout improves
+  3.675→3.598 ms (-2.12%) at fixed graph/kernels/submissions.
+
+  All eight model holdouts pass independent F32 and repeatability checks
+  before/after timing. Other first-run changes range -0.40% to +1.43%.
+  Intel SmolVLA's +1.43% loss selects no larger block: the ordinary scalar-flash
+  challenger is measured but fails the existing noise margin. A focused fresh
+  parent/new repeat reverses that legacy attention choice; its matched-count
+  holdout is -1.62%. Retain both outcomes as search variability. The decision
+  rule, sample count, accuracy gates and submission policy are unchanged.
+
+  Local trials clone the actual tuned winner, alter one attention class and
+  skip backend re-selection, fusion, reordering and unrelated kernel retuning.
+  Construction verifies exact plan preservation. The first prototype instead
+  reprocessed an already prepared plan and changed unrelated kernels/fusion;
+  its separate samples establish no isolated key-block claim. One shared WGSL
+  template emits byte-identical expansions to the prior templates for all 48
+  checked row/head/key combinations. All 681 unit tests pass, including the
+  calibration check after earlier failed attempts; the final prepared-order
+  regression is also retested. All-target/all-feature lint passes.
+  Evidence: `attention-block-selection-*`, especially the search assessment,
+  key-only and matched-repeat holdouts, and final source snapshots.
+- [ ] Investigate bounded extra paired samples for ambiguous small gains.
+  Intel SmolVLA's six-pair race rejects a positive median gain because its
+  noise margin is wide. Preserve confidence thresholds and the common deadline;
+  do not lower the acceptance bar to force this candidate to win.
 
 - [ ] Extend useful storage chains through pointwise operations and compatible
   fusion without adding redundant widening/narrowing dispatches.

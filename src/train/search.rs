@@ -7,6 +7,7 @@ use crate::{
 };
 use serde::Serialize;
 
+mod attention_blocks;
 mod measure;
 mod storage;
 mod winograd;
@@ -796,6 +797,8 @@ fn implementations(
         shared_memory_bytes,
         max_partial_bytes,
         split_plans,
+        attention_blocks: attention_blocks::Refinements::new(shared_memory_bytes),
+        refine_next: false,
         queued_splits: false,
         replace_extracted_matrices: false,
         replace_extracted_attention: false,
@@ -815,6 +818,8 @@ struct Implementations {
     max_partial_bytes: usize,
     split_plans: Vec<measure::Program>,
     queued_splits: bool,
+    attention_blocks: attention_blocks::Refinements,
+    refine_next: bool,
     replace_extracted_matrices: bool,
     replace_extracted_attention: bool,
     defer_bf16: bool,
@@ -1258,7 +1263,17 @@ impl measure::Frontier for Implementations {
         }
     }
 
+    fn selected(&mut self, origin: Option<measure::Origin>, plan: &ExecutionPlan) {
+        self.attention_blocks.selected(origin, plan);
+    }
+
     fn next(&mut self, incumbent: Option<measure::Origin>) -> Option<measure::Program> {
+        if self.refine_next && self.early_programs_remaining(incumbent) == 0 {
+            self.refine_next = false;
+            if let Some(program) = self.attention_blocks.next() {
+                return Some(program);
+            }
+        }
         loop {
             if let Some(plan) = self.split_plans.pop() {
                 return Some(plan);
@@ -1385,7 +1400,9 @@ impl measure::Frontier for Implementations {
                     index,
                 )
             });
-            let (seed_index, choice_index) = self.order.next(incumbent)?;
+            let Some((seed_index, choice_index)) = self.order.next(incumbent) else {
+                return self.attention_blocks.next();
+            };
             let seed = &self.seeds[seed_index];
             let AxisChoice {
                 attention: (splits, flash),
@@ -1495,6 +1512,8 @@ impl measure::Frontier for Implementations {
                     continue;
                 }
             }
+            self.attention_blocks.apply(&mut plan);
+            self.refine_next = true;
             let mut description = format!(
                 "{}, dispatch_fusion={fuse_dispatches}, attention_splits={splits}, flash={flash:?}",
                 seed.description
@@ -1521,6 +1540,7 @@ impl measure::Frontier for Implementations {
                 description.push_str(&format!(", winograd={dtype:?}"));
             }
             return Some(measure::Program {
+                prepared: false,
                 description,
                 plan,
                 submission_chunks: None,
@@ -1533,7 +1553,10 @@ impl measure::Frontier for Implementations {
     }
 
     fn may_remain(&self) -> bool {
-        !self.queued_splits || !self.split_plans.is_empty() || !self.order.exhausted()
+        !self.queued_splits
+            || !self.split_plans.is_empty()
+            || !self.order.exhausted()
+            || self.attention_blocks.may_remain()
     }
 }
 
@@ -1583,6 +1606,7 @@ fn low_occupancy_weight_splits(
             continue;
         }
         programs.push(measure::Program {
+            prepared: false,
             description: format!(
                 "{}, dispatch_fusion={}, conv_dw_splits={splits}, workgroups<48",
                 seed.description, seed.options.fuse_dispatches

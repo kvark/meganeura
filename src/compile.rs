@@ -1036,7 +1036,7 @@ fn reorder_by_level(dispatches: &mut Vec<Dispatch>) {
 }
 
 /// Start a new compute pass when a dispatch reads an earlier write.
-fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
+pub(crate) fn compute_groups(dispatches: &[Dispatch]) -> Vec<std::ops::Range<usize>> {
     let mut groups = Vec::new();
     let mut dirty = HashSet::<u32>::new();
     let mut start = 0;
@@ -1292,6 +1292,10 @@ pub enum Kernel {
     Reduction(ReductionKernel),
     AttentionBackward {
         ept_cap: u32,
+    },
+    /// F16 QK/PV key tile; arithmetic and F32 output/LSE formats are unchanged.
+    AttentionProducts {
+        keys: u32,
     },
     /// F32 transform arithmetic, narrowed only when writing private scratch.
     WinogradTransform(crate::DType),
