@@ -76,6 +76,13 @@ the qualified memory-ordering contract remains unchanged.
   over the published implementation. Barrier removal and direct-successor
   reservation also pass focused checks without a timing gain; retain the
   evidence and revert these candidates.
+- [x] Put Linux builds, tests and captures in separate bounded cgroups using the
+  checked-in `scripts/run_bounded_job.py`; verify membership, memory limits and
+  exit propagation. Fix the shared-DAG debug-log expansion that caused host OOM.
+- [x] Measure the combined register/shared footprint. Probe parameter layout,
+  metadata lifetimes, range-aware dependencies, wider attention workgroups and
+  leader-computed coordinates. Correctness passes but timing and follow-up SDK
+  instruction counts show no useful gain; retain the evidence and revert them.
 - [ ] Isolate remaining queue/indexing/resource costs and reach baseline
   performance under the same full-step measurement and correctness gates. Keep this opt-in until performance justifies
   a default change.

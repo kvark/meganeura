@@ -556,10 +556,22 @@ systemd-run --user --scope --slice=ml.slice \
   cargo build --release --features models --example bench_smolvla_train --example bench_ci_latency
 ```
 
-The local launcher `/x/Tools/meganeura-run-job.py LABEL -- COMMAND ...` creates a
-unique scope, verifies its membership and limits from inside the child, then
-executes the command. Captures keep their target and SDK monitor in that scope.
-GPU jobs remain serial, and primary measurements exclude builds and analysis.
+The checked-in [launcher](../scripts/run_bounded_job.py) creates a unique scope,
+verifies its membership and limits from inside the child, then executes the
+command. For example:
+
+```sh
+python3 scripts/run_bounded_job.py release-build -- \
+  cargo build --release --features models --example bench_smolvla_train --example bench_ci_latency
+```
+
+It requires a systemd user manager and cgroup v2. Verification fails closed if
+membership or limits differ. The child inherits the current directory and
+environment, and its exit code is propagated. Captures keep their target and
+SDK monitor in that scope. GPU jobs remain serial: wait for the previous job's
+exit before launching another. Primary measurements exclude builds and analysis.
+Launcher checks verified scope membership, limits and propagation of exit code 7.
+The earlier local launcher remains at `/x/Tools/meganeura-run-job.py`.
 
 A diagnostic run exposed an unrelated host-memory failure before GPU execution:
 the optimizer eagerly expanded a shared expression DAG for a debug-log argument,
@@ -607,6 +619,45 @@ SmolVLA comparisons without improving either workload. Both were reverted.
 Patches and records are `target/joined-claim*` and
 `target/successor-reservation*`. No rejected experiment changes the published
 queue or memory contract.
+
+Further resource diagnostics at `05ed893` report **113 / 111 registers per
+thread**, **29,184 / 29,200 shared bytes**, and **113,280 / 273,664 executable
+bytes** for forward / training combined shaders. These are separate instrumented
+runs, not primary timing measurements. Ordinary forward pipelines use 16–120
+registers and at most 16,768 shared bytes. The common footprint is a plausible
+occupancy cost, but these statistics do not isolate its runtime contribution.
+The driver's implausible local-memory statistic remains excluded from spill
+claims. Pipeline statistics require `MEGANEURA_GPU_CAPTURE=1` as well as
+`--diagnostics`; records are `target/resource-stats.{json,log}`.
+
+Five follow-ups were reverted:
+
+| Experiment | Finding |
+|---|---|
+| Struct-valued node parameters | Two codegen tests and both diagnostic comparisons pass; registers and shared storage remain unchanged. |
+| Reload completion metadata after the handler | Both diagnostic comparisons pass; forward registers stay 113 and training falls only from 111 to 110. |
+| Physical tensor-range dependencies | Seven focused tests and 20 short comparisons pass. Forward retains 161 edges; training falls only from 706 to 698. Persistent medians are 6.312 / 21.483 ms. |
+| 128-lane cooperative forward attention in both paths | The selected-geometry test and 20 comparisons pass. The combined register/shared footprint is unchanged; persistent medians are 6.211 / 21.513 ms. |
+| Leader-computed tile coordinates | Seven focused tests and 20 comparisons pass. Persistent medians are 6.177 / 21.581 ms. |
+
+The three timing probes use ten pairs per phase and at least one second of
+warmup. They do not establish an improvement over the published measurements.
+Their forward comparisons are exact and maximum training error is 4.66e-9.
+Patches and records use `target/parameter-struct*`, `metadata-lifetime*`,
+`range-dependency*`, `wide-attention*` and `leader-coordinates*`; the summary and
+patch hashes are in `target/megakernel-results/resource-followups/summary.json`.
+
+A separate SDK capture of leader-computed coordinates collects two sequential
+single-pass groups per mode, each with 146 samples, successful exits and no
+warnings. Forward state retains the same hash as the published capture.
+Ordinary / persistent replay medians are 3.774 / 6.044 ms. Activity-time estimates
+are 1.889× ordinary warp instructions, 2.552× integer-pipe instructions, 1.132×
+global-load sectors and 1.204× shared wavefronts, close to the published packing
+results. Thus this experiment did not remove a substantial part of the measured
+excess instruction work. Receipts are in
+`target/megakernel-results/leader-coordinates-sdk/`. All follow-up jobs used
+separate bounded cgroups. The published runtime and performance claims remain
+unchanged; parity is still unmet.
 
 ## Earlier artifact identities
 
