@@ -45,6 +45,8 @@ gradient read these indices directly. Use
 For local iteration see [testing and coverage](docs/testing.md) and [debugging the stack](#debugging).
 The [shader generation investigation](docs/shader-generation.md) compares WGSL,
 synaga and other shader construction approaches.
+The active [precision work plan](docs/precision-plan.md) tracks reduced matrix
+storage, Intel kernel efficiency and unused matrix types.
 
 ## Why Meganeura
 

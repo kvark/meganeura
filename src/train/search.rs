@@ -8,6 +8,7 @@ use crate::{
 use serde::Serialize;
 
 mod measure;
+mod storage;
 mod winograd;
 pub use measure::BuildSearchTrial;
 use std::{
@@ -381,6 +382,7 @@ pub fn build_measured_with_inputs(
         .nodes()
         .iter()
         .all(|n| n.attention_ept_cap.is_none() && n.attention_impl.is_none());
+    programs.allow_matrix_storage = !cfg.runtime.debug && cfg.runtime.pin_buffers.is_none();
     programs.enable_matrix_inputs(&supported, &gpu.capabilities());
     let preparation_time = start.elapsed();
     measure::select(
@@ -503,6 +505,7 @@ struct AxisChoice {
     attention: AttentionChoice,
     fuse_dispatches: bool,
     matrix_inputs: Option<crate::DType>,
+    matrix_storage: bool,
     vector_convolutions_only: bool,
     winograd: Option<crate::DType>,
     f16_attention: bool,
@@ -722,6 +725,7 @@ fn implementations(
     let baseline = AxisChoice {
         attention: (0, None),
         matrix_inputs: None,
+        matrix_storage: false,
         vector_convolutions_only: false,
         winograd: None,
         f16_attention: false,
@@ -745,6 +749,7 @@ fn implementations(
                 attention,
                 fuse_dispatches,
                 matrix_inputs: None,
+                matrix_storage: false,
                 vector_convolutions_only: false,
                 winograd: None,
                 f16_attention: false,
@@ -785,6 +790,7 @@ fn implementations(
         replace_extracted_matrices: false,
         replace_extracted_attention: false,
         defer_bf16: false,
+        allow_matrix_storage: true,
         matrix_shapes: collections::HashMap::new(),
     }
 }
@@ -802,6 +808,7 @@ struct Implementations {
     replace_extracted_matrices: bool,
     replace_extracted_attention: bool,
     defer_bf16: bool,
+    allow_matrix_storage: bool,
     matrix_shapes: collections::HashMap<crate::DType, ([u32; 3], u32)>,
 }
 
@@ -822,7 +829,7 @@ impl Implementations {
                 ) == Some([8, 16, 16])
                 && caps.cooperative_matrix.workgroup.granularities.is_empty();
         let ordinary = self.choices.clone();
-        let mut dense = vec![(None, false)];
+        let mut dense = vec![(None, false, false)];
         let mut winograd = vec![None];
         for &multiply in inputs {
             let shapes = match multiply {
@@ -873,24 +880,38 @@ impl Implementations {
                             )
                 });
                 if mixed {
-                    dense.push((Some(multiply), true));
+                    dense.push((Some(multiply), true, false));
                 }
-                dense.push((Some(multiply), false));
+                dense.push((Some(multiply), false, false));
+                if self.allow_matrix_storage
+                    && self.seeds.iter().any(|seed| {
+                        let mut plan = seed.plan.clone();
+                        fill_matrix_candidates(
+                            &mut plan,
+                            multiply,
+                            self.replace_extracted_matrices,
+                        );
+                        storage::fill(&mut plan) != 0
+                    })
+                {
+                    dense.push((Some(multiply), false, true));
+                }
             }
         }
         // Independent precision coordinates keep both single-family candidates
         // and their combinations reachable, including mixed F16/BF16 programs.
-        for &(matrix_inputs, vector_convolutions_only) in &dense {
+        for &(matrix_inputs, vector_convolutions_only, matrix_storage) in &dense {
             for &winograd in &winograd {
                 if matrix_inputs.is_none() && winograd.is_none() {
                     continue;
                 }
-                if matrix_inputs.is_none() || winograd.is_none() {
+                if !matrix_storage && (matrix_inputs.is_none() || winograd.is_none()) {
                     self.order.priority_choices.push_back(self.choices.len());
                 }
                 self.choices
                     .extend(ordinary.iter().map(|choice| AxisChoice {
                         matrix_inputs,
+                        matrix_storage,
                         vector_convolutions_only,
                         winograd,
                         ..*choice
@@ -1030,6 +1051,19 @@ impl measure::Frontier for Implementations {
 
     fn observe(&mut self, origin: measure::Origin, qualified: bool) {
         let choice = self.choices[origin.choice];
+        if qualified && choice.matrix_inputs.is_some() && !choice.matrix_storage {
+            let stored = AxisChoice {
+                matrix_storage: true,
+                ..choice
+            };
+            if let Some(index) = self.choices.iter().position(|&c| c == stored) {
+                if !self.order.tried.contains(&(origin.form, index))
+                    && !self.order.priority_choices.contains(&index)
+                {
+                    self.order.priority_choices.push_back(index);
+                }
+            }
+        }
         if !self.defer_bf16 {
             return;
         }
@@ -1092,6 +1126,7 @@ impl measure::Frontier for Implementations {
                 let arithmetic = self.choices[*index];
                 let neighbor = AxisChoice {
                     matrix_inputs: arithmetic.matrix_inputs,
+                    matrix_storage: arithmetic.matrix_storage,
                     vector_convolutions_only: arithmetic.vector_convolutions_only,
                     winograd: arithmetic.winograd,
                     ..active
@@ -1113,6 +1148,11 @@ impl measure::Frontier for Implementations {
                     }
                     let choice = AxisChoice {
                         matrix_inputs: trial.matrix_inputs.or(active.matrix_inputs),
+                        matrix_storage: if trial.matrix_inputs.is_some() {
+                            trial.matrix_storage
+                        } else {
+                            active.matrix_storage
+                        },
                         vector_convolutions_only: if trial.matrix_inputs.is_some() {
                             trial.vector_convolutions_only
                         } else {
@@ -1142,8 +1182,15 @@ impl measure::Frontier for Implementations {
                 let choice = self.choices[index];
                 (
                     usize::from(
-                        (choice.matrix_inputs, choice.vector_convolutions_only)
-                            != (active.matrix_inputs, active.vector_convolutions_only),
+                        (
+                            choice.matrix_inputs,
+                            choice.vector_convolutions_only,
+                            choice.matrix_storage,
+                        ) != (
+                            active.matrix_inputs,
+                            active.vector_convolutions_only,
+                            active.matrix_storage,
+                        ),
                     ) + usize::from(choice.winograd != active.winograd),
                     choice.f16_attention != active.f16_attention,
                     choice.attention != active.attention,
@@ -1157,6 +1204,7 @@ impl measure::Frontier for Implementations {
                 attention: (splits, flash),
                 fuse_dispatches,
                 matrix_inputs,
+                matrix_storage,
                 vector_convolutions_only,
                 winograd,
                 f16_attention,
@@ -1237,6 +1285,9 @@ impl measure::Frontier for Implementations {
                     continue;
                 }
             }
+            if matrix_storage && storage::fill(&mut plan) == 0 {
+                continue;
+            }
             if let Some(storage) = winograd {
                 let (shape, subgroup) = self.matrix_shapes[&storage];
                 if winograd::fill(&mut plan, storage, shape, subgroup) == 0 {
@@ -1252,6 +1303,9 @@ impl measure::Frontier for Implementations {
             }
             if let Some(dtype) = matrix_inputs {
                 description.push_str(&format!(", matrix_inputs={dtype:?}"));
+                if matrix_storage {
+                    description.push_str(&format!(", matrix_storage={dtype:?}"));
+                }
                 if vector_convolutions_only {
                     description.push_str(", vector_convolutions_only=true");
                 }
@@ -1643,6 +1697,49 @@ mod tests {
                     std::iter::from_fn(|| frontier.next(incumbent))
                         .any(|p| p.description.contains("matrix_inputs=BF16")),
                     "deferral must leave BF16 reachable"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn storage_candidates_follow_staged_arithmetic_and_respect_pins() {
+        use measure::Frontier as _;
+        for allow_storage in [false, true] {
+            let mut graph = Graph::new();
+            let x = graph.input("x", &[32, 32]);
+            let w = graph.parameter("w", &[32, 32]);
+            let x = graph.relu(x);
+            let y = graph.matmul(x, w);
+            graph.set_outputs(vec![y]);
+            let mut frontier = graph_frontier(graph);
+            frontier.allow_matrix_storage = allow_storage;
+            let mut caps = blade_graphics::Capabilities {
+                shader_float16: true,
+                shader_bfloat16: true,
+                ..Default::default()
+            };
+            caps.cooperative_matrix.f16_f32_shapes.push([16, 16, 16]);
+            caps.cooperative_matrix.bf16_f32_shapes.push([16, 16, 16]);
+            frontier.enable_matrix_inputs(&[crate::DType::F16, crate::DType::BF16], &caps);
+            let baseline = frontier.next(None).unwrap().origin;
+            let staged = frontier.next(baseline).unwrap();
+            assert!(staged.description.contains("matrix_inputs=F16"));
+            assert!(!staged.description.contains("matrix_storage="));
+            frontier.observe(staged.origin.unwrap(), true);
+            let other = frontier.next(baseline).unwrap();
+            assert!(other.description.contains("matrix_inputs=BF16"));
+            assert!(!other.description.contains("matrix_storage="));
+            let stored = std::iter::from_fn(|| frontier.next(baseline))
+                .find(|p| p.description.contains("matrix_storage=F16"));
+            assert_eq!(stored.is_some(), allow_storage);
+            if let Some(stored) = stored {
+                assert!(
+                    stored
+                        .plan
+                        .dispatches
+                        .iter()
+                        .any(|d| d.pointwise_storage.f16_output)
                 );
             }
         }
@@ -2152,6 +2249,7 @@ mod tests {
             attention: (0, None),
             fuse_dispatches: true,
             matrix_inputs: None,
+            matrix_storage: false,
             vector_convolutions_only: false,
             winograd: None,
             f16_attention: false,

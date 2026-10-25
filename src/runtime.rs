@@ -1283,9 +1283,13 @@ fn precision_requirements(dispatches: &[Dispatch]) -> (Vec<crate::DType>, Vec<cr
         if matches!(
             &dispatch.shader,
             ShaderEntry::ToBF16 | ShaderEntry::FromBF16
-        ) || dispatch.pointwise_storage != crate::schedule::PointwiseStorage::default()
+        ) || dispatch.pointwise_storage.bf16_inputs != 0
+            || dispatch.pointwise_storage.bf16_output
         {
             add(&mut storage, DType::BF16);
+        }
+        if dispatch.pointwise_storage.f16_output {
+            add(&mut storage, DType::F16);
         }
     }
     (storage, multiply)
@@ -1594,6 +1598,12 @@ mod precision_requirement_tests {
                 ..Default::default()
             }]),
             (vec![DType::BF16], vec![DType::BF16])
+        );
+        let mut pointwise = Dispatch::default();
+        pointwise.pointwise_storage.f16_output = true;
+        assert_eq!(
+            precision_requirements(&[pointwise]),
+            (vec![DType::F16], vec![])
         );
         let mut pointwise = Dispatch::default();
         pointwise.pointwise_storage.bf16_output = true;
@@ -2152,7 +2162,7 @@ impl Pipelines {
                 let kernel = dispatch.reduction().expect("reduction implementation");
                 layout = reduction_data_layout(kernel);
                 entry_point = crate::schedule::REDUCTION_ENTRY;
-                crate::schedule::lower(&kernel.to_template())
+                kernel.lower_with_storage(dispatch.pointwise_storage)
             }
             Variant::Horizontal(_, count, kind) => {
                 let coop = match kind {
@@ -2291,7 +2301,14 @@ impl Pipelines {
             };
         }
         if let Some(kernel) = dispatch.reduction() {
-            return Variant::Reduction(kernel.hash_key());
+            if dispatch.pointwise_storage == crate::schedule::PointwiseStorage::default() {
+                return Variant::Reduction(kernel.hash_key());
+            }
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            kernel.hash(&mut hash);
+            dispatch.pointwise_storage.hash(&mut hash);
+            return Variant::Reduction(hash.finish());
         }
         if let Some(dag) = dispatch.pointwise() {
             if dispatch.pointwise_storage == crate::schedule::PointwiseStorage::default() {

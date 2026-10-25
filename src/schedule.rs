@@ -560,6 +560,25 @@ impl ReductionKernel {
         h.finish()
     }
 
+    /// Keep reduction arithmetic and scratch F32; optionally narrow its map result.
+    pub(crate) fn lower_with_storage(&self, storage: PointwiseStorage) -> ShaderModule {
+        lower_reduction(
+            self.op,
+            &self.prologue,
+            &self.extra_prologues,
+            self.epilogue.as_ref(),
+            self.n_per_elem,
+            self.n_per_row,
+            &self.gather_elem,
+            &self.input_row_repeats,
+            self.rows_per_workgroup,
+            GridShape {
+                workgroup_size: self.workgroup_size,
+            },
+            storage,
+        )
+    }
+
     /// Lower to the template form consumed by `lower`.
     pub fn to_template(&self) -> KernelTemplate {
         KernelTemplate::Reduction {
@@ -631,6 +650,7 @@ pub fn lower(t: &KernelTemplate) -> ShaderModule {
             input_row_repeats,
             rows_per_workgroup,
             grid,
+            PointwiseStorage::default(),
         ),
         KernelTemplate::Attention {
             mask,
@@ -646,6 +666,8 @@ pub struct PointwiseStorage {
     /// Bit i marks input i as BF16. Unmarked inputs are F32.
     pub bf16_inputs: u8,
     pub bf16_output: bool,
+    #[serde(default)]
+    pub f16_output: bool,
 }
 
 fn lower_pointwise(dag: &PointwiseDAG, grid: GridShape) -> ShaderModule {
@@ -658,6 +680,7 @@ pub fn lower_pointwise_storage(
     storage: PointwiseStorage,
 ) -> ShaderModule {
     assert_eq!(storage.bf16_inputs >> dag.n_inputs, 0);
+    assert!(!(storage.bf16_output && storage.f16_output));
     assert!(
         dag.n_inputs >= 1,
         "PointwiseDAG must have at least one input stream"
@@ -670,7 +693,10 @@ pub fn lower_pointwise_storage(
     let input_names = PointwiseDAG::input_binding_names(dag.n_inputs);
 
     let mut src = String::new();
-    if storage != PointwiseStorage::default() {
+    if storage.f16_output {
+        src.push_str("enable f16;\n");
+    }
+    if storage.bf16_inputs != 0 || storage.bf16_output {
         src.push_str("enable wgpu_bfloat16;\n");
         src.push_str(include_str!("shaders/bf16_round.wgsl"));
     }
@@ -685,7 +711,13 @@ pub fn lower_pointwise_storage(
         };
         let _ = writeln!(src, "var<storage> {name}: array<{ty}>;");
     }
-    let ty = if storage.bf16_output { "bf16" } else { "f32" };
+    let ty = if storage.bf16_output {
+        "bf16"
+    } else if storage.f16_output {
+        "f16"
+    } else {
+        "f32"
+    };
     let _ = writeln!(src, "var<storage, read_write> dst: array<{ty}>;");
     src.push_str("var<uniform> params: Params;\n\n");
     let _ = writeln!(src, "@compute @workgroup_size({})", grid.workgroup_size);
@@ -710,6 +742,8 @@ pub fn lower_pointwise_storage(
     ));
     if storage.bf16_output {
         let _ = writeln!(src, "    dst[i] = round_bf16(v{});", dag.output);
+    } else if storage.f16_output {
+        let _ = writeln!(src, "    dst[i] = f16(v{});", dag.output);
     } else {
         let _ = writeln!(src, "    dst[i] = v{};", dag.output);
     }
@@ -729,7 +763,14 @@ fn lower_reduction(
     input_row_repeats: &[u32],
     rows_per_workgroup: u32,
     grid: GridShape,
+    storage: PointwiseStorage,
 ) -> ShaderModule {
+    assert_eq!(storage.bf16_inputs, 0, "reduction inputs remain F32");
+    assert!(!(storage.bf16_output && storage.f16_output));
+    assert!(
+        epilogue.is_some() || storage == PointwiseStorage::default(),
+        "reduction partials remain F32"
+    );
     assert!(
         n_per_elem >= 1,
         "reduction must have at least one per-element input stream"
@@ -850,6 +891,13 @@ fn lower_reduction(
     };
 
     let mut src = String::new();
+    if storage.f16_output {
+        src.push_str("enable f16;\n");
+    }
+    if storage.bf16_output {
+        src.push_str("enable wgpu_bfloat16;\n");
+        src.push_str(include_str!("shaders/bf16_round.wgsl"));
+    }
     src.push_str(
         "struct Params {\n    outer: u32,\n    inner: u32,\n    round_one_bits: u32,\n    table_rows: u32,\n}\n\n",
     );
@@ -866,7 +914,14 @@ fn lower_reduction(
     for name in &per_col_names {
         let _ = writeln!(src, "var<storage> {}: array<f32>;", name);
     }
-    src.push_str("var<storage, read_write> dst: array<f32>;\n");
+    let output_type = if storage.f16_output {
+        "f16"
+    } else if storage.bf16_output {
+        "bf16"
+    } else {
+        "f32"
+    };
+    let _ = writeln!(src, "var<storage, read_write> dst: array<{output_type}>;");
     src.push_str("var<uniform> params: Params;\n");
     let wg = grid.workgroup_size;
     let lanes_per_row = wg / rows_per_workgroup;
@@ -985,11 +1040,15 @@ fn lower_reduction(
                 src.push_str(line.trim_start_matches(' '));
                 src.push('\n');
             }
-            let _ = writeln!(
-                src,
-                "            dst[row_offset + wcol] = v{};",
-                epi.dag.output
-            );
+            let result = format!("v{}", epi.dag.output);
+            let result = if storage.f16_output {
+                format!("f16({result})")
+            } else if storage.bf16_output {
+                format!("round_bf16({result})")
+            } else {
+                result
+            };
+            let _ = writeln!(src, "            dst[row_offset + wcol] = {result};");
             let _ = writeln!(src, "            wcol += {}u;", lanes_per_row);
             src.push_str("        }\n");
             src.push_str("    }\n");

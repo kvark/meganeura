@@ -1,9 +1,12 @@
 # Roadmap
 
-Updated October 4, 2026. Keep optimizations reusable across operators and shapes,
+Updated October 25, 2026. Keep optimizations reusable across operators and shapes,
 with numerical qualification and whole-step measurements determining adoption.
 The [compiler-search design](compiler-search.md) describes the current direction;
 [experiments](experiments.md) records measurements and rejected candidates.
+
+Active precision work: [reduced matrix storage and unused hardware paths](precision-plan.md).
+The plan records the two-GPU survey, implementation order and adoption checks.
 
 The September tuning-foundation milestone is closed. The bounded compensated
 weight-gradient candidate failed 10 of 240 accuracy rows, its arithmetic was

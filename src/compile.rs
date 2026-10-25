@@ -1224,8 +1224,8 @@ pub struct Dispatch {
     /// Storage format of the B (weight) input buffer.
     #[serde(default)]
     pub weight_format: WeightFormat,
-    /// Explicit BF16 conversion boundaries folded into a generated pointwise
-    /// kernel. Scalar arithmetic remains F32. Never inferred from a timing.
+    /// Reduced storage boundaries in generated scalar kernels. Expressions
+    /// remain F32; automatic stores follow the readers' chosen matrix types.
     #[serde(default)]
     pub pointwise_storage: crate::schedule::PointwiseStorage,
 }
@@ -2624,6 +2624,7 @@ fn is_plain_rmsnorm(dispatch: &Dispatch) -> bool {
     // The canonical generated norm only: after pointwise or gather fusion
     // the reduction differs, and a dedicated runtime shader cannot replace it.
     dispatch.input_buffers.len() == 2
+        && dispatch.pointwise_storage == crate::schedule::PointwiseStorage::default()
         && dispatch.params.len() >= 3
         && dispatch.reduction()
             == Some(&rmsnorm_kernel(
