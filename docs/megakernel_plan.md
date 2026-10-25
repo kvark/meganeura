@@ -155,10 +155,22 @@ the descriptor-reference repair requires fresh measurements.
   shader speedup. Explicit inner-loop expansion and a 46-worker control also
   fail to close the gap. Preserve 660 normal comparisons and twelve diagnostics;
   revert every runtime probe.
-- [ ] Compare serial and independent-node dependencies with identical shader
-  code and resources to isolate whole-node ordering costs before changing
-  dependency granularity. Retain both model phases and all CI gates; baseline
-  parity and spill attribution remain open.
+- [x] Compare serial and independent-node dependencies with identical shader
+  code and resource layouts. At 256 workers, independent matrix nodes take
+  about 0.80 ms in the combined shader versus 2.97 ms with an artificial chain;
+  the ordinary independent control takes about 0.71 ms. Preserve 240 normal
+  comparisons and six metadata/resource diagnostics. This isolates a large
+  scheduling cost but does not establish a full-model optimization.
+- [x] Probe terminal-only publication elision, preserving every input acquire,
+  nonterminal publication and final workgroup rendezvous. Compare 100 candidate
+  pairs with 100 fresh-control pairs; no convincing full-step gain is established.
+  Revert the candidate and all temporary dependency-fixture APIs.
+- [ ] Measure intermediate dependency widths with fixed code and resources,
+  then identify real producer/consumer regions that can overlap safely. Any
+  finer dependency scheme must prove payload ranges, allocation-reuse hazards,
+  original tile coordinates and completion aggregation before benchmarking.
+  Retain both model phases and all CI gates; baseline parity and spill
+  attribution remain open.
 
 The Blade extension exposes binding inspection and runtime buffer-array binding
 in [commit 1bb5aef](https://github.com/kvark/blade/commit/1bb5aef0fea5fbc4249fdc40a7f1398f5c3ac012).

@@ -1276,10 +1276,96 @@ Source patches, proofs, binaries, raw samples and SDK receipts remain in
 `target/{matrix-address-probe,matrix-unroll-probe}/`; their checked manifest is
 `target/megakernel-results/matrix-address/summary.json`.
 
-The next experiment varies serial versus independent-node dependencies while
-holding shader code and resource bindings fixed. It should measure the cost
-of waiting for complete nodes before motivating finer dependency granularity.
-Full-model baseline parity remains unmet.
+The following experiment varies serial versus independent-node dependencies
+while holding shader code and resource layouts fixed. Full-model baseline
+parity remains unmet.
+
+## Independent nodes and terminal publication
+
+A new matrix fixture gives each of the 32 selected matrix nodes its own output
+allocation. The nodes share the same three input buffers and have no native
+data hazards; lifetime aliasing is disabled. Every node retains the original
+46 logical tiles, parameters and arithmetic. Every paired sample reads all
+32 complete outputs outside timing, verifies that they agree exactly and are
+nonzero, and compares them with ordinary execution.
+
+The parallel mode uses the empty dependency graph. A serial control adds an
+artificial edge from each node to the next in the persistent path only. Both
+modes have identical physical pipeline keys, descriptor layouts, buffer sizes,
+parameter words, metadata sizes and queue sizes. Separate sessions own distinct
+allocations. The edge buffers both have 32 words; unused entries are unreachable.
+Diagnostic receipts verify that only dependency metadata and initial readiness
+differ. Neither the scheduler shader nor its publication protocol changes.
+
+Twenty completed-step pairs per case give these medians:
+
+| Workers | Compiled handlers | Ordinary independent ms, parallel / chain runs | Persistent parallel ms | Persistent artificial chain ms |
+|---|---|---:|---:|---:|
+| 64 | Matrix only | 0.733 / 0.710 | 1.565 | 2.135 |
+| 64 | With unused forward handlers | 0.708 / 0.707 | 1.405 | 1.963 |
+| 64 | With unused training handlers | 0.708 / 0.739 | 1.410 | 1.990 |
+| 256 | Matrix only | 0.733 / 0.728 | 0.788 | 4.144 |
+| 256 | With unused forward handlers | 0.709 / 0.726 | 0.798 | 2.970 |
+| 256 | With unused training handlers | 0.708 / 0.732 | 0.799 | 2.972 |
+
+Within each handler variant, driver executable statistics also match between
+the dependency modes: 48/112/105 registers and 9,584/29,200/29,232 shared bytes
+for isolated/forward/training variants. The implausible driver Local Memory Size
+statistic remains excluded. The independent combined shader comes much closer
+to ordinary execution despite retaining its resource footprint and dynamic
+addresses. Adding a chain exposes a large scheduling cost in this narrow
+workload. This does not establish how much overlap a real model permits, nor
+does it prove that finer dependencies will recover the full-model gap.
+
+The ordinary control executes the same independent plan in both modes. Thus
+the artificial-chain ratios measure an imposed delay, not ordinary execution
+of a naturally dependent graph. These distinct-output results also are not
+directly comparable with earlier fixtures that repeatedly wrote one output.
+
+A separate prototype removes publication fences and the first post-body
+workgroup rendezvous only for nodes with no successors. All input acquisition,
+nonterminal publication and the final workgroup barrier remain. Conservative
+RAW/WAR/WAW reachability means terminal payloads have no later conflicting
+access in the dispatch. Their external visibility still depends on real dispatch
+completion **and existing API memory dependencies**, not the scheduler counter
+or host fence alone. The proof and source patch are preserved with the probe.
+
+Twenty paired comparisons per full-step case, followed by fresh controls, give:
+
+| Case | Existing scheduler ms | Terminal elision ms | Existing / elision paired ratios |
+|---|---:|---:|---:|
+| CI inference | 0.07007 | 0.07082 | 1.359 / 1.358 |
+| CI forward/backward | 0.10347 | 0.10166 | 1.547 / 1.544 |
+| CI forward/backward/SGD | 0.10132 | 0.10162 | 1.502 / 1.510 |
+| SmolVLA forward | 6.549 | 6.557 | 1.570 / 1.519 |
+| SmolVLA forward/backward/SGD | 21.284 | 20.888 | 1.406 / 1.383 |
+
+Ratios compare each persistent sample with its own ordinary control. Forward
+latency is essentially unchanged. The small training difference does not
+establish a benefit given substantial variation, including long outliers in
+both modes. The terminal candidate is reverted without claiming full memory
+protocol qualification or a speedup.
+
+All **440 normal comparisons and six diagnostics** pass with one persistent
+dispatch, identical selected arithmetic and no fallback. Matrix, CI and model
+forward outputs are exact; maximum model-training error is 4.66e-9. All runtime
+and temporary benchmark APIs are reverted, production release examples rebuilt,
+and formatting checked. Runtime source still matches `ed81459`; Naga and Blade
+pins are unchanged. No broad GPU suite is repeated for these discarded probes.
+
+Every build, test and analysis job uses a verified separate bounded cgroup.
+GPU jobs are serialized, builds/analysis stay outside timing intervals, and all
+artifacts use local `/x` storage. The recovered terminal-probe logs confirm the
+20 GiB memory caps and GPU lock; neither job remained running after recovery.
+Raw results, patches, proofs and binaries are in
+`target/{matrix-dependency-probe,terminal-publication-probe}/`; the checked
+manifest and artifact hashes are in
+`target/megakernel-results/matrix-dependencies/summary.json`.
+
+The next control measures intermediate dependency widths before attempting
+finer dependencies in a real graph. Such a change needs explicit proofs for
+access ranges, lifetime reuse, original tile coordinates and completion counts.
+Baseline parity remains unmet.
 
 ## Earlier artifact identities
 
