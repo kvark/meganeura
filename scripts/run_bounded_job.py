@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Run one Linux build, test, or benchmark in a separate bounded user cgroup.
 
-Usage: python3 scripts/run_bounded_job.py LABEL -- COMMAND ...
+Usage: python3 scripts/run_bounded_job.py LABEL [--gpu] -- COMMAND ...
 Requires systemd's user manager and the unified cgroup hierarchy.
+Use --gpu for GPU tests, benchmarks and profiling to serialize their processes.
 """
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -14,6 +16,9 @@ import uuid
 
 if len(sys.argv) > 1 and sys.argv[1] == "--inside":
     unit, *command = sys.argv[2:]
+    gpu = command[0] == "--gpu"
+    if gpu:
+        command.pop(0)
     relative = next(
         (line[3:] for line in Path("/proc/self/cgroup").read_text().splitlines()
          if line.startswith("0::")),
@@ -30,11 +35,21 @@ if len(sys.argv) > 1 and sys.argv[1] == "--inside":
     if limits != expected:
         raise SystemExit(f"Unexpected child memory limits: {limits!r}")
     print(json.dumps({"cgroup": relative, "limits": limits}), file=sys.stderr, flush=True)
+    if gpu:
+        # Share the lock across checkouts, while keeping it on local runtime storage.
+        path = Path("/run/user") / str(os.getuid()) / "meganeura-gpu-job.lock"
+        lock = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        os.set_inheritable(lock, True)
+        print("Acquired GPU job lock", file=sys.stderr, flush=True)
     os.execvp(command[0], command)
 else:
     if len(sys.argv) < 3:
         raise SystemExit(__doc__)
     label, *command = sys.argv[1:]
+    gpu = bool(command and command[0] == "--gpu")
+    if gpu:
+        command.pop(0)
     if command and command[0] == "--":
         command.pop(0)
     if not re.fullmatch(r"[a-z0-9-]+", label) or not command:
@@ -43,5 +58,6 @@ else:
     os.execvp("systemd-run", [
         "systemd-run", "--user", "--scope", "--slice=ml.slice", "--unit=" + unit,
         "-p", "MemoryHigh=16G", "-p", "MemoryMax=20G", "-p", "MemorySwapMax=1G",
-        sys.executable, str(Path(__file__).resolve()), "--inside", unit, *command,
+        sys.executable, str(Path(__file__).resolve()), "--inside", unit,
+        *(["--gpu"] if gpu else []), *command,
     ])
