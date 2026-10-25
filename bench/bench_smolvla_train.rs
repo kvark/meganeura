@@ -8,11 +8,127 @@
 ///
 /// Usage:
 ///   cargo run --release --example bench_smolvla_train [-- --warmup 3 --runs 5]
-use std::time::{Duration, Instant};
+///   --profile-json PREFIX captures state-checked, graph-only dispatch profiles.
+///   --capture-phase forward|backward selects a resident loop for external counters.
+use std::{
+    io::Write,
+    time::{Duration, Instant},
+};
 
 use meganeura::{compile_training_graph, models::smolvla};
 
 mod paired;
+
+fn profile_graph_session(
+    session: &mut meganeura::Session,
+    prefix: &str,
+    phase: &str,
+    warmup: usize,
+    runs: usize,
+    capture_seconds: u64,
+    prepare: impl Fn(&mut meganeura::Session),
+) {
+    // Graph attribution excludes runtime-appended optimizer passes. Restore the
+    // same parameters and inputs before every ordinary and profiled replay.
+    session.clear_optimizer();
+    assert!(runs > 0);
+    for _ in 0..warmup {
+        prepare(session);
+        session.step();
+        session.wait();
+    }
+    let mut samples = Vec::new();
+    for _ in 0..runs {
+        prepare(session);
+        let start = Instant::now();
+        session.step();
+        session.wait();
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        session.validate_persistent_completion().unwrap();
+    }
+    let mut requests = Vec::new();
+    for (name, parameter) in &session.plan().param_buffers {
+        let len = session.param_size(name).unwrap();
+        requests.push((format!("parameter.{name}"), *parameter, len));
+        if let Some(&(_, gradient)) = session
+            .plan()
+            .param_grad_pairs
+            .iter()
+            .find(|pair| pair.0 == *parameter)
+        {
+            requests.push((format!("gradient.{name}"), gradient, len));
+        }
+    }
+    requests.sort_by(|a, b| a.0.cmp(&b.0));
+    let snapshot = |session: &mut meganeura::Session| {
+        let buffers: Vec<_> = requests.iter().map(|entry| entry.1).collect();
+        let mut values = session.read_output(1);
+        for (data, request) in session.read_buffers(&buffers).into_iter().zip(&requests) {
+            values.extend_from_slice(&data[..request.2]);
+        }
+        assert!(values.iter().all(|value| value.is_finite()));
+        values
+    };
+    let expected = snapshot(session);
+    let mut sorted = samples.clone();
+    sorted.sort_by(f64::total_cmp);
+    let mut capture_samples = Vec::new();
+    let profile = if capture_seconds != 0 {
+        eprintln!("CAPTURE_READY {phase}");
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(capture_seconds) {
+            let step = Instant::now();
+            session.step();
+            session.wait();
+            capture_samples.push(step.elapsed().as_secs_f64() * 1000.0);
+        }
+        None
+    } else {
+        let median = (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) * 0.5;
+        Some(
+            meganeura::profiler::capture_session_profile(
+                session,
+                prepare,
+                meganeura::profiler::CaptureOptions {
+                    samples: 5,
+                    unprofiled_median_ms: Some(median),
+                    ..Default::default()
+                },
+            )
+            .expect("profile every graph region"),
+        )
+    };
+    session.validate_persistent_completion().unwrap();
+    let actual = snapshot(session);
+    assert_eq!(actual.len(), expected.len());
+    assert!(
+        actual
+            .iter()
+            .zip(&expected)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "profile changed graph state"
+    );
+    std::fs::File::create(format!("{prefix}.{phase}.state.bin"))
+        .unwrap()
+        .write_all(bytemuck::cast_slice(&actual))
+        .unwrap();
+    let record = serde_json::json!({
+        "phase": phase, "work": "graph only; optimizer disabled",
+        "normal_samples_ms": samples, "profile": profile,
+        "capture_seconds": capture_seconds, "capture_samples_ms": capture_samples,
+        "execution": session.execution_report(),
+        "implementation_keys": session.dispatch_implementation_keys(),
+        "state_layout": requests.iter().map(|entry| (&entry.0, entry.2)).collect::<Vec<_>>(),
+        "state_encoding": "little-endian f32: scalar loss, then state_layout tensors",
+        "profile_state_exact": true,
+    });
+    serde_json::to_writer(
+        std::fs::File::create(format!("{prefix}.{phase}.json")).unwrap(),
+        &record,
+    )
+    .unwrap();
+    eprintln!("{phase}: capture completed; complete state unchanged");
+}
 
 fn check_bench_preconditions(abort_on_warn: bool) {
     #[cfg(not(target_os = "linux"))]
@@ -111,6 +227,9 @@ fn main() {
     let mut runs: usize = 5;
     let mut force = false;
     let mut profile = false;
+    let mut profile_json = None;
+    let mut capture_phase = None;
+    let mut capture_seconds = 10;
     let mut chunk_override: Option<usize> = None;
 
     while let Some(arg) = args.next() {
@@ -128,6 +247,17 @@ fn main() {
             }
             "--force" => force = true,
             "--profile" => profile = true,
+            "--profile-json" => profile_json = Some(args.next().expect("--profile-json prefix")),
+            "--capture-phase" => {
+                capture_phase = Some(args.next().expect("--capture-phase forward|backward"))
+            }
+            "--capture-seconds" => {
+                capture_seconds = args
+                    .next()
+                    .expect("--capture-seconds value")
+                    .parse()
+                    .unwrap()
+            }
             _ => {
                 if !paired_options.argument(&arg, &mut args) {
                     eprintln!("unknown arg: {}", arg);
@@ -138,10 +268,14 @@ fn main() {
     }
 
     assert!(
-        !paired_options.enabled || !profile,
+        !paired_options.enabled || (!profile && profile_json.is_none()),
         "use --diagnostics for paired GPU intervals and worker counters"
     );
     let paired_gpu = paired_options.enabled.then(|| paired_options.context());
+    assert!(
+        capture_phase.is_none() || profile_json.is_some(),
+        "--capture-phase requires --profile-json"
+    );
     eprintln!("checking preconditions...");
     check_bench_preconditions(!force);
 
@@ -220,7 +354,7 @@ fn main() {
             .collect();
         train_session.set_parameter(&name, &data);
         infer_session.set_parameter(&name, &data);
-        if paired_options.enabled {
+        if paired_options.enabled || profile_json.is_some() {
             parameter_seed.push((name, data));
         }
     }
@@ -250,6 +384,52 @@ fn main() {
         }
         session.set_input("target_actions", &target_actions);
     };
+
+    if let Some(prefix) = profile_json {
+        let prepare = |session: &mut meganeura::Session| {
+            for (name, values) in &parameter_seed {
+                session.set_parameter(name, values);
+            }
+            set_inputs(session);
+        };
+        if let Some(phase) = capture_phase {
+            assert!(capture_seconds > 0);
+            let session = match phase.as_str() {
+                "forward" => &mut infer_session,
+                "backward" => &mut train_session,
+                _ => panic!("--capture-phase must be forward or backward"),
+            };
+            profile_graph_session(
+                session,
+                &prefix,
+                &phase,
+                warmup,
+                runs,
+                capture_seconds,
+                prepare,
+            );
+        } else {
+            profile_graph_session(
+                &mut infer_session,
+                &prefix,
+                "forward",
+                warmup,
+                runs,
+                0,
+                prepare,
+            );
+            profile_graph_session(
+                &mut train_session,
+                &prefix,
+                "backward",
+                warmup,
+                runs,
+                0,
+                prepare,
+            );
+        }
+        return;
+    }
 
     if let Some(gpu) = paired_gpu {
         let (mut candidate_infer, candidate_forward_ms) =

@@ -9,6 +9,11 @@ scheduling covers compatible regions of selected kernels. Appended optimizer,
 clipping and accumulation phases use portable persistent queues with their
 existing dispatch and submission boundaries.
 
+The [NVIDIA counter investigation](megakernel_performance_analysis.md) identifies
+fixed worker sizing and portable queue overhead as the leading SmolVLA costs.
+Per-region worker sizing precedes further atomic-interface optimization in the
+performance work; the qualified memory-ordering contract remains unchanged.
+
 Implementation is delivered in separate testable commits. The standalone
 prototype is the baseline; subsequent commits update the milestone checklist
 only when the corresponding implementation and checks are present.
