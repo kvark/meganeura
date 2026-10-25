@@ -802,7 +802,7 @@ fn implementations(
         split_plans,
         attention_blocks: attention_blocks::Refinements::new(shared_memory_bytes),
         refine_next: false,
-        nn_source: None,
+        prepared_source: None,
         queued_splits: false,
         replace_extracted_matrices: false,
         replace_extracted_attention: false,
@@ -824,7 +824,7 @@ struct Implementations {
     queued_splits: bool,
     attention_blocks: attention_blocks::Refinements,
     refine_next: bool,
-    nn_source: Option<(measure::Origin, ExecutionPlan)>,
+    prepared_source: Option<(measure::Origin, ExecutionPlan)>,
     replace_extracted_matrices: bool,
     replace_extracted_attention: bool,
     defer_bf16: bool,
@@ -1265,6 +1265,8 @@ impl measure::Frontier for Implementations {
         let form = incumbent.map_or(0, |origin| origin.form);
         let nn_selected =
             incumbent.is_some_and(|origin| self.choices[origin.choice].bf16_nn_gradients);
+        let storage_selected =
+            incumbent.is_some_and(|origin| self.choices[origin.choice].matrix_storage);
         self.order
             .priority_choices
             .iter()
@@ -1272,7 +1274,11 @@ impl measure::Frontier for Implementations {
                 // Once graph coverage is complete, reserve one comparison for
                 // the independent NN family before further submission probes.
                 (self.order.arithmetic_layouts == 1
-                    || (self.choices[choice].bf16_nn_gradients && !nn_selected))
+                    || (self.choices[choice].bf16_nn_gradients && !nn_selected)
+                    || (self.choices[choice].matrix_storage
+                        && !storage_selected
+                        && (self.choices[choice].gradient_inputs.is_some()
+                            || self.choices[choice].bf16_nn_gradients)))
                     && !self.order.tried.contains(&(form, choice))
                     && !self.order.deferred.contains(&(form, choice))
             })
@@ -1325,8 +1331,59 @@ impl measure::Frontier for Implementations {
 
     fn selected(&mut self, origin: Option<measure::Origin>, plan: &ExecutionPlan) {
         self.attention_blocks.selected(origin, plan);
-        if self.choices.iter().any(|choice| choice.bf16_nn_gradients) {
-            self.nn_source = origin.map(|origin| (origin, plan.clone()));
+        self.prepared_source = origin.map(|origin| (origin, plan.clone()));
+        let Some(origin) = origin else {
+            return;
+        };
+        let active = self.choices[origin.choice];
+        if !self.allow_matrix_storage
+            || active.matrix_storage
+            || !plan.dispatches.iter().any(|d| {
+                d.is_derivative
+                    && !d.requires_full_precision
+                    && matches!(d.kernel,
+                    compile::Kernel::CooperativeTyped { types, .. }
+                    | compile::Kernel::CooperativeWorkgroup { types: Some(types), .. }
+                    if matches!(types.multiply, crate::DType::F16 | crate::DType::BF16))
+            })
+            || storage::fill(&mut plan.clone()) == 0
+        {
+            return;
+        }
+        // Add only the actual winner's storage neighbor, after its derivative
+        // multiplication has qualified. Do not expand the initial cross product.
+        let stored = AxisChoice {
+            matrix_storage: true,
+            ..active
+        };
+        let index = self
+            .choices
+            .iter()
+            .position(|&c| c == stored)
+            .unwrap_or_else(|| {
+                let index = self.choices.len();
+                self.choices.push(stored);
+                self.order.choices = self.choices.len();
+                self.order.choice_order.push(index);
+                index
+            });
+        if !self.order.tried.contains(&(origin.form, index))
+            && !self.order.deferred.contains(&(origin.form, index))
+            && !self.order.priority_choices.contains(&index)
+        {
+            // This is reserved work: keep it directly after a pending NN trial,
+            // ahead of soft arithmetic alternatives that would block submissions.
+            let priority = if active.bf16_nn_gradients {
+                None
+            } else {
+                self.order.priority_choices.iter().position(|&other| {
+                    self.choices[other].bf16_nn_gradients
+                        && !self.order.tried.contains(&(origin.form, other))
+                        && !self.order.deferred.contains(&(origin.form, other))
+                })
+            }
+            .map_or(0, |position| position + 1);
+            self.order.priority_choices.insert(priority, index);
         }
     }
 
@@ -1403,6 +1460,13 @@ impl measure::Frontier for Implementations {
                 };
                 if let Some(next) = self.choices.iter().position(|&choice| choice == neighbor) {
                     *index = next;
+                } else if active.matrix_storage && derivative_trial {
+                    // A lazily added storage choice still needs independent
+                    // derivative neighbors, including NN after storage wins.
+                    *index = self.choices.len();
+                    self.choices.push(neighbor);
+                    self.order.choices = self.choices.len();
+                    self.order.choice_order.push(*index);
                 }
             }
             // Try the other arithmetic family on top of a winning family
@@ -1487,19 +1551,29 @@ impl measure::Frontier for Implementations {
                 gradient_inputs,
                 bf16_nn_gradients,
             } = self.choices[choice_index];
-            // Change only NN multiplication on the measured winner. Rebuilding
-            // its graph would discard unrelated kernel/layout tuning.
-            let source = self.nn_source.as_ref().filter(|entry| {
+            // Refine the measured winner's NN multiplication or private storage.
+            // Rebuilding its graph would discard unrelated kernel/layout tuning.
+            let source = self.prepared_source.as_ref().filter(|entry| {
                 let origin = entry.0;
                 let selected = self.choices[origin.choice];
                 origin.form == seed_index
-                    && !selected.bf16_nn_gradients
-                    && bf16_nn_gradients
-                    && AxisChoice {
-                        bf16_nn_gradients: true,
-                        ..selected
-                    } == self.choices[choice_index]
+                    && ((!selected.bf16_nn_gradients
+                        && bf16_nn_gradients
+                        && AxisChoice {
+                            bf16_nn_gradients: true,
+                            ..selected
+                        } == self.choices[choice_index])
+                        || (!selected.matrix_storage
+                            && matrix_storage
+                            && AxisChoice {
+                                matrix_storage: true,
+                                ..selected
+                            } == self.choices[choice_index]))
             });
+            let nn_trial = source
+                .is_some_and(|s| !self.choices[s.0.choice].bf16_nn_gradients && bf16_nn_gradients);
+            let storage_trial =
+                source.is_some_and(|s| !self.choices[s.0.choice].matrix_storage && matrix_storage);
             let prepared = source.is_some();
             let mut plan = if let Some(source) = source {
                 source.1.clone()
@@ -1597,14 +1671,23 @@ impl measure::Frontier for Implementations {
                 }
             }
             if bf16_nn_gradients
+                && (!prepared || nn_trial)
                 && fill_nn_gradient_candidates(&mut plan, self.replace_extracted_matrices) == 0
             {
                 continue;
             }
-            if !prepared {
-                if matrix_storage && storage::fill(&mut plan) == 0 {
+            if matrix_storage {
+                let groups = prepared.then(|| plan.groups.clone());
+                let changed = storage::fill(&mut plan);
+                if let Some(groups) = groups {
+                    // Storage changes leave dependencies and dispatch order intact.
+                    plan.groups = groups;
+                }
+                if changed == 0 && (!prepared || storage_trial) {
                     continue;
                 }
+            }
+            if !prepared {
                 if let Some(storage) = winograd {
                     let (shape, subgroup) = self.matrix_shapes[&storage];
                     if winograd::fill(&mut plan, storage, shape, subgroup) == 0 {
@@ -1632,6 +1715,9 @@ impl measure::Frontier for Implementations {
                 if vector_convolutions_only {
                     description.push_str(", vector_convolutions_only=true");
                 }
+            }
+            if matrix_storage && matrix_inputs.is_none() {
+                description.push_str(", private_matrix_storage=true");
             }
             if let Some(dtype) = gradient_inputs {
                 description.push_str(&format!(", gradient_inputs={dtype:?}"));
@@ -1919,6 +2005,141 @@ mod tests {
         }
         assert_eq!(fill_nn_gradient_candidates(&mut locked, false), 0);
         assert_eq!(fill_nn_gradient_candidates(&mut locked, true), 1);
+    }
+
+    #[test]
+    fn derivative_storage_refines_the_actual_winner_and_keeps_nn_priority() {
+        use crate::DType::{BF16, F16};
+        use measure::Frontier as _;
+        for (allow_storage, nn_selected) in [(true, false), (true, true), (false, true)] {
+            let mut g = Graph::new();
+            let x = g.input("x", &[17, 23]);
+            let a = g.parameter("a", &[38, 23]);
+            let b = g.parameter("b", &[7, 19]);
+            let y = g.matmul_bt(x, a);
+            let y = g.swiglu_concat(y);
+            let y = g.matmul_bt(y, b);
+            let loss = g.mean_all(y);
+            g.set_outputs(vec![loss]);
+            let mut frontier = graph_frontier(crate::autodiff::differentiate(&g));
+            frontier.allow_matrix_storage = allow_storage;
+            let mut caps = blade_graphics::Capabilities {
+                shader_float16: true,
+                shader_bfloat16: true,
+                subgroup_size: 32,
+                ..Default::default()
+            };
+            caps.cooperative_matrix.f16_f32_shapes = vec![[8, 16, 16]];
+            caps.cooperative_matrix.bf16_f32_shapes = vec![[8, 16, 16]];
+            frontier.enable_matrix_inputs(&[F16, BF16], &caps);
+            frontier.enable_gradient_inputs(&[F16, BF16]);
+            let choice = frontier
+                .choices
+                .iter()
+                .position(|c| {
+                    c.matrix_inputs == Some(F16)
+                        && c.gradient_inputs == Some(F16)
+                        && c.bf16_nn_gradients == nn_selected
+                        && !c.matrix_storage
+                        && c.attention == (0, None)
+                        && c.fuse_dispatches
+                })
+                .unwrap();
+            let origin = measure::Origin { form: 0, choice };
+            let mut winner = frontier.seeds[0].plan.clone();
+            assert!(fill_matrix_candidates(&mut winner, F16, false) > 0);
+            assert!(fill_gradient_candidates(&mut winner, F16, false) > 0);
+            if nn_selected {
+                assert!(fill_nn_gradient_candidates(&mut winner, false) > 0);
+            }
+            winner.dispatches[0].label.push_str(":measured");
+            winner.groups = (0..winner.dispatches.len()).map(|i| i..i + 1).collect();
+            frontier.order.mark((0, choice));
+            frontier.order.initial = INITIAL_LAYOUTS;
+            frontier.queued_splits = true;
+            frontier.order.priority_choices.clear();
+            let pending_nn = (!nn_selected).then(|| {
+                frontier
+                    .choices
+                    .iter()
+                    .position(|&c| {
+                        c == AxisChoice {
+                            bf16_nn_gradients: true,
+                            ..frontier.choices[choice]
+                        }
+                    })
+                    .unwrap()
+            });
+            if let Some(index) = pending_nn {
+                frontier.order.priority_choices.clear();
+                frontier.order.priority_choices.push_back(index);
+            }
+            let soft = frontier
+                .choices
+                .iter()
+                .position(|&c| {
+                    c == AxisChoice {
+                        gradient_inputs: Some(BF16),
+                        ..frontier.choices[choice]
+                    }
+                })
+                .unwrap();
+            frontier.order.priority_choices.push_back(soft);
+            let before = frontier.choices.len();
+            frontier.selected(Some(origin), &winner);
+            if !allow_storage {
+                assert_eq!(frontier.choices.len(), before);
+                assert_eq!(frontier.early_programs_remaining(Some(origin)), 0);
+                continue;
+            }
+            assert_eq!(
+                frontier.choices.len(),
+                before + 1,
+                "only one local neighbor is added"
+            );
+            assert_eq!(frontier.order.choices, frontier.choices.len());
+            if let Some(index) = pending_nn {
+                assert_eq!(frontier.order.priority_choices.front(), Some(&index));
+                assert_eq!(frontier.early_programs_remaining(Some(origin)), 2);
+                // Model an NN trial that did not replace this incumbent.
+                frontier.order.priority_choices.pop_front();
+            }
+            assert_eq!(frontier.early_programs_remaining(Some(origin)), 1);
+            assert_eq!(
+                frontier.order.priority_choices.front(),
+                Some(&before),
+                "reserved storage must precede soft arithmetic alternatives"
+            );
+            let candidate = frontier.next(Some(origin)).unwrap();
+            assert!(candidate.prepared);
+            let mut expected = winner.clone();
+            assert!(storage::fill(&mut expected) > 0);
+            expected.groups = winner.groups;
+            assert_eq!(candidate.plan, expected);
+            assert_eq!(
+                frontier.choices[candidate.origin.unwrap().choice],
+                AxisChoice {
+                    matrix_storage: true,
+                    ..frontier.choices[choice]
+                }
+            );
+            frontier.selected(candidate.origin, &candidate.plan);
+            assert_eq!(frontier.choices.len(), before + 1);
+            assert_eq!(frontier.early_programs_remaining(candidate.origin), 0);
+            if let Some(index) = pending_nn {
+                frontier.order.priority_choices.push_back(index);
+                let nn = frontier.next(candidate.origin).unwrap();
+                assert!(nn.prepared);
+                let mut expected_nn = candidate.plan.clone();
+                assert!(fill_nn_gradient_candidates(&mut expected_nn, false) > 0);
+                let groups = expected_nn.groups.clone();
+                storage::fill(&mut expected_nn);
+                expected_nn.groups = groups;
+                assert_eq!(nn.plan, expected_nn);
+                let selected = frontier.choices[nn.origin.unwrap().choice];
+                assert!(selected.bf16_nn_gradients && selected.matrix_storage);
+            }
+        }
     }
 
     #[test]

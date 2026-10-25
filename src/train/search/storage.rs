@@ -1,5 +1,8 @@
 //! Narrow private producers whose readers already require one reduced format.
 //! Multiplication types are already chosen; this pass does not choose precision.
+//! A derivative reader may use a reduced binding when its multiplication was
+//! already selected in that format. Derivative producers and explicit pins
+//! retain F32 stores.
 
 use crate::{
     DType,
@@ -43,7 +46,7 @@ pub(super) fn fill(plan: &mut ExecutionPlan) -> usize {
             _ => continue,
         };
         if !d.shader.is_matmul()
-            || d.full_precision()
+            || d.requires_full_precision
             || d.matmul_prologue.is_some()
             || d.matmul_epilogue.is_some()
         {
@@ -135,7 +138,7 @@ pub(super) fn fill(plan: &mut ExecutionPlan) -> usize {
             _ => continue,
         };
         if !d.shader.is_matmul()
-            || (d.requires_full_precision || d.is_derivative)
+            || d.requires_full_precision
             || d.matmul_prologue.is_some()
             || d.matmul_epilogue.is_some()
         {
@@ -279,27 +282,80 @@ mod tests {
     }
 
     #[test]
+    fn reduced_derivative_readers_share_private_stores_without_narrowing_gradients() {
+        for dtype in [DType::F16, DType::BF16] {
+            let mut p = plan(&chain(true, 3), dtype);
+            assert!(super::super::fill_gradient_candidates(&mut p, dtype, false) > 0);
+            let before = p.clone();
+            assert!(fill(&mut p) > 0);
+            assert_eq!(fill(&mut p), 0, "storage refinement is idempotent");
+            for buffer in before.externally_visible_buffers() {
+                assert_eq!(
+                    p.buffers[buffer.0 as usize],
+                    before.buffers[buffer.0 as usize]
+                );
+            }
+            assert!(p.dispatches.iter().any(|d| {
+                d.is_derivative
+                    && matches!(d.kernel, Kernel::CooperativeTyped { types, .. }
+                    if types.a == dtype || types.b == dtype)
+            }));
+            for (old, new) in before.dispatches.iter().zip(&p.dispatches) {
+                assert_eq!(old.is_derivative, new.is_derivative);
+                assert_eq!(old.requires_full_precision, new.requires_full_precision);
+                if old.is_derivative {
+                    assert_eq!(
+                        p.buffers[old.output_buffer.0 as usize],
+                        before.buffers[old.output_buffer.0 as usize]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_precision_or_pinned_derivative_readers_prevent_narrowing() {
+        let mut mixed = plan(&chain(true, 3), DType::F16);
+        super::super::fill_gradient_candidates(&mut mixed, DType::BF16, false);
+        assert_eq!(fill(&mut mixed), 0);
+
+        let mut pinned = plan(&chain(true, 3), DType::F16);
+        super::super::fill_gradient_candidates(&mut pinned, DType::F16, false);
+        for d in &mut pinned.dispatches {
+            if d.is_derivative {
+                d.requires_full_precision = true;
+            }
+        }
+        assert_eq!(fill(&mut pinned), 0);
+    }
+
+    #[test]
     fn native_storage_keeps_chain_outputs_gradients_and_parameter_updates() {
         let gpu = crate::reference::gpu::shared_context();
         for dtype in [DType::F16, DType::BF16] {
             if !crate::runtime::typed_matrix_supported(&gpu, dtype) {
                 continue;
             }
-            for (training, pointwise) in [
-                (false, 0),
-                (false, 1),
-                (false, 2),
-                (false, 3),
-                (false, 4),
-                (true, 0),
-                (true, 3),
+            for (training, pointwise, reduced_derivatives) in [
+                (false, 0, false),
+                (false, 1, false),
+                (false, 2, false),
+                (false, 3, false),
+                (false, 4, false),
+                (true, 0, false),
+                (true, 3, false),
+                (true, 0, true),
+                (true, 3, true),
             ] {
                 let g = chain(training, pointwise);
-                let staged = plan(&g, dtype);
+                let mut staged = plan(&g, dtype);
+                if reduced_derivatives {
+                    assert!(super::super::fill_gradient_candidates(&mut staged, dtype, false) > 0);
+                }
                 let mut native = staged.clone();
                 assert_eq!(
                     fill(&mut native) > 0,
-                    !training,
+                    !training || reduced_derivatives,
                     "{dtype:?}, training={training}, pointwise={pointwise}"
                 );
                 let reads = staged
