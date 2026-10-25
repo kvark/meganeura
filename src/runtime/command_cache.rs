@@ -22,6 +22,16 @@ impl Cache {
         }
     }
 
+    #[cfg(all(
+        not(gles),
+        any(
+            vulkan,
+            windows,
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd"
+        )
+    ))]
     pub fn execute(
         &mut self,
         gpu: &Gpu,
@@ -50,5 +60,27 @@ impl Cache {
             }
         };
         primary.execute_secondary(&self.chunks[index].1);
+    }
+
+    #[cfg(not(all(
+        not(gles),
+        any(
+            vulkan,
+            windows,
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd"
+        )
+    )))]
+    pub fn execute(
+        &mut self,
+        _gpu: &Gpu,
+        primary: &mut blade_graphics::CommandEncoder,
+        _range: Range<usize>,
+        record: impl FnOnce(&mut blade_graphics::CommandEncoder),
+    ) {
+        // Metal and GLES record directly on the GPU's primary encoder.
+        record(primary);
+        self.recordings += 1;
     }
 }

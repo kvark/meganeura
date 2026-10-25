@@ -30,6 +30,7 @@ path = "tests/oracle/main.rs"
 [lints.rust]
 trivial_numeric_casts = "warn"
 unused_extern_crates = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(vulkan)', 'cfg(gles)'] }
 
 [lints.clippy]
 match_like_matches_macro = "allow"
