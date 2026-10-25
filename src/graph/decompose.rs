@@ -92,6 +92,7 @@ impl Graph {
             map.push(id);
         }
         out.new_nodes_require_full_precision = self.new_nodes_require_full_precision;
+        out.new_nodes_are_derivatives = self.new_nodes_are_derivatives;
         out.outputs = self.outputs.iter().map(|&o| map[o as usize]).collect();
         out.num_param_grad_outputs = self.num_param_grad_outputs;
         Some(out)
@@ -2408,6 +2409,20 @@ fn per_channel_dims(g: &Graph, node: &Node, gate: NodeId) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decomposition_preserves_policy_for_appended_nodes() {
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[2, 8]);
+        let w = graph.parameter("w", &[8]);
+        let y = graph.rms_norm(x, w, 1e-5);
+        graph.nodes_mut()[y as usize].is_derivative = true;
+        graph.set_outputs(vec![y]);
+        let mut expanded = graph.decompose();
+        assert!(expanded.nodes().iter().any(|node| node.is_derivative));
+        let next = expanded.input("next", &[8]);
+        assert!(!expanded.node(next).is_derivative);
+    }
 
     #[test]
     fn validity_rejects_zero_width_axial_rope_axes() {
