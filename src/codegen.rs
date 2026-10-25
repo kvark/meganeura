@@ -6,9 +6,20 @@
 
 use crate::compile::WeightFormat;
 
+pub(crate) use qualified_cooperative::generate_vector as generate_checked_vector_matmul;
+mod pool;
+pub use pool::PoolKernel;
+mod image;
+pub use image::{ImageKernel, ImageView};
+mod copy;
+pub use copy::{CopyKernel, CopyNode, CopySource};
+mod convolution_reuse;
 mod coop_tiled;
 mod cooperative;
 mod matrix_types;
+mod qualified_cooperative;
+pub use convolution_reuse::ConvolutionReuseShape;
+pub(crate) use qualified_cooperative::generate_reuse as generate_convolution_reuse;
 mod workgroup;
 pub use coop_tiled::{CooperativeMatmulShape, generate_tiled_coop_matmul};
 pub use matrix_types::MatrixTypes;
@@ -595,8 +606,15 @@ fn matmul_stage_maps(
 // Shader groups — each group is WGSL source with one or more entry points
 // ---------------------------------------------------------------------------
 
-/// A shader group corresponds to one WGSL source that may contain multiple
-/// entry points (e.g. `Unary` has relu, sigmoid, neg).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum ConvolutionPass {
+    Forward,
+    InputGradient,
+    WeightGradient,
+}
+
+/// A shader group corresponds to a single `naga::Module` that may
+/// contain multiple entry points (e.g. `Unary` has relu, sigmoid, neg).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ShaderGroup {
     /// Generated pointwise and reduction kernels, lowered from their
@@ -612,6 +630,11 @@ pub enum ShaderGroup {
     BlockMatMul,
     BlockMatMulAT,
     BlockMatMulBT,
+    BlockMatMulTyped {
+        transpose_a: bool,
+        transpose_b: bool,
+        types: MatrixTypes,
+    },
     BatchMatMul,
     BatchMatMulAT,
     BatchMatMulBT,
@@ -636,6 +659,12 @@ pub enum ShaderGroup {
     ToF16,
     ToBF16,
     FromBF16,
+    MatMulTyped {
+        transpose_a: bool,
+        transpose_b: bool,
+        addend: bool,
+        types: MatrixTypes,
+    },
     RoPE,
     RoPEGrad,
     LayerNorm,
@@ -673,7 +702,6 @@ pub enum ShaderGroup {
     /// Used by EfficientNet Squeeze-and-Excitation.
     MulPerChannel,
     Conv2dGemm,
-    /// Checked implicit GEMM with types supplied by the pipeline.
     Conv2dChecked {
         kernel_h: u32,
         kernel_w: u32,
@@ -684,6 +712,26 @@ pub enum ShaderGroup {
         kernel_w: u32,
         stride: u32,
         output_bf16: bool,
+    },
+    PackChannels {
+        dtype: crate::DType,
+        transpose: bool,
+    },
+    Conv2dPacked {
+        pass: crate::codegen::ConvolutionPass,
+        splits: u32,
+        kernel_h: u32,
+        kernel_w: u32,
+        stride: u32,
+        types: MatrixTypes,
+    },
+    Conv2dGradientTyped {
+        weight_gradient: bool,
+        kernel_h: u32,
+        kernel_w: u32,
+        stride: u32,
+        splits: u32,
+        types: MatrixTypes,
     },
     Conv2dGemmSmall,
     Conv2dGemm16,
@@ -788,17 +836,22 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         ShaderGroup::Conv2dChecked { .. } => {
             panic!("checked convolution requires explicit matrix types")
         }
-        ShaderGroup::Conv2dBF16 { output_bf16, .. } => cooperative::generate(
+        ShaderGroup::MatMulTyped { .. }
+        | ShaderGroup::BlockMatMulTyped { .. }
+        | ShaderGroup::Conv2dBF16 { .. }
+        | ShaderGroup::Conv2dGradientTyped { .. } => qualified_cooperative::generate(group),
+        ShaderGroup::PackChannels { dtype, transpose } => {
+            coop_tiled::generate_channel_pack(dtype, transpose)
+        }
+        ShaderGroup::Conv2dPacked { splits, .. } => generate_tiled_coop_matmul(
             group,
-            MatrixTypes {
-                output: if output_bf16 {
-                    crate::DType::BF16
-                } else {
-                    crate::DType::F32
-                },
-                ..MatrixTypes::BF16
+            CooperativeMatmulShape {
+                columns: 64,
+                k_stage: 32,
+                prefetch: false,
             },
-            [16, 16, 16],
+            splits,
+            None,
         ),
         ShaderGroup::ToBF16 | ShaderGroup::FromBF16 => {
             let narrowing = group == ShaderGroup::ToBF16;
@@ -1115,6 +1168,7 @@ pub fn generate_horizontal_matmul(
 fn matmul_module(
     source: &str,
     b_storage: &str,
+    c_storage: &str,
     coop_threads: Option<u32>,
     count: u32,
 ) -> ShaderModule {
@@ -1164,6 +1218,7 @@ fn matmul_module(
                 ("$B_BUFFER", &b),
                 ("$C_BUFFER", &c),
                 ("$B_STORAGE", b_storage),
+                ("$C_STORAGE", c_storage),
             ],
         ));
         let name = if count == 1 {
@@ -1831,7 +1886,7 @@ fn matmul_vars_tiled(
             ("$ACC_ARRAY", &acc_array),
         ],
     );
-    matmul_module(&src, b_storage, None, copies)
+    matmul_module(&src, b_storage, "array<f32>", None, copies)
 }
 
 /// f16 → f32 for the packed-weight kernels' block scales.
@@ -2518,6 +2573,36 @@ fn gen_matmul_coop_stored(
     );
     if config.tile_size == 8 && !config.use_f16_input {
         return gen_matmul_coop_f32_8x8(fused_add, variant, prologue, epilogue, copies);
+    }
+    if typed.is_none()
+        && config.tile_size == 16
+        && !config.compensated
+        && copies == 1
+        && prologue.is_none()
+        && epilogue.is_none()
+    {
+        return qualified_cooperative::generate_dense(
+            ShaderGroup::MatMulTyped {
+                transpose_a: variant == MatMulCoopVariant::AT,
+                transpose_b: variant == MatMulCoopVariant::BT,
+                addend: fused_add,
+                types: MatrixTypes {
+                    a: crate::DType::F32,
+                    b: if b_f16 {
+                        crate::DType::F16
+                    } else {
+                        crate::DType::F32
+                    },
+                    multiply: if config.use_f16_input {
+                        crate::DType::F16
+                    } else {
+                        crate::DType::F32
+                    },
+                    output: crate::DType::F32,
+                },
+            },
+            false,
+        );
     }
     let tile = config.tile_size;
     let output_tile = config.output_tile();
@@ -3213,7 +3298,7 @@ fn gen_matmul_coop_stored(
             ],
         ));
     }
-    matmul_module(&src, &b_storage, Some(wg_size), copies)
+    matmul_module(&src, &b_storage, "array<f32>", Some(wg_size), copies)
 }
 
 /// F32 8x8 cooperative matrices: four SIMD groups own disjoint
@@ -3385,7 +3470,7 @@ fn gen_matmul_coop_f32_8x8(
             ),
         ],
     );
-    matmul_module(&src, "array<f32>", Some(128), copies)
+    matmul_module(&src, "array<f32>", "array<f32>", Some(128), copies)
 }
 
 /// Variant selector for gen_matmul_coop_inner.
@@ -4149,7 +4234,7 @@ mod tests {
             ShaderGroup::MatMulBTAdd,
         ] {
             let plain = generate_module_coop_weighted(group, &config, WeightFormat::F16);
-            assert!(plain.source.contains("vec4<f16>"), "{group:?}");
+            assert!(plain.source.contains("matrix_b: array<f16>"), "{group:?}");
             let fused = generate_coop_matmul_with_dag_epilogue(
                 group,
                 &config,
@@ -4376,10 +4461,12 @@ mod tests {
                 ShaderEntry::BlockMatMul
                 | ShaderEntry::BlockMatMulAT
                 | ShaderEntry::BlockMatMulBT
+                | ShaderEntry::BlockMatMulTyped { .. }
                 | ShaderEntry::BatchMatMul
                 | ShaderEntry::BatchMatMulAT
                 | ShaderEntry::BatchMatMulBT => vec!["matrix_a", "matrix_b", "matrix_c", "params"],
                 ShaderEntry::MatMul
+                | ShaderEntry::MatMulTyped { addend: false, .. }
                 | ShaderEntry::MatMulAT
                 | ShaderEntry::MatMulBT
                 | ShaderEntry::MatMulGemv
@@ -4390,6 +4477,7 @@ mod tests {
                     vec!["matrix_a", "matrix_b", "matrix_c", "src", "params"]
                 }
                 ShaderEntry::FusedMatMulAdd
+                | ShaderEntry::MatMulTyped { addend: true, .. }
                 | ShaderEntry::FusedMatMulATAdd
                 | ShaderEntry::FusedMatMulBTAdd => {
                     vec!["matrix_a", "matrix_b", "matrix_c", "src", "params"]
@@ -4491,7 +4579,10 @@ mod tests {
                 ShaderEntry::BiasedAttention => {
                     vec!["q", "k", "v", "bias", "kv_pos", "dst", "params"]
                 }
-                ShaderEntry::SplitA | ShaderEntry::SplitB | ShaderEntry::Permute => {
+                ShaderEntry::SplitA
+                | ShaderEntry::SplitB
+                | ShaderEntry::Permute
+                | ShaderEntry::PackChannels { .. } => {
                     vec!["src", "dst", "params"]
                 }
                 ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => {
@@ -4503,16 +4594,36 @@ mod tests {
                 ShaderEntry::MulPerChannel => vec!["src", "gate", "dst", "params"],
                 ShaderEntry::Conv2dGemm
                 | ShaderEntry::Conv2dBF16 { .. }
+                | ShaderEntry::Conv2dPacked {
+                    pass: crate::codegen::ConvolutionPass::Forward,
+                    ..
+                }
                 | ShaderEntry::Conv2dGemmSmall
                 | ShaderEntry::Conv2dGemm16
                 | ShaderEntry::Conv2dGemmCoopGen(..) => vec!["src", "weight", "dst", "params"],
                 ShaderEntry::Conv2dGradInputGemm
+                | ShaderEntry::Conv2dGradientTyped {
+                    weight_gradient: false,
+                    ..
+                }
+                | ShaderEntry::Conv2dPacked {
+                    pass: crate::codegen::ConvolutionPass::InputGradient,
+                    ..
+                }
                 | ShaderEntry::Conv2dGradInputGemmSmall
                 | ShaderEntry::Conv2dGradInputGemm16
                 | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => {
                     vec!["grad_out", "weight", "dst", "params"]
                 }
                 ShaderEntry::Conv2dGradWeightGemm
+                | ShaderEntry::Conv2dGradientTyped {
+                    weight_gradient: true,
+                    ..
+                }
+                | ShaderEntry::Conv2dPacked {
+                    pass: crate::codegen::ConvolutionPass::WeightGradient,
+                    ..
+                }
                 | ShaderEntry::Conv2dGradWeightGemmSmall
                 | ShaderEntry::Conv2dGradWeightGemm16
                 | ShaderEntry::Conv2dGradWeightGemmSplit

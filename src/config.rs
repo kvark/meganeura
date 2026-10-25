@@ -368,6 +368,7 @@ impl SessionOptions {
                 }
             },
             wgsl_dump_dir: DUMP_WGSL.text(),
+            prepare_outputs: Vec::new(),
         }
     }
 }

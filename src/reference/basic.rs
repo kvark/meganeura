@@ -498,6 +498,21 @@ pub(super) fn eval(node: &Node, ins: &[&Tensor]) -> Result<Vec<f64>, Error> {
                 })
                 .collect()
         }
+        Op::ArgMaxOneHot => {
+            let x = arg(0)?;
+            let (rows, cols) = rows_cols(x);
+            let mut result = vec![0.0; x.len()];
+            for row in 0..rows {
+                let mut winner = 0;
+                for col in 1..cols {
+                    if x.data[row * cols + col] > x.data[row * cols + winner] {
+                        winner = col;
+                    }
+                }
+                result[row * cols + winner] = 1.0;
+            }
+            result
+        }
         Op::BroadcastInner { inner } => {
             let x = arg(0)?;
             let inner = inner as usize;

@@ -62,10 +62,15 @@ impl<'a> Compiler<'a> {
                             | Op::MatMul
                             | Op::MatMulAT
                             | Op::MatMulBT
+                            | Op::BlockMatMul
+                            | Op::BlockMatMulAT { .. }
+                            | Op::BlockMatMulBT
                             | Op::FusedMatMulAdd
                             | Op::FusedMatMulATAdd
                             | Op::FusedMatMulBTAdd
                             | Op::Conv2d { .. }
+                            | Op::Conv2dGradInput { .. }
+                            | Op::Conv2dGradWeight { .. }
                     ),
                     "BF16 input to unsupported operation {:?}",
                     node.op
@@ -857,12 +862,13 @@ impl<'a> Compiler<'a> {
         let out_buf = self.get_buffer(node.id);
         let dispatch_start = self.plan.dispatches.len();
 
-        if let Some(storage) = typed_product_storage(self.graph, node) {
+        if typed_product_storage(self.graph, node).is_some() {
+            let input_type = self.graph.node(node.inputs[0]).ty.dtype;
             assert!(
                 node.inputs[..2]
                     .iter()
-                    .all(|&id| self.graph.node(id).ty.dtype == storage),
-                "{storage:?} matrix products require two {storage:?} operands"
+                    .all(|&id| self.graph.node(id).ty.dtype == input_type),
+                "explicit reduced matrix products require matching operand storage"
             );
             let a = &self.graph.node(node.inputs[0]).ty.shape;
             let b = &self.graph.node(node.inputs[1]).ty.shape;
@@ -878,11 +884,10 @@ impl<'a> Compiler<'a> {
                 (a[0], a[1])
             };
             let n = if transpose_b { b[0] } else { b[1] };
-            let [m, n, k] = [m, n, k]
-                .map(|dimension| u32::try_from(dimension).expect("typed matrix dimension"));
+            let [m, n, k] =
+                [m, n, k].map(|dimension| u32::try_from(dimension).expect("matrix dimension"));
             for (rows, columns) in [(m, k), (k, n), (m, n)] {
-                rows.checked_mul(columns)
-                    .expect("typed matrix address space");
+                rows.checked_mul(columns).expect("matrix address space");
             }
             // Leave fused epilogues intact. Partitions must be reduced in F32
             // before any explicit BF16 output conversion.
@@ -891,7 +896,17 @@ impl<'a> Compiler<'a> {
             } else {
                 crate::kernels::matmul::matrix_splits(m, n, k)
             };
-            let grid = [m.div_ceil(32), n.div_ceil(32), splits];
+            let shape = crate::codegen::CooperativeMatmulShape {
+                columns: 64,
+                k_stage: 32,
+                prefetch: true,
+            };
+            let tiled = shape.fits_dimensions(m, n, k);
+            let grid = if tiled {
+                [m / 64, n / 64, splits]
+            } else {
+                [m.div_ceil(32), n.div_ceil(32), splits]
+            };
             assert!(workgroups_within_portable_limits(grid));
             let partial = if splits > 1 {
                 self.alloc_buffer((m as usize) * (n as usize) * (splits as usize) * 4)
@@ -899,31 +914,27 @@ impl<'a> Compiler<'a> {
                 out_buf
             };
             let dispatch = Dispatch {
-                shader: match node.op {
-                    Op::MatMul => ShaderEntry::MatMul,
-                    Op::MatMulAT => ShaderEntry::MatMulAT,
-                    Op::MatMulBT => ShaderEntry::MatMulBT,
-                    Op::FusedMatMulAdd => ShaderEntry::FusedMatMulAdd,
-                    Op::FusedMatMulATAdd => ShaderEntry::FusedMatMulATAdd,
-                    Op::FusedMatMulBTAdd => ShaderEntry::FusedMatMulBTAdd,
-                    _ => unreachable!(),
-                },
-                kernel: super::Kernel::CooperativeTyped {
-                    types: crate::codegen::MatrixTypes::reduced(storage),
-                    splits,
+                shader: ShaderEntry::MatMulTyped {
+                    transpose_a,
+                    transpose_b,
+                    addend,
+                    types: crate::codegen::MatrixTypes {
+                        a: input_type,
+                        b: input_type,
+                        multiply: input_type,
+                        output: DType::F32,
+                    },
                 },
                 workgroups: grid,
+                kernel: if tiled {
+                    Kernel::CooperativeTiled { shape, splits }
+                } else {
+                    Kernel::Default
+                },
                 input_buffers: node.inputs.iter().map(|&id| self.get_buffer(id)).collect(),
                 output_buffer: partial,
-                params: if transpose_a || transpose_b {
-                    vec![m, n, k, 0]
-                } else {
-                    vec![m, k, n, 0]
-                },
+                params: vec![m, n, k, splits],
                 fusion_barrier: true,
-                // The typed kernel is fixed by storage, not by a schedule:
-                // kernel selection keeps it, and tuning only varies K
-                // partitions within the partial buffer.
                 schedule_locked: false,
                 origin: vec![node.id],
                 ..Default::default()
@@ -1116,8 +1127,7 @@ impl<'a> Compiler<'a> {
                 let b = self.get_buffer(node.inputs[1]);
                 let a_ty = &self.graph.node(node.inputs[0]).ty;
                 let b_ty = &self.graph.node(node.inputs[1]).ty;
-                assert_eq!(a_ty.dtype, crate::graph::DType::F32);
-                assert_eq!(b_ty.dtype, crate::graph::DType::F32);
+                assert_eq!(a_ty.dtype, b_ty.dtype, "group operand storage must match");
                 for ty in [a_ty, b_ty, &node.ty] {
                     let elements = ty
                         .shape
@@ -1177,10 +1187,90 @@ impl<'a> Compiler<'a> {
                     _ => unreachable!(),
                 };
                 let [m, n, k, groups] = [m, n, k, groups].map(|d| u32::try_from(d).unwrap());
+                assert!(m > 0 && n > 0 && k > 0 && groups > 0);
                 assert!(
                     groups <= 65535,
                     "block count exceeds portable dispatch limit"
                 );
+                if a_ty.dtype != DType::F32 {
+                    let (transpose_a, transpose_b) = match node.op {
+                        Op::BlockMatMul => (false, false),
+                        Op::BlockMatMulAT { .. } => (true, false),
+                        Op::BlockMatMulBT => (false, true),
+                        _ => panic!("typed batch-major products are not supported"),
+                    };
+                    assert!(matches!(a_ty.dtype, DType::F16 | DType::BF16));
+                    let types = crate::codegen::MatrixTypes {
+                        a: a_ty.dtype,
+                        b: b_ty.dtype,
+                        multiply: a_ty.dtype,
+                        output: DType::F32,
+                    };
+                    let shape = crate::codegen::CooperativeMatmulShape {
+                        columns: 64,
+                        k_stage: 32,
+                        prefetch: true,
+                    };
+                    let tiled = shape.fits_dimensions(m, n, k);
+                    let tile = if tiled { 64 } else { 32 };
+                    let workgroups = m
+                        .div_ceil(tile)
+                        .saturating_mul(n.div_ceil(tile))
+                        .saturating_mul(groups);
+                    let splits =
+                        crate::kernels::matmul::matrix_splits_for_workgroups(workgroups, k)
+                            .max(k.div_ceil(4096));
+                    let grid = [
+                        m.div_ceil(tile),
+                        n.div_ceil(tile),
+                        groups
+                            .checked_mul(splits)
+                            .expect("grouped dispatch overflow"),
+                    ];
+                    assert!(workgroups_within_portable_limits(grid));
+                    let elements = m
+                        .checked_mul(n)
+                        .and_then(|v| v.checked_mul(groups))
+                        .expect("grouped output index overflow");
+                    let partial = if splits > 1 {
+                        let bytes = (elements as usize)
+                            .checked_mul(splits as usize)
+                            .and_then(|n| n.checked_mul(4))
+                            .expect("grouped partial overflow");
+                        assert!(
+                            bytes <= 64 << 20,
+                            "grouped matrix partial storage exceeds 64 MiB"
+                        );
+                        self.alloc_buffer(bytes)
+                    } else {
+                        out_buf
+                    };
+                    let dispatch = Dispatch {
+                        shader: ShaderEntry::BlockMatMulTyped {
+                            transpose_a,
+                            transpose_b,
+                            types,
+                        },
+                        workgroups: grid,
+                        kernel: if tiled {
+                            Kernel::CooperativeTiled { shape, splits }
+                        } else {
+                            Kernel::Default
+                        },
+                        input_buffers: vec![a, b],
+                        output_buffer: partial,
+                        params: vec![m, n, k, groups, splits, 0, 0, 0],
+                        fusion_barrier: true,
+                        origin: vec![node.id],
+                        ..Default::default()
+                    };
+                    let reduction = dispatch.partial_sum(partial, out_buf, elements, splits);
+                    self.plan.dispatches.push(dispatch);
+                    if splits > 1 {
+                        self.plan.dispatches.push(reduction);
+                    }
+                    return;
+                }
                 // Match the ordinary scalar per-block tile choice. This
                 // operator does not opt into GEMV or cooperative variants.
                 let small = m.div_ceil(64) * n.div_ceil(64) < 16;
@@ -1556,6 +1646,43 @@ impl<'a> Compiler<'a> {
                 );
             }
 
+            Op::ArgMaxOneHot => {
+                let input = self.get_buffer(node.inputs[0]);
+                let indices = self.get_buffer(node.inputs[1]);
+                let (rows, cols) = (node.ty.shape[0] as u32, node.ty.shape[1] as u32);
+                let rows_per_workgroup = if cols <= 32 {
+                    256 / cols.next_power_of_two()
+                } else {
+                    1
+                };
+                self.emit_inner_reduction(
+                    crate::schedule::ReduceOp::ArgMax,
+                    input,
+                    out_buf,
+                    rows,
+                    cols,
+                    rows_per_workgroup,
+                );
+                let dispatch = self.plan.dispatches.last_mut().unwrap();
+                dispatch.input_buffers.push(indices);
+                dispatch.reduction_mut().unwrap().epilogue = Some(ReductionEpilogue {
+                    n_per_col_inputs: 1,
+                    dag: PointwiseDAG {
+                        n_inputs: 3,
+                        ops: vec![
+                            Pw::LoadInput(1),
+                            Pw::LoadInput(2),
+                            Pw::Sub(0, 1),
+                            Pw::Abs(2),
+                            Pw::const_f32(0.0),
+                            Pw::Greater(3, 4),
+                            Pw::const_f32(1.0),
+                            Pw::Sub(6, 5),
+                        ],
+                        output: 7,
+                    },
+                });
+            }
             Op::BroadcastInner { inner } => {
                 let input = self.get_buffer(node.inputs[0]);
                 let rows = node.ty.shape[0] as u32;
@@ -2951,6 +3078,42 @@ impl<'a> Compiler<'a> {
                 let out_size = node.ty.shape[0] as u32;
                 let batch = out_size / (in_channels * in_h * in_w);
 
+                if self.graph.node(node.inputs[0]).ty.dtype == DType::BF16 {
+                    assert_eq!(self.graph.node(node.inputs[1]).ty.dtype, DType::BF16);
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::Conv2dGradientTyped {
+                            weight_gradient: false,
+                            kernel_h,
+                            kernel_w,
+                            stride,
+                            splits: 1,
+                            types: crate::codegen::MatrixTypes::BF16,
+                        },
+                        workgroups: [in_channels.div_ceil(32), (in_h * in_w).div_ceil(32), batch],
+                        input_buffers: vec![grad_out, kernel],
+                        output_buffer: out_buf,
+                        params: vec![
+                            batch,
+                            in_channels,
+                            in_h,
+                            in_w,
+                            out_channels,
+                            kernel_h,
+                            kernel_w,
+                            stride,
+                            padding_h,
+                            out_h,
+                            out_w,
+                            padding_w,
+                        ],
+                        origin: vec![node.id],
+                        requires_full_precision: true,
+                        fusion_barrier: true,
+                        ..Default::default()
+                    });
+                    return;
+                }
+
                 // No 1×1 MatMul shortcut — see the Op::Conv2d arm: the
                 // shortcut family used a transposed (NHWC-ish) view of
                 // NCHW data. The GEMM path handles kernel 1×1 correctly.
@@ -3010,6 +3173,132 @@ impl<'a> Compiler<'a> {
                 let out_w = (in_w + 2 * padding_w - kernel_w) / stride + 1;
                 let out_size = self.graph.node(node.inputs[0]).ty.shape[0] as u32;
                 let batch = out_size / (out_channels * out_h * out_w);
+
+                if self.graph.node(node.inputs[0]).ty.dtype == DType::BF16 {
+                    assert_eq!(self.graph.node(node.inputs[1]).ty.dtype, DType::BF16);
+                    let m = out_channels;
+                    let n = in_channels * kernel_h * kernel_w;
+                    let k = batch * out_h * out_w;
+                    // Bound accumulation error even when optional occupancy
+                    // splitting is disabled. Ordinary F32 dispatches are unchanged.
+                    let mut splits = k.div_ceil(4096).max(1);
+                    if let Some(options) = self.options.conv_weight_splits {
+                        assert!(
+                            options.reduction_chunk >= 16
+                                && options.reduction_chunk.is_multiple_of(16)
+                        );
+                        let scalar_tile = conv::register_tile(m, n, 1, self.coop_caps.f32_tile > 0);
+                        let count = k.div_ceil(16).div_ceil(options.reduction_chunk / 16);
+                        let used: usize = self
+                            .plan
+                            .dispatches
+                            .iter()
+                            .filter_map(|d| match d.shader {
+                                ShaderEntry::Conv2dGradientTyped {
+                                    weight_gradient: true,
+                                    splits,
+                                    ..
+                                } if splits > 1 => {
+                                    Some(self.plan.buffers[d.output_buffer.0 as usize])
+                                }
+                                _ => None,
+                            })
+                            .sum();
+                        let bytes = (m as usize)
+                            .checked_mul(n as usize)
+                            .and_then(|n| n.checked_mul(count as usize))
+                            .and_then(|n| n.checked_mul(4))
+                            .and_then(|n| n.checked_add(used));
+                        if m.div_ceil(scalar_tile) * n.div_ceil(scalar_tile)
+                            < options.workgroup_threshold
+                            && (2..=65535).contains(&count)
+                            && bytes.is_some_and(|n| n <= options.max_partial_bytes)
+                        {
+                            splits = splits.max(count);
+                        }
+                    }
+                    assert!(splits <= 65535, "typed convolution reduction partitions");
+                    if splits > 1 {
+                        let prior_bytes: usize = self
+                            .plan
+                            .dispatches
+                            .iter()
+                            .filter_map(|d| match d.shader {
+                                ShaderEntry::Conv2dGradientTyped {
+                                    weight_gradient: true,
+                                    splits,
+                                    ..
+                                } if splits > 1 => {
+                                    Some(self.plan.buffers[d.output_buffer.0 as usize])
+                                }
+                                _ => None,
+                            })
+                            .sum();
+                        let budget = self
+                            .options
+                            .conv_weight_splits
+                            .map_or(64 << 20, |o| o.max_partial_bytes);
+                        assert!(
+                            (m as usize)
+                                .checked_mul(n as usize)
+                                .and_then(|n| n.checked_mul(splits as usize))
+                                .and_then(|n| n.checked_mul(4))
+                                .and_then(|n| n.checked_add(prior_bytes))
+                                .is_some_and(|n| n <= budget),
+                            "typed convolution needs bounded-accumulation scratch"
+                        );
+                    }
+                    let partial = if splits > 1 {
+                        self.alloc_buffer(m as usize * n as usize * splits as usize * 4)
+                    } else {
+                        out_buf
+                    };
+                    self.plan.dispatches.push(Dispatch {
+                        shader: ShaderEntry::Conv2dGradientTyped {
+                            weight_gradient: true,
+                            kernel_h,
+                            kernel_w,
+                            stride,
+                            splits,
+                            types: crate::codegen::MatrixTypes::BF16,
+                        },
+                        workgroups: [m.div_ceil(32), n.div_ceil(32), splits],
+                        input_buffers: vec![grad_out, input],
+                        output_buffer: partial,
+                        params: vec![
+                            batch,
+                            in_channels,
+                            in_h,
+                            in_w,
+                            out_channels,
+                            kernel_h,
+                            kernel_w,
+                            stride,
+                            padding_h,
+                            out_h,
+                            out_w,
+                            padding_w,
+                        ],
+                        origin: vec![node.id],
+                        requires_full_precision: true,
+                        fusion_barrier: true,
+                        ..Default::default()
+                    });
+                    if splits > 1 {
+                        self.plan.dispatches.push(Dispatch {
+                            shader: ShaderEntry::SumRows,
+                            workgroups: [(m * n).div_ceil(32), 1, 1],
+                            input_buffers: vec![partial],
+                            output_buffer: out_buf,
+                            params: vec![splits, m * n, 0, 0],
+                            origin: vec![node.id],
+                            requires_full_precision: true,
+                            fusion_barrier: true,
+                            ..Default::default()
+                        });
+                    }
+                    return;
+                }
 
                 // No 1×1 MatMulAT shortcut — see the Op::Conv2d arm: the
                 // shortcut family used a transposed (NHWC-ish) view of

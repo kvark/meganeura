@@ -1,21 +1,21 @@
 //! Bind dispatch operands and uniforms to their shader layout.
 
 use super::{
-    AttentionParams, BceData, BiasAddParams, BinaryData, CacheWriteData, CacheWritePrefixData,
-    CachedAttentionData, CachedAttentionParams, CachedBlockAttentionCombineData,
-    CachedBlockAttentionData, ChunkedRelativeAttentionData, ChunkedRelativeAttentionParams,
-    Conv2dData, Conv2dDwData, Conv2dDwParams, Conv2dGradInputData, Conv2dGradWeightData,
-    Conv2dParams, CrossEntropyData, DynReductionData, EmbeddingData, FourBufData,
-    FusedMatMulAddData, GlobalAvgPoolData, GlobalAvgPoolParams, GroupNormApplyData, GroupNormData,
-    GroupNormGradData, GroupNormParams, GroupNormStatsData, HorizMatMulData, LayerNormData,
-    MatMulData, MatMulParams, MatMulPrologue2Data, MatMulRmsNormData, MatMulRmsNormParams,
-    MaxPool2dData, MaxPool2dGradData, MaxPool2dParams, MulPerChannelData, MulPerChannelParams,
-    MultiHeadAttnData, MultiHeadAttnGradData, MultiHeadAttnGradKVData, PrefixLastData,
-    ReductionParams, ReductionPass1Data, ReductionPass2RowData, RmsNormAddData, RmsNormData,
-    RoPEData, RoPEDynamicData, RoPEDynamicFactorsData, RoPEParams, ScatterAddAtomicData,
-    ScatterAddData, ScatterAddParams, Session, SoftmaxParams, TernaryData, TransposeData,
-    TransposeParams, UnaryData, UnaryParams, WinogradTransformData, WinogradTransformParams,
-    reduction_is_dynamic,
+    AttentionParams, BceData, BiasAddParams, BinaryData, BlockMatMulData, BufferListData,
+    CacheWriteData, CacheWritePrefixData, CachedAttentionData, CachedAttentionParams,
+    CachedBlockAttentionCombineData, CachedBlockAttentionData, ChunkedRelativeAttentionData,
+    ChunkedRelativeAttentionParams, Conv2dData, Conv2dDwData, Conv2dDwParams, Conv2dGradInputData,
+    Conv2dGradWeightData, Conv2dParams, CrossEntropyData, DynReductionData, EmbeddingData,
+    FourBufData, FusedMatMulAddData, GlobalAvgPoolData, GlobalAvgPoolParams, GroupNormApplyData,
+    GroupNormData, GroupNormGradData, GroupNormParams, GroupNormStatsData, HorizMatMulData,
+    LayerNormData, MatMulData, MatMulParams, MatMulPrologue2Data, MatMulRmsNormData,
+    MatMulRmsNormParams, MaxPool2dData, MaxPool2dGradData, MaxPool2dParams, MulPerChannelData,
+    MulPerChannelParams, MultiHeadAttnData, MultiHeadAttnGradData, MultiHeadAttnGradKVData,
+    PackChannelsData, PrefixLastData, ReductionParams, ReductionPass1Data, ReductionPass2RowData,
+    RmsNormAddData, RmsNormData, RoPEData, RoPEDynamicData, RoPEDynamicFactorsData, RoPEParams,
+    ScatterAddAtomicData, ScatterAddData, ScatterAddParams, Session, SoftmaxParams, TernaryData,
+    TransposeData, TransposeParams, UnaryData, UnaryParams, WinogradTransformData,
+    WinogradTransformParams, reduction_is_dynamic,
 };
 use crate::compile::{
     BufferRef, CachedBlockAttentionParams, Dispatch, DispatchParams, Kernel, ShaderEntry,
@@ -31,6 +31,7 @@ fn dense_params(dispatch: &Dispatch) -> MatMulParams {
         _pad: match dispatch.kernel {
             Kernel::CooperativeTyped { splits, .. }
             | Kernel::CooperativeWorkgroup { splits, .. } => splits,
+            _ if matches!(dispatch.shader, ShaderEntry::MatMulTyped { .. }) => dispatch.params[3],
             _ => dispatch.workgroups[1],
         },
     }
@@ -43,6 +44,50 @@ impl Session {
         pc: &mut impl blade_graphics::traits::PipelineEncoder,
     ) {
         let buf = |r: BufferRef| buffers[r.0 as usize];
+        if matches!(dispatch.kernel, crate::compile::Kernel::Copy(_)) {
+            let mut pieces: Vec<_> = dispatch.input_buffers.iter().map(|&b| buf(b)).collect();
+            pieces.push(buf(dispatch.output_buffer));
+            pc.bind(
+                0,
+                &BufferListData {
+                    buffers: pieces,
+                    params: bytemuck::pod_read_unaligned::<UnaryParams>(bytemuck::cast_slice(
+                        &dispatch.params,
+                    )),
+                },
+            );
+            return;
+        }
+        if matches!(dispatch.kernel, crate::compile::Kernel::Image(_)) {
+            let mut pieces: Vec<_> = dispatch.input_buffers.iter().map(|&b| buf(b)).collect();
+            pieces.push(buf(dispatch.output_buffer));
+            pieces.extend(dispatch.extra_outputs.iter().map(|&b| buf(b)));
+            pc.bind(
+                0,
+                &BufferListData {
+                    buffers: pieces,
+                    params: bytemuck::pod_read_unaligned::<[u32; 8]>(bytemuck::cast_slice(
+                        &dispatch.params,
+                    )),
+                },
+            );
+            return;
+        }
+        if matches!(dispatch.kernel, crate::compile::Kernel::Pool(_)) {
+            let mut pieces: Vec<_> = dispatch.input_buffers.iter().map(|&b| buf(b)).collect();
+            pieces.push(buf(dispatch.output_buffer));
+            pieces.extend(dispatch.extra_outputs.iter().map(|&b| buf(b)));
+            pc.bind(
+                0,
+                &BufferListData {
+                    buffers: pieces,
+                    params: bytemuck::pod_read_unaligned::<MaxPool2dParams>(bytemuck::cast_slice(
+                        &dispatch.params,
+                    )),
+                },
+            );
+            return;
+        }
         let mnk = || {
             dispatch
                 .mnk()
@@ -140,8 +185,8 @@ impl Session {
                             params: BiasAddParams {
                                 len: params.outer,
                                 bias_len: params.inner,
-                                _pad0: 0,
-                                _pad1: 0,
+                                _pad0: params.round_one_bits,
+                                _pad1: params.table_rows,
                             },
                         },
                     );
@@ -155,9 +200,7 @@ impl Session {
             }
             return;
         }
-        // Schedule-template pointwise dispatches route by DAG arity, not
-        // by the dummy `shader` entry — arity may be 3 after fusion, which
-        // no ShaderEntry variant represents.
+        // Generated pointwise dispatches bind by DAG arity, not shader name.
         if let Some(dag) = dispatch.pointwise() {
             let params = UnaryParams {
                 len: dispatch.params[0],
@@ -199,6 +242,21 @@ impl Session {
                         },
                     );
                 }
+                4..=crate::schedule::PointwiseDAG::MAX_INPUTS => {
+                    assert_eq!(dispatch.input_buffers.len(), dag.n_inputs as usize);
+                    let mut buffers = [buf(dispatch.output_buffer);
+                        crate::schedule::PointwiseDAG::MAX_INPUTS as usize + 1];
+                    for (target, &input) in buffers.iter_mut().zip(&dispatch.input_buffers) {
+                        *target = buf(input);
+                    }
+                    pc.bind(
+                        0,
+                        &BufferListData {
+                            buffers: &buffers[..dag.n_inputs as usize + 1],
+                            params,
+                        },
+                    );
+                }
                 n => panic!("pointwise arity {} has no runtime data layout", n),
             }
             return;
@@ -229,6 +287,17 @@ impl Session {
             ShaderEntry::Generated => {
                 unreachable!("generated kernels are bound by their kernel above")
             }
+            ShaderEntry::BlockMatMulTyped { .. } => {
+                pc.bind(
+                    0,
+                    &BlockMatMulData {
+                        matrix_a: buf(dispatch.input_buffers[0]),
+                        matrix_b: buf(dispatch.input_buffers[1]),
+                        matrix_c: buf(dispatch.output_buffer),
+                        params: dispatch.params[..8].try_into().unwrap(),
+                    },
+                );
+            }
             ShaderEntry::BlockMatMul
             | ShaderEntry::BlockMatMulAT
             | ShaderEntry::BlockMatMulBT
@@ -255,7 +324,8 @@ impl Session {
             | ShaderEntry::MatMulGemv
             | ShaderEntry::MatMulAT
             | ShaderEntry::MatMulBT
-            | ShaderEntry::MatMulGemvBT => {
+            | ShaderEntry::MatMulGemvBT
+            | ShaderEntry::MatMulTyped { addend: false, .. } => {
                 pc.bind(
                     0,
                     &MatMulData {
@@ -269,6 +339,7 @@ impl Session {
             ShaderEntry::FusedMatMulAdd
             | ShaderEntry::MatMulGemvAdd
             | ShaderEntry::FusedMatMulATAdd
+            | ShaderEntry::MatMulTyped { addend: true, .. }
             | ShaderEntry::FusedMatMulBTAdd
             | ShaderEntry::MatMulGemvBTAdd => {
                 pc.bind(
@@ -831,6 +902,16 @@ impl Session {
                     },
                 );
             }
+            ShaderEntry::PackChannels { .. } => {
+                pc.bind(
+                    0,
+                    &PackChannelsData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: dispatch.params.as_slice().try_into().unwrap(),
+                    },
+                );
+            }
             ShaderEntry::SplitA | ShaderEntry::SplitB => {
                 let p = &dispatch.params;
                 pc.bind(
@@ -907,6 +988,10 @@ impl Session {
             }
             ShaderEntry::Conv2dGemm
             | ShaderEntry::Conv2dBF16 { .. }
+            | ShaderEntry::Conv2dPacked {
+                pass: crate::codegen::ConvolutionPass::Forward,
+                ..
+            }
             | ShaderEntry::Conv2dGemmSmall
             | ShaderEntry::Conv2dGemm16
             | ShaderEntry::Conv2dGemmCoopGen(..) => {
@@ -921,6 +1006,14 @@ impl Session {
                 );
             }
             ShaderEntry::Conv2dGradInputGemm
+            | ShaderEntry::Conv2dGradientTyped {
+                weight_gradient: false,
+                ..
+            }
+            | ShaderEntry::Conv2dPacked {
+                pass: crate::codegen::ConvolutionPass::InputGradient,
+                ..
+            }
             | ShaderEntry::Conv2dGradInputGemmSmall
             | ShaderEntry::Conv2dGradInputGemm16
             | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => {
@@ -935,6 +1028,14 @@ impl Session {
                 );
             }
             ShaderEntry::Conv2dGradWeightGemm
+            | ShaderEntry::Conv2dGradientTyped {
+                weight_gradient: true,
+                ..
+            }
+            | ShaderEntry::Conv2dPacked {
+                pass: crate::codegen::ConvolutionPass::WeightGradient,
+                ..
+            }
             | ShaderEntry::Conv2dGradWeightGemmSmall
             | ShaderEntry::Conv2dGradWeightGemm16
             | ShaderEntry::Conv2dGradWeightGemmSplit

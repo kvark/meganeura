@@ -121,7 +121,7 @@ mod tests {
             source: &source,
             naga_module: None,
         });
-        let mut pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+        let mut pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc { full_subgroup_size: None,
             name: "exact_division_test",
             data_layouts: &[&Data::layout()],
             compute: shader.at("main"),

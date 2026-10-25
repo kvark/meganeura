@@ -44,7 +44,10 @@ use std::{io, path::Path};
 // Version 13 reduces loss partials into a scalar, lowers LayerNorm to the
 // two-pass kernel, carries RoPE's static offset into the dynamic kernels, and
 // changes which dispatches fusion may merge.
-const CACHE_FORMAT_VERSION: u32 = 33;
+// Version31 generalizes scalar storage to reduction inputs/outputs and renames
+// the serialized storage field. Older kernels cannot execute these plans.
+// Version32 permits generated pointwise plans beyond three input bindings.
+const CACHE_FORMAT_VERSION: u32 = 34;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]
@@ -287,11 +290,7 @@ mod tests {
         let output = graph.from_bf16(scaled);
         graph.set_outputs(vec![output]);
         let plan = compile::compile(&graph);
-        assert!(
-            plan.dispatches
-                .iter()
-                .any(|d| d.pointwise_storage.bf16_output)
-        );
+        assert!(plan.dispatches.iter().any(|d| d.scalar_storage.bf16_output));
         let path =
             std::env::temp_dir().join(format!("meganeura-cache-bf16-{}.ron", std::process::id()));
         save_plan(&plan, &graph, &path).unwrap();

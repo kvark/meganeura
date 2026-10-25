@@ -242,25 +242,17 @@ impl PointwiseDAG {
         out
     }
 
-    /// Binding names for each input stream, chosen to match the existing
-    /// hand-written shaders so generated modules plug into the same
-    /// runtime data layouts:
-    ///   - n=1 → ["src"]                        (matches `UnaryData`)
-    ///   - n=2 → ["src_a", "src_b"]             (matches `BinaryData`)
-    ///   - n=3 → ["src_a", "src_b", "src_c"]    (matches `TernaryData`)
-    ///
-    /// Panics for n>3 — the runtime does not currently plumb a wider
-    /// data layout (see `runtime::pointwise_data_layout`). The fusion
-    /// pass caps output arity at 3.
-    fn input_binding_names(n: u8) -> Vec<String> {
+    /// Reserve one of eight storage-buffer bindings for the output.
+    pub const MAX_INPUTS: u8 = 7;
+
+    /// Keep the existing unary/binary/ternary names; wider DAGs use the same
+    /// ordered buffer-list binding contract.
+    pub(crate) fn input_binding_names(n: u8) -> &'static [&'static str] {
         match n {
-            1 => vec!["src".to_string()],
-            2 => vec!["src_a".to_string(), "src_b".to_string()],
-            3 => vec![
-                "src_a".to_string(),
-                "src_b".to_string(),
-                "src_c".to_string(),
-            ],
+            1 => &["src"],
+            2..=Self::MAX_INPUTS => &[
+                "src_a", "src_b", "src_c", "src_d", "src_e", "src_f", "src_g",
+            ][..n as usize],
             n => panic!("PointwiseDAG arity {} has no binding layout", n),
         }
     }
@@ -408,13 +400,16 @@ pub enum ReduceOp {
     Sum,
     /// Max: identity -inf, accumulator `max(acc, v)`.
     Max,
+    /// Index of the first maximum. Accumulate (value, lowest column) pairs;
+    /// expose the winning index as an exact F32 scalar, not the maximum value.
+    ArgMax,
 }
 
 impl ReduceOp {
     fn identity_wgsl(self) -> &'static str {
         match self {
             ReduceOp::Sum => "0.0f",
-            ReduceOp::Max => "bitcast<f32>(0xff800000u)", // -inf
+            ReduceOp::Max | ReduceOp::ArgMax => "bitcast<f32>(0xff800000u)", // -inf
         }
     }
 
@@ -425,11 +420,18 @@ impl ReduceOp {
             // measurably better than explicit `x = x + y` form.
             ReduceOp::Sum => format!("{} += {};", acc, v),
             ReduceOp::Max => format!("{} = max({}, {});", acc, acc, v),
+            ReduceOp::ArgMax => unreachable!("argmax combines value/index pairs"),
         }
     }
 }
 
-/// A schedule template — to be lowered to WGSL source.
+fn combine_argmax(acc: &str, index: &str, value: &str, column: &str) -> String {
+    format!(
+        "if {value} > {acc} || ({value} == {acc} && {column} < {index}) {{\n{acc} = {value};\n{index} = {column};\n}}"
+    )
+}
+
+/// A schedule template — to be lowered to a Naga [`naga::Module`].
 #[derive(Clone, Debug)]
 pub enum KernelTemplate {
     Pointwise {
@@ -631,6 +633,7 @@ pub fn lower(t: &KernelTemplate) -> ShaderModule {
             input_row_repeats,
             rows_per_workgroup,
             grid,
+            ScalarStorage::default(),
         ),
         KernelTemplate::Attention {
             mask,
@@ -642,26 +645,26 @@ pub fn lower(t: &KernelTemplate) -> ShaderModule {
 
 /// Storage only; generated scalar expressions and sensitive consumers stay F32.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct PointwiseStorage {
+pub struct ScalarStorage {
     /// Bit i marks input i as BF16. Unmarked inputs are F32.
     pub bf16_inputs: u8,
     pub bf16_output: bool,
 }
 
 fn lower_pointwise(dag: &PointwiseDAG, grid: GridShape) -> ShaderModule {
-    lower_pointwise_storage(dag, grid, PointwiseStorage::default())
+    lower_scalar_storage(dag, grid, ScalarStorage::default())
 }
 
-pub fn lower_pointwise_storage(
+pub fn lower_scalar_storage(
     dag: &PointwiseDAG,
     grid: GridShape,
-    storage: PointwiseStorage,
+    storage: ScalarStorage,
 ) -> ShaderModule {
-    assert_eq!(storage.bf16_inputs >> dag.n_inputs, 0);
     assert!(
-        dag.n_inputs >= 1,
-        "PointwiseDAG must have at least one input stream"
+        (1..=PointwiseDAG::MAX_INPUTS).contains(&dag.n_inputs),
+        "PointwiseDAG input arity is outside the binding capacity"
     );
+    assert_eq!(storage.bf16_inputs >> dag.n_inputs, 0);
     assert!(
         (dag.output as usize) < dag.ops.len(),
         "PointwiseDAG.output is out of range"
@@ -670,7 +673,7 @@ pub fn lower_pointwise_storage(
     let input_names = PointwiseDAG::input_binding_names(dag.n_inputs);
 
     let mut src = String::new();
-    if storage != PointwiseStorage::default() {
+    if storage != ScalarStorage::default() {
         src.push_str("enable wgpu_bfloat16;\n");
         src.push_str(include_str!("shaders/bf16_round.wgsl"));
     }
@@ -729,6 +732,7 @@ fn lower_reduction(
     input_row_repeats: &[u32],
     rows_per_workgroup: u32,
     grid: GridShape,
+    storage: ScalarStorage,
 ) -> ShaderModule {
     assert!(
         n_per_elem >= 1,
@@ -773,6 +777,8 @@ fn lower_reduction(
         );
     }
     let n_reduced = 1 + extra_prologues.len();
+    let buffer_inputs = n_per_elem + n_per_row + epilogue.map_or(0, |e| e.n_per_col_inputs);
+    assert!(buffer_inputs < 8 && storage.bf16_inputs >> buffer_inputs == 0);
     assert!(
         grid.workgroup_size.is_power_of_two() && grid.workgroup_size >= 2,
         "reduction workgroup_size must be a power of 2 ≥ 2"
@@ -806,7 +812,7 @@ fn lower_reduction(
     // Builds the `load(idx)` expression for a given DAG input index,
     // respecting the documented per-elem / per-row / per-col / reduced
     // ordering. `in_epilogue = false` disallows per-col and reduced.
-    let load_expr = |idx: u8, col_var: &str, in_epilogue: bool| -> String {
+    let load_raw = |idx: u8, col_var: &str, in_epilogue: bool| -> String {
         let i = idx as usize;
         let per_elem_end = n_per_elem as usize;
         let per_row_end = per_elem_end + n_per_row as usize;
@@ -849,29 +855,64 @@ fn lower_reduction(
         }
     };
 
+    let widen = |idx: u8, expression: String| {
+        if idx < buffer_inputs && storage.bf16_inputs & (1 << idx) != 0 {
+            format!("f32({expression})")
+        } else {
+            expression
+        }
+    };
+    let load_expr = |idx, col: &str, epilogue| widen(idx, load_raw(idx, col, epilogue));
+    let broadcast = |idx: u8, divisor: u32, modulus: u32, col: &str| {
+        assert!(idx < n_per_elem && !is_gather(idx as usize));
+        assert!(divisor > 0 && modulus > 0);
+        widen(
+            idx,
+            format!(
+                "{}[((row_offset + {col}) / {divisor}u) % {modulus}u]",
+                per_elem_names[idx as usize]
+            ),
+        )
+    };
+
     let mut src = String::new();
+    if storage != ScalarStorage::default() {
+        src.push_str("enable wgpu_bfloat16;\n");
+        src.push_str(include_str!("shaders/bf16_round.wgsl"));
+    }
     src.push_str(
         "struct Params {\n    outer: u32,\n    inner: u32,\n    round_one_bits: u32,\n    table_rows: u32,\n}\n\n",
     );
     for (i, name) in per_elem_names.iter().enumerate() {
-        let _ = writeln!(src, "var<storage> {}: array<f32>;", name);
+        let ty = if storage.bf16_inputs & (1 << i) != 0 {
+            "bf16"
+        } else {
+            "f32"
+        };
+        let _ = writeln!(src, "var<storage> {name}: array<{ty}>;");
         if is_gather(i) {
             // u32 indices buffer for this gather stream.
             let _ = writeln!(src, "var<storage> {}_idx: array<u32>;", name);
         }
     }
-    for name in &per_row_names {
-        let _ = writeln!(src, "var<storage> {}: array<f32>;", name);
+    for (i, name) in per_row_names.iter().chain(&per_col_names).enumerate() {
+        let ty = if storage.bf16_inputs & (1 << (n_per_elem as usize + i)) != 0 {
+            "bf16"
+        } else {
+            "f32"
+        };
+        let _ = writeln!(src, "var<storage> {name}: array<{ty}>;");
     }
-    for name in &per_col_names {
-        let _ = writeln!(src, "var<storage> {}: array<f32>;", name);
-    }
-    src.push_str("var<storage, read_write> dst: array<f32>;\n");
+    let ty = if storage.bf16_output { "bf16" } else { "f32" };
+    let _ = writeln!(src, "var<storage, read_write> dst: array<{ty}>;");
     src.push_str("var<uniform> params: Params;\n");
     let wg = grid.workgroup_size;
     let lanes_per_row = wg / rows_per_workgroup;
     for k in 0..n_reduced {
         let _ = writeln!(src, "var<workgroup> wg_data_{k}: array<f32, {wg}>;");
+        if op == ReduceOp::ArgMax {
+            let _ = writeln!(src, "var<workgroup> wg_index_{k}: array<u32, {wg}>;");
+        }
     }
     src.push('\n');
     let _ = writeln!(src, "@compute @workgroup_size({})", wg);
@@ -892,6 +933,9 @@ fn lower_reduction(
     src.push_str("    let row_offset = row * params.inner;\n");
     for k in 0..n_reduced {
         let _ = writeln!(src, "    var acc_{k}: f32 = {};", op.identity_wgsl());
+        if op == ReduceOp::ArgMax {
+            let _ = writeln!(src, "    var index_{k}: u32 = 0xffffffffu;");
+        }
     }
     src.push_str("    var col = lane;\n");
     src.push_str("    if row_valid {\n");
@@ -905,7 +949,10 @@ fn lower_reduction(
         .enumerate()
     {
         src.push_str("            {\n");
-        let body = dag.emit_body(|idx| load_expr(idx, "col", false));
+        let body = dag.emit_body_with(
+            |idx| load_expr(idx, "col", false),
+            |idx, divisor, modulus| broadcast(idx, divisor, modulus, "col"),
+        );
         for line in body.lines() {
             src.push_str("                ");
             src.push_str(line.trim_start_matches(' '));
@@ -920,11 +967,17 @@ fn lower_reduction(
         } else {
             format!("v{}", dag.output)
         };
-        let _ = writeln!(
-            src,
-            "                {}",
+        let combine = if op == ReduceOp::ArgMax {
+            combine_argmax(
+                &format!("acc_{k}"),
+                &format!("index_{k}"),
+                &prologue_value,
+                "col",
+            )
+        } else {
             op.combine_wgsl(&format!("acc_{k}"), &prologue_value)
-        );
+        };
+        let _ = writeln!(src, "                {combine}");
         src.push_str("            }\n");
     }
     let _ = writeln!(src, "            col += {}u;", lanes_per_row);
@@ -932,6 +985,9 @@ fn lower_reduction(
     src.push_str("    }\n");
     for k in 0..n_reduced {
         let _ = writeln!(src, "    wg_data_{k}[tid] = acc_{k};");
+        if op == ReduceOp::ArgMax {
+            let _ = writeln!(src, "    wg_index_{k}[tid] = index_{k};");
+        }
     }
     src.push_str("    workgroupBarrier();\n");
     // Independent tree reductions within each packed row's lane group.
@@ -940,10 +996,19 @@ fn lower_reduction(
     while stride > 0 {
         let _ = writeln!(src, "    if lane < {}u {{", stride);
         for k in 0..n_reduced {
-            let combined = op.combine_wgsl(
-                &format!("wg_data_{k}[tid]"),
-                &format!("wg_data_{k}[tid + {}u]", stride),
-            );
+            let combined = if op == ReduceOp::ArgMax {
+                combine_argmax(
+                    &format!("wg_data_{k}[tid]"),
+                    &format!("wg_index_{k}[tid]"),
+                    &format!("wg_data_{k}[tid + {stride}u]"),
+                    &format!("wg_index_{k}[tid + {stride}u]"),
+                )
+            } else {
+                op.combine_wgsl(
+                    &format!("wg_data_{k}[tid]"),
+                    &format!("wg_data_{k}[tid + {stride}u]"),
+                )
+            };
             let _ = writeln!(src, "        {}", combined);
         }
         src.push_str("    }\n");
@@ -956,12 +1021,11 @@ fn lower_reduction(
             src.push_str("    if lane == 0u && row_valid {\n");
             for k in 0..n_reduced {
                 if n_reduced == 1 {
-                    let _ = writeln!(src, "        dst[row] = wg_data_{k}[tid];");
+                    let value = store_reduction_value(reduced_value(op, k, "tid"), storage);
+                    let _ = writeln!(src, "        dst[row] = {value};");
                 } else {
-                    let _ = writeln!(
-                        src,
-                        "        dst[row * {n_reduced}u + {k}u] = wg_data_{k}[tid];"
-                    );
+                    let value = store_reduction_value(reduced_value(op, k, "tid"), storage);
+                    let _ = writeln!(src, "        dst[row * {n_reduced}u + {k}u] = {value};");
                 }
             }
             src.push_str("    }\n");
@@ -972,24 +1036,25 @@ fn lower_reduction(
             for k in 0..n_reduced {
                 let _ = writeln!(
                     src,
-                    "    let reduced_{k} = wg_data_{k}[row_slot * {lanes_per_row}u];"
+                    "    let reduced_{k} = {};",
+                    reduced_value(op, k, &format!("row_slot * {lanes_per_row}u"))
                 );
             }
             src.push_str("    var wcol = lane;\n");
             src.push_str("    if row_valid {\n");
             src.push_str("        loop {\n");
             src.push_str("            if wcol >= params.inner { break; }\n");
-            let body = epi.dag.emit_body(|idx| load_expr(idx, "wcol", true));
+            let body = epi.dag.emit_body_with(
+                |idx| load_expr(idx, "wcol", true),
+                |idx, divisor, modulus| broadcast(idx, divisor, modulus, "wcol"),
+            );
             for line in body.lines() {
                 src.push_str("            ");
                 src.push_str(line.trim_start_matches(' '));
                 src.push('\n');
             }
-            let _ = writeln!(
-                src,
-                "            dst[row_offset + wcol] = v{};",
-                epi.dag.output
-            );
+            let value = store_reduction_value(format!("v{}", epi.dag.output), storage);
+            let _ = writeln!(src, "            dst[row_offset + wcol] = {value};");
             let _ = writeln!(src, "            wcol += {}u;", lanes_per_row);
             src.push_str("        }\n");
             src.push_str("    }\n");
@@ -998,6 +1063,40 @@ fn lower_reduction(
     src.push_str("}\n");
 
     ShaderModule::with_hint(src, "reduction")
+}
+
+fn reduced_value(op: ReduceOp, accumulator: usize, index: &str) -> String {
+    if op == ReduceOp::ArgMax {
+        format!("f32(wg_index_{accumulator}[{index}])")
+    } else {
+        format!("wg_data_{accumulator}[{index}]")
+    }
+}
+
+fn store_reduction_value(value: String, storage: ScalarStorage) -> String {
+    if storage.bf16_output {
+        format!("round_bf16({value})")
+    } else {
+        value
+    }
+}
+
+pub fn lower_reduction_storage(kernel: &ReductionKernel, storage: ScalarStorage) -> ShaderModule {
+    lower_reduction(
+        kernel.op,
+        &kernel.prologue,
+        &kernel.extra_prologues,
+        kernel.epilogue.as_ref(),
+        kernel.n_per_elem,
+        kernel.n_per_row,
+        &kernel.gather_elem,
+        &kernel.input_row_repeats,
+        kernel.rows_per_workgroup,
+        GridShape {
+            workgroup_size: kernel.workgroup_size,
+        },
+        storage,
+    )
 }
 
 /// Binding names for per-row broadcast inputs used by the reduction

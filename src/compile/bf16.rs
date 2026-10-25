@@ -1,7 +1,7 @@
 //! Fold explicit conversion boundaries, never choose a precision policy.
 
 use super::{ExecutionPlan, Kernel, ShaderEntry};
-use crate::schedule::PointwiseStorage;
+use crate::schedule::ScalarStorage;
 use std::collections::HashMap;
 
 pub(super) fn fuse_boundaries(plan: &mut ExecutionPlan) {
@@ -21,9 +21,11 @@ pub(super) fn fuse_boundaries(plan: &mut ExecutionPlan) {
             let consumer = &plan.dispatches[ci];
             // A materialization boundary stays a boundary. A dispatch this
             // pass already typed is allowed to absorb its other conversions.
-            if consumer.pointwise().is_some()
-                && (!consumer.fusion_barrier
-                    || consumer.pointwise_storage != PointwiseStorage::default())
+            if (consumer.pointwise().is_some()
+                || consumer
+                    .reduction()
+                    .is_some_and(|k| k.gather_elem.iter().all(|&v| !v)))
+                && (!consumer.fusion_barrier || consumer.scalar_storage != ScalarStorage::default())
             {
                 for (slot, &buffer) in consumer.input_buffers.iter().enumerate() {
                     let Some(&pi) = producers.get(&buffer) else {
@@ -37,7 +39,7 @@ pub(super) fn fuse_boundaries(plan: &mut ExecutionPlan) {
                     let origin = producer.origin.clone();
                     let consumer = &mut plan.dispatches[ci];
                     consumer.input_buffers[slot] = input;
-                    consumer.pointwise_storage.bf16_inputs |= 1 << slot;
+                    consumer.scalar_storage.bf16_inputs |= 1 << slot;
                     consumer.fusion_barrier = true;
                     consumer.origin.extend(origin);
                     changed = true;
@@ -64,15 +66,20 @@ pub(super) fn fuse_boundaries(plan: &mut ExecutionPlan) {
             let output = consumer.output_buffer;
             let origin = consumer.origin.clone();
             let producer = &mut plan.dispatches[pi];
-            if producer.pointwise().is_some()
-                && (!producer.fusion_barrier
-                    || producer.pointwise_storage != PointwiseStorage::default())
+            if (producer.pointwise().is_some() || producer.reduction().is_some())
+                && (!producer.fusion_barrier || producer.scalar_storage != ScalarStorage::default())
             {
-                producer.pointwise_storage.bf16_output = true;
+                producer.scalar_storage.bf16_output = true;
             } else if let Kernel::CooperativeTyped {
                 ref mut types,
                 splits: 1,
             } = producer.kernel
+            {
+                assert_eq!(types.output, crate::DType::F32);
+                types.output = crate::DType::BF16;
+                producer.fusion_barrier = true;
+            } else if let ShaderEntry::MatMulTyped { ref mut types, .. }
+            | ShaderEntry::BlockMatMulTyped { ref mut types, .. } = producer.shader
             {
                 assert_eq!(types.output, crate::DType::F32);
                 types.output = crate::DType::BF16;
@@ -98,6 +105,28 @@ pub(super) fn fuse_boundaries(plan: &mut ExecutionPlan) {
             }
             None if !changed => break,
             None => (),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::kernels::matmul::matrix_splits;
+
+    #[test]
+    fn matrix_partitions_keep_short_and_occupied_products_unsplit() {
+        for (m, n, k, expected) in [
+            (8, 256, 1023, 1),
+            (8, 256, 1024, 4),
+            (8, 256, 2048, 8),
+            (8, 256, 4096, 16),
+            (8, 256, 65536, 16),
+            (128, 256, 2560, 4),
+            (512, 256, 2560, 1),
+            (33, 65, 1031, 4),
+            (u32::MAX, u32::MAX, 2048, 1),
+        ] {
+            assert_eq!(matrix_splits(m, n, k), expected, "{m}x{n}x{k}");
         }
     }
 }

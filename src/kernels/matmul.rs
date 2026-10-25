@@ -15,11 +15,15 @@ use super::{Family, Rejection};
 use crate::codegen::{CoopConfig, ShaderGroup};
 use crate::compile::{Dispatch, Kernel};
 
-/// K partitions for a checked typed product: fill a small 32×32 output grid
-/// without making each partition mostly staging work. Storage and
-/// multiplication types do not change the partition contract.
+/// Fill a checked 32x32 output grid without making partitions mostly staging.
+/// Storage and multiplication precision do not change the partition contract.
 pub(crate) fn matrix_splits(m: u32, n: u32, k: u32) -> u32 {
     let groups = m.div_ceil(32).saturating_mul(n.div_ceil(32)).max(1);
+    matrix_splits_for_workgroups(groups, k)
+}
+
+pub(crate) fn matrix_splits_for_workgroups(groups: u32, k: u32) -> u32 {
+    assert!(groups > 0);
     if k < 1024 || groups >= 128 {
         return 1;
     }

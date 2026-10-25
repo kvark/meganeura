@@ -286,6 +286,8 @@ pub enum Op {
     SumInner,
     /// Row-wise maximum over the inner axis: `[M, N]` → `[M, 1]`.
     MaxInner,
+    /// One-hot first maximum of each nonempty row; hard selection has no gradient.
+    ArgMaxOneHot,
     /// Backward helper for [`Op::SumInner`]: repeat each `[M, 1]` row across
     /// the inner axis, `[M, 1]` → `[M, N]`.
     BroadcastInner {
@@ -1425,20 +1427,21 @@ impl Graph {
     }
 
     /// Multiply independent column blocks without slicing or transposing storage.
-    /// A is `[M, G*K]`, B is `[G, K, N]`, and C is `[M, G*N]`. F32 only.
+    /// A is `[M, G*K]`, B is `[G, K, N]`, and C is `[M, G*N]`.
+    /// Matching F32/BF16 operands accumulate and return F32.
     #[track_caller]
     pub fn block_matmul(&mut self, a: NodeId, b: NodeId) -> NodeId {
         self.block_matmul_impl(a, b, false)
     }
 
     /// Per-block input-transposed product, used for block-weight gradients.
-    /// A is `[K, G*M]`, B is `[K, G*N]`, and C is `[G, M, N]`. F32 only.
+    /// A is `[K, G*M]`, B is `[K, G*N]`, and C is `[G, M, N]`.
     #[track_caller]
     pub fn block_matmul_at(&mut self, a: NodeId, b: NodeId, groups: usize) -> NodeId {
         let a_ty = &self.node(a).ty;
         let b_ty = &self.node(b).ty;
-        assert_eq!(a_ty.dtype, DType::F32, "block matmul requires F32");
-        assert_eq!(b_ty.dtype, DType::F32, "block matmul requires F32");
+        assert!(matches!(a_ty.dtype, DType::F32 | DType::BF16));
+        assert_eq!(a_ty.dtype, b_ty.dtype, "block operand storage must match");
         assert_eq!(a_ty.rank(), 2, "block_matmul_at requires 2D inputs");
         assert_eq!(b_ty.rank(), 2, "block_matmul_at requires 2D inputs");
         assert!(groups > 0, "block matmul requires nonempty groups");
@@ -1451,7 +1454,7 @@ impl Graph {
     }
 
     /// Per-block weight-transposed product, used for block-input gradients.
-    /// A is `[M, G*K]`, B is `[G, N, K]`, and C is `[M, G*N]`. F32 only.
+    /// A is `[M, G*K]`, B is `[G, N, K]`, and C is `[M, G*N]`.
     #[track_caller]
     pub fn block_matmul_bt(&mut self, a: NodeId, b: NodeId) -> NodeId {
         self.block_matmul_impl(a, b, true)
@@ -1503,8 +1506,8 @@ impl Graph {
     fn block_matmul_impl(&mut self, a: NodeId, b: NodeId, transpose_b: bool) -> NodeId {
         let a_ty = &self.node(a).ty;
         let b_ty = &self.node(b).ty;
-        assert_eq!(a_ty.dtype, DType::F32, "block matmul requires F32");
-        assert_eq!(b_ty.dtype, DType::F32, "block matmul requires F32");
+        assert!(matches!(a_ty.dtype, DType::F32 | DType::BF16));
+        assert_eq!(a_ty.dtype, b_ty.dtype, "block operand storage must match");
         assert_eq!(a_ty.rank(), 2, "block matmul requires 2D activations");
         assert_eq!(b_ty.rank(), 3, "block matmul requires 3D weights");
         assert!(a_ty.shape.iter().chain(&b_ty.shape).all(|&d| d > 0));
@@ -1900,6 +1903,38 @@ impl Graph {
         );
         let ty = TensorType::f32(vec![shape[0], 1]);
         self.add_node(Op::MaxInner, vec![x], ty)
+    }
+
+    /// Select the first maximum of each nonempty F32 row as an exact one-hot
+    /// vector. Ties include signed zeros and infinities; NaN rows are unspecified.
+    /// The hard selection has zero derivative. Columns fit exact F32 indices.
+    #[track_caller]
+    pub fn argmax_one_hot(&mut self, x: NodeId) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        assert_eq!(ty.dtype, DType::F32, "argmax_one_hot expects F32 values");
+        assert_eq!(ty.rank(), 2, "argmax_one_hot expects [rows, columns]");
+        assert!(
+            (1..=1 << 24).contains(&ty.shape[1]),
+            "nonempty exact index range"
+        );
+        assert!(
+            ty.shape[0] > 0
+                && ty.shape[0]
+                    .checked_mul(ty.shape[1])
+                    .is_some_and(|len| len <= u32::MAX as usize)
+        );
+        let packed_rows = if ty.shape[1] <= 32 {
+            256 / ty.shape[1].next_power_of_two()
+        } else {
+            1
+        };
+        assert!(
+            ty.shape[0].div_ceil(packed_rows) <= 65535,
+            "portable row selection dispatch"
+        );
+        let columns = ty.shape[1];
+        let indices = self.constant((0..columns).map(|i| i as f32).collect(), &[columns]);
+        self.add_node(Op::ArgMaxOneHot, vec![x, indices], ty)
     }
 
     /// Row-wise mean over the inner axis: `x: [M, N] → [M, 1]`, spelled

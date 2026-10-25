@@ -27,9 +27,9 @@ pub fn differentiate(forward: &Graph) -> Graph {
     differentiate_impl(forward, false)
 }
 
-/// Differentiate explicit BF16 matrix products with BF16 derivative operands
-/// and F32 accumulation/output. Other derivatives and master gradients stay
-/// F32. This is an explicit arithmetic choice, not the default F32 backward.
+/// Differentiate explicit BF16 matrix/convolution products with BF16 derivative
+/// operands and F32 accumulation/output. Master gradients stay F32. This is
+/// an explicit arithmetic choice, not the default F32 backward.
 pub fn differentiate_with_bf16_gradients(forward: &Graph) -> Graph {
     differentiate_impl(forward, true)
 }
@@ -90,6 +90,9 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
                 Op::MatMul
                     | Op::MatMulAT
                     | Op::MatMulBT
+                    | Op::BlockMatMul
+                    | Op::BlockMatMulAT { .. }
+                    | Op::BlockMatMulBT
                     | Op::FusedMatMulAdd
                     | Op::FusedMatMulATAdd
                     | Op::FusedMatMulBTAdd
@@ -164,16 +167,20 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
                 let a = node.inputs[0];
                 let b = node.inputs[1];
                 let groups = graph.node(b).ty.shape[0];
-                let grad_a = graph.block_matmul_bt(grad_output, b);
-                let grad_b = graph.block_matmul_at(a, grad_output, groups);
+                let wide_a = matrix_operand(&mut graph, &mut widened, a);
+                let wide_b = matrix_operand(&mut graph, &mut widened, b);
+                let grad_a = graph.block_matmul_bt(matrix_grad, wide_b);
+                let grad_b = graph.block_matmul_at(wide_a, matrix_grad, groups);
                 accumulate_grad(&mut graph, &mut grads, a, grad_a);
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
             }
             Op::BlockMatMulAT { groups: _ } => {
                 let a = node.inputs[0];
                 let b = node.inputs[1];
-                let grad_a = graph.block_matmul_bt(b, grad_output);
-                let grad_b = graph.block_matmul(a, grad_output);
+                let wide_a = matrix_operand(&mut graph, &mut widened, a);
+                let wide_b = matrix_operand(&mut graph, &mut widened, b);
+                let grad_a = graph.block_matmul_bt(wide_b, matrix_grad);
+                let grad_b = graph.block_matmul(wide_a, matrix_grad);
                 accumulate_grad(&mut graph, &mut grads, a, grad_a);
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
             }
@@ -181,8 +188,10 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
                 let a = node.inputs[0];
                 let b = node.inputs[1];
                 let groups = graph.node(b).ty.shape[0];
-                let grad_a = graph.block_matmul(grad_output, b);
-                let grad_b = graph.block_matmul_at(grad_output, a, groups);
+                let wide_a = matrix_operand(&mut graph, &mut widened, a);
+                let wide_b = matrix_operand(&mut graph, &mut widened, b);
+                let grad_a = graph.block_matmul(matrix_grad, wide_b);
+                let grad_b = graph.block_matmul_at(matrix_grad, wide_a, groups);
                 accumulate_grad(&mut graph, &mut grads, a, grad_a);
                 accumulate_grad(&mut graph, &mut grads, b, grad_b);
             }
@@ -817,6 +826,7 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
             | Op::Parameter { .. }
             | Op::Constant { .. }
             | Op::Greater
+            | Op::ArgMaxOneHot
             | Op::StopGradient => {}
             Op::Nop => {}
             Op::Identity => {
@@ -891,10 +901,21 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
                 let kernel = node.inputs[1];
                 let in_size = forward.nodes()[input as usize].ty.num_elements() as u32;
                 let batch = in_size / (in_channels * in_h * in_w);
-                let wide_input = gradient_operand(&mut graph, &mut widened, input);
-                let wide_kernel = gradient_operand(&mut graph, &mut widened, kernel);
+                let reduced = bf16_gradients
+                    && [input, kernel]
+                        .into_iter()
+                        .all(|id| graph.node(id).ty.dtype == DType::BF16);
+                let (wide_input, wide_kernel, convolution_gradient) = if reduced {
+                    (input, kernel, graph.to_bf16(grad_output))
+                } else {
+                    (
+                        gradient_operand(&mut graph, &mut widened, input),
+                        gradient_operand(&mut graph, &mut widened, kernel),
+                        grad_output,
+                    )
+                };
                 let grad_input = graph.conv2d_grad_input(
-                    grad_output,
+                    convolution_gradient,
                     wide_kernel,
                     batch,
                     in_channels,
@@ -908,7 +929,7 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
                     padding_w,
                 );
                 let grad_kernel = graph.conv2d_grad_weight(
-                    grad_output,
+                    convolution_gradient,
                     wide_input,
                     in_channels,
                     in_h,

@@ -1,33 +1,29 @@
 // @section header
 enable wgpu_cooperative_matrix;
-struct Params { m: u32, n: u32, k: u32, _pad: u32, }
-var<storage> matrix_a: array<vec4<f32>>;
+$EXTENSIONS
+$PARAMS_TYPE
+var<storage> matrix_a: array<vec4<$A_TYPE>>;
 $MATRIX_BINDINGS
 $ADD_DECL
 $PROLOGUE_DECL
 var<uniform> params: Params;
-var<workgroup> sa: array<f32, $A_SIZE>;
-var<workgroup> sb: array<f32, $B_SIZE>;
+$SHARED_DECL
+$RESULT_DECL
+$ROUND
 $CACHE_DECL
 
 // @section kernel
 $ENTRY_SIGNATURE {
-    let m = params.m;
-    let n = params.n;
-    let k = params.k;
+    $DIMS
     let tile_row = wgid.x * 64u;
     let tile_col = wgid.y * $COLUMNSu;
-    // Keep split boundaries in native 16-wide tiles. Changing the staging
-    // width must not also change the floating-point reduction partitions.
-    let chunk = ((k / 16u + $SPLITSu - 1u) / $SPLITSu) * 16u;
-    let begin = wgid.z * chunk;
-    let end = min(k, begin + chunk);
-    let output_base = wgid.z * m * n;
+    $RANGE
+    $OUTPUT_LAYOUT
     $CACHE_INIT
     // Subgroup width is not a pipeline requirement in Blade. Every width
     // executes the same four logical tiles, with uniform outer-loop trips
     // and workgroup barriers even when some subgroups have no matrix tile.
-    for (var wave_base = 0u; wave_base < 4u; wave_base += 256u / sg_size) {
+    for (var wave_base = 0u; wave_base < 4u; wave_base += $THREADSu / sg_size) {
         let wave = wave_base + sg;
         // Extra subgroups compute a valid tile but do not store it. Keeping
         // cooperative loads and arithmetic in uniform flow also satisfies
@@ -43,10 +39,13 @@ $ENTRY_SIGNATURE {
             workgroupBarrier();
             $NEXT_LOAD
             $MULTIPLY
+            $PARTIAL_STEP
             workgroupBarrier();
         }
+        $PARTIAL_FINISH
         if wave < 4u {
             $STORES
         }
+        $SCATTER
     }
 }

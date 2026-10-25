@@ -1,6 +1,6 @@
 // @section bindings
 var<storage> $B_BUFFER: $B_STORAGE;
-var<storage, read_write> $C_BUFFER: array<f32>;
+var<storage, read_write> $C_BUFFER: $C_STORAGE;
 
 // @section entry_signature
 @compute @workgroup_size($WORKGROUP_SIZE)

@@ -1,3 +1,5 @@
+[workspace]
+
 [package]
 name = "meganeura"
 version = "0.3.0"
@@ -70,7 +72,7 @@ profiler = ["dep:tracing-subscriber"]
 
 [dependencies]
 # Merged workgroup matrices, per-entry validation, and unified BF16 capability.
-blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "4845d6529c38b07718a624bf3c4f2ab4317c9bf4" }
+blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "bbbc93b7d26b8196d9143944fe7d8a61d6da4583" }
 blade-macros = "0.3"
 # `default-features = false` drops egglog's `bin` stack (clap, mimalloc,
 # env_logger, chrono, graphviz); library builds use the shared rewrite engine.

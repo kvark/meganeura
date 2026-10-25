@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod convolution_reuse_tests;
 mod workgroup;
 use crate::compile::{
     AttentionParams, BufferRef, CachedBlockAttentionParams, Dispatch, DispatchParams,
@@ -10,6 +12,7 @@ use std::sync::Arc;
 
 mod calibration;
 mod checkpoint;
+mod command_cache;
 mod optimizer;
 pub(crate) mod search_state;
 mod tuning;
@@ -261,6 +264,14 @@ struct MatMulData {
     params: MatMulParams,
 }
 
+#[derive(blade_macros::ShaderData)]
+struct BlockMatMulData {
+    matrix_a: blade_graphics::BufferPiece,
+    matrix_b: blade_graphics::BufferPiece,
+    matrix_c: blade_graphics::BufferPiece,
+    params: [u32; 8],
+}
+
 // MatMul coop with 2-factor prologue — bindings match `matmul_prologue_to_wgsl`
 // generated names (`prologue_buf_0`, `prologue_buf_1`).
 #[derive(blade_macros::ShaderData)]
@@ -307,6 +318,13 @@ struct UnaryParams {
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
+}
+
+#[derive(blade_macros::ShaderData)]
+struct PackChannelsData {
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: [u32; 4],
 }
 
 // permute: var src, dst, params (eight words)
@@ -652,6 +670,14 @@ impl From<&Dispatch> for Conv2dParams {
     fn from(dispatch: &Dispatch) -> Self {
         let p = &dispatch.params;
         let column_width = match dispatch.shader {
+            ShaderEntry::Conv2dGradientTyped {
+                weight_gradient: false,
+                ..
+            }
+            | ShaderEntry::Conv2dPacked {
+                pass: crate::codegen::ConvolutionPass::InputGradient,
+                ..
+            } => p[3],
             ShaderEntry::Conv2dGradInputGemm
             | ShaderEntry::Conv2dGradInputGemmSmall
             | ShaderEntry::Conv2dGradInputGemm16
@@ -962,6 +988,8 @@ fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
 /// implementation once; preparation builds exactly the selected pipeline.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Variant {
+    ConvolutionReuse(ShaderEntry, crate::codegen::ConvolutionReuseShape),
+    CheckedVector(ShaderEntry),
     /// Checked cooperative product with explicit operand, multiplication and
     /// output types. K partitions are uniform data and do not change the
     /// pipeline.
@@ -998,6 +1026,9 @@ enum Variant {
     /// identifies them.
     Reduction(u64),
     Pointwise(u64),
+    Pool(u64),
+    Image(u64),
+    Copy(u64),
     /// Attention specialization includes the head width and the scalar
     /// backward EPT cap. Both can differ between dispatches in one plan.
     Attention(ShaderEntry, u32, Option<u32>),
@@ -1061,6 +1092,92 @@ enum Variant {
     Scalar(ShaderEntry),
 }
 
+fn checked_vector_staging(dispatch: &Dispatch) -> bool {
+    if dispatch.kernel != crate::compile::Kernel::Default
+        || dispatch.schedule_locked
+        || dispatch.horizontal_batch >= 2
+        || dispatch.matmul_prologue.is_some()
+        || dispatch.matmul_epilogue.is_some()
+        || dispatch.scalar_storage != crate::schedule::ScalarStorage::default()
+    {
+        return false;
+    }
+    let (at, bt) = match dispatch.shader {
+        ShaderEntry::MatMulTyped {
+            transpose_a,
+            transpose_b,
+            ..
+        }
+        | ShaderEntry::BlockMatMulTyped {
+            transpose_a,
+            transpose_b,
+            ..
+        } => (transpose_a, transpose_b),
+        _ => return false,
+    };
+    let Some((m, n, k)) = dispatch.mnk() else {
+        return false;
+    };
+    m != 0
+        && n != 0
+        && k != 0
+        && !(at && bt)
+        && (if at { m } else { k }).is_multiple_of(4)
+        && (if bt { k } else { n }).is_multiple_of(4)
+}
+
+#[cfg(test)]
+mod checked_vector_tests {
+    use super::*;
+
+    #[test]
+    fn checked_vector_selection_keeps_alignment_and_explicit_implementations() {
+        for (at, bt, m, n, k, expected) in [
+            (false, false, 3, 36, 28, true),
+            (false, false, 3, 35, 28, false),
+            (true, false, 36, 20, 7, true),
+            (true, false, 35, 20, 7, false),
+            (false, true, 35, 37, 28, true),
+            (false, true, 35, 37, 27, false),
+            (false, false, 0, 32, 32, false),
+            (true, true, 32, 32, 32, false),
+        ] {
+            for grouped in [false, true] {
+                let types = crate::codegen::MatrixTypes::BF16;
+                let shader = if grouped {
+                    ShaderEntry::BlockMatMulTyped {
+                        transpose_a: at,
+                        transpose_b: bt,
+                        types,
+                    }
+                } else {
+                    ShaderEntry::MatMulTyped {
+                        transpose_a: at,
+                        transpose_b: bt,
+                        types,
+                        addend: true,
+                    }
+                };
+                let mut dispatch = Dispatch {
+                    shader,
+                    params: vec![m, n, k, 3, 1, 0, 0, 0],
+                    ..Default::default()
+                };
+                assert_eq!(checked_vector_staging(&dispatch), expected);
+                assert_eq!(
+                    matches!(Pipelines::key(&dispatch), Variant::CheckedVector(_)),
+                    expected
+                );
+                dispatch.schedule_locked = true;
+                assert!(!checked_vector_staging(&dispatch));
+                dispatch.schedule_locked = false;
+                dispatch.kernel = crate::compile::Kernel::SmallTile;
+                assert!(!checked_vector_staging(&dispatch));
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum HorizMatMulKind {
     Scalar,
@@ -1083,8 +1200,14 @@ impl Variant {
     /// schedule-template kernels, which have no entry of their own.
     fn entry(&self) -> Option<&ShaderEntry> {
         match *self {
-            Variant::Reduction(_) | Variant::Pointwise(_) => None,
+            Variant::Reduction(_)
+            | Variant::Pointwise(_)
+            | Variant::Pool(_)
+            | Variant::Image(_)
+            | Variant::Copy(_) => None,
             Variant::Attention(ref e, _, _)
+            | Variant::ConvolutionReuse(ref e, _)
+            | Variant::CheckedVector(ref e)
             | Variant::CoopTyped(ref e, _, _)
             | Variant::CoopWorkgroup(ref e, _, _)
             | Variant::CoopTiled(ref e, _, _, _)
@@ -1111,6 +1234,8 @@ impl Variant {
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
+            Variant::ConvolutionReuse(ref e, shape) => format!("{e:?}:reuse-{shape:?}-full32"),
+            Variant::CheckedVector(ref e) => format!("{e:?}:checked-vector4"),
             Variant::CoopWorkgroup(ref e, shape, types) => {
                 format!("{e:?}:workgroup-{shape:?}-{types:?}")
             }
@@ -1140,6 +1265,9 @@ impl Variant {
             }
             Variant::Reduction(hash) => format!("generated-reduction:{hash:016x}"),
             Variant::Pointwise(hash) => format!("generated-pointwise:{hash:016x}"),
+            Variant::Pool(hash) => format!("generated-pool:{hash:016x}"),
+            Variant::Image(hash) => format!("generated-image:{hash:016x}"),
+            Variant::Copy(hash) => format!("generated-copy:{hash:016x}"),
             Variant::Attention(ref e, head_dim, ept) => {
                 format!("{e:?}:head-dim-{head_dim}:ept-{ept:?}")
             }
@@ -1195,6 +1323,8 @@ struct SharedPipelineKey {
     entry_point: &'static str,
     layout: String,
     source: String,
+    full_subgroup_size: Option<u32>,
+    convolution_reuse: Option<crate::codegen::ConvolutionReuseShape>,
 }
 
 /// Live pipelines by generated code. Candidate sessions in a measured search
@@ -1306,7 +1436,7 @@ fn precision_requirements(dispatches: &[Dispatch]) -> (Vec<crate::DType>, Vec<cr
         if matches!(
             &dispatch.shader,
             ShaderEntry::ToBF16 | ShaderEntry::FromBF16
-        ) || dispatch.pointwise_storage != crate::schedule::PointwiseStorage::default()
+        ) || dispatch.scalar_storage != crate::schedule::ScalarStorage::default()
         {
             add(&mut storage, DType::BF16);
         }
@@ -1619,7 +1749,7 @@ mod precision_requirement_tests {
             (vec![DType::BF16], vec![DType::BF16])
         );
         let mut pointwise = Dispatch::default();
-        pointwise.pointwise_storage.bf16_output = true;
+        pointwise.scalar_storage.bf16_output = true;
         assert_eq!(
             precision_requirements(&[pointwise]),
             (vec![DType::BF16], vec![])
@@ -1730,6 +1860,16 @@ fn create_profiled_pipeline(
     layout: &blade_graphics::ShaderDataLayout,
     compute: blade_graphics::ShaderFunction<'_>,
 ) -> blade_graphics::ComputePipeline {
+    create_profiled_pipeline_with_subgroups(gpu, name, layout, compute, None)
+}
+
+fn create_profiled_pipeline_with_subgroups(
+    gpu: &Gpu,
+    name: String,
+    layout: &blade_graphics::ShaderDataLayout,
+    compute: blade_graphics::ShaderFunction<'_>,
+    full_subgroup_size: Option<u32>,
+) -> blade_graphics::ComputePipeline {
     let _span = tracing::info_span!(
         "pipeline",
         name = %name,
@@ -1737,6 +1877,7 @@ fn create_profiled_pipeline(
     )
     .entered();
     gpu.create_compute_pipeline(blade_graphics::ComputePipelineDesc {
+        full_subgroup_size,
         name: &name,
         data_layouts: &[layout],
         compute,
@@ -1908,6 +2049,30 @@ impl Pipelines {
             matmul_knobs.unroll_k = shape.unroll_k;
         }
         let group = dispatch.shader.shader_group();
+        let types = match group {
+            ShaderGroup::MatMulTyped { types, .. }
+            | ShaderGroup::BlockMatMulTyped { types, .. } => Some(types),
+            ShaderGroup::Conv2dPacked { types, .. } => Some(types),
+            ShaderGroup::Conv2dGradientTyped { types, .. } => Some(types),
+            ShaderGroup::Conv2dBF16 { .. } => Some(crate::codegen::MatrixTypes::BF16),
+            _ => None,
+        };
+        if let Some(types) = types {
+            types.validate();
+            let caps = &gpu.capabilities().cooperative_matrix;
+            let supported = match types.multiply {
+                crate::DType::BF16 => caps.bf16_f32_shapes.contains(&[16, 16, 16]),
+                crate::DType::F16 => caps.f16_f32_shapes.contains(&[16, 16, 16]),
+                crate::DType::F32 => caps.f32_shapes.contains(&[16, 16, 16]),
+                _ => false,
+            };
+            if !supported {
+                return Err(format!(
+                    "typed matrix product requires native 16x16x16 {:?}/F32 cooperative matrices",
+                    types.multiply
+                ));
+            }
+        }
         let typed_shape = |multiply| {
             let capabilities = gpu.capabilities();
             crate::codegen::checked_cooperative_shape(cooperative_shapes(
@@ -1921,6 +2086,13 @@ impl Pipelines {
         let cooperative =
             || *coop_config.expect("cooperative dispatch needs a qualified device configuration");
         let module = match *key {
+            Variant::ConvolutionReuse(_, shape) => {
+                if convolution_reuse_choice(dispatch, &gpu.capabilities()) != Some(shape) {
+                    return Err("unsupported convolution reuse contract".to_owned());
+                }
+                crate::codegen::generate_convolution_reuse(group, shape)
+            }
+            Variant::CheckedVector(_) => crate::codegen::generate_checked_vector_matmul(group),
             Variant::CoopTyped(ref entry, types, staging) => {
                 let group = match *entry {
                     ShaderEntry::Conv2dGemmCoopGen(kernel_h, kernel_w, stride) => {
@@ -1948,9 +2120,11 @@ impl Pipelines {
                 crate::codegen::generate_workgroup_matmul(group, shape, types)
             }
             Variant::CoopTiled(_, shape, splits, _) => {
-                let config = cooperative();
-                if config.tile_size != 16 || config.use_f16_input || config.compensated {
-                    return Err("tiled cooperative matmul requires native 16x16 f32".to_owned());
+                if types.is_none() {
+                    let config = cooperative();
+                    if config.tile_size != 16 || config.use_f16_input || config.compensated {
+                        return Err("tiled cooperative matmul requires native 16x16 f32".to_owned());
+                    }
                 }
                 if !dispatch
                     .mnk()
@@ -1976,17 +2150,7 @@ impl Pipelines {
                     dispatch.matmul_prologue.as_ref(),
                 )
             }
-            Variant::Scalar(_) => match group {
-                ShaderGroup::Conv2dBF16 { .. } => {
-                    let types = checked_matrix_types(dispatch).expect("BF16 convolution types");
-                    crate::codegen::generate_module_coop_typed_with_shape(
-                        group,
-                        types,
-                        typed_shape(types.multiply)?,
-                    )
-                }
-                _ => crate::codegen::generate_module(group, matmul_knobs),
-            },
+            Variant::Scalar(_) => crate::codegen::generate_module(group, matmul_knobs),
             Variant::SmallTile(_) => crate::codegen::generate_module_small(group, matmul_knobs),
             Variant::Weight(_, format) => {
                 crate::codegen::generate_module_weighted(group, format, matmul_knobs)
@@ -2131,21 +2295,62 @@ impl Pipelines {
                 }
                 _ => unreachable!("non-parameterized attention group {group:?}"),
             },
+            Variant::Copy(_) => {
+                let crate::compile::Kernel::Copy(ref kernel) = dispatch.kernel else {
+                    unreachable!()
+                };
+                layout = pointwise_data_layout(kernel.n_inputs);
+                entry_point = "copy_main";
+                kernel.generate()
+            }
+            Variant::Image(_) => {
+                let crate::compile::Kernel::Image(ref kernel) = dispatch.kernel else {
+                    unreachable!()
+                };
+                let mut bindings = kernel
+                    .binding_names()
+                    .into_iter()
+                    .map(|name| (name, blade_graphics::ShaderBinding::Buffer))
+                    .collect::<Vec<_>>();
+                bindings.push(("params", blade_graphics::ShaderBinding::Plain { size: 32 }));
+                layout = blade_graphics::ShaderDataLayout { bindings };
+                entry_point = "image";
+                kernel.generate()
+            }
+            Variant::Pool(_) => {
+                let crate::compile::Kernel::Pool(ref kernel) = dispatch.kernel else {
+                    unreachable!()
+                };
+                let mut bindings = kernel
+                    .binding_names()
+                    .into_iter()
+                    .map(|name| (name, blade_graphics::ShaderBinding::Buffer))
+                    .collect::<Vec<_>>();
+                bindings.push((
+                    "params",
+                    blade_graphics::ShaderBinding::Plain {
+                        size: std::mem::size_of::<MaxPool2dParams>() as u32,
+                    },
+                ));
+                layout = blade_graphics::ShaderDataLayout { bindings };
+                entry_point = "pool";
+                kernel.generate()
+            }
             Variant::Pointwise(_) => {
                 let dag = dispatch.pointwise().expect("pointwise implementation");
                 layout = pointwise_data_layout(dag.n_inputs);
                 entry_point = crate::schedule::POINTWISE_ENTRY;
-                crate::schedule::lower_pointwise_storage(
+                crate::schedule::lower_scalar_storage(
                     dag,
                     crate::schedule::GridShape::default(),
-                    dispatch.pointwise_storage,
+                    dispatch.scalar_storage,
                 )
             }
             Variant::Reduction(_) => {
                 let kernel = dispatch.reduction().expect("reduction implementation");
                 layout = reduction_data_layout(kernel);
                 entry_point = crate::schedule::REDUCTION_ENTRY;
-                crate::schedule::lower(&kernel.to_template())
+                crate::schedule::lower_reduction_storage(kernel, dispatch.scalar_storage)
             }
             Variant::Horizontal(_, count, kind) => {
                 let coop = match kind {
@@ -2167,11 +2372,18 @@ impl Pipelines {
         if let Some(dir) = dump_dir {
             module.dump(dir);
         }
+        let convolution_reuse = match *key {
+            Variant::ConvolutionReuse(_, shape) => Some(shape),
+            _ => None,
+        };
+        let full_subgroup_size = convolution_reuse.map(|_| 32);
         let shared_key = SharedPipelineKey {
             context: Arc::as_ptr(gpu) as usize,
             entry_point,
             layout: format!("{:?}", layout.bindings),
             source: module.source.clone(),
+            full_subgroup_size,
+            convolution_reuse,
         };
         if let Some(pipeline) = SharedPipelines::get(&shared_key) {
             return Ok(pipeline);
@@ -2179,7 +2391,13 @@ impl Pipelines {
         let shader = create_gen_shader(gpu, module)?;
         let pipeline = Arc::new(SharedPipeline {
             gpu: Arc::clone(gpu),
-            raw: create_profiled_pipeline(gpu, key.label(), &layout, shader.at(entry_point)),
+            raw: create_profiled_pipeline_with_subgroups(
+                gpu,
+                key.label(),
+                &layout,
+                shader.at(entry_point),
+                full_subgroup_size,
+            ),
         });
         SharedPipelines::insert(shared_key, &pipeline);
         Ok(pipeline)
@@ -2210,6 +2428,18 @@ impl Pipelines {
     /// Resolve one implementation. Geometry and arithmetic must not depend on
     /// which unrelated pipelines happen to have been compiled.
     fn key(dispatch: &Dispatch) -> Variant {
+        if let crate::compile::Kernel::ConvolutionReuse(shape) = dispatch.kernel {
+            return Variant::ConvolutionReuse(dispatch.shader.clone(), shape);
+        }
+        if let crate::compile::Kernel::Copy(ref kernel) = dispatch.kernel {
+            return Variant::Copy(kernel.hash_key());
+        }
+        if let crate::compile::Kernel::Image(ref kernel) = dispatch.kernel {
+            return Variant::Image(kernel.hash_key());
+        }
+        if let crate::compile::Kernel::Pool(ref kernel) = dispatch.kernel {
+            return Variant::Pool(kernel.hash_key());
+        }
         let entry = dispatch.shader.clone();
         if let crate::compile::Kernel::CooperativeWorkgroup { shape, types, .. } = dispatch.kernel {
             return Variant::CoopWorkgroup(
@@ -2220,6 +2450,9 @@ impl Pipelines {
         }
         if let crate::compile::Kernel::CooperativeTyped { types, .. } = dispatch.kernel {
             return Variant::CoopTyped(entry, types, typed_matmul_layout(dispatch));
+        }
+        if checked_vector_staging(dispatch) {
+            return Variant::CheckedVector(entry);
         }
         if let crate::compile::Kernel::CooperativeTiled { shape, splits } = dispatch.kernel {
             return Variant::CoopTiled(
@@ -2272,16 +2505,23 @@ impl Pipelines {
             };
         }
         if let Some(kernel) = dispatch.reduction() {
-            return Variant::Reduction(kernel.hash_key());
+            if dispatch.scalar_storage == crate::schedule::ScalarStorage::default() {
+                return Variant::Reduction(kernel.hash_key());
+            }
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            kernel.hash(&mut hash);
+            dispatch.scalar_storage.hash(&mut hash);
+            return Variant::Reduction(hash.finish());
         }
         if let Some(dag) = dispatch.pointwise() {
-            if dispatch.pointwise_storage == crate::schedule::PointwiseStorage::default() {
+            if dispatch.scalar_storage == crate::schedule::ScalarStorage::default() {
                 return Variant::Pointwise(dag.hash_key());
             }
             use std::hash::{Hash, Hasher};
             let mut hash = std::collections::hash_map::DefaultHasher::new();
             dag.hash(&mut hash);
-            dispatch.pointwise_storage.hash(&mut hash);
+            dispatch.scalar_storage.hash(&mut hash);
             return Variant::Pointwise(hash.finish());
         }
         if let Some(dim) = Self::attention_head_dim(dispatch) {
@@ -2507,19 +2747,21 @@ struct MatMulRmsNormParams {
 ///
 /// `layout()` is therefore a placeholder that is never consulted; the
 /// pipelines these bind against carry the real layout.
-struct BufferListData<P> {
-    buffers: Vec<blade_graphics::BufferPiece>,
+struct BufferListData<P, B = Vec<blade_graphics::BufferPiece>> {
+    buffers: B,
     params: P,
 }
 
-impl<P: blade_graphics::ShaderBindable + Copy> blade_graphics::ShaderData for BufferListData<P> {
+impl<P: blade_graphics::ShaderBindable + Copy, B: AsRef<[blade_graphics::BufferPiece]>>
+    blade_graphics::ShaderData for BufferListData<P, B>
+{
     fn layout() -> blade_graphics::ShaderDataLayout {
         blade_graphics::ShaderDataLayout::default()
     }
     fn fill(&self, mut context: blade_graphics::PipelineContext) {
         use blade_graphics::ShaderBindable;
         let mut index = 0u32;
-        for b in &self.buffers {
+        for b in self.buffers.as_ref() {
             b.bind_to(&mut context, index);
             index += 1;
         }
@@ -2573,6 +2815,20 @@ fn pointwise_data_layout(n_inputs: u8) -> blade_graphics::ShaderDataLayout {
         1 => UnaryData::layout(),
         2 => BinaryData::layout(),
         3 => TernaryData::layout(),
+        4..=crate::schedule::PointwiseDAG::MAX_INPUTS => {
+            let mut bindings = crate::schedule::PointwiseDAG::input_binding_names(n_inputs)
+                .iter()
+                .map(|&name| (name, blade_graphics::ShaderBinding::Buffer))
+                .collect::<Vec<_>>();
+            bindings.push(("dst", blade_graphics::ShaderBinding::Buffer));
+            bindings.push((
+                "params",
+                blade_graphics::ShaderBinding::Plain {
+                    size: std::mem::size_of::<UnaryParams>() as u32,
+                },
+            ));
+            blade_graphics::ShaderDataLayout { bindings }
+        }
         n => panic!("pointwise arity {} has no runtime data layout", n),
     }
 }
@@ -2595,6 +2851,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
             bindings: Vec::new(),
         },
         ShaderEntry::MatMul
+        | ShaderEntry::MatMulTyped { addend: false, .. }
         | ShaderEntry::MatMulAT
         | ShaderEntry::MatMulBT
         | ShaderEntry::MatMulGemv
@@ -2605,7 +2862,9 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         | ShaderEntry::BatchMatMul
         | ShaderEntry::BatchMatMulAT
         | ShaderEntry::BatchMatMulBT => MatMulData::layout(),
+        ShaderEntry::BlockMatMulTyped { .. } => BlockMatMulData::layout(),
         ShaderEntry::FusedMatMulAdd
+        | ShaderEntry::MatMulTyped { addend: true, .. }
         | ShaderEntry::FusedMatMulATAdd
         | ShaderEntry::FusedMatMulBTAdd
         | ShaderEntry::MatMulGemvBTAdd
@@ -2654,20 +2913,41 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::Concat => BinaryData::layout(),
         ShaderEntry::SplitA | ShaderEntry::SplitB => UnaryData::layout(),
         ShaderEntry::Permute => PermuteData::layout(),
+        ShaderEntry::PackChannels { .. } => PackChannelsData::layout(),
         ShaderEntry::BiasedAttention => BiasedAttentionData::layout(),
         ShaderEntry::Upsample2x | ShaderEntry::Upsample2xGrad => UnaryData::layout(),
         ShaderEntry::Conv2dDw => Conv2dDwData::layout(),
         ShaderEntry::MulPerChannel => MulPerChannelData::layout(),
         ShaderEntry::Conv2dGemm
         | ShaderEntry::Conv2dBF16 { .. }
+        | ShaderEntry::Conv2dPacked {
+            pass: crate::codegen::ConvolutionPass::Forward,
+            ..
+        }
         | ShaderEntry::Conv2dGemmSmall
         | ShaderEntry::Conv2dGemm16
         | ShaderEntry::Conv2dGemmCoopGen(..) => Conv2dData::layout(),
         ShaderEntry::Conv2dGradInputGemm
+        | ShaderEntry::Conv2dGradientTyped {
+            weight_gradient: false,
+            ..
+        }
+        | ShaderEntry::Conv2dPacked {
+            pass: crate::codegen::ConvolutionPass::InputGradient,
+            ..
+        }
         | ShaderEntry::Conv2dGradInputGemmSmall
         | ShaderEntry::Conv2dGradInputGemm16
         | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => Conv2dGradInputData::layout(),
         ShaderEntry::Conv2dGradWeightGemm
+        | ShaderEntry::Conv2dGradientTyped {
+            weight_gradient: true,
+            ..
+        }
+        | ShaderEntry::Conv2dPacked {
+            pass: crate::codegen::ConvolutionPass::WeightGradient,
+            ..
+        }
         | ShaderEntry::Conv2dGradWeightGemmSmall
         | ShaderEntry::Conv2dGradWeightGemm16
         | ShaderEntry::Conv2dGradWeightGemmSplit
@@ -2710,6 +2990,152 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
 // how many dispatches a plan has, so the groups cannot be computed apart from
 // it. Recording them is all that is left here.
 
+fn is_convolution_product(shader: &ShaderEntry) -> bool {
+    matches!(
+        shader,
+        ShaderEntry::Conv2dDw
+            | ShaderEntry::Conv2dBF16 { .. }
+            | ShaderEntry::Conv2dPacked { .. }
+            | ShaderEntry::Conv2dGradientTyped { .. }
+            | ShaderEntry::Conv2dGemm
+            | ShaderEntry::Conv2dGemmSmall
+            | ShaderEntry::Conv2dGemm16
+            | ShaderEntry::Conv2dGemmCoopGen(..)
+            | ShaderEntry::Conv2dGradInputGemm
+            | ShaderEntry::Conv2dGradInputGemmSmall
+            | ShaderEntry::Conv2dGradInputGemm16
+            | ShaderEntry::Conv2dGradInputGemmCoopGen(..)
+            | ShaderEntry::Conv2dGradWeightGemm
+            | ShaderEntry::Conv2dGradWeightGemmSmall
+            | ShaderEntry::Conv2dGradWeightGemm16
+            | ShaderEntry::Conv2dGradWeightGemmSplit
+            | ShaderEntry::Conv2dGradWeightGemmSplitSmall
+            | ShaderEntry::Conv2dGradWeightGemmSplit16
+    )
+}
+
+fn convolution_boundary(previous: Option<&ShaderEntry>, current: &ShaderEntry) -> bool {
+    previous.is_some_and(|shader| is_convolution_product(shader) != is_convolution_product(current))
+}
+
+fn record_group(
+    pass: &mut blade_graphics::ComputeCommandEncoder<'_>,
+    plan: &ExecutionPlan,
+    pipelines: &Pipelines,
+    buffers: &[blade_graphics::BufferPiece],
+    group: std::ops::Range<usize>,
+) {
+    let mut previous = None;
+    for i in group {
+        let dispatch = &plan.dispatches[i];
+        // Keep independent convolution products together, but do not let
+        // auxiliary kernels change the execution context of that run.
+        if convolution_boundary(previous, &dispatch.shader) {
+            pass.barrier();
+        }
+        previous = Some(&dispatch.shader);
+        let mut pc = pass.with(pipelines.get(i));
+        Session::bind_dispatch(buffers, dispatch, &mut pc);
+        pc.dispatch(dispatch.workgroups);
+    }
+}
+
+#[cfg(test)]
+mod convolution_scheduling_tests {
+    use super::{ShaderEntry, convolution_boundary, is_convolution_product};
+
+    fn boundaries(shaders: &[ShaderEntry]) -> Vec<usize> {
+        shaders
+            .iter()
+            .enumerate()
+            .filter_map(|(i, shader)| {
+                convolution_boundary(i.checked_sub(1).map(|p| &shaders[p]), shader).then_some(i)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn typed_and_scalar_products_share_the_rule() {
+        use crate::{DType, codegen::MatrixTypes};
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for weight_gradient in [false, true] {
+                let typed = ShaderEntry::Conv2dGradientTyped {
+                    weight_gradient,
+                    kernel_h: 5,
+                    kernel_w: 5,
+                    stride: 1,
+                    splits: 1,
+                    types: MatrixTypes {
+                        a: dtype,
+                        b: dtype,
+                        multiply: dtype,
+                        output: DType::F32,
+                    },
+                };
+                assert!(is_convolution_product(&typed));
+                assert!(convolution_boundary(Some(&ShaderEntry::SumRows), &typed));
+                assert!(!convolution_boundary(
+                    Some(&ShaderEntry::Conv2dGemm),
+                    &typed
+                ));
+            }
+        }
+        for shader in [
+            ShaderEntry::Conv2dDw,
+            ShaderEntry::Conv2dGemm,
+            ShaderEntry::Conv2dGradInputGemm16,
+            ShaderEntry::Conv2dGradWeightGemmSplitSmall,
+        ] {
+            assert!(is_convolution_product(&shader));
+        }
+    }
+
+    #[test]
+    fn homogeneous_and_empty_runs_add_no_boundaries() {
+        assert!(boundaries(&[]).is_empty());
+        assert!(boundaries(&[ShaderEntry::Generated, ShaderEntry::SumRows]).is_empty());
+        assert!(
+            boundaries(&[ShaderEntry::Conv2dGemm, ShaderEntry::Conv2dGradInputGemm]).is_empty()
+        );
+    }
+
+    #[test]
+    fn only_class_transitions_get_boundaries() {
+        assert_eq!(
+            boundaries(&[
+                ShaderEntry::Generated,
+                ShaderEntry::SumRows,
+                ShaderEntry::SumRows,
+                ShaderEntry::Conv2dGradInputGemm,
+                ShaderEntry::Conv2dGradWeightGemmSplit
+            ]),
+            vec![3]
+        );
+        assert_eq!(
+            boundaries(&[
+                ShaderEntry::Conv2dGemm,
+                ShaderEntry::Generated,
+                ShaderEntry::Conv2dGradInputGemm
+            ]),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn image_helpers_remain_non_products() {
+        for shader in [
+            ShaderEntry::MaxPool2d,
+            ShaderEntry::MaxPool2dGrad,
+            ShaderEntry::Upsample2x,
+            ShaderEntry::Upsample2xGrad,
+            ShaderEntry::WinogradInputTransform,
+            ShaderEntry::WinogradOutputTransform,
+        ] {
+            assert!(!is_convolution_product(&shader));
+        }
+    }
+}
+
 /// Record the compiled graph, leaving the last chunk open for appended work.
 fn record_groups(
     gpu: &Gpu,
@@ -2721,6 +3147,7 @@ fn record_groups(
     buffers: &[blade_graphics::BufferPiece],
     chunks: usize,
     timing: bool,
+    cache: &mut command_cache::Cache,
 ) {
     let total = groups.len();
     let per_chunk = total.div_ceil(chunks.min(total).max(1));
@@ -2733,26 +3160,25 @@ fn record_groups(
     let mut chunk_index = 0;
     while start < total {
         let end = (start + per_chunk).min(total);
-        {
+        let record = |encoder: &mut blade_graphics::CommandEncoder| {
             let label = format!("step {}/{}", chunk_index + 1, chunk_count);
             let mut pass = encoder.compute(&label);
             for (gi, group) in groups.iter().enumerate().take(end).skip(start) {
                 if gi > start {
                     pass.barrier();
                 }
-                for i in group.clone() {
-                    let dispatch = &plan.dispatches[i];
-                    let pipeline = pipelines.get(i);
-                    let mut pc = pass.with(pipeline);
-                    Session::bind_dispatch(buffers, dispatch, &mut pc);
-                    pc.dispatch(dispatch.workgroups);
-                }
+                record_group(&mut pass, plan, pipelines, buffers, group.clone());
             }
+        };
+        if cache.enabled {
+            let range = groups[start].start..groups[end - 1].end;
+            cache.execute(gpu, encoder, range, record);
+        } else {
+            record(encoder);
         }
         start = end;
         chunk_index += 1;
         if start < total {
-            log::debug!(target: "meganeura::submission", "submit chunk {chunk_index}/{chunk_count}, groups {}..{end}", end - per_chunk);
             let sync = gpu.submit(encoder);
             if timing {
                 // The next start reuses the timestamp queries. Harvest them
@@ -2772,6 +3198,12 @@ fn tiled_coop_shared_bytes(
     dispatch: &Dispatch,
     shape: crate::codegen::CooperativeMatmulShape,
 ) -> u64 {
+    if let ShaderEntry::MatMulTyped { types, addend, .. } = dispatch.shader {
+        return u64::from(shape.typed_shared_bytes(types, addend));
+    }
+    if let ShaderEntry::BlockMatMulTyped { types, .. } = dispatch.shader {
+        return u64::from(shape.typed_shared_bytes(types, false));
+    }
     let row_factors = dispatch.matmul_prologue.as_ref().map_or(0, |p| {
         p.factors
             .iter()
@@ -2779,6 +3211,163 @@ fn tiled_coop_shared_bytes(
             .count()
     });
     u64::from(shape.shared_bytes()) + row_factors as u64 * 64 * 4
+}
+
+fn fit_grouped_shared_memory(plan: &mut ExecutionPlan, limit: u32) {
+    for dispatch in &mut plan.dispatches {
+        if !matches!(dispatch.shader, ShaderEntry::BlockMatMulTyped { .. }) {
+            continue;
+        }
+        if let crate::compile::Kernel::CooperativeTiled { shape, .. } = dispatch.kernel {
+            if limit != 0 && tiled_coop_shared_bytes(dispatch, shape) > u64::from(limit) {
+                dispatch.kernel = crate::compile::Kernel::Default;
+                dispatch.workgroups[0] = dispatch.params[0].div_ceil(32);
+                dispatch.workgroups[1] = dispatch.params[1].div_ceil(32);
+            }
+        }
+    }
+}
+
+fn convolution_reuse_choice(
+    dispatch: &Dispatch,
+    caps: &blade_graphics::Capabilities,
+) -> Option<crate::codegen::ConvolutionReuseShape> {
+    use crate::{
+        DType,
+        codegen::{ConvolutionReuseShape, MatrixTypes},
+        compile::Kernel,
+    };
+    if !matches!(
+        dispatch.kernel,
+        Kernel::Default | Kernel::ConvolutionReuse(_)
+    ) || dispatch.schedule_locked
+        || dispatch.horizontal_batch != 0
+        || dispatch.matmul_prologue.is_some()
+        || dispatch.matmul_epilogue.is_some()
+        || !caps.full_subgroups?.supports(32, [128, 1, 1])
+        || !caps.shader_bfloat16
+        || !caps
+            .cooperative_matrix
+            .bf16_f32_shapes
+            .contains(&[16, 16, 16])
+    {
+        return None;
+    }
+    let p = &dispatch.params;
+    if p.len() < 12 || p[5..8] != [5, 5, 1] {
+        return None;
+    }
+    let (m, n, slices) = match dispatch.shader {
+        ShaderEntry::Conv2dBF16 {
+            kernel_h: 5,
+            kernel_w: 5,
+            stride: 1,
+            output_bf16: true,
+        } => (p[4], p[9].checked_mul(p[10])?, p[0]),
+        ShaderEntry::Conv2dGradientTyped {
+            kernel_h: 5,
+            kernel_w: 5,
+            stride: 1,
+            weight_gradient,
+            splits,
+            types,
+        } if types
+            == (MatrixTypes {
+                output: DType::F32,
+                ..MatrixTypes::BF16
+            }) =>
+        {
+            if weight_gradient {
+                (p[4], p[1].checked_mul(25)?, splits)
+            } else if splits == 1 {
+                (p[1], p[2].checked_mul(p[3])?, p[0])
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    let shape = ConvolutionReuseShape::for_dimensions(m, n)?;
+    if slices == 0
+        || !shape.valid()
+        || shape.shared_bytes(DType::BF16) > caps.max_compute_shared_memory_size
+    {
+        return None;
+    }
+    let previous_tile = match dispatch.kernel {
+        Kernel::ConvolutionReuse(previous) if previous.valid() => [previous.rows, previous.columns],
+        Kernel::Default => [32, 32],
+        _ => return None,
+    };
+    if dispatch.workgroups
+        != [
+            m.div_ceil(previous_tile[0]),
+            n.div_ceil(previous_tile[1]),
+            slices,
+        ]
+    {
+        return None;
+    }
+    Some(shape)
+}
+
+fn reset_convolution_reuse(dispatch: &mut Dispatch) {
+    if let crate::compile::Kernel::ConvolutionReuse(shape) = dispatch.kernel {
+        assert!(shape.valid(), "invalid cached convolution reuse shape");
+        dispatch.workgroups[0] = dispatch.workgroups[0]
+            .checked_mul(shape.rows / 32)
+            .expect("reuse grid overflow");
+        dispatch.workgroups[1] = dispatch.workgroups[1]
+            .checked_mul(shape.columns / 32)
+            .expect("reuse grid overflow");
+        dispatch.kernel = crate::compile::Kernel::Default;
+    }
+}
+
+fn select_convolution_reuse(dispatch: &mut Dispatch, caps: &blade_graphics::Capabilities) {
+    reset_convolution_reuse(dispatch);
+    let Some(shape) = convolution_reuse_choice(dispatch, caps) else {
+        return;
+    };
+    // The policy divides the incumbent's padded output, so no matrix work is added.
+    dispatch.workgroups[0] /= shape.rows / 32;
+    dispatch.workgroups[1] /= shape.columns / 32;
+    dispatch.kernel = crate::compile::Kernel::ConvolutionReuse(shape);
+}
+
+#[test]
+fn grouped_shared_memory_fallback_preserves_contract() {
+    use crate::{Graph, compile::Kernel};
+    let mut graph = Graph::new();
+    let a = graph.input("a", &[64, 3 * 128]);
+    let b = graph.parameter("b", &[3, 128, 64]);
+    let a = graph.to_bf16(a);
+    let b = graph.to_bf16(b);
+    let y = graph.block_matmul(a, b);
+    let y = graph.to_bf16(y);
+    let y = graph.from_bf16(y);
+    graph.set_outputs(vec![y]);
+    let plan = crate::compile::compile(&graph);
+    let original = plan
+        .dispatches
+        .iter()
+        .find(|d| matches!(d.shader, ShaderEntry::BlockMatMulTyped { .. }))
+        .unwrap();
+    assert!(matches!(original.kernel, Kernel::CooperativeTiled { .. }));
+    for (limit, checked) in [(32768, false), (16384, true)] {
+        let mut candidate = plan.clone();
+        fit_grouped_shared_memory(&mut candidate, limit);
+        let d = candidate
+            .dispatches
+            .iter()
+            .find(|d| matches!(d.shader, ShaderEntry::BlockMatMulTyped { .. }))
+            .unwrap();
+        assert_eq!(d.params, original.params);
+        assert_eq!(d.input_buffers, original.input_buffers);
+        assert_eq!(d.output_buffer, original.output_buffer);
+        assert_eq!(matches!(d.kernel, Kernel::Default), checked);
+        assert_eq!(d.workgroups, if checked { [2, 2, 3] } else { [1, 1, 3] });
+    }
 }
 
 /// A compiled, ready-to-execute GPU session.
@@ -3158,6 +3747,10 @@ mod coop_precision_tests {
 /// Options for session construction beyond the plan itself.
 #[derive(Clone, Debug, Default)]
 pub struct SessionOptions {
+    /// Outputs whose dependencies may run before late inputs arrive.
+    /// Enables `prepare_step`/`finish_prepared_step`; allocation lifetimes
+    /// span both stages. Empty keeps ordinary scheduling unchanged.
+    pub prepare_outputs: Vec<usize>,
     /// Debug session: disable buffer aliasing and device-local placement so
     /// materialized values stay host-visible and readable via
     /// [`Session::read_node`] after a completed step. `build` also disables
@@ -3411,6 +4004,7 @@ pub struct Session {
     /// device-local placement.
     alias: crate::memplan::AliasPlan,
     pipelines: Pipelines,
+    blend_pipeline: Option<blade_graphics::ComputePipeline>,
     /// Session policy/capabilities after the cooperative smoke test. Tuning
     /// must not re-enable a rejected or explicitly disabled implementation.
     coop_config: Option<crate::codegen::CoopConfig>,
@@ -3418,7 +4012,11 @@ pub struct Session {
     /// Pre-computed barrier groups: each range of dispatch indices shares one
     /// compute pass. Pass boundaries in blade emit ALL_COMMANDS barriers.
     groups: Vec<std::ops::Range<usize>>,
+    preparation: Option<crate::compile::stages::Preparation>,
+    step_prepared: bool,
+    diagnostic_workgroups: Option<Vec<[u32; 3]>>,
     encoder: blade_graphics::CommandEncoder,
+    command_cache: command_cache::Cache,
     /// Caller-selected upper bound on the submissions used by `step()`.
     /// See [`Session::set_submission_chunks`]. Always at least 1.
     submission_chunks: usize,
@@ -4026,6 +4624,13 @@ impl Session {
 
         let mut plan = plan;
         let schedule_span = tracing::info_span!("schedule").entered();
+        if !opts.debug {
+            plan.pack_convolution_channels(gpu.capabilities().max_compute_shared_memory_size);
+            if std::env::var("MEGANEURA_IMAGE_VIEWS").is_ok_and(|v| v == "1") {
+                plan.fold_image_views();
+            }
+        }
+        fit_grouped_shared_memory(&mut plan, gpu.capabilities().max_compute_shared_memory_size);
 
         // Per-dispatch kernel-variant selection: one pass, one owner.
         select_variants(
@@ -4034,7 +4639,19 @@ impl Session {
             !opts.debug,
             opts.coop == CoopPolicy::AllowF16,
         );
+        if !opts.debug && std::env::var("MEGANEURA_COPY_COMPOSITION").is_ok_and(|v| v == "1") {
+            plan.fold_private_copies();
+        }
         workgroup::select(&mut plan, &gpu.capabilities(), &opts);
+        let convolution_reuse_enabled = !opts.debug
+            && std::env::var("MEGANEURA_CONVOLUTION_WORDS").as_deref() == Ok("1")
+            && std::env::var("MEGANEURA_CONVOLUTION_REUSE").as_deref() == Ok("1");
+        for dispatch in &mut plan.dispatches {
+            reset_convolution_reuse(dispatch);
+            if convolution_reuse_enabled {
+                select_convolution_reuse(dispatch, &gpu.capabilities());
+            }
+        }
         if let Some(head_dim) = plan
             .dispatches
             .iter()
@@ -4057,11 +4674,21 @@ impl Session {
         if opts.serial_dispatch {
             log::info!("MEGANEURA_SERIAL_DISPATCH: forcing one dispatch per pass");
         }
-        crate::compile::schedule_dispatches(
-            &mut plan,
-            opts.serial_dispatch,
-            !opts.serial_dispatch && !opts.debug,
-        );
+        let preparation = if opts.prepare_outputs.is_empty() {
+            crate::compile::schedule_dispatches(
+                &mut plan,
+                opts.serial_dispatch,
+                !opts.serial_dispatch && !opts.debug,
+            );
+            None
+        } else {
+            Some(crate::compile::stages::schedule(
+                &mut plan,
+                &opts.prepare_outputs,
+                opts.serial_dispatch,
+                !opts.serial_dispatch && !opts.debug,
+            ))
+        };
         let groups = std::mem::take(&mut plan.groups);
         log::info!(
             "{} dispatches → {} barrier groups",
@@ -4546,11 +5173,18 @@ impl Session {
             physical_buffers,
             alias,
             pipelines,
+            blend_pipeline: None,
             coop_config,
             plan,
             groups,
+            preparation,
+            step_prepared: false,
+            diagnostic_workgroups: None,
             encoder,
             submission_chunks: 1,
+            command_cache: command_cache::Cache::new(
+                std::env::var("MEGANEURA_COMMAND_CACHE").is_ok_and(|value| value == "1"),
+            ),
             sync_point: None,
             external_sync_point: None,
             gpu_timing,
@@ -4760,6 +5394,8 @@ impl Session {
         offset: usize,
         device_local: bool,
     ) {
+        assert!(!self.step_prepared, "cannot rebind during a prepared step");
+        self.clear_command_cache();
         self.buffers[index] = physical.handle.at(offset as u64);
         let target = self
             .alias
@@ -4886,6 +5522,7 @@ impl Session {
     /// `chunks` is clamped to at least 1; 1 restores the single-submission
     /// default.
     pub fn set_submission_chunks(&mut self, chunks: usize) {
+        self.clear_command_cache();
         let chunks = chunks.max(1);
         if chunks == self.submission_chunks {
             return;
@@ -6164,6 +6801,8 @@ mod transfer;
 
 // Turning a dispatch into bound shader data lives in `runtime/binding.rs`.
 mod binding;
+mod parameter_blend;
+pub use parameter_blend::BlendParameterError;
 
 // The execution half of `Session` continues here: waiting, stepping,
 // recording, dispatch binding and the optimizer entry points.
@@ -6187,7 +6826,13 @@ impl Session {
     }
 
     /// Execute the full dispatch sequence (forward + backward + update).
+    ///
+    /// A prepared step must be completed explicitly instead.
     pub fn step(&mut self) {
+        assert!(
+            !self.step_prepared,
+            "finish the prepared step before another full step"
+        );
         let _span = tracing::info_span!(
             "step",
             dispatches = self.plan.dispatches.len(),
@@ -6202,6 +6847,256 @@ impl Session {
         self.encode_step(self.submission_chunks, self.profile_window.clone());
         log::debug!(target: "meganeura::submission", "submit final chunk, {} dispatches", self.plan.dispatches.len());
         self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+    }
+
+    /// Execute only the dependencies of `SessionOptions::prepare_outputs`.
+    /// Parameters and early inputs remain immutable until completion. Late
+    /// inputs may then be supplied before `finish_prepared_step`. No optimizer
+    /// or clipping executes here. Direct GPU-buffer users must honor the same
+    /// immutability and submission ordering as host uploads.
+    pub fn prepare_step(&mut self) {
+        assert!(!self.step_prepared, "step already prepared");
+        assert!(
+            self.grad_accum_scale.is_none(),
+            "prepared steps do not support temporal accumulation"
+        );
+        assert!(
+            self.profile_window.is_none(),
+            "prepared steps do not support dispatch profiling"
+        );
+        let end = self
+            .preparation
+            .as_ref()
+            .expect("no preparation outputs configured")
+            .groups;
+        self.wait();
+        self.encoder.start();
+        self.profiled_pass_map.clear();
+        let chunks = self.preparation_chunks(end);
+        record_groups(
+            &self.gpu,
+            &mut self.encoder,
+            &mut self.sync_point,
+            &self.plan,
+            &self.groups[..end],
+            &self.pipelines,
+            &self.buffers,
+            chunks,
+            self.gpu_timing,
+            &mut self.command_cache,
+        );
+        self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+        self.step_prepared = true;
+    }
+
+    /// Finish the retained forward/backward work, clipping and optimizer once.
+    pub fn finish_prepared_step(&mut self) {
+        assert!(self.step_prepared, "no prepared step to finish");
+        assert!(
+            self.grad_accum_scale.is_none(),
+            "prepared steps do not support temporal accumulation"
+        );
+        let start = self.preparation.as_ref().unwrap().groups;
+        self.wait();
+        self.encoder.start();
+        let chunks = self.preparation_chunks(self.groups.len() - start);
+        record_groups(
+            &self.gpu,
+            &mut self.encoder,
+            &mut self.sync_point,
+            &self.plan,
+            &self.groups[start..],
+            &self.pipelines,
+            &self.buffers,
+            chunks,
+            self.gpu_timing,
+            &mut self.command_cache,
+        );
+        self.encode_training_update();
+        self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+        self.step_prepared = false;
+    }
+
+    fn preparation_chunks(&self, groups: usize) -> usize {
+        groups
+            .saturating_mul(self.submission_chunks)
+            .div_ceil(self.groups.len().max(1))
+            .max(1)
+    }
+
+    fn clear_command_cache(&mut self) {
+        self.wait();
+        self.command_cache.clear(&self.gpu);
+    }
+
+    /// Diagnostic immutable graph cache; optimizer commands remain dynamic.
+    pub fn set_command_cache(&mut self, enabled: bool) {
+        assert!(!self.step_prepared);
+        self.clear_command_cache();
+        self.command_cache.enabled = enabled;
+    }
+
+    /// Cumulative chunk recordings and reuses, including prior invalidations.
+    pub fn command_cache_counts(&self) -> (u64, u64) {
+        (self.command_cache.recordings, self.command_cache.replays)
+    }
+
+    /// Actual prefix dispatch count after scheduling and fusion.
+    pub fn preparation_dispatch_count(&self) -> usize {
+        self.preparation
+            .as_ref()
+            .and_then(|p| p.groups.checked_sub(1))
+            .map_or(0, |last| self.groups[last].end)
+    }
+
+    /// Diagnostic zero-work subsets: convolution(1), matrix(2), other(4).
+    /// Outputs are invalid until mask 7 is restored and a full step completes.
+    /// This never changes dependencies, bindings or optimizer state.
+    pub fn set_diagnostic_work_mask(&mut self, mask: u8) {
+        assert!(mask < 8 && !self.step_prepared);
+        let keep: Vec<_> = self
+            .plan
+            .dispatches
+            .iter()
+            .map(|dispatch| {
+                let name = format!("{:?}", dispatch.shader);
+                let bit = if name.starts_with("Conv2d") {
+                    1
+                } else if name.contains("MatMul") || name.contains("MatVec") {
+                    2
+                } else {
+                    4
+                };
+                mask & bit != 0
+            })
+            .collect();
+        self.set_diagnostic_dispatch_mask(&keep);
+    }
+
+    /// Suppress work only, retaining the original command and dependency stream.
+    /// A full step with every flag true must precede any output use.
+    pub fn set_diagnostic_dispatch_mask(&mut self, keep: &[bool]) {
+        self.clear_command_cache();
+        assert!(!self.step_prepared);
+        assert!(self.pending_lr.is_none() && self.pending_adam.is_none());
+        assert!(self.grad_accum_scale.is_none());
+        assert_eq!(keep.len(), self.plan.dispatches.len());
+        self.wait();
+        let original = self
+            .diagnostic_workgroups
+            .get_or_insert_with(|| self.plan.dispatches.iter().map(|d| d.workgroups).collect());
+        for ((dispatch, workgroups), &active) in
+            self.plan.dispatches.iter_mut().zip(original).zip(keep)
+        {
+            dispatch.workgroups = if active { *workgroups } else { [0, 1, 1] };
+        }
+    }
+
+    pub fn diagnostic_groups(&self) -> &[std::ops::Range<usize>] {
+        &self.groups
+    }
+
+    pub fn diagnostic_convolution_boundaries(&self) -> Vec<usize> {
+        self.groups
+            .iter()
+            .flat_map(|group| {
+                (group.start + 1..group.end).filter(|&i| {
+                    convolution_boundary(
+                        Some(&self.plan.dispatches[i - 1].shader),
+                        &self.plan.dispatches[i].shader,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Add one diagnostic barrier after allocation, without changing any
+    /// existing boundary, prepared prefix, buffer binding or pipeline.
+    pub fn split_diagnostic_group(&mut self, before: usize) {
+        assert!(!self.step_prepared);
+        let index = self
+            .groups
+            .iter()
+            .position(|group| group.start < before && before < group.end)
+            .expect("split must be inside an existing group");
+        assert!(self.preparation.as_ref().is_none_or(|p| index >= p.groups));
+        self.clear_command_cache();
+        let end = self.groups[index].end;
+        self.groups[index].end = before;
+        self.groups.insert(index + 1, before..end);
+    }
+
+    /// Diagnostic only: preserve the original allocation, pipelines and group
+    /// ordering. The caller owns producer completion and tracks the submission.
+    pub fn record_diagnostic_groups(
+        &mut self,
+        encoder: &mut blade_graphics::CommandEncoder,
+        groups: std::ops::Range<usize>,
+    ) {
+        assert!(!self.step_prepared && self.command_cache.enabled);
+        assert!(self.pending_lr.is_none() && self.pending_adam.is_none());
+        assert!(self.grad_accum_scale.is_none());
+        assert!(groups.start <= groups.end && groups.end <= self.groups.len());
+        record_groups(
+            &self.gpu,
+            encoder,
+            &mut self.sync_point,
+            &self.plan,
+            &self.groups[groups],
+            &self.pipelines,
+            &self.buffers,
+            1,
+            self.gpu_timing,
+            &mut self.command_cache,
+        );
+    }
+
+    /// Record an independent subset of one original barrier group, using its
+    /// original allocation and pipelines. The caller supplies valid cut inputs.
+    pub fn record_diagnostic_cut(
+        &mut self,
+        encoder: &mut blade_graphics::CommandEncoder,
+        dispatches: std::ops::Range<usize>,
+    ) {
+        assert!(!self.step_prepared && self.command_cache.enabled);
+        assert!(self.pending_lr.is_none() && self.pending_adam.is_none());
+        assert!(self.grad_accum_scale.is_none());
+        assert!(dispatches.start < dispatches.end);
+        assert!(
+            self.groups
+                .iter()
+                .any(|group| { group.start <= dispatches.start && dispatches.end <= group.end })
+        );
+        record_groups(
+            &self.gpu,
+            encoder,
+            &mut self.sync_point,
+            &self.plan,
+            std::slice::from_ref(&dispatches),
+            &self.pipelines,
+            &self.buffers,
+            1,
+            self.gpu_timing,
+            &mut self.command_cache,
+        );
+    }
+
+    /// Diagnostic view of the original storage. Aliased contents are only valid
+    /// at their graph lifetime; the caller must preserve ordering and ownership.
+    pub fn diagnostic_buffer_piece(&self, buffer: BufferRef) -> blade_graphics::BufferPiece {
+        self.buffers[buffer.0 as usize]
+    }
+
+    /// Physical allocation, byte offset, logical capacity and device-only flag.
+    pub fn diagnostic_buffer_region(&self, buffer: BufferRef) -> (usize, usize, usize, bool) {
+        let index = buffer.0 as usize;
+        let physical = self.alias.map[index];
+        (
+            physical,
+            self.alias.offsets[index],
+            self.plan.buffers[index],
+            self.alias.device_local[physical],
+        )
     }
 
     /// Record one step — the same work as [`Session::step`] — into a
@@ -6254,6 +7149,10 @@ impl Session {
         &mut self,
         encoder: &mut blade_graphics::CommandEncoder,
     ) -> Result<(), RecordError> {
+        assert!(
+            !self.step_prepared,
+            "finish the prepared step before recording"
+        );
         if self.grad_accum_scale.is_some() {
             return Err(RecordError::GradAccumulation);
         }
@@ -6313,13 +7212,13 @@ impl Session {
                             if position > 0 {
                                 pass.barrier();
                             }
-                            for i in span {
-                                let dispatch = &self.plan.dispatches[i];
-                                let pipeline = self.pipelines.get(i);
-                                let mut pc = pass.with(pipeline);
-                                Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
-                                pc.dispatch(dispatch.workgroups);
-                            }
+                            record_group(
+                                &mut pass,
+                                &self.plan,
+                                &self.pipelines,
+                                &self.buffers,
+                                span,
+                            );
                         }
                         self.profiled_pass_map.push(None);
                     }
@@ -6346,9 +7245,14 @@ impl Session {
                 &self.buffers,
                 chunks,
                 self.gpu_timing,
+                &mut self.command_cache,
             );
         }
 
+        self.encode_training_update();
+    }
+
+    fn encode_training_update(&mut self) {
         // Gradient clipping runs after backward and before the optimizer in
         // the same GPU submission. Global clipping measures the concatenated
         // gradient; AGC measures each parameter and its gradient separately.
@@ -6578,6 +7482,10 @@ impl Session {
 
     /// CPU-fallback SGD update.
     pub fn sgd_step_cpu(&mut self, learning_rate: f32) {
+        assert!(
+            !self.step_prepared,
+            "cannot update parameters during a prepared step"
+        );
         let _span = tracing::info_span!("sgd_step_cpu").entered();
         self.wait();
         for &(param_buf, grad_buf) in &self.plan.param_grad_pairs {
@@ -6734,6 +7642,10 @@ impl Session {
     /// `micro_batches = 1` (or [`Session::clear_grad_accumulate`]) to
     /// restore direct single-step optimizer reads.
     pub fn set_grad_accumulate(&mut self, micro_batches: u32) {
+        assert!(
+            !self.step_prepared,
+            "cannot change accumulation during a prepared step"
+        );
         assert!(micro_batches >= 1);
         if micro_batches == 1 {
             self.grad_accum_scale = None;
@@ -6864,6 +7776,10 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.wait();
+        self.command_cache.clear(&self.gpu);
+        if let Some(mut pipeline) = self.blend_pipeline.take() {
+            self.gpu.destroy_compute_pipeline(&mut pipeline);
+        }
         self.gpu.destroy_command_encoder(&mut self.encoder);
         if let Some(staging) = self.upload_staging.get_mut().take() {
             self.gpu.destroy_buffer(staging.buffer);

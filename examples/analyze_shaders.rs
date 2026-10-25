@@ -130,7 +130,7 @@ fn analyze_gpu(gpu: &blade_graphics::Context, name: &str, sm: &ShaderModule, ent
         naga_module: None,
     });
     let layout = meganeura::runtime::shader_data_layout(entry);
-    let mut pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc {
+    let mut pipeline = gpu.create_compute_pipeline(bg::ComputePipelineDesc { full_subgroup_size: None,
         name: entry.entry_point(),
         data_layouts: &[&layout],
         compute: shader.at(entry.entry_point()),

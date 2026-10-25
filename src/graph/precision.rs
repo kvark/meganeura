@@ -2,14 +2,12 @@ use super::{DType, Graph, NodeId, Op};
 use std::collections::HashMap;
 
 impl Graph {
-    /// Explicit mixed precision for ordinary dense products in a forward graph.
+    /// Explicit mixed precision for dense and grouped products in a forward graph.
     /// Operands and stored results use BF16; accumulators, other operations,
     /// parameters and graph interfaces remain F32. Call before autodiff and
     /// enable `CompileOptions::bf16_matrix_gradients` for reduced derivatives.
-    /// Block/batched products, convolution and full-precision regions are not
-    /// silently converted. Native BF16 cooperative support is required. This
-    /// is currently a training policy: inference would re-round F32 parameters
-    /// on every run until persistent BF16 parameter storage is implemented.
+    /// Batch-major products, convolution and full-precision regions are not
+    /// silently converted. Native BF16 cooperative support is required.
     pub fn into_bf16_matmuls(self) -> Self {
         self.into_bf16_selected(|op| {
             matches!(
@@ -17,6 +15,9 @@ impl Graph {
                 Op::MatMul
                     | Op::MatMulAT
                     | Op::MatMulBT
+                    | Op::BlockMatMul
+                    | Op::BlockMatMulAT { .. }
+                    | Op::BlockMatMulBT
                     | Op::FusedMatMulAdd
                     | Op::FusedMatMulATAdd
                     | Op::FusedMatMulBTAdd
@@ -26,9 +27,7 @@ impl Graph {
 
     /// Explicit BF16 convolution operands and stored results, with F32
     /// accumulation and derivatives. Parameters and graph interfaces stay F32.
-    /// Compose with `into_bf16_matmuls` before differentiation as needed. This
-    /// is currently intended for training because inference would re-round F32
-    /// parameters on every run.
+    /// Compose with `into_bf16_matmuls` before differentiation as needed.
     pub fn into_bf16_convolutions(self) -> Self {
         self.into_bf16_selected(|op| matches!(op, Op::Conv2d { .. }))
     }

@@ -5,9 +5,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 mod bf16;
+mod channels;
+mod copy_composition;
+mod image;
+mod image_views;
 mod params;
+mod pool;
+mod row_fusion;
 mod softplus;
 mod split_k;
+pub(crate) mod stages;
 pub(crate) use params::{AttentionParams, CachedBlockAttentionParams, DispatchParams, RoPEParams};
 
 /// Weight storage format for matmul B operands.
@@ -282,6 +289,11 @@ pub enum ShaderEntry {
     BlockMatMul,
     BlockMatMulAT,
     BlockMatMulBT,
+    BlockMatMulTyped {
+        transpose_a: bool,
+        transpose_b: bool,
+        types: crate::codegen::MatrixTypes,
+    },
     /// Batch-major products: `[B, M, K] × [B, K, N] → [B, M, N]`.
     BatchMatMul,
     BatchMatMulAT,
@@ -318,6 +330,13 @@ pub enum ShaderEntry {
     ToF16,
     ToBF16,
     FromBF16,
+    /// Bounds-checked cooperative product with explicit storage/arithmetic.
+    MatMulTyped {
+        transpose_a: bool,
+        transpose_b: bool,
+        addend: bool,
+        types: crate::codegen::MatrixTypes,
+    },
     RoPE,
     RoPEGrad,
     LayerNorm,
@@ -385,6 +404,26 @@ pub enum ShaderEntry {
         stride: u32,
         output_bf16: bool,
     },
+    PackChannels {
+        dtype: crate::DType,
+        transpose: bool,
+    },
+    Conv2dPacked {
+        pass: crate::codegen::ConvolutionPass,
+        splits: u32,
+        kernel_h: u32,
+        kernel_w: u32,
+        stride: u32,
+        types: crate::codegen::MatrixTypes,
+    },
+    Conv2dGradientTyped {
+        weight_gradient: bool,
+        kernel_h: u32,
+        kernel_w: u32,
+        stride: u32,
+        splits: u32,
+        types: crate::codegen::MatrixTypes,
+    },
     Conv2dGradInputGemm,
     Conv2dGradInputGemmSmall,
     Conv2dGradInputGemm16,
@@ -450,11 +489,13 @@ impl ShaderEntry {
         match *self {
             ShaderEntry::Generated => "pointwise",
             ShaderEntry::MatMul
+            | ShaderEntry::MatMulTyped { .. }
             | ShaderEntry::MatMulAT
             | ShaderEntry::MatMulBT
             | ShaderEntry::BlockMatMul
             | ShaderEntry::BlockMatMulAT
             | ShaderEntry::BlockMatMulBT
+            | ShaderEntry::BlockMatMulTyped { .. }
             | ShaderEntry::BatchMatMul
             | ShaderEntry::BatchMatMulAT
             | ShaderEntry::BatchMatMulBT
@@ -481,6 +522,8 @@ impl ShaderEntry {
 
             ShaderEntry::Conv2dDw
             | ShaderEntry::Conv2dBF16 { .. }
+            | ShaderEntry::Conv2dPacked { .. }
+            | ShaderEntry::Conv2dGradientTyped { .. }
             | ShaderEntry::Conv2dGemm
             | ShaderEntry::Conv2dGemmSmall
             | ShaderEntry::Conv2dGemm16
@@ -547,6 +590,7 @@ impl ShaderEntry {
             | ShaderEntry::SplitA
             | ShaderEntry::SplitB
             | ShaderEntry::Permute
+            | ShaderEntry::PackChannels { .. }
             | ShaderEntry::CacheWrite
             | ShaderEntry::CacheWritePrefix
             | ShaderEntry::PrefixLast => "data_movement",
@@ -611,6 +655,15 @@ impl ShaderEntry {
             ShaderEntry::BlockMatMul => ShaderGroup::BlockMatMul,
             ShaderEntry::BlockMatMulAT => ShaderGroup::BlockMatMulAT,
             ShaderEntry::BlockMatMulBT => ShaderGroup::BlockMatMulBT,
+            ShaderEntry::BlockMatMulTyped {
+                transpose_a,
+                transpose_b,
+                types,
+            } => ShaderGroup::BlockMatMulTyped {
+                transpose_a,
+                transpose_b,
+                types,
+            },
             ShaderEntry::BatchMatMul => ShaderGroup::BatchMatMul,
             ShaderEntry::BatchMatMulAT => ShaderGroup::BatchMatMulAT,
             ShaderEntry::BatchMatMulBT => ShaderGroup::BatchMatMulBT,
@@ -636,6 +689,17 @@ impl ShaderEntry {
             ShaderEntry::ToF16 => ShaderGroup::ToF16,
             ShaderEntry::ToBF16 => ShaderGroup::ToBF16,
             ShaderEntry::FromBF16 => ShaderGroup::FromBF16,
+            ShaderEntry::MatMulTyped {
+                transpose_a,
+                transpose_b,
+                addend,
+                types,
+            } => ShaderGroup::MatMulTyped {
+                transpose_a,
+                transpose_b,
+                addend,
+                types,
+            },
             ShaderEntry::RoPE => ShaderGroup::RoPE,
             ShaderEntry::RoPEGrad => ShaderGroup::RoPEGrad,
             ShaderEntry::LayerNorm => ShaderGroup::LayerNorm,
@@ -667,11 +731,44 @@ impl ShaderEntry {
             ShaderEntry::Concat => ShaderGroup::Concat,
             ShaderEntry::SplitA | ShaderEntry::SplitB => ShaderGroup::Split,
             ShaderEntry::Permute => ShaderGroup::Permute,
+            ShaderEntry::PackChannels { dtype, transpose } => {
+                ShaderGroup::PackChannels { dtype, transpose }
+            }
+            ShaderEntry::Conv2dPacked {
+                pass,
+                splits,
+                kernel_h,
+                kernel_w,
+                stride,
+                types,
+            } => ShaderGroup::Conv2dPacked {
+                pass,
+                splits,
+                kernel_h,
+                kernel_w,
+                stride,
+                types,
+            },
             ShaderEntry::Upsample2x => ShaderGroup::Upsample,
             ShaderEntry::Upsample2xGrad => ShaderGroup::UpsampleGrad,
             ShaderEntry::Conv2dDw => ShaderGroup::Conv2dDw,
             ShaderEntry::MulPerChannel => ShaderGroup::MulPerChannel,
             ShaderEntry::Conv2dGemm => ShaderGroup::Conv2dGemm,
+            ShaderEntry::Conv2dGradientTyped {
+                weight_gradient,
+                kernel_h,
+                kernel_w,
+                stride,
+                splits,
+                types,
+            } => ShaderGroup::Conv2dGradientTyped {
+                weight_gradient,
+                kernel_h,
+                kernel_w,
+                stride,
+                splits,
+                types,
+            },
             ShaderEntry::Conv2dBF16 {
                 kernel_h,
                 kernel_w,
@@ -732,6 +829,7 @@ impl ShaderEntry {
             ShaderEntry::BlockMatMul
             | ShaderEntry::BlockMatMulAT
             | ShaderEntry::BlockMatMulBT
+            | ShaderEntry::BlockMatMulTyped { .. }
             | ShaderEntry::BatchMatMul
             | ShaderEntry::BatchMatMulAT
             | ShaderEntry::BatchMatMulBT => "main",
@@ -759,6 +857,7 @@ impl ShaderEntry {
             ShaderEntry::Embedding => "main",
             ShaderEntry::ToF16 => "main",
             ShaderEntry::ToBF16 | ShaderEntry::FromBF16 => "main",
+            ShaderEntry::MatMulTyped { .. } => "main",
             ShaderEntry::RoPE => "main",
             ShaderEntry::RoPEGrad => "main",
             ShaderEntry::LayerNorm => "main",
@@ -790,12 +889,14 @@ impl ShaderEntry {
             ShaderEntry::Concat => "main",
             ShaderEntry::SplitA => "split_a",
             ShaderEntry::Permute => "main",
+            ShaderEntry::PackChannels { .. } | ShaderEntry::Conv2dPacked { .. } => "main",
             ShaderEntry::SplitB => "split_b",
             ShaderEntry::Upsample2x => "main",
             ShaderEntry::Upsample2xGrad => "main",
             ShaderEntry::Conv2dDw => "main",
             ShaderEntry::MulPerChannel => "main",
             ShaderEntry::Conv2dGemm
+            | ShaderEntry::Conv2dGradientTyped { .. }
             | ShaderEntry::Conv2dBF16 { .. }
             | ShaderEntry::Conv2dGemmSmall
             | ShaderEntry::Conv2dGemm16
@@ -976,17 +1077,25 @@ fn norm_weight_grad_rows_per_workgroup(rows: u32) -> u32 {
 
 /// Order dependent dispatches, form barrier groups, then fuse within groups.
 pub fn schedule_dispatches(plan: &mut ExecutionPlan, serial: bool, fuse_horizontal: bool) {
-    reorder_by_level(&mut plan.dispatches);
+    plan.groups = schedule_sequence(&mut plan.dispatches, serial, fuse_horizontal);
+}
+
+fn schedule_sequence(
+    dispatches: &mut Vec<Dispatch>,
+    serial: bool,
+    fuse_horizontal: bool,
+) -> Vec<std::ops::Range<usize>> {
+    reorder_by_level(dispatches);
     let mut groups = if serial {
-        (0..plan.dispatches.len()).map(|i| i..i + 1).collect()
+        (0..dispatches.len()).map(|i| i..i + 1).collect()
     } else {
-        compute_groups(&plan.dispatches)
+        compute_groups(dispatches)
     };
     if fuse_horizontal {
-        fuse_horizontal_matmuls(&mut plan.dispatches, &mut groups);
+        fuse_horizontal_matmuls(dispatches, &mut groups);
     }
-    warn_on_hazards(&plan.dispatches, &groups);
-    plan.groups = groups;
+    warn_on_hazards(dispatches, &groups);
+    groups
 }
 
 /// Stable dependency ordering places independent dispatches next to each other.
@@ -1214,10 +1323,10 @@ pub struct Dispatch {
     /// Storage format of the B (weight) input buffer.
     #[serde(default)]
     pub weight_format: WeightFormat,
-    /// Explicit BF16 conversion boundaries folded into a generated pointwise
+    /// Explicit BF16 conversion boundaries folded into a generated scalar
     /// kernel. Scalar arithmetic remains F32. Never inferred from a timing.
     #[serde(default)]
-    pub pointwise_storage: crate::schedule::PointwiseStorage,
+    pub scalar_storage: crate::schedule::ScalarStorage,
 }
 
 /// Mutually exclusive implementations. Bindings and launch geometry live on
@@ -1226,6 +1335,7 @@ pub struct Dispatch {
 pub enum Kernel {
     #[default]
     Default,
+    ConvolutionReuse(crate::codegen::ConvolutionReuseShape),
     SmallTile,
     ScalarMatmul(crate::codegen::ScalarMatmulShape),
     SplitMatmul {
@@ -1270,6 +1380,9 @@ pub enum Kernel {
     },
     Pointwise(PointwiseDAG),
     Reduction(ReductionKernel),
+    Pool(crate::codegen::PoolKernel),
+    Image(crate::codegen::ImageKernel),
+    Copy(crate::codegen::CopyKernel),
     AttentionBackward {
         ept_cap: u32,
     },
@@ -1286,6 +1399,7 @@ impl Dispatch {
             | ShaderEntry::MatMulGemvAdd
             | ShaderEntry::FusedMatMulAdd => Some((a, c, b)),
             ShaderEntry::MatMulAT
+            | ShaderEntry::MatMulTyped { .. }
             | ShaderEntry::MatMulBT
             | ShaderEntry::MatMulGemvBT
             | ShaderEntry::MatMulGemvBTAdd
@@ -1297,6 +1411,7 @@ impl Dispatch {
             | ShaderEntry::BatchMatMul
             | ShaderEntry::BatchMatMulAT
             | ShaderEntry::BatchMatMulBT => Some((a, b, c)),
+            ShaderEntry::BlockMatMulTyped { .. } => Some((a, b, c)),
             _ => None,
         }
     }
@@ -1460,6 +1575,12 @@ pub struct ExecutionPlan {
 }
 
 impl ExecutionPlan {
+    pub fn fold_private_copies(&mut self) {
+        copy_composition::fold(self);
+    }
+    pub(crate) fn fold_image_views(&mut self) {
+        image_views::fold(self);
+    }
     /// The dispatches the plan runs, independent of their order and buffer
     /// numbering: each one's shader, kernel, parameters, grid, operand
     /// counts and fused prologue, epilogue, norm, weight format and
@@ -1616,7 +1737,7 @@ impl ExecutionPlan {
     /// derived parameters, inputs, constants, attention LSE side outputs,
     /// and every dispatch's extra outputs. A fusion pass may elide the write
     /// of an intermediate only when it is not one of these.
-    pub(crate) fn externally_visible_buffers(&self) -> std::collections::HashSet<BufferRef> {
+    fn graph_visible_buffers(&self) -> std::collections::HashSet<BufferRef> {
         let mut visible: std::collections::HashSet<BufferRef> =
             self.output_buffers.iter().copied().collect();
         visible.extend(self.loss_buffer);
@@ -1630,6 +1751,11 @@ impl ExecutionPlan {
         visible.extend(self.input_buffers.iter().map(|entry| entry.1));
         visible.extend(self.constant_buffers.iter().map(|entry| entry.0));
         visible.extend(self.lse_buffers.iter().map(|entry| entry.1));
+        visible
+    }
+
+    pub(crate) fn externally_visible_buffers(&self) -> std::collections::HashSet<BufferRef> {
+        let mut visible = self.graph_visible_buffers();
         for dispatch in &self.dispatches {
             visible.extend(dispatch.extra_outputs.iter().copied());
         }
@@ -1644,6 +1770,10 @@ impl ExecutionPlan {
             fuse_reduction_chains(&mut self);
             fuse_row_scaled_scatters(&mut self);
             bf16::fuse_boundaries(&mut self);
+            row_fusion::fuse(&mut self);
+            pool::fuse(&mut self);
+            image::fuse(&mut self);
+            row_fusion::fold_repeated_inputs(&mut self);
         }
         // RmsNorm+MatMul prologue fusion is applied later in the runtime,
         // after per-dispatch coop selection — the prologue path currently
@@ -2070,12 +2200,9 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
                 {
                     continue;
                 }
-                // Arity cap: the runtime binds pointwise pipelines via
-                // UnaryData (n=1), BinaryData (n=2), or TernaryData (n=3).
-                // A higher-arity fused DAG would need a wider layout we
-                // don't plumb yet.
+                // One output binding remains in addition to the input streams.
                 let new_arity = p.input_buffers.len() + c.input_buffers.len() - 1;
-                if new_arity > 3 {
+                if new_arity > PointwiseDAG::MAX_INPUTS as usize {
                     continue;
                 }
                 candidate = Some((slot_idx as u8, pi));
@@ -2105,14 +2232,7 @@ fn fuse_pointwise_chains(plan: &mut ExecutionPlan) {
             consumer_d.input_buffers = new_inputs;
             consumer_d.kernel = Kernel::Pointwise(fused_dag);
             consumer_d.origin.extend(producer_d.origin.iter().copied());
-            // The consumer now reads from more buffers; its ShaderEntry
-            // (used only to pick the data layout) must reflect the new
-            // arity. The runtime binds via UnaryData for n=1, BinaryData
-            // for n=2; arities >2 would need a wider layout we don't yet
-            // plumb. Guard against that.
-            // Update the sentinel `shader` so the (legacy) pipeline
-            // lookup still resolves — actual binding/pipeline come from
-            // the `pointwise` DAG's arity.
+            // The generated DAG supplies the actual pipeline and binding layout.
             consumer_d.shader = ShaderEntry::Generated;
 
             // Drop the producer dispatch.
@@ -2459,84 +2579,7 @@ fn fuse_reduction_chains(plan: &mut ExecutionPlan) {
         }
     }
 
-    loop {
-        let prot = protected(plan);
-        let (producer, reads) = scan(plan);
-        let mut fused = false;
-        'rows: for ci in 0..plan.dispatches.len() {
-            let c = &plan.dispatches[ci];
-            let Some(kernel) = c.reduction() else {
-                continue;
-            };
-            if c.fusion_barrier || kernel.gather_elem.iter().any(|&g| g) {
-                continue;
-            }
-            let outer = c.params[0];
-            let inner = c.params[1];
-            let per_elem = kernel.n_per_elem as usize;
-            for s in 0..per_elem {
-                if kernel.input_row_repeats.get(s).copied().unwrap_or(1) != 1 {
-                    continue;
-                }
-                let buf = c.input_buffers[s];
-                let Some(&ti) = producer.get(&buf) else {
-                    continue;
-                };
-                let t = &plan.dispatches[ti];
-                if ti >= ci
-                    || t.shader != ShaderEntry::Transpose
-                    || t.fusion_barrier
-                    || t.input_buffers.len() != 1
-                    || t.params[0] != inner
-                {
-                    continue;
-                }
-                let repeats = t.params[1];
-                let batch = t.workgroups[2];
-                if repeats <= 1 || batch.checked_mul(repeats) != Some(outer) {
-                    continue;
-                }
-                let expanded = t.input_buffers[0];
-                let Some(&bi) = producer.get(&expanded) else {
-                    continue;
-                };
-                let b = &plan.dispatches[bi];
-                if bi >= ti
-                    || b.fusion_barrier
-                    || !b.is_inner_broadcast()
-                    || b.input_buffers.len() != 1
-                    || b.params[1] != repeats
-                    || outer.checked_mul(inner) != b.params.first().copied()
-                {
-                    continue;
-                }
-                let input = b.input_buffers[0];
-                let origin = t
-                    .origin
-                    .iter()
-                    .chain(&b.origin)
-                    .copied()
-                    .collect::<Vec<_>>();
-                let c = &mut plan.dispatches[ci];
-                let kernel = c.reduction_mut().expect("checked");
-                kernel.input_row_repeats.resize(per_elem, 1);
-                kernel.input_row_repeats[s] = repeats;
-                c.input_buffers[s] = input;
-                c.origin.extend(origin);
-                if reads.get(&buf) == Some(&1) && !prot.contains(&buf) {
-                    plan.dispatches.remove(ti);
-                    if reads.get(&expanded) == Some(&1) && !prot.contains(&expanded) {
-                        plan.dispatches.remove(bi);
-                    }
-                }
-                fused = true;
-                break 'rows;
-            }
-        }
-        if !fused {
-            break;
-        }
-    }
+    row_fusion::fold_repeated_inputs(plan);
 }
 
 fn rmsnorm_kernel(cols: u32, eps: f32) -> ReductionKernel {
@@ -2604,7 +2647,8 @@ fn rmsnorm_kernel(cols: u32, eps: f32) -> ReductionKernel {
 fn is_plain_rmsnorm(dispatch: &Dispatch) -> bool {
     // The canonical generated norm only: after pointwise or gather fusion
     // the reduction differs, and a dedicated runtime shader cannot replace it.
-    dispatch.input_buffers.len() == 2
+    dispatch.scalar_storage == crate::schedule::ScalarStorage::default()
+        && dispatch.input_buffers.len() == 2
         && dispatch.params.len() >= 3
         && dispatch.reduction()
             == Some(&rmsnorm_kernel(
