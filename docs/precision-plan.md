@@ -182,6 +182,44 @@ profile supports the opportunity.
   All 16 searches finish in 30–34.1 seconds including setup. Timing covers
   forward, loss and backward; optimizer updates are verified separately.
 
+Dense derivative controls now separate multiplication precision from storage.
+They retain F32 inputs, outputs, accumulators, split partials and protection
+flags while explicitly testing the existing F16/BF16 kernels on saved layouts.
+Paired complete-model training changes, with fixed submission counts:
+
+| GPU | Model | Plain F16 | BF16 |
+| --- | --- | ---: | ---: |
+| B570 | SmolLM2 | -6.84% | -5.65% |
+| B570 | SmolVLA | +2.67% | +4.01% |
+| B570 | SD U-Net | -2.32% | -1.94% |
+| B570 | Whisper | rejected | -1.16% |
+| RTX 5070 | SmolLM2 | -10.74% | -3.68% |
+| RTX 5070 | SmolVLA | -8.27% | -4.35% |
+| RTX 5070 | SD U-Net | -1.45% | +0.08% |
+| RTX 5070 | Whisper | rejected | +61.91% |
+
+Plain F16 fails Whisper's unchanged maximum-gradient gate on both GPUs
+(1.963e-5 error, 7.696e-6 limit), so those candidates are not timed. The
+SmolLM2 F16 plans pass all 256 real-text updates on both GPUs against native
+and PyTorch F32 references. Six selected 32-update cases also pass: F16 for
+SmolVLA/SD on both cards, BF16 for Intel Whisper and scaled F16 for NVIDIA
+Whisper. Preserve the losing Intel SmolVLA timing beside its passing accuracy
+checks. These are saved-plan opportunities, not bounded-search results.
+
+- [x] Prototype per-K32 binary scaling with F32 bindings and accumulation.
+  Vectorization and single-factor restoration improve the prototype, but its
+  complete-model gains are smaller than plain F16 where plain F16 qualifies.
+  Scaled NVIDIA SmolLM2 improves 2.80% and passes 256 updates; Intel regresses.
+  Scanning once per partition is slower and fails a block-varying range fixture
+  that per-K32 scaling passes. Mixed-range stress still rejects per-K32 scaling;
+  the F32 baseline also fails the subnormal-input fixture. Retain all failures.
+- [ ] Add qualified measured derivative-input choices using the existing
+  kernels. Preserve ordinary F32 construction, strict policy, explicit precision
+  pins and the whole-gradient/trajectory gates; do not clear the blanket guard.
+  Verify fresh 30-second searches reach the gains without displacing stronger
+  layouts. Keep F32 fallbacks for rejected or slower models. No mixed-storage
+  profile or new backend capability API is justified by these measurements.
+
 Preserve these additional leads for follow-up:
 
 - Explicit F16 quantization before residual subtraction: a small GPU probe
