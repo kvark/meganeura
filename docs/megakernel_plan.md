@@ -114,9 +114,14 @@ the descriptor-reference repair requires fresh measurements.
   captures preserve exact state and show 1.924× warp instructions, 2.552× integer
   instructions and 62.28% barrier waiting among active warp cycles. SmolVLA
   ratios remain 1.489× forward and 1.375× training; parity is still unmet.
-- [ ] Prove complete-step immutability of input/weight allocations before
-  testing separate read-only access paths; keep canonical descriptor references
-  for all mutable storage and rerun both performance phases.
+- [x] Audit complete-step immutability, including optimizer writes and backing
+  allocation reuse. Test separate read-only tables with canonical references.
+  Handler variants improve forward but regress training; conservative shared
+  bindings show no useful gain. Preserve 200 exploratory paired comparisons,
+  register diagnostics and worker-count controls, and revert the probes.
+- [ ] Localize register spills and worker placement to distinguish handler
+  costs from occupancy and idle-worker interference before the next runtime
+  change. Keep compiler validation and both phases' acceptance gates intact.
 
 The Blade extension exposes binding inspection and runtime buffer-array binding
 in [commit 1bb5aef](https://github.com/kvark/blade/commit/1bb5aef0fea5fbc4249fdc40a7f1398f5c3ac012).

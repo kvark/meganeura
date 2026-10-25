@@ -837,10 +837,10 @@ local traffic above comes from the SDK counters.
 
 The measured gap still includes substantial extra integer/addressing and worker
 coordination work, with waiting workers contributing to barrier stalls. These
-counters do not isolate each handler's elapsed cost. The next useful experiment
-is to identify allocations that are never written during the complete step and
-test read-only loads for those inputs/weights, while retaining canonical
-references for every mutable allocation. Both phases must pass the same gates.
+counters do not isolate each handler's elapsed cost. The immutable-allocation
+experiments below did not improve both phases. The next diagnostic should
+localize register spills and worker placement before changing scheduling or
+resource access again. Retained changes must pass both phases' existing gates.
 
 Primary binaries, commands, hashes, cgroup identities, receipts and raw samples
 are in `target/megakernel-results/canonical-descriptors-paired/`; SDK records are
@@ -848,6 +848,62 @@ in `canonical-descriptors-sdk/`. All GPU jobs use separate bounded scopes and
 the shared GPU lock. No builds, profiling or analysis overlap primary timing.
 Library tests also execute GPU work: an earlier overlapping test attempt was
 followed by isolated library, focused and oracle reruns before these measurements.
+
+## Immutable allocations and occupancy follow-ups
+
+An audit at `4469a03` includes every appended optimizer command and every slice
+of a backing allocation. Forward has **147 immutable allocations out of 170**,
+totaling **399,576,768 bytes**. Training has only **13 out of 205**, totaling
+**187,056 bytes**, because optimizer updates make the weights mutable.
+
+A temporary implementation separated immutable and mutable descriptor tables,
+retaining one offset-zero descriptor per physical buffer and aliasing typed
+views within each table. Distinct immutable-binding masks required 18 forward
+handlers instead of 15, and 39 training handlers instead of 33. It preserved
+the mutable publication protocol and allowed private reads only for storage
+never written anywhere in the step.
+
+A second version conservatively demoted all allocations sharing a handler
+binding with mutable storage, propagating until no further demotions occurred.
+That retained one handler per kernel and one descriptor per buffer. It left
+137 immutable forward buffers (399,400,768 bytes) and three immutable training
+buffers (11,056 bytes).
+
+These are **exploratory** runs: 20 alternating pairs per phase, at least ten
+warmup pairs and one second of warmup, with the same completed-step boundary
+and full state comparison. They do not replace the 50-pair primary results.
+
+| Experiment | Forward persistent ms / paired ratio | Training persistent ms / paired ratio | Diagnostic registers, forward / training |
+|---|---:|---:|---:|
+| Immutable handler variants | 5.941 / 1.334 | 25.163 / 1.625 | 143 / 140 |
+| Immutable bindings shared by every invocation | 6.522 / 1.509 | 20.830 / 1.357 | 112 / 105 |
+| Original shader, 84 workers | 5.564 / 1.410 | 24.633 / 1.663 | Not recaptured |
+| Original shader, 256 workers, fresh control | 6.583 / 1.568 | 21.110 / 1.373 | Not recaptured |
+| Uniform broadcast inside each handler | 6.512 / 1.488 | 20.800 / 1.388 | 123 / 118 |
+
+All **200 comparisons** in these five completed trials pass; forward is exact
+and maximum training error is 4.66e-9. Each persistent step uses one dispatch
+and unchanged selected arithmetic. The variant trial's forward gain coincides
+with higher register use and a training regression. The 84-worker control
+has the same direction of tradeoff, making occupancy a plausible contributor;
+these runs do not establish SM placement or isolate a read-only-load benefit.
+Moving the uniform broadcast inside each selected handler increases registers
+and shows no useful gain. None of these implementation changes is retained.
+
+Two incomplete attempts are also recorded. The initial variant generator
+renamed a storage struct still referenced by its typed table; shader validation
+rejected it, and shared type declarations were preserved for the completed
+trial. A separate 64 KiB shared-memory reservation intended to constrain
+residency was rejected by the runtime's 48 KiB workgroup limit before dispatch.
+No admission or validation check was disabled.
+
+Patches, preserved binaries, samples, separate pipeline captures, cgroup logs
+and a hashed summary are in `target/megakernel-results/immutable-variants/`.
+GPU jobs were serialized in bounded scopes and their exits confirmed before
+the next GPU job. Builds and analysis did not overlap measurements. The
+published runtime and compiler pins remain the qualified canonical-descriptor
+implementation above; the rejected probes did not proceed to its full
+library/oracle/CI acceptance gate.
 
 ## Earlier artifact identities
 
