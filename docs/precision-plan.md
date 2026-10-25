@@ -3,7 +3,9 @@
 Updated October 25, 2026. First priority: let measured search retain reduced
 operand and activation storage, with F32 accumulation. Keep the staged F32
 candidate available and select by qualified complete-program time.
-Next: complete-plan cost estimates and matched Intel XPU/Vulkan GEMM analysis.
+Next: measured graph/precision retries and matched Intel XPU/Vulkan GEMM analysis.
+The complete-plan cost-ordering experiment is retained below with its regressions;
+its proposed ordering is not enabled.
 
 ## Survey complete
 
@@ -550,6 +552,60 @@ fresh-execution counts.
   allocation remains separate work; this does not establish a 3.65% automatic
   end-to-end improvement under the 30-second budget.
 
+  Budget follow-up: the saved Intel trace gives the F16 forward/AT/BT trial
+  zero private-tuning time when it reserves one later NN comparison. Its
+  parent receives 254.5 ms, completing the races that install two/four
+  partitions in those 90 GEMMs. The conservative comparison reserve is about
+  3.64 seconds per slot, while the prepared NN trial completes in 2.15 seconds.
+
+- [x] Test measured reservations for pending early arithmetic comparisons,
+  separately from graph-cost ordering. Keep the current comparison's conservative
+  reserve and estimate later comparisons from the median of the last three
+  fully sampled fresh-program costs, excluding private kernel probes and
+  submission-only comparisons. Cap that estimate at the original reserve;
+  empty history and no pending early programs retain the original allocation.
+  The common deadline, final checks and numerical/timing gates are unchanged.
+
+  Fresh 30-second SmolLM2 searches and independent 100-pair holdouts give:
+
+  | GPU | Parent training ms | Measured reserve ms | Change | Submissions |
+  | --- | ---: | ---: | ---: | --- |
+  | B570 | 41.179 | 39.969 | -2.94% | 1 / 1 |
+  | RTX 5070 | 15.495 | 15.753 | +1.67% | 16 / 8 |
+
+  Intel's F16 trial receives 570.3 ms for private tuning, spends 264.1 ms and
+  completes all eight kernel races, recovering two/four partitions in the 90
+  GEMMs. NVIDIA completes all fifteen races in both searches. Its selected
+  physical kernels and submission counts differ; at sixteen submissions for
+  both saved plans, a separate holdout gives 15.313→15.251 ms (-0.40%). Keep
+  the raw NVIDIA regression alongside this matched-count result. Other models'
+  prior traces have no pending early arithmetic program, so their allocation
+  is unchanged; no fresh whole-model performance claim is made for them.
+
+  Both selected winners pass all frozen 256 real-text updates, probe/held-out
+  losses and learning checks against native and PyTorch F32, with zero mismatched
+  steps under the unchanged bounds. All 685 unit tests pass with the explicit
+  NVIDIA adapter and all-target/all-feature lint passes. An existing default-
+  adapter calibration test intermittently reports no bandwidth measurement;
+  retain the failed and successful attempts separately, with no calibration
+  code change or claim that the issue is fixed. Investigate cold round-trip
+  subtraction in host timing before relying more heavily on those profiles.
+
+  The first, uncapped reservation prototype is retained separately: Intel
+  -3.01%, NVIDIA +1.20% at matched counts, with both 256-update gates passing.
+  The final capped prototype is commit `60d61aa`; evidence and complete source
+  snapshots remain in `measured-search-reserve-*`, including the `*-v2` search,
+  holdout and trajectory artifacts. Neither prototype changes submission policy.
+
+  A second search interaction appears in NVIDIA SD U-Net: a graph rejected
+  during its F32 comparison is not revisited promptly after F16/Winograd wins.
+  Another run selects that graph with reduced arithmetic and has a stronger
+  saved winner. Study graph-coordinate coverage per winning physical choice,
+  and normalize scalar layout ranks made obsolete by cooperative replacements.
+  If graph costs guide this retry, estimate the current physical/arithmetic
+  choice rather than only the original F32 seed. Do not replace this with an
+  unqualified forced graph or a model-name rule.
+
   All sixteen searches finish in 30.65–33.90 seconds including preparation.
   All 684 unit tests and all-target/all-feature Clippy pass. All six selected
   32-update synthetic trajectories pass, including real parameter updates and
@@ -732,6 +788,53 @@ fresh-execution counts.
   The current cost fallback charges multiply FLOPs only for dispatches with
   `mnk()`; attention otherwise contributes mostly buffer traffic. Account for
   attention work and staging before using this estimate to rank graph forms.
+
+  Work-accounting prototype: forward QK/PV and backward recomputation,
+  causal/prefix/window masks and GQA, row-tile operand reloads, batch/packed
+  multiplicity, convolution directions, Winograd's sixteen products, and extra
+  output bindings. Four CPU tests cover enumerated mask counts, independent
+  contraction directions, storage traffic and malformed parameters; lint passes.
+  A CPU-only audit covers sixteen saved model/GPU/mode plans. The raw
+  `mnk()` fallback omits 62.208 GFLOPs of attention in Whisper training; the
+  broader contraction count also exposes missing convolution/batch work in
+  SD U-Net. These are work counts, not measured gains or corrected absolute
+  latency predictions. Cache hits, softmax/SFU cost and shared-memory throughput
+  remain outside this coarse estimate; equal arithmetic can have different
+  tile performance, as the key-block measurements show.
+
+  A diagnostic compares existing order, old-estimate order and complete-estimate
+  order with the same engine, 30-second budget and qualification gates. The
+  first control also changed initial layout coverage and cannot establish a
+  production gain; preserve it in `complete-plan-cost-source-v1-initial-order-control`.
+  The corrected version tests that disabled ranking keeps coverage 0/1/2 even
+  when form priorities change, and checks those identities in the live SmolLM2
+  run. The corrected study completes 24 searches (three arms × four models ×
+  two GPUs, 29.94–33.80 seconds including preparation) and sixteen separate
+  paired holdouts. Every saved plan passes independent F32 and repeatability
+  checks before and after timing. No new training-trajectory claim is made.
+
+  | GPU / model | Old-estimate order | Complete-estimate order |
+  | --- | ---: | ---: |
+  | B570 SmolLM2 | -0.82% | -2.09% |
+  | RTX 5070 SmolLM2 | +0.49% | -0.14% |
+  | B570 SD U-Net | -0.83% | -0.93% |
+  | RTX 5070 SD U-Net | -2.40% | +7.43% |
+  | B570 Whisper | -1.82% | +0.16% |
+  | RTX 5070 Whisper | +0.33% | +0.95% |
+  | B570 SmolVLA | +7.85% | +6.41% |
+  | RTX 5070 SmolVLA | +0.05% | +0.04% |
+
+  Do not promote either ranking policy. NVIDIA SmolVLA's three physical plans
+  and submission counts are identical, supporting its neutral result. The
+  large regressions show that work accounting alone is insufficient: raw-F32
+  seed costs do not represent every later arithmetic choice or its kernel
+  throughput, and a rejected F32 graph can be missed after that choice changes.
+  Preserve the estimator as a prototype; investigate measured class costs and
+  physical-coordinate retries before changing production ordering. The separate
+  comparison-budget follow-up above targets a directly observed zero-allocation
+  case without these ranking changes. Evidence: `complete-plan-cost-*`, including
+  `complete-plan-cost-source-v2-qualified-controls`, and
+  `assess-complete-plan-cost.py`.
 
 The split-count regression above is not explained by missing coverage: both
 searches measure the two-partition candidate before their deadlines. In the
