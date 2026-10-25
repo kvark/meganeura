@@ -238,6 +238,44 @@ products and overflow/mixed-range cases, and serialize any admitted scaling
 as part of kernel identity. Raw controls and trajectories are archived in
 `static-dense-model-controls` and `static-dense-real-text` beside the survey.
 
+The same fixed scale also restores Whisper's rejected plain-F16 AT/BT gradient
+checks: all 28 changed products qualify before and after timing. At power 8,
+Intel improves 59.051 to 57.992 ms (1.79%), but NVIDIA regresses 18.989 to
+23.724 ms (24.93%); power 12 repeats these outcomes. The NVIDIA diagnostic
+forces the generic generator, so this does not isolate the cost of scaling
+from its specialized-kernel routing. Both variants also pass all 32 updates,
+parameter-change checks, loss curves and gradients at identical final F32 weights. Keep the regression; neither
+variant is admitted to search. Raw plans/samples and trajectory checks are in
+`static-transposed-model-controls` and `static-transposed-32gate`.
+A follow-up retains NVIDIA's specialized 16x16 generator while applying the
+same input scaling and one F32 restoration. It still qualifies before/after
+timing but regresses Whisper by 39.06% (19.044 to 26.482 ms); Intel repeats a
+1.68% gain. Thus bypassing NVIDIA's specialized generator does not explain the
+loss. Keep `static-native-model-controls` and the generic control separately;
+the losing NVIDIA variant has no additional trajectory/admission claim.
+
+A direct paired NN comparison starts from the same BF16-NN/F16-AT/BT plan and
+changes only NN to fixed-scale F16, retaining native specialization and the
+same submission counts (Intel 4, NVIDIA 8). Intel changes 39.234 to 39.133 ms
+(-0.26%); NVIDIA changes 15.644 to 15.596 ms (-0.31%). Both pass full gradient
+checks before/after timing. This small difference does not justify production
+scaling machinery and its range restrictions. Keep the qualified BF16 NN
+opportunity separate from #295's AT/BT admission; neither a new NN search
+coordinate nor static scaling is included in that PR. The native-specialized
+paired diagnostic has no extra trajectory/admission claim. Retain its plans,
+samples and assertions in `static-native-nn-paired-assessment.json`.
+
+The fixed scale is not generally range-safe: the finite cancellation fixture
+with magnitude-256 operands passes scalar F32 and ordinary F16/F32-accumulation
+on both GPUs, but scaling both inputs by 256 creates 1,024 nonfinite outputs.
+Tiny 1e-10 inputs still vanish at power 8, and extreme mixed-range/overflow
+fixtures fail. The F32 baseline also loses the subnormal fixture. Preserve
+these failures beside the model passes; a passing initial checkpoint does not
+guarantee validity after an arbitrary training distribution shift.
+The 74 isolated cases (37 per GPU) cover NN/AT/BT, aligned shapes and tails;
+all ordinary and zero cases pass. See `static-dense-probes-assessment.json`
+for every passing and failing numerical arm, including the F64 oracle.
+
 - [x] Separate automatic derivative protection from explicit precision pins:
   [PR #294](https://github.com/kvark/meganeura/pull/294). Ordinary construction
   keeps the combined F32 guard, including after extraction, fusion and splitting.
