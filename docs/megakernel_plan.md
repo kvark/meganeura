@@ -53,6 +53,16 @@ the qualified memory-ordering contract remains unchanged.
   with scalar accumulators while preserving arithmetic in both paths.
   Clean `36304a0` passes 250 new paired comparisons; SmolVLA ratios are now
   1.816× forward and 1.510× with SGD.
+- [x] Collect sequential single-pass SDK stall components with stable-clock,
+  instruction-rate and complete-state checks. Workgroup-barrier waiting rises
+  from 3.6% to 50.4% of active warp cycles; memory-barrier waiting is only 0.5%.
+  Separate scheduler waiting and inactive-lane costs before changing semantics.
+- [x] Test skipping inactive lanes' synchronization-free loops. The candidate
+  passes 664 library tests, 168 strict oracle tests and 250 paired comparisons;
+  SDK instruction and load counts fall, but full-step timing does not show a
+  useful improvement. Revert it and retain the evidence.
+- [ ] Investigate packing independent logical tiles into spare subgroups of a
+  physical worker, subject to scratch isolation and full barrier validation.
 - [ ] Isolate remaining queue/indexing/resource costs and reach baseline
   performance under the same full-step measurement and correctness gates. Keep this opt-in until performance justifies
   a default change.

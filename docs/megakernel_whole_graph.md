@@ -295,9 +295,10 @@ resource and scheduling improvements.
 A second SDK metric set measures instructions and memory transactions during
 the same state-checked forward replay. The script accepts `--metrics` for
 reproducible single-pass sets; exact metric names and commands are saved in
-each receipt. Stall-reason metrics require multiple passes on this device and
-cannot be collected by the SDK's standalone live sampler. No stall attribution
-is inferred from its failed configuration probes.
+each receipt. The SDK's derived stall percentages require multiple passes on
+this device and cannot be collected by its standalone live sampler. Individual
+raw stall components can be sampled in sequential single-pass groups, as
+described below; failed configuration probes are excluded from attribution.
 
 At the `58458d2` implementation, ordinary / persistent replay medians are
 3.785 / 7.988 ms. Counter rates multiplied by replay duration estimate the
@@ -346,6 +347,96 @@ also gave no useful speedup and made training compilation exceed four minutes.
 Claiming four tiles per queue operation regressed CI and SmolVLA and was
 reverted. Saved patches and exploratory paired records remain under `target/`;
 none of those experiments changes the published fence contract.
+
+## Warp waiting and synchronization
+
+The capture script also accepts repeated `--metric-group` arguments. Each group
+must fit one hardware pass; groups run sequentially during one longer resident
+replay. Every group retains its command, timestamps, raw CSV, 146 post-warmup
+samples and individual counter means. The target must remain resident through
+the last group and pass the same complete-state and arithmetic checks. These
+groups are not simultaneous measurements.
+
+On the `5fff909` implementation, 18 groups collect the raw active-warp rate and
+17 issue states. The L1TEX component of long-scoreboard waiting and the non-RT
+MIO component each fit one pass; their combined SDK metrics do not. Normalizing
+each raw rate by the first group's `smsp__warps_active.avg.per_second` gives:
+
+| Active warp-cycle state | Ordinary, % | Whole graph, 256 workers, % |
+|---|---:|---:|
+| Workgroup barrier | 3.623 | 50.447 |
+| Long scoreboard, L1TEX | 42.303 | 21.740 |
+| Fixed-latency wait | 12.913 | 9.749 |
+| MIO throttle, non-RT | 17.380 | 4.707 |
+| Short scoreboard | 4.032 | 4.460 |
+| Selected to issue | 9.402 | 3.929 |
+| No instruction | 0.588 | 0.950 |
+| Memory barrier | 0.000 | 0.493 |
+
+Clock and instruction-rate counters accompany every group. Their means vary by
+at most 0.67% from the across-group mean, and the 17 states sum to 100.001% /
+99.920%, supporting cross-window stability. Replay medians are 3.777 / 7.398 ms;
+both modes have the same forward-state hash listed above. Target and monitor
+exits succeed without SDK warnings. Receipts and the derived summary are in
+`target/megakernel-results/whole-graph-stalls-sdk/`. The executable is from the
+published implementation; source-status receipts disclose the modified capture
+script and an unrelated untracked configuration directory.
+
+These are **shares of active warp cycles, not shares of elapsed time**. NVIDIA
+defines barrier waiting as a warp waiting for sibling warps to reach the
+[workgroup barrier](https://docs.nvidia.com/nsight-graphics/UserGuide/shader-profiler.html).
+Here that includes both handler barriers and inactive workers/extra subgroups
+waiting for their leader or useful lanes. The data does not establish that
+removing barriers would recover half the runtime. The low memory-barrier and
+instruction-fetch shares argue against prioritizing another fence API change
+or instruction-cache optimization. The smaller long-scoreboard percentage also
+does not imply less absolute memory waiting: persistent execution has more
+active warp cycles per step. A leader's atomic or fence latency can still delay
+many waiting warps; a small aggregate memory-barrier share does not exclude
+that critical-path cost.
+
+A compact reproduction of the active, barrier and memory-barrier groups is:
+
+```sh
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json \
+python3 scripts/profile_smolvla_sdk.py --sdk /x/Tools/nsight-perf-sdk-2026.3 \
+  --output target/new-stall-capture --phase forward --workers 256 --whole-graph \
+  --metric-group smsp__warps_active.avg.per_second \
+    gpc__cycles_elapsed.avg.per_second sm__inst_executed_realtime.sum.per_second \
+  --metric-group smsp__warps_issue_stalled_barrier.avg.per_second \
+    gpc__cycles_elapsed.avg.per_second sm__inst_executed_realtime.sum.per_second \
+  --metric-group smsp__warps_issue_stalled_membar.avg.per_second \
+    gpc__cycles_elapsed.avg.per_second sm__inst_executed_realtime.sum.per_second
+```
+
+Further exploratory changes moved parameters into a uniform buffer, removed the
+native scratch-clear prefix, and resumed bitmap searches at the last successful
+word. Each passed short paired state comparisons but gave no useful full-step
+improvement and was reverted. The uniform-buffer SDK capture likewise showed no
+replay improvement and increased estimated integer-pipe instructions. These
+negative results narrow the remaining investigation without weakening the
+memory contract or changing ordinary arithmetic selection.
+
+An additional candidate guarded synchronization-free loops with the existing
+lane-activity predicate. It preserved calls containing barriers and loops that
+could return, then passed full Naga validation, 664 library tests, all 168 strict
+whole-graph oracle tests and 250 completed-step paired comparisons. SDK captures
+estimated 2.13× ordinary warp instructions and 1.81× global-load sectors, down
+from 2.88× / 2.69×. Complete forward state remained bitwise identical. However,
+the uninstrumented SmolVLA paired ratios were 1.798× forward (95% interval
+1.778–1.845) and 1.509× training (1.472–1.618), overlapping the published results
+below. CI ratios were 1.340× / 1.500× / 1.519×. The transformation was reverted
+because it did not establish a useful timing improvement. Its patch, binary
+hashes, raw samples and bootstrap summary are retained in
+`target/megakernel-results/masked-loops-paired/`; separate counters are in
+`target/megakernel-results/masked-loops-sdk/`.
+
+This also bounds the conclusion from excess instructions: many can be removed
+without recovering the elapsed-time gap. The next resource investigation is
+whether a physical worker can use spare subgroups for additional independent
+logical tiles. Such a change must preserve scratch isolation, arithmetic,
+workgroup-barrier uniformity and the existing completion/fence contract; the
+earlier rejected sequential four-tile batching does not provide this behavior.
 
 ## Latest completed-step measurement
 

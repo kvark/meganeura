@@ -31,7 +31,9 @@ def sha256(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
-def capture(repo, sdk, output, phase, workers, whole_graph=False, metrics=METRICS):
+def capture(repo, sdk, output, phase, workers, whole_graph=False, metric_groups=None):
+    metric_groups = metric_groups or [METRICS]
+    capture_seconds = max(10, 4 * len(metric_groups) + 4)
     mode = "ordinary" if workers is None else ("whole-" if whole_graph else "") + str(workers)
     prefix = output / mode
     binary = repo / "target/release/examples/bench_smolvla_train"
@@ -43,22 +45,30 @@ def capture(repo, sdk, output, phase, workers, whole_graph=False, metrics=METRIC
             env["MEGANEURA_WHOLE_GRAPH"] = "1"
     command = [str(binary), "--force", "--warmup", "10", "--runs", "20",
                "--profile-json", str(prefix), "--capture-phase", phase,
-               "--capture-seconds", "10"]
-    monitor_command = [str(sdk / "NvPerf/bin/x64/Monitoring"),
-                       "--metrics", ",".join(metrics),
-                       "--output-yaml", str(prefix) + ".yaml", "--csv",
-                       "--output-csv", str(prefix) + ".csv", "--csv-duration", "3",
-                       "-n", "0.02"]
+               "--capture-seconds", str(capture_seconds)]
+    monitor_groups = []
+    for index, metrics in enumerate(metric_groups):
+        group_prefix = str(prefix) + (f"-group-{index:02}" if len(metric_groups) > 1 else "")
+        monitor_groups.append({
+            "metrics": metrics, "prefix": group_prefix,
+            "command": [str(sdk / "NvPerf/bin/x64/Monitoring"),
+                        "--metrics", ",".join(metrics),
+                        "--output-yaml", group_prefix + ".yaml", "--csv",
+                        "--output-csv", group_prefix + ".csv", "--csv-duration", "3",
+                        "-n", "0.02"],
+        })
     receipt = {
-        "target_command": command, "monitor_command": monitor_command,
+        "target_command": command, "monitor_groups": monitor_groups,
         "source_revision": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
         "source_status": subprocess.check_output(
             ["git", "status", "--porcelain"], cwd=repo, text=True).strip(),
         "binary_sha256": sha256(binary),
         "benchmark_source_sha256": sha256(repo / "bench/bench_smolvla_train.rs"),
+        "capture_script_sha256": sha256(Path(__file__)),
         "environment": {k: v for k, v in env.items()
-                        if k.startswith("MEGANEURA_") or k == "VK_DRIVER_FILES"},
+                        if k.startswith("MEGANEURA_")
+                        or k in ("VK_DRIVER_FILES", "VK_ICD_FILENAMES")},
         "started_unix": time.time(),
     }
     log_path = Path(str(prefix) + ".log")
@@ -72,21 +82,44 @@ def capture(repo, sdk, output, phase, workers, whole_graph=False, metrics=METRIC
                     raise RuntimeError(f"Target did not become ready: {log_path}")
                 time.sleep(0.05)
             receipt["ready_unix"] = time.time()
-            capture_deadline = time.monotonic() + 9.5
+            capture_deadline = time.monotonic() + capture_seconds - 0.5
             time.sleep(1)
-            receipt["monitor_started_unix"] = time.time()
-            monitor_log = Path(str(prefix) + "-monitor.log")
-            with monitor_log.open("x") as log:
-                monitor = subprocess.run(monitor_command, env=env, cwd=output,
-                                         stdout=log, stderr=subprocess.STDOUT, timeout=20)
-            receipt["monitor_exit"] = monitor.returncode
-            receipt["monitor_finished_unix"] = time.time()
-            if (monitor.returncode or target.poll() is not None
-                    or time.monotonic() >= capture_deadline):
-                raise RuntimeError("SDK failed or collection exceeded the resident capture window")
-            if any(marker in monitor_log.read_text() for marker in ("WRN", "ERR")):
-                raise RuntimeError(f"SDK reported a warning/error: {monitor_log}")
-            receipt["target_exit"] = target.wait(timeout=30)
+            values_by_metric = {}
+            for index, group in enumerate(monitor_groups):
+                group["started_unix"] = time.time()
+                monitor_log = Path(group["prefix"] + "-monitor.log")
+                with monitor_log.open("x") as log:
+                    monitor = subprocess.run(group["command"], env=env, cwd=output,
+                                             stdout=log, stderr=subprocess.STDOUT, timeout=20)
+                group["exit"] = monitor.returncode
+                group["finished_unix"] = time.time()
+                if (monitor.returncode or target.poll() is not None
+                        or time.monotonic() >= capture_deadline):
+                    raise RuntimeError("SDK failed or collection exceeded the resident capture window")
+                if any(marker in monitor_log.read_text() for marker in ("WRN", "ERR")):
+                    raise RuntimeError(f"SDK reported a warning/error: {monitor_log}")
+                with Path(group["prefix"] + ".csv").open() as source:
+                    rows = list(csv.DictReader(source))[5:]
+                assert len(rows) >= 100, "Incomplete counter collection"
+                group["sample_count_after_warmup"] = len(rows)
+                group["counter_means"] = {}
+                for metric in group["metrics"]:
+                    column, = [key for key in rows[0] if key.split(" (")[0] == metric]
+                    values = [float(row[column]) for row in rows]
+                    assert all(math.isfinite(value) for value in values)
+                    group["counter_means"][metric] = statistics.mean(values)
+                    values_by_metric.setdefault(metric, []).extend(values)
+                print(f"{mode}: counter group {index + 1}/{len(monitor_groups)} collected", flush=True)
+            receipt["counter_means"] = {name: statistics.mean(values)
+                                         for name, values in values_by_metric.items()}
+            if len(monitor_groups) == 1:
+                group = monitor_groups[0]
+                receipt.update(monitor_command=group["command"], monitor_exit=group["exit"],
+                               monitor_started_unix=group["started_unix"],
+                               monitor_finished_unix=group["finished_unix"],
+                               counter_sample_count_after_warmup=group["sample_count_after_warmup"])
+            receipt["target_exit"] = target.wait(
+                timeout=max(30, capture_deadline - time.monotonic() + 30))
             if receipt["target_exit"]:
                 raise RuntimeError(f"Target failed state qualification: {log_path}")
             record = json.loads(Path(str(prefix) + f".{phase}.json").read_text())
@@ -99,17 +132,6 @@ def capture(repo, sdk, output, phase, workers, whole_graph=False, metrics=METRIC
                 if whole_graph:
                     assert execution["compute_dispatches"] == 1
             receipt["state_sha256"] = sha256(Path(str(prefix) + f".{phase}.state.bin"))
-            with Path(str(prefix) + ".csv").open() as source:
-                rows = list(csv.DictReader(source))[5:]
-            assert len(rows) >= 100, "Incomplete counter collection"
-            means = {}
-            for metric in metrics:
-                column, = [key for key in rows[0] if key.split(" (")[0] == metric]
-                values = [float(row[column]) for row in rows]
-                assert all(math.isfinite(value) for value in values)
-                means[metric] = statistics.mean(values)
-            receipt["counter_sample_count_after_warmup"] = len(rows)
-            receipt["counter_means"] = means
             receipt["diagnostic_capture_median_ms"] = statistics.median(record["capture_samples_ms"])
             return receipt, record
         finally:
@@ -127,18 +149,22 @@ def main():
     parser.add_argument("--phase", choices=("forward", "backward"), default="forward")
     parser.add_argument("--workers", type=int, nargs="+", default=[64, 256])
     parser.add_argument("--whole-graph", action="store_true")
-    parser.add_argument("--metrics", nargs="+", default=METRICS,
-                        help="SDK metric names that can be collected in one pass")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--metrics", nargs="+",
+                           help="SDK metric names that can be collected in one pass")
+    selection.add_argument("--metric-group", nargs="+", action="append",
+                           help="repeat for sequential single-pass sets during one resident replay")
     args = parser.parse_args()
+    metric_groups = args.metric_group or [args.metrics or METRICS]
     assert all(1 <= workers <= 65535 for workers in args.workers)
     assert len(set(args.workers)) == len(args.workers)
     repo = Path(__file__).resolve().parents[1]
     args.output.mkdir(parents=True, exist_ok=False)
     reference, reference_record = capture(repo, args.sdk.resolve(), args.output.resolve(), args.phase, None,
-                                          metrics=args.metrics)
+                                          metric_groups=metric_groups)
     for workers in args.workers:
         receipt, record = capture(repo, args.sdk.resolve(), args.output.resolve(), args.phase, workers,
-                                  args.whole_graph, args.metrics)
+                                  args.whole_graph, metric_groups)
         assert record["implementation_keys"] == reference_record["implementation_keys"]
         assert record["state_layout"] == reference_record["state_layout"]
         assert receipt["state_sha256"] == reference["state_sha256"], "Backend state differs"
