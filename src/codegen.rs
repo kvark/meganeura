@@ -8,6 +8,7 @@ use crate::compile::WeightFormat;
 
 mod coop_tiled;
 mod cooperative;
+pub(crate) mod graph;
 mod matrix_types;
 pub(crate) mod tile;
 pub(crate) mod winograd;

@@ -16,6 +16,7 @@ pub struct Options {
     pub warmup_ms: u64,
     pub diagnostics: bool,
     pub device_scheduling: bool,
+    pub whole_graph: bool,
 }
 
 impl Default for Options {
@@ -28,6 +29,7 @@ impl Default for Options {
             warmup_ms: 1000,
             diagnostics: false,
             device_scheduling: false,
+            whole_graph: false,
         }
     }
 }
@@ -46,6 +48,11 @@ impl Options {
             "--device-scheduling" => {
                 self.enabled = true;
                 self.device_scheduling = true;
+            }
+            "--whole-graph" => {
+                self.enabled = true;
+                self.device_scheduling = true;
+                self.whole_graph = true;
             }
             _ => return false,
         }
@@ -84,6 +91,7 @@ impl Options {
             allow_fallback: true,
             track_workers: self.diagnostics,
             device_scheduling: self.device_scheduling,
+            whole_graph: self.whole_graph,
         });
         config
     }

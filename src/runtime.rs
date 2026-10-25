@@ -2550,6 +2550,14 @@ impl<P: blade_graphics::ShaderBindable + Copy> blade_graphics::ShaderData for Bu
         }
         self.params.bind_to(&mut context, index);
     }
+
+    fn visit(&self, visitor: &mut dyn blade_graphics::ShaderDataVisitor) {
+        use blade_graphics::ShaderBindable;
+        for (index, buffer) in self.buffers.iter().enumerate() {
+            buffer.visit(visitor, index as u32);
+        }
+        self.params.visit(visitor, self.buffers.len() as u32);
+    }
 }
 
 /// Horizontal matmul bindings: every matrix in the pack, then `params`.
@@ -3448,6 +3456,7 @@ impl DebugStepReport {
 pub struct Session {
     persistent: Option<persistent::State>,
     optimizer_records: Vec<AppendedDispatch>,
+    optimizer_commands: Option<Vec<persistent::graph::Command>>,
     gpu: Arc<Gpu>,
     /// Per-logical-buffer view: `buffers[i]` backs `BufferRef(i)`, at its
     /// offset within its physical allocation. Aliased logical buffers share
@@ -4611,6 +4620,7 @@ impl Session {
             gpu,
             persistent,
             optimizer_records: Vec::new(),
+            optimizer_commands: None,
             buffers,
             physical_buffers,
             alias,
@@ -6302,6 +6312,7 @@ impl Session {
     /// Wait for any pending GPU work, including a caller submission reported
     /// through [`Session::track_submission`].
     pub fn wait(&mut self) {
+        let waited = self.external_sync_point.is_some() || self.sync_point.is_some();
         if let Some(sp) = self.external_sync_point.take() {
             let _span = tracing::info_span!("wait_external").entered();
             let _ = self.gpu.wait_for(&sp, !0);
@@ -6314,6 +6325,14 @@ impl Session {
                     .ok()
                     .flatten();
             log::debug!(target: "meganeura::submission", "wait complete");
+        }
+        if waited {
+            if let Some(ref mut state) = self.persistent {
+                if let Some(ref mut graph) = state.graph {
+                    graph.idle();
+                    state.report.scheduler_bytes = graph.bytes();
+                }
+            }
         }
     }
 
@@ -6333,6 +6352,7 @@ impl Session {
         self.encode_step(self.submission_chunks, self.profile_window.clone());
         log::debug!(target: "meganeura::submission", "submit final chunk, {} dispatches", self.plan.dispatches.len());
         self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+        self.mark_persistent_submitted();
     }
 
     /// Record one step — the same work as [`Session::step`] — into a
@@ -6412,8 +6432,22 @@ impl Session {
     /// host-side uploads and readbacks, and dropping the session wait for
     /// it. Only the latest submission needs reporting: submissions to one
     /// queue complete in order.
+    /// With whole-graph execution, report each submission before recording
+    /// later unsubmitted steps, so scheduler parameter lifetimes stay associated
+    /// with the submission that owns them.
     pub fn track_submission(&mut self, sync_point: blade_graphics::SyncPoint) {
         self.external_sync_point = Some(sync_point);
+        self.mark_persistent_submitted();
+    }
+
+    fn mark_persistent_submitted(&mut self) {
+        if let Some(ref mut graph) = self
+            .persistent
+            .as_mut()
+            .and_then(|state| state.graph.as_mut())
+        {
+            graph.submitted();
+        }
     }
 
     /// Record forward, backward and the optimizer into `self.encoder`, which
@@ -6427,6 +6461,30 @@ impl Session {
             self.require_optimizer_execution();
         }
         self.optimizer_records.clear();
+        if self
+            .persistent
+            .as_ref()
+            .is_some_and(|state| state.options.whole_graph)
+        {
+            assert_eq!(
+                chunks, 1,
+                "whole-graph execution requires one submission chunk"
+            );
+            self.optimizer_commands = Some(Vec::new());
+            self.encode_step_optimizer();
+            let commands = self.optimizer_commands.take().unwrap();
+            let state = self.persistent.as_mut().unwrap();
+            let graph = state.graph.as_mut().unwrap();
+            self.optimizer_records = graph
+                .prepare(&self.plan, &self.buffers, commands, true)
+                .expect("whole-graph recording");
+            graph.record(&mut self.encoder);
+            state.report.scheduler_bytes = graph.bytes();
+            if profile_window.is_some() {
+                self.profiled_pass_map.extend([None, Some(0)]);
+            }
+            return;
+        }
         if self.persistent.as_ref().is_some_and(|state| {
             state.reset(
                 &mut self.encoder,
@@ -6517,6 +6575,10 @@ impl Session {
             );
         }
 
+        self.encode_step_optimizer();
+    }
+
+    fn encode_step_optimizer(&mut self) {
         // Gradient clipping runs after backward and before the optimizer in
         // the same GPU submission. Global clipping measures the concatenated
         // gradient; AGC measures each parameter and its gradient separately.

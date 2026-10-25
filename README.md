@@ -174,6 +174,7 @@ an uninitialized model. See [compiler search](docs/compiler-search.md).
 | `MEGANEURA_PERSISTENT_WORKERS` | Opt in to persistent compute regions with 1–65535 workgroups per dispatch. Reports ordinary fallback and orders physical allocation reuse. |
 | `MEGANEURA_PERSISTENT_STRICT` | Reject ordinary fallback when persistent execution is selected. |
 | `MEGANEURA_DEVICE_SCHEDULING` | Use qualified Vulkan fences to schedule whole-operation dependencies inside persistent regions. Requires `MEGANEURA_PERSISTENT_WORKERS`; other backends report fallback or reject strict selection. |
+| `MEGANEURA_WHOLE_GRAPH` | Schedule the entire graph, including the step's optimizer, in one persistent compute dispatch. Requires `MEGANEURA_PERSISTENT_WORKERS` and `MEGANEURA_DEVICE_SCHEDULING`; rejects unsupported resources or imported allocations. See [the plan](docs/megakernel_plan.md). |
 | `MEGANEURA_NO_DEVICE_LOCAL` | Keep all buffers host-visible. |
 | `MEGANEURA_POISON` | Fill non-parameter buffers with NaN at session build, so reads of memory nothing wrote show up. |
 | `MEGANEURA_SERIAL_DISPATCH` | One compute pass per dispatch — serial execution for bisection. |

@@ -101,6 +101,13 @@ purposes and must not be conflated.
 
 ## Progress, completion and reuse
 
+The original regional queue below permits idle workers to retire. The optional
+[whole-graph pool](megakernel_whole_graph.md) instead keeps workers polling until
+the remaining-node count reaches zero; its bitmap contains ready nodes and each
+node has a tile-claim counter. It uses the same lane-level publication/visibility
+contract and orders physical allocation conflicts across every node, including
+optimizer phases. It does not add a global workgroup barrier.
+
 A worker searches the finite bitmap for any ready task. It never waits for a
 particular predecessor or slot. Session workers make at most 64 unsuccessful
 scan rounds before retiring, allowing short producer/consumer handoffs to retain

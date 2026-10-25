@@ -41,8 +41,16 @@ fn record_dispatch<D: bg::ShaderData>(
     label: &'static str,
     grid: [u32; 3],
     data: &D,
-    pass: &mut bg::ComputeCommandEncoder<'_>,
+    commands: &mut Option<Vec<super::persistent::graph::Command>>,
+    pass: &mut Option<bg::ComputeCommandEncoder<'_>>,
 ) {
+    if let Some(ref mut commands) = *commands {
+        commands.push(super::persistent::graph::Command::new(
+            entry, label, grid, data,
+        ));
+        return;
+    }
+    let pass = pass.as_mut().expect("optimizer encoder");
     let appended = persistent.and_then(|state| state.appended.as_ref());
     let record = appended.map_or_else(
         || super::AppendedDispatch::ordinary(&entry, label, grid),
@@ -471,7 +479,10 @@ impl Session {
         // will read.
         if let Some(scale) = self.grad_accum_scale {
             {
-                let mut pass = self.encoder.compute("grad_accum");
+                let mut pass = self
+                    .optimizer_commands
+                    .is_none()
+                    .then(|| self.encoder.compute("grad_accum"));
                 for unit in &units {
                     record_dispatch(
                         &self.pipelines,
@@ -491,6 +502,7 @@ impl Session {
                                 square: 0,
                             },
                         },
+                        &mut self.optimizer_commands,
                         &mut pass,
                     );
                 }
@@ -499,9 +511,11 @@ impl Session {
             // durable before the optimizer's separate passes read it.
             // Sharing one submission left a write/read hazard that
             // corrupted the accumulator on the apply step.
-            self.sync_point = Some(self.gpu.submit(&mut self.encoder));
-            self.wait();
-            self.encoder.start();
+            if self.optimizer_commands.is_none() {
+                self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+                self.wait();
+                self.encoder.start();
+            }
         }
 
         if clip {
@@ -515,7 +529,10 @@ impl Session {
         match update {
             None => {}
             Some(Update::Sgd { lr }) => {
-                let mut pass = self.encoder.compute("sgd_update");
+                let mut pass = self
+                    .optimizer_commands
+                    .is_none()
+                    .then(|| self.encoder.compute("sgd_update"));
                 for unit in &units {
                     record_dispatch(
                         &self.pipelines,
@@ -535,6 +552,7 @@ impl Session {
                                 _pad0: 0,
                             },
                         },
+                        &mut self.optimizer_commands,
                         &mut pass,
                     );
                 }
@@ -563,7 +581,10 @@ impl Session {
                         ),
                     };
 
-                let mut pass = self.encoder.compute("adam_update");
+                let mut pass = self
+                    .optimizer_commands
+                    .is_none()
+                    .then(|| self.encoder.compute("adam_update"));
                 for unit in &units {
                     record_dispatch(
                         &self.pipelines,
@@ -596,6 +617,7 @@ impl Session {
                                 one_minus_beta2: 1.0 - beta2,
                             },
                         },
+                        &mut self.optimizer_commands,
                         &mut pass,
                     );
                 }
@@ -612,7 +634,10 @@ impl Session {
 
         let slots: u32 = units.iter().map(|unit| unit.groups).sum();
         {
-            let mut pass = self.encoder.compute("grad_clip_norm_sq");
+            let mut pass = self
+                .optimizer_commands
+                .is_none()
+                .then(|| self.encoder.compute("grad_clip_norm_sq"));
             for unit in units {
                 record_dispatch(
                     &self.pipelines,
@@ -632,12 +657,16 @@ impl Session {
                             square: 1,
                         },
                     },
+                    &mut self.optimizer_commands,
                     &mut pass,
                 );
             }
         }
         {
-            let mut pass = self.encoder.compute("grad_clip_norm_total");
+            let mut pass = self
+                .optimizer_commands
+                .is_none()
+                .then(|| self.encoder.compute("grad_clip_norm_total"));
             record_dispatch(
                 &self.pipelines,
                 self.persistent.as_ref(),
@@ -656,11 +685,15 @@ impl Session {
                         square: 0,
                     },
                 },
+                &mut self.optimizer_commands,
                 &mut pass,
             );
         }
 
-        let mut pass = self.encoder.compute("grad_clip_scale");
+        let mut pass = self
+            .optimizer_commands
+            .is_none()
+            .then(|| self.encoder.compute("grad_clip_scale"));
         for unit in units {
             record_dispatch(
                 &self.pipelines,
@@ -680,6 +713,7 @@ impl Session {
                         square: 0,
                     },
                 },
+                &mut self.optimizer_commands,
                 &mut pass,
             );
         }
@@ -692,7 +726,10 @@ impl Session {
         let scales = self.agc_scales.expect("optimizer scratch");
 
         for (mode, label) in [(0u32, "agc_norms"), (1, "agc_factor"), (2, "agc_apply")] {
-            let mut pass = self.encoder.compute(label);
+            let mut pass = self
+                .optimizer_commands
+                .is_none()
+                .then(|| self.encoder.compute(label));
             for unit in units {
                 record_dispatch(
                     &self.pipelines,
@@ -722,6 +759,7 @@ impl Session {
                             _pad1: 0,
                         },
                     },
+                    &mut self.optimizer_commands,
                     &mut pass,
                 );
             }
@@ -734,6 +772,25 @@ impl Session {
         self.wait();
         self.optimizer_records.clear();
         self.encoder.start();
+        if self
+            .persistent
+            .as_ref()
+            .is_some_and(|state| state.options.whole_graph)
+        {
+            self.optimizer_commands = Some(Vec::new());
+            self.encode_optimizer(Some(update), false);
+            let commands = self.optimizer_commands.take().unwrap();
+            let state = self.persistent.as_mut().unwrap();
+            let graph = state.graph.as_mut().unwrap();
+            self.optimizer_records = graph
+                .prepare(&self.plan, &self.buffers, commands, false)
+                .expect("whole-graph optimizer recording");
+            graph.record(&mut self.encoder);
+            state.report.scheduler_bytes = graph.bytes();
+            self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+            self.mark_persistent_submitted();
+            return;
+        }
         if let Some(ref state) = self.persistent {
             state.reset_appended(&mut self.encoder);
         }

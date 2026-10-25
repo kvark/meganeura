@@ -4,15 +4,46 @@ Agreed direction, October 24, 2026. Implementation starts with **Milestone 1**,
 then proceeds to the **Naga investigation in Milestone 2**. The existing
 [prototype and measurements](megakernel.md) are the starting evidence.
 Milestone 1 is complete with explicit fallback and measured regressions.
-Milestone 2 qualifies the existing fence interface on Vulkan. Session device
-scheduling covers compatible regions of selected kernels. Appended optimizer,
-clipping and accumulation phases use portable persistent queues with their
-existing dispatch and submission boundaries.
+Milestone 2 qualifies the existing fence interface on Vulkan. The regional
+backend remains available for comparison. The next milestone now implements
+**one persistent worker pool for the entire graph**, including optimizer,
+clipping and accumulation nodes, in a single compute dispatch. This is selected
+with `PersistentOptions::whole_graph` or `MEGANEURA_WHOLE_GRAPH=1` together with
+device scheduling and a worker count. Ordinary execution remains the default.
 
 The [NVIDIA counter investigation](megakernel_performance_analysis.md) identifies
 fixed worker sizing and portable queue overhead as the leading SmolVLA costs.
-Per-region worker sizing precedes further atomic-interface optimization in the
-performance work; the qualified memory-ordering contract remains unchanged.
+Those measurements describe the regional implementation. Whole-graph execution
+has a different resource and scheduling cost and needs its own measurements;
+the qualified memory-ordering contract remains unchanged.
+
+## Whole-graph milestone
+
+- [x] Reuse and deduplicate the selected ordinary tile implementations, preserving
+  their arithmetic and logical geometry. Adapt smaller workgroups without
+  putting workgroup barriers behind lane-dependent control flow.
+- [x] Replace per-operation bind groups with typed buffer descriptor arrays and
+  immutable node parameters. Lift uniform parameters into function arguments so
+  Naga can still prove barrier uniformity. Pool shared scratch across handlers.
+- [x] Build a device queue over every graph node. Add physical RAW/WAR/WAW edges,
+  including lifetime reuse, and publish successors only after every producer
+  tile completes. Workers remain live until the graph completes.
+- [x] Capture the existing SGD, Adam/LaProp, clipping and accumulation bindings
+  into that same queue. `step()` performs a transfer reset and one compute
+  dispatch in one submission, with no intermediate accumulation submission.
+- [x] Preserve immutable parameters across external recordings; reuse metadata
+  only after the corresponding submission completes. Report total physical
+  compute dispatches separately from logical optimizer phases.
+- [x] Pass all 168 oracle tests with strict whole-graph selection, the six focused
+  queue/replay/optimizer tests, and broader ordinary-path regression checks.
+- [ ] Record fresh paired model benchmarks and the remaining cost with the
+  NVIDIA SDK. Keep this opt-in until performance justifies a default change.
+
+The Blade extension exposes binding inspection and runtime buffer-array binding
+in [commit 1bb5aef](https://github.com/kvark/blade/commit/1bb5aef0fea5fbc4249fdc40a7f1398f5c3ac012).
+No additional Naga atomic syntax or memory-semantics changes are required.
+Whole-graph selection rejects unsupported work instead of silently splitting
+the graph. See the [whole-graph contract and results](megakernel_whole_graph.md).
 
 Implementation is delivered in separate testable commits. The standalone
 prototype is the baseline; subsequent commits update the milestone checklist

@@ -9,6 +9,7 @@ use std::{
 };
 
 mod appended;
+pub(super) mod graph;
 
 /// Opt-in persistent execution of selected compute implementations as tiles.
 /// Compatible operations share a queue. Device scheduling additionally orders
@@ -25,6 +26,9 @@ pub struct PersistentOptions {
     /// Schedule dependent operations using native device memory fences.
     /// Requires the qualified Vulkan memory-model path; opt-in during qualification.
     pub device_scheduling: bool,
+    /// Run the entire compiled graph and step's optimizer in one dispatch.
+    /// Requires device scheduling and rejects unsupported work, even with fallback enabled.
+    pub whole_graph: bool,
 }
 
 impl Default for PersistentOptions {
@@ -34,6 +38,7 @@ impl Default for PersistentOptions {
             allow_fallback: true,
             track_workers: false,
             device_scheduling: false,
+            whole_graph: false,
         }
     }
 }
@@ -86,7 +91,7 @@ pub struct AppendedDispatch {
     pub logical_tasks: u64,
     /// Zero denotes an ordinary dispatch.
     pub workers: u32,
-    /// Appended phases currently retain hardware boundaries and portable queues.
+    /// True when this phase is a node of the same whole-graph dispatch.
     pub device_scheduled: bool,
     pub workgroup_shape: Option<[u32; 3]>,
     pub fallback_reason: Option<String>,
@@ -118,8 +123,11 @@ impl AppendedDispatch {
 pub struct ExecutionReport {
     pub persistent: Option<PersistentOptions>,
     pub regions: Vec<ExecutionRegion>,
-    /// Graph launches only; appended optimizer work is reported separately.
+    /// Dispatches containing compiled graph operations. With whole-graph mode,
+    /// the same dispatch can also contain the appended optimizer nodes.
     pub graph_dispatches: usize,
+    /// Total physical compute dispatches, including any runtime optimizer work.
+    pub compute_dispatches: usize,
     pub persistent_tasks: u64,
     pub scheduler_bytes: usize,
     pub appended: Vec<AppendedDispatch>,
@@ -156,6 +164,7 @@ pub(super) struct State {
     queue_offsets: Vec<usize>,
     pub groups: Vec<std::ops::Range<usize>>,
     pub appended: Option<appended::Appended>,
+    pub graph: Option<graph::Graph>,
 }
 
 struct Handler {
@@ -531,12 +540,18 @@ impl State {
     }
 
     pub fn pipeline(&self, index: usize) -> Option<&bg::ComputePipeline> {
+        if let Some(ref graph) = self.graph {
+            return graph.pipeline().map(|pipeline| &pipeline.raw);
+        }
         self.pipelines[self.dispatch_regions[index]]
             .as_ref()
             .map(|pipeline| &pipeline.raw)
     }
 
     pub fn pipeline_key(&self, index: usize) -> Option<&str> {
+        if let Some(ref graph) = self.graph {
+            return graph.pipeline_key();
+        }
         self.keys[self.dispatch_regions[index]].as_deref()
     }
 
@@ -557,6 +572,64 @@ impl State {
             "persistent workers must be in 1..=65535"
         );
         let caps = gpu.capabilities();
+        if options.whole_graph {
+            assert!(
+                options.device_scheduling,
+                "whole-graph workers require device scheduling"
+            );
+            assert!(
+                !external,
+                "whole-graph workers cannot prove aliasing of imported allocations"
+            );
+            let graph = graph::Graph::new(gpu, plan, options, dump_dir, coop_config)
+                .expect("whole-graph admission");
+            let tasks = plan.dispatches.iter().map(count).sum();
+            let regions = if plan.dispatches.is_empty() {
+                Vec::new()
+            } else {
+                vec![ExecutionRegion {
+                    dispatches: 0..plan.dispatches.len(),
+                    origin: plan
+                        .dispatches
+                        .iter()
+                        .flat_map(|d| d.origin.iter().copied())
+                        .collect(),
+                    label: "whole graph".into(),
+                    logical_tasks: tasks,
+                    worker_owned_chain: false,
+                    device_scheduled: true,
+                    workers: options.workers,
+                    workgroup_size: Some(graph.threads()),
+                    workgroup_shape: Some([graph.threads(), 1, 1]),
+                    fallback_reason: None,
+                }]
+            };
+            return Self {
+                gpu: Arc::clone(gpu),
+                options,
+                allow_chains,
+                groups: (0..regions.len()).map(|i| i..i + 1).collect(),
+                report: ExecutionReport {
+                    persistent: Some(options),
+                    graph_dispatches: regions.len(),
+                    compute_dispatches: regions.len(),
+                    regions,
+                    persistent_tasks: tasks,
+                    scheduler_bytes: 0,
+                    appended: Vec::new(),
+                    appended_fallback: Vec::new(),
+                },
+                pipelines: Vec::new(),
+                keys: Vec::new(),
+                params: Vec::new(),
+                dispatch_regions: Vec::new(),
+                queue: None,
+                initial_queue: None,
+                queue_offsets: Vec::new(),
+                appended: None,
+                graph: Some(graph),
+            };
+        }
         let mut queue_offsets = Vec::new();
         let mut queue_bytes = 0;
         let mut pipelines = Vec::new();
@@ -567,6 +640,7 @@ impl State {
             persistent: Some(options),
             regions: Vec::new(),
             graph_dispatches: 0,
+            compute_dispatches: 0,
             persistent_tasks: 0,
             scheduler_bytes: 0,
             appended: Vec::new(),
@@ -896,6 +970,7 @@ impl State {
             queue_offsets,
             groups,
             appended,
+            graph: None,
         }
     }
 
@@ -979,6 +1054,18 @@ impl Session {
         let Some(ref state) = self.persistent else {
             return Ok(());
         };
+        if let Some(ref graph) = state.graph {
+            if let Some(queue) = graph.queue() {
+                let mut words = vec![0u32; queue.size() as usize / 4];
+                self.read_staged_f32(
+                    queue.into(),
+                    bytemuck::cast_slice_mut(&mut words),
+                    &mut self.readback.borrow_mut(),
+                );
+                graph.check_completion(&words)?;
+            }
+            return Ok(());
+        }
         if state.initial_queue.is_some() {
             let queue = state.queue.expect("device graph queue");
             let mut words = vec![0u32; queue.size() as usize / 4];
@@ -1024,6 +1111,7 @@ impl Session {
     pub(crate) fn profiling_overhead_passes(&self) -> usize {
         usize::from(self.persistent.as_ref().is_some_and(|state| {
             state.queue.is_some()
+                || state.graph.is_some()
                 || (state.appended.as_ref().is_some_and(|a| a.queue().is_some())
                     && (self.grad_accum_scale.is_some()
                         || self.pending_lr.is_some()
@@ -1063,6 +1151,22 @@ impl Session {
         let state = self.persistent.as_ref()?;
         if !state.options.track_workers {
             return None;
+        }
+        if let Some(ref graph) = state.graph {
+            if !graph.has_graph() {
+                return None;
+            }
+            let queue = graph.queue()?;
+            let mut words = vec![0u32; queue.size() as usize / 4];
+            self.read_staged_f32(
+                queue.into(),
+                bytemuck::cast_slice_mut(&mut words),
+                &mut self.readback.borrow_mut(),
+            );
+            graph
+                .check_completion(&words)
+                .expect("whole-graph completion");
+            return Some(graph.worker_tasks(&words, false));
         }
         let queue = state.queue?;
         let mut words = vec![0u32; queue.size() as usize / 4];
@@ -1119,6 +1223,7 @@ impl Session {
                     })
                     .collect(),
                 graph_dispatches: self.plan.dispatches.len(),
+                compute_dispatches: self.plan.dispatches.len(),
                 persistent_tasks: 0,
                 scheduler_bytes: 0,
                 appended: Vec::new(),
@@ -1127,6 +1232,21 @@ impl Session {
             |state| state.report.clone(),
         );
         report.appended = self.optimizer_records.clone();
+        if self
+            .persistent
+            .as_ref()
+            .and_then(|state| state.graph.as_ref())
+            .is_some_and(|graph| !graph.has_graph())
+        {
+            report.regions.clear();
+            report.graph_dispatches = 0;
+            report.persistent_tasks = 0;
+        }
+        report.compute_dispatches = if report.persistent.is_some_and(|o| o.whole_graph) {
+            usize::from(report.graph_dispatches != 0 || !report.appended.is_empty())
+        } else {
+            report.graph_dispatches + report.appended.len()
+        };
         if self.persistent.as_ref().is_some_and(|state| {
             state
                 .appended
@@ -1159,6 +1279,9 @@ impl Session {
 
     pub(super) fn require_optimizer_execution(&self) {
         if let Some(ref state) = self.persistent {
+            if state.options.whole_graph {
+                return;
+            }
             if !state.options.allow_fallback && !self.plan.param_grad_pairs.is_empty() {
                 let appended = state.appended.as_ref().expect("optimizer queue admission");
                 assert!(
@@ -1177,6 +1300,19 @@ impl Session {
         let state = self.persistent.as_ref()?;
         if !state.options.track_workers || self.optimizer_records.is_empty() {
             return None;
+        }
+        if let Some(ref graph) = state.graph {
+            let queue = graph.queue()?;
+            let mut words = vec![0u32; queue.size() as usize / 4];
+            self.read_staged_f32(
+                queue.into(),
+                bytemuck::cast_slice_mut(&mut words),
+                &mut self.readback.borrow_mut(),
+            );
+            graph
+                .check_completion(&words)
+                .expect("whole-graph completion");
+            return Some(graph.worker_tasks(&words, true));
         }
         let appended = state.appended.as_ref()?;
         let queue = appended.queue()?;

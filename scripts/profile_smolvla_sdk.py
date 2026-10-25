@@ -31,14 +31,16 @@ def sha256(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
-def capture(repo, sdk, output, phase, workers):
-    mode = "ordinary" if workers is None else str(workers)
+def capture(repo, sdk, output, phase, workers, whole_graph=False):
+    mode = "ordinary" if workers is None else ("whole-" if whole_graph else "") + str(workers)
     prefix = output / mode
     binary = repo / "target/release/examples/bench_smolvla_train"
     env = {k: v for k, v in os.environ.items() if not k.startswith("MEGANEURA_")}
     if workers is not None:
         env.update(MEGANEURA_PERSISTENT_WORKERS=str(workers),
                    MEGANEURA_DEVICE_SCHEDULING="1", MEGANEURA_PERSISTENT_STRICT="1")
+        if whole_graph:
+            env["MEGANEURA_WHOLE_GRAPH"] = "1"
     command = [str(binary), "--force", "--warmup", "10", "--runs", "20",
                "--profile-json", str(prefix), "--capture-phase", phase,
                "--capture-seconds", "10"]
@@ -94,6 +96,8 @@ def capture(repo, sdk, output, phase, workers):
             if workers is not None:
                 assert all(r["workers"] and not r["fallback_reason"]
                            for r in execution["regions"])
+                if whole_graph:
+                    assert execution["compute_dispatches"] == 1
             receipt["state_sha256"] = sha256(Path(str(prefix) + f".{phase}.state.bin"))
             with Path(str(prefix) + ".csv").open() as source:
                 rows = list(csv.DictReader(source))[5:]
@@ -122,6 +126,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True, help="new local artifact directory")
     parser.add_argument("--phase", choices=("forward", "backward"), default="forward")
     parser.add_argument("--workers", type=int, nargs="+", default=[64, 256])
+    parser.add_argument("--whole-graph", action="store_true")
     args = parser.parse_args()
     assert all(1 <= workers <= 65535 for workers in args.workers)
     assert len(set(args.workers)) == len(args.workers)
@@ -129,7 +134,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     reference, reference_record = capture(repo, args.sdk.resolve(), args.output.resolve(), args.phase, None)
     for workers in args.workers:
-        receipt, record = capture(repo, args.sdk.resolve(), args.output.resolve(), args.phase, workers)
+        receipt, record = capture(repo, args.sdk.resolve(), args.output.resolve(), args.phase, workers, args.whole_graph)
         assert record["implementation_keys"] == reference_record["implementation_keys"]
         assert record["state_layout"] == reference_record["state_layout"]
         assert receipt["state_sha256"] == reference["state_sha256"], "Backend state differs"

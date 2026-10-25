@@ -28,6 +28,277 @@ fn validate(module: &Module) -> Result<naga::valid::ModuleInfo, String> {
     .map_err(|error| format!("callable tile validation: {error:?}"))
 }
 
+/// Extra physical lanes repeat a logical lane's calculations so that every
+/// invocation reaches the original workgroup barriers. Only the original lanes
+/// may modify shared/storage memory. The caller sets this private flag before
+/// entering a tile and supplies the original logical invocation geometry.
+pub(crate) fn mask_extra_lanes(mut tile: Tile, physical_threads: u32) -> Result<Tile, String> {
+    let logical_threads = tile.workgroup_size.into_iter().product::<u32>();
+    if physical_threads == logical_threads {
+        return Ok(tile);
+    }
+    if !physical_threads.is_multiple_of(logical_threads) {
+        return Err("physical worker size must be a multiple of each logical workgroup".into());
+    }
+    if tile.cooperative == Some(naga::CooperativeScope::Workgroup) {
+        return Err("workgroup cooperative tiles require their physical workgroup size".into());
+    }
+    let source = tile.source.replace("$PREFIX", PREFIX);
+    let mut module =
+        naga::front::wgsl::parse_str(&source).map_err(|error| error.emit_to_string(&source))?;
+    let info = validate(&module)?;
+    let bool_ty = module.types.insert(
+        Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::BOOL),
+        },
+        Span::UNDEFINED,
+    );
+    let active = module.global_variables.append(
+        naga::GlobalVariable {
+            name: Some(format!("{PREFIX}active_lane")),
+            space: AddressSpace::Private,
+            binding: None,
+            ty: bool_ty,
+            init: None,
+            memory_decorations: Default::default(),
+        },
+        Span::UNDEFINED,
+    );
+    for (handle, function) in module.functions.iter_mut() {
+        let pointer = function
+            .expressions
+            .append(Expression::GlobalVariable(active), Span::UNDEFINED);
+        let condition = function
+            .expressions
+            .append(Expression::Load { pointer }, Span::UNDEFINED);
+        mask_writes(&mut function.body, condition, &info[handle], &module.types)?;
+        let mut body = Block::new();
+        emit(&mut body, condition, condition);
+        body.extend_block(std::mem::take(&mut function.body));
+        function.body = body;
+    }
+    let mut names = HashMap::new();
+    for (index, (_, var)) in module.global_variables.iter_mut().enumerate() {
+        let original = var.name.clone().ok_or("unnamed tile global")?;
+        let temporary = format!("{PREFIX}adapted_global_{index}_value");
+        names.insert(temporary.clone(), original);
+        var.name = Some(temporary);
+    }
+    let info = validate(&module)?;
+    let source =
+        naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty())
+            .map_err(|error| format!("worker lane adaptation: {error}"))?;
+    tile.source = rename_tokens(&source, &names).replace(PREFIX, "$PREFIX");
+    Ok(tile)
+}
+
+pub(crate) fn rename_tokens(source: &str, names: &HashMap<String, String>) -> String {
+    let mut renamed = String::with_capacity(source.len());
+    let mut start = 0;
+    for (index, ch) in source.char_indices() {
+        if !ch.is_ascii_alphanumeric() && ch != '_' {
+            let token = &source[start..index];
+            renamed.push_str(names.get(token).map_or(token, String::as_str));
+            renamed.push(ch);
+            start = index + ch.len_utf8();
+        }
+    }
+    let token = &source[start..];
+    renamed.push_str(names.get(token).map_or(token, String::as_str));
+    renamed
+}
+
+/// Pass node uniforms as values whose caller obtains with workgroupUniformLoad.
+/// This retains uniform-control-flow proofs for barriers inside tile helpers.
+pub(crate) fn lift_uniforms(mut tile: Tile) -> Result<Tile, String> {
+    let source = tile.source.replace("$PREFIX", PREFIX);
+    let mut module =
+        naga::front::wgsl::parse_str(&source).map_err(|e| e.emit_to_string(&source))?;
+    let uniforms: Vec<_> = module
+        .global_variables
+        .iter()
+        .filter(|&(_, var)| var.space == AddressSpace::Uniform)
+        .map(|(handle, var)| (handle, var.ty, var.name.clone().unwrap()))
+        .collect();
+    for (_, function) in module.functions.iter_mut() {
+        let first_argument = function.arguments.len() as u32;
+        let mut roots = HashMap::new();
+        for (handle, expression) in function.expressions.iter() {
+            let root = match *expression {
+                Expression::GlobalVariable(global) => uniforms.iter().position(|u| u.0 == global),
+                Expression::Access { base, .. } | Expression::AccessIndex { base, .. } => {
+                    roots.get(&base).copied()
+                }
+                _ => None,
+            };
+            if let Some(root) = root {
+                roots.insert(handle, root);
+            }
+        }
+        let mut replacements = Vec::new();
+        for (handle, expression) in function.expressions.iter() {
+            match *expression {
+                Expression::GlobalVariable(_) if roots.contains_key(&handle) => {
+                    replacements.push((
+                        handle,
+                        Expression::FunctionArgument(first_argument + roots[&handle] as u32),
+                    ));
+                }
+                Expression::Load { pointer } if roots.contains_key(&pointer) => {
+                    let value = match function.expressions[pointer] {
+                        Expression::GlobalVariable(_) => {
+                            Expression::FunctionArgument(first_argument + roots[&pointer] as u32)
+                        }
+                        ref access => access.clone(),
+                    };
+                    replacements.push((handle, value));
+                }
+                _ => {}
+            }
+        }
+        for (handle, replacement) in replacements {
+            function.expressions[handle] = replacement;
+        }
+        let mut arguments = Vec::new();
+        for (i, &(_, ty, ref name)) in uniforms.iter().enumerate() {
+            function.arguments.push(FunctionArgument {
+                name: Some(format!("{name}_argument")),
+                ty,
+                binding: None,
+            });
+            arguments.push(function.expressions.append(
+                Expression::FunctionArgument(first_argument + i as u32),
+                Span::UNDEFINED,
+            ));
+        }
+        append_call_arguments(&mut function.body, &arguments);
+    }
+    let mut names = HashMap::new();
+    for (index, (_, var)) in module.global_variables.iter_mut().enumerate() {
+        let original = var.name.clone().ok_or("unnamed tile global")?;
+        let temporary = format!("{PREFIX}lifted_global_{index}_value");
+        names.insert(temporary.clone(), original);
+        var.name = Some(temporary);
+    }
+    let info = validate(&module)?;
+    let source =
+        naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty())
+            .map_err(|e| e.to_string())?;
+    tile.source = rename_tokens(&source, &names).replace(PREFIX, "$PREFIX");
+    if !uniforms.is_empty() {
+        let end = tile.call.rfind(')').ok_or("missing tile call arguments")?;
+        let values = uniforms
+            .iter()
+            .map(|u| u.2.replace(PREFIX, "$PREFIX"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        tile.call.insert_str(end, &format!(", {values}"));
+    }
+    Ok(tile)
+}
+
+fn append_call_arguments(block: &mut Block, values: &[Handle<Expression>]) {
+    for statement in block.iter_mut() {
+        match *statement {
+            Statement::Call {
+                ref mut arguments, ..
+            } => arguments.extend_from_slice(values),
+            Statement::Block(ref mut body) => append_call_arguments(body, values),
+            Statement::If {
+                ref mut accept,
+                ref mut reject,
+                ..
+            } => {
+                append_call_arguments(accept, values);
+                append_call_arguments(reject, values);
+            }
+            Statement::Switch { ref mut cases, .. } => {
+                for case in cases {
+                    append_call_arguments(&mut case.body, values);
+                }
+            }
+            Statement::Loop {
+                ref mut body,
+                ref mut continuing,
+                ..
+            } => {
+                append_call_arguments(body, values);
+                append_call_arguments(continuing, values);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn mask_writes(
+    block: &mut Block,
+    condition: Handle<Expression>,
+    info: &naga::valid::FunctionInfo,
+    types: &naga::UniqueArena<Type>,
+) -> Result<(), String> {
+    for statement in block.iter_mut() {
+        let mask = match *statement {
+            Statement::Block(ref mut inner) => {
+                mask_writes(inner, condition, info, types)?;
+                false
+            }
+            Statement::If {
+                ref mut accept,
+                ref mut reject,
+                ..
+            } => {
+                mask_writes(accept, condition, info, types)?;
+                mask_writes(reject, condition, info, types)?;
+                false
+            }
+            Statement::Switch { ref mut cases, .. } => {
+                for case in cases {
+                    mask_writes(&mut case.body, condition, info, types)?;
+                }
+                false
+            }
+            Statement::Loop {
+                ref mut body,
+                ref mut continuing,
+                ..
+            } => {
+                mask_writes(body, condition, info, types)?;
+                mask_writes(continuing, condition, info, types)?;
+                false
+            }
+            Statement::Store { pointer, .. } => matches!(
+                *info[pointer].ty.inner_with(types),
+                TypeInner::Pointer {
+                    space: AddressSpace::Storage { .. } | AddressSpace::WorkGroup,
+                    ..
+                } | TypeInner::ValuePointer {
+                    space: AddressSpace::Storage { .. } | AddressSpace::WorkGroup,
+                    ..
+                }
+            ),
+            Statement::CooperativeStore { .. } => true,
+            Statement::Atomic { .. }
+            | Statement::ImageAtomic { .. }
+            | Statement::ImageStore { .. } => {
+                return Err(
+                    "atomic/image tile side effects require an exact physical workgroup".into(),
+                );
+            }
+            _ => false,
+        };
+        if mask {
+            let write = std::mem::replace(statement, Statement::Break);
+            *statement = Statement::If {
+                condition,
+                accept: Block::from_vec(vec![write]),
+                reject: Block::new(),
+            };
+        }
+    }
+    Ok(())
+}
+
 fn zero_type(module: &mut Module, ty: Handle<Type>) -> Result<Handle<Type>, String> {
     match module.types[ty].inner {
         TypeInner::Scalar(Scalar {
@@ -383,18 +654,7 @@ pub(crate) fn from_module(source: &str, entry_point: &str) -> Result<Tile, Strin
     let source =
         naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty())
             .map_err(|error| format!("callable tile emission: {error}"))?;
-    let mut renamed = String::with_capacity(source.len());
-    let mut start = 0;
-    for (index, ch) in source.char_indices() {
-        if !ch.is_ascii_alphanumeric() && ch != '_' {
-            let token = &source[start..index];
-            renamed.push_str(global_names.get(token).map_or(token, String::as_str));
-            renamed.push(ch);
-            start = index + ch.len_utf8();
-        }
-    }
-    let token = &source[start..];
-    renamed.push_str(global_names.get(token).map_or(token, String::as_str));
+    let renamed = rename_tokens(&source, &global_names);
     Ok(Tile {
         source: renamed.replace(PREFIX, "$PREFIX"),
         call: format!("$PREFIXentry({})", arguments.join(", ")),

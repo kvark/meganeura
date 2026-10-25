@@ -43,7 +43,161 @@ fn check_worker_tasks(session: &mut meganeura::Session) {
 
 #[test]
 fn session_persistent_optimizer_tiles_preserve_training_state() {
+    check_optimizer_tiles(false);
+}
+
+#[test]
+fn session_whole_graph_optimizer_uses_one_dispatch() {
+    check_optimizer_tiles(true);
+}
+
+#[test]
+fn session_whole_graph_wait_preserves_unsubmitted_parameters() {
     let gpu = crate::support::gpu::gpu();
+    if !gpu.capabilities().device_memory_fence || !gpu.capabilities().binding_array {
+        return;
+    }
+    let mut graph = meganeura::Graph::new();
+    let p = graph.parameter("p", &[257]);
+    let x = graph.input("x", &[257]);
+    let loss = graph.mse_loss(p, x);
+    graph.set_outputs(vec![loss]);
+    let mut sessions: Vec<_> = [false, true]
+        .into_iter()
+        .map(|persistent| {
+            let mut config = crate::support::gpu::config();
+            config.runtime.persistent = persistent.then_some(meganeura::PersistentOptions {
+                workers: 3,
+                device_scheduling: true,
+                whole_graph: true,
+                allow_fallback: false,
+                track_workers: true,
+            });
+            let mut session = meganeura::build(&graph, config).0;
+            session.set_parameter("p", &vec![1.0; 257]);
+            session.set_input("x", &vec![0.5; 257]);
+            session
+        })
+        .collect();
+    for lr in [0.01, 0.02, 0.03] {
+        sessions[0].set_learning_rate(lr);
+        sessions[0].step();
+    }
+    sessions[0].wait();
+    let session = &mut sessions[1];
+    let mut first = gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
+        name: "submitted graph",
+        buffer_count: 1,
+        manual_barriers: false,
+    });
+    let mut later = gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
+        name: "pending graphs",
+        buffer_count: 1,
+        manual_barriers: false,
+    });
+    first.start();
+    session.set_learning_rate(0.01);
+    session.record(&mut first).unwrap();
+    session.track_submission(gpu.submit(&mut first));
+    later.start();
+    session.set_learning_rate(0.02);
+    session.record(&mut later).unwrap();
+    session.wait();
+    session.set_learning_rate(0.03);
+    session.record(&mut later).unwrap();
+    session.track_submission(gpu.submit(&mut later));
+    session.wait();
+    check_worker_tasks(session);
+    gpu.destroy_command_encoder(&mut first);
+    gpu.destroy_command_encoder(&mut later);
+    let mut expected = vec![0.0; 257];
+    let mut actual = expected.clone();
+    sessions[0].read_param("p", &mut expected);
+    sessions[1].read_param("p", &mut actual);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn session_whole_graph_mixes_128_and_256_lane_reductions() {
+    let gpu = crate::support::gpu::gpu();
+    if !gpu.capabilities().device_memory_fence || !gpu.capabilities().binding_array {
+        return;
+    }
+    let mut graph = meganeura::Graph::new();
+    let x = graph.input("x", &[37, 259]);
+    let w = graph.parameter("w", &[259]);
+    let b = graph.parameter("b", &[259]);
+    let norm = graph.layer_norm(x, w, b, 1e-5);
+    let pool = graph.global_avg_pool(norm, 37, 1, 259);
+    graph.set_outputs(vec![norm, pool]);
+    let plan = meganeura::compile::compile_with(
+        &graph,
+        &meganeura::CompileOptions {
+            fuse_dispatches: false,
+            ..Default::default()
+        },
+    );
+    for workers in [1, 64, 4096] {
+        let mut sessions: Vec<_> = [false, true]
+            .into_iter()
+            .map(|persistent| {
+                meganeura::Session::with_context_opts(
+                    plan.clone(),
+                    gpu.clone(),
+                    meganeura::SessionOptions {
+                        persistent: persistent.then_some(meganeura::PersistentOptions {
+                            workers,
+                            device_scheduling: true,
+                            whole_graph: true,
+                            track_workers: true,
+                            allow_fallback: false,
+                        }),
+                        poison: true,
+                        coop: meganeura::CoopPolicy::Disabled,
+                        ..meganeura::SessionOptions::from_env()
+                    },
+                )
+            })
+            .collect();
+        for replay in 0..3 {
+            for session in &mut sessions {
+                session.set_input(
+                    "x",
+                    &(0..37 * 259)
+                        .map(|i| ((i * 17 + replay * 19) % 113) as f32 / 16.0 - 3.0)
+                        .collect::<Vec<_>>(),
+                );
+                session.set_parameter(
+                    "w",
+                    &(0..259).map(|i| (i % 11) as f32 / 16.0).collect::<Vec<_>>(),
+                );
+                session.set_parameter(
+                    "b",
+                    &(0..259).map(|i| (i % 7) as f32 / 32.0).collect::<Vec<_>>(),
+                );
+                session.step();
+                check_worker_tasks(session);
+            }
+            assert_eq!(sessions[1].execution_report().compute_dispatches, 1);
+            for (index, len) in [37 * 259, 37].into_iter().enumerate() {
+                let mut expected = vec![0.0; len];
+                let mut actual = expected.clone();
+                sessions[0].read_output_by_index(index, &mut expected);
+                sessions[1].read_output_by_index(index, &mut actual);
+                assert_eq!(
+                    actual, expected,
+                    "workers={workers}, replay={replay}, output={index}"
+                );
+            }
+        }
+    }
+}
+
+fn check_optimizer_tiles(whole_graph: bool) {
+    let gpu = crate::support::gpu::gpu();
+    if whole_graph && !gpu.capabilities().binding_array {
+        return;
+    }
     let parameters = [("a", "x", 8193), ("b", "y", 1031), ("c", "z", 33)];
     let names = ["a", "b", "c"];
     let mut graph = meganeura::Graph::new();
@@ -57,6 +211,9 @@ fn session_persistent_optimizer_tiles_preserve_training_state() {
     let loss = graph.add(sum, losses[2]);
     graph.set_outputs(vec![loss]);
     for device_scheduling in [false, true] {
+        if whole_graph && !device_scheduling {
+            continue;
+        }
         if device_scheduling && !gpu.capabilities().device_memory_fence {
             continue;
         }
@@ -74,6 +231,7 @@ fn session_persistent_optimizer_tiles_preserve_training_state() {
                             track_workers: true,
                             allow_fallback: false,
                             device_scheduling,
+                            whole_graph,
                         });
                     let mut session = meganeura::build(&graph, config).0;
                     for (name, _, len) in parameters {
@@ -82,7 +240,7 @@ fn session_persistent_optimizer_tiles_preserve_training_state() {
                         session.set_parameter(name, &values);
                     }
                     session.set_adam_grouped_grad_norm("c", 3);
-                    session.set_submission_chunks(3);
+                    session.set_submission_chunks(if whole_graph { 1 } else { 3 });
                     session
                 })
                 .collect();
@@ -124,7 +282,7 @@ fn session_persistent_optimizer_tiles_preserve_training_state() {
                         _ => {}
                     }
                     session.set_profiling(stage == 3);
-                    if stage == 1 {
+                    if stage == 1 || stage == 3 {
                         let mut encoder =
                             gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
                                 name: "persistent training reset epochs",
@@ -150,6 +308,10 @@ fn session_persistent_optimizer_tiles_preserve_training_state() {
                 let ordinary = &sessions[0];
                 let selected = &sessions[1];
                 let report = selected.execution_report();
+                if whole_graph {
+                    assert_eq!(report.compute_dispatches, 1);
+                    assert!(report.appended.iter().all(|row| row.device_scheduled));
+                }
                 assert!(report.appended_fallback.is_empty());
                 assert!(
                     report
@@ -209,7 +371,19 @@ fn session_persistent_optimizer_tiles_preserve_training_state() {
 
 #[test]
 fn session_device_graphs_release_dependencies_across_worker_tiles() {
+    check_device_graphs(false);
+}
+
+#[test]
+fn session_whole_graph_releases_all_nodes() {
+    check_device_graphs(true);
+}
+
+fn check_device_graphs(whole_graph: bool) {
     let gpu = crate::support::gpu::gpu();
+    if whole_graph && !gpu.capabilities().binding_array {
+        return;
+    }
     if !gpu.capabilities().device_memory_fence {
         eprintln!("device graph fences are unsupported on this backend");
         return;
@@ -256,6 +430,7 @@ fn session_device_graphs_release_dependencies_across_worker_tiles() {
                 track_workers: workers == 3,
                 allow_fallback: false,
                 device_scheduling: true,
+                whole_graph,
             });
             let mut session = meganeura::build(&graph, config).0;
             let report = session.execution_report();
@@ -268,14 +443,16 @@ fn session_device_graphs_release_dependencies_across_worker_tiles() {
             };
             assert_eq!(
                 report.graph_dispatches,
-                if serial {
+                if whole_graph {
+                    1
+                } else if serial {
                     operations
                 } else {
                     operations.div_ceil(3)
                 }
             );
             assert!(report.regions.iter().all(|region| region.device_scheduled
-                == (region.dispatches.len() > 1 && case != 2)
+                == (whole_graph || (region.dispatches.len() > 1 && case != 2))
                 && !region.worker_owned_chain));
             assert_eq!(
                 report
@@ -318,7 +495,7 @@ fn session_device_graphs_release_dependencies_across_worker_tiles() {
                 if case == 3 {
                     session.set_input("empty", &[]);
                 }
-                session.set_submission_chunks(3);
+                session.set_submission_chunks(if whole_graph { 1 } else { 3 });
                 session.set_profiling(replay == 1);
                 if replay < 2 {
                     session.step();
@@ -383,6 +560,7 @@ fn session_device_graphs_release_dependencies_across_worker_tiles() {
                 device_scheduling: true,
                 allow_fallback: false,
                 track_workers: true,
+                whole_graph,
             }),
             ..meganeura::SessionOptions::from_env()
         };
@@ -426,6 +604,7 @@ fn session_persistent_tiles_use_normal_graph_storage_and_reset() {
             track_workers: workers == 3,
             device_scheduling: false,
             allow_fallback: false,
+            whole_graph: false,
         });
         let mut session = meganeura::build(&graph, config).0;
         let report = session.execution_report();
@@ -528,6 +707,7 @@ fn session_persistent_tiles_use_normal_graph_storage_and_reset() {
             track_workers: workers == 3,
             device_scheduling,
             allow_fallback: false,
+            whole_graph: false,
         });
         let mut session = meganeura::Session::with_context_opts(plan.clone(), gpu.clone(), options);
         let input: Vec<_> = (0..513).map(|i| (i % 17) as f32 - 8.0).collect();
@@ -573,6 +753,7 @@ fn session_persistent_regions_combine_independent_ragged_tasks() {
             track_workers: workers == 3,
             device_scheduling: false,
             allow_fallback: false,
+            whole_graph: false,
         });
         let mut session = meganeura::build(&graph, config).0;
         let report = session.execution_report();
@@ -675,6 +856,7 @@ fn session_persistent_regions_combine_independent_ragged_tasks() {
             track_workers: true,
             device_scheduling: false,
             allow_fallback: false,
+            whole_graph: false,
         });
         config
     };
@@ -782,6 +964,7 @@ fn session_persistent_regions_combine_independent_ragged_tasks() {
             track_workers: workers == 3,
             device_scheduling,
             allow_fallback: false,
+            whole_graph: false,
         });
         let mut session = meganeura::Session::with_context_opts(plan.clone(), gpu.clone(), options);
         assert_eq!(session.execution_dispatch_count(), 1);
@@ -810,7 +993,19 @@ fn session_persistent_regions_combine_independent_ragged_tasks() {
 
 #[test]
 fn session_persistent_lifetime_reuse_orders_physical_dependencies() {
+    check_lifetime_reuse(false);
+}
+
+#[test]
+fn session_whole_graph_lifetime_reuse() {
+    check_lifetime_reuse(true);
+}
+
+fn check_lifetime_reuse(whole_graph: bool) {
     let gpu = crate::support::gpu::gpu();
+    if whole_graph && !gpu.capabilities().binding_array {
+        return;
+    }
     let mut graph = meganeura::Graph::new();
     let x = graph.input("x", &[8193]);
     let a = graph.neg(x);
@@ -837,6 +1032,9 @@ fn session_persistent_lifetime_reuse_orders_physical_dependencies() {
     let mut ordinary =
         meganeura::Session::with_context_opts(plan.clone(), gpu.clone(), options.clone());
     for device_scheduling in [false, true] {
+        if whole_graph && !device_scheduling {
+            continue;
+        }
         if device_scheduling && !gpu.capabilities().device_memory_fence {
             continue;
         }
@@ -851,6 +1049,7 @@ fn session_persistent_lifetime_reuse_orders_physical_dependencies() {
                         device_scheduling,
                         allow_fallback: false,
                         track_workers: true,
+                        whole_graph,
                     }),
                     ..options.clone()
                 },
@@ -872,7 +1071,7 @@ fn session_persistent_lifetime_reuse_orders_physical_dependencies() {
                         && region.origin.contains(&c)
                 }));
             }
-            session.set_submission_chunks(3);
+            session.set_submission_chunks(if whole_graph { 1 } else { 3 });
             for replay in 0..3 {
                 let input: Vec<_> = (0..8193)
                     .map(|i| ((i * 17 + replay * 31) % 101) as f32 - 50.0)
@@ -937,6 +1136,7 @@ fn session_persistent_owned_chains_keep_tile_dependencies_local() {
             track_workers: workers == 3,
             device_scheduling: false,
             allow_fallback: false,
+            whole_graph: false,
         });
         let mut session = meganeura::Session::with_context_opts(plan.clone(), gpu.clone(), options);
         let report = session.execution_report();
@@ -1001,7 +1201,19 @@ fn session_persistent_owned_chains_keep_tile_dependencies_local() {
 
 #[test]
 fn session_persistent_selected_kernels_preserve_geometry_and_scratch() {
+    check_selected_kernels(false);
+}
+
+#[test]
+fn session_whole_graph_selected_geometry_and_scratch() {
+    check_selected_kernels(true);
+}
+
+fn check_selected_kernels(whole_graph: bool) {
     let gpu = crate::support::gpu::gpu();
+    if whole_graph && !gpu.capabilities().binding_array {
+        return;
+    }
     for attention in [false, true] {
         let (x_shape, a_shape, b_shape, output_lengths) = if attention {
             ([33, 64], [33, 32], [33, 32], [33 * 64; 3])
@@ -1049,6 +1261,9 @@ fn session_persistent_selected_kernels_preserve_geometry_and_scratch() {
             ordinary_options.clone(),
         );
         for device_scheduling in [false, true] {
+            if whole_graph && !device_scheduling {
+                continue;
+            }
             if device_scheduling && !gpu.capabilities().device_memory_fence {
                 continue;
             }
@@ -1062,6 +1277,7 @@ fn session_persistent_selected_kernels_preserve_geometry_and_scratch() {
                             device_scheduling,
                             allow_fallback: false,
                             track_workers: true,
+                            whole_graph,
                         }),
                         ..ordinary_options.clone()
                     },
@@ -1073,12 +1289,12 @@ fn session_persistent_selected_kernels_preserve_geometry_and_scratch() {
                         .iter()
                         .all(|region| region.workers == workers && region.fallback_reason.is_none())
                 );
-                assert!(
-                    report
-                        .regions
-                        .iter()
-                        .any(|region| region.workgroup_shape == Some([16, 16, 1]))
-                );
+                assert!(report.regions.iter().any(|region| region.workgroup_shape
+                    == Some(if whole_graph {
+                        [256, 1, 1]
+                    } else {
+                        [16, 16, 1]
+                    })));
                 assert_eq!(
                     report.regions.iter().any(|region| region.device_scheduled),
                     device_scheduling

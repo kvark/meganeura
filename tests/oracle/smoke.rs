@@ -139,9 +139,21 @@ fn persistent_execution_reports_actual_coverage() {
             device_scheduling: true,
             ..Default::default()
         }),
+        Some(meganeura::PersistentOptions {
+            workers: 3,
+            allow_fallback: false,
+            device_scheduling: true,
+            whole_graph: true,
+            ..Default::default()
+        }),
     ] {
         if persistent.is_some_and(|options| options.device_scheduling)
             && !gpu::shared_context().capabilities().device_memory_fence
+        {
+            continue;
+        }
+        if persistent.is_some_and(|options| options.whole_graph)
+            && !gpu::shared_context().capabilities().binding_array
         {
             continue;
         }

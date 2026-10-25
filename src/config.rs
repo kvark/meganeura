@@ -156,6 +156,8 @@ registry! {
         "Reject ordinary fallback when persistent execution is selected.";
     DEVICE_SCHEDULING: "MEGANEURA_DEVICE_SCHEDULING", Bool, Diagnostic,
         "Use qualified native fences to schedule dependencies inside persistent regions.";
+    WHOLE_GRAPH: "MEGANEURA_WHOLE_GRAPH", Bool, Diagnostic,
+        "Schedule the entire graph and optimizer in one persistent dispatch; requires device scheduling.";
     POISON: "MEGANEURA_POISON", Bool, Diagnostic,
         "Fill every non-parameter buffer with NaN at session build, so a kernel that reads memory nothing wrote produces NaN instead of a plausible zero.";
     NO_DEVICE_LOCAL: "MEGANEURA_NO_DEVICE_LOCAL", Bool, Diagnostic,
@@ -355,6 +357,7 @@ impl SessionOptions {
                     workers,
                     allow_fallback: !PERSISTENT_STRICT.bool_or(false),
                     device_scheduling: DEVICE_SCHEDULING.bool_or(false),
+                    whole_graph: WHOLE_GRAPH.bool_or(false),
                     ..Default::default()
                 }),
             coop,

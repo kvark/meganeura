@@ -70,8 +70,8 @@ profiler = ["dep:tracing-subscriber"]
 
 [dependencies]
 # FP16 denormal preservation: https://github.com/kvark/blade/pull/416.
-blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "5011dea27d0df487196ab279ef53a93aaef2607b" }
-blade-macros = "0.3"
+blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "1bb5aef0fea5fbc4249fdc40a7f1398f5c3ac012" }
+blade-macros = { version = "0.3", git = "https://github.com/kvark/blade", rev = "1bb5aef0fea5fbc4249fdc40a7f1398f5c3ac012" }
 # Reuse selected compute implementations as persistent callable tiles.
 naga = { git = "https://github.com/kvark/wgpu", rev = "f09d62e54d743f89879e4e8dfb32e717146f2670", version = "30", default-features = false, features = ["wgsl-in", "wgsl-out"] }
 # `default-features = false` drops egglog's `bin` stack (clap, mimalloc,
