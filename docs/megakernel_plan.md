@@ -93,6 +93,11 @@ the qualified memory-ordering contract remains unchanged.
   retain the straight-line handler for small initial grids. Pass 665 library,
   168 strict oracle and seven focused tests, including a partial 1,025-tile
   optimizer chunk followed by small chunks sharing the handler.
+- [x] Qualify large-grid batching with 250 final paired comparisons and a fresh
+  100-comparison run of the prior runtime. SmolVLA training medians are 20.965 ms
+  and 21.552 ms; normalized intervals overlap. Preserve the uncertainty and
+  leave baseline parity open. Small CI training avoids the unrestricted
+  batching prototype's regression.
 - [ ] Isolate remaining queue/indexing/resource costs and reach baseline
   performance under the same full-step measurement and correctness gates. Keep this opt-in until performance justifies
   a default change.

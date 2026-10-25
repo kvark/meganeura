@@ -719,6 +719,46 @@ the short correctness probes. Patches and receipts are
 `target/{parameter-hint-probe,readonly-primary-smolvla,fence-visibility-smolvla}.{json,log}`.
 All jobs used separate bounded cgroups and local storage.
 
+## Large SGD claim batches
+
+The first four-tile SGD prototype batches every grid. All seven focused tests
+and 250 paired comparisons pass, but small CI training regresses to 0.1108 ms
+from the published 0.1008 ms. Restricting the transformation to large initial
+grids removes that regression. Sixteen-tile claims offer little further benefit
+in short SmolVLA probes, so the retained width is four. The selected SGD body,
+element arithmetic and graph submission count remain unchanged.
+
+At **`b23d422`**, all **250 final comparisons** pass with the same 50-pair,
+256-worker protocol and isolated measurements. Forward and CI comparisons are
+exact; maximum SmolVLA training error is 4.66e-9. Every selected case reports one
+compute dispatch and no fallback, with identical plans and arithmetic selection.
+All 665 library tests (eight ignored), 168 strict whole-graph oracle tests,
+seven focused tests, formatting and strict all-target/all-feature Clippy pass.
+
+| Workload | Ordinary median, ms | Persistent median, ms | Paired ratio | 95% bootstrap interval |
+|---|---:|---:|---:|---:|
+| SmolVLA forward | 4.441 | 6.510 | 1.465 | 1.453–1.474 |
+| SmolVLA forward/backward/SGD | 15.129 | 20.965 | 1.390 | 1.378–1.608 |
+| CI inference | 0.05213 | 0.07008 | 1.343 | 1.338–1.351 |
+| CI forward/backward | 0.06603 | 0.10120 | 1.533 | 1.519–1.538 |
+| CI forward/backward/SGD | 0.06737 | 0.10095 | 1.498 | 1.483–1.519 |
+
+A fresh, separate checkout of the prior runtime (`3628005`) passes another
+100 SmolVLA comparisons under the same protocol. Its forward median is 6.497 ms
+(1.475× ordinary, interval 1.463–1.507), and training is 21.552 ms
+(1.424×, 1.400–1.453). Large-grid batching lowers the observed training median
+by 2.7%; the paired-ratio intervals overlap, and these separate runs do not
+establish a statistically isolated speedup. The small-grid penalty is avoided,
+and the transformation reduces large SGD queues to roughly one claim per four
+logical tiles. **Baseline parity remains unmet.**
+
+The qualified executables, source/binary hashes, commands, cgroup identities,
+successful exits, raw samples and summaries are under
+`target/megakernel-results/sgd-large-paired/`; the contemporary comparison is in
+`sgd-contemporary-baseline/`. Both use clean tracked source. Prototype records
+are `sgd-batch4-paired/` and `target/sgd-batch{,16}-smolvla.{json,log}`. All
+measurements exclude profiling, builds and concurrent analysis.
+
 ## Earlier artifact identities
 
 All records remain on local storage at
