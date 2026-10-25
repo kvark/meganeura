@@ -492,8 +492,30 @@ fresh-execution counts.
   optimizer writes on shared storage, retuning and lifetime/memory-budget
   behavior against fresh F32 references before admitting caching. Keep the
   existing mutable/sharing API behavior; inference alone is not immutability.
-  Measure
-  device-local and host-visible placement independently.
+  Measure device-local and host-visible placement independently.
+
+  A diagnostic coherent F16 mirror now retains F32 master parameters. Private
+  half buffers are pinned for the session lifetime; tracked CPU writes advance
+  the shared physical owner's generation. Possible GPU/external writers and
+  caller-recorded steps refresh in queue order. A cache stamp is committed only
+  after submission; source/destination ownership and offsets distinguish rebinding.
+  All 48 coherence cases pass on both GPUs and both mirror placements: uploads
+  through both APIs, checkpoint restore, sharing/rebinding/drop, reverse-order
+  recorded submissions, published/external GPU writes, shared optimizer writes,
+  retuning, concatenated derived uploads, packed-source exclusion, serialization,
+  budget rejection and persistent scratch/alias-region checks.
+
+  Matched SmolLM2 inference holdouts pass before/after timing. On the selected
+  Intel plan, 8.081 to 7.255 ms improves 10.23%; on NVIDIA's selected F32-storage
+  plan, 3.691 to 3.299 ms improves 10.64%. Both retain their submission counts.
+  The 181 mirrors occupy an extra 268.96 MB; counters confirm exactly one fill
+  per mirror across warmup/timing. The separate forced-private-storage control
+  also improves about 10% on NVIDIA, but has a weaker baseline; keep it separate.
+  The first prototype adds 181 allocations. Packing into a few persistent
+  aligned chunks is in progress, with the same coherence checks repeated for
+  the changed allocation. Placement and other model measurements are pending;
+  no bounded-search or production admission is claimed yet. Sources, checks
+  and samples are in `coherent-weight-*` and `coherent-weight-source-v1`.
 
 ## 3. Intel loading and tile geometry
 
