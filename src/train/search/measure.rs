@@ -224,16 +224,30 @@ fn comparison_exceeds_deadline(
         .is_some_and(|&cost| elapsed + cost > max_time)
 }
 
+fn future_comparison_reserve(costs: &VecDeque<Duration>, fallback: Duration) -> Duration {
+    let mut costs: Vec<_> = costs.iter().copied().collect();
+    costs.sort_unstable();
+    costs
+        .get(costs.len() / 2)
+        .copied()
+        .unwrap_or(fallback)
+        .min(fallback)
+}
+
 fn kernel_probe_budget(
     available: Duration,
     comparison: Duration,
     early_programs: usize,
+    future_comparison: Duration,
 ) -> Duration {
     let slots = early_programs.saturating_add(1).min(u32::MAX as usize) as u32;
-    // Keep comparison time for this trial and each early alternative, then
-    // share only the remaining private-probe time. The final qualification
-    // reservation has already been subtracted from `available` by the caller.
-    available.saturating_sub(comparison.saturating_mul(slots)) / slots
+    // Keep the current comparison's conservative bound. Forecast later fresh
+    // programs from completed comparisons, excluding private kernel probing.
+    // The common deadline and final numerical checks still govern admission.
+    available
+        .saturating_sub(comparison)
+        .saturating_sub(future_comparison.saturating_mul(slots - 1))
+        / slots
 }
 
 pub(super) fn select(
@@ -286,6 +300,7 @@ pub(super) fn select(
     let mut tuning = options.tuning.clone();
     // Recent complete comparisons, without their private kernel probes.
     let mut comparison_costs = VecDeque::new();
+    let mut fresh_comparison_costs = VecDeque::new();
     // Nothing executed since the incumbent's last qualification.
     let mut incumbent_checked = false;
     let mut incumbent_origin = None;
@@ -447,6 +462,10 @@ pub(super) fn select(
                         search_time.saturating_sub(start.elapsed()),
                         trial.comparison_time_reserved,
                         trial.early_programs_reserved,
+                        future_comparison_reserve(
+                            &fresh_comparison_costs,
+                            trial.comparison_time_reserved,
+                        ),
                     ));
                     trial.kernel_tuning = Some(
                         candidate
@@ -596,8 +615,16 @@ pub(super) fn select(
                 .kernel_tuning
                 .as_ref()
                 .map_or(Duration::ZERO, |t| t.elapsed);
-            comparison_costs
-                .push_back((trial.lowering_time + trial.outcome.elapsed).saturating_sub(probes));
+            let cost = (trial.lowering_time + trial.outcome.elapsed).saturating_sub(probes);
+            comparison_costs.push_back(cost);
+            // Submission-count probes usually reuse a CPU-qualified plan and
+            // are cheaper than a fresh graph/arithmetic program.
+            if program.submission_chunks.is_none() {
+                fresh_comparison_costs.push_back(cost);
+                if fresh_comparison_costs.len() > 3 {
+                    fresh_comparison_costs.pop_front();
+                }
+            }
             if comparison_costs.len() > 3 {
                 comparison_costs.pop_front();
             }
@@ -1641,22 +1668,55 @@ mod tests {
     #[test]
     fn early_arithmetic_shares_probe_time_and_reserves_its_comparisons() {
         let seconds = Duration::from_secs;
-        assert_eq!(kernel_probe_budget(seconds(30), seconds(2), 0), seconds(28));
-        assert_eq!(kernel_probe_budget(seconds(30), seconds(2), 2), seconds(8));
         assert_eq!(
-            kernel_probe_budget(seconds(5), seconds(2), 2),
+            kernel_probe_budget(seconds(30), seconds(2), 0, seconds(2)),
+            seconds(28)
+        );
+        assert_eq!(
+            kernel_probe_budget(seconds(30), seconds(2), 2, seconds(2)),
+            seconds(8)
+        );
+        assert_eq!(
+            kernel_probe_budget(seconds(5), seconds(2), 2, seconds(2)),
             Duration::ZERO
         );
         assert_eq!(
-            kernel_probe_budget(seconds(30), Duration::ZERO, 2),
+            kernel_probe_budget(seconds(30), Duration::ZERO, 2, Duration::ZERO),
             seconds(10)
         );
         assert_eq!(
-            kernel_probe_budget(Duration::ZERO, seconds(2), 2),
+            kernel_probe_budget(Duration::ZERO, seconds(2), 2, seconds(2)),
             Duration::ZERO
         );
         assert_eq!(
-            kernel_probe_budget(seconds(30), seconds(2), usize::MAX),
+            kernel_probe_budget(seconds(30), seconds(2), usize::MAX, seconds(2)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn observed_fresh_cost_keeps_current_reserve_without_starving_kernel_probes() {
+        let ms = Duration::from_millis;
+        let fallback = ms(3600);
+        assert_eq!(
+            future_comparison_reserve(&VecDeque::new(), fallback),
+            fallback
+        );
+        let measured = VecDeque::from([ms(900), ms(2800), ms(2200)]);
+        let future = future_comparison_reserve(&measured, fallback);
+        assert_eq!(future, ms(2200));
+        assert_eq!(
+            future_comparison_reserve(&VecDeque::from([ms(5000)]), fallback),
+            fallback
+        );
+        assert_eq!(
+            kernel_probe_budget(ms(7000), fallback, 1, fallback),
+            Duration::ZERO
+        );
+        assert_eq!(kernel_probe_budget(ms(7000), fallback, 1, future), ms(600));
+        assert_eq!(kernel_probe_budget(ms(7000), fallback, 0, future), ms(3400));
+        assert_eq!(
+            kernel_probe_budget(ms(3000), fallback, 1, future),
             Duration::ZERO
         );
     }
