@@ -499,7 +499,7 @@ fresh-execution counts.
   the shared physical owner's generation. Possible GPU/external writers and
   caller-recorded steps refresh in queue order. A cache stamp is committed only
   after submission; source/destination ownership and offsets distinguish rebinding.
-  All 48 coherence cases pass on both GPUs and both mirror placements: uploads
+  All 60 coherence cases pass on both GPUs and both mirror placements: uploads
   through both APIs, checkpoint restore, sharing/rebinding/drop, reverse-order
   recorded submissions, published/external GPU writes, shared optimizer writes,
   retuning, concatenated derived uploads, packed-source exclusion, serialization,
@@ -511,11 +511,40 @@ fresh-execution counts.
   The 181 mirrors occupy an extra 268.96 MB; counters confirm exactly one fill
   per mirror across warmup/timing. The separate forced-private-storage control
   also improves about 10% on NVIDIA, but has a weaker baseline; keep it separate.
-  The first prototype adds 181 allocations. Packing into a few persistent
-  aligned chunks is in progress, with the same coherence checks repeated for
-  the changed allocation. Placement and other model measurements are pending;
-  no bounded-search or production admission is claimed yet. Sources, checks
-  and samples are in `coherent-weight-*` and `coherent-weight-source-v1`.
+  Packing reduces those 181 allocations to three persistent aligned chunks
+  (315 total allocations versus 312 without mirrors). The expanded 60-case
+  suite also checks convolution operand order, odd tails, allocation-aligned
+  budget limits and exclusion of weights written within the graph. All pass.
+  Eight independently verified master/mirror placement combinations give
+  10.03–10.59% gains: allocation class does not explain the result. The first
+  script's unsupported master-placement value fell back to host-visible;
+  those mislabeled runs are retained separately, and the final assessment
+  uses the corrected `device-buddy` runs plus the valid host-master runs.
+  See `coherent-weight-placement-assessment.json` and
+  `coherent-weight-tests-v6-tails/assessment.json`.
+
+  Other-model fixed-plan holdouts also pass both independent output gates:
+
+  | Model | B570 latency change | RTX 5070 latency change |
+  | --- | ---: | ---: |
+  | SmolVLA | -7.13% | -11.06% |
+  | SD U-Net | -1.18% | -4.69% |
+  | Whisper | -0.50% | no eligible weights |
+
+  Forcing every SmolLM2 `step()` to refill mirrors instead regresses Intel
+  8.108 to 10.689 ms (+31.83%) and NVIDIA 3.747 to 4.970 ms (+32.65%). Both
+  output gates still pass. This measures refresh cost with the original fixed
+  submission counts; it is not an end-to-end caller-recorded benchmark.
+  Recorded steps and possible GPU writers currently require these conservative
+  refills. Thus the warm readonly-cache gain does not justify automatic use for
+  mutable or recorded workloads. Keep the prototype outside production until
+  selection, memory bounds and those API paths have a measured useful policy.
+  No bounded-search admission is claimed. Structural audits verify unchanged
+  master parameters, arithmetic, workgroups and ordinary dispatch counts.
+  Sources, checks and samples are in `coherent-weight-*`; the latest complete
+  source snapshot is `coherent-weight-source-v3-extended`, with file hashes.
+  See `coherent-weight-extended-assessment.json` for the seven timed pairs
+  and the NVIDIA Whisper summary for the ineligible case.
 
 ## 3. Intel loading and tile geometry
 
