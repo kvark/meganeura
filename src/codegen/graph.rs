@@ -38,6 +38,7 @@ impl Kernel {
     pub fn tiles_per_claim(&self, grid: [u32; 3]) -> u32 {
         match self.batch_axis {
             Some(axis) if !grid.contains(&0) => packing_width(self.batch_size, grid[axis]),
+            None if !grid.contains(&0) => self.batch_size,
             _ => 1,
         }
     }
@@ -90,8 +91,21 @@ impl Builder {
         layout: &bg::ShaderDataLayout,
         index: usize,
         grids: &[[u32; 3]],
+        sequential: bool,
     ) -> Result<Kernel, String> {
         let logical_threads = body.workgroup_size.into_iter().product::<u32>();
+        // Amortize queue publication only for large, independent optimizer grids.
+        // Smaller grids retain the straight-line handler and its parallelism.
+        if sequential
+            && logical_threads == self.threads
+            && grids.iter().any(|grid| {
+                grid.iter()
+                    .fold(1u64, |count, &n| count.saturating_mul(u64::from(n)))
+                    >= 1024
+            })
+        {
+            return self.add_inner(body, layout, index, None, 4);
+        }
         let batch_size = self.batch_limit.min(self.threads / logical_threads);
         if batch_size > 1 {
             let mut axes = [0, 1, 2];
@@ -156,7 +170,8 @@ impl Builder {
         batch_axis: Option<usize>,
         batch_size: u32,
     ) -> Result<Kernel, String> {
-        if batch_size > 1
+        let packing_size = if batch_axis.is_some() { batch_size } else { 1 };
+        if packing_size > 1
             && (body.source.contains("workgroupUniformLoad(") || body.source.contains("switch"))
         {
             return Err(
@@ -269,6 +284,9 @@ impl Builder {
                     replacements.push((range, String::new()));
                 }
                 AddressSpace::WorkGroup => {
+                    if batch_axis.is_none() && batch_size > 1 {
+                        return Err("sequential batches require scratch-free handlers".into());
+                    }
                     let (base, count, stride, array) = match module.types[global.ty].inner {
                         TypeInner::Array {
                             base,
@@ -286,25 +304,25 @@ impl Builder {
                         .iter()
                         .position(|s| s.ty == ty && s.slot == *slot)
                     {
-                        self.scratch[i].count = self.scratch[i].count.max(count * batch_size);
+                        self.scratch[i].count = self.scratch[i].count.max(count * packing_size);
                         i
                     } else {
                         let i = self.scratch.len();
                         self.scratch.push(Scratch {
                             ty,
                             slot: *slot,
-                            count: count * batch_size,
+                            count: count * packing_size,
                             stride,
                         });
                         i
                     };
                     *slot += 1;
-                    let offset = if batch_size == 1 {
+                    let offset = if packing_size == 1 {
                         "0u".to_owned()
                     } else {
                         format!("{count}u * {prefix}tile_group_argument")
                     };
-                    if array && batch_size > 1 {
+                    if array && packing_size > 1 {
                         shared_offsets.insert(name.to_owned(), count);
                     }
                     names.insert(
@@ -334,7 +352,7 @@ impl Builder {
                 .ok_or("missing graph function span")?;
             let mut local_names = names.clone();
             let mut function_source = source[range.clone()].to_owned();
-            if batch_size > 1 {
+            if packing_size > 1 {
                 let argument = function
                     .arguments
                     .iter()
@@ -391,6 +409,12 @@ impl Builder {
         } else {
             format!("physical_lane / {logical_threads}u")
         };
+        let sequential = batch_axis.is_none() && batch_size > 1;
+        let tile = if sequential {
+            "(ticket.y + graph_repeat)"
+        } else {
+            "ticket.y"
+        };
         let logical = if let Some(axis) = batch_axis {
             let coordinate = ["x", "y", "z"][axis];
             let mut parts = [String::new(), String::new(), String::new()];
@@ -409,10 +433,17 @@ impl Builder {
             parts
         } else {
             [
-                "ticket.y % grid.x".into(),
-                "(ticket.y / grid.x) % grid.y".into(),
-                "ticket.y / (grid.x * grid.y)".into(),
+                format!("{tile} % grid.x"),
+                format!("({tile} / grid.x) % grid.y"),
+                format!("{tile} / (grid.x * grid.y)"),
             ]
+        };
+        let (repeat_begin, repeat_end) = if sequential {
+            include_str!("../shaders/graph_repeat.wgsl")
+                .split_once("$BODY")
+                .unwrap()
+        } else {
+            ("", "")
         };
         let case = include_str!("../shaders/graph_handler.wgsl")
             .replace("$INDEX", &index.to_string())
@@ -421,7 +452,17 @@ impl Builder {
             .replace("$Y", &body.workgroup_size[1].to_string())
             .replace("$SUBGROUPS", &subgroups)
             .replace("$GROUP", &group)
-            .replace("$LAST_GROUP", &(batch_size - 1).to_string())
+            .replace("$LAST_GROUP", &(packing_size - 1).to_string())
+            .replace(
+                "$ACTIVE_GROUPS",
+                if sequential {
+                    "1u"
+                } else {
+                    "(node.grid.w >> 16u)"
+                },
+            )
+            .replace("$REPEAT_BEGIN", repeat_begin)
+            .replace("$REPEAT_END", repeat_end)
             .replace("$LOGICAL_X", &logical[0])
             .replace("$LOGICAL_Y", &logical[1])
             .replace("$LOGICAL_Z", &logical[2])
@@ -673,6 +714,7 @@ mod tests {
                 ),
                 0,
                 &[],
+                false,
             )
             .unwrap();
         assert_eq!(kernel.batch_axis, None);
@@ -697,7 +739,11 @@ mod tests {
         ] {
             let body = tile::from_module(source, entry).unwrap();
             let layout = crate::runtime::shader_data_layout(&shader);
-            kernels.push(builder.add(body, &layout, kernels.len(), &[]).unwrap());
+            kernels.push(
+                builder
+                    .add(body, &layout, kernels.len(), &[], false)
+                    .unwrap(),
+            );
         }
         assert_eq!(builder.views.len(), 1);
         let cooperative = crate::codegen::generate_module_coop(
@@ -720,6 +766,7 @@ mod tests {
                     &crate::runtime::shader_data_layout(&crate::compile::ShaderEntry::MatMul),
                     kernels.len(),
                     &[],
+                    false,
                 )
                 .unwrap(),
         );

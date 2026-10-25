@@ -62,6 +62,14 @@ broadcasts and switch-containing bodies also stay unpacked; the latter avoids
 relying on incomplete post-switch exit analysis. Failure to qualify packing
 retains the same handler inside the single graph dispatch.
 
+SGD handlers first built for grids of at least 1,024 tiles also batch four
+adjacent tiles sequentially when logical and physical workgroups match. This
+amortizes queue claims, parameter broadcasts and publication across independent
+updates, without changing the selected SGD body or element arithmetic. The
+handler must have no workgroup scratch. A final partial batch executes and
+counts only the remaining logical tiles; the cached handler can therefore also
+serve later small chunks. Other optimizer handlers retain their existing claims.
+
 Admission checks descriptor counts, storage ranges, shared memory (including
 reserved workgroup cooperative storage), and counter sizes. Imported allocations
 are rejected because distinct handles may alias without a provable relationship.
@@ -75,7 +83,7 @@ support for arbitrary shaders or hardware.
 
 The ready bitmap contains nodes, not individual tiles. Each node has a next-tile
 counter, remaining-tile counter and predecessor count. A worker claims one or
-more concurrently executed tiles from a ready node; the final claim clears its
+more tiles from a ready node; the final claim clears its
 ready bit. Completion subtracts that claim's logical tile count, and the final
 completion releases every successor whose predecessor count reaches zero. Zero-tile
 nodes use one control task to propagate dependencies and perform no arithmetic.
@@ -124,6 +132,9 @@ includes two- and four-tile claims, partial rows and repeated scratch reuse
 with 1, 3, 64 and 4096 workers. The external-recording test
 also waits for a submitted step while a later recording with a different
 learning rate remains unsubmitted, then verifies all three parameter updates.
+The optimizer fixture includes a 1,025-tile SGD chunk with a partial final
+batch, followed by small chunks reusing the handler, across all four worker
+counts and repeated optimizer/reset stages.
 
 On RTX 5080, strict whole-graph selection passes all **168 oracle tests**,
 including attention, convolution, reduced-precision storage, scatter, fusion and
@@ -658,6 +669,55 @@ excess instruction work. Receipts are in
 `target/megakernel-results/leader-coordinates-sdk/`. All follow-up jobs used
 separate bounded cgroups. The published runtime and performance claims remain
 unchanged; parity is still unmet.
+
+## Worker clock diagnostics
+
+A temporary Blade instrumentation patch inserts device-scope
+`OpReadClockKHR` instructions at explicit marker calls, without changing Naga's
+language or validation rules. Each transformed module passes `spirv-val` before
+pipeline creation. The device clock and Vulkan memory-model device-scope
+features are queried and enabled. These patches are diagnostic artifacts, not
+part of the runtime dependency. Source and raw records are under
+`target/clock-profile/`; the first capture is preserved in its `first/` directory.
+
+In that capture, worker entry-to-exit envelopes are 6.421 ms forward and
+21.035 ms training, within 0.04% of the corresponding dispatch timestamps.
+Task counts agree with the logical grids and all recorded intervals are
+contained in worker lifetimes. There are 168 long-lived workers; the other 88
+enter near completion. Summed handler intervals occupy 27.47% / 45.39% of
+summed worker lifetimes. These are worker-time fractions, **not elapsed-time
+savings**: many workers wait while a narrow node has too few tiles to occupy
+them. Handler intervals include the publication fence and workgroup rendezvous.
+Instrumentation also raises register counts to 126 / 123, and clock reads do
+not guarantee compiler code-motion barriers, so this is diagnostic attribution.
+
+Scalar matrix handlers dominate the forward trace. Its 50 `MatMul` nodes have
+3.671 ms of summed node spans and 32 `FusedMatMulAdd` nodes have 2.625 ms;
+cooperative attention contributes 0.307 ms. Spans can overlap and must not be
+added as elapsed time. Separate ordinary dispatch profiles retain bitwise exact
+complete state and show materially shorter matrix intervals. For example,
+`FusedMatMulAdd[50x720x2048]` is about 63 microseconds ordinary versus
+115–118 microseconds between the first and last persistent worker timestamps.
+The instrumentation differs, so this does not establish an exact kernel ratio.
+Training also exposes roughly 95,000 small SGD tiles as a queue-batching target.
+Ordinary profiles and comparisons are `target/clock-profile/ordinary.*` and
+`compare-{forward,backward}.json`.
+
+Three compiler-oriented experiments followed:
+
+| Experiment | Finding |
+|---|---|
+| Subgroup-uniform parameter hints | Ten paired comparisons pass, but forward registers remain 126 and timing does not show a useful gain. No Naga uniformity change is retained. |
+| Split read-only descriptor views and rely on existing tile fences for read visibility | All 20 uninstrumented comparisons pass. Forward improves to 5.228 ms, but training regresses to 27.519 ms. A separate diagnostic run reports 140 / 139 registers, up from 113 / 111. |
+| Fence-based visibility with the original descriptor views | All 20 comparisons pass; forward / training medians are 6.317 / 21.649 ms, with large training outliers. No improvement is established. |
+
+Read-only splitting therefore has a substantial resource tradeoff. None of
+these experiments is retained, and no memory-semantics change is proposed from
+the short correctness probes. Patches and receipts are
+`target/clock-profile/{parameter-hint,readonly-clock,fence-visibility}*` and
+`readonly-primary-meganeura.patch`; timing records are
+`target/{parameter-hint-probe,readonly-primary-smolvla,fence-visibility-smolvla}.{json,log}`.
+All jobs used separate bounded cgroups and local storage.
 
 ## Earlier artifact identities
 

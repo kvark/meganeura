@@ -198,7 +198,10 @@ fn check_optimizer_tiles(whole_graph: bool) {
     if whole_graph && !gpu.capabilities().binding_array {
         return;
     }
-    let parameters = [("a", "x", 8193), ("b", "y", 1031), ("c", "z", 33)];
+    // Whole-graph SGD must exercise a large grid with a partial final batch,
+    // followed by small chunks sharing the same cached optimizer handler.
+    let first_len = if whole_graph { 1024 * 1024 + 17 } else { 8193 };
+    let parameters = [("a", "x", first_len), ("b", "y", 1031), ("c", "z", 33)];
     let names = ["a", "b", "c"];
     let mut graph = meganeura::Graph::new();
     let mut losses = Vec::new();

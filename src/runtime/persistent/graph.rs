@@ -227,8 +227,13 @@ impl Graph {
                             (handler_index == index).then_some(dispatch.workgroups)
                         })
                         .collect::<Vec<_>>();
-                    match builder.add(handler.body.clone(), &handler.layout, kernels.len(), &grids)
-                    {
+                    match builder.add(
+                        handler.body.clone(),
+                        &handler.layout,
+                        kernels.len(),
+                        &grids,
+                        false,
+                    ) {
                         Ok(kernel) => kernels.push(kernel),
                         Err(error) => return Some(Err(error)),
                     }
@@ -331,6 +336,7 @@ impl Graph {
                     &handler.layout,
                     index,
                     &[command.grid],
+                    command.entry == ShaderEntry::SgdUpdate,
                 )?);
                 self.layouts.push(handler.layout);
                 self.optimizer_handlers.insert(command.entry.clone(), index);
@@ -453,14 +459,16 @@ impl Graph {
                 .into_iter()
                 .try_fold(1u32, |a, b| a.checked_mul(b))
                 .ok_or("tile count overflow")?;
-            if count > u32::MAX - 4 * self.options.workers - 1 {
-                return Err("tile claims may overflow".into());
-            }
             if handler > u16::MAX as usize {
                 return Err("too many whole-graph handlers".into());
             }
             let kernel = &self.kernels[handler];
             let batch = kernel.tiles_per_claim(grid);
+            if u64::from(count) + u64::from(batch) * u64::from(self.options.workers) + 1
+                > u64::from(u32::MAX)
+            {
+                return Err("tile claims may overflow".into());
+            }
             tasks.push(count);
             let base = u32::try_from(parameters.len()).map_err(|_| "parameter offset overflow")?;
             let layout = &self.layouts[handler];

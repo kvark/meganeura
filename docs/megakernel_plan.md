@@ -83,6 +83,16 @@ the qualified memory-ordering contract remains unchanged.
   metadata lifetimes, range-aware dependencies, wider attention workgroups and
   leader-computed coordinates. Correctness passes but timing and follow-up SDK
   instruction counts show no useful gain; retain the evidence and revert them.
+- [x] Add temporary device-clock instrumentation and compare worker lifetimes,
+  handler intervals and ordinary dispatch profiles. Scalar matrix handlers and
+  small SGD claims remain expensive; narrow nodes leave many workers waiting.
+  Reject parameter hints and read-only/visibility prototypes that fail to
+  improve both phases. Preserve the instrumentation and raw evidence locally.
+- [x] Batch four independent SGD tiles per claim for large grids while retaining
+  the selected element arithmetic. Clamp final-batch completion counts and
+  retain the straight-line handler for small initial grids. Pass 665 library,
+  168 strict oracle and seven focused tests, including a partial 1,025-tile
+  optimizer chunk followed by small chunks sharing the handler.
 - [ ] Isolate remaining queue/indexing/resource costs and reach baseline
   performance under the same full-step measurement and correctness gates. Keep this opt-in until performance justifies
   a default change.

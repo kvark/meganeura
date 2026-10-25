@@ -98,7 +98,7 @@ fn graph_main(@builtin(local_invocation_index) physical_lane: u32,
         if physical_lane == 0u {
             storageFence();
             let counter = graph_config.counters + 3u * ticket.x;
-            let completed = node.grid.w >> 16u;
+            let completed = min(node.grid.w >> 16u, max(node.work.y, 1u) - ticket.y);
             let remaining = atomicSub(&graph_queue[counter + 1u], completed);
             if remaining < completed { atomicOr(&graph_queue[1], 2u); }
             if remaining == completed {
