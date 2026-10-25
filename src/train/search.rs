@@ -516,6 +516,7 @@ struct AxisChoice {
     f16_attention: bool,
     forward_products: bool,
     gradient_inputs: Option<crate::DType>,
+    bf16_nn_gradients: bool,
 }
 
 fn early_physical_cover(baseline: AxisChoice, attention: &[AttentionChoice]) -> Vec<AxisChoice> {
@@ -738,6 +739,7 @@ fn implementations(
         f16_attention: false,
         forward_products: false,
         gradient_inputs: None,
+        bf16_nn_gradients: false,
         fuse_dispatches: seeds
             .first()
             .is_some_and(|seed| seed.options.fuse_dispatches),
@@ -764,6 +766,7 @@ fn implementations(
                 f16_attention: false,
                 forward_products: false,
                 gradient_inputs: None,
+                bf16_nn_gradients: false,
             })
         })
         .filter(|&choice| seen.insert(choice))
@@ -799,6 +802,7 @@ fn implementations(
         split_plans,
         attention_blocks: attention_blocks::Refinements::new(shared_memory_bytes),
         refine_next: false,
+        nn_source: None,
         queued_splits: false,
         replace_extracted_matrices: false,
         replace_extracted_attention: false,
@@ -820,6 +824,7 @@ struct Implementations {
     queued_splits: bool,
     attention_blocks: attention_blocks::Refinements,
     refine_next: bool,
+    nn_source: Option<(measure::Origin, ExecutionPlan)>,
     replace_extracted_matrices: bool,
     replace_extracted_attention: bool,
     defer_bf16: bool,
@@ -894,6 +899,31 @@ impl Implementations {
                 .extend(ordinary.iter().map(|choice| AxisChoice {
                     gradient_inputs: Some(multiply),
                     ..*choice
+                }));
+        }
+        if inputs.contains(&crate::DType::BF16)
+            && self.matrix_shapes.contains_key(&crate::DType::BF16)
+            && self.seeds.iter().any(|seed| {
+                fill_nn_gradient_candidates(&mut seed.plan.clone(), self.replace_extracted_matrices)
+                    != 0
+            })
+        {
+            // Cover a different derivative family before revisiting the
+            // transposed family's dtype. Inherit its measured F16 winner.
+            let priority = self
+                .order
+                .priority_choices
+                .iter()
+                .position(|&index| self.choices[index].gradient_inputs == Some(crate::DType::F16))
+                .map_or(0, |index| index + 1);
+            self.order
+                .priority_choices
+                .insert(priority, self.choices.len());
+            let ordinary = self.choices.clone();
+            self.choices
+                .extend(ordinary.into_iter().map(|choice| AxisChoice {
+                    bf16_nn_gradients: true,
+                    ..choice
                 }));
         }
         self.order.choices = self.choices.len();
@@ -1118,22 +1148,44 @@ fn fill_matrix_candidates_scoped(
     count
 }
 
-/// Only AT/BT derivative products were qualified by the dense controls. In
-/// particular, SmolLM2's long-K NN gradient fails the unchanged F16 gate.
-/// Bindings, partials and automatic derivative protection remain F32.
+/// Plain F16 NN fails the long-K vocabulary-gradient gate. Transposed
+/// products and BF16 NN are independent choices; every program still qualifies.
 fn fill_gradient_candidates(
     plan: &mut ExecutionPlan,
     multiply: crate::DType,
     replace_extracted: bool,
 ) -> usize {
+    fill_gradient_products(
+        plan,
+        multiply,
+        replace_extracted,
+        &[
+            compile::ShaderEntry::MatMulAT,
+            compile::ShaderEntry::MatMulBT,
+        ],
+    )
+}
+
+fn fill_nn_gradient_candidates(plan: &mut ExecutionPlan, replace_extracted: bool) -> usize {
+    fill_gradient_products(
+        plan,
+        crate::DType::BF16,
+        replace_extracted,
+        &[compile::ShaderEntry::MatMul],
+    )
+}
+
+fn fill_gradient_products(
+    plan: &mut ExecutionPlan,
+    multiply: crate::DType,
+    replace_extracted: bool,
+    entries: &[compile::ShaderEntry],
+) -> usize {
     let mut count = 0;
     for d in &mut plan.dispatches {
         if d.is_derivative
             && !d.requires_full_precision
-            && matches!(
-                d.shader,
-                compile::ShaderEntry::MatMulAT | compile::ShaderEntry::MatMulBT
-            )
+            && entries.contains(&d.shader)
             && matches!(
                 d.kernel,
                 compile::Kernel::Default
@@ -1205,15 +1257,23 @@ fn fill_dense_product(
 
 impl measure::Frontier for Implementations {
     fn early_programs_remaining(&self, incumbent: Option<measure::Origin>) -> usize {
-        if self.order.arithmetic_layouts != 1 {
+        let covered = self.order.visited_forms.iter().filter(|&&v| v).count()
+            >= self.order.seeds.min(self.order.arithmetic_layouts);
+        if self.order.arithmetic_layouts != 1 && !covered {
             return 0;
         }
         let form = incumbent.map_or(0, |origin| origin.form);
+        let nn_selected =
+            incumbent.is_some_and(|origin| self.choices[origin.choice].bf16_nn_gradients);
         self.order
             .priority_choices
             .iter()
             .filter(|&&choice| {
-                !self.order.tried.contains(&(form, choice))
+                // Once graph coverage is complete, reserve one comparison for
+                // the independent NN family before further submission probes.
+                (self.order.arithmetic_layouts == 1
+                    || (self.choices[choice].bf16_nn_gradients && !nn_selected))
+                    && !self.order.tried.contains(&(form, choice))
                     && !self.order.deferred.contains(&(form, choice))
             })
             .count()
@@ -1265,6 +1325,9 @@ impl measure::Frontier for Implementations {
 
     fn selected(&mut self, origin: Option<measure::Origin>, plan: &ExecutionPlan) {
         self.attention_blocks.selected(origin, plan);
+        if self.choices.iter().any(|choice| choice.bf16_nn_gradients) {
+            self.nn_source = origin.map(|origin| (origin, plan.clone()));
+        }
     }
 
     fn next(&mut self, incumbent: Option<measure::Origin>) -> Option<measure::Program> {
@@ -1304,8 +1367,10 @@ impl measure::Frontier for Implementations {
             // Carry the winning attention choice into arithmetic trials.
             for index in &mut self.order.priority_choices {
                 let arithmetic = self.choices[*index];
-                let derivative_trial = arithmetic.gradient_inputs.is_some()
-                    && arithmetic.gradient_inputs != active.gradient_inputs;
+                let nn_trial = arithmetic.bf16_nn_gradients && !active.bf16_nn_gradients;
+                let derivative_trial = nn_trial
+                    || (arithmetic.gradient_inputs.is_some()
+                        && arithmetic.gradient_inputs != active.gradient_inputs);
                 let neighbor = AxisChoice {
                     matrix_inputs: if derivative_trial {
                         active.matrix_inputs.or(arithmetic.matrix_inputs)
@@ -1327,7 +1392,12 @@ impl measure::Frontier for Implementations {
                     } else {
                         arithmetic.winograd
                     },
-                    gradient_inputs: arithmetic.gradient_inputs.or(active.gradient_inputs),
+                    gradient_inputs: if nn_trial {
+                        active.gradient_inputs
+                    } else {
+                        arithmetic.gradient_inputs.or(active.gradient_inputs)
+                    },
+                    bf16_nn_gradients: arithmetic.bf16_nn_gradients || active.bf16_nn_gradients,
                     forward_products: arithmetic.forward_products || active.forward_products,
                     ..active
                 };
@@ -1392,7 +1462,8 @@ impl measure::Frontier for Implementations {
                             active.matrix_storage,
                         ),
                     ) + usize::from(choice.winograd != active.winograd)
-                        + usize::from(choice.gradient_inputs != active.gradient_inputs),
+                        + usize::from(choice.gradient_inputs != active.gradient_inputs)
+                        + usize::from(choice.bf16_nn_gradients != active.bf16_nn_gradients),
                     choice.forward_products != active.forward_products,
                     choice.f16_attention != active.f16_attention,
                     choice.attention != active.attention,
@@ -1414,8 +1485,25 @@ impl measure::Frontier for Implementations {
                 f16_attention,
                 forward_products,
                 gradient_inputs,
+                bf16_nn_gradients,
             } = self.choices[choice_index];
-            let mut plan = if splits == 0
+            // Change only NN multiplication on the measured winner. Rebuilding
+            // its graph would discard unrelated kernel/layout tuning.
+            let source = self.nn_source.as_ref().filter(|entry| {
+                let origin = entry.0;
+                let selected = self.choices[origin.choice];
+                origin.form == seed_index
+                    && !selected.bf16_nn_gradients
+                    && bf16_nn_gradients
+                    && AxisChoice {
+                        bf16_nn_gradients: true,
+                        ..selected
+                    } == self.choices[choice_index]
+            });
+            let prepared = source.is_some();
+            let mut plan = if let Some(source) = source {
+                source.1.clone()
+            } else if splits == 0
                 && !f16_attention
                 && flash.is_none()
                 && fuse_dispatches == seed.options.fuse_dispatches
@@ -1480,36 +1568,48 @@ impl measure::Frontier for Implementations {
                 }
                 plan
             };
-            if forward_products
-                && fill_attention_products(&mut plan, self.caps, self.shared_memory_bytes) == 0
+            if !prepared {
+                if forward_products
+                    && fill_attention_products(&mut plan, self.caps, self.shared_memory_bytes) == 0
+                {
+                    continue;
+                }
+                if let Some(multiply) = matrix_inputs {
+                    if fill_matrix_candidates_scoped(
+                        &mut plan,
+                        multiply,
+                        self.replace_extracted_matrices,
+                        vector_convolutions_only,
+                    ) == 0
+                    {
+                        continue;
+                    }
+                }
+                if let Some(multiply) = gradient_inputs {
+                    if fill_gradient_candidates(
+                        &mut plan,
+                        multiply,
+                        self.replace_extracted_matrices,
+                    ) == 0
+                    {
+                        continue;
+                    }
+                }
+            }
+            if bf16_nn_gradients
+                && fill_nn_gradient_candidates(&mut plan, self.replace_extracted_matrices) == 0
             {
                 continue;
             }
-            if let Some(multiply) = matrix_inputs {
-                if fill_matrix_candidates_scoped(
-                    &mut plan,
-                    multiply,
-                    self.replace_extracted_matrices,
-                    vector_convolutions_only,
-                ) == 0
-                {
+            if !prepared {
+                if matrix_storage && storage::fill(&mut plan) == 0 {
                     continue;
                 }
-            }
-            if let Some(multiply) = gradient_inputs {
-                if fill_gradient_candidates(&mut plan, multiply, self.replace_extracted_matrices)
-                    == 0
-                {
-                    continue;
-                }
-            }
-            if matrix_storage && storage::fill(&mut plan) == 0 {
-                continue;
-            }
-            if let Some(storage) = winograd {
-                let (shape, subgroup) = self.matrix_shapes[&storage];
-                if winograd::fill(&mut plan, storage, shape, subgroup) == 0 {
-                    continue;
+                if let Some(storage) = winograd {
+                    let (shape, subgroup) = self.matrix_shapes[&storage];
+                    if winograd::fill(&mut plan, storage, shape, subgroup) == 0 {
+                        continue;
+                    }
                 }
             }
             self.attention_blocks.apply(&mut plan);
@@ -1536,11 +1636,14 @@ impl measure::Frontier for Implementations {
             if let Some(dtype) = gradient_inputs {
                 description.push_str(&format!(", gradient_inputs={dtype:?}"));
             }
+            if bf16_nn_gradients {
+                description.push_str(", nn_gradient_inputs=BF16");
+            }
             if let Some(dtype) = winograd {
                 description.push_str(&format!(", winograd={dtype:?}"));
             }
             return Some(measure::Program {
-                prepared: false,
+                prepared,
                 description,
                 plan,
                 submission_chunks: None,
@@ -1764,6 +1867,163 @@ mod tests {
         let loss = graph.mean_all(y);
         graph.set_outputs(vec![loss]);
         graph_frontier(crate::autodiff::differentiate(&graph))
+    }
+
+    fn nn_gradient_frontier() -> Implementations {
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[32, 64]);
+        let w = graph.parameter("w", &[16, 64]);
+        let y = graph.matmul_bt(x, w);
+        let loss = graph.mean_all(y);
+        graph.set_outputs(vec![loss]);
+        graph_frontier(crate::autodiff::differentiate(&graph))
+    }
+
+    #[test]
+    fn nn_bf16_keeps_storage_pins_and_transposed_products() {
+        let baseline = nn_gradient_frontier().seeds.remove(0).plan;
+        let nn: Vec<_> = baseline
+            .dispatches
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| {
+                (d.is_derivative && d.shader == compile::ShaderEntry::MatMul).then_some(i)
+            })
+            .collect();
+        assert_eq!(nn.len(), 1);
+        let mut candidate = baseline.clone();
+        assert_eq!(fill_nn_gradient_candidates(&mut candidate, true), 1);
+        for &i in &nn {
+            let d = &candidate.dispatches[i];
+            assert!(d.full_precision() && d.is_derivative && !d.requires_full_precision);
+            assert!(
+                matches!(d.kernel, compile::Kernel::CooperativeTyped { types, .. }
+                if types.a == crate::DType::F32 && types.b == crate::DType::F32
+                    && types.output == crate::DType::F32 && types.multiply == crate::DType::BF16)
+            );
+            candidate.dispatches[i].kernel = baseline.dispatches[i].kernel.clone();
+            candidate.dispatches[i].workgroups = baseline.dispatches[i].workgroups;
+        }
+        assert_eq!(candidate, baseline);
+        for pin in [true, false] {
+            let mut protected = baseline.clone();
+            for &i in &nn {
+                protected.dispatches[i].requires_full_precision = true;
+                protected.dispatches[i].is_derivative = pin;
+            }
+            assert_eq!(fill_nn_gradient_candidates(&mut protected, true), 0);
+        }
+        let mut locked = baseline.clone();
+        for &i in &nn {
+            locked.dispatches[i].schedule_locked = true;
+        }
+        assert_eq!(fill_nn_gradient_candidates(&mut locked, false), 0);
+        assert_eq!(fill_nn_gradient_candidates(&mut locked, true), 1);
+    }
+
+    #[test]
+    fn nn_trial_preserves_the_measured_winners_other_kernels() {
+        use measure::Frontier as _;
+        let mut frontier = nn_gradient_frontier();
+        let mut caps = blade_graphics::Capabilities {
+            shader_float16: true,
+            shader_bfloat16: true,
+            subgroup_size: 32,
+            ..Default::default()
+        };
+        caps.cooperative_matrix.f16_f32_shapes = vec![[8, 16, 16]];
+        caps.cooperative_matrix.bf16_f32_shapes = vec![[8, 16, 16]];
+        frontier.enable_matrix_inputs(&[crate::DType::F16, crate::DType::BF16], &caps);
+        frontier.enable_gradient_inputs(&[crate::DType::F16, crate::DType::BF16]);
+        let mut winner = frontier.next(None).unwrap();
+        // Represent a runtime-tuned choice that rebuilding the graph would lose.
+        winner.plan.dispatches[0].label.push_str(":measured");
+        let origin = winner.origin.unwrap();
+        frontier.selected(Some(origin), &winner.plan);
+        let choice = frontier
+            .choices
+            .iter()
+            .position(|&c| {
+                c == AxisChoice {
+                    bf16_nn_gradients: true,
+                    ..frontier.choices[origin.choice]
+                }
+            })
+            .unwrap();
+        frontier.order.priority_choices.clear();
+        frontier.order.priority_choices.push_back(choice);
+        assert_eq!(frontier.early_programs_remaining(Some(origin)), 1);
+        let candidate = frontier.next(Some(origin)).unwrap();
+        assert!(candidate.prepared);
+        let mut expected = winner.plan.clone();
+        assert_eq!(fill_nn_gradient_candidates(&mut expected, false), 1);
+        assert_eq!(candidate.plan, expected);
+        assert_eq!(frontier.early_programs_remaining(Some(origin)), 0);
+    }
+
+    #[test]
+    fn nn_bf16_is_independent_of_forward_and_transposed_precision() {
+        use crate::DType::{BF16, F16};
+        use measure::Frontier as _;
+        let mut caps = blade_graphics::Capabilities {
+            shader_float16: true,
+            shader_bfloat16: true,
+            subgroup_size: 32,
+            ..Default::default()
+        };
+        caps.cooperative_matrix.f16_f32_shapes = vec![[8, 16, 16]];
+        caps.cooperative_matrix.bf16_f32_shapes = vec![[8, 16, 16]];
+        for allowed in [vec![], vec![F16], vec![BF16], vec![F16, BF16]] {
+            let mut frontier = nn_gradient_frontier();
+            frontier.enable_matrix_inputs(&allowed, &caps);
+            frontier.enable_gradient_inputs(&allowed);
+            assert_eq!(
+                frontier.choices.iter().any(|c| c.bf16_nn_gradients),
+                allowed.contains(&BF16)
+            );
+            if allowed != [F16, BF16] {
+                continue;
+            }
+            let priority: Vec<_> = frontier
+                .order
+                .priority_choices
+                .iter()
+                .map(|&i| frontier.choices[i])
+                .collect();
+            assert_eq!(priority[0].gradient_inputs, Some(F16));
+            assert!(priority[1].bf16_nn_gradients);
+            let mut reached = collections::HashSet::new();
+            let mut incumbent = None;
+            while let Some(program) = frontier.next(incumbent) {
+                let choice = frontier.choices[program.origin.unwrap().choice];
+                reached.insert((
+                    choice.matrix_inputs,
+                    choice.gradient_inputs,
+                    choice.bf16_nn_gradients,
+                ));
+                for d in program
+                    .plan
+                    .dispatches
+                    .iter()
+                    .filter(|d| d.is_derivative && d.shader == compile::ShaderEntry::MatMul)
+                {
+                    if let compile::Kernel::CooperativeTyped { types, .. } = d.kernel {
+                        assert_eq!(types.multiply, BF16, "F16 NN remains unqualified");
+                    }
+                }
+                if choice.gradient_inputs == Some(F16) {
+                    incumbent = program.origin;
+                }
+            }
+            for forward in [None, Some(F16), Some(BF16)] {
+                for transposed in [None, Some(F16), Some(BF16)] {
+                    assert!(
+                        reached.contains(&(forward, transposed, true)),
+                        "missing {forward:?}/{transposed:?}/BF16 NN"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2723,6 +2983,7 @@ mod tests {
             f16_attention: false,
             forward_products: false,
             gradient_inputs: None,
+            bf16_nn_gradients: false,
         };
         let unfused = AxisChoice {
             fuse_dispatches: false,

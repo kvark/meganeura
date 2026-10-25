@@ -3,6 +3,7 @@
 Updated October 25, 2026. First priority: let measured search retain reduced
 operand and activation storage, with F32 accumulation. Keep the staged F32
 candidate available and select by qualified complete-program time.
+Next: complete-plan cost estimates and matched Intel XPU/Vulkan GEMM analysis.
 
 ## Survey complete
 
@@ -513,10 +514,56 @@ fresh-execution counts.
   Saved-trace replay also fails to support increasing the fixed count; its
   circular offsets are sensitivity views, not independent trials. Sources,
   counter traces, receipts, policies and checks remain in `paired-sampling-*`.
-  The next precision implementation is BF16 for NN derivative multiplication,
-  independently of F16 AT/BT; its earlier 256-update controls already qualify
-  and show a separate 3.72% Intel opportunity. F32 bindings/accumulators/partials,
-  explicit pins and the existing model gates must remain intact.
+
+- [x] Add independently measured BF16 NN derivative multiplication in
+  [PR #298](https://github.com/kvark/meganeura/pull/298), keeping
+  F32 bindings, accumulation, gradient outputs and split partials. BF16 must
+  be allowed by the caller and pass the existing device probe. Plain F16 NN
+  remains excluded because the long-K gradient fails its unchanged gate.
+  Reuse #297's prepared-plan support: change only NN on the actual measured
+  winner, preserving other kernels, layouts and fusion. Reserve the comparison
+  after ordinary graph coverage; keep the transposed/forward choices independent.
+
+  Fresh 30-second searches reach NN on both GPUs. NVIDIA's qualified trial
+  improves 0.55%, below the unchanged 1% margin, and retains the old path. Intel
+  selects NN with a 3.2% in-search gain. A separate NN-only control confirms
+  42.660→41.103 ms (-3.65%) at one submission, retaining all 48 split partitions
+  and changing no other operation. All saved winners qualify against independent
+  F32 and repeatability checks before/after timing.
+
+  Whole-search paired holdouts (forward + loss + backward):
+
+  | Model | RTX 5070 change | B570 change | NN selected |
+  | --- | ---: | ---: | --- |
+  | SmolLM2 | +0.02% | +0.74% | B570 only |
+  | SmolVLA | +1.34% | +1.47% | neither |
+  | SD U-Net | -3.10% | -0.40% | neither |
+  | Whisper | +0.06% | -0.17% | neither |
+
+  Do not interpret the other models' variation as an NN gain. NVIDIA SmolVLA's
+  physical plans are identical; the searches choose sixteen versus eight
+  submissions. Intel SmolVLA also changes one GEMV tile. The Intel SmolLM2
+  parent/candidate choose four/one submissions: 40.842→41.144 ms. At four for
+  both, the result is 40.826→40.479 ms (-0.85%). The candidate retains eight
+  partitions in 90 other GEMMs where the parent selects two or four, consuming
+  much of the NN-only gain. Improving whole-plan ordering and kernel-budget
+  allocation remains separate work; this does not establish a 3.65% automatic
+  end-to-end improvement under the 30-second budget.
+
+  All sixteen searches finish in 30.65–33.90 seconds including preparation.
+  All 684 unit tests and all-target/all-feature Clippy pass. All six selected
+  32-update synthetic trajectories pass, including real parameter updates and
+  gradients compared again at identical final F32 weights. The two selected
+  256-update real-text SmolLM2 trajectories pass against native and PyTorch
+  F32 training/probe/held-out loss curves, with update and learning checks.
+  No numerical gates, optimizer semantics, storage types or submission policy
+  changed.
+
+  Earlier attempts remain archived: the first searches expire before NN;
+  moving it earlier but rebuilding the graph yields a 25% slower NVIDIA
+  challenger. These motivated the prepared-plan trial, rather than a new
+  generator. Sources, controls and failures are retained in `bf16-nn-selection-*`,
+  including `source-v3`, the search assessment, plan diff and ablations.
 
 - [ ] Extend useful storage chains through pointwise operations and compatible
   fusion without adding redundant widening/narrowing dispatches.
