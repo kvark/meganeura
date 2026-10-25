@@ -1702,10 +1702,10 @@ fn matmul_vars_tiled(
         format!("{}\n{}", fused_decl, epilogue_decl)
     };
     let store_body = if epilogue_body.is_empty() {
-        format!("$C_BUFFER[idx] = s[i][j]{};", fused_expr)
+        format!("$C_BUFFER[idx] = $ACC_VALUE{};", fused_expr)
     } else {
         format!(
-            "var val = s[i][j]{};\n                {}\n                $C_BUFFER[idx] = val;",
+            "var val = $ACC_VALUE{};\n                {}\n                $C_BUFFER[idx] = val;",
             fused_expr, epilogue_body
         )
     };
@@ -1828,20 +1828,35 @@ fn matmul_vars_tiled(
         knobs.k_stage
     );
     let interleave_columns = !b_mode.is_quantized() && knobs.interleave_columns;
-    let (acc_decl, compute_body, acc_array) = tiled_matmul_body(tile, k_tile, interleave_columns);
+    let (acc_decl, compute_body, _) = tiled_matmul_body(tile, k_tile, interleave_columns);
     let k_math = if knobs.unroll_k {
         unroll_k_math(&compute_body, k_tile)
     } else {
         compute_body
     };
-    let output_column = if interleave_columns {
-        "tx + j * 16u".to_string()
-    } else {
-        format!("tx * {tn}u + j")
-    };
+    let mut result_stores = String::new();
+    for i in 0..tm {
+        for j in 0..tn {
+            let column = if interleave_columns {
+                format!("tx + {j}u * 16u")
+            } else {
+                format!("tx * {tn}u + {j}u")
+            };
+            result_stores.push_str(&preprocess(
+                template_section(src, "store"),
+                &[
+                    ("$ROW", &format!("{i}u")),
+                    ("$OUTPUT_COLUMN", &column),
+                    ("$STORE_BODY", &store_body),
+                    ("$ACC_VALUE", &format!("s{i}_{j}")),
+                ],
+            ));
+        }
+    }
     let src = preprocess(
         src,
         &[
+            ("$RESULT_STORES", &result_stores),
             ("$COMPUTE_BODY", &k_math),
             (
                 "$K_UNROLL_U",
@@ -1861,8 +1876,6 @@ fn matmul_vars_tiled(
             ("$B_ROW", b_row),
             ("$B_COL", b_col),
             ("$FUSED_ADD_DECL", &full_decl),
-            ("$STORE_BODY", &store_body),
-            ("$OUTPUT_COLUMN", &output_column),
             ("$BM_U", &format!("{bm}u")),
             ("$BN_U", &format!("{bn}u")),
             ("$TM_U", &format!("{tm}u")),
@@ -1875,7 +1888,6 @@ fn matmul_vars_tiled(
             ("$SHARED_A_SIZE", &(bm * (k_tile + 1)).to_string()),
             ("$SHARED_B_SIZE", &(k_tile * (bn + 1)).to_string()),
             ("$ACC_DECL", &acc_decl),
-            ("$ACC_ARRAY", &acc_array),
         ],
     );
     matmul_module(&src, b_storage, None, copies)
