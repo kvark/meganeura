@@ -20,6 +20,27 @@ pub(crate) struct Kernel {
     pub subgroups: bool,
     pub subgroup_threads: u32,
     pub workgroup_cooperative: bool,
+    pub batch_axis: Option<usize>,
+    pub batch_size: u32,
+}
+
+fn packing_width(maximum: u32, extent: u32) -> u32 {
+    if extent == 0 {
+        return 1;
+    }
+    [4, 2, 1]
+        .into_iter()
+        .find(|&width| width <= maximum && extent.is_multiple_of(width))
+        .unwrap()
+}
+
+impl Kernel {
+    pub fn tiles_per_claim(&self, grid: [u32; 3]) -> u32 {
+        match self.batch_axis {
+            Some(axis) if !grid.contains(&0) => packing_width(self.batch_size, grid[axis]),
+            _ => 1,
+        }
+    }
 }
 
 pub(crate) struct View {
@@ -40,6 +61,7 @@ pub(crate) struct Builder {
     pub parameter_words: usize,
     pub views: Vec<View>,
     scratch: Vec<Scratch>,
+    pub batch_limit: u32,
 }
 
 impl Builder {
@@ -49,6 +71,7 @@ impl Builder {
             parameter_words: 0,
             views: Vec::new(),
             scratch: Vec::new(),
+            batch_limit: 4,
         }
     }
 
@@ -66,7 +89,80 @@ impl Builder {
         body: tile::Tile,
         layout: &bg::ShaderDataLayout,
         index: usize,
+        grids: &[[u32; 3]],
     ) -> Result<Kernel, String> {
+        let logical_threads = body.workgroup_size.into_iter().product::<u32>();
+        let batch_size = self.batch_limit.min(self.threads / logical_threads);
+        if batch_size > 1 {
+            let mut axes = [0, 1, 2];
+            axes.sort_by_key(|&axis| {
+                grids.iter().fold(0u64, |cost, grid| {
+                    let count = grid
+                        .iter()
+                        .fold(1u64, |count, &n| count.saturating_mul(u64::from(n)));
+                    cost.saturating_add(count / u64::from(packing_width(batch_size, grid[axis])))
+                })
+            });
+            for axis in axes {
+                let batch_size = grids
+                    .iter()
+                    .filter(|grid| !grid.contains(&0))
+                    .map(|grid| packing_width(batch_size, grid[axis]))
+                    .max()
+                    .unwrap_or(if grids.is_empty() { batch_size } else { 1 });
+                if batch_size == 1 {
+                    continue;
+                }
+                let mut candidate = Self::new(self.threads);
+                let Ok(kernel) =
+                    candidate.add_inner(body.clone(), layout, index, Some(axis), batch_size)
+                else {
+                    continue;
+                };
+                let mut source = candidate.source(
+                    std::slice::from_ref(&kernel),
+                    &vec![1; candidate.views.len()],
+                );
+                // Admission only: apply the scope-aware cooperative checker
+                // to barrier control, including helper arguments and locals.
+                for barrier in [
+                    "workgroupBarrier();",
+                    "storageBarrier();",
+                    "textureBarrier();",
+                ] {
+                    source =
+                        source.replace(barrier, &format!("graph_packing_sync_probe(); {barrier}"));
+                }
+                if !source.contains("enable wgpu_cooperative_matrix;") {
+                    source.insert_str(0, "enable wgpu_cooperative_matrix;\n");
+                }
+                source.push_str(include_str!("../shaders/graph_packing_probe.wgsl"));
+                let Ok(module) = naga::front::wgsl::parse_str(&source) else {
+                    continue;
+                };
+                if tile::validate(&module).is_ok() {
+                    return self.add_inner(body, layout, index, Some(axis), batch_size);
+                }
+            }
+        }
+        self.add_inner(body, layout, index, None, 1)
+    }
+
+    fn add_inner(
+        &mut self,
+        body: tile::Tile,
+        layout: &bg::ShaderDataLayout,
+        index: usize,
+        batch_axis: Option<usize>,
+        batch_size: u32,
+    ) -> Result<Kernel, String> {
+        if batch_size > 1
+            && (body.source.contains("workgroupUniformLoad(") || body.source.contains("switch"))
+        {
+            return Err(
+                "packed tiles require qualified barrier control and no workgroup broadcasts".into(),
+            );
+        }
         let logical_threads = body.workgroup_size.into_iter().product::<u32>();
         let body = tile::mask_extra_lanes(body, self.threads)?;
         let body = tile::lift_uniforms(body)?;
@@ -96,6 +192,7 @@ impl Builder {
         let mut buffers = Vec::new();
         let mut parameters = String::new();
         let mut shared_slots = HashMap::new();
+        let mut shared_offsets = HashMap::new();
         for (handle, global) in module.global_variables.iter() {
             let name = global.name.as_deref().ok_or("unnamed graph global")?;
             let range = module
@@ -189,22 +286,37 @@ impl Builder {
                         .iter()
                         .position(|s| s.ty == ty && s.slot == *slot)
                     {
-                        self.scratch[i].count = self.scratch[i].count.max(count);
+                        self.scratch[i].count = self.scratch[i].count.max(count * batch_size);
                         i
                     } else {
                         let i = self.scratch.len();
                         self.scratch.push(Scratch {
                             ty,
                             slot: *slot,
-                            count,
+                            count: count * batch_size,
                             stride,
                         });
                         i
                     };
                     *slot += 1;
+                    let offset = if batch_size == 1 {
+                        "0u".to_owned()
+                    } else {
+                        format!("{count}u * {prefix}tile_group_argument")
+                    };
+                    if array && batch_size > 1 {
+                        shared_offsets.insert(name.to_owned(), count);
+                    }
                     names.insert(
                         name.to_owned(),
-                        format!("graph_scratch_{bank}{}", if array { "" } else { "[0]" }),
+                        format!(
+                            "graph_scratch_{bank}{}",
+                            if array {
+                                String::new()
+                            } else {
+                                format!("[{offset}]")
+                            }
+                        ),
                     );
                     replacements.push((range, String::new()));
                 }
@@ -221,6 +333,19 @@ impl Builder {
                 .to_range()
                 .ok_or("missing graph function span")?;
             let mut local_names = names.clone();
+            let mut function_source = source[range.clone()].to_owned();
+            if batch_size > 1 {
+                let argument = function
+                    .arguments
+                    .iter()
+                    .filter_map(|a| a.name.as_deref())
+                    .find(|name| name.starts_with(&format!("{prefix}tile_group_argument")))
+                    .ok_or("missing tile group argument")?;
+                for name in local_names.values_mut() {
+                    *name = name.replace(&format!("{prefix}tile_group_argument"), argument);
+                }
+                function_source = offset_scratch(&function_source, &shared_offsets, argument)?;
+            }
             for (_, global) in module.global_variables.iter() {
                 if !matches!(global.space, AddressSpace::Storage { .. }) {
                     continue;
@@ -238,7 +363,7 @@ impl Builder {
             }
             replacements.push((
                 range.clone(),
-                tile::rename_tokens(&source[range], &local_names),
+                tile::rename_tokens(&function_source, &local_names),
             ));
         }
         let mut source = source;
@@ -261,15 +386,33 @@ impl Builder {
         } else {
             String::new()
         };
-        let active = if logical_threads == self.threads {
-            String::new()
+        let group = if body.subgroups || body.cooperative.is_some() {
+            format!("graph_subgroup_id / ({logical_threads}u / graph_subgroup_size)")
         } else {
-            let predicate = if body.subgroups || body.cooperative.is_some() {
-                format!("graph_subgroup_id < {logical_threads}u / graph_subgroup_size")
-            } else {
-                format!("physical_lane < {logical_threads}u")
-            };
-            format!("let {prefix}active_lane = {predicate};")
+            format!("physical_lane / {logical_threads}u")
+        };
+        let logical = if let Some(axis) = batch_axis {
+            let coordinate = ["x", "y", "z"][axis];
+            let mut parts = [String::new(), String::new(), String::new()];
+            parts[axis] = format!(
+                "ticket.y % grid.{coordinate} + min(graph_tile_group, (node.grid.w >> 16u) - 1u)"
+            );
+            let remaining = (0..3).filter(|&i| i != axis).collect::<Vec<_>>();
+            parts[remaining[0]] = format!(
+                "(ticket.y / grid.{coordinate}) % grid.{}",
+                ["x", "y", "z"][remaining[0]]
+            );
+            parts[remaining[1]] = format!(
+                "ticket.y / (grid.{coordinate} * grid.{})",
+                ["x", "y", "z"][remaining[0]]
+            );
+            parts
+        } else {
+            [
+                "ticket.y % grid.x".into(),
+                "(ticket.y / grid.x) % grid.y".into(),
+                "ticket.y / (grid.x * grid.y)".into(),
+            ]
         };
         let case = include_str!("../shaders/graph_handler.wgsl")
             .replace("$INDEX", &index.to_string())
@@ -277,9 +420,20 @@ impl Builder {
             .replace("$X", &body.workgroup_size[0].to_string())
             .replace("$Y", &body.workgroup_size[1].to_string())
             .replace("$SUBGROUPS", &subgroups)
-            .replace("$ACTIVE", &active)
+            .replace("$GROUP", &group)
+            .replace("$LAST_GROUP", &(batch_size - 1).to_string())
+            .replace("$LOGICAL_X", &logical[0])
+            .replace("$LOGICAL_Y", &logical[1])
+            .replace("$LOGICAL_Z", &logical[2])
             .replace("$PARAMETERS", &parameters)
-            .replace("$CALL", &body.call.replace("$PREFIX", &prefix));
+            .replace(
+                "$CALL",
+                &body
+                    .call
+                    .replace("$PREFIXactive_lane", "graph_active_lane")
+                    .replace("$PREFIXtile_group", "graph_tile_group")
+                    .replace("$PREFIX", &prefix),
+            );
         Ok(Kernel {
             buffers,
             source,
@@ -291,6 +445,8 @@ impl Builder {
                 0
             },
             workgroup_cooperative: body.cooperative == Some(naga::CooperativeScope::Workgroup),
+            batch_axis,
+            batch_size,
         })
     }
 
@@ -382,6 +538,49 @@ impl Builder {
     }
 }
 
+fn offset_scratch(
+    source: &str,
+    arrays: &HashMap<String, u32>,
+    group: &str,
+) -> Result<String, String> {
+    let mut insertions = Vec::new();
+    let identifier = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    for (name, &count) in arrays {
+        for (start, _) in source.match_indices(name) {
+            let end = start + name.len();
+            if start != 0 && identifier(source.as_bytes()[start - 1])
+                || end < source.len() && identifier(source.as_bytes()[end])
+            {
+                continue;
+            }
+            let opening = end + source[end..].len() - source[end..].trim_start().len();
+            if source.as_bytes().get(opening) != Some(&b'[') {
+                return Err("packed scratch arrays must be directly indexed".into());
+            }
+            let mut depth = 0;
+            let closing = source[opening..]
+                .char_indices()
+                .find_map(|(i, c)| {
+                    match c {
+                        '[' => depth += 1,
+                        ']' => depth -= 1,
+                        _ => {}
+                    }
+                    (depth == 0).then_some(opening + i)
+                })
+                .ok_or("unterminated scratch index")?;
+            insertions.push((opening + 1, format!("{count}u * {group} + (")));
+            insertions.push((closing, ")".to_owned()));
+        }
+    }
+    let mut output = source.to_owned();
+    insertions.sort_by_key(|&(position, _)| position);
+    for (position, text) in insertions.into_iter().rev() {
+        output.insert_str(position, &text);
+    }
+    Ok(output)
+}
+
 fn type_name(types: &naga::UniqueArena<Type>, ty: Handle<Type>) -> Result<String, String> {
     let scalar = |s: naga::Scalar| match (s.kind, s.width) {
         (ScalarKind::Float, 4) => Ok("f32"),
@@ -461,6 +660,26 @@ mod tests {
     use super::{Builder, tile};
 
     #[test]
+    fn packing_rejects_query_dependent_barrier_loops() {
+        let attention = crate::codegen::generate_flash_attention_coop_module(64);
+        let body =
+            tile::from_module(&attention.source, &attention.module.entry_points[0].name).unwrap();
+        let mut builder = Builder::new(256);
+        let kernel = builder
+            .add(
+                body,
+                &crate::runtime::shader_data_layout(
+                    &crate::compile::ShaderEntry::FlashAttentionCoop,
+                ),
+                0,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(kernel.batch_axis, None);
+        assert_eq!(kernel.batch_size, 1);
+    }
+
+    #[test]
     fn mixed_geometry_graph_preserves_barrier_uniformity() {
         let mut builder = Builder::new(256);
         let mut kernels = Vec::new();
@@ -478,7 +697,7 @@ mod tests {
         ] {
             let body = tile::from_module(source, entry).unwrap();
             let layout = crate::runtime::shader_data_layout(&shader);
-            kernels.push(builder.add(body, &layout, kernels.len()).unwrap());
+            kernels.push(builder.add(body, &layout, kernels.len(), &[]).unwrap());
         }
         assert_eq!(builder.views.len(), 1);
         let cooperative = crate::codegen::generate_module_coop(
@@ -500,12 +719,15 @@ mod tests {
                     body,
                     &crate::runtime::shader_data_layout(&crate::compile::ShaderEntry::MatMul),
                     kernels.len(),
+                    &[],
                 )
                 .unwrap(),
         );
+        assert_eq!(kernels.last().unwrap().batch_size, 4);
         assert!(builder.views.iter().any(|view| view.written));
         assert!(builder.views.iter().any(|view| !view.written));
         let source = builder.source(&kernels, &vec![6; builder.views.len()]);
+        assert!(!source.contains("graph_packing_sync_probe"));
         let module = naga::front::wgsl::parse_str(&source)
             .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));
         let info = naga::valid::Validator::new(

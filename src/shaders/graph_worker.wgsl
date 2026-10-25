@@ -3,7 +3,7 @@ enable wgpu_binding_array;
 $ENABLES
 
 struct GraphNode {
-    // Logical grid and handler index.
+    // Logical grid, low 16 bits handler, high 16 bits tiles per claim.
     grid: vec4<u32>,
     // Parameter offset, logical tiles, successor offset, successor count.
     work: vec4<u32>,
@@ -48,15 +48,16 @@ fn graph_claim(worker: u32, lane: u32) -> vec4<u32> {
                     let node = graph_nodes[node_index];
                     let count = max(node.work.y, 1u);
                     let counter = graph_config.counters + 3u * node_index;
-                    let tile = atomicAdd(&graph_queue[counter], 1u);
-                    if tile + 1u >= count {
+                    let batch = node.grid.w >> 16u;
+                    let tile = atomicAdd(&graph_queue[counter], batch);
+                    if tile + batch >= count {
                         atomicAnd(&graph_queue[2u + word], ~mask);
                     }
                     if tile < count {
                         storageFence();
                         graph_node_grid = node.grid;
                         graph_node_work = node.work;
-                        graph_ticket = vec4<u32>(node_index, tile, node.work.x, node.grid.w);
+                        graph_ticket = vec4<u32>(node_index, tile, node.work.x, node.grid.w & 0xffffu);
                         break;
                     }
                     bits &= ~mask;
@@ -85,8 +86,6 @@ fn graph_main(@builtin(local_invocation_index) physical_lane: u32,
         storageFence();
         if node.work.y != 0u {
             let grid = node.grid.xyz;
-            let logical = vec3<u32>(ticket.y % grid.x,
-                (ticket.y / grid.x) % grid.y, ticket.y / (grid.x * grid.y));
             switch ticket.w {
                 $CASES
                 default: {
@@ -99,9 +98,10 @@ fn graph_main(@builtin(local_invocation_index) physical_lane: u32,
         if physical_lane == 0u {
             storageFence();
             let counter = graph_config.counters + 3u * ticket.x;
-            let remaining = atomicSub(&graph_queue[counter + 1u], 1u);
-            if remaining == 0u { atomicOr(&graph_queue[1], 2u); }
-            if remaining == 1u {
+            let completed = node.grid.w >> 16u;
+            let remaining = atomicSub(&graph_queue[counter + 1u], completed);
+            if remaining < completed { atomicOr(&graph_queue[1], 2u); }
+            if remaining == completed {
                 storageFence();
                 for (var edge = 0u; edge < node.work.w; edge += 1u) {
                     let successor = graph_edges[node.work.z + edge];
@@ -120,7 +120,7 @@ fn graph_main(@builtin(local_invocation_index) physical_lane: u32,
             }
             if graph_config.track_workers != 0u && node.work.y != 0u {
                 atomicAdd(&graph_queue[graph_config.worker_counts
-                    + ticket.x * graph_config.workers + worker.x], 1u);
+                    + ticket.x * graph_config.workers + worker.x], completed);
             }
         }
         workgroupBarrier();

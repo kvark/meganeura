@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 const PREFIX: &str = "persistent_template_";
 
+#[derive(Clone)]
 pub(crate) struct Tile {
     pub source: String,
     pub call: String,
@@ -31,7 +32,8 @@ pub(super) fn validate(module: &Module) -> Result<naga::valid::ModuleInfo, Strin
 /// Every physical lane reaches the original workgroup barriers. Only the
 /// original lanes modify shared/storage memory; inactive subgroups also skip
 /// cooperative products assigned to local accumulators. The caller supplies a
-/// subgroup-uniform activity argument and the original logical geometry.
+/// subgroup-uniform activity and scratch-group arguments, and the original
+/// logical geometry.
 pub(crate) fn mask_extra_lanes(mut tile: Tile, physical_threads: u32) -> Result<Tile, String> {
     let logical_threads = tile.workgroup_size.into_iter().product::<u32>();
     if physical_threads == logical_threads {
@@ -54,6 +56,13 @@ pub(crate) fn mask_extra_lanes(mut tile: Tile, physical_threads: u32) -> Result<
         },
         Span::UNDEFINED,
     );
+    let group_ty = module.types.insert(
+        Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::U32),
+        },
+        Span::UNDEFINED,
+    );
     for (handle, function) in module.functions.iter_mut() {
         let index = function.arguments.len() as u32;
         function.arguments.push(FunctionArgument {
@@ -64,7 +73,15 @@ pub(crate) fn mask_extra_lanes(mut tile: Tile, physical_threads: u32) -> Result<
         let condition = function
             .expressions
             .append(Expression::FunctionArgument(index), Span::UNDEFINED);
-        append_call_arguments(&mut function.body, &[condition]);
+        function.arguments.push(FunctionArgument {
+            name: Some(format!("{PREFIX}tile_group_argument")),
+            ty: group_ty,
+            binding: None,
+        });
+        let group = function
+            .expressions
+            .append(Expression::FunctionArgument(index + 1), Span::UNDEFINED);
+        append_call_arguments(&mut function.body, &[condition, group]);
         mask_writes(&mut function.body, condition, &info[handle], &module.types)?;
         if tile.cooperative == Some(naga::CooperativeScope::Subgroup) {
             let mut products = HashMap::new();
@@ -85,7 +102,8 @@ pub(crate) fn mask_extra_lanes(mut tile: Tile, physical_threads: u32) -> Result<
         }
     }
     let end = tile.call.rfind(')').ok_or("missing tile call arguments")?;
-    tile.call.insert_str(end, ", $PREFIXactive_lane");
+    tile.call
+        .insert_str(end, ", $PREFIXactive_lane, $PREFIXtile_group");
     let mut names = HashMap::new();
     for (index, (_, var)) in module.global_variables.iter_mut().enumerate() {
         let original = var.name.clone().ok_or("unnamed tile global")?;
@@ -796,6 +814,16 @@ pub(crate) fn from_module(source: &str, entry_point: &str) -> Result<Tile, Strin
         var.name = Some(temporary);
     }
     function.name = Some(format!("{PREFIX}entry"));
+    subgroups |= std::iter::once(&function)
+        .chain(module.functions.iter().map(|(_, function)| function))
+        .any(|function| {
+            function.expressions.iter().any(|(_, expression)| {
+                matches!(
+                    *expression,
+                    Expression::SubgroupBallotResult | Expression::SubgroupOperationResult { .. }
+                )
+            })
+        });
     module.functions.append(function, Span::UNDEFINED);
     let info = validate(&module)?;
     let source =

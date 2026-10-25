@@ -211,13 +211,44 @@ impl Graph {
         if threads > 1024 {
             return Err("whole-graph worker exceeds 1024 invocations".into());
         }
-        let mut builder = codegen::graph::Builder::new(threads);
-        let mut kernels = Vec::new();
-        let mut layouts = Vec::new();
-        for handler in selected {
-            kernels.push(builder.add(handler.body, &handler.layout, kernels.len())?);
-            layouts.push(handler.layout);
-        }
+        let (builder, kernels, layouts) = [4, 2, 1]
+            .into_iter()
+            .find_map(|batch_limit| {
+                let mut builder = codegen::graph::Builder::new(threads);
+                builder.batch_limit = batch_limit;
+                let mut kernels = Vec::new();
+                let mut layouts = Vec::new();
+                for (index, handler) in selected.iter().enumerate() {
+                    let grids = plan
+                        .dispatches
+                        .iter()
+                        .zip(&handlers)
+                        .filter_map(|(dispatch, &handler_index)| {
+                            (handler_index == index).then_some(dispatch.workgroups)
+                        })
+                        .collect::<Vec<_>>();
+                    match builder.add(handler.body.clone(), &handler.layout, kernels.len(), &grids)
+                    {
+                        Ok(kernel) => kernels.push(kernel),
+                        Err(error) => return Some(Err(error)),
+                    }
+                    layouts.push(handler.layout.clone());
+                }
+                let reserved = if kernels.iter().any(|kernel| kernel.workgroup_cooperative) {
+                    u64::from(caps.cooperative_matrix.workgroup.reserved_shared_memory)
+                } else {
+                    0
+                };
+                if builder.shared_bytes() + reserved
+                    <= u64::from(caps.max_compute_shared_memory_size)
+                    || batch_limit == 1
+                {
+                    Some(Ok((builder, kernels, layouts)))
+                } else {
+                    None
+                }
+            })
+            .unwrap()?;
         Ok(Self {
             gpu: Arc::clone(gpu),
             options,
@@ -295,8 +326,12 @@ impl Graph {
                 };
                 let handler = tile(&self.gpu, plan, &dispatch, None)?;
                 let index = self.kernels.len();
-                self.kernels
-                    .push(self.builder.add(handler.body, &handler.layout, index)?);
+                self.kernels.push(self.builder.add(
+                    handler.body,
+                    &handler.layout,
+                    index,
+                    &[command.grid],
+                )?);
                 self.layouts.push(handler.layout);
                 self.optimizer_handlers.insert(command.entry.clone(), index);
                 index
@@ -418,9 +453,14 @@ impl Graph {
                 .into_iter()
                 .try_fold(1u32, |a, b| a.checked_mul(b))
                 .ok_or("tile count overflow")?;
-            if count > u32::MAX - self.options.workers - 1 {
+            if count > u32::MAX - 4 * self.options.workers - 1 {
                 return Err("tile claims may overflow".into());
             }
+            if handler > u16::MAX as usize {
+                return Err("too many whole-graph handlers".into());
+            }
+            let kernel = &self.kernels[handler];
+            let batch = kernel.tiles_per_claim(grid);
             tasks.push(count);
             let base = u32::try_from(parameters.len()).map_err(|_| "parameter offset overflow")?;
             let layout = &self.layouts[handler];
@@ -487,8 +527,35 @@ impl Graph {
             if pending == 0 {
                 queue[2 + node / 32] |= 1 << (node % 32);
             }
-            metadata.extend([grid[0], grid[1], grid[2], handler as u32, base, count, 0, 0]);
+            metadata.extend([
+                grid[0],
+                grid[1],
+                grid[2],
+                handler as u32 | (batch << 16),
+                base,
+                count,
+                0,
+                0,
+            ]);
         }
+        log::debug!(
+            "packed graph: shared={} nodes={} packed_nodes={} packed_tiles={}",
+            self.builder.shared_bytes(),
+            nodes,
+            metadata
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .filter(|node| node[3] >> 16 > 1)
+                .count(),
+            metadata
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .filter(|node| node[3] >> 16 > 1)
+                .map(|node| u64::from(node[5]))
+                .sum::<u64>()
+        );
         let mut edges = Vec::new();
         if self.options.track_workers
             && tasks.iter().map(|&count| u64::from(count)).sum::<u64>() > u64::from(u32::MAX)

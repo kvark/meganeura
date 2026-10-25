@@ -31,9 +31,12 @@ carry the original uniform bytes. Uniform word offsets are fixed by each
 handler's layout; descriptor indices are passed by value through its helpers.
 
 One physical workgroup is at least 256 invocations and must be a multiple of
-each selected logical workgroup. Extra lanes participate in every workgroup
-barrier; only the original lanes write shared/storage memory. Inactive subgroups
-skip cooperative multiply-adds assigned to local accumulators. Other extra-lane
+each selected logical workgroup. Eligible smaller tiles share the worker in
+groups of two or four, each with its original logical coordinates and separate
+scratch. The chosen grid axis minimizes queue claims and each claim width
+divides that axis, so claims cannot straddle its boundary. Inactive groups
+participate in every workgroup barrier but do not write shared/storage memory
+or execute cooperative products assigned to local accumulators. Other extra-lane
 calculations are still repeated. Subgroup handlers use virtual subgroup coordinates. A shader guard
 checks dense, linear subgroup mapping, full groups and compatible widths before
 executing graph work. This mapping is a qualification condition, not a portable
@@ -43,10 +46,21 @@ Unsupported mapping sets a completion diagnostic and executes no tile in that
 worker. Call `validate_persistent_completion()` during qualification.
 
 Shared arrays reuse a pool by element type and slot; capacity is the maximum
-across handlers. Original per-tile initialization remains in each callable body.
+across handlers, including each handler's packing width. Original per-tile
+initialization remains in each callable body. Packing retries with smaller
+widths if the combined scratch exceeds the device limit.
 Uniform parameters are loaded through `workgroupUniformLoad` and passed by value
 through tile helpers, preserving Naga's uniform-control-flow validation.
 No validation flags related to barrier uniformity are disabled.
+
+Packing requires uniform barrier control across the physical workgroup. An
+admission-only module inserts workgroup-scope cooperative operations at barriers
+to apply the fork's scope-aware dependency analysis through helper calls and
+locals. These probes never appear in the runtime shader. Query-dependent causal
+attention loops fail this check and retain one tile per claim. Native workgroup
+broadcasts and switch-containing bodies also stay unpacked; the latter avoids
+relying on incomplete post-switch exit analysis. Failure to qualify packing
+retains the same handler inside the single graph dispatch.
 
 Admission checks descriptor counts, storage ranges, shared memory (including
 reserved workgroup cooperative storage), and counter sizes. Imported allocations
@@ -60,9 +74,10 @@ support for arbitrary shaders or hardware.
 ## Dependencies and completion
 
 The ready bitmap contains nodes, not individual tiles. Each node has a next-tile
-counter, remaining-tile counter and predecessor count. A worker claims a tile
-from a ready node; the final claim clears its ready bit. The final completing
-tile releases every successor whose predecessor count reaches zero. Zero-tile
+counter, remaining-tile counter and predecessor count. A worker claims one or
+more concurrently executed tiles from a ready node; the final claim clears its
+ready bit. Completion subtracts that claim's logical tile count, and the final
+completion releases every successor whose predecessor count reaches zero. Zero-tile
 nodes use one control task to propagate dependencies and perform no arithmetic.
 
 Edges point forward in recording order. Conflicting reads/writes of the same
@@ -104,20 +119,27 @@ Initial checks cover 1, 3, 64 and 4096 workers, repeated resets, empty nodes,
 fan-in/fan-out, physical allocation reuse, external repeated recording, selected
 matrix/attention kernels, mixed 128/256-lane reductions, and exact small-graph
 parameters, gradients and optimizer state. Vulkan validation is enabled in the
-GPU tests. All six focused whole-graph tests pass. The external-recording test
+GPU tests. All seven focused whole-graph tests pass. Packed matrix coverage
+includes two- and four-tile claims, partial rows and repeated scratch reuse
+with 1, 3, 64 and 4096 workers. The external-recording test
 also waits for a submitted step while a later recording with a different
 learning rate remains unsubmitted, then verifies all three parameter updates.
 
 On RTX 5080, strict whole-graph selection passes all **168 oracle tests**,
 including attention, convolution, reduced-precision storage, scatter, fusion and
 backward cases. Queue completion is checked by the shared reference harness.
-The ordinary-path integration run passes **664 library, 168 oracle, 182
+The earlier broad ordinary-path integration run passed **664 library, 168 oracle, 182
 regression, 81 smoke and 22 GGUF tests** (8 library, 21 regression and 2 smoke
 tests remain ignored).
 Formatting, all-target Clippy, bare/all-feature checks and documentation pass.
 The Metal library cross-check passes with `models,gguf`; all-feature cross-checking
 is blocked by the Linux C compiler's unsupported Apple flags in `ring`.
 No Metal GPU execution is claimed.
+
+The concurrent-packing change passes **665 library tests** (eight ignored),
+all **168 strict whole-graph oracle tests**, the seven focused graph tests,
+formatting and strict all-target/all-feature Clippy. The Naga and Blade
+dependency revisions are unchanged.
 
 ```sh
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json \

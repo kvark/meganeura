@@ -61,8 +61,13 @@ the qualified memory-ordering contract remains unchanged.
   passes 664 library tests, 168 strict oracle tests and 250 paired comparisons;
   SDK instruction and load counts fall, but full-step timing does not show a
   useful improvement. Revert it and retain the evidence.
-- [ ] Investigate packing independent logical tiles into spare subgroups of a
-  physical worker, subject to scratch isolation and full barrier validation.
+- [x] Pack two or four independent logical tiles into spare worker subgroups,
+  with isolated scratch and admission checks for uniform barrier control.
+  Keep query-dependent causal attention unpacked. Pass 665 library tests,
+  all 168 strict oracle tests and seven focused whole-graph tests, including
+  repeated packed matrix execution with 1/3/64/4096 workers.
+- [ ] Measure the qualified concurrent packing implementation with isolated
+  full-step paired runs and separate SDK counters.
 - [ ] Isolate remaining queue/indexing/resource costs and reach baseline
   performance under the same full-step measurement and correctness gates. Keep this opt-in until performance justifies
   a default change.
