@@ -132,6 +132,45 @@ fn recorded_inference_matches_step_between_application_passes() {
     gpu.destroy_buffer(result);
 }
 
+/// A sibling consumer reads gradients directly from the same queue, without
+/// a host wait between the backward submission and the application's copy.
+#[test]
+fn application_consumes_parameter_gradients() {
+    let gpu = crate::support::gpu::gpu();
+    let mut session = training_session(&gpu, false);
+    assert!(
+        session
+            .gradient_buffer(meganeura::compile::BufferRef(u32::MAX))
+            .is_none()
+    );
+    let gradient = session
+        .gradient_buffer(session.param_buffer("w0").unwrap())
+        .unwrap();
+    let result = shared_buffer(&gpu, "gradient result", &[f32::NAN; 64]);
+    let mut encoder = app_encoder(&gpu);
+    session.step();
+    encoder.start();
+    encoder
+        .transfer("consume gradient")
+        .copy_buffer_to_buffer(gradient, result.at(0), 64 * 4);
+    let sync = gpu.submit(&mut encoder);
+    assert!(gpu.wait_for(&sync, u32::MAX).unwrap());
+    session.wait();
+    let mut expected = vec![0.; 64];
+    session.read_param_grad("w0", &mut expected);
+    assert!(expected.iter().any(|&v| v != 0.));
+    assert_eq!(read_shared(result, 64), expected);
+    gpu.destroy_command_encoder(&mut encoder);
+    gpu.destroy_buffer(result);
+
+    let inference = meganeura::build(&training_graph(), crate::support::gpu::inference_config()).0;
+    assert!(
+        inference
+            .gradient_buffer(inference.param_buffer("w0").unwrap())
+            .is_none()
+    );
+}
+
 fn training_graph() -> Graph {
     let mut g = Graph::new();
     let x = g.input("x", &[4, 8]);
