@@ -464,9 +464,34 @@ fresh-execution counts.
   for this rejected inference-only experiment. Raw sources, plans, ABBA samples,
   gate results and structural assertions are retained in `pointwise-chains-*`,
   especially `pointwise-chains-assessment.json` and `pointwise-chains-source-v2`.
+
+  The wider chain exposes two unpartitioned F16-output products in SD U-Net.
+  A separate combined Intel holdout changes only their backend store paths:
+  3.099 to 3.103 ms (+0.11%), with both independent output gates passing and
+  identical physical plans/counts. The NVIDIA versions are workgroup kernels;
+  this checked-store prototype does not alter that generator. Keep the Intel
+  neutral result in `pointwise-direct-result-model-control`; it establishes
+  no model win for the extra cooperative conversion support.
 - [ ] Consider immutable reduced weight caches only with upload, sharing,
   checkpoint, external-buffer and optimizer-update invalidation defined and
   tested. Inference parameters are still mutable through these interfaces.
+
+  The runtime audit confirms that `set_parameter` rebuilds derived concatenated
+  uploads, but `upload_param` writes the named buffer directly. Checkpoint
+  restoration writes parameter buffers directly too. `share_parameter_from`
+  and `bind_external_buffer(ExternalSlot::Parameter)` replace the physical
+  backing, and another session or external GPU producer can change it. Derived
+  parameter metadata alone therefore does not establish a coherent cache.
+
+  A candidate must preserve F32 parameters/optimizer state and refresh or
+  bypass every untracked GPU/external writer. CPU write generations must cover
+  all upload/restore paths and follow shared backing, including derived views;
+  merely marking a newly recorded GPU command as complete is insufficient.
+  Test warm-cache uploads (both APIs and packed forms), checkpoint restoration,
+  sharing/rebinding before and after warming, external parameter mutation,
+  optimizer writes on shared storage, retuning and lifetime/memory-budget
+  behavior against fresh F32 references before admitting caching. Keep the
+  existing mutable/sharing API behavior; inference alone is not immutability.
   Measure
   device-local and host-visible placement independently.
 
