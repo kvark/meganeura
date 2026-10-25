@@ -547,6 +547,69 @@ and the derived summary are in `target/megakernel-results/packed-tiles-sdk/`.
 
 ## Reproduction and artifact identities
 
+On this Linux host, run each build, test and benchmark in a separate user
+cgroup. The parent session must remain outside it. For example:
+
+```sh
+systemd-run --user --scope --slice=ml.slice \
+  -p MemoryHigh=16G -p MemoryMax=20G -p MemorySwapMax=1G \
+  cargo build --release --features models --example bench_smolvla_train --example bench_ci_latency
+```
+
+The local launcher `/x/Tools/meganeura-run-job.py LABEL -- COMMAND ...` creates a
+unique scope, verifies its membership and limits from inside the child, then
+executes the command. Captures keep their target and SDK monitor in that scope.
+GPU jobs remain serial, and primary measurements exclude builds and analysis.
+
+A diagnostic run exposed an unrelated host-memory failure before GPU execution:
+the optimizer eagerly expanded a shared expression DAG for a debug-log argument,
+even when that logging target was filtered out. The kernel killed the benchmark
+at approximately 29 GiB resident memory. Commit `cbf5167` logs the root term and
+DAG size instead. The same debug-enabled SmolVLA workload then completed all 20
+paired comparisons with 3.54 GiB peak RSS; ordinary training construction took
+88 ms. The failed run contributes no timing data. Logs are
+`target/head-packing-oom.log`, `target/head-packing-bounded.log` (a bounded
+reproduction stopped before its memory limit), and `target/head-packing-fixed.log`.
+
+## Subsequent experiments
+
+Worker counts 64, 128 and 512 each passed 20 short SmolVLA comparisons. None
+clearly improved both phases over 256: 64 workers measured 5.94 ms forward but
+33.89 ms training; 128 measured 6.21 / 22.80 ms and 512 measured 6.14 / 21.64 ms.
+These short probes are not primary performance claims. Records are
+`target/packed-workers-{64,128,512}.{json,log}`.
+
+Retesting inactive-loop suppression after packing passed 100 comparisons with
+the full 50-pair protocol. Forward measured 1.448× ordinary (95% interval
+1.441–1.519), training 1.418× (1.392–1.453). Both overlap the published results,
+so the transformation remains reverted. The patch, binary hash and summary are
+under `target/megakernel-results/packed-masked-paired/`.
+
+Another prototype separated workgroup coordinates into scalar arguments, so
+barrier analysis could admit independent attention heads while still rejecting
+query-axis packing with unequal loop bounds. Three-tile claims packed SmolVLA's
+15 heads. Compiler checks and the focused selected-geometry GPU test passed;
+100 full-step comparisons also passed with unchanged arithmetic selection.
+However, shared storage grew from 29,184 to 41,216 bytes for forward execution.
+Forward measured 6.534 ms / 1.475× ordinary (1.464–1.483), training 21.645 ms /
+1.431× (1.416–1.610), giving no useful improvement. The prototype was reverted;
+records and its patch are under `target/megakernel-results/head-packing-paired/`.
+Sorting scratch slots by size did not reduce this allocation and was also
+reverted; its short probe and patch are `target/head-ranked-smolvla.*` and
+`target/head-packing-ranked.patch`.
+
+Removing the final worker-loop barrier, relying on the next queue broadcast's
+rendezvous, passed all seven focused graph tests but gave no clear CI or
+SmolVLA improvement. A direct-successor experiment let the final producer reserve
+the successor's first tile, fencing that reservation before publishing remaining
+work. It also passed the seven focused tests, 150 CI comparisons and 20 short
+SmolVLA comparisons without improving either workload. Both were reverted.
+Patches and records are `target/joined-claim*` and
+`target/successor-reservation*`. No rejected experiment changes the published
+queue or memory contract.
+
+## Earlier artifact identities
+
 All records remain on local storage at
 `target/megakernel-results/whole-graph-20261025/`. The measured SmolVLA executable
 has SHA-256 `fd52b1400a974c8c7a326afcc40b071310aecb61aa4cba9c5a19a64de6398637`.

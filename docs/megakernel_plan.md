@@ -71,6 +71,11 @@ the qualified memory-ordering contract remains unchanged.
   measures 1.426× with a wider interval. Separate SDK captures preserve exact
   forward state and estimate 1.87× warp instructions and 1.11× global-load
   sectors. Every selected case still uses one dispatch; parity remains unmet.
+- [x] Probe 64/128/512 workers, retest inactive-loop suppression, and qualify
+  head-axis packing with 100 comparisons. None establishes a useful improvement
+  over the published implementation. Barrier removal and direct-successor
+  reservation also pass focused checks without a timing gain; retain the
+  evidence and revert these candidates.
 - [ ] Isolate remaining queue/indexing/resource costs and reach baseline
   performance under the same full-step measurement and correctness gates. Keep this opt-in until performance justifies
   a default change.
