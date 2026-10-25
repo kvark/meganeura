@@ -379,11 +379,10 @@ fresh-execution counts.
   padding by 8 or 16 half-elements regresses the staged Intel 128×576×576
   products by 5–11%. Native direct loads are unchanged. Retain the samples;
   do not change production staging or spend model time on this losing variant.
-- Larger key blocks for QK/PV: the prototype processes 16 keys between shared
-  memory exchanges. Test 32/64-key blocks at fixed arithmetic and storage before
-  attributing Intel Whisper's loss to matrix hardware. Measure barriers,
-  staging/register pressure and complete models; preserve masks/tails, F32
-  online softmax and the smaller portable fallback.
+- Larger key blocks for QK/PV: the 32/64-key experiment below finds a small
+  SmolLM2 gain on both GPUs, but loses on Whisper and exposes Intel spills at
+  64 keys. Preserve masks/tails, F32 online softmax and the 16-key fallback;
+  investigate measured class selection before production admission.
 - Per-attention-class selection: SD U-Net and SmolVLA contain multiple
   attention shapes. A whole-program switch can hide a profitable subset;
   evaluate class-specific alternatives with complete-program qualification.
@@ -407,6 +406,64 @@ fresh-execution counts.
   per-element feature bits remain disabled. The pinned Naga IR has matrix
   loads, multiply-add and stores, but no matrix reduction or per-element call.
   These require compiler/backend work before a model experiment can use them.
+
+- [x] Test 32/64-key QK/PV blocks without changing operand precision, F32
+  accumulation, online statistics or output/LSE formats. Forty-six fixtures
+  fit the advertised shared-memory limit: 38 pass the independent F64 bounds;
+  the two long cancellation fixtures on each GPU/key size miss the provisional
+  1% relative-L2 bound with both the original and new kernels. Retain all
+  eight failures. The two 64-key/128-wide-head cases need 51,200 bytes against
+  the advertised 49,152 and are excluded despite driver execution in the first
+  raw sweep. The final prototype rejects them before pipeline creation.
+
+  All 24 model variants pass independent F32 output and same-program
+  repeatability checks before/after timing. A serialized diagnostic key-size
+  knob distinguishes algorithm identity. Earlier environment-only SD U-Net
+  trials incorrectly shared the 16-key plan identity and were rejected by the
+  tighter repeatability gate; retain those reports separately. No gate changed.
+  The matching diagnostic engine is required for these saved plans.
+
+  At fixed plans/submission counts, changes versus each selected baseline are:
+
+  | GPU | Model | 32 keys | 64 keys |
+  | --- | --- | ---: | ---: |
+  | B570 | SmolLM2 | -1.87% | +4.69% |
+  | B570 | SD U-Net | -0.30% | +0.33% |
+  | B570 | SmolVLA | +1.51% | +2.47% |
+  | B570 | Whisper | +100.59% | +108.20% |
+  | RTX 5070 | SmolLM2 | -1.67% | -2.11% |
+  | RTX 5070 | SD U-Net | -0.82% | -0.73% |
+  | RTX 5070 | SmolVLA | -0.43% | +0.12% |
+  | RTX 5070 | Whisper | +5.36% | +11.72% |
+
+  Intel Whisper's selected baseline is scalar flash attention; forcing the
+  existing 16-key QK/PV path already loses 66.07%. SmolLM2 baselines already
+  use 16-key QK/PV, isolating the new block sizes. Separate uninstrumented
+  100-sample paired repeats confirm Intel 32-key 7.825→7.681 ms (-1.84%),
+  NVIDIA 32-key 3.633→3.576 ms (-1.57%) and 64-key 3.621→3.548 ms (-2.00%).
+  Qualification passes before/after every repeat. One repeat's subsequent
+  profiling call lacked enabled timestamp pools; its completed uninstrumented
+  timing pair remains valid. Separate timestamp-enabled, qualification-only
+  runs collect the profiles; their instrumented wall times are not holdouts.
+
+  Across 30 attention dispatches, timestamp-median sums change Intel
+  1.757→1.613 ms, NVIDIA 0.552→0.492 ms (32 keys) and 0.553→0.482 ms
+  (64 keys), consistent with the complete-step savings. Instrumented totals
+  differ from ordinary step times. Intel native compilation remains SIMD32:
+  16/32-key variants have zero spills, while 64 keys reports 2 spills / 36
+  fills and 1,004 instructions versus 747 at 16 keys. Shared storage at width
+  64 grows 11,776→17,408→28,672 bytes. These support pressure as a concern;
+  they do not establish a complete cause for every losing shape.
+
+  The four rebuilt probe pairs across both GPUs emit byte-identical WGSL to the raw
+  fixture sweep and pass F64 checks. Plan audits find only the intended key
+  knob and forward attention shader/geometry changes. Evidence is retained in
+  `attention-key-block-*`, including model/followup/profile/assembly assessments
+  and `attention-key-block-source-v2-serialized` with hashes and external app
+  modules. No training trajectory or bounded-search admission is claimed.
+- [ ] Evaluate class-local measured key-block selection, retaining 16 keys and
+  unchanged training admission. Confirm the SmolLM2 gain through bounded search
+  and independent holdouts before adding a production choice.
 
 - [ ] Extend useful storage chains through pointwise operations and compatible
   fusion without adding redundant widening/narrowing dispatches.
@@ -472,7 +529,7 @@ fresh-execution counts.
   this checked-store prototype does not alter that generator. Keep the Intel
   neutral result in `pointwise-direct-result-model-control`; it establishes
   no model win for the extra cooperative conversion support.
-- [ ] Consider immutable reduced weight caches only with upload, sharing,
+- [x] Prototype coherent reduced weight caches with upload, sharing,
   checkpoint, external-buffer and optimizer-update invalidation defined and
   tested. Inference parameters are still mutable through these interfaces.
 
