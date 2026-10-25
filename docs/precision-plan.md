@@ -489,10 +489,34 @@ fresh-execution counts.
   regression is also retested. All-target/all-feature lint passes.
   Evidence: `attention-block-selection-*`, especially the search assessment,
   key-only and matched-repeat holdouts, and final source snapshots.
-- [ ] Investigate bounded extra paired samples for ambiguous small gains.
-  Intel SmolVLA's six-pair race rejects a positive median gain because its
-  noise margin is wide. Preserve confidence thresholds and the common deadline;
-  do not lower the acceptance bar to force this candidate to win.
+- [x] Investigate bounded extra paired samples for ambiguous small gains.
+  Retain the fixed policy: the noise penalty is twice the paired-difference
+  MAD, a dispersion measure that need not shrink with more samples.
+
+  A prospective fixed-plan study uses both GPUs, SmolLM2 and SmolVLA, 30
+  separate attempts per case, 250 ms warmup and 24 alternating pairs per
+  attempt. Every step refreshes identical inputs before timing, and both
+  sessions share every parameter (302 for SmolLM2, 168 for SmolVLA). All eight
+  before/after independent F32 and repeatability gates pass.
+
+  Across the three beneficial cases, the six-pair rule accepts 75/90 attempts;
+  fixed twelve accepts 78/90, and twenty-four accepts 74/90. One bounded
+  extension, requiring both a fresh twelve-pair batch and the pooled eighteen
+  to pass the unchanged rule, accepts 79/90 and adds a mean 6.06 ms of measured
+  step time per comparison across all eight cases. Extra confirmation of
+  ambiguous wins accepts 75/90 with more work. Every policy rejects all 120
+  identical-program controls and the 30 below-threshold NVIDIA SmolVLA attempts.
+  These are descriptive results from the same recorded attempts, not a formal
+  confidence guarantee or a demonstrated whole-search improvement. The small,
+  inconsistent benefit does not justify another default policy or public knob.
+
+  Saved-trace replay also fails to support increasing the fixed count; its
+  circular offsets are sensitivity views, not independent trials. Sources,
+  counter traces, receipts, policies and checks remain in `paired-sampling-*`.
+  The next precision implementation is BF16 for NN derivative multiplication,
+  independently of F16 AT/BT; its earlier 256-update controls already qualify
+  and show a separate 3.72% Intel opportunity. F32 bindings/accumulators/partials,
+  explicit pins and the existing model gates must remain intact.
 
 - [ ] Extend useful storage chains through pointwise operations and compatible
   fusion without adding redundant widening/narrowing dispatches.
