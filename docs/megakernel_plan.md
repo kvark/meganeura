@@ -51,6 +51,8 @@ the qualified memory-ordering contract remains unchanged.
 - [x] Extend SDK captures to instruction and memory counters. Trace excess
   local-memory traffic to cooperative attention's output array and replace it
   with scalar accumulators while preserving arithmetic in both paths.
+  Clean `36304a0` passes 250 new paired comparisons; SmolVLA ratios are now
+  1.816× forward and 1.510× with SGD.
 - [ ] Isolate remaining queue/indexing/resource costs and reach baseline
   performance under the same full-step measurement and correctness gates. Keep this opt-in until performance justifies
   a default change.

@@ -347,6 +347,30 @@ Claiming four tiles per queue operation regressed CI and SmolVLA and was
 reverted. Saved patches and exploratory paired records remain under `target/`;
 none of those experiments changes the published fence contract.
 
+## Latest completed-step measurement
+
+Clean commit `36304a0` includes the scalar attention accumulators. The same
+uninstrumented 50-pair protocol passes all **250 comparisons**, with exact
+forward/CI state and maximum training difference `4.6566128730773926e-9`.
+Every persistent case reports one dispatch and identical arithmetic selection.
+All rows use 256 workers.
+
+| Workload | Ordinary median, ms | Whole-graph median, ms | Median paired ratio | 95% bootstrap interval |
+|---|---:|---:|---:|---:|
+| SmolVLA forward | 4.439 | 8.047 | 1.816 | 1.804–1.858 |
+| SmolVLA forward/backward/SGD | 15.133 | 22.821 | 1.510 | 1.485–1.529 |
+| CI inference | 0.0520 | 0.0691 | 1.324 | 1.316–1.332 |
+| CI forward/backward | 0.0665 | 0.1002 | 1.496 | 1.485–1.513 |
+| CI forward/backward/SGD | 0.0677 | 0.1032 | 1.505 | 1.485–1.524 |
+
+These results improve SmolVLA over the initial implementation but remain below
+ordinary performance. CI does not use the changed attention kernel; its gap
+remains. Records and hashes are under
+`target/megakernel-results/whole-graph-scalar-36304a0/summary.json`, with the
+same bootstrap procedure in filename/case order. The isolated final run is
+the only SmolVLA record used here. An invalid ICD-path attempt and two cancelled
+overlapping runs are retained and explicitly excluded in that summary.
+
 ## Reproduction and artifact identities
 
 All records remain on local storage at
