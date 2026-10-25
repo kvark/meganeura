@@ -1018,9 +1018,8 @@ enum Variant {
     Coop(ShaderEntry, crate::compile::WeightFormat),
     /// Cooperative f16 with hi/lo residual staging (C1).
     CoopCompensated(ShaderEntry),
-    /// Same-A matmul pack (D1). The kind is part of the key so a
-    /// forward Q/K/V pack (plain f16 coop) cannot share a pipeline with
-    /// a backward pack of the same arity (compensated).
+    /// Same-A matmul pack (D1). The key distinguishes scalar tile geometry
+    /// and plain versus compensated cooperative arithmetic.
     Horizontal(ShaderEntry, u32, HorizMatMulKind),
     SmallTile(ShaderEntry),
     /// The unmodified pipeline.
@@ -1029,7 +1028,7 @@ enum Variant {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum HorizMatMulKind {
-    Scalar,
+    Scalar(crate::codegen::MatMulTile),
     Coop,
     CoopCompensated,
 }
@@ -1040,7 +1039,11 @@ fn horiz_kind(dispatch: &Dispatch) -> HorizMatMulKind {
     } else if dispatch.use_coop() {
         HorizMatMulKind::Coop
     } else {
-        HorizMatMulKind::Scalar
+        HorizMatMulKind::Scalar(if dispatch.use_small_tiles() {
+            crate::codegen::MatMulTile::Small
+        } else {
+            crate::codegen::MatMulTile::Large
+        })
     }
 }
 
@@ -2182,7 +2185,7 @@ impl Pipelines {
             }
             Variant::Horizontal(_, count, kind) => {
                 let coop = match kind {
-                    HorizMatMulKind::Scalar => None,
+                    HorizMatMulKind::Scalar(_) => None,
                     HorizMatMulKind::Coop | HorizMatMulKind::CoopCompensated => {
                         let mut config = cooperative();
                         config.compensated = kind == HorizMatMulKind::CoopCompensated;
@@ -2191,7 +2194,19 @@ impl Pipelines {
                 };
                 layout = horizontal_matmul_layout(count);
                 entry_point = "main";
-                crate::codegen::generate_horizontal_matmul(group, count, coop.as_ref())
+                crate::codegen::generate_horizontal_matmul(
+                    group,
+                    count,
+                    coop.as_ref(),
+                    crate::codegen::MatMulOptions {
+                        tile: match kind {
+                            HorizMatMulKind::Scalar(tile) => tile,
+                            _ => crate::codegen::MatMulTile::Large,
+                        },
+                        knobs: matmul_knobs,
+                        ..Default::default()
+                    },
+                )
             }
         };
         Ok((module, layout, entry_point))
@@ -5775,8 +5790,12 @@ mod variant_tests {
     }
 
     #[test]
-    fn horizontal_pack_keys_include_precision() {
+    fn horizontal_pack_keys_include_geometry_and_precision() {
         let scalar = matmul(|d| d.horizontal_batch = 3);
+        let small = matmul(|d| {
+            d.horizontal_batch = 3;
+            d.kernel = crate::compile::Kernel::SmallTile;
+        });
         let coop = matmul(|d| {
             d.horizontal_batch = 3;
             d.kernel = crate::compile::Kernel::Cooperative;
@@ -5787,8 +5806,21 @@ mod variant_tests {
         });
         assert_eq!(
             scalar,
-            Variant::Horizontal(ShaderEntry::MatMul, 3, HorizMatMulKind::Scalar)
+            Variant::Horizontal(
+                ShaderEntry::MatMul,
+                3,
+                HorizMatMulKind::Scalar(crate::codegen::MatMulTile::Large)
+            )
         );
+        assert_eq!(
+            small,
+            Variant::Horizontal(
+                ShaderEntry::MatMul,
+                3,
+                HorizMatMulKind::Scalar(crate::codegen::MatMulTile::Small)
+            )
+        );
+        assert_ne!(scalar, small);
         assert_ne!(scalar, coop);
         assert_ne!(coop, compensated);
         assert_eq!(

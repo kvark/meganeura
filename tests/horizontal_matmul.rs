@@ -44,7 +44,7 @@ fn assert_close(gpu: &[f32], cpu: &[f32], label: &str) {
         .fold(0.0_f32, f32::max);
     let rel = max_abs / max_cpu;
     assert!(
-        rel < 0.02,
+        rel < 2e-5,
         "{label}: rel err {:.3}% (max|gpu-cpu|={:.3e}, max|cpu|={:.3e})\n  gpu[..8]={:?}\n  cpu[..8]={:?}",
         rel * 100.0,
         max_abs,
@@ -56,9 +56,9 @@ fn assert_close(gpu: &[f32], cpu: &[f32], label: &str) {
 
 #[test]
 fn same_a_qkv_pack_matches_cpu() {
-    let m = 32usize;
-    let k = 32usize;
-    let n = 32usize;
+    let m = 35usize;
+    let k = 33usize;
+    let n = 385usize;
     let mut g = Graph::new();
     let a = g.input("a", &[m, k]);
     let wq = g.input("wq", &[k, n]);
@@ -69,7 +69,7 @@ fn same_a_qkv_pack_matches_cpu() {
     let v = g.matmul(a, wv);
     g.set_outputs(vec![q, kk, v]);
 
-    let (mut session, _) = build(
+    let (session, _) = build(
         &g,
         SessionConfig {
             mode: Mode::Inference,
@@ -91,22 +91,74 @@ fn same_a_qkv_pack_matches_cpu() {
             .collect::<Vec<_>>()
     );
 
-    let a_data = pcg_inputs(m * k, 1);
+    let gpu = crate::support::gpu::gpu();
+    let supports_graph = gpu.capabilities().device_memory_fence && gpu.capabilities().binding_array;
+    let mut sessions = Vec::new();
+    // Keep both geometries alive on one context so their pipeline keys cannot collide.
+    for (tile, kernel) in [
+        (32usize, meganeura::compile::Kernel::SmallTile),
+        (64, meganeura::compile::Kernel::Default),
+    ] {
+        let mut plan = session.plan().clone();
+        assert_eq!(plan.dispatches.len(), 1);
+        let dispatch = &mut plan.dispatches[0];
+        dispatch.kernel = kernel;
+        dispatch.workgroups = [n.div_ceil(tile) as u32, m.div_ceil(tile) as u32, 3];
+        for persistent in [false, true] {
+            if persistent && !supports_graph {
+                continue;
+            }
+            let mut options = meganeura::SessionOptions::from_env();
+            options.persistent = persistent.then_some(meganeura::PersistentOptions {
+                workers: 3,
+                device_scheduling: true,
+                whole_graph: true,
+                allow_fallback: false,
+                track_workers: true,
+            });
+            let selected =
+                meganeura::Session::with_context_opts(plan.clone(), gpu.clone(), options);
+            assert_eq!(
+                selected.plan().dispatches[0].kernel,
+                plan.dispatches[0].kernel
+            );
+            assert_eq!(
+                selected.plan().dispatches[0].workgroups,
+                plan.dispatches[0].workgroups
+            );
+            sessions.push((tile, persistent, selected));
+        }
+    }
     let wq_data = pcg_inputs(k * n, 2);
     let wk_data = pcg_inputs(k * n, 3);
     let wv_data = pcg_inputs(k * n, 4);
-    session.set_input("a", &a_data);
-    session.set_input("wq", &wq_data);
-    session.set_input("wk", &wk_data);
-    session.set_input("wv", &wv_data);
-    session.step();
-    session.wait();
-
-    for (idx, weight) in [(0, &wq_data), (1, &wk_data), (2, &wv_data)] {
-        let mut gpu = vec![0.0_f32; m * n];
-        session.read_output_by_index(idx, &mut gpu);
-        let cpu = cpu_matmul(&a_data, weight, m, k, n);
-        assert_close(&gpu, &cpu, &format!("sibling {idx}"));
+    for seed in [1, 5] {
+        let a_data = pcg_inputs(m * k, seed);
+        let expected: Vec<_> = [&wq_data, &wk_data, &wv_data]
+            .into_iter()
+            .map(|weight| cpu_matmul(&a_data, weight, m, k, n))
+            .collect();
+        for (tile, persistent, session) in &mut sessions {
+            session.set_input("a", &a_data);
+            session.set_input("wq", &wq_data);
+            session.set_input("wk", &wk_data);
+            session.set_input("wv", &wv_data);
+            session.step();
+            session.wait();
+            if *persistent {
+                session.validate_persistent_completion().unwrap();
+                assert_eq!(session.execution_report().compute_dispatches, 1);
+            }
+            for (idx, cpu) in expected.iter().enumerate() {
+                let mut values = vec![0.0_f32; m * n];
+                session.read_output_by_index(idx, &mut values);
+                assert_close(
+                    &values,
+                    cpu,
+                    &format!("tile {tile}, persistent {persistent}, sibling {idx}"),
+                );
+            }
+        }
     }
 }
 

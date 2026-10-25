@@ -1132,10 +1132,12 @@ pub fn generate_module_coop_weighted(
 
 /// Pack `count` same-A matmuls into one dispatch (`workgroups.z = count`).
 /// Each z-slice uses `matrix_b{i}` / `matrix_c{i}`.
+/// Scalar packs use `options` to preserve the selected tile geometry and staging.
 pub fn generate_horizontal_matmul(
     group: ShaderGroup,
     count: u32,
     coop: Option<&CoopConfig>,
+    options: MatMulOptions,
 ) -> ShaderModule {
     assert!((2..=3).contains(&count));
     match coop {
@@ -1152,7 +1154,7 @@ pub fn generate_horizontal_matmul(
                 WeightFormat::F32,
             )
         }
-        None => generate_partitioned_matmul(group, None, MatMulOptions::default(), 1, count),
+        None => generate_partitioned_matmul(group, None, options, 1, count),
     }
 }
 
@@ -3982,12 +3984,29 @@ mod tests {
                 ShaderGroup::MatMulAT,
                 ShaderGroup::MatMulBT,
             ] {
-                let module = generate_horizontal_matmul(group, count, None);
-                assert!(module.source.contains("matrix_b0"));
-                assert!(module.source.contains("horiz_0"));
-                Validator::new(flags, Capabilities::empty())
-                    .validate(&module.module)
-                    .unwrap_or_else(|e| panic!("horizontal {group:?} {count} failed: {e:#?}"));
+                for (tile, width) in [(MatMulTile::Large, 64), (MatMulTile::Small, 32)] {
+                    let module = generate_horizontal_matmul(
+                        group,
+                        count,
+                        None,
+                        MatMulOptions {
+                            tile,
+                            ..Default::default()
+                        },
+                    );
+                    assert!(module.source.contains("matrix_b0"));
+                    assert!(module.source.contains("horiz_0"));
+                    assert!(
+                        module
+                            .source
+                            .contains(&format!("let tile_col = wgid.x * {width}u;"))
+                    );
+                    Validator::new(flags, Capabilities::empty())
+                        .validate(&module.module)
+                        .unwrap_or_else(|e| {
+                            panic!("horizontal {group:?} {count} {tile:?} failed: {e:#?}")
+                        });
+                }
             }
             for (label, cfg, caps) in [
                 (
@@ -4005,7 +4024,12 @@ mod tests {
                         | Capabilities::SUBGROUP,
                 ),
             ] {
-                let module = generate_horizontal_matmul(ShaderGroup::MatMul, count, Some(&cfg));
+                let module = generate_horizontal_matmul(
+                    ShaderGroup::MatMul,
+                    count,
+                    Some(&cfg),
+                    MatMulOptions::default(),
+                );
                 assert!(module.source.contains("matrix_b0"));
                 Validator::new(flags, caps)
                     .validate(&module.module)
