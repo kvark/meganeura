@@ -43,7 +43,7 @@ pub(super) fn fill(plan: &mut ExecutionPlan) -> usize {
             _ => continue,
         };
         if !d.shader.is_matmul()
-            || d.requires_full_precision
+            || d.full_precision()
             || d.matmul_prologue.is_some()
             || d.matmul_epilogue.is_some()
         {
@@ -79,7 +79,7 @@ pub(super) fn fill(plan: &mut ExecutionPlan) -> usize {
             let d = &plan.dispatches[index];
             !protected.contains(&source)
                 && reads[&source] == count
-                && !d.requires_full_precision
+                && !d.full_precision()
                 && d.extra_outputs.is_empty()
                 && d.matmul_prologue.is_none()
                 && d.matmul_epilogue.is_none()
@@ -135,7 +135,7 @@ pub(super) fn fill(plan: &mut ExecutionPlan) -> usize {
             _ => continue,
         };
         if !d.shader.is_matmul()
-            || d.requires_full_precision
+            || (d.requires_full_precision || d.is_derivative)
             || d.matmul_prologue.is_some()
             || d.matmul_epilogue.is_some()
         {

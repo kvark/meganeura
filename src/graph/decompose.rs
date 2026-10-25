@@ -59,6 +59,7 @@ impl Graph {
             nodes: Vec::with_capacity(self.nodes.len()),
             outputs: Vec::new(),
             new_nodes_require_full_precision: false,
+            new_nodes_are_derivatives: false,
             num_param_grad_outputs: 0,
             derived_params: self.derived_params.clone(),
         };
@@ -66,6 +67,7 @@ impl Graph {
         for node in &self.nodes {
             let inputs: Vec<NodeId> = node.inputs.iter().map(|&i| map[i as usize]).collect();
             out.new_nodes_require_full_precision = node.requires_full_precision;
+            out.new_nodes_are_derivatives = node.is_derivative;
             let id = if chosen(node) {
                 let id = out.expand(&node.op, &inputs, &node.ty);
                 if node.name.is_some() {
@@ -73,11 +75,12 @@ impl Graph {
                 }
                 id
             } else {
-                let id = out.add_raw_node_with_precision(
+                let id = out.add_raw_node_with_flags(
                     node.op.clone(),
                     inputs,
                     node.ty.clone(),
                     node.requires_full_precision,
+                    node.is_derivative,
                 );
                 let new = &mut out.nodes[id as usize];
                 new.name.clone_from(&node.name);

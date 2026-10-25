@@ -189,7 +189,7 @@ impl Problem {
             window: [p[5], p[6], p[7]],
             pinned: dispatch.conv_k_tile().is_some_and(|k| k != EXACT_K_TILE),
             reduced_storage: dispatch.weight_format.uses_reduced_storage(),
-            requires_full_precision: dispatch.requires_full_precision,
+            requires_full_precision: dispatch.full_precision(),
             epilogue_inputs: dispatch
                 .matmul_epilogue
                 .as_ref()

@@ -983,7 +983,7 @@ fn fill_attention_products(
     use compile::{DispatchParams as _, ShaderEntry};
     let mut count = 0;
     for dispatch in &mut plan.dispatches {
-        if dispatch.requires_full_precision
+        if dispatch.full_precision()
             || dispatch.schedule_locked
             || !matches!(
                 dispatch.shader,
@@ -1034,7 +1034,7 @@ fn fill_matrix_candidates_scoped(
         if d.shader.is_conv2d_gemm()
             && (!vector_convolutions_only
                 || crate::kernels::conv::Params::from(&*d).vectorized_forward())
-            && !d.requires_full_precision
+            && !d.full_precision()
             && !d.schedule_locked
             && d.matmul_epilogue.is_none()
             && d.extra_outputs.is_empty()
@@ -1070,7 +1070,7 @@ fn fill_matrix_candidates_scoped(
                     | compile::Kernel::ScalarMatmul(_)
                     | compile::Kernel::SplitMatmul { .. }
             )
-            || d.requires_full_precision
+            || d.full_precision()
             || (d.schedule_locked && !replace_extracted)
             || d.horizontal_batch > 1
             || d.weight_format != compile::WeightFormat::F32

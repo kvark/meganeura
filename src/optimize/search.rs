@@ -404,7 +404,7 @@ fn segment_candidates(
     if roots.is_empty() {
         return Err("region has no observable output".into());
     }
-    let full_precision = graph.node(roots[0] as u32).requires_full_precision;
+    let (full_precision, is_derivative) = graph.node(roots[0] as u32).precision_key();
     for id in segment
         .shifts
         .iter()
@@ -418,7 +418,7 @@ fn segment_candidates(
             }
             _ => {}
         }
-        if node.requires_full_precision != full_precision {
+        if node.precision_key() != (full_precision, is_derivative) {
             return Err("region crosses a precision boundary".into());
         }
         if !(1..=6).contains(&node.inputs.len()) {
@@ -610,6 +610,7 @@ fn segment_candidates(
                     fusions: &mut Vec::new(),
                     memo: HashMap::new(),
                     requires_full_precision: full_precision,
+                    is_derivative,
                 }
                 .stamp_root(root + shift, &terms, term)?;
             }
@@ -719,7 +720,7 @@ mod tests {
                     };
                     choices[index] = node.attention_impl.is_some();
                     assert!(!choices[index] || node.attention_ept_cap.is_none());
-                    assert!(node.requires_full_precision);
+                    assert!(node.full_precision());
                     assert_eq!(
                         form.graph.node(fwd).attention_impl,
                         Some(AttentionImpl::CooperativeF32)

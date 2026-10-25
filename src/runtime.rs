@@ -3303,8 +3303,8 @@ pub struct SessionOptions {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CoopPolicy {
     /// Prefer f32 operands and accumulators. On f16-only devices, enable f16 tiles for
-    /// work that permits reduced input precision; `requires_full_precision`
-    /// dispatches retain scalar f32 operands. Measured search also considers
+    /// work that permits reduced input precision; explicitly pinned and ordinary
+    /// derivative dispatches retain scalar f32 operands. Measured search also considers
     /// device-qualified F16/BF16 forward products and mixed-precision attention
     /// derivatives, subject to the caller's whole-program accuracy and timing gates.
     #[default]

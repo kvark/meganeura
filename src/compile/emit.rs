@@ -356,7 +356,7 @@ impl<'a> Compiler<'a> {
             Op::MultiHeadAttnGradQ { fwd_node, .. }
             | Op::MultiHeadAttnGradK { fwd_node, .. }
             | Op::MultiHeadAttnGradV { fwd_node, .. } => {
-                !self.graph.node(fwd_node).requires_full_precision
+                !self.graph.node(fwd_node).full_precision()
             }
             _ => false,
         };
@@ -2282,7 +2282,7 @@ impl<'a> Compiler<'a> {
                     seq,
                     head_dim,
                     num_heads,
-                    node.requires_full_precision,
+                    node.full_precision(),
                     node.attention_impl,
                 );
                 self.plan.dispatches.push(Dispatch {
@@ -2324,7 +2324,7 @@ impl<'a> Compiler<'a> {
                     seq,
                     head_dim,
                     num_heads,
-                    node.requires_full_precision,
+                    node.full_precision(),
                     node.attention_impl,
                 );
                 self.plan.dispatches.push(Dispatch {
@@ -2704,6 +2704,7 @@ impl<'a> Compiler<'a> {
                         ],
                         fusion_barrier: true,
                         requires_full_precision: node.requires_full_precision,
+                        is_derivative: node.is_derivative,
                         ..Default::default()
                     });
                     return;
@@ -3560,7 +3561,7 @@ impl<'a> Compiler<'a> {
                     q_seq,
                     head_dim,
                     num_heads,
-                    node.requires_full_precision,
+                    node.full_precision(),
                     node.attention_impl,
                 );
                 self.plan.dispatches.push(Dispatch {
@@ -3950,6 +3951,7 @@ impl<'a> Compiler<'a> {
         // silently turn f32 autodiff math into f16-input math.
         for dispatch in &mut self.plan.dispatches[dispatch_start..] {
             dispatch.requires_full_precision = node.requires_full_precision;
+            dispatch.is_derivative = node.is_derivative;
         }
     }
 

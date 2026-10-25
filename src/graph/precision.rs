@@ -63,7 +63,7 @@ impl Graph {
                 } => *fwd_node = remap[*fwd_node as usize],
                 _ => (),
             }
-            let cast = !node.requires_full_precision
+            let cast = !node.full_precision()
                 && select(&node.op)
                 && node.ty.dtype == DType::F32
                 && node.inputs[..2]
@@ -93,6 +93,7 @@ impl Graph {
             .map(|id| remap[id as usize])
             .collect();
         result.new_nodes_require_full_precision = sorted.new_nodes_require_full_precision;
+        result.new_nodes_are_derivatives = sorted.new_nodes_are_derivatives;
         result
     }
 }

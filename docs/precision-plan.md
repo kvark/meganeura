@@ -182,7 +182,8 @@ profile supports the opportunity.
   All 16 searches finish in 30–34.1 seconds including setup. Timing covers
   forward, loss and backward; optimizer updates are verified separately.
 
-Dense derivative controls now separate multiplication precision from storage.
+Dense derivative controls for transposed AT/BT products now separate
+multiplication precision from storage.
 They retain F32 inputs, outputs, accumulators, split partials and protection
 flags while explicitly testing the existing F16/BF16 kernels on saved layouts.
 Paired complete-model training changes, with fixed submission counts:
@@ -213,6 +214,15 @@ checks. These are saved-plan opportunities, not bounded-search results.
   Scanning once per partition is slower and fails a block-varying range fixture
   that per-K32 scaling passes. Mixed-range stress still rejects per-K32 scaling;
   the F32 baseline also fails the subnormal-input fixture. Retain all failures.
+A separate NN control covers the long-K vocabulary-input gradient in
+SmolLM2 (128×576×49,152, retaining 48 split partitions). Plain F16 fails the
+unchanged gradient gate on both cards: RMS error is about 7.3e-5 against a
+3.68e-5 limit. Consequently, extending the passing AT/BT candidate to every
+derivative product is not valid. BF16 qualifies at the initial/final weights
+and changes complete-step time by -3.23% on Intel and -0.27% on NVIDIA; its
+trajectory and combination with F16 AT/BT still need checking. Keep the NN
+scope separate from the AT/BT gains in the table above.
+
 - [ ] Add qualified measured derivative-input choices using the existing
   kernels. Preserve ordinary F32 construction, strict policy, explicit precision
   pins and the whole-gradient/trajectory gates; do not clear the blanket guard.

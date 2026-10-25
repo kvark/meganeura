@@ -829,7 +829,7 @@ impl TuneClass {
             n,
             k,
             conv2d,
-            requires_full_precision: dispatch.requires_full_precision,
+            requires_full_precision: dispatch.full_precision(),
             weight_format: dispatch.weight_format,
             gemv_int_dot: dispatch.gemv_int_dot(),
             gemv_rmsnorm: dispatch.gemv_rmsnorm.is_some(),

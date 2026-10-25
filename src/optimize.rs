@@ -21,6 +21,8 @@ use egglog::{Term, TermDag, TermId, ast::Literal, extract::Extractor};
 use std::collections::{HashMap, HashSet};
 use std::{fmt, time::Instant};
 
+type StructuralIndex = HashMap<(&'static str, Vec<NodeId>, (bool, bool)), NodeId>;
+
 /// Node-count ceiling for a single egglog saturation. Above this, the
 /// graph is segmented (see module docs). Shared-parameter graphs create
 /// large e-classes that make pattern matching superlinear: the SmolVLA
@@ -429,6 +431,7 @@ fn pack_glu_matmul(
     wu: NodeId,
     transposed: bool,
     requires_full_precision: bool,
+    is_derivative: bool,
 ) -> Option<NodeId> {
     let (gate, up) = (graph.node(wg), graph.node(wu));
     let Op::Parameter {
@@ -480,18 +483,20 @@ fn pack_glu_matmul(
             crate::graph::ParamTransform::HorizontalConcat
         },
     });
-    let concat_w = graph.add_raw_node_with_precision(
+    let concat_w = graph.add_raw_node_with_flags(
         Op::Parameter { name: concat_name },
         vec![],
         TensorType::new(shape, dtype),
         requires_full_precision,
+        is_derivative,
     );
     let m = graph.node(h).ty.shape[0];
-    Some(graph.add_raw_node_with_precision(
+    Some(graph.add_raw_node_with_flags(
         if transposed { Op::MatMulBT } else { Op::MatMul },
         vec![h, concat_w],
         TensorType::f32(vec![m, 2 * out_features]),
         requires_full_precision,
+        is_derivative,
     ))
 }
 
@@ -585,20 +590,15 @@ fn plan_segments(g: &Graph, mode: OptimizeMode, saturation_cutoff: usize) -> Vec
     segments
         .into_iter()
         .flat_map(|seg| {
-            let (full, relaxed) = seg
-                .ids
-                .into_iter()
-                .partition(|&id| g.nodes()[id].requires_full_precision);
-            [
-                Segment {
-                    ids: relaxed,
-                    shifts: seg.shifts.clone(),
-                },
-                Segment {
-                    ids: full,
-                    shifts: seg.shifts,
-                },
-            ]
+            [(false, false), (false, true), (true, false), (true, true)].map(|precision| Segment {
+                ids: seg
+                    .ids
+                    .iter()
+                    .copied()
+                    .filter(|&id| g.nodes()[id].precision_key() == precision)
+                    .collect(),
+                shifts: seg.shifts.clone(),
+            })
         })
         .filter(|seg| !seg.ids.is_empty())
         .collect()
@@ -992,7 +992,7 @@ fn instance_ext_map(
 fn process_segment(
     g: &mut Graph,
     seg: &Segment,
-    index: &mut HashMap<(&'static str, Vec<NodeId>, bool), NodeId>,
+    index: &mut StructuralIndex,
     report: &mut OptimizeReport,
     config: OptimizeConfig,
 ) {
@@ -1087,7 +1087,8 @@ fn process_segment(
             continue;
         };
         for &(root, term_id) in &terms {
-            let requires_full_precision = g.node((root + shift) as NodeId).requires_full_precision;
+            let (requires_full_precision, is_derivative) =
+                g.node((root + shift) as NodeId).precision_key();
             let mut stamper = Stamper {
                 g,
                 index,
@@ -1097,6 +1098,7 @@ fn process_segment(
                 fusions: &mut report.fusions_applied,
                 memo: HashMap::new(),
                 requires_full_precision,
+                is_derivative,
             };
             if let Err(e) = stamper.stamp_root(root + shift, &dag, term_id) {
                 log::warn!("stamping $n{} (+{}) failed: {}", root, shift, e);
@@ -1116,7 +1118,7 @@ struct Stamper<'a> {
     g: &'a mut Graph,
     /// Structural memo for named constructors:
     /// (name, children, precision policy) → node.
-    index: &'a mut HashMap<(&'static str, Vec<NodeId>, bool), NodeId>,
+    index: &'a mut StructuralIndex,
     /// Node ids of the encoded instance (terms only reference these).
     seg_ids: &'a HashSet<usize>,
     /// Id shift of the instance being stamped.
@@ -1130,6 +1132,7 @@ struct Stamper<'a> {
     /// materialized interior nodes must not cross the forward/backward
     /// reduced-precision boundary.
     requires_full_precision: bool,
+    is_derivative: bool,
 }
 
 impl Stamper<'_> {
@@ -1214,7 +1217,7 @@ impl Stamper<'_> {
                 match self.index.get(&(
                     static_constructor(name)?,
                     inputs.clone(),
-                    self.requires_full_precision,
+                    (self.requires_full_precision, self.is_derivative),
                 )) {
                     Some(&hit) => hit,
                     None => self.build_named(name, inputs, None)?,
@@ -1326,7 +1329,7 @@ impl Stamper<'_> {
             (
                 static_constructor(name)?,
                 inputs,
-                self.requires_full_precision,
+                (self.requires_full_precision, self.is_derivative),
             ),
             id,
         );
@@ -1360,9 +1363,15 @@ impl Stamper<'_> {
             Op::GeGLUConcat => "GeGLU",
             _ => unreachable!("glu pack only for SwiGLU/GeGLU concat"),
         };
-        let Some(wide_mm) =
-            pack_glu_matmul(self.g, h, wg, wu, transposed, self.requires_full_precision)
-        else {
+        let Some(wide_mm) = pack_glu_matmul(
+            self.g,
+            h,
+            wg,
+            wu,
+            transposed,
+            self.requires_full_precision,
+            self.is_derivative,
+        ) else {
             let gate = self.lookup_or_build(&scheduled, vec![h, wg])?;
             let up = self.lookup_or_build(&scheduled, vec![h, wu])?;
             return self.build_named(unpacked, vec![gate, up], target);
@@ -1377,7 +1386,11 @@ impl Stamper<'_> {
             target,
         );
         self.index.insert(
-            (packed_key, inputs.to_vec(), self.requires_full_precision),
+            (
+                packed_key,
+                inputs.to_vec(),
+                (self.requires_full_precision, self.is_derivative),
+            ),
             id,
         );
         self.fusions.push((
@@ -1391,7 +1404,7 @@ impl Stamper<'_> {
         match self.index.get(&(
             static_constructor(name)?,
             inputs.clone(),
-            self.requires_full_precision,
+            (self.requires_full_precision, self.is_derivative),
         )) {
             Some(&hit) => Ok(hit),
             None => self.build_named(name, inputs, None),
@@ -1415,10 +1428,13 @@ impl Stamper<'_> {
                 // ty deliberately untouched: same e-class, same tensor.
                 id
             }
-            None => {
-                self.g
-                    .add_raw_node_with_precision(op, inputs, ty, self.requires_full_precision)
-            }
+            None => self.g.add_raw_node_with_flags(
+                op,
+                inputs,
+                ty,
+                self.requires_full_precision,
+                self.is_derivative,
+            ),
         };
         self.g.nodes_mut()[id as usize].matmul_impl = None;
         self.g.nodes_mut()[id as usize].attention_ept_cap = None;
@@ -1673,14 +1689,11 @@ fn lit_node_id(dag: &TermDag, term_id: TermId) -> Result<usize, String> {
 /// Structural memo of the existing graph for named constructors, so
 /// term resolution finds each instance's own nodes (and never duplicates
 /// an existing equivalent node).
-fn build_structural_index(g: &Graph) -> HashMap<(&'static str, Vec<NodeId>, bool), NodeId> {
+fn build_structural_index(g: &Graph) -> StructuralIndex {
     let mut index = HashMap::new();
     for node in g.nodes() {
         if let Some(name) = named_constructor(&node.op) {
-            index.insert(
-                (name, node.inputs.clone(), node.requires_full_precision),
-                node.id,
-            );
+            index.insert((name, node.inputs.clone(), node.precision_key()), node.id);
         }
     }
     index

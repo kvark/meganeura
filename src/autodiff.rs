@@ -38,11 +38,12 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
     let mut graph = Graph::new();
     // Copy forward graph nodes
     for node in forward.nodes() {
-        let id = graph.add_raw_node_with_precision(
+        let id = graph.add_raw_node_with_flags(
             node.op.clone(),
             node.inputs.clone(),
             node.ty.clone(),
             node.requires_full_precision,
+            node.is_derivative,
         );
         graph.nodes_mut()[id as usize].name = node.name.clone();
         // Keep the implementation of a measured candidate.
@@ -57,9 +58,9 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
     // Derivative operands are often orders of magnitude smaller than forward
     // activations. In particular, directly rounding them to IEEE f16 before a
     // cooperative matmul can underflow whole parameter-gradient projections.
-    // Keep the logical graph f32 and mark every node appended below as
-    // ineligible for optional reduced-precision promotion.
-    graph.begin_full_precision_region();
+    // Keep the logical graph f32 and automatically protect every derivative
+    // from unqualified reduced-input promotion. Explicit pins stay distinct.
+    graph.begin_derivative_region();
 
     // Map from forward node id → gradient node id
     let mut grads: HashMap<NodeId, NodeId> = HashMap::new();
@@ -79,6 +80,13 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
             Some(&g) => g,
             None => continue, // no gradient flows to this node
         };
+        graph.pin_new_derivatives(
+            node.requires_full_precision
+                || node
+                    .inputs
+                    .iter()
+                    .any(|&id| forward.node(id).requires_full_precision),
+        );
         let gradient_start = graph.nodes().len();
 
         // Only explicit BF16 forward matrices opt into BF16 backward. The
@@ -1478,7 +1486,7 @@ mod tests {
     }
 
     #[test]
-    fn autodiff_marks_only_derivative_nodes_full_precision() {
+    fn autodiff_distinguishes_derivative_guard_from_explicit_pins() {
         let mut g = Graph::new();
         let x = g.input("x", &[4, 3]);
         let w = g.parameter("w", &[3, 2]);
@@ -1491,13 +1499,97 @@ mod tests {
         assert!(
             diff.nodes()[..forward_len]
                 .iter()
-                .all(|node| !node.requires_full_precision)
+                .all(|node| !node.requires_full_precision && !node.is_derivative)
         );
         assert!(
             diff.nodes()[forward_len..]
                 .iter()
-                .all(|node| node.requires_full_precision)
+                .all(|node| node.is_derivative && !node.requires_full_precision)
         );
+    }
+
+    #[test]
+    fn explicit_pin_reaches_derivatives_and_survives_legacy_metadata() {
+        let mut forward = Graph::new();
+        let x = forward.input("x", &[4, 3]);
+        let w = forward.parameter("w", &[3, 2]);
+        let y = forward.matmul(x, w);
+        forward.nodes_mut()[y as usize].requires_full_precision = true;
+        let loss = forward.mean_all(y);
+        forward.set_outputs(vec![loss]);
+        let diff = differentiate(&forward);
+        let products: Vec<_> = diff
+            .nodes()
+            .iter()
+            .filter(|node| {
+                node.is_derivative && matches!(node.op, Op::MatMul | Op::MatMulAT | Op::MatMulBT)
+            })
+            .collect();
+        assert!(!products.is_empty());
+        assert!(products.iter().all(|node| node.requires_full_precision));
+        let mut legacy = serde_json::to_value(products[0]).unwrap();
+        legacy.as_object_mut().unwrap().remove("is_derivative");
+        let restored: crate::graph::Node = serde_json::from_value(legacy).unwrap();
+        assert!(restored.requires_full_precision && !restored.is_derivative);
+        assert!(restored.full_precision());
+    }
+
+    #[test]
+    fn derivative_guard_survives_decomposition_extraction_and_lowering() {
+        let mut forward = Graph::new();
+        let x = forward.input("x", &[8, 16]);
+        let a = forward.parameter("a", &[16, 32]);
+        let b = forward.parameter("b", &[32, 4]);
+        let y = forward.matmul(x, a);
+        let norm = forward.parameter("norm", &[32]);
+        let y = forward.rms_norm(y, norm, 1e-5);
+        let y = forward.silu(y);
+        let y = forward.matmul(y, b);
+        let loss = forward.mean_all(y);
+        forward.set_outputs(vec![loss]);
+        let diff = differentiate(&forward);
+        let optimized = crate::optimize::optimize(&diff.decompose()).toposort();
+        let products: Vec<_> = optimized
+            .nodes()
+            .iter()
+            .filter(|node| {
+                node.is_derivative && matches!(node.op, Op::MatMul | Op::MatMulAT | Op::MatMulBT)
+            })
+            .collect();
+        assert!(!products.is_empty(), "extraction lost derivative origins");
+        assert!(
+            products
+                .iter()
+                .all(|node| node.full_precision() && !node.requires_full_precision)
+        );
+        let plan = crate::compile::compile(&optimized);
+        let mut count = 0;
+        for d in &plan.dispatches {
+            if d.origin.iter().any(|&id| optimized.node(id).is_derivative) {
+                count += 1;
+                assert!(
+                    d.is_derivative && d.full_precision(),
+                    "lost origin at {}",
+                    d.label
+                );
+            }
+        }
+        assert!(count > 0);
+
+        // The new provenance must not change ordinary arithmetic or layouts.
+        let mut legacy = diff.deep_clone();
+        for node in legacy.nodes_mut() {
+            node.requires_full_precision |= node.is_derivative;
+            node.is_derivative = false;
+        }
+        let legacy = crate::optimize::optimize(&legacy.decompose()).toposort();
+        let legacy_plan = crate::compile::compile(&legacy);
+        let mut normalized = plan;
+        for d in &mut normalized.dispatches {
+            d.requires_full_precision |= d.is_derivative;
+            d.is_derivative = false;
+        }
+        assert_eq!(normalized, legacy_plan);
     }
 
     #[test]
