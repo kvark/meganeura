@@ -262,6 +262,31 @@ Preserve these additional leads for follow-up:
   dense products improve 4.93%; adding forward QK/PV improves 5.44%. The
   instrumented profile is dominated by protected F32 backward products. Do
   not confuse earlier candidate coverage with a better selected program.
+  The current cost fallback charges multiply FLOPs only for dispatches with
+  `mnk()`; attention otherwise contributes mostly buffer traffic. Account for
+  attention work and staging before using this estimate to rank graph forms.
+
+The split-count regression above is not explained by missing coverage: both
+searches measure the two-partition candidate before their deadlines. In the
+losing race, its median paired gain exceeds the configured 5% improvement plus
+twice the median absolute deviation of paired differences. An additional check
+on the difference of two independent medians rejects it under timing drift.
+Using paired gains/noise consistently, with the same margin, sample count and
+numerical qualification, retains two partitions in all six NVIDIA SmolLM2
+searches (three per mode), versus one of six with the old rule. Independent
+holdouts improve inference by 2.98–5.29%; the partition-only ablation gives
+4.59% at fixed graph, arithmetic, storage and submission count. Training
+winners cluster at 18.01–18.03 ms, versus 18.04–21.51 ms; against the stronger
+saved baseline the gain is 2.24%, and the winner is within 0.18% of the manually
+assembled fast plan. This is more reliable selection, not a new kernel gain.
+
+All 16 two-GPU/model/mode holdouts qualify before and after timing. Other
+models change by -1.19% to +1.29%; the Intel Whisper inference loss repeats
+at +1.25%, and its winning decisions would also pass the old timing rule.
+Retain that losing selection beside the gains. All six 32-update and both
+256-update selected-winner trajectories pass unchanged gates against the
+independent F32 references. Intel SmolLM2 training remains neutral: improving
+late layout/arithmetic combinations still needs the complete-plan work above.
 
 - [x] Repair dropped direct-output layout information in checked rectangular
   GEMMs and enable direct stores for aligned checked convolutions: [PR #286](https://github.com/kvark/meganeura/pull/286).

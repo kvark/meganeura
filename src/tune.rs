@@ -1327,7 +1327,8 @@ pub struct TuneOptions {
     /// reports default to None; new searches target two milliseconds.
     #[serde(default)]
     pub target_sample_time: Option<Duration>,
-    /// Required fractional improvement, in addition to a noise margin.
+    /// Median paired gain must exceed this fraction of the baseline median,
+    /// in addition to the paired noise margin.
     pub min_improvement: f64,
     /// Defaults to Race. Both strategies apply the same decision rule and
     /// qualification; historical missing settings retain Sequential.
@@ -1539,6 +1540,8 @@ pub struct TuneOutcome<Class = TuneClass, Choice = MatmulTile> {
     /// None for historical reports, whole-program trials, or skipped sampling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample_repetitions: Option<u32>,
+    /// Separate timing summaries; selection uses the median paired gain,
+    /// which can differ from the difference of these medians under drift.
     pub baseline_median_ms: Option<f64>,
     pub candidate_median_ms: Option<f64>,
     /// Twice the median absolute deviation of paired time differences.
@@ -1758,10 +1761,9 @@ pub(crate) fn decide<Class, Choice: Copy>(
     outcome.baseline_median_ms = Some(baseline);
     outcome.candidate_median_ms = Some(candidate);
     outcome.noise_margin_ms = Some(noise);
-    if outcome.qualified
-        && baseline - candidate > baseline * options.min_improvement + noise
-        && gain > baseline * options.min_improvement + noise
-    {
+    // Compare paired gains against paired noise. Separate medians discard
+    // the matching rounds and can reject a consistent gain under shared drift.
+    if outcome.qualified && gain > baseline * options.min_improvement + noise {
         outcome.selected = outcome.candidate;
         outcome.decision = TuneDecision::FasterCandidate;
     } else {
@@ -2476,6 +2478,28 @@ mod tests {
         invalid.qualified = false;
         decide(&mut invalid, &options);
         assert_eq!(invalid.selected, invalid.initial);
+    }
+
+    #[test]
+    fn paired_gains_keep_the_same_margin_under_shared_drift() {
+        let options = TuneOptions::default();
+        let mut win = outcome();
+        // Five paired gains and one tie. The independent medians differ by
+        // only 3, but the paired median gain is 5 with a noise margin of 2.
+        win.baseline_ms = vec![42., 41., 43., 43., 50., 49.];
+        win.candidate_ms = vec![37., 37., 37., 43., 44., 44.];
+        decide(&mut win, &options);
+        assert_eq!(win.decision, TuneDecision::FasterCandidate);
+        assert_eq!(win.noise_margin_ms, Some(2.));
+        assert_eq!(win.baseline_median_ms, Some(43.));
+        assert_eq!(win.candidate_median_ms, Some(40.));
+        // A paired gain of 4 still misses 5% of 43 plus the same noise.
+        let mut marginal = outcome();
+        marginal.baseline_ms = win.baseline_ms;
+        marginal.candidate_ms = vec![38., 38., 38., 43., 45., 45.];
+        decide(&mut marginal, &options);
+        assert_eq!(marginal.decision, TuneDecision::KeepBaseline);
+        assert_eq!(marginal.noise_margin_ms, Some(2.));
     }
 
     #[test]
