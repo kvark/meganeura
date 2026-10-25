@@ -127,10 +127,16 @@ the descriptor-reference repair requires fresh measurements.
 - [x] Time queue reset separately with worker histograms disabled. Its median
   interval is 2.4 microseconds for CI and 3.9–5.1 microseconds for SmolVLA, too
   small to explain the gap. Do not add a reset protocol on that hypothesis.
-- [ ] Separate scheduler/fence overhead from handler work, starting with a
-  single-worker specialization that needs no cross-workgroup coordination.
-  Continue larger-graph optimization and retain both model phases and all CI
-  acceptance gates; baseline parity and spill attribution remain open.
+- [x] Probe a single-worker executor with workgroup synchronization and cached
+  node parameters. It improves the one-worker controls but remains slower than
+  parallel execution. Test parameter reuse and aggregated publication across
+  multiple claims at 256 workers; neither unrestricted nor large-grid-only reuse
+  shows a useful full-step gain. Preserve 430 paired comparisons and revert all
+  three prototypes.
+- [ ] Isolate ready-bitmap polling and contention; evaluate a bounded ready-node
+  queue that avoids scanning every bitmap word. Prove publication and completion
+  ordering before GPU qualification. Retain both model phases and all CI gates;
+  baseline parity and spill attribution remain open.
 
 The Blade extension exposes binding inspection and runtime buffer-array binding
 in [commit 1bb5aef](https://github.com/kvark/blade/commit/1bb5aef0fea5fbc4249fdc40a7f1398f5c3ac012).

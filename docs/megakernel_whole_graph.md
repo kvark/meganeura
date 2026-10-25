@@ -970,14 +970,74 @@ GPU timing, so the reset image has its normal size. Twenty pairs per workload
 pass. Median pass intervals for `reset whole-graph queue` are **2.432 µs** for
 each CI case, **3.920 µs** for SmolVLA forward and **5.136 µs** for training.
 These include the transfer pass boundary, not just DMA time. They are too small
-to explain the gap, and no more complex reset protocol is added. The next probe
-will isolate intra-workgroup scheduling from cross-workgroup coordination;
+to explain the gap, and no more complex reset protocol is added. The following
+probes compare intra-workgroup scheduling and cross-workgroup coordination;
 larger-model performance and all shared acceptance gates remain in scope.
 
 Raw records are in `target/{sm-placement,shader-isa,inline-probe,spirv-opt-probe,
 uniform-descriptor-probe,ci-worker-sweep,queue-reset-timing}/`. The combined
 manifest, hashes and placement checks are in
 `target/megakernel-results/placement-compiler-followups/summary.json`.
+
+## Coordination follow-ups
+
+A temporary specialization for an explicitly selected **one worker** walks
+nodes in recording order, caches each node's parameters and executes its tiles
+with workgroup storage/shared barriers. Every dependency points from an earlier
+recorded node to a later one, so this order respects RAW/WAR/WAW dependencies.
+All payload accesses are confined to one physical workgroup; the existing
+canonical descriptors remain intact. Selected handler bodies, tile packing and
+arithmetic are unchanged. Actual tile completion still updates diagnostics.
+
+| One-worker workload | Original persistent ms | Specialized persistent ms | Specialized / ordinary paired ratio |
+|---|---:|---:|---:|
+| CI inference | 0.09433 | 0.06661 | 1.300 |
+| CI forward/backward | 0.27334 | 0.15581 | 2.382 |
+| CI forward/backward/SGD | 0.32322 | 0.17628 | 2.635 |
+| SmolVLA forward | 263.379 | 234.231 | 60.787 |
+| SmolVLA forward/backward/SGD | 1561.585 | 983.762 | 81.875 |
+
+CI uses 50 pairs per case and compares with the earlier one-worker sweep.
+SmolVLA uses a fresh original control followed by the specialization, each with
+20 pairs per phase. All runs have at least ten warmups and one second of warmup.
+These are separate runs, not directly interleaved original/specialized pairs;
+each reported ratio compares its persistent candidate with its own interleaved
+ordinary control. Ordinary forward latency also moves between the model runs.
+Training improves substantially within the one-worker configuration, but
+remains far slower than the qualified 256-worker path. Several coordination
+operations change together, so this does not assign a precise cost to fences
+alone. The specialization is reverted.
+
+Two 256-worker probes keep node parameters while claiming further tiles from
+the same node. They synchronize scratch between claims and defer payload
+publication and completion accounting until the worker finishes that node's
+claims. One applies this to all nodes; the other only repeats when the node has
+more tiles than the pool can claim at once. Both retain cross-workgroup fences
+at publication/acquisition and the original selected arithmetic.
+
+| Probe | CI inference / backward / SGD paired ratios | SmolVLA forward persistent ms / ratio | SmolVLA training persistent ms / ratio |
+|---|---|---:|---:|
+| Reuse across all nodes | 1.377 / 1.575 / 1.638 | 6.281 / 1.586 | 21.042 / 1.397 |
+| Reuse only on larger grids | 1.434 / 1.532 / 1.525 | 6.527 / 1.515 | 21.167 / 1.391 |
+
+Each probe runs 20 pairs for all five cases. Neither demonstrates a useful
+full-step gain, and both are reverted. Across these probes and the one-worker
+controls, **430 normal comparisons** pass, plus three one-worker diagnostic
+comparisons checking task counts. CI and model forward are exact; maximum
+training error is 4.66e-9. Every candidate uses one dispatch and the same
+selected implementation keys as its ordinary control. The initial reuse
+attempt was rejected before execution because WGSL does not permit taking a
+vector component's address; the completed probe broadcasts the whole vector.
+An initial build omitted the model feature and was rerun with it enabled.
+
+All jobs run in separate verified bounded cgroups, GPU jobs are serialized,
+and builds/analysis do not overlap measurements. Patches, binaries, raw samples,
+logs and hashes are local under `target/{single-worker-probe,node-cache-probe}/`
+and `target/megakernel-results/coordination-followups/summary.json`. The runtime
+and compiler pins are restored and release examples rebuilt. These diagnostic
+experiments do not change the primary qualification or establish parity. The
+next investigation is ready-bitmap polling and contention; a bounded ready-node
+queue would require its own publication proof and the same acceptance gates.
 
 ## Earlier artifact identities
 
