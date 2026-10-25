@@ -223,14 +223,65 @@ and changes complete-step time by -3.23% on Intel and -0.27% on NVIDIA; its
 trajectory and combination with F16 AT/BT still need checking. Keep the NN
 scope separate from the AT/BT gains in the table above.
 
-- [ ] Add qualified measured derivative-input choices using the existing
-  kernels. Preserve ordinary F32 construction, strict policy, explicit precision
-  pins and the whole-gradient/trajectory gates; do not clear the blanket guard.
-  Verify fresh 30-second searches reach the gains without displacing stronger
-  layouts. Keep F32 fallbacks for rejected or slower models. No mixed-storage
-  profile or new backend capability API is justified by these measurements.
+- [x] Separate automatic derivative protection from explicit precision pins:
+  [PR #294](https://github.com/kvark/meganeura/pull/294). Ordinary construction
+  keeps the combined F32 guard, including after extraction, fusion and splitting.
+  Explicit pins propagate into derivatives; older metadata stays conservative.
+- [x] Add measured AT/BT derivative-input choices using the existing kernels.
+  Forward and derivative types remain independent. Bindings, accumulators and
+  split partials stay F32; strict policy and explicit pins remain in force.
+  Keep the derivative guard and the caller's whole-gradient/trajectory gates.
+  No mixed-storage profile or new backend capability API is needed.
+- [ ] Reach the Intel SmolLM2 derivative opportunity within 30 seconds without
+  displacing its stronger layout. The fresh search below does not reach it.
+
+Fresh 30-second search winners, measured in separate 100-sample paired
+holdouts after 10 seconds of warmup (forward + loss + backward, milliseconds;
+optimizer updates are qualified separately):
+
+| GPU | Model | Baseline | Derivative search | Change |
+| --- | --- | ---: | ---: | ---: |
+| B570 | SmolLM2 | 50.383 | 50.421 | +0.08% |
+| B570 | SmolVLA | 14.690 | 14.692 | +0.01% |
+| B570 | SD U-Net | 9.342 | 9.361 | +0.21% |
+| B570 | Whisper | 59.172 | 58.995 | -0.30% |
+| RTX 5070 | SmolLM2 | 17.982 | 16.437 | -8.59% |
+| RTX 5070 | SmolVLA | 6.637 | 6.096 | -8.15% |
+| RTX 5070 | SD U-Net | 3.798 | 3.716 | -2.15% |
+| RTX 5070 | Whisper | 19.288 | 19.300 | +0.06% |
+
+NVIDIA's three gains select F16 AT/BT inputs. Intel SD also selects them,
+without a whole-search gain; the other Intel winners and NVIDIA Whisper keep
+F32 derivative products. Intel SmolLM2 spends the budget on graph coverage,
+qualification and existing submission trials before reaching reduced arithmetic.
+Keep its fixed-plan gain separate from the neutral search result.
+
+Submission counts match except NVIDIA SmolLM2: its new winner chooses four
+instead of eight. At matched counts, the saved plans give 18.568→16.350 ms
+(-11.94%, four submissions) and 17.966→15.721 ms (-12.50%, eight). Only artifact
+submission metadata changes for these comparisons; neither physical plan is
+retuned. Search still leaves about 0.63 ms available at eight submissions.
+The submission policy itself is unchanged.
+
+All sixteen searches complete in 30.35–34.05 seconds including setup. All eight
+holdouts qualify before/after timing, and every winner passes its declared
+training gate: six 32-update synthetic cases and both 256-update real-text
+cases, with initial/final fixed-state gradients, parameter updates and the
+unchanged native/PyTorch F32 loss bounds as applicable. All 677 unit tests and
+all-target/all-feature lint pass. Earlier search orderings and their neutral
+results remain in the external archive.
 
 Preserve these additional leads for follow-up:
+
+- Repeated full-gradient qualification on Intel: the 134.5M-element SmolLM2
+  check transfers roughly 538 MB each time. In the first 30-second derivative
+  search, repeated checks prevent reaching the new precision trial. Investigate
+  comparing every output/gradient bit on the GPU against an already CPU-qualified
+  snapshot. Any difference must use the existing full CPU check; every new plan
+  still needs its independent F32 qualification. This could avoid duplicate
+  transfers without dropping gates or approximating their numerical reductions.
+  Include packed/combined gradients, buffer lifetimes, changed inputs and a
+  bounded snapshot allocation before considering production admission.
 
 - Explicit F16 quantization before residual subtraction: a small GPU probe
   retains the F32→F16→F32 conversions in emitted SPIR-V, yet the Intel driver

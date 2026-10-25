@@ -387,6 +387,7 @@ pub fn build_measured_with_inputs(
     if cfg.options.flash_forward_coop {
         programs.enable_forward_products(gpu.capabilities().subgroup_size);
     }
+    programs.enable_gradient_inputs(&supported);
     let preparation_time = start.elapsed();
     measure::select(
         programs,
@@ -513,6 +514,7 @@ struct AxisChoice {
     winograd: Option<crate::DType>,
     f16_attention: bool,
     forward_products: bool,
+    gradient_inputs: Option<crate::DType>,
 }
 
 fn early_physical_cover(baseline: AxisChoice, attention: &[AttentionChoice]) -> Vec<AxisChoice> {
@@ -734,6 +736,7 @@ fn implementations(
         winograd: None,
         f16_attention: false,
         forward_products: false,
+        gradient_inputs: None,
         fuse_dispatches: seeds
             .first()
             .is_some_and(|seed| seed.options.fuse_dispatches),
@@ -759,6 +762,7 @@ fn implementations(
                 winograd: None,
                 f16_attention: false,
                 forward_products: false,
+                gradient_inputs: None,
             })
         })
         .filter(|&choice| seen.insert(choice))
@@ -846,6 +850,47 @@ impl Implementations {
                     ..choice
                 }),
         );
+        self.order.choices = self.choices.len();
+        self.order.choice_order = (0..self.choices.len()).collect();
+    }
+
+    fn enable_gradient_inputs(&mut self, inputs: &[crate::DType]) {
+        let ordinary = self.choices.clone();
+        for multiply in [crate::DType::F16, crate::DType::BF16] {
+            if !inputs.contains(&multiply)
+                || !self.matrix_shapes.contains_key(&multiply)
+                || !self.seeds.iter().any(|seed| {
+                    fill_gradient_candidates(
+                        &mut seed.plan.clone(),
+                        multiply,
+                        self.replace_extracted_matrices,
+                    ) != 0
+                })
+            {
+                continue;
+            }
+            // Keep ordinary graph coverage and backward attention first.
+            // Try F16 forward + derivatives together when both are available;
+            // separate choices remain reachable if the combination fails.
+            if multiply == crate::DType::F16 {
+                let forward = ordinary.iter().position(|c| {
+                    c.matrix_inputs == Some(multiply)
+                        && !c.matrix_storage
+                        && !c.vector_convolutions_only
+                        && c.winograd.is_none()
+                });
+                self.order
+                    .priority_choices
+                    .push_front(self.choices.len() + forward.unwrap_or(0));
+            } else {
+                self.order.priority_choices.push_back(self.choices.len());
+            }
+            self.choices
+                .extend(ordinary.iter().map(|choice| AxisChoice {
+                    gradient_inputs: Some(multiply),
+                    ..*choice
+                }));
+        }
         self.order.choices = self.choices.len();
         self.order.choice_order = (0..self.choices.len()).collect();
     }
@@ -1061,53 +1106,96 @@ fn fill_matrix_candidates_scoped(
             continue;
         }
 
-        if !d.shader.is_matmul()
-            || !matches!(
+        if !d.full_precision() && fill_dense_product(d, multiply, replace_extracted) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Only AT/BT derivative products were qualified by the dense controls. In
+/// particular, SmolLM2's long-K NN gradient fails the unchanged F16 gate.
+/// Bindings, partials and automatic derivative protection remain F32.
+fn fill_gradient_candidates(
+    plan: &mut ExecutionPlan,
+    multiply: crate::DType,
+    replace_extracted: bool,
+) -> usize {
+    let mut count = 0;
+    for d in &mut plan.dispatches {
+        if d.is_derivative
+            && !d.requires_full_precision
+            && matches!(
+                d.shader,
+                compile::ShaderEntry::MatMulAT | compile::ShaderEntry::MatMulBT
+            )
+            && matches!(
                 d.kernel,
                 compile::Kernel::Default
-                    | compile::Kernel::SmallTile
-                    | compile::Kernel::Cooperative
                     | compile::Kernel::ScalarMatmul(_)
                     | compile::Kernel::SplitMatmul { .. }
             )
-            || d.full_precision()
-            || (d.schedule_locked && !replace_extracted)
-            || d.horizontal_batch > 1
-            || d.weight_format != compile::WeightFormat::F32
-            || d.matmul_prologue.is_some()
-            || d.matmul_epilogue.is_some()
+            && d.input_buffers.len() == 2
+            && d.extra_outputs.is_empty()
+            && fill_dense_product(d, multiply, replace_extracted)
         {
-            continue;
+            count += 1;
         }
-        let Some((m, n, k)) = d.mnk() else { continue };
-        if m <= 1 || n == 0 || k == 0 {
-            continue;
-        }
-        let splits = match d.kernel {
-            compile::Kernel::SplitMatmul { splits, .. } => splits,
-            _ => 1,
-        };
-        // Keep the existing partial buffer and SumRows contract, adding a
-        // fused addend only in the first partition. Each part needs a K block.
-        if splits > 1 && splits > k.div_ceil(32) {
-            continue;
-        }
-        let grid = [m.div_ceil(32), n.div_ceil(32), splits];
-        if !compile::workgroups_within_portable_limits(grid) {
-            continue;
-        }
-        d.kernel = compile::Kernel::CooperativeTyped {
-            types: crate::codegen::MatrixTypes {
-                multiply,
-                ..crate::codegen::MatrixTypes::F32_AS_F16
-            },
-            splits,
-        };
-        d.schedule_locked = false;
-        d.workgroups = grid;
-        count += 1;
     }
     count
+}
+
+fn fill_dense_product(
+    d: &mut compile::Dispatch,
+    multiply: crate::DType,
+    replace_extracted: bool,
+) -> bool {
+    if !d.shader.is_matmul()
+        || !matches!(
+            d.kernel,
+            compile::Kernel::Default
+                | compile::Kernel::SmallTile
+                | compile::Kernel::Cooperative
+                | compile::Kernel::ScalarMatmul(_)
+                | compile::Kernel::SplitMatmul { .. }
+        )
+        || (d.schedule_locked && !replace_extracted)
+        || d.horizontal_batch > 1
+        || d.weight_format != compile::WeightFormat::F32
+        || d.matmul_prologue.is_some()
+        || d.matmul_epilogue.is_some()
+    {
+        return false;
+    }
+    let Some((m, n, k)) = d.mnk() else {
+        return false;
+    };
+    if m <= 1 || n == 0 || k == 0 {
+        return false;
+    }
+    let splits = match d.kernel {
+        compile::Kernel::SplitMatmul { splits, .. } => splits,
+        _ => 1,
+    };
+    // Keep the existing partial buffer and SumRows contract, adding a
+    // fused addend only in the first partition. Each part needs a K block.
+    if splits > 1 && splits > k.div_ceil(32) {
+        return false;
+    }
+    let grid = [m.div_ceil(32), n.div_ceil(32), splits];
+    if !compile::workgroups_within_portable_limits(grid) {
+        return false;
+    }
+    d.kernel = compile::Kernel::CooperativeTyped {
+        types: crate::codegen::MatrixTypes {
+            multiply,
+            ..crate::codegen::MatrixTypes::F32_AS_F16
+        },
+        splits,
+    };
+    d.schedule_locked = false;
+    d.workgroups = grid;
+    true
 }
 
 impl measure::Frontier for Implementations {
@@ -1144,20 +1232,20 @@ impl measure::Frontier for Implementations {
         if !self.defer_bf16 {
             return;
         }
-        for winograd in [false, true] {
-            let dtype = if winograd {
-                choice.winograd
-            } else {
-                choice.matrix_inputs
+        for family in 0..3 {
+            let dtype = match family {
+                0 => choice.matrix_inputs,
+                1 => choice.winograd,
+                _ => choice.gradient_inputs,
             };
             if dtype != Some(crate::DType::F16) {
                 continue;
             }
             let mut bf16 = choice;
-            if winograd {
-                bf16.winograd = Some(crate::DType::BF16);
-            } else {
-                bf16.matrix_inputs = Some(crate::DType::BF16);
+            match family {
+                0 => bf16.matrix_inputs = Some(crate::DType::BF16),
+                1 => bf16.winograd = Some(crate::DType::BF16),
+                _ => bf16.gradient_inputs = Some(crate::DType::BF16),
             }
             if let Some(index) = self.choices.iter().position(|&c| c == bf16) {
                 let entry = (origin.form, index);
@@ -1201,11 +1289,30 @@ impl measure::Frontier for Implementations {
             // Carry the winning attention choice into arithmetic trials.
             for index in &mut self.order.priority_choices {
                 let arithmetic = self.choices[*index];
+                let derivative_trial = arithmetic.gradient_inputs.is_some()
+                    && arithmetic.gradient_inputs != active.gradient_inputs;
                 let neighbor = AxisChoice {
-                    matrix_inputs: arithmetic.matrix_inputs,
-                    matrix_storage: arithmetic.matrix_storage,
-                    vector_convolutions_only: arithmetic.vector_convolutions_only,
-                    winograd: arithmetic.winograd,
+                    matrix_inputs: if derivative_trial {
+                        active.matrix_inputs.or(arithmetic.matrix_inputs)
+                    } else {
+                        arithmetic.matrix_inputs
+                    },
+                    matrix_storage: if derivative_trial {
+                        active.matrix_storage
+                    } else {
+                        arithmetic.matrix_storage
+                    },
+                    vector_convolutions_only: if derivative_trial {
+                        active.vector_convolutions_only
+                    } else {
+                        arithmetic.vector_convolutions_only
+                    },
+                    winograd: if derivative_trial {
+                        active.winograd
+                    } else {
+                        arithmetic.winograd
+                    },
+                    gradient_inputs: arithmetic.gradient_inputs.or(active.gradient_inputs),
                     forward_products: arithmetic.forward_products || active.forward_products,
                     ..active
                 };
@@ -1269,7 +1376,8 @@ impl measure::Frontier for Implementations {
                             active.vector_convolutions_only,
                             active.matrix_storage,
                         ),
-                    ) + usize::from(choice.winograd != active.winograd),
+                    ) + usize::from(choice.winograd != active.winograd)
+                        + usize::from(choice.gradient_inputs != active.gradient_inputs),
                     choice.forward_products != active.forward_products,
                     choice.f16_attention != active.f16_attention,
                     choice.attention != active.attention,
@@ -1288,6 +1396,7 @@ impl measure::Frontier for Implementations {
                 winograd,
                 f16_attention,
                 forward_products,
+                gradient_inputs,
             } = self.choices[choice_index];
             let mut plan = if splits == 0
                 && !f16_attention
@@ -1370,6 +1479,13 @@ impl measure::Frontier for Implementations {
                     continue;
                 }
             }
+            if let Some(multiply) = gradient_inputs {
+                if fill_gradient_candidates(&mut plan, multiply, self.replace_extracted_matrices)
+                    == 0
+                {
+                    continue;
+                }
+            }
             if matrix_storage && storage::fill(&mut plan) == 0 {
                 continue;
             }
@@ -1397,6 +1513,9 @@ impl measure::Frontier for Implementations {
                 if vector_convolutions_only {
                     description.push_str(", vector_convolutions_only=true");
                 }
+            }
+            if let Some(dtype) = gradient_inputs {
+                description.push_str(&format!(", gradient_inputs={dtype:?}"));
             }
             if let Some(dtype) = winograd {
                 description.push_str(&format!(", winograd={dtype:?}"));
@@ -1611,6 +1730,119 @@ mod tests {
             4,
             "both forward/backward choices stay reachable"
         );
+    }
+
+    fn gradient_frontier() -> Implementations {
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[32, 64]);
+        let w = graph.parameter("w", &[64, 32]);
+        let y = graph.matmul(x, w);
+        let loss = graph.mean_all(y);
+        graph.set_outputs(vec![loss]);
+        graph_frontier(crate::autodiff::differentiate(&graph))
+    }
+
+    #[test]
+    fn derivative_arithmetic_keeps_pins_storage_and_unmeasured_nn() {
+        use crate::DType::{BF16, F16};
+        let baseline = gradient_frontier().seeds.remove(0).plan;
+        let products: Vec<_> = baseline
+            .dispatches
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| (d.is_derivative && d.shader.is_matmul()).then_some(i))
+            .collect();
+        assert_eq!(products.len(), 2);
+        for dtype in [F16, BF16] {
+            let mut candidate = baseline.clone();
+            assert_eq!(fill_gradient_candidates(&mut candidate, dtype, true), 2);
+            assert_eq!(candidate.buffers, baseline.buffers);
+            assert_eq!(candidate.param_grad_pairs, baseline.param_grad_pairs);
+            assert_eq!(candidate.param_types, baseline.param_types);
+            for (index, d) in candidate.dispatches.iter().enumerate() {
+                if products.contains(&index) {
+                    assert!(d.is_derivative && d.full_precision() && !d.requires_full_precision);
+                    assert!(
+                        matches!(d.kernel, compile::Kernel::CooperativeTyped { types, .. }
+                        if types.multiply == dtype && types.a == crate::DType::F32
+                        && types.b == crate::DType::F32 && types.output == crate::DType::F32)
+                    );
+                } else {
+                    assert_eq!(d, &baseline.dispatches[index]);
+                }
+            }
+            let mut protected = baseline.clone();
+            for &index in &products {
+                protected.dispatches[index].requires_full_precision = true;
+            }
+            assert_eq!(fill_gradient_candidates(&mut protected, dtype, true), 0);
+            // Old plans have only the blanket bit and remain pinned.
+            for &index in &products {
+                protected.dispatches[index].is_derivative = false;
+            }
+            assert_eq!(fill_gradient_candidates(&mut protected, dtype, true), 0);
+            let mut nn = baseline.clone();
+            for &index in &products {
+                nn.dispatches[index].shader = compile::ShaderEntry::MatMul;
+            }
+            assert_eq!(fill_gradient_candidates(&mut nn, dtype, true), 0);
+            let mut locked = baseline.clone();
+            for &index in &products {
+                locked.dispatches[index].schedule_locked = true;
+            }
+            assert_eq!(fill_gradient_candidates(&mut locked, dtype, false), 0);
+            assert_eq!(fill_gradient_candidates(&mut locked, dtype, true), 2);
+        }
+    }
+
+    #[test]
+    fn derivative_precision_is_independent_of_forward_precision_and_policy() {
+        use crate::DType::{BF16, F16};
+        use measure::Frontier as _;
+        let mut frontier = gradient_frontier();
+        let mut caps = blade_graphics::Capabilities {
+            shader_float16: true,
+            shader_bfloat16: true,
+            subgroup_size: 32,
+            ..Default::default()
+        };
+        caps.cooperative_matrix.f16_f32_shapes = vec![[8, 16, 16]];
+        caps.cooperative_matrix.bf16_f32_shapes = vec![[8, 16, 16]];
+        frontier.enable_matrix_inputs(&[], &caps);
+        frontier.enable_gradient_inputs(&[]);
+        assert!(frontier.choices.iter().all(|c| c.gradient_inputs.is_none()));
+        frontier.enable_matrix_inputs(&[BF16, F16], &caps);
+        frontier.enable_gradient_inputs(&[BF16, F16]);
+        let baseline = frontier.next(None).unwrap();
+        assert!(!baseline.description.contains("gradient_inputs="));
+        assert!(
+            baseline
+                .plan
+                .dispatches
+                .iter()
+                .filter(|d| d.is_derivative)
+                .all(|d| !matches!(d.kernel, compile::Kernel::CooperativeTyped { .. }))
+        );
+        let mut reached = collections::HashSet::new();
+        let mut incumbent = baseline.origin;
+        while let Some(program) = frontier.next(incumbent) {
+            let choice = frontier.choices[program.origin.unwrap().choice];
+            reached.insert((choice.matrix_inputs, choice.gradient_inputs));
+            // Simulate accepting F16 forward first, then a derivative choice.
+            if choice.matrix_inputs == Some(F16)
+                && (incumbent == baseline.origin || choice.gradient_inputs == Some(F16))
+            {
+                incumbent = program.origin;
+            }
+        }
+        for forward in [None, Some(F16), Some(BF16)] {
+            for derivative in [Some(F16), Some(BF16)] {
+                assert!(
+                    reached.contains(&(forward, derivative)),
+                    "missing {forward:?}/{derivative:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2466,6 +2698,7 @@ mod tests {
             winograd: None,
             f16_attention: false,
             forward_products: false,
+            gradient_inputs: None,
         };
         let unfused = AxisChoice {
             fuse_dispatches: false,
