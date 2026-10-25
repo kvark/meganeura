@@ -218,7 +218,7 @@ A separate NN control covers the long-K vocabulary-input gradient in
 SmolLM2 (128×576×49,152, retaining 48 split partitions). Plain F16 fails the
 unchanged gradient gate on both cards: RMS error is about 7.3e-5 against a
 3.68e-5 limit. Consequently, extending the passing AT/BT candidate to every
-derivative product is not valid. BF16 qualifies at the initial/final weights
+derivative product is not valid. BF16 qualifies before/after timing at fixed weights
 and changes complete-step time by -3.23% on Intel and -0.27% on NVIDIA; its
 trajectory and combination with F16 AT/BT still need checking. Keep the NN
 scope separate from the AT/BT gains in the table above.
@@ -227,7 +227,8 @@ scope separate from the AT/BT gains in the table above.
   [PR #294](https://github.com/kvark/meganeura/pull/294). Ordinary construction
   keeps the combined F32 guard, including after extraction, fusion and splitting.
   Explicit pins propagate into derivatives; older metadata stays conservative.
-- [x] Add measured AT/BT derivative-input choices using the existing kernels.
+- [x] Add measured AT/BT derivative-input choices using the existing kernels:
+  [PR #295](https://github.com/kvark/meganeura/pull/295).
   Forward and derivative types remain independent. Bindings, accumulators and
   split partials stay F32; strict policy and explicit pins remain in force.
   Keep the derivative guard and the caller's whole-gradient/trajectory gates.
@@ -282,6 +283,25 @@ Preserve these additional leads for follow-up:
   transfers without dropping gates or approximating their numerical reductions.
   Include packed/combined gradients, buffer lifetimes, changed inputs and a
   bounded snapshot allocation before considering production admission.
+
+The exact-repeat prototype reaches the Intel opportunity: nine→twelve trials
+within the 30-second budget, with eleven exact GPU repeats replacing duplicate
+538 MB readbacks. The independent CPU gate still checks every new plan. The
+normal holdout harness (shortcut disabled) gives 50.401→40.713 ms (-19.22%) for
+the saved winners. At matched submission counts, the gain is 17.87% at one
+(50.378→41.373 ms) and 18.07% at four (49.736→40.749 ms). Both GPU winners pass
+the unchanged 256-update real-text gate against native/PyTorch F32 references.
+NVIDIA is neutral in this comparison (-0.44%). This is a qualification/search
+prototype, separate from the arithmetic admission in #295; its Inferena port
+and remaining validation are in progress.
+
+The prototype also passes explicit GPU tests on both cards: loss-preserving
+gradient mutations, final-element/large-array tails, CPU fallback on changed
+gradients and exact restoration. Snapshot data is bounded by 1 GiB and half the
+available GPU budget. [PR #296](https://github.com/kvark/meganeura/pull/296),
+standalone on main, supplies the gradient-buffer interop accessor so the port
+can avoid internal-buffer hooks. The shortcut changes no numerical bounds or
+fresh-execution counts.
 
 - Explicit F16 quantization before residual subtraction: a small GPU probe
   retains the F32→F16→F32 conversions in emitted SPIR-V, yet the Intel driver
