@@ -149,10 +149,16 @@ the descriptor-reference repair requires fresh measurements.
   claims decrease, but full training regresses against fresh controls. Preserve
   560 normal comparisons and twelve diagnostics across these experiments;
   revert the temporary runtime and benchmark API changes.
-- [ ] Isolate descriptor/address calculations at a fixed worker count in the
-  matrix fixture before proposing further whole-model changes. Retain both
-  model phases and all CI gates; baseline parity and spill attribution remain
-  open.
+- [x] Isolate constant descriptors, dimensions and grid coordinates in the
+  fixed-work matrix fixture. Check generated substitutions and collect four
+  matched SDK capture pairs. Integer activity falls without a useful combined
+  shader speedup. Explicit inner-loop expansion and a 46-worker control also
+  fail to close the gap. Preserve 660 normal comparisons and twelve diagnostics;
+  revert every runtime probe.
+- [ ] Compare serial and independent-node dependencies with identical shader
+  code and resources to isolate whole-node ordering costs before changing
+  dependency granularity. Retain both model phases and all CI gates; baseline
+  parity and spill attribution remain open.
 
 The Blade extension exposes binding inspection and runtime buffer-array binding
 in [commit 1bb5aef](https://github.com/kvark/blade/commit/1bb5aef0fea5fbc4249fdc40a7f1398f5c3ac012).

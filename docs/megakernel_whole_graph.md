@@ -1199,6 +1199,88 @@ and the priority proof remain in `target/{matrix-handler-probe,claim-priority-pr
 The checked manifest and hashes are in
 `target/megakernel-results/matrix-followups/summary.json`. Parity remains unmet.
 
+## Matrix constants and inner-loop expansion
+
+Further controls keep the same 32-node matrix chain, selected arithmetic,
+operands and complete-output checks. A descriptor probe substitutes a constant
+descriptor index and element offset only when every node using that handler
+agrees. A dimensions probe substitutes the invariant integer uniform words while
+leaving descriptor lookup dynamic. A combined probe also substitutes invariant
+grid coordinates. Constants replace helper-argument uses directly, avoiding a
+dependence on driver propagation through calls. Uniform-specialized diagnostics
+assert that reused recordings do not change the embedded plain values.
+Generated shader dumps verify every intended substitution.
+
+Twenty normal pairs per case give these completed-step persistent medians at
+64 workers. Ordinary medians range from 1.669 to 1.703 ms in these runs.
+
+| Probe | Isolated ms | With unused forward handlers ms | With unused training handlers ms |
+|---|---:|---:|---:|
+| Fresh control | 2.104 | 1.936 | 1.940 |
+| Constant descriptors and offsets | 2.049 | 1.937 | 1.943 |
+| Constant dimensions | 1.843 | 1.929 | 1.929 |
+| Constants plus grid coordinates | 1.998 | 1.928 | 1.917 |
+| Explicit inner-loop expansion | 2.162 | 1.939 | 1.946 |
+
+The isolated dimensions result improves, but the combined shaders retain their
+gap. At 256 workers, the combined variants stay between 2.924 and 2.955 ms;
+the isolated variants range from 4.084 to 4.342 ms. A fresh 46-worker control,
+matching each node's logical tile count, takes 2.107/1.938/1.946 ms and does not
+improve on the 64-worker control.
+
+Four separate SDK comparisons collect three sequential single-pass groups per
+mode at 64 workers. Every group has 146 samples, successful target/monitor exits,
+matching NVIDIA adapter identity and no SDK warning. All eight replays preserve
+exact output and matching arithmetic (state SHA-256
+`cbf2e7ebdfb60979fce668c7879a168a1923982a6d37441a12c5399d0a1752fe`).
+Repeated instruction rates deviate by at most 0.92% from their group mean;
+clock rates deviate by at most 0.28%. Rate times replay duration gives:
+
+| Capture | Ordinary / persistent replay ms | Warp activity ratio | Integer activity ratio | Global-load ratio | Shared-wavefront ratio | Persistent barrier share |
+|---|---:|---:|---:|---:|---:|---:|
+| Isolated control | 1.728 / 2.136 | 1.312 | 1.863 | 1.050 | 1.028 | 27.49% |
+| Forward-handler control | 1.704 / 1.969 | 1.202 | 3.380 | 1.054 | 1.029 | 27.02% |
+| Isolated, constant dimensions | 1.710 / 1.873 | 1.290 | 1.252 | 1.059 | 1.033 | 27.71% |
+| Forward handlers, all constants | 1.710 / 1.954 | 1.148 | 2.856 | 1.052 | 1.026 | 27.22% |
+
+The integer column uses the SDK's FMA-heavy integer-thread metric; it does not
+enumerate every integer operation. Ratios use each capture's ordinary control.
+These are activity estimates, not simultaneous exact instruction counts.
+Ordinary barrier shares are about 2.6%; all barrier percentages describe active
+warp cycles, not elapsed-time fractions.
+
+Constant dimensions reduce the isolated shader's estimated integer activity
+by about one-third and shorten replay. In the combined shader, fixing all three
+sources of dynamic addresses removes about 16% of that activity but improves
+replay by less than 1%. Thus descriptor indirection and these address calculations
+alone do not recover the combined shader's gap. Compiling unused handlers still
+changes instruction behavior even when the executed matrix work is fixed.
+
+The inner-loop probe separately expands the selected scalar matrix template's
+32 arithmetic iterations using the existing unroll generator. It preserves
+every accumulator's operation order, all stage loads, scratch, stores and
+barriers. Dumps contain 128 explicit accumulator updates and no `kk` loop in
+the active handler. The isolated executable remains 17,408 bytes; forward and
+training combinations grow to 121,216 and 303,104 bytes without a timing gain.
+All probes retain 48/112/105 registers for isolated/forward/training variants
+and the same shared-memory capacities. No missing-unroll diagnosis is established.
+
+All **660 normal comparisons and twelve diagnostics** pass with exact output,
+one persistent dispatch, identical selected arithmetic and no fallback. These
+are matrix diagnostics; no whole-model speedup is claimed. All runtime and
+temporary benchmark API changes are reverted, production release examples are
+rebuilt and formatting passes. Runtime source and dependency pins remain at the
+qualified implementation. Every job used a verified bounded cgroup, GPU jobs
+were serialized, and builds/analysis stayed outside measurement intervals.
+Source patches, proofs, binaries, raw samples and SDK receipts remain in
+`target/{matrix-address-probe,matrix-unroll-probe}/`; their checked manifest is
+`target/megakernel-results/matrix-address/summary.json`.
+
+The next experiment varies serial versus independent-node dependencies while
+holding shader code and resource bindings fixed. It should measure the cost
+of waiting for complete nodes before motivating finer dependency granularity.
+Full-model baseline parity remains unmet.
+
 ## Earlier artifact identities
 
 All records remain on local storage at
