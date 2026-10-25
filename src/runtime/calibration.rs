@@ -600,17 +600,37 @@ impl<'a> Bench<'a> {
                     pad1: 0,
                 },
             };
-            let samples = self.time(3, |encoder, pipelines| {
-                let mut pass = encoder.compute("calibration_stream");
-                let mut pc = pass.with(&pipelines[stream]);
-                pc.bind(0, &data);
-                pc.dispatch([columns_groups, groups.div_ceil(columns_groups), 1]);
-            });
-            self.release(&[src, dst]);
+            let measure = |bench: &mut Self, repeats: u32| {
+                bench.time(3, |encoder, pipelines| {
+                    let mut pass = encoder.compute("calibration_stream");
+                    for index in 0..repeats {
+                        if index != 0 {
+                            pass.barrier();
+                        }
+                        let mut pc = pass.with(&pipelines[stream]);
+                        pc.bind(0, &data);
+                        pc.dispatch([columns_groups, groups.div_ceil(columns_groups), 1]);
+                    }
+                })
+            };
+            let samples = measure(self, 1);
             if samples.is_empty() {
+                self.release(&[src, dst]);
                 return rate;
             }
-            let elapsed = median(&samples);
+            let mut elapsed = median(&samples);
+            if elapsed == 0.0 && !self.timestamps {
+                // A cached cold empty-submit baseline can exceed a later short
+                // stream dispatch. Amortize that baseline over more useful work
+                // rather than turn every sample into zero. Keep completed profile
+                // fields and the timestamped measurement path unchanged.
+                const REPEATS: u32 = 32;
+                let samples = measure(self, REPEATS);
+                if !samples.is_empty() {
+                    elapsed = median(&samples) / f64::from(REPEATS);
+                }
+            }
+            self.release(&[src, dst]);
             if elapsed > 0.0 {
                 rate = Some(2.0 * bytes as f64 / (elapsed / 1e3));
             }
@@ -755,6 +775,37 @@ mod tests {
             profile.dispatch_overhead = Some(Duration::from_micros(1));
         });
         assert_eq!(cache.measure(resources(1000, 64), unused), complete);
+    }
+
+    #[test]
+    fn host_bandwidth_survives_a_stale_empty_submit_estimate() {
+        let gpu = Arc::new(
+            crate::init_gpu_context_with(crate::GpuOptions {
+                timing: false,
+                ..crate::GpuOptions::from_env()
+            })
+            .unwrap(),
+        );
+        // A cached cold submit can be slower than later streaming dispatches.
+        // This is in the range observed during partial-profile upgrades.
+        let profile = MachineProfile {
+            submit_round_trip: Some(Duration::from_micros(200)),
+            ..Default::default()
+        };
+        let mut bench = Bench::new(
+            &gpu,
+            false,
+            Instant::now() + Duration::from_secs(2),
+            64 << 20,
+            &profile,
+        );
+        let bandwidth = bench.bandwidth();
+        bench.finish();
+        assert!(
+            bandwidth.is_some_and(|rate| rate.is_finite() && rate > 0.0),
+            "{bandwidth:?}"
+        );
+        assert_eq!(profile.submit_round_trip, Some(Duration::from_micros(200)));
     }
 
     #[test]
