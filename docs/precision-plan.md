@@ -438,11 +438,32 @@ fresh-execution counts.
   without a qualified model win. Evidence: `direct-f16-result-probes-*`,
   `direct-f16-result-spv-validation.json`, `direct-f16-result-model-inventory.json`,
   `direct-f16-result-assembly` and `coop-convert-compiler-checks`.
-- [ ] Prototype backward propagation of private F16 storage through pointwise
-  and gated consumers. Decode inputs into F32 expressions; retain F32
-  reductions, explicit pins, visible buffers and unmatched readers. Compare
-  whole models with the existing narrow-producer candidate before admitting
-  any additional rounding boundary or revisiting direct result stores.
+- [x] Prototype backward propagation of private F16 storage through pointwise
+  and gated consumers, including an F16 store for the final `SumRows` result.
+  Inputs decode to F32 expressions; matrix partials and row-reduction arithmetic
+  remain F32. The input-only prototype reaches no SmolLM2 buffers because the
+  split reduction ends the chain. Supporting its final store reaches 30
+  split-reduction/SwiGLU pairs, without adding dispatches.
+
+  All six inference comparisons pass full independent F32 output checks before
+  and after timing. At fixed plans/counts, changes versus the existing private
+  producer candidate are:
+
+  | Model | B570 latency change | RTX 5070 latency change |
+  | --- | ---: | ---: |
+  | SmolLM2 | +0.05% | +0.003% |
+  | SD U-Net | +0.21% | +0.41% |
+  | SmolVLA | +0.26% | +0.07% |
+
+  The extra 30/10/17 narrowed buffers save 23.59/1.84/6.63 MB of logical
+  storage respectively; this is not an allocated-peak-memory measurement.
+  Parameters, inputs, outputs, precision guards, workgroups and dispatch counts
+  are unchanged. Every reader of a narrowed buffer is checked for F16 storage;
+  split partials remain F32. Keep the prototype outside production because it
+  establishes no latency win. No training-trajectory/admission claim is made
+  for this rejected inference-only experiment. Raw sources, plans, ABBA samples,
+  gate results and structural assertions are retained in `pointwise-chains-*`,
+  especially `pointwise-chains-assessment.json` and `pointwise-chains-source-v2`.
 - [ ] Consider immutable reduced weight caches only with upload, sharing,
   checkpoint, external-buffer and optimizer-update invalidation defined and
   tested. Inference parameters are still mutable through these interfaces.
