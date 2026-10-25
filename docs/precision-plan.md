@@ -233,8 +233,10 @@ scope separate from the AT/BT gains in the table above.
   split partials stay F32; strict policy and explicit pins remain in force.
   Keep the derivative guard and the caller's whole-gradient/trajectory gates.
   No mixed-storage profile or new backend capability API is needed.
-- [ ] Reach the Intel SmolLM2 derivative opportunity within 30 seconds without
-  displacing its stronger layout. The fresh search below does not reach it.
+- [x] Reach the Intel SmolLM2 derivative opportunity within 30 seconds without
+  displacing its stronger layout, combining #295 with the exact-repeat port in
+  [Inferena #83](https://github.com/kvark/inferena/pull/83). The arithmetic-only
+  comparison below remains neutral; the qualified combined result follows.
 
 Fresh 30-second search winners, measured in separate 100-sample paired
 holdouts after 10 seconds of warmup (forward + loss + backward, milliseconds;
@@ -292,8 +294,19 @@ the saved winners. At matched submission counts, the gain is 17.87% at one
 (50.378→41.373 ms) and 18.07% at four (49.736→40.749 ms). Both GPU winners pass
 the unchanged 256-update real-text gate against native/PyTorch F32 references.
 NVIDIA is neutral in this comparison (-0.44%). This is a qualification/search
-prototype, separate from the arithmetic admission in #295; its Inferena port
-and remaining validation are in progress.
+prototype, separate from the arithmetic admission in #295. The port is now
+[Inferena #83](https://github.com/kvark/inferena/pull/83). A build of the unmodified
+production framework sources with #295 plus #296 also reaches the typed
+AT/BT choice in fresh 30-second searches: training is 40.956 ms on Intel and
+15.989 ms on NVIDIA; inference is 7.812/3.660 ms. Every ordinary qualification
+passes, without internal-buffer hooks.
+
+The standalone port on current main plus #296 also improves selection: Intel
+training changes 49.738→45.664 ms and NVIDIA 18.462→18.042 ms, while total native
+setup/search changes 78.365→75.521 s and 68.189→67.821 s. These are separate
+ordinary 100-sample collections, not paired fixed-plan effects; submission
+counts change under the existing policy. Keep this experiment distinct from
+the precision-stack holdouts above.
 
 The prototype also passes explicit GPU tests on both cards: loss-preserving
 gradient mutations, final-element/large-array tails, CPU fallback on changed
