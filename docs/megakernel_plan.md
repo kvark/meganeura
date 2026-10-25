@@ -66,8 +66,11 @@ the qualified memory-ordering contract remains unchanged.
   Keep query-dependent causal attention unpacked. Pass 665 library tests,
   all 168 strict oracle tests and seven focused whole-graph tests, including
   repeated packed matrix execution with 1/3/64/4096 workers.
-- [ ] Measure the qualified concurrent packing implementation with isolated
-  full-step paired runs and separate SDK counters.
+- [x] Measure concurrent packing at `88d5e51`: 250 isolated full-step paired
+  comparisons pass. SmolVLA forward improves to 1.468× ordinary, while training
+  measures 1.426× with a wider interval. Separate SDK captures preserve exact
+  forward state and estimate 1.87× warp instructions and 1.11× global-load
+  sectors. Every selected case still uses one dispatch; parity remains unmet.
 - [ ] Isolate remaining queue/indexing/resource costs and reach baseline
   performance under the same full-step measurement and correctness gates. Keep this opt-in until performance justifies
   a default change.

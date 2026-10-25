@@ -454,13 +454,12 @@ hashes, raw samples and bootstrap summary are retained in
 `target/megakernel-results/masked-loops-sdk/`.
 
 This also bounds the conclusion from excess instructions: many can be removed
-without recovering the elapsed-time gap. The next resource investigation is
-whether a physical worker can use spare subgroups for additional independent
-logical tiles. Such a change must preserve scratch isolation, arithmetic,
-workgroup-barrier uniformity and the existing completion/fence contract; the
-earlier rejected sequential four-tile batching does not provide this behavior.
+without recovering the elapsed-time gap. It motivated concurrent tile packing,
+measured below, which puts spare subgroups to work on independent logical tiles
+while preserving scratch isolation and the completion/fence contract. The
+earlier rejected sequential four-tile batching did not provide this behavior.
 
-## Latest completed-step measurement
+## Scalar-accumulator completed-step measurement
 
 Clean commit `36304a0` includes the scalar attention accumulators. The same
 uninstrumented 50-pair protocol passes all **250 comparisons**, with exact
@@ -483,6 +482,68 @@ remains. Records and hashes are under
 same bootstrap procedure in filename/case order. The isolated final run is
 the only SmolVLA record used here. An invalid ICD-path attempt and two cancelled
 overlapping runs are retained and explicitly excluded in that summary.
+
+## Concurrent tile packing: latest measurements
+
+Commit `88d5e51` packs eligible logical tiles concurrently into the existing
+worker workgroup. The matrix tiles use separate scratch ranges and preserve
+their original subgroup coordinates and arithmetic. The grid axis is selected
+from actual dispatch dimensions to reduce claims. Causal attention remains
+unpacked because its query-dependent barrier loop fails the admission check.
+The focused packing fixture covers two- and four-tile claims, partial rows,
+repeated scratch reuse and worker pools from 1 to 4096. The regional selected
+geometry/scratch test also passes after the shared subgroup-detection change.
+
+All **250 completed-step comparisons** pass at 256 workers, with identical
+plans and implementation keys, one physical dispatch and no fallback. Each row
+uses 50 alternating pairs and at least ten warmup pairs / one second of warmup.
+Forward and CI state are exact; the maximum training difference remains
+`4.6566128730773926e-9`. Tracked source was clean. Receipts disclose the unrelated
+untracked `configs/` directory, binary hashes, commands and start/end times;
+SDK, CI and SmolVLA runs were sequential, with no profiling, builds or analysis
+during the primary measurements.
+
+| Workload | Ordinary median, ms | Whole-graph median, ms | Median paired ratio | 95% bootstrap interval |
+|---|---:|---:|---:|---:|
+| SmolVLA forward | 4.421 | 6.483 | 1.468 | 1.461–1.514 |
+| SmolVLA forward/backward/SGD | 15.149 | 21.620 | 1.426 | 1.410–1.553 |
+| CI inference | 0.05054 | 0.06830 | 1.337 | 1.250–1.440 |
+| CI forward/backward | 0.06647 | 0.10046 | 1.522 | 1.499–1.529 |
+| CI forward/backward/SGD | 0.06810 | 0.10078 | 1.486 | 1.469–1.505 |
+
+The forward median falls from 8.047 to 6.483 ms compared with the preceding
+scalar-accumulator measurement, while the ordinary median is nearly unchanged.
+The training interval is broader and overlaps the preceding result, so it does
+not establish a training speedup. CI uses no packed matrix tiles and retains
+its scheduling overhead. **Baseline parity remains unmet.** Raw records and the
+10,000-resample bootstrap summary, using the same seed and filename/case order,
+are in `target/megakernel-results/packed-tiles-88d5e51/`.
+
+Separate SDK captures collect six sequential single-pass groups per mode, each
+with 146 samples, successful exits and no warnings. Complete forward state
+retains SHA-256 `4e5d66e6ce5e95142b848651d316b4df64855a9d85669499cabc3a81089be629`.
+Ordinary / persistent replay medians are 3.775 / 6.013 ms. Estimated per-step
+activity, calculated as counter rate times replay duration, is:
+
+| Metric | Persistent / ordinary |
+|---|---:|
+| Warp instructions | 1.869× |
+| Predicated-on integer FMA-pipe thread instructions | 2.537× |
+| Global-load sectors | 1.115× |
+| Shared-memory wavefronts | 1.185× |
+| Tensor activity × duration | 1.016× |
+
+The corresponding pre-packing estimates were 2.88× warp instructions, 4.29×
+integer-pipe instructions, 2.69× global-load sectors and 1.62× shared wavefronts.
+Packing substantially reduces redundant work while maintaining the tensor work
+of the ordinary implementation. These remain aggregate activity estimates.
+
+Barrier waiting is now 62.50% of persistent active warp cycles, versus 3.73%
+ordinary; memory-barrier waiting is 0.49%. Clock/instruction-rate means vary by
+at most 0.33% across their sampled groups. The increased barrier share alongside
+lower runtime reinforces that it is not an elapsed-time fraction. The capture
+does not separate scheduler waiting from handler barriers. Receipts, raw CSVs
+and the derived summary are in `target/megakernel-results/packed-tiles-sdk/`.
 
 ## Reproduction and artifact identities
 
