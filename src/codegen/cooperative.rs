@@ -88,7 +88,13 @@ pub(super) fn generate_with_params(
                 },
                 "(group.z * m + r) * n + c",
                 "matrix_c",
-                if addend { " + src[index]" } else { "" },
+                if addend && layout.partitioned_add {
+                    " + select(0.0, src[select(0u, r * n + c, group.z == 0u)], group.z == 0u)"
+                } else if addend {
+                    " + src[index]"
+                } else {
+                    ""
+                },
             )
         }
         ShaderGroup::Conv2dBF16 {

@@ -1078,11 +1078,14 @@ pub struct TypedMatmulLayout {
     pub direct_output: bool,
     /// Native operands may bypass staging when all 32x32 K/output tiles fit.
     pub direct_inputs: bool,
+    /// An addend belongs only to the first K partition.
+    pub partitioned_add: bool,
 }
 
 impl TypedMatmulLayout {
     pub fn for_product(types: MatrixTypes, addend: bool, [m, n, k]: [u32; 3]) -> Self {
         Self {
+            partitioned_add: false,
             vectorized: (u64::from(m) * u64::from(k)).is_multiple_of(4)
                 && (u64::from(k) * u64::from(n)).is_multiple_of(4),
             direct_inputs: matches!(types.multiply, crate::DType::F16 | crate::DType::BF16)
@@ -3137,8 +3140,14 @@ fn gen_matmul_coop_stored(
     } else {
         "row * n + col"
     };
-    let result_value = if let Some((types, _)) = typed {
-        let value = if fused_add { "val + src[idx]" } else { "val" };
+    let result_value = if let Some((types, layout)) = typed {
+        let value = if fused_add && layout.partitioned_add {
+            "val + select(0.0, src[select(0u, row * n + col, wgid.z == 0u)], wgid.z == 0u)"
+        } else if fused_add {
+            "val + src[idx]"
+        } else {
+            "val"
+        };
         let cast = if types.output == crate::DType::BF16 {
             "round_bf16"
         } else {

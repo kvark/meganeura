@@ -211,3 +211,183 @@ fn check_candidates(strategy: TuneStrategy) {
     }
     println!("rectangular_workgroup_candidates_reported={probes}");
 }
+
+#[test]
+fn typed_split_add_keeps_bias_in_first_partition() {
+    use meganeura::compile::{BufferRef, Dispatch, Kernel, ShaderEntry};
+    let gpu = crate::support::gpu::gpu();
+    for operand in [DType::F16, DType::BF16] {
+        if !meganeura::runtime::typed_matrix_supported(&gpu, operand) {
+            continue;
+        }
+        for storage in [DType::F32, operand] {
+            for (dims, splits) in [([64, 64, 256], 8), ([33, 65, 1031], 4), ([16, 48, 65], 3)] {
+                let [m, n, k] = dims;
+                for layout in 0..3 {
+                    let g = graph(storage, layout, true, false, dims);
+                    let mut plan = meganeura::compile::compile(&g);
+                    let index = plan
+                        .dispatches
+                        .iter()
+                        .position(|d| d.shader.is_matmul())
+                        .unwrap();
+                    let output = plan.dispatches[index].output_buffer;
+                    let partial = BufferRef(plan.buffers.len() as u32);
+                    plan.buffers.push(m * n * splits * 4);
+                    let types = MatrixTypes {
+                        a: storage,
+                        b: storage,
+                        multiply: operand,
+                        output: DType::F32,
+                    };
+                    let product = &mut plan.dispatches[index];
+                    product.kernel = Kernel::CooperativeTyped {
+                        types,
+                        splits: splits as u32,
+                    };
+                    product.output_buffer = partial;
+                    product.workgroups = [
+                        (m as u32).div_ceil(32),
+                        (n as u32).div_ceil(32),
+                        splits as u32,
+                    ];
+                    let sum = Dispatch {
+                        shader: ShaderEntry::SumRows,
+                        input_buffers: vec![partial],
+                        output_buffer: output,
+                        params: vec![splits as u32, (m * n) as u32, 1, 0],
+                        workgroups: [((m * n) as u32).div_ceil(256), 1, 1],
+                        ..Default::default()
+                    };
+                    plan.dispatches.insert(index + 1, sum);
+                    plan.groups.clear();
+                    let mut session = meganeura::Session::with_context_opts(
+                        plan,
+                        gpu.clone(),
+                        meganeura::SessionOptions {
+                            poison: true,
+                            no_alias: true,
+                            ..Default::default()
+                        },
+                    );
+                    let a: Vec<_> = (0..m * k)
+                        .map(|i| ((i * 17 % 31) as f32 - 15.) / 64.)
+                        .collect();
+                    let b: Vec<_> = (0..n * k)
+                        .map(|i| ((i * 23 % 29) as f32 - 14.) / 64.)
+                        .collect();
+                    let bias: Vec<_> = (0..m * n)
+                        .map(|i| {
+                            if i % 17 == 0 {
+                                70_000.125
+                            } else {
+                                (i % 13) as f32 / 127. - 0.05
+                            }
+                        })
+                        .collect();
+                    for zero_product in [false, true] {
+                        session.set_parameter(
+                            "a",
+                            &if zero_product {
+                                vec![0.; a.len()]
+                            } else {
+                                a.clone()
+                            },
+                        );
+                        session.set_parameter("b", &b);
+                        session.set_parameter("bias", &bias);
+                        session.step();
+                        session.wait();
+                        let mut partials = vec![0.; m * n * splits];
+                        session.read_buffer(partial, &mut partials);
+                        let actual = session.read_output(m * n);
+                        for row in 0..m {
+                            for col in 0..n {
+                                let offset = row * n + col;
+                                let (mut total, mut total_abs) = (0., 0.);
+                                let blocks = k.div_ceil(32);
+                                for split in 0..splits {
+                                    let first = (split * (blocks / splits)
+                                        + split.min(blocks % splits))
+                                        * 32;
+                                    let end = (first
+                                        + (blocks / splits + usize::from(split < blocks % splits))
+                                            * 32)
+                                        .min(k);
+                                    let mut expected = if split == 0 {
+                                        f64::from(bias[offset])
+                                    } else {
+                                        0.
+                                    };
+                                    let mut sum_abs = expected.abs();
+                                    if !zero_product {
+                                        for inner in first..end {
+                                            let ai = if layout == 1 {
+                                                inner * m + row
+                                            } else {
+                                                row * k + inner
+                                            };
+                                            let bi = if layout == 2 {
+                                                col * k + inner
+                                            } else {
+                                                inner * n + col
+                                            };
+                                            let term = f64::from(a[ai]) * f64::from(b[bi]);
+                                            expected += term;
+                                            sum_abs += term.abs();
+                                        }
+                                    }
+                                    let got = f64::from(partials[split * m * n + offset]);
+                                    let bound = meganeura::reference::native_matrix::error_bound(
+                                        end - first + 1,
+                                        sum_abs,
+                                    )
+                                    .unwrap();
+                                    assert!(
+                                        got.is_finite() && (got - expected).abs() <= bound,
+                                        "{operand:?}/{storage:?} {dims:?} layout={layout} split={split}: {got} != {expected}"
+                                    );
+                                    total += expected;
+                                    total_abs += sum_abs;
+                                }
+                                let got = f64::from(actual[offset]);
+                                let bound = meganeura::reference::native_matrix::error_bound(
+                                    k + splits,
+                                    total_abs,
+                                )
+                                .unwrap();
+                                assert!(got.is_finite() && (got - total).abs() <= bound);
+                                if zero_product {
+                                    assert_eq!(actual[offset], bias[offset]);
+                                }
+                            }
+                        }
+                    }
+                    if operand == DType::F16
+                        && storage == DType::F32
+                        && dims == [33, 65, 1031]
+                        && layout == 0
+                    {
+                        let report = session
+                            .tune_with(TuneOptions {
+                                max_time: Duration::from_secs(10),
+                                max_classes: 1,
+                                warmup_runs: 1,
+                                sample_pairs: 4,
+                                dispatches_per_sample: 1,
+                                target_sample_time: None,
+                                ..crate::support::sequential_tuning()
+                            })
+                            .unwrap();
+                        assert_eq!(report.eligible_classes, 1);
+                        assert!(!report.outcomes.is_empty());
+                        assert!(report.outcomes.iter().all(|o| o.qualified), "{report:?}");
+                        session.step();
+                        session.wait();
+                        assert_eq!(session.read_output(m * n), bias);
+                    }
+                }
+            }
+        }
+    }
+}

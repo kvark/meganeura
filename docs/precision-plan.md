@@ -238,6 +238,31 @@ Preserve these additional leads for follow-up:
 
 ## 3. Intel loading and tile geometry
 
+- [x] Extend checked typed NN/AT/BT split products to fused addends. Add the
+  F32 bias only to the first partition, keep F32 partials and the existing
+  reduction, and distinguish this addressing in the pipeline key. Ordinary
+  shaders remain byte-identical to the baseline. Independent F64 partial/final
+  fixtures, poisoned-buffer reuse and private tuner checks pass on both GPUs.
+  Fixed-plan training holdouts isolating this extension improve B570 SmolLM2
+  47.860→45.802 ms (4.30%) and RTX 5070 18.314→17.905 ms (2.23%), with matched
+  submission counts and independent F32 qualification before/after timing.
+  All six 32-update model cases and both 256-update real-text variants pass
+  unchanged training gates. These are saved-layout opportunities; bounded
+  search does not yet reliably combine the best layout and arithmetic. A fresh
+  30-second NVIDIA search reaches all 60 new split/add products, but its
+  holdout is neutral (18.382→18.362 ms): another class retains eight partitions
+  instead of the older winner's two. Preserve this result beside the fixed-plan
+  gains rather than claim an automatic end-to-end improvement.
+- [x] Test earlier rectangular arithmetic coverage. The old early-coverage
+  condition recognizes 8×8×8, while B570 exposes 8×16×16. Extending it reaches
+  reduced products earlier, but loses 5.62% on SmolLM2 and is neutral on
+  SmolVLA by displacing a better graph layout. Retain this rejected experiment.
+- [ ] Improve layout/arithmetic ordering using a cost estimate that covers the
+  complete plan. On the saved B570 SmolLM2 layout, the previously eligible 121
+  dense products improve 4.93%; adding forward QK/PV improves 5.44%. The
+  instrumented profile is dominated by protected F32 backward products. Do
+  not confuse earlier candidate coverage with a better selected program.
+
 - [x] Repair dropped direct-output layout information in checked rectangular
   GEMMs and enable direct stores for aligned checked convolutions: [PR #286](https://github.com/kvark/meganeura/pull/286).
   The same-plan model comparison improves B570 SmolLM2 inference by 2.6% and

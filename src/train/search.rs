@@ -1087,9 +1087,9 @@ fn fill_matrix_candidates_scoped(
             compile::Kernel::SplitMatmul { splits, .. } => splits,
             _ => 1,
         };
-        // Keep the existing partial buffer and SumRows contract. Typed split
-        // products cannot fuse an addend and need a 32-element K block per part.
-        if splits > 1 && (d.input_buffers.len() != 2 || splits > k.div_ceil(32)) {
+        // Keep the existing partial buffer and SumRows contract, adding a
+        // fused addend only in the first partition. Each part needs a K block.
+        if splits > 1 && splits > k.div_ceil(32) {
             continue;
         }
         let grid = [m.div_ceil(32), n.div_ceil(32), splits];

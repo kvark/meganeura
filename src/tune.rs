@@ -579,9 +579,7 @@ impl MatmulTile {
             if splits == 0
                 || (splits > 1) != class.split_k
                 || (splits > 1
-                    && (splits > class.k.div_ceil(32)
-                        || class.has_addend()
-                        || types.output != crate::DType::F32))
+                    && (splits > class.k.div_ceil(32) || types.output != crate::DType::F32))
             {
                 return None;
             }
@@ -2840,6 +2838,32 @@ mod tests {
         assert!(native.buffer_sizes(&class).is_none());
         class.shader = ShaderEntry::MatMulBT;
         assert!(native.buffer_sizes(&class).is_some());
+    }
+
+    #[test]
+    fn typed_split_add_keeps_logical_bias_and_partitioned_output_extents() {
+        let mut class = class(33, 65, 1031);
+        class.shader = ShaderEntry::FusedMatMulAdd;
+        class.matrix_types = Some(crate::codegen::MatrixTypes::F32_AS_F16);
+        class.split_k = true;
+        let tile = MatmulTile::CooperativeChecked { splits: 4 };
+        let sizes = tile.buffer_sizes(&class).unwrap();
+        assert_eq!(
+            sizes,
+            [33 * 1031 * 4, 1031 * 65 * 4, 33 * 65 * 4, 4 * 33 * 65 * 4]
+        );
+        class.binding_bytes = sizes;
+        assert!(tile.fits(&class));
+        class.binding_bytes[2] -= 4;
+        assert!(
+            !tile.fits(&class),
+            "partition capacity cannot enlarge the bias binding"
+        );
+        class.binding_bytes[2] += 4;
+        class.binding_bytes[3] -= 4;
+        assert!(!tile.fits(&class));
+        class.matrix_types.as_mut().unwrap().output = crate::DType::F16;
+        assert!(tile.buffer_sizes(&class).is_none(), "partials remain F32");
     }
 
     #[test]

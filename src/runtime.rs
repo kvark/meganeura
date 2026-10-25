@@ -1247,16 +1247,14 @@ fn typed_matmul_layout(dispatch: &Dispatch) -> crate::codegen::TypedMatmulLayout
         ));
         return crate::codegen::TypedMatmulLayout::default();
     };
-    crate::codegen::TypedMatmulLayout::for_product(
-        types,
-        matches!(
-            dispatch.shader,
-            ShaderEntry::FusedMatMulAdd
-                | ShaderEntry::FusedMatMulATAdd
-                | ShaderEntry::FusedMatMulBTAdd
-        ),
-        [m, n, k],
-    )
+    let addend = matches!(
+        dispatch.shader,
+        ShaderEntry::FusedMatMulAdd | ShaderEntry::FusedMatMulATAdd | ShaderEntry::FusedMatMulBTAdd
+    );
+    let mut layout = crate::codegen::TypedMatmulLayout::for_product(types, addend, [m, n, k]);
+    layout.partitioned_add = addend
+        && matches!(dispatch.kernel, crate::compile::Kernel::CooperativeTyped { splits, .. } if splits > 1);
+    layout
 }
 
 /// Reduced storage types, and the multiplication types of checked
@@ -5371,11 +5369,33 @@ mod variant_tests {
                 );
                 if let Kernel::CooperativeTyped { ref mut splits, .. } = dispatch.kernel {
                     *splits = 4;
-                    assert_eq!(
-                        Pipelines::key(&dispatch),
-                        key,
-                        "K partitions are uniform data"
-                    );
+                    if matches!(
+                        entry,
+                        ShaderEntry::FusedMatMulAdd
+                            | ShaderEntry::FusedMatMulATAdd
+                            | ShaderEntry::FusedMatMulBTAdd
+                    ) {
+                        assert_ne!(
+                            Pipelines::key(&dispatch),
+                            key,
+                            "split addends need first-partition addressing"
+                        );
+                        let split_key = Pipelines::key(&dispatch);
+                        if let Kernel::CooperativeTyped { ref mut splits, .. } = dispatch.kernel {
+                            *splits = 8;
+                        }
+                        assert_eq!(
+                            Pipelines::key(&dispatch),
+                            split_key,
+                            "partition counts share the guarded shader"
+                        );
+                    } else {
+                        assert_eq!(
+                            Pipelines::key(&dispatch),
+                            key,
+                            "K partitions are uniform data"
+                        );
+                    }
                 }
             }
         }
