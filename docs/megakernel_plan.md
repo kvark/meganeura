@@ -39,12 +39,18 @@ the qualified memory-ordering contract remains unchanged.
 - [x] Record 350 paired comparisons and qualified NVIDIA SDK captures. Every
   selected case uses one dispatch; SmolVLA at 256 workers regresses by
   2.300× forward and 1.886× with SGD. Counter evidence identifies fourfold
-  duplicated tensor calculations in the current lane adapter.
+  duplicated tensor calculations in the initial lane adapter.
 - [x] Skip inactive subgroups' cooperative products using scope-aware Naga
   validation. SDK estimates fall from 4× to 1.012× ordinary tensor activity per
   step. Cache descriptor indices, use fixed uniform offsets, omit transitive
   edges and retain only necessary per-access memory propagation; repeat oracle
   and focused graph qualification.
+- [x] Repeat clean full-step measurements after those optimizations: 550 paired
+  comparisons pass at `58458d2`; SmolVLA ratios improve to 1.897× forward and
+  1.534× with SGD. Baseline parity remains unmet.
+- [x] Extend SDK captures to instruction and memory counters. Trace excess
+  local-memory traffic to cooperative attention's output array and replace it
+  with scalar accumulators while preserving arithmetic in both paths.
 - [ ] Isolate remaining queue/indexing/resource costs and reach baseline
   performance under the same full-step measurement and correctness gates. Keep this opt-in until performance justifies
   a default change.

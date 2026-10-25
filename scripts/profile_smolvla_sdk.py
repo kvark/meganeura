@@ -31,7 +31,7 @@ def sha256(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
-def capture(repo, sdk, output, phase, workers, whole_graph=False):
+def capture(repo, sdk, output, phase, workers, whole_graph=False, metrics=METRICS):
     mode = "ordinary" if workers is None else ("whole-" if whole_graph else "") + str(workers)
     prefix = output / mode
     binary = repo / "target/release/examples/bench_smolvla_train"
@@ -45,7 +45,7 @@ def capture(repo, sdk, output, phase, workers, whole_graph=False):
                "--profile-json", str(prefix), "--capture-phase", phase,
                "--capture-seconds", "10"]
     monitor_command = [str(sdk / "NvPerf/bin/x64/Monitoring"),
-                       "--metrics", ",".join(METRICS),
+                       "--metrics", ",".join(metrics),
                        "--output-yaml", str(prefix) + ".yaml", "--csv",
                        "--output-csv", str(prefix) + ".csv", "--csv-duration", "3",
                        "-n", "0.02"]
@@ -103,7 +103,7 @@ def capture(repo, sdk, output, phase, workers, whole_graph=False):
                 rows = list(csv.DictReader(source))[5:]
             assert len(rows) >= 100, "Incomplete counter collection"
             means = {}
-            for metric in METRICS:
+            for metric in metrics:
                 column, = [key for key in rows[0] if key.split(" (")[0] == metric]
                 values = [float(row[column]) for row in rows]
                 assert all(math.isfinite(value) for value in values)
@@ -127,14 +127,18 @@ def main():
     parser.add_argument("--phase", choices=("forward", "backward"), default="forward")
     parser.add_argument("--workers", type=int, nargs="+", default=[64, 256])
     parser.add_argument("--whole-graph", action="store_true")
+    parser.add_argument("--metrics", nargs="+", default=METRICS,
+                        help="SDK metric names that can be collected in one pass")
     args = parser.parse_args()
     assert all(1 <= workers <= 65535 for workers in args.workers)
     assert len(set(args.workers)) == len(args.workers)
     repo = Path(__file__).resolve().parents[1]
     args.output.mkdir(parents=True, exist_ok=False)
-    reference, reference_record = capture(repo, args.sdk.resolve(), args.output.resolve(), args.phase, None)
+    reference, reference_record = capture(repo, args.sdk.resolve(), args.output.resolve(), args.phase, None,
+                                          metrics=args.metrics)
     for workers in args.workers:
-        receipt, record = capture(repo, args.sdk.resolve(), args.output.resolve(), args.phase, workers, args.whole_graph)
+        receipt, record = capture(repo, args.sdk.resolve(), args.output.resolve(), args.phase, workers,
+                                  args.whole_graph, args.metrics)
         assert record["implementation_keys"] == reference_record["implementation_keys"]
         assert record["state_layout"] == reference_record["state_layout"]
         assert receipt["state_sha256"] == reference["state_sha256"], "Backend state differs"

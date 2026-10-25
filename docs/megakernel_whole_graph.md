@@ -252,10 +252,100 @@ Qualification passes 664 library tests, all 168 strict whole-graph oracle tests,
 and the six focused graph tests. Naga passes 144 unit, 268 integration and six
 documentation tests (24 ignored), plus strict all-target/all-feature Clippy;
 Blade passes 20 unit tests (one ignored). Meganeura's strict Clippy also passes.
-Short five-pair experiments retain state parity and improve the measured path,
-but **baseline parity has not been reached**. New production measurements and
-further resource/indexing/scheduling work remain required. The 50-pair table
-above describes the original implementation, not these changes.
+Clean commit `58458d2bcd1fb4c518be714e2e11e27130b95fdd` was then measured with
+the same completed-step boundaries, 50 alternating pairs per row and at least
+ten warmup pairs / one second of warmup. No diagnostics or concurrent builds
+were active during these measurements.
+
+| Workload | Workers | Ordinary median, ms | Whole-graph median, ms | Median paired ratio | 95% bootstrap interval |
+|---|---:|---:|---:|---:|---:|
+| SmolVLA forward | 256 | 4.448 | 8.426 | 1.897 | 1.890–1.910 |
+| SmolVLA forward/backward/SGD | 256 | 15.123 | 23.134 | 1.534 | 1.518–1.549 |
+| CI inference | 256 | 0.0517 | 0.0665 | 1.278 | 1.252–1.423 |
+| CI forward/backward | 256 | 0.0663 | 0.1003 | 1.513 | 1.487–1.522 |
+| CI forward/backward/SGD | 256 | 0.0683 | 0.1037 | 1.515 | 1.477–1.537 |
+| CI inference | 64 | 0.0522 | 0.0687 | 1.317 | 1.310–1.326 |
+| CI forward/backward | 64 | 0.0665 | 0.0975 | 1.459 | 1.419–1.472 |
+| CI forward/backward/SGD | 64 | 0.0686 | 0.1008 | 1.474 | 1.459–1.485 |
+| CI inference | 16 | 0.0522 | 0.0689 | 1.316 | 1.305–1.328 |
+| CI forward/backward | 16 | 0.0670 | 0.0992 | 1.475 | 1.432–1.493 |
+| CI forward/backward/SGD | 16 | 0.0682 | 0.1020 | 1.495 | 1.485–1.505 |
+
+All **550 comparisons** pass with identical plans and arithmetic selection,
+one persistent dispatch and no fallback. Forward and CI state are exact;
+SmolVLA training's maximum absolute difference remains
+`4.6566128730773926e-9`. Bootstrap settings match the earlier table, with samples
+drawn in sorted artifact-filename order and then case order. Results and SHA-256
+identities are in `target/megakernel-results/whole-graph-opt-58458d2/summary.json`.
+**Baseline parity has not been reached.** The SmolVLA paired ratios improve
+from 2.300 / 1.886 to 1.897 / 1.534; the small CI graph still has substantial
+GPU scheduling overhead. Separate diagnostic timestamps place CI inference at
+about 13 / 31 microseconds of GPU time and training at 28 / 72 microseconds for
+ordinary / persistent execution. These timestamps are not primary timings.
+
+The same commit's separate SDK forward capture estimates **1.028× ordinary
+tensor activity per step**, with replay medians 3.775 / 7.995 ms. Both captures
+have 146 samples, exact state and successful target/monitor exits without SDK
+warnings. Receipts are under the results directory's `sdk-forward/` subdirectory.
+Thus the duplicate matrix work is removed, while the remaining slowdown needs
+resource and scheduling improvements.
+
+## Instruction and local-memory costs
+
+A second SDK metric set measures instructions and memory transactions during
+the same state-checked forward replay. The script accepts `--metrics` for
+reproducible single-pass sets; exact metric names and commands are saved in
+each receipt. Stall-reason metrics require multiple passes on this device and
+cannot be collected by the SDK's standalone live sampler. No stall attribution
+is inferred from its failed configuration probes.
+
+At the `58458d2` implementation, ordinary / persistent replay medians are
+3.785 / 7.988 ms. Counter rates multiplied by replay duration estimate the
+following per-step work. These are whole-workload activity estimates, not
+per-kernel counts or isolated timings.
+
+| Metric | Ordinary | Persistent | Ratio |
+|---|---:|---:|---:|
+| Warp instructions, millions | 389.8 | 1137.6 | 2.919 |
+| Predicated-on integer FMA-pipe thread instructions, millions | 701.0 | 2910.6 | 4.152 |
+| Heavy FP32-pipe thread instructions, millions | 1770.1 | 1718.6 | 0.971 |
+| Light FP32-pipe thread instructions, millions | 2649.1 | 2890.7 | 1.091 |
+| Global-load sectors, millions | 51.11 | 136.78 | 2.676 |
+| Global-store sectors, millions | 2.813 | 2.843 | 1.011 |
+| Local-load sectors, millions | 0 | 14.139 | — |
+| Local-store sectors, millions | 0 | 15.695 | — |
+| Shared-memory wavefronts, millions | 128.96 | 208.88 | 1.620 |
+
+The local-memory traffic is measured directly, independent of the driver's
+unusable local-memory-size statistic. Explicit scalar output accumulators in
+cooperative attention replace its dynamically indexed local array, using the
+existing template expansion in both ordinary and persistent paths. The order
+of each accumulator's operations, precision and selected kernel remain the same.
+The follow-up SDK capture estimates **0.041 million local-load sectors and
+0.690 million local-store sectors** per persistent step: reductions of 99.7%
+and 95.6%. Replay medians are 3.797 / 7.553 ms. Both captures have 146 samples
+and the same bitwise-exact state hash as the original forward capture. These
+receipts are under `target/megakernel-results/whole-graph-memory-sdk/` and
+`scalar-attention-sdk/`; the latter records the uncommitted candidate source.
+
+The scalar change substantially reduces this memory cost but leaves roughly
+2.88× the warp instructions, 4.29× integer-pipe instructions and 1.62× shared
+wavefronts. These aggregates do not isolate the cost of queue polling,
+descriptor addressing, extra lanes or scratch initialization.
+
+The scalar-accumulator change passes 664 library tests (eight ignored), all
+26 ordinary attention oracle tests, all 168 strict whole-graph oracle tests,
+the six focused graph tests and strict all-target/all-feature Clippy. SDK
+capture qualification also compares the complete forward state with the
+unchanged arithmetic reference.
+
+Experiments with directional payload fences, scalar parameter broadcasts,
+unchanged-parameter upload elision and merged metadata broadcasts gave no
+material improvement and were reverted. Per-node descriptor specialization
+also gave no useful speedup and made training compilation exceed four minutes.
+Claiming four tiles per queue operation regressed CI and SmolVLA and was
+reverted. Saved patches and exploratory paired records remain under `target/`;
+none of those experiments changes the published fence contract.
 
 ## Reproduction and artifact identities
 

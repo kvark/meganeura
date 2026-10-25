@@ -286,11 +286,18 @@ pub fn generate_flash_attention_coop_f32_module(head_dim: u32) -> ShaderModule {
 }
 
 fn generate_flash_attention_coop(head_dim: u32, use_f16: bool) -> ShaderModule {
+    let template = include_str!("../shaders/flash_attention_coop.wgsl");
+    let elements = |name| unroll_elements(template_section(template, name), head_dim / 4, 1);
     let source = preprocess(
-        include_str!("../shaders/flash_attention_coop.wgsl"),
+        template_section(template, "main"),
         &[
             ("$ENABLE_F16", if use_f16 { "enable f16;" } else { "" }),
             ("$INPUT_TYPE", if use_f16 { "f16" } else { "f32" }),
+            ("$OUTPUT_INIT", &elements("output_init")),
+            ("$OUTPUT_SCALE", &elements("output_scale")),
+            ("$OUTPUT_ACCUMULATE", &elements("output_accumulate")),
+            ("$OUTPUT_TAIL", &elements("output_tail")),
+            ("$OUTPUT_STORE", &elements("output_store")),
         ],
     );
     generate_coop_attention(&source, head_dim, "flash_attention_coop")

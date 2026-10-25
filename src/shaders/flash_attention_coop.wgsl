@@ -1,3 +1,4 @@
+// @section main
 // QK^T uses $INPUT_TYPE cooperative operands; V and the scalar PV accumulation stay f32.
 // Each of 64 threads owns one (query row, head-dimension chunk). Keeping O,
 // its maximum and sum in registers avoids a shared-memory roundtrip per tile.
@@ -50,10 +51,7 @@ fn main(
     let first_kv_len = select(kv_seq, pos_base + 1u, pos_base < causal_rows);
     let min_kv_start = select(0u, first_kv_len - min(first_kv_len, window_size), window_size > 0u);
 
-    var local_o: array<f32, $CHUNK_HD>;
-    for (var e = 0u; e < $CHUNK_HDu; e = e + 1u) {
-        local_o[e] = 0.0;
-    }
+    $OUTPUT_INIT
     var local_max: f32 = -1e30;
     var local_sum: f32 = 0.0;
 
@@ -96,9 +94,7 @@ fn main(
         }
         let new_max = max(local_max, rowmax);
         let correction = select(exp(local_max - new_max), 0.0, !q_valid);
-        for (var e = 0u; e < $CHUNK_HDu; e = e + 1u) {
-            local_o[e] = local_o[e] * correction;
-        }
+        $OUTPUT_SCALE
         var rowsum = 0.0;
         for (var j = 0u; j < 16u; j = j + 1u) {
             let kv_pos = t + j;
@@ -106,9 +102,7 @@ fn main(
             let score = shared_score[row * 16u + j] * scale;
             let p = select(exp(score - new_max), 0.0, masked);
             rowsum = rowsum + p;
-            for (var e = 0u; e < $CHUNK_HDu; e = e + 1u) {
-                local_o[e] = local_o[e] + p * shared_v[j * $HEAD_DIMu + d_off + e];
-            }
+            $OUTPUT_ACCUMULATE
         }
         local_sum = local_sum * correction + rowsum;
         local_max = select(local_max, new_max, q_valid);
@@ -127,10 +121,7 @@ fn main(
         let new_max = select(local_max, max(local_max, score), !masked);
         let correction = exp(local_max - new_max);
         let p = select(exp(score - new_max), 0.0, masked);
-        for (var e = 0u; e < $CHUNK_HDu; e = e + 1u) {
-            let v = bias[t * kv_dim + kv_head_off + d_off + e];
-            local_o[e] = local_o[e] * correction + p * v;
-        }
+        $OUTPUT_TAIL
         local_sum = local_sum * correction + p;
         local_max = select(local_max, new_max, q_valid);
     }
@@ -138,9 +129,7 @@ fn main(
     if q_valid {
         let safe_sum = select(local_sum, 1.0, local_sum == 0.0);
         let q_base = qpos * (num_heads * head_dim) + head * head_dim;
-        for (var e = 0u; e < $CHUNK_HDu; e = e + 1u) {
-            dst[q_base + d_off + e] = local_o[e] / safe_sum;
-        }
+        $OUTPUT_STORE
         if chunk == 0u {
             let idx = (qpos * num_heads + head) * 2u;
             lse[idx] = local_max;
@@ -148,3 +137,21 @@ fn main(
         }
     }
 }
+
+// @section output_init
+    var local_o$INDEX = 0.0;
+
+// @section output_scale
+        local_o$INDEX = local_o$INDEX * correction;
+
+// @section output_accumulate
+                local_o$INDEX = local_o$INDEX + p * shared_v[j * $HEAD_DIMu + d_off + $OFFSETu];
+
+// @section output_tail
+        {
+            let v = bias[t * kv_dim + kv_head_off + d_off + $OFFSETu];
+            local_o$INDEX = local_o$INDEX * correction + p * v;
+        }
+
+// @section output_store
+        dst[q_base + d_off + $OFFSETu] = local_o$INDEX / safe_sum;
