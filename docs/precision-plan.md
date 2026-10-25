@@ -91,6 +91,104 @@ qualify F16 P/V operands against the unchanged output and training gates.
 This is a separate algorithm experiment from narrowing the attention output.
 Keep tails, causal/window masks, GQA, head padding and LSE storage explicit.
 
+The 8/16-row prototype now uses native F16 products for both QK and PV,
+with F32 online softmax, LSE, output storage and accumulation. Same-plan
+inference checks pass against the independent F32 oracle on both cards.
+The production-identity rerun improves NVIDIA Whisper by 10.1% and Intel SD
+U-Net by 5.6%, but regresses Intel Whisper by 66.5%; these fixed-plan results
+require measured selection. Other inference changes range from a 2.9% gain
+to a 1.6% regression.
+
+Training admission remains excluded. Independent F32 trajectories show that
+the selected baseline also drifts: at step 20 the NVIDIA baseline has 69.7%
+gradient error and 5.62% loss error; Intel has 2.48% gradient error while its
+loss remains close. Comparing two independently updated reduced programs did
+not isolate the new attention algorithm's contribution.
+
+At identical weights from the F32 step-20 checkpoint, the NVIDIA baseline has
+20.5% gradient error and 4.46% loss error. Replacing only forward attention with
+scalar F32 barely changes this. Replacing dense products with F32 restores the
+fixed-state gradient/loss bounds (0.49% gradient error); a diagnostic three-F16-
+product residual correction also passes (0.58%). Correcting both dense products
+and attention gives 0.25% gradient error. F32 accumulation and storage remain
+unchanged. These are accuracy results, not latency claims or production code.
+On Intel, correcting both QK and PV restores the fixed-state bounds; the plain
+candidate fails the maximum-gradient bound even though relative L2 is 0.61%.
+
+The extra 1% gradient comparison between independently updated states also
+rejects an all-F32 layout change (4.39% at step 20). Retain it as a stress
+diagnostic, but do not interpret it alone as reduced-precision error. The
+benchmark's existing contract uses 1% maximum/RMS gradient bounds at identical
+weights and 2% per-step training/probe/held-out loss bounds over 256 real-text
+updates. Run that frozen workload, with its parameter-update and learning
+checks, before extending training admission. Keep all thresholds unchanged.
+
+The frozen 256-update workload now passes on both GPUs for all six variants:
+native F32, the selected native program, plain QK/PV, residual-corrected dense
+and attention with F32 derivatives, PyTorch F32 and PyTorch FP16. Every
+training/probe/held-out loss comparison passes against both F32 references,
+with parameter updates and learning checks satisfied. The synthetic checkpoint
+still exposes a real input-precision limitation: PyTorch FP16 at those exact
+weights has 34.5% gradient error and 7.97% loss error too. Its F32 loss agrees
+with the native F32 oracle. Neither result establishes accuracy at every state.
+
+The compensated workgroup prototype does not establish a performance win on
+this model. Its best combined dense/attention variant is 2.4% slower than the
+qualified F32 program. Holding forward attention identical in each paired run,
+dense correction alone is 2.9–3.0% slower (same weights, F32 derivatives and
+submission count; 100 paired samples per arm after 10 seconds of warmup).
+Keep the prototype and its accuracy results, but do not add a production
+precision option for this result. Investigate larger shapes only if a model
+profile supports the opportunity.
+
+- [x] Validate rectangular QK/PV shaders, padded heads, query/key tails,
+  GQA, causal/sliding/partial-causal masks and full F64 output/LSE fixtures.
+  The long cancellation fixture (128 queries, 1024 keys, width 64) misses the
+  probe's provisional 1% relative-L2 bound at 1.31%; PyTorch F16 has the same
+  error on the identical inputs. Preserve that failure beside the model results.
+- [x] Measure complete inference/training plans on both cards; retain losing
+  models and failed trajectory checks, not only favorable kernel timings.
+- [x] Give the candidate a distinct shader identity so numerical qualification
+  does not mistake two algorithms for repeated executions of one plan.
+- [x] Verify inference-only measured admission with fresh 30-second searches
+  and independent paired holdouts, including Intel Whisper's losing case.
+  Holdout: NVIDIA Whisper 4.336→3.904 ms (9.95% faster); Intel SD U-Net
+  3.279→3.086 ms (5.89% faster). Intel Whisper retains the old path and changes
+  by 0.03%. Submission counts match in every pair; all plans qualify before
+  and after timing. The six searches finish in 22–30.4 seconds including setup.
+- [x] Investigate training drift against independent F32 trajectories and
+  distinguish fixed-state error from optimizer-trajectory sensitivity.
+- [x] Complete the frozen 256-update real-text training gate on both GPUs,
+  retaining plain, corrected and strict references and every failed gate.
+- [x] Measure compensated workgroup dense products after numerical qualification,
+  against a qualified F32 alternative at the same weights. The matched dense-only
+  pairs regress, so no production precision API or default change is proposed.
+- [ ] Qualify the remaining models with their declared 32-update synthetic
+  workload before revisiting training admission for the QK/PV candidate.
+
+Preserve these additional leads for follow-up:
+
+- Explicit F16 quantization before residual subtraction: a small GPU probe
+  retains the F32→F16→F32 conversions in emitted SPIR-V, yet the Intel driver
+  returns zero residuals. `quantizeToF16` preserves the intended correction.
+  Check production compensated GEMMs before changing their generator; the
+  isolated NVIDIA cast probe does not reproduce this Intel behavior.
+- Shared-memory stride/padding for staged matrix operands: compare matched
+  NN/AT/BT kernels, then complete models, preserving direct-load paths.
+- Per-attention-class selection: SD U-Net and SmolVLA contain multiple
+  attention shapes. A whole-program switch can hide a profitable subset;
+  evaluate class-specific alternatives with complete-program qualification.
+  The collected Whisper fixture is encoder-only: all four attention dispatches
+  are 1500×1500 with width 64, so no decoder subset exists in that workload.
+- Scaled F16 backward GEMMs: preserve very small derivatives and dynamic
+  range explicitly, as the existing attention derivative path does. Do not
+  clear full-precision protection merely to reach matrix hardware.
+- NVIDIA's raw NV2 query also advertises reductions, per-element operations
+  and conversions. Survey Blade/Naga support before exploring softmax on
+  cooperative fragments or accumulator-to-operand conversion; these might
+  avoid shared score/PV round trips. Retain the portable path and require a
+  complete-model gain before adding APIs for them.
+
 - [ ] Extend useful storage chains through pointwise operations and compatible
   fusion without adding redundant widening/narrowing dispatches.
 - [ ] Cover additional NN/AT/BT, batched/block and split-reduction forms where

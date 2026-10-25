@@ -2102,6 +2102,15 @@ impl Pipelines {
                 ShaderGroup::FlashAttentionCoop => {
                     crate::codegen::generate_flash_attention_coop_module(hd)
                 }
+                ShaderGroup::FlashAttentionProducts => {
+                    let rows = auto_tune(gpu, 0).coop_caps.f16_attention_rows;
+                    if !matches!(rows, 8 | 16)
+                        || !(4..=64).contains(&gpu.capabilities().subgroup_size)
+                    {
+                        return Err("attention products require native 8/16x16 F16 matrices".into());
+                    }
+                    crate::codegen::generate_flash_attention_product_module(hd, rows)
+                }
                 ShaderGroup::FlashAttentionCoopF32 => {
                     let config = cooperative();
                     if config.tile_size != 16 || config.use_f16_input || config.compensated {
@@ -2217,6 +2226,7 @@ impl Pipelines {
             ShaderGroup::MultiHeadAttn
             | ShaderGroup::FlashAttention
             | ShaderGroup::FlashAttentionCoop
+            | ShaderGroup::FlashAttentionProducts
             | ShaderGroup::FlashAttentionCoopF32 => {
                 AttentionParams::from_words(&dispatch.params).map(|p| p.head_dim)
             }
@@ -2688,6 +2698,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::MultiHeadAttn
         | ShaderEntry::FlashAttention
         | ShaderEntry::FlashAttentionCoop
+        | ShaderEntry::FlashAttentionProducts
         | ShaderEntry::FlashAttentionCoopF32 => MultiHeadAttnData::layout(),
         ShaderEntry::AttentionGrad(kernel) => match kernel.part {
             AttentionGradPart::Q => MultiHeadAttnGradData::layout(),

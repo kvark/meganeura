@@ -340,3 +340,103 @@ fn coop_f32_forward_matches_f64_across_heads_masks_and_tails() {
         }
     }
 }
+
+#[test]
+fn f16_products_forward_matches_f64_across_padded_heads_and_masks() {
+    use meganeura::{Session, SessionOptions};
+    let gpu = crate::support::gpu::gpu();
+    if !matches!(
+        meganeura::runtime::auto_tune(&gpu, 0)
+            .coop_caps
+            .f16_attention_rows,
+        8 | 16
+    ) {
+        return;
+    }
+    for (qs, ks, hd, heads, kv_heads, window, causal) in [
+        (7, 5, 16, 2, 1, 0, false),
+        (33, 19, 48, 3, 1, 0, false),
+        (65, 65, 80, 3, 1, 0, true),
+        (45, 45, 128, 2, 2, 17, true),
+        (17, 17, 64, 2, 1, 1, true),
+        (33, 19, 5, 3, 1, 0, false),
+        (128, 128, 64, 9, 3, 0, true),
+    ] {
+        let mut graph = Graph::new();
+        let q = graph.input("q", &[qs, heads * hd]);
+        let k = graph.input("k", &[ks, kv_heads * hd]);
+        let v = graph.input("v", &[ks, kv_heads * hd]);
+        let y = if window > 0 {
+            graph.sliding_window_attention(
+                q,
+                k,
+                v,
+                heads as u32,
+                kv_heads as u32,
+                hd as u32,
+                window,
+            )
+        } else if causal {
+            graph.causal_attention(q, k, v, heads as u32, kv_heads as u32, hd as u32)
+        } else {
+            graph.multi_head_attn(q, k, v, heads as u32, kv_heads as u32, hd as u32, true)
+        };
+        graph.set_outputs(vec![y]);
+        let mut config = crate::support::gpu::inference_config();
+        config.tune = false;
+        config.optimize.mode = meganeura::optimize::OptimizeMode::Off;
+        let (baseline, _) = build(&graph, config);
+        let mut plan = baseline.plan().clone();
+        drop(baseline);
+        for d in &mut plan.dispatches {
+            if d.shader.is_attention() {
+                d.shader = ShaderEntry::FlashAttentionProducts;
+                d.workgroups = [(qs as u32).div_ceil(16), heads as u32, 1];
+            }
+        }
+        let mut session = Session::with_context_opts(
+            plan,
+            gpu.clone(),
+            SessionOptions {
+                poison: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            session
+                .plan()
+                .dispatches
+                .iter()
+                .any(|d| d.shader == ShaderEntry::FlashAttentionProducts)
+        );
+        let mut feeds = reference::Feeds::new();
+        for (name, len, scale, phase) in [
+            ("q", qs * heads * hd, 0.8, 0.3),
+            ("k", ks * kv_heads * hd, 0.8, 0.7),
+            ("v", ks * kv_heads * hd, 0.4, 1.1),
+        ] {
+            let values: Vec<f32> = (0..len)
+                .map(|i| (i as f32 * 0.017 + phase).sin() * scale)
+                .collect();
+            feeds.set(name, &values);
+            session.set_input(name, &values);
+        }
+        let expected = reference::evaluate_outputs(&graph, &feeds).unwrap();
+        session.step();
+        session.wait();
+        let actual = session.read_output(qs * heads * hd);
+        let (mut err, mut norm, mut maximum, mut reference_maximum) = (0., 0., 0f64, 0f64);
+        for (&a, &b) in actual.iter().zip(&expected[0].data) {
+            assert!(a.is_finite());
+            err += (f64::from(a) - b).powi(2);
+            norm += b * b;
+            maximum = maximum.max((f64::from(a) - b).abs());
+            reference_maximum = reference_maximum.max(b.abs());
+        }
+        assert!(
+            (err / norm.max(1e-300)).sqrt() < 0.01 && maximum < 1e-3 + 0.01 * reference_maximum,
+            "q={qs}, k={ks}, d={hd}, window={window}: relL2={}, max={maximum}",
+            (err / norm).sqrt()
+        );
+    }
+}

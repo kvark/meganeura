@@ -19,3 +19,20 @@ pub(crate) fn admits_cooperative_f32(
         && attention_coop_shared_bytes(ShaderGroup::FlashAttentionCoopF32, head_dim)
             <= u64::from(shared_memory_bytes)
 }
+
+/// Rectangular F16 QK/PV, with padded heads and F32 online statistics.
+/// Admission is separate from numerical qualification and whole-program timing.
+pub(crate) fn admits_products(
+    rows: u32,
+    head_dim: u32,
+    heads: u32,
+    caps: CoopCaps,
+    shared_memory_bytes: u32,
+) -> bool {
+    matches!(caps.f16_attention_rows, 8 | 16)
+        && head_dim > 0
+        && rows > 0
+        && crate::compile::workgroups_within_portable_limits([rows.div_ceil(16), heads, 1])
+        && attention_coop_shared_bytes(ShaderGroup::FlashAttentionProducts, head_dim)
+            <= u64::from(shared_memory_bytes)
+}
