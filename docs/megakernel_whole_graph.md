@@ -136,6 +136,11 @@ attribute time to its internal nodes.
 
 ## Qualification and measurements
 
+The [descriptor repair measurements](#descriptor-identity-repair-current-measurements)
+are the current qualification record. Measurements before `ed81459` below are
+historical hardware observations: they predate the descriptor-reference repair
+and do not establish its memory-model contract.
+
 Initial checks cover 1, 3, 64 and 4096 workers, repeated resets, empty nodes,
 fan-in/fan-out, physical allocation reuse, external repeated recording, selected
 matrix/attention kernels, mixed 128/256-lane reductions, and exact small-graph
@@ -507,7 +512,7 @@ same bootstrap procedure in filename/case order. The isolated final run is
 the only SmolVLA record used here. An invalid ICD-path attempt and two cancelled
 overlapping runs are retained and explicitly excluded in that summary.
 
-## Concurrent tile packing: latest measurements
+## Concurrent tile packing measurements
 
 Commit `88d5e51` packs eligible logical tiles concurrently into the existing
 worker workgroup. The matrix tiles use separate scratch ranges and preserve
@@ -771,6 +776,78 @@ successful exits, raw samples and summaries are under
 `sgd-contemporary-baseline/`. Both use clean tracked source. Prototype records
 are `sgd-batch4-paired/` and `target/sgd-batch{,16}-smolvla.{json,log}`. All
 measurements exclude profiling, builds and concurrent analysis.
+
+## Descriptor identity repair: current measurements
+
+At **`ed81459`**, Naga `bc7b70b` and Blade `c09c89f` preserve one descriptor
+reference per backing buffer across typed views and nonzero offsets. No
+publication fence or selected arithmetic is removed. Isolated reruns against
+the published pins pass **665 library tests** (eight ignored), **168 strict
+whole-graph oracle tests**, **eight focused GPU tests**, and strict Clippy.
+The [memory contract](megakernel_memory_contract.md) records compiler validation
+and the eight workspace failures already present in the saved baseline.
+
+All **250 primary comparisons** pass: 50 alternating AB/BA pairs for each case,
+256 workers, at least ten warmup pairs and one second of warmup. Tracked source
+is clean; receipts disclose unrelated untracked `configs/`. Every selected case
+uses one compute dispatch and the same arithmetic, without fallback. Forward
+and CI state are exact; maximum SmolVLA training error is **4.66e-9**. Identical
+state is restored outside timing, and qualification readbacks are excluded.
+
+| Workload | Ordinary median, ms | Persistent median, ms | Paired ratio | 95% bootstrap interval |
+|---|---:|---:|---:|---:|
+| SmolVLA forward | 4.448 | 6.608 | 1.489 | 1.484–1.494 |
+| SmolVLA forward/backward/SGD | 15.154 | 20.884 | 1.375 | 1.358–1.396 |
+| CI inference | 0.05220 | 0.07068 | 1.353 | 1.345–1.374 |
+| CI forward/backward | 0.06598 | 0.10280 | 1.557 | 1.547–1.565 |
+| CI forward/backward/SGD | 0.06745 | 0.10130 | 1.510 | 1.489–1.523 |
+
+Intervals bootstrap paired-ratio medians 10,000 times with seed 20261025 and
+describe within-run uncertainty. The repair is retained for correctness;
+these measurements do not show performance parity or an isolated speedup.
+
+A separate NVIDIA Perf SDK forward capture collects six sequential groups per
+mode, each with 146 post-warmup samples. All monitor/target processes exit zero,
+without SDK warnings, and both modes produce identical state (SHA-256
+`4e5d66e6ce5e95142b848651d316b4df64855a9d85669499cabc3a81089be629`). Diagnostic
+replay medians are **3.772 ms ordinary / 6.103 ms persistent**. Cross-group clock
+means stay within 0.25% and warp-instruction rates within 0.70% of their means.
+
+| Estimated activity per forward replay | Persistent / ordinary |
+|---|---:|
+| Warp instructions | 1.924× |
+| Integer-pipe thread instructions | 2.552× |
+| Global-load sectors | 1.117× |
+| Shared-memory wavefronts | 1.193× |
+| Tensor activity | 1.017× |
+| DRAM read activity | 1.000× |
+
+Persistent execution also has about 39,854 local-load and 678,795 local-store
+sectors per replay, versus zero ordinary. Workgroup-barrier waiting is **62.28%**
+of active warp cycles, versus **3.75%** ordinary; memory-barrier waiting is
+**0.47%** versus zero. These are active-warp shares, not elapsed-time fractions
+or recoverable-runtime estimates. Counter rates times replay duration estimate
+activity; the peak-normalized tensor and DRAM metrics support relative comparison.
+
+A separate pipeline-statistics capture reports **112 registers** in both
+combined shaders, with **29,200 / 29,232 bytes** of shared storage and
+**114,560 / 272,000 bytes** of executable code for forward/training. The driver's
+implausible approximately 64 GiB per-thread Local Memory Size field is excluded;
+local traffic above comes from the SDK counters.
+
+The measured gap still includes substantial extra integer/addressing and worker
+coordination work, with waiting workers contributing to barrier stalls. These
+counters do not isolate each handler's elapsed cost. The next useful experiment
+is to identify allocations that are never written during the complete step and
+test read-only loads for those inputs/weights, while retaining canonical
+references for every mutable allocation. Both phases must pass the same gates.
+
+Primary binaries, commands, hashes, cgroup identities, receipts and raw samples
+are in `target/megakernel-results/canonical-descriptors-paired/`; SDK records are
+in `canonical-descriptors-sdk/`. All GPU jobs use separate bounded scopes and
+the shared GPU lock. No builds, profiling or analysis overlap primary timing.
+Library tests also execute GPU work: an earlier overlapping test attempt was
+followed by isolated library, focused and oracle reruns before these measurements.
 
 ## Earlier artifact identities
 

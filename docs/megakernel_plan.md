@@ -109,6 +109,14 @@ the descriptor-reference repair requires fresh measurements.
 - [ ] Isolate remaining queue/indexing/resource costs and reach baseline
   performance under the same full-step measurement and correctness gates. Keep this opt-in until performance justifies
   a default change.
+- [x] Requalify canonical descriptors at `ed81459`: 665 library, 168 strict
+  oracle, eight focused GPU tests and 250 paired comparisons pass. Fresh SDK
+  captures preserve exact state and show 1.924× warp instructions, 2.552× integer
+  instructions and 62.28% barrier waiting among active warp cycles. SmolVLA
+  ratios remain 1.489× forward and 1.375× training; parity is still unmet.
+- [ ] Prove complete-step immutability of input/weight allocations before
+  testing separate read-only access paths; keep canonical descriptor references
+  for all mutable storage and rerun both performance phases.
 
 The Blade extension exposes binding inspection and runtime buffer-array binding
 in [commit 1bb5aef](https://github.com/kvark/blade/commit/1bb5aef0fea5fbc4249fdc40a7f1398f5c3ac012).
