@@ -14,8 +14,8 @@ pub(super) const SPLIT_RANGE: &str = "let blocks = (k + 31u) / 32u;\n\
     let end = min(first + count * 32u, k);";
 
 /// Dense and implicit-GEMM convolutions share the same checked cooperative
-/// loop. Operands are staged in the multiplication type; the accumulator is
-/// F32, and so are partials until their reduction.
+/// loop. Aligned native operands load directly; conversions and tails stage
+/// in the multiplication type. Accumulators and split partials remain F32.
 pub(super) fn generate(
     group: ShaderGroup,
     types: MatrixTypes,
@@ -43,7 +43,9 @@ pub(super) fn generate_with_params(
     let variant = coop_shape(group).map(|(_, variant)| variant);
     let split_range = SPLIT_RANGE.replace("wgid.", "group.");
     let vector_conv = params.is_some_and(Params::vectorized_forward);
-    let vector_dense = layout.vectorized && coop_shape(group).is_some();
+    let vector_dense = layout.vectorized && variant.is_some();
+    let global_a = layout.direct_inputs && vector_dense && types.a == types.multiply;
+    let global_b = layout.direct_inputs && vector_dense && types.b == types.multiply;
     let (declaration, dimensions, range, a, b, index, destination, add) = match group {
         ShaderGroup::MatMul
         | ShaderGroup::MatMulAT
@@ -63,9 +65,12 @@ pub(super) fn generate_with_params(
                 declaration.push_str("var<storage> src: array<f32>;\n");
             }
             if vector_dense {
-                declaration = declaration
-                    .replace("array<$A_TYPE>", "array<vec4<$A_TYPE>>")
-                    .replace("array<$B_TYPE>", "array<vec4<$B_TYPE>>");
+                if !global_a {
+                    declaration = declaration.replace("array<$A_TYPE>", "array<vec4<$A_TYPE>>");
+                }
+                if !global_b {
+                    declaration = declaration.replace("array<$B_TYPE>", "array<vec4<$B_TYPE>>");
+                }
             }
             (
                 declaration,
@@ -198,12 +203,87 @@ pub(super) fn generate_with_params(
             format!("vec4<{cast}>({value})")
         }
     };
-    let stage = if vector_dense {
-        include_str!("../shaders/matmul_checked_vector.wgsl")
+    let stage = if global_a || global_b {
+        let mut stage = String::new();
+        for (a_side, global, storage) in [(true, global_a, types.a), (false, global_b, types.b)] {
+            if global {
+                continue;
+            }
+            let transpose = variant
+                == Some(if a_side {
+                    MatMulCoopVariant::AT
+                } else {
+                    MatMulCoopVariant::BT
+                });
+            let name = if a_side { "a" } else { "b" };
+            let index = match (a_side, transpose) {
+                (true, false) => "(row + r) * k + start + c",
+                (true, true) => "(start + r) * m + row + c",
+                (false, false) => "(start + r) * n + col + c",
+                (false, true) => "(col + r) * k + start + c",
+            };
+            let target = if transpose {
+                "(c + e) * 32u + r"
+            } else {
+                "index * 4u + e"
+            };
+            stage += &preprocess(
+                super::template_section(template, "stage"),
+                &[
+                    ("$OPERAND", name),
+                    ("$GLOBAL_INDEX", index),
+                    ("$SHARED_INDEX", target),
+                    ("$CONVERT", &convert("v", storage)),
+                ],
+            );
+        }
+        stage
+    } else if vector_dense {
+        include_str!("../shaders/matmul_checked_vector.wgsl").to_owned()
     } else if vector_conv {
-        include_str!("../shaders/conv2d_checked_vector.wgsl")
+        include_str!("../shaders/conv2d_checked_vector.wgsl").to_owned()
     } else {
-        include_str!("../shaders/matmul_checked_stage.wgsl")
+        include_str!("../shaders/matmul_checked_stage.wgsl").to_owned()
+    };
+    let matrix_load = |a_side: bool, extra: &str| {
+        let name = if a_side { "a" } else { "b" };
+        let ty = if a_side { "$A_TILE" } else { "$B_TILE" };
+        let offset = if extra == "0u" {
+            String::new()
+        } else {
+            format!(" + {extra}")
+        };
+        if if a_side { global_a } else { global_b } {
+            let transpose = variant
+                == Some(if a_side {
+                    MatMulCoopVariant::AT
+                } else {
+                    MatMulCoopVariant::BT
+                });
+            let (index, stride) = match (a_side, transpose) {
+                (true, false) => (
+                    format!("(row + a_offset / 32u{offset}) * k + start + inner"),
+                    "k",
+                ),
+                (true, true) => (
+                    format!("(start + inner) * m + row + a_offset / 32u{offset}"),
+                    "m",
+                ),
+                (false, false) => (format!("(start + inner) * n + col + b_offset{offset}"), "n"),
+                (false, true) => (format!("(col + b_offset{offset}) * k + start + inner"), "k"),
+            };
+            let load = if transpose { "coopLoad" } else { "coopLoadT" };
+            format!("{load}<{ty}>(&matrix_{name}[{index}], {stride})")
+        } else if a_side {
+            let offset = if extra == "0u" {
+                String::new()
+            } else {
+                format!(" + {extra} * 32u")
+            };
+            format!("coopLoadT<{ty}>(&stage_a[a_offset{offset} + inner], 32u)")
+        } else {
+            format!("coopLoadT<{ty}>(&stage_b[b_offset + inner * 32u{offset}], 32u)")
+        }
     };
     let rounds = types.output == DType::BF16
         || (types.multiply == DType::BF16 && (types.a == DType::F32 || types.b == DType::F32));
@@ -222,7 +302,37 @@ pub(super) fn generate_with_params(
     ShaderModule::new(&preprocess(
         super::template_section(template, "main"),
         &[
-            ("$STAGE", stage),
+            ("$STAGE", &stage),
+            (
+                "$A_STAGE_DECL",
+                if global_a {
+                    String::new()
+                } else {
+                    format!("var<workgroup> stage_a: array<{multiply}, 1024>;")
+                }
+                .as_str(),
+            ),
+            (
+                "$B_STAGE_DECL",
+                if global_b {
+                    String::new()
+                } else {
+                    format!("var<workgroup> stage_b: array<{multiply}, 1024>;")
+                }
+                .as_str(),
+            ),
+            (
+                "$INPUT_BARRIER",
+                if global_a && global_b {
+                    ""
+                } else {
+                    "workgroupBarrier();"
+                },
+            ),
+            ("$A_MATRIX", &matrix_load(true, "0u")),
+            ("$A_LOWER_MATRIX", &matrix_load(true, "lower_row")),
+            ("$B_MATRIX", &matrix_load(false, "0u")),
+            ("$B_RIGHT_MATRIX", &matrix_load(false, "right_col")),
             (
                 "$RESULT_DECL",
                 if direct_output {
@@ -448,6 +558,7 @@ mod tests {
                 super::super::TypedMatmulLayout {
                     vectorized: true,
                     direct_output: false,
+                    ..Default::default()
                 },
                 super::super::TypedMatmulLayout::for_product(
                     types,

@@ -1044,6 +1044,8 @@ pub fn generate_module_coop_typed_with_shape(
 pub struct TypedMatmulLayout {
     pub vectorized: bool,
     pub direct_output: bool,
+    /// Native operands may bypass staging when all 32x32 K/output tiles fit.
+    pub direct_inputs: bool,
 }
 
 impl TypedMatmulLayout {
@@ -1051,6 +1053,9 @@ impl TypedMatmulLayout {
         Self {
             vectorized: (u64::from(m) * u64::from(k)).is_multiple_of(4)
                 && (u64::from(k) * u64::from(n)).is_multiple_of(4),
+            direct_inputs: matches!(types.multiply, crate::DType::F16 | crate::DType::BF16)
+                && [m, n, k].into_iter().all(|s| s.is_multiple_of(32))
+                && (types.a == types.multiply || types.b == types.multiply),
             direct_output: types.output == crate::DType::F32
                 && !addend
                 && m.is_multiple_of(16)

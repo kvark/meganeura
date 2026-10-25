@@ -1,8 +1,8 @@
 // @section main
 $EXTENSIONS
 $DECL
-var<workgroup> stage_a: array<$MULTIPLY_TYPE, 1024>;
-var<workgroup> stage_b: array<$MULTIPLY_TYPE, 1024>;
+$A_STAGE_DECL
+$B_STAGE_DECL
 $RESULT_DECL
 $ROUND
 
@@ -33,27 +33,27 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         var lower_right = $C_TILE();
         for (var start = first; start < end; start += 32u) {
             $STAGE
-            workgroupBarrier();
+$INPUT_BARRIER
             for (var inner = 0u; inner < 32u; inner += $TILE_Ku) {
-                let a = coopLoadT<$A_TILE>(&stage_a[a_offset + inner], 32u);
-                let b = coopLoadT<$B_TILE>(&stage_b[b_offset + inner * 32u], 32u);
+                let a = $A_MATRIX;
+                let b = $B_MATRIX;
                 accumulator = coopMultiplyAdd(a, b, accumulator);
                 var a_lower = a;
                 // Loops keep cooperative operations in uniform control flow
                 // despite Naga's conservative subgroup-size conditional check.
                 for (var lower_row = $TILE_Mu; lower_row < tile_rows; lower_row += $TILE_Mu) {
-                    a_lower = coopLoadT<$A_TILE>(&stage_a[a_offset + lower_row * 32u + inner], 32u);
+                    a_lower = $A_LOWER_MATRIX;
                     lower = coopMultiplyAdd(a_lower, b, lower);
                 }
                 for (var right_col = $TILE_Nu; right_col < 16u; right_col += $TILE_Nu) {
-                    let b_right = coopLoadT<$B_TILE>(&stage_b[b_offset + inner * 32u + right_col], 32u);
+                    let b_right = $B_RIGHT_MATRIX;
                     right = coopMultiplyAdd(a, b_right, right);
                     for (var lower_row = $TILE_Mu; lower_row < tile_rows; lower_row += $TILE_Mu) {
                         lower_right = coopMultiplyAdd(a_lower, b_right, lower_right);
                     }
                 }
             }
-            workgroupBarrier();
+$INPUT_BARRIER
         }
         if tile < tile_count$STORE_VALID {
             coopStoreT(accumulator, $C_BASE, $RESULT_STRIDE);
@@ -81,3 +81,14 @@ workgroupBarrier();
             $DEST[index] = $STORE(result[offset]$ADD);
         }
     }
+
+// @section stage
+for (var index = lane; index < 256u; index += $THREADSu) {
+    let r = index / 8u;
+    let c = (index % 8u) * 4u;
+    let v = matrix_$OPERAND[($GLOBAL_INDEX) / 4u];
+    let converted = $CONVERT;
+    for (var e = 0u; e < 4u; e++) {
+        stage_$OPERAND[$SHARED_INDEX] = converted[e];
+    }
+}

@@ -5351,8 +5351,10 @@ mod variant_tests {
         assert_eq!(key(32, 32, 32), key(64, 64, 1024));
         assert_ne!(key(32, 32, 32), key(33, 64, 32));
         assert_ne!(key(33, 64, 32), key(33, 65, 1031));
-        // Odd K is still vectorizable when the full binding is a whole vector.
-        assert_eq!(key(32, 32, 32), key(32, 32, 31));
+        // Odd K is vectorizable when the full binding is a whole vector,
+        // but needs shared staging instead of the aligned native load path.
+        assert_ne!(key(32, 32, 32), key(32, 32, 31));
+        assert_eq!(key(32, 32, 31), key(32, 32, 33));
     }
 
     /// A dispatch whose epilogue ops were folded into the matmul has no
