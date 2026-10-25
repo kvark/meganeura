@@ -127,7 +127,7 @@ copying are disabled during these measurements.
 
 | Workers | Case | Ordinary median, ms | Selected median, ms | Median paired ratio | 95% bootstrap interval |
 |---|---|---:|---:|---:|---:|
-| 64 | Forward | 4.417 | 8.442 | 1.909 | 1.904–1.913 |
+| 64 | Forward | 4.417 | 8.442 | 1.909 | 1.903–1.913 |
 | 256 | Forward | 4.396 | 5.385 | 1.228 | 1.225–1.234 |
 | 512 | Forward | 4.413 | 5.413 | 1.263 | 1.226–1.305 |
 | 64 | Forward/backward/SGD | 15.213 | 24.488 | 1.611 | 1.595–1.613 |

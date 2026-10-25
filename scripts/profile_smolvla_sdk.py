@@ -81,7 +81,7 @@ def capture(repo, sdk, output, phase, workers):
             receipt["monitor_finished_unix"] = time.time()
             if (monitor.returncode or target.poll() is not None
                     or time.monotonic() >= capture_deadline):
-                raise RuntimeError("SDK failed or target ended before collection completed")
+                raise RuntimeError("SDK failed or collection exceeded the resident capture window")
             if any(marker in monitor_log.read_text() for marker in ("WRN", "ERR")):
                 raise RuntimeError(f"SDK reported a warning/error: {monitor_log}")
             receipt["target_exit"] = target.wait(timeout=30)
