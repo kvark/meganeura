@@ -27,12 +27,14 @@ whole-graph execution. A Blade visitor captures buffers and plain parameter
 bytes, including the optimizer's existing segmented arena bindings. Kernels are
 deduplicated by source, call and layout. Per-type descriptor arrays replace a
 bind group for every operation. Node parameter records select descriptors and
-carry the original uniform bytes.
+carry the original uniform bytes. Uniform word offsets are fixed by each
+handler's layout; descriptor indices are passed by value through its helpers.
 
 One physical workgroup is at least 256 invocations and must be a multiple of
-each selected logical workgroup. Extra lanes repeat logical calculations and
-participate in every barrier; only the original lanes write shared/storage
-memory. Subgroup handlers use virtual subgroup coordinates. A shader guard
+each selected logical workgroup. Extra lanes participate in every workgroup
+barrier; only the original lanes write shared/storage memory. Inactive subgroups
+skip cooperative multiply-adds assigned to local accumulators. Other extra-lane
+calculations are still repeated. Subgroup handlers use virtual subgroup coordinates. A shader guard
 checks dense, linear subgroup mapping, full groups and compatible widths before
 executing graph work. This mapping is a qualification condition, not a portable
 Vulkan assumption: [subgroup and local invocation indices are not generally
@@ -66,8 +68,11 @@ nodes use one control task to propagate dependencies and perform no arithmetic.
 Edges point forward in recording order. Conflicting reads/writes of the same
 backing allocation create RAW/WAR/WAW edges, covering arena slices and lifetime
 reuse. The initial implementation conservatively orders the entire allocation,
-which can serialize independent slices. Descriptors are coherent and producer
-and consumer lanes use the existing [native fence protocol](megakernel_memory_contract.md).
+which can serialize independent slices. Transitive dependency edges are omitted
+without changing reachability. Producer and consumer lanes use the existing
+[native fence protocol](megakernel_memory_contract.md). Written descriptor tables
+use NonPrivatePointer accesses and tile-boundary fences; read-only typed aliases
+retain their explicit coherent annotation.
 The ready load, tile-completion RMWs and predecessor RMWs carry the ordering
 chain; every consumer lane performs its own storage visibility operation.
 
@@ -214,11 +219,43 @@ latencies. The driver's implausible approximately 64 GiB local-memory statistic
 is excluded from spill claims. The timestamp training run contains a 90 ms
 outlier; the table above uses the separate primary measurements.
 
-The next performance step is to avoid repeated tensor calculations when adapting
-logical workgroups, while preserving barrier uniformity and per-tile scratch.
-Then measure narrower physical dependencies, parameter indexing and queue
-contention independently. Retain the existing memory contract and repeat full
-state qualification before considering a default change.
+## Optimization in progress
+
+[Naga f4fe7e8](https://github.com/kvark/wgpu/commit/f4fe7e85790d44f46c7107675ca075a3471d6163)
+checks cooperative control flow at the matrix's scope, including helper calls,
+locals and loop-carried dependencies. Subgroup-uniform activity arguments can
+therefore guard the extra subgroups' products. Workgroup operations retain their
+existing validation; no workgroup barrier is placed inside the new condition.
+The ordinary arithmetic and logical geometry are unchanged. The corresponding
+[Blade pin](https://github.com/kvark/blade/commit/fd04c27dff43ab02894186d26078afeb833c9631)
+uses the same Naga identity. Atomic syntax and fence semantics are unchanged.
+
+A separate SDK capture after masking those products estimates **1.012× ordinary
+tensor activity per step**, down from approximately 4×. This is the ratio of
+tensor activity × replay duration, not an instruction count. Ordinary and
+whole-graph replay medians are 3.793 ms and 9.277 ms; both captures have 146
+counter samples and identical complete forward state. Removing duplicate tensor
+work alone therefore does not explain or remove the whole slowdown. Captures are
+in `target/megakernel-results/masked-products-sdk/` with commands, binary hashes
+and source-status receipts. They precede the later indexing/fence changes.
+
+Further changes cache descriptor indices as function arguments, reconstruct
+uniforms with constant offsets, remove transitive dependency edges, and omit
+per-access availability/visibility for descriptor globals that Naga proves are
+written by this dispatch. Those globals retain NonPrivatePointer on every
+access, so the existing tile-boundary fences cover communication. Read-only
+aliases keep `@coherent` to prevent private-access elision. A generated-SPIR-V
+check verifies both classes of table accesses, including mixed geometry and a
+cooperative handler.
+
+Qualification passes 664 library tests, all 168 strict whole-graph oracle tests,
+and the six focused graph tests. Naga passes 144 unit, 268 integration and six
+documentation tests (24 ignored), plus strict all-target/all-feature Clippy;
+Blade passes 20 unit tests (one ignored). Meganeura's strict Clippy also passes.
+Short five-pair experiments retain state parity and improve the measured path,
+but **baseline parity has not been reached**. New production measurements and
+further resource/indexing/scheduling work remain required. The 50-pair table
+above describes the original implementation, not these changes.
 
 ## Reproduction and artifact identities
 

@@ -410,6 +410,7 @@ impl Graph {
         let mut metadata = Vec::new();
         let mut views: Vec<Vec<bg::BufferPiece>> = vec![Vec::new(); self.builder.views.len()];
         let mut accesses: Vec<Vec<(bg::BufferPiece, bool)>> = Vec::new();
+        let mut ancestors: Vec<Vec<u64>> = Vec::new();
         let mut successors = vec![Vec::new(); nodes as usize];
         let mut tasks = Vec::new();
         for (node, (handler, grid, bindings)) in work.into_iter().enumerate() {
@@ -455,7 +456,11 @@ impl Graph {
             words.resize(self.builder.parameter_words.max(4), 0);
             parameters.extend(words);
             let mut pending = 0;
-            for (prior, prior_accesses) in accesses.iter().enumerate() {
+            let mut ordered = vec![0u64; (nodes as usize).div_ceil(64)];
+            for (prior, prior_accesses) in accesses.iter().enumerate().rev() {
+                if ordered[prior / 64] & (1u64 << (prior % 64)) != 0 {
+                    continue;
+                }
                 // Conservatively order the entire backing allocation. This covers
                 // lifetime reuse, tensor slices and optimizer chunks, including WAR/WAW.
                 if prior_accesses.iter().any(|&(a, aw)| {
@@ -465,8 +470,16 @@ impl Graph {
                 }) {
                     successors[prior].push(node as u32);
                     pending += 1;
+                    // An edge from a later predecessor already orders all of its
+                    // ancestors. Keep the same happens-before relation without
+                    // making the completing worker publish redundant edges.
+                    ordered[prior / 64] |= 1u64 << (prior % 64);
+                    for (word, &inherited) in ordered.iter_mut().zip(&ancestors[prior]) {
+                        *word |= inherited;
+                    }
                 }
             }
+            ancestors.push(ordered);
             accesses.push(node_accesses);
             let counter = counters as usize + 3 * node;
             queue[counter + 1] = count.max(1);

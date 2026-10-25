@@ -27,7 +27,6 @@ var<workgroup> graph_node_grid: vec4<u32>;
 var<workgroup> graph_node_work: vec4<u32>;
 var<workgroup> graph_parameter_words: array<u32, $PARAMETER_WORDS>;
 var<workgroup> graph_geometry_error: array<atomic<u32>, 4>;
-var<private> graph_parameter_base: u32;
 
 $HANDLERS
 $BUFFERS
@@ -79,7 +78,6 @@ fn graph_main(@builtin(local_invocation_index) physical_lane: u32,
         if ticket.x == 0xffffffffu { continue; }
         let node = GraphNode(workgroupUniformLoad(&graph_node_grid),
                              workgroupUniformLoad(&graph_node_work));
-        graph_parameter_base = ticket.z;
         for (var word = physical_lane; word < $PARAMETER_WORDSu; word += $THREADSu) {
             graph_parameter_words[word] = graph_parameters[ticket.z + word];
         }

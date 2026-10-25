@@ -40,8 +40,13 @@ the qualified memory-ordering contract remains unchanged.
   selected case uses one dispatch; SmolVLA at 256 workers regresses by
   2.300× forward and 1.886× with SGD. Counter evidence identifies fourfold
   duplicated tensor calculations in the current lane adapter.
-- [ ] Remove duplicated tile calculations, then isolate queue/indexing/resource
-  costs and repeat qualification. Keep this opt-in until performance justifies
+- [x] Skip inactive subgroups' cooperative products using scope-aware Naga
+  validation. SDK estimates fall from 4× to 1.012× ordinary tensor activity per
+  step. Cache descriptor indices, use fixed uniform offsets, omit transitive
+  edges and retain only necessary per-access memory propagation; repeat oracle
+  and focused graph qualification.
+- [ ] Isolate remaining queue/indexing/resource costs and reach baseline
+  performance under the same full-step measurement and correctness gates. Keep this opt-in until performance justifies
   a default change.
 
 The Blade extension exposes binding inspection and runtime buffer-array binding

@@ -42,6 +42,16 @@ rejects storage-pointer helper types and the qualified bodies access globals
 directly.
 Compiler tests must cover the aliased read-only case explicitly.
 
+Whole-graph descriptor tables share one global across handlers of the same
+storage type. If reachable handlers write that global, Naga already retains
+NonPrivatePointer on all its accesses. These tables omit `@coherent` and use the
+lane-level fences below for availability/visibility, avoiding redundant per-access
+propagation. A read-only typed alias may still alias another table's writes;
+it retains `@coherent`. Code generation uses Naga's global-use analysis to make
+this distinction, and its SPIR-V test checks NonPrivatePointer and per-access
+operands for both table classes. No fence or ordering edge in the protocol is
+removed by this optimization; transitive graph edges retain the same reachability.
+
 ## Publication by all lanes
 
 After a cooperative tile body finishes:

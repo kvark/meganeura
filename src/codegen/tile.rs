@@ -19,7 +19,7 @@ pub(crate) struct Tile {
     pub shared_aligned: bool,
 }
 
-fn validate(module: &Module) -> Result<naga::valid::ModuleInfo, String> {
+pub(super) fn validate(module: &Module) -> Result<naga::valid::ModuleInfo, String> {
     naga::valid::Validator::new(
         naga::valid::ValidationFlags::all() - naga::valid::ValidationFlags::BINDINGS,
         naga::valid::Capabilities::all(),
@@ -28,10 +28,10 @@ fn validate(module: &Module) -> Result<naga::valid::ModuleInfo, String> {
     .map_err(|error| format!("callable tile validation: {error:?}"))
 }
 
-/// Extra physical lanes repeat a logical lane's calculations so that every
-/// invocation reaches the original workgroup barriers. Only the original lanes
-/// may modify shared/storage memory. The caller sets this private flag before
-/// entering a tile and supplies the original logical invocation geometry.
+/// Every physical lane reaches the original workgroup barriers. Only the
+/// original lanes modify shared/storage memory; inactive subgroups also skip
+/// cooperative products assigned to local accumulators. The caller supplies a
+/// subgroup-uniform activity argument and the original logical geometry.
 pub(crate) fn mask_extra_lanes(mut tile: Tile, physical_threads: u32) -> Result<Tile, String> {
     let logical_threads = tile.workgroup_size.into_iter().product::<u32>();
     if physical_threads == logical_threads {
@@ -54,30 +54,38 @@ pub(crate) fn mask_extra_lanes(mut tile: Tile, physical_threads: u32) -> Result<
         },
         Span::UNDEFINED,
     );
-    let active = module.global_variables.append(
-        naga::GlobalVariable {
-            name: Some(format!("{PREFIX}active_lane")),
-            space: AddressSpace::Private,
-            binding: None,
-            ty: bool_ty,
-            init: None,
-            memory_decorations: Default::default(),
-        },
-        Span::UNDEFINED,
-    );
     for (handle, function) in module.functions.iter_mut() {
-        let pointer = function
-            .expressions
-            .append(Expression::GlobalVariable(active), Span::UNDEFINED);
+        let index = function.arguments.len() as u32;
+        function.arguments.push(FunctionArgument {
+            name: Some(format!("{PREFIX}active_lane")),
+            ty: bool_ty,
+            binding: None,
+        });
         let condition = function
             .expressions
-            .append(Expression::Load { pointer }, Span::UNDEFINED);
+            .append(Expression::FunctionArgument(index), Span::UNDEFINED);
+        append_call_arguments(&mut function.body, &[condition]);
         mask_writes(&mut function.body, condition, &info[handle], &module.types)?;
-        let mut body = Block::new();
-        emit(&mut body, condition, condition);
-        body.extend_block(std::mem::take(&mut function.body));
-        function.body = body;
+        if tile.cooperative == Some(naga::CooperativeScope::Subgroup) {
+            let mut products = HashMap::new();
+            collect_products(&function.body, &function.expressions, &mut products);
+            let mut products = products.into_iter().collect::<Vec<_>>();
+            products.sort_by_key(|&(value, _)| value);
+            let products = products
+                .into_iter()
+                .map(|(value, pointer)| {
+                    let product = function
+                        .expressions
+                        .append(function.expressions[value].clone(), Span::UNDEFINED);
+                    function.expressions[value] = Expression::Load { pointer };
+                    (value, (pointer, product))
+                })
+                .collect();
+            mask_products(&mut function.body, condition, &products);
+        }
     }
+    let end = tile.call.rfind(')').ok_or("missing tile call arguments")?;
+    tile.call.insert_str(end, ", $PREFIXactive_lane");
     let mut names = HashMap::new();
     for (index, (_, var)) in module.global_variables.iter_mut().enumerate() {
         let original = var.name.clone().ok_or("unnamed tile global")?;
@@ -91,6 +99,119 @@ pub(crate) fn mask_extra_lanes(mut tile: Tile, physical_threads: u32) -> Result<
             .map_err(|error| format!("worker lane adaptation: {error}"))?;
     tile.source = rename_tokens(&source, &names).replace(PREFIX, "$PREFIX");
     Ok(tile)
+}
+
+// Cooperative products assigned back to a local accumulator can be skipped by
+// whole subgroups. The original result becomes a load of that accumulator, so
+// every SSA value used outside the conditional remains in scope.
+fn collect_products(
+    block: &Block,
+    expressions: &naga::Arena<Expression>,
+    products: &mut HashMap<Handle<Expression>, Handle<Expression>>,
+) {
+    let mut last_emitted = None;
+    for statement in block {
+        match *statement {
+            Statement::Store { pointer, value }
+                if matches!(
+                    expressions[value],
+                    Expression::CooperativeMultiplyAdd { .. }
+                ) && matches!(expressions[pointer], Expression::LocalVariable(_))
+                    && last_emitted == Some(value) =>
+            {
+                products.insert(value, pointer);
+            }
+            Statement::Block(ref body) => collect_products(body, expressions, products),
+            Statement::If {
+                ref accept,
+                ref reject,
+                ..
+            } => {
+                collect_products(accept, expressions, products);
+                collect_products(reject, expressions, products);
+            }
+            Statement::Switch { ref cases, .. } => {
+                for case in cases {
+                    collect_products(&case.body, expressions, products);
+                }
+            }
+            Statement::Loop {
+                ref body,
+                ref continuing,
+                ..
+            } => {
+                collect_products(body, expressions, products);
+                collect_products(continuing, expressions, products);
+            }
+            _ => {}
+        }
+        last_emitted = match *statement {
+            Statement::Emit(ref range) => range.clone().last(),
+            _ => None,
+        };
+    }
+}
+
+fn mask_products(
+    block: &mut Block,
+    condition: Handle<Expression>,
+    products: &HashMap<Handle<Expression>, (Handle<Expression>, Handle<Expression>)>,
+) {
+    let mut output = Block::new();
+    for (mut statement, span) in std::mem::take(block).span_into_iter() {
+        match statement {
+            Statement::Emit(ref range) => {
+                for value in range.clone() {
+                    if let Some(&(pointer, product)) = products.get(&value) {
+                        let mut accept = Block::new();
+                        emit(&mut accept, product, product);
+                        accept.push(
+                            Statement::Store {
+                                pointer,
+                                value: product,
+                            },
+                            span,
+                        );
+                        output.push(
+                            Statement::If {
+                                condition,
+                                accept,
+                                reject: Block::new(),
+                            },
+                            span,
+                        );
+                    }
+                    emit(&mut output, value, value);
+                }
+                continue;
+            }
+            Statement::Block(ref mut body) => mask_products(body, condition, products),
+            Statement::If {
+                ref mut accept,
+                ref mut reject,
+                ..
+            } => {
+                mask_products(accept, condition, products);
+                mask_products(reject, condition, products);
+            }
+            Statement::Switch { ref mut cases, .. } => {
+                for case in cases {
+                    mask_products(&mut case.body, condition, products);
+                }
+            }
+            Statement::Loop {
+                ref mut body,
+                ref mut continuing,
+                ..
+            } => {
+                mask_products(body, condition, products);
+                mask_products(continuing, condition, products);
+            }
+            _ => {}
+        }
+        output.push(statement, span);
+    }
+    *block = output;
 }
 
 pub(crate) fn rename_tokens(source: &str, names: &HashMap<String, String>) -> String {
@@ -115,6 +236,32 @@ pub(crate) fn lift_uniforms(mut tile: Tile) -> Result<Tile, String> {
     let source = tile.source.replace("$PREFIX", PREFIX);
     let mut module =
         naga::front::wgsl::parse_str(&source).map_err(|e| e.emit_to_string(&source))?;
+    let storage = module
+        .global_variables
+        .iter()
+        .filter(|&(_, var)| matches!(var.space, AddressSpace::Storage { .. }))
+        .map(|(_, var)| var.name.clone().unwrap())
+        .collect::<Vec<_>>();
+    let index_ty = module.types.insert(
+        Type {
+            name: None,
+            inner: TypeInner::Scalar(Scalar::U32),
+        },
+        Span::UNDEFINED,
+    );
+    for name in storage {
+        module.global_variables.append(
+            naga::GlobalVariable {
+                name: Some(format!("{name}_binding_index")),
+                space: AddressSpace::Uniform,
+                binding: None,
+                ty: index_ty,
+                init: None,
+                memory_decorations: Default::default(),
+            },
+            Span::UNDEFINED,
+        );
+    }
     let uniforms: Vec<_> = module
         .global_variables
         .iter()
