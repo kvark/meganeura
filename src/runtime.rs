@@ -920,6 +920,7 @@ fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
 /// implementation once; preparation builds exactly the selected pipeline.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Variant {
+    StoredGate(ShaderEntry, crate::DType),
     WinogradTransform(ShaderEntry, crate::DType),
     WinogradMatmul(ShaderEntry, crate::DType, [u32; 2]),
     /// Checked cooperative product with explicit operand, multiplication and
@@ -1045,7 +1046,8 @@ impl Variant {
     fn entry(&self) -> Option<&ShaderEntry> {
         match *self {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
-            Variant::WinogradTransform(ref e, _)
+            Variant::StoredGate(ref e, _)
+            | Variant::WinogradTransform(ref e, _)
             | Variant::WinogradMatmul(ref e, _, _)
             | Variant::Attention(ref e, _, _)
             | Variant::CoopTyped(ref e, _, _)
@@ -1078,6 +1080,7 @@ impl Variant {
             Variant::CoopConv(ref e, types, ref params) => {
                 format!("{e:?}:checked-{types:?}-fixed-{params:?}")
             }
+            Variant::StoredGate(ref entry, storage) => format!("{entry:?}:store-{storage:?}"),
             Variant::WinogradTransform(ref entry, storage) => format!("{entry:?}:{storage:?}"),
             Variant::WinogradMatmul(ref entry, storage, tile) => {
                 format!("{entry:?}:{storage:?}-{tile:?}")
@@ -1908,6 +1911,7 @@ impl Pipelines {
         let cooperative =
             || *coop_config.expect("cooperative dispatch needs a qualified device configuration");
         let module = match *key {
+            Variant::StoredGate(_, output) => crate::codegen::generate_gated_module(output),
             Variant::WinogradTransform(_, storage) => {
                 crate::codegen::winograd::transform(group, storage)
             }
@@ -2228,6 +2232,20 @@ impl Pipelines {
     /// which unrelated pipelines happen to have been compiled.
     fn key(dispatch: &Dispatch) -> Variant {
         let entry = dispatch.shader.clone();
+        if matches!(entry, ShaderEntry::SwiGLUConcat | ShaderEntry::GeGLUConcat) {
+            let storage = dispatch.pointwise_storage;
+            if storage.bf16_output || storage.f16_output {
+                assert!(!(storage.bf16_output && storage.f16_output));
+                return Variant::StoredGate(
+                    entry,
+                    if storage.bf16_output {
+                        crate::DType::BF16
+                    } else {
+                        crate::DType::F16
+                    },
+                );
+            }
+        }
         match dispatch.kernel {
             crate::compile::Kernel::WinogradTransform(storage) => {
                 return Variant::WinogradTransform(entry, storage);

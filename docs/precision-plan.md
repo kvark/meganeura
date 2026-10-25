@@ -70,11 +70,17 @@ within the small changes seen between tuning runs). Both searches finish in
 
 ## 2. Broaden storage coverage — active
 
-The next prototype specializes private SwiGLU/GeGLU output stores in the
-consumer's F16/BF16 type, without another dispatch. Forward arithmetic stays
-F32 and backward readers prevent narrowing. GPU output/gradient/update checks
-pass on both cards; complete-model timing is in progress. Forward attention
-and batched/block storage remain subsequent opportunities.
+Private SwiGLU/GeGLU stores now specialize to the consumer's F16/BF16 type,
+without another dispatch. Forward arithmetic stays F32 and backward readers
+prevent narrowing. GPU output/gradient/update checks pass on both cards.
+Fresh 30-second searches plus a separate paired holdout improve Intel
+SmolLM2 from 8.228 to 8.068 ms (1.94%) over the first producer pass. NVIDIA
+retains F32 storage; its holdout change is 0.84%, treated as tuning variation.
+Fixed-plan complete-model results put the combined Intel storage improvement
+at 7.85% (8.751 to 8.064 ms); other measured models are neutral or regress.
+
+- [x] Extend private reduced stores through SwiGLU/GeGLU, preserving F32
+  consumers and avoiding standalone conversions.
 
 The forward attention generator currently requires square 16x16 matrices, so
 B570's 8x16 product is not admitted there; the rectangular scaled-backward path
@@ -93,7 +99,9 @@ Keep tails, causal/window masks, GQA, head padding and LSE storage explicit.
   stores, avoiding an F32 shared-memory round trip. Naga currently rejects
   matrix casts; each intermediate matrix type must be supported by the device.
 - [ ] Consider immutable reduced weight caches only with upload, sharing,
-  checkpoint and optimizer-update invalidation defined and tested. Measure
+  checkpoint, external-buffer and optimizer-update invalidation defined and
+  tested. Inference parameters are still mutable through these interfaces.
+  Measure
   device-local and host-visible placement independently.
 
 ## 3. Intel loading and tile geometry

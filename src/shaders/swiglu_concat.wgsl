@@ -1,3 +1,4 @@
+$EXTENSIONS
 // SwiGLUConcat: input[M, 2*N] → output[M, N]
 // gate = input[:, :N], up = input[:, N:]
 // output = silu(gate) * up
@@ -14,8 +15,12 @@ struct Params {
 
 var<storage> src_a: array<f32>;
 var<storage> src_b: array<f32>;
-var<storage, read_write> dst: array<f32>;
+var<storage, read_write> dst: array<$OUT_TYPE>;
 var<uniform> params: Params;
+
+fn store_result(index: u32, value: f32) {
+    dst[index] = $STORE(value);
+}
 
 // Forward: src_a = input[M, 2*N], dst = output[M, N]
 @compute @workgroup_size(256)
@@ -28,7 +33,7 @@ fn swiglu_concat(@builtin(global_invocation_id) gid: vec3<u32>) {
     let gate = src_a[row * wide + col];
     let up = src_a[row * wide + params.half_n + col];
     let sig = 1.0 / (1.0 + exp(-gate));
-    dst[i] = gate * sig * up;
+    store_result(i, gate * sig * up);
 }
 
 // Backward: src_a = input[M, 2*N], src_b = grad_out[M, N], dst = grad_input[M, 2*N]
@@ -47,8 +52,8 @@ fn swiglu_concat_grad(@builtin(global_invocation_id) gid: vec3<u32>) {
     let sig = 1.0 / (1.0 + exp(-gate));
     let silu_g = gate * sig;
     let dsilu_g = sig + silu_g * (1.0 - sig);
-    dst[row * wide + col] = grad_out * up * dsilu_g;
-    dst[row * wide + params.half_n + col] = grad_out * silu_g;
+    store_result(row * wide + col, grad_out * up * dsilu_g);
+    store_result(row * wide + params.half_n + col, grad_out * silu_g);
 }
 
 // GeGLUConcat: same layout as SwiGLUConcat, gelu(gate) * up.
@@ -78,7 +83,7 @@ fn geglu_concat(@builtin(global_invocation_id) gid: vec3<u32>) {
     let wide = params.half_n * 2u;
     let gate = src_a[row * wide + col];
     let up = src_a[row * wide + params.half_n + col];
-    dst[i] = gelu_tanh(gate) * up;
+    store_result(i, gelu_tanh(gate) * up);
 }
 
 @compute @workgroup_size(256)
@@ -91,6 +96,6 @@ fn geglu_concat_grad(@builtin(global_invocation_id) gid: vec3<u32>) {
     let gate = src_a[row * wide + col];
     let up = src_a[row * wide + params.half_n + col];
     let grad_out = src_b[i];
-    dst[row * wide + col] = grad_out * up * dgelu_tanh(gate);
-    dst[row * wide + params.half_n + col] = grad_out * gelu_tanh(gate);
+    store_result(row * wide + col, grad_out * up * dgelu_tanh(gate));
+    store_result(row * wide + params.half_n + col, grad_out * gelu_tanh(gate));
 }

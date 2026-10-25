@@ -3,7 +3,7 @@
 
 use crate::{
     DType,
-    compile::{ExecutionPlan, Kernel},
+    compile::{ExecutionPlan, Kernel, ShaderEntry},
 };
 use std::collections::{HashMap, HashSet};
 
@@ -89,7 +89,11 @@ pub(super) fn fill(plan: &mut ExecutionPlan) -> usize {
                     if types.output == DType::F32)
                     && d.shader.is_matmul()
                     || ((d.pointwise().is_some()
-                        || d.reduction().is_some_and(|r| r.epilogue.is_some()))
+                        || d.reduction().is_some_and(|r| r.epilogue.is_some())
+                        || matches!(
+                            d.shader,
+                            ShaderEntry::SwiGLUConcat | ShaderEntry::GeGLUConcat
+                        ))
                         && !d.fusion_barrier
                         && !d.pointwise_storage.bf16_output
                         && !d.pointwise_storage.f16_output))
@@ -98,7 +102,13 @@ pub(super) fn fill(plan: &mut ExecutionPlan) -> usize {
             continue;
         }
         let d = &mut plan.dispatches[index];
-        if d.pointwise().is_some() || d.reduction().is_some() {
+        if d.pointwise().is_some()
+            || d.reduction().is_some()
+            || matches!(
+                d.shader,
+                ShaderEntry::SwiGLUConcat | ShaderEntry::GeGLUConcat
+            )
+        {
             d.pointwise_storage.f16_output = dtype == DType::F16;
             d.pointwise_storage.bf16_output = dtype == DType::BF16;
         } else {
@@ -154,7 +164,8 @@ mod tests {
     fn chain(training: bool, pointwise: u8) -> Graph {
         let mut g = Graph::new();
         let x = g.input("x", &[17, 23]);
-        let a = g.parameter("a", &[23, 19]);
+        let width = if pointwise >= 3 { 38 } else { 19 };
+        let a = g.parameter("a", &[23, width]);
         let b = g.parameter("b", &[19, 7]);
         let first = g.matmul(x, a);
         let first = match pointwise {
@@ -163,6 +174,8 @@ mod tests {
                 let weight = g.parameter("norm", &[19]);
                 g.rms_norm(first, weight, 1e-5)
             }
+            3 => g.swiglu_concat(first),
+            4 => g.geglu_concat(first),
             _ => first,
         };
         let last = g.matmul(first, b);
@@ -272,7 +285,15 @@ mod tests {
             if !crate::runtime::typed_matrix_supported(&gpu, dtype) {
                 continue;
             }
-            for (training, pointwise) in [(false, 0), (false, 1), (false, 2), (true, 0)] {
+            for (training, pointwise) in [
+                (false, 0),
+                (false, 1),
+                (false, 2),
+                (false, 3),
+                (false, 4),
+                (true, 0),
+                (true, 3),
+            ] {
                 let g = chain(training, pointwise);
                 let staged = plan(&g, dtype);
                 let mut native = staged.clone();
@@ -291,12 +312,20 @@ mod tests {
                 for update in [1.0, 0.5] {
                     for s in &mut sessions {
                         let input: Vec<_> = (0..17 * 23)
-                            .map(|i| ((i % 13) as f32 - 6.0) * 0.125 * 2.0f32.powi(-15))
+                            .map(|i| {
+                                ((i % 13) as f32 - 6.0)
+                                    * 0.125
+                                    * if pointwise >= 3 {
+                                        1.0
+                                    } else {
+                                        2.0f32.powi(-15)
+                                    }
+                            })
                             .collect();
                         s.set_input("x", &input);
                         s.set_parameter(
                             "a",
-                            &(0..23 * 19)
+                            &(0..23 * if pointwise >= 3 { 38 } else { 19 })
                                 .map(|i| ((i % 7) as f32 - 3.0) * 0.125 * update)
                                 .collect::<Vec<_>>(),
                         );
