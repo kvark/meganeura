@@ -137,6 +137,65 @@ fn check_case(
     path: Path,
     keys: Keys,
 ) {
+    check_case_with_forward(
+        (q_seq, kv_seq, heads, kv_heads, window, causal),
+        head_dim,
+        value_scale,
+        upstream_scales,
+        tolerance,
+        (path, false),
+        keys,
+    );
+}
+
+#[test]
+fn f16_products_lse_and_output_support_independent_backward_paths() {
+    let gpu = crate::support::gpu::gpu();
+    if meganeura::runtime::auto_tune(&gpu, 0)
+        .coop_caps
+        .f16_attention_rows
+        == 0
+    {
+        return;
+    }
+    for path in [Path::Rowwise, Path::Cooperative(Operands::F16)] {
+        for shape in [
+            (7, 5, 2, 1, 0, false),
+            (33, 19, 3, 1, 0, false),
+            (65, 65, 3, 1, 0, true),
+            (45, 45, 2, 2, 17, true),
+        ] {
+            check_case_with_forward(
+                shape,
+                64,
+                0.4,
+                &[1e-12, 0.1],
+                0.01,
+                (path, true),
+                Keys::Sinusoid,
+            );
+        }
+    }
+    check_case_with_forward(
+        (33, 19, 3, 1, 0, false),
+        48,
+        0.4,
+        &[0.1],
+        0.01,
+        (Path::Rowwise, true),
+        Keys::Sinusoid,
+    );
+}
+
+fn check_case_with_forward(
+    (q_seq, kv_seq, heads, kv_heads, window, causal): (usize, usize, u32, u32, u32, bool),
+    head_dim: u32,
+    value_scale: f32,
+    upstream_scales: &[f32],
+    tolerance: f64,
+    (path, forward_products): (Path, bool),
+    keys: Keys,
+) {
     let q_width = heads as usize * head_dim as usize;
     let kv_width = kv_heads as usize * head_dim as usize;
     let mut graph = Graph::new();
@@ -202,7 +261,30 @@ fn check_case(
             Some(meganeura::graph::AttentionImpl::CooperativeF32);
         config.optimize.mode = meganeura::optimize::OptimizeMode::Off;
     }
+    let runtime = config.runtime.clone();
     let (mut session, _) = build(&graph, config);
+    if forward_products {
+        let mut plan = session.plan().clone();
+        for d in &mut plan.dispatches {
+            if d.shader.is_attention() {
+                d.shader = ShaderEntry::FlashAttentionProducts;
+                d.workgroups = [(q_seq as u32).div_ceil(16), heads, 1];
+            }
+        }
+        drop(session);
+        session = meganeura::Session::with_context_opts(
+            plan,
+            crate::support::gpu::gpu().clone(),
+            runtime,
+        );
+        assert!(
+            session
+                .plan()
+                .dispatches
+                .iter()
+                .any(|d| d.shader == ShaderEntry::FlashAttentionProducts)
+        );
+    }
     assert!(
         session
             .plan()

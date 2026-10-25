@@ -99,7 +99,8 @@ U-Net by 5.6%, but regresses Intel Whisper by 66.5%; these fixed-plan results
 require measured selection. Other inference changes range from a 2.9% gain
 to a 1.6% regression.
 
-Training admission remains excluded. Independent F32 trajectories show that
+Training admission is being evaluated separately from the inference candidate.
+Independent F32 trajectories show that
 the selected baseline also drifts: at step 20 the NVIDIA baseline has 69.7%
 gradient error and 5.62% loss error; Intel has 2.48% gradient error while its
 loss remains close. Comparing two independently updated reduced programs did
@@ -163,8 +164,23 @@ profile supports the opportunity.
 - [x] Measure compensated workgroup dense products after numerical qualification,
   against a qualified F32 alternative at the same weights. The matched dense-only
   pairs regress, so no production precision API or default change is proposed.
-- [ ] Qualify the remaining models with their declared 32-update synthetic
-  workload before revisiting training admission for the QK/PV candidate.
+- [x] Qualify the remaining models with their declared 32-update synthetic
+  workload. SmolVLA, SD U-Net and Whisper pass on both GPUs: unchanged loss
+  curves and initial full-gradient gates, nonzero parameter updates, and
+  gradients checked again at identical F32 step-32 weights.
+- [x] Admit training as a separate measured choice, preserving independent
+  forward/backward search coverage. All eight saved winners from fresh
+  30-second searches pass their declared trajectories: 32 synthetic updates
+  for three models and 256 real-text updates for SmolLM2 on both GPUs. Keep
+  the independent F32 references, parameter updates and thresholds unchanged.
+  Same-plan holdouts, changing only forward attention, improve NVIDIA Whisper
+  by 4.5% at both 4 and 8 submissions (19.953→19.054 ms at 8) and Intel SD
+  U-Net by 1.84% at one submission (8.553→8.395 ms). Fresh-search holdouts
+  select QK/PV for those two cases and retain other paths for the other six;
+  Intel SmolVLA regresses 1.24% after search without choosing QK/PV. Do not
+  attribute the other models' tuning variation to the attention algorithm.
+  All 16 searches finish in 30–34.1 seconds including setup. Timing covers
+  forward, loss and backward; optimizer updates are verified separately.
 
 Preserve these additional leads for follow-up:
 
@@ -173,8 +189,16 @@ Preserve these additional leads for follow-up:
   returns zero residuals. `quantizeToF16` preserves the intended correction.
   Check production compensated GEMMs before changing their generator; the
   isolated NVIDIA cast probe does not reproduce this Intel behavior.
-- Shared-memory stride/padding for staged matrix operands: compare matched
-  NN/AT/BT kernels, then complete models, preserving direct-load paths.
+- Shared-memory stride/padding: tested 18 matched NN/AT/BT cases, including
+  mixed storage, BF16 and tails on both GPUs. All numerical checks pass, but
+  padding by 8 or 16 half-elements regresses the staged Intel 128×576×576
+  products by 5–11%. Native direct loads are unchanged. Retain the samples;
+  do not change production staging or spend model time on this losing variant.
+- Larger key blocks for QK/PV: the prototype processes 16 keys between shared
+  memory exchanges. Test 32/64-key blocks at fixed arithmetic and storage before
+  attributing Intel Whisper's loss to matrix hardware. Measure barriers,
+  staging/register pressure and complete models; preserve masks/tails, F32
+  online softmax and the smaller portable fallback.
 - Per-attention-class selection: SD U-Net and SmolVLA contain multiple
   attention shapes. A whole-program switch can hide a profitable subset;
   evaluate class-specific alternatives with complete-program qualification.
@@ -187,15 +211,25 @@ Preserve these additional leads for follow-up:
   and conversions. Survey Blade/Naga support before exploring softmax on
   cooperative fragments or accumulator-to-operand conversion; these might
   avoid shared score/PV round trips. Retain the portable path and require a
-  complete-model gain before adding APIs for them.
+  complete-model gain before adding APIs for them. The pinned Blade enables
+  only NV2 workgroup scope and flexible dimensions; reduction/conversion/
+  per-element feature bits remain disabled. The pinned Naga IR has matrix
+  loads, multiply-add and stores, but no matrix reduction or per-element call.
+  These require compiler/backend work before a model experiment can use them.
 
 - [ ] Extend useful storage chains through pointwise operations and compatible
   fusion without adding redundant widening/narrowing dispatches.
 - [ ] Cover additional NN/AT/BT, batched/block and split-reduction forms where
   profiles justify the generator and qualification work.
 - [ ] Investigate cooperative matrix conversions for direct reduced result
-  stores, avoiding an F32 shared-memory round trip. Naga currently rejects
-  matrix casts; each intermediate matrix type must be supported by the device.
+  stores, avoiding an F32 shared-memory round trip. Both queried GPUs expose
+  F16 accumulator/result matrices, so test F32 accumulation followed by a
+  same-role F16 conversion and direct store. This does not require doing the
+  reduction in F16. [Standard KHR matrix conversions](https://github.com/KhronosGroup/SPIRV-Registry/blob/main/extensions/KHR/SPV_KHR_cooperative_matrix.asciidoc#34211-conversion-instructions)
+  preserve scope, dimensions and use; NV2's accumulator-to-operand conversions
+  are separate. Naga currently rejects matrix casts. Each intermediate matrix
+  type still needs device support; require qualified model gains before adding
+  compiler/capability APIs.
 - [ ] Consider immutable reduced weight caches only with upload, sharing,
   checkpoint, external-buffer and optimizer-update invalidation defined and
   tested. Inference parameters are still mutable through these interfaces.

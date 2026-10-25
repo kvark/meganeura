@@ -384,7 +384,7 @@ pub fn build_measured_with_inputs(
         .all(|n| n.attention_ept_cap.is_none() && n.attention_impl.is_none());
     programs.allow_matrix_storage = !cfg.runtime.debug && cfg.runtime.pin_buffers.is_none();
     programs.enable_matrix_inputs(&supported, &gpu.capabilities());
-    if cfg.mode == crate::Mode::Inference && cfg.options.flash_forward_coop {
+    if cfg.options.flash_forward_coop {
         programs.enable_forward_products(gpu.capabilities().subgroup_size);
     }
     let preparation_time = start.elapsed();
@@ -828,7 +828,14 @@ impl Implementations {
         }) {
             return;
         }
-        self.order.priority_attention = Some(self.choices.len());
+        let first = self.choices.len();
+        if self.order.priority_attention.is_none() {
+            self.order.priority_attention = Some(first);
+        } else {
+            // Keep the backward trial first. The forward trial inherits its
+            // winner, just like the later matrix arithmetic alternatives.
+            self.order.priority_choices.push_front(first);
+        }
         let ordinary = self.choices.clone();
         self.choices.extend(
             ordinary
@@ -965,23 +972,15 @@ impl Implementations {
     }
 }
 
-/// Retain the staged/scalar candidate. Only complete inference plans are
-/// eligible: the F16 PV approximation has not passed the training trajectory
-/// checks. Parameter/gradient types and all F32 output bindings stay unchanged.
+/// Retain the staged/scalar candidate and measure this forward algorithm
+/// independently of backward precision. Parameter/gradient types and all F32
+/// output/LSE bindings stay unchanged; qualification belongs to the caller.
 fn fill_attention_products(
     plan: &mut ExecutionPlan,
     caps: crate::codegen::CoopCaps,
     shared_memory_bytes: u32,
 ) -> usize {
     use compile::{DispatchParams as _, ShaderEntry};
-    if !plan.param_grad_pairs.is_empty()
-        || plan
-            .dispatches
-            .iter()
-            .any(|d| matches!(d.shader, ShaderEntry::AttentionGrad(_)))
-    {
-        return 0;
-    }
     let mut count = 0;
     for dispatch in &mut plan.dispatches {
         if dispatch.requires_full_precision
@@ -1207,6 +1206,7 @@ impl measure::Frontier for Implementations {
                     matrix_storage: arithmetic.matrix_storage,
                     vector_convolutions_only: arithmetic.vector_convolutions_only,
                     winograd: arithmetic.winograd,
+                    forward_products: arithmetic.forward_products || active.forward_products,
                     ..active
                 };
                 if let Some(next) = self.choices.iter().position(|&choice| choice == neighbor) {
@@ -1490,7 +1490,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_products_keep_fallback_policy_and_training_boundaries() {
+    fn attention_products_keep_fallback_and_precision_policy() {
         use measure::Frontier as _;
         let mut graph = Graph::new();
         let q = graph.input("q", &[33, 144]);
@@ -1545,15 +1545,72 @@ mod tests {
             fill_attention_products(&mut baseline.plan.clone(), caps, 8192),
             0
         );
-        let mut training = baseline.plan.clone();
-        training
-            .param_grad_pairs
-            .push((compile::BufferRef(0), compile::BufferRef(1)));
-        assert_eq!(fill_attention_products(&mut training, caps, 65536), 0);
         let mut unsupported = graph_frontier((*frontier.seeds[0].graph).deep_clone());
         unsupported.caps = caps;
         unsupported.enable_forward_products(128);
         assert!(unsupported.choices.iter().all(|c| !c.forward_products));
+    }
+
+    #[test]
+    fn forward_products_preserve_backward_choices_and_parameter_storage() {
+        use measure::Frontier as _;
+        let mut graph = Graph::new();
+        let q = graph.parameter("q", &[33, 48]);
+        let k = graph.parameter("k", &[19, 16]);
+        let v = graph.parameter("v", &[19, 16]);
+        let y = graph.multi_head_attn(q, k, v, 3, 1, 16, true);
+        let weights = graph.input("weights", &[33, 48]);
+        let weighted = graph.mul(y, weights);
+        let loss = graph.sum_all(weighted);
+        graph.set_outputs(vec![loss]);
+        let graph = std::sync::Arc::new(crate::autodiff::differentiate(&graph));
+        let caps = crate::codegen::CoopCaps {
+            f16_attention_rows: 8,
+            ..Default::default()
+        };
+        let options = compile::CompileOptions {
+            flash_backward_coop: false,
+            ..Default::default()
+        };
+        let plan = compile::compile_with_caps(&graph, &options, caps, 65536);
+        let mut frontier = implementations(
+            vec![Seed {
+                graph,
+                options,
+                plan,
+                description: "training".into(),
+                backward_rank: 0,
+            }],
+            caps,
+            65536,
+            512 << 20,
+        );
+        frontier.enable_forward_products(32);
+        let baseline = frontier.next(None).unwrap();
+        let backward = frontier.next(baseline.origin).unwrap();
+        let backward_choice = frontier.choices[backward.origin.unwrap().choice];
+        assert!(backward_choice.f16_attention && !backward_choice.forward_products);
+        let forward = frontier.next(backward.origin).unwrap();
+        let forward_choice = frontier.choices[forward.origin.unwrap().choice];
+        assert!(forward_choice.f16_attention && forward_choice.forward_products);
+        assert_eq!(
+            forward.plan.param_grad_pairs,
+            backward.plan.param_grad_pairs
+        );
+        assert_eq!(forward.plan.param_types, backward.plan.param_types);
+        let mut expected = backward.plan;
+        assert!(fill_attention_products(&mut expected, caps, 65536) > 0);
+        assert_eq!(forward.plan, expected);
+        let mut reached = collections::HashSet::from([(false, false), (false, true), (true, true)]);
+        while let Some(program) = frontier.next(baseline.origin) {
+            let choice = frontier.choices[program.origin.unwrap().choice];
+            reached.insert((choice.forward_products, choice.f16_attention));
+        }
+        assert_eq!(
+            reached.len(),
+            4,
+            "both forward/backward choices stay reachable"
+        );
     }
 
     #[test]
