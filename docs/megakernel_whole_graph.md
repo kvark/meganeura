@@ -8,6 +8,10 @@ nodes in the same dispatch. The transfer reset and compute dispatch share one
 queue submission. Initial parameter/moment allocation and explicit optimizer
 calls remain separate operations outside that step boundary.
 
+The latest qualified runtime is `12f7c5a`; its
+[horizontal geometry fix and fresh measurements](#correct-horizontal-matmul-geometry)
+are recorded below. Performance parity remains unmet.
+
 For the application benchmarks, use `--whole-graph --workers 256`. For a regular
 Session configured from the environment:
 
@@ -1362,10 +1366,160 @@ Raw results, patches, proofs and binaries are in
 manifest and artifact hashes are in
 `target/megakernel-results/matrix-dependencies/summary.json`.
 
-The next control measures intermediate dependency widths before attempting
+The following controls measure intermediate dependency widths before attempting
 finer dependencies in a real graph. Such a change needs explicit proofs for
 access ranges, lifetime reuse, original tile coordinates and completion counts.
-Baseline parity remains unmet.
+
+## Dependency width and handler isolation
+
+The distinct-output fixture adds an edge `n-W -> n` for each node `n >= W`.
+Widths 1/2/4/8/16 create that many independent chains; width 32 leaves all
+nodes independent. The ordinary plan remains independent at every width.
+All cases retain the same shader keys, resource layouts, parameter words and
+buffer sizes within each compiled-handler variant. Eighteen metadata receipts
+check the exact edges, ready bits, predecessor counters and unchanged fields.
+
+Twenty normal pairs per case give these persistent medians at 256 workers:
+
+| Ready chains | Matrix only ms | With unused forward handlers ms | With unused training handlers ms |
+|---|---:|---:|---:|
+| 1 | 4.141 | 2.972 | 2.979 |
+| 2 | 2.168 | 1.518 | 1.534 |
+| 4 | 1.230 | 0.983 | 1.019 |
+| 8 | 0.911 | 0.801 | 0.840 |
+| 16 | 0.767 | 0.802 | 0.829 |
+| 32 | 0.796 | 0.801 | 0.798 |
+
+Ordinary independent controls range from 0.708 to 0.760 ms. At 64 workers,
+the combined variants plateau near 1.4 ms even with more independent chains.
+The 256-worker combined shader needs about eight chains to approach its
+independent-node timing. This is an imposed scheduling constraint, not a model
+speedup. Splitting a real matrix by rows may enable earlier consumers without
+increasing the total ready tile count enough to reproduce this benefit.
+
+A separate scheduler probe replaces fetch-add claims with a load and retrying
+compare-exchange, advancing the tile counter only while work remains. It retains
+last-claim/helper ready-bit clearing, partial-batch clamping and every publication
+fence. The forward-handler matrix chain slows from 2.972 to 3.106 ms. Full model
+forward/training medians become 7.841/24.871 ms, substantially worse than the
+qualified scheduler. All 120 matrix and 100 full-step pairs pass, but the probe
+is reverted. Final counter overshoot is not a count of failed CAS attempts.
+
+Eighteen further diagnostics compile each unique forward implementation family
+into the independent matrix shader without scheduling its work:
+
+| Compiled alongside the matrix | Registers | Shared bytes |
+|---|---:|---:|
+| Nothing | 48 | 9,584 |
+| Horizontal scalar matmul | 128 | 16,880 |
+| Cooperative matmul with prologue | 108 | 16,768 |
+| Cooperative attention | 80 | 12,688 |
+| GEMV | 80 | 15,728 |
+| Full forward handler set | 112 | 29,200 |
+
+The other individual forward families retain 48 registers. Composition remains
+nonadditive: the horizontal-only combination has more registers than the full
+shader. Instrumented timings from these diagnostics are not speedup evidence.
+Inspecting that horizontal family reveals the geometry bug fixed below.
+
+All **940 normal comparisons and 54 diagnostics** across the width, claim and
+family probes pass with unchanged selected arithmetic, one persistent dispatch
+and no fallback. The scheduler and temporary benchmark APIs are reverted.
+One resource-only capture omitted metadata dumps; a separate complete capture
+provides all 18 audited width receipts. Local proofs, patches, binaries and raw
+results are indexed in `target/megakernel-results/dependency-width/summary.json`.
+
+## Correct horizontal matmul geometry
+
+Horizontal fusion admits `Kernel::SmallTile` and retains its 32×32 output-tile
+grid. Its scalar runtime key previously omitted tile geometry, and the generator
+always emitted the default 64×64 body. The small grid therefore overscheduled
+the larger body and included its larger register tile in the combined shader.
+
+Commit `12f7c5a` carries scalar geometry in the horizontal implementation key
+and passes it, with the session's existing staging knobs, to the common
+generator. Ordinary and persistent execution now both honor the selected
+32×32 or 64×64 tile. The plan's logical grids, bindings and output buffers remain
+the same. Queue scheduling, publication, descriptors and worker counts do not
+change. In the default model, K-stage depth and column layout already matched
+the previous defaults; the corrected body visits K in the same order.
+
+The expanded GPU regression checks all three packed outputs against a CPU
+reference with non-multiple M/N/K dimensions and repeated input updates. Both
+geometries remain alive on one context to exercise separate cache entries, in
+ordinary and whole-graph modes. The fixture asserts actual selection; an initial
+too-small large-tile control was automatically reselected and is preserved as a
+failed fixture attempt. Module tests check generated tile-column spacing as
+well as validation, since overscheduling can still produce correct output.
+
+Qualification passes **665 library tests (eight ignored), 168 strict whole-graph
+oracle tests and nine focused GPU tests**: two horizontal regressions and seven
+whole-graph geometry, scratch, replay, lifetime and optimizer tests. Formatting
+and strict all-feature/all-target Clippy pass. Naga and Blade pins are unchanged;
+their previously recorded checks are not rerun for this shared generator fix.
+
+Fresh production binaries from clean tracked source `12f7c5a` run 50 alternating
+AB/BA pairs per workload, with ten warmups and at least one second of warmup.
+The existing completed-step boundaries, state restoration and full-state checks
+remain unchanged. Every case reports one persistent dispatch, matching corrected
+arithmetic and no fallback. CI and forward state are exact; maximum training
+error is 4.66e-9.
+
+| Workload, 256 workers | Ordinary ms | Persistent ms | Paired ratio | 95% interval |
+|---|---:|---:|---:|---:|
+| CI inference | 0.05527 | 0.07423 | 1.358 | 1.230–1.430 |
+| CI forward/backward | 0.06613 | 0.10271 | 1.551 | 1.541–1.569 |
+| CI forward/backward/SGD | 0.06743 | 0.10201 | 1.522 | 1.510–1.539 |
+| SmolVLA forward | 4.235 | 6.061 | 1.427 | 1.413–1.439 |
+| SmolVLA forward/backward/SGD | 14.947 | 20.716 | 1.380 | 1.360–1.401 |
+
+Intervals bootstrap paired-ratio medians 10,000 times and describe within-run
+uncertainty, not between-run variation. A separate 20-pair-per-case control uses
+the preserved pre-fix binaries: persistent forward/training medians are
+6.396/20.779 ms. The new forward median is about 5.2% lower; training is effectively
+unchanged and CI shows no established benefit. Old-binary controls are historical
+timing comparisons, not matching-arithmetic pairs against the corrected binary.
+Their recorded worktree revision is not their binary build identity. An earlier
+40-pair model exploration is also preserved. Baseline parity remains unmet.
+
+Separate driver diagnostics report 116/117 registers for corrected forward/
+training shaders, versus 112/112 before the fix. Forward shared storage falls
+from 29,200 to 20,880 bytes; training remains 29,232 bytes. Executable sizes fall
+from 114,560/272,000 to 101,248/259,968 bytes. The driver's implausible Local
+Memory Size field remains excluded.
+
+Fresh NVIDIA SDK captures use the previous six sequential single-pass metric
+groups per mode, with 146 samples in every group, no SDK warnings, matching
+NVIDIA adapter identity and successful target/monitor exits. Both corrected
+paths retain the exact previous forward-state SHA-256
+`4e5d66e6ce5e95142b848651d316b4df64855a9d85669499cabc3a81089be629`.
+Repeated instruction rates deviate by at most 0.50% from their group mean;
+clock rates deviate by at most 0.23%. Rate times replay duration gives:
+
+| Metric | Corrected ordinary | Corrected persistent |
+|---|---:|---:|
+| Graph replay ms | 3.579 | 5.582 |
+| Warp instructions, relative to ordinary | 1.000 | 1.934 |
+| FMA-heavy integer-thread activity, relative | 1.000 | 2.625 |
+| Global-load sectors, relative | 1.000 | 1.097 |
+| Shared-memory wavefronts, relative | 1.000 | 1.155 |
+| Barrier waiting, share of active warp cycles | 3.70% | 61.57% |
+| Local-load/store sectors | 0 / 0 | 0 / 0 |
+
+The earlier forward capture estimated about 39,854 local-load and 678,795
+local-store sectors for persistent execution. The corrected capture reports
+zero for both metrics. This is evidence for the measured forward replay, not
+proof that every supported graph is spill-free. The integer metric does not
+count all integer operations; rate-times-duration values are activity estimates,
+and barrier share is not an elapsed-time fraction. Substantial extra instructions
+and coordination costs remain after local traffic disappears.
+
+All jobs use verified separate bounded cgroups; GPU jobs are serialized, and
+builds/analysis/profiling do not overlap primary timing. Artifacts stay on `/x`.
+Tests, source patch, pre-fix controls, production binaries and SDK receipts are
+indexed in `target/megakernel-results/horizontal-geometry/summary.json`. The next
+investigation targets the remaining cost on this corrected runtime, including
+training counters and the cooperative-prologue handler's resource footprint.
 
 ## Earlier artifact identities
 

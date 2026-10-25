@@ -165,12 +165,29 @@ the descriptor-reference repair requires fresh measurements.
   nonterminal publication and final workgroup rendezvous. Compare 100 candidate
   pairs with 100 fresh-control pairs; no convincing full-step gain is established.
   Revert the candidate and all temporary dependency-fixture APIs.
-- [ ] Measure intermediate dependency widths with fixed code and resources,
-  then identify real producer/consumer regions that can overlap safely. Any
-  finer dependency scheme must prove payload ranges, allocation-reuse hazards,
-  original tile coordinates and completion aggregation before benchmarking.
-  Retain both model phases and all CI gates; baseline parity and spill
-  attribution remain open.
+- [x] Measure widths 1/2/4/8/16/32 with fixed code and resources. At 256
+  workers, combined matrix shaders approach their independent-node timing at
+  eight chains; 64 workers plateau near 1.4 ms. Real row partitioning does not
+  necessarily supply that many ready tiles. Preserve 720 comparisons and
+  36 diagnostics, including 18 audited dependency receipts.
+- [x] Test saturating compare-exchange claims without changing publication.
+  All 120 matrix and 100 full-step comparisons pass, but both model phases
+  regress substantially. Revert the scheduler change.
+- [x] Compile each forward implementation family separately into the matrix
+  shader. Eighteen diagnostics expose a horizontal-matmul geometry mismatch:
+  SmallTile grids used the default 64-wide scalar body. Correct the common
+  ordinary/graph generator and distinguish scalar geometry in pipeline keys.
+- [x] Qualify the geometry fix at `12f7c5a`: 665 library tests, 168 strict
+  whole-graph oracle tests, nine focused GPU tests, all-target Clippy and 250
+  primary pairs pass. Fresh old-binary controls show about 5% lower persistent
+  forward latency and effectively unchanged training. Six SDK groups per mode
+  retain the previous exact forward state and report zero local load/store
+  traffic; the primary paired ratios remain 1.427 forward and 1.380 training.
+- [ ] Investigate the remaining scheduling/integer cost on the corrected
+  runtime, including training counters and the cooperative-prologue resource
+  footprint. Finer dependencies still require proofs for payload ranges,
+  allocation reuse, original tile coordinates and completion aggregation.
+  Retain both model phases and all CI gates; baseline parity remains open.
 
 The Blade extension exposes binding inspection and runtime buffer-array binding
 in [commit 1bb5aef](https://github.com/kvark/blade/commit/1bb5aef0fea5fbc4249fdc40a7f1398f5c3ac012).
