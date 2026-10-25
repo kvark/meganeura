@@ -28,6 +28,12 @@ fn profile_graph_session(
     capture_seconds: u64,
     prepare: impl Fn(&mut meganeura::Session),
 ) {
+    let device = session.device_information();
+    let adapter = serde_json::json!({
+        "device_name": device.device_name, "driver_name": device.driver_name,
+        "driver_info": device.driver_info, "is_software_emulated": device.is_software_emulated,
+    });
+    eprintln!("CAPTURE_DEVICE {adapter}");
     // Graph attribution excludes runtime-appended optimizer passes. Restore the
     // same parameters and inputs before every ordinary and profiled replay.
     session.clear_optimizer();
@@ -113,6 +119,7 @@ fn profile_graph_session(
         .write_all(bytemuck::cast_slice(&actual))
         .unwrap();
     let record = serde_json::json!({
+        "adapter": adapter,
         "phase": phase, "work": "graph only; optimizer disabled",
         "normal_samples_ms": samples, "profile": profile,
         "capture_seconds": capture_seconds, "capture_samples_ms": capture_samples,

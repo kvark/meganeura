@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import statistics
 import subprocess
 import time
@@ -29,6 +30,24 @@ METRICS = [
 def sha256(path):
     with path.open("rb") as source:
         return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+def capture_adapter(log):
+    lines = [line.removeprefix("CAPTURE_DEVICE ") for line in log.splitlines()
+             if line.startswith("CAPTURE_DEVICE ")]
+    if len(lines) != 1:
+        raise RuntimeError("Capture requires exactly one benchmark adapter record; rebuild the benchmark")
+    adapter = json.loads(lines[0])
+    if adapter["is_software_emulated"] or "nvidia" not in adapter["driver_name"].lower():
+        raise RuntimeError(f"Perf SDK cannot monitor the benchmark adapter: {adapter}. Select the NVIDIA Vulkan ICD.")
+    return adapter
+
+
+def check_monitor_adapter(log, adapter):
+    devices = re.findall(r"SelectDevice \|\| \[\d+\] (.*?) \([^\n]*periodic-sampler-supported=yes", log)
+    counts = re.findall(r"SelectDevice \|\| Detected (\d+) NvPerf device", log)
+    if counts != ["1"] or devices != [adapter["device_name"]]:
+        raise RuntimeError(f"Cannot uniquely match SDK device(s) {devices} to benchmark adapter {adapter['device_name']}")
 
 
 def capture(repo, sdk, output, phase, workers, whole_graph=False, metric_groups=None):
@@ -58,6 +77,7 @@ def capture(repo, sdk, output, phase, workers, whole_graph=False, metric_groups=
                         "-n", "0.02"],
         })
     receipt = {
+        "counter_capture_valid": False,
         "target_command": command, "monitor_groups": monitor_groups,
         "source_revision": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
@@ -82,6 +102,8 @@ def capture(repo, sdk, output, phase, workers, whole_graph=False, metric_groups=
                     raise RuntimeError(f"Target did not become ready: {log_path}")
                 time.sleep(0.05)
             receipt["ready_unix"] = time.time()
+            adapter = capture_adapter(log_path.read_text(errors="replace"))
+            receipt["adapter"] = adapter
             capture_deadline = time.monotonic() + capture_seconds - 0.5
             time.sleep(1)
             values_by_metric = {}
@@ -96,8 +118,10 @@ def capture(repo, sdk, output, phase, workers, whole_graph=False, metric_groups=
                 if (monitor.returncode or target.poll() is not None
                         or time.monotonic() >= capture_deadline):
                     raise RuntimeError("SDK failed or collection exceeded the resident capture window")
-                if any(marker in monitor_log.read_text() for marker in ("WRN", "ERR")):
+                monitor_text = monitor_log.read_text()
+                if any(marker in monitor_text for marker in ("WRN", "ERR")):
                     raise RuntimeError(f"SDK reported a warning/error: {monitor_log}")
+                check_monitor_adapter(monitor_text, adapter)
                 with Path(group["prefix"] + ".csv").open() as source:
                     rows = list(csv.DictReader(source))[5:]
                 assert len(rows) >= 100, "Incomplete counter collection"
@@ -109,6 +133,10 @@ def capture(repo, sdk, output, phase, workers, whole_graph=False, metric_groups=
                     assert all(math.isfinite(value) for value in values)
                     group["counter_means"][metric] = statistics.mean(values)
                     values_by_metric.setdefault(metric, []).extend(values)
+                activity = [value for name, value in group["counter_means"].items()
+                            if name.startswith(("sm__inst_executed", "sm__cycles_active", "smsp__warps_active"))]
+                if activity and not any(value > 0 for value in activity):
+                    raise RuntimeError("SDK observed no shader activity during the resident capture")
                 print(f"{mode}: counter group {index + 1}/{len(monitor_groups)} collected", flush=True)
             receipt["counter_means"] = {name: statistics.mean(values)
                                          for name, values in values_by_metric.items()}
@@ -123,6 +151,7 @@ def capture(repo, sdk, output, phase, workers, whole_graph=False, metric_groups=
             if receipt["target_exit"]:
                 raise RuntimeError(f"Target failed state qualification: {log_path}")
             record = json.loads(Path(str(prefix) + f".{phase}.json").read_text())
+            assert record["adapter"] == adapter
             assert record["profile_state_exact"] and record["profile"] is None
             execution = record["execution"]
             assert not execution["appended"] and not execution["appended_fallback"]
@@ -133,7 +162,11 @@ def capture(repo, sdk, output, phase, workers, whole_graph=False, metric_groups=
                     assert execution["compute_dispatches"] == 1
             receipt["state_sha256"] = sha256(Path(str(prefix) + f".{phase}.state.bin"))
             receipt["diagnostic_capture_median_ms"] = statistics.median(record["capture_samples_ms"])
+            receipt["counter_capture_valid"] = True
             return receipt, record
+        except Exception as error:
+            receipt["error"] = str(error)
+            raise
         finally:
             if target.poll() is None:
                 target.terminate()

@@ -1036,8 +1036,84 @@ logs and hashes are local under `target/{single-worker-probe,node-cache-probe}/`
 and `target/megakernel-results/coordination-followups/summary.json`. The runtime
 and compiler pins are restored and release examples rebuilt. These diagnostic
 experiments do not change the primary qualification or establish parity. The
-next investigation is ready-bitmap polling and contention; a bounded ready-node
-queue would require its own publication proof and the same acceptance gates.
+following investigation tests ready-bitmap polling and contention, with local
+publication proofs and the same completed-step comparisons.
+
+## Ready-queue and polling results
+
+An append-only queue reserves one slot per graph node. It preserves the existing
+payload fences, marks a slot consumed after its final tile claim, and advances
+a monotonic search head. Consumers scan past unpublished reservations so they
+can execute other ready nodes. Slots are not recycled within a dispatch.
+Completion checks retain exact node/tile counts and additionally require a
+permutation of all nodes in consumed slots. The proof sketch is preserved with
+the prototype; it does not replace full acceptance qualification.
+
+Another probe keeps the bitmap and lets idle leaders wait for a change in the
+remaining-node count before rescanning. A new release fence after publishing
+successors and before decrementing that count pairs with an acquire before
+the next scan. Without that ordering, a worker could cache the new count while
+missing published bits. Sibling lanes wait at the uniform broadcast. Successful
+claims can continue consuming already-ready tiles within the same completion
+epoch. No new Naga interface is involved.
+
+Two additional probes raise the physical worker width to 512 lanes, or make
+the active-lane mask constant only when the original logical tile fills the
+physical worker. Each preserves the selected arithmetic and reports its actual
+worker geometry. Every probe runs 20 pairs in all five cases, with ten warmups
+and at least one second of warmup.
+
+| Probe | CI inference / backward / SGD paired ratios | SmolVLA forward ms / paired ratio | SmolVLA training ms / paired ratio |
+|---|---|---:|---:|
+| Ready-node queue | 1.385 / 1.564 / 1.569 | 6.298 / 1.631 | 21.364 / 1.411 |
+| 512-lane workers | 1.486 / 1.725 / 1.810 | 8.598 / 1.951 | 33.801 / 2.232 |
+| Constant full-tile active mask | 1.335 / 1.563 / 1.510 | 6.581 / 1.570 | 20.812 / 1.376 |
+| Completion-gated leader polling | 1.349 / 1.631 / 1.692 | 6.613 / 1.529 | 21.064 / 1.384 |
+
+All **400 comparisons** pass with one dispatch and matching implementation
+keys. CI and forward are exact; maximum training error is 4.66e-9. None shows
+a useful full-step gain, so all four runtime changes are reverted. Ordinary
+control latency varies across runs; these exploratory ratios are not substitutes
+for the primary 50-pair results.
+
+Fresh Perf SDK captures compare graph-only forward replay, collecting six
+sequential groups for the queue and three for completion-gated polling. Every
+group has 146 post-warmup samples, successful target/monitor exits and no SDK
+warnings. Device identity and complete state agree between modes. Rate times
+replay duration gives the following activity estimates relative to ordinary:
+
+| Implementation | Persistent replay ms | Warp instructions | Integer instructions | Global-load sectors | Shared wavefronts | Barrier share of active warp cycles |
+|---|---:|---:|---:|---:|---:|---:|
+| Qualified bitmap, earlier capture | 6.103 | 1.924× | 2.552× | 1.117× | 1.193× | 62.28% |
+| Ready-node queue | 6.128 | 2.153× | 2.528× | 1.158× | 1.358× | 54.58% |
+| Completion-gated leader polling | 6.151 | 1.603× | 2.544× | 1.140× | 1.097× | 65.60% |
+
+Ordinary replay medians are 3.772, 3.765 and 3.774 ms respectively. Reducing
+polling removes substantial warp instructions and shared traffic without
+reducing replay latency; the measured integer activity remains almost unchanged.
+The barrier percentages are not elapsed-time fractions. These results shift the
+next experiment toward matrix addressing and the resource cost of combining
+handlers, rather than claiming that idle instruction removal recovers the gap.
+
+One initial queue capture selected RADV for the benchmark while NvPerf monitored
+the RTX 5080. Both processes completed and numerical state matched, but NVIDIA
+shader counters were zero. That capture is explicitly **invalid and excluded**.
+The benchmark now emits adapter metadata before resident capture and includes
+it in the JSON result. The helper requires the NVIDIA driver, one matching
+NvPerf device, and nonzero shader activity when those metrics are collected.
+Receipts include adapter identity, `counter_capture_valid` and an error on
+failure. Matching real SDK logs pass; missing, non-NVIDIA, mismatched and
+ambiguous adapter fixtures are rejected. Corrected captures pass these checks.
+The earlier primary capture's NVIDIA ICD, target log and monitor identity were
+also audited successfully; its measurements remain valid.
+
+The capture guard is retained. Release examples rebuild, strict benchmark
+Clippy and formatting pass. The runtime and dependency pins match the qualified
+implementation. Raw samples, binaries, proofs, patches and SDK records are in
+`target/{ready-queue-probe,wide-worker-probe,active-lane-probe,completion-poll-probe}/`;
+the combined manifest is `target/megakernel-results/queue-followups/summary.json`.
+All workloads used verified bounded cgroups, serialized GPU jobs and local
+storage. Builds and analysis did not overlap timing. Parity remains unmet.
 
 ## Earlier artifact identities
 
@@ -1049,7 +1125,9 @@ has SHA-256 `fd52b1400a974c8c7a326afcc40b071310aecb61aa4cba9c5a19a64de6398637`.
 cargo build --release --features models --example bench_smolvla_train --example bench_ci_latency
 target/release/examples/bench_smolvla_train --whole-graph --workers 256 --warmup 10 --runs 50 --warmup-ms 1000
 target/release/examples/bench_ci_latency --whole-graph --workers 256 --warmup 10 --runs 50 --warmup-ms 1000
-python3 scripts/profile_smolvla_sdk.py --sdk /x/Tools/nsight-perf-sdk-2026.3 \
+python3 scripts/run_bounded_job.py sdk-capture --gpu -- \
+  env VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json \
+  python3 scripts/profile_smolvla_sdk.py --sdk /x/Tools/nsight-perf-sdk-2026.3 \
   --output target/new-whole-graph-capture --phase forward --workers 64 256 --whole-graph
 ```
 

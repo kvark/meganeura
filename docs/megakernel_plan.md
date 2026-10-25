@@ -133,10 +133,18 @@ the descriptor-reference repair requires fresh measurements.
   multiple claims at 256 workers; neither unrestricted nor large-grid-only reuse
   shows a useful full-step gain. Preserve 430 paired comparisons and revert all
   three prototypes.
-- [ ] Isolate ready-bitmap polling and contention; evaluate a bounded ready-node
-  queue that avoids scanning every bitmap word. Prove publication and completion
-  ordering before GPU qualification. Retain both model phases and all CI gates;
-  baseline parity and spill attribution remain open.
+- [x] Test an append-only ready-node queue and completion-gated leader polling,
+  preserving publication proofs. Also test 512-lane workers and constant active
+  masks. All 400 exploratory comparisons pass, but no runtime change wins.
+  SDK captures show polling can lose substantial warp instructions without
+  reducing latency. Revert the probes and preserve their evidence.
+- [x] Require matching benchmark/SDK adapters and collected shader activity.
+  Exclude a RADV-target/NVIDIA-monitor capture and audit the primary NVIDIA
+  captures; record device identity and explicit capture validity in receipts.
+- [ ] Compare isolated matrix handlers with the same handlers inside a combined
+  shader, separating descriptor addressing from the shared resource footprint.
+  Retain both model phases and all CI gates; baseline parity and spill
+  attribution remain open.
 
 The Blade extension exposes binding inspection and runtime buffer-array binding
 in [commit 1bb5aef](https://github.com/kvark/blade/commit/1bb5aef0fea5fbc4249fdc40a7f1398f5c3ac012).
