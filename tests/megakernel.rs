@@ -1553,7 +1553,18 @@ fn session_whole_graph_packed_matrix_tiles_preserve_scratch() {
         let normalized = graph.rms_norm(input, norm, 1e-5);
         let weights = graph.parameter("weights", &[inner, cols]);
         let output = graph.matmul(normalized, weights);
-        graph.set_outputs(vec![output]);
+        let mixed_columns = if (rows, inner, cols) == (33, 719, 2080) {
+            // The same handler sees two- and four-tile claims in one graph.
+            let norm = graph.parameter("norm_second", &[inner]);
+            let normalized = graph.rms_norm(input, norm, 1e-5);
+            let weights = graph.parameter("weights_second", &[inner, 4096]);
+            let second = graph.matmul(normalized, weights);
+            graph.set_outputs(vec![output, second]);
+            Some(4096)
+        } else {
+            graph.set_outputs(vec![output]);
+            None
+        };
         let config = |persistent| {
             let mut config = crate::support::gpu::inference_config();
             config.tune = false;
@@ -1569,6 +1580,15 @@ fn session_whole_graph_packed_matrix_tiles_preserve_scratch() {
                 .iter()
                 .any(|key| key.contains("cooperative-prologue"))
         );
+        if mixed_columns.is_some() {
+            let keys = ordinary.dispatch_implementation_keys();
+            let prologues: Vec<_> = keys
+                .iter()
+                .filter(|key| key.contains("cooperative-prologue"))
+                .collect();
+            assert_eq!(prologues.len(), 2);
+            assert_eq!(prologues[0], prologues[1]);
+        }
         for workers in [1, 3, 64, 4096] {
             let options = meganeura::PersistentOptions {
                 workers,
@@ -1595,6 +1615,10 @@ fn session_whole_graph_packed_matrix_tiles_preserve_scratch() {
                     session.set_input("x", &input);
                     session.set_parameter("norm", &norm);
                     session.set_parameter("weights", &weights);
+                    if let Some(columns) = mixed_columns {
+                        session.set_parameter("norm_second", &values(inner));
+                        session.set_parameter("weights_second", &values(inner * columns));
+                    }
                     session.step();
                     session.wait();
                     check_worker_tasks(session);
@@ -1604,6 +1628,13 @@ fn session_whole_graph_packed_matrix_tiles_preserve_scratch() {
                     ordinary.read_output(rows * cols),
                     packed.read_output(rows * cols)
                 );
+                if let Some(columns) = mixed_columns {
+                    let mut expected = vec![0.0; rows * columns];
+                    let mut actual = vec![0.0; rows * columns];
+                    ordinary.read_output_by_index(1, &mut expected);
+                    packed.read_output_by_index(1, &mut actual);
+                    assert_eq!(expected, actual);
+                }
             }
         }
     }

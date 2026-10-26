@@ -973,11 +973,13 @@ enum Variant {
     CoopEpilogue(ShaderEntry, EpiloguePipelineKey),
     /// Prologue-fused coop matmuls. Prologues only apply when `use_coop`
     /// is set. Weight storage and factor kinds determine the shader; buffer
-    /// IDs are resolved at dispatch time.
+    /// IDs are resolved at dispatch time. The final flag allows a narrower
+    /// native tile only when its grid fits; it is part of pipeline deduplication.
     CoopPrologue(
         ShaderEntry,
         crate::compile::WeightFormat,
         Vec<crate::compile::PrologueLoadKind>,
+        bool,
     ),
     /// GEMV with a RmsNorm folded into its A operand, at a weight format
     /// and measured shape. Packing and width are part of the key so a Q4_0
@@ -1065,7 +1067,7 @@ impl Variant {
             | Variant::ScalarMatmul(ref e, _, _)
             | Variant::Epilogue(ref e, _)
             | Variant::CoopEpilogue(ref e, _)
-            | Variant::CoopPrologue(ref e, _, _)
+            | Variant::CoopPrologue(ref e, _, _, _)
             | Variant::GemvRmsNorm(ref e, _, _)
             | Variant::Gemv(ref e, _, _)
             | Variant::GemvIntDot(ref e, _, _)
@@ -1124,11 +1126,13 @@ impl Variant {
             }
             Variant::Epilogue(ref e, ref key) => epilogue_profile_key(e, key, false),
             Variant::CoopEpilogue(ref e, ref key) => epilogue_profile_key(e, key, true),
-            Variant::CoopPrologue(ref e, crate::compile::WeightFormat::F32, ref kinds) => {
-                format!("{e:?}:cooperative-prologue:{kinds:?}")
+            Variant::CoopPrologue(ref e, crate::compile::WeightFormat::F32, ref kinds, narrow) => {
+                let shape = if narrow { ":narrow-eligible" } else { "" };
+                format!("{e:?}:cooperative-prologue:{kinds:?}{shape}")
             }
-            Variant::CoopPrologue(ref e, format, ref kinds) => {
-                format!("{e:?}:cooperative-prologue-{format:?}-weights:{kinds:?}")
+            Variant::CoopPrologue(ref e, format, ref kinds, narrow) => {
+                let shape = if narrow { ":narrow-eligible" } else { "" };
+                format!("{e:?}:cooperative-prologue-{format:?}-weights:{kinds:?}{shape}")
             }
             Variant::GemvRmsNorm(ref e, format, shape) => {
                 format!("{e:?}:rmsnorm-{format:?}-{shape:?}")
@@ -2105,7 +2109,7 @@ impl Pipelines {
                     .expect("cooperative epilogue"),
                 dispatch.weight_format,
             ),
-            Variant::CoopPrologue(..) => {
+            Variant::CoopPrologue(_, _, _, allow_narrow) => {
                 let prologue = dispatch
                     .matmul_prologue
                     .as_ref()
@@ -2113,12 +2117,13 @@ impl Pipelines {
                 let (add, variant) =
                     crate::codegen::coop_shape(group).expect("cooperative matrix group");
                 layout = matmul_with_prologue_layout(prologue.factors.len());
-                crate::codegen::gen_matmul_coop_with_prologue(
+                crate::codegen::gen_matmul_coop_with_prologue_shape(
                     add,
                     variant,
                     &cooperative(),
                     prologue,
                     dispatch.weight_format,
+                    allow_narrow,
                 )
             }
             Variant::Attention(_, hd, ept) => match group {
@@ -2350,6 +2355,8 @@ impl Pipelines {
                     entry,
                     dispatch.weight_format,
                     prologue.factors.iter().map(|f| f.1.clone()).collect(),
+                    crate::kernels::matmul::Problem::of(dispatch)
+                        .is_some_and(|problem| problem.narrow_prologue_allowed()),
                 );
             }
             return if dispatch.use_coop_compensated() {
@@ -2902,6 +2909,22 @@ pub(crate) fn select_variants(
         crate::compile::fuse_rmsnorm_into_add(plan);
         crate::compile::fuse_rmsnorm_into_gemv(plan);
     }
+    // Fusion changes the native prologue's tile width. Refresh its grid after
+    // fusion, using the same geometry as the initial cooperative selection.
+    if let Some(config) = coop_config.filter(|config| config.narrow_prologue()) {
+        for dispatch in &mut plan.dispatches {
+            if dispatch.kernel != crate::compile::Kernel::Cooperative
+                || dispatch.matmul_prologue.is_none()
+            {
+                continue;
+            }
+            let problem = crate::kernels::matmul::Problem::of(dispatch)
+                .expect("cooperative prologue matrix product");
+            dispatch.workgroups = crate::kernels::matmul::cooperative_geometry(&problem, config)
+                .expect("cooperative prologue geometry")
+                .grid;
+        }
+    }
     // Aligned native-f32 products share 64-row tiles between four subgroups.
     // Up to 16 K partitions of at least 128 each raise small outputs toward
     // 512 workgroups; 128 columns are used when partitions can still reach
@@ -3072,6 +3095,70 @@ mod tiled_cooperative_policy_tests {
         codegen::CoopConfig,
         compile::{self, Kernel},
     };
+
+    #[test]
+    fn prologue_geometry_refreshes_after_fusion_and_respects_grid_limits() {
+        let config = CoopConfig {
+            tile_size: 16,
+            use_f16_input: true,
+            compensated: false,
+        };
+        let mut keys = Vec::new();
+        for (columns, narrow) in [(2080, true), (65_535 * 16, true), (65_536 * 16, false)] {
+            let mut graph = Graph::new();
+            let x = graph.input("x", &[53, 720]);
+            let norm = graph.parameter("norm", &[720]);
+            let normalized = graph.rms_norm(x, norm, 1e-5);
+            let weight = graph.parameter("weight", &[720, columns]);
+            let output = graph.matmul(normalized, weight);
+            graph.set_outputs(vec![output]);
+            let mut plan = compile::compile(&graph);
+            select_variants(&mut plan, Some(&config), true, true);
+            let dispatch = plan
+                .dispatches
+                .iter()
+                .find(|d| d.matmul_prologue.is_some())
+                .unwrap();
+            let width = if narrow { 16 } else { 32 };
+            assert_eq!(
+                dispatch.workgroups,
+                [2, (columns as u32).div_ceil(width), 1]
+            );
+            let key = super::Pipelines::key(dispatch);
+            assert!(matches!(key, super::Variant::CoopPrologue(_, _, _, allow) if allow == narrow));
+            keys.push(key);
+            let prologue = dispatch.matmul_prologue.as_ref().unwrap();
+            let module = crate::codegen::gen_matmul_coop_with_prologue_shape(
+                false,
+                crate::codegen::MatMulCoopVariant::Normal,
+                &config,
+                prologue,
+                compile::WeightFormat::F32,
+                narrow,
+            );
+            assert!(
+                module
+                    .source
+                    .contains(&format!("let tile_col = wgid.y * {width}u;"))
+            );
+            // The existing public generator keeps its original geometry.
+            let default_module = crate::codegen::gen_matmul_coop_with_prologue(
+                false,
+                crate::codegen::MatMulCoopVariant::Normal,
+                &config,
+                prologue,
+                compile::WeightFormat::F32,
+            );
+            assert!(
+                default_module
+                    .source
+                    .contains("let tile_col = wgid.y * 32u;")
+            );
+        }
+        assert_eq!(keys[0], keys[1]);
+        assert_ne!(keys[1], keys[2]);
+        assert_ne!(keys[1].label(), keys[2].label());
+    }
 
     #[test]
     fn measured_aligned_products_select_bounded_tiles_and_keep_fallbacks() {
@@ -5452,6 +5539,7 @@ mod variant_tests {
             matmul(|dispatch| {
                 dispatch.kernel = Kernel::Cooperative;
                 dispatch.weight_format = format;
+                dispatch.params = vec![53, 720, 4096, 0];
                 dispatch.matmul_prologue = Some(MatMulPrologue {
                     factors: vec![
                         (BufferRef(3), PrologueLoadKind::PerRow),

@@ -186,6 +186,10 @@ pub struct CoopConfig {
 }
 
 impl CoopConfig {
+    pub(crate) fn narrow_prologue(&self) -> bool {
+        self.tile_size == 16 && self.use_f16_input && !self.compensated
+    }
+
     /// Output tile per workgroup = 2 × tile_size (2×2 grid of coop tiles).
     pub fn output_tile(&self) -> u32 {
         2 * self.tile_size
@@ -1107,6 +1111,7 @@ pub(crate) fn generate_module_coop_typed_with_subgroup(
             1,
             WeightFormat::F32,
             Some((types, layout)),
+            false,
         );
     }
     cooperative::generate(group, types, shape, subgroup)
@@ -2545,6 +2550,27 @@ pub fn gen_matmul_coop_with_prologue(
     gen_matmul_coop_wgsl_full(fused_add, variant, config, Some(prologue), None, 1, format)
 }
 
+pub(crate) fn gen_matmul_coop_with_prologue_shape(
+    fused_add: bool,
+    variant: MatMulCoopVariant,
+    config: &CoopConfig,
+    prologue: &crate::compile::MatMulPrologue,
+    format: WeightFormat,
+    allow_narrow: bool,
+) -> ShaderModule {
+    gen_matmul_coop_stored(
+        fused_add,
+        variant,
+        config,
+        Some(prologue),
+        None,
+        1,
+        format,
+        None,
+        allow_narrow,
+    )
+}
+
 /// Generate a cooperative matmul that stages its f32 accumulators through
 /// workgroup memory before applying a scalar PointwiseDAG epilogue.
 ///
@@ -2578,7 +2604,7 @@ fn gen_matmul_coop_wgsl_full(
     b_format: WeightFormat,
 ) -> ShaderModule {
     gen_matmul_coop_stored(
-        fused_add, variant, config, prologue, epilogue, copies, b_format, None,
+        fused_add, variant, config, prologue, epilogue, copies, b_format, None, false,
     )
 }
 
@@ -2593,6 +2619,7 @@ fn gen_matmul_coop_stored(
     copies: u32,
     b_format: WeightFormat,
     typed: Option<(MatrixTypes, TypedMatmulLayout)>,
+    allow_narrow: bool,
 ) -> ShaderModule {
     if let Some((types, layout)) = typed {
         types.validate();
@@ -2620,6 +2647,15 @@ fn gen_matmul_coop_stored(
     }
     let tile = config.tile_size;
     let output_tile = config.output_tile();
+    let narrow_prologue = allow_narrow
+        && prologue.is_some()
+        && epilogue.is_none()
+        && !fused_add
+        && copies == 1
+        && variant == MatMulCoopVariant::Normal
+        && b_format == WeightFormat::F32
+        && config.narrow_prologue();
+    let output_columns = if narrow_prologue { tile } else { output_tile };
     let shared_size = tile * tile;
     let wg_size: u32 = 64;
     let staging_iters = shared_size / wg_size;
@@ -3152,7 +3188,9 @@ fn gen_matmul_coop_stored(
     };
     let acc_init = template_section(
         template,
-        if fused_add && typed.is_none() {
+        if narrow_prologue {
+            "acc_zero_narrow"
+        } else if fused_add && typed.is_none() {
             "acc_add"
         } else {
             "acc_zero"
@@ -3188,7 +3226,9 @@ fn gen_matmul_coop_stored(
     };
     let result_store = template_section(
         template,
-        if shared_result {
+        if narrow_prologue {
+            "direct_store_narrow"
+        } else if shared_result {
             "shared_store"
         } else {
             "direct_store"
@@ -3220,6 +3260,11 @@ fn gen_matmul_coop_stored(
             ("$RESULT_SCATTER", result_scatter),
             ("$SHARED_LO_DECL", shared_lo_decl),
             ("$COMPENSATED_MMA", compensated_mma),
+            (
+                "$MMA",
+                template_section(template, if narrow_prologue { "mma_narrow" } else { "mma" })
+                    .trim_end(),
+            ),
             ("$RESULT_SHARED_SIZE_U", &format!("{result_shared_size}u")),
             ("$RESULT_SHARED_SIZE", &result_shared_size.to_string()),
             (
@@ -3256,7 +3301,7 @@ fn gen_matmul_coop_stored(
             ("$ELEM_TYPE", elem_type),
             ("$SHARED_SIZE", &shared_size_s),
             ("$OUTPUT_M_U", &output_tile_u),
-            ("$OUTPUT_N_U", &output_tile_u),
+            ("$OUTPUT_N_U", &format!("{output_columns}u")),
             ("$TILE_M_U", &tile_size_u),
             ("$TILE_N_U", &tile_size_u),
             ("$TILE_K_U", &tile_size_u),
@@ -3265,7 +3310,7 @@ fn gen_matmul_coop_stored(
             ("$A_STORAGE", &a_storage),
             ("$STAGING_VARS", &staging_vars),
             ("$B_STAGE_0", &b_stage_0),
-            ("$B_STAGE_1", &b_stage_1),
+            ("$B_STAGE_1", if narrow_prologue { "" } else { &b_stage_1 }),
             ("$A_STAGE_0", &a_stage_0),
             ("$A_STAGE_1", &a_stage_1),
             ("$PROLOGUE_DECL", &prologue_decl),

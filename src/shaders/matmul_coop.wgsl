@@ -77,14 +77,7 @@ $ENTRY_SIGNATURE {
             a = coopLoadT<$COOP_AB>(&shared_b1[0], $TILE_K_U);
         }
         let b0 = coopLoadT<$COOP_BA>(&shared_a0[0], $TILE_N_U);
-        let b1 = coopLoadT<$COOP_BA>(&shared_a1[0], $TILE_N_U);
-        acc0 = coopMultiplyAdd(a, b0, acc0);
-        acc1 = coopMultiplyAdd(a, b1, acc1);
-        if owns_second_row {
-            let a_second = coopLoadT<$COOP_AB>(&shared_b1[0], $TILE_K_U);
-            acc2 = coopMultiplyAdd(a_second, b0, acc2);
-            acc3 = coopMultiplyAdd(a_second, b1, acc3);
-        }
+        $MMA
         $COMPENSATED_MMA
 
         workgroupBarrier();
@@ -92,6 +85,35 @@ $ENTRY_SIGNATURE {
     }
     $RESULT_STORE
     $RESULT_SCATTER
+}
+
+// @section mma
+let b1 = coopLoadT<$COOP_BA>(&shared_a1[0], $TILE_N_U);
+        acc0 = coopMultiplyAdd(a, b0, acc0);
+        acc1 = coopMultiplyAdd(a, b1, acc1);
+        if owns_second_row {
+            let a_second = coopLoadT<$COOP_AB>(&shared_b1[0], $TILE_K_U);
+            acc2 = coopMultiplyAdd(a_second, b0, acc2);
+            acc3 = coopMultiplyAdd(a_second, b1, acc3);
+        }
+
+// @section mma_narrow
+acc0 = coopMultiplyAdd(a, b0, acc0);
+if owns_second_row {
+    let a_second = coopLoadT<$COOP_AB>(&shared_b1[0], $TILE_K_U);
+    acc2 = coopMultiplyAdd(a_second, b0, acc2);
+}
+
+// @section acc_zero_narrow
+var acc0 = $COOP_C();
+var acc2 = $COOP_C();
+
+// @section direct_store_narrow
+if row_valid {
+    coopStoreT(acc0, &$C_BUFFER[c0], n);
+}
+if second_row_valid {
+    coopStoreT(acc2, &$C_BUFFER[c2], n);
 }
 
 // @section prologue_stage_vector

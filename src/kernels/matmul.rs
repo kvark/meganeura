@@ -80,6 +80,8 @@ pub(crate) struct Problem {
     pub reduced_storage: bool,
     /// f16 weights, which f16-input cooperative tiles also read.
     pub f16_weights: bool,
+    /// A prologue without an epilogue or horizontal copies.
+    pub prologue: bool,
     /// Autodiff's mark on derivative work that must keep f32 operands.
     pub requires_full_precision: bool,
     /// A fused epilogue that binds buffers of its own, which only the
@@ -92,6 +94,19 @@ pub(crate) struct Problem {
 }
 
 impl Problem {
+    /// Narrow prologues must still fit the portable dispatch grid. Wider
+    /// products retain their original output tile and remain eligible for fusion.
+    pub(crate) fn narrow_prologue_allowed(&self) -> bool {
+        self.prologue
+            && self.layout == Layout::Plain
+            && !self.reduced_storage
+            && crate::compile::workgroups_within_portable_limits([
+                self.m.div_ceil(32),
+                self.n.div_ceil(16),
+                1,
+            ])
+    }
+
     /// A product with nothing pinned or fused, as tuning measures it.
     pub(crate) fn plain(layout: Layout, [m, n, k]: [u32; 3], reduced_storage: bool) -> Self {
         Self {
@@ -101,6 +116,7 @@ impl Problem {
             k,
             reduced_storage,
             f16_weights: false,
+            prologue: false,
             requires_full_precision: false,
             epilogue_inputs: false,
             pinned: false,
@@ -126,6 +142,9 @@ impl Problem {
             k,
             reduced_storage: dispatch.weight_format.uses_reduced_storage(),
             f16_weights: dispatch.weight_format == crate::compile::WeightFormat::F16,
+            prologue: dispatch.matmul_prologue.is_some()
+                && dispatch.matmul_epilogue.is_none()
+                && dispatch.horizontal_batch < 2,
             requires_full_precision: dispatch.requires_full_precision,
             epilogue_inputs: dispatch
                 .matmul_epilogue
@@ -260,7 +279,12 @@ pub(crate) fn cooperative_geometry(
     config: &CoopConfig,
 ) -> Result<CooperativeGeometry, Rejection> {
     let tile = config.matmul_output_tile();
-    let grid = [problem.m.div_ceil(tile), problem.n.div_ceil(tile), 1];
+    let columns = if problem.narrow_prologue_allowed() && config.narrow_prologue() {
+        config.tile_size
+    } else {
+        tile
+    };
+    let grid = [problem.m.div_ceil(tile), problem.n.div_ceil(columns), 1];
     // Direct stores write whole sub-tiles, so N must stay aligned for
     // stores never to straddle rows. The bottom edge is safe: the output
     // allocation rounds M up to whole tiles.
