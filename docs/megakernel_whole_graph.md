@@ -3204,6 +3204,126 @@ optimization. Further work must distinguish payload instruction cost from
 combined-handler code/resource effects while keeping all CI and training gates.
 The qualified runtime and baseline performance gap remain unchanged.
 
+## Subgroup-uniform scalar output guards
+
+Runtime `ac8ce60fbb2bd195358fc9b45eb555a1996d4ae1` skips a scalar matrix
+subgroup's K reduction only when none of its threads owns a valid output.
+`subgroupAny` votes on each thread's first output row and column, accounting for
+interleaved columns. A thread's other outputs have greater coordinates, so a
+false per-thread predicate implies no valid store. The vote can only enlarge
+that active set: partial subgroups keep their original arithmetic. Every thread
+still stages operands and reaches both workgroup barriers. K order, padding
+arithmetic for active subgroups, output stores, tile geometry, dependencies,
+descriptors, fences and whole-step boundaries remain unchanged. Both backends
+use the same selected matrix template.
+
+An independent geometry audit checks 1,009,152 thread/tile ownership cases over
+square and rectangular tiles, both column layouts and boundary dimensions. It
+finds wholly inactive warps account for 18.75% of forward and 16.3% of training
+scalar warp K iterations in the audited model geometry. These are potential
+reductions, not measured native instructions or a predicted elapsed-time gain.
+
+The initial per-thread guard passes nine smoke tests, eight strict matrix
+oracle tests and **500 paired comparisons**, but slows persistent model forward
+by 8.0% and training by 19.2%. The candidate/control intervals are
+1.080 [1.055, 1.088] and 1.192 [1.050, 1.279]. SDK captures confirm that persistent
+FP32 thread activity falls 20.6/13.7%, yet resident replay grows from
+5.246/16.912 ms to 5.471/18.988 ms. Persistent local-memory traffic stays zero.
+This rejects padded arithmetic count alone as a sufficient explanation of the
+performance gap. The per-thread source, binaries, timings and counters remain
+preserved; this form is not retained.
+
+Replacing its predicate with a subgroup vote avoids that regression. Another
+**500 comparisons** find 3.9% lower persistent forward latency and 3.4/3.1%
+lower CI backward/SGD latency; training-model improvement is inconclusive.
+The final implementation then adds capability selection. Blade graphics
+[`fde3a9f`](https://github.com/kvark/blade/commit/fde3a9fe609af7f31d50c53fc0e1469fc0e17cfa)
+reports compute-stage subgroup voting from Vulkan's stage and `VOTE` property
+bits. Subgroup width alone is not sufficient, as specified by
+[Vulkan's subgroup properties](https://docs.vulkan.org/refpages/latest/refpages/source/VkPhysicalDeviceSubgroupProperties.html).
+Metal/GLES currently do not report this capability and retain the
+original shader. Codegen defaults to that fallback. Blade macros remain pinned
+at `c09c89f`; Naga remains unchanged at `bc7b70b`. No local dependency override,
+new Naga syntax or memory-semantics change remains.
+
+Qualification passes **667 library tests** (eight existing ignores), **168
+strict whole-graph oracle tests**, **50 matrix regressions in their original
+mode**, **nine whole-graph smoke tests**, formatting, strict all-target/all-feature
+Clippy and Metal-target compilation. The new shader test covers normal,
+transposed and fused-add forms, four tile geometries, both column layouts and
+validation with/without subgroup capability. Blade passes 21 library tests
+(one existing ignore), plus Metal and WebAssembly compilation. GPU execution
+qualification remains RTX 5080 Vulkan; the original-mode matrix run does not
+qualify previously rejected strict whole-graph matrix configurations.
+
+All 19 CI and 43 model shader bodies match the successful subgroup prototype
+after ignoring comments/whitespace. Its five complete graph shaders match
+byte-for-byte; executable resource multisets, selected keys and scheduler bytes
+also match. Model forward/training use 102/103 registers, 20,880/29,232 shared
+bytes and 107,904/263,296 code bytes, versus the old 100/103 registers and
+106,752/256,512 code bytes. CI retains 48 registers and adds 16 reported shared
+bytes as the existing subgroup geometry checks become active.
+
+Fresh final binaries run another **500 comparisons** against saved qualified
+`3cb7d57` binaries: control / final / final / control, with 25 interleaved
+ordinary/persistent pairs per case and visit. No performance override remains.
+
+| Case | Final ordinary / persistent ms | Final median paired persistent / ordinary | Persistent final/control, bootstrap 95% interval |
+|---|---:|---:|---:|
+| CI inference | 0.05207 / 0.06912 | 1.329 | 0.981 [0.956, 0.990] |
+| CI backward | 0.06551 / 0.09345 | 1.420 | 0.956 [0.946, 0.973] |
+| CI backward/SGD | 0.06684 / 0.09417 | 1.406 | 0.970 [0.950, 0.978] |
+| Model forward | 4.198 / 5.596 | 1.332 | 0.980 [0.974, 1.015] |
+| Model backward/SGD | 14.754 / 18.749 | 1.282 | 0.999 [0.943, 1.010] |
+
+CI backward/SGD improve **4.4% / 3.0%**. Normalizing by paired ordinary timing
+also shows gains: 0.970 [0.959, 0.986] and 0.985 [0.970, 0.998]. The inference
+normalized interval is inconclusive. Neither model phase establishes a
+completed-step gain: normalized ratios are 0.979 [0.958, 1.003] forward and
+1.011 [0.948, 1.047] training. Intervals use 10,000 bootstrap resamples and do
+not cover every source of between-visit variation. Paired ratios are medians
+of individual ratios, not ratios of aggregate medians.
+
+Fresh final SDK captures collect four sequential metric groups per resident
+replay, with matched selections and exact same-backend state against the saved
+runtime. Training includes SGD at zero learning rate for stable replay. Group
+clock and instruction-rate means vary by less than 1% within each capture.
+
+| Phase | Ordinary control / final replay ms | Persistent control / final replay ms | Persistent warp instructions, billions, control / final | Persistent FP32 thread instructions, billions, control / final |
+|---|---:|---:|---:|---:|
+| Forward | 3.852 / 3.744 | 5.253 / 5.051 | 0.686 / 0.650 | 3.597 / 2.962 |
+| Training + SGD | 12.005 / 11.990 | 16.892 / 16.266 | 2.807 / 2.739 | 18.975 / 16.937 |
+
+Persistent resident replay improves **3.8% / 3.7%**. Estimated FP32 thread
+activity falls 17.6/10.7%, and shared wavefronts fall 12.6/9.4%. Persistent local
+loads/stores remain zero. Ordinary execution now has small local traffic:
+about 79,780 load/store sectors forward and 323,180 training. These counters do
+not identify its source, and no SASS attribution is claimed. Barrier waiting
+increases from 57.07/50.09% to 59.19/50.87% of active warp cycles despite the
+faster replay. Those percentages are not elapsed-time fractions. Resident replay
+does not replace the completed-step model gate above.
+
+All **1,500 normal comparisons** preserve matching selections, full state
+budgets and completion, with one persistent dispatch and no fallback. Maximum
+model error remains 4.66e-9. The record contains **30 native resource records**
+and **16 SDK backend captures / 64 metric groups**, including the rejected
+per-thread variant. The initial source-audit filename assumption failed because
+shader filenames hash their contents; its log is preserved with the corrected
+body comparison. No numerical tolerance or validation rule is relaxed.
+
+Heavy jobs run in verified separate cgroups with 16/20/1 GiB limits; GPU jobs
+serialize and no build or heavy analysis overlaps measurements. All artifacts
+remain on local `/x` under `target/scalar-output-guard{,-subgroup,-qualified}/`.
+The manifest `target/megakernel-results/scalar-output-guard/summary.json` has
+**1,269 independently verified artifact hashes**, SHA-256
+`7064d00abe13aee7aafa88b9d2516300a64046b690ba416b502766c0a0b0d483`.
+Its frozen source patch matches the retained runtime commit. Measured final
+CI/model binary SHA-256 values are
+`8a0ecaf9ebc0c5ad6f4fedccd6957e2373d96773cd85e8db8be826d06c4175f6` and
+`de9aea135071b6b0b8ef9f08bdd5db6aca253ccbc252073ee2b70e85b781bfcf`.
+The retained change improves CI training and resident GPU replay; model
+completed-step improvement and ordinary-baseline parity remain unproven.
+
 ## Earlier artifact identities
 
 All records remain on local storage at

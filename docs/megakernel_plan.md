@@ -357,11 +357,21 @@ the descriptor-reference repair requires fresh measurements.
   Preserve 1,600 normal comparisons, 32 resource records, indexing audits and
   focused tail/transpose/worker checks. Revert all variants and the temporary
   benchmark switch; restore exact qualified binaries and nine smoke checks.
+- [x] Skip scalar matrix reduction work only when a whole subgroup has no valid
+  output. Reject a per-thread guard: it removes FP32 work but slows persistent
+  replay. The subgroup-uniform form passes 667 library, 168 strict oracle,
+  50 original-mode matrix and nine smoke tests. Query compute-vote support in
+  Blade and retain the original shader when it is unreported. Final CI backward
+  and SGD improve 4.4/3.0%; completed-step model intervals remain inconclusive.
+  SDK resident forward/training improve 3.8/3.7% with exact same-backend state.
+  Preserve 1,500 normal comparisons, 30 resource records and 16 SDK captures.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
-  preserve arithmetic and completed-step boundaries. The gradient-arena change
-  removes false ordering without closing the model gap; do not infer elapsed
-  cost from barrier-wait counters alone. Recheck both model phases and all CI
-  cases before retaining further changes.
+  preserve arithmetic and completed-step boundaries. The retained dependency
+  ranges and subgroup guard improve CI training without establishing model
+  completed-step parity. The rejected per-thread guard shows that fewer FP32
+  operations alone do not establish a speedup. Recheck both model phases and all
+  CI cases before retaining further changes; do not infer elapsed cost from
+  barrier-wait counters alone.
   Keep the shared-state failure as a separate unresolved diagnostic.
   Retain both model phases and all CI gates; baseline parity remains open.
 
