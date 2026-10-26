@@ -4762,3 +4762,131 @@ python3 scripts/run_bounded_job.py sdk-capture --gpu -- \
 | `sdk-forward/ordinary-receipt.json` | `e209faec2241740d5c13306595bab3fb8defb3407b83d5563e61a05ed2ec28a1` |
 | `sdk-forward/whole-64-receipt.json` | `d280ce9059afbe6f73229c35f6fb6605b5e7906f9af305593850effcf359eb35` |
 | `sdk-forward/whole-256-receipt.json` | `a996d1fc0fc624c1502cdbc7e14074d6a0a028cffa3fadb3f9fb8c33870ca618` |
+
+
+## Scalar attention head packing
+
+Retain `8a63a0a` after full qualification and a larger completed-step repeat.
+Scalar callable tiles expose direct workgroup-coordinate reads as separate
+arguments, so the existing scope-aware admission check can distinguish the
+uniform query coordinate from independent head coordinates. Whole-vector uses
+remain conservative. Scalar packing considers widths 4/3/2/1; subgroup and
+cooperative handlers retain 4/2/1. Each node chooses a divisor of its own grid,
+while the shared handler allocates scratch for its largest admitted width.
+
+The rowwise dQ/dKV templates remove only their redundant head-bound early exit:
+the common selector dispatches exactly the query/KV head count on Y. Row bounds,
+masks, reduction trees, query/head accumulation order and dimension guards stay
+intact. The original head guard prevents packing admission even after splitting
+coordinate arguments; removing it admits heads while causal row packing still
+fails validation. No new shader, runtime enum, environment hook, Naga change or
+Blade change is introduced.
+
+In this model, the sixteen dQ nodes have 50×15 grids. Packing three heads changes
+12,000 successful single-tile claims into 4,000 three-tile claims, preserving all
+12,000 logical tiles. The five KV heads remain unpacked because no permitted
+width divides five. Captured dQ/dKV cases confirm widths 3/1. The reported graph
+logical tasks remain 79,824; buffers, scheduler storage, implementation keys,
+geometry, completion accounting and one-dispatch execution remain unchanged.
+All cooperative handler functions and cases are byte-identical to the control.
+
+Training still uses **103 registers and 29,232 shared bytes**; compiled code
+changes 267,776→267,904 bytes. Forward remains 100 registers, 18,832 shared bytes
+and 107,648 code bytes. CI resource statistics are also unchanged. Ordinary dQ
+registers fall 35→30, with shared/code sizes unchanged at 512/6,272 bytes; ordinary
+dKV resources do not change. The ordinary source audit finds only the two head
+guard removals. Separate arguments change additional scalar callable functions,
+so this is not a claim that only dQ source bytes differ.
+
+The first **500 normal comparisons** give training 17.805→17.001 ms,
+candidate/control **0.9549 [0.9450, 1.0388]**. That interval includes no change.
+A fresh **1,000-comparison repeat** uses fifty AB/BA pairs per case in each of
+two control and two candidate visits:
+
+| Case | Control ordinary / persistent ms | Candidate ordinary / persistent ms | Persistent candidate / control (95% interval) |
+|---|---:|---:|---:|
+| CI inference | 0.052301 / 0.069505 | 0.057171 / 0.074400 | 1.0704 (1.0533–1.0776) |
+| CI backward | 0.064771 / 0.093856 | 0.065276 / 0.093705 | 0.9984 (0.9936–1.0040) |
+| CI SGD | 0.066596 / 0.094966 | 0.066535 / 0.094966 | 1.0000 (0.9941–1.0074) |
+| Model forward | 3.806824 / 4.958675 | 3.847089 / 5.008921 | 1.0101 (1.0045–1.0225) |
+| Model training + SGD | 14.625019 / 17.881634 | 14.729420 / 17.044788 | 0.9532 (0.9384–0.9704) |
+
+The repeat establishes a **4.68% absolute persistent training improvement**.
+The normalized training ratio is **0.9559 [0.9015, 1.0268]**, so a relative-gap
+improvement is not established. The candidate's paired persistent/ordinary
+ratios remain **1.3050 forward and 1.1807 training**. Baseline parity is unmet.
+Forward's approximately 1% movement tracks ordinary execution; its normalized
+ratio is 1.0018 [0.9970, 1.0368]. Do not attribute this to head packing.
+
+CI inference moves substantially between visits in both backends. Its repeat
+persistent median rises 7.0% while ordinary rises 9.3%; an additional **1,200
+CI-only comparisons**, with one hundred pairs per case in each visit, reverse
+both movements using the same rebuilt binaries:
+
+| Case | Control ordinary / persistent ms | Candidate ordinary / persistent ms | Persistent candidate / control (95% interval) |
+|---|---:|---:|---:|
+| CI inference | 0.057066 / 0.074295 | 0.051886 / 0.068910 | 0.9275 (0.9125–0.9330) |
+| CI backward | 0.065135 / 0.093576 | 0.064565 / 0.093540 | 0.9996 (0.9961–1.0024) |
+| CI SGD | 0.066440 / 0.094530 | 0.066505 / 0.094280 | 0.9974 (0.9952–1.0007) |
+
+The confirmation's normalized inference ratio is 1.0067 [0.9931, 1.0172]. CI
+backward/SGD absolute changes remain near zero across the studies. Preserve all
+samples and both directions of movement; claim no consistent CI speedup or
+regression. Ratios improved by slower ordinary execution do not count as gains.
+Pooled bootstrap intervals do not capture all between-visit variation.
+
+Four complete-step Perf SDK captures, with sixteen metric groups and zero-rate
+SGD for stable replay, give persistent **15.8761→15.1283 ms (−4.71%)**; ordinary
+is 11.9153→11.9863 ms (+0.60%). Estimated warp instructions fall **6.48%**, integer
+thread instructions **3.76%**, FP32 thread instructions **3.40%**, global-load
+sectors **5.79%** and shared wavefronts **1.84%**. Persistent local traffic stays
+zero. Barrier waiting is 50.96→51.27% of active warp cycles, not elapsed time.
+Maximum metric-group clock/instruction-rate spreads are 0.398%/0.985%.
+These counters support less duplicated work and fewer claims at unchanged
+register/shared capacity; they do not establish exact elapsed stall costs.
+
+Each captured state contains **246,883,105 floats**. Control/candidate actual
+files are bitwise identical within each backend: ordinary SHA-256
+`f67022044ae8966ac48c5d62cd0907411fb42f4d1864c1ba0b3d555b17ce7be0`,
+persistent `1e359875fa92965d4b0aa9026c050702ae3ac165aa59c0a4cc74a6381589c3b7`.
+Across backends, the original budget passes with maximum error 4.66e-9; their
+states are not bitwise identical. All **2,700 normal** and **twenty diagnostic**
+comparisons preserve the same arithmetic selection, full-state/completion
+checks, single compute dispatch and absence of fallback.
+
+Qualification passes **669 library tests** (eight ignored), **168 strict
+whole-graph oracle tests**, **50 matrix tests**, **ten whole-graph smoke tests**,
+22 attention reference tests in each execution mode, formatting, strict Clippy
+and Metal compilation. The new mixed fixture shares handlers across 1/2/3/4/5/15
+query heads and 1/2/3/5 KV heads, widths 63/64/65/129/193, causal/cross/window masks,
+poisoned scratch, three replays and worker counts 1/3/64/4096. Its outputs match
+ordinary execution exactly. Admission checks both three- and four-tile maximum
+handlers and smaller per-node widths; a separate mapping audit checks 146,016
+unique coordinates and 91,520 claims across representative grids and axes.
+
+Preserve the initial test-import failure and rejected head-guard admission.
+The test-only qualification rebuild changes executable hashes despite identical
+production source. The repeat measures those rebuilt binaries after confirming
+byte-identical generated WGSL, matching resource-statistic multisets, geometry,
+implementation selection, execution and buffers. The initial byte-hash assertion
+and an order-sensitive statistics comparison are preserved alongside their
+corrected audits. Native instruction bytes are unavailable; Metal compilation
+does not qualify Metal GPU execution. Performance evidence is for the RTX 5080.
+
+Artifacts are under `target/scalar-head-packing/`, including the primary study,
+`qualification/`, `repeat/` and `ci-confirm/`. The manifest
+`target/megakernel-results/scalar-head-packing/summary.json` indexes **806
+independently verified artifact hashes**, **thirty measurement scopes** and
+**62 recorded job scopes**; SHA-256
+`17084fdf6631cb1f211c4093cd1b60516d383bf9a578b9ab5fcf690db6d469b5`.
+All heavy jobs use separate verified cgroups with 16/20/1 GiB memory-high/hard/
+swap limits. GPU jobs are serialized; builds, copies and heavy analyses do not
+overlap timing or SDK capture. Artifacts remain on local `/x`.
+
+Next, investigate partial scalar head batches for the five KV heads, preserving
+uniform barrier loops, valid inactive-lane coordinates, scratch isolation and
+exact logical completion despite any padded claim space. Keep cooperative
+packing fixed and measure both model phases and all CI cases. Exact-order
+subgroup reduction remains a separate experiment; the forward gap also remains
+open. Do not silently cap requested workers or infer parity from diagnostic
+counter reductions.

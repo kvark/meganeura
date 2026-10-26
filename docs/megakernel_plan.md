@@ -475,6 +475,15 @@ the descriptor-reference repair requires fresh measurements.
   Ordinary registers fall 35→24 and combined code shrinks, but normal training
   timing is inconclusive and SDK replay improves only 0.65%. Reject the probe,
   restore source/tests and pass smoke/format plus byte-identical rebuilt controls.
+- [x] Pack independent scalar attention heads without changing cooperative
+  handlers or scratch capacity. Expose coordinate dependencies to admission;
+  remove redundant exact-grid head guards while rejecting causal row packing.
+  Preserve 2,700 normal comparisons, twenty diagnostics and four SDK captures.
+  A larger repeat establishes a 4.68% absolute training gain; normalized gap
+  improvement remains inconclusive. SDK replay improves 4.71% with exact
+  same-backend state. Retain `8a63a0a` after 669 library, 168 strict oracle,
+  50 matrix and ten smoke tests, Clippy, formatting and Metal compilation.
+  Preserve CI's bidirectional timing movement and the test-only binary bridge.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
@@ -498,13 +507,14 @@ the descriptor-reference repair requires fresh measurements.
   latency difference, and average active warps remain near 32.5% of peak.
   Deprioritize small capacity-only reductions; per-node utilization and the
   separate costs of the changed cooperative body remain unmeasured.
-  Component-count specialization does not establish a training gain. The
-  retained rowwise gradients use only 64 lanes of each 256-lane physical
-  worker. Test packing independent heads of non-cooperative handlers while
-  retaining cooperative packing and its scratch footprint. Separate coordinate
-  arguments can expose equal loop bounds on the head axis; query-dependent
-  causal rows must still fail packing admission. Cover three-tile claims,
-  inactive groups, scratch reuse, mixed grids and exact completion counts.
+  Component-count specialization does not establish a training gain. Scalar
+  head packing now runs three dQ heads per worker and improves absolute training
+  time by 4.68% in the repeat; the normalized interval still includes no change.
+  The five KV heads remain unpacked. Investigate partial scalar head batches
+  with valid inactive-lane coordinates, uniform loops, scratch isolation and
+  exact logical completion despite a padded claim space. Keep cooperative
+  packing unchanged and preserve explicit requested worker counts. Continue
+  investigating the forward gap; the repeat paired ratios remain 1.305/1.181.
   Investigate exact-order subgroup reduction separately if needed: dKV has
   eight workgroup barriers per query/head iteration. Preserve the reduction
   tree, masks, accumulation order and supported fallback in any such change.
