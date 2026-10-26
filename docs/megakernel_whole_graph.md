@@ -1836,8 +1836,89 @@ Patches, proofs, binaries, test logs, source dumps, SDK records and 226 artifact
 hashes are indexed by
 `target/megakernel-results/synchronization-probes/summary.json`. The original
 library assertion failure remains in `target/scalar-double-buffer-probe/lib.log`.
-The next investigation tests handler function boundaries and register lifetimes,
-with local-traffic and completed-step checks before retaining any compiler hint.
+The following investigation tests handler function boundaries and register
+lifetimes, with local-traffic and completed-step checks.
+
+## Handler function-control probes
+
+Two temporary Blade backend probes apply SPIR-V `DontInline` controls after
+normal validated generation, on Meganeura source base `bca1536`. The production
+Naga and Blade pins, application shaders, arithmetic, fences, descriptors,
+scratch and scheduler protocol remain unchanged. Both probes are fully reverted;
+the retained runtime remains `5dbabed` and its primary qualification above applies.
+
+The first probe changes the control words of all direct handler callees of
+`graph_main`, excluding `graph_claim`. A binary audit verifies that only those
+words change in fifteen modules, all validated for Vulkan 1.3. Four exact smoke
+tests pass and three fail: mixed-width reductions, optimizer updates, and the
+attention branch of the selected-geometry test. Maximum differences are
+1.19e-7, 2.33e-10 and 1.19e-7 respectively. **These exact-test failures reject
+the candidate**, regardless of their numerical magnitude. No performance run
+qualifies it. Removing the hint restores all seven passes.
+
+The second probe selects only scalar matrix handlers, including their horizontal
+wrappers. A shadow emission with debug names must become byte-for-byte identical
+to the original module after removing debug instructions, including the header
+and IDs. This identifies the intended handler functions without changing the
+driver's input debug settings. Independent audits verify all twenty-three
+original/modified module pairs: only twenty-five selected function-control words
+change in total, and both versions pass Vulkan 1.3 validation. The classification
+uses matrix-dimension arguments and scalar accumulators as an experimental
+filter, not a proposed compiler API. `DontInline` is advisory; the SPIR-V hint
+does not prove the driver's machine-code call structure.
+
+All seven unchanged whole-graph smoke tests pass. Twenty alternating pairs per
+model phase, followed by a fresh retained-runtime control, give:
+
+| Case | Hint ordinary / persistent ms | Control ordinary / persistent ms | Hint / control paired ratios |
+|---|---:|---:|---:|
+| SmolVLA forward | 3.646 / 15.518 | 4.224 / 6.082 | 4.258 / 1.442 |
+| SmolVLA forward/backward/SGD | 11.824 / 60.716 | 14.897 / 19.514 | 5.049 / 1.312 |
+
+All eighty comparisons retain identical implementation keys, one persistent
+compute dispatch, no fallback and the existing maximum training error of
+4.66e-9. All samples and outliers remain. These are exploratory twenty-pair
+runs; ordinary execution also varies between runs. The much slower persistent
+candidate is rejected without claiming full oracle qualification.
+
+Four separate resource diagnostics show forward registers rising from 116 to
+127 and training from 114 to 128. Code sizes rise from 101,248/249,344 to
+116,352/285,184 bytes; shared storage remains 20,880/29,232 bytes. Those diagnostic
+timings and the driver's implausible Local Memory Size field are excluded from
+performance conclusions.
+
+Matched complete-step SDK captures include zero-rate SGD and one single-pass
+metric group per mode/variant, with 146 samples each, matching adapters,
+successful exits and no SDK warnings. Both variants preserve the exact prior
+state hash within each backend. All 246,883,105 cross-backend floats pass the
+existing comparison budget with maximum error 4.66e-9; they are not bitwise equal
+across backends. Selected graph/optimizer pipelines and task counts match the
+normal nonzero-rate training benchmark.
+
+Persistent replay rises from **17.402 to 55.590 ms**, while ordinary replay stays
+11.944/11.952 ms. Estimated persistent warp instructions rise from **2.830 to
+8.595 billion per replay**. Local traffic changes from zero to approximately
+**427.10 million load and 3.301 billion store sectors per replay**; ordinary
+traffic remains zero. These rate-times-duration estimates support increased
+local-memory and instruction costs from the compiler hint. They do not identify
+particular stack/spill instructions or prove how much time each cost contributes.
+The single-pass capture has no cross-group stability estimate, and zero-rate
+replay does not replace the completed-step gate.
+
+Both backend patches and the Cargo override are reverted. The retained examples
+are rebuilt from the git-pinned dependencies, and all seven restored whole-graph
+smoke tests pass. Every build, test, copy, capture and heavy analysis uses a
+verified bounded cgroup; GPU work is serialized and artifacts stay on `/x`.
+Proofs, patches, failed and successful logs, binaries, SPIR-V/source dumps,
+measurements and **324 independently verified artifact hashes** are indexed by
+`target/megakernel-results/noinline-probes/summary.json`. The independent audit
+log is `target/noinline-probes-artifact-audit.log`.
+
+The next source-level experiment will test a shared scalar body for horizontal
+matrix slices, selecting buffer views uniformly before entering the K loop.
+It must preserve geometry, offsets, alias semantics and output mapping and pass
+the same resource, local-traffic and completed-step checks. Baseline parity
+remains open.
 
 ## Earlier artifact identities
 

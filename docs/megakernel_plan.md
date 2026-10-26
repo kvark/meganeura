@@ -221,12 +221,22 @@ the descriptor-reference repair requires fresh measurements.
   pass without a useful timing gain. Matched two-group complete-step SDK captures
   show nearly unchanged instruction activity and barrier waiting. Revert the
   scheduler change and preserve the six resource diagnostics across these probes.
+- [x] Test handler `DontInline` controls without changing instruction operands.
+  Applying the hint to every handler fails three exact smoke checks. Restricting
+  it to scalar matrix handlers passes all seven checks and eighty model
+  comparisons, but raises forward/training latency to 15.518/60.716 ms versus
+  6.082/19.514 ms control. Matched full-step SDK captures preserve exact
+  same-backend state but expose substantial local traffic and more instructions.
+  Revert both backend probes and the local dependency override; retain the
+  original tests, production pins and rebuilt binaries.
 - [ ] Investigate the remaining scheduling/integer cost after output-array
   removal. Complete-step replay still executes about 1.84 times as many warp
-  instructions as ordinary execution. Test whether keeping handler calls separate
-  changes register allocation, checking local-memory traffic and complete-step
-  latency before retaining any compiler hint. This tests resource lifetime;
-  the measured no-instruction waiting does not establish a cache bottleneck.
+  instructions as ordinary execution. Next, test sharing a scalar kernel body
+  across horizontal matrix slices by selecting their buffer views uniformly
+  before the K loop. Preserve each slice's geometry, descriptor/element offsets,
+  alias semantics, K order and output mapping. Check resource statistics, local
+  traffic and completed-step latency before retaining a change. The measured
+  no-instruction waiting does not establish a cache bottleneck.
   Finer dependencies require proofs for payload ranges,
   allocation reuse, original tile coordinates and completion aggregation.
   Retain both model phases and all CI gates; baseline parity remains open.
