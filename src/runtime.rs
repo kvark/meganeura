@@ -1,4 +1,5 @@
 use crate::kernels::conv::Params as Conv2dParams;
+mod prepare;
 mod workgroup;
 use crate::compile::{
     AttentionParams, BufferRef, CachedBlockAttentionParams, Dispatch, DispatchParams,
@@ -4115,64 +4116,13 @@ impl Session {
             );
         }
 
-        // A mirrored plan and its independently qualified parent share buffer
-        // lifetimes. Preserve their physical order and fusion on every entry
-        // point, including public constructors and saved-plan reloads.
-        let prepared = prepared || !plan.f16_weight_mirrors.is_empty();
-        let mut plan = plan;
         let schedule_span = tracing::info_span!("schedule").entered();
-
-        if !prepared {
-            // Per-dispatch kernel-variant selection: one pass, one owner.
-            select_variants(
-                &mut plan,
-                coop_config.as_ref(),
-                !opts.debug,
-                opts.coop == CoopPolicy::AllowF16,
-            );
-            workgroup::select(&mut plan, &gpu.capabilities(), &opts);
-            if let Some(head_dim) = plan
-                .dispatches
-                .iter()
-                .filter(|dispatch| dispatch.shader == ShaderEntry::FlashAttention)
-                .map(|dispatch| {
-                    AttentionParams::from_words(&dispatch.params)
-                        .expect("invalid attention parameters")
-                        .head_dim
-                })
-                .max()
-            {
-                plan.knobs
-                    .flash
-                    .fit_shared_memory(head_dim, gpu.capabilities().max_compute_shared_memory_size);
-            }
-        }
-
-        // Order the dispatches into barrier groups. The compiler owns this because
-        // horizontal fusion changes how many dispatches there are, so the
-        // groups cannot be computed independently of it.
-        if opts.serial_dispatch {
-            log::info!("MEGANEURA_SERIAL_DISPATCH: forcing one dispatch per pass");
-        }
-        let groups = if prepared {
-            // The plan already owns its measured dispatch order and fusion.
-            if opts.serial_dispatch {
-                (0..plan.dispatches.len()).map(|i| i..i + 1).collect()
-            } else {
-                crate::compile::compute_groups(&plan.dispatches)
-            }
-        } else {
-            crate::compile::schedule_dispatches(
-                &mut plan,
-                opts.serial_dispatch,
-                !opts.serial_dispatch && !opts.debug,
-            );
-            std::mem::take(&mut plan.groups)
-        };
-        log::info!(
-            "{} dispatches → {} barrier groups",
-            plan.dispatches.len(),
-            groups.len()
+        let (plan, groups) = prepare::schedule(
+            plan,
+            &opts,
+            coop_config.as_ref(),
+            &gpu.capabilities(),
+            prepared,
         );
         drop(schedule_span);
 
@@ -4182,72 +4132,7 @@ impl Session {
         // Debug sessions keep every logical buffer distinct and
         // host-visible so any node's value can be read back after a step.
         let memory_plan_span = tracing::info_span!("memory_plan").entered();
-        let mut alias = if opts.debug || opts.no_alias {
-            if opts.debug {
-                log::info!("debug session: buffer aliasing disabled");
-            } else {
-                log::info!("MEGANEURA_NO_ALIAS: buffer aliasing disabled");
-            }
-            crate::memplan::plan_no_alias(&plan, &groups, opts.pin_buffers.as_deref())
-        } else {
-            crate::memplan::plan_buffer_aliasing(&plan, &groups, opts.pin_buffers.as_deref())
-        };
-        alias.pack_weight_mirrors(
-            &plan,
-            opts.arena_chunk_bytes
-                .unwrap_or(crate::memplan::ARENA_CHUNK_BYTES),
-        );
-        alias.pack_arena(
-            &plan,
-            opts.arena_chunk_bytes
-                .unwrap_or(crate::memplan::ARENA_CHUNK_BYTES),
-        );
-        let device_parameters = opts.device_parameters;
-        // Only a parameter-bearing physical allocation may be
-        // relocated, and it must be on its own physical buffer.
-        let mut parameter_memory = vec![None; alias.sizes.len()];
-        if let Some(memory) = device_parameters {
-            for buffer in plan
-                .param_buffers
-                .iter()
-                .map(|entry| entry.1)
-                .chain(plan.derived_params.iter().map(|entry| entry.0))
-            {
-                if plan.input_buffers.iter().any(|entry| entry.1 == buffer)
-                    || plan.constant_buffers.iter().any(|entry| entry.0 == buffer)
-                    || plan.loss_buffer == Some(buffer)
-                    || !plan.buffers[buffer.0 as usize].is_multiple_of(4)
-                    || plan
-                        .param_types
-                        .get(&buffer)
-                        .is_some_and(|ty| !ty.size_bytes().is_multiple_of(4))
-                {
-                    continue;
-                }
-                let physical = alias.map[buffer.0 as usize];
-                // Its own pinned allocation, or a parameter arena.
-                assert!(
-                    alias.arena.iter().any(|chunk| chunk.params == physical)
-                        || alias
-                            .map
-                            .iter()
-                            .enumerate()
-                            .all(|(i, &p)| p != physical || i == buffer.0 as usize),
-                    "device parameter must have its own pinned allocation"
-                );
-                alias.device_local[physical] = true;
-                parameter_memory[physical] = Some(memory);
-            }
-        }
-        // Step-local intermediates default to device-local memory on the
-        // theory that host-visible (ReBAR) traffic is slower on discrete
-        // boards; kill switch for measurement and UMA debugging.
-        if opts.debug || opts.no_device_local {
-            if !opts.debug {
-                log::info!("MEGANEURA_NO_DEVICE_LOCAL: all buffers host-visible");
-            }
-            alias.device_local.fill(false);
-        }
+        let (mut alias, mut parameter_memory) = prepare::memory_layout(&plan, &groups, &opts);
         // Install compatible donor bindings before budgeting or allocating.
         // A parameter in an arena leaves that arena as an individual piece;
         // this preserves the donor's offset and lets the optimizer treat the
@@ -4255,17 +4140,14 @@ impl Session {
         let mut provided_physical = vec![None; alias.sizes.len()];
         let mut provided_parameters = 0usize;
         if let Some(source) = parameter_source.as_deref() {
-            for (target, source_buffer) in shared_parameters(&plan, &source.plan, immutable_only) {
-                let target_index = target.0 as usize;
-                let source_index = source_buffer.0 as usize;
-                let source_physical = source.alias.map[source_index];
-                let physical = alias.rebind(
-                    target_index,
-                    plan.buffers[target_index],
-                    source.alias.offsets[source_index],
-                    source.alias.device_local[source_physical],
-                );
-                provided_physical.resize(alias.sizes.len(), None);
+            for (physical, source_physical) in prepare::shared_bindings(
+                &plan,
+                &mut alias,
+                &source.plan,
+                &source.alias,
+                immutable_only,
+            ) {
+                provided_physical.resize(provided_physical.len().max(physical + 1), None);
                 provided_physical[physical] =
                     Some(Arc::clone(&source.physical_buffers[source_physical]));
                 provided_parameters += 1;
@@ -4274,14 +4156,9 @@ impl Session {
         // A fully donated parameter arena no longer has logical tenants. Keep
         // a harmless minimum-sized backing slot because optimizer metadata
         // retains its physical index, but do not reserve the arena's capacity.
-        parameter_memory.resize(alias.sizes.len(), None);
-        for physical in 0..alias.sizes.len() {
-            if provided_physical[physical].is_none() && !alias.map.contains(&physical) {
-                alias.sizes[physical] = 0;
-                alias.device_local[physical] = false;
-                parameter_memory[physical] = None;
-            }
-        }
+        prepare::retire_unbound(&mut alias, &mut parameter_memory, |physical| {
+            provided_physical[physical].is_some()
+        });
         if provided_parameters != 0 {
             log::info!("reused {provided_parameters} parameter allocations from donor session");
         }
