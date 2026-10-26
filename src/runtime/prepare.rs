@@ -246,7 +246,7 @@ mod tests {
         assert!(
             plan.param_buffers
                 .iter()
-                .any(|(_, p)| ordinary.offsets[p.0 as usize] != 0)
+                .any(|&(_, p)| ordinary.offsets[p.0 as usize] != 0)
         );
         let mut donated = placed;
         let mut donated_memory = memory;
@@ -257,7 +257,7 @@ mod tests {
         retire_unbound(&mut donated, &mut donated_memory, |p| {
             bindings.iter().any(|&(target, _)| target == p)
         });
-        for (_, parameter) in &plan.param_buffers {
+        for &(_, parameter) in &plan.param_buffers {
             let p = parameter.0 as usize;
             assert_eq!(donated.offsets[p], ordinary.offsets[p]);
             assert_eq!(
