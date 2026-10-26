@@ -443,6 +443,14 @@ the descriptor-reference repair requires fresh measurements.
   SDK replay stays flat. Restore `9ff1b50`, pass nine restored smoke tests and
   rebuild byte-identical controls. The result weakens duplicate A staging as
   an explanation for the remaining latency gap.
+- [x] Reduce the wide cooperative prologue from four to two tiles per claim,
+  preserving axis selection and scratch capacity, then guard all four inactive
+  A/B staging regions. Preserve 1,250 normal comparisons and ten SDK backend
+  captures across the two studies. The guards remove the extra staging loads,
+  but normalized completed-step intervals include no change; SDK replay gains
+  only about 1%. Retain neither prototype. Restore `9ff1b50`, pass nine smoke
+  tests and rebuild byte-identical controls. Record source inverses, exact
+  forward state and separate bounded-cgroup receipts.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
@@ -458,9 +466,13 @@ the descriptor-reference repair requires fresh measurements.
   worker shader before choosing a change. Preserve arithmetic and test changes
   individually; exclude clock instrumentation from normal performance gates.
   Both store-only and complete-region A sharing fail to establish a speedup.
-  Investigate work distribution next: the wide prologue's 256 logical tiles
-  become 64 four-tile claims. Compare smaller packing widths, checking actual
-  claims and shader resources separately from scratch-capacity changes.
+  Two-tile packing doubles the wide prologue's claims from 64 to 128 but leaves
+  half the physical groups inactive; guarding their staging does not establish
+  a completed-step gain. Investigate cooperative tile geometry that increases
+  available claims while keeping the physical groups active. Use the common
+  selector and preserve each output's accumulation order; measure any geometry
+  change independently from scratch-capacity changes. Actual per-node SM
+  utilization is still unmeasured by the aggregate worker diagnostics.
   Keep the qualified runtime as control and preserve all completed-step gates.
   Reducing scratch capacity remains unmeasured; instruction or traffic savings
   alone are insufficient evidence to retain it.

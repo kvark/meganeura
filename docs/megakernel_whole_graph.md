@@ -4354,6 +4354,101 @@ All heavy jobs run in separate verified 16/20/1 GiB cgroups; GPU jobs serialize,
 builds and heavy analysis do not overlap measurement, and artifacts stay on
 local `/x`. Baseline parity remains unmet.
 
+## Two-tile cooperative packing and inactive staging
+
+Two probes based on `76fda5c` test the wide cooperative prologue's work
+distribution. The first limits eligible F32, uncompensated, 16-wide native
+prologues to two tiles per claim. Axis ranking and the original four-slice
+scratch capacity stay fixed. The forward grid `[2,128,1]` still contains 256
+logical tiles, now in 128 claims instead of 64. The physical worker remains
+256 invocations. This leaves half its logical groups inactive for that handler;
+their masked stores and products still allow redundant staging loads.
+
+The second probe guards all four complete A/B staging blocks with the existing
+active-lane condition, using the preceding side-effect and local-state escape
+checks. Every physical invocation still reaches the original barriers. The
+first emitted shader differs from the control by exactly one tile-group clamp;
+the second adds exactly four block-to-condition changes. Reversing those edits
+reconstructs the entire qualified shader. Enumeration covers 264 grids and
+309,636 active tile coordinates exactly once. Claim counts follow runtime batch
+selection; aggregate worker reports do not establish per-node SM utilization.
+
+Both prototypes pass 49 codegen checks, nine whole-graph tests and the prologue
+regression. All **1,250 normal paired comparisons** preserve full-state budgets,
+matching selected arithmetic, one persistent dispatch, completion and no
+fallback. Maximum error is 4.66e-9. The first sequence has two 25-pair visits
+per binary and case in control/pack2/pack2/control order. The second uses
+control/pack2/guarded/guarded/pack2/control, also 25 pairs per visit across all
+five cases. Warmup, 256 workers and completed-step boundaries stay unchanged.
+
+In the first sequence, forward ordinary/persistent medians are
+4.021/5.222 ms for the control and 4.029/5.220 ms for two-tile packing.
+Persistent candidate/control is 1.000 [0.985, 1.066]; the normalized paired
+ratio is 0.965 [0.960, 1.011]. Training and CI intervals also include no change.
+The three-way sequence gives:
+
+| Case | Control ordinary / persistent ms | Two-tile ordinary / persistent ms | Guarded ordinary / persistent ms | Guarded/control paired-ratio ratio, bootstrap 95% interval |
+|---|---:|---:|---:|---:|
+| CI inference | 0.05265 / 0.06879 | 0.05725 / 0.07451 | 0.05202 / 0.06911 | 1.028 [0.983, 1.072] |
+| CI backward | 0.06463 / 0.09341 | 0.06504 / 0.09410 | 0.06463 / 0.09359 | 0.994 [0.985, 1.007] |
+| CI SGD | 0.06661 / 0.09474 | 0.06684 / 0.09510 | 0.06655 / 0.09494 | 0.998 [0.990, 1.012] |
+| Model forward | 4.105 / 5.311 | 4.104 / 5.257 | 3.957 / 4.986 | 1.009 [0.973, 1.042] |
+| Model training + SGD | 14.848 / 18.054 | 14.637 / 18.118 | 14.817 / 18.024 | 1.002 [0.984, 1.022] |
+
+Guarded forward's raw persistent median falls 6.1%, but ordinary also becomes
+faster during those visits. Its paired ratio changes from 1.293 to 1.305, with
+no established normalized improvement. Unchanged CI inference also varies
+between visits. All samples remain; the pooled bootstrap does not account for
+every source of between-visit variation. Neither prototype is retained on this
+evidence, and full candidate retention qualification was not pursued.
+
+All 19 CI sources and 42 of 43 model sources match the control. Ordinary and
+CI/training pipeline identities and resources are unchanged. Forward remains
+at 100 registers and 20,880 shared bytes; code is 111,360 bytes for control and
+two-tile packing, and 110,336 bytes with guards. Scheduler sizes are unchanged.
+
+Ten SDK backend captures across both studies contain forty metric groups. In
+the first, two-tile packing improves persistent replay 1.5% but raises estimated
+global-load sectors 59.9% and integer activity 18.3%. The three-way capture
+reproduces this excess and shows that the complete guards remove it:
+
+| SDK forward diagnostic | Control | Two-tile | Two-tile with guards |
+|---|---:|---:|---:|
+| Ordinary replay ms | 3.601 | 3.602 | 3.604 |
+| Persistent replay ms | 4.708 | 4.649 | 4.663 |
+| Persistent global-load sectors / control | 1.000 | 1.603 | 0.997 |
+| Persistent integer activity / control | 1.000 | 1.186 | 0.976 |
+| Persistent warp instructions / control | 1.000 | 1.143 | 0.989 |
+| Persistent shared wavefronts / control | 1.000 | 1.103 | 1.062 |
+| Barrier waiting, percent of active warp cycles | 59.27 | 52.81 | 60.56 |
+
+Persistent local load/store traffic stays zero. All ten actual forward state
+files are bitwise identical. The three-way capture's maximum clock spread is
+0.288% and instruction-rate spread 1.134%. Guarded replay improves only 1.0%
+against control and is 0.3% slower than unguarded two-tile packing. These
+rate-times-replay estimates neither replace the completed-step gate nor turn
+barrier-cycle shares into elapsed costs. Reducing inactive staging traffic does
+not explain the remaining latency gap by itself.
+
+The qualified source is restored exactly. Nine restored whole-graph tests and
+formatting pass; rebuilt benchmarks match the qualified controls byte-for-byte.
+Runtime `9ff1b50`, both clean fork checkouts and dependency pins stay unchanged.
+Investigate cooperative geometry that supplies more claims while keeping the
+physical groups active; scratch-capacity changes remain unmeasured.
+
+Artifacts are under local `target/coop-prologue-pack2/` and
+`target/coop-prologue-pack2-active/`. The combined manifest
+`target/megakernel-results/coop-prologue-pack2/summary.json` records 1,250 normal
+and 25 diagnostic comparisons, 35 measurement scopes, 59 recorded job scopes
+and **1,003 independently verified artifact hashes**, SHA-256
+`be84f6e06208525733a8398c318c6249f36b4d8c89104e77532b710a65ae953e`.
+The interrupted session's final SDK capture completed successfully; its exit
+receipt and actual files were checked before continuing. A fresh launcher
+check verified separate 16/20/1 GiB cgroup limits and the shared GPU lock, with
+no surviving measurement jobs. Heavy jobs use those verified scopes, GPU jobs
+serialize, and builds or heavy analyses do not overlap measurement. All
+artifacts remain on `/x`. Baseline parity remains unmet.
+
 ## Earlier artifact identities
 
 All records remain on local storage at
