@@ -307,14 +307,21 @@ the descriptor-reference repair requires fresh measurements.
   one/two/three fail, but alignment operands do not fix it and a standalone
   shader does not reproduce it. Keep the cause unresolved and all diagnostic
   changes reverted; the qualified binaries and eight smoke checks are restored.
-- [ ] Audit moving ordinary workgroup availability/visibility propagation from
-  individual accesses to existing synchronization barriers in the Naga fork.
-  First prove ordering for workgroupUniformLoad, control barriers, subgroup
-  synchronization, fence-only operations, atomics, pointer helpers and explicit
-  memory decorations. Preserve NonPrivatePointer and every synchronization
-  edge; do not infer correctness or a performance benefit from the proposal.
-  Keep the shared-state reproducer as a separate regression diagnostic, and
-  require all existing correctness and completed-step performance gates.
+- [x] Audit and probe moving ordinary workgroup availability/visibility from
+  individual accesses to existing barriers in Naga. Preserve NonPrivatePointer,
+  decorations, atomics and synchronization placement, with a module-wide
+  fallback for subgroup barriers. Five focused compiler tests, eight smoke
+  checks, publication stress and 200 comparisons pass. No reliable model gain
+  appears; four resource captures are unchanged. Revert the prototype and
+  preserve 225 independently verified artifact hashes, including the confirmed
+  pre-existing subgroup-only SPIR-V validation failure and harness failures.
+  Qualified binaries and all eight restored smoke checks are unchanged.
+- [ ] Investigate subgroup-local cooperative tiles only after proving packed
+  scratch ownership and validating Naga's subgroup-barrier lowering. Preserve
+  common ordinary/persistent arithmetic selection, explicit schedules, supported
+  subgroup widths and partial-batch completion. Require a useful whole-program
+  improvement before retaining a geometry or synchronization change.
+  Keep the shared-state failure as a separate unresolved diagnostic.
   Finer dependencies require proofs for payload ranges,
   allocation reuse, original tile coordinates and completion aggregation.
   Retain both model phases and all CI gates; baseline parity remains open.

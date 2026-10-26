@@ -11,8 +11,8 @@ calls remain separate operations outside that step boundary.
 The latest qualified runtime is `762faf2`; its
 [cooperative row distribution and fresh measurements](#cooperative-row-distribution)
 are recorded below. Subsequent [scheduler locality probes](#scheduler-locality-probes)
-establish no useful model improvement and are reverted. Performance parity
-remains unmet.
+and the [workgroup propagation probe](#workgroup-barrier-propagation) establish
+no useful model improvement and are reverted. Performance parity remains unmet.
 
 For model benchmarks, use `--whole-graph --workers 256`. The
 [current worker sweep](#worker-counts-and-deeper-scalar-staging) finds lower CI
@@ -2672,9 +2672,75 @@ provide that propagation for every supported synchronization path, preserving
 NonPrivatePointer and explicit decorations. The
 [Vulkan memory model](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html#availability-visibility-semantics)
 defines the required barrier propagation; it does not by itself prove the
-proposed compiler transformation. This proposal is unimplemented and requires
-an ordering proof, compiler checks, publication tests, and the same CI/model
-performance gates. It is not an explanation for the shared-state failure.
+proposed compiler transformation. The subsequent prototype and its limits are
+recorded below. It is not an explanation for the shared-state failure.
+
+## Workgroup barrier propagation
+
+At `e246ee6`, a temporary Naga change moves ordinary workgroup-memory
+availability/visibility from individual accesses to the existing workgroup
+control barriers. It retains NonPrivatePointer, barrier placement and scopes,
+relaxed atomics, explicit storage decorations and fence-only propagation.
+This includes barriers generated for workgroupUniformLoad and initialization.
+The ordering argument relies on valid cross-invocation non-atomic communication
+being synchronized with WorkgroupMemory semantics; it does not admit data races
+or change the WGSL memory contract. Pointer helpers using workgroup globals
+are covered; this validator rejects workgroup-pointer function parameters.
+
+Any subgroup control or memory barrier, including nested or unused functions
+and entries, disables the transformation for the entire module. Reusing a
+Writer recomputes this decision. A separate pinned-compiler reproduction
+confirms that subgroup-only barriers already fail Vulkan SPIR-V validation with
+`VUID-StandaloneSpirv-MemorySemantics-10870`: the emitter selects SubgroupMemory
+without a Vulkan-supported storage-class semantics bit. The test explicitly
+preserves this rejection in fallback cases. No valid subgroup GPU execution
+or repair of that separate issue is claimed.
+
+Five focused Naga tests pass, checking operands, scopes, decorated accesses,
+relaxed atomics, writer reuse and the fallback. All eight whole-graph smoke
+tests and the publication/reuse stress test pass. Four initial test-development
+failures are preserved: an unsupported subgroup enable directive, an invalid
+workgroup-pointer parameter, the existing subgroup validation error, and the
+test's initial SPIR-V 1.0 target. The final fixture uses supported syntax and
+SPIR-V 1.3, and checks the existing subgroup rejection explicitly.
+
+The normal comparison uses 20 AB/BA pairs per case for both fresh control and
+candidate binaries: **200 comparisons** across three CI cases and both model
+phases. All preserve selection, state, completion, tolerance and one-dispatch
+gates. Ordinary and persistent paths use the same compiler in each binary.
+
+| Model case | Control ordinary / persistent ms | Candidate ordinary / persistent ms | Candidate / control paired ratio, 95% interval |
+|---|---:|---:|---:|
+| Forward | 3.921 / 5.652 | 3.912 / 5.405 | 0.998 [0.971, 1.021] |
+| Training + SGD | 14.860 / 18.863 | 14.842 / 19.059 | 1.005 [0.908, 1.142] |
+
+The last column compares median paired persistent/ordinary ratios. Although
+the raw forward persistent median falls, the normalized result establishes no
+gain. Training has large outliers in both binaries, reaching 78–86 ms, which
+are retained without filtering. Its raw persistent candidate/control interval
+is especially wide, [0.991, 2.355]. The CI normalized ratios are 0.980, 0.996
+and 1.016; all intervals include one. These data do not establish equivalence
+or a small improvement, and the prototype fails the retention gate.
+
+Four separate resource captures report unchanged forward/training resources:
+100/103 registers, 20,880/29,232 shared bytes and 106,752/256,512 executable bytes.
+All 43 dumped shader sources, including both whole-graph shaders, match between
+control and candidate. Equal executable sizes do not prove identical native
+instructions. No new SDK capture or full oracle qualification is claimed for
+this rejected compiler prototype.
+
+The temporary Cargo override and Naga implementation/tests are reverted after
+preserving their patches and fixture. Both forks are clean, rebuilt examples
+match the qualified binary hashes exactly, and all eight restored smoke tests
+pass. Each heavy job uses a verified separate cgroup with 16/20/1 GiB limits;
+GPU jobs serialize and artifacts remain on `/x`. Captures and raw samples are
+under `target/workgroup-barrier-propagation/`. The manifest
+`target/megakernel-results/workgroup-barrier-propagation/summary.json` has
+**225 independently verified artifact hashes** and SHA-256
+`1072455373873c0be6bf09093fe85a3617ad7703b7acb67776ce705d81210e7c`.
+The qualified runtime, dependency pins and primary measurements remain unchanged.
+Baseline parity is still unmet. Subgroup-local cooperative tiles require a
+scratch-ownership proof and valid subgroup-barrier lowering before a new probe.
 
 ## Earlier artifact identities
 
