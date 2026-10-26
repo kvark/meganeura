@@ -40,6 +40,7 @@ $ENTRY_SIGNATURE {
     let tile_row = select(($TILE_ROW), wgid.y, SPLITS > 1u) * $BM_U;
     let tile_col = wgid.x * $BN_U;
     let tid = ty * 16u + tx;
+    $OUTPUT_GUARD_DECL
 
     $ACC_DECL
 
@@ -65,15 +66,28 @@ $ENTRY_SIGNATURE {
         $B_STAGE_BODY
         workgroupBarrier();
 
-        for (var kk = 0u; kk < $K_TILE_U; kk += $K_UNROLL_U) {
-            $COMPUTE_BODY
-        }
+        $REDUCTION_BODY
 
         workgroupBarrier();
         t += $K_TILE_U;
     }
 
     $RESULT_STORES
+}
+
+// @section output_guard
+// Keep the reduction subgroup-uniform; all lanes still stage and synchronize.
+let has_output = subgroupAny(tile_row + ty * $TM_U < params.m
+    && tile_col + $FIRST_OUTPUT_COLUMN < params.n);
+
+// @section reduction
+for (var kk = 0u; kk < $K_TILE_U; kk += $K_UNROLL_U) {
+    $COMPUTE_BODY
+}
+
+// @section guarded_reduction
+if has_output {
+    $REDUCTION_BODY
 }
 
 // @section store

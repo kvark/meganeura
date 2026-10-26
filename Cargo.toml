@@ -70,7 +70,7 @@ profiler = ["dep:tracing-subscriber"]
 
 [dependencies]
 # FP16 denormal preservation: https://github.com/kvark/blade/pull/416.
-blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "c09c89f79681f879ef37b28125b914be45fc1726" }
+blade-graphics = { version = "0.9", git = "https://github.com/kvark/blade", rev = "fde3a9fe609af7f31d50c53fc0e1469fc0e17cfa" }
 blade-macros = { version = "0.3", git = "https://github.com/kvark/blade", rev = "c09c89f79681f879ef37b28125b914be45fc1726" }
 # Reuse selected compute implementations as persistent callable tiles.
 naga = { git = "https://github.com/kvark/wgpu", rev = "bc7b70bc5d283202e1ec904dd244489f2fe0366a", version = "30", default-features = false, features = ["wgsl-in", "wgsl-out"] }

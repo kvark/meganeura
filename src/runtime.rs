@@ -1919,6 +1919,7 @@ impl Pipelines {
             interleave_columns: knobs.matmul_interleave_columns,
             integer_dot: gpu.capabilities().shader_integer_dot_product,
             unroll_k: false,
+            subgroup_output_guard: gpu.capabilities().subgroup_vote,
         };
         if let Some(shape) = dispatch.scalar_matmul() {
             matmul_knobs.k_stage = shape.k_stage;

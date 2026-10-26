@@ -403,6 +403,9 @@ pub struct MatmulKnobs {
     pub integer_dot: bool,
     /// Straight-line K loop instead of a counted loop.
     pub unroll_k: bool,
+    /// Skip a subgroup's reduction when none of its lanes owns a valid output.
+    /// Requires reported compute subgroup-vote support.
+    pub subgroup_output_guard: bool,
 }
 
 impl Default for MatmulKnobs {
@@ -412,6 +415,7 @@ impl Default for MatmulKnobs {
             interleave_columns: false,
             integer_dot: false,
             unroll_k: false,
+            subgroup_output_guard: false,
         }
     }
 }
@@ -1828,11 +1832,25 @@ fn matmul_vars_tiled(
         knobs.k_stage
     );
     let interleave_columns = !b_mode.is_quantized() && knobs.interleave_columns;
+    let first_output_column = if interleave_columns {
+        "tx".to_owned()
+    } else {
+        format!("tx * {tn}u")
+    };
     let (acc_decl, compute_body, _) = tiled_matmul_body(tile, k_tile, interleave_columns);
     let k_math = if knobs.unroll_k {
         unroll_k_math(&compute_body, k_tile)
     } else {
         compute_body
+    };
+    let reduction = template_section(src, "reduction");
+    let reduction_body = if knobs.subgroup_output_guard {
+        preprocess(
+            template_section(src, "guarded_reduction"),
+            &[("$REDUCTION_BODY", reduction)],
+        )
+    } else {
+        reduction.to_owned()
     };
     let mut result_stores = String::new();
     for i in 0..tm {
@@ -1857,6 +1875,16 @@ fn matmul_vars_tiled(
         src,
         &[
             ("$RESULT_STORES", &result_stores),
+            ("$REDUCTION_BODY", &reduction_body),
+            (
+                "$OUTPUT_GUARD_DECL",
+                if knobs.subgroup_output_guard {
+                    template_section(src, "output_guard")
+                } else {
+                    ""
+                },
+            ),
+            ("$FIRST_OUTPUT_COLUMN", &first_output_column),
             ("$COMPUTE_BODY", &k_math),
             (
                 "$K_UNROLL_U",
@@ -5460,6 +5488,51 @@ mod tests {
             .source
             .contains("dequant_q4k")
         );
+    }
+
+    #[test]
+    fn scalar_output_guard_respects_subgroup_capability() {
+        let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
+        for group in [
+            ShaderGroup::MatMul,
+            ShaderGroup::MatMulAdd,
+            ShaderGroup::MatMulAT,
+            ShaderGroup::MatMulATAdd,
+            ShaderGroup::MatMulBT,
+            ShaderGroup::MatMulBTAdd,
+        ] {
+            for tile in [
+                MatMulTile::Large,
+                MatMulTile::Small,
+                MatMulTile::Occupancy,
+                MatMulTile::Rect { bm: 32, bn: 16 },
+            ] {
+                for interleave_columns in [false, true] {
+                    for subgroup_output_guard in [false, true] {
+                        let module = generate_matmul_with_epilogue(
+                            group,
+                            None,
+                            MatMulOptions {
+                                tile,
+                                knobs: MatmulKnobs {
+                                    interleave_columns,
+                                    subgroup_output_guard,
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            },
+                        );
+                        let without_votes =
+                            naga::valid::Validator::new(flags, naga::valid::Capabilities::empty())
+                                .validate(&module.module);
+                        assert_eq!(without_votes.is_ok(), !subgroup_output_guard);
+                        naga::valid::Validator::new(flags, naga::valid::Capabilities::SUBGROUP)
+                            .validate(&module.module)
+                            .unwrap();
+                    }
+                }
+            }
+        }
     }
 
     /// The epilogue skeleton has to be specialized for the tile the
