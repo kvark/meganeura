@@ -3324,6 +3324,132 @@ CI/model binary SHA-256 values are
 The retained change improves CI training and resident GPU replay; model
 completed-step improvement and ordinary-baseline parity remain unproven.
 
+## Interior staging for transposed scalar matrices
+
+Runtime `540eccfd312b7e6ae372e434d36c3a10d145c684` adds a uniform direct-load
+path for complete B stages in F32 transposed-B scalar products. These stages
+are contiguous along K. The predicate proves that all tile columns and all K
+positions are inside the matrix; the original per-element checked path handles
+every edge stage. The loop already guarantees `t < end_k <= K`, and subtracting
+the tile width from N avoids overflowing an upper-bound addition. Each direct
+load uses the same original address and writes the same shared cell. A staging,
+K order, zero padding, accumulator updates, stores, subgroup output guards,
+barriers, descriptors, dependencies and completion remain unchanged. Both
+backends use the same template. Other layouts and weight formats keep their
+existing staging. No configuration hook or Naga/Blade change is added.
+
+A coordinate audit checks **3,133,440 staged elements** over both B mappings,
+legal tile/stage sizes, boundary dimensions and unsigned-32-bit limits. Every
+admitted interior rectangle contains exactly the original coordinates. This
+does not authorize allocations beyond the existing runtime limits or predict
+native instruction counts.
+
+The broad prototype enables the branch for every F32 scalar B layout. Its
+500 paired comparisons pass, but persistent forward regresses **3.5%**
+(candidate/control 1.035 [1.025, 1.046]); ordinary forward regresses 4.5%.
+Training's raw ratio is 0.963 [0.897, 1.017], despite a favorable normalized
+ratio. The forward regression rejects this form. Restricting the branch to
+transposed-A products adds another 500 passing comparisons, but CI SGD
+regresses **5.2%** and model training has no established gain. Its training
+register count drops from 103 to 100, showing that this resource reduction
+alone does not establish a speedup. Both prototypes remain rejected.
+
+The transposed-B prototype instead improves persistent model training by
+**5.7%** in 500 comparisons: 17.871 versus 18.944 ms, ratio
+0.943 [0.937, 0.958]. Its normalized ratio is 0.950 [0.899, 0.963]. Both
+transposed-only variants leave the complete forward shader byte-for-byte
+unchanged; their differing forward timings are not evidence of a shader gain.
+
+Final qualification passes **667 library tests** (eight existing ignores),
+**168 strict whole-graph oracle tests**, **50 matrix regressions in their
+original mode**, **nine whole-graph smoke tests**, formatting, strict
+all-target/all-feature Clippy and Metal-target compilation. The existing
+scalar edge fixture now also checks the transposed-B 64×64 kernel on a
+35×65×1031 product with an addend, signed dyadic CPU results, changed inputs,
+poisoned storage and ordinary/1/3/256-worker execution. Interior columns and K
+stages use the direct path, while the final column tile and K tail exercise
+the original path. Its first run failed a new geometry assertion expecting
+32×32 SmallTile; the existing selection is 64×64 Default. Only that test
+expectation was corrected, and the initial failure remains in the artifacts.
+No tolerance, validation or admission rule is relaxed. These original-mode
+matrix results do not qualify the previously rejected strict configurations.
+
+All 19 CI and 43 model shader files match the successful transposed-B prototype
+byte-for-byte. Pipeline resource multisets, selections and scheduler sizes also
+match. Training retains **103 registers and 29,232 shared bytes**; code grows
+from 263,296 to 267,776 bytes. Forward remains 102 registers, 20,880 shared
+bytes and 107,904 code bytes. CI inference is unchanged; backward/SGD retain
+48 registers and 9,600 shared bytes, with 61,312/65,408 code bytes.
+
+Fresh final binaries run another **500 paired comparisons**, using
+control/final/final/control visits and 25 interleaved ordinary/persistent pairs
+per case and visit. The complete nonzero-rate training step remains the primary
+boundary, with 256 workers, ten warmups and at least one second of warmup.
+
+| Case | Final ordinary / persistent ms | Final median paired persistent / ordinary | Persistent final/control, bootstrap 95% interval |
+|---|---:|---:|---:|
+| CI inference | 0.05193 / 0.06961 | 1.342 | 1.015 [1.001, 1.066] |
+| CI backward | 0.06494 / 0.09343 | 1.432 | 0.998 [0.986, 1.007] |
+| CI backward/SGD | 0.06682 / 0.09455 | 1.413 | 1.005 [1.0003, 1.0095] |
+| Model forward | 4.127 / 5.541 | 1.335 | 1.004 [0.988, 1.074] |
+| Model backward/SGD | 14.613 / 17.892 | 1.225 | 0.944 [0.938, 0.966] |
+
+Persistent model training falls from **18.953 to 17.892 ms**, a **5.6%** gain.
+Normalizing by paired ordinary timing gives 0.971 [0.951, 0.991], a **2.9%**
+improvement. Ordinary training's ratio is 0.984 [0.965, 1.002], so its apparent
+gain remains inconclusive. CI SGD's raw median rises about **0.5% / 0.47 µs**;
+its normalized interval, 0.999 [0.990, 1.008], is inconclusive. No CI improvement
+is claimed. CI inference and model forward shader bytes are unchanged, so their
+timing movements illustrate variability. All samples and outliers remain.
+The 10,000-resample intervals describe these runs and do not cover every source
+of between-visit variation. Paired-ratio medians need not equal ratios of time
+medians. **Training remains about 22.5% slower than ordinary execution.**
+
+Fresh NVIDIA SDK captures compare complete training plus zero-rate SGD replay,
+with four sequential metric groups per backend and variant. All four backend
+captures have matching adapters, successful exits, at least 100 post-warmup
+samples per group and valid receipts. Actual state-file hashes match exactly
+within each backend and retain the prior qualified state hashes. All complete
+cross-backend state comparisons pass with maximum error 4.66e-9. Clock-rate
+spread is at most 0.213%, and instruction-rate spread at most 1.066%, across
+groups within a capture. No new forward counter claim is made.
+
+| Complete-step SDK diagnostic | Control | Final |
+|---|---:|---:|
+| Ordinary resident replay ms | 11.9949 | 11.9427 |
+| Persistent resident replay ms | 16.2214 | 15.8999 |
+| Persistent warp instructions per replay, billions | 2.73978 | 2.72635 |
+| Persistent integer-pipe thread instructions, billions | 6.57675 | 6.58486 |
+| Persistent shared wavefronts, millions | 487.995 | 489.197 |
+| Persistent barrier share of active warp cycles | 51.01% | 50.76% |
+| Persistent local load/store sectors | zero | zero |
+
+Persistent resident replay improves **2.0%**, less than the primary completed-step
+gain. Aggregate integer and shared activity stays approximately flat; these
+counters do not establish reduced integer instruction count as the cause.
+Ordinary local load/store sectors rise from about 323,000 to 407,000 per replay.
+No SASS or source-level spill attribution is available. Rate-times-duration
+values estimate activity, barrier shares are not elapsed-time fractions, and
+zero-rate resident replay does not replace the nonzero-rate primary gate.
+
+The record preserves **2,000 normal comparisons, 40 native resource records,
+four SDK backend captures / sixteen metric groups**, all variants, the fixture
+failure and final qualification. Every comparison retains matching selected
+arithmetic, full state/completion budgets, one persistent dispatch and no
+fallback. All heavy jobs use verified separate cgroups with 16/20/1 GiB memory
+limits; GPU jobs serialize and artifacts remain on `/x`.
+
+Artifacts are under `target/scalar-interior-staging{,-at,-bt,-qualified}/`.
+The manifest `target/megakernel-results/scalar-interior-staging/summary.json`
+indexes **1,361 independently verified hashes**, SHA-256
+`a2bb70df4e99c89c030e7359939c4e12668c7ffad212f79c128f7b1f71f87678`.
+The frozen final patch matches the retained runtime commit. Final measured
+CI/model binary SHA-256 values are
+`b364fe6014d166ec297e37219d3b85cac1c99b267bd70b5f98348c23d2b5d8db` and
+`3beabdb3af3e97ee825f25ae696fa25f4cb90d18914b1cc2e019be7739c4b1c7`.
+The independent verification log is `target/interior-staging-verify.log`.
+Baseline parity remains unmet; ordinary execution remains the default.
+
 ## Earlier artifact identities
 
 All records remain on local storage at
