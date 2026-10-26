@@ -50,6 +50,60 @@ def check_monitor_adapter(log, adapter):
         raise RuntimeError(f"Cannot uniquely match SDK device(s) {devices} to benchmark adapter {adapter['device_name']}")
 
 
+def check_execution(record, phase, workers, whole_graph):
+    assert record["phase"] == phase
+    assert record["profile_state_exact"] and record["profile"] is None
+    execution = record["execution"]
+    assert not execution["appended_fallback"]
+    if phase == "step":
+        assert record["optimizer_learning_rate"] == 0
+        assert record["work"] == "forward/backward/SGD; zero learning rate for stable replay"
+        assert execution["appended"], "Step capture omitted SGD"
+        assert all(r["implementation_key"] == "SgdUpdate:scalar" and r["logical_tasks"] > 0
+                   and not r["fallback_reason"] for r in execution["appended"])
+    else:
+        assert record["work"] == "graph only; optimizer disabled"
+        assert not execution["appended"] and record.get("optimizer_learning_rate") is None
+    if workers is not None:
+        assert all(r["workers"] == workers and not r["fallback_reason"]
+                   for r in execution["regions"])
+        assert all(r["workers"] == workers and not r["fallback_reason"]
+                   for r in execution["appended"])
+        if whole_graph:
+            assert execution["compute_dispatches"] == 1
+
+
+def compare_state_files(reference, candidate, floats, comparison):
+    """Keep exact comparison as default; benchmark mode uses the paired Rust budget."""
+    assert reference.stat().st_size == candidate.stat().st_size == floats * 4
+    result = {"comparison": comparison, "floats": floats,
+              "bitwise_equal": sha256(reference) == sha256(candidate)}
+    if comparison == "exact":
+        result["valid"] = result["bitwise_equal"]
+        return result
+    assert comparison == "benchmark"
+    # Optional dependency for full model states (hundreds of millions of floats).
+    # Chunked mmap avoids making several full-size temporary copies.
+    import numpy as np
+    a = np.memmap(reference, mode="r", dtype="<f4")
+    b = np.memmap(candidate, mode="r", dtype="<f4")
+    maximum, fraction, different = 0.0, 0.0, 0
+    for start in range(0, floats, 1024 * 1024):
+        av, bv = a[start:start + 1024 * 1024], b[start:start + 1024 * 1024]
+        assert np.isfinite(av).all() and np.isfinite(bv).all(), "Nonfinite captured state"
+        different += int(np.count_nonzero(av.view("u4") != bv.view("u4")))
+        av, bv = av.astype("f8"), bv.astype("f8")
+        error = np.abs(av - bv)
+        # Identical to bench/paired.rs, including max(abs(a), abs(b)).
+        budget = 1e-5 + 1e-4 * np.maximum(np.abs(av), np.abs(bv))
+        maximum = max(maximum, float(error.max()))
+        fraction = max(fraction, float((error / budget).max()))
+    result.update(valid=fraction <= 1, differing_bits=different,
+                  max_absolute_error=maximum, max_budget_fraction=fraction,
+                  atol=1e-5, rtol=1e-4)
+    return result
+
+
 def capture(repo, sdk, output, phase, workers, whole_graph=False, metric_groups=None):
     metric_groups = metric_groups or [METRICS]
     capture_seconds = max(10, 4 * len(metric_groups) + 4)
@@ -152,14 +206,7 @@ def capture(repo, sdk, output, phase, workers, whole_graph=False, metric_groups=
                 raise RuntimeError(f"Target failed state qualification: {log_path}")
             record = json.loads(Path(str(prefix) + f".{phase}.json").read_text())
             assert record["adapter"] == adapter
-            assert record["profile_state_exact"] and record["profile"] is None
-            execution = record["execution"]
-            assert not execution["appended"] and not execution["appended_fallback"]
-            if workers is not None:
-                assert all(r["workers"] and not r["fallback_reason"]
-                           for r in execution["regions"])
-                if whole_graph:
-                    assert execution["compute_dispatches"] == 1
+            check_execution(record, phase, workers, whole_graph)
             receipt["state_sha256"] = sha256(Path(str(prefix) + f".{phase}.state.bin"))
             receipt["diagnostic_capture_median_ms"] = statistics.median(record["capture_samples_ms"])
             receipt["counter_capture_valid"] = True
@@ -179,7 +226,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sdk", type=Path, required=True, help="extracted Perf SDK root")
     parser.add_argument("--output", type=Path, required=True, help="new local artifact directory")
-    parser.add_argument("--phase", choices=("forward", "backward"), default="forward")
+    parser.add_argument("--phase", choices=("forward", "backward", "step"), default="forward",
+                        help="step includes SGD at zero learning rate for stable replay")
+    parser.add_argument("--state-comparison", choices=("exact", "benchmark"), default="exact",
+                        help="benchmark explicitly uses paired-test tolerances (requires NumPy); within-path replay stays exact")
     parser.add_argument("--workers", type=int, nargs="+", default=[64, 256])
     parser.add_argument("--whole-graph", action="store_true")
     selection = parser.add_mutually_exclusive_group()
@@ -200,8 +250,18 @@ def main():
                                   args.whole_graph, metric_groups)
         assert record["implementation_keys"] == reference_record["implementation_keys"]
         assert record["state_layout"] == reference_record["state_layout"]
-        assert receipt["state_sha256"] == reference["state_sha256"], "Backend state differs"
-        print(f"{workers} workers: identical state and arithmetic; capture qualified", flush=True)
+        def appended(record):
+            return [(r["implementation_key"], r["workgroups"], r["logical_tasks"])
+                    for r in record["execution"]["appended"]]
+        assert appended(record) == appended(reference_record), "Optimizer arithmetic differs"
+        mode = ("whole-" if args.whole_graph else "") + str(workers)
+        comparison = compare_state_files(
+            args.output / f"ordinary.{args.phase}.state.bin",
+            args.output / f"{mode}.{args.phase}.state.bin",
+            1 + sum(size for _, size in record["state_layout"]), args.state_comparison)
+        (args.output / f"{mode}-comparison.json").write_text(json.dumps(comparison, indent=2) + "\n")
+        assert comparison["valid"], "Backend state differs under the requested comparison"
+        print(f"{workers} workers: {args.state_comparison} state comparison and identical arithmetic; capture qualified", flush=True)
 
 
 if __name__ == "__main__":

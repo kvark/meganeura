@@ -1627,6 +1627,92 @@ initial backward failure and numerical audit are in
 `target/corrected-training-sdk/summary.json`. Remaining work is to isolate the
 extra instruction and scheduling cost after local traffic disappears.
 
+## Complete-step SDK replay and host attribution
+
+The retained runtime remains `5dbabed`; these changes extend capture tooling.
+`--capture-phase step` includes forward, backward and SGD, using a zero learning
+rate so repeated captures preserve state. It selects the same graph and optimizer
+pipeline keys and task counts as the normal nonzero-learning-rate benchmark:
+ordinary execution has 527 compute dispatches, while persistent execution has
+one. Four SGD nodes contribute 97,522 logical tiles. Zero-rate replay is a
+diagnostic and does not replace the completed-step measurements above.
+
+The SDK wrapper keeps exact cross-backend comparison as its default. Explicit
+`--state-comparison benchmark` compares every captured float using the shared
+benchmark budget `1e-5 + 1e-4 * max(abs(a), abs(b))`, records the policy and error,
+and requires NumPy for chunked memory-mapped comparison. Both policies still
+require bitwise-stable replay within each backend. The previously failed exact
+backward capture remains preserved. Run a new complete-step capture with:
+
+```sh
+python3 scripts/run_bounded_job.py sdk-step --gpu -- \
+  env VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json \
+  python3 scripts/profile_smolvla_sdk.py --sdk /x/Tools/nsight-perf-sdk-2026.3 \
+  --output target/new-step-capture --phase step --workers 256 --whole-graph \
+  --state-comparison benchmark
+```
+
+Separate six-group counter and eighteen-group stall captures each collect 146
+samples per group and mode. All target and monitor exits succeed, adapters match,
+and no SDK warnings occur. Captured state hashes match each backend's previous
+backward capture exactly. Comparing all 246,883,105 floats across backends gives
+the existing maximum error of 4.66e-9; 54,475,347 float representations differ.
+The maximum error/budget fraction is 0.0004594. Cross-backend state is numerically
+qualified, not bitwise equal.
+
+The six-group ordinary/persistent replay medians are 11.941/17.245 ms. Both modes
+have zero local-load and local-store sectors. Rate-times-duration estimates are
+1.844× warp instructions, 2.659× FMA-heavy integer-thread activity, 1.297× global
+load sectors and 1.216× shared-memory wavefronts. The integer metric covers that
+execution pipe rather than all integer instructions. Repeated instruction rates
+vary by at most 0.33% from their within-mode group mean; clocks by at most 0.25%.
+
+The eighteen-group replay medians are 11.982/17.287 ms. Its leading issue states
+are below, expressed as percentages of active warp cycles, **not elapsed-time
+percentages**. The SDK defines no-instruction waiting to include instruction
+selection/fetch as well as cache misses; these measurements do not establish
+instruction-cache thrashing.
+
+| Issue state | Ordinary % | Persistent % |
+|---|---:|---:|
+| L1TEX memory dependency | 60.049 | 19.109 |
+| Workgroup barrier | 3.035 | 51.770 |
+| Memory barrier | 0.000 | 1.428 |
+| No instruction | 0.340 | 0.939 |
+| MIO dependency | 4.072 | 3.028 |
+| MIO queue throttle | 10.270 | 6.660 |
+| Fixed-latency dependency | 8.518 | 8.568 |
+
+Across those eighteen groups, repeated instruction-rate deviation is at most
+0.91% and clock deviation at most 0.38%. Counters describe the combined shader;
+they do not attribute barrier cycles to individual scheduler or tile barriers.
+
+A separate 300-comparison CI host probe splits input upload, recording/submission,
+completion wait and readback. For forward/backward/SGD, median recording/submission
+falls from 18.475 to 7.360 microseconds, while completion wait rises from 48.055
+to 92.805 microseconds. Input and readback are unchanged at 0.22 and 0.54
+microseconds. The other two CI cases show the same direction. These instrumented
+host intervals include driver and wakeup costs and are not pure GPU timestamps
+or primary timing results. The temporary instrumentation is reverted.
+
+Retesting immutable descriptor variants after scalar output stores gives
+6.114 ms forward and 23.354 ms training, with paired ratios 1.551 and 1.567 across
+twenty pairs per case. All 100 CI/model comparisons preserve selected arithmetic,
+state budgets and one dispatch, but training regresses against the retained
+19.403 ms primary measurement. Training resources rise to 142 registers and
+337,920 bytes of code, from 114 and 249,344. The variant is reverted.
+
+Capture-tool qualification passes three execution admissions, seven rejection
+fixtures and six state-comparison fixtures, plus formatting and strict all-feature,
+all-target Clippy. Runtime sources are unchanged; the existing runtime test
+qualification still applies. All jobs use the verified bounded cgroups and GPU
+serialization described above. Captures, tooling source patches, binaries,
+host/variant probes and 236 independently verified artifact hashes are indexed by
+`target/megakernel-results/step-sdk/summary.json`. The independent hash-audit log is
+`target/step-sdk-artifact-audit.log`. The next experiment is to assess whether
+packing logical tiles across grid-axis boundaries can reduce idle lanes while
+preserving partial-batch completion, isolated scratch and barrier uniformity.
+
 ## Earlier artifact identities
 
 All records remain on local storage at

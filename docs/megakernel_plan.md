@@ -195,9 +195,22 @@ the descriptor-reference repair requires fresh measurements.
   pairs. Backward SDK captures retain exact same-backend pre-change state and
   eliminate measured local traffic. A fresh 100-pair old-binary control gives
   20.725 ms training versus 19.403 ms after the change; forward is unchanged.
+- [x] Separate CI host recording from completion waits. Recording is already
+  faster with persistent workers; the remaining gap occurs after submission.
+  Retest immutable descriptor variants after scalar stores; training still
+  regresses, so revert the probe.
+- [x] Extend SDK capture to complete forward/backward/SGD replay with zero
+  learning rate. Keep exact within-backend replay and default exact cross-backend
+  checks; add an explicit comparison using the existing benchmark tolerances.
+  Qualify six counter groups and eighteen stall groups, preserving all state,
+  selected graph/optimizer arithmetic and one persistent compute dispatch.
+  Local traffic remains zero; barrier waiting is 51.77% of active warp cycles,
+  while no-instruction waiting is below 1%.
 - [ ] Investigate the remaining scheduling/integer cost after output-array
-  removal. The measured backward graph still executes about 1.83 times as many
-  warp instructions as ordinary execution. Finer dependencies require proofs for payload ranges,
+  removal. Complete-step replay still executes about 1.84 times as many warp
+  instructions as ordinary execution. First assess packing across grid-axis
+  boundaries with a partial final batch and qualified barrier control.
+  Finer dependencies require proofs for payload ranges,
   allocation reuse, original tile coordinates and completion aggregation.
   Retain both model phases and all CI gates; baseline parity remains open.
 

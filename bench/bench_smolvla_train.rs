@@ -8,8 +8,9 @@
 ///
 /// Usage:
 ///   cargo run --release --example bench_smolvla_train [-- --warmup 3 --runs 5]
-///   --profile-json PREFIX captures state-checked, graph-only dispatch profiles.
-///   --capture-phase forward|backward selects a resident loop for external counters.
+///   --profile-json PREFIX captures state-checked dispatch profiles.
+///   --capture-phase forward|backward|step selects a resident loop for external counters.
+///   The step capture includes SGD with zero learning rate to keep replay state fixed.
 use std::{
     io::Write,
     time::{Duration, Instant},
@@ -19,7 +20,7 @@ use meganeura::{compile_training_graph, models::smolvla};
 
 mod paired;
 
-fn profile_graph_session(
+fn profile_session(
     session: &mut meganeura::Session,
     prefix: &str,
     phase: &str,
@@ -34,9 +35,13 @@ fn profile_graph_session(
         "driver_info": device.driver_info, "is_software_emulated": device.is_software_emulated,
     });
     eprintln!("CAPTURE_DEVICE {adapter}");
-    // Graph attribution excludes runtime-appended optimizer passes. Restore the
-    // same parameters and inputs before every ordinary and profiled replay.
-    session.clear_optimizer();
+    // A zero rate retains the SGD dispatches while keeping repeated replay fixed.
+    // Normal paired benchmarks continue to qualify nonzero parameter updates.
+    if phase == "step" {
+        session.set_learning_rate(0.0);
+    } else {
+        session.clear_optimizer();
+    }
     assert!(runs > 0);
     for _ in 0..warmup {
         prepare(session);
@@ -118,12 +123,24 @@ fn profile_graph_session(
         .unwrap()
         .write_all(bytemuck::cast_slice(&actual))
         .unwrap();
+    let execution = session.execution_report();
+    if phase == "step" {
+        assert!(!execution.appended.is_empty(), "capture omitted SGD");
+        assert!(execution.appended.iter().all(|dispatch| {
+            dispatch.implementation_key == "SgdUpdate:scalar" && dispatch.logical_tasks > 0
+        }));
+    } else {
+        assert!(execution.appended.is_empty());
+    }
     let record = serde_json::json!({
         "adapter": adapter,
-        "phase": phase, "work": "graph only; optimizer disabled",
+        "phase": phase,
+        "work": if phase == "step" { "forward/backward/SGD; zero learning rate for stable replay" }
+                else { "graph only; optimizer disabled" },
+        "optimizer_learning_rate": (phase == "step").then_some(0.0),
         "normal_samples_ms": samples, "profile": profile,
         "capture_seconds": capture_seconds, "capture_samples_ms": capture_samples,
-        "execution": session.execution_report(),
+        "execution": execution,
         "implementation_keys": session.dispatch_implementation_keys(),
         "state_layout": requests.iter().map(|entry| (&entry.0, entry.2)).collect::<Vec<_>>(),
         "state_encoding": "little-endian f32: scalar loss, then state_layout tensors",
@@ -256,7 +273,7 @@ fn main() {
             "--profile" => profile = true,
             "--profile-json" => profile_json = Some(args.next().expect("--profile-json prefix")),
             "--capture-phase" => {
-                capture_phase = Some(args.next().expect("--capture-phase forward|backward"))
+                capture_phase = Some(args.next().expect("--capture-phase forward|backward|step"))
             }
             "--capture-seconds" => {
                 capture_seconds = args
@@ -403,10 +420,10 @@ fn main() {
             assert!(capture_seconds > 0);
             let session = match phase.as_str() {
                 "forward" => &mut infer_session,
-                "backward" => &mut train_session,
-                _ => panic!("--capture-phase must be forward or backward"),
+                "backward" | "step" => &mut train_session,
+                _ => panic!("--capture-phase must be forward, backward or step"),
             };
-            profile_graph_session(
+            profile_session(
                 session,
                 &prefix,
                 &phase,
@@ -416,7 +433,7 @@ fn main() {
                 prepare,
             );
         } else {
-            profile_graph_session(
+            profile_session(
                 &mut infer_session,
                 &prefix,
                 "forward",
@@ -425,7 +442,7 @@ fn main() {
                 0,
                 prepare,
             );
-            profile_graph_session(
+            profile_session(
                 &mut train_session,
                 &prefix,
                 "backward",
