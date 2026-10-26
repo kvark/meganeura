@@ -206,10 +206,16 @@ the descriptor-reference repair requires fresh measurements.
   selected graph/optimizer arithmetic and one persistent compute dispatch.
   Local traffic remains zero; barrier waiting is 51.77% of active warp cycles,
   while no-instruction waiting is below 1%.
+- [x] Test flat concurrent packing across grid-axis boundaries with partial
+  final claims and unchanged barrier admission. Two parser and seven GPU tests
+  pass, including ragged matrix grids and 1/3/64/4096 workers. Eighty candidate
+  and fresh-control comparisons show no timing improvement. Metadata disproves
+  the proposed utilization benefit for SmolVLA: all sixteen eligible cooperative
+  nodes already pack four tiles along their 128-wide axis. Revert the probe.
 - [ ] Investigate the remaining scheduling/integer cost after output-array
   removal. Complete-step replay still executes about 1.84 times as many warp
-  instructions as ordinary execution. First assess packing across grid-axis
-  boundaries with a partial final batch and qualified barrier control.
+  instructions as ordinary execution. Attribute the cost to the selected scalar
+  handlers and queue work before changing packing or synchronization again.
   Finer dependencies require proofs for payload ranges,
   allocation reuse, original tile coordinates and completion aggregation.
   Retain both model phases and all CI gates; baseline parity remains open.

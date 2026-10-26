@@ -1709,9 +1709,46 @@ qualification still applies. All jobs use the verified bounded cgroups and GPU
 serialization described above. Captures, tooling source patches, binaries,
 host/variant probes and 236 independently verified artifact hashes are indexed by
 `target/megakernel-results/step-sdk/summary.json`. The independent hash-audit log is
-`target/step-sdk-artifact-audit.log`. The next experiment is to assess whether
-packing logical tiles across grid-axis boundaries can reduce idle lanes while
-preserving partial-batch completion, isolated scratch and barrier uniformity.
+`target/step-sdk-artifact-audit.log`.
+
+## Flat packing probe
+
+A subsequent prototype packs consecutive linear tile indices across grid-axis
+boundaries, allowing a partial final claim. The existing lane masks suppress
+inactive groups' writes/products, scratch remains separate, and inactive groups
+clamp reads to the last valid tile. The generic queue already clamps final-batch
+completion. Barrier admission still applies the scope-aware checker to every
+original barrier, rejecting divergent control before trying existing axis packing.
+No queue, fence or submission protocol changes are involved.
+
+Both parser checks and all seven whole-graph GPU tests pass. The existing packed
+matrix fixture includes 130- and 258-tile grids with partial four-tile batches,
+1/3/64/4096 workers, changed inputs, exact outputs and checked completion counts.
+Twenty alternating pairs per model phase, followed by twenty pairs of the
+preserved current binary, give:
+
+| Case | Flat ordinary / persistent ms | Current ordinary / persistent ms | Flat / current paired ratios |
+|---|---:|---:|---:|
+| SmolVLA forward | 4.248 / 6.378 | 3.980 / 6.023 | 1.542 / 1.448 |
+| SmolVLA forward/backward/SGD | 14.948 / 19.544 | 14.893 / 19.367 | 1.317 / 1.302 |
+
+All eighty normal comparisons preserve selected arithmetic, one persistent
+dispatch, no fallback and the previous state-error bound. Two separate metadata
+diagnostics reveal that all sixteen eligible cooperative nodes have grid
+`[2, 128, 1]`. They already pack four tiles along the 128-wide axis in the retained
+shader. Flat packing changes tile grouping without increasing the number of
+useful subgroups per worker; the suspected divisibility limitation is absent in
+this model. The experiment does not establish a timing improvement and is fully
+reverted, including its temporary metadata dump. The restored benchmark binaries
+are rebuilt from the retained source.
+
+These are exploratory comparisons with all outliers retained; diagnostic timings
+are excluded, and the rejected candidate does not receive the full oracle gate.
+Source patch, proof, binaries, test logs, raw samples and metadata are preserved
+in `target/flat-packing-probe/`, indexed by
+`target/megakernel-results/flat-packing/summary.json`. Every build, test, timing and
+analysis job uses a verified separate bounded cgroup, and GPU jobs run serially.
+The runtime remains `5dbabed`, with the primary qualification and parity gap above.
 
 ## Earlier artifact identities
 
