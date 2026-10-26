@@ -1640,6 +1640,157 @@ fn session_whole_graph_packed_matrix_tiles_preserve_scratch() {
     }
 }
 
+#[test]
+fn session_whole_graph_packed_attention_heads_preserve_scratch() {
+    use meganeura::graph::Op;
+    use meganeura::kernels::attention_grad::Path;
+    let gpu = crate::support::gpu::gpu();
+    if !gpu.capabilities().device_memory_fence || !gpu.capabilities().binding_array {
+        return;
+    }
+    let mut graph = meganeura::Graph::new();
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    let mut lengths = Vec::new();
+    // Both rowwise handlers are shared by nodes with different per-claim
+    // widths. Include three active groups, the inactive fourth group, and
+    // smaller head counts using the same pooled scratch banks.
+    for (index, (heads, kv_heads, dim)) in [
+        (1, 1, 63),
+        (2, 1, 65),
+        (3, 3, 129),
+        (4, 2, 64),
+        (5, 5, 193),
+        (15, 3, 64),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rows = 7 + index % 3;
+        let is_cross = index % 3 == 1;
+        let kv_rows = rows + if is_cross { 2 } else { 0 };
+        let q_shape = [rows, (heads * dim) as usize];
+        let kv_shape = [kv_rows, (kv_heads * dim) as usize];
+        let mut nodes = Vec::new();
+        for (name, shape) in [
+            ("q", q_shape),
+            ("k", kv_shape),
+            ("v", kv_shape),
+            ("do", q_shape),
+        ] {
+            let name = format!("{name}_{index}");
+            nodes.push(graph.input(&name, &shape));
+            inputs.push((name, shape.into_iter().product::<usize>()));
+        }
+        let [q, k, v, d_out] = nodes.try_into().unwrap();
+        let fwd_node = match index % 3 {
+            0 => graph.causal_attention(q, k, v, heads, kv_heads, dim),
+            1 => graph.multi_head_attn(q, k, v, heads, kv_heads, dim, true),
+            _ => graph.sliding_window_attention(q, k, v, heads, kv_heads, dim, 3),
+        };
+        outputs.push(fwd_node);
+        lengths.push(q_shape.into_iter().product());
+        for (op, original) in [
+            (
+                Op::MultiHeadAttnGradQ {
+                    fwd_node,
+                    num_heads: heads,
+                    num_kv_heads: kv_heads,
+                    head_dim: dim,
+                    is_cross,
+                },
+                q,
+            ),
+            (
+                Op::MultiHeadAttnGradK {
+                    fwd_node,
+                    num_heads: heads,
+                    num_kv_heads: kv_heads,
+                    head_dim: dim,
+                    is_cross,
+                },
+                k,
+            ),
+            (
+                Op::MultiHeadAttnGradV {
+                    fwd_node,
+                    num_heads: heads,
+                    num_kv_heads: kv_heads,
+                    head_dim: dim,
+                    is_cross,
+                },
+                v,
+            ),
+        ] {
+            let ty = graph.node(original).ty.clone();
+            lengths.push(
+                if original == q { q_shape } else { kv_shape }
+                    .into_iter()
+                    .product(),
+            );
+            outputs.push(graph.add_raw_node(op, vec![d_out, q, k, v], ty));
+        }
+    }
+    graph.set_outputs(outputs);
+    let plan = meganeura::compile::compile_with(
+        &graph,
+        &meganeura::CompileOptions {
+            fuse_dispatches: false,
+            prefer_attention_grad: Some(Path::Rowwise),
+            ..Default::default()
+        },
+    );
+    let options = meganeura::SessionOptions {
+        persistent: None,
+        coop: meganeura::CoopPolicy::Disabled,
+        poison: true,
+        ..meganeura::SessionOptions::from_env()
+    };
+    let mut ordinary =
+        meganeura::Session::with_context_opts(plan.clone(), gpu.clone(), options.clone());
+    for workers in [1, 3, 64, 4096] {
+        let mut packed = meganeura::Session::with_context_opts(
+            plan.clone(),
+            gpu.clone(),
+            meganeura::SessionOptions {
+                persistent: Some(meganeura::PersistentOptions {
+                    workers,
+                    device_scheduling: true,
+                    whole_graph: true,
+                    allow_fallback: false,
+                    track_workers: true,
+                }),
+                ..options.clone()
+            },
+        );
+        assert_eq!(packed.execution_report().compute_dispatches, 1);
+        for replay in 0..3 {
+            for (name, len) in &inputs {
+                let values = (0..*len)
+                    .map(|i| ((i * 17 + replay * 23 + name.len()) % 61) as f32 / 32.0 - 1.0)
+                    .collect::<Vec<_>>();
+                ordinary.set_input(name, &values);
+                packed.set_input(name, &values);
+            }
+            for session in [&mut ordinary, &mut packed] {
+                session.step();
+                session.wait();
+            }
+            check_worker_tasks(&mut packed);
+            for (index, &len) in lengths.iter().enumerate() {
+                let mut expected = vec![f32::NAN; len];
+                let mut actual = expected.clone();
+                ordinary.read_output_by_index(index, &mut expected);
+                packed.read_output_by_index(index, &mut actual);
+                assert_eq!(
+                    actual, expected,
+                    "workers={workers}, replay={replay}, output={index}"
+                );
+            }
+        }
+    }
+}
+
 fn check_selected_kernels(whole_graph: bool) {
     let gpu = crate::support::gpu::gpu();
     if whole_graph && !gpu.capabilities().binding_array {

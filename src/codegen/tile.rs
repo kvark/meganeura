@@ -500,6 +500,47 @@ fn emit(block: &mut Block, first: Handle<Expression>, last: Handle<Expression>) 
     );
 }
 
+fn omit_argument_emits(block: &mut Block, expressions: &naga::Arena<Expression>) {
+    let mut output = Block::new();
+    for (mut statement, span) in std::mem::take(block).span_into_iter() {
+        match statement {
+            Statement::Emit(ref range) => {
+                for value in range.clone() {
+                    if !matches!(expressions[value], Expression::FunctionArgument(_)) {
+                        emit(&mut output, value, value);
+                    }
+                }
+                continue;
+            }
+            Statement::Block(ref mut body) => omit_argument_emits(body, expressions),
+            Statement::If {
+                ref mut accept,
+                ref mut reject,
+                ..
+            } => {
+                omit_argument_emits(accept, expressions);
+                omit_argument_emits(reject, expressions);
+            }
+            Statement::Switch { ref mut cases, .. } => {
+                for case in cases {
+                    omit_argument_emits(&mut case.body, expressions);
+                }
+            }
+            Statement::Loop {
+                ref mut body,
+                ref mut continuing,
+                ..
+            } => {
+                omit_argument_emits(body, expressions);
+                omit_argument_emits(continuing, expressions);
+            }
+            _ => {}
+        }
+        output.push(statement, span);
+    }
+    *block = output;
+}
+
 /// Ordinary dispatches initialize shared storage once per workgroup. A reused
 /// worker must repeat that initialization for each logical tile, before its body.
 fn reset_scratch(
@@ -745,9 +786,13 @@ pub(crate) fn from_module(source: &str, entry_point: &str) -> Result<Tile, Strin
     let mut subgroups = false;
     let mut arguments = Vec::new();
     let mut function = entry.function;
-    for argument in &mut function.arguments {
+    let mut workgroup_argument = None;
+    for (index, argument) in function.arguments.iter_mut().enumerate() {
         let value = match argument.binding.take() {
-            Some(Binding::BuiltIn(BuiltIn::WorkGroupId)) => "logical".into(),
+            Some(Binding::BuiltIn(BuiltIn::WorkGroupId)) => {
+                workgroup_argument = Some(index as u32);
+                "logical".into()
+            }
             Some(Binding::BuiltIn(BuiltIn::LocalInvocationId)) => "lid".into(),
             Some(Binding::BuiltIn(BuiltIn::LocalInvocationIndex)) => "lane".into(),
             Some(Binding::BuiltIn(BuiltIn::GlobalInvocationId)) => {
@@ -768,6 +813,49 @@ pub(crate) fn from_module(source: &str, entry_point: &str) -> Result<Tile, Strin
             _ => return Err("tile entry arguments must be direct compute builtins".into()),
         };
         arguments.push(value);
+    }
+    if let Some(argument) = workgroup_argument
+        && !subgroups
+        && !module
+            .types
+            .iter()
+            .any(|(_, ty)| matches!(ty.inner, TypeInner::CooperativeMatrix { .. }))
+    {
+        let scalar = module.types.insert(
+            Type {
+                name: None,
+                inner: TypeInner::Scalar(Scalar::U32),
+            },
+            Span::UNDEFINED,
+        );
+        let first = function.arguments.len() as u32;
+        for axis in ["x", "y", "z"] {
+            function.arguments.push(FunctionArgument {
+                name: Some(format!("{PREFIX}workgroup_{axis}")),
+                ty: scalar,
+                binding: None,
+            });
+            arguments.push(format!("logical.{axis}"));
+        }
+        // Separate coordinate arguments let barrier analysis distinguish
+        // query-dependent loops from independent heads in the same worker.
+        // Whole-vector uses retain their conservative dependency on all axes.
+        let components = function
+            .expressions
+            .iter()
+            .filter_map(|(handle, expression)| match *expression {
+                Expression::AccessIndex { base, index }
+                    if matches!(function.expressions[base], Expression::FunctionArgument(i) if i == argument) =>
+                {
+                    Some((handle, index))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (handle, component) in components {
+            function.expressions[handle] = Expression::FunctionArgument(first + component);
+        }
+        omit_argument_emits(&mut function.body, &function.expressions);
     }
     let (shared_bytes, shared_aligned) =
         reset_scratch(&mut module, &mut function, geometry.into_iter().product())?;

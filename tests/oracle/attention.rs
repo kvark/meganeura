@@ -352,6 +352,10 @@ fn every_backward_path_against_the_reference() {
     let shapes = [
         (Kind::Causal, shape(1, 1, 2, 1, 64)),
         (Kind::Causal, shape(17, 17, 2, 2, 16)),
+        (Kind::Causal, shape(7, 7, 15, 3, 63)),
+        (Kind::Mha { cross: true }, shape(7, 9, 6, 3, 65)),
+        (Kind::Window(3), shape(9, 9, 3, 3, 129)),
+        (Kind::Causal, shape(7, 7, 5, 5, 193)),
         (Kind::Window(17), shape(33, 33, 2, 1, 256)),
         (Kind::Mha { cross: true }, shape(20, 9, 2, 1, 48)),
         (Kind::Causal, shape(130, 130, 2, 1, 64)),

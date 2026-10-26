@@ -24,20 +24,24 @@ pub(crate) struct Kernel {
     pub batch_size: u32,
 }
 
-fn packing_width(maximum: u32, extent: u32) -> u32 {
+fn packing_width(maximum: u32, extent: u32, subgroups: bool) -> u32 {
     if extent == 0 {
         return 1;
     }
-    [4, 2, 1]
+    [4, 3, 2, 1]
         .into_iter()
-        .find(|&width| width <= maximum && extent.is_multiple_of(width))
+        .find(|&width| {
+            width <= maximum && (width != 3 || !subgroups) && extent.is_multiple_of(width)
+        })
         .unwrap()
 }
 
 impl Kernel {
     pub fn tiles_per_claim(&self, grid: [u32; 3]) -> u32 {
         match self.batch_axis {
-            Some(axis) if !grid.contains(&0) => packing_width(self.batch_size, grid[axis]),
+            Some(axis) if !grid.contains(&0) => {
+                packing_width(self.batch_size, grid[axis], self.subgroups)
+            }
             None if !grid.contains(&0) => self.batch_size,
             _ => 1,
         }
@@ -105,6 +109,7 @@ impl Builder {
         {
             return self.add_inner(body, layout, index, None, 4);
         }
+        let subgroups = body.subgroups || body.cooperative.is_some();
         let batch_size = self.batch_limit.min(self.threads / logical_threads);
         if batch_size > 1 {
             let mut axes = [0, 1, 2];
@@ -113,14 +118,16 @@ impl Builder {
                     let count = grid
                         .iter()
                         .fold(1u64, |count, &n| count.saturating_mul(u64::from(n)));
-                    cost.saturating_add(count / u64::from(packing_width(batch_size, grid[axis])))
+                    cost.saturating_add(
+                        count / u64::from(packing_width(batch_size, grid[axis], subgroups)),
+                    )
                 })
             });
             for axis in axes {
                 let batch_size = grids
                     .iter()
                     .filter(|grid| !grid.contains(&0))
-                    .map(|grid| packing_width(batch_size, grid[axis]))
+                    .map(|grid| packing_width(batch_size, grid[axis], subgroups))
                     .max()
                     .unwrap_or(if grids.is_empty() { batch_size } else { 1 });
                 if batch_size == 1 {
@@ -482,6 +489,9 @@ impl Builder {
                 "$CALL",
                 &body
                     .call
+                    .replace("logical.x", &format!("({})", logical[0]))
+                    .replace("logical.y", &format!("({})", logical[1]))
+                    .replace("logical.z", &format!("({})", logical[2]))
                     .replace("$PREFIXactive_lane", "graph_active_lane")
                     .replace("$PREFIXtile_group", "graph_tile_group")
                     .replace("$PREFIX", &prefix),
@@ -735,6 +745,56 @@ mod tests {
             .unwrap();
         assert_eq!(kernel.batch_axis, None);
         assert_eq!(kernel.batch_size, 1);
+    }
+
+    #[test]
+    fn scalar_attention_packs_heads_with_uniform_barrier_loops() {
+        for (part, source) in [
+            (
+                crate::kernels::attention_grad::Part::Q,
+                include_str!("../shaders/mha_grad_q.wgsl"),
+            ),
+            (
+                crate::kernels::attention_grad::Part::KV,
+                include_str!("../shaders/mha_grad_kv.wgsl"),
+            ),
+        ] {
+            let body = tile::from_module(source, "main").unwrap();
+            let layout =
+                crate::runtime::shader_data_layout(&crate::compile::ShaderEntry::AttentionGrad(
+                    crate::kernels::attention_grad::AttentionGrad {
+                        part,
+                        path: crate::kernels::attention_grad::Path::Rowwise,
+                    },
+                ));
+            let mut builder = Builder::new(256);
+            let kernel = builder
+                .add(body.clone(), &layout, 0, &[[4, 1, 1]], false)
+                .unwrap();
+            assert_eq!(kernel.batch_axis, None);
+            let kernel = builder
+                .add(body.clone(), &layout, 1, &[[7, 15, 1], [9, 6, 1]], false)
+                .unwrap();
+            assert_eq!(kernel.batch_axis, Some(1));
+            assert_eq!(kernel.batch_size, 3);
+            for (heads, packed) in [(1, 1), (2, 2), (3, 3), (4, 2), (5, 1), (6, 3), (15, 3)] {
+                assert_eq!(kernel.tiles_per_claim([7, heads, 1]), packed);
+            }
+            let kernel = builder
+                .add(
+                    body,
+                    &layout,
+                    2,
+                    &[[7, 15, 1], [9, 4, 1], [11, 2, 1], [13, 1, 1]],
+                    false,
+                )
+                .unwrap();
+            assert_eq!(kernel.batch_axis, Some(1));
+            assert_eq!(kernel.batch_size, 4);
+            for (heads, packed) in [(1, 1), (2, 2), (3, 3), (4, 4), (5, 1), (6, 3), (15, 3)] {
+                assert_eq!(kernel.tiles_per_claim([7, heads, 1]), packed);
+            }
+        }
     }
 
     #[test]

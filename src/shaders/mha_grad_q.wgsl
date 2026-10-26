@@ -59,7 +59,8 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let num_kv_heads = params.packed_heads & 0xFFFFu;
     let head_dim = params.head_dim;
 
-    if pos >= q_seq || head >= num_heads { return; }
+    // Dispatch Y is exactly num_heads; there are no padded head groups.
+    if pos >= q_seq { return; }
 
     let kv_head = head / (num_heads / num_kv_heads);
     let kv_head_off = kv_head * head_dim;
