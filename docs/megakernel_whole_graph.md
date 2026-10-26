@@ -8,8 +8,8 @@ nodes in the same dispatch. The transfer reset and compute dispatch share one
 queue submission. Initial parameter/moment allocation and explicit optimizer
 calls remain separate operations outside that step boundary.
 
-The latest qualified runtime is `12f7c5a`; its
-[horizontal geometry fix and fresh measurements](#correct-horizontal-matmul-geometry)
+The latest qualified runtime is `bed8c91`; its
+[narrow scalar tiles and fresh measurements](#narrow-scalar-tiles)
 are recorded below. Performance parity remains unmet.
 
 For the application benchmarks, use `--whole-graph --workers 256`. For a regular
@@ -140,7 +140,7 @@ attribute time to its internal nodes.
 
 ## Qualification and measurements
 
-The [descriptor repair measurements](#descriptor-identity-repair-current-measurements)
+The [narrow scalar tile measurements](#narrow-scalar-tiles)
 are the current qualification record. Measurements before `ed81459` below are
 historical hardware observations: they predate the descriptor-reference repair
 and do not establish its memory-model contract.
@@ -1914,11 +1914,147 @@ measurements and **324 independently verified artifact hashes** are indexed by
 `target/megakernel-results/noinline-probes/summary.json`. The independent audit
 log is `target/noinline-probes-artifact-audit.log`.
 
-The next source-level experiment will test a shared scalar body for horizontal
+The next source-level experiment tested a shared scalar body for horizontal
 matrix slices, selecting buffer views uniformly before entering the K loop.
-It must preserve geometry, offsets, alias semantics and output mapping and pass
-the same resource, local-traffic and completed-step checks. Baseline parity
-remains open.
+Its result and the subsequent tile selection are recorded below. Baseline
+parity remains open.
+
+## Narrow scalar tiles
+
+Runtime `bed8c9196c7821aa2989199f71db5473901dac62` selects existing 32×16 scalar
+tiles for unpinned F32 fused matmul/add products with M≤64, N≤1024 and K≥1024,
+when the remaining choice is SmallTile without an epilogue. Selection runs
+**after split-K planning**, so the existing split kernels and reduction nodes
+remain authoritative. It preserves the configured K stage and column mapping;
+an illegal shape retains SmallTile. Explicit schedules are unchanged. Both
+ordinary and persistent execution use this common selection and retain each
+output's original K accumulation order and addend.
+
+Exactly sixteen nodes in each model phase change from 46 to 90 logical tiles,
+adding 704 graph tiles. Other implementation keys and appended optimizer tasks
+are unchanged. Worker count, queue protocol, canonical descriptors, payload
+fences and the single dispatch/submission boundary are unchanged. The production
+Naga and Blade pins are unchanged; there are no local dependency overrides.
+
+### Candidate comparison
+
+The preceding horizontal-body experiment uniformly selected B/C buffer views
+and offsets before calling one shared scalar body. Source audits confirm one
+such body in forward and two in training. Two focused GPU tests cover three
+siblings, both 32/64 geometries, tails and changed inputs; all seven whole-graph
+smoke tests pass. Eighty candidate/control comparisons show no timing benefit:
+persistent forward/training medians are 6.072/19.457 ms versus 6.088/19.245 ms
+control. Code size falls to 96,768/233,728 bytes, but that does not justify
+retaining the rewrite. It is reverted; no full oracle or SDK qualification is
+claimed for it.
+
+Three scalar shapes were then tested with the same eligible fused products:
+
+| Rows × columns | Tiles per changed node | Persistent forward / training ms | Observation |
+|---|---:|---:|---|
+| 16×32 | 92 | 5.904 / 19.257 | Repeat improves persistent timing, but ordinary forward is 2.3% slower than its fresh control |
+| 16×16 | 180 | 6.010 / 19.511 | Twenty-pair exploration does not justify a repeat |
+| 32×16 | 90 | 5.943 / 18.915 | Fifty-pair repeat supports lower training latency without an established ordinary regression |
+
+The 32×16 repeat's fresh persistent control is 5.982/19.546 ms. Its candidate /
+control median ratio is 0.993 forward (95% bootstrap interval 0.969–1.019) and
+0.968 training (0.936–0.987). These are exploratory results, separate from the
+clean-runtime primary measurements below. Temporary selectors hard-coded the
+default tuning knobs; integration fixes that limitation and preserves the
+original split-K policy. Every temporary source rewrite is reverted.
+
+All tile candidates pass their focused exact-output fixture and the existing
+whole-graph checks. Each has separate resource diagnostics. The first 16×16
+diagnostic failed before execution because its ICD path was mistyped; that log
+and empty result remain alongside the successful corrected capture. Separate
+single-group complete-step SDK checks for 16×32 and 32×16 preserve the prior
+state hash within each backend and measure zero local traffic. Instrumented
+timings are excluded from the normal timing gate.
+
+### Qualification and primary measurements
+
+The integrated source passes **666 library tests** (eight ignored), **168 strict
+whole-graph oracle tests**, **50 matrix regression tests**, and **eight whole-graph
+tests**, plus formatting and strict all-target/all-feature Clippy. The new
+selection test covers K-stage 8 fallback, stage 16 with interleaving, stage 32,
+an explicit SmallTile schedule and K=8192's original split-K/reduction sequence.
+The new GPU fixture compares exact signed dyadic CPU results for 35×65×1031
+with an addend, changed inputs, ordinary execution and 1/3/256 workers. It checks
+selected geometry, complete worker counts and one persistent compute dispatch.
+
+Clean-runtime binaries then run fifty alternating pairs per case with 256
+workers, ten warmups and one second of additional warmup. All **250 primary
+comparisons** pass the unchanged full-state budget, matching ordinary/persistent
+implementation keys and one persistent compute dispatch without fallback.
+The maximum training difference remains 4.66e-9. All samples and outliers are
+retained. Times are completed-step wall medians; ratios are medians of paired
+ratios and therefore need not equal the ratio of the time columns.
+
+| Case | Ordinary ms | Persistent ms | Paired ratio | 95% bootstrap interval |
+|---|---:|---:|---:|---:|
+| CI inference | 0.052125 | 0.071101 | 1.363 | 1.355–1.379 |
+| CI forward/backward | 0.066411 | 0.102471 | 1.537 | 1.526–1.557 |
+| CI forward/backward/SGD | 0.067991 | 0.100801 | 1.490 | 1.478–1.508 |
+| SmolVLA forward | 4.134971 | 5.853895 | 1.471 | 1.395–1.475 |
+| SmolVLA forward/backward/SGD | 15.088333 | 19.131577 | 1.276 | 1.254–1.388 |
+
+A fresh old-runtime binary control adds fifty pairs per model phase. Persistent
+control medians are 6.096263/19.459284 ms, giving candidate / control ratios of
+0.960 forward (0.930–1.002) and **0.983 training (0.971–0.993)**. Ordinary control
+medians are 4.256071/15.085087 ms; corresponding ratios are 0.972 (0.911–0.985)
+and 1.000 (0.971–1.096). Thus training's absolute improvement is about 1.7%,
+while forward and normalized paired comparisons remain inconclusive. The
+candidate / control ratios of paired medians are 1.030 (0.974–1.045) forward
+and 0.995 (0.929–1.078) training. Bootstrap intervals use 10,000 resamples and
+describe within-run sampling uncertainty, not between-run drift or other GPUs.
+**Baseline parity remains unmet; ordinary execution remains the default.**
+
+### Complete-step counter evidence
+
+Final resource diagnostics report 116/114 registers, 20,880/29,232 bytes of
+shared storage and 108,544/256,512 bytes of compiled code for forward/training.
+The six-group NVIDIA SDK capture uses complete graph plus zero-rate SGD replay,
+146 samples per group per backend, the matching RTX 5080 adapter, successful
+target/monitor exits and no SDK warnings. Receipts identify the clean runtime
+and preserved binaries. Repeated instruction rates vary by at most 0.245%
+across the five groups collecting that metric; elapsed-cycle rates vary by at
+most 0.357% across all six groups.
+
+The actual state files match the prior qualified SHA-256 within each backend:
+`f67022044ae8966ac48c5d62cd0907411fb42f4d1864c1ba0b3d555b17ce7be0`
+for ordinary and
+`1e359875fa92965d4b0aa9026c050702ae3ac165aa59c0a4cc74a6381589c3b7`
+for persistent. Within-backend replay is exact. All 246,883,105 floats pass the
+explicit benchmark comparison across backends with maximum error 4.66e-9;
+cross-backend state is not bitwise equal. Selected graph and optimizer work
+matches the normal nonzero-rate training case.
+
+Diagnostic replay medians are 12.003 ms ordinary and 17.058 ms persistent.
+Rate-times-duration estimates give **1.546 versus 2.825 billion warp
+instructions**, **2.346 versus 6.342 billion integer thread instructions** and
+**zero local load/store traffic** in both modes. Barrier waiting represents
+3.121% versus 50.165% of active warp cycles; memory-barrier waiting is 0% versus
+1.461%. These are counter shares, not elapsed-time attribution. They support
+continued investigation of synchronization and execution overhead but do not
+prove a specific stall's contribution to latency. Zero-rate SDK replay does
+not replace the normal completed-step performance gate.
+
+Every build, test, copy, capture and heavy analysis runs in a verified bounded
+cgroup; GPU jobs are serialized and all artifacts remain on local `/x` storage.
+The complete exploration and final qualification retain **950 normal paired
+comparisons**, **ten resource diagnostics**, proofs, patches, binaries, source/
+SPIR-V dumps, SDK receipts and state files. The manifest
+`target/megakernel-results/narrow-scalar-tiles/summary.json` indexes **637
+independently verified artifact hashes**; the independent audit log is
+`target/narrow-scalar-artifact-audit.log`.
+
+Next, test omitting per-tile scratch clearing only for scalar matrix bodies
+whose staging overwrites every shared location before reading it. Admission
+must prove tail/padding safety, K=0 behavior, lane participation and ordering
+across reused scratch. Keep initialization for unproven families and preserve
+all payload fences, selected geometry and arithmetic. Poison/replay tests,
+resource/local-traffic diagnostics and fresh completed-step controls must
+qualify any retained change.
 
 ## Earlier artifact identities
 

@@ -229,14 +229,28 @@ the descriptor-reference repair requires fresh measurements.
   same-backend state but expose substantial local traffic and more instructions.
   Revert both backend probes and the local dependency override; retain the
   original tests, production pins and rebuilt binaries.
-- [ ] Investigate the remaining scheduling/integer cost after output-array
-  removal. Complete-step replay still executes about 1.84 times as many warp
-  instructions as ordinary execution. Next, test sharing a scalar kernel body
-  across horizontal matrix slices by selecting their buffer views uniformly
-  before the K loop. Preserve each slice's geometry, descriptor/element offsets,
-  alias semantics, K order and output mapping. Check resource statistics, local
-  traffic and completed-step latency before retaining a change. The measured
-  no-instruction waiting does not establish a cache bottleneck.
+- [x] Share scalar bodies across horizontal slices by selecting buffer views
+  uniformly before the K loop. Preserve the selected geometry and arithmetic;
+  two focused GPU tests and eighty comparisons pass. Smaller compiled shaders
+  do not improve completed-step timing, so revert the probe.
+- [x] Compare 16×32, 16×16 and 32×16 scalar tiles for narrow fused products.
+  Reject 16×16 on timing and 16×32's ordinary forward regression. Integrate
+  32×16 selection after split-K planning, preserving tuning knobs and explicit
+  schedules. At `bed8c91`, 666 library, 168 strict oracle, 50 matrix regression
+  and eight whole-graph tests pass, followed by 250 primary comparisons.
+  Training improves from 19.459 to 19.132 ms against a fresh 100-comparison
+  old-binary control; the normalized interval still overlaps no change.
+  Six SDK groups per mode retain exact same-backend state and zero local traffic.
+  Preserve all 950 comparisons, ten resource diagnostics and rejected variants.
+- [ ] Investigate the remaining scheduling/integer cost. Complete-step replay
+  still executes about 1.83 times as many warp instructions as ordinary execution.
+  Next, test skipping per-tile scratch clearing only for scalar matrix bodies
+  proven to overwrite every shared location before reading it. Prove staging,
+  tail/padding accesses, zero-length K, lane participation and reuse ordering;
+  retain initialization for every unproven family. Preserve arithmetic, selected
+  geometry and payload fences. Check poison/replay correctness, resource and
+  local-traffic counters, then completed-step latency against a fresh control.
+  The measured no-instruction waiting does not establish a cache bottleneck.
   Finer dependencies require proofs for payload ranges,
   allocation reuse, original tile coordinates and completion aggregation.
   Retain both model phases and all CI gates; baseline parity remains open.
