@@ -2936,7 +2936,47 @@ fn gen_matmul_coop_stored(
             typed.map_or(crate::DType::F32, |(types, _)| types.a),
         )
     };
-    let (a_stage_0, a_stage_1) = if vec4_a {
+    let (a_stage_0, a_stage_1) = if prologue.is_some()
+        && variant == MatMulCoopVariant::Normal
+        && tile == 16
+        && !compensated
+        && b_format == WeightFormat::F32
+    {
+        let gen_prologue_a = |shared: &str, row_offset: &str| {
+            let store = store_a(shared, "flat", &format!("a_val{a_transform}"));
+            let zero = store_a(shared, "flat", "0.0");
+            let mut vector_stores = String::new();
+            for (offset, component) in ["x", "y", "z", "w"].iter().enumerate() {
+                vector_stores.push_str(&preprocess(
+                    template_section(
+                        include_str!("shaders/matmul_coop.wgsl"),
+                        "prologue_stage_component",
+                    ),
+                    &[
+                        ("$OFFSET", &offset.to_string()),
+                        ("$COMPONENT", component),
+                        ("$STORE", &store),
+                    ],
+                ));
+            }
+            preprocess(
+                template_section(
+                    include_str!("shaders/matmul_coop.wgsl"),
+                    "prologue_stage_vector",
+                ),
+                &[
+                    ("$ROW_OFFSET", row_offset),
+                    ("$VECTOR_STORES", &vector_stores),
+                    ("$STORE", &store),
+                    ("$ZERO", &zero),
+                ],
+            )
+        };
+        (
+            gen_prologue_a("shared_b0", "tile_row"),
+            gen_prologue_a("shared_b1", "tile_row + 16u"),
+        )
+    } else if vec4_a {
         // Normal/BT: A[M,K], load vec4 along K (consecutive in memory).
         //
         // The fast vec4 path packs 4 lanes as 4 consecutive K-elements for

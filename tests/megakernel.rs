@@ -1539,8 +1539,14 @@ fn session_whole_graph_packed_matrix_tiles_preserve_scratch() {
     {
         return;
     }
-    let (rows, inner) = (53, 720);
-    for cols in [2080, 4096, 4128] {
+    for (rows, inner, cols) in [
+        (53, 720, 2080),
+        (53, 720, 4096),
+        (53, 720, 4128),
+        (53, 717, 4096),
+        (53, 718, 4128),
+        (33, 719, 2080),
+    ] {
         let mut graph = meganeura::Graph::new();
         let input = graph.input("x", &[rows, inner]);
         let norm = graph.parameter("norm", &[inner]);

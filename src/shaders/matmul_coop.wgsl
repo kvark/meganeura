@@ -94,6 +94,38 @@ $ENTRY_SIGNATURE {
     $RESULT_SCATTER
 }
 
+// @section prologue_stage_vector
+{
+    let gr = $ROW_OFFSET + v4_row;
+    let tc4 = t + v4_col;
+    let shared_base = v4_row * 16u + v4_col;
+    if gr < m && tc4 <= k && k - tc4 >= 4u {
+        let base = gr * k + tc4;
+        let a_values = vec4<f32>(matrix_a[base], matrix_a[base + 1u],
+                                  matrix_a[base + 2u], matrix_a[base + 3u]);
+        $VECTOR_STORES
+    } else {
+        for (var e = 0u; e < 4u; e++) {
+            let tc = tc4 + e;
+            let flat = shared_base + e;
+            if gr < m && tc < k {
+                let a_val = matrix_a[gr * k + tc];
+                $STORE
+            } else {
+                $ZERO
+            }
+        }
+    }
+}
+
+// @section prologue_stage_component
+{
+    let tc = tc4 + $OFFSETu;
+    let flat = shared_base + $OFFSETu;
+    let a_val = a_values.$COMPONENT;
+    $STORE
+}
+
 // @section acc_zero
 var acc0 = $COOP_C();
 var acc1 = $COOP_C();
