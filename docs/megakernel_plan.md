@@ -484,6 +484,18 @@ the descriptor-reference repair requires fresh measurements.
   same-backend state. Retain `8a63a0a` after 669 library, 168 strict oracle,
   50 matrix and ten smoke tests, Clippy, formatting and Metal compilation.
   Preserve CI's bidirectional timing movement and the test-only binary bridge.
+- [x] Extend scalar packing to partial head batches while retaining subgroup
+  and cooperative divisor packing. Separate padded claim limits from logical
+  completion, clamp inactive coordinates/scratch and reject overflow. Emit
+  the completion variable only for graphs that need partial scalar batches.
+  Preserve 2,000 normal comparisons, twenty diagnostics and four SDK captures.
+  The refined primary/repeat improve absolute training by 4.08%/2.02%; the
+  repeat also improves its normalized comparison. CI/forward shader functions
+  and resources match the control and their timing intervals include no change.
+  Retain `2997a85` after 669 library, 168 strict oracle, 50 matrix and ten smoke
+  tests, attention references, Clippy, formatting and Metal compilation.
+  Preserve the initial CI SGD regression, exact training-shader SDK bridge,
+  recovered audit exit and corrected unordered-statistics audit.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
@@ -508,17 +520,18 @@ the descriptor-reference repair requires fresh measurements.
   Deprioritize small capacity-only reductions; per-node utilization and the
   separate costs of the changed cooperative body remain unmeasured.
   Component-count specialization does not establish a training gain. Scalar
-  head packing now runs three dQ heads per worker and improves absolute training
-  time by 4.68% in the repeat; the normalized interval still includes no change.
-  The five KV heads remain unpacked. Investigate partial scalar head batches
-  with valid inactive-lane coordinates, uniform loops, scratch isolation and
-  exact logical completion despite a padded claim space. Keep cooperative
-  packing unchanged and preserve explicit requested worker counts. Continue
-  investigating the forward gap; the repeat paired ratios remain 1.305/1.181.
+  head packing first improved absolute training by 4.68%. Partial scalar batches
+  now pack dQ and dKV in groups of four, including smaller tails, and improve
+  training by another 2.02% in the larger repeat. Padded claims preserve valid
+  coordinates, uniform loops, scratch isolation and exact logical completion.
+  Keep cooperative packing unchanged and preserve explicit requested worker
+  counts. Continue investigating the forward gap; the latest paired ratios
+  remain 1.302/1.133. CI and forward functions/resources match the control;
+  their latest timing intervals include no change.
   Investigate exact-order subgroup reduction separately if needed: dKV has
   eight workgroup barriers per query/head iteration. Preserve the reduction
   tree, masks, accumulation order and supported fallback in any such change.
-  Keep `d01534a` as control and all completed-step gates;
+  Keep `2997a85` as control and all completed-step gates;
   instruction or traffic savings alone are insufficient retention evidence.
   Preserve initialization, writer ownership, publication, independent B storage
   and every logical tile's arithmetic and completion accounting.

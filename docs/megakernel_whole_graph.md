@@ -8,14 +8,15 @@ nodes in the same dispatch. The transfer reset and compute dispatch share one
 queue submission. Initial parameter/moment allocation and explicit optimizer
 calls remain separate operations outside that step boundary.
 
-The current qualified runtime, `d01534a`, adds
-[32×16 native cooperative prologue tiles](#narrow-native-cooperative-prologue-tiles)
-to the retained contiguous staging, gradient dependencies, subgroup guards and
-transposed-matrix staging. The repeat and final sequences improve persistent
-forward by 5.9% and 6.4%; two other sequences are inconclusive. Ordinary also
-improves, so no reduction in the relative gap is established. Final paired
-ratios are 1.322× ordinary forward and 1.217× complete training. CI and training
-shaders remain unchanged. Performance parity remains unmet.
+The current qualified runtime, `2997a85`, adds
+[partial scalar head batches](#partial-scalar-head-batches) to the retained
+scalar head packing, narrow cooperative prologue tiles, contiguous staging,
+gradient dependencies, subgroup guards and transposed-matrix staging.
+The latest 1,000-comparison repeat improves complete persistent training by
+2.02%, from 17.266 to 16.917 ms; its normalized comparison also improves.
+CI and forward shader functions/resources remain unchanged and their timing
+intervals include no change. Final paired ratios are 1.302× ordinary forward
+and 1.133× complete training. Performance parity remains unmet.
 
 For model benchmarks, use `--whole-graph --workers 256`. The
 [current worker sweep](#worker-counts-and-deeper-scalar-staging) finds lower CI
@@ -53,9 +54,12 @@ element offsets are passed by value through its helpers.
 
 One physical workgroup is at least 256 invocations and must be a multiple of
 each selected logical workgroup. Eligible smaller tiles share the worker in
-groups of two or four, each with its original logical coordinates and separate
-scratch. The chosen grid axis minimizes queue claims and each claim width
-divides that axis, so claims cannot straddle its boundary. Inactive groups
+groups of up to four, each with its original logical coordinates and separate
+scratch. The chosen grid axis minimizes queue claims. Subgroup/cooperative
+handlers use divisor widths 4/2/1. Scalar handlers permit partial batches:
+the claim space pads each packed axis, while completion counts only valid
+logical tiles. Inactive scalar groups clamp both coordinates and scratch to a
+valid group. Claims cannot straddle the packed axis boundary. Inactive groups
 participate in every workgroup barrier but do not write shared/storage memory
 or execute cooperative products assigned to local accumulators. Other extra-lane
 calculations are still repeated. Subgroup handlers use virtual subgroup coordinates. A shader guard
@@ -78,7 +82,7 @@ Packing requires uniform barrier control across the physical workgroup. An
 admission-only module inserts workgroup-scope cooperative operations at barriers
 to apply the fork's scope-aware dependency analysis through helper calls and
 locals. These probes never appear in the runtime shader. Query-dependent causal
-attention loops fail this check and retain one tile per claim. Native workgroup
+attention rows fail this check; independent heads at one row can pass. Native workgroup
 broadcasts and switch-containing bodies also stay unpacked; the latter avoids
 relying on incomplete post-switch exit analysis. Failure to qualify packing
 retains the same handler inside the single graph dispatch.
@@ -4890,3 +4894,123 @@ packing fixed and measure both model phases and all CI cases. Exact-order
 subgroup reduction remains a separate experiment; the forward gap also remains
 open. Do not silently cap requested workers or infer parity from diagnostic
 counter reductions.
+
+## Partial scalar head batches
+
+Retain `2997a85` after full qualification and a larger completed-step repeat,
+using `8a63a0a` as the runtime control. Scalar packing selects up to four heads
+without requiring the width to divide the head count. Subgroup/cooperative
+handlers retain their divisor-based 4/2/1 selection. No shader file, runtime
+selector, environment hook, Naga interface or dependency revision is added.
+
+Each node separates its padded ticket limit from its original logical task
+count. The GPU metadata layout and queue allocation stay unchanged; a CPU
+vector stores the claim limits for completion validation. A scalar handler
+computes the valid head count for its ticket and uses that count for completion
+and worker statistics. Inactive groups clamp both their logical coordinates
+and scratch-bank index to a valid group, keeping barrier loops uniform without
+reading an uninitialized tail bank. Empty nodes retain one completion-only
+ticket and zero logical worker tasks. Checked padding and the existing worker
+overshoot bound reject counters that could overflow.
+
+The model's sixteen dQ nodes retain 12,000 logical tiles while successful claims
+fall from 4,000 to 3,200. Its dKV nodes retain 2,640 logical tiles while claims
+fall from 2,640 to 1,056. These are counts derived from the selected grids and
+batch widths, not hardware counter estimates. Reported graph tasks remain
+79,824. Implementation selection, GPU buffers, queue bytes, one compute
+dispatch, one submission and complete Session/SGD boundaries are preserved.
+
+The initial implementation kept a completion variable live across every handler,
+including graphs with no partial scalar batches. Its **500 normal comparisons**
+show training 17.044→16.587 ms, candidate/control **0.9732 [0.9553, 1.0102]**,
+but CI SGD regresses 2.27% with an interval above no change. This version is
+superseded. Code generation now emits that variable only when a graph has a
+scalar packed handler. All CI and model-forward shader functions and resource
+statistics then match the control. Their whole-source hashes can still differ
+because the metadata comment changes; native instruction bytes are unavailable.
+
+All ordinary shader files remain byte-identical. Cooperative handler functions,
+cases and pooled scratch declarations also remain byte-identical. The refined
+training shader is byte-identical to the initially profiled candidate, with the
+same pipeline identity and resource statistics. Training registers fall
+**103→98**, shared memory remains **29,232 bytes**, and code grows
+267,904→269,824 bytes. Forward remains 100 registers, 18,832 shared bytes and
+107,648 code bytes. No occupancy change is inferred from those counts.
+
+A refined **500-comparison primary** improves persistent training
+17.3165→16.6105 ms, ratio **0.9592 [0.9490, 0.9766]**. Its normalized ratio is
+0.9555 [0.9279, 1.0362], so that sequence does not establish a relative-gap
+improvement. A fresh **1,000-comparison repeat** uses the identical frozen
+binaries, fifty paired samples per case in each of two control and two candidate
+visits:
+
+| Case | Control ordinary / persistent ms | Candidate ordinary / persistent ms | Persistent candidate / control (95% interval) |
+|---|---:|---:|---:|
+| CI inference | 0.056596 / 0.069860 | 0.053250 / 0.070426 | 1.0081 (0.9449–1.0189) |
+| CI backward | 0.065166 / 0.093906 | 0.065310 / 0.094046 | 1.0015 (0.9957–1.0068) |
+| CI SGD | 0.066490 / 0.094551 | 0.067090 / 0.095040 | 1.0052 (0.9988–1.0115) |
+| Model forward | 3.851389 / 5.016856 | 3.843593 / 5.013291 | 0.9993 (0.9943–1.0055) |
+| Model training + SGD | 14.709211 / 17.266281 | 14.735774 / 16.917443 | 0.9798 (0.9733–0.9913) |
+
+The repeat establishes a **2.02% absolute persistent training improvement**.
+Its normalized ratio is **0.9681 [0.9496, 0.9890]**, with ordinary latency nearly
+unchanged, supporting a smaller relative gap in this sequence. Final paired
+persistent/ordinary ratios remain **1.3021 forward and 1.1328 training**; parity
+is unmet. Both candidate training visit medians are below both control visit
+medians. CI and forward timing intervals include no change in both refined
+sequences. Preserve the initial result and all visits; pooled bootstrap
+intervals do not account for all between-visit variation.
+
+Four complete-step SDK backend captures, sixteen metric groups and zero-rate
+SGD give persistent **15.1314→14.7050 ms (−2.82%)**; ordinary changes only +0.14%.
+Estimated persistent warp instructions fall **7.72%**, integer thread
+instructions **7.82%**, FP32 thread instructions **4.23%**, global-load sectors
+**7.72%**, and shared wavefronts **1.08%**. Persistent local traffic stays zero.
+Barrier waiting rises 51.39→53.00% of active warp cycles despite faster replay;
+this is not elapsed stall cost. Maximum metric-group clock and instruction-rate
+spreads are 0.393% and 1.827%. Rate-times-duration instruction estimates and the
+exact training-shader bridge support the explanation of less duplicated work
+and fewer claims, without replacing normal completed-step timing.
+
+Each actual SDK state has **246,883,105 floats**. Independent hashing confirms
+bitwise-identical control/candidate files within each backend, with the same
+ordinary/persistent hashes recorded for scalar head packing. Across backends,
+maximum error stays at 4.66e-9 under the unchanged budget; their states are not
+bitwise identical. All **2,000 normal and twenty diagnostic comparisons** pass
+arithmetic-selection, full-state, completion, one-dispatch and no-fallback gates.
+
+Qualification passes **669 library tests** (eight ignored), **168 strict oracle
+checks**, **50 matrix regressions**, **ten whole-graph smoke tests**, 22 attention
+references in each execution mode, formatting, strict Clippy and Metal-target
+compilation. The mixed-head fixture adds six and seven KV heads to cover tails
+of one, two and three heads. It preserves exact outputs across poisoned scratch,
+three replays, partial dimensions, causal/cross/window masks and 1/3/64/4096
+workers. The independent mapping audit covers 146,016 unique logical coordinates,
+68,224 successful claims and 126,880 safely clamped inactive coordinates, plus
+empty/overflow cases. Metal compilation is not Metal GPU qualification.
+
+After session recovery, no jobs remained live. The initial audit's completed
+artifacts survived without its shell exit; a separate verification run records
+an explicit successful exit. A later audit incorrectly compared an unordered
+pipeline-statistics list by position. Preserve that failure; comparison of the
+full normalized statistic multisets passes, without dropping any statistics.
+The source and capture audits, exact binary repeat and dependency checks pass.
+Blade graphics, macros and Naga remain at fde3a9f/c09c89f/bc7b70b; both fork
+checkouts stay clean and the lock is unchanged.
+
+Raw evidence is local under `target/scalar-head-tail/`,
+`target/scalar-head-tail-isolated/` and `target/scalar-head-tail-repeat/`.
+The manifest `target/megakernel-results/scalar-head-tail/summary.json` contains
+**843 independently verified artifact hashes**, **34 measurement scopes** and
+**66 recorded job scopes**; SHA-256
+`79028c78eea049775a38e4d7a88d79b2640a18153c4470bd95a8b8697eb6ec01`.
+Every heavy job uses a separate verified 16/20/1 GiB cgroup. GPU jobs serialize,
+and builds, copies and analyses do not overlap timing or SDK capture. All
+artifacts stay on local `/x`.
+
+Next, investigate exact-order subgroup reduction separately: the rowwise dKV
+loop still executes eight workgroup barriers per query/head iteration. Preserve
+the existing reduction tree, masks, accumulation order and a supported fallback;
+first prove the subgroup mapping and cross-subgroup publication requirements.
+Keep cooperative packing and explicit requested worker counts fixed. Continue
+measuring the forward gap and all CI cases against this qualified runtime.
