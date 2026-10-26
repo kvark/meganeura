@@ -5,14 +5,63 @@ use super::{
 };
 use crate::{
     codegen,
-    compile::{Dispatch, ExecutionPlan, ShaderEntry},
+    compile::{Dispatch, ExecutionPlan, Kernel, ShaderEntry, WeightFormat},
 };
 use blade_graphics as bg;
 use std::{
     collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
+    ops::Range,
     sync::{Arc, LazyLock, Mutex},
 };
+
+struct Access {
+    piece: bg::BufferPiece,
+    write: bool,
+    range: Range<u64>,
+}
+
+fn output_bytes(dispatch: &Dispatch, name: &str) -> Option<u64> {
+    if dispatch.pointwise_storage.bf16_output
+        || dispatch.pointwise_storage.bf16_inputs != 0
+        || dispatch.matmul_epilogue.is_some()
+        || dispatch.matmul_prologue.is_some()
+    {
+        return None;
+    }
+    match dispatch.shader {
+        ShaderEntry::MatMulAT
+            if matches!(
+                dispatch.kernel,
+                Kernel::Default | Kernel::SmallTile | Kernel::ScalarMatmul(_)
+            ) && dispatch.weight_format == WeightFormat::F32
+                && (name == "matrix_c"
+                    || name
+                        .strip_prefix("matrix_c")
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .is_some_and(|i| i < dispatch.horizontal_batch)) =>
+        {
+            // The scalar template guards row < M and col < N, stores
+            // C[row*N + col], and does not read C. Horizontal outputs each
+            // use this same extent; split-K and cooperative kernels stay out.
+            let (m, n, _) = dispatch.mnk()?;
+            u64::from(m).checked_mul(u64::from(n))?.checked_mul(4)
+        }
+        ShaderEntry::SumRows if dispatch.kernel == Kernel::Default && name == "dst" => {
+            // Both layouts guard col < N. Parallel rows additionally store
+            // at workgroup_id.y*N; serial rows store at col only.
+            let n = *dispatch.params.get(1)?;
+            let splits = if dispatch.params.get(2).copied().unwrap_or(0) == 0 {
+                dispatch.workgroups[1]
+            } else {
+                1
+            };
+            u64::from(n).checked_mul(u64::from(splits))?.checked_mul(4)
+        }
+        _ => None,
+    }
+    .filter(|&bytes| bytes != 0)
+}
 
 #[derive(Default)]
 pub(in crate::runtime) struct Bindings {
@@ -448,7 +497,7 @@ impl Graph {
         let mut parameters = Vec::new();
         let mut metadata = Vec::new();
         let mut buffers: Vec<bg::BufferPiece> = Vec::new();
-        let mut accesses: Vec<Vec<(bg::BufferPiece, bool)>> = Vec::new();
+        let mut accesses: Vec<Vec<Access>> = Vec::new();
         let mut ancestors: Vec<Vec<u64>> = Vec::new();
         let mut successors = vec![Vec::new(); nodes as usize];
         let mut tasks = Vec::new();
@@ -503,7 +552,17 @@ impl Graph {
                 words[2 * binding.slot + 1] =
                     u32::try_from(piece.offset / u64::from(binding.stride))
                         .map_err(|_| "graph buffer element offset exceeds u32")?;
-                node_accesses.push((piece, binding.write));
+                let range = (node < graph_nodes && binding.write && binding.stride == 4)
+                    .then(|| output_bytes(&plan.dispatches[node], layout.bindings[binding.slot].0))
+                    .flatten()
+                    .and_then(|bytes| piece.offset.checked_add(bytes))
+                    .filter(|&end| end <= piece.buffer.size())
+                    .map_or(0..piece.buffer.size(), |end| piece.offset..end);
+                node_accesses.push(Access {
+                    piece,
+                    write: binding.write,
+                    range,
+                });
             }
             if words.len() > self.builder.parameter_words {
                 return Err("node uniforms exceed shared parameter capacity".into());
@@ -516,12 +575,16 @@ impl Graph {
                 if ordered[prior / 64] & (1u64 << (prior % 64)) != 0 {
                     continue;
                 }
-                // Conservatively order the entire backing allocation. This covers
-                // lifetime reuse, tensor slices and optimizer chunks, including WAR/WAW.
-                if prior_accesses.iter().any(|&(a, aw)| {
-                    node_accesses
-                        .iter()
-                        .any(|&(b, bw)| a.buffer == b.buffer && (aw || bw))
+                // Unknown accesses cover the whole allocation. Proven output
+                // ranges can be disjoint; reuse and overlapping aliases still
+                // preserve every physical RAW/WAR/WAW relation.
+                if prior_accesses.iter().any(|a| {
+                    node_accesses.iter().any(|b| {
+                        a.piece.buffer == b.piece.buffer
+                            && (a.write || b.write)
+                            && a.range.start < b.range.end
+                            && b.range.start < a.range.end
+                    })
                 }) {
                     successors[prior].push(node as u32);
                     pending += 1;

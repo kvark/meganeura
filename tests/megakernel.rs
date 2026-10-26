@@ -1085,6 +1085,220 @@ fn session_whole_graph_lifetime_reuse() {
     check_lifetime_reuse(true);
 }
 
+#[test]
+fn session_whole_graph_gradient_write_ranges() {
+    let gpu = crate::support::gpu::gpu();
+    if !gpu.capabilities().device_memory_fence || !gpu.capabilities().binding_array {
+        return;
+    }
+    let (rows, inner, columns) = (17, 33, 65);
+    let mut graph = meganeura::Graph::new();
+    let x = graph.input("x", &[rows, inner]);
+    let target = graph.input("target", &[rows, columns]);
+    let mut losses = Vec::new();
+    for i in 0..3 {
+        let w = graph.parameter(&format!("w{i}"), &[inner, columns]);
+        let b = graph.parameter(&format!("b{i}"), &[columns]);
+        let product = graph.matmul(x, w);
+        let biased = graph.bias_add(product, b);
+        losses.push(graph.mse_loss(biased, target));
+    }
+    let sum = graph.add(losses[0], losses[1]);
+    let sum = graph.add(sum, losses[2]);
+    graph.set_outputs(vec![sum]);
+    for workers in [1, 3, 64, 4096] {
+        let mut sessions: Vec<_> = [false, true]
+            .into_iter()
+            .map(|persistent| {
+                let mut config = crate::support::gpu::config();
+                config.optimize.mode = meganeura::OptimizeMode::Off;
+                config.tune = false;
+                config.runtime.coop = meganeura::CoopPolicy::Disabled;
+                config.runtime.poison = true;
+                config.runtime.arena_chunk_bytes = Some(1 << 20);
+                config.runtime.persistent = persistent.then_some(meganeura::PersistentOptions {
+                    workers,
+                    device_scheduling: true,
+                    whole_graph: true,
+                    allow_fallback: false,
+                    track_workers: true,
+                });
+                let mut session = meganeura::build(&graph, config).0;
+                for i in 0..3 {
+                    session.set_parameter(
+                        &format!("w{i}"),
+                        &vec![(i + 1) as f32 / 64.0; inner * columns],
+                    );
+                    session.set_parameter(&format!("b{i}"), &vec![-0.125; columns]);
+                }
+                assert!(
+                    session
+                        .plan()
+                        .dispatches
+                        .iter()
+                        .any(|d| d.shader == meganeura::compile::ShaderEntry::MatMulAT)
+                );
+                assert!(
+                    session
+                        .plan()
+                        .dispatches
+                        .iter()
+                        .any(|d| d.shader == meganeura::compile::ShaderEntry::SumRows)
+                );
+                session
+            })
+            .collect();
+        assert_eq!(
+            sessions[0].dispatch_implementation_keys(),
+            sessions[1].dispatch_implementation_keys()
+        );
+        for replay in 0..3 {
+            for session in &mut sessions {
+                session.set_input(
+                    "x",
+                    &(0..rows * inner)
+                        .map(|i| ((i * 7 + replay * 13) % 31) as f32 / 64.0 - 0.25)
+                        .collect::<Vec<_>>(),
+                );
+                session.set_input("target", &vec![0.0625; rows * columns]);
+                if replay == 0 {
+                    session.set_learning_rate(0.01);
+                }
+                if replay == 1 {
+                    session.set_adam(0.001, 0.9, 0.99, 1e-8);
+                    session.set_grad_clip_norm(0.02);
+                }
+                if replay == 2 {
+                    let mut encoder =
+                        gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
+                            name: "gradient ranges external records",
+                            buffer_count: 1,
+                            manual_barriers: false,
+                        });
+                    encoder.start();
+                    session.record(&mut encoder).unwrap();
+                    session.record(&mut encoder).unwrap();
+                    let sync = gpu.submit(&mut encoder);
+                    session.track_submission(sync);
+                    session.wait();
+                    gpu.destroy_command_encoder(&mut encoder);
+                } else {
+                    session.step();
+                    session.wait();
+                }
+                check_worker_tasks(session);
+            }
+            assert_eq!(sessions[1].execution_report().compute_dispatches, 1);
+            for i in 0..3 {
+                for (name, len) in [
+                    (format!("w{i}"), inner * columns),
+                    (format!("b{i}"), columns),
+                ] {
+                    let mut a = vec![0.0; len];
+                    let mut b = a.clone();
+                    sessions[0].read_param(&name, &mut a);
+                    sessions[1].read_param(&name, &mut b);
+                    assert_eq!(a, b, "parameter {name}, workers={workers}, replay={replay}");
+                    sessions[0].read_param_grad(&name, &mut a);
+                    sessions[1].read_param_grad(&name, &mut b);
+                    assert_eq!(a, b, "gradient {name}, workers={workers}, replay={replay}");
+                }
+            }
+            assert_eq!(
+                sessions[0].read_adam_states(&["w0", "w1", "w2", "b0", "b1", "b2"]),
+                sessions[1].read_adam_states(&["w0", "w1", "w2", "b0", "b1", "b2"])
+            );
+        }
+    }
+
+    // Rebinding can make two bounded outputs overlap after the first frame.
+    // Keep WAW order and both consumers' RAW order when that happens.
+    let mut donor = meganeura::Graph::new();
+    let a = donor.parameter("a", &[33, 33]);
+    let b = donor.parameter("b", &[33, 33]);
+    donor.set_outputs(vec![a, b]);
+    let mut donor_plan = meganeura::compile::compile_with(&donor, &Default::default());
+    donor_plan.param_buffers[1].1 = donor_plan.param_buffers[0].1;
+    let mut donor_options = meganeura::SessionOptions::from_env();
+    donor_options.persistent = None;
+    let mut donor = meganeura::Session::with_context_opts(donor_plan, gpu.clone(), donor_options);
+    let mut graph = meganeura::Graph::new();
+    let a = graph.parameter("a", &[33, 33]);
+    let b = graph.parameter("b", &[33, 33]);
+    let x = graph.input("x", &[17, 33]);
+    let y = graph.input("y", &[17, 33]);
+    let ax = graph.matmul_at(x, x);
+    let by = graph.matmul_at(y, y);
+    let sa = graph.sum_inner(a);
+    let sb = graph.sum_inner(b);
+    graph.set_outputs(vec![ax, by, sa, sb]);
+    let mut plan = meganeura::compile::compile_with(
+        &graph,
+        &meganeura::CompileOptions {
+            fuse_dispatches: false,
+            ..Default::default()
+        },
+    );
+    for (output, name) in [(ax, "a"), (by, "b")] {
+        let old = plan.node_buffers[output as usize].1;
+        let new = plan.param_buffers.iter().find(|p| p.0 == name).unwrap().1;
+        plan.dispatches
+            .iter_mut()
+            .find(|d| d.output_buffer == old)
+            .unwrap()
+            .output_buffer = new;
+        for slot in &mut plan.output_buffers {
+            if *slot == old {
+                *slot = new;
+            }
+        }
+        plan.node_buffers[output as usize].1 = new;
+    }
+    // The original independent reductions may have been scheduled first.
+    // After redirecting the matrix outputs, make this fixture write then read.
+    plan.dispatches
+        .sort_by_key(|d| d.shader != meganeura::compile::ShaderEntry::MatMulAT);
+    for workers in [1, 3, 64, 4096] {
+        let mut options = meganeura::SessionOptions::from_env();
+        options.coop = meganeura::CoopPolicy::Disabled;
+        options.poison = true;
+        options.persistent = Some(meganeura::PersistentOptions {
+            workers,
+            device_scheduling: true,
+            whole_graph: true,
+            allow_fallback: false,
+            track_workers: true,
+        });
+        let mut session = meganeura::Session::with_context_opts(plan.clone(), gpu.clone(), options);
+        session.set_input("x", &vec![0.25; 17 * 33]);
+        session.set_input("y", &vec![-0.5; 17 * 33]);
+        for replay in 0..3 {
+            if replay == 1 {
+                session.share_parameter_from(&mut donor, "a").unwrap();
+                session.share_parameter_from(&mut donor, "b").unwrap();
+            }
+            session.step();
+            session.wait();
+            check_worker_tasks(&mut session);
+            assert_eq!(session.execution_report().compute_dispatches, 1);
+            let first = if replay == 0 { 1.0625 } else { 4.25 };
+            for (index, count, value) in [
+                (0, 33 * 33, first),
+                (1, 33 * 33, 4.25),
+                (2, 33, first * 33.0),
+                (3, 33, 4.25 * 33.0),
+            ] {
+                let mut output = vec![f32::NAN; count];
+                session.read_output_by_index(index, &mut output);
+                assert!(
+                    output.iter().all(|&v| v == value),
+                    "rebind workers={workers}, replay={replay}, output={index}"
+                );
+            }
+        }
+    }
+}
+
 fn check_lifetime_reuse(whole_graph: bool) {
     let gpu = crate::support::gpu::gpu();
     if whole_graph && !gpu.capabilities().binding_array {

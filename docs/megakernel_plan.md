@@ -340,13 +340,20 @@ the descriptor-reference repair requires fresh measurements.
   All 300 comparisons pass, but no useful gain is established. Preserve four
   resource records and 503 independently verified hashes; revert the prototype
   and restore exact qualified binaries and all eight smoke checks.
-- [ ] Test proven disjoint gradient-arena write ranges while retaining whole
-  operation completion and existing node counts. Start with selected matrix
-  products and row sums whose output bounds can be checked; keep unknown
-  accesses conservative. Reconstruct all physical RAW/WAR/WAW hazards, verify
-  padded extents and external rebinding, and compare against the same qualified
-  runtime before retaining any change. This targets the training opportunity
-  from the interval audit; the forward performance gap remains separate.
+- [x] Retain proved scalar gradient-output ranges with whole-operation completion
+  and unchanged node counts. Keep all reads and unsupported writes conservative;
+  reconstruct physical hazards and test parameter-sharing rebinding. A same-binary
+  control improves CI backward/SGD by 4.0/4.4%; final binaries improve them by
+  5.6/5.4% against fresh qualified controls. Neither comparison establishes a
+  model gain. Preserve 1,200 normal comparisons, 19 resource records, the fixture
+  setup failure and seven strict matrix admission failures reproduced on the
+  preceding runtime. All 666 library, 168 strict oracle, 50 original-mode matrix
+  and nine whole-graph smoke tests pass, as do formatting and strict Clippy.
+- [ ] Isolate the remaining model scheduling/instruction cost with controls that
+  preserve arithmetic and completed-step boundaries. The gradient-arena change
+  removes false ordering without closing the model gap; do not infer elapsed
+  cost from barrier-wait counters alone. Recheck both model phases and all CI
+  cases before retaining further changes.
   Keep the shared-state failure as a separate unresolved diagnostic.
   Retain both model phases and all CI gates; baseline parity remains open.
 

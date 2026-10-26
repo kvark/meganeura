@@ -148,7 +148,11 @@ The original regional queue below permits idle workers to retire. The optional
 the remaining-node count reaches zero; its bitmap contains ready nodes and each
 node has a tile-claim counter. It uses the same lane-level publication/visibility
 contract and orders physical allocation conflicts across every node, including
-optimizer phases. It does not add a global workgroup barrier.
+optimizer phases. The whole-graph planner narrows only proved write-only scalar
+matrix and row-sum outputs; reads and other writes still cover the whole backing
+allocation. Disjoint writes may overlap in execution, while reuse, overlapping
+aliases and all read/write hazards retain their ordering. Rebinding invalidates
+the cached dependency metadata. It does not add a global workgroup barrier.
 
 A worker searches the finite bitmap for any ready task. It never waits for a
 particular predecessor or slot. Session workers make at most 64 unsuccessful

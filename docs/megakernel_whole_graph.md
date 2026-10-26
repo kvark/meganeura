@@ -8,13 +8,12 @@ nodes in the same dispatch. The transfer reset and compute dispatch share one
 queue submission. Initial parameter/moment allocation and explicit optimizer
 calls remain separate operations outside that step boundary.
 
-The latest qualified runtime is `762faf2`; its
-[cooperative row distribution and fresh measurements](#cooperative-row-distribution)
-are recorded below. Subsequent [scheduler locality probes](#scheduler-locality-probes)
-and the [workgroup propagation probe](#workgroup-barrier-propagation) establish
-no useful model improvement and are reverted. The subsequent
-[subgroup-local row staging probe](#subgroup-local-cooperative-row-staging)
-also fails the performance gate. Performance parity remains unmet.
+The current runtime adds [bounded gradient writes](#bounded-gradient-write-dependencies)
+to the qualified cooperative row distribution at `762faf2`. Removing false
+ordering between independent bias and weight gradients improves CI training;
+the model gap remains. The intervening scheduler, workgroup-propagation,
+subgroup-staging and two-band release probes remain reverted. Performance parity
+remains unmet.
 
 For model benchmarks, use `--whole-graph --workers 256`. The
 [current worker sweep](#worker-counts-and-deeper-scalar-staging) finds lower CI
@@ -112,9 +111,11 @@ nodes use one control task to propagate dependencies and perform no arithmetic.
 
 Edges point forward in recording order. Conflicting reads/writes of the same
 backing allocation create RAW/WAR/WAW edges, covering arena slices and lifetime
-reuse. The initial implementation conservatively orders the entire allocation,
-which can serialize independent slices. Transitive dependency edges are omitted
-without changing reachability. Producer and consumer lanes use the existing
+reuse. Reads and unrecognized writes cover the entire allocation. Selected scalar
+`MatMulAT` and `SumRows` outputs use proved byte ranges, allowing disjoint writes
+without weakening physical read/write hazards. Rebinding rebuilds these ranges
+from the actual buffer pieces. Transitive dependency edges are omitted without
+changing reachability. Producer and consumer lanes use the existing
 [native fence protocol](megakernel_memory_contract.md). Naga combines writes
 across all declarations mapped to the same descriptor binding, preserving
 NonPrivatePointer accesses through typed aliases. Tile-boundary fences provide
@@ -2990,6 +2991,116 @@ Next, test proven disjoint gradient-arena writes without increasing node counts
 or changing whole-operation completion. That is a separate training hypothesis;
 the qualified runtime and primary results remain unchanged, and baseline parity
 is still unmet.
+
+## Bounded gradient-write dependencies
+
+The retained change narrows only proved write-only outputs when constructing
+physical dependency edges. Scalar float32 `MatMulAT` outputs cover `M*N*4` bytes,
+including each output of a horizontally packed dispatch. `SumRows` covers `N*4`
+bytes for its serial layout and `N*workgroups.y*4` for partial-row outputs. These
+templates guard their stores and never read the destination. Cooperative and
+split-K matrix kernels, fused prologues/epilogues and reduced-storage outputs are
+excluded. Checked arithmetic and allocation bounds fall back to the whole
+allocation when the extent cannot be proved.
+
+All reads, unrecognized writes and optimizer bindings remain whole-allocation.
+Consequently only disjoint WAW relationships disappear; physical RAW/WAR and
+overlapping WAW hazards retain their ordering. The planner reconstructs the full
+hazard relation before reducing edges. It changes no node count, original tile,
+parameter block, arithmetic, descriptor identity, shader, fence or completion
+protocol. Parameter sharing invalidates cached metadata and recomputes ranges
+from the rebound buffer pieces. Imported allocations remain rejected.
+
+Independent audits reconstruct exact output bounds, full hazard closure and its
+transitive reduction, initial claims, remaining counts, predecessor counts and
+ready bits. The CI training graph removes two ordered pairs: bias-gradient
+`SumRows` nodes 12 and 16 no longer precede independent weight-gradient
+`MatMulAT` nodes 14 and 17. Removing transitive ordering can increase the number
+of direct edges; edge count alone is not the scheduling opportunity.
+
+| Graph | Nodes | Whole-allocation edges | Bounded-write edges | Ordered pairs removed |
+|---|---:|---:|---:|---:|
+| CI inference | 5 | 4 | 4 | 0 |
+| CI backward | 18 | 19 | 20 | 2 |
+| CI backward/SGD | 19 | 20 | 22 | 2 |
+| Model forward | 154 | 161 | 161 | 0 |
+| Model backward/SGD | 527 | 706 | 698 | 6,597 |
+
+The model refines 99 matrix outputs and 37 row-sum outputs; CI refines three
+matrix outputs and two row sums. No forward access changes. All 19 CI and 43
+model generated shader files match their controls. Executable resource multisets
+also match, retaining 100/103 registers, 20,880/29,232 shared bytes and
+106,752/256,512 code bytes for model forward/training.
+
+An initial 200-comparison screen suggested a CI benefit but no model gain. To
+separate the dependency change from binary-layout effects, a temporary config
+switch then selects whole-allocation or bounded-write hazards in one executable.
+Whole / bounded / bounded / whole visits each contain 25 interleaved
+ordinary/persistent pairs per case: **500 comparisons**, or 50 pairs per policy
+and case. CI backward and SGD persistent latency improve **4.0% and 4.4%**.
+Their bounded/whole ratios are 0.960 [0.948, 0.963] and 0.956 [0.943, 0.969];
+normalizing by ordinary timing gives 0.947 [0.931, 0.963] and
+0.941 [0.928, 0.955]. Model forward/training show no clear change. The switch,
+diagnostic metadata dumps and temporary public configuration field are removed.
+
+The same-binary inference control has identical graph metadata, yet its raw
+latency ratio is 1.046 [1.011, 1.076]; normalization is inconclusive at
+1.036 [0.936, 1.121]. This variation is preserved rather than attributed to a
+dependency change that inference does not contain.
+
+Fresh final binaries then run against saved `762faf2` binaries in the same
+mirrored order, again with **500 comparisons** and 50 pairs per implementation
+and case. Every comparison passes selected-implementation matching, full state
+budgets and completion checks, with one persistent dispatch and no fallback.
+Maximum model training error remains 4.66e-9.
+
+| Case | Previous ordinary / persistent ms | Final ordinary / persistent ms | Final median paired persistent / ordinary |
+|---|---:|---:|---:|
+| CI inference | 0.05242 / 0.06786 | 0.05173 / 0.06963 | 1.371 |
+| CI backward | 0.06630 / 0.10196 | 0.06635 / 0.09627 | 1.443 |
+| CI backward/SGD | 0.06763 / 0.10226 | 0.06835 / 0.09675 | 1.420 |
+| Model forward | 4.292 / 5.726 | 4.324 / 5.732 | 1.319 |
+| Model backward/SGD | 14.736 / 18.894 | 14.749 / 18.887 | 1.358 |
+
+Final CI backward and SGD persistent latency improve **5.6% and 5.4%**:
+ratios 0.944 [0.928, 0.957] and 0.946 [0.940, 0.960]. The normalized ratios are
+0.934 [0.923, 0.957] and 0.942 [0.928, 0.951]. Inference is inconclusive at
+1.026 [0.976, 1.046]. Model forward/training remain unchanged within the
+measurement intervals: 1.001 [0.987, 1.012] and 1.000 [0.985, 1.017].
+Intervals use 10,000 bootstrap resamples and do not cover all between-run
+variation. Paired ratios are medians of individual sample ratios, not ratios of
+the aggregate medians; ordinary model-training samples have substantial spread.
+
+Qualification passes 666 library tests (eight existing ignores), 168 strict
+whole-graph oracle tests, 50 matrix regressions in their original mode and nine
+whole-graph smoke tests, plus formatting and strict all-target/all-feature Clippy.
+The added fixture compares exact parameters, gradients and optimizer state for
+three gradient branches at 1/3/64/4096 workers, including SGD, Adam, clipping,
+poisoned storage and repeated external records. A second part redirects two
+matrix outputs and then shares their parameter allocation, checking overlapping
+WAW/RAW ordering and cached replays against exact CPU values. The first version
+of that fixture kept independent reads scheduled before its redirected writes;
+the failed run is preserved, and the fixture now explicitly orders writes first.
+
+An additional strict whole-graph run of all 50 matrix regressions passes 43 and
+rejects seven at admission for unsupported scalar types or cooperative physical
+workgroup sizes. All seven failures reproduce on the preceding qualified runtime.
+No admission check or numerical tolerance is relaxed. These cases limit coverage;
+the passing original-mode suite does not qualify them for whole-graph execution.
+
+This investigation retains **1,200 normal comparisons** and **19 separate native
+resource records**. No new Perf SDK counter capture is claimed. All heavy jobs
+run in verified separate cgroups with 16/20/1 GiB limits, GPU jobs serialize, and
+no build or heavy analysis overlaps normal measurement. Artifacts stay on local
+`/x` under `target/gradient-write-ranges/`. The manifest
+`target/megakernel-results/gradient-write-ranges/summary.json` contains **979
+independently verified artifact hashes**, with SHA-256
+`ad81207646b3ecd9b5fbf1c5e5acf68486a40106b4a657047f914376ffff7093`.
+The measured final CI/model binaries have SHA-256
+`c7529ae3eb8a374ec1d7a8086ff8aac7313a43c75c0f62750661c0596e19355c` and
+`2ca00e91956a3eb426493746e7b9e8660321de3aab41156a71ebfb5d816266c7`.
+Both dependency forks remain unchanged and clean. This is a CI training gain;
+ordinary-baseline parity and the model performance gap remain open.
 
 ## Earlier artifact identities
 
