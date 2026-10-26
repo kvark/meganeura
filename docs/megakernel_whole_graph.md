@@ -3999,6 +3999,112 @@ independently verified artifact hashes**, SHA-256
 The independent audit log is `target/scalar-a-address/verify.log`.
 Baseline parity remains unmet.
 
+## Refreshed worker clock diagnostics
+
+The older clock trace predates retained geometry, staging and dependency
+changes. This refresh instruments qualified runtime `540eccf`, with the
+published Blade and Naga revisions as its control. A temporary Blade patch
+queries and enables the device-clock features and replaces four explicit
+marker-call sites with `OpReadClockKHR` after normal Naga validation. An
+independent audit validates all **30 original and transformed module pairs**
+and reverses the added capabilities, extension, scope constant and clock
+instructions to reproduce each original binary byte-for-byte. No Naga
+language, IR, memory-semantics or validation change is introduced.
+
+The first lane records worker entry/exit, each node/worker's first handler
+start and last handler end, and summed handler intervals. Existing histogram
+counts remain intact. The measured handler interval starts after parameter
+broadcast and acquire fencing, and ends after the payload's publication fence
+and workgroup rendezvous. It excludes ready-queue search, parameter staging,
+successor publication and diagnostic bookkeeping. All recorded task counts
+match the logical grids; intervals fit inside their worker lifetimes. The
+current partial-batch completion clamp remains unchanged.
+
+The probe passes **49 codegen checks and nine whole-graph smoke tests**. Frozen
+qualified and instrumented binaries run in control/probe/probe/control order,
+with ten paired samples per case/visit, ten minimum warmup pairs and at least
+one second of warmup. All **200 diagnostic comparisons** preserve matching
+implementations, full-state budgets, completion, one persistent dispatch and
+no fallback. Maximum model error is 4.66e-9. These are instrumented diagnostics,
+not new normal-performance qualification or a retained optimization.
+
+| Case | Qualified / probe persistent GPU interval, ms | Probe change | Registers, qualified / probe |
+|---|---:|---:|---:|
+| CI inference | 0.03106 / 0.03408 | +9.7% | 48 / 48 |
+| CI backward | 0.06787 / 0.07632 | +12.4% | 48 / 48 |
+| CI SGD | 0.07226 / 0.08112 | +12.3% | 48 / 48 |
+| Model forward | 5.327 / 5.062 | −5.0% | 102 / 112 |
+| Model training + SGD | 17.378 / 17.434 | +0.3% | 103 / 111 |
+
+These GPU intervals include the queue reset. Ordinary forward GPU time also
+falls 4.1% between the visits; no speedup is attributed to instrumentation.
+Persistent model wall medians change from 5.573/18.164 to 5.487/18.011 ms.
+All twenty resource records preserve shared capacity, but model code grows
+from 107,904/267,776 to 110,208/270,720 bytes. Reported scheduler storage grows
+from 337,036/1,170,776 to 2,237,580/7,654,744 bytes. The probe therefore changes
+more than clock-read instruction count and is particularly intrusive for CI.
+
+Both model-forward traces have **168 long-lived workers** and **88 entering
+in the final 5% of the dispatch envelope**. Summed measured handler intervals
+occupy 33.62–33.71% of summed worker lifetimes, equivalent to about 56.5 busy
+workers averaged over that envelope. Training has the same lifetime pattern,
+with 45.63–50.18% of worker time inside measured handler regions, averaging
+76.7–84.3 busy workers. Narrow ready work and time outside the handler coexist;
+the complement is not all avoidable scheduling work, and these fractions are
+**not elapsed-time savings**. In the much smaller CI graphs the corresponding
+fractions are below 1%, with 256 long-lived workers.
+
+Raw model envelopes are 5,108,128–5,122,752 ticks forward and
+15,635,040–17,195,936 ticks for complete training. Their ratios to dispatch
+timestamp nanoseconds are 0.99917–0.99982 on these captures. This observation
+does not establish a universal tick rate. CI ratios are only 0.808–0.957,
+where dispatch boundaries matter more. The
+[clock extension](https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_shader_clock.html)
+does not guarantee a fixed rate or a compiler code-motion barrier.
+
+Fresh ordinary dispatch profiles preserve bitwise exact complete state during
+profiling and match the paired benchmark's selected implementation keys.
+The initial invocation omitted GPU timing and failed with `MissingGpuTimings`;
+its log is preserved separately from the successful timing-enabled invocation.
+The ordinary backward profile excludes SGD, while the training clock trace
+includes it. Representative current shapes are:
+
+| Phase / shape | Nodes | Ordinary median interval, µs | Persistent median node span, µs | Ordinary registers / shared bytes |
+|---|---:|---:|---:|---:|
+| Forward `MatMul[50x4096x720]` | 16 | 77.84 | 110.04 | 55 / 2,176 |
+| Forward `FusedMatMulAdd[50x720x2048]` | 16 | 63.49 | 69.37 | 40 / 6,400 |
+| Forward `FlashAttentionCoop[50]` | 16 | 9.14 | 23.49 | 120 / 9,216 |
+| Training `MatMulBT[50x720x4096]` | 16 | 149.49 | 183.99 | 48 / 9,472 |
+| Training `MatMulBT[50x2048x720]` | 16 | 50.18 | 83.42 | 98 / 16,768 |
+| Training attention gradient dKV, q=50/kv=0 | 8 | 100.35 | 143.61 | 35 / 512 |
+
+Persistent spans use each capture's timestamp/envelope scale. Node spans
+overlap, and ordinary pass-start intervals have different boundaries from
+instrumented handler clocks; the columns do not establish exact kernel ratios
+or additive elapsed savings. The wide forward matrix product, transposed
+training products and attention gradients are concrete targets for examining
+the cost of combining handlers with different resource requirements. The
+four SGD nodes also vary substantially between the two training traces;
+their overlapping spans sum to 3.81–5.30 million ticks, which is not a measured
+optimizer-only elapsed interval.
+
+The probe is preserved locally and removed from the working runtime. Runtime
+sources, Blade and `Cargo.lock` are restored exactly, both forks are clean,
+release examples are rebuilt and all nine restored smoke tests pass. All
+heavy jobs use verified separate 16/20/1 GiB cgroups; GPU work is serialized,
+and builds and heavy analysis do not overlap measurements. Artifacts remain
+on local `/x`.
+
+The record under `target/clock-current/` includes ten benchmark traces, twenty
+resource records, current ordinary profiles and 162 independently verified
+artifact hashes. Twenty job cgroups are recorded, including nine successful
+measurement scopes and the failed profile setup. The manifest is
+`target/megakernel-results/clock-current/summary.json`, SHA-256
+`5ad0b2412d5460e317a575b145e7f59f26797a0ddafe2ddb9a19d2c5ca883ee8`.
+No fresh SDK capture or full retained-change qualification is claimed.
+The qualified runtime and performance claims remain unchanged; parity is
+still unmet.
+
 ## Earlier artifact identities
 
 All records remain on local storage at

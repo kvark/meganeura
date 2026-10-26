@@ -409,6 +409,15 @@ the descriptor-reference repair requires fresh measurements.
   per form. Preserve 1,000 comparisons and 20 resource records. A slows forward
   1.8%; transposed B slows CI SGD 5.7%; neither establishes a training gain.
   Revert both and recheck all nine restored smoke tests.
+- [x] Refresh device-clock traces on qualified runtime `540eccf`, with 200
+  diagnostic comparisons, 20 resource records and current ordinary dispatch
+  profiles. Validate all 30 transformed SPIR-V modules and invert the changes
+  byte-for-byte. The probe raises model registers from 102/103 to 112/111;
+  CI GPU intervals grow about 10–12%. Model traces show 168 long-lived workers
+  and 88 entering near completion. Handler intervals occupy about 34% of
+  forward worker time and 46–50% of training worker time; these are not elapsed
+  savings. Restore the runtime/fork/lock exactly and pass nine restored smoke
+  tests. Preserve the trace, instrumentation costs and measurement limits.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
@@ -418,10 +427,11 @@ the descriptor-reference repair requires fresh measurements.
   Recheck both model phases and all
   CI cases before retaining further changes; do not infer elapsed cost from
   barrier-wait counters alone.
-  Refresh per-handler device-clock traces on the current qualified runtime,
-  measuring instrumentation's resource and timing cost before using those
-  traces to choose another payload change. The older trace predates retained
-  geometry, staging and dependency improvements.
+  Use the refreshed trace to target the forward `50×4096×720` matrix product,
+  transposed training products and attention gradients. Compare each selected
+  handler's ordinary resource footprint with its cost inside the combined
+  worker shader before choosing a change. Preserve arithmetic and test changes
+  individually; exclude clock instrumentation from normal performance gates.
   Keep the shared-state failure as a separate unresolved diagnostic.
   Retain both model phases and all CI gates; baseline parity remains open.
 
