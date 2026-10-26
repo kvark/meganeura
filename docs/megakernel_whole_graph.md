@@ -8,12 +8,13 @@ nodes in the same dispatch. The transfer reset and compute dispatch share one
 queue submission. Initial parameter/moment allocation and explicit optimizer
 calls remain separate operations outside that step boundary.
 
-The current runtime adds [bounded gradient writes](#bounded-gradient-write-dependencies)
-to the qualified cooperative row distribution at `762faf2`. Removing false
-ordering between independent bias and weight gradients improves CI training;
-the model gap remains. The intervening scheduler, workgroup-propagation,
-subgroup-staging and two-band release probes remain reverted. Performance parity
-remains unmet.
+The current qualified runtime, `9ff1b50`, adds
+[contiguous cooperative prologue staging](#contiguous-cooperative-prologue-staging)
+to the retained gradient dependencies, subgroup guards and transposed-matrix
+staging. Two independent comparisons improve persistent model forward by
+3.6% and 4.7%; the CI and complete-training shaders remain unchanged. The
+repeated paired ratios are 1.293× ordinary forward and 1.220× complete training.
+Performance parity remains unmet.
 
 For model benchmarks, use `--whole-graph --workers 256`. The
 [current worker sweep](#worker-counts-and-deeper-scalar-staging) finds lower CI
@@ -147,7 +148,7 @@ attribute time to its internal nodes.
 
 ## Qualification and measurements
 
-The [narrow scalar tile measurements](#narrow-scalar-tiles)
+The [cooperative prologue staging measurements](#contiguous-cooperative-prologue-staging)
 are the current qualification record. Measurements before `ed81459` below are
 historical hardware observations: they predate the descriptor-reference repair
 and do not establish its memory-model contract.
@@ -4104,6 +4105,109 @@ measurement scopes and the failed profile setup. The manifest is
 No fresh SDK capture or full retained-change qualification is claimed.
 The qualified runtime and performance claims remain unchanged; parity is
 still unmet.
+
+## Contiguous cooperative prologue staging
+
+The refreshed trace identifies the forward `MatMul[50x4096x720]` as a native
+cooperative kernel with a fused normalization prologue. Its A staging still
+uses four scalar passes, whereas the plain cooperative path stages adjacent
+K elements together. At `9ff1b50`, eligible prologue lanes stage four adjacent
+K values, apply the original scalar factor chain to each value and write the
+same shared cells before the existing barrier. The scalar storage binding is
+retained: this introduces no vector-alignment requirement or assertion that
+the driver emits a particular vector-load instruction.
+
+The change applies to normal-layout, 16-wide native cooperative tiles with
+a prologue, F32 weight storage and uncompensated accumulation. Other layouts,
+weight formats, compensated and typed products retain their original paths.
+Full four-element groups use direct checked loads; partial groups check each
+element and preserve positive-zero padding. The original PerRow cache and
+PerKCol indices, scalar multiplication order, matrix-input conversion, B
+staging, cooperative accumulation order, stores, geometry, packing, barriers,
+dependencies and queue protocol remain unchanged in both execution modes.
+
+The ownership audit checks **3,276,800 shared cells in 12,800 stages**, including
+zero dimensions, partial rows and K tails. It proves unique staging writes and
+the same A/factor index tuple or zero value for every shared cell. The expanded
+packed-matrix fixture adds K=717/718/719, alongside K=720, with changed inputs,
+poisoned storage, 1/3/64/4096 workers and repeated scratch reuse. It requires
+bitwise equality with ordinary execution and validates completion. The existing
+prologue regression also passes.
+
+Two independent control/candidate/candidate/control sequences preserve **1,000
+normal comparisons**, with 25 AB/BA pairs per case and visit, ten minimum
+warmup pairs, at least one second of warmup and 256 workers. Every comparison
+retains matching implementations, complete state budgets, completion, one
+persistent dispatch and no fallback; maximum model error remains 4.66e-9.
+
+| Forward sequence | Control ordinary / persistent ms | Candidate ordinary / persistent ms | Persistent candidate/control, bootstrap 95% interval | Paired-ratio candidate/control, 95% interval |
+|---|---:|---:|---:|---:|
+| First | 4.131 / 5.506 | 4.085 / 5.306 | 0.964 [0.957, 0.971] | 0.969 [0.928, 0.980] |
+| Independent repeat | 4.108 / 5.531 | 4.088 / 5.273 | 0.953 [0.945, 0.969] | 0.953 [0.938, 0.992] |
+
+The repeated completed-step measurements are:
+
+| Case | Ordinary / persistent ms | Median paired persistent / ordinary |
+|---|---:|---:|
+| CI inference | 0.05723 / 0.07417 | 1.283× |
+| CI backward | 0.06467 / 0.09346 | 1.445× |
+| CI SGD | 0.06684 / 0.09474 | 1.422× |
+| Model forward | 4.088 / 5.273 | 1.293× |
+| Model training + SGD | 14.631 / 17.738 | 1.220× |
+
+Training's first raw persistent median rises from 17.094 to 18.069 ms, while
+the repeat changes from 17.834 to 17.738 ms. Their normalized ratios are
+0.997 [0.975, 1.004] and 0.997 [0.900, 1.009]. CI inference also shifts between
+visits. These changes are not attributed to the shader modification: all
+nineteen CI shader files and the complete training shader are byte-identical,
+and both backends' compiled pipeline/resource multisets match in these cases.
+Only two of 43 model source files change: the prologue module and the combined
+forward shader. No CI or training improvement is claimed. All samples remain;
+bootstrap intervals do not cover every source of between-visit variation.
+
+Ten separate resource records retain all shared capacities and scheduler sizes.
+Persistent forward registers fall from 102 to 100, while code grows from
+107,904 to 111,360 bytes. Training remains at 103 registers, 29,232 shared bytes
+and 267,776 code bytes. The new forward binary remains roughly 29% slower than
+ordinary execution in the repeat; complete training remains about 22% slower.
+
+Four forward SDK backend captures, with four sequential metric groups each,
+pass adapter, activity, exit and full-state checks. All four actual state files
+are independently hashed and bitwise identical, SHA-256
+`4e5d66e6ce5e95142b848651d316b4df64855a9d85669499cabc3a81089be629`.
+Ordinary replay changes from 3.742 to 3.600 ms; persistent replay improves
+**6.6%**, from 5.046 to 4.714 ms. Estimated persistent integer-pipe instructions
+fall **18.3%**, warp instructions fall **5.2%**, and FP32 activity remains nearly
+flat. Global-load sectors rise **46.2%**, shared wavefronts rise **2.2%**, and
+persistent local load/store traffic stays zero. Thus this result supports less
+integer work as a contributor; it does not establish reduced memory traffic
+or identify particular native instructions. Ordinary local traffic increases
+from about 79,500 to 113,000 sectors per replay despite its faster replay.
+
+Barrier waiting remains about 59.0/59.2% of active warp cycles, not elapsed
+time. Across metric groups, maximum clock spread is 0.376% and instruction-rate
+spread is 1.205%. Counter rates multiplied by replay duration are estimates;
+resident SDK replay does not replace the completed-step measurements.
+
+Full qualification passes **667 library tests** (eight existing ignores),
+**168 strict whole-graph oracle tests**, **50 matrix regressions in their
+original mode**, and all **nine expanded whole-graph smoke tests**. The 49
+codegen checks, prologue regression, formatting, strict all-target/all-feature
+Clippy and Metal compilation with `models,gguf,profiler` also pass. Rebuilt
+benchmark binaries match the measured candidates byte-for-byte. Both dependency
+forks remain clean and their pins and `Cargo.lock` are unchanged. Metal GPU
+execution and additional GPUs remain unqualified.
+
+Records are under `target/coop-prologue-stage/` and
+`target/coop-prologue-stage-repeat/`. The manifest
+`target/megakernel-results/coop-prologue-stage/summary.json` preserves 1,000
+normal comparisons, ten resource records, four SDK backend captures/sixteen
+metric groups, 22 verified measurement scopes and **461 independently verified
+artifact hashes**, SHA-256
+`1e318dd91d7c3e92524913d6a333b5210f5acccb1913262a7a88b97f1aab60b8`.
+Heavy jobs use separate verified 16/20/1 GiB cgroups, GPU work is serialized,
+builds and heavy analysis do not overlap measurements, and all artifacts stay
+on local `/x`. The change is retained; ordinary-baseline parity remains open.
 
 ## Earlier artifact identities
 

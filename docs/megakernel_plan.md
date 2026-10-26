@@ -418,6 +418,16 @@ the descriptor-reference repair requires fresh measurements.
   forward worker time and 46–50% of training worker time; these are not elapsed
   savings. Restore the runtime/fork/lock exactly and pass nine restored smoke
   tests. Preserve the trace, instrumentation costs and measurement limits.
+- [x] Stage four adjacent K values in the native cooperative prologue, keeping
+  scalar bindings, factor order, conversion, shared cells and synchronization.
+  Audit 3.28 million cells and expand the packed fixture for K tails. Two
+  independent sequences preserve 1,000 comparisons and improve persistent
+  forward 3.6%/4.7%; CI and training shaders remain byte-identical. SDK forward
+  replay improves 6.6%, with 18.3% less estimated integer-pipe activity despite
+  more global-load sectors. Retain `9ff1b50` after full qualification: 667
+  library, 168 strict oracle, 50 matrix and nine smoke tests, formatting,
+  strict Clippy and Metal compilation. The repeat ratios remain 1.293× forward
+  and 1.220× complete training; parity is unmet.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
@@ -432,6 +442,10 @@ the descriptor-reference repair requires fresh measurements.
   handler's ordinary resource footprint with its cost inside the combined
   worker shader before choosing a change. Preserve arithmetic and test changes
   individually; exclude clock instrumentation from normal performance gates.
+  Check whether column-packed cooperative tiles can safely share identical
+  A/prologue staging. Prove shared initialization, writer ownership and
+  publication before measuring such a change; retain independent B storage
+  and every logical tile's arithmetic and completion accounting.
   Keep the shared-state failure as a separate unresolved diagnostic.
   Retain both model phases and all CI gates; baseline parity remains open.
 
