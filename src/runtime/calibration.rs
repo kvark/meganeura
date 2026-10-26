@@ -267,6 +267,14 @@ fn calibrate(
         profile.parallel_width = bench.parallel_width();
     }
     bench.deadline = start + budget / 2;
+    // A cold stream pipeline can outlast the first short slice. Reuse it
+    // before throughput samples so their pass correction is available.
+    if !bench.expired()
+        && (profile.dispatch_overhead.is_none()
+            || (bench.timestamps && profile.pass_overhead.is_none()))
+    {
+        bench.overheads(profile);
+    }
     if profile.bandwidth.is_none() {
         profile.bandwidth = bench.bandwidth();
     }
