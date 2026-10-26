@@ -85,7 +85,7 @@ pub struct BuildSearchTrial {
     /// Pending early arithmetic programs sharing this trial's private kernel
     /// budget. Capped by the remaining program slots; all must still qualify.
     pub early_programs_reserved: usize,
-    /// Absent for the initial fallback and prepared, fixed-kernel neighbors.
+    /// Absent for the initial fallback and neighbors that skip private probes.
     pub kernel_tuning: Option<TuneReport>,
     pub outcome: TuneOutcome<(), usize>,
 }
