@@ -1521,6 +1521,112 @@ indexed in `target/megakernel-results/horizontal-geometry/summary.json`. The nex
 investigation targets the remaining cost on this corrected runtime, including
 training counters and the cooperative-prologue handler's resource footprint.
 
+## Scalar matmul output stores (October 26, 2026)
+
+The corrected runtime's first backward SDK capture completes successfully on
+both backends, but the wrapper's cross-backend bitwise check fails. That failure
+is preserved. A separate audit compares all 246,883,105 state floats: loss and
+parameters are exact; 54,475,347 gradient values differ, with maximum error
+4.6566128730773926e-9. The largest fraction of the existing benchmark tolerance
+is 0.000460. Each backend remains bitwise stable across its entire capture.
+The SDK script's exact-state gate is not weakened.
+
+This capture measures **forward plus backward with the optimizer disabled**,
+not the complete SGD step. Ordinary/persistent replay takes 10.611/17.175 ms.
+Rate times duration estimates about 12.08 million local-load and 206.12 million
+local-store sectors for persistent execution, versus zero ordinary. The earlier
+forward-only zero-traffic result therefore did not extend to backward work.
+
+A cooperative-matmul probe moves output-address calculations after accumulation.
+It saves one forward and two training registers, but 40 normal comparisons show
+no useful timing gain. The probe is reverted; its source, binary and two resource
+diagnostics remain in `target/coop-output-address-probe/`.
+
+Commit `5dbabed` changes the common scalar matmul generator. It previously built
+a nested array from completed scalar accumulators and dynamically indexed that
+array in output loops. It now emits a bounds-checked store for each accumulator,
+in the same row/column order. Both ordinary and persistent execution use this
+change. K staging and accumulation, selected geometry, column mapping, split
+offsets, fused addends and epilogues remain unchanged. The WGSL store fragment
+stays in `matmul.wgsl`. Queue scheduling, fences, scratch isolation and submission
+are unchanged; the shared convolution generator retains its existing output path.
+
+Qualification passes **665 library tests (eight ignored), 168 strict whole-graph
+oracle cases, 50 matrix regressions and seven whole-graph tests**, plus formatting
+and strict all-feature/all-target Clippy. Matrix regressions cover transposes,
+partial dimensions, packed outputs, rectangular candidates and split reductions.
+Naga and Blade pins are unchanged. Clean tracked source `5dbabed` produces the
+final binaries; the unrelated untracked `configs/` directory is disclosed.
+
+All 250 primary comparisons pass with 256 workers, 50 alternating AB/BA pairs
+per workload, ten warmups and at least one second of warmup. Every persistent
+case has one dispatch, identical selected arithmetic and no fallback. CI and
+forward are exact; maximum training error remains 4.66e-9.
+
+| Workload | Ordinary ms | Persistent ms | Paired ratio | 95% interval |
+|---|---:|---:|---:|---:|
+| CI inference | 0.05728 | 0.07564 | 1.319 | 1.310–1.327 |
+| CI forward/backward | 0.06613 | 0.10239 | 1.553 | 1.543–1.567 |
+| CI forward/backward/SGD | 0.06714 | 0.10096 | 1.508 | 1.484–1.524 |
+| SmolVLA forward | 4.207 | 6.056 | 1.436 | 1.427–1.482 |
+| SmolVLA forward/backward/SGD | 14.945 | 19.403 | 1.310 | 1.276–1.471 |
+
+Intervals bootstrap paired-ratio medians 10,000 times and describe within-run
+uncertainty. Long outliers on both paths remain in every calculation and widen
+the training interval; no samples are excluded. A subsequent 50-pair-per-phase
+control uses the preserved geometry-corrected binary: forward/training medians
+are 6.097/20.725 ms persistent and 4.217/14.940 ms ordinary. The observed training
+median falls about **6.4%**, with forward effectively unchanged. The normalized
+training intervals overlap, so the median improvement is not a guarantee across
+runs. Independently bootstrapping the two runs' persistent latency medians gives
+a new/old ratio of 0.936 (95% interval 0.924–0.952); ordinary is 1.000
+(0.978–1.021). These intervals also exclude between-run drift. The source
+revision observed by an old binary is not its build identity.
+Earlier 20-pair-per-phase candidate/control runs are also preserved: there are
+470 normal comparisons and four resource diagnostics across this investigation.
+**Baseline parity remains unmet.**
+
+The new backward SDK capture uses six sequential single-pass groups per mode,
+146 samples each, matching NVIDIA adapters, successful process exits and no
+warnings. Both modes preserve their exact respective pre-change state hashes;
+the known cross-backend gradient difference remains. Repeated instruction rates
+deviate by at most 0.22% from their group means and clocks by at most 0.25%.
+
+| Backward graph metric | Ordinary | Persistent |
+|---|---:|---:|
+| Replay ms | 10.526 | 15.926 |
+| Warp instructions, relative to ordinary | 1.000 | 1.833 |
+| FMA-heavy integer-thread activity, relative | 1.000 | 2.923 |
+| Global-load sectors, relative | 1.000 | 1.364 |
+| Shared-memory wavefronts, relative | 1.000 | 1.186 |
+| Barrier waiting, share of active warp cycles | 5.74% | 57.40% |
+| Local-load/store sectors | 0 / 0 | 0 / 0 |
+
+Removing the output arrays eliminates the measured local traffic and shortens
+persistent backward replay by about 7.3%. This supports array materialization or
+its resulting register pressure as a cause; the aggregate counters do not map
+traffic to individual instructions. Counts estimate rate times duration, the
+integer metric covers one pipe class, and barrier share is not elapsed-time share.
+The capture excludes optimizer work and is not a full-step timing substitute.
+It uses the preserved exploratory binary; the only subsequent shader change
+before the final production build corrects a source comment.
+
+Separate full-step resource diagnostics report unchanged forward resources:
+116 registers, 20,880 shared bytes and 101,248 executable bytes. Training falls
+from 117 to 114 registers and from 259,968 to 249,344 executable bytes, with
+29,232 shared bytes unchanged. The driver's implausible Local Memory Size field
+is excluded. Diagnostic instrumentation timings are not performance results.
+
+All jobs use verified separate cgroups with 16 GiB MemoryHigh, 20 GiB MemoryMax
+and 1 GiB MemorySwapMax. GPU jobs are serialized; builds, copies and heavy
+analysis do not overlap primary timing. The agent remains outside those scopes
+and all artifacts stay on `/x`. Captures, patches, binaries, test logs, raw
+samples, uncertainty calculations and artifact hashes are indexed by
+`target/megakernel-results/scalar-output-stores/summary.json`; the preserved
+initial backward failure and numerical audit are in
+`target/corrected-training-sdk/summary.json`. Remaining work is to isolate the
+extra instruction and scheduling cost after local traffic disappears.
+
 ## Earlier artifact identities
 
 All records remain on local storage at

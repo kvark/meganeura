@@ -183,9 +183,21 @@ the descriptor-reference repair requires fresh measurements.
   forward latency and effectively unchanged training. Six SDK groups per mode
   retain the previous exact forward state and report zero local load/store
   traffic; the primary paired ratios remain 1.427 forward and 1.380 training.
-- [ ] Investigate the remaining scheduling/integer cost on the corrected
-  runtime, including training counters and the cooperative-prologue resource
-  footprint. Finer dependencies still require proofs for payload ranges,
+- [x] Capture the corrected backward graph with the NVIDIA SDK. Preserve the
+  failed cross-backend exact-state gate and audit the known gradient difference
+  separately: maximum error 4.66e-9, with exact stability within each backend.
+  The graph-only capture exposes substantial persistent local-memory traffic.
+- [x] Probe cooperative output-address lifetimes. Saving one or two registers
+  gives no useful timing improvement; revert that change and preserve its data.
+- [x] Replace scalar matmul output arrays with direct stores in both paths at
+  `5dbabed`. Preserve K arithmetic, geometry, bounds and epilogues. Pass 665
+  library tests, 168 strict oracle cases, 57 focused GPU tests and 250 primary
+  pairs. Backward SDK captures retain exact same-backend pre-change state and
+  eliminate measured local traffic. A fresh 100-pair old-binary control gives
+  20.725 ms training versus 19.403 ms after the change; forward is unchanged.
+- [ ] Investigate the remaining scheduling/integer cost after output-array
+  removal. The measured backward graph still executes about 1.83 times as many
+  warp instructions as ordinary execution. Finer dependencies require proofs for payload ranges,
   allocation reuse, original tile coordinates and completion aggregation.
   Retain both model phases and all CI gates; baseline parity remains open.
 
