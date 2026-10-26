@@ -97,6 +97,7 @@ impl Refinements {
             }
             return Some(measure::Program {
                 prepared: true,
+                retune: false,
                 description: format!(
                     "refine={origin:?}, attention_keys={key_tile}, class={class:?}"
                 ),

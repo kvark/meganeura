@@ -6,6 +6,8 @@ use std::collections::{HashSet, VecDeque};
 enum Kind {
     Cooperative,
     Vector,
+    CooperativeTuned,
+    VectorTuned,
 }
 
 pub(super) struct Refinements {
@@ -40,6 +42,24 @@ impl Refinements {
                     .push_back((origin, Kind::Cooperative, native.clone()));
             }
         }
+        if !plan.f16_weight_mirrors.is_empty() {
+            let vector = plan.dispatches.iter().any(|d| {
+                d.gemv_shape().is_some()
+                    && d.weight_format == crate::compile::WeightFormat::F16
+                    && plan
+                        .f16_weight_mirrors
+                        .iter()
+                        .any(|entry| d.input_buffers.get(1) == Some(&entry.1))
+            });
+            let kind = if vector {
+                Kind::VectorTuned
+            } else {
+                Kind::CooperativeTuned
+            };
+            if !self.tried.contains(&(origin, kind)) {
+                self.pending.push_back((origin, kind, plan.clone()));
+            }
+        }
         // Keep the cooperative-only comparison. Rounding vector B operands
         // changes arithmetic and may fail when cooperative caching passes.
         if !self.tried.contains(&(origin, Kind::Vector)) {
@@ -57,6 +77,7 @@ impl Refinements {
         self.tried.insert((origin, kind));
         Some(measure::Program {
             prepared: true,
+            retune: matches!(kind, Kind::CooperativeTuned | Kind::VectorTuned),
             description: format!("refine={origin:?}, coherent_weight_cache=true, weights={kind:?}"),
             plan,
             submission_chunks: None,
@@ -66,14 +87,14 @@ impl Refinements {
     pub(super) fn early_remaining(&self) -> usize {
         self.pending
             .iter()
-            .filter(|entry| entry.1 == Kind::Cooperative)
+            .filter(|entry| entry.1 != Kind::Vector)
             .count()
     }
     pub(super) fn next_early(&mut self) -> Option<measure::Program> {
         if self
             .pending
             .front()
-            .is_some_and(|entry| entry.1 == Kind::Cooperative)
+            .is_some_and(|entry| entry.1 != Kind::Vector)
         {
             self.next()
         } else {
@@ -366,6 +387,10 @@ mod tests {
         refined.dispatches[vector_index].schedule_locked =
             !refined.dispatches[vector_index].schedule_locked;
         r.selected(origin, &refined);
+        assert_eq!(r.pending.len(), 2);
+        let tuned = r.next_early().unwrap();
+        assert!(tuned.prepared && tuned.retune);
+        assert_eq!(tuned.plan, refined);
         assert_eq!(r.pending.len(), 1);
         assert_eq!(r.early_remaining(), 0);
         assert!(
@@ -392,6 +417,10 @@ mod tests {
                 .any(|d| d.gemv_shape().is_some() && d.weight_format == compile::WeightFormat::F16)
         );
         r.selected(origin, &vector.plan);
+        let tuned = r.next_early().unwrap();
+        assert!(tuned.prepared && tuned.retune);
+        assert_eq!(tuned.plan, vector.plan);
+        r.selected(origin, &tuned.plan);
         assert_eq!(r.pending.len(), 0);
         let (_, p) = vector_graph(false, false, false);
         for case in 0..5 {
@@ -606,6 +635,10 @@ mod tests {
         r.selected(Some(measure::Origin { form: 3, choice: 3 }), &p);
         assert!(r.next().is_some());
         r.selected(origin, &n.plan);
+        let tuned = r.next_early().unwrap();
+        assert!(tuned.prepared && tuned.retune);
+        assert_eq!(tuned.plan, n.plan);
+        r.selected(origin, &tuned.plan);
         assert!(!r.may_remain());
     }
     #[test]

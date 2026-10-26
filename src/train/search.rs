@@ -1759,6 +1759,7 @@ impl measure::Frontier for Implementations {
             }
             return Some(measure::Program {
                 prepared,
+                retune: false,
                 description,
                 plan,
                 submission_chunks: None,
@@ -1826,6 +1827,7 @@ fn low_occupancy_weight_splits(
         }
         programs.push(measure::Program {
             prepared: false,
+            retune: false,
             description: format!(
                 "{}, dispatch_fusion={}, conv_dw_splits={splits}, workgroups<48",
                 seed.description, seed.options.fuse_dispatches

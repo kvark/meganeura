@@ -16,8 +16,10 @@ use std::{
 };
 
 pub(super) struct Program {
-    /// Final physical kernels: preserve them during construction and skip private tuning.
+    /// Preserve physical kernels during construction.
     pub prepared: bool,
+    /// Run bounded private probes on this preserved neighbor as a separate trial.
+    pub retune: bool,
     pub description: String,
     pub plan: ExecutionPlan,
     /// Unspecified candidates retain the incumbent's measured submission choice.
@@ -343,6 +345,7 @@ pub(super) fn select(
                         .pop_front()
                         .map(|submission_chunks| Program {
                             prepared: selected_prepared,
+                            retune: false,
                             description: selected_description.clone(),
                             plan: selected_plan.as_ref().unwrap().clone(),
                             submission_chunks: Some(submission_chunks),
@@ -420,7 +423,7 @@ pub(super) fn select(
                 let state = SearchState::capture(&mut candidate, options.max_plan_bytes)?;
                 trial.state_copy_time += copy_start.elapsed();
                 trial.snapshot_bytes = state.bytes();
-                if incumbent.is_some() && !program.prepared {
+                if incumbent.is_some() && (!program.prepared || program.retune) {
                     // Do not spend kernel probes on an invalid program.
                     // Memoized winners still need whole-program acceptance.
                     let mut step = incumbent_step;
@@ -561,6 +564,7 @@ pub(super) fn select(
                     {
                         pending_tuned = Some(Program {
                             prepared: false,
+                            retune: false,
                             description: program.description.clone(),
                             plan: original_plan.clone(),
                             submission_chunks: program.submission_chunks,
@@ -773,6 +777,7 @@ mod tests {
         assert_ne!(baseline.knobs, alternate.knobs);
         let programs = [baseline.clone(), alternate, baseline].map(|plan| Program {
             prepared: false,
+            retune: false,
             description: format!("interleave={}", plan.knobs.flash.interleave),
             plan,
             submission_chunks: Some(1),
@@ -878,6 +883,7 @@ mod tests {
                 plan.dispatches[0].label = name.into();
                 Program {
                     prepared: false,
+                    retune: false,
                     description: name.into(),
                     plan,
                     submission_chunks: (name == "baseline").then_some(2),
@@ -1020,6 +1026,7 @@ mod tests {
             .collect();
         let programs = (0..3).map(|index| Program {
             prepared: false,
+            retune: false,
             description: index.to_string(),
             plan: plan.clone(),
             submission_chunks: Some(1),
@@ -1119,6 +1126,7 @@ mod tests {
                 let skipped = std::cell::Cell::new(0);
                 let programs = (0..3).map(|index| Program {
                     prepared: false,
+                    retune: false,
                     description: index.to_string(),
                     plan: plan.clone(),
                     submission_chunks: Some(1),
@@ -1221,6 +1229,7 @@ mod tests {
                 select(
                     [1, 2].map(|chunks| Program {
                         prepared: false,
+                        retune: false,
                         description: "ordinary".into(),
                         plan: plan.clone(),
                         submission_chunks: Some(chunks),
@@ -1380,6 +1389,7 @@ mod tests {
             let (mut session, report) = select(
                 [Program {
                     prepared: false,
+                    retune: false,
                     description: "ordinary".into(),
                     plan: plan.clone(),
                     submission_chunks: Some(1),
@@ -1486,6 +1496,7 @@ mod tests {
         let plan = crate::compile::compile(&graph);
         (0..count).map(move |index| Program {
             prepared: false,
+            retune: false,
             description: index.to_string(),
             plan: plan.clone(),
             submission_chunks: Some(1),
@@ -1788,6 +1799,7 @@ mod tests {
                 );
                 Program {
                     prepared: false,
+                    retune: false,
                     description: splits.to_string(),
                     plan,
                     submission_chunks: Some(splits as usize),
