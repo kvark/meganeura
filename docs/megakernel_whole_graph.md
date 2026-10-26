@@ -3931,6 +3931,74 @@ SHA-256 `92ec945f6265c987570a9fb524863c408aabafc73f5cb805c3cefcf17965c07f`.
 The independent audit log is `target/linear-grid/verify.log`.
 Baseline parity remains unmet.
 
+## Scalar staging address hoisting
+
+Two rejected prototypes on `8554bd0` precompute a lane's matrix base and stage
+stride before the scalar K loop. The first applies to F32 products with normal
+A storage and staging maps. The second restores A and applies the same
+transformation only to F32 transposed B, preserving both its retained interior
+branch and its original checked edge path. Both backends use the same template.
+
+For the admitted K tiles, `KT` divides 256. Therefore
+`floor((tid + e*256)/KT) = floor(tid/KT) + e*(256/KT)` and the remainder is
+`tid % KT`. The original matrix index equals `base + e*stride + t`, including
+unsigned wrapping. The base uses `tile_row` for A and `tile_col` for transposed
+B. Original bounds checks, discarded element-zero reads, shared addresses,
+K order, splits, barriers, subgroup guards and output arithmetic remain.
+Precomputation reads only immutable parameters when K=0; no matrix read is
+introduced. Dependencies and selected geometry remain unchanged.
+
+Each proof checks **3,354,624 addresses across eleven layouts**, including
+2,325,808 wrapping cases and original masked reads. These arithmetic boundary
+checks do not authorize allocations beyond existing limits. Source audits
+remove only the base/stride declarations and restore the original index
+expressions, reproducing every ordinary shader body after whitespace/comment
+normalization. All 19 CI and 43 model modules per variant are accounted for.
+
+Each form passes **49 codegen checks, nine whole-graph smoke tests and eight
+strict matmul oracle cases**, followed by 500 normal comparisons against frozen
+qualified `540eccf` binaries. The established control/candidate/candidate/control
+protocol uses 25 interleaved pairs per case and visit, ten warmup pairs, at least
+one second of warmup and 256 workers. All 1,000 comparisons preserve matching
+selections, full-state budgets, completion, one persistent dispatch and no
+fallback; maximum model error remains 4.66e-9.
+
+| Operand / case | Control ordinary / persistent ms | Candidate ordinary / persistent ms | Persistent candidate/control, bootstrap 95% interval |
+|---|---:|---:|---:|
+| A, forward | 4.124 / 5.531 | 4.232 / 5.629 | 1.018 [1.010, 1.076] |
+| A, training + SGD | 14.582 / 17.853 | 14.772 / 18.112 | 1.015 [0.993, 1.024] |
+| Transposed B, training + SGD | 14.630 / 17.779 | 14.592 / 17.996 | 1.012 [0.997, 1.086] |
+| Transposed B, CI SGD | 0.06661 / 0.09468 | 0.06637 / 0.10003 | 1.057 [1.023, 1.065] |
+
+A hoisting slows persistent/ordinary forward **1.8% / 2.6%** and establishes no
+training improvement. Transposed-B hoisting establishes no model-training gain
+and slows CI SGD **5.7% raw / 5.2% normalized**. Its complete model-forward and
+CI-inference shaders and compiled pipeline/resource multisets are identical
+in both backends despite timing shifts, including 7.0% higher persistent CI
+inference. Those shifts are not attributed to the shader change. All samples
+remain; bootstrap intervals do not cover all between-visit variation.
+
+Twenty resource records preserve 48 CI registers, 102/103 model registers and
+all shared capacities. A hoisting grows model code from 107,904/267,776 to
+108,288/268,416 bytes. Transposed-B model code retains the original sizes;
+its CI SGD code grows from 65,408 to 66,560 bytes. These totals do not establish
+native instruction identities, load-address latency or the cause of the timing
+changes. No fresh SDK capture or full retained-change qualification is claimed.
+
+Both probes are restored exactly to runtime `540eccf`, locks match the qualified
+copy, both forks are clean, release examples are rebuilt, and all nine restored
+smoke tests pass. Heavy jobs use separate verified 16/20/1 GiB cgroups, GPU work
+is serialized, builds and heavy analyses do not overlap measurements, and all
+artifacts stay on local `/x`.
+
+Records are under `target/scalar-{a,bt}-address/`. The manifest
+`target/megakernel-results/scalar-stage-address/summary.json` preserves **1,000
+comparisons, 20 resource records, 24 verified measurement scopes and 667
+independently verified artifact hashes**, SHA-256
+`9aa3c53d539a513b4ecc9bb7b68635b6f6aa574ff50686defa64b80908fdd4a3`.
+The independent audit log is `target/scalar-a-address/verify.log`.
+Baseline parity remains unmet.
+
 ## Earlier artifact identities
 
 All records remain on local storage at

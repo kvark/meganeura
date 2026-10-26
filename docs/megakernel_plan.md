@@ -403,6 +403,12 @@ the descriptor-reference repair requires fresh measurements.
   Broad training SDK captures reduce integer-pipe activity 6.7% with essentially
   flat replay time and exact same-backend state. Revert both; reduced instruction
   or register counts alone do not establish progress toward parity.
+- [x] Hoist scalar staging bases/strides for normal A and transposed B separately.
+  Prove the original checked and direct addresses, including unsigned wrapping;
+  pass 49 codegen checks, nine smoke tests and eight strict matrix oracle cases
+  per form. Preserve 1,000 comparisons and 20 resource records. A slows forward
+  1.8%; transposed B slows CI SGD 5.7%; neither establishes a training gain.
+  Revert both and recheck all nine restored smoke tests.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
@@ -412,6 +418,10 @@ the descriptor-reference repair requires fresh measurements.
   Recheck both model phases and all
   CI cases before retaining further changes; do not infer elapsed cost from
   barrier-wait counters alone.
+  Refresh per-handler device-clock traces on the current qualified runtime,
+  measuring instrumentation's resource and timing cost before using those
+  traces to choose another payload change. The older trace predates retained
+  geometry, staging and dependency improvements.
   Keep the shared-state failure as a separate unresolved diagnostic.
   Retain both model phases and all CI gates; baseline parity remains open.
 
