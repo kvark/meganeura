@@ -26,29 +26,26 @@ impl Refinements {
     pub(super) fn selected(&mut self, origin: Option<measure::Origin>, plan: &ExecutionPlan) {
         self.pending.clear();
         let Some(origin) = origin else { return };
-        // Cache neighbors always retain the selected uncached executable as
-        // their caller-recorded/unmanaged-writer fallback, without nesting.
-        let parent = plan.f16_weight_parent.as_deref().unwrap_or(plan);
         if !self.enabled
-            || !parent.param_grad_pairs.is_empty()
-            || parent.dispatches.iter().any(|d| d.is_derivative)
+            || !plan.param_grad_pairs.is_empty()
+            || plan.dispatches.iter().any(|d| d.is_derivative)
         {
             return;
         }
-        let mut native = parent.clone();
+        let mut native = plan.clone();
         if fill(&mut native, self.max_bytes) > 0 {
-            native.groups = parent.groups.clone();
+            native.groups = plan.groups.clone();
             if !self.tried.contains(&(origin, Kind::Cooperative)) {
                 self.pending
                     .push_back((origin, Kind::Cooperative, native.clone()));
             }
         }
         // Keep the cooperative-only comparison. Rounding vector B operands
-        // changes arithmetic and may fail qualification even when it passes.
+        // changes arithmetic and may fail when cooperative caching passes.
         if !self.tried.contains(&(origin, Kind::Vector)) {
-            let mut vector = parent.clone();
+            let mut vector = plan.clone();
             if fill_vectors(&mut vector, self.max_bytes) > 0 {
-                vector.groups = parent.groups.clone();
+                vector.groups = plan.groups.clone();
                 if vector != native {
                     self.pending.push_back((origin, Kind::Vector, vector));
                 }
@@ -101,7 +98,7 @@ fn fill_impl(plan: &mut ExecutionPlan, max_bytes: usize, vectors: bool) -> usize
         compile::{BufferRef, Kernel, WeightFormat},
     };
     use std::collections::{BTreeMap, HashMap};
-    if !plan.f16_weight_mirrors.is_empty()
+    if (!vectors && !plan.f16_weight_mirrors.is_empty())
         || !plan.param_grad_pairs.is_empty()
         || plan.dispatches.iter().any(|d| d.is_derivative)
     {
@@ -140,18 +137,35 @@ fn fill_impl(plan: &mut ExecutionPlan, max_bytes: usize, vectors: bool) -> usize
             }
         }
     }
-    let Some(extra) = sources.values().try_fold(0usize, |sum, bytes| {
-        sum.checked_add(bytes.next_multiple_of(crate::memplan::ARENA_ALIGNMENT))
-    }) else {
+    let mut mirrors: HashMap<_, _> = plan.f16_weight_mirrors.iter().copied().collect();
+    let Some(extra) = plan
+        .f16_weight_mirrors
+        .iter()
+        .map(|entry| plan.buffers[entry.1.0 as usize])
+        .chain(
+            sources
+                .iter()
+                .filter(|entry| !mirrors.contains_key(&BufferRef(*entry.0)))
+                .map(|entry| entry.1.next_multiple_of(crate::memplan::ARENA_ALIGNMENT)),
+        )
+        .try_fold(0usize, |sum, bytes| sum.checked_add(bytes))
+    else {
         return 0;
     };
     if sources.is_empty() || extra > max_bytes {
         return 0;
     }
-    let parent = plan.clone();
-    let mut mirrors = HashMap::new();
+    // Extend the actual selected executable, retaining any later kernel
+    // refinements. Keep its existing qualified fallback without nesting it.
+    let parent = plan
+        .f16_weight_parent
+        .clone()
+        .unwrap_or_else(|| Box::new(plan.clone()));
     for (source, bytes) in sources {
         let source = BufferRef(source);
+        if mirrors.contains_key(&source) {
+            continue;
+        }
         let destination = BufferRef(u32::try_from(plan.buffers.len()).unwrap());
         plan.buffers
             .push(bytes.next_multiple_of(crate::memplan::ARENA_ALIGNMENT));
@@ -181,7 +195,7 @@ fn fill_impl(plan: &mut ExecutionPlan, max_bytes: usize, vectors: bool) -> usize
             }
         }
     }
-    plan.f16_weight_parent = Some(Box::new(parent));
+    plan.f16_weight_parent = Some(parent);
     plan.groups.clear();
     mirrors.len()
 }
@@ -341,7 +355,17 @@ mod tests {
                 .iter()
                 .any(|d| d.gemv_shape().is_some() && d.weight_format == compile::WeightFormat::F32)
         );
-        r.selected(origin, &cooperative.plan);
+        let mut refined = cooperative.plan.clone();
+        let vector_index = refined
+            .dispatches
+            .iter()
+            .position(|d| d.gemv_shape().is_some())
+            .unwrap();
+        // Another measured refinement may lock an existing kernel after the
+        // cache was installed. A vector neighbor must retain that choice.
+        refined.dispatches[vector_index].schedule_locked =
+            !refined.dispatches[vector_index].schedule_locked;
+        r.selected(origin, &refined);
         assert_eq!(r.pending.len(), 1);
         assert_eq!(r.early_remaining(), 0);
         assert!(
@@ -349,6 +373,11 @@ mod tests {
             "vector rounding waits for ordinary layouts"
         );
         let vector = r.next().unwrap();
+        assert_eq!(
+            vector.plan.dispatches[vector_index].schedule_locked,
+            refined.dispatches[vector_index].schedule_locked,
+            "must extend the current executable, not rebuild its older parent"
+        );
         assert_eq!(
             vector.plan.f16_weight_mirrors,
             cooperative.plan.f16_weight_mirrors
