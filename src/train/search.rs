@@ -1266,7 +1266,7 @@ impl measure::Frontier for Implementations {
         let covered = self.order.visited_forms.iter().filter(|&&v| v).count()
             >= self.order.seeds.min(self.order.arithmetic_layouts);
         if self.order.arithmetic_layouts != 1 && !covered {
-            return usize::from(self.weight_cache.may_remain());
+            return self.weight_cache.early_remaining();
         }
         let form = incumbent.map_or(0, |origin| origin.form);
         let nn_selected =
@@ -1289,7 +1289,7 @@ impl measure::Frontier for Implementations {
                     && !self.order.deferred.contains(&(form, choice))
             })
             .count()
-            + usize::from(self.weight_cache.may_remain())
+            + self.weight_cache.early_remaining()
     }
 
     fn observe(&mut self, origin: measure::Origin, qualified: bool) {
@@ -1409,7 +1409,7 @@ impl measure::Frontier for Implementations {
                 && !self.order.tried.contains(&(form, choice))
                 && !self.order.deferred.contains(&(form, choice))
         });
-        if !storage_pending && let Some(program) = self.weight_cache.next() {
+        if !storage_pending && let Some(program) = self.weight_cache.next_early() {
             return Some(program);
         }
         if self.refine_next && self.early_programs_remaining(incumbent) == 0 {
@@ -1560,7 +1560,12 @@ impl measure::Frontier for Implementations {
                 )
             });
             let Some((seed_index, choice_index)) = self.order.next(incumbent) else {
-                return self.attention_blocks.next();
+                // Vector rounding changes arithmetic. Let ordinary layouts
+                // settle first so recording retains their selected parent.
+                return self
+                    .attention_blocks
+                    .next()
+                    .or_else(|| self.weight_cache.next());
             };
             let seed = &self.seeds[seed_index];
             let AxisChoice {
@@ -3179,6 +3184,12 @@ mod tests {
                     );
                 }
             } else {
+                assert!(
+                    report
+                        .trials
+                        .iter()
+                        .all(|t| !t.description.contains("coherent_weight_cache="))
+                );
                 assert!(report.matrix_inputs.is_empty());
                 assert!(report.unsupported_matrix_inputs.is_empty());
                 assert!(

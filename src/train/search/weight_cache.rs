@@ -1,12 +1,18 @@
 //! A bounded local cache neighbor of an already qualified inference executable.
 use super::{compile::ExecutionPlan, measure};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Kind {
+    Cooperative,
+    Vector,
+}
 
 pub(super) struct Refinements {
     pub(super) enabled: bool,
     max_bytes: usize,
-    tried: HashSet<measure::Origin>,
-    pending: Option<(measure::Origin, ExecutionPlan)>,
+    tried: HashSet<(measure::Origin, Kind)>,
+    pending: VecDeque<(measure::Origin, Kind, ExecutionPlan)>,
 }
 impl Refinements {
     pub(super) fn new(max_bytes: usize) -> Self {
@@ -14,51 +20,91 @@ impl Refinements {
             enabled: false,
             max_bytes,
             tried: HashSet::new(),
-            pending: None,
+            pending: VecDeque::new(),
         }
     }
     pub(super) fn selected(&mut self, origin: Option<measure::Origin>, plan: &ExecutionPlan) {
-        self.pending = None;
+        self.pending.clear();
         let Some(origin) = origin else { return };
+        // Cache neighbors always retain the selected uncached executable as
+        // their caller-recorded/unmanaged-writer fallback, without nesting.
+        let parent = plan.f16_weight_parent.as_deref().unwrap_or(plan);
         if !self.enabled
-            || self.tried.contains(&origin)
-            || !plan.f16_weight_mirrors.is_empty()
-            || !plan.param_grad_pairs.is_empty()
-            || plan.dispatches.iter().any(|d| d.is_derivative)
+            || !parent.param_grad_pairs.is_empty()
+            || parent.dispatches.iter().any(|d| d.is_derivative)
         {
             return;
         }
-        let mut native = plan.clone();
+        let mut native = parent.clone();
         if fill(&mut native, self.max_bytes) > 0 {
-            // There are no added compute dependencies. Keep all of the actual
-            // winner's kernel choices, fusion and pass ranges.
-            native.groups = plan.groups.clone();
-            self.pending = Some((origin, native));
+            native.groups = parent.groups.clone();
+            if !self.tried.contains(&(origin, Kind::Cooperative)) {
+                self.pending
+                    .push_back((origin, Kind::Cooperative, native.clone()));
+            }
+        }
+        // Keep the cooperative-only comparison. Rounding vector B operands
+        // changes arithmetic and may fail qualification even when it passes.
+        if !self.tried.contains(&(origin, Kind::Vector)) {
+            let mut vector = parent.clone();
+            if fill_vectors(&mut vector, self.max_bytes) > 0 {
+                vector.groups = parent.groups.clone();
+                if vector != native {
+                    self.pending.push_back((origin, Kind::Vector, vector));
+                }
+            }
         }
     }
     pub(super) fn next(&mut self) -> Option<measure::Program> {
-        let (origin, plan) = self.pending.take()?;
-        self.tried.insert(origin);
+        let (origin, kind, plan) = self.pending.pop_front()?;
+        self.tried.insert((origin, kind));
         Some(measure::Program {
             prepared: true,
-            description: format!("refine={origin:?}, coherent_weight_cache=true"),
+            description: format!("refine={origin:?}, coherent_weight_cache=true, weights={kind:?}"),
             plan,
             submission_chunks: None,
             origin: Some(origin),
         })
     }
+    pub(super) fn early_remaining(&self) -> usize {
+        self.pending
+            .iter()
+            .filter(|entry| entry.1 == Kind::Cooperative)
+            .count()
+    }
+    pub(super) fn next_early(&mut self) -> Option<measure::Program> {
+        if self
+            .pending
+            .front()
+            .is_some_and(|entry| entry.1 == Kind::Cooperative)
+        {
+            self.next()
+        } else {
+            None
+        }
+    }
     pub(super) fn may_remain(&self) -> bool {
-        self.pending.is_some()
+        !self.pending.is_empty()
     }
 }
 
-fn fill(plan: &mut crate::compile::ExecutionPlan, max_bytes: usize) -> usize {
+fn fill(plan: &mut ExecutionPlan, max_bytes: usize) -> usize {
+    fill_impl(plan, max_bytes, false)
+}
+fn fill_vectors(plan: &mut ExecutionPlan, max_bytes: usize) -> usize {
+    fill_impl(plan, max_bytes, true)
+}
+
+fn fill_impl(plan: &mut ExecutionPlan, max_bytes: usize, vectors: bool) -> usize {
     use crate::{
         DType,
         compile::{BufferRef, Kernel, WeightFormat},
     };
-    use std::collections::{BTreeMap, HashMap, HashSet};
-    if !plan.f16_weight_mirrors.is_empty() {
+    use std::collections::{BTreeMap, HashMap};
+    if !plan.f16_weight_mirrors.is_empty()
+        || !plan.param_grad_pairs.is_empty()
+        || plan.dispatches.iter().any(|d| d.is_derivative)
+    {
         return 0;
     }
     let parameters: HashSet<_> = plan
@@ -67,63 +113,39 @@ fn fill(plan: &mut crate::compile::ExecutionPlan, max_bytes: usize) -> usize {
         .map(|p| p.1)
         .chain(plan.derived_params.iter().map(|p| p.0))
         .collect();
-    let graph_written: HashSet<_> = plan
+    let written: HashSet<_> = plan
         .dispatches
         .iter()
         .flat_map(|d| std::iter::once(d.output_buffer).chain(d.extra_outputs.iter().copied()))
         .collect();
     let mut sources = BTreeMap::new();
     for d in &plan.dispatches {
-        let Some(slots) = weight_mirror_operand_slots(d) else {
-            continue;
-        };
-        if d.full_precision() || d.matmul_prologue.is_some() || d.matmul_epilogue.is_some() {
-            continue;
-        }
-        let types = match d.kernel {
-            Kernel::CooperativeTyped { types, .. }
-            | Kernel::CooperativeWorkgroup {
-                types: Some(types), ..
-            } => types,
-            _ => continue,
-        };
-        if types.multiply != DType::F16 {
-            continue;
-        }
-        for (slot, storage) in slots.into_iter().zip([types.a, types.b]) {
+        for (slot, _) in mirror_operands(d, vectors).into_iter().flatten() {
             let buffer = d.input_buffers[slot];
-            if storage != DType::F32
-                || !parameters.contains(&buffer)
-                || graph_written.contains(&buffer)
-            {
-                continue;
-            }
-            if plan
-                .param_types
-                .get(&buffer)
-                .is_none_or(|t| t.dtype != DType::F32)
-            {
-                continue;
-            }
-            if plan
-                .weight_buffers
-                .get(&buffer)
-                .is_some_and(|x| x.0 != WeightFormat::F32)
-            {
-                continue;
-            }
             let bytes = plan.buffers[buffer.0 as usize];
-            if !bytes.is_multiple_of(4) || bytes == 0 {
-                continue;
+            if parameters.contains(&buffer)
+                && !written.contains(&buffer)
+                && plan
+                    .param_types
+                    .get(&buffer)
+                    .is_some_and(|t| t.dtype == DType::F32)
+                && plan
+                    .weight_buffers
+                    .get(&buffer)
+                    .is_none_or(|x| x.0 == WeightFormat::F32)
+                && bytes > 0
+                && bytes.is_multiple_of(4)
+            {
+                sources.insert(buffer.0, (bytes / 4).div_ceil(2) * 4);
             }
-            sources.insert(buffer.0, (bytes / 4).div_ceil(2) * 4);
         }
     }
-    let extra: usize = sources
-        .values()
-        .map(|bytes| bytes.next_multiple_of(crate::memplan::ARENA_ALIGNMENT))
-        .sum();
-    if extra > max_bytes {
+    let Some(extra) = sources.values().try_fold(0usize, |sum, bytes| {
+        sum.checked_add(bytes.next_multiple_of(crate::memplan::ARENA_ALIGNMENT))
+    }) else {
+        return 0;
+    };
+    if sources.is_empty() || extra > max_bytes {
         return 0;
     }
     let parent = plan.clone();
@@ -137,37 +159,79 @@ fn fill(plan: &mut crate::compile::ExecutionPlan, max_bytes: usize) -> usize {
         mirrors.insert(source, destination);
     }
     for d in &mut plan.dispatches {
-        let Some(slots) = weight_mirror_operand_slots(d) else {
-            continue;
-        };
-        if d.full_precision() || d.matmul_prologue.is_some() || d.matmul_epilogue.is_some() {
-            continue;
-        }
-        let types = match d.kernel {
-            Kernel::CooperativeTyped { ref mut types, .. }
-            | Kernel::CooperativeWorkgroup {
-                types: Some(ref mut types),
-                ..
-            } => types,
-            _ => continue,
-        };
-        if types.multiply != DType::F16 {
-            continue;
-        }
-        for (slot, storage) in slots.into_iter().zip([&mut types.a, &mut types.b]) {
-            if *storage == DType::F32
-                && let Some(&mirror) = mirrors.get(&d.input_buffers[slot])
-            {
-                d.input_buffers[slot] = mirror;
-                *storage = DType::F16;
+        for (slot, operand) in mirror_operands(d, vectors).into_iter().flatten() {
+            let Some(&mirror) = mirrors.get(&d.input_buffers[slot]) else {
+                continue;
+            };
+            d.input_buffers[slot] = mirror;
+            match d.kernel {
+                Kernel::CooperativeTyped { ref mut types, .. }
+                | Kernel::CooperativeWorkgroup {
+                    types: Some(ref mut types),
+                    ..
+                } => {
+                    if operand == 0 {
+                        types.a = DType::F16;
+                    } else {
+                        types.b = DType::F16;
+                    }
+                }
+                Kernel::Gemv { .. } => d.weight_format = WeightFormat::F16,
+                _ => unreachable!("mirror operand requires a supported kernel"),
             }
         }
     }
-    if !mirrors.is_empty() {
-        plan.f16_weight_parent = Some(Box::new(parent));
-        plan.groups.clear();
-    }
+    plan.f16_weight_parent = Some(Box::new(parent));
+    plan.groups.clear();
     mirrors.len()
+}
+
+// (binding slot, mathematical operand). Convolution's operands are reversed.
+fn mirror_operands(d: &crate::compile::Dispatch, vectors: bool) -> [Option<(usize, usize)>; 2] {
+    use crate::{
+        DType,
+        compile::{Kernel, ShaderEntry, WeightFormat},
+    };
+    if d.full_precision() || d.matmul_prologue.is_some() || d.matmul_epilogue.is_some() {
+        return [None; 2];
+    }
+    // GEMV's existing decoder unpacks B into F32 before multiplication. A,
+    // accumulation, bias and outputs stay F32; the private weight copy rounds.
+    if vectors
+        && matches!(
+            d.shader,
+            ShaderEntry::MatMulGemv
+                | ShaderEntry::MatMulGemvAdd
+                | ShaderEntry::MatMulGemvBT
+                | ShaderEntry::MatMulGemvBTAdd
+        )
+        && matches!(
+            d.kernel,
+            Kernel::Gemv {
+                integer_dot: false,
+                ..
+            }
+        )
+        && d.weight_format == WeightFormat::F32
+        && d.mnk()
+            .is_some_and(|(m, n, k)| m == 1 && n.is_multiple_of(4) && k.is_multiple_of(4))
+    {
+        return [Some((1, 1)), None];
+    }
+    let Some(slots) = weight_mirror_operand_slots(d) else {
+        return [None; 2];
+    };
+    let types = match d.kernel {
+        Kernel::CooperativeTyped { types, .. }
+        | Kernel::CooperativeWorkgroup {
+            types: Some(types), ..
+        } if types.multiply == DType::F16 => types,
+        _ => return [None; 2],
+    };
+    [
+        (types.a == DType::F32).then_some((slots[0], 0)),
+        (types.b == DType::F32).then_some((slots[1], 1)),
+    ]
 }
 
 fn weight_mirror_operand_slots(d: &crate::compile::Dispatch) -> Option<[usize; 2]> {
@@ -202,6 +266,291 @@ mod tests {
             1
         );
         p
+    }
+    fn vector_graph(bt: bool, add: bool, norm: bool) -> (Graph, ExecutionPlan) {
+        let mut g = Graph::new();
+        let x = g.input("x", &[1, 36]);
+        let a = if norm {
+            let scale = g.parameter("scale", &[36]);
+            g.rms_norm(x, scale, 1e-5)
+        } else {
+            x
+        };
+        let w = g.parameter("w", if bt { &[20, 36] } else { &[36, 20] });
+        let y = if bt {
+            g.matmul_bt(a, w)
+        } else {
+            g.matmul(a, w)
+        };
+        if add {
+            let bias = g.input("bias", &[1, 20]);
+            let n = &mut g.nodes_mut()[y as usize];
+            n.op = if bt {
+                crate::graph::Op::FusedMatMulBTAdd
+            } else {
+                crate::graph::Op::FusedMatMulAdd
+            };
+            n.inputs.push(bias);
+        }
+        g.set_outputs(vec![y]);
+        let mut p = compile::compile(&g);
+        if norm {
+            compile::fuse_rmsnorm_into_gemv(&mut p);
+        }
+        assert_eq!(p.dispatches.len(), if norm && add { 2 } else { 1 });
+        let vector = p
+            .dispatches
+            .iter()
+            .find(|d| d.gemv_shape().is_some())
+            .unwrap();
+        assert_eq!(vector.gemv_rmsnorm.is_some(), norm && !add);
+        (g, p)
+    }
+    #[test]
+    fn vector_cache_keeps_cooperative_choice_and_shared_mirror() {
+        let mut g = Graph::new();
+        let x = g.input("x", &[32, 32]);
+        let v = g.input("v", &[1, 32]);
+        let w = g.parameter("w", &[32, 32]);
+        let a = g.matmul(x, w);
+        let b = g.matmul(v, w);
+        g.set_outputs(vec![a, b]);
+        let mut p = compile::compile_with(
+            &g,
+            &compile::CompileOptions {
+                fuse_dispatches: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            super::super::fill_matrix_candidates(&mut p, DType::F16, true),
+            1
+        );
+        let origin = Some(measure::Origin { form: 0, choice: 0 });
+        let mut r = Refinements::new(2048);
+        r.enabled = true;
+        r.selected(origin, &p);
+        assert_eq!(r.pending.len(), 2);
+        assert_eq!(r.early_remaining(), 1);
+        let cooperative = r.next_early().unwrap();
+        assert_eq!(cooperative.plan.f16_weight_mirrors.len(), 1);
+        assert!(
+            cooperative
+                .plan
+                .dispatches
+                .iter()
+                .any(|d| d.gemv_shape().is_some() && d.weight_format == compile::WeightFormat::F32)
+        );
+        r.selected(origin, &cooperative.plan);
+        assert_eq!(r.pending.len(), 1);
+        assert_eq!(r.early_remaining(), 0);
+        assert!(
+            r.next_early().is_none(),
+            "vector rounding waits for ordinary layouts"
+        );
+        let vector = r.next().unwrap();
+        assert_eq!(
+            vector.plan.f16_weight_mirrors,
+            cooperative.plan.f16_weight_mirrors
+        );
+        assert_eq!(vector.plan.f16_weight_parent.as_deref(), Some(&p));
+        assert_eq!(vector.plan.buffers, cooperative.plan.buffers);
+        assert!(
+            vector
+                .plan
+                .dispatches
+                .iter()
+                .any(|d| d.gemv_shape().is_some() && d.weight_format == compile::WeightFormat::F16)
+        );
+        r.selected(origin, &vector.plan);
+        assert_eq!(r.pending.len(), 0);
+        let (_, p) = vector_graph(false, false, false);
+        for case in 0..5 {
+            let mut p = p.clone();
+            let original = p.clone();
+            let budget = if case == 0 { 0 } else { usize::MAX };
+            match case {
+                1 => p.dispatches[0].requires_full_precision = true,
+                2 => p.dispatches[0].is_derivative = true,
+                3 => p
+                    .param_grad_pairs
+                    .push((p.param_buffers[0].1, p.output_buffers[0])),
+                4 => p.dispatches.push(compile::Dispatch {
+                    output_buffer: p.param_buffers[0].1,
+                    ..Default::default()
+                }),
+                _ => {}
+            }
+            let before = p.clone();
+            assert_eq!(fill_vectors(&mut p, budget), 0, "case {case}");
+            assert_eq!(p, before);
+            assert!(original.f16_weight_mirrors.is_empty());
+        }
+    }
+    #[test]
+    fn vector_cache_decoders_preserve_f32_inputs_and_accumulation() {
+        use crate::{Session, SessionOptions};
+        let gpu = crate::reference::gpu::shared_context();
+        for bt in [false, true] {
+            for add in [false, true] {
+                for norm in [false, true] {
+                    let (_, mut p) = vector_graph(bt, add, norm);
+                    assert_eq!(fill_vectors(&mut p, 2048), 1);
+                    let restored: ExecutionPlan =
+                        serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+                    assert_eq!(restored, p);
+                    let mut session =
+                        Session::with_context_opts(p, gpu.clone(), SessionOptions::default());
+                    // F16 subnormal B and A beyond F16 range expose accidental A
+                    // narrowing or F16 arithmetic, independent of a matching GPU parent.
+                    let x: Vec<f32> = (0..36)
+                        .map(|i| 1048576.0 + (i % 7) as f32 * 1024.0)
+                        .collect();
+                    let w: Vec<f32> = (0..720)
+                        .map(|i| (1.0 + (i % 11) as f32 / 10.0) * 2f32.powi(-20))
+                        .collect();
+                    let bias: Vec<f32> = (0..20).map(|i| i as f32 / 8.0).collect();
+                    session.set_input("x", &x);
+                    session.set_parameter("w", &w);
+                    if norm {
+                        session.set_parameter("scale", &[1.; 36]);
+                    }
+                    if add {
+                        session.set_input("bias", &bias);
+                    }
+                    session.step();
+                    session.wait();
+                    let got = session.read_output(20);
+                    let divisor = if norm {
+                        (x.iter().map(|&a| f64::from(a).powi(2)).sum::<f64>() / 36.0 + 1e-5).sqrt()
+                    } else {
+                        1.0
+                    };
+                    for j in 0..20 {
+                        let want = (0..36)
+                            .map(|k| {
+                                f64::from(x[k]) / divisor
+                                    * f64::from(
+                                        half::f16::from_f32(
+                                            w[if bt { j * 36 + k } else { k * 20 + j }],
+                                        )
+                                        .to_f32(),
+                                    )
+                            })
+                            .sum::<f64>()
+                            + if add { f64::from(bias[j]) } else { 0.0 };
+                        assert!(
+                            (f64::from(got[j]) - want).abs() < 1e-9 + want.abs() * 2e-5,
+                            "bt={bt}, add={add}, norm={norm}, j={j}, got={}, want={want}",
+                            got[j]
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn vector_rounding_still_rejects_cancellation_and_overflow() {
+        use crate::{Session, SessionOptions};
+        let gpu = crate::reference::gpu::shared_context();
+        for overflow in [false, true] {
+            let (_, parent) = vector_graph(false, false, false);
+            let mut cached = parent.clone();
+            assert_eq!(fill_vectors(&mut cached, 2048), 1);
+            let mut original =
+                Session::with_context_opts(parent, gpu.clone(), SessionOptions::default());
+            let mut candidate =
+                Session::with_context_opts(cached, gpu.clone(), SessionOptions::default());
+            let mut w = vec![0.; 720];
+            for j in 0..20 {
+                w[j] = if overflow { 70000. } else { 1.0001 };
+                if !overflow {
+                    w[20 + j] = -1.;
+                }
+            }
+            for s in [&mut original, &mut candidate] {
+                s.set_input("x", &[1.; 36]);
+                s.set_parameter("w", &w);
+                s.step();
+                s.wait();
+            }
+            let want = original.read_output(20);
+            let got = candidate.read_output(20);
+            assert!(want.iter().all(|x| x.is_finite() && *x != 0.));
+            let relative_rms = (got
+                .iter()
+                .zip(&want)
+                .map(|(&a, &b)| f64::from(a - b).powi(2))
+                .sum::<f64>()
+                / want.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>())
+            .sqrt();
+            assert!(
+                !relative_rms.is_finite() || relative_rms > 0.01,
+                "rounding must remain a qualified alternative, overflow={overflow}"
+            );
+        }
+    }
+    #[test]
+    fn vector_cache_tracks_restore_share_record_and_gpu_writes() {
+        use crate::{Session, SessionOptions};
+        let gpu = crate::reference::gpu::shared_context();
+        let (graph, mut parent) = vector_graph(false, false, false);
+        parent.output_buffers.push(parent.param_buffers[0].1);
+        let mut cached = parent.clone();
+        assert_eq!(fill_vectors(&mut cached, 2048), 1);
+        let path =
+            std::env::temp_dir().join(format!("meganeura-vector-cache-{}.ron", std::process::id()));
+        crate::cache::save_plan(&cached, &graph, &path).unwrap();
+        let restored = crate::cache::load_plan(&graph, &path).unwrap().unwrap();
+        assert_eq!(restored, cached);
+        std::fs::remove_file(&path).unwrap();
+        let mut s = Session::with_context_opts(restored, gpu.clone(), SessionOptions::default());
+        s.set_input("x", &[1.; 36]);
+        s.set_parameter("w", &[1.; 720]);
+        let check = |s: &mut Session, scale: f32| {
+            s.step();
+            s.wait();
+            assert_eq!(s.read_output(20), vec![36. * scale; 20]);
+        };
+        check(&mut s, 1.);
+        let checkpoint = path.with_extension("safetensors");
+        s.save_checkpoint(&checkpoint).unwrap();
+        s.upload_param("w", &[2.; 720]);
+        check(&mut s, 2.);
+        s.load_checkpoint(&checkpoint).unwrap();
+        check(&mut s, 1.);
+        std::fs::remove_file(checkpoint).unwrap();
+        let mut owner = Session::with_context_opts(parent, gpu.clone(), SessionOptions::default());
+        owner.set_parameter("w", &[3.; 720]);
+        s.share_parameter_from(&mut owner, "w").unwrap();
+        check(&mut s, 3.);
+        owner.upload_param("w", &[4.; 720]);
+        check(&mut s, 4.);
+        let mut enc = gpu.create_command_encoder(blade_graphics::CommandEncoderDesc {
+            name: "vector-cache-test",
+            buffer_count: 1,
+            manual_barriers: false,
+        });
+        enc.start();
+        s.record(&mut enc).unwrap();
+        owner.upload_param("w", &[5.; 720]);
+        let sync = gpu.submit(&mut enc);
+        s.track_submission(sync);
+        s.wait();
+        assert_eq!(s.read_output(20), vec![180.; 20]);
+        check(&mut s, 5.);
+        // Publishing an output that aliases the shared master makes all
+        // caches of that allocation use the parent. A real GPU write after
+        // the last cache refresh must be observed by the next owned step.
+        let exposed = owner.output_buffer(1).unwrap();
+        enc.start();
+        enc.transfer("replace-vector-weight")
+            .fill_buffer(exposed, 2880, 0);
+        let sync = gpu.submit(&mut enc);
+        s.track_submission(sync);
+        s.wait();
+        check(&mut s, 0.);
+        gpu.destroy_command_encoder(&mut enc);
     }
     #[test]
     fn cache_neighbor_is_local_prepared_and_once_per_origin() {
