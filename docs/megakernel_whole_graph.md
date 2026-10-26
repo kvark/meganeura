@@ -8,8 +8,8 @@ nodes in the same dispatch. The transfer reset and compute dispatch share one
 queue submission. Initial parameter/moment allocation and explicit optimizer
 calls remain separate operations outside that step boundary.
 
-The latest qualified runtime is `bed8c91`; its
-[narrow scalar tiles and fresh measurements](#narrow-scalar-tiles)
+The latest qualified runtime is `762faf2`; its
+[cooperative row distribution and fresh measurements](#cooperative-row-distribution)
 are recorded below. Performance parity remains unmet.
 
 For the application benchmarks, use `--whole-graph --workers 256`. For a regular
@@ -2280,11 +2280,127 @@ serialized GPU jobs and local storage. Builds and analysis do not overlap
 normal timing or SDK capture. The retained runtime and primary measurements
 remain unchanged; baseline parity remains unmet.
 
-The next candidate is to distribute distinct cooperative output rows across
-subgroups, reducing idle lanes and per-thread accumulator liveness while
-preserving the output geometry and arithmetic. This requires a uniform staging
-and barrier proof at alternate subgroup widths, followed by the same completed-
-step gates. The owner-only result does not establish that this will be faster.
+The following investigation distributes distinct cooperative output rows across
+subgroups while preserving output geometry and arithmetic. The owner-only result
+does not by itself establish that a different distribution will be faster.
+
+## Cooperative row distribution
+
+Runtime `762faf20b03a0d36e0a56a9b5180aa486aafd0bd` distributes the native
+cooperative matmul's two output row halves across logical subgroups zero and
+one. Each computes two accumulators. At subgroup width 64, subgroup zero also
+computes the second row's two accumulators; additional subgroups at narrower
+widths never store. The original 64-invocation geometry, four operand tiles,
+single K loop and unconditional staging/barriers remain. Packed graph tiles
+retain separate virtual subgroup coordinates and four-tile packing.
+
+Each output preserves its K order, conversion, fused-add initialization and
+compensated main/high-low/low-high product order. Typed splits, output casts,
+post-product addends, horizontal copies, prologue caching and shared epilogues
+retain their behavior. The separate 8×8 F32 and workgroup-scoped templates are
+unchanged. New fragments reside in the existing WGSL template. No scheduler,
+descriptor, fence, Naga or validation-flag change is needed. Both ordinary and
+persistent execution use the same updated template.
+
+The initial variant put K loops inside subgroup-width-dependent rounds. It
+produced correct results but failed the existing packing assertion: Naga's
+scope-aware admission analysis could not prove the outer loop workgroup-uniform,
+so the native handler packed one tile instead of four. Its 80 comparisons,
+two resource captures and failed assertion remain in the record. The retained
+variant keeps barriers outside all subgroup-dependent control. Ownership proofs
+and shader validation cover alternate widths; hardware execution is qualified
+only on RTX 5080.
+
+Qualification passes **666 library tests** (eight existing ignores), **168 strict
+whole-graph oracle tests**, **50 matrix regressions**, **eight whole-graph smoke
+tests**, formatting and strict all-target/all-feature Clippy. One existing typed
+source assertion referred to the old accumulator name; it now checks both row
+paths and all four static multiply-adds. No numerical tolerance was changed.
+Although this edit only affected a test, rebuilding changed the example binary
+hashes. The failed equivalence audit is preserved, and the final binaries
+received fresh primary measurements, resources and both-phase SDK captures.
+Their generated model shaders match the exploratory fixed-barrier shaders
+byte-for-byte; those exploratory timings remain separately identified.
+
+The final primary dataset contains **250 comparisons**, fifty AB/BA pairs for
+each case, plus **250 fresh old-binary control comparisons**. Every case passes
+the existing state budgets and completion checks, with matching implementation
+keys, one persistent compute dispatch and no fallback. Maximum training error
+remains 4.66e-9. Paired ratios are medians of per-pair ratios, not ratios of the
+separate latency medians.
+
+| Case | Ordinary ms | Persistent ms | Paired persistent / ordinary, bootstrap 95% interval |
+|---|---:|---:|---:|
+| CI inference | 0.05225 | 0.07096 | 1.363 [1.352, 1.371] |
+| CI backward | 0.06629 | 0.10208 | 1.545 [1.535, 1.555] |
+| CI SGD | 0.06768 | 0.10187 | 1.508 [1.493, 1.531] |
+| Model forward | 4.270 | 5.654 | 1.382 [1.328, 1.388] |
+| Model training + SGD | 15.177 | 19.106 | 1.256 [1.235, 1.268] |
+
+Against the fresh controls, persistent forward changes from 5.814 to 5.654 ms:
+ratio **0.973 [0.913, 0.982]**, about 2.7% lower. Training changes from 19.216 to
+19.106 ms: **0.994 [0.979, 0.997]**, about 0.6% lower. Normalizing by each run's
+ordinary timings gives forward **0.996 [0.916, 1.016]**, an inconclusive change,
+and training **0.969 [0.947, 0.991]**. These are modest gains; parity remains unmet.
+
+CI inference varies between runs despite identical ordinary and persistent GPU
+pipeline identities. The primary persistent median is 6.5% lower than control,
+but its normalized ratio is 2.9% higher. An additional **600-comparison A/B/B/A
+sequence** gives candidate/control persistent ratios 1.113 then 0.966, with
+normalized ratios 0.965 then 0.988; the second comparison's intervals include
+no change. CI backward and SGD intervals include no change. No stable CI
+inference speedup or regression is established, nor a specific host-side cause.
+All samples remain. Bootstrap intervals use 10,000 resamples and describe
+within-run uncertainty, not between-run variation.
+
+Two final resource captures show persistent forward/training register counts
+falling from 116/114 to **100/103**. Shared memory remains **20,880/29,232 bytes**;
+code changes from 108,544/256,512 to **106,752/256,512 bytes**.
+
+Four SDK groups per backend and phase collect 146 post-warmup samples each.
+All final captures have matching adapters, successful exits, no monitor warnings,
+exact prior same-backend state hashes and zero measured local load/store traffic.
+Cross-backend state passes the existing benchmark budget. Training SDK replay
+uses zero-rate SGD and is diagnostic, separate from normal completed-step timing.
+
+| Final SDK replay | Candidate ordinary / persistent | Fresh control ordinary / persistent |
+|---|---:|---:|
+| Forward ms | 3.852 / 5.248 | 3.677 / 5.324 |
+| Training ms | 12.001 / 16.909 | 11.997 / 17.074 |
+| Forward estimated warp instructions, billion | 0.382 / 0.679 | 0.382 / 0.696 |
+| Training estimated warp instructions, billion | 1.549 / 2.803 | 1.553 / 2.824 |
+| Forward estimated shared wavefronts, million | 126.057 / 141.433 | 129.848 / 144.561 |
+| Training estimated shared wavefronts, million | 448.750 / 536.862 | 451.353 / 539.028 |
+| Forward barrier share of active warp cycles | 4.10% / 57.17% | 3.97% / 57.42% |
+| Training barrier share of active warp cycles | 3.12% / 50.35% | 3.13% / 50.21% |
+
+Duration-weighted tensor activity is approximately half the control in both
+phases and backends. Persistent instruction estimates fall about 2.5% forward
+and 0.8% training, but training still executes about **1.81× ordinary warp
+instructions**. Barrier waiting remains substantial. Ordinary forward SDK replay
+is slower in this capture, consistent with treating normalized forward benefit
+as unresolved. Rates multiplied by replay duration are estimates, and active
+warp-cycle shares are not elapsed-time attribution. These counters do not prove
+that a particular queue instruction or cache effect causes the remaining gap.
+
+All **1,880 normal comparisons**, **six resource diagnostics** and **seven SDK
+capture directories** (three exploratory, four final) are preserved under
+`target/coop-row-subgroups-{probe,packed,qualified}/`. The manifest is
+`target/megakernel-results/coop-row-subgroups/summary.json`, with **607 independently
+verified artifact hashes**. It also checks source patches against base `70c75f4`,
+generated packing, pipeline identities, exact SDK state files and restored final
+binaries. Verification logs are `target/coop-rows-manifest.log` and
+`target/coop-rows-artifact-audit.log`.
+
+The final CI binary SHA-256 is
+`9164358b0a3baf3e3c3a491ebbb4199736fb05fd81289c98edff18fa88af5fce`;
+the model binary is
+`f4c43ae7e5a36fbe571cb51496a0f7237982401cc1d01dfed76dbac70fe7448a`.
+Builds, tests, copies and analyses use verified bounded cgroups on local `/x`
+storage. GPU jobs are serialized; builds and heavy analysis do not overlap
+normal timing or SDK capture. Next investigations are explicit worker-count
+sweeps on the current geometry and deeper scalar K staging, subject to the
+same arithmetic, completion and completed-step gates.
 
 ## Earlier artifact identities
 

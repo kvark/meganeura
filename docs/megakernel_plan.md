@@ -267,14 +267,24 @@ the descriptor-reference repair requires fresh measurements.
   tensor-active work, exact prior state and zero local traffic, but completed
   steps show no useful gain. Revert the probe; preserve two resource diagnostics
   and 185 independently verified artifact hashes.
-- [ ] Investigate the remaining scheduling/integer cost. Complete-step replay
-  still executes about 1.83 times as many warp instructions as ordinary execution.
-  Next, assess distributing distinct cooperative output rows across subgroups
-  to reduce idle lanes and accumulator liveness. Preserve per-output arithmetic,
-  uniform staging/barriers and correctness at alternate subgroup widths.
-  The ownership probe rules out duplicate tensor products as a useful latency
-  target by itself. Require completed-step gains in matched ordinary/persistent
-  comparisons before retaining a new distribution.
+- [x] Distribute native cooperative output rows across subgroups while retaining
+  the original K loop and unconditional workgroup barriers. Reject the first
+  variant because its outer loop prevents four-tile packing admission; retain
+  the fixed-barrier variant at `762faf2` after 666 library, 168 strict oracle,
+  50 matrix and eight whole-graph checks. Final 50-pair model comparisons show persistent
+  forward/training medians 2.7%/0.6% below fresh controls; normalized forward
+  improvement remains inconclusive. Preserve CI inference's between-run
+  variation, including the A/B/B/A follow-up, rather than claim a CI speedup.
+  Keep all 1,880 normal comparisons, six resource diagnostics and both-phase
+  SDK captures. Alternate subgroup widths have ownership and validation
+  coverage; GPU execution remains qualified only on RTX 5080.
+- [ ] Investigate the remaining scheduling/integer cost and barrier waiting.
+  Sweep explicit worker counts on the current geometry, including the small CI
+  graphs; preserve the requested counts and report actual execution geometry.
+  Separately assess deeper scalar K staging to reduce barrier frequency,
+  preserving configured choices, output arithmetic (including padded tails),
+  resource admission and the existing correctness gates. Neither change is
+  implemented yet. Require completed-step gains against fresh controls.
   The measured no-instruction waiting does not establish a cache bottleneck.
   Finer dependencies require proofs for payload ranges,
   allocation reuse, original tile coordinates and completion aggregation.
