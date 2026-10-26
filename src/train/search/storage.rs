@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn attention_store_narrows_only_its_private_f16_output() {
-        for protection in 0..4 {
+        for protection in 0..5 {
             let mut g = Graph::new();
             let q = g.input("q", &[33, 144]);
             let k = g.input("k", &[19, 48]);
@@ -250,6 +250,9 @@ mod tests {
                 .position(|d| d.shader == ShaderEntry::FlashAttentionProducts)
                 .unwrap();
             p.dispatches[index].requires_full_precision = protection == 3;
+            if protection == 4 {
+                p.lse_buffers.clear(); // Unrecognized auxiliary output.
+            }
             let buffer = p.dispatches[index].output_buffer;
             let before = p.clone();
             assert_eq!(fill(&mut p), usize::from(protection == 0));
