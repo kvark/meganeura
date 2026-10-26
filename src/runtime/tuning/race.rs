@@ -144,7 +144,11 @@ impl Session {
             output_index,
             sequences,
         } = prepare_race(class, &self.plan.dispatches[class.members[0]], &tiles);
-        let Some(bytes) = scratch_bytes(&sizes).filter(|&bytes| bytes <= options.max_scratch_bytes)
+        let Some(bytes) = scratch_bytes(&sizes)
+            .and_then(|bytes| {
+                bytes.checked_add(sizes[1].checked_mul((class.input_b_copies - 1) as usize)?)
+            })
+            .filter(|&bytes| bytes <= options.max_scratch_bytes)
         else {
             fail_remaining(&mut outcomes, TuneDecision::ScratchLimit);
             return conclude(race, outcomes);
@@ -230,6 +234,10 @@ impl Session {
         }
         scratch.input_b_uploaded = true;
         drop(inputs);
+        {
+            let _timer = super::PhaseTimer::new(&mut preparation_times.buffers);
+            scratch.replicate_input_b(class.input_b_copies, device_local[1]);
+        }
         let runs: Vec<Option<Run<'_>>> = sequences
             .iter()
             .zip(&alive)
@@ -362,6 +370,35 @@ impl Session {
     }
 }
 
+/// Bound the modeled weight working set by the caller's sample and memory
+/// limits. Reserve every potential host encoder before choosing a copy count,
+/// so compilation failures cannot change a memo's sampling contract.
+pub(super) fn weight_copies(
+    class: &SearchClass,
+    options: &TuneOptions,
+    distinct: usize,
+    timestamps: bool,
+) -> u32 {
+    let Some(sizes) = class.key.buffer_sizes() else {
+        return 1;
+    };
+    let Some(bytes) = scratch_bytes(&sizes).and_then(|bytes| {
+        let encoders = if timestamps {
+            0
+        } else {
+            class.challengers.len() + 1
+        };
+        bytes.checked_add(encoders.checked_mul(ENCODER_SCRATCH_BYTES)?)
+    }) else {
+        return 1;
+    };
+    let extra = options.max_scratch_bytes.saturating_sub(bytes) / sizes[1].max(1);
+    distinct
+        .min(options.dispatches_per_sample as usize)
+        .min(extra.saturating_add(1))
+        .max(1) as u32
+}
+
 struct PreparedRace {
     logical_sizes: Vec<usize>,
     sizes: Vec<usize>,
@@ -445,7 +482,7 @@ fn race_rounds(
             host,
             runs,
             &order,
-            1,
+            (scratch.input_b_copies.len() + 1) as u32,
             timestamps,
             start,
             options.max_time,
@@ -469,7 +506,8 @@ fn race_rounds(
         timestamps,
         runs[0].as_ref().unwrap().len(),
         fastest,
-    );
+    )
+    .max((scratch.input_b_copies.len() + 1) as u32);
     // samples[candidate][round]: a dropped candidate has no later samples.
     let mut samples: Vec<Vec<Option<f64>>> = vec![Vec::new(); alive.len()];
     let max_rounds = options.sample_pairs;
@@ -653,11 +691,13 @@ impl Scratch<'_, '_> {
         &mut self,
         entries: &[(&[(&bg::ComputePipeline, &Dispatch)], u32)],
     ) -> Option<Vec<f64>> {
-        let pieces: Vec<bg::BufferPiece> = self.buffers.iter().map(|&b| b.into()).collect();
+        let mut pieces: Vec<bg::BufferPiece> = self.buffers.iter().map(|&b| b.into()).collect();
         self.encoder.start();
         for &(sequence, reps) in entries {
             let mut pass = self.encoder.compute("tune_race");
             for repetition in 0..reps {
+                pieces[1] =
+                    super::timed_input_b(self.buffers[1], &self.input_b_copies, repetition).into();
                 for (position, &(pipeline, dispatch)) in sequence.iter().enumerate() {
                     if repetition != 0 || position != 0 {
                         pass.barrier();
@@ -716,6 +756,7 @@ fn run_round(
                     Scratch::run_on(
                         scratch.gpu,
                         &scratch.buffers,
+                        &scratch.input_b_copies,
                         host.encoders[candidate]
                             .as_mut()
                             .expect("live host candidate owns an encoder"),
@@ -994,6 +1035,155 @@ mod tests {
         assert!(!decided_outcome(&outcome));
         outcome.qualified = true;
         assert!(decided_outcome(&outcome));
+    }
+
+    #[test]
+    #[ignore = "GPU qualification of distinct-weight sampling on host and timestamp paths"]
+    fn timed_samples_read_weight_copies_but_qualification_reads_original() {
+        let gpu = std::sync::Arc::new(
+            crate::init_gpu_context_with(crate::GpuOptions {
+                timing: true,
+                ..crate::GpuOptions::from_env()
+            })
+            .unwrap(),
+        );
+        let mut graph = crate::Graph::new();
+        let x = graph.input("x", &[1, 64]);
+        let w = graph.parameter("w", &[64, 96]);
+        let v = graph.parameter("v", &[64, 96]);
+        let a = graph.matmul(x, w);
+        let b = graph.matmul(x, v);
+        graph.set_outputs(vec![a, b]);
+        let mut session = Session::with_context_opts(
+            crate::compile::compile(&graph),
+            gpu.clone(),
+            crate::SessionOptions {
+                coop: crate::CoopPolicy::Disabled,
+                ..Default::default()
+            },
+        );
+        let options = TuneOptions::default();
+        let (classes, _) = session.tune_classes(&options);
+        assert_eq!(classes.len(), 1);
+        let class = &classes[0];
+        assert_eq!(class.input_b_copies, 2);
+        let mut limited = options.clone();
+        limited.max_scratch_bytes = 0;
+        assert_eq!(session.tune_classes(&limited).0[0].input_b_copies, 1);
+        let mut repeated = crate::compile::compile(&graph);
+        repeated.dispatches[1].input_buffers[1] = repeated.dispatches[0].input_buffers[1];
+        let reused = Session::with_context_opts(
+            repeated,
+            gpu.clone(),
+            crate::SessionOptions {
+                coop: crate::CoopPolicy::Disabled,
+                ..Default::default()
+            },
+        );
+        assert_eq!(reused.tune_classes(&options).0[0].input_b_copies, 1);
+        session
+            .pipelines
+            .ensure_tune_tile(
+                &gpu,
+                &session.plan.dispatches[class.members[0]],
+                class.initial,
+            )
+            .unwrap();
+        let PreparedRace {
+            logical_sizes,
+            sizes,
+            output_index,
+            sequences,
+        } = prepare_race(
+            class,
+            &session.plan.dispatches[class.members[0]],
+            &[class.initial],
+        );
+        let bytes = scratch_bytes(&sizes).unwrap() + sizes[1];
+        let placement = vec![true; sizes.len()];
+        let mut staging = Staging::new(&gpu, options.staging, options.staging_reuse);
+        let mut preparation = TunePreparationTimes::default();
+        let mut cleanup = None;
+        let mut scratch = Scratch::new(
+            &placement,
+            &sizes,
+            (&class.key, output_index),
+            bytes,
+            &mut staging,
+            &mut preparation,
+            &mut cleanup,
+        );
+        let inputs = race_inputs(class, &logical_sizes, &sizes, 0);
+        for (i, data) in inputs.iter().enumerate() {
+            scratch.upload(i, data, None);
+        }
+        scratch.input_b_uploaded = true;
+        scratch.replicate_input_b(2, true);
+        let sequence: Vec<_> = sequences[0]
+            .iter()
+            .map(|d| (&session.pipelines.map[&Pipelines::key(d)].raw, d))
+            .collect();
+        let mut times = TuneQualificationTimes::default();
+        for timestamps in [false, true] {
+            // Both replicas initially contain the exact qualified operand.
+            let ms = if timestamps {
+                scratch.run_timed(&[(&sequence, 2)]).unwrap()[0]
+            } else {
+                Scratch::run_on(
+                    &gpu,
+                    &scratch.buffers,
+                    &scratch.input_b_copies,
+                    &mut scratch.encoder,
+                    &sequence,
+                    2,
+                )
+            };
+            assert!(ms.is_finite() && ms > 0.0);
+            assert!(qualify_output(
+                &class.key,
+                &inputs,
+                &scratch.read_output(&mut times),
+                1.0
+            ));
+            scratch.encoder.start();
+            scratch
+                .encoder
+                .transfer("poison weight replica")
+                .fill_buffer(scratch.input_b_copies[0].into(), sizes[1] as u64, 0xff);
+            scratch.submit_wait();
+            if timestamps {
+                scratch.run_timed(&[(&sequence, 2)]).unwrap();
+            } else {
+                Scratch::run_on(
+                    &gpu,
+                    &scratch.buffers,
+                    &scratch.input_b_copies,
+                    &mut scratch.encoder,
+                    &sequence,
+                    2,
+                );
+            }
+            assert!(scratch.read_output(&mut times).iter().all(|v| v.is_nan()));
+            // Numerical qualification does not depend on the timing pool.
+            scratch.run(&sequence, 1);
+            assert!(qualify_output(
+                &class.key,
+                &inputs,
+                &scratch.read_output(&mut times),
+                1.0
+            ));
+            scratch.encoder.start();
+            scratch
+                .encoder
+                .transfer("restore weight replica")
+                .copy_buffer_to_buffer(
+                    scratch.buffers[1].into(),
+                    scratch.input_b_copies[0].into(),
+                    sizes[1] as u64,
+                );
+            scratch.submit_wait();
+        }
+        assert!(scratch.staging.stats.peak_bytes >= bytes);
     }
 
     #[test]
