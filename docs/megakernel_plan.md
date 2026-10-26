@@ -242,14 +242,27 @@ the descriptor-reference repair requires fresh measurements.
   old-binary control; the normalized interval still overlaps no change.
   Six SDK groups per mode retain exact same-backend state and zero local traffic.
   Preserve all 950 comparisons, ten resource diagnostics and rejected variants.
+- [x] Omit redundant scratch clearing for proven F32 scalar matmul bodies only.
+  Preserve staging, tails, padding, K=0 behavior, lane participation, reuse
+  ordering and every payload fence. Eight whole-graph and 168 strict oracle
+  checks pass, followed by 400 candidate/control comparisons. Code shrinks and
+  SDK estimates fall slightly, but model timing intervals include no gain and
+  normalized CI SGD regresses. Revert the probe and preserve the evidence.
+- [x] Test independent pointwise batches using the existing optimizer batching
+  machinery. Nine focused checks pass, including partial 1,025-tile and small
+  three-tile grids. Neither four tiles at a 1,024-tile threshold nor two at 512
+  selects model work: its largest generated pointwise grid has only 141 tiles.
+  Preserve eighty control comparisons, two resource diagnostics and the
+  construction audit; generated model shaders are exactly unchanged. Revert
+  both prototypes without treating these timings as a batching improvement.
 - [ ] Investigate the remaining scheduling/integer cost. Complete-step replay
   still executes about 1.83 times as many warp instructions as ordinary execution.
-  Next, test skipping per-tile scratch clearing only for scalar matrix bodies
-  proven to overwrite every shared location before reading it. Prove staging,
-  tail/padding accesses, zero-length K, lane participation and reuse ordering;
-  retain initialization for every unproven family. Preserve arithmetic, selected
-  geometry and payload fences. Check poison/replay correctness, resource and
-  local-traffic counters, then completed-step latency against a fresh control.
+  Next, compare the existing contiguous and interleaved scalar column mappings
+  with identical shapes, K stages, precision and per-output accumulation order.
+  Inspect generated shared-memory accesses, resource/local-traffic counters and
+  both model phases against fresh completed-step controls. Keep arithmetic
+  selection matched across ordinary and persistent execution, and preserve
+  explicit tuning choices in any retained implementation.
   The measured no-instruction waiting does not establish a cache bottleneck.
   Finer dependencies require proofs for payload ranges,
   allocation reuse, original tile coordinates and completion aggregation.

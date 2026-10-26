@@ -2048,13 +2048,109 @@ SPIR-V dumps, SDK receipts and state files. The manifest
 independently verified artifact hashes**; the independent audit log is
 `target/narrow-scalar-artifact-audit.log`.
 
-Next, test omitting per-tile scratch clearing only for scalar matrix bodies
-whose staging overwrites every shared location before reading it. Admission
-must prove tail/padding safety, K=0 behavior, lane participation and ordering
-across reused scratch. Keep initialization for unproven families and preserve
-all payload fences, selected geometry and arithmetic. Poison/replay tests,
-resource/local-traffic diagnostics and fresh completed-step controls must
-qualify any retained change.
+The subsequent scratch-clearing and pointwise-batching experiments are recorded
+below. Neither is retained; the qualified runtime remains `bed8c91`.
+
+## Scratch clearing and pointwise batching probes
+
+The scratch probe omits the callable converter's explicit zeroing loops and
+initial workgroup barrier for F32 scalar matmul bodies only. Each K stage already
+overwrites all shared A/B cells it reads, including zero values for edge inputs,
+then synchronizes before computing. Padding is never read; K=0 and empty splits
+perform no shared reads. The original end-of-stage and worker-loop barriers
+order subsequent reuse. Admission covers plain/AT/BT products, addends, scalar
+horizontal slices and split-K bodies, preserving their original geometry and
+arithmetic. Other families, regional execution and all payload fences retain
+their existing behavior. Shared capacity and pooling are unchanged.
+
+Source audits confirm removal from four forward and ten training handlers.
+All eight whole-graph checks and all 168 strict whole-graph oracle tests pass.
+Normal measurements retain **400 comparisons**: twenty-pair CI/model trials
+and fresh controls, then fifty-pair model repeats with another fresh control.
+Every comparison preserves implementation keys, logical work, one compute
+dispatch and no fallback. Maximum training error remains 4.66e-9. The first
+repeat-control launch used a mistyped ICD path and failed before GPU execution;
+its log and empty result are preserved beside the successful corrected run.
+
+| Case | Candidate ordinary / persistent ms | Control ordinary / persistent ms | Persistent candidate / control | 95% bootstrap interval |
+|---|---:|---:|---:|---:|
+| SmolVLA forward, fifty pairs | 4.154 / 5.791 | 4.209 / 5.811 | 0.997 | 0.955–1.012 |
+| SmolVLA training, fifty pairs | 15.173 / 18.953 | 14.848 / 19.224 | 0.986 | 0.944–1.001 |
+| CI inference, twenty pairs | 0.049471 / 0.069051 | 0.057451 / 0.075850 | 0.910 | 0.870–0.931 |
+| CI backward, twenty pairs | 0.066565 / 0.099536 | 0.066685 / 0.102351 | 0.973 | 0.962–0.991 |
+| CI SGD, twenty pairs | 0.068116 / 0.102576 | 0.068500 / 0.101465 | 1.011 | 0.994–1.054 |
+
+All samples and outliers remain. The large ordinary CI inference movement
+illustrates why the absolute changes alone cannot establish a runtime benefit.
+Candidate/control ratios of paired medians are 1.001 (0.970–1.060) forward and
+0.977 (0.895–1.001) training. CI SGD's paired ratio regresses from 1.483 to 1.517,
+a relative ratio of 1.023 (1.008–1.052). Intervals use 10,000 bootstrap resamples
+and describe sampling within these runs, not between-run drift. The probe does
+not establish a useful completed-step gain and is reverted.
+
+Separate resource diagnostics report unchanged 116/114 registers and
+20,880/29,232 bytes of shared storage. Code decreases from 108,544/256,512 to
+104,576/246,656 bytes for forward/training. Candidate and fresh-control SDK
+captures each collect three groups per backend, with 146 samples per group,
+matching adapters, successful exits and no warnings. The actual state files
+match the prior qualified hash within each backend; cross-backend state passes
+the explicit benchmark comparison with maximum error 4.66e-9. Replay is exact
+within each backend, and graph/optimizer arithmetic remains matched.
+
+| Complete-step SDK diagnostic | Candidate | Fresh control |
+|---|---:|---:|
+| Ordinary replay ms | 12.002 | 12.009 |
+| Persistent replay ms | 17.017 | 17.064 |
+| Persistent warp instructions per replay | 2.808 billion | 2.829 billion |
+| Persistent shared wavefronts per replay | 537.518 million | 541.199 million |
+| Persistent barrier share of active warp cycles | 50.027% | 50.299% |
+| Local load/store traffic, both backends | zero | zero |
+
+Repeated instruction and clock rates vary by at most 0.327% and 0.267%
+respectively across these captures' three groups. The small reductions in
+estimated work and diagnostic replay time do not override the normal timing
+gate. Counter counts are rates multiplied by replay duration, and barrier
+shares are not elapsed-time attribution. The proof, patches, rejected source,
+binaries, dumps, measurements and SDK states are indexed by
+`target/megakernel-results/scalar-scratch/summary.json`, with **177 independently
+verified hashes** and audit log `target/scalar-scratch-artifact-audit.log`.
+
+The following pointwise experiment reuses the existing scratch-free sequential
+batch loop, original logical coordinates and clamped completion RMW. Admission
+requires generated F32 pointwise bodies without broadcasts and matching logical/
+physical workgroup sizes. The first version requests four tiles per claim at
+the existing 1,024-tile threshold. A second version requests two at 512, leaving
+SGD's four/1,024 policy unchanged. Both pass nine whole-graph tests, including a
+new exact-output fixture with changed inputs, 1/3/256 workers, a partial
+1,025-tile grid and a three-tile grid using the same handler. Its initial failure
+was a mistaken assertion about compilation order, before execution; the corrected
+fixture requires the exact multiset of two large and two small grids.
+
+Neither policy selects model work. A construction audit finds five generated
+pointwise nodes totaling 161 tiles in forward and forty totaling 4,690 tiles
+in training. The largest grid has **141 tiles**. After excluding broadcasts,
+eligible work totals only seven forward tiles and 4,536 training tiles; none
+meets either per-node threshold. There is no reason to relax broadcast admission
+to reach these thresholds. The two variants' eighty normal comparisons are
+therefore controls, not evidence of a batching speedup. Two resource diagnostics
+match the retained pipeline reports, and both complete generated model shader
+files are byte-for-byte identical to the retained runtime. Full oracle and SDK
+qualification are not claimed for these prototypes.
+
+Both pointwise policies, temporary diagnostics and the temporary fixture are
+reverted. The evidence is indexed by
+`target/megakernel-results/pointwise-batches/summary.json`, with **122 independently
+verified hashes** and audit log `target/pointwise-batches-artifact-audit.log`.
+The retained examples are rebuilt byte-for-byte identically to the preserved
+qualified binaries, and all eight restored whole-graph checks pass. Every
+build, test, copy, capture and heavy analysis uses a verified bounded
+cgroup; GPU jobs are serialized and all artifacts stay on local `/x` storage.
+
+Next, compare the existing contiguous and interleaved scalar column mappings
+while preserving shapes, K staging and each output's accumulation order. Check
+shared-memory access patterns, resource/local-traffic counters and completed
+CI/model timings in both backends. Any retained policy must preserve explicit
+tuning choices. Baseline parity remains open.
 
 ## Earlier artifact identities
 
