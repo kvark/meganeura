@@ -3595,6 +3595,106 @@ independently verified artifact hashes**, SHA-256
 The independent verification log is `target/ticket-subgroup-hint/verify.log`.
 Runtime `540eccf` remains qualified; baseline parity remains unmet.
 
+## Scalar B shared-memory column permutation
+
+Two rejected prototypes on `f466007` permute the physical shared-memory columns
+of F32 scalar B tiles while retaining each thread's original output columns.
+For `BN = 16 * TN`, the mapping is
+`P(c) = c / TN + (c % TN) * 16`. It is bijective, and the original output column
+`c = tx * TN + j` maps to `tx + j * 16`. Both staging and reduction use this
+mapping. Unlike the earlier interleaved-output experiment, global storage
+addresses and output ownership remain unchanged. So do masked element-zero
+reads, padding, per-output K order, guards, barriers, shared capacity and hazards.
+
+The broad form applies to non-interleaved F32 tiles with `TN > 1`; the second
+restricts it to transposed B. Other formats and explicit interleaved output
+layouts remain unchanged. NVIDIA documents successive 32-bit shared words in
+successive banks, motivating a test of consecutive reduction loads across
+`tx`; this source-level observation does not establish native vectorization or
+a speedup. See the [CUDA programming guide](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html).
+An enumerated index proof checks unique staging writes and exact load mapping.
+Generated-source audits invert only the changed shared B indices and reproduce
+the original ordinary shader bodies after whitespace/comment normalization.
+
+Each variant passes **40 code-generation checks, nine whole-graph smoke tests
+and eight strict matrix oracle cases**. Each preserves 500 normal comparisons
+in control/candidate/candidate/control order: 25 interleaved ordinary/persistent
+pairs per case and visit, ten warmup pairs, at least one second of warmup and
+256 workers. Controls are immutable qualified `540eccf` binaries. All full-state,
+selection, completion, one-dispatch and no-fallback gates pass, with maximum
+model error 4.66e-9. No build, heavy analysis or SDK sampling overlaps timings.
+
+| Form / case | Control ordinary / persistent ms | Candidate ordinary / persistent ms | Persistent candidate/control, bootstrap 95% interval |
+|---|---:|---:|---:|
+| Broad, forward | 4.094 / 5.398 | 4.177 / 5.684 | 1.053 [0.982, 1.098] |
+| Broad, training + SGD | 14.600 / 17.741 | 15.889 / 18.320 | 1.033 [1.028, 1.074] |
+| Transposed B, forward | 3.777 / 5.164 | 4.203 / 5.609 | 1.086 [1.022, 1.095] |
+| Transposed B, training + SGD | 14.649 / 18.060 | 16.170 / 18.497 | 1.024 [1.009, 1.040] |
+
+Broad persistent training regresses **3.3%**, while ordinary training regresses
+**8.8%**. The transposed-B subset regresses **2.4% / 10.4%**, respectively.
+Their normalized training ratios, 0.947 [0.930, 0.961] and 0.930 [0.856, 0.950],
+improve by degrading the ordinary baseline more. That does not satisfy the
+performance objective. Broad CI SGD also regresses 4.2% raw / 3.6% normalized;
+the subset's CI SGD comparison is inconclusive.
+
+The subset's complete forward and CI-inference shaders are **byte-identical**
+to their controls, with matching compiled pipeline identities and resource
+multisets in both backends. Their timing shifts, including an apparent
+normalized forward improvement, therefore cannot be attributed to this code
+change. The 10,000-resample intervals describe within-run uncertainty, not all
+between-visit variation. All samples and outliers remain in the record.
+
+Twenty resource records retain 48 CI registers, 102/103 model registers and
+the original shared capacities. Broad model code grows from 107,904/267,776 to
+109,952/273,280 bytes; the subset leaves forward unchanged and grows training
+to 270,080 bytes. Ordinary-source audits cover all 19 CI and 43 model files per
+variant. Broad/subset changes affect six/three CI files and eleven/four model
+files, including the combined graph shaders.
+
+Fresh SDK captures cover **the broad variant only**, with both model phases,
+both backends and four single-pass metric groups per capture: eight backend
+captures / 32 groups. Actual saved states match exactly within each backend;
+cross-backend state passes the existing budget. Training replay includes SGD
+at zero learning rate and does not replace the nonzero-rate completed-step gate.
+
+| Phase / version | Ordinary / persistent replay ms | Persistent warp instructions, billions | Persistent integer-pipe instructions, billions | Persistent shared wavefronts, millions |
+|---|---:|---:|---:|---:|
+| Forward, control | 3.744 / 5.037 | 0.656 | 1.999 | 124.595 |
+| Forward, broad | 3.812 / 5.231 | 0.668 | 2.125 | 124.758 |
+| Training, control | 11.910 / 15.901 | 2.722 | 6.575 | 488.368 |
+| Training, broad | 13.004 / 16.610 | 2.774 | 6.757 | 431.394 |
+
+Persistent training's estimated shared activity falls **11.7%**, but integer
+activity rises 2.8%, warp instructions rise 1.9% and replay slows **4.5%**.
+Forward shared activity is approximately flat, integer activity rises 6.3%
+and replay slows 3.9%. Persistent local load/store traffic remains zero.
+Ordinary local load/store estimates rise from about 79,000 to 121,000 sectors
+in forward and fall from about 405,000 to 200,000 in training. No native
+instruction or spill attribution is established from these totals.
+
+Clock spread across groups is at most 0.406%, and instruction-rate spread is
+at most 1.705%. Persistent workgroup-barrier waiting rises from 58.94% to 59.61%
+of active warp cycles in forward and 50.81% to 52.00% in training. Counter counts
+are rate-times-duration estimates; these waiting shares are not elapsed-time
+attribution. The evidence rejects reduced shared activity as a sufficient
+argument for this layout and directs further work toward instruction cost.
+
+Both prototypes are restored exactly to runtime `540eccf`; dependency locks
+match the frozen qualified copy, both forks are clean, release examples are
+rebuilt, and all nine restored smoke checks pass. No full library/oracle/matrix
+qualification or subset SDK capture is claimed for the rejected prototypes.
+Every heavy job uses a verified separate 16/20/1 GiB cgroup; GPU jobs remain
+serialized and all artifacts are on local `/x`.
+
+The records are under `target/scalar-shared-b-permutation{,-bt}/`. The manifest
+`target/megakernel-results/scalar-shared-b-permutation/summary.json` preserves
+**1,000 comparisons, 20 resource records, eight SDK captures / 32 metric groups,
+and 814 independently verified artifact hashes**, SHA-256
+`014007c7b3c923ca3c954fec292bfce5e1c61bc63886b8caba9efd2f9a1bde17`.
+Its independent audit log is `target/scalar-shared-b-permutation/verify.log`.
+Baseline parity remains unmet.
+
 ## Earlier artifact identities
 
 All records remain on local storage at

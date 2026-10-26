@@ -379,6 +379,13 @@ the descriptor-reference repair requires fresh measurements.
   preserve 500 comparisons and ten resource records. No model-training gain
   appears and CI SGD regresses 6.6%; restore the backend and dependency lock.
   No new Naga semantics or uniformity-validation exception is needed.
+- [x] Permute scalar B's shared columns without changing output ownership.
+  Reject broad and transposed-B-only forms after 1,000 comparisons and 20
+  resource records. Broad SDK training reduces estimated shared activity
+  11.7% but increases instructions and slows replay 4.5%; preserve eight
+  captures / 32 groups with exact same-backend state. Both forms slow ordinary
+  training more than persistent training, so improved normalized ratios do not
+  count toward parity. Restore the runtime and all nine smoke checks.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
