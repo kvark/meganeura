@@ -1662,6 +1662,8 @@ fn session_whole_graph_packed_attention_heads_preserve_scratch() {
         (4, 2, 64),
         (5, 5, 193),
         (15, 3, 64),
+        (12, 6, 64),
+        (14, 7, 65),
     ]
     .into_iter()
     .enumerate()

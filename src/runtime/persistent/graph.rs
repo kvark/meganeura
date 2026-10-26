@@ -171,6 +171,7 @@ struct Frame {
     buffers: Vec<bg::BufferPiece>,
     config: Config,
     tasks: Vec<u32>,
+    claim_limits: Vec<u32>,
     graph_nodes: usize,
     pipeline: Arc<SharedPipeline>,
     key: String,
@@ -501,6 +502,7 @@ impl Graph {
         let mut ancestors: Vec<Vec<u64>> = Vec::new();
         let mut successors = vec![Vec::new(); nodes as usize];
         let mut tasks = Vec::new();
+        let mut claim_limits = Vec::new();
         for (node, (handler, grid, bindings)) in work.into_iter().enumerate() {
             let count = grid
                 .into_iter()
@@ -511,12 +513,16 @@ impl Graph {
             }
             let kernel = &self.kernels[handler];
             let batch = kernel.tiles_per_claim(grid);
-            if u64::from(count) + u64::from(batch) * u64::from(self.options.workers) + 1
+            let claim_limit = kernel
+                .claim_limit(grid)
+                .ok_or("padded tile count overflow")?;
+            if u64::from(claim_limit) + u64::from(batch) * u64::from(self.options.workers) + 1
                 > u64::from(u32::MAX)
             {
                 return Err("tile claims may overflow".into());
             }
             tasks.push(count);
+            claim_limits.push(claim_limit);
             let base = u32::try_from(parameters.len()).map_err(|_| "parameter offset overflow")?;
             let layout = &self.layouts[handler];
             let mut words = vec![0; 2 * layout.bindings.len()];
@@ -611,13 +617,13 @@ impl Graph {
                 grid[2],
                 handler as u32 | (batch << 16),
                 base,
-                count,
+                claim_limit,
                 0,
                 0,
             ]);
         }
         log::debug!(
-            "packed graph: shared={} nodes={} packed_nodes={} packed_tiles={}",
+            "packed graph: shared={} nodes={} packed_nodes={} packed_slots={}",
             self.builder.shared_bytes(),
             nodes,
             metadata
@@ -751,6 +757,7 @@ impl Graph {
             buffers,
             config,
             tasks,
+            claim_limits,
             graph_nodes,
             pipeline,
             key: pipeline_key.clone(),
@@ -819,7 +826,10 @@ impl Graph {
         }
         for (node, &tasks) in frame.tasks.iter().enumerate() {
             let counter = frame.config.counters as usize + 3 * node;
-            if words[counter] < tasks.max(1) || words[counter + 1] != 0 || words[counter + 2] != 0 {
+            if words[counter] < frame.claim_limits[node].max(1)
+                || words[counter + 1] != 0
+                || words[counter + 2] != 0
+            {
                 return Err(format!(
                     "whole-graph node {node} incomplete: {:?}",
                     &words[counter..counter + 3]

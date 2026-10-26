@@ -28,11 +28,12 @@ fn packing_width(maximum: u32, extent: u32, subgroups: bool) -> u32 {
     if extent == 0 {
         return 1;
     }
-    [4, 3, 2, 1]
+    if !subgroups {
+        return maximum.min(extent);
+    }
+    [4, 2, 1]
         .into_iter()
-        .find(|&width| {
-            width <= maximum && (width != 3 || !subgroups) && extent.is_multiple_of(width)
-        })
+        .find(|&width| width <= maximum && extent.is_multiple_of(width))
         .unwrap()
 }
 
@@ -45,6 +46,20 @@ impl Kernel {
             None if !grid.contains(&0) => self.batch_size,
             _ => 1,
         }
+    }
+
+    /// The ticket counter includes padding at the end of each packed axis.
+    /// Completion and worker statistics count only the original logical tiles.
+    pub fn claim_limit(&self, mut grid: [u32; 3]) -> Option<u32> {
+        if grid.contains(&0) {
+            return Some(0);
+        }
+        if let Some(axis) = self.batch_axis {
+            let batch = self.tiles_per_claim(grid);
+            grid[axis] = grid[axis].div_ceil(batch).checked_mul(batch)?;
+        }
+        grid.into_iter()
+            .try_fold(1u32, |count, n| count.checked_mul(n))
     }
 }
 
@@ -115,12 +130,15 @@ impl Builder {
             let mut axes = [0, 1, 2];
             axes.sort_by_key(|&axis| {
                 grids.iter().fold(0u64, |cost, grid| {
+                    if grid.contains(&0) {
+                        return cost;
+                    }
                     let count = grid
                         .iter()
                         .fold(1u64, |count, &n| count.saturating_mul(u64::from(n)));
-                    cost.saturating_add(
-                        count / u64::from(packing_width(batch_size, grid[axis], subgroups)),
-                    )
+                    cost.saturating_add((count / u64::from(grid[axis])).saturating_mul(u64::from(
+                        grid[axis].div_ceil(packing_width(batch_size, grid[axis], subgroups)),
+                    )))
                 })
             });
             for axis in axes {
@@ -428,6 +446,15 @@ impl Builder {
             format!("physical_lane / {logical_threads}u")
         };
         let sequential = batch_axis.is_none() && batch_size > 1;
+        let partial = batch_axis.is_some() && !body.subgroups && body.cooperative.is_none();
+        let claim_geometry = if partial {
+            let coordinate = ["x", "y", "z"][batch_axis.unwrap()];
+            format!(
+                "    let graph_claim_extent = ((grid.{coordinate} - 1u) / (node.grid.w >> 16u) + 1u) * (node.grid.w >> 16u);\n    let graph_valid_tiles = min(node.grid.w >> 16u, grid.{coordinate} - ticket.y % graph_claim_extent);\n"
+            )
+        } else {
+            String::new()
+        };
         let tile = if sequential {
             "(ticket.y + graph_repeat)"
         } else {
@@ -435,17 +462,24 @@ impl Builder {
         };
         let logical = if let Some(axis) = batch_axis {
             let coordinate = ["x", "y", "z"][axis];
+            let extent = if partial {
+                "graph_claim_extent".to_owned()
+            } else {
+                format!("grid.{coordinate}")
+            };
             let mut parts = [String::new(), String::new(), String::new()];
-            parts[axis] = format!(
-                "ticket.y % grid.{coordinate} + min(graph_tile_group, (node.grid.w >> 16u) - 1u)"
-            );
+            parts[axis] = if partial {
+                format!("ticket.y % {extent} + graph_tile_group")
+            } else {
+                format!("ticket.y % {extent} + min(graph_tile_group, (node.grid.w >> 16u) - 1u)")
+            };
             let remaining = (0..3).filter(|&i| i != axis).collect::<Vec<_>>();
             parts[remaining[0]] = format!(
-                "(ticket.y / grid.{coordinate}) % grid.{}",
+                "(ticket.y / {extent}) % grid.{}",
                 ["x", "y", "z"][remaining[0]]
             );
             parts[remaining[1]] = format!(
-                "ticket.y / (grid.{coordinate} * grid.{})",
+                "ticket.y / ({extent} * grid.{})",
                 ["x", "y", "z"][remaining[0]]
             );
             parts
@@ -465,22 +499,40 @@ impl Builder {
         };
         let case = include_str!("../shaders/graph_handler.wgsl")
             .replace("$INDEX", &index.to_string())
+            .replace("$CLAIM_GEOMETRY", &claim_geometry)
             .replace("$LANE", &lane)
             .replace("$X", &body.workgroup_size[0].to_string())
             .replace("$Y", &body.workgroup_size[1].to_string())
             .replace("$SUBGROUPS", &subgroups)
             .replace("$GROUP", &group)
-            .replace("$LAST_GROUP", &(packing_size - 1).to_string())
+            .replace(
+                "$LAST_GROUP",
+                &if partial {
+                    "(graph_valid_tiles - 1u)".to_owned()
+                } else {
+                    format!("{}u", packing_size - 1)
+                },
+            )
             .replace(
                 "$ACTIVE_GROUPS",
                 if sequential {
                     "1u"
+                } else if partial {
+                    "graph_valid_tiles"
                 } else {
                     "(node.grid.w >> 16u)"
                 },
             )
             .replace("$REPEAT_BEGIN", repeat_begin)
             .replace("$REPEAT_END", repeat_end)
+            .replace(
+                "$COMPLETE",
+                if partial {
+                    "    graph_completed = graph_valid_tiles;\n"
+                } else {
+                    ""
+                },
+            )
             .replace("$LOGICAL_X", &logical[0])
             .replace("$LOGICAL_Y", &logical[1])
             .replace("$LOGICAL_Z", &logical[2])
@@ -514,6 +566,10 @@ impl Builder {
 
     pub fn source(&self, kernels: &[Kernel], count: usize) -> String {
         assert!(count > 0);
+        let partial = kernels
+            .iter()
+            .any(|k| k.batch_axis.is_some() && !k.subgroups);
+        let completed = "min(node.grid.w >> 16u, max(node.work.y, 1u) - ticket.y)";
         let mut enables = BTreeSet::new();
         let mut handlers = String::new();
         for kernel in kernels {
@@ -551,6 +607,22 @@ impl Builder {
             .replace("$HANDLERS", &handlers)
             .replace("$BUFFERS", &buffers)
             .replace("$SHARED", &shared)
+            .replace(
+                "$PARTIAL_COMPLETION",
+                &if partial {
+                    format!("        var graph_completed = {completed};\n")
+                } else {
+                    String::new()
+                },
+            )
+            .replace(
+                "$COMPLETED",
+                if partial {
+                    "graph_completed"
+                } else {
+                    completed
+                },
+            )
             .replace(
                 "$GEOMETRY",
                 if kernels.iter().any(|k| k.subgroups) {
@@ -768,6 +840,7 @@ mod tests {
                     },
                 ));
             let mut builder = Builder::new(256);
+            builder.batch_limit = 3;
             let kernel = builder
                 .add(body.clone(), &layout, 0, &[[4, 1, 1]], false)
                 .unwrap();
@@ -777,9 +850,19 @@ mod tests {
                 .unwrap();
             assert_eq!(kernel.batch_axis, Some(1));
             assert_eq!(kernel.batch_size, 3);
-            for (heads, packed) in [(1, 1), (2, 2), (3, 3), (4, 2), (5, 1), (6, 3), (15, 3)] {
+            for (heads, packed, limit) in [
+                (1, 1, 21),
+                (2, 2, 42),
+                (3, 3, 63),
+                (4, 3, 126),
+                (5, 3, 126),
+                (6, 3, 126),
+                (15, 3, 315),
+            ] {
                 assert_eq!(kernel.tiles_per_claim([7, heads, 1]), packed);
+                assert_eq!(kernel.claim_limit([7, heads, 3]), Some(limit));
             }
+            builder.batch_limit = 4;
             let kernel = builder
                 .add(
                     body,
@@ -791,9 +874,21 @@ mod tests {
                 .unwrap();
             assert_eq!(kernel.batch_axis, Some(1));
             assert_eq!(kernel.batch_size, 4);
-            for (heads, packed) in [(1, 1), (2, 2), (3, 3), (4, 4), (5, 1), (6, 3), (15, 3)] {
+            for (heads, packed, limit) in [
+                (1, 1, 21),
+                (2, 2, 42),
+                (3, 3, 63),
+                (4, 4, 84),
+                (5, 4, 168),
+                (6, 4, 168),
+                (15, 4, 336),
+            ] {
                 assert_eq!(kernel.tiles_per_claim([7, heads, 1]), packed);
+                assert_eq!(kernel.claim_limit([7, heads, 3]), Some(limit));
             }
+            assert_eq!(kernel.claim_limit([0, 15, 1]), Some(0));
+            assert_eq!(kernel.claim_limit([1, u32::MAX, 1]), None);
+            assert_eq!(kernel.claim_limit([u32::MAX, 15, 1]), None);
         }
     }
 

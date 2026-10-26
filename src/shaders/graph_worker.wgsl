@@ -5,7 +5,7 @@ $ENABLES
 struct GraphNode {
     // Logical grid, low 16 bits handler, high 16 bits tiles per claim.
     grid: vec4<u32>,
-    // Parameter offset, logical tiles, successor offset, successor count.
+    // Parameter offset, claim slots (including padding), successor offset/count.
     work: vec4<u32>,
 }
 struct GraphConfig {
@@ -84,7 +84,7 @@ fn graph_main(@builtin(local_invocation_index) physical_lane: u32,
         }
         let graph_parameter_values = workgroupUniformLoad(&graph_parameter_words);
         storageFence();
-        if node.work.y != 0u {
+$PARTIAL_COMPLETION        if node.work.y != 0u {
             let grid = node.grid.xyz;
             switch ticket.w {
                 $CASES
@@ -98,7 +98,7 @@ fn graph_main(@builtin(local_invocation_index) physical_lane: u32,
         if physical_lane == 0u {
             storageFence();
             let counter = graph_config.counters + 3u * ticket.x;
-            let completed = min(node.grid.w >> 16u, max(node.work.y, 1u) - ticket.y);
+            let completed = $COMPLETED;
             let remaining = atomicSub(&graph_queue[counter + 1u], completed);
             if remaining < completed { atomicOr(&graph_queue[1], 2u); }
             if remaining == completed {
