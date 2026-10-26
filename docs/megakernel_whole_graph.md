@@ -2146,11 +2146,145 @@ qualified binaries, and all eight restored whole-graph checks pass. Every
 build, test, copy, capture and heavy analysis uses a verified bounded
 cgroup; GPU jobs are serialized and all artifacts stay on local `/x` storage.
 
-Next, compare the existing contiguous and interleaved scalar column mappings
-while preserving shapes, K staging and each output's accumulation order. Check
-shared-memory access patterns, resource/local-traffic counters and completed
-CI/model timings in both backends. Any retained policy must preserve explicit
-tuning choices. Baseline parity remains open.
+The following experiment compares the existing contiguous and interleaved
+scalar column mappings while preserving shapes, K staging and each output's
+accumulation order. Baseline parity remains open.
+
+## Interleaved scalar columns
+
+An exploratory default-policy probe enables the existing interleaved scalar
+column mapping in both backends. The same mapping selects B shared-memory
+reads, fused addends and output columns. It preserves tile dimensions, K
+staging, split count, precision and every output's accumulation order; explicit
+scalar-shape choices remain authoritative. Exactly sixteen model shape keys per
+phase change their interleave flag, while logical work and optimizer tasks stay
+unchanged. Generated model sources confirm the alternate second-column loads.
+
+Eight whole-graph smoke checks and **200 normal paired comparisons** pass.
+Each case has twenty AB/BA pairs after ten warmups and at least one second of
+warmup. All samples are retained. Full-state budgets, matched backend selection,
+one persistent dispatch and no fallback remain intact; maximum training error
+is 4.66e-9. These are exploratory runs, with no full oracle or matrix-regression
+qualification claimed for the rejected probe.
+
+| Case | Candidate ordinary / persistent ms | Fresh control ordinary / persistent ms | Candidate / control persistent median, bootstrap 95% interval |
+|---|---:|---:|---:|
+| Model forward | 3.844 / 5.677 | 4.185 / 5.802 | 0.978 [0.948, 1.027] |
+| Model training + SGD | 15.189 / 19.731 | 15.128 / 18.930 | 1.042 [0.991, 1.055] |
+| CI inference | 0.05876 / 0.07716 | 0.05219 / 0.07045 | 1.095 [1.061, 1.110] |
+| CI backward | 0.06715 / 0.10169 | 0.06696 / 0.10278 | 0.989 [0.980, 1.016] |
+| CI SGD | 0.06890 / 0.10325 | 0.06792 / 0.10185 | 1.014 [0.986, 1.039] |
+
+The intervals describe within-run sampling uncertainty, not between-run drift.
+The paired persistent/ordinary medians are 1.485 / 1.310 for the two model
+phases, versus 1.403 / 1.271 in the fresh control. This does not establish a
+useful completed-step benefit.
+
+Two separate resource diagnostics retain 116 / 114 registers and 20,880 /
+29,232 shared bytes for forward / training. Code grows from 108,544 / 256,512
+to 109,440 / 258,560 bytes. Three supported SDK groups per backend each retain
+146 post-warmup samples, no monitor warnings and the exact prior same-backend
+state hashes. Cross-backend replay passes the existing benchmark budget.
+
+| Training replay | Candidate | Fresh control |
+|---|---:|---:|
+| Ordinary / persistent ms | 12.287 / 17.676 | 12.008 / 17.083 |
+| Ordinary / persistent estimated warp instructions | 1.590 / 2.877 billion | 1.542 / 2.831 billion |
+| Ordinary / persistent estimated shared wavefronts | 407.615 / 476.807 million | 447.523 / 543.752 million |
+| Persistent barrier share of active warp cycles | 51.07% | 50.09% |
+
+Both modes retain zero measured local load/store traffic. The smaller shared
+wavefront estimate does not produce lower instruction count or replay time.
+These counters do not establish a bank-conflict or vectorization explanation.
+Counts are rate-times-duration estimates; barrier shares are not elapsed-time
+attribution. SDK replay uses zero-rate SGD and does not replace normal timing.
+
+The probe is reverted exactly. Its proof, patch, binaries, samples and captures
+remain at `target/scalar-interleave-probe/`. The independently checked manifest
+is `target/megakernel-results/scalar-interleave/summary.json` with **168 artifact
+hashes**; the restore audit is `target/scalar-interleave-artifact-audit.log`.
+All jobs used verified bounded cgroups and local storage, with serialized GPU
+work and no builds or analysis during normal timing or SDK capture.
+
+## Cooperative subgroup ownership
+
+The native cooperative matmul template stages inputs with all 64 invocations,
+then each subgroup computes the same four accumulators. Only logical subgroup
+zero stores their results, including the shared result used by scalar epilogues.
+A one-template probe wraps cooperative operand loads and products in the same
+subgroup-zero condition. It includes compensated products, preserves accumulator
+initialization and every K iteration, and leaves both surrounding workgroup
+barriers outside the condition. The separate 8×8 F32 and workgroup-scoped
+templates are unchanged. Ordinary and persistent execution share this change;
+packed persistent tiles retain independently virtualized subgroup indices.
+
+Eight whole-graph smoke checks and **200 normal paired comparisons** pass with
+the unchanged state budgets and maximum training error of 4.66e-9. Selected
+implementation keys, logical work, optimizer tasks, one persistent dispatch and
+absence of fallback match the retained runtime. Generated graph sources confirm
+the four operand loads and products are inside the owner guard, between the
+original barriers. Each case uses twenty AB/BA pairs, ten warmups and at least
+one warmup second. All samples remain; no full oracle or matrix-regression
+qualification is claimed for this rejected probe.
+
+| Case | Candidate ordinary / persistent ms | Fresh control ordinary / persistent ms | Candidate / control persistent median, bootstrap 95% interval |
+|---|---:|---:|---:|
+| Model forward | 4.478 / 5.764 | 4.089 / 5.762 | 1.000 [0.976, 1.052] |
+| Model training + SGD | 14.860 / 18.795 | 15.064 / 19.046 | 0.987 [0.917, 1.076] |
+| CI inference | 0.05213 / 0.07190 | 0.05284 / 0.07241 | 0.993 [0.948, 1.074] |
+| CI backward | 0.06595 / 0.10292 | 0.06670 / 0.10281 | 1.001 [0.993, 1.009] |
+| CI SGD | 0.06799 / 0.10224 | 0.06794 / 0.10148 | 1.007 [0.991, 1.023] |
+
+Ordinary forward is slower in this short run: candidate/control ratio 1.095
+[1.043, 1.216]. Consequently its lower paired persistent/ordinary ratio, 1.280
+versus 1.465, is not a persistent speedup. Training's paired ratio is essentially
+unchanged, 1.270 versus 1.269. Bootstrap intervals describe within-run sampling
+uncertainty, not between-run drift; these results do not establish a useful gain.
+
+Two separate resource captures show forward registers falling from 116 to 100,
+while training increases from 114 to 115. Shared memory stays at 20,880 / 29,232
+bytes; code changes from 108,544 / 256,512 to 110,080 / 256,640 bytes.
+Four supported SDK groups per backend collect 146 samples each, with matching
+adapters, successful exits, no warnings and exact prior same-backend state
+hashes. Cross-backend state passes the existing benchmark budget.
+
+| Training replay | Candidate | Fresh control |
+|---|---:|---:|
+| Ordinary / persistent ms | 12.004 / 17.016 | 12.007 / 17.064 |
+| Ordinary / persistent estimated warp instructions | 1.567 / 2.814 billion | 1.547 / 2.830 billion |
+| Ordinary / persistent estimated shared wavefronts | 444.537 / 533.853 million | 449.838 / 539.899 million |
+| Ordinary / persistent tensor-active percentage | 0.4314% / 0.3013% | 0.8393% / 0.5993% |
+| Persistent barrier share of active warp cycles | 50.23% | 50.29% |
+
+Both modes retain zero measured local load/store traffic. Multiplying the tensor
+percentage by replay duration yields approximately 51.4% / 50.1% of the control's
+ordinary / persistent tensor-active work. This supports actual duplication in
+the original shader, but removing it changes persistent replay by only 0.28%
+and does not improve the normal completed-step gate. Tensor-active percentage
+is not elapsed-time attribution. Instruction and wavefront totals are
+rate-times-duration estimates; SDK zero-rate SGD replay remains diagnostic.
+
+The probe is reverted exactly. Its proof, source patch, measured models-feature
+binaries, samples and captures are in `target/coop-owner-subgroup-probe/`.
+The first build omitted the required models feature and failed before compiling;
+its log is preserved. An additional all-feature build was not used for timing
+or SDK capture. The independently checked manifest is
+`target/megakernel-results/coop-owner-subgroup/summary.json`, with **185 artifact
+hashes**; the restore audit is `target/coop-owner-artifact-audit.log`.
+Both rebuilt benchmark binaries match the retained binaries byte-for-byte, and
+all eight restored whole-graph checks pass. The final records are
+`target/coop-owner-restored-{build,smoke}.log` and
+`target/coop-owner-final-audit.log`.
+All builds, tests, copies, captures and analysis use verified bounded cgroups,
+serialized GPU jobs and local storage. Builds and analysis do not overlap
+normal timing or SDK capture. The retained runtime and primary measurements
+remain unchanged; baseline parity remains unmet.
+
+The next candidate is to distribute distinct cooperative output rows across
+subgroups, reducing idle lanes and per-thread accumulator liveness while
+preserving the output geometry and arithmetic. This requires a uniform staging
+and barrier proof at alternate subgroup widths, followed by the same completed-
+step gates. The owner-only result does not establish that this will be faster.
 
 ## Earlier artifact identities
 

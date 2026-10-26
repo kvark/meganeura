@@ -255,14 +255,26 @@ the descriptor-reference repair requires fresh measurements.
   Preserve eighty control comparisons, two resource diagnostics and the
   construction audit; generated model shaders are exactly unchanged. Revert
   both prototypes without treating these timings as a batching improvement.
+- [x] Compare the existing contiguous and interleaved scalar column mappings
+  with identical shapes, K stages, precision and per-output accumulation order.
+  Eight whole-graph checks and 200 completed-step comparisons pass. Interleaving
+  reduces estimated shared wavefronts but increases instructions and SDK replay
+  time; normal training shows no useful gain. Restore the default and preserve
+  two resource captures, exact same-backend replay state and 168 artifact hashes.
+- [x] Restrict native cooperative products to their output-owning subgroup,
+  preserving staging and all workgroup barriers. Eight whole-graph checks and
+  200 comparisons pass. Four SDK groups per mode confirm roughly half the
+  tensor-active work, exact prior state and zero local traffic, but completed
+  steps show no useful gain. Revert the probe; preserve two resource diagnostics
+  and 185 independently verified artifact hashes.
 - [ ] Investigate the remaining scheduling/integer cost. Complete-step replay
   still executes about 1.83 times as many warp instructions as ordinary execution.
-  Next, compare the existing contiguous and interleaved scalar column mappings
-  with identical shapes, K stages, precision and per-output accumulation order.
-  Inspect generated shared-memory accesses, resource/local-traffic counters and
-  both model phases against fresh completed-step controls. Keep arithmetic
-  selection matched across ordinary and persistent execution, and preserve
-  explicit tuning choices in any retained implementation.
+  Next, assess distributing distinct cooperative output rows across subgroups
+  to reduce idle lanes and accumulator liveness. Preserve per-output arithmetic,
+  uniform staging/barriers and correctness at alternate subgroup widths.
+  The ownership probe rules out duplicate tensor products as a useful latency
+  target by itself. Require completed-step gains in matched ordinary/persistent
+  comparisons before retaining a new distribution.
   The measured no-instruction waiting does not establish a cache bottleneck.
   Finer dependencies require proofs for payload ranges,
   allocation reuse, original tile coordinates and completion aggregation.
