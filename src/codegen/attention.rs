@@ -295,6 +295,15 @@ pub fn generate_flash_attention_product_module_with_keys(
     rows: u32,
     keys: u32,
 ) -> ShaderModule {
+    generate_flash_attention_product_with_output(head_dim, rows, keys, false)
+}
+
+pub(crate) fn generate_flash_attention_product_with_output(
+    head_dim: u32,
+    rows: u32,
+    keys: u32,
+    f16_output: bool,
+) -> ShaderModule {
     assert!(head_dim > 0 && matches!(rows, 8 | 16));
     let padded = head_dim.next_multiple_of(16);
     assert!(matches!(keys, 16 | 32 | 64));
@@ -303,6 +312,9 @@ pub fn generate_flash_attention_product_module_with_keys(
         preprocess(
             template_section(template, "main"),
             &[
+                ("$OUTPUT_TYPE", if f16_output { "f16" } else { "f32" }),
+                ("$OUTPUT_BEGIN", if f16_output { "f16(" } else { "" }),
+                ("$OUTPUT_END", if f16_output { ")" } else { "" }),
                 (
                     "$QK_BODY",
                     template_section(template, if keys == 16 { "qk16" } else { "qk_wide" }),
@@ -332,19 +344,29 @@ pub fn generate_flash_attention_product_module_with_keys(
 /// Cooperative forward attention: QKᵀ uses f16 matrix operands, while softmax
 /// and PV accumulate in f32 registers. Dispatch `[ceil(q_seq/16), num_heads, 1]`.
 pub fn generate_flash_attention_coop_module(head_dim: u32) -> ShaderModule {
-    generate_flash_attention_coop(head_dim, true)
+    generate_flash_attention_coop_with_output(head_dim, false)
+}
+
+pub(crate) fn generate_flash_attention_coop_with_output(
+    head_dim: u32,
+    f16_output: bool,
+) -> ShaderModule {
+    generate_flash_attention_coop(head_dim, true, f16_output)
 }
 
 pub fn generate_flash_attention_coop_f32_module(head_dim: u32) -> ShaderModule {
-    generate_flash_attention_coop(head_dim, false)
+    generate_flash_attention_coop(head_dim, false, false)
 }
 
-fn generate_flash_attention_coop(head_dim: u32, use_f16: bool) -> ShaderModule {
+fn generate_flash_attention_coop(head_dim: u32, use_f16: bool, f16_output: bool) -> ShaderModule {
     let source = preprocess(
         include_str!("../shaders/flash_attention_coop.wgsl"),
         &[
             ("$ENABLE_F16", if use_f16 { "enable f16;" } else { "" }),
             ("$INPUT_TYPE", if use_f16 { "f16" } else { "f32" }),
+            ("$OUTPUT_TYPE", if f16_output { "f16" } else { "f32" }),
+            ("$OUTPUT_BEGIN", if f16_output { "f16(" } else { "" }),
+            ("$OUTPUT_END", if f16_output { ")" } else { "" }),
         ],
     );
     generate_coop_attention(&source, head_dim, "flash_attention_coop")
@@ -1479,6 +1501,58 @@ mod product_tests {
                 )
                 .unwrap();
             }
+        }
+    }
+
+    fn element_width(module: &naga::Module, ty: naga::Handle<naga::Type>) -> u8 {
+        let naga::TypeInner::Array { base, .. } = module.types[ty].inner else {
+            panic!("expected an array");
+        };
+        let naga::TypeInner::Scalar(scalar) = module.types[base].inner else {
+            panic!("expected scalar elements");
+        };
+        assert_eq!(scalar.kind, naga::ScalarKind::Float);
+        scalar.width
+    }
+
+    #[test]
+    fn attention_half_output_keeps_inputs_statistics_and_accumulation_f32() {
+        let modules = [
+            generate_flash_attention_coop_with_output(48, true),
+            generate_flash_attention_coop_with_output(64, true),
+            generate_flash_attention_coop_with_output(128, true),
+            generate_flash_attention_product_with_output(48, 8, 16, true),
+            generate_flash_attention_product_with_output(80, 16, 32, true),
+            generate_flash_attention_product_with_output(128, 8, 64, true),
+        ];
+        for shader in modules {
+            let module = shader.module;
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS,
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap();
+            for name in ["src_a", "src_b", "bias", "dst", "lse"] {
+                let global = module
+                    .global_variables
+                    .iter()
+                    .find(|&(_, v)| v.name.as_deref() == Some(name))
+                    .unwrap()
+                    .1;
+                assert_eq!(
+                    element_width(&module, global.ty),
+                    if name == "dst" { 2 } else { 4 }
+                );
+            }
+            let accumulator = module.entry_points[0]
+                .function
+                .local_variables
+                .iter()
+                .find(|&(_, v)| v.name.as_deref() == Some("local_o"))
+                .unwrap()
+                .1;
+            assert_eq!(element_width(&module, accumulator.ty), 4);
         }
     }
 }

@@ -8,7 +8,7 @@ $PARAMS
 var<storage> src_a: array<f32>;
 var<storage> src_b: array<f32>;
 var<storage> bias: array<f32>;
-var<storage, read_write> dst: array<f32>;
+var<storage, read_write> dst: array<$OUTPUT_TYPE>;
 var<storage, read_write> lse: array<f32>;
 var<uniform> params: Params;
 
@@ -139,7 +139,7 @@ fn main(
         let safe_sum = select(local_sum, 1.0, local_sum == 0.0);
         let q_base = qpos * (num_heads * head_dim) + head * head_dim;
         for (var e = 0u; e < $CHUNK_HDu; e = e + 1u) {
-            dst[q_base + d_off + e] = local_o[e] / safe_sum;
+            dst[q_base + d_off + e] = $OUTPUT_BEGINlocal_o[e] / safe_sum$OUTPUT_END;
         }
         if chunk == 0u {
             let idx = (qpos * num_heads + head) * 2u;

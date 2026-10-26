@@ -755,7 +755,11 @@ mod tests {
         gpu.destroy_command_encoder(&mut enc);
         // New schemas must not be decoded through a matching older version.
         let current = std::fs::read_to_string(&file).unwrap();
-        let stale = current.replacen("format_version: 39,", "format_version: 38,", 1);
+        let version = current
+            .lines()
+            .find(|line| line.trim_start().starts_with("format_version:"))
+            .unwrap();
+        let stale = current.replacen(version, "    format_version: 38,", 1);
         assert_ne!(current, stale);
         std::fs::write(&file, stale).unwrap();
         assert!(crate::cache::load_plan(&g, &file).unwrap().is_none());

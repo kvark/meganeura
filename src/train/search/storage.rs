@@ -63,6 +63,7 @@ pub(super) fn fill(plan: &mut ExecutionPlan) -> usize {
         }
     }
     let protected = plan.externally_visible_buffers();
+    let lse: HashSet<_> = plan.lse_buffers.iter().map(|entry| entry.1).collect();
     let mut requests: Vec<_> = requested.into_iter().collect();
     // Keep the transformation order reproducible for inspection.
     requests.sort_by_key(|&((buffer, dtype), (first, _))| (first, buffer.0, dtype == DType::BF16));
@@ -80,10 +81,18 @@ pub(super) fn fill(plan: &mut ExecutionPlan) -> usize {
         }
         let eligible = {
             let d = &plan.dispatches[index];
+            // The primary attention output may narrow independently of LSE.
+            // Its readers already round to F16; softmax/statistics remain F32.
+            let attention = dtype == DType::F16
+                && matches!(
+                    d.shader,
+                    ShaderEntry::FlashAttentionCoop | ShaderEntry::FlashAttentionProducts
+                )
+                && d.extra_outputs.iter().all(|buffer| lse.contains(buffer));
             !protected.contains(&source)
                 && reads[&source] == count
                 && !d.full_precision()
-                && d.extra_outputs.is_empty()
+                && (d.extra_outputs.is_empty() || attention)
                 && d.matmul_prologue.is_none()
                 && d.matmul_epilogue.is_none()
                 && (matches!(d.kernel,
@@ -96,7 +105,8 @@ pub(super) fn fill(plan: &mut ExecutionPlan) -> usize {
                         || matches!(
                             d.shader,
                             ShaderEntry::SwiGLUConcat | ShaderEntry::GeGLUConcat
-                        ))
+                        )
+                        || attention)
                         && !d.fusion_barrier
                         && !d.pointwise_storage.bf16_output
                         && !d.pointwise_storage.f16_output))
@@ -109,7 +119,10 @@ pub(super) fn fill(plan: &mut ExecutionPlan) -> usize {
             || d.reduction().is_some()
             || matches!(
                 d.shader,
-                ShaderEntry::SwiGLUConcat | ShaderEntry::GeGLUConcat
+                ShaderEntry::SwiGLUConcat
+                    | ShaderEntry::GeGLUConcat
+                    | ShaderEntry::FlashAttentionCoop
+                    | ShaderEntry::FlashAttentionProducts
             )
         {
             d.pointwise_storage.f16_output = dtype == DType::F16;
@@ -203,6 +216,160 @@ mod tests {
         );
         super::super::fill_matrix_candidates(&mut p, dtype, false);
         p
+    }
+
+    #[test]
+    fn attention_store_narrows_only_its_private_f16_output() {
+        for protection in 0..4 {
+            let mut g = Graph::new();
+            let q = g.input("q", &[33, 144]);
+            let k = g.input("k", &[19, 48]);
+            let v = g.input("v", &[19, 48]);
+            let attention = g.multi_head_attn(q, k, v, 3, 1, 48, true);
+            let w = g.parameter("w", &[144, 32]);
+            let output = g.matmul(attention, w);
+            let mut outputs = vec![output];
+            if protection == 1 {
+                outputs.push(g.neg(attention)); // A reader still needs F32.
+            } else if protection == 2 {
+                outputs.push(attention); // An externally observed value.
+            }
+            g.set_outputs(outputs);
+            let mut p = plan(&g, DType::F16);
+            super::super::fill_attention_products(
+                &mut p,
+                crate::codegen::CoopCaps {
+                    f16_attention_rows: 8,
+                    ..Default::default()
+                },
+                32 << 10,
+            );
+            let index = p
+                .dispatches
+                .iter()
+                .position(|d| d.shader == ShaderEntry::FlashAttentionProducts)
+                .unwrap();
+            p.dispatches[index].requires_full_precision = protection == 3;
+            let buffer = p.dispatches[index].output_buffer;
+            let before = p.clone();
+            assert_eq!(fill(&mut p), usize::from(protection == 0));
+            if protection != 0 {
+                assert_eq!(p, before);
+                continue;
+            }
+            assert!(p.dispatches[index].pointwise_storage.f16_output);
+            assert_eq!(
+                p.buffers[buffer.0 as usize],
+                before.buffers[buffer.0 as usize] / 2
+            );
+            assert_eq!(
+                p.dispatches[index].extra_outputs,
+                before.dispatches[index].extra_outputs
+            );
+            for &extra in &p.dispatches[index].extra_outputs {
+                assert_eq!(
+                    p.buffers[extra.0 as usize],
+                    before.buffers[extra.0 as usize]
+                );
+            }
+            let reader = p.dispatches.iter().find(|d| d.shader.is_matmul()).unwrap();
+            assert!(
+                matches!(reader.kernel, Kernel::CooperativeTyped { types, .. } if types.a == DType::F16)
+            );
+            let path = std::env::temp_dir().join(format!(
+                "meganeura-attention-half-store-{}.ron",
+                std::process::id()
+            ));
+            crate::cache::save_plan(&p, &g, &path).unwrap();
+            assert_eq!(crate::cache::load_plan(&g, &path).unwrap().unwrap(), p);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "GPU qualification of private attention stores and LSE"]
+    fn attention_half_store_preserves_f16_readers_and_lse() {
+        let gpu = crate::reference::gpu::shared_context();
+        let caps = gpu.capabilities();
+        let Some(rows) = caps
+            .cooperative_matrix
+            .f16_f32_shapes
+            .iter()
+            .find_map(|&[m, n, k]| (matches!(m, 8 | 16) && n == 16 && k == 16).then_some(m))
+        else {
+            return;
+        };
+        for (queries, keys, heads, kv_heads, dim, window) in
+            [(33, 19, 3, 1, 48, 7), (16, 16, 2, 2, 64, 0)]
+        {
+            let mut g = Graph::new();
+            let q = g.input("q", &[queries, heads * dim]);
+            let k = g.input("k", &[keys, kv_heads * dim]);
+            let v = g.input("v", &[keys, kv_heads * dim]);
+            let y = g.multi_head_attn(
+                q,
+                k,
+                v,
+                heads as u32,
+                kv_heads as u32,
+                dim as u32,
+                window != 0,
+            );
+            let w = g.parameter("w", &[heads * dim, 17]);
+            let output = g.matmul(y, w);
+            g.set_outputs(vec![output]);
+            let mut baseline = plan(&g, DType::F16);
+            super::super::fill_attention_products(
+                &mut baseline,
+                crate::codegen::CoopCaps {
+                    f16_attention_rows: rows,
+                    ..Default::default()
+                },
+                caps.max_compute_shared_memory_size,
+            );
+            let attention = baseline
+                .dispatches
+                .iter_mut()
+                .find(|d| d.shader == ShaderEntry::FlashAttentionProducts)
+                .unwrap();
+            attention.params[4] = window;
+            let lse = attention.extra_outputs[0];
+            let mut half = baseline.clone();
+            assert_eq!(fill(&mut half), 1);
+            let options = crate::SessionOptions {
+                coop: crate::CoopPolicy::Disabled,
+                no_alias: true,
+                poison: true,
+                ..Default::default()
+            };
+            let mut baseline = Session::with_context_opts(baseline, gpu.clone(), options.clone());
+            let mut half = Session::with_context_opts(half, gpu.clone(), options);
+            let values = |n: usize, scale: f32| {
+                (0..n)
+                    .map(|i| (i as f32 * 0.17).sin() * scale)
+                    .collect::<Vec<_>>()
+            };
+            for session in [&mut baseline, &mut half] {
+                session.set_input("q", &values(queries * heads * dim, 0.7));
+                session.set_input("k", &values(keys * kv_heads * dim, 0.4));
+                session.set_input("v", &values(keys * kv_heads * dim, 0.9));
+                session.set_parameter("w", &values(heads * dim * 17, 0.03));
+                session.step();
+                session.wait();
+            }
+            assert_eq!(
+                baseline.read_output(queries * 17),
+                half.read_output(queries * 17)
+            );
+            let count = baseline.plan().buffers[lse.0 as usize] / 4;
+            let (mut original, mut narrowed) = (vec![0.0; count], vec![0.0; count]);
+            baseline.read_buffer(lse, &mut original);
+            half.read_buffer(lse, &mut narrowed);
+            assert_eq!(
+                original.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                narrowed.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

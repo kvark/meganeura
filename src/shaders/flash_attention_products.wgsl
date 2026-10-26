@@ -5,7 +5,7 @@ $PARAMS
 var<storage> src_a: array<f32>;
 var<storage> src_b: array<f32>;
 var<storage> bias: array<f32>;
-var<storage, read_write> dst: array<f32>;
+var<storage, read_write> dst: array<$OUTPUT_TYPE>;
 var<storage, read_write> lse: array<f32>;
 var<uniform> params: Params;
 var<workgroup> shared_q: array<f16, $ELEMENTS>;
@@ -107,7 +107,7 @@ $PV_BODY        workgroupBarrier();
         let sum = select(local_sum, 1.0, local_sum == 0.0);
         for (var e = 0u; e < $CHUNKu; e++) {
             let d = d_base + e;
-            if d < params.head_dim { dst[(qpos * heads + head) * params.head_dim + d] = local_o[e] / sum; }
+            if d < params.head_dim { dst[(qpos * heads + head) * params.head_dim + d] = $OUTPUT_BEGINlocal_o[e] / sum$OUTPUT_END; }
         }
         if tid % 4u == 0u {
             let i = (qpos * heads + head) * 2u;

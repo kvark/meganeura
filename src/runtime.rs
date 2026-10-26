@@ -964,7 +964,7 @@ enum Variant {
     Pointwise(u64),
     /// Attention specialization includes the head width and the scalar
     /// backward EPT cap or QK/PV key tile. These can differ within one plan.
-    Attention(ShaderEntry, u32, Option<u32>),
+    Attention(ShaderEntry, u32, Option<u32>, bool),
     /// Epilogue-fused matmuls, keyed by their actual DAG. The cooperative form
     /// uses workgroup memory to expose accumulator lanes to the epilogue.
     Epilogue(ShaderEntry, EpiloguePipelineKey),
@@ -1051,7 +1051,7 @@ impl Variant {
             Variant::StoredGate(ref e, _)
             | Variant::WinogradTransform(ref e, _)
             | Variant::WinogradMatmul(ref e, _, _)
-            | Variant::Attention(ref e, _, _)
+            | Variant::Attention(ref e, _, _, _)
             | Variant::CoopTyped(ref e, _, _)
             | Variant::CoopConv(ref e, _, _)
             | Variant::CoopWorkgroup(ref e, _, _)
@@ -1116,14 +1116,18 @@ impl Variant {
             }
             Variant::Reduction(hash) => format!("generated-reduction:{hash:016x}"),
             Variant::Pointwise(hash) => format!("generated-pointwise:{hash:016x}"),
-            Variant::Attention(ShaderEntry::FlashAttentionProducts, head_dim, keys) => {
+            Variant::Attention(ShaderEntry::FlashAttentionProducts, head_dim, keys, f16_output) => {
                 format!(
-                    "FlashAttentionProducts:head-dim-{head_dim}:keys-{}",
-                    keys.unwrap_or(16)
+                    "FlashAttentionProducts:head-dim-{head_dim}:keys-{}{}",
+                    keys.unwrap_or(16),
+                    if f16_output { ":output-f16" } else { "" }
                 )
             }
-            Variant::Attention(ref e, head_dim, ept) => {
-                format!("{e:?}:head-dim-{head_dim}:ept-{ept:?}")
+            Variant::Attention(ref e, head_dim, ept, f16_output) => {
+                format!(
+                    "{e:?}:head-dim-{head_dim}:ept-{ept:?}{}",
+                    if f16_output { ":output-f16" } else { "" }
+                )
             }
             Variant::Epilogue(ref e, ref key) => epilogue_profile_key(e, key, false),
             Variant::CoopEpilogue(ref e, ref key) => epilogue_profile_key(e, key, true),
@@ -2099,14 +2103,14 @@ impl Pipelines {
                     dispatch.weight_format,
                 )
             }
-            Variant::Attention(_, hd, ept) => match group {
+            Variant::Attention(_, hd, ept, f16_output) => match group {
                 ShaderGroup::FlashAttention => crate::codegen::generate_flash_attention_module(
                     hd,
                     knobs.flash_ept_cap,
                     knobs.flash,
                 ),
                 ShaderGroup::FlashAttentionCoop => {
-                    crate::codegen::generate_flash_attention_coop_module(hd)
+                    crate::codegen::generate_flash_attention_coop_with_output(hd, f16_output)
                 }
                 ShaderGroup::FlashAttentionProducts => {
                     let rows = auto_tune(gpu, 0).coop_caps.f16_attention_rows;
@@ -2122,8 +2126,8 @@ impl Pipelines {
                     {
                         return Err("unsupported attention product key block".into());
                     }
-                    crate::codegen::generate_flash_attention_product_module_with_keys(
-                        hd, rows, keys,
+                    crate::codegen::generate_flash_attention_product_with_output(
+                        hd, rows, keys, f16_output,
                     )
                 }
                 ShaderGroup::FlashAttentionCoopF32 => {
@@ -2373,7 +2377,16 @@ impl Pipelines {
                 }
                 _ => None,
             };
-            return Variant::Attention(entry, dim, ept);
+            let f16_output = dispatch.pointwise_storage.f16_output;
+            assert!(
+                !f16_output
+                    || matches!(
+                        entry,
+                        ShaderEntry::FlashAttentionCoop | ShaderEntry::FlashAttentionProducts
+                    ),
+                "unsupported attention output storage"
+            );
+            return Variant::Attention(entry, dim, ept, f16_output);
         }
         if let Some(shape) = dispatch.gemv_shape() {
             return Variant::Gemv(entry, dispatch.weight_format, shape);
@@ -5227,6 +5240,12 @@ mod variant_tests {
         }
         dispatch.kernel = crate::compile::Kernel::Default;
         assert_eq!(Pipelines::key(&dispatch), ordinary);
+        dispatch.pointwise_storage.f16_output = true;
+        assert!(keys.insert(Pipelines::key(&dispatch)));
+        dispatch.shader = ShaderEntry::FlashAttentionCoop;
+        let half_output = Pipelines::key(&dispatch);
+        dispatch.pointwise_storage.f16_output = false;
+        assert_ne!(Pipelines::key(&dispatch), half_output);
     }
 
     #[test]

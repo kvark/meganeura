@@ -51,7 +51,9 @@ use std::{io, path::Path};
 // changes which dispatches fusion may merge.
 // Version 39 records coherent half-weight mirrors and their qualified parent.
 // Older engines would ignore the metadata and leave native weights unfilled.
-const CACHE_FORMAT_VERSION: u32 = 39;
+// Version 40 permits F16 primary stores in cooperative forward attention.
+// Older readers ignore that storage flag for attention and would write F32.
+const CACHE_FORMAT_VERSION: u32 = 40;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]
