@@ -391,6 +391,11 @@ the descriptor-reference repair requires fresh measurements.
   and source proofs, 1,500 comparisons and 30 resource records. Broad/AT-only
   forms regress CI SGD 5.4%/4.6%; no form establishes a model-training speedup.
   Reject all three, restore exact sources/locks and pass nine smoke checks.
+- [x] Initialize invalid A rows once and stage only valid rows, using variable
+  or fixed loop bounds. Both pass value/source proofs and focused correctness
+  gates, but persistent forward/training regress 16.4%/9.7% and 12.4%/10.5%.
+  Preserve 1,000 comparisons and 20 resource records; reject both, restore
+  qualified sources/locks and pass nine smoke checks in separate bounded cgroups.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
@@ -400,6 +405,10 @@ the descriptor-reference repair requires fresh measurements.
   Recheck both model phases and all
   CI cases before retaining further changes; do not infer elapsed cost from
   barrier-wait counters alone.
+  Next, test a uniform runtime fast path for one-dimensional grid coordinates,
+  avoiding dynamic quotient/remainder projection without new shared fields.
+  Preserve the general projection, packed/repeated tile bounds, zero-work
+  handling and completion; this hypothesis is not yet implemented or measured.
   Keep the shared-state failure as a separate unresolved diagnostic.
   Retain both model phases and all CI gates; baseline parity remains open.
 

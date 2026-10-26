@@ -3773,6 +3773,76 @@ hashes**, SHA-256
 The independent audit log is `target/scalar-interior-a/verify.log`.
 Baseline parity remains unmet.
 
+## Staging only valid A rows
+
+Two rejected prototypes on `f758c61` initialize invalid A rows to positive zero
+once, before the K loop, then stage only valid rows on each iteration. They
+apply to F32 scalar products with normal A indexing, including transposed B;
+transposed A and other weight formats retain the original stage. The first
+form bounds the staging loop by the valid-row count. The second keeps the
+original constant iteration count and guards each iteration by that count.
+Both backends use the same template.
+
+The valid prefix and explicitly cleared suffix partition the used shared A
+cells. Every valid cell retains its original address and checked K-tail load;
+invalid cells remain zero across stages. The first existing staging barrier
+orders both initialization and valid writes. No barrier, reduction, store,
+shared capacity, subgroup guard or dependency changes. K=0 uses none of the
+initialized cells. Removing invalid-row element-zero reads does not qualify
+narrower read hazards: dependencies still cover the original allocations.
+
+Each form independently compares **3,674,112 shared-cell values across 4,784
+stages and 184 layouts**, starting from poisoned scratch and using opaque
+input values. The proof covers zero dimensions, edges and unsigned-32-bit
+limits without authorizing larger allocations. Inverse source audits reproduce
+the original ordinary shader bodies after restoring only A initialization and
+staging; all 19 CI and 43 model files are accounted for.
+
+Each variant passes **40 code-generation checks, nine whole-graph smoke tests
+and eight strict matrix oracle cases**, then 500 normal comparisons against
+frozen qualified `540eccf` binaries. The control/candidate/candidate/control
+protocol uses 25 interleaved pairs per case and visit, ten warmup pairs, at
+least one second of warmup and 256 workers. All 1,000 comparisons preserve
+matching selections, full-state budgets, completion, one persistent dispatch
+and no fallback. Maximum model error remains 4.66e-9.
+
+| Loop form / case | Control ordinary / persistent ms | Candidate ordinary / persistent ms | Persistent candidate/control, bootstrap 95% interval |
+|---|---:|---:|---:|
+| Variable bound, forward | 4.187 / 5.586 | 4.839 / 6.504 | 1.164 [1.129, 1.181] |
+| Variable bound, training + SGD | 14.610 / 17.756 | 16.294 / 19.481 | 1.097 [1.013, 1.179] |
+| Fixed bound, forward | 4.118 / 5.487 | 4.392 / 6.168 | 1.124 [1.114, 1.198] |
+| Fixed bound, training + SGD | 14.603 / 17.785 | 14.935 / 19.650 | 1.105 [1.090, 1.110] |
+
+The variable-bound form slows persistent forward/training **16.4% / 9.7%**;
+ordinary execution also slows **15.6% / 11.5%**. Its favorable normalized
+training ratio, 0.967 [0.948, 0.998], reflects the larger ordinary regression.
+The fixed-bound form slows persistent forward/training **12.4% / 10.5%** and
+CI SGD **6.2%**; normalized training and CI SGD regress **7.6% / 3.3%**. Neither
+form advances parity. All samples remain; the 10,000-resample intervals
+describe within-run uncertainty, not every source of between-visit variation.
+
+Twenty resource records preserve 48 CI registers, 102/103 model registers and
+the original shared capacities. Model code grows from 107,904/267,776 bytes
+to 124,800/293,888 with variable bounds and 118,656/286,464 with fixed bounds.
+The variable-bound CI code shrinks despite slower medians. Source operations
+and these resource totals do not establish native instruction counts, loop
+unrolling, spills or the cause of the timing changes. No fresh SDK capture or
+full-suite qualification is claimed for the rejected prototypes.
+
+Both probes are restored exactly to runtime `540eccf`. Dependency locks match
+the qualified copy, both forks are clean, release examples are rebuilt, and
+all nine restored smoke tests pass. Heavy jobs use verified separate cgroups
+with 16 GiB memory high, 20 GiB maximum and 1 GiB swap; GPU work is serialized,
+and builds/heavy analyses do not overlap measurements. Artifacts stay on `/x`.
+
+Records are under `target/scalar-bounded-a{,-fixed}/`. The manifest
+`target/megakernel-results/scalar-bounded-a/summary.json` preserves **1,000
+comparisons, 20 resource records, 24 verified measurement scopes and 665
+independently verified artifact hashes**, SHA-256
+`6f35ed2ef68dec4f732ec441268732f939ac9d1cc19a12a6feb7722cc23d025e`.
+The independent audit log is `target/scalar-bounded-a/verify.log`.
+Baseline parity remains unmet.
+
 ## Earlier artifact identities
 
 All records remain on local storage at
