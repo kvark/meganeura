@@ -39,18 +39,7 @@ $ENTRY_SIGNATURE {
     let k = params.k;
     $K_RANGE
 
-    // C offsets for the 4 output tiles
-    let c00 = $OUTPUT_OFFSET + tile_row * n + tile_col;
-    let c01 = $OUTPUT_OFFSET + tile_row * n + (tile_col + $TILE_N_U);
-    let c10 = $OUTPUT_OFFSET + (tile_row + $TILE_M_U) * n + tile_col;
-    let c11 = $OUTPUT_OFFSET + (tile_row + $TILE_M_U) * n + (tile_col + $TILE_N_U);
-
-    // Validity flags for secondary tiles
     let n1_valid = (tile_col + $TILE_N_U) < n;
-    let m1_valid = (tile_row + $TILE_M_U) < m;
-
-    // Initialize accumulators
-    $ACC_INIT
 
     // Hoisted staging index components
     $STAGING_VARS
@@ -59,40 +48,148 @@ $ENTRY_SIGNATURE {
     // from global into shared memory so the K-loop staging reads are cheap.
     $PROLOGUE_CACHE_INIT
 
+    // Two subgroups own separate rows. A single wide subgroup keeps both
+    // rows, without putting staging or workgroup barriers in subgroup control.
+    let sg_row = (sg % 2u) * $TILE_M_U;
+    let row_valid = sg < 2u && tile_row + sg_row < m;
+    let c0 = $OUTPUT_OFFSET + (tile_row + sg_row) * n + tile_col;
+    let c1 = c0 + $TILE_N_U;
+    let owns_second_row = sg == 0u && sg_size >= 64u;
+    let second_row_valid = owns_second_row && tile_row + $TILE_M_U < m;
+    let c2 = $OUTPUT_OFFSET + (tile_row + $TILE_M_U) * n + tile_col;
+    let c3 = c2 + $TILE_N_U;
+    $ACC_INIT
+
     var t = $K_START;
     loop {
         if t >= $K_END { break; }
 
-        // Stage sa0: B[t:t+tile, tile_col:tile_col+tile] → shared_a0
         $B_STAGE_0
-
-        // Stage sa1: B[t:t+tile, tile_col+tile:tile_col+2*tile] → shared_a1
         $B_STAGE_1
-
-        // Stage sb0: A[tile_row:tile_row+tile, t:t+tile] → shared_b0
         $A_STAGE_0
-
-        // Stage sb1: A[tile_row+tile:tile_row+2*tile, t:t+tile] → shared_b1
         $A_STAGE_1
-
         workgroupBarrier();
 
-        // Cooperative matrix multiply-add: C += A × B
-        // shared_b{0,1} hold A-matrix row tiles; shared_a{0,1} hold B-matrix column tiles.
-        // Load A data into role-A (left operand), B data into role-B (right operand).
-        let a0 = coopLoadT<$COOP_AB>(&shared_b0[0], $TILE_K_U);
-        let a1 = coopLoadT<$COOP_AB>(&shared_b1[0], $TILE_K_U);
+        var a = $COOP_AB();
+        if sg_row == 0u {
+            a = coopLoadT<$COOP_AB>(&shared_b0[0], $TILE_K_U);
+        } else {
+            a = coopLoadT<$COOP_AB>(&shared_b1[0], $TILE_K_U);
+        }
         let b0 = coopLoadT<$COOP_BA>(&shared_a0[0], $TILE_N_U);
         let b1 = coopLoadT<$COOP_BA>(&shared_a1[0], $TILE_N_U);
-        acc00 = coopMultiplyAdd(a0, b0, acc00);
-        acc01 = coopMultiplyAdd(a0, b1, acc01);
-        acc10 = coopMultiplyAdd(a1, b0, acc10);
-        acc11 = coopMultiplyAdd(a1, b1, acc11);
+        acc0 = coopMultiplyAdd(a, b0, acc0);
+        acc1 = coopMultiplyAdd(a, b1, acc1);
+        if owns_second_row {
+            let a_second = coopLoadT<$COOP_AB>(&shared_b1[0], $TILE_K_U);
+            acc2 = coopMultiplyAdd(a_second, b0, acc2);
+            acc3 = coopMultiplyAdd(a_second, b1, acc3);
+        }
         $COMPENSATED_MMA
 
         workgroupBarrier();
         t += $TILE_K_U;
     }
-
     $RESULT_STORE
+    $RESULT_SCATTER
+}
+
+// @section acc_zero
+var acc0 = $COOP_C();
+var acc1 = $COOP_C();
+var acc2 = $COOP_C();
+var acc3 = $COOP_C();
+
+// @section acc_add
+var acc0 = $COOP_C();
+var acc1 = $COOP_C();
+var acc2 = $COOP_C();
+var acc3 = $COOP_C();
+if row_valid {
+    acc0 = coopLoadT<$COOP_C>(&src[c0], n);
+    if n1_valid {
+        acc1 = coopLoadT<$COOP_C>(&src[c1], n);
+    }
+}
+
+if second_row_valid {
+    acc2 = coopLoadT<$COOP_C>(&src[c2], n);
+    if n1_valid {
+        acc3 = coopLoadT<$COOP_C>(&src[c3], n);
+    }
+}
+
+// @section direct_store
+if row_valid {
+    coopStoreT(acc0, &$C_BUFFER[c0], n);
+    if n1_valid {
+        coopStoreT(acc1, &$C_BUFFER[c1], n);
+    }
+}
+
+if second_row_valid {
+    coopStoreT(acc2, &$C_BUFFER[c2], n);
+    if n1_valid {
+        coopStoreT(acc3, &$C_BUFFER[c3], n);
+    }
+}
+
+// @section shared_result
+var<workgroup> shared_c: array<f32, $RESULT_SHARED_SIZE>;
+
+// @section shared_store
+if sg < 2u {
+    coopStoreT(acc0, &shared_c[sg_row * $OUTPUT_N_U], $OUTPUT_N_U);
+    coopStoreT(acc1, &shared_c[sg_row * $OUTPUT_N_U + $TILE_N_U], $OUTPUT_N_U);
+}
+
+if owns_second_row {
+    coopStoreT(acc2, &shared_c[$TILE_M_U * $OUTPUT_N_U], $OUTPUT_N_U);
+    coopStoreT(acc3, &shared_c[$TILE_M_U * $OUTPUT_N_U + $TILE_N_U], $OUTPUT_N_U);
+}
+
+// @section result_scatter
+workgroupBarrier();
+for (var e = 0u; e < $STORE_ITERS_U; e++) {
+    let local_idx = lid.x + e * 64u;
+    if local_idx < $RESULT_SHARED_SIZE_U {
+        let local_row = local_idx / $OUTPUT_N_U;
+        let local_col = local_idx - local_row * $OUTPUT_N_U;
+        let row = tile_row + local_row;
+        let col = tile_col + local_col;
+        if row < m && col < n {
+            let idx = $RESULT_INDEX;
+            var val = shared_c[local_idx];
+            $EPILOGUE_BODY
+            $C_BUFFER[idx] = $RESULT_VALUE;
+        }
+    }
+}
+
+// @section shared_low
+var<workgroup> shared_a0_lo: array<f16, $SHARED_SIZE>;
+var<workgroup> shared_a1_lo: array<f16, $SHARED_SIZE>;
+var<workgroup> shared_b0_lo: array<f16, $SHARED_SIZE>;
+var<workgroup> shared_b1_lo: array<f16, $SHARED_SIZE>;
+
+// @section compensated
+var a_lo = $COOP_AB();
+if sg_row == 0u {
+    a_lo = coopLoadT<$COOP_AB>(&shared_b0_lo[0], $TILE_K_U);
+} else {
+    a_lo = coopLoadT<$COOP_AB>(&shared_b1_lo[0], $TILE_K_U);
+}
+let b0_lo = coopLoadT<$COOP_BA>(&shared_a0_lo[0], $TILE_N_U);
+let b1_lo = coopLoadT<$COOP_BA>(&shared_a1_lo[0], $TILE_N_U);
+acc0 = coopMultiplyAdd(a, b0_lo, acc0);
+acc0 = coopMultiplyAdd(a_lo, b0, acc0);
+acc1 = coopMultiplyAdd(a, b1_lo, acc1);
+acc1 = coopMultiplyAdd(a_lo, b1, acc1);
+if owns_second_row {
+    let a_second = coopLoadT<$COOP_AB>(&shared_b1[0], $TILE_K_U);
+    let a_second_lo = coopLoadT<$COOP_AB>(&shared_b1_lo[0], $TILE_K_U);
+    acc2 = coopMultiplyAdd(a_second, b0_lo, acc2);
+    acc2 = coopMultiplyAdd(a_second_lo, b0, acc2);
+    acc3 = coopMultiplyAdd(a_second, b1_lo, acc3);
+    acc3 = coopMultiplyAdd(a_second_lo, b1, acc3);
 }

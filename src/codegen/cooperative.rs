@@ -508,8 +508,14 @@ mod tests {
             assert!(
                 module
                     .source
-                    .contains("acc11 = coopMultiplyAdd(a1, b1, acc11)")
+                    .contains("acc1 = coopMultiplyAdd(a, b1, acc1)")
             );
+            assert!(
+                module
+                    .source
+                    .contains("acc3 = coopMultiplyAdd(a_second, b1, acc3)")
+            );
+            assert_eq!(module.source.matches("= coopMultiplyAdd(").count(), 4);
             assert!(!module.source.contains("var<workgroup> shared_c"));
             assert!(module.source.contains("wgid.z * m * n"));
         }

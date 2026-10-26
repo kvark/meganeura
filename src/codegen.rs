@@ -3066,31 +3066,20 @@ fn gen_matmul_coop_stored(
         )
     };
 
-    let (fused_decl, acc_init) = if fused_add && typed.is_none() {
-        (
-            "var<storage> src: array<f32>;".to_string(),
-            format!(
-                "var acc00 = coopLoadT<{coop_c}>(&src[c00], n);\n\
-                 \x20   var acc01 = coopLoadT<{coop_c}>(&src[c01], n);\n\
-                 \x20   var acc10 = coopLoadT<{coop_c}>(&src[c10], n);\n\
-                 \x20   var acc11 = coopLoadT<{coop_c}>(&src[c11], n);"
-            ),
-        )
+    let template = include_str!("shaders/matmul_coop.wgsl");
+    let fused_decl = if fused_add {
+        "var<storage> src: array<f32>;"
     } else {
-        (
-            if fused_add {
-                "var<storage> src: array<f32>;".to_owned()
-            } else {
-                String::new()
-            },
-            format!(
-                "var acc00 = {coop_c}();\n\
-                 \x20   var acc01 = {coop_c}();\n\
-                 \x20   var acc10 = {coop_c}();\n\
-                 \x20   var acc11 = {coop_c}();"
-            ),
-        )
+        ""
     };
+    let acc_init = template_section(
+        template,
+        if fused_add && typed.is_none() {
+            "acc_add"
+        } else {
+            "acc_zero"
+        },
+    );
 
     let output_tile_u = format!("{}u", output_tile);
     let tile_size_u = format!("{}u", tile);
@@ -3112,94 +3101,57 @@ fn gen_matmul_coop_stored(
     } else {
         "val".to_owned()
     };
-    let (result_shared_decl, result_store) =
-        if epilogue.is_some() || typed.is_some_and(|(_, layout)| !layout.direct_output) {
-            // Cooperative matrices are subgroup-scoped. Only one subgroup may
-            // store these shared tiles; every invocation still reaches the barrier.
-            let store_iters = result_shared_size.div_ceil(wg_size);
-            (
-                format!(
-                    "var<workgroup> shared_c: array<f32, {}>;",
-                    result_shared_size
-                ),
-                format!(
-                    "if sg == 0u {{\n\
-                 \x20   coopStoreT(acc00, &shared_c[0], {output_tile}u);\n\
-                 \x20   coopStoreT(acc01, &shared_c[{tile}u], {output_tile}u);\n\
-                 \x20   coopStoreT(acc10, &shared_c[{}u], {output_tile}u);\n\
-                 \x20   coopStoreT(acc11, &shared_c[{}u], {output_tile}u);\n\
-                 \x20   }}\n\
-                 \x20   workgroupBarrier();\n\
-                 \n\
-                 \x20   for (var e = 0u; e < {store_iters}u; e++) {{\n\
-                 \x20       let local_idx = lid.x + e * {wg_size}u;\n\
-                 \x20       if local_idx < {result_shared_size}u {{\n\
-                 \x20           let local_row = local_idx / {output_tile}u;\n\
-                 \x20           let local_col = local_idx - local_row * {output_tile}u;\n\
-                 \x20           let row = tile_row + local_row;\n\
-                 \x20           let col = tile_col + local_col;\n\
-                 \x20           if row < m && col < n {{\n\
-                 \x20               let idx = {result_index};\n\
-                 \x20               var val = shared_c[local_idx];\n\
-                 \x20               {epilogue_body}\n\
-                 \x20               $C_BUFFER[idx] = {result_value};\n\
-                 \x20           }}\n\
-                 \x20       }}\n\
-                 \x20   }}",
-                    tile * output_tile,
-                    tile * output_tile + tile,
-                ),
-            )
-        } else {
-            (
-                String::new(),
-                "if sg == 0u {\n\
-             \x20   coopStoreT(acc00, &$C_BUFFER[c00], n);\n\
-             \x20   if n1_valid {\n\
-             \x20       coopStoreT(acc01, &$C_BUFFER[c01], n);\n\
-             \x20   }\n\
-             \x20   if m1_valid {\n\
-             \x20       coopStoreT(acc10, &$C_BUFFER[c10], n);\n\
-             \x20   }\n\
-             \x20   if n1_valid && m1_valid {\n\
-             \x20       coopStoreT(acc11, &$C_BUFFER[c11], n);\n\
-             \x20   }\n\
-             \x20   }"
-                    .to_string(),
-            )
-        };
-
-    let (shared_lo_decl, compensated_mma) = if compensated {
-        (
-            format!(
-                "var<workgroup> shared_a0_lo: array<f16, {shared_size}>;\n\
-                 var<workgroup> shared_a1_lo: array<f16, {shared_size}>;\n\
-                 var<workgroup> shared_b0_lo: array<f16, {shared_size}>;\n\
-                 var<workgroup> shared_b1_lo: array<f16, {shared_size}>;"
-            ),
-            format!(
-                "let a0_lo = coopLoadT<{coop_ab}>(&shared_b0_lo[0], {tile}u);\n\
-                 \x20   let a1_lo = coopLoadT<{coop_ab}>(&shared_b1_lo[0], {tile}u);\n\
-                 \x20   let b0_lo = coopLoadT<{coop_ba}>(&shared_a0_lo[0], {tile}u);\n\
-                 \x20   let b1_lo = coopLoadT<{coop_ba}>(&shared_a1_lo[0], {tile}u);\n\
-                 \x20   acc00 = coopMultiplyAdd(a0, b0_lo, acc00);\n\
-                 \x20   acc00 = coopMultiplyAdd(a0_lo, b0, acc00);\n\
-                 \x20   acc01 = coopMultiplyAdd(a0, b1_lo, acc01);\n\
-                 \x20   acc01 = coopMultiplyAdd(a0_lo, b1, acc01);\n\
-                 \x20   acc10 = coopMultiplyAdd(a1, b0_lo, acc10);\n\
-                 \x20   acc10 = coopMultiplyAdd(a1_lo, b0, acc10);\n\
-                 \x20   acc11 = coopMultiplyAdd(a1, b1_lo, acc11);\n\
-                 \x20   acc11 = coopMultiplyAdd(a1_lo, b1, acc11);"
-            ),
-        )
+    let shared_result =
+        epilogue.is_some() || typed.is_some_and(|(_, layout)| !layout.direct_output);
+    let result_shared_decl = if shared_result {
+        template_section(template, "shared_result")
     } else {
-        (String::new(), String::new())
+        ""
+    };
+    let result_store = template_section(
+        template,
+        if shared_result {
+            "shared_store"
+        } else {
+            "direct_store"
+        },
+    );
+    let result_scatter = if shared_result {
+        template_section(template, "result_scatter")
+    } else {
+        ""
+    };
+    let shared_lo_decl = if compensated {
+        template_section(template, "shared_low")
+    } else {
+        ""
+    };
+    let compensated_mma = if compensated {
+        template_section(template, "compensated")
+    } else {
+        ""
     };
 
-    let src = include_str!("shaders/matmul_coop.wgsl");
     let src = preprocess(
-        src,
+        template,
         &[
+            ("$FUSED_ADD_DECL", fused_decl),
+            ("$ACC_INIT", acc_init),
+            ("$RESULT_SHARED_DECL", result_shared_decl),
+            ("$RESULT_STORE", result_store),
+            ("$RESULT_SCATTER", result_scatter),
+            ("$SHARED_LO_DECL", shared_lo_decl),
+            ("$COMPENSATED_MMA", compensated_mma),
+            ("$RESULT_SHARED_SIZE_U", &format!("{result_shared_size}u")),
+            ("$RESULT_SHARED_SIZE", &result_shared_size.to_string()),
+            (
+                "$STORE_ITERS_U",
+                &format!("{}u", result_shared_size.div_ceil(wg_size)),
+            ),
+            ("$RESULT_INDEX", result_index),
+            ("$RESULT_VALUE", &result_value),
+            ("$EPILOGUE_BODY", &epilogue_body),
+            ("$COOP_C", &coop_c),
             (
                 "$PARTITION_FIELD",
                 if typed.is_some() { "splits" } else { "_pad" },
@@ -3242,12 +3194,6 @@ fn gen_matmul_coop_stored(
             ("$EPILOGUE_DECL", &epilogue_decl),
             ("$PROLOGUE_CACHE_DECL", &prologue_cache_decl),
             ("$PROLOGUE_CACHE_INIT", &prologue_cache_init),
-            ("$FUSED_ADD_DECL", &fused_decl),
-            ("$ACC_INIT", &acc_init),
-            ("$RESULT_SHARED_DECL", &result_shared_decl),
-            ("$RESULT_STORE", &result_store),
-            ("$SHARED_LO_DECL", &shared_lo_decl),
-            ("$COMPENSATED_MMA", &compensated_mma),
         ],
     );
 
@@ -3261,6 +3207,11 @@ fn gen_matmul_coop_stored(
         let bindings = format!(
             "var<storage> matrix_b: {b_storage};\nvar<storage, read_write> matrix_c: array<{output}>;\n{rounding}"
         );
+        let src = format!(
+            "{}\n{}",
+            template_section(&src, "header"),
+            template_section(&src, "kernel"),
+        );
         return ShaderModule::new(&preprocess(
             &src,
             &[
@@ -3269,7 +3220,7 @@ fn gen_matmul_coop_stored(
                 ("$C_BUFFER", "matrix_c"),
                 (
                     "$ENTRY_SIGNATURE",
-                    "@compute @workgroup_size(64) fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(subgroup_id) sg: u32)",
+                    "@compute @workgroup_size(64) fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(subgroup_id) sg: u32, @builtin(subgroup_size) sg_size: u32)",
                 ),
             ],
         ));
