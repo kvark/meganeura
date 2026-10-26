@@ -365,11 +365,27 @@ the descriptor-reference repair requires fresh measurements.
   and SGD improve 4.4/3.0%; completed-step model intervals remain inconclusive.
   SDK resident forward/training improve 3.8/3.7% with exact same-backend state.
   Preserve 1,500 normal comparisons, 30 resource records and 16 SDK captures.
+- [x] Qualify uniform interior staging for F32 transposed-B matrices at
+  `540eccf`, preserving original checked edge loads and selected arithmetic.
+  Final completed-step model training improves 5.6% raw / 2.9% normalized;
+  SDK resident training improves 2.0%. Recheck 667 library, 168 strict oracle,
+  50 original-mode matrix and nine smoke tests. Preserve 2,000 comparisons
+  across the rejected broad/transposed-A probes and qualified transposed-B form.
+- [x] Test conditional scalar A loads with a merged value and branch-local
+  stores. Both pass focused correctness checks but regress model timing.
+  Preserve 1,000 comparisons and 20 resource records, then restore the runtime.
+- [x] Test an explicit subgroup broadcast of the already workgroup-uniform
+  claim ticket. Validate and independently invert 35 SPIR-V transformations;
+  preserve 500 comparisons and ten resource records. No model-training gain
+  appears and CI SGD regresses 6.6%; restore the backend and dependency lock.
+  No new Naga semantics or uniformity-validation exception is needed.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
-  completed-step parity. The rejected per-thread guard shows that fewer FP32
-  operations alone do not establish a speedup. Recheck both model phases and all
+  completed-step parity. Transposed-B staging improves training, which remains
+  about 22.5% slower than ordinary execution. The rejected per-thread guard
+  shows that fewer FP32 operations alone do not establish a speedup.
+  Recheck both model phases and all
   CI cases before retaining further changes; do not infer elapsed cost from
   barrier-wait counters alone.
   Keep the shared-state failure as a separate unresolved diagnostic.

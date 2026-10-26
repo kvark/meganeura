@@ -3526,6 +3526,75 @@ The independent audit log is `target/conditional-a-verify.log`.
 The retained runtime and its performance claims remain unchanged; baseline
 parity is still unmet.
 
+## Subgroup broadcast of the claim ticket
+
+A temporary Blade backend probe on `7a8804e` tests whether explicitly exposing
+the claim ticket's subgroup uniformity helps driver control flow. It inserts
+one `OpGroupNonUniformBroadcastFirst` of the `uvec4` result immediately after
+the single `graph_claim` call. The function already returns
+`workgroupUniformLoad(&graph_ticket)`, so every active invocation has the same
+value; selecting the first active value in each subgroup preserves all four
+components, including the sentinel values. Original workgroup barriers remain.
+The RTX 5080 reports compute-stage ballot support for this instruction. See the
+[SPIR-V instruction specification](https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#OpGroupNonUniformBroadcastFirst).
+
+The temporary postprocessor uses a separate DEBUG module to identify the call,
+requiring that stripping its debug instructions reproduces the original
+module. It validates the input, named and transformed modules with `spirv-val`
+before pipeline creation. An independent inverse audit of **35 modules** removes
+only the broadcast and any added capability/scope declaration, restores the
+call result ID and bound, and reproduces every original byte. Memory operations,
+scopes and semantics are unchanged. No Naga validator relaxation is involved.
+This is a device-specific diagnostic, not a portable API change.
+
+Nine whole-graph smoke tests pass. Control/candidate/candidate/control visits
+then preserve **500 normal comparisons**, with 25 interleaved ordinary/
+persistent pairs per case and visit, ten warmup pairs, at least one second of
+warmup and 256 workers. Controls are the frozen qualified `540eccf` binaries.
+Every selection, complete-state, completion, one-dispatch and no-fallback gate
+passes; maximum model error is 4.66e-9. No build, heavy analysis or SDK capture
+overlaps normal measurements.
+
+| Case | Control ordinary / persistent ms | Candidate ordinary / persistent ms | Persistent candidate/control, bootstrap 95% interval |
+|---|---:|---:|---:|
+| CI inference | 0.05170 / 0.06587 | 0.05728 / 0.07466 | 1.133 [1.074, 1.145] |
+| CI backward | 0.06453 / 0.09327 | 0.06513 / 0.09433 | 1.011 [1.001, 1.035] |
+| CI SGD | 0.06630 / 0.09445 | 0.06661 / 0.10066 | 1.066 [1.049, 1.073] |
+| Model forward | 4.120 / 5.517 | 4.183 / 5.591 | 1.013 [1.005, 1.024] |
+| Model training + SGD | 14.586 / 17.819 | 14.631 / 17.855 | 1.002 [0.986, 1.023] |
+
+There is no useful model-training gain. The normalized forward/training ratios
+are 1.003 [0.976, 1.030] and 0.982 [0.951, 1.020], both inconclusive. CI SGD
+regresses **6.6% raw / 4.2% normalized**, with normalized interval
+[1.021, 1.064]. CI inference's ordinary timing also rises 10.8%; its normalized
+interval includes no change. All samples and outliers remain. These
+10,000-resample intervals describe within-run uncertainty, not every source of
+between-visit variation.
+
+Ten separate resource records retain 48 CI registers, 102/103 model registers
+and all original shared-memory sizes. CI backward/SGD code grows from
+61,312/65,408 to 61,696/67,584 bytes; model forward grows from 107,904 to 108,032
+bytes. Training remains 267,776 bytes. All **19 CI and 43 model WGSL files** are
+byte-identical between control and candidate, as are ordinary pipeline resource
+multisets. These counts do not establish native control-flow uniformity or
+explain the timing changes. No new SDK capture or full-suite qualification is
+claimed for this rejected probe.
+
+The backend patch and ignored lockfile are restored exactly. Both forks are
+clean, release examples are rebuilt from the original pins, and all nine
+restored whole-graph smoke tests pass. The recovered initial smoke log contains
+its passing result and separate cgroup receipt; no stale GPU job remained and
+the recovered run was not duplicated. Every heavy job uses a verified separate
+16/20/1 GiB cgroup, GPU work is serialized, and all artifacts remain on `/x`.
+
+Sources, binaries, module proofs, samples and captures are under
+`target/ticket-subgroup-hint/`. The manifest
+`target/megakernel-results/ticket-subgroup-hint/summary.json` contains **435
+independently verified artifact hashes**, SHA-256
+`01a671f874b16eb8934d954ab9568fb02a3ffab667a4bdf37ddf3bf21cb34386`.
+The independent verification log is `target/ticket-subgroup-hint/verify.log`.
+Runtime `540eccf` remains qualified; baseline parity remains unmet.
+
 ## Earlier artifact identities
 
 All records remain on local storage at
