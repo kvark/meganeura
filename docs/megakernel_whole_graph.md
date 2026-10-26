@@ -12,7 +12,9 @@ The latest qualified runtime is `762faf2`; its
 [cooperative row distribution and fresh measurements](#cooperative-row-distribution)
 are recorded below. Subsequent [scheduler locality probes](#scheduler-locality-probes)
 and the [workgroup propagation probe](#workgroup-barrier-propagation) establish
-no useful model improvement and are reverted. Performance parity remains unmet.
+no useful model improvement and are reverted. The subsequent
+[subgroup-local row staging probe](#subgroup-local-cooperative-row-staging)
+also fails the performance gate. Performance parity remains unmet.
 
 For model benchmarks, use `--whole-graph --workers 256`. The
 [current worker sweep](#worker-counts-and-deeper-scalar-staging) finds lower CI
@@ -2739,8 +2741,89 @@ under `target/workgroup-barrier-propagation/`. The manifest
 **225 independently verified artifact hashes** and SHA-256
 `1072455373873c0be6bf09093fe85a3617ad7703b7acb67776ce705d81210e7c`.
 The qualified runtime, dependency pins and primary measurements remain unchanged.
-Baseline parity is still unmet. Subgroup-local cooperative tiles require a
-scratch-ownership proof and valid subgroup-barrier lowering before a new probe.
+Baseline parity is still unmet. The following probe supplies a scratch-ownership
+argument and temporary subgroup-barrier lowering before measuring that direction.
+
+## Subgroup-local cooperative row staging
+
+At `5356830`, a temporary native cooperative matmul change keeps 64 logical
+invocations, the original output tile, per-output accumulation order, K loop,
+logical grid and four-tile packing. On 32-lane subgroups, each subgroup stages
+its own A row tile and copies both B column tiles into disjoint shared slices.
+Two staging passes cover the original 64 staging coordinates. The two K-loop
+rendezvous use subgroup barriers. Other subgroup widths retain the original
+staging and workgroup synchronization path. Prologue initialization, epilogue
+scatter, graph publication/completion and scratch-reuse barriers remain.
+
+The ownership audit finds a necessary adapter change: previously, inactive
+packed groups masked writes and products but could still load a clamped active
+scratch slice. The old workgroup barriers ordered those reads; subgroup barriers
+would not. The probe also masks cooperative loads assigned to local matrices,
+and rejects conversion if any cooperative load in such a handler is not
+maskable. Generated model sources confirm all five loads in the changed handler
+have activity guards. The two attention loads retain their original workgroup
+synchronization. Partial packing and scratch reuse remain explicitly tested.
+
+The temporary Naga patch maps subgroup barriers to AcquireRelease plus
+WorkgroupMemory, retaining subgroup execution and memory scopes. Vulkan ignores
+SubgroupMemory; it does not identify the shared storage class. See the
+[Vulkan memory semantics](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html#memory-semantics).
+The cooperative operand checker also recognizes subgroup_size as workgroup-uniform:
+[WGSL guarantees dispatch uniformity in compute](https://gpuweb.github.io/gpuweb/wgsl/#subgroups),
+and Naga restricts cooperative loads/products to compute. Subgroup and invocation
+IDs keep their previous classifications. No general relaxation of barrier
+control validation or cross-backend repair is made.
+
+Five focused fence tests and nine cooperative-matrix tests pass, including
+SPIR-V validation, both operand scopes and negative divergent cases. All 48
+shader-generation tests pass, retaining the four-tile packing assertion. All
+eight expanded whole-graph smoke tests and publication/reuse stress pass. The
+packed-matrix test covers plain and fused-prologue paths, short K tails,
+single-tile claims, inactive groups, 1/3/64/4096 workers and three replays.
+
+Development failures remain in the record: reserved names in the first WGSL
+fixtures; missing subgroup-barrier capabilities in positive shader tests;
+packing rejection from the conservative subgroup-size classification; a helper
+fixture hitting existing workgroup control-flow rejection; and two fixture
+variants retaining an unsupported 64×64 subgroup matrix type. The final operand
+test uses valid shapes and retains the negative control tests. The first artifact
+audit also mistakenly expected guards on the unchanged attention loads; the
+corrected audit checks every load in the subgroup-synchronized handler.
+
+Fresh control and candidate binaries each run 20 AB/BA pairs for all three CI
+cases and both model phases: **200 normal comparisons**. All retain matching
+selection, state/completion/tolerance checks, one persistent dispatch and no
+fallback. Both execution modes share the candidate compiler and arithmetic.
+
+| Model case | Control ordinary / persistent ms | Candidate ordinary / persistent ms | Candidate / control persistent median, 95% interval |
+|---|---:|---:|---:|
+| Forward | 4.242 / 5.703 | 4.613 / 6.028 | 1.057 [1.051, 1.116] |
+| Training + SGD | 14.944 / 18.708 | 13.970 / 19.662 | 1.051 [0.997, 1.150] |
+
+Forward's normalized paired ratio is 0.967 [0.909, 1.011], but ordinary execution
+slows more, so this is not a persistent speedup. Training's normalized ratio is
+1.068 [0.978, 1.920], with substantial timing variation retained. CI normalized
+ratios are 1.018, 1.001 and 1.017; their intervals all include one. The probe
+establishes no useful completed-step improvement and is rejected.
+
+Four separate resource captures report forward/training shared storage growing
+from 20,880/29,232 to 24,976/33,328 bytes. Registers change from 100/103 to 100/102;
+executable sizes change from 106,752/256,512 to 107,776/254,848 bytes. Extra staging
+and storage are potential costs, not an isolated causal attribution. No new SDK
+capture or full oracle qualification is claimed for this rejected prototype.
+
+All temporary runtime, shader, test, Cargo and Naga changes are reverted.
+Rebuilt examples match the qualified hashes byte-for-byte, both forks are clean,
+and all eight restored smoke tests pass. Heavy jobs use verified separate
+16/20/1 GiB cgroups, GPU jobs serialize, and all artifacts stay on local `/x`.
+Sources, patches, samples and failures are under `target/subgroup-row-staging/`.
+The manifest `target/megakernel-results/subgroup-row-staging/summary.json` contains
+**282 independently verified artifact hashes**, with SHA-256
+`48d1e6d3edb41ca67d2d3539b91e3121b66148e3fd32b9388745910d498f022b`.
+The qualified runtime and dependency pins remain unchanged. Next, audit which
+real model dependencies permit safe release of row or element ranges; the prior
+independent-node diagnostics motivate measuring that opportunity before changing
+the scheduler. Baseline parity remains unmet.
 
 ## Earlier artifact identities
 

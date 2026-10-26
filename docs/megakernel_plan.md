@@ -316,14 +316,20 @@ the descriptor-reference repair requires fresh measurements.
   preserve 225 independently verified artifact hashes, including the confirmed
   pre-existing subgroup-only SPIR-V validation failure and harness failures.
   Qualified binaries and all eight restored smoke checks are unchanged.
-- [ ] Investigate subgroup-local cooperative tiles only after proving packed
-  scratch ownership and validating Naga's subgroup-barrier lowering. Preserve
-  common ordinary/persistent arithmetic selection, explicit schedules, supported
-  subgroup widths and partial-batch completion. Require a useful whole-program
-  improvement before retaining a geometry or synchronization change.
+- [x] Probe subgroup-local cooperative row staging with the original output
+  geometry and arithmetic. Duplicate B staging per subgroup, mask inactive
+  cooperative loads, and test subgroup-barrier lowering and compute-uniform
+  subgroup-size operands in Naga. Fourteen focused compiler tests, 48 shader
+  tests, eight expanded smoke tests, publication stress and 200 comparisons
+  pass. Persistent forward slows 5.7%; training establishes no gain. Revert the
+  probe, preserving four resource captures and 282 independently verified
+  artifact hashes. Restore the exact qualified binaries and eight smoke checks.
+- [ ] Audit real model dependencies for opportunities to release row or element
+  ranges before an entire operation finishes. Measure eligible work before
+  changing scheduling. Finer dependencies require proofs for payload ranges,
+  allocation reuse, original tile coordinates and completion aggregation;
+  preserve common arithmetic and conservative edges for unsupported accesses.
   Keep the shared-state failure as a separate unresolved diagnostic.
-  Finer dependencies require proofs for payload ranges,
-  allocation reuse, original tile coordinates and completion aggregation.
   Retain both model phases and all CI gates; baseline parity remains open.
 
 The Blade extension exposes binding inspection and runtime buffer-array binding
