@@ -3843,6 +3843,94 @@ independently verified artifact hashes**, SHA-256
 The independent audit log is `target/scalar-bounded-a/verify.log`.
 Baseline parity remains unmet.
 
+## Direct coordinates for one-dimensional grids
+
+Two rejected prototypes on `a6a7629` use the current node's uniform
+`grid.y == 1 && grid.z == 1` predicate to construct logical coordinates
+directly. Other grids retain the original quotient/remainder projection.
+The broad form applies to every handler, including packed tiles. The subset
+applies only inside the existing repeated optimizer batches. Neither changes
+batch admission, selected arithmetic, shared state, barriers, fences or queue
+operations. Runtime inspection preserves reuse of a handler with different
+grids; no dimensions are assumed from its first recording.
+
+For an entered claim, the tile index is below the logical count. Sequential
+repeats retain their bounded final batch. Packed widths divide their selected
+extent, and inactive groups clamp to the last active coordinate. For a
+one-dimensional grid, x-packed coordinates therefore equal the tile plus its
+clamped offset; packing on y or z has width one. The resulting y/z coordinates
+are zero.
+Zero-work nodes retain their outer skip, and overflow admission is unchanged.
+Each independent proof checks **338,998 coordinates across 602 grids**, including
+partial batches, inactive groups and unsigned-32-bit boundaries. This proves
+the mapping without authorizing allocations beyond existing limits.
+
+Both variants pass **49 code-generation checks, nine whole-graph smoke tests
+and all 168 strict oracle tests**. Each then receives 500 normal comparisons
+against frozen qualified `540eccf` binaries, using the established
+control/candidate/candidate/control protocol, 25 interleaved pairs per case
+and visit, ten warmup pairs, at least one second of warmup and 256 workers.
+All 1,000 comparisons preserve matching selections, full-state budgets,
+completion, one persistent dispatch and no fallback; maximum model error is
+4.66e-9.
+
+| Form / case | Control ordinary / persistent ms | Candidate ordinary / persistent ms | Persistent candidate/control, bootstrap 95% interval |
+|---|---:|---:|---:|
+| Broad, forward | 4.118 / 5.493 | 4.118 / 5.517 | 1.004 [0.943, 1.065] |
+| Broad, training + SGD | 14.622 / 17.815 | 14.639 / 17.873 | 1.003 [0.961, 1.087] |
+| Repeated batches, training + SGD | 14.791 / 17.749 | 14.583 / 18.113 | 1.020 [1.006, 1.106] |
+
+The broad form establishes no speedup in either model phase or CI. The subset
+slows persistent training **2.0% raw / 2.6% normalized**. All samples and outliers
+remain; bootstrap intervals describe within-run uncertainty, not all
+between-visit variation. The subset's complete forward and CI shaders and
+compiled pipeline/resource multisets are identical, so their timing shifts
+are not attributed to this change.
+
+Source audits account for 19 CI and 43 model modules per variant. Every ordinary
+module is byte-identical, with matching selected pipeline keys and resource
+multisets. Reversing only the coordinate transformation reproduces every whole
+graph module after whitespace/comment normalization. Initial order-sensitive
+resource assertions and their multiset corrections remain in the audit records.
+Twenty resource records preserve shared capacities. Training registers fall
+from 103 to **100 / 101** for broad/subset forms; code changes from 267,776 to
+268,928 / 267,648 bytes. These reductions do not establish faster execution.
+
+Fresh SDK captures cover **broad training only**: four backend captures and
+sixteen sequential single-pass metric groups. Actual saved states match exactly
+within each backend, and the cross-backend comparison satisfies the existing
+budget. Zero-rate SGD keeps resident replay stable; it does not replace the
+nonzero-rate completed-step gate.
+
+| Version | Ordinary / persistent replay ms | Persistent warp instructions, billions | Persistent integer-pipe instructions, billions | Persistent shared wavefronts, millions |
+|---|---:|---:|---:|---:|
+| Control | 11.911 / 15.883 | 2.721 | 6.573 | 488.285 |
+| Broad | 11.941 / 15.873 | 2.708 | 6.132 | 488.137 |
+
+Estimated persistent integer-pipe work falls **6.7%**, but replay changes only
+**-0.06%**. Warp instructions fall 0.48%, shared activity remains approximately
+flat, and persistent local load/store traffic stays zero. Barrier waiting is
+50.83% / 51.04% of active warp cycles. Across metric groups, clock spread is at
+most 0.412% and instruction-rate spread 1.016%. Rate-times-duration counts are
+estimates, and barrier shares do not attribute elapsed time. This transformation
+reduces measured integer activity without advancing the completed-step gate;
+it does not isolate the remaining cause of the performance gap.
+
+Both probes are restored exactly to runtime `540eccf`, locks match the qualified
+copy, both forks are clean, release examples are rebuilt, and all nine restored
+smoke tests pass. No full retained-change qualification or subset/forward SDK
+capture is claimed. Heavy jobs use verified separate 16/20/1 GiB cgroups,
+GPU jobs are serialized, measurements exclude builds/heavy analyses, and all
+artifacts stay on local `/x`.
+
+Records are under `target/linear-grid{,-repeat}/`. The manifest
+`target/megakernel-results/linear-grid/summary.json` preserves **1,000 normal
+comparisons, 20 resource records, four SDK captures / sixteen metric groups,
+26 verified measurement scopes and 762 independently verified artifact hashes**,
+SHA-256 `92ec945f6265c987570a9fb524863c408aabafc73f5cb805c3cefcf17965c07f`.
+The independent audit log is `target/linear-grid/verify.log`.
+Baseline parity remains unmet.
+
 ## Earlier artifact identities
 
 All records remain on local storage at

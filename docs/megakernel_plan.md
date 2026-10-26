@@ -396,6 +396,13 @@ the descriptor-reference repair requires fresh measurements.
   gates, but persistent forward/training regress 16.4%/9.7% and 12.4%/10.5%.
   Preserve 1,000 comparisons and 20 resource records; reject both, restore
   qualified sources/locks and pass nine smoke checks in separate bounded cgroups.
+- [x] Bypass coordinate division for one-dimensional grids, broadly and only
+  within repeated optimizer batches. Both pass 49 codegen checks, nine smoke
+  tests and 168 strict oracle cases. Broad timing is inconclusive; the subset
+  slows training 2.0%. Preserve 1,000 comparisons and 20 resource records.
+  Broad training SDK captures reduce integer-pipe activity 6.7% with essentially
+  flat replay time and exact same-backend state. Revert both; reduced instruction
+  or register counts alone do not establish progress toward parity.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
@@ -405,10 +412,6 @@ the descriptor-reference repair requires fresh measurements.
   Recheck both model phases and all
   CI cases before retaining further changes; do not infer elapsed cost from
   barrier-wait counters alone.
-  Next, test a uniform runtime fast path for one-dimensional grid coordinates,
-  avoiding dynamic quotient/remainder projection without new shared fields.
-  Preserve the general projection, packed/repeated tile bounds, zero-work
-  handling and completion; this hypothesis is not yet implemented or measured.
   Keep the shared-state failure as a separate unresolved diagnostic.
   Retain both model phases and all CI gates; baseline parity remains open.
 
