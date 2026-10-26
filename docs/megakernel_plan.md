@@ -428,6 +428,14 @@ the descriptor-reference repair requires fresh measurements.
   library, 168 strict oracle, 50 matrix and nine smoke tests, formatting,
   strict Clippy and Metal compilation. The repeat ratios remain 1.293× forward
   and 1.220× complete training; parity is unmet.
+- [x] Probe group-zero ownership of A scratch across column-packed native
+  cooperative prologues, including initialization and unchanged barriers.
+  Preserve 500 completed-step comparisons and four SDK captures. Forward's
+  −0.9% median change is inconclusive; SDK replay worsens 0.8% despite 7.5%
+  less estimated integer activity. Global loads remain unchanged, and emitted
+  A/factor loads remain outside the ownership guard. Restore `9ff1b50`, pass
+  nine restored smoke tests and rebuild byte-identical qualified benchmarks.
+  Preserve the rejected patch, source inverse audit and bounded-cgroup evidence.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
@@ -442,9 +450,10 @@ the descriptor-reference repair requires fresh measurements.
   handler's ordinary resource footprint with its cost inside the combined
   worker shader before choosing a change. Preserve arithmetic and test changes
   individually; exclude clock instrumentation from normal performance gates.
-  Check whether column-packed cooperative tiles can safely share identical
-  A/prologue staging. Prove shared initialization, writer ownership and
-  publication before measuring such a change; retain independent B storage
+  The first column-sharing probe guards stores only. Guarding complete A
+  staging regions and reducing their scratch capacity remain unmeasured;
+  require evidence that either reduces the completed step before retaining it.
+  Preserve initialization, writer ownership, publication, independent B storage
   and every logical tile's arithmetic and completion accounting.
   Keep the shared-state failure as a separate unresolved diagnostic.
   Retain both model phases and all CI gates; baseline parity remains open.

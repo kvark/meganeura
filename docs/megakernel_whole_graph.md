@@ -4209,6 +4209,81 @@ Heavy jobs use separate verified 16/20/1 GiB cgroups, GPU work is serialized,
 builds and heavy analysis do not overlap measurements, and all artifacts stay
 on local `/x`. The change is retained; ordinary-baseline parity remains open.
 
+## Column-shared cooperative A scratch probe
+
+On October 26, 2026, a prototype based on `0caf997` gave the first column-packed
+logical tile ownership of the native cooperative prologue's A scratch. It
+redirected all four logical tiles' A reads to that slice and guarded every
+write, including initialization. Admission was limited to normal F32-weight,
+uncompensated f16-input, 16×16 cooperative prologues packed on grid axis 1.
+The original barriers, B storage, arithmetic, completion and scratch allocation
+were retained. No workgroup variables were added.
+
+The prototype passes 49 codegen checks, nine whole-graph smoke tests and the
+prologue regression. The existing packed fixture covers K tails, partial rows,
+poisoning, changed-input replays and 1/3/64/4096 workers. **All 500 normal paired
+comparisons pass** matching arithmetic, complete-state budgets, completion,
+one persistent dispatch and no fallback. The maximum model error is 4.66e-9.
+The interleaved control/candidate/candidate/control sequence uses 25 pairs per
+case per visit, 256 workers and the established warmup and timing boundaries.
+
+| Case | Control persistent ms | Candidate persistent ms | Candidate/control, bootstrap 95% interval |
+|---|---:|---:|---:|
+| CI inference | 0.06976 | 0.06934 | 0.994 [0.979, 1.005] |
+| CI backward | 0.09408 | 0.09364 | 0.995 [0.990, 1.005] |
+| CI SGD | 0.09475 | 0.09472 | 1.000 [0.992, 1.005] |
+| Model forward | 5.182 | 5.135 | 0.991 [0.928, 1.073] |
+| Model training + SGD | 18.043 | 18.069 | 1.001 [0.987, 1.018] |
+
+Forward's ordinary medians are 3.979/3.978 ms; the median paired
+persistent/ordinary ratios are 1.346/1.342. Their candidate/control ratio is
+0.997 [0.967, 1.003]. Training ordinary medians are 14.649/14.706 ms, and its
+normalized ratio is 0.980 [0.960, 1.004]. Between-visit variation is substantial;
+no completed-step improvement is established.
+
+Only the combined forward shader changes: all 19 CI sources and 42 of 43 model
+sources match exactly. Both backends' CI/training pipeline identities and
+resources match, as do every ordinary pipeline's statistics. Forward remains
+at 100 registers and 20,880 shared bytes; code falls from 111,360 to 110,464
+bytes. Scheduler sizes are unchanged. An exact inverse of the generated-source
+edits reconstructs the entire control shader: the changes are the ownership
+condition, 14 guarded stores including resets, and the two A arrays' indices.
+Scratch declarations and barriers are identical.
+
+Four SDK backend captures with sixteen sequential metric groups preserve
+bitwise-identical complete forward state. Persistent replay changes from
+4.697 to 4.735 ms (**+0.8%**), while ordinary changes from 3.596 to 3.606 ms.
+Estimated persistent integer-pipe activity falls 7.5%, FP32 activity 3.8%,
+warp instructions 1.3% and shared wavefronts 1.8%. Global-load sectors change
+only −0.06%; persistent local traffic remains zero. The emitted WGSL still
+evaluates A and factor loads outside the ownership guard, consistent with the
+absence of a global-load reduction. Native instruction attribution is not
+available, so the counter changes do not prove which loads the driver retains.
+
+Barrier waiting changes from 59.44% to 59.71% of active warp cycles, not elapsed
+time. Maximum cross-group clock spread is 0.421% and instruction-rate spread
+0.997%. All four actual 588,138,052-byte state files independently hash to
+`4e5d66e6ce5e95142b848651d316b4df64855a9d85669499cabc3a81089be629`.
+These rate-times-replay estimates do not replace the completed-step gate.
+
+The prototype is **rejected; the qualified runtime is exactly restored**. Nine restored whole-graph
+tests and formatting pass; rebuilt benchmark binaries match the qualified
+controls byte-for-byte. Runtime `9ff1b50`, both fork checkouts and dependency
+pins remain unchanged. Full candidate qualification and mixed packing widths
+sharing a handler were not pursued after the performance gate failed.
+Guarding complete staging regions or reducing scratch capacity remains
+unmeasured; this result only rejects the tested store-guard prototype.
+
+Artifacts remain on local `/x` under `target/column-shared-a/`. The manifest
+`target/megakernel-results/column-shared-a/summary.json` records 500 normal and
+ten diagnostic comparisons, 14 verified measurement scopes, 28 recorded job
+scopes and **416 independently verified artifact hashes**. Its SHA-256 is
+`140932375f74e924d0b76470c8fd732360108f0dfe5dd4ef1ef9ef1637624476`.
+It retains the initial compile error, rejected patch, source audit, captures,
+restoration checks and qualification limits. Every heavy job used its own
+verified 16/20/1 GiB cgroup; GPU jobs were serialized, with no competing builds
+or heavy analyses during measurement. Ordinary-baseline parity remains open.
+
 ## Earlier artifact identities
 
 All records remain on local storage at
