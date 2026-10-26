@@ -15,6 +15,7 @@ mod checkpoint;
 mod optimizer;
 pub(crate) mod search_state;
 mod tuning;
+mod weight_mirrors;
 pub use crate::tune::TuneOutcome;
 pub(crate) use calibration::machine_profile;
 pub use tuning::KernelMemo;
@@ -3435,6 +3436,8 @@ pub struct DebugStepReport {
 struct PhysicalBuffer {
     gpu: Arc<Gpu>,
     handle: blade_graphics::Buffer,
+    cpu_epoch: std::sync::atomic::AtomicU64,
+    gpu_writes: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for PhysicalBuffer {
@@ -3488,6 +3491,7 @@ impl DebugStepReport {
 }
 
 pub struct Session {
+    weight_mirrors: weight_mirrors::WeightMirrors,
     gpu: Arc<Gpu>,
     /// Per-logical-buffer view: `buffers[i]` backs `BufferRef(i)`, at its
     /// offset within its physical allocation. Aliased logical buffers share
@@ -4111,6 +4115,10 @@ impl Session {
             );
         }
 
+        // A mirrored plan and its independently qualified parent share buffer
+        // lifetimes. Preserve their physical order and fusion on every entry
+        // point, including public constructors and saved-plan reloads.
+        let prepared = prepared || !plan.f16_weight_mirrors.is_empty();
         let mut plan = plan;
         let schedule_span = tracing::info_span!("schedule").entered();
 
@@ -4184,6 +4192,11 @@ impl Session {
         } else {
             crate::memplan::plan_buffer_aliasing(&plan, &groups, opts.pin_buffers.as_deref())
         };
+        alias.pack_weight_mirrors(
+            &plan,
+            opts.arena_chunk_bytes
+                .unwrap_or(crate::memplan::ARENA_CHUNK_BYTES),
+        );
         alias.pack_arena(
             &plan,
             opts.arena_chunk_bytes
@@ -4420,6 +4433,8 @@ impl Session {
                     slots[i] = Some(Arc::new(PhysicalBuffer {
                         gpu: Arc::clone(&gpu),
                         handle,
+                        cpu_epoch: std::sync::atomic::AtomicU64::new(0),
+                        gpu_writes: std::sync::atomic::AtomicBool::new(false),
                     }));
                 }
             };
@@ -4638,7 +4653,22 @@ impl Session {
             written[b.0 as usize] = true;
         }
 
+        weight_mirrors::WeightMirrors::track_sources(&plan, &physical_buffers, &alias);
+        let weight_mirrors = weight_mirrors::WeightMirrors::new(&gpu, &plan, coop_config.as_ref());
+        for buffer in plan
+            .dispatches
+            .iter()
+            .flat_map(|d| std::iter::once(d.output_buffer).chain(d.extra_outputs.iter().copied()))
+            .chain(plan.param_grad_pairs.iter().map(|x| x.0))
+            .chain(plan.input_buffers.iter().map(|x| x.1))
+            .chain(plan.output_buffers.iter().copied())
+        {
+            physical_buffers[alias.map[buffer.0 as usize]]
+                .gpu_writes
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         Self {
+            weight_mirrors,
             gpu,
             buffers,
             physical_buffers,
@@ -4792,6 +4822,8 @@ impl Session {
         let physical = Arc::new(PhysicalBuffer {
             gpu: Arc::clone(&self.gpu),
             handle: imported,
+            cpu_epoch: std::sync::atomic::AtomicU64::new(0),
+            gpu_writes: std::sync::atomic::AtomicBool::new(true),
         });
         self.rebind_logical(buf_ref.0 as usize, physical, 0, device_local);
         Ok(())
@@ -4858,6 +4890,30 @@ impl Session {
         offset: usize,
         device_local: bool,
     ) {
+        if self
+            .plan
+            .param_grad_pairs
+            .iter()
+            .any(|x| x.0.0 as usize == index)
+            || self
+                .plan
+                .input_buffers
+                .iter()
+                .any(|x| x.1.0 as usize == index)
+            || self
+                .plan
+                .output_buffers
+                .iter()
+                .any(|x| x.0 as usize == index)
+            || self.plan.dispatches.iter().any(|d| {
+                d.output_buffer.0 as usize == index
+                    || d.extra_outputs.iter().any(|x| x.0 as usize == index)
+            })
+        {
+            physical
+                .gpu_writes
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         self.buffers[index] = physical.handle.at(offset as u64);
         let target = self
             .alias
@@ -4867,6 +4923,11 @@ impl Session {
         } else {
             self.physical_buffers[target] = physical;
         }
+        weight_mirrors::WeightMirrors::track_sources(
+            &self.plan,
+            &self.physical_buffers,
+            &self.alias,
+        );
     }
 
     /// Whether this session's parameter `name` is the same storage as
@@ -5100,7 +5161,8 @@ impl Session {
     /// fused RmsNorm, fused epilogue or prologue, attention width, or a
     /// generated pointwise/reduction kernel.
     pub fn dispatch_pipeline_keys(&self) -> Vec<String> {
-        self.pipelines
+        self.step_execution()
+            .1
             .selected
             .iter()
             .map(|selected| selected.0.label())
@@ -5116,7 +5178,7 @@ impl Session {
         self.gpu.clone()
     }
 
-    /// Query GPU pipeline statistics for all compiled compute pipelines.
+    /// Query GPU pipeline statistics for compiled variants of the current step path.
     ///
     /// Returns driver-reported statistics (register counts, spill counts,
     /// SIMD width, etc.) for each pipeline executable. The exact statistics
@@ -5128,7 +5190,7 @@ impl Session {
         &self,
     ) -> Vec<(String, Vec<blade_graphics::PipelineExecutableInfo>)> {
         let mut result = Vec::new();
-        for (name, pipeline) in self.pipelines.all_pipelines() {
+        for (name, pipeline) in self.step_execution().1.all_pipelines() {
             let stats = self.gpu.get_pipeline_statistics(pipeline);
             if !stats.is_empty() {
                 result.push((name.to_string(), stats));
@@ -5141,7 +5203,7 @@ impl Session {
         &self,
     ) -> Vec<(String, Vec<blade_graphics::PipelineExecutableInfo>)> {
         let mut result = Vec::new();
-        for (name, pipeline) in self.pipelines.all_profile_pipelines() {
+        for (name, pipeline) in self.step_execution().1.all_profile_pipelines() {
             let stats = self.gpu.get_pipeline_statistics(pipeline);
             if !stats.is_empty() {
                 result.push((name, stats));
@@ -6378,9 +6440,10 @@ impl Session {
 
         self.encoder.start();
         self.profiled_pass_map.clear();
-        self.encode_step(self.submission_chunks, self.profile_window.clone());
+        self.encode_weight_policy(self.submission_chunks, self.profile_window.clone(), true);
         log::debug!(target: "meganeura::submission", "submit final chunk, {} dispatches", self.plan.dispatches.len());
         self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+        self.weight_mirrors.commit();
     }
 
     /// Record one step — the same work as [`Session::step`] — into a
@@ -6446,7 +6509,7 @@ impl Session {
         // caller's encoder in its place keeps a single code path for both.
         std::mem::swap(&mut self.encoder, encoder);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.encode_step(1, None);
+            self.encode_weight_policy(1, None, false);
         }));
         std::mem::swap(&mut self.encoder, encoder);
         if let Err(panic) = result {
@@ -6467,7 +6530,7 @@ impl Session {
     /// Record forward, backward and the optimizer into `self.encoder`, which
     /// must be started. `chunks` above one submits all but the last chunk;
     /// with a `profile_window`, the dispatches in it get passes of their own.
-    fn encode_step(&mut self, chunks: usize, profile_window: Option<std::ops::Range<usize>>) {
+    fn encode_step_body(&mut self, chunks: usize, profile_window: Option<std::ops::Range<usize>>) {
         if let Some(window) = profile_window {
             // Multi-pass mode: one compute pass per dispatch in the window,
             // with per-pass barriers and GPU timestamps. Enables

@@ -74,6 +74,8 @@ impl SearchState {
                 .map(|p| {
                     let size = session.alias.sizes[p].max(4);
                     let saved = PhysicalBuffer {
+                        cpu_epoch: std::sync::atomic::AtomicU64::new(0),
+                        gpu_writes: std::sync::atomic::AtomicBool::new(false),
                         gpu: session.gpu.clone(),
                         handle: session.gpu.create_buffer(bg::BufferDesc {
                             name: "program_search_state",

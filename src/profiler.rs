@@ -288,6 +288,8 @@ pub struct CaptureOptions {
     /// windows — each replay then perturbs the schedule less, at the cost of
     /// more replays.
     ///
+    /// Weight caches reserve another slot for a possible conversion pass.
+    /// A windowed cache capture needs a limit of at least four.
     /// Clamped to `3 ..= blade_graphics::limits::PASS_COUNT`: two slots
     /// always go to the untimed passes around the window, and raising the
     /// bound past the backend's own limit would only build a window whose
@@ -565,12 +567,23 @@ fn capture_windows(
         .max_timed_passes_per_replay
         .unwrap_or(blade_graphics::limits::PASS_COUNT)
         .clamp(3, blade_graphics::limits::PASS_COUNT);
-    let windows = profile_windows(dispatch_count, pass_limit);
+    // Parameter uploads in prepare() may require one conversion pass on any
+    // replay, including a middle window with untimed dispatches on both sides.
+    let reserved = usize::from(!session.plan().f16_weight_mirrors.is_empty());
+    let dispatch_limit = pass_limit - reserved;
+    if dispatch_limit < 3 && dispatch_count > dispatch_limit {
+        return Err(ProfileError::Attribution {
+            sample: 0,
+            detail: "profiling this weight cache needs a pass limit of at least four".into(),
+        });
+    }
+    let windows = profile_windows(dispatch_count, dispatch_limit);
     let window_count = windows.len();
     let mut timing_samples = vec![Vec::with_capacity(options.samples); dispatch_count];
     let mut timestamp_labels = vec![String::new(); dispatch_count];
     let mut profiled_wall_samples_ms = Vec::with_capacity(options.samples);
     let mut gpu_total_samples_ms = Vec::with_capacity(options.samples);
+    let mut execution = None;
 
     for sample in 0..options.samples {
         let mut total_ms = 0.0;
@@ -578,6 +591,17 @@ fn capture_windows(
         for window in &windows {
             session.set_profiling_window(Some(window.clone()));
             prepare(session);
+            let current = session.step_plan();
+            if let Some(expected) = execution.as_ref() {
+                if current != expected {
+                    return Err(ProfileError::Attribution {
+                        sample,
+                        detail: "step executable changed between profiling replays".into(),
+                    });
+                }
+            } else {
+                execution = Some(current.clone());
+            }
             let wall_start = Instant::now();
             session.step();
             session.wait();
@@ -620,7 +644,7 @@ fn capture_windows(
         gpu_total_samples_ms.push(total_ms);
     }
 
-    let plan = session.plan();
+    let plan = session.step_plan();
     let pipeline_keys = session.dispatch_pipeline_keys();
     let loss_dispatch = plan.loss_buffer.and_then(|loss| {
         plan.dispatches.iter().rposition(|dispatch| {
@@ -1410,6 +1434,19 @@ mod tests {
 
     /// A window may hold at most `pass_limit - 2` dispatches, must tile the
     /// plan exactly, and must stay a single window for plans that already fit.
+    #[test]
+    fn refreshed_weight_pass_fits_with_actual_window_recording() {
+        for count in [1, 2, 3, 255, 256, 257, 1034] {
+            let groups = (0..count).map(|i| i..i + 1).collect::<Vec<_>>();
+            for limit in [4, 8, 256] {
+                for window in profile_windows(count, limit - 1) {
+                    let passes = crate::runtime::profile_pass_plan(&groups, count, window);
+                    assert!(passes.len() < limit, "{count}/{limit}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn profile_windows_tile_the_plan_within_the_timestamp_limit() {
         for (dispatch_count, pass_limit) in [

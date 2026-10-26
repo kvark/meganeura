@@ -1479,6 +1479,11 @@ pub struct ExecutionPlan {
     /// Quantized weight buffers: format + matrix dimensions (rows, cols).
     #[serde(default)]
     pub weight_buffers: HashMap<BufferRef, (WeightFormat, usize, usize)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub f16_weight_mirrors: Vec<(BufferRef, BufferRef)>,
+    /// Diagnostic specialization retains its independently qualified parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub f16_weight_parent: Option<Box<ExecutionPlan>>,
     /// Node id → buffer holding that node's value, for every graph node.
     /// Debug/introspection only (`Session::read_node`); aliasing may reuse
     /// the physical allocation once the value's live range ends unless the
@@ -1668,6 +1673,11 @@ impl ExecutionPlan {
                 .flat_map(|&(param, grad)| [param, grad]),
         );
         visible.extend(self.derived_params.iter().map(|entry| entry.0));
+        visible.extend(
+            self.f16_weight_mirrors
+                .iter()
+                .flat_map(|&(src, dst)| [src, dst]),
+        );
         visible.extend(self.input_buffers.iter().map(|entry| entry.1));
         visible.extend(self.constant_buffers.iter().map(|entry| entry.0));
         visible.extend(self.lse_buffers.iter().map(|entry| entry.1));

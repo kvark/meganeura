@@ -39,6 +39,7 @@ impl Session {
                     .cloned()
                     .collect();
                 for (derived_buf, sources, transform) in derived {
+                    self.mark_host_write(derived_buf);
                     let sources = sources.as_slice();
                     match transform {
                         crate::graph::ParamTransform::VerticalConcat => {
@@ -177,6 +178,7 @@ impl Session {
                 .cloned()
                 .collect();
             for (derived_buf, sources, transform) in derived {
+                self.mark_host_write(derived_buf);
                 match transform {
                     crate::graph::ParamTransform::HorizontalConcat => {
                         self.restage_packed_concat(derived_buf, name, data, &sources);
@@ -395,6 +397,9 @@ impl Session {
     /// The handle must not be used after the session is destroyed.
     pub fn output_buffer(&self, index: usize) -> Option<blade_graphics::BufferPiece> {
         let &buf_ref = self.plan.output_buffers.get(index)?;
+        self.physical_buffers[self.alias.map[buf_ref.0 as usize]]
+            .gpu_writes
+            .store(true, std::sync::atomic::Ordering::Release);
         Some(self.buffers[buf_ref.0 as usize])
     }
 
@@ -534,6 +539,7 @@ impl Session {
             data.len(),
             expected,
         );
+        self.mark_host_write(buf_ref);
         self.write_raw_buffer(buffer, data, self.logical_host_visible(buf_ref));
     }
 
@@ -1111,6 +1117,22 @@ impl Session {
 
     /// Read a parameter's gradient buffer by name.
     ///
+    /// Return the GPU gradient buffer for a compiled parameter handle, such as
+    /// one returned by [`Self::param_buffer`]. Returns `None` when the parameter
+    /// has no gradient, including in an inference session.
+    ///
+    /// A sibling pipeline on the shared context can consume this after the
+    /// backward step, following [`Self::output_buffer`]'s queue-ordering rules.
+    /// The session owns the buffer; reacquire the handle after retuning.
+    pub fn gradient_buffer(&self, parameter: BufferRef) -> Option<blade_graphics::BufferPiece> {
+        let &(_, gradient) = self
+            .plan
+            .param_grad_pairs
+            .iter()
+            .find(|&&(p, _)| p == parameter)?;
+        Some(self.buffers[gradient.0 as usize])
+    }
+
     /// Returns the gradient computed during the last backward pass.
     /// Panics if the parameter has no associated gradient (e.g. inference-only session).
     pub fn read_param_grad(&self, name: &str, out: &mut [f32]) {

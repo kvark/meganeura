@@ -592,11 +592,14 @@ impl Session {
         }
         for write in restore.writes {
             let (buffer, capacity, host_visible) = match write.target {
-                Target::Parameter(param) => (
-                    self.buffers[param.0 as usize],
-                    self.plan.buffers[param.0 as usize],
-                    self.logical_host_visible(param),
-                ),
+                Target::Parameter(param) => {
+                    self.mark_host_write(param);
+                    (
+                        self.buffers[param.0 as usize],
+                        self.plan.buffers[param.0 as usize],
+                        self.logical_host_visible(param),
+                    )
+                }
                 Target::Moment { index, second } => {
                     let param = self.plan.param_grad_pairs[index].0;
                     let (m, v) = self.adam_moments(index).expect("Adam state");

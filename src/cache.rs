@@ -49,7 +49,9 @@ use std::{io, path::Path};
 // Version 13 reduces loss partials into a scalar, lowers LayerNorm to the
 // two-pass kernel, carries RoPE's static offset into the dynamic kernels, and
 // changes which dispatches fusion may merge.
-const CACHE_FORMAT_VERSION: u32 = 38;
+// Version 39 records coherent half-weight mirrors and their qualified parent.
+// Older engines would ignore the metadata and leave native weights unfilled.
+const CACHE_FORMAT_VERSION: u32 = 39;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]

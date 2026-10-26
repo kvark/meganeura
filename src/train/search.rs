@@ -10,6 +10,7 @@ use serde::Serialize;
 mod attention_blocks;
 mod measure;
 mod storage;
+mod weight_cache;
 mod winograd;
 pub use measure::BuildSearchTrial;
 use std::{
@@ -384,6 +385,9 @@ pub fn build_measured_with_inputs(
         .iter()
         .all(|n| n.attention_ept_cap.is_none() && n.attention_impl.is_none());
     programs.allow_matrix_storage = !cfg.runtime.debug && cfg.runtime.pin_buffers.is_none();
+    programs.weight_cache.enabled = cfg.mode == crate::Mode::Inference
+        && programs.allow_matrix_storage
+        && supported.contains(&crate::DType::F16);
     programs.enable_matrix_inputs(&supported, &gpu.capabilities());
     if cfg.options.flash_forward_coop {
         programs.enable_forward_products(gpu.capabilities().subgroup_size);
@@ -801,6 +805,7 @@ fn implementations(
         max_partial_bytes,
         split_plans,
         attention_blocks: attention_blocks::Refinements::new(shared_memory_bytes),
+        weight_cache: weight_cache::Refinements::new(max_partial_bytes),
         refine_next: false,
         prepared_source: None,
         queued_splits: false,
@@ -823,6 +828,7 @@ struct Implementations {
     split_plans: Vec<measure::Program>,
     queued_splits: bool,
     attention_blocks: attention_blocks::Refinements,
+    weight_cache: weight_cache::Refinements,
     refine_next: bool,
     prepared_source: Option<(measure::Origin, ExecutionPlan)>,
     replace_extracted_matrices: bool,
@@ -1260,7 +1266,7 @@ impl measure::Frontier for Implementations {
         let covered = self.order.visited_forms.iter().filter(|&&v| v).count()
             >= self.order.seeds.min(self.order.arithmetic_layouts);
         if self.order.arithmetic_layouts != 1 && !covered {
-            return 0;
+            return usize::from(self.weight_cache.may_remain());
         }
         let form = incumbent.map_or(0, |origin| origin.form);
         let nn_selected =
@@ -1283,6 +1289,7 @@ impl measure::Frontier for Implementations {
                     && !self.order.deferred.contains(&(form, choice))
             })
             .count()
+            + usize::from(self.weight_cache.may_remain())
     }
 
     fn observe(&mut self, origin: measure::Origin, qualified: bool) {
@@ -1331,7 +1338,15 @@ impl measure::Frontier for Implementations {
 
     fn selected(&mut self, origin: Option<measure::Origin>, plan: &ExecutionPlan) {
         self.attention_blocks.selected(origin, plan);
-        self.prepared_source = origin.map(|origin| (origin, plan.clone()));
+        self.weight_cache.selected(origin, plan);
+        // Changes to private storage need the parent's F32 temporary sizes.
+        // The cached incumbent remains available for the actual comparison.
+        self.prepared_source = origin.map(|origin| {
+            (
+                origin,
+                plan.f16_weight_parent.as_deref().unwrap_or(plan).clone(),
+            )
+        });
         let Some(origin) = origin else {
             return;
         };
@@ -1388,6 +1403,15 @@ impl measure::Frontier for Implementations {
     }
 
     fn next(&mut self, incumbent: Option<measure::Origin>) -> Option<measure::Program> {
+        let form = incumbent.map_or(0, |origin| origin.form);
+        let storage_pending = self.order.priority_choices.iter().any(|&choice| {
+            self.choices[choice].matrix_storage
+                && !self.order.tried.contains(&(form, choice))
+                && !self.order.deferred.contains(&(form, choice))
+        });
+        if !storage_pending && let Some(program) = self.weight_cache.next() {
+            return Some(program);
+        }
         if self.refine_next && self.early_programs_remaining(incumbent) == 0 {
             self.refine_next = false;
             if let Some(program) = self.attention_blocks.next() {
@@ -1746,6 +1770,7 @@ impl measure::Frontier for Implementations {
             || !self.split_plans.is_empty()
             || !self.order.exhausted()
             || self.attention_blocks.may_remain()
+            || self.weight_cache.may_remain()
     }
 }
 

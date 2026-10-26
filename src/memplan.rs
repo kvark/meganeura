@@ -231,6 +231,68 @@ impl AliasPlan {
         }
     }
 
+    pub(crate) fn pack_weight_mirrors(&mut self, plan: &ExecutionPlan, chunk_bytes: usize) {
+        if plan.f16_weight_mirrors.is_empty() {
+            return;
+        }
+        assert!(self.arena.is_empty());
+        let mut retired = vec![false; self.sizes.len()];
+        let mut chunk: Option<(usize, usize, bool)> = None;
+        for &(_, mirror) in &plan.f16_weight_mirrors {
+            let logical = mirror.0 as usize;
+            let old = self.map[logical];
+            let local = self.device_local[old];
+            assert_eq!(self.offsets[logical], 0);
+            assert!(
+                self.map
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &p)| i == logical || p != old)
+            );
+            let bytes = plan.buffers[logical]
+                .max(4)
+                .next_multiple_of(ARENA_ALIGNMENT);
+            let (physical, used) = match chunk {
+                Some((p, used, kind)) if kind == local && used + bytes <= chunk_bytes => (p, used),
+                _ => {
+                    let p = self.sizes.len();
+                    self.sizes.push(0);
+                    self.device_local.push(local);
+                    (p, 0)
+                }
+            };
+            self.map[logical] = physical;
+            self.offsets[logical] = used;
+            self.sizes[physical] = used + bytes;
+            retired[old] = true;
+            chunk = Some((physical, used + bytes, local));
+        }
+        retired.resize(self.sizes.len(), false);
+        let mut renumber = vec![usize::MAX; self.sizes.len()];
+        let mut next = 0;
+        for (i, &gone) in retired.iter().enumerate() {
+            if !gone {
+                renumber[i] = next;
+                next += 1;
+            }
+        }
+        let mut i = 0;
+        self.sizes.retain(|_| {
+            let keep = !retired[i];
+            i += 1;
+            keep
+        });
+        let mut i = 0;
+        self.device_local.retain(|_| {
+            let keep = !retired[i];
+            i += 1;
+            keep
+        });
+        for p in &mut self.map {
+            *p = renumber[*p];
+        }
+    }
+
     pub fn logical_bytes(&self, buffer_sizes: &[usize]) -> usize {
         buffer_sizes.iter().sum()
     }
@@ -510,6 +572,9 @@ fn device_local_eligible(plan: &ExecutionPlan) -> Vec<bool> {
             ok[i] = true;
         }
     }
+    for &(_, mirror) in &plan.f16_weight_mirrors {
+        ok[mirror.0 as usize] = true;
+    }
     // A gradient seed can also be a compile-time constant. Session setup
     // initializes constants through their host pointer, so that role takes
     // precedence over device-local gradient storage.
@@ -541,6 +606,10 @@ fn compute_pinned(
     }
     for &(b, _) in &plan.constant_buffers {
         pin(b, &mut pinned);
+    }
+    for &(source, mirror) in &plan.f16_weight_mirrors {
+        pin(source, &mut pinned);
+        pin(mirror, &mut pinned);
     }
     for &b in &plan.output_buffers {
         pin(b, &mut pinned);
@@ -676,6 +745,8 @@ mod tests {
 
     fn plan(buffers: Vec<usize>, dispatches: Vec<Dispatch>) -> ExecutionPlan {
         ExecutionPlan {
+            f16_weight_mirrors: Vec::new(),
+            f16_weight_parent: None,
             buffers,
             param_buffers: Vec::new(),
             param_types: Default::default(),

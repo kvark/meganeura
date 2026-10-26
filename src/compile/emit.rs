@@ -101,6 +101,8 @@ impl<'a> Compiler<'a> {
         Self {
             graph,
             plan: ExecutionPlan {
+                f16_weight_mirrors: Vec::new(),
+                f16_weight_parent: None,
                 buffers: vec![],
                 param_buffers: vec![],
                 param_types: HashMap::new(),

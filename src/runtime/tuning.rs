@@ -900,6 +900,7 @@ impl Session {
         mut memo: Option<&mut KernelMemo>,
     ) -> Result<TuneReport, TuneError> {
         options.validate()?;
+        self.prepare_weight_mirrors();
         let start = Instant::now();
         if let Some(memo) = memo.as_deref_mut() {
             memo.bind(&self.gpu, &options, self.gpu_timing);
