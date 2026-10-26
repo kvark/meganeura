@@ -349,6 +349,14 @@ the descriptor-reference repair requires fresh measurements.
   setup failure and seven strict matrix admission failures reproduced on the
   preceding runtime. All 666 library, 168 strict oracle, 50 original-mode matrix
   and nine whole-graph smoke tests pass, as do formatting and strict Clippy.
+- [x] Compare four-float scalar matrix input staging for A+B, B only and A only,
+  preserving shared layouts and arithmetic in both backends. A same-binary
+  A-only control improves model forward by 4.8% but regresses CI inference by
+  8.4%. Restricting staging to K >= 512 restores identical CI shaders, but the
+  forward raw interval includes no gain and training improves only 0.5%.
+  Preserve 1,600 normal comparisons, 32 resource records, indexing audits and
+  focused tail/transpose/worker checks. Revert all variants and the temporary
+  benchmark switch; restore exact qualified binaries and nine smoke checks.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The gradient-arena change
   removes false ordering without closing the model gap; do not infer elapsed

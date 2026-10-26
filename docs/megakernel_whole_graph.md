@@ -3102,6 +3102,108 @@ The measured final CI/model binaries have SHA-256
 Both dependency forks remain unchanged and clean. This is a CI training gain;
 ordinary-baseline parity and the model performance gap remain open.
 
+## Scalar matrix vector staging
+
+Four-float input staging tests whether scalar matrix loads contribute useful
+optimization headroom. The prototype reads aligned `vec4<f32>` values and
+scatters their unchanged components into the existing padded shared arrays.
+Accumulator arithmetic, reduction order, output stores, grids, scratch capacity,
+dependencies and fences remain unchanged. Ordinary and persistent execution use
+the same implementation selection. Eligibility excludes horizontal packs,
+cooperative/split kernels, reduced storage, prologues/epilogues and locked
+schedules; alignment checks admit only complete in-bounds vectors. Masked reads
+still access element zero, covered by the unchanged whole-allocation read edges.
+
+Three initial variants stage both A and B, only B, or only A. Each changes 50
+forward and 200 training nodes. An independent indexing audit checks exact
+shared-cell coverage and vector alignment at first/last row, column and K-stage
+boundaries for 22 actual model shapes: **93,184 vector checks**. Each variant
+passes a focused exact-reference fixture covering normal, A-transposed and
+B-transposed products with partial tiles, two input seeds and ordinary execution
+plus 1/3/64/4096 workers. A fourth fixture uses reductions of 516/517 elements
+for the later long-K variant.
+
+Each initial variant runs 200 normal comparisons in mirrored control / candidate
+/ candidate / control visits, with ten interleaved ordinary/persistent pairs per
+case per visit. These screens do not establish a useful model improvement:
+
+| Staged input | Forward persistent candidate/control, 95% interval | Training persistent candidate/control, 95% interval |
+|---|---:|---:|
+| A+B | 0.972 [0.952, 1.054] | 0.991 [0.981, 1.086] |
+| B only | 1.085 [1.071, 1.132] | 0.985 [0.915, 1.021] |
+| A only | 0.970 [0.955, 1.067] | 0.988 [0.911, 1.040] |
+
+The A-only forward signal warrants a same-binary control. A temporary benchmark
+flag reconstructs the same selected plan with schedules locked to suppress only
+the vector-staging wrapper. Both modes perform the same untimed reconstruction
+and assert unchanged dispatches and buffer sizes. Audits reproduce the qualified
+control's selected keys, executable resources, scheduler bytes and graph shader
+hashes. Another **500 comparisons** use mirrored visits with 25 pairs per case,
+giving 50 pairs per mode and case.
+
+| Case | Scalar / vector persistent ms | Vector/scalar, 95% interval | Ratio normalized by paired ordinary timing, 95% interval |
+|---|---:|---:|---:|
+| CI inference | 0.06677 / 0.07241 | 1.084 [1.059, 1.111] | 0.965 [0.936, 0.990] |
+| CI backward | 0.09615 / 0.09734 | 1.012 [0.991, 1.025] | 0.982 [0.960, 0.997] |
+| CI backward/SGD | 0.09691 / 0.09742 | 1.005 [0.970, 1.030] | 0.989 [0.969, 1.004] |
+| Model forward | 6.003 / 5.717 | 0.952 [0.942, 0.999] | 0.983 [0.967, 0.998] |
+| Model backward/SGD | 18.799 / 18.739 | 0.997 [0.980, 1.013] | 0.972 [0.904, 1.076] |
+
+The **4.8% forward gain** comes with an **8.4% CI inference regression**.
+Ordinary CI inference also slows by 13.5%, so its favorable normalized ratio
+does not justify retaining the change. Model training shows no clear benefit.
+A-only staging keeps model shared memory unchanged and uses 100/101 registers
+and 107,264/255,488 code bytes, versus the control's 100/103 registers and
+106,752/256,512 code bytes. CI inference code grows from 17,536 to 26,240 bytes;
+backward and SGD code also grow. These are native resource statistics, not SASS
+instruction counts or an attribution of elapsed time.
+
+A narrower A-only variant requires **K >= 512**. It changes 49 forward and 113
+training nodes; the excluded forward node has K=32. CI selected keys, shader
+files and executable resources now match the scalar mode exactly. Mixing scalar
+and vector handlers increases model code to 116,224/290,560 bytes, with 100/100
+registers and unchanged shared capacity. The same focused correctness checks
+pass, followed by another **500 same-binary comparisons**:
+
+| Case | Scalar / vector persistent ms | Vector/scalar, 95% interval | Ratio normalized by paired ordinary timing, 95% interval |
+|---|---:|---:|---:|
+| CI inference | 0.07596 / 0.07187 | 0.946 [0.930, 0.982] | 1.011 [0.977, 1.031] |
+| CI backward | 0.09662 / 0.09802 | 1.014 [0.994, 1.032] | 1.009 [0.993, 1.042] |
+| CI backward/SGD | 0.09681 / 0.09851 | 1.018 [0.987, 1.031] | 1.012 [0.990, 1.038] |
+| Model forward | 5.972 / 5.783 | 0.968 [0.958, 1.012] | 0.973 [0.956, 0.995] |
+| Model backward/SGD | 18.794 / 18.692 | 0.995 [0.989, 0.999] | 0.948 [0.898, 1.043] |
+
+Identical CI inference shaders still show raw timing movement, while their
+normalized interval includes no change. The model forward raw interval also
+includes no change. Training improves only about 0.5%, and its normalized
+interval is inconclusive. Ordinary model-training timing has substantial spread.
+All intervals use 10,000 bootstrap resamples; they do not cover every source of
+between-visit variation or establish performance on additional graphs.
+
+All **1,600 normal comparisons** pass matching selection within each backend
+pair, full state budgets and worker completion, with one persistent dispatch and
+no fallback. Maximum model error remains 4.66e-9. There are **32 separate native
+resource records** and no new Perf SDK captures. The rejected prototypes do not
+receive full oracle/library/matrix qualification. The initial audit-script
+failure on an omitted optional JSON field is preserved alongside its corrected
+run; no GPU correctness failure is hidden.
+
+All prototype code, the focused fixture and temporary benchmark switch are
+removed. The rebuilt CI/model binaries exactly reproduce the qualified
+`3cb7d57` hashes recorded above; formatting and all nine whole-graph smoke checks
+pass. Both dependency forks remain unchanged. Every heavy job uses a verified
+separate cgroup with 16/20/1 GiB memory limits; GPU jobs serialize and no build or
+heavy analysis overlaps measurements. Local artifacts are under
+`target/scalar-vector-staging{,-a-only,-b-only,-a-long}/`, with the manifest at
+`target/megakernel-results/scalar-vector-staging/summary.json`. It contains
+**1,405 independently verified artifact hashes**, with SHA-256
+`4b5381e8ea6a78d60a445b8f5e73c8da0f0ad060743a0fd3a541d7ad78ca40a8`.
+
+Vector staging remains evidence of possible forward headroom, not a retained
+optimization. Further work must distinguish payload instruction cost from
+combined-handler code/resource effects while keeping all CI and training gates.
+The qualified runtime and baseline performance gap remain unchanged.
+
 ## Earlier artifact identities
 
 All records remain on local storage at
