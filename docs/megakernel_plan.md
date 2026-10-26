@@ -436,6 +436,13 @@ the descriptor-reference repair requires fresh measurements.
   A/factor loads remain outside the ownership guard. Restore `9ff1b50`, pass
   nine restored smoke tests and rebuild byte-identical qualified benchmarks.
   Preserve the rejected patch, source inverse audit and bounded-cgroup evidence.
+- [x] Guard both complete A staging regions after checking local-state escape
+  and side effects. Preserve another 500 comparisons and four SDK captures.
+  Estimated global-load sectors fall 35.6%, integer activity 17.7% and warp
+  instructions 9.3%, but forward's completed-step change is inconclusive and
+  SDK replay stays flat. Restore `9ff1b50`, pass nine restored smoke tests and
+  rebuild byte-identical controls. The result weakens duplicate A staging as
+  an explanation for the remaining latency gap.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
@@ -450,9 +457,13 @@ the descriptor-reference repair requires fresh measurements.
   handler's ordinary resource footprint with its cost inside the combined
   worker shader before choosing a change. Preserve arithmetic and test changes
   individually; exclude clock instrumentation from normal performance gates.
-  The first column-sharing probe guards stores only. Guarding complete A
-  staging regions and reducing their scratch capacity remain unmeasured;
-  require evidence that either reduces the completed step before retaining it.
+  Both store-only and complete-region A sharing fail to establish a speedup.
+  Investigate work distribution next: the wide prologue's 256 logical tiles
+  become 64 four-tile claims. Compare smaller packing widths, checking actual
+  claims and shader resources separately from scratch-capacity changes.
+  Keep the qualified runtime as control and preserve all completed-step gates.
+  Reducing scratch capacity remains unmeasured; instruction or traffic savings
+  alone are insufficient evidence to retain it.
   Preserve initialization, writer ownership, publication, independent B storage
   and every logical tile's arithmetic and completion accounting.
   Keep the shared-state failure as a separate unresolved diagnostic.

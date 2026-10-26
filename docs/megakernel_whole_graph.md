@@ -4284,6 +4284,76 @@ restoration checks and qualification limits. Every heavy job used its own
 verified 16/20/1 GiB cgroup; GPU jobs were serialized, with no competing builds
 or heavy analyses during measurement. Ordinary-baseline parity remains open.
 
+## Complete A staging-region guard
+
+A second probe, based on `780cb7c`, guards both complete A staging blocks,
+including addresses, bounds and A/factor loads. It retains the prior ownership
+rule and scratch allocation. Admission checks that each block only publishes
+the named A scratch, contains no barriers or control flow leaving the region,
+and does not write local values read outside the block. Only a single-function
+shader with scalar boolean/integer staging locals is admitted. Other shader
+selections retain their original paths.
+
+The captured forward shader differs from the preceding store-only prototype
+by exactly two block-to-condition changes. An independent inverse reconstructs
+the entire qualified shader. Four-tile packing, declarations, barriers,
+arithmetic and completion are unchanged. All 19 CI sources and 42 of 43 model
+sources match the control. Ordinary and CI/training pipeline identities and
+resources are identical. Persistent forward remains at 100 registers and
+20,880 shared bytes; code changes from 111,360 to 109,952 bytes.
+
+All 49 codegen checks, nine whole-graph GPU tests and the prologue regression
+pass. Another **500 normal paired comparisons** preserve matching selected
+arithmetic, full-state budgets, one persistent dispatch, completion and no
+fallback. Maximum error remains 4.66e-9. Each of the five cases has two
+25-pair visits per binary in control/candidate/candidate/control order, with
+256 workers and the existing warmup and completed-step boundaries.
+
+| Case | Control ordinary / persistent ms | Candidate ordinary / persistent ms | Persistent candidate/control, bootstrap 95% interval |
+|---|---:|---:|---:|
+| CI inference | 0.05234 / 0.06808 | 0.05210 / 0.06955 | 1.022 [0.998, 1.061] |
+| CI backward | 0.06550 / 0.09406 | 0.06463 / 0.09352 | 0.994 [0.987, 1.002] |
+| CI SGD | 0.06674 / 0.09494 | 0.06699 / 0.09500 | 1.001 [0.986, 1.012] |
+| Model forward | 4.084 / 5.285 | 4.062 / 5.256 | 0.995 [0.986, 1.003] |
+| Model training + SGD | 14.615 / 17.760 | 14.605 / 17.975 | 1.012 [0.999, 1.104] |
+
+Forward's median paired ratio changes from 1.297 to 1.295; its normalized
+candidate/control ratio is 0.998 [0.982, 1.033]. Training's normalized ratio
+is 0.999 [0.980, 1.102]. Unchanged CI backward has a normalized ratio of
+1.013 [1.003, 1.028], illustrating variation despite identical shaders.
+No completed-step improvement is established.
+
+Four SDK captures with sixteen metric groups confirm the intended reduction
+in activity. Estimated persistent global-load sectors fall **35.6%**, integer
+activity **17.7%**, warp instructions **9.3%**, FP32 activity 3.6% and shared
+wavefronts 4.8%. Local load/store traffic remains zero. Yet persistent replay
+changes from **4.710 to 4.724 ms**, while ordinary changes from 3.599 to
+3.606 ms. Barrier waiting rises from 59.51% to 62.03% of active warp cycles;
+this fraction does not establish an elapsed synchronization cost. Maximum
+cross-group clock spread is 0.431% and instruction-rate spread 1.807%
+(0.497% for persistent captures). All four actual forward state files remain
+bitwise identical to the preceding probe's recorded hash. Rate-times-replay
+estimates do not replace the normal performance gate or identify native
+instructions.
+
+The prototype is rejected. The qualified source is restored exactly, nine
+restored whole-graph tests and formatting pass, and rebuilt benchmark binaries
+match the controls byte-for-byte. Runtime `9ff1b50`, dependency pins and both
+forks remain unchanged. Full candidate retention qualification is not claimed.
+Removing duplicate A staging activity alone does not explain the remaining
+latency gap. Investigate work distribution and packing width next, separating
+changes in physical claims from scratch/resource changes; smaller scratch
+capacity remains unmeasured.
+
+Local artifacts are under `target/column-shared-a-regions/`. Manifest
+`target/megakernel-results/column-shared-a-regions/summary.json` records 500
+normal/ten diagnostic comparisons, 14 verified measurement scopes, 27 recorded
+job scopes and **414 independently verified artifact hashes**, SHA-256
+`2e67888f79587648f3fe0dad8b146e74d5dc46bcf21ce9468dd85686317e3178`.
+All heavy jobs run in separate verified 16/20/1 GiB cgroups; GPU jobs serialize,
+builds and heavy analysis do not overlap measurement, and artifacts stay on
+local `/x`. Baseline parity remains unmet.
+
 ## Earlier artifact identities
 
 All records remain on local storage at
