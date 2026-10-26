@@ -451,6 +451,16 @@ the descriptor-reference repair requires fresh measurements.
   only about 1%. Retain neither prototype. Restore `9ff1b50`, pass nine smoke
   tests and rebuild byte-identical controls. Record source inverses, exact
   forward state and separate bounded-cgroup receipts.
+- [x] Narrow eligible native cooperative prologue output tiles from 32×32 to
+  32×16 through the common selector, keeping four active tiles per worker.
+  Refresh grids after fusion, retain portable wide fallbacks and public API
+  geometry, and distinguish eligibility in pipeline identities. Preserve 2,000
+  normal comparisons and eight SDK captures. Repeat/final forward improves
+  5.9%/6.4%; two other intervals include no change. SDK replay improves 6.0%
+  twice. Ordinary also improves; no relative-gap reduction is established.
+  Retain `d01534a` after 668 library, 168 strict oracle, 50 matrix and nine smoke
+  tests, exact shader/resource bridges, Clippy, formatting and Metal compilation.
+  The final paired ratios are 1.322× forward and 1.217× complete training.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
@@ -468,14 +478,15 @@ the descriptor-reference repair requires fresh measurements.
   Both store-only and complete-region A sharing fail to establish a speedup.
   Two-tile packing doubles the wide prologue's claims from 64 to 128 but leaves
   half the physical groups inactive; guarding their staging does not establish
-  a completed-step gain. Investigate cooperative tile geometry that increases
-  available claims while keeping the physical groups active. Use the common
-  selector and preserve each output's accumulation order; measure any geometry
-  change independently from scratch-capacity changes. Actual per-node SM
-  utilization is still unmeasured by the aggregate worker diagnostics.
-  Keep the qualified runtime as control and preserve all completed-step gates.
-  Reducing scratch capacity remains unmeasured; instruction or traffic savings
-  alone are insufficient evidence to retain it.
+  a completed-step gain. The retained 32×16 prologue also supplies 128 claims,
+  keeps four physical groups active and reduces the compiled scratch footprint.
+  Geometry and footprint change together; their individual contributions remain
+  unmeasured. Its persistent average active warps remain near 32.5% of peak;
+  do not attribute the gain to greater occupancy from capacity alone. Use a
+  fixed-footprint control or per-node measurements to separate these effects
+  before making causal claims. Preserve the common selector and each output's
+  accumulation order. Keep `d01534a` as control and all completed-step gates;
+  instruction or traffic savings alone are insufficient retention evidence.
   Preserve initialization, writer ownership, publication, independent B storage
   and every logical tile's arithmetic and completion accounting.
   Keep the shared-state failure as a separate unresolved diagnostic.

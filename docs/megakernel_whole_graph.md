@@ -8,13 +8,14 @@ nodes in the same dispatch. The transfer reset and compute dispatch share one
 queue submission. Initial parameter/moment allocation and explicit optimizer
 calls remain separate operations outside that step boundary.
 
-The current qualified runtime, `9ff1b50`, adds
-[contiguous cooperative prologue staging](#contiguous-cooperative-prologue-staging)
-to the retained gradient dependencies, subgroup guards and transposed-matrix
-staging. Two independent comparisons improve persistent model forward by
-3.6% and 4.7%; the CI and complete-training shaders remain unchanged. The
-repeated paired ratios are 1.293× ordinary forward and 1.220× complete training.
-Performance parity remains unmet.
+The current qualified runtime, `d01534a`, adds
+[32×16 native cooperative prologue tiles](#narrow-native-cooperative-prologue-tiles)
+to the retained contiguous staging, gradient dependencies, subgroup guards and
+transposed-matrix staging. The repeat and final sequences improve persistent
+forward by 5.9% and 6.4%; two other sequences are inconclusive. Ordinary also
+improves, so no reduction in the relative gap is established. Final paired
+ratios are 1.322× ordinary forward and 1.217× complete training. CI and training
+shaders remain unchanged. Performance parity remains unmet.
 
 For model benchmarks, use `--whole-graph --workers 256`. The
 [current worker sweep](#worker-counts-and-deeper-scalar-staging) finds lower CI
@@ -4448,6 +4449,123 @@ check verified separate 16/20/1 GiB cgroup limits and the shared GPU lock, with
 no surviving measurement jobs. Heavy jobs use those verified scopes, GPU jobs
 serialize, and builds or heavy analyses do not overlap measurement. All
 artifacts remain on `/x`. Baseline parity remains unmet.
+
+## Narrow native cooperative prologue tiles
+
+Runtime `d01534a` uses a 32×16 output tile instead of 32×32 for eligible normal,
+F32-weight, uncompensated f16-input prologues with 16×16 hardware tiles. The
+logical workgroup remains 64 lanes; its two 32-lane subgroups each own one
+16×16 output. The wider-subgroup path still computes the second row. Epilogues,
+horizontal copies, add products and other arithmetic selections retain their
+existing geometry. Both execution modes use the common selector.
+
+The measured wide prologue changes from grid `[2,128,1]` to `[2,256,1]`.
+Four logical tiles still share a 256-lane physical worker, so the available
+claims rise from 64 to 128 while all four groups remain active. Sixteen model
+prologue nodes select this geometry. Total graph tasks rise from 17,242 to
+21,338; the 154 operations and 337,036 scheduler bytes remain unchanged.
+Claim counts follow runtime batching; they are not measured per-node SM usage.
+
+The generator removes the second B staging region, its cooperative load, two
+accumulators, two multiply-add expressions and two stores. It preserves A/factor
+staging, K=16 iteration order, conversion and every barrier. An independent
+transformation matches the control's remaining executable tokens, ignoring
+comments and whitespace; enumeration covers 168 geometries and 9,208,320
+outputs exactly once. This changes geometry and physical scratch together,
+so their individual contributions are not isolated.
+
+Fusion occurs after initial geometry selection. An initial smoke failure caught
+the stale grid: both backends left half the output unwritten. The selector now
+refreshes fused grids through the common geometry function. Grids that would
+exceed portable limits retain the original wide tile and fusion. Narrow
+eligibility participates in internal cache keys and public pipeline labels;
+the original public code-generation entry point retains its wide geometry.
+The preserved failure and subsequent regression check document this boundary.
+
+Four control/candidate/candidate/control sequences preserve **2,000 normal
+comparisons**, with 25 pairs per case and visit, ten minimum warmup pairs,
+at least one second of warmup and 256 workers. All state budgets, completion,
+matching arithmetic within each binary, one persistent dispatch and no fallback
+pass; maximum model error remains 4.66e-9. Across control/candidate binaries,
+only the declared `:narrow-eligible` reporting suffix is normalized.
+
+| Forward sequence | Control ordinary / persistent ms | Candidate ordinary / persistent ms | Persistent candidate/control, bootstrap 95% interval | Paired-ratio candidate/control, 95% interval |
+|---|---:|---:|---:|---:|
+| Prototype | 3.985 / 5.102 | 3.794 / 4.923 | 0.965 [0.938, 1.015] | 0.979 [0.967, 1.033] |
+| Independent repeat | 4.064 / 5.229 | 3.724 / 4.918 | 0.941 [0.925, 0.956] | 1.041 [0.989, 1.062] |
+| Legality/API hardening | 4.007 / 5.217 | 3.832 / 4.975 | 0.954 [0.944, 1.022] | 1.007 [0.978, 1.032] |
+| Final reporting fix | 4.014 / 5.229 | 3.795 / 4.894 | 0.936 [0.884, 0.957] | 1.012 [0.968, 1.050] |
+
+The repeat and final sequences establish lower absolute forward latency under
+their pooled bootstrap; the other two intervals include no change. Ordinary
+also becomes faster. All four normalized intervals include no change, so the
+result does not establish progress in closing the relative gap. All visits are
+retained; pooled intervals do not capture every source of between-visit variation.
+
+| Final candidate case | Ordinary / persistent ms | Median paired persistent / ordinary |
+|---|---:|---:|
+| CI inference | 0.05180 / 0.06684 | 1.293× |
+| CI backward | 0.06493 / 0.09344 | 1.433× |
+| CI SGD | 0.06672 / 0.09508 | 1.424× |
+| Model forward | 3.795 / 4.894 | 1.322× |
+| Model training + SGD | 14.624 / 17.788 | 1.217× |
+
+All 19 CI sources and 41 of 43 model sources match the qualified control.
+Only the ordinary prologue and combined forward shader change. CI and training
+pipeline/resource multisets remain identical. Training's raw persistent change
+across the four sequences is −0.1%, +1.3%, +0.3% and −1.5%; every interval includes
+no change. Final CI SGD rises 0.5% in raw timing, but its normalized interval
+includes no change; CI inference also varies. No CI or training gain is claimed.
+Bridges from the prototype through hardening and the reporting fix prove exact
+shader bytes, resources and execution metadata, allowing only the label suffix.
+
+Persistent forward remains at 100 registers; shared memory falls from 20,880
+to 18,832 bytes and code from 111,360 to 107,648 bytes. The one changed ordinary
+executable falls from 48 to 40 registers, 2,432 to 1,664 shared bytes and 59,776
+to 49,536 code bytes. Training stays at 103 registers, 29,232 shared bytes and
+267,776 code bytes.
+
+Eight SDK backend captures across prototype and final binaries contain 32
+sequential metric groups. Persistent replay improves **6.0% in both captures**:
+4.706→4.422 ms initially and 4.699→4.415 ms finally. Ordinary replay improves
+7.4% in both, finally 3.602→3.335 ms. All eight actual forward state files are
+independently hashed and bitwise identical, SHA-256
+`4e5d66e6ce5e95142b848651d316b4df64855a9d85669499cabc3a81089be629`.
+
+Final estimated persistent integer activity rises 22.9%, warp instructions
+9.9%, global-load sectors 47.2%, shared wavefronts 8.3% and FP32 activity 5.1%.
+Local load/store traffic remains zero. Barrier waiting falls from 59.31% to
+54.20% of active warp cycles, not elapsed time. Active compute warps remain
+near 32.5% of peak, so an average persistent occupancy gain is not demonstrated.
+The data support faster replay despite increased traffic and instructions;
+they do not isolate work distribution, scratch footprint or native instructions
+as the cause. Final maximum cross-group clock spread is 0.392% and instruction
+rate spread 1.388%. Counter-rate-times-replay estimates do not replace the
+completed-step gate.
+
+Full qualification passes **668 library tests** (eight existing ignores),
+**168 strict oracle tests**, **50 matrix regressions**, and all **nine expanded
+whole-graph smoke tests**. The packed fixture covers mixed two/four-tile claims
+sharing a handler, K tails, partial rows, poisoned scratch, repeated updates and
+1/3/64/4096 workers. The 49 focused codegen checks, prologue regression, format,
+strict all-target/all-feature Clippy and Metal compilation also pass. The final
+label fix reruns the library, smoke, prologue, Clippy, Metal and formatting gates;
+exact shader/resource bridges connect it to the full oracle/matrix qualification.
+An earlier library fixture failure and its corrected dimensions are preserved.
+The committed source and current binaries match the frozen final candidate.
+Both forks stay clean; dependency pins and lock remain unchanged.
+
+Records stay on local `/x` under `target/coop-prologue-narrow{,-repeat,-qualified,-final}/`.
+The manifest `target/megakernel-results/coop-prologue-narrow/summary.json` preserves
+2,000 normal and 30 diagnostic comparisons, eight SDK captures / 32 metric groups,
+48 measurement scopes, 94 recorded job scopes and **1,216 independently verified
+artifact hashes**, SHA-256
+`3f3de22e898c1f97627a590e07db2a718f232b6106e4e22b92a74ec9d0e11351`.
+Recovered jobs had completed successfully; no surviving heavy jobs were found.
+Every heavy job uses a separate verified 16/20/1 GiB cgroup, GPU work holds the
+shared lock, and builds/copies/heavy analysis do not overlap measurements.
+Retain this change for its reproduced absolute forward gain. Baseline parity,
+Metal GPU execution and additional GPU qualification remain open.
 
 ## Earlier artifact identities
 
