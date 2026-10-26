@@ -461,11 +461,18 @@ the descriptor-reference repair requires fresh measurements.
   Retain `d01534a` after 668 library, 168 strict oracle, 50 matrix and nine smoke
   tests, exact shader/resource bridges, Clippy, formatting and Metal compilation.
   The final paired ratios are 1.322× forward and 1.217× complete training.
+- [x] Restore 2 KiB of existing f16 scratch capacity while retaining narrow
+  geometry and all handler bodies. Prove the exact source inverse and
+  unchanged code size/registers; preserve 500 comparisons and four SDK captures.
+  Forward completed-step timing is unchanged within uncertainty; SDK replay
+  rises only 0.4% and active warps stay near 32.5%. This weakens capacity as the
+  explanation for the preceding 6% gain. Remove the diagnostic, pass nine
+  restored smoke tests and rebuild byte-identical `d01534a` controls.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
   completed-step parity. Transposed-B staging improves training, which remains
-  about 22.5% slower than ordinary execution. The rejected per-thread guard
+  about 22% slower than ordinary execution. The rejected per-thread guard
   shows that fewer FP32 operations alone do not establish a speedup.
   Recheck both model phases and all
   CI cases before retaining further changes; do not infer elapsed cost from
@@ -480,12 +487,16 @@ the descriptor-reference repair requires fresh measurements.
   half the physical groups inactive; guarding their staging does not establish
   a completed-step gain. The retained 32×16 prologue also supplies 128 claims,
   keeps four physical groups active and reduces the compiled scratch footprint.
-  Geometry and footprint change together; their individual contributions remain
-  unmeasured. Its persistent average active warps remain near 32.5% of peak;
-  do not attribute the gain to greater occupancy from capacity alone. Use a
-  fixed-footprint control or per-node measurements to separate these effects
-  before making causal claims. Preserve the common selector and each output's
-  accumulation order. Keep `d01534a` as control and all completed-step gates;
+  Restoring its previous scratch capacity does not reproduce the earlier
+  latency difference, and average active warps remain near 32.5% of peak.
+  Deprioritize small capacity-only reductions; per-node utilization and the
+  separate costs of the changed cooperative body remain unmeasured.
+  Next, specialize rowwise attention-gradient arrays for the selected head
+  width through the existing common pipeline machinery. The measured model
+  uses 64-wide heads but the current fallback carries four 64-element chunks.
+  Preserve the reduction tree, accumulation order, masking and causal/window
+  limits; cover partial chunks, mixed widths and complete training state.
+  Keep `d01534a` as control and all completed-step gates;
   instruction or traffic savings alone are insufficient retention evidence.
   Preserve initialization, writer ownership, publication, independent B storage
   and every logical tile's arithmetic and completion accounting.

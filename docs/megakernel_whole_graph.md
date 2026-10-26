@@ -4567,6 +4567,87 @@ shared lock, and builds/copies/heavy analysis do not overlap measurements.
 Retain this change for its reproduced absolute forward gain. Baseline parity,
 Metal GPU execution and additional GPU qualification remain open.
 
+## Cooperative prologue scratch-capacity control
+
+A diagnostic based on `189ab53` appends 1,024 unused f16 elements to the last
+existing f16 scratch bank in each combined shader. Admission accounting uses
+the same larger capacity. No array, initialization store, handler, index,
+geometry, packing rule, queue operation or fence is added. This restores
+forward's shared allocation from 18,832 to 20,880 bytes while keeping the
+retained narrow tile. Training's allocation grows from 29,232 to 31,280 bytes.
+
+Independent reversal of that one capacity declaration reproduces each entire
+control shader exactly. All 19 CI sources and 41 of 43 model sources are
+unchanged. Ordinary pipelines and other cached pipeline/resource multisets
+match. Persistent registers remain 100/103 and code sizes 107,648/267,776 bytes
+for forward/training. The driver reports exactly 2,048 additional shared bytes
+in each. Source identity changes in appended pipeline metadata are accounted
+for explicitly; selected implementations, geometry, tasks, scheduler bytes
+and execution metadata otherwise match.
+
+The control/padded/padded/control sequence preserves **500 normal comparisons**,
+25 pairs per case and visit, ten minimum warmup pairs, at least one warmup
+second and 256 workers. All state budgets, completion, matching arithmetic,
+one persistent dispatch and no fallback pass. Maximum model error is 4.66e-9.
+
+| Case | Control ordinary / persistent ms | Padded ordinary / persistent ms | Persistent padded/control, bootstrap 95% interval | Paired-ratio padded/control, 95% interval |
+|---|---:|---:|---:|---:|
+| CI inference | 0.05143 / 0.06643 | 0.05208 / 0.06957 | 1.047 [1.004, 1.061] | 1.033 [0.930, 1.059] |
+| CI backward | 0.06493 / 0.09390 | 0.06493 / 0.09391 | 1.000 [0.992, 1.007] | 0.998 [0.986, 1.009] |
+| CI SGD | 0.06660 / 0.09484 | 0.06647 / 0.09500 | 1.002 [0.997, 1.032] | 1.007 [0.999, 1.035] |
+| Model forward | 3.829 / 4.990 | 3.832 / 4.976 | 0.997 [0.992, 1.007] | 0.991 [0.957, 1.017] |
+| Model training + SGD | 14.720 / 17.998 | 14.608 / 17.827 | 0.991 [0.980, 1.007] | 1.001 [0.909, 1.073] |
+
+Neither model phase establishes a timing change. CI inference varies despite
+identical shader sources and resources, and its normalized interval includes
+no change. All samples remain; pooled intervals do not capture all between-visit
+variation. The forward result does not reproduce the roughly 6% loss that would
+be expected if the previous gain came entirely from the 2 KiB capacity reduction.
+
+Four forward SDK backend captures contain sixteen metric groups and preserve
+bitwise-identical actual state files. Persistent replay changes **4.411→4.428 ms
+(+0.4%)**, while ordinary is 3.334→3.338 ms. Estimated persistent warp/integer
+instructions, global-load sectors and shared wavefronts all change by about
++0.06%; local traffic stays zero. Active compute warps remain **32.50%/32.47%**
+of peak, and barrier waiting is **54.14%/54.00%** of active warp cycles. Maximum
+cross-group clock spread is 0.416% and instruction-rate spread 0.437%.
+These estimates and cycle shares do not establish native instruction identity
+or elapsed-time attribution.
+
+This control weakens shared capacity as an explanation for the narrow tile's
+gain and gives little reason to prioritize another small capacity reduction.
+It does not isolate work distribution from the changed cooperative body, or
+prove that all scratch reductions are ineffective. Driver bounds handling,
+initialization and allocation can respond to array capacity even when source
+indices and reported code size stay fixed.
+
+The diagnostic passes 49 codegen checks, nine whole-graph smoke tests and the
+prologue regression. It is removed exactly; nine restored smoke tests and
+formatting pass, and rebuilt benchmarks match the qualified `d01534a` controls
+byte-for-byte. Both forks and dependency pins/lock remain unchanged. An initial
+audit's incorrect assumption about cached pipeline count is preserved alongside
+the corrected audit, which also verifies every unchanged cached pipeline.
+No full candidate-retention qualification is claimed for this diagnostic.
+
+Records are local under `target/prologue-scratch-control/`. The manifest
+`target/megakernel-results/prologue-scratch-control/summary.json` preserves
+500 normal/ten diagnostic comparisons, four SDK captures/sixteen groups,
+14 measurement scopes, 27 recorded job scopes and **426 independently verified
+artifact hashes**, SHA-256
+`3f77f1ecf45fccd636f980da1aad71b8a9687bcb511ed9ecbe412d2cf2006694`.
+Every heavy job uses a separate verified 16/20/1 GiB cgroup, GPU jobs serialize,
+and builds/analysis do not overlap measurements. The qualified runtime and
+performance claims remain unchanged; baseline parity remains unmet.
+
+The next concrete training target is the selected rowwise attention gradient.
+Its current shader reserves four components per lane to cover heads up to
+256 with 64 lanes, while this model's 64-wide heads need one component.
+Investigate head-width specialization
+through the existing common attention pipeline key and generator. Preserve
+dimension masking, the exact reduction tree, query/head accumulation order,
+causal/window bounds and complete training state; test partial chunk boundaries
+and mixed head widths before any retention decision.
+
 ## Earlier artifact identities
 
 All records remain on local storage at
