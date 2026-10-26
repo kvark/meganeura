@@ -212,10 +212,21 @@ the descriptor-reference repair requires fresh measurements.
   and fresh-control comparisons show no timing improvement. Metadata disproves
   the proposed utilization benefit for SmolVLA: all sixteen eligible cooperative
   nodes already pack four tiles along their 128-wide axis. Revert the probe.
+- [x] Test alternating scratch buffers for scalar Small tiles, preserving K
+  arithmetic and halving their source-level loop barriers. Dynamic offsets slow
+  the ordinary path; explicit constant-offset stages regress persistent timing.
+  Preserve the compiler/oracle/replay checks and 120 comparisons; revert both.
+- [x] Combine node and parameter broadcasts while retaining the ticket broadcast,
+  empty-queue path and every payload fence. All 200 candidate/control comparisons
+  pass without a useful timing gain. Matched two-group complete-step SDK captures
+  show nearly unchanged instruction activity and barrier waiting. Revert the
+  scheduler change and preserve the six resource diagnostics across these probes.
 - [ ] Investigate the remaining scheduling/integer cost after output-array
   removal. Complete-step replay still executes about 1.84 times as many warp
-  instructions as ordinary execution. Attribute the cost to the selected scalar
-  handlers and queue work before changing packing or synchronization again.
+  instructions as ordinary execution. Test whether keeping handler calls separate
+  changes register allocation, checking local-memory traffic and complete-step
+  latency before retaining any compiler hint. This tests resource lifetime;
+  the measured no-instruction waiting does not establish a cache bottleneck.
   Finer dependencies require proofs for payload ranges,
   allocation reuse, original tile coordinates and completion aggregation.
   Retain both model phases and all CI gates; baseline parity remains open.

@@ -1750,6 +1750,95 @@ in `target/flat-packing-probe/`, indexed by
 analysis job uses a verified separate bounded cgroup, and GPU jobs run serially.
 The runtime remains `5dbabed`, with the primary qualification and parity gap above.
 
+## Scalar staging and combined broadcast probes
+
+Three further prototypes are evaluated on source base `f3b38b6` and fully
+reverted. The retained runtime and its primary qualification remain `5dbabed`.
+Every candidate preserves selected arithmetic and one persistent compute
+dispatch, and all normal state comparisons satisfy the existing budget.
+
+The first two change the common scalar Small-tile generator used by both paths.
+Alternating two scratch stages lets iteration i+1 load a different buffer while
+slower lanes finish reading iteration i. The staging barrier in i+1 then orders
+all those reads before iteration i+2 reuses the first buffer. K arithmetic,
+geometry, tails, split offsets and output stores are unchanged. Larger tiles keep
+their original scratch and reuse barrier. The first version uses dynamic stage
+bases; the second emits two explicit stages with constant offsets and checks the
+original end-K condition before each stage.
+
+Twenty alternating pairs per model phase produce:
+
+| Variant | Forward ordinary / persistent ms | Training ordinary / persistent ms |
+|---|---:|---:|
+| Dynamic scratch offsets | 4.679 / 6.032 | 15.999 / 19.130 |
+| Subsequent retained-runtime control | 3.834 / 5.712 | 14.926 / 19.487 |
+| Constant scratch offsets | 4.102 / 6.625 | 15.376 / 20.222 |
+
+The dynamic variant's paired ratios fall to 1.289 forward and 1.194 training,
+partly because ordinary execution becomes slower. This is not evidence of
+approaching the original baseline. The explicit-stage variant also fails to
+improve persistent timing. Dynamic/static forward resources are both 112
+registers and 29,328 shared bytes, with 102,400/122,880 code bytes. Training uses
+114/103 registers, 29,360 shared bytes and 250,880/283,264 code bytes. Reduced
+register counts alone do not establish a speedup.
+
+The dynamic candidate's library run passes 664 tests and fails the assertion
+that expected one Small-tile scratch allocation. Updating that expectation for
+two stages makes the focused check pass; the original failure is preserved.
+The static candidate passes all 48 code-generation tests. Each version passes
+eight strict matrix oracle cases and all seven whole-graph GPU tests. Both the
+runtime changes and the temporary test-expectation change are reverted.
+
+The third prototype groups shared node metadata and parameter words into one
+struct. The claiming leader publishes the node before the unchanged ticket
+broadcast; all lanes then copy parameters using that ticket, followed by one
+uniform struct load. Successful claims use two uniform loads instead of four.
+The empty/done paths, shared-memory bound, payload fences, claims, dependencies
+and completion protocol are unchanged. Two compiler checks and all seven
+whole-graph GPU tests pass.
+
+Twenty pairs per case, followed by twenty fresh retained-runtime pairs, give:
+
+| Case | Combined broadcast persistent ms | Control persistent ms | Candidate / control paired ratios |
+|---|---:|---:|---:|
+| CI inference | 0.07047 | 0.07008 | 1.357 / 1.358 |
+| CI forward/backward | 0.10160 | 0.10226 | 1.532 / 1.551 |
+| CI forward/backward/SGD | 0.10153 | 0.10070 | 1.507 / 1.499 |
+| SmolVLA forward | 6.044 | 6.009 | 1.513 / 1.549 |
+| SmolVLA forward/backward/SGD | 19.472 | 19.348 | 1.279 / 1.283 |
+
+The combined broadcast retains 116 forward registers and uses 113 training
+registers, versus 114 retained. Shared storage is unchanged. Code sizes are
+101,120/249,344 bytes. There is no useful completed-step gain.
+
+A matched SDK check collects two sequential single-pass groups per mode and
+variant, with 146 samples per group. Both captures include zero-rate SGD,
+matching adapters, successful target/monitor exits and no warnings. Each
+backend preserves its exact previous state hash; all 246,883,105 cross-backend
+floats satisfy the existing tolerance, with maximum error 4.66e-9. Persistent
+candidate/control replay medians are 17.232/17.262 ms, with approximately
+2.791/2.797 billion warp instructions per replay. Barrier waiting is
+51.92%/51.81% of active warp cycles. Ordinary replay is 11.953/11.959 ms.
+Repeated instruction-rate deviation within each two-group capture is at most
+0.46%, and clock deviation at most 0.0022%. These counters show little change
+from reducing the WGSL broadcasts. They do not establish the driver's exact
+barrier instruction counts; active-warp shares are not elapsed-time shares.
+
+All **320 normal comparisons and six resource diagnostics** retain their raw
+samples and outliers. No full oracle qualification is claimed for the rejected
+candidates. Timings from resource captures and zero-rate resident replay do not
+replace the normal completed-step gate. The restored benchmark binaries are
+rebuilt, and all runtime source changes are absent. Builds, tests, timing,
+captures and analysis use verified bounded cgroups; GPU jobs remain serialized
+and every artifact stays on `/x`.
+
+Patches, proofs, binaries, test logs, source dumps, SDK records and 226 artifact
+hashes are indexed by
+`target/megakernel-results/synchronization-probes/summary.json`. The original
+library assertion failure remains in `target/scalar-double-buffer-probe/lib.log`.
+The next investigation tests handler function boundaries and register lifetimes,
+with local-traffic and completed-step checks before retaining any compiler hint.
+
 ## Earlier artifact identities
 
 All records remain on local storage at
