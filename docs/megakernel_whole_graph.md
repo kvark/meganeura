@@ -3450,6 +3450,82 @@ CI/model binary SHA-256 values are
 The independent verification log is `target/interior-staging-verify.log`.
 Baseline parity remains unmet; ordinary execution remains the default.
 
+## Conditional scalar A staging
+
+Two rejected prototypes on `6e8013f` test whether avoiding discarded A reads
+helps the current scalar matrix path. The original checked load reads element
+zero for an invalid row or K position, then selects zero for the shared cell.
+Both prototypes instead read A only inside `if in_bounds`. Valid coordinates
+use the identical original address; invalid coordinates still write positive
+zero. Every staging cell is written before the unchanged barrier. All B formats
+and normal/transposed/batched A mappings use this common template; arithmetic,
+geometry, B staging, dependencies, descriptors and completion are unchanged.
+
+The first form initializes a temporary float to zero, conditionally loads it,
+then writes shared memory after the branch. The second puts the shared store
+inside both branches, avoiding the temporary value across the merge. Neither
+adds a barrier inside conditional control. Generated-source audits restore the
+original masked expression and compare ordinary shader bodies after removing
+only whitespace/comments; all other payload code matches.
+
+Each prototype passes **40 code-generation checks, nine whole-graph smoke tests
+and eight strict matrix oracle cases**. Each then runs control/candidate/
+candidate/control visits with 25 interleaved ordinary/persistent pairs per case
+and visit: **1,000 normal comparisons** total. All state, selection, completion,
+one-dispatch and no-fallback gates pass, with maximum model error 4.66e-9.
+The controls are immutable binaries of qualified runtime `540eccf`, including
+its retained transposed-B interior staging. Worker count remains 256, with ten
+warmup pairs and at least one second of warmup. No SDK sampling or build overlaps
+normal measurements, and all samples and outliers remain.
+
+| Form / model case | Control ordinary / persistent ms | Candidate ordinary / persistent ms | Persistent candidate/control, bootstrap 95% interval |
+|---|---:|---:|---:|
+| Merged value, forward | 4.114 / 5.553 | 4.346 / 5.744 | 1.034 [1.022, 1.101] |
+| Merged value, training + SGD | 14.636 / 17.758 | 14.774 / 19.002 | 1.070 [1.004, 1.160] |
+| Branch-local stores, forward | 4.134 / 5.530 | 4.347 / 6.748 | 1.220 [1.183, 1.232] |
+| Branch-local stores, training + SGD | 14.648 / 17.747 | 14.827 / 20.409 | 1.150 [1.145, 1.240] |
+
+The first form regresses persistent forward/training by **3.4% / 7.0%**. Its
+normalized training ratio is 1.064 [1.035, 1.086]. Moving the stores into the
+branches regresses forward/training by **22.0% / 15.0%**; normalized ratios are
+1.146 [1.130, 1.169] and 1.131 [1.108, 1.158]. Thus removing the temporary value
+does not provide a remedy. CI also fails to establish a useful overall gain:
+the first form slows backward 3.2%, while the second slows SGD 2.4% with a
+normalized ratio of 1.024 [1.012, 1.039]. These 10,000-resample intervals describe
+within-run uncertainty, not every source of between-visit variation.
+
+Twenty separate native resource records preserve **102/103 registers** and
+**20,880/29,232 shared bytes** for forward/training in both forms. The control's
+107,904/267,776 code bytes grow to 109,568/272,768 with the merged value and
+111,232/278,144 with branch-local stores. Resource totals do not identify native
+predication, spills or the cause of the elapsed-time regressions. No new SDK
+capture or full library/oracle/matrix-regression qualification is claimed for
+either rejected candidate.
+
+Removing the discarded element-zero read changes the shader's read footprint,
+but the current whole-allocation read dependencies remain conservative. This
+does not qualify a narrower hazard analysis or a row-partitioned scheduler.
+The earlier two-band result remains rejected; any future revisit would need
+its own physical hazard proof, matched controls and completed-step gain large
+enough to cover the staging cost. Fewer source-level reads alone are not a
+sufficient performance argument.
+
+Both prototypes are reverted exactly. Release examples are rebuilt, all nine
+restored whole-graph smoke tests pass, and runtime/dependency sources match
+`540eccf`. Saved lockfiles also match. The first manifest attempt incorrectly
+assumed ignored `Cargo.lock` was tracked; its failed log remains beside the
+corrected audit. GPU work stays serialized in verified separate 16/20/1 GiB
+cgroups, and every artifact remains on local `/x`.
+
+Sources, binaries, samples, proofs and captures are under
+`target/scalar-conditional-a{,-store}/`. The manifest
+`target/megakernel-results/scalar-conditional-a/summary.json` contains **635
+independently verified artifact hashes**, SHA-256
+`03b93d9d7daad5afaca53ed00c0f823a7acf9801c51d42bce4bcdb546e1d8fa6`.
+The independent audit log is `target/conditional-a-verify.log`.
+The retained runtime and its performance claims remain unchanged; baseline
+parity is still unmet.
+
 ## Earlier artifact identities
 
 All records remain on local storage at
