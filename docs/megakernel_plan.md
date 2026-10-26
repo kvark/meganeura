@@ -386,6 +386,11 @@ the descriptor-reference repair requires fresh measurements.
   captures / 32 groups with exact same-backend state. Both forms slow ordinary
   training more than persistent training, so improved normalized ratios do not
   count toward parity. Restore the runtime and all nine smoke checks.
+- [x] Test uniform interior A staging across F32 scalar layouts, then restrict
+  it separately to transposed-A and transposed-B products. Preserve coordinate
+  and source proofs, 1,500 comparisons and 30 resource records. Broad/AT-only
+  forms regress CI SGD 5.4%/4.6%; no form establishes a model-training speedup.
+  Reject all three, restore exact sources/locks and pass nine smoke checks.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model

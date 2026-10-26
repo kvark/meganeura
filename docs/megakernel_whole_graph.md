@@ -3695,6 +3695,84 @@ and 814 independently verified artifact hashes**, SHA-256
 Its independent audit log is `target/scalar-shared-b-permutation/verify.log`.
 Baseline parity remains unmet.
 
+## Uniform interior A staging
+
+Three rejected prototypes on `5095e6c` test a uniform direct-load path for
+complete scalar A stages. The predicate checks `M >= BM`,
+`tile_row <= M - BM` and `K - t >= KTILE`; the existing loop guarantees
+`t < end_k <= K`. Every admitted A coordinate is therefore in bounds, and
+the direct path uses its original storage index and shared cell. The original
+per-element checked stage handles every edge, including its element-zero reads
+and positive-zero padding. B staging, K order, stores, subgroup guards,
+barriers, shared capacity, descriptors and dependencies remain unchanged.
+
+The broad form enables this path for all F32 scalar layouts. Two subsets
+restrict it to transposed-A or transposed-B products. Both backends use the
+same template; other weight formats retain the original checked A stage.
+An independent coordinate proof covers **3,133,440 staged elements**, including
+both A mappings, legal tile/stage sizes, edge dimensions and unsigned-32-bit
+limits. This proves the coordinate predicate without authorizing allocations
+beyond the runtime's existing limits. Generated-source audits replace the new
+branch with its unchanged edge body and reproduce the original ordinary shader
+bodies after whitespace/comment normalization.
+
+Each form passes **40 code-generation checks, nine whole-graph smoke tests and
+eight strict matrix oracle cases**, followed by 500 normal comparisons. The
+control/candidate/candidate/control protocol uses 25 interleaved ordinary/
+persistent pairs per case and visit, ten warmup pairs, at least one second of
+warmup and 256 workers. Controls are frozen qualified `540eccf` binaries.
+All 1,500 comparisons preserve full-state budgets, matching selections,
+completion, one persistent dispatch and no fallback. Maximum model error stays
+4.66e-9. Builds, heavy analyses and profiling do not overlap normal timings.
+
+| Form / case | Control ordinary / persistent ms | Candidate ordinary / persistent ms | Persistent candidate/control, bootstrap 95% interval |
+|---|---:|---:|---:|
+| Broad, forward | 4.169 / 5.524 | 4.654 / 5.583 | 1.011 [0.997, 1.072] |
+| Broad, training + SGD | 14.563 / 17.802 | 15.829 / 18.259 | 1.026 [1.004, 1.035] |
+| Transposed A, training + SGD | 14.626 / 17.757 | 14.570 / 17.835 | 1.004 [0.987, 1.084] |
+| Transposed B, training + SGD | 14.618 / 17.818 | 15.226 / 18.118 | 1.017 [0.996, 1.025] |
+
+The broad form slows persistent training **2.6%** and CI SGD **5.4%**; ordinary
+forward/training also regress **11.6% / 8.7%**. Transposed-A restriction gives
+no established model-training gain and slows CI SGD **4.6%**, or 4.9% normalized.
+The transposed-B subset gives no established persistent training gain and slows
+ordinary training **4.2%**. Its small 0.8% raw CI SGD reduction accompanies a
+2.0% ordinary slowdown and does not remedy the model result.
+
+Normalized training ratios are 0.921 [0.873, 0.955], 1.012 [0.988, 1.108] and
+0.973 [0.951, 0.987] for broad, transposed-A and transposed-B forms. The favorable
+broad/transposed-B ratios reflect the larger ordinary slowdown and fail to
+establish faster persistent steps. All samples and outliers remain. The
+10,000-resample intervals describe within-run uncertainty, not all between-visit
+variation.
+Both restricted variants leave the complete forward and CI-inference shaders
+byte-identical, with matching compiled pipeline identities and resource
+multisets in both backends; their timing shifts are not attributed to this
+change.
+
+Thirty resource records retain 48 CI registers, 102/103 model registers and
+all original shared capacities. Broad model code grows from 107,904/267,776 to
+112,896/282,368 bytes. Restricted forward code stays unchanged; training grows
+to 272,896 bytes for transposed A and 272,768 for transposed B. Transposed-A
+CI SGD code shrinks from 65,408 to 65,024 bytes despite its slowdown. These
+totals and source-level check removal do not establish native instruction
+counts or explain the elapsed-time changes. No new SDK capture or full-suite
+qualification is claimed for these rejected candidates.
+
+All three probes are restored exactly to runtime `540eccf`, including the
+retained B-stage optimization. Dependency locks match the qualified copy, both
+forks are clean, release examples are rebuilt, and all nine restored smoke
+tests pass. Heavy jobs use verified separate 16/20/1 GiB cgroups, GPU work is
+serialized, and every artifact stays on local `/x`.
+
+Records are under `target/scalar-interior-a{,-at,-bt}/`. The manifest
+`target/megakernel-results/scalar-interior-a/summary.json` preserves **1,500
+comparisons, 30 resource records and 991 independently verified artifact
+hashes**, SHA-256
+`21f0cafb3925e8503b5078ac6ac13e99a9490c22a5fc70997c3e151c1b252d28`.
+The independent audit log is `target/scalar-interior-a/verify.log`.
+Baseline parity remains unmet.
+
 ## Earlier artifact identities
 
 All records remain on local storage at
