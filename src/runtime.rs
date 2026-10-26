@@ -2869,6 +2869,26 @@ pub(crate) fn select_variants(
 
     plan.split_long_scalar_products();
 
+    for dispatch in &mut plan.dispatches {
+        if dispatch.kernel != crate::compile::Kernel::SmallTile
+            || dispatch.schedule_locked
+            || dispatch.matmul_epilogue.is_some()
+        {
+            continue;
+        }
+        let Some(problem) = crate::kernels::matmul::Problem::of(dispatch) else {
+            continue;
+        };
+        if let Some(shape) = crate::kernels::matmul::narrow_scalar_shape(&problem, plan.knobs) {
+            dispatch.kernel = crate::compile::Kernel::ScalarMatmul(shape);
+            dispatch.workgroups = [
+                problem.n.div_ceil(shape.cols()),
+                problem.m.div_ceil(shape.rows()),
+                1,
+            ];
+        }
+    }
+
     // Apply RmsNorm+MatMul prologue fusion only after per-dispatch coop
     // selection. A coop-capable device can still route small matmuls to a
     // scalar pipeline, which has no prologue implementation. The fusion
@@ -5338,6 +5358,52 @@ mod variant_tests {
                 output: 1,
             },
             inputs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn narrow_scalar_selection_preserves_knobs_pins_and_long_reductions() {
+        for (k, stage, interleave, locked) in [
+            (1031, 8, false, false),
+            (1031, 16, true, false),
+            (1031, 32, false, false),
+            (1031, 32, false, true),
+            (8192, 32, false, false),
+        ] {
+            let mut graph = crate::Graph::new();
+            let a = graph.input("a", &[35, k]);
+            let b = graph.input("b", &[k, 65]);
+            let d = graph.input("d", &[35, 65]);
+            let y = graph.matmul(a, b);
+            graph.nodes_mut()[y as usize].op = crate::graph::Op::FusedMatMulAdd;
+            graph.nodes_mut()[y as usize].inputs.push(d);
+            graph.set_outputs(vec![y]);
+            let mut plan = crate::compile::compile(&graph);
+            plan.knobs.matmul_k_stage = stage;
+            plan.knobs.matmul_interleave_columns = interleave;
+            if locked {
+                plan.dispatches[0].kernel = crate::compile::Kernel::SmallTile;
+                plan.dispatches[0].workgroups = [3, 2, 1];
+                plan.dispatches[0].schedule_locked = true;
+            }
+            select_variants(&mut plan, None, false, false);
+            if k == 8192 {
+                assert!(matches!(
+                    plan.dispatches[0].kernel,
+                    crate::compile::Kernel::SplitMatmul { .. }
+                ));
+                assert_eq!(plan.dispatches[1].shader, ShaderEntry::SumRows);
+            } else if locked || stage == 8 {
+                assert_eq!(plan.dispatches[0].kernel, crate::compile::Kernel::SmallTile);
+                assert_eq!(plan.dispatches[0].workgroups, [3, 2, 1]);
+            } else {
+                let shape = plan.dispatches[0].scalar_matmul().unwrap();
+                assert!(shape.legal());
+                assert_eq!((shape.rows(), shape.cols()), (32, 16));
+                assert_eq!(shape.k_stage, stage);
+                assert_eq!(shape.interleave_columns, interleave);
+                assert_eq!(plan.dispatches[0].workgroups, [5, 2, 1]);
+            }
         }
     }
 

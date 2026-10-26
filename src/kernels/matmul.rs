@@ -291,6 +291,31 @@ pub(crate) fn tiled_workgroups(problem: &Problem, tile: u32) -> [u32; 3] {
     [problem.n.div_ceil(tile), problem.m.div_ceil(tile), 1]
 }
 
+/// More independent tiles for narrow fused products with long dot products.
+/// Apply only to the remaining SmallTile choices after split-K selection.
+pub(crate) fn narrow_scalar_shape(
+    problem: &Problem,
+    knobs: crate::compile::TuningKnobs,
+) -> Option<crate::codegen::ScalarMatmulShape> {
+    if problem.layout != Layout::PlainAdd
+        || problem.reduced_storage
+        || problem.pinned
+        || problem.m > 64
+        || problem.n > 1024
+        || problem.k < 1024
+    {
+        return None;
+    }
+    let shape = crate::codegen::ScalarMatmulShape {
+        tile_size: 32,
+        tile_n: 16,
+        k_stage: knobs.matmul_k_stage,
+        interleave_columns: knobs.matmul_interleave_columns,
+        unroll_k: false,
+    };
+    shape.legal().then_some(shape)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

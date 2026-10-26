@@ -1,5 +1,86 @@
 use meganeura::megakernel::{Execution, Executor, Instruction, Job, Options};
 
+#[test]
+fn session_whole_graph_narrow_scalar_tiles() {
+    let gpu = crate::support::gpu::gpu();
+    let supports_graph = gpu.capabilities().device_memory_fence && gpu.capabilities().binding_array;
+    let (m, n, k) = (35, 65, 1031);
+    let mut graph = meganeura::Graph::new();
+    let a = graph.input("a", &[m, k]);
+    let b = graph.input("b", &[k, n]);
+    let d = graph.input("d", &[m, n]);
+    let y = graph.matmul(a, b);
+    graph.nodes_mut()[y as usize].op = meganeura::graph::Op::FusedMatMulAdd;
+    graph.nodes_mut()[y as usize].inputs.push(d);
+    graph.set_outputs(vec![y]);
+    for workers in [0, 1, 3, 256] {
+        if workers != 0 && !supports_graph {
+            continue;
+        }
+        let mut config = meganeura::SessionConfig::inference_from_env_on(gpu.clone());
+        config.optimize.mode = meganeura::OptimizeMode::Off;
+        config.tune = false;
+        config.runtime.poison = true;
+        config.runtime.persistent = (workers != 0).then_some(meganeura::PersistentOptions {
+            workers,
+            device_scheduling: true,
+            whole_graph: true,
+            allow_fallback: false,
+            track_workers: true,
+        });
+        let mut session = meganeura::build(&graph, config).0;
+        let dispatch = &session.plan().dispatches[0];
+        let meganeura::compile::Kernel::ScalarMatmul(shape) = dispatch.kernel else {
+            panic!(
+                "narrow probe did not select scalar geometry: {:?}",
+                dispatch.kernel
+            );
+        };
+        assert_eq!(shape.rows(), 32);
+        assert_eq!(shape.k_stage, 32);
+        assert_eq!(
+            dispatch.workgroups,
+            [
+                (n as u32).div_ceil(shape.cols()),
+                (m as u32).div_ceil(shape.rows()),
+                1
+            ]
+        );
+        for seed in [3, 7] {
+            let values = |len, salt| {
+                (0..len)
+                    .map(|i| ((i * seed + salt) % 7) as f32 / 32.0 - 3.0 / 32.0)
+                    .collect::<Vec<_>>()
+            };
+            let av = values(m * k, 1);
+            let bv = values(k * n, 2);
+            let dv = values(m * n, 4);
+            let mut expected = dv.clone();
+            for row in 0..m {
+                for col in 0..n {
+                    let mut sum = 0.0;
+                    for inner in 0..k {
+                        sum += av[row * k + inner] * bv[inner * n + col];
+                    }
+                    expected[row * n + col] += sum;
+                }
+            }
+            session.set_input("a", &av);
+            session.set_input("b", &bv);
+            session.set_input("d", &dv);
+            session.step();
+            session.wait();
+            if workers != 0 {
+                check_worker_tasks(&mut session);
+                assert_eq!(session.execution_report().compute_dispatches, 1);
+            }
+            let mut actual = vec![0.0; m * n];
+            session.read_output_by_index(0, &mut actual);
+            assert_eq!(actual, expected, "workers={workers}, seed={seed}");
+        }
+    }
+}
+
 fn check_worker_tasks(session: &mut meganeura::Session) {
     session.validate_persistent_completion().unwrap();
     let report = session.execution_report();
