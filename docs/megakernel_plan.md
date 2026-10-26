@@ -290,13 +290,20 @@ the descriptor-reference repair requires fresh measurements.
   both. Retain eight resource captures and 463 independently verified hashes
   across this investigation and the worker sweep. Rebuilt binaries match the
   qualified binaries exactly, and all eight restored smoke checks pass.
-- [ ] Investigate remaining scheduling/integer cost with a per-worker ready-word
-  cursor initialized from the worker ID and updated after successful claims.
-  Keep a full wraparound scan, all claim/publication fences, completion checks
-  and original handler arithmetic. This is an unimplemented locality hint,
-  not a different queue protocol. Qualify progress and performance on branching
-  graphs, both model phases and all CI cases before considering retention.
-  The measured no-instruction waiting does not establish a cache bottleneck.
+- [x] Test a per-worker ready-word cursor with full wraparound scans and all
+  original fences. Eight expanded smoke checks and 200 comparisons pass, but
+  model performance does not improve; revert the cursor. Preserve the
+  99-operation independent-root fixture and generated shaders with the probe.
+- [x] Test direct handoff of an entire single-claim successor, withholding its
+  ready bit while the finishing worker owns it. Shared-state variants fail a
+  packed-matrix case even without executing a handoff; padding does not fix it.
+  A private reservation passes eight expanded smoke checks and 200 comparisons,
+  but establishes no model gain. Revert the prototype and preserve failures,
+  four resource diagnostics per experiment, and the exact qualified binaries.
+- [ ] Minimize the extra-workgroup-state failure and inspect emitted WGSL,
+  SPIR-V and shared layout before attributing it to Naga or the driver. Keep
+  the failing variants out of the runtime. Resume performance experiments
+  from the qualified version with unchanged arithmetic and completion gates.
   Finer dependencies require proofs for payload ranges,
   allocation reuse, original tile coordinates and completion aggregation.
   Retain both model phases and all CI gates; baseline parity remains open.

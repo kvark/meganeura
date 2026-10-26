@@ -10,7 +10,9 @@ calls remain separate operations outside that step boundary.
 
 The latest qualified runtime is `762faf2`; its
 [cooperative row distribution and fresh measurements](#cooperative-row-distribution)
-are recorded below. Performance parity remains unmet.
+are recorded below. Subsequent [scheduler locality probes](#scheduler-locality-probes)
+establish no useful model improvement and are reverted. Performance parity
+remains unmet.
 
 For model benchmarks, use `--whole-graph --workers 256`. The
 [current worker sweep](#worker-counts-and-deeper-scalar-staging) finds lower CI
@@ -2515,9 +2517,92 @@ verified artifact hashes**. Successful audit logs are
 All work uses verified bounded cgroups and local `/x` storage. GPU jobs are
 serialized, and no builds, copies or heavy analysis overlap normal timing.
 The qualified runtime remains `762faf2`, and baseline parity remains unmet.
-The next scheduling experiment is a per-worker cursor that starts a full ready-
-bitmap scan near the last successful claim, preserving all existing claim and
-publication fences. It is not implemented or qualified by these results.
+The subsequent scheduler locality experiments are recorded below.
+
+## Scheduler locality probes
+
+Two experiments start from `a611752`, with the qualified runtime and binary
+controls from `762faf2`. Neither changes arithmetic selection, worker counts,
+graph geometry, memory fences or the complete-step submission boundary. Each
+uses twenty AB/BA pairs per case, ten warmups and at least one second of warmup,
+with a fresh control process before the candidate. All 400 normal comparisons
+pass the existing state and completion gates, matching implementation keys,
+one persistent compute dispatch and no fallback. Maximum training error remains
+4.66e-9. Bootstrap intervals use 10,000 resamples with seed 20261026 and describe
+within-run uncertainty, not drift or causal attribution.
+
+The first probe starts each worker's full ready-bitmap scan at its last
+successful ready word. Every word remains reachable, including wraparound.
+The expanded fixture contains two independent chains and a join across 99
+operations, with allocation reuse disabled to preserve their independence.
+It passes all eight whole-graph smoke checks with poison, repeated steps,
+external recording, serial mode and worker counts 1, 3, 64 and 4096.
+
+The second probe lets the final producer reserve one newly ready successor
+whose entire logical workload fits in one existing claim. Its ready bit stays
+unpublished, so the already-running worker has exclusive ownership. Other
+successors publish normally. The successor remains in the unfinished-node
+count and follows the original claim, payload and completion fences. A private
+reservation passes all eight smoke checks, including both multi-claim and
+single-claim versions of the 99-operation fixture.
+
+| Probe / case | Control ordinary / persistent ms | Candidate ordinary / persistent ms | Persistent candidate / control [95% interval] |
+|---|---:|---:|---:|
+| Cursor, CI inference | 0.05253 / 0.07089 | 0.05165 / 0.06989 | 0.986 [0.951, 1.057] |
+| Cursor, CI backward | 0.06520 / 0.10265 | 0.06626 / 0.10173 | 0.991 [0.981, 1.034] |
+| Cursor, CI SGD | 0.06827 / 0.10286 | 0.06825 / 0.10092 | 0.981 [0.973, 0.996] |
+| Cursor, model forward | 4.221 / 5.642 | 4.309 / 5.718 | 1.014 [0.993, 1.064] |
+| Cursor, model training | 14.779 / 19.006 | 14.768 / 19.553 | 1.029 [0.971, 1.045] |
+| Handoff, CI inference | 0.05327 / 0.07132 | 0.05696 / 0.07378 | 1.035 [0.947, 1.113] |
+| Handoff, CI backward | 0.06646 / 0.10286 | 0.06650 / 0.10156 | 0.987 [0.980, 0.996] |
+| Handoff, CI SGD | 0.06855 / 0.10278 | 0.06834 / 0.10271 | 0.999 [0.973, 1.018] |
+| Handoff, model forward | 4.245 / 5.764 | 3.947 / 5.742 | 0.996 [0.944, 1.070] |
+| Handoff, model training | 14.767 / 19.073 | 14.954 / 18.894 | 0.991 [0.950, 1.008] |
+
+The cursor's training ratio normalized to ordinary execution worsens by 3.2%
+[1.015, 1.157]. The handoff's normalized candidate/control ratios are 1.012
+[0.991, 1.056] forward and 0.992 [0.835, 1.109] training. Neither establishes a
+useful model improvement, so both are reverted. The isolated CI reductions
+do not justify retaining either change.
+
+Eight separate resource diagnostics pass the same correctness gates. Forward /
+training registers remain 100 / 103 and shared storage 20,880 / 29,232 bytes for
+both candidates and controls. Generated executable sizes are:
+
+| Variant | Forward bytes | Training bytes |
+|---|---:|---:|
+| Qualified control | 106,752 | 256,512 |
+| Ready-word cursor | 106,880 | 256,640 |
+| Private successor handoff | 107,776 | 257,536 |
+
+No new SDK capture or counter-based causal claim accompanies these rejected
+probes. The qualified SDK results above remain the current counter evidence.
+
+The handoff investigation also preserves a correctness failure. An initial
+workgroup scalar reservation produces nonfinite output in the packed-matrix
+scratch test at 2080 columns, one worker and the first replay. Instrumenting
+the reservation branch confirms that this graph never takes that branch;
+neither of its two nodes fits one claim. Deferring metadata writes until the
+next claim still fails, as does a vec4-padded shared reservation. Using a private
+reservation passes the focused case and complete eight-test suite. This shows
+sensitivity to the added shared state, but does not establish an alignment,
+Naga or driver cause. Five failing test logs and their source variants remain
+in `target/single-claim-handoff/`; no failed variant is retained in the runtime.
+The next correctness investigation will minimize that reproducer and inspect
+its emitted WGSL, SPIR-V and shared layout.
+
+Raw measurements, patches, proofs, binary receipts and generated shaders remain
+under `target/ready-word-cursor/` and `target/single-claim-handoff/`. The combined
+manifest is `target/megakernel-results/scheduler-locality/summary.json`.
+Its 435 artifact hashes are independently verified; the manifest SHA-256 is
+`b711bf95d0043d92cf49bd9a662a1a3aea9e33d95c13359c2986102c519aef4d`.
+Both prototypes and their temporary test extensions are reverted. Rebuilt
+examples match the qualified binaries byte-for-byte, and all eight restored
+smoke tests pass. Restoration and audit logs use the
+`target/scheduler-locality-*` prefix. Every heavy job uses a verified separate
+cgroup with the existing 16/20/1 GiB limits; GPU jobs are serialized and artifacts
+remain on local `/x`. The qualified runtime, Naga/Blade pins and primary
+measurements remain unchanged. Baseline parity is still unmet.
 
 ## Earlier artifact identities
 
