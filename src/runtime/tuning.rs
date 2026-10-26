@@ -41,7 +41,7 @@ pub struct KernelMemo {
 
 // Bump when kernel generation, qualification or decision semantics change,
 // including changes between package releases. This also versions the memo schema.
-const KERNEL_MEMO_REVISION: u32 = 13;
+const KERNEL_MEMO_REVISION: u32 = 14;
 
 /// Undecided classes predicted to total less than this share of the plan are
 /// not probed. Kernel winners are accepted together, so classes well below
@@ -2068,12 +2068,19 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
         let pieces: Vec<bg::BufferPiece> = buffers.iter().map(|&b| b.into()).collect();
         let start = Instant::now();
         encoder.start();
-        for _ in 0..repeats {
-            for &(pipeline, dispatch) in sequence {
-                let mut pass = encoder.compute("tune_kernel");
-                let mut pc = pass.with(pipeline);
-                Session::bind_dispatch(&pieces, dispatch, &mut pc);
-                pc.dispatch(dispatch.workgroups);
+        {
+            let mut pass = encoder.compute("tune_kernel");
+            for repetition in 0..repeats {
+                for (position, &(pipeline, dispatch)) in sequence.iter().enumerate() {
+                    // Match timestamp rounds and live inline-barrier execution.
+                    // Order split reductions and repeated writes explicitly.
+                    if repetition != 0 || position != 0 {
+                        pass.barrier();
+                    }
+                    let mut pc = pass.with(pipeline);
+                    Session::bind_dispatch(&pieces, dispatch, &mut pc);
+                    pc.dispatch(dispatch.workgroups);
+                }
             }
         }
         let sync = gpu.submit(encoder);
