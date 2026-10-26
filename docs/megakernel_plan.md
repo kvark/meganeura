@@ -332,15 +332,21 @@ the descriptor-reference repair requires fresh measurements.
   intervals. Audit original tile coordinates, packing, padded stores, allocation
   reuse and masked element-zero reads. Preserve the failed timing setup and the
   successful state-exact profiles; restore the qualified runtime and binaries.
-- [ ] Prototype row-band release for the audited matrix/SwiGLU/matrix pattern.
-  Keep common arithmetic, original grids and absolute tile coordinates. Rebuild
-  all physical RAW/WAR/WAW hazards, including those previously ordered only
-  transitively; retain conservative accesses outside the supported pattern.
-  Include padded cooperative stores and masked element-zero reads, and
-  aggregate completion/worker counts back to the original dispatches. Compare
-  against whole-node execution with the same partitioning and shader before
-  attributing any gain to earlier release. Only two row bands are available in
-  this model; the synthetic eight-chain result does not predict its benefit.
+- [x] Prototype two-band release for the audited matrix/SwiGLU/matrix pattern.
+  Preserve arithmetic, grids, coordinates, packing, padded stores and masked
+  element-zero reads; rebuild physical hazards and aggregate completion. Check
+  five row/column shapes across four worker counts, then compare against both
+  the qualified runtime and identical partitioning with whole-node dependencies.
+  All 300 comparisons pass, but no useful gain is established. Preserve four
+  resource records and 503 independently verified hashes; revert the prototype
+  and restore exact qualified binaries and all eight smoke checks.
+- [ ] Test proven disjoint gradient-arena write ranges while retaining whole
+  operation completion and existing node counts. Start with selected matrix
+  products and row sums whose output bounds can be checked; keep unknown
+  accesses conservative. Reconstruct all physical RAW/WAR/WAW hazards, verify
+  padded extents and external rebinding, and compare against the same qualified
+  runtime before retaining any change. This targets the training opportunity
+  from the interval audit; the forward performance gap remains separate.
   Keep the shared-state failure as a separate unresolved diagnostic.
   Retain both model phases and all CI gates; baseline parity remains open.
 

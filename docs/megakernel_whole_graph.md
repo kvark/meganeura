@@ -2908,6 +2908,89 @@ independently verified artifact hashes** and SHA-256
 The qualified runtime and primary performance results are unchanged. Baseline
 parity remains unmet.
 
+## Two-band release of feed-forward chains
+
+At `e8ffb25`, a temporary host-side prototype splits each of the 16 audited
+matrix/SwiGLU/matrix chains into two row bands. It changes no worker or payload
+shader. Each part retains the original grid, parameter block and absolute ticket
+coordinates; its initial claim counter starts at the band's first tile and its
+remaining counter counts only that band. Completion checks use the absolute end,
+while worker totals aggregate the parts. Cached parameter uploads and appended
+optimizer records keep their original operation indexing.
+
+The prototype rebuilds all physical hazards before reducing edges. Only accesses
+inside an admitted chain use the proved row footprints; other relationships stay
+whole-allocation. Cooperative padding, inference output reuse and the scalar
+element-zero read remain in those footprints. A separate control has identical
+parts and payloads but keeps whole-operation dependency edges between them.
+The two source versions differ only in the host dependency-selection constant.
+
+| Model graph | Expanded nodes | Whole-operation edges | Early-release edges |
+|---|---:|---:|---:|
+| Forward | 202 | 289 | 241 |
+| Forward/backward/SGD | 575 | 834 | 786 |
+
+Both modes execute the original 17,242 / 177,346 payload tiles. Independent
+audits match every coordinate, parameter word, descriptor allocation, initial
+counter and ready bit, full hazard closure and reduced edge set. Both contain
+all 16 partitioned chains. Their 43 generated shader files are identical to each
+other, and the model pipeline identities match the qualified runtime.
+
+All eight expanded whole-graph smoke tests pass. The packed-matrix fixture adds
+complete feed-forward chains at 33/50/53/64 rows with 4096 intermediate columns,
+and 53 rows with 4224 columns. Each runs three exact-output replays at
+1/3/64/4096 workers. Twenty captured partitioned graphs confirm that the intended
+cases actually enter the new path. Existing tests also retain optimizer,
+allocation-reuse, scratch, geometry and external-recording coverage.
+
+The normal benchmark runs qualified / whole-operation / early / early /
+whole-operation / qualified, with ten interleaved ordinary/persistent pairs per
+case per visit: **300 comparisons** across all five cases. Selection, state
+budgets and completion pass throughout, with one persistent compute dispatch and
+no fallback. Maximum training error remains 4.66e-9.
+
+| Graph | Qualified ordinary / persistent ms | Partitioned whole-operation ordinary / persistent ms | Early-release ordinary / persistent ms |
+|---|---:|---:|---:|
+| Forward | 3.901 / 5.381 | 3.993 / 5.400 | 4.266 / 5.691 |
+| Forward/backward/SGD | 14.828 / 18.921 | 14.791 / 18.816 | 14.812 / 18.873 |
+
+Forward early/whole persistent latency is **1.054 [0.992, 1.065]**; normalized
+by each run's ordinary timing, **0.981 [0.918, 1.029]**. Against the qualified
+runtime, raw latency is **1.058 [1.004, 1.080]**, while the normalized comparison
+is inconclusive at **0.963 [0.907, 1.015]**. Training early/whole is
+**1.003 [0.927, 1.045]** and early/qualified **0.998 [0.924, 1.051]**;
+both normalized intervals also include no change. All CI comparisons are
+inconclusive. These 10,000-resample intervals do not capture every source of
+between-run variation: qualified forward medians change from 5.268 to 5.596 ms,
+and the partitioned control changes from 5.733 to 5.369 ms. No useful gain is
+established, so neither partitioning nor earlier release is retained.
+
+Four separate native resource records confirm equal executable statistics in both modes:
+forward/training use 100/103 registers, 20,880/29,232 shared bytes and
+106,752/256,512 code bytes. With worker histograms enabled, early-release
+scheduler storage is 438,364 / 1,272,128 bytes; the whole-operation control needs
+192 more bytes for its extra edges. Initial diagnostics did not enable native
+capture and contain no executable statistics; the separate capture-enabled runs
+supply this check. The first resource audit incorrectly compared hash-map-derived
+pipeline lists positionally. Comparing multisets, preserving duplicates, passes.
+That failed audit and the initial Rust import-path build failure remain in the
+record. No full oracle qualification or new SDK counter capture is claimed.
+
+All temporary runtime and test changes are reverted. Rebuilt examples match the
+qualified hashes byte-for-byte, both forks remain clean, and eight restored
+whole-graph smoke tests pass. Every heavy job uses a verified separate 16/20/1 GiB
+cgroup; GPU jobs serialize, and artifacts stay on local `/x`. Sources, binaries,
+scripts, samples and failures are under `target/row-range-release/`. The manifest
+`target/megakernel-results/row-range-release/summary.json` has **503 independently
+verified artifact hashes** and SHA-256
+`0e3943af3d131346c18fe4829ff89fbb681efa01de402af903e7e8c09f675c5b`.
+
+Two-band release does not reproduce the earlier synthetic wide-graph benefit.
+Next, test proven disjoint gradient-arena writes without increasing node counts
+or changing whole-operation completion. That is a separate training hypothesis;
+the qualified runtime and primary results remain unchanged, and baseline parity
+is still unmet.
+
 ## Earlier artifact identities
 
 All records remain on local storage at
