@@ -2589,7 +2589,7 @@ sensitivity to the added shared state, but does not establish an alignment,
 Naga or driver cause. Five failing test logs and their source variants remain
 in `target/single-claim-handoff/`; no failed variant is retained in the runtime.
 The next correctness investigation will minimize that reproducer and inspect
-its emitted WGSL, SPIR-V and shared layout.
+its emitted WGSL, SPIR-V and shared layout; the follow-up is recorded below.
 
 Raw measurements, patches, proofs, binary receipts and generated shaders remain
 under `target/ready-word-cursor/` and `target/single-claim-handoff/`. The combined
@@ -2603,6 +2603,78 @@ smoke tests pass. Restoration and audit logs use the
 cgroup with the existing 16/20/1 GiB limits; GPU jobs are serialized and artifacts
 remain on local `/x`. The qualified runtime, Naga/Blade pins and primary
 measurements remain unchanged. Baseline parity is still unmet.
+
+## Shared-state failure reduction
+
+At `f78a9f4`, the failing graph is reduced to 53×720 input, 2080 output columns,
+one worker and one replay of the existing packed-matrix scratch test. The
+smallest worker change reproduced here adds a live shared `u32`, stores the
+worker ID in it and uses it for the initial ready-word index. There is no
+successor handoff. The captured payload WGSL is identical to the passing
+control; only this shared declaration, store and scan-start read differ.
+
+| Diagnostic | Result |
+|---|---|
+| Original shared handoff | Nonfinite output at index zero |
+| Unused extra shared scalar | Pass |
+| Live shared worker ID, before or after scratch declarations | Nonfinite output at index zero |
+| Live scalar with an initialization barrier | Incorrect finite output |
+| Two or three live shared words | Incorrect finite output |
+| Four or eight live shared words | Pass |
+| Explicit `Aligned 16` operands on all five cooperative loads | Still fails |
+| Standalone 16×16 cooperative matrix with 1/2/3/4/8 live words | All five cases pass |
+| Packing disabled in graph admission | Stalls; explicitly cancelled |
+
+The four/eight-word probes initialize and consume every word, unlike the
+earlier vec4 variant that used only its first component. The pattern is
+consistent with a layout sensitivity but does not establish its cause.
+Vulkan requires these cooperative matrix pointers and strides to meet the
+minimum of 16 bytes and the natural row/column alignment; static SPIR-V
+validation does not prove the runtime address alignment.
+See [VUID-RuntimeSpirv-OpCooperativeMatrixLoadKHR-08986](https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-RuntimeSpirv-OpCooperativeMatrixLoadKHR-08986).
+All 17 captured SPIR-V modules validate for Vulkan 1.3. Requesting driver internal
+representations returns an empty list, so no native instruction or actual
+shared-address inspection is claimed. The aligned-load diagnostic changes
+only the five cooperative-load memory operands and does not fix the output.
+
+The first attempt to disable packing changed a builder default that graph
+admission overrides; its generated shader is unchanged and its failed run is
+retained as an ineffective probe. The corrected admission change reduces each
+half-precision scratch array from 512 to 256 elements, but stalls after the
+shader dump. Repeated checks find the process still live, waiting without
+new output or sustained CPU/GPU activity. Its exact cgroup is explicitly
+stopped after more than two minutes, and the driver records exit -15. This is
+a cancelled diagnostic, not a proven GPU deadlock or a passing check. The
+standalone harness also retains its initial compile failure from an invalid
+cleanup-method call; correcting that harness allows all five matrix cases
+to execute successfully.
+
+The record contains 15 focused runs: five passes, nine failures and one
+cancellation, plus the five standalone matrix cases. These are correctness
+diagnostics, with no normal benchmark or new SDK performance claim. All
+temporary worker, test, packing, example and Blade instrumentation changes
+are reverted. Rebuilt benchmark binaries exactly match the qualified hashes,
+and all eight restored whole-graph smoke tests pass. Work remains inside
+verified bounded cgroups, with serialized GPU jobs and local `/x` artifacts.
+
+Sources, patches, outputs and process observations are in
+`target/shared-state-repro/`. The manifest
+`target/megakernel-results/shared-state-repro/summary.json` has 206 independently
+verified artifact hashes and SHA-256
+`18701f31cac9804d26dbeb34515543dc91090e4b2587643bcb13672cb077b487`.
+The cause remains open; no alignment workaround or dependency change is retained.
+
+The inspection identifies a separate performance hypothesis. Current Naga
+emits per-access availability/visibility for ordinary workgroup memory accesses,
+while workgroup control barriers provide ordering without the corresponding
+propagation bits. Before changing this, audit whether existing barriers can
+provide that propagation for every supported synchronization path, preserving
+NonPrivatePointer and explicit decorations. The
+[Vulkan memory model](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html#availability-visibility-semantics)
+defines the required barrier propagation; it does not by itself prove the
+proposed compiler transformation. This proposal is unimplemented and requires
+an ordering proof, compiler checks, publication tests, and the same CI/model
+performance gates. It is not an explanation for the shared-state failure.
 
 ## Earlier artifact identities
 

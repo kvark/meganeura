@@ -300,10 +300,21 @@ the descriptor-reference repair requires fresh measurements.
   A private reservation passes eight expanded smoke checks and 200 comparisons,
   but establishes no model gain. Revert the prototype and preserve failures,
   four resource diagnostics per experiment, and the exact qualified binaries.
-- [ ] Minimize the extra-workgroup-state failure and inspect emitted WGSL,
-  SPIR-V and shared layout before attributing it to Naga or the driver. Keep
-  the failing variants out of the runtime. Resume performance experiments
-  from the qualified version with unchanged arithmetic and completion gates.
+- [x] Reduce the extra-workgroup-state failure to a shared worker-ID scalar,
+  without handoff logic. Preserve five passing and nine failing focused runs,
+  one explicitly cancelled stalled diagnostic, five passing standalone matrix
+  cases and 17 validated SPIR-V modules. Four/eight live words pass where
+  one/two/three fail, but alignment operands do not fix it and a standalone
+  shader does not reproduce it. Keep the cause unresolved and all diagnostic
+  changes reverted; the qualified binaries and eight smoke checks are restored.
+- [ ] Audit moving ordinary workgroup availability/visibility propagation from
+  individual accesses to existing synchronization barriers in the Naga fork.
+  First prove ordering for workgroupUniformLoad, control barriers, subgroup
+  synchronization, fence-only operations, atomics, pointer helpers and explicit
+  memory decorations. Preserve NonPrivatePointer and every synchronization
+  edge; do not infer correctness or a performance benefit from the proposal.
+  Keep the shared-state reproducer as a separate regression diagnostic, and
+  require all existing correctness and completed-step performance gates.
   Finer dependencies require proofs for payload ranges,
   allocation reuse, original tile coordinates and completion aggregation.
   Retain both model phases and all CI gates; baseline parity remains open.
