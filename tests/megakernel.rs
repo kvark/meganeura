@@ -2,15 +2,28 @@ use meganeura::megakernel::{Execution, Executor, Instruction, Job, Options};
 
 #[test]
 fn session_whole_graph_narrow_scalar_tiles() {
+    check_scalar_tile_edges(false);
+    check_scalar_tile_edges(true);
+}
+
+fn check_scalar_tile_edges(transposed_b: bool) {
     let gpu = crate::support::gpu::gpu();
     let supports_graph = gpu.capabilities().device_memory_fence && gpu.capabilities().binding_array;
     let (m, n, k) = (35, 65, 1031);
     let mut graph = meganeura::Graph::new();
     let a = graph.input("a", &[m, k]);
-    let b = graph.input("b", &[k, n]);
+    let b = graph.input("b", &if transposed_b { [n, k] } else { [k, n] });
     let d = graph.input("d", &[m, n]);
-    let y = graph.matmul(a, b);
-    graph.nodes_mut()[y as usize].op = meganeura::graph::Op::FusedMatMulAdd;
+    let y = if transposed_b {
+        graph.matmul_bt(a, b)
+    } else {
+        graph.matmul(a, b)
+    };
+    graph.nodes_mut()[y as usize].op = if transposed_b {
+        meganeura::graph::Op::FusedMatMulBTAdd
+    } else {
+        meganeura::graph::Op::FusedMatMulAdd
+    };
     graph.nodes_mut()[y as usize].inputs.push(d);
     graph.set_outputs(vec![y]);
     for workers in [0, 1, 3, 256] {
@@ -30,21 +43,23 @@ fn session_whole_graph_narrow_scalar_tiles() {
         });
         let mut session = meganeura::build(&graph, config).0;
         let dispatch = &session.plan().dispatches[0];
-        let meganeura::compile::Kernel::ScalarMatmul(shape) = dispatch.kernel else {
-            panic!(
-                "narrow probe did not select scalar geometry: {:?}",
-                dispatch.kernel
-            );
+        let (rows, cols) = if transposed_b {
+            assert_eq!(dispatch.kernel, meganeura::compile::Kernel::Default);
+            (64, 64)
+        } else {
+            let meganeura::compile::Kernel::ScalarMatmul(shape) = dispatch.kernel else {
+                panic!(
+                    "narrow probe did not select scalar geometry: {:?}",
+                    dispatch.kernel
+                );
+            };
+            assert_eq!(shape.rows(), 32);
+            assert_eq!(shape.k_stage, 32);
+            (shape.rows(), shape.cols())
         };
-        assert_eq!(shape.rows(), 32);
-        assert_eq!(shape.k_stage, 32);
         assert_eq!(
             dispatch.workgroups,
-            [
-                (n as u32).div_ceil(shape.cols()),
-                (m as u32).div_ceil(shape.rows()),
-                1
-            ]
+            [(n as u32).div_ceil(cols), (m as u32).div_ceil(rows), 1]
         );
         for seed in [3, 7] {
             let values = |len, salt| {
@@ -60,7 +75,12 @@ fn session_whole_graph_narrow_scalar_tiles() {
                 for col in 0..n {
                     let mut sum = 0.0;
                     for inner in 0..k {
-                        sum += av[row * k + inner] * bv[inner * n + col];
+                        let b_index = if transposed_b {
+                            col * k + inner
+                        } else {
+                            inner * n + col
+                        };
+                        sum += av[row * k + inner] * bv[b_index];
                     }
                     expected[row * n + col] += sum;
                 }
@@ -76,7 +96,10 @@ fn session_whole_graph_narrow_scalar_tiles() {
             }
             let mut actual = vec![0.0; m * n];
             session.read_output_by_index(0, &mut actual);
-            assert_eq!(actual, expected, "workers={workers}, seed={seed}");
+            assert_eq!(
+                actual, expected,
+                "transposed_b={transposed_b}, workers={workers}, seed={seed}"
+            );
         }
     }
 }

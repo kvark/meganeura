@@ -75,6 +75,21 @@ $ENTRY_SIGNATURE {
     $RESULT_STORES
 }
 
+// @section interior_b_stage
+if params.n >= $BN_U && tile_col <= params.n - $BN_U
+    && params.k - t >= $K_TILE_U {
+    for (var e = 0u; e < $B_STAGE_EPT_U; e++) {
+        let flat = tid + e * 256u;
+        let row_local = $B_ROW;
+        let col_local = $B_COL;
+        let b_row = t + row_local;
+        let b_col = tile_col + col_local;
+        shared_b[row_local * $B_STRIDE_U + col_local] = $B_BUFFER[$B_INDEX];
+    }
+} else {
+    $EDGE_B_STAGE
+}
+
 // @section output_guard
 // Keep the reduction subgroup-uniform; all lanes still stage and synchronize.
 let has_output = subgroupAny(tile_row + ty * $TM_U < params.m

@@ -1813,6 +1813,16 @@ fn matmul_vars_tiled(
         }"
         .to_string()
     };
+    // Transposed B is contiguous along K. Its full stages can use the original
+    // addresses directly; the edge path still supplies the same zero padding.
+    let b_stage_body = if b_mode == WeightFormat::F32 && b_row == B_ROW_BT {
+        preprocess(
+            template_section(src, "interior_b_stage"),
+            &[("$EDGE_B_STAGE", &b_stage_body)],
+        )
+    } else {
+        b_stage_body
+    };
     let bm = tile.bm();
     let bn = tile.bn();
     let tm = tile.tm();
