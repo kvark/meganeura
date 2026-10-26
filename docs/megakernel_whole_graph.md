@@ -2825,6 +2825,89 @@ real model dependencies permit safe release of row or element ranges; the prior
 independent-node diagnostics motivate measuring that opportunity before changing
 the scheduler. Baseline parity remains unmet.
 
+## Real model dependency and row-range audit
+
+At `c47b40a`, temporary diagnostics under the existing shader-dump option record
+the selected dispatches, physical allocations, logical extents, binding offsets,
+packing, parameters and dependency metadata. Scheduler code, shaders, arithmetic
+and compiler pins are unchanged. Both 256-worker diagnostic comparisons pass
+state, selection and completion checks with one compute dispatch and one submit.
+An independent pairwise hazard reconstruction matches the captured transitive
+closure, reduced edges and initial predecessor counts: 154 nodes / 161 edges
+for forward and 527 nodes / 706 edges for forward/backward/SGD.
+
+Forward has no sliced allocations, so replacing whole-allocation conflicts with
+logical intervals provides no additional ordering freedom. Training packs
+parameters and gradients into arenas. A hypothetical interval analysis removes
+6,597 ordered node pairs and changes the reduced graph from 706 to 698 edges;
+the longest unweighted path changes from 349 to 336 nodes. This uses the largest
+logical extent at each physical offset, rounded to 16 bytes, and keeps appended
+bindings conservative. It is an opportunity estimate, not a proof that every
+selected kernel stays in those intervals or a performance prediction. The four
+SGD chunks already have independent readiness: their immediate predecessors are
+`[522]`, `[494,495]`, `[406,407]` and `[164,165]`. They are not chained together by
+the optimizer's shared read-only segment table.
+
+The narrower row-release candidate is the 16 repeated feed-forward chains:
+`[50,720] × [720,4096] → SwiGLU [50,2048] → matrix/add [50,720]`.
+Each chain has three selected dispatches and two compatible row bands, rows
+0–31 and 32–49. The cooperative output includes padding through row 63.
+Separate ordinary dispatch profiles locate the work:
+
+| Graph | Eligible dispatches | Their median interval sum | All dispatch median sum | Share |
+|---|---:|---:|---:|---:|
+| Forward | 48 / 154 | 2.430144 ms | 4.003744 ms | 60.7% |
+| Forward/backward, optimizer disabled | 48 / 523 | 2.108224 ms | 12.482208 ms | 16.9% |
+
+Each profile contains five samples per dispatch, with exact state unchanged by
+profiling. Attributions match the captured labels, grids and logical outputs.
+The profiled/unprofiled wall ratios are 1.202 and 1.276: these are instrumented
+ordinary intervals, not persistent per-node timings or projected speedups.
+The initial profile attempt fails with `MissingGpuTimings`; enabling the existing
+`MEGANEURA_GPU_TIMING` setting fixes the setup. Both logs are retained.
+
+The static coordinate audit preserves the original grids and packing. The
+cooperative matrix's two absolute ticket intervals are `[0,128)` and `[128,256)`,
+each with 32 four-tile claims. SwiGLU uses `[0,256)` and `[256,400)`, with 256 and
+144 claims. The final scalar matrix uses `[0,45)` and `[45,90)`, with 45 claims
+each. All original coordinates occur exactly once, boundaries align with claims,
+and same-operation partitions have no overlapping writes or read/write hazards.
+Splitting these operations adds 48 scheduler nodes without adding payload tiles.
+Only two bands are available; the earlier synthetic eight-chain result does not
+establish a benefit for this model.
+
+Two physical hazards prevent a simple row-for-row dependency rule:
+
+- Every inference chain reuses the cooperative output allocation for the final
+  matrix output, whose narrower rows overlap the first producer band. Both final
+  bands must respect those WAW and SwiGLU-read WAR dependencies. The captured
+  training chains use separate allocations at this boundary.
+- Scalar matrix staging evaluates an element-zero load for masked rows or K
+  lanes before selecting zero. The second final-matrix band therefore also reads
+  the first SwiGLU band, even though that value is discarded. Its footprint must
+  include that load; matching only the mathematical output rows is insufficient.
+
+The next prototype should preserve these ranges, padded stores and all unrelated
+physical hazards, rebuilding the full hazard relation before reducing edges.
+Removing only old direct edges is unsafe: whole-node chains previously carried
+transitive reuse ordering that finer completion can break. Completion and worker
+counts must aggregate back to the original dispatches. Compare earlier release
+against a control with identical partitioning, shader and whole-node barriers,
+then apply the normal state/selection/latency gates. No partitioned runtime or
+new SDK performance result is claimed by this audit.
+
+All temporary diagnostics are reverted. Rebuilt examples match the qualified
+hashes byte-for-byte, both forks are clean, and eight restored whole-graph smoke
+tests pass. Builds, GPU jobs, copies and analyses use verified separate cgroups
+with 16/20/1 GiB limits; GPU work is serialized and artifacts remain on local
+`/x`. Captures, source snapshots, diagnostic binary, scripts, profiles and the
+failed setup are under `target/dependency-range-audit/`. The manifest is
+`target/megakernel-results/dependency-range-audit/summary.json`, with **86
+independently verified artifact hashes** and SHA-256
+`5b1e3bf5c20f79f260ef4044a073cdc01733218d863f5ff3682e36be5bb47391`.
+The qualified runtime and primary performance results are unchanged. Baseline
+parity remains unmet.
+
 ## Earlier artifact identities
 
 All records remain on local storage at

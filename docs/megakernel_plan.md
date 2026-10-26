@@ -324,11 +324,23 @@ the descriptor-reference repair requires fresh measurements.
   pass. Persistent forward slows 5.7%; training establishes no gain. Revert the
   probe, preserving four resource captures and 282 independently verified
   artifact hashes. Restore the exact qualified binaries and eight smoke checks.
-- [ ] Audit real model dependencies for opportunities to release row or element
-  ranges before an entire operation finishes. Measure eligible work before
-  changing scheduling. Finer dependencies require proofs for payload ranges,
-  allocation reuse, original tile coordinates and completion aggregation;
-  preserve common arithmetic and conservative edges for unsupported accesses.
+- [x] Audit real model dependencies before changing scheduling. Independently
+  reconstruct both captured hazard graphs. Whole-buffer slices offer no forward
+  overlap; hypothetical training intervals remove some gradient-arena ordering.
+  Identify 16 matrix/SwiGLU/matrix chains with two compatible row bands, covering
+  60.7% of ordinary forward dispatch intervals and 16.9% of training-graph
+  intervals. Audit original tile coordinates, packing, padded stores, allocation
+  reuse and masked element-zero reads. Preserve the failed timing setup and the
+  successful state-exact profiles; restore the qualified runtime and binaries.
+- [ ] Prototype row-band release for the audited matrix/SwiGLU/matrix pattern.
+  Keep common arithmetic, original grids and absolute tile coordinates. Rebuild
+  all physical RAW/WAR/WAW hazards, including those previously ordered only
+  transitively; retain conservative accesses outside the supported pattern.
+  Include padded cooperative stores and masked element-zero reads, and
+  aggregate completion/worker counts back to the original dispatches. Compare
+  against whole-node execution with the same partitioning and shader before
+  attributing any gain to earlier release. Only two row bands are available in
+  this model; the synthetic eight-chain result does not predict its benefit.
   Keep the shared-state failure as a separate unresolved diagnostic.
   Retain both model phases and all CI gates; baseline parity remains open.
 
