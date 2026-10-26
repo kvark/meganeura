@@ -12,8 +12,10 @@ The latest qualified runtime is `762faf2`; its
 [cooperative row distribution and fresh measurements](#cooperative-row-distribution)
 are recorded below. Performance parity remains unmet.
 
-For the application benchmarks, use `--whole-graph --workers 256`. For a regular
-Session configured from the environment:
+For model benchmarks, use `--whole-graph --workers 256`. The
+[current worker sweep](#worker-counts-and-deeper-scalar-staging) finds lower CI
+backward/SGD latency with an explicit 64-worker pool; no universal replacement
+count is established. For a regular Session configured from the environment:
 
 ```sh
 MEGANEURA_PERSISTENT_WORKERS=256 MEGANEURA_DEVICE_SCHEDULING=1 \
@@ -2398,9 +2400,124 @@ the model binary is
 `f4c43ae7e5a36fbe571cb51496a0f7237982401cc1d01dfed76dbac70fe7448a`.
 Builds, tests, copies and analyses use verified bounded cgroups on local `/x`
 storage. GPU jobs are serialized; builds and heavy analysis do not overlap
-normal timing or SDK capture. Next investigations are explicit worker-count
-sweeps on the current geometry and deeper scalar K staging, subject to the
-same arithmetic, completion and completed-step gates.
+normal timing or SDK capture. The following investigation measures explicit
+worker counts on this geometry and deeper scalar K staging under the same
+arithmetic, completion and completed-step gates.
+
+## Worker counts and deeper scalar staging
+
+On source base `e9a32a9`, the qualified row-distribution binaries are swept at
+explicit worker counts, without changing runtime code or defaults. The earlier
+CI sweep used different persistent pipelines; the earlier model sweep preceded
+the current geometry and register reductions. Fresh 256-worker controls bracket
+each sweep. Every run retains matching arithmetic, complete state/completion
+checks, one persistent dispatch, no fallback and exact requested/reported
+worker counts. All GPU pipeline identities match the qualified runtime for
+each workload; only the runtime pool count changes.
+
+CI uses fifty AB/BA pairs per case, **900 comparisons** total:
+
+| Workers, execution order | Inference persistent ms | Backward persistent ms | SGD persistent ms |
+|---|---:|---:|---:|
+| 256, before | 0.07159 | 0.10218 | 0.10155 |
+| 32 | 0.06816 | 0.09689 | 0.09803 |
+| 128 | 0.07440 | 0.09794 | 0.09813 |
+| 64 | 0.07335 | 0.09672 | 0.09720 |
+| 16 | 0.07487 | 0.09836 | 0.09859 |
+| 256, after | 0.07081 | 0.10235 | 0.10157 |
+
+At 64 workers, backward is about 5.3–5.5% below both controls and SGD about
+4.3% below them; normalized comparisons also improve. Inference comparisons
+remain inconclusive because ordinary latency varies between runs. The 64-worker
+paired persistent/ordinary ratios are still 1.349/1.460/1.435, so this does not
+close the baseline gap. It is evidence for an explicit CI choice, not for
+silently capping requested workers or a graph-independent automatic policy.
+
+The model uses twenty pairs per phase, **240 comparisons** total. Counts 168
+and 336 also sample two/four workers per SM on this 84-SM device; that is not
+a portable workgroup-placement assumption.
+
+| Workers, execution order | Forward persistent ms / paired ratio | Training persistent ms / paired ratio |
+|---|---:|---:|
+| 256, before | 5.714 / 1.366 | 19.076 / 1.273 |
+| 128 | 5.446 / 1.394 | 20.467 / 1.373 |
+| 336 | 5.415 / 1.354 | 18.933 / 1.264 |
+| 168 | 5.379 / 1.386 | 18.900 / 1.289 |
+| 512 | 5.725 / 1.370 | 19.080 / 1.281 |
+| 256, after | 5.580 / 1.374 | 18.991 / 1.266 |
+
+128 workers slows training substantially. Neither 168 nor 336 establishes a
+normalized improvement against both controls; forward ordinary latency ranges
+from 3.861 to 4.248 ms. Keep the existing model setting and preserve all samples.
+The raw records, binaries, receipts and comparisons are in
+`target/worker-count-current/`.
+
+Two subsequent prototypes add an explicit 64-deep setting to the existing
+scalar staging knob and pass it through the shared paired benchmark config to
+both backends. The default remains 32 throughout. Explicit schedules, including
+the existing 16-deep split-long products, stay pinned; quantized decoders retain
+their fixed 32-deep layout. Each output retains ascending-K arithmetic and the
+old 32-rounded tail, rather than adding another 32 zero FMAs. Neither prototype
+changes the queue, descriptors, fences or submission boundary.
+
+The first stages 64 values and uses a variable arithmetic-loop bound for the
+final tail. The second executes two fixed 32-step inner loops and guards only
+the second loop. Counted and unrolled 64-deep ragged products are added to the
+existing smoke fixture and compared with an independent CPU result under
+ordinary execution and 1/3/256 persistent workers. Both variants pass all eight
+expanded whole-graph checks and **200 normal comparisons each**, twenty pairs
+for all five cases with fresh 32-stage controls from the same binaries.
+
+| Variant | Forward ordinary / persistent ms | Training ordinary / persistent ms |
+|---|---:|---:|
+| Variable bound, 32-stage control | 3.904 / 5.406 | 14.947 / 18.880 |
+| Variable bound, 64-stage candidate | 4.267 / 6.680 | 14.887 / 21.193 |
+| Fixed loops, 32-stage control | 4.219 / 5.404 | 14.818 / 18.991 |
+| Fixed loops, 64-stage candidate | 3.918 / 5.750 | 14.464 / 19.088 |
+
+The variable-bound candidate regresses persistent forward/training by about
+24%/12%. Fixed loops reduce that loss, but forward still regresses about 6.4%
+and training is effectively unchanged. Neither improves both model phases.
+CI backward/SGD show small gains, insufficient to justify the model regressions.
+The short samples include ordinary-training outliers; nothing is removed.
+Bootstrap intervals describe within-run uncertainty, not drift or causal
+attribution. No full oracle or matrix-regression qualification is claimed for
+these rejected candidates.
+
+Eight separate resource diagnostics show:
+
+| Combined shader | Registers forward / training | Shared bytes forward / training | Code bytes forward / training |
+|---|---:|---:|---:|
+| 32-stage controls, both variants | 100 / 103 | 20,880 / 29,232 | 106,752 / 256,512 |
+| 64-stage variable bound | 102 / 112 | 29,200 / 45,744 | 108,928 / 292,608 |
+| 64-stage fixed loops | 100 / 114 | 29,200 / 45,744 | 133,376 / 342,656 |
+
+Deeper staging trades barrier frequency for greater scratch and code size;
+these resource observations do not assign the latency regression to one cause.
+Generated graph sources verify the variable bound and the fixed-loop tail guard
+with second-half shared indices. The first source-audit assertion expected the
+pre-emission variable spelling; it was corrected to check the emitted loop and
+index structure. Its failed log remains `target/workers-stage64-manifest.log`.
+No new SDK counter capture is claimed for these probes.
+
+Both prototypes, the temporary benchmark option and the expanded test are
+reverted exactly. Rebuilt examples match the qualified binaries byte-for-byte,
+and all eight restored whole-graph checks pass. The patches, proofs, measured
+binaries and generated sources remain in `target/scalar-stage64-probe/` and
+`target/scalar-stage64-fixed-loops/`.
+The combined manifest is `target/megakernel-results/workers-stage64/summary.json`:
+**1,540 normal comparisons, eight resource diagnostics and 463 independently
+verified artifact hashes**. Successful audit logs are
+`target/workers-stage64-manifest-fixed.log` and
+`target/workers-stage64-artifact-audit.log`; restoration logs are
+`target/workers-stage64-restored-{build,smoke}.log`.
+
+All work uses verified bounded cgroups and local `/x` storage. GPU jobs are
+serialized, and no builds, copies or heavy analysis overlap normal timing.
+The qualified runtime remains `762faf2`, and baseline parity remains unmet.
+The next scheduling experiment is a per-worker cursor that starts a full ready-
+bitmap scan near the last successful claim, preserving all existing claim and
+publication fences. It is not implemented or qualified by these results.
 
 ## Earlier artifact identities
 

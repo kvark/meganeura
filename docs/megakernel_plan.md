@@ -278,13 +278,24 @@ the descriptor-reference repair requires fresh measurements.
   Keep all 1,880 normal comparisons, six resource diagnostics and both-phase
   SDK captures. Alternate subgroup widths have ownership and validation
   coverage; GPU execution remains qualified only on RTX 5080.
-- [ ] Investigate the remaining scheduling/integer cost and barrier waiting.
-  Sweep explicit worker counts on the current geometry, including the small CI
-  graphs; preserve the requested counts and report actual execution geometry.
-  Separately assess deeper scalar K staging to reduce barrier frequency,
-  preserving configured choices, output arithmetic (including padded tails),
-  resource admission and the existing correctness gates. Neither change is
-  implemented yet. Require completed-step gains against fresh controls.
+- [x] Sweep explicit worker counts on the current geometry with 1,140 paired
+  comparisons and bracketing 256-worker controls. CI backward/SGD improve about
+  4–5% at 64 workers, but 128 workers slows model training and other model
+  counts show no reliable normalized gain. Preserve all requested/reported
+  counts; do not introduce an automatic policy or change defaults.
+- [x] Probe 64-deep scalar K staging through the shared benchmark configuration,
+  preserving explicit schedules and the original 32-rounded arithmetic tail.
+  Both variable-bound and fixed-inner-loop variants pass eight expanded smoke
+  checks and 200 comparisons each. Neither improves both model phases; revert
+  both. Retain eight resource captures and 463 independently verified hashes
+  across this investigation and the worker sweep. Rebuilt binaries match the
+  qualified binaries exactly, and all eight restored smoke checks pass.
+- [ ] Investigate remaining scheduling/integer cost with a per-worker ready-word
+  cursor initialized from the worker ID and updated after successful claims.
+  Keep a full wraparound scan, all claim/publication fences, completion checks
+  and original handler arithmetic. This is an unimplemented locality hint,
+  not a different queue protocol. Qualify progress and performance on branching
+  graphs, both model phases and all CI cases before considering retention.
   The measured no-instruction waiting does not establish a cache bottleneck.
   Finer dependencies require proofs for payload ranges,
   allocation reuse, original tile coordinates and completion aggregation.
