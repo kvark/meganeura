@@ -4648,6 +4648,95 @@ dimension masking, the exact reduction tree, query/head accumulation order,
 causal/window bounds and complete training state; test partial chunk boundaries
 and mixed head widths before any retention decision.
 
+## Rowwise dKV component-count specialization
+
+A prototype based on `58468b0` specializes rowwise dK/dV for the selected head
+width through the existing attention pipeline key. Its template's `MAX_CHUNKS`
+changes from four to `clamp(ceil(head_dim/64),1,4)`. The measured 64-wide heads
+need one component per lane. dQ, geometry, masks, query/head accumulation order,
+dual reduction tree, barriers and the queue protocol stay unchanged.
+
+An independent audit reverses that one constant in the ordinary shader exactly.
+In the combined training shader, only the corresponding constant and
+`graph_handler_29_entry` change; all other source matches. Enumeration verifies
+the same ordered valid components for every lane at all 256 supported head
+widths, totaling 32,896 dimensions. Sixteen selected dKV labels change from
+`:scalar` to `:head-dim-64:ept-None`; the audit explicitly checks this mapping.
+Both backends select identical raw keys within each binary. All 19 CI sources
+and 41 of 43 model sources remain identical, including complete model forward.
+
+The ordinary dKV executable falls from **35 to 24 registers** and **6,784 to
+3,712 code bytes**, retaining 512 shared bytes. Combined training code falls
+from **267,776 to 263,168 bytes**, but stays at **103 registers and 29,232 shared
+bytes**. Other compiled pipeline/resource multisets, logical tasks, geometry
+and scheduler sizes match. Smaller code does not establish a latency gain.
+
+The control/candidate/candidate/control sequence preserves **500 normal
+comparisons**, 25 pairs per case/visit, ten minimum warmup pairs, one warmup
+second and 256 workers. Every state budget, completion check, matching arithmetic,
+one persistent dispatch and no-fallback check passes; maximum error is 4.66e-9.
+
+| Case | Control ordinary / persistent ms | Candidate ordinary / persistent ms | Persistent candidate/control, bootstrap 95% interval |
+|---|---:|---:|---:|
+| CI inference | 0.05743 / 0.07464 | 0.05362 / 0.06948 | 0.931 [0.888, 0.949] |
+| CI backward | 0.06482 / 0.09374 | 0.06512 / 0.09433 | 1.006 [0.999, 1.014] |
+| CI SGD | 0.06654 / 0.09483 | 0.06687 / 0.09533 | 1.005 [0.998, 1.040] |
+| Model forward | 3.555 / 4.875 | 3.801 / 4.903 | 1.006 [0.980, 1.097] |
+| Model training + SGD | 14.591 / 17.855 | 14.424 / 17.800 | 0.997 [0.975, 1.013] |
+
+Training's normalized candidate/control paired ratio is **1.003 [0.905, 1.093]**;
+no completed-step improvement is established. The unchanged CI inference
+shader varies alongside ordinary execution; its normalized interval includes
+no change. All samples remain, and pooled bootstrap intervals do not capture
+all between-visit variation. No CI or forward gain is attributed to this edit.
+
+Four SDK backend captures contain sixteen metric groups and include forward,
+backward and zero-rate SGD for stable replay. Persistent replay changes
+**15.907→15.804 ms (−0.65%)**; ordinary changes **11.921→11.734 ms (−1.57%)**.
+Estimated persistent warp instructions fall 1.92% and FP32 activity 2.46%,
+while integer activity rises 0.98%. Global-load sectors and shared wavefronts
+remain nearly unchanged; persistent local traffic is zero. Barrier waiting is
+50.77%/51.04% of active warp cycles, not elapsed time. Maximum cross-group clock
+spread is 0.396% and instruction-rate spread 0.642%.
+
+Each backend preserves bitwise-identical actual state before and after the
+change. Ordinary and persistent state are compared with the unchanged benchmark
+budget, not claimed bitwise equal to each other. SDK zero-rate replay and
+rate-times-duration instruction estimates remain diagnostic. The small replay
+change does not replace the normal completed-step acceptance gate.
+
+Qualification passes **669 library tests** (eight ignores), all **nine whole-graph
+smoke tests**, and **22 attention reference tests in each of ordinary and strict
+whole-graph modes**. The reference sweep adds 63/65/129/193-wide cases with GQA,
+cross/causal/window masks; a pipeline-key regression separates 64/65-wide heads.
+An initial source-audit assumption omitted the global chunk constant; its
+failure and corrected exact audit are preserved. No full candidate-retention
+qualification is claimed.
+
+The prototype is rejected and source/tests are restored exactly. Nine restored
+smoke tests and formatting pass; rebuilt benchmarks match the qualified
+`d01534a` controls byte-for-byte. Forks, dependency pins and lock stay unchanged.
+The manifest `target/megakernel-results/rowwise-kv-chunks/summary.json` preserves
+500 normal/ten diagnostic comparisons, four SDK captures/sixteen groups,
+14 measurement scopes, 29 recorded job scopes and **430 independently verified
+artifact hashes**, SHA-256
+`cd48f2111b0bcea81cf47f616e4a2ba5379020b19a42087eee724b80ad3458f5`.
+Raw artifacts stay under local `target/rowwise-kv-chunks/`. Every heavy job uses
+a separate bounded cgroup, GPU work serializes, and builds/analysis do not
+overlap measurements. Baseline parity remains unmet.
+
+The retained combined shader runs dQ/dKV as one 64-lane logical tile in a
+256-lane physical worker. Independent heads have equal query-loop bounds at
+the same row, whereas different causal rows do not. The earlier broad
+three-tile packing probe admitted heads by separating coordinate arguments,
+but enlarged cooperative attention scratch and failed its timing gate. Test
+the non-cooperative gradient opportunity separately, keeping cooperative
+packing and its footprint unchanged. Audit scope/uniformity, three-tile tails,
+scratch isolation and exact task coverage. An exact-order subgroup reduction
+remains a separate possible experiment: the current dKV loop has eight
+workgroup barriers per query/head iteration, and any replacement must preserve
+the original tree and a supported fallback.
+
 ## Earlier artifact identities
 
 All records remain on local storage at

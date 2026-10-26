@@ -468,6 +468,13 @@ the descriptor-reference repair requires fresh measurements.
   rises only 0.4% and active warps stay near 32.5%. This weakens capacity as the
   explanation for the preceding 6% gain. Remove the diagnostic, pass nine
   restored smoke tests and rebuild byte-identical `d01534a` controls.
+- [x] Specialize rowwise dKV's component count through the existing head-width
+  pipeline key. Verify 32,896 ordered lane components, 669 library tests,
+  nine smoke tests and 22 attention reference tests in both execution modes.
+  Preserve 500 normal comparisons and four complete-step SDK captures.
+  Ordinary registers fall 35→24 and combined code shrinks, but normal training
+  timing is inconclusive and SDK replay improves only 0.65%. Reject the probe,
+  restore source/tests and pass smoke/format plus byte-identical rebuilt controls.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
@@ -491,11 +498,16 @@ the descriptor-reference repair requires fresh measurements.
   latency difference, and average active warps remain near 32.5% of peak.
   Deprioritize small capacity-only reductions; per-node utilization and the
   separate costs of the changed cooperative body remain unmeasured.
-  Next, specialize rowwise attention-gradient arrays for the selected head
-  width through the existing common pipeline machinery. The measured model
-  uses 64-wide heads but the current fallback carries four 64-element chunks.
-  Preserve the reduction tree, accumulation order, masking and causal/window
-  limits; cover partial chunks, mixed widths and complete training state.
+  Component-count specialization does not establish a training gain. The
+  retained rowwise gradients use only 64 lanes of each 256-lane physical
+  worker. Test packing independent heads of non-cooperative handlers while
+  retaining cooperative packing and its scratch footprint. Separate coordinate
+  arguments can expose equal loop bounds on the head axis; query-dependent
+  causal rows must still fail packing admission. Cover three-tile claims,
+  inactive groups, scratch reuse, mixed grids and exact completion counts.
+  Investigate exact-order subgroup reduction separately if needed: dKV has
+  eight workgroup barriers per query/head iteration. Preserve the reduction
+  tree, masks, accumulation order and supported fallback in any such change.
   Keep `d01534a` as control and all completed-step gates;
   instruction or traffic savings alone are insufficient retention evidence.
   Preserve initialization, writer ownership, publication, independent B storage
