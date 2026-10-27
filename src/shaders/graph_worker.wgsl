@@ -77,7 +77,7 @@ $PARTIAL_COMPLETION        if node.work.y != 0u {
                     if pending == 1u {
                         storageFence();
                         atomicOr(&graph_queue[2u + successor / 32u], 1u << (successor % 32u));
-                    }
+$PUBLISH_SUMMARY                    }
                 }
 $COMPLETE_EPOCH                if atomicSub(&graph_queue[0], 1u) == 0u {
                     atomicOr(&graph_queue[1], 8u);

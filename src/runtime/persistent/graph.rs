@@ -471,7 +471,13 @@ impl Graph {
             .collect();
         let nodes = u32::try_from(work.len()).map_err(|_| "too many graph nodes")?;
         let ready_words = nodes.div_ceil(32);
-        let counters = 2 + ready_words;
+        let summary_words = if ready_words > 1 {
+            ready_words.div_ceil(32)
+        } else {
+            0
+        };
+        let summary_offset = 2 + ready_words;
+        let counters = summary_offset + summary_words;
         let worker_counts = counters
             .checked_add(nodes.checked_mul(3).ok_or("queue size overflow")?)
             .ok_or("queue size overflow")?;
@@ -491,7 +497,11 @@ impl Graph {
             worker_counts,
             workers: self.options.workers,
             track_workers: u32::from(self.options.track_workers),
-            padding: [0; 2],
+            padding: if summary_words == 0 {
+                [0; 2]
+            } else {
+                [summary_offset, summary_words]
+            },
         };
         let mut queue = vec![0u32; queue_words as usize];
         queue[0] = nodes;
@@ -610,6 +620,9 @@ impl Graph {
             queue[counter + 2] = pending;
             if pending == 0 {
                 queue[2 + node / 32] |= 1 << (node % 32);
+                if summary_words != 0 {
+                    queue[summary_offset as usize + node / 1024] |= 1 << ((node / 32) % 32);
+                }
             }
             metadata.extend([
                 grid[0],
@@ -817,7 +830,7 @@ impl Graph {
 
     pub fn check_completion(&self, words: &[u32]) -> Result<(), String> {
         let frame = self.current.as_ref().ok_or("graph has not run")?;
-        if words[..frame.config.counters as usize]
+        if words[..(2 + frame.config.ready_words) as usize]
             .iter()
             .any(|&w| w != 0)
         {
@@ -825,6 +838,15 @@ impl Graph {
                 "whole graph incomplete: remaining={}, diagnostics={}",
                 words[0], words[1]
             ));
+        }
+        // Advisory summary bits may remain stale at completion. Validate their
+        // index domain; only the ready bitmap and node counters define done.
+        for index in 0..frame.config.padding[1] {
+            let valid = (frame.config.ready_words - index * 32).min(32);
+            let mask = u32::MAX >> (32 - valid);
+            if words[(frame.config.padding[0] + index) as usize] & !mask != 0 {
+                return Err("whole-graph summary has an out-of-range word".into());
+            }
         }
         for (node, &tasks) in frame.tasks.iter().enumerate() {
             let counter = frame.config.counters as usize + 3 * node;

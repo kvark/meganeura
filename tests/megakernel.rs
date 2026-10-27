@@ -575,10 +575,10 @@ fn session_whole_graph_bitmap_word_boundaries() {
     if !gpu.capabilities().device_memory_fence || !gpu.capabilities().binding_array {
         return;
     }
-    // Independent chains publish across the 32-node bitmap boundary. Keep
+    // Independent chains cross ready-word and 1024-node summary boundaries. Keep
     // every intermediate output live so a missed publication cannot be hidden
     // by a later overwrite. Replays also require fresh completion epochs.
-    for nodes in [32, 33, 65] {
+    for nodes in [32, 33, 65, 1024, 1025] {
         let mut graph = meganeura::Graph::new();
         let x = graph.input("x", &[259]);
         let mut outputs = Vec::new();

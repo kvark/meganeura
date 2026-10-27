@@ -631,7 +631,7 @@ impl Builder {
         let wait_for_completion = ready_words > 1;
         let source = include_str!("../shaders/graph_worker.wgsl")
             .replace("$CLAIM", if wait_for_completion {
-                include_str!("../shaders/graph_claim_epoch.wgsl")
+                include_str!("../shaders/graph_claim_summary.wgsl")
             } else {
                 include_str!("../shaders/graph_claim.wgsl")
             })
@@ -640,6 +640,9 @@ impl Builder {
             } else { "" })
             .replace("$COMPLETE_EPOCH", if wait_for_completion {
                 "                storageFence();\n"
+            } else { "" })
+            .replace("$PUBLISH_SUMMARY", if wait_for_completion {
+                "                        atomicOr(&graph_queue[graph_config.padding.x + successor / 1024u], 1u << ((successor / 32u) % 32u));\n"
             } else { "" })
             .replace(
                 "$ENABLES",
