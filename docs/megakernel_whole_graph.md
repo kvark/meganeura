@@ -13,12 +13,17 @@ including read-only views that may alias writable bindings. It retains the
 preceding scratch-read repair and packing optimizations. Passing numerical
 tests alone did not reveal these extra inactive accesses.
 
-The latest 500 primary comparisons measure a 5.58% absolute training regression
+The storage repair's 500 primary comparisons measure a 5.58% absolute training regression
 from the storage repair. Paired persistent/ordinary medians are 1.355× forward
 and 1.219× training. A separate worker-count control supports a cost from the
 increased number of participating workers. The repair is retained for
 correctness; requested worker counts and the 256-worker primary gate remain
 unchanged. Baseline performance parity remains unmet.
+
+A subsequent [attention-reduction experiment](#serial-attention-reduction-tail)
+removes two barriers while preserving the exact addition tree. Its 500 new
+comparisons establish no useful gain, so the patch is reverted. Fresh retained
+control ratios are 1.357× forward and 1.231× training.
 
 For model benchmarks, use `--whole-graph --workers 256`. The
 [current worker sweep](#worker-counts-and-deeper-scalar-staging) finds lower CI
@@ -40,6 +45,91 @@ separate verified cgroup (16 GiB soft memory limit, 20 GiB hard limit, 1 GiB swa
 The GPU flag holds a shared file lock across command execution, so marked jobs
 cannot overlap. Library tests also use the GPU and need this flag. Builds use
 the same launcher without the GPU flag; finish them before primary measurements.
+
+## Serial attention reduction tail
+
+The rowwise dQ and dKV helpers use seven workgroup barriers per dual reduction,
+plus a caller barrier before reusing scratch. This probe lets lane zero finish
+the last three levels after the eight-lane stage, reducing the helper to five
+barriers. It preserves the original addition tree, operand order, masks and
+caller synchronization. Both ordinary and persistent paths use the same
+candidate shaders. No subgroup operation, capability, packing rule, scratch
+allocation or worker-count policy changes.
+
+An independent interpreter evaluates the actual original and candidate helper
+source as ordered symbolic trees: all 64 leaves and 63 additions match for
+both arrays in each helper. It checks cross-lane reads/writes between barriers
+and verifies that callers consume only element zero and reinitialize every
+lane before the next reduction. This source audit supplements GPU execution
+checks; it does not describe native instructions.
+
+Qualification passes 671 library tests (eight ignored), 52 code-generation
+tests, 168 strict whole-graph oracle tests, 50 matrix regressions, ten
+whole-graph smoke tests, 22 attention references in each mode, strict Clippy,
+formatting and Metal compilation. Metal GPU execution remains unqualified.
+
+Ten diagnostic comparisons preserve selection, geometry, buffers, scheduler
+metadata, logical work and the one-dispatch boundary. Generated source differs
+only in the two reduction helpers and harmless local-variable renaming in
+the dKV caller. The initial text audit rejected that rename; the corrected
+audit verifies a one-to-one local renaming and checks the remaining source.
+Both audit versions and the initial failure are preserved. The independent
+Naga access audit still finds 102 guarded storage-read sites and valid shared
+read/write protection.
+
+All CI and forward shaders/resources remain unchanged. The training worker
+keeps 80 registers and 29,344 shared bytes; code size falls 264,320→263,552
+bytes. Diagnostic participation remains 168 workers forward and 252 training,
+with 256 requested. Native instruction bytes are unavailable.
+
+The primary run has 500 completed-step comparisons, ordered control, candidate,
+candidate, control, with 25 paired samples per case per visit. The control is
+the retained storage repair, `e4e70c5`. Full-state budgets remain unchanged.
+
+| Case | Control persistent ms | Candidate ms | Candidate/control, 95% interval | Candidate paired persistent/ordinary |
+|---|---:|---:|---:|---:|
+| CI inference | 0.069441 | 0.069506 | 1.0009 (0.9619–1.0169) | 1.291× |
+| CI backward | 0.092991 | 0.093335 | 1.0037 (0.9977–1.0156) | 1.434× |
+| CI SGD | 0.095166 | 0.096525 | 1.0143 (0.9942–1.0499) | 1.435× |
+| Model forward | 5.186537 | 5.144061 | 0.9918 (0.9866–1.0043) | 1.368× |
+| Model training + SGD | 17.727893 | 17.877664 | 1.0084 (0.9909–1.0463) | 1.237× |
+
+Every absolute and normalized persistent timing interval includes no change.
+Pooled bootstrap intervals do not capture all between-visit variation. Timing
+movement in unchanged CI/forward shaders is not attributed to this patch.
+
+Four full-step SDK backend captures / sixteen sequential metric groups preserve
+all 246,883,105 state floats bitwise within each backend. Hashing the actual
+state files independently verifies this; cross-backend error remains at most
+4.66e-9 under the existing budget. The backends are not bitwise identical.
+Persistent diagnostic replay changes 15.9458→15.8365 ms (−0.69%), while ordinary
+changes 11.9655→11.8055 ms (−1.34%). Estimated persistent warp instructions and
+shared wavefronts each fall 1.05%; integer instructions change −0.07%, FP32
+instructions +0.03%, and global-load sectors +0.03%. Persistent local traffic
+stays zero. Barrier waiting changes 64.03→63.92% of active warp cycles.
+Maximum sequential clock/instruction-rate spreads are 0.411%/0.575%.
+
+The counter reductions are small and do not establish a completed-step gain.
+Barrier shares are fractions of active warp cycles, not elapsed-time
+attribution. This experiment does not show that other barriers are removable
+or that all synchronization costs are negligible. The patch is reverted,
+and ordinary release examples are rebuilt from the restored runtime.
+
+Evidence is local under `target/attention-tree-tail8/`; the candidate patch,
+frozen binaries, generated shaders, states and failed audit remain available.
+Manifest: `target/megakernel-results/attention-tree-tail8/summary.json`.
+It contains 451 independently verified artifact hashes and 39 recorded bounded
+cgroups; SHA-256
+`a2b20605778269ef2fdf1c0befa8356a8bd9d17bb4d47f9749c3837a354e12b2`.
+All heavy jobs use separate verified 16/20/1 GiB cgroups, with serialized GPU
+work and no builds, copies or heavy analyses overlapping measurements.
+No dependency pin or Naga/Blade source changes.
+
+The current capability API exposes subgroup voting but not shuffle support.
+Any subsequent exact-order shuffle probe must expose and check that capability,
+retain the ordinary tree fallback, and preserve head packing and uniform
+barrier admission. Do not infer its benefit from this smaller serial-tail
+probe. The five completed-step gates and performance-parity goal remain open.
 
 ## Inactive storage reads and worker participation
 

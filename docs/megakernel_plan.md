@@ -524,6 +524,14 @@ the descriptor-reference repair requires fresh measurements.
   6.43% lower absolute training time at 168 rather than 256 workers; normalized
   uncertainty includes no change. Keep explicit counts and the 256-worker
   primary gate, and preserve all 900 normal comparisons and 24 diagnostics.
+- [x] Test a serial tail for the common dQ/dKV reduction, keeping the exact
+  addition tree while removing two barriers. A symbolic source audit and all
+  correctness gates pass; emitted access guards and head packing are preserved.
+  Preserve 500 completed-step comparisons, ten diagnostics and four SDK backend
+  captures with bitwise within-backend state. Training measures 17.728→17.878 ms,
+  with uncertainty including no change. Warp instructions and shared wavefronts
+  fall only 1.05%, while barrier waiting stays near 64% of active warp cycles.
+  Revert the patch and rebuild the retained `e4e70c5` runtime.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
@@ -559,11 +567,17 @@ the descriptor-reference repair requires fresh measurements.
   The storage guard's training regression and the worker-count diagnostic
   support investigating concurrency costs, without attributing all delay to
   polling or residency. Simple leader-only polling does not resolve the gap.
+  Finishing the last three attention-reduction levels in lane zero removes two
+  barriers without a useful timing gain. Fresh retained control ratios are
+  1.357/1.231 forward/training. Preserve that rejected probe's exact-order and
+  generated-source audits; its small counter changes do not establish that
+  other synchronization is free or removable.
   Investigate exact-order subgroup reduction separately: dKV has
   eight workgroup barriers per query/head iteration. Preserve the reduction
   tree, masks, accumulation order and supported fallback in any such change.
   Check shuffle capability, exact addition order and fallback before emitting
-  new subgroup operations. Preserve head-axis packing and uniform-barrier
+  new subgroup operations; the current capability API exposes vote but not
+  shuffle support. Preserve head-axis packing and uniform-barrier
   admission when adding subgroup builtins; do not trade away the retained
   batching gains accidentally.
   Use `e4e70c5` as the next control and retain all completed-step gates;
