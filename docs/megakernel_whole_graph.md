@@ -25,6 +25,11 @@ removes two barriers while preserving the exact addition tree. Its 500 new
 comparisons establish no useful gain, so the patch is reverted. Fresh retained
 control ratios are 1.357× forward and 1.231× training.
 
+The [subgroup-shuffle experiment](#subgroup-attention-reduction) also preserves
+the exact tree, but has an unacceptable tradeoff: persistent training improves
+1.66% while ordinary training regresses 8.12%. It is reverted with its dependency
+changes. The newest retained-control ratios are 1.346× forward and 1.217× training.
+
 For model benchmarks, use `--whole-graph --workers 256`. The
 [current worker sweep](#worker-counts-and-deeper-scalar-staging) finds lower CI
 backward/SGD latency with an explicit 64-worker pool; no universal replacement
@@ -45,6 +50,109 @@ separate verified cgroup (16 GiB soft memory limit, 20 GiB hard limit, 1 GiB swa
 The GPU flag holds a shared file lock across command execution, so marked jobs
 cannot overlap. Library tests also use the GPU and need this flag. Builds use
 the same launcher without the GPU flag; finish them before primary measurements.
+
+## Subgroup attention reduction
+
+This rejected experiment replaces the common rowwise dQ/dKV reduction with a
+shuffle helper on devices reporting compute shuffle support and a nominal
+subgroup size of 32. The helper checks its runtime geometry, reads the first
+pair of operands from shared memory, and finishes the same ordered tree with
+subgroup shuffles. Other helper geometries use the original tree. Seven helper
+barriers become two; the caller's reuse barrier remains. Both ordinary and
+persistent paths receive the same module.
+
+The experiment adds a temporary Blade shuffle capability and corrects Naga's
+compute subgroup-size/count uniformity classification, preserving fragment
+subgroup-size nonuniformity. Partial head packing remains enabled, with the
+existing dense/full-subgroup admission checks. Logical lane numbering follows
+subgroup coordinates without assuming a relationship to physical local IDs.
+The symbolic source audit preserves all 64 leaves and 63 additions and checks
+active shuffle sources. Emitted-source auditing preserves the fallback exactly,
+all other handlers, globals, scheduler and completion accounting, and verifies
+the new lane mapping. All 102 storage-read sites remain guarded.
+
+An initial diagnostic capture caught a routing error: the rowwise scalar
+variant bypassed the new device-aware generator. Its shader remained unchanged,
+so those captures cannot measure this optimization. Fixing the actual route and
+adding a runtime-selection regression precede all timings below. The initial
+captures and qualification failures remain in the artifact record. A later
+text-audit failure is corrected by preserving field names during one-to-one
+local-variable renaming; the remaining statements compare exactly.
+
+The integrated candidate passes 673 library tests (eight ignored), 52 codegen
+tests, 168 strict whole-graph oracle tests, 50 matrix regressions, ten graph
+smoke tests, 22 attention references in each execution mode, Clippy, formatting
+and Metal compilation. Metal GPU execution remains unqualified. The mixed-head
+fixture preserves exact outputs with poisoned scratch, partial dimensions,
+three replays and 1/3/64/4096 workers.
+
+Naga passes 144 unit, 270 integration and six doctests (24 ignored), plus strict
+Clippy. The required full wgpu run has 1,145 passes, eight failures and six skips.
+Three missing-DXC failures pass after installing the compiler locally. The
+other five depth/stencil failures reproduce with identical error messages on
+the unchanged `bc7b70b` fork revision. The full wgpu suite is therefore not
+green. Tool-dependent SPIRV-Cross snapshot noise is archived and restored after
+checking that its SPIR-V inputs are unchanged.
+
+The primary sequence runs control, candidate, candidate, control, with 25 paired
+samples per case per visit: 500 comparisons. The control is retained runtime
+`e4e70c5`; requested workers remain 256. Every comparison passes the unchanged
+state budget and uses one persistent dispatch without fallback.
+
+| Case | Control persistent ms | Candidate ms | Candidate/control, 95% interval |
+|---|---:|---:|---:|
+| CI inference | 0.069025 | 0.069456 | 1.0062 (0.9823–1.0635) |
+| CI backward | 0.093316 | 0.093186 | 0.9986 (0.9924–1.0068) |
+| CI SGD | 0.096266 | 0.094736 | 0.9841 (0.9477–1.0003) |
+| Model forward | 5.163906 | 5.142052 | 0.9958 (0.9882–1.0056) |
+| Model training + SGD | 17.972040 | 17.674273 | 0.9834 (0.9692–0.9938) |
+
+Ordinary training regresses **14.695235→15.888007 ms**, ratio
+**1.0812 [1.0473, 1.0861]**. The apparent paired persistent/ordinary improvement,
+1.2170→1.1225, largely reflects a slower baseline. This is not an acceptable
+way to close the gap. Pooled bootstrap intervals do not capture all between-visit
+variation. CI and forward shaders/resources are unchanged, so their movement
+is not attributed to the patch.
+
+Training workers use 79 rather than 80 registers, retain 29,344 shared bytes,
+and shrink from 264,320 to 262,912 code bytes. Diagnostic participation remains
+252 workers in training and 168 in forward, with 256 requested. The two ordinary
+attention shaders instead use 40 registers each, previously 30/35; their shared
+allocations grow from 512 bytes each to 1,536/2,048 bytes. These compiler
+statistics describe an additional cost, but do not establish its elapsed-time
+contribution or an occupancy change. Native instructions are unavailable.
+
+Four complete-step SDK backend captures and sixteen metric groups confirm
+persistent replay **15.9159→15.6716 ms (−1.54%)**, versus ordinary
+**11.9885→12.8687 ms (+7.34%)**. Persistent estimated warp instructions fall
+2.43% and shared wavefronts 1.62%, while integer thread instructions rise 0.44%.
+Ordinary shared wavefronts fall 4.67%, but warp and integer thread instructions
+rise 2.54% and 4.97%. Fewer shared accesses and source barriers do not establish
+a net win. Barrier waiting changes 64.13→63.82% of active warp cycles in
+persistent execution and 5.39→8.13% in ordinary execution; these are not elapsed
+stall costs. Maximum clock and instruction-rate spreads across groups are
+0.401% and 0.411%.
+
+Independent hashing confirms bitwise-identical control/candidate state within
+each backend across all 246,883,105 floats. The backend hashes remain those
+recorded in the preceding experiment; cross-backend maximum error remains
+4.66e-9 under the unchanged budget. Cross-backend state is not bitwise identical.
+
+Revert the runtime, shader, Blade and Naga changes. Both rebuilt release
+benchmark binaries match the retained control byte for byte; the dependency
+lock is restored and both fork worktrees are clean. Preserve the candidate
+source, patches, binaries, raw samples, generated shaders and SDK states under
+local `target/attention-shuffle/` and `target/attention-shuffle-integrated/`.
+The manifest `target/megakernel-results/attention-shuffle/summary.json` contains
+846 independently verified artifact hashes and 74 recorded bounded cgroups;
+SHA-256 `353988b31267f56938642a0e2ba432f08e47a1cf980f4f2df40d1f5130668c23`.
+Every heavy job uses a separate verified 16/20/1 GiB cgroup; GPU jobs serialize,
+and builds or heavy analyses do not overlap measurements.
+
+Next, separate runtime subgroup-geometry overhead from the looped shuffle
+helper. A statically unrolled exact-order helper is a distinct candidate, not
+an established fix. Preserve the runtime fallback and all existing gates, and
+require ordinary execution to avoid regressions as well.
 
 ## Serial attention reduction tail
 

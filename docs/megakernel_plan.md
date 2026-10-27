@@ -532,6 +532,14 @@ the descriptor-reference repair requires fresh measurements.
   with uncertainty including no change. Warp instructions and shared wavefronts
   fall only 1.05%, while barrier waiting stays near 64% of active warp cycles.
   Revert the patch and rebuild the retained `e4e70c5` runtime.
+- [x] Test exact-order subgroup shuffles with an explicit Blade capability,
+  runtime geometry check, original-tree fallback and preserved partial head
+  packing. Correct Naga's compute subgroup-geometry uniformity classification
+  for the experiment. All graph correctness gates pass, including a regression
+  for the actual rowwise generation route. In 500 comparisons, persistent
+  training improves 1.66%, but ordinary training regresses 8.12%; SDK replay
+  confirms the tradeoff. Reject the common change, preserve the fork patches
+  and all evidence, and restore byte-identical retained benchmark binaries.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
@@ -572,14 +580,16 @@ the descriptor-reference repair requires fresh measurements.
   1.357/1.231 forward/training. Preserve that rejected probe's exact-order and
   generated-source audits; its small counter changes do not establish that
   other synchronization is free or removable.
-  Investigate exact-order subgroup reduction separately: dKV has
-  eight workgroup barriers per query/head iteration. Preserve the reduction
-  tree, masks, accumulation order and supported fallback in any such change.
-  Check shuffle capability, exact addition order and fallback before emitting
-  new subgroup operations; the current capability API exposes vote but not
-  shuffle support. Preserve head-axis packing and uniform-barrier
-  admission when adding subgroup builtins; do not trade away the retained
-  batching gains accidentally.
+  A subgroup-shuffle reduction removes five helper barriers, but makes ordinary
+  training materially slower while improving persistent training only 1.66%.
+  Its smaller persistent/ordinary ratio largely reflects the slower baseline.
+  Fresh retained control ratios are 1.346/1.217 forward/training. Separate
+  runtime subgroup-geometry overhead from the looped shuffle implementation;
+  test a statically unrolled exact-order helper as a distinct experiment.
+  Require ordinary execution to avoid regressions. Preserve the original-tree
+  fallback, head packing, masks, accumulation order and barrier admission.
+  Reapply the archived shuffle capability and Naga uniformity patches only with
+  qualification; neither dependency change is retained by the rejected probe.
   Use `e4e70c5` as the next control and retain all completed-step gates;
   instruction or traffic savings alone are insufficient retention evidence.
   Preserve initialization, writer ownership, publication, independent B storage
