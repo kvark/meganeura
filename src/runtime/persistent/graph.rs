@@ -716,7 +716,7 @@ impl Graph {
                 },
             ));
         }
-        let source = self.builder.source(&self.kernels, buffers.len());
+        let source = self.builder.source(&self.kernels, buffers.len())?;
         let key = SharedPipelineKey {
             context: Arc::as_ptr(&self.gpu) as usize,
             entry_point: "graph_main",

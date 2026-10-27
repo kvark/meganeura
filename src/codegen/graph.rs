@@ -75,6 +75,14 @@ struct Scratch {
     stride: u32,
 }
 
+impl Scratch {
+    fn guarded_count(&self) -> u32 {
+        // Reserve a read-only element outside every handler's scratch range,
+        // retaining the bank's 16-byte allocation granularity.
+        self.count + 16u32.div_ceil(self.stride)
+    }
+}
+
 pub(crate) struct Builder {
     pub threads: u32,
     pub parameter_words: usize,
@@ -99,7 +107,7 @@ impl Builder {
             + self
                 .scratch
                 .iter()
-                .map(|s| u64::from(s.count * s.stride))
+                .map(|s| u64::from(s.guarded_count() * s.stride))
                 .sum::<u64>()
     }
 
@@ -157,7 +165,9 @@ impl Builder {
                 else {
                     continue;
                 };
-                let mut source = candidate.source(std::slice::from_ref(&kernel), 1);
+                let Ok(mut source) = candidate.source(std::slice::from_ref(&kernel), 1) else {
+                    continue;
+                };
                 // Admission only: apply the scope-aware cooperative checker
                 // to barrier control, including helper arguments and locals.
                 for barrier in [
@@ -564,7 +574,7 @@ impl Builder {
         })
     }
 
-    pub fn source(&self, kernels: &[Kernel], count: usize) -> String {
+    pub fn source(&self, kernels: &[Kernel], count: usize) -> Result<String, String> {
         assert!(count > 0);
         let partial = kernels
             .iter()
@@ -591,15 +601,27 @@ impl Builder {
             writeln!(buffers, "struct GraphBuffer{i} {{ data: {} }}\nvar<storage, read_write> {}: binding_array<GraphBuffer{i}, {count}>;", view.ty, view.name).unwrap();
         }
         let mut shared = String::new();
+        let mut initialize = String::new();
         for (i, s) in self.scratch.iter().enumerate() {
             writeln!(
                 shared,
-                "var<workgroup> graph_scratch_{i}: array<{}, {}>;",
-                s.ty, s.count
+                "const graph_scratch_{i}_inactive: u32 = {}u;\nvar<workgroup> graph_scratch_{i}: array<{}, {}>;",
+                s.count, s.ty, s.guarded_count()
+            )
+            .unwrap();
+            writeln!(
+                initialize,
+                "graph_scratch_{i}[graph_scratch_{i}_inactive] = {}();",
+                s.ty
             )
             .unwrap();
         }
-        include_str!("../shaders/graph_worker.wgsl")
+        let initialize = if initialize.is_empty() {
+            initialize
+        } else {
+            format!("if physical_lane == 0u {{\n{initialize}}}\nworkgroupBarrier();")
+        };
+        let source = include_str!("../shaders/graph_worker.wgsl")
             .replace(
                 "$ENABLES",
                 &enables.into_iter().collect::<Vec<_>>().join("\n"),
@@ -607,6 +629,7 @@ impl Builder {
             .replace("$HANDLERS", &handlers)
             .replace("$BUFFERS", &buffers)
             .replace("$SHARED", &shared)
+            .replace("$SCRATCH_GUARD_INIT", &initialize)
             .replace(
                 "$PARTIAL_COMPLETION",
                 &if partial {
@@ -665,8 +688,98 @@ impl Builder {
                     .map(|k| k.case.as_str())
                     .collect::<Vec<_>>()
                     .join("\n"),
-            )
+            );
+        guard_scratch_reads(&source)
     }
+}
+
+// Inactive groups still reach workgroup barriers, but must not read an active
+// group's in-place updates. Select a reserved element in the load's address;
+// selecting the loaded value would still perform the conflicting access.
+fn guard_scratch_reads(source: &str) -> Result<String, String> {
+    let module =
+        naga::front::wgsl::parse_str(source).map_err(|error| error.emit_to_string(source))?;
+    let info = tile::validate(&module)?;
+    let mut replacements = Vec::new();
+    for (handle, function) in module.functions.iter() {
+        let Some((index, _)) = function
+            .name
+            .as_deref()
+            .and_then(|name| name.strip_prefix("graph_handler_"))
+            .and_then(|name| name.split_once('_'))
+        else {
+            continue;
+        };
+        let prefix = format!("graph_handler_{index}_active_lane");
+        let Some(active) = function
+            .arguments
+            .iter()
+            .filter_map(|a| a.name.as_deref())
+            .find(|name| name.starts_with(&prefix))
+        else {
+            continue;
+        };
+        for (value, expression) in function.expressions.iter() {
+            let naga::Expression::Load { pointer } = *expression else {
+                continue;
+            };
+            if !matches!(
+                info[handle][pointer].ty.inner_with(&module.types),
+                TypeInner::Pointer {
+                    space: AddressSpace::WorkGroup,
+                    ..
+                } | TypeInner::ValuePointer {
+                    space: AddressSpace::WorkGroup,
+                    ..
+                }
+            ) {
+                continue;
+            }
+            let range = function
+                .expressions
+                .get_span(value)
+                .to_range()
+                .ok_or("missing scratch load span")?;
+            let read = &source[range.clone()];
+            let open = read.find('[').ok_or("scratch load has no index")?;
+            let bank = &read[..open];
+            if !bank.starts_with("graph_scratch_") {
+                return Err("unrecognized shared load".into());
+            }
+            let mut depth = 1;
+            let close = read[open + 1..]
+                .char_indices()
+                .find_map(|(i, c)| {
+                    if c == '[' {
+                        depth += 1;
+                    }
+                    if c == ']' {
+                        depth -= 1;
+                    }
+                    (depth == 0).then_some(open + 1 + i)
+                })
+                .ok_or("unterminated scratch load index")?;
+            replacements.push((
+                range,
+                format!(
+                    "{bank}[select({bank}_inactive, {}, {active})]{}",
+                    &read[open + 1..close],
+                    &read[close + 1..]
+                ),
+            ));
+        }
+    }
+    replacements.sort_by_key(|replacement| replacement.0.start);
+    for pair in replacements.windows(2) {
+        if pair[0].0.end > pair[1].0.start {
+            return Err("overlapping scratch loads".into());
+        }
+    }
+    let mut result = source.to_owned();
+    for (range, replacement) in replacements.into_iter().rev() {
+        result.replace_range(range, &replacement);
+    }
+    Ok(result)
 }
 
 fn offset_scratch(
@@ -797,6 +910,143 @@ fn uniform_value(
 #[cfg(test)]
 mod tests {
     use super::{Builder, tile};
+
+    #[test]
+    fn inactive_scratch_reads_use_reserved_addresses() {
+        use naga::{AddressSpace, ArraySize, Expression, TypeInner};
+
+        let source = r#"
+            var<workgroup> scratch: array<vec2<f32>, 4>;
+            var<workgroup> scalar: f32;
+            var<storage, read_write> output: array<f32>;
+            fn reduce(lane: u32, other_active_lane: bool) {
+                if lane < 2u && other_active_lane {
+                    scratch[lane] += scratch[lane + 2u];
+                }
+            }
+            @compute @workgroup_size(4)
+            fn main(@builtin(local_invocation_index) lane: u32,
+                    @builtin(workgroup_id) group: vec3<u32>) {
+                scratch[lane] = vec2<f32>(f32(lane));
+                if lane == 0u { scalar = 1.0; }
+                workgroupBarrier();
+                reduce(lane, true);
+                workgroupBarrier();
+                if lane == 0u { output[group.x] = scratch[0].x + scalar; }
+            }
+        "#;
+        let layout = blade_graphics::ShaderDataLayout {
+            bindings: vec![("output", blade_graphics::ShaderBinding::Buffer)],
+        };
+        // Both an unpacked smaller handler and a three-tile batch leave
+        // physical groups inactive. A later handler grows the pooled banks.
+        for width in [1, 3] {
+            let mut builder = Builder::new(16);
+            builder.batch_limit = width;
+            let body = tile::from_module(source, "main").unwrap();
+            let mut kernels = vec![
+                builder
+                    .add(body.clone(), &layout, 0, &[[3, 1, 1]], false)
+                    .unwrap(),
+            ];
+            builder.batch_limit = 4;
+            kernels.push(builder.add(body, &layout, 1, &[[4, 1, 1]], false).unwrap());
+            let generated = builder.source(&kernels, 1).unwrap();
+            let module = naga::front::wgsl::parse_str(&generated).unwrap();
+            let info = tile::validate(&module).unwrap();
+            let mut reads = 0;
+            for (handle, function) in module.functions.iter() {
+                if !function.arguments.iter().any(|argument| {
+                    argument
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.contains("_active_lane"))
+                }) {
+                    continue;
+                }
+                for (_, expression) in function.expressions.iter() {
+                    let Expression::Load { mut pointer } = *expression else {
+                        continue;
+                    };
+                    if !matches!(
+                        info[handle][pointer].ty.inner_with(&module.types),
+                        TypeInner::Pointer {
+                            space: AddressSpace::WorkGroup,
+                            ..
+                        } | TypeInner::ValuePointer {
+                            space: AddressSpace::WorkGroup,
+                            ..
+                        }
+                    ) {
+                        continue;
+                    }
+                    // A component access may follow the protected array index.
+                    while let Expression::AccessIndex { base, .. } = function.expressions[pointer] {
+                        pointer = base;
+                    }
+                    let Expression::Access { base, index } = function.expressions[pointer] else {
+                        panic!("scratch load lacks a guarded array index");
+                    };
+                    let Expression::GlobalVariable(global) = function.expressions[base] else {
+                        panic!()
+                    };
+                    let Expression::Select {
+                        condition, reject, ..
+                    } = function.expressions[index]
+                    else {
+                        panic!("inactive scratch load still addresses an active bank");
+                    };
+                    let Expression::FunctionArgument(argument) = function.expressions[condition]
+                    else {
+                        panic!()
+                    };
+                    assert!(
+                        function.arguments[argument as usize]
+                            .name
+                            .as_ref()
+                            .unwrap()
+                            .contains("_active_lane")
+                    );
+                    assert!(
+                        function.arguments[argument as usize]
+                            .name
+                            .as_ref()
+                            .unwrap()
+                            .starts_with("graph_handler_")
+                    );
+                    let Expression::Constant(constant) = function.expressions[reject] else {
+                        panic!()
+                    };
+                    let name = module.global_variables[global].name.as_ref().unwrap();
+                    assert_eq!(
+                        module.constants[constant].name.as_deref(),
+                        Some(format!("{name}_inactive").as_str())
+                    );
+                    let Expression::Literal(naga::Literal::U32(reserved)) =
+                        module.global_expressions[module.constants[constant].init]
+                    else {
+                        panic!()
+                    };
+                    let bank: usize = name
+                        .strip_prefix("graph_scratch_")
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    assert_eq!(reserved, builder.scratch[bank].count);
+                    let TypeInner::Array {
+                        size: ArraySize::Constant(count),
+                        ..
+                    } = module.types[module.global_variables[global].ty].inner
+                    else {
+                        panic!()
+                    };
+                    assert!(reserved < count.get());
+                    reads += 1;
+                }
+            }
+            assert_eq!(reads, 8); // Four loads per handler, including helper and scalar.
+        }
+    }
 
     #[test]
     fn packing_rejects_query_dependent_barrier_loops() {
@@ -943,10 +1193,69 @@ mod tests {
         );
         assert_eq!(kernels.last().unwrap().batch_size, 4);
         assert!(builder.views.len() > 1);
-        let source = builder.source(&kernels, 6);
+        let source = builder.source(&kernels, 6).unwrap();
         assert!(!source.contains("graph_packing_sync_probe"));
         let mut module = naga::front::wgsl::parse_str(&source)
             .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));
+        fn check_cooperative_reads(
+            block: &naga::Block,
+            function: &naga::Function,
+            active: bool,
+        ) -> usize {
+            let mut reads = 0;
+            for statement in block.iter() {
+                match *statement {
+                    naga::Statement::Emit(ref range) => {
+                        for value in range.clone() {
+                            if matches!(
+                                function.expressions[value],
+                                naga::Expression::CooperativeLoad { .. }
+                            ) {
+                                assert!(active, "inactive subgroup can load cooperative scratch");
+                                reads += 1;
+                            }
+                        }
+                    }
+                    naga::Statement::If {
+                        condition,
+                        ref accept,
+                        ref reject,
+                    } => {
+                        let guarded = match function.expressions[condition] {
+                            naga::Expression::FunctionArgument(index) => function.arguments
+                                [index as usize]
+                                .name
+                                .as_deref()
+                                .is_some_and(|name| name.contains("_active_lane")),
+                            _ => false,
+                        };
+                        reads += check_cooperative_reads(accept, function, active || guarded);
+                        reads += check_cooperative_reads(reject, function, active);
+                    }
+                    naga::Statement::Block(ref block) => {
+                        reads += check_cooperative_reads(block, function, active)
+                    }
+                    naga::Statement::Loop {
+                        ref body,
+                        ref continuing,
+                        ..
+                    } => {
+                        reads += check_cooperative_reads(body, function, active);
+                        reads += check_cooperative_reads(continuing, function, active);
+                    }
+                    _ => {}
+                }
+            }
+            reads
+        }
+        assert!(
+            module
+                .functions
+                .iter()
+                .map(|(_, function)| { check_cooperative_reads(&function.body, function, false) })
+                .sum::<usize>()
+                > 0
+        );
         let mut binding_map = naga::back::spv::BindingMap::default();
         for (handle, global) in module.global_variables.iter_mut() {
             if matches!(

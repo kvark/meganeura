@@ -73,6 +73,7 @@ fn graph_claim(worker: u32, lane: u32) -> vec4<u32> {
 fn graph_main(@builtin(local_invocation_index) physical_lane: u32,
               @builtin(workgroup_id) worker: vec3<u32>$SUBGROUPS) {
     $GEOMETRY
+    $SCRATCH_GUARD_INIT
     loop {
         let ticket = graph_claim(worker.x, physical_lane);
         if ticket.x == 0xfffffffeu { return; }

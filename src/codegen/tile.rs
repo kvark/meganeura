@@ -83,6 +83,14 @@ pub(crate) fn mask_extra_lanes(mut tile: Tile, physical_threads: u32) -> Result<
             .append(Expression::FunctionArgument(index + 1), Span::UNDEFINED);
         append_call_arguments(&mut function.body, &[condition, group]);
         mask_writes(&mut function.body, condition, &info[handle], &module.types)?;
+        for (value, expression) in function.expressions.iter() {
+            if matches!(expression, Expression::CooperativeLoad { .. }) {
+                function.named_expressions.insert(
+                    value,
+                    format!("{PREFIX}memory_read_{}_value", value.index()),
+                );
+            }
+        }
         if tile.cooperative == Some(naga::CooperativeScope::Subgroup) {
             let mut products = HashMap::new();
             collect_products(&function.body, &function.expressions, &mut products);
@@ -112,11 +120,90 @@ pub(crate) fn mask_extra_lanes(mut tile: Tile, physical_threads: u32) -> Result<
         var.name = Some(temporary);
     }
     let info = validate(&module)?;
-    let source =
-        naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty())
-            .map_err(|error| format!("worker lane adaptation: {error}"))?;
+    let source = naga::back::wgsl::write_string(
+        &module,
+        &info,
+        naga::back::wgsl::WriterFlags::EXPLICIT_TYPES,
+    )
+    .map_err(|error| format!("worker lane adaptation: {error}"))?;
+    let source = mask_cooperative_loads(&source)?;
     tile.source = rename_tokens(&source, &names).replace(PREFIX, "$PREFIX");
     Ok(tile)
+}
+
+// Cooperative loads span multiple elements, so they cannot use the scalar
+// read-only slot reserved by graph::Builder. Skip them in inactive subgroups;
+// workgroup-scoped cooperative operations are rejected above.
+fn mask_cooperative_loads(source: &str) -> Result<String, String> {
+    let module =
+        naga::front::wgsl::parse_str(source).map_err(|error| error.emit_to_string(source))?;
+    let info = validate(&module)?;
+    let mut replacements = Vec::new();
+    for (handle, function) in module.functions.iter() {
+        let active = function
+            .arguments
+            .iter()
+            .filter_map(|a| a.name.as_deref())
+            .find(|name| name.starts_with(&format!("{PREFIX}active_lane")))
+            .ok_or("missing lane activity argument")?;
+        for (value, expression) in function.expressions.iter() {
+            let pointer = match *expression {
+                Expression::CooperativeLoad { ref data, .. } => data.pointer,
+                _ => continue,
+            };
+            if !matches!(
+                info[handle][pointer].ty.inner_with(&module.types),
+                TypeInner::Pointer {
+                    space: AddressSpace::WorkGroup,
+                    ..
+                } | TypeInner::ValuePointer {
+                    space: AddressSpace::WorkGroup,
+                    ..
+                }
+            ) {
+                continue;
+            }
+            let span = function
+                .expressions
+                .get_span(value)
+                .to_range()
+                .ok_or("missing memory load span")?;
+            let start = source[..span.start].rfind('\n').map_or(0, |i| i + 1);
+            let end = source[span.end..]
+                .find('\n')
+                .map_or(source.len(), |i| span.end + i);
+            let line = source[start..end].trim();
+            let (binding, load) = line
+                .strip_prefix("let ")
+                .and_then(|s| s.strip_suffix(';'))
+                .and_then(|s| s.split_once(" = "))
+                .ok_or_else(|| format!("memory load is not a materialized let: {line}"))?;
+            let (_, ty) = binding
+                .split_once(':')
+                .ok_or("memory load has no explicit type")?;
+            replacements.push((
+                start..end,
+                format!(
+                    "var {PREFIX}read_{}_value: {};\nif {active} {{ {PREFIX}read_{}_value = {load}; }}\nlet {binding} = {PREFIX}read_{}_value;",
+                    value.index(),
+                    ty.trim(),
+                    value.index(),
+                    value.index(),
+                ),
+            ));
+        }
+    }
+    replacements.sort_by_key(|replacement| replacement.0.start);
+    for pair in replacements.windows(2) {
+        if pair[0].0.end > pair[1].0.start {
+            return Err("overlapping memory load statements".into());
+        }
+    }
+    let mut result = source.to_owned();
+    for (range, replacement) in replacements.into_iter().rev() {
+        result.replace_range(range, &replacement);
+    }
+    Ok(result)
 }
 
 // Cooperative products assigned back to a local accumulator can be skipped by
