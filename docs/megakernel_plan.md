@@ -854,10 +854,22 @@ the descriptor-reference repair requires fresh measurements.
   adds eight queue bytes. Preserve all eight SDK states, 32 metric groups,
   542 verified artifact hashes and 43 completed cgroups. See the
   [summary evidence](megakernel_whole_graph.md#advisory-ready-word-summary).
-  Next, test reducing summary-maintenance RMWs and adjusting hint publication
-  relative to the existing release fence. Preserve the authoritative fallback,
-  payload ordering, all requested workers and full measurement gates. Increased
-  atomic traffic is a target to investigate, not an assumed timing bottleneck.
+  Test reducing summary-maintenance RMWs and adjusting hint publication relative
+  to the existing release fence. Early publication without empty-word clears
+  leaves GPU diagnostics flat; guarded RMWs regress forward 0.90% and training
+  0.17%. Four training SDK backend captures show 5.56% fewer global atomic
+  sectors, nearly unchanged L2 atomic traffic and no useful replay gain. Revert
+  both probes after 100 diagnostics, exact shader audits, codegen/smoke checks
+  and state validation. Preserve 761 verified artifact hashes and 31 completed
+  cgroups; restore twenty source/dependency hashes, both qualified binaries and
+  fourteen smoke tests. No normal completed-step series or full qualification
+  is claimed for these rejected probes. See the
+  [maintenance evidence](megakernel_whole_graph.md#advisory-summary-maintenance-controls).
+  Next, simplify hint traversal when the summary fits one word (33–1,024 nodes),
+  preserving the general larger-graph path, cyclic preference, full fallback,
+  payload ordering and all requested workers. This tests the new summary scan,
+  rather than repeating the earlier bitmap-width constant probe. Keep all
+  completed-step gates; reduced code or traffic alone is insufficient evidence.
   Keep the short-K AT gap as an unresolved target without repeating rejected
   tile selectors or delaying optimizer eligibility.
   Do not sum overlapping spans or infer a memory bottleneck from traffic alone.

@@ -23,6 +23,12 @@ Current paired persistent/ordinary medians are **1.289× forward / 1.052× train
 or **1.300× / 1.139×** prewarmed. All requested workers remain enabled; baseline
 parity remains unmet.
 
+Two subsequent [summary-maintenance controls](#advisory-summary-maintenance-controls)
+establish no gain. Moving hint publication earlier while removing empty-word
+clears leaves GPU diagnostics flat. Guarding redundant RMWs reduces estimated
+global atomic sectors by 5.56%, but L2 atomic traffic and SDK training replay
+remain nearly unchanged. Both probes are reverted; `c3ad104` remains qualified.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -300,11 +306,97 @@ All heavy jobs use verified 16/20/1 GiB memory-high/hard/swap limits; GPU jobs a
 serialized, and builds/copies/heavy analysis stay outside measurements. All
 launched jobs finish. Both compiler forks remain clean and unchanged.
 
-Next, test reducing advisory summary-maintenance RMWs, including publication
-placement relative to the existing release fence. Preserve the authoritative
-fallback, payload ordering, all requested workers and the full qualification
-protocol. Increased atomic traffic is an investigation target, not proof that
-removing it will improve timing.
+The subsequent [maintenance controls](#advisory-summary-maintenance-controls)
+test that extra atomic traffic directly, without establishing a useful gain.
+
+## Advisory summary maintenance controls
+
+Starting from `1548824`, both controls use qualified runtime `c3ad104` and its
+frozen `target/ready-word-summary/final-*` binaries. The first moves successor
+hint publication ahead of the existing ready-bit release fence and removes
+empty-word hint clears. The unique last-ready-bit clear and fallback repairs
+remain. The second restores the original publication order, then guards
+empty-word clears, fallback repairs and successor hint sets with an atomic load
+of the hint bit. It leaves the unique last-ready-bit clear unconditional.
+
+Hints remain advisory, including when a guard races and skips an update. Every
+authoritative bitmap, tile-counter, dependency and epoch operation retains its
+relative order, as do payload fences. The full scan remains mandatory before
+caching an empty epoch. No worker is retired or capped, and no compiler-fork
+change is involved.
+
+Each host checker passes 30,948 ready/hint/worker states and 7,295 segmented
+scan-boundary cases. The first also checks forty publication/clear schedules
+across the two policies: the simplified model sees more missing-hint outcomes
+with early publication, eight versus two. The second enumerates twelve guarded
+set/clear interleavings, including skipped updates. These are not complete Vulkan
+memory-model proofs and establish no stronger hint consistency guarantee.
+
+Both candidates pass the release benchmark build, formatting, **52 codegen
+checks and fourteen whole-graph smoke tests**, including 1,024/1,025-node summary
+boundaries and 1/3/256/4096-worker replays. Each has fifty diagnostic comparisons
+over all five CI/model cases, with 256 requested workers and matched 100 ms
+prewarming. All state, selection, completion, single-dispatch and no-fallback
+checks pass; maximum model error is 4.66e-9.
+
+Exact source inverses cover both changed model shaders. Only `graph_claim_word`
+and `graph_main` change; all handlers, nineteen CI shaders and forty ordinary
+model shaders stay exact. Queue and payload allocations do not change. Both
+model phases retain 86/84 registers, 18,928/29,344 shared bytes, 168 participating
+workers and 22,042/83,312 logical tiles. Code size changes −128/−256 bytes for
+early publication, and +256/+256 bytes for guarded RMWs.
+
+| Five-pair GPU diagnostic median | Qualified control | Candidate | Change |
+|---|---:|---:|---:|
+| Early publication: forward | 4.081536 ms | 4.084448 ms | +0.07% |
+| Early publication: training | 12.736928 ms | 12.729952 ms | −0.05% |
+| Guarded RMWs: forward | 4.073088 ms | 4.109792 ms | +0.90% |
+| Guarded RMWs: training | 12.736192 ms | 12.757504 ms | +0.17% |
+
+Ordinary GPU changes remain within 0.19%. Neither candidate passes this initial
+timing screen. No normal completed-step series or full library/oracle/Metal
+qualification is claimed for either rejected candidate.
+
+Four matched training SDK backend captures collect sixteen metric groups for
+the guarded candidate. Replay changes **13.043040→13.074000 ms (+0.24%)**
+persistent, versus **11.694901→11.720792 ms (+0.22%)** ordinary. Estimated global
+atomic sectors fall **259,564→245,135 (−5.56%)**, while L2 atomic sectors change
+**243,661→243,109 (−0.23%)**. This does not establish summary-maintenance traffic
+as a useful timing target. It also does not isolate the cost of every remaining
+queue operation.
+
+Estimated warp/integer/FP32 work and global loads all shift about −0.5%, which
+should not be interpreted as a selective arithmetic reduction. Barrier waiting
+changes **45.31→45.48% of active warp cycles**; active compute warps stay near
+32.6% of peak, with no local traffic. Counter rates multiplied by replay duration
+are estimates, and barrier share is not an elapsed-time fraction. Maximum
+between-group clock/instruction-rate spreads are 0.44%/0.71%; all groups collect
+at least 100 post-warmup samples and pass adapter/exit validation.
+
+All four actual exported training states contain **246,883,105 floats** each.
+Control and candidate match bit-for-bit within each backend: ordinary SHA-256
+`f67022044ae8966ac48c5d62cd0907411fb42f4d1864c1ba0b3d555b17ce7be0`, persistent
+`1e359875fa92965d4b0aa9026c050702ae3ac165aa59c0a4cc74a6381589c3b7`.
+Cross-backend states pass the numerical budget but are not bit-identical. SDK
+training uses zero-rate SGD for stable replay; no forward SDK capture is claimed.
+
+Both probes are reverted. All **twenty source/dependency hashes**, both qualified
+benchmark executable hashes and fourteen restored smoke tests match the retained
+runtime. Evidence stays local in `target/ready-summary-maintenance/` and
+`target/ready-summary-guarded-rmw/`. Manifest
+`target/megakernel-results/ready-summary-maintenance/summary.json` independently
+verifies **761 artifact hashes and 31 completed study cgroups**, SHA-256
+`31509e91a8fe9d43fb40ffdb6f9fbe744252f58b289e78291aa0369bf498ca3a`.
+Peak recorded memory is **4,715,696,128 bytes**, with zero memory-limit events.
+All heavy jobs use the verified 16/20/1 GiB cgroup limits, GPU runs are serialized,
+and all launched jobs finish. Both compiler forks remain clean and unchanged.
+
+Next, test simplifying the hint traversal when the whole summary fits one word
+(33–1,024 graph nodes), retaining the general path for larger graphs. This is a
+new control of the summary scan, distinct from the earlier rejected bitmap-width
+specialization. Preserve cyclic preference, the authoritative fallback and all
+completed-step gates; a smaller loop alone is insufficient retention evidence.
+The short-K transposed-A gap also remains unresolved. Baseline parity is unmet.
 
 ## Completion-epoch control on the current runtime
 
