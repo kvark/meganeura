@@ -6,6 +6,68 @@ fn session_whole_graph_narrow_scalar_tiles() {
     check_scalar_tile_edges(true);
 }
 
+#[test]
+fn session_whole_graph_narrow_transposed_tiles() {
+    let gpu = crate::support::gpu::gpu();
+    let supports_graph = gpu.capabilities().device_memory_fence && gpu.capabilities().binding_array;
+    let (m, n, k) = (35, 1025, 263);
+    let mut graph = meganeura::Graph::new();
+    let a = graph.input("a", &[m, k]);
+    let b = graph.input("b", &[n, k]);
+    let y = graph.matmul_bt(a, b);
+    graph.set_outputs(vec![y]);
+    let references = [3, 7].map(|seed| {
+        let values = |len, salt| {
+            (0..len)
+                .map(|i| ((i * seed + salt) % 7) as f32 / 32.0 - 3.0 / 32.0)
+                .collect::<Vec<_>>()
+        };
+        let av = values(m * k, 1);
+        let bv = values(n * k, 2);
+        let mut expected = vec![0.0; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                for inner in 0..k {
+                    expected[row * n + col] += av[row * k + inner] * bv[col * k + inner];
+                }
+            }
+        }
+        (av, bv, expected)
+    });
+    for workers in [0, 1, 3, 256, 4096] {
+        if workers != 0 && !supports_graph {
+            continue;
+        }
+        let mut config = meganeura::SessionConfig::inference_from_env_on(gpu.clone());
+        config.optimize.mode = meganeura::OptimizeMode::Off;
+        config.tune = false;
+        config.runtime.coop = meganeura::CoopPolicy::Disabled;
+        config.runtime.poison = true;
+        config.runtime.persistent = (workers != 0).then_some(meganeura::PersistentOptions {
+            workers,
+            device_scheduling: true,
+            whole_graph: true,
+            allow_fallback: false,
+            track_workers: true,
+        });
+        let mut session = meganeura::build(&graph, config).0;
+        let dispatch = &session.plan().dispatches[0];
+        assert_eq!(dispatch.kernel, meganeura::compile::Kernel::SmallTile);
+        assert_eq!(dispatch.workgroups, [33, 2, 1]);
+        for (av, bv, expected) in &references {
+            session.set_input("a", av);
+            session.set_input("b", bv);
+            session.step();
+            session.wait();
+            if workers != 0 {
+                check_worker_tasks(&mut session);
+                assert_eq!(session.execution_report().compute_dispatches, 1);
+            }
+            assert_eq!(&session.read_output(m * n), expected, "workers={workers}");
+        }
+    }
+}
+
 fn check_scalar_tile_edges(transposed_b: bool) {
     let gpu = crate::support::gpu::gpu();
     let supports_graph = gpu.capabilities().device_memory_fence && gpu.capabilities().binding_array;

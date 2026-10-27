@@ -678,12 +678,19 @@ the descriptor-reference repair requires fresh measurements.
   allocation. Both follow-ups are archived after 125 diagnostic comparisons;
   retain the existing Naga API and qualified runtime. See the
   [epoch state and fence controls](megakernel_whole_graph.md#epoch-state-and-directional-fence-controls).
-  Next, recover the forward regression and reduce the expensive narrow matrix
-  stages while preserving all five acceptance cases. Keep the five-case primary gate and
+  The shared matrix selector now exposes 128 rather than 32 tiles for sixteen
+  narrow backward products, reusing the existing 32×32 kernel. Another 1,000
+  completed-step comparisons improve training 3.7% under the original protocol
+  and 1.9% with prewarming; SDK replay improves 3.6%. All other measured shaders
+  remain unchanged, and both forks keep their existing interfaces. See the
+  [narrow transposed-B qualification](megakernel_whole_graph.md#narrow-transposed-b-tile-selection).
+  Next, test finer tiles for the remaining 46-tile `50x720x4096` backward stages
+  and recover the forward regression while preserving all five acceptance cases.
+  Keep the five-case primary gate and
   add matched `--prewarm-ms 100` controls. Preserve all samples, state checks,
   requested workers and acceptance budgets; changed cache/power state is not a
   runtime optimization.
-  Use the qualified multiword epoch policy as the next control and retain all completed-step gates;
+  Use the qualified narrow transposed-B policy as the next control and retain all completed-step gates;
   instruction or traffic savings alone are insufficient retention evidence.
   Preserve initialization, writer ownership, publication, independent B storage
   and every logical tile's arithmetic and completion accounting.

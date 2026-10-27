@@ -237,13 +237,22 @@ impl Family for Path {
                 }
             }
             Path::SmallTile => {
+                // Narrow transposed products can leave most of the device idle
+                // with 64-wide tiles. Use the existing smaller scalar kernel
+                // for substantial dot products, keeping cooperative preference
+                // and explicit schedules authoritative.
                 if problem.pinned {
                     Err("the kernel is fixed by a schedule or storage policy")
                 } else if problem.reduced_storage {
                     Err("packed weights keep their compiled kernel")
                 } else if problem.layout.transposed_with_addend() {
                     Err("no 32-wide kernel for transposed products with an addend")
-                } else if problem.compiled_workgroups >= SMALL_TILE_BELOW_WORKGROUPS {
+                } else if problem.compiled_workgroups >= SMALL_TILE_BELOW_WORKGROUPS
+                    && !(problem.layout == Layout::TransposedB
+                        && problem.m <= 64
+                        && problem.k >= 256
+                        && problem.compiled_workgroups < 128)
+                {
                     Err("64-wide tiles already occupy the device")
                 } else {
                     Ok(())
@@ -394,6 +403,51 @@ mod tests {
         }
         assert_eq!(select(&product(4096, 4096, 64), &bare), Path::Compiled);
         assert_eq!(select(&product(64, 64, 64), &bare), Path::SmallTile);
+    }
+
+    #[test]
+    fn narrow_transposed_products_keep_storage_and_schedule_constraints() {
+        let bare = Target {
+            cooperative: None,
+            allow_raw_f16: false,
+        };
+        let narrow = Problem::plain(Layout::TransposedB, [50, 2048, 720], false);
+        assert_eq!(select(&narrow, &bare), Path::SmallTile);
+        for (m, n, k, expected) in [
+            (64, 1024, 256, Path::SmallTile),
+            (64, 8128, 256, Path::SmallTile),
+            (64, 8192, 256, Path::Compiled),
+            (65, 2048, 720, Path::Compiled),
+            (50, 2048, 255, Path::Compiled),
+        ] {
+            let p = Problem::plain(Layout::TransposedB, [m, n, k], false);
+            assert_eq!(select(&p, &bare), expected, "{m}x{n}x{k}");
+        }
+        for p in [
+            Problem {
+                pinned: true,
+                ..narrow
+            },
+            Problem {
+                reduced_storage: true,
+                ..narrow
+            },
+            Problem {
+                layout: Layout::Plain,
+                ..narrow
+            },
+            Problem {
+                layout: Layout::TransposedA,
+                ..narrow
+            },
+            Problem {
+                layout: Layout::TransposedBAdd,
+                ..narrow
+            },
+        ] {
+            assert_eq!(select(&p, &bare), Path::Compiled);
+        }
+        assert_eq!(select(&narrow, &target(&F32)), Path::Cooperative);
     }
 
     #[test]

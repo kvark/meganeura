@@ -13,13 +13,18 @@ including read-only views that may alias writable bindings. It retains the
 preceding scratch-read repair and packing optimizations. Passing numerical
 tests alone did not reveal these extra inactive accesses.
 
-The latest [completion-epoch policy](#completion-gated-idle-scans) waits on one
-counter between empty scans of a multiword bitmap. Across 1,000 completed-step
-comparisons, training improves 7.0% with the original protocol and 5.5% with
-matched prewarming. Original-protocol forward regresses 1.05%; the prewarmed
-forward interval includes no change. Current paired persistent/ordinary medians
-are 1.380× forward and 1.134× training, or 1.379×/1.285× with prewarming.
-All requested workers remain live until completion. Baseline parity remains unmet.
+The latest [narrow transposed-B selection](#narrow-transposed-b-tile-selection)
+uses existing 32×32 scalar tiles to expose more independent backward work.
+Across 1,000 completed-step comparisons, training improves 3.7% with the original
+protocol and 1.9% with matched prewarming. Forward and CI shaders are unchanged.
+Current paired persistent/ordinary medians are 1.357× forward and 1.111× training,
+or 1.403×/1.233× with prewarming. All requested workers remain enabled.
+Baseline parity remains unmet.
+
+The preceding [completion-epoch policy](#completion-gated-idle-scans) waits on
+one counter between empty scans of a multiword bitmap. Its separate comparison
+improves training 7.0%/5.5%, with a 1.05% original-protocol forward regression.
+The new matrix selection does not resolve that forward tradeoff.
 
 The earlier storage repair's 500 primary comparisons measure a 5.58% absolute training regression
 from the storage repair. Paired persistent/ordinary medians are 1.355× forward
@@ -82,6 +87,104 @@ cannot overlap. Library tests also use the GPU and need this flag. Builds use
 the same launcher without the GPU flag; finish them before primary measurements.
 The launcher now records memory peaks, limit events and memory/CPU/I/O pressure
 after each job, preserving the target's exit status and forwarding termination.
+
+## Narrow transposed-B tile selection
+
+The shared matrix family now admits its existing 32×32 scalar kernel for
+unpinned F32 transposed-B products with at most 64 rows, K≥256 and fewer than
+128 original 64×64 workgroups. The existing small-grid rule remains in place;
+cooperative preference, reduced storage and explicit schedules keep their
+precedence. Transposed products with an addend retain their existing kernel.
+No shader template, arithmetic mode, queue protocol, fence, dependency, access
+guard or compiler fork changes.
+
+In SmolVLA training, exactly sixteen `MatMulBT[50x2048x720]` nodes change from
+32 to 128 logical tiles. Each valid output retains its K accumulation order.
+Long reductions retain their original split count, partial storage and SumRows
+parameters; the selected tile geometry can change within those partitions.
+The complete step now counts 81,360 logical tiles, up from 79,824, while keeping
+the same nodes, buffer allocation, queue bytes, one dispatch and one submission.
+All 256 workers remain requested. Both backends select the same implementations.
+
+The training pipeline reuses an existing small-tile handler and drops the
+unused large-tile variant. Registers remain **82**, shared storage remains
+**29,344 bytes**, participating workers remain **168**, and code shrinks
+264,704→249,088 bytes. Forward remains 86 registers and 18,928 shared bytes.
+All nineteen CI shader sources and all model sources except the training graph
+and its now-unused ordinary large-tile module are byte-identical. Geometry,
+padded arithmetic and compiled-handler composition change together; the study
+does not isolate their individual contributions or measure per-node residency.
+
+The primary gate compares qualified `6fd43c8` binaries with the fully tested
+candidate on source base `89a49d5`. Control/candidate/candidate/control visits
+retain 25 interleaved pairs per case, at least ten warmups/one second and the
+256-worker gate. **500 original-protocol and 500 prewarmed comparisons** pass
+all full-state budgets, matching backend selection, task accounting, one-dispatch
+and no-fallback checks. Maximum model error remains 4.66e-9. Prewarming is the
+same supplemental 100 ms control and remains off by default.
+
+| Completed-step measurement | Control, ms | Candidate, ms | Candidate/control, bootstrap 95% interval |
+|---|---:|---:|---:|
+| Original forward | 5.203167 | 5.227358 | 1.0046 [0.9969, 1.0137] |
+| Original training + SGD | 17.042129 | 16.412600 | 0.9631 [0.9490, 0.9855] |
+| Prewarmed forward | 5.176952 | 5.133936 | 0.9917 [0.9370, 1.0012] |
+| Prewarmed training + SGD | 15.006357 | 14.719415 | 0.9809 [0.9650, 0.9836] |
+
+Training's normalized ratios also improve: **0.9777 [0.9570, 0.9912]** original
+and **0.9775 [0.9717, 0.9990]** prewarmed. Ordinary training medians change
+15.025→14.906 ms and 12.133→11.714 ms respectively. Normalized results use
+medians of paired ratios, not ratios of aggregate medians. Pooled bootstrap
+intervals do not capture all between-visit variation; all visits and samples
+remain archived. The original CI-backward persistent median rises **0.88%**,
+with its raw interval above one; ordinary rises 0.75%, while the normalized
+interval includes one. CI and forward shifts occur on unchanged shader/resource
+identities and are not attributed to this selection change.
+
+Four complete-step SDK backend captures, sixteen metric groups and zero-rate
+SGD measure persistent replay **14.884→14.354 ms (−3.56%)** and ordinary replay
+12.004→11.913 ms (−0.75%). All 246,883,105 captured floats are independently
+verified bitwise identical between control and candidate within each backend.
+Cross-backend state remains within the existing budget and is not bitwise equal.
+Maximum clock/instruction-rate group spreads are 0.017%/0.494%.
+
+Persistent estimated warp instructions increase **0.54%**, integer-pipe work
+**2.84%** and global-load sectors **2.89%**, while FP32 activity falls **0.63%**.
+Shared wavefronts rise 0.17%; persistent local traffic remains zero. Average
+active compute warps stay near 32.7% of peak. Barrier waiting changes
+54.74→52.79% of active warp cycles; it is not an elapsed-time fraction.
+Ordinary local sectors increase from about 402,000 to 666,000 per replay;
+these counters do not identify the responsible shader. Faster replay with
+more estimated instruction and load work supports investigating useful tile
+parallelism, while code footprint and padding remain joint contributors.
+
+Qualification passes **673 library tests (eight ignored), 168 strict whole-graph
+oracle cases, 50 matrix regressions and twelve whole-graph GPU smoke tests**,
+plus all 52 codegen checks, strict all-target/all-feature Clippy, formatting,
+release example builds and Metal-target compilation. New checks cover selection
+boundaries, storage/schedule constraints and preserved long-K partitions. A
+35×1025×263 GPU fixture checks every output against signed dyadic CPU results,
+ragged row/column/K tails, poisoned storage, changed inputs and
+ordinary/1/3/256/4096-worker execution. Metal GPU execution remains unqualified.
+
+There are **75 diagnostic comparisons**, including a post-qualification bridge.
+Test additions change executable hashes; primary and SDK gates use the final
+qualified binaries. Their full generated shader sets, resource multisets,
+selection, execution and buffers exactly match the preflight candidate.
+Dependency pins and both fork checkouts remain unchanged.
+
+Local evidence is under `target/narrow-bt-selection/`. Manifest
+`target/megakernel-results/narrow-bt-selection/summary.json` contains **588
+independently verified artifact hashes and 44 recorded job cgroups**, SHA-256
+`afc185b0f1db71993b119b8381835a180d24f2da5bee48fff2246c2910d8c88b`.
+Every heavy job has verified 16/20/1 GiB memory-high/hard/swap limits. GPU jobs
+serialize, with builds and heavy analysis outside measurement intervals; all
+artifacts remain on local `/x`. Peak job memory is 4,709,826,560 bytes and
+recorded memory-limit events are zero. Small SDK-export pressure totals remain
+in the logs. All jobs finish. Baseline parity and the forward gap remain open.
+
+Next, test finer tiles for the remaining `50x720x4096` transposed-B stages,
+which still expose only 46 logical tiles, while preserving selected precision,
+K order, requested workers and all five completed-step cases.
 
 ## Completion-gated idle scans
 

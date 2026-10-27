@@ -5495,6 +5495,47 @@ mod variant_tests {
         }
     }
 
+    #[test]
+    fn narrow_transposed_selection_preserves_long_reduction_partitions() {
+        for k in [720, 8192] {
+            let mut graph = crate::Graph::new();
+            let a = graph.input("a", &[50, k]);
+            let b = graph.input("b", &[2048, k]);
+            let y = graph.matmul_bt(a, b);
+            graph.set_outputs(vec![y]);
+            let mut plan = crate::compile::compile(&graph);
+            plan.knobs.matmul_k_stage = 16;
+            plan.knobs.matmul_interleave_columns = true;
+            let mut control = plan.clone();
+            control.split_long_scalar_products();
+            select_variants(&mut plan, None, false, false);
+            assert_eq!(plan.dispatches.len(), control.dispatches.len());
+            assert_eq!(plan.buffers, control.buffers);
+            if k == 8192 {
+                let crate::compile::Kernel::SplitMatmul { shape, splits } =
+                    plan.dispatches[0].kernel
+                else {
+                    panic!("long transposed product lost its split reduction");
+                };
+                let crate::compile::Kernel::SplitMatmul {
+                    splits: old_splits, ..
+                } = control.dispatches[0].kernel
+                else {
+                    panic!("expected original split reduction");
+                };
+                assert_eq!(splits, old_splits);
+                assert_eq!((shape.rows(), shape.cols(), shape.k_stage), (32, 32, 16));
+                assert_eq!(plan.dispatches[1].shader, ShaderEntry::SumRows);
+                assert_eq!(plan.dispatches[1].params, control.dispatches[1].params);
+            } else {
+                assert_eq!(plan.dispatches[0].kernel, crate::compile::Kernel::SmallTile);
+                assert_eq!(plan.dispatches[0].workgroups, [64, 2, 1]);
+                assert_eq!(plan.knobs.matmul_k_stage, 16);
+                assert!(plan.knobs.matmul_interleave_columns);
+            }
+        }
+    }
+
     fn matmul(f: impl FnOnce(&mut Dispatch)) -> Variant {
         let mut d = Dispatch {
             shader: ShaderEntry::MatMul,
