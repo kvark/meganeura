@@ -42,6 +42,9 @@ Same-binary ordinary training visits range from 11.79 to 14.72 ms. A subsequent
 [stability investigation](#gpu-idle-effects-and-benchmark-stability) localizes
 the large spikes to GPU execution and suppresses them with untimed prewarming.
 The warmed diagnostic still shows a substantial persistent GPU-time gap.
+The [current clock study](#warmed-handler-clock-attribution) identifies expensive
+narrow matrix stages and overlapping SGD work. Its smaller probe preserves
+training's register count and worker participation. Neither probe is retained.
 
 For model benchmarks, use `--whole-graph --workers 256`. The
 [current worker sweep](#worker-counts-and-deeper-scalar-staging) finds lower CI
@@ -65,6 +68,98 @@ cannot overlap. Library tests also use the GPU and need this flag. Builds use
 the same launcher without the GPU flag; finish them before primary measurements.
 The launcher now records memory peaks, limit events and memory/CPU/I/O pressure
 after each job, preserving the target's exit status and forwarding termination.
+
+## Warmed handler clock attribution
+
+The retained Naga and Blade forks have no shader-clock API. The archived
+diagnostic already provides a feature-checked Vulkan device clock, so this
+study adapts that temporary probe to runtime `e4e70c5`. Blade replaces explicit
+marker calls after Naga validation and validates the resulting SPIR-V before
+pipeline creation. Independent reversal reproduces all **64 original module
+binaries** exactly: 32 pairs for each probe. Naga, atomic semantics, handler
+arithmetic, memory guards and the requested 256-worker pool remain unchanged.
+
+The full probe records worker lifetimes, first/last node timestamps and summed
+handler intervals. It passes 400 paired comparisons across all five cases,
+with control/probe/probe/control visits at both zero and 100 ms prewarming.
+However, model registers rise from 84/80 to 94/89 forward/training. Training
+changes from 252 participating control workers to 168 long-lived instrumented
+workers, with the other 88 entering near completion. Warmed training GPU time
+falls from 15.553 to 14.486 ms while ordinary GPU time stays about 11.03 ms.
+This **6.9% apparent improvement is a profiling perturbation**, not an accepted
+optimization or proof that clock reads help. Register allocation, queue
+storage, bookkeeping and work distribution change together.
+
+The sparse probe keeps only first/last node/worker timestamps. Clock values
+are consumed immediately; none survives across a handler body. It passes
+another 200 paired comparisons with 100 ms prewarming, plus four preliminary
+model comparisons. Training retains **80 registers, 29,344 shared bytes and
+252 participating workers** in both visits. Forward uses 86 rather than 84
+registers, unchanged shared capacity and 168 participating workers.
+
+| Case | Control / sparse-probe persistent GPU interval, ms | Probe change |
+|---|---:|---:|
+| CI inference | 0.030928 / 0.033280 | +7.6% |
+| CI backward | 0.067872 / 0.074544 | +9.8% |
+| CI SGD | 0.072192 / 0.079488 | +10.1% |
+| Model forward | 4.552896 / 4.639440 | +1.9% |
+| Model training + SGD | 15.536304 / 15.839776 | +2.0% |
+
+These include queue-reset timing and worker counters; they are diagnostics,
+not the normal completed-step performance gate. Sparse-probe ordinary GPU
+medians stay within 0.1% of control for both model phases. Every comparison
+preserves selected implementations, full-state budgets, logical completion,
+one compute dispatch and no fallback. Maximum model error is 4.66e-9.
+
+Fresh ordinary dispatch profiles preserve bitwise exact complete state and
+match the paired benchmark's implementation keys. Representative spans are:
+
+| Phase / shape | Nodes | Ordinary median interval, µs | Sparse persistent median span, µs | Median participating workers |
+|---|---:|---:|---:|---:|
+| Forward `MatMul[50x4096x720]` | 16 | 53.06 | 74.91 | 128 |
+| Forward `FusedMatMulAdd[50x720x2048]` | 16 | 63.55 | 68.80 | 90 |
+| Training `MatMulBT[50x720x4096]` | 16 | 127.06 | 207.72 | 46 |
+| Training `MatMulBT[50x2048x720]` | 16 | 43.01 | 94.49 | 32 |
+| Training `FusedMatMulAdd[50x720x2048]` | 16 | 63.49 | 96.03 | 90 |
+| Training cross-attention dKV, `q=50,kv=16,h=15/5` | 8 | 106.50 | 156.84 | 32 |
+
+The four SGD nodes overlap backward work and each other. In the two sparse
+training traces their envelope unions cover 1.848/1.853 ms, with only
+0.652/0.635 ms after the last non-SGD handler. The ordinary SGD pass measures
+1.355/1.348 ms. Summing the four persistent spans would double-count overlap;
+their final tail does not explain the entire model gap. Removing SGD could
+also change contention and scheduling, so that tail is not a savings estimate.
+
+The table compares different instrumentation contracts: ordinary profiles
+split dispatches into timed passes, while persistent spans include gaps between
+a node's claims and can overlap other nodes. The ordinary backward profile
+excludes SGD. Each sparse trace is the final measured step of its visit; paired
+timing distributions retain every sample. Clock-to-time scaling uses that
+trace's GPU interval and envelope. The
+[SPIR-V clock extension](https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_shader_clock.html)
+guarantees neither a fixed rate nor a compiler code-motion barrier. These
+measurements identify targets, not additive recoverable costs.
+
+Both probes pass five focused graph-codegen tests and ten whole-graph GPU
+smoke tests. Both forks, runtime source and lock are restored exactly; rebuilt
+benchmark binaries match the frozen controls byte-for-byte, and all ten
+restored smoke tests pass. No full retained-change suite or new SDK counter
+capture is claimed. All jobs use separate bounded cgroups and local `/x`
+storage. The 46 recorded job scopes have zero memory-limit events; peak job
+memory is 4,254,867,456 bytes, below the 16 GiB soft limit.
+
+Evidence is under `target/clock-{warmed,sparse}/`. The manifest
+`target/megakernel-results/clock-warmed-sparse/summary.json` preserves 600 paired
+diagnostic comparisons, four preflight comparisons, 30 traces, 60 resource
+records and **366 independently verified artifact hashes**, SHA-256
+`3d907706ef92bbc33c78183b2c580ffecdbcaf5918c12d323e0dcc0da4e53b32`.
+
+Next, isolate the resource/concurrency effect without clock bookkeeping or a
+smaller requested pool. A shared-capacity control can preserve all 256 workers
+and handler arithmetic while testing a different residency limit. Verify the
+actual compiled footprint and source differences before attributing a result
+to residency. Then target narrow matrix stages with normal and matched
+prewarmed completed-step gates. Baseline parity remains unmet.
 
 ## GPU idle effects and benchmark stability
 
@@ -156,9 +251,10 @@ patches and frozen binaries. The manifest is
 It records 228 artifact hashes and 48 bounded cgroups; SHA-256
 `b24aa8737fe2c9fad652756fbb5bf2fe0be3a17e2a5ebe65af28cb8a5f8a17f4`.
 
-The next profiling task is to attribute the residual GPU cost to individual
-handlers inside the combined dispatch. Audit available shader-clock support
-first; keep the unchanged primary gate alongside matched prewarmed controls.
+The subsequent [clock study](#warmed-handler-clock-attribution) attributes
+residual GPU time inside the combined dispatch and quantifies its own
+instrumentation overhead. Keep the unchanged primary gate alongside matched
+prewarmed controls.
 Baseline parity remains unmet.
 
 ## Fully occupied packed claims

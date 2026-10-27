@@ -562,6 +562,14 @@ the descriptor-reference repair requires fresh measurements.
   `--prewarm-ms` control, default zero, after 50 five-case state comparisons.
   Record post-job cgroup pressure while preserving exit status, termination
   forwarding and GPU serialization. Keep the original primary gate unchanged.
+- [x] Refresh device-clock attribution on retained runtime `e4e70c5`. Preserve
+  600 diagnostic comparisons, four preliminary comparisons and 64 independently
+  validated/reversible SPIR-V transformations. The full probe changes training
+  registers and worker participation; a sparse probe preserves 80 registers
+  and 252 participating workers with about 2% model GPU overhead. Narrow matrix
+  stages remain expensive, while SGD overlaps backward work and leaves only
+  0.64 ms after the last graph handler. Restore exact runtime/forks and binaries,
+  pass all ten restored smoke tests, and archive both probes locally.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
@@ -620,9 +628,15 @@ the descriptor-reference repair requires fresh measurements.
   The stability investigation localizes the large timing spikes to GPU execution
   and suppresses them with untimed prewarming. The warmed diagnostic still
   measures 15.584 ms persistent versus 11.034 ms ordinary GPU training time;
-  worker counters are enabled in that diagnostic. Next, attribute residual GPU
-  cost to handlers inside the combined dispatch, starting with an audit of
-  available shader-clock support. Keep the original five-case primary gate and
+  worker counters are enabled in that diagnostic. Fresh sparse clocks preserve
+  training's register count and worker participation and identify narrow matrix
+  stages as the next targets. `MatMulBT[50x720x4096]` spans about 208 µs against
+  127 µs in ordinary profiling; overlapping node spans are not additive costs.
+  The full probe's 6.9% apparent training improvement is confounded by changed
+  allocation, bookkeeping and work distribution. Next, isolate the concurrency
+  effect using a shared-capacity control without clock bookkeeping, preserving
+  all requested 256 workers and exact arithmetic. Audit the compiled footprint
+  before attributing a result to residency. Keep the five-case primary gate and
   add matched `--prewarm-ms 100` controls. Preserve all samples, state checks,
   requested workers and acceptance budgets; changed cache/power state is not a
   runtime optimization.
