@@ -906,10 +906,19 @@ the descriptor-reference repair requires fresh measurements.
   state exports, 448 verified artifacts, 26 completed cgroups and the corrected
   source-auditor failure. Restore source/binary hashes and fourteen smoke tests.
   See the [final-stage barrier evidence](megakernel_whole_graph.md#final-scalar-at-stage-barrier).
-  Next, sample individual AT tile entry/exit times with immediate timestamp
-  stores, keeping clock values out of handler live ranges. Calibrate overhead
-  and resources against fresh controls; current node spans include gaps between
-  claims. Separate that effect from slow tile execution before another policy.
+  Sample individual AT tile entry/exit times with immediate timestamp stores,
+  keeping clocks out of handler live ranges. Preserve 200 calibrated diagnostics
+  and 10,932 intervals from two final training traces covering twenty nodes.
+  Training GPU time rises 1.25% with unchanged registers/shared memory. The two
+  largest shapes average only 53–54 overlapping tile intervals; between-tile
+  gaps can include other useful work. Exact source/SPIR-V inverses, full-state
+  checks and ordinary profiles pass. Remove the probe and verify 371 artifacts,
+  27 completed cgroups, restored source/binary hashes and fourteen smoke tests.
+  See the [individual tile evidence](megakernel_whole_graph.md#individual-at-tile-clocks).
+  Next, record optimizer claims alongside the sampled AT tiles to identify
+  competing work during long node spans. Respect existing four-tile claims and
+  recalibrate overhead before interpreting the extra records. Keep arithmetic
+  and scheduling unchanged until the traces support a specific policy.
   Keep every completed-step gate; lower claim traffic alone is insufficient.
   Keep the short-K AT gap as an unresolved target without repeating rejected
   tile selectors or delaying optimizer eligibility.

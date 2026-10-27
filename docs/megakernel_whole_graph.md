@@ -50,8 +50,15 @@ remains the qualified runtime.
 The following [final-stage barrier control](#final-scalar-at-stage-barrier) also
 stays flat: training GPU diagnostics change −0.11%, while SDK replay changes
 +0.15% persistent / +0.04% ordinary. It preserves arithmetic, tile geometry,
-registers and shared memory. The probe is reverted; individual tile timing is
-the next attribution target.
+registers and shared memory. The probe is reverted.
+
+The subsequent [individual AT tile clocks](#individual-at-tile-clocks) separate
+tile intervals from gaps between claims. The two largest sampled shapes average
+only 53–54 overlapping tile intervals despite 168 workers participating in the
+whole training graph. Their between-tile gaps include other work and cannot be
+counted as idle time. The calibrated probe adds 1.25% training GPU time and is
+removed; the next attribution target is competing optimizer work during those
+AT spans. Qualified runtime remains `c3ad104`.
 
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
@@ -778,6 +785,109 @@ and resource changes against fresh uninstrumented controls. The existing node
 spans include gaps between claims; individual tile intervals can distinguish
 that effect from slow tile execution. Keep every numerical and completed-step
 gate, and do not sum overlapping intervals into purported recoverable time.
+
+## Individual AT tile clocks
+
+This attribution study starts from `09d8014`, using qualified `c3ad104` and its
+frozen binaries as controls. It samples the first, middle and last node of each
+eligible scalar AT shape, or all nodes when fewer than three exist. It records
+**every tile of twenty selected nodes: 5,466 intervals per trace**, including
+horizontal batches and K=1 tails. Sampling complete nodes avoids choosing only
+particular column or edge coordinates. These are a subset of the 82 eligible
+nodes and 25,972 tiles, not the entire training workload.
+
+The leader writes entry and exit timestamps directly to unique queue slots;
+no timestamp remains live across the handler. Entry follows parameter broadcast
+and the existing payload acquire. Exit follows the original payload fence and
+workgroup barrier, before completion/publication. Thus a recorded interval
+includes handler initialization, arithmetic and those final synchronizations,
+plus instrumentation overhead. Gaps between a worker's successive tiles also
+include scheduling, parameter broadcast, publication and potentially other
+nodes. They are not measurements of idle polling alone.
+
+A temporary Blade hook replaces one marker call in the timestamp helper with
+device-scope `OpReadClockKHR` after Naga validation. Both SPIR-V versions pass
+`spirv-val --target-env vulkan1.3`; reversing the transformation recovers the
+entire original module byte-for-byte. Naga source and API remain unchanged.
+Reversing four clock call sites and the helper definitions similarly recovers
+the complete training WGSL. Every handler, case, claim, completion and publication
+statement remains exact. All nineteen CI sources, forty ordinary model sources
+and the forward graph remain byte-identical.
+
+The [shader-clock specification](https://raw.githubusercontent.com/KhronosGroup/SPIRV-Registry/main/extensions/KHR/SPV_KHR_shader_clock.asciidoc)
+provides a shared source clock at device scope, but guarantees neither a fixed
+rate nor code-motion barriers. Raw ticks are preserved. The microseconds below
+are approximate, scaled by each final step's GPU timestamp interval divided by
+its worker clock envelope. The two traces measure 12.893088/12.893184 ms, with
+envelope ratios 0.999804/0.999725 ticks per timestamp nanosecond. Neither this
+close agreement nor unchanged register counts makes the probe free of effects.
+
+**Two hundred paired diagnostics** use control/probe/probe/control visits,
+ten pairs per case/visit, ten warmups and at least one warmup second, with
+100 ms prewarming and 256 requested workers. All full-state, selection,
+logical-work, one-dispatch and no-fallback gates pass. Eight preflight pairs,
+five graph-codegen checks and fourteen smoke tests also pass. The two final
+training steps supply **10,932 tile intervals**; the trace file is overwritten
+per process, so these are not traces of every timing sample.
+
+Training GPU medians change **12.762896→12.922816 ms (+1.25%)**, while ordinary
+training is effectively unchanged at 10.769344→10.769280 ms. Forward GPU time
+changes 4.077728→4.080608 ms (+0.07%) on an unchanged shader. Training retains
+**84 registers, 29,344 shared bytes and 168 participating workers**. The probe
+adds 2,560 native code bytes and 231,048 scheduler/resident bytes. All requested
+workers remain enabled; logical work stays 22,042/83,312 tiles for forward/training.
+This is instrumentation calibration, not a completed-step optimization gate.
+
+The table uses medians over selected node observations in both final traces.
+“Overlap” is the sum of tile intervals divided by their node envelope; it is
+average concurrent recorded intervals, not occupancy or resident workgroups.
+“Body share” divides recorded intervals by the sum of each participating
+worker's first-to-last span for that node. A single-tile worker has no internal
+gap and contributes a body share of one.
+
+| AT shape | Tiles/node | Ordinary dispatch µs | Persistent node span µs | Tile median µs | Overlap | Body share |
+|---|---:|---:|---:|---:|---:|---:|
+| 2048×720×50 | 384 | 22.53 | 51.44 | 6.49 | 53.1 | 80.7% |
+| 720×4096×50 | 768 | 36.83 | 98.12 | 6.35 | 54.3 | 72.6% |
+| 960×720×50 | 180 | 14.37 | 22.02 | 7.07 | 62.1 | 85.6% |
+| 720×960×50 | 180 | 14.34 | 23.22 | 7.00 | 55.8 | 83.2% |
+| 320×320×16, two products | 50 | 6.14 | 7.67 | 4.39 | 32.7 | 100% |
+| 720×320×50, two products | 120 | 10.24 | 10.83 | 7.14 | 89.4 | 100% |
+| 720×720×1 | 144 | 8.19 | 9.30 | 4.55 | 71.5 | 100% |
+| 1440×720×1 | 276 | 12.32 | 16.37 | 4.18 | 73.2 | 76.6% |
+
+The fresh ordinary split-pass profile preserves complete state and matching
+implementations. Its timestamp boundaries and overhead differ from persistent
+clocks; ordinary backward also excludes SGD. These columns locate the gap but
+do not establish an exact same-instrumentation kernel ratio. Ordinary AT uses
+92 registers, or 94 for horizontal batches, and 16,768 shared bytes.
+
+For 720×4096×50, the median sampled node uses only 78 distinct workers and has
+about 54 overlapping tile intervals on average. Its longest worker's accumulated
+tile time covers about 74% of the node envelope. This supports investigating
+work distribution and concurrent work, but does not show that the remaining
+workers are idle or that the gaps are recoverable. In particular, neither
+overlapping node spans nor worker intervals may be summed into elapsed savings.
+
+**The probe is removed.** Twenty-one main source/dependency hashes, three Blade
+source hashes, both qualified binary hashes and fourteen restored smoke tests
+match. Both compiler forks are clean. No full library/oracle/Metal qualification,
+normal completed-step series or fresh SDK counters are claimed for this study.
+
+Evidence is under `target/clock-at-tiles/`. Manifest
+`target/megakernel-results/clock-at-tiles/summary.json` independently verifies
+**371 artifact hashes and 27 completed study cgroups**, SHA-256
+`1ee03f8a5b7f32c6d3f5b90c8199ecef009ed817de6ca07ff79ec6246f2d8b5d`.
+Peak job memory is **4,247,101,440 bytes**, with zero memory-limit events. Every
+heavy job runs in a separate verified 16/20/1 GiB cgroup, GPU jobs serialize,
+and artifacts stay on local `/x`. All launched jobs finish.
+
+Next, extend the same metadata-selected recording to optimizer claims to
+identify which work overlaps the long AT spans and intervening gaps. Account
+for existing four-tile optimizer claims and calibrate the extra recording cost
+before drawing conclusions. Keep handler arithmetic, requested workers and all
+completed-step gates. Do not repeat global optimizer deferral or alter queue
+priority solely from these partial traces.
 
 ## Completion-epoch control on the current runtime
 
