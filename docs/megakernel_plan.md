@@ -748,11 +748,22 @@ the descriptor-reference repair requires fresh measurements.
   431 verified artifact hashes and 26 completed cgroups. Restore the runtime,
   compiler fork, lock and exact benchmark binaries; fourteen smoke tests pass.
   See the [refreshed attribution](megakernel_whole_graph.md#refreshed-handler-clock-attribution).
-  Next, audit short-K transposed-A weight-gradient geometry and claim
-  distribution, including contention with optimizer updates. The 720×4096×50
-  stage spans about 108 µs versus 37 µs in ordinary profiling; 2048×720×50 spans
-  55 µs versus 23 µs. Preserve arithmetic order, storage and locked schedules
-  in both backends. Keep forward cooperative attention as another target.
+  Test short-K transposed-A weight-gradient geometry using existing 32×32,
+  32×64 and 64×32 scalar tiles. Exactly 66 training nodes change in each probe;
+  arithmetic order, storage and locked schedules remain intact in both backends.
+  Each passes 52 codegen checks, nine selector tests, 51 matrix regressions,
+  fourteen smoke tests and fifty diagnostic comparisons. Persistent training
+  GPU time regresses 9.5%/2.5%/1.3%, despite lower code size and, for 64×32,
+  fewer registers. Preserve exact per-node task audits, 923 verified artifact
+  hashes and 43 completed cgroups, including two corrected non-GPU audit errors.
+  Revert all three probes and restore exact qualified binaries and smoke checks.
+  See the [short-K geometry evidence](megakernel_whole_graph.md#short-k-transposed-a-tile-geometry).
+  Next, isolate optimizer contention with a dependency-only control that defers
+  appended commands until original graph work completes. Preserve original
+  dependencies, handler bytes, logical grids, worker count, fences, exact state
+  checks and one compute dispatch/submission. The 720×4096×50 stage spans about
+  108 µs versus 37 µs in ordinary profiling; 2048×720×50 spans 55 µs versus 23 µs.
+  Keep forward cooperative attention as another target.
   Do not sum overlapping spans or infer a memory bottleneck from traffic alone.
   Keep the five-case primary gate and
   add matched `--prewarm-ms 100` controls. Preserve all samples, state checks,

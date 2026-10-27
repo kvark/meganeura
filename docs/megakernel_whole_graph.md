@@ -32,6 +32,12 @@ short-K transposed-A weight gradients as a stronger remaining target. The
 instrumentation is removed after calibration; this is attribution evidence,
 not another retained speedup.
 
+Three subsequent [short-K tile probes](#short-k-transposed-a-tile-geometry)
+replace selected 64×64 tiles with 32×32, 32×64 or 64×32. All pass correctness
+checks but regress persistent training GPU diagnostics by 9.5%, 2.5% and 1.3%.
+They are reverted. Next, isolate contention between graph work and optimizer
+updates while preserving the single-dispatch execution contract.
+
 The preceding [fused-matrix tile selection](#fused-matrix-tile-selection) adds
 small-tile routing for fused transposed-B products and extends the existing
 32×16 fused-plain refinement to K≥256. Against qualified `da86b45`, 1,000
@@ -109,6 +115,81 @@ cannot overlap. Library tests also use the GPU and need this flag. Builds use
 the same launcher without the GPU flag; finish them before primary measurements.
 The launcher now records memory peaks, limit events and memory/CPU/I/O pressure
 after each job, preserving the target's exit status and forwarding termination.
+
+## Short-K transposed-A tile geometry
+
+Three selector-only probes against qualified runtime `3f95fa4` test the large
+transposed-A weight gradients identified by the refreshed clocks. Each admits
+the existing scalar small-tile path for unpinned F32-storage products with
+0<K≤64, at least 128 original 64×64 workgroups and a portable 32×32 grid.
+Cooperative preference, required precision and locked schedules remain
+authoritative; transposed-A addends remain excluded. Two follow-ups refine
+eligible non-epilogue products to existing 32×64 and 64×32 scalar shapes.
+K-stage width, accumulation order, storage types, per-output arithmetic, barriers,
+inactive guards, queue operations and dependency pins are unchanged.
+
+Exactly **66 training nodes** change selection in each probe: sixteen instances
+each of 2048×720×50, 720×4096×50, 960×720×50 and 720×960×50, plus 720×720×1
+and 1440×720×1. Independent per-node grid checks recover the exact total task
+increase. Both backends select the same implementations. All nineteen CI shader
+sources and forty model sources remain identical, including the forward graph.
+The unused ordinary 64×64 AT module disappears; the square probe reuses an
+existing small-tile module, while each rectangle adds one ordinary AT module.
+Each probe changes the training graph module.
+
+Each completes **52 codegen checks, nine selector tests, 51 matrix regressions,
+fourteen whole-graph smoke tests and fifty diagnostic comparisons**. Diagnostics
+use one control and one candidate visit, five interleaved ordinary/persistent
+pairs per case, at least ten warmups and one warmup second, and 100 ms matched
+prewarming. All full-state budgets, matching-selection, logical-completion,
+one-dispatch and no-fallback checks pass. Maximum model error remains 4.66e-9.
+
+| Candidate tile | Persistent training GPU interval, control / candidate, ms | Change | Ordinary training GPU change | Graph tasks |
+|---|---:|---:|---:|---:|
+| 32×32 | 13.059392 / 14.299648 | +9.50% | −0.25% | 83,312→153,000 |
+| 32×64 | 13.057664 / 13.390336 | +2.55% | −0.11% | 83,312→106,636 |
+| 64×32 | 13.054304 / 13.219520 | +1.27% | −1.18% | 83,312→107,137 |
+
+Training measurements include SGD; the task totals above count graph work only.
+All 256 requested workers remain enabled, and all model captures record 168
+participating workers. Training shared memory stays 29,344 bytes. Registers
+remain 84 for the first two probes and fall to 82 for 64×32. Code changes from
+238,720 bytes to 224,000 / 235,392 / 234,624 bytes. Forward retains 86 registers,
+18,928 shared bytes, 99,584 code bytes and 22,042 graph tasks; its GPU medians
+change by at most 0.11% on identical shader sources.
+
+Reducing per-thread accumulator storage does not produce a persistent speedup
+in these diagnostics. Tile counts, repeated staging and shader composition
+change together, so the results do not isolate queue claims as the cause.
+These are small diagnostic samples, not a full completed-step retention gate.
+No new SDK capture, full library/oracle qualification or retained optimization
+is claimed. All three probes are reverted.
+
+Two non-GPU audit errors are preserved with their original scripts and logs:
+the square source audit expected one too many common modules, overlooking the
+retired 64×64 AT module; the first rectangular task estimate omitted parentheses
+around integer ceil factors. Corrected audits verify the removed source and
+each changed node's exact grid. No GPU work is rerun for either correction.
+Runtime source and dependency hashes are restored exactly, both forks are clean,
+rebuilt benchmark binaries match the qualified controls byte-for-byte, and
+fourteen restored smoke tests pass.
+
+Evidence remains local in `target/short-k-at-small/`, `target/short-k-at-32x64/`
+and `target/short-k-at-64x32/`. Manifest
+`target/megakernel-results/short-k-at-geometry/summary.json` contains **923
+independently verified artifact hashes and 43 completed bounded cgroups**,
+SHA-256 `2134d9f5946db274360079ff9d96bfcba9c86752e8f03cde9b30d1313a670b8b`.
+Peak recorded job memory is **3,716,517,888 bytes**, with zero memory-limit
+events. All heavy jobs use separate verified 16/20/1 GiB memory-high/hard/swap
+limits; GPU jobs are serialized and builds/copies/heavy analysis stay outside
+timing. No jobs survive the completed investigation. Baseline parity remains open.
+
+Next, test a dependency-only control that defers appended optimizer commands
+until original graph work completes. Keep handler bytes, logical grids, worker
+count, fences and the single dispatch/submission unchanged. This can test the
+effect of optimizer overlap without another matrix geometry change. Preserve
+the original dependency edges and exact state checks; an improvement would
+still require the full completed-step and matched-counter qualification.
 
 ## Refreshed handler clock attribution
 
