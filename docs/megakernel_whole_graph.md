@@ -75,6 +75,11 @@ Subsequent [family-isolation controls](#swiglu-family-isolation-and-forward-only
 select forward-only batching. Its production candidate passes full correctness
 qualification and 1,000 normal comparisons, but neither model phase passes both
 protocols. It is reverted; the temporary metadata probe is removed.
+The following [three-tile forward control](#three-tile-forward-claim-control)
+preserves all shader bytes and native statistics against four tiles, but is
+0.24% slower in forward GPU diagnostics and 0.20% slower in training. It fails
+the predeclared advancement gate and is reverted without normal timing or SDK
+captures. Qualified runtime remains `c3ad104`.
 
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
@@ -1442,13 +1447,91 @@ All heavy jobs use separate verified 16/20/1 GiB cgroups; GPU jobs serialize,
 heavy analysis stays outside measurements, and artifacts remain on local `/x`.
 Every launched job finishes.
 
-Next, compare three versus four tiles for forward-only claims with identical
+The following control compares three versus four tiles for forward-only claims with identical
 shaders and native resources. A 400-tile node offers 134 three-tile claims
 instead of 100 four-tile claims; both fit below the 168 participating workers
 observed in model graphs. This tests more parallel claims and less work per
 claim against extra queue traffic. It does not assume simultaneous residency
 or a gain from the counts alone. Preserve partial completion, small-grid and
 SGD behavior, and the fixed criterion under both timing protocols.
+
+## Three-tile forward claim control
+
+Starting from `9d7441c`, this control changes the archived forward-only candidate's
+sequential claim width from four to three. Production admission is otherwise
+identical: only explicit unfused F32 `SwiGLUConcat` nodes with at least 256 tiles
+qualify. Small grids, gradient handlers, four-tile SGD claims, arithmetic,
+publication fences and all requested workers retain their prior behavior.
+
+Each admitted 400-tile node offers **134 claims instead of 100**. Across sixteen
+forward nodes, this saves **4,256 successful claims** versus qualified execution
+in either model phase, compared with 4,800 saved by four-tile batching. These
+metadata-derived counts exclude failed claims and do not establish hardware
+atomic traffic, simultaneous residency or a performance gain.
+
+The candidate passes **53 codegen checks and fifteen whole-graph smoke tests**,
+formatting and release builds. The thirteen-grid fixture covers all three-tile
+remainders, the 256-tile threshold, element tails and mixed cached handlers.
+Changed-input replay is bitwise exact against ordinary execution at
+**1/3/256/4,096 workers**. A finite audit covers **2,050 tile counts, 722,433
+claims and 2,100,225 logical coordinates**.
+
+The predeclared diagnostic series uses qualified/four/three/three/four/qualified
+visits, five interleaved pairs per case/visit, ten warmups, at least one warmup
+second and matched 100 ms prewarming: **150 comparisons** total. Advancement
+requires an affected model GPU median at least 0.5% below qualified and below
+four tiles, neither model phase more than 0.5% above qualified, and no CI case
+more than 3% above qualified. This screens candidates; it does not replace the
+completed-step retention criterion.
+
+All **61 shader sources and reported native pipeline statistics match** between
+three and four tiles. Source reconstruction confirms that the only production
+change against four tiles is the admitted width. Against qualified, all
+19 CI sources and 40 ordinary model sources remain exact; each model's graph
+changes only the forward dispatch case. Removing that repeat wrapper reconstructs
+the entire qualified source byte for byte, and every handler body is unchanged.
+
+| Persistent GPU diagnostic | Qualified | Four tiles | Three tiles | Three versus four |
+|---|---:|---:|---:|---:|
+| Forward | 4.079488 ms | 4.012048 ms | 4.021536 ms | +0.24% |
+| Training + SGD | 12.761264 ms | 12.675456 ms | 12.700736 ms | +0.20% |
+
+Three tiles improve forward **1.42% versus qualified** and training **0.47%**,
+but neither phase beats four tiles. **The advancement gate fails.** These small
+differences are diagnostic medians, not established completed-step regressions.
+No CI case exceeds the guard; its shaders remain unchanged.
+
+Forward uses **86 registers / 18,928 shared bytes / 102,528 code bytes** and
+training **83 / 29,344 / 241,792**, identical to four tiles. Both phases retain
+168 participating graph workers with all 256 requested workers enabled.
+Every state, selection, single-dispatch, no-fallback and logical-work gate passes.
+Payload, scheduler and resident allocations remain exact. All 150 comparisons
+preserve optimizer accounting, including four model SGD chunks and 97,522
+logical optimizer tiles.
+
+**The candidate is reverted.** No additional diagnostics, full qualification,
+normal timing or SDK captures follow the failed gate. Twenty-two source/
+dependency hashes, both qualified binaries and fourteen restored smoke tests
+match. Both compiler forks remain clean. Qualified runtime stays `c3ad104`, and
+baseline parity remains unmet.
+
+Evidence remains under `target/swiglu-forward-three/`. The independently checked
+manifest `target/megakernel-results/swiglu-forward-three/summary.json` verifies
+**735 artifact hashes and 26 completed study cgroups**, SHA-256
+`123da1eb03c8bf875c27706310a46abfed46a89a3050b7fb94b92939b22be563`.
+Peak study memory is **3,717,373,952 bytes**, with zero memory-limit or OOM events.
+All heavy jobs use separate verified 16/20/1 GiB cgroups; GPU jobs serialize,
+heavy analysis stays outside measurements, and artifacts remain on local `/x`.
+Every launched job finishes, including the separate manifest and verification
+jobs.
+
+Further claim-width sweeps are not supported by this evidence. Return to the
+qualified runtime and extend calibrated complete-claim timing to the forward
+graph, whose remaining relative gap is larger. Compare dependency-aware node
+envelopes with matched ordinary dispatches, including overlapping work, before
+choosing another runtime change. Keep instrumentation overhead, source/native
+resource changes and full-state checks separate from performance attribution;
+do not sum overlapping spans or treat participating workers as occupancy.
 
 ## Completion-epoch control on the current runtime
 

@@ -964,12 +964,20 @@ the descriptor-reference repair requires fresh measurements.
   1.0001700494; keep the criterion and revert without extra repeats or SDK
   captures. Restore 22 source hashes, both qualified binaries and fourteen
   smoke tests. See [family isolation and forward-only batching](megakernel_whole_graph.md#swiglu-family-isolation-and-forward-only-batching).
-  Next, compare three versus four tiles for forward-only claims with identical
-  shaders/native resources. A 400-tile node offers 134 versus 100 claims, both
-  below 168 observed participating workers. Measure the parallelism/queue-work
-  tradeoff; do not infer residency or performance from claim counts alone.
-  Preserve partial completion, small grids, unchanged SGD batching, all
-  requested workers and the fixed absolute criterion under both protocols.
+  Compare three versus four tiles for forward-only claims: all 61 shaders and
+  native statistics match, and all 150 diagnostic comparisons pass correctness
+  and work accounting. Three tiles offer 134 claims per 400-tile node versus
+  100, but forward/training GPU medians are 0.24%/0.20% slower than four tiles.
+  The predeclared advancement gate fails. Revert without additional timing or
+  SDK captures; restore 22 source hashes, both binaries and fourteen smoke tests.
+  See the [three-tile forward control](megakernel_whole_graph.md#three-tile-forward-claim-control).
+  Stop the claim-width sweep. Extend calibrated complete-claim timing to the
+  qualified forward graph and compare dependency-aware node envelopes with
+  matched ordinary dispatches before choosing another change. Account for
+  overlapping work, instrumentation overhead and native-resource changes;
+  neither claim counts nor participating workers establish occupancy.
+  Preserve partial completion, small grids, SGD batching, all requested
+  workers and the fixed absolute criterion under both protocols.
   Keep every completed-step gate; lower claim traffic alone is insufficient.
   Keep the short-K AT gap as an unresolved target without repeating rejected
   tile selectors or delaying optimizer eligibility.
