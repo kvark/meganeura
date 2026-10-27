@@ -41,6 +41,12 @@ preserve all shader bytes: globally deferring updates regresses training about
 no useful gain. All three dependency probes are reverted; the qualified runtime
 remains `3f95fa4`.
 
+Two [cooperative-attention probes](#cooperative-attention-ownership-and-row-softmax)
+also establish no gain. Restricting score computation to its publishing subgroup
+leaves model GPU diagnostics within 0.2% of control. Sharing row softmax results
+adds a barrier and shared storage; forward SDK replay regresses 0.57% despite
+slightly lower estimated instruction counts. Both are reverted.
+
 The preceding [fused-matrix tile selection](#fused-matrix-tile-selection) adds
 small-tile routing for fused transposed-B products and extends the existing
 32×16 fused-plain refinement to K≥256. Against qualified `da86b45`, 1,000
@@ -118,6 +124,103 @@ cannot overlap. Library tests also use the GPU and need this flag. Builds use
 the same launcher without the GPU flag; finish them before primary measurements.
 The launcher now records memory peaks, limit events and memory/CPU/I/O pressure
 after each job, preserving the target's exit status and forwarding termination.
+
+## Cooperative attention ownership and row softmax
+
+Two independent probes start from qualified runtime `3f95fa4`, using its archived
+`validated-*` binaries as controls. Neither changes worker counts, selected
+implementations, graph dependencies, queue atomics, fences or submission scope.
+The same forward shader serves ordinary and persistent execution.
+
+The **score-owner probe** places cooperative Q/K loads and accumulation inside
+the existing `sg == 0u` publication condition. The subgroup that writes the
+score tile performs the same reduction in the same order; other subgroups'
+discarded private results are unused. The predicate is subgroup-uniform, and
+all workgroup barriers remain unconditional. This does not eliminate inactive
+logical groups or assume a mapping between local invocation and subgroup IDs.
+
+The **row-softmax probe** starts independently from the qualified shader. One
+of each query row's four output chunks computes its maximum, probabilities and
+serial sum, then publishes the results to the other chunks through shared
+memory and one additional workgroup barrier. The score array becomes probability
+storage after the complete row-maximum pass. Two new f32[16] arrays hold the
+maximum and sum; every row, including padding, is initialized. The original
+correction, scalar PV order, scalar tails, masking and all existing barriers
+remain. Shared-memory admission accounts for the additional **128 bytes** in
+both operand-precision specializations. Graph scratch adds **160 bytes** after
+inactive-sentinel padding, and both new statistic reads retain their guards.
+
+Each probe passes **52 codegen checks, 22 attention reference tests in ordinary
+execution, the same 22 tests in strict whole-graph execution, fourteen whole-graph
+smoke tests and fifty diagnostic comparisons**. The diagnostic protocol uses
+five pairs per case/mode, 100 ms matched prewarming and at least ten warmups and
+one warmup second. All complete-state budgets, selection, completion, one-dispatch
+and no-fallback checks pass; maximum error remains 4.66e-9. This is a preflight,
+not the normal completed-step retention gate or full library/oracle/matrix suite.
+
+| Probe | Model phase | Persistent GPU interval, control / candidate | Change | Ordinary GPU change |
+|---|---|---:|---:|---:|
+| Score owner | Forward | 4.091200 / 4.094368 ms | +0.08% | +0.00% |
+| Score owner | Training + SGD | 13.067264 / 13.051168 ms | −0.12% | −0.09% |
+| Shared row softmax | Forward | 4.102880 / 4.119936 ms | +0.42% | +0.24% |
+| Shared row softmax | Training + SGD | 13.045152 / 13.109824 ms | +0.50% | +0.12% |
+
+All 256 requested workers remain enabled, with 168 participating model workers.
+Graph work stays 22,042 forward / 83,312 training tiles. Score ownership leaves
+forward/training register counts at 86/84, shared storage at 18,928/29,344 bytes
+and code sizes at 99,584/238,720 bytes. Shared softmax raises registers to **94/88**,
+shared storage to **19,088/29,504 bytes**, and code sizes to **103,040/242,048 bytes**.
+No gain is established; source-level removal of duplicated work alone is
+insufficient evidence for retention.
+
+All nineteen CI sources and thirty-nine model sources are byte-identical in
+each probe. Exact ordinary-source inverses isolate the intended score block or
+softmax block and declarations. Each model graph has one changed attention
+handler. For shared softmax, the audit first reverses the two new scratch arrays,
+their inactive initialization and the corresponding renumbering of existing
+f16 scratch slots; remaining differences outside attention are blank lines.
+Other handler arithmetic, scratch ownership and guards remain unchanged.
+
+Four matched **row-softmax forward SDK backend captures / sixteen metric groups**
+measure ordinary replay **3.263045→3.266990 ms (+0.12%)** and persistent replay
+**4.203976→4.228145 ms (+0.57%)**. Persistent estimated warp instructions fall
+0.91%, integer-pipe work 1.07%, FP32 work 1.70%, global-load sectors 1.06% and
+shared wavefronts 0.48%. Local loads/stores remain zero. Barrier waiting rises
+**55.29→55.57% of active warp cycles**, with active compute warps near 32.3% of
+peak. These small estimates do not separate added synchronization, register
+lifetime, scratch layout and code composition as causes; waiting shares are
+not elapsed-time fractions. No new training or score-owner SDK result is claimed.
+
+All four actual exported states are bitwise identical across both binaries and
+backends: **147,034,513 floats / 588,138,052 bytes** each, SHA-256
+`4e5d66e6ce5e95142b848651d316b4df64855a9d85669499cabc3a81089be629`.
+Maximum within-capture clock/instruction-rate spreads are **0.142%/1.183%**.
+The instruction-rate spread also limits interpretation of small counter changes.
+No GPU test or SDK capture fails or needs a repeat.
+
+Both probes are reverted. Source/dependency hashes and rebuilt benchmark binaries
+match the qualified controls exactly; fourteen restored smoke tests pass. Both
+compiler forks remain clean and unchanged. Three non-GPU audit failures are
+preserved and corrected: an ordinary-shader filename prefix, an archived-source
+directory name, and the initial assumption that adding scratch would leave all
+other handler text unchanged. No GPU work is rerun for these corrections.
+
+Evidence is local in `target/coop-attention-score-owner/` and
+`target/coop-attention-row-softmax/`. The independently verified manifest
+`target/megakernel-results/coop-attention-ownership/summary.json` records **723
+artifact hashes and 34 completed bounded cgroups**, SHA-256
+`f480e9ed17113cacc59404b27c066ac631f66b353bbac39e244819ac94fd4ba2`.
+Peak recorded job memory is **3,717,472,256 bytes**, with zero memory-limit events.
+All heavy work uses separate verified `ml.slice` scopes; GPU work is serialized,
+and builds/copies/heavy analysis stay outside measurements. Artifacts remain on
+local `/x`, and all launched jobs finish. Runtime remains `3f95fa4`; baseline
+parity remains unmet.
+
+Next, audit whether subgroup-local sharing can avoid the extra workgroup barrier
+and scratch arrays. Any such probe must explicitly establish its lane mapping
+and admission conditions, preserve per-output arithmetic and inactive guards,
+and pass the same completed-step gates. The current shared-memory variant is
+rejected; fewer active-lane operations do not establish a speedup.
 
 ## Optimizer overlap controls
 

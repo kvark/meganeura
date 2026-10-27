@@ -773,11 +773,24 @@ the descriptor-reference repair requires fresh measurements.
   receipts, preserving the failed manifest; no GPU rerun. Revert all probes,
   restore exact qualified binaries and pass fourteen final smoke tests. See
   the [optimizer-overlap evidence](megakernel_whole_graph.md#optimizer-overlap-controls).
-  Next, inspect forward cooperative-attention staging and synchronization:
+  Inspect forward cooperative-attention staging and synchronization, where
   refreshed spans are about 20.5 µs per node versus 9.2 µs in ordinary profiling.
-  Preserve arithmetic order, inactive guards, scratch ownership and required
-  barriers. Keep the short-K AT gap as an unresolved target without repeating
-  the rejected tile selectors or delaying optimizer eligibility.
+  Restrict score computation to its publishing subgroup, then independently
+  share each row's softmax through existing score storage and two new arrays.
+  Each probe passes 52 codegen checks, 22 attention references in each execution
+  mode, fourteen smoke tests and fifty full-state diagnostics. Score ownership
+  leaves model timings within 0.2%; shared softmax adds a barrier, 160 graph
+  scratch bytes and registers without a speedup. Four forward SDK captures show
+  0.57% slower persistent replay despite small estimated instruction savings.
+  Preserve exact exported states, corrected source/scratch audits, 723 verified
+  artifact hashes and 34 completed cgroups. Revert both probes, restore exact
+  qualified binaries and pass fourteen restored smoke tests. See the
+  [attention ownership evidence](megakernel_whole_graph.md#cooperative-attention-ownership-and-row-softmax).
+  Next, audit subgroup-local sharing that could avoid added workgroup barriers
+  and scratch arrays. Establish explicit lane mapping and admission conditions;
+  preserve arithmetic order, inactive guards and required synchronization.
+  Keep the short-K AT gap as an unresolved target without repeating rejected
+  tile selectors or delaying optimizer eligibility.
   Do not sum overlapping spans or infer a memory bottleneck from traffic alone.
   Keep the five-case primary gate and
   add matched `--prewarm-ms 100` controls. Preserve all samples, state checks,
