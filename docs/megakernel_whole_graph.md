@@ -35,8 +35,11 @@ not another retained speedup.
 Three subsequent [short-K tile probes](#short-k-transposed-a-tile-geometry)
 replace selected 64×64 tiles with 32×32, 32×64 or 64×32. All pass correctness
 checks but regress persistent training GPU diagnostics by 9.5%, 2.5% and 1.3%.
-They are reverted. Next, isolate contention between graph work and optimizer
-updates while preserving the single-dispatch execution contract.
+They are reverted. Subsequent [optimizer-overlap controls](#optimizer-overlap-controls)
+preserve all shader bytes: globally deferring updates regresses training about
+5%, while serializing independent updates in prerequisite-count order yields
+no useful gain. All three dependency probes are reverted; the qualified runtime
+remains `3f95fa4`.
 
 The preceding [fused-matrix tile selection](#fused-matrix-tile-selection) adds
 small-tile routing for fused transposed-B products and extends the existing
@@ -116,6 +119,112 @@ the same launcher without the GPU flag; finish them before primary measurements.
 The launcher now records memory peaks, limit events and memory/CPU/I/O pressure
 after each job, preserving the target's exit status and forwarding termination.
 
+## Optimizer overlap controls
+
+Three host-side dependency probes test optimizer overlap against qualified
+runtime `3f95fa4`. They preserve every original dependency and add no GPU nodes.
+The first links original graph sinks to appended-command roots, so all optimizer
+work waits for the graph. The second links appended commands in recording
+order. The third, limited to originally independent appended commands, chains
+them by increasing original ancestor count, breaking ties by recording index.
+Ancestor count is a readiness heuristic, not a measured completion time.
+
+All **61 shader sources and complete pipeline-resource multisets remain
+identical** in every probe. Handler selection, logical grids, descriptors,
+arithmetic, packing, scratch, queue layout, fences and atomic instructions are
+unchanged. Independent audits of fifteen metadata dumps verify original-edge
+inclusion, exact added edges, acyclicity, transitive prerequisites, initial
+pending counts and ready bits. Removing each temporary host block recovers the
+original runtime source exactly. The original graph metadata also matches
+between the three controls.
+
+Model training has 523 graph nodes and four SGD nodes. Global deferral adds
+129 edges, changing 698→827 edges and scheduler/resident memory by 516 bytes.
+It adds one edge and four bytes to CI SGD. Each chain adds three model edges
+and twelve bytes, leaving CI dependencies unchanged. No other allocation
+changes. All 256 requested workers remain enabled; model participation stays
+168. Forward retains 86 registers / 18,928 shared bytes / 99,584 code bytes;
+training retains 84 / 29,344 / 238,720. Graph tasks remain 22,042 forward and
+83,312 training, with 97,522 additional SGD tiles in training.
+
+Each probe passes **52 codegen checks, fourteen whole-graph smoke tests and
+fifty diagnostic comparisons**. Each control/candidate visit uses five
+interleaved ordinary/persistent pairs per case, at least ten warmups and one
+warmup second, and 100 ms matched prewarming. Every full-state, selection,
+logical-completion, one-dispatch and no-fallback check passes; maximum model
+error remains 4.66e-9.
+
+| Dependency control | Persistent training GPU interval, control / candidate, ms | Change | Ordinary training GPU change |
+|---|---:|---:|---:|
+| Defer all optimizer work | 13.056032 / 13.694144 | +4.89% | +0.02% |
+| Chain in recording order | 13.058112 / 13.724640 | +5.10% | −0.07% |
+| Chain by prerequisite count | 13.048288 / 13.064224 | +0.12% | +0.11% |
+
+The recording-order chain also makes its last three updates wait for the full
+graph, so it does not isolate inter-optimizer concurrency. The exact numbers
+of original graph ancestors, in SGD recording order, are:
+
+| Policy | SGD 523 | SGD 524 | SGD 525 | SGD 526 |
+|---|---:|---:|---:|---:|
+| Original | 511 | 470 | 380 | 165 |
+| Global deferral | 523 | 523 | 523 | 523 |
+| Recording-order chain | 511 | 523 | 523 | 523 |
+| Prerequisite-count chain | 523 | 470 | 380 | 165 |
+
+The last chain runs 526→525→524→523. Unlike the recording-order chain, it retains
+the earlier graph prerequisites for the first three updates it executes. Both
+chains have identical edge counts, allocations and shader bytes, yet substantially
+different timings. The prerequisite-count chain's ratio of GPU medians changes
+only +0.009% after ordinary normalization; no useful gain is established.
+The unchanged CI backward control shifts −2.5% in one visit, and ordinary CI
+inference shifts −4.9% in another, reinforcing the limits of these small samples.
+
+Four fresh **global-deferral training SDK captures / sixteen metric groups**
+confirm persistent replay **13.304061→13.973526 ms (+5.03%)**, versus ordinary
+**11.670792→11.682692 ms (+0.10%)**. Estimated persistent warp instructions change
++0.43%, integer work −0.07%, FP32 work −0.10%, global-load sectors +0.27% and
+shared wavefronts −0.06%. Local loads/stores remain zero. Barrier waiting rises
+**47.06→48.71% of active warp cycles**, while active compute warps stay near
+32.6% of peak. The extra elapsed time is not accompanied by a comparable
+increase in estimated instruction or traffic totals. This supports scheduling
+and overlap as contributors without identifying one stall mechanism. Counter
+totals are estimated from rates and replay duration; barrier shares describe
+active warp cycles, not elapsed-time fractions.
+
+All four exported states contain **246,883,105 floats / 987,532,420 bytes** and
+are independently hashed. States match bitwise across control/candidate within
+each backend. Ordinary/persistent states use the unchanged numerical budget,
+with maximum error 4.66e-9; they are not bitwise equal. SDK replay uses zero
+learning rate for stable state. Maximum within-capture clock/instruction-rate
+spreads are 0.448%/0.282%; no capture fails or requires a repeat. No fresh SDK
+result is claimed for either chain or forward.
+
+All three probes are reverted. Runtime and dependency hashes are restored,
+both forks are clean, rebuilt benchmark binaries match the qualified controls
+exactly, and fourteen final restored smoke tests pass. A missing-receipt error
+in the first manifest attempt exposed stale study labels in a copied restoration
+script. Source/binaries were already restored; an independent hash audit writes
+the omitted receipts and verifies that earlier-study receipts remain unchanged.
+The original scripts and failed manifest are preserved; no GPU work is rerun.
+
+Local evidence is in `target/optimizer-deferred/`, `target/optimizer-serial/`
+and `target/optimizer-ready-order/`. Manifest
+`target/megakernel-results/optimizer-overlap/summary.json` contains **1,023
+independently verified artifact hashes and 42 completed bounded cgroups**,
+SHA-256 `d32ee878e1cd96b64371789d186b537f76ee9a3b1815be7a13b5ffc0171025a8`.
+Peak recorded job memory is **4,720,439,296 bytes**, with zero memory-limit
+events. Heavy jobs use separate verified 16/20/1 GiB memory-high/hard/swap scopes;
+GPU jobs are serialized, timing excludes builds/copies/heavy analysis, and all
+artifacts stay on local `/x`. Every launched job finishes. No normal retention
+gate or full library/oracle/matrix qualification is claimed for these reverted
+controls. Baseline parity remains unmet.
+
+Next, inspect the forward cooperative-attention handler and its shared-memory
+staging/synchronization. The refreshed trace spans about 20.5 µs per node versus
+9.2 µs in ordinary profiling. Preserve selected arithmetic, inactive guards,
+scratch ownership and required barriers; different profiling contracts still
+prevent treating that span difference as directly recoverable time.
+
 ## Short-K transposed-A tile geometry
 
 Three selector-only probes against qualified runtime `3f95fa4` test the large
@@ -184,12 +293,11 @@ events. All heavy jobs use separate verified 16/20/1 GiB memory-high/hard/swap
 limits; GPU jobs are serialized and builds/copies/heavy analysis stay outside
 timing. No jobs survive the completed investigation. Baseline parity remains open.
 
-Next, test a dependency-only control that defers appended optimizer commands
-until original graph work completes. Keep handler bytes, logical grids, worker
-count, fences and the single dispatch/submission unchanged. This can test the
-effect of optimizer overlap without another matrix geometry change. Preserve
-the original dependency edges and exact state checks; an improvement would
-still require the full completed-step and matched-counter qualification.
+The subsequent [optimizer-overlap controls](#optimizer-overlap-controls) test
+deferral and two serialization orders while preserving handler bytes, logical
+grids, workers, fences, original dependency edges and one dispatch/submission.
+None establishes an improvement; any future retained change still requires the
+full completed-step and matched-counter qualification.
 
 ## Refreshed handler clock attribution
 

@@ -758,12 +758,26 @@ the descriptor-reference repair requires fresh measurements.
   hashes and 43 completed cgroups, including two corrected non-GPU audit errors.
   Revert all three probes and restore exact qualified binaries and smoke checks.
   See the [short-K geometry evidence](megakernel_whole_graph.md#short-k-transposed-a-tile-geometry).
-  Next, isolate optimizer contention with a dependency-only control that defers
-  appended commands until original graph work completes. Preserve original
-  dependencies, handler bytes, logical grids, worker count, fences, exact state
-  checks and one compute dispatch/submission. The 720×4096×50 stage spans about
-  108 µs versus 37 µs in ordinary profiling; 2048×720×50 spans 55 µs versus 23 µs.
-  Keep forward cooperative attention as another target.
+  Test optimizer overlap using global deferral, a recording-order chain and
+  an independent-command chain ordered by prerequisite count. Preserve every
+  original dependency, all 61 shader sources, pipeline resources, logical work,
+  workers, fences and one dispatch/submission. Each passes 52 codegen checks,
+  fourteen smoke tests and fifty full-state diagnostics. Global deferral and
+  recording-order chaining regress training about 5%; the latter also postpones
+  three updates until the full graph completes. Prerequisite-count chaining
+  preserves earlier eligibility but establishes no gain. Four global-deferral
+  training SDK captures confirm a 5.03% regression with nearly unchanged
+  estimated instruction/traffic totals and higher barrier waiting. Preserve
+  exact per-backend exported states, fifteen dependency audits, 1,023 verified
+  artifact hashes and 42 completed cgroups. Correct the missing restoration
+  receipts, preserving the failed manifest; no GPU rerun. Revert all probes,
+  restore exact qualified binaries and pass fourteen final smoke tests. See
+  the [optimizer-overlap evidence](megakernel_whole_graph.md#optimizer-overlap-controls).
+  Next, inspect forward cooperative-attention staging and synchronization:
+  refreshed spans are about 20.5 µs per node versus 9.2 µs in ordinary profiling.
+  Preserve arithmetic order, inactive guards, scratch ownership and required
+  barriers. Keep the short-K AT gap as an unresolved target without repeating
+  the rejected tile selectors or delaying optimizer eligibility.
   Do not sum overlapping spans or infer a memory bottleneck from traffic alone.
   Keep the five-case primary gate and
   add matched `--prewarm-ms 100` controls. Preserve all samples, state checks,
