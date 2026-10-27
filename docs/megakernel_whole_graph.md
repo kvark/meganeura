@@ -19,7 +19,8 @@ the existing shared-cache initialization and barrier. Against qualified
 `cf8940f`, 1,000 completed-step comparisons improve persistent forward by
 **5.8% original / 6.6% prewarmed**. SDK forward replay improves **6.9% persistent /
 2.3% ordinary**. CI and training shader bytes are unchanged; no new gain is
-attributed to those cases. Current paired persistent/ordinary medians are
+attributed to those cases. That qualification's paired persistent/ordinary
+medians are
 **1.310× forward / 1.069× training**, or **1.282× / 1.165×** with prewarming.
 All requested workers remain enabled. Baseline parity remains unmet.
 
@@ -62,6 +63,14 @@ The following [cooperative-matrix reset controls](#cooperative-matrix-scratch-in
 also stay within 0.2% of control and are reverted. An expanded strict matrix
 sweep identifies seven admission rejections shared by the baseline and both
 candidates, while all forty-four admitted cases pass.
+
+Two [ready-width specialization probes](#immutable-ready-bitmap-width) pass full
+qualification and 3,000 completed-step comparisons, but no absolute model gain
+survives reversed-order confirmation. Refined training SDK GPU time improves
+1.02% and normalized prewarmed timing improves in both sequences; that evidence
+does not meet the declared absolute retention criterion. Both are reverted.
+Fresh control paired persistent/ordinary medians are **1.309× forward / 1.093×
+training**, or **1.275× / 1.164×** prewarmed. Runtime remains `3f95fa4`.
 
 The preceding [fused-matrix tile selection](#fused-matrix-tile-selection) adds
 small-tile routing for fused transposed-B products and extends the existing
@@ -141,6 +150,131 @@ the same launcher without the GPU flag; finish them before primary measurements.
 The launcher now records memory peaks, limit events and memory/CPU/I/O pressure
 after each job, preserving the target's exit status and forwarding termination.
 
+## Immutable ready-bitmap width
+
+Two probes start from `1b0b2d3`, against qualified runtime `3f95fa4`. They replace
+the ready-bitmap scan bound and modulo divisor with the width already known
+when generating the graph. The first specializes every width; the refinement
+keeps single-word graphs byte-identical and specializes only the multiword
+completion-epoch scheduler. It preserves the exact u32 expressions, overflow
+behavior, scan order, atomics, fences, completion policy and requested workers.
+It does not introduce the previously rejected last-successful-word cursor.
+
+`Graph::record` derives width from the final work length, including optimizer
+nodes, and supplies the same value to queue allocation, configuration and source
+generation. Source participates in the pipeline cache key. Frame reuse requires
+matching graph nodes, work length, handlers, grids and bindings; parameter-only
+updates preserve width. External recordings own immutable frames through
+submission retirement. Empty graphs return before queue construction.
+
+Source audits reverse exactly two replacements within `graph_claim`; every
+other byte is unchanged. The first changes five graphs, with widths 1/1/1/5/17,
+while preserving sixteen ordinary CI and forty ordinary model sources. The
+refinement preserves **all nineteen CI sources**, including their three graph
+shaders, and changes only the two model graphs. All forty-two model sources
+match the first candidate exactly. No handler, arithmetic selection, allocation,
+scratch size or logical work changes. Model resources remain **86/84 registers,
+18,928/29,344 shared bytes and 168 participating workers**, with all 256 requested
+workers enabled. Code shrinks 99,584→99,200 forward and 238,720→238,464 training
+bytes. Logical work remains 22,042/83,312 tiles.
+
+Each candidate passes **676 library tests (eight ignored), 168 strict whole-graph
+oracle cases, 51 ordinary matrix regressions, fourteen whole-graph smoke tests
+and 52 codegen checks**, plus strict all-target/all-feature Clippy, formatting,
+release builds and Metal-target compilation. Existing smoke coverage includes
+32/33/65-node bitmap boundaries, poisoned storage, parameter/optimizer changes,
+external recording snapshots, repeated execution and 1/3/256/4096 workers.
+No Metal GPU execution or additional hardware is qualified. Qualified rebuilds
+match both frozen candidate binaries exactly; both compiler forks are unchanged.
+
+Each probe completes 1,000 normal completed-step comparisons: 500 original and
+500 with matched 100 ms prewarming, control/candidate/candidate/control visits,
+25 interleaved pairs per case/visit, at least ten warmups and one warmup second.
+All five cases pass matching implementation, complete-state, logical-work,
+one-dispatch and no-fallback checks. Fifty separate diagnostic comparisons per
+candidate also pass. Maximum absolute model error remains 4.66e-9.
+
+| Probe | Protocol / model phase | Control, ms | Candidate, ms | Candidate/control, bootstrap 95% interval |
+|---|---|---:|---:|---:|
+| All widths | Original forward | 4.695474 | 4.634854 | 0.9871 [0.9796, 0.9982] |
+| All widths | Original training + SGD | 15.490774 | 15.536485 | 1.0030 [0.9975, 1.0189] |
+| All widths | Prewarmed forward | 4.386577 | 4.684283 | 1.0679 [0.9528, 1.0764] |
+| All widths | Prewarmed training + SGD | 13.446528 | 13.340097 | 0.9921 [0.9739, 0.9950] |
+| Multiword only | Original forward | 4.710884 | 4.659223 | 0.9890 [0.9830, 0.9974] |
+| Multiword only | Original training + SGD | 15.580531 | 15.542225 | 0.9975 [0.9810, 1.0138] |
+| Multiword only | Prewarmed forward | 4.415392 | 4.548398 | 1.0301 [0.9366, 1.0699] |
+| Multiword only | Prewarmed training + SGD | 13.448068 | 13.379692 | 0.9949 [0.9763, 1.0152] |
+
+The first candidate's CI SGD medians regress 3.3% original / 3.5% prewarmed;
+their intervals include no change. The refinement restores the exact CI
+shaders. Remaining CI timing shifts therefore cannot establish a shader gain.
+Refined original forward's apparent 1.10% absolute gain tracks ordinary's
+1.15% improvement. Refined prewarmed training improves the paired persistent/
+ordinary ratio 0.74% [0.42%, 0.99%], but its absolute interval includes no change.
+Pooled bootstrap intervals omit some between-visit variation.
+
+Both diagnostic visits measure about **0.9% lower persistent training GPU
+time**; forward remains within 0.2%. Four matched SDK backend captures, sixteen
+metric groups, compare only refined training plus SGD. Persistent replay
+improves **13.396912→13.260011 ms (1.02%)**, versus ordinary
+11.715802→11.735737 ms (+0.17%). Estimated persistent warp instructions fall
+1.04%; integer-pipe work changes −0.10%, FP32 −0.13%, global-load sectors +0.01%
+and shared wavefronts −0.09%. Local traffic stays zero. Barrier waiting changes
+47.03→46.51% of active warp cycles; this is not an elapsed-time fraction.
+Active compute warps stay near 32.6% of peak. Counter rates multiplied by replay
+duration are estimates: unchanged ordinary shader work also shifts by about
+1.2% in these estimates. Maximum clock/instruction-rate group spreads are
+0.50%/1.19%. These counters support a small GPU-time change without isolating
+its cause or establishing an end-to-end win.
+
+All four actual SDK training states contain **246,883,105 floats / 987,532,420
+bytes**. Control and candidate match bit-for-bit within each backend; ordinary
+and persistent states pass the numerical budget but are not bit-identical.
+Ordinary SHA-256 is `f67022044ae8966ac48c5d62cd0907411fb42f4d1864c1ba0b3d555b17ce7be0`;
+persistent SHA-256 is `1e359875fa92965d4b0aa9026c050702ae3ac165aa59c0a4cc74a6381589c3b7`.
+SDK replay uses zero-rate SGD for stable state, separately from normal training.
+There are no fresh forward or first-candidate SDK captures.
+
+Because refined absolute training intervals included no change, a predeclared
+confirmation requires an absolute model completed-step benefit before retention.
+It reverses visit order to candidate/control/control/candidate and completes
+another **1,000 comparisons**, with the same five cases, protocols and checks.
+All pass. This brings the study to **3,000 completed-step comparisons**, plus
+100 diagnostics, without removing any sample or repeating until success.
+
+| Confirmation, persistent completed step | Control, ms | Candidate, ms | Candidate/control, bootstrap 95% interval |
+|---|---:|---:|---:|
+| Original forward | 4.683378 | 4.678629 | 0.9990 [0.9421, 1.0190] |
+| Original training + SGD | 15.363919 | 15.368989 | 1.0003 [0.9724, 1.0165] |
+| Prewarmed forward | 4.383697 | 4.384576 | 1.0002 [0.9638, 1.0666] |
+| Prewarmed training + SGD | 13.458263 | 13.351132 | 0.9920 [0.9708, 1.0105] |
+
+Prewarmed normalized training improves again, by **0.87%**, with ratio
+0.9913 [0.9882, 0.9949]. However, every absolute model interval includes one;
+the prewarmed absolute training estimate is −0.80% [−2.92%, +1.05%]. Thus a
+small steady-state GPU/relative benefit repeats, but no absolute completed-step
+benefit survives the confirmation criterion. **Both probes are reverted**;
+this is inconclusive absolute timing evidence, not proof of zero GPU benefit.
+No further confirmation is run. Fresh qualified-control paired persistent/
+ordinary medians are **1.309× forward / 1.093× training**, or **1.275× / 1.164×**
+prewarmed. These are medians of paired ratios, not ratios of aggregate medians.
+
+All nineteen source/dependency hashes and both rebuilt benchmark binaries match
+the qualified control exactly; fourteen restored smoke tests pass. Both compiler
+forks remain clean. Runtime stays `3f95fa4`; baseline parity remains unmet.
+
+Artifacts remain local in `target/ready-width-constant/` and
+`target/ready-width-multiword/`. Manifest
+`target/megakernel-results/ready-width-specialization/summary.json` independently
+verifies **908 artifact hashes and 98 completed bounded study cgroups**,
+SHA-256 `f4f7a6576cce8a9ab0bd2b6cd5fb10f349080f28ddea7d4aa132a5c71a10599b`.
+Peak recorded job memory is **4,717,015,040 bytes**, with zero memory-limit events.
+Heavy jobs use verified 16/20/1 GiB memory-high/hard/swap limits, GPU work is
+serialized, and builds/copies/heavy analysis stay outside measurements. All
+launched jobs finish. The next control revisits completion-epoch waiting against
+the latest qualified runtime, including the deferred direct forward comparison,
+while retaining both model phases and unchanged CI/state gates.
+
 ## Cooperative matrix scratch initialization
 
 Two controls start from `d0caa54`, retaining runtime `3f95fa4`. They omit converter
@@ -209,11 +343,9 @@ Peak recorded job memory is **3,716,595,712 bytes**, with zero memory-limit even
 All heavy work uses separate verified `ml.slice` scopes, GPU jobs are serialized,
 and artifacts stay on local `/x`. All jobs finish. Baseline parity remains unmet.
 
-Next, specialize the ready-bitmap width already known when compiling each graph.
-The runtime currently uses it as a scan bound and modulo divisor. Preserve the
-same word order, claims, publication and worker counts; verify frame reuse and
-pipeline identity retain the matching width. This differs from the rejected
-last-successful-word cursor, which changed scan order.
+The subsequent [ready-width study](#immutable-ready-bitmap-width) specializes
+the scan bound and modulo divisor while preserving word order, claims,
+publication and workers. It verifies frame reuse and pipeline width agreement.
 
 ## Cooperative attention scratch initialization
 

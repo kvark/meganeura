@@ -818,10 +818,24 @@ the descriptor-reference repair requires fresh measurements.
   admission failures, exact source inverses, 660 verified hashes and 37 completed
   cgroups. Revert both probes and restore exact qualified binaries and smoke
   tests. See the [matrix reset evidence](megakernel_whole_graph.md#cooperative-matrix-scratch-initialization).
-  Next, specialize the immutable ready-bitmap width in the generated scheduler,
-  preserving scan order, claims, fences and all requested workers. Verify width
-  agreement across frame reuse and pipeline caching. This changes the dynamic
-  scan bound/divisor, not the rejected last-successful-word cursor policy.
+  Specialize the immutable ready-bitmap width, first for all graphs and then
+  only multiword graphs, preserving exact scan order, claims, fences and workers.
+  Audit frame/cache width agreement, reverse exactly two source substitutions,
+  and preserve all ordinary shaders; the refinement also preserves all CI shaders.
+  Each passes 676 library tests, 168 strict oracle cases, 51 matrix regressions,
+  fourteen smoke and 52 codegen checks, plus 1,000 completed-step comparisons.
+  Refined SDK training improves 1.02% GPU
+  time, but its absolute completed-step interval includes no change. Run one
+  predeclared reversed-order, 1,000-comparison confirmation: relative prewarmed
+  training improves again, while every absolute model interval still includes
+  one. Revert both because the absolute gain remains unestablished. Preserve all
+  3,000 comparisons, 100 diagnostics, sixteen SDK groups, 908 verified artifact
+  hashes and 98 completed bounded cgroups; restore exact sources/binaries and
+  fourteen smoke tests. See the [ready-width evidence](megakernel_whole_graph.md#immutable-ready-bitmap-width).
+  Next, complete the deferred direct forward comparison of completion-epoch
+  waiting against the latest qualified runtime. Preserve both model phases,
+  all requested workers, publication/progress semantics and the unchanged gates;
+  distinguish polling savings from resource/worker-participation changes.
   Keep the short-K AT gap as an unresolved target without repeating rejected
   tile selectors or delaying optimizer eligibility.
   Do not sum overlapping spans or infer a memory bottleneck from traffic alone.
