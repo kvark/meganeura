@@ -699,8 +699,16 @@ the descriptor-reference repair requires fresh measurements.
   Prewarmed forward's larger 9.1% wall shift accompanies an 8.3% ordinary shift
   and an inconclusive normalized interval; do not attribute all of it to the
   selector. See the [fused-matrix qualification](megakernel_whole_graph.md#fused-matrix-tile-selection).
-  Next, audit exhausted-tile claims in the single-word small-graph scheduler
-  and the remaining forward payload costs while preserving all acceptance cases.
+  Audit exhausted-tile claims in the single-word small-graph scheduler with a
+  counter precheck, a private exhaustion bitmap and a delayed completion load.
+  All three pass 52 codegen checks, fourteen smoke tests and fifty diagnostic
+  comparisons each. The delayed load's short timestamp gain does not survive
+  600 completed-step CI comparisons: all raw persistent intervals include one,
+  and prewarmed backward's normalized ratio regresses 1.45%. Revert all probes;
+  restored binaries match the qualified control and fourteen smoke tests pass.
+  Preserve 932 verified artifact hashes and 44 completed cgroup records. See the
+  [single-word claim controls](megakernel_whole_graph.md#single-word-claim-controls).
+  Next, investigate the remaining forward payload costs while preserving all acceptance cases.
   Keep the five-case primary gate and
   add matched `--prewarm-ms 100` controls. Preserve all samples, state checks,
   requested workers and acceptance budgets; changed cache/power state is not a

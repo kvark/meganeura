@@ -92,6 +92,90 @@ the same launcher without the GPU flag; finish them before primary measurements.
 The launcher now records memory peaks, limit events and memory/CPU/I/O pressure
 after each job, preserving the target's exit status and forwarding termination.
 
+## Single-word claim controls
+
+Three scheduler probes against qualified `cf8940f` target graphs with at most
+32 nodes. All are reverted. The retained runtime, dependency pins and both
+compiler forks are unchanged; baseline parity remains unmet.
+
+1. Load a node's allocation counter before attempting its fetch-add, rejecting
+   exhausted nodes without an RMW. Only the original RMW grants ownership.
+2. Cache exhausted nodes in a private bitmap used by the worker's leader.
+   Only the final valid allocator clears the global ready bit; failed claimers
+   remember exhaustion and skip redundant clears and later claims. Nodes are
+   published once per dispatch. The cache prevents repeated overclaims while
+   the final valid allocator's clear is pending, preserving the host's
+   `claim_limit + batch * workers + 1` overflow bound.
+3. Read the graph's remaining-node counter only after a scan fails to claim
+   work. A valid allocated tile keeps its node incomplete until execution, so
+   a successful claim does not need that termination check. Ready-bit clearing,
+   including failed-claim helping, remains unchanged.
+
+Every probe preserves payload fences, successor publication, completion,
+queue layout, logical tasks and all 256 requested workers. The multiword
+completion-epoch source is untouched. Proof sketches and exact candidate
+patches are archived alongside the measurements.
+
+Each candidate passes **52 codegen checks, fourteen whole-graph smoke tests and
+fifty diagnostic comparisons** across the three CI and two model cases.
+Diagnostics use five pairs per case/mode, at least ten warmups and one second
+of warmup, with 100 ms prewarming and worker/resource instrumentation. Every
+full-state budget, matching implementation, task-total, single-dispatch and
+no-fallback check passes; maximum error is 4.66e-9.
+
+| Diagnostic persistent GPU time, ms | Counter precheck, control → probe | Exhaustion cache, control → probe | Delayed completion load, control → probe |
+|---|---:|---:|---:|
+| CI inference | 0.030912 → 0.030784 | 0.030944 → 0.030624 | 0.030656 → 0.030784 |
+| CI backward | 0.066496 → 0.069888 | 0.066336 → 0.068096 | 0.067616 → 0.066144 |
+| CI backward + SGD | 0.073760 → 0.074176 | 0.072096 → 0.073888 | 0.073920 → 0.072384 |
+
+The first two probes show no useful improvement. The third's approximately
+2% backward/SGD timestamp reduction motivates **600 completed-step CI
+comparisons** without diagnostics: control/candidate/candidate/control visits,
+25 interleaved pairs per case/visit, both original and 100 ms prewarmed protocols.
+All state and execution checks pass, but wall time does not confirm the gain:
+
+| Persistent completed step | Control, ms | Probe, ms | Probe/control, bootstrap 95% interval |
+|---|---:|---:|---:|
+| Original inference | 0.066945 | 0.069226 | 1.0341 [0.9895, 1.1183] |
+| Original backward | 0.093201 | 0.093981 | 1.0084 [0.9991, 1.0169] |
+| Original backward + SGD | 0.096296 | 0.095056 | 0.9871 [0.9684, 1.0015] |
+| Prewarmed inference | 0.065166 | 0.063846 | 0.9797 [0.9391, 1.0285] |
+| Prewarmed backward | 0.092716 | 0.093390 | 1.0073 [0.9980, 1.0210] |
+| Prewarmed backward + SGD | 0.094516 | 0.094711 | 1.0021 [0.9930, 1.0108] |
+
+All six raw persistent intervals include one. Prewarmed backward's normalized
+persistent/ordinary ratio regresses **1.45% [0.15%, 3.06%]**. The original SGD
+ordinary median falls 0.57%, with its ratio interval below one despite identical
+ordinary shader sources. Preserve these shifts and all visits; pooled bootstrap
+intervals do not capture all between-visit variation. The confirmation covers
+CI only, rather than the complete five-case retention gate.
+
+For each probe, only the three CI whole-graph sources change. The other sixteen
+CI sources and all forty-two model sources are byte-identical to control.
+Independent inverse substitutions recover all nine changed CI sources exactly.
+CI register counts stay 48 and shared memory stays 9,616/9,648 bytes. Executable
+sizes for inference/backward/SGD change from 18,944/61,440/65,536 bytes to
+19,072/62,720/64,896 for the precheck, 19,584/61,312/66,816 for the cache, and
+18,944/62,336/65,536 for the delayed load. Model registers remain 84, shared
+memory remains 18,928/29,344 bytes and code remains 102,400/238,720 bytes.
+All model diagnostics still record 168 participating workers and
+22,042/83,312 logical tiles. No model speedup or new SDK counter result is claimed.
+
+All original source and dependency hashes are restored. Rebuilt release
+benchmark binaries match the qualified controls byte-for-byte, and all
+fourteen restored smoke tests pass. The rejected candidates do not receive
+full library/oracle/matrix qualification. Local evidence is under
+`target/single-word-{claim-precheck,exhausted-mask,completion-load}/`.
+The manifest `target/megakernel-results/single-word-claims/summary.json` contains
+**932 independently verified artifact hashes and 44 completed cgroup records**,
+SHA-256 `2e410b83da3835d5e0089355e03b723239bd4e2091be30ad29df78a88e6e2ee7`.
+Peak recorded memory is **3,714,752,512 bytes**, with zero memory-limit events.
+All heavy jobs use verified separate 16/20/1 GiB cgroups, GPU work is serialized,
+and builds/copies/analysis do not overlap timing. All artifacts remain on local
+NVMe under `/x`. Continue investigating the remaining forward payload costs;
+these queue-operation reductions do not justify a runtime change.
+
 ## Fused matrix tile selection
 
 Two changes reuse the existing scalar generator through the shared selector:
