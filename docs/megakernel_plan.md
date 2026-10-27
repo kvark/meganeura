@@ -897,8 +897,19 @@ the descriptor-reference repair requires fresh measurements.
   both qualified binaries and fourteen smoke tests. No normal completed-step
   series or full qualification is claimed. See the
   [private-reservation evidence](megakernel_whole_graph.md#private-second-tile-reservation).
-  Next, isolate per-tile synchronization and execution efficiency with matched
-  geometry and shader resources before introducing another scheduling policy.
+  Test omission of the final scalar AT K-stage reuse barrier in both backends,
+  retaining intermediate-stage and outer reuse synchronization. Verify 7,878
+  scratch-order states, 804 bound cases, 52 codegen checks, fifteen smoke tests,
+  exact source inverses and fifty diagnostics. Training GPU time changes −0.11%;
+  sixteen SDK groups show replay +0.15% persistent / +0.04% ordinary and nearly
+  unchanged persistent barrier share. Revert the probe and preserve four actual
+  state exports, 448 verified artifacts, 26 completed cgroups and the corrected
+  source-auditor failure. Restore source/binary hashes and fourteen smoke tests.
+  See the [final-stage barrier evidence](megakernel_whole_graph.md#final-scalar-at-stage-barrier).
+  Next, sample individual AT tile entry/exit times with immediate timestamp
+  stores, keeping clock values out of handler live ranges. Calibrate overhead
+  and resources against fresh controls; current node spans include gaps between
+  claims. Separate that effect from slow tile execution before another policy.
   Keep every completed-step gate; lower claim traffic alone is insufficient.
   Keep the short-K AT gap as an unresolved target without repeating rejected
   tile selectors or delaying optimizer eligibility.

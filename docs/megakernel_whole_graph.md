@@ -47,6 +47,12 @@ reservations with identical shaders and moving the check outside idle polling
 also produce no retained optimization. All probes are reverted; `c3ad104`
 remains the qualified runtime.
 
+The following [final-stage barrier control](#final-scalar-at-stage-barrier) also
+stays flat: training GPU diagnostics change −0.11%, while SDK replay changes
++0.15% persistent / +0.04% ordinary. It preserves arithmetic, tile geometry,
+registers and shared memory. The probe is reverted; individual tile timing is
+the next attribution target.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -678,10 +684,100 @@ Peak study memory is **4,716,912,640 bytes**, with zero memory-limit events.
 Every heavy job uses a separate verified 16/20/1 GiB cgroup, GPU jobs are
 serialized, and artifacts remain on local `/x` storage. All launched jobs finish.
 
-The short-K AT gap remains unresolved. Further work should isolate per-tile
-synchronization and execution efficiency while preserving geometry and shader
-resources; fewer claims alone do not justify another scheduling policy. Keep
-the existing completed-step gates and qualified runtime as the control.
+The following control isolates a final-stage synchronization opportunity without
+changing claim policy. Keep the existing completed-step gates and qualified
+runtime as the control.
+
+## Final scalar AT stage barrier
+
+This probe starts from `542c69c`, against qualified `c3ad104` and its frozen
+benchmark binaries. It omits the scratch-reuse barrier after the final K stage
+of plain F32, 64×64 scalar AT products without addends, epilogues or split-K.
+Both ordinary and persistent execution use the same change. Existing horizontal
+batches remain eligible: their uniform entry selects exactly one of two bodies.
+The captured plan identifies **82 affected nodes**, including sixteen horizontal
+nodes, totaling **25,972 logical tiles**. These are host-derived barrier
+opportunities, not measured native barrier instructions.
+
+The original pre-reduction barrier orders staged writes before reads. The
+uniform condition `end_k - t > K_TILE` retains the reuse barrier whenever another
+K stage will write scratch. After the final shared read, only register/output
+work remains. Ordinary execution ends; persistent execution retains its outer
+workgroup rendezvous before scratch can be reused. This ordering uses the
+[WGSL workgroup memory semantics](https://www.w3.org/TR/WGSL/#memory-semantics).
+Converter initialization, payload fences, completion, publication and queue
+policy remain unchanged. No compiler-fork change is introduced.
+
+A finite two-/three-lane scratch model checks **7,878 states and 17,016
+transitions** across 32 ordinary/persistent cases with up to four K stages and
+three successive tiles. All retain correct staged values. Negative controls
+that remove an intermediate reuse barrier or the outer rendezvous produce
+four/two hazards. Another **804 bound cases** verify the last-stage predicate,
+including empty K and unsigned boundary arithmetic. This is not a complete
+Vulkan memory-model proof or authorization for allocations beyond runtime limits.
+
+Release builds, formatting, **52 codegen checks and fifteen whole-graph smoke
+tests** pass. The focused test uses K=1/31/32/33/50/64/65/97, output edges,
+dependent consumers, live intermediate outputs, poisoned scratch and two exact
+dyadic-input replays. It tests sixteen-/forty-nine-node graphs under ordinary
+execution and **1/3/256/4096 workers**. An initial passing implementation also
+allowed input-free epilogues; the scope was tightened before measurement and
+all checks rerun.
+
+All **fifty diagnostics** pass selection, complete-state, logical-work,
+one-dispatch and no-fallback gates. Two ordinary shader sources change; reversing
+the barrier condition restores each exactly. Training changes only handler 20
+and the two internal horizontal bodies of handler 29. Removing the condition
+and alpha-renaming Naga's expression temporaries recovers every staging,
+arithmetic, initialization and store statement. All other functions, cases,
+graph entry, nineteen CI shaders and the forward graph remain byte-exact.
+The first auditor incorrectly expected only one changed function; its script
+and failed log remain preserved. The corrected audit covers all three without
+rerunning GPU work.
+
+Training GPU medians are **12.746464→12.732512 ms (−0.11%)**, versus ordinary
+**10.748576→10.751072 ms (+0.02%)**. Forward changes
+**4.073280→4.079136 ms (+0.14%)** on an unchanged shader. Training retains
+**84 registers and 29,344 shared bytes**; code grows 241,664→241,792 bytes.
+Both phases retain 168 participating workers, all 256 requested workers, and
+22,042/83,312 logical tiles. Buffer allocations and scheduler sizes are unchanged.
+These short sequential visits establish no useful gain.
+
+Four matched SDK backend captures collect **sixteen metric groups**. Persistent
+training replay changes **13.023640→13.043179 ms (+0.15%)**, versus ordinary
+**11.675162→11.679551 ms (+0.04%)**. Persistent estimated warp instructions,
+integer instructions, global loads and shared traffic each move less than 0.12%.
+Barrier waiting changes **45.20→45.26% of active warp cycles**, active compute
+warps stay near 32.6%, and persistent local traffic remains zero. Ordinary
+barrier share falls 6.91→6.65% without a replay gain. Clock/instruction-rate group
+spreads stay below 0.43%/0.54%. Counts are rate-times-duration estimates; barrier
+shares do not isolate elapsed-time costs or prove native instruction counts.
+
+All four actual exported states contain **246,883,105 floats** and match
+bit-for-bit between control and candidate within each backend. Cross-backend
+training passes tolerance but is not bit-identical. SDK training uses zero-rate
+SGD for replay stability, separately from normal nonzero-rate diagnostics.
+
+**The probe is reverted.** Twenty-one source/dependency hashes, both qualified
+binary hashes and fourteen restored smoke tests match the retained runtime.
+No full library/oracle/Metal qualification or normal completed-step series is
+claimed. Both compiler forks remain clean and unchanged.
+
+Evidence is under `target/at-final-stage-barrier/`. Manifest
+`target/megakernel-results/at-final-stage-barrier/summary.json` independently
+verifies **448 artifact hashes and 26 completed study cgroups**, including the
+preserved auditor failure, SHA-256
+`e86974a534b7f72a4a3885a11745b192f98def9dff9837aa3b0a78d92321d388`.
+Peak study memory is **4,698,873,856 bytes**, with zero memory-limit events.
+Every heavy job uses a separate verified 16/20/1 GiB cgroup; GPU jobs serialize,
+and artifacts remain on local `/x`. All launched jobs finish.
+
+Next, sample individual AT tile entry/exit times, storing each timestamp
+immediately so no clock value stays live across the handler. Calibrate overhead
+and resource changes against fresh uninstrumented controls. The existing node
+spans include gaps between claims; individual tile intervals can distinguish
+that effect from slow tile execution. Keep every numerical and completed-step
+gate, and do not sum overlapping intervals into purported recoverable time.
 
 ## Completion-epoch control on the current runtime
 
