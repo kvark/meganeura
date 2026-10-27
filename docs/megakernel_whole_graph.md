@@ -38,9 +38,14 @@ also reverted without adding repeats. Baseline parity remains open.
 The following [targeted two-tile claims](#targeted-transposed-a-two-tile-claims)
 also regress. After correcting an admission guard that excluded subgroup votes,
 looped and fixed two-call forms increase training GPU diagnostics by 1.04% and
-1.15%, with registers rising from 84 to 103/96. Both are reverted; the next
-control will preserve the existing single handler call through a private tile
-reservation.
+1.15%, with registers rising from 84 to 103/96. Both are reverted.
+
+The subsequent [private tile reservation](#private-second-tile-reservation)
+preserves that single handler call but also establishes no gain. SDK global/L2
+atomic estimates fall 3.51%/3.73%, while training replay stays flat. Disabling
+reservations with identical shaders and moving the check outside idle polling
+also produce no retained optimization. All probes are reverted; `c3ad104`
+remains the qualified runtime.
 
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
@@ -579,14 +584,104 @@ Peak memory is **3,717,894,144 bytes**, with zero memory-limit events. All heavy
 jobs use the verified 16/20/1 GiB limits, GPU work is serialized, and every
 launched job finishes. Both compiler forks remain clean and unchanged.
 
-Next, test reserving the second tile of an admitted AT claim in private leader
-state across existing outer-loop iterations, preserving the single handler call
-and original scratch barriers. Count completion per executed tile and consume
-reserved work before any idle-epoch wait; prove that outstanding reservations
-prevent premature graph completion. Add no shared state. This differs from the
-earlier single-claim successor handoff: it reserves another tile of the same
-node. It may still increase register pressure and must pass the same gates.
-Baseline parity remains unmet.
+The following private-reservation control preserves the existing single handler
+call while testing the same claim reduction. Baseline parity remains unmet.
+
+## Private second-tile reservation
+
+Starting from `4993113`, these probes compare against qualified `c3ad104` and
+the frozen `target/ready-word-summary/final-*` binaries. They keep the preceding
+admission predicate: **33 short-K scalar AT nodes, 18,708 logical tiles and
+9,354 valid two-tile range claims**, derived from the captured host plan.
+
+The leader claims two adjacent tiles and holds the second in two private words.
+Each tile executes through the original outer iteration, single handler call,
+scratch rendezvous, payload fences and per-tile completion. A metadata flag
+selects claim width two while the broadcast execution width remains one. The
+overflow bound uses the actual claim width. No shared storage is added and no
+compiler-fork API changes.
+
+The leader consumes a reservation before inspecting readiness or waiting on an
+idle epoch. Reserved work remains included in the node's unfinished count, so
+clearing its ready bit cannot prematurely complete the node or graph. The host
+model checks **5,862 states and 14,790 transitions** across 27 one-node cases,
+plus sixteen metadata masks. Ownership never overlaps completed work, reserved
+tiles survive readiness exhaustion, and all modeled nonterminal states can
+advance. This finite model is not a complete Vulkan memory-model proof.
+
+The initial form checks the private slot inside the idle-poll loop. A second
+build disables the runtime metadata flag while retaining identical shaders,
+separating the policy from the added code. A third form checks the slot once at
+function entry, outside idle polling. This is valid because a failed scan cannot
+create a reservation and a successful claim immediately exits the scan. The
+single-word claim path already checks once at entry.
+
+Each build passes formatting, release builds, **52 codegen checks and fifteen
+whole-graph smoke tests**. The focused reservation case covers 255/256-tile
+admission, a 289-tile odd tail, K=65 exclusion, dependent consumers, poisoned
+scratch and two input replays at **1/3/256/4096 workers**. It is expanded from
+eight to forty-one nodes to exercise both single-word and summary claim paths;
+the initial candidate passes that expansion separately. The disabled control
+does not exercise consumption of reserved tiles.
+
+All **175 diagnostic comparisons** pass state, selection, logical completion,
+one-dispatch and no-fallback checks. Maximum model error remains 4.66e-9.
+Only training's `graph_claim_word` and `graph_claim` change, with one added
+`graph_take_reserved` helper. Exact source inverses preserve `graph_main`, every
+case, all handlers, completion and publication. All nineteen CI shaders, forty
+ordinary model shaders and the forward graph remain exact. Enabled and disabled
+reservations have all **61 shader sources** in common.
+
+| Diagnostic training visit | Ordinary GPU ms | Persistent GPU ms |
+|---|---:|---:|
+| Initial control → reservation | 10.753056→10.748736 | 12.705536→12.917888 (+1.67%) |
+| Fresh control / disabled / enabled | 10.757536 / 10.757440 / 10.765408 | 12.872736 / 12.786048 / 12.893376 |
+| Entry-check control → candidate | 10.765504→10.780352 | 12.751104→12.983776 (+1.82%) |
+
+Enabled reservations are 0.84% slower than disabled metadata in the middle
+comparison. These short sequential visits do not isolate a precise causal
+effect; the fresh enabled/control difference is only 0.16%. Moving the check
+out of idle polling does not recover performance. All three builds use training
+registers **84→86** and code bytes **241,664→243,072**. Model shared bytes,
+logical tiles and 168 participating workers remain unchanged, with all 256
+requested workers enabled. Forward GPU changes stay within 0.24% on identical
+shaders.
+
+Four matched SDK backend captures collect **sixteen metric groups** for the
+initial active reservation. Persistent training replay changes
+**13.079270→13.111235 ms (+0.24%)**, versus ordinary
+**11.679766→11.719162 ms (+0.34%)**. Estimated global/L2 atomic sectors fall
+**3.51%/3.73%**, but warp instructions rise **1.18%**. Integer instructions and
+shared traffic stay within 0.14%. Barrier waiting stays at **45.32% of active
+warp cycles**, active compute warps move 32.60→32.73%, and persistent local
+traffic remains zero. Clock/instruction-rate group spreads stay below 0.42%.
+These counters establish no useful replay gain or exact bottleneck attribution;
+rates times duration are estimates and barrier shares are not elapsed time.
+
+All four actual exported states contain **246,883,105 floats** and match
+bit-for-bit between control and candidate within each backend. Cross-backend
+training passes tolerance but is not bit-identical. SDK training uses zero-rate
+SGD for stable replay, separately from the normal nonzero-rate diagnostics.
+
+**All three builds are reverted.** Twenty-one source/dependency hashes, both
+qualified executable hashes and fourteen restored smoke tests match the retained
+runtime. No full library/oracle/Metal qualification or normal completed-step
+series is claimed for these rejected screens. SDK evidence covers only the
+initial active form. Both compiler forks remain clean and unchanged.
+
+Evidence stays in `target/at-private-tile-reservation/` and
+`target/at-private-reservation-{disabled,entry}/`. Manifest
+`target/megakernel-results/at-private-reservation/summary.json` independently
+verifies **1,228 artifact hashes and 46 completed study cgroups**, SHA-256
+`bdec68fe9e02f0d3b9f3f8841b68112a0ef610a1b53e84912fe63a07487b2ce7`.
+Peak study memory is **4,716,912,640 bytes**, with zero memory-limit events.
+Every heavy job uses a separate verified 16/20/1 GiB cgroup, GPU jobs are
+serialized, and artifacts remain on local `/x` storage. All launched jobs finish.
+
+The short-K AT gap remains unresolved. Further work should isolate per-tile
+synchronization and execution efficiency while preserving geometry and shader
+resources; fewer claims alone do not justify another scheduling policy. Keep
+the existing completed-step gates and qualified runtime as the control.
 
 ## Completion-epoch control on the current runtime
 

@@ -884,13 +884,22 @@ the descriptor-reference repair requires fresh measurements.
   source/dependency hashes, both qualified binaries and fourteen smoke tests.
   No normal timing, full qualification or fresh SDK capture is claimed. See the
   [two-tile evidence](megakernel_whole_graph.md#targeted-transposed-a-two-tile-claims).
-  Next, reserve the second admitted AT tile in private leader state across the
-  existing outer loop, preserving the single handler call and scratch barriers.
-  Complete each tile separately, consume reservations before idle waiting, and
-  prove that reserved tiles keep the graph live. Add no shared state. This is
-  same-node tile reservation, distinct from the earlier successor handoff.
-  Keep all completed-step gates; lower claim traffic alone is insufficient, and
-  the reservation may still increase register pressure or reduce parallelism.
+  Test private second-tile reservation through the existing outer loop, keeping
+  every handler, case, scratch barrier and per-tile completion unchanged. Prove
+  reserved-work liveness in 5,862 finite states; extend the focused smoke case
+  to both eight- and forty-one-node graphs. The initial form regresses training
+  GPU diagnostics 1.67%; SDK replay stays flat despite 3.51%/3.73% fewer estimated
+  global/L2 atomic sectors. Compare disabled metadata with all 61 shader sources
+  identical, then move reservation checks outside idle polling; the latter
+  regresses 1.82%. Revert all three. Preserve 175 diagnostics, sixteen SDK groups,
+  four actual full-state exports and exact source audits. Independently verify
+  1,228 artifacts, 46 completed bounded cgroups, twenty-one restored source hashes,
+  both qualified binaries and fourteen smoke tests. No normal completed-step
+  series or full qualification is claimed. See the
+  [private-reservation evidence](megakernel_whole_graph.md#private-second-tile-reservation).
+  Next, isolate per-tile synchronization and execution efficiency with matched
+  geometry and shader resources before introducing another scheduling policy.
+  Keep every completed-step gate; lower claim traffic alone is insufficient.
   Keep the short-K AT gap as an unresolved target without repeating rejected
   tile selectors or delaying optimizer eligibility.
   Do not sum overlapping spans or infer a memory bottleneck from traffic alone.
