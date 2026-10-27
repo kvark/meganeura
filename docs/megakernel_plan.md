@@ -979,12 +979,22 @@ the descriptor-reference repair requires fresh measurements.
   Full recording adds 0.98% forward GPU time. Restore 21 main/three Blade source
   hashes, both qualified binaries and fourteen smoke tests; retain no probe.
   See [complete forward claim attribution](megakernel_whole_graph.md#complete-forward-claim-attribution).
-  Next, bracket last-tile completion, ready publication, the zero-ticket claim
-  and handler entry with identical disabled metadata/storage controls. A
-  consumer may claim before the publisher records its post-publication time;
-  preserve bounds rather than inventing an ordering. Calibrate overhead before
-  assigning the roughly 0.46 ms outside recorded handler bodies to any stage
-  or changing fences, atomics, worker eligibility or descriptor semantics.
+  Bracket completion, ready publication, the zero-ticket claim and handler entry
+  with identical disabled controls. Preserve 300 diagnostics, 63,592 final claim
+  intervals, 644 edge-order checks and 1,500 unique stage timestamps. Recording
+  adds 3.87% forward GPU time versus qualified and 0.47% versus disabled stage
+  recording. On 136 dependent chain nodes, completion-to-publication totals
+  about 142 µs, publication-to-claim is bounded by 153–184 µs, and ticket return
+  to entry takes about 124 µs. The probe also enlarges gaps; no interval is
+  established recoverable time. Restore all sources/binaries and fourteen
+  smoke tests. See [forward publication and entry stages](megakernel_whole_graph.md#forward-publication-and-entry-stages).
+  Next, audit whether the last-tile acquire/release fence can also supply the
+  release before every successor-counter decrement. Prove the actual SPIR-V
+  dominance and inter-thread ordering, including fan-in/fan-out and the absence
+  of intervening payload writes, before testing removal of only the per-edge
+  fence. Retain all-lane payload fences, last-tile acquisition, final-dependency
+  acquisition/publication and epoch ordering. Require the unchanged full
+  correctness, resource, completed-step and SDK gates; keep the Naga API intact.
   Neither empty recorded intervals nor participating workers establish idle
   hardware, recoverable time or occupancy. Do not repeat rejected attention
   ownership, softmax-sharing or scratch-clear probes from the span comparison.

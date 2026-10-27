@@ -87,6 +87,12 @@ handler bodies. This identifies publication-to-entry latency as an attribution
 target; the remaining gaps include synchronization, queue work, parameter setup
 and instrumentation, and are not established recoverable time. The probe is
 removed and the qualified runtime remains unchanged.
+The subsequent [forward stage trace](#forward-publication-and-entry-stages)
+separates completion, publication bounds, the zero-ticket claim, ticket return
+and handler entry. Delay is distributed across these stages; the extra checks
+also perturb the gaps. The next candidate is a formal audit of whether the
+last-tile fence can cover the release currently repeated before each successor
+decrement. No fence or runtime change is retained from the trace.
 
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
@@ -1628,10 +1634,10 @@ The listed spans also must not be summed across overlapping nodes.
 
 The attention span repeats an already investigated discrepancy; it does not
 justify repeating rejected ownership, softmax-sharing or scratch-clear probes.
-The dependency-chain gaps instead motivate a narrower measurement of
-publication-to-entry stages. Record last-tile completion, bounds around ready
+The dependency-chain gaps instead motivate the following narrower measurement of
+publication-to-entry stages. It records last-tile completion, bounds around ready
 publication, the zero-ticket claim and handler entry, with identical disabled
-metadata/storage controls. Bracket publication because a consumer may claim
+metadata/storage controls. It brackets publication because a consumer may claim
 before the publishing worker records its post-publication timestamp. Calibrate
 the new instrumentation before attributing the gaps to any single stage or
 changing fences, atomics, worker eligibility or descriptor semantics.
@@ -1658,6 +1664,112 @@ was repeated, with no GPU rerun. Peak job memory is **4,246,446,080 bytes**, wit
 zero memory-limit or OOM events. Heavy work uses separate verified 16/20/1 GiB
 cgroups, GPU jobs serialize, artifacts remain on local `/x`, and every launched
 job finishes.
+
+## Forward publication and entry stages
+
+Starting from `6379d88`, a temporary probe adds up to five unique events per forward
+node: the completion-winning RMW observation, bounds around ready-bit and
+summary-bit publication, the zero-ticket claim observation, and return from the
+ticket broadcast. Existing per-claim body timestamps provide handler entry and
+exit. Immediate stores avoid keeping a timestamp live across a handler. No new
+shared GPU variables are introduced, and no synchronization operation changes.
+
+One frozen binary compares body recording with body-plus-stage recording. Both
+modes reserve identical queue storage; **only one stage-recording flag differs**.
+Both record all **15,898 claims and 22,042 logical tiles**. The disabled stage
+table remains zero. The host preserves exact node metadata and physical edges.
+Only the 154-node forward fixture is instrumented; training and CI stay exact.
+
+The probe passes **five focused graph codegen tests and fourteen whole-graph
+smoke tests**. The inherited finite claim audit covers 3,648 cases, 94,336 claims,
+162,000 logical coordinates and 19,134 partial claims. Twelve preflight
+comparisons precede **300 fixed diagnostics** in qualified/body/stages/stages/
+body/qualified order, ten pairs per five-case visit, ten warmups, at least one
+warmup second and matched 100 ms prewarming. All state, implementation-selection,
+logical-work, single-dispatch and no-fallback gates pass; no capture is repeated.
+
+| Persistent GPU diagnostic | Qualified | Body recording | Body and stages |
+|---|---:|---:|---:|
+| Forward | 4.091360 ms | 4.229872 ms | 4.249744 ms |
+| Training + SGD, unchanged shader | 12.848192 ms | 12.781216 ms | 12.795888 ms |
+
+Stage recording adds **3.87%** forward GPU time versus qualified and **0.47%**
+versus the identical shader with stage recording disabled. Preflight overhead
+is 3.99%. All 61 shader sources and reported native statistics match between
+recording modes. Forward remains **86 registers / 18,928 shared bytes**, while
+code grows from 102,400 to 108,544 bytes. Initial/live diagnostic queues add
+**909,592 bytes**; payload allocation is unchanged. All 256 workers remain
+enabled, with 168 participating in graph work.
+
+Removing every clock hook reconstructs the entire qualified forward shader.
+All handler bodies, geometry, claims and publication operations remain exact;
+the 19 CI sources and 41 other model sources are unchanged. Both original and
+transformed SPIR-V validate, reversing the clock substitution restores each
+original module byte for byte, and the two captured modules differ only in
+debug records. Naga is unchanged; the temporary Blade hook is later removed.
+
+Four final traces contain **63,592 claim intervals**, with exact ownership and
+completion counts. All 161 physical edges obey producer-endpoint-before-consumer-
+entry ordering in every trace: **644 checks**. Each trace has a 137-node
+last-finishing-predecessor chain. The two stage-enabled traces also validate
+**1,500 unique stage timestamps**: completion, claim and ticket-return events
+for all 154 nodes, plus publication bounds for 144 dependent nodes.
+
+The following totals cover the chain's **136 dependent nodes**. Publication's
+actual point lies inside the recorded bounds; the lower/upper claim latency
+uses those bounds. The zero-ticket owner may enter after another worker, so its
+entry lag is subtracted to recover the earliest-entry gap.
+
+| Scaled interval, summed on the observed chain | First stage trace | Second stage trace |
+|---|---:|---:|
+| Last predecessor body to latest predecessor completion marker | 69.33 µs | 69.31 µs |
+| Latest completion marker to publication-before marker | 142.57 µs | 141.76 µs |
+| Publication to zero-ticket claim, bounded | 153.33–181.16 µs | 155.85–183.78 µs |
+| Zero-ticket claim marker to ticket return | 61.23 µs | 61.17 µs |
+| Ticket return to zero-ticket handler entry | 123.77 µs | 124.21 µs |
+| Zero-ticket entry lag behind earliest handler entry | 6.92 µs | 6.95 µs |
+
+Using the upper publication-to-claim latency, the first five rows total **578.06/580.23 µs**
+to zero-ticket entry. Subtracting its lag yields **571.14/573.28 µs** to first
+entry. Adding the root's 9.64/9.54 µs entry gap reproduces the full chain gaps
+of **580.78/582.83 µs**. The final dispatches measure 4.214912/4.218784 ms.
+No consumer timestamp falls inside its publication bracket in these samples;
+the protocol still requires bounds because that ordering is not guaranteed.
+
+This does **not** identify one dominant removable delay. Completion-to-publication
+includes fences, dependency atomics and immutable-edge loads. Publication-to-claim
+includes polling and acquisition. Ticket-return-to-entry includes node broadcasts,
+parameter loading and the payload acquire. Every interval also contains probe
+work. Even body-only controls show 556–560 µs chain gaps; the preceding, smaller
+probe showed 477–484 µs. Aggregate overhead below the predeclared 10% threshold
+does not make per-stage measurements unperturbed or directly recoverable.
+The [clock-rate and code-motion limitations](#complete-forward-claim-attribution)
+continue to apply.
+
+The next narrowly scoped candidate is to audit the release fence repeated before
+each successor dependency decrement. The last-tile acquire/release fence already
+dominates the successor loop. Establish whether it can serve the required release
+for every decrement using the [Vulkan fence-to-fence and inter-thread ordering rules](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html#memory-model-synchronizes-with),
+the actual emitted SPIR-V and the absence of intervening payload writes. Only if
+that proof holds, test omitting the per-edge fence while retaining all-lane payload
+fences, last-tile acquisition, final-dependency acquisition/publication and epoch
+ordering. This is a candidate, not a revised memory contract. It needs full
+correctness, native-resource, completed-step and SDK qualification; the trace
+does not justify a new Naga API or establish a speedup.
+
+**The probe is removed.** Twenty-one main source/dependency hashes, three Blade
+source hashes, both qualified binaries and fourteen restored smoke tests match.
+Both forks are clean. No runtime optimization, normal completed-step series,
+full oracle/Metal qualification or fresh SDK capture is claimed. Qualified
+runtime remains `c3ad104`, and baseline parity remains unmet.
+
+Evidence remains under `target/clock-forward-stages/`. Manifest
+`target/megakernel-results/clock-forward-stages/summary.json` independently verifies
+**506 artifact hashes and 32 completed study cgroups**, SHA-256
+`3cfa41441f8c688c690d752f6f5e2f6fcafccf0cda50ad3e218b73927505385b`.
+Peak job memory is **3,720,974,336 bytes**, with zero memory-limit or OOM events.
+All heavy work uses separate verified 16/20/1 GiB cgroups; GPU jobs serialize,
+artifacts stay on local `/x`, and every launched job finishes.
 
 ## Completion-epoch control on the current runtime
 
