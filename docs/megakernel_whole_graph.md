@@ -90,9 +90,12 @@ removed and the qualified runtime remains unchanged.
 The subsequent [forward stage trace](#forward-publication-and-entry-stages)
 separates completion, publication bounds, the zero-ticket claim, ticket return
 and handler entry. Delay is distributed across these stages; the extra checks
-also perturb the gaps. The next candidate is a formal audit of whether the
-last-tile fence can cover the release currently repeated before each successor
-decrement. No fence or runtime change is retained from the trace.
+also perturb the gaps. No fence or runtime change is retained from the trace.
+The subsequent [successor release-fence control](#successor-release-fence-control)
+passes the source-level ordering and emitted SPIR-V audit, but fails its fixed
+diagnostic gate: forward improves 0.60% while training regresses 0.67%, exceeding
+the 0.5% guardrail. The one-fence deletion is reverted without extra timing or
+SDK captures. Qualified runtime remains `c3ad104`.
 
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
@@ -1770,6 +1773,100 @@ Evidence remains under `target/clock-forward-stages/`. Manifest
 Peak job memory is **3,720,974,336 bytes**, with zero memory-limit or OOM events.
 All heavy work uses separate verified 16/20/1 GiB cgroups; GPU jobs serialize,
 artifacts stay on local `/x`, and every launched job finishes.
+
+## Successor release-fence control
+
+Starting from `8b25a00` with qualified runtime `c3ad104`, this candidate deletes
+only the `storageFence()` immediately before each successor dependency decrement
+in `graph_worker.wgsl`. The preceding last-tile acquire/release fence remains.
+There is no Naga API, dependency, arithmetic, geometry, queue-layout or worker
+admission change.
+
+The source-level argument uses
+[Vulkan fence synchronization and inter-thread ordering](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html#memory-model-synchronizes-with).
+Let C be the last-tile fence and P the final predecessor's fence before ready
+publication. All payload lanes still fence before the workgroup rendezvous;
+the leader fence and tile-completion RMW sequence still collect their accesses
+at C. C also supplies release ordering before every successor decrement. Each
+counter's contiguous relaxed RMW sequence connects earlier predecessors' C to
+the final predecessor's P. For that final predecessor itself, C's acquire side
+also orders P. These relations compose within UniformMemory inter-thread
+happens-before; this does not assume unrestricted transitivity of plain
+happens-before.
+
+Every writer still makes its own payload writes available directly to the queue
+family, and every consumer lane still performs its visibility operation. No
+availability/visibility chains are needed. Between C and the decrements, the
+fan-out loop accesses immutable metadata and writes only queue atomics and
+function-local variables. Earlier successor publications create no new payload
+writes requiring a later release. The final-dependency publication fence and
+post-loop completion-epoch fence remain. The argument also preserves read-before-
+write alias dependencies, zero-successor nodes and partial/packed completion.
+
+A temporary output-only Blade hook captures the actual SPIR-V supplied to Vulkan
+for control and candidate. All **ten modules validate**. In all five graph pairs,
+C dominates the successor loop and dependency decrement, and the loop contains
+no payload writes or calls. Surviving storage fences retain QueueFamily scope
+5 and semantics `0x6048`. Module headers match; excluding debug records, each
+candidate differs by **exactly one removed OpMemoryBarrier**. The hook and local
+dependency override are removed before production builds. This concrete audit
+and ordering argument supplement tests; they are not a complete formal model
+of all Vulkan executions.
+
+Production passes **52 codegen tests and fourteen whole-graph smoke tests**.
+Twenty audit-build comparisons and fifty production diagnostics pass state,
+implementation-selection, allocation, optimizer, logical-work, one-dispatch
+and no-fallback checks. Each production visit uses five interleaved pairs,
+ten warmups, at least one warmup second and 100 ms prewarming. The audit builds
+bridge to production through all **61 exact shader sources** per mode, exact
+whole-graph native statistics and full ordinary-statistic multisets. All 56
+ordinary sources remain exact between control and candidate; the five graph
+sources differ only by the fence deletion.
+
+| Persistent GPU diagnostic, ms | Qualified | One fence removed | Change |
+|---|---:|---:|---:|
+| CI inference | 0.030752 | 0.031040 | +0.94% |
+| CI forward/backward | 0.066432 | 0.067968 | +2.31% |
+| CI forward/backward/SGD | 0.072224 | 0.072480 | +0.35% |
+| SmolVLA forward | 4.076992 | 4.052448 | −0.60% |
+| SmolVLA forward/backward/SGD | 12.745984 | 12.830944 | +0.67% |
+
+Ordinary model GPU medians remain 2.926656→2.923296 ms forward and
+10.751168→10.748992 ms training. Every graph's native code shrinks 128 bytes.
+Forward retains **86 registers / 18,928 shared bytes**; training retains
+**84 registers / 29,344 shared bytes**. Both have 168 participating workers out
+of 256 enabled. Payload, scheduler and resident allocations are unchanged.
+
+The policy recorded before measurement requires at least one model GPU median
+to improve 0.5%, neither model to regress over 0.5%, and no CI regression over
+3%. **Training fails the guardrail.** These small diagnostic samples do not
+establish completed-step gains or regressions, but they do determine that this
+candidate does not advance. No additional repeats, full library/oracle/Metal
+qualification, normal completed-step series or SDK captures are run.
+
+The initial bridge audit incorrectly compared the pipeline-cache iteration order.
+Entry-point names are nonunique. Its script and failed log are preserved; the
+corrected audit compares complete-record multisets, retaining duplicates and
+every statistic. The unique whole-graph pipeline is also compared directly.
+Only analysis is rerun; no GPU capture is repeated.
+
+**The candidate is reverted.** All 22 archived source/dependency hashes, the
+Blade source hash, both qualified binaries and fourteen restored smoke tests
+match. Both forks are clean. The retained memory contract is unchanged.
+Next, audit repeated immutable parameter staging on consecutive claims for the
+same node. Any probe must preserve uniform broadcasts, transitions between
+nodes, all lanes and existing shared state; the earlier combined-broadcast
+controls are not evidence that caching copies will help.
+
+Evidence remains under `target/successor-release-fence/`. Manifest
+`target/megakernel-results/successor-release-fence/summary.json` independently
+verifies **667 artifacts and 26 completed study scopes**, SHA-256
+`3a2acf4364d4e9bd6c87f9e453a99b83a02f70d6e3de03cb5ddd8a5cbd93c22c`.
+One inspection scope's receipt is transcribed from observed terminal tool
+output; all other study scope receipts are raw logs. Peak job memory is
+**3,721,666,560 bytes**, with zero memory-limit or OOM events. Heavy work uses
+separate verified 16/20/1 GiB cgroups, GPU jobs serialize, artifacts stay on
+local `/x`, and every launched job finishes. Baseline parity remains unmet.
 
 ## Completion-epoch control on the current runtime
 

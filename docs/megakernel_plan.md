@@ -988,13 +988,22 @@ the descriptor-reference repair requires fresh measurements.
   to entry takes about 124 µs. The probe also enlarges gaps; no interval is
   established recoverable time. Restore all sources/binaries and fourteen
   smoke tests. See [forward publication and entry stages](megakernel_whole_graph.md#forward-publication-and-entry-stages).
-  Next, audit whether the last-tile acquire/release fence can also supply the
-  release before every successor-counter decrement. Prove the actual SPIR-V
-  dominance and inter-thread ordering, including fan-in/fan-out and the absence
-  of intervening payload writes, before testing removal of only the per-edge
-  fence. Retain all-lane payload fences, last-tile acquisition, final-dependency
-  acquisition/publication and epoch ordering. Require the unchanged full
-  correctness, resource, completed-step and SDK gates; keep the Naga API intact.
+  Audit whether the last-tile acquire/release fence can also supply the release
+  before every successor-counter decrement. Preserve the source-level fan-in/
+  fan-out argument and ten validated SPIR-V modules: each of five candidate
+  graphs removes exactly one barrier, with the retained fence dominating the
+  loop and no intervening payload writes. Pass 52 codegen/fourteen smoke tests,
+  twenty audit comparisons and fifty production diagnostics. Forward improves
+  0.60%, but training regresses 0.67%, failing the predeclared 0.5% guardrail.
+  Restore all 22 source hashes, the Blade hook, both qualified binaries and
+  fourteen smoke tests without extra timing or SDK captures. The memory contract
+  and Naga API remain unchanged. See the
+  [successor release-fence control](megakernel_whole_graph.md#successor-release-fence-control).
+  Next, audit immutable parameter copies on consecutive claims for the same
+  node. Preserve uniform broadcasts, node transitions, all lanes and existing
+  shared state; do not repeat the rejected combined-broadcast controls. Require
+  the unchanged correctness, resource, completed-step and SDK gates for any
+  candidate that advances beyond diagnostics.
   Neither empty recorded intervals nor participating workers establish idle
   hardware, recoverable time or occupancy. Do not repeat rejected attention
   ownership, softmax-sharing or scratch-clear probes from the span comparison.
