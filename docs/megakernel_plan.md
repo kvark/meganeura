@@ -865,11 +865,21 @@ the descriptor-reference repair requires fresh measurements.
   fourteen smoke tests. No normal completed-step series or full qualification
   is claimed for these rejected probes. See the
   [maintenance evidence](megakernel_whole_graph.md#advisory-summary-maintenance-controls).
-  Next, simplify hint traversal when the summary fits one word (33–1,024 nodes),
-  preserving the general larger-graph path, cyclic preference, full fallback,
-  payload ordering and all requested workers. This tests the new summary scan,
-  rather than repeating the earlier bitmap-width constant probe. Keep all
-  completed-step gates; reduced code or traffic alone is insufficient evidence.
+  Simplify hint traversal when the summary fits one word (33–1,024 nodes),
+  preserving the general path, cyclic preference, full fallback and all workers.
+  Full qualification, 645,696 rotation checks, exact source audits, fifty
+  diagnostics and 1,000 completed-step comparisons pass. Original training
+  improves 0.71%, but prewarmed training remains inconclusive, failing the fixed
+  two-protocol retention criterion. Revert without timing repeats or fresh SDK
+  capture. Preserve 414 verified artifact hashes and 39 completed cgroups;
+  restore twenty source/dependency hashes, both qualified binaries and fourteen
+  smoke tests. See the [single-word scan evidence](megakernel_whole_graph.md#rotated-single-word-summary-scan).
+  Next, test two-tile sequential claims restricted to large transposed-A
+  gradient grids. The old four-tile experiment batches every node and does not
+  isolate this target. Prove shared-scratch reuse with an inter-tile rendezvous,
+  preserve every selected tile's arithmetic, clamp tail completion and retain
+  smaller/other grids. Keep all completed-step gates; reduced claim traffic or
+  code size alone is insufficient evidence, and batching can reduce parallelism.
   Keep the short-K AT gap as an unresolved target without repeating rejected
   tile selectors or delaying optimizer eligibility.
   Do not sum overlapping spans or infer a memory bottleneck from traffic alone.

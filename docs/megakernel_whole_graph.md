@@ -19,7 +19,7 @@ idle epoch. Against qualified `3f95fa4`, 1,000 completed-step comparisons improv
 persistent training **1.39% original / 1.61% prewarmed**, with both pooled 95%
 intervals below no change. Matched SDK training replay improves **2.24%**;
 ordinary training is stable. Forward completed-step gain remains unestablished.
-Current paired persistent/ordinary medians are **1.289× forward / 1.052× training**,
+That study's paired persistent/ordinary medians are **1.289× forward / 1.052× training**,
 or **1.300× / 1.139×** prewarmed. All requested workers remain enabled; baseline
 parity remains unmet.
 
@@ -28,6 +28,12 @@ establish no gain. Moving hint publication earlier while removing empty-word
 clears leaves GPU diagnostics flat. Guarding redundant RMWs reduces estimated
 global atomic sectors by 5.56%, but L2 atomic traffic and SDK training replay
 remain nearly unchanged. Both probes are reverted; `c3ad104` remains qualified.
+
+A subsequent [single-word summary scan](#rotated-single-word-summary-scan) passes
+full qualification and 1,000 completed-step comparisons. Original training
+improves 0.71%, but prewarmed training remains inconclusive. The fixed criterion
+requires an absolute training gain under both protocols, so this candidate is
+also reverted without adding repeats. Baseline parity remains open.
 
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
@@ -391,12 +397,98 @@ Peak recorded memory is **4,715,696,128 bytes**, with zero memory-limit events.
 All heavy jobs use the verified 16/20/1 GiB cgroup limits, GPU runs are serialized,
 and all launched jobs finish. Both compiler forks remain clean and unchanged.
 
-Next, test simplifying the hint traversal when the whole summary fits one word
-(33–1,024 graph nodes), retaining the general path for larger graphs. This is a
-new control of the summary scan, distinct from the earlier rejected bitmap-width
-specialization. Preserve cyclic preference, the authoritative fallback and all
-completed-step gates; a smaller loop alone is insufficient retention evidence.
-The short-K transposed-A gap also remains unresolved. Baseline parity is unmet.
+The following [single-word scan](#rotated-single-word-summary-scan) tests that
+remaining traversal cost. The short-K transposed-A gap also remains unresolved.
+
+## Rotated single-word summary scan
+
+This candidate starts from `c0dbc51`, comparing against qualified runtime
+`c3ad104` and its archived `target/ready-word-summary/final-*` executables. For
+graphs with 2–32 ready words (33–1,024 nodes), it loads the advisory summary once,
+rotates it by the worker's starting word, then visits set bits using trailing-bit
+extraction. Mapping back modulo 32 preserves cyclic preference, including a
+partial final ready word. An explicit width guard still excludes invalid bits.
+The two model graphs have five/seventeen ready words and both use this path.
+
+The general segmented scan is extracted unchanged and selected above 1,024
+nodes; the original single-ready-word path remains below 33 nodes. Source
+reconstruction checks recover the entire original general template exactly.
+Only `graph_claim` changes in either model shader. The authoritative word helper,
+fallback scan, payload/dependency/epoch operations, summary maintenance, handlers
+and allocations remain exact. All nineteen CI shaders and forty ordinary model
+shaders remain byte-identical. One snapshot can miss a concurrently published
+hint that the old wrapped scan would observe, but hints already permit arbitrary
+staleness and cannot authorize waiting without the full fallback.
+
+The host checker passes **645,696 rotation cases**, covering widths 1–32, all
+single/two-set-bit masks, invalid advisory bits and varied worker indices. It also
+passes 30,948 ready/hint/worker states, 7,295 segmented scan-boundary cases and the
+twenty existing publication/clear interleavings. This is not a complete Vulkan
+memory-model proof. GPU smoke retains 32/33/65/1024/1025-node boundary coverage,
+poisoned storage, independent chains/fan-in and repeated 1/3/256/4096-worker runs.
+
+Full qualification passes **676 library tests (eight ignored), 168 strict
+whole-graph oracle cases, 51 matrix regressions, fourteen smoke tests and 52
+codegen checks**, plus strict all-target/all-feature Clippy, formatting, release
+builds and Metal-target compilation. The qualified rebuild matches the frozen
+candidate binaries exactly; Metal GPU execution and additional hardware are not
+qualified.
+
+Fifty diagnostics preserve all selection, state, completion, one-dispatch and
+no-fallback checks. Forward GPU time changes **4.074432→4.069120 ms (−0.13%)**;
+training changes **12.748768→12.671168 ms (−0.61%)**. Ordinary GPU changes stay
+within 0.11%. Model registers remain 86/84, shared bytes 18,928/29,344,
+participating workers 168, and logical tiles 22,042/83,312. Code shrinks by
+640 forward / 768 training bytes. All 256 requested workers remain enabled.
+
+The primary protocol is fixed before collection: **1,000 completed-step
+comparisons**, five cases, control/candidate/candidate/control visits, 25 pairs
+per case/visit, at least ten warmups and one warmup second. Half use the original
+protocol and half add matched 100 ms prewarming. Retention requires both absolute
+training intervals below one, no established material regression, complete
+qualification and corroborating SDK evidence. No samples are discarded.
+
+| Persistent completed step | Qualified control | Candidate | Candidate/control, pooled bootstrap 95% interval |
+|---|---:|---:|---:|
+| Original forward | 4.667234 ms | 4.659364 ms | 0.9983 [0.9914, 1.0402] |
+| Original training + SGD | 15.388254 ms | 15.278244 ms | 0.9929 [0.9771, 0.9970] |
+| Prewarmed forward | 4.482318 ms | 4.393332 ms | 0.9801 [0.9313, 1.0694] |
+| Prewarmed training + SGD | 13.158245 ms | 13.097540 ms | 0.9954 [0.9865, 1.0074] |
+
+All numerical/execution checks pass, with maximum model error 4.66e-9. Original
+training improves **0.71%**, but the **−0.46%** prewarmed change remains
+inconclusive. Normalized training intervals include one under both protocols;
+ordinary training shifts +0.73%/+0.37%. Original normalized forward worsens
+**4.78% [1.91%, 9.01%]**, while absolute persistent forward is flat and ordinary
+forward shifts −2.24%. Prewarmed ordinary forward shifts −6.81% with a broad
+interval; all these samples remain included. Every CI persistent absolute and
+normalized interval includes one. Pooled intervals omit some between-visit
+variation.
+
+The candidate **fails the declared two-protocol criterion and is reverted**.
+No timing confirmation or fresh SDK capture is run. Fresh qualified-control
+paired persistent/ordinary medians are **1.253× forward / 1.078× training**, or
+**1.300× / 1.139×** prewarmed. These are medians of paired ratios, not ratios of
+aggregate medians; baseline parity remains unmet.
+
+All twenty source/dependency hashes, both qualified executable hashes and
+fourteen restored smoke tests are verified, and both temporary shader files are
+removed. Evidence remains in `target/ready-summary-single-scan/`; manifest
+`target/megakernel-results/ready-summary-single-scan/summary.json` independently
+verifies **414 artifact hashes and 39 completed study cgroups**, SHA-256
+`d1b329f9e1a1eacfda16e027485f151c1ee8b2f0b8876961bba16a6cc09ea84d`.
+Peak memory is **3,718,868,992 bytes**, with zero memory-limit events. Every heavy
+job uses the verified 16/20/1 GiB limits; GPU runs are serialized and measurements
+do not overlap builds, copies or heavy analysis. All launched jobs finish, and
+both compiler forks remain clean and unchanged.
+
+Next, investigate two-tile sequential claims restricted to large transposed-A
+gradient grids. The earlier rejected `target/batched-four.patch` batches every
+node by four; it does not isolate this target. Preserve selected tiles and their
+arithmetic, prove shared-scratch reuse with an inter-tile rendezvous, clamp tail
+completion and keep smaller/other grids unchanged. This remains a hypothesis:
+fewer claims can also reduce useful parallelism, so correctness and complete-step
+gates remain mandatory.
 
 ## Completion-epoch control on the current runtime
 
