@@ -67,6 +67,10 @@ The subsequent [two-tile SwiGLU claims](#two-tile-swiglu-claims) reduce diagnost
 GPU time by about 0.65%, but all four model absolute intervals include no change
 in 1,000 completed-step comparisons. The candidate is reverted without extra
 repeats. Qualified runtime remains `c3ad104`.
+The following [four-tile metadata control](#four-tile-swiglu-metadata-control)
+preserves the two-tile shader bytes and improves forward GPU diagnostics 1.68%
+against qualified. In 1,000 normal comparisons, original forward and prewarmed
+training improve, but neither phase passes both protocols. It is also reverted.
 
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
@@ -1213,6 +1217,108 @@ reduces available claims from 200 to 100 per 400-tile node, so any saved queue
 work must be weighed against reduced parallelism. Verify partial completion,
 changed-input replay and all five diagnostic cases before a new fixed normal
 gate. Keep the acceptance criterion and requested worker count unchanged.
+
+## Four-tile SwiGLU metadata control
+
+Starting from `778f5be`, this study compares qualified `c3ad104`, the archived
+two-tile SwiGLU candidate and a four-tile candidate. The only production-source
+change from two to four is the admitted claim width. Admission remains limited
+to explicit unfused F32 SwiGLUConcat/Grad grids with at least 256 logical tiles;
+smaller nodes and existing SGD batching retain their previous behavior.
+
+All **61 generated shader sources match byte-for-byte between two and four**,
+and every reported native pipeline statistic matches across both visits.
+Only claim-width metadata changes between these runtime policies: each
+admitted 400-tile node offers 100 four-tile claims instead of 200 two-tile claims. Against the
+qualified single-tile path, host-plan calculation saves **4,800 forward /
+9,600 training claims per step**. These are not hardware atomic counts.
+Reversing the existing repeat wrappers still recovers the complete qualified
+shaders, including all arithmetic and synchronization. Allocations do not grow.
+
+Replay coverage expands to **thirteen grid sizes**: 1, 3, 255–259, 400–403,
+1,024 and 1,025 tiles. This includes every partial four-tile remainder, element
+tails, and small/large grids sharing cached handlers. All 52 graph operations
+complete in one dispatch; two changed-input replays match ordinary outputs
+bit-for-bit with **1/3/256/4,096 workers**. The finite audit checks **2,050 tile
+counts, 550,209 claims, 2,100,225 logical coordinates and 39,908 independent
+gradient writes**. Existing overflow guards use the actual per-node width.
+This is not a complete Vulkan memory-model proof.
+
+The diagnostic protocol is fixed before measurement: **150 comparisons**,
+qualified/two/four/four/two/qualified, five pairs per case/visit, ten warmups,
+at least one warmup second and matched 100 ms prewarming. All complete-state,
+selection, logical-work, one-dispatch and no-fallback checks pass. Every
+requested worker remains enabled; 168 participate in each model graph.
+
+| Persistent GPU diagnostic | Qualified | Two tiles | Four tiles |
+|---|---:|---:|---:|
+| Forward | 4.082928 ms | 4.058848 ms | 4.014400 ms |
+| Training + SGD | 12.747248 ms | 12.823504 ms | 12.790784 ms |
+
+Four tiles improve forward **1.68% versus qualified / 1.10% versus two**; both
+visits show the forward improvement. Training changes **+0.34% versus qualified
+/ −0.26% versus two**. The fresh two-tile training control is +0.60% versus
+qualified, unlike its earlier −0.65% diagnostic result. Both studies and all
+visits remain preserved. Forward meets the predeclared advancement gate;
+diagnostics do not establish a completed-step gain.
+
+Both batched variants use **86 registers / 18,928 shared bytes / 102,528 code
+bytes** forward, and **83 / 29,344 / 241,920** training. Relative to qualified,
+forward adds 128 code bytes; training removes one register and adds 256 code
+bytes. Payload, scheduler and resident bytes remain unchanged.
+
+Full qualification passes **677 library tests (eight ignored), 168 strict
+oracle cases, 51 matrix regressions, 53 codegen checks and fifteen whole-graph
+smoke tests**, plus strict Clippy, Metal-target compilation, formatting and
+release builds. Both rebuilt binaries match the frozen candidate exactly.
+
+The subsequent **1,000 completed-step comparisons** use the unchanged
+control/candidate/candidate/control sequence, 25 interleaved pairs per case/
+visit, ten warmups and at least one warmup second. Half use the original
+protocol; half use matched 100 ms prewarming. Every numerical and execution
+gate passes. A separate audit covers all **1,150 diagnostic/normal comparisons
+and 70 case visits**: optimizer implementation keys, grids and logical task
+counts match ordinary and persistent execution in every mode. Training retains
+all four SGD chunks and **97,522 optimizer tiles** per step.
+
+| Persistent completed step | Qualified | Four tiles | Candidate/control, pooled bootstrap 95% interval |
+|---|---:|---:|---:|
+| Original forward | 4.671153 ms | 4.595394 ms | 0.9838 [0.9235, 0.9973] |
+| Original training + SGD | 15.345569 ms | 15.163832 ms | 0.9882 [0.9746, 1.0017] |
+| Prewarmed forward | 4.363912 ms | 4.592538 ms | 1.0524 [0.9803, 1.0592] |
+| Prewarmed training + SGD | 13.242206 ms | 13.054930 ms | 0.9859 [0.9753, 0.9990] |
+
+**Original forward improves 1.62%; prewarmed training improves 1.41%.** Their
+respective pooled intervals lie below one. However, prewarmed forward and
+original training remain inconclusive. Neither model phase satisfies the
+fixed requirement for an absolute gain under both protocols. No model or CI
+case shows a significant persistent regression.
+
+Prewarmed forward's persistent median instead rises 5.24%, while its unchanged
+ordinary path rises 6.40%. Its normalized ratio can therefore appear better
+without an absolute completed-step gain. Unchanged CI shaders also show timing
+variation. Pooled bootstrap intervals omit some between-visit variation.
+
+**The candidate is reverted without extra primary repeats or SDK captures.**
+Twenty-two source/dependency hashes, both qualified benchmark binaries and
+fourteen restored smoke tests match. Both compiler forks are clean. Qualified
+runtime remains `c3ad104`; baseline parity remains unmet.
+
+Evidence is under `target/swiglu-four-tile/`. Manifest
+`target/megakernel-results/swiglu-four-tile/summary.json` independently verifies
+**806 artifact hashes and 52 completed study cgroups**, SHA-256
+`fe65edc72c745fea25d0c43908162692e4fb561519f1ac698654b9569f3cb2a9`.
+Peak job memory is **3,717,292,032 bytes**, with zero memory-limit events.
+Every heavy job uses a separate verified 16/20/1 GiB cgroup, GPU jobs serialize,
+and builds/copies/heavy analysis stay outside measurements. All artifacts
+remain on local `/x`, and all launched jobs finish.
+
+Next, isolate forward and gradient claim widths through metadata while
+requiring the same repeated shaders and native resources. Compare disabled
+batching, forward-only and gradient-only batching before combining policies.
+The forward-only graph's diagnostic gain does not establish that widening
+gradient claims helps training. Preserve partial completion, exact arithmetic,
+requested workers and the fixed absolute timing criterion under both protocols.
 
 ## Completion-epoch control on the current runtime
 

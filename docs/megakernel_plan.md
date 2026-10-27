@@ -945,11 +945,21 @@ the descriptor-reference repair requires fresh measurements.
   SDK captures; restore 22 source hashes, both qualified binaries and fourteen
   smoke tests. Preserve the corrected plan-parser and reference-pattern lint
   failures. See [two-tile SwiGLU claims](megakernel_whole_graph.md#two-tile-swiglu-claims).
-  Next, test a four-tile metadata control while requiring the same shader and
-  native resources as the two-tile candidate. A 400-tile node then has 100
-  claims, so measure the parallelism tradeoff before normal qualification.
-  Recheck partial completion and replay, keep all workers enabled and preserve
-  the fixed absolute timing criterion under both protocols.
+  Test four-tile metadata with the same 61 shader sources and native resources
+  as the two-tile candidate. All 150 three-way diagnostics pass; forward GPU
+  time improves 1.68% versus qualified and 1.10% versus two tiles, while training
+  is +0.34% versus qualified. Pass full qualification and 1,000 normal pairs:
+  original forward improves 1.62% and prewarmed training 1.41%, but neither phase
+  passes both protocols. Revert without extra repeats or SDK captures; verify
+  optimizer accounting across all 1,150 comparisons, restore 22 source hashes,
+  both qualified binaries and fourteen smoke tests. See the
+  [four-tile metadata control](megakernel_whole_graph.md#four-tile-swiglu-metadata-control).
+  Next, isolate forward and gradient widths through metadata with identical
+  repeated shaders and native resources. Compare disabled, forward-only and
+  gradient-only batching before combining policies; the forward diagnostic
+  gain does not establish a training benefit from widening gradient claims.
+  Preserve partial completion, replay, all requested workers and the fixed
+  absolute timing criterion under both protocols.
   Keep every completed-step gate; lower claim traffic alone is insufficient.
   Keep the short-K AT gap as an unresolved target without repeating rejected
   tile selectors or delaying optimizer eligibility.
