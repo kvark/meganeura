@@ -727,10 +727,23 @@ the descriptor-reference repair requires fresh measurements.
   instructions and zero persistent local traffic. Retain the full qualification,
   four exact-state SDK captures, 616 verified artifact hashes and 49 completed
   cgroups. See the [prologue-factor qualification](megakernel_whole_graph.md#cooperative-prologue-factor-caching).
-  Next, audit per-K-column factor reuse across the two A staging row bands.
-  Cache within the current K stage, preserving factor order and the original
-  row/K/activity read bounds; do not introduce extra element-zero alias reads.
-  Measure the four extra live scalars before any retention decision.
+  Audit per-K-column factor reuse with per-component guards, a complete-vector
+  setup block and loads inside the existing first-row vector branch. Preserve
+  factor order and row/K/activity bounds; inverse audits recover the original
+  ordinary shaders and isolate one changed graph handler in each probe.
+  Each passes 52 codegen checks, two prologue regressions, fourteen smoke tests
+  and fifty diagnostic comparisons, but persistent forward GPU time regresses
+  5.8%/3.0%/2.9%. Complete-vector SDK replay regresses 2.9% despite 3.3% fewer
+  global-load sectors and 5.6% fewer shared wavefronts; estimated warp/integer
+  work increases. Preserve four exact-state captures, 1,017 verified artifact
+  hashes and 48 completed cgroups. Revert all three probes and restore exact
+  qualified binaries and smoke checks. See the
+  [column-factor evidence](megakernel_whole_graph.md#cooperative-column-factor-reuse).
+  Next, refresh sparse per-handler timings against the qualified runtime after
+  the matrix-selector and row-factor changes. Recheck instrumentation overhead,
+  registers, shared memory and worker participation, then compare the remaining
+  expensive handlers with ordinary execution. Do not sum overlapping node spans
+  or infer a memory bottleneck from duplicate factor traffic alone.
   Keep the five-case primary gate and
   add matched `--prewarm-ms 100` controls. Preserve all samples, state checks,
   requested workers and acceptance budgets; changed cache/power state is not a

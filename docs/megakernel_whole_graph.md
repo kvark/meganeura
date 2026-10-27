@@ -23,6 +23,10 @@ attributed to those cases. Current paired persistent/ordinary medians are
 **1.310× forward / 1.069× training**, or **1.282× / 1.165×** with prewarming.
 All requested workers remain enabled. Baseline parity remains unmet.
 
+Three subsequent [column-factor reuse probes](#cooperative-column-factor-reuse)
+reduce duplicated factor loads but regress persistent GPU time. All are reverted;
+the qualified runtime remains `3f95fa4`.
+
 The preceding [fused-matrix tile selection](#fused-matrix-tile-selection) adds
 small-tile routing for fused transposed-B products and extends the existing
 32×16 fused-plain refinement to K≥256. Against qualified `da86b45`, 1,000
@@ -100,6 +104,96 @@ cannot overlap. Library tests also use the GPU and need this flag. Builds use
 the same launcher without the GPU flag; finish them before primary measurements.
 The launcher now records memory peaks, limit events and memory/CPU/I/O pressure
 after each job, preserving the target's exit status and forwarding termination.
+
+## Cooperative column-factor reuse
+
+Three probes against qualified `3f95fa4` reuse per-K-column factors across the
+cooperative prologue's two A staging row bands. None establishes a useful GPU-time
+gain, and all are reverted. Each retains the qualified per-row factor caching,
+factor multiplication order, conversion points, selected geometry, packing,
+scratch capacity, original barriers, payload fences and queue operations.
+
+The first loads four factors into a private vector per K stage, guarded separately
+by each column's K bound and the first row's validity. Both row bands index that
+vector for complete and partial groups of four columns. The second uses one
+complete-vector predicate and direct `.x/.y/.z/.w` references, retaining original
+scalar factor reads for partial columns. The third moves the complete-vector
+loads inside the first row band's existing vector branch, after its original A
+loads, eliminating the additional setup branch.
+
+A valid second-band row implies a valid first-band row, and both bands use the
+same K indices. No factor mutation or output write separates the original two
+loads. The new values therefore replace the same factor values without adding
+global reads, extending lifetime across K stages, or introducing element-zero
+fallback accesses. Each inverse audit recovers the complete ordinary control
+shader exactly. In each graph, only `graph_handler_10_entry` changes; source
+outside it is byte-identical. All **forty other model and nineteen CI sources**
+are identical, including every training source. Separate generated-source audits
+verify the row/K bounds and activity guards on all factor storage loads.
+
+Each probe passes **52 codegen checks, two prologue regressions and fourteen
+whole-graph GPU smoke tests**, including padded rows, ragged K/N tails, a single
+K stage, inactive final packs, poisoned storage, changed inputs/parameters and
+1/3/64/4096 workers. Each also completes fifty diagnostic comparisons across the
+five cases, using five pairs per case/mode, ten warmups, at least one warmup
+second and 100 ms prewarming. All state budgets, matching implementations,
+logical-work totals, one-dispatch and no-fallback checks pass; maximum model
+error remains 4.66e-9.
+
+| Forward GPU diagnostic, ms | Ordinary, control → probe | Persistent, control → probe |
+|---|---:|---:|
+| Per-component guarded factors | 2.924992 → 2.906848 | 4.095488 → 4.334112 |
+| Complete-vector setup | 2.923520 → 2.912704 | 4.093632 → 4.215872 |
+| Loads inside existing vector branch | 2.924864 → 2.922720 | 4.094912 → 4.213568 |
+
+Persistent forward GPU time regresses **5.8%, 3.0% and 2.9%**, respectively.
+The first retains 86 registers and shrinks code from 99,584 to 99,072 bytes.
+The second and third use **84 registers**, with 99,968 and 100,480 code bytes.
+All keep 18,928 shared bytes, 168 participating workers and 22,042 forward
+logical tiles. Training retains 84 registers, 29,344 shared bytes, 238,720 code
+bytes, 168 participating workers and 83,312 tiles. All 256 requested workers
+remain enabled. Short completed-step medians vary between visits and do not
+constitute the normal performance gate.
+
+Four matched SDK backend captures, sixteen metric groups, compare the
+complete-vector setup probe with the qualified control. They confirm persistent
+forward replay **4.204356→4.325156 ms (+2.87%)**, versus ordinary
+**3.264280→3.247570 ms (−0.51%)**. No SDK capture is claimed for the other two
+variants or training.
+
+Persistent estimated global-load sectors fall **3.32%**, and shared wavefronts
+fall **5.62%**, but estimated warp instructions rise **3.37%** and integer-pipe
+work rises **2.25%**. FP32 work changes +0.03%; local loads/stores remain zero.
+Average active compute warps change 32.24→32.45% of peak. Barrier waiting changes
+55.51→54.52% of active warp cycles, which is not an elapsed-time fraction.
+The traffic reduction does not yield a GPU-time improvement. The counters do
+not isolate the added control flow, code composition or register lifetime from
+changes in scheduling and polling.
+
+Ordinary estimated global-load sectors fall 3.52% and integer work falls 4.71%.
+Local load/store sectors fall from about 120,965 to 55,326, without shader or
+native-instruction attribution. All four actual exported forward states are
+bitwise identical: **147,034,513 floats / 588,138,052 bytes** each, SHA-256
+`4e5d66e6ce5e95142b848651d316b4df64855a9d85669499cabc3a81089be629`.
+Maximum within-capture clock/instruction-rate spreads are **0.429%/0.790%**;
+no test or capture fails or requires a repeat.
+
+All three probes are rejected without a normal completed-step retention gate
+or full library/oracle/matrix qualification. Source and dependency hashes are
+restored, both compiler forks remain unchanged and clean, rebuilt release
+benchmark binaries match the qualified controls byte-for-byte, and fourteen
+restored smoke tests pass.
+
+Artifacts remain local in `target/coop-prologue-column-{factors,vector,inline}/`.
+Manifest `target/megakernel-results/coop-prologue-column-factors/summary.json`
+contains **1,017 independently verified artifact hashes and 48 completed bounded
+cgroups**, SHA-256 `84f971d85673712991140a20491a09178cbac0c096e1e6ff3d7f66a335132892`.
+Peak recorded job memory is **3,718,488,064 bytes**, with zero memory-limit events.
+All heavy jobs use verified 16/20/1 GiB memory-high/hard/swap limits; GPU work is
+serialized and builds/copies/heavy analysis stay outside measurements. Every
+launched job finishes. The next investigation refreshes sparse per-handler
+timing against the latest runtime, checking instrumentation resources and
+worker participation before using it to choose another optimization target.
 
 ## Cooperative prologue factor caching
 
@@ -292,10 +386,9 @@ SHA-256 `f92e340d7a729027fb85ccfb1542260e35ca00c5d66a48ead7f5650a73b70fc6`.
 Peak recorded memory is **3,717,189,632 bytes**, with zero memory-limit events.
 Heavy jobs use separate verified 16/20/1 GiB cgroups and local NVMe; GPU jobs
 are serialized and builds/copies/analysis do not overlap measurements.
-Next, audit loop-invariant shared prologue-factor reads in the cooperative
-forward matrix, preserving cache initialization, factor order and inactive
-guards while measuring any additional register lifetime. Baseline parity
-remains unmet.
+The following [row-factor qualification](#cooperative-prologue-factor-caching)
+retains loop-invariant shared factor values in registers while preserving
+initialization, factor order and inactive guards. Baseline parity remains unmet.
 
 ## Single-word claim controls
 
