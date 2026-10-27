@@ -510,13 +510,25 @@ the descriptor-reference repair requires fresh measurements.
   captures and exact within-backend state. Model timing intervals include no
   change; CI SGD has a small 0.36% absolute regression. The final namespace
   correction has byte-identical benchmark shaders and resources.
-- [ ] Audit inactive storage reads and intra-node in-place/aliased bindings
-  before extending the safety contract to arbitrary handlers.
+- [x] Audit and guard inactive storage reads, including in-place writes and
+  read-only aliases. A structural regression fails on the prior source; the
+  emitted-shader audit verifies all 102 storage-read sites in adapted model
+  handlers. Retain `e4e70c5` after 671 library, 168 strict oracle, 50 matrix and
+  ten smoke tests, attention references, Clippy, formatting and Metal compile.
+  Preserve 500 primary comparisons and exact SDK state. Training registers
+  fall 91→80 and participating workers rise 168→252, but absolute training
+  time regresses 5.58%; fewer instructions/registers do not establish a win.
+- [x] Revisit leader-only polling with the corrected 80-register training
+  shader. All 200 exploratory comparisons pass without a useful model gain;
+  revert the probe. A separate 200-comparison same-binary worker control finds
+  6.43% lower absolute training time at 168 rather than 256 workers; normalized
+  uncertainty includes no change. Keep explicit counts and the 256-worker
+  primary gate, and preserve all 900 normal comparisons and 24 diagnostics.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
   completed-step parity. Transposed-B staging improved training; the latest
-  scratch-repair comparison still measures a 15.8% training gap. The rejected per-thread guard
+  storage-repair comparison measures a 21.9% training gap at 256 workers. The rejected per-thread guard
   shows that fewer FP32 operations alone do not establish a speedup.
   Recheck both model phases and all
   CI cases before retaining further changes; do not infer elapsed cost from
@@ -543,13 +555,18 @@ the descriptor-reference repair requires fresh measurements.
   scratch-read audit found a race that the numerical qualification missed.
   Keep cooperative packing unchanged and preserve explicit requested worker
   counts. Continue investigating the forward gap; the latest repaired runtime's
-  paired ratios are 1.338/1.158. Its model timing intervals relative to the
-  historical control include no change, despite lower register counts.
-  Audit the remaining inactive storage accesses before investigating exact-order
-  subgroup reduction separately: dKV has
+  paired ratios are 1.355/1.219 at the unchanged 256-worker primary gate.
+  The storage guard's training regression and the worker-count diagnostic
+  support investigating concurrency costs, without attributing all delay to
+  polling or residency. Simple leader-only polling does not resolve the gap.
+  Investigate exact-order subgroup reduction separately: dKV has
   eight workgroup barriers per query/head iteration. Preserve the reduction
   tree, masks, accumulation order and supported fallback in any such change.
-  Use `137bfdd` as the next control and retain all completed-step gates;
+  Check shuffle capability, exact addition order and fallback before emitting
+  new subgroup operations. Preserve head-axis packing and uniform-barrier
+  admission when adding subgroup builtins; do not trade away the retained
+  batching gains accidentally.
+  Use `e4e70c5` as the next control and retain all completed-step gates;
   instruction or traffic savings alone are insufficient retention evidence.
   Preserve initialization, writer ownership, publication, independent B storage
   and every logical tile's arithmetic and completion accounting.

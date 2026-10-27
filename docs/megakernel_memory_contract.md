@@ -63,8 +63,41 @@ Structural regression tests inspect the load address, including vector
 components, helper calls and later growth of a pooled bank, and check that
 cooperative loads occur under the activity guard. This establishes the intended
 scratch transformation; numerical qualification is additional evidence.
-Inactive storage reads and intra-node in-place/aliased bindings require a
-separate audit before extending the contract to arbitrary handlers.
+The subsequent storage audit below covers inactive reads through in-place and
+aliased storage bindings.
+
+## Inactive storage accesses
+
+Masking a store does not protect an earlier load from that same location. An
+ordinary in-place handler can assign one element to each invocation safely,
+while an inactive physical group duplicates those indices and reads an active
+group's updates. A read-only declaration can also alias a writable binding;
+its declaration alone is not an immutability proof.
+
+The adapter now guards every storage load in a smaller handler, including
+read-only views and cooperative loads. The original load executes only when
+the logical group is active. A typed local provides a zero value to inactive
+lanes, and an immutable binding preserves the loaded snapshot for subsequent
+expressions. Active addresses, operands and memory-access order remain intact.
+All lanes still reach the original workgroup barriers. Skipped instructions do
+not contribute memory operations or races under the
+[Vulkan memory model](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html#memory-model-data-race).
+
+A structural regression first fails on the prior adapter, using an in-place
+write and a read-only view of the same canonical backing-buffer descriptor.
+It then passes with guarded loads. An independent Naga audit of all five
+benchmark captures finds 102 storage-read sites in adapted handlers: all are
+inside the generated activity guard. It also verifies shared-read protection
+and shared/storage write guards. Numerical state checks remain additional
+evidence; they are not the race argument.
+
+This removes the extra storage accesses introduced by inactive invocations.
+The original handler must still be valid for its supplied aliasing and logical
+geometry. The adapter does not make an already-racing ordinary shader safe.
+Descriptor metadata queries, collective workgroup broadcasts, and exact-size
+handlers retain their existing contracts. Atomic/image side effects still
+require exact physical geometry; unsupported storage-pointer helpers remain
+rejected.
 
 ## Smallest candidate interface
 

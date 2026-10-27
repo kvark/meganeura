@@ -8,16 +8,17 @@ nodes in the same dispatch. The transfer reset and compute dispatch share one
 queue submission. Initial parameter/moment allocation and explicit optimizer
 calls remain separate operations outside that step boundary.
 
-Runtime `137bfdd` repairs [inactive scratch reads](#inactive-scratch-reads)
-while retaining partial scalar head packing and the preceding optimizations.
-A source audit found that inactive groups could read an active group's scratch
-during in-place updates. The numerical and performance results at `2997a85`
-remain historical evidence; they do not establish race freedom.
+Runtime `e4e70c5` guards [inactive storage reads](#inactive-storage-reads-and-worker-participation),
+including read-only views that may alias writable bindings. It retains the
+preceding scratch-read repair and packing optimizations. Passing numerical
+tests alone did not reveal these extra inactive accesses.
 
-The latest 500 comparisons establish no model timing improvement or regression
-from the repair. Paired persistent/ordinary medians are 1.338× forward and
-1.158× complete training. The change is retained for correctness, and baseline
-performance parity remains unmet.
+The latest 500 primary comparisons measure a 5.58% absolute training regression
+from the storage repair. Paired persistent/ordinary medians are 1.355× forward
+and 1.219× training. A separate worker-count control supports a cost from the
+increased number of participating workers. The repair is retained for
+correctness; requested worker counts and the 256-worker primary gate remain
+unchanged. Baseline performance parity remains unmet.
 
 For model benchmarks, use `--whole-graph --workers 256`. The
 [current worker sweep](#worker-counts-and-deeper-scalar-staging) finds lower CI
@@ -39,6 +40,104 @@ separate verified cgroup (16 GiB soft memory limit, 20 GiB hard limit, 1 GiB swa
 The GPU flag holds a shared file lock across command execution, so marked jobs
 cannot overlap. Library tests also use the GPU and need this flag. Builds use
 the same launcher without the GPU flag; finish them before primary measurements.
+
+## Inactive storage reads and worker participation
+
+The [storage-access contract](megakernel_memory_contract.md#inactive-storage-accesses)
+now guards every storage load in an adapted smaller handler. This covers both
+in-place updates and read-only bindings that alias a writable view. Active
+addresses, operands and memory-access order remain intact. The change adds no
+buffers, descriptors or fences, and preserves the existing shared-read guards,
+workgroup barriers, queue, metadata and single-dispatch boundary.
+
+A new structural test fails on `137bfdd` and passes after the repair. It uses
+an in-place write and two views of one canonical descriptor. An independent
+Naga audit inspects all captured adapted handlers: their 102 storage-read sites
+change from unguarded to guarded, while shared-load protection and write guards
+remain valid. All 671 library tests (eight ignored), 52 code-generation tests,
+168 strict graph oracle tests, 50 matrix regressions, ten whole-graph tests,
+22 attention references in each mode, strict Clippy, formatting and Metal
+compilation pass. Metal compilation does not qualify Metal GPU execution.
+
+All ordinary shaders/resources and all CI worker shaders/resources remain
+unchanged. Model forward registers fall 86→84, with 18,928 shared bytes and
+code size 107,904→112,000 bytes. Training registers fall 91→80, with 29,344
+shared bytes and code size 270,848→264,320 bytes. In separate diagnostic steps,
+workers receiving tasks remain 168 forward but rise 168→252 for training.
+These counts describe participation, not a direct residency measurement.
+
+The primary run uses 500 completed-step comparisons: 25 paired samples per
+case in two control and two candidate visits, with 256 workers and unchanged
+full-state budgets. The control is the scratch-only repair, `137bfdd`.
+
+| Case | Control persistent ms | Storage-guarded ms | Guarded/control, 95% interval | Paired persistent/ordinary |
+|---|---:|---:|---:|---:|
+| CI inference | 0.070175 | 0.069131 | 0.9851 (0.8756–1.0279) | 1.269× |
+| CI backward | 0.093246 | 0.093625 | 1.0041 (0.9972–1.0106) | 1.436× |
+| CI SGD | 0.095896 | 0.094590 | 0.9864 (0.9530–0.9966) | 1.415× |
+| Model forward | 4.962865 | 5.126381 | 1.0329 (0.9899–1.1077) | 1.355× |
+| Model training + SGD | 16.911478 | 17.855279 | 1.0558 (1.0431–1.0756) | 1.219× |
+
+Training regresses in absolute time; its normalized interval includes no
+change. Forward intervals also include no change. CI timing moves despite
+identical shaders/resources, so its apparent SGD improvement is not attributed
+to the repair. Pooled intervals do not capture all between-visit variation.
+
+Four full-step SDK backend captures / sixteen metric groups preserve all
+246,883,105 captured floats bitwise within each backend. Actual state hashes
+match the preceding runtime. Cross-backend maximum error remains at most
+4.66e-9 under the unchanged budget; the backends are not bitwise identical.
+Persistent diagnostic replay rises 14.7897→15.9556 ms (+7.88%), while ordinary
+changes +0.18%. Estimated integer instructions fall 10.54%, but warp instructions
+rise 10.59%, shared wavefronts rise 3.21%, and global-load sectors change +0.28%.
+FP32 instructions are effectively unchanged and local traffic remains zero.
+Barrier waiting rises 53.08→64.03% of active warp cycles. Maximum sequential
+clock/instruction-rate spreads are 0.407%/0.896%. These are sampled rate-times-
+duration estimates; barrier shares do not attribute elapsed-time cost.
+
+A leader-only polling probe then runs 200 comparisons against the guarded
+runtime. Other lanes wait at the existing uniform broadcast while the leader
+rescans; no fence or worker-count change is introduced. All 671 library tests,
+52 code-generation tests and ten whole-graph tests pass. Handler bodies and
+worker main bodies are byte-identical to the guarded control. Model register,
+shared-memory and executable-size statistics are unchanged. Forward changes
+4.846→4.977 ms and training 17.749→17.691 ms, with wide intervals including
+no change. The probe is reverted; its patch and binaries are preserved.
+
+A separate 200-comparison diagnostic uses the same corrected binary and
+identical pipeline keys/resources at explicit worker counts of 168 and 256.
+It does not change the primary gate or cap the implementation's requested
+workers:
+
+| Case | 256 workers ms | 168 workers ms | 168/256, 95% interval |
+|---|---:|---:|---:|
+| Model forward | 5.128862 | 5.132506 | 1.0007 (0.9518–1.0643) |
+| Model training + SGD | 17.981100 | 16.824818 | 0.9357 (0.9241–0.9508) |
+
+Training improves 6.43% in absolute time at 168 workers. Its normalized interval
+includes no change. Forward still has 168 workers receiving tasks at either
+count; training participation changes 252→168. This supports a cost from
+additional worker concurrency in this sequence, without distinguishing queue
+contention, synchronization and other residency effects. It does not establish
+a universal worker-count policy or performance parity.
+
+The complete record contains 900 normal comparisons, 24 diagnostics, and the
+four SDK backend captures. Manifest:
+`target/megakernel-results/inactive-storage-reads/summary.json`, with 810
+independently verified artifact hashes and 65 recorded bounded cgroups;
+SHA-256 `1c9259057a2f56395f1726c9f3231cd24d19c43c22d5364407a8b43a6eda01a8`.
+Evidence is local under `target/inactive-storage-reads/` and
+`target/inactive-storage-leader-poll/`. The reverted shader and restored source
+match the qualified storage-guard runtime exactly. No dependency pin or
+Naga/Blade source changed. All heavy jobs completed in separate verified
+16/20/1 GiB cgroups; GPU jobs were serialized and measurements did not overlap
+builds, copies or heavy analysis.
+
+The next experiment should target productive synchronization in rowwise
+attention gradients. Check shuffle capability and exact addition order before
+replacing tree-reduction barriers, and preserve head packing when introducing
+subgroup builtins. Fewer instructions or lower register counts alone remain
+insufficient evidence for retention.
 
 ## Inactive scratch reads
 
