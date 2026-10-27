@@ -10,6 +10,8 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
+import subprocess
 import sys
 import uuid
 
@@ -17,6 +19,7 @@ import uuid
 if len(sys.argv) > 1 and sys.argv[1] == "--inside":
     unit, *command = sys.argv[2:]
     gpu = command[0] == "--gpu"
+    inherited = ()
     if gpu:
         command.pop(0)
     relative = next(
@@ -41,8 +44,40 @@ if len(sys.argv) > 1 and sys.argv[1] == "--inside":
         lock = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         fcntl.flock(lock, fcntl.LOCK_EX)
         os.set_inheritable(lock, True)
+        inherited = (lock,)
         print("Acquired GPU job lock", file=sys.stderr, flush=True)
-    os.execvp(command[0], command)
+    child = subprocess.Popen(command, pass_fds=inherited)
+
+    def forward_signal(sig, _frame):
+        try:
+            child.send_signal(sig)
+        except ProcessLookupError:
+            pass
+
+    previous = {sig: signal.signal(sig, forward_signal)
+                for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    try:
+        returncode = child.wait()
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    # Read before this scope disappears. Limits alone do not show whether a
+    # benchmark actually encountered reclaim, throttling, or memory pressure.
+    resources = {
+        key: (cgroup / key).read_text().strip()
+        for key in ("memory.peak", "memory.events", "memory.swap.peak",
+                    "memory.pressure", "cpu.stat", "cpu.pressure", "io.pressure")
+        if (cgroup / key).exists()
+    }
+    print(json.dumps({"job_resources": {"cgroup": relative,
+                                      "exit_code": returncode,
+                                      **resources}}), file=sys.stderr, flush=True)
+    if returncode < 0:
+        sig = -returncode
+        if sig not in (signal.SIGKILL, signal.SIGSTOP):
+            signal.signal(sig, signal.SIG_DFL)
+        os.kill(os.getpid(), sig)
+    raise SystemExit(returncode)
 else:
     if len(sys.argv) < 3:
         raise SystemExit(__doc__)

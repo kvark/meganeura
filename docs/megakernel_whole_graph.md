@@ -38,8 +38,10 @@ are 1.424× forward and 1.209× training; forward timings vary substantially.
 A [packed-activity specialization](#fully-occupied-packed-claims) changes only
 one matrix handler in each model phase. It reduces instruction work but does
 not establish an absolute model speedup in confirmation, and is reverted.
-Same-binary ordinary training visits range from 11.79 to 14.72 ms. The next
-step is to attribute that measurement variation before another small change.
+Same-binary ordinary training visits range from 11.79 to 14.72 ms. A subsequent
+[stability investigation](#gpu-idle-effects-and-benchmark-stability) localizes
+the large spikes to GPU execution and suppresses them with untimed prewarming.
+The warmed diagnostic still shows a substantial persistent GPU-time gap.
 
 For model benchmarks, use `--whole-graph --workers 256`. The
 [current worker sweep](#worker-counts-and-deeper-scalar-staging) finds lower CI
@@ -61,6 +63,103 @@ separate verified cgroup (16 GiB soft memory limit, 20 GiB hard limit, 1 GiB swa
 The GPU flag holds a shared file lock across command execution, so marked jobs
 cannot overlap. Library tests also use the GPU and need this flag. Builds use
 the same launcher without the GPU flag; finish them before primary measurements.
+The launcher now records memory peaks, limit events and memory/CPU/I/O pressure
+after each job, preserving the target's exit status and forwarding termination.
+
+## GPU idle effects and benchmark stability
+
+This investigation keeps runtime and shader source exactly at `e4e70c5`. It
+collects 600 diagnostic comparisons: a frozen control, host tracing, two fixed
+four-visit prewarming controls, and GPU timestamp comparisons. Every sample
+keeps the selected arithmetic, 256 requested workers, complete state checks,
+logical completion and one compute dispatch without fallback. No CPU or GPU
+policy is changed, and no samples are discarded.
+
+The first frozen control peaks at 3.38 GiB of cgroup memory and records no
+memory-limit events or memory pressure. The unexported-state prewarming visits
+also record no memory pressure. State-file export visits peak around 5.37 GiB
+and record 6–116 ms of aggregate memory pressure over their whole run, while
+all limit-event counters remain zero. These are distinct measurements:
+[`memory.high`](https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-interface-files)
+can throttle a job, but a configured limit alone does not prove that happened.
+
+Host tracing separates `Session::step` from `Session::wait`. Ordinary/persistent
+training recording and submission take about 0.62/0.29 ms. Long samples spend
+66–79 ms in the completion wait, with negligible measured CPU runqueue delay.
+Sparse 100 ms NVML observations show low GPU clocks and P3/P5 states around
+those samples. The long CPU state qualification between samples can leave the
+GPU idle after the initial warmup.
+
+A fixed sequence of 0, 100, 100, 0 ms of per-sample prewarming uses one frozen
+binary and 25 pairs per model case per visit: 200 comparisons. Prewarming runs
+the same completed workload outside timing, then restores parameters and inputs
+before the measured execution. In the training samples, the unwarmed ordinary
+and persistent paths reach about 78–79 ms; none of the prewarmed training samples
+exceeds 40 ms. Prewarmed persistent visit medians are 16.28 and 16.08 ms,
+compared with 17.92 ms in the first unwarmed visit. All state checks pass.
+
+A second fixed 200-comparison sequence tests whether restoration after warming
+undoes the benefit. Its alternative restores first, warms training with zero-rate
+SGD, then sets the original nonzero learning rate before timing. Saved complete
+training states—246,883,105 floats per backend—are bitwise identical across all
+four visits within each backend. That alternative establishes no useful further
+benefit, so its learning-rate manipulation is not retained.
+
+GPU timestamps then distinguish shader execution from queue-start and host-wake
+delays. These 100 comparisons retain the normal pass grouping and enable worker
+counters, so they remain diagnostic. Decoded calibrated trace intervals match
+the benchmark's GPU intervals for every sample. An approximately 78 ms host
+sample contains roughly 77 ms between GPU timestamps; the spike is inside the
+GPU interval. Submission-to-GPU-start and GPU-end-to-host-return delays are
+each below 0.6 ms in these captures.
+
+| GPU interval | Unwarmed ordinary / persistent median ms | Prewarmed ordinary / persistent median ms |
+|---|---:|---:|
+| Forward | 3.476 / 4.927 | 2.999 / 4.528 |
+| Training + SGD | 13.919 / 17.248 | 11.034 / 15.584 |
+
+Prewarmed ordinary training GPU intervals span 11.001–11.054 ms and persistent
+intervals 15.397–15.773 ms. Unwarmed maxima reach 76.919/78.772 ms. Prewarming
+holds observed clocks near 2.85 GHz with memory at 15 GHz and suppresses the
+large spikes. It changes cache state as well as power state; this does not
+isolate clock changes alone or identify a specific driver mechanism. Small host
+wake delays still affect completed-step measurements. The remaining persistent
+GPU-time gap is substantial even in the warmed control.
+
+The common paired benchmark now accepts `--prewarm-ms`, **off by default**.
+It validates completion during untimed prewarming, restores matched state
+again, and records warm-step counts and elapsed time for each sample. Callers'
+`prepare` callback must restore every state item their execution modifies.
+Both current benchmarks use inference/backward or stateless SGD. The original
+five-case completed-step gate and its default warmup remain unchanged; add this
+as a supplemental matched control, for example:
+
+```sh
+python3 scripts/run_bounded_job.py model-prewarmed --gpu -- \
+  target/release/examples/bench_smolvla_train --whole-graph --workers 256 \
+  --runs 25 --warmup 10 --warmup-ms 1000 --prewarm-ms 100 --force
+```
+
+The retained option passes 50 additional full-state comparisons covering all
+five cases with prewarming off and on. Clippy across all targets/features,
+formatting and release example builds pass. Launcher checks verify ordinary
+failure status, signal status, termination forwarding without an orphaned test
+child, resource summaries and serialization of two competing GPU jobs. Temporary
+host/state/timestamp tracing and zero-rate prewarming remain archived; only the
+common optional control and launcher reporting are retained. Runtime, shaders,
+dependency pins and both fork worktrees remain unchanged.
+
+Evidence is local under `target/benchmark-stability/`, including every sample,
+GPU clock/resource observations, complete states, calibrated traces, prototype
+patches and frozen binaries. The manifest is
+`target/megakernel-results/benchmark-stability/summary.json`.
+It records 228 artifact hashes and 48 bounded cgroups; SHA-256
+`b24aa8737fe2c9fad652756fbb5bf2fe0be3a17e2a5ebe65af28cb8a5f8a17f4`.
+
+The next profiling task is to attribute the residual GPU cost to individual
+handlers inside the combined dispatch. Audit available shader-clock support
+first; keep the unchanged primary gate alongside matched prewarmed controls.
+Baseline parity remains unmet.
 
 ## Fully occupied packed claims
 

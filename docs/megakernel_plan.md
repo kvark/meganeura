@@ -555,6 +555,13 @@ the descriptor-reference repair requires fresh measurements.
   confirmation establishes no absolute model gain. Archive the candidate and
   restore byte-identical retained binaries. Investigate same-binary timing
   variation before the next small optimization.
+- [x] Trace same-binary variation with cgroup resources, host phases, NVML and
+  calibrated GPU timestamps. Preserve 600 diagnostic comparisons and exact
+  saved states. Long samples are GPU-side; untimed prewarming suppresses large
+  spikes, but a substantial persistent GPU gap remains. Retain an opt-in shared
+  `--prewarm-ms` control, default zero, after 50 five-case state comparisons.
+  Record post-job cgroup pressure while preserving exit status, termination
+  forwarding and GPU serialization. Keep the original primary gate unchanged.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
@@ -610,11 +617,15 @@ the descriptor-reference repair requires fresh measurements.
   comparisons, ten diagnostics and four SDK backend captures. Confirmation
   establishes no absolute model gain, despite 2.01% lower estimated integer
   activity; revert the patch and restore byte-identical retained binaries.
-  Next, quantify and attribute benchmark variation with frozen identical-binary
-  controls. Same-binary ordinary training visit medians range 11.79–14.72 ms.
-  Separate CPU recording/submission/wait time, GPU clocks and cgroup pressure
-  before interpreting another small optimization. Keep telemetry separate from
-  primary qualification, preserve all samples and change no acceptance budget.
+  The stability investigation localizes the large timing spikes to GPU execution
+  and suppresses them with untimed prewarming. The warmed diagnostic still
+  measures 15.584 ms persistent versus 11.034 ms ordinary GPU training time;
+  worker counters are enabled in that diagnostic. Next, attribute residual GPU
+  cost to handlers inside the combined dispatch, starting with an audit of
+  available shader-clock support. Keep the original five-case primary gate and
+  add matched `--prewarm-ms 100` controls. Preserve all samples, state checks,
+  requested workers and acceptance budgets; changed cache/power state is not a
+  runtime optimization.
   Use `e4e70c5` as the next control and retain all completed-step gates;
   instruction or traffic savings alone are insufficient retention evidence.
   Preserve initialization, writer ownership, publication, independent B storage

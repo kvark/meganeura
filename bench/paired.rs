@@ -14,6 +14,7 @@ pub struct Options {
     pub warmup: usize,
     pub runs: usize,
     pub warmup_ms: u64,
+    pub prewarm_ms: u64,
     pub diagnostics: bool,
     pub device_scheduling: bool,
     pub whole_graph: bool,
@@ -27,6 +28,7 @@ impl Default for Options {
             warmup: 10,
             runs: 50,
             warmup_ms: 1000,
+            prewarm_ms: 0,
             diagnostics: false,
             device_scheduling: false,
             whole_graph: false,
@@ -43,6 +45,9 @@ impl Options {
             "--runs" => self.runs = args.next().expect("--runs value").parse().unwrap(),
             "--warmup-ms" => {
                 self.warmup_ms = args.next().expect("--warmup-ms value").parse().unwrap()
+            }
+            "--prewarm-ms" => {
+                self.prewarm_ms = args.next().expect("--prewarm-ms value").parse().unwrap()
             }
             "--diagnostics" => self.diagnostics = true,
             "--device-scheduling" => {
@@ -185,6 +190,9 @@ fn metadata(session: &mut Session, construction_ms: f64) -> serde_json::Value {
 /// `prepare` restores matched state outside timing. `execute` owns the exact
 /// application boundary and must wait for completion. `observe` qualifies
 /// outputs/state after timing, without mutating the next execution's seed.
+/// Optional per-sample prewarming executes this same boundary, then calls
+/// `prepare` again. It must restore all state modified by those executions.
+/// Prewarming is a supplemental control; the default benchmark leaves it off.
 pub fn measure(
     name: &str,
     ordinary: &mut Session,
@@ -228,6 +236,8 @@ pub fn measure(
     let mut last_gpu_passes = [Vec::new(), Vec::new()];
     let mut max_absolute_error = 0.0f64;
     let mut max_budget_fraction = 0.0f64;
+    let mut prewarm_steps = [Vec::new(), Vec::new()];
+    let mut prewarm_elapsed_ms = [Vec::new(), Vec::new()];
     for pair in 0..options.runs {
         let mut observations = [Vec::new(), Vec::new()];
         for index in [pair % 2, 1 - pair % 2] {
@@ -237,6 +247,20 @@ pub fn measure(
                 &mut *persistent
             };
             prepare(session);
+            let mut steps = 0;
+            let mut elapsed_ms = 0.0;
+            if options.prewarm_ms != 0 {
+                let start = Instant::now();
+                while start.elapsed() < Duration::from_millis(options.prewarm_ms) {
+                    execute(session);
+                    session.validate_persistent_completion().unwrap();
+                    steps += 1;
+                }
+                elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                prepare(session);
+            }
+            prewarm_steps[index].push(steps);
+            prewarm_elapsed_ms[index].push(elapsed_ms);
             let start = Instant::now();
             execute(session);
             samples[index].push(start.elapsed().as_secs_f64() * 1000.0);
@@ -311,6 +335,10 @@ pub fn measure(
         "case": name, "sample_pairs": options.runs, "order": "alternating AB / BA",
         "warmup_pairs": warmed, "warmup_elapsed_ms": warmup_elapsed_ms,
         "minimum_warmup_pairs": options.warmup, "minimum_warmup_ms": options.warmup_ms,
+        "per_sample_prewarm_ms": options.prewarm_ms,
+        "ordinary_prewarm_steps": prewarm_steps[0], "persistent_prewarm_steps": prewarm_steps[1],
+        "ordinary_prewarm_elapsed_ms": prewarm_elapsed_ms[0], "persistent_prewarm_elapsed_ms": prewarm_elapsed_ms[1],
+        "prewarm_contract": "Supplemental control, off by default: complete executions outside timing, then restore matched state before each timed sample",
         "diagnostic_instrumentation": options.diagnostics, "kernel_search_budget_ms": 0,
         "ordinary_wall_ms": distribution(&samples[0]), "persistent_wall_ms": distribution(&samples[1]),
         "persistent_over_ordinary": distribution(&ratios),
