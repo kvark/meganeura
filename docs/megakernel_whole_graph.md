@@ -59,8 +59,12 @@ whole training graph. Their between-tile gaps include other work and cannot be
 counted as idle time. The calibrated probe adds 1.25% training GPU time and is
 removed. Subsequent [optimizer claim clocks](#optimizer-claims-alongside-at-tiles)
 find no recorded optimizer body overlapping either largest sampled shape, and
-none inside same-worker gaps between sampled AT claims. The next trace must
-identify the remaining graph work. Qualified runtime remains `c3ad104`.
+none inside same-worker gaps between sampled AT claims. Subsequent
+[all-claim traces](#all-graph-claim-attribution) identify concurrent BT work:
+AT720×4096×50 finishes before its paired BT node in all 32 observations.
+Its long individual span therefore does not establish a whole-step loss.
+The next candidate is two-tile batching for short, explicit SwiGLU handlers.
+Qualified runtime remains `c3ad104`.
 
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
@@ -996,6 +1000,124 @@ which handlers overlap the long AT spans and same-worker gaps. Preserve all
 arithmetic, fences, requested workers and completed-step gates. Direct optimizer
 competition is unsupported for the largest sampled AT shapes, so these traces
 provide no reason to repeat global SGD deferral or alter its eligibility.
+
+## All graph claim attribution
+
+This study starts from `137161c`, against qualified `c3ad104`. It extends clock
+metadata to every nonempty node of the training graph, including packed-axis
+claims and partial completion. The shader, timestamp helper, arithmetic,
+scheduling and synchronization remain identical to the preceding probe.
+Sparse recording selects the same twenty AT nodes and all four SGD nodes;
+full recording enables every node. Both modes reserve identical storage,
+including unused slots for packed-axis padding. CI and standalone forward
+remain uninstrumented.
+
+A finite decoder audit checks **3,648 geometry cases, 94,336 claims and 162,000
+logical coordinates**, including 19,134 partial claims and empty grids. It
+independently enumerates coordinates and requires exact coverage without
+duplicates. Actual traces verify padded limits, logical completion counts,
+every claim owner against the original per-node worker histograms, all unused
+slots and cross-node interval ordering on each worker. Full recording covers
+**527 nodes and 94,238 claims per step**: 83,312 graph tiles and 97,522 optimizer
+tiles, with 183,218 allocated claim slots including padding.
+
+All **61 shader sources match between recording modes** and the preceding
+probe. Reversing clock call sites and helpers recovers the complete original
+training source. Both captured SPIR-V variants validate alongside their
+pre-clock originals, and inverse transformation restores each original exactly.
+Removing debug instructions makes the two variants byte-identical. No Naga
+source or API change is introduced.
+
+**Three hundred diagnostics** use qualified/sparse/full/full/sparse/qualified
+visits, ten pairs per case/visit, ten warmups and at least one warmup second,
+100 ms prewarming and 256 requested workers. All complete-state, selection,
+logical-work, one-dispatch and no-fallback gates pass. Twelve preflight pairs,
+five graph-codegen checks and fourteen smoke tests also pass.
+
+| Training GPU diagnostic | Qualified | Sparse | Full |
+|---|---:|---:|---:|
+| Persistent | 12.809296 ms | 13.040096 ms | 13.066480 ms |
+| Ordinary | 10.782416 ms | 10.776304 ms | 10.775248 ms |
+
+Full recording costs **0.20% over sparse / 2.01% over qualified** in pooled
+GPU medians. The short preflight instead measures +7.01% over sparse; all
+samples are retained without extra repeats. Training retains **84 registers,
+29,344 shared bytes and 168 participating graph workers**. Both instrumented
+modes use 244,224 code bytes and 8,511,912 scheduler bytes: respectively 2,560
+and 7,341,128 above control. Resident bytes rise by the same metadata delta.
+All requested workers remain enabled. This is instrumentation calibration,
+not a normal completed-step improvement.
+
+Two final steps per recording mode provide **248,172 intervals**: 188,476 full
+and 59,696 sparse. Full-step traces measure **14.859520 / 12.895904 ms**, versus
+sparse **12.848320 / 12.935520 ms**. The longer first full trace is preserved.
+Low pooled overhead does not imply unperturbed individual traces. Raw ticks
+and all worker intervals remain available; approximate microseconds use each
+trace's timestamp interval and worker envelope. The existing shader-clock
+rate and code-motion limitations still apply.
+
+The missing concurrency is predominantly the preceding transposed-B gradient:
+
+| Sampled AT shape | Mean simultaneous AT bodies | Other bodies | All bodies | Other-body share of same-worker AT gaps |
+|---|---:|---:|---:|---:|
+| 2048×720×50 | 52.4 | 78.0 | 132.6 | 0% |
+| 720×4096×50 | 54.0 | 90.0 | 143.9 | 1.68% |
+
+These are medians over six observations per shape; separately aggregated
+columns need not add exactly. During AT720×4096×50, the preceding
+BT50×720×4096 accounts for nearly all concurrent bodies on other workers.
+The 1.68% of internal AT gap time occupied by another body comes from one
+horizontal AT node in one trace. Most gaps contain no other recorded body:
+they include claim handling, parameter broadcast, completion/publication,
+waiting and instrumentation. Body concurrency is not hardware occupancy, and
+unrecorded worker lifetime is not synonymous with GPU idle time.
+
+A fresh ordinary profile preserves complete state and matching implementation
+keys. Adjacent AT/BT nodes with matching matrix dimensions give this comparison:
+
+| AT shape | Matched pairs | Ordinary BT+AT interval sum µs | Persistent pair envelope µs | AT finishes before BT |
+|---|---:|---:|---:|---:|
+| 2048×720×50 | 13 | 65.54 | 58.80 | 0/26 observations |
+| 720×4096×50 | 16 | 186.35 | 159.17 | 32/32 |
+| 960×720×50 | 13 | 51.23 | 35.34 | 26/26 |
+| 720×960×50 | 9 | 55.10 | 44.70 | 18/18 |
+
+The 720×4096×50 AT node spans about 98.20 µs, yet always finishes before the
+paired BT node. Its apparent per-node regression does not establish a loss
+for the combined work. Ordinary split-pass timestamps and persistent clock
+envelopes have different overhead; these are attribution comparisons, not an
+exact speedup claim or a full graph critical-path proof. Pair envelopes also
+overlap other work and cannot be summed into recoverable whole-step time.
+
+The trace identifies a separate scheduling-cost candidate: **sixteen explicit
+SwiGLUConcat and sixteen SwiGLUConcatGrad nodes each execute 400 single-tile
+claims**. Median recorded bodies are approximately 0.70/0.99 µs; median node
+spans are 7.39/12.34 µs, versus ordinary intervals of 4.10/6.30 µs. Their F32
+source uses independent element writes and no workgroup scratch or barriers.
+Earlier [pointwise-batching probes](#scratch-clearing-and-pointwise-batching-probes)
+admitted only generated pointwise bodies, whose largest model grid was 141
+tiles; neither their 512 nor 1,024 threshold selected model work. Those controls
+do not test these explicit 400-tile handlers.
+
+**The probe is removed.** Twenty-one main source/dependency hashes, three Blade
+source hashes, both qualified binary hashes and fourteen restored smoke tests
+match. Both compiler forks are clean. No full library/oracle/Metal qualification,
+normal completed-step series or fresh SDK counters are claimed.
+
+Evidence is under `target/clock-all-claims/`. Manifest
+`target/megakernel-results/clock-all-claims/summary.json` independently verifies
+**515 artifact hashes and 37 completed study cgroups**, SHA-256
+`55a3aaa0b8cf24bdaa250f13ecbdff5011a44c2a795d0f38c6262ed5f197b605`.
+Peak job memory is **4,270,448,640 bytes**, with zero memory-limit events.
+Every heavy job uses a separate verified 16/20/1 GiB cgroup; GPU jobs serialize,
+artifacts remain on local `/x`, and all launched jobs finish.
+
+Next, test two-tile sequential claims for large explicit F32 SwiGLU forward/
+gradient grids, preserving the selected per-element arithmetic, independent
+writes, clamped completion and small-grid behavior. Verify admission on actual
+model nodes and partial claims, then check native resources and all five cases
+before normal completed-step qualification. Keep SGD batching unchanged. Do not
+prioritize AT based only on its longer span while useful BT work overlaps it.
 
 ## Completion-epoch control on the current runtime
 

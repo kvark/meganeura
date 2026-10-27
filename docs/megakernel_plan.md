@@ -925,12 +925,23 @@ the descriptor-reference repair requires fresh measurements.
   Remove the probe; verify 504 artifacts, 35 completed cgroups, restored source/
   binary hashes and fourteen smoke tests. See the
   [optimizer-claim attribution](megakernel_whole_graph.md#optimizer-claims-alongside-at-tiles).
-  Next, record the remaining graph handlers, including packed-axis claims and
-  partial completion, to identify concurrent work during the long AT spans and
-  same-worker gaps. Calibrate against identical shaders/storage with those
-  records disabled. Keep arithmetic and scheduling unchanged until the traces
-  support a specific policy; direct SGD competition does not explain the
-  largest sampled AT spans.
+  Record all graph claims, including packed axes and partial completion. Check
+  3,648 geometry cases and preserve 300 calibrated diagnostics plus 248,172
+  final-step intervals. The largest AT shape runs alongside about ninety BT
+  bodies and finishes before BT in all 32 matched observations. Its pair
+  envelope is about 159 µs versus 186 µs for ordinary BT+AT intervals; differing
+  measurement contracts prevent an exact speedup claim. Full recording costs
+  0.20% over sparse in pooled GPU medians, with a longer final trace preserved.
+  Restore source/binary hashes and fourteen smoke tests; verify 515 artifacts
+  and 37 completed bounded cgroups. See the
+  [all-claim attribution](megakernel_whole_graph.md#all-graph-claim-attribution).
+  Next, test two-tile sequential claims for explicit F32 SwiGLUConcat and
+  SwiGLUConcatGrad grids of at least 256 tiles. Their sixteen nodes per family
+  each have 400 single-tile claims and sub-microsecond recorded bodies. Earlier
+  generated-pointwise batching controls did not admit these handlers. Preserve
+  exact arithmetic, independent writes, partial completion, small-grid behavior
+  and existing SGD batching. Confirm actual model admission and native resources
+  before the five-case diagnostics and normal completed-step gates.
   Keep every completed-step gate; lower claim traffic alone is insufficient.
   Keep the short-K AT gap as an unresolved target without repeating rejected
   tile selectors or delaying optimizer eligibility.
