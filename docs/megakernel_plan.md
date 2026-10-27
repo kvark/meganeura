@@ -954,12 +954,22 @@ the descriptor-reference repair requires fresh measurements.
   optimizer accounting across all 1,150 comparisons, restore 22 source hashes,
   both qualified binaries and fourteen smoke tests. See the
   [four-tile metadata control](megakernel_whole_graph.md#four-tile-swiglu-metadata-control).
-  Next, isolate forward and gradient widths through metadata with identical
-  repeated shaders and native resources. Compare disabled, forward-only and
-  gradient-only batching before combining policies; the forward diagnostic
-  gain does not establish a training benefit from widening gradient claims.
-  Preserve partial completion, replay, all requested workers and the fixed
-  absolute timing criterion under both protocols.
+  Isolate forward and gradient widths through metadata in one frozen binary.
+  All 61 shaders, native resources, non-width node words and dependency edges
+  remain exact across four modes. Preserve 250 diagnostics; forward-only is
+  the sole policy passing all predeclared advancement guards. Remove the probe
+  and unused gradient repeat wrapper. The production candidate passes another
+  50 diagnostics, full qualification and 1,000 normal comparisons, but neither
+  model phase passes both protocols. Original forward's upper interval is
+  1.0001700494; keep the criterion and revert without extra repeats or SDK
+  captures. Restore 22 source hashes, both qualified binaries and fourteen
+  smoke tests. See [family isolation and forward-only batching](megakernel_whole_graph.md#swiglu-family-isolation-and-forward-only-batching).
+  Next, compare three versus four tiles for forward-only claims with identical
+  shaders/native resources. A 400-tile node offers 134 versus 100 claims, both
+  below 168 observed participating workers. Measure the parallelism/queue-work
+  tradeoff; do not infer residency or performance from claim counts alone.
+  Preserve partial completion, small grids, unchanged SGD batching, all
+  requested workers and the fixed absolute criterion under both protocols.
   Keep every completed-step gate; lower claim traffic alone is insufficient.
   Keep the short-K AT gap as an unresolved target without repeating rejected
   tile selectors or delaying optimizer eligibility.

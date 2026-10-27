@@ -71,6 +71,10 @@ The following [four-tile metadata control](#four-tile-swiglu-metadata-control)
 preserves the two-tile shader bytes and improves forward GPU diagnostics 1.68%
 against qualified. In 1,000 normal comparisons, original forward and prewarmed
 training improve, but neither phase passes both protocols. It is also reverted.
+Subsequent [family-isolation controls](#swiglu-family-isolation-and-forward-only-batching)
+select forward-only batching. Its production candidate passes full correctness
+qualification and 1,000 normal comparisons, but neither model phase passes both
+protocols. It is reverted; the temporary metadata probe is removed.
 
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
@@ -1319,6 +1323,132 @@ batching, forward-only and gradient-only batching before combining policies.
 The forward-only graph's diagnostic gain does not establish that widening
 gradient claims helps training. Preserve partial completion, exact arithmetic,
 requested workers and the fixed absolute timing criterion under both protocols.
+
+## SwiGLU family isolation and forward-only batching
+
+Starting from `2116962`, a temporary host metadata probe isolates forward and
+gradient widths using one frozen binary. It always builds the existing repeated
+handlers, then chooses widths at graph construction: disabled (1/1), forward
+only (4/1), gradient only (1/4), or both (4/4). These settings remain fixed for
+the graph's lifetime. Small grids retain width one, and optimizer nodes retain
+their original metadata. Relative to the archived four-tile candidate, the
+probe adds no GPU code or allocation.
+
+All **61 shader sources match** across probe modes and the archived four-tile
+candidate; reported native pipeline statistics match across probe modes.
+Twenty actual immutable frame
+records verify that **only the intended claim-width bits differ**: every other
+node word and every dependency edge is exact. Training keeps four SGD chunks,
+24,382 optimizer claims and 97,522 optimizer tiles. Recorded metadata gives:
+
+| Mode | Forward scheduled claims | Training scheduled claims |
+|---|---:|---:|
+| Disabled | 15,898 | 94,238 |
+| Forward only | 11,098 | 89,438 |
+| Gradient only | 15,898 | 89,438 |
+| Both | 11,098 | 84,638 |
+
+These counts derive from captured node limits and widths, not hardware atomic
+traffic. They exclude failed claims. A finite audit covers **16,400 mask/family/
+tile-count cases, 10,601,736 claims and 16,801,800 logical coordinates**. The
+probe passes 53 codegen checks, fifteen whole-graph smoke tests, the changed-input
+replay test in each additional mode, formatting, release builds and Clippy.
+
+**Two hundred fifty diagnostics** use qualified/disabled/forward/gradient/both
+and the reverse order, five pairs per case/visit, ten warmups, at least one
+warmup second, and matched 100 ms prewarming. Every full-state, selection,
+logical-work, optimizer, one-dispatch and no-fallback check passes.
+
+| Persistent GPU diagnostic | Qualified | Disabled | Forward only | Gradient only | Both |
+|---|---:|---:|---:|---:|---:|
+| Forward | 4.083808 ms | 4.078144 ms | 4.021296 ms | 4.090400 ms | 4.020240 ms |
+| Training + SGD | 12.769808 ms | 12.785840 ms | 12.731264 ms | 12.832928 ms | 12.650864 ms |
+
+Forward-only batching improves forward **1.53% versus qualified** and training
+0.30%. Gradient-only batching shows no improvement in its affected phase.
+Combined batching improves both model GPU medians, but its unchanged CI
+inference shader measures +3.80%, exceeding the predeclared 3% diagnostic guard.
+This is measured variation, not evidence that the metadata policy changes CI
+work. Forward-only is the sole policy that passes every advancement condition;
+these diagnostics do not qualify a retained optimization.
+
+The production candidate **removes every probe field, environment switch and
+metadata dump**. It admits only explicit unfused F32 SwiGLUConcat grids of at
+least 256 tiles. Gradient dispatch cases return to their qualified form. A
+source reconstruction verifies that single admission change against the
+archived four-tile candidate; its other source files remain exact. The forward
+shader matches the probe, while training changes only its gradient dispatch case. The existing
+arithmetic, synchronization and SGD batching remain unchanged.
+
+Because removing an inactive gradient repeat wrapper changes the training
+shader, a separate **50-pair diagnostic** checks the production build:
+
+| Persistent GPU diagnostic | Qualified | Production candidate | Change |
+|---|---:|---:|---:|
+| Forward | 4.089824 ms | 4.015680 ms | −1.81% |
+| Training + SGD | 12.949664 ms | 12.675456 ms | −2.12% |
+
+Forward uses **86 registers / 18,928 shared bytes / 102,528 code bytes**;
+training uses **83 / 29,344 / 241,792**. Against qualified, each phase adds 128
+code bytes and training removes one register. Payload, scheduler and resident
+bytes remain exact. Both phases retain 168 participating graph workers, with
+all 256 requested workers enabled. Every diagnostic state/execution check
+passes. Native differences and diagnostic GPU savings require independent
+completed-step confirmation.
+
+Full production qualification passes **677 library tests (eight ignored),
+168 strict oracle cases, 51 matrix regressions, 53 codegen checks and fifteen
+whole-graph smoke tests**, plus strict Clippy, Metal-target compilation,
+formatting and release builds. Thirteen-grid replay covers every partial
+four-tile remainder with 1/3/256/4,096 workers and exact changed-input outputs.
+Both rebuilt benchmark binaries match the frozen candidate.
+
+The fixed **1,000 completed-step comparisons** use control/candidate/candidate/
+control visits, 25 interleaved pairs per case/visit, ten warmups and at least one
+warmup second. Half use the original protocol; half add matched 100 ms
+prewarming. All numerical and execution gates pass. Optimizer accounting is
+verified separately across all 1,050 production diagnostic/normal comparisons,
+in addition to the 250 probe comparisons. The observation handle was lost
+mid-run; the original driver and cgroup were confirmed live and monitored to
+completion. No benchmark process was restarted.
+
+| Persistent completed step | Qualified | Production candidate | Candidate/control, pooled bootstrap 95% interval |
+|---|---:|---:|---:|
+| Original forward | 4.670894 ms | 4.603128 ms | 0.98549 [0.91889, 1.00017] |
+| Original training + SGD | 15.366479 ms | 15.128452 ms | 0.98451 [0.97046, 0.99943] |
+| Prewarmed forward | 4.358717 ms | 4.286056 ms | 0.98333 [0.97639, 0.99879] |
+| Prewarmed training + SGD | 13.209936 ms | 13.121010 ms | 0.99327 [0.98442, 1.00661] |
+
+Prewarmed forward improves **1.67%**, and original training improves **1.55%**,
+with their respective intervals below one. Original forward's upper endpoint
+is **1.0001700494**, and prewarmed training remains inconclusive. **Neither
+model phase passes both required protocols.** No model or CI case shows a
+significant persistent regression. The near miss does not change the criterion
+or justify extra samples. Pooled intervals omit some between-visit variation.
+
+**The production candidate is reverted; the probe is removed.** No extra
+primary repeats or SDK captures follow the failed gate. Twenty-two source/
+dependency hashes, both qualified binaries and fourteen restored smoke tests
+match. Both compiler forks remain clean. Qualified runtime stays `c3ad104`;
+baseline parity remains unmet.
+
+Evidence remains under `target/swiglu-family-widths/` and
+`target/swiglu-forward-four/`. The combined manifest
+`target/megakernel-results/swiglu-forward-four/summary.json` independently verifies
+**1,546 artifact hashes and 77 completed study cgroups**, SHA-256
+`505ab5c443f3eac7fb29164416f9b41e26c0203c7d33a8a8e769148494a9c058`.
+Peak job memory is **3,716,567,040 bytes**, with zero memory-limit events.
+All heavy jobs use separate verified 16/20/1 GiB cgroups; GPU jobs serialize,
+heavy analysis stays outside measurements, and artifacts remain on local `/x`.
+Every launched job finishes.
+
+Next, compare three versus four tiles for forward-only claims with identical
+shaders and native resources. A 400-tile node offers 134 three-tile claims
+instead of 100 four-tile claims; both fit below the 168 participating workers
+observed in model graphs. This tests more parallel claims and less work per
+claim against extra queue traffic. It does not assume simultaneous residency
+or a gain from the counts alone. Preserve partial completion, small-grid and
+SGD behavior, and the fixed criterion under both timing protocols.
 
 ## Completion-epoch control on the current runtime
 
