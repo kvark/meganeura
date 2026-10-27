@@ -37,6 +37,35 @@ particular, read-only and visibility-removal prototypes are not eligible for
 acceptance based on their timings. Their coherent cross-binding treatment is
 superseded by the shared-reference requirement.
 
+## Inactive scratch accesses
+
+The adapter originally guarded shared stores while inactive physical groups
+could still load the scratch range of an active group. In an in-place tree
+reduction, an inactive load and an active store can therefore access the same
+element between barriers. Clamping coordinates and passing numerical tests do
+not order those accesses. This affects smaller unpacked handlers as well as
+partially packed batches; it is not limited to the latest head-packing change.
+
+The repair selects a reserved address for each ordinary shared load in an
+adapted handler. Active lanes retain the original index and arithmetic. Each
+pooled bank has an extra element outside every handler's range, with allocation
+rounded to the existing 16-byte granularity. One physical lane initializes it
+before the worker loop, followed by a workgroup barrier. No handler writes it.
+This avoids changing scalar loads into conditional floating-point values.
+
+Cooperative matrix loads span multiple elements and cannot use that scalar
+slot. Inactive subgroups skip those loads under the same subgroup-uniform
+activity condition used for their products. Workgroup-scoped cooperative tiles
+still require matching physical geometry. Existing uniformity validation stays
+enabled, and all physical lanes continue to reach workgroup barriers.
+
+Structural regression tests inspect the load address, including vector
+components, helper calls and later growth of a pooled bank, and check that
+cooperative loads occur under the activity guard. This establishes the intended
+scratch transformation; numerical qualification is additional evidence.
+Inactive storage reads and intra-node in-place/aliased bindings require a
+separate audit before extending the contract to arbitrary handlers.
+
 ## Smallest candidate interface
 
 Retain the fork's existing `enable wgpu_memory_fence;`, `storageFence()`,

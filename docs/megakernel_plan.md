@@ -496,11 +496,27 @@ the descriptor-reference repair requires fresh measurements.
   tests, attention references, Clippy, formatting and Metal compilation.
   Preserve the initial CI SGD regression, exact training-shader SDK bridge,
   recovered audit exit and corrected unordered-statistics audit.
+- [x] Repair inactive scratch reads before further barrier optimization. The
+  previous lane adapter masked writes but let inactive groups read an active
+  group's scratch during in-place updates. Numerical and coordinate tests did
+  not establish race freedom. Redirect ordinary shared loads to a reserved,
+  initialized read-only element and skip cooperative loads in inactive
+  subgroups. Check the generated addresses and subgroup control directly;
+  rerun full correctness, completed-step timing and SDK state qualification.
+  Treat `2997a85` as a historical performance control with this known defect.
+  Retain `137bfdd` after 670 library, 168 strict oracle, 50 matrix and ten smoke
+  tests, attention references, Clippy, formatting and Metal compilation.
+  Preserve 500 normal comparisons, fifteen diagnostics, four SDK backend
+  captures and exact within-backend state. Model timing intervals include no
+  change; CI SGD has a small 0.36% absolute regression. The final namespace
+  correction has byte-identical benchmark shaders and resources.
+- [ ] Audit inactive storage reads and intra-node in-place/aliased bindings
+  before extending the safety contract to arbitrary handlers.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
-  completed-step parity. Transposed-B staging improves training, which remains
-  about 22% slower than ordinary execution. The rejected per-thread guard
+  completed-step parity. Transposed-B staging improved training; the latest
+  scratch-repair comparison still measures a 15.8% training gap. The rejected per-thread guard
   shows that fewer FP32 operations alone do not establish a speedup.
   Recheck both model phases and all
   CI cases before retaining further changes; do not infer elapsed cost from
@@ -523,15 +539,17 @@ the descriptor-reference repair requires fresh measurements.
   head packing first improved absolute training by 4.68%. Partial scalar batches
   now pack dQ and dKV in groups of four, including smaller tails, and improve
   training by another 2.02% in the larger repeat. Padded claims preserve valid
-  coordinates, uniform loops, scratch isolation and exact logical completion.
+  coordinates, uniform loops and exact logical completion; the subsequent
+  scratch-read audit found a race that the numerical qualification missed.
   Keep cooperative packing unchanged and preserve explicit requested worker
-  counts. Continue investigating the forward gap; the latest paired ratios
-  remain 1.302/1.133. CI and forward functions/resources match the control;
-  their latest timing intervals include no change.
-  Investigate exact-order subgroup reduction separately if needed: dKV has
+  counts. Continue investigating the forward gap; the latest repaired runtime's
+  paired ratios are 1.338/1.158. Its model timing intervals relative to the
+  historical control include no change, despite lower register counts.
+  Audit the remaining inactive storage accesses before investigating exact-order
+  subgroup reduction separately: dKV has
   eight workgroup barriers per query/head iteration. Preserve the reduction
   tree, masks, accumulation order and supported fallback in any such change.
-  Keep `2997a85` as control and all completed-step gates;
+  Use `137bfdd` as the next control and retain all completed-step gates;
   instruction or traffic savings alone are insufficient retention evidence.
   Preserve initialization, writer ownership, publication, independent B storage
   and every logical tile's arithmetic and completion accounting.

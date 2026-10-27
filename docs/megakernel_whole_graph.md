@@ -8,15 +8,16 @@ nodes in the same dispatch. The transfer reset and compute dispatch share one
 queue submission. Initial parameter/moment allocation and explicit optimizer
 calls remain separate operations outside that step boundary.
 
-The current qualified runtime, `2997a85`, adds
-[partial scalar head batches](#partial-scalar-head-batches) to the retained
-scalar head packing, narrow cooperative prologue tiles, contiguous staging,
-gradient dependencies, subgroup guards and transposed-matrix staging.
-The latest 1,000-comparison repeat improves complete persistent training by
-2.02%, from 17.266 to 16.917 ms; its normalized comparison also improves.
-CI and forward shader functions/resources remain unchanged and their timing
-intervals include no change. Final paired ratios are 1.302× ordinary forward
-and 1.133× complete training. Performance parity remains unmet.
+Runtime `137bfdd` repairs [inactive scratch reads](#inactive-scratch-reads)
+while retaining partial scalar head packing and the preceding optimizations.
+A source audit found that inactive groups could read an active group's scratch
+during in-place updates. The numerical and performance results at `2997a85`
+remain historical evidence; they do not establish race freedom.
+
+The latest 500 comparisons establish no model timing improvement or regression
+from the repair. Paired persistent/ordinary medians are 1.338× forward and
+1.158× complete training. The change is retained for correctness, and baseline
+performance parity remains unmet.
 
 For model benchmarks, use `--whole-graph --workers 256`. The
 [current worker sweep](#worker-counts-and-deeper-scalar-staging) finds lower CI
@@ -39,6 +40,105 @@ The GPU flag holds a shared file lock across command execution, so marked jobs
 cannot overlap. Library tests also use the GPU and need this flag. Builds use
 the same launcher without the GPU flag; finish them before primary measurements.
 
+## Inactive scratch reads
+
+The [memory contract](megakernel_memory_contract.md#inactive-scratch-accesses)
+describes the source-level race and repair. Store masking alone left inactive
+loads outside the mask. Ordinary shared loads now select a reserved address;
+cooperative shared loads are skipped by inactive subgroups. Original active
+indices, arithmetic, workgroup barriers and queue publication remain intact.
+This also addresses smaller unpacked handlers, not just partial head batches.
+Inactive storage reads and intra-node in-place/aliased bindings remain a
+separate audit item.
+
+Qualification passes 670 library tests (eight ignored), all 168 strict graph
+oracle tests, 50 matrix regressions, ten whole-graph smoke tests and 22 attention
+references in each mode. All 51 code-generation tests, strict Clippy, formatting
+and Metal compilation pass. Metal compilation is not Metal GPU qualification.
+The new structural test checks reserved addresses for scalar/vector loads,
+helper calls, pooled-bank growth and an original helper argument whose name
+resembles the generated activity argument. The mixed-geometry test also checks
+that cooperative loads are inside the activity guard.
+
+All ordinary shader files and ordinary pipeline resources match `2997a85`.
+The queue claim function and worker main body match apart from the one-time
+reserved-slot initialization. Selected implementations, buffers, metadata,
+logical completion and the single-dispatch boundary stay unchanged. Model
+forward redirects 29 ordinary shared loads; training redirects 81. Forward
+registers fall 100→86, shared bytes rise 18,832→18,928, and code bytes rise
+107,648→107,904. Training registers fall 98→91, shared bytes rise
+29,232→29,344, and code bytes rise 269,824→270,848. These resource changes alone
+do not establish a speedup.
+
+The normal run contains 500 completed-step comparisons: 25 paired samples per
+case in each of two control and two candidate visits, ordered control,
+candidate, candidate, control. It uses 256 requested workers and the same
+warmup, arithmetic selection and full-state budgets as prior measurements.
+The control is historical `2997a85`, with the known inactive-read defect.
+
+| Case | Control persistent ms | Repaired persistent ms | Repaired/control, 95% interval | Paired persistent/ordinary |
+|---|---:|---:|---:|---:|
+| CI inference | 0.069920 | 0.069920 | 1.0000 (0.9886–1.0642) | 1.306× |
+| CI backward | 0.093381 | 0.093016 | 0.9961 (0.9834–1.0024) | 1.433× |
+| CI SGD | 0.094941 | 0.095280 | 1.0036 (1.0003–1.0106) | 1.416× |
+| Model forward | 4.941066 | 4.893955 | 0.9905 (0.9227–1.0794) | 1.338× |
+| Model training + SGD | 16.928983 | 17.001523 | 1.0043 (0.9876–1.0161) | 1.158× |
+
+The absolute CI SGD result is a small 0.36% regression; its normalized interval
+includes no change. Both model absolute and normalized intervals include no
+change, with substantial variation in forward timing. Pooled bootstrap
+intervals do not account for all between-visit variation. The repair is a
+correctness change, not a demonstrated performance optimization.
+
+A final namespace-matching correction prevents an original helper argument
+from being mistaken for the generated activity flag. After rebuilding, all
+62 captured shader files and all five cases' pipeline resources match the
+timed candidate exactly. Five additional diagnostic comparisons pass full
+state checks. The correction affects construction outside the timed boundary;
+native instruction bytes are unavailable. SDK captures use the corrected
+binary, and both binary versions are preserved.
+
+Four full-step SDK backend captures, with sixteen sequential metric groups and
+zero-rate SGD for stable replay, preserve all 246,883,105 captured floats
+bitwise within each backend. Independent hashing verifies the actual files.
+Cross-backend states are not bitwise identical; their maximum error remains
+at most 4.66e-9 under the unchanged budget. SDK replay changes
+14.6935→14.7789 ms (+0.58%) for persistent execution and
+11.9698→11.9862 ms (+0.14%) for ordinary execution.
+
+Persistent estimated warp instructions change +0.98%, integer instructions
++1.63%, FP32 instructions −0.11%, global-load sectors −0.14%, and shared
+wavefronts −1.48%. Local traffic remains zero. Barrier waiting is essentially
+unchanged, 52.98→53.02% of active warp cycles. Maximum clock spread is 0.130%;
+instruction-rate spread is 1.315% across the sequential groups. Rates multiplied
+by diagnostic replay duration are estimates, not native instruction counts or
+elapsed stall-time attribution. The corrected persistent capture still has
+about 1.61× ordinary warp instructions and 2.11× integer instructions, with
+53.02% barrier waiting versus ordinary's 5.34%. These remain profiling targets;
+the scratch repair does not resolve the performance gap.
+
+Rejected intermediate patches remain local. A separate scratch-bank prototype
+first failed generated identifier resolution. Giving every physical group its
+own writable scratch passed focused tests but exceeded the 48 KiB device limit
+for wide attention. Conditional scalar-load variants changed exact outputs by
+up to roughly 1e-7 and were rejected without changing tolerances; the cause of
+those numerical differences is not established. Reserved load addresses avoid
+introducing conditional floating-point values. The initial Clippy failure and
+its correction are also preserved.
+
+Manifest: `target/megakernel-results/inactive-scratch-reads/summary.json`, with
+679 independently verified artifact hashes and 68 recorded bounded cgroups;
+SHA-256 `afab156166ef0616cfb04303c1d50b75a2c97995b2716d429b108468a0c9753a`.
+Raw evidence is local under `target/inactive-read-sentinel/`, including the
+namespace-correction comparison. The three rejected prototype roots are
+`target/inactive-scratch-isolation/`, `target/inactive-scratch-owned/`, and
+`target/inactive-read-mask/`. All heavy jobs completed in verified separate
+cgroups, with 16 GiB memory-high, 20 GiB memory-max and 1 GiB swap. GPU jobs
+were serialized; builds, copies and heavy analyses did not overlap measurement.
+No dependency pin or Naga/Blade source changed. Keep the PR as a draft; the next
+step is the inactive-storage audit followed by profiling from this repaired
+control.
+
 ## Resource and arithmetic contract
 
 The same implementation selector and binding function supply ordinary and
@@ -58,8 +158,10 @@ groups of up to four, each with its original logical coordinates and separate
 scratch. The chosen grid axis minimizes queue claims. Subgroup/cooperative
 handlers use divisor widths 4/2/1. Scalar handlers permit partial batches:
 the claim space pads each packed axis, while completion counts only valid
-logical tiles. Inactive scalar groups clamp both coordinates and scratch to a
-valid group. Claims cannot straddle the packed axis boundary. Inactive groups
+logical tiles. Inactive scalar groups clamp logical coordinates to a valid
+group. Ordinary shared loads select a reserved read-only element outside every
+handler's scratch range; inactive cooperative subgroups skip shared matrix
+loads. Claims cannot straddle the packed axis boundary. Inactive groups
 participate in every workgroup barrier but do not write shared/storage memory
 or execute cooperative products assigned to local accumulators. Other extra-lane
 calculations are still repeated. Subgroup handlers use virtual subgroup coordinates. A shader guard
@@ -74,6 +176,10 @@ Shared arrays reuse a pool by element type and slot; capacity is the maximum
 across handlers, including each handler's packing width. Original per-tile
 initialization remains in each callable body. Packing retries with smaller
 widths if the combined scratch exceeds the device limit.
+Each pooled bank reserves an additional 16 bytes (rounded to element stride)
+for the inactive read address. Physical lane zero initializes that element once
+before the worker loop, followed by a workgroup barrier. The allocation counts
+toward admission limits. Handler stores never address the reserved element.
 Uniform parameters are loaded through `workgroupUniformLoad` and passed by value
 through tile helpers, preserving Naga's uniform-control-flow validation.
 No validation flags related to barrier uniformity are disabled.
