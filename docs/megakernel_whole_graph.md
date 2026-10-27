@@ -63,8 +63,10 @@ none inside same-worker gaps between sampled AT claims. Subsequent
 [all-claim traces](#all-graph-claim-attribution) identify concurrent BT work:
 AT720×4096×50 finishes before its paired BT node in all 32 observations.
 Its long individual span therefore does not establish a whole-step loss.
-The next candidate is two-tile batching for short, explicit SwiGLU handlers.
-Qualified runtime remains `c3ad104`.
+The subsequent [two-tile SwiGLU claims](#two-tile-swiglu-claims) reduce diagnostic
+GPU time by about 0.65%, but all four model absolute intervals include no change
+in 1,000 completed-step comparisons. The candidate is reverted without extra
+repeats. Qualified runtime remains `c3ad104`.
 
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
@@ -1118,6 +1120,99 @@ writes, clamped completion and small-grid behavior. Verify admission on actual
 model nodes and partial claims, then check native resources and all five cases
 before normal completed-step qualification. Keep SGD batching unchanged. Do not
 prioritize AT based only on its longer span while useful BT work overlaps it.
+
+## Two-tile SwiGLU claims
+
+Starting from `f0de2f2` and qualified runtime `c3ad104`, this candidate admits
+only explicit, unfused F32 `SwiGLUConcat` and `SwiGLUConcatGrad` handlers. Grids
+with at least 256 logical tiles claim two sequential tiles; smaller grids keep
+one, including those sharing a cached handler with a larger grid. Existing
+four-tile SGD batching remains unchanged. No Naga/Blade source, arithmetic,
+payload fence, shared GPU state or queue allocation changes.
+
+The source audit verifies 19 CI and 40 ordinary model sources byte-for-byte.
+Every callable arithmetic handler remains exact. Only one forward and two
+training dispatch cases acquire the existing sequential-repeat wrapper;
+reversing those cases restores both complete original shaders exactly. All
+sixteen forward and sixteen gradient nodes have 400 logical tiles. Admission
+therefore saves 3,200 forward / 6,400 training claims per step by host-plan
+calculation; these are not hardware atomic counts.
+
+The new replay test combines nine grid sizes: **1, 3, 255, 256, 257, 400, 401,
+1,024 and 1,025 tiles**, with element tails, forward/gradient consumers and
+small/large nodes sharing cached handlers. Two changed-input replays produce
+bit-exact ordinary/persistent outputs with **1/3/256/4,096 workers**. A finite
+coverage/completion audit enumerates **2,050 tile counts, 1,066,881 claims and
+2,100,225 logical coordinates**; 21 gradient layouts verify 39,908 independent
+writes. This supplements the existing publication contract, not a complete
+Vulkan memory-model proof.
+
+Qualification passes **677 library tests (eight ignored), 168 strict oracle
+cases, 51 matrix regressions, 53 codegen checks and fifteen whole-graph smoke
+tests**, plus Clippy with warnings denied, Metal-target compilation, formatting
+and release builds. Clippy initially rejected an implicit reference pattern;
+the corrected spelling produces byte-identical frozen release binaries and
+passes fifteen post-fix smoke tests. The first source-plan auditor also failed
+because repeated forward plans lacked a matching phase banner. The corrected
+parser uses actual dispatch-zero plan starts and requires four complete,
+matching plans. Both failures and original scripts/sources remain preserved.
+The initial manifest auditor also incorrectly required a GPU lock for CPU analysis; its
+corrected job classification and original failure are preserved. No GPU
+measurements were rerun for these corrections.
+
+All **50 diagnostics** preserve complete-state budgets, selected implementations,
+logical work, requested workers, one dispatch and no fallback. Payload,
+scheduler and resident byte counts are unchanged. Both model phases retain
+168 participating graph workers, with all 256 requested workers enabled.
+
+| Model diagnostic | Qualified | Candidate | Change |
+|---|---:|---:|---:|
+| Forward persistent GPU | 4.070432 ms | 4.044128 ms | −0.65% |
+| Training persistent GPU | 12.727744 ms | 12.644640 ms | −0.65% |
+| Forward registers / shared / code bytes | 86 / 18,928 / 102,400 | 86 / 18,928 / 102,528 | +128 code bytes |
+| Training registers / shared / code bytes | 84 / 29,344 / 241,664 | 83 / 29,344 / 241,920 | −1 register, +256 code bytes |
+
+The predeclared normal gate uses **1,000 completed-step comparisons**:
+control/candidate/candidate/control, 25 pairs per case/visit, ten warmups and
+at least one warmup second. Half use the original protocol; half add matched
+100 ms prewarming. Every state, selection and completion check passes.
+
+| Persistent completed step | Qualified | Candidate | Candidate/control, pooled bootstrap 95% interval |
+|---|---:|---:|---:|
+| Original forward | 4.663694 ms | 4.639423 ms | 0.9948 [0.9876, 1.0575] |
+| Original training + SGD | 15.372354 ms | 15.239828 ms | 0.9914 [0.9747, 1.0019] |
+| Prewarmed forward | 4.365727 ms | 4.331816 ms | 0.9922 [0.9300, 1.0644] |
+| Prewarmed training + SGD | 13.205901 ms | 13.162524 ms | 0.9967 [0.9832, 1.0133] |
+
+**All four model absolute intervals include no change.** Neither phase meets
+the requirement for an absolute completed-step gain under both protocols.
+There is no significant persistent regression in another model or CI case.
+Original ordinary training moves +2.48%, and prewarmed ordinary training
++1.47%; this makes the normalized training ratios look more favorable than
+the absolute persistent changes. Unchanged CI shaders also show timing
+variation. Pooled intervals omit some between-visit variation.
+
+**The candidate is reverted.** No extra primary repeats or fresh SDK counters
+are collected after the failed normal gate. Twenty-two source/dependency
+hashes, both qualified binary hashes and fourteen restored smoke tests match;
+both compiler forks remain clean. Qualified runtime remains `c3ad104`, and
+baseline parity remains unmet.
+
+Evidence is under `target/swiglu-two-tile/`. Manifest
+`target/megakernel-results/swiglu-two-tile/summary.json` independently verifies
+**443 artifact hashes and 45 completed study cgroups**, SHA-256
+`f1fdddd47caf2976456ee20738887d6de32fae336a92cf8fdc6bcae58cad8c23`.
+Peak job memory is **3,714,166,784 bytes**, with zero memory-limit events.
+Every heavy job uses a separate verified 16/20/1 GiB cgroup; GPU jobs serialize,
+builds and heavy analysis stay outside timing, and all artifacts remain on `/x`.
+All launched jobs finish.
+
+A next control can vary the admitted claim width to four while requiring the
+same generated shader and native resources as this two-tile candidate. That
+reduces available claims from 200 to 100 per 400-tile node, so any saved queue
+work must be weighed against reduced parallelism. Verify partial completion,
+changed-input replay and all five diagnostic cases before a new fixed normal
+gate. Keep the acceptance criterion and requested worker count unchanged.
 
 ## Completion-epoch control on the current runtime
 

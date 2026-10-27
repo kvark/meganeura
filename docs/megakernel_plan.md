@@ -935,13 +935,21 @@ the descriptor-reference repair requires fresh measurements.
   Restore source/binary hashes and fourteen smoke tests; verify 515 artifacts
   and 37 completed bounded cgroups. See the
   [all-claim attribution](megakernel_whole_graph.md#all-graph-claim-attribution).
-  Next, test two-tile sequential claims for explicit F32 SwiGLUConcat and
-  SwiGLUConcatGrad grids of at least 256 tiles. Their sixteen nodes per family
-  each have 400 single-tile claims and sub-microsecond recorded bodies. Earlier
-  generated-pointwise batching controls did not admit these handlers. Preserve
-  exact arithmetic, independent writes, partial completion, small-grid behavior
-  and existing SGD batching. Confirm actual model admission and native resources
-  before the five-case diagnostics and normal completed-step gates.
+  Test two-tile claims for explicit F32 SwiGLUConcat/Grad grids of at least 256
+  tiles. Verify exact arithmetic, mixed small/large cached handlers, odd tails,
+  clamped completion and unchanged SGD batching. Pass 677 library tests,
+  168 strict oracle cases, 51 matrix regressions, 53 codegen checks, fifteen
+  smoke tests, Clippy and Metal compilation. Fifty diagnostics reduce model
+  GPU time about 0.65%, but all four absolute model intervals include no change
+  in 1,000 fixed completed-step comparisons. Revert without extra repeats or
+  SDK captures; restore 22 source hashes, both qualified binaries and fourteen
+  smoke tests. Preserve the corrected plan-parser and reference-pattern lint
+  failures. See [two-tile SwiGLU claims](megakernel_whole_graph.md#two-tile-swiglu-claims).
+  Next, test a four-tile metadata control while requiring the same shader and
+  native resources as the two-tile candidate. A 400-tile node then has 100
+  claims, so measure the parallelism tradeoff before normal qualification.
+  Recheck partial completion and replay, keep all workers enabled and preserve
+  the fixed absolute timing criterion under both protocols.
   Keep every completed-step gate; lower claim traffic alone is insufficient.
   Keep the short-K AT gap as an unresolved target without repeating rejected
   tile selectors or delaying optimizer eligibility.
