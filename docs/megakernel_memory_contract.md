@@ -216,6 +216,31 @@ allocation. Disjoint writes may overlap in execution, while reuse, overlapping
 aliases and all read/write hazards retain their ordering. Rebinding invalidates
 the cached dependency metadata. It does not add a global workgroup barrier.
 
+For a whole graph with more than one ready-bitmap word, an idle leader scans
+again only after the remaining-node count changes. Sibling lanes wait at the
+existing uniform claim broadcast. Successful claims can keep consuming ready
+tiles in the same completion epoch. Single-word graphs retain their original
+claim path; the complete step's node count, including optimizer nodes, selects
+the shader, and source identity remains part of the pipeline cache key.
+
+Every completing node publishes its successors, then executes a release fence
+before decrementing the remaining-node counter. A leader observing a new count
+executes an acquire fence before scanning. The counter is monotonic during a
+dispatch and only RMWs modify it. The existing queue-family storage fences and
+shared descriptor satisfy the
+[fence-to-fence synchronization conditions](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html#memory-model-synchronizes-with).
+The acquire prevents caching a new count after an empty scan that missed a
+preceding publication. A publication concurrent with an empty scan is followed
+by a decrement, permitting another scan. The reset/launch boundary orders
+initial ready work. Existing per-lane payload fences remain in place.
+
+An empty scan still does not mean completion. Every requested worker remains
+live until the count reaches zero; no worker waits for a particular producer.
+Executing producers publish before scanning again, so this protocol adds no
+requirement that all dispatched workers be resident simultaneously. Tests cover
+32/33/65-node boundaries, independent chains, repeated reset/execution and
+1/3/256/4096 workers with full output and logical-task checks.
+
 A worker searches the finite bitmap for any ready task. It never waits for a
 particular predecessor or slot. Session workers make at most 64 unsuccessful
 scan rounds before retiring, allowing short producer/consumer handoffs to retain

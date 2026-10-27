@@ -584,6 +584,16 @@ the descriptor-reference repair requires fresh measurements.
   in preflight. Archive the prototype and restore exact runtime/binaries;
   ten restored smoke tests pass. Preserve 319 verified artifacts and both
   initial failed checks. No new Naga API or atomic semantics are needed.
+- [x] Revisit completion-gated idle polling on the repaired resource footprint.
+  Retain it only for multiword bitmaps, preserving the one-word shader exactly.
+  Pass 1,000 completed-step comparisons and fresh SDK captures: training improves
+  7.0% under the original protocol, 5.5% with prewarming and 6.9% in SDK replay.
+  Record the 1.05% original forward regression and changed register allocation;
+  neither all-case speedup nor isolated polling causality is claimed. Qualify
+  671 library, 168 strict oracle, 50 matrix and eleven whole-graph tests, including
+  bitmap boundaries, repeated execution and 4,096 workers. Preserve 150 diagnostic
+  comparisons across the unrestricted, multiword and rejected constant-width
+  variants, with 1,089 verified artifacts. Keep the requested pool unchanged.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
@@ -656,14 +666,18 @@ the descriptor-reference repair requires fresh measurements.
   contributors. The hard-coded padding is not a portable resource policy.
   Combining a claim into one broadcast leaves model participation and timings
   essentially unchanged in preflight, so do not assume broadcast count is the
-  limiting cost. Next, investigate a general scheduling/resource policy that
-  controls concurrent work without abandoning requested workers or relying on
-  model-specific padding. Require progress and completion under oversubscription
-  and arbitrary graph widths before qualification. Keep the five-case primary gate and
+  limiting cost. Completion-gated retries now provide a general multiword-bitmap
+  policy without padding or worker retirement. Its training registers rise to
+  82 and participation falls to 168; fresh SDK replay improves 6.9%, so allocation
+  and reduced polling remain joint contributors. The complete-step training gain
+  is 7.0% without prewarming and 5.5% with it, at a 1.05% original forward cost.
+  Constant bitmap-width specialization does not recover that cost and is removed.
+  Next, recover the forward regression and reduce the expensive narrow matrix
+  stages while preserving all five acceptance cases. Keep the five-case primary gate and
   add matched `--prewarm-ms 100` controls. Preserve all samples, state checks,
   requested workers and acceptance budgets; changed cache/power state is not a
   runtime optimization.
-  Use `e4e70c5` as the next control and retain all completed-step gates;
+  Use the qualified multiword epoch policy as the next control and retain all completed-step gates;
   instruction or traffic savings alone are insufficient retention evidence.
   Preserve initialization, writer ownership, publication, independent B storage
   and every logical tile's arithmetic and completion accounting.

@@ -486,6 +486,79 @@ fn session_whole_graph_releases_all_nodes() {
     check_device_graphs(true);
 }
 
+#[test]
+fn session_whole_graph_bitmap_word_boundaries() {
+    let gpu = crate::support::gpu::gpu();
+    if !gpu.capabilities().device_memory_fence || !gpu.capabilities().binding_array {
+        return;
+    }
+    // Independent chains publish across the 32-node bitmap boundary. Keep
+    // every intermediate output live so a missed publication cannot be hidden
+    // by a later overwrite. Replays also require fresh completion epochs.
+    for nodes in [32, 33, 65] {
+        let mut graph = meganeura::Graph::new();
+        let x = graph.input("x", &[259]);
+        let mut outputs = Vec::new();
+        for index in 0..nodes {
+            let output = if index % 11 == 0 {
+                graph.neg(x)
+            } else if index % 11 == 10 {
+                graph.add(outputs[index - 1], outputs[index - 9])
+            } else {
+                graph.neg(outputs[index - 1])
+            };
+            outputs.push(output);
+        }
+        graph.set_outputs(outputs);
+        for workers in [1, 3, 256, 4096] {
+            let mut config = meganeura::SessionConfig::inference_from_env_on(gpu.clone());
+            config.optimize.mode = meganeura::OptimizeMode::Off;
+            config.options.fuse_dispatches = false;
+            config.runtime.poison = true;
+            config.runtime.persistent = Some(meganeura::PersistentOptions {
+                workers,
+                track_workers: true,
+                allow_fallback: false,
+                device_scheduling: true,
+                whole_graph: true,
+            });
+            let mut session = meganeura::build(&graph, config).0;
+            assert_eq!(session.plan().dispatches.len(), nodes);
+            assert_eq!(session.execution_report().compute_dispatches, 1);
+            for replay in 0..3 {
+                let input: Vec<f32> = (0..259)
+                    .map(|i| ((i * 17 + replay * 23) % 101) as f32 / 32.0 - 1.0)
+                    .collect();
+                session.set_input("x", &input);
+                session.step();
+                session.wait();
+                check_worker_tasks(&mut session);
+                let mut expected: Vec<Vec<f32>> = Vec::new();
+                for index in 0..nodes {
+                    let values = if index % 11 == 0 {
+                        input.iter().map(|value| -value).collect()
+                    } else if index % 11 == 10 {
+                        expected[index - 1]
+                            .iter()
+                            .zip(&expected[index - 9])
+                            .map(|(a, b)| a + b)
+                            .collect()
+                    } else {
+                        expected[index - 1].iter().map(|value| -value).collect()
+                    };
+                    let mut actual = vec![0.0; input.len()];
+                    session.read_output_by_index(index, &mut actual);
+                    assert_eq!(
+                        actual, values,
+                        "nodes={nodes}, workers={workers}, replay={replay}, output={index}"
+                    );
+                    expected.push(values);
+                }
+            }
+        }
+    }
+}
+
 fn check_device_graphs(whole_graph: bool) {
     let gpu = crate::support::gpu::gpu();
     if whole_graph && !gpu.capabilities().binding_array {

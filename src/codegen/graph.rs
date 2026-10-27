@@ -165,7 +165,7 @@ impl Builder {
                 else {
                     continue;
                 };
-                let Ok(mut source) = candidate.source(std::slice::from_ref(&kernel), 1) else {
+                let Ok(mut source) = candidate.source(std::slice::from_ref(&kernel), 1, 2) else {
                     continue;
                 };
                 // Admission only: apply the scope-aware cooperative checker
@@ -574,7 +574,12 @@ impl Builder {
         })
     }
 
-    pub fn source(&self, kernels: &[Kernel], count: usize) -> Result<String, String> {
+    pub fn source(
+        &self,
+        kernels: &[Kernel],
+        count: usize,
+        ready_words: u32,
+    ) -> Result<String, String> {
         assert!(count > 0);
         let partial = kernels
             .iter()
@@ -621,7 +626,21 @@ impl Builder {
         } else {
             format!("if physical_lane == 0u {{\n{initialize}}}\nworkgroupBarrier();")
         };
+        // Poll one completion word only when an empty scan would read multiple
+        // ready words. A single-word graph keeps the original claim path.
+        let wait_for_completion = ready_words > 1;
         let source = include_str!("../shaders/graph_worker.wgsl")
+            .replace("$CLAIM", if wait_for_completion {
+                include_str!("../shaders/graph_claim_epoch.wgsl")
+            } else {
+                include_str!("../shaders/graph_claim.wgsl")
+            })
+            .replace("$IDLE_EPOCH_STATE", if wait_for_completion {
+                "var<private> graph_idle_remaining: u32 = 0xffffffffu;\nvar<private> graph_acquired_remaining: u32 = 0xffffffffu;\n"
+            } else { "" })
+            .replace("$COMPLETE_EPOCH", if wait_for_completion {
+                "                storageFence();\n"
+            } else { "" })
             .replace(
                 "$ENABLES",
                 &enables.into_iter().collect::<Vec<_>>().join("\n"),
@@ -944,7 +963,7 @@ mod tests {
             )
             .unwrap();
         // Both views may use the same canonical backing-buffer descriptor.
-        let generated = builder.source(&[kernel], 1).unwrap();
+        let generated = builder.source(&[kernel], 1, 2).unwrap();
         let module = naga::front::wgsl::parse_str(&generated).unwrap();
         let info = tile::validate(&module).unwrap();
         fn inspect(
@@ -1066,7 +1085,7 @@ mod tests {
             ];
             builder.batch_limit = 4;
             kernels.push(builder.add(body, &layout, 1, &[[4, 1, 1]], false).unwrap());
-            let generated = builder.source(&kernels, 1).unwrap();
+            let generated = builder.source(&kernels, 1, 2).unwrap();
             let module = naga::front::wgsl::parse_str(&generated).unwrap();
             let info = tile::validate(&module).unwrap();
             let mut reads = 0;
@@ -1308,7 +1327,7 @@ mod tests {
         );
         assert_eq!(kernels.last().unwrap().batch_size, 4);
         assert!(builder.views.len() > 1);
-        let source = builder.source(&kernels, 6).unwrap();
+        let source = builder.source(&kernels, 6, 2).unwrap();
         assert!(!source.contains("graph_packing_sync_probe"));
         let mut module = naga::front::wgsl::parse_str(&source)
             .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));

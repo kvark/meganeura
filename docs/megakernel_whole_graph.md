@@ -8,12 +8,20 @@ nodes in the same dispatch. The transfer reset and compute dispatch share one
 queue submission. Initial parameter/moment allocation and explicit optimizer
 calls remain separate operations outside that step boundary.
 
-Runtime `e4e70c5` guards [inactive storage reads](#inactive-storage-reads-and-worker-participation),
+The runtime preserves `e4e70c5`'s guarded [inactive storage reads](#inactive-storage-reads-and-worker-participation),
 including read-only views that may alias writable bindings. It retains the
 preceding scratch-read repair and packing optimizations. Passing numerical
 tests alone did not reveal these extra inactive accesses.
 
-The storage repair's 500 primary comparisons measure a 5.58% absolute training regression
+The latest [completion-epoch policy](#completion-gated-idle-scans) waits on one
+counter between empty scans of a multiword bitmap. Across 1,000 completed-step
+comparisons, training improves 7.0% with the original protocol and 5.5% with
+matched prewarming. Original-protocol forward regresses 1.05%; the prewarmed
+forward interval includes no change. Current paired persistent/ordinary medians
+are 1.380× forward and 1.134× training, or 1.379×/1.285× with prewarming.
+All requested workers remain live until completion. Baseline parity remains unmet.
+
+The earlier storage repair's 500 primary comparisons measure a 5.58% absolute training regression
 from the storage repair. Paired persistent/ordinary medians are 1.355× forward
 and 1.219× training. A separate worker-count control supports a cost from the
 increased number of participating workers. The repair is retained for
@@ -74,6 +82,101 @@ cannot overlap. Library tests also use the GPU and need this flag. Builds use
 the same launcher without the GPU flag; finish them before primary measurements.
 The launcher now records memory peaks, limit events and memory/CPU/I/O pressure
 after each job, preserving the target's exit status and forwarding termination.
+
+## Completion-gated idle scans
+
+An idle worker repeatedly scanning every ready-bitmap word cannot discover new
+work until a producer publishes a successor. For graphs with more than 32 nodes,
+the retained policy lets lane zero wait for the remaining-node count to change
+before rescanning. Other lanes wait at the existing uniform claim broadcast.
+Successful workers can keep consuming already-ready tiles in the same epoch.
+The one-word path remains byte-identical to its control. Selection uses the full
+step's bitmap width, including optimizer nodes, and source identity distinguishes
+the pipeline cache entries.
+
+A release fence after successor publication and before the remaining-node RMW
+pairs with an acquire before a scan of a newly observed epoch. This prevents a
+worker from caching the new count after missing its preceding publication.
+The [memory contract](megakernel_memory_contract.md#progress-completion-and-reuse)
+records the ordering and progress argument. Existing payload fences, relaxed
+atomics, arithmetic, descriptor identity, inactive access guards and logical
+completion accounting remain unchanged. No worker is capped or retired early;
+the original 256-worker benchmark gate is retained. Neither fork changes.
+
+The earlier completion-polling experiment used a different shader footprint.
+Repeating it on `e4e70c5` passes 50 diagnostic comparisons and improves model
+training GPU time 15.531→14.553 ms, while slowing small CI graphs by about
+2–7 µs. Restricting it to multiword bitmaps preserves all 19 CI shader sources
+and their resources exactly. Another 50 diagnostic comparisons confirm that
+both model shaders match the unrestricted prototype byte-for-byte; reversing
+only its epoch changes recovers their entire control source exactly.
+
+Control/candidate/candidate/control sequences then pass **500 original-protocol
+and 500 prewarmed completed-step comparisons**, with 25 pairs per case/visit,
+ten minimum warmups and at least one warmup second. The supplemental sequence
+prewarms each sample for 100 ms. All five cases preserve arithmetic selection,
+full-state budgets, one dispatch, no fallback and complete task accounting.
+Maximum model error remains 4.66e-9; all raw samples are retained.
+
+| Completed-step measurement | Control, ms | Epoch policy, ms | Candidate/control, bootstrap 95% interval |
+|---|---:|---:|---:|
+| Original forward | 5.126816 | 5.180661 | 1.0105 [1.0031, 1.0384] |
+| Original training + SGD | 18.003525 | 16.747768 | 0.9302 [0.8580, 0.9480] |
+| Prewarmed forward | 5.132527 | 5.146547 | 1.0027 [0.9457, 1.0418] |
+| Prewarmed training + SGD | 16.163839 | 15.267334 | 0.9445 [0.9331, 0.9525] |
+
+Ordinary training changes 15.010→15.052 ms and 11.805→11.835 ms respectively.
+Training's normalized intervals also exclude no change. The **1.05% original
+forward regression is a retained tradeoff**, not a speedup in all cases.
+Pooled intervals do not capture all between-visit variation. CI differences,
+including a lower prewarmed SGD median, occur on identical shaders/resources
+and are not attributed to this policy.
+
+Forward/training registers change **84/80→86/82**, while shared bytes stay
+18,928/29,344. Executable sizes grow by 384 bytes each. Forward participation
+stays 168; training participation changes **252→168**. The added private state
+changes allocation, so the timing result does not isolate polling savings from
+resource/concurrency effects. The policy adds no diagnostic scratch padding.
+
+Fresh SDK captures preserve bitwise-identical complete state within each
+backend, including all 246,883,105 captured training floats. Persistent replay
+improves **15.971→14.867 ms (6.9%)**, while ordinary replay is 11.996→11.972 ms.
+Average active compute warps fall **49.10%→32.75% of peak**, with SM-active time
+near 98.2%. Estimated warp instructions fall 16.25%, integer-pipe activity 0.85%,
+FP32 work 0.36%, global-load sectors 3.19% and shared wavefronts 5.44%. Persistent
+local load/store traffic remains zero. Barrier waiting falls 63.92%→55.00% of
+active warp cycles. These rate-times-duration estimates and waiting shares do
+not assign elapsed-time savings to individual instructions.
+
+The initial candidate ordinary capture has 2.28% instruction-rate spread across
+counter groups, exceeding the 2% audit limit. It remains archived; only that
+ordinary capture is repeated, preserving exact full state and selection. The
+final comparisons have maximum clock/instruction-rate spreads of 0.32%/0.73%.
+There are five backend captures and twenty metric groups including the repeat.
+
+A further 50-pair diagnostic preflight compiles the known bitmap width into
+the shader. It reduces executable sizes but shows no useful timing improvement
+and does not resolve the forward cost. Reversing its two constant substitutions
+recovers all five epoch-control shaders exactly. It is removed; the qualified
+multiword policy's source and rebuilt benchmark binaries are restored exactly.
+
+Qualification passes **671 library tests (eight ignored), 168 strict whole-graph
+oracle tests, 50 matrix regressions, 52 codegen tests and eleven whole-graph GPU
+smoke tests**, plus strict all-target/all-feature Clippy, formatting, release
+examples and Metal-target compilation. The new GPU test covers 32/33/65-node
+boundaries, independent chains, three replays and 1/3/256/4096 workers, checking
+every intermediate output and logical-task total. All eleven restored smoke
+tests pass. Metal GPU execution and additional hardware remain unqualified.
+
+The combined local record spans `target/completion-epoch-{current,multiword,constant-bitmap}/`.
+Manifest `target/megakernel-results/completion-epoch-policy/summary.json` contains
+1,000 completed-step comparisons, 150 diagnostic comparisons, **1,089 independently
+verified artifact hashes and 69 recorded bounded cgroups**, SHA-256
+`6383db3e024e3b83c92b473b6853e17e3e8bc744399636f746a5f61ad6ba42c1`.
+Peak job memory is 4,709,658,624 bytes; recorded memory-limit events are zero.
+Small SDK-export pressure totals remain in the logs. Every job completes on
+local storage, with GPU captures serialized and builds/analysis outside timing.
+The remaining forward regression and gaps in all five cases stay open.
 
 ## Single-broadcast claim snapshot
 
