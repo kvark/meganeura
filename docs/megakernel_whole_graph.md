@@ -178,6 +178,70 @@ Small SDK-export pressure totals remain in the logs. Every job completes on
 local storage, with GPU captures serialized and builds/analysis outside timing.
 The remaining forward regression and gaps in all five cases stay open.
 
+## Epoch state and directional fence controls
+
+Two diagnostic follow-ups use retained runtime `6fd43c8`. Neither establishes
+a useful GPU-time improvement, so both are removed. The retained runtime,
+dependency lock, fork checkouts and benchmark binaries are restored exactly.
+
+The first packs the two private epoch words into one, using the high bit to
+record an empty scan. Existing checked queue allocation bounds the node count
+below that bit; the sentinel remains distinct. It changes no synchronization,
+queue operation, arithmetic or requested worker count. Fifty diagnostic
+comparisons pass, but model registers remain 86 forward / 82 training, shared
+bytes remain 18,928 / 29,344, and executable sizes remain 112,384 / 264,704.
+Model GPU medians change 4.568→4.578 ms forward and 14.525→14.579 ms training.
+Reducing source-level private state does not reduce the compiled allocation.
+
+The second changes only the two fences added by epoch polling. A temporary
+Blade hook keeps Naga validation and then substitutes an acquire before the
+new-epoch scan and a release after successor publication. It preserves
+QueueFamily scope, UniformMemory, acquire visibility and release availability;
+all existing payload fences remain acquire/release. This follows the existing
+[Vulkan fence-to-fence synchronization rules](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html#memory-model-synchronizes-with).
+No Naga API, WGSL source, worker count, queue layout or instrumentation counter
+changes. The same frozen diagnostic binary selects unchanged or directional
+SPIR-V; both enable debug names so the hook can identify the intended operations.
+
+Seven original/transformed module pairs validate before use and pass an
+independent inverse audit: removing two constants and reversing two fence
+operands recovers each entire original module byte-for-byte. One initial model
+attempt stops before pipeline creation because debug line records intervene
+between the fence and store. Its script, log and nonzero exit remain archived.
+The corrected identification skips only debug records and retains all operation
+and queue-address checks. The original and transformed modules then validate.
+
+Seventy-five diagnostic comparisons cover the retained binary and both probe
+modes, with five paired samples per case, 256 requested workers, at least ten
+warmups/one second and 100 ms prewarming. All generated WGSL files are identical across
+these modes, and registers, shared memory, executable sizes and model worker
+participation match. Model GPU medians are:
+
+| Case | Retained binary, ms | Probe control, ms | Directional fences, ms |
+|---|---:|---:|---:|
+| Forward | 4.564960 | 4.572256 | 4.567840 |
+| Training + SGD | 14.579840 | 14.550592 | 14.589280 |
+
+Across both studies, all **125 diagnostic comparisons** pass full-state budgets,
+selected-implementation equality, logical task totals, one-dispatch and
+no-fallback checks. Maximum model error remains 4.66e-9. Each probe passes
+52 codegen checks and eleven whole-graph GPU smoke tests; all eleven restored
+smoke tests also pass. These are preflight results, without a full performance
+gate or additional SDK captures. Native instruction bytes remain unavailable;
+the result neither proves identical driver lowering nor qualifies another GPU.
+It provides no performance justification for extending the Naga fence API.
+
+Evidence stays local in `target/completion-epoch-packed-state/` and
+`target/epoch-directional-fence/`. Manifest
+`target/megakernel-results/epoch-state-fences/summary.json` contains **854
+independently verified artifact hashes and 31 recorded job cgroups**, SHA-256
+`0cca15260635881c3b3beacc9521c7758ab62419100f878b159b12ced2d4c31b`.
+Every heavy job has verified 16/20/1 GiB memory-high/hard/swap limits; GPU jobs
+serialize and no build or heavy analysis overlaps measurements. Peak job memory
+is 3,725,115,392 bytes, with no recorded memory-limit events. All jobs finish.
+The forward regression and baseline parity remain open; the measured narrow
+matrix stages remain the next optimization target.
+
 ## Single-broadcast claim snapshot
 
 The earlier combined-broadcast experiment retained a separate ticket broadcast

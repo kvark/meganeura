@@ -672,6 +672,12 @@ the descriptor-reference repair requires fresh measurements.
   and reduced polling remain joint contributors. The complete-step training gain
   is 7.0% without prewarming and 5.5% with it, at a 1.05% original forward cost.
   Constant bitmap-width specialization does not recover that cost and is removed.
+  Packing the two private epoch words into one also leaves the compiled register
+  counts unchanged and shows no useful timing improvement. A validated, exactly reversible SPIR-V probe of
+  directional epoch fences provides no useful GPU-time gain with the same
+  allocation. Both follow-ups are archived after 125 diagnostic comparisons;
+  retain the existing Naga API and qualified runtime. See the
+  [epoch state and fence controls](megakernel_whole_graph.md#epoch-state-and-directional-fence-controls).
   Next, recover the forward regression and reduce the expensive narrow matrix
   stages while preserving all five acceptance cases. Keep the five-case primary gate and
   add matched `--prewarm-ms 100` controls. Preserve all samples, state checks,
