@@ -832,10 +832,21 @@ the descriptor-reference repair requires fresh measurements.
   3,000 comparisons, 100 diagnostics, sixteen SDK groups, 908 verified artifact
   hashes and 98 completed bounded cgroups; restore exact sources/binaries and
   fourteen smoke tests. See the [ready-width evidence](megakernel_whole_graph.md#immutable-ready-bitmap-width).
-  Next, complete the deferred direct forward comparison of completion-epoch
-  waiting against the latest qualified runtime. Preserve both model phases,
-  all requested workers, publication/progress semantics and the unchanged gates;
-  distinguish polling savings from resource/worker-participation changes.
+  Complete the deferred direct forward comparison by selecting continuous
+  bitmap scanning on the latest handler footprint. Full qualification and 1,000
+  completed-step comparisons pass. Registers fall by two in each model phase;
+  participation stays 168, unlike the earlier epoch qualification. Fifty GPU
+  diagnostics improve 1.18% forward / 0.81% training, but every absolute model
+  completed-step interval includes no change. Revert the control and retain the
+  epoch policy. Preserve the corrected brace-balanced source audit, 396 verified
+  hashes and 38 completed cgroups; restore exact sources/binaries and fourteen
+  smoke checks. No confirmation or fresh SDK capture is claimed. See the
+  [current epoch control](megakernel_whole_graph.md#completion-epoch-control-on-the-current-runtime).
+  Next, investigate a ready-word summary above the existing bitmap, preserving
+  cyclic word preference and requested workers. Prove publication/clearing races
+  cannot lose a ready word or strand epoch waiters before GPU testing. Cover
+  summary-word boundaries and adversarial interleavings, then apply the unchanged
+  source, full-state, resource and completed-step gates. No gain is assumed.
   Keep the short-K AT gap as an unresolved target without repeating rejected
   tile selectors or delaying optimizer eligibility.
   Do not sum overlapping spans or infer a memory bottleneck from traffic alone.

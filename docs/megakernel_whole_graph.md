@@ -72,6 +72,14 @@ does not meet the declared absolute retention criterion. Both are reverted.
 Fresh control paired persistent/ordinary medians are **1.309× forward / 1.093×
 training**, or **1.275× / 1.164×** prewarmed. Runtime remains `3f95fa4`.
 
+The [current-footprint epoch control](#completion-epoch-control-on-the-current-runtime)
+then tests continuous ready-bitmap scanning against the latest optimized handlers.
+It passes full qualification and 1,000 completed-step comparisons. Short GPU
+intervals improve 1.18% forward / 0.81% training, with unchanged model worker
+participation, but all absolute completed-step model intervals include no change.
+The control is reverted; the retained epoch policy stays. This completes the
+previously deferred direct forward comparison.
+
 The preceding [fused-matrix tile selection](#fused-matrix-tile-selection) adds
 small-tile routing for fused transposed-B products and extends the existing
 32×16 fused-plain refinement to K≥256. Against qualified `da86b45`, 1,000
@@ -85,8 +93,9 @@ That qualification's paired persistent/ordinary medians were **1.321× forward /
 The preceding [completion-epoch policy](#completion-gated-idle-scans) waits on
 one counter between empty scans of a multiword bitmap. Its separate comparison
 improves training 7.0%/5.5%, with a 1.05% original-protocol forward regression.
-The latest forward gain has not been remeasured directly against that pre-epoch
-control.
+The [current-footprint control](#completion-epoch-control-on-the-current-runtime)
+now repeats that comparison without establishing a completed-step benefit from
+removing epoch waiting.
 
 The earlier storage repair's 500 primary comparisons measure a 5.58% absolute training regression
 from the storage repair. Paired persistent/ordinary medians are 1.355× forward
@@ -149,6 +158,96 @@ cannot overlap. Library tests also use the GPU and need this flag. Builds use
 the same launcher without the GPU flag; finish them before primary measurements.
 The launcher now records memory peaks, limit events and memory/CPU/I/O pressure
 after each job, preserving the target's exit status and forwarding termination.
+
+## Completion-epoch control on the current runtime
+
+This counterfactual starts from `f28a00f`, with qualified runtime `3f95fa4`.
+It selects the original continuous bitmap scanner for every graph while keeping
+the latest matrix, packing, inactive-read and prologue optimizations. Single-word
+CI shaders stay exact. Multiword graphs remove only two private epoch counters,
+the epoch-aware claim function and the extra fence between successor publication
+and the remaining-node decrement.
+
+Successful claims retain their acquire fence. Tile payload fences, completion
+fan-in, dependency RMW fences and release before ready-bit publication remain.
+Continuous rescanning does not cache an empty scan by completion epoch, so it
+does not need the additional epoch-observation ordering. Empty scans retry;
+workers terminate only at global completion. No worker is retired or capped.
+Queue layout, buffers, selected arithmetic and logical work stay unchanged.
+
+Generated-source audits recover the entire candidate from those exact changes.
+Every handler body, all nineteen CI sources and all forty ordinary model sources
+remain byte-identical. The first audit's regular-expression extractor stopped
+at a nested column-zero closing brace in the entry point. Its failed log and
+script are preserved; a brace-balanced extractor verifies the full source
+inverse without repeating GPU work.
+
+The control passes **676 library tests (eight ignored), 168 strict whole-graph
+oracle cases, 51 matrix regressions, fourteen whole-graph smoke tests and 52
+codegen checks**, plus strict all-target/all-feature Clippy, formatting, release
+builds and Metal-target compilation. The qualified rebuild matches both frozen
+candidate binaries exactly. No Metal GPU execution or additional hardware is
+qualified; neither compiler fork changes.
+
+Fifty diagnostic comparisons use five pairs per case/mode and matched 100 ms
+prewarming. Full state, selection, one dispatch, no fallback and complete work
+accounting pass; maximum model error remains 4.66e-9.
+
+| Model phase | Persistent GPU interval, control → continuous | Change | Ordinary GPU change |
+|---|---:|---:|---:|
+| Forward | 4.098400 → 4.049888 ms | −1.18% | +0.05% |
+| Training + SGD | 13.065216 → 12.959072 ms | −0.81% | +0.06% |
+
+Forward/training registers fall **86/84→84/82**, code shrinks
+99,584/238,720→99,072/238,336 bytes, and shared memory stays 18,928/29,344 bytes.
+Both modes have **168 participating model workers**, all 256 requested workers
+enabled, and 22,042/83,312 logical tiles. The earlier epoch qualification changed
+training participation from 252 to 168. That earlier resource effect does not
+recur here. This counterfactual still changes generated code and registers, so
+it does not isolate the cost of polling from compiler/resource effects.
+
+The normal gate completes **1,000 comparisons**, 500 original-protocol and 500
+with matched 100 ms prewarming. Each uses control/candidate/candidate/control
+visits, 25 interleaved pairs per case/visit, at least ten warmups and one warmup
+second. Every state/execution gate passes and all samples are preserved.
+
+| Persistent completed step | Epoch control, ms | Continuous scanning, ms | Candidate/control, bootstrap 95% interval |
+|---|---:|---:|---:|
+| Original forward | 4.619804 | 4.636788 | 1.0037 [0.9943, 1.0666] |
+| Original training + SGD | 15.309254 | 15.260173 | 0.9968 [0.9769, 1.0173] |
+| Prewarmed forward | 4.382197 | 4.329527 | 0.9880 [0.9267, 1.0103] |
+| Prewarmed training + SGD | 13.583753 | 13.377017 | 0.9848 [0.9746, 1.0042] |
+
+All four absolute model intervals include one. Prewarmed normalized training
+improves 0.48%, ratio 0.9952 [0.9917, 0.9988], but original normalized intervals
+include no change. Pooled bootstrap intervals omit some between-visit variation.
+CI timing moves on identical shaders; no shader gain is attributed to those
+cases. The direct forward comparison is complete, and **the epoch policy remains
+retained** because its removal establishes no absolute completed-step gain.
+No fixed confirmation or fresh SDK capture is run; prepared SDK scripts are
+archived but were not executed.
+
+Fresh retained-control paired persistent/ordinary medians are **1.271× forward /
+1.093× training**, or **1.279× / 1.164×** prewarmed. They are medians of paired
+ratios, not ratios of aggregate medians. Baseline parity remains unmet.
+Nineteen source/dependency hashes and both rebuilt benchmark binaries match the
+qualified control exactly; fourteen restored smoke tests pass. Both forks remain
+clean. The implementation is fully reverted.
+
+Evidence remains local in `target/completion-epoch-revisit/`. Manifest
+`target/megakernel-results/completion-epoch-revisit/summary.json` independently
+verifies **396 artifact hashes and 38 completed study cgroups**, SHA-256
+`6fa2e4a4abd16b198411500a771e2dd9ba00ef3fcc1df6d94c1ca9ecbff42644`.
+Peak recorded job memory is **3,722,444,800 bytes**, with zero memory-limit events.
+All heavy jobs use verified 16/20/1 GiB memory-high/hard/swap limits, GPU jobs are
+serialized, and builds/copies/heavy analysis stay outside measurements. All jobs
+finish; no shared-drive artifacts are created.
+
+Next, investigate a ready-word summary above the existing bitmap to skip empty
+words. Preserve cyclic word preference and all requested workers. Prove that
+concurrent publication and clearing cannot lose a ready word or strand epoch
+waiters before GPU testing; cover summary-word boundaries and adversarial
+interleavings. This is a new hypothesis, not an established optimization.
 
 ## Immutable ready-bitmap width
 
@@ -271,9 +370,9 @@ SHA-256 `f4f7a6576cce8a9ab0bd2b6cd5fb10f349080f28ddea7d4aa132a5c71a10599b`.
 Peak recorded job memory is **4,717,015,040 bytes**, with zero memory-limit events.
 Heavy jobs use verified 16/20/1 GiB memory-high/hard/swap limits, GPU work is
 serialized, and builds/copies/heavy analysis stay outside measurements. All
-launched jobs finish. The next control revisits completion-epoch waiting against
-the latest qualified runtime, including the deferred direct forward comparison,
-while retaining both model phases and unchanged CI/state gates.
+launched jobs finish. The subsequent
+[epoch control](#completion-epoch-control-on-the-current-runtime) performs the
+deferred direct forward comparison against the latest qualified runtime.
 
 ## Cooperative matrix scratch initialization
 
