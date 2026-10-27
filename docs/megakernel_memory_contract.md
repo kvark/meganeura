@@ -234,11 +234,29 @@ preceding publication. A publication concurrent with an empty scan is followed
 by a decrement, permitting another scan. The reset/launch boundary orders
 initial ready work. Existing per-lane payload fences remain in place.
 
+Multiword graphs first consult an advisory summary of ready words. Every hinted
+word is re-read from the authoritative bitmap; only the original tile-counter
+RMW grants ownership. If the hinted search fails, the original full scan runs
+before the leader caches an empty epoch. Summary publication and clearing may
+race, leaving either missing or stale hints. Neither can authorize completion
+or waiting by itself. Finite ready work and the full fallback preserve progress;
+concurrent selection need not reproduce the control's interleaving. Existing
+payload and epoch fences remain sufficient; hints need no new ordering API.
+At completion, the host validates the summary's index domain separately from
+the authoritative bitmap and node/task counters.
+
+Each node is published once. A worker's exhausted-ready-bit clear precedes a
+subsequent load through the same queue reference. Same-agent location ordering
+and [Vulkan atomic coherence](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html)
+require that load to observe the clear or a later write. It follows that the
+fallback cannot let that worker overclaim the same node again, preserving the
+existing `claim_limit + batch * workers + 1` overflow bound.
+
 An empty scan still does not mean completion. Every requested worker remains
 live until the count reaches zero; no worker waits for a particular producer.
 Executing producers publish before scanning again, so this protocol adds no
 requirement that all dispatched workers be resident simultaneously. Tests cover
-32/33/65-node boundaries, independent chains, repeated reset/execution and
+32/33/65/1024/1025-node boundaries, independent chains, repeated reset/execution and
 1/3/256/4096 workers with full output and logical-task checks.
 
 A worker searches the finite bitmap for any ready task. It never waits for a

@@ -13,7 +13,17 @@ including read-only views that may alias writable bindings. It retains the
 preceding scratch-read repair and packing optimizations. Passing numerical
 tests alone did not reveal these extra inactive accesses.
 
-The latest [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
+The latest [advisory ready-word summary](#advisory-ready-word-summary), retained
+in `c3ad104`, skips empty words while keeping the original full scan before an
+idle epoch. Against qualified `3f95fa4`, 1,000 completed-step comparisons improve
+persistent training **1.39% original / 1.61% prewarmed**, with both pooled 95%
+intervals below no change. Matched SDK training replay improves **2.24%**;
+ordinary training is stable. Forward completed-step gain remains unestablished.
+Current paired persistent/ordinary medians are **1.289× forward / 1.052× training**,
+or **1.300× / 1.139×** prewarmed. All requested workers remain enabled; baseline
+parity remains unmet.
+
+The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
 `cf8940f`, 1,000 completed-step comparisons improve persistent forward by
@@ -26,7 +36,7 @@ All requested workers remain enabled. Baseline parity remains unmet.
 
 Three subsequent [column-factor reuse probes](#cooperative-column-factor-reuse)
 reduce duplicated factor loads but regress persistent GPU time. All are reverted;
-the qualified runtime remains `3f95fa4`.
+the then-qualified runtime was `3f95fa4`.
 
 The [refreshed sparse clocks](#refreshed-handler-clock-attribution) now identify
 short-K transposed-A weight gradients as a stronger remaining target. The
@@ -39,8 +49,8 @@ checks but regress persistent training GPU diagnostics by 9.5%, 2.5% and 1.3%.
 They are reverted. Subsequent [optimizer-overlap controls](#optimizer-overlap-controls)
 preserve all shader bytes: globally deferring updates regresses training about
 5%, while serializing independent updates in prerequisite-count order yields
-no useful gain. All three dependency probes are reverted; the qualified runtime
-remains `3f95fa4`.
+no useful gain. All three dependency probes are reverted; the then-qualified runtime
+was `3f95fa4`.
 
 Two [cooperative-attention probes](#cooperative-attention-ownership-and-row-softmax)
 also establish no gain. Restricting score computation to its publishing subgroup
@@ -70,7 +80,7 @@ survives reversed-order confirmation. Refined training SDK GPU time improves
 1.02% and normalized prewarmed timing improves in both sequences; that evidence
 does not meet the declared absolute retention criterion. Both are reverted.
 Fresh control paired persistent/ordinary medians are **1.309× forward / 1.093×
-training**, or **1.275× / 1.164×** prewarmed. Runtime remains `3f95fa4`.
+training**, or **1.275× / 1.164×** prewarmed. That study retained `3f95fa4`.
 
 The [current-footprint epoch control](#completion-epoch-control-on-the-current-runtime)
 then tests continuous ready-bitmap scanning against the latest optimized handlers.
@@ -159,6 +169,143 @@ the same launcher without the GPU flag; finish them before primary measurements.
 The launcher now records memory peaks, limit events and memory/CPU/I/O pressure
 after each job, preserving the target's exit status and forwarding termination.
 
+## Advisory ready-word summary
+
+The retained change starts from `5cfea07` and compares against qualified runtime
+`3f95fa4`. For multiword graphs it adds one advisory summary bit per ready-bitmap
+word. A leader visits hinted words in cyclic order from its existing start word.
+Each visit re-reads the authoritative bitmap, and only the original tile-counter
+RMW grants ownership. If the hinted pass fails, the leader performs the original
+full bitmap scan before caching an empty completion epoch. That scan also
+repairs missing hints. Single-word graphs keep their original shader and layout.
+
+Publishers set hints after their ready bits. Claimers clear a hint when removing
+the final bit from a ready word, or when a hinted word is empty. These operations
+can race and leave missing or stale hints; both states are permitted. A missing
+hint can postpone a ready word while other hinted work succeeds, but finite DAG
+work and the full-scan fallback preserve progress. Cyclic preference is preserved
+among hinted words; concurrent selection need not match the control interleaving.
+Summary state never authorizes ownership, completion or an idle epoch by itself.
+
+The existing per-lane payload, completion fan-in, dependency publication and
+epoch fences remain intact. No Naga interface or compiler pin changes. Nodes
+are published once. Same-invocation ready-bit clearing precedes a subsequent
+load through the same queue reference; the reasoning in the
+[memory contract](megakernel_memory_contract.md#progress-completion-and-reuse)
+preserves the original per-worker overclaim bound even across the two searches.
+
+The existing two configuration padding words hold the summary offset/count.
+The queue adds one word per 1,024 graph nodes to each live/reset buffer: **eight
+additional scheduler/resident bytes** in each model phase. Payload allocations
+and logical buffer sizes do not change. Host completion validation still checks
+the full ready bitmap, every node counter and worker task totals. Advisory bits
+may remain stale at completion, so their index domain is checked separately.
+
+The host checker exhausts **30,948 ready-set/hint/worker states**, verifies
+**7,295 segmented scan boundary cases**, and enumerates twenty publication/clear
+interleavings. It observes both missing and stale hints. This is not a complete
+Vulkan memory-model checker; its progress argument allows arbitrary hint
+staleness and relies on the unchanged authoritative scan and publication rules.
+The existing GPU boundary test expands to **32/33/65/1024/1025 nodes**, independent
+chains and fan-in, all intermediate outputs, poisoned storage, three replays and
+**1/3/256/4096 workers**.
+
+Qualification passes **676 library tests (eight ignored), 168 strict whole-graph
+oracle cases, 51 matrix regressions, fourteen expanded smoke tests and 52 codegen
+checks**, plus strict all-target/all-feature Clippy, formatting, release builds
+and Metal-target compilation. Rebuilt executables match the frozen candidate
+binaries exactly. Metal GPU execution and additional hardware remain unqualified.
+
+Generated-source audits recover each whole graph from the original by replacing
+its claim block and adding the one summary-publication RMW. Removing hint
+maintenance from the helper recovers every token in the original tile-claim loop,
+with its successful break represented as a helper return. All handler bodies,
+**nineteen CI sources and forty ordinary model sources** remain byte-identical.
+All epoch and payload fences remain. The two model graphs change only their
+scheduler functions and add `graph_claim_word`.
+
+Fifty full-state diagnostics pass every selection, work, one-dispatch and
+no-fallback check. Maximum model error remains 4.66e-9. Persistent forward GPU
+time changes **4.095744→4.074752 ms (−0.51%)**, and training
+**13.039840→12.724256 ms (−2.42%)**. Ordinary training changes +0.03%.
+Model registers remain **86/84**, shared bytes **18,928/29,344**, participating
+workers **168**, requested workers **256**, and logical tiles **22,042/83,312**.
+Code grows 99,584→102,400 forward and 238,720→241,664 training bytes.
+
+The normal gate completes **1,000 comparisons**: 500 original and 500 with
+matched 100 ms prewarming, control/candidate/candidate/control visits, 25
+interleaved pairs per case/visit, at least ten warmups and one warmup second.
+All five cases pass full-state budgets and execution checks; all samples remain.
+
+| Persistent completed step | Control, ms | Candidate, ms | Candidate/control, bootstrap 95% interval |
+|---|---:|---:|---:|
+| Original forward | 4.705179 | 4.636049 | 0.9853 [0.9101, 1.0028] |
+| Original training + SGD | 15.560865 | 15.345248 | 0.9861 [0.9678, 0.9977] |
+| Prewarmed forward | 4.370782 | 4.543098 | 1.0394 [0.9383, 1.0737] |
+| Prewarmed training + SGD | 13.459792 | 13.243651 | 0.9839 [0.9633, 0.9991] |
+
+Training improves **1.39% original / 1.61% prewarmed**, with both absolute
+intervals below one. Original ordinary training moves +2.43%, inflating the
+normalized improvement; prewarmed ordinary training moves +0.11%. Paired
+normalized training improves 3.77% and 2.22%, respectively. Forward absolute
+intervals include no change; no forward completed-step gain is claimed.
+Original CI backward changes +0.88% persistent / +1.01% ordinary on unchanged
+shaders; the normalized interval includes no change. All CI shifts remain in
+the record. Pooled bootstrap intervals omit some between-visit variation.
+
+Current paired persistent/ordinary medians are **1.289× forward / 1.052× training**,
+or **1.300× / 1.139×** prewarmed. These are medians of paired ratios, not ratios
+of aggregate medians. Baseline parity remains unmet.
+
+Eight matched SDK backend captures contain **32 metric groups**. Every group
+has at least 100 post-warmup samples, valid target/device identity and successful
+exits. Persistent forward replay changes **4.217166→4.203696 ms (−0.32%)**,
+versus ordinary 3.274125→3.276010 ms (+0.06%). Persistent training replay improves
+**13.347622→13.049200 ms (−2.24%)**, versus ordinary
+11.719042→11.721722 ms (+0.02%).
+
+Estimated persistent training warp instructions fall **0.83%**, integer-pipe
+work changes −0.03%, FP32 −0.01%, global-load sectors −0.15% and shared wavefronts
+−0.25%. Local traffic remains zero. Estimated global atomic sectors rise
+**24.78%**, and L2 atomic sectors rise **22.95%**. Barrier waiting falls
+**46.80→45.45% of active warp cycles**, while active compute warps stay near
+32.6% of peak. Faster execution accompanies increased atomic traffic and reduced
+waiting, not a large reduction in total integer work. These counters do not
+isolate the exact source of the gain.
+
+Forward estimated global/L2 atomic sectors rise 20.47%/40.27%, with a much
+smaller replay change. Counter rates multiplied by duration are estimates;
+barrier shares are not elapsed-time fractions. Maximum clock/instruction-rate
+spreads are **0.013%/1.980%**. Unchanged ordinary forward instruction estimates
+move about 1.44%, illustrating their uncertainty. Zero ordinary atomic counts
+have no defined candidate/control ratio.
+
+All eight actual exported states match bit-for-bit between control and candidate
+within each backend. The four forward states are also identical across backends:
+**147,034,513 floats / 588,138,052 bytes**, SHA-256
+`4e5d66e6ce5e95142b848651d316b4df64855a9d85669499cabc3a81089be629`.
+Each training state contains **246,883,105 floats / 987,532,420 bytes**. Ordinary
+SHA-256 is `f67022044ae8966ac48c5d62cd0907411fb42f4d1864c1ba0b3d555b17ce7be0`;
+persistent SHA-256 is `1e359875fa92965d4b0aa9026c050702ae3ac165aa59c0a4cc74a6381589c3b7`.
+Cross-backend training passes tolerance but is not bit-identical. SDK training
+uses zero-rate SGD for stable replay, separately from normal nonzero-rate timing.
+
+Runtime **`c3ad104` is retained**. Evidence remains local in
+`target/ready-word-summary/`. Manifest
+`target/megakernel-results/ready-word-summary/summary.json` independently verifies
+**542 artifact hashes and 43 completed study cgroups**, SHA-256
+`cfb49fce887414cff3cbc913bb1676ba9f1707a4427226df080ed4e66b3bb1a9`.
+Peak recorded job memory is **4,715,782,144 bytes**, with zero memory-limit events.
+All heavy jobs use verified 16/20/1 GiB memory-high/hard/swap limits; GPU jobs are
+serialized, and builds/copies/heavy analysis stay outside measurements. All
+launched jobs finish. Both compiler forks remain clean and unchanged.
+
+Next, test reducing advisory summary-maintenance RMWs, including publication
+placement relative to the existing release fence. Preserve the authoritative
+fallback, payload ordering, all requested workers and the full qualification
+protocol. Increased atomic traffic is an investigation target, not proof that
+removing it will improve timing.
+
 ## Completion-epoch control on the current runtime
 
 This counterfactual starts from `f28a00f`, with qualified runtime `3f95fa4`.
@@ -243,11 +390,9 @@ All heavy jobs use verified 16/20/1 GiB memory-high/hard/swap limits, GPU jobs a
 serialized, and builds/copies/heavy analysis stay outside measurements. All jobs
 finish; no shared-drive artifacts are created.
 
-Next, investigate a ready-word summary above the existing bitmap to skip empty
-words. Preserve cyclic word preference and all requested workers. Prove that
-concurrent publication and clearing cannot lose a ready word or strand epoch
-waiters before GPU testing; cover summary-word boundaries and adversarial
-interleavings. This is a new hypothesis, not an established optimization.
+The subsequent [advisory summary](#advisory-ready-word-summary) skips empty
+words while retaining a full-scan fallback before epoch waiting. Its argument
+allows stale hints and preserves authoritative ownership and progress checks.
 
 ## Immutable ready-bitmap width
 

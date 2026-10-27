@@ -842,11 +842,22 @@ the descriptor-reference repair requires fresh measurements.
   hashes and 38 completed cgroups; restore exact sources/binaries and fourteen
   smoke checks. No confirmation or fresh SDK capture is claimed. See the
   [current epoch control](megakernel_whole_graph.md#completion-epoch-control-on-the-current-runtime).
-  Next, investigate a ready-word summary above the existing bitmap, preserving
-  cyclic word preference and requested workers. Prove publication/clearing races
-  cannot lose a ready word or strand epoch waiters before GPU testing. Cover
-  summary-word boundaries and adversarial interleavings, then apply the unchanged
-  source, full-state, resource and completed-step gates. No gain is assumed.
+  Add an advisory ready-word summary with the original full scan before epoch
+  waiting. Permit stale hints without letting them authorize ownership or idle
+  epochs. Check 30,948 ready/hint/worker states, 7,295 scan boundary cases and
+  twenty publication/clear interleavings; expand GPU tests to 1,024/1,025 nodes.
+  Full qualification and 1,000 completed-step comparisons pass. Retain `c3ad104`:
+  persistent training improves 1.39% original / 1.61% prewarmed, with both pooled
+  absolute intervals below one; matched SDK training improves 2.24%. Forward
+  completed-step gain remains unestablished. Every handler and ordinary/CI shader
+  stays exact, resources/participation remain unchanged, and each model phase
+  adds eight queue bytes. Preserve all eight SDK states, 32 metric groups,
+  542 verified artifact hashes and 43 completed cgroups. See the
+  [summary evidence](megakernel_whole_graph.md#advisory-ready-word-summary).
+  Next, test reducing summary-maintenance RMWs and adjusting hint publication
+  relative to the existing release fence. Preserve the authoritative fallback,
+  payload ordering, all requested workers and full measurement gates. Increased
+  atomic traffic is a target to investigate, not an assumed timing bottleneck.
   Keep the short-K AT gap as an unresolved target without repeating rejected
   tile selectors or delaying optimizer eligibility.
   Do not sum overlapping spans or infer a memory bottleneck from traffic alone.
@@ -854,8 +865,8 @@ the descriptor-reference repair requires fresh measurements.
   add matched `--prewarm-ms 100` controls. Preserve all samples, state checks,
   requested workers and acceptance budgets; changed cache/power state is not a
   runtime optimization.
-  Use the qualified prologue-factor caching and its archived `validated-*`
-  binaries as the next control, and retain all completed-step gates;
+  Use qualified `c3ad104` and its archived `target/ready-word-summary/final-*`
+  binaries and receipt as the next control, and retain all completed-step gates;
   instruction or traffic savings alone are insufficient retention evidence.
   Preserve initialization, writer ownership, publication, independent B storage
   and every logical tile's arithmetic and completion accounting.
