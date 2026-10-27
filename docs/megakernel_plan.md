@@ -874,12 +874,23 @@ the descriptor-reference repair requires fresh measurements.
   capture. Preserve 414 verified artifact hashes and 39 completed cgroups;
   restore twenty source/dependency hashes, both qualified binaries and fourteen
   smoke tests. See the [single-word scan evidence](megakernel_whole_graph.md#rotated-single-word-summary-scan).
-  Next, test two-tile sequential claims restricted to large transposed-A
-  gradient grids. The old four-tile experiment batches every node and does not
-  isolate this target. Prove shared-scratch reuse with an inter-tile rendezvous,
-  preserve every selected tile's arithmetic, clamp tail completion and retain
-  smaller/other grids. Keep all completed-step gates; reduced claim traffic or
-  code size alone is insufficient evidence, and batching can reduce parallelism.
+  Test two-tile sequential claims for large short-K transposed-A grids. The
+  initial guard excludes subgroup votes and changes no model shader; preserve
+  it as an admission control. Revised looped and fixed two-call forms admit 33
+  nodes but regress training GPU diagnostics 1.04%/1.15%, with registers rising
+  84→103/96. Preserve the scratch-order proof, focused 255/256/289-tile and K=65
+  exclusion test, 150 diagnostics and exact source inverses. Revert all three;
+  verify 1,020 artifact hashes, 42 completed cgroups, twenty-one restored
+  source/dependency hashes, both qualified binaries and fourteen smoke tests.
+  No normal timing, full qualification or fresh SDK capture is claimed. See the
+  [two-tile evidence](megakernel_whole_graph.md#targeted-transposed-a-two-tile-claims).
+  Next, reserve the second admitted AT tile in private leader state across the
+  existing outer loop, preserving the single handler call and scratch barriers.
+  Complete each tile separately, consume reservations before idle waiting, and
+  prove that reserved tiles keep the graph live. Add no shared state. This is
+  same-node tile reservation, distinct from the earlier successor handoff.
+  Keep all completed-step gates; lower claim traffic alone is insufficient, and
+  the reservation may still increase register pressure or reduce parallelism.
   Keep the short-K AT gap as an unresolved target without repeating rejected
   tile selectors or delaying optimizer eligibility.
   Do not sum overlapping spans or infer a memory bottleneck from traffic alone.

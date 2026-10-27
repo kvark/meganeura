@@ -35,6 +35,13 @@ improves 0.71%, but prewarmed training remains inconclusive. The fixed criterion
 requires an absolute training gain under both protocols, so this candidate is
 also reverted without adding repeats. Baseline parity remains open.
 
+The following [targeted two-tile claims](#targeted-transposed-a-two-tile-claims)
+also regress. After correcting an admission guard that excluded subgroup votes,
+looped and fixed two-call forms increase training GPU diagnostics by 1.04% and
+1.15%, with registers rising from 84 to 103/96. Both are reverted; the next
+control will preserve the existing single handler call through a private tile
+reservation.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -482,13 +489,104 @@ job uses the verified 16/20/1 GiB limits; GPU runs are serialized and measuremen
 do not overlap builds, copies or heavy analysis. All launched jobs finish, and
 both compiler forks remain clean and unchanged.
 
-Next, investigate two-tile sequential claims restricted to large transposed-A
-gradient grids. The earlier rejected `target/batched-four.patch` batches every
-node by four; it does not isolate this target. Preserve selected tiles and their
-arithmetic, prove shared-scratch reuse with an inter-tile rendezvous, clamp tail
-completion and keep smaller/other grids unchanged. This remains a hypothesis:
-fewer claims can also reduce useful parallelism, so correctness and complete-step
-gates remain mandatory.
+The following [targeted claims](#targeted-transposed-a-two-tile-claims) test the
+remaining short-K transposed-A target, separately from the earlier all-node
+four-tile batching experiment.
+
+## Targeted transposed-A two-tile claims
+
+These probes start from `ed2505b`, against qualified runtime `c3ad104` and the
+frozen `target/ready-word-summary/final-*` binaries. Admission requires plain
+F32 `MatMulAT` with `Kernel::Default`, K in 1–64, at least 256 logical tiles,
+no horizontal packing, prologue, epilogue or BF16 storage, and a full physical
+scalar workgroup. Per-node metadata keeps small and long-K grids at one tile,
+including when they share the batched handler. Arithmetic selection and logical
+tile dimensions are unchanged.
+
+The initial guard also rejects `body.subgroups`. The model's scalar output-vote
+guard uses subgroups, so that attempt **admits no model batching**. All nineteen
+CI and forty-two model shader sources stay identical. Preserve its fifty
+diagnostics as an admission control, not evidence for or against model batching.
+The revision allows subgroup votes while continuing to exclude cooperative
+kernels and smaller logical workgroups.
+
+The captured host plan admits **33 training nodes**: sixteen 2048×720×50,
+sixteen 720×4096×50, and one 1440×720×1 product. Their **18,708 logical tiles**
+correspond to **9,354 valid two-tile claims**. This count is derived from the
+selected host plan and admission predicate, not a hardware claim counter.
+
+The first admitted form loops over the existing tile call. A uniform workgroup
+barrier separates iterations before shared scratch is reused. The original
+tile initialization, arithmetic and internal barriers remain. The final payload
+fence/barrier, clamped completion count, dependency publication, worker totals
+and overflow checks retain the existing batch protocol. No new shared storage
+or compiler-fork change is introduced.
+
+The second admitted form emits the first call directly and conditionally emits
+the second, with the same inter-tile barrier. The condition is uniform and false
+for a one-tile claim or odd final tail. It removes the loop while keeping the
+same admission, inputs and arithmetic. It also changes compiler code duplication
+and register allocation, so this is not a pure measurement of loop overhead.
+
+Each attempt passes release builds, formatting and **52 codegen checks**. The
+initial attempt passes the fourteen original whole-graph smoke cases plus a
+separately added focused case; each revision passes all fifteen together. The
+focused case covers 255/256-tile admission boundaries, an odd 289-tile grid,
+K=65 exclusion, dependent consumers and live outputs, poisoned scratch, two
+input replays and **1/3/256/4096 workers**.
+
+The host model verifies **8,194 claim partitions and 135,000 logical coordinates**.
+Its two-lane scratch model admits twenty-four schedules without an inter-tile
+rendezvous and finds eight reuse hazards; all sixteen schedules with the
+rendezvous are safe. This finite model is not a complete GPU memory-model proof.
+
+All **150 diagnostic comparisons** pass complete-state, matching-selection,
+logical-completion, one-dispatch and no-fallback checks. Maximum model error
+remains 4.66e-9. Each attempt uses fresh control/candidate visits, five pairs per
+case, ten warmups, at least one warmup second and matched 100 ms prewarming.
+All 256 requested workers remain enabled.
+
+For both admitted variants, exactly one case in `graph_main` changes: case 20.
+All handler functions, other cases, scheduler/publication functions, nineteen CI
+shaders, forty ordinary model shaders and the whole forward shader remain exact.
+Reversing the loop/index/activity changes recovers the original case tokens;
+the fixed form reconstructs exactly from the audited loop. Replacing the changed
+case recovers the entire control source byte-for-byte. A full physical workgroup
+allows the case's active-group bound to become one without disabling any lane.
+
+| Admitted form | Training GPU control → candidate | Change | Registers | Training code bytes |
+|---|---:|---:|---:|---:|
+| Two-tile loop | 12.870688→13.003936 ms | +1.04% | 84→103 | 241,664→248,320 |
+| Fixed two calls | 12.764064→12.911488 ms | +1.15% | 84→96 | 241,664→256,000 |
+
+Ordinary training changes +0.11%/+0.16%. Forward GPU changes stay within 0.21%
+on identical shaders. Model shared bytes remain 18,928/29,344, participating
+workers 168, and logical tiles 22,042/83,312. Register/code growth accompanies
+the training regressions but does not isolate their cause. Fewer valid claims
+do not establish a performance benefit; batching can also reduce parallelism.
+
+**All three attempts are reverted.** No full library/oracle/Metal qualification,
+normal completed-step series or fresh SDK capture is claimed for these rejected
+screens. Twenty-one source/dependency hashes, both qualified executable hashes
+and fourteen restored smoke tests match the retained runtime. The temporary
+focused test is archived with the candidates.
+
+Evidence stays in `target/at-two-tile-{claims,vote-claims,unrolled}/`. Manifest
+`target/megakernel-results/at-two-tile-claims/summary.json` independently verifies
+**1,020 artifact hashes and 42 completed study cgroups**, SHA-256
+`7c7ab7dfcba6e560766c592175e4a575455b12b41cfe99e1ed2d80b0ecba0dc3`.
+Peak memory is **3,717,894,144 bytes**, with zero memory-limit events. All heavy
+jobs use the verified 16/20/1 GiB limits, GPU work is serialized, and every
+launched job finishes. Both compiler forks remain clean and unchanged.
+
+Next, test reserving the second tile of an admitted AT claim in private leader
+state across existing outer-loop iterations, preserving the single handler call
+and original scratch barriers. Count completion per executed tile and consume
+reserved work before any idle-epoch wait; prove that outstanding reservations
+prevent premature graph completion. Add no shared state. This differs from the
+earlier single-claim successor handoff: it reserves another tile of the same
+node. It may still increase register pressure and must pass the same gates.
+Baseline parity remains unmet.
 
 ## Completion-epoch control on the current runtime
 
