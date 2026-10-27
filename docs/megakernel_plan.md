@@ -739,11 +739,21 @@ the descriptor-reference repair requires fresh measurements.
   hashes and 48 completed cgroups. Revert all three probes and restore exact
   qualified binaries and smoke checks. See the
   [column-factor evidence](megakernel_whole_graph.md#cooperative-column-factor-reuse).
-  Next, refresh sparse per-handler timings against the qualified runtime after
-  the matrix-selector and row-factor changes. Recheck instrumentation overhead,
-  registers, shared memory and worker participation, then compare the remaining
-  expensive handlers with ordinary execution. Do not sum overlapping node spans
-  or infer a memory bottleneck from duplicate factor traffic alone.
+  Refresh sparse per-handler timings after the matrix-selector and row-factor
+  changes. Eight preflight and 200 paired diagnostics pass; instrumentation adds
+  1.9%/1.3% forward/training GPU time, with unchanged model participation and
+  training register/shared counts. Reversal recovers all 37 original SPIR-V
+  modules, and all callable handlers and ordinary shaders remain identical.
+  Preserve both final training steps (14.90/13.14 ms), exact ordinary profiles,
+  431 verified artifact hashes and 26 completed cgroups. Restore the runtime,
+  compiler fork, lock and exact benchmark binaries; fourteen smoke tests pass.
+  See the [refreshed attribution](megakernel_whole_graph.md#refreshed-handler-clock-attribution).
+  Next, audit short-K transposed-A weight-gradient geometry and claim
+  distribution, including contention with optimizer updates. The 720×4096×50
+  stage spans about 108 µs versus 37 µs in ordinary profiling; 2048×720×50 spans
+  55 µs versus 23 µs. Preserve arithmetic order, storage and locked schedules
+  in both backends. Keep forward cooperative attention as another target.
+  Do not sum overlapping spans or infer a memory bottleneck from traffic alone.
   Keep the five-case primary gate and
   add matched `--prewarm-ms 100` controls. Preserve all samples, state checks,
   requested workers and acceptance budgets; changed cache/power state is not a

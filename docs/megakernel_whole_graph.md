@@ -27,6 +27,11 @@ Three subsequent [column-factor reuse probes](#cooperative-column-factor-reuse)
 reduce duplicated factor loads but regress persistent GPU time. All are reverted;
 the qualified runtime remains `3f95fa4`.
 
+The [refreshed sparse clocks](#refreshed-handler-clock-attribution) now identify
+short-K transposed-A weight gradients as a stronger remaining target. The
+instrumentation is removed after calibration; this is attribution evidence,
+not another retained speedup.
+
 The preceding [fused-matrix tile selection](#fused-matrix-tile-selection) adds
 small-tile routing for fused transposed-B products and extends the existing
 32×16 fused-plain refinement to K≥256. Against qualified `da86b45`, 1,000
@@ -104,6 +109,90 @@ cannot overlap. Library tests also use the GPU and need this flag. Builds use
 the same launcher without the GPU flag; finish them before primary measurements.
 The launcher now records memory peaks, limit events and memory/CPU/I/O pressure
 after each job, preserving the target's exit status and forwarding termination.
+
+## Refreshed handler clock attribution
+
+The sparse probe is refreshed against runtime `3f95fa4`, after the matrix-selector
+and prologue-row changes. It records each node/worker's first and last timestamp,
+consuming clock values immediately. The temporary Blade hook replaces two explicit
+marker calls after Naga validation. All **37 original/transformed SPIR-V pairs**
+validate, and independent reversal recovers every original binary exactly.
+Removing the instrumentation also recovers the worker template exactly. All
+callable handler text in the five benchmark graph modules, and all **56 ordinary
+shader sources**, remain byte-identical. Naga and atomic semantics are unchanged.
+
+Eight preflight comparisons precede **200 paired diagnostics** across all five
+cases: control/probe/probe/control visits, ten pairs per case/visit, at least ten
+warmups and one warmup second, and 100 ms prewarming. Every full-state budget,
+selected-implementation, logical-work, one-dispatch and no-fallback check passes.
+Maximum model error remains 4.66e-9. All 256 requested workers remain enabled.
+
+| Case | Control / probe GPU interval, ms | Probe change |
+|---|---:|---:|
+| CI inference | 0.031056 / 0.033456 | +7.7% |
+| CI backward | 0.067744 / 0.074496 | +10.0% |
+| CI SGD | 0.073744 / 0.079600 | +7.9% |
+| Model forward | 4.102992 / 4.181968 | +1.9% |
+| Model training + SGD | 13.075872 / 13.247376 | +1.3% |
+
+Training retains **84 registers / 29,344 shared bytes**. Forward changes from
+86 to 84 registers with 18,928 shared bytes. Both model phases retain **168
+participating workers**. Code grows 99,584→100,608 / 238,720→239,872 bytes.
+The four timestamp words per node/worker increase forward/training scheduler
+storage by 1,261,568 / 4,317,184 bytes, exactly matching the resident-memory
+increase. Ordinary model GPU medians move only +0.15%/+0.03%; ordinary forward
+wall time shifts −8.8%, so wall changes are not used to calibrate the probe.
+
+Fresh ordinary profiles preserve exact complete state and match the benchmark's
+selected implementations. Representative comparisons across both trace visits:
+
+| Phase / shape | Nodes | Ordinary median, µs | Persistent median span, µs |
+|---|---:|---:|---:|
+| Forward `MatMul[50x4096x720]` | 16 | 49.09 | 54.47 |
+| Forward `FusedMatMulAdd[50x720x2048]` | 16 | 63.49 | 68.51 |
+| Forward `FlashAttentionCoop[50]` | 16 | 9.20 | 20.50 |
+| Training `MatMulAT[720x4096x50]` | 16 | 36.90 | 107.99 |
+| Training `MatMulAT[2048x720x50]` | 16 | 22.80 | 54.55 |
+| Training `MatMulBT[50x720x4096]` | 16 | 136.22 | 160.52 |
+| Training cross-attention dKV, `q=50,kv=16,h=15/5` | 8 | 106.50 | 144.61 |
+
+The first transposed-A shape stays near 108 µs in both visits. It uses 768
+logical tiles per node; the smaller shape uses 384. Their ordinary kernels use
+92 registers and 16,768 shared bytes. These short-K weight-gradient products
+are the next target for a geometry/claim-distribution audit, including contention
+with optimizer updates. The forward prologue's remaining span difference is
+substantially smaller than in the earlier clock study.
+
+Both final training steps remain in the record: **14.902624 / 13.137280 ms**,
+despite prewarming. SGD envelope unions cover 4.192 / 2.958 ms; their tails after
+the last non-SGD handler cover 1.779 / 1.143 ms. The corresponding ordinary SGD
+passes are both about 1.351 ms. Summing SGD spans would double-count overlap,
+and the final tails are not estimates of savings from removing updates.
+
+Ordinary profiles split dispatches into timed passes and exclude SGD from the
+backward profile. Persistent node spans include gaps between claims and overlap
+other work. Each trace is the final measured step of its visit; its timestamp
+interval and clock envelope provide the time scale. Clock rate and compiler
+code-motion barriers are not guaranteed. These observations select targets;
+they do not establish additive recoverable costs or a new performance result.
+
+Five focused graph-codegen tests and fourteen whole-graph smoke tests pass.
+The initial preflight audit incorrectly required resident bytes to stay equal
+despite the added timestamp queue. Its script/log are preserved; the corrected
+audit verifies the exact queue/resident delta, without rerunning GPU work.
+Runtime, Blade source and dependency lock are restored exactly, both forks are
+clean, rebuilt benchmark binaries match the qualified controls byte-for-byte,
+and fourteen restored smoke tests pass. No full retained-change qualification
+or fresh SDK counter capture is claimed.
+
+Evidence is local in `target/clock-refreshed/`. Manifest
+`target/megakernel-results/clock-refreshed/summary.json` contains **431 independently
+verified artifact hashes and 26 completed bounded cgroups**, SHA-256
+`0170ed293fd5ddd121b551a4a5646e065509fff79ea80cbf2b4ffbdce40cca61`.
+Peak recorded job memory is **4,282,998,784 bytes**, with zero memory-limit events.
+Every heavy job uses verified 16/20/1 GiB memory-high/hard/swap limits; GPU work
+is serialized and builds/copies/heavy analysis stay outside measurements.
+All jobs finish. The runtime remains `3f95fa4`; baseline parity remains open.
 
 ## Cooperative column-factor reuse
 
