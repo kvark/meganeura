@@ -808,10 +808,20 @@ the descriptor-reference repair requires fresh measurements.
   restore nineteen source/dependency hashes, exact qualified binaries and fourteen
   smoke checks. See the
   [scratch-initialization evidence](megakernel_whole_graph.md#cooperative-attention-scratch-initialization).
-  Next, inspect complete initialization in cooperative matrix handlers. Prove
-  each admitted path separately, including padded writes, result storage and
-  prologue factors; preserve inactive sentinels and required publication/reuse
-  barriers. This is separate from both rejected attention and F32 scalar probes.
+  Audit complete initialization in selected 16×16 f16-input cooperative matrix
+  handlers. Check 3,564 parameter/tile cases, including zero K, padded staging,
+  prologue factors and result storage. Omit converter clears, then their entry
+  barrier; both leave model GPU diagnostics within 0.2%. Each passes 52 codegen,
+  51 ordinary matrix, fourteen smoke and fifty full-state diagnostic checks.
+  Expanded strict matrix sweeps pass 44 cases and reject the same seven typed/
+  workgroup cases on both candidates and the unmodified baseline. Preserve these
+  admission failures, exact source inverses, 660 verified hashes and 37 completed
+  cgroups. Revert both probes and restore exact qualified binaries and smoke
+  tests. See the [matrix reset evidence](megakernel_whole_graph.md#cooperative-matrix-scratch-initialization).
+  Next, specialize the immutable ready-bitmap width in the generated scheduler,
+  preserving scan order, claims, fences and all requested workers. Verify width
+  agreement across frame reuse and pipeline caching. This changes the dynamic
+  scan bound/divisor, not the rejected last-successful-word cursor policy.
   Keep the short-K AT gap as an unresolved target without repeating rejected
   tile selectors or delaying optimizer eligibility.
   Do not sum overlapping spans or infer a memory bottleneck from traffic alone.

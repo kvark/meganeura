@@ -58,6 +58,11 @@ omit redundant converter clears, with and without the converter's entry barrier.
 Both pass correctness and exact source audits but leave model GPU diagnostics
 within 0.2% of control. Both are reverted; no new speedup is established.
 
+The following [cooperative-matrix reset controls](#cooperative-matrix-scratch-initialization)
+also stay within 0.2% of control and are reverted. An expanded strict matrix
+sweep identifies seven admission rejections shared by the baseline and both
+candidates, while all forty-four admitted cases pass.
+
 The preceding [fused-matrix tile selection](#fused-matrix-tile-selection) adds
 small-tile routing for fused transposed-B products and extends the existing
 32×16 fused-plain refinement to K≥256. Against qualified `da86b45`, 1,000
@@ -136,6 +141,80 @@ the same launcher without the GPU flag; finish them before primary measurements.
 The launcher now records memory peaks, limit events and memory/CPU/I/O pressure
 after each job, preserving the target's exit status and forwarding termination.
 
+## Cooperative matrix scratch initialization
+
+Two controls start from `d0caa54`, retaining runtime `3f95fa4`. They omit converter
+clears for selected non-compensated 16×16 f16-input matrix, prologue and epilogue
+generators. Typed, horizontal, convolution, compensated, 8×8 and f32-input
+generators retain resets. The first keeps the converter entry barrier; the
+second removes it. All original shader and worker barriers, fences, inactive
+sentinels and guards remain. Ordinary shaders and arithmetic selection do not
+change. Each model phase selects sixteen affected projection nodes.
+
+Direct, transposed and scalar staging each cover all 256 operand cells, with
+explicit padding writes before reads. Prologue caches initialize all 32 rows
+before their barrier and the retained per-lane factor loads. A zero-K path
+never reads operand scratch; initialized accumulators still supply results.
+Epilogue cooperative stores cover all 1,024 result cells before scatter.
+Index checks enumerate 3,564 parameter/tile cases, including 324 zero-K cases,
+and result ownership for subgroup widths 4–128 without equating subgroup lanes
+with local invocation IDs. Full-result coverage relies on the original
+cooperative intrinsic semantics. Packed groups retain disjoint scratch; worker
+barriers order prior reuse even when the converter entry barrier is omitted.
+
+Each probe passes **52 codegen checks, 51 ordinary matrix regressions, fourteen
+whole-graph smoke tests and fifty full-state diagnostics**. The expanded strict
+matrix sweep is **44 passing / seven rejected** for both candidates and an
+independently rebuilt, unmodified baseline. Two rectangular cases require their
+physical cooperative workgroup size; five typed cases encounter unsupported
+graph scalar types. Test names and admission errors match exactly. These are
+existing admission limits, not a wholly passing strict suite; no numerical
+failure occurs in the admitted cases. Smoke coverage includes poisoned scratch,
+ragged K/rows, changed inputs/factors and 1/3/64/4096 workers.
+
+Five diagnostic pairs per case/mode use matched 100 ms prewarming. Selection,
+full-state budgets, completion, one dispatch and no fallback all pass; maximum
+absolute error is 4.66e-9. All 256 requested workers remain enabled, with 168
+participating model workers and 22,042/83,312 logical tiles.
+
+| Probe | Phase | Persistent GPU interval, control / candidate | Change | Ordinary GPU change |
+|---|---|---:|---:|---:|
+| Omit clears | Forward | 4.099456 / 4.092960 ms | −0.16% | +0.02% |
+| Omit clears | Training + SGD | 13.046176 / 13.061536 ms | +0.12% | +0.04% |
+| Omit clears and entry barrier | Forward | 4.100032 / 4.096992 ms | −0.07% | −0.05% |
+| Omit clears and entry barrier | Training + SGD | 13.058848 / 13.063136 ms | +0.03% | +0.22% |
+
+Both retain 18,928/29,344 shared bytes and 86 forward registers; training
+registers fall 84→82. Code size falls from 99,584/238,720 to 98,944/238,080 bytes
+for clears alone and 98,816/237,952 with the entry barrier removed. Neither
+establishes a useful speedup. Wall timings vary more than GPU intervals; no
+completed-step gain, normal retention gate or fresh SDK capture is claimed.
+
+All nineteen CI and forty model sources remain byte-identical, including all
+fifty-six ordinary shaders. Each model graph changes one matrix handler. Source
+audits isolate four reset loops (800 forward / 1,024 training cells), their
+cursor declarations and, in the second probe, one entry barrier. Every remaining
+handler token matches after one-to-one temporary renaming; all source outside
+the handler is exact. No scratch capacity, handler arithmetic or selection
+changes. A formatting failure is corrected before building and preserved.
+
+Both probes and wrappers are reverted. Nineteen original source/dependency
+hashes and both qualified binaries match exactly; fourteen restored smoke tests
+pass. Both compiler forks remain clean. Evidence is local in
+`target/coop-matrix-clear/` and `target/coop-matrix-clear-barrier/`. Manifest
+`target/megakernel-results/coop-matrix-clearing/summary.json` independently
+verifies **660 artifact hashes and 37 completed bounded cgroups**, SHA-256
+`19d44db268f658048323a1501c9c48d97be4616456c14ce2943186dd9da88509`.
+Peak recorded job memory is **3,716,595,712 bytes**, with zero memory-limit events.
+All heavy work uses separate verified `ml.slice` scopes, GPU jobs are serialized,
+and artifacts stay on local `/x`. All jobs finish. Baseline parity remains unmet.
+
+Next, specialize the ready-bitmap width already known when compiling each graph.
+The runtime currently uses it as a scan bound and modulo divisor. Preserve the
+same word order, claims, publication and worker counts; verify frame reuse and
+pipeline identity retain the matching width. This differs from the rejected
+last-successful-word cursor, which changed scan order.
+
 ## Cooperative attention scratch initialization
 
 Two independent controls start from source revision `701602e` and qualified
@@ -206,12 +285,9 @@ GPU jobs are serialized, heavy work uses separate verified `ml.slice` scopes,
 and artifacts stay on local `/x`. All launched jobs finish. Runtime remains
 `3f95fa4`; baseline parity remains unmet.
 
-Next, inspect initialization coverage in cooperative matrix handlers, whose
-staging and result scratch differ from attention and scalar matrix code. Admit
-only individually proven paths, preserving prologue factors, padded writes,
-inactive sentinels, publication and reuse barriers. The attention result does
-not establish that clearing is free elsewhere or identify a unique cause of
-the remaining graph overhead.
+The subsequent [matrix controls](#cooperative-matrix-scratch-initialization)
+audit their different staging, prologue and result storage, but also establish
+no gain. These results do not identify a unique cause of the remaining overhead.
 
 ## Cooperative attention subgroup sharing
 
