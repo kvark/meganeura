@@ -548,6 +548,13 @@ the descriptor-reference repair requires fresh measurements.
   persistent gain; the relative training gap grows 3.73%. SDK replay improves
   5.13% ordinary and 1.78% persistent. Archive the ordinary optimization
   candidate, revert the experiment and restore exact retained binaries.
+- [x] Prove fully occupied packed claims across all shared-handler grids and
+  restore dynamic activity before reused handlers receive partial grids.
+  Preserve unchanged helper guards and ordinary shader bytes. Qualify 1,000
+  completed-step comparisons, ten diagnostics and four SDK backend captures;
+  confirmation establishes no absolute model gain. Archive the candidate and
+  restore byte-identical retained binaries. Investigate same-binary timing
+  variation before the next small optimization.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
@@ -596,12 +603,18 @@ the descriptor-reference repair requires fresh measurements.
   optimization candidate; both shuffle variants and their dependency changes
   remain reverted. The confirmation's retained-control paired ratios are
   1.424/1.209 forward/training, with substantial forward timing variation.
-  Next, audit whether proved fully occupied packed claims still pay adaptation
-  guards for inactive groups. Preserve the guards on every partial/tail case,
-  and prove the occupancy condition across every grid sharing a handler before
-  specializing activity. The earlier constant-mask probe covered original
-  logical workgroups equal to physical workers, before the inactive-read repairs;
-  it does not answer this narrower packed-claim question.
+  The packed-activity follow-up proves full physical-group coverage across known
+  grids and demotes reused handlers before compiling a new partial grid. Only
+  one matrix handler in each model phase specializes; all other shader bytes,
+  including inactive access guards, remain identical. Preserve 1,000 normal
+  comparisons, ten diagnostics and four SDK backend captures. Confirmation
+  establishes no absolute model gain, despite 2.01% lower estimated integer
+  activity; revert the patch and restore byte-identical retained binaries.
+  Next, quantify and attribute benchmark variation with frozen identical-binary
+  controls. Same-binary ordinary training visit medians range 11.79–14.72 ms.
+  Separate CPU recording/submission/wait time, GPU clocks and cgroup pressure
+  before interpreting another small optimization. Keep telemetry separate from
+  primary qualification, preserve all samples and change no acceptance budget.
   Use `e4e70c5` as the next control and retain all completed-step gates;
   instruction or traffic savings alone are insufficient retention evidence.
   Preserve initialization, writer ownership, publication, independent B storage

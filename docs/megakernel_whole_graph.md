@@ -35,6 +35,12 @@ regression but does not establish a persistent completed-step gain in its
 confirmation run. It is also reverted. Confirmation retained-control ratios
 are 1.424× forward and 1.209× training; forward timings vary substantially.
 
+A [packed-activity specialization](#fully-occupied-packed-claims) changes only
+one matrix handler in each model phase. It reduces instruction work but does
+not establish an absolute model speedup in confirmation, and is reverted.
+Same-binary ordinary training visits range from 11.79 to 14.72 ms. The next
+step is to attribute that measurement variation before another small change.
+
 For model benchmarks, use `--whole-graph --workers 256`. The
 [current worker sweep](#worker-counts-and-deeper-scalar-staging) finds lower CI
 backward/SGD latency with an explicit 64-worker pool; no universal replacement
@@ -55,6 +61,98 @@ separate verified cgroup (16 GiB soft memory limit, 20 GiB hard limit, 1 GiB swa
 The GPU flag holds a shared file lock across command execution, so marked jobs
 cannot overlap. Library tests also use the GPU and need this flag. Builds use
 the same launcher without the GPU flag; finish them before primary measurements.
+
+## Fully occupied packed claims
+
+This experiment proves when every physical group in a packed worker has a real
+logical tile. Only parallel packing of smaller logical workgroups qualifies:
+the batch must fill the physical worker, and the packed axis must divide evenly
+by that batch. Every known grid sharing a handler participates. Empty grids
+skip the handler, but unknown or all-empty initial grids cannot establish the
+proof. Original generic packing admission and subgroup geometry checks remain.
+
+Optimizer handlers may later receive different grids. The candidate rechecks
+every newly prepared frame and restores dynamic activity before shader source
+and pipeline cache lookup if any grid is partial. Existing frames keep immutable
+pipelines. The idle-frame shortcut already requires identical handlers, grids
+and bindings, so it reuses an existing proof. Tests independently enumerate
+claim/group coverage and check full-to-partial reuse, unknown and mixed grids.
+
+All 673 library tests (eight ignored), 54 codegen tests, 168 strict whole-graph
+oracle tests, 50 matrix regressions, ten whole-graph smoke tests, 22 attention
+references in each mode, strict Clippy, formatting and Metal compilation pass.
+Metal GPU execution remains unqualified. One redundant test launch used a
+nonexistent standalone `megakernel` target; those tests are part of the passing
+`smoke` suite. The launch error is preserved separately.
+
+Ten diagnostic comparisons preserve selection, geometry, buffers, scheduler,
+completion and one-dispatch execution without fallback. All 57 ordinary shader
+sources and all three CI persistent shaders are byte-identical to control.
+Only handler 10 changes in each model shader: four logical 64-lane groups fill
+the physical 256-lane worker, allowing `graph_active_lane = true`. Every other
+source byte is identical, including the previously audited 102 storage-read
+guards, scratch protection and stores. Partial attention handlers stay guarded.
+
+Forward code size falls 112,000→108,928 bytes, while training falls
+264,320→263,040 bytes. Registers remain 84/80 and shared allocations remain
+18,928/29,344 bytes for forward/training. Diagnostic participation stays
+168/252 workers, with 256 requested and 21,338/79,824 logical tasks completed.
+These statistics do not establish an occupancy change.
+
+The primary sequence is control, candidate, candidate, control, with 25 pairs
+per case per visit: 500 completed-step comparisons at 256 workers. Forward
+persistent time improves 5.1260→4.7867 ms, ratio 0.9338 [0.8711, 0.9975], but
+training changes 17.8367→17.7141 ms, ratio 0.9931 [0.9836, 1.0041]. Unchanged
+ordinary CI inference also moves −8.00% and persistent CI SGD −1.72%.
+
+One fixed 500-comparison confirmation uses the same frozen binaries, all five
+cases and unchanged sample acceptance, without rebuilding. Its model results:
+
+| Case | Control persistent ms | Candidate persistent ms | Candidate/control, 95% pooled bootstrap interval |
+|---|---:|---:|---:|
+| Forward | 4.819140 | 4.658913 | 0.9668 [0.8859, 1.0145] |
+| Training + SGD | 17.838643 | 18.000229 | 1.0091 [0.9962, 1.0176] |
+
+Neither absolute model interval establishes improvement. Confirmation paired
+persistent/ordinary medians change 1.4261→1.3258 forward and 1.2659→1.4954
+training, while pooled ordinary training changes 14.5976→11.9985 ms. Across
+visits, the same control binary's ordinary training medians range
+11.7893–14.7227 ms, and the same candidate's range 11.7905–14.7248 ms. Samples
+also include large completion-time spikes. All visits and samples are preserved;
+pooled bootstrap intervals do not capture all between-visit variation. These
+ordinary changes cannot be attributed to altered ordinary shader source.
+
+Four complete-step SDK backend captures, using sixteen metric groups, measure
+ordinary replay 11.9882→11.9860 ms and persistent replay 15.9345→15.8890 ms
+(−0.29%). Estimated persistent warp instructions fall 0.81% and integer-pipe
+thread instructions 2.01%; shared wavefronts change +0.18% and global loads
++0.04%, with no local traffic. Barrier waiting remains 64.12→64.19% of active
+warp cycles. Counter rates times replay duration are estimates; barrier share
+is not an elapsed-time stall cost. Maximum within-capture clock and repeated
+instruction-rate spreads are 0.43% and 0.68%.
+
+All 246,883,105 captured state floats are bitwise identical between control and
+candidate within each backend, verified from the actual files. Cross-backend
+maximum error remains at most 4.66e-9 under the unchanged budget; the backends
+are not bitwise identical. All 1,000 normal comparisons and ten diagnostics
+pass numerical, selection, completion and single-dispatch checks.
+
+The candidate is archived and reverted. Both rebuilt release benchmark binaries
+match retained `e4e70c5` byte for byte. Blade and Naga are unchanged and clean;
+this experiment introduces no dependency or atomic-semantics changes.
+
+Evidence is local under `target/packed-full-activity/`, including the proof,
+patch, frozen binaries, source audit, raw visits, fixed confirmation design and
+SDK states. Manifest `target/megakernel-results/packed-full-activity/summary.json`
+records 495 artifact hashes and 50 bounded cgroups; SHA-256
+`b79afc2a756bfde3e66d5b4bbb1fb13f44526b499f016c0bbc1dd94edaecc8f2`.
+Every heavy job used the verified memory limits and GPU jobs were serialized.
+
+Before another small optimization, run frozen identical-binary controls and
+attribute the visit variation using CPU recording/submission/wait timing, GPU
+clocks and cgroup memory/CPU pressure. Keep telemetry separate from primary
+qualification, preserve all samples and retain the existing benchmark boundary
+and 256-worker gate. No CPU or GPU policy was changed in this experiment.
 
 ## Static subgroup reduction
 
