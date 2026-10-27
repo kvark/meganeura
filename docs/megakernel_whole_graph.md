@@ -13,16 +13,25 @@ including read-only views that may alias writable bindings. It retains the
 preceding scratch-read repair and packing optimizations. Passing numerical
 tests alone did not reveal these extra inactive accesses.
 
-The latest [fused-matrix tile selection](#fused-matrix-tile-selection) adds
+The latest [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
+keeps each lane's two per-row factors in registers across the K loop, after
+the existing shared-cache initialization and barrier. Against qualified
+`cf8940f`, 1,000 completed-step comparisons improve persistent forward by
+**5.8% original / 6.6% prewarmed**. SDK forward replay improves **6.9% persistent /
+2.3% ordinary**. CI and training shader bytes are unchanged; no new gain is
+attributed to those cases. Current paired persistent/ordinary medians are
+**1.310× forward / 1.069× training**, or **1.282× / 1.165×** with prewarming.
+All requested workers remain enabled. Baseline parity remains unmet.
+
+The preceding [fused-matrix tile selection](#fused-matrix-tile-selection) adds
 small-tile routing for fused transposed-B products and extends the existing
 32×16 fused-plain refinement to K≥256. Against qualified `da86b45`, 1,000
 completed-step comparisons improve persistent forward/training by **4.8%/4.1%**
 under the original protocol. Matched prewarming measures 9.1%/4.2%, although
 ordinary forward also shifts substantially. SDK replay confirms smaller
 forward/training gains of **3.5%/4.4%**. Ordinary training improves about 1.8%.
-Current paired persistent/ordinary medians are **1.321× forward / 1.080× training**,
-or **1.368× / 1.166×** with prewarming. All requested workers remain enabled.
-CI shaders are unchanged. Baseline parity remains unmet.
+That qualification's paired persistent/ordinary medians were **1.321× forward /
+1.080× training**, or **1.368× / 1.166×** with prewarming. CI shaders were unchanged.
 
 The preceding [completion-epoch policy](#completion-gated-idle-scans) waits on
 one counter between empty scans of a multiword bitmap. Its separate comparison
@@ -91,6 +100,119 @@ cannot overlap. Library tests also use the GPU and need this flag. Builds use
 the same launcher without the GPU flag; finish them before primary measurements.
 The launcher now records memory peaks, limit events and memory/CPU/I/O pressure
 after each job, preserving the target's exit status and forwarding termination.
+
+## Cooperative prologue factor caching
+
+The retained change caches loop-invariant per-row prologue factors in private
+scalars for the normal-layout, tile-16, uncompensated, F32-weight vector staging
+path. Each of its 64 logical lanes owns four adjacent columns in each of two
+16-row bands. `v4_row = lid.x >> 2` stays in 0..15 throughout the K loop, so the
+lane's factor indices stay `v4_row` and `16 + v4_row`. The existing cache writes
+initialize all 32 entries, including zero padding, and the original workgroup
+barrier precedes the new private loads. There are no subsequent cache writes
+within the handler. This also bounds the extra reads for padded rows or K=0.
+
+Factor multiplication order, per-K-column global loads, conversion points,
+staging, geometry and selected arithmetic remain unchanged. Packed inactive
+groups retain the sentinel guards on both new shared loads. The change adds no
+global read or cross-operation immutability assumption. Queue operations,
+fences, scratch capacity, dependency pins and both compiler forks are unchanged.
+
+The source audit finds exactly two changed modules: the ordinary forward
+prologue and its whole-graph shader. The other **forty model and nineteen CI
+sources are byte-identical**, including every training source. Removing the two
+private declarations and reversing their uses exactly recovers the ordinary
+control source. Only `graph_handler_10_entry` changes in the graph; everything
+outside that function is byte-identical. The audit verifies cache writes,
+original barrier, private-load ordering and inactive guards explicitly.
+
+Forward registers rise **84→86**, code shrinks **102,400→99,584 bytes**, shared
+memory stays **18,928 bytes**, and participating workers stay **168**. Training
+keeps 84 registers, 29,344 shared bytes, 238,720 code bytes and 168 participating
+workers. All 256 requested workers remain enabled. Logical work remains
+**22,042 forward / 83,312 training tiles**. CI resources and selected
+implementations are unchanged.
+
+The **1,000 completed-step comparisons** comprise 500 original-protocol and
+500 matched `--prewarm-ms 100` comparisons, with control/candidate/candidate/control
+visits, 25 interleaved pairs per case/visit, at least ten warmups and one warmup
+second. Every state budget, matching-selection, logical-work, single-dispatch
+and no-fallback check passes. Maximum model error remains 4.66e-9.
+
+| Persistent completed step, ms | Control | Candidate | Candidate/control, bootstrap 95% interval |
+|---|---:|---:|---:|
+| Original forward | 4.991556 | 4.703744 | 0.9423 [0.9377, 0.9534] |
+| Prewarmed forward | 4.993896 | 4.662704 | 0.9337 [0.8765, 0.9980] |
+| Original training + SGD | 15.328789 | 15.274573 | 0.9965 [0.9766, 1.0198] |
+| Prewarmed training + SGD | 13.710784 | 13.442557 | 0.9804 [0.9770, 1.0168] |
+
+Ordinary forward improves 2.48% under the original protocol, with ratio
+0.9752 [0.9296, 0.9983]. Its prewarmed ratio, 0.9926 [0.9346, 1.0776], is
+inconclusive. Forward's normalized persistent/ordinary ratio is inconclusive
+under the original protocol, 0.9799 [0.9354, 1.0231], but improves with prewarming,
+0.9486 [0.9245, 0.9756]. Paired persistent/ordinary medians become
+**1.310/1.069 forward/training original**, and **1.282/1.165 prewarmed**. These
+use medians of paired ratios, not ratios of aggregate medians.
+
+Negative controls remain in the record: original CI inference shifts −7.27%
+persistent and −8.91% ordinary, with an inconclusive normalized interval, despite
+identical shaders/resources. Prewarmed ordinary training shifts −0.28% with its
+pooled interval below one, also on identical shader bytes. All other raw CI
+persistent intervals and both training normalized intervals include no change.
+No new CI or training gain is attributed to this patch. All samples and visits
+remain archived; pooled bootstrap intervals omit some between-visit variation.
+The forward gain has not been directly remeasured against the pre-epoch control.
+
+Four fresh forward SDK backend captures, sixteen metric groups, confirm:
+
+| SDK forward replay, ms | Control | Candidate | Change |
+|---|---:|---:|---:|
+| Ordinary | 3.350070 | 3.274660 | −2.25% |
+| Persistent | 4.536408 | 4.223386 | −6.90% |
+
+Persistent estimated warp instructions fall **14.63%**, integer-pipe work
+**10.54%**, shared wavefronts **4.49%**, FP32 work 0.47% and global-load sectors
+0.54%. Local load/store traffic remains zero. Barrier waiting rises
+**53.25→55.33% of active warp cycles** while active compute warps stay near
+32.3% of peak. These are rate-times-duration estimates and active-warp waiting
+shares, not elapsed-time attribution. The results support reduced repeated
+factor reads and integer work as contributors, alongside changed code composition
+and register lifetime; they do not isolate a single instruction-level cause.
+
+Ordinary estimated warp/integer work falls 2.96%/3.26%, and shared wavefronts
+fall 9.39%. Ordinary local load/store sectors rise from about 55,320 to 120,937 /
+120,946, without shader or native-instruction attribution. No training SDK
+capture is claimed for this change. Maximum within-capture clock/instruction-rate
+spreads are **0.323%/0.627%**; no capture fails or needs a repeat. All four actual
+exported states are bitwise identical, **147,034,513 floats / 588,138,052 bytes**
+each, SHA-256 `4e5d66e6ce5e95142b848651d316b4df64855a9d85669499cabc3a81089be629`.
+
+Qualification passes **676 library tests (eight ignored), 168 strict whole-graph
+oracle cases, 51 matrix regressions, fourteen whole-graph GPU smoke tests and
+52 codegen checks**, plus strict all-target/all-feature Clippy, formatting,
+release builds and Metal-target compilation. The expanded packed-matrix fixture
+covers padded rows and a single K stage, alongside its existing ragged K/N tails,
+inactive final packs, poisoned storage, changed inputs/parameters and
+1/3/64/4096 workers. The new ordinary regression asserts cooperative prologue
+selection at 17×719×4096 and 32×16×4096, then compares two input/weight updates
+against unfused cooperative and scalar GPU execution. Metal GPU execution and
+additional hardware remain unqualified.
+
+There are **75 diagnostic comparisons**, including a 25-comparison final-binary
+check. All 61 generated sources, complete pipeline-resource multisets, selections,
+execution and tensor allocations match the preflight candidate exactly. An initial
+source-verifier prefix error and two Clippy pattern-style failures are preserved
+and corrected; neither changes generated shader behavior. No GPU test or
+measurement fails or is rerun for those corrections.
+
+Evidence stays local in `target/coop-prologue-register-factors/`. The manifest
+`target/megakernel-results/coop-prologue-register-factors/summary.json` contains
+**616 independently verified artifact hashes and 49 completed bounded cgroups**,
+SHA-256 `9820d36d64ae8d925e199dc0b643b2425e73b972190f4f405535296005ffbc75`.
+Peak recorded job memory is **3,720,613,888 bytes**, with zero memory-limit events.
+Every heavy job uses verified 16/20/1 GiB memory-high/hard/swap limits; GPU jobs
+serialize, and builds/copies/heavy analysis stay outside measurements. All jobs
+finish. Use the archived `validated-*` binaries as the next qualified control.
 
 ## Scalar B register staging
 

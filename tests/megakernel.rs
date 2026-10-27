@@ -1702,6 +1702,8 @@ fn session_whole_graph_packed_matrix_tiles_preserve_scratch() {
         (53, 717, 4096),
         (53, 718, 4128),
         (33, 719, 2080),
+        (17, 719, 4096),
+        (32, 16, 4096),
     ] {
         let mut graph = meganeura::Graph::new();
         let input = graph.input("x", &[rows, inner]);

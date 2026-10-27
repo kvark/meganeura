@@ -717,14 +717,26 @@ the descriptor-reference repair requires fresh measurements.
   build failure, 693 verified artifact hashes and 29 completed cgroup records.
   Revert both probes and restore the exact qualified binaries and smoke checks.
   See the [scalar B staging evidence](megakernel_whole_graph.md#scalar-b-register-staging).
-  Next, audit loop-invariant shared prologue-factor reads in the cooperative
-  forward matrix, preserving cache initialization, factor order and inactive
-  guards while measuring added register lifetime. Retain all acceptance cases.
+  Cache each lane's two per-row prologue factors across the cooperative K loop,
+  preserving the original shared-cache initialization/barrier, factor order and
+  inactive guards. Exactly one ordinary module and one forward graph handler
+  change; all training and CI shaders remain identical. Another 1,000 completed-step
+  comparisons improve persistent forward 5.8% original / 6.6% prewarmed, with
+  a 5.1% improvement in the prewarmed normalized ratio. Fresh forward SDK replay
+  improves 6.9% persistent / 2.3% ordinary, with 14.6% fewer estimated warp
+  instructions and zero persistent local traffic. Retain the full qualification,
+  four exact-state SDK captures, 616 verified artifact hashes and 49 completed
+  cgroups. See the [prologue-factor qualification](megakernel_whole_graph.md#cooperative-prologue-factor-caching).
+  Next, audit per-K-column factor reuse across the two A staging row bands.
+  Cache within the current K stage, preserving factor order and the original
+  row/K/activity read bounds; do not introduce extra element-zero alias reads.
+  Measure the four extra live scalars before any retention decision.
   Keep the five-case primary gate and
   add matched `--prewarm-ms 100` controls. Preserve all samples, state checks,
   requested workers and acceptance budgets; changed cache/power state is not a
   runtime optimization.
-  Use the qualified fused-matrix selection as the next control and retain all completed-step gates;
+  Use the qualified prologue-factor caching and its archived `validated-*`
+  binaries as the next control, and retain all completed-step gates;
   instruction or traffic savings alone are insufficient retention evidence.
   Preserve initialization, writer ownership, publication, independent B storage
   and every logical tile's arithmetic and completion accounting.

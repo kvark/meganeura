@@ -2706,7 +2706,8 @@ fn gen_matmul_coop_stored(
     let coop_ba = format!("coop_mat{tile_n}x{tile_k}<{ab_type},B>");
     let coop_c = format!("coop_mat{tile_n}x{tile_m}<f32,C>");
 
-    let (prologue_decl, prologue_cache_decl, prologue_cache_init, a_transform) = match prologue {
+    let (prologue_decl, prologue_cache_decl, mut prologue_cache_init, a_transform) = match prologue
+    {
         Some(p) => matmul_prologue_to_wgsl(p, output_tile),
         None => (String::new(), String::new(), String::new(), String::new()),
     };
@@ -2973,14 +2974,29 @@ fn gen_matmul_coop_stored(
             typed.map_or(crate::DType::F32, |(types, _)| types.a),
         )
     };
-    let (a_stage_0, a_stage_1) = if prologue.is_some()
-        && variant == MatMulCoopVariant::Normal
-        && tile == 16
-        && !compensated
-        && b_format == WeightFormat::F32
-    {
-        let gen_prologue_a = |shared: &str, row_offset: &str| {
-            let store = store_a(shared, "flat", &format!("a_val{a_transform}"));
+    let vector_prologue = prologue.filter(|_| {
+        variant == MatMulCoopVariant::Normal
+            && tile == 16
+            && !compensated
+            && b_format == WeightFormat::F32
+    });
+    let (a_stage_0, a_stage_1) = if let Some(prologue) = vector_prologue {
+        let mut gen_prologue_a = |shared: &str, row_offset: &str, relative_row: &str| {
+            let mut transform = a_transform.clone();
+            for (i, factor) in prologue.factors.iter().enumerate() {
+                if factor.1 == crate::compile::PrologueLoadKind::PerRow {
+                    let value = format!("prologue_row_{i}_{shared}");
+                    // The cache initializer and its barrier precede this load.
+                    // All 32 entries, including padded rows, are initialized;
+                    // these two lane-owned rows stay fixed through the K loop.
+                    prologue_cache_init.push_str(&format!(
+                        "\nlet {value} = prologue_cache_{i}[{relative_row} + v4_row];"
+                    ));
+                    transform =
+                        transform.replace(&format!("prologue_cache_{i}[gr - tile_row]"), &value);
+                }
+            }
+            let store = store_a(shared, "flat", &format!("a_val{transform}"));
             let zero = store_a(shared, "flat", "0.0");
             let mut vector_stores = String::new();
             for (offset, component) in ["x", "y", "z", "w"].iter().enumerate() {
@@ -3010,8 +3026,8 @@ fn gen_matmul_coop_stored(
             )
         };
         (
-            gen_prologue_a("shared_b0", "tile_row"),
-            gen_prologue_a("shared_b1", "tile_row + 16u"),
+            gen_prologue_a("shared_b0", "tile_row", "0u"),
+            gen_prologue_a("shared_b1", "tile_row + 16u", "16u"),
         )
     } else if vec4_a {
         // Normal/BT: A[M,K], load vec4 along K (consecutive in memory).
