@@ -684,13 +684,20 @@ the descriptor-reference repair requires fresh measurements.
   and 1.9% with prewarming; SDK replay improves 3.6%. All other measured shaders
   remain unchanged, and both forks keep their existing interfaces. See the
   [narrow transposed-B qualification](megakernel_whole_graph.md#narrow-transposed-b-tile-selection).
-  Next, test finer tiles for the remaining 46-tile `50x720x4096` backward stages
+  The follow-up reuses 32×16 tiles for sixteen `50x720x4096` backward stages,
+  increasing each from 46 to 90 tiles. Another 1,000 completed-step comparisons
+  improve persistent training 3.6% original / 1.9% prewarmed; SDK replay improves
+  2.7%. Retain the ordinary-execution tradeoff explicitly: prewarmed training
+  regresses 0.6%, and SDK ordinary replay regresses 0.4%. Both backends still
+  select the same implementations. See the
+  [column-refinement qualification](megakernel_whole_graph.md#narrow-transposed-b-columns).
+  Next, investigate the remaining fused transposed-B and forward matrix stages,
   and recover the forward regression while preserving all five acceptance cases.
   Keep the five-case primary gate and
   add matched `--prewarm-ms 100` controls. Preserve all samples, state checks,
   requested workers and acceptance budgets; changed cache/power state is not a
   runtime optimization.
-  Use the qualified narrow transposed-B policy as the next control and retain all completed-step gates;
+  Use the qualified 32×16 transposed-B refinement as the next control and retain all completed-step gates;
   instruction or traffic savings alone are insufficient retention evidence.
   Preserve initialization, writer ownership, publication, independent B storage
   and every logical tile's arithmetic and completion accounting.

@@ -324,13 +324,13 @@ pub(crate) fn tiled_workgroups(problem: &Problem, tile: u32) -> [u32; 3] {
     [problem.n.div_ceil(tile), problem.m.div_ceil(tile), 1]
 }
 
-/// More independent tiles for narrow fused products with long dot products.
+/// More independent tiles for narrow fused or transposed-B products with long dot products.
 /// Apply only to the remaining SmallTile choices after split-K selection.
 pub(crate) fn narrow_scalar_shape(
     problem: &Problem,
     knobs: crate::compile::TuningKnobs,
 ) -> Option<crate::codegen::ScalarMatmulShape> {
-    if problem.layout != Layout::PlainAdd
+    if !matches!(problem.layout, Layout::PlainAdd | Layout::TransposedB)
         || problem.reduced_storage
         || problem.pinned
         || problem.m > 64
@@ -448,6 +448,32 @@ mod tests {
             assert_eq!(select(&p, &bare), Path::Compiled);
         }
         assert_eq!(select(&narrow, &target(&F32)), Path::Cooperative);
+    }
+
+    #[test]
+    fn narrow_transposed_columns_preserve_shape_and_storage_boundaries() {
+        let knobs = crate::compile::TuningKnobs::default();
+        let narrow = Problem::plain(Layout::TransposedB, [64, 1024, 1024], false);
+        assert_eq!(narrow_scalar_shape(&narrow, knobs).unwrap().cols(), 16);
+        for p in [
+            Problem { m: 65, ..narrow },
+            Problem { n: 1025, ..narrow },
+            Problem { k: 1023, ..narrow },
+            Problem {
+                pinned: true,
+                ..narrow
+            },
+            Problem {
+                reduced_storage: true,
+                ..narrow
+            },
+            Problem {
+                layout: Layout::TransposedBAdd,
+                ..narrow
+            },
+        ] {
+            assert_eq!(narrow_scalar_shape(&p, knobs), None, "{p:?}");
+        }
     }
 
     #[test]

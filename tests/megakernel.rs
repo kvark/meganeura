@@ -8,9 +8,17 @@ fn session_whole_graph_narrow_scalar_tiles() {
 
 #[test]
 fn session_whole_graph_narrow_transposed_tiles() {
+    check_transposed_tile_edges(35, 1025, 263, false);
+}
+
+#[test]
+fn session_whole_graph_narrow_transposed_columns() {
+    check_transposed_tile_edges(35, 65, 1031, true);
+}
+
+fn check_transposed_tile_edges(m: usize, n: usize, k: usize, narrow_columns: bool) {
     let gpu = crate::support::gpu::gpu();
     let supports_graph = gpu.capabilities().device_memory_fence && gpu.capabilities().binding_array;
-    let (m, n, k) = (35, 1025, 263);
     let mut graph = meganeura::Graph::new();
     let a = graph.input("a", &[m, k]);
     let b = graph.input("b", &[n, k]);
@@ -52,8 +60,16 @@ fn session_whole_graph_narrow_transposed_tiles() {
         });
         let mut session = meganeura::build(&graph, config).0;
         let dispatch = &session.plan().dispatches[0];
-        assert_eq!(dispatch.kernel, meganeura::compile::Kernel::SmallTile);
-        assert_eq!(dispatch.workgroups, [33, 2, 1]);
+        if narrow_columns {
+            let meganeura::compile::Kernel::ScalarMatmul(shape) = dispatch.kernel else {
+                panic!("transposed product did not select rectangular tiles");
+            };
+            assert_eq!((shape.rows(), shape.cols(), shape.k_stage), (32, 16, 32));
+            assert_eq!(dispatch.workgroups, [5, 2, 1]);
+        } else {
+            assert_eq!(dispatch.kernel, meganeura::compile::Kernel::SmallTile);
+            assert_eq!(dispatch.workgroups, [33, 2, 1]);
+        }
         for (av, bv, expected) in &references {
             session.set_input("a", av);
             session.set_input("b", bv);
