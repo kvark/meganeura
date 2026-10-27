@@ -2,8 +2,13 @@ use meganeura::megakernel::{Execution, Executor, Instruction, Job, Options};
 
 #[test]
 fn session_whole_graph_narrow_scalar_tiles() {
-    check_scalar_tile_edges(false);
-    check_scalar_tile_edges(true);
+    check_scalar_tile_edges(false, 1031);
+    check_scalar_tile_edges(true, 1031);
+}
+
+#[test]
+fn session_whole_graph_narrow_short_fused_tiles() {
+    check_scalar_tile_edges(false, 263);
 }
 
 #[test]
@@ -84,10 +89,10 @@ fn check_transposed_tile_edges(m: usize, n: usize, k: usize, narrow_columns: boo
     }
 }
 
-fn check_scalar_tile_edges(transposed_b: bool) {
+fn check_scalar_tile_edges(transposed_b: bool, k: usize) {
     let gpu = crate::support::gpu::gpu();
     let supports_graph = gpu.capabilities().device_memory_fence && gpu.capabilities().binding_array;
-    let (m, n, k) = (35, 65, 1031);
+    let (m, n) = (35, 65);
     let mut graph = meganeura::Graph::new();
     let a = graph.input("a", &[m, k]);
     let b = graph.input("b", &if transposed_b { [n, k] } else { [k, n] });
@@ -122,8 +127,8 @@ fn check_scalar_tile_edges(transposed_b: bool) {
         let mut session = meganeura::build(&graph, config).0;
         let dispatch = &session.plan().dispatches[0];
         let (rows, cols) = if transposed_b {
-            assert_eq!(dispatch.kernel, meganeura::compile::Kernel::Default);
-            (64, 64)
+            assert_eq!(dispatch.kernel, meganeura::compile::Kernel::SmallTile);
+            (32, 32)
         } else {
             let meganeura::compile::Kernel::ScalarMatmul(shape) = dispatch.kernel else {
                 panic!(

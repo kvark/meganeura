@@ -2056,7 +2056,8 @@ pub fn generate_module_small(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderMo
         ShaderGroup::MatMul
         | ShaderGroup::MatMulAdd
         | ShaderGroup::MatMulAT
-        | ShaderGroup::MatMulBT => generate_matmul_with_epilogue(
+        | ShaderGroup::MatMulBT
+        | ShaderGroup::MatMulBTAdd => generate_matmul_with_epilogue(
             group,
             None,
             MatMulOptions {

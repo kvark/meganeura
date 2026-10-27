@@ -691,13 +691,21 @@ the descriptor-reference repair requires fresh measurements.
   regresses 0.6%, and SDK ordinary replay regresses 0.4%. Both backends still
   select the same implementations. See the
   [column-refinement qualification](megakernel_whole_graph.md#narrow-transposed-b-columns).
-  Next, investigate the remaining fused transposed-B and forward matrix stages,
-  and recover the forward regression while preserving all five acceptance cases.
+  The next qualification adds 32×32 routing for fused transposed-B products on
+  fewer than sixteen original workgroups and extends fused-plain 32×16 geometry
+  to K≥256. It also makes `schedule_locked` authoritative during selection.
+  Another 1,000 paired comparisons improve original forward/training 4.8%/4.1%;
+  SDK replay improves 3.5%/4.4%. Ordinary training improves about 1.8%.
+  Prewarmed forward's larger 9.1% wall shift accompanies an 8.3% ordinary shift
+  and an inconclusive normalized interval; do not attribute all of it to the
+  selector. See the [fused-matrix qualification](megakernel_whole_graph.md#fused-matrix-tile-selection).
+  Next, audit exhausted-tile claims in the single-word small-graph scheduler
+  and the remaining forward payload costs while preserving all acceptance cases.
   Keep the five-case primary gate and
   add matched `--prewarm-ms 100` controls. Preserve all samples, state checks,
   requested workers and acceptance budgets; changed cache/power state is not a
   runtime optimization.
-  Use the qualified 32×16 transposed-B refinement as the next control and retain all completed-step gates;
+  Use the qualified fused-matrix selection as the next control and retain all completed-step gates;
   instruction or traffic savings alone are insufficient retention evidence.
   Preserve initialization, writer ownership, publication, independent B storage
   and every logical tile's arithmetic and completion accounting.

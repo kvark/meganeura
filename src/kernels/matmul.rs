@@ -63,7 +63,7 @@ impl Layout {
         )
     }
 
-    /// Transposed products with an addend have no 32-wide scalar kernel.
+    /// Products that transpose an input and read an addend.
     fn transposed_with_addend(self) -> bool {
         matches!(self, Self::TransposedAAdd | Self::TransposedBAdd)
     }
@@ -150,7 +150,8 @@ impl Problem {
                 .matmul_epilogue
                 .as_ref()
                 .is_some_and(|epilogue| !epilogue.inputs.is_empty()),
-            pinned: dispatch.scalar_matmul().is_some()
+            pinned: dispatch.schedule_locked
+                || dispatch.scalar_matmul().is_some()
                 || matches!(
                     dispatch.kernel,
                     Kernel::SplitMatmul { .. }
@@ -245,8 +246,8 @@ impl Family for Path {
                     Err("the kernel is fixed by a schedule or storage policy")
                 } else if problem.reduced_storage {
                     Err("packed weights keep their compiled kernel")
-                } else if problem.layout.transposed_with_addend() {
-                    Err("no 32-wide kernel for transposed products with an addend")
+                } else if problem.layout == Layout::TransposedAAdd {
+                    Err("no 32-wide kernel for transposed-A products with an addend")
                 } else if problem.compiled_workgroups >= SMALL_TILE_BELOW_WORKGROUPS
                     && !(problem.layout == Layout::TransposedB
                         && problem.m <= 64
@@ -335,7 +336,12 @@ pub(crate) fn narrow_scalar_shape(
         || problem.pinned
         || problem.m > 64
         || problem.n > 1024
-        || problem.k < 1024
+        || problem.k
+            < if problem.layout == Layout::PlainAdd {
+                256
+            } else {
+                1024
+            }
     {
         return None;
     }
@@ -444,6 +450,10 @@ mod tests {
                 layout: Layout::TransposedBAdd,
                 ..narrow
             },
+            Problem {
+                layout: Layout::TransposedAAdd,
+                ..narrow
+            },
         ] {
             assert_eq!(select(&p, &bare), Path::Compiled);
         }
@@ -451,28 +461,64 @@ mod tests {
     }
 
     #[test]
-    fn narrow_transposed_columns_preserve_shape_and_storage_boundaries() {
-        let knobs = crate::compile::TuningKnobs::default();
-        let narrow = Problem::plain(Layout::TransposedB, [64, 1024, 1024], false);
-        assert_eq!(narrow_scalar_shape(&narrow, knobs).unwrap().cols(), 16);
+    fn small_transposed_addends_preserve_grid_and_storage_constraints() {
+        let bare = Target {
+            cooperative: None,
+            allow_raw_f16: false,
+        };
+        let small = Problem::plain(Layout::TransposedBAdd, [50, 720, 32], false);
+        assert_eq!(select(&small, &bare), Path::SmallTile);
+        assert_eq!(select(&small, &target(&F32)), Path::Cooperative);
+        for (m, n, expected) in [
+            (64, 960, Path::SmallTile),
+            (64, 961, Path::Compiled),
+            (65, 480, Path::Compiled),
+        ] {
+            let p = Problem::plain(Layout::TransposedBAdd, [m, n, 320], false);
+            assert_eq!(select(&p, &bare), expected);
+        }
         for p in [
-            Problem { m: 65, ..narrow },
-            Problem { n: 1025, ..narrow },
-            Problem { k: 1023, ..narrow },
             Problem {
                 pinned: true,
-                ..narrow
+                ..small
             },
             Problem {
                 reduced_storage: true,
-                ..narrow
-            },
-            Problem {
-                layout: Layout::TransposedBAdd,
-                ..narrow
+                ..small
             },
         ] {
-            assert_eq!(narrow_scalar_shape(&p, knobs), None, "{p:?}");
+            assert_eq!(select(&p, &bare), Path::Compiled);
+        }
+    }
+
+    #[test]
+    fn narrow_columns_preserve_shape_and_storage_boundaries() {
+        let knobs = crate::compile::TuningKnobs::default();
+        for (layout, min_k) in [(Layout::PlainAdd, 256), (Layout::TransposedB, 1024)] {
+            let narrow = Problem::plain(layout, [64, 1024, min_k], false);
+            assert_eq!(narrow_scalar_shape(&narrow, knobs).unwrap().cols(), 16);
+            for p in [
+                Problem { m: 65, ..narrow },
+                Problem { n: 1025, ..narrow },
+                Problem {
+                    k: min_k - 1,
+                    ..narrow
+                },
+                Problem {
+                    pinned: true,
+                    ..narrow
+                },
+                Problem {
+                    reduced_storage: true,
+                    ..narrow
+                },
+                Problem {
+                    layout: Layout::TransposedBAdd,
+                    ..narrow
+                },
+            ] {
+                assert_eq!(narrow_scalar_shape(&p, knobs), None, "{p:?}");
+            }
         }
     }
 
@@ -577,7 +623,14 @@ mod tests {
             assert_eq!(select(&large, &allowed), Path::Compiled);
             // The shared occupancy floor still applies.
             let small = Problem::plain(layout, [32, 32, 32], false);
-            assert_eq!(select(&small, &target(&F32)), Path::Compiled);
+            assert_eq!(
+                select(&small, &target(&F32)),
+                if layout == Layout::TransposedBAdd {
+                    Path::SmallTile
+                } else {
+                    Path::Compiled
+                }
+            );
         }
     }
 

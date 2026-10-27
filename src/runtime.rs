@@ -5504,6 +5504,73 @@ mod variant_tests {
     }
 
     #[test]
+    fn fused_transposed_small_tiles_preserve_pins_and_split_reductions() {
+        for k in [1031, 8192] {
+            let mut graph = crate::Graph::new();
+            let a = graph.input("a", &[35, k]);
+            let b = graph.input("b", &[65, k]);
+            let d = graph.input("d", &[35, 65]);
+            let y = graph.matmul_bt(a, b);
+            graph.nodes_mut()[y as usize].op = crate::graph::Op::FusedMatMulBTAdd;
+            graph.nodes_mut()[y as usize].inputs.push(d);
+            graph.set_outputs(vec![y]);
+            let original = crate::compile::compile(&graph);
+            for kernel in [
+                crate::compile::Kernel::Default,
+                crate::compile::Kernel::SmallTile,
+            ] {
+                let mut locked = original.clone();
+                locked.dispatches[0].kernel = kernel;
+                locked.dispatches[0].workgroups =
+                    if locked.dispatches[0].kernel == crate::compile::Kernel::Default {
+                        [2, 1, 1]
+                    } else {
+                        [3, 2, 1]
+                    };
+                locked.dispatches[0].schedule_locked = true;
+                let before = locked.dispatches.clone();
+                let coop = crate::codegen::CoopConfig {
+                    tile_size: 8,
+                    use_f16_input: false,
+                    compensated: false,
+                };
+                select_variants(&mut locked, Some(&coop), false, false);
+                assert_eq!(locked.dispatches, before);
+            }
+            let mut control = original.clone();
+            control.split_long_scalar_products();
+            let mut plan = original;
+            plan.knobs.matmul_k_stage = 16;
+            plan.knobs.matmul_interleave_columns = true;
+            select_variants(&mut plan, None, false, false);
+            assert_eq!(plan.dispatches.len(), control.dispatches.len());
+            assert_eq!(plan.buffers, control.buffers);
+            if k == 8192 {
+                let crate::compile::Kernel::SplitMatmul { shape, splits } =
+                    plan.dispatches[0].kernel
+                else {
+                    panic!("fused transposed product lost its split reduction");
+                };
+                let crate::compile::Kernel::SplitMatmul {
+                    splits: old_splits, ..
+                } = control.dispatches[0].kernel
+                else {
+                    panic!("expected original split reduction");
+                };
+                assert_eq!(splits, old_splits);
+                assert_eq!((shape.rows(), shape.cols(), shape.k_stage), (32, 32, 16));
+                assert_eq!(plan.dispatches[1].shader, ShaderEntry::SumRows);
+                assert_eq!(plan.dispatches[1].params, control.dispatches[1].params);
+            } else {
+                assert_eq!(plan.dispatches[0].kernel, crate::compile::Kernel::SmallTile);
+                assert_eq!(plan.dispatches[0].workgroups, [3, 2, 1]);
+                assert_eq!(plan.knobs.matmul_k_stage, 16);
+                assert!(plan.knobs.matmul_interleave_columns);
+            }
+        }
+    }
+
+    #[test]
     fn narrow_transposed_selection_preserves_long_reduction_partitions() {
         for k in [720, 8192] {
             let mut graph = crate::Graph::new();

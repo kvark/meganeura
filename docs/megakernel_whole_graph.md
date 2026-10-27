@@ -13,19 +13,22 @@ including read-only views that may alias writable bindings. It retains the
 preceding scratch-read repair and packing optimizations. Passing numerical
 tests alone did not reveal these extra inactive accesses.
 
-The latest [narrow transposed-B column selection](#narrow-transposed-b-columns)
-extends the existing 32×16 scalar geometry to long backward products. Across
-1,000 completed-step comparisons against the preceding 32×32 policy, persistent
-training improves 3.6% with the original protocol and 1.9% with matched prewarming.
-Ordinary prewarmed training regresses 0.6%; this is a retained tradeoff.
-Forward and CI shaders are unchanged. Current paired persistent/ordinary medians
-are 1.424× forward and 1.095× training, or 1.389×/1.194× with prewarming.
-All requested workers remain enabled. Baseline parity remains unmet.
+The latest [fused-matrix tile selection](#fused-matrix-tile-selection) adds
+small-tile routing for fused transposed-B products and extends the existing
+32×16 fused-plain refinement to K≥256. Against qualified `da86b45`, 1,000
+completed-step comparisons improve persistent forward/training by **4.8%/4.1%**
+under the original protocol. Matched prewarming measures 9.1%/4.2%, although
+ordinary forward also shifts substantially. SDK replay confirms smaller
+forward/training gains of **3.5%/4.4%**. Ordinary training improves about 1.8%.
+Current paired persistent/ordinary medians are **1.321× forward / 1.080× training**,
+or **1.368× / 1.166×** with prewarming. All requested workers remain enabled.
+CI shaders are unchanged. Baseline parity remains unmet.
 
 The preceding [completion-epoch policy](#completion-gated-idle-scans) waits on
 one counter between empty scans of a multiword bitmap. Its separate comparison
 improves training 7.0%/5.5%, with a 1.05% original-protocol forward regression.
-The new matrix selection does not resolve that forward tradeoff.
+The latest forward gain has not been remeasured directly against that pre-epoch
+control.
 
 The earlier storage repair's 500 primary comparisons measure a 5.58% absolute training regression
 from the storage repair. Paired persistent/ordinary medians are 1.355× forward
@@ -88,6 +91,147 @@ cannot overlap. Library tests also use the GPU and need this flag. Builds use
 the same launcher without the GPU flag; finish them before primary measurements.
 The launcher now records memory peaks, limit events and memory/CPU/I/O pressure
 after each job, preserving the target's exit status and forwarding termination.
+
+## Fused matrix tile selection
+
+Two changes reuse the existing scalar generator through the shared selector:
+
+- Fused transposed-B products can use the 32×32 small kernel when the original
+  64×64 grid has fewer than sixteen workgroups. The small-module dispatcher now
+  routes this addend form to the generator instead of its large-tile fallback.
+  The broader narrow-transposed policy remains restricted to products without
+  an addend. Transposed-A addends keep their original treatment.
+- Remaining fused-plain SmallTile products with M≤64, N≤1024 and K≥256 can use
+  32×16 geometry, extending the previous K≥1024 policy. Transposed-B products
+  without an addend retain their K≥1024 refinement. K stage, interleaving,
+  storage constraints and split-K precedence are preserved.
+
+The matrix problem now also treats `schedule_locked` as pinned. This prevents
+automatic selection from replacing an extracted default or small kernel.
+Cooperative preference for unlocked problems, epilogue handling, arithmetic,
+dependency pins, queue protocol, fences and inactive-access guards are unchanged.
+No shader template or compiler-fork change is required.
+
+Exactly sixteen `FusedMatMulAdd[50x720x960]` nodes per model phase change from
+46 to 90 logical tiles. Training also changes sixteen fused transposed-B nodes
+with K=32/320/960 from 12 to 46 tiles. Total forward/training work becomes
+**22,042 / 83,312** tiles, up from 21,338 / 82,064. Both backends select the same
+implementations, with unchanged nodes, tensor allocations, storage formats and
+queue bytes within each instrumentation mode. Each valid output keeps its K
+accumulation order. The complete step remains one dispatch and one submission,
+with all 256 workers enabled.
+
+The new selections remove duplicate or larger handlers. Forward registers fall
+**86→84**, training registers rise **82→84**, and code shrinks
+**112,384→102,400 / 256,512→238,720 bytes**. Shared memory stays
+18,928 / 29,344 bytes; both phases still record 168 participating workers.
+All nineteen CI sources/resources are identical. The model replaces both graph
+sources, replaces one ordinary module and removes another; 39 sources are
+identical. Geometry, staging, padding, register allocation and code composition
+change together; per-node simultaneous residency is not measured.
+
+The transposed-addend-only probe passes fifty diagnostic comparisons and changes
+training GPU time 13.666→13.224 ms. A separate combined preflight passes fifty
+more, measuring forward 4.571→4.424 ms and training 13.688→13.073 ms. These are
+short diagnostics, not primary performance qualifications. Before full
+qualification, the addend policy is restricted to its original small-grid floor
+and the schedule-lock repair is added. A twenty-five-comparison final bridge
+verifies identical measured shader sets, full resource multisets, selection,
+execution and tensor allocations. Final qualified binaries drive the gates below.
+
+**500 original-protocol and 500 prewarmed comparisons** use
+control/candidate/candidate/control visits, 25 interleaved pairs per case/visit,
+at least ten warmups and one warmup second. Every full-state budget, backend
+selection, task-count, one-dispatch and no-fallback check passes. Maximum error
+remains 4.66e-9. The supplemental 100 ms prewarming remains off by default.
+
+| Persistent completed step | Control, ms | Candidate, ms | Candidate/control, bootstrap 95% interval |
+|---|---:|---:|---:|
+| Original CI inference | 0.074216 | 0.069526 | 0.9368 [0.9285, 1.0252] |
+| Original CI backward | 0.093391 | 0.092736 | 0.9930 [0.9764, 1.0003] |
+| Original CI SGD | 0.095111 | 0.094881 | 0.9976 [0.9657, 1.0305] |
+| Original forward | 5.185632 | 4.935020 | 0.9517 [0.9381, 0.9650] |
+| Original training + SGD | 16.159464 | 15.500535 | 0.9592 [0.9411, 0.9780] |
+| Prewarmed CI inference | 0.066636 | 0.067780 | 1.0172 [0.9846, 1.0894] |
+| Prewarmed CI backward | 0.092525 | 0.093165 | 1.0069 [0.9922, 1.0171] |
+| Prewarmed CI SGD | 0.094610 | 0.095701 | 1.0115 [0.9971, 1.0271] |
+| Prewarmed forward | 5.156147 | 4.687214 | 0.9091 [0.9003, 0.9680] |
+| Prewarmed training + SGD | 14.333292 | 13.732029 | 0.9581 [0.9381, 0.9676] |
+
+Normalized training ratios improve **0.9747 [0.9540, 0.9958]** original and
+**0.9747 [0.9552, 0.9881]** prewarmed. Ordinary training also improves:
+14.581034→14.312707 ms (−1.84%) and 11.780522→11.565481 ms (−1.83%), with both
+ratio intervals below one. Original forward's normalized ratio improves
+**0.9307 [0.9153, 0.9766]**. Prewarmed forward's normalized ratio is
+**0.9907 [0.9648, 1.0136]**: its large persistent wall shift accompanies an
+ordinary median shift of **3.740338→3.428646 ms (−8.33%)**, whose interval includes
+one. Do not attribute the full 9.1% wall improvement to this policy.
+
+Normalized values are medians of paired ratios, not ratios of aggregate medians.
+Original CI inference's normalized ratio rises **2.74% [0.46%, 9.48%]**, while
+its raw persistent interval includes one and ordinary inference falls 8.52%.
+All CI shifts occur on identical shader/resource identities and are not
+attributed to the selector. All samples and visits remain archived; pooled
+bootstrap intervals omit some between-visit variation. The new forward gain
+does not directly remeasure the earlier pre-epoch control.
+
+Eight SDK backend captures collect thirty-two sequential metric groups, with
+no failed capture or repeat. Forward replay is graph-only; complete training
+replay uses zero-rate SGD, separately from primary nonzero-rate training.
+
+| SDK replay | Control, ms | Candidate, ms | Change |
+|---|---:|---:|---:|
+| Ordinary forward | 3.348321 | 3.342171 | −0.18% |
+| Persistent forward | 4.702349 | 4.536708 | −3.52% |
+| Ordinary training + SGD | 11.951973 | 11.728481 | −1.87% |
+| Persistent training + SGD | 13.968511 | 13.350892 | −4.42% |
+
+Each actual forward state has **147,034,513 floats**, and each training state
+has **246,883,105 floats**. Independent hashing verifies bitwise equality
+between control and candidate within each backend/phase. Forward also matches
+bitwise across backends; training passes the unchanged numerical budget.
+Maximum clock/instruction-rate group spreads are 0.024%/0.632%.
+
+Estimated persistent warp instructions rise **3.24% forward / 0.80% training**,
+integer-pipe work **7.80% / 3.16%**, global-load sectors **1.97% / 1.50%**, and
+shared wavefronts **5.27% / 1.28%**. FP32 instruction work changes +0.11% / −0.29%.
+Persistent local loads/stores remain zero. Active compute warps remain near
+32.5% / 32.7% of peak. Barrier waiting falls **55.56→53.15% / 49.40→47.04% of
+active warp cycles**, not elapsed time. Ordinary local-load/store sectors fall
+from about 79,000 to 55,000 each in forward and rise from 618,000 to 693,000 in
+training; the counters do not identify individual shaders. Faster replay with
+more instruction/load work supports useful tile parallelism as a contributor,
+without isolating it from padding, staging or code composition.
+
+Qualification passes **676 library tests (eight ignored), 168 strict whole-graph
+oracle cases, 50 matrix regressions, fourteen whole-graph GPU smoke tests and
+all 52 codegen checks**, plus strict all-target/all-feature Clippy, formatting,
+release builds and Metal-target compilation. New checks cover selector boundaries,
+storage, locked default/small schedules and preserved long-K partial buffers and
+SumRows parameters. Ragged fused products at 35×65×263 and 35×65×1031 compare
+every output against signed dyadic CPU arithmetic with poisoned storage, changed
+inputs and ordinary/1/3/256 workers. Metal GPU execution remains unqualified.
+
+The archive preserves the initial setup failure on ignored `Cargo.lock`, a new
+test's moved-value compilation error and an old selector expectation. Setup is
+recovered from verified originals; both tests are corrected before the passing
+full qualification. No GPU measurement fails or is rerun for these corrections.
+
+Local evidence is in `target/narrow-bt-addend/` and
+`target/narrow-fused-products/`. Manifest
+`target/megakernel-results/narrow-fused-products/summary.json` contains **975
+independently verified artifact hashes and 59 recorded bounded cgroups**, SHA-256
+`d56c5cf57f8506240d3b8d96446ec6433f53ef58c0c61e1657ca4d3bb6a0841e`.
+All recorded memory-limit events are zero; peak job memory is 4,709,384,192 bytes.
+SDK-export pressure totals remain in the logs. Every heavy job uses a separate
+verified 16/20/1 GiB memory-high/hard/swap cgroup on local `/x`. GPU runs serialize;
+builds, copies and heavy analysis stay outside measurements. Every job finishes,
+and both compiler forks and dependency pins remain unchanged.
+
+Next, audit exhausted-tile claims in the single-word small-graph scheduler and
+the remaining forward payload costs. Preserve all requested workers, publication
+fences and logical work. The unchanged CI path and the remaining model gaps
+still prevent baseline parity.
 
 ## Narrow transposed-B columns
 
@@ -194,9 +338,9 @@ with verified 16/20/1 GiB memory-high/hard/swap limits. GPU jobs serialize, and
 builds, copies and heavy analyses stay outside measurements. Both forks and
 dependency pins remain unchanged. Every launched job reaches a terminal state.
 
-Next, investigate the remaining fused transposed-B and forward matrix stages,
-preserving the shared selection, arithmetic contract and all five acceptance
-cases. Baseline parity and recovery of the forward regression remain open.
+The [fused-matrix follow-up above](#fused-matrix-tile-selection) investigates the
+remaining fused transposed-B and forward matrix stages while preserving the
+shared selection, arithmetic contract and all five acceptance cases.
 
 ## Narrow transposed-B tile selection
 
