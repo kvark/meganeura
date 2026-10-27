@@ -92,6 +92,89 @@ the same launcher without the GPU flag; finish them before primary measurements.
 The launcher now records memory peaks, limit events and memory/CPU/I/O pressure
 after each job, preserving the target's exit status and forwarding termination.
 
+## Scalar B register staging
+
+Two probes against runtime `cf8940f` change F32 scalar matrices with at most
+32 output rows per tile. Both are reverted. Selection, tile counts, K stages,
+split boundaries, zero padding, arithmetic order, epilogues and shared-memory
+layouts remain unchanged in both ordinary and persistent execution. Every
+original workgroup barrier, payload fence, inactive-storage guard and queue
+operation remains. These probes do not add the second shared stage used by the
+earlier double-buffer experiment.
+
+The lookahead probe holds one B stage in named per-lane scalars. It loads the
+first stage only for a nonempty split range, writes those values into the
+original shared cells, then fetches the next B stage before current arithmetic.
+The next fetch is guarded by `end_k - t > K_TILE`, preventing reads beyond the
+split range. The existing reuse barrier still precedes the next shared writes.
+The second probe loads only the current B stage before staging A, then writes
+B into shared memory before the original staging barrier. Its values need not
+survive arithmetic or the reuse barrier. Both also explicitly unroll B's
+per-lane load/store ownership; the comparison does not isolate scheduling from
+that code-generation change.
+
+Each passes **52 codegen checks, fourteen whole-graph GPU smoke tests and fifty
+diagnostic comparisons**. The five cases use five pairs per mode, ten warmups
+and at least one warmup second, 100 ms prewarming, and worker/resource
+instrumentation. Every state budget, matching implementation, task-total,
+single-dispatch and no-fallback check passes; maximum error remains 4.66e-9.
+The lookahead's initial build fails for a missing `std::fmt::Write` import; its
+source, log and exit are preserved. The import is fixed before all passing
+tests and measurements.
+
+| Diagnostic GPU time, ms | Ordinary, control → probe | Persistent, control → probe |
+|---|---:|---:|
+| Lookahead forward | 2.986848 → 3.177792 | 4.411840 → 4.846368 |
+| Lookahead training + SGD | 10.731808 → 11.144480 | 13.062048 → 13.634016 |
+| B-first forward | 2.986208 → 2.974720 | 4.410208 → 4.751904 |
+| B-first training + SGD | 10.739104 → 10.427424 | 13.043680 → 13.392704 |
+
+Lookahead increases forward/training registers from 84/84 to **92/86** and code
+from 102,400/238,720 to **105,856/247,168 bytes**. B-first uses **86/82 registers**
+and **102,272/238,336 code bytes**. Both keep 18,928/29,344 shared bytes,
+168 participating workers, all 256 requested workers and 22,042/83,312 logical
+tiles. CI registers remain 48 and shared bytes remain 9,616/9,648. In each probe,
+three ordinary CI modules and seven ordinary model modules change, along with
+their three/two graph modules. Thirteen CI and thirty-three model sources are
+byte-identical; every changed candidate module contains the new staging locals.
+
+The persistent slowdown survives a separate **B-first forward SDK comparison**:
+ordinary replay changes **3.333440→3.317160 ms (−0.49%)**, while persistent replay
+changes **4.528698→4.883405 ms (+7.83%)**. Four backend captures and sixteen groups
+pass without repeats. Actual exported state is bitwise identical across both
+backends and both binaries: **147,034,513 floats / 588,138,052 bytes** each,
+SHA-256 `4e5d66e6ce5e95142b848651d316b4df64855a9d85669499cabc3a81089be629`.
+Clock rates across all groups range from 2.832 to 2.843 GHz; maximum within-capture
+clock/instruction-rate spreads are 0.371%/0.926%.
+
+Persistent estimated warp instructions change −0.42%, integer-pipe instructions
+−0.07%, FP32 work −0.07%, global-load sectors −0.11% and shared wavefronts −0.07%.
+Local loads/stores remain zero. Barrier waiting changes **53.52→51.27% of active
+warp cycles**; this is not an elapsed-time fraction or evidence of a latency
+saving. Active compute warps remain about 32.5% of peak. Thus the slower replay
+has nearly unchanged estimated work and worker participation. It supports a
+latency/issue-scheduling investigation, without identifying a particular
+instruction-level cause. Ordinary estimated integer work rises 22.4% and local
+load/store sectors rise from about 55,312 to 127,545 per replay; these counters
+do not attribute that traffic to a particular shader. Counter-rate products
+remain estimates. No lookahead or training SDK capture is claimed.
+
+Both probes are rejected without a normal completed-step retention gate or
+full library/oracle/matrix qualification. Original sources, dependency hashes
+and clean compiler forks are restored. Rebuilt release benchmark binaries
+match the qualified controls exactly, and fourteen restored smoke tests pass.
+Artifacts are under `target/scalar-b-{register-prefetch,first-staging}/`.
+The manifest `target/megakernel-results/scalar-b-prefetch/summary.json` contains
+**693 independently verified artifact hashes and 29 completed cgroup records**,
+SHA-256 `f92e340d7a729027fb85ccfb1542260e35ca00c5d66a48ead7f5650a73b70fc6`.
+Peak recorded memory is **3,717,189,632 bytes**, with zero memory-limit events.
+Heavy jobs use separate verified 16/20/1 GiB cgroups and local NVMe; GPU jobs
+are serialized and builds/copies/analysis do not overlap measurements.
+Next, audit loop-invariant shared prologue-factor reads in the cooperative
+forward matrix, preserving cache initialization, factor order and inactive
+guards while measuring any additional register lifetime. Baseline parity
+remains unmet.
+
 ## Single-word claim controls
 
 Three scheduler probes against qualified `cf8940f` target graphs with at most

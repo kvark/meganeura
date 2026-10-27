@@ -708,7 +708,18 @@ the descriptor-reference repair requires fresh measurements.
   restored binaries match the qualified control and fourteen smoke tests pass.
   Preserve 932 verified artifact hashes and 44 completed cgroup records. See the
   [single-word claim controls](megakernel_whole_graph.md#single-word-claim-controls).
-  Next, investigate the remaining forward payload costs while preserving all acceptance cases.
+  Test scalar B register lookahead and current-stage B-first staging without
+  increasing scratch or removing barriers. Each passes 52 codegen checks,
+  fourteen smoke tests and fifty diagnostic comparisons, but persistent model
+  timing regresses. B-first forward SDK replay is 7.8% slower with nearly
+  unchanged estimated instruction/load/shared work and zero local traffic.
+  Preserve four exact-state captures / sixteen groups, the initial corrected
+  build failure, 693 verified artifact hashes and 29 completed cgroup records.
+  Revert both probes and restore the exact qualified binaries and smoke checks.
+  See the [scalar B staging evidence](megakernel_whole_graph.md#scalar-b-register-staging).
+  Next, audit loop-invariant shared prologue-factor reads in the cooperative
+  forward matrix, preserving cache initialization, factor order and inactive
+  guards while measuring added register lifetime. Retain all acceptance cases.
   Keep the five-case primary gate and
   add matched `--prewarm-ms 100` controls. Preserve all samples, state checks,
   requested workers and acceptance budgets; changed cache/power state is not a
