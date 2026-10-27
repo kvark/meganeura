@@ -786,9 +786,22 @@ the descriptor-reference repair requires fresh measurements.
   artifact hashes and 34 completed cgroups. Revert both probes, restore exact
   qualified binaries and pass fourteen restored smoke tests. See the
   [attention ownership evidence](megakernel_whole_graph.md#cooperative-attention-ownership-and-row-softmax).
-  Next, audit subgroup-local sharing that could avoid added workgroup barriers
-  and scratch arrays. Establish explicit lane mapping and admission conditions;
-  preserve arithmetic order, inactive guards and required synchronization.
+  Audit subgroup-local sharing without additional workgroup barriers or scratch.
+  Check active source lanes and matching row IDs at runtime, gated by reported
+  compute shuffle/ballot support. Test one row producer and distributed keys;
+  both preserve the original max/sum/PV sequence. Each passes 53 codegen checks,
+  22 attention references in each mode, fourteen smoke tests and fifty full-state
+  diagnostics, but forward/training GPU time regresses 0.50%/0.39% and 0.85%/0.29%.
+  Preserve 6,624/6,630 symbolic ownership/order cases, exact source audits, 675
+  verified hashes and 30 completed cgroups. Revert both shaders, the temporary
+  Blade capability and dependency override; restore exact qualified binaries and
+  pass fourteen final smoke tests. See the
+  [subgroup-sharing evidence](megakernel_whole_graph.md#cooperative-attention-subgroup-sharing).
+  Next, audit repeated cooperative scratch initialization, starting with forward
+  attention. Prove complete writes and required synchronization before every
+  read across tails, masks and reuse before omitting any converter-generated
+  clear. Preserve inactive sentinels and guards; this is separate from the
+  rejected F32 scalar scratch-clear probe.
   Keep the short-K AT gap as an unresolved target without repeating rejected
   tile selectors or delaying optimizer eligibility.
   Do not sum overlapping spans or infer a memory bottleneck from traffic alone.

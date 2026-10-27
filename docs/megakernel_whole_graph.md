@@ -47,6 +47,12 @@ leaves model GPU diagnostics within 0.2% of control. Sharing row softmax results
 adds a barrier and shared storage; forward SDK replay regresses 0.57% despite
 slightly lower estimated instruction counts. Both are reverted.
 
+The subsequent [subgroup-sharing probes](#cooperative-attention-subgroup-sharing)
+avoid additional barriers and scratch. Sharing one producer's softmax or
+distributing keys across lanes also fails to improve GPU diagnostics, despite
+preserving the original reduction order. Both probes and their temporary Blade
+capability are reverted; the qualified runtime is unchanged.
+
 The preceding [fused-matrix tile selection](#fused-matrix-tile-selection) adds
 small-tile routing for fused transposed-B products and extends the existing
 32×16 fused-plain refinement to K≥256. Against qualified `da86b45`, 1,000
@@ -124,6 +130,87 @@ cannot overlap. Library tests also use the GPU and need this flag. Builds use
 the same launcher without the GPU flag; finish them before primary measurements.
 The launcher now records memory peaks, limit events and memory/CPU/I/O pressure
 after each job, preserving the target's exit status and forwarding termination.
+
+## Cooperative attention subgroup sharing
+
+Two independent follow-ups to the shared-memory softmax probe keep all original
+workgroup barriers, shared arrays and per-output arithmetic. Both select the
+same shader in ordinary and persistent execution, gated by a temporary Blade
+capability reporting compute-stage `SHUFFLE | BALLOT` support. Unsupported
+devices retain the original generator and template. Naga remains unchanged.
+
+Neither probe assumes that local invocation IDs match subgroup lane IDs.
+They use ballots to find active lanes and shuffles to check their row IDs before
+sharing. This respects the active-source requirement for
+[WGSL subgroup shuffles](https://www.w3.org/TR/WGSL/).
+
+The **producer-sharing probe** proposes the first lane in each native four-lane
+cluster. It falls back to the caller's own lane if that source is inactive or
+owns another query row. Every selected source computes its own maximum and
+probability. All lanes retain the original correction, serial sum and PV order.
+A symbolic audit checks 6,624 active-lane/row assignments, including exhaustive
+four-lane cases and larger groups with holes and arbitrary row assignments.
+
+The **distributed-key probe** requires all active lanes in a subgroup to belong
+to complete, equal-row four-lane clusters. Otherwise it uses scalar computation.
+Each fast-path lane loads/scales four keys and computes four probabilities.
+Shuffles gather keys **0 through 15 in the original order** for the maximum,
+serial sum and PV accumulation; even the maximum sequence is not reassociated.
+A second ballot makes the fast-path condition subgroup-uniform. A symbolic
+audit checks 6,630 assignments and the exact gathered key sequence. Speculative
+masked score reads remain within initialized scratch and retain inactive guards.
+
+Each probe passes **53 codegen checks, 22 attention reference tests in each
+execution mode, fourteen whole-graph smoke tests and fifty full-state diagnostic
+comparisons**. The added codegen test validates subgroup control flow and exact
+shared-storage accounting for both operand precisions and head widths 16–512.
+The five-pair visits use matched 100 ms prewarming and the existing minimum
+warmup count/time. Selection, numerical budgets, completion, one dispatch and
+absence of fallback all pass; maximum error remains 4.66e-9.
+
+| Probe | Phase | Persistent GPU interval, control / candidate | Change | Ordinary GPU change |
+|---|---|---:|---:|---:|
+| Producer sharing | Forward | 4.097664 / 4.118048 ms | +0.50% | +1.06% |
+| Producer sharing | Training + SGD | 13.042080 / 13.093248 ms | +0.39% | +0.36% |
+| Distributed keys | Forward | 4.095328 / 4.129984 ms | +0.85% | +1.10% |
+| Distributed keys | Training + SGD | 13.070464 / 13.107744 ms | +0.29% | +0.20% |
+
+Both retain **18,928/29,344 shared bytes**, 168 participating model workers and
+all 256 requested workers. Graph work remains 22,042/83,312 tiles. Producer
+sharing retains 86/84 forward/training registers and adds 384 code bytes to each
+graph. Distributed keys uses 85/84 registers and code sizes 101,120/243,968 bytes,
+versus 99,584/238,720 control. Neither establishes a gain. Removing additional
+workgroup synchronization alone does not rescue these sharing schemes; the
+measurements do not identify one hardware cost as the cause.
+
+All nineteen CI and thirty-nine model sources remain byte-identical. Exact
+ordinary-source inverses isolate the changed row/probability blocks and lane
+argument. Each graph has one changed attention handler; all source outside it
+matches after removing the added lane argument at its call site. Barrier counts,
+scratch declarations, score calculation, tails, dependencies and fences remain.
+No normal retention gate, full library/oracle/matrix qualification or fresh SDK
+capture is claimed for either rejected probe.
+
+Both shader probes, their codegen test, the temporary Blade capability and local
+dependency override are removed. All original source/dependency hashes and both
+qualified benchmark hashes match exactly, and fourteen restored smoke tests
+pass. Both compiler forks are clean. No test, capture or audit fails or is rerun.
+
+Local evidence is in `target/coop-attention-subgroup-softmax/` and
+`target/coop-attention-distributed-softmax/`. The independently verified manifest
+`target/megakernel-results/coop-attention-subgroup-sharing/summary.json` records
+**675 artifact hashes and 30 completed bounded cgroups**, SHA-256
+`81dd95e9110af58d4e152de8199305a70d89ab397976bbc6249c4b3220e8178c`.
+Peak recorded job memory is **3,718,881,280 bytes**, with zero memory-limit events.
+All heavy jobs use separate verified `ml.slice` scopes, GPU jobs are serialized,
+and artifacts stay on local `/x`. All launched jobs finish. Runtime remains
+`3f95fa4`; baseline parity remains unmet.
+
+Next, audit repeated cooperative scratch initialization, starting with forward
+attention. Before omitting any converter-generated clear, prove that every
+read is dominated by a complete write and the necessary barrier for every tail,
+mask and reuse path. Preserve inactive sentinels and their guards. This is
+separate from the rejected F32 scalar scratch-clear probe.
 
 ## Cooperative attention ownership and row softmax
 
@@ -216,11 +303,10 @@ and builds/copies/heavy analysis stay outside measurements. Artifacts remain on
 local `/x`, and all launched jobs finish. Runtime remains `3f95fa4`; baseline
 parity remains unmet.
 
-Next, audit whether subgroup-local sharing can avoid the extra workgroup barrier
-and scratch arrays. Any such probe must explicitly establish its lane mapping
-and admission conditions, preserve per-output arithmetic and inactive guards,
-and pass the same completed-step gates. The current shared-memory variant is
-rejected; fewer active-lane operations do not establish a speedup.
+The subsequent [subgroup-sharing probes](#cooperative-attention-subgroup-sharing)
+avoid the extra workgroup barrier and scratch arrays, with explicit ownership
+checks and unchanged arithmetic order. They also establish no gain. Fewer
+active-lane operations do not establish a speedup.
 
 ## Optimizer overlap controls
 
