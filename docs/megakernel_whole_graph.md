@@ -45,6 +45,12 @@ The warmed diagnostic still shows a substantial persistent GPU-time gap.
 The [current clock study](#warmed-handler-clock-attribution) identifies expensive
 narrow matrix stages and overlapping SGD work. Its smaller probe preserves
 training's register count and worker participation. Neither probe is retained.
+The subsequent [capacity control](#worker-capacity-and-concurrency-control)
+reproduces a training improvement without clock instrumentation, while keeping
+the requested 256 workers and all handler arithmetic.
+A [single-broadcast claim prototype](#single-broadcast-claim-snapshot) then passes
+50 diagnostic comparisons without a material model improvement. It is reverted;
+the qualified runtime and both forks remain unchanged.
 
 For model benchmarks, use `--whole-graph --workers 256`. The
 [current worker sweep](#worker-counts-and-deeper-scalar-staging) finds lower CI
@@ -68,6 +74,134 @@ cannot overlap. Library tests also use the GPU and need this flag. Builds use
 the same launcher without the GPU flag; finish them before primary measurements.
 The launcher now records memory peaks, limit events and memory/CPU/I/O pressure
 after each job, preserving the target's exit status and forwarding termination.
+
+## Single-broadcast claim snapshot
+
+The earlier combined-broadcast experiment retained a separate ticket broadcast
+and parallel parameter loads. This follow-up instead makes lane zero load node
+metadata and all parameters before broadcasting one complete `GraphClaim`.
+The queue, payload fences, handler arithmetic, inactive access guards and
+completion/publication protocol remain unchanged. Shared-header accounting
+includes the structure's 16-byte alignment; the five measured cases retain
+their existing shared-memory sizes.
+
+Five prewarmed diagnostic pairs per case in each control/candidate visit pass
+all state budgets, matching arithmetic selection, complete worker accounting,
+one-dispatch and no-fallback checks: **50 comparisons** in total. All five
+generated whole-graph shaders reverse byte-for-byte by undoing only this
+broadcast transformation. Ordinary and other shader sources/resources match.
+
+| Diagnostic GPU median, ms | Control | Single broadcast |
+|---|---:|---:|
+| CI inference | 0.030816 | 0.030432 |
+| CI forward/backward | 0.066208 | 0.065920 |
+| CI forward/backward/SGD | 0.072288 | 0.069824 |
+| SmolVLA forward | 4.534400 | 4.576864 |
+| SmolVLA forward/backward/SGD | 15.622144 | 15.578432 |
+
+Ordinary model GPU medians remain approximately 3.00/11.00 ms. Model registers
+remain 84/80, shared bytes 18,928/29,344, and participating workers 168/252.
+The requested pool remains 256 throughout. This short preflight shows no
+material model gain; it is not a full performance qualification, a confidence
+bound on small effects, or an SDK counter study. Archive the prototype without
+running the full acceptance gate.
+
+The initial packing check fails because the subgroup-geometry prelude still
+references the replaced ticket variable. A diagnostic rerun reproduces that
+failure. Updating both references restores all **52 codegen checks and ten
+whole-graph GPU smoke tests**, without changing the test expectation or Naga
+validation. Initial binaries are archived and never benchmarked. After removing
+the prototype, rebuilt benchmark binaries match the qualified controls exactly,
+and all ten restored GPU smoke tests pass. Runtime, dependencies and both forks
+remain unchanged.
+
+Records are under `target/claim-snapshot-control/`. Manifest
+`target/megakernel-results/claim-snapshot-control/summary.json` contains **319
+independently verified artifact hashes and 17 recorded bounded job scopes**,
+SHA-256 `18d52aea99213939bace7f97f351763bc4a225f28ffbff65a58cf10400120ebb`.
+It preserves both initial failures and the corrected results. Peak job memory
+is 3,718,123,520 bytes; all recorded memory-limit event counts are zero. All
+jobs complete, with artifacts on local storage.
+
+## Worker capacity and concurrency control
+
+The full clock probe changed both register allocation and worker participation.
+This control instead appends **12,288 unused bytes** to the final scratch bank
+when existing scratch exceeds 24 KiB, with matching admission accounting.
+The threshold and amount are diagnostic choices, not a portable runtime policy.
+The inactive-read sentinel, indices, initialization stores, selected geometry,
+handler bodies, queue operations and fences remain unchanged.
+
+Only the model training shader changes. Reversing its one array-capacity
+declaration reproduces the entire control source exactly. All 19 CI sources and
+42 other model sources match byte-for-byte, including forward and ordinary
+execution. Cached pipeline/resource multisets also match except for that
+training pipeline's identity and shared allocation. Training retains **80
+registers and 264,320 code bytes**, while shared memory grows from **29,344 to
+41,632 bytes** and participating workers change **252→168**. The dispatch still
+requests 256 workers, and workers still exit only after graph completion.
+
+The local CUDA driver reports 84 multiprocessors, 102,400 shared bytes and
+65,536 registers per multiprocessor. Three padded workgroups cannot fit within
+that shared-memory bound. These hardware limits and participation observations
+do not by themselves measure simultaneous Vulkan residency; the SDK activity
+measurements below support the concurrency change.
+
+Control/padded/padded/control visits pass **500 original-protocol and 500
+prewarmed completed-step comparisons**, with 25 pairs per case/visit, ten minimum
+warmups, at least one warmup second and all five cases. Prewarming is 100 ms
+per sample in the supplemental sequence; the primary gate remains unchanged.
+All state budgets, implementation selections, completion checks, one-dispatch
+and no-fallback checks pass. Maximum model error is 4.66e-9.
+
+| Training measurement | Control, ms | Padded, ms | Padded/control, bootstrap 95% interval |
+|---|---:|---:|---:|
+| Original completed-step protocol | 17.773244 | 16.734058 | 0.9415 [0.9298, 0.9580] |
+| Matched 100 ms prewarming | 16.038833 | 14.834796 | 0.9249 [0.9183, 0.9344] |
+
+Ordinary training medians change by about 0.2% in both sequences. Paired
+persistent/ordinary medians move 1.211→1.140 without prewarming and
+1.356→1.255 with it. The original normalized ratio's interval includes no
+change, while the prewarmed normalized interval is 0.9190–0.9339. Forward's
+unchanged shader establishes no timing change. Small CI differences occur
+despite identical source/resources; pooled sample intervals do not capture all
+between-visit variation. All raw samples and visit results remain archived.
+
+Four SDK backend captures collect 16 sequential single-pass metric groups and
+preserve bitwise-identical actual state files within each backend, including
+all 246,883,105 training state floats. Persistent zero-rate-SGD replay improves
+**15.963→14.746 ms (7.6%)**; ordinary replay stays 12.001→11.992 ms. Average
+active compute warps fall **49.19%→32.76% of peak**, while SM-active time stays
+about 98.3%. Estimated per-step warp instructions fall 11.2%, global-load
+sectors 3.8% and shared wavefronts 2.4%. Integer-pipe activity changes −0.27%
+and FP32 work +0.02%. Barrier waiting falls 63.88%→53.73% of active warp cycles.
+Maximum clock-group spread is 0.52%; instruction-rate spread stays below 0.92%.
+These rate-times-replay estimates and waiting shares are not elapsed-time
+attributions or proof of native instruction identity.
+
+The result supports excess concurrent workers as a contributor to the training
+gap at this footprint. Array capacity can also affect driver initialization,
+bounds handling and allocation/cache decisions. The control does not establish
+a universal worker-count or padding policy, and it does not close the remaining
+gap. Archive the hard-coded allocation probe; investigate a general scheduler
+change rather than applying this threshold to arbitrary graphs.
+
+The probe passes 52 codegen checks and ten whole-graph GPU smoke tests. Its
+source is restored exactly; rebuilt benchmark binaries match the retained
+controls, and all ten restored smoke tests pass. Neither fork nor any dependency
+pin changes. No full retained-change qualification is claimed. All heavy jobs
+use separate bounded cgroups and local storage; all memory-limit event counts
+are zero. SDK state export produces small pressure totals, preserved in the
+logs. Peak job memory is 4,722,343,936 bytes.
+
+Records are under `target/worker-capacity-control/`. The manifest
+`target/megakernel-results/worker-capacity-control/summary.json` preserves
+1,000 completed-step comparisons, ten diagnostics, four SDK backend captures,
+36 recorded job scopes and **441 independently verified artifact hashes**,
+SHA-256 `1b39e34fff15ca42638641be94297571d623817128742e2a00eed338af32f442`.
+Two initial archival checks misclassified a CPU-analysis log and then attempted
+verification before a manifest existed; corrected checks pass and both failed
+logs remain. No benchmark or test failed in this capacity study.
 
 ## Warmed handler clock attribution
 

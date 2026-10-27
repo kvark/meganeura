@@ -570,6 +570,20 @@ the descriptor-reference repair requires fresh measurements.
   stages remain expensive, while SGD overlaps backward work and leaves only
   0.64 ms after the last graph handler. Restore exact runtime/forks and binaries,
   pass all ten restored smoke tests, and archive both probes locally.
+- [x] Isolate a resource/concurrency change without clock bookkeeping: append
+  12 KiB of unused scratch to the training shader, preserving requested workers,
+  arithmetic, indices, guards, registers and code size. Pass 1,000 completed-step
+  comparisons plus ten diagnostics. Fresh SDK replay improves 7.6% with fewer
+  average active warps and essentially unchanged FP32 work. Preserve 441
+  verified artifacts; revert the diagnostic allocation rather than adopt a
+  model-specific threshold. The remaining baseline gap stays open.
+- [x] Test one complete claim broadcast with leader-loaded parameters. Correct
+  the subgroup-prelude reference exposed by the unchanged packing test, then
+  pass 52 codegen checks, ten GPU smoke tests and 50 diagnostic comparisons.
+  Model resources and participation stay unchanged, with no material GPU gain
+  in preflight. Archive the prototype and restore exact runtime/binaries;
+  ten restored smoke tests pass. Preserve 319 verified artifacts and both
+  initial failed checks. No new Naga API or atomic semantics are needed.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
@@ -633,10 +647,19 @@ the descriptor-reference repair requires fresh measurements.
   stages as the next targets. `MatMulBT[50x720x4096]` spans about 208 µs against
   127 µs in ordinary profiling; overlapping node spans are not additive costs.
   The full probe's 6.9% apparent training improvement is confounded by changed
-  allocation, bookkeeping and work distribution. Next, isolate the concurrency
-  effect using a shared-capacity control without clock bookkeeping, preserving
-  all requested 256 workers and exact arithmetic. Audit the compiled footprint
-  before attributing a result to residency. Keep the five-case primary gate and
+  allocation, bookkeeping and work distribution. The independent capacity
+  control now reproduces a 7.6% SDK training gain with the same 80 registers and
+  code size: shared bytes grow 29,344→41,632 and participating workers change
+  252→168, while all 256 workers are still requested. Active compute warps fall
+  49.19%→32.76% of peak. This supports excess concurrency as a contributor;
+  driver allocation, bounds, initialization and cache behavior remain possible
+  contributors. The hard-coded padding is not a portable resource policy.
+  Combining a claim into one broadcast leaves model participation and timings
+  essentially unchanged in preflight, so do not assume broadcast count is the
+  limiting cost. Next, investigate a general scheduling/resource policy that
+  controls concurrent work without abandoning requested workers or relying on
+  model-specific padding. Require progress and completion under oversubscription
+  and arbitrary graph widths before qualification. Keep the five-case primary gate and
   add matched `--prewarm-ms 100` controls. Preserve all samples, state checks,
   requested workers and acceptance budgets; changed cache/power state is not a
   runtime optimization.
