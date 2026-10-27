@@ -642,6 +642,7 @@ pub fn lower(t: &KernelTemplate) -> ShaderModule {
 
 /// Storage only; generated scalar expressions and sensitive consumers stay F32.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PointwiseStorage {
     /// Bit i marks input i as BF16. Unmarked inputs are F32.
     pub bf16_inputs: u8,
@@ -1151,6 +1152,34 @@ fn per_col_binding_names(n: u8) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_metadata_rejects_unknown_precision() {
+        let storage = PointwiseStorage {
+            bf16_inputs: 1,
+            bf16_output: true,
+        };
+        let json = serde_json::to_string(&storage).unwrap();
+        let ron = ron::to_string(&storage).unwrap();
+        assert_eq!(
+            serde_json::from_str::<PointwiseStorage>(&json).unwrap(),
+            storage
+        );
+        assert_eq!(ron::from_str::<PointwiseStorage>(&ron).unwrap(), storage);
+
+        // An older runtime must not drop an unfamiliar storage type while
+        // retaining a plan's reduced buffer sizes and typed consumers.
+        assert!(
+            serde_json::from_str::<PointwiseStorage>(
+                r#"{"bf16_inputs":0,"bf16_output":false,"f16_output":true}"#,
+            )
+            .is_err()
+        );
+        assert!(
+            ron::from_str::<PointwiseStorage>("(bf16_inputs:0,bf16_output:false,f16_output:true)",)
+                .is_err()
+        );
+    }
 
     /// dst[i] = max(src[i], 0).
     fn relu_dag() -> PointwiseDAG {
