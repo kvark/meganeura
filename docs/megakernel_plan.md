@@ -797,11 +797,21 @@ the descriptor-reference repair requires fresh measurements.
   Blade capability and dependency override; restore exact qualified binaries and
   pass fourteen final smoke tests. See the
   [subgroup-sharing evidence](megakernel_whole_graph.md#cooperative-attention-subgroup-sharing).
-  Next, audit repeated cooperative scratch initialization, starting with forward
-  attention. Prove complete writes and required synchronization before every
-  read across tails, masks and reuse before omitting any converter-generated
-  clear. Preserve inactive sentinels and guards; this is separate from the
-  rejected F32 scalar scratch-clear probe.
+  Audit repeated forward-attention scratch initialization across six head widths
+  and 3,913 sequence/mask/window cases. Test omitting converter clears, then also
+  their entry barrier, preserving all shader/worker barriers and inactive guards.
+  Each passes 52 codegen checks, 22 attention references in each mode, fourteen
+  smoke tests and fifty full-state diagnostics. Model GPU timings stay within
+  0.2% of control; no useful gain. All ordinary shaders remain exact; each graph
+  changes only one attention handler. Preserve corrected temporary-name auditing,
+  659 verified hashes and 32 completed bounded cgroups. Revert both probes and
+  restore nineteen source/dependency hashes, exact qualified binaries and fourteen
+  smoke checks. See the
+  [scratch-initialization evidence](megakernel_whole_graph.md#cooperative-attention-scratch-initialization).
+  Next, inspect complete initialization in cooperative matrix handlers. Prove
+  each admitted path separately, including padded writes, result storage and
+  prologue factors; preserve inactive sentinels and required publication/reuse
+  barriers. This is separate from both rejected attention and F32 scalar probes.
   Keep the short-K AT gap as an unresolved target without repeating rejected
   tile selectors or delaying optimizer eligibility.
   Do not sum overlapping spans or infer a memory bottleneck from traffic alone.

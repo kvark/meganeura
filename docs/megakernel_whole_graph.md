@@ -53,6 +53,11 @@ distributing keys across lanes also fails to improve GPU diagnostics, despite
 preserving the original reduction order. Both probes and their temporary Blade
 capability are reverted; the qualified runtime is unchanged.
 
+Two [attention scratch-reset controls](#cooperative-attention-scratch-initialization)
+omit redundant converter clears, with and without the converter's entry barrier.
+Both pass correctness and exact source audits but leave model GPU diagnostics
+within 0.2% of control. Both are reverted; no new speedup is established.
+
 The preceding [fused-matrix tile selection](#fused-matrix-tile-selection) adds
 small-tile routing for fused transposed-B products and extends the existing
 32×16 fused-plain refinement to K≥256. Against qualified `da86b45`, 1,000
@@ -131,6 +136,83 @@ the same launcher without the GPU flag; finish them before primary measurements.
 The launcher now records memory peaks, limit events and memory/CPU/I/O pressure
 after each job, preserving the target's exit status and forwarding termination.
 
+## Cooperative attention scratch initialization
+
+Two independent controls start from source revision `701602e` and qualified
+runtime `3f95fa4`. They omit converter-generated scratch clears only for
+whole-graph `FlashAttentionCoop` and `FlashAttentionCoopF32` handlers. Ordinary
+shaders, regional execution and appended commands retain their initialization.
+The first preserves the converter entry barrier; the second also omits that
+now-empty barrier. Both preserve every original attention staging/reuse barrier,
+worker rendezvous, payload fence, inactive sentinel and access guard. Neither
+changes a shader template, dependency, compiler fork or selected implementation.
+
+The storage audit establishes complete writes before every scratch read:
+Q staging covers all 16×head-width cells, including explicit zeros for padded
+queries. Each full key tile fills transposed K and V before its barrier. The
+publishing subgroup stores the entire 16×16 score matrix before its barrier.
+PV consumes those initialized cells; scalar tails use initialized Q and global
+K/V. Paths without full key tiles never read K/V/score scratch. Worker barriers
+order prior claims before scratch reuse, and first use requires no prior values.
+Index-domain checks cover head widths 16–512 and 3,913 sequence/mask/window
+cases, including 3,364 full key tiles and 15,898 scalar tail keys. Full-score
+coverage relies on the cooperative store semantics already required by the
+original shader; these checks complement GPU tests rather than proving arbitrary
+generated shaders.
+
+Each probe passes **52 codegen checks, 22 attention reference tests in each
+execution mode, fourteen whole-graph smoke tests and fifty full-state diagnostic
+comparisons**. The strict reference run uses 64 workers; diagnostics request 256.
+Five pairs per case/mode use matched 100 ms prewarming and the existing minimum
+warmup count/time. Selection, numerical budgets, completion, one dispatch and
+absence of fallback pass. Maximum absolute error remains 4.66e-9.
+
+| Probe | Phase | Persistent GPU interval, control / candidate | Change | Ordinary GPU change |
+|---|---|---:|---:|---:|
+| Omit clears | Forward | 4.095392 / 4.089824 ms | −0.14% | −0.04% |
+| Omit clears | Training + SGD | 13.041344 / 13.062976 ms | +0.17% | +0.01% |
+| Omit clears and entry barrier | Forward | 4.089312 / 4.088832 ms | −0.01% | +0.05% |
+| Omit clears and entry barrier | Training + SGD | 13.064448 / 13.040768 ms | −0.18% | +0.23% |
+
+Both retain **86/84 forward/training registers**, **18,928/29,344 shared bytes**,
+168 participating model workers and all 256 requested workers. Logical work
+remains 22,042/83,312 tiles. Compiled code shrinks from 99,584/238,720 to
+98,816/238,080 bytes in both probes. Neither establishes a useful gain. Completed
+wall times vary more than GPU intervals, including slower candidate forward
+visits; no wall-time improvement is claimed. No normal retention gate, full
+library/oracle/matrix qualification or fresh SDK capture is claimed.
+
+All nineteen CI and forty model sources remain byte-identical, including all
+fifty-six ordinary shaders. Each model graph changes exactly one attention
+handler. Source audits remove four reset loops covering 3,328 cells and their
+cursor declarations; the second additionally removes the entry barrier. Every
+remaining handler token matches after one-to-one generated-temporary renaming,
+and all source outside the handler matches exactly. Application identifiers and
+field names remain intact. The first audit initially missed temporary names
+such as `_e637` and `_e275_1`; the corrected audit passes, with the original script
+and failed log preserved. No GPU work is rerun. Temporary wrappers produce a
+dead-code warning outside tests; no Clippy qualification is claimed for them.
+
+Both probes and their wrappers are removed. All nineteen original source and
+dependency hashes and both qualified benchmark hashes match exactly; fourteen
+restored smoke tests pass. Both compiler forks are clean and unchanged. Local
+evidence is in `target/coop-attention-clear/` and
+`target/coop-attention-clear-barrier/`. The independently verified manifest
+`target/megakernel-results/coop-attention-clearing/summary.json` records
+**659 artifact hashes and 32 completed bounded cgroups**, SHA-256
+`498d0a1ec49a38910c73767dc509cde14089c6f40b0a187c1824d53784cb2ab9`.
+Peak recorded job memory is **3,719,450,624 bytes**, with zero memory-limit events.
+GPU jobs are serialized, heavy work uses separate verified `ml.slice` scopes,
+and artifacts stay on local `/x`. All launched jobs finish. Runtime remains
+`3f95fa4`; baseline parity remains unmet.
+
+Next, inspect initialization coverage in cooperative matrix handlers, whose
+staging and result scratch differ from attention and scalar matrix code. Admit
+only individually proven paths, preserving prologue factors, padded writes,
+inactive sentinels, publication and reuse barriers. The attention result does
+not establish that clearing is free elsewhere or identify a unique cause of
+the remaining graph overhead.
+
 ## Cooperative attention subgroup sharing
 
 Two independent follow-ups to the shared-memory softmax probe keep all original
@@ -206,11 +288,10 @@ All heavy jobs use separate verified `ml.slice` scopes, GPU jobs are serialized,
 and artifacts stay on local `/x`. All launched jobs finish. Runtime remains
 `3f95fa4`; baseline parity remains unmet.
 
-Next, audit repeated cooperative scratch initialization, starting with forward
-attention. Before omitting any converter-generated clear, prove that every
-read is dominated by a complete write and the necessary barrier for every tail,
-mask and reuse path. Preserve inactive sentinels and their guards. This is
-separate from the rejected F32 scalar scratch-clear probe.
+The subsequent [scratch-initialization controls](#cooperative-attention-scratch-initialization)
+prove complete writes across forward-attention tails, masks and reuse, but
+omitting converter clears and their entry barrier establishes no gain. Both are
+reverted, separately from the rejected F32 scalar scratch-clear probe.
 
 ## Cooperative attention ownership and row softmax
 
