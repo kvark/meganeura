@@ -80,6 +80,13 @@ preserves all shader bytes and native statistics against four tiles, but is
 0.24% slower in forward GPU diagnostics and 0.20% slower in training. It fails
 the predeclared advancement gate and is reverted without normal timing or SDK
 captures. Qualified runtime remains `c3ad104`.
+The subsequent [complete forward claim trace](#complete-forward-claim-attribution)
+finds a 137-node dependency chain with 477–484 µs between recorded predecessor
+completion and first handler entry. Only about 21 µs overlaps other recorded
+handler bodies. This identifies publication-to-entry latency as an attribution
+target; the remaining gaps include synchronization, queue work, parameter setup
+and instrumentation, and are not established recoverable time. The probe is
+removed and the qualified runtime remains unchanged.
 
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
@@ -1525,13 +1532,132 @@ heavy analysis stays outside measurements, and artifacts remain on local `/x`.
 Every launched job finishes, including the separate manifest and verification
 jobs.
 
-Further claim-width sweeps are not supported by this evidence. Return to the
-qualified runtime and extend calibrated complete-claim timing to the forward
+Further claim-width sweeps are not supported by this evidence. The following
+study returns to the qualified runtime and extends calibrated complete-claim timing to the forward
 graph, whose remaining relative gap is larger. Compare dependency-aware node
 envelopes with matched ordinary dispatches, including overlapping work, before
 choosing another runtime change. Keep instrumentation overhead, source/native
 resource changes and full-state checks separate from performance attribution;
 do not sum overlapping spans or treat participating workers as occupancy.
+
+## Complete forward claim attribution
+
+Starting from `b387702`, a temporary diagnostic extends the existing clock
+instrumentation to the **154-node forward fixture**. One frozen binary compares
+worker timestamps alone with all claim timestamps. Both modes reserve identical
+storage and use identical shaders; only the per-node recording offsets change.
+The host also preserves the exact immutable node metadata and physical
+dependency edges. Training and CI graphs remain uninstrumented.
+
+The timestamp helper is unchanged from the earlier AT study. Each timestamp is
+stored immediately, so no clock value remains live across a handler. A local
+Blade hook substitutes Device-scope `OpReadClockKHR` for the validated marker;
+Naga is unchanged. Both original and transformed SPIR-V validate, and reversing
+the substitution reproduces each original module byte for byte. The two captured
+modules differ only in debug records. All **61 WGSL sources match between
+recording modes**. Against qualified, all 19 CI sources and 41 model sources
+remain exact; removing the clock hooks reconstructs the entire forward graph
+source. Handler arithmetic, geometry, claims and synchronization are unchanged.
+
+The probe passes **five focused graph codegen tests and fourteen whole-graph
+smoke tests**. A finite geometry audit covers **3,648 cases, 94,336 claims,
+162,000 logical coordinates and 19,134 partial claims**, including empty grids.
+Every decoded full trace contains **15,898 claims covering 22,042 logical tiles**,
+with exact per-worker ownership and completion counts. Disabled recording leaves
+every reserved claim record zero. Metadata and dependency edges match across all
+recording modes and visits.
+
+Twelve preflight comparisons precede a fixed **300-comparison diagnostic series**:
+qualified/disabled/all/all/disabled/qualified, ten interleaved pairs per case/
+visit, ten warmups, at least one warmup second and matched 100 ms prewarming.
+Every numerical, implementation-selection, one-dispatch, no-fallback and
+logical-work gate passes. No timing run is repeated.
+
+| Persistent GPU diagnostic | Qualified | Recording disabled | All claims |
+|---|---:|---:|---:|
+| Forward | 4.091376 ms | 4.120768 ms | 4.131344 ms |
+| Training + SGD, unchanged shader | 12.792032 ms | 12.765296 ms | 12.784640 ms |
+
+Full recording adds **0.98%** forward GPU time versus qualified and **0.26%**
+versus disabled recording. Preflight overhead is 1.04%. This stays below the
+predeclared 10% threshold for treating durations as highly perturbed, but does
+not eliminate individual interval perturbation. Forward retains **86 registers
+and 18,928 shared bytes**. Code grows from 102,400 to 104,576 bytes; initial/live
+queue storage adds **891,104 bytes**. Both recording modes have identical native
+statistics and allocations. All 256 requested workers remain enabled, with
+168 participating in graph work.
+
+Two final full traces preserve **31,796 claim intervals**. Every one of the
+161 physical dependency edges has its producer endpoint before its consumer
+entry in both traces: **322 ordering checks**. Following the last-finishing
+predecessor back from the final node yields a **137-node chain** in each trace.
+Its nonoverlapping node spans and predecessor-to-entry gaps partition the
+observed final-node envelope; this is an observed execution path, not a causal
+prediction of a changed schedule.
+
+| Scaled interval | First full trace | Second full trace |
+|---|---:|---:|
+| GPU dispatch | 4.106144 ms | 4.090816 ms |
+| Chain node spans | 3,620.16 µs | 3,612.05 µs |
+| Chain predecessor-to-first-entry gaps | 484.32 µs | 477.07 µs |
+| Gap time overlapping another recorded claim body | 20.63 µs | 20.69 µs |
+| Gap time outside all recorded claim bodies | 463.69 µs | 456.38 µs |
+| Final node endpoint to worker-envelope exit | 1.67 µs | 1.70 µs |
+
+Most of the roughly **0.48 ms** chain gap therefore lies outside recorded
+handler bodies. These intervals still contain completion fan-in, dependency
+publication, ready scanning, claim acquisition, broadcasts, parameter loading,
+fences and probe work. They are not proof of GPU idleness or 0.46 ms of removable
+overhead. The full-pass mean is about 70 overlapping claim bodies; this is not
+an occupancy estimate.
+
+A separate qualified ordinary profile preserves complete forward/backward
+state and selected implementations. Its pass-start timestamps include dispatch
+boundaries; forward profiling adds **16.8% wall time**. Consequently the following
+matched node medians identify candidates, rather than exact kernel speed ratios.
+The listed spans also must not be summed across overlapping nodes.
+
+| Shape | Ordinary dispatch median | Persistent node-span median, scaled | Median claim body, scaled |
+|---|---:|---:|---:|
+| FusedMatMulAdd 50×720×2048 | 63.55 µs | 69.04 µs | 52.63 µs |
+| MatMul 50×4096×720 | 49.15 µs | 55.86 µs | 55.42 µs |
+| FusedMatMulAdd 50×720×960 | 32.74 µs | 33.16 µs | 25.30 µs |
+| FlashAttentionCoop, sequence 50 | 9.15 µs | 21.62 µs | 14.77 µs |
+| SwiGLUConcat, 102,400 elements | 4.10 µs | 7.24 µs | 0.70 µs |
+| RmsNorm 50×720 | 4.11 µs | 2.16 µs | 1.65 µs |
+
+The attention span repeats an already investigated discrepancy; it does not
+justify repeating rejected ownership, softmax-sharing or scratch-clear probes.
+The dependency-chain gaps instead motivate a narrower measurement of
+publication-to-entry stages. Record last-tile completion, bounds around ready
+publication, the zero-ticket claim and handler entry, with identical disabled
+metadata/storage controls. Bracket publication because a consumer may claim
+before the publishing worker records its post-publication timestamp. Calibrate
+the new instrumentation before attributing the gaps to any single stage or
+changing fences, atomics, worker eligibility or descriptor semantics.
+
+The [shader-clock specification](https://raw.githubusercontent.com/KhronosGroup/SPIRV-Registry/main/extensions/KHR/SPV_KHR_shader_clock.asciidoc)
+does not guarantee a fixed tick rate or code-motion barriers. Raw ticks remain
+available; scaled microseconds use each dispatch's GPU interval and worker
+envelope. Two final traces per mode do not capture every measured step, and
+small aggregate overhead does not remove per-node scheduling perturbation.
+
+**The probe is removed.** Twenty-one main source/dependency hashes, three Blade
+source hashes, both qualified binary hashes and fourteen restored smoke tests
+match. Both forks are clean. No runtime optimization, normal completed-step
+qualification, full oracle/Metal qualification or fresh SDK capture is claimed.
+Qualified runtime remains `c3ad104`; baseline parity remains unmet.
+
+Evidence remains under `target/clock-forward-claims/`. Manifest
+`target/megakernel-results/clock-forward-claims/summary.json` independently verifies
+**515 artifact hashes and 35 completed study cgroups**, SHA-256
+`b8bed92e5f23d4ba774ecc1fab07ac477477e297f0d27f75a8e2fe5769c03519`.
+It preserves an early verification failure: verification began before the first
+manifest job finished. That original job completed; only artifact verification
+was repeated, with no GPU rerun. Peak job memory is **4,246,446,080 bytes**, with
+zero memory-limit or OOM events. Heavy work uses separate verified 16/20/1 GiB
+cgroups, GPU jobs serialize, artifacts remain on local `/x`, and every launched
+job finishes.
 
 ## Completion-epoch control on the current runtime
 

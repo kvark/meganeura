@@ -971,11 +971,23 @@ the descriptor-reference repair requires fresh measurements.
   The predeclared advancement gate fails. Revert without additional timing or
   SDK captures; restore 22 source hashes, both binaries and fourteen smoke tests.
   See the [three-tile forward control](megakernel_whole_graph.md#three-tile-forward-claim-control).
-  Stop the claim-width sweep. Extend calibrated complete-claim timing to the
-  qualified forward graph and compare dependency-aware node envelopes with
-  matched ordinary dispatches before choosing another change. Account for
-  overlapping work, instrumentation overhead and native-resource changes;
-  neither claim counts nor participating workers establish occupancy.
+  Stop the claim-width sweep and extend complete-claim timing to forward.
+  Preserve 300 calibrated diagnostics, identical recording-mode shaders/native
+  statistics/storage, all 15,898 claims per final trace and 322 physical-edge
+  ordering checks. The 137-node dependency chain has 477–484 µs of predecessor-
+  to-entry gaps, only about 21 µs overlapping other recorded handler bodies.
+  Full recording adds 0.98% forward GPU time. Restore 21 main/three Blade source
+  hashes, both qualified binaries and fourteen smoke tests; retain no probe.
+  See [complete forward claim attribution](megakernel_whole_graph.md#complete-forward-claim-attribution).
+  Next, bracket last-tile completion, ready publication, the zero-ticket claim
+  and handler entry with identical disabled metadata/storage controls. A
+  consumer may claim before the publisher records its post-publication time;
+  preserve bounds rather than inventing an ordering. Calibrate overhead before
+  assigning the roughly 0.46 ms outside recorded handler bodies to any stage
+  or changing fences, atomics, worker eligibility or descriptor semantics.
+  Neither empty recorded intervals nor participating workers establish idle
+  hardware, recoverable time or occupancy. Do not repeat rejected attention
+  ownership, softmax-sharing or scratch-clear probes from the span comparison.
   Preserve partial completion, small grids, SGD batching, all requested
   workers and the fixed absolute criterion under both protocols.
   Keep every completed-step gate; lower claim traffic alone is insufficient.
