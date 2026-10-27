@@ -57,8 +57,10 @@ tile intervals from gaps between claims. The two largest sampled shapes average
 only 53–54 overlapping tile intervals despite 168 workers participating in the
 whole training graph. Their between-tile gaps include other work and cannot be
 counted as idle time. The calibrated probe adds 1.25% training GPU time and is
-removed; the next attribution target is competing optimizer work during those
-AT spans. Qualified runtime remains `c3ad104`.
+removed. Subsequent [optimizer claim clocks](#optimizer-claims-alongside-at-tiles)
+find no recorded optimizer body overlapping either largest sampled shape, and
+none inside same-worker gaps between sampled AT claims. The next trace must
+identify the remaining graph work. Qualified runtime remains `c3ad104`.
 
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
@@ -835,7 +837,8 @@ training is effectively unchanged at 10.769344→10.769280 ms. Forward GPU time
 changes 4.077728→4.080608 ms (+0.07%) on an unchanged shader. Training retains
 **84 registers, 29,344 shared bytes and 168 participating workers**. The probe
 adds 2,560 native code bytes and 231,048 scheduler/resident bytes. All requested
-workers remain enabled; logical work stays 22,042/83,312 tiles for forward/training.
+workers remain enabled; graph work stays 22,042/83,312 tiles for forward/training,
+with 97,522 additional optimizer tiles in training.
 This is instrumentation calibration, not a completed-step optimization gate.
 
 The table uses medians over selected node observations in both final traces.
@@ -888,6 +891,111 @@ for existing four-tile optimizer claims and calibrate the extra recording cost
 before drawing conclusions. Keep handler arithmetic, requested workers and all
 completed-step gates. Do not repeat global optimizer deferral or alter queue
 priority solely from these partial traces.
+
+## Optimizer claims alongside AT tiles
+
+This study starts from `3f3aa9c`, against qualified `c3ad104`. It extends the
+previous clock metadata to the four SGD nodes, without changing the timestamp
+helper or any handler, case, scheduling, completion or publication statement.
+The optimizer's **97,522 logical tiles form 24,382 claims of up to four tiles**.
+The existing 83,312 training graph tiles are additional; the benchmark reports
+graph and appended-command worker counters separately.
+
+Two instrumented modes reserve identical timestamp storage. AT-only recording
+leaves the optimizer table pointers zero; combined recording enables those
+pointers. Each claim writes at its first logical tile's slot, leaving other
+slots zero. The decoder verifies every unused slot, all claim owners against
+the original per-node worker histograms, and both partial final SGD claims.
+It also verifies nonoverlapping intervals across all recorded nodes on each
+worker. Both modes preserve all 256 requested workers.
+
+All **61 shader sources match between recording modes** and the previous AT
+probe. Reversing the four clock call sites and helper definitions restores the
+complete original training WGSL. CI and forward remain uninstrumented. The two
+captured SPIR-V modules differ only in one `OpString` debug source-file path;
+every other instruction is exact. Both modules and their pre-clock originals
+validate, and inverse clock transformation restores each original byte-for-byte.
+An auxiliary audit first assumed an `OpName` difference; its script and failed
+log remain preserved alongside the corrected audit. No GPU work was rerun.
+
+**Three hundred diagnostics** use qualified/AT-only/combined/combined/AT-only/
+qualified visits, ten pairs per case/visit, ten warmups and at least one warmup
+second, 100 ms prewarming and 256 workers. All complete-state, matching-selection,
+logical-work, one-dispatch and no-fallback gates pass. Twelve preflight pairs,
+five graph-codegen checks and fourteen smoke tests also pass.
+
+| Training GPU diagnostic | Qualified | AT-only | Combined |
+|---|---:|---:|---:|
+| Persistent | 12.810240 ms | 12.930128 ms | 12.946784 ms |
+| Ordinary | 10.779280 ms | 10.773040 ms | 10.772608 ms |
+
+Combined recording costs **0.13% over AT-only / 1.07% over qualified** in these
+pooled GPU medians. All training modes retain **84 registers, 29,344 shared
+bytes and 168 participating graph workers**. Both instrumented modes use
+244,224 code bytes and 5,302,712 scheduler bytes, respectively 2,560 and
+4,131,928 above control. Resident bytes rise by the same metadata delta.
+This calibrates the probe; it establishes
+no runtime improvement or normal completed-step result.
+
+Two final steps per instrumented mode yield **70,628 recorded intervals**:
+10,932 AT-only intervals and 59,696 combined intervals. Each combined step
+covers all 24,382 SGD claims and all 5,466 tiles of the twenty selected AT nodes.
+These are final-step traces, not traces of every timing sample. Raw ticks,
+worker ownership, unused slots and all per-node intervals remain archived.
+
+No recorded SGD body overlaps **any of the six observations per shape**
+for AT2048×720×50 or AT720×4096×50. Their combined-mode median spans remain
+51.60/98.78 µs, with approximately 54.6/53.6 simultaneous recorded AT intervals.
+The larger shape still uses a median of 78 distinct workers. SGD therefore
+does not directly occupy the workers during these sampled long AT spans.
+
+Some other shapes do overlap SGD: four of six AT960×720×50 observations,
+two of six AT720×960×50 observations, two of six horizontal AT720×320×50
+observations, and both observations of each K=1 tail. Even there, **zero recorded
+SGD-body ticks occur inside any same-worker gap between sampled AT claims**.
+This separates simultaneous work on other workers from work interposed between
+a given worker's AT claims. It does not identify unrecorded graph handlers or
+the scheduler work outside recorded bodies.
+
+The four SGD nodes have these observed ranges across the two combined traces:
+
+| Node | Claims | Node envelope µs | Median four-tile claim µs | Mean overlapping claims |
+|---|---:|---:|---:|---:|
+| 523 | 8,180 | 670.74–671.54 | 11.30–11.33 | 136.74–136.93 |
+| 524 | 7,562 | 1,442.57–1,443.82 | 10.95 | 57.44–57.49 |
+| 525 | 7,920 | 1,229.07–1,248.02 | 10.02–10.05 | 61.18–62.15 |
+| 526 | 720 | 38.06–39.75 | 3.91 | 74.08–77.29 |
+
+The same [clock limitations](#individual-at-tile-clocks) apply: entry/exit
+intervals include handler initialization, the original payload fence/barrier
+and recording overhead; clock rate and code-motion barriers are not guaranteed.
+Scaled microseconds use each step's GPU interval and worker envelope. Small
+pooled overhead does not eliminate per-node perturbation: the final K=1 node's
+median envelope differs 11.6% between modes. Final AT-only steps measure
+12.812480/13.173120 ms, versus combined 12.813408/12.843488 ms. All are preserved.
+Overlapping intervals cannot be summed into recoverable elapsed time.
+
+**The probe is removed.** Twenty-one main source/dependency hashes, three Blade
+source hashes, both qualified binary hashes and fourteen restored smoke tests
+match. Both compiler forks are clean. No full library/oracle/Metal qualification,
+normal completed-step series or fresh SDK counters are claimed.
+
+Evidence is under `target/clock-at-optimizer/`. Manifest
+`target/megakernel-results/clock-at-optimizer/summary.json` independently verifies
+**504 artifact hashes and 35 completed study cgroups**, including the preserved
+auxiliary audit failure, SHA-256
+`691a7e9b96bc87989d83235ff268a56b30c2de04c93ca0cc93cbbe50353f6b6d`.
+Peak job memory is **3,720,683,520 bytes**, with zero memory-limit events. Every
+heavy job uses a separate verified 16/20/1 GiB cgroup; GPU jobs serialize,
+artifacts remain on local `/x`, and all launched jobs finish.
+
+Next, extend metadata-selected claim recording to the remaining graph handlers,
+including packed-axis claims and partial completion. Compare identical shaders
+and reserved storage with recording disabled for those nodes, then identify
+which handlers overlap the long AT spans and same-worker gaps. Preserve all
+arithmetic, fences, requested workers and completed-step gates. Direct optimizer
+competition is unsupported for the largest sampled AT shapes, so these traces
+provide no reason to repeat global SGD deferral or alter its eligibility.
 
 ## Completion-epoch control on the current runtime
 

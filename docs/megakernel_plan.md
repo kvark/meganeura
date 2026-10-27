@@ -915,10 +915,22 @@ the descriptor-reference repair requires fresh measurements.
   checks and ordinary profiles pass. Remove the probe and verify 371 artifacts,
   27 completed cgroups, restored source/binary hashes and fourteen smoke tests.
   See the [individual tile evidence](megakernel_whole_graph.md#individual-at-tile-clocks).
-  Next, record optimizer claims alongside the sampled AT tiles to identify
-  competing work during long node spans. Respect existing four-tile claims and
-  recalibrate overhead before interpreting the extra records. Keep arithmetic
-  and scheduling unchanged until the traces support a specific policy.
+  Record optimizer claims alongside the sampled AT tiles, preserving existing
+  four-tile claims and comparing identical shaders/storage with recording
+  disabled. All 300 diagnostics pass; combined recording adds 0.13% GPU time
+  over AT-only and 1.07% over qualified. Across two combined final steps, no
+  optimizer body overlaps either largest sampled AT shape or occupies any
+  same-worker gap between sampled AT claims. Preserve 70,628 intervals across
+  both modes, exact source/SPIR-V audits and the corrected debug-label auditor.
+  Remove the probe; verify 504 artifacts, 35 completed cgroups, restored source/
+  binary hashes and fourteen smoke tests. See the
+  [optimizer-claim attribution](megakernel_whole_graph.md#optimizer-claims-alongside-at-tiles).
+  Next, record the remaining graph handlers, including packed-axis claims and
+  partial completion, to identify concurrent work during the long AT spans and
+  same-worker gaps. Calibrate against identical shaders/storage with those
+  records disabled. Keep arithmetic and scheduling unchanged until the traces
+  support a specific policy; direct SGD competition does not explain the
+  largest sampled AT spans.
   Keep every completed-step gate; lower claim traffic alone is insufficient.
   Keep the short-K AT gap as an unresolved target without repeating rejected
   tile selectors or delaying optimizer eligibility.
