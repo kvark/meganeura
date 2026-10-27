@@ -912,6 +912,121 @@ mod tests {
     use super::{Builder, tile};
 
     #[test]
+    fn inactive_storage_reads_are_masked_for_in_place_and_aliased_bindings() {
+        use naga::{AddressSpace, Expression, Statement, TypeInner};
+
+        let source = r#"
+            var<storage> src: array<vec2<f32>>;
+            var<storage, read_write> dst: array<vec2<f32>>;
+            fn read(index: u32, other_active_lane: bool) -> vec2<f32> {
+                if other_active_lane { return dst[index] + src[index]; }
+                return vec2<f32>(0.0);
+            }
+            @compute @workgroup_size(4)
+            fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+                dst[id.x] = read(id.x, true);
+            }
+        "#;
+        let layout = blade_graphics::ShaderDataLayout {
+            bindings: vec![
+                ("src", blade_graphics::ShaderBinding::Buffer),
+                ("dst", blade_graphics::ShaderBinding::Buffer),
+            ],
+        };
+        let mut builder = Builder::new(16);
+        let kernel = builder
+            .add(
+                tile::from_module(source, "main").unwrap(),
+                &layout,
+                0,
+                &[[3, 1, 1]],
+                false,
+            )
+            .unwrap();
+        // Both views may use the same canonical backing-buffer descriptor.
+        let generated = builder.source(&[kernel], 1).unwrap();
+        let module = naga::front::wgsl::parse_str(&generated).unwrap();
+        let info = tile::validate(&module).unwrap();
+        fn inspect(
+            block: &naga::Block,
+            function: &naga::Function,
+            loads: &[naga::Handle<Expression>],
+            active: bool,
+        ) -> usize {
+            let mut found = 0;
+            for statement in block.iter() {
+                match *statement {
+                    Statement::Emit(ref range) => {
+                        for value in range.clone() {
+                            if loads.contains(&value) {
+                                assert!(
+                                    active,
+                                    "inactive invocation can race an in-place storage update"
+                                );
+                                found += 1;
+                            }
+                        }
+                    }
+                    Statement::If {
+                        condition,
+                        ref accept,
+                        ref reject,
+                    } => {
+                        let guarded = match function.expressions[condition] {
+                            Expression::FunctionArgument(index) => function.arguments
+                                [index as usize]
+                                .name
+                                .as_deref()
+                                .is_some_and(|name| {
+                                    name.starts_with("graph_handler_0_active_lane")
+                                }),
+                            _ => false,
+                        };
+                        found += inspect(accept, function, loads, active || guarded);
+                        found += inspect(reject, function, loads, active);
+                    }
+                    Statement::Block(ref block) => found += inspect(block, function, loads, active),
+                    _ => {}
+                }
+            }
+            found
+        }
+        let mut reads = 0;
+        for (handle, function) in module.functions.iter() {
+            if !function
+                .name
+                .as_deref()
+                .unwrap()
+                .starts_with("graph_handler_0_")
+            {
+                continue;
+            }
+            let loads = function
+                .expressions
+                .iter()
+                .filter_map(|(value, expression)| {
+                    let Expression::Load { pointer } = *expression else {
+                        return None;
+                    };
+                    matches!(
+                        info[handle][pointer].ty.inner_with(&module.types),
+                        TypeInner::Pointer {
+                            space: AddressSpace::Storage { .. },
+                            ..
+                        } | TypeInner::ValuePointer {
+                            space: AddressSpace::Storage { .. },
+                            ..
+                        }
+                    )
+                    .then_some(value)
+                })
+                .collect::<Vec<_>>();
+            reads += inspect(&function.body, function, &loads, false);
+        }
+        assert_eq!(reads, 2);
+    }
+
+    #[test]
     fn inactive_scratch_reads_use_reserved_addresses() {
         use naga::{AddressSpace, ArraySize, Expression, TypeInner};
 

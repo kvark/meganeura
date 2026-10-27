@@ -126,15 +126,15 @@ pub(crate) fn mask_extra_lanes(mut tile: Tile, physical_threads: u32) -> Result<
         naga::back::wgsl::WriterFlags::EXPLICIT_TYPES,
     )
     .map_err(|error| format!("worker lane adaptation: {error}"))?;
-    let source = mask_cooperative_loads(&source)?;
+    let source = mask_memory_reads(&source)?;
     tile.source = rename_tokens(&source, &names).replace(PREFIX, "$PREFIX");
     Ok(tile)
 }
 
-// Cooperative loads span multiple elements, so they cannot use the scalar
-// read-only slot reserved by graph::Builder. Skip them in inactive subgroups;
-// workgroup-scoped cooperative operations are rejected above.
-fn mask_cooperative_loads(source: &str) -> Result<String, String> {
+// Read-only storage bindings can alias writable bindings, so guard their loads
+// too. Shared scalar loads use graph::Builder's reserved address; cooperative
+// loads span multiple elements and instead need this subgroup-uniform guard.
+fn mask_memory_reads(source: &str) -> Result<String, String> {
     let module =
         naga::front::wgsl::parse_str(source).map_err(|error| error.emit_to_string(source))?;
     let info = validate(&module)?;
@@ -147,20 +147,18 @@ fn mask_cooperative_loads(source: &str) -> Result<String, String> {
             .find(|name| name.starts_with(&format!("{PREFIX}active_lane")))
             .ok_or("missing lane activity argument")?;
         for (value, expression) in function.expressions.iter() {
-            let pointer = match *expression {
-                Expression::CooperativeLoad { ref data, .. } => data.pointer,
+            let (pointer, cooperative) = match *expression {
+                Expression::Load { pointer } => (pointer, false),
+                Expression::CooperativeLoad { ref data, .. } => (data.pointer, true),
                 _ => continue,
             };
-            if !matches!(
-                info[handle][pointer].ty.inner_with(&module.types),
-                TypeInner::Pointer {
-                    space: AddressSpace::WorkGroup,
-                    ..
-                } | TypeInner::ValuePointer {
-                    space: AddressSpace::WorkGroup,
-                    ..
-                }
-            ) {
+            let space = match *info[handle][pointer].ty.inner_with(&module.types) {
+                TypeInner::Pointer { space, .. } | TypeInner::ValuePointer { space, .. } => space,
+                _ => continue,
+            };
+            if !matches!(space, AddressSpace::Storage { .. })
+                && !(cooperative && space == AddressSpace::WorkGroup)
+            {
                 continue;
             }
             let span = function
