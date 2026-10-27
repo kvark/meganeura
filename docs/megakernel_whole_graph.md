@@ -28,7 +28,12 @@ control ratios are 1.357× forward and 1.231× training.
 The [subgroup-shuffle experiment](#subgroup-attention-reduction) also preserves
 the exact tree, but has an unacceptable tradeoff: persistent training improves
 1.66% while ordinary training regresses 8.12%. It is reverted with its dependency
-changes. The newest retained-control ratios are 1.346× forward and 1.217× training.
+changes. Its retained-control ratios are 1.346× forward and 1.217× training.
+
+A [static-unrolling follow-up](#static-subgroup-reduction) fixes the ordinary
+regression but does not establish a persistent completed-step gain in its
+confirmation run. It is also reverted. Confirmation retained-control ratios
+are 1.424× forward and 1.209× training; forward timings vary substantially.
 
 For model benchmarks, use `--whole-graph --workers 256`. The
 [current worker sweep](#worker-counts-and-deeper-scalar-staging) finds lower CI
@@ -50,6 +55,106 @@ separate verified cgroup (16 GiB soft memory limit, 20 GiB hard limit, 1 GiB swa
 The GPU flag holds a shared file lock across command execution, so marked jobs
 cannot overlap. Library tests also use the GPU and need this flag. Builds use
 the same launcher without the GPU flag; finish them before primary measurements.
+
+## Static subgroup reduction
+
+This follow-up keeps the preceding shuffle candidate's capability reporting,
+runtime geometry guard, exact addition order, original-tree fallback and head
+packing. Its only new shader change expands the five shuffle iterations into
+five explicit stages. The Blade and Naga patches match the preceding qualified
+experiment exactly; their test record, including the five verified pre-existing
+wgpu GPU failures, is reused rather than represented as a new green suite.
+
+The ordered-tree audit verifies both arrays in both helpers: 64 leaves,
+63 additions, two helper barriers, and active shuffle sources at every stage.
+All 673 library tests (eight ignored), 52 codegen tests, 168 strict graph oracle
+tests, 50 matrix regressions, ten whole-graph smoke tests, attention references
+in both modes, strict Clippy, formatting and Metal compilation pass. Metal GPU
+execution remains unqualified.
+
+Fifteen diagnostic comparisons preserve selected implementations, geometry,
+buffers, scheduler, work accounting and one-dispatch execution without fallback.
+The fresh looped-control binaries, shader bytes and compiler statistics match
+the preceding experiment. Unrolled source changes only the expected attention
+helpers and associated local names. The original fallback, other handlers,
+globals and all 102 guarded storage-read sites remain intact.
+
+Ordinary attention shared allocations return from the looped candidate's
+1,536/2,048 bytes to 512 bytes each. Registers instead rise from 40 each to
+44/46. The persistent training shader reports the same resources as the looped
+version: 79 registers, 29,344 shared bytes and 262,912 code bytes. These counts
+do not prove identical native instructions or an occupancy change. Diagnostic
+participation remains 252 workers in training and 168 in forward, out of 256
+requested; every logical task completes.
+
+The primary sequence is tree, looped, unrolled, unrolled, looped, tree, with
+25 paired samples per case per visit: **750 comparisons**. Training results are:
+
+| Version | Ordinary ms | Persistent ms | Paired persistent/ordinary |
+|---|---:|---:|---:|
+| Retained tree | 14.651669 | 17.907924 | 1.2287× |
+| Looped shuffles | 15.590231 | 17.564922 | 1.1418× |
+| Unrolled shuffles | 14.104727 | 17.715782 | 1.2466× |
+
+Unrolling improves ordinary training versus the looped version by 9.53%, ratio
+0.9047 [0.8870, 0.9266], while persistent timing between them includes no change,
+1.0086 [0.9933, 1.0223]. Against the retained tree, unrolled persistent training
+improves 1.07%, ratio 0.9893 [0.9768, 0.9996], but ordinary uncertainty spans
+0.9585–1.1885 despite its lower median. The same sequence records 0.60% CI-backward
+and 7.44% forward persistent regressions, even though their shader bytes and
+resources are unchanged. Keep these results and all visits; do not attribute
+that movement to the reduction.
+
+The unresolved variation triggers one fixed **500-comparison confirmation**,
+using the same frozen tree/unrolled binaries in control, candidate, candidate,
+control order. There is no rebuild or sample filtering:
+
+| Case | Control persistent ms | Unrolled ms | Candidate/control, 95% interval |
+|---|---:|---:|---:|
+| CI inference | 0.069696 | 0.069491 | 0.9971 (0.9592–1.0392) |
+| CI backward | 0.093186 | 0.093356 | 1.0018 (0.9936–1.0085) |
+| CI SGD | 0.095005 | 0.094981 | 0.9997 (0.9921–1.0110) |
+| Model forward | 5.137887 | 5.167241 | 1.0057 (0.9945–1.0711) |
+| Model training + SGD | 17.872130 | 17.785119 | 0.9951 (0.9784–1.0058) |
+
+All absolute persistent intervals now include no change. Ordinary training
+improves **14.686630→14.150677 ms**, ratio **0.9635 [0.9427, 0.9699]**. The
+paired persistent/ordinary training ratio grows **1.2094→1.2545**, relative ratio
+**1.0373 [1.0140, 1.0565]**. Pooled bootstrap intervals do not capture all
+between-visit variation. The experiment does not establish progress toward
+persistent baseline parity; preserve the ordinary optimization separately.
+
+Four complete-step SDK backend captures and sixteen metric groups measure
+ordinary **11.9853→11.3701 ms (−5.13%)** and persistent
+**15.9301→15.6469 ms (−1.78%)**. Estimated persistent warp instructions fall
+2.86% and shared wavefronts 2.09%, with zero local traffic. Ordinary warp
+instructions fall 2.00% and shared wavefronts 6.33%. Persistent barrier waiting
+stays nearly unchanged, 63.97→63.95% of active warp cycles; ordinary changes
+5.41→5.80%. These are not elapsed stall costs. Maximum clock/instruction-rate
+spreads across metric groups are 0.361%/0.886%.
+
+Independent hashing verifies bitwise-identical control/candidate states within
+each backend across all 246,883,105 floats, with the same hashes as the preceding
+experiment. Cross-backend maximum error stays 4.66e-9 under the unchanged budget.
+All 1,250 normal comparisons and fifteen diagnostics pass state, selection,
+completion and one-dispatch checks.
+
+Revert the experiment and its dependency patches. Both rebuilt benchmark
+binaries match the retained `e4e70c5` control byte for byte, the lock is restored,
+and both fork worktrees are clean. Source, binaries, three-way samples,
+confirmation design/results, captures and SDK states remain under local
+`target/attention-shuffle-unrolled/`; the manifest is
+`target/megakernel-results/attention-shuffle-unrolled/summary.json`.
+It contains 663 independently verified artifact hashes and 53 recorded bounded
+cgroups; SHA-256
+`e63e24ead7641824d41ab1ce7fddcfa88a4c4eb8e44eca82c6c173b0214cddaa`.
+All heavy jobs use separate verified 16/20/1 GiB cgroups, GPU jobs serialize,
+and builds or heavy analyses do not overlap timing or SDK capture.
+
+Next, audit inactive-lane guard costs on packed claims whose physical groups
+are all proved occupied. Any specialization must cover every grid sharing the
+handler and retain the original guards for partial claims, tails and unsupported
+geometries. This differs from the earlier full-width logical-tile mask probe.
 
 ## Subgroup attention reduction
 

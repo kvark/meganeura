@@ -540,6 +540,14 @@ the descriptor-reference repair requires fresh measurements.
   training improves 1.66%, but ordinary training regresses 8.12%; SDK replay
   confirms the tradeoff. Reject the common change, preserve the fork patches
   and all evidence, and restore byte-identical retained benchmark binaries.
+- [x] Unroll the exact-order shuffle helper and compare retained tree, looped
+  shuffles and unrolled shuffles in 750 completed-step comparisons. Unrolling
+  removes the ordinary shader's extra shared allocation and improves ordinary
+  training versus the looped control. A fixed 500-comparison confirmation
+  improves ordinary training 3.65% versus the retained tree but establishes no
+  persistent gain; the relative training gap grows 3.73%. SDK replay improves
+  5.13% ordinary and 1.78% persistent. Archive the ordinary optimization
+  candidate, revert the experiment and restore exact retained binaries.
 - [ ] Isolate the remaining model scheduling/instruction cost with controls that
   preserve arithmetic and completed-step boundaries. The retained dependency
   ranges and subgroup guard improve CI training without establishing model
@@ -583,13 +591,17 @@ the descriptor-reference repair requires fresh measurements.
   A subgroup-shuffle reduction removes five helper barriers, but makes ordinary
   training materially slower while improving persistent training only 1.66%.
   Its smaller persistent/ordinary ratio largely reflects the slower baseline.
-  Fresh retained control ratios are 1.346/1.217 forward/training. Separate
-  runtime subgroup-geometry overhead from the looped shuffle implementation;
-  test a statically unrolled exact-order helper as a distinct experiment.
-  Require ordinary execution to avoid regressions. Preserve the original-tree
-  fallback, head packing, masks, accumulation order and barrier admission.
-  Reapply the archived shuffle capability and Naga uniformity patches only with
-  qualification; neither dependency change is retained by the rejected probe.
+  Static unrolling fixes that ordinary regression but does not establish a
+  persistent completed-step gain in confirmation. Archive it as an ordinary
+  optimization candidate; both shuffle variants and their dependency changes
+  remain reverted. The confirmation's retained-control paired ratios are
+  1.424/1.209 forward/training, with substantial forward timing variation.
+  Next, audit whether proved fully occupied packed claims still pay adaptation
+  guards for inactive groups. Preserve the guards on every partial/tail case,
+  and prove the occupancy condition across every grid sharing a handler before
+  specializing activity. The earlier constant-mask probe covered original
+  logical workgroups equal to physical workers, before the inactive-read repairs;
+  it does not answer this narrower packed-claim question.
   Use `e4e70c5` as the next control and retain all completed-step gates;
   instruction or traffic savings alone are insufficient retention evidence.
   Preserve initialization, writer ownership, publication, independent B storage
