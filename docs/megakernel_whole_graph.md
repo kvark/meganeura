@@ -150,6 +150,13 @@ CI SGD GPU time 4.47% against the matched control. CPU export of existing
 counters finds unsuccessful attempts in 45%/22% of the final forward/training
 snapshots, but those counts do not establish saved time. The probe is removed.
 
+The subsequent [disabled worker-tracking specialization](#disabled-worker-tracking-specialization)
+removes the histogram update from generated shaders only when tracking is off.
+Matched timing-only diagnostics regress model forward/training **5.37%/18.27%**,
+despite fewer registers and smaller native programs. Fully tracked shaders and
+statistics remain exact. The candidate and temporary benchmark selector are
+removed; the experiment does not establish the native cause of the slowdown.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -2638,6 +2645,85 @@ Heavy work uses separate verified 16/20/1 GiB cgroups; GPU work serializes and
 measurements do not overlap builds, copies or heavy analysis. Every launched
 job finishes. Qualified runtime `c3ad104`, its memory contract and dependency
 pins remain unchanged; baseline parity is unmet.
+
+## Disabled worker-tracking specialization
+
+Starting from `5529a6b`, this candidate omits the worker-histogram update from
+generated graph shaders when the immutable Graph options have
+`track_workers=false`. The original uniform conditional is then false for every
+invocation. Removing it changes no executed memory operation or publication
+ordering. Claims, completion, dependencies, ready-word updates, payload fences,
+workgroup barriers, arithmetic, geometry and all 256 requested workers remain.
+Tracked graphs insert the exact original block. The entire generated source is
+part of the pipeline-cache key, preventing tracked/untracked shader collisions.
+Neither compiler fork changes.
+
+The normal diagnostic option enables both timestamps and worker histograms.
+A temporary benchmark selector disables only histograms while retaining GPU
+timestamps, native resource queries, full-state comparisons and completion
+checks. The timing control and candidate share this selector; the control uses
+the original runtime. Separate fully tracked qualified/candidate visits check
+the diagnostic path. Only the timing-only pair determines advancement.
+
+Formatting, release builds, **52 codegen tests and fourteen whole-graph smoke
+tests** pass. The fixed **100 comparisons** comprise fifty timing-only and fifty
+fully tracked comparisons: five pairs per case/mode, ten warmups, at least one
+warmup second and 100 ms prewarming. Selection, complete state, completion,
+one compute dispatch, reset pass and no-fallback checks pass. Maximum model
+error remains 4.66e-9. Tracked logical work remains **22,042/83,312 graph tiles**
+and **97,522 SGD tiles across four phases**.
+
+All **61 sources and native-statistic multisets** match across the timing
+control and both tracked builds. The untracked candidate preserves all
+**56 ordinary sources**; reinserting the original histogram block recovers
+all five complete graph shaders exactly. The tracked template also reconstructs
+the original byte-for-byte. Each comparison pair has identical allocations;
+tracked versus untracked storage differs only by the initial/live histograms,
+`2 × nodes × 256 × 4` bytes. Model scheduler storage is **21,652/91,488 bytes**
+without histograms, versus **337,044/1,170,784 bytes** with them. Payload
+allocations and selected implementations remain exact in every mode.
+
+| Persistent GPU, timing-only | Original runtime | Specialized | Change |
+|---|---:|---:|---:|
+| CI inference | 0.030368 ms | 0.030560 ms | +0.63% |
+| CI forward/backward | 0.064896 ms | 0.066656 ms | +2.71% |
+| CI forward/backward/SGD | 0.071456 ms | 0.071392 ms | −0.09% |
+| Model forward | 4.060544 ms | 4.278752 ms | **+5.37%** |
+| Model training | 12.694336 ms | 15.014016 ms | **+18.27%** |
+
+Both model regressions exceed the fixed 0.5% guardrail. No model wins, so the
+experiment ends without extra repeats, normal completed-step timing, full
+library/oracle/matrix qualification or fresh SDK captures. Ordinary model GPU
+medians remain close: forward 2.920640→2.923744 ms and training
+10.738048→10.728992 ms.
+
+Untracked model registers fall **86→84 forward / 84→80 training**. Native code
+shrinks **102,400→101,504 / 241,664→239,488 bytes**; shared memory remains
+**18,928/29,344 bytes**. These reductions do not predict a gain. Tracked builds
+retain their original resources and **168 participating model workers**.
+Participation is not measured in timing-only mode; the tracked result cannot
+establish untracked participation, occupancy or the native cause of the
+slowdown. No worker cap or shared-memory padding is introduced.
+
+The first analysis script expected an empty list for optimizer histograms in
+cases without appended nodes, but the format returns null. Its script and failed
+log are preserved. Corrected analysis reuses the same captures; no GPU work is
+repeated. All **25 source/dependency hashes**, both qualified binaries and
+fourteen restored smoke tests match. The temporary selector and new shader
+fragment are removed; both forks remain clean.
+
+Local `target/worker-tracking-specialization/` preserves the proof, frozen
+sources/binaries and raw captures. Manifest
+`target/megakernel-results/worker-tracking-specialization/summary.json` independently
+verifies **648 artifacts and 24 completed study scopes**, including the expected
+failed initial analysis, SHA-256
+`310e66a7297152f7e6bc70b80fd90e11d6125a8c51155db10d8fafca125f9bca`.
+Peak job memory is **3,719,647,232 bytes**, with zero memory-limit or OOM events.
+Heavy work uses separate verified 16/20/1 GiB cgroups; GPU work serializes and
+measurements do not overlap builds, copies or heavy analysis. The interrupted
+session's successful build/codegen/smoke receipts are recovered without reruns.
+All launched jobs finish. Qualified runtime `c3ad104`, its memory contract and
+dependency pins remain unchanged; baseline parity is unmet.
 
 ## Completion-epoch control on the current runtime
 

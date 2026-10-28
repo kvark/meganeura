@@ -1090,6 +1090,16 @@ the descriptor-reference repair requires fresh measurements.
   export. Preserve 531 verified artifacts and 23 completed bounded scopes with
   no extra timing or SDK captures. See
   [late claim-metadata fetch](megakernel_whole_graph.md#late-claim-metadata-fetch).
+  Specialize disabled worker histograms out of generated graph shaders, with
+  matched timing-only controls and a separate fully tracked correctness path.
+  Pass 52 codegen tests, fourteen smoke tests and 100 fixed diagnostics; recover
+  all five original graph shaders by exact inverse and preserve all 61 tracked
+  sources/statistics. Timing-only forward/training regress 5.37%/18.27% despite
+  fewer registers and smaller code. Restore all 25 source hashes, both qualified
+  binaries and fourteen smoke tests; remove the temporary harness selector.
+  Preserve 648 verified artifacts and 24 completed study scopes, including the
+  initial analyzer's corrected null-list error, without repeating GPU work.
+  See [disabled worker-tracking specialization](megakernel_whole_graph.md#disabled-worker-tracking-specialization).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
@@ -1101,6 +1111,9 @@ the descriptor-reference repair requires fresh measurements.
   Late full-node fetching is closed under the fixed gate. Use the archived
   failed-claim counts only to motivate distinct policies with a progress proof;
   do not reopen rejected prechecks, exhaustion caches or priority windows.
+  Disabled worker-tracking specialization is closed under its fixed gate.
+  Do not infer untracked participation or occupancy from tracked histograms,
+  or mask its regression with a worker cap or shared-memory padding.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,
