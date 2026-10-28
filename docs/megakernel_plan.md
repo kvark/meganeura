@@ -1013,13 +1013,22 @@ the descriptor-reference repair requires fresh measurements.
   without extra repeats, normal timing or fresh SDK captures. Close parameter
   caching/broadcast/barrier controls for this runtime; no Naga API change is
   justified. See [parameter staging controls](megakernel_whole_graph.md#parameter-staging-controls).
-  Next, audit native cooperative K-loop operand prefetch. First map generated
-  staging names to actual operands, then prove split/tail bounds, alias safety
-  and inactive-lane behavior. Preserve each output's arithmetic order, selected
-  geometry, every existing barrier and packing admission. Do not repeat the
-  rejected scalar prefetch or subgroup-local staging layouts. Require unchanged
-  correctness, resource, completed-step and matched SDK gates for any candidate
-  that advances beyond diagnostics.
+  Audit native cooperative B prefetch after mapping staging names to operands.
+  Preserve tail bounds, alias safety, inactive reads, arithmetic order, selected
+  geometry, every barrier and packing admission. Pass 52 codegen/fourteen smoke
+  tests and fifty diagnostics, with exact inverses of both changed ordinary
+  sources and unchanged graph schedulers. Forward/training GPU diagnostics
+  regress 1.40%/1.50%, failing the fixed gate; ordinary execution stays roughly
+  flat. Registers stay 86 forward and fall 84→83 in training, so register count
+  alone does not explain the result. Restore all 22 source hashes, both qualified
+  binaries and fourteen smoke tests without extra timing or SDK captures. See
+  [native cooperative B prefetch](megakernel_whole_graph.md#native-cooperative-b-prefetch).
+  Do not repeat this lookahead, rejected scalar prefetch or subgroup-local
+  staging layouts. Further overlap or scheduling candidates need a distinct
+  mechanism supported by attribution; code size or barrier-wait percentages
+  alone do not establish a cause. Require unchanged correctness, resource,
+  completed-step and matched SDK gates for any candidate that advances beyond
+  diagnostics.
   Neither empty recorded intervals nor participating workers establish idle
   hardware, recoverable time or occupancy. Do not repeat rejected attention
   ownership, softmax-sharing or scratch-clear probes from the span comparison.

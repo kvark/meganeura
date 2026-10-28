@@ -105,6 +105,12 @@ the emitted post-read barrier improves training by 0.46% against qualified and
 0.33% against a matched loader control, below the required 0.5% against both.
 All four probes are removed; no Naga API change follows from these results.
 
+The subsequent [native cooperative B prefetch](#native-cooperative-b-prefetch)
+also fails its diagnostic gate: forward/training GPU time rises 1.40%/1.50%
+while ordinary execution stays roughly flat. Model registers remain 86 forward
+and fall 84→83 in training, so register count alone does not explain the result.
+The probe is reverted and the qualified runtime remains `c3ad104`.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -1999,8 +2005,8 @@ Temporary Blade hooks are removed and both forks are clean. The combined
 study contains **175 diagnostic comparisons**, no normal completed-step series,
 no fresh SDK captures and no extra repeats after a failed gate. Parameter
 caching and post-read barrier elision are closed for this runtime; they do not
-justify a new Naga API. Next, audit native cooperative operand prefetch while
-preserving arithmetic, all existing barriers, bounds and packing admission.
+justify a new Naga API. The following native cooperative operand prefetch study
+preserves arithmetic, all existing barriers, bounds and packing admission.
 
 Evidence remains under `target/parameter-copy-cache/`,
 `target/parameter-value-cache/`, `target/parameter-read-barrier/` and
@@ -2012,6 +2018,92 @@ Peak study job memory is **3,716,214,784 bytes**, with zero memory-limit or OOM
 events. Every heavy job has a separate verified 16/20/1 GiB cgroup; GPU jobs
 serialize and artifacts stay on local `/x`. Qualified runtime remains `c3ad104`;
 baseline parity remains unmet.
+
+## Native cooperative B prefetch
+
+Starting from `eeb95f8`, this control changes plain 16×16 f16-input cooperative
+matrices without typed layouts, compensation or multiple copies. The separate
+8×8 implementation and scalar matrix templates remain unchanged. It applies
+identically to ordinary and persistent execution and retains selected geometry.
+
+The template's `B_STAGE_0/1` loads the mathematical right-hand B operand into
+`shared_a0/1`; `A_STAGE_0/1` loads the left-hand operand into `shared_b0/1`.
+Normal/AT B loads run along N; BT loads run along K and scatter transposed.
+The probe redirects each B stage's four assignment targets into a private
+vector, retaining every original branch, bounds check, fallback address, zero
+and f16 conversion. The original staging site writes those four values into
+the original shared cells. Narrow prologue variants retain only their first
+B tile. All 64 logical lanes keep their original ownership.
+
+Private values initialize only for a nonempty K range. After the original
+staging barrier, `k - t > 16` guards loading the next stage using `t + 16`.
+Eligible kernels have no split range; original tail bounds remain. The trailing
+reuse barrier still completes all current shared reads before the next shared
+writes. Cooperative loads, MMA order, accumulators, A prologues and epilogues
+are unchanged. Inputs remain read-only for the handler, whose outputs are
+written after its K loop. Graph alias dependencies and inactive-read guards
+still cover the entire handler. No shared allocation, barrier, fence or queue
+operation is added or removed.
+
+The probe passes **52 codegen tests and fourteen whole-graph smoke tests**.
+Fifty fixed diagnostics use five interleaved pairs per case/mode, ten warmups,
+at least one warmup second and 100 ms prewarming. Every selection, allocation,
+state-budget, optimizer, logical-work, one-dispatch and no-fallback check passes.
+Maximum error remains 4.66e-9. All 256 requested workers remain enabled.
+
+All **nineteen CI shaders** and **38 ordinary model shaders** are byte-identical.
+The two changed ordinary model sources have exact inverses: redirecting the
+private components back to their original shared targets and restoring the
+staging positions recovers every original source byte. One handler changes in
+each model graph. Every other function, including the scheduler, remains exact;
+changed signatures and barrier counts match. All storage reads in the changed
+packed handlers retain explicit inactive-lane guards. That graph audit is not
+a byte-exact inverse of Naga's normalized changed handlers.
+
+| Persistent GPU diagnostic, ms | Qualified | B prefetch | Change |
+|---|---:|---:|---:|
+| CI inference | 0.030528 | 0.030880 | +1.15% |
+| CI forward/backward | 0.068128 | 0.067744 | −0.56% |
+| CI forward/backward/SGD | 0.073856 | 0.072256 | −2.17% |
+| SmolVLA forward | 4.077376 | 4.134464 | +1.40% |
+| SmolVLA forward/backward/SGD | 12.785120 | 12.977408 | +1.50% |
+
+Ordinary model GPU medians change 2.922720→2.920512 ms forward and
+10.737760→10.754784 ms training. Native model registers are **86→86 / 84→83**,
+shared memory remains **18,928 / 29,344 bytes**, and code grows
+**102,400→104,960 / 241,664→247,040 bytes**. Both model phases retain 168
+participating workers and 22,042/83,312 logical graph tiles; training also
+executes all 97,522 optimizer tiles across four appended phases. These resource
+observations do not identify an instruction-level cause or establish occupancy.
+CI shaders and native resources are unchanged despite small timing differences.
+
+Both model phases exceed the predeclared **0.5% regression guardrail** and
+neither improves 0.5%, so the probe does not advance. There are no additional
+repeats, full library/oracle/Metal qualification, normal completed-step series
+or fresh SDK captures. The small diagnostic samples determine this decision;
+they do not establish completed-step performance changes.
+
+The initial source audit incorrectly required an inactive-lane guard on every
+handler, including unchanged full-width handlers without inactive lanes. Its
+script and failed log are preserved. The corrected audit compares unchanged
+functions byte-for-byte and checks every storage read in changed packed
+handlers. Only analysis is rerun; no GPU measurement is repeated.
+
+**The probe is reverted.** All 22 source/dependency hashes, both qualified
+binary hashes and fourteen restored smoke tests match. Both compiler forks
+remain clean. The result closes this native B lookahead control; it does not
+justify another fence API, removal of existing barriers, or an instruction-cache
+diagnosis from code size alone. Further candidates must pass the same fixed
+correctness, resource, completed-step and matched SDK gates.
+
+Evidence remains under `target/coop-b-prefetch/`. Manifest
+`target/megakernel-results/coop-b-prefetch/summary.json` independently verifies
+**359 artifacts and seventeen completed study scopes**, SHA-256
+`05f92a599a0980086ef2fa400113df9d778f41ea25e7c6de4ec81c526b2ef39b`.
+Peak study job memory is **3,713,859,584 bytes**, with zero memory-limit or OOM
+events. All heavy work runs in separate verified 16/20/1 GiB cgroups, GPU jobs
+serialize, and artifacts remain on local `/x`. Qualified runtime remains
+`c3ad104`; baseline parity remains unmet.
 
 ## Completion-epoch control on the current runtime
 
