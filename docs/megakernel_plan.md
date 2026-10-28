@@ -999,11 +999,27 @@ the descriptor-reference repair requires fresh measurements.
   fourteen smoke tests without extra timing or SDK captures. The memory contract
   and Naga API remain unchanged. See the
   [successor release-fence control](megakernel_whole_graph.md#successor-release-fence-control).
-  Next, audit immutable parameter copies on consecutive claims for the same
-  node. Preserve uniform broadcasts, node transitions, all lanes and existing
-  shared state; do not repeat the rejected combined-broadcast controls. Require
-  the unchanged correctness, resource, completed-step and SDK gates for any
-  candidate that advances beyond diagnostics.
+  Audit immutable parameter reuse on consecutive claims. Copy caching leaves
+  model diagnostics flat; complete value caching increases forward registers
+  from 86 to 100 and GPU time by 2.01%. Both pass 52 codegen/fourteen smoke tests
+  but fail their fixed diagnostic gates. Preserve the direct shared-read
+  control's two packing admission failures and stop it before GPU execution.
+  Audit exact emitted post-read barrier elision with a matched loader control:
+  44 validated SPIR-V pairs, fourteen smoke tests and 75 comparisons preserve
+  all source, state and work checks. Training improves 0.46% against qualified
+  and 0.33% against the loader control, below the 0.5% gate against both.
+  Restore every probe, both compiler forks, 22 source hashes, both qualified
+  binaries and restored smoke tests. Preserve all 175 diagnostics and failures
+  without extra repeats, normal timing or fresh SDK captures. Close parameter
+  caching/broadcast/barrier controls for this runtime; no Naga API change is
+  justified. See [parameter staging controls](megakernel_whole_graph.md#parameter-staging-controls).
+  Next, audit native cooperative K-loop operand prefetch. First map generated
+  staging names to actual operands, then prove split/tail bounds, alias safety
+  and inactive-lane behavior. Preserve each output's arithmetic order, selected
+  geometry, every existing barrier and packing admission. Do not repeat the
+  rejected scalar prefetch or subgroup-local staging layouts. Require unchanged
+  correctness, resource, completed-step and matched SDK gates for any candidate
+  that advances beyond diagnostics.
   Neither empty recorded intervals nor participating workers establish idle
   hardware, recoverable time or occupancy. Do not repeat rejected attention
   ownership, softmax-sharing or scratch-clear probes from the span comparison.

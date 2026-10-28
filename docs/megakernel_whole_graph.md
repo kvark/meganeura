@@ -97,6 +97,14 @@ diagnostic gate: forward improves 0.60% while training regresses 0.67%, exceedin
 the 0.5% guardrail. The one-fence deletion is reverted without extra timing or
 SDK captures. Qualified runtime remains `c3ad104`.
 
+The following [parameter staging controls](#parameter-staging-controls) also
+establish no gain. Caching copies leaves model diagnostics flat; caching the
+broadcast value increases forward registers and time. A direct shared-array
+read fails existing packing admission tests before GPU execution. Removing only
+the emitted post-read barrier improves training by 0.46% against qualified and
+0.33% against a matched loader control, below the required 0.5% against both.
+All four probes are removed; no Naga API change follows from these results.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -1853,10 +1861,9 @@ Only analysis is rerun; no GPU capture is repeated.
 **The candidate is reverted.** All 22 archived source/dependency hashes, the
 Blade source hash, both qualified binaries and fourteen restored smoke tests
 match. Both forks are clean. The retained memory contract is unchanged.
-Next, audit repeated immutable parameter staging on consecutive claims for the
-same node. Any probe must preserve uniform broadcasts, transitions between
-nodes, all lanes and existing shared state; the earlier combined-broadcast
-controls are not evidence that caching copies will help.
+The following parameter study audits repeated immutable parameter staging on
+consecutive claims for the same node, preserving transitions, all lanes and
+existing shared state.
 
 Evidence remains under `target/successor-release-fence/`. Manifest
 `target/megakernel-results/successor-release-fence/summary.json` independently
@@ -1867,6 +1874,144 @@ output; all other study scope receipts are raw logs. Peak job memory is
 **3,721,666,560 bytes**, with zero memory-limit or OOM events. Heavy work uses
 separate verified 16/20/1 GiB cgroups, GPU jobs serialize, artifacts stay on
 local `/x`, and every launched job finishes. Baseline parity remains unmet.
+
+## Parameter staging controls
+
+Four controls start from `9fad2a9`, retaining qualified runtime `c3ad104` as
+their baseline. They investigate the immutable per-node parameter copy and
+uniform broadcast before handler entry. None advances beyond its fixed
+diagnostic gate, and all source and dependency changes are restored.
+
+First, complete archived claim traces estimate opportunities for consecutive
+same-node reuse. Two forward traces each contain 15,898 claims; 3,741/3,744
+claims (23.53%/23.55%) could reuse the previous node's parameters. Two training
+traces each contain 94,238 graph/optimizer claims; 47,834/46,080
+(50.76%/48.90%) could reuse them. Nonconsecutive node revisits remain misses.
+These are historical instrumented claim orders, not measured candidate cache
+hit rates, traffic reductions or recoverable time.
+
+**Copy-only cache.** A function-local node ID guards the strided copy from
+immutable storage parameters into the existing shared parameter array. The
+`workgroupUniformLoad` remains unconditional. All physical lanes see the same
+broadcast ticket; the first valid claim and every node transition refresh the
+array. Idle tickets leave the cache untouched, and each dispatch initializes
+it again. No shared state, handler arithmetic, fence or selected geometry
+changes. The control passes 52 codegen and fourteen whole-graph smoke tests.
+
+**Complete value cache.** A second control keeps both the node ID and the
+returned parameter array in function-local variables across claims, skipping
+the copy and uniform broadcast on a hit. All lanes start with the same ID and
+update it to the same broadcast node ID, preserving uniform control flow by
+induction. Existing Naga validation flags and checks remain unchanged. Naga's
+specific `WorkGroupUniformLoad` control-flow validation is incomplete, so
+passing tests alone is not the uniformity argument. This control also passes
+52 codegen and fourteen whole-graph smoke tests.
+
+Each cache control runs fifty production diagnostics: five interleaved pairs
+per case/mode, ten warmups, at least one warmup second and 100 ms prewarming.
+All 56 ordinary shader sources remain exact; the five graph sources differ
+only by the audited cache edit. Native ordinary-statistic multisets, selected
+implementations, allocation, optimizer work, state budgets and logical work
+match. Every case keeps one dispatch, no fallback and all 256 enabled workers.
+
+| Persistent GPU diagnostic, ms | Copy control | Copy cache | Value control | Value cache |
+|---|---:|---:|---:|---:|
+| CI inference | 0.031296 | 0.031104 | 0.031104 | 0.031264 |
+| CI forward/backward | 0.067552 | 0.067712 | 0.067584 | 0.067968 |
+| CI forward/backward/SGD | 0.073952 | 0.072064 | 0.072736 | 0.073760 |
+| SmolVLA forward | 4.072736 | 4.072320 | 4.079712 | 4.161568 |
+| SmolVLA forward/backward/SGD | 12.809696 | 12.837408 | 12.741952 | 12.768320 |
+
+Copy caching changes forward/training by **−0.01%/+0.22%**; value caching by
+**+2.01%/+0.21%**. Neither meets the required 0.5% model improvement, and value
+caching also exceeds the 0.5% model regression guardrail. Forward/training
+registers change from 86/84 to **88/84** for copy caching and **100/92** for
+value caching. Shared memory remains 18,928/29,344 bytes. Native model code
+grows from 102,400/241,664 bytes to 102,528/241,920 and 109,952/242,944 bytes,
+respectively. These results do not establish a completed-step change or prove
+that register growth alone causes the regression.
+
+**Direct shared-array read.** A third source control replaces the uniform load
+with a workgroup barrier followed by a direct array read. Fifty codegen tests
+pass, but two existing packing admission tests fail: the mixed-geometry matrix
+batch becomes 1 instead of 4, and scalar attention loses its required packing
+axis. The direct read loses the uniform-value classification needed by the
+scope-aware cooperative operand check. The probe stops before GPU execution;
+no validation or assertions are weakened. Previously captured control files
+are explicitly marked as reused provenance, not new measurements or a
+completed candidate SPIR-V audit. Its unused Blade dump hook is removed.
+
+**Emitted post-read barrier.** A final application-specific counterfactual
+preserves every WGSL source and Naga validation result. A temporary Blade loader
+captures emitted SPIR-V and, only for the graph entry point, removes the
+`OpControlBarrier` immediately after the parameter-array load. A matched loader
+control leaves the original bytes untouched. Both modes use the same frozen
+binary and debug emission options; the archived qualified binary supplies a
+third control. This is a diagnostic transform, not a general compiler rule or
+a new WGSL memory contract.
+
+Before Vulkan sees each module, the transform verifies that the parameter load
+is bracketed by matching workgroup execution/memory barriers with semantics
+`0x108`, that the shared parameter array has only the expected write site,
+and that every control-flow path from the removed barrier to another write
+crosses a retained workgroup barrier or terminates. The preceding barrier
+still orders all parameter writes; intervening handler scratch is disjoint.
+All storage fences remain. This application-specific ordering audit supplements
+the [uniform-load synchronization contract](https://gpuweb.github.io/gpuweb/wgsl/#workgroupUniformLoad-builtin);
+it does not change that contract or constitute a general optimization proof.
+
+Fourteen GPU smoke tests pass with elision. All **44 original/output module
+pairs** validate before pipeline creation. Independent checks verify byte-exact
+controls and recover every elided original by reinserting only that instruction.
+All five benchmark graph sources have matching original non-debug SPIR-V
+between loader modes. Seventy-five fixed diagnostics compare qualified,
+loader-control and elided modes, using the same warmup and pairing protocol.
+All 61 shader sources match across modes. Qualified/control native statistics
+match exactly; ordinary native-statistic multisets match across all three.
+State, optimizer, selection, allocation, one-dispatch and no-fallback checks pass.
+
+| Persistent GPU diagnostic, ms | Qualified | Loader control | Barrier elided |
+|---|---:|---:|---:|
+| CI inference | 0.031040 | 0.031072 | 0.030304 |
+| CI forward/backward | 0.067520 | 0.067392 | 0.067808 |
+| CI forward/backward/SGD | 0.072256 | 0.072320 | 0.072320 |
+| SmolVLA forward | 4.080512 | 4.074720 | 4.080896 |
+| SmolVLA forward/backward/SGD | 12.760128 | 12.743936 | 12.701280 |
+
+Elision changes forward by **+0.01%/+0.15%** against qualified/loader control,
+and training by **−0.46%/−0.33%**. The predeclared gate requires the same model
+phase to improve at least 0.5% against both controls, neither model to regress
+over 0.5% against either, and no CI regression over 3%. **It does not advance.**
+Model registers and shared memory remain 86/84 and 18,928/29,344 bytes;
+forward code stays 102,400 bytes and training grows 128 bytes to 241,792.
+Both model phases have 168 participating workers out of 256 enabled, which
+does not by itself establish occupancy.
+
+The initial freeze rejected the local Blade override's `Cargo.lock` change.
+Its script and failed log are preserved. The corrected freeze admits exactly
+the single removed git-source line for the overridden Blade package, hashes
+the probe lockfile and rejects every other change. No measurement is repeated.
+
+**All four controls are reverted.** Every study verifies 22 restored main
+source/dependency hashes, both qualified binary hashes and fourteen restored
+smoke tests. The direct-read study also reruns all 52 restored codegen tests.
+Temporary Blade hooks are removed and both forks are clean. The combined
+study contains **175 diagnostic comparisons**, no normal completed-step series,
+no fresh SDK captures and no extra repeats after a failed gate. Parameter
+caching and post-read barrier elision are closed for this runtime; they do not
+justify a new Naga API. Next, audit native cooperative operand prefetch while
+preserving arithmetic, all existing barriers, bounds and packing admission.
+
+Evidence remains under `target/parameter-copy-cache/`,
+`target/parameter-value-cache/`, `target/parameter-read-barrier/` and
+`target/parameter-post-barrier-spv/`. Combined manifest
+`target/megakernel-results/parameter-staging/summary.json` independently verifies
+**1,491 artifact hashes and 49 completed study scopes**, SHA-256
+`69cc88023adad8a9c2e38f40fdff0d2ab164af69242200b6d681e3ebb7db142f`.
+Peak study job memory is **3,716,214,784 bytes**, with zero memory-limit or OOM
+events. Every heavy job has a separate verified 16/20/1 GiB cgroup; GPU jobs
+serialize and artifacts stay on local `/x`. Qualified runtime remains `c3ad104`;
+baseline parity remains unmet.
 
 ## Completion-epoch control on the current runtime
 
