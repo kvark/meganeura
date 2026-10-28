@@ -157,6 +157,13 @@ despite fewer registers and smaller native programs. Fully tracked shaders and
 statistics remain exact. The candidate and temporary benchmark selector are
 removed; the experiment does not establish the native cause of the slowdown.
 
+The following [single-predecessor publication](#single-predecessor-publication)
+replaces a dependency decrement with an atomic store only when one producer
+owns that signal. It preserves every fence, passes full qualification and
+improves forward GPU diagnostics 0.59% against qualified execution. However,
+1,000 completed-step comparisons establish no absolute model gain under both
+protocols. The candidate is restored without extra timing or SDK captures.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -2724,6 +2731,114 @@ measurements do not overlap builds, copies or heavy analysis. The interrupted
 session's successful build/codegen/smoke receipts are recovered without reruns.
 All launched jobs finish. Qualified runtime `c3ad104`, its memory contract and
 dependency pins remain unchanged; baseline parity is unmet.
+
+## Single-predecessor publication
+
+Starting from `e0dbc90`, this candidate changes dependency publication only for
+nodes with exactly one predecessor. Bit 31 of an immutable edge word marks that
+case; the original checked three-word counter allocation already bounds every
+node index below that bit. Masking the flag recovers the original destination.
+The unique predecessor's unique last-tile winner stores zero to the dependency
+counter instead of decrementing its known initial value of one. Multiple-
+predecessor nodes retain the original RMW and error checks. Edges, initial
+counters, ready bits, storage capacity and reset sizes remain unchanged.
+
+Every original fence remains. The last-tile fence still collects all producer
+tiles before publication. A single predecessor has no other predecessor's
+dependency sequence to acquire; the retained publication fence and ready-bit
+RMW still precede consumer acquisition. Payload lanes retain their own
+availability/visibility operations and canonical descriptors. Claims, arithmetic,
+geometry, RAW/WAR/WAW ordering, workgroup barriers, epoch ordering and all 256
+requested workers remain. The argument uses the existing
+[Vulkan fence synchronization rules](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html#memory-model-synchronizes-with);
+it does not introduce a Naga interface or alter the qualified memory contract.
+
+An exhaustive finite check covers **33,867 topologically ordered DAGs through
+six nodes, 462,033 reachable completion states and 707,952 transitions**.
+It verifies identical counters, readiness and unique publication. This is not a
+formal Vulkan execution model. A host-only export independently checks every
+encoded edge, incoming count, metadata offset, initial counter, ready/summary
+bit and logical grid in **204 smoke records plus five benchmark records per
+mode**. Decoding the flags recovers identical control/candidate records,
+including parameters and queue contents. Current forward/training topology has
+**154/527 nodes, 161/698 edges and 127/383 single-predecessor destinations**.
+
+One frozen probe binary compares flags disabled with flags enabled. Both modes
+have identical shaders and allocations; the qualified runtime is a third
+control. All **61 probe sources and native-statistic multisets** match between
+flag modes, all **56 ordinary sources** match qualified, and inverse substitutions
+recover all five qualified graph shaders and the original worker template.
+Model resources remain **86/84 registers, 18,928/29,344 shared bytes and 168
+participating workers**. Probe code grows 256 bytes in each model phase.
+
+The fixed **75 diagnostics** use five pairs per five-case visit, ten warmups,
+at least one warmup second and 100 ms prewarming. All state, selection,
+allocation, completion, optimizer, single-dispatch and no-fallback checks pass;
+maximum model error remains 4.66e-9. Work remains **22,042/83,312 graph tiles**
+and **97,522 SGD tiles in four phases**.
+
+| Persistent GPU diagnostic | Qualified | Flags disabled | Atomic store |
+|---|---:|---:|---:|
+| Model forward | 4.075104 ms | 4.077024 ms | 4.051008 ms |
+| Model training | 12.735968 ms | 12.902336 ms | 12.704960 ms |
+
+Forward improves **0.59% against qualified / 0.64% against disabled flags**;
+training improves **0.24% / 1.53%**. CI stays within its regression guardrail.
+This passes the predeclared diagnostic screen, without establishing retention.
+
+After removing the selector and export, production passes **676 library tests
+(eight ignored), 168 strict whole-graph oracle cases, 51 matrix regressions and
+fourteen whole-graph smoke tests**, plus Clippy, formatting, release builds and
+Metal-target compilation. The probe also passed 52 codegen tests and fourteen
+smoke tests per flag mode. No Metal GPU or additional hardware is qualified.
+
+An output-only Blade hook captures the five actual graph SPIR-V modules supplied
+to Vulkan. All validate. The control-flow audit verifies that the per-edge fence
+dominates both branches, the atomic store occurs only when bit 31 is set, and
+the original decrement occurs only otherwise. Both use QueueFamily scope and
+relaxed semantics; the store writes zero and the decrement subtracts one. All
+six/seven entry-point fences retain QueueFamily scope and `0x6048` semantics.
+The last-tile fence dominates the fan-out loop, the publication fence remains,
+and the loop writes only queue atomics and function locals. This is emitted
+SPIR-V evidence, not native ISA inspection or a complete memory-model proof.
+
+Five audit comparisons bridge back to production with all 61 sources, native
+statistics, allocation and execution metadata exact; complete-state checks pass.
+Removing the hook restores both frozen production binaries exactly; both compiler forks
+remain clean. Normal timing uses those production binaries without diagnostics.
+
+The fixed **1,000 completed-step comparisons** comprise 500 original and 500
+100 ms prewarmed comparisons. Each protocol visits qualified/candidate/candidate/
+qualified, with 25 interleaved ordinary/persistent pairs per case/visit. All
+samples and outliers remain. The 10,000-resample bootstrap uses seed 2026102619.
+
+| Absolute persistent wall time | Qualified | Candidate | Candidate / qualified, 95% interval |
+|---|---:|---:|---:|
+| Forward, original | 4.644953 ms | 4.637089 ms | 0.9983 [0.9897, 1.0561] |
+| Training, original | 15.013361 ms | 15.133472 ms | 1.0080 [0.9926, 1.0207] |
+| Forward, prewarmed | 4.319372 ms | 4.318871 ms | 0.9999 [0.9873, 1.0048] |
+| Training, prewarmed | 13.240755 ms | 13.097884 ms | 0.9892 [0.9776, 1.0028] |
+
+**No model phase establishes an absolute gain under both protocols.** No
+persistent regression is statistically established either. Prewarmed CI backward
+and SGD improve 2.10%/3.37%, but these do not satisfy the model acceptance
+criterion. Normalized forward ratios improve 3.62%/2.11% with intervals below
+one while ordinary forward medians move +11.39%/+1.55%. Those ratios cannot
+replace the inconclusive absolute persistent measurements. The failed gate ends
+the experiment without extra timing or fresh SDK captures.
+
+All **25 source/dependency hashes**, both qualified binaries and fourteen
+restored smoke tests match. No selector, export or compiler hook remains.
+Local `target/single-predecessor-publication/` preserves the proof, model checker,
+metadata, frozen sources/binaries, SPIR-V and every sample. Manifest
+`target/megakernel-results/single-predecessor-publication/summary.json` independently
+verifies **1,175 artifacts and 54 completed study scopes**, SHA-256
+`b1acf1bfdd9e9f1e103f6bbcb28da0b5a45a42c199fb1593185999121ebcc801`.
+Peak job memory is **3,719,016,448 bytes**, with zero memory-limit or OOM events.
+Heavy work uses separate verified 16/20/1 GiB cgroups; GPU jobs serialize,
+measurements do not overlap builds/copies/heavy analysis, and artifacts remain
+on local `/x`. Every launched job finishes. Qualified runtime `c3ad104` and its
+memory contract remain unchanged; baseline parity is unmet.
 
 ## Completion-epoch control on the current runtime
 

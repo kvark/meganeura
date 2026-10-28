@@ -1100,6 +1100,19 @@ the descriptor-reference repair requires fresh measurements.
   Preserve 648 verified artifacts and 24 completed study scopes, including the
   initial analyzer's corrected null-list error, without repeating GPU work.
   See [disabled worker-tracking specialization](megakernel_whole_graph.md#disabled-worker-tracking-specialization).
+  Test replacing dependency RMWs with atomic stores only for single-predecessor
+  destinations, retaining every fence and the original multi-predecessor path.
+  Audit 33,867 finite DAGs, 707,952 transitions and 209 metadata records per mode.
+  The fixed 75 diagnostics improve forward 0.59%/0.64% against qualified and an
+  identical-shader zero-flag control. Remove host hooks, pass full library,
+  strict oracle, matrix, smoke, Clippy and Metal compilation qualification,
+  and validate five emitted SPIR-V modules plus five audit comparisons.
+  The fixed 1,000 normal comparisons establish no absolute model gain under
+  both protocols; normalized forward gains coincide with slower ordinary
+  controls. Restore all 25 source hashes, both binaries and fourteen smoke
+  tests without extra timing or SDK captures. Preserve 1,175 verified artifacts
+  and 54 completed bounded scopes. See
+  [single-predecessor publication](megakernel_whole_graph.md#single-predecessor-publication).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
@@ -1114,6 +1127,9 @@ the descriptor-reference repair requires fresh measurements.
   Disabled worker-tracking specialization is closed under its fixed gate.
   Do not infer untracked participation or occupancy from tracked histograms,
   or mask its regression with a worker cap or shared-memory padding.
+  Single-predecessor atomic-store publication is closed under the fixed
+  completed-step gate. Do not substitute normalized forward ratios or CI gains
+  for the required absolute model improvement under both protocols.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,
