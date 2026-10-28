@@ -935,6 +935,8 @@ enum Variant {
         ShaderEntry,
         crate::codegen::WorkgroupMatmulShape,
         crate::codegen::MatrixTypes,
+        /// Guard global accesses to the final, incomplete row tile.
+        bool,
     ),
     CoopTiled(
         ShaderEntry,
@@ -1050,7 +1052,7 @@ impl Variant {
             | Variant::Attention(ref e, _, _)
             | Variant::CoopTyped(ref e, _, _)
             | Variant::CoopConv(ref e, _, _)
-            | Variant::CoopWorkgroup(ref e, _, _)
+            | Variant::CoopWorkgroup(ref e, _, _, _)
             | Variant::CoopTiled(ref e, _, _, _)
             | Variant::SplitMatmul(ref e, _, _, _)
             | Variant::SpecializedConv(ref e, _, _, _)
@@ -1082,8 +1084,9 @@ impl Variant {
             Variant::WinogradMatmul(ref entry, storage, tile) => {
                 format!("{entry:?}:{storage:?}-{tile:?}")
             }
-            Variant::CoopWorkgroup(ref e, shape, types) => {
-                format!("{e:?}:workgroup-{shape:?}-{types:?}")
+            Variant::CoopWorkgroup(ref e, shape, types, row_bounds) => {
+                let suffix = if row_bounds { "-row-bounds" } else { "" };
+                format!("{e:?}:workgroup-{shape:?}-{types:?}{suffix}")
             }
             Variant::CoopTyped(ref e, types, staging) => {
                 use crate::codegen::MatrixTypes;
@@ -1932,13 +1935,15 @@ impl Pipelines {
                     gpu.capabilities().subgroup_size,
                 )
             }
-            Variant::CoopWorkgroup(_, shape, types) => {
-                if !shape.supports(&gpu.capabilities(), types)
-                    || !dispatch.mnk().is_some_and(|(m, n, k)| shape.fits(m, n, k))
-                {
+            Variant::CoopWorkgroup(_, shape, types, row_bounds) => {
+                if !dispatch.mnk().is_some_and(|(m, n, k)| {
+                    shape.supports_dimensions(&gpu.capabilities(), types, m, n, k)
+                }) {
                     return Err("unsupported workgroup cooperative product".to_owned());
                 }
-                crate::codegen::generate_workgroup_matmul(group, shape, types)
+                crate::codegen::generate_workgroup_matmul_with_row_bounds(
+                    group, shape, types, row_bounds,
+                )
             }
             Variant::CoopTiled(_, shape, splits, _) => {
                 let config = cooperative();
@@ -2232,6 +2237,9 @@ impl Pipelines {
                 entry,
                 shape,
                 types.unwrap_or(crate::codegen::MatrixTypes::F32_AS_F16),
+                dispatch
+                    .mnk()
+                    .is_some_and(|(m, _, _)| shape.rows != 0 && !m.is_multiple_of(shape.rows)),
             );
         }
         if let crate::compile::Kernel::CooperativeTyped { types, .. } = dispatch.kernel {
@@ -5195,6 +5203,28 @@ mod variant_tests {
         Dispatch, HorizMatMulKind, Pipelines, ShaderEntry, Variant, epilogue_pipeline_key,
         epilogue_tile, select_variants,
     };
+
+    #[test]
+    fn ragged_workgroup_rows_have_a_distinct_pipeline() {
+        let shape = crate::codegen::WorkgroupMatmulShape {
+            rows: 32,
+            columns: 64,
+            k_stage: 32,
+            threads: 64,
+        };
+        let make = |m| Dispatch {
+            shader: ShaderEntry::MatMul,
+            params: vec![m, 384, 384, 0],
+            kernel: crate::compile::Kernel::CooperativeWorkgroup {
+                shape,
+                splits: 1,
+                types: Some(crate::codegen::MatrixTypes::F32_AS_F16),
+            },
+            ..Default::default()
+        };
+        assert_ne!(Pipelines::key(&make(1500)), Pipelines::key(&make(1536)));
+        assert_eq!(Pipelines::key(&make(1500)), Pipelines::key(&make(1476)));
+    }
 
     fn relu_epilogue() -> crate::compile::MatMulEpilogue {
         crate::compile::MatMulEpilogue {

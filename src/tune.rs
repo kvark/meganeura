@@ -526,7 +526,11 @@ impl MatmulTile {
                 return [class.m / 64, class.n / shape.columns, splits];
             }
             Self::CooperativeWorkgroup { shape, splits } => {
-                return [class.m / shape.rows, class.n / shape.columns, splits];
+                return [
+                    class.m.div_ceil(shape.rows),
+                    class.n / shape.columns,
+                    splits,
+                ];
             }
             // Checked tiles use X for rows, Y for columns, over 32x32 blocks.
             Self::CooperativeChecked { splits } => {
@@ -554,7 +558,7 @@ impl MatmulTile {
                 || class.conv2d.is_some()
                 || !class.shader.is_matmul()
                 || class.weight_format != crate::compile::WeightFormat::F32
-                || !shape.fits(class.m, class.n, class.k)
+                || !shape.fits_with_row_bounds(class.m, class.n, class.k)
                 || splits == 0
                 || splits > class.k / shape.k_stage
                 || (splits > 1) != class.split_k
@@ -562,6 +566,7 @@ impl MatmulTile {
             {
                 return None;
             }
+            class.m.checked_mul(class.n)?.checked_mul(splits)?;
             let mut sizes = class.buffer_sizes()?;
             *sizes.last_mut()? = sizes.last()?.checked_mul(splits as usize)?;
             return crate::compile::workgroups_within_portable_limits(self.workgroups(class))
@@ -1774,6 +1779,41 @@ pub(crate) fn decide<Class, Choice: Copy>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ragged_rows_offer_workgroup_products_without_padded_bindings() {
+        use crate::codegen::{MatrixTypes, WorkgroupMatmulShape};
+        let mut problem = class(1500, 384, 384);
+        problem.requires_full_precision = false;
+        problem.matrix_types = Some(MatrixTypes::F32_AS_F16);
+        problem.binding_bytes = problem.buffer_sizes().unwrap();
+        let shape = WorkgroupMatmulShape {
+            rows: 32,
+            columns: 64,
+            k_stage: 32,
+            threads: 64,
+        };
+        let tile = MatmulTile::CooperativeWorkgroup { shape, splits: 1 };
+        let initial = MatmulTile::CooperativeChecked { splits: 1 };
+        assert!(
+            problem.challengers(initial, None).contains(&tile),
+            "profiled M1500 must reach a bounded workgroup candidate"
+        );
+        assert_eq!(tile.workgroups(&problem), [47, 6, 1]);
+        assert_eq!(tile.buffer_sizes(&problem), problem.buffer_sizes());
+        problem.split_k = true;
+        *problem.binding_bytes.last_mut().unwrap() *= 2;
+        let split = MatmulTile::CooperativeWorkgroup { shape, splits: 2 };
+        assert!(split.fits(&problem));
+        assert_eq!(split.workgroups(&problem), [47, 6, 2]);
+        problem.m = 65536;
+        problem.n = 32768;
+        let overflow = MatmulTile::CooperativeWorkgroup { shape, splits: 4 };
+        assert!(
+            overflow.buffer_sizes(&problem).is_none(),
+            "partial shader indices cannot wrap u32"
+        );
+    }
 
     fn dispatch() -> Dispatch {
         Dispatch {

@@ -13,6 +13,7 @@ pub(crate) mod winograd;
 mod workgroup;
 pub use coop_tiled::{CooperativeMatmulShape, generate_tiled_coop_matmul};
 pub use matrix_types::MatrixTypes;
+pub(crate) use workgroup::generate_workgroup_matmul_with_row_bounds;
 pub use workgroup::{WorkgroupMatmulShape, generate_workgroup_matmul};
 
 /// Forward attention staging and lane layout, independent of the EPT cap.

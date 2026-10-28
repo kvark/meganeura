@@ -41,7 +41,7 @@ pub struct KernelMemo {
 
 // Bump when kernel generation, qualification or decision semantics change,
 // including changes between package releases. This also versions the memo schema.
-const KERNEL_MEMO_REVISION: u32 = 12;
+const KERNEL_MEMO_REVISION: u32 = 13;
 
 /// Undecided classes predicted to total less than this share of the plan are
 /// not probed. Kernel winners are accepted together, so classes well below
@@ -452,7 +452,14 @@ pub(super) fn tile_module(
             MatmulTile::CooperativeWorkgroup { shape, .. } => {
                 let types = super::checked_matrix_types(dispatch)
                     .unwrap_or(crate::codegen::MatrixTypes::F32_AS_F16);
-                crate::codegen::generate_workgroup_matmul(entry.shader_group(), shape, types)
+                crate::codegen::generate_workgroup_matmul_with_row_bounds(
+                    entry.shader_group(),
+                    shape,
+                    types,
+                    dispatch
+                        .mnk()
+                        .is_some_and(|(m, _, _)| shape.rows != 0 && !m.is_multiple_of(shape.rows)),
+                )
             }
             MatmulTile::SpecializedConv { .. } | MatmulTile::Gemv(_) | MatmulTile::Scalar(_) => {
                 unreachable!()
@@ -510,10 +517,17 @@ fn retain_tunable_classes(
             MatmulTile::CooperativeTiled { shape, .. } => {
                 shared_limit == 0 || shape.shared_bytes() <= shared_limit
             }
-            MatmulTile::CooperativeWorkgroup { shape, .. } => class
-                .key
-                .effective_matrix_types()
-                .is_some_and(|types| shape.supports(capabilities, types)),
+            MatmulTile::CooperativeWorkgroup { shape, .. } => {
+                class.key.effective_matrix_types().is_some_and(|types| {
+                    shape.supports_dimensions(
+                        capabilities,
+                        types,
+                        class.key.m,
+                        class.key.n,
+                        class.key.k,
+                    )
+                })
+            }
             _ => true,
         });
     }
@@ -2776,7 +2790,8 @@ mod tests {
             (None, false, F16, 32768, 1024, 256, false),
             (Some(F16), false, F16, 32768, 16, 256, false),
             (Some(F16), false, F16, 0, 1024, 256, false),
-            (Some(F16), false, F16, 32768, 1024, 257, false),
+            (Some(F16), false, F16, 32768, 1024, 257, true),
+            (Some(F16), false, F16, 16384, 1024, 257, false),
         ] {
             let mut caps = bg::Capabilities {
                 shader_float16: true,

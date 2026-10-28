@@ -52,18 +52,20 @@ pub(super) fn select(
             || dispatch.weight_format != WeightFormat::F32
             || (types.is_none() && dispatch.schedule_locked)
             || !(types.is_some() || f32)
-            || !shape.supports(caps, types.unwrap_or(MatrixTypes::F32_AS_F16))
         {
             continue;
         }
         if let Some((m, n, k)) = dispatch.mnk() {
-            if shape.fits(m, n, k) && splits > 0 && splits <= k / shape.k_stage {
+            if shape.supports_dimensions(caps, types.unwrap_or(MatrixTypes::F32_AS_F16), m, n, k)
+                && splits > 0
+                && splits <= k / shape.k_stage
+            {
                 dispatch.kernel = Kernel::CooperativeWorkgroup {
                     shape,
                     types,
                     splits,
                 };
-                dispatch.workgroups = [m / shape.rows, n / shape.columns, splits];
+                dispatch.workgroups = [m.div_ceil(shape.rows), n / shape.columns, splits];
             }
         }
     }
@@ -160,7 +162,8 @@ mod tests {
         };
         for (dims, policy, device, expected) in [
             ((128, 256, 128), CoopPolicy::AllowF16, caps(), true),
-            ((129, 256, 128), CoopPolicy::AllowF16, caps(), false),
+            ((129, 256, 128), CoopPolicy::AllowF16, caps(), true),
+            ((128, 257, 128), CoopPolicy::AllowF16, caps(), false),
             ((128, 256, 129), CoopPolicy::AllowF16, caps(), false),
             ((128, 256, 128), CoopPolicy::NativeF32, caps(), false),
             ((128, 256, 128), CoopPolicy::Auto, caps(), false),
@@ -196,6 +199,32 @@ mod tests {
                 .iter()
                 .any(|d| matches!(d.kernel, Kernel::CooperativeWorkgroup { .. }))
         );
+    }
+
+    #[test]
+    fn row_bounds_account_for_shared_tiles_without_growing_bindings() {
+        let mut device = caps();
+        device.max_compute_shared_memory_size = 32767;
+        assert!(TILE.supports_dimensions(&device, MatrixTypes::F32_AS_F16, 1536, 384, 384));
+        assert!(!TILE.supports_dimensions(&device, MatrixTypes::F32_AS_F16, 1500, 384, 384));
+        device.max_compute_shared_memory_size += 1;
+        let mut p = plan(1500, 384, 384);
+        let buffers = p.buffers.clone();
+        select(
+            &mut p,
+            &device,
+            &SessionOptions {
+                coop: CoopPolicy::AllowF16,
+                workgroup_matmul: Some(TILE),
+                ..Default::default()
+            },
+        );
+        assert_eq!(p.buffers, buffers);
+        assert_eq!(p.dispatches[0].workgroups, [24, 6, 1]);
+        assert!(matches!(
+            p.dispatches[0].kernel,
+            Kernel::CooperativeWorkgroup { .. }
+        ));
     }
 
     #[test]
