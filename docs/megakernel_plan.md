@@ -1142,6 +1142,17 @@ the descriptor-reference repair requires fresh measurements.
   fourteen smoke tests without a width sweep or extra timing/SDK captures.
   Preserve 907 verified artifacts and eighteen completed study scopes. See
   [tile strip ordering](megakernel_whole_graph.md#tile-strip-ordering).
+  Collect four Nsight Graphics traces with full-state checks, source correlation
+  and bounded sampling bandwidth. Export and account for all 7.08M/7.18M
+  persistent source samples. Ticket-broadcast waits contribute 48.20%/36.70%
+  of samples; these are waiting-warp counts, not removable elapsed time.
+  SGD segment search has 4.59× more samples per replay inside the persistent
+  shader, while the entire SGD handler differs only 3.65%. Preserve this as
+  a distinct lookup hypothesis and retain the unsupported driver-version
+  caveat. Restore 26 source hashes, both qualified binaries and fourteen smoke
+  tests. Archive the canceled default-bandwidth probe's pressure events as well
+  as the four successful captures' zero-event receipts. See
+  [Nsight Graphics source sampling](megakernel_whole_graph.md#nsight-graphics-source-sampling).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
@@ -1167,6 +1178,11 @@ the descriptor-reference repair requires fresh measurements.
   do not hide the training regression with padding or a worker cap.
   The tested tile strip ordering is closed under its fixed gate. Exact tile
   permutations do not establish useful locality or justify a strip-width sweep.
+  Investigate SGD segment lookup with a bounded metadata or search transformation
+  that proves exact group-to-segment selection, including partial tiles and
+  learning-rate scales. Preserve arithmetic, optimizer eligibility and workers;
+  use the existing fixed diagnostics and both completed-step protocols. The
+  source-sample ratio alone cannot justify retention or extra repeats.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,

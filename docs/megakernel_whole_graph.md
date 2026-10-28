@@ -183,6 +183,14 @@ Against an identical shader retaining original order, forward/training GPU time
 changes +0.47%/+0.33%. Neither model improves against both controls. The probe
 and host hooks are removed after the fixed diagnostic gate.
 
+The following [Nsight shader sampling](#nsight-graphics-source-sampling) correlates
+all 7.08M/7.18M persistent forward/training samples with generated WGSL lines.
+Ticket-broadcast waits account for 48.20%/36.70% of samples, not elapsed time or
+removable overhead. SGD segment lookup has 4.59× more samples per replay in
+persistent execution than ordinary dispatches; the whole SGD handler differs
+only 3.65%. This supplies a distinct lookup hypothesis, not a retained gain.
+Four captures pass complete-state checks; temporary capture hooks are removed.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -3073,6 +3081,113 @@ Heavy work uses separate verified 16/20/1 GiB cgroups; GPU jobs serialize, and
 builds/copies/heavy analysis stay outside measurements. Artifacts remain on
 local `/x`. Qualified runtime `c3ad104` and its memory contract remain unchanged;
 baseline parity is unmet.
+
+## Nsight Graphics source sampling
+
+This attribution study starts from `1e723d1` and leaves qualified runtime
+`c3ad104` unchanged. Earlier driver queries already requested
+`CAPTURE_INTERNAL_REPRESENTATIONS_KHR` and returned no native representations.
+They are not repeated. The user-provided Nsight Graphics 2026.3.1 package is
+extracted under `/x/Tools/nsight-graphics-2026.3.1`; nothing is installed or
+written on the shared drive. The installed driver stays at 595.91.07.
+
+The headless CLI successfully captures this driver, despite the
+[release notes](https://docs.nvidia.com/nsight-graphics/ReleaseNotes/index.html)
+requiring Linux driver 615 or newer. These results remain diagnostic and do
+not establish vendor support for this combination. The public profiler exposes
+WGSL/source and SPIR-V correlation here, not native ISA. Its missing nested
+function debug information is retained as a limitation; the independent
+analysis groups samples by verified WGSL line ranges instead.
+
+The temporary benchmark hook calls the supplied NGFX SDK immediately before
+and after its existing one-second resident loop. All steps still wait for GPU
+completion, and complete output/parameter/gradient snapshots bracket the loop.
+Training includes real SGD dispatches at zero learning rate, as in the existing
+stable SDK protocol. Graph arithmetic, queue atomics, fences, selected geometry,
+256 requested workers and graph construction are unchanged. Capture uses
+`MEGANEURA_GPU_CAPTURE=1` for existing Blade debug/source support; no compiler
+fork is edited. The public `NGFX_GPUTrace_WaitForTraceFilePath` confirms transfer
+before the benchmark finishes its state checks.
+
+The CLI is invoked with `--activity="GPU Trace Profiler"`,
+`--platform="Linux (x86_64)"`, `--start-with-ngfx-sdk`, `--stop-with-ngfx-sdk`,
+`--max-duration-ms 3000`, `--architecture="Blackwell GB20x"`,
+`--metric-set-name="Top-Level Triage"`, `--real-time-shader-profiler`,
+`--pm-bandwidth-limit 32`, `--set-gpu-clocks unaltered`,
+`--collect-screenshot 0`, `--auto-export` and `--keep-going`.
+The effective interval is 89,408 ns with a 32,768-cycle warp-state interval;
+the tool reports a 1,500 MB PMA buffer. Preserve these effective settings rather
+than inferring allocation from the requested bandwidth. The `--platform=value`
+form avoids Qt interpreting a separate platform argument as its display plugin.
+
+`--keep-going` permits the benchmark to complete instead of terminating it at
+the first export. The host subsequently exits 1 while awaiting a second SDK
+trigger after the target exits. That status is preserved, not relabeled as
+zero: validation independently requires one saved/exported trace, complete
+state JSON, expected work and no fallback. Three captures additionally record
+all five NGFX control statuses and final completion in a target log; forward
+persistent capture predates that stderr logging hook.
+
+| Capture | Ordinary replays | Persistent replays | Floats checked per backend |
+|---|---:|---:|---:|
+| Forward | 294 | 239 | 147,034,513 |
+| Forward/backward/SGD | 84 | 77 | 246,883,105 |
+
+All four before/after states are bitwise unchanged. Ordinary/persistent forward
+states are bitwise equal; training's maximum cross-backend error is
+**4.6566128730773926e-9**, within the existing budget. Replay counts are capture
+metadata, not an uninstrumented speed comparison.
+
+Both persistent source exports account for every sampled PC exactly once:
+**7,080,184 forward and 7,182,224 training samples**. The CSV parser separates
+the source and SPIR-V tables, avoids counting their interleaved annotations
+twice, and verifies every exported source line against the saved WGSL.
+
+| Source attribution | Forward samples | Training samples |
+|---|---:|---:|
+| `graph_claim`, including its broadcast wait | 54.45% | 40.83% |
+| Ticket `workgroupUniformLoad` alone | 48.20% | 36.70% |
+| Claim-word helper | 0.63% | 1.16% |
+| Worker main, including completion and parameter staging | 3.70% | 7.57% |
+
+The broadcast samples predominantly report Barrier stalls while the leader
+searches or polls. They count waiting resident warps: they are neither elapsed
+GPU-time percentages nor evidence that the barrier can be removed. The earlier
+claim/broadcast/barrier controls remain closed. Forward handler lines also
+identify scalar shared loads with MIO Throttle samples and cooperative staging
+with Long Scoreboard samples, consistent with several possible dependency and
+occupancy effects rather than an isolated cause.
+
+A narrower new lead is SGD's binary search over segment metadata. Its lookup
+accounts for **37,649 ordinary / 158,382 persistent samples**, or **448.20 /
+2,056.91 samples per replay: 4.59×**. However, the *whole* SGD handler differs
+only **3.65%** in samples per replay (823,570/84 versus 782,492/77). Do not convert
+these ratios into time savings or claim the search explains the full gap.
+The next probe may isolate segment lookup using bounded immutable metadata or
+a proven search transformation, preserving every segment boundary, partial
+tile, learning-rate scale, update and requested worker. It must pass the
+existing five-case diagnostic and full completed-step/SDK gates. This evidence
+does not reopen larger SGD batches, worker caps or optimizer deferral.
+
+The default-bandwidth model probe was explicitly canceled after reaching
+**17,785,212,928 bytes** and 32,546 memory-high events; its peak swap was
+1,073,729,536 bytes. It produced no accepted state/timing evidence. Its scope
+exited before lower-bandwidth capture began. The four accepted captures peak
+at **8,734,875,648 bytes**, with zero memory-high/max/OOM events and zero swap.
+The benchmark, profiler and compiler children were observed in their bounded
+job scopes. UI inspection ran on a private virtual display in another bounded
+scope and has exited. GUI/CSV setup failures are retained in the audit.
+
+All **26 original source/dependency hashes**, both qualified binaries and
+fourteen restored smoke tests match. No new runtime optimization or performance
+qualification is claimed. Local evidence in `target/native-shader-profiling/`
+includes the temporary hook/bridge, commands, four trace reports, full states,
+source CSVs and analysis. Manifest
+`target/megakernel-results/native-shader-profiling/summary.json` verifies
+**455 artifacts and twenty archived scope receipts**, SHA-256
+`1675f5abbac70b0fdea616c01942add61d4c621d7624fc53778f2fdddccfbb2b`.
+All heavy jobs use separate 16/20/1 GiB cgroups, GPU jobs serialize, and artifacts
+remain on local `/x`. Baseline parity remains unmet.
 
 ## Completion-epoch control on the current runtime
 
