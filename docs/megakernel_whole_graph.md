@@ -216,6 +216,12 @@ cursor and per-node dependency waits. Forward improves 2.56% against qualified
 execution and 2.61% against the probe control, but training regresses
 0.85%/2.03%, failing the model regression guard. The candidate is restored.
 
+The following [ready-clear snapshot reuse](#ready-clear-snapshot-reuse) continues
+failed-claim scanning from the bitmap returned by its existing atomic clear,
+discarding stale bits without an extra memory operation. Forward/training GPU
+time changes +0.25%/−0.09%, below the fixed improvement threshold. The candidate
+is restored without further timing or SDK captures.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -3524,6 +3530,74 @@ classification required no new GPU run. Peak job memory is **3,714,973,696
 bytes**, with zero memory-high/max/OOM events or swap. Heavy jobs use separate
 verified 16/20/1 GiB cgroups, GPU work is serialized, and artifacts remain on
 local `/x`. Baseline parity remains unmet.
+
+## Ready-clear snapshot reuse
+
+This experiment starts from `80fafb0`, with qualified runtime `c3ad104`.
+The earlier failed-claim audit found 44.8%/21.7% failed attempts in model
+forward/training. Those counts do not establish elapsed cost. This probe tests
+one unused result of the existing helping clear: after an exhausted claim,
+`atomicAnd` returns the current ready word, but the scanner continues through
+its older snapshot. Reusing the returned word can skip bits other workers have
+already cleared and discover bits published before that RMW. This changes
+three assignment lines across the single-word, epoch and summary templates;
+it adds no load, atomic, fence, scratch state or allocation.
+
+The existing final mask removes the chosen bit. A node's bit is published once
+per dispatch, so a scanner cannot revisit a bit it has cleared; each scan is
+still bounded by the word's 32 nodes. The original fetch-add grants ownership,
+failed claims still help clear exhausted nodes, and every successful claim
+keeps its completion token. The authoritative fallback scan before caching an
+empty epoch, all publication fences and all requested workers remain unchanged.
+Newly observed ready bits pass through the same successful-claim acquire fence.
+The read part of the clear RMW participates in the producer's hypothetical
+release sequence under the
+[Vulkan barrier-to-barrier synchronization rule](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html#memory-model-synchronizes-with).
+No Naga API or compiler-fork change is needed.
+
+The finite checker verifies **86,870 old/current snapshot pairs**, then
+**340 scan configurations, 9,138 states and 17,308 transitions** with concurrent
+publication/helping clears and stale initial snapshots. It finds no revisited
+bits. This checks monotonic bitmap behavior, not full DAG execution, native
+atomic latency, throughput or the complete Vulkan memory model.
+
+The candidate passes **52 codegen checks, fourteen whole-graph smoke tests and
+fifty fixed diagnostic comparisons**. State, selection, allocation, optimizer,
+exact work accounting, one-dispatch and no-fallback checks pass. Maximum model
+error remains 4.66e-9. All **56 ordinary sources** remain exact; inverse
+assignments recover all five complete original graph shaders and all three
+claim templates. Every handler, geometry expression, atomic and fence remains
+unchanged. Ordinary and non-graph native pipeline statistics also match.
+
+| Persistent GPU diagnostic | Qualified | Reused clear snapshot | Change |
+|---|---:|---:|---:|
+| Model forward | 4.073056 ms | 4.083424 ms | +0.25% |
+| Model training | 12.733696 ms | 12.722464 ms | −0.09% |
+
+Neither model meets the required 0.5% improvement. Regression guards pass;
+CI inference/backward/SGD changes −0.82%/+0.14%/+2.26%. The failed improvement
+gate ends the experiment without extra timing, full qualification,
+completed-step acceptance runs or SDK captures. The snapshot proof and fewer
+possible stale-bit visits do not establish useful throughput improvement.
+
+Model registers remain **86/84**, shared storage **18,928/29,344 bytes**,
+and participation **168/168**, with all **256 workers** enabled. Native code
+grows **102,400→102,656 / 241,664→241,792 bytes**. Graph work remains
+**22,042/83,312 tiles**, plus **97,522 SGD tiles in four phases**.
+
+All **29 source/dependency hashes, both qualified binaries and fourteen restored
+smoke tests** match, and both compiler forks remain clean and unchanged. The
+first source inverse matched `bits` inside `old_bits`; its original script,
+exit-1 log and exact diagnostic diff are preserved. Anchoring the replacement
+to its full assignment line recovers all original sources without a new GPU run.
+
+Evidence stays under `target/ready-clear-snapshot/`. Manifest
+`target/megakernel-results/ready-clear-snapshot/summary.json` independently
+verifies **367 artifacts and seventeen terminal scope receipts**, SHA-256
+`1404cb98d285cf4fe64e8520fb83bb2954a47700c2f97c32679aeca407b800f5`.
+Peak job memory is **3,713,695,744 bytes**, with zero memory-high/max/OOM events
+or swap. Heavy jobs use separate verified 16/20/1 GiB cgroups, GPU work is
+serialized, and artifacts remain on local `/x`. Baseline parity remains unmet.
 
 ## Completion-epoch control on the current runtime
 

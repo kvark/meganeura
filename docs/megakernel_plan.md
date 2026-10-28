@@ -1195,6 +1195,17 @@ the descriptor-reference repair requires fresh measurements.
   Preserve 796 verified artifacts and 22 terminal scope receipts, including
   the corrected manifest classification of the CPU metadata smoke audit.
   See [topological tickets](megakernel_whole_graph.md#topological-immutable-tickets).
+  Reuse the bitmap returned by an exhausted-bit atomic clear for continued
+  scanning, preserving every atomic/fence and all allocation/ownership rules.
+  Check 86,870 snapshot pairs and 9,138 finite scan states. Pass 52 codegen
+  checks, fourteen smoke tests and fifty diagnostics; recover all five graph
+  shaders and three claim templates through exact inverse assignments.
+  Forward/training changes +0.25%/−0.09%, below the 0.5% improvement threshold.
+  Restore 29 source hashes, both qualified binaries and fourteen smoke tests.
+  Preserve 367 verified artifacts and seventeen terminal scope receipts,
+  including the corrected source-inverse identifier match, without extra timing
+  or SDK captures. See
+  [ready-clear snapshot reuse](megakernel_whole_graph.md#ready-clear-snapshot-reuse).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
@@ -1236,6 +1247,9 @@ the descriptor-reference repair requires fresh measurements.
   gate. Preserve its forward gain and training regression together; do not
   treat fewer claim operations, smaller native code or fewer registers as an
   acceptable improvement, or sweep node order after this failure.
+  Reusing the exhausted-bit clear snapshot is also closed under its fixed gate.
+  Fewer possible stale-bit visits and unchanged native resources do not prove
+  recoverable time; keep its exact scan/publication proof and failed timing gate.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,
