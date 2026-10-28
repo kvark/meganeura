@@ -36,37 +36,59 @@ pub(super) struct RaceResult {
 
 type Run<'a> = Vec<(&'a bg::ComputePipeline, &'a Dispatch)>;
 
-/// Blade reclaims descriptor caches unused in the previous recording. A
-/// shared host encoder cycling through many layouts would repeatedly measure
-/// allocation/destruction instead of steady-state execution. Keep one encoder
-/// per candidate (still one shared scratch); timestamp rounds already record
-/// every live layout together and need only the scratch encoder.
+/// Keep the same shader layouts in each host encoder's recordings so Blade's
+/// descriptor caches stay warm. Equal shader sequences can share one encoder:
+/// host samples submit and wait synchronously before recording the next sample.
+/// Timestamp rounds already use only the scratch encoder.
+fn host_encoder_slots(sequences: &[Vec<Dispatch>], alive: &[bool]) -> Vec<Option<usize>> {
+    debug_assert_eq!(sequences.len(), alive.len());
+    let keys: Vec<Option<Vec<_>>> = sequences
+        .iter()
+        .zip(alive)
+        .map(|(sequence, &live)| live.then(|| sequence.iter().map(Pipelines::key).collect()))
+        .collect();
+    keys.iter()
+        .enumerate()
+        .map(|(i, key)| {
+            key.as_ref()
+                .map(|key| (0..i).find(|&j| keys[j].as_ref() == Some(key)).unwrap_or(i))
+        })
+        .collect()
+}
+
 struct HostEncoders<'a> {
     gpu: &'a bg::Context,
+    slots: Vec<Option<usize>>,
     encoders: Vec<Option<bg::CommandEncoder>>,
 }
 
 impl<'a> HostEncoders<'a> {
-    fn new(gpu: &'a bg::Context, alive: &[bool], timestamps: bool) -> Self {
+    fn new(gpu: &'a bg::Context, slots: Vec<Option<usize>>) -> Self {
+        let encoders = slots
+            .iter()
+            .enumerate()
+            .map(|(index, &slot)| {
+                (slot == Some(index)).then(|| {
+                    gpu.create_command_encoder(bg::CommandEncoderDesc {
+                        name: "tune_race_host",
+                        buffer_count: 1,
+                        manual_barriers: false,
+                    })
+                })
+            })
+            .collect();
         Self {
             gpu,
-            encoders: if timestamps {
-                Vec::new()
-            } else {
-                alive
-                    .iter()
-                    .map(|&live| {
-                        live.then(|| {
-                            gpu.create_command_encoder(bg::CommandEncoderDesc {
-                                name: "tune_race_host",
-                                buffer_count: 1,
-                                manual_barriers: false,
-                            })
-                        })
-                    })
-                    .collect()
-            },
+            slots,
+            encoders,
         }
+    }
+
+    fn for_candidate(&mut self, candidate: usize) -> &mut bg::CommandEncoder {
+        let slot = self.slots[candidate].expect("live host candidate has an encoder slot");
+        self.encoders[slot]
+            .as_mut()
+            .expect("host encoder slot is owned")
     }
 }
 
@@ -186,7 +208,12 @@ impl Session {
 
         let timestamps = self.gpu_timing && self.gpu.capabilities().timing;
         race.gpu_timestamps = timestamps;
-        let Some(bytes) = race_scratch_bytes(bytes, &alive, timestamps)
+        let host_slots = if timestamps {
+            Vec::new()
+        } else {
+            host_encoder_slots(&sequences, &alive)
+        };
+        let Some(bytes) = race_scratch_bytes(bytes, &host_slots)
             .filter(|&bytes| bytes <= options.max_scratch_bytes)
         else {
             fail_remaining(&mut outcomes, TuneDecision::ScratchLimit);
@@ -244,7 +271,7 @@ impl Session {
                 })
             })
             .collect();
-        let mut host = HostEncoders::new(&self.gpu, &alive, timestamps);
+        let mut host = HostEncoders::new(&self.gpu, host_slots);
         race.preparation = preparation.elapsed().saturating_sub(race.compile_time);
 
         let racing = Instant::now();
@@ -634,13 +661,13 @@ fn fail_remaining(outcomes: &mut [TuneOutcome], decision: TuneDecision) {
 }
 
 /// `scratch` already includes the shared scratch encoder. Timestamp rounds
-/// reuse it; host rounds additionally retain one encoder per compiled candidate.
-fn race_scratch_bytes(scratch: usize, alive: &[bool], timestamps: bool) -> Option<usize> {
-    let encoders = if timestamps {
-        0
-    } else {
-        alive.iter().filter(|&&live| live).count()
-    };
+/// reuse it; host rounds retain one encoder per distinct compiled shader sequence.
+fn race_scratch_bytes(scratch: usize, slots: &[Option<usize>]) -> Option<usize> {
+    let encoders = slots
+        .iter()
+        .enumerate()
+        .filter(|&(i, &slot)| slot == Some(i))
+        .count();
     scratch.checked_add(encoders.checked_mul(ENCODER_SCRATCH_BYTES)?)
 }
 
@@ -716,9 +743,7 @@ fn run_round(
                     Scratch::run_on(
                         scratch.gpu,
                         &scratch.buffers,
-                        host.encoders[candidate]
-                            .as_mut()
-                            .expect("live host candidate owns an encoder"),
+                        host.for_candidate(candidate),
                         run(candidate),
                         reps,
                     ) / f64::from(reps)
@@ -968,6 +993,87 @@ fn qualify(
 mod tests {
     use super::*;
     use crate::tune::{MatmulTile, TuneClass};
+
+    #[test]
+    fn identical_shader_sequences_share_host_encoder_resources() {
+        use crate::{
+            codegen::{MatrixTypes, WorkgroupMatmulShape},
+            compile::{Kernel, ShaderEntry},
+        };
+        let types = MatrixTypes::reduced(crate::DType::F16);
+        let typed = Dispatch {
+            shader: ShaderEntry::MatMul,
+            kernel: Kernel::CooperativeTyped { types, splits: 2 },
+            params: vec![64, 1024, 128, 0],
+            input_buffers: vec![BufferRef(0), BufferRef(1)],
+            output_buffer: BufferRef(2),
+            workgroups: [4, 2, 2],
+            ..Default::default()
+        };
+        let sequence = |mut product: Dispatch, splits| {
+            product.workgroups[2] = splits;
+            let sum = product.partial_sum(BufferRef(2), BufferRef(3), 64 * 128, splits);
+            vec![product, sum]
+        };
+        let mut checked4 = typed.clone();
+        checked4.kernel = Kernel::CooperativeTyped { types, splits: 4 };
+        let mut workgroup2 = typed.clone();
+        let shape = WorkgroupMatmulShape {
+            rows: 64,
+            columns: 64,
+            k_stage: 32,
+            threads: 64,
+        };
+        workgroup2.kernel = Kernel::CooperativeWorkgroup {
+            types: Some(types),
+            shape,
+            splits: 2,
+        };
+        let mut workgroup4 = workgroup2.clone();
+        workgroup4.kernel = Kernel::CooperativeWorkgroup {
+            types: Some(types),
+            shape,
+            splits: 4,
+        };
+        let mut reordered = sequence(workgroup2.clone(), 2);
+        reordered.reverse();
+        let sequences = vec![
+            sequence(typed, 2),
+            sequence(checked4, 4),
+            sequence(workgroup2, 2),
+            sequence(workgroup4, 4),
+            reordered.clone(),
+            reordered,
+        ];
+        let keys = |seq: &[Dispatch]| seq.iter().map(Pipelines::key).collect::<Vec<_>>();
+        assert_eq!(
+            keys(&sequences[0]),
+            keys(&sequences[1]),
+            "typed partitions are uniform data"
+        );
+        assert_eq!(
+            keys(&sequences[2]),
+            keys(&sequences[3]),
+            "workgroup partitions are uniform data"
+        );
+        assert_ne!(keys(&sequences[0]), keys(&sequences[2]));
+        let slots = host_encoder_slots(&sequences, &[true, true, true, true, false, true]);
+        assert_eq!(
+            slots,
+            vec![Some(0), Some(0), Some(2), Some(2), None, Some(5)],
+            "one owned encoder per exact shader sequence, including order"
+        );
+        assert_eq!(
+            race_scratch_bytes(1024, &slots),
+            Some(1024 + 3 * ENCODER_SCRATCH_BYTES)
+        );
+        assert_eq!(
+            race_scratch_bytes(1024, &[]),
+            Some(1024),
+            "timestamps use scratch encoder only"
+        );
+        assert_eq!(race_scratch_bytes(usize::MAX, &slots), None);
+    }
 
     fn outcome(candidate: MatmulTile) -> TuneOutcome {
         TuneOutcome::new(TuneClass::default(), 1, MatmulTile::Tile64, candidate)

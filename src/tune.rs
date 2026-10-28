@@ -1069,14 +1069,12 @@ impl TuneClass {
                 _ => 1,
             };
             candidates.extend(
-                crate::codegen::WorkgroupMatmulShape::all()
-                    .map(|shape| MatmulTile::CooperativeWorkgroup { shape, splits }),
+                crate::codegen::WorkgroupMatmulShape::all().flat_map(|shape| {
+                    std::iter::once(splits)
+                        .chain([1, 2, 4, 8, 16].into_iter().filter(move |&n| n != splits))
+                        .map(move |splits| MatmulTile::CooperativeWorkgroup { shape, splits })
+                }),
             );
-            if let MatmulTile::CooperativeWorkgroup { shape, .. } = initial {
-                candidates.extend(
-                    [2, 4, 8, 16].map(|splits| MatmulTile::CooperativeWorkgroup { shape, splits }),
-                );
-            }
             return candidates
                 .into_iter()
                 .filter(|&tile| tile != initial && tile.fits(self))
@@ -1195,17 +1193,18 @@ pub(crate) enum TileFamily {
     Gemv,
 }
 
-/// How a class's challengers are compared with its incumbent.
+/// How the same legal challenger set is compared with a class's incumbent.
 /// Its default preserves historical reports; new [`TuneOptions`] race.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TuneStrategy {
     /// One challenger at a time against the latest winner, each qualified
-    /// before it is timed (historical policy).
+    /// before it is timed, preparing only the next candidate.
     #[default]
     Sequential,
     /// Time the incumbent and every challenger together in shared rounds,
     /// drop challengers that cannot pass the decision rule, and qualify only
-    /// a finalist that would be installed.
+    /// a finalist that would be installed. Shader compilation and host encoders
+    /// are shared by candidates with identical pipeline keys.
     Race,
 }
 
@@ -1782,6 +1781,135 @@ mod tests {
             input_buffers: vec![crate::compile::BufferRef(0), crate::compile::BufferRef(1)],
             output_buffer: crate::compile::BufferRef(2),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn workgroup_shapes_and_partitions_are_independent() {
+        use crate::{
+            DType,
+            codegen::{MatrixTypes, WorkgroupMatmulShape},
+        };
+        let mut problem = class(128, 3072, 576);
+        problem.requires_full_precision = false;
+        problem.matrix_types = Some(MatrixTypes {
+            a: DType::F32,
+            b: DType::F16,
+            multiply: DType::F16,
+            output: DType::F32,
+        });
+        problem.split_k = true;
+        problem.binding_bytes = problem.buffer_sizes().unwrap();
+        *problem.binding_bytes.last_mut().unwrap() *= 8;
+        let shape = WorkgroupMatmulShape {
+            rows: 64,
+            columns: 64,
+            k_stage: 32,
+            threads: 64,
+        };
+        let desired = MatmulTile::CooperativeWorkgroup { shape, splits: 2 };
+        for initial in [
+            MatmulTile::CooperativeChecked { splits: 4 },
+            MatmulTile::CooperativeWorkgroup {
+                shape: WorkgroupMatmulShape { rows: 32, ..shape },
+                splits: 4,
+            },
+        ] {
+            let joint = problem.challengers(initial, None);
+            assert!(desired.fits(&problem));
+            assert!(
+                joint.contains(&desired),
+                "legal joint shape/split is missing"
+            );
+            assert!(
+                joint
+                    .iter()
+                    .all(|&tile| tile != initial && tile.fits(&problem))
+            );
+            assert_eq!(
+                joint.iter().collect::<std::collections::HashSet<_>>().len(),
+                joint.len()
+            );
+        }
+    }
+
+    #[test]
+    fn joint_workgroup_choices_preserve_storage_geometry_and_partial_capacity() {
+        use crate::{
+            DType,
+            codegen::{MatrixTypes, WorkgroupMatmulShape},
+        };
+        for shader in [
+            ShaderEntry::MatMul,
+            ShaderEntry::MatMulAT,
+            ShaderEntry::MatMulBT,
+        ] {
+            for types in [
+                MatrixTypes::BF16,
+                MatrixTypes::reduced(DType::F16),
+                MatrixTypes {
+                    a: DType::F32,
+                    b: DType::F16,
+                    multiply: DType::F16,
+                    output: DType::F32,
+                },
+            ] {
+                let mut p = class(128, 3072, 576);
+                p.shader = shader.clone();
+                p.requires_full_precision = false;
+                p.matrix_types = Some(types);
+                p.split_k = true;
+                p.binding_bytes = p.buffer_sizes().unwrap();
+                *p.binding_bytes.last_mut().unwrap() *= 16;
+                let initial = MatmulTile::CooperativeChecked { splits: 16 };
+                assert!(initial.fits(&p));
+                let joint = p.challengers(initial, None);
+                for shape in WorkgroupMatmulShape::all() {
+                    for splits in [1, 2, 4, 8, 16] {
+                        let tile = MatmulTile::CooperativeWorkgroup { shape, splits };
+                        assert_eq!(
+                            joint.contains(&tile),
+                            tile.fits(&p),
+                            "{shader:?} {types:?} {tile:?}"
+                        );
+                    }
+                }
+                let mut short = p.clone();
+                *short.binding_bytes.last_mut().unwrap() /= 8; // Only two partials.
+                assert!(
+                    short
+                        .challengers(MatmulTile::CooperativeChecked { splits: 2 }, None)
+                        .iter()
+                        .all(|tile| tile.partitions().is_none_or(|n| n <= 2))
+                );
+                for output in [DType::F16, DType::BF16] {
+                    let mut narrow = p.clone();
+                    narrow.matrix_types.as_mut().unwrap().output = output;
+                    assert!(
+                        !narrow
+                            .challengers(initial, None)
+                            .iter()
+                            .any(|tile| matches!(tile, MatmulTile::CooperativeWorkgroup { .. })),
+                        "split partials must retain F32"
+                    );
+                }
+                let mut ragged = p.clone();
+                ragged.n += 1;
+                assert!(
+                    !ragged
+                        .challengers(initial, None)
+                        .iter()
+                        .any(|tile| matches!(tile, MatmulTile::CooperativeWorkgroup { .. }))
+                );
+                let mut short_input = p;
+                short_input.binding_bytes[0] -= 1;
+                assert!(
+                    !short_input
+                        .challengers(initial, None)
+                        .iter()
+                        .any(|tile| matches!(tile, MatmulTile::CooperativeWorkgroup { .. }))
+                );
+            }
         }
     }
 
