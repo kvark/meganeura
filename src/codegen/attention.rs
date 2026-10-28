@@ -284,10 +284,21 @@ fn generate_flash_attention(
 pub fn generate_flash_attention_product_module(head_dim: u32, rows: u32) -> ShaderModule {
     assert!(head_dim > 0 && matches!(rows, 8 | 16));
     let padded = head_dim.next_multiple_of(16);
+    // A four-element head stride also aligns every Q/K/V row and head.
+    // Other head widths retain scalar loads without padding external bindings.
+    let (input_type, q_stage, kv_stage) = if head_dim.is_multiple_of(4) {
+        ("vec4<f32>", "vector_q", "vector_kv")
+    } else {
+        ("f32", "scalar_q", "scalar_kv")
+    };
+    let template = include_str!("../shaders/flash_attention_products.wgsl");
     attention_module(
         preprocess(
-            include_str!("../shaders/flash_attention_products.wgsl"),
+            super::template_section(template, "main"),
             &[
+                ("$STAGE_Q", super::template_section(template, q_stage)),
+                ("$STAGE_KV", super::template_section(template, kv_stage)),
+                ("$QKV_TYPE", input_type),
                 ("$PARAMS", ATTENTION_PARAMS_WGSL),
                 ("$PV_TILES_", &((16 / rows) * (padded / 16)).to_string()),
                 ("$HEAD_TILES_", &(padded / 16).to_string()),
@@ -1424,7 +1435,7 @@ mod product_tests {
             | naga::valid::Capabilities::COOPERATIVE_MATRIX
             | naga::valid::Capabilities::SUBGROUP;
         for rows in [8, 16] {
-            for head_dim in [1, 5, 16, 48, 64, 80, 128, 256] {
+            for head_dim in [1, 4, 5, 12, 16, 20, 48, 64, 80, 128, 256] {
                 let mut module = generate_flash_attention_product_module(head_dim, rows);
                 let mut binding = 0;
                 for (_, global) in module.module.global_variables.iter_mut() {

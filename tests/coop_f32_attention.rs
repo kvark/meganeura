@@ -361,6 +361,9 @@ fn f16_products_forward_matches_f64_across_padded_heads_and_masks() {
         (17, 17, 64, 2, 1, 1, true),
         (33, 19, 5, 3, 1, 0, false),
         (128, 128, 64, 9, 3, 0, true),
+        (19, 23, 4, 3, 1, 0, false),
+        (37, 37, 12, 2, 1, 7, true),
+        (31, 13, 20, 2, 2, 0, false),
     ] {
         let mut graph = Graph::new();
         let q = graph.input("q", &[qs, heads * hd]);
