@@ -1,4 +1,4 @@
-use super::{Gpu, Pipelines, Session, Variant, ensure_device_memory_budget};
+use super::{Gpu, Pipelines, Session, SharedPipeline, Variant, ensure_device_memory_budget};
 use crate::compile::{BufferRef, Dispatch, ShaderEntry};
 use crate::tune::{
     MachineProfile, MatmulTile, TileFamily, TuneCalibration, TuneClass, TuneDecision, TuneError,
@@ -9,6 +9,7 @@ use crate::tune::{
 use blade_graphics as bg;
 use std::{
     collections::HashMap,
+    sync::{Arc, Weak},
     time::{Duration, Instant},
 };
 
@@ -37,6 +38,32 @@ pub(super) const ENCODER_SCRATCH_BYTES: usize = 1 << 20;
 pub struct KernelMemo {
     scope: Option<MemoScope>,
     progress: HashMap<MemoKey, KernelProgress>,
+    // Only live winners, never retained by the memo or persisted to disk.
+    prepared: HashMap<MemoKey, PreparedWinner>,
+}
+
+struct PreparedWinner {
+    pipeline: Weak<SharedPipeline>,
+    variant: Variant,
+    knobs: crate::compile::TuningKnobs,
+    cooperative: Option<crate::codegen::CoopConfig>,
+}
+
+impl PreparedWinner {
+    fn get(&self, session: &Session, variant: &Variant) -> Option<Arc<SharedPipeline>> {
+        // These are all inputs to compilation besides the dispatch variant and
+        // device. Dumps must still go through generation even on a cache hit.
+        if session.pipelines.dump_dir.is_some()
+            || self.variant != *variant
+            || self.knobs != session.pipelines.knobs
+            || self.cooperative != session.coop_config
+        {
+            return None;
+        }
+        self.pipeline
+            .upgrade()
+            .filter(|pipeline| Arc::ptr_eq(&pipeline.gpu, &session.gpu))
+    }
 }
 
 // Bump when kernel generation, qualification or decision semantics change,
@@ -123,8 +150,38 @@ impl KernelMemo {
                 );
             }
             self.progress.clear();
+            self.prepared.clear();
             self.scope = Some(scope);
         }
+    }
+
+    fn remember_pipeline(&mut self, key: &MemoKey, session: &Session, class: &SearchClass) {
+        let selected = self.progress[key].selected;
+        let variant = tile_variant(&session.plan.dispatches[class.members[0]], selected);
+        if let Some(pipeline) = session.pipelines.map.get(&variant) {
+            self.prepared.insert(
+                key.clone(),
+                PreparedWinner {
+                    pipeline: Arc::downgrade(pipeline),
+                    variant,
+                    knobs: session.pipelines.knobs,
+                    cooperative: session.coop_config,
+                },
+            );
+        } else {
+            self.prepared.remove(key);
+        }
+    }
+
+    fn record(
+        &mut self,
+        key: MemoKey,
+        progress: KernelProgress,
+        session: &Session,
+        class: &SearchClass,
+    ) {
+        self.progress.insert(key.clone(), progress);
+        self.remember_pipeline(&key, session, class);
     }
 
     /// Classes with recorded progress.
@@ -142,6 +199,7 @@ impl KernelMemo {
         Ok(Self {
             scope: file.scope,
             progress: file.progress.into_iter().collect(),
+            prepared: HashMap::new(),
         })
     }
 
@@ -919,26 +977,37 @@ impl Session {
         for (index, class) in classes.iter().enumerate() {
             let mut incumbent = class.initial;
             let mut next_candidate = 0;
-            if let Some(&progress) = memo
-                    .as_ref()
-                    .and_then(|m| m.progress.get(&memo_key(&self.plan, class)))
+            let key = memo_key(&self.plan, class);
+            if let Some(&progress) = memo.as_ref().and_then(|m| m.progress.get(&key))
                 && progress.applies_to(class)
-                // A pipeline already held by this session needs neither a
-                // probe budget nor compilation to restore its recorded tile.
-                && (self.pipelines.map.contains_key(&tile_variant(
-                    &self.plan.dispatches[class.members[0]],
-                    progress.selected,
-                )) || (start.elapsed() < options.max_time
-                    && self
-                        .pipelines
-                        .ensure_tune_tile(
-                            &gpu,
-                            &self.plan.dispatches[class.members[0]],
-                            progress.selected,
-                        )
-                        .is_ok()))
             {
+                let variant =
+                    tile_variant(&self.plan.dispatches[class.members[0]], progress.selected);
+                if !self.pipelines.map.contains_key(&variant) {
+                    let prepared = memo
+                        .as_ref()
+                        .and_then(|m| m.prepared.get(&key))
+                        .and_then(|winner| winner.get(self, &variant));
+                    if let Some(pipeline) = prepared {
+                        self.pipelines.map.insert(variant, pipeline);
+                    } else if start.elapsed() >= options.max_time
+                        || self
+                            .pipelines
+                            .ensure_tune_tile(
+                                &gpu,
+                                &self.plan.dispatches[class.members[0]],
+                                progress.selected,
+                            )
+                            .is_err()
+                    {
+                        pending.push((index, incumbent, next_candidate));
+                        continue;
+                    }
+                }
                 class.install(&mut self.plan.dispatches, progress.selected);
+                memo.as_deref_mut()
+                    .unwrap()
+                    .remember_pipeline(&key, self, class);
                 report
                     .reused_classes
                     .push((class.key.clone(), progress.selected));
@@ -1057,12 +1126,14 @@ impl Session {
                         && let Some(ref mut memo) = memo
                     {
                         // Every challenger is decided, failures included.
-                        memo.progress.insert(
+                        memo.record(
                             memo_key,
                             KernelProgress {
                                 selected: result.selected,
                                 next_candidate: class.challengers.len(),
                             },
+                            self,
+                            class,
                         );
                     }
                     let measured = result.race.incumbent_ms;
@@ -1122,12 +1193,14 @@ impl Session {
                                 next_candidate += 1;
                             }
                             if let Some(ref mut memo) = memo {
-                                memo.progress.insert(
+                                memo.record(
                                     memo_key.clone(),
                                     KernelProgress {
                                         selected: incumbent,
                                         next_candidate,
                                     },
+                                    self,
+                                    class,
                                 );
                             }
                         }
@@ -3142,6 +3215,135 @@ mod tests {
                 assert!(actual.iter().all(|&x| x == value));
             }
         }
+    }
+
+    #[test]
+    fn memo_reuses_only_compatible_live_winner_pipelines() {
+        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
+        let mut graph = crate::Graph::new();
+        let a = graph.input("a", &[64, 64]);
+        let b = graph.parameter("b", &[64, 64]);
+        let y = graph.matmul(a, b);
+        graph.set_outputs(vec![y]);
+        let create = |gpu| {
+            Session::with_context_opts(
+                crate::compile::compile(&graph),
+                gpu,
+                crate::SessionOptions {
+                    coop: crate::CoopPolicy::Disabled,
+                    ..Default::default()
+                },
+            )
+        };
+        let options = TuneOptions {
+            max_time: Duration::ZERO,
+            calibration: TuneCalibration::Measure,
+            ..Default::default()
+        };
+        let mut source = create(gpu.clone());
+        let (classes, _) = source.tune_classes(&options);
+        let class = &classes[0];
+        let template = source.plan.dispatches[class.members[0]].clone();
+        let selected = *class
+            .challengers
+            .iter()
+            .find(|&&tile| {
+                !source
+                    .pipelines
+                    .map
+                    .contains_key(&tile_variant(&template, tile))
+            })
+            .unwrap();
+        let variant = tile_variant(&template, selected);
+        source
+            .pipelines
+            .ensure_tune_tile(&gpu, &template, selected)
+            .unwrap();
+        let key = memo_key(&source.plan, class);
+        let mut memo = KernelMemo::default();
+        memo.bind(&gpu, &options, false);
+        memo.record(
+            key.clone(),
+            KernelProgress {
+                selected,
+                next_candidate: class.challengers.len(),
+            },
+            &source,
+            class,
+        );
+
+        // A decision survives persistence, but process-local pipeline handles don't.
+        let path =
+            std::env::temp_dir().join(format!("meganeura-live-memo-{}.json", std::process::id()));
+        memo.save(&path).unwrap();
+        let loaded = KernelMemo::load(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.prepared.is_empty());
+
+        let mut target = create(gpu.clone());
+        assert!(!target.pipelines.map.contains_key(&variant));
+        let before = target.pipelines.map.len();
+        let report = target
+            .tune_with_memo(options.clone(), Some(&mut memo))
+            .unwrap();
+        assert_eq!(report.reused_classes, vec![(class.key.clone(), selected)]);
+        assert!(report.outcomes.is_empty() && report.races.is_empty());
+        assert!(report.calibration_time.is_zero());
+        assert_eq!(target.pipelines.map.len(), before + 1);
+        assert!(Arc::ptr_eq(
+            &target.pipelines.map[&variant],
+            &source.pipelines.map[&variant]
+        ));
+        target.set_input("a", &[0.125; 64 * 64]);
+        target.set_parameter("b", &[0.25; 64 * 64]);
+        target.step();
+        target.wait();
+        assert!(target.read_output(64 * 64).iter().all(|&x| x == 2.0));
+        drop(target);
+
+        let mut incompatible = create(gpu.clone());
+        incompatible.pipelines.knobs.flash_ept_cap *= 2;
+        assert!(memo.prepared[&key].get(&incompatible, &variant).is_none());
+        let report = incompatible
+            .tune_with_memo(options.clone(), Some(&mut memo))
+            .unwrap();
+        assert!(report.reused_classes.is_empty());
+        assert!(!incompatible.pipelines.map.contains_key(&variant));
+        incompatible.pipelines.knobs = source.pipelines.knobs;
+        incompatible.coop_config = Some(crate::codegen::CoopConfig {
+            tile_size: 16,
+            use_f16_input: true,
+            compensated: false,
+        });
+        assert!(memo.prepared[&key].get(&incompatible, &variant).is_none());
+        incompatible.coop_config = source.coop_config;
+        incompatible.pipelines.dump_dir = Some(String::new());
+        assert!(memo.prepared[&key].get(&incompatible, &variant).is_none());
+        let other_gpu =
+            Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
+        assert!(
+            memo.prepared[&key]
+                .get(&create(other_gpu), &variant)
+                .is_none()
+        );
+        assert!(
+            memo.prepared[&key]
+                .get(&source, &tile_variant(&template, class.initial))
+                .is_none()
+        );
+
+        // The memo alone must not keep the compiled winner or its device alive.
+        drop(source);
+        assert!(memo.prepared[&key].pipeline.upgrade().is_none());
+        let mut cold = create(gpu.clone());
+        let report = cold.tune_with_memo(options, Some(&mut memo)).unwrap();
+        assert!(report.reused_classes.is_empty());
+        assert!(!cold.pipelines.map.contains_key(&variant));
+        let mut scope = memo.scope.clone().unwrap();
+        scope.revision += 1;
+        memo.bind_scope(scope);
+        assert!(memo.is_empty() && memo.prepared.is_empty());
     }
 
     #[test]
