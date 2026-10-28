@@ -229,6 +229,12 @@ comparisons establish no absolute model gain under both protocols. Original
 forward and prewarmed CI inference regress. The candidate is restored without
 additional timing or SDK captures; fewer registers do not establish a gain.
 
+The following [completion-polling control](#completion-polling-after-empty-scans)
+lets an active worker scan again before reading the remaining-node count.
+An empty authoritative scan returns it to the original epoch wait/acquire.
+Forward/training GPU time changes +0.276%/+0.804%, failing the diagnostic gate
+with unchanged registers and shared memory. The candidate is restored.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -3687,6 +3693,79 @@ stays under `target/scalar-a-row-pairs/`. Manifest
 **614 artifacts and 52 terminal scope receipts**, SHA-256
 `858bac0c7e26154798ed39f5e38790ecdc6010ad4ab9b6e07365a51539614253`.
 Peak job memory is **3,714,080,768 bytes**, with zero memory-high/max/OOM events
+or swap. Heavy jobs use separate verified 16/20/1 GiB cgroups; GPU work is
+serialized and artifacts remain on local `/x`. Baseline parity remains unmet.
+
+## Completion polling after empty scans
+
+Deferring multiword completion polling until a failed ready scan does not
+improve the fixed diagnostic gate: forward/training changes **+0.276%/+0.804%**.
+Training exceeds the 0.5% regression guard. The candidate is restored; qualified
+runtime `c3ad104` remains unchanged. The study starts from evidence commit
+`f34f6b3` and does not repeat the earlier single-word control, whose changes
+left both model shaders untouched.
+
+Nsight Graphics samples identify waits at the remaining-node load in the
+multiword claim path. They do not establish removable elapsed cost. This
+candidate uses the existing acquired and idle epoch words: while they differ,
+the worker tries the unchanged summary/full-bitmap scan before polling
+completion. A failed authoritative scan copies the acquired epoch into the idle
+word. Equality then enters the original completion wait, with its acquire
+before scanning a newly observed epoch. There is no new private/shared state,
+metadata, allocation, atomic site, fence site or worker cap.
+
+A valid allocated tile keeps its node unfinished, so a successful claim does
+not require a global termination check. Its original acquire fence still
+follows the ready observation and ownership RMW. After a failed scan, the next
+epoch observation retains the original acquire; producer publication retains
+the release before decrementing the remaining-node count. This preserves the
+existing [Vulkan barrier-to-barrier synchronization argument](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html#memory-model-synchronizes-with)
+before caching an empty epoch. The all-ones initializer is outside admitted
+graph sizes because checked queue sizing includes three counters per node.
+Atomic/fence sites remain unchanged, but their dynamic execution can change.
+
+The finite model explores **812 graph/work/batch/worker configurations** under
+both policies: **904,807 qualified and 2,114,894 candidate states**, with
+**1,552,588/4,104,429 transitions**. It checks partial batches, publication before
+retirement, skipped unacquired ready observations, ownership and completion.
+Every terminal state completes all work; no terminal deadlock occurs. Omitting
+the epoch acquire in a negative control produces a deadlock. Scans and node
+fan-out are abstract transitions; this is not a complete Vulkan model, an
+atomic-overclaim proof, a native latency estimate or an unconditional GPU
+forward-progress guarantee. State/transition totals are exploration counts,
+not runtime operation counts.
+
+The candidate passes **52 codegen checks, fourteen whole-graph smoke tests and
+fifty fixed diagnostic comparisons**. State, selection, allocation, optimizer,
+exact work, one-dispatch and no-fallback checks pass; maximum model error is
+4.66e-9. **59 of 61 sources remain exact**, including all nineteen CI sources.
+An exact inverse recovers both complete model shaders and the claim template;
+four negative controls reject unauthorized control-flow, fence and RMW changes.
+Every handler, publication operation and scratch declaration remains exact.
+Ordinary and non-graph native statistics match.
+
+| Persistent GPU diagnostic | Qualified | Deferred completion poll | Change |
+|---|---:|---:|---:|
+| Model forward | 4.069568 ms | 4.080800 ms | +0.276% |
+| Model training | 12.759584 ms | 12.862144 ms | +0.804% |
+
+Neither model meets the 0.5% improvement threshold. CI inference/backward/SGD
+changes +1.158%/−0.236%/−1.059% on unchanged shaders and native statistics;
+those movements are not attributed to the candidate. Model registers stay
+**86/84**, shared bytes **18,928/29,344**, and participation **168/168**, with
+all 256 workers enabled. Code changes **102,400→102,528 / 241,664→241,664 bytes**.
+Graph work stays 22,042/83,312 tiles plus 97,522 SGD tiles in four phases.
+Fewer completion reads on successful paths do not establish useful throughput.
+The failed gate ends the study without extra timing, full qualification,
+emitted-SPIR-V qualification, completed-step acceptance runs or SDK captures.
+
+All **29 source/dependency hashes, both qualified binaries and fourteen restored
+smoke tests** match; both compiler forks stay clean and unchanged. Evidence is
+under `target/active-epoch-claims/`. Manifest
+`target/megakernel-results/active-epoch-claims/summary.json` independently verifies
+**367 artifacts and nineteen terminal scope receipts**, SHA-256
+`add2ecf08ffb073b49ee3fed7f4f71fa0f6a47c9ad28a64334d0d147bcd259fa`.
+Peak job memory is **3,714,015,232 bytes**, with zero memory-high/max/OOM events
 or swap. Heavy jobs use separate verified 16/20/1 GiB cgroups; GPU work is
 serialized and artifacts remain on local `/x`. Baseline parity remains unmet.
 

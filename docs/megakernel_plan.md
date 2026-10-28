@@ -1218,6 +1218,18 @@ the descriptor-reference repair requires fresh measurements.
   without extra timing or SDK captures. Preserve 614 verified artifacts and
   52 terminal scope receipts. See
   [paired scalar A rows](megakernel_whole_graph.md#paired-scalar-a-rows).
+  Defer multiword completion polling while ready claims succeed, using the
+  existing idle/acquired epoch words. Preserve the authoritative fallback,
+  epoch acquisition, successful-claim fence and all payload/publication code.
+  Check 812 finite scheduling configurations with partial batches and stale
+  unacquired observations; a missing-acquire negative control deadlocks.
+  Pass 52 codegen checks, fourteen smoke tests and fifty diagnostics; recover
+  both complete changed model shaders through exact control-flow inversion.
+  Forward/training changes +0.276%/+0.804%, failing the fixed regression guard.
+  Restore 29 source hashes, both binaries and fourteen smoke tests without
+  extra timing or SDK captures. Preserve 367 artifacts and nineteen terminal
+  scope receipts. See
+  [completion polling after empty scans](megakernel_whole_graph.md#completion-polling-after-empty-scans).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
@@ -1266,6 +1278,10 @@ the descriptor-reference repair requires fresh measurements.
   diagnostic gain, adjacent scalar source addresses and fewer native registers
   do not establish a retained improvement. Preserve both protocols and their
   regression checks without adding runs or sweeping layouts after failure.
+  Deferring multiword completion polling is also closed under its fixed gate.
+  The remaining-node load's source samples, fewer loads on successful paths
+  and unchanged native resources do not establish recoverable time. Preserve
+  its acquired-epoch progress argument and training regression together.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,
