@@ -118,6 +118,12 @@ passes full correctness qualification and improves forward GPU diagnostics
 Neither model wins under both protocols, so it is reverted without extra runs
 or SDK captures. The retained memory contract remains unchanged.
 
+The subsequent [disjoint ready-word scans](#disjoint-ready-word-scans) avoid
+examining a word again in the fallback after the advisory pass has already
+checked it. Correctness and source audits pass, but forward/training GPU
+diagnostics change +0.21%/−0.30%, below the required gain. The candidate is
+reverted without extra repeats; qualified runtime remains `c3ad104`.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -2224,6 +2230,72 @@ Peak job memory is **3,719,712,768 bytes**, with zero memory-limit or OOM events
 Heavy work uses separate verified 16/20/1 GiB cgroups, GPU jobs serialize,
 builds/copies/heavy analysis stay outside timing, and artifacts stay on local
 `/x`. Baseline parity remains unmet.
+
+## Disjoint ready-word scans
+
+Starting from `8777d02`, this candidate records which authoritative ready-word
+helpers the advisory scan has already called. The fallback visits only the
+other words. A separate template applies to 2–32 ready words; single-word
+graphs and graphs above 1,024 nodes retain their original templates. Both model
+graphs use the candidate path, with five/seventeen ready words.
+
+The local visited mask starts empty on each scan attempt. A word is marked only
+when its valid hint leads to the unchanged authoritative helper. Failure of
+that helper means it examined the word and could not allocate any observed
+ready bit. Before caching the sampled epoch as idle, the two passes together
+therefore still examine every word. A publication after a word's visit either
+belongs to the acquired completion epoch or causes a subsequent epoch change,
+as in the original scan's progress argument. Skipped fallback repairs may leave
+missing hints, which remain advisory. No mask survives the attempt, and removing
+repeated helper calls cannot increase the existing overclaim bound.
+
+Host checks pass **94,454 static ready/hint/worker cases** and thirty small
+publication schedules. The latter use sequential consistency and do not model
+Vulkan weak-memory behavior; they supplement the source-level argument, not a
+formal memory-model proof. Ownership RMWs, the authoritative helper, queue
+layout, every fence and barrier, handlers and all requested workers stay intact.
+No new shared storage, descriptor, Naga capability or arithmetic is introduced.
+
+The candidate passes formatting, release builds, **52 codegen checks and fourteen
+whole-graph smoke tests**, including 1,024/1,025-node boundaries and repeated
+1/3/256/4096-worker execution. Fifty diagnostic comparisons use five pairs per
+case/mode, ten warmups, at least one warmup second and matched 100 ms prewarming.
+All selection, allocation, full-state, optimizer, completion, one-dispatch and
+no-fallback checks pass; maximum model error remains 4.66e-9.
+
+Exact inverse substitutions recover both original model graph sources and the
+code-generation branch. All nineteen CI shaders, forty ordinary model shaders
+and their native-statistic multisets remain exact. Model registers remain
+86/84, shared bytes 18,928/29,344, participating workers 168 and logical graph
+tiles 22,042/83,312. All 256 requested workers remain enabled. The four SGD
+phases preserve another 97,522 logical tiles. Code grows by 128 forward / 256
+training bytes; queue and payload allocations do not change.
+
+| Five-pair persistent GPU median | Qualified control | Candidate | Change |
+|---|---:|---:|---:|
+| CI inference | 0.030688 ms | 0.030560 ms | −0.42% |
+| CI backward | 0.068128 ms | 0.067456 ms | −0.99% |
+| CI backward + SGD | 0.072416 ms | 0.073920 ms | +2.08% |
+| Model forward | 4.071136 ms | 4.079776 ms | +0.21% |
+| Model training + SGD | 12.893696 ms | 12.854656 ms | −0.30% |
+
+Ordinary model GPU changes remain within 0.06%. Neither model reaches the
+predeclared 0.5% improvement threshold. The candidate is reverted without extra
+repeats, normal completed-step timing, full library/oracle/matrix qualification
+or fresh SDK captures. These diagnostics do not qualify a performance gain.
+
+All **23 source/dependency hashes**, both qualified executable hashes and
+fourteen restored smoke tests match; the temporary template is removed and
+both compiler forks remain clean. Local evidence is under
+`target/disjoint-ready-scans/`. Manifest
+`target/megakernel-results/disjoint-ready-scans/summary.json` independently
+verifies **363 artifacts and seventeen completed study scopes**, SHA-256
+`ea7dd6231c8f538f9211b5a4eacb1b8b8fa352b31a808fa2b7e2b34df7fedee2`.
+Peak recorded memory is **3,714,416,640 bytes**, with zero memory-limit or OOM
+events. Heavy jobs use separate verified 16/20/1 GiB cgroups. GPU work is
+serialized, and builds/copies/heavy analysis stay outside measurements. All
+launched jobs finish; artifacts remain on local `/x` storage. Qualified runtime
+`c3ad104` and its memory contract remain unchanged. Baseline parity is unmet.
 
 ## Completion-epoch control on the current runtime
 

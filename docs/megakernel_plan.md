@@ -1036,8 +1036,19 @@ the descriptor-reference repair requires fresh measurements.
   fourteen smoke tests without extra runs or SDK captures. Keep the production
   memory contract unchanged. See
   [active-lane payload fences](megakernel_whole_graph.md#active-lane-payload-fences).
+  Audit skipping fallback words already examined by the advisory pass in the
+  same attempt, preserving an authoritative visit to every word before waiting.
+  Pass 94,454 static host cases, thirty publication schedules, 52 codegen checks,
+  fourteen smoke tests and fifty diagnostics. Exact inverses recover both model
+  graph sources; other shaders, arithmetic, fences and allocations stay exact.
+  Forward/training GPU diagnostics change +0.21%/−0.30%, failing the fixed 0.5%
+  improvement gate. Restore 23 source hashes, both qualified binaries and
+  fourteen smoke tests; preserve 363 verified artifacts and seventeen completed
+  bounded scopes. Do not add repeats, normal timing or fresh SDK captures. See
+  [disjoint ready-word scans](megakernel_whole_graph.md#disjoint-ready-word-scans).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
-  staging layouts, or repeat guarded-fence timing after its failed fixed gate.
+  staging layouts, or repeat guarded-fence or disjoint-scan timing after their
+  failed fixed gates.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,
