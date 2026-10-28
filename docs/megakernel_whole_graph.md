@@ -244,6 +244,13 @@ establish no absolute model gain under both protocols. Positive median changes
 remain inconclusive; the candidate is restored without extra timing or SDK
 captures.
 
+The subsequent [acquire completion-counter load](#acquire-completion-counter-load)
+puts epoch acquisition directly on the atomic load, replacing its later
+standalone fence. All payload and publication fences remain. SPIR-V validation,
+exact binary inverses and the finite progress model pass, but forward/training
+GPU diagnostics regress **1.98%/2.81%** against qualified execution. The probe
+is removed; it supplies no performance reason for a new Naga atomic API.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -3885,6 +3892,102 @@ verifies **917 artifacts and 67 terminal scope receipts**, SHA-256
 Peak job memory is **3,715,145,728 bytes**, with zero memory-limit events or swap.
 Every heavy job uses a separate verified 16/20/1 GiB cgroup; GPU jobs serialize,
 artifacts remain on local `/x`, and all launched jobs finish. Baseline parity
+remains unmet.
+
+## Acquire completion-counter load
+
+Putting epoch acquisition directly on the completion-counter load regresses
+both model phases and fails the fixed diagnostic gate. Qualified runtime
+`c3ad104`, the compiler pins and the retained memory contract remain unchanged.
+This study starts from evidence commit `7727b61`; it adds no Naga API.
+
+The earlier directional-fence control retained a standalone epoch barrier.
+This probe instead changes the multiword claim path's relaxed `OpAtomicLoad`
+of `graph_queue[0]` to **QueueFamily scope 5, Acquire | UniformMemory |
+MakeVisible (`0x4042`)**, removing the later conditional epoch
+`OpMemoryBarrier`. Every poll now acquires, including unchanged-epoch polls.
+The acquired/idle epoch state, authoritative scans, all RMWs, requested workers,
+queue layout, selected arithmetic and allocations stay unchanged.
+
+The existing release before a node's remaining-count decrement stays intact.
+An acquire load reading that RMW sequence supplies the ordering needed before
+scanning ready words, under Vulkan's
+[fence-to-atomic synchronization rule](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html#memory-model-synchronizes-with).
+The observer's removed release half is unnecessary here: the unchanged
+all-lane and leader completion protocol already publishes payload writes before
+returning to polling. Intervening scans write no payload. Every successful-claim,
+consumer-lane, writer-lane, completion, successor-publication and epoch-release
+fence remains. Descriptor identity and nonprivate access semantics stay exact;
+the argument does not introduce availability/visibility chains or qualify
+arbitrary ordered atomics.
+
+The finite model checks **812 configurations**, including partial batches and
+stale unacquired ready observations. The original conditional acquisition and
+acquire-on-poll policies have **identical reachable state sets**: each explores
+904,807 states, 1,552,588 transitions and 47,335 complete terminal states with
+zero terminal deadlocks. An acquisition-omission negative control deadlocks.
+Scans and fan-out are abstract transitions; this is not a complete Vulkan
+memory model or an unconditional GPU progress proof.
+
+A temporary local Blade hook runs after normal Naga validation and validates
+both SPIR-V forms before pipeline creation. Two archived qualified modules
+whose WGSL matches the current runtime pass preflight transformation/validation;
+eight malformed-target controls are rejected. Both actual probe modes then pass
+**52 codegen checks and fourteen whole-graph smoke tests**. The hook control
+and candidate use the same frozen binary with one process-level mode selector.
+The hook sources and local Cargo override are restored before timing.
+
+An independent audit validates **fourteen captured original/transformed pairs**,
+including four primary model pairs. Reversing exactly one atomic-load semantics
+operand, one removed fence and one added constant recovers every original
+module byte for byte. Queue-root/index, scope, function and acquired-epoch store
+checks constrain the target. Fourteen relaxed-semantics mutations are rejected.
+Primary originals match the archived current-qualified modules after removing
+debug records. No payload operation, alias decoration, workgroup barrier or
+other atomic/fence instruction changes. These checks do not expose native ISA.
+
+The fixed **75 diagnostic comparisons** use qualified, hook-control and
+acquire-load visits, five pairs per case/mode, at least ten warmups and one warmup
+second, 100 ms prewarming and 256 workers. Every complete-state, implementation,
+allocation, optimizer, exact-work, one-dispatch and no-fallback check passes;
+maximum model error stays 4.66e-9. **All 61 WGSL sources are byte-identical in
+all three modes.** Qualified/control native-statistic multisets match, as do all
+ordinary and CI statistics across modes.
+
+| Persistent GPU diagnostic | Qualified | Hook control | Acquire load |
+|---|---:|---:|---:|
+| Model forward | 4.074560 ms | 4.084512 ms | 4.155296 ms |
+| Model training | 12.704992 ms | 12.747648 ms | 13.062240 ms |
+
+Forward regresses **1.981% versus qualified / 1.733% versus hook control**;
+training regresses **2.812% / 2.468%**. Both exceed the 0.5% regression guard,
+and neither meets the 0.5% improvement threshold. These are screening results,
+not completed-step qualification. No extra timing, broader ordered-atomic
+sweep, full qualification or SDK captures follow the failed gate.
+
+Registers fall **86→84 forward / 84→82 training**, while shared storage remains
+18,928/29,344 bytes and code remains 102,400/241,664 bytes. Both model captures
+still show 168 participating workers with all 256 enabled. Main work stays
+22,042/83,312 tiles plus 97,522 SGD tiles in four phases. Lower register counts,
+one fewer SPIR-V fence and unchanged executable sizes do not establish useful
+throughput or isolate the native cost of acquiring on every poll. CI timing
+movement occurs on unchanged shaders/statistics and is not attributed to the
+transformation.
+
+The first analyzer retained literal filenames from the preceding serial/parallel
+study and stopped in its final equality check. Its script and exit-1 log remain.
+Correcting only those filenames completes analysis without repeating GPU work.
+
+Restoration verifies **29 main source/dependency hashes, two Blade source
+hashes, both qualified binaries and fourteen smoke tests**. The owned hook
+module is removed; both compiler forks remain clean and unchanged. Evidence is
+under `target/epoch-acquire-load/`. Manifest
+`target/megakernel-results/epoch-acquire-load/summary.json` independently verifies
+**533 artifacts and 24 terminal scope receipts**, SHA-256
+`ede10c45fe72d57846f2338031c1b7c9ffe25c2f1b1556260a47d1def225e521`.
+Peak job memory is **3,715,878,912 bytes**, with zero memory-limit events or swap.
+All heavy jobs use separate verified 16/20/1 GiB cgroups, GPU work serializes,
+and artifacts stay on local `/x`. Every launched job finishes. Baseline parity
 remains unmet.
 
 ## Completion-epoch control on the current runtime

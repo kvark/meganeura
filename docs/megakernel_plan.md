@@ -1243,6 +1243,18 @@ the descriptor-reference repair requires fresh measurements.
   artifacts and 67 terminal cgroup receipts. A queried ballot capability gate
   would be required before shipping this mechanism on other devices. See
   [subgroup ready-word hints](megakernel_whole_graph.md#subgroup-ready-word-hints).
+  Test acquisition directly on the multiword completion-counter atomic load,
+  retaining all payload/publication fences. The finite model gives identical
+  reachable sets over 812 configurations; omitting acquisition deadlocks.
+  Validate fourteen captured SPIR-V pairs and recover every original through
+  exact binary inversion. All 61 WGSL sources and qualified/control native
+  statistics match. Pass 52 codegen checks, fourteen smoke tests per mode and
+  75 diagnostics, but reject forward/training regressions of 1.981%/2.812%
+  versus qualified execution. Restore all main/Blade hashes, both binaries and
+  fourteen smoke tests without implementing a Naga API or adding timing/SDK
+  captures. Preserve 533 artifacts, 24 terminal cgroup receipts and the corrected
+  analyzer's initial filename failure. See
+  [acquire completion-counter load](megakernel_whole_graph.md#acquire-completion-counter-load).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
@@ -1299,6 +1311,10 @@ the descriptor-reference repair requires fresh measurements.
   The matched serial-control win and positive wall-time medians do not
   establish an absolute gain under both protocols. Preserve the full series
   without adding timing runs or sweeping window sizes after the failed gate.
+  Acquiring directly on every completion-counter poll is also closed under
+  its fixed diagnostic gate. Preserve the exact synchronization/binary proof
+  and both model regressions; fewer SPIR-V fences and registers do not justify
+  a new Naga API or a broader ordered-atomic sweep after failure.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,
