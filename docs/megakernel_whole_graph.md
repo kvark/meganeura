@@ -210,6 +210,12 @@ Matrix-load byte strides, conversions and scratch capacity remain exact.
 Forward/training GPU time changes −0.15%/+0.13%, below the fixed improvement
 threshold. The candidate is restored without extra timing or SDK captures.
 
+The subsequent [topological tickets](#topological-immutable-tickets) prebuild
+every valid claim in node order and replace ready scanning with one global
+cursor and per-node dependency waits. Forward improves 2.56% against qualified
+execution and 2.61% against the probe control, but training regresses
+0.85%/2.03%, failing the model regression guard. The candidate is restored.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -3430,6 +3436,94 @@ Evidence stays under `target/coop-wide-shared-b/`. Manifest
 Peak job memory is **3,713,527,808 bytes**, with zero memory-high/max/OOM events
 or swap. Heavy jobs use separate verified 16/20/1 GiB cgroups, GPU work is
 serialized, and artifacts remain on local `/x`. Baseline parity remains unmet.
+
+## Topological immutable tickets
+
+This experiment starts from `ee42636`, with qualified runtime `c3ad104`.
+It tests a different ownership mechanism from the earlier append-only queue
+of ready nodes: the CPU prebuilds **every valid node/batch claim**, including
+padded slots and the existing dummy claim for empty nodes, in topological
+recording order. Immutable `(node, tile_start)` pairs follow the existing
+successor data in `graph_edges`, preserving every successor offset and payload
+descriptor. A single global atomic cursor grants each claim exactly once.
+The worker waits for that node's dependency count to reach zero, executes and
+fully publishes its claim, then requests another. This removes bitmap scans,
+per-node claim RMWs, failed claims and ready/summary publication.
+
+Each worker holds at most one ticket. Waiting on a later node implies that
+every earlier ticket has already been assigned. The least unfinished node has
+only earlier predecessors; an owner can finish its payload or bounded successor
+publication without acquiring another ticket or waiting for queue capacity.
+Workers receiving out-of-range tickets wait for global completion and retire
+without fetching again. The final cursor must equal `tickets + workers`.
+The host checks cursor overflow and the device storage-range limit before
+allocating the expanded edge table. The finite interleaving model checks
+**3,306 configurations, 338,142 states and 758,081 transitions**, including
+empty-node configurations, with exact ownership/completion and no deadlock.
+Two deliberately reversed-order controls deadlock as expected. This assumes
+eventual execution and atomic visibility; it is not a general Vulkan
+forward-progress guarantee or a native occupancy model.
+
+Payload-lane release fences, workgroup rendezvous, the remaining-tile RMW
+chain, last-tile acquisition and the release fence before each dependency
+decrement remain unchanged. The consumer loads the final dependency zero and
+executes a storage fence before the existing uniform broadcast and all-lane
+acquire fences. The
+[Vulkan barrier-to-barrier synchronization rule](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html#memory-model-synchronizes-with)
+connects preceding producer fences through hypothetical release sequences of
+the dependency-counter RMWs. The ticket cursor does not publish payloads.
+Canonical descriptors, NonPrivatePointer accesses and external-frame lifetimes
+remain unchanged. No Naga API or compiler-fork change is needed.
+
+One frozen probe binary selects bitmap or ticket scheduling through a host
+flag; the qualified binary supplies an independent control. The candidate
+passes **53 codegen checks, fourteen whole-graph smoke tests per mode and
+75 fixed diagnostic comparisons**. The metadata audit verifies actual claim
+coverage, batch sizes, topological successor indices, queue initialization and
+all other metadata across **142 smoke and five benchmark records per mode**.
+The control reproduces all **61 qualified WGSL sources**
+and native statistics. The candidate preserves all **56 ordinary sources**;
+exact inverses for five graph shaders recover everything except the audited
+claim function, unused idle state and ready/summary publication. All handlers,
+layouts and fences in `graph_main` remain exact.
+
+State, selection, optimizer, exact logical-work accounting, one-dispatch and
+no-fallback checks pass. Graph work remains **22,042/83,312 tiles**, with
+**97,522 SGD tiles in four phases**. Forward/training use **15,898/94,238
+tickets**, adding **127,192/753,912 bytes** to scheduler allocations, including
+the cursor's upload and device copies. Payload allocations remain exact.
+All **256 requested workers** stay enabled; model participation remains
+**168/168**. Registers fall **86→84 / 84→82**, shared storage remains
+**18,928/29,344 bytes**, and native code shrinks
+**102,400→98,432 / 241,664→239,488 bytes**.
+
+| Persistent GPU diagnostic | Qualified | Bitmap probe | Topological tickets |
+|---|---:|---:|---:|
+| Model forward | 4.064256 ms | 4.066656 ms | 3.960320 ms |
+| Model training | 12.894080 ms | 12.745536 ms | 13.004064 ms |
+
+Forward improves **2.56% against qualified / 2.61% against the bitmap probe**.
+Training regresses **0.85% / 2.03%**, exceeding the predeclared 0.5% regression
+guard against both controls. CI cases improve 7.51–12.78% against qualified
+and 7.13–13.22% against the probe. The failed guard ends this experiment
+without additional timing, full qualification, completed-step acceptance runs
+or SDK captures. Fewer claim operations, smaller native code and lower register
+counts do not establish an acceptable end-to-end improvement. These diagnostics
+do not isolate the cost of the global cursor or waiting on assigned nodes.
+
+The prototype, selector and export hooks are removed. All **29 original
+source/dependency hashes, both qualified binaries and fourteen restored smoke
+tests** match; both compiler forks remain clean and unchanged. Evidence stays
+under `target/topological-tickets/`. Manifest
+`target/megakernel-results/topological-tickets/summary.json` independently verifies
+**796 artifacts and 22 terminal scope receipts**, SHA-256
+`1c1c462eead0f194a946e4ef4f4e85479bfb3e00abd4fdf658a46d843a8e616d`.
+The first manifest generator misclassified the CPU metadata smoke audit as a
+GPU test; its exit-1 log and original script are preserved. Correcting that
+classification required no new GPU run. Peak job memory is **3,714,973,696
+bytes**, with zero memory-high/max/OOM events or swap. Heavy jobs use separate
+verified 16/20/1 GiB cgroups, GPU work is serialized, and artifacts remain on
+local `/x`. Baseline parity remains unmet.
 
 ## Completion-epoch control on the current runtime
 

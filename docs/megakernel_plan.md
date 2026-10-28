@@ -1183,6 +1183,18 @@ the descriptor-reference repair requires fresh measurements.
   Preserve 368 verified artifacts and seventeen terminal scope receipts without
   extra timing or SDK captures. See
   [wide cooperative shared B stores](megakernel_whole_graph.md#wide-cooperative-shared-b-stores).
+  Test immutable topological tickets with one global claim cursor and direct
+  dependency waits. Preserve all payload fences, handlers, claim coverage,
+  partial completion and all requested workers. Check 3,306 finite scheduling
+  configurations plus reversed-order deadlock controls and actual metadata.
+  Pass 53 codegen checks, fourteen smoke tests per mode and 75 fixed diagnostics;
+  audit exact control sources/statistics and five candidate graph inverses.
+  Forward improves 2.56%/2.61% against qualified/bitmap controls, but training
+  regresses 0.85%/2.03%, failing the 0.5% model guard. Restore 29 source hashes,
+  both binaries and fourteen smoke tests without extra timing or SDK captures.
+  Preserve 796 verified artifacts and 22 terminal scope receipts, including
+  the corrected manifest classification of the CPU metadata smoke audit.
+  See [topological tickets](megakernel_whole_graph.md#topological-immutable-tickets).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
@@ -1220,6 +1232,10 @@ the descriptor-reference repair requires fresh measurements.
   Fewer source store sites and smaller native code do not prove wider native
   instructions or recoverable time. Preserve this result without sweeping vector
   widths or masking it with padding or a worker cap.
+  The tested topological ticket scheduler is closed under the fixed regression
+  gate. Preserve its forward gain and training regression together; do not
+  treat fewer claim operations, smaller native code or fewer registers as an
+  acceptable improvement, or sweep node order after this failure.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,
