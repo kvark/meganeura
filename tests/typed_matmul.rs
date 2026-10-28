@@ -16,6 +16,12 @@ const K: usize = 1031;
 #[test]
 fn typed_staging_handles_vector_tails_and_split_output() {
     let gpu = crate::support::gpu::gpu();
+    let row_tile = meganeura::codegen::WorkgroupMatmulShape {
+        rows: 32,
+        columns: 64,
+        k_stage: 32,
+        threads: 64,
+    };
     for storage in [DType::F16, DType::BF16] {
         if !meganeura::runtime::typed_matrix_supported(&gpu, storage) {
             continue;
@@ -24,6 +30,7 @@ fn typed_staging_handles_vector_tails_and_split_output() {
             (64, 64, 64),
             (16, 48, 31),
             (33, 65, 31),
+            (33, 64, 64),
             (36, 68, 35),
             (1, 1, 1),
             (32, 32, 1031),
@@ -71,6 +78,9 @@ fn typed_staging_handles_vector_tails_and_split_output() {
                             y
                         };
                         g.set_outputs(vec![y]);
+                        let native_rows = storage == DType::F16 && (m, n, k) == (33, 64, 64);
+                        // A subnormal one-hot entry also checks native vector loads.
+                        let a_value = if native_rows { 2.0f32.powi(-15) } else { 1.0 };
                         let mut a = vec![0.0; m * k];
                         let b: Vec<f32> =
                             (0..k * n).map(|i| (i * 31 % 61 + 1) as f32 / 4.0).collect();
@@ -82,24 +92,42 @@ fn typed_staging_handles_vector_tails_and_split_output() {
                                 inner * m + row
                             } else {
                                 row * k + inner
-                            }] = 1.0;
+                            }] = a_value;
                             for col in 0..n {
-                                expected[row * n + col] =
-                                    b[if layout == 2 {
-                                        col * k + inner
-                                    } else {
-                                        inner * n + col
-                                    }] + if add { bias[row * n + col] } else { 0.0 };
+                                expected[row * n + col] = b[if layout == 2 {
+                                    col * k + inner
+                                } else {
+                                    inner * n + col
+                                }] * a_value
+                                    + if add { bias[row * n + col] } else { 0.0 };
                             }
                         }
                         let mut session = meganeura::Session::with_context_opts(
                             meganeura::compile::compile(&g),
                             gpu.clone(),
                             meganeura::SessionOptions {
+                                coop: if native_rows {
+                                    CoopPolicy::AllowF16
+                                } else {
+                                    CoopPolicy::Auto
+                                },
+                                workgroup_matmul: native_rows.then_some(row_tile),
                                 poison: true,
                                 ..Default::default()
                             },
                         );
+                        let caps = gpu.capabilities();
+                        // Guarded native A plus F32 results need 10 KiB of scratch.
+                        if native_rows
+                            && row_tile.supports(&caps, MatrixTypes::reduced(DType::F16))
+                            && caps.cooperative_matrix.workgroup.reserved_shared_memory + 10 * 1024
+                                <= caps.max_compute_shared_memory_size
+                        {
+                            assert!(matches!(
+                                session.plan().dispatches[0].kernel,
+                                Kernel::CooperativeWorkgroup { .. }
+                            ));
+                        }
                         session.set_parameter("a", &a);
                         session.set_parameter("b", &b);
                         if add {

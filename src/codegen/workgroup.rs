@@ -158,11 +158,17 @@ pub(crate) fn generate_workgroup_matmul_with_row_bounds(
         source += "enable wgpu_bfloat16;\n";
         source += include_str!("../shaders/bf16_round.wgsl");
     }
+    // K stages are four-aligned. NN/BT A can keep vector loads even when
+    // its matching F16 storage still needs a guarded shared-memory tile.
+    let vector_a = row_bounds
+        && variant != MatMulCoopVariant::AT
+        && types.a == DType::F16
+        && types.multiply == DType::F16;
     source +=
         "struct Params { m: u32, n: u32, k: u32, splits: u32 }\nvar<uniform> params: Params;\n";
     for (name, storage, extent) in [("a", types.a, m), ("b", types.b, n)] {
         let scalar = MatrixTypes::name(storage);
-        let storage_name = if storage != types.multiply {
+        let storage_name = if storage != types.multiply || (name == "a" && vector_a) {
             format!("vec4<{scalar}>")
         } else {
             scalar.to_owned()
@@ -199,7 +205,7 @@ pub(crate) fn generate_workgroup_matmul_with_row_bounds(
         } else {
             ("b", k, n, "B")
         };
-        if storage != types.multiply {
+        if storage != types.multiply || (a && vector_a) {
             let width = if transpose { rows } else { cols };
             let index = match (a, transpose) {
                 (true, false) => "(row + r) * k + t + c",
