@@ -146,10 +146,7 @@ fn run(
     refresh_inputs: &mut impl FnMut(&mut Session) -> Result<(), String>,
 ) -> Result<f64, String> {
     prepare(session, state, trial, refresh_inputs)?;
-    let start = Instant::now();
-    session.step();
-    session.wait();
-    Ok(start.elapsed().as_secs_f64() * 1000.0)
+    Ok(session.measure_step().as_secs_f64() * 1000.0)
 }
 
 fn validate(
@@ -789,10 +786,50 @@ mod tests {
     }
 
     #[test]
+    fn measured_steps_restore_explicit_profiling() {
+        let gpu_options = crate::GpuOptions::from_env();
+        let timing = gpu_options.timing;
+        let gpu = Arc::new(crate::init_gpu_context_with(gpu_options).unwrap());
+        let mut graph = crate::Graph::new();
+        let input = graph.input("x", &[2]);
+        let neg = graph.neg(input);
+        let output = graph.neg(neg);
+        graph.set_outputs(vec![output]);
+        let plan = crate::compile::compile(&graph);
+        let mut session = Session::with_context_opts(
+            plan.clone(),
+            gpu,
+            SessionOptions {
+                gpu_timing: timing,
+                ..Default::default()
+            },
+        );
+        session.set_input("x", &[2.0, -4.0]);
+        session.set_submission_chunks(2);
+        session.set_profiling_window(Some(0..1));
+        // A pending explicit profile must be drained before query reuse.
+        session.step();
+        assert!(session.measure_step() > Duration::ZERO);
+        assert_eq!(session.read_output(2), [2.0, -4.0]);
+        assert_eq!(session.plan(), &plan);
+        assert_eq!(session.gpu_timing(), timing);
+        assert_eq!(session.profiling_window(), Some(0..1));
+        assert!(session.gpu_timings().is_empty());
+        session.step();
+        session.wait();
+        assert_eq!(session.read_output(2), [2.0, -4.0]);
+        if timing {
+            assert!(!session.gpu_timings().is_empty());
+        }
+    }
+
+    #[test]
     fn program_search_preserves_update_and_failure_contracts() {
         use crate::compile::{Dispatch, Kernel, ShaderEntry};
         use crate::schedule::{PointwiseDAG, Pw};
-        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
+        let gpu_options = crate::GpuOptions::from_env();
+        let timing = gpu_options.timing;
+        let gpu = Arc::new(crate::init_gpu_context_with(gpu_options).unwrap());
         let mut graph = crate::Graph::new();
         let x = graph.input("x", &[2]);
         let w = graph.parameter("w", &[2]);
@@ -845,7 +882,10 @@ mod tests {
             let result = select(
                 programs,
                 gpu.clone(),
-                SessionOptions::default(),
+                SessionOptions {
+                    gpu_timing: timing,
+                    ..Default::default()
+                },
                 BuildSearchOptions {
                     qualification_runs: checkpoint_runs,
                     final_qualification_runs: final_runs,
@@ -876,6 +916,8 @@ mod tests {
                     Ok(())
                 },
                 |s| {
+                    assert_eq!(s.gpu_timing(), timing);
+                    assert!(s.profiling_window().is_none());
                     if initialized.get() == max_programs
                         && invalidate.is_some_and(|name| s.plan().dispatches[0].label == name)
                     {

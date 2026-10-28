@@ -6202,6 +6202,22 @@ mod binding;
 // The execution half of `Session` continues here: waiting, stepping,
 // recording, dispatch binding and the optimizer entry points.
 impl Session {
+    /// Measure a whole-program search sample without profiling waits.
+    /// Timestamp harvesting between chunks serializes recording and GPU work;
+    /// private kernel tuning and explicit profiles keep their timing settings.
+    pub(crate) fn measure_step(&mut self) -> std::time::Duration {
+        self.wait();
+        let timing = std::mem::replace(&mut self.gpu_timing, false);
+        let window = self.profile_window.take();
+        let start = std::time::Instant::now();
+        self.step();
+        self.wait();
+        let elapsed = start.elapsed();
+        self.gpu_timing = timing;
+        self.profile_window = window;
+        elapsed
+    }
+
     /// Wait for any pending GPU work, including a caller submission reported
     /// through [`Session::track_submission`].
     pub fn wait(&mut self) {
