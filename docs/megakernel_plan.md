@@ -1206,6 +1206,18 @@ the descriptor-reference repair requires fresh measurements.
   including the corrected source-inverse identifier match, without extra timing
   or SDK captures. See
   [ready-clear snapshot reuse](megakernel_whole_graph.md#ready-clear-snapshot-reuse).
+  Pair each lane's two scalar A row operands in unchanged shared storage.
+  Check 60 layouts, 18,880 cells and 3,444,480 boundary operand cases; recover
+  all changed source through exact index inversion. Fifty diagnostics improve
+  training 0.535%, narrowly advancing to full qualification and 1,000 fixed
+  completed-step comparisons. Qualification and numerical checks pass, but
+  neither model establishes an absolute gain under both protocols; original
+  forward and prewarmed CI inference regress. Preserve the seven identical
+  strict-admission rejections on candidate and qualified matrix controls.
+  Restore 29 source hashes, both qualified binaries and fourteen smoke tests
+  without extra timing or SDK captures. Preserve 614 verified artifacts and
+  52 terminal scope receipts. See
+  [paired scalar A rows](megakernel_whole_graph.md#paired-scalar-a-rows).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
@@ -1250,6 +1262,10 @@ the descriptor-reference repair requires fresh measurements.
   Reusing the exhausted-bit clear snapshot is also closed under its fixed gate.
   Fewer possible stale-bit visits and unchanged native resources do not prove
   recoverable time; keep its exact scan/publication proof and failed timing gate.
+  Pairing scalar A rows is closed under its fixed completed-step gate. A narrow
+  diagnostic gain, adjacent scalar source addresses and fewer native registers
+  do not establish a retained improvement. Preserve both protocols and their
+  regression checks without adding runs or sweeping layouts after failure.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,

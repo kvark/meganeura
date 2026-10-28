@@ -222,6 +222,13 @@ discarding stale bits without an extra memory operation. Forward/training GPU
 time changes +0.25%/−0.09%, below the fixed improvement threshold. The candidate
 is restored without further timing or SDK captures.
 
+The subsequent [paired scalar A rows](#paired-scalar-a-rows) make each lane's
+two shared operands adjacent while preserving capacity and arithmetic.
+Training passes the diagnostic screen at −0.535%, but 1,000 completed-step
+comparisons establish no absolute model gain under both protocols. Original
+forward and prewarmed CI inference regress. The candidate is restored without
+additional timing or SDK captures; fewer registers do not establish a gain.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -3598,6 +3605,90 @@ verifies **367 artifacts and seventeen terminal scope receipts**, SHA-256
 Peak job memory is **3,713,695,744 bytes**, with zero memory-high/max/OOM events
 or swap. Heavy jobs use separate verified 16/20/1 GiB cgroups, GPU work is
 serialized, and artifacts remain on local `/x`. Baseline parity remains unmet.
+
+## Paired scalar A rows
+
+This experiment starts from `1e54dc6`, with qualified runtime `c3ad104`.
+Nsight Graphics source samples place MIOThrottle waits at shared A/B loads in
+the narrow scalar forward handler. Those are waiting-warp samples, not elapsed
+cost. This probe permutes shared A for F32 scalar matmul tiles with 32 rows,
+placing each lane's two row operands at adjacent scalar addresses. Normal,
+transposed, fused and horizontal variants use the same transformation; other
+tile heights, weight formats and convolution keep their original layout.
+
+For stride `K_STAGE+1`, the address changes from `row*stride+k` to
+`((row/2)*stride+k)*2+row%2`. The low bit identifies the row component;
+division and remainder recover the row pair and K index. This is a bijection
+of the entire padded array. Scalar reads/writes, capacity, global addresses,
+masks, FMA order, B staging, geometry, barriers, fences and scheduler operations
+remain unchanged. Adjacent source addresses do not prove native load combining.
+
+The finite checker covers **60 layouts, 18,880 cells, 35,840 staging writes,
+573,440 operand reads and 3,444,480 boundary cases**. Ownership, operand order,
+packing offsets and sentinel separation pass. Of 61 generated sources,
+**46 remain exact**; symbolic index inversion recovers ten ordinary sources
+and all five graph shaders after temporary renaming. Scratch declarations and
+every atomic/fence remain exact. Three positive and six negative audit controls
+check the verifier. No compiler-fork or memory-contract change is needed.
+
+Fifty fixed diagnostics pass state, selection, allocation, optimizer, exact
+work, one-dispatch and no-fallback checks. Maximum model error is 4.66e-9.
+
+| Persistent GPU diagnostic | Qualified | Paired A rows | Change |
+|---|---:|---:|---:|
+| Model forward | 4.070496 ms | 4.074720 ms | +0.104% |
+| Model training | 12.735744 ms | 12.667616 ms | −0.535% |
+
+Training narrowly passes the 0.5% advancement threshold. CI inference/backward/
+SGD changes −1.542%/+0.047%/+2.625%; regression guards pass. Model registers
+fall **86→84 / 84→81**, shared storage stays **18,928/29,344 bytes**, and code
+grows **102,400→103,552 / 241,664→243,328 bytes**. Participation stays 168/168
+with all 256 workers enabled. Main work remains 22,042/83,312 tiles, plus
+97,522 SGD tiles in four phases. These counts do not establish native occupancy
+or identify a causal performance improvement.
+
+The final generator produces indices directly instead of rewriting generated
+strings. All **61 emitted shaders, native statistics and allocations** match
+the prototype; five final state checks pass. Qualification passes **676 library
+tests (eight ignored), 168 strict oracle tests, 51 ordinary matrix tests,
+52 codegen checks, fourteen whole-graph smoke tests, Clippy and Metal compilation**.
+Metal GPU execution is not qualified. Forcing the entire ordinary matrix suite
+through strict whole-graph admission yields seven unsupported-case rejections
+on both candidate and freshly rebuilt qualified runtime: two physical-workgroup
+and five scalar-type restrictions. Both **44-pass/7-fail, exit-101** records and
+their exact matching errors remain archived; they are not numerical failures
+or omitted successful tests.
+
+The fixed completed-step gate uses **1,000 comparisons**, 500 without prewarming
+and 500 with 100 ms per-sample prewarming. Each protocol visits qualified,
+candidate, candidate, qualified, with 25 pairs per case/visit. Ten minimum
+warmup pairs and at least one second of warmup precede measurement. All states,
+selections, allocations and completed-work checks pass. Intervals use 10,000
+bootstrap resamples with seed 2026102619.
+
+| Protocol, model | Qualified persistent ms | Candidate persistent ms | Candidate/qualified, 95% interval |
+|---|---:|---:|---:|
+| Original, forward | 4.287622 | 4.625859 | 1.0789 [1.0007, 1.0857] |
+| Original, training | 15.034597 | 15.061203 | 1.0018 [0.9792, 1.0177] |
+| Prewarmed, forward | 4.340462 | 4.305797 | 0.9920 [0.9732, 1.0054] |
+| Prewarmed, training | 13.122807 | 13.091942 | 0.9976 [0.9863, 1.0093] |
+
+Neither model establishes an absolute gain under both protocols. Original
+forward also regresses, as does prewarmed CI inference at **1.0651
+[1.0123, 1.1131]**. Ordinary forward moves +9.77% original / +0.52% prewarmed;
+normalized ratios do not rescue the failed absolute gate or isolate a causal
+cost. The candidate is restored without extra timing, layout sweeps or SDK
+captures. Fewer registers and the narrow diagnostic gain do not justify retention.
+
+All **29 source/dependency hashes, both qualified binaries and fourteen restored
+smoke tests** match; both compiler forks remain clean and unchanged. Evidence
+stays under `target/scalar-a-row-pairs/`. Manifest
+`target/megakernel-results/scalar-a-row-pairs/summary.json` verifies
+**614 artifacts and 52 terminal scope receipts**, SHA-256
+`858bac0c7e26154798ed39f5e38790ecdc6010ad4ab9b6e07365a51539614253`.
+Peak job memory is **3,714,080,768 bytes**, with zero memory-high/max/OOM events
+or swap. Heavy jobs use separate verified 16/20/1 GiB cgroups; GPU work is
+serialized and artifacts remain on local `/x`. Baseline parity remains unmet.
 
 ## Completion-epoch control on the current runtime
 
