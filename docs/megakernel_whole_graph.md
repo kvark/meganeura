@@ -177,6 +177,12 @@ regresses 11.10%. Training registers fall 84→80 while participation rises
 168→252. The representation is restored; smaller register counts do not
 establish a gain or isolate the cause of the regression.
 
+The subsequent [tile strip ordering](#tile-strip-ordering) changes the order of
+independent unpacked tiles, preserving their exact coordinates and claim counts.
+Against an identical shader retaining original order, forward/training GPU time
+changes +0.47%/+0.33%. Neither model improves against both controls. The probe
+and host hooks are removed after the fixed diagnostic gate.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -2993,6 +2999,80 @@ Heavy work uses separate verified 16/20/1 GiB cgroups, GPU jobs serialize, and
 builds/copies/heavy analysis stay outside measurements. All artifacts remain
 on local `/x`. Qualified runtime `c3ad104` and its memory contract remain
 unchanged; baseline parity is unmet.
+
+## Tile strip ordering
+
+This experiment starts from `ffbf309`, retaining qualified runtime `c3ad104`.
+Earlier tile clocks showed uneven work distribution in the short-K AT stages,
+without proving idle hardware or recoverable time. This candidate tests tile
+order within a node, distinct from ready-node preference, changed tile geometry,
+claim batching or worker caps. It maps unpacked, nonsequential claims through
+strips of eight X tiles, visiting every Y coordinate before the next strip.
+The Z coordinate is unchanged. Packed handlers and sequential optimizer batches
+retain their existing coordinates and completion accounting.
+
+Each full strip contains `min(X,8) * Y` claims. The last strip uses its actual
+remaining width. Disjoint strip rectangles partition each original XY plane,
+so every original coordinate occurs exactly once. Checked host grid products
+bound intermediate arithmetic; nonempty nodes have positive divisors, and empty
+nodes skip handler execution. Original handler arithmetic, parameters, scratch,
+atomics, fences, dependency edges, optimizer eligibility and all 256 requested
+workers remain unchanged. The representation does not establish better cache
+locality or native scheduling.
+
+An unused config word selects width X for the original-order control or
+`min(X,8)` for the candidate. Both use one frozen binary and identical shaders;
+qualified execution is the third control. A finite checker verifies **17,958
+grid/mode states, 27,906,732 tile assignments and 98 large-index boundary
+samples**. Control mode exactly recovers the original order. Candidate order
+also stays unchanged when X is at most eight or Y is one.
+
+Host exports audit **204 smoke records plus five benchmark records per mode**.
+Every field matches except the config flag, including handler packing, metadata,
+parameters, edges, counters and initial readiness. Independent enumeration of
+the **66 actual eligible grid shapes and 10,510 tiles** verifies bounds,
+uniqueness and complete coordinate sets. Forward/training map 138/475 nodes;
+**57/205 nodes actually change order**, assigning new coordinates to
+3,391/31,913 claim IDs. CI order remains unchanged in both probe modes.
+
+All **61 generated sources and native-statistic multisets** match between
+probe modes. Exact inverse edits recover all five original graph shaders;
+all 56 ordinary sources remain exact. Forward/training retain **86/84 registers,
+18,928/29,344 shared bytes and 168 participating workers**. Model native code
+grows 9,472/17,408 bytes. These counts do not establish native instruction
+identity or the elapsed cost of the new coordinate calculation.
+
+The candidate passes **52 codegen checks, fourteen whole-graph smoke tests per
+mode and 75 fixed diagnostics**. Diagnostics use five pairs per case/mode, ten
+warmups lasting at least one second, 100 ms prewarming and 256 workers. Full
+state, selection, allocation, completion, optimizer, one-dispatch and no-fallback
+checks pass. Model error stays at most 4.66e-9; work remains 22,042/83,312 graph
+tiles and 97,522 SGD tiles in four phases.
+
+| Persistent GPU diagnostic | Qualified | Original-order probe | Strip order |
+|---|---:|---:|---:|
+| Model forward | 4.078880 ms | 4.086272 ms | 4.105472 ms |
+| Model training | 12.852960 ms | 12.777696 ms | 12.820096 ms |
+
+Forward changes **+0.65% against qualified / +0.47% against probe control**;
+training changes **−0.26% / +0.33%**. Neither model improves 0.5% against both
+controls. Forward exceeds its 0.5% regression guardrail against qualified;
+CI backward also exceeds its 3% guardrail at **+3.013%**. CI timing differences
+cannot be attributed to reordered coordinates, since its order is unchanged.
+The failed gate ends this experiment without a strip-width sweep, additional
+timing, full qualification or fresh SDK captures.
+
+All **25 source/dependency hashes**, both qualified binaries and fourteen
+restored smoke tests match. The selector/export are removed, and both compiler
+forks remain clean and unchanged. Evidence is local in `target/tile-strip-order/`.
+Manifest `target/megakernel-results/tile-strip-order/summary.json` independently
+verifies **907 artifacts and eighteen completed study scopes**, SHA-256
+`897f77b0c061b456466c718a671b3a4854591b2a5ef8dba85824a3a39f1a3eb7`.
+Peak job memory is **3,715,629,056 bytes**, with zero memory-limit or OOM events.
+Heavy work uses separate verified 16/20/1 GiB cgroups; GPU jobs serialize, and
+builds/copies/heavy analysis stay outside measurements. Artifacts remain on
+local `/x`. Qualified runtime `c3ad104` and its memory contract remain unchanged;
+baseline parity is unmet.
 
 ## Completion-epoch control on the current runtime
 

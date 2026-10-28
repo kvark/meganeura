@@ -1133,6 +1133,15 @@ the descriptor-reference repair requires fresh measurements.
   verified artifacts and fifteen completed study scopes without extra timing
   or SDK captures. See
   [vector parameter staging](megakernel_whole_graph.md#vector-parameter-staging).
+  Test strips of eight X tiles for unpacked, nonsequential claims against an
+  identical shader retaining original order. Prove exact coordinate coverage
+  across 17,958 grid/mode states and audit 209 metadata records per mode.
+  Pass 52 codegen checks, fourteen smoke tests per mode and 75 diagnostics.
+  Forward/training regress 0.47%/0.33% against the probe control; neither model
+  improves against both controls. Restore 25 source hashes, both binaries and
+  fourteen smoke tests without a width sweep or extra timing/SDK captures.
+  Preserve 907 verified artifacts and eighteen completed study scopes. See
+  [tile strip ordering](megakernel_whole_graph.md#tile-strip-ordering).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
@@ -1156,6 +1165,8 @@ the descriptor-reference repair requires fresh measurements.
   Vector parameter staging is closed under its failed diagnostic gate. Fewer
   registers and source-level vector loads do not establish faster execution;
   do not hide the training regression with padding or a worker cap.
+  The tested tile strip ordering is closed under its fixed gate. Exact tile
+  permutations do not establish useful locality or justify a strip-width sweep.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,
