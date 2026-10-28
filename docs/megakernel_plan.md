@@ -1069,12 +1069,24 @@ the descriptor-reference repair requires fresh measurements.
   do not guarantee elapsed delay, and this study does not measure the achieved
   polling interval or traffic. See
   [bounded idle-poll backoff](megakernel_whole_graph.md#bounded-idle-poll-backoff).
+  Test spacing node counters 128 bytes apart against qualified and a dense
+  control with identical shaders, capacity and reset size. Preserve every atomic
+  and fence; validate all padding. Pass 52 codegen checks, fourteen smoke tests
+  per layout, 75 diagnostics and exact source/layout/resource audits. Forward/
+  training regress 0.82%/1.73% against dense and 1.12%/1.68% against qualified.
+  Restore all 24 source hashes, both binaries and fourteen smoke tests. Preserve
+  479 verified artifacts and seventeen completed bounded scopes; do not add
+  spacing sweeps or SDK captures after the failed gate. No hardware contention
+  cause is established. See
+  [node-counter spacing](megakernel_whole_graph.md#node-counter-spacing).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
   on this runtime; do not mask its regression by silently capping workers.
   The tested idle-backoff delays are closed under the fixed gate; do not scan
   further tick values without new attribution and a distinct hypothesis.
+  The tested counter spacing is also closed; preserve its dense storage control
+  and regression rather than treating separated addresses as a speedup proxy.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,

@@ -137,6 +137,12 @@ The 256-tick training result improves 0.71% against qualified but regresses
 0.09% against zero delay. The experiment is restored without extra runs or a
 Naga API change; it does not establish how much polling traffic changed.
 
+The following [counter-spacing control](#node-counter-spacing) puts independent
+node counters 128 bytes apart, with identical shaders and storage in a dense
+control. Forward/training GPU time regresses 0.82%/1.73% against dense and
+1.12%/1.68% against qualified execution. The fixed gate fails; the layout is
+restored without extra runs or fresh SDK captures.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -2456,6 +2462,85 @@ Heavy jobs use separate verified 16/20/1 GiB cgroups. GPU jobs serialize, and
 measurements do not overlap builds, copies or heavy analysis. All launched
 jobs finish. Qualified runtime `c3ad104`, its memory contract and dependency
 pins remain unchanged; baseline parity is unmet.
+
+## Node-counter spacing
+
+Starting from `b9fe9fe`, this diagnostic changes only the physical placement of
+the three atomic counters per node: allocation, completion and dependency.
+Dense counters remain four bytes apart; spaced counters are 128 bytes apart.
+Both probe modes use the same frozen binary, generated shaders, 32-byte Config,
+counter-region alignment, queue capacity, reset-copy size and histogram offset.
+Only the uniform counter stride and initial counter-value positions differ.
+The dense control reserves the same unused space as the spaced variant. A
+separate qualified control accounts for the added address calculation, alignment
+and reserved capacity. The spacing is a diagnostic choice, not a claimed
+universal cache-line or atomic granularity.
+
+Logical counter `(node, role)` maps to `base + (3*node + role)*stride`, for
+stride 1 or 32 words. The base rounds past the header, ready bitmap and summary
+to a multiple of 32 words. Reserving `3*N*32` words makes the mapping injective
+and disjoint from the following worker histogram. Checked host arithmetic
+rejects overflow before allocation; every shader intermediate is bounded by
+that checked total. Initialization and completion validation use the same
+mapping. Completion additionally checks that every unused padding word remains
+zero, including the aligned gap and the dense control's unused tail.
+
+Each logical counter retains its original modification order, atomic operands,
+ownership rules and fence/RMW chains. No atomic operation, fence, shader branch,
+eligibility rule or worker count changes. The unused Config node-count word
+becomes the stride at the same offset; actual node construction and completion
+counts remain intact. All immutable node metadata, dependencies, parameters,
+descriptors, handler arithmetic and payload allocation keep their meaning.
+Naga and Blade remain unchanged.
+
+Formatting, release builds, **52 codegen checks and fourteen whole-graph smoke
+tests in each layout** pass. The fixed **75 diagnostic comparisons** use
+qualified/dense/spaced visits, five pairs per case/visit, ten warmups, at least
+one warmup second and 100 ms prewarming. All full-state, selected-implementation,
+optimizer, completion, one-dispatch and no-fallback checks pass. Maximum model
+error remains 4.66e-9; padding checks pass throughout.
+
+All **61 probe sources** match between layouts. All **56 ordinary sources** and
+their native-statistic multisets match qualified execution. Inverting only the
+uniform-member rename and counter-address expressions recovers all five entire
+qualified graph sources, including every handler, guard, fence and atomic.
+Complete native-statistic multisets also match between probe layouts. The audit
+checks the actual uniform stride, counter base, histogram offset and allocation
+delta for every case. These are source/layout checks, not a formal compiler or
+Vulkan memory-model proof.
+
+| Persistent GPU diagnostic | Qualified | Dense probe | Spaced probe |
+|---|---:|---:|---:|
+| Model forward | 4.073120 ms | 4.085088 ms | 4.118784 ms |
+| Model training | 12.738688 ms | 12.732992 ms | 12.953120 ms |
+
+Spacing regresses forward/training **0.82%/1.73% against dense** and
+**1.12%/1.68% against qualified**. Both model guardrails fail, and neither
+phase meets the improvement criterion. Ordinary model GPU changes stay within 0.11%
+against qualified; CI remains within its 3% regression guardrail. All samples
+are preserved. The failed screen does not justify an extra spacing sweep,
+normal timing, full library/oracle/matrix qualification or fresh SDK captures.
+
+Forward/training registers remain **86/84**, shared bytes **18,928/29,344**, and
+participating graph workers **168** out of 256 requested. The probe adds 128
+code bytes to each model pipeline. Initial and live queue padding together add
+**114,768/392,184 scheduler bytes**, exactly matched between probe layouts;
+payload storage is unchanged. Work remains 22,042/83,312 graph tiles and 97,522
+SGD tiles in four phases. This test changes counter placement without changing
+the operations, but does not identify a cache or atomic-traffic cause for the
+observed slowdown. Lower contention was a hypothesis, not an established fact.
+
+All **24 source/dependency hashes**, both qualified binaries and fourteen
+restored smoke tests match. Both forks are clean. Local
+`target/counter-spacing/` preserves the proof, policy, patches and captures.
+Manifest `target/megakernel-results/counter-spacing/summary.json` independently
+verifies **479 artifacts and seventeen completed study scopes**, SHA-256
+`8248db4d8b628387e0f84adceae2aba7193ead4e022a18a879a612bd7b4f2d1f`.
+Peak job memory is **3,716,063,232 bytes**, with zero memory-limit or OOM events.
+Heavy work uses separate verified 16/20/1 GiB cgroups, GPU jobs serialize,
+and no build, copy or heavy analysis overlaps measurement. All launched jobs
+finish. Qualified runtime `c3ad104`, its memory contract and dependency pins
+remain unchanged; baseline parity is unmet.
 
 ## Completion-epoch control on the current runtime
 
