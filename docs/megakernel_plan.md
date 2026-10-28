@@ -1123,6 +1123,16 @@ the descriptor-reference repair requires fresh measurements.
   without extra timing or SDK captures. Preserve 909 verified artifacts and
   eighteen completed study scopes. See
   [node-bit rotation](megakernel_whole_graph.md#node-bit-rotation).
+  Test vector representation of immutable parameter storage, shared staging
+  and uniform values, retaining the host byte layout and every synchronization
+  operation. Verify 3,072 layout/lane states, 1,579,008 word mappings and exact
+  inverses of five graph shaders. Pass 52 codegen checks, fourteen smoke tests
+  and fifty fixed diagnostics. Forward changes −0.08%; training regresses
+  11.10% while registers fall 84→80 and participation rises 168→252. Restore
+  all 25 source hashes, both binaries and fourteen smoke tests. Preserve 355
+  verified artifacts and fifteen completed study scopes without extra timing
+  or SDK captures. See
+  [vector parameter staging](megakernel_whole_graph.md#vector-parameter-staging).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
@@ -1143,6 +1153,9 @@ the descriptor-reference repair requires fresh measurements.
   The tested node-bit rotation is closed under its fixed diagnostic gate.
   Structural same-word independence alone does not establish simultaneous
   readiness or recoverable time; do not sweep rotations after this failure.
+  Vector parameter staging is closed under its failed diagnostic gate. Fewer
+  registers and source-level vector loads do not establish faster execution;
+  do not hide the training regression with padding or a worker cap.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,

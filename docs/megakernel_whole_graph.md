@@ -170,6 +170,13 @@ atomic/fence. Neither model improves 0.5% against both qualified execution and
 an identical zero-rotation shader; training regresses 0.69% against the latter.
 The fixed diagnostic gate fails, and the candidate is restored.
 
+The following [vector parameter staging](#vector-parameter-staging) preserves
+every scalar parameter while grouping storage, shared staging and uniform
+values into `vec4<u32>` elements. Forward GPU time changes −0.08%, but training
+regresses 11.10%. Training registers fall 84→80 while participation rises
+168→252. The representation is restored; smaller register counts do not
+establish a gain or isolate the cause of the regression.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -2919,6 +2926,73 @@ Heavy work uses separate verified 16/20/1 GiB cgroups; GPU jobs serialize and
 measurements do not overlap builds, copies or heavy analysis. Artifacts remain
 on local `/x`. Qualified runtime `c3ad104`, its memory contract and the Naga API
 remain unchanged; baseline parity is unmet.
+
+## Vector parameter staging
+
+Starting from `5afa333`, this probe changes the representation of immutable
+parameters before handler entry. The existing stage traces include roughly
+124 µs of summed ticket-return-to-entry intervals on the observed forward
+chain, containing parameter setup, node broadcasts, fencing and probe work.
+That does not assign an isolated cost to parameter loading. Caching and
+combined broadcasts are already rejected; this experiment retains the copy
+and uniform broadcast, but represents their arrays as `vec4<u32>`.
+
+The host already rounds every parameter block to four words, with a minimum
+of four. Node offsets are multiples of that padded stride. Scalar word `i`
+becomes vector `i / 4`, component `i % 4`, retaining byte offset `4 * i`.
+Descriptor indices, descriptor offsets, plain values, bitcasts and half-word
+unpacking remain exact. The strided vector loop initializes every shared
+element before the original `workgroupUniformLoad`. It changes no host data,
+buffer allocation, descriptor binding, shared capacity or synchronization.
+All handler arithmetic, tile packing, queue operations, fences and requested
+workers remain unchanged. No compiler-fork edit or diagnostic hook is needed.
+
+A finite checker verifies **3,072 block-size/lane-count states and 1,579,008
+word mappings**, including both half-word offsets. The general correspondence
+also follows from the padded host stride and index arithmetic; finite tests
+alone are not a complete compiler proof. Exact inverse edits recover all five
+original graph shaders. All **56 ordinary sources and ordinary native-statistic
+multisets remain exact**. The measured model blocks retain **80/112 bytes**, now
+five/seven vectors. Source vectors do not establish native vector instructions.
+
+The probe passes **52 codegen checks, fourteen whole-graph smoke tests and fifty
+fixed diagnostics**. Diagnostics use five pairs per case/mode, ten warmups
+lasting at least one second, 100 ms prewarming and 256 requested workers.
+Every full-state, selection, allocation, completion, optimizer, one-dispatch
+and no-fallback check passes. Maximum model error is 4.66e-9; graph work remains
+22,042/83,312 logical tiles, with 97,522 SGD tiles across four phases.
+
+| Persistent GPU diagnostic | Qualified scalar | Vector | Change |
+|---|---:|---:|---:|
+| Model forward | 4.074592 ms | 4.071296 ms | −0.08% |
+| Model training | 12.741920 ms | 14.156192 ms | +11.10% |
+
+Ordinary GPU medians stay within 0.06%. Neither model meets the required 0.5%
+improvement; training exceeds the 0.5% regression guardrail. CI changes
+−0.72%/+0.95%/+1.72%, within its 3% guardrail. The failed fixed gate ends the
+experiment without extra repeats, longer completed-step measurements, full
+qualification or SDK captures.
+
+Forward registers fall **86→84**, code shrinks **102,400→102,272 bytes**, and
+participation stays at 168 workers. Training registers fall **84→80**, code
+grows **241,664→241,792 bytes**, and participation rises **168→252**. Shared
+memory remains **18,928/29,344 bytes**. The training regression accompanies the
+same direction of participation change seen in earlier concurrency controls,
+but does not isolate its cause or measure simultaneous residency. Do not mask
+the failed gate by adding padding or reducing the requested worker pool.
+
+All **25 source/dependency hashes**, both qualified binaries and fourteen
+restored smoke tests match. Both compiler forks remain clean and unchanged.
+Local `target/parameter-vector-staging/` preserves the proof, layout checker,
+frozen sources/binaries, exact source inverses, resources and every sample.
+Manifest `target/megakernel-results/parameter-vector-staging/summary.json`
+independently verifies **355 artifacts and fifteen completed study scopes**,
+SHA-256 `354b43a2fd2a5da9c050db6f32c8fb9a28e9f8ac17232b18166df13d06da8fcd`.
+Peak job memory is **3,714,682,880 bytes**, with zero memory-limit or OOM events.
+Heavy work uses separate verified 16/20/1 GiB cgroups, GPU jobs serialize, and
+builds/copies/heavy analysis stay outside measurements. All artifacts remain
+on local `/x`. Qualified runtime `c3ad104` and its memory contract remain
+unchanged; baseline parity is unmet.
 
 ## Completion-epoch control on the current runtime
 
