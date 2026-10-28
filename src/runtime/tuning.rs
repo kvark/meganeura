@@ -919,19 +919,24 @@ impl Session {
         for (index, class) in classes.iter().enumerate() {
             let mut incumbent = class.initial;
             let mut next_candidate = 0;
-            if start.elapsed() < options.max_time
-                && let Some(&progress) = memo
+            if let Some(&progress) = memo
                     .as_ref()
                     .and_then(|m| m.progress.get(&memo_key(&self.plan, class)))
                 && progress.applies_to(class)
-                && self
-                    .pipelines
-                    .ensure_tune_tile(
-                        &gpu,
-                        &self.plan.dispatches[class.members[0]],
-                        progress.selected,
-                    )
-                    .is_ok()
+                // A pipeline already held by this session needs neither a
+                // probe budget nor compilation to restore its recorded tile.
+                && (self.pipelines.map.contains_key(&tile_variant(
+                    &self.plan.dispatches[class.members[0]],
+                    progress.selected,
+                )) || (start.elapsed() < options.max_time
+                    && self
+                        .pipelines
+                        .ensure_tune_tile(
+                            &gpu,
+                            &self.plan.dispatches[class.members[0]],
+                            progress.selected,
+                        )
+                        .is_ok()))
             {
                 class.install(&mut self.plan.dispatches, progress.selected);
                 report
@@ -3051,39 +3056,92 @@ mod tests {
         let small = graph.matmul(a, b);
         let large = graph.matmul(c, d);
         graph.set_outputs(vec![small, large]);
-        let mut session = Session::with_context_opts(
-            crate::compile::compile(&graph),
-            gpu.clone(),
-            crate::SessionOptions {
-                coop: crate::CoopPolicy::Disabled,
+        for (budget, cached) in [
+            (None, false),
+            (Some(Duration::ZERO), false),
+            (Some(Duration::ZERO), true),
+        ] {
+            let mut session = Session::with_context_opts(
+                crate::compile::compile(&graph),
+                gpu.clone(),
+                crate::SessionOptions {
+                    coop: crate::CoopPolicy::Disabled,
+                    ..Default::default()
+                },
+            );
+            let options = TuneOptions {
+                max_classes: 0,
+                max_time: budget.unwrap_or_else(|| TuneOptions::default().max_time),
+                calibration: TuneCalibration::Measure,
                 ..Default::default()
-            },
-        );
-        let options = TuneOptions {
-            max_classes: 0,
-            calibration: TuneCalibration::Measure,
-            ..Default::default()
-        };
-        let (classes, _) = session.tune_classes(&options);
-        assert_eq!(classes.len(), 2);
-        let tail = classes.last().unwrap();
-        let selected = tail.challengers[0];
-        let mut memo = KernelMemo::default();
-        memo.bind(&gpu, &options, false);
-        memo.progress.insert(
-            memo_key(&session.plan, tail),
-            KernelProgress {
-                selected,
-                next_candidate: tail.challengers.len(),
-            },
-        );
-        let report = session.tune_with_memo(options, Some(&mut memo)).unwrap();
-        assert_eq!(report.reused_classes, [(tail.key.clone(), selected)]);
-        assert!(report.races.is_empty() && report.outcomes.is_empty());
-        assert!(report.class_limit_reached);
-        assert!(report.calibration_time.is_zero());
-        let actual = &session.plan.dispatches[tail.members[0]];
-        assert_eq!(MatmulTile::selected(actual, None), Some(selected));
+            };
+            let (classes, _) = session.tune_classes(&options);
+            assert_eq!(classes.len(), 2);
+            let tail = classes.last().unwrap();
+            let template = session.plan.dispatches[tail.members[0]].clone();
+            let selected = *tail
+                .challengers
+                .iter()
+                .find(|&&tile| {
+                    !session
+                        .pipelines
+                        .map
+                        .contains_key(&tile_variant(&template, tile))
+                })
+                .unwrap();
+            if cached {
+                session
+                    .pipelines
+                    .ensure_tune_tile(&gpu, &template, selected)
+                    .unwrap();
+            }
+            let pipelines_before = session.pipelines.map.len();
+            let mut memo = KernelMemo::default();
+            memo.bind(&gpu, &options, false);
+            memo.progress.insert(
+                memo_key(&session.plan, tail),
+                KernelProgress {
+                    selected,
+                    next_candidate: tail.challengers.len(),
+                },
+            );
+            let report = session.tune_with_memo(options, Some(&mut memo)).unwrap();
+            let restored = cached || budget.is_none();
+            let expected = if restored { selected } else { tail.initial };
+            assert_eq!(
+                report.reused_classes,
+                if restored {
+                    vec![(tail.key.clone(), selected)]
+                } else {
+                    Vec::new()
+                }
+            );
+            assert!(report.races.is_empty() && report.outcomes.is_empty());
+            assert!(report.calibration_time.is_zero());
+            if budget.is_some() {
+                assert!(report.time_budget_exhausted);
+                assert_eq!(
+                    session.pipelines.map.len(),
+                    pipelines_before,
+                    "zero budget must not compile a missing tile"
+                );
+            } else {
+                assert!(report.class_limit_reached);
+            }
+            let actual = &session.plan.dispatches[tail.members[0]];
+            assert_eq!(MatmulTile::selected(actual, None), Some(expected));
+            session.set_input("a", &vec![0.125; 32 * 32]);
+            session.set_parameter("b", &vec![0.25; 32 * 32]);
+            session.set_input("c", &vec![0.125; 64 * 64]);
+            session.set_parameter("d", &vec![0.25; 64 * 64]);
+            session.step();
+            session.wait();
+            for (index, size, value) in [(0, 32 * 32, 1.0), (1, 64 * 64, 2.0)] {
+                let mut actual = vec![0.0; size];
+                session.read_output_by_index(index, &mut actual);
+                assert!(actual.iter().all(|&x| x == value));
+            }
+        }
     }
 
     #[test]
