@@ -286,7 +286,8 @@ fn bf16_connected_plan_cpu() {
     assert!(
         plan.dispatches
             .iter()
-            .any(|d| d.pointwise_storage.bf16_inputs != 0 && d.pointwise_storage.bf16_output)
+            .any(|d| d.pointwise_storage.bf16_inputs != 0
+                && d.pointwise_storage.output == meganeura::DType::BF16)
     );
     assert!(plan.param_types.values().all(|ty| ty.dtype == DType::F32));
     for &(param, grad) in &plan.param_grad_pairs {
@@ -316,7 +317,8 @@ fn bf16_connected_plan_cpu() {
     assert!(
         plan.dispatches
             .iter()
-            .any(|d| d.pointwise_storage.bf16_inputs == 3 && d.pointwise_storage.bf16_output)
+            .any(|d| d.pointwise_storage.bf16_inputs == 3
+                && d.pointwise_storage.output == meganeura::DType::BF16)
     );
     for &buffer in &plan.output_buffers {
         assert_eq!(plan.buffers[buffer.0 as usize], 37 * 4);
@@ -343,13 +345,13 @@ fn bf16_pointwise_shaders_validate() {
         output: 4,
     };
     for inputs in 0..8 {
-        for output in [false, true] {
+        for output in [DType::F32, DType::F16, DType::BF16] {
             let shader = meganeura::schedule::lower_pointwise_storage(
                 &dag,
                 Default::default(),
                 PointwiseStorage {
                     bf16_inputs: inputs,
-                    bf16_output: output,
+                    output,
                 },
             );
             let module = parse_with_bindings(&shader.source);

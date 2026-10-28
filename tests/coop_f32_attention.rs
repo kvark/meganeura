@@ -353,7 +353,7 @@ fn f16_products_forward_matches_f64_across_padded_heads_and_masks() {
     ) {
         return;
     }
-    for (qs, ks, hd, heads, kv_heads, window, causal) in [
+    for ((qs, ks, hd, heads, kv_heads, window, causal), kv_f16) in [
         (7, 5, 16, 2, 1, 0, false),
         (33, 19, 48, 3, 1, 0, false),
         (65, 65, 80, 3, 1, 0, true),
@@ -364,11 +364,24 @@ fn f16_products_forward_matches_f64_across_padded_heads_and_masks() {
         (19, 23, 4, 3, 1, 0, false),
         (37, 37, 12, 2, 1, 7, true),
         (31, 13, 20, 2, 2, 0, false),
-    ] {
+    ]
+    .into_iter()
+    .flat_map(|case| [(case, false), (case, true)])
+    {
         let mut graph = Graph::new();
         let q = graph.input("q", &[qs, heads * hd]);
         let k = graph.input("k", &[ks, kv_heads * hd]);
         let v = graph.input("v", &[ks, kv_heads * hd]);
+        let (q, k, v) = if kv_f16 {
+            let qb = graph.parameter("query_bias", &[heads * hd]);
+            let q = graph.bias_add(q, qb);
+            let w = graph.parameter("key_identity", &[kv_heads * hd, kv_heads * hd]);
+            let k = graph.matmul(k, w);
+            let vb = graph.parameter("value_bias", &[kv_heads * hd]);
+            (q, k, graph.bias_add(v, vb))
+        } else {
+            (q, k, v)
+        };
         let y = if window > 0 {
             graph.sliding_window_attention(
                 q,
@@ -393,9 +406,54 @@ fn f16_products_forward_matches_f64_across_padded_heads_and_masks() {
         drop(baseline);
         for d in &mut plan.dispatches {
             if d.shader.is_attention() {
-                d.shader = ShaderEntry::FlashAttentionProducts;
+                d.shader = ShaderEntry::FlashAttentionProducts { kv_f16 };
                 d.workgroups = [(qs as u32).div_ceil(16), heads as u32, 1];
             }
+        }
+        if kv_f16 {
+            let reader = plan
+                .dispatches
+                .iter()
+                .find(|d| d.shader.is_attention())
+                .unwrap();
+            let (kb, vb) = (reader.input_buffers[1], reader.input_buffers[2]);
+            for d in &mut plan.dispatches {
+                if d.output_buffer == kb {
+                    d.kernel = meganeura::compile::Kernel::CooperativeTyped {
+                        types: meganeura::codegen::MatrixTypes {
+                            output: meganeura::DType::F16,
+                            ..meganeura::codegen::MatrixTypes::F32_AS_F16
+                        },
+                        splits: 1,
+                    };
+                    d.workgroups = [
+                        (ks as u32).div_ceil(32),
+                        ((kv_heads * hd) as u32).div_ceil(32),
+                        1,
+                    ];
+                }
+                if d.output_buffer == vb {
+                    assert!(d.pointwise().is_some());
+                    d.pointwise_storage.output = meganeura::DType::F16;
+                }
+            }
+            plan.buffers[kb.0 as usize] /= 2;
+            plan.buffers[vb.0 as usize] /= 2;
+            let path = std::env::temp_dir().join(format!(
+                "meganeura-kv-{}-{}-{}-{}.ron",
+                std::process::id(),
+                qs,
+                hd,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            meganeura::cache::save_plan(&plan, &graph, &path).unwrap();
+            let loaded = meganeura::cache::load_plan(&graph, &path).unwrap().unwrap();
+            assert_eq!(loaded, plan);
+            plan = loaded;
+            std::fs::remove_file(path).unwrap();
         }
         let mut session = Session::with_context_opts(
             plan,
@@ -410,7 +468,7 @@ fn f16_products_forward_matches_f64_across_padded_heads_and_masks() {
                 .plan()
                 .dispatches
                 .iter()
-                .any(|d| d.shader == ShaderEntry::FlashAttentionProducts)
+                .any(|d| d.shader == ShaderEntry::FlashAttentionProducts { kv_f16 })
         );
         let mut feeds = reference::Feeds::new();
         for (name, len, scale, phase) in [
@@ -423,6 +481,46 @@ fn f16_products_forward_matches_f64_across_padded_heads_and_masks() {
                 .collect();
             feeds.set(name, &values);
             session.set_input(name, &values);
+        }
+        if kv_f16 {
+            let width = kv_heads * hd;
+            for (name, data) in [
+                (
+                    "key_identity",
+                    (0..width * width)
+                        .map(|i| f32::from(i / width == i % width))
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    "query_bias",
+                    (0..heads * hd)
+                        .map(|i| ((i % 7) as f32 - 3.0) / 1024.0)
+                        .collect(),
+                ),
+                (
+                    "value_bias",
+                    (0..width)
+                        .map(|i| ((i % 11) as f32 - 5.0) / 1024.0)
+                        .collect(),
+                ),
+            ] {
+                feeds.set(name, &data);
+                session.set_parameter(name, &data);
+            }
+            assert!(
+                session
+                    .plan()
+                    .dispatches
+                    .iter()
+                    .any(|d| d.pointwise_storage.output == meganeura::DType::F16)
+            );
+            assert!(
+                session
+                    .plan()
+                    .param_types
+                    .values()
+                    .all(|t| t.dtype == meganeura::DType::F32)
+            );
         }
         let expected = reference::evaluate_outputs(&graph, &feeds).unwrap();
         session.step();

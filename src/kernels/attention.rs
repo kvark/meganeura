@@ -33,6 +33,8 @@ pub(crate) fn admits_products(
         && head_dim > 0
         && rows > 0
         && crate::compile::workgroups_within_portable_limits([rows.div_ceil(16), heads, 1])
-        && attention_coop_shared_bytes(ShaderGroup::FlashAttentionProducts, head_dim)
-            <= u64::from(shared_memory_bytes)
+        && attention_coop_shared_bytes(
+            ShaderGroup::FlashAttentionProducts { kv_f16: false },
+            head_dim,
+        ) <= u64::from(shared_memory_bytes)
 }

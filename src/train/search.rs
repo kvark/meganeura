@@ -7,6 +7,7 @@ use crate::{
 };
 use serde::Serialize;
 
+mod attention_storage;
 mod measure;
 mod winograd;
 pub use measure::BuildSearchTrial;
@@ -383,7 +384,10 @@ pub fn build_measured_with_inputs(
         .all(|n| n.attention_ept_cap.is_none() && n.attention_impl.is_none());
     programs.enable_matrix_inputs(&supported, &gpu.capabilities());
     if cfg.mode == crate::Mode::Inference && cfg.options.flash_forward_coop {
-        programs.enable_forward_products(gpu.capabilities().subgroup_size);
+        programs.enable_forward_products(
+            gpu.capabilities().subgroup_size,
+            !cfg.runtime.debug && cfg.runtime.pin_buffers.is_none() && !cfg.runtime.no_alias,
+        );
     }
     let preparation_time = start.elapsed();
     measure::select(
@@ -502,6 +506,13 @@ struct Seed {
 type AttentionChoice = (u32, Option<(u32, crate::codegen::FlashAttentionShape)>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ForwardProducts {
+    Off,
+    Staged,
+    HalfKv,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct AxisChoice {
     attention: AttentionChoice,
     fuse_dispatches: bool,
@@ -509,7 +520,7 @@ struct AxisChoice {
     vector_convolutions_only: bool,
     winograd: Option<crate::DType>,
     f16_attention: bool,
-    forward_products: bool,
+    forward_products: ForwardProducts,
 }
 
 fn early_physical_cover(baseline: AxisChoice, attention: &[AttentionChoice]) -> Vec<AxisChoice> {
@@ -729,7 +740,7 @@ fn implementations(
         vector_convolutions_only: false,
         winograd: None,
         f16_attention: false,
-        forward_products: false,
+        forward_products: ForwardProducts::Off,
         fuse_dispatches: seeds
             .first()
             .is_some_and(|seed| seed.options.fuse_dispatches),
@@ -753,7 +764,7 @@ fn implementations(
                 vector_convolutions_only: false,
                 winograd: None,
                 f16_attention: false,
-                forward_products: false,
+                forward_products: ForwardProducts::Off,
             })
         })
         .filter(|&choice| seen.insert(choice))
@@ -791,6 +802,7 @@ fn implementations(
         replace_extracted_matrices: false,
         replace_extracted_attention: false,
         defer_bf16: false,
+        private_attention_storage: false,
         matrix_shapes: collections::HashMap::new(),
     }
 }
@@ -808,11 +820,12 @@ struct Implementations {
     replace_extracted_matrices: bool,
     replace_extracted_attention: bool,
     defer_bf16: bool,
+    private_attention_storage: bool,
     matrix_shapes: collections::HashMap<crate::DType, ([u32; 3], u32)>,
 }
 
 impl Implementations {
-    fn enable_forward_products(&mut self, subgroup_size: u32) {
+    fn enable_forward_products(&mut self, subgroup_size: u32, private_storage: bool) {
         if !matches!(self.caps.f16_attention_rows, 8 | 16)
             || !(4..=64).contains(&subgroup_size)
             || !subgroup_size.is_power_of_two()
@@ -831,10 +844,11 @@ impl Implementations {
                 .into_iter()
                 .filter(|choice| choice.attention.1.is_none())
                 .map(|choice| AxisChoice {
-                    forward_products: true,
+                    forward_products: ForwardProducts::Staged,
                     ..choice
                 }),
         );
+        self.private_attention_storage = private_storage;
         self.order.choices = self.choices.len();
         self.order.choice_order = (0..self.choices.len()).collect();
     }
@@ -988,7 +1002,7 @@ fn fill_attention_products(
         ) {
             continue;
         }
-        dispatch.shader = ShaderEntry::FlashAttentionProducts;
+        dispatch.shader = ShaderEntry::FlashAttentionProducts { kv_f16: false };
         dispatch.workgroups = [p.q_seq.div_ceil(16), p.packed_heads >> 16, 1];
         count += 1;
     }
@@ -1111,6 +1125,21 @@ impl measure::Frontier for Implementations {
 
     fn observe(&mut self, origin: measure::Origin, qualified: bool) {
         let choice = self.choices[origin.choice];
+        // Try the legal K/V neighbor after a qualified staged parent,
+        // even when the parent's timing loses.
+        if qualified && choice.forward_products == ForwardProducts::Staged {
+            let neighbor = AxisChoice {
+                forward_products: ForwardProducts::HalfKv,
+                ..choice
+            };
+            if let Some(index) = self.choices.iter().position(|&c| c == neighbor) {
+                if !self.order.tried.contains(&(origin.form, index))
+                    && !self.order.priority_choices.contains(&index)
+                {
+                    self.order.priority_choices.push_front(index);
+                }
+            }
+        }
         if !self.defer_bf16 {
             return;
         }
@@ -1175,6 +1204,11 @@ impl measure::Frontier for Implementations {
                     matrix_inputs: arithmetic.matrix_inputs,
                     vector_convolutions_only: arithmetic.vector_convolutions_only,
                     winograd: arithmetic.winograd,
+                    forward_products: if arithmetic.forward_products == ForwardProducts::HalfKv {
+                        ForwardProducts::HalfKv
+                    } else {
+                        active.forward_products
+                    },
                     ..active
                 };
                 if let Some(next) = self.choices.iter().position(|&choice| choice == neighbor) {
@@ -1189,6 +1223,9 @@ impl measure::Frontier for Implementations {
                 .iter()
                 .filter_map(|&index| {
                     let trial = self.choices[index];
+                    if trial.forward_products == ForwardProducts::HalfKv {
+                        return None;
+                    }
                     if trial.matrix_inputs.is_some() == trial.winograd.is_some() {
                         return None;
                     }
@@ -1309,7 +1346,7 @@ impl measure::Frontier for Implementations {
                 }
                 plan
             };
-            if forward_products
+            if forward_products != ForwardProducts::Off
                 && fill_attention_products(&mut plan, self.caps, self.shared_memory_bytes) == 0
             {
                 continue;
@@ -1325,6 +1362,25 @@ impl measure::Frontier for Implementations {
                     continue;
                 }
             }
+            if forward_products == ForwardProducts::Staged
+                && self.private_attention_storage
+                && attention_storage::fill(&mut plan.clone()) != 0
+            {
+                let neighbor = AxisChoice {
+                    forward_products: ForwardProducts::HalfKv,
+                    ..self.choices[choice_index]
+                };
+                if !self.choices.contains(&neighbor) {
+                    self.order.choice_order.push(self.choices.len());
+                    self.choices.push(neighbor);
+                    self.order.choices = self.choices.len();
+                }
+            }
+            if forward_products == ForwardProducts::HalfKv
+                && attention_storage::fill(&mut plan) == 0
+            {
+                continue;
+            }
             if let Some(storage) = winograd {
                 let (shape, subgroup) = self.matrix_shapes[&storage];
                 if winograd::fill(&mut plan, storage, shape, subgroup) == 0 {
@@ -1338,8 +1394,11 @@ impl measure::Frontier for Implementations {
             if f16_attention {
                 description.push_str(", f16_attention=true");
             }
-            if forward_products {
+            if forward_products != ForwardProducts::Off {
                 description.push_str(", forward_products=true");
+                if forward_products == ForwardProducts::HalfKv {
+                    description.push_str(", kv_storage=F16");
+                }
             }
             if let Some(dtype) = matrix_inputs {
                 description.push_str(&format!(", matrix_inputs={dtype:?}"));
@@ -1453,26 +1512,21 @@ mod tests {
         };
         let mut frontier = graph_frontier(graph);
         frontier.caps = caps;
-        frontier.enable_forward_products(32);
+        frontier.enable_forward_products(32, false);
         let baseline = frontier.next(None).unwrap();
         assert!(
             baseline
                 .plan
                 .dispatches
                 .iter()
-                .all(|d| d.shader != compile::ShaderEntry::FlashAttentionProducts)
+                .all(|d| d.shader != compile::ShaderEntry::FlashAttentionProducts { kv_f16: false })
         );
         let candidate = frontier.next(baseline.origin).unwrap();
-        assert!(
-            candidate
-                .plan
-                .dispatches
-                .iter()
-                .any(|d| d.shader == compile::ShaderEntry::FlashAttentionProducts
-                    && d.workgroups == [3, 3, 1])
-        );
+        assert!(candidate.plan.dispatches.iter().any(|d| d.shader
+            == compile::ShaderEntry::FlashAttentionProducts { kv_f16: false }
+            && d.workgroups == [3, 3, 1]));
         assert_ne!(baseline.plan, candidate.plan);
-        assert!(compile::ShaderEntry::FlashAttentionProducts.is_attention());
+        assert!(compile::ShaderEntry::FlashAttentionProducts { kv_f16: false }.is_attention());
         let restored: ExecutionPlan =
             serde_json::from_str(&serde_json::to_string(&candidate.plan).unwrap()).unwrap();
         assert_eq!(candidate.plan, restored);
@@ -1502,14 +1556,24 @@ mod tests {
         for subgroup in [0, 3, 12, 128] {
             let mut unsupported = graph_frontier((*frontier.seeds[0].graph).deep_clone());
             unsupported.caps = caps;
-            unsupported.enable_forward_products(subgroup);
-            assert!(unsupported.choices.iter().all(|c| !c.forward_products));
+            unsupported.enable_forward_products(subgroup, false);
+            assert!(
+                unsupported
+                    .choices
+                    .iter()
+                    .all(|c| c.forward_products == ForwardProducts::Off)
+            );
         }
         for policy in [crate::CoopPolicy::Disabled, crate::CoopPolicy::NativeF32] {
             let mut strict = graph_frontier((*frontier.seeds[0].graph).deep_clone());
             strict.caps = policy.filter_caps(caps);
-            strict.enable_forward_products(32);
-            assert!(strict.choices.iter().all(|c| !c.forward_products));
+            strict.enable_forward_products(32, false);
+            assert!(
+                strict
+                    .choices
+                    .iter()
+                    .all(|c| c.forward_products == ForwardProducts::Off)
+            );
         }
     }
 
@@ -2321,7 +2385,7 @@ mod tests {
             vector_convolutions_only: false,
             winograd: None,
             f16_attention: false,
-            forward_products: false,
+            forward_products: ForwardProducts::Off,
         };
         let unfused = AxisChoice {
             fuse_dispatches: false,

@@ -11,7 +11,7 @@ pub(crate) fn attention_coop_shared_bytes(group: ShaderGroup, head_dim: u32) -> 
     let (per_dim, fixed) = match group {
         ShaderGroup::FlashAttentionCoop => (128u64, 1024),
         ShaderGroup::FlashAttentionCoopF32 => (192, 1024),
-        ShaderGroup::FlashAttentionProducts => {
+        ShaderGroup::FlashAttentionProducts { .. } => {
             return 160 * u64::from(head_dim).next_multiple_of(16) + 1536;
         }
         ShaderGroup::AttentionGrad(kernel) => return kernel.shared_bytes(head_dim),
@@ -282,6 +282,14 @@ fn generate_flash_attention(
 /// The fixed query block is 16 rows; `rows` selects an advertised 8x16 or
 /// 16x16 native product. Padding keeps head/key/query tails inside scratch.
 pub fn generate_flash_attention_product_module(head_dim: u32, rows: u32) -> ShaderModule {
+    generate_flash_attention_product_storage_module(head_dim, rows, false)
+}
+
+pub(crate) fn generate_flash_attention_product_storage_module(
+    head_dim: u32,
+    rows: u32,
+    kv_f16: bool,
+) -> ShaderModule {
     assert!(head_dim > 0 && matches!(rows, 8 | 16));
     let padded = head_dim.next_multiple_of(16);
     // A four-element head stride also aligns every Q/K/V row and head.
@@ -291,6 +299,12 @@ pub fn generate_flash_attention_product_module(head_dim: u32, rows: u32) -> Shad
     } else {
         ("f32", "scalar_q", "scalar_kv")
     };
+    let (kv_type, kv_zero) = match (head_dim.is_multiple_of(4), kv_f16) {
+        (true, true) => ("vec4<f16>", "vec4<f16>(0.0)"),
+        (true, false) => ("vec4<f32>", "vec4<f32>(0.0)"),
+        (false, true) => ("f16", "f16(0.0)"),
+        (false, false) => ("f32", "0.0"),
+    };
     let template = include_str!("../shaders/flash_attention_products.wgsl");
     attention_module(
         preprocess(
@@ -299,6 +313,8 @@ pub fn generate_flash_attention_product_module(head_dim: u32, rows: u32) -> Shad
                 ("$STAGE_Q", super::template_section(template, q_stage)),
                 ("$STAGE_KV", super::template_section(template, kv_stage)),
                 ("$QKV_TYPE", input_type),
+                ("$KV_TYPE", kv_type),
+                ("$KV_ZERO", kv_zero),
                 ("$PARAMS", ATTENTION_PARAMS_WGSL),
                 ("$PV_TILES_", &((16 / rows) * (padded / 16)).to_string()),
                 ("$HEAD_TILES_", &(padded / 16).to_string()),
@@ -1436,27 +1452,31 @@ mod product_tests {
             | naga::valid::Capabilities::SUBGROUP;
         for rows in [8, 16] {
             for head_dim in [1, 4, 5, 12, 16, 20, 48, 64, 80, 128, 256] {
-                let mut module = generate_flash_attention_product_module(head_dim, rows);
-                let mut binding = 0;
-                for (_, global) in module.module.global_variables.iter_mut() {
-                    if matches!(
-                        global.space,
-                        naga::AddressSpace::Uniform | naga::AddressSpace::Storage { .. }
-                    ) {
-                        global.binding = Some(naga::ResourceBinding { group: 0, binding });
-                        binding += 1;
+                for kv_f16 in [false, true] {
+                    let mut module =
+                        generate_flash_attention_product_storage_module(head_dim, rows, kv_f16);
+                    let mut binding = 0;
+                    for (_, global) in module.module.global_variables.iter_mut() {
+                        if matches!(
+                            global.space,
+                            naga::AddressSpace::Uniform | naga::AddressSpace::Storage { .. }
+                        ) {
+                            global.binding = Some(naga::ResourceBinding { group: 0, binding });
+                            binding += 1;
+                        }
                     }
+                    let info =
+                        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), caps)
+                            .validate(&module.module)
+                            .unwrap_or_else(|e| panic!("rows={rows} head={head_dim}: {e:?}"));
+                    naga::back::spv::write_vec(
+                        &module.module,
+                        &info,
+                        &naga::back::spv::Options::default(),
+                        None,
+                    )
+                    .unwrap();
                 }
-                let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), caps)
-                    .validate(&module.module)
-                    .unwrap_or_else(|e| panic!("rows={rows} head={head_dim}: {e:?}"));
-                naga::back::spv::write_vec(
-                    &module.module,
-                    &info,
-                    &naga::back::spv::Options::default(),
-                    None,
-                )
-                .unwrap();
             }
         }
     }

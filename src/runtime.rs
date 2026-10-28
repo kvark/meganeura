@@ -1286,9 +1286,16 @@ fn precision_requirements(dispatches: &[Dispatch]) -> (Vec<crate::DType>, Vec<cr
         if matches!(
             &dispatch.shader,
             ShaderEntry::ToBF16 | ShaderEntry::FromBF16
-        ) || dispatch.pointwise_storage != crate::schedule::PointwiseStorage::default()
+        ) || dispatch.pointwise_storage.bf16_inputs != 0
         {
             add(&mut storage, DType::BF16);
+        }
+        add(&mut storage, dispatch.pointwise_storage.output);
+        if matches!(
+            dispatch.shader,
+            ShaderEntry::FlashAttentionProducts { kv_f16: true }
+        ) {
+            add(&mut storage, DType::F16);
         }
     }
     (storage, multiply)
@@ -1599,7 +1606,12 @@ mod precision_requirement_tests {
             (vec![DType::BF16], vec![DType::BF16])
         );
         let mut pointwise = Dispatch::default();
-        pointwise.pointwise_storage.bf16_output = true;
+        pointwise.pointwise_storage.output = crate::DType::F16;
+        assert_eq!(
+            precision_requirements(&[pointwise.clone()]),
+            (vec![DType::F16], vec![])
+        );
+        pointwise.pointwise_storage.output = crate::DType::BF16;
         assert_eq!(
             precision_requirements(&[pointwise]),
             (vec![DType::BF16], vec![])
@@ -2093,7 +2105,7 @@ impl Pipelines {
                 ShaderGroup::FlashAttentionCoop => {
                     crate::codegen::generate_flash_attention_coop_module(hd)
                 }
-                ShaderGroup::FlashAttentionProducts => {
+                ShaderGroup::FlashAttentionProducts { kv_f16 } => {
                     let caps = gpu.capabilities();
                     let native = auto_tune(gpu, 0).coop_caps;
                     let params = AttentionParams::from_words(&dispatch.params)
@@ -2110,9 +2122,10 @@ impl Pipelines {
                     {
                         return Err("attention products exceed device tile, subgroup or shared-memory support".into());
                     }
-                    crate::codegen::generate_flash_attention_product_module(
+                    crate::codegen::generate_flash_attention_product_storage_module(
                         hd,
                         native.f16_attention_rows,
+                        kv_f16,
                     )
                 }
                 ShaderGroup::FlashAttentionCoopF32 => {
@@ -2230,7 +2243,7 @@ impl Pipelines {
             ShaderGroup::MultiHeadAttn
             | ShaderGroup::FlashAttention
             | ShaderGroup::FlashAttentionCoop
-            | ShaderGroup::FlashAttentionProducts
+            | ShaderGroup::FlashAttentionProducts { .. }
             | ShaderGroup::FlashAttentionCoopF32 => {
                 AttentionParams::from_words(&dispatch.params).map(|p| p.head_dim)
             }
@@ -2684,7 +2697,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::MultiHeadAttn
         | ShaderEntry::FlashAttention
         | ShaderEntry::FlashAttentionCoop
-        | ShaderEntry::FlashAttentionProducts
+        | ShaderEntry::FlashAttentionProducts { .. }
         | ShaderEntry::FlashAttentionCoopF32 => MultiHeadAttnData::layout(),
         ShaderEntry::AttentionGrad(kernel) => match kernel.part {
             AttentionGradPart::Q => MultiHeadAttnGradData::layout(),
@@ -5321,6 +5334,35 @@ mod variant_tests {
         assert!(matches!(f16, Variant::CoopPrologue(..)));
         assert_ne!(f32, f16, "mixed-storage prologues must not reuse a shader");
         assert_ne!(f32.label(), f16.label());
+    }
+
+    #[test]
+    fn pointwise_and_attention_keys_include_stored_formats() {
+        let mut g = crate::Graph::new();
+        let a = g.input("a", &[32]);
+        let b = g.input("b", &[32]);
+        let y = g.add(a, b);
+        g.set_outputs(vec![y]);
+        let p = crate::compile::compile(&g);
+        let mut d = p
+            .dispatches
+            .iter()
+            .find(|d| d.pointwise().is_some())
+            .unwrap()
+            .clone();
+        let mut keys = std::collections::HashSet::new();
+        for output in [crate::DType::F32, crate::DType::F16, crate::DType::BF16] {
+            d.pointwise_storage.output = output;
+            assert!(keys.insert(Pipelines::key(&d)));
+        }
+        let mut d = Dispatch {
+            shader: ShaderEntry::FlashAttentionProducts { kv_f16: false },
+            params: vec![32, 32, 65537, 16, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        let staged = Pipelines::key(&d);
+        d.shader = ShaderEntry::FlashAttentionProducts { kv_f16: true };
+        assert_ne!(staged, Pipelines::key(&d));
     }
 
     #[test]

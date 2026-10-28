@@ -68,7 +68,7 @@ pub(super) fn fuse_boundaries(plan: &mut ExecutionPlan) {
                 && (!producer.fusion_barrier
                     || producer.pointwise_storage != PointwiseStorage::default())
             {
-                producer.pointwise_storage.bf16_output = true;
+                producer.pointwise_storage.output = crate::DType::BF16;
             } else if let Kernel::CooperativeTyped {
                 ref mut types,
                 splits: 1,

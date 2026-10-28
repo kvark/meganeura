@@ -3,8 +3,8 @@ enable f16;
 enable wgpu_cooperative_matrix;
 $PARAMS
 var<storage> src_a: array<$QKV_TYPE>;
-var<storage> src_b: array<$QKV_TYPE>;
-var<storage> bias: array<$QKV_TYPE>;
+var<storage> src_b: array<$KV_TYPE>;
+var<storage> bias: array<$KV_TYPE>;
 var<storage, read_write> dst: array<f32>;
 var<storage, read_write> lse: array<f32>;
 var<uniform> params: Params;
@@ -125,8 +125,8 @@ $STAGE_KV        workgroupBarrier();
         for (var i = tid; i < $ELEMENTSu; i += 64u) {
             let kr = i / $PADDEDu;
             let d = i % $PADDEDu;
-            var k = 0.0;
-            var v = 0.0;
+            var k = $KV_ZERO;
+            var v = $KV_ZERO;
             if t + kr < last_len && d < params.head_dim {
                 let index = (t + kr) * kv_dim + kv_head * params.head_dim + d;
                 k = src_b[index];
@@ -155,8 +155,8 @@ $STAGE_KV        workgroupBarrier();
             let i = pack * 4u;
             let kr = i / $PADDEDu;
             let d = i % $PADDEDu;
-            var k = vec4<f32>(0.0);
-            var v = vec4<f32>(0.0);
+            var k = $KV_ZERO;
+            var v = $KV_ZERO;
             if t + kr < last_len && d < params.head_dim {
                 let index = ((t + kr) * kv_dim + kv_head * params.head_dim + d) / 4u;
                 k = src_b[index];

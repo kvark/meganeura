@@ -337,7 +337,9 @@ pub enum ShaderEntry {
     /// Forward attention using native 16x16 f32 cooperative matrices.
     FlashAttentionCoopF32,
     /// F16 QK and PV products, with F32 softmax and accumulation.
-    FlashAttentionProducts,
+    FlashAttentionProducts {
+        kv_f16: bool,
+    },
     /// Attention backward; the kernel family says which part and path.
     AttentionGrad(crate::kernels::attention_grad::AttentionGrad),
     SwiGLUGradGate,
@@ -479,7 +481,7 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttn
             | ShaderEntry::FlashAttention
             | ShaderEntry::FlashAttentionCoop
-            | ShaderEntry::FlashAttentionProducts
+            | ShaderEntry::FlashAttentionProducts { .. }
             | ShaderEntry::FlashAttentionCoopF32
             | ShaderEntry::AttentionGrad(_)
             | ShaderEntry::CachedAttention
@@ -608,7 +610,7 @@ impl ShaderEntry {
             Self::FlashAttention
                 | Self::MultiHeadAttn
                 | Self::FlashAttentionCoop
-                | Self::FlashAttentionProducts
+                | Self::FlashAttentionProducts { .. }
                 | Self::FlashAttentionCoopF32
         )
     }
@@ -655,7 +657,9 @@ impl ShaderEntry {
             ShaderEntry::FlashAttention => ShaderGroup::FlashAttention,
             ShaderEntry::FlashAttentionCoop => ShaderGroup::FlashAttentionCoop,
             ShaderEntry::FlashAttentionCoopF32 => ShaderGroup::FlashAttentionCoopF32,
-            ShaderEntry::FlashAttentionProducts => ShaderGroup::FlashAttentionProducts,
+            ShaderEntry::FlashAttentionProducts { kv_f16 } => {
+                ShaderGroup::FlashAttentionProducts { kv_f16 }
+            }
             ShaderEntry::AttentionGrad(kernel) => ShaderGroup::AttentionGrad(kernel),
             ShaderEntry::SwiGLUGradGate | ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => {
                 ShaderGroup::SwiGLUGrad
@@ -780,7 +784,7 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttn
             | ShaderEntry::FlashAttention
             | ShaderEntry::FlashAttentionCoop
-            | ShaderEntry::FlashAttentionProducts
+            | ShaderEntry::FlashAttentionProducts { .. }
             | ShaderEntry::FlashAttentionCoopF32
             | ShaderEntry::AttentionGrad(_) => "main",
             ShaderEntry::SwiGLUGradGate => "swiglu_grad_gate",
@@ -2759,7 +2763,10 @@ pub fn fuse_rmsnorm_into_add(plan: &mut ExecutionPlan) {
         // absorbed a consumer (for example Gemma4's `(norm + embedding) /
         // sqrt(2)`) into its DAG, and RmsNormAdd has no pointwise epilogue,
         // so replacing that dispatch would silently drop the consumer.
-        if add.pointwise() != Some(&plain_add) || add.output_buffer == normed {
+        if add.pointwise() != Some(&plain_add)
+            || add.output_buffer == normed
+            || add.pointwise_storage != crate::schedule::PointwiseStorage::default()
+        {
             continue;
         }
         // The add's other input carries the residual.

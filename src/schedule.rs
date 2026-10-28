@@ -641,11 +641,21 @@ pub fn lower(t: &KernelTemplate) -> ShaderModule {
 }
 
 /// Storage only; generated scalar expressions and sensitive consumers stay F32.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PointwiseStorage {
     /// Bit i marks input i as BF16. Unmarked inputs are F32.
     pub bf16_inputs: u8,
-    pub bf16_output: bool,
+    /// Stored output type; scalar expressions remain F32.
+    pub output: crate::DType,
+}
+
+impl Default for PointwiseStorage {
+    fn default() -> Self {
+        Self {
+            bf16_inputs: 0,
+            output: crate::DType::F32,
+        }
+    }
 }
 
 fn lower_pointwise(dag: &PointwiseDAG, grid: GridShape) -> ShaderModule {
@@ -670,7 +680,10 @@ pub fn lower_pointwise_storage(
     let input_names = PointwiseDAG::input_binding_names(dag.n_inputs);
 
     let mut src = String::new();
-    if storage != PointwiseStorage::default() {
+    if storage.output == crate::DType::F16 {
+        src.push_str("enable f16;\n");
+    }
+    if storage.bf16_inputs != 0 || storage.output == crate::DType::BF16 {
         src.push_str("enable wgpu_bfloat16;\n");
         src.push_str(include_str!("shaders/bf16_round.wgsl"));
     }
@@ -685,7 +698,12 @@ pub fn lower_pointwise_storage(
         };
         let _ = writeln!(src, "var<storage> {name}: array<{ty}>;");
     }
-    let ty = if storage.bf16_output { "bf16" } else { "f32" };
+    let ty = match storage.output {
+        crate::DType::F32 => "f32",
+        crate::DType::F16 => "f16",
+        crate::DType::BF16 => "bf16",
+        _ => panic!("pointwise output storage must be F32, F16 or BF16"),
+    };
     let _ = writeln!(src, "var<storage, read_write> dst: array<{ty}>;");
     src.push_str("var<uniform> params: Params;\n\n");
     let _ = writeln!(src, "@compute @workgroup_size({})", grid.workgroup_size);
@@ -708,10 +726,16 @@ pub fn lower_pointwise_storage(
         |idx| load(idx, "i".into()),
         |idx, divisor, modulus| load(idx, format!("(i / {divisor}u) % {modulus}u")),
     ));
-    if storage.bf16_output {
-        let _ = writeln!(src, "    dst[i] = round_bf16(v{});", dag.output);
-    } else {
-        let _ = writeln!(src, "    dst[i] = v{};", dag.output);
+    match storage.output {
+        crate::DType::BF16 => {
+            let _ = writeln!(src, "    dst[i] = round_bf16(v{});", dag.output);
+        }
+        crate::DType::F16 => {
+            let _ = writeln!(src, "    dst[i] = f16(v{});", dag.output);
+        }
+        _ => {
+            let _ = writeln!(src, "    dst[i] = v{};", dag.output);
+        }
     }
     src.push_str("}\n");
 
