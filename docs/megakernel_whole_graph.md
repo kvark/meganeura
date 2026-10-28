@@ -111,6 +111,13 @@ while ordinary execution stays roughly flat. Model registers remain 86 forward
 and fall 84→83 in training, so register count alone does not explain the result.
 The probe is reverted and the qualified runtime remains `c3ad104`.
 
+The following [active-lane payload-fence control](#active-lane-payload-fences)
+passes full correctness qualification and improves forward GPU diagnostics
+1.56%. Its fixed 1,000 completed-step comparisons improve original forward
+2.84%, but prewarmed forward and both training intervals remain inconclusive.
+Neither model wins under both protocols, so it is reverted without extra runs
+or SDK captures. The retained memory contract remains unchanged.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -2104,6 +2111,119 @@ Peak study job memory is **3,713,859,584 bytes**, with zero memory-limit or OOM
 events. All heavy work runs in separate verified 16/20/1 GiB cgroups, GPU jobs
 serialize, and artifacts remain on local `/x`. Qualified runtime remains
 `c3ad104`; baseline parity remains unmet.
+
+## Active-lane payload fences
+
+Starting from `24d22f7`, this probe moves the two lane-level payload fences
+from the worker entry point into each handler case, guarded by that case's
+existing `graph_active_lane` value. The first fence precedes the complete
+handler/repeat sequence and the second follows it. Handler bodies, masks,
+arithmetic, geometry, parameters, scratch, descriptors and all queue operations
+remain unchanged. Every workgroup control barrier remains unconditional.
+
+The ordering argument relies on the retained inactive-access repair: smaller
+and packed handlers perform no payload storage reads or writes in inactive
+lanes, including through read-only aliases. Full-width handlers have no inactive
+lanes. Every lane that accesses payload still performs its own queue-family
+availability/visibility operations through the canonical descriptor reference.
+The successful-claim leader fence and uniform broadcasts still precede its
+acquire. Its release still precedes the same workgroup rendezvous and leader
+completion fence. Last-tile, successor-publication and epoch fences remain.
+Earlier active claims have already completed their own publication protocol;
+later active claims still acquire. Empty nodes perform no payload access.
+
+This preserves the relevant
+[Vulkan fence and memory-operation rules](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html#memory-model-synchronizes-with)
+without relying on availability/visibility chains. It is a source-level
+argument supplemented by structural and emitted-code audits, not a complete
+formal model of Vulkan executions. It does not change the production contract.
+
+Exact inverse substitutions reconstruct all five original graph sources.
+All **56 ordinary shaders** and their complete native-statistic multisets remain
+exact. A fresh audit built against pinned Naga `bc7b70bc` validates the emitted
+WGSL and checks storage reads, shared-read protection and shared/storage writes.
+All **102 adapted storage-read sites** remain guarded in both variants.
+
+A temporary output-only Blade hook captures the actual five candidate SPIR-V
+modules supplied to Vulkan, without changing emission flags or instructions.
+Every module validates. Across **71 handler cases**, both payload fences use
+the same SSA activity predicate, QueueFamily scope 5 and semantics `0x6048`.
+The acquire guard dominates the handler call; the release guard postdominates
+it. Their conditional blocks contain only the intended fence, and the remaining
+entry-point fences retain their scopes and semantics. Five audit comparisons
+bridge all 61 shader sources, full native-statistic multisets, state, allocation
+and execution records to the production candidate.
+
+The initial SPIR-V audit assumed the activity predicate would have an `OpName`.
+It did not. Its script and failed log remain archived. The corrected audit
+checks the defining `OpULessThan` and its original activity-declaration source
+line, the shared SSA predicate and both control-flow properties. Only analysis
+is rerun; no shader, test or GPU measurement changes. The hook and local Cargo
+override are removed, and both rebuilt production candidate binaries match
+their frozen hashes before normal timing.
+
+Qualification passes **676 library tests (eight ignored), 168 strict
+whole-graph oracle cases, 51 matrix regressions, 52 codegen tests and fourteen
+whole-graph smoke tests**, plus strict all-target/all-feature Clippy, formatting,
+release builds and Metal-target compilation. Metal GPU execution and additional
+hardware remain unqualified. Every state budget, selected implementation,
+allocation, optimizer phase, logical task, one-dispatch and no-fallback check
+passes. Maximum error remains 4.66e-9; all 256 workers remain enabled.
+
+Fifty production diagnostics use five interleaved pairs per case/mode, ten
+warmups, at least one warmup second and 100 ms prewarming:
+
+| Persistent GPU diagnostic, ms | Qualified | Guarded payload fences | Change |
+|---|---:|---:|---:|
+| CI inference | 0.030752 | 0.031136 | +1.25% |
+| CI forward/backward | 0.067584 | 0.067936 | +0.52% |
+| CI forward/backward/SGD | 0.072224 | 0.072224 | 0.00% |
+| SmolVLA forward | 4.077376 | 4.013792 | −1.56% |
+| SmolVLA forward/backward/SGD | 12.860416 | 12.855040 | −0.04% |
+
+This passes the fixed advancement gate. Ordinary model GPU medians remain
+2.922496→2.922496 ms forward and 10.733440→10.731808 ms training. Model
+registers remain **86/84**, shared bytes **18,928/29,344**, and participating
+workers **168**. Code grows **102,400→107,264 / 241,664→253,056 bytes**.
+These resources do not establish occupancy or isolate the effect of skipping
+inactive fences from moving them into cases.
+
+The fixed **1,000 completed-step comparisons** use qualified/candidate/candidate/
+qualified visits, 25 interleaved pairs per case/visit, all five cases and both
+original and 100 ms prewarmed protocols. Every sample and visit is retained.
+
+| Persistent completed step | Qualified, ms | Candidate, ms | Candidate/control [pooled 95% interval] |
+|---|---:|---:|---:|
+| Original forward | 4.681407 | 4.548516 | 0.9716 [0.9138, 0.9849] |
+| Prewarmed forward | 4.373801 | 4.336035 | 0.9914 [0.9274, 1.0603] |
+| Original training + SGD | 15.322953 | 15.151188 | 0.9888 [0.9665, 1.0161] |
+| Prewarmed training + SGD | 13.115031 | 13.260397 | 1.0111 [0.9901, 1.0138] |
+
+Original forward improves **2.84%**, but neither model has an absolute gain
+under both protocols. No raw persistent interval establishes a regression.
+Unchanged ordinary inference shifts −7.51% original / −8.91% prewarmed;
+original inference's normalized ratio worsens 2.22% with an interval above one.
+Ordinary forward shifts −1.89% original / +8.68% prewarmed, with both intervals
+including no change. Original forward's normalized ratio is also inconclusive.
+These ordinary shifts and broad intervals remain in the record; pooled
+bootstrap intervals do not capture all between-visit variation. There are no
+additional repeats or fresh SDK captures after the failed retention gate.
+
+**The candidate is reverted.** All 23 source/dependency hashes, the original
+Blade source hash, both qualified benchmark binaries and fourteen restored
+smoke tests match. Both forks are clean. Qualified runtime `c3ad104` and its
+all-lane payload-fence contract remain unchanged. The result does not establish
+that inactive fences are a recoverable whole-step cost; future candidates need
+a distinct mechanism and the same correctness, timing and matched SDK gates.
+
+Evidence remains under `target/active-payload-fences/`. Manifest
+`target/megakernel-results/active-payload-fences/summary.json` independently
+verifies **611 artifacts and 54 completed study scopes**, SHA-256
+`03b0e5a21385f6262af91eaec9b57f698198b11e04d733acfcff58920a689d0c`.
+Peak job memory is **3,719,712,768 bytes**, with zero memory-limit or OOM events.
+Heavy work uses separate verified 16/20/1 GiB cgroups, GPU jobs serialize,
+builds/copies/heavy analysis stay outside timing, and artifacts stay on local
+`/x`. Baseline parity remains unmet.
 
 ## Completion-epoch control on the current runtime
 

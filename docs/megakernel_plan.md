@@ -1023,9 +1023,23 @@ the descriptor-reference repair requires fresh measurements.
   alone does not explain the result. Restore all 22 source hashes, both qualified
   binaries and fourteen smoke tests without extra timing or SDK captures. See
   [native cooperative B prefetch](megakernel_whole_graph.md#native-cooperative-b-prefetch).
-  Do not repeat this lookahead, rejected scalar prefetch or subgroup-local
-  staging layouts. Further overlap or scheduling candidates need a distinct
-  mechanism supported by attribution; code size or barrier-wait percentages
+  Audit guarding lane-level payload fences with the existing activity mask.
+  Preserve every active reader/writer's direct availability/visibility and all
+  leader fences and workgroup barriers. Exact source inverses, 102 guarded
+  storage-read sites and five validated SPIR-V modules establish the intended
+  transformation; all 71 handler cases retain matching acquire/release guards
+  around their calls. Pass full library/oracle/matrix/Clippy/Metal qualification,
+  fifty diagnostics and five audit comparisons. Forward GPU diagnostics improve
+  1.56%, but 1,000 completed-step comparisons improve only original forward:
+  prewarmed forward and both training intervals remain inconclusive. Restore
+  all 23 source hashes, the temporary Blade hook, both qualified binaries and
+  fourteen smoke tests without extra runs or SDK captures. Keep the production
+  memory contract unchanged. See
+  [active-lane payload fences](megakernel_whole_graph.md#active-lane-payload-fences).
+  Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
+  staging layouts, or repeat guarded-fence timing after its failed fixed gate.
+  Further overlap or scheduling candidates need a distinct mechanism supported
+  by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,
   completed-step and matched SDK gates for any candidate that advances beyond
   diagnostics.
