@@ -235,6 +235,15 @@ An empty authoritative scan returns it to the original epoch wait/acquire.
 Forward/training GPU time changes +0.276%/+0.804%, failing the diagnostic gate
 with unchanged registers and shared memory. The candidate is restored.
 
+The next [subgroup ready-word hints](#subgroup-ready-word-hints) use parallel
+reads and a ballot before the original authoritative claim path. A matched
+serial control shares the same shader. Forward narrowly passes the diagnostic
+screen at −0.503% versus qualified execution. The finalized candidate passes
+correctness and emitted-SPIR-V checks, but 1,000 completed-step comparisons
+establish no absolute model gain under both protocols. Positive median changes
+remain inconclusive; the candidate is restored without extra timing or SDK
+captures.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -3768,6 +3777,115 @@ under `target/active-epoch-claims/`. Manifest
 Peak job memory is **3,714,015,232 bytes**, with zero memory-high/max/OOM events
 or swap. Heavy jobs use separate verified 16/20/1 GiB cgroups; GPU work is
 serialized and artifacts remain on local `/x`. Baseline parity remains unmet.
+
+## Subgroup ready-word hints
+
+Parallel ready-word hints narrowly pass the diagnostic screen, but fail the
+fixed completed-step retention gate. Neither model establishes an absolute
+wall-time gain under both original and prewarmed protocols. There are no
+established persistent regressions. The candidate is restored; qualified
+runtime `c3ad104` remains unchanged. This study starts from evidence commit
+`03dae7f`.
+
+For multiword graphs already using subgroup handlers, the first subgroup reads
+up to one subgroup's worth of cyclic ready words. All its lanes participate in
+the ballot: lanes beyond the bitmap clamp their address and contribute false.
+The leader visits the hinted words in order, using the unchanged
+`graph_claim_word` helper. Its ready-bitmap observation, allocation RMW and
+successful-claim acquire remain authoritative. Hints convey no payload
+visibility or ownership. If every hint fails, the entire original summary,
+full-bitmap fallback and epoch loop runs before caching an idle epoch. No
+shared state, workgroup barrier, allocation, payload operation or worker cap
+is added.
+
+The diagnostic control gathers the same advisory window serially on lane zero.
+Control and parallel modes use **identical shader bytes and native statistics**;
+one temporary bit in the otherwise shader-unused node-count config field
+selects the branch. Actual host node counts and all allocation/completion
+calculations stay exact. Config audits verify the bit and every other field.
+The finalized candidate removes the serial branch, config flag and experiment
+environment variables. Exact source inverses bridge those changes; final native
+statistics are recorded rather than assumed identical to the prototype.
+
+A finite address/ballot model checks **43,021 layouts, 1,744,306 ready-load
+addresses, 172,084 ballot components and 87,380 stale-hint cases**, including
+wrapped starts, subgroup sizes 1–128 and admitted maximum bitmap sizes. It
+verifies bounds, serial/parallel agreement and ordered unique hints, and that
+only the original authoritative claim can grant work. It abstracts that helper
+and fallback; it is not a complete DAG, Vulkan memory-model or progress proof.
+
+Both diagnostic modes pass **52 codegen checks and fourteen smoke tests**.
+The fixed **75 comparisons** preserve full state, implementation selection,
+allocations, optimizer phases, exact work, one dispatch and no fallback.
+Maximum model error remains 4.66e-9. **59 of 61 sources remain exact**, including
+every CI and ordinary model shader. Source inverses recover both complete
+changed graph shaders; eight negative controls reject unauthorized changes.
+
+| Persistent GPU diagnostic | Qualified | Serial hints | Parallel hints |
+|---|---:|---:|---:|
+| Model forward | 4.072704 ms | 4.181760 ms | 4.052224 ms |
+| Model training | 12.710816 ms | 12.996128 ms | 12.690048 ms |
+
+Parallel forward improves **0.503% versus qualified / 3.098% versus serial**;
+training improves **0.163% / 2.355%**. The fixed improvement and regression
+guards pass narrowly. Registers stay **86/84**, shared bytes **18,928/29,344**,
+and participation **168/168**, with all 256 workers requested. Qualified code
+sizes **102,400/241,664 bytes** become **113,664/252,800** in the dual-mode probe
+and **105,088/244,224** after removing its controls. Graph work remains
+22,042/83,312 tiles plus 97,522 SGD tiles in four phases.
+
+The finalized candidate passes **677 library tests (eight ignored), 168 strict
+graph-oracle tests, 51 ordinary matrix regressions, fourteen whole-graph smoke
+tests, Clippy and Metal compilation**. The first library attempt passes all
+676 existing tests but rejects the new fixture's unsupported `enable subgroups`
+directive. Removing only that directive fixes the fixture; every validation
+flag, including subgroup uniformity, stays enabled. Both logs and the failed
+fixture are preserved. Metal GPU execution is not qualified.
+
+Five additional state-checked pairs bridge final shader/source/resource changes.
+Another five capture the actual bound SPIR-V: **all five modules validate**.
+The audit checks subgroup-scoped ballots under the subgroup-zero guard, one
+advisory atomic load in that region, unchanged queue-atomic/fence scope and
+semantics, and ownership/acquire/ticket-publication dominance. Four scope
+mutations fail the audit. All captured shader bytes and native statistics match
+the finalized candidate. The temporary Blade hook is removed, restoring its
+source, lockfile and both candidate binary hashes exactly. This is selected
+control-flow validation, not a complete formal proof or native ISA inspection.
+
+The fixed **1,000 completed-step comparisons** disable worker tracking and use
+qualified/candidate/candidate/qualified visits, 25 pairs per case/visit, ten
+warmups and at least one warmup second. Original and 100 ms prewarmed protocols
+both preserve numerical budgets and exact selections. Bootstrap intervals use
+10,000 resamples with seed 2026102619.
+
+| Protocol | Model | Persistent candidate/qualified wall time | 95% interval |
+|---|---|---:|---:|
+| Original | Forward | 0.990657× (−0.93%) | [0.919391, 1.001469] |
+| Original | Training | 0.991579× (−0.84%) | [0.972721, 0.999512] |
+| Prewarmed | Forward | 0.994659× (−0.53%) | [0.955417, 1.002757] |
+| Prewarmed | Training | 0.988587× (−1.14%) | [0.982878, 1.004641] |
+
+Only original-protocol training excludes one. Neither model meets the required
+absolute gain under both protocols, so positive medians and the serial-control
+win do not establish retention. No extra timing, window-size sweep or SDK
+captures follow this failed gate.
+
+Ballot support is confirmed on this RTX 5080. Shipping would also require a
+queried ballot capability gate: existing subgroup/vote support does not imply
+the optional [ballot operation category](https://www.khronos.org/blog/vulkan-subgroup-tutorial).
+The rejected experiment introduces no capability assumption into retained code.
+
+Restoration verifies **29 original source/dependency hashes, both qualified
+binaries and fourteen smoke tests**; the owned hint shader is removed. Both
+compiler forks remain clean and unchanged. Evidence is under
+`target/subgroup-ready-hints/`. Manifest
+`target/megakernel-results/subgroup-ready-hints/summary.json` independently
+verifies **917 artifacts and 67 terminal scope receipts**, SHA-256
+`15b1861d1ebc6313ab39ebd6f333931fb470242c8fb41f095e895d666fe5ed91`.
+Peak job memory is **3,715,145,728 bytes**, with zero memory-limit events or swap.
+Every heavy job uses a separate verified 16/20/1 GiB cgroup; GPU jobs serialize,
+artifacts remain on local `/x`, and all launched jobs finish. Baseline parity
+remains unmet.
 
 ## Completion-epoch control on the current runtime
 

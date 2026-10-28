@@ -1230,6 +1230,19 @@ the descriptor-reference repair requires fresh measurements.
   extra timing or SDK captures. Preserve 367 artifacts and nineteen terminal
   scope receipts. See
   [completion polling after empty scans](megakernel_whole_graph.md#completion-polling-after-empty-scans).
+  Test subgroup ready-word hints against qualified execution and a serial
+  control using the same shader/config layout. Verify 43,021 address/ballot
+  layouts, exact source inverses and metadata; 75 diagnostics narrowly pass
+  with forward −0.503%. Remove experiment controls, qualify 677 library tests,
+  168 strict oracle cases, 51 matrix regressions, fourteen smoke tests and five
+  emitted SPIR-V modules. Preserve the corrected new test fixture's initial
+  parser failure. The fixed 1,000 completed-step comparisons establish no
+  absolute model gain under both protocols, despite positive medians and no
+  established regressions. Restore all 29 original hashes, both binaries and
+  fourteen smoke tests without extra timing or SDK captures. Preserve 917
+  artifacts and 67 terminal cgroup receipts. A queried ballot capability gate
+  would be required before shipping this mechanism on other devices. See
+  [subgroup ready-word hints](megakernel_whole_graph.md#subgroup-ready-word-hints).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
@@ -1282,6 +1295,10 @@ the descriptor-reference repair requires fresh measurements.
   The remaining-node load's source samples, fewer loads on successful paths
   and unchanged native resources do not establish recoverable time. Preserve
   its acquired-epoch progress argument and training regression together.
+  Subgroup ready-word hints are closed under their fixed completed-step gate.
+  The matched serial-control win and positive wall-time medians do not
+  establish an absolute gain under both protocols. Preserve the full series
+  without adding timing runs or sweeping window sizes after the failed gate.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,
