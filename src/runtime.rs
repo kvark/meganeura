@@ -2093,6 +2093,28 @@ impl Pipelines {
                 ShaderGroup::FlashAttentionCoop => {
                     crate::codegen::generate_flash_attention_coop_module(hd)
                 }
+                ShaderGroup::FlashAttentionProducts => {
+                    let caps = gpu.capabilities();
+                    let native = auto_tune(gpu, 0).coop_caps;
+                    let params = AttentionParams::from_words(&dispatch.params)
+                        .ok_or("invalid attention product parameters")?;
+                    if !(4..=64).contains(&caps.subgroup_size)
+                        || !caps.subgroup_size.is_power_of_two()
+                        || !crate::kernels::attention::admits_products(
+                            params.q_seq,
+                            hd,
+                            params.packed_heads >> 16,
+                            native,
+                            caps.max_compute_shared_memory_size,
+                        )
+                    {
+                        return Err("attention products exceed device tile, subgroup or shared-memory support".into());
+                    }
+                    crate::codegen::generate_flash_attention_product_module(
+                        hd,
+                        native.f16_attention_rows,
+                    )
+                }
                 ShaderGroup::FlashAttentionCoopF32 => {
                     let config = cooperative();
                     if config.tile_size != 16 || config.use_f16_input || config.compensated {
@@ -2208,6 +2230,7 @@ impl Pipelines {
             ShaderGroup::MultiHeadAttn
             | ShaderGroup::FlashAttention
             | ShaderGroup::FlashAttentionCoop
+            | ShaderGroup::FlashAttentionProducts
             | ShaderGroup::FlashAttentionCoopF32 => {
                 AttentionParams::from_words(&dispatch.params).map(|p| p.head_dim)
             }
@@ -2661,6 +2684,7 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::MultiHeadAttn
         | ShaderEntry::FlashAttention
         | ShaderEntry::FlashAttentionCoop
+        | ShaderEntry::FlashAttentionProducts
         | ShaderEntry::FlashAttentionCoopF32 => MultiHeadAttnData::layout(),
         ShaderEntry::AttentionGrad(kernel) => match kernel.part {
             AttentionGradPart::Q => MultiHeadAttnGradData::layout(),

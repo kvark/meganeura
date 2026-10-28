@@ -482,6 +482,7 @@ impl Session {
             ShaderEntry::MultiHeadAttn
             | ShaderEntry::FlashAttention
             | ShaderEntry::FlashAttentionCoop
+            | ShaderEntry::FlashAttentionProducts
             | ShaderEntry::FlashAttentionCoopF32 => {
                 pc.bind(
                     0,

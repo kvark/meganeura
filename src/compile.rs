@@ -336,6 +336,8 @@ pub enum ShaderEntry {
     FlashAttentionCoop,
     /// Forward attention using native 16x16 f32 cooperative matrices.
     FlashAttentionCoopF32,
+    /// F16 QK and PV products, with F32 softmax and accumulation.
+    FlashAttentionProducts,
     /// Attention backward; the kernel family says which part and path.
     AttentionGrad(crate::kernels::attention_grad::AttentionGrad),
     SwiGLUGradGate,
@@ -477,6 +479,7 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttn
             | ShaderEntry::FlashAttention
             | ShaderEntry::FlashAttentionCoop
+            | ShaderEntry::FlashAttentionProducts
             | ShaderEntry::FlashAttentionCoopF32
             | ShaderEntry::AttentionGrad(_)
             | ShaderEntry::CachedAttention
@@ -605,6 +608,7 @@ impl ShaderEntry {
             Self::FlashAttention
                 | Self::MultiHeadAttn
                 | Self::FlashAttentionCoop
+                | Self::FlashAttentionProducts
                 | Self::FlashAttentionCoopF32
         )
     }
@@ -651,6 +655,7 @@ impl ShaderEntry {
             ShaderEntry::FlashAttention => ShaderGroup::FlashAttention,
             ShaderEntry::FlashAttentionCoop => ShaderGroup::FlashAttentionCoop,
             ShaderEntry::FlashAttentionCoopF32 => ShaderGroup::FlashAttentionCoopF32,
+            ShaderEntry::FlashAttentionProducts => ShaderGroup::FlashAttentionProducts,
             ShaderEntry::AttentionGrad(kernel) => ShaderGroup::AttentionGrad(kernel),
             ShaderEntry::SwiGLUGradGate | ShaderEntry::SwiGLUGradUp | ShaderEntry::SiluGrad => {
                 ShaderGroup::SwiGLUGrad
@@ -775,6 +780,7 @@ impl ShaderEntry {
             ShaderEntry::MultiHeadAttn
             | ShaderEntry::FlashAttention
             | ShaderEntry::FlashAttentionCoop
+            | ShaderEntry::FlashAttentionProducts
             | ShaderEntry::FlashAttentionCoopF32
             | ShaderEntry::AttentionGrad(_) => "main",
             ShaderEntry::SwiGLUGradGate => "swiglu_grad_gate",
