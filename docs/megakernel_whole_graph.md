@@ -143,6 +143,13 @@ control. Forward/training GPU time regresses 0.82%/1.73% against dense and
 1.12%/1.68% against qualified execution. The fixed gate fails; the layout is
 restored without extra runs or fresh SDK captures.
 
+The subsequent [late claim-metadata fetch](#late-claim-metadata-fetch) loads
+only the claim limit and batch flags before allocation, then the full record
+on success. It establishes no model gain against both controls and regresses
+CI SGD GPU time 4.47% against the matched control. CPU export of existing
+counters finds unsuccessful attempts in 45%/22% of the final forward/training
+snapshots, but those counts do not establish saved time. The probe is removed.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -2541,6 +2548,96 @@ Heavy work uses separate verified 16/20/1 GiB cgroups, GPU jobs serialize,
 and no build, copy or heavy analysis overlaps measurement. All launched jobs
 finish. Qualified runtime `c3ad104`, its memory contract and dependency pins
 remain unchanged; baseline parity is unmet.
+
+## Late claim-metadata fetch
+
+Starting from `2d81213`, this candidate loads only `work.y` and `grid.w` before
+the tile-allocation RMW. The complete immutable GraphNode is loaded only inside
+the successful-claim branch, immediately before the existing storage fence and
+shared node/ticket writes. All three claim templates receive the same change.
+Two previously validated SPIR-V modules from the idle-backoff control confirm
+that the unchanged claim helper originally loads the complete node before its
+tile atomic. This establishes an emitted-source opportunity, not the driver's
+native load behavior or actual memory traffic.
+
+Each recording owns immutable node metadata until completion, so repeated
+component reads return the same values. The candidate retains every atomic,
+fence, branch, claim bound, exhausted-bit clear, ownership rule and worker.
+Zero-work nodes retain their count-one control task. No payload access moves
+across a fence; dependencies, publication, epoch progress, arithmetic and GPU
+allocations remain unchanged. Extra scalar reads on successful attempts may
+offset any benefit from narrowing failed attempts. Neither compiler fork nor
+its API changes.
+
+A CPU-only control exports the already-read allocation/completion/dependency
+counters, immutable claim geometry and worker histograms from `worker_tasks`.
+It adds no shader instrumentation. All **61 generated sources, GPU allocations
+and native-statistic multisets** match qualified execution exactly. The
+candidate shares that host export; its **56 ordinary sources/statistics** stay
+exact. Inverse substitutions recover all five entire qualified graph shaders
+and all three edited templates. Every handler, guard, atomic and fence remains.
+
+Formatting, release builds, **52 codegen checks and fourteen whole-graph smoke
+tests in each control/candidate build** pass. The fixed **75 diagnostics** use
+qualified/control/late visits, five pairs per five-case visit, ten warmups,
+at least one warmup second and 100 ms prewarming. Full-state, selection,
+allocation, optimizer, completion, one-dispatch and no-fallback checks pass;
+maximum model error remains 4.66e-9.
+
+| Persistent GPU diagnostic | Qualified | CPU-only control | Late fetch |
+|---|---:|---:|---:|
+| Model forward | 4.076736 ms | 4.079168 ms | 4.087552 ms |
+| Model training | 12.842688 ms | 12.720416 ms | 12.777376 ms |
+| CI forward/backward/SGD | 0.071904 ms | 0.072224 ms | 0.075456 ms |
+
+Forward changes **+0.27% against qualified / +0.21% against control**. Training
+changes **−0.51% / +0.45%**, so it has no gain against both. CI SGD regresses
+**4.94% / 4.47%**, exceeding the 3% guardrail. The failed fixed gate ends the
+experiment without extra repeats, normal timing, full library/oracle/matrix
+qualification or fresh SDK captures.
+
+The independent counter decoder checks every node's packed/sequential geometry,
+partial claims, logical tile coverage, ticket alignment, overflow bound,
+zero remaining/dependency counts and complete worker histogram. Since each
+attempt adds its immutable batch, attempts equal `next_tile / batch`; successes
+equal `ceil(max(claim_limit, 1) / batch)`. Their difference counts unsuccessful
+attempts, including zero-work control nodes without counting them as payload
+tiles. The control's **single final-step snapshot per case** gives:
+
+| Case | Attempts | Successful claims | Unsuccessful attempts |
+|---|---:|---:|---:|
+| CI inference | 1,188 | 13 | 1,175 |
+| CI forward/backward | 4,315 | 62 | 4,253 |
+| CI forward/backward/SGD | 4,523 | 77 | 4,446 |
+| Model forward | 28,800 | 15,898 | 12,902 |
+| Model training | 120,371 | 94,238 | 26,133 |
+
+The late-fetch snapshots have 12,994/25,963 failed model attempts. The control's
+failed fractions are **44.80% forward / 21.71% training**, and 98.3–98.9% in CI.
+RmsNorm 50×720 contributes the largest failed family count: 3,683 across its
+32 forward nodes and 3,357 in training. These are final-step counts, not sample
+medians, GPU traffic measurements or elapsed-time attribution. The result does
+not reopen rejected single-word prechecks, exhaustion caches or priority windows.
+Any further claim policy needs a distinct mechanism and a progress proof.
+
+Model registers remain **86/84**, shared bytes **18,928/29,344**, and participating
+workers **168** out of 256 requested. Candidate code grows by 256/128 bytes.
+CI SGD code instead shrinks 65,536→63,872 bytes despite its slowdown. Logical
+work remains 22,042/83,312 graph tiles and 97,522 SGD tiles in four phases.
+Resource sizes and unsuccessful-claim counts alone do not predict a speedup.
+
+All **24 source/dependency hashes**, both qualified binaries and fourteen
+restored smoke tests match; the host export is removed and both forks are clean.
+Local `target/claim-metadata-fetch/` preserves source, counters, proofs and raw
+measurements. Manifest
+`target/megakernel-results/claim-metadata-fetch/summary.json` independently verifies
+**531 artifacts and 23 completed study scopes**, SHA-256
+`5811380b3e7a4543948c1b6173f13c5c981a72165973fa321980a8ee4b2cc5bf`.
+Peak job memory is **3,718,524,928 bytes**, with zero memory-limit or OOM events.
+Heavy work uses separate verified 16/20/1 GiB cgroups; GPU work serializes and
+measurements do not overlap builds, copies or heavy analysis. Every launched
+job finishes. Qualified runtime `c3ad104`, its memory contract and dependency
+pins remain unchanged; baseline parity is unmet.
 
 ## Completion-epoch control on the current runtime
 

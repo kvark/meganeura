@@ -1079,6 +1079,17 @@ the descriptor-reference repair requires fresh measurements.
   spacing sweeps or SDK captures after the failed gate. No hardware contention
   cause is established. See
   [node-counter spacing](megakernel_whole_graph.md#node-counter-spacing).
+  Test fetching complete node metadata only after successful tile allocation,
+  retaining two scalar reads before the RMW and every original atomic/fence.
+  A CPU-only export control preserves all GPU sources, resources and native
+  statistics. Pass 52 codegen checks, fourteen smoke tests per build, 75
+  diagnostics and exact source inverses. No model gains against both controls;
+  CI SGD regresses 4.47% against control. Final-step counters show 12,902/26,133
+  unsuccessful model attempts, but do not establish their elapsed-time cost.
+  Restore 24 source hashes, both binaries and fourteen smoke tests; remove the
+  export. Preserve 531 verified artifacts and 23 completed bounded scopes with
+  no extra timing or SDK captures. See
+  [late claim-metadata fetch](megakernel_whole_graph.md#late-claim-metadata-fetch).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
@@ -1087,6 +1098,9 @@ the descriptor-reference repair requires fresh measurements.
   further tick values without new attribution and a distinct hypothesis.
   The tested counter spacing is also closed; preserve its dense storage control
   and regression rather than treating separated addresses as a speedup proxy.
+  Late full-node fetching is closed under the fixed gate. Use the archived
+  failed-claim counts only to motivate distinct policies with a progress proof;
+  do not reopen rejected prechecks, exhaustion caches or priority windows.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,
