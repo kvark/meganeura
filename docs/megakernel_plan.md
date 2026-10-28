@@ -1163,6 +1163,16 @@ the descriptor-reference repair requires fresh measurements.
   binaries and fourteen smoke tests without further timing or SDK captures.
   Preserve 508 verified artifacts and nineteen completed study scopes. See
   [SGD segment buckets](megakernel_whole_graph.md#sgd-segment-buckets).
+  Test a fixed-shrink SGD predecessor search without metadata or a runtime
+  selector. Prove the interval invariant over 87,636 states and 1,087,813 group
+  queries; audit all 61 emitted sources and every archived benchmark-layout
+  group. Pass 52 codegen checks, fourteen smoke tests and fifty fixed diagnostics.
+  Training changes −0.13%, below the 0.5% threshold; model native resources stay
+  unchanged. Restore all 29 source hashes, both qualified binaries and fourteen
+  smoke tests without further timing or SDK captures. Preserve 373 verified
+  artifacts and eighteen terminal scope receipts, including the corrected
+  analysis-script assumption about precompiled unused SGD pipelines. See
+  [fixed-shrink SGD search](megakernel_whole_graph.md#fixed-shrink-sgd-search).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
@@ -1190,10 +1200,12 @@ the descriptor-reference repair requires fresh measurements.
   permutations do not establish useful locality or justify a strip-width sweep.
   The tested SGD segment buckets are closed under the failed fixed gate.
   Fewer modeled search reads and the source-sample ratio do not establish a
-  speedup or justify a bucket-density sweep. A further lookup candidate needs
-  a distinct mechanism and exact group-to-segment selection, including partial
-  tiles and learning-rate scales. Preserve arithmetic, optimizer eligibility,
-  workers and the existing diagnostic/completed-step/SDK acceptance gates.
+  speedup or justify a bucket-density sweep. Fixed-shrink search is also closed:
+  simpler source control flow and unchanged model resources do not establish
+  a useful gain. A further lookup candidate needs a distinct mechanism and
+  exact group-to-segment selection, including partial tiles and learning-rate
+  scales. Preserve arithmetic, optimizer eligibility, workers and the existing
+  diagnostic/completed-step/SDK acceptance gates.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,

@@ -198,6 +198,12 @@ Training improves 0.68% against an identical-shader original-search control,
 but regresses 3.15% against qualified execution. The fixed diagnostic gate
 fails; the candidate is restored without further timing or SDK captures.
 
+The following [fixed-shrink SGD search](#fixed-shrink-sgd-search) removes the
+data-dependent interval length without adding metadata or a runtime selector.
+Training changes −0.13%, below the fixed 0.5% diagnostic threshold, with model
+native resources unchanged. It is also restored; the source-sample imbalance
+does not establish that either tested lookup transformation is useful.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -3272,6 +3278,82 @@ commands, raw samples, metadata and audits. Manifest
 Peak job memory is **3,716,972,544 bytes**, with zero memory-high/max/OOM events
 or swap. Heavy jobs use separate verified 16/20/1 GiB cgroups; GPU work is
 serialized and artifacts remain on local `/x`. Baseline parity remains unmet.
+
+## Fixed-shrink SGD search
+
+This experiment starts from `0543c01`, with qualified runtime `c3ad104`.
+It tests a search transformation distinct from the preceding bucket metadata.
+Only the SGD shader changes: start with `lo = 0` and `length = count`, probe
+`lo + floor(length / 2)`, select that index when its first group is at most the
+query, and always subtract `floor(length / 2)` from the length. The desired
+predecessor stays inside `[lo, lo + length)`. On a left step, the retained
+interval may overlap a rejected midpoint, but remains in bounds and contains
+the predecessor. Length decreases until it is one, which identifies the same
+segment. Single-segment units do no search; empty units issue no work.
+
+This changes control flow without adding a metadata index, runtime selector,
+variable divisor or allocation. Host segment construction, offsets, lengths,
+learning-rate scales, update arithmetic, optimizer eligibility, batching,
+geometry, fences, atomics and all 256 requested workers remain unchanged.
+The shared optimizer search stays unchanged for other optimizer kernels.
+
+The checker covers **87,636 states, 1,087,813 queried groups, twelve empty states
+and forty large-index cases**. It checks the interval invariant at every step
+and matches the original predecessor, including duplicate starts and partial
+tiles. It also enumerates every group in the preceding study's archived smoke,
+CI and model layouts; no new host export is added. The host construction and
+benchmark shapes remain exact. Across the four model units, search reads rise
+**491,999→537,209**, excluding final segment loads. Simpler source control flow
+therefore comes with additional comparisons; neither count predicts time.
+
+The emitted-source audit finds **57 of 61 sources unchanged**. Removing the
+helper and restoring the call recovers both ordinary SGD sources exactly.
+Replacing the new search with the original search in each combined graph
+recovers all remaining source exactly after renaming generated temporaries in
+the otherwise equivalent update. Inference, CI backward and model forward graph
+sources remain exact. This is a source/semantic audit, not a full compiler proof.
+
+The candidate passes **52 codegen checks, fourteen whole-graph smoke tests and
+fifty fixed diagnostic comparisons**. Complete state, selected implementations,
+allocations, completion, one-dispatch and no-fallback checks pass. Maximum model
+error stays 4.66e-9. Graph work remains 22,042/83,312 tiles; SGD remains 97,522
+tiles in four phases. Model registers stay **86/84**, shared storage
+**18,928/29,344 bytes**, native code **102,400/241,664 bytes**, and participation
+**168/168**. Ordinary SGD native code shrinks 1,408→1,280 bytes, while the CI
+combined SGD shader grows 65,536→65,664 bytes.
+
+| Persistent GPU diagnostic | Qualified | Fixed-shrink search | Change |
+|---|---:|---:|---:|
+| Model forward | 4.077120 ms | 4.079200 ms | +0.05% |
+| Model training | 12.732448 ms | 12.716160 ms | −0.13% |
+
+The fixed gate requires the changed training model to improve at least 0.5%,
+neither model to regress more than 0.5%, and no CI case to regress more than 3%.
+Forward is unchanged and cannot supply a credited win. All regression guards
+pass, but training does not meet the improvement threshold. The candidate is
+restored without extra timing, full qualification, completed-step acceptance
+runs or SDK captures. The raw diagnostic wall-time movement does not override
+the predeclared GPU diagnostic gate.
+
+The first analysis script incorrectly expected all compiled pipeline statistics
+to match in backward-only execution. Session construction also compiles an
+unused ordinary SGD pipeline. Its sole difference is the code-size reduction
+above; all other fields match, as do the executed combined graph's statistics.
+The corrected audit checks those facts explicitly. The rejected script and
+exit-1 receipt remain archived; analysis uses the original samples without
+repeating any benchmark.
+
+All **29 source/dependency hashes, both qualified binaries and fourteen restored
+smoke tests** match. Both compiler forks remain clean and unchanged. Evidence
+under `target/sgd-fixed-search/` includes the fixed policy, source proof, frozen
+binaries, commands and all samples. Manifest
+`target/megakernel-results/sgd-fixed-search/summary.json` independently verifies
+**373 artifacts and eighteen archived scope receipts**, SHA-256
+`1f6c7244e7f54d1f9015af71321f2e9ec0d36d8cadca0b5660a9c499040caf81`.
+All scopes are terminal. Peak job memory is **3,717,611,520 bytes**, with zero
+memory-high/max/OOM events or swap. Heavy jobs use separate verified 16/20/1 GiB
+cgroups, GPU work is serialized, and artifacts remain on local `/x`.
+Baseline parity remains unmet.
 
 ## Completion-epoch control on the current runtime
 
