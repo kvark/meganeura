@@ -130,6 +130,13 @@ but participating workers rise 168→252 and forward GPU time worsens 21.38%.
 Training improves only 0.51%. The candidate fails the model-regression guardrail
 and is reverted. Smaller resource counts alone do not predict a useful gain.
 
+The subsequent [bounded idle-poll backoff](#bounded-idle-poll-backoff) tests
+64/256 clock ticks against both qualified execution and an identical zero-delay
+probe. Neither delay improves a model phase by 0.5% against both controls.
+The 256-tick training result improves 0.71% against qualified but regresses
+0.09% against zero delay. The experiment is restored without extra runs or a
+Naga API change; it does not establish how much polling traffic changed.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -2373,6 +2380,82 @@ events. Heavy jobs use separate verified 16/20/1 GiB cgroups; GPU work serialize
 and measurements do not overlap builds, copies or heavy analysis. All launched
 jobs finish. Qualified runtime `c3ad104` and its memory contract remain unchanged;
 baseline parity is unmet.
+
+## Bounded idle-poll backoff
+
+Starting from `8e7070a`, this diagnostic adds a bounded clock loop only after
+a worker leader observes the same idle epoch again. Successful claims and
+new-epoch scans retain their original path. The loop compares elapsed low-word
+ticks against 64 or 256, with at most sixteen iterations. A zero-delay control
+returns immediately. All three probe modes use the same frozen binary and shader;
+only an otherwise unused uniform word changes. Renaming `Config.nodes` to
+`poll_ticks` preserves its offset, the 32-byte structure and all allocations.
+The real node count used for construction and completion remains unchanged.
+
+The loop contains no collective or shared write, and no clock-dependent value
+reaches a handler or uniform broadcast. Its finite iteration bound preserves
+progress independently of clock wrapping or rate. All original ownership,
+publication, epoch-acquisition and payload fences retain their order. Every
+requested worker remains live; there is no worker cap or global barrier.
+The [shader-clock specification](https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_shader_clock.html)
+does not guarantee a fixed rate or provide a code-motion barrier. These values
+are ticks, not nanoseconds, and the study does not measure achieved polling
+intervals or atomic traffic.
+
+A temporary Blade hook checks/enables the device-clock feature and replaces
+two explicit marker calls with device-scope `OpReadClockKHR`. It validates
+emitted SPIR-V before pipeline creation. An independent audit validates all
+**21 input/output pairs** and reconstructs every original module byte-for-byte
+by reversing only the two calls and added scope/capability/extension records.
+The model instruction streams match across the three modes after removing
+debug records. All 61 generated sources match across probe modes; all 56
+ordinary sources match qualified execution. Exact inverses recover all five
+qualified graph sources, preserving every handler, guard, fence and barrier.
+No Naga source or API change is introduced.
+
+Formatting, release builds, **52 codegen checks and fourteen whole-graph smoke
+tests in each of the three delay modes** pass. The fixed **100 diagnostic
+comparisons** use five pairs per case/mode, ten warmups, at least one warmup
+second and 100 ms prewarming. Complete state, selection, allocation, optimizer,
+completion, one-dispatch and no-fallback checks pass; maximum model error is
+4.66e-9. All ordinary native-statistic records stay exact. Probe-mode records
+also match each other exactly. CI records match qualified execution except
+for the source-hash pipeline label changed by the unused member rename.
+The initial audit incorrectly required that label to match; its failure is
+preserved, and the corrected audit normalizes only that label without repeating
+any GPU run.
+
+| Persistent GPU diagnostic | Qualified | Zero delay | 64 ticks | 256 ticks |
+|---|---:|---:|---:|---:|
+| Model forward | 4.078880 ms | 4.079168 ms | 4.076576 ms | 4.080544 ms |
+| Model training | 12.848736 ms | 12.746208 ms | 12.874432 ms | 12.757344 ms |
+
+The 64-tick delay changes forward/training **−0.06%/+0.20% against qualified**
+and **−0.06%/+1.01% against zero delay**, failing both the improvement criterion
+and training guardrail. The 256-tick delay changes **+0.04%/−0.71% against
+qualified**, but **+0.03%/+0.09% against zero delay**. It has no qualifying gain
+against both controls. CI remains within its 3% guardrail.
+
+All modes retain forward/training registers **86/84**, shared bytes
+**18,928/29,344** and **168 participating graph workers** out of 256 requested.
+The probe grows code from 102,400/241,664 to 104,576/244,096 bytes. Graph work
+remains 22,042/83,312 tiles, with 97,522 SGD tiles in four phases. The failed
+fixed gate ends the experiment: no extra repeats, normal timing, full
+library/oracle/matrix qualification or fresh SDK captures follow. These results
+do not prove polling cheap or identify a different delay policy as useful.
+
+All **24 main source/dependency hashes**, three modified Blade sources, both
+qualified binaries and fourteen restored smoke tests match. The temporary
+Blade helper is removed; both compiler forks are clean. Evidence stays in
+local `target/idle-poll-backoff/`. Manifest
+`target/megakernel-results/idle-poll-backoff/summary.json` independently verifies
+**670 artifacts and 24 completed study scopes**, SHA-256
+`35d44081151e276b2b9285078d2b13f9075b6f69c96dc86a5f7b0feceacce424`.
+Peak job memory is **3,716,980,736 bytes**, with zero memory-limit or OOM events.
+Heavy jobs use separate verified 16/20/1 GiB cgroups. GPU jobs serialize, and
+measurements do not overlap builds, copies or heavy analysis. All launched
+jobs finish. Qualified runtime `c3ad104`, its memory contract and dependency
+pins remain unchanged; baseline parity is unmet.
 
 ## Completion-epoch control on the current runtime
 

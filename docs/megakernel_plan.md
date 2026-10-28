@@ -1058,10 +1058,23 @@ the descriptor-reference repair requires fresh measurements.
   extra timing or SDK captures. Do not treat reduced resources or participation
   counts as proof of a cause or gain. See
   [scalar GEMV scratch pooling](megakernel_whole_graph.md#scalar-gemv-scratch-pooling).
+  Test bounded 64/256-tick idle-poll delays against qualified execution and an
+  identical zero-delay probe. Pass 52 codegen checks, fourteen smoke tests per
+  probe mode, 100 diagnostics and exact source/SPIR-V inverse audits. Neither
+  delay improves a model phase by 0.5% against both controls; 64 ticks also
+  regresses training 1.01% against zero delay. Restore 24 main hashes, three
+  Blade sources, both binaries and fourteen smoke tests; remove the temporary
+  clock helper. Preserve 670 verified artifacts and 24 completed bounded scopes
+  without extra timing or SDK captures. No Naga API change follows. Clock ticks
+  do not guarantee elapsed delay, and this study does not measure the achieved
+  polling interval or traffic. See
+  [bounded idle-poll backoff](megakernel_whole_graph.md#bounded-idle-poll-backoff).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
   on this runtime; do not mask its regression by silently capping workers.
+  The tested idle-backoff delays are closed under the fixed gate; do not scan
+  further tick values without new attribution and a distinct hypothesis.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,
