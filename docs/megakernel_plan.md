@@ -1046,9 +1046,22 @@ the descriptor-reference repair requires fresh measurements.
   fourteen smoke tests; preserve 363 verified artifacts and seventeen completed
   bounded scopes. Do not add repeats, normal timing or fresh SDK captures. See
   [disjoint ready-word scans](megakernel_whole_graph.md#disjoint-ready-word-scans).
+  Audit storing forward tree GEMV scratch as adjacent scalar components so the
+  graph can reuse its existing f32 bank. Preserve the exact reduction tree,
+  products, guards, barriers, geometry and scheduler. Pass 52 codegen checks,
+  fourteen smoke tests, four GEMV parity tests in each ordinary/strict mode and
+  fifty diagnostics. Shared memory falls 4,112 bytes in each model shader;
+  forward registers fall 86→77, but participation rises 168→252 and GPU time
+  regresses 21.38%. Training improves 0.51%, failing the combined guardrail.
+  Restore 24 source hashes, both qualified binaries and fourteen smoke tests;
+  preserve 367 verified artifacts and nineteen completed bounded scopes without
+  extra timing or SDK captures. Do not treat reduced resources or participation
+  counts as proof of a cause or gain. See
+  [scalar GEMV scratch pooling](megakernel_whole_graph.md#scalar-gemv-scratch-pooling).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
-  failed fixed gates.
+  failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
+  on this runtime; do not mask its regression by silently capping workers.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,

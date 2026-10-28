@@ -124,6 +124,12 @@ checked it. Correctness and source audits pass, but forward/training GPU
 diagnostics change +0.21%/−0.30%, below the required gain. The candidate is
 reverted without extra repeats; qualified runtime remains `c3ad104`.
 
+The following [scalar GEMV scratch pooling](#scalar-gemv-scratch-pooling) removes
+4,112 shared bytes from each model shader. Forward registers also fall 86→77,
+but participating workers rise 168→252 and forward GPU time worsens 21.38%.
+Training improves only 0.51%. The candidate fails the model-regression guardrail
+and is reverted. Smaller resource counts alone do not predict a useful gain.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -2296,6 +2302,77 @@ events. Heavy jobs use separate verified 16/20/1 GiB cgroups. GPU work is
 serialized, and builds/copies/heavy analysis stay outside measurements. All
 launched jobs finish; artifacts remain on local `/x` storage. Qualified runtime
 `c3ad104` and its memory contract remain unchanged. Baseline parity is unmet.
+
+## Scalar GEMV scratch pooling
+
+Starting from `3689ef1`, this candidate represents forward tree GEMV's vector
+scratch as four adjacent f32 components. The ordinary and persistent generators
+share the change. In a combined graph, the existing scalar bank is large enough
+to hold those elements, so the separate vector bank and its sentinel disappear.
+Subgroup reductions, transposed GEMV and integer-dot templates stay unchanged.
+
+Element `i`, component `c` maps bijectively to `4*i+c`. Reads reconstruct the
+original vector before its original vector addition; stores split the result
+without conversion. Each reduction step writes the first half and reads the
+disjoint second half, retaining column grouping and the original barrier. The
+last pair is still added by lane zero. The existing allocator separates arrays
+live within a handler and packed tile groups; the tile reset and handler-boundary
+barriers protect scratch reuse. Products, tree order, fused addends, storage
+guards, output coordinates, fences and queue operations remain unchanged.
+
+Qualification for the diagnostic screen passes formatting, release builds,
+**52 codegen checks, fourteen whole-graph smoke tests and four GEMV parity tests
+in each ordinary/strict whole-graph mode**. The GEMV suite covers reduction
+widths, grouped columns, row/K tails, fused addends and normalization. Fifty
+diagnostic comparisons preserve selected implementations, allocation, full
+state, optimizer work, completion, one dispatch and no fallback. Maximum model
+error remains 4.66e-9. Runs use five pairs per case/mode, ten warmups, at least
+one warmup second and matched 100 ms prewarming.
+
+The changed ordinary GEMV source has an exact inverse. All nineteen CI sources
+and the other thirty-nine ordinary model sources remain exact. Every ordinary
+native-statistic multiset also remains exact, including GEMV; this does not
+establish native instruction identity. The graph audit reconstructs both entire
+original sources outside the changed GEMV function, accounting for bank renaming
+and the removed sentinel initialization. Within that function it checks all
+sixteen reconstructed vector loads, 64 scalar loads, 32 scalar stores, eight
+reduction strides, nine barriers, reset coverage, unchanged products and output
+guards. This source audit supplements the layout argument, not a formal compiler
+or Vulkan memory-model proof.
+
+| Persistent model resource or GPU diagnostic | Qualified forward | Candidate forward | Qualified training | Candidate training |
+|---|---:|---:|---:|---:|
+| GPU time | 4.079008 ms | 4.951104 ms | 12.903296 ms | 12.837504 ms |
+| Registers | 86 | 77 | 84 | 84 |
+| Shared bytes | 18,928 | 14,816 | 29,344 | 25,232 |
+| Code bytes | 102,400 | 102,784 | 241,664 | 242,304 |
+| Participating workers | 168 | 252 | 168 | 168 |
+
+Forward GPU time regresses **21.38%**, while training improves **0.51%**.
+Ordinary GPU changes are +0.002% forward / −0.26% training. CI GPU changes are
++2.11%/+0.47%/+0.62% on unchanged shaders. All 256 requested workers remain
+enabled, with 22,042/83,312 logical graph tiles and 97,522 SGD tiles in four
+unchanged phases. Queue and payload allocations are unchanged.
+
+The forward result contradicts using lower registers or shared capacity as a
+speedup proxy. Increased participation is consistent with concurrency effects,
+but does not measure occupancy or isolate them from the changed GEMV body,
+scratch addresses and native compilation. No new counter attribution is claimed.
+The candidate fails the fixed model-regression guardrail and is reverted without
+extra repeats, normal timing, full library/oracle/matrix qualification or fresh
+SDK captures. This result does not justify a worker cap or weakened gates.
+
+All **24 source/dependency hashes**, both qualified binaries and fourteen
+restored smoke tests match; both compiler forks remain clean. Evidence stays in
+local `target/gemv-scalar-scratch/`. Manifest
+`target/megakernel-results/gemv-scalar-scratch/summary.json` independently verifies
+**367 artifacts and nineteen completed study scopes**, SHA-256
+`d44f14b8114080911997ebaa421c2747f6882f1fa56de415cc890669d6b74034`.
+Peak recorded memory is **3,715,629,056 bytes**, with zero memory-limit or OOM
+events. Heavy jobs use separate verified 16/20/1 GiB cgroups; GPU work serializes
+and measurements do not overlap builds, copies or heavy analysis. All launched
+jobs finish. Qualified runtime `c3ad104` and its memory contract remain unchanged;
+baseline parity is unmet.
 
 ## Completion-epoch control on the current runtime
 
