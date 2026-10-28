@@ -1173,6 +1173,16 @@ the descriptor-reference repair requires fresh measurements.
   artifacts and eighteen terminal scope receipts, including the corrected
   analysis-script assumption about precompiled unused SGD pipelines. See
   [fixed-shrink SGD search](megakernel_whole_graph.md#fixed-shrink-sgd-search).
+  Test four-component shared B stores for eligible half-precision cooperative
+  products using the existing vector-pointer API and quarter matrix-load stride.
+  Preserve exact bytes, conversions, bounds, arithmetic, packing and synchronization.
+  Audit 2,560 byte addresses, 1,072,128 lane/boundary cases and all 61 sources.
+  Pass 52 codegen checks, fourteen smoke tests and fifty fixed diagnostics.
+  Forward/training changes −0.15%/+0.13%; neither meets the 0.5% threshold.
+  Restore 29 source hashes, both qualified binaries and fourteen smoke tests.
+  Preserve 368 verified artifacts and seventeen terminal scope receipts without
+  extra timing or SDK captures. See
+  [wide cooperative shared B stores](megakernel_whole_graph.md#wide-cooperative-shared-b-stores).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
@@ -1206,6 +1216,10 @@ the descriptor-reference repair requires fresh measurements.
   exact group-to-segment selection, including partial tiles and learning-rate
   scales. Preserve arithmetic, optimizer eligibility, workers and the existing
   diagnostic/completed-step/SDK acceptance gates.
+  The tested wide cooperative shared B stores are closed under the fixed gate.
+  Fewer source store sites and smaller native code do not prove wider native
+  instructions or recoverable time. Preserve this result without sweeping vector
+  widths or masking it with padding or a worker cap.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,

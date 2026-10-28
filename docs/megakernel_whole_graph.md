@@ -204,6 +204,12 @@ Training changes −0.13%, below the fixed 0.5% diagnostic threshold, with model
 native resources unchanged. It is also restored; the source-sample imbalance
 does not establish that either tested lookup transformation is useful.
 
+The subsequent [wide cooperative shared stores](#wide-cooperative-shared-b-stores)
+group each lane's four adjacent half-precision B values into a vector store.
+Matrix-load byte strides, conversions and scratch capacity remain exact.
+Forward/training GPU time changes −0.15%/+0.13%, below the fixed improvement
+threshold. The candidate is restored without extra timing or SDK captures.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -3354,6 +3360,76 @@ All scopes are terminal. Peak job memory is **3,717,611,520 bytes**, with zero
 memory-high/max/OOM events or swap. Heavy jobs use separate verified 16/20/1 GiB
 cgroups, GPU work is serialized, and artifacts remain on local `/x`.
 Baseline parity remains unmet.
+
+## Wide cooperative shared B stores
+
+This experiment starts from `e935edb`, with qualified runtime `c3ad104`.
+The source-sampling study attributes substantial cooperative staging samples
+to the first half-value store, predominantly with Long Scoreboard stalls.
+This does not identify the store itself as the cause. The probe tests grouping
+four adjacent converted values into one shared-memory store, independently of
+the rejected global-load vectorization and prefetch probes.
+
+Eligibility is limited to untyped, uncompensated 16×16 half-precision
+cooperative products with F32 B storage and direct B staging: Normal and AT,
+including their existing prologues. Transposed B, compensated and typed paths
+retain their original representation. Each lane still reads the same global
+values, applies the same four `f16` conversions and owns the same shared bytes.
+The B arrays become `array<vec4<f16>, 64>` instead of `array<f16, 256>`.
+Fast, masked-edge and zero-fill paths all store the corresponding vector.
+
+The existing Naga API accepts the vector pointer. Cooperative loads use stride
+4 instead of 16, preserving **32 bytes per matrix row**. The
+[SPIR-V cooperative-matrix specification](https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_cooperative_matrix.html)
+defines this stride in units of the pointed-to type. No compiler fork, API,
+memory semantics or dependency pin changes. Shared initialization clears the
+same component bytes through vectors; packing offsets scale by four elements.
+Arithmetic, global bounds/addresses, geometry, batching, optimizer eligibility,
+all 256 requested workers, payload fences and queue atomics remain unchanged.
+
+The layout model checks **2,560 scalar byte addresses across ten packing/group
+states**, all matrix-load addresses, and **1,072,128 lane/boundary cases**.
+The emitted-source audit finds **57 of 61 sources unchanged**, including every
+CI source. Two ordinary modules have exact inverses after whitespace
+normalization. Only handler 10 changes in each combined model graph: expanding
+three/six vector-store sites restores twelve/twenty-four scalar-store sites,
+and restoring one/two matrix-load strides recovers the original handler after
+temporary and bank renaming. All other functions and scheduler synchronization
+match. Each scratch bank has the same byte capacity, including sentinel padding.
+These are source/layout checks, not native instruction-width attribution or
+a complete compiler proof.
+
+The candidate passes **52 codegen checks, fourteen whole-graph smoke tests and
+fifty fixed diagnostic comparisons**. State, selection, allocation, completion,
+one-dispatch and no-fallback checks pass; maximum model error stays 4.66e-9.
+Graph work remains 22,042/83,312 tiles and SGD remains 97,522 tiles in four
+phases. Model registers stay **86/84**, shared storage **18,928/29,344 bytes**,
+and participation **168/168**. Native code shrinks **102,400→102,272 bytes**
+forward and **241,664→241,408 bytes** in training.
+
+| Persistent GPU diagnostic | Qualified | Wide shared stores | Change |
+|---|---:|---:|---:|
+| Model forward | 4.074304 ms | 4.068384 ms | −0.15% |
+| Model training | 12.742624 ms | 12.759552 ms | +0.13% |
+
+Regression guards pass, but neither model improves by the required 0.5%.
+The fixed gate ends the experiment without extra timing, full qualification,
+completed-step acceptance runs or SDK captures. Smaller source store counts
+and code size do not establish a useful speedup.
+
+All **29 source/dependency hashes, both qualified binaries and fourteen restored
+smoke tests** match. Both compiler forks remain clean and unchanged. The initial
+source verifier omitted generated `memory_read` names from temporary renaming;
+its script, exit-1 receipt and diagnostic diff are preserved. Correcting that
+audit requires no new GPU run or source change.
+
+Evidence stays under `target/coop-wide-shared-b/`. Manifest
+`target/megakernel-results/coop-wide-shared-b/summary.json` independently verifies
+**368 artifacts and seventeen terminal scope receipts**, SHA-256
+`c5214bdda783f9982afc4089fcb6cab51b8931b0469491ec5382eb559749d6de`.
+Peak job memory is **3,713,527,808 bytes**, with zero memory-high/max/OOM events
+or swap. Heavy jobs use separate verified 16/20/1 GiB cgroups, GPU work is
+serialized, and artifacts remain on local `/x`. Baseline parity remains unmet.
 
 ## Completion-epoch control on the current runtime
 
