@@ -164,6 +164,12 @@ improves forward GPU diagnostics 0.59% against qualified execution. However,
 1,000 completed-step comparisons establish no absolute model gain under both
 protocols. The candidate is restored without extra timing or SDK captures.
 
+The subsequent [node-bit rotation](#node-bit-rotation) varies each worker's
+preferred node within a ready word while preserving word traversal and every
+atomic/fence. Neither model improves 0.5% against both qualified execution and
+an identical zero-rotation shader; training regresses 0.69% against the latter.
+The fixed diagnostic gate fails, and the candidate is restored.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -2839,6 +2845,80 @@ Heavy work uses separate verified 16/20/1 GiB cgroups; GPU jobs serialize,
 measurements do not overlap builds/copies/heavy analysis, and artifacts remain
 on local `/x`. Every launched job finishes. Qualified runtime `c3ad104` and its
 memory contract remain unchanged; baseline parity is unmet.
+
+## Node-bit rotation
+
+This experiment starts from `7fded2c`, with qualified runtime `c3ad104`.
+Workers already vary their starting ready word, but prefer its lowest ready
+node. The candidate varies that preference within each loaded word using
+`(worker / ready_words) & 31`. This differs from previously rejected summary
+rotation and last-successful-word cursors: word traversal remains unchanged.
+
+The current forward/training topologies contain **225/1,450 independent
+same-word node pairs**, across all five/seventeen ready words. Their initial
+ready words contain ten/eleven root nodes. These are structural opportunities,
+not observations of simultaneous readiness or recoverable elapsed time. The
+actual benchmark exports recover the archived topology and parameter data.
+
+Each leader rotates a loaded bitmap, extracts its lowest bit, and maps that
+bit back to the original node index. Failed attempts clear only that rotated
+local bit. The physical queue masks, claim RMW, summary repair, complete
+fallback scan, idle epoch, payload propagation and every original fence remain.
+No new shared state or GPU instrumentation is added. All 256 requested workers,
+kernel arithmetic, geometry and optimizer eligibility remain unchanged.
+
+A finite checker covers **246,208 mask/rotation states, 900,192 failed-claim
+prefix steps and 589,815 worker/word arithmetic states**. It verifies exact
+permutations, original ordering at zero rotation, bounded shifts and partial
+final words. Progress still relies on the unchanged complete word scan and
+publication protocol; this is not a complete formal Vulkan/compiler proof.
+
+One frozen probe binary supplies both rotated and zero-rotation modes. An
+unused config word carries the selector without changing layout or allocation;
+a temporary host export records metadata without shader instrumentation.
+Qualified execution supplies the third control. Audits cover **204 smoke
+records plus five benchmark records per mode**. Every exported field matches
+between probe modes except that config word, including parameters, edges,
+initial queue, counters, roots, tasks and claim limits.
+
+All **61 generated sources and native-statistic multisets** match between
+probe modes. All 56 ordinary sources remain exact; inverse edits recover all
+five original graph shaders and both changed templates. Single-ready-word CI
+claim logic is unchanged, so its measured timing differences cannot be
+attributed to rotation. Model registers remain **86/84**, shared storage
+**18,928/29,344 bytes**, and participating workers **168/168**. Forward/training
+native code grows 256/128 bytes. These resources do not establish a cause.
+
+The candidate passes **52 codegen tests, fourteen whole-graph smoke tests per
+probe mode and 75 fixed diagnostics**. Diagnostics use five pairs per case,
+ten warmups lasting at least one second, and 100 ms prewarming. Full-state,
+selection, allocation, completion, optimizer, one-dispatch and no-fallback
+checks pass. Model error remains at most 4.66e-9; graph work stays
+22,042/83,312 tiles and SGD work 97,522 tiles in four phases.
+
+| Persistent GPU diagnostic | Qualified | Zero rotation | Rotated |
+|---|---:|---:|---:|
+| Model forward | 4.073184 ms | 4.091680 ms | 4.077536 ms |
+| Model training | 12.831424 ms | 12.724640 ms | 12.811904 ms |
+
+Forward changes **+0.11% against qualified / −0.35% against zero rotation**;
+training changes **−0.15% / +0.69%**. Neither model improves at least 0.5%
+against both controls, and training exceeds the 0.5% regression guardrail.
+CI stays within its guardrail. The failed gate ends the experiment without
+extra repeats, longer completed-step timing, full qualification or SDK captures.
+
+All **25 original source/dependency hashes**, both qualified binaries and
+fourteen restored smoke tests match. The selector and export are removed;
+both forks remain clean and unchanged. Local `target/node-bit-rotation/`
+preserves the proof, checker, frozen sources/binaries, metadata and every
+sample. Manifest `target/megakernel-results/node-bit-rotation/summary.json`
+independently verifies **909 artifacts and eighteen completed study scopes**,
+SHA-256 `86a327e906e4f77acc64d3c405400458fefeb6ea7f11539e84468e0d114a4a18`.
+Peak job memory is **3,716,816,896 bytes**, with zero memory-limit or OOM events.
+Heavy work uses separate verified 16/20/1 GiB cgroups; GPU jobs serialize and
+measurements do not overlap builds, copies or heavy analysis. Artifacts remain
+on local `/x`. Qualified runtime `c3ad104`, its memory contract and the Naga API
+remain unchanged; baseline parity is unmet.
 
 ## Completion-epoch control on the current runtime
 

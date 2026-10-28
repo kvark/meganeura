@@ -1113,6 +1113,16 @@ the descriptor-reference repair requires fresh measurements.
   tests without extra timing or SDK captures. Preserve 1,175 verified artifacts
   and 54 completed bounded scopes. See
   [single-predecessor publication](megakernel_whole_graph.md#single-predecessor-publication).
+  Vary worker node preference within each ready word, preserving word traversal,
+  complete fallback, every atomic/fence and all requested workers. Check finite
+  bit permutations and 209 metadata records per mode; preserve an identical
+  zero-rotation shader control and qualified third control. Pass 52 codegen
+  tests, fourteen smoke tests per mode and 75 fixed diagnostics. Neither model
+  improves 0.5% against both controls; training regresses 0.69% against zero
+  rotation. Restore 25 source hashes, both binaries and fourteen smoke tests
+  without extra timing or SDK captures. Preserve 909 verified artifacts and
+  eighteen completed study scopes. See
+  [node-bit rotation](megakernel_whole_graph.md#node-bit-rotation).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
@@ -1130,6 +1140,9 @@ the descriptor-reference repair requires fresh measurements.
   Single-predecessor atomic-store publication is closed under the fixed
   completed-step gate. Do not substitute normalized forward ratios or CI gains
   for the required absolute model improvement under both protocols.
+  The tested node-bit rotation is closed under its fixed diagnostic gate.
+  Structural same-word independence alone does not establish simultaneous
+  readiness or recoverable time; do not sweep rotations after this failure.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,
