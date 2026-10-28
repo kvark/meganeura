@@ -191,6 +191,13 @@ persistent execution than ordinary dispatches; the whole SGD handler differs
 only 3.65%. This supplies a distinct lookup hypothesis, not a retained gain.
 Four captures pass complete-state checks; temporary capture hooks are removed.
 
+The subsequent [SGD segment buckets](#sgd-segment-buckets) bound the original
+binary search using predecessor indices stored in existing segment padding.
+Every tested group selects the same segment, with no additional allocation.
+Training improves 0.68% against an identical-shader original-search control,
+but regresses 3.15% against qualified execution. The fixed diagnostic gate
+fails; the candidate is restored without further timing or SDK captures.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -3163,11 +3170,11 @@ accounts for **37,649 ordinary / 158,382 persistent samples**, or **448.20 /
 2,056.91 samples per replay: 4.59×**. However, the *whole* SGD handler differs
 only **3.65%** in samples per replay (823,570/84 versus 782,492/77). Do not convert
 these ratios into time savings or claim the search explains the full gap.
-The next probe may isolate segment lookup using bounded immutable metadata or
-a proven search transformation, preserving every segment boundary, partial
-tile, learning-rate scale, update and requested worker. It must pass the
-existing five-case diagnostic and full completed-step/SDK gates. This evidence
-does not reopen larger SGD batches, worker caps or optimizer deferral.
+The following [segment-bucket probe](#sgd-segment-buckets) tests bounded
+immutable lookup metadata while preserving every segment boundary, partial
+tile, learning-rate scale, update and requested worker. It fails the fixed
+diagnostic gate against qualified execution. This evidence does not reopen
+larger SGD batches, worker caps or optimizer deferral.
 
 The default-bandwidth model probe was explicitly canceled after reaching
 **17,785,212,928 bytes** and 32,546 memory-high events; its peak swap was
@@ -3188,6 +3195,83 @@ source CSVs and analysis. Manifest
 `1675f5abbac70b0fdea616c01942add61d4c621d7624fc53778f2fdddccfbb2b`.
 All heavy jobs use separate 16/20/1 GiB cgroups, GPU jobs serialize, and artifacts
 remain on local `/x`. Baseline parity remains unmet.
+
+## SGD segment buckets
+
+This experiment starts from `f80a923`, with qualified runtime `c3ad104`.
+The preceding source samples motivate an isolated segment-lookup change;
+they do not predict its speedup. Each 32-byte segment already contains three
+unused padding words. The candidate uses two of them for predecessor indices,
+without changing allocation size, offsets, lengths, learning-rate scales or
+the arithmetic of any update. Other optimizer consumers ignore those words.
+
+For N segments and G workgroups, use 2N equal-width group buckets with width
+`ceil(G / (2N))`. Each hint names the last segment starting at or before its
+bucket boundary. The next hint, plus one, bounds the exclusive upper search
+index; the final bucket uses N. Monotonic segment starts place the original
+predecessor inside these bounds, and the original binary search selects it.
+Zero-length segments, duplicate starts, partial tiles and the last bucket are
+covered. Empty work and single-segment units retain the original path; host
+overflow guards disable the index when twice the segment count is not
+representable. Hint construction uses a 64-bit product for bucket boundaries.
+
+One frozen probe binary builds identical metadata for both modes. A temporary
+host selector sets the formerly unused SGD parameter word to zero for the
+original-search control or to the bucket width for the candidate. Both modes
+use identical shaders and allocations. Qualified execution is the third
+control. Graph construction, optimizer eligibility, batching, tile geometry,
+payload fences, queue atomics and all 256 requested workers remain unchanged.
+
+The finite checker covers **87,636 states, 1,283,708 queried groups, twelve
+empty states and forty large-index cases**, including totals through `u32::MAX`.
+Independent host-metadata checks audit three smoke records and one record from
+each benchmark suite per mode. Every field matches except the selected width;
+every actual workgroup selects the same segment. The four model units contain
+77/47/11/1 segments and 32,717/30,245/31,680/2,880 groups. Their modeled binary
+search reads fall **491,999→39,717**, excluding hint and final segment loads.
+This is semantic/read-count evidence, not measured time or a compiler proof.
+
+All **61 probe shader sources and native-statistic multisets** match between
+modes. Relative to qualified execution, 57 sources remain exact. Two ordinary
+SGD shaders have exact inverses; the two combined SGD graph shaders preserve
+update arithmetic after renaming generated temporaries, and removing the
+lookup additions recovers all remaining source exactly. Inference, CI backward
+and model forward shaders are unchanged. Their incidental timing differences
+cannot be credited to this lookup change.
+
+The probe passes **52 codegen checks, fourteen whole-graph smoke tests per mode
+and 75 fixed diagnostic comparisons**. Complete state, selection, allocation,
+completion, one-dispatch and no-fallback checks pass. Maximum model error stays
+4.66e-9, graph work stays 22,042/83,312 tiles, and SGD work stays 97,522 tiles
+in four phases. Training registers rise **84→88**, native code grows
+**241,664→248,704 bytes**, shared storage stays 29,344 bytes and participation
+stays 168. Both probe modes have the same resources; these changes alone do
+not isolate the regression's cause.
+
+| Persistent GPU diagnostic | Qualified | Original-search probe | Bucket lookup |
+|---|---:|---:|---:|
+| Model forward | 4.074528 ms | 4.080864 ms | 4.075200 ms |
+| Model training | 12.732352 ms | 13.223040 ms | 13.133152 ms |
+
+Training improves **0.68% against the identical-shader control** but regresses
+**3.15% against qualified execution**. The predeclared gate requires the changed
+training model to improve at least 0.5% against both controls, with neither
+model regressing more than 0.5% and no CI case more than 3%. Unchanged forward
+execution is only a guard. Training fails both its improvement criterion and
+regression guard. No density sweep, extra timing, full qualification,
+completed-step acceptance run or SDK capture follows this failed gate.
+
+All **29 original source/dependency hashes, both qualified binaries and fourteen
+restored smoke tests** match. The selector/export hooks and lookup changes are
+removed; both compiler forks remain clean and unchanged. Local evidence in
+`target/sgd-segment-buckets/` preserves the probe sources/binaries, fixed policy,
+commands, raw samples, metadata and audits. Manifest
+`target/megakernel-results/sgd-segment-buckets/summary.json` independently verifies
+**508 artifacts and nineteen completed study scopes**, SHA-256
+`382912dfd3aa6d39eae26561a069e3dc79535e6e2c780c0958c5db4e73faec0d`.
+Peak job memory is **3,716,972,544 bytes**, with zero memory-high/max/OOM events
+or swap. Heavy jobs use separate verified 16/20/1 GiB cgroups; GPU work is
+serialized and artifacts remain on local `/x`. Baseline parity remains unmet.
 
 ## Completion-epoch control on the current runtime
 

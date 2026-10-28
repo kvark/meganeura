@@ -1153,6 +1153,16 @@ the descriptor-reference repair requires fresh measurements.
   tests. Archive the canceled default-bandwidth probe's pressure events as well
   as the four successful captures' zero-event receipts. See
   [Nsight Graphics source sampling](megakernel_whole_graph.md#nsight-graphics-source-sampling).
+  Test SGD predecessor buckets in existing segment padding against an identical
+  original-search shader control. Check 87,636 states, 1,283,708 group queries
+  and every actual benchmark segment selection, preserving allocations,
+  arithmetic, eligibility, batches, synchronization and workers. Pass 52 codegen
+  checks, fourteen smoke tests per mode and 75 fixed diagnostics. Training
+  improves 0.68% against the probe control but regresses 3.15% against qualified
+  execution, failing the fixed gate. Restore 29 source hashes, both qualified
+  binaries and fourteen smoke tests without further timing or SDK captures.
+  Preserve 508 verified artifacts and nineteen completed study scopes. See
+  [SGD segment buckets](megakernel_whole_graph.md#sgd-segment-buckets).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
@@ -1178,11 +1188,12 @@ the descriptor-reference repair requires fresh measurements.
   do not hide the training regression with padding or a worker cap.
   The tested tile strip ordering is closed under its fixed gate. Exact tile
   permutations do not establish useful locality or justify a strip-width sweep.
-  Investigate SGD segment lookup with a bounded metadata or search transformation
-  that proves exact group-to-segment selection, including partial tiles and
-  learning-rate scales. Preserve arithmetic, optimizer eligibility and workers;
-  use the existing fixed diagnostics and both completed-step protocols. The
-  source-sample ratio alone cannot justify retention or extra repeats.
+  The tested SGD segment buckets are closed under the failed fixed gate.
+  Fewer modeled search reads and the source-sample ratio do not establish a
+  speedup or justify a bucket-density sweep. A further lookup candidate needs
+  a distinct mechanism and exact group-to-segment selection, including partial
+  tiles and learning-rate scales. Preserve arithmetic, optimizer eligibility,
+  workers and the existing diagnostic/completed-step/SDK acceptance gates.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,
