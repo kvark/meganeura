@@ -774,6 +774,7 @@ fn implementations(
     }
     let split_plans = Vec::new();
     Implementations {
+        joint_attention_affordable: false,
         order,
         choices,
         seeds,
@@ -791,6 +792,7 @@ fn implementations(
 
 /// Programs in [`CoordinateOrder`], lowered lazily.
 struct Implementations {
+    joint_attention_affordable: bool,
     order: CoordinateOrder,
     choices: Vec<AxisChoice>,
     seeds: Vec<Seed>,
@@ -1012,7 +1014,86 @@ fn fill_matrix_candidates_scoped(
     count
 }
 
+impl Implementations {
+    /// Explore coupled workgroup and lane layouts without assuming their
+    /// marginal costs add. Only existing legal choices move forward.
+    fn prioritize_joint_attention(&mut self, incumbent: (usize, usize)) -> bool {
+        if !self.joint_attention_affordable {
+            return false;
+        }
+        if !self.order.physical_next
+            || self.order.priority_attention.is_some()
+            || self.order.initial < self.order.seeds.min(INITIAL_LAYOUTS)
+            || self.order.visited_forms.iter().filter(|&&v| v).count()
+                < self.order.seeds.min(self.order.arithmetic_layouts)
+            || self.order.priority_choices.iter().any(|&c| {
+                !self.order.tried.contains(&(incumbent.0, c))
+                    && !self.order.deferred.contains(&(incumbent.0, c))
+            })
+        {
+            return false;
+        }
+        let Some(seed) = self.seeds.get(incumbent.0) else {
+            return false;
+        };
+        if !seed.plan.dispatches.iter().any(|d| d.shader.is_attention()) {
+            return false;
+        }
+        let base = seed.plan.knobs.flash;
+        let ept = seed.plan.knobs.flash_ept_cap;
+        let Some(keys) = base.keys.checked_mul(2) else {
+            return false;
+        };
+        let shapes = [
+            (
+                ept,
+                crate::codegen::FlashAttentionShape {
+                    threads: base.threads / 2,
+                    keys,
+                    ..base
+                },
+            ),
+            (
+                ept / 2,
+                crate::codegen::FlashAttentionShape {
+                    interleave: !base.interleave,
+                    ..base
+                },
+            ),
+        ];
+        let active = self.choices[incumbent.1];
+
+        for (ept, shape) in shapes {
+            if ept == 0 || shape.threads == 0 {
+                continue;
+            }
+            let neighbor = AxisChoice {
+                attention: (0, Some((ept, shape))),
+                ..active
+            };
+            let Some(choice) = self.choices.iter().position(|&c| c == neighbor) else {
+                continue;
+            };
+            if self.order.tried.contains(&(incumbent.0, choice))
+                || self.order.deferred.contains(&(incumbent.0, choice))
+            {
+                continue;
+            }
+            let Some(position) = self.order.choice_order.iter().position(|&c| c == choice) else {
+                continue;
+            };
+            self.order.choice_order.remove(position);
+            self.order.choice_order.insert(0, choice);
+            return true;
+        }
+        false
+    }
+}
+
 impl measure::Frontier for Implementations {
+    fn explore_joint_attention(&mut self, affordable: bool) {
+        self.joint_attention_affordable = affordable;
+    }
     fn early_programs_remaining(&self, incumbent: Option<measure::Origin>) -> usize {
         if self.order.arithmetic_layouts != 1 {
             return 0;
@@ -1151,6 +1232,7 @@ impl measure::Frontier for Implementations {
                     index,
                 )
             });
+            self.prioritize_joint_attention(incumbent);
             let (seed_index, choice_index) = self.order.next(incumbent)?;
             let seed = &self.seeds[seed_index];
             let AxisChoice {
@@ -1345,6 +1427,104 @@ mod tests {
         let y = graph.matmul(x, w);
         graph.set_outputs(vec![y]);
         graph_frontier(graph)
+    }
+
+    fn joint_attention_frontier() -> Implementations {
+        let mut graph = Graph::new();
+        let q = graph.input("q", &[129, 64]);
+        let k = graph.input("k", &[129, 64]);
+        let v = graph.input("v", &[129, 64]);
+        let y = graph.full_attention(q, k, v, 1, 1, 64);
+        graph.set_outputs(vec![y]);
+        graph_frontier(graph)
+    }
+
+    #[test]
+    fn joint_attention_keeps_coverage_and_skips_ineligible_neighbors() {
+        let mut f = joint_attention_frontier();
+        f.joint_attention_affordable = true;
+        f.order.physical_next = true;
+        assert!(!f.prioritize_joint_attention((0, 0)));
+        f.order.initial = 1;
+        f.order.visited_forms[0] = true;
+        f.order.tried.insert((0, 0));
+        f.order.priority_choices.push_back(1);
+        assert!(!f.prioritize_joint_attention((0, 0)));
+        f.order.priority_choices.clear();
+        f.order.tried.insert((0, 1));
+        let tried = f.order.tried.clone();
+        assert!(f.prioritize_joint_attention((0, 0)));
+        let first = f.order.choice_order[0];
+        assert_eq!(f.order.tried, tried);
+        assert_eq!(
+            AxisChoice {
+                attention: f.choices[0].attention,
+                ..f.choices[first]
+            },
+            f.choices[0]
+        );
+        f.order.tried.insert((0, first));
+        assert!(f.prioritize_joint_attention((0, 0)));
+        let second = f.order.choice_order[0];
+        assert_ne!(first, second);
+        f.order.deferred.insert((0, second));
+        assert!(!f.prioritize_joint_attention((0, 0)));
+        f.order.tried.remove(&(0, first));
+        f.choices[first].winograd = Some(crate::DType::F16);
+        assert!(!f.prioritize_joint_attention((0, 0)));
+    }
+
+    #[test]
+    fn joint_attention_accepts_cooperative_seeds_but_not_unrelated_graphs() {
+        for shader in [
+            compile::ShaderEntry::FlashAttentionCoop,
+            compile::ShaderEntry::FlashAttentionCoopF32,
+            compile::ShaderEntry::MultiHeadAttn,
+        ] {
+            let mut f = joint_attention_frontier();
+            let mut changed = 0;
+            for d in &mut f.seeds[0].plan.dispatches {
+                if d.shader == compile::ShaderEntry::FlashAttention {
+                    d.shader = shader.clone();
+                    changed += 1;
+                }
+            }
+            assert!(changed > 0);
+            f.joint_attention_affordable = true;
+            f.order.physical_next = true;
+            f.order.initial = 1;
+            f.order.visited_forms[0] = true;
+            f.order.tried.insert((0, 0));
+            f.order.tried.insert((0, 1));
+            let tried = f.order.tried.clone();
+            assert!(f.prioritize_joint_attention((0, 0)));
+            assert_eq!(f.order.tried, tried);
+        }
+        let mut f = matrix_frontier();
+        f.joint_attention_affordable = true;
+        f.order.physical_next = true;
+        f.order.initial = 1;
+        f.order.visited_forms[0] = true;
+        assert!(!f.prioritize_joint_attention((0, 0)));
+    }
+
+    #[test]
+    fn joint_attention_preserves_all_reachable_origins() {
+        use measure::Frontier as _;
+        let collect = |enabled| {
+            let mut f = joint_attention_frontier();
+            f.explore_joint_attention(enabled);
+            let mut found = collections::HashSet::new();
+            for _ in 0..1000 {
+                let Some(p) = f.next(None) else {
+                    return found;
+                };
+                let origin = p.origin.unwrap();
+                assert!(found.insert((origin.form, origin.choice)));
+            }
+            panic!("attention frontier did not terminate");
+        };
+        assert_eq!(collect(false), collect(true));
     }
 
     #[test]

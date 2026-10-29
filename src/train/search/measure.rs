@@ -34,6 +34,8 @@ pub(super) struct Origin {
 pub(super) trait Frontier {
     /// The next program to measure; `incumbent` is the selected program's origin.
     fn next(&mut self, incumbent: Option<Origin>) -> Option<Program>;
+    /// Permit joint attention coverage when recent comparison costs leave room.
+    fn explore_joint_attention(&mut self, _affordable: bool) {}
     /// Whole-program qualification, including candidates that did not win.
     fn observe(&mut self, _origin: Origin, _qualified: bool) {}
     /// Whether a later call could still return a program.
@@ -220,6 +222,15 @@ fn comparison_exceeds_deadline(
         .is_some_and(|&cost| elapsed + cost > max_time)
 }
 
+fn joint_attention_fits(comparison_costs: &VecDeque<Duration>, remaining: Duration) -> bool {
+    comparison_costs.iter().max().is_some_and(|cost| {
+        !cost.is_zero()
+            && cost
+                .checked_mul(2)
+                .is_some_and(|needed| needed <= remaining)
+    })
+}
+
 fn kernel_probe_budget(
     available: Duration,
     comparison: Duration,
@@ -313,6 +324,10 @@ pub(super) fn select(
         // Cover early arithmetic and the first layouts, then alternate so
         // submission probes cannot consume the budget before useful layouts arrive.
         let program = pending_tuned.take().or_else(|| {
+            programs.explore_joint_attention(joint_attention_fits(
+                &comparison_costs,
+                search_time.saturating_sub(start.elapsed()),
+            ));
             (programs.early_programs_remaining(incumbent_origin) > 0
                 || index < super::INITIAL_LAYOUTS + usize::from(initial_tuning_queued)
                 || !probe_submission)
@@ -644,6 +659,20 @@ mod tests {
     use super::*;
     use crate::TuneOptions;
     use crate::train::BuildSearchOptions;
+
+    #[test]
+    fn joint_attention_requires_two_recent_comparisons() {
+        let mut costs = VecDeque::new();
+        assert!(!joint_attention_fits(&costs, Duration::MAX));
+        costs.push_back(Duration::ZERO);
+        assert!(!joint_attention_fits(&costs, Duration::MAX));
+        costs.push_back(Duration::from_millis(40));
+        costs.push_back(Duration::from_millis(1));
+        assert!(!joint_attention_fits(&costs, Duration::from_millis(79)));
+        assert!(joint_attention_fits(&costs, Duration::from_millis(80)));
+        costs.push_back(Duration::MAX);
+        assert!(!joint_attention_fits(&costs, Duration::MAX));
+    }
 
     fn select(
         programs: impl IntoIterator<Item = Program>,
