@@ -258,6 +258,12 @@ Persistent training GPU diagnostics improve **6.10%**, but forward regresses
 also change; this does not isolate load width as the cause. The probe is
 removed and both qualified executable hashes are restored.
 
+The following [balanced handler dispatch](#balanced-handler-dispatch) replaces
+only the worker's switch with a numeric decision tree. All handler bodies and
+resources remain exact. Fifty diagnostics change forward/training GPU time
+**+0.113% / −0.052%**, below the fixed improvement threshold. The probe is
+removed without testing alternate tree shapes or case orders.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -4069,6 +4075,67 @@ Peak job memory is **3,716,038,656 bytes**, with zero memory-limit events or swa
 Every heavy job runs in a separate verified 16/20/1 GiB cgroup, GPU jobs serialize,
 and builds/copies/heavy analysis stay outside measurement intervals. All jobs
 finish. Runtime and memory contracts remain unchanged; baseline parity is unmet.
+
+## Balanced handler dispatch
+
+This study starts from `912400f` and leaves qualified runtime `c3ad104`
+unchanged. Earlier combined-handler controls showed that code composition can
+affect execution even when matrix work stays fixed. This probe tests dispatch
+structure without changing any handler body, scratch layout, parameter load,
+claim, completion, payload fence, numeric handler ID or requested worker.
+It does not assume that source-level switch latency explains the remaining gap.
+
+A guard checks that the handler ID is below the table length. A fixed balanced
+tree then splits the dense numeric ID interval in half at each branch; each
+leaf contains the original case body. Invalid IDs perform the original
+leader-only error atomic. Case order is unchanged. A finite check covers
+21 table sizes through 65,536 handlers, **1,376,340 ID queries and 134,171
+interval leaves**. A wrong-boundary negative control fails as expected.
+
+The first codegen run passes 49 tests and fails three: standalone packing
+admission can compile a single handler with a nonzero ID. The corrected
+rewrite applies only to complete dense tables and leaves those sparse admission
+switches unchanged. Existing validation is preserved. All **52 codegen checks
+and fourteen whole-graph smoke tests** then pass before GPU timing. The initial
+source, failures and correction remain in the evidence.
+
+All **fifty fixed diagnostics** pass complete-state, implementation, allocation,
+optimizer, exact-work, one-dispatch and no-fallback checks. They use five cases,
+five pairs per mode, ten warmups/minimum one second, 100 ms prewarming and all
+256 requested workers. Maximum model error stays 4.66e-9. Work remains
+22,042/83,312 main graph tiles plus 97,522 SGD tiles in four phases.
+
+| Persistent GPU diagnostic | Qualified switch | Balanced tree | Change |
+|---|---:|---:|---:|
+| Model forward | 4.076224 ms | 4.080832 ms | +0.113% |
+| Model training | 12.734016 ms | 12.727424 ms | −0.052% |
+
+Neither model reaches the predeclared 0.5% improvement threshold. Regression
+guards pass, but the failed improvement gate ends this experiment without
+extra timing, alternate tree/order sweeps, full qualification, a completed-step
+series or fresh SDK captures.
+
+**56 of 61 shader sources remain exact.** Five full-source inverses recover
+every original by reversing only the switch-to-tree substitution, including
+every case body and default action. Ten threshold/error-action mutations are
+rejected. All ordinary native-statistic multisets remain exact. Persistent
+forward/training registers stay **86/84**, shared bytes **18,928/29,344**, and
+participating workers **168/168**. Code sizes change **102,400→102,272** and
+**241,664→242,560** bytes. These source and resource checks do not establish
+the driver's native branch lowering or the elapsed cost of dispatch.
+
+All **29 original source hashes, both qualified executable hashes and fourteen
+restored smoke tests** pass. Restoring source with fresh timestamps invalidates
+the probe build correctly; both compiler forks remain clean. The selector and
+tree prototype are removed. Local evidence is in
+`target/balanced-handler-dispatch/`. Manifest
+`target/megakernel-results/balanced-handler-dispatch/summary.json` independently
+verifies **374 artifacts and twenty terminal scope receipts**, SHA-256
+`6061aaef0c6aee1c82bba6e7989f6b05b8e2368ecd75c0a91968599d600a16fa`.
+Peak job memory is **3,719,839,744 bytes**, with zero memory-limit events or swap.
+Every heavy job uses a separate verified 16/20/1 GiB cgroup, GPU jobs serialize,
+and builds/copies/heavy analysis stay outside measurements. All jobs finish;
+baseline parity remains unmet.
 
 ## Completion-epoch control on the current runtime
 

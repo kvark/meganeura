@@ -1265,6 +1265,15 @@ the descriptor-reference repair requires fresh measurements.
   tests. Preserve initial source-audit failures and the stale-timestamp rebuild
   correction, 519 artifacts and thirty terminal scope receipts. See
   [four-K shared A loads](megakernel_whole_graph.md#four-k-shared-a-loads).
+  Test a fixed balanced numeric handler-dispatch tree with every case body,
+  resource and memory operation unchanged. Check 21 table sizes and 1,376,340
+  ID queries; correct the initial nonzero-ID packing-admission assumption
+  without changing validation. Pass 52 codegen checks, fourteen smoke tests,
+  fifty diagnostics and five complete source inverses. Forward/training GPU
+  changes +0.113%/−0.052% fail the minimum improvement gate. Restore all source
+  and binary hashes plus fourteen smoke tests without alternate trees or more
+  timing. Preserve 374 artifacts and twenty terminal scope receipts. See
+  [balanced handler dispatch](megakernel_whole_graph.md#balanced-handler-dispatch).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
@@ -1330,6 +1339,10 @@ the descriptor-reference repair requires fresh measurements.
   sweep widths or padding, cap workers, or infer native load width and elapsed
   cost from source vectors or resource counts. Preserve the scratch-pooling
   change as a limitation of causal attribution.
+  Balanced numeric handler dispatch is also closed under its fixed diagnostic
+  gate. Exact case bodies and unchanged native resources do not establish a
+  useful gain. Do not extend this experiment with alternate tree shapes, case
+  orders or timing repeats after the failed improvement threshold.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,
