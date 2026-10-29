@@ -1255,6 +1255,16 @@ the descriptor-reference repair requires fresh measurements.
   captures. Preserve 533 artifacts, 24 terminal cgroup receipts and the corrected
   analyzer's initial filename failure. See
   [acquire completion-counter load](megakernel_whole_graph.md#acquire-completion-counter-load).
+  Test four-K shared A vector loads against qualified execution and a matched
+  scalar expansion control. Preserve operand order and check twelve layouts,
+  52 codegen tests and fourteen smoke tests per mode. All 75 diagnostics pass
+  state/work checks; training improves 6.10%, but forward regresses 9.59%,
+  failing the fixed guard. Record typed scratch pooling, native resources and
+  changed participating workers without claiming an isolated load-width cause.
+  Restore 29 source hashes, both qualified binaries and fourteen fresh smoke
+  tests. Preserve initial source-audit failures and the stale-timestamp rebuild
+  correction, 519 artifacts and thirty terminal scope receipts. See
+  [four-K shared A loads](megakernel_whole_graph.md#four-k-shared-a-loads).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
@@ -1315,6 +1325,11 @@ the descriptor-reference repair requires fresh measurements.
   its fixed diagnostic gate. Preserve the exact synchronization/binary proof
   and both model regressions; fewer SPIR-V fences and registers do not justify
   a new Naga API or a broader ordered-atomic sweep after failure.
+  The broad four-K shared A vector-load probe is closed under its fixed guard:
+  its training diagnostic gain does not excuse the forward regression. Do not
+  sweep widths or padding, cap workers, or infer native load width and elapsed
+  cost from source vectors or resource counts. Preserve the scratch-pooling
+  change as a limitation of causal attribution.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,

@@ -251,6 +251,13 @@ exact binary inverses and the finite progress model pass, but forward/training
 GPU diagnostics regress **1.98%/2.81%** against qualified execution. The probe
 is removed; it supplies no performance reason for a new Naga atomic API.
 
+The next [four-K shared A load control](#four-k-shared-a-loads) groups adjacent
+reduction operands in a vector, with a matched scalar expansion control.
+Persistent training GPU diagnostics improve **6.10%**, but forward regresses
+**9.59%**, failing the fixed guard. Typed scratch pooling and native resources
+also change; this does not isolate load width as the cause. The probe is
+removed and both qualified executable hashes are restored.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -3989,6 +3996,79 @@ Peak job memory is **3,715,878,912 bytes**, with zero memory-limit events or swa
 All heavy jobs use separate verified 16/20/1 GiB cgroups, GPU work serializes,
 and artifacts stay on local `/x`. Every launched job finishes. Baseline parity
 remains unmet.
+
+## Four-K shared A loads
+
+This control starts from evidence commit `1f3517a` and leaves qualified runtime
+`c3ad104` unchanged. Nsight source sampling previously identified MIOThrottle
+samples on scalar shared A/B loads. The candidate reads four consecutive K
+values for each A row as one WGSL `vec4`, then performs the four accumulator
+updates in their original order. It applies to F32 scalar matrices with
+32-row tiles, 32-deep K stages and counted reduction, including existing
+horizontal fusion. A matched scalar control expands the same four iterations
+using the original shared layout. This differs from the rejected full 32-K
+expansion, global B prefetch and paired-row permutation.
+
+Vector A uses nine vectors per row instead of 33 scalars, adding 384 bytes to
+each selected handler's A allocation. The graph allocator pools scratch by
+element type and slot, so the combined shader's resource change is different.
+B accesses, global load guards, epilogues, per-accumulator operation order,
+geometry, task counts, scheduler atomics and payload fences remain intact.
+All 256 requested workers stay enabled.
+
+Both modes pass **52 codegen checks and fourteen whole-graph smoke tests**.
+The finite layout check covers twelve layouts, 12,288 staged cells and 458,752
+ordered accumulator updates, including transposed A and both column mappings.
+Each mode leaves 46 of 61 captured sources exact. Ten ordinary sources recover
+through exact four-step expansion checks modulo whitespace. Five graph sources
+preserve non-payload code after type-preserving scratch-bank renaming and
+separately checked sentinel initialization and horizontal-wrapper scratch
+reset changes. Synchronization counts remain unchanged. This is not a full
+graph-handler inverse or an emitted-SPIR-V audit.
+
+The predeclared **75 diagnostics** use five cases, five pairs per mode, ten
+warmups lasting at least one second, 100 ms prewarming and 256 workers. Full
+state, allocation, selection, optimizer, completion, one-dispatch and no-fallback
+checks pass; maximum error remains 4.66e-9. Main graph work stays 22,042/83,312
+tiles, with 97,522 SGD tiles in four phases.
+
+| Persistent GPU diagnostic | Qualified | Scalar four-K control | Vector A |
+|---|---:|---:|---:|
+| Model forward | 4.072800 ms | 4.080864 ms | 4.463584 ms |
+| Model training | 12.743328 ms | 12.711520 ms | 11.966208 ms |
+
+Vector A changes forward **+9.595% / +9.378%** against qualified/scalar control,
+and training **−6.098% / −5.863%**. The forward regression fails the fixed guard
+despite the training improvement. No further timing, width/padding sweep, full
+qualification, normal completed-step series or fresh SDK capture follows.
+
+Qualified/scalar/vector forward register counts are **86/88/79**, shared bytes
+**18,928/18,928/16,240**, and participating workers **168/168/252**. Training
+registers are **84/82/83**, shared bytes **29,344/29,344/29,856**, with 168 workers
+participating throughout. Ordinary forward/training GPU diagnostics change
+2.920416/10.726272 ms to 2.639328/10.403456 ms. Thus a lower resource footprint
+and improved ordinary execution do not establish a persistent forward gain.
+Neither source vectors nor participating-worker counts prove native load width,
+occupancy or a causal explanation of the timing changes.
+
+All five initial source-audit failures and scripts remain: corrections account
+for actual handler names, typed bank remapping, 16-byte sentinel granularity,
+horizontal fusion and multiple reduction loops. No GPU diagnostic is repeated.
+The first restoration preserved old source timestamps with `copy2`; Cargo
+skipped compilation, and the executable hash check caught both remaining probe
+binaries. Touching the restored source forced a rebuild. All **29 source hashes,
+both qualified executable hashes and fourteen fresh restored smoke tests** then
+pass; both compiler forks remain clean. The first restored smoke run used the
+default-disabled probe and is not proof of restored binary identity.
+
+Evidence remains local in `target/scalar-a-k4-loads/`. The independently verified
+manifest `target/megakernel-results/scalar-a-k4-loads/summary.json` contains
+**519 artifacts and thirty terminal scope receipts**, SHA-256
+`c9510f46f2367b4c7bcfa299513bb7b58139baf27633ecc638004f3a2f3586f8`.
+Peak job memory is **3,716,038,656 bytes**, with zero memory-limit events or swap.
+Every heavy job runs in a separate verified 16/20/1 GiB cgroup, GPU jobs serialize,
+and builds/copies/heavy analysis stay outside measurement intervals. All jobs
+finish. Runtime and memory contracts remain unchanged; baseline parity is unmet.
 
 ## Completion-epoch control on the current runtime
 
