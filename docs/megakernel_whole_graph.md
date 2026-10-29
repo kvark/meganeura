@@ -13,7 +13,19 @@ including read-only views that may alias writable bindings. It retains the
 preceding scratch-read repair and packing optimizations. Passing numerical
 tests alone did not reveal these extra inactive accesses.
 
-The latest [advisory ready-word summary](#advisory-ready-word-summary), retained
+The current qualified runtime, `171d50d`, adds
+[four adjacent SGD elements per lane](#four-adjacent-sgd-elements-per-lane).
+Against the preceding qualified runtime, 1,000 completed-step comparisons
+improve persistent training **2.73% original / 5.37% prewarmed**, with both
+pooled 95% intervals below no change and no established persistent regression.
+Matched SDK training replay improves **3.68%**, with ordinary training flat.
+This is not a memory-traffic reduction: estimated global-load sectors rise
+41% while warp instructions fall 1.84%. The latest paired persistent/ordinary
+medians are **1.306× forward / 1.069× training**, or **1.309× / 1.097×** prewarmed.
+Baseline parity remains unmet and ordinary execution remains the default.
+The experiments below retain their historical runtime identities and results.
+
+The earlier [advisory ready-word summary](#advisory-ready-word-summary), retained
 in `c3ad104`, skips empty words while keeping the original full scan before an
 idle epoch. Against qualified `3f95fa4`, 1,000 completed-step comparisons improve
 persistent training **1.39% original / 1.61% prewarmed**, with both pooled 95%
@@ -4524,6 +4536,123 @@ Heavy jobs use separate verified 16/20/1 GiB cgroups; GPU work serializes and
 builds/copies/heavy analysis stay outside timing. All jobs finish. No actual
 emitted-SPIR-V qualification follows the failed gate. Qualified runtime
 `c3ad104` remains unchanged; baseline parity remains unmet.
+
+## Four adjacent SGD elements per lane
+
+Runtime `171d50d` extends qualified `c3ad104`; this study starts at `7b5000d`.
+Each SGD lane previously updated four elements 256 positions apart. It now
+owns four adjacent elements in the same 1,024-element tile. A complete group
+uses four scalar parameter loads, four scalar gradient loads, componentwise
+`p - vec4(lr) * g`, and four scalar stores. A partial final group executes the
+original scalar expression only for valid elements. Scalar buffer views and
+arbitrary element offsets remain supported; no vector-alignment assumption or
+new descriptor view is introduced. Both ordinary and persistent execution use
+this shader. This does not claim native vector load/store instructions.
+
+Segment lookup, learning-rate scaling, metadata, 256 lanes, four-tile large-grid
+claims, optimizer eligibility, graph dependencies and every publication fence
+remain unchanged. The change is distinct from earlier segment-search and
+claim-batching experiments. All requested workers remain eligible. Forward and
+training retain **22,042 / 83,312 graph tiles**, with **97,522 SGD tiles in four
+phases**. Selected keys, payload allocation, scheduler bytes and the one-dispatch,
+one-submission boundary remain unchanged.
+
+The finite checker verifies **570 layouts, 10,854,100 element addresses and
+264,450 wrapped-grid/four-claim assignments**, including empty and ragged
+segments, arbitrary offsets and partial final claims. Two missing/duplicate
+ownership controls fail. A CPU-reference fixture covers fourteen parameter
+lengths, all one-to-three-element tails, a 1,025-tile chunk, per-parameter
+learning-rate multipliers, poisoned storage and three changed-input replays.
+Every parameter and unchanged gradient matches exactly with ordinary execution
+and 1/3/256 persistent workers. Unsupported graph capabilities skip only the
+persistent fixture cases.
+
+Qualification passes **676 library tests (eight ignored), 168 strict whole-graph
+oracle cases, 51 matrix regressions, fourteen whole-graph smoke tests, 52 codegen
+checks and the dedicated CPU fixture**, plus formatting, strict all-target/
+all-feature Clippy, release builds and Metal-target compilation. Metal GPU
+execution remains unqualified. Of 61 emitted sources, **57 are unchanged**;
+two ordinary SGD inverses and two graph-entry audits preserve lookup, scaling,
+all unrelated code and canonical scalar bindings. Six incorrect-source controls
+fail. A final bridge preserves all 61 sources and native-statistic multisets.
+
+Seven actual emitted SPIR-V modules pass Vulkan 1.3 validation. The four SGD
+payloads retain ten scalar storage loads and five scalar stores across their
+full/tail branches, with a vector multiply followed by subtraction. Graph
+payload accesses preserve their canonical root and NonPrivatePointer operands;
+queue atomics remain relaxed and payload fence scopes/semantics are unchanged.
+Five bad-fence and four bad-arithmetic controls fail. The read-only capture hook
+is removed, both forks are clean, and both final executable hashes are exact.
+
+The fixed **50 diagnostic comparisons** pass all complete-state, selection,
+allocation, work-count and no-fallback checks. Maximum model error is 4.66e-9.
+Persistent forward is **4.072768→4.071392 ms**; training is
+**12.702528→12.251328 ms (−3.55%)**, passing advancement. Forward/training
+registers remain **86/84**, shared storage **18,928/29,344 bytes**, and participating
+workers **168/168**. Forward native code remains 102,400 bytes; training grows
+241,664→244,096 bytes. No resource-footprint or residency explanation is inferred.
+
+The completed-step gate uses **500 original and 500 prewarmed comparisons**,
+control/candidate/candidate/control visits, 25 pairs per case per visit, at least
+ten warmups and one warmup second. All complete-state and execution checks pass.
+Bootstrap intervals use 10,000 resamples, seed 2026102619.
+
+| Persistent completed step | Qualified, ms | Adjacent four, ms | Candidate/control, 95% interval |
+|---|---:|---:|---:|
+| Original forward | 4.332868 | 4.489928 | 1.03625 [0.93455, 1.09946] |
+| Original training + SGD | 15.331532 | 14.913045 | 0.97270 [0.86135, 0.99216] |
+| Prewarmed forward | 4.307792 | 4.342078 | 1.00796 [0.99215, 1.01396] |
+| Prewarmed training + SGD | 13.374140 | 12.655650 | 0.94628 [0.94351, 0.96255] |
+
+Training establishes absolute gain under both protocols, with no established
+persistent regression in any case. Original/prewarmed ordinary training ratios
+are **0.99899 [0.83160, 1.00573] / 1.00167 [0.99302, 1.00429]**. Normalized
+persistent/ordinary training ratios are **0.98438 [0.92881, 1.01689] /
+0.96323 [0.95115, 0.96794]**: the original normalized interval remains inconclusive.
+Unchanged inference/backward/forward sources do not explain their incidental
+wall-time movements. Pooled intervals describe within-run sampling uncertainty
+and do not eliminate between-visit drift. Every sample is retained.
+
+Eight matched SDK backend captures collect **32 sequential single-pass metric
+groups**, each with at least 100 samples, successful exits, matching adapter and
+no SDK warning. Maximum clock/instruction-rate group spreads are **0.463% /
+1.193%**. Each actual forward state contains **147,034,513 floats** and each
+training state **246,883,105 floats**. Independent hashing confirms bitwise
+equality across versions within each backend; forward is also exact across
+backends, and training meets the unchanged cross-backend budget. Training
+capture includes SGD at zero learning rate for stable replay; normal timing
+uses nonzero learning rate.
+
+| SDK replay | Qualified, ms | Adjacent four, ms | Change |
+|---|---:|---:|---:|
+| Ordinary forward | 3.274466 | 3.261776 | −0.39% |
+| Persistent forward | 4.215766 | 4.199722 | −0.38% |
+| Ordinary training + SGD | 11.701404 | 11.702619 | +0.01% |
+| Persistent training + SGD | 13.095468 | 12.613880 | −3.68% |
+
+Estimated persistent training warp instructions fall **1.84%**, integer-pipe
+thread instructions **1.27%**, and shared wavefronts **0.45%**. Global-load
+sectors rise **41.02%**; ordinary training also rises **44.26%**. Local traffic
+remains zero in persistent execution. Global/L2 atomic estimates change
+**+0.19% / +0.07%**, while barrier waiting rises **45.27→48.05% of active warp
+cycles**, not elapsed time. The result supports the complete transformation,
+not a reduced-traffic, native-vector-width or isolated barrier explanation.
+
+The three rejected audit attempts are retained: an old loop-variable declaration
+assumption, inclusion of uniform loads in the ordinary payload count, and a
+manifest filename classifier that mistook CPU analysis for a GPU run. Corrections
+preserve every original measurement and do not relax runtime validation.
+The final fixture name/capability guard is checked separately with unchanged
+production source and binary hashes. No temporary runtime selector is retained.
+
+Local evidence in `target/sgd-adjacent-four/` is indexed by
+`target/megakernel-results/sgd-adjacent-four/summary.json`, independently verifying
+**952 artifacts and 71 terminal scope receipts**, SHA-256
+`2bc8a7704b20f407a7574b16716ecc88cc1d76ea210eb26b09fa7b9ebac4c15e`.
+Peak job memory is **4,701,589,504 bytes**, with zero memory-limit events or swap.
+Heavy jobs use separate verified 16/20/1 GiB cgroups on local `/x`; GPU jobs
+serialize and builds/copies/heavy analysis stay outside measurements. The
+optimization is retained, but full baseline parity remains unmet.
 
 ## Completion-epoch control on the current runtime
 

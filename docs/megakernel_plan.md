@@ -13,6 +13,17 @@ clipping and accumulation nodes, in a single compute dispatch. This is selected
 with `PersistentOptions::whole_graph` or `MEGANEURA_WHOLE_GRAPH=1` together with
 device scheduling and a worker count. Ordinary execution remains the default.
 
+The latest retained runtime, `171d50d`, updates four adjacent SGD elements per
+lane while preserving tile/claim counts, scalar storage views, arithmetic and
+the publication protocol. Full correctness qualification and 1,000 completed-step
+comparisons establish **2.73% original / 5.37% prewarmed** persistent training
+improvement without an established persistent regression. Eight matched SDK
+captures corroborate **3.68%** lower training replay with ordinary training flat.
+Estimated load traffic increases, so this is not a reduced-memory-traffic claim.
+See [the qualification](megakernel_whole_graph.md#four-adjacent-sgd-elements-per-lane).
+Baseline parity remains open; the historical experiments below keep their
+original runtime identities and acceptance results.
+
 The [NVIDIA counter investigation](megakernel_performance_analysis.md) identifies
 fixed worker sizing and portable queue overhead as the leading SmolVLA costs.
 Those measurements describe the regional implementation. Whole-graph execution
@@ -1328,6 +1339,18 @@ the descriptor-reference repair requires fresh measurements.
   This level scheduler is closed under its failed gate. Added ordering and
   changed native resources are coupled; neither fewer registers nor unblocked
   ticket ownership establishes a useful speedup.
+  Retain four adjacent SGD elements per lane after exact ownership checks over
+  570 layouts, a complete CPU parameter/gradient fixture, full correctness
+  qualification, 50 diagnostic comparisons and seven actual SPIR-V validations.
+  Preserve all 61 final emitted sources/native statistics, canonical accesses,
+  relaxed queue atomics and fences. The 1,000-comparison completed-step gate
+  establishes absolute training gain under both timing protocols without an
+  established persistent regression. Eight matched SDK captures corroborate
+  training improvement, with exact same-backend state and stable ordinary
+  training. Record increased load-sector estimates and avoid claiming native
+  vector memory instructions. Preserve 952 artifacts and 71 terminal scope
+  receipts; publish runtime `171d50d` and keep baseline parity open. See
+  [four adjacent SGD elements](megakernel_whole_graph.md#four-adjacent-sgd-elements-per-lane).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
