@@ -31,6 +31,12 @@ qualified build but regresses 0.09% against a scalar control from the same
 probe binary. The candidate is restored without extra timing or SDK capture;
 `171d50d` remains the qualified runtime.
 
+The following [sharded tile-claim probe](#sharded-per-node-tile-claims) also fails
+its fixed gate. Eight counters per ready node regress forward/training GPU
+time 2.16%/1.87% against qualified execution and 0.80%/0.77% against an
+identical-shader one-counter control. The probe is restored; this result does
+not isolate atomic contention time or establish that it is negligible.
+
 The earlier [advisory ready-word summary](#advisory-ready-word-summary), retained
 in `c3ad104`, skips empty words while keeping the original full scan before an
 idle epoch. Against qualified `3f95fa4`, 1,000 completed-step comparisons improve
@@ -4747,6 +4753,106 @@ Peak job memory is **3,714,449,408 bytes**, with zero memory-limit events or swa
 All heavy work, including restoration and analysis, uses separate verified
 16/20/1 GiB cgroups. GPU jobs serialize, builds/copies/heavy analyses stay
 outside timing, and all artifacts remain on local `/x`.
+
+## Sharded per-node tile claims
+
+This rejected probe starts at `52ff435`, with qualified runtime `171d50d`.
+The retained scheduler allocates a ready node's tiles through one atomic
+counter. Earlier scan, batch, completion-replica and level-ticket probes did
+not distribute that node's ownership counter. Existing waiting-warp samples
+do not quantify contention time; this experiment tests the complete mechanism.
+
+Each node receives eight atomic cursors. Cursor `s` owns claim numbers
+`s, s+S, s+2S, ...`, with `S` selected as one or eight. Claims retain their
+original batch width and logical coordinates. A worker tries its preferred
+cursor, then all other active cursors before declaring the node exhausted.
+A monotonic mask clears each cursor when its final valid claim is assigned;
+the last cleared bit allows the existing ready-bit removal. The mask controls
+availability only: existing remaining-tile counters, completion fan-in and
+payload fences still govern successor publication. No work is tied to a
+particular resident worker, no future blocked ticket is held, and all requested
+workers remain eligible.
+
+One- and eight-cursor modes use the same binary, all **61 shader sources**,
+native resources and queue allocation. Their uniform selector and initial
+exhaustion masks differ. Eight cursors in both reset and live queues add
+**64 bytes per node**, exactly **9,856 forward / 33,728 training bytes** to
+scheduler and resident accounting. The uniform configuration grows sixteen
+bytes. Payload buffers, graph hazards, parameters, geometry, optimizer policy
+and every payload/publication fence remain unchanged.
+
+The finite atomic-action model checks **46 configurations, 232,044 states,
+613,066 transitions and 175 terminal states**. It allows stale mask snapshots,
+delayed workers and one worker stealing all residue classes. It checks unique
+ownership, complete work, monotonic exhaustion and bounded cursor overshoot.
+Invalid early-clear, duplicate-ownership and preferred-cursor-only controls
+fail. A separate mapping check covers **10,290 layouts and 16,112,850 logical
+coordinates**, including empty nodes and partial batches. These are finite
+checks assuming eventual execution/visibility, not a full Vulkan progress proof.
+
+Both modes pass **52 codegen checks**, **fourteen whole-graph smoke tests** and
+the retained exact CPU SGD fixture, including one-worker execution and changed
+input replays. Independent reconstruction checks **169 test, three CI and two
+model metadata records per mode**. Dependencies, parameters, counts and every
+nonselection field match. Completion validation checks zero exhaustion masks,
+each cursor's full quota and bounded overshoot, remaining/dependency counters,
+and unchanged per-node worker totals.
+
+Generated-source audits preserve **56 qualified sources** exactly and recover
+the other **five graph sources** by removing the new configuration/helper and
+restoring the original claim calls. All handlers, fences, successor publication
+and unrelated scheduler code are exact. Five modified-fence controls fail.
+Host metadata and hazard construction are exact outside mask initialization.
+
+All **75 fixed diagnostic comparisons** pass full-state, selected-arithmetic,
+logical-work, allocation and no-fallback checks; maximum error remains 4.66e-9.
+The screen uses five pairs per case/mode, ten warmups/minimum one second and
+100 ms prewarming. All 256 workers remain requested. Model work remains
+22,042/83,312 graph tiles plus 97,522 SGD tiles in four phases, with one compute
+dispatch and the existing submission boundary.
+
+| Persistent GPU interval | Qualified, ms | One cursor, ms | Eight cursors, ms |
+|---|---:|---:|---:|
+| CI inference | 0.030592 | 0.030752 | 0.032320 |
+| CI backward | 0.068096 | 0.072192 | 0.074272 |
+| CI SGD | 0.072128 | 0.078304 | 0.079744 |
+| Model forward | 4.070816 | 4.126048 | 4.158944 |
+| Model training + SGD | 12.275040 | 12.409408 | 12.504672 |
+
+Eight cursors regress model forward/training **2.165%/1.871% against qualified**
+and **0.797%/0.768% against one cursor**, failing both improvement and regression
+criteria. CI cases also regress against qualified execution. Ordinary model
+GPU intervals remain approximately 2.924/10.74 ms. Model registers stay 86/84,
+shared bytes 18,928/29,344 and participating workers 168/168. Native code grows
+102,400→106,368 bytes forward and 244,096→248,064 training in both probe modes.
+CI inference changes 48→64 registers and 9,616→8,592 reported shared bytes.
+Native resources match exactly between one and eight cursors; those counts
+do not identify the cost of changed claim order, contention or steal/mask work.
+No isolated atomic-cost or traffic-reduction claim follows.
+
+The fixed gate fails. No further timing, shard-count/order/spacing sweep, full
+correctness/SPIR-V qualification, completed-step gate or SDK capture follows.
+The prototype and selector/export hooks are removed. The first restoration
+preserved older source timestamps, so Cargo reused both probe executables;
+the binary-hash assertion caught this. Its tests still exercised probe control.
+That failed receipt and exact stale/probe hash equality remain archived.
+Refreshing the five changed-file timestamps forces a rebuild before fresh
+restoration tests; no benchmark measurement is repeated.
+
+All **32 original source hashes and both rebuilt qualified executable hashes**
+match. Fourteen fresh whole-graph smoke tests and the retained CPU fixture
+pass; both owned compiler forks remain clean and pinned. Runtime `171d50d`
+remains qualified, and baseline parity remains unmet.
+
+Local evidence under `target/sharded-tile-claims/` is indexed by
+`target/megakernel-results/sharded-tile-claims/summary.json`, independently
+verifying **867 artifacts and 30 terminal study scope receipts**, including
+the failed stale-build assertion; SHA-256
+`e666ecf669dd170bc5a1f1fd65c2a8a19523a78c4a0d0787081f2db6565836f0`.
+Peak job memory is **3,720,495,104 bytes**, with zero memory-limit events or swap.
+Heavy jobs use separate verified 16/20/1 GiB cgroups; GPU work serializes and
+builds/copies/heavy analysis stay outside timing. All jobs finish and artifacts
+remain on local `/x`.
 
 ## Completion-epoch control on the current runtime
 

@@ -1362,6 +1362,17 @@ the descriptor-reference repair requires fresh measurements.
   receipts. No alignment/width/family sweep or further timing follows; native
   memory width and traffic reduction remain unmeasured for this rejected probe.
   See [aligned vector-storage SGD](megakernel_whole_graph.md#aligned-vector-storage-sgd).
+  Test eight per-node tile cursors with exhaustive stealing and monotonic
+  exhaustion against an identical-shader one-cursor control. Verify 232,044
+  finite atomic-interleaving states, 10,290 ownership layouts, 174 metadata
+  records per mode, 52 codegen checks, fourteen smoke tests and the CPU fixture.
+  The 75-diagnostic gate fails: forward/training regress 2.165%/1.871% against
+  qualified and 0.797%/0.768% against one cursor. Restore the qualified runtime
+  without further timing or a shard-count/order/spacing sweep. This complete
+  transformation does not isolate atomic contention time or traffic. Preserve
+  the caught stale-build restoration, fresh qualified rebuild checks,
+  867 verified artifacts and 30 terminal scope receipts. See
+  [sharded per-node tile claims](megakernel_whole_graph.md#sharded-per-node-tile-claims).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
