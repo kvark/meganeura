@@ -1313,6 +1313,21 @@ the descriptor-reference repair requires fresh measurements.
   This paired-column fusion is closed under the fixed gate; fewer task boundaries
   do not establish less global traffic or justify a shape/family sweep after the
   forward regression. A new fusion mechanism needs distinct evidence.
+  Test dependency-level immutable tickets, which admit only ready-level work
+  and publish the next level after all current nodes complete. Preserve the
+  physical hazard graph, payload fences, all workers and selected arithmetic.
+  Verify 3,306 interleaving configurations, 2,134,512 states, three invalid
+  publication controls, three focused unit checks, 53 codegen checks and
+  fourteen smoke tests per mode. Audit 147 metadata records per mode, all
+  61 control sources and five candidate source inverses. The fixed 75-diagnostic
+  screen shows forward −0.588% against qualified/−0.475% against control and
+  training +20.317%/+18.789%, failing advancement. Restore all source/binary
+  hashes and fourteen smoke tests without further timing, level/order sweeps
+  or worker caps. Preserve 811 artifacts and 25 terminal scope receipts. See
+  [dependency-level immutable tickets](megakernel_whole_graph.md#dependency-level-immutable-tickets).
+  This level scheduler is closed under its failed gate. Added ordering and
+  changed native resources are coupled; neither fewer registers nor unblocked
+  ticket ownership establishes a useful speedup.
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed

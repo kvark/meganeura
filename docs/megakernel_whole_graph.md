@@ -4435,6 +4435,96 @@ Heavy jobs use separate verified 16/20/1 GiB cgroups, GPU jobs serialize, and no
 build/copy/heavy analysis overlaps timing. Qualified runtime `c3ad104` remains
 unchanged; baseline parity remains unmet.
 
+## Dependency-level immutable tickets
+
+Starting from `da636ef`, this study replaces ready scanning with immutable
+claims grouped by dependency level. Unlike the earlier topological ticket
+cursor, a worker cannot reserve work from a future blocked node. The CPU derives
+levels from the existing physical RAW/WAR/WAW graph. A cursor assigns each
+current-level `(node, tile_start)` ticket once; the last completed node publishes
+the next level. Exhausted workers wait for the level index to change before
+fetching again. All requested workers remain eligible, including late entrants.
+No global workgroup barrier or fixed resident-worker count is required.
+
+This adds ordering. The current forward/training graphs have **137/336 levels**
+and acquire **599/8,507 additional ordering relations** between independent nodes.
+The preflight uses the prior authoritative metadata capture after verifying
+identical source and qualified binary hashes. All five fresh control metadata
+records subsequently match it exactly. Level scheduling preserves the original
+hazards but can delay work that the ready bitmap could overlap.
+
+The existing all-lane payload fences, workgroup rendezvous, node completion RMW
+chain and last-tile acquisition remain. Each last-tile leader then decrements
+its level's remaining-node counter. The last node acquires that RMW chain with
+an acquire/release storage fence before storing the next level index. Successful
+claimants acquire after observing that index; original uniform broadcasts and
+all-lane acquisition remain. This uses the
+[Vulkan barrier-to-barrier synchronization rule](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html#memory-model-synchronizes-with)
+with relaxed atomics and unchanged canonical descriptors. Every writing lane
+still makes its own writes available. The ticket cursor grants ownership; it
+does not publish payloads. No Naga API or compiler-fork change is introduced.
+
+While a level is unfinished, an unassigned ticket, an executing owner or a
+bounded publisher can advance it without acquiring future work. Finite
+interleaving exploration covers **3,306 configurations, 2,134,512 states and
+5,158,235 transitions**, with unique ownership, exact completion and no deadlock.
+It includes empty nodes, delayed entry, delayed publication and a level change
+between a worker's load and cursor RMW. Same-level dependency violations,
+premature publication and missing publication are detected by three negative
+controls. Eventual execution/atomic visibility remain assumptions; this is not
+a general Vulkan forward-progress or native occupancy proof.
+
+Three focused unit checks, **53 codegen checks and fourteen whole-graph smoke
+tests per mode** pass. Independent metadata reconstruction verifies all
+**142 smoke and five benchmark records per mode**, including exact tickets,
+partial batches, dummy empty-node claims, level node counts, cursor overflow
+bounds, original hazard edges and reset values. Source audits preserve all
+**61 control sources** and **56 candidate ordinary sources**. Five full graph
+source inverses recover everything outside claim/idle state and node publication;
+ten incorrect-source controls fail. Handlers, descriptor layouts, scratch,
+packing, broadcasts, payload/node-completion fences and worker tracking remain
+exact. The ordinary native-statistic multisets also remain exact.
+
+All **75 fixed diagnostics** pass full-state, selection, optimizer, completion,
+one-dispatch and no-fallback checks, with maximum error **4.66e-9**. Five cases
+run five pairs per mode after ten warmups/minimum one second and 100 ms
+prewarming. All 256 workers remain requested. Graph work stays **22,042/83,312
+tiles**, plus **97,522 SGD tiles in four phases**. Forward/training use
+15,898/94,238 immutable tickets; added scheduler allocations are
+**130,484/761,980 bytes**, including level headers, counters and reset copies.
+Payload allocations and selected ordinary/persistent implementations stay exact.
+
+| Persistent GPU diagnostic | Qualified | Bitmap control | Level tickets |
+|---|---:|---:|---:|
+| Model forward | 4.076800 ms | 4.072160 ms | 4.052832 ms |
+| Model training + SGD | 12.730848 ms | 12.894656 ms | 15.317376 ms |
+
+Forward improves **0.588% against qualified / 0.475% against control**, below the
+required improvement against both. Training regresses **20.317% / 18.789%**.
+**The fixed diagnostic gate fails.** There is no additional timing, level
+grouping/order sweep, worker cap, completed-step qualification or SDK capture.
+
+Forward registers fall **86→84** and code size **102,400→98,048 bytes**;
+training registers fall **84→80** and code size **241,664→239,104 bytes**.
+Model shared storage remains **18,928/29,344 bytes**. Forward participation stays
+168 workers; training rises **168→252**. Ordinary forward/training GPU medians
+remain near 2.92/10.75 ms. Additional level ordering and changed native resources
+occur together; the result does not isolate serialization, contention or
+participation as the cause of the regression. Smaller code and fewer registers
+do not establish faster persistent execution.
+
+All **32 original source hashes, both qualified executable hashes and fourteen
+restored smoke tests** pass. Both new shader templates are removed and both
+forks remain clean. Evidence is local in `target/level-tickets/`; manifest
+`target/megakernel-results/level-tickets/summary.json` independently verifies
+**811 artifacts and 25 terminal scope receipts**, SHA-256
+`7d666c3bb3e578bdef2262fd79e558ded511e52a393b800d0de753877e4f6422`.
+Peak job memory is **3,714,826,240 bytes**, with zero memory-limit events or swap.
+Heavy jobs use separate verified 16/20/1 GiB cgroups; GPU work serializes and
+builds/copies/heavy analysis stay outside timing. All jobs finish. No actual
+emitted-SPIR-V qualification follows the failed gate. Qualified runtime
+`c3ad104` remains unchanged; baseline parity remains unmet.
+
 ## Completion-epoch control on the current runtime
 
 This counterfactual starts from `f28a00f`, with qualified runtime `3f95fa4`.
