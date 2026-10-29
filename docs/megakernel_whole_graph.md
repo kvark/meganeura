@@ -23,6 +23,11 @@ This is not a memory-traffic reduction: estimated global-load sectors rise
 41% while warp instructions fall 1.84%. The latest paired persistent/ordinary
 medians are **1.306× forward / 1.069× training**, or **1.309× / 1.097×** prewarmed.
 Baseline parity remains unmet and ordinary execution remains the default.
+
+The latest [original-tile SwiGLU fusion probe](#pairing-original-matrix-tiles-for-swiglu)
+passes its diagnostic GPU gate and correctness qualification, but fails the
+fixed 1,000-comparison wall-time gate. It is archived and reverted; `171d50d`
+remains the qualified runtime.
 The experiments below retain their historical runtime identities and results.
 
 A subsequent [aligned vector-storage SGD probe](#aligned-vector-storage-sgd)
@@ -4853,6 +4858,119 @@ Peak job memory is **3,720,495,104 bytes**, with zero memory-limit events or swa
 Heavy jobs use separate verified 16/20/1 GiB cgroups; GPU work serializes and
 builds/copies/heavy analysis stay outside timing. All jobs finish and artifacts
 remain on local `/x`.
+
+## Pairing original matrix tiles for SwiGLU
+
+This experiment starts at `82f68cc`, with qualified runtime `171d50d`.
+The earlier paired-column probe widened the native forward prologue tile and
+regressed forward execution. This composition instead places two unchanged
+64-lane matrix tiles in one 128-lane workgroup: one owns gate columns, the
+other owns corresponding up columns. Each keeps its original K arithmetic,
+staging and scratch. The prologue remains 32×16; the plain product remains
+32×32. Packing two pairs into a 256-lane persistent worker retains four
+original tiles and the existing shared-memory allocation.
+
+The paired control keeps a separate SwiGLU operation. Fusion adds one uniform
+storage barrier, evaluates the original scalar activation and removes that
+adjacent operation. The complete raw matrix remains available to backward
+and other readers. This reduces scheduling work, not all intermediate traffic.
+Both ordinary and persistent execution use the same selection. Unsupported
+modifiers, aliases, precision policies and incomplete paired column blocks
+retain their original implementation; no worker cap or scheduler change is used.
+
+Exact inverse source checks recover both original matrix shaders, and removing
+only the activation fragment recovers the paired control. The ownership model
+checks 110 layouts, 1,915,392 raw stores, 778,128 activation outputs, 5,376 lane
+and subgroup cases and 12,096 scratch addresses, including padded rows and
+inactive packed tiles. Invalid column and scratch offsets fail. These finite
+checks do not establish a full Vulkan progress proof.
+
+All 75 fixed diagnostic comparisons pass complete-state, selected-arithmetic,
+allocation and completion checks. Maximum error is 4.66e-9. Each model plan
+contains sixteen eligible pairs. Forward graph tiles change from 22,042 to
+17,946 paired and 11,546 fused; training changes from 83,312 to 81,264 and
+74,864. The four optimizer phases retain all 97,522 SGD tiles. Physical buffer
+assignments and logical buffer sizes match; scheduler accounting follows the
+sixteen removed nodes. The entire step remains one compute dispatch/submission.
+
+| Persistent GPU interval | Qualified, ms | Paired, ms | Fused, ms |
+|---|---:|---:|---:|
+| Model forward | 4.073728 | 4.103744 | 3.956224 |
+| Model training + SGD | 12.347968 | 12.288416 | 12.136960 |
+
+Fusion improves forward/training 2.884%/1.709% against qualified execution and
+3.595%/1.233% against the paired control, passing the fixed diagnostic gate.
+Reported shared bytes remain 18,928/29,344 and participating workers 168/168.
+Fused registers change 86→88 forward and 84→86 training; native code changes
+102,400→104,832 and 244,096→250,368 bytes. These counts do not isolate the
+cost of scheduling, packing or the additional barrier.
+
+Removing the probe selector, paired-only control and export hook passes
+678 library tests (eight ignored), 168 strict oracle cases, 51 matrix cases,
+fifteen whole-graph smoke tests, strict Clippy and Metal-target compilation.
+The fixture compares raw outputs, activations and gradients through changed
+input replays and poisoned storage with ordinary and 1/3/256-worker execution.
+Metal compilation is not Metal GPU qualification.
+
+The final bridge matches 59 shader sources byte-for-byte. Two ordinary sources
+differ only by four leading spaces in the activation fragment; the original
+strict byte comparison and the focused corrected check are both archived.
+All native statistics and allocation counts match the measured fused probe.
+Seven actual emitted SPIR-V modules validate. Four fused payloads preserve
+canonical `NonPrivatePointer` accesses, the original activation expression,
+and a workgroup control barrier with storage visibility semantics `0x6048`.
+The barrier dominates activation accesses and every function return. Five
+fence, four storage-barrier, four arithmetic and four access-flag mutations
+fail the audit. The temporary capture hook is removed, both compiler forks
+are clean, and rebuilt final binary hashes match. No native instruction-width
+or isolated stall-time claim follows.
+
+The fixed **1,000-comparison completed-step gate fails**. It uses qualified /
+final / final / qualified visits, 25 pairs per case/visit, both 0 and 100 ms
+prewarming, ten warmups/minimum one second, and 10,000 bootstrap resamples
+with seed 2026102619. All state, selection, allocation and work checks pass;
+diagnostic instrumentation and worker histograms are disabled.
+
+| Protocol / phase | Qualified persistent, ms | Fused persistent, ms | Ratio [pooled 95% interval] |
+|---|---:|---:|---:|
+| Original forward | 4.331788 | 4.585135 | 1.058485 [0.987864, 1.073246] |
+| Original training + SGD | 15.155308 | 14.794525 | 0.976194 [0.928241, 1.004663] |
+| Prewarmed forward | 4.336099 | 4.232822 | 0.976182 [0.938330, 1.052439] |
+| Prewarmed training + SGD | 12.653651 | 12.543542 | 0.991298 [0.988026, 0.994600] |
+
+Prewarmed training establishes an absolute 0.870% gain, but neither model
+phase establishes an absolute improvement under both protocols. No persistent
+regression is established. Normalized persistent/ordinary training ratios
+improve under both protocols, but do not replace the predeclared absolute-time
+criterion. Original ordinary forward also rises 5.67%; unchanged prewarmed CI
+inference rises 9.28% in ordinary execution. These observations do not isolate
+a cause or justify selectively dropping visits. The preliminary GPU improvement
+does not qualify retention, and baseline parity remains unmet.
+
+No repeat timing, pair-width/family/packing sweep or SDK capture follows this
+failed fixed gate. The prototype, selector and new fixture are archived and
+removed; runtime `171d50d` remains the qualified control. Initial production
+compilation caught a test-only parsed-module field, then the generator was
+corrected to parse its source before any timing. The source bridge's indentation
+assumption, a disassembly filename-suffix typo and an initially wrong handler
+scope in the SPIR-V audit were corrected without repeating measurements. Their
+failed terminal receipts remain archived.
+
+All **32 original source hashes and both qualified executable hashes** are
+restored. Changed source timestamps are refreshed before rebuilding, and the
+binary hashes are checked before fourteen restored whole-graph smoke tests
+and the retained CPU SGD fixture pass. Both owned compiler forks remain clean
+and pinned. The only published changes from this experiment are its records.
+
+Local evidence under `target/tile-pair-swiglu/` is indexed by
+`target/megakernel-results/tile-pair-swiglu/summary.json`, independently
+verifying **967 artifacts and 79 terminal study scopes**, including all four
+corrected failure receipts; SHA-256
+`5f2ee9b1c415dd36eebaee9df9c972c0431c9f342bf1ce63800abcdef0676fbc`.
+Peak job memory is **3,719,180,288 bytes**, with zero memory-limit events or swap.
+Heavy jobs use separate verified 16/20/1 GiB cgroups, GPU jobs serialize,
+and builds/copies/heavy analysis stay outside timing. All jobs finish and
+artifacts remain on local `/x`.
 
 ## Completion-epoch control on the current runtime
 

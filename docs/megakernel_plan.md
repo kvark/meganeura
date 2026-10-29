@@ -24,6 +24,11 @@ See [the qualification](megakernel_whole_graph.md#four-adjacent-sgd-elements-per
 Baseline parity remains open; the historical experiments below keep their
 original runtime identities and acceptance results.
 
+The latest [original-tile SwiGLU fusion probe](megakernel_whole_graph.md#pairing-original-matrix-tiles-for-swiglu)
+passes diagnostics and full correctness qualification but fails the fixed
+1,000-comparison completed-step gate. It is archived and reverted; the
+qualified runtime above is unchanged.
+
 The [NVIDIA counter investigation](megakernel_performance_analysis.md) identifies
 fixed worker sizing and portable queue overhead as the leading SmolVLA costs.
 Those measurements describe the regional implementation. Whole-graph execution
@@ -1373,6 +1378,21 @@ the descriptor-reference repair requires fresh measurements.
   the caught stale-build restoration, fresh qualified rebuild checks,
   867 verified artifacts and 30 terminal scope receipts. See
   [sharded per-node tile claims](megakernel_whole_graph.md#sharded-per-node-tile-claims).
+  Pair two unchanged 64-lane matrix tiles in one 128-lane workgroup, preserving
+  the native 32×16 prologue and 32×32 plain tiles; fuse the adjacent SwiGLU
+  behind a uniform storage barrier while preserving the complete raw matrix.
+  The 75-diagnostic gate passes, improving forward/training 2.884%/1.709%
+  against qualified and 3.595%/1.233% against the paired control. Full
+  correctness, Clippy, Metal compilation and seven emitted SPIR-V modules pass.
+  The fixed 1,000-comparison completed-step gate fails: only prewarmed training
+  establishes an absolute gain (0.870%); neither model phase qualifies under
+  both protocols. No persistent regression is established. Restore qualified
+  `171d50d`, archive both prototype forms and stop this experiment without
+  extra timing, SDK capture or a pair-width/family/packing sweep. Verify all 32
+  original source hashes, both qualified executables, fourteen restored smoke
+  cases and the CPU SGD fixture. Preserve 967 artifacts and 79 terminal study
+  scopes, with zero memory-limit events or swap. See
+  [pairing original matrix tiles](megakernel_whole_graph.md#pairing-original-matrix-tiles-for-swiglu).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
