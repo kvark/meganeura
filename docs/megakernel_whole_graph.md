@@ -264,6 +264,13 @@ resources remain exact. Fifty diagnostics change forward/training GPU time
 **+0.113% / −0.052%**, below the fixed improvement threshold. The probe is
 removed without testing alternate tree shapes or case orders.
 
+The next [replicated completion-epoch control](#replicated-completion-epochs)
+distributes idle polls over eight counters, with an identical-publication
+control that reads only the original counter. Progress and correctness checks
+pass, but forward/training GPU diagnostics regress **0.627% / 1.143%** against
+qualified execution. Neither model gains enough against both controls. The
+probe is removed without a replica-count or spacing sweep.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -4136,6 +4143,90 @@ Peak job memory is **3,719,839,744 bytes**, with zero memory-limit events or swa
 Every heavy job uses a separate verified 16/20/1 GiB cgroup, GPU jobs serialize,
 and builds/copies/heavy analysis stay outside measurements. All jobs finish;
 baseline parity remains unmet.
+
+## Replicated completion epochs
+
+This study starts from `0f9cdab` and leaves qualified runtime `c3ad104`
+unchanged. Every idle leader currently polls one remaining-node counter. The
+probe tests distributing those reads over eight fixed addresses, distinct from
+the rejected clock backoff, node-counter spacing and ordered-load controls.
+Existing source samples do not establish shared-address contention as a cause.
+
+For multiword graphs, each completed node decrements seven added counters and
+then the original counter, after its existing epoch release fence. Counters
+start at the real node count and occupy distinct 128-byte regions. A worker
+polls the fixed replica selected by its ID modulo eight. The matched central
+control performs the same publication work and reads only original `queue[0]`.
+Both probe modes use the same binary, shader, queue allocation and reset; only
+the previously unused Config word holding a zero/seven polling mask differs.
+Single-word graphs retain their original layout and source.
+
+The ordering argument applies the existing
+[fence-to-fence synchronization rule](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html#memory-model-synchronizes-with)
+independently to each replica's RMW sequence. Each worker keeps one selected
+address, so its count is monotonic even when replicas observe different
+completion orders. Successor publication precedes every replica decrement;
+changed-epoch acquisition and the authoritative fallback scan remain intact.
+Every successful-claim and per-lane payload fence remains. A zero replica means
+all payloads and successor publications are complete, although other replicas
+or global bookkeeping can still be in progress. Those publishers finish their
+bounded loops before returning to claim. Host validation retains all existing
+global/node/task checks and additionally requires every replica to be zero.
+
+The finite model checks **4,155 policy/configuration runs**, exploring
+**6,422,205 states and 11,388,133 transitions**, with no terminal deadlocks.
+Two- and three-replica policies each cover the existing 812 configurations;
+eight-replica cases cover smaller graphs and every individual replica.
+Early observer termination is exercised. Missing acquisition and a missing
+replica update produce the expected deadlocks. This abstracts scans, fan-out,
+overclaims and weak memory, and assumes eventual transitions; it is not an
+unconditional GPU progress proof. A separate layout check covers **2,024
+multiword layouts and 16,580,608 worker addresses**, including disjoint metadata,
+counter regions and unchanged single-word layouts.
+
+Before timing, redundant branches on the added RMW return values are removed;
+the original global underflow check and all replica-zero checks remain.
+Initial successful checks and source are preserved. The finalized probe passes
+**52 codegen checks and fourteen whole-graph smoke tests in each polling mode**.
+All **75 fixed diagnostics** pass full state, selection, payload allocation,
+optimizer, exact work, completion, one-dispatch and no-fallback checks. They use
+five cases, five pairs per mode, ten warmups/minimum one second, 100 ms prewarming
+and all 256 requested workers. Maximum model error remains 4.66e-9.
+
+| Persistent GPU diagnostic | Qualified | Central replica control | Striped polls |
+|---|---:|---:|---:|
+| Model forward | 4.073088 ms | 4.089248 ms | 4.098624 ms |
+| Model training | 12.728352 ms | 12.891232 ms | 12.873856 ms |
+
+Striped polling changes forward **+0.627% / +0.229%** against qualified/central
+control, and training **+1.143% / −0.135%**. Neither model gains 0.5% against
+both controls, and both exceed the qualified model-regression guard. No extra
+timing, replica-count/spacing sweep, full qualification, completed-step series,
+fresh SDK capture or new compiler API follows the failed gate.
+
+All **61 sources and native-statistic multisets match between probe modes**.
+Against qualified execution, 59 sources and all ordinary/CI statistics stay
+exact. Two complete source inverses isolate the new polling index and seven-RMW
+loop; six publication/index/acquisition mutations are rejected. Actual metadata
+confirms matched layouts and exactly **1,984/1,888 added scheduler bytes** for
+forward/training, including initial and live queues. The prefix growth also
+shifts node counters. Registers remain **86/84**, shared bytes **18,928/29,344**,
+and participating workers **168/168**. Both probes add 1,408 code bytes per model
+pipeline. Work stays 22,042/83,312 main tiles plus 97,522 SGD tiles in four phases.
+This isolates distributed polling at the probe layout; it neither measures
+atomic contention nor proves polling cheap. CI timing movement has unchanged
+shaders and native statistics.
+
+All **29 source hashes, both qualified executable hashes and fourteen restored
+smoke tests** match; both compiler forks remain clean. Evidence is local in
+`target/replicated-completion-epochs/`. Manifest
+`target/megakernel-results/replicated-completion-epochs/summary.json` independently
+verifies **514 artifacts and 26 terminal scope receipts**, SHA-256
+`31a2f4ef412081514879ba343354fb2261e1513aef69008d64cd65ebde4de580`.
+Peak job memory is **3,714,011,136 bytes**, with zero memory-limit events or swap.
+Every heavy job uses a separate verified 16/20/1 GiB cgroup, GPU jobs serialize,
+and builds/copies/heavy analysis stay outside measurements. All jobs finish.
+The qualified memory contract remains unchanged; baseline parity is unmet.
 
 ## Completion-epoch control on the current runtime
 

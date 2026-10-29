@@ -1274,6 +1274,17 @@ the descriptor-reference repair requires fresh measurements.
   and binary hashes plus fourteen smoke tests without alternate trees or more
   timing. Preserve 374 artifacts and twenty terminal scope receipts. See
   [balanced handler dispatch](megakernel_whole_graph.md#balanced-handler-dispatch).
+  Test eight completion-counter replicas against qualified execution and an
+  identical-publication central-polling control. Verify interleaved publication,
+  early observer termination, missing-acquire/update negative controls and
+  layout separation over 4,155 policy/configuration runs and 16,580,608 worker
+  addresses. Pass 52 codegen checks, fourteen smoke tests per mode and 75
+  diagnostics, with matched probe shaders/resources and two full source inverses.
+  Forward/training regress 0.627%/1.143% against qualified execution; neither
+  gains enough against both controls. Restore all source/binary hashes and
+  fourteen smoke tests without a replica-count/spacing sweep. Preserve 514
+  artifacts and 26 terminal scope receipts. See
+  [replicated completion epochs](megakernel_whole_graph.md#replicated-completion-epochs).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
@@ -1343,6 +1354,10 @@ the descriptor-reference repair requires fresh measurements.
   gate. Exact case bodies and unchanged native resources do not establish a
   useful gain. Do not extend this experiment with alternate tree shapes, case
   orders or timing repeats after the failed improvement threshold.
+  Eight completion-counter replicas are also closed under their fixed gate.
+  Preserve the matched central control, independent replica progress argument
+  and both qualified regressions. Do not sweep replica counts or spacing after
+  failure, or infer that atomic polling is cheap from this timing result.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,
