@@ -24,10 +24,14 @@ This is not a memory-traffic reduction: estimated global-load sectors rise
 medians are **1.306× forward / 1.069× training**, or **1.309× / 1.097×** prewarmed.
 Baseline parity remains unmet and ordinary execution remains the default.
 
-The latest [original-tile SwiGLU fusion probe](#pairing-original-matrix-tiles-for-swiglu)
+The [original-tile SwiGLU fusion probe](#pairing-original-matrix-tiles-for-swiglu)
 passes its diagnostic GPU gate and correctness qualification, but fails the
 fixed 1,000-comparison wall-time gate. It is archived and reverted; `171d50d`
 remains the qualified runtime.
+
+The subsequent [combined publication-barrier probe](#combined-publication-barrier)
+preserves the memory contract but fails its fixed diagnostic improvement gate.
+Its temporary backend hook is removed; no Naga change is retained.
 The experiments below retain their historical runtime identities and results.
 
 A subsequent [aligned vector-storage SGD probe](#aligned-vector-storage-sgd)
@@ -4969,6 +4973,99 @@ corrected failure receipts; SHA-256
 `5f2ee9b1c415dd36eebaee9df9c972c0431c9f342bf1ce63800abcdef0676fbc`.
 Peak job memory is **3,719,180,288 bytes**, with zero memory-limit events or swap.
 Heavy jobs use separate verified 16/20/1 GiB cgroups, GPU jobs serialize,
+and builds/copies/heavy analysis stay outside timing. All jobs finish and
+artifacts remain on local `/x`.
+
+## Combined publication barrier
+
+This rejected probe starts at `e3bc1d2`, with qualified runtime `171d50d`.
+After each claimed tile, all lanes execute a storage fence followed immediately
+by a workgroup barrier before the leader updates completion counters. This
+experiment combines that adjacent pair into one SPIR-V instruction while
+preserving its execution and storage synchronization requirements.
+
+The [SPIR-V control-barrier contract](https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#OpControlBarrier)
+also supplies memory-barrier semantics when its semantics operand is nonzero.
+The [Vulkan memory model](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html)
+defines the associated ordering, scope and availability/visibility operations.
+The replacement keeps workgroup execution scope and queue-family memory scope,
+and combines both original memory-class masks:
+
+```text
+OpMemoryBarrier  QueueFamily AcquireRelease|UniformMemory|MakeAvailable|MakeVisible
+OpControlBarrier Workgroup Workgroup AcquireRelease|WorkgroupMemory
+    =>
+OpControlBarrier Workgroup QueueFamily 0x6148
+```
+
+Only debug line directives may intervene. The helper rejects different scopes,
+semantics or memory models and intervening loads, stores, calls, branches and
+atomics. Storage ordering and propagation remain; shared-memory scope and
+propagation strengthen. It changes no access flags, remaining fences, relaxed
+queue atomics, payload instructions or scheduler control flow. It adds no
+language API. The temporary Blade hook applies the same exact transformation
+after Naga emission, before driver submission, to test its value before a Naga
+implementation would be justified.
+
+Two helper tests pass. Offline reconstruction checks seven archived qualified
+modules, finding exactly one eligible pair in each of five graph modules and
+none in two ordinary SGD modules. All outputs validate for Vulkan 1.3. Fifteen
+weakened-semantics mutations fail the independent comparison. A finite scope
+membership check covers 9,520 cases; it is not an arbitrary Vulkan execution or
+progress proof. Both control and combined modes pass fourteen whole-graph
+smoke tests, the exact CPU SGD fixture and the publication/reuse stress test.
+An additional captured stress run confirms that the transformed module was
+submitted and passed.
+
+All **75 fixed diagnostic comparisons** pass state, selection, completion,
+allocation and work checks, with maximum error 4.66e-9. The screen uses five
+pairs per case/mode, ten warmups/minimum one second, 100 ms prewarming and
+256 requested workers. Qualified and fresh-control native statistics match.
+All **61 WGSL sources** match across qualified, control and combined modes.
+The audit validates **126 submitted modules** across both probe modes and
+independently reconstructs the five changed graph modules exactly. Input
+module comparisons normalize only debug filename directories. Runtime source
+is unchanged; the local dependency override removes only Blade's source line
+from the lockfile during the probe.
+
+| Persistent GPU interval | Qualified, ms | Fresh control, ms | Combined, ms |
+|---|---:|---:|---:|
+| CI inference | 0.030528 | 0.030944 | 0.030944 |
+| CI backward | 0.066144 | 0.067776 | 0.067648 |
+| CI SGD | 0.071936 | 0.072160 | 0.072512 |
+| Model forward | 4.075296 | 4.073312 | 4.083488 |
+| Model training + SGD | 12.308448 | 12.248576 | 12.273280 |
+
+Combined forward/training medians change **+0.201%/−0.286% against qualified**
+and **+0.250%/+0.202% against the fresh control**. Neither phase reaches the
+required 0.5% gain against both controls. Regression guards pass, but the fixed
+improvement gate fails. All cases retain reported register/shared/code counts;
+model counts remain 86/84 registers, 18,928/29,344 shared bytes and
+102,400/244,096 native code bytes. Model participating workers remain 168/168.
+Graph work remains 22,042/83,312 tiles plus 97,522 SGD tiles in four phases,
+with one compute dispatch and one submission.
+
+Fewer SPIR-V instructions and unchanged reported code sizes do not prove
+identical native instructions, cheap fences or recoverable synchronization
+time. No extra timing, scope/mask/barrier-family sweep, full compiler/runtime
+qualification, completed-step gate or SDK capture follows. Naga is unchanged.
+The temporary Blade module/hook and local override are removed. All 32 source
+and lock hashes, Blade's original file and both qualified executables match;
+fourteen restored smoke tests, the CPU fixture and protocol stress pass.
+Both owned forks are clean and pinned. Baseline parity remains unmet.
+
+The initial offline audit needed absolute-path normalization. The hook's
+format/build steps initially used Rust 2021 assumptions in a Rust 2024 crate;
+the corrected helper reproduces every validated offline output exactly. The
+initial freeze check omitted the expected local-dependency lockfile change.
+All four failed terminal receipts are preserved; no GPU measurement is repeated.
+
+Local evidence under `target/combined-publication-barrier/` is indexed by
+`target/megakernel-results/combined-publication-barrier/summary.json`,
+independently verifying **1,029 artifacts and 30 terminal study scopes**;
+SHA-256 `60582d9c028076944f6bea24197154b042fbae5e4ad10b90132ee42906bf77ce`.
+Peak job memory is **3,719,208,960 bytes**, with zero memory-limit events or swap.
+Heavy jobs use separate verified 16/20/1 GiB cgroups, GPU work serializes,
 and builds/copies/heavy analysis stay outside timing. All jobs finish and
 artifacts remain on local `/x`.
 

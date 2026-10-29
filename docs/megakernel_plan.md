@@ -24,10 +24,14 @@ See [the qualification](megakernel_whole_graph.md#four-adjacent-sgd-elements-per
 Baseline parity remains open; the historical experiments below keep their
 original runtime identities and acceptance results.
 
-The latest [original-tile SwiGLU fusion probe](megakernel_whole_graph.md#pairing-original-matrix-tiles-for-swiglu)
+The [original-tile SwiGLU fusion probe](megakernel_whole_graph.md#pairing-original-matrix-tiles-for-swiglu)
 passes diagnostics and full correctness qualification but fails the fixed
 1,000-comparison completed-step gate. It is archived and reverted; the
 qualified runtime above is unchanged.
+
+The subsequent [combined publication-barrier probe](megakernel_whole_graph.md#combined-publication-barrier)
+also fails its fixed diagnostic gate. Its temporary backend hook is removed,
+and no Naga change is retained.
 
 The [NVIDIA counter investigation](megakernel_performance_analysis.md) identifies
 fixed worker sizing and portable queue overhead as the leading SmolVLA costs.
@@ -1393,6 +1397,21 @@ the descriptor-reference repair requires fresh measurements.
   cases and the CPU SGD fixture. Preserve 967 artifacts and 79 terminal study
   scopes, with zero memory-limit events or swap. See
   [pairing original matrix tiles](megakernel_whole_graph.md#pairing-original-matrix-tiles-for-swiglu).
+  Combine only the adjacent storage fence and workgroup barrier into one
+  queue-family memory/workgroup execution control barrier with semantics
+  `0x6148`. Preserve both original memory classes and all access flags,
+  atomics, remaining fences and handler code. Seven offline modules validate;
+  the actual audit reconstructs five transformed graph modules among 126
+  submitted modules, with all 61 WGSL sources unchanged. Both modes pass
+  fourteen smoke tests, the CPU fixture and publication/reuse stress test.
+  The fixed 75-comparison gate fails: model forward/training change
+  +0.250%/+0.202% against a fresh identical-SPIR-V control. Remove the hook
+  and override, restore both forks and qualified hashes, and preserve the
+  result without extra timing or a scope/mask/barrier-family sweep. Fewer
+  SPIR-V barriers and equal reported code sizes do not establish native
+  equivalence or recoverable time. Independently verify 1,029 artifacts and
+  30 terminal study scopes, with zero memory-limit events or swap. See
+  [combined publication barrier](megakernel_whole_graph.md#combined-publication-barrier).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
