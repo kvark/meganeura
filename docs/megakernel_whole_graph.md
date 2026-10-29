@@ -25,6 +25,12 @@ medians are **1.306× forward / 1.069× training**, or **1.309× / 1.097×** pre
 Baseline parity remains unmet and ordinary execution remains the default.
 The experiments below retain their historical runtime identities and results.
 
+A subsequent [aligned vector-storage SGD probe](#aligned-vector-storage-sgd)
+does not pass its fixed diagnostic gate. Training improves 0.59% against the
+qualified build but regresses 0.09% against a scalar control from the same
+probe binary. The candidate is restored without extra timing or SDK capture;
+`171d50d` remains the qualified runtime.
+
 The earlier [advisory ready-word summary](#advisory-ready-word-summary), retained
 in `c3ad104`, skips empty words while keeping the original full scan before an
 idle epoch. Against qualified `3f95fa4`, 1,000 completed-step comparisons improve
@@ -4653,6 +4659,94 @@ Peak job memory is **4,701,589,504 bytes**, with zero memory-limit events or swa
 Heavy jobs use separate verified 16/20/1 GiB cgroups on local `/x`; GPU jobs
 serialize and builds/copies/heavy analysis stay outside measurements. The
 optimization is retained, but full baseline parity remains unmet.
+
+## Aligned vector-storage SGD
+
+This rejected probe starts at `25937cf`, with qualified runtime `171d50d`.
+The preceding adjacent-four study improved training despite a 41.02% increase
+in estimated persistent global-load sectors, while its actual SPIR-V retained
+scalar storage accesses. This probe keeps the adjacent lane mapping and tests
+explicit `array<vec4<f32>>` parameter/gradient storage. Full groups use two
+vector loads and one vector store in generated WGSL; partial groups access
+only valid scalar components. It preserves the original multiply/subtract,
+segment search, learning-rate scaling, 1,024-element tile and four-tile claims.
+
+Both backends select the vector entry only when both binding offsets are
+16-byte aligned, every nonempty segment begins at a four-element boundary,
+and every enclosing vector fits both backing allocations. Checked bounds
+reject offset/range overflow. Unaligned or undersized units retain the
+qualified scalar-storage implementation. Selection uses the actual gradient
+source, including the accumulator when temporal accumulation is active.
+Canonical descriptor conversion and the publication protocol remain unchanged.
+
+The host admission test covers **368,640 parameter/gradient boundary cases**,
+plus overflow and mixed-segment checks. A separate finite model checks
+**240 layouts, 5,337,645 elements, 1,334,325 full vector blocks, 345 scalar tail
+elements and 81,920 binding-component addresses**; three invalid layouts are
+rejected. A GPU fixture rebinds both parameters and gradients across aligned,
+unaligned and exact-size allocations with ordinary execution and 1/3/256
+workers. Two changed-input replays per stage preserve every CPU parameter,
+gradient and poisoned padding element, and verify the selected fallback.
+Ordinary execution skips only rebinding offsets prohibited by its descriptor
+alignment; the graph path tests those offsets through canonical bindings.
+
+Both scalar-control and vector modes pass that fixture, the retained SGD CPU
+fixture and **fourteen whole-graph smoke tests**. **52 codegen checks**, release
+builds and formatting pass. Independent metadata reconstruction confirms
+identical segments, allocation ranges, group prefixes and learning-rate bits.
+All four model optimizer units are eligible, covering 99,848,592 elements with
+no scalar tail. Test metadata also exercises four distinct ineligible units.
+
+The control retains all **61 qualified sources** and adds two unused ordinary
+vector sources. Candidate/control ordinary sources and native statistics are
+identical. Only the two graph SGD entries change; CI adds a canonical vector
+view, while model training reuses its existing view. Source inverses preserve
+all other graph code, including every fence, queue operation and handler.
+Eight invalid source mutations fail. This is a generated-WGSL audit; no claim
+of native memory width or reduced traffic follows from it.
+
+The fixed **75 diagnostic comparisons** use five pairs per case and mode,
+ten warmups/minimum one second, and 100 ms prewarming. Every full-state,
+selection, allocation, logical-completion and no-fallback check passes, with
+maximum error 4.66e-9. All 256 workers remain requested. Model work stays
+22,042/83,312 graph tiles plus 97,522 SGD tiles in four phases; each step retains
+one compute dispatch and the existing submission boundary.
+
+| Persistent GPU interval | Qualified, ms | Scalar control, ms | Vector storage, ms |
+|---|---:|---:|---:|
+| CI inference | 0.030848 | 0.030496 | 0.032224 |
+| CI backward | 0.067616 | 0.068064 | 0.067520 |
+| CI SGD | 0.072256 | 0.073824 | 0.072256 |
+| Model forward | 4.077376 | 4.076640 | 4.077408 |
+| Model training + SGD | 12.354720 | 12.270880 | 12.281792 |
+
+Training improves **0.590% against qualified** but regresses **0.089% against
+the scalar control**. It fails the required 0.5% gain against both. Unchanged
+CI inference also crosses the 3% diagnostic guard; identical source and native
+statistics do not attribute that movement to vector storage. Forward remains
+flat. Ordinary training is 10.752160/10.737056/10.743040 ms across the three
+modes. Model registers stay 86/84, shared bytes 18,928/29,344 and participating
+workers 168/168. Training code falls 244,096→243,200 bytes; CI SGD code falls
+67,584→67,200. These counts do not establish a performance benefit.
+
+The fixed gate fails, so no extra repeats, alignment/width/family sweep, full
+correctness/SPIR-V qualification, completed-step gate or SDK capture follows.
+All **32 original source hashes and both qualified executable hashes** are
+restored. The new shader, selector, exporter and temporary tests are removed;
+fourteen restored smoke tests and the retained CPU fixture pass. Both owned
+compiler forks remain clean and pinned. Runtime `171d50d` remains qualified;
+baseline parity remains unmet.
+
+After session recovery, all six measurement receipts were terminal and the
+GPU was idle; no measurement was restarted. Local evidence under
+`target/sgd-vector-storage/` is indexed by
+`target/megakernel-results/sgd-vector-storage/summary.json`, independently
+verifying **564 artifacts and 29 terminal study scope receipts**, SHA-256
+`2a8205493805e4c34d44265023d977d016ac89bdbf164ffefc4b2753f6cc0630`.
+Peak job memory is **3,714,449,408 bytes**, with zero memory-limit events or swap.
+All heavy work, including restoration and analysis, uses separate verified
+16/20/1 GiB cgroups. GPU jobs serialize, builds/copies/heavy analyses stay
+outside timing, and all artifacts remain on local `/x`.
 
 ## Completion-epoch control on the current runtime
 

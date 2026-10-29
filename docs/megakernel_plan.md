@@ -1351,6 +1351,17 @@ the descriptor-reference repair requires fresh measurements.
   vector memory instructions. Preserve 952 artifacts and 71 terminal scope
   receipts; publish runtime `171d50d` and keep baseline parity open. See
   [four adjacent SGD elements](megakernel_whole_graph.md#four-adjacent-sgd-elements-per-lane).
+  Test aligned vector-storage SGD against the qualified build and a scalar
+  control from the same probe binary, preserving fallback for unaligned or
+  undersized allocations. Pass admission/address checks, exact CPU rebinding
+  and padding checks, 52 codegen tests and fourteen smoke tests per mode.
+  The fixed 75-diagnostic screen gives training −0.590% against qualified but
+  +0.089% against scalar control, failing the required gain against both.
+  Restore all 32 source hashes, both qualified binaries, fourteen smoke tests
+  and the retained CPU fixture. Preserve 564 artifacts and 29 terminal scope
+  receipts. No alignment/width/family sweep or further timing follows; native
+  memory width and traffic reduction remain unmeasured for this rejected probe.
+  See [aligned vector-storage SGD](megakernel_whole_graph.md#aligned-vector-storage-sgd).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
@@ -1447,7 +1458,7 @@ the descriptor-reference repair requires fresh measurements.
   add matched `--prewarm-ms 100` controls. Preserve all samples, state checks,
   requested workers and acceptance budgets; changed cache/power state is not a
   runtime optimization.
-  Use qualified `c3ad104` and its archived `target/ready-word-summary/final-*`
+  Use qualified `171d50d` and its archived `target/sgd-adjacent-four/final-*`
   binaries and receipt as the next control, and retain all completed-step gates;
   instruction or traffic savings alone are insufficient retention evidence.
   Preserve initialization, writer ownership, publication, independent B storage
