@@ -4345,6 +4345,96 @@ Heavy jobs use separate verified 16/20/1 GiB cgroups; GPU jobs serialize, and
 builds/copies/heavy analysis stay outside timing. All jobs finish. The retained
 memory contract and baseline-performance goal remain unchanged.
 
+## Paired-column MatMul and SwiGLU fusion
+
+Starting from `6a77cb7`, this study tests removing the scheduling boundary
+between adjacent cooperative F32 MatMul and SwiGLUConcat operations. The paired
+control computes 16 gate columns and their matching 16 up columns in one
+32-row workgroup, while retaining the separate activation node. The fused
+candidate uses the same matrix geometry, writes the full original matrix,
+executes an unconditional `storageBarrier()`, then computes the original scalar
+SwiGLU into an extra output. Backward and other readers retain the raw matrix.
+Both use the common ordinary/persistent selector and existing four-way packing.
+
+Admission requires the already-selected 16×16 promoted-F16 cooperative path,
+plain F32 storage, complete 32-column pairs, checked extents, adjacent matching
+producer/consumer buffers, and no aliases, pinned schedules or incompatible
+modifiers. The full original K accumulation and activation operator order stay
+intact. No new atomic interface or scheduler fence change is needed: the existing
+Naga fork emits a workgroup-scoped storage control barrier with acquire/release,
+UniformMemory, MakeAvailable and MakeVisible. All activation reads refer to
+outputs from their own logical workgroup through the same canonical descriptor.
+This follows the existing [Vulkan memory-model rules](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html);
+it does not remove the raw global stores or activation loads.
+
+The finite ownership audit covers **70 layouts, 4,249,600 raw store locations and
+1,662,656 activation outputs**, including 50 partial packed grids and two
+incorrect-coordinate controls. Validation passes the admission test, **53
+codegen checks**, fourteen existing whole-graph smoke tests and a dedicated
+replay fixture in each mode. The fixture compares raw output, activation and
+backward output exactly against an unfused ordinary reference for partial rows
+and K tails, both prologue forms, changed inputs, ordinary execution and
+1/3/256 persistent workers. It also checks the CPU activation formula.
+
+All **75 fixed diagnostic comparisons** pass full-state, selection, optimizer,
+completion, one-dispatch and no-fallback checks, with maximum error **4.66e-9**.
+The protocol uses five cases, five pairs per mode, ten warmups/minimum one
+second, 100 ms prewarming and all 256 requested workers. Each model phase
+contains sixteen eligible pairs. Forward operations fall from 154 to 138 and
+training operations from 523 to 507. Main logical work changes as predicted:
+22,042/83,312 tiles qualified, 17,946/83,312 paired, and 11,546/76,912 fused.
+All 97,522 SGD tiles in four phases remain. Eight plan comparisons preserve
+every unrelated dispatch field, logical buffer size and physical assignment.
+Reduced task counts therefore reflect changed tiling/fusion, not omitted outputs.
+
+| Persistent GPU diagnostic | Qualified | Paired control | Fused |
+|---|---:|---:|---:|
+| Model forward | 4.080800 ms | 4.397472 ms | 4.259424 ms |
+| Model training + SGD | 12.902304 ms | 12.749024 ms | 12.588704 ms |
+
+Fusion improves **3.139% forward and 1.258% training** against paired execution,
+but forward remains **4.377% slower** than qualified execution. Training improves
+2.431% against qualified. **The fixed advancement gate fails its 0.5% forward
+regression guard.** No extra timing, shape/family sweep, completed-step
+qualification or fresh SDK capture follows. The training diagnostic is not a
+retained completed-step gain.
+
+Forward registers are 86/84/89 and shared memory 18,928/20,992/20,992 bytes for
+qualified/paired/fused. Training registers are 84/83/83 with 29,344 shared bytes
+throughout. All model captures have 168 participating workers. Forward code
+sizes are 102,400/105,728/110,464 bytes; training sizes are
+241,664/241,664/247,808. Ordinary forward GPU time also rises from 2.924128 to
+3.191712/3.187488 ms. The paired forward geometry expands the qualified narrow
+prologue tile and adds a 2,064-byte packed F16 scratch bank. This changes staging
+sharing and native resources together; the measurements do not isolate one
+resource as the cause of the regression.
+
+Each probe preserves 57 dumped sources. All unrelated graph functions and
+handler cases match after handler-ID renaming. Main scheduling/publication code
+matches outside the changed cases and the added forward scratch sentinel
+initialization. Both fused ordinary sources invert exactly to their paired
+controls by removing the extra output and activation/barrier fragment; six
+incorrect-source controls fail. No actual emitted-SPIR-V qualification follows
+the failed performance gate.
+
+The first test build used `PerCol` instead of `PerKCol`; the corrected build
+passes. The source auditor initially omitted the added scratch sentinel,
+assumed every handler had an entry-suffixed function, and then confused identical
+packing wrappers with unique handlers. Matching complete handler function groups
+resolves these audit errors. Failed logs remain; runtime validation is unchanged,
+and no GPU timing is repeated.
+
+All **32 original source hashes, both qualified executable hashes and fourteen
+restored smoke tests** pass. Both added source files are removed and both forks
+are clean. Evidence is local in `target/paired-swiglu/`; manifest
+`target/megakernel-results/paired-swiglu/summary.json` independently verifies
+**526 artifacts and 31 terminal scope receipts**, SHA-256
+`e50e5526cb913ed4cdc73137b28ca2dea48516a86aa9149a9af6e800bf9cbae3`.
+Peak job memory is **3,716,501,504 bytes**, with zero memory-limit events or swap.
+Heavy jobs use separate verified 16/20/1 GiB cgroups, GPU jobs serialize, and no
+build/copy/heavy analysis overlaps timing. Qualified runtime `c3ad104` remains
+unchanged; baseline parity remains unmet.
+
 ## Completion-epoch control on the current runtime
 
 This counterfactual starts from `f28a00f`, with qualified runtime `3f95fa4`.

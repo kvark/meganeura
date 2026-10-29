@@ -1299,6 +1299,20 @@ the descriptor-reference repair requires fresh measurements.
   Reject without extra timing or SDK captures; restore all source/binary hashes
   and fourteen smoke tests. Preserve 918 artifacts and 63 terminal receipts.
   See [four-element SwiGLU lanes](megakernel_whole_graph.md#four-element-swiglu-lanes).
+  Test adjacent cooperative MatMul→SwiGLU fusion with a paired-column control
+  that retains the separate activation. Preserve the full raw matrix for
+  backward, all outputs and original arithmetic. Verify 70 ownership layouts,
+  admission, 53 codegen checks, fourteen smoke tests plus a dedicated changed-input
+  replay fixture per mode, and 75 fixed diagnostics. Audit all eight model plans,
+  unchanged physical allocation, exact predicted work and unrelated shader code.
+  Fusion gains 3.139%/1.258% against paired forward/training, but forward regresses
+  4.377% against qualified execution and fails the guard. Restore all source and
+  binary hashes plus fourteen smoke tests without more timing or SDK captures.
+  Preserve 526 artifacts and 31 terminal scope receipts. See
+  [paired-column MatMul and SwiGLU fusion](megakernel_whole_graph.md#paired-column-matmul-and-swiglu-fusion).
+  This paired-column fusion is closed under the fixed gate; fewer task boundaries
+  do not establish less global traffic or justify a shape/family sweep after the
+  forward regression. A new fusion mechanism needs distinct evidence.
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
