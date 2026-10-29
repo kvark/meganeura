@@ -34,6 +34,11 @@ preserves the memory contract but fails its fixed diagnostic improvement gate.
 Its temporary backend hook is removed; no Naga change is retained.
 The experiments below retain their historical runtime identities and results.
 
+The following [direct SGD record probe](#direct-sgd-segment-records) eliminates
+the predecessor search but regresses training GPU time 5.24% against qualified
+execution and 1.21% against an identical-shader search control. It is restored
+without extra timing or SDK capture; `171d50d` remains the qualified runtime.
+
 A subsequent [aligned vector-storage SGD probe](#aligned-vector-storage-sgd)
 does not pass its fixed diagnostic gate. Training improves 0.59% against the
 qualified build but regresses 0.09% against a scalar control from the same
@@ -5068,6 +5073,82 @@ Peak job memory is **3,719,208,960 bytes**, with zero memory-limit events or swa
 Heavy jobs use separate verified 16/20/1 GiB cgroups, GPU work serializes,
 and builds/copies/heavy analysis stay outside timing. All jobs finish and
 artifacts remain on local `/x`.
+
+## Direct SGD segment records
+
+This experiment starts at `d40743e`, with qualified runtime `171d50d`.
+It appends one complete immutable segment record per SGD logical workgroup
+after each unit's original segment table. Direct indexing selects the same
+offset, length, first group, parameter index and learning-rate bits as the
+original predecessor search. This removes the search and the subsequent
+indirect record lookup, unlike the earlier bucket and fixed-shrink probes.
+Single-segment, empty and budget-exceeding units retain the original search.
+Additional records have a 16 MiB session budget, admitting complete units in
+their original order. Other optimizer passes retain their original tables.
+
+Both probe modes allocate identical metadata and use identical shader bytes.
+Only the formerly unused SGD parameter word selects the direct offset or zero
+for the original-search control. Qualified execution supplies a third control.
+Update expressions, geometry, four-tile claims, dependencies, fences, atomics
+and all 256 requested workers remain unchanged. The step still uses one compute
+dispatch and one submission.
+
+The finite checker covers **97,739 layouts, 664,328 queried groups and 2,657,312
+admission checks**, including zero-length parameters, duplicate starts, partial
+tiles, wrapped grids, budget exhaustion and integer limits. Three invalid
+record controls fail. Actual uploaded records match across both modes except
+the selected offset. The four model units retain 77/47/11/1 segments and
+32,717/30,245/31,680/2,880 groups. The first three use direct records; the final
+single-segment unit already needs no search. This eliminates **491,999 modeled
+search comparisons** and adds **3,028,736 bytes**, including alignment padding.
+Those counts do not predict elapsed time or native memory traffic.
+
+All **61 WGSL sources and native-statistic multisets match between probe modes**.
+Against qualified execution, 57 sources remain exact. Two ordinary SGD sources
+have exact inverses; the two combined shaders preserve update arithmetic after
+renaming generated temporaries, and removing the lookup addition recovers all
+other source exactly. Forward, CI inference and CI backward shaders are unchanged.
+Training registers rise **84→88**, code grows **244,096→249,856 bytes**, and shared
+storage stays **29,344 bytes**. Both model phases still record 168 participating
+workers. These resource changes do not isolate a slowdown's cause.
+
+Both modes pass **52 shared codegen checks, fourteen whole-graph smoke tests each
+and the exact CPU SGD fixture each**. Ten separate metadata preflight comparisons
+pass before the fixed 75-comparison diagnostic series. Metadata export is disabled
+during that timing series. Complete-state, selected-arithmetic, payload/scheduler
+allocation, completion and no-fallback checks pass; maximum error remains 4.66e-9.
+Graph work stays 22,042/83,312 tiles, with 97,522 SGD tiles in four phases.
+
+| Persistent GPU interval | Qualified, ms | Search control, ms | Direct records, ms |
+|---|---:|---:|---:|
+| Model forward | 4.060544 | 4.072448 | 4.076800 |
+| Model training + SGD | 12.305632 | 12.794848 | 12.950240 |
+
+Training regresses **5.238% against qualified** and **1.214% against the matched
+search control**, failing the fixed improvement and regression gates. Unchanged
+CI inference also crosses its 3% guard at +5.318%/+4.231%; that incidental change
+is not attributed to SGD. Ordinary training GPU time stays near 10.74 ms. No
+extra timing, full qualification, actual-SPIR-V audit, normal completed-step
+acceptance series, SDK capture or lookup-layout/size sweep follows the failure.
+
+Two rejected analyses remain archived. The first metadata audit incorrectly
+required the backward-only CI table to contain SGD records. The first allocation
+audit expected `resident_buffer_bytes` to include the segment table, but
+`memory_summary` currently excludes `optimizer_segments`. Corrected checks
+separately account for the exported table and its host allocation: 3,033,376
+versus 4,640 model bytes, and 640 versus 160 CI SGD bytes. Reported tensor and
+scheduler allocations remain exact. No GPU samples were discarded or repeated.
+
+The prototype and selector/export hooks are removed. All **32 original source
+hashes and both qualified executable hashes** match before fourteen restored
+smoke tests and the CPU fixture pass. Both compiler forks remain clean. Evidence
+under `target/sgd-direct-records/` is indexed by
+`target/megakernel-results/sgd-direct-records/summary.json`, SHA-256
+`b717d7e2a207ae320e021ac23b6273884bb987448488361c590487d2409d0d1a`.
+Independent verification covers **678 artifacts and 34 terminal study scopes**.
+Peak job memory is **3,739,439,104 bytes**, with zero memory-limit/OOM events or
+swap. Heavy work uses separate verified 16/20/1 GiB cgroups, GPU jobs serialize,
+and artifacts remain on local `/x`. Baseline parity remains unmet.
 
 ## Completion-epoch control on the current runtime
 

@@ -1412,6 +1412,18 @@ the descriptor-reference repair requires fresh measurements.
   equivalence or recoverable time. Independently verify 1,029 artifacts and
   30 terminal study scopes, with zero memory-limit events or swap. See
   [combined publication barrier](megakernel_whole_graph.md#combined-publication-barrier).
+  Materialize one complete immutable segment record per SGD logical tile,
+  with a checked 16 MiB budget and original-search fallback. Exact finite and
+  uploaded-metadata checks pass; 94,642 model tiles use direct records and
+  491,999 modeled search comparisons disappear. Both modes pass codegen,
+  graph smoke and CPU-reference checks. The fixed 75-comparison gate fails:
+  training regresses 5.238% against qualified and 1.214% against an identical
+  search control. Restore qualified sources and executable hashes before
+  fresh smoke/CPU checks. Preserve 678 artifacts, 34 terminal bounded scopes
+  and both corrected analysis failures. Account separately for the 3,028,736
+  added metadata bytes, which current `memory_summary` omits. No further
+  timing, SDK capture or lookup-layout/size sweep follows this rejection.
+  See [direct SGD segment records](megakernel_whole_graph.md#direct-sgd-segment-records).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
