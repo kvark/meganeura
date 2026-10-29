@@ -1285,6 +1285,20 @@ the descriptor-reference repair requires fresh measurements.
   fourteen smoke tests without a replica-count/spacing sweep. Preserve 514
   artifacts and 26 terminal scope receipts. See
   [replicated completion epochs](megakernel_whole_graph.md#replicated-completion-epochs).
+  Test four-element F32 SwiGLU lanes with a matched scalar control at the same
+  64-lane geometry and existing packing. Verify 88 layouts and 4,605,608
+  operand/result addresses; pass 53 prototype codegen checks and fifteen smoke
+  tests per mode. The 75-diagnostic screen advances: vector forward/training
+  improves 1.66%/1.19% against qualified, and training improves 1.03% against
+  scalar control. Remove the probe selector and pass 678 library tests,
+  168 strict oracle cases, 51 matrix regressions, fifteen smoke tests, Clippy,
+  Metal compilation and seven actual SPIR-V validations. Preserve 62 identical
+  prototype/production sources and native statistics. In 1,000 completed-step
+  comparisons, only prewarmed training establishes an absolute gain; neither
+  model passes both protocols and prewarmed CI inference crosses its guard.
+  Reject without extra timing or SDK captures; restore all source/binary hashes
+  and fourteen smoke tests. Preserve 918 artifacts and 63 terminal receipts.
+  See [four-element SwiGLU lanes](megakernel_whole_graph.md#four-element-swiglu-lanes).
   Do not repeat native B lookahead, rejected scalar prefetch or subgroup-local
   staging layouts, or repeat guarded-fence or disjoint-scan timing after their
   failed fixed gates. The scalar GEMV scratch-pooling candidate is also closed
@@ -1358,6 +1372,11 @@ the descriptor-reference repair requires fresh measurements.
   Preserve the matched central control, independent replica progress argument
   and both qualified regressions. Do not sweep replica counts or spacing after
   failure, or infer that atomic polling is cheap from this timing result.
+  Four-element SwiGLU lanes are also closed under the fixed completed-step
+  gate. Preserve the matched scalar geometry, verified vector SPIR-V and
+  prewarmed-only training gain without substituting them for the required
+  two-protocol result. Do not extend this study with width/family sweeps or
+  repeated timing after failure.
   Further overlap or scheduling candidates need a distinct mechanism supported
   by attribution; code size, inactive-lane counts or barrier-wait percentages
   alone do not establish a cause. Require unchanged correctness, resource,

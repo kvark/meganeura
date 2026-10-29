@@ -271,6 +271,14 @@ pass, but forward/training GPU diagnostics regress **0.627% / 1.143%** against
 qualified execution. Neither model gains enough against both controls. The
 probe is removed without a replica-count or spacing sweep.
 
+The subsequent [four-element SwiGLU lane study](#four-element-swiglu-lanes)
+passes its diagnostic screen, full correctness qualification and emitted SPIR-V
+checks. Vector loads and arithmetic improve forward/training GPU diagnostics
+**1.66% / 1.19%** against qualified execution. In 1,000 completed-step
+comparisons, only prewarmed training establishes an absolute gain; neither model
+passes both protocols, and prewarmed CI inference crosses its regression guard.
+The candidate is restored without extra timing or SDK captures.
+
 The preceding [cooperative prologue factor caching](#cooperative-prologue-factor-caching)
 keeps each lane's two per-row factors in registers across the K loop, after
 the existing shared-cache initialization and barrier. Against qualified
@@ -4227,6 +4235,115 @@ Peak job memory is **3,714,011,136 bytes**, with zero memory-limit events or swa
 Every heavy job uses a separate verified 16/20/1 GiB cgroup, GPU jobs serialize,
 and builds/copies/heavy analysis stay outside measurements. All jobs finish.
 The qualified memory contract remains unchanged; baseline parity is unmet.
+
+## Four-element SwiGLU lanes
+
+Starting from `b4c1da9`, this study tests vector storage accesses and arithmetic
+for explicit F32 `SwiGLUConcat` and its gradient. The earlier SwiGLU experiments
+repeated original scalar tiles sequentially; this mechanism computes four
+adjacent elements per lane. Each logical workgroup has 64 lanes and still owns
+256 elements, preserving the original grid. The common ordinary/persistent
+selector admits positive whole rows whose half-width is divisible by four,
+with checked index bounds and no reduced storage or other kernel modifiers.
+Other shapes and GeGLU retain their original implementations.
+
+The scalar control unrolls four original scalar calculations per lane with
+the same 64-lane geometry. The vector candidate loads/stores `vec4<f32>` and
+uses the original componentwise operator order. Both enable the existing
+four-way physical-worker packing, including partial final groups. No new
+scheduler, payload fence, allocation policy, optimizer rule or worker limit is
+introduced. Relative to qualified execution, geometry, memory access width,
+packing and compiler resources change together; the matched scalar control
+separates the vector representation at the new geometry.
+
+The finite coordinate audit covers **88 layouts, 657,944 scalar elements and
+4,605,608 operand/result addresses**, including 66 partial packed grids and two
+incorrect-coordinate controls. Prototype validation passes **53 codegen checks
+and fifteen whole-graph smoke tests per mode**. A new fixture checks forward
+and gradient outputs against CPU formulas and exact ordinary/persistent
+agreement, changed-input replay, aligned partial tiles, unaligned fallbacks and
+1/3/256 workers.
+
+All **75 fixed diagnostics** pass full-state, allocation, selection, optimizer,
+completion, exact-work, one-dispatch and no-fallback checks. They use five cases,
+five pairs per mode, ten warmups/minimum one second, 100 ms prewarming and all
+256 requested workers. Maximum model error remains **4.66e-9**. Main work stays
+22,042/83,312 logical tiles, with 97,522 SGD tiles in four training phases.
+
+| Persistent GPU diagnostic | Qualified | Scalar four-element control | Vector |
+|---|---:|---:|---:|
+| Model forward | 4.071008 ms | 4.015104 ms | 4.003360 ms |
+| Model training | 12.736704 ms | 12.715904 ms | 12.584832 ms |
+
+Vector forward improves **1.662% against qualified / 0.292% against scalar**;
+training improves **1.192% / 1.031%**. Training passes the 0.5% improvement
+threshold against both controls, and all model/CI regression guards pass.
+Forward registers change 86→82 in both probes; training stays at 84. Shared
+storage stays at 18,928/29,344 bytes, and 168 workers participate in both model
+phases. Qualified/scalar/vector code sizes are 102,400/105,472/102,912 bytes
+forward and 241,664/250,880/244,096 bytes training. These counts do not establish
+an isolated cause of the timing changes.
+
+Each probe preserves **58 complete source files**. Two separate ordinary
+modules replace the original combined SwiGLU module, and two model graph
+shaders change only the admitted payload functions and existing packing
+wrappers. Other functions and global declarations remain exact. Source checks
+verify scheduler/publication code outside those wrappers and reject eight
+mutations; scalar/vector graph main functions match exactly. This is a scope
+audit, not a complete inverse of the changed Naga-lowered payload functions.
+The initial auditor incorrectly expected an unqualified active-lane parameter
+name; correcting it passes. A diagnostic helper named `inspect.py` also
+shadowed Python traceback machinery and is renamed. Both failures and the
+initial auditor are preserved, without repeating GPU timing.
+
+The production candidate removes the environment switch and scalar control,
+and adds admission tests. Full qualification passes **678 library tests**
+(eight ignored), **168 strict whole-graph oracle tests, 51 ordinary matrix
+regressions and fifteen whole-graph smoke tests**, plus formatting, Clippy and
+Metal compilation. A final source bridge verifies all **62 emitted sources**,
+native statistics and allocations against the vector prototype; only the
+human-readable implementation label changes.
+
+A temporary read-only Blade hook captures **seven actual SPIR-V modules**:
+five graph pipelines and two ordinary SwiGLU pipelines. All validate for
+Vulkan 1.3. Forward/gradient bodies contain two/three vector storage loads and
+one/two vector storage stores, with no added payload barriers or atomics.
+Existing payload-fence and relaxed queue-atomic semantics remain intact; five
+incorrect-fence controls are rejected. Hooked sources and native statistics
+match production, and both compiler forks and candidate binary hashes are
+restored afterward. This validates SPIR-V operations, not native instruction
+width or a complete Vulkan progress proof.
+
+The fixed **1,000 completed-step comparisons** use qualified/candidate/
+candidate/qualified order, 25 pairs per case/visit, under original and 100 ms
+prewarmed protocols. All correctness checks pass. Bootstrap intervals use
+10,000 resamples and seed 2026102619; all samples remain included.
+
+| Protocol | Model phase | Candidate / qualified persistent wall time | 95% interval |
+|---|---|---:|---:|
+| Original | Forward | 1.059967 | 0.990399–1.074652 |
+| Original | Training | 0.989031 | 0.968664–1.005521 |
+| Prewarmed | Forward | 0.983213 | 0.926420–1.020426 |
+| Prewarmed | Training | 0.981466 | 0.970681–0.999827 |
+
+Only prewarmed training establishes an absolute gain. Neither model does so
+under both protocols. Prewarmed CI inference also regresses **5.38%**, interval
+**1.005219–1.074297**. Its shaders and native statistics are unchanged; the
+measurement is retained without assigning that movement to the shader change.
+**The completed-step retention gate fails.** No extra timing, width/family
+sweep or fresh SDK capture follows.
+
+All **29 original source hashes, both qualified executable hashes and fourteen
+restored smoke tests** pass. The new generator is removed, both forks are clean,
+and runtime `c3ad104` remains qualified. Evidence is local in
+`target/swiglu-four-lanes/`; manifest
+`target/megakernel-results/swiglu-four-lanes/summary.json` independently verifies
+**918 artifacts and 63 terminal scope receipts**, SHA-256
+`9d437616c7d9074df3a52a84fbf76fb4cf2f3632daec5d73fa46ac846fe43980`.
+Peak job memory is **3,719,389,184 bytes**, with zero memory-limit events or swap.
+Heavy jobs use separate verified 16/20/1 GiB cgroups; GPU jobs serialize, and
+builds/copies/heavy analysis stay outside timing. All jobs finish. The retained
+memory contract and baseline-performance goal remain unchanged.
 
 ## Completion-epoch control on the current runtime
 
