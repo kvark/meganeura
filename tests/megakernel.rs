@@ -1,6 +1,105 @@
 use meganeura::megakernel::{Execution, Executor, Instruction, Job, Options};
 
 #[test]
+fn sgd_adjacent_four_matches_cpu() {
+    let gpu = crate::support::gpu::gpu();
+    let supports_graph = gpu.capabilities().device_memory_fence && gpu.capabilities().binding_array;
+    let lengths = [
+        1,
+        2,
+        3,
+        4,
+        5,
+        255,
+        256,
+        257,
+        1023,
+        1024,
+        1025,
+        1026,
+        1027,
+        1024 * 1024 + 17,
+    ];
+    let mut graph = meganeura::Graph::new();
+    let mut loss = None;
+    for (index, &len) in lengths.iter().enumerate() {
+        let p = graph.parameter(&format!("p{index}/weight"), &[len]);
+        let x = graph.input(&format!("x{index}"), &[len]);
+        let product = graph.mul(p, x);
+        let sum = graph.sum_all(product);
+        loss = Some(loss.map_or(sum, |prior| graph.add(prior, sum)));
+    }
+    graph.set_outputs(vec![loss.unwrap()]);
+    for workers in [0, 1, 3, 256] {
+        if workers != 0 && !supports_graph {
+            continue;
+        }
+        let mut config = crate::support::gpu::config();
+        config.optimize.mode = meganeura::OptimizeMode::Off;
+        config.tune = false;
+        config.runtime.coop = meganeura::CoopPolicy::Disabled;
+        config.runtime.poison = true;
+        config.runtime.arena_chunk_bytes = Some(8 * 1024 * 1024);
+        config.runtime.persistent = (workers != 0).then_some(meganeura::PersistentOptions {
+            workers,
+            device_scheduling: true,
+            whole_graph: true,
+            allow_fallback: false,
+            track_workers: true,
+        });
+        let mut session = meganeura::build(&graph, config).0;
+        session.set_learning_rate(1.0 / 64.0);
+        let mut expected: Vec<Vec<f32>> = lengths
+            .iter()
+            .map(|&len| (0..len).map(|i| (i % 17) as f32 / 16.0 - 0.5).collect())
+            .collect();
+        for (index, values) in expected.iter().enumerate() {
+            let name = format!("p{index}/weight");
+            session.set_parameter(&name, values);
+            session.set_lr_multiplier(&name, [0.0, 0.5, 2.0][index % 3]);
+        }
+        for replay in 0..3 {
+            let inputs: Vec<Vec<f32>> = lengths
+                .iter()
+                .enumerate()
+                .map(|(index, &len)| {
+                    (0..len)
+                        .map(|i| ((i * 7 + index + replay * 3) % 19) as f32 / 32.0 - 0.25)
+                        .collect()
+                })
+                .collect();
+            for (index, input) in inputs.iter().enumerate() {
+                session.set_input(&format!("x{index}"), input);
+                let lr = (1.0 / 64.0) * [0.0, 0.5, 2.0][index % 3];
+                for (p, &g) in expected[index].iter_mut().zip(input) {
+                    *p -= lr * g;
+                }
+            }
+            session.step();
+            session.wait();
+            if workers != 0 {
+                check_worker_tasks(&mut session);
+                assert_eq!(session.execution_report().compute_dispatches, 1);
+            }
+            for (index, &len) in lengths.iter().enumerate() {
+                let name = format!("p{index}/weight");
+                let mut actual = vec![0.0; len];
+                session.read_param(&name, &mut actual);
+                assert_eq!(
+                    actual, expected[index],
+                    "parameter {index}, workers={workers}, replay={replay}"
+                );
+                session.read_param_grad(&name, &mut actual);
+                assert_eq!(
+                    actual, inputs[index],
+                    "gradient {index}, workers={workers}, replay={replay}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn session_whole_graph_narrow_scalar_tiles() {
     check_scalar_tile_edges(false, 1031);
     check_scalar_tile_edges(true, 1031);

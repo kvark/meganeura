@@ -20,11 +20,24 @@ fn main(
     let s = find_segment(params.count, group);
     let lr = params.lr * s.lr_scale;
     let start = (group - s.first_group) * TILE;
-    for (var k = lid.x; k < TILE; k += WORKGROUP) {
-        let i = start + k;
-        if i < s.len {
+    let i = start + lid.x * 4u;
+    if i < s.len {
+        if s.len - i >= 4u {
             let e = s.offset + i;
-            param[e] = param[e] - lr * grad[e];
+            let p = vec4<f32>(param[e], param[e + 1u], param[e + 2u], param[e + 3u]);
+            let g = vec4<f32>(grad[e], grad[e + 1u], grad[e + 2u], grad[e + 3u]);
+            let updated = p - vec4<f32>(lr) * g;
+            param[e] = updated.x;
+            param[e + 1u] = updated.y;
+            param[e + 2u] = updated.z;
+            param[e + 3u] = updated.w;
+        } else {
+            for (var component = 0u; component < 4u; component++) {
+                if i + component < s.len {
+                    let e = s.offset + i + component;
+                    param[e] = param[e] - lr * grad[e];
+                }
+            }
         }
     }
 }
