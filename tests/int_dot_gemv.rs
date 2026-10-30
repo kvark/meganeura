@@ -958,3 +958,91 @@ fn host_dequant_matches_ggml() {
         }
     }
 }
+
+/// Inactive column/K tails must reach both sharing barriers. All-one inputs
+/// keep the RMS reduction exact across widths, so grouping must preserve every
+/// output bit, including the fused residual and zero-activation cases.
+#[test]
+fn grouped_q8_sharing_preserves_tails_norm_and_residual() {
+    for (k, n, norm, zero) in [
+        (96, 12, false, false),
+        (1056, 36, true, false),
+        (8224, 4, false, false),
+        (96, 4, true, true),
+    ] {
+        let (packed, _) = q8_weight(k, n, 137);
+        let x = vec![if zero { 0.0 } else { 1.0 }; k];
+        let norm_weight = activation(k);
+        let residual: Vec<_> = (0..n).map(|i| i as f32 / 16.0).collect();
+        let mut graph = Graph::new();
+        let input = graph.input("x", &[1, k]);
+        let input = if norm {
+            let weight = graph.parameter("norm", &[k]);
+            graph.rms_norm(input, weight, 1e-6)
+        } else {
+            input
+        };
+        let weight = graph.parameter_q8("w", &[k, n]);
+        let product = graph.matmul(input, weight);
+        let output = if norm {
+            product
+        } else {
+            let addend = graph.input("d", &[1, n]);
+            graph.add(product, addend)
+        };
+        graph.set_outputs(vec![output]);
+        for threads in [32, 64, 128] {
+            let mut baseline: Option<Vec<f32>> = None;
+            for column_groups in [1, 2, 4, 8] {
+                if threads * column_groups > 256 {
+                    continue;
+                }
+                let shape = meganeura::GemvShape {
+                    threads,
+                    column_groups,
+                    bt_rows: 1,
+                    reduction: meganeura::GemvReduction::Tree,
+                };
+                let mut config = crate::support::gpu::inference_config();
+                config.options.gemv_shape = Some(shape);
+                config.options.quantized_activations = true;
+                let mut session = meganeura::build(&graph, config).0;
+                let dispatch = session
+                    .plan()
+                    .dispatches
+                    .iter()
+                    .find(|d| d.gemv_int_dot())
+                    .unwrap();
+                assert_eq!(
+                    dispatch.kernel,
+                    meganeura::compile::Kernel::Gemv {
+                        shape,
+                        integer_dot: true
+                    }
+                );
+                assert_eq!(dispatch.gemv_rmsnorm.is_some(), norm);
+                session.set_input("x", &x);
+                if !norm {
+                    session.set_input("d", &residual);
+                }
+                if norm {
+                    session.set_parameter("norm", &norm_weight);
+                }
+                session.set_parameter_packed("w", &packed);
+                session.step();
+                session.wait();
+                let output = session.read_output(n);
+                assert!(output.iter().all(|x| x.is_finite()));
+                if let Some(want) = &baseline {
+                    assert_eq!(
+                        output.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                        want.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                        "k={k}, n={n}, norm={norm}, zero={zero}, shape={shape:?}"
+                    );
+                } else {
+                    baseline = Some(output);
+                }
+            }
+        }
+    }
+}

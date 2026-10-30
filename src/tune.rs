@@ -621,10 +621,11 @@ impl MatmulTile {
                     && (!matches!(
                         class.shader,
                         ShaderEntry::MatMulGemv | ShaderEntry::MatMulGemvAdd
-                    ) || !matches!(
+                    ) || !(matches!(
                         class.weight_format,
                         crate::compile::WeightFormat::F32 | crate::compile::WeightFormat::F16
-                    )))
+                    ) || (class.weight_format == crate::compile::WeightFormat::Q8
+                        && class.gemv_int_dot))))
             {
                 return None;
             }
