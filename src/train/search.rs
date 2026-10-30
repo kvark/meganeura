@@ -385,6 +385,9 @@ pub fn build_measured_with_inputs(
     programs.allow_matrix_storage = !cfg.runtime.debug && cfg.runtime.pin_buffers.is_none();
     programs.enable_matrix_inputs(&supported, &gpu.capabilities());
     programs.enable_gradient_inputs(&supported);
+    if cfg.mode == crate::Mode::Inference && cfg.options.flash_forward_coop {
+        programs.enable_forward_products(gpu.capabilities().subgroup_size);
+    }
     let preparation_time = start.elapsed();
     measure::select(
         programs,
@@ -511,6 +514,7 @@ struct AxisChoice {
     winograd: Option<crate::DType>,
     f16_attention: bool,
     gradient_inputs: Option<crate::DType>,
+    forward_products: bool,
 }
 
 fn early_physical_cover(baseline: AxisChoice, attention: &[AttentionChoice]) -> Vec<AxisChoice> {
@@ -732,6 +736,7 @@ fn implementations(
         winograd: None,
         f16_attention: false,
         gradient_inputs: None,
+        forward_products: false,
         fuse_dispatches: seeds
             .first()
             .is_some_and(|seed| seed.options.fuse_dispatches),
@@ -757,6 +762,7 @@ fn implementations(
                 winograd: None,
                 f16_attention: false,
                 gradient_inputs: None,
+                forward_products: false,
             })
         })
         .filter(|&choice| seen.insert(choice))
@@ -793,6 +799,7 @@ fn implementations(
         queued_splits: false,
         replace_extracted_matrices: false,
         replace_extracted_attention: false,
+        attention_subgroup_size: 0,
         defer_bf16: false,
         allow_matrix_storage: false,
         matrix_shapes: collections::HashMap::new(),
@@ -811,6 +818,7 @@ struct Implementations {
     queued_splits: bool,
     replace_extracted_matrices: bool,
     replace_extracted_attention: bool,
+    attention_subgroup_size: u32,
     defer_bf16: bool,
     allow_matrix_storage: bool,
     matrix_shapes: collections::HashMap<crate::DType, ([u32; 3], u32)>,
@@ -841,6 +849,33 @@ impl Implementations {
                     ..*choice
                 }));
         }
+        self.order.choices = self.choices.len();
+        self.order.choice_order = (0..self.choices.len()).collect();
+    }
+
+    fn enable_forward_products(&mut self, subgroup_size: u32) {
+        self.attention_subgroup_size = subgroup_size;
+        if !self.seeds.iter().any(|seed| {
+            fill_attention_products(
+                &mut seed.plan.clone(),
+                self.caps,
+                self.shared_memory_bytes,
+                subgroup_size,
+            ) > 0
+        }) {
+            return;
+        }
+        self.order.priority_attention = Some(self.choices.len());
+        let ordinary = self.choices.clone();
+        self.choices.extend(
+            ordinary
+                .into_iter()
+                .filter(|choice| choice.attention.1.is_none())
+                .map(|choice| AxisChoice {
+                    forward_products: true,
+                    ..choice
+                }),
+        );
         self.order.choices = self.choices.len();
         self.order.choice_order = (0..self.choices.len()).collect();
     }
@@ -965,6 +1000,56 @@ impl Implementations {
         self.order.choices = self.choices.len();
         self.order.choice_order = (0..self.choices.len()).collect();
     }
+}
+
+/// Retain the staged/scalar candidate. Only complete inference plans are
+/// eligible here; independent training admission remains a separate choice.
+/// Parameter/gradient types and all F32 output/LSE bindings stay unchanged.
+// Called only from the inference frontier.
+fn fill_attention_products(
+    plan: &mut ExecutionPlan,
+    caps: crate::codegen::CoopCaps,
+    shared_memory_bytes: u32,
+    subgroup_size: u32,
+) -> usize {
+    use compile::{DispatchParams as _, ShaderEntry};
+    let mut count = 0;
+    for dispatch in &mut plan.dispatches {
+        if dispatch.requires_full_precision
+            || dispatch.schedule_locked
+            || !matches!(
+                dispatch.shader,
+                ShaderEntry::MultiHeadAttn
+                    | ShaderEntry::FlashAttention
+                    | ShaderEntry::FlashAttentionCoop
+            )
+        {
+            continue;
+        }
+        let p = compile::AttentionParams::from_words(&dispatch.params)
+            .expect("invalid attention parameters");
+        if !crate::kernels::attention::admits_products(
+            p.q_seq,
+            p.head_dim,
+            p.packed_heads >> 16,
+            caps,
+            shared_memory_bytes,
+            subgroup_size,
+        ) {
+            continue;
+        }
+        dispatch.shader = ShaderEntry::FlashAttentionProducts;
+        dispatch.label = format!(
+            "FlashAttentionProducts {}x{} hd{} heads{}",
+            p.q_seq,
+            p.kv_seq,
+            p.head_dim,
+            p.packed_heads >> 16
+        );
+        dispatch.workgroups = [p.q_seq.div_ceil(16), p.packed_heads >> 16, 1];
+        count += 1;
+    }
+    count
 }
 
 /// Checked typed products preserve the existing F32 or F16 weight bindings,
@@ -1283,6 +1368,7 @@ impl measure::Frontier for Implementations {
                         ),
                     ) + usize::from(choice.winograd != active.winograd)
                         + usize::from(choice.gradient_inputs != active.gradient_inputs),
+                    choice.forward_products != active.forward_products,
                     choice.f16_attention != active.f16_attention,
                     choice.attention != active.attention,
                     choice.fuse_dispatches != active.fuse_dispatches,
@@ -1300,6 +1386,7 @@ impl measure::Frontier for Implementations {
                 winograd,
                 f16_attention,
                 gradient_inputs,
+                forward_products,
             } = self.choices[choice_index];
             let mut plan = if splits == 0
                 && !f16_attention
@@ -1366,6 +1453,16 @@ impl measure::Frontier for Implementations {
                 }
                 plan
             };
+            if forward_products
+                && fill_attention_products(
+                    &mut plan,
+                    self.caps,
+                    self.shared_memory_bytes,
+                    self.attention_subgroup_size,
+                ) == 0
+            {
+                continue;
+            }
             if let Some(multiply) = matrix_inputs {
                 if fill_matrix_candidates_scoped(
                     &mut plan,
@@ -1399,6 +1496,9 @@ impl measure::Frontier for Implementations {
             );
             if f16_attention {
                 description.push_str(", f16_attention=true");
+            }
+            if forward_products {
+                description.push_str(", forward_products=true");
             }
             if let Some(dtype) = matrix_inputs {
                 description.push_str(&format!(", matrix_inputs={dtype:?}"));
@@ -1637,6 +1737,134 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn attention_products_keep_fallback_and_explicit_pins() {
+        use measure::Frontier as _;
+        let mut graph = Graph::new();
+        let q = graph.input("q", &[33, 144]);
+        let k = graph.input("k", &[19, 48]);
+        let v = graph.input("v", &[19, 48]);
+        let y = graph.multi_head_attn(q, k, v, 3, 1, 48, true);
+        graph.set_outputs(vec![y]);
+        let caps = crate::codegen::CoopCaps {
+            f16_attention_rows: 8,
+            ..Default::default()
+        };
+        let mut frontier = graph_frontier(graph);
+        frontier.caps = caps;
+        frontier.enable_forward_products(32);
+        let baseline = frontier.next(None).unwrap();
+        assert!(
+            baseline
+                .plan
+                .dispatches
+                .iter()
+                .all(|d| d.shader != compile::ShaderEntry::FlashAttentionProducts)
+        );
+        let candidate = frontier.next(baseline.origin).unwrap();
+        assert!(
+            candidate
+                .plan
+                .dispatches
+                .iter()
+                .any(|d| d.shader == compile::ShaderEntry::FlashAttentionProducts
+                    && d.workgroups == [3, 3, 1]
+                    && d.label.starts_with("FlashAttentionProducts"))
+        );
+        let mut pinned = baseline.plan;
+        for d in &mut pinned.dispatches {
+            d.requires_full_precision = true;
+        }
+        assert_eq!(fill_attention_products(&mut pinned, caps, 65536, 32), 0);
+        for width in [1, 5] {
+            assert!(!crate::kernels::attention::admits_products(
+                33, width, 3, caps, 65536, 32
+            ));
+        }
+    }
+
+    #[test]
+    fn search_rejects_attention_products_when_values_exceed_f16_range() {
+        use std::cell::Cell;
+        let gpu = crate::reference::gpu::shared_context();
+        let native = runtime::auto_tune(&gpu, 0).coop_caps;
+        if !crate::kernels::attention::admits_products(
+            17,
+            64,
+            1,
+            native,
+            gpu.capabilities().max_compute_shared_memory_size,
+            gpu.capabilities().subgroup_size,
+        ) {
+            return;
+        }
+        let mut graph = Graph::new();
+        let q = graph.input("q", &[17, 64]);
+        let k = graph.input("k", &[17, 64]);
+        let v = graph.input("v", &[17, 64]);
+        let y = graph.causal_attention(q, k, v, 1, 1, 64);
+        graph.set_outputs(vec![y]);
+        let tried = Cell::new(false);
+        let (session, _) = build_measured(
+            &graph,
+            SessionConfig {
+                gpu: Some(gpu),
+                mode: crate::Mode::Inference,
+                tune: false,
+                cache: None,
+                ..Default::default()
+            },
+            BuildSearchOptions {
+                max_graphs: 1,
+                max_programs: 2,
+                max_time: Duration::from_secs(10),
+                warmup_runs: 1,
+                warmup_time: Duration::ZERO,
+                tuning: TuneOptions {
+                    max_classes: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            |s, _| {
+                s.set_input("q", &[0.01; 17 * 64]);
+                s.set_input("k", &[0.01; 17 * 64]);
+                s.set_input("v", &[3e5; 17 * 64]);
+                Ok(())
+            },
+            |s| {
+                if s.plan()
+                    .dispatches
+                    .iter()
+                    .any(|d| d.shader == compile::ShaderEntry::FlashAttentionProducts)
+                {
+                    tried.set(true);
+                }
+                // A convex average of constant V has this exact finite value.
+                if s.read_output(17 * 64)
+                    .iter()
+                    .all(|x| x.is_finite() && (*x - 3e5).abs() < 1.0)
+                {
+                    Ok(())
+                } else {
+                    Err("attention value overflow".into())
+                }
+            },
+        )
+        .unwrap();
+        assert!(
+            tried.get(),
+            "the unsafe candidate must actually be qualified"
+        );
+        assert!(
+            session
+                .plan()
+                .dispatches
+                .iter()
+                .all(|d| d.shader != compile::ShaderEntry::FlashAttentionProducts)
+        );
     }
 
     #[test]
@@ -2527,6 +2755,7 @@ mod tests {
             winograd: None,
             f16_attention: false,
             gradient_inputs: None,
+            forward_products: false,
         };
         let unfused = AxisChoice {
             fuse_dispatches: false,

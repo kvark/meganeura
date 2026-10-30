@@ -11,6 +11,9 @@ pub(crate) fn attention_coop_shared_bytes(group: ShaderGroup, head_dim: u32) -> 
     let (per_dim, fixed) = match group {
         ShaderGroup::FlashAttentionCoop => (128u64, 1024),
         ShaderGroup::FlashAttentionCoopF32 => (192, 1024),
+        ShaderGroup::FlashAttentionProducts => {
+            return 160 * u64::from(head_dim).next_multiple_of(16) + 1536;
+        }
         ShaderGroup::AttentionGrad(kernel) => return kernel.shared_bytes(head_dim),
         _ => unreachable!("shared-memory accounting requires cooperative attention"),
     };
@@ -272,6 +275,32 @@ fn generate_flash_attention(
         } else {
             "flash_attention"
         },
+    )
+}
+
+/// Inference F16 QK/PV products with F32 online softmax and accumulation.
+/// The fixed query block is 16 rows; `rows` selects an advertised 8x16 or
+/// 16x16 native product. Padding keeps head/key/query tails inside scratch.
+pub fn generate_flash_attention_product_module(head_dim: u32, rows: u32) -> ShaderModule {
+    assert!(head_dim > 0 && head_dim.is_multiple_of(4) && matches!(rows, 8 | 16));
+    let padded = head_dim.next_multiple_of(16);
+    let template = include_str!("../shaders/flash_attention_products.wgsl");
+    attention_module(
+        preprocess(
+            super::template_section(template, "main"),
+            &[
+                ("$STAGE_Q", super::template_section(template, "vector_q")),
+                ("$STAGE_KV", super::template_section(template, "vector_kv")),
+                ("$PARAMS", ATTENTION_PARAMS_WGSL),
+                ("$PV_TILES_", &((16 / rows) * (padded / 16)).to_string()),
+                ("$HEAD_TILES_", &(padded / 16).to_string()),
+                ("$ELEMENTS", &(16 * padded).to_string()),
+                ("$PADDED", &padded.to_string()),
+                ("$CHUNK", &head_dim.div_ceil(4).to_string()),
+                ("$ROWS", &rows.to_string()),
+            ],
+        ),
+        "flash_attention_products",
     )
 }
 
@@ -1387,3 +1416,40 @@ pub(super) fn emit_forward_im2col_stage(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod product_tests {
+    use super::*;
+
+    #[test]
+    fn products_validate_with_rectangular_tiles_and_padded_heads() {
+        let caps = naga::valid::Capabilities::SHADER_FLOAT16
+            | naga::valid::Capabilities::COOPERATIVE_MATRIX
+            | naga::valid::Capabilities::SUBGROUP;
+        for rows in [8, 16] {
+            for head_dim in [4, 12, 16, 20, 48, 64, 80, 128, 256] {
+                let mut module = generate_flash_attention_product_module(head_dim, rows);
+                let mut binding = 0;
+                for (_, global) in module.module.global_variables.iter_mut() {
+                    if matches!(
+                        global.space,
+                        naga::AddressSpace::Uniform | naga::AddressSpace::Storage { .. }
+                    ) {
+                        global.binding = Some(naga::ResourceBinding { group: 0, binding });
+                        binding += 1;
+                    }
+                }
+                let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), caps)
+                    .validate(&module.module)
+                    .unwrap_or_else(|e| panic!("rows={rows} head={head_dim}: {e:?}"));
+                naga::back::spv::write_vec(
+                    &module.module,
+                    &info,
+                    &naga::back::spv::Options::default(),
+                    None,
+                )
+                .unwrap();
+            }
+        }
+    }
+}
