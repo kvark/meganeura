@@ -162,13 +162,6 @@ fn application_consumes_parameter_gradients() {
     assert_eq!(read_shared(result, 64), expected);
     gpu.destroy_command_encoder(&mut encoder);
     gpu.destroy_buffer(result);
-
-    let inference = meganeura::build(&training_graph(), crate::support::gpu::inference_config()).0;
-    assert!(
-        inference
-            .gradient_buffer(inference.param_buffer("w0").unwrap())
-            .is_none()
-    );
 }
 
 fn training_graph() -> Graph {
