@@ -1994,7 +1994,6 @@ mod tests {
         let original = compile::compile(&graph);
         let dispatch = &original.dispatches[0];
         assert_eq!(dispatch.weight_format, WeightFormat::F16);
-        let b = dispatch.input_buffers[1];
         let mut candidate = original.clone();
         assert_eq!(
             fill_matrix_candidates(&mut candidate, DType::F16, false),
