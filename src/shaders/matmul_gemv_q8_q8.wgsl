@@ -82,7 +82,6 @@ $NORM_PROLOGUE
         // dividing by it, which would put NaN into every column.
         let inv = select(0.0, 1.0 / d8, amax > 0.0);
         var u: array<u32, 8>;
-        var qsum = 0;
         for (var j = 0u; j < 8u; j++) {
             var word = 0u;
             for (var b = 0u; b < 4u; b++) {
@@ -91,12 +90,10 @@ $NORM_PROLOGUE
                 // clamp is a guard on the float-to-int conversion for a row
                 // carrying an infinity or a NaN, not a rounding case.
                 let q = clamp(i32(round(a_val(abase + j * 4u + b) * inv)), -127, 127);
-                qsum += q;
                 word |= (bitcast<u32>(q) & 0xFFu) << (b * 8u);
             }
             u[j] = word;
         }
-        let s8 = d8 * f32(qsum);
 
         // Four columns share the quantized block.
         let col = col4 * 4u;

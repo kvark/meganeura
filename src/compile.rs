@@ -254,7 +254,7 @@ impl CompileOptions {
             };
             shape.threads = 256 / shape.column_groups;
         }
-        if format.is_quantized() {
+        if format.is_quantized() && !(format == WeightFormat::Q8 && self.quantized_activations) {
             shape.column_groups = 1;
         }
         Kernel::Gemv {

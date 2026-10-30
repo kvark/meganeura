@@ -2124,9 +2124,10 @@ const CACHED_ATTENTION_PARAMS_WGSL: &str = include_str!("shaders/cached_attentio
 const GEMV_TEMPLATE: &str = include_str!("shaders/matmul_gemv.wgsl");
 
 /// Apply width and reduction slots shared by floating-point and integer-dot GEMV.
-fn specialize_gemv(source: &str, shape: GemvShape) -> String {
+// Dense grouped GEMV interleaves columns; shared Q8 packing keeps each
+// column's K lanes contiguous so the packing group has contiguous threads.
+fn specialize_gemv(source: &str, shape: GemvShape, lane_stride: u32) -> String {
     shape.validate();
-    let columns = shape.column_groups;
     let (reduction, subgroup_args, total) = match shape.reduction {
         GemvReduction::Tree => {
             let mut body = template_section(GEMV_TEMPLATE, "tree_start").to_owned();
@@ -2136,16 +2137,16 @@ fn specialize_gemv(source: &str, shape: GemvShape) -> String {
                     template_section(GEMV_TEMPLATE, "tree_step"),
                     &[
                         ("$STRIDE", &stride.to_string()),
-                        ("$REDUCE_STRIDE", &(stride * columns).to_string()),
+                        ("$REDUCE_STRIDE", &(stride * lane_stride).to_string()),
                     ],
                 ));
                 stride /= 2;
             }
-            // Read by lane zero, where lid.x is the column within the group.
+            // Read by lane zero within each column group.
             (
                 body,
                 "",
-                format!("reduce_buf[lid.x] + reduce_buf[lid.x + {columns}u]"),
+                format!("reduce_buf[lid.x] + reduce_buf[lid.x + {lane_stride}u]"),
             )
         }
         GemvReduction::Subgroup => (
@@ -2161,8 +2162,11 @@ fn specialize_gemv(source: &str, shape: GemvShape) -> String {
             ("$SUBGROUP_ARGS", subgroup_args),
             ("$TOTAL", &total),
             ("$LANES", &shape.threads.to_string()),
-            ("$COLUMN_GROUPS", &columns.to_string()),
-            ("$WORKGROUP_SIZE", &(shape.threads * columns).to_string()),
+            ("$COLUMN_GROUPS", &shape.column_groups.to_string()),
+            (
+                "$WORKGROUP_SIZE",
+                &(shape.threads * shape.column_groups).to_string(),
+            ),
         ],
     )
 }
@@ -2390,7 +2394,7 @@ fn generate_gemv(
             ),
         ],
     );
-    ShaderModule::new(&specialize_gemv(&source, shape))
+    ShaderModule::new(&specialize_gemv(&source, shape, shape.column_groups))
 }
 
 /// The Q8_1-activation, integer-dot GEMV at an explicit shape.
@@ -2412,10 +2416,7 @@ pub(crate) fn generate_module_gemv_int_dot(
     packed_dot: bool,
     norm: bool,
 ) -> ShaderModule {
-    assert_eq!(
-        shape.column_groups, 1,
-        "integer-dot GEMV has no grouped-column variant"
-    );
+    assert!(shape.column_groups == 1 || format == WeightFormat::Q8);
     let dot_helpers = if packed_dot {
         include_str!("shaders/matmul_gemv_int_dot_packed.wgsl")
     } else {
@@ -2428,6 +2429,9 @@ pub(crate) fn generate_module_gemv_int_dot(
     };
     let base = match format {
         WeightFormat::Q40 => include_str!("shaders/matmul_gemv_q40_q8.wgsl"),
+        WeightFormat::Q8 if shape.column_groups > 1 => {
+            include_str!("shaders/matmul_gemv_q8_q8_grouped.wgsl")
+        }
         WeightFormat::Q8 => include_str!("shaders/matmul_gemv_q8_q8.wgsl"),
         WeightFormat::Q4K | WeightFormat::Q5K | WeightFormat::Q6K | WeightFormat::Q3K => {
             include_str!("shaders/matmul_gemv_qk_q8.wgsl")
@@ -2478,7 +2482,7 @@ pub(crate) fn generate_module_gemv_int_dot(
             ("$BLOCK_DOT", block_dot),
         ],
     );
-    ShaderModule::new(&specialize_gemv(&source, shape))
+    ShaderModule::new(&specialize_gemv(&source, shape, 1))
 }
 
 /// Generate coop matmul with an optional [`crate::compile::MatMulPrologue`].
@@ -5087,13 +5091,24 @@ mod tests {
                     _ => unreachable!(),
                 };
                 for threads in [32, 64, 128, 256] {
-                    for reduction in [GemvReduction::Tree, GemvReduction::Subgroup] {
+                    for (reduction, column_groups) in [
+                        (GemvReduction::Tree, 1),
+                        (GemvReduction::Subgroup, 1),
+                        (GemvReduction::Tree, 2),
+                        (GemvReduction::Tree, 4),
+                        (GemvReduction::Tree, 8),
+                    ] {
                         let shape = GemvShape {
                             threads,
                             reduction,
                             bt_rows: 1,
-                            column_groups: 1,
+                            column_groups,
                         };
+                        if !shape.valid_columns()
+                            || (column_groups > 1 && format != WeightFormat::Q8)
+                        {
+                            continue;
+                        }
                         for packed_dot in [true, false] {
                             for norm in [false, true] {
                                 let module = generate_module_gemv_int_dot(
@@ -5128,7 +5143,11 @@ mod tests {
                                         .contains(&format!("const LANES: u32 = {threads}u;")),
                                     "{group:?} {format:?} {shape:?}: wrong width"
                                 );
-                                assert!(module.source.contains("blk += LANES;"));
+                                assert!(module.source.contains(if column_groups > 1 {
+                                    "tile += LANES;"
+                                } else {
+                                    "blk += LANES;"
+                                }));
                                 assert_eq!(
                                     module.source.contains("subgroupAdd"),
                                     reduction == GemvReduction::Subgroup,
