@@ -1002,10 +1002,9 @@ impl Implementations {
     }
 }
 
-/// Retain the staged/scalar candidate. Only complete inference plans are
-/// eligible here; independent training admission remains a separate choice.
-/// Parameter/gradient types and all F32 output/LSE bindings stay unchanged.
-// Called only from the inference frontier.
+/// Switch eligible inference attention to F16 QK/PV products.
+/// Q/K/V values outside the F16 range can produce non-finite output. Admission
+/// relies on the caller's quality check, which covers only the search inputs.
 fn fill_attention_products(
     plan: &mut ExecutionPlan,
     caps: crate::codegen::CoopCaps,

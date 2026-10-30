@@ -1,4 +1,3 @@
-// @section main
 enable f16;
 enable wgpu_cooperative_matrix;
 $PARAMS
@@ -43,11 +42,47 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     let subgroups = 64u / width;
     var local_o: array<f32, $CHUNK>;
     for (var e = 0u; e < $CHUNKu; e++) { local_o[e] = 0.0; }
-$STAGE_Q    var local_max = -1e30;
+    for (var pack = tid; pack < ($ELEMENTSu / 4u); pack += 64u) {
+        let i = pack * 4u;
+        let qr = i / $PADDEDu;
+        let d = i % $PADDEDu;
+        var q = vec4<f32>(0.0);
+        if pos_base + qr < params.q_seq && d < params.head_dim {
+            q = src_a[(((pos_base + qr) * heads + head) * params.head_dim + d) / 4u];
+        }
+        let h = vec4<f16>(q);
+        shared_q[i] = h.x;
+        shared_q[i + 1u] = h.y;
+        shared_q[i + 2u] = h.z;
+        shared_q[i + 3u] = h.w;
+    }
+    var local_max = -1e30;
     var local_sum = 0.0;
     workgroupBarrier();
     for (var t = begin; t < last_len; t += 16u) {
-$STAGE_KV        workgroupBarrier();
+        for (var pack = tid; pack < ($ELEMENTSu / 4u); pack += 64u) {
+            let i = pack * 4u;
+            let kr = i / $PADDEDu;
+            let d = i % $PADDEDu;
+            var k = vec4<f32>(0.0);
+            var v = vec4<f32>(0.0);
+            if t + kr < last_len && d < params.head_dim {
+                let index = ((t + kr) * kv_dim + kv_head * params.head_dim + d) / 4u;
+                k = src_b[index];
+                v = bias[index];
+            }
+            let kh = vec4<f16>(k);
+            let vh = vec4<f16>(v);
+            shared_k[i] = kh.x;
+            shared_k[i + 1u] = kh.y;
+            shared_k[i + 2u] = kh.z;
+            shared_k[i + 3u] = kh.w;
+            shared_v[i] = vh.x;
+            shared_v[i + 1u] = vh.y;
+            shared_v[i + 2u] = vh.z;
+            shared_v[i + 3u] = vh.w;
+        }
+        workgroupBarrier();
         for (var qr = sg * $ROWSu; qr < 16u; qr += subgroups * $ROWSu) {
             var score = coop_mat16x$ROWS<f32,C>();
             for (var d = 0u; d < $PADDEDu; d += 16u) {
@@ -110,41 +145,3 @@ $STAGE_KV        workgroupBarrier();
         }
     }
 }
-// @section vector_q
-    for (var pack = tid; pack < ($ELEMENTSu / 4u); pack += 64u) {
-        let i = pack * 4u;
-        let qr = i / $PADDEDu;
-        let d = i % $PADDEDu;
-        var q = vec4<f32>(0.0);
-        if pos_base + qr < params.q_seq && d < params.head_dim {
-            q = src_a[(((pos_base + qr) * heads + head) * params.head_dim + d) / 4u];
-        }
-        let h = vec4<f16>(q);
-        shared_q[i] = h.x;
-        shared_q[i + 1u] = h.y;
-        shared_q[i + 2u] = h.z;
-        shared_q[i + 3u] = h.w;
-    }
-// @section vector_kv
-        for (var pack = tid; pack < ($ELEMENTSu / 4u); pack += 64u) {
-            let i = pack * 4u;
-            let kr = i / $PADDEDu;
-            let d = i % $PADDEDu;
-            var k = vec4<f32>(0.0);
-            var v = vec4<f32>(0.0);
-            if t + kr < last_len && d < params.head_dim {
-                let index = ((t + kr) * kv_dim + kv_head * params.head_dim + d) / 4u;
-                k = src_b[index];
-                v = bias[index];
-            }
-            let kh = vec4<f16>(k);
-            let vh = vec4<f16>(v);
-            shared_k[i] = kh.x;
-            shared_k[i + 1u] = kh.y;
-            shared_k[i + 2u] = kh.z;
-            shared_k[i + 3u] = kh.w;
-            shared_v[i] = vh.x;
-            shared_v[i + 1u] = vh.y;
-            shared_v[i + 2u] = vh.z;
-            shared_v[i + 3u] = vh.w;
-        }

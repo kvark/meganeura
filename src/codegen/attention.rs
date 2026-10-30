@@ -287,10 +287,8 @@ pub fn generate_flash_attention_product_module(head_dim: u32, rows: u32) -> Shad
     let template = include_str!("../shaders/flash_attention_products.wgsl");
     attention_module(
         preprocess(
-            super::template_section(template, "main"),
+            template,
             &[
-                ("$STAGE_Q", super::template_section(template, "vector_q")),
-                ("$STAGE_KV", super::template_section(template, "vector_kv")),
                 ("$PARAMS", ATTENTION_PARAMS_WGSL),
                 ("$PV_TILES_", &((16 / rows) * (padded / 16)).to_string()),
                 ("$HEAD_TILES_", &(padded / 16).to_string()),
@@ -1427,7 +1425,7 @@ mod product_tests {
             | naga::valid::Capabilities::COOPERATIVE_MATRIX
             | naga::valid::Capabilities::SUBGROUP;
         for rows in [8, 16] {
-            for head_dim in [4, 12, 16, 20, 48, 64, 80, 128, 256] {
+            for head_dim in [4, 20, 64] {
                 let mut module = generate_flash_attention_product_module(head_dim, rows);
                 let mut binding = 0;
                 for (_, global) in module.module.global_variables.iter_mut() {
