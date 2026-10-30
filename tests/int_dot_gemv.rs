@@ -971,7 +971,11 @@ fn grouped_q8_sharing_preserves_tails_norm_and_residual() {
         (96, 4, true, true),
     ] {
         let (packed, _) = q8_weight(k, n, 137);
-        let x = vec![if zero { 0.0 } else { 1.0 }; k];
+        let x = if norm {
+            vec![if zero { 0.0 } else { 1.0 }; k]
+        } else {
+            activation(k)
+        };
         let norm_weight = activation(k);
         let residual: Vec<_> = (0..n).map(|i| i as f32 / 16.0).collect();
         let mut graph = Graph::new();
