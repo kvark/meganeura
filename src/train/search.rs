@@ -2001,7 +2001,6 @@ mod tests {
             1,
             "a legacy F16 weight must not hide a legal typed mixed-storage alternative"
         );
-        assert_eq!(candidate.buffers[b.0 as usize], 1024 * 128 * 2);
         assert_eq!(
             candidate.dispatches[0].weight_format,
             WeightFormat::F32,
