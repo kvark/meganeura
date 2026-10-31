@@ -129,18 +129,19 @@ is the separate September 10 study in `docs/experiments.md`.
 analyzer; its docstring lists the steps. The protocol changed between the two
 runs, so the comparison does not isolate a compiler speedup.
 
-"Where is the gap? One op at a time" comes from `data/op-bench.tsv`, an
-October 30 run at 99e3de2 on the RTX 5070 and B570: one strict-f32 GEMM or
-batch-1 convolution per process, Meganeura with tile search on and
-cooperative matrices off against PyTorch 2.13.0 with TF32 off and
-`cudnn.benchmark` on. Times are medians of summed GPU kernel time over 30
-operations. The shape list, the PyTorch runner and the driver script are in
-`data/op-bench/`, and the Meganeura runner is `examples/op_bench.rs` at the
-repository root. The RX 7900 XT column comes from
-`data/op-bench-7900xt.tsv` (October 31, system Mesa 26.0.8, PyTorch
-2.13.0+rocm7.2); its PyTorch times are HIP event intervals over a graph of 30
-serial ops rather than summed profiler kernel times, as its header records.
-The slide's ranges group the rows of the TSVs. The 5.45× in the takeaway is the cohort's
+"Where is the gap? One op at a time" comes from `data/op-bench.tsv`: one
+strict-f32 GEMM or batch-1 convolution per process on the RX 7900 XT (October
+31, RADV Mesa 26.0.8; Meganeura 5b232bd, one process per shape) and the RTX
+5070 and B570 (October 31; Meganeura e40648f, which adds the tuner scratch fix,
+median of three processes per shape in `data/op-bench/meganeura-runs.tsv`),
+with the kernel tuner on and cooperative matrices off, against PyTorch 2.13.0
+with TF32 off and `cudnn.benchmark` on. Our GPU time sums Vulkan pass
+timestamps; PyTorch's is a device interval around a graph of 30 serial ops,
+divided by 30, with the profiler off, since profiling slows ROCm execution.
+The TSV header records the protocol. The shape list, the PyTorch runner and
+the driver script are in `data/op-bench/`, and the Meganeura runner is
+`examples/op_bench.rs` at the repository root. The slide's ranges group the
+rows of the TSV. The 5.45× in the takeaway is the cohort's
 B570 U-Net strict inference ratio. The notes' 16 KiB comes from
 `data/b570-unet-shared-memory.txt`, and the earlier U-Net diagnostics (286
 against 276 dispatches, the F16 Winograd ablation) from `data/intel-gap.json`.

@@ -704,14 +704,14 @@ Sources: data/results.csv; data/summary.json; ../NUMERICAL-POLICY.txt;
 
 <table class="ops">
 <tr><th>Operation</th><th>Shapes</th><th>RX 7900 XT</th><th>RTX 5070</th><th>Arc B570</th></tr>
-<tr><td>Large GEMM</td><td>4096³</td><td>1.7×</td><td>2.2×</td><td>2.2×</td></tr>
-<tr><td>Transformer GEMMs</td><td>Speech, LLM</td><td>1.3×</td><td>1.6–1.75×</td><td class="near">1.1–1.2×</td></tr>
-<tr><td>Small GEMMs</td><td>Diffusion, M = 64–256</td><td class="near">0.65–1.5×</td><td>1.6–4.8×</td><td class="far">4.3–11×</td></tr>
-<tr><td>3×3 convolutions</td><td>Diffusion, Vision</td><td>0.8–2.0×</td><td class="near">0.5–1.1×</td><td class="far">1.7–5.4×</td></tr>
-<tr><td>Other convolutions</td><td>1×1, stems</td><td class="near">0.6–1.2×</td><td>1.4–1.6×</td><td>1.6–3.8×</td></tr>
+<tr><td>Large GEMM</td><td>4096³</td><td>1.7×</td><td>2.1×</td><td>2.2×</td></tr>
+<tr><td>Transformer GEMMs</td><td>Speech, LLM</td><td>1.3×</td><td>1.5–1.7×</td><td>1.2–1.5×</td></tr>
+<tr><td>Small GEMMs</td><td>Diffusion, M = 64–256</td><td class="near">0.65–1.5×</td><td class="far">1.6–4.9×</td><td class="far">2.0–4.6×</td></tr>
+<tr><td>3×3 convolutions</td><td>Diffusion, Vision</td><td>0.8–2.0×</td><td class="near">0.45–1.0×</td><td class="far">1.45–3.2×</td></tr>
+<tr><td>Other convolutions</td><td>1×1, stems</td><td class="near">0.6–1.2×</td><td>1.4–2.0×</td><td>1.4–1.75×</td></tr>
 </table>
 
-**Diagnosis:** our kernels, worst on small matrices on the Arc, where the image-diffusion U-Net is 5.45×. **Next:** split-K and smaller tiles for small matrices.
+**Diagnosis:** our kernels, worst on the small matrices of the image-diffusion U-Net (5.45× on the Arc). **Next:** split-K and smaller tiles for small matrices.
 
 <!--
 Time: 1:30.
@@ -722,44 +722,49 @@ mode the vendor libraries use ordinary f32 kernels, CUTLASS on NVIDIA, oneDNN
 on Intel and the ROCm libraries on AMD, so we compare kernels on the same
 execution units.
 
-Large GEMMs: the vendor libraries reach 2.2 times our throughput on NVIDIA
-and Intel, and 1.7 times on AMD. Transformer-sized GEMMs from Whisper and the
-LLM are closer, especially on the Arc. The small GEMMs in the diffusion U-Net are where we lose most: on the
-Arc, a 64-row matrix product takes 55 microseconds for us and 5 for oneDNN.
-There is too little work per dispatch for our tiles, and cuBLAS splits the K
-dimension for these shapes.
+Large GEMMs: the vendor libraries reach 1.7 to 2.2 times our throughput.
+Transformer-sized GEMMs from Whisper and the LLM are closer. The small GEMMs
+in the diffusion U-Net are where we lose most on NVIDIA and Intel: a 64-row
+matrix product takes 28 microseconds for us and 6 for cuBLAS, and 55 against
+12 on the Arc. There is too little work per dispatch for our tiles, and
+cuBLAS splits the K dimension for these shapes.
 
 Convolutions split by vendor. On the RTX 5070 our Winograd 3×3 convolutions
-match or beat cuDNN; on the Arc, oneDNN's are 1.7 to 5.4 times faster. The
+match or beat cuDNN; on the Arc, oneDNN's are 1.45 to 3.2 times faster. The
 RX 7900 XT is our closest GPU, as in the model results: we win some small
 GEMMs and convolutions there and lose others by up to 2×.
 
-So the Arc's U-Net gap, 5.45 times in the cohort, sits in our small-matrix and
-small-convolution kernels. The fix is ours: split-K and smaller tiles.
+So the U-Net gap sits in our small-matrix and small-convolution kernels. The
+fix is ours: split-K and smaller tiles.
 
 If asked:
 - Large GEMM: 13.3 against 22.3 TFLOP/s on the RX 7900 XT, 10.2 against
-  22.5 on the RTX 5070, 3.2 against 6.9 on the B570.
-- The RX 7900 XT's PyTorch times are HIP event intervals around a graph of 30
-  serial ops, which include gaps between kernels; the other two GPUs sum
-  profiler kernel times. Its ratios are slightly in our favor for that
-  reason. We have not shown that Vulkan reaches the vendor libraries' f32
-  GEMM throughput; this shows our kernel does not yet.
+  21.6 on the RTX 5070, 3.2 against 6.9 on the B570. This shows our kernel
+  does not yet reach the vendor libraries' f32 throughput; it does not show
+  that Vulkan can.
+- 4096³ needs more than the tuner's 64 MiB of scratch, so all three GPUs run
+  our default tile. 2048³, which the tuner covers, is 2.0× on the RTX 5070
+  and 1.9× on the Arc.
+- Each process tunes for 2 s and may pick a different tile. On the RTX 5070
+  and Arc we report the median of three processes; small Arc ops vary by up
+  to 45% between them.
+- Timing: our GPU time sums Vulkan pass timestamps; PyTorch's is a device
+  interval around a graph of 30 serial ops, divided by 30, with the profiler
+  off (profiling slows ROCm down). The PyTorch interval includes dispatch gaps
+  between kernels, which matters most for the smallest ops, especially on the
+  Arc.
 - Shared memory is not the reason: the U-Net's largest generated kernel uses
   16 KiB of Vulkan's 48.
-- Convolution times include our per-call Winograd weight transform and
-  oneDNN's conv_reorder.
-- Submission: a single host-timed op adds 30–60 µs over GPU time for us on the
-  5070 and 100–200 µs on the B570, against about 10 and 40 µs for PyTorch. In a
-  model this is paid per submission, not per kernel.
+- Convolution times include our per-call Winograd weight transform.
 - Earlier diagnostics on the U-Net: similar kernel counts (286 against 276),
   and F16 Winograd storage made the whole inference 9.3% faster.
-- Current code (October 30–31, 99e3de2), not the cohort's revision; do not
-  combine with the cohort ratios. PyTorch 2.13.0 (CUDA, XPU, ROCm 7.2), TF32
-  off, cudnn.benchmark on. The RX 7900 XT runs system Mesa 26.0.8.
+- Current code (October 31: Meganeura 5b232bd on the RX 7900 XT, e40648f
+  with the tuner scratch fix on the others), not the cohort's revision; do
+  not combine with the cohort ratios. PyTorch 2.13.0 (CUDA 13.0, XPU, ROCm
+  7.2), TF32 off, cudnn.benchmark on.
 
-Sources: data/op-bench.tsv; data/op-bench-7900xt.tsv; data/op-bench/; examples/op_bench.rs; data/b570-unet-shared-memory.txt;
-data/intel-gap.json; data/results.csv.
+Sources: data/op-bench.tsv; data/op-bench/; examples/op_bench.rs;
+data/b570-unet-shared-memory.txt; data/intel-gap.json; data/results.csv.
 -->
 
 ---
