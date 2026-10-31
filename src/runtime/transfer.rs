@@ -806,10 +806,61 @@ impl Session {
         {
             return Err(ReadNodeError::Aliased);
         }
-        let n = self.plan.buffers[buf.0 as usize] / 4;
-        let mut out = vec![0.0f32; n];
-        self.read_buffer(buf, &mut out);
+        let dtype = self
+            .plan
+            .dispatches
+            .iter()
+            .find(|d| d.output_buffer == buf)
+            .map_or(crate::DType::F32, Self::dispatch_output_dtype);
+        let out = self.read_dispatch_output(buf, dtype, usize::MAX);
         Ok(out)
+    }
+
+    fn dispatch_output_dtype(d: &crate::compile::Dispatch) -> crate::DType {
+        if d.pointwise_storage.f16_output {
+            return crate::DType::F16;
+        }
+        if d.pointwise_storage.bf16_output {
+            return crate::DType::BF16;
+        }
+        match d.kernel {
+            crate::compile::Kernel::CooperativeTyped { types, .. }
+            | crate::compile::Kernel::CooperativeWorkgroup {
+                types: Some(types), ..
+            } => types.output,
+            _ => crate::DType::F32,
+        }
+    }
+
+    fn read_dispatch_output(&self, buf: BufferRef, dtype: crate::DType, limit: usize) -> Vec<f32> {
+        if !matches!(dtype, crate::DType::F16 | crate::DType::BF16) {
+            let mut out = vec![0.0; (self.plan.buffers[buf.0 as usize] / 4).min(limit)];
+            self.read_buffer(buf, &mut out);
+            return out;
+        }
+        let n = (self.plan.buffers[buf.0 as usize] / 2).min(limit);
+        let mut packed = vec![0.0; n.div_ceil(2)];
+        // Private reduced stores use owned allocations, already padded to vec4.
+        // Word-sized copies also satisfy Metal's transfer alignment for odd n.
+        self.read_raw_f32(
+            self.buffers[buf.0 as usize],
+            &mut packed,
+            self.logical_host_visible(buf),
+        );
+        packed
+            .into_iter()
+            .flat_map(|x| {
+                let bits = x.to_bits();
+                [bits as u16, (bits >> 16) as u16].map(|bits| {
+                    if dtype == crate::DType::F16 {
+                        half::f16::from_bits(bits).to_f32()
+                    } else {
+                        half::bf16::from_bits(bits).to_f32()
+                    }
+                })
+            })
+            .take(n)
+            .collect()
     }
 
     /// Read back a node's value by the name attached via `Graph::named`.
@@ -849,13 +900,8 @@ impl Session {
                 report.skipped_aliased += 1;
                 continue;
             }
-            let buf_size = self.plan.buffers[d.output_buffer.0 as usize];
-            let n = (buf_size / 4).min(65536);
-            if n == 0 {
-                continue;
-            }
-            let mut data = vec![0.0f32; n];
-            self.read_buffer(d.output_buffer, &mut data);
+            let data =
+                self.read_dispatch_output(d.output_buffer, Self::dispatch_output_dtype(d), 65536);
             let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
             let has_nan = data.iter().any(|v| v.is_nan());
             let has_inf = data.iter().any(|v| v.is_infinite());
@@ -884,15 +930,9 @@ impl Session {
     /// instability first appears in the forward/backward chain.
     pub fn trace_dispatches(&self, threshold: f32) {
         for (i, d) in self.plan.dispatches.iter().enumerate() {
-            let buf_size = self.plan.buffers[d.output_buffer.0 as usize];
-            let n = buf_size / 4;
-            if n == 0 {
-                continue;
-            }
-            let read_n = n.min(65536);
-            let mut data = vec![0.0f32; read_n];
-            self.read_buffer(d.output_buffer, &mut data);
-
+            let data =
+                self.read_dispatch_output(d.output_buffer, Self::dispatch_output_dtype(d), 65536);
+            let n = data.len();
             let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
             let has_nan = data.iter().any(|v| v.is_nan());
             let has_inf = data.iter().any(|v| v.is_infinite());

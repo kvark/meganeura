@@ -920,6 +920,7 @@ fn epilogue_tile(dispatch: &Dispatch) -> crate::codegen::MatMulTile {
 /// implementation once; preparation builds exactly the selected pipeline.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Variant {
+    StoredGate(ShaderEntry, crate::DType),
     WinogradTransform(ShaderEntry, crate::DType),
     WinogradMatmul(ShaderEntry, crate::DType, [u32; 2]),
     /// Checked cooperative product with explicit operand, multiplication and
@@ -1047,7 +1048,8 @@ impl Variant {
     fn entry(&self) -> Option<&ShaderEntry> {
         match *self {
             Variant::Reduction(_) | Variant::Pointwise(_) => None,
-            Variant::WinogradTransform(ref e, _)
+            Variant::StoredGate(ref e, _)
+            | Variant::WinogradTransform(ref e, _)
             | Variant::WinogradMatmul(ref e, _, _)
             | Variant::Attention(ref e, _, _)
             | Variant::CoopTyped(ref e, _, _)
@@ -1080,6 +1082,7 @@ impl Variant {
             Variant::CoopConv(ref e, types, ref params) => {
                 format!("{e:?}:checked-{types:?}-fixed-{params:?}")
             }
+            Variant::StoredGate(ref entry, storage) => format!("{entry:?}:store-{storage:?}"),
             Variant::WinogradTransform(ref entry, storage) => format!("{entry:?}:{storage:?}"),
             Variant::WinogradMatmul(ref entry, storage, tile) => {
                 format!("{entry:?}:{storage:?}-{tile:?}")
@@ -1286,9 +1289,13 @@ fn precision_requirements(dispatches: &[Dispatch]) -> (Vec<crate::DType>, Vec<cr
         if matches!(
             &dispatch.shader,
             ShaderEntry::ToBF16 | ShaderEntry::FromBF16
-        ) || dispatch.pointwise_storage != crate::schedule::PointwiseStorage::default()
+        ) || dispatch.pointwise_storage.bf16_inputs != 0
+            || dispatch.pointwise_storage.bf16_output
         {
             add(&mut storage, DType::BF16);
+        }
+        if dispatch.pointwise_storage.f16_output {
+            add(&mut storage, DType::F16);
         }
     }
     (storage, multiply)
@@ -1599,6 +1606,12 @@ mod precision_requirement_tests {
             (vec![DType::BF16], vec![DType::BF16])
         );
         let mut pointwise = Dispatch::default();
+        pointwise.pointwise_storage.f16_output = true;
+        assert_eq!(
+            precision_requirements(&[pointwise]),
+            (vec![DType::F16], vec![])
+        );
+        let mut pointwise = Dispatch::default();
         pointwise.pointwise_storage.bf16_output = true;
         assert_eq!(
             precision_requirements(&[pointwise]),
@@ -1902,6 +1915,7 @@ impl Pipelines {
         let cooperative =
             || *coop_config.expect("cooperative dispatch needs a qualified device configuration");
         let module = match *key {
+            Variant::StoredGate(_, output) => crate::codegen::generate_gated_module(output),
             Variant::WinogradTransform(_, storage) => {
                 crate::codegen::winograd::transform(group, storage)
             }
@@ -2157,7 +2171,7 @@ impl Pipelines {
                 let kernel = dispatch.reduction().expect("reduction implementation");
                 layout = reduction_data_layout(kernel);
                 entry_point = crate::schedule::REDUCTION_ENTRY;
-                crate::schedule::lower(&kernel.to_template())
+                kernel.lower_with_storage(dispatch.pointwise_storage)
             }
             Variant::Horizontal(_, count, kind) => {
                 let coop = match kind {
@@ -2223,6 +2237,20 @@ impl Pipelines {
     /// which unrelated pipelines happen to have been compiled.
     fn key(dispatch: &Dispatch, caps: &blade_graphics::Capabilities) -> Variant {
         let entry = dispatch.shader.clone();
+        if matches!(entry, ShaderEntry::SwiGLUConcat | ShaderEntry::GeGLUConcat) {
+            let storage = dispatch.pointwise_storage;
+            if storage.bf16_output || storage.f16_output {
+                assert!(!(storage.bf16_output && storage.f16_output));
+                return Variant::StoredGate(
+                    entry,
+                    if storage.bf16_output {
+                        crate::DType::BF16
+                    } else {
+                        crate::DType::F16
+                    },
+                );
+            }
+        }
         match dispatch.kernel {
             crate::compile::Kernel::WinogradTransform(storage) => {
                 return Variant::WinogradTransform(entry, storage);
@@ -2307,7 +2335,14 @@ impl Pipelines {
             };
         }
         if let Some(kernel) = dispatch.reduction() {
-            return Variant::Reduction(kernel.hash_key());
+            if dispatch.pointwise_storage == crate::schedule::PointwiseStorage::default() {
+                return Variant::Reduction(kernel.hash_key());
+            }
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            kernel.hash(&mut hash);
+            dispatch.pointwise_storage.hash(&mut hash);
+            return Variant::Reduction(hash.finish());
         }
         if let Some(dag) = dispatch.pointwise() {
             if dispatch.pointwise_storage == crate::schedule::PointwiseStorage::default() {
