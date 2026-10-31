@@ -12,7 +12,7 @@ if [[ $# != 0 ]]; then
 fi
 
 uv run figures.py
-marp=(npx --yes @marp-team/marp-cli@4.5.1 slides.md --theme theme.css --html)
+marp=(npx --yes @marp-team/marp-cli@4.5.1 slides.md --theme theme.css --html --no-stdin)
 "${marp[@]}" -o slides.html
 "${marp[@]}" --pdf --allow-local-files --pdf-outlines -o slides.pdf
 "${marp[@]}" --notes -o slides-notes.txt

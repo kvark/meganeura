@@ -1,0 +1,145 @@
+{
+  "scope": "Arc B570, SD U-Net-small. Separate October 20 diagnostic runs; no cohort results replaced.",
+  "meganeura_commit": "48f3305692f0cbb350ff966a716fc37279ca9c07",
+  "base_commit": "ad0cc917dbe9a9a30db7bed5b1c274b64d049b19",
+  "sources": {
+    "winograd_ablation": {
+      "relative_to_local_results": "intel-unet-production-half-20261020/results-summary.json",
+      "sha256": "74ce1710114e5e3f22d838da1c8b4a582d1a2d6a426b27848be089ca0bb04234"
+    },
+    "native_profile": {
+      "relative_to_local_results": "intel-unet-production-half-20261020/profile-b570/session-0-side-1.json",
+      "sha256": "37ff7426d81cf7284e700299c5a1f43e68a8bde370ce45f372adacbd714b0e6e"
+    },
+    "torch_trace": {
+      "relative_to_local_results": "intel-unet-20261020/torch-uncaptured-profile/profiles/StableDiffusion_pytorch_inference.json",
+      "sha256": "3e8f66d6218967773035f34f05c7163fb2eb01e45a9c58edd319462dad300341"
+    },
+    "ablation_samples": {
+      "relative_to_local_results": "intel-unet-production-half-20261020/final-b570.jsonl",
+      "sha256": "a4b84dda5f445bf970b3b073c7ee237c02432e2fe3b6540becc2890c3b8c03c9"
+    }
+  },
+  "native_profile": {
+    "arithmetic": "F16 Winograd candidate; remaining selected arithmetic unchanged",
+    "timing_contract": "Blade calibrated pass-start timestamps on the process monotonic clock; each interval ends at the next pass start or final submission completion; one compute pass per timed plan dispatch, with the dispatches outside the replay's window batched into one untimed pass per side",
+    "dispatches": 286,
+    "measurement": {
+      "sample_count": 5,
+      "window_count": 1,
+      "unprofiled_median_ms": 3.3191815,
+      "profiled_wall_median_ms": 6.303036,
+      "gpu_total_median_ms": 3.6789590000000008,
+      "instrumentation_wall_ratio": 1.8989729847554282
+    },
+    "families": [
+      {
+        "family": "attention",
+        "dispatch_count": 10,
+        "median_ms": 0.509739,
+        "share_of_dispatch_median_sum_pct": 13.866639613965937
+      },
+      {
+        "family": "convolution_spatial",
+        "dispatch_count": 77,
+        "median_ms": 1.0972910000000002,
+        "share_of_dispatch_median_sum_pct": 29.835420942380452
+      },
+      {
+        "family": "data_movement",
+        "dispatch_count": 13,
+        "median_ms": 0.09437600000000002,
+        "share_of_dispatch_median_sum_pct": 2.566760970350639
+      },
+      {
+        "family": "matrix",
+        "dispatch_count": 66,
+        "median_ms": 1.0281829999999996,
+        "share_of_dispatch_median_sum_pct": 27.93862228138036
+      },
+      {
+        "family": "normalization_reduction",
+        "dispatch_count": 91,
+        "median_ms": 0.7402120000000001,
+        "share_of_dispatch_median_sum_pct": 20.125006323478136
+      },
+      {
+        "family": "pointwise",
+        "dispatch_count": 29,
+        "median_ms": 0.208174,
+        "share_of_dispatch_median_sum_pct": 5.667549868444456
+      }
+    ]
+  },
+  "winograd_ablation": {
+    "baseline_ms": 3.506573,
+    "candidate_ms": 3.1812035,
+    "change_percent": -9.278845756241205,
+    "candidate_record_submit_ms": 0.6248865,
+    "protocol": {
+      "measurement_order": "adjacent ABBA samples after shared warmup",
+      "samples_per_version": 100,
+      "warmup_seconds": 10
+    }
+  },
+  "qualification": {
+    "passed": true,
+    "policy": "Inferena tensor-fidelity outputs 2%; full-gradient aggregate 1%"
+  },
+  "torch_trace": {
+    "arithmetic": "strict F32; graph capture disabled to expose kernel names",
+    "inferences": 5,
+    "kernel_events": 1380,
+    "kernels_per_inference": 276,
+    "selected_kernel_names": [
+      "gemm_kernel",
+      "gen_conv",
+      "triton_per_fused_add_addmm_native_group_norm_unsqueeze_31",
+      "triton_per_fused_add_native_group_norm_34",
+      "triton_per_fused_add_native_group_norm_46",
+      "triton_per_fused_add_native_group_norm_48",
+      "triton_per_fused_native_group_norm_28",
+      "triton_per_fused_native_group_norm_59",
+      "triton_per_fused_native_group_norm_9",
+      "triton_poi_fused_add_addmm_native_group_norm_silu_unsqueeze_13",
+      "triton_poi_fused_add_addmm_native_group_norm_silu_unsqueeze_32",
+      "triton_poi_fused_add_addmm_native_group_norm_silu_unsqueeze_7",
+      "triton_poi_fused_add_native_group_norm_16",
+      "triton_poi_fused_add_native_group_norm_35",
+      "triton_poi_fused_add_native_group_norm_49",
+      "triton_poi_fused_add_native_group_norm_silu_47",
+      "triton_poi_fused_add_native_group_norm_silu_64",
+      "triton_poi_fused_addmm_silu_3",
+      "triton_poi_fused_convolution_native_group_norm_silu_62",
+      "triton_poi_fused_convolution_silu_11",
+      "triton_poi_fused_convolution_silu_14",
+      "triton_poi_fused_convolution_silu_30",
+      "triton_poi_fused_convolution_silu_33",
+      "triton_poi_fused_convolution_silu_53",
+      "triton_poi_fused_convolution_silu_57",
+      "triton_poi_fused_convolution_silu_60",
+      "triton_poi_fused_convolution_silu_61",
+      "triton_poi_fused_convolution_silu_65",
+      "triton_poi_fused_native_group_norm_silu_10",
+      "triton_poi_fused_native_group_norm_silu_29",
+      "triton_poi_fused_native_group_norm_silu_5",
+      "triton_poi_fused_silu_52",
+      "triton_poi_fused_silu_56",
+      "triton_red_fused__to_copy__unsafe_index_add_arange_cat_mul_native_group_norm_unsqueeze_58",
+      "triton_red_fused_add_addmm_native_group_norm_unsqueeze_12",
+      "triton_red_fused_add_addmm_native_group_norm_unsqueeze_6",
+      "triton_red_fused_add_native_group_norm_15",
+      "triton_red_fused_add_native_group_norm_63",
+      "triton_red_fused_convolution_native_group_norm_51",
+      "triton_red_fused_convolution_native_group_norm_55",
+      "triton_red_fused_native_group_norm_4"
+    ]
+  },
+  "interpretation": [
+    "Kernel efficiency and tensor traffic are the strongest leads; this does not establish bandwidth saturation or a stall breakdown.",
+    "Profile percentages describe instrumented dispatch intervals, not uninstrumented wall time or fractions of the framework gap.",
+    "The native and PyTorch traces use different precision profiles and execution modes; their counts are illustrative, not a matched ablation.",
+    "CPU recording can overlap GPU execution. Do not subtract its duration from host-wall time.",
+    "Shared-memory limits constrain candidates; their performance contribution and driver code-generation differences have not been isolated."
+  ]
+}
