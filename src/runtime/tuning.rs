@@ -23,7 +23,8 @@ pub(super) const ENCODER_SCRATCH_BYTES: usize = 1 << 20;
 /// Qualified private-scratch kernel comparisons, resumable by later tuning.
 ///
 /// Each decision covers one complete class key and candidate list, measured
-/// in private scratch, so it does not depend on the surrounding program.
+/// in private scratch, including its modeled weight reuse. A different reuse count cannot
+/// inherit the decision.
 /// Later searches on the same engine, device, driver and decision policy install
 /// the recorded winner and probe only the challengers it has not decided.
 /// [`crate::train::build_measured`] still requires whole-program qualification
@@ -212,16 +213,28 @@ impl KernelProgress {
     }
 }
 
-type MemoKey = (u32, bool, TuneClass, Vec<MatmulTile>);
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+struct MemoKey(
+    u32,
+    bool,
+    TuneClass,
+    Vec<MatmulTile>,
+    #[serde(default = "one_copy")] u32,
+);
+
+fn one_copy() -> u32 {
+    1
+}
 
 fn memo_key(plan: &crate::compile::ExecutionPlan, class: &SearchClass) -> MemoKey {
-    (
+    MemoKey(
         plan.knobs.matmul_k_stage,
         plan.knobs.matmul_interleave_columns,
         class.key.clone(),
         std::iter::once(class.initial)
             .chain(class.challengers.iter().copied())
             .collect(),
+        class.input_b_copies,
     )
 }
 
@@ -488,6 +501,8 @@ struct SearchClass {
     /// The SumRows of each split member, in member order.
     reductions: Vec<usize>,
     challengers: Vec<MatmulTile>,
+    /// Distinct weight addresses in a private timed sample (including B itself).
+    input_b_copies: u32,
 }
 
 impl SearchClass {
@@ -699,6 +714,7 @@ fn collect_classes(
                 members: Vec::new(),
                 reductions: Vec::new(),
                 challengers,
+                input_b_copies: 1,
             });
         }
         classes[class_index].members.push(index);
@@ -850,6 +866,34 @@ impl Session {
             collect_classes(&self.plan, &self.alias, self.coop_config.as_ref());
         let capabilities = self.gpu.capabilities();
         let left_out = retain_tunable_classes(&mut classes, &options.scope, &capabilities);
+        if options.strategy == TuneStrategy::Race {
+            for class in &mut classes {
+                if !matches!(class.initial, MatmulTile::Gemv(_))
+                    || class.key.weight_format.is_quantized()
+                {
+                    continue;
+                }
+                // Count physical weight regions, so aliases and repeated uses of
+                // one parameter do not pretend to be distinct model weights.
+                let weights: std::collections::HashSet<_> = class
+                    .members
+                    .iter()
+                    .map(|&index| {
+                        let logical = self.plan.dispatches[index].input_buffers[1].0 as usize;
+                        (
+                            std::sync::Arc::as_ptr(&self.physical_buffers[self.alias.map[logical]]),
+                            self.alias.offsets[logical],
+                        )
+                    })
+                    .collect();
+                class.input_b_copies = race::weight_copies(
+                    class,
+                    options,
+                    weights.len(),
+                    self.gpu_timing && capabilities.timing,
+                );
+            }
+        }
         (classes, excluded_dispatches + left_out)
     }
 
@@ -1891,6 +1935,7 @@ impl Drop for Staging<'_> {
 struct Scratch<'gpu, 'trial> {
     gpu: &'gpu Gpu,
     buffers: Vec<bg::Buffer>,
+    input_b_copies: Vec<bg::Buffer>,
     staging: &'trial mut Staging<'gpu>,
     staging_reused: bool,
     class: &'trial TuneClass,
@@ -1974,6 +2019,7 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
         Self {
             gpu,
             buffers,
+            input_b_copies: Vec::new(),
             staging,
             staging_reused,
             class,
@@ -2006,6 +2052,38 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
             self.buffers[index].into(),
             std::mem::size_of_val(data) as u64,
         );
+        self.submit_wait();
+    }
+
+    /// Timed samples cycle identical weights at distinct addresses. Numerical
+    /// qualification still runs on the original B buffer, without this pool.
+    fn replicate_input_b(&mut self, copies: u32, device_local: bool) {
+        for _ in 1..copies {
+            self.input_b_copies
+                .push(self.gpu.create_buffer(bg::BufferDesc {
+                    name: "tune_weight_copy",
+                    size: self.buffers[1].size(),
+                    memory: if device_local {
+                        bg::Memory::DeviceTransient
+                    } else {
+                        bg::Memory::Shared
+                    },
+                }));
+        }
+        if self.input_b_copies.is_empty() {
+            return;
+        }
+        self.encoder.start();
+        {
+            let mut transfer = self.encoder.transfer("tune_weight_copies");
+            for &buffer in &self.input_b_copies {
+                transfer.copy_buffer_to_buffer(
+                    self.buffers[1].into(),
+                    buffer.into(),
+                    buffer.size(),
+                );
+            }
+        }
         self.submit_wait();
     }
 
@@ -2070,6 +2148,7 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
         Self::run_on(
             self.gpu,
             &self.buffers,
+            &[],
             &mut self.encoder,
             sequence,
             repeats,
@@ -2081,24 +2160,42 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
     fn run_on(
         gpu: &Gpu,
         buffers: &[bg::Buffer],
+        input_b_copies: &[bg::Buffer],
         encoder: &mut bg::CommandEncoder,
         sequence: &[(&bg::ComputePipeline, &Dispatch)],
         repeats: u32,
     ) -> f64 {
-        let pieces: Vec<bg::BufferPiece> = buffers.iter().map(|&b| b.into()).collect();
+        let mut pieces: Vec<bg::BufferPiece> = buffers.iter().map(|&b| b.into()).collect();
         let start = Instant::now();
         encoder.start();
-        for _ in 0..repeats {
-            for &(pipeline, dispatch) in sequence {
-                let mut pass = encoder.compute("tune_kernel");
-                let mut pc = pass.with(pipeline);
-                Session::bind_dispatch(&pieces, dispatch, &mut pc);
-                pc.dispatch(dispatch.workgroups);
+        {
+            let mut pass = encoder.compute("tune_kernel");
+            for repetition in 0..repeats {
+                pieces[1] = timed_input_b(buffers[1], input_b_copies, repetition).into();
+                for (position, &(pipeline, dispatch)) in sequence.iter().enumerate() {
+                    // Match timestamp rounds and live inline-barrier execution.
+                    // Order split reductions and repeated writes explicitly.
+                    if repetition != 0 || position != 0 {
+                        pass.barrier();
+                    }
+                    let mut pc = pass.with(pipeline);
+                    Session::bind_dispatch(&pieces, dispatch, &mut pc);
+                    pc.dispatch(dispatch.workgroups);
+                }
             }
         }
         let sync = gpu.submit(encoder);
         let _ = super::wait_for_timed_encoder(gpu, &sync, encoder, false);
         start.elapsed().as_secs_f64() * 1e3
+    }
+}
+
+fn timed_input_b(original: bg::Buffer, copies: &[bg::Buffer], repetition: u32) -> bg::Buffer {
+    let index = repetition as usize % (copies.len() + 1);
+    if index == 0 {
+        original
+    } else {
+        copies[index - 1]
     }
 }
 
@@ -2114,7 +2211,7 @@ impl Drop for Scratch<'_, '_> {
             buffer: self.buffers.swap_remove(1),
             uploaded: self.input_b_uploaded,
         });
-        for buffer in self.buffers.drain(..) {
+        for buffer in self.buffers.drain(..).chain(self.input_b_copies.drain(..)) {
             self.gpu.destroy_buffer(buffer);
         }
     }
@@ -2581,11 +2678,12 @@ mod memo_tests {
             &TuneOptions::default(),
         ));
         memo.progress.insert(
-            (
+            MemoKey(
                 32,
                 false,
                 TuneClass::default(),
                 vec![MatmulTile::Tile32, MatmulTile::Tile64],
+                1,
             ),
             KernelProgress {
                 selected: MatmulTile::Tile64,
@@ -2593,6 +2691,16 @@ mod memo_tests {
             },
         );
         memo
+    }
+
+    #[test]
+    fn legacy_memo_keys_default_to_one_weight_copy() {
+        let memo = populated_memo();
+        let key = memo.progress.keys().next().unwrap();
+        let mut old = serde_json::to_value(key).unwrap();
+        old.as_array_mut().unwrap().pop();
+        let decoded: MemoKey = serde_json::from_value(old).unwrap();
+        assert_eq!(&decoded, key);
     }
 
     #[test]
@@ -2839,6 +2947,7 @@ mod tests {
             };
             let challengers = key.challengers(initial, config);
             let mut classes = vec![SearchClass {
+                input_b_copies: 1,
                 key,
                 initial,
                 members: vec![0],
