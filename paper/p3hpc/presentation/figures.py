@@ -75,7 +75,7 @@ def shade(value):
 def ratio_panels(panels, name, note):
     """Core comparisons, one panel per (profile, phase), one cell per GPU and model."""
     fig = plt.figure(figsize=(11.56, 4.38))
-    left, gap = .11, .025
+    left, gap = .15, .025
     width = (.985 - left - gap * (len(panels) - 1)) / len(panels)
     for panel, (profile, phase, title) in enumerate(panels):
         ax = fig.add_axes((left + panel * (width + gap), .15, width, .63))
@@ -94,29 +94,36 @@ def ratio_panels(panels, name, note):
         for spine in ax.spines.values():
             spine.set_visible(False)
         ax.set_title(title, loc="left", fontsize=16, weight="bold", pad=46)
-    fig.text(left, .065, "Meganeura time ÷ PyTorch time.  Teal: Meganeura faster.  —: PyTorch did not pass its checks.",
-             fontsize=12, weight="bold")
-    fig.text(left, .015, note, fontsize=10.5, color=MUTED)
+    # Legend in the corner above the GPU names, with cells drawn like the table's.
+    fig.text(.008, .965, "Ours ÷ PyTorch", fontsize=11.5, weight="bold", va="center")
+    for i, (value, label) in enumerate([(.5, "Meganeura faster"), (2, "PyTorch faster"), (None, "PyTorch failed")]):
+        y = .905 - i * .058
+        fill, ink = shade(value)
+        fig.add_artist(Rectangle((.008, y - .022), .016, .044, facecolor=fill, linewidth=0,
+                                 transform=fig.transFigure))
+        if value is None:
+            fig.text(.016, y, "—", fontsize=9, color=ink, ha="center", va="center")
+        fig.text(.03, y, label, fontsize=10.5, va="center")
+    fig.text(left, .04, note, fontsize=10.5, color=MUTED)
     save(fig, name)
 
 
 def search_loop():
-    """The search: what it varies, the four steps for each candidate, and where candidates leave."""
+    """The search: the four steps for each candidate program, and where candidates leave."""
     from matplotlib.patches import FancyBboxPatch
     fig, ax = plt.subplots(figsize=(11.56, 4.38))
     fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
     ax.set(xlim=(0, 1156), ylim=(438, 0))
     ax.axis("off")
-    choices = ["graph forms", "layouts", "fusion", "matrix types", "submissions"]
     top, height, width, gap, start = 150, 112, 200, 30, 236
     middle = top + height / 2
-    for i, word in enumerate(choices):
-        y = 82 + i * 46
-        ax.text(168, y, word, ha="right", va="center", fontsize=16, weight="bold", color=INK)
-        ax.annotate("", xy=(start - 4, middle + (i - 2) * 12), xytext=(176, y),
-                    arrowprops=dict(arrowstyle="->", color=MUTED, lw=1.5, shrinkA=0, shrinkB=0))
+    ax.text(196, middle - 14, "candidate\nprograms", ha="right", va="center", fontsize=17, weight="bold",
+            color=INK, linespacing=1.15)
+    ax.text(196, middle + 30, "from the e-graph", ha="right", va="center", fontsize=12.5, color=MUTED)
+    ax.annotate("", xy=(start - 4, middle), xytext=(204, middle),
+                arrowprops=dict(arrowstyle="->", color=MUTED, lw=1.8, shrinkA=0, shrinkB=0))
     steps = [("Build", "one candidate", "program"), ("Validate", "outputs + gradients", "against the f32 build"),
-             ("Tune", "time kernel variants,", "remember the winners"), ("Measure", "time the program,", "keep it if it wins")]
+             ("Tune", "time kernels,", "remember winners"), ("Measure", "time the program,", "keep it if it wins")]
     for i, (title, *lines) in enumerate(steps):
         x = start + i * (width + gap)
         ax.add_patch(FancyBboxPatch((x, top), width, height, boxstyle="round,pad=0,rounding_size=9",
@@ -132,17 +139,65 @@ def search_loop():
     ax.plot([last, last, first], [top - 3, 112, 112], color=TEAL, lw=2.2, solid_capstyle="butt")
     ax.annotate("", xy=(first, top - 3), xytext=(first, 111),
                 arrowprops=dict(arrowstyle="->", color=TEAL, lw=2.2, shrinkA=0, shrinkB=0))
-    ax.text((first + last) / 2, 96, "next candidate, until the 30 s budget runs out", ha="center", va="center",
+    ax.text((first + last) / 2, 96, "next candidate, until the 30s budget runs out", ha="center", va="center",
             fontsize=14, color=TEAL, backgroundcolor=CANVAS)
     check = start + width + gap + width / 2
     ax.annotate("", xy=(check, 338), xytext=(check, top + height + 3),
                 arrowprops=dict(arrowstyle="->", color=ORANGE, lw=1.8))
-    ax.text(check, 360, "fails: dropped", ha="center", va="center", fontsize=14, color=ORANGE)
+    ax.text(check, 360, "drop invalid", ha="center", va="center", fontsize=14, color=ORANGE)
     ax.annotate("", xy=(last, 338), xytext=(last, top + height + 3),
                 arrowprops=dict(arrowstyle="->", color=TEAL, lw=2.2))
     ax.text(last, 372, "fastest checked\nprogram", ha="center", va="center", fontsize=15, weight="bold",
             color=TEAL, linespacing=1.25)
     save(fig, "search.svg")
+
+
+def egraph():
+    """One e-graph: attention reads three e-classes; rewrites add a packed product and a split-K schedule."""
+    from matplotlib.patches import FancyBboxPatch
+    fig, ax = plt.subplots(figsize=(7.2, 4.6))
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+    ax.set(xlim=(0, 720), ylim=(460, 0))
+    ax.axis("off")
+    old, new = ("#dcebe8", TEAL), ("#f5e3d8", ORANGE)
+
+    def node(x, y, text, style, width=170):
+        fill, edge = style
+        ax.add_patch(FancyBboxPatch((x - width / 2, y - 17), width, 34, boxstyle="round,pad=0,rounding_size=6",
+                                   facecolor=fill, edgecolor=edge, linewidth=1.6))
+        ax.text(x, y, text, ha="center", va="center", fontsize=13.5, color=INK)
+
+    def eclass(x, y, width, height, label):
+        ax.add_patch(FancyBboxPatch((x - width / 2, y - height / 2), width, height,
+                                   boxstyle="round,pad=0,rounding_size=12", facecolor="none",
+                                   edgecolor=MUTED, linewidth=1.5, linestyle=(0, (4, 3))))
+        ax.text(x - width / 2 + 4, y - height / 2 - 12, label, fontsize=14, weight="bold", color=MUTED, va="center")
+
+    def arrow(start, end, color=MUTED):
+        ax.annotate("", xy=end, xytext=start,
+                    arrowprops=dict(arrowstyle="->", color=color, lw=1.6, shrinkA=0, shrinkB=0))
+
+    node(360, 32, "attention(Q, K, V)", old, width=230)
+    columns = [(125, "Q", "Wq", 0), (360, "K", "Wk", 1), (595, "V", "Wv", 2)]
+    for x, name, weight, i in columns:
+        eclass(x, 162, 200, 108, name)
+        node(x, 140, f"X · {weight}", old)
+        node(x, 184, f"slice(P, {i})", new)
+        arrow((360 + (x - 360) * .35, 49), (x, 107))
+        arrow((x, 201), (360 + (x - 360) * .45, 296), ORANGE)
+    eclass(360, 333, 470, 70, "P")
+    node(245, 333, "X · [Wq Wk Wv]", new, width=200)
+    node(475, 333, "Σ 8 K-slice products", new, width=210)
+    # Legend.
+    y = 430
+    ax.add_patch(FancyBboxPatch((8, y - 11), 30, 22, boxstyle="round,pad=0,rounding_size=5", facecolor="none",
+                               edgecolor=MUTED, linewidth=1.4, linestyle=(0, (4, 3))))
+    ax.text(46, y, "e-class: equal values", fontsize=12.5, va="center", color=INK)
+    for x, (fill, edge), label in [(256, old, "original e-node"), (452, new, "added by a rewrite")]:
+        ax.add_patch(FancyBboxPatch((x, y - 11), 30, 22, boxstyle="round,pad=0,rounding_size=5",
+                                   facecolor=fill, edgecolor=edge, linewidth=1.4))
+        ax.text(x + 38, y, label, fontsize=12.5, va="center", color=INK)
+    save(fig, "egraph.svg")
 
 
 def precision_gain():
@@ -231,7 +286,7 @@ def attention_followup():
     axes[0].tick_params(axis="y", length=0)
     fig.text(.14, .12, "Whole training-step time change: F32 → scaled F16 attention backward. Negative is faster.", fontsize=11)
     fig.text(.14, .065, "Same graph, forward kernels and submission count. All eight pass full-output/full-gradient checks; no BF16 operands required.", fontsize=10)
-    fig.text(.14, .015, "Separate Oct 24 experiment: one process, 10 s shared warmup, 100 interleaved samples per arm. Not a new PyTorch comparison.", fontsize=9.7, color=MUTED)
+    fig.text(.14, .015, "Separate Oct 24 experiment: one process, 10s shared warmup, 100 interleaved samples per arm. Not a new PyTorch comparison.", fontsize=9.7, color=MUTED)
     save(fig, "attention-followup.svg")
 
 
@@ -329,7 +384,7 @@ def preparation_models():
                   for key in ("native_preparation_seconds", "reference_compile_seconds")]
         for offset, value, color in zip((-.18, .18), values, (TEAL, ORANGE)):
             ax.barh(i+offset, value, height=.31, color=color)
-            ax.text(value+1, i+offset, f"{value:.1f} s", va="center", fontsize=12, color=color)
+            ax.text(value+1, i+offset, f"{value:.1f}s", va="center", fontsize=12, color=color)
     ax.set_yticks(range(5), ["SmolLM2-135M", "SmolVLA", "SD U-Net", "ResNet-50", "Whisper-tiny"])
     ax.invert_yaxis(); ax.set_xlim(0, 80)
     ax.set_xlabel("Seconds per workload process · strict f32")
@@ -413,7 +468,7 @@ def warmup():
                         color=color, label=phase if rep == "1" else None, linewidth=1.7, markersize=5)
         ax.set_title(title, loc="left", weight="bold");ax.set_xticks([5, 15, 30, 60]);ax.set_ylim(-3.4, 1.4)
         ax.set_xlabel("Cumulative post-search warmup, seconds");clean(ax)
-    axes[0].set_ylabel("Time relative to own 60 s result, %")
+    axes[0].set_ylabel("Time relative to own 60s result, %")
     axes[1].legend(frameon=False, fontsize=10, loc="lower right")
     fig.text(.08, .035, "Two processes/GPU (solid / dashed). Same selected program; earlier timing windows add elapsed heat.", fontsize=11)
     save(fig, "warmup.svg")
@@ -427,6 +482,7 @@ if __name__ == "__main__":
     ratio_panels([("strict", "latency", "Strict f32"), ("accelerated", "latency", "Reduced precision")],
                  "minimal-shape-ratios.svg", "Minimal shape: one token, action or image, run after training. "
                  "Apple M3 times vary by a median 34% between processes.")
+    egraph()
     search_loop()
     precision_gain()
     gap_accounting()
