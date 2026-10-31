@@ -1140,9 +1140,15 @@ mod tests {
         }
         scratch.input_b_uploaded = true;
         scratch.replicate_input_b(2, true);
+        let capabilities = gpu.capabilities();
         let sequence: Vec<_> = sequences[0]
             .iter()
-            .map(|d| (&session.pipelines.map[&Pipelines::key(d)].raw, d))
+            .map(|d| {
+                (
+                    &session.pipelines.map[&Pipelines::key(d, &capabilities)].raw,
+                    d,
+                )
+            })
             .collect();
         let mut times = TuneQualificationTimes::default();
         scratch.encoder.start();
