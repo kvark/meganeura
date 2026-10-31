@@ -221,10 +221,9 @@ A separate October 31 single-operation comparison is retained in
 `examples/op_bench.rs`; the shape list, PyTorch runner and driver script are
 in `presentation/data/op-bench/`. It times one strict-F32 GEMM or batch-1
 convolution per process on the RX 7900 XT, RTX 5070 and Arc B570, with one
-timing protocol on all three: Meganeura with the kernel tuner on and
-cooperative matrices off (`5b232bd` on the RX 7900 XT, one process per shape;
-`e40648f`, which adds the tuner scratch fix below, on the RTX 5070 and B570,
-median of three processes per shape), against PyTorch 2.13.0 (ROCm 7.2, CUDA 13.0 and XPU
+timing protocol on all three: Meganeura `e40648f` (which adds the tuner
+scratch fix below) with the kernel tuner on and cooperative matrices off,
+median of three processes per shape, against PyTorch 2.13.0 (ROCm 7.2, CUDA 13.0 and XPU
 wheels) with TF32 off and `cudnn.benchmark` on. Meganeura's GPU time is the
 median over 30 steps of summed Vulkan pass timestamps. PyTorch's is a device
 event interval around one replay of a graph of 30 serial operations, divided
@@ -237,16 +236,17 @@ F32 kernels here (rocBLAS/MIOpen, CUTLASS SIMT and cuDNN, oneDNN), so these
 ratios compare kernels on the same execution units. Host wall columns are
 not comparable across engines.
 
-Square 4096 GEMMs take 1.68×, 2.11× and 2.19× PyTorch's time on the RX 7900
-XT, RTX 5070 and B570 (13.3 against 22.3, 10.2 against 21.6 and 3.2 against
+Square 4096 GEMMs take 1.65×, 2.11× and 2.19× PyTorch's time on the RX 7900
+XT, RTX 5070 and B570 (13.5 against 22.3, 10.2 against 21.6 and 3.2 against
 6.9 TFLOP/s). They exceed the tuner's 64 MiB scratch, so all three run our
-default tile; 2048³, which the tuner covers, takes 2.03× and 1.92× on the
-RTX 5070 and B570. Whisper and LLM shapes (1500×384×1536, 512×576×1536) take
-1.26–1.34×, 1.50–1.69× and 1.20–1.46×. The U-Net's small GEMMs (M of 64–256)
-take 0.65–1.50×, 1.59–4.93× and 2.01–4.62×; for 64×1024×256, cuBLAS (split-K)
+default tile; 2048³, which the tuner covers, takes 1.23×, 2.03× and 1.92×.
+Whisper and LLM shapes (1500×384×1536, 512×576×1536) take 1.19–1.29×,
+1.50–1.69× and 1.20–1.46×. The U-Net's small GEMMs (M of 64–256) take
+0.66–1.31×, 1.59–4.93× and 2.01–4.62×; for 64×1024×256, cuBLAS (split-K)
 takes 6 µs against our 28 and oneDNN 12 µs against our 55. Our 3×3
-convolutions take 0.77–1.98×, 0.45–1.03× and 1.45–3.16×, and 1×1 and stem
-convolutions 0.59–1.17×, 1.36–1.97× and 1.40–1.75×. Convolution times include
+convolutions take 0.76–2.23×, 0.45–1.03× and 1.45–3.16×, and 1×1 and stem
+convolutions 0.55–1.06×, 1.36–1.97× and 1.40–1.75×. On the RX 7900 XT the
+geometric means are 1.11× for GEMMs and 0.98× for convolutions. Convolution times include
 our per-call Winograd weight transform. The RX 7900 XT is the closest of the
 three GPUs, as in the cohort. These results place the U-Net gaps on NVIDIA and
 Intel in our small-matrix and small-convolution kernels. They do not show
@@ -256,10 +256,12 @@ not be combined with the cohort ratios. At `5b232bd` the B570 2048³ GEMM took
 5.31 ms against 3.58 ms at `99e3de2`: a 1 MiB encoder allowance, newly
 counted inside the tuner's 64 MiB scratch limit, pushed its exactly-64 MiB
 buffers over it, so the tuner skipped the product. `e40648f` keeps encoder
-allowances outside the limit and restores 3.58 ms; the RX 7900 XT's 2048³ row
-predates the fix. Each process tunes for 2 s and can pick different tiles:
+allowances outside the limit and restores 3.58 ms; on the RX 7900 XT 2048³
+went from 1.30 to 1.08 ms. Each process tunes for 2 s and can pick different tiles:
 across three processes, small B570 operations vary by up to 45% and the
 RTX 5070's 4-channel stem by 31%, while large and transformer GEMMs agree
-within 1% (`presentation/data/op-bench/meganeura-runs.tsv`). The U-Net's largest generated kernel uses
+within 1% (`presentation/data/op-bench/meganeura-runs.tsv`; the RX 7900 XT's
+per-process rows are kept with its run archive). Its sampled outputs also
+matched CPU f64 sums at 256 positions per shape. The U-Net's largest generated kernel uses
 16.4 KiB of workgroup memory (`presentation/data/b570-unet-shared-memory.txt`,
 at `99e3de2`), so Vulkan's 48 KiB limit does not constrain it.
