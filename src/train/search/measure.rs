@@ -146,10 +146,7 @@ fn run(
     refresh_inputs: &mut impl FnMut(&mut Session) -> Result<(), String>,
 ) -> Result<f64, String> {
     prepare(session, state, trial, refresh_inputs)?;
-    let start = Instant::now();
-    session.step();
-    session.wait();
-    Ok(start.elapsed().as_secs_f64() * 1000.0)
+    Ok(session.measure_step().as_secs_f64() * 1000.0)
 }
 
 fn validate(
@@ -792,7 +789,9 @@ mod tests {
     fn program_search_preserves_update_and_failure_contracts() {
         use crate::compile::{Dispatch, Kernel, ShaderEntry};
         use crate::schedule::{PointwiseDAG, Pw};
-        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
+        let gpu_options = crate::GpuOptions::from_env();
+        let timing = gpu_options.timing;
+        let gpu = Arc::new(crate::init_gpu_context_with(gpu_options).unwrap());
         let mut graph = crate::Graph::new();
         let x = graph.input("x", &[2]);
         let w = graph.parameter("w", &[2]);
@@ -845,7 +844,10 @@ mod tests {
             let result = select(
                 programs,
                 gpu.clone(),
-                SessionOptions::default(),
+                SessionOptions {
+                    gpu_timing: timing,
+                    ..Default::default()
+                },
                 BuildSearchOptions {
                     qualification_runs: checkpoint_runs,
                     final_qualification_runs: final_runs,
@@ -876,6 +878,8 @@ mod tests {
                     Ok(())
                 },
                 |s| {
+                    assert_eq!(s.gpu_timing(), timing);
+                    assert!(s.profiling_window().is_none());
                     if initialized.get() == max_programs
                         && invalidate.is_some_and(|name| s.plan().dispatches[0].label == name)
                     {
