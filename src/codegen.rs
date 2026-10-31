@@ -861,7 +861,7 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
             kernel.generate(64, None, &crate::compile::TuningKnobs::default())
         }
         ShaderGroup::SwiGLUGrad => ShaderModule::new(include_str!("shaders/swiglu_grad.wgsl")),
-        ShaderGroup::SwiGLUConcat => ShaderModule::new(include_str!("shaders/swiglu_concat.wgsl")),
+        ShaderGroup::SwiGLUConcat => generate_gated_module(crate::DType::F32),
         ShaderGroup::SumRows => ShaderModule::new(include_str!("shaders/sum_rows.wgsl")),
         ShaderGroup::RmsNormGrad => ShaderModule::new(include_str!("shaders/rms_norm_grad.wgsl")),
         ShaderGroup::RmsNormGradWRowPar => {
@@ -1016,6 +1016,35 @@ pub fn generate_module_coop(group: ShaderGroup, config: &CoopConfig) -> ShaderMo
 /// stores support arbitrary output tails.
 pub fn generate_module_coop_typed(group: ShaderGroup, types: MatrixTypes) -> ShaderModule {
     generate_module_coop_typed_with_shape(group, types, [16, 16, 16])
+}
+
+/// Keep gated activation arithmetic in F32 and specialize only the final store.
+pub(crate) fn generate_gated_module(output: crate::DType) -> ShaderModule {
+    use crate::DType;
+    let extensions = match output {
+        DType::F16 => "enable f16;\n".to_owned(),
+        DType::BF16 => format!(
+            "enable wgpu_bfloat16;\n{}",
+            include_str!("shaders/bf16_round.wgsl")
+        ),
+        DType::F32 => String::new(),
+        _ => panic!("unsupported gated output {output:?}"),
+    };
+    ShaderModule::new(&preprocess(
+        include_str!("shaders/swiglu_concat.wgsl"),
+        &[
+            ("$EXTENSIONS", &extensions),
+            ("$OUT_TYPE", MatrixTypes::name(output)),
+            (
+                "$STORE",
+                if output == DType::BF16 {
+                    "round_bf16"
+                } else {
+                    MatrixTypes::name(output)
+                },
+            ),
+        ],
+    ))
 }
 
 /// Select a supported native M×N×K tile for the checked cooperative product,

@@ -343,13 +343,14 @@ fn bf16_pointwise_shaders_validate() {
         output: 4,
     };
     for inputs in 0..8 {
-        for output in [false, true] {
+        for output in [DType::F32, DType::F16, DType::BF16] {
             let shader = meganeura::schedule::lower_pointwise_storage(
                 &dag,
                 Default::default(),
                 PointwiseStorage {
                     bf16_inputs: inputs,
-                    bf16_output: output,
+                    bf16_output: output == DType::BF16,
+                    f16_output: output == DType::F16,
                 },
             );
             let module = parse_with_bindings(&shader.source);
