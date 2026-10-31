@@ -258,15 +258,14 @@ fn calibrate(
             .submit_round_trip
             .get_or_insert(Duration::from_secs_f64(round_trip_ms / 1e3));
     }
-    if profile.dispatch_overhead.is_none() || (bench.timestamps && profile.pass_overhead.is_none())
-    {
-        bench.overheads(profile);
-    }
+    bench.overheads(profile);
     bench.deadline = start + budget / 4;
     if profile.parallel_width.is_none() {
         profile.parallel_width = bench.parallel_width();
     }
     bench.deadline = start + budget / 2;
+    // Retry a cold pipeline after the first short slice.
+    bench.overheads(profile);
     if profile.bandwidth.is_none() {
         profile.bandwidth = bench.bandwidth();
     }
@@ -460,10 +459,34 @@ impl<'a> Bench<'a> {
         }
     }
 
+    fn record_stream(
+        encoder: &mut bg::CommandEncoder,
+        pipelines: &[bg::ComputePipeline],
+        stream: usize,
+        data: &StreamData,
+        grid: [u32; 3],
+        dispatches: u32,
+    ) {
+        let mut pass = encoder.compute("calibration_stream");
+        for dispatch in 0..dispatches {
+            if dispatch != 0 {
+                pass.barrier();
+            }
+            let mut pc = pass.with(&pipelines[stream]);
+            pc.bind(0, data);
+            pc.dispatch(grid);
+        }
+    }
+
     /// Overhead of a timed pass and of one more dispatch inside a pass, from
     /// a one-workgroup streaming dispatch.
     fn overheads(&mut self, profile: &mut MachineProfile) {
         const DISPATCHES: u32 = 32;
+        if profile.dispatch_overhead.is_some()
+            && (!self.timestamps || profile.pass_overhead.is_some())
+        {
+            return;
+        }
         let Some(stream) = self.stream_pipeline() else {
             return;
         };
@@ -485,22 +508,12 @@ impl<'a> Bench<'a> {
                 pad1: 0,
             },
         };
-        let data = &data;
-        let record = |dispatches: u32| {
-            move |encoder: &mut bg::CommandEncoder, pipelines: &[bg::ComputePipeline]| {
-                let mut pass = encoder.compute("calibration_overhead");
-                for dispatch in 0..dispatches {
-                    if dispatch != 0 {
-                        pass.barrier();
-                    }
-                    let mut pc = pass.with(&pipelines[stream]);
-                    pc.bind(0, data);
-                    pc.dispatch([1, 1, 1]);
-                }
-            }
-        };
-        let single = self.time(DISPATCHES as usize, record(1));
-        let batched = self.time(3, record(DISPATCHES));
+        let single = self.time(DISPATCHES as usize, |encoder, pipelines| {
+            Self::record_stream(encoder, pipelines, stream, &data, [1, 1, 1], 1)
+        });
+        let batched = self.time(3, |encoder, pipelines| {
+            Self::record_stream(encoder, pipelines, stream, &data, [1, 1, 1], DISPATCHES)
+        });
         if !single.is_empty() && !batched.is_empty() {
             let single = median(&single);
             if self.timestamps {
@@ -600,17 +613,34 @@ impl<'a> Bench<'a> {
                     pad1: 0,
                 },
             };
-            let samples = self.time(3, |encoder, pipelines| {
-                let mut pass = encoder.compute("calibration_stream");
-                let mut pc = pass.with(&pipelines[stream]);
-                pc.bind(0, &data);
-                pc.dispatch([columns_groups, groups.div_ceil(columns_groups), 1]);
-            });
-            self.release(&[src, dst]);
+            let measure = |bench: &mut Self, repeats: u32| {
+                bench.time(3, |encoder, pipelines| {
+                    Self::record_stream(
+                        encoder,
+                        pipelines,
+                        stream,
+                        &data,
+                        [columns_groups, groups.div_ceil(columns_groups), 1],
+                        repeats,
+                    );
+                })
+            };
+            let samples = measure(self, 1);
             if samples.is_empty() {
+                self.release(&[src, dst]);
                 return rate;
             }
-            let elapsed = median(&samples);
+            let mut elapsed = median(&samples);
+            if elapsed == 0.0 && !self.timestamps {
+                // Amortize a stale cold-submit estimate over enough useful work
+                // to avoid clipping every host sample to zero.
+                const REPEATS: u32 = 32;
+                let samples = measure(self, REPEATS);
+                if !samples.is_empty() {
+                    elapsed = median(&samples) / f64::from(REPEATS);
+                }
+            }
+            self.release(&[src, dst]);
             if elapsed > 0.0 {
                 rate = Some(2.0 * bytes as f64 / (elapsed / 1e3));
             }
