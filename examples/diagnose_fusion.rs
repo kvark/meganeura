@@ -249,7 +249,7 @@ fn analyze(label: &str, plan: &ExecutionPlan) {
             | ShaderEntry::MatMulGemvBT => (d.params[0], d.params[1], d.params[2]),
             _ => continue,
         };
-        let key = (shader_name(&d.shader), m, n, k, d.requires_full_precision);
+        let key = (shader_name(&d.shader), m, n, k, d.full_precision());
         *shapes.entry(key).or_insert(0usize) += 1;
     }
     println!("\n  matmul shape classes (entry, M, N, K, full-precision operands):");

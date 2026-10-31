@@ -126,7 +126,7 @@ impl Problem {
             k,
             reduced_storage: dispatch.weight_format.uses_reduced_storage(),
             f16_weights: dispatch.weight_format == crate::compile::WeightFormat::F16,
-            requires_full_precision: dispatch.requires_full_precision,
+            requires_full_precision: dispatch.full_precision(),
             epilogue_inputs: dispatch
                 .matmul_epilogue
                 .as_ref()

@@ -42,7 +42,7 @@ pub(super) fn fill(
     for i in 0..plan.dispatches.len() {
         let d = &plan.dispatches[i];
         if d.shader != ShaderEntry::WinogradBatchedMatMul
-            || d.requires_full_precision
+            || d.full_precision()
             || d.schedule_locked
             || !matches!(d.kernel, Kernel::Default | Kernel::ScalarMatmul(_))
             || d.input_buffers.len() != 2
@@ -84,7 +84,7 @@ pub(super) fn fill(
             if index >= i
                 || p.shader != shader
                 || p.kernel != Kernel::Default
-                || p.requires_full_precision
+                || p.full_precision()
                 || p.schedule_locked
                 || !p.extra_outputs.is_empty()
             {
