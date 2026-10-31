@@ -1,7 +1,7 @@
 # P3HPC presentation
 
 This is the main 20-minute talk: 18 main slides with about 18:15 of suggested
-speaking time, followed by a backup index and 26 backups. It asks whether
+speaking time, followed by a backup index and 25 backups. It asks whether
 Vulkan and Metal can carry ML training and inference, and answers in the
 workshop's three parts between an introduction and a conclusion. The header
 on every main slide names the sections and highlights the current one.
@@ -66,8 +66,8 @@ every build regenerates the figures. Outputs are ignored by Git:
 needs its adjacent `figures/`, `assets/`, and
 `../../figures/dinovision-quest3s.jpg`; the PDF embeds them. In the HTML, the
 backup index links to each backup. No GPU or full benchmark archive is needed
-to build. `figures.py` imports `../artifact/gap_analysis.py` and reads
-`../artifact/attention-followup.json` for two backups.
+to build. `figures.py` imports `../artifact/gap_analysis.py` for the
+gap-accounting backup.
 
 Each slide's notes hold a short script, an "If asked" list and the sources.
 The results tables show inference and training; the minimal shape is a backup.
@@ -134,8 +134,8 @@ runs, so the comparison does not isolate a compiler speedup.
 
 "Where is the gap? One op at a time" comes from `data/op-bench.tsv`: one
 strict-f32 GEMM or batch-1 convolution per process on the RX 7900 XT (RADV
-Mesa 26.0.8), RTX 5070 and B570, all on October 31 at Meganeura e40648f, which
-adds the tuner scratch fix, with the kernel tuner on and cooperative matrices
+Mesa 26.0.8), RTX 5070 and B570, all on October 31 at Meganeura 5b232bd plus
+the tuner scratch fix (567028b on main), with the kernel tuner on and cooperative matrices
 off. Each Meganeura row is the median of three processes; the RTX 5070 and
 B570 trials are in `data/op-bench/meganeura-runs.tsv`. PyTorch 2.13.0 runs
 with TF32 off and `cudnn.benchmark` on. Our GPU time sums Vulkan pass
@@ -146,8 +146,7 @@ the driver script are in `data/op-bench/`, and the Meganeura runner is
 `examples/op_bench.rs` at the repository root. The slide's ranges group the
 rows of the TSV. The 5.45× in the takeaway is the cohort's
 B570 U-Net strict inference ratio. The notes' 16 KiB comes from
-`data/b570-unet-shared-memory.txt`, and the earlier U-Net diagnostics (286
-against 276 dispatches, the F16 Winograd ablation) from `data/intel-gap.json`.
+`data/b570-unet-shared-memory.txt`.
 
 The B570's zero selected matrix sessions belongs to the October 19 runs. The
 October 21 local follow-up at PR #274 revision
@@ -160,11 +159,6 @@ engines and both arithmetic profiles. `../artifact/gap_analysis.py` computes
 an exact accounting identity and geometric means on 32 inference / 30
 training conditions. These are not the main table's medians and do not
 allocate time to CPU, GPU, API or driver causes.
-
-The "Change one path" backup uses the separate October 24 data in
-`../artifact/attention-followup.json`, with all eight model/device
-comparisons. It is one process per condition and a within-native shader
-ablation; it updates none of the cohort ratios or coverage.
 
 The opening uses a real Unreal Tournament screenshot. Its source and
 attribution are in [assets/README.md](assets/README.md).

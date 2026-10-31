@@ -2,8 +2,8 @@
 # RX 7900 XT (gfx1100, RADV Mesa 26.0.8, PyTorch 2.13.0+rocm7.2, Ryzen 5 9600X), October 31, 2026; Meganeura outputs sample-checked against CPU f64.
 # RTX 5070 (driver 595, PyTorch 2.13.0+cu130) and Arc B570 (Mesa ANV, PyTorch 2.13.0+xpu), i5-12400F, October 31, 2026.
 # Meganeura with examples/op_bench.rs; MEGANEURA_TUNE=1 (2 s kernel tuner, 64 MiB scratch; the 4096 GEMM exceeds it) MEGANEURA_DISABLE_COOP=1.
-#   e40648f (5b232bd plus the tuner scratch fix, which makes the 2048 GEMM fit) on all three GPUs; each row has the median gpu_ms of 3 processes
-#   (the tuner can pick different tiles per process; small B570 ops vary by up to 45%). RX 7900 XT run from branch e2f58e4, same runtime code.
+#   5b232bd plus the tuner scratch fix (567028b on main), which makes the 2048 GEMM fit, on all three GPUs; each row has the median gpu_ms of 3 processes
+#   (the tuner can pick different tiles per process; small B570 ops vary by up to 45%). RX 7900 XT run from a branch build with the same runtime code.
 #   gpu_ms = median over 30 profiled steps of summed Vulkan pass timestamps (excludes gaps between passes).
 # PyTorch: TF32 off, cudnn.benchmark on, profiler off during timing (profiling perturbs ROCm execution).
 #   gpu_ms = device events around one replay of a graph of 30 serial ops / 30, median of 30 replays (includes device dispatch gaps,

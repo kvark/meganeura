@@ -58,23 +58,7 @@ def analyze(rows):
                 groups=groups, conditions=cells)
 
 
-def followups(path):
-    data = json.loads(path.read_text())
-    for row in [*data["conditions"], *data.get("auxiliary_conditions", [])]:
-        for key in ("baseline", "candidate"):
-            samples = row[key + "_samples_ms"]
-            if len(samples) != 100 or any(not math.isfinite(x) or x <= 0 for x in samples):
-                raise ValueError("invalid follow-up sample inventory")
-            # The diagnostic runner uses the upper median for an even count.
-            if sorted(samples)[len(samples) // 2] != row[key + "_ms"]:
-                raise ValueError("follow-up median differs from retained samples")
-        if row["qualification_before"] != {"Ok": None} or row["qualification_after"] != {"Ok": None}:
-            raise ValueError("follow-up failed qualification")
-        row["change_percent"] = 100 * (row["candidate_ms"] / row["baseline_ms"] - 1)
-    return data
-
-
-def render(rows, local):
+def render(rows):
     summary = analyze(rows)
     summary["input_sha256"] = hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
     lookup = {(r["device"], r["phase"]): r for r in summary["groups"]}
@@ -89,25 +73,16 @@ def render(rows, local):
         table.append(f"{name} & {g['n']} & " + " & ".join(f"{g[k]:.2f}" for k in
                      ("strict_ratio", "torch_gain", "native_gain", "gap_multiplier", "accelerated_ratio")) + r" \\")
     table.extend([r"\bottomrule", r"\end{tabular}"])
-    local_lookup = {(r["gpu"], r["model"]): r for r in local["conditions"]}
-    second = [r"\begin{tabular}{@{}lrr@{}}", r"\toprule", r"Model & RTX 5070 & Arc B570 \\", r"\midrule"]
-    for model, label in [("SmolLM2-135M", "SmolLM2-135M"), ("Whisper-tiny", "Whisper encoder"),
-                         ("StableDiffusion", "U-Net-small"), ("SmolVLA", "SmolVLA expert")]:
-        values = [local_lookup[g, model]["change_percent"] for g in ("rtx5070", "b570")]
-        second.append(label + " & " + " & ".join(f"${v:+.1f}\\%$" for v in values) + r" \\")
-    second.extend([r"\bottomrule", r"\end{tabular}"])
-    return {"gap.json": json.dumps(summary, indent=2) + "\n", "gap.tex": "\n".join(table) + "\n",
-            "attention-followup.tex": "\n".join(second) + "\n"}
+    return {"gap.json": json.dumps(summary, indent=2) + "\n", "gap.tex": "\n".join(table) + "\n"}
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--input", type=Path, default=HERE.parent / "tables/results.csv")
-    p.add_argument("--followups", type=Path, default=HERE / "attention-followup.json")
     p.add_argument("--output", type=Path)
     p.add_argument("--check", type=Path)
     args = p.parse_args()
-    outputs = render(list(csv.DictReader(args.input.open())), followups(args.followups))
+    outputs = render(list(csv.DictReader(args.input.open())))
     if not args.output and not args.check:
         p.error("specify --output and/or --check")
     for name, content in outputs.items():
@@ -116,7 +91,7 @@ def main():
         if args.output:
             args.output.mkdir(parents=True, exist_ok=True)
             (args.output / name).write_text(content)
-    print("Gap identity and follow-up sample medians verified.")
+    print("Gap identity verified.")
 
 
 if __name__ == "__main__":
