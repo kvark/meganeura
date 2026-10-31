@@ -58,6 +58,7 @@ fn session(debug: bool) -> meganeura::Session {
     meganeura::build(
         &graph,
         SessionConfig {
+            gpu: Some(crate::support::gpu::gpu()),
             runtime: SessionOptions {
                 debug,
                 coop: CoopPolicy::Disabled,
@@ -278,7 +279,10 @@ fn parameter_reads_reject_wrong_storage_and_oversized_views() {
     let mut graph = Graph::new();
     let p = graph.parameter_f16("p", &[3]);
     graph.set_outputs(vec![p]);
-    let s = meganeura::Session::new(meganeura::compile::compile(&graph));
+    let s = meganeura::Session::with_context(
+        meganeura::compile::compile(&graph),
+        crate::support::gpu::gpu(),
+    );
     assert_eq!(s.param_size("p"), Some(3));
     assert!(catch_unwind(AssertUnwindSafe(|| s.read_param("p", &mut [0.0; 3]))).is_err());
     assert!(catch_unwind(AssertUnwindSafe(|| s.read_params(&["p"]))).is_err());
@@ -304,6 +308,7 @@ fn arena_chunking_does_not_change_updates() {
         let mut s = meganeura::build(
             &graph,
             SessionConfig {
+                gpu: Some(crate::support::gpu::gpu()),
                 runtime: SessionOptions {
                     coop: CoopPolicy::Disabled,
                     arena_chunk_bytes: chunk,

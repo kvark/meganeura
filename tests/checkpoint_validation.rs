@@ -46,6 +46,7 @@ fn training_session() -> Session {
     let mut session = meganeura::build(
         &graph(),
         SessionConfig {
+            gpu: Some(crate::support::gpu::gpu()),
             runtime: SessionOptions {
                 coop: CoopPolicy::Disabled,
                 ..Default::default()
@@ -248,6 +249,7 @@ fn training_checkpoint_loads_into_inference_without_optimizer_allocation() {
     let (mut target, _) = meganeura::build(
         &graph(),
         SessionConfig {
+            gpu: Some(crate::support::gpu::gpu()),
             mode: Mode::Inference,
             runtime: SessionOptions {
                 coop: CoopPolicy::Disabled,
@@ -340,6 +342,7 @@ fn quantized_checkpoint_preserves_storage_identity_and_payload() {
             meganeura::build(
                 &graph,
                 SessionConfig {
+                    gpu: Some(crate::support::gpu::gpu()),
                     mode: Mode::Inference,
                     ..Default::default()
                 },
@@ -393,12 +396,12 @@ fn checkpoint_refreshes_derived_f16_staging_before_later_source_updates() {
         vec![("a".into(), 1), ("b".into(), 1)],
         meganeura::graph::ParamTransform::HorizontalConcat,
     ));
-    let mut source = Session::new(plan.clone());
+    let mut source = Session::with_context(plan.clone(), crate::support::gpu::gpu());
     source.set_parameter("a", &[1.0, 2.0]);
     source.set_parameter("b", &[3.0, 4.0]);
     let file = TestFile::new();
     source.save_checkpoint(&file.0).unwrap();
-    let mut target = Session::new(plan);
+    let mut target = Session::with_context(plan, crate::support::gpu::gpu());
     target.set_parameter("a", &[10.0, 20.0]);
     target.set_parameter("b", &[30.0, 40.0]);
     target.load_checkpoint(&file.0).unwrap();
@@ -432,13 +435,13 @@ fn checkpoint_refreshes_derived_packed_staging_before_later_source_updates() {
     ));
     let packed = |value| meganeura::runtime::quantize_q4_0(&[value; 32], 32, 1);
 
-    let mut source = Session::new(plan.clone());
+    let mut source = Session::with_context(plan.clone(), crate::support::gpu::gpu());
     source.set_parameter_packed("a", &packed(1.0));
     source.set_parameter_packed("b", &packed(3.0));
     let file = TestFile::new();
     source.save_checkpoint(&file.0).unwrap();
 
-    let mut target = Session::new(plan);
+    let mut target = Session::with_context(plan, crate::support::gpu::gpu());
     target.set_parameter_packed("a", &packed(10.0));
     target.set_parameter_packed("b", &packed(30.0));
     target.load_checkpoint(&file.0).unwrap();

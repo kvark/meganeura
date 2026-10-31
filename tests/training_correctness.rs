@@ -431,6 +431,7 @@ fn smollm2_kv_cache_decode_graph() {
 }
 
 #[test]
+#[ignore = "slow: full 224x224 ResNet-50 training; run with --include-ignored"]
 fn resnet50_training_loss_decreases() {
     let g = meganeura::models::resnet::build_resnet50_training(1);
     let batch = 1u32;
@@ -491,7 +492,14 @@ fn resnet50_training_loss_decreases() {
 fn whisper_encoder_training_loss_decreases() {
     use meganeura::models::whisper;
 
-    let config = whisper::Config::whisper_tiny();
+    // One narrow layer covers the same training graph as whisper_tiny.
+    let config = whisper::Config {
+        d_model: 64,
+        n_heads: 2,
+        n_layers: 1,
+        ffn_dim: 256,
+        ..whisper::Config::whisper_tiny()
+    };
     let batch = 1;
     let mel_len = 100; // short clip for testing
 
