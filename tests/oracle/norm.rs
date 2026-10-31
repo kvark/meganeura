@@ -74,13 +74,15 @@ fn random_feeds(g: &Graph, seed: u64) -> Feeds {
     feeds
 }
 
-/// The dispatches of the inference plan `options` builds for `g`.
+/// The dispatches of the inference session `options` builds for `g`.
+/// Session construction applies the RmsNorm fusions.
 fn plan(g: &Graph, options: &gpu::Options) -> Vec<(ShaderEntry, bool)> {
     let mut config = SessionConfig::from_env();
     config.mode = Mode::Inference;
     config.options = options.compile.clone();
     config.optimize = options.optimize;
     config.runtime.coop = options.coop;
+    config.gpu = Some(gpu::shared_context());
     let (session, _) = meganeura::build(g, config);
     session
         .plan()

@@ -10,10 +10,7 @@ fn optimizer_state(session: &meganeura::Session, n: usize) -> [Vec<f32>; 3] {
 
 #[test]
 fn adaptive_optimizers_preserve_tiny_variance_and_nonfinite_state() {
-    use std::sync::Arc;
-
-    let gpu =
-        Arc::new(meganeura::init_gpu_context_with(meganeura::GpuOptions::from_env()).unwrap());
+    let gpu = crate::support::gpu::gpu();
     let gradients = [
         0.0f32, 1.0, -1.0, 1e-6, -1e-6, 1e-16, -1e-16, 1e-17, -1e-17, 3e-18, -3e-18, 1e-18, -1e-18,
         1e-20, -1e-20, 1e-23,

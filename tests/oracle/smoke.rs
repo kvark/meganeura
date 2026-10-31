@@ -108,6 +108,7 @@ fn poison_reaches_unwritten_memory() {
     g.set_outputs(vec![y]);
     let mut config = meganeura::SessionConfig::from_env();
     config.mode = meganeura::Mode::Inference;
+    config.gpu = Some(meganeura::reference::gpu::shared_context());
     config.runtime.poison = true;
     let (mut session, _) = meganeura::build(&g, config);
     session.step();

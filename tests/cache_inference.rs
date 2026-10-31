@@ -90,7 +90,7 @@ fn infer_from_loaded_plan() {
         .expect("cache should hit");
 
     // Build a GPU session from the loaded plan and run inference
-    let mut session = Session::new(loaded);
+    let mut session = Session::with_context(loaded, crate::support::gpu::gpu());
 
     session.set_parameter("w1", &[0.1_f32; 8 * 5]);
     session.set_parameter("b1", &[0.01_f32; 5]);

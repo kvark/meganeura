@@ -12,12 +12,15 @@ use meganeura::reference::{Feeds, Report, Rng, gpu, gradients};
 use meganeura::{CoopPolicy, Graph, Mode, NodeId, Session, SessionConfig, SessionOptions};
 
 /// Shaders the session compiled for `graph` under `options` dispatches.
+/// This builds a session because its construction selects the
+/// cooperative convolution entries.
 fn dispatched(graph: &Graph, mode: Mode, options: &gpu::Options) -> Vec<ShaderEntry> {
     let mut config = SessionConfig::from_env();
     config.mode = mode;
     config.options = options.compile.clone();
     config.optimize = options.optimize;
     config.runtime.coop = options.coop;
+    config.gpu = Some(gpu::shared_context());
     let (session, _) = meganeura::build(graph, config);
     session
         .plan()
@@ -439,22 +442,17 @@ fn conv2d_winograd_residual() {
             g.set_outputs(if protected { vec![y, conv] } else { vec![y] });
             let mut feeds = Feeds::new();
             feeds.fill_random(&g, 1270, 0.5);
-            let mut config = SessionConfig::from_env();
-            config.mode = Mode::Inference;
-            config.optimize.no_winograd = false;
-            config.runtime.coop = CoopPolicy::Disabled;
-            let (session, _) = meganeura::build(&g, config);
-            assert_eq!(
-                session
-                    .plan()
-                    .dispatches
-                    .iter()
-                    .any(|d| d.shader == (ShaderEntry::WinogradOutputTransform { fused: true })),
-                !protected,
-            );
-            drop(session);
             let mut options = gpu::Options::default();
             options.optimize.no_winograd = false;
+            let selection = gpu::Options {
+                coop: CoopPolicy::Disabled,
+                ..options.clone()
+            };
+            assert_eq!(
+                dispatched(&g, Mode::Inference, &selection)
+                    .contains(&ShaderEntry::WinogradOutputTransform { fused: true }),
+                !protected,
+            );
             let report = gpu::check_inference(&g, &feeds, &options).unwrap();
             failures.report(
                 &format!("residual protected={protected} reversed={reversed}"),
