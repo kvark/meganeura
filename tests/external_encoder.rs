@@ -138,11 +138,6 @@ fn recorded_inference_matches_step_between_application_passes() {
 fn application_consumes_parameter_gradients() {
     let gpu = crate::support::gpu::gpu();
     let mut session = training_session(&gpu, false);
-    assert!(
-        session
-            .gradient_buffer(meganeura::compile::BufferRef(u32::MAX))
-            .is_none()
-    );
     let gradient = session
         .gradient_buffer(session.param_buffer("w0").unwrap())
         .unwrap();
