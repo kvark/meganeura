@@ -35,7 +35,14 @@ impl WorkgroupMatmulShape {
         })
     }
 
-    pub fn supports(self, caps: &blade_graphics::Capabilities, types: MatrixTypes) -> bool {
+    pub fn supports(
+        self,
+        caps: &blade_graphics::Capabilities,
+        types: MatrixTypes,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> bool {
         use blade_graphics::CooperativeMatrixOperand;
         let matrix = &caps.cooperative_matrix.workgroup;
         let operand = match types.multiply {
@@ -43,7 +50,8 @@ impl WorkgroupMatmulShape {
             DType::BF16 => CooperativeMatrixOperand::Bf16,
             _ => return false,
         };
-        types.is_valid()
+        self.fits(m, n, k)
+            && types.is_valid()
             && (!types.uses(DType::F16) || caps.shader_float16)
             && (!types.uses(DType::BF16) || caps.shader_bfloat16)
             && [self.rows, self.columns, self.k_stage]
@@ -55,7 +63,7 @@ impl WorkgroupMatmulShape {
                 self.threads,
             )
             && self
-                .shared_bytes(types)
+                .shared_bytes(types, self.ragged_rows(m))
                 .and_then(|bytes| bytes.checked_add(matrix.reserved_shared_memory))
                 .is_some_and(|bytes| bytes <= caps.max_compute_shared_memory_size)
     }
@@ -68,15 +76,21 @@ impl WorkgroupMatmulShape {
             && m != 0
             && n != 0
             && k != 0
-            && m.is_multiple_of(self.rows)
             && n.is_multiple_of(self.columns)
             && k.is_multiple_of(self.k_stage)
     }
 
-    pub fn shared_bytes(self, types: MatrixTypes) -> Option<u32> {
+    pub(crate) fn ragged_rows(self, m: u32) -> bool {
+        !m.is_multiple_of(self.rows)
+    }
+
+    pub fn shared_bytes(self, types: MatrixTypes, row_bounds: bool) -> Option<u32> {
         let mut bytes = 0u32;
-        for (storage, extent) in [(types.a, self.rows), (types.b, self.columns)] {
-            if storage != types.multiply {
+        for (storage, extent, bounded) in [
+            (types.a, self.rows, row_bounds),
+            (types.b, self.columns, false),
+        ] {
+            if storage != types.multiply || bounded {
                 bytes = bytes.checked_add(
                     extent
                         .checked_mul(self.k_stage)?
@@ -84,20 +98,20 @@ impl WorkgroupMatmulShape {
                 )?;
             }
         }
-        if types.output != DType::F32 {
+        if types.output != DType::F32 || row_bounds {
             bytes = bytes.checked_add(self.rows.checked_mul(self.columns)?.checked_mul(4)?)?;
         }
         Some(bytes)
     }
 }
 
-/// Aligned NN/AT/BT products, including addends and complete K partitions.
-/// Matching storage loads directly; only operands needing conversion stage in
-/// shared memory. Reduced outputs round once after F32 accumulation and addition.
+/// NN/AT/BT products, with optional guarded final rows. Cooperative operations
+/// stay uniform; shared A/result tiles keep ragged global accesses in bounds.
 pub fn generate_workgroup_matmul(
     group: ShaderGroup,
     shape: WorkgroupMatmulShape,
     types: MatrixTypes,
+    row_bounds: bool,
 ) -> ShaderModule {
     types.validate();
     assert!(matches!(types.multiply, DType::F16 | DType::BF16));
@@ -128,7 +142,7 @@ pub fn generate_workgroup_matmul(
             scalar.to_owned()
         };
         source += &format!("var<storage> matrix_{name}: array<{storage_name}>;\n");
-        if storage != types.multiply {
+        if storage != types.multiply || (name == "a" && row_bounds) {
             source += &format!(
                 "var<workgroup> s{name}: array<{multiply}, {}>;\n",
                 extent * k
@@ -142,7 +156,7 @@ pub fn generate_workgroup_matmul(
     if addend {
         source += "var<storage> src: array<f32>;\n";
     }
-    if types.output != DType::F32 {
+    if types.output != DType::F32 || row_bounds {
         source += &format!("var<workgroup> result: array<f32, {}>;\n", m * n);
     }
     source += &format!(
@@ -173,11 +187,28 @@ pub fn generate_workgroup_matmul(
                 multiply
             };
             source += &format!(
-                "for (var i = lid; i < {}u; i += {threads}u) {{\nlet r = i / {}u;\nlet c = (i % {}u) * 4u;\nlet v = matrix_{name}[({index}) / 4u];\n",
+                "for (var i = lid; i < {}u; i += {threads}u) {{\nlet r = i / {}u;\nlet c = (i % {}u) * 4u;\n",
                 rows * cols / 4,
                 width / 4,
                 width / 4
             );
+            if a && row_bounds {
+                let scalar = MatrixTypes::name(storage);
+                source += &format!("var v = vec4<{scalar}>(0.0);\n");
+                if transpose {
+                    // An odd M stride can straddle two vec4s. Gather valid
+                    // lanes instead of rounding the address or reading a tail.
+                    for (lane, field) in ["x", "y", "z", "w"].iter().enumerate() {
+                        source += &format!(
+                            "if (row + c + {lane}u < m) {{ v.{field} = matrix_a[((({index}) + {lane}u) / 4u)][((({index}) + {lane}u) % 4u)]; }}\n"
+                        );
+                    }
+                } else {
+                    source += &format!("if (row + r < m) {{ v = matrix_a[({index}) / 4u]; }}\n");
+                }
+            } else {
+                source += &format!("let v = matrix_{name}[({index}) / 4u];\n");
+            }
             for (lane, field) in ["x", "y", "z", "w"].iter().enumerate() {
                 let index = if transpose {
                     format!("(c + {lane}u) * {cols}u + r")
@@ -189,6 +220,17 @@ pub fn generate_workgroup_matmul(
             source += "}\nworkgroupBarrier();\n";
             source += &format!(
                 "let {name} = coopLoadT<coop_mat{cols}x{rows}<{multiply},{role},workgroup>>(&s{name}[0], {cols}u);\n"
+            );
+        } else if a && row_bounds {
+            let width = if transpose { rows } else { cols };
+            let (index, stage, axis) = if transpose {
+                ("(t + r) * m + row + c", format!("c * {cols}u + r"), "c")
+            } else {
+                ("(row + r) * k + t + c", format!("r * {cols}u + c"), "r")
+            };
+            source += &format!(
+                "for (var i = lid; i < {}u; i += {threads}u) {{\nlet r = i / {width}u;\nlet c = i % {width}u;\nvar value = {multiply}(0.0);\nif (row + {axis} < m) {{ value = matrix_a[{index}]; }}\nsa[{stage}] = value;\n}}\nworkgroupBarrier();\nlet a = coopLoadT<coop_mat{cols}x{rows}<{multiply},A,workgroup>>(&sa[0], {cols}u);\n",
+                rows * cols
             );
         } else {
             let load = if transpose { "coopLoad" } else { "coopLoadT" };
@@ -204,16 +246,32 @@ pub fn generate_workgroup_matmul(
         }
     }
     source += "acc = coopMultiplyAdd(a,b,acc);\n";
-    if types.a != types.multiply || types.b != types.multiply {
+    if row_bounds || types.a != types.multiply || types.b != types.multiply {
         source += "workgroupBarrier();\n";
     }
     source += "}\n";
-    if addend {
+    if addend && !row_bounds {
         source += &format!(
             "acc = acc + coopLoadT<coop_mat{n}x{m}<f32,C,workgroup>>(&src[row * n + col], n);\n"
         );
     }
-    if types.output == DType::F32 {
+    if row_bounds {
+        let index = format!("(group.z * m + row + i / {n}u) * n + col + i % {n}u");
+        let value = if addend {
+            format!("result[i] + src[(row + i / {n}u) * n + col + i % {n}u]")
+        } else {
+            "result[i]".to_owned()
+        };
+        let value = match types.output {
+            DType::F32 => value,
+            DType::BF16 => format!("round_bf16({value})"),
+            dtype => format!("{}({value})", MatrixTypes::name(dtype)),
+        };
+        source += &format!(
+            "coopStoreT(acc, &result[0], {n}u);\nworkgroupBarrier();\nfor (var i = lid; i < {}u; i += {threads}u) {{\nif (row + i / {n}u < m) {{ matrix_c[{index}] = {value}; }}\n}}\n",
+            m * n
+        );
+    } else if types.output == DType::F32 {
         source += "coopStoreT(acc, &matrix_c[(group.z * m + row) * n + col], n);\n";
     } else {
         let cast = if types.output == DType::BF16 {
@@ -263,39 +321,18 @@ mod tests {
                                 multiply,
                                 output,
                             };
-                            let mut module = generate_workgroup_matmul(group, shape, types);
-                            let mut binding = 0;
-                            for (_, global) in module.module.global_variables.iter_mut() {
-                                if matches!(
-                                    global.space,
-                                    naga::AddressSpace::Uniform
-                                        | naga::AddressSpace::Storage { .. }
-                                ) {
-                                    global.binding =
-                                        Some(naga::ResourceBinding { group: 0, binding });
-                                    binding += 1;
-                                }
+                            for row_bounds in [false, true] {
+                                let mut module =
+                                    generate_workgroup_matmul(group, shape, types, row_bounds);
+                                super::super::validate_shader_for_test(
+                                    &mut module.module,
+                                    capabilities,
+                                    (1, 6),
+                                )
+                                .unwrap_or_else(|error| {
+                                    panic!("{group:?} {types:?} {shape:?}: {error}")
+                                });
                             }
-                            let info = naga::valid::Validator::new(
-                                naga::valid::ValidationFlags::all(),
-                                capabilities,
-                            )
-                            .validate(&module.module)
-                            .unwrap_or_else(|error| {
-                                panic!("{group:?} {types:?} {shape:?}: {error:?}")
-                            });
-                            let words = naga::back::spv::write_vec(
-                                &module.module,
-                                &info,
-                                &naga::back::spv::Options {
-                                    lang_version: (1, 6),
-                                    flags: naga::back::spv::WriterFlags::empty(),
-                                    ..Default::default()
-                                },
-                                None,
-                            )
-                            .unwrap();
-                            assert!(!words.is_empty());
                         }
                     }
                 }

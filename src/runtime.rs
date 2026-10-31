@@ -935,6 +935,8 @@ enum Variant {
         ShaderEntry,
         crate::codegen::WorkgroupMatmulShape,
         crate::codegen::MatrixTypes,
+        /// Guard global accesses to the final, incomplete row tile.
+        bool,
     ),
     CoopTiled(
         ShaderEntry,
@@ -1050,7 +1052,7 @@ impl Variant {
             | Variant::Attention(ref e, _, _)
             | Variant::CoopTyped(ref e, _, _)
             | Variant::CoopConv(ref e, _, _)
-            | Variant::CoopWorkgroup(ref e, _, _)
+            | Variant::CoopWorkgroup(ref e, _, _, _)
             | Variant::CoopTiled(ref e, _, _, _)
             | Variant::SplitMatmul(ref e, _, _, _)
             | Variant::SpecializedConv(ref e, _, _, _)
@@ -1082,8 +1084,9 @@ impl Variant {
             Variant::WinogradMatmul(ref entry, storage, tile) => {
                 format!("{entry:?}:{storage:?}-{tile:?}")
             }
-            Variant::CoopWorkgroup(ref e, shape, types) => {
-                format!("{e:?}:workgroup-{shape:?}-{types:?}")
+            Variant::CoopWorkgroup(ref e, shape, types, row_bounds) => {
+                let suffix = if row_bounds { "-row-bounds" } else { "" };
+                format!("{e:?}:workgroup-{shape:?}-{types:?}{suffix}")
             }
             Variant::CoopTyped(ref e, types, staging) => {
                 use crate::codegen::MatrixTypes;
@@ -1728,6 +1731,7 @@ impl Pipelines {
         wgsl_dump_dir: Option<&str>,
     ) -> Self {
         validate_precision_plan(gpu, plan);
+        let capabilities = gpu.capabilities();
         let mut pipelines = Self {
             map: HashMap::new(),
             selected: Vec::new(),
@@ -1761,7 +1765,7 @@ impl Pipelines {
             .map(|dispatch| (dispatch, coop_config))
             .chain(optimizer.iter().map(|dispatch| (dispatch, None)))
         {
-            let key = Self::key(dispatch);
+            let key = Self::key(dispatch, &capabilities);
             if keys.insert(key.clone()) {
                 jobs.push((key, dispatch, coop));
             }
@@ -1779,7 +1783,7 @@ impl Pipelines {
                 });
             pipelines.map.insert(key, pipeline);
         }
-        pipelines.select(&plan.dispatches);
+        pipelines.select(&plan.dispatches, gpu);
         pipelines
     }
 
@@ -1846,7 +1850,7 @@ impl Pipelines {
         dispatch: &Dispatch,
         coop_config: Option<&crate::codegen::CoopConfig>,
     ) -> Result<(), String> {
-        let key = Self::key(dispatch);
+        let key = Self::key(dispatch, &gpu.capabilities());
         if self.map.contains_key(&key) {
             return Ok(());
         }
@@ -1932,13 +1936,14 @@ impl Pipelines {
                     gpu.capabilities().subgroup_size,
                 )
             }
-            Variant::CoopWorkgroup(_, shape, types) => {
-                if !shape.supports(&gpu.capabilities(), types)
-                    || !dispatch.mnk().is_some_and(|(m, n, k)| shape.fits(m, n, k))
+            Variant::CoopWorkgroup(_, shape, types, row_bounds) => {
+                if !dispatch
+                    .mnk()
+                    .is_some_and(|(m, n, k)| shape.supports(&gpu.capabilities(), types, m, n, k))
                 {
                     return Err("unsupported workgroup cooperative product".to_owned());
                 }
-                crate::codegen::generate_workgroup_matmul(group, shape, types)
+                crate::codegen::generate_workgroup_matmul(group, shape, types, row_bounds)
             }
             Variant::CoopTiled(_, shape, splits, _) => {
                 let config = cooperative();
@@ -2216,7 +2221,7 @@ impl Pipelines {
 
     /// Resolve one implementation. Geometry and arithmetic must not depend on
     /// which unrelated pipelines happen to have been compiled.
-    fn key(dispatch: &Dispatch) -> Variant {
+    fn key(dispatch: &Dispatch, caps: &blade_graphics::Capabilities) -> Variant {
         let entry = dispatch.shader.clone();
         match dispatch.kernel {
             crate::compile::Kernel::WinogradTransform(storage) => {
@@ -2232,13 +2237,24 @@ impl Pipelines {
                 entry,
                 shape,
                 types.unwrap_or(crate::codegen::MatrixTypes::F32_AS_F16),
+                dispatch.mnk().is_some_and(|(m, _, _)| shape.ragged_rows(m)),
             );
         }
         if let crate::compile::Kernel::CooperativeTyped { types, .. } = dispatch.kernel {
             if matches!(entry, ShaderEntry::Conv2dGemmCoopGen(..)) {
                 return Variant::CoopConv(entry, types, Conv2dParams::from(dispatch));
             }
-            return Variant::CoopTyped(entry, types, typed_matmul_layout(dispatch));
+            let mut layout = typed_matmul_layout(dispatch);
+            // The native16 stored generator does not use direct_inputs.
+            // Normalize it before any pipeline lookup, including tuning reuse.
+            if crate::codegen::checked_cooperative_shape(cooperative_shapes(
+                &caps.cooperative_matrix,
+                types.multiply,
+            )) == Some([16, 16, 16])
+            {
+                layout.direct_inputs = false;
+            }
+            return Variant::CoopTyped(entry, types, layout);
         }
         if let crate::compile::Kernel::CooperativeTiled { shape, splits } = dispatch.kernel {
             return Variant::CoopTiled(
@@ -2351,11 +2367,12 @@ impl Pipelines {
         &self.map[&Variant::Scalar(entry)].raw
     }
 
-    fn select(&mut self, dispatches: &[Dispatch]) {
+    fn select(&mut self, dispatches: &[Dispatch], gpu: &Gpu) {
+        let capabilities = gpu.capabilities();
         self.selected = dispatches
             .iter()
             .map(|dispatch| {
-                let key = Self::key(dispatch);
+                let key = Self::key(dispatch, &capabilities);
                 let pipeline = Arc::clone(
                     self.map
                         .get(&key)
@@ -5191,10 +5208,60 @@ mod parameter_sharing_tests {
 
 #[cfg(test)]
 mod variant_tests {
+    fn test_key(dispatch: &super::Dispatch) -> super::Variant {
+        super::Pipelines::key(dispatch, &blade_graphics::Capabilities::default())
+    }
+
     use super::{
         Dispatch, HorizMatMulKind, Pipelines, ShaderEntry, Variant, epilogue_pipeline_key,
         epilogue_tile, select_variants,
     };
+
+    #[test]
+    fn native16_ignores_direct_input_layout_in_pipeline_keys() {
+        let make = |m| Dispatch {
+            shader: ShaderEntry::MatMul,
+            kernel: crate::compile::Kernel::CooperativeTyped {
+                types: crate::codegen::MatrixTypes::reduced(crate::DType::F16),
+                splits: 1,
+            },
+            params: vec![m, 64, 64, 0],
+            ..Default::default()
+        };
+        let mut caps = blade_graphics::Capabilities::default();
+        caps.cooperative_matrix.f16_f32_shapes = vec![[16, 16, 16]];
+        assert_eq!(
+            Pipelines::key(&make(64), &caps),
+            Pipelines::key(&make(48), &caps)
+        );
+        caps.cooperative_matrix.f16_f32_shapes = vec![[8, 16, 16]];
+        assert_ne!(
+            Pipelines::key(&make(64), &caps),
+            Pipelines::key(&make(48), &caps)
+        );
+    }
+
+    #[test]
+    fn ragged_workgroup_rows_have_a_distinct_pipeline() {
+        let shape = crate::codegen::WorkgroupMatmulShape {
+            rows: 32,
+            columns: 64,
+            k_stage: 32,
+            threads: 64,
+        };
+        let make = |m| Dispatch {
+            shader: ShaderEntry::MatMul,
+            params: vec![m, 384, 384, 0],
+            kernel: crate::compile::Kernel::CooperativeWorkgroup {
+                shape,
+                splits: 1,
+                types: Some(crate::codegen::MatrixTypes::F32_AS_F16),
+            },
+            ..Default::default()
+        };
+        assert_ne!(test_key(&make(1500)), test_key(&make(1536)));
+        assert_eq!(test_key(&make(1500)), test_key(&make(1476)));
+    }
 
     fn relu_epilogue() -> crate::compile::MatMulEpilogue {
         crate::compile::MatMulEpilogue {
@@ -5216,7 +5283,7 @@ mod variant_tests {
             ..Default::default()
         };
         f(&mut d);
-        Pipelines::key(&d)
+        test_key(&d)
     }
 
     /// The order here is what makes a modifier win over a less specific
@@ -5318,18 +5385,14 @@ mod variant_tests {
                     params: vec![32, 32, 32, 0],
                     ..Default::default()
                 };
-                let key = Pipelines::key(&dispatch);
+                let key = test_key(&dispatch);
                 assert!(
                     keys.insert(key.clone()),
                     "different storage must not share a pipeline"
                 );
                 if let Kernel::CooperativeTyped { ref mut splits, .. } = dispatch.kernel {
                     *splits = 4;
-                    assert_eq!(
-                        Pipelines::key(&dispatch),
-                        key,
-                        "K partitions are uniform data"
-                    );
+                    assert_eq!(test_key(&dispatch), key, "K partitions are uniform data");
                 }
             }
         }
@@ -5338,7 +5401,7 @@ mod variant_tests {
     #[test]
     fn typed_pipeline_keys_distinguish_staging_and_output_layouts() {
         let key = |m, n, k| {
-            Pipelines::key(&Dispatch {
+            test_key(&Dispatch {
                 shader: ShaderEntry::MatMul,
                 kernel: crate::compile::Kernel::CooperativeTyped {
                     types: crate::codegen::MatrixTypes::BF16,
@@ -5351,8 +5414,10 @@ mod variant_tests {
         assert_eq!(key(32, 32, 32), key(64, 64, 1024));
         assert_ne!(key(32, 32, 32), key(33, 64, 32));
         assert_ne!(key(33, 64, 32), key(33, 65, 1031));
-        // Odd K is still vectorizable when the full binding is a whole vector.
-        assert_eq!(key(32, 32, 32), key(32, 32, 31));
+        // Odd K is vectorizable when the full binding is a whole vector,
+        // but needs shared staging instead of the aligned native load path.
+        assert_ne!(key(32, 32, 32), key(32, 32, 31));
+        assert_eq!(key(32, 32, 31), key(32, 32, 33));
     }
 
     /// A dispatch whose epilogue ops were folded into the matmul has no
@@ -5429,9 +5494,9 @@ mod variant_tests {
                         kernel: crate::compile::Kernel::ScalarMatmul(shape),
                         ..large.clone()
                     };
-                    assert!(matches!(Pipelines::key(&dispatch), Variant::Epilogue(..)));
+                    assert!(matches!(test_key(&dispatch), Variant::Epilogue(..)));
                     assert_eq!(epilogue_tile(&dispatch), shape.geometry());
-                    assert!(keys.insert(Pipelines::key(&dispatch)), "{shape:?}");
+                    assert!(keys.insert(test_key(&dispatch)), "{shape:?}");
                     let split = Dispatch {
                         kernel: crate::compile::Kernel::SplitMatmul { shape, splits: 4 },
                         matmul_epilogue: None,
@@ -5441,7 +5506,7 @@ mod variant_tests {
                         weight_format: crate::compile::WeightFormat::F16,
                         ..split.clone()
                     };
-                    assert_ne!(Pipelines::key(&split), Pipelines::key(&half));
+                    assert_ne!(test_key(&split), test_key(&half));
                 }
             }
         }

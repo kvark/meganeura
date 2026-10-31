@@ -70,6 +70,7 @@ fn check_candidates(strategy: TuneStrategy) {
                 (true, false, [256, 512, 256]),
                 (true, true, [128, 256, 128]),
                 (false, false, [64, 128, 1024]),
+                (false, false, [33, 64, 64]),
             ] {
                 if storage == DType::F32 && (round || dims[2] == 1024) {
                     continue;
@@ -166,8 +167,7 @@ fn check_candidates(strategy: TuneStrategy) {
                         .or_else(|| class.cooperative_f16.then_some(MatrixTypes::F32_AS_F16));
                     types.is_some_and(|types| {
                         WorkgroupMatmulShape::all().any(|shape| {
-                            shape.supports(&gpu.capabilities(), types)
-                                && shape.fits(class.m, class.n, class.k)
+                            shape.supports(&gpu.capabilities(), types, class.m, class.n, class.k)
                         })
                     })
                 });
