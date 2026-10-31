@@ -2124,8 +2124,8 @@ const CACHED_ATTENTION_PARAMS_WGSL: &str = include_str!("shaders/cached_attentio
 const GEMV_TEMPLATE: &str = include_str!("shaders/matmul_gemv.wgsl");
 
 /// Apply width and reduction slots shared by floating-point and integer-dot GEMV.
-// Dense grouped GEMV interleaves columns; shared Q8 packing keeps each
-// column's K lanes contiguous so the packing group has contiguous threads.
+/// `lane_stride` interleaves dense column groups; shared Q8 packing instead
+/// keeps each column's K lanes contiguous for its packing group.
 fn specialize_gemv(source: &str, shape: GemvShape, lane_stride: u32) -> String {
     shape.validate();
     let (reduction, subgroup_args, total) = match shape.reduction {
@@ -2416,7 +2416,10 @@ pub(crate) fn generate_module_gemv_int_dot(
     packed_dot: bool,
     norm: bool,
 ) -> ShaderModule {
-    assert!(shape.column_groups == 1 || format == WeightFormat::Q8);
+    assert!(
+        shape.column_groups == 1 || format == WeightFormat::Q8,
+        "grouped integer-dot GEMV requires Q8 weights",
+    );
     let dot_helpers = if packed_dot {
         include_str!("shaders/matmul_gemv_int_dot_packed.wgsl")
     } else {
