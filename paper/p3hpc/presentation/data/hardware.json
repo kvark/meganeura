@@ -1,0 +1,169 @@
+{
+  "driver_query_date": "2026-10-15",
+  "vulkan": {
+    "b570": {
+      "driverInfo": "Mesa 26.0.3-1ubuntu1",
+      "subgroupSize": "32",
+      "minSubgroupSize": "16",
+      "maxSubgroupSize": "32",
+      "maxComputeSharedMemorySize": "49152",
+      "shaderBFloat16DotProduct": "true",
+      "shaderBufferFloat32AtomicAdd": "true",
+      "shaderSharedFloat32AtomicAdd": "false",
+      "workgroupMemoryExplicitLayout": "true",
+      "shaderFloatControls2": "true",
+      "shaderDenormPreserveFloat16": "true",
+      "device": "Intel(R) Arc(tm) B570 Graphics (BMG G21)",
+      "features": {},
+      "properties": {}
+    },
+    "rtx5070": {
+      "driverInfo": "595.91.07",
+      "subgroupSize": "32",
+      "minSubgroupSize": "32",
+      "maxSubgroupSize": "32",
+      "maxComputeSharedMemorySize": "49152",
+      "shaderBFloat16DotProduct": "false",
+      "shaderBufferFloat32AtomicAdd": "true",
+      "shaderSharedFloat32AtomicAdd": "true",
+      "workgroupMemoryExplicitLayout": "true",
+      "shaderFloatControls2": "true",
+      "shaderDenormPreserveFloat16": "true",
+      "device": "NVIDIA GeForce RTX 5070",
+      "features": {
+        "VK_NV_cooperative_matrix2": {
+          "workgroupScope": 1,
+          "flexibleDimensions": 1,
+          "reductions": 1,
+          "conversions": 1,
+          "perElement": 1,
+          "tensorAddressing": 1,
+          "blockLoads": 1
+        },
+        "VK_NV_cooperative_vector": {
+          "cooperativeVector": 1,
+          "cooperativeVectorTraining": 1
+        },
+        "VK_EXT_shader_float8": {
+          "shaderFloat8": 1,
+          "shaderFloat8CooperativeMatrix": 1
+        }
+      },
+      "properties": {
+        "VK_NV_cooperative_matrix2": {
+          "maxWorkgroupSize": 256,
+          "maxDimension": 1024,
+          "reservedSharedMemory": 8192
+        },
+        "VK_NV_cooperative_vector": {
+          "supportedStages": 16383,
+          "trainingFloat16Accumulation": 1,
+          "trainingFloat32Accumulation": 1,
+          "maxComponents": 1024
+        }
+      }
+    }
+  },
+  "cohort": {
+    "amd-mi300": {
+      "cooperative_bf16_f32_shapes": [],
+      "cooperative_f16_tile": 16,
+      "cooperative_f32_tile": 16,
+      "gpu_device_id": 29877,
+      "gpu_device_local_budget_bytes": 205522763776,
+      "gpu_device_name": "AMD Instinct MI300X VF (RADV GFX940)",
+      "gpu_driver_info": "Mesa 26.3.0-devel (git-8c7f5fdd60)",
+      "gpu_driver_name": "radv"
+    },
+    "amd-7900xt": {
+      "cooperative_bf16_f32_shapes": [],
+      "cooperative_f16_tile": 16,
+      "cooperative_f32_tile": 0,
+      "gpu_device_id": 29772,
+      "gpu_device_local_budget_bytes": 21429952512,
+      "gpu_device_name": "AMD Radeon RX 7900 XT (RADV NAVI31)",
+      "gpu_driver_info": "Mesa 26.0.3-1ubuntu1",
+      "gpu_driver_name": "radv"
+    },
+    "apple-m3": {
+      "cooperative_bf16_f32_shapes": [
+        [
+          8,
+          8,
+          8
+        ]
+      ],
+      "cooperative_f16_tile": 8,
+      "cooperative_f32_tile": 8,
+      "gpu_device_id": 980,
+      "gpu_device_local_budget_bytes": 11453251584,
+      "gpu_device_name": "Apple M3",
+      "gpu_driver_info": "",
+      "gpu_driver_name": "Metal"
+    },
+    "nvidia-5070": {
+      "cooperative_bf16_f32_shapes": [
+        [
+          16,
+          16,
+          16
+        ]
+      ],
+      "cooperative_f16_tile": 16,
+      "cooperative_f32_tile": 0,
+      "gpu_device_id": 12036,
+      "gpu_device_local_budget_bytes": 12129599488,
+      "gpu_device_name": "NVIDIA GeForce RTX 5070",
+      "gpu_driver_info": "595.91.07",
+      "gpu_driver_name": "NVIDIA"
+    },
+    "nvidia-h100": {
+      "cooperative_bf16_f32_shapes": [
+        [
+          16,
+          16,
+          16
+        ]
+      ],
+      "cooperative_f16_tile": 16,
+      "cooperative_f32_tile": 0,
+      "gpu_device_id": 9008,
+      "gpu_device_local_budget_bytes": 84839694336,
+      "gpu_device_name": "NVIDIA H100 80GB HBM3",
+      "gpu_driver_info": "595.91.07",
+      "gpu_driver_name": "NVIDIA"
+    },
+    "intel-b570": {
+      "cooperative_bf16_f32_shapes": [
+        [
+          8,
+          16,
+          16
+        ]
+      ],
+      "cooperative_f16_tile": 0,
+      "cooperative_f32_tile": 0,
+      "gpu_device_id": 57868,
+      "gpu_device_local_budget_bytes": 9816768512,
+      "gpu_device_name": "Intel(R) Arc(tm) B570 Graphics (BMG G21)",
+      "gpu_driver_info": "Mesa 26.0.3-1ubuntu1",
+      "gpu_driver_name": "Intel open-source Mesa driver"
+    }
+  },
+  "vendor_query_date": "2026-10-19",
+  "cuda_rtx5070": {
+    "shared_memory_bytes": 49152,
+    "shared_memory_optin_bytes": 101376,
+    "threads_per_block": 1024
+  },
+  "level_zero_b570": {
+    "shared_memory_bytes": 131072,
+    "threads_per_workgroup": 1024,
+    "driver": "1.14.37020"
+  },
+  "native_runner": {
+    "bytes": 20072584,
+    "sha256": "b8d25fac4992dd3cace578a81ec54e60bd543cb4ae1cec8b964ba9dff0fc258e",
+    "inferena": "add19182e5479e3f7549894c524ac6691d3dc363"
+  }
+}

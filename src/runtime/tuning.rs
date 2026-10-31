@@ -18,6 +18,8 @@ mod race;
 /// Vulkan backend (4845d65). Reserve it on every backend, conservatively, until
 /// Blade exposes encoder allocation sizes. Pipelines and opaque driver command
 /// and descriptor allocations are outside this buffer budget.
+/// `TuneOptions::max_scratch_bytes` limits buffers only; these allowances
+/// come on top and are checked against device headroom.
 pub(super) const ENCODER_SCRATCH_BYTES: usize = 1 << 20;
 
 /// Qualified private-scratch kernel comparisons, resumable by later tuning.
@@ -886,12 +888,7 @@ impl Session {
                         )
                     })
                     .collect();
-                class.input_b_copies = race::weight_copies(
-                    class,
-                    options,
-                    weights.len(),
-                    self.gpu_timing && capabilities.timing,
-                );
+                class.input_b_copies = race::weight_copies(class, options, weights.len());
             }
         }
         (classes, excluded_dispatches + left_out)
@@ -1410,14 +1407,10 @@ impl Session {
                 sequence.push(sum);
             }
         }
-        let Some(bytes) = scratch_bytes(&sizes) else {
+        let Some(bytes) = limited_scratch_bytes(&sizes, 0, options.max_scratch_bytes) else {
             outcome.decision = TuneDecision::ScratchLimit;
             return;
         };
-        if bytes > options.max_scratch_bytes {
-            outcome.decision = TuneDecision::ScratchLimit;
-            return;
-        }
         drop(checks);
         {
             let _timer = PhaseTimer::new(&mut prep.staging);
@@ -1816,11 +1809,27 @@ fn weight_reference_dot(
     value
 }
 
+/// Bindings plus the staging buffer for the largest of them: the bytes that
+/// `max_scratch_bytes` limits.
+fn buffer_bytes(sizes: &[usize]) -> Option<usize> {
+    sizes
+        .iter()
+        .try_fold(*sizes.iter().max()?, |sum, size| sum.checked_add(*size))
+}
+
+/// Buffers plus the shared encoder's allowance, which device headroom bounds.
 fn scratch_bytes(sizes: &[usize]) -> Option<usize> {
-    sizes.iter().try_fold(
-        sizes.iter().max()?.checked_add(ENCODER_SCRATCH_BYTES)?,
-        |sum, size| sum.checked_add(*size),
-    )
+    buffer_bytes(sizes)?.checked_add(ENCODER_SCRATCH_BYTES)
+}
+
+/// Scratch for `sizes` plus `extra` buffer bytes, if those buffers fit
+/// `limit`. Encoder allowances are fixed per encoder and sit outside the
+/// limit, so a class whose buffers fit is not rejected for them.
+fn limited_scratch_bytes(sizes: &[usize], extra: usize, limit: usize) -> Option<usize> {
+    if buffer_bytes(sizes)?.checked_add(extra)? > limit {
+        return None;
+    }
+    scratch_bytes(sizes)?.checked_add(extra)
 }
 
 fn reuse_staging(policy: TuneStagingReuse, retained: usize, requested: usize) -> bool {

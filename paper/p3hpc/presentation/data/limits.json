@@ -1,0 +1,68 @@
+{
+  "description": "Shared memory per workgroup through each GPU's vendor compute API and through Vulkan or Metal, in bytes, with the source of each value. Feeds the 'Same GPU, different limits' slide.",
+  "rows": [
+    {
+      "gpu": "RTX 5070",
+      "vendor_api": "CUDA (opt-in)",
+      "vendor_bytes": 101376,
+      "vendor_source": "queried October 19 (data/hardware.json, cuda_rtx5070.shared_memory_optin_bytes)",
+      "graphics_api": "Vulkan",
+      "graphics_bytes": 49152,
+      "graphics_source": "queried October 15 (data/hardware.json, vulkan.rtx5070.maxComputeSharedMemorySize)"
+    },
+    {
+      "gpu": "RTX 3050",
+      "vendor_api": "CUDA (opt-in)",
+      "vendor_bytes": 101376,
+      "vendor_source": "documented for compute capability 8.6: https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#features-and-technical-specifications",
+      "graphics_api": "Vulkan",
+      "graphics_bytes": 49152,
+      "graphics_source": "same NVIDIA Vulkan limit as the queried RTX 5070; not queried on this host"
+    },
+    {
+      "gpu": "H100",
+      "vendor_api": "CUDA (opt-in)",
+      "vendor_bytes": 232448,
+      "vendor_source": "documented 227 KB per thread block: https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html",
+      "graphics_api": "Vulkan",
+      "graphics_bytes": 49152,
+      "graphics_source": "same NVIDIA Vulkan limit as the queried RTX 5070; not queried on this host"
+    },
+    {
+      "gpu": "Arc B570",
+      "vendor_api": "Level Zero",
+      "vendor_bytes": 131072,
+      "vendor_source": "queried October 19 (data/hardware.json, level_zero_b570.shared_memory_bytes)",
+      "graphics_api": "Vulkan",
+      "graphics_bytes": 49152,
+      "graphics_source": "queried October 15 (data/hardware.json, vulkan.b570.maxComputeSharedMemorySize)"
+    },
+    {
+      "gpu": "RX 7900 XT",
+      "vendor_api": "HIP",
+      "vendor_bytes": 65536,
+      "vendor_source": "documented: RDNA has 128 KB of LDS per WGP and one workgroup can use up to 64 KB, https://gpuopen.com/download/RDNA_Architecture_public.pdf",
+      "graphics_api": "Vulkan",
+      "graphics_bytes": 65536,
+      "graphics_source": "RADV NAVI31 report https://vulkan.gpuinfo.org/displayreport.php?id=40820 (RX 7900 XTX); not queried on this host"
+    },
+    {
+      "gpu": "MI300X",
+      "vendor_api": "HIP",
+      "vendor_bytes": 65536,
+      "vendor_source": "documented 64 KiB LDS for gfx942: https://rocm.docs.amd.com/en/docs-7.0.0/reference/gpu-arch-specs.html",
+      "graphics_api": "Vulkan",
+      "graphics_bytes": 65536,
+      "graphics_source": "RADV's limit on other AMD GPUs; cannot exceed the 64 KiB LDS; not queried on this host"
+    },
+    {
+      "gpu": "Apple M3",
+      "vendor_api": "Metal (MPS)",
+      "vendor_bytes": 32768,
+      "vendor_source": "PyTorch's MPS backend runs on Metal; documented 32 KB threadgroup memory: https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf",
+      "graphics_api": "Metal",
+      "graphics_bytes": 32768,
+      "graphics_source": "same API as PyTorch"
+    }
+  ]
+}

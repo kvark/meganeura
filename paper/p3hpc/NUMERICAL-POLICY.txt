@@ -1,0 +1,88 @@
+The paper and the presentation incorporate this policy.
+This file remains a detailed protocol reference; see main.tex for publication prose.
+
+Numerical-policy disclosure for the October 19 P3HPC cohort update
+
+Evidence: Inferena add19182, Meganeura c19cb1c, paired campaign v33;
+artifact/final_cohort.py replays the audit. No gates or measurements changed.
+
+The paper states that the gates are part of the optimization objective.
+Wider bounds could admit faster kernels, tiles, reduction orders or arithmetic
+in either engine. We did not measure a tolerance sweep or an accuracy/performance
+frontier. Existing rejection receipts cannot establish the speed of a search
+under different gates, and observed qualified speedups are not independent of
+the selected numerical policy.
+
+The methods distinguish these layers:
+
+1. Independent arithmetic fidelity.
+   Meganeura checks candidates against an original-graph, untuned strict-f32
+   native reference, prepared before precision conversion. For accelerated
+   non-LM-inference outputs, both maximum and RMS errors must be <= 1e-6 +
+   0.02 times the corresponding reference scale. Complete training gradients
+   use 0.01, with strict checks using 1e-4. Accelerated LM inference instead
+   uses the distribution gate: mean KL <= log(1.01), maximum token KL <=
+   log(1.10), and mean loss error <= 1e-6 + 0.02 * abs(reference loss).
+   PyTorch checks its accelerated forward outputs against eager strict-f32
+   with the same non-LM bound and LM distribution gate. Sharing these constants
+   does not make all qualification procedures identical.
+
+2. Repeatability of an execution path.
+   Both engines use 1e-6 + 1e-4 * reference scale for full-output maximum and
+   RMS repeatability. Accelerated complete-gradient repeatability uses 0.01;
+   strict gradients also have per-parameter checks. PyTorch verifies two
+   uncaptured repeats (eight for accelerated training), then two graph replays
+   where capture is requested. Meganeura checks candidates during search and
+   runs two final selected-program qualification executions. These are different
+   sample counts and execution mechanisms, even where numerical bounds match.
+
+3. Accelerated training fidelity is not assessed identically.
+   PyTorch has an additional trajectory gate against eager f32: 256 matched
+   SGD updates on varying real-text batches for all three SmolLM2 sizes, with
+   fixed probe/held-out checkpoints, or 32 repeated synthetic updates for the
+   other workloads. Per-loss bounds are 2% + 1e-6; complete updates and finite
+   values are required. Meganeura's cohort gate instead checks the complete
+   single-step gradients against its F32 reference. It does not run that same
+   256-step trajectory for each selected program. Neither test is a substitute
+   for the other. A passing native gradient gate and failing PyTorch trajectory
+   do not establish a ranking of training quality or learning convergence.
+
+4. Cross-engine implementation check.
+   The accelerated outer comparison uses the two preserved original F32
+   snapshots, not reduced-precision PyTorch as native gradient ground truth.
+   It uses sampled outputs/scalar loss and parameter/total gradient norms;
+   this layer must not be described as a full elementwise comparison between
+   the two timed accelerated candidates. Each candidate's independent gates
+   supply the additional arithmetic evidence.
+
+5. Candidate selection differs.
+   Meganeura searches qualified programs and can retain an F32 baseline when
+   faster reduced-precision candidates fail. PyTorch's arithmetic recipe is
+   predetermined by model/backend policy; it does not search dtypes or change
+   dtype after numerical failure. This difference can affect both coverage and
+   timing. The comparison is of these recorded preparation policies, not equal
+   optimization effort or the fastest attainable qualified PyTorch recipe.
+
+Interpretation of the final cohort:
+- 20 measured phase groups lack a fully qualified PyTorch comparison because
+  of a numerical gate failure or a later phase not being attempted. They are
+  contract rejections/coverage gaps, not demonstrated vendor bugs or native wins.
+- In accelerated 360M on RTX 5070, PyTorch's real-text training gate fails in
+  two of three runs. Native single-step gradients pass. State the different
+  tests explicitly if discussing this example.
+- H100/MI300X accelerated 1.7B misses the worst-token KL bound while mean KL
+  passes. This is a useful concrete example of criterion-dependent eligibility.
+- The B570 360M XPU command-graph event-wait exception is a separate execution
+  failure. It should not be pooled with numerical rejections. The incomplete
+  native run lacks an independent comparison and is not a qualified speedup.
+- Keep all available-comparison denominators visible and preserve all repeats.
+  No retroactive threshold relaxation, favorable dtype substitution or old-run
+  replacement is part of the final cohort.
+
+Implementation references (Inferena add19182):
+  frameworks/meganeura/src/qualification.rs
+  frameworks/meganeura/src/main.rs
+  frameworks/pytorch/execution.py
+  frameworks/pytorch/amp.py
+  scripts/precision.py, scripts/quality.py, scripts/training_gate.py
+  harness/src/main.rs, scripts/p3hpc.py

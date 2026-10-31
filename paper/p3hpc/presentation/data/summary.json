@@ -1,0 +1,149 @@
+{
+  "accelerated": {
+    "inference": {
+      "median": 2.055423520195436,
+      "nominal_wins": 4,
+      "pairs": 32
+    },
+    "latency": {
+      "median": 1.49321515502387,
+      "nominal_wins": 13,
+      "pairs": 32
+    },
+    "training": {
+      "median": 2.209440302268394,
+      "nominal_wins": 4,
+      "pairs": 32
+    }
+  },
+  "accelerated_selection": {
+    "amd-7900xt": {
+      "bf16_sessions": 0,
+      "cooperative_sessions": 22,
+      "selected_reused_workgroup_sessions": 0,
+      "sessions": 42
+    },
+    "amd-mi300": {
+      "bf16_sessions": 0,
+      "cooperative_sessions": 30,
+      "selected_reused_workgroup_sessions": 0,
+      "sessions": 42
+    },
+    "apple-m3": {
+      "bf16_sessions": 0,
+      "cooperative_sessions": 30,
+      "selected_reused_workgroup_sessions": 0,
+      "sessions": 42
+    },
+    "intel-b570": {
+      "bf16_sessions": 0,
+      "cooperative_sessions": 0,
+      "selected_reused_workgroup_sessions": 0,
+      "sessions": 42
+    },
+    "nvidia-3050": {
+      "bf16_sessions": 3,
+      "cooperative_sessions": 24,
+      "selected_reused_workgroup_sessions": 6,
+      "sessions": 42
+    },
+    "nvidia-5070": {
+      "bf16_sessions": 3,
+      "cooperative_sessions": 24,
+      "selected_reused_workgroup_sessions": 6,
+      "sessions": 42
+    },
+    "nvidia-h100": {
+      "bf16_sessions": 0,
+      "cooperative_sessions": 21,
+      "selected_reused_workgroup_sessions": 6,
+      "sessions": 42
+    }
+  },
+  "cache_states": {
+    "cold-first-session": 123,
+    "warm-decisions": 164
+  },
+  "cells": {
+    "core_native": 330,
+    "measured_native": 246,
+    "paired": 226
+  },
+  "elapsed_device_hours": 15.163470156115713,
+  "inferena": "add19182e5479e3f7549894c524ac6691d3dc363",
+  "meganeura": "c19cb1caedd90be7abc61de61f6197018711398e",
+  "portability_means": [
+    0.6234769042329807,
+    0.8736674895198822,
+    0.726182335495693,
+    0.3877213650148047,
+    0.5704817914775415,
+    0.5440487460055368
+  ],
+  "receipt_checks": {
+    "android_full_tensor_receipts": 10,
+    "native_receipts": 277,
+    "paired_phase_receipts": 769
+  },
+  "search": {
+    "minutes": 212.21438186978332,
+    "numerical_rejections": 13,
+    "scratch_limits": 34,
+    "sessions": 588,
+    "trials": 23669
+  },
+  "spread": {
+    "amd-7900xt": {
+      "above_10_percent": 2,
+      "groups": 58,
+      "median_percent": 0.5469773995046572
+    },
+    "amd-mi300": {
+      "above_10_percent": 0,
+      "groups": 52,
+      "median_percent": 2.125390169694877
+    },
+    "apple-m3": {
+      "above_10_percent": 59,
+      "groups": 60,
+      "median_percent": 33.83837685928256
+    },
+    "intel-b570": {
+      "above_10_percent": 7,
+      "groups": 60,
+      "median_percent": 0.3903589636922089
+    },
+    "nvidia-3050": {
+      "above_10_percent": 0,
+      "groups": 60,
+      "median_percent": 0.47912881897310855
+    },
+    "nvidia-5070": {
+      "above_10_percent": 0,
+      "groups": 60,
+      "median_percent": 0.693057303975317
+    },
+    "nvidia-h100": {
+      "above_10_percent": 1,
+      "groups": 57,
+      "median_percent": 0.5071352864592827
+    }
+  },
+  "strict": {
+    "inference": {
+      "median": 1.349838106114818,
+      "nominal_wins": 10,
+      "pairs": 35
+    },
+    "latency": {
+      "median": 1.0285091681704255,
+      "nominal_wins": 15,
+      "pairs": 33
+    },
+    "training": {
+      "median": 1.610695856731302,
+      "nominal_wins": 4,
+      "pairs": 33
+    }
+  }
+}
