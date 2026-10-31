@@ -865,17 +865,22 @@ impl Implementations {
         }) {
             return;
         }
-        self.order.priority_attention = Some(self.choices.len());
+        // Cover ordinary arithmetic before attention products, then compare
+        // products on its winner and on each early arithmetic alternative.
+        let priorities = self.order.priority_choices.clone();
         let ordinary = self.choices.clone();
-        self.choices.extend(
-            ordinary
-                .into_iter()
-                .filter(|choice| choice.attention.1.is_none())
-                .map(|choice| AxisChoice {
-                    forward_products: true,
-                    ..choice
-                }),
-        );
+        for (index, choice) in ordinary.into_iter().enumerate() {
+            if choice.attention.1.is_some() {
+                continue;
+            }
+            if index == 0 || priorities.contains(&index) {
+                self.order.priority_choices.push_back(self.choices.len());
+            }
+            self.choices.push(AxisChoice {
+                forward_products: true,
+                ..choice
+            });
+        }
         self.order.choices = self.choices.len();
         self.order.choice_order = (0..self.choices.len()).collect();
     }
@@ -1292,14 +1297,40 @@ impl measure::Frontier for Implementations {
                 .form_order
                 .sort_by_key(|&index| (self.seeds[index].backward_rank != backward_rank, index));
             let active = self.choices[incumbent.1];
-            // Carry the winning attention choice into arithmetic trials.
+            // Carry winning attention into arithmetic trials. The products-only
+            // trial instead keeps the arithmetic winner; explicit combined
+            // trials still compare each arithmetic alternative with products.
+            // Qualification can queue private-storage alternatives later.
+            // Keep that arithmetic coverage ahead of the products family too.
+            self.order
+                .priority_choices
+                .make_contiguous()
+                .sort_by_key(|&index| self.choices[index].forward_products);
+            let arithmetic_pending = self.order.priority_choices.iter().any(|&index| {
+                let entry = (incumbent.0, index);
+                !self.choices[index].forward_products
+                    && !self.order.tried.contains(&entry)
+                    && !self.order.deferred.contains(&entry)
+            });
             for index in &mut self.order.priority_choices {
                 let arithmetic = self.choices[*index];
                 let derivative_trial = arithmetic.gradient_inputs.is_some()
                     && arithmetic.gradient_inputs != active.gradient_inputs;
-                let base = if derivative_trial { active } else { arithmetic };
+                let products_only = arithmetic.forward_products
+                    && arithmetic.matrix_inputs.is_none()
+                    && arithmetic.winograd.is_none();
+                // Do not bind this trial to an interim arithmetic winner.
+                if products_only && arithmetic_pending {
+                    continue;
+                }
+                let base = if derivative_trial || products_only {
+                    active
+                } else {
+                    arithmetic
+                };
                 let neighbor = AxisChoice {
                     gradient_inputs: arithmetic.gradient_inputs.or(active.gradient_inputs),
+                    forward_products: arithmetic.forward_products || active.forward_products,
                     attention: active.attention,
                     fuse_dispatches: active.fuse_dispatches,
                     f16_attention: active.f16_attention,
@@ -1317,7 +1348,9 @@ impl measure::Frontier for Implementations {
                 .iter()
                 .filter_map(|&index| {
                     let trial = self.choices[index];
-                    if trial.matrix_inputs.is_some() == trial.winograd.is_some() {
+                    if trial.forward_products != active.forward_products
+                        || trial.matrix_inputs.is_some() == trial.winograd.is_some()
+                    {
                         return None;
                     }
                     let choice = AxisChoice {
@@ -1739,10 +1772,13 @@ mod tests {
     }
 
     #[test]
-    fn attention_products_keep_fallback_and_explicit_pins() {
+    fn attention_products_follow_arithmetic_and_keep_explicit_pins() {
         use measure::Frontier as _;
         let mut graph = Graph::new();
         let q = graph.input("q", &[33, 144]);
+        let weights = graph.parameter("weights", &[144, 144]);
+        let q = graph.matmul(q, weights);
+        let q = graph.matmul(q, weights);
         let k = graph.input("k", &[19, 48]);
         let v = graph.input("v", &[19, 48]);
         let y = graph.multi_head_attn(q, k, v, 3, 1, 48, true);
@@ -1751,9 +1787,22 @@ mod tests {
             f16_attention_rows: 8,
             ..Default::default()
         };
-        let mut frontier = graph_frontier(graph);
-        frontier.caps = caps;
-        frontier.enable_forward_products(32);
+        let make_frontier = |shape| {
+            let mut frontier = graph_frontier(graph.deep_clone());
+            frontier.caps = caps;
+            frontier.allow_matrix_storage = true;
+            let mut matrix_caps = blade_graphics::Capabilities {
+                shader_float16: true,
+                shader_bfloat16: true,
+                ..Default::default()
+            };
+            matrix_caps.cooperative_matrix.f16_f32_shapes.push(shape);
+            matrix_caps.cooperative_matrix.bf16_f32_shapes.push(shape);
+            frontier.enable_matrix_inputs(&[crate::DType::F16, crate::DType::BF16], &matrix_caps);
+            frontier.enable_forward_products(32);
+            frontier
+        };
+        let mut frontier = make_frontier([16, 16, 16]);
         let baseline = frontier.next(None).unwrap();
         assert!(
             baseline
@@ -1762,7 +1811,22 @@ mod tests {
                 .iter()
                 .all(|d| d.shader != compile::ShaderEntry::FlashAttentionProducts)
         );
-        let candidate = frontier.next(baseline.origin).unwrap();
+        let arithmetic = frontier.next(baseline.origin).unwrap();
+        assert!(arithmetic.description.contains("matrix_inputs=F16"));
+        assert!(!arithmetic.description.contains("forward_products=true"));
+        frontier.observe(arithmetic.origin.unwrap(), true);
+        let other = frontier.next(arithmetic.origin).unwrap();
+        assert!(other.description.contains("matrix_inputs=BF16"));
+        assert!(!other.description.contains("forward_products=true"));
+        frontier.observe(other.origin.unwrap(), true);
+        let stored_f16 = frontier.next(other.origin).unwrap();
+        assert!(stored_f16.description.contains("matrix_storage=F16"));
+        let stored_bf16 = frontier.next(other.origin).unwrap();
+        assert!(stored_bf16.description.contains("matrix_storage=BF16"));
+        // The final arithmetic/storage winner must carry into products.
+        let candidate = frontier.next(stored_bf16.origin).unwrap();
+        assert!(candidate.description.contains("matrix_storage=BF16"));
+        assert!(candidate.description.contains("matrix_inputs=BF16"));
         assert!(
             candidate
                 .plan
@@ -1772,6 +1836,9 @@ mod tests {
                     && d.workgroups == [3, 3, 1]
                     && d.label.starts_with("FlashAttentionProducts"))
         );
+        let combined = frontier.next(candidate.origin).unwrap();
+        assert!(combined.description.contains("matrix_inputs=F16"));
+        assert!(combined.description.contains("forward_products=true"));
         let mut pinned = baseline.plan;
         for d in &mut pinned.dispatches {
             d.requires_full_precision = true;
@@ -1782,6 +1849,17 @@ mod tests {
                 33, width, 3, caps, 65536, 32
             ));
         }
+        // Intel can defer BF16 after an F16 pass. A deferred ordinary entry
+        // must not send the products-only trial back to unreduced arithmetic.
+        let mut deferred = make_frontier([8, 16, 16]);
+        let baseline = deferred.next(None).unwrap();
+        let arithmetic = deferred.next(baseline.origin).unwrap();
+        deferred.observe(arithmetic.origin.unwrap(), true);
+        let stored = deferred.next(arithmetic.origin).unwrap();
+        assert!(stored.description.contains("matrix_storage=F16"));
+        let candidate = deferred.next(stored.origin).unwrap();
+        assert!(candidate.description.contains("matrix_inputs=F16"));
+        assert!(candidate.description.contains("forward_products=true"));
     }
 
     #[test]
