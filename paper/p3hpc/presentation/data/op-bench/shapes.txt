@@ -1,0 +1,20 @@
+# kind name dims...   gemm: M K N   conv: Cin H W Cout k stride pad (batch 1)
+gemm square-1024 1024 1024 1024
+gemm square-2048 2048 2048 2048
+gemm square-4096 4096 4096 4096
+gemm unet-ff-up 64 256 1024
+gemm unet-ff-down 64 1024 256
+gemm unet-ctx-kv 77 768 256
+gemm unet-proj-16 256 128 128
+gemm whisper-ff-up 1500 384 1536
+gemm whisper-ff-down 1500 1536 384
+gemm whisper-qkv 1500 384 1152
+gemm llm-ff-up 512 576 1536
+conv unet-3x3-64@32 64 32 32 64 3 1 1
+conv unet-3x3-128@16 128 16 16 128 3 1 1
+conv unet-3x3-256@8 256 8 8 256 3 1 1
+conv unet-stem-4@32 4 32 32 64 3 1 1
+conv resnet-3x3-64@56 64 56 56 64 3 1 1
+conv resnet-1x1-256@56 256 56 56 64 1 1 0
+conv resnet-3x3-512@7 512 7 7 512 3 1 1
+conv resnet-stem-7x7 3 224 224 64 7 2 3
