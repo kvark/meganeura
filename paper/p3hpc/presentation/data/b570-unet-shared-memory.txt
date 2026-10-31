@@ -1,0 +1,103 @@
+# SD U-Net-small inference, strict f32 program (scalar kernels; the B570 has no f32 matrix tiles), Arc B570 (device 57868), October 30, 2026.
+# Meganeura 99e3de2, scratch driver building sd_unet::Config::small() with SessionConfig::inference_from_env(), MEGANEURA_TUNE=1.
+# Workgroup (shared) memory per generated shader, from MEGANEURA_DUMP_WGSL; includes every candidate the tile search compiled. Vulkan limit: 48 KiB.
+  16.4 KiB  9 shaders
+  11.0 KiB  1 shaders
+   8.3 KiB  9 shaders
+   8.2 KiB  8 shaders
+   8.0 KiB  1 shaders
+   4.3 KiB  4 shaders
+   4.2 KiB  13 shaders
+   2.2 KiB  4 shaders
+   2.1 KiB  10 shaders
+   2.0 KiB  1 shaders
+   1.1 KiB  2 shaders
+   1.0 KiB  1 shaders
+   0.0 KiB  17 shaders
+## Selected matrix and convolution kernels (count, shader, workgroups, kernel)
+      8 Conv2dGemm16 wg=[4, 16, 1] kernel=SpecializedConv { k_tile: 16, interleave_columns: false }
+      6 WinogradBatchedMatMul wg=[1, 4, 16] kernel=Default
+      6 MatMul wg=[8, 2, 1] kernel=SmallTile
+      6 FusedMatMulAdd wg=[8, 2, 1] kernel=SmallTile
+      6 Conv2dGemm16 wg=[16, 8, 1] kernel=SpecializedConv { k_tile: 16, interleave_columns: false }
+      5 MatMulGemv wg=[64, 1, 1] kernel=Gemv { shape: GemvShape { threads: 256, reduction: Tree, bt_rows: 1, column_groups: 1 }, integer_dot: false }
+      4 WinogradBatchedMatMul wg=[4, 1, 16] kernel=Default
+      4 WinogradBatchedMatMul wg=[1, 2, 16] kernel=Default
+      4 MatMul wg=[4, 8, 1] kernel=SmallTile
+      4 FusedMatMulAdd wg=[4, 8, 1] kernel=SmallTile
+      3 MatMul wg=[8, 2, 3] kernel=SmallTile
+      3 MatMul wg=[32, 2, 1] kernel=ScalarMatmul(ScalarMatmulShape { tile_size: 32, tile_n: 0, k_stage: 32, interleave_columns: false, unroll_k: false })
+      3 MatMul wg=[2, 8, 1] kernel=SmallTile
+      2 MatMulGemv wg=[32, 1, 1] kernel=Gemv { shape: GemvShape { threads: 256, reduction: Tree, bt_rows: 1, column_groups: 1 }, integer_dot: false }
+      2 MatMulGemv wg=[16, 1, 1] kernel=Gemv { shape: GemvShape { threads: 256, reduction: Tree, bt_rows: 1, column_groups: 1 }, integer_dot: false }
+      2 MatMul wg=[8, 4, 1] kernel=SmallTile
+      2 MatMul wg=[8, 3, 3] kernel=SmallTile
+      2 MatMul wg=[4, 8, 3] kernel=SmallTile
+      2 MatMul wg=[16, 8, 1] kernel=ScalarMatmul(ScalarMatmulShape { tile_size: 32, tile_n: 0, k_stage: 16, interleave_columns: false, unroll_k: false })
+      2 MatMul wg=[16, 1, 1] kernel=Default
+      2 Conv2dGemmSmall wg=[32, 2, 1] kernel=SpecializedConv { k_tile: 16, interleave_columns: false }
+      1 MatMul wg=[4, 3, 3] kernel=SmallTile
+      1 MatMul wg=[4, 3, 1] kernel=SmallTile
+      1 Conv2dGemm16 wg=[64, 1, 1] kernel=SpecializedConv { k_tile: 16, interleave_columns: false }
+      1 Conv2dGemm16 wg=[4, 8, 1] kernel=SpecializedConv { k_tile: 16, interleave_columns: false }
+      1 Conv2dGemm16 wg=[16, 4, 1] kernel=SpecializedConv { k_tile: 16, interleave_columns: false }
+## Unprofiled step, 200 samples after 3 s warmup
+median_ms=4.030 p10=3.995 p90=4.063
+## Per-pass GPU timings (profiling adds overhead and locates work only)
+--- GPU pass timings (234 passes, 4.64ms total) ---
+       Conv2dGemm16[1]:  17x     0.39ms (  8.5%)
+  MatMul[77x256x768]x3:   2x     0.34ms (  7.3%)
+  WinogradBatchedMatMul[256]:   6x     0.33ms (  7.0%)
+   FlashAttention[256]:   4x     0.28ms (  6.0%)
+   MatMul[64x256x1024]:   3x     0.26ms (  5.6%)
+  MatMul[64x256x256]x3:   3x     0.18ms (  4.0%)
+  MatMul[77x128x768]x3:   1x     0.16ms (  3.5%)
+  FusedMatMulAdd[64x256x256]:   6x     0.16ms (  3.5%)
+  MultiHeadAttn[q=64,kv=77,h=8/8]:   3x     0.15ms (  3.3%)
+  WinogradWeightTransform[256]:   6x     0.15ms (  3.2%)
+  WinogradBatchedMatMul[128]:   4x     0.14ms (  3.1%)
+  WinogradInputTransform[1]:  14x     0.12ms (  2.6%)
+  WinogradOutputTransform[1]:  14x     0.11ms (  2.3%)
+  MatMul[256x128x128]x3:   2x     0.10ms (  2.1%)
+  WinogradBatchedMatMul[64]:   4x     0.10ms (  2.1%)
+   MatMul[256x128x512]:   2x     0.10ms (  2.1%)
+      GroupNormSilu[1]:   9x     0.09ms (  2.0%)
+   MatMul[64x1024x256]:   3x     0.09ms (  1.9%)
+  MultiHeadAttn[q=64,kv=64,h=8/8]:   3x     0.09ms (  1.9%)
+          Add[16384x0]:  12x     0.08ms (  1.8%)
+         LayerNorm[64]:   9x     0.08ms (  1.7%)
+    MatMul[64x256x256]:   3x     0.08ms (  1.7%)
+  FusedMatMulAdd[256x128x128]:   4x     0.07ms (  1.5%)
+     GroupNormApply[1]:   6x     0.06ms (  1.4%)
+    MatMul[77x128x768]:   1x     0.06ms (  1.3%)
+     GroupNormStats[1]:   6x     0.06ms (  1.3%)
+          Add[32768x0]:   8x     0.06ms (  1.2%)
+  WinogradWeightTransform[128]:   4x     0.05ms (  1.2%)
+          GroupNorm[1]:   5x     0.05ms (  1.1%)
+        LayerNorm[256]:   6x     0.05ms (  1.1%)
+   MatMul[256x512x128]:   2x     0.05ms (  1.0%)
+  MatMulGemv[1x256x256]:   4x     0.04ms (  0.9%)
+    Conv2dGemmSmall[1]:   2x     0.04ms (  0.8%)
+   MatMul[256x128x128]:   2x     0.03ms (  0.7%)
+  WinogradWeightTransform[64]:   4x     0.03ms (  0.7%)
+        Transpose[256]:   5x     0.03ms (  0.7%)
+          Add[65536x0]:   4x     0.03ms (  0.6%)
+             Concat[1]:   3x     0.03ms (  0.6%)
+        BiasAdd[256x0]:   4x     0.03ms (  0.6%)
+      MatMul[256x64x1]:   3x     0.02ms (  0.5%)
+      BiasAdd[65536x0]:   3x     0.02ms (  0.5%)
+     MatMul[64x1024x1]:   2x     0.02ms (  0.5%)
+          Mul[65536x0]:   3x     0.02ms (  0.5%)
+         Transpose[64]:   3x     0.02ms (  0.4%)
+  MatMulGemv[1x64x256]:   2x     0.02ms (  0.4%)
+  MatMulGemv[1x128x256]:   2x     0.02ms (  0.4%)
+         Upsample2x[1]:   2x     0.02ms (  0.4%)
+     MatMul[128x256x1]:   2x     0.02ms (  0.4%)
+         Mul[131072x0]:   2x     0.02ms (  0.4%)
+     BiasAdd[131072x0]:   2x     0.02ms (  0.3%)
+         BiasAdd[64x0]:   2x     0.01ms (  0.3%)
+        Transpose[128]:   2x     0.01ms (  0.3%)
+        BiasAdd[128x0]:   2x     0.01ms (  0.3%)
+  MatMulGemv[1x256x64]:   1x     0.01ms (  0.2%)
+           Silu[256x0]:   1x     0.01ms (  0.1%)
+---

@@ -1,0 +1,44 @@
+# Whisper-tiny encoder inference, per-pass GPU timings, RTX 5070 (device 12036), October 30, 2026.
+# Meganeura 99e3de2, examples/profile_whisper_inference.rs, MEGANEURA_GPU_TIMING=1; profiling adds overhead and locates work only.
+## Default build (matrix units allowed)
+coop_matrix_available=true
+Whisper-tiny encoder: 61 dispatches, 173 buffers, seq_len=1500
+--- GPU pass timings (61 passes, 5.26ms total) ---
+  FlashAttentionCoop[1500]:   4x     3.30ms ( 62.7%)
+  MatMul[1500x384x1536]:   4x     0.46ms (  8.8%)
+  MatMul[1500x1536x384]:   4x     0.40ms (  7.5%)
+  MatMul[1500x384x384]x3:   4x     0.38ms (  7.2%)
+         Conv2dGemm[1]:   2x     0.22ms (  4.1%)
+  MatMul[1500x384x384]:   4x     0.14ms (  2.7%)
+       LayerNorm[1500]:   9x     0.10ms (  1.9%)
+        Mul[2304000x0]:   4x     0.07ms (  1.2%)
+    BiasAdd[2304000x0]:   4x     0.06ms (  1.1%)
+         Add[576000x0]:   9x     0.06ms (  1.1%)
+     BiasAdd[576000x0]:   8x     0.05ms (  0.9%)
+        Mul[1152000x0]:   1x     0.01ms (  0.2%)
+  AddPerChannel[1152000x0]:   1x     0.01ms (  0.2%)
+        Transpose[384]:   1x     0.01ms (  0.1%)
+         Mul[576000x0]:   1x     0.01ms (  0.1%)
+  AddPerChannel[576000x0]:   1x     0.01ms (  0.1%)
+---
+## MEGANEURA_DISABLE_COOP=1 (matrix units off, close to the strict program)
+coop_matrix_available=true
+Whisper-tiny encoder: 61 dispatches, 173 buffers, seq_len=1500
+--- GPU pass timings (61 passes, 5.75ms total) ---
+  FlashAttention[1500]:   4x     2.98ms ( 51.8%)
+  MatMul[1500x384x1536]:   4x     0.74ms ( 12.9%)
+  MatMul[1500x1536x384]:   4x     0.70ms ( 12.2%)
+  MatMul[1500x384x384]x3:   4x     0.54ms (  9.5%)
+         Conv2dGemm[1]:   2x     0.22ms (  3.8%)
+  MatMul[1500x384x384]:   4x     0.20ms (  3.6%)
+       LayerNorm[1500]:   9x     0.09ms (  1.6%)
+        Mul[2304000x0]:   4x     0.07ms (  1.1%)
+    BiasAdd[2304000x0]:   4x     0.06ms (  1.0%)
+         Add[576000x0]:   9x     0.06ms (  1.0%)
+     BiasAdd[576000x0]:   8x     0.05ms (  0.9%)
+  AddPerChannel[1152000x0]:   1x     0.01ms (  0.2%)
+        Mul[1152000x0]:   1x     0.01ms (  0.1%)
+  AddPerChannel[576000x0]:   1x     0.01ms (  0.1%)
+         Mul[576000x0]:   1x     0.01ms (  0.1%)
+        Transpose[384]:   1x     0.01ms (  0.1%)
+---
