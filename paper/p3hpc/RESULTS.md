@@ -192,25 +192,7 @@ PyTorch/Meganeura gains of 1.69/1.05. On 30 common training conditions it is
 it must not be substituted for the main table's medians or read as a causal
 CPU/GPU/API time partition.
 
-A separate October 24 fixed-plan shader ablation is retained in
-`artifact/attention-followup.json` (production shader commit `3d7cafa`). It
-changes attention backward only, keeping each graph, forward kernels and
-submission count fixed, with ordinary command recording, profiling disabled,
-10 seconds shared warmup and 100 interleaved samples per side. All eight
-model/device comparisons report full-output/full-gradient qualification
-before and after. The retained medians can be replayed without a GPU; the
-compact data do not independently replay those numerical checks. The runner
-uses a diagnostic reconstruction hook and the production shader text, not a
-new ordinary Auto-search measurement. It has one process per condition,
-no new PyTorch measurements and no long-run convergence claim.
-
-The same scaled-F16 transformation improves RTX 5070 training by 3.6–13.3%
-but has mixed Intel results (3.2% faster U-Net; 1.1–11.4% slower elsewhere).
-This supports range-aware lowering as a recoverable implementation factor,
-not matrix-unit selection as sufficient for speed. These local times must
-not be combined with the older cohort's PyTorch denominator. Reusing staging
-also makes head-128 gradients fit within 48 KiB; this is not an end-to-end
-head-128 model timing result. Missing TF32/reduced-precision WGMMA inputs
+Missing TF32/reduced-precision WGMMA inputs
 are not an established explanation of the strict-F32 H100 result, since
 that contract excludes those direct accelerated paths. Actual instruction
 use still needs matched kernel inspection. The remaining host/GPU/driver partition is
@@ -221,8 +203,8 @@ A separate October 31 single-operation comparison is retained in
 `examples/op_bench.rs`; the shape list, PyTorch runner and driver script are
 in `presentation/data/op-bench/`. It times one strict-F32 GEMM or batch-1
 convolution per process on the RX 7900 XT, RTX 5070 and Arc B570, with one
-timing protocol on all three: Meganeura `e40648f` (which adds the tuner
-scratch fix below) with the kernel tuner on and cooperative matrices off,
+timing protocol on all three: Meganeura `5b232bd` plus the tuner scratch
+fix below (`567028b` on main) with the kernel tuner on and cooperative matrices off,
 median of three processes per shape, against PyTorch 2.13.0 (ROCm 7.2, CUDA 13.0 and XPU
 wheels) with TF32 off and `cudnn.benchmark` on. Meganeura's GPU time is the
 median over 30 steps of summed Vulkan pass timestamps. PyTorch's is a device
@@ -255,7 +237,7 @@ not demonstrated. They use current code, not the cohort's revision, and must
 not be combined with the cohort ratios. At `5b232bd` the B570 2048³ GEMM took
 5.31 ms against 3.58 ms at `99e3de2`: a 1 MiB encoder allowance, newly
 counted inside the tuner's 64 MiB scratch limit, pushed its exactly-64 MiB
-buffers over it, so the tuner skipped the product. `e40648f` keeps encoder
+buffers over it, so the tuner skipped the product. The fix keeps encoder
 allowances outside the limit and restores 3.58 ms; on the RX 7900 XT 2048³
 went from 1.30 to 1.08 ms. Each process tunes for 2 s and can pick different tiles:
 across three processes, small B570 operations vary by up to 45% and the

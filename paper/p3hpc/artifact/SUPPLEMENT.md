@@ -61,10 +61,4 @@ versioned and publicly archived at the links in the paper.
 The gap accounting is a derived analysis of the same frozen result CSV. Run
 `python3 gap_analysis.py --input tables/results.csv --check tables` to verify
 its per-condition identity and geometric means. `gap.json` is the full matched
-condition inventory. `attention-followup.json` is separate October 24 local
-evidence, excluded from all primary cohort ratios and coverage; it includes
-the retained 100 samples per arm, protocol, source hashes and reported
-qualification status for eight fixed-plan native shader comparisons. This
-command replays sample medians and tables; it neither retimes models nor
-independently reproduces their numerical qualification. No new PyTorch timing
-or learning-convergence result is supplied by that local study.
+condition inventory.
