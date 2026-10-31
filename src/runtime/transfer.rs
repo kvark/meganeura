@@ -1149,6 +1149,24 @@ impl Session {
         self.read_f32_buffers(&buffers, "parameter_readback")
     }
 
+    /// Return the GPU gradient buffer for a compiled parameter handle, such as
+    /// one returned by [`Self::param_buffer`]. Returns `None` when the parameter
+    /// has no gradient, including in an inference session.
+    ///
+    /// A sibling pipeline on the shared context can consume this after the
+    /// backward step, following [`Self::output_buffer`]'s queue-ordering rules.
+    /// The session owns the buffer, which remains stable for its lifetime.
+    /// The piece may start within a shared gradient arena; use [`Self::param_size`]
+    /// for its element count instead of the backing allocation's size.
+    pub fn gradient_buffer(&self, parameter: BufferRef) -> Option<blade_graphics::BufferPiece> {
+        let &(_, gradient) = self
+            .plan
+            .param_grad_pairs
+            .iter()
+            .find(|&&(p, _)| p == parameter)?;
+        Some(self.buffers[gradient.0 as usize])
+    }
+
     /// Read a parameter's gradient buffer by name.
     ///
     /// Returns the gradient computed during the last backward pass.
