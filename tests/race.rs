@@ -103,14 +103,13 @@ fn race_decides_every_challenger_and_keeps_live_outputs() {
 }
 
 #[test]
-fn host_encoder_scratch_is_bounded_and_a_larger_search_can_retry() {
+fn host_encoders_sit_outside_the_scratch_limit_and_a_larger_search_can_retry() {
     let mut session = product(crate::support::gpu::gpu(), false);
     let before = run(&mut session);
-    // The bindings, staging and shared encoder fit, but the candidate host
-    // encoders do not. This used to run anyway, exceeding the caller's limit.
+    // The limit covers bindings and staging, which do not fit 16 KiB here.
     let report = session
         .tune_with(TuneOptions {
-            max_scratch_bytes: 2 << 20,
+            max_scratch_bytes: 16 << 10,
             ..race_options()
         })
         .unwrap();
@@ -121,12 +120,19 @@ fn host_encoder_scratch_is_bounded_and_a_larger_search_can_retry() {
         report
             .outcomes
             .iter()
-            .any(|o| o.decision == TuneDecision::ScratchLimit)
+            .all(|o| o.decision == TuneDecision::ScratchLimit)
     );
     assert_eq!(report.scratch.unwrap().peak_bytes, 0);
     assert_eq!(run(&mut session), before);
-    let report = session.tune_with(race_options()).unwrap();
+    // The buffers fit 2 MiB; the 1 MiB encoder allowances come on top.
+    let report = session
+        .tune_with(TuneOptions {
+            max_scratch_bytes: 2 << 20,
+            ..race_options()
+        })
+        .unwrap();
     check_race(&report);
+    assert!(!report.races[0].gpu_timestamps);
     // All live candidate encoders plus the upload/qualification encoder.
     assert!(report.scratch.unwrap().peak_bytes > (report.races[0].candidates + 1) * (1 << 20));
     assert_eq!(run(&mut session), before);
@@ -196,8 +202,7 @@ fn races_use_gpu_timestamps_when_the_context_records_them() {
     );
     let mut session = product(gpu, true);
     let before = run(&mut session);
-    // Timestamp rounds share the scratch encoder, so they fit the same small
-    // allowance that cannot accommodate per-candidate host encoders.
+    // Timestamp rounds share the scratch encoder: no host encoders on top.
     let report = session
         .tune_with(TuneOptions {
             max_scratch_bytes: 2 << 20,

@@ -18,6 +18,8 @@ mod race;
 /// Vulkan backend (4845d65). Reserve it on every backend, conservatively, until
 /// Blade exposes encoder allocation sizes. Pipelines and opaque driver command
 /// and descriptor allocations are outside this buffer budget.
+/// `TuneOptions::max_scratch_bytes` limits buffers only; these allowances
+/// come on top and are checked against device headroom.
 pub(super) const ENCODER_SCRATCH_BYTES: usize = 1 << 20;
 
 /// Qualified private-scratch kernel comparisons, resumable by later tuning.
@@ -886,12 +888,7 @@ impl Session {
                         )
                     })
                     .collect();
-                class.input_b_copies = race::weight_copies(
-                    class,
-                    options,
-                    weights.len(),
-                    self.gpu_timing && capabilities.timing,
-                );
+                class.input_b_copies = race::weight_copies(class, options, weights.len());
             }
         }
         (classes, excluded_dispatches + left_out)
@@ -1410,14 +1407,10 @@ impl Session {
                 sequence.push(sum);
             }
         }
-        let Some(bytes) = scratch_bytes(&sizes) else {
+        let Some(bytes) = limited_scratch_bytes(&sizes, 0, options.max_scratch_bytes) else {
             outcome.decision = TuneDecision::ScratchLimit;
             return;
         };
-        if bytes > options.max_scratch_bytes {
-            outcome.decision = TuneDecision::ScratchLimit;
-            return;
-        }
         drop(checks);
         {
             let _timer = PhaseTimer::new(&mut prep.staging);
@@ -1816,11 +1809,27 @@ fn weight_reference_dot(
     value
 }
 
+/// Bindings plus the staging buffer for the largest of them: the bytes that
+/// `max_scratch_bytes` limits.
+fn buffer_bytes(sizes: &[usize]) -> Option<usize> {
+    sizes
+        .iter()
+        .try_fold(*sizes.iter().max()?, |sum, size| sum.checked_add(*size))
+}
+
+/// Buffers plus the shared encoder's allowance, which device headroom bounds.
 fn scratch_bytes(sizes: &[usize]) -> Option<usize> {
-    sizes.iter().try_fold(
-        sizes.iter().max()?.checked_add(ENCODER_SCRATCH_BYTES)?,
-        |sum, size| sum.checked_add(*size),
-    )
+    buffer_bytes(sizes)?.checked_add(ENCODER_SCRATCH_BYTES)
+}
+
+/// Scratch for `sizes` and additional weight buffers if all buffers fit `limit`.
+/// Staging already covers the largest binding. Encoder allowances sit outside
+/// the limit, so a class whose buffers fit is not rejected for them.
+fn limited_scratch_bytes(sizes: &[usize], extra_buffers: usize, limit: usize) -> Option<usize> {
+    buffer_bytes(sizes)?
+        .checked_add(extra_buffers)
+        .filter(|&bytes| bytes <= limit)?;
+    scratch_bytes(sizes)?.checked_add(extra_buffers)
 }
 
 fn reuse_staging(policy: TuneStagingReuse, retained: usize, requested: usize) -> bool {
@@ -4197,6 +4206,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn scratch_limit_counts_all_buffers_without_encoder_allowance() {
+        let binding = 16 << 20;
+        let buffers = 4 * binding;
+        let sizes = [binding; 3];
+        assert_eq!(
+            limited_scratch_bytes(&sizes, 0, buffers),
+            Some(buffers + ENCODER_SCRATCH_BYTES)
+        );
+        assert_eq!(limited_scratch_bytes(&sizes, 0, buffers - 1), None);
+        // Distinct representative weights are buffers too, unlike encoders.
+        assert_eq!(limited_scratch_bytes(&sizes, binding, buffers), None);
+        assert_eq!(
+            limited_scratch_bytes(&sizes, binding, buffers + binding),
+            Some(buffers + binding + ENCODER_SCRATCH_BYTES)
+        );
+        assert_eq!(limited_scratch_bytes(&[], 0, usize::MAX), None);
+        assert_eq!(limited_scratch_bytes(&[usize::MAX, 4], 0, usize::MAX), None);
+        assert_eq!(limited_scratch_bytes(&[4], usize::MAX, usize::MAX), None);
+        // Even a fitting buffer budget cannot overflow the encoder reserve.
+        assert_eq!(
+            limited_scratch_bytes(&[1], usize::MAX - 2, usize::MAX),
+            None
+        );
     }
 
     #[test]
