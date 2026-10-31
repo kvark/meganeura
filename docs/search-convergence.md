@@ -135,15 +135,18 @@ A class's incumbent and all of its legal challengers are measured together.
    builder's `compile_all` pool. Workers stop starting new jobs at the search
    deadline; skipped jobs are retryable, not shader rejections. Up to eight
    already-running driver calls may overrun it.
-2. Check the full scratch allowance after compilation, then allocate one
-   scratch for the class, sized for its largest candidate, and upload
-   ordinary-magnitude inputs once. The allowance includes staging, the shared
-   upload/qualification encoder and one host encoder per compiled candidate.
-   Rejected candidates get no encoder. Each single-buffer encoder reserves
-   1 MiB, matching the pinned Blade Vulkan uniform buffer and conservatively
-   charged on other backends. Pipelines and opaque driver command/descriptor
-   allocations are outside this buffer budget. Device headroom is rechecked
-   before allocation. A limit leaves the class retryable.
+2. Check the scratch limit after compilation, then allocate one scratch for
+   the class, sized for its largest candidate, and upload ordinary-magnitude
+   inputs once. The limit covers the bindings, all distinct representative
+   weight buffers and staging. The shared
+   upload/qualification encoder and one host encoder per compiled candidate
+   come on top and are checked against device headroom only, so that a class
+   whose buffers exactly fill the limit (a 2048³ f32 product in the default
+   64 MiB) is still tuned. Rejected candidates get no encoder. Each
+   single-buffer encoder reserves 1 MiB, matching the pinned Blade Vulkan
+   uniform buffer and conservatively charged on other backends. Pipelines and
+   opaque driver command/descriptor allocations are outside the limit. Device
+   headroom is rechecked before allocation. A limit leaves the class retryable.
 3. Run rounds. With GPU timestamps, a round is one submission holding one timed
    pass per candidate. Every rotated round is followed by its reverse, with
    the same candidates, to balance position-dependent drift. Every dispatch
@@ -284,7 +287,8 @@ elapsed time and the selected program's held-out time.
 
 Review regression coverage includes transient failures remaining retryable,
 cached tails restored with no probe slots, non-mutating pending-work checks,
-partial-profile upgrades and reuse, encoder scratch limits, expired compilation
+partial-profile upgrades and reuse, encoder allowances outside the scratch
+limit, expired compilation
 budgets, balanced round order,
 invalid supplied profiles, host/timestamped F16 split sequences, finalist
 margin/noise guards, non-chaining ties, and preservation

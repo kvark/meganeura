@@ -8,8 +8,9 @@
 //! that would be installed is qualified. See `docs/search-convergence.md`.
 
 use super::{
-    ENCODER_SCRATCH_BYTES, Scratch, SearchClass, Staging, outputs_agree, prepared_inputs,
-    qualify_output, reordered_outputs_agree, scratch_bytes, small_pattern_scale, typed_inputs,
+    ENCODER_SCRATCH_BYTES, Scratch, SearchClass, Staging, buffer_bytes, limited_scratch_bytes,
+    outputs_agree, prepared_inputs, qualify_output, reordered_outputs_agree, small_pattern_scale,
+    typed_inputs,
 };
 use crate::compile::{BufferRef, Dispatch};
 use crate::runtime::{Pipelines, Session, Variant};
@@ -145,11 +146,9 @@ impl Session {
             output_index,
             sequences,
         } = prepare_race(class, &self.plan.dispatches[class.members[0]], &tiles);
-        let Some(bytes) = scratch_bytes(&sizes)
-            .and_then(|bytes| {
-                bytes.checked_add(sizes[1].checked_mul((class.input_b_copies - 1) as usize)?)
-            })
-            .filter(|&bytes| bytes <= options.max_scratch_bytes)
+        let Some(bytes) = sizes[1]
+            .checked_mul((class.input_b_copies - 1) as usize)
+            .and_then(|extra| limited_scratch_bytes(&sizes, extra, options.max_scratch_bytes))
         else {
             fail_remaining(&mut outcomes, TuneDecision::ScratchLimit);
             return conclude(race, outcomes);
@@ -191,9 +190,9 @@ impl Session {
 
         let timestamps = self.gpu_timing && capabilities.timing;
         race.gpu_timestamps = timestamps;
+        // Host encoders are outside the limit, like the shared one.
         let Some(bytes) =
             race_scratch_bytes(bytes, alive.iter().filter(|&&v| v).count(), timestamps)
-                .filter(|&bytes| bytes <= options.max_scratch_bytes)
         else {
             fail_remaining(&mut outcomes, TuneDecision::ScratchLimit);
             return conclude(race, outcomes);
@@ -376,22 +375,15 @@ impl Session {
     }
 }
 
-/// Bound the modeled weight working set by the caller's sample and memory
-/// limits. Reserve every potential host encoder before choosing a copy count,
-/// so compilation failures cannot change a memo's sampling contract.
-pub(super) fn weight_copies(
-    class: &SearchClass,
-    options: &TuneOptions,
-    distinct: usize,
-    timestamps: bool,
-) -> u32 {
+/// Bound the modeled weight working set by the caller's sample and buffer
+/// limits. Encoders are reserved separately against device headroom, so their
+/// count cannot reduce the representative weight working set.
+pub(super) fn weight_copies(class: &SearchClass, options: &TuneOptions, distinct: usize) -> u32 {
     let sizes = class
         .key
         .buffer_sizes()
         .expect("class collection checked extents");
-    let Some(bytes) = scratch_bytes(&sizes)
-        .and_then(|bytes| race_scratch_bytes(bytes, class.challengers.len() + 1, timestamps))
-    else {
+    let Some(bytes) = buffer_bytes(&sizes) else {
         return 1;
     };
     let extra = options.max_scratch_bytes.saturating_sub(bytes) / sizes[1].max(1);
@@ -1005,6 +997,7 @@ fn qualify(
 
 #[cfg(test)]
 mod tests {
+    use super::super::scratch_bytes;
     use super::*;
     use crate::tune::{MatmulTile, TuneClass};
 
@@ -1064,6 +1057,21 @@ mod tests {
         let session = make(plan.clone());
         let options = TuneOptions::default();
         assert_eq!(session.tune_classes(&options).0[0].input_b_copies, 2);
+        let class = &session.tune_classes(&options).0[0];
+        let sizes = class.key.buffer_sizes().unwrap();
+        let limit = buffer_bytes(&sizes).unwrap() + sizes[1];
+        for (max_scratch_bytes, expected) in [(limit, 2), (limit - 1, 1)] {
+            assert_eq!(
+                session
+                    .tune_classes(&TuneOptions {
+                        max_scratch_bytes,
+                        ..options.clone()
+                    })
+                    .0[0]
+                    .input_b_copies,
+                expected
+            );
+        }
         assert_eq!(
             session
                 .tune_classes(&TuneOptions {

@@ -1307,9 +1307,12 @@ pub struct TuneOptions {
     #[serde(default)]
     pub scope: TuneScope,
     pub max_classes: usize,
-    /// Comparison/calibration buffers including staging and a conservative
-    /// 1 MiB encoder-scratch allowance per command buffer. Excludes pipelines
-    /// and opaque driver command/descriptor allocations.
+    /// Comparison/calibration buffers including staging and all representative
+    /// weight copies. Comparisons reserve
+    /// a conservative 1 MiB encoder-scratch allowance per command buffer on
+    /// top, checked against device headroom; calibration counts its one
+    /// encoder inside. Excludes pipelines and opaque driver
+    /// command/descriptor allocations.
     pub max_scratch_bytes: usize,
     /// Defaults to Download. Does not alter scratch binding placement,
     /// validation or kernel candidates.

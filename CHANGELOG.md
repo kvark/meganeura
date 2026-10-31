@@ -27,8 +27,10 @@
   guard instead of ranking insignificant differences. Historical reports keep
   their sequential, uncalibrated policy. Cached winners no longer consume probe slots;
   memory limits, invalid timings and interrupted races remain retryable.
-  Scratch limits include encoder uniform-buffer allowances, and rejected
-  candidates allocate no host encoder. Partial machine profiles can fill
+  Comparison scratch limits cover bindings and staging; encoder
+  uniform-buffer allowances are reserved on top against device headroom, so a
+  class whose buffers fit the default 64 MiB (a 2048³ f32 product) is still
+  tuned. Rejected candidates allocate no host encoder. Partial machine profiles can fill
   missing measurements when later calls provide more time or scratch space,
   preserving completed measurements without repeating unchanged allowances.
   Host/GPU timing modes have separate memo decisions.
