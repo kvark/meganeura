@@ -963,19 +963,24 @@ impl Session {
         for (index, class) in classes.iter().enumerate() {
             let mut incumbent = class.initial;
             let mut next_candidate = 0;
-            if start.elapsed() < options.max_time
-                && let Some(&progress) = memo
+            if let Some(&progress) = memo
                     .as_ref()
                     .and_then(|m| m.progress.get(&memo_key(&self.plan, class)))
                 && progress.applies_to(class)
-                && self
-                    .pipelines
-                    .ensure_tune_tile(
-                        &gpu,
-                        &self.plan.dispatches[class.members[0]],
-                        progress.selected,
-                    )
-                    .is_ok()
+                // A pipeline already held by this session needs neither a
+                // probe budget nor compilation to restore its recorded tile.
+                && (self.pipelines.map.contains_key(&tile_variant(
+                    &self.plan.dispatches[class.members[0]],
+                    progress.selected,
+                )) || (start.elapsed() < options.max_time
+                    && self
+                        .pipelines
+                        .ensure_tune_tile(
+                            &gpu,
+                            &self.plan.dispatches[class.members[0]],
+                            progress.selected,
+                        )
+                        .is_ok()))
             {
                 class.install(&mut self.plan.dispatches, progress.selected);
                 report
@@ -3170,13 +3175,23 @@ mod tests {
         );
         let options = TuneOptions {
             max_classes: 0,
+            max_time: Duration::ZERO,
             calibration: TuneCalibration::Measure,
             ..Default::default()
         };
         let (classes, _) = session.tune_classes(&options);
-        assert_eq!(classes.len(), 2);
         let tail = classes.last().unwrap();
-        let selected = tail.challengers[0];
+        let template = session.plan.dispatches[tail.members[0]].clone();
+        let selected = *tail
+            .challengers
+            .iter()
+            .find(|&&tile| {
+                !session
+                    .pipelines
+                    .map
+                    .contains_key(&tile_variant(&template, tile))
+            })
+            .unwrap();
         let mut memo = KernelMemo::default();
         memo.bind(&gpu, &options, false);
         memo.progress.insert(
@@ -3186,13 +3201,34 @@ mod tests {
                 next_candidate: tail.challengers.len(),
             },
         );
+
+        let before = session.pipelines.map.len();
+        let report = session
+            .tune_with_memo(options.clone(), Some(&mut memo))
+            .unwrap();
+        assert!(report.reused_classes.is_empty());
+        assert_eq!(
+            session.pipelines.map.len(),
+            before,
+            "zero budget must not compile"
+        );
+        assert_eq!(
+            MatmulTile::selected(&session.plan.dispatches[tail.members[0]], None),
+            Some(tail.initial)
+        );
+
+        session
+            .pipelines
+            .ensure_tune_tile(&gpu, &template, selected)
+            .unwrap();
         let report = session.tune_with_memo(options, Some(&mut memo)).unwrap();
         assert_eq!(report.reused_classes, [(tail.key.clone(), selected)]);
         assert!(report.races.is_empty() && report.outcomes.is_empty());
-        assert!(report.class_limit_reached);
-        assert!(report.calibration_time.is_zero());
-        let actual = &session.plan.dispatches[tail.members[0]];
-        assert_eq!(MatmulTile::selected(actual, None), Some(selected));
+        assert!(report.time_budget_exhausted && report.calibration_time.is_zero());
+        assert_eq!(
+            MatmulTile::selected(&session.plan.dispatches[tail.members[0]], None),
+            Some(selected)
+        );
     }
 
     #[test]
