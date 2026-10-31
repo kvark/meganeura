@@ -252,17 +252,6 @@ section.since-paper td:last-child { font-weight: 700; color: #12363d; }
 section.stages table { font-size: 21px; }
 section.stages th, section.stages td { padding: 10px 12px; }
 
-section.intel-gap h1 { margin-bottom: 12px; }
-section.intel-gap .case-context { font-size: 23px; margin: 0 0 22px; }
-.gap-causes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 28px; }
-.gap-causes > div { border-top: 4px solid #006b70; padding-top: 12px; }
-.gap-causes h3 { color: #006b70; font-size: 27px; margin: 0 0 12px; }
-.gap-causes p { font-size: 21px; line-height: 1.3; margin: 12px 0; }
-.gap-causes .evidence { color: #12363d; }
-.gap-causes .hypothesis { color: #a44616; }
-section.intel-gap > p { font-size: 22px; margin: 14px 0 0; }
-section.intel-gap small { font-size: 16px; }
-
 /* Section tracker: the header names all three sections and highlights the current one. */
 header { color: #a3b0b1; }
 header strong { color: #006b70; border-bottom: 3px solid #006b70; padding-bottom: 2px; }

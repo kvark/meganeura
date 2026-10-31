@@ -27,10 +27,8 @@ and \href{https://github.com/kvark/inferena/tree/add19182e5479e3f7549894c524ac66
 sources at the measured commits; sixteen campaign archives and an offline
 analyzer. The older \code{paper-p3hpc-2026-final} tags do not identify these
 runs. The separate warmup diagnostic has its own recorded revision.
-The artifact also includes derived gap accounting and separate October~24
-attention timings, with production shader source at revision \code{3d7cafa}.
-These local inputs do not replace cohort cells or independently replay
-their GPU qualification. No DOI has been assigned.
+The artifact also includes derived gap accounting from the frozen result
+CSV; it does not replace cohort cells or replay their GPU qualification. No DOI has been assigned.
 \item[$A_2$] Public
 \href{https://github.com/kvark/dinovision/tree/dc35cdf1c7c910cdd93c5b5362846842ae469a21}{DinoVision source}
 and \href{https://huggingface.co/mad-bot/dinovision/tree/2c3f9017fe74c41482b165890c14737a2ccd4b6a}{evidence archive}.
@@ -188,9 +186,5 @@ Its records support Section~\ref{sec:edge}; none enters the framework timing
 tables or portability aggregate.
 
 \paragraph{Additional gap-analysis inputs.}
-The supplement also contains \code{gap\_analysis.py} and the separate
-October~24 \code{attention-followup.json}. The script reproduces matched-cell
-accounting from the frozen CSV and verifies the retained local timing samples.
-The local shader ablation is excluded from the cohort's ratios and coverage.
-Its compact data report qualification status but do not independently replay
-the GPU experiment, numerical checks or long-run learning behavior.
+The supplement also contains \code{gap\_analysis.py}, which reproduces
+matched-cell accounting from the frozen CSV without GPU execution.

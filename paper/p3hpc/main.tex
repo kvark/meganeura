@@ -614,44 +614,6 @@ deadline and a whole-program timing comparison. Conversely, more selected
 matrix dispatches need not be faster: operand staging, conversions, barriers,
 reductions and occupancy can cancel the arithmetic gain.
 
-\emph{A controlled implementation counterfactual.}
-A separate October~24 local study changes only attention backward on saved
-plans for four training models, with the graph, forward kernels and
-submission counts fixed \cite{meganeura2026scaledattention}.
-It uses paired sessions sharing a GPU context in one process per condition,
-ten seconds of shared warmup and
-100 interleaved samples per side, with full output/gradient qualification
-before and after. These results are excluded from the October~19 cohort,
-its ratios and coverage; retained samples and protocol are separate artifact
-inputs. They do not retime PyTorch or establish long-run convergence.
-
-\begin{table}[t]
-\centering
-\caption{Separate local attention-backward ablation: whole training-step
-time change from F32 to scaled F16, same plan and GPU context. Negative is
-faster. All eight comparisons pass the unchanged qualification gate; these
-force the path and are not Auto-search selections.}
-\label{tab:attention-followup}
-\small
-\input{tables/attention-followup}
-\end{table}
-
-The kernels scale operands by powers of two, accumulate in f32, and restore
-partial products before summing across reduction blocks. They also center
-keys and restore the common score term in f32. This permits small gradients
-without requiring BF16 matrix operands. A non-grid shared-key regression
-previously had 3.35\% dV error on both GPUs; the revised path passes the
-unchanged 1\% f64-relative bound. Table~\ref{tab:attention-followup} shows why
-range handling and matrix eligibility are only part of the answer: on
-Whisper, training falls from 23.19 to 20.11\,ms on the RTX~5070 but rises
-from 61.83 to 68.86\,ms on the B570. The same arithmetic transformation is
-profitable on one device and not the other. Search must retain the faster
-F32 path where appropriate. Broadly enabling a dtype is not sufficient.
-A second controlled change shares the common F32 anchor dot over four lanes:
-B570 Whisper falls from 75.12 to 68.86\,ms relative to a serial anchor
-calculation, without changing operand types or adding a pre-pass. Execution
-cost can therefore change even after numerical admission is solved.
-
 \emph{API limits are constraints, not an attributed fraction.}
 This stack does not expose explicit control of Hopper's asynchronous
 warpgroup instructions or thread-block clusters, nor a TF32 matrix-input path
@@ -659,13 +621,7 @@ warpgroup instructions or thread-block clusters, nor a TF32 matrix-input path
 those warpgroup products are also excluded by our strict-f32 contract.
 Their missing direct accelerated paths are therefore not an established
 explanation of the strict-f32 H100 gap; instruction-level attribution would
-require inspecting the executed kernels. Lower shared-memory
-limits can reject a particular kernel without imposing an unavoidable model
-cost: in the local study, reusing scaled score operands reduces head-128
-attention storage from 50,816/51,648 to 47,360/48,128 bytes for dQ/dK--dV.
-Both then fit within the existing 48\,KiB Vulkan limit on the two local GPUs,
-without a driver change. This establishes admission and checked gradients,
-not a full-model head-128 speedup.
+require inspecting the executed kernels.
 
 \emph{The residual needs timelines and matched kernels.}
 The cohort's host-wall measurements combine recording, submission, execution,

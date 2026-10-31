@@ -792,14 +792,13 @@ If asked:
 - Shared memory is not the reason: the U-Net's largest generated kernel uses
   16 KiB of Vulkan's 48.
 - Convolution times include our per-call Winograd weight transform.
-- Earlier diagnostics on the U-Net: similar kernel counts (286 against 276),
-  and F16 Winograd storage made the whole inference 9.3% faster.
-- Current code (October 31, Meganeura e40648f, with the tuner scratch fix),
-  not the cohort's revision; do not combine with the cohort ratios. PyTorch 2.13.0 (CUDA 13.0, XPU, ROCm
-  7.2), TF32 off, cudnn.benchmark on.
+- Current code (October 31, Meganeura 5b232bd plus the tuner scratch fix,
+  567028b on main), not the cohort's revision; do not combine with the cohort
+  ratios. PyTorch 2.13.0 (CUDA 13.0, XPU, ROCm 7.2), TF32 off,
+  cudnn.benchmark on.
 
 Sources: data/op-bench.tsv; data/op-bench/; examples/op_bench.rs;
-data/b570-unet-shared-memory.txt; data/intel-gap.json; data/results.csv.
+data/b570-unet-shared-memory.txt; data/results.csv.
 -->
 
 ---
@@ -890,8 +889,7 @@ If asked:
 - ROCm PyTorch on a consumer RDNA3 GPU may be less tuned than CUDA PyTorch,
   so part of the RX 7900 XT result is a weaker baseline.
 
-Sources: data/results.csv; data/whisper-profile.txt;
-data/intel-gap.json.
+Sources: data/results.csv; data/whisper-profile.txt; data/op-bench.tsv.
 -->
 
 ---
@@ -959,10 +957,10 @@ Sources: data/results.csv; data/summary.json; data/hardware.json;
 </div><div>
 
 **Performance**
-[Minimal shape](#32) · [Who gains from reduced precision?](#33) · [Two gaps](#34) · [Larger models](#35) · [Change one path](#36) · [Reduced-precision rules](#37) · [What the checks admit](#38) · [Where TF32 fits](#39) · [SPIR-V precision](#40) · [Timing variability](#41) · [Warmup](#42) · [Portability scores](#43)
+[Minimal shape](#32) · [Who gains from reduced precision?](#33) · [Two gaps](#34) · [Larger models](#35) · [Reduced-precision rules](#36) · [What the checks admit](#37) · [Where TF32 fits](#38) · [SPIR-V precision](#39) · [Timing variability](#40) · [Warmup](#41) · [Portability scores](#42)
 
 **Deployment**
-[Queue measurements](#44) · [Learning on the device](#45)
+[Queue measurements](#43) · [Learning on the device](#44)
 
 </div></div>
 
@@ -1558,48 +1556,6 @@ If asked:
   both servers (its mean KL passes), so there is no reduced-precision ratio.
 
 Sources: ../tables/scaling.tex; ../RESULTS.md.
--->
-
----
-
-<!-- _header: 'Backup · Performance · separate local experiment' -->
-<!-- _class: chart -->
-
-# Change one path
-
-![Whole training-step changes from replacing only attention backward with scaled F16, on RTX 5070 and B570](figures/attention-followup.svg)
-
-**Same Vulkan API, same numerical bounds; different outcomes.** Range handling unlocks a path. Whole-model timing decides whether it wins.
-
-<!--
-Backup, for "can you close the gap without changing the API?"
-
-This is a separate local experiment after the cohort, not a replacement for
-any of the PyTorch ratios. The graph, forward kernels and submission count
-stay fixed. Only attention backward changes, from F32 to scaled F16 operands
-with F32 accumulation. Power-of-two scaling preserves tiny derivatives;
-centering the keys keeps their common component from corrupting the scores.
-
-Every comparison passes the unchanged full-model output and gradient checks.
-Whisper gets 13.3 percent faster on the RTX 5070 but 11.4 percent slower on
-the B570. Merely unlocking a matrix kernel is not enough. Search should keep
-F32 where it is faster. BF16 is not required for this attention family.
-
-If asked:
-- Each condition has one process, ten seconds shared warmup, and 100
-  interleaved samples per arm, with profiling off and ordinary recording.
-  This does not characterize cross-process variability or learning convergence.
-- A non-grid shared-key case exposed 3.35% dV error; score centering fixes it
-  under the existing 1% F64 bound. Head widths 16/32/64/128 pass on both GPUs.
-- Sharing the common F32 anchor dot over four lanes reduces B570 Whisper
-  from 75.12 to 68.86 ms compared with a serial anchor, with unchanged
-  operand types and no extra pre-pass. The auxiliary samples are retained.
-- Reusing scaled score staging brings head-128 dQ/dKV from 50,816/51,648 to
-  47,360/48,128 bytes: it fits the same 48 KiB limit without a new driver.
-  That is checked admission, not a full-model head-128 speedup.
-
-Sources: ../artifact/attention-followup.json; PR #279, shader revision 3d7cafa.
-https://github.com/kvark/meganeura/commit/3d7cafaa777dd186a07745faaee6a4f81acc24c7
 -->
 
 ---

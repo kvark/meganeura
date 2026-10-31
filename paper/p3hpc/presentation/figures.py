@@ -40,9 +40,8 @@ assert sum(bool(r["ratio"]) for r in ROWS) == 226
 
 # Shared accounting with the paper; independent of the raw archive replay.
 sys.path.insert(0, str(HERE.parent / "artifact"))
-from gap_analysis import analyze, followups
+from gap_analysis import analyze
 GAP = analyze(ROWS)
-FOLLOWUP = followups(HERE.parent / "artifact" / "attention-followup.json")
 
 
 def save(fig, name):
@@ -265,31 +264,6 @@ def gap_accounting():
     save(fig, "gap-accounting.svg")
 
 
-def attention_followup():
-    """Local within-native experiment, kept separate from cohort ratios."""
-    fig, axes = plt.subplots(1, 2, figsize=(11.56, 4.38), sharey=True)
-    fig.subplots_adjust(left=.14, right=.975, top=.84, bottom=.23, wspace=.13)
-    lookup = {(r["gpu"], r["model"]): r for r in FOLLOWUP["conditions"]}
-    models = ["SmolLM2-135M", "Whisper-tiny", "StableDiffusion", "SmolVLA"]
-    for ax, gpu, title in zip(axes, ["rtx5070", "b570"], ["RTX 5070", "Arc B570"]):
-        for y, model in enumerate(models):
-            value = lookup[gpu, model]["change_percent"]
-            color = TEAL if value < 0 else ORANGE
-            ax.barh(y, value, color=color, height=.6)
-            ax.text(value + (-.5 if value < 0 else .5), y, f"{value:+.1f}%", ha="right" if value < 0 else "left", va="center", color=color, fontsize=11)
-        ax.axvline(0, color=MUTED, lw=1)
-        ax.set(xlim=(-18, 16), ylim=(3.6, -.6))
-        ax.set_xticks([-15, -10, -5, 0, 5, 10, 15], ["−15", "−10", "−5", "0", "+5", "+10", "+15"], fontsize=10)
-        ax.set_title(title, loc="left", fontsize=14, weight="bold")
-        ax.spines[["top", "right"]].set_visible(False)
-    axes[0].set_yticks(range(4), ["SmolLM2-135M", "Whisper encoder", "U-Net-small", "SmolVLA expert"], fontsize=12)
-    axes[0].tick_params(axis="y", length=0)
-    fig.text(.14, .12, "Whole training-step time change: F32 → scaled F16 attention backward. Negative is faster.", fontsize=11)
-    fig.text(.14, .065, "Same graph, forward kernels and submission count. All eight pass full-output/full-gradient checks; no BF16 operands required.", fontsize=10)
-    fig.text(.14, .015, "Separate Oct 24 experiment: one process, 10s shared warmup, 100 interleaved samples per arm. Not a new PyTorch comparison.", fontsize=9.7, color=MUTED)
-    save(fig, "attention-followup.svg")
-
-
 def path_admission():
     """Admission checkpoints, with separate rejection branches at each stop."""
     from matplotlib.patches import FancyBboxPatch
@@ -486,6 +460,5 @@ if __name__ == "__main__":
     search_loop()
     precision_gain()
     gap_accounting()
-    attention_followup()
     path_admission()
     scaling();preparation();preparation_models();compiler_map();timing_spread();warmup()
