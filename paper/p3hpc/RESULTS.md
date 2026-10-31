@@ -247,4 +247,18 @@ libraries' F32 GEMM throughput, which we have not demonstrated. They use
 current code, not the cohort's revision, and must not be combined with the
 cohort ratios. The U-Net's largest generated kernel uses 16.4 KiB of
 workgroup memory (`presentation/data/b570-unet-shared-memory.txt`), so
-Vulkan's 48 KiB limit does not constrain it. An RX 7900 XT run is pending.
+Vulkan's 48 KiB limit does not constrain it.
+
+An October 31 RX 7900 XT run of the same shapes and Meganeura runner (system
+Mesa 26.0.8, PyTorch 2.13.0+rocm7.2) is retained separately in
+`presentation/data/op-bench-7900xt.tsv`. Its PyTorch times are HIP event
+intervals around a graph of 30 serial operations divided by 30, median of 30
+replays with the profiler off, so they include gaps between kernels that the
+summed-kernel times on the other two GPUs and our summed pass times exclude;
+the timing boundaries differ and its ratios lean in Meganeura's favor.
+Square 4096 GEMMs take 1.68× PyTorch's time (13.3 against 22.3 TFLOP/s),
+Whisper and LLM shapes 1.26–1.34×, the U-Net's small GEMMs 0.65–1.50×, 3×3
+convolutions 0.77–1.98× and 1×1 and stem convolutions 0.59–1.17×. The RX
+7900 XT is the closest of the three GPUs, as in the cohort. A common timing
+method across vendors is needed before cross-vendor claims at publication
+level.
