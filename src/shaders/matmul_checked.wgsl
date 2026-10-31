@@ -1,8 +1,9 @@
+// @section main
 $EXTENSIONS
 $DECL
-var<workgroup> stage_a: array<$MULTIPLY_TYPE, 1024>;
-var<workgroup> stage_b: array<$MULTIPLY_TYPE, 1024>;
-var<workgroup> result: array<f32, 1024>;
+$A_STAGE_DECL
+$B_STAGE_DECL
+$RESULT_DECL
 $ROUND
 
 @compute @workgroup_size($THREADS)
@@ -32,42 +33,46 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         var lower_right = $C_TILE();
         for (var start = first; start < end; start += 32u) {
             $STAGE
-            workgroupBarrier();
+$INPUT_BARRIER
             for (var inner = 0u; inner < 32u; inner += $TILE_Ku) {
-                let a = coopLoadT<$A_TILE>(&stage_a[a_offset + inner], 32u);
-                let b = coopLoadT<$B_TILE>(&stage_b[b_offset + inner * 32u], 32u);
+                let a = $A_MATRIX;
+                let b = $B_MATRIX;
                 accumulator = coopMultiplyAdd(a, b, accumulator);
                 var a_lower = a;
                 // Loops keep cooperative operations in uniform control flow
                 // despite Naga's conservative subgroup-size conditional check.
                 for (var lower_row = $TILE_Mu; lower_row < tile_rows; lower_row += $TILE_Mu) {
-                    a_lower = coopLoadT<$A_TILE>(&stage_a[a_offset + lower_row * 32u + inner], 32u);
+                    a_lower = $A_LOWER_MATRIX;
                     lower = coopMultiplyAdd(a_lower, b, lower);
                 }
                 for (var right_col = $TILE_Nu; right_col < 16u; right_col += $TILE_Nu) {
-                    let b_right = coopLoadT<$B_TILE>(&stage_b[b_offset + inner * 32u + right_col], 32u);
+                    let b_right = $B_RIGHT_MATRIX;
                     right = coopMultiplyAdd(a, b_right, right);
                     for (var lower_row = $TILE_Mu; lower_row < tile_rows; lower_row += $TILE_Mu) {
                         lower_right = coopMultiplyAdd(a_lower, b_right, lower_right);
                     }
                 }
             }
-            workgroupBarrier();
+$INPUT_BARRIER
         }
-        if tile < tile_count {
-            coopStoreT(accumulator, &result[a_offset + b_offset], 32u);
+        if tile < tile_count$STORE_VALID {
+            coopStoreT(accumulator, $C_BASE, $RESULT_STRIDE);
             if paired {
-                coopStoreT(lower, &result[a_offset + b_offset + 256u], 32u);
+                coopStoreT(lower, $C_LOWER, $RESULT_STRIDE);
             }
             if $TILE_Nu == 8u {
-                coopStoreT(right, &result[a_offset + b_offset + 8u], 32u);
+                coopStoreT(right, $C_RIGHT, $RESULT_STRIDE);
                 if paired {
-                    coopStoreT(lower_right, &result[a_offset + b_offset + 264u], 32u);
+                    coopStoreT(lower_right, $C_LOWER_RIGHT, $RESULT_STRIDE);
                 }
             }
         }
     }
-    workgroupBarrier();
+    $RESULT_SCATTER
+}
+
+// @section scatter
+workgroupBarrier();
     for (var offset = lane; offset < 1024u; offset += $THREADSu) {
         let r = row + offset / 32u;
         let c = col + offset % 32u;
@@ -76,4 +81,3 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
             $DEST[index] = $STORE(result[offset]$ADD);
         }
     }
-}

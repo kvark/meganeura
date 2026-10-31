@@ -526,7 +526,11 @@ impl MatmulTile {
                 return [class.m / 64, class.n / shape.columns, splits];
             }
             Self::CooperativeWorkgroup { shape, splits } => {
-                return [class.m / shape.rows, class.n / shape.columns, splits];
+                return [
+                    class.m.div_ceil(shape.rows),
+                    class.n / shape.columns,
+                    splits,
+                ];
             }
             // Checked tiles use X for rows, Y for columns, over 32x32 blocks.
             Self::CooperativeChecked { splits } => {
@@ -563,7 +567,11 @@ impl MatmulTile {
                 return None;
             }
             let mut sizes = class.buffer_sizes()?;
-            *sizes.last_mut()? = sizes.last()?.checked_mul(splits as usize)?;
+            // Partitioned WGSL offsets are u32 even on a 64-bit host.
+            let elements = class.m.checked_mul(class.n)?.checked_mul(splits)?;
+            *sizes.last_mut()? = usize::try_from(elements)
+                .ok()?
+                .checked_mul(crate::codegen::MatrixTypes::bytes(types.output))?;
             return crate::compile::workgroups_within_portable_limits(self.workgroups(class))
                 .then_some(sizes);
         }

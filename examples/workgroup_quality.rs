@@ -65,9 +65,11 @@ fn main() {
                                     meganeura::codegen::MatrixTypes::BF16
                                 } else {
                                     meganeura::codegen::MatrixTypes::F32_AS_F16
-                                }
+                                },
+                                m as u32,
+                                n as u32,
+                                k as u32,
                             )
-                            && tile.fits(m as u32, n as u32, k as u32)
                     );
                     let f16 = !bf16
                         && keys

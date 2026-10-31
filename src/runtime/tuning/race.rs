@@ -92,6 +92,7 @@ impl Session {
         profile: Option<&MachineProfile>,
         predicted_ms: Option<f64>,
     ) -> RaceResult {
+        let capabilities = self.gpu.capabilities();
         let race_start = Instant::now();
         let mut tiles = vec![incumbent];
         for &tile in &class.challengers {
@@ -184,7 +185,7 @@ impl Session {
             return conclude(race, outcomes);
         }
 
-        let timestamps = self.gpu_timing && self.gpu.capabilities().timing;
+        let timestamps = self.gpu_timing && capabilities.timing;
         race.gpu_timestamps = timestamps;
         let Some(bytes) = race_scratch_bytes(bytes, &alive, timestamps)
             .filter(|&bytes| bytes <= options.max_scratch_bytes)
@@ -238,7 +239,10 @@ impl Session {
                     sequence
                         .iter()
                         .map(|dispatch| {
-                            (&self.pipelines.map[&Pipelines::key(dispatch)].raw, dispatch)
+                            (
+                                &self.pipelines.map[&Pipelines::key(dispatch, &capabilities)].raw,
+                                dispatch,
+                            )
                         })
                         .collect()
                 })
@@ -291,12 +295,13 @@ impl Session {
         outcomes: &mut [TuneOutcome],
         race: &mut TuneRace,
     ) -> Option<Vec<bool>> {
+        let capabilities = self.gpu.capabilities();
         // Compile every missing pipeline in one parallel batch.
         let compile = Instant::now();
         let mut wanted: Vec<(Variant, &Dispatch, Option<crate::codegen::CoopConfig>)> = Vec::new();
         for (sequence, &tile) in sequences.iter().zip(tiles) {
             for (position, dispatch) in sequence.iter().enumerate() {
-                let key = Pipelines::key(dispatch);
+                let key = Pipelines::key(dispatch, &capabilities);
                 if self.pipelines.map.contains_key(&key) || wanted.iter().any(|w| w.0 == key) {
                     continue;
                 }
@@ -341,7 +346,7 @@ impl Session {
         for (index, sequence) in sequences.iter().enumerate() {
             let Some(error) = sequence
                 .iter()
-                .find_map(|dispatch| rejected.get(&Pipelines::key(dispatch)))
+                .find_map(|dispatch| rejected.get(&Pipelines::key(dispatch, &capabilities)))
             else {
                 continue;
             };
@@ -1000,7 +1005,14 @@ mod tests {
     fn expired_compilation_budget_does_not_start_shader_jobs() {
         let gpu = crate::reference::gpu::shared_context();
         let dispatch = Dispatch::default();
-        let jobs = vec![(Pipelines::key(&dispatch), &dispatch, None); 12];
+        let jobs = vec![
+            (
+                Pipelines::key(&dispatch, &bg::Capabilities::default()),
+                &dispatch,
+                None
+            );
+            12
+        ];
         let results = Pipelines::compile_all(
             &gpu,
             Default::default(),

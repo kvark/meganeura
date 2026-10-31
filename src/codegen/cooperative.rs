@@ -1,4 +1,7 @@
-use super::{MatMulCoopVariant, MatrixTypes, ShaderGroup, ShaderModule, coop_shape, preprocess};
+use super::{
+    MatMulCoopVariant, MatrixTypes, ShaderGroup, ShaderModule, TypedMatmulLayout, coop_shape,
+    preprocess,
+};
 use crate::{DType, kernels::conv::Params};
 
 // Keep partition boundaries identical across native tile shapes.
@@ -11,16 +14,16 @@ pub(super) const SPLIT_RANGE: &str = "let blocks = (k + 31u) / 32u;\n\
     let end = min(first + count * 32u, k);";
 
 /// Dense and implicit-GEMM convolutions share the same checked cooperative
-/// loop. Operands are staged in the multiplication type; the accumulator is
-/// F32, and so are partials until their reduction.
+/// loop. Aligned native operands load directly; conversions and tails stage
+/// in the multiplication type. Accumulators and split partials remain F32.
 pub(super) fn generate(
     group: ShaderGroup,
     types: MatrixTypes,
     shape: [u32; 3],
     subgroup: u32,
-    vectorized: bool,
+    layout: TypedMatmulLayout,
 ) -> ShaderModule {
-    generate_with_params(group, types, shape, None, subgroup, vectorized)
+    generate_with_params(group, types, shape, None, subgroup, layout)
 }
 
 pub(super) fn generate_with_params(
@@ -29,7 +32,7 @@ pub(super) fn generate_with_params(
     shape: [u32; 3],
     params: Option<&Params>,
     subgroup: u32,
-    vectorized: bool,
+    layout: TypedMatmulLayout,
 ) -> ShaderModule {
     types.validate();
     assert!(
@@ -40,7 +43,9 @@ pub(super) fn generate_with_params(
     let variant = coop_shape(group).map(|(_, variant)| variant);
     let split_range = SPLIT_RANGE.replace("wgid.", "group.");
     let vector_conv = params.is_some_and(Params::vectorized_forward);
-    let vector_dense = vectorized && coop_shape(group).is_some();
+    let vector_dense = layout.vectorized && variant.is_some();
+    let global_a = layout.direct_inputs && vector_dense && types.a == types.multiply;
+    let global_b = layout.direct_inputs && vector_dense && types.b == types.multiply;
     let (declaration, dimensions, range, a, b, index, destination, add) = match group {
         ShaderGroup::MatMul
         | ShaderGroup::MatMulAT
@@ -60,9 +65,12 @@ pub(super) fn generate_with_params(
                 declaration.push_str("var<storage> src: array<f32>;\n");
             }
             if vector_dense {
-                declaration = declaration
-                    .replace("array<$A_TYPE>", "array<vec4<$A_TYPE>>")
-                    .replace("array<$B_TYPE>", "array<vec4<$B_TYPE>>");
+                if !global_a {
+                    declaration = declaration.replace("array<$A_TYPE>", "array<vec4<$A_TYPE>>");
+                }
+                if !global_b {
+                    declaration = declaration.replace("array<$B_TYPE>", "array<vec4<$B_TYPE>>");
+                }
             }
             (
                 declaration,
@@ -154,6 +162,21 @@ pub(super) fn generate_with_params(
         }
         _ => unreachable!(),
     };
+    assert!(!layout.direct_output || (types.output == DType::F32 && add.is_empty()));
+    let direct_output = layout.direct_output;
+    // Callers select this only for whole native output tiles. Partial 32x32
+    // workgroups still guard each subgroup's tile before the global store.
+    let result_pointer = |rows: u32, columns: u32| {
+        if direct_output {
+            format!(
+                "&{destination}[(group.z * m + row + a_offset / 32u + {rows}u) * n + col + b_offset + {columns}u]"
+            )
+        } else {
+            format!("&result[a_offset + b_offset + {}u]", rows * 32 + columns)
+        }
+    };
+    let template = include_str!("../shaders/matmul_checked.wgsl");
+    let scatter = super::template_section(template, "scatter");
     let mut extensions = String::from("enable wgpu_cooperative_matrix;\n");
     if types.uses(DType::F16) {
         extensions.push_str("enable f16;\n");
@@ -181,12 +204,87 @@ pub(super) fn generate_with_params(
             format!("vec4<{cast}>({value})")
         }
     };
+    // Logical output and K coordinates map to one storage index for both
+    // vector staging and direct cooperative loads.
+    let operand = |a_side: bool| {
+        let transposed = variant
+            == Some(if a_side {
+                MatMulCoopVariant::AT
+            } else {
+                MatMulCoopVariant::BT
+            });
+        let (name, base, limit) = if a_side {
+            ("a", "row", "m")
+        } else {
+            ("b", "col", "n")
+        };
+        (name, base, limit, transposed, a_side != transposed)
+    };
+    let address = |a_side: bool, output: &str, reduction: &str| {
+        let (_, _, limit, _, output_outer) = operand(a_side);
+        if output_outer {
+            (format!("({output}) * k + ({reduction})"), "k")
+        } else {
+            (format!("({reduction}) * {limit} + ({output})"), limit)
+        }
+    };
     let stage = if vector_dense {
-        include_str!("../shaders/matmul_checked_vector.wgsl")
+        let mut body = String::new();
+        for (a_side, global, storage) in [(true, global_a, types.a), (false, global_b, types.b)] {
+            if global {
+                continue;
+            }
+            let (name, base, limit, transposed, output_outer) = operand(a_side);
+            body += &preprocess(
+                include_str!("../shaders/matmul_checked_vector.wgsl"),
+                &[
+                    ("$OPERAND", name),
+                    ("$OUTPUT_BASE", base),
+                    ("$OUTPUT_LIMIT", limit),
+                    ("$OUTPUT_OUTER", if output_outer { "true" } else { "false" }),
+                    ("$TRANSPOSE", if transposed { "true" } else { "false" }),
+                    ("$GLOBAL_INDEX", &address(a_side, "out_pos", "k_pos").0),
+                    (
+                        "$UNCHECKED",
+                        if global_a || global_b {
+                            "true"
+                        } else {
+                            "false"
+                        },
+                    ),
+                    ("$VECTOR", &convert("raw", storage)),
+                    ("$CAST", cast(storage)),
+                ],
+            );
+        }
+        if body.is_empty() {
+            body
+        } else {
+            format!("for (var index = lane; index < 256u; index += $THREADSu) {{\n{body}}}\n")
+        }
     } else if vector_conv {
-        include_str!("../shaders/conv2d_checked_vector.wgsl")
+        include_str!("../shaders/conv2d_checked_vector.wgsl").to_owned()
     } else {
-        include_str!("../shaders/matmul_checked_stage.wgsl")
+        include_str!("../shaders/matmul_checked_stage.wgsl").to_owned()
+    };
+    let matrix_load = |a_side: bool, extra_output: &str| {
+        let (name, base, _, transposed, _) = operand(a_side);
+        let ty = if a_side { "$A_TILE" } else { "$B_TILE" };
+        if if a_side { global_a } else { global_b } {
+            let tile_output = if a_side { "a_offset / 32u" } else { "b_offset" };
+            let (index, stride) = address(
+                a_side,
+                &format!("{base} + {tile_output} + {extra_output}"),
+                "start + inner",
+            );
+            let load = if transposed { "coopLoad" } else { "coopLoadT" };
+            format!("{load}<{ty}>(&matrix_{name}[{index}], {stride})")
+        } else if a_side {
+            // Output offsets count rows; each scratch row spans 32 elements.
+            format!("coopLoadT<{ty}>(&stage_a[a_offset + {extra_output} * 32u + inner], 32u)")
+        } else {
+            format!("coopLoadT<{ty}>(&stage_b[b_offset + inner * 32u + {extra_output}], 32u)")
+        }
     };
     let rounds = types.output == DType::BF16
         || (types.multiply == DType::BF16 && (types.a == DType::F32 || types.b == DType::F32));
@@ -203,9 +301,61 @@ pub(super) fn generate_with_params(
         128
     };
     ShaderModule::new(&preprocess(
-        include_str!("../shaders/matmul_checked.wgsl"),
+        super::template_section(template, "main"),
         &[
-            ("$STAGE", stage),
+            ("$STAGE", &stage),
+            (
+                "$A_STAGE_DECL",
+                if global_a {
+                    String::new()
+                } else {
+                    format!("var<workgroup> stage_a: array<{multiply}, 1024>;")
+                }
+                .as_str(),
+            ),
+            (
+                "$B_STAGE_DECL",
+                if global_b {
+                    String::new()
+                } else {
+                    format!("var<workgroup> stage_b: array<{multiply}, 1024>;")
+                }
+                .as_str(),
+            ),
+            (
+                "$INPUT_BARRIER",
+                if global_a && global_b {
+                    ""
+                } else {
+                    "workgroupBarrier();"
+                },
+            ),
+            ("$A_MATRIX", &matrix_load(true, "0u")),
+            ("$A_LOWER_MATRIX", &matrix_load(true, "lower_row")),
+            ("$B_MATRIX", &matrix_load(false, "0u")),
+            ("$B_RIGHT_MATRIX", &matrix_load(false, "right_col")),
+            (
+                "$RESULT_DECL",
+                if direct_output {
+                    ""
+                } else {
+                    "var<workgroup> result: array<f32, 1024>;"
+                },
+            ),
+            ("$RESULT_SCATTER", if direct_output { "" } else { scatter }),
+            (
+                "$STORE_VALID",
+                if direct_output {
+                    " && row + a_offset / 32u < m && col + b_offset < n"
+                } else {
+                    ""
+                },
+            ),
+            ("$RESULT_STRIDE", if direct_output { "n" } else { "32u" }),
+            ("$C_LOWER_RIGHT", &result_pointer(8, 8)),
+            ("$C_LOWER", &result_pointer(8, 0)),
+            ("$C_RIGHT", &result_pointer(0, 8)),
+            ("$C_BASE", &result_pointer(0, 0)),
             ("$THREADS", &threads.to_string()),
             (
                 "$TRANSPOSE_A",
@@ -376,27 +526,29 @@ mod tests {
                 ));
                 for storage in [DType::BF16, DType::F16, DType::F32] {
                     for multiply in [DType::BF16, DType::F16, DType::F32] {
-                        let types = MatrixTypes {
-                            a: storage,
-                            b: DType::F32,
-                            multiply,
-                            output,
-                        };
-                        if types.is_valid() {
-                            for group in [
-                                ShaderGroup::Conv2dChecked {
-                                    kernel_h: 2,
-                                    kernel_w: 4,
-                                    stride: 2,
-                                },
-                                ShaderGroup::MatMul,
-                                ShaderGroup::MatMulAT,
-                                ShaderGroup::MatMulBT,
-                                ShaderGroup::MatMulAdd,
-                                ShaderGroup::MatMulATAdd,
-                                ShaderGroup::MatMulBTAdd,
-                            ] {
-                                cases.push((group, types, shape));
+                        for b in [DType::F32, multiply] {
+                            let types = MatrixTypes {
+                                a: storage,
+                                b,
+                                multiply,
+                                output,
+                            };
+                            if types.is_valid() {
+                                for group in [
+                                    ShaderGroup::Conv2dChecked {
+                                        kernel_h: 2,
+                                        kernel_w: 4,
+                                        stride: 2,
+                                    },
+                                    ShaderGroup::MatMul,
+                                    ShaderGroup::MatMulAT,
+                                    ShaderGroup::MatMulBT,
+                                    ShaderGroup::MatMulAdd,
+                                    ShaderGroup::MatMulATAdd,
+                                    ShaderGroup::MatMulBTAdd,
+                                ] {
+                                    cases.push((group, types, shape));
+                                }
                             }
                         }
                     }
@@ -409,6 +561,7 @@ mod tests {
                 super::super::TypedMatmulLayout {
                     vectorized: true,
                     direct_output: false,
+                    ..Default::default()
                 },
                 super::super::TypedMatmulLayout::for_product(
                     types,
@@ -426,28 +579,8 @@ mod tests {
                         [8 * subgroup, 1, 1]
                     );
                 }
-                let mut binding = 0;
-                for (_, global) in module.module.global_variables.iter_mut() {
-                    if matches!(
-                        global.space,
-                        naga::AddressSpace::Uniform | naga::AddressSpace::Storage { .. }
-                    ) {
-                        global.binding = Some(naga::ResourceBinding { group: 0, binding });
-                        binding += 1;
-                    }
-                }
-                let info =
-                    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), capabilities)
-                        .validate(&module.module)
-                        .unwrap_or_else(|error| panic!("{group:?} {types:?} {shape:?}: {error:?}"));
-                let options = naga::back::spv::Options {
-                    lang_version: (1, 3),
-                    flags: naga::back::spv::WriterFlags::empty(),
-                    ..Default::default()
-                };
-                let words =
-                    naga::back::spv::write_vec(&module.module, &info, &options, None).unwrap();
-                assert!(!words.is_empty());
+                super::super::validate_shader_for_test(&mut module.module, capabilities, (1, 3))
+                    .unwrap_or_else(|error| panic!("{group:?} {types:?} {shape:?}: {error}"));
             }
         }
     }
@@ -497,7 +630,7 @@ mod tests {
                             shape,
                             Some(&params),
                             subgroup,
-                            false,
+                            TypedMatmulLayout::default(),
                         );
                         assert_eq!(
                             module.module.entry_points[0].workgroup_size,

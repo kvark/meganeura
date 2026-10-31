@@ -52,18 +52,20 @@ pub(super) fn select(
             || dispatch.weight_format != WeightFormat::F32
             || (types.is_none() && dispatch.schedule_locked)
             || !(types.is_some() || f32)
-            || !shape.supports(caps, types.unwrap_or(MatrixTypes::F32_AS_F16))
         {
             continue;
         }
         if let Some((m, n, k)) = dispatch.mnk() {
-            if shape.fits(m, n, k) && splits > 0 && splits <= k / shape.k_stage {
+            if shape.supports(caps, types.unwrap_or(MatrixTypes::F32_AS_F16), m, n, k)
+                && splits > 0
+                && splits <= k / shape.k_stage
+            {
                 dispatch.kernel = Kernel::CooperativeWorkgroup {
                     shape,
                     types,
                     splits,
                 };
-                dispatch.workgroups = [m / shape.rows, n / shape.columns, splits];
+                dispatch.workgroups = [m.div_ceil(shape.rows), n / shape.columns, splits];
             }
         }
     }
@@ -130,16 +132,16 @@ mod tests {
             k_stage: 32,
             threads: 256,
         };
-        assert!(tile.supports(&device, MatrixTypes::F32_AS_F16));
+        assert!(tile.supports(&device, MatrixTypes::F32_AS_F16, 1536, 512, 384));
         let deeper = WorkgroupMatmulShape {
             k_stage: 64,
             ..tile
         };
-        assert!(!deeper.supports(&device, MatrixTypes::F32_AS_F16));
-        assert!(deeper.supports(&device, MatrixTypes::BF16));
+        assert!(!deeper.supports(&device, MatrixTypes::F32_AS_F16, 1536, 512, 384));
+        assert!(deeper.supports(&device, MatrixTypes::BF16, 1536, 512, 384));
         device.cooperative_matrix.workgroup.max_dimension = 128;
-        assert!(!tile.supports(&device, MatrixTypes::BF16));
-        assert!(!tile.supports(&device, MatrixTypes::F32_AS_F16));
+        assert!(!tile.supports(&device, MatrixTypes::BF16, 1536, 512, 384));
+        assert!(!tile.supports(&device, MatrixTypes::F32_AS_F16, 1536, 512, 384));
 
         let overflow = WorkgroupMatmulShape {
             rows: u32::MAX - 3,
@@ -147,8 +149,8 @@ mod tests {
             ..tile
         };
         device.cooperative_matrix.workgroup.max_dimension = u32::MAX;
-        assert_eq!(overflow.shared_bytes(MatrixTypes::F32_AS_F16), None);
-        assert!(!overflow.supports(&device, MatrixTypes::F32_AS_F16));
+        assert_eq!(overflow.shared_bytes(MatrixTypes::F32_AS_F16, false), None);
+        assert!(!overflow.supports(&device, MatrixTypes::F32_AS_F16, 1536, 512, 384));
     }
 
     #[test]
@@ -160,7 +162,8 @@ mod tests {
         };
         for (dims, policy, device, expected) in [
             ((128, 256, 128), CoopPolicy::AllowF16, caps(), true),
-            ((129, 256, 128), CoopPolicy::AllowF16, caps(), false),
+            ((129, 256, 128), CoopPolicy::AllowF16, caps(), true),
+            ((128, 257, 128), CoopPolicy::AllowF16, caps(), false),
             ((128, 256, 129), CoopPolicy::AllowF16, caps(), false),
             ((128, 256, 128), CoopPolicy::NativeF32, caps(), false),
             ((128, 256, 128), CoopPolicy::Auto, caps(), false),

@@ -625,11 +625,12 @@ impl<'a> Bench<'a> {
     /// Throughput of the ordinary f32 matmul at the first size worth timing,
     /// scaled to a fully occupied machine.
     fn matmul(&mut self, profile: &mut MachineProfile) {
+        let capabilities = self.gpu.capabilities();
         let target = self.target_ms();
         let mut size = 64;
         while size <= MAX_MATMUL && !self.expired() && self.fits_memory(3 * size * size * 4) {
             let (dispatch, knobs) = matmul_dispatch(size);
-            let key = Pipelines::key(&dispatch);
+            let key = Pipelines::key(&dispatch, &capabilities);
             let pipeline = match Pipelines::compile(self.gpu, knobs, None, &dispatch, &key, None) {
                 Ok(pipeline) => pipeline,
                 Err(error) => {

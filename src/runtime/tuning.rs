@@ -41,7 +41,7 @@ pub struct KernelMemo {
 
 // Bump when kernel generation, qualification or decision semantics change,
 // including changes between package releases. This also versions the memo schema.
-const KERNEL_MEMO_REVISION: u32 = 12;
+const KERNEL_MEMO_REVISION: u32 = 13;
 
 /// Undecided classes predicted to total less than this share of the plan are
 /// not probed. Kernel winners are accepted together, so classes well below
@@ -316,8 +316,13 @@ impl Pipelines {
         self.prepare(gpu, &selected, tile.coop_config().as_ref())
     }
 
-    fn discard_unused_convolutions(&mut self, plan: &crate::compile::ExecutionPlan) {
-        let used: std::collections::HashSet<_> = plan.dispatches.iter().map(Self::key).collect();
+    fn discard_unused_convolutions(&mut self, plan: &crate::compile::ExecutionPlan, gpu: &Gpu) {
+        let capabilities = gpu.capabilities();
+        let used: std::collections::HashSet<_> = plan
+            .dispatches
+            .iter()
+            .map(|d| Self::key(d, &capabilities))
+            .collect();
         self.map.retain(|key, _| {
             let convolution = key.entry().is_some_and(|entry| {
                 matches!(
@@ -452,7 +457,12 @@ pub(super) fn tile_module(
             MatmulTile::CooperativeWorkgroup { shape, .. } => {
                 let types = super::checked_matrix_types(dispatch)
                     .unwrap_or(crate::codegen::MatrixTypes::F32_AS_F16);
-                crate::codegen::generate_workgroup_matmul(entry.shader_group(), shape, types)
+                crate::codegen::generate_workgroup_matmul(
+                    entry.shader_group(),
+                    shape,
+                    types,
+                    dispatch.mnk().is_some_and(|(m, _, _)| shape.ragged_rows(m)),
+                )
             }
             MatmulTile::SpecializedConv { .. } | MatmulTile::Gemv(_) | MatmulTile::Scalar(_) => {
                 unreachable!()
@@ -461,10 +471,14 @@ pub(super) fn tile_module(
     }
 }
 
-pub(super) fn tile_variant(dispatch: &Dispatch, tile: MatmulTile) -> Variant {
+pub(super) fn tile_variant(
+    dispatch: &Dispatch,
+    tile: MatmulTile,
+    caps: &bg::Capabilities,
+) -> Variant {
     let mut selected = dispatch.clone();
     tile.configure(&mut selected);
-    Pipelines::key(&selected)
+    Pipelines::key(&selected, caps)
 }
 
 struct SearchClass {
@@ -510,10 +524,11 @@ fn retain_tunable_classes(
             MatmulTile::CooperativeTiled { shape, .. } => {
                 shared_limit == 0 || shape.shared_bytes() <= shared_limit
             }
-            MatmulTile::CooperativeWorkgroup { shape, .. } => class
-                .key
-                .effective_matrix_types()
-                .is_some_and(|types| shape.supports(capabilities, types)),
+            MatmulTile::CooperativeWorkgroup { shape, .. } => {
+                class.key.effective_matrix_types().is_some_and(|types| {
+                    shape.supports(capabilities, types, class.key.m, class.key.n, class.key.k)
+                })
+            }
             _ => true,
         });
     }
@@ -764,8 +779,8 @@ impl Session {
             swap.left
                 .apply(&mut other.plan.dispatches[swap.index], &swap.class);
         }
-        self.pipelines.select(&self.plan.dispatches);
-        other.pipelines.select(&other.plan.dispatches);
+        self.pipelines.select(&self.plan.dispatches, &self.gpu);
+        other.pipelines.select(&other.plan.dispatches, &other.gpu);
         Ok(swaps.len())
     }
 
@@ -1158,9 +1173,10 @@ impl Session {
             let _timer = PhaseTimer::new(&mut report.final_cleanup);
             staging.clear();
             self.wait();
-            self.pipelines.discard_unused_convolutions(&self.plan);
+            self.pipelines
+                .discard_unused_convolutions(&self.plan, &self.gpu);
         }
-        self.pipelines.select(&self.plan.dispatches);
+        self.pipelines.select(&self.plan.dispatches, &self.gpu);
         report.scratch = Some(staging.stats);
         report.elapsed = start.elapsed();
         report.time_budget_exhausted |= report.elapsed >= options.max_time;
@@ -1272,6 +1288,7 @@ impl Session {
         outcome: &mut TuneOutcome,
         staging: &mut Staging<'_>,
     ) {
+        let capabilities = self.gpu.capabilities();
         let phases = outcome
             .phase_times
             .as_mut()
@@ -1458,9 +1475,13 @@ impl Session {
                     .map(|(position, dispatch)| {
                         let key = if position > 0 || (i == 1 && outcome.candidate_split_k.is_some())
                         {
-                            Pipelines::key(dispatch)
+                            Pipelines::key(dispatch, &capabilities)
                         } else {
-                            tile_variant(dispatch, [outcome.initial, outcome.candidate][i])
+                            tile_variant(
+                                dispatch,
+                                [outcome.initial, outcome.candidate][i],
+                                &capabilities,
+                            )
                         };
                         (&self.pipelines.map[&key].raw, dispatch)
                     })
@@ -2600,8 +2621,8 @@ mod memo_tests {
                 ..Default::default()
             };
             assert_ne!(
-                tile_variant(&dispatch, contiguous),
-                tile_variant(&dispatch, interleaved)
+                tile_variant(&dispatch, contiguous, &bg::Capabilities::default()),
+                tile_variant(&dispatch, interleaved, &bg::Capabilities::default())
             );
         }
         let directory = TestDirectory::new();
@@ -2776,7 +2797,8 @@ mod tests {
             (None, false, F16, 32768, 1024, 256, false),
             (Some(F16), false, F16, 32768, 16, 256, false),
             (Some(F16), false, F16, 0, 1024, 256, false),
-            (Some(F16), false, F16, 32768, 1024, 257, false),
+            (Some(F16), false, F16, 32768, 1024, 257, true),
+            (Some(F16), false, F16, 16384, 1024, 257, false),
         ] {
             let mut caps = bg::Capabilities {
                 shader_float16: true,
@@ -3406,9 +3428,12 @@ mod tests {
             },
             ..Default::default()
         };
-        assert!(matches!(Pipelines::key(&dispatch), Variant::GemvIntDot(..)));
         assert!(matches!(
-            tile_variant(&dispatch, MatmulTile::Gemv(shape)),
+            Pipelines::key(&dispatch, &bg::Capabilities::default()),
+            Variant::GemvIntDot(..)
+        ));
+        assert!(matches!(
+            tile_variant(&dispatch, MatmulTile::Gemv(shape), &bg::Capabilities::default()),
             Variant::GemvIntDot(_, format, selected) if format == crate::compile::WeightFormat::Q40 && selected == shape
         ));
         assert!(
@@ -3426,7 +3451,7 @@ mod tests {
             ..dispatch
         };
         assert!(matches!(
-            Pipelines::key(&ordinary),
+            Pipelines::key(&ordinary, &bg::Capabilities::default()),
             Variant::Weight(_, crate::compile::WeightFormat::Q40)
         ));
     }
@@ -3752,8 +3777,8 @@ mod tests {
         for &index in &class.members {
             alternative.apply(&mut b.plan.dispatches[index], &class.key);
         }
-        b.pipelines.discard_unused_convolutions(&b.plan);
-        b.pipelines.select(&b.plan.dispatches);
+        b.pipelines.discard_unused_convolutions(&b.plan, &b.gpu);
+        b.pipelines.select(&b.plan.dispatches, &b.gpu);
         if convolution {
             assert!(b.pipelines.map.len() < pipeline_count);
         }
@@ -4386,7 +4411,7 @@ mod tests {
                 };
                 if convolution && !specialized {
                     assert_eq!(
-                        tile_variant(&dispatch, tile),
+                        tile_variant(&dispatch, tile, &bg::Capabilities::default()),
                         Variant::Scalar(tile.shader(&entry))
                     );
                 }

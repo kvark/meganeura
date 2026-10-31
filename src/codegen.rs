@@ -824,7 +824,7 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
             },
             [16, 16, 16],
             0,
-            false,
+            TypedMatmulLayout::default(),
         ),
         ShaderGroup::ToBF16 | ShaderGroup::FromBF16 => {
             let narrowing = group == ShaderGroup::ToBF16;
@@ -1039,11 +1039,13 @@ pub fn generate_module_coop_typed_with_shape(
 
 /// Storage layout specialization of the shared cooperative dense generator.
 /// Vector bindings must cover whole vectors; direct matrix stores must cover
-/// whole native output tiles. The generic form safely handles arbitrary tails.
+/// whole 16×16 per-subgroup output blocks. The generic form safely handles arbitrary tails.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TypedMatmulLayout {
     pub vectorized: bool,
     pub direct_output: bool,
+    /// Native operands may bypass staging when all 32x32 K/output tiles fit.
+    pub direct_inputs: bool,
 }
 
 impl TypedMatmulLayout {
@@ -1051,6 +1053,9 @@ impl TypedMatmulLayout {
         Self {
             vectorized: (u64::from(m) * u64::from(k)).is_multiple_of(4)
                 && (u64::from(k) * u64::from(n)).is_multiple_of(4),
+            direct_inputs: matches!(types.multiply, crate::DType::F16 | crate::DType::BF16)
+                && [m, n, k].into_iter().all(|s| s.is_multiple_of(32))
+                && (types.a == types.multiply || types.b == types.multiply),
             direct_output: types.output == crate::DType::F32
                 && !addend
                 && m.is_multiple_of(16)
@@ -1104,7 +1109,7 @@ pub(crate) fn generate_module_coop_typed_with_subgroup(
             Some((types, layout)),
         );
     }
-    cooperative::generate(group, types, shape, subgroup, layout.vectorized)
+    cooperative::generate(group, types, shape, subgroup, layout)
 }
 
 pub(crate) fn generate_checked_conv(
@@ -1114,7 +1119,21 @@ pub(crate) fn generate_checked_conv(
     params: &crate::kernels::conv::Params,
     subgroup: u32,
 ) -> ShaderModule {
-    cooperative::generate_with_params(group, types, shape, Some(params), subgroup, false)
+    // Keep native C stores inside each channel's spatial row.
+    let direct_output = types.output == crate::DType::F32
+        && params.out_channels.is_multiple_of(16)
+        && (u64::from(params.out_h) * u64::from(params.out_w)).is_multiple_of(16);
+    cooperative::generate_with_params(
+        group,
+        types,
+        shape,
+        Some(params),
+        subgroup,
+        TypedMatmulLayout {
+            direct_output,
+            ..Default::default()
+        },
+    )
 }
 
 /// [`generate_module_coop`] reading B in `format`: f32, or f16 with f16-input
@@ -5552,4 +5571,39 @@ mod tests {
             );
         }
     }
+}
+
+/// Assign test bindings, validate the module and exercise SPIR-V emission.
+#[cfg(test)]
+pub(crate) fn validate_shader_for_test(
+    module: &mut naga::Module,
+    caps: naga::valid::Capabilities,
+    version: (u8, u8),
+) -> Result<(), String> {
+    let mut binding = 0;
+    for (_, global) in module.global_variables.iter_mut() {
+        if matches!(
+            global.space,
+            naga::AddressSpace::Uniform | naga::AddressSpace::Storage { .. }
+        ) {
+            global.binding = Some(naga::ResourceBinding { group: 0, binding });
+            binding += 1;
+        }
+    }
+    let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), caps)
+        .validate(module)
+        .map_err(|e| format!("{e:?}"))?;
+    let words = naga::back::spv::write_vec(
+        module,
+        &info,
+        &naga::back::spv::Options {
+            lang_version: version,
+            flags: naga::back::spv::WriterFlags::empty(),
+            ..Default::default()
+        },
+        None,
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    assert!(!words.is_empty());
+    Ok(())
 }
