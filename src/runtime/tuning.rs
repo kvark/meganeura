@@ -960,6 +960,7 @@ impl Session {
     ) -> Result<TuneReport, TuneError> {
         options.validate()?;
         let start = Instant::now();
+        let capabilities = self.gpu.capabilities();
         if let Some(memo) = memo.as_deref_mut() {
             memo.bind(&self.gpu, &options, self.gpu_timing);
         }
@@ -987,6 +988,7 @@ impl Session {
                 && (self.pipelines.map.contains_key(&tile_variant(
                     &self.plan.dispatches[class.members[0]],
                     progress.selected,
+                    &capabilities,
                 )) || (start.elapsed() < options.max_time
                     && self
                         .pipelines
@@ -3204,6 +3206,7 @@ mod tests {
         let (classes, _) = session.tune_classes(&options);
         let tail = classes.last().unwrap();
         let template = session.plan.dispatches[tail.members[0]].clone();
+        let capabilities = gpu.capabilities();
         let selected = *tail
             .challengers
             .iter()
@@ -3211,7 +3214,7 @@ mod tests {
                 !session
                     .pipelines
                     .map
-                    .contains_key(&tile_variant(&template, tile))
+                    .contains_key(&tile_variant(&template, tile, &capabilities))
             })
             .unwrap();
         let mut memo = KernelMemo::default();

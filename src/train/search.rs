@@ -967,9 +967,9 @@ impl Implementations {
     }
 }
 
-/// Checked typed products preserve the F32 binding contract, including tails.
-/// Conversion happens inside each timed dispatch. This also reaches rectangular
-/// subgroup shapes and workgroup tuning without the legacy square-tile heuristic.
+/// Checked typed products preserve the existing F32 or F16 weight bindings,
+/// including tails. Conversion happens inside each timed dispatch. This reaches
+/// rectangular subgroup shapes and workgroup tuning without the legacy heuristic.
 fn fill_matrix_candidates(
     plan: &mut ExecutionPlan,
     multiply: crate::DType,
@@ -1063,6 +1063,11 @@ fn fill_dense_product(
     multiply: crate::DType,
     replace_extracted: bool,
 ) -> bool {
+    let b = match (d.weight_format, multiply) {
+        (compile::WeightFormat::F32, _) => crate::DType::F32,
+        (compile::WeightFormat::F16, crate::DType::F16) if !d.is_derivative => crate::DType::F16,
+        _ => return false,
+    };
     if !d.shader.is_matmul()
         || !matches!(
             d.kernel,
@@ -1074,7 +1079,6 @@ fn fill_dense_product(
         )
         || (d.schedule_locked && !replace_extracted)
         || d.horizontal_batch > 1
-        || d.weight_format != compile::WeightFormat::F32
         || d.matmul_prologue.is_some()
         || d.matmul_epilogue.is_some()
     {
@@ -1098,8 +1102,12 @@ fn fill_dense_product(
     if !compile::workgroups_within_portable_limits(grid) {
         return false;
     }
+    // Legacy F16 parameters already contain packed half values. Describe
+    // that binding explicitly; keep plan.weight_buffers for host uploads.
+    d.weight_format = compile::WeightFormat::F32;
     d.kernel = compile::Kernel::CooperativeTyped {
         types: crate::codegen::MatrixTypes {
+            b,
             multiply,
             ..crate::codegen::MatrixTypes::F32_AS_F16
         },
@@ -1973,6 +1981,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn typed_candidates_preserve_legacy_f16_weight_storage() {
+        use crate::{DType, compile::WeightFormat};
+        let mut graph = Graph::new();
+        let a = graph.input("a", &[64, 1024]);
+        let b = graph.parameter_f16("b", &[1024, 128]);
+        let y = graph.matmul(a, b);
+        graph.set_outputs(vec![y]);
+        let original = compile::compile(&graph);
+        let dispatch = &original.dispatches[0];
+        assert_eq!(dispatch.weight_format, WeightFormat::F16);
+        let mut candidate = original.clone();
+        assert_eq!(
+            fill_matrix_candidates(&mut candidate, DType::F16, false),
+            1,
+            "a legacy F16 weight must not hide a legal typed mixed-storage alternative"
+        );
+        assert_eq!(
+            candidate.dispatches[0].weight_format,
+            WeightFormat::F32,
+            "typed storage replaces opaque-format dispatch metadata"
+        );
+        assert!(matches!(candidate.dispatches[0].kernel,
+            compile::Kernel::CooperativeTyped {types, splits:1}
+                if types.a == DType::F32 && types.b == DType::F16
+                    && types.multiply == DType::F16 && types.output == DType::F32));
+        let mut bf16 = original.clone();
+        assert_eq!(
+            fill_matrix_candidates(&mut bf16, DType::BF16, false),
+            0,
+            "F16 storage cannot be reinterpreted as BF16"
+        );
+        assert_eq!(bf16, original);
     }
 
     #[test]
