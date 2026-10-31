@@ -926,18 +926,33 @@ pub struct Node {
     /// scalar `attention_ept_cap`; `None` retains ordinary kernel selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention_impl: Option<AttentionImpl>,
-    /// Prevent reduced-precision kernel promotion for numerically sensitive
-    /// work derived by autodiff. Forward tensors remain logically f32 too;
-    /// this flag only constrains optional runtime accelerations such as
-    /// f16-input cooperative matrices.
+    /// Explicitly prevent optional reduced-input arithmetic. Autodiff's
+    /// automatic derivative guard is tracked separately by `is_derivative`.
+    /// Explicit pins also propagate through derivative consumers; pinning a late
+    /// forward layer may therefore pin derivatives of earlier layers.
     #[serde(default)]
     pub requires_full_precision: bool,
+    /// Automatically protected derivative work; measured arithmetic may qualify
+    /// a reduced-input implementation without overriding an explicit pin.
+    #[serde(default)]
+    pub is_derivative: bool,
     /// Optional human-readable name (e.g. `"blk7.mlp.gate"`). Carried through
     /// autodiff, rewrites, and compilation so dispatch labels, profiler rows,
     /// plan dumps, and debug readback can address values by name instead of
     /// bare node ids.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+impl Node {
+    /// Guard used by ordinary construction and storage/fusion passes.
+    pub fn full_precision(&self) -> bool {
+        self.requires_full_precision || self.is_derivative
+    }
+
+    pub(crate) fn precision_key(&self) -> (bool, bool) {
+        (self.requires_full_precision, self.is_derivative)
+    }
 }
 
 /// How a derived parameter is computed from its source(s).
@@ -966,10 +981,9 @@ pub struct DerivedParam {
 pub struct Graph {
     nodes: Vec<Node>,
     outputs: Vec<NodeId>,
-    /// Precision policy inherited by newly appended nodes. Autodiff switches
-    /// this on after copying the forward graph so all derivative work is
-    /// marked without giving gradient ops a parallel set of IR variants.
+    /// Explicit precision policy inherited by newly appended nodes.
     new_nodes_require_full_precision: bool,
+    new_nodes_are_derivatives: bool,
     /// Number of trailing entries in `outputs` that are parameter gradients
     /// appended by autodiff (positionally aligned with `param_buffers` in the
     /// compiled plan). The leading `outputs.len() - num_param_grad_outputs`
@@ -985,6 +999,7 @@ impl Graph {
             nodes: Vec::new(),
             outputs: Vec::new(),
             new_nodes_require_full_precision: false,
+            new_nodes_are_derivatives: false,
             num_param_grad_outputs: 0,
             derived_params: Vec::new(),
         }
@@ -1009,6 +1024,7 @@ impl Graph {
             nodes,
             outputs,
             new_nodes_require_full_precision,
+            new_nodes_are_derivatives,
             num_param_grad_outputs,
             derived_params,
         } = self;
@@ -1115,6 +1131,7 @@ impl Graph {
             nodes: new_nodes,
             outputs: new_outputs,
             new_nodes_require_full_precision,
+            new_nodes_are_derivatives,
             num_param_grad_outputs,
             derived_params,
         }
@@ -1164,15 +1181,27 @@ impl Graph {
     }
 
     pub fn add_raw_node(&mut self, op: Op, inputs: Vec<NodeId>, ty: TensorType) -> NodeId {
-        self.add_raw_node_with_precision(op, inputs, ty, self.new_nodes_require_full_precision)
+        let requires_full_precision = self.new_nodes_require_full_precision
+            || (self.new_nodes_are_derivatives
+                && inputs
+                    .iter()
+                    .any(|&id| self.node(id).requires_full_precision));
+        self.add_raw_node_with_flags(
+            op,
+            inputs,
+            ty,
+            requires_full_precision,
+            self.new_nodes_are_derivatives,
+        )
     }
 
-    pub(crate) fn add_raw_node_with_precision(
+    pub(crate) fn add_raw_node_with_flags(
         &mut self,
         op: Op,
         inputs: Vec<NodeId>,
         ty: TensorType,
         requires_full_precision: bool,
+        is_derivative: bool,
     ) -> NodeId {
         let id = self.nodes.len() as NodeId;
         self.nodes.push(Node {
@@ -1181,6 +1210,7 @@ impl Graph {
             inputs,
             ty,
             requires_full_precision,
+            is_derivative,
             name: None,
             matmul_impl: None,
             attention_ept_cap: None,
@@ -1211,6 +1241,7 @@ impl Graph {
             nodes: self.nodes.clone(),
             outputs: self.outputs.clone(),
             new_nodes_require_full_precision: self.new_nodes_require_full_precision,
+            new_nodes_are_derivatives: self.new_nodes_are_derivatives,
             num_param_grad_outputs: self.num_param_grad_outputs,
             derived_params: self.derived_params.clone(),
         }
@@ -1219,6 +1250,21 @@ impl Graph {
     /// Mark subsequently appended nodes as numerically sensitive derivative
     /// work. This is intentionally crate-private: graph authors express f32
     /// tensors as usual, while autodiff owns the forward/backward boundary.
+    pub(crate) fn begin_derivative_region(&mut self) {
+        self.new_nodes_are_derivatives = true;
+        self.new_nodes_require_full_precision = false;
+    }
+
+    pub(crate) fn pin_new_derivatives(&mut self, pinned: bool) {
+        assert!(self.new_nodes_are_derivatives);
+        if pinned {
+            self.begin_full_precision_region();
+        } else {
+            self.new_nodes_require_full_precision = false;
+        }
+    }
+
+    /// Pin subsequently appended nodes against optional reduced-input arithmetic.
     pub(crate) fn begin_full_precision_region(&mut self) {
         self.new_nodes_require_full_precision = true;
     }

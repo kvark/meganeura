@@ -2903,6 +2903,10 @@ fn select_conv_paths(
         let Some(problem) = conv::Problem::of(&plan.dispatches[index]) else {
             continue;
         };
+        let target = conv::Target {
+            allow_raw_f16: target.allow_raw_f16 && !plan.dispatches[index].requires_full_precision,
+            ..target
+        };
         if conv::select(&problem, &target) != conv::Path::Cooperative {
             continue;
         }
@@ -2940,6 +2944,10 @@ fn select_matmul_paths(
     for index in 0..plan.dispatches.len() {
         let Some(problem) = matmul::Problem::of(&plan.dispatches[index]) else {
             continue;
+        };
+        let target = matmul::Target {
+            allow_raw_f16: target.allow_raw_f16 && !plan.dispatches[index].requires_full_precision,
+            ..target
         };
         match matmul::select(&problem, &target) {
             matmul::Path::Cooperative => {
@@ -3276,10 +3284,11 @@ pub struct SessionOptions {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CoopPolicy {
     /// Prefer f32 operands and accumulators. On f16-only devices, enable f16 tiles for
-    /// work that permits reduced input precision; `requires_full_precision`
-    /// dispatches retain scalar f32 operands. Measured search also considers
+    /// work that permits reduced input precision; explicitly pinned and ordinary
+    /// derivative dispatches retain scalar f32 operands. Measured search also considers
     /// device-qualified F16/BF16 forward products and mixed-precision attention
-    /// derivatives, subject to the caller's whole-program accuracy and timing gates.
+    /// derivatives and AT/BT derivative products, subject to the caller's whole-program
+    /// accuracy and timing gates. Explicit precision pins are never bypassed.
     #[default]
     Auto,
     /// Allow only f32 cooperative operands and accumulators, without f16
@@ -3293,7 +3302,7 @@ pub enum CoopPolicy {
     /// Use f16 tiles without residual compensation, including for
     /// derivative work. Faster than [`Self::Auto`] on f16-only devices,
     /// and can overflow or lose gradient range. Measured search also considers
-    /// device-qualified typed F16 candidates for eligible forward products,
+    /// device-qualified typed F16/BF16 candidates for eligible forward and AT/BT derivative products,
     /// subject to the caller's whole-program accuracy and timing gates.
     AllowF16,
 }

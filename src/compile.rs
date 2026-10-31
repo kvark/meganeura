@@ -1154,6 +1154,7 @@ fn merge_horizontal(dispatches: &[Dispatch], batch: &[usize]) -> Dispatch {
     for (k, &idx) in batch.iter().enumerate() {
         let d = &dispatches[idx];
         merged.requires_full_precision |= d.requires_full_precision;
+        merged.is_derivative |= d.is_derivative;
         merged.input_buffers.push(d.input_buffers[1]);
         if k == 0 {
             merged.output_buffer = d.output_buffer;
@@ -1190,11 +1191,14 @@ pub struct Dispatch {
     /// count when this is ≥ 2 (only applied when the original Z was 1).
     #[serde(default)]
     pub horizontal_batch: u32,
-    /// The dispatch belongs to numerically sensitive derivative work and may
-    /// not be promoted to a reduced-input-precision implementation. Native
-    /// f32 cooperative kernels remain eligible.
+    /// Explicitly forbid optional reduced-input arithmetic. Native F32
+    /// cooperative kernels remain eligible; automatic derivative protection
+    /// is tracked separately by `is_derivative`.
     #[serde(default)]
     pub requires_full_precision: bool,
+    /// Automatic derivative guard, independent of an explicit precision pin.
+    #[serde(default)]
+    pub is_derivative: bool,
     /// Prevent this dispatch from being absorbed into a producer or consumer.
     /// Used for explicit memory-placement boundaries such as [`Op::Materialize`].
     #[serde(default)]
@@ -1224,8 +1228,8 @@ pub struct Dispatch {
     /// Storage format of the B (weight) input buffer.
     #[serde(default)]
     pub weight_format: WeightFormat,
-    /// Explicit BF16 conversion boundaries folded into a generated pointwise
-    /// kernel. Scalar arithmetic remains F32. Never inferred from a timing.
+    /// Reduced storage boundaries in generated scalar kernels. Expressions
+    /// remain F32; automatic stores follow the readers' chosen matrix types.
     #[serde(default)]
     pub pointwise_storage: crate::schedule::PointwiseStorage,
 }
@@ -1293,6 +1297,11 @@ pub enum Kernel {
 }
 
 impl Dispatch {
+    /// Guard used by ordinary construction and storage/fusion passes.
+    pub fn full_precision(&self) -> bool {
+        self.requires_full_precision || self.is_derivative
+    }
+
     /// Logical `(m, n, k)` dimensions, accounting for shader parameter order.
     pub fn mnk(&self) -> Option<(u32, u32, u32)> {
         let p = &self.params;
@@ -1494,7 +1503,7 @@ impl ExecutionPlan {
                     e.inputs.iter().map(|i| i.1.clone()).collect::<Vec<_>>()
                 };
                 format!(
-                    "{:?} {:?} {:?} {:?} in={} extra={} epilogue={:?} prologue={:?} norm={:?} weights={:?} batch={} full={}",
+                    "{:?} {:?} {:?} {:?} in={} extra={} epilogue={:?} prologue={:?} norm={:?} weights={:?} batch={} precision={:?}",
                     d.shader,
                     d.kernel,
                     d.params,
@@ -1508,7 +1517,7 @@ impl ExecutionPlan {
                     d.gemv_rmsnorm.as_ref().map(|n| n.eps_bits),
                     d.weight_format,
                     d.horizontal_batch,
-                    d.requires_full_precision,
+                    (d.requires_full_precision, d.is_derivative),
                 )
             })
             .collect();
@@ -1575,7 +1584,11 @@ impl ExecutionPlan {
                 (&d.params, d.workgroups, reads),
                 (epilogue, prologue, norm),
                 structural_key(&d.weight_format),
-                (d.horizontal_batch, d.requires_full_precision),
+                (
+                    d.horizontal_batch,
+                    d.requires_full_precision,
+                    d.is_derivative,
+                ),
             ));
             for (slot, out) in std::iter::once(&d.output_buffer)
                 .chain(&d.extra_outputs)
@@ -2624,6 +2637,7 @@ fn is_plain_rmsnorm(dispatch: &Dispatch) -> bool {
     // The canonical generated norm only: after pointwise or gather fusion
     // the reduction differs, and a dedicated runtime shader cannot replace it.
     dispatch.input_buffers.len() == 2
+        && dispatch.pointwise_storage == crate::schedule::PointwiseStorage::default()
         && dispatch.params.len() >= 3
         && dispatch.reduction()
             == Some(&rmsnorm_kernel(
@@ -2963,6 +2977,7 @@ fn fuse_winograd_add(plan: &mut ExecutionPlan) {
             fused.output_buffer = consumer.output_buffer;
             fused.origin.extend_from_slice(&consumer.origin);
             fused.requires_full_precision |= consumer.requires_full_precision;
+            fused.is_derivative |= consumer.is_derivative;
             plan.dispatches[ci] = fused;
             remove.push(pi);
             break;
@@ -3022,6 +3037,7 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
         let primary_buf = d.input_buffers[0];
         let elem_output = d.output_buffer;
         let consumer_requires_full_precision = d.requires_full_precision;
+        let consumer_is_derivative = d.is_derivative;
 
         // The elementwise op reads from primary_buf. Find the matmul that produced it.
         let Some(&prod_idx) = producer.get(&primary_buf) else {
@@ -3069,6 +3085,7 @@ fn fuse_epilogues(plan: &mut ExecutionPlan) {
             });
         }
         dispatches[prod_idx].requires_full_precision |= consumer_requires_full_precision;
+        dispatches[prod_idx].is_derivative |= consumer_is_derivative;
         dispatches[prod_idx].output_buffer = elem_output;
         let absorbed_origin = dispatches[i].origin.clone();
         dispatches[prod_idx].origin.extend(absorbed_origin);

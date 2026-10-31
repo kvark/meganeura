@@ -75,7 +75,7 @@ fn node_signature(graph: &Graph, id: usize) -> u64 {
     }
     node.ty.shape.hash(&mut h);
     format!("{:?}", node.ty.dtype).hash(&mut h);
-    node.requires_full_precision.hash(&mut h);
+    node.precision_key().hash(&mut h);
     node.inputs.len().hash(&mut h);
     h.finish()
 }
@@ -122,7 +122,7 @@ fn pair_isomorphic(graph: &Graph, start: usize, period: usize, m: usize) -> bool
         if !ops_equivalent(&a.op, &b.op)
             || a.ty != b.ty
             || a.inputs.len() != b.inputs.len()
-            || a.requires_full_precision != b.requires_full_precision
+            || a.precision_key() != b.precision_key()
         {
             return false;
         }

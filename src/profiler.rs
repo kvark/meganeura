@@ -684,7 +684,7 @@ fn capture_windows(
             output_buffer_bytes,
             cooperative: dispatch.use_coop(),
             small_tile: dispatch.use_small_tiles(),
-            requires_full_precision: dispatch.requires_full_precision,
+            requires_full_precision: dispatch.full_precision(),
             weight_format: format!("{:?}", dispatch.weight_format),
             has_prologue: dispatch.matmul_prologue.is_some(),
             has_epilogue: dispatch.matmul_epilogue.is_some(),
