@@ -1,25 +1,28 @@
 # P3HPC presentation
 
-This is the main 20-minute talk: 17 main slides with about 17:50 of suggested
+This is the main 20-minute talk: 18 main slides with about 18:15 of suggested
 speaking time, followed by a backup index and 26 backups. It asks whether
 Vulkan and Metal can carry ML training and inference, and answers in the
-workshop's three parts. The header on every main slide names the parts and
-highlights the current one.
+workshop's three parts between an introduction and a conclusion. The header
+on every main slide names the sections and highlights the current one.
 
-- **Productivity:** one small stack; writing and training a model in Rust,
-  with the ONNX, NNEF and GGUF importers; how we know it is right; the search
-  that adapts the same code to each GPU.
+- **Introduction:** one GPU, two stacks; the stack comparison.
+- **Productivity:** writing and training a model in Rust,
+  with the ONNX, NNEF and GGUF importers; how we know it is right; the e-graph
+  that holds the candidate forms; the search that adapts the same code to each
+  GPU.
 - **Portability:** which hardware features we reach; same GPU, different
-  limits; the headset application; the MI300X driver.
+  limits; DinoVision, trained on an RTX 3050 under Windows and deployed on the
+  Quest 3S; the MI300X driver.
 - **Performance:** the five models and eleven GPUs, and the measurement
   protocol; strict f32 and reduced-precision results for inference and
   training; single GEMMs and convolutions against the vendor libraries;
   changes since the paper.
-- **Conclusion:** two slides. What Meganeura shows: one compact binary
+- **Conclusion:** two slides. Whether Vulkan and Metal reach the vendor
+  stacks: some GPUs already match, and the rest splits into our kernels and
+  what the drivers expose. Then what Meganeura shows: one compact binary
   trains and runs on every GPU we tried, with no runtime dependencies, within
-  2× of PyTorch. Whether Vulkan and Metal reach the vendor stacks: some GPUs
-  already match, and the rest splits into our kernels and what the drivers
-  expose.
+  2× of PyTorch.
 
 The code on "How do we write a model?" and on the "Importing a model" backup
 type-checks against the crate's public API (`Graph`, `nn::Linear`,
@@ -130,11 +133,11 @@ analyzer; its docstring lists the steps. The protocol changed between the two
 runs, so the comparison does not isolate a compiler speedup.
 
 "Where is the gap? One op at a time" comes from `data/op-bench.tsv`: one
-strict-f32 GEMM or batch-1 convolution per process on the RX 7900 XT (October
-31, RADV Mesa 26.0.8; Meganeura 5b232bd, one process per shape) and the RTX
-5070 and B570 (October 31; Meganeura e40648f, which adds the tuner scratch fix,
-median of three processes per shape in `data/op-bench/meganeura-runs.tsv`),
-with the kernel tuner on and cooperative matrices off, against PyTorch 2.13.0
+strict-f32 GEMM or batch-1 convolution per process on the RX 7900 XT (RADV
+Mesa 26.0.8), RTX 5070 and B570, all on October 31 at Meganeura e40648f, which
+adds the tuner scratch fix, with the kernel tuner on and cooperative matrices
+off. Each Meganeura row is the median of three processes; the RTX 5070 and
+B570 trials are in `data/op-bench/meganeura-runs.tsv`. PyTorch 2.13.0 runs
 with TF32 off and `cudnn.benchmark` on. Our GPU time sums Vulkan pass
 timestamps; PyTorch's is a device interval around a graph of 30 serial ops,
 divided by 30, with the profiler off, since profiling slows ROCm execution.
