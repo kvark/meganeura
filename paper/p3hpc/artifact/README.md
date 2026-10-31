@@ -74,3 +74,19 @@ include the old search ablation. See [SUPPLEMENT.md](SUPPLEMENT.md).
 `footprint.py`, and `ablation.tex` are historical. Do not run their older
 protocol checks against the new collection. Legacy verification of the
 original arXiv evidence remains separate in `verify.py` and `test_verify.py`.
+
+### Derived gap accounting and local shader ablation
+
+`gap_analysis.py` uses the frozen result CSV on identical qualified model sets
+and generates `gap.json`/`gap.tex` without GPU execution. It also checks the
+retained samples in `attention-followup.json`, including the separate
+serial/four-lane F32 anchor comparison, and generates
+`attention-followup.tex`. The latter is a separate October 24 experiment,
+not part of the final cohort, its coverage or its PyTorch ratios. Its
+candidate shader revision, diagnostic runner hash, limitations and per-arm
+samples are retained in the JSON. Replaying this analysis does not reproduce
+the GPU experiment or independently audit its numerical qualification.
+
+```sh
+python3 paper/p3hpc/artifact/gap_analysis.py --check paper/p3hpc/tables
+```

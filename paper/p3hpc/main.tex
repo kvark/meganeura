@@ -54,7 +54,9 @@ point, \system{}'s median time is $1.35\times$ PyTorch's for inference and
 $1.61\times$ for training. It wins most comparisons on an AMD RX~7900~XT and
 loses all of them on an Intel Arc~B570. Allowing reduced precision widens the
 gap to $2.06\times$ and $2.21\times$: PyTorch's own times fall by a median
-factor of 1.5 to 1.6, \system{}'s by 1--3\%. The same checks pass on three
+factor of 1.5 to 1.6, \system{}'s by 1--3\%. A separate attention-kernel
+ablation improves RTX~5070 training by 3.6--13.3\% without changing the API
+or numerical bounds, but is not uniformly beneficial on Intel. The same checks pass on three
 integrated GPUs and a Quest~3S headset, and \system{} runs inside an Android
 XR application, sharing the Vulkan queue with rendering.
 \end{abstract}
@@ -99,13 +101,14 @@ macOS, with five workloads under two arithmetic contracts. Every timed result
 must first pass numerical checks. Three more integrated GPUs and the Adreno
 GPU of an Android Quest~3S headset are checked against CPU references without
 timing, and an Android XR application on the same headset tests deployment.
-All of it comes from one collection in October 2026, at frozen compiler and
-harness revisions.
+The primary comparison comes from one October 2026 collection at frozen
+compiler and harness revisions. Section~\ref{sec:gaps} separately reports
+a local kernel ablation without replacing any cohort result.
 
 PyTorch is faster in most comparisons, but the spread across platforms is
 large. In strict f32, \system{} is faster in 11 of 13 comparisons on the
 RX~7900~XT and in none on the Arc~B570. Reduced precision helps PyTorch far
-more than \system{}: autocast moves PyTorch's forward and backward matrix
+more than the measured \system{} revision: autocast moves PyTorch's forward and backward matrix
 work onto the GPUs' matrix units, while \system{}'s search seldom selects
 matrix kernels on NVIDIA and never on the B570, and its derivatives stay in
 f32. No shipping Vulkan driver supports the MI300X; it runs the same engine
@@ -118,6 +121,9 @@ Our contributions are:
         with compiled PyTorch on seven GPUs from four vendors, including the
         points where each stack fails (Sections~\ref{sec:method}
         and~\ref{sec:results}).
+  \item An accounting of the performance gap on identical qualified conditions,
+        and a controlled attention-kernel study distinguishing exposed features
+        from accurate, profitable implementations (Section~\ref{sec:gaps}).
   \item A working Vulkan compute path on MI300X through experimental Mesa
         and AMDGPU patches (Section~\ref{sec:availability}).
   \item Measurements of compile-time graph and kernel search: what it
@@ -539,8 +545,7 @@ cells where each engine qualified under both contracts, it cuts PyTorch's
 median time by a factor of 1.50 for inference and 1.56 for training, and
 \system{}'s by 1.03 and 1.01. Per GPU, over the workloads where both engines
 qualified, PyTorch's median gain is 1.22--3.12 on the NVIDIA GPUs, the
-RX~7900~XT, and the B570, where autocast moves its matrix work in both
-directions onto the matrix units. On the H100, accelerated SmolLM2 training
+RX~7900~XT, and the B570, where autocast permits matrix-unit implementations in both directions. On the H100, accelerated SmolLM2 training
 takes 17.49\,ms in \system{} and 4.77\,ms in PyTorch. On the MI300X and M3,
 PyTorch gains little or slows down, with median gains of 0.76 and 1.08 for
 inference and 0.85 and 0.69 for training. \system{} already uses f32 matrix
@@ -557,33 +562,123 @@ minimal-shape process took 5.310\,ms against 1.773 and 1.772\,ms for the
 other two, with the same selected program; that phase has no PyTorch
 comparison anyway. The CSV keeps every process median.
 
-\subsection{Where the time goes}
+\subsection{Accounting for the gap}
 \label{sec:gaps}
 
-Host-wall time includes command recording, submission, waiting, and GPU
-execution, and this collection has no device timeline to divide a gap among
-them. The search receipts do show how much matrix work each selected program
-has. Under the strict contract, only the M3 and MI300X programs use matrix
-tiles, in up to 513 and 543 dispatches per program. Under the accelerated
-contract, the selected NVIDIA programs use matrix kernels in at most 19
-dispatches, all in forward regions. Six of 42 sessions on each NVIDIA GPU
-reuse workgroup-scope kernel decisions through
-\code{VK\_NV\_cooperative\_matrix2} \cite{khronos2024cooperative2}, and BF16
-is selected in three sessions each on the RTX~5070 and RTX~3050 and in none
-on the H100. The B570 advertises rectangular $8\times16\times16$ f16 and
-BF16 tiles, which the compiler accepts, yet none of its 42 accelerated
-sessions selects a matrix dispatch. The MI300X's Vulkan driver exposes f16
-and f32 tiles but no BF16, while ROCm PyTorch uses BF16. So the matrix
-extensions that the H100 and B570 do expose are rarely used: the search
-seldom selects the matrix kernels it has, and derivatives never use them.
+\emph{Two gaps, measured on the same conditions.}
+An existing strict-f32 gap and unequal gains from reduced precision should
+not be pooled into one explanation. For one GPU, model and phase, let
+$R_s=T_{M,s}/T_{P,s}$, $R_a=T_{M,a}/T_{P,a}$, and let each engine's speedup
+be $S_E=T_{E,s}/T_{E,a}$. Then
+\begin{equation}
+ R_a = R_s\,\frac{S_P}{S_M}.
+ \label{eq:gap}
+\end{equation}
+We evaluate this identity only where both engines qualify under both
+contracts. Geometric means preserve it across conditions; medians do not.
+Table~\ref{tab:gap} therefore uses geometric means on these identical sets,
+rather than dividing the medians of differently covered populations in
+Section~\ref{sec:performance}. On 32 common inference conditions, the ratio
+rises from 1.28 to 2.06: PyTorch gains $1.69\times$, \system{} $1.05\times$.
+On 30 common training conditions, it rises from 1.57 to 2.46, with gains of
+$1.59\times$ and $1.02\times$. Unequal acceleration multiplies the existing
+gap by 1.61 and 1.56 respectively. This accounts for the widening; it does
+not identify where either engine spends time or imply identical learning
+quality under the different gates.
 
-Other hardware paths stay out of reach of Vulkan shaders altogether. Hopper's CUDA
-path issues asynchronous matrix operations across a 128-thread warpgroup
-(\code{wgmma}) \cite{nvidia2026wgmma}; these, thread-block clusters, and
-TF32 matrix inputs are all unavailable through this stack. Equal extension
-support would still not imply equal instructions, conversion traffic,
-occupancy, or fusion. Separating these factors would take matched-kernel
-inspection or feature-off runs, which this collection does not include.
+\begin{table}[t]
+\centering
+\caption{Gap accounting on identical qualified core conditions. All entries
+except $n$ are geometric means. $R$: Meganeura/PyTorch time; $S$: strict/
+accelerated time. $s$: strict, $a$: accelerated, $P$: PyTorch, $M$: Meganeura.
+Numbers are rounded after aggregation; these are not the medians of
+Table~\ref{tab:performance}. M3 variability
+and the small MI300X denominator still apply.}
+\label{tab:gap}
+\footnotesize\setlength{\tabcolsep}{2.3pt}
+\input{tables/gap}
+\end{table}
+
+\emph{Exposure, admission, selection, execution.}
+The cohort receipts locate several missing paths, but a dispatch count is
+neither a time share nor a utilization measurement. Only the M3 and MI300X
+use native f32 matrix tiles under the strict contract. The accelerated
+NVIDIA programs use matrix kernels in at most 19 dispatches, all in forward
+regions; six of 42 sessions per NVIDIA GPU reuse workgroup-scope decisions
+through \code{VK\_NV\_cooperative\_matrix2} \cite{khronos2024cooperative2}.
+The B570 exposes rectangular $8\times16\times16$ f16/BF16 matrices, yet
+selects no matrix dispatch in its 42 accelerated sessions. Thus zero
+selection does not establish missing hardware. A usable path must also
+survive shape and memory admission, numerical qualification, the search
+deadline and a whole-program timing comparison. Conversely, more selected
+matrix dispatches need not be faster: operand staging, conversions, barriers,
+reductions and occupancy can cancel the arithmetic gain.
+
+\emph{A controlled implementation counterfactual.}
+A separate October~24 local study changes only attention backward on saved
+plans for four training models, with the graph, forward kernels and
+submission counts fixed \cite{meganeura2026scaledattention}.
+It uses paired sessions sharing a GPU context in one process per condition,
+ten seconds of shared warmup and
+100 interleaved samples per side, with full output/gradient qualification
+before and after. These results are excluded from the October~19 cohort,
+its ratios and coverage; retained samples and protocol are separate artifact
+inputs. They do not retime PyTorch or establish long-run convergence.
+
+\begin{table}[t]
+\centering
+\caption{Separate local attention-backward ablation: whole training-step
+time change from F32 to scaled F16, same plan and GPU context. Negative is
+faster. All eight comparisons pass the unchanged qualification gate; these
+force the path and are not Auto-search selections.}
+\label{tab:attention-followup}
+\small
+\input{tables/attention-followup}
+\end{table}
+
+The kernels scale operands by powers of two, accumulate in f32, and restore
+partial products before summing across reduction blocks. They also center
+keys and restore the common score term in f32. This permits small gradients
+without requiring BF16 matrix operands. A non-grid shared-key regression
+previously had 3.35\% dV error on both GPUs; the revised path passes the
+unchanged 1\% f64-relative bound. Table~\ref{tab:attention-followup} shows why
+range handling and matrix eligibility are only part of the answer: on
+Whisper, training falls from 23.19 to 20.11\,ms on the RTX~5070 but rises
+from 61.83 to 68.86\,ms on the B570. The same arithmetic transformation is
+profitable on one device and not the other. Search must retain the faster
+F32 path where appropriate. Broadly enabling a dtype is not sufficient.
+A second controlled change shares the common F32 anchor dot over four lanes:
+B570 Whisper falls from 75.12 to 68.86\,ms relative to a serial anchor
+calculation, without changing operand types or adding a pre-pass. Execution
+cost can therefore change even after numerical admission is solved.
+
+\emph{API limits are constraints, not an attributed fraction.}
+This stack does not expose explicit control of Hopper's asynchronous
+warpgroup instructions or thread-block clusters, nor a TF32 matrix-input path
+\cite{nvidia2026wgmma}. However, TF32 and the reduced-precision inputs of
+those warpgroup products are also excluded by our strict-f32 contract.
+Their missing direct accelerated paths are therefore not an established
+explanation of the strict-f32 H100 gap; instruction-level attribution would
+require inspecting the executed kernels. Lower shared-memory
+limits can reject a particular kernel without imposing an unavoidable model
+cost: in the local study, reusing scaled score operands reduces head-128
+attention storage from 50,816/51,648 to 47,360/48,128 bytes for dQ/dK--dV.
+Both then fit within the existing 48\,KiB Vulkan limit on the two local GPUs,
+without a driver change. This establishes admission and checked gradients,
+not a full-model head-128 speedup.
+
+\emph{The residual needs timelines and matched kernels.}
+The cohort's host-wall measurements combine recording, submission, execution,
+overlap and waiting. They cannot assign percentages to CPU work, GPU
+instructions or driver quality. Minimal-shape parity is not an upper bound
+on host overhead: the workloads and PyTorch denominator change too.
+The opposite H100/MI300X scaling trends below also defeat a single fixed
+per-phase submission latency as a complete explanation; per-dispatch cost
+can still grow with the graph. Attribution requires the same algorithm,
+shapes and admitted precision in a matched-kernel comparison, plus a device
+and host timeline. Missing instructions, backend maturity and driver quality
+remain hypotheses for the unexplained portion, rather than additive slices
+of the measured gap.
 
 \subsection{Larger models}
 \label{sec:scaling}
@@ -748,7 +843,7 @@ at the probe scratch limit; a rejected candidate never replaces the checked
 incumbent. The M3 kept the extracted graph in 63 of its 84 sessions, which is
 consistent with its noisy timing, since a challenger must beat the incumbent
 by more than the measured noise. Device features only supply candidates, as
-the B570 and BF16 selections in Section~\ref{sec:gaps} show.
+the B570's unselected exposed matrix paths in Section~\ref{sec:gaps} show.
 
 A workload builds three sessions, or two for Whisper. The 30-second deadline
 is soft, and preparing the original-f32 reference falls outside it but inside
@@ -912,7 +1007,9 @@ population of machines. CPU power management, cloud co-tenancy, thermals,
 and the short timing window can all matter. Fresh processes start with empty
 TorchInductor caches but keep whatever driver state the machine had. We
 report warmed short-window latency rather than sustained throughput and
-remove no outliers.
+remove no outliers. The separate local attention study uses one process per
+condition; interleaving sessions reduces drift within that process but does
+not measure process-to-process variability.
 
 \emph{Numerics.} Strict f32 fixes arithmetic width, not operation order.
 Native full-gradient checks, PyTorch's trajectory gate, and the cross-engine
@@ -932,14 +1029,17 @@ separate its architecture from the engineering effort behind it.
 
 \section{Future Work}
 
-The gaps point at the compiler's next steps: matrix kernels for backward
-passes and convolutions, broader BF16 coverage, and a cheaper search. The
-B570 needs rectangular matrix kernels that win, and the H100 needs
-matched-precision kernel and memory analysis, since enabling the features
-has not closed either gap. The next experiments should isolate the effects
-of search budget, kernel-decision reuse, matrix features, and numerical
-bounds on the same workloads, and native trajectory checks would remove an
-asymmetry in qualification. The MI300X driver work needs further validation
+The first priority is to make exposed paths accurate and profitable: range-aware
+backward kernels, matrix convolutions, better operand reuse, and search that
+reaches useful alternatives within its budget. The local scaled-F16 study
+shows that BF16 is not required for every derivative path and that admission
+alone does not guarantee a speedup. A maxima pre-pass could reduce repeated
+scaling reductions, but its buffers and dispatch cost require a separate
+measurement. Matched-kernel and host/device timeline studies are needed before
+assigning the remaining H100 or B570 gap to API limits or drivers. Numerical
+policy also needs a controlled accuracy/performance study; matching native
+trajectory checks to PyTorch's would remove an important asymmetry.
+The MI300X driver work needs further validation
 and upstream review. Further out, persistent megakernels could move
 dependency scheduling onto the GPU, as MPK does for CUDA task graphs
 \cite{cheng2026mpk}, subject to graphics-API forward-progress and
@@ -955,9 +1055,12 @@ Android XR application next to its renderer. PyTorch is still faster in most
 comparisons. \system{}'s median strict time is $1.35\times$ PyTorch's for
 inference and $1.61\times$ for training, with wins on the RX~7900~XT and
 losses everywhere on the Arc~B570. Reduced precision widens the gap to
-$2.06\times$ and $2.21\times$, because PyTorch moves its matrix work in both
-directions onto matrix units, while \system{} seldom selects matrix kernels
-and keeps derivatives in f32. Larger models do not settle the question:
+$2.06\times$ and $2.21\times$ in the measured revision. On identical qualified conditions, unequal
+acceleration multiplies the inference and training gaps by 1.61 and 1.56.
+The separate scaled-F16 study recovers part of the RTX~5070 training loss
+without changing the API or numerical bounds, but Intel does not benefit
+uniformly. Feature exposure, accurate lowering and profitable execution
+are separate requirements; no universal graphics-API penalty is measured. Larger models do not settle the question:
 MI300X's strict training ratio narrows to 1.65 at 1.7B, while H100's grows
 to 3.79. Both stacks also have coverage gaps, so availability belongs beside
 speed when judging portability.

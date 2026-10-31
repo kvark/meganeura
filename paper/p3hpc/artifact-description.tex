@@ -15,6 +15,8 @@ comparison with compiled PyTorch on seven GPUs, including models up to 1.7B.
 kernel-decision cache states and numerical-policy limitations.
 \item[$C_3$] Additional qualification on three integrated GPUs and Quest~3S,
 experimental MI300X Vulkan support, and an XR queue-sharing application.
+\item[$C_4$] Matched-condition gap accounting and a separate local
+attention-kernel ablation with retained timing samples.
 \end{description}
 
 \subsection{Computational Artifacts}
@@ -25,7 +27,10 @@ and \href{https://github.com/kvark/inferena/tree/add19182e5479e3f7549894c524ac66
 sources at the measured commits; sixteen campaign archives and an offline
 analyzer. The older \code{paper-p3hpc-2026-final} tags do not identify these
 runs. The separate warmup diagnostic has its own recorded revision.
-No DOI has been assigned.
+The artifact also includes derived gap accounting and separate October~24
+attention timings, with production shader source at revision \code{3d7cafa}.
+These local inputs do not replace cohort cells or independently replay
+their GPU qualification. No DOI has been assigned.
 \item[$A_2$] Public
 \href{https://github.com/kvark/dinovision/tree/dc35cdf1c7c910cdd93c5b5362846842ae469a21}{DinoVision source}
 and \href{https://huggingface.co/mad-bot/dinovision/tree/2c3f9017fe74c41482b165890c14737a2ccd4b6a}{evidence archive}.
@@ -37,7 +42,7 @@ No DOI has been assigned.
 \toprule
 Artifact & Contributions & Paper elements\\
 \midrule
-$A_1$ & $C_1$, $C_2$, $C_3$ & Tables~\ref{tab:devices}--\ref{tab:preparation}, Fig.~\ref{fig:ratios}\\
+$A_1$ & $C_1$--$C_4$ & Tables~\ref{tab:devices}--\ref{tab:preparation}, Fig.~\ref{fig:ratios}\\
 $A_2$ & $C_3$ & Section~\ref{sec:edge}, Fig.~\ref{fig:dinovision}\\
 \bottomrule
 \end{tabular}
@@ -181,3 +186,11 @@ The output check measures numerical agreement, not image-quality superiority.
 The sweep measures application submissions, eye updates and worker latency.
 Its records support Section~\ref{sec:edge}; none enters the framework timing
 tables or portability aggregate.
+
+\paragraph{Additional gap-analysis inputs.}
+The supplement also contains \code{gap\_analysis.py} and the separate
+October~24 \code{attention-followup.json}. The script reproduces matched-cell
+accounting from the frozen CSV and verifies the retained local timing samples.
+The local shader ablation is excluded from the cohort's ratios and coverage.
+Its compact data report qualification status but do not independently replay
+the GPU experiment, numerical checks or long-run learning behavior.

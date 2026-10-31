@@ -219,7 +219,8 @@ section.contracts table { font-size: 23px; }
 section.since-paper table { font-size: 23px; }
 section.since-paper th, section.since-paper td { padding: 11px 13px; }
 section.since-paper p { font-size: 24px; }
-section.api-code pre { font-size: 21px; line-height: 1.45; }
+section.api-code pre { font-size: 18px; line-height: 1.38; margin: 10px 0; }
+section.api-code > p { margin: 8px 0; }
 
 /* Ratio colors match the charts: teal when Meganeura is faster, brown when slower. */
 .slower { color: #a44616; font-weight: 700; }
@@ -229,8 +230,8 @@ section.api-code pre { font-size: 21px; line-height: 1.45; }
 .torch { color: #a44616; font-weight: 700; }
 .stack-columns > div:not(.layers) { border-top: 0; padding-top: 4px; }
 
-section.results img { height: 432px; }
-section.results > p:last-of-type { font-size: 22px; line-height: 1.3; }
+section.results img { height: 412px; }
+section.results > p { font-size: 22px; line-height: 1.3; margin: 8px 0 0; }
 
 section.measure { font-size: 24px; }
 section.measure h1 { margin-bottom: 16px; }
@@ -250,3 +251,183 @@ section.since-paper td:last-child { font-weight: 700; color: #12363d; }
 
 section.stages table { font-size: 21px; }
 section.stages th, section.stages td { padding: 10px 12px; }
+
+section.intel-gap h1 { margin-bottom: 12px; }
+section.intel-gap .case-context { font-size: 23px; margin: 0 0 22px; }
+.gap-causes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 28px; }
+.gap-causes > div { border-top: 4px solid #006b70; padding-top: 12px; }
+.gap-causes h3 { color: #006b70; font-size: 27px; margin: 0 0 12px; }
+.gap-causes p { font-size: 21px; line-height: 1.3; margin: 12px 0; }
+.gap-causes .evidence { color: #12363d; }
+.gap-causes .hypothesis { color: #a44616; }
+section.intel-gap > p { font-size: 22px; margin: 14px 0 0; }
+section.intel-gap small { font-size: 16px; }
+
+/* Section tracker: the header names all three sections and highlights the current one. */
+header { color: #a3b0b1; }
+header strong { color: #006b70; border-bottom: 3px solid #006b70; padding-bottom: 2px; }
+section.backup-slide header { color: #637679; }
+
+/* Opening: the three questions the talk answers. */
+.agenda { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 4px; }
+.agenda div { border-top: 4px solid #006b70; padding-top: 8px; font-size: 19px; line-height: 1.25; }
+.agenda b { display: block; color: #006b70; font-size: 22px; margin-bottom: 4px; }
+
+/* Productivity: two stacks side by side. */
+.stacks { display: grid; grid-template-columns: 1fr 1fr; gap: 56px; margin: 4px 0 18px; }
+.stacks h3 { font-size: 27px; margin: 0 0 12px; }
+.stacks .stack-mega h3 { color: #006b70; }
+.stacks .stack-torch h3 { color: #a44616; }
+.stacks .layer { padding: 11px 16px; margin-bottom: 7px; font-size: 22px; line-height: 1.25; }
+.stacks .layer b { font-size: 24px; margin-right: 8px; }
+.stacks .stack-mega .layer { background: #e1ecea; border-left: 5px solid #006b70; }
+.stacks .stack-torch .layer { background: #f3e7e0; border-left: 5px solid #a44616; }
+.stacks .layer.driver { background: #eceeec; border-left-color: #8d9c9d; color: #4a5c60; }
+.stacks .size { margin: 16px 0 0; font-size: 23px; }
+.stacks .size strong { font-size: 44px; letter-spacing: -1.5px; margin-right: 6px; }
+.stacks .stack-torch .size strong { color: #a44616; }
+section.stack-compare > p { font-size: 24px; margin: 6px 0 0; }
+
+/* Productivity: what each test compares. */
+section.testing h1 { margin-bottom: 14px; }
+section.testing > p { font-size: 24px; margin: 10px 0; }
+.checks { display: grid; grid-template-columns: 230px 1fr 50px 1fr; gap: 14px 12px; align-items: center; margin: 14px 0 18px; }
+.checks .what { font-size: 24px; font-weight: 700; color: #12363d; }
+.checks .side { padding: 13px 16px; font-size: 22px; line-height: 1.25; background: #e7eeeb; border-left: 5px solid #006b70; }
+.checks .side small { display: block; color: #4a5c60; font-size: 17px; margin-top: 4px; }
+.checks .side.ref { background: #eceeec; border-left-color: #12363d; }
+.checks .vs { text-align: center; font-size: 30px; color: #637679; }
+.caught { border-top: 4px solid #a44616; padding-top: 8px; font-size: 22px; }
+.caught b { color: #a44616; }
+
+/* Portability: features in tiers, and matrix inputs by GPU. */
+.reach { display: grid; grid-template-columns: 1.05fr 1fr; gap: 44px; }
+.tier { margin-bottom: 20px; }
+.tier h3 { font-size: 24px; margin: 0 0 10px; }
+.tier.used h3 { color: #006b70; }
+.tier.unused h3 { color: #637679; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chips span { padding: 7px 13px; font-size: 20px; line-height: 1.2; border-radius: 4px; }
+.tier.used .chips span { background: #d6e7e4; color: #0d4b4f; }
+.tier.unused .chips span { background: #eceeec; color: #4a5c60; border: 1px dashed #a3b0b1; }
+table.tiles { font-size: 21px; margin: 0; }
+table.tiles th, table.tiles td { padding: 8px 10px; }
+table.tiles td:not(:first-child), table.tiles th:not(:first-child) { text-align: center; }
+table.tiles td.tile { color: #637679; font-size: 18px; }
+.dot { color: #006b70; font-size: 26px; line-height: 1; }
+.no { color: #c3cccb; }
+.dot.f32 { color: #a44616; }
+section.features > p { font-size: 23px; margin: 12px 0 0; }
+
+/* Portability: shared memory as paired bars. */
+section.limits-wide h1 { margin-bottom: 10px; }
+table.limits { font-size: 21px; margin: 4px 0 14px; }
+table.limits th, table.limits td { padding: 7px 10px; vertical-align: middle; }
+table.limits th:first-child { width: 17%; }
+table.limits th:nth-child(2) { width: 50%; }
+.bars { display: grid; grid-template-columns: 112px 1fr; gap: 3px 8px; align-items: center; font-size: 16px; }
+.bars span { color: #4a5c60; }
+.bars i { display: block; height: 15px; font-style: normal; }
+.bars i b { position: relative; left: calc(100% + 6px); top: -4px; font-size: 16px; white-space: nowrap; }
+.bars .vendor { background: #a44616; }
+.bars .vendor b { color: #a44616; }
+.bars .graphics { background: #006b70; }
+.bars .graphics b { color: #006b70; }
+table.limits td:last-child { font-size: 19px; color: #4a5c60; }
+section.limits-wide > p { font-size: 22px; margin: 6px 0; }
+
+/* Portability: the search diagram and its one line of numbers. */
+section.search-loop img { height: 400px; }
+section.search-loop > p:last-of-type { font-size: 24px; }
+
+/* Portability: MI300X plus the full device list. */
+section.mi300 .mi300-columns { margin-bottom: 8px; }
+.coverage { border-top: 4px solid #006b70; padding-top: 10px; }
+.coverage h3 { font-size: 22px; margin: 0 0 8px; color: #006b70; }
+.coverage .chips span { background: #e7eeeb; font-size: 17px; padding: 5px 10px; }
+.coverage .chips span.here { background: #006b70; color: #fff; }
+.coverage .chips span.vendor { background: transparent; color: #637679; font-weight: 700; padding-left: 4px; padding-right: 0; }
+
+/* Performance: the protocol at a glance. */
+section.measure-new h1 { margin-bottom: 16px; }
+.measure-rows > div { display: grid; grid-template-columns: 200px 1fr; gap: 16px; align-items: baseline; border-top: 1px solid #d1dad8; padding: 11px 0; }
+.measure-rows b { color: #006b70; font-size: 23px; }
+.measure-rows span { font-size: 22px; line-height: 1.3; }
+.measure-rows .flow { color: #12363d; font-weight: 700; }
+.contracts-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 26px; margin-top: 14px; }
+.contracts-pair > div { border-top: 4px solid #006b70; padding-top: 8px; font-size: 20px; line-height: 1.3; }
+.contracts-pair h3 { font-size: 23px; margin: 0 0 4px; color: #006b70; }
+section.measure-new > p { font-size: 22px; margin: 14px 0 0; }
+
+/* Productivity: application code and the formats that produce the graph. */
+.client { display: grid; grid-template-columns: 2.05fr 1fr; gap: 32px; align-items: start; margin-top: 0; }
+.client pre { font-size: 18px; line-height: 1.38; margin: 0; padding: 14px 16px; }
+.formats h3 { font-size: 20px; margin: 0 0 6px; color: #637679; text-transform: uppercase; letter-spacing: 1px; }
+.formats > div { display: grid; grid-template-columns: 84px 1fr; gap: 12px; align-items: baseline; border-top: 1px solid #d1dad8; padding: 14px 0; }
+.formats h3 + div { border-top: 4px solid #006b70; }
+.formats b { color: #006b70; font-size: 25px; }
+.formats span { font-size: 20px; line-height: 1.3; }
+section.client-code > p { font-size: 24px; margin: 14px 0 0; }
+
+/* Performance: case study as questions with answers. */
+section.case h1 { margin-bottom: 8px; }
+section.case .case-context { font-size: 23px; margin: 0 0 14px; }
+.qa > div { display: grid; grid-template-columns: 410px 104px 1fr; gap: 16px; align-items: center; border-top: 1px solid #d1dad8; padding: 9px 0; }
+.qa .q { font-size: 23px; font-weight: 700; color: #12363d; }
+.qa .a { font-size: 22px; font-weight: 700; text-align: center; padding: 4px 0; border-radius: 4px; }
+.qa .a.no { background: #eceeec; color: #4a5c60; }
+.qa .a.yes { background: #a44616; color: #fff; }
+.qa .a.open { background: #fff; color: #637679; border: 1px dashed #8d9c9d; }
+.qa .e { font-size: 20px; line-height: 1.25; }
+section.case > p { font-size: 22px; margin: 14px 0 0; }
+section.case small { font-size: 16px; }
+
+/* Conclusion: one verdict per section. */
+.verdicts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 30px; margin: 22px 0 34px; }
+.verdicts > div { border-top: 5px solid #006b70; padding-top: 10px; }
+.verdicts > div.open { border-top-color: #a44616; }
+.verdicts h3 { font-size: 24px; margin: 0; color: #637679; text-transform: uppercase; letter-spacing: 1px; }
+.verdicts .answer { font-size: 44px; font-weight: 700; color: #006b70; margin: 2px 0 10px; }
+.verdicts .open .answer { color: #a44616; }
+.verdicts p { font-size: 24px; line-height: 1.3; margin: 8px 0; }
+section.verdict > p { font-size: 24px; }
+
+section.backup-index .columns > div { font-size: 22px; }
+section.backup-index .columns p { margin: 0 0 18px; line-height: 1.45; }
+section.backup-index a { color: #23343b; text-decoration: none; border-bottom: 1px solid #b6cdca; }
+.coverage .groups { display: flex; flex-wrap: wrap; gap: 8px 22px; }
+.coverage .groups > div { display: flex; gap: 6px; align-items: center; }
+.coverage .groups b { color: #637679; font-size: 16px; margin-right: 2px; }
+.coverage .groups span { background: #e7eeeb; font-size: 17px; padding: 5px 10px; border-radius: 4px; }
+.coverage .groups span.here { background: #006b70; color: #fff; }
+table.limits th:first-child { width: 21%; }
+table.limits th:nth-child(2) { width: 46%; }
+
+/* The default theme centers content vertically in block layout; keep titles at one height. */
+section { align-content: start; }
+section.title { align-content: center; }
+section.verdict > p:first-of-type { font-size: 27px; margin: 0 0 22px; }
+section.verdict .verdicts p { font-size: 23px; }
+.verdicts .answer { white-space: nowrap; font-size: 40px; }
+
+/* Measure: models by kind and GPUs by vendor. */
+.measure-rows .kinds, .measure-rows .gpu-groups { display: flex; flex-wrap: wrap; gap: 8px 10px; }
+.measure-rows .kinds i, .measure-rows .gpu-groups i { font-style: normal; background: #e7eeeb; padding: 5px 11px; border-radius: 4px; font-size: 19px; line-height: 1.25; }
+.measure-rows .kinds i b { display: block; font-size: 19px; color: #006b70; }
+.measure-rows .gpu-groups i b { font-size: 14px; color: #637679; margin-right: 7px; letter-spacing: 1px; text-transform: uppercase; }
+.measure-rows u { text-decoration: underline dotted #637679 2px; text-underline-offset: 4px; color: #4d5f62; }
+section.measure-new > p:has(> small) { margin: 6px 0 0; }
+section.results > p:has(> small) { margin: 6px 0 0; }
+.mi300-dies { font-size: 23px; border-top: 4px solid #006b70; padding-top: 12px; }
+
+/* Performance: single ops against the vendor libraries. */
+section.ops h1 { margin-bottom: 8px; }
+section.ops .case-context { font-size: 22px; margin: 0 0 12px; }
+table.ops { font-size: 23px; margin: 0 0 16px; }
+table.ops th, table.ops td { padding: 9px 14px; }
+table.ops td:nth-child(2) { color: #4a5c60; font-size: 20px; }
+table.ops td:nth-child(n+3), table.ops th:nth-child(n+3) { text-align: center; width: 19%; }
+table.ops td.near { color: #006b70; font-weight: 700; }
+table.ops td.far { color: #a44616; font-weight: 700; }
+section.ops > p { font-size: 22px; margin: 0; }
+table.ops th:nth-child(-n+2) { text-align: left; }

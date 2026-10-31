@@ -180,3 +180,71 @@ for one XCC (163.4 TFLOP/s / 8).
 Compiler-stage and search-ablation measurements remain historical evidence
 from earlier revisions. DinoVision is separately versioned; its queue-sharing
 results remain unchanged.
+
+## Gap analysis and separate local evidence
+
+`artifact/gap_analysis.py` derives gap accounting from the frozen result CSV;
+no primary cell, timing, qualification result or aggregate has changed. On the
+32 common inference conditions the geometric-mean ratio is 1.28 → 2.06, with
+PyTorch/Meganeura gains of 1.69/1.05. On 30 common training conditions it is
+1.57 → 2.46, with gains 1.59/1.02. Unequal acceleration multiplies the gap by
+1.61 and 1.56. The identity uses identical qualified sets and geometric means;
+it must not be substituted for the main table's medians or read as a causal
+CPU/GPU/API time partition.
+
+A separate October 24 fixed-plan shader ablation is retained in
+`artifact/attention-followup.json` (production shader commit `3d7cafa`). It
+changes attention backward only, keeping each graph, forward kernels and
+submission count fixed, with ordinary command recording, profiling disabled,
+10 seconds shared warmup and 100 interleaved samples per side. All eight
+model/device comparisons report full-output/full-gradient qualification
+before and after. The retained medians can be replayed without a GPU; the
+compact data do not independently replay those numerical checks. The runner
+uses a diagnostic reconstruction hook and the production shader text, not a
+new ordinary Auto-search measurement. It has one process per condition,
+no new PyTorch measurements and no long-run convergence claim.
+
+The same scaled-F16 transformation improves RTX 5070 training by 3.6–13.3%
+but has mixed Intel results (3.2% faster U-Net; 1.1–11.4% slower elsewhere).
+This supports range-aware lowering as a recoverable implementation factor,
+not matrix-unit selection as sufficient for speed. These local times must
+not be combined with the older cohort's PyTorch denominator. Reusing staging
+also makes head-128 gradients fit within 48 KiB; this is not an end-to-end
+head-128 model timing result. Missing TF32/reduced-precision WGMMA inputs
+are not an established explanation of the strict-F32 H100 result, since
+that contract excludes those direct accelerated paths. Actual instruction
+use still needs matched kernel inspection. The remaining host/GPU/driver partition is
+unmeasured; minimal-shape parity does not bound host overhead.
+
+A separate October 30 single-operation comparison is retained in
+`presentation/data/op-bench.tsv`. The Meganeura runner is
+`examples/op_bench.rs`; the shape list, PyTorch runner and driver script are
+in `presentation/data/op-bench/`. It times one strict-F32 GEMM or batch-1
+convolution per session on the RTX 5070 and the Arc B570, one process per
+shape and engine: Meganeura `99e3de2` with tile search on and cooperative
+matrices off, against PyTorch 2.13.0 (CUDA 13.0 and XPU wheels) with TF32 off
+and `cudnn.benchmark` on. GPU time is the median over 30 operations of summed
+Blade pass timestamps or summed `torch.profiler` device-kernel times, so it
+excludes submission. Both vendor libraries use plain F32 kernels here
+(CUTLASS SIMT on the 5070, oneDNN `gemm_kernel` on the B570), so these
+ratios compare kernels on the same execution units.
+
+Square 4096 GEMMs take 2.20× PyTorch's GPU time on both GPUs: 10.2 against
+22.5 TFLOP/s on the 5070 and 3.2 against 6.9 on the B570. Whisper and LLM
+shapes (1500×384×1536, 512×576×1536) take 1.6–1.75× on the 5070 and 1.1–1.2×
+on the B570. The U-Net's small GEMMs (M of 64–256) take 1.6–4.8× on the 5070,
+where cuBLAS uses split-K, and 4.3–11.1× on the B570, where oneDNN finishes
+64×1024×256 in 5 µs against our 55 µs. Our Winograd 3×3 convolutions match
+or beat cuDNN on the 5070 (0.49–1.09×) and take 1.7–5.4× oneDNN's time on
+the B570; 1×1 and stem convolutions take 1.4–1.6× and 1.6–3.8×. Convolution
+times include our per-call Winograd weight transform and oneDNN's
+`conv_reorder`. Host-timed single operations add 30–60 µs over GPU time for
+Meganeura on the 5070 and 100–200 µs on the B570, against about 10 and 40 µs
+for PyTorch; in a model this cost is paid per submission, not per kernel.
+These results place the B570 U-Net gap in our small-matrix and
+small-convolution kernels. They do not show that Vulkan reaches the vendor
+libraries' F32 GEMM throughput, which we have not demonstrated. They use
+current code, not the cohort's revision, and must not be combined with the
+cohort ratios. The U-Net's largest generated kernel uses 16.4 KiB of
+workgroup memory (`presentation/data/b570-unet-shared-memory.txt`), so
+Vulkan's 48 KiB limit does not constrain it. An RX 7900 XT run is pending.
