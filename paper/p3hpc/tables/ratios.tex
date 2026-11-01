@@ -2,40 +2,35 @@
 \toprule
 GPU & Workload & \multicolumn{3}{c}{Strict} & \multicolumn{3}{c}{Accelerated} \\\cmidrule(lr){3-5}\cmidrule(lr){6-8} & & Inf. & Min. & F+L+B & Inf. & Min. & F+L+B \\
 \midrule
-RTX 5070 & SmolLM2-135M & 1.04 & \textbf{0.87} & 1.51 & 1.87 & \textbf{0.88} & 2.49 \\
- & SmolVLA & 1.12 & 1.13 & 1.33 & 1.61 & \textbf{0.83} & 1.86 \\
- & SD U-Net & \textbf{0.86} & \textbf{0.88} & 1.24 & 2.21 & 2.17 & 2.16 \\
- & ResNet-50 & \textbf{0.74} & \textbf{0.69} & 1.61 & 3.56 & 3.63 & 5.91 \\
- & Whisper-tiny & 1.56 & 1.52 & 1.95 & 4.34 & 4.27 & 7.01 \\
-H100 & SmolLM2-135M & 1.57 & 1.00 & 1.90 & 2.51 & \textbf{0.95} & 3.66 \\
- & SmolVLA & \textbf{0.94} & \textbf{0.74} & 1.48 & 2.02 & 1.02 & 2.61 \\
- & SD U-Net & 1.13 & 1.05 & 1.27 & 1.78\,ms$^\dagger$ & 1.77\,ms$^\dagger$ & 5.06\,ms$^\dagger$ \\
- & ResNet-50 & 1.13 & \textbf{0.99} & 2.06 & 6.07 & 4.49 & 8.61 \\
- & Whisper-tiny & 2.24 & 2.25 & 2.94 & 8.46 & 8.26 & 12.46 \\
-RTX 3050 & SmolLM2-135M & 1.51 & \textbf{0.84} & 1.56 & 2.04 & \textbf{0.84} & 2.26 \\
- & SmolVLA & 1.12 & \textbf{0.77} & 1.29 & 1.27 & \textbf{0.52} & 1.61 \\
- & SD U-Net & 1.05 & 1.04 & 1.55 & 1.93 & 1.95 & 2.02 \\
- & ResNet-50 & \textbf{0.97} & 1.03 & 1.63 & 3.40 & 2.69 & 4.80 \\
- & Whisper-tiny & 1.34 & 1.35 & 1.69 & 3.61 & 3.64 & 5.11 \\
-RX 7900 XT & SmolLM2-135M & \textbf{0.61} & \textbf{0.19} & \textbf{0.67} & 1.25 & \textbf{0.19} & 1.69 \\
- & SmolVLA & \textbf{0.44} & \textbf{0.20} & \textbf{0.49} & \textbf{0.85} & \textbf{0.36} & 1.03 \\
- & SD U-Net & \textbf{0.71} & \textbf{0.71} & \textbf{0.66} & \textbf{0.77} & \textbf{0.77} & \textbf{0.92} \\
- & ResNet-50 & 1.41 & \textbf{0.95} & 1.26 & 1.60 & 1.84 & 2.13 \\
- & Whisper-tiny & \textbf{0.63} & 4.59\,ms$^\dagger$ & 18.51\,ms$^\dagger$ & 2.43 & 2.42 & 3.64 \\
-MI300X & SmolLM2-135M & 1.90 & \textbf{0.98} & 2.29 & 1.28 & 1.00 & 2.01 \\
- & SmolVLA & 1.72 & 1.13 & 1.99 & 1.39 & \textbf{0.96} & 1.68 \\
- & SD U-Net & 2.25 & 2.33 & 2.33 & 2.71\,ms$^\dagger$ & 2.77\,ms$^\dagger$ & 7.13\,ms$^\dagger$ \\
- & ResNet-50 & 3.14 & 3.31\,ms$^\dagger$ & 19.99\,ms$^\dagger$ & 2.98 & 3.30 & 4.66 \\
- & Whisper-tiny & 2.65 & 2.67 & 3.25 & 2.87\,ms$^\dagger$ & 2.88\,ms$^\dagger$ & 12.02\,ms$^\dagger$ \\
-Arc B570 & SmolLM2-135M & 2.28 & 1.73 & 2.92 & 2.79 & 1.66 & 4.04 \\
- & SmolVLA & 1.99 & 1.77 & 1.86 & 2.07 & 1.33 & 2.05 \\
- & SD U-Net & 5.45 & 5.44 & 3.50 & 5.41 & 4.55 & 4.11 \\
- & ResNet-50 & 2.58 & 3.23 & 3.22 & 5.13 & 5.06 & 6.49 \\
- & Whisper-tiny & 1.62 & 1.62 & 3.02 & 2.45 & 2.46 & 5.28 \\
-Apple M3 & SmolLM2-135M & 1.35 & \textbf{0.77} & 1.23 & 1.17 & \textbf{0.80} & \textbf{0.77} \\
- & SmolVLA & 1.54 & 1.10 & 1.66 & 1.00 & \textbf{0.65} & \textbf{0.73} \\
- & SD U-Net & \textbf{0.40} & \textbf{0.36} & \textbf{0.89} & \textbf{0.45} & \textbf{0.37} & \textbf{0.53} \\
- & ResNet-50 & 2.15 & 1.65 & 1.36 & 2.26 & 2.16 & 1.28 \\
- & Whisper-tiny & \textbf{0.79} & \textbf{0.76} & 1.23 & \textbf{0.86} & \textbf{0.86} & 1.32 \\
+RTX 5070 & SmolLM2-135M & 1.05 & \textbf{0.84} & 1.47 & 1.23 & \textbf{0.84} & 1.76 \\
+ & SmolVLA & 1.12 & 1.16 & 1.32 & 1.29 & \textbf{0.85} & 1.59 \\
+ & SD U-Net & \textbf{0.80} & \textbf{0.80} & 1.19 & 1.67 & 1.66 & 1.71 \\
+ & ResNet-50 & \textbf{0.74} & \textbf{0.68} & 1.62 & 2.86 & 2.87 & 5.94 \\
+ & Whisper-tiny & 1.54 & 1.52 & 1.95 & 3.18 & 3.14 & 6.17 \\
+H100 & SmolLM2-135M & 1.56 & \textbf{0.94} & 1.86 & 2.14 & \textbf{0.91} & 2.96 \\
+ & SmolVLA & \textbf{0.93} & \textbf{0.69} & 1.47 & 1.96 & \textbf{0.97} & 2.50 \\
+ & SD U-Net & 1.00 & \textbf{0.95} & 1.19 & 1.44\,ms$^\dagger$ & 1.45\,ms$^\dagger$ & 3.98\,ms$^\dagger$ \\
+ & ResNet-50 & 1.11 & \textbf{0.95} & 2.03 & 5.08 & 4.15 & 8.48 \\
+ & Whisper-tiny & 2.33 & 2.33 & 2.95 & 7.43 & 7.35 & 12.02 \\
+RX 7900 XT & SmolLM2-135M & \textbf{0.60} & \textbf{0.19} & \textbf{0.63} & \textbf{0.89} & \textbf{0.19} & 1.35 \\
+ & SmolVLA & \textbf{0.42} & \textbf{0.20} & \textbf{0.47} & \textbf{0.76} & \textbf{0.35} & \textbf{0.98} \\
+ & SD U-Net & \textbf{0.64} & \textbf{0.64} & \textbf{0.59} & \textbf{0.48} & \textbf{0.48} & \textbf{0.81} \\
+ & ResNet-50 & 1.41 & \textbf{0.91} & 1.23 & 1.55 & 1.71 & 2.03 \\
+ & Whisper-tiny & \textbf{0.63} & 4.55\,ms$^\dagger$ & 17.83\,ms$^\dagger$ & 2.41 & 2.41 & 3.50 \\
+MI300X & SmolLM2-135M & 1.78 & \textbf{0.99} & 2.18 & 1.26 & \textbf{0.93} & 1.88 \\
+ & SmolVLA & 1.61 & 1.10 & 2.01 & 1.30 & \textbf{0.91} & 1.47 \\
+ & SD U-Net & 2.19 & 2.21 & 2.20 & 2.26\,ms$^\dagger$ & 2.30\,ms$^\dagger$ & 6.33\,ms$^\dagger$ \\
+ & ResNet-50 & 3.02 & 3.18\,ms$^\dagger$ & 19.85\,ms$^\dagger$ & 2.57 & 2.97 & 4.60 \\
+ & Whisper-tiny & 2.63 & 2.64 & 3.20 & 2.66\,ms$^\dagger$ & 2.66\,ms$^\dagger$ & 9.77\,ms$^\dagger$ \\
+Arc B570 & SmolLM2-135M & 2.18 & 1.59 & 2.75 & 1.69 & 1.62 & 3.40 \\
+ & SmolVLA & 1.92 & 1.36 & 1.80 & 1.42 & 1.01 & 1.92 \\
+ & SD U-Net & 2.95 & 2.95 & 3.02 & 3.01 & 3.00 & 3.11 \\
+ & ResNet-50 & 2.39 & 2.56 & 3.22 & 3.49 & 2.88 & 6.59 \\
+ & Whisper-tiny & 1.60 & 1.58 & 3.00 & 1.92 & 1.93 & 4.91 \\
+Apple M3 & SmolLM2-135M & 1.34 & \textbf{0.89} & 1.24 & 1.30 & \textbf{0.90} & \textbf{0.83} \\
+ & SmolVLA & 1.51 & 1.18 & 1.56 & 1.13 & \textbf{0.69} & \textbf{0.86} \\
+ & SD U-Net & \textbf{0.39} & \textbf{0.37} & \textbf{0.88} & \textbf{0.33} & \textbf{0.41} & \textbf{0.53} \\
+ & ResNet-50 & 2.14 & 1.55 & 1.36 & 2.26 & 1.85 & 1.51 \\
+ & Whisper-tiny & \textbf{0.79} & \textbf{0.78} & 1.21 & \textbf{0.85} & \textbf{0.87} & 1.29 \\
 \bottomrule
 \end{tabular}

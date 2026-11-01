@@ -55,7 +55,7 @@ def write(archive, name, data):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("archives", type=Path, help="directory holding the sixteen final campaign archives")
-    parser.add_argument("--inferena", type=Path, required=True, help="clean checkout of measured Inferena add19182")
+    parser.add_argument("--inferena", type=Path, required=True, help="clean checkout of measured Inferena a0799e42")
     parser.add_argument("--pdf", type=Path, required=True, help="built paper PDF to copy beside the ZIPs")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--submission-id", help="SC submission number; names the auxiliary ZIP <id>aux.zip")
@@ -99,6 +99,13 @@ def main():
         files[f"tables/{name}"] = (P3HPC / "tables" / name).read_bytes()
     for name in ("summary.csv", "protocol.json"):
         files[f"warmup/{name}"] = (HERE / "warmup" / name).read_bytes()
+    # A repository-shaped overlay keeps the single-op driver's relative paths valid.
+    for name in ("op-bench.tsv", "b570-unet-shared-memory.txt",
+                 "op-bench/meganeura-runs.tsv", "op-bench/run_all.sh",
+                 "op-bench/shapes.txt", "op-bench/torch_ops.py"):
+        files["op-bench/paper/p3hpc/presentation/data/" + name] = (
+            P3HPC / "presentation" / "data" / name).read_bytes()
+    files["op-bench/examples/op_bench.rs"] = (PAPER.parent / "examples/op_bench.rs").read_bytes()
     for name in ("RESULTS.md", "QUALIFICATION.md"):
         files[name] = (P3HPC / name).read_bytes()
     manifest = "".join(f"{hashlib.sha256(data).hexdigest()}  {name}\n" for name, data in sorted(files.items()))

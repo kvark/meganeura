@@ -10,25 +10,26 @@
 \subsection{Paper's Main Contributions}
 \begin{description}
 \item[$C_1$] A numerically qualified Vulkan/Metal training and inference
-comparison with compiled PyTorch on seven GPUs, including models up to 1.7B.
+comparison with compiled PyTorch on six GPUs, including models up to 1.7B.
 \item[$C_2$] Search selection and preparation measurements, with explicit
 kernel-decision cache states and numerical-policy limitations.
-\item[$C_3$] Additional qualification on three integrated GPUs and Quest~3S,
+\item[$C_3$] Additional qualification on RTX~3050, three integrated GPUs and Quest~3S,
 experimental MI300X Vulkan support, and an XR queue-sharing application.
-\item[$C_4$] Matched-condition gap accounting and a separate local
-attention-kernel ablation with retained timing samples.
+\item[$C_4$] Matched-condition gap accounting and a separate single-operation
+study identifying kernel losses.
 \end{description}
 
 \subsection{Computational Artifacts}
 \begin{description}
 \item[$A_1$] Public
-\href{https://github.com/kvark/meganeura/tree/c19cb1caedd90be7abc61de61f6197018711398e}{Meganeura}
-and \href{https://github.com/kvark/inferena/tree/add19182e5479e3f7549894c524ac6691d3dc363}{Inferena}
+\href{https://github.com/kvark/meganeura/tree/567028b805425375148e88a7e1d464fafdd99777}{Meganeura}
+and \href{https://github.com/kvark/inferena/tree/a0799e4210eafa25161ec50d475b186c4b19d3da}{Inferena}
 sources at the measured commits; sixteen campaign archives and an offline
 analyzer. The older \code{paper-p3hpc-2026-final} tags do not identify these
 runs. The separate warmup diagnostic has its own recorded revision.
 The artifact also includes derived gap accounting from the frozen result
-CSV; it does not replace cohort cells or replay their GPU qualification. No DOI has been assigned.
+CSV and a separate single-operation summary with shapes and runners;
+neither replaces cohort cells or replays their GPU qualification. No DOI has been assigned.
 \item[$A_2$] Public
 \href{https://github.com/kvark/dinovision/tree/dc35cdf1c7c910cdd93c5b5362846842ae469a21}{DinoVision source}
 and \href{https://huggingface.co/mad-bot/dinovision/tree/2c3f9017fe74c41482b165890c14737a2ccd4b6a}{evidence archive}.
@@ -56,38 +57,39 @@ are not substituted for missing final-cohort measurements.
 
 \artexp
 Offline replay regenerates eight TeX fragments, a CSV with all process medians
-and paired-ratio ranges, and coverage/search summaries. It rechecks 277
-desktop native receipts, 769 valid paired-phase receipts, and ten Android
+and paired-ratio ranges, and coverage/search summaries. It rechecks 262
+desktop native receipts, 735 valid paired-phase receipts, and ten Android
 full-tensor comparison receipts. All 330 core native cells qualify, as do
-246 completed measured native cells including larger models; 226 have ratios.
-The incomplete B570 360M campaign and all rejected references remain visible.
+222 completed measured native cells including larger models; 201 have ratios.
+B570 360M completes all native cells; one strict reference process fails
+repeatability. All rejected references remain visible.
 Android archives omit the raw NPZ tensors: replay verifies hashes and
 comparison receipts, not the original elementwise arithmetic. Fresh runs
 reproduce the procedure, not the exact timing noise or driver failures.
 
 \arttime
 Offline analysis takes minutes and needs no GPU. The recorded campaigns sum
-to 15.16 device-hours; setup, downloads, and unarchived bring-up are excluded.
+to 14.48 device-hours; setup, downloads, and unarchived bring-up are excluded.
 A fresh full collection needs access to all eleven devices. It is not
 required to regenerate the paper's results.
 
 \artin
 \artinpart{Hardware}
 A CPU and several GiB of temporary disk suffice for offline replay.
-Performance devices are RTX~5070, RTX~3050, H100, RX~7900~XT, MI300X,
-Arc~B570, and M3. Radeon~780M, Ryzen~9600X iGPU, RPL-U, and Quest~3S
+Performance devices are RTX~5070, H100, RX~7900~XT, MI300X,
+Arc~B570, and M3. RTX~3050, Radeon~780M, Ryzen~9600X iGPU, RPL-U, and Quest~3S
 supply qualification only. Device and driver identities are in the manifests.
 MI300X needs the experimental Mesa and AMDGPU patches of
 Section~\ref{sec:availability}; both are public in a draft Mesa merge request.
 
 \artinpart{Software}
 The analyzer uses Python 3.12+ and a clean checkout of Inferena
-\code{add19182e5479e3f7549894c524ac6691d3dc363}. It imports that checkout's
+\code{a0799e4210eafa25161ec50d475b186c4b19d3da}. It imports that checkout's
 qualification routines, avoiding a separate implementation of numerical gates.
 No PyTorch installation is needed for offline replay. Collection uses Python
 3.13.13 and PyTorch 2.13.0 at \code{cf30153c4c131c8164ee7798e5022d810682e2cb}.
-The lockfile pins Meganeura \code{c19cb1c}, Blade \code{4845d65}, and Naga
-\code{13f582d}. Desktop paired protocol is v33; Android protocol is v15.
+The lockfile pins Meganeura \code{567028b8}, Blade \code{eae0c6f}, and Naga
+\code{a489554}. Desktop paired protocol is v33; Android protocol is v15.
 
 \artinpart{Datasets / Inputs}
 The archives preserve manifests, samples, qualification reports, logs,

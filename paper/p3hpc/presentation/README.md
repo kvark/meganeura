@@ -1,56 +1,13 @@
 # P3HPC presentation
 
-This is the main 20-minute talk: 18 main slides with about 18:15 of suggested
-speaking time, followed by a backup index and 25 backups. It asks whether
-Vulkan and Metal can carry ML training and inference, and answers in the
-workshop's three parts between an introduction and a conclusion. The header
-on every main slide names the sections and highlights the current one.
-
-- **Introduction:** one GPU, two stacks; the stack comparison.
-- **Productivity:** writing and training a model in Rust,
-  with the ONNX, NNEF and GGUF importers; how we know it is right; the e-graph
-  that holds the candidate forms; the search that adapts the same code to each
-  GPU.
-- **Portability:** which hardware features we reach; same GPU, different
-  limits; DinoVision, trained on an RTX 3050 under Windows and deployed on the
-  Quest 3S; the MI300X driver.
-- **Performance:** the five models and eleven GPUs, and the measurement
-  protocol; strict f32 and reduced-precision results for inference and
-  training; single GEMMs and convolutions against the vendor libraries;
-  changes since the paper.
-- **Conclusion:** two slides. Whether Vulkan and Metal reach the vendor
-  stacks: some GPUs already match, and the rest splits into our kernels and
-  what the drivers expose. Then what Meganeura shows: one compact binary
-  trains and runs on every GPU we tried, with no runtime dependencies, within
-  2× of PyTorch.
-
-The code on "How do we write a model?" and on the "Importing a model" backup
-type-checks against the crate's public API (`Graph`, `nn::Linear`,
-`build_session`, `Trainer`; `load_onnx`, `build_inference_session` and the
-`Session` methods), as in `examples/mnist.rs` and `examples/onnx_compare.rs`.
-`init` and `mnist` stand for the application's initial weights and dataset.
-
-The conclusion's 1.70× is the median `ratio` in `data/results.csv` over the
-five core models' inference and training rows, both precisions: 132
-comparisons (68 strict, 64 reduced precision) on the seven timed GPUs. Their
-geometric mean is 1.81×; reduced precision alone is 2.06× and 2.21×.
-
-`data/whisper-profile.txt` is a local per-pass profile of Whisper-tiny
-inference on the RTX 5070 (October 30, Meganeura `99e3de2`, not the cohort
-revision). Attention over 1,500 positions takes 2.98 of 5.77 ms with matrix
-units off, and the matrix-unit attention kernel takes 3.30 ms. It explains
-the Whisper notes on the two results slides; it is not part of the cohort.
-Without Whisper, the strict medians are 1.24 and 1.55 and the reduced ones
-1.97 and 2.09.
-
-The f16 tile shapes on "Which hardware features do we reach?" were queried
-through `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` on the RTX 5070
-and B570 on October 30; the H100 and RTX 3050 rows assume the same NVIDIA
-driver shapes.
-
-`presentation-full` is the earlier 24-slide version of this talk, with the
-same data. The `presentation-alt`, `presentation-api` and `presentation-story`
-siblings remain local reference drafts.
+The main talk has 19 slides with 19:20 of suggested speaking time, a backup
+index and 24 backups. It combines the Vulkan/Metal deployment argument, the
+compiler's architecture and search, hardware access and limits, and measured
+performance. The compiler map and server scaling comparison are in the main
+talk; the Rust API example is in backup. The paper and talk use the same October 31–November 1, 2026
+cohort. Earlier `presentation-full`, `presentation-alt`, `presentation-api`
+and `presentation-story` drafts remain local references with older evidence;
+they are not regenerated with this deck.
 
 From the repository root:
 
@@ -58,112 +15,104 @@ From the repository root:
 bash paper/p3hpc/presentation/build.sh
 ```
 
-The build needs `uv`, Node/npm and a Chromium-compatible browser. It pins
-Matplotlib 3.11.2 and Marp CLI 4.5.1, and passes `--no-stdin` so Marp does not
-wait on an open pipe. `--figures` remains accepted for existing commands;
-every build regenerates the figures. Outputs are ignored by Git:
-`figures/*.svg`, `slides.html`, `slides.pdf` and `slides-notes.txt`. The HTML
-needs its adjacent `figures/`, `assets/`, and
-`../../figures/dinovision-quest3s.jpg`; the PDF embeds them. In the HTML, the
-backup index links to each backup. No GPU or full benchmark archive is needed
-to build. `figures.py` imports `../artifact/gap_analysis.py` for the
-gap-accounting backup.
+This needs `uv`, Node/npm and a Chromium-compatible browser. The build pins
+Matplotlib 3.11.2 and Marp CLI 4.5.1 and regenerates every figure. SVGs, HTML,
+PDF and notes are ignored build products. The HTML needs the adjacent
+`figures/`, `assets/` and `../../figures/dinovision-quest3s.jpg`; the PDF embeds
+them. No GPU or raw archive is needed to build. Each slide's notes carry a
+short script, qualifications and sources. The backup index links to numbered
+slides in HTML.
 
-Each slide's notes hold a short script, an "If asked" list and the sources.
-The results tables show inference and training; the minimal shape is a backup.
+## Framework cohort
 
-The framework comparison tables use the final October 19, 2026 cohort:
+- Inferena `a0799e4210eafa25161ec50d475b186c4b19d3da`.
+- Meganeura `567028b805425375148e88a7e1d464fafdd99777`.
+- Blade `eae0c6f7aa3167c79d1135050cf8e17c17fabd0a`.
+- Naga `a489554c96f87cbc5252ee00350730f6e93869f9`.
+- PyTorch 2.13.0, source `cf30153c4c131c8164ee7798e5022d810682e2cb`.
 
-- Inferena `add19182e5479e3f7549894c524ac6691d3dc363`.
-- Meganeura `c19cb1caedd90be7abc61de61f6197018711398e`.
-- Blade `4845d6529c38b07718a624bf3c4f2ab4317c9bf4`.
-- Naga `13f582ddd2792befb46952498010248bd65818e6`.
-- PyTorch 2.13.0 at source `cf30153c`.
+`data/results.csv`, `preparation.csv` and `summary.json` copy the paper
+analyzer's audited outputs. `cohort.sha256` identifies all sixteen raw
+archives. `preparation-cache.csv` transcribes its six-row preparation table.
+These compact chart inputs do not replace full qualification receipts.
+The paper's [result ledger](../RESULTS.md) documents the audit and failures;
+[artifact README](../artifact/README.md) gives the offline replay command.
 
-The camera-ready paper is tag `paper-p3hpc-work` (`c62a8ec`) and reports the
-September 25 runs. The chart inputs in `data/` are frozen separately; do not
-regenerate them from an older paper checkout.
+All 330 core native cells qualify across eleven GPUs. Six devices provide
+replicated performance results; RTX 3050 joins the three integrated GPUs
+and Quest as correctness-only. Core plus larger models provide 222 native
+timing cells and 201 ratios. B570 360M completes all native cells and all
+accelerated reference phases; one strict reference process fails gradient
+repeatability. No old result fills a missing new cell.
 
-`data/results.csv`, `preparation.csv` and `summary.json` preserve the audited
-final-cohort analyzer outputs; CSV line endings are normalized to LF, with
-every field unchanged. `cohort.sha256` identifies all sixteen raw archives.
-`preparation-cache.csv` transcribes the analyzer's seven-row preparation table
-without additional rounding. These are presentation inputs, not substitutes
-for the full qualification receipts in the archives.
+The ratio is **Meganeura time / PyTorch time**; below one is faster. Teal
+marks native wins and brown losses. Missing ratios mean a failed reference
+or incomplete qualifying repeats, never zero or infinite speedups. A sample
+is one host-wall model call ending after GPU completion. Each measured
+process takes twenty samples after ten seconds' warmup. The engine time is
+the median of three process medians from sequential pairs with alternating
+engine order. M3 process spread remains high (median 15.7%, 43/60 groups over
+10%); small differences are uncertain.
 
-`warmup.csv` and `warmup-protocol.json` are the separately versioned SmolLM2
-diagnostic, copied from the paper's warmup artifact. `hardware.json` records
-the October 15 Vulkan feature query, selected cohort capability fields,
-October 19 CUDA/Level Zero limit checks and the measured native runner's
-size and hash.
+Main medians are strict 1.46 inference / 1.59 training, accelerated 1.67 /
+1.92. The final slide's 1.60 median covers 112 core inference/training
+comparisons, both profiles (58 strict, 54 accelerated), excluding duplicated
+minimal shapes. Its geometric mean is 1.66; 71/112 ratios are below two.
+The aggregate is not an upper bound.
 
-`limits.json` feeds "Same GPU, different limits" and gives each value's
-source. The RTX 5070 and B570 values were queried. The RTX 3050, H100, AMD and
-Apple values come from vendor documentation and a public RADV report, not from
-our hosts; `vulkaninfo` and a HIP device query on the RX 7900 XT and MI300X
-hosts would confirm the AMD row. The "Only through the vendor API" column
-lists matrix inputs and Hopper features that Vulkan does not expose; for the
-AMD GPUs it is BF16 matrices, which the RADV builds in these runs do not
-report (`cooperative_bf16_f32_shapes` is empty in their run records).
+Native strict/accelerated speedup medians are 1.19 inference / 1.05 training,
+PyTorch 1.46 / 1.64, using each engine's own eligible pairs. Precision-gain
+bars instead hold both engines and both profiles to the same model set per
+GPU: 27 inference and 25 training conditions globally. Their native medians
+are 1.19 / 1.04. `gap_analysis.py` uses geometric means on those identical
+sets: ratios 1.24 → 1.66 and 1.54 → 2.21, multipliers 1.34 / 1.44. This
+accounting is not a causal CPU/GPU/API/driver partition.
 
-The feature tiers on "Which hardware features do we reach?" come from Blade's
-`Capabilities` at the pinned revision and their uses in Meganeura `c19cb1c`;
-the exposed-but-unused features are the RTX 5070's October 15 query.
+Matrix kernels are selected on every timed GPU, including 36/42 accelerated
+B570 sessions. Backward coverage is partial: selected AT/BT products may use
+F16/BF16; NN derivatives remain protected. Private matrix storage is searched
+as well. The archive's generic dtype summary has older backward-f32 wording;
+selected descriptions and the pinned compiler establish the actual paths.
+Public tensors, masters, loss and accumulation remain f32. These facts
+replace the old deck's “Intel selects no matrices” and “derivatives stay f32.”
 
-The ratio is **Meganeura time ÷ PyTorch time**; below 1, Meganeura is faster.
-Teal marks Meganeura faster and brown slower, in the charts and in the text.
-Every missing ratio is a PyTorch result that failed its checks, or a later
-phase not attempted after such a failure; all native results pass.
+## Separate evidence
 
-A synchronized sample means one host-wall timing of a model call, ending after
-GPU completion. A process pair means fresh Meganeura and PyTorch processes for
-the same condition, run sequentially. Each process takes 20 samples after
-warmup; the reported engine time is the median of three process medians.
-Engine order alternates between pairs.
+- **Single operations:** `data/op-bench.tsv`, three native processes and one reference
+  process per shape on RX 7900
+  XT, RTX 5070 and B570, October 31. Native `5b232bd` plus the tuner scratch
+  fix present in cohort revision `567028b8`; strict f32, tuner on, cooperative
+  matrices off. PyTorch 2.13, TF32 off, `cudnn.benchmark` on. Native GPU time
+  sums pass timestamps; reference device events time a graph of 30 serial
+  ops divided by 30, including dispatch gaps. This favors native most on
+  small ops and cannot partition cohort model time. Shapes, reference runner
+  and driver are in `data/op-bench/`; native runner is `examples/op_bench.rs`.
+  The table's small-GEMM losses support testing split-K and smaller tiles,
+  not a claim that those proposed changes already recover the gap.
+- **Shared memory:** `data/b570-unet-shared-memory.txt` at `99e3de2` records
+  16.4 KiB for the largest generated U-Net kernel, below the 48 KiB ceiling.
+- **Hardware:** `hardware.json` keeps the October 15 query and October 19
+  CUDA/Level Zero limits, plus capability fields and native runner identity
+  from the new cohort. The runner is 19.4 MiB, 14.9 stripped; source is
+  54,271 Rust and 7,025 WGSL lines. `limits.json` distinguishes queried and
+  documented values. RTX 5070/B570 f16 tile shapes were queried October 30;
+  H100/3050 shapes assume the corresponding NVIDIA driver's offerings.
+- **Since the paper:** `since_paper.py` compares the tagged September 25
+  supplement with current results on the five shared timed GPUs. Both
+  populations are restricted to the same qualified conditions. The tag
+  `paper-p3hpc-work` (`c62a8ec`) and its supplement remain unchanged; the
+  protocol changes prevent attributing every improvement to the compiler.
+- **Warmup:** `warmup.csv` / `warmup-protocol.json` remain the separate
+  October 19 diagnostic at Meganeura `c19cb1c`, not the new cohort revision.
+  It keeps a program fixed over cumulative 5/15/30/60-second checkpoints,
+  two processes per GPU, after search; no universal warmup claim follows.
+- **Compile stages:** the September 10 diagnostic in `docs/experiments.md`
+  remains historical, separately labeled in the backup.
+- **DinoVision:** the separately pinned
+  [study](https://github.com/kvark/dinovision/blob/dc35cdf1c7c910cdd93c5b5362846842ae469a21/REPORT.md)
+  trains with Adam on desktop Vulkan and deploys beside headset rendering.
+  Cohort training times exclude optimizer updates.
 
-The search line's 306 of 588 sessions (52%) choosing a program other than
-ordinary extraction comes from the search table in `../main.tex`. The
-matrix-dispatch counts in the backups come from the `cooperative_dispatches`
-field of each selected session in the raw archives. The compile-stage backup
-is the separate September 10 study in `docs/experiments.md`.
-
-`since_paper.py` reproduces the "Since the paper" numbers. It compares
-`data/results.csv` with the camera-ready supplement, replayed by the tagged
-analyzer; its docstring lists the steps. The protocol changed between the two
-runs, so the comparison does not isolate a compiler speedup.
-
-"Where is the gap? One op at a time" comes from `data/op-bench.tsv`: one
-strict-f32 GEMM or batch-1 convolution per process on the RX 7900 XT (RADV
-Mesa 26.0.8), RTX 5070 and B570, all on October 31 at Meganeura 5b232bd plus
-the tuner scratch fix (567028b on main), with the kernel tuner on and cooperative matrices
-off. Each Meganeura row is the median of three processes; the RTX 5070 and
-B570 trials are in `data/op-bench/meganeura-runs.tsv`. PyTorch 2.13.0 runs
-with TF32 off and `cudnn.benchmark` on. Our GPU time sums Vulkan pass
-timestamps; PyTorch's is a device interval around a graph of 30 serial ops,
-divided by 30, with the profiler off, since profiling slows ROCm execution.
-The TSV header records the protocol. The shape list, the PyTorch runner and
-the driver script are in `data/op-bench/`, and the Meganeura runner is
-`examples/op_bench.rs` at the repository root. The slide's ranges group the
-rows of the TSV. The 5.45× in the takeaway is the cohort's
-B570 U-Net strict inference ratio. The notes' 16 KiB comes from
-`data/b570-unet-shared-memory.txt`.
-
-The B570's zero selected matrix sessions belongs to the October 19 runs. The
-October 21 local follow-up at PR #274 revision
-`a0cd01b806363bd30ea81ef75510882883fc3394` selects F16 Winograd kernels for
-U-Net inference and training; the tables do not include it. Local receipt:
-`/x/Code/inferena-results/pr273-274-review-20261021/review-summary.json`.
-
-The gap-accounting backup holds the qualified model set fixed across both
-engines and both arithmetic profiles. `../artifact/gap_analysis.py` computes
-an exact accounting identity and geometric means on 32 inference / 30
-training conditions. These are not the main table's medians and do not
-allocate time to CPU, GPU, API or driver causes.
-
-The opening uses a real Unreal Tournament screenshot. Its source and
-attribution are in [assets/README.md](assets/README.md).
-
-The headset and full training-cycle evidence comes from the separately pinned
-[DinoVision study](https://github.com/kvark/dinovision/blob/dc35cdf1c7c910cdd93c5b5362846842ae469a21/REPORT.md).
-It trains with Adam on a desktop Vulkan GPU and deploys on Quest; the
-framework training timings exclude optimizer updates.
+The opening's real Unreal Tournament screenshot is attributed in
+[assets/README.md](assets/README.md). The model/API snippets follow the
+public API, with `init` and `mnist` standing for application data.

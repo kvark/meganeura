@@ -2,8 +2,8 @@
 
 `final_cohort.py` audits the sixteen archives identified by
 [final-cohort.sha256](final-cohort.sha256). The measured revisions are Inferena
-`add19182e5479e3f7549894c524ac6691d3dc363` and Meganeura
-`c19cb1caedd90be7abc61de61f6197018711398e`. The paired protocol is v33;
+`a0799e4210eafa25161ec50d475b186c4b19d3da` and Meganeura
+`567028b805425375148e88a7e1d464fafdd99777`. The paired protocol is v33;
 Android is v15. Older paper tags do not identify this collection.
 
 ## Replay
@@ -33,10 +33,11 @@ these are not confidence intervals. No outliers are dropped.
 
 ## Interpretation
 
-- Eleven GPUs pass 330/330 core native cells. Seven measured GPUs plus completed
-  larger models supply 246 native performance cells and 226 paired ratios.
-- The B570 360M campaign is incomplete; no independent reference or replicated
-  timing exists. Internal native checks alone do not qualify a published cell.
+- Eleven GPUs pass 330/330 core native cells. Six measured GPUs plus completed
+  larger models supply 222 native performance cells and 201 paired ratios.
+- B570 360M completes all six native cells; four have ratios. One strict
+  reference process fails gradient repeatability, leaving no aggregated
+  strict training or subsequent latency ratio. All accelerated phases pass.
 - Numerical rejection, execution failure and later phases not attempted are
   different outcomes. Missing references are neither zero nor infinite speedups.
 - Native full-gradient single-step checks and PyTorch AMP trajectory gates have
@@ -50,13 +51,13 @@ these are not confidence intervals. No outliers are dropped.
   full-tensor comparison receipts, not the original tensor arithmetic.
 
 The [result ledger](../RESULTS.md) and paper give failure details and policy.
-The four correctness-only GPUs never contribute CPU/GPU timing ratios.
+The five correctness-only GPUs never contribute CPU/GPU timing ratios.
 
 ## Separate warmup diagnostic
 
 `warmup/summary.csv` and `protocol.json` preserve a two-process-per-GPU
-SmolLM2-135M accelerated study at the same Meganeura revision, but a distinct
-Inferena study revision. It keeps each selected program through cumulative
+SmolLM2-135M accelerated study at the older Meganeura `c19cb1c` and a distinct
+Inferena study revision; it is not a final-cohort condition. It keeps each selected program through cumulative
 5/15/30/60-second checkpoints, after search has exercised the GPU. It is not a
 cold-start study, does not directly sample ten seconds, and does not establish
 a universal warmup duration. Full raw study records remain in the separate
@@ -67,11 +68,14 @@ study archive; this supplement carries the summary and provenance only.
 After building the paper, `submission.py` requires `--inferena` and validates
 the data against the checked-in tables before writing a source ZIP and a
 supplement. The supplement retains the original sixteen archives (about
-151 MiB compressed), the analyzers and compact generated inputs. It does not
-include the old search ablation. See [SUPPLEMENT.md](SUPPLEMENT.md).
+147 MiB compressed), the analyzers and compact generated inputs. It does not
+include the old search ablation. It also carries the separate single-op
+summary, available process rows and runners as a repository-shaped overlay.
+See [SUPPLEMENT.md](SUPPLEMENT.md).
 
 `cohort.py`, `cohort.sha256`, `search_ablation.py`, `search-ablation.sha256`,
-`footprint.py`, and `ablation.tex` are historical. Do not run their older
+and `ablation.tex` describe historical campaigns. `footprint.py` also measures
+source and binary size for the new pinned revision. Do not run their older
 protocol checks against the new collection. Legacy verification of the
 original arXiv evidence remains separate in `verify.py` and `test_verify.py`.
 

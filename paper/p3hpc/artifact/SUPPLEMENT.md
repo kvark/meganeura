@@ -1,8 +1,8 @@
 # Meganeura P3HPC final supplement
 
-Final October 2026 framework evidence for the P3HPC paper. Frozen sources:
-Meganeura c19cb1caedd90be7abc61de61f6197018711398e and
-Inferena add19182e5479e3f7549894c524ac6691d3dc363. The old
+Final October 31–November 1, 2026 framework evidence for the P3HPC paper. Frozen sources:
+Meganeura 567028b805425375148e88a7e1d464fafdd99777 and
+Inferena a0799e4210eafa25161ec50d475b186c4b19d3da. The old
 paper-p3hpc-2026-final tags point to earlier measurements.
 
 ## Contents
@@ -11,8 +11,11 @@ paper-p3hpc-2026-final tags point to earlier measurements.
   identifies them exactly. No old run fills a missing result.
 - `final_cohort.py`: frozen-validator audit and final table generation.
 - `cohort.py`: historical code used only for the TikZ plot layout by this analyzer.
-- `tables/`: eight TeX fragments, `summary.json`, `results.csv`, and
+- `tables/`: eight cohort TeX fragments, derived `gap.tex` / `gap.json`,
+  `summary.json`, `results.csv`, and
   `preparation.csv` (native setup/search and reference compilation by process).
+- `op-bench/`: repository-shaped overlay with the separate strict-f32
+  single-operation summary, available per-process rows, shapes and runners.
 - `warmup/`: summary and provenance of the separate 5/15/30/60-second diagnostic.
 - `RESULTS.md`, `QUALIFICATION.md`: interpretation and coverage.
 - `MANIFEST.sha256`: hashes of the packaged files.
@@ -29,20 +32,21 @@ python3 final_cohort.py archives --inferena /path/to/frozen/inferena \
   --check tables --output regenerated
 ```
 
-The command checks all archive digests, 277 desktop native receipts, 769
+The command checks all archive digests, 262 desktop native receipts, 735
 paired-phase receipts and ten Android full-tensor receipts, then reproduces
 the supplied tables and unrounded summaries. Android raw NPZ tensors are
 absent, so the audit verifies hashed manifests and complete comparison
 receipts, not original elementwise arithmetic. Rejected references remain
-missing. The incomplete B570 360M campaign is excluded from qualified cells.
+missing. B570 360M completes all native cells and all accelerated reference phases;
+one strict reference process fails gradient repeatability.
 
 ## Read the numbers
 
 All published ratios are Meganeura / PyTorch time: below one favors native.
 A cell is a model/profile/phase, with three processes when measured. All 330
-core native cells qualify across eleven GPUs. Seven timed GPUs plus completed
-larger models contribute 246 native performance cells and 226 paired ratios.
-The other four devices are correctness-only. No outliers are removed; CSV
+core native cells qualify across eleven GPUs. Six timed GPUs plus completed
+larger models contribute 222 native performance cells and 201 paired ratios.
+The other five devices are correctness-only. No outliers are removed; CSV
 process medians and paired ratios retain ranges, especially important on M3.
 Numerical gates affect both eligibility and search selection. Native
 single-step full-gradient fidelity is not the same as PyTorch's AMP training
@@ -62,3 +66,21 @@ The gap accounting is a derived analysis of the same frozen result CSV. Run
 `python3 gap_analysis.py --input tables/results.csv --check tables` to verify
 its per-condition identity and geometric means. `gap.json` is the full matched
 condition inventory.
+
+## Separate single-operation study
+
+`op-bench/` is a small overlay for a Meganeura checkout, preserving the
+`examples/` and `paper/p3hpc/presentation/data/` paths expected by the driver.
+Copy its contents into a checkout with the recorded tuner scratch fix
+(`567028b8` on main), then see `run_all.sh` for GPU-specific arguments.
+Offline reading of `op-bench.tsv` needs no GPU. Re-running it needs both
+engines and hardware; the framework-cohort analyzer does not execute it.
+
+This uses three native processes and one reference process per shape, with
+thirty device samples per process. Operands differ between engines. Native
+times sum pass intervals; reference events include gaps between serial graph
+operations. The measurements support kernel comparisons, not an exact share
+of the model-level gap or an independent cross-engine accuracy test. The
+original native per-process rows for RTX 5070/B570 are retained; AMD's full
+run archive remains outside this supplement. The source runner and recorded
+protocol are supplied, not all executed binaries or GPU traces.

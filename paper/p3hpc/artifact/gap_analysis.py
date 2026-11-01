@@ -14,7 +14,7 @@ from pathlib import Path
 import statistics
 
 HERE = Path(__file__).resolve().parent
-DEVICES = {"nvidia-5070": "RTX 5070", "nvidia-h100": "H100", "nvidia-3050": "RTX 3050",
+DEVICES = {"nvidia-5070": "RTX 5070", "nvidia-h100": "H100",
            "amd-7900xt": "RX 7900 XT", "amd-mi300": "MI300X", "intel-b570": "Arc B570", "apple-m3": "Apple M3"}
 MODELS = ("SmolLM2-135M", "SmolVLA", "StableDiffusion", "ResNet-50", "Whisper-tiny")
 
