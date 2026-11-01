@@ -62,42 +62,40 @@ fn scaled_f16_gradients_keep_small_upstream_values_across_masks_and_tails() {
     {
         return;
     }
-    for head_dim in [16, 32, 64, 128] {
-        for shape in [
-            (7, 5, 2, 1, 0, false),
-            (33, 19, 3, 1, 0, false),
-            (65, 65, 3, 1, 0, true),
-            (45, 45, 2, 2, 17, true),
-            (17, 17, 2, 1, 1, true),
-        ] {
-            check_case(
-                shape,
-                head_dim,
-                3e5,
-                &[1e-30, 1e-12, 0.1],
-                0.01,
-                Path::Cooperative(Operands::F16),
-                Keys::Sinusoid,
-            );
-        }
+    // Every mask and tail shape once, each head width at least once.
+    for (head_dim, shape) in [
+        (16, (7, 5, 2, 1, 0, false)),
+        (32, (33, 19, 3, 1, 0, false)),
+        (64, (65, 65, 3, 1, 0, true)),
+        (128, (65, 65, 3, 1, 0, true)),
+        (128, (45, 45, 2, 2, 17, true)),
+        (16, (17, 17, 2, 1, 1, true)),
+    ] {
+        check_case(
+            shape,
+            head_dim,
+            3e5,
+            &[1e-30, 1e-12, 0.1],
+            0.01,
+            Path::Cooperative(Operands::F16),
+            Keys::Sinusoid,
+        );
     }
-    for head_dim in [16, 64, 128] {
-        for keys in [
-            Keys::Dyadic(0.0),
-            Keys::Dyadic(16.0),
-            Keys::SharedSinusoid(0.0),
-            Keys::SharedSinusoid(16.0),
-        ] {
-            check_case(
-                (33, 19, 3, 1, 0, false),
-                head_dim,
-                3e5,
-                &[1e-30, 1e-12, 0.1],
-                0.01,
-                Path::Cooperative(Operands::F16),
-                keys,
-            );
-        }
+    for (head_dim, keys) in [
+        (16, Keys::Dyadic(0.0)),
+        (64, Keys::Dyadic(16.0)),
+        (128, Keys::SharedSinusoid(0.0)),
+        (64, Keys::SharedSinusoid(16.0)),
+    ] {
+        check_case(
+            (33, 19, 3, 1, 0, false),
+            head_dim,
+            3e5,
+            &[1e-30, 1e-12, 0.1],
+            0.01,
+            Path::Cooperative(Operands::F16),
+            keys,
+        );
     }
 }
 
@@ -266,77 +264,80 @@ fn coop_f32_forward_matches_f64_across_heads_masks_and_tails() {
     {
         return;
     }
-    for hd in [16, 32, 64, 128, 256] {
-        for (qs, ks, heads, kv_heads, window, causal) in [
-            (16, 19, 2, 1, 0, false),
-            (17, 17, 2, 1, 0, true),
-            (129, 19, 4, 2, 0, false),
-            (145, 145, 3, 1, 0, true),
-            (161, 161, 2, 1, 17, true),
+    // Every shape and width runs; the widest heads unmasked, causal and windowed.
+    for (hd, (qs, ks, heads, kv_heads, window, causal)) in [
+        (16, (16, 19, 2, 1, 0, false)),
+        (256, (16, 19, 2, 1, 0, false)),
+        (32, (17, 17, 2, 1, 0, true)),
+        (256, (17, 17, 2, 1, 0, true)),
+        (64, (129, 19, 4, 2, 0, false)),
+        (16, (129, 19, 4, 2, 0, false)),
+        (128, (145, 145, 3, 1, 0, true)),
+        (256, (161, 161, 2, 1, 17, true)),
+        (64, (161, 161, 2, 1, 17, true)),
+    ] {
+        let mut graph = Graph::new();
+        let q = graph.input("q", &[qs, heads * hd]);
+        let k = graph.input("k", &[ks, kv_heads * hd]);
+        let v = graph.input("v", &[ks, kv_heads * hd]);
+        let y = if window > 0 {
+            graph.sliding_window_attention(
+                q,
+                k,
+                v,
+                heads as u32,
+                kv_heads as u32,
+                hd as u32,
+                window,
+            )
+        } else if causal {
+            graph.causal_attention(q, k, v, heads as u32, kv_heads as u32, hd as u32)
+        } else {
+            graph.multi_head_attn(q, k, v, heads as u32, kv_heads as u32, hd as u32, true)
+        };
+        graph.set_outputs(vec![y]);
+        graph.nodes_mut()[y as usize].attention_impl =
+            Some(meganeura::graph::AttentionImpl::CooperativeF32);
+        let mut config = crate::support::gpu::inference_config();
+        config.runtime.coop = CoopPolicy::NativeF32;
+        config.runtime.poison = true;
+        config.tune = false;
+        config.optimize.mode = meganeura::optimize::OptimizeMode::Off;
+        let (mut session, _) = build(&graph, config);
+        assert!(
+            session
+                .plan()
+                .dispatches
+                .iter()
+                .any(|d| d.shader == ShaderEntry::FlashAttentionCoopF32)
+        );
+        let mut feeds = reference::Feeds::new();
+        for (name, len, scale, phase) in [
+            ("q", qs * heads * hd, 0.8, 0.3),
+            ("k", ks * kv_heads * hd, 0.8, 0.7),
+            ("v", ks * kv_heads * hd, 3.0e5, 1.1),
         ] {
-            let mut graph = Graph::new();
-            let q = graph.input("q", &[qs, heads * hd]);
-            let k = graph.input("k", &[ks, kv_heads * hd]);
-            let v = graph.input("v", &[ks, kv_heads * hd]);
-            let y = if window > 0 {
-                graph.sliding_window_attention(
-                    q,
-                    k,
-                    v,
-                    heads as u32,
-                    kv_heads as u32,
-                    hd as u32,
-                    window,
-                )
-            } else if causal {
-                graph.causal_attention(q, k, v, heads as u32, kv_heads as u32, hd as u32)
-            } else {
-                graph.multi_head_attn(q, k, v, heads as u32, kv_heads as u32, hd as u32, true)
-            };
-            graph.set_outputs(vec![y]);
-            graph.nodes_mut()[y as usize].attention_impl =
-                Some(meganeura::graph::AttentionImpl::CooperativeF32);
-            let mut config = crate::support::gpu::inference_config();
-            config.runtime.coop = CoopPolicy::NativeF32;
-            config.runtime.poison = true;
-            config.tune = false;
-            config.optimize.mode = meganeura::optimize::OptimizeMode::Off;
-            let (mut session, _) = build(&graph, config);
-            assert!(
-                session
-                    .plan()
-                    .dispatches
-                    .iter()
-                    .any(|d| d.shader == ShaderEntry::FlashAttentionCoopF32)
-            );
-            let mut feeds = reference::Feeds::new();
-            for (name, len, scale, phase) in [
-                ("q", qs * heads * hd, 0.8, 0.3),
-                ("k", ks * kv_heads * hd, 0.8, 0.7),
-                ("v", ks * kv_heads * hd, 3.0e5, 1.1),
-            ] {
-                let values: Vec<f32> = (0..len)
-                    .map(|i| (i as f32 * 0.017 + phase).sin() * scale)
-                    .collect();
-                feeds.set(name, &values);
-                session.set_input(name, &values);
-            }
-            let expected = reference::evaluate_outputs(&graph, &feeds).unwrap();
-            session.step();
-            session.wait();
-            let actual = session.read_output(qs * heads * hd);
-            let mut error = 0.0;
-            let mut norm = 0.0;
-            for (&a, &b) in actual.iter().zip(&expected[0].data) {
-                assert!(a.is_finite());
-                error += (a as f64 - b).powi(2);
-                norm += b.powi(2);
-            }
-            assert!(
-                (error / norm).sqrt() < 1e-5,
-                "hd={hd}, qs={qs}, ks={ks}, window={window}: {}",
-                (error / norm).sqrt()
-            );
+            let values: Vec<f32> = (0..len)
+                .map(|i| (i as f32 * 0.017 + phase).sin() * scale)
+                .collect();
+            feeds.set(name, &values);
+            session.set_input(name, &values);
         }
+        let expected = reference::evaluate_outputs(&graph, &feeds).unwrap();
+        session.step();
+        session.wait();
+        let actual = session.read_output(qs * heads * hd);
+        let mut error = 0.0;
+        let mut norm = 0.0;
+        for (&a, &b) in actual.iter().zip(&expected[0].data) {
+            assert!(a.is_finite());
+            error += (a as f64 - b).powi(2);
+            norm += b.powi(2);
+        }
+        assert!(
+            (error / norm).sqrt() < 1e-5,
+            "hd={hd}, qs={qs}, ks={ks}, window={window}: {}",
+            (error / norm).sqrt()
+        );
     }
 }

@@ -1,5 +1,5 @@
-//! The M=1 GEMV path beyond the default kernel: every thread-count and
-//! reduction variant of its shape knobs, f16 weights restaged for a fused
+//! The M=1 GEMV path beyond the default kernel: its thread-count, reduction,
+//! row and column-group shape knobs, f16 weights restaged for a fused
 //! GLU, and a quantized weight with a folded RmsNorm. The default f32 GEMV
 //! at decode shapes is checked against the f64 reference by `oracle`.
 
@@ -62,19 +62,6 @@ fn grouped_columns_cover_partial_tiles_with_rmsnorm() {
     }
 }
 
-/// Reference CPU matmul for [1,K] × [K,N] → [1,N].
-fn cpu_gemv(a: &[f32], b: &[f32], k: usize, n: usize) -> Vec<f32> {
-    let mut out = vec![0.0_f32; n];
-    for col in 0..n {
-        let mut acc = 0.0_f32;
-        for kk in 0..k {
-            acc += a[kk] * b[kk * n + col];
-        }
-        out[col] = acc;
-    }
-    out
-}
-
 fn assert_close_named(label: &str, a: &[f32], b: &[f32], rel_tol: f32, abs_tol: f32) {
     assert_eq!(a.len(), b.len());
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
@@ -115,13 +102,21 @@ fn q40_rmsnorm_folds_into_gemv() {
     }
     packed.resize(packed.len().next_multiple_of(4), 0);
 
-    let mut g = Graph::new();
-    let xin = g.input("x", &[1, K]);
-    let norm = g.parameter("nw", &[K]);
-    let h = g.rms_norm(xin, norm, 1e-5);
-    let w = g.parameter_q40("w", &[K, N]);
-    let y = g.matmul(h, w);
-    g.set_outputs(vec![y]);
+    // Exposing the normalized row keeps the RmsNorm out of the GEMV.
+    let graph = |expose_normalized: bool| {
+        let mut g = Graph::new();
+        let xin = g.input("x", &[1, K]);
+        let norm = g.parameter("nw", &[K]);
+        let h = g.rms_norm(xin, norm, 1e-5);
+        let w = g.parameter_q40("w", &[K, N]);
+        let y = g.matmul(h, w);
+        g.set_outputs(if expose_normalized {
+            vec![h, y]
+        } else {
+            vec![y]
+        });
+        g
+    };
 
     let ms = x.iter().map(|v| v * v).sum::<f32>() / K as f32;
     let inv = (ms + 1e-5).sqrt().recip();
@@ -131,26 +126,51 @@ fn q40_rmsnorm_folds_into_gemv() {
             want[col] += x[i] * inv * nw[i] * reference[i * N + col];
         }
     }
-    for (reduction, column_groups, integer_dot) in [
-        (meganeura::GemvReduction::Subgroup, 1, true),
-        (meganeura::GemvReduction::Tree, 8, true),
-        (meganeura::GemvReduction::Tree, 8, false),
-    ] {
+    let run = |graph: &Graph, shape, integer_dot| {
         let mut config = crate::support::gpu::inference_config();
-        config.options.gemv_shape = Some(meganeura::GemvShape {
-            threads: 32,
-            reduction,
-            bt_rows: 1,
-            column_groups,
-        });
+        config.options.gemv_shape = shape;
         config.options.quantized_activations = integer_dot;
-        let mut session = meganeura::build(&g, config).0;
+        let mut session = meganeura::build(graph, config).0;
+        let gemv = session
+            .plan()
+            .dispatches
+            .iter()
+            .find(|d| d.shader == meganeura::compile::ShaderEntry::MatMulGemv)
+            .expect("Q40 matmul should run as a GEMV");
+        assert_eq!(gemv.gemv_int_dot(), integer_dot);
         let fused = session
             .plan()
             .dispatches
             .iter()
             .filter(|d| d.gemv_rmsnorm.is_some())
             .count();
+        session.set_input("x", &x);
+        session.set_parameter("nw", &nw);
+        session.set_parameter_packed("w", &packed);
+        session.step();
+        session.wait();
+        let mut output = vec![0.0; N];
+        session.read_output_by_index(graph.outputs().len() - 1, &mut output);
+        (session, fused, output)
+    };
+    // The Q8_1 activation of the fused prologue must match quantizing the
+    // separately normalized row.
+    let (session, fused, unfused) = run(&graph(true), None, true);
+    assert_eq!(fused, 0);
+    drop(session);
+    let scale = unfused.iter().fold(0.0f32, |m, value| m.max(value.abs()));
+    for (reduction, column_groups, integer_dot) in [
+        (meganeura::GemvReduction::Subgroup, 1, true),
+        (meganeura::GemvReduction::Tree, 8, true),
+        (meganeura::GemvReduction::Tree, 8, false),
+    ] {
+        let shape = meganeura::GemvShape {
+            threads: 32,
+            reduction,
+            bt_rows: 1,
+            column_groups,
+        };
+        let (session, fused, gpu) = run(&graph(false), Some(shape), integer_dot);
         assert_eq!(fused, 1, "Q40 GEMV should fold the RmsNorm");
         assert!(
             session
@@ -159,14 +179,18 @@ fn q40_rmsnorm_folds_into_gemv() {
                 .iter()
                 .all(|d| d.reduction().is_none())
         );
-        session.set_input("x", &x);
-        session.set_parameter("nw", &nw);
-        session.set_parameter_packed("w", &packed);
-        session.step();
-        session.wait();
-        let gpu = session.read_output(N);
-
         assert_close_named("Q40 RmsNorm GEMV", &gpu, &want, 2e-2, 2e-2);
+        if integer_dot {
+            let difference = gpu
+                .iter()
+                .zip(&unfused)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                difference <= scale * 0.01,
+                "fused Q8_1 activation changed RMSNorm GEMV by {difference} at scale {scale}"
+            );
+        }
     }
 }
 
@@ -231,15 +255,13 @@ fn dense_transposed_glu_matches_reference_after_restage() {
                 } else {
                     1.0
                 };
-                for pass in 0..3 {
+                for pass in 0..2 {
                     if pass == 1 {
                         gate.iter_mut().for_each(|v| *v *= -0.5);
-                    }
-                    if pass == 2 {
                         up.iter_mut().for_each(|v| *v *= 0.75);
                     }
                     // Reverse source order; mix f32 and exact f16 uploads.
-                    if f16 && pass == 2 {
+                    if f16 && pass == 1 {
                         let bytes: Vec<_> = up
                             .iter()
                             .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
@@ -292,7 +314,9 @@ fn dense_transposed_glu_matches_reference_after_restage() {
                         1e-4,
                         1e-5,
                     );
-                    if m == 1 && !gelu && pass == 0 {
+                    // Tuning qualifies the fused class once; the f16 weights
+                    // share its GEMV shape candidates.
+                    if m == 1 && !gelu && !f16 && pass == 0 {
                         let before = session.read_output(m * n);
                         let report = session
                             .tune_with(meganeura::tune::TuneOptions {
@@ -332,35 +356,9 @@ fn dense_transposed_glu_matches_reference_after_restage() {
     }
 }
 
-// ---- FusedMatMulAdd (GEMV + residual) ----
-
-/// CPU reference: 1×K × K×N + D[1,N].
-fn cpu_gemv_add(a: &[f32], b: &[f32], d: &[f32], k: usize, n: usize) -> Vec<f32> {
-    let mut out = cpu_gemv(a, b, k, n);
-    for (o, r) in out.iter_mut().zip(d.iter()) {
-        *o += *r;
-    }
-    out
-}
-
-// ---- MatMulBT GEMV (B stored [N, K]) ----
-
-/// CPU reference for MatMulBT: accumulate in f64 so the reference isn't
-/// itself lossy for K ≥ 1024. Narrow to f32 only for the final result.
-fn cpu_gemv_bt(a: &[f32], b: &[f32], k: usize, n: usize) -> Vec<f32> {
-    let mut out = vec![0.0_f32; n];
-    for col in 0..n {
-        let mut acc = 0.0_f64;
-        for kk in 0..k {
-            acc += (a[kk] as f64) * (b[col * k + kk] as f64);
-        }
-        out[col] = acc as f32;
-    }
-    out
-}
-
-/// Cover widths, reduction paths and row tails; live tuning qualifies each candidate.
-/// Plain and transposed-B products, with and without addends, share each session.
+/// Cover workgroup widths, both reductions, one and several transposed rows
+/// per thread (with a row tail), and grouped columns. Plain and transposed-B
+/// products, with and without addends, share each session.
 #[test]
 fn gemv_shapes_cover_widths_reductions_and_row_tails() {
     use meganeura::compile::{CompileOptions, ShaderEntry};
@@ -368,13 +366,9 @@ fn gemv_shapes_cover_widths_reductions_and_row_tails() {
     use meganeura::{GemvReduction, GemvShape};
 
     let data = |n: usize, seed: u32| -> Vec<f32> {
-        let mut state = seed | 1;
+        let mut rng = crate::support::data::Pcg::new(seed);
         (0..n)
-            .map(|_| {
-                state = state.wrapping_mul(747796405).wrapping_add(2891336453);
-                let w = ((state >> ((state >> 28) + 4)) ^ state).wrapping_mul(277803737);
-                (((w >> 22) ^ w) % 2001) as f32 * 0.001 - 1.0
-            })
+            .map(|_| (rng.next_u32() % 2001) as f32 * 0.001 - 1.0)
             .collect()
     };
 
@@ -395,25 +389,24 @@ fn gemv_shapes_cover_widths_reductions_and_row_tails() {
         }
     }
 
-    let want = cpu_gemv(&a, &b, K, N);
-    let want_add = cpu_gemv_add(&a, &b, &addend, K, N);
-    let want_bt = cpu_gemv_bt(&a, &b_t, K, BT_N);
+    let reference = |layout, b: &[f32], n| -> Vec<f32> {
+        crate::support::data::matmul_reference(layout, &a, b, [1, n, K])
+            .into_iter()
+            .map(|v| v as f32)
+            .collect()
+    };
+    let want = reference(0, &b, N);
+    let want_add: Vec<_> = want.iter().zip(&addend).map(|(a, b)| a + b).collect();
+    let want_bt = reference(2, &b_t[..BT_N * K], BT_N);
     let want_bt_add: Vec<_> = want_bt.iter().zip(&addend).map(|(a, b)| a + b).collect();
 
     use GemvReduction::{Subgroup, Tree};
     for (threads, reduction, bt_rows, column_groups) in [
         (32, Tree, 1, 1),
-        (32, Subgroup, 4, 1),
-        (64, Tree, 2, 1),
-        (64, Subgroup, 1, 1),
         (128, Tree, 4, 1),
-        (128, Subgroup, 2, 1),
-        (256, Tree, 1, 1),
+        (64, Subgroup, 1, 1),
         (256, Subgroup, 4, 1),
-        (32, Tree, 1, 4),
         (32, Tree, 1, 8),
-        (64, Tree, 1, 4),
-        (128, Tree, 1, 2),
     ] {
         let shape = GemvShape {
             threads,

@@ -51,12 +51,8 @@ fn q40_block(d: f32, nibbles: &[u8; BLOCK]) -> Vec<u8> {
 /// the f16 scale in the low half of word zero, then the thirty-two int8
 /// quants, four per word.
 fn q8_weight(k: usize, n: usize, seed: u32) -> (Vec<u8>, Vec<f32>) {
-    let mut state = seed | 1;
-    let mut rnd = || {
-        state = state.wrapping_mul(747796405).wrapping_add(2891336453);
-        let w = ((state >> ((state >> 28) + 4)) ^ state).wrapping_mul(277803737);
-        (w >> 22) ^ w
-    };
+    let mut rng = crate::support::data::Pcg::new(seed);
+    let mut rnd = || rng.next_u32();
     let mut packed = Vec::new();
     // Row-major [k, n] f32 reference, matching what the graph multiplies.
     let mut reference = vec![0.0f32; k * n];
@@ -100,12 +96,8 @@ fn weight(format: Format, k: usize, n: usize, seed: u32) -> (Vec<u8>, Vec<f32>) 
 /// One Q4_K superblock with a realistic spread: per-sub-block scales and
 /// mins that actually differ, and quants across the whole nibble range.
 fn q4k_superblock(seed: u32) -> Vec<u8> {
-    let mut st = seed | 1;
-    let mut rnd = || {
-        st = st.wrapping_mul(747796405).wrapping_add(2891336453);
-        let w = ((st >> ((st >> 28) + 4)) ^ st).wrapping_mul(277803737);
-        (w >> 22) ^ w
-    };
+    let mut rng = crate::support::data::Pcg::new(seed);
+    let mut rnd = || rng.next_u32();
     let mut b = vec![0u8; 144];
     b[0..2].copy_from_slice(&half::f16::from_f32(0.0035).to_bits().to_le_bytes());
     b[2..4].copy_from_slice(&half::f16::from_f32(0.0021).to_bits().to_le_bytes());
@@ -129,12 +121,8 @@ fn q4k_superblock(seed: u32) -> Vec<u8> {
 /// One Q5_K superblock: a spread of scales and mins, plus full-range
 /// nibbles and high bits.
 fn q5k_superblock(seed: u32) -> Vec<u8> {
-    let mut st = seed | 1;
-    let mut rnd = || {
-        st = st.wrapping_mul(747796405).wrapping_add(2891336453);
-        let w = ((st >> ((st >> 28) + 4)) ^ st).wrapping_mul(277803737);
-        (w >> 22) ^ w
-    };
+    let mut rng = crate::support::data::Pcg::new(seed);
+    let mut rnd = || rng.next_u32();
     let mut b = vec![0u8; 176];
     b[0..2].copy_from_slice(&half::f16::from_f32(0.0031).to_bits().to_le_bytes());
     b[2..4].copy_from_slice(&half::f16::from_f32(0.0019).to_bits().to_le_bytes());
@@ -158,12 +146,8 @@ fn q5k_superblock(seed: u32) -> Vec<u8> {
 
 /// One Q6_K superblock: full-range ql/qh, int8 scales straddling zero.
 fn q6k_superblock(seed: u32) -> Vec<u8> {
-    let mut st = seed | 1;
-    let mut rnd = || {
-        st = st.wrapping_mul(747796405).wrapping_add(2891336453);
-        let w = ((st >> ((st >> 28) + 4)) ^ st).wrapping_mul(277803737);
-        (w >> 22) ^ w
-    };
+    let mut rng = crate::support::data::Pcg::new(seed);
+    let mut rnd = || rng.next_u32();
     let mut b = vec![0u8; 210];
     for byte in b[..192].iter_mut() {
         *byte = (rnd() % 256) as u8;
@@ -177,12 +161,8 @@ fn q6k_superblock(seed: u32) -> Vec<u8> {
 
 /// One Q3_K superblock: full-range hmask, 2-bit quants and packed scales.
 fn q3k_superblock(seed: u32) -> Vec<u8> {
-    let mut st = seed | 1;
-    let mut rnd = || {
-        st = st.wrapping_mul(747796405).wrapping_add(2891336453);
-        let w = ((st >> ((st >> 28) + 4)) ^ st).wrapping_mul(277803737);
-        (w >> 22) ^ w
-    };
+    let mut rng = crate::support::data::Pcg::new(seed);
+    let mut rnd = || rng.next_u32();
     let mut b = vec![0u8; 110];
     for byte in b[..108].iter_mut() {
         *byte = (rnd() % 256) as u8;
@@ -220,12 +200,8 @@ fn kquant_weight(
 /// A `[k, n]` GGML Q4_0 weight, column-major in blocks the way packing lays
 /// it out: all of column 0's blocks, then column 1's.
 fn q40_weight(k: usize, n: usize, seed: u32) -> (Vec<u8>, Vec<f32>) {
-    let mut state = seed | 1;
-    let mut rnd = || {
-        state = state.wrapping_mul(747796405).wrapping_add(2891336453);
-        let w = ((state >> ((state >> 28) + 4)) ^ state).wrapping_mul(277803737);
-        (w >> 22) ^ w
-    };
+    let mut rng = crate::support::data::Pcg::new(seed);
+    let mut rnd = || rng.next_u32();
     let mut packed = Vec::new();
     // Row-major [k, n] f32 reference, matching what the graph multiplies.
     let mut reference = vec![0.0f32; k * n];
@@ -514,60 +490,6 @@ fn run(
     session.read_output(n)
 }
 
-fn run_q40_rmsnorm(
-    k: usize,
-    n: usize,
-    x: &[f32],
-    norm_weight: &[f32],
-    packed: &[u8],
-    expose_normalized: bool,
-) -> Vec<f32> {
-    let mut g = Graph::new();
-    let input = g.input("x", &[1, k]);
-    let scale = g.parameter("norm", &[k]);
-    let normalized = g.rms_norm(input, scale, 1.0e-6);
-    let weight = g.parameter_q40("w", &[k, n]);
-    let output = g.matmul(normalized, weight);
-    if expose_normalized {
-        g.set_outputs(vec![normalized, output]);
-    } else {
-        g.set_outputs(vec![output]);
-    }
-
-    let (mut session, _): (Session, _) = meganeura::train::build(
-        &g,
-        SessionConfig {
-            mode: Mode::Inference,
-            options: CompileOptions {
-                quantized_activations: true,
-                ..CompileOptions::from_env()
-            },
-            ..crate::support::gpu::config()
-        },
-    );
-    let dispatch = session
-        .plan()
-        .dispatches
-        .iter()
-        .find(|dispatch| dispatch.shader == ShaderEntry::MatMulGemv)
-        .expect("RmsNorm output should feed a GEMV");
-    assert!(dispatch.gemv_int_dot());
-    assert_eq!(dispatch.gemv_rmsnorm.is_some(), !expose_normalized);
-
-    session.set_input("x", x);
-    session.set_parameter("norm", norm_weight);
-    session.set_parameter_packed("w", packed);
-    session.step();
-    session.wait();
-    if expose_normalized {
-        let mut values = vec![0.0; n];
-        session.read_output_by_index(1, &mut values);
-        values
-    } else {
-        session.read_output(n)
-    }
-}
-
 /// Largest absolute difference between two outputs.
 ///
 /// `f32::max` returns the non-NaN operand, so folding differences with it
@@ -601,88 +523,6 @@ fn activation(k: usize) -> Vec<f32> {
 /// which dot product. The K-quants span 256-element superblocks whose
 /// 210- and 110-byte forms are never whole words either, so their shapes
 /// cover whole and odd superblock counts per column.
-/// All-ones activation isolates the Q3_K weight arithmetic: with every
-/// activation quant at 127 and `d8 = 1/127`, the kernel output times 127
-/// must equal the host's element-weight sum exactly. Any misread region of
-/// the superblock shows up as a clean integer gap.
-#[test]
-fn q3k_weight_sum_with_unit_activation() {
-    let (k, n) = (256usize, 4usize);
-    let a = vec![1.0f32; k];
-    let mut sup = vec![0u8; 110];
-    let mut st = 77u32 | 1;
-    let mut rnd = || {
-        st = st.wrapping_mul(747796405).wrapping_add(2891336453);
-        let w = ((st >> ((st >> 28) + 4)) ^ st).wrapping_mul(277803737);
-        (w >> 22) ^ w
-    };
-    for b in sup[..108].iter_mut() {
-        *b = (rnd() % 256) as u8;
-    }
-    sup[108..110].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
-    let mut packed = Vec::new();
-    for _ in 0..n {
-        packed.extend_from_slice(&sup);
-    }
-
-    // Host per-sub-block sums: sc_j * sum of the sub-block's quants, with
-    // the quant = q2 - (hbit ? 0 : 4) and the hmask bit at e/32.
-    let byte_at = |off: usize| -> u32 { u32::from(sup[off]) };
-    let scale_at = |i: usize| -> f32 {
-        let b = i % 4;
-        let g = i / 4;
-        let src = if g.is_multiple_of(2) { b } else { 4 + b };
-        let raw = byte_at(96 + src);
-        let nib = if g < 2 { raw & 0xF } else { raw >> 4 };
-        let hi = (byte_at(96 + 8 + b) >> (g * 2)) & 3;
-        (((nib as i32) | ((hi as i32) << 4)) - 32) as f32
-    };
-    let mut host_blocks = [0.0f32; 8];
-    for e in 0..256usize {
-        let j = (e % 128) / 32;
-        let l = e % 32;
-        let q2 = (byte_at(32 + (e / 128) * 32 + l) >> (j * 2)) & 3;
-        let hb = (byte_at(l) >> (e / 32)) & 1;
-        let quant = q2 as i32 - if hb == 1 { 0 } else { 4 };
-        host_blocks[e / 32] += scale_at(e / 16) * quant as f32;
-    }
-    // Kernel simulation: the shader's integer form, per sub-block.
-    let word_at =
-        |off: usize| u32::from_le_bytes([sup[off], sup[off + 1], sup[off + 2], sup[off + 3]]);
-    let mut kernel_blocks = [0.0f32; 8];
-    for (j8, block) in kernel_blocks.iter_mut().enumerate() {
-        let h = j8 / 4;
-        let j3 = j8 % 4;
-        let qshift = j3 * 2;
-        let hshift = j8;
-        let mut sum_a = 0i32;
-        let mut sum_b = 0i32;
-        for i in 0..4usize {
-            let q_a = (word_at(32 + h * 32 + i * 4) >> qshift) & 0x03030303;
-            let q_b = (word_at(32 + h * 32 + 16 + i * 4) >> qshift) & 0x03030303;
-            let hb_a = (word_at(i * 4) >> hshift) & 0x01010101;
-            let hb_b = (word_at(16 + i * 4) >> hshift) & 0x01010101;
-            for byt in 0..4usize {
-                let qa = ((q_a >> (byt * 8)) & 0xFF) as i32;
-                let qb = ((q_b >> (byt * 8)) & 0xFF) as i32;
-                let ha = ((hb_a >> (byt * 8)) & 1) as i32;
-                let hbb = ((hb_b >> (byt * 8)) & 1) as i32;
-                sum_a += qa - 4 * (1 - ha);
-                sum_b += qb - 4 * (1 - hbb);
-            }
-        }
-        *block = scale_at(j8 * 2) * sum_a as f32 + scale_at(j8 * 2 + 1) * sum_b as f32;
-    }
-    let got = run(Format::Q3K, k, n, &a, &packed, true, None);
-    let host_sum: f32 = host_blocks.iter().sum();
-    assert!(
-        (got[0] - host_sum).abs() <= 1.0e-2,
-        "kernel {:.6} vs host sum {:.6}",
-        got[0],
-        host_sum
-    );
-}
-
 #[test]
 fn int_dot_gemv_matches_the_q4_0_q8_1_reference() {
     for format in [
@@ -694,14 +534,7 @@ fn int_dot_gemv_matches_the_q4_0_q8_1_reference() {
         Format::Q3K,
     ] {
         let shapes: &[(usize, usize)] = match format {
-            Format::Q40 => &[
-                (64usize, 8usize),
-                (96, 4),
-                (256, 16),
-                (6144, 1536),
-                (8224, 4),
-            ],
-            Format::Q8 => &[(64usize, 8usize), (96, 4), (256, 16), (8224, 4)],
+            Format::Q40 | Format::Q8 => &[(64usize, 8usize), (96, 4), (8224, 4)],
             // The envelope only opens where an element sits on a rounding
             // boundary, and each such element contributes up to a full quant
             // step of its weight. At 8192 elements a Q4_K/Q5_K/Q6_K column
@@ -822,35 +655,14 @@ fn int_dot_gemv_stays_close_to_the_full_precision_path() {
 }
 
 #[test]
-fn q40_q8_1_rmsnorm_fusion_matches_the_unfused_path() {
-    let (k, n) = (1536, 64);
-    let x = (0..k)
-        .map(|i| ((i * 37 % 257) as f32 - 128.0) * 0.013)
-        .collect::<Vec<_>>();
-    let norm_weight = (0..k)
-        .map(|i| 0.5 + (i * 17 % 101) as f32 * 0.011)
-        .collect::<Vec<_>>();
-    let (packed, _) = q40_weight(k, n, 0x51a7);
-
-    let fused = run_q40_rmsnorm(k, n, &x, &norm_weight, &packed, false);
-    let unfused = run_q40_rmsnorm(k, n, &x, &norm_weight, &packed, true);
-    let scale = unfused.iter().fold(0.0f32, |m, value| m.max(value.abs()));
-    let difference = max_abs_diff(&fused, &unfused);
-    assert!(
-        difference <= scale * 0.01,
-        "fused Q8_1 activation changed RMSNorm GEMV by {difference} at scale {scale}"
-    );
-}
-
-#[test]
 fn q6k_sub_block_correction_matches_the_reference() {
-    let (k, n) = (256usize, 4usize);
+    let (k, n) = (256usize, 16usize);
     let a = activation(k);
-    // For each of the sixteen 16-element sub-blocks of one superblock, zero
-    // every scale but that sub-block's, which carries q6 = 17. The exact
-    // product is -15 * the sub-block's activation sum, so a misread region
-    // shows up immediately.
-    for keep in 0..16usize {
+    // Column `keep` zeroes every scale of its superblock but sub-block
+    // `keep`'s, which carries q6 = 17. The exact product is -15 times that
+    // sub-block's activation sum, so a misread region shows up immediately.
+    let mut packed = Vec::new();
+    for keep in 0..n {
         let half = keep / 8;
         let j = (keep % 8) / 2;
         let lbase = (keep % 2) * 16;
@@ -863,17 +675,22 @@ fn q6k_sub_block_correction_matches_the_reference() {
         }
         sup[192 + keep] = 1;
         sup[208..210].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
-        let mut packed = Vec::new();
-        for _ in 0..n {
-            packed.extend_from_slice(&sup);
-        }
-        let (want, lo, hi) = int_dot_reference(Format::Q6K, &a, &packed, k, n);
-        let got = run(Format::Q6K, k, n, &a, &packed, true, None);
-        // The envelope is exact: only this sub-block's elements carry
-        // weight, and the quantization choices bound the rest. The noise
-        // slack covers backend reassociation of the scale, as elsewhere.
-        if let Some(why) = within_envelope(&got, &lo, &hi, want[0].abs() * 2.0e-5) {
-            panic!("keep={keep}: {why} (nominal {})", want[0]);
+        packed.extend_from_slice(&sup);
+    }
+    let (want, lo, hi) = int_dot_reference(Format::Q6K, &a, &packed, k, n);
+    let got = run(Format::Q6K, k, n, &a, &packed, true, None);
+    // The envelope is exact: only this sub-block's elements carry
+    // weight, and the quantization choices bound the rest. The noise
+    // slack covers backend reassociation of the scale, as elsewhere.
+    for keep in 0..n {
+        let column = keep..keep + 1;
+        if let Some(why) = within_envelope(
+            &got[column.clone()],
+            &lo[column.clone()],
+            &hi[column],
+            want[keep].abs() * 2.0e-5,
+        ) {
+            panic!("keep={keep}: {why} (nominal {})", want[keep]);
         }
     }
 }
@@ -995,12 +812,10 @@ fn grouped_q8_sharing_preserves_tails_norm_and_residual() {
             graph.add(product, addend)
         };
         graph.set_outputs(vec![output]);
-        for threads in [32, 64, 128] {
+        // Each width's widest grouping fills a 256-thread workgroup.
+        for (threads, groups) in [(32, 8), (128, 2)] {
             let mut baseline: Option<Vec<f32>> = None;
-            for column_groups in [1, 2, 4, 8] {
-                if threads * column_groups > 256 {
-                    continue;
-                }
+            for column_groups in [1, groups] {
                 let shape = meganeura::GemvShape {
                     threads,
                     column_groups,

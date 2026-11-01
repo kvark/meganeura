@@ -1,38 +1,7 @@
-use meganeura::{
-    DType, Graph,
-    codegen::MatrixTypes,
-    compile::{Kernel, ShaderEntry},
-};
+use meganeura::{DType, Graph, compile::Kernel};
 
 fn graph(m: usize, n: usize, k: usize, layout: usize, add: bool, round: bool) -> Graph {
-    let mut graph = Graph::new();
-    let a = graph.parameter("a", &if layout == 1 { [k, m] } else { [m, k] });
-    let b = graph.parameter("b", &if layout == 2 { [n, k] } else { [k, n] });
-    let bias = add.then(|| graph.parameter("bias", &[m, n]));
-    let a = graph.to_bf16(a);
-    let b = graph.to_bf16(b);
-    let y = match layout {
-        0 => graph.matmul(a, b),
-        1 => graph.matmul_at(a, b),
-        _ => graph.matmul_bt(a, b),
-    };
-    if let Some(bias) = bias {
-        let node = &mut graph.nodes_mut()[y as usize];
-        node.op = match layout {
-            0 => meganeura::graph::Op::FusedMatMulAdd,
-            1 => meganeura::graph::Op::FusedMatMulATAdd,
-            _ => meganeura::graph::Op::FusedMatMulBTAdd,
-        };
-        node.inputs.push(bias);
-    }
-    let y = if round {
-        let y = graph.to_bf16(y);
-        graph.from_bf16(y)
-    } else {
-        y
-    };
-    graph.set_outputs(vec![y]);
-    graph
+    crate::support::data::layout_graph(DType::BF16, layout, add, round, [m, n, k])
 }
 
 fn values(len: usize, seed: u32) -> Vec<f32> {
@@ -53,78 +22,8 @@ fn partition(k: usize, splits: usize, split: usize) -> std::ops::Range<usize> {
     first..(first + count * 32).min(k)
 }
 
-#[test]
-fn partitions_balance_whole_cooperative_tiles() {
-    for (k, splits) in [(1031, 4), (2303, 8), (4607, 16), (5000, 16), (6000, 16)] {
-        let ranges: Vec<_> = (0..splits)
-            .map(|split| partition(k, splits, split))
-            .collect();
-        assert_eq!(ranges.first().unwrap().start, 0);
-        assert_eq!(ranges.last().unwrap().end, k);
-        for pair in ranges.windows(2) {
-            assert_eq!(pair[0].end, pair[1].start);
-        }
-        let blocks: Vec<_> = ranges
-            .iter()
-            .map(|range| range.len().div_ceil(32))
-            .collect();
-        assert!(blocks.iter().max().unwrap() - blocks.iter().min().unwrap() <= 1);
-    }
-}
-
-#[test]
-fn partitions_reduce_before_rounding_and_leave_addends_unsplit() {
-    for layout in 0..3 {
-        for add in [false, true] {
-            let graph = graph(33, 65, 1031, layout, add, true);
-            for node in graph.nodes() {
-                assert!(node.inputs.iter().all(|&input| input < node.id));
-            }
-            let plan = meganeura::compile::compile(&graph);
-            let index = plan
-                .dispatches
-                .iter()
-                .position(|d| matches!(d.kernel, Kernel::CooperativeTyped { .. }))
-                .unwrap();
-            let product = &plan.dispatches[index];
-            let splits = if add { 1 } else { 4 };
-            assert_eq!(product.mnk(), Some((33, 65, 1031)));
-            assert_eq!(product.workgroups, [2, 3, splits]);
-            let expected_entry = match (layout, add) {
-                (0, false) => ShaderEntry::MatMul,
-                (0, true) => ShaderEntry::FusedMatMulAdd,
-                (1, false) => ShaderEntry::MatMulAT,
-                (1, true) => ShaderEntry::FusedMatMulATAdd,
-                (2, false) => ShaderEntry::MatMulBT,
-                (2, true) => ShaderEntry::FusedMatMulBTAdd,
-                _ => unreachable!(),
-            };
-            assert_eq!(product.shader, expected_entry);
-            assert_eq!(
-                product.kernel,
-                Kernel::CooperativeTyped {
-                    types: MatrixTypes {
-                        output: if add { DType::BF16 } else { DType::F32 },
-                        ..MatrixTypes::BF16
-                    },
-                    splits
-                }
-            );
-            if !add {
-                let sum = &plan.dispatches[index + 1];
-                assert_eq!(sum.shader, ShaderEntry::SumRows);
-                assert_eq!(sum.params, [4, 33 * 65, 1, 0]);
-                assert_eq!(sum.input_buffers, [product.output_buffer]);
-                assert_eq!(
-                    plan.buffers[product.output_buffer.0 as usize],
-                    4 * 33 * 65 * 4
-                );
-                assert_ne!(sum.output_buffer, product.output_buffer);
-            }
-        }
-    }
-}
-
+/// `typed_matmul::explicit_storage_selects_the_typed_schedule` checks the
+/// partitioned plan; this checks every partial and the reduced output.
 #[test]
 fn partitions_and_outputs_meet_native_accuracy_budget() {
     let gpu = crate::support::gpu::gpu();
@@ -139,14 +38,13 @@ fn partitions_and_outputs_meet_native_accuracy_budget() {
     let check_budget = || crate::support::gpu::assert_protocol_headroom(&gpu);
     let mut cases = 0;
     let mut checked = 0;
-    for (m, n, k, layouts) in [
-        (8, 256, 2048, 1),
-        (128, 256, 2560, 1),
-        (33, 65, 1031, 3),
-        (1, 7, 4099, 3),
-    ] {
+    for (m, n, k, layouts) in [(8, 256, 2048, 1), (33, 65, 1031, 3), (1, 7, 4099, 3)] {
         for layout in 0..layouts {
+            // Rounding applies after the reduction, whatever the layout.
             for round in [false, true] {
+                if round && layout != 0 {
+                    continue;
+                }
                 check_budget();
                 let mut config = crate::support::gpu::inference_config();
                 config.tune = false;

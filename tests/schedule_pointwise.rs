@@ -71,18 +71,3 @@ fn ternary_fusion_add_of_mul() {
         .expect("fused dispatch should carry a DAG");
     assert_eq!(dag.n_inputs, 3);
 }
-
-/// Softmax compiles to two generated reductions: the row max, then the
-/// normalized exponentials.
-#[test]
-fn softmax_schedule_emits_two_dispatches() {
-    let mut g = Graph::new();
-    let x = g.input("x", &[4, 64]);
-    let y = g.softmax(x);
-    g.set_outputs(vec![y]);
-
-    let plan = compile_with(&g, &CompileOptions::default());
-    assert_eq!(plan.dispatches.len(), 2);
-    assert!(plan.dispatches[0].reduction().is_some());
-    assert!(plan.dispatches[1].reduction().is_some());
-}

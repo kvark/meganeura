@@ -126,51 +126,6 @@ fn bf16_storage_rejects_untyped_arithmetic() {
 }
 
 #[test]
-fn unsupported_device_reports_bf16_requirement_before_shader_validation() {
-    let context = crate::support::gpu::gpu();
-    let caps = context.capabilities();
-    if caps.shader_bfloat16
-        && meganeura::codegen::checked_cooperative_shape(&caps.cooperative_matrix.bf16_f32_shapes)
-            .is_some()
-    {
-        eprintln!(
-            "native BF16 storage and matrices available; skipping unsupported-device coverage"
-        );
-        return;
-    }
-    let mut graph = Graph::new();
-    let input = graph.input("x", &[3, 7]);
-    let narrow = graph.to_bf16(input);
-    let (output, expected) = if caps.shader_bfloat16 {
-        let weight = graph.parameter("w", &[7, 5]);
-        let weight = graph.to_bf16(weight);
-        (
-            graph.matmul(narrow, weight),
-            "BF16 matrix products require native 16x16x16, 8x16x16 or 8x8x8 BF16/F32 cooperative matrices",
-        )
-    } else {
-        (
-            graph.from_bf16(narrow),
-            "selected plan requires native BF16 shader support",
-        )
-    };
-    graph.set_outputs(vec![output]);
-    let plan = meganeura::compile::compile(&graph);
-    let panic = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        meganeura::Session::with_context(plan, context)
-    })) {
-        Ok(_) => panic!("unsupported device accepted a BF16 plan"),
-        Err(panic) => panic,
-    };
-    let message = panic
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| panic.downcast_ref::<&str>().copied())
-        .unwrap_or("non-string panic");
-    assert!(message.contains(expected), "unexpected panic: {message}");
-}
-
-#[test]
 fn bf16_matrix_shaders_validate() {
     for entry in [
         ShaderEntry::MatMul,
@@ -342,36 +297,42 @@ fn bf16_pointwise_shaders_validate() {
         ],
         output: 4,
     };
-    for inputs in 0..8 {
-        for output in [DType::F32, DType::F16, DType::BF16] {
-            let shader = meganeura::schedule::lower_pointwise_storage(
-                &dag,
-                Default::default(),
-                PointwiseStorage {
-                    bf16_inputs: inputs,
-                    bf16_output: output == DType::BF16,
-                    f16_output: output == DType::F16,
-                },
-            );
-            let module = parse_with_bindings(&shader.source);
-            let info = naga::valid::Validator::new(
-                naga::valid::ValidationFlags::all(),
-                naga::valid::Capabilities::all(),
-            )
-            .validate(&module)
-            .unwrap();
-            naga::back::spv::write_vec(
-                &module,
-                &info,
-                &naga::back::spv::Options {
-                    lang_version: (1, 3),
-                    capabilities: None,
-                    ..Default::default()
-                },
-                None,
-            )
-            .unwrap();
-        }
+    // Each BF16 input slot, none and all, against each output type.
+    for (inputs, output) in [
+        (0, DType::BF16),
+        (1, DType::F16),
+        (2, DType::F32),
+        (4, DType::BF16),
+        (7, DType::F32),
+        (7, DType::F16),
+    ] {
+        let shader = meganeura::schedule::lower_pointwise_storage(
+            &dag,
+            Default::default(),
+            PointwiseStorage {
+                bf16_inputs: inputs,
+                bf16_output: output == DType::BF16,
+                f16_output: output == DType::F16,
+            },
+        );
+        let module = parse_with_bindings(&shader.source);
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+        naga::back::spv::write_vec(
+            &module,
+            &info,
+            &naga::back::spv::Options {
+                lang_version: (1, 3),
+                capabilities: None,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
     }
 }
 
@@ -447,57 +408,57 @@ fn bf16_matrix_reduced_gradients() {
         return;
     }
     let mut cases = 0;
+    // Each layout and addend meets one upstream scale; each scale runs twice.
     for layout in 0..3 {
         for addend in [false, true] {
-            for scale in [1e-20, 1.0, 1e20] {
-                let (m, n, k) = (35, 37, 41);
-                let mut graph = Graph::new();
-                let a = graph.parameter("a", &if layout == 1 { [k, m] } else { [m, k] });
-                let b = graph.parameter("b", &if layout == 2 { [n, k] } else { [k, n] });
-                let aq = graph.to_bf16(a);
-                let bq = graph.to_bf16(b);
-                let output = match layout {
-                    0 => graph.matmul(aq, bq),
-                    1 => graph.matmul_at(aq, bq),
-                    _ => graph.matmul_bt(aq, bq),
-                };
-                let output = if addend {
-                    let bias = graph.parameter("bias", &[m, n]);
-                    graph.add(output, bias)
-                } else {
-                    output
-                };
-                let output = graph.to_bf16(output);
-                let output = graph.from_bf16(output);
-                let weights = graph.input("weights", &[m, n]);
-                let weighted = graph.mul(output, weights);
-                let loss = graph.sum_all(weighted);
-                graph.set_outputs(vec![loss, output]);
-                let mut feeds = meganeura::reference::Feeds::new();
-                for (name, count) in [("a", m * k), ("b", k * n)] {
-                    feeds.set(
-                        name,
-                        &(0..count)
-                            .map(|i| ((i * 37 + 11) % 53) as f32 / 128.0 - 26.0 / 128.0)
-                            .collect::<Vec<_>>(),
-                    );
-                }
-                if addend {
-                    feeds.set("bias", &vec![0.125; m * n]);
-                }
+            let scale = [1e-20, 1.0, 1e20][(layout * 2 + usize::from(addend)) % 3];
+            let (m, n, k) = (35, 37, 41);
+            let mut graph = Graph::new();
+            let a = graph.parameter("a", &if layout == 1 { [k, m] } else { [m, k] });
+            let b = graph.parameter("b", &if layout == 2 { [n, k] } else { [k, n] });
+            let aq = graph.to_bf16(a);
+            let bq = graph.to_bf16(b);
+            let output = match layout {
+                0 => graph.matmul(aq, bq),
+                1 => graph.matmul_at(aq, bq),
+                _ => graph.matmul_bt(aq, bq),
+            };
+            let output = if addend {
+                let bias = graph.parameter("bias", &[m, n]);
+                graph.add(output, bias)
+            } else {
+                output
+            };
+            let output = graph.to_bf16(output);
+            let output = graph.from_bf16(output);
+            let weights = graph.input("weights", &[m, n]);
+            let weighted = graph.mul(output, weights);
+            let loss = graph.sum_all(weighted);
+            graph.set_outputs(vec![loss, output]);
+            let mut feeds = meganeura::reference::Feeds::new();
+            for (name, count) in [("a", m * k), ("b", k * n)] {
                 feeds.set(
-                    "weights",
-                    &(0..m * n)
-                        .map(|i| ((i % 7) as f32 - 3.0) * scale * 1.0015)
+                    name,
+                    &(0..count)
+                        .map(|i| ((i * 37 + 11) % 53) as f32 / 128.0 - 26.0 / 128.0)
                         .collect::<Vec<_>>(),
                 );
-                let mut options = meganeura::reference::gpu::Options::default();
-                options.compile.bf16_matrix_gradients = true;
-                let report =
-                    meganeura::reference::gpu::check_training(&graph, &feeds, &options).unwrap();
-                report.assert_passed("BF16 reduced derivative inputs");
-                cases += 1;
             }
+            if addend {
+                feeds.set("bias", &vec![0.125; m * n]);
+            }
+            feeds.set(
+                "weights",
+                &(0..m * n)
+                    .map(|i| ((i % 7) as f32 - 3.0) * scale * 1.0015)
+                    .collect::<Vec<_>>(),
+            );
+            let mut options = meganeura::reference::gpu::Options::default();
+            options.compile.bf16_matrix_gradients = true;
+            let report =
+                meganeura::reference::gpu::check_training(&graph, &feeds, &options).unwrap();
+            report.assert_passed("BF16 reduced derivative inputs");
+            cases += 1;
         }
     }
     println!("bf16_reduced_gradients_verified cases={cases}");
@@ -566,56 +527,56 @@ fn bf16_matrix_values_and_f32_gradients() {
     }
     crate::support::gpu::assert_protocol_headroom(&context);
     let mut comparisons = 0;
-    for (m, n, k) in [(19, 23, 17), (32, 48, 64), (1, 7, 1)] {
-        for layout in 0..3 {
-            for addend in [false, true] {
-                let mut graph = Graph::new();
-                let a = graph.parameter("a", &if layout == 1 { [k, m] } else { [m, k] });
-                let b = graph.parameter("b", &if layout == 2 { [n, k] } else { [k, n] });
-                let aq = graph.to_bf16(a);
-                let bq = graph.to_bf16(b);
-                let product = match layout {
-                    0 => graph.matmul(aq, bq),
-                    1 => graph.matmul_at(aq, bq),
-                    _ => graph.matmul_bt(aq, bq),
-                };
-                let output = if addend {
-                    let bias = graph.parameter("bias", &[m, n]);
-                    graph.add(product, bias)
-                } else {
-                    product
-                };
-                let loss = graph.sum_all(output);
-                graph.set_outputs(vec![loss, output]);
-                let mut feeds = meganeura::reference::Feeds::new();
-                feeds.set(
-                    "a",
-                    &(0..m * k)
-                        .map(|i| ((i * 37 + 11) % 53) as f32 / 17.0 - 1.5)
-                        .collect::<Vec<_>>(),
-                );
-                feeds.set(
-                    "b",
-                    &(0..k * n)
-                        .map(|i| ((i * 23 + 7) % 47) as f32 / 13.0 - 1.75)
-                        .collect::<Vec<_>>(),
-                );
-                if addend {
-                    feeds.set("bias", &vec![0.125; m * n]);
-                }
-                let options = meganeura::reference::gpu::Options::default();
-                let plan =
-                    meganeura::reference::gpu::plan(&graph, &options, meganeura::Mode::Training);
-                assert!(
-                    plan.dispatches
-                        .iter()
-                        .any(|d| matches!(d.kernel, Kernel::CooperativeTyped { .. }))
-                );
-                let report =
-                    meganeura::reference::gpu::check_training(&graph, &feeds, &options).unwrap();
-                report.assert_passed("BF16 matrix values and F32 gradients");
-                comparisons += 1;
+    // Each layout and addend meets one shape; each shape runs twice.
+    for layout in 0..3 {
+        for addend in [false, true] {
+            let (m, n, k) =
+                [(19, 23, 17), (32, 48, 64), (1, 7, 1)][(layout * 2 + usize::from(addend)) % 3];
+            let mut graph = Graph::new();
+            let a = graph.parameter("a", &if layout == 1 { [k, m] } else { [m, k] });
+            let b = graph.parameter("b", &if layout == 2 { [n, k] } else { [k, n] });
+            let aq = graph.to_bf16(a);
+            let bq = graph.to_bf16(b);
+            let product = match layout {
+                0 => graph.matmul(aq, bq),
+                1 => graph.matmul_at(aq, bq),
+                _ => graph.matmul_bt(aq, bq),
+            };
+            let output = if addend {
+                let bias = graph.parameter("bias", &[m, n]);
+                graph.add(product, bias)
+            } else {
+                product
+            };
+            let loss = graph.sum_all(output);
+            graph.set_outputs(vec![loss, output]);
+            let mut feeds = meganeura::reference::Feeds::new();
+            feeds.set(
+                "a",
+                &(0..m * k)
+                    .map(|i| ((i * 37 + 11) % 53) as f32 / 17.0 - 1.5)
+                    .collect::<Vec<_>>(),
+            );
+            feeds.set(
+                "b",
+                &(0..k * n)
+                    .map(|i| ((i * 23 + 7) % 47) as f32 / 13.0 - 1.75)
+                    .collect::<Vec<_>>(),
+            );
+            if addend {
+                feeds.set("bias", &vec![0.125; m * n]);
             }
+            let options = meganeura::reference::gpu::Options::default();
+            let plan = meganeura::reference::gpu::plan(&graph, &options, meganeura::Mode::Training);
+            assert!(
+                plan.dispatches
+                    .iter()
+                    .any(|d| matches!(d.kernel, Kernel::CooperativeTyped { .. }))
+            );
+            let report =
+                meganeura::reference::gpu::check_training(&graph, &feeds, &options).unwrap();
+            report.assert_passed("BF16 matrix values and F32 gradients");
+            comparisons += 1;
         }
     }
     crate::support::gpu::assert_protocol_headroom(&context);

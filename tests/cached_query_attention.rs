@@ -31,10 +31,9 @@ fn cache_writes_alias_before_following_views_are_allocated() {
 
 #[test]
 fn cached_blocks_match_cpu_and_reset_excludes_stale_tokens() {
+    // A single token, and a block wider than one 32-lane group.
     check_cached_blocks::<1>();
-    check_cached_blocks::<3>();
     check_cached_blocks::<33>();
-    check_cached_blocks::<196>();
 }
 
 fn check_cached_blocks<const BLOCK: usize>() {

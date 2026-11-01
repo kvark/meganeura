@@ -1,6 +1,6 @@
 //! Regressions from the September 2026 shader audit that the `oracle`
-//! suite cannot express: gradient-clipping measurements, which buffers the
-//! flash backward binds, and finiteness where f32 saturates but f64 does
+//! suite cannot express: gradient-clipping measurements, which reduction
+//! the flash backward binds, and finiteness where f32 saturates but f64 does
 //! not. The audit's numerical regressions now live in `oracle`.
 
 use meganeura::{Graph, Session};
@@ -11,49 +11,12 @@ fn values(n: usize, frequency: f32, phase: f32) -> Vec<f32> {
         .collect()
 }
 
-/// Central finite difference of the scalar loss for one parameter element.
-fn finite_difference(
-    session: &mut Session,
-    parameters: &[(&str, Vec<f32>)],
-    inputs: &[(&str, Vec<f32>)],
-    name: &str,
-    index: usize,
-    step: f32,
-) -> f32 {
-    let mut evaluate = |delta: f32| {
-        for (parameter, data) in parameters {
-            if *parameter == name {
-                let mut data = data.clone();
-                data[index] += delta;
-                session.set_parameter(parameter, &data);
-            } else {
-                session.set_parameter(parameter, data);
-            }
-        }
-        for (input, data) in inputs {
-            session.set_input(input, data);
-        }
-        session.step();
-        session.wait();
-        session.read_loss()
-    };
-    (evaluate(step) - evaluate(-step)) / (2.0 * step)
-}
-
-fn assert_close(label: &str, actual: f32, expected: f32) {
-    let error = (actual - expected).abs();
-    let scale = actual.abs().max(expected.abs()).max(1e-5);
-    assert!(
-        error < 2e-3 || error / scale < 0.05,
-        "{label}: analytical={actual:+.6e}, numerical={expected:+.6e}"
-    );
-}
-
-/// Global clipping measures the norm with many workgroups per gradient. With
-/// SGD the step is exactly `-lr * g * min(1, max_norm / ||g||)`, so the
-/// update reveals the norm the GPU computed across every workgroup.
+/// Clipping measures norms with many workgroups per tensor. With SGD each
+/// step reveals the scale the GPU computed: global clipping steps by exactly
+/// `-lr * g * min(1, max_norm / ||g||)`, adaptive clipping scales each
+/// parameter by `min(1, clip * max(pmin, ||p||) / ||g||)`.
 #[test]
-fn global_grad_clip_measures_large_gradients() {
+fn grad_clip_measures_large_parameters_and_gradients() {
     let sizes = [300_001usize, 5, 70_000];
     let mut graph = Graph::new();
     let mut terms = Vec::new();
@@ -75,26 +38,26 @@ fn global_grad_clip_measures_large_gradients() {
         .enumerate()
         .map(|(i, &n)| values(n, 0.37 + i as f32 * 0.1, 0.3))
         .collect();
-    let norm = targets
-        .iter()
-        .flatten()
-        .map(|&v| (v as f64).powi(2))
-        .sum::<f64>()
-        .sqrt();
-    let max_norm = (norm * 0.25) as f32;
+    let norm = |v: &[f32]| v.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
     let lr = 0.5f32;
+    let step = |initial: &[Vec<f32>], clip: &dyn Fn(&mut Session)| {
+        let mut session = meganeura::build(&graph, crate::support::gpu::config()).0;
+        for (i, initial) in initial.iter().enumerate() {
+            session.set_parameter(&format!("p{i}"), initial);
+            session.set_input(&format!("t{i}"), &targets[i]);
+        }
+        clip(&mut session);
+        session.set_learning_rate(lr);
+        session.step();
+        session.wait();
+        session
+    };
 
-    let mut session = meganeura::build(&graph, crate::support::gpu::config()).0;
-    for (i, &n) in sizes.iter().enumerate() {
-        session.set_parameter(&format!("p{i}"), &vec![0.0; n]);
-        session.set_input(&format!("t{i}"), &targets[i]);
-    }
-    session.set_grad_clip_norm(max_norm);
-    session.set_learning_rate(lr);
-    session.step();
-    session.wait();
-
-    let scale = max_norm as f64 / norm;
+    let global_norm = norm(&targets.concat());
+    let max_norm = (global_norm * 0.25) as f32;
+    let zeros: Vec<_> = sizes.iter().map(|&n| vec![0.0; n]).collect();
+    let session = step(&zeros, &|s| s.set_grad_clip_norm(max_norm));
+    let scale = max_norm as f64 / global_norm;
     for (i, &n) in sizes.iter().enumerate() {
         let mut after = vec![0.0; n];
         session.read_param(&format!("p{i}"), &mut after);
@@ -102,56 +65,19 @@ fn global_grad_clip_measures_large_gradients() {
             let want = -(lr as f64) * targets[i][j] as f64 * scale;
             assert!(
                 (after[j] as f64 - want).abs() <= 1e-4 * want.abs().max(1e-3),
-                "p{i}[{j}]: got {}, want {want}",
+                "global p{i}[{j}]: got {}, want {want}",
                 after[j]
             );
         }
     }
-}
 
-/// Adaptive clipping measures every parameter with many workgroups and
-/// scales each by min(1, clip * max(pmin, ||p||) / ||g||). With SGD the step
-/// reveals the scale the GPU computed for each parameter.
-#[test]
-fn adaptive_grad_clip_measures_large_parameters() {
-    let sizes = [300_001usize, 5, 70_000];
-    let (clip, pmin, lr) = (0.05f32, 1e-3f32, 0.5f32);
-    let mut graph = Graph::new();
-    let mut terms = Vec::new();
-    for (i, &n) in sizes.iter().enumerate() {
-        let p = graph.parameter(&format!("p{i}"), &[n]);
-        let t = graph.input(&format!("t{i}"), &[n]);
-        let product = graph.mul(p, t);
-        terms.push(graph.sum_all(product));
-    }
-    let loss = terms
-        .into_iter()
-        .reduce(|a, b| graph.add(a, b))
-        .expect("at least one term");
-    graph.set_outputs(vec![loss]);
-
+    let (clip, pmin) = (0.05f32, 1e-3f32);
     let initial: Vec<Vec<f32>> = sizes
         .iter()
         .enumerate()
         .map(|(i, &n)| values(n, 0.21 + i as f32 * 0.05, 1.1))
         .collect();
-    let targets: Vec<Vec<f32>> = sizes
-        .iter()
-        .enumerate()
-        .map(|(i, &n)| values(n, 0.37 + i as f32 * 0.1, 0.3))
-        .collect();
-
-    let mut session = meganeura::build(&graph, crate::support::gpu::config()).0;
-    for (i, _) in sizes.iter().enumerate() {
-        session.set_parameter(&format!("p{i}"), &initial[i]);
-        session.set_input(&format!("t{i}"), &targets[i]);
-    }
-    session.set_adaptive_grad_clip(clip, pmin);
-    session.set_learning_rate(lr);
-    session.step();
-    session.wait();
-
-    let norm = |v: &[f32]| v.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
+    let session = step(&initial, &|s| s.set_adaptive_grad_clip(clip, pmin));
     for (i, &n) in sizes.iter().enumerate() {
         let upper = clip as f64 * norm(&initial[i]).max(pmin as f64);
         let scale = (upper / norm(&targets[i])).min(1.0);
@@ -161,7 +87,7 @@ fn adaptive_grad_clip_measures_large_parameters() {
             let want = initial[i][j] as f64 - lr as f64 * targets[i][j] as f64 * scale;
             assert!(
                 (after[j] as f64 - want).abs() <= 1e-5 * want.abs().max(1e-2),
-                "p{i}[{j}]: got {}, want {want}",
+                "adaptive p{i}[{j}]: got {}, want {want}",
                 after[j]
             );
         }
@@ -169,7 +95,9 @@ fn adaptive_grad_clip_measures_large_parameters() {
 }
 
 /// Flash dQ and dK/dV share one per-row dot(dO, O) reduction, including the
-/// register and shared-memory KV variants, GQA and causal masking.
+/// register and shared-memory KV variants, GQA and causal masking. The
+/// gradients themselves are checked by `oracle`'s
+/// `every_backward_path_against_the_reference`.
 #[test]
 fn flash_attention_backward_uses_precomputed_row_dots() {
     use meganeura::compile::ShaderEntry;
@@ -197,65 +125,39 @@ fn flash_attention_backward_uses_precomputed_row_dots() {
         let loss = graph.sum_all(weighted);
         graph.set_outputs(vec![loss]);
 
-        let parameters = [
-            ("q", values(seq * q_width, 0.017, 0.3)),
-            ("k", values(seq * kv_width, 0.019, 0.7)),
-            ("v", values(seq * kv_width, 0.023, 1.1)),
-        ];
-        let inputs = [("weights", values(seq * q_width, 0.013, 1.7))];
-        let mut training = meganeura::build(&graph, crate::support::gpu::config()).0;
-        let dispatches = &training.plan().dispatches;
-        let query = dispatches
-            .iter()
-            .find(|d| {
-                matches!(
-                    d.shader,
-                    ShaderEntry::AttentionGrad(AttentionGrad {
-                        part: Part::Q,
-                        path: Path::Flash | Path::Cooperative(Operands::F32),
-                    })
-                )
-            })
-            .unwrap();
-        let kv = dispatches
-            .iter()
-            .find(|d| {
-                matches!(
-                    d.shader,
-                    ShaderEntry::AttentionGrad(AttentionGrad {
-                        part: Part::KV,
-                        path: Path::Flash | Path::Cooperative(Operands::F32),
-                    })
-                )
-            })
-            .unwrap();
-        assert_eq!(
-            query.input_buffers[5], kv.input_buffers[5],
-            "dQ and dK/dV must share the row reduction"
+        let plan = meganeura::reference::gpu::plan(
+            &graph,
+            &Default::default(),
+            meganeura::train::Mode::Training,
         );
-        for (name, data) in &parameters {
-            training.set_parameter(name, data);
-        }
-        training.set_input("weights", &inputs[0].1);
-        training.set_learning_rate(0.0);
-        training.step();
-        training.wait();
-
-        let mut inference = meganeura::build(&graph, crate::support::gpu::inference_config()).0;
-        for (name, data) in &parameters {
-            let mut gradient = vec![0.0; data.len()];
-            training.read_param_grad(name, &mut gradient);
-            let width = data.len() / seq;
-            for index in [0, width + 3, (seq / 2) * width + width - 1, data.len() - 1] {
-                let numerical =
-                    finite_difference(&mut inference, &parameters, &inputs, name, index, 1e-2);
-                assert_close(
-                    &format!("seq={seq} hd={head_dim} causal={causal} {name}[{index}]"),
-                    gradient[index],
-                    numerical,
-                );
-            }
-        }
+        let grad = |part| {
+            plan.dispatches
+                .iter()
+                .find(|d| {
+                    matches!(
+                        d.shader,
+                        ShaderEntry::AttentionGrad(AttentionGrad {
+                            part: p,
+                            path: Path::Flash | Path::Cooperative(Operands::F32),
+                        }) if p == part
+                    )
+                })
+                .unwrap_or_else(|| panic!("seq={seq} hd={head_dim}: no flash {part:?} gradient"))
+        };
+        let (query, kv) = (grad(Part::Q), grad(Part::KV));
+        let shared = plan
+            .dispatches
+            .iter()
+            .filter(|d| {
+                d.reduction().is_some()
+                    && query.input_buffers.contains(&d.output_buffer)
+                    && kv.input_buffers.contains(&d.output_buffer)
+            })
+            .count();
+        assert_eq!(
+            shared, 1,
+            "seq={seq} hd={head_dim} causal={causal}: dQ and dK/dV must share the row reduction"
+        );
     }
 }
 

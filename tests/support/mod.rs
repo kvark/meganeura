@@ -1,4 +1,5 @@
 //! Shared helpers for the test suites.
+pub mod data;
 pub mod gpu;
 
 /// Tuning that compares one challenger at a time, qualifying every challenger,
