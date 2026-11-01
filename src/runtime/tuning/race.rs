@@ -1214,7 +1214,7 @@ mod tests {
     }
 
     #[test]
-    fn paired_rounds_balance_positions_even_after_elimination() {
+    fn paired_rounds_balance_positions_and_pair_only_shared_rounds() {
         for alive in [vec![true; 25], vec![true, false, true, true, false]] {
             for pair in 0..6 {
                 let forward = round_order(&alive, pair * 2);
@@ -1224,6 +1224,12 @@ mod tests {
                 assert_eq!(forward.len(), alive.iter().filter(|&&v| v).count());
             }
         }
+        // Pairs are the rounds both candidates ran.
+        let samples = [
+            vec![Some(1.0), Some(2.0), Some(3.0)],
+            vec![Some(4.0), None, Some(6.0)],
+        ];
+        assert_eq!(pairs(&samples, 1), [(1.0, 4.0), (3.0, 6.0)]);
     }
 
     fn timing_winner(samples: &[f64], options: &TuneOptions) -> TuneOutcome {
@@ -1238,7 +1244,7 @@ mod tests {
     }
 
     #[test]
-    fn finalists_require_a_meaningful_gain_over_each_other() {
+    fn finalists_need_a_meaningful_low_noise_gain_and_ties_do_not_chain() {
         let options = TuneOptions::default();
         let winner = |ms| timing_winner(&vec![ms; options.sample_pairs], &options);
         // Both beat the original incumbent, but 2% is below the requested 5%.
@@ -1259,12 +1265,6 @@ mod tests {
             finalist_order(&[winner(10.0), winner(9.8)], &precise),
             [1, 0]
         );
-    }
-
-    #[test]
-    fn finalist_ties_include_paired_noise_and_do_not_chain() {
-        let options = TuneOptions::default();
-        let winner = |ms| timing_winner(&vec![ms; options.sample_pairs], &options);
         let noisy = timing_winner(&[8.0, 9.5, 8.0, 9.5, 8.0, 9.5], &options);
         // Median gain is >5%, but not >5% plus the paired noise margin.
         assert_eq!(finalist_order(&[winner(10.0), noisy], &options), [0, 1]);
@@ -1306,24 +1306,11 @@ mod tests {
                 .iter()
                 .all(|o| o.decision == TuneDecision::KeepBaseline)
         );
-    }
-
-    #[test]
-    fn a_single_fast_sample_keeps_a_challenger_in_the_race() {
-        let samples = vec![vec![Some(10.0); 3], vec![Some(12.0), Some(9.0), Some(12.0)]];
+        // A single fast sample keeps a challenger in the race.
+        let samples = [vec![Some(10.0); 3], vec![Some(12.0), Some(9.0), Some(12.0)]];
         let mut alive = vec![true; 2];
-        let mut outcomes = vec![outcome(MatmulTile::Tile32)];
-        eliminate(&samples, &mut alive, &mut outcomes, 0.05);
+        eliminate(&samples, &mut alive, &mut outcomes[..1], 0.05);
         assert_eq!(alive, [true, true]);
-    }
-
-    #[test]
-    fn pairs_follow_rounds_both_candidates_ran() {
-        let samples = vec![
-            vec![Some(1.0), Some(2.0), Some(3.0)],
-            vec![Some(4.0), None, Some(6.0)],
-        ];
-        assert_eq!(pairs(&samples, 1), [(1.0, 4.0), (3.0, 6.0)]);
     }
 
     #[test]

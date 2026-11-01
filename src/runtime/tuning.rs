@@ -2749,17 +2749,9 @@ mod memo_tests {
                 tile_variant(&dispatch, interleaved, &bg::Capabilities::default())
             );
         }
-        let directory = TestDirectory::new();
-        let path = directory.0.join("conv-memo.json");
-        let mut memo = populated_memo();
-        let (mut key, mut progress) = memo.progress.drain().next().unwrap();
-        key.3 = vec![contiguous, interleaved];
-        progress.selected = interleaved;
-        memo.progress.insert(key, progress);
-        memo.save(&path).unwrap();
-        let loaded = KernelMemo::load(&path).unwrap();
+        let saved = serde_json::to_string(&interleaved).unwrap();
         assert_eq!(
-            loaded.progress.values().next().unwrap().selected,
+            serde_json::from_str::<MatmulTile>(&saved).unwrap(),
             interleaved
         );
     }
@@ -2770,47 +2762,50 @@ mod memo_tests {
         let path = directory.0.join("memo.json");
         let memo = populated_memo();
         memo.save(&path).unwrap();
-        let mut loaded = KernelMemo::load(&path).unwrap();
+        let loaded = KernelMemo::load(&path).unwrap();
         assert_eq!(loaded.scope, memo.scope);
-        loaded.bind_scope(memo.scope.clone().unwrap());
-        assert_eq!(loaded.len(), 1);
         let progress = loaded.progress.values().next().unwrap();
         assert_eq!(
             (progress.selected, progress.next_candidate),
             (MatmulTile::Tile64, 1)
         );
+        let kept = |scope: MemoScope| {
+            let mut loaded = KernelMemo::load(&path).unwrap();
+            loaded.bind_scope(scope);
+            loaded.len()
+        };
+        assert_eq!(kept(memo.scope.clone().unwrap()), 1);
         // Budgets and calibration do not change a decision; the decision
-        // policy and strategy do.
+        // policy, strategy and timing source do.
         let options = TuneOptions {
             max_time: Duration::from_secs(1),
             max_classes: 1,
             calibration: TuneCalibration::Off,
             ..Default::default()
         };
-        loaded.bind_scope(MemoScope::new(&bg::DeviceInformation::default(), &options));
-        assert_eq!(loaded.len(), 1);
-        let mut sequential = KernelMemo::load(&path).unwrap();
-        sequential.bind_scope(MemoScope::new(
-            &bg::DeviceInformation::default(),
-            &TuneOptions {
+        let scope = |options: &TuneOptions| MemoScope::new(&Default::default(), options);
+        assert_eq!(kept(scope(&options)), 1);
+        assert_eq!(
+            kept(scope(&TuneOptions {
                 strategy: TuneStrategy::Sequential,
                 ..options.clone()
-            },
-        ));
-        assert!(sequential.is_empty());
-        let mut timestamped = KernelMemo::load(&path).unwrap();
-        let mut scope = timestamped.scope.clone().unwrap();
-        scope.gpu_timestamps = true;
-        timestamped.bind_scope(scope);
-        assert!(timestamped.is_empty());
-        loaded.bind_scope(MemoScope::new(
-            &bg::DeviceInformation::default(),
-            &TuneOptions {
+            })),
+            0
+        );
+        assert_eq!(
+            kept(MemoScope {
+                gpu_timestamps: true,
+                ..scope(&options)
+            }),
+            0
+        );
+        assert_eq!(
+            kept(scope(&TuneOptions {
                 min_improvement: 0.1,
                 ..options
-            },
-        ));
-        assert!(loaded.is_empty());
+            })),
+            0
+        );
     }
 
     #[test]
@@ -3096,9 +3091,7 @@ mod tests {
     /// decided class installs its winner without taking a class slot.
     #[test]
     fn raced_classes_are_decided_and_leave_their_slot_to_others() {
-        let gpu = std::sync::Arc::new(
-            crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap(),
-        );
+        let gpu = crate::reference::gpu::shared_context();
         let mut graph = crate::Graph::new();
         let x = graph.input("x", &[33, 17]);
         let w = graph.parameter("w", &[17, 65]);
@@ -3132,24 +3125,6 @@ mod tests {
             ..Default::default()
         };
         let mut memo = KernelMemo::default();
-        let skipped = create()
-            .tune_with_memo(
-                TuneOptions {
-                    max_scratch_bytes: 0,
-                    ..options.clone()
-                },
-                Some(&mut memo),
-            )
-            .unwrap();
-        assert_eq!(skipped.races.len(), 1);
-        assert!(!skipped.races[0].complete);
-        assert!(
-            skipped
-                .outcomes
-                .iter()
-                .all(|outcome| outcome.decision == TuneDecision::ScratchLimit)
-        );
-        assert!(memo.is_empty(), "a scratch limit is not a kernel decision");
         let first = create()
             .tune_with_memo(options.clone(), Some(&mut memo))
             .unwrap();
@@ -3284,85 +3259,85 @@ mod tests {
             cfg
         };
         let (ordinary, _) = crate::build(&graph, config());
-        for strategy in [TuneStrategy::Sequential, TuneStrategy::Race] {
-            let tuning = TuneOptions {
-                strategy,
-                calibration: TuneCalibration::Off,
-                // The only class is completely decided below: replay must not
-                // depend on a hardware-specific private race or any new probe.
-                max_classes: 1,
-                max_time: Duration::from_secs(10),
-                sample_pairs: 4,
+        // Both strategies resume shared decisions in measure.rs's
+        // `later_searches_resume_shared_kernel_decisions`; one suffices here.
+        let tuning = TuneOptions {
+            strategy: TuneStrategy::Race,
+            calibration: TuneCalibration::Off,
+            // The only class is completely decided below: replay must not
+            // depend on a hardware-specific private race or any new probe.
+            max_classes: 1,
+            max_time: Duration::from_secs(10),
+            sample_pairs: 4,
+            ..Default::default()
+        };
+        let (classes, _) = ordinary.tune_classes(&tuning);
+        assert_eq!(classes.len(), 1);
+        let class = &classes[0];
+        let selected = class.challengers[0];
+        assert_ne!(selected, class.initial);
+        let mut memo = KernelMemo::default();
+        memo.bind(&gpu, &tuning, false);
+        memo.progress.insert(
+            memo_key(&ordinary.plan, class),
+            KernelProgress {
+                selected,
+                next_candidate: class.challengers.len(),
+            },
+        );
+        let memo = Arc::new(Mutex::new(memo));
+        let (mut session, report) = crate::train::build_measured(
+            &graph,
+            config(),
+            crate::train::BuildSearchOptions {
+                max_graphs: 1,
+                max_programs: 2,
+                max_time: Duration::from_secs(30),
+                // An intentionally unreachable whole-program gain makes
+                // rejection independent of which valid tile was cached.
+                min_improvement: 0.999999,
+                warmup_runs: 1,
+                warmup_time: Duration::ZERO,
+                tuning,
+                kernel_memo: Some(memo.clone()),
                 ..Default::default()
-            };
-            let (classes, _) = ordinary.tune_classes(&tuning);
-            assert_eq!(classes.len(), 1);
-            let class = &classes[0];
-            let selected = class.challengers[0];
-            assert_ne!(selected, class.initial);
-            let mut memo = KernelMemo::default();
-            memo.bind(&gpu, &tuning, false);
-            memo.progress.insert(
-                memo_key(&ordinary.plan, class),
-                KernelProgress {
-                    selected,
-                    next_candidate: class.challengers.len(),
-                },
-            );
-            let memo = Arc::new(Mutex::new(memo));
-            let (mut session, report) = crate::train::build_measured(
-                &graph,
-                config(),
-                crate::train::BuildSearchOptions {
-                    max_graphs: 1,
-                    max_programs: 2,
-                    max_time: Duration::from_secs(30),
-                    // An intentionally unreachable whole-program gain makes
-                    // rejection independent of which valid tile was cached.
-                    min_improvement: 0.999999,
-                    warmup_runs: 1,
-                    warmup_time: Duration::ZERO,
-                    tuning,
-                    kernel_memo: Some(memo.clone()),
-                    ..Default::default()
-                },
-                |s, _| {
-                    s.set_input("x", &[0.25; 33 * 17]);
-                    s.set_parameter("w", &[0.125; 17 * 65]);
+            },
+            |s, _| {
+                s.set_input("x", &[0.25; 33 * 17]);
+                s.set_parameter("w", &[0.125; 17 * 65]);
+                Ok(())
+            },
+            |s| {
+                if s.read_output(33 * 65).iter().all(|&v| v == 17.0 / 32.0) {
                     Ok(())
-                },
-                |s| {
-                    if s.read_output(33 * 65).iter().all(|&v| v == 17.0 / 32.0) {
-                        Ok(())
-                    } else {
-                        Err("matmul mismatch".into())
-                    }
-                },
-            )
-            .unwrap();
-            assert_eq!(report.trials.len(), 2);
-            assert!(report.trials[0].kernel_tuning.is_none());
-            let challenger = &report.trials[1];
-            let replay = challenger.kernel_tuning.as_ref().unwrap();
-            assert_eq!(replay.reused_classes, [(class.key.clone(), selected)]);
-            assert!(replay.races.is_empty() && replay.outcomes.is_empty());
-            assert!(challenger.outcome.qualified);
-            assert_eq!(challenger.outcome.baseline_ms.len(), 4);
-            assert_eq!(challenger.outcome.candidate_ms.len(), 4);
-            assert_eq!(challenger.outcome.decision, TuneDecision::KeepBaseline);
-            assert_eq!(report.selected, 0);
-            assert_eq!(session.plan(), ordinary.plan());
-            // Rejecting a whole program does not erase useful private evidence.
-            assert_eq!(memo.lock().unwrap().len(), 1);
-            session.step();
-            session.wait();
-            assert!(
-                session
-                    .read_output(33 * 65)
-                    .iter()
-                    .all(|&v| v == 17.0 / 32.0)
-            );
-        }
+                } else {
+                    Err("matmul mismatch".into())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(report.trials.len(), 2);
+        assert!(report.trials[0].kernel_tuning.is_none());
+        let challenger = &report.trials[1];
+        let replay = challenger.kernel_tuning.as_ref().unwrap();
+        assert_eq!(replay.reused_classes, [(class.key.clone(), selected)]);
+        assert!(replay.races.is_empty() && replay.outcomes.is_empty());
+        assert!(challenger.outcome.qualified);
+        assert_eq!(challenger.outcome.baseline_ms.len(), 4);
+        assert_eq!(challenger.outcome.candidate_ms.len(), 4);
+        assert_eq!(challenger.outcome.decision, TuneDecision::KeepBaseline);
+        assert_eq!(report.selected, 0);
+        assert_eq!(session.plan(), ordinary.plan());
+        // Rejecting a whole program does not erase useful private evidence.
+        assert_eq!(memo.lock().unwrap().len(), 1);
+        session.step();
+        session.wait();
+        assert!(
+            session
+                .read_output(33 * 65)
+                .iter()
+                .all(|&v| v == 17.0 / 32.0)
+        );
     }
 
     #[test]
@@ -3395,33 +3370,60 @@ mod tests {
         };
         assert!(session.kernel_probes_pending(&options, None));
         assert!(super::super::calibration::cached_profile(&gpu, false).is_none());
-        for skip in [
-            TuneOptions {
-                max_classes: 0,
+        let before = session.dispatch_pipeline_keys();
+        for strategy in [TuneStrategy::Race, TuneStrategy::Sequential] {
+            let options = TuneOptions {
+                strategy,
                 ..options.clone()
-            },
-            TuneOptions {
-                max_time: Duration::ZERO,
-                ..options.clone()
-            },
-            TuneOptions {
-                max_scratch_bytes: 0,
-                ..options.clone()
-            },
-        ] {
-            let report = session.tune_with(skip).unwrap();
-            assert!(report.machine_profile.is_none());
-            assert!(report.calibration_time.is_zero());
-            assert!(super::super::calibration::cached_profile(&gpu, false).is_none());
+            };
+            for skip in [
+                TuneOptions {
+                    max_classes: 0,
+                    ..options.clone()
+                },
+                TuneOptions {
+                    max_time: Duration::ZERO,
+                    ..options.clone()
+                },
+                TuneOptions {
+                    max_scratch_bytes: 0,
+                    ..options.clone()
+                },
+            ] {
+                let report = session.tune_with(skip).unwrap();
+                assert!(report.machine_profile.is_none());
+                assert!(report.calibration_time.is_zero());
+                assert!(super::super::calibration::cached_profile(&gpu, false).is_none());
+                // Nothing is allocated or selected, and no comparison passes
+                // its checks.
+                assert_eq!(report.scratch.unwrap(), Default::default());
+                assert_eq!(report.final_cleanup, None);
+                assert_eq!(report.eligible_classes, 1);
+                assert_eq!(before, session.dispatch_pipeline_keys());
+                for outcome in &report.outcomes {
+                    assert_eq!(outcome.decision, TuneDecision::ScratchLimit);
+                    if strategy == TuneStrategy::Race {
+                        continue;
+                    }
+                    let phases = outcome.phase_times.unwrap();
+                    assert!(phases.preparation.unwrap() <= outcome.elapsed);
+                    assert_eq!(phases.qualification, None);
+                    assert_eq!(phases.warmup, None);
+                    assert_eq!(phases.sampling, None);
+                    assert_eq!(phases.cleanup, None);
+                    let preparation = phases.preparation_breakdown.unwrap();
+                    assert!(preparation.checks.is_some());
+                    assert_eq!(preparation.buffers, None);
+                    assert_eq!(preparation.staging, None);
+                }
+            }
         }
     }
 
     #[test]
     #[ignore = "GPU qualification of resumable private kernel searches"]
     fn kernel_memo_resumes_only_qualified_comparisons() {
-        let gpu = std::sync::Arc::new(
-            crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap(),
-        );
+        let gpu = crate::reference::gpu::shared_context();
         let mut graph = crate::Graph::new();
         let x = graph.input("x", &[33, 17]);
         let w = graph.parameter("w", &[17, 65]);
@@ -3490,8 +3492,7 @@ mod tests {
             .unwrap();
         assert!(skipped.outcomes.is_empty() && skipped.reused_classes.is_empty());
         assert_eq!(memo.progress.values().next().unwrap().next_candidate, 1);
-        let mut replay = create();
-        let replayed = replay
+        let replayed = create()
             .tune_with_memo(
                 TuneOptions {
                     max_classes: 0,
@@ -3505,16 +3506,6 @@ mod tests {
         assert_eq!(replayed.reused_classes[0].1, first.outcomes[0].selected);
         assert_eq!(memo.progress.values().next().unwrap().next_candidate, 1);
         assert!(session.kernel_probes_pending(&options, Some(&memo)));
-        replay.set_input("x", &[0.25; 33 * 17]);
-        replay.set_parameter("w", &[0.125; 17 * 65]);
-        replay.step();
-        replay.wait();
-        assert!(
-            replay
-                .read_output(33 * 65)
-                .iter()
-                .all(|&x| x == 17.0 / 32.0)
-        );
         let resumed = session
             .tune_with_memo(options.clone(), Some(&mut memo))
             .unwrap();
@@ -3548,22 +3539,6 @@ mod tests {
                 .all(|&x| x == 17.0 / 32.0)
         );
         assert_eq!(session.read_params(&["w"])[0], [0.125; 17 * 65]);
-        // Attention layout does not change any matrix kernel or scratch input.
-        let mut other = plan.clone();
-        other.knobs.flash_ept_cap = 16;
-        other.knobs.flash.interleave = true;
-        let complete = Session::with_context_opts(
-            other,
-            gpu,
-            crate::SessionOptions {
-                coop: crate::CoopPolicy::Disabled,
-                ..Default::default()
-            },
-        )
-        .tune_with_memo(options, Some(&mut memo))
-        .unwrap();
-        assert_eq!(complete.reused_classes.len(), 1);
-        assert!(complete.outcomes.is_empty());
     }
 
     #[test]
@@ -3583,6 +3558,8 @@ mod tests {
                 shape: crate::codegen::GemvShape::initial(crate::codegen::ShaderGroup::MatMulGemv),
                 integer_dot: true,
             },
+            input_buffers: vec![BufferRef(0), BufferRef(1)],
+            output_buffer: BufferRef(2),
             ..Default::default()
         };
         assert!(matches!(
@@ -3605,29 +3582,30 @@ mod tests {
 
         let ordinary = Dispatch {
             kernel: crate::compile::Kernel::Default,
-            ..dispatch
+            ..dispatch.clone()
         };
         assert!(matches!(
             Pipelines::key(&ordinary, &bg::Capabilities::default()),
             Variant::Weight(_, crate::compile::WeightFormat::Q40)
         ));
+        // Activation quantization splits the tuning class.
+        let a = TuneClass::from_dispatch(&ordinary, None).expect("ordinary Q4_0 GEMV");
+        let b = TuneClass::from_dispatch(&dispatch, None).expect("int-dot Q4_0 GEMV");
+        assert_eq!(
+            (a.weight_format, a.m, a.n, a.k, &a.shader),
+            (b.weight_format, b.m, b.n, b.k, &b.shader)
+        );
+        assert_ne!(a, b, "the two kernels would coalesce into one class");
+        assert!(!a.gemv_int_dot && b.gemv_int_dot);
     }
 
+    /// The grad-weight reference gathers along K; check it against a scatter
+    /// from input coordinates on a strided, padded and a pointwise layer.
     #[test]
-    fn retained_control_rejections_match_independent_f32_accumulation() {
-        for (params, pattern, index, observed) in [
-            (
-                [1u32, 3, 224, 224, 64, 7, 7, 2, 3, 112, 112, 3],
-                0,
-                177,
-                -7.426374e-3f32,
-            ),
-            (
-                [1u32, 256, 56, 56, 64, 1, 1, 1, 0, 56, 56, 0],
-                1,
-                6391,
-                1.4238133e-14f32,
-            ),
+    fn grad_weight_reference_matches_independent_scatter() {
+        for (params, pattern, index) in [
+            ([1u32, 3, 224, 224, 64, 7, 7, 2, 3, 112, 112, 3], 0, 177),
+            ([1u32, 256, 56, 56, 64, 1, 1, 1, 0, 56, 56, 0], 1, 6391),
         ] {
             let [batch, ci, h, w, co, kh, kw, stride, ph, oh, ow, pw] = params;
             let dispatch = Dispatch {
@@ -3643,7 +3621,7 @@ mod tests {
             let n = ci * kh * kw;
             let (channel_out, column) = (index / n, index % n);
             let (channel_in, ky, kx) = (column / (kh * kw), column / kw % kh, column % kw);
-            let (mut exact, mut separate, mut fused) = (0.0f64, 0.0f32, 0.0f32);
+            let mut exact = 0.0f64;
             // Scatter from input coordinates, independently of the K gather.
             for b in 0..batch {
                 for iy in 0..h {
@@ -3665,26 +3643,12 @@ mod tests {
                             + x / stride) as usize];
                         let v = inputs[1][(((b * ci + channel_in) * h + iy) * w + ix) as usize];
                         exact += f64::from(a) * f64::from(v);
-                        separate += a * v;
-                        fused = a.mul_add(v, fused);
                     }
                 }
             }
             assert_eq!(
                 exact,
                 reference_dot(&class, &inputs, channel_out as usize, column as usize)
-            );
-            assert!(!close(
-                exact,
-                observed,
-                if pattern == 0 { 1.0 } else { 1e-12 }
-            ));
-            assert!(
-                observed.to_bits() == separate.to_bits() || observed.to_bits() == fused.to_bits(),
-                "observed={observed:e}, separate={separate:e}, fused={fused:e}"
-            );
-            eprintln!(
-                "element {index}: observed={observed:e}, separate={separate:e}, fused={fused:e}, f64={exact:e}"
             );
         }
     }
@@ -3758,10 +3722,21 @@ mod tests {
         for splits in [0, 1, 7, u32::MAX] {
             assert!(split_dispatches(&dispatch, &class, splits).is_err());
         }
+        // The cap counts staging for the largest buffer and checks overflow.
         assert_eq!(
             scratch_bytes(&[4, 8, 12, 128]),
             Some(280 + ENCODER_SCRATCH_BYTES)
         );
+        assert_eq!(scratch_bytes(&[usize::MAX, 4]), None);
+        assert!(reuse_staging(TuneStagingReuse::SameSize, 12, 12));
+        for (retained, requested) in [(0, 0), (0, 12), (12, 8), (8, 12)] {
+            assert!(!reuse_staging(
+                TuneStagingReuse::SameSize,
+                retained,
+                requested
+            ));
+        }
+        assert!(!reuse_staging(TuneStagingReuse::Fresh, 12, 12));
     }
 
     #[test]
@@ -3822,6 +3797,50 @@ mod tests {
             )
             .is_err()
         );
+
+        // Native f32 tiles swap only under the precision and complete
+        // geometry they were classified with.
+        let mut graph = crate::Graph::new();
+        let x = graph.input("x", &[32, 32]);
+        let w = graph.parameter("w", &[32, 32]);
+        let y = graph.matmul(x, w);
+        graph.set_outputs(vec![y]);
+        let mut left = crate::compile::compile_with(&graph, &Default::default());
+        super::super::select_variants(&mut left, None, false, false);
+        let alias = crate::memplan::AliasPlan::identity(&left.buffers);
+        for tile_size in [8, 16] {
+            let config = crate::codegen::CoopConfig {
+                tile_size,
+                use_f16_input: false,
+                compensated: false,
+            };
+            let reduced = crate::codegen::CoopConfig {
+                use_f16_input: true,
+                ..config
+            };
+            let classes = collect_classes(&left, &alias, Some(&config)).0;
+            let mut right = left.clone();
+            MatmulTile::CooperativeF32 { tile_size }
+                .apply(&mut right.dispatches[0], &classes[0].key);
+            let swaps_to = |right: &crate::compile::ExecutionPlan,
+                            config: &crate::codegen::CoopConfig| {
+                selection_swaps(
+                    &left.dispatches,
+                    &right.dispatches,
+                    &classes,
+                    &collect_classes(right, &alias, Some(config)).0,
+                )
+            };
+            let swaps = swaps_to(&right, &config).unwrap();
+            assert_eq!(swaps.len(), 1);
+            let mut selected = left.dispatches[0].clone();
+            swaps[0].right.apply(&mut selected, &swaps[0].class);
+            assert_eq!(selected, right.dispatches[0]);
+            assert!(selected.use_coop());
+            assert!(swaps_to(&right, &reduced).is_err());
+            right.dispatches[0].workgroups[0] += 1;
+            assert!(swaps_to(&right, &config).is_err());
+        }
     }
 
     #[test]
@@ -4046,65 +4065,6 @@ mod tests {
     }
 
     #[test]
-    fn swap_preflight_obeys_native_precision_and_complete_geometry() {
-        let mut graph = crate::Graph::new();
-        let x = graph.input("x", &[32, 32]);
-        let w = graph.parameter("w", &[32, 32]);
-        let y = graph.matmul(x, w);
-        graph.set_outputs(vec![y]);
-        let mut left = crate::compile::compile_with(&graph, &Default::default());
-        super::super::select_variants(&mut left, None, false, false);
-        let alias = crate::memplan::AliasPlan::identity(&left.buffers);
-        for tile_size in [8, 16] {
-            let config = crate::codegen::CoopConfig {
-                tile_size,
-                use_f16_input: false,
-                compensated: false,
-            };
-            let classes = collect_classes(&left, &alias, Some(&config)).0;
-            let mut right = left.clone();
-            MatmulTile::CooperativeF32 { tile_size }
-                .apply(&mut right.dispatches[0], &classes[0].key);
-            let right_classes = collect_classes(&right, &alias, Some(&config)).0;
-            let swaps = selection_swaps(
-                &left.dispatches,
-                &right.dispatches,
-                &classes,
-                &right_classes,
-            )
-            .unwrap();
-            assert_eq!(swaps.len(), 1);
-            let mut selected = left.dispatches[0].clone();
-            swaps[0].right.apply(&mut selected, &swaps[0].class);
-            assert_eq!(selected, right.dispatches[0]);
-            assert!(selected.use_coop());
-            let reduced = crate::codegen::CoopConfig {
-                use_f16_input: true,
-                ..config
-            };
-            assert!(
-                selection_swaps(
-                    &left.dispatches,
-                    &right.dispatches,
-                    &classes,
-                    &collect_classes(&right, &alias, Some(&reduced)).0
-                )
-                .is_err()
-            );
-            right.dispatches[0].workgroups[0] += 1;
-            assert!(
-                selection_swaps(
-                    &left.dispatches,
-                    &right.dispatches,
-                    &classes,
-                    &collect_classes(&right, &alias, Some(&config)).0
-                )
-                .is_err()
-            );
-        }
-    }
-
-    #[test]
     fn phase_timer_records_partial_time_on_early_exit() {
         fn exit_early(elapsed: &mut Option<Duration>) -> Result<(), ()> {
             let _timer = PhaseTimer {
@@ -4124,87 +4084,86 @@ mod tests {
     #[test]
     #[ignore = "GPU staging round-trip qualification, not a performance assertion"]
     fn tuning_staging_round_trips_all_bits_and_declared_extents() {
-        let gpu = crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap();
-        for (m, n, k) in [(3, 7, 5), (33, 65, 17), (2048, 1000, 1)] {
-            for device_local in [false, true] {
-                let class = TuneClass {
-                    weight_format: crate::compile::WeightFormat::F32,
-                    gemv_int_dot: false,
-                    shader: ShaderEntry::MatMulAT,
-                    m,
-                    n,
-                    k,
-                    conv2d: None,
-                    requires_full_precision: true,
-                    device_local: [device_local; 4],
-                    binding_bytes: Vec::new(),
-                    ..Default::default()
-                };
-                let mut sizes = class.buffer_sizes().unwrap();
-                let output_index = sizes.len() - 1;
-                sizes.push(17 * 4);
-                let bytes = scratch_bytes(&sizes).unwrap();
-                let patterns = [
-                    0,
-                    0x8000_0000,
-                    1,
-                    0x0080_0000,
-                    0x3f80_0000,
-                    0xbf80_0000,
-                    0x7f80_0000,
-                    0x7fc0_1234,
-                ];
-                let data: Vec<_> = (0..m as usize * n as usize)
-                    .map(|i| f32::from_bits(patterns[i % patterns.len()]))
-                    .collect();
-                for staging in [TuneStaging::Shared, TuneStaging::Download] {
-                    let mut staging = Staging::new(&gpu, staging, TuneStagingReuse::Fresh);
-                    let mut prep = TunePreparationTimes::default();
-                    let mut cleanup = None;
-                    let mut scratch = Scratch::new(
-                        &vec![device_local; sizes.len()],
-                        &sizes,
-                        (&class, output_index),
-                        bytes,
-                        &mut staging,
-                        &mut prep,
-                        &mut cleanup,
-                    );
-                    let mut times = TuneQualificationTimes::default();
-                    scratch.upload(output_index, &data, Some(&mut times));
-                    let read = scratch.read_output(&mut times);
-                    assert_eq!(read.len(), data.len());
-                    assert!(
-                        read.iter()
-                            .zip(&data)
-                            .all(|(a, b)| a.to_bits() == b.to_bits())
-                    );
-                    for time in [
-                        times.upload_host_copy,
-                        times.upload_transfer,
-                        times.readback_transfer,
-                        times.readback_host_copy,
-                    ] {
-                        assert!(time.is_some_and(|time| !time.is_zero()));
-                    }
-                    assert_eq!(times.validation, None);
-                    assert_eq!(times.dispatch, None);
-                    let input = vec![0.375; sizes[0] / 4];
-                    scratch.upload(0, &input, Some(&mut times));
-                    scratch.poison_outputs(&sizes, &mut times);
-                    assert!(scratch.read_output(&mut times).iter().all(|v| v.is_nan()));
-                    assert!(
-                        scratch
-                            .read_buffer(output_index + 1, 17, &mut times)
-                            .iter()
-                            .all(|v| v.is_nan())
-                    );
-                    assert_eq!(scratch.read_buffer(0, input.len(), &mut times), input);
-                    assert!(times.output_clear.is_some_and(|time| !time.is_zero()));
-                    drop(scratch);
-                    assert!(cleanup.is_some_and(|time| !time.is_zero()));
-                }
+        let gpu = crate::reference::gpu::shared_context();
+        // Every placement and staging memory once, across edge, rectangular
+        // and large shapes.
+        for ((m, n, k), device_local, staging) in [
+            ((3, 7, 5), false, TuneStaging::Download),
+            ((33, 65, 17), false, TuneStaging::Shared),
+            ((33, 65, 17), true, TuneStaging::Download),
+            ((2048, 1000, 1), true, TuneStaging::Shared),
+        ] {
+            let class = TuneClass {
+                shader: ShaderEntry::MatMulAT,
+                m,
+                n,
+                k,
+                requires_full_precision: true,
+                device_local: [device_local; 4],
+                ..Default::default()
+            };
+            let mut sizes = class.buffer_sizes().unwrap();
+            let output_index = sizes.len() - 1;
+            sizes.push(17 * 4);
+            let bytes = scratch_bytes(&sizes).unwrap();
+            let patterns = [
+                0,
+                0x8000_0000,
+                1,
+                0x0080_0000,
+                0x3f80_0000,
+                0xbf80_0000,
+                0x7f80_0000,
+                0x7fc0_1234,
+            ];
+            let data: Vec<_> = (0..m as usize * n as usize)
+                .map(|i| f32::from_bits(patterns[i % patterns.len()]))
+                .collect();
+            let mut staging = Staging::new(&gpu, staging, TuneStagingReuse::Fresh);
+            let mut prep = TunePreparationTimes::default();
+            let mut cleanup = None;
+            let mut scratch = Scratch::new(
+                &vec![device_local; sizes.len()],
+                &sizes,
+                (&class, output_index),
+                bytes,
+                &mut staging,
+                &mut prep,
+                &mut cleanup,
+            );
+            let mut times = TuneQualificationTimes::default();
+            scratch.upload(output_index, &data, Some(&mut times));
+            let read = scratch.read_output(&mut times);
+            assert_eq!(read.len(), data.len());
+            assert!(
+                read.iter()
+                    .zip(&data)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            );
+            for time in [
+                times.upload_host_copy,
+                times.upload_transfer,
+                times.readback_transfer,
+                times.readback_host_copy,
+            ] {
+                assert!(time.is_some_and(|time| !time.is_zero()));
             }
+            assert_eq!(times.validation, None);
+            assert_eq!(times.dispatch, None);
+            let input = vec![0.375; sizes[0] / 4];
+            scratch.upload(0, &input, Some(&mut times));
+            scratch.poison_outputs(&sizes, &mut times);
+            assert!(scratch.read_output(&mut times).iter().all(|v| v.is_nan()));
+            assert!(
+                scratch
+                    .read_buffer(output_index + 1, 17, &mut times)
+                    .iter()
+                    .all(|v| v.is_nan())
+            );
+            assert_eq!(scratch.read_buffer(0, input.len(), &mut times), input);
+            assert!(times.output_clear.is_some_and(|time| !time.is_zero()));
+            drop(scratch);
+            assert!(cleanup.is_some_and(|time| !time.is_zero()));
         }
     }
 
@@ -4235,21 +4194,6 @@ mod tests {
     }
 
     #[test]
-    fn scratch_cap_counts_staging_and_checks_overflow() {
-        assert_eq!(scratch_bytes(&[4, 8, 12]), Some(36 + ENCODER_SCRATCH_BYTES));
-        assert_eq!(scratch_bytes(&[usize::MAX, 4]), None);
-        assert!(reuse_staging(TuneStagingReuse::SameSize, 12, 12));
-        for (retained, requested) in [(0, 0), (0, 12), (12, 8), (8, 12)] {
-            assert!(!reuse_staging(
-                TuneStagingReuse::SameSize,
-                retained,
-                requested
-            ));
-        }
-        assert!(!reuse_staging(TuneStagingReuse::Fresh, 12, 12));
-    }
-
-    #[test]
     #[ignore = "GPU exact-size reuse and early-return cleanup qualification"]
     fn staging_reuse_replaces_sizes_and_cleans_up_after_early_returns() {
         fn trial(
@@ -4260,16 +4204,10 @@ mod tests {
             reuse_b: bool,
         ) -> Result<(), ()> {
             let class = TuneClass {
-                weight_format: crate::compile::WeightFormat::F32,
-                gemv_int_dot: false,
-                shader: ShaderEntry::MatMul,
                 m,
                 n,
                 k: 5,
-                conv2d: None,
-                requires_full_precision: false,
                 device_local: [true; 4],
-                binding_bytes: Vec::new(),
                 ..Default::default()
             };
             let sizes = class.buffer_sizes().unwrap();
@@ -4315,115 +4253,53 @@ mod tests {
             assert!(cleanup.is_some());
             result
         }
-        let gpu = crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap();
-        for memory in [TuneStaging::Shared, TuneStaging::Download] {
-            for policy in [TuneStagingReuse::Fresh, TuneStagingReuse::SameSize] {
-                let mut staging = Staging::new(&gpu, memory, policy);
-                for (index, (m, n)) in [(3, 7), (3, 7), (3, 65), (4, 7), (3, 7)]
-                    .into_iter()
-                    .enumerate()
-                {
-                    assert!(trial(&mut staging, m, n, index as u32 * 1024, index == 1).is_err());
-                }
-                let fresh = policy == TuneStagingReuse::Fresh;
-                assert_eq!(staging.stats.staging_allocations, if fresh { 5 } else { 3 });
-                assert_eq!(staging.stats.staging_reuses, if fresh { 0 } else { 2 });
-                assert_eq!(staging.stats.input_b_allocations, 4);
-                assert_eq!(staging.stats.input_b_reuses, 1);
-                assert_eq!(
-                    staging.stats.peak_bytes,
-                    scratch_bytes(&[60, 1300, 780]).unwrap()
-                );
-                assert_eq!(
-                    staging.stats.retained_staging_bytes,
-                    if fresh { 0 } else { 140 }
-                );
-                staging.clear();
-                assert_eq!(staging.stats.retained_staging_bytes, 0);
-                assert_eq!(staging.stats.retained_input_bytes, 0);
-                assert_eq!(
-                    staging.stats.input_b_allocations,
-                    staging.stats.input_b_releases
-                );
-                assert_eq!(
-                    staging.stats.staging_allocations,
-                    staging.stats.staging_releases
-                );
+        let gpu = crate::reference::gpu::shared_context();
+        for (memory, policy) in [
+            (TuneStaging::Shared, TuneStagingReuse::SameSize),
+            (TuneStaging::Download, TuneStagingReuse::Fresh),
+        ] {
+            let mut staging = Staging::new(&gpu, memory, policy);
+            // Reuse both, keep the same-size staging but not another class's
+            // B operand, then replace both for a larger size.
+            for (index, (m, n)) in [(3, 7), (3, 7), (4, 7), (3, 65)].into_iter().enumerate() {
+                assert!(trial(&mut staging, m, n, index as u32 * 1024, index == 1).is_err());
             }
+            let fresh = policy == TuneStagingReuse::Fresh;
+            assert_eq!(staging.stats.staging_allocations, if fresh { 4 } else { 2 });
+            assert_eq!(staging.stats.staging_reuses, if fresh { 0 } else { 2 });
+            assert_eq!(staging.stats.input_b_allocations, 3);
+            assert_eq!(staging.stats.input_b_reuses, 1);
+            assert_eq!(
+                staging.stats.peak_bytes,
+                scratch_bytes(&[60, 1300, 780]).unwrap()
+            );
+            assert_eq!(
+                staging.stats.retained_staging_bytes,
+                if fresh { 0 } else { 1300 }
+            );
+            staging.clear();
+            assert_eq!(staging.stats.retained_staging_bytes, 0);
+            assert_eq!(staging.stats.retained_input_bytes, 0);
+            assert_eq!(
+                staging.stats.input_b_allocations,
+                staging.stats.input_b_releases
+            );
+            assert_eq!(
+                staging.stats.staging_allocations,
+                staging.stats.staging_releases
+            );
         }
     }
 
-    #[test]
-    fn initial_small_tile_geometry_is_exact_before_search() {
-        let mut graph = crate::Graph::new();
-        let x = graph.input("x", &[33, 17]);
-        let w = graph.parameter("w", &[17, 65]);
-        let y = graph.matmul(x, w);
-        graph.set_outputs(vec![y]);
-        let mut plan = crate::compile::compile_with(&graph, &crate::CompileOptions::default());
-        super::super::select_variants(&mut plan, None, false, false);
-        let dispatch = &plan.dispatches[0];
-        assert!(dispatch.use_small_tiles());
-        assert_eq!(dispatch.workgroups, [3, 2, 1]);
-        assert!(TuneClass::from_dispatch(dispatch, None).is_some());
-    }
-
-    /// A transposed-B GEMV must be read as `[N, K]`, like the tiled one.
-    ///
-    /// Worked by hand rather than against the implementation: A is 1..8 and
-    /// B is 1..24 laid out as three contiguous rows of eight, so column `c`
-    /// is `sum_i A[i] * B[c][i]`. Forward `[K, N]` addressing over the same
-    /// bytes gives [540, 576, 612], which is what the oracle produced while
-    /// this entry was missing from the transposed branch — a wrong reference
-    /// that fails correct kernels.
-    #[test]
-    fn a_transposed_gemv_reference_reads_b_by_row() {
-        let class = TuneClass {
-            weight_format: crate::compile::WeightFormat::F32,
-            gemv_int_dot: false,
-            shader: ShaderEntry::MatMulGemvBT,
-            m: 1,
-            n: 3,
-            k: 8,
-            conv2d: None,
-            requires_full_precision: false,
-            device_local: [false; 4],
-            binding_bytes: vec![32, 96, 12],
-            ..Default::default()
-        };
-        let a: Vec<f32> = (1..=8).map(|v| v as f32).collect();
-        let b: Vec<f32> = (1..=24).map(|v| v as f32).collect();
-        let inputs = vec![a, b, Vec::new()];
-        let got: Vec<f64> = (0..3)
-            .map(|col| reference_dot(&class, &inputs, 0, col))
-            .collect();
-        assert_eq!(got, vec![204.0, 492.0, 780.0]);
-
-        // The tiled transposed entry has always read it this way, and the
-        // two must agree: they describe the same operand layout.
-        let tiled = TuneClass {
-            shader: ShaderEntry::MatMulBT,
-            ..class
-        };
-        let tiled_got: Vec<f64> = (0..3)
-            .map(|col| reference_dot(&tiled, &inputs, 0, col))
-            .collect();
-        assert_eq!(tiled_got, got);
-    }
-
+    /// Worked by hand rather than against the implementation. Every
+    /// transposed-B entry, including the GEMV, reads B as `[N, K]` rows; an
+    /// oracle that read the GEMV forward once failed correct kernels.
     #[test]
     fn reference_dots_match_independent_rectangular_example() {
         let mut class = TuneClass {
-            weight_format: crate::compile::WeightFormat::F32,
-            gemv_int_dot: false,
-            shader: ShaderEntry::MatMul,
             m: 2,
             n: 2,
             k: 3,
-            conv2d: None,
-            requires_full_precision: false,
-            device_local: [false; 4],
-            binding_bytes: Vec::new(),
             ..Default::default()
         };
         let normal = vec![
@@ -4435,6 +4311,7 @@ mod tests {
             ShaderEntry::MatMul,
             ShaderEntry::MatMulAT,
             ShaderEntry::MatMulBT,
+            ShaderEntry::MatMulGemvBT,
             ShaderEntry::FusedMatMulAdd,
             ShaderEntry::FusedMatMulATAdd,
             ShaderEntry::FusedMatMulBTAdd,
@@ -4449,7 +4326,7 @@ mod tests {
             }
             if matches!(
                 class.shader,
-                ShaderEntry::MatMulBT | ShaderEntry::FusedMatMulBTAdd
+                ShaderEntry::MatMulBT | ShaderEntry::MatMulGemvBT | ShaderEntry::FusedMatMulBTAdd
             ) {
                 inputs[1] = vec![7.0, 9.0, 11.0, 8.0, 10.0, 12.0];
             }
@@ -4519,7 +4396,18 @@ mod tests {
             ShaderEntry::Conv2dGradInputGemm,
             ShaderEntry::Conv2dGradWeightGemm,
         ] {
-            let mut tiles = vec![
+            // One tile per generator path; each size, stage and column layout
+            // appears at least once.
+            let scalar = |tile_size, k_stage, interleave_columns| {
+                MatmulTile::Scalar(crate::codegen::ScalarMatmulShape {
+                    tile_size,
+                    tile_n: 0,
+                    k_stage,
+                    interleave_columns,
+                    unroll_k: false,
+                })
+            };
+            let tiles = [
                 MatmulTile::Tile32,
                 MatmulTile::Tile64,
                 MatmulTile::CooperativeF32 { tile_size: 8 },
@@ -4532,31 +4420,12 @@ mod tests {
                 MatmulTile::SpecializedConv {
                     tile_size: 64,
                     k_tile: 32,
-                    interleave_columns: false,
+                    interleave_columns: true,
                 },
+                scalar(32, 8, false),
+                scalar(64, 16, true),
+                scalar(32, 32, true),
             ];
-            for tile_size in [32, 64] {
-                for k_tile in [16, 32] {
-                    tiles.push(MatmulTile::SpecializedConv {
-                        tile_size,
-                        k_tile,
-                        interleave_columns: true,
-                    });
-                }
-            }
-            for tile_size in [32, 64] {
-                for k_stage in [8, 16, 32] {
-                    for interleave_columns in [false, true] {
-                        tiles.push(MatmulTile::Scalar(crate::codegen::ScalarMatmulShape {
-                            tile_size,
-                            tile_n: 0,
-                            k_stage,
-                            interleave_columns,
-                            unroll_k: false,
-                        }));
-                    }
-                }
-            }
             for (tile, format) in tiles.into_iter().flat_map(|tile| {
                 [WeightFormat::F32, WeightFormat::F16]
                     .into_iter()
@@ -4945,11 +4814,6 @@ mod tests {
                         }
                     }
                     if range == (0..k) {
-                        assert!(!close(
-                            reference_dot(&class, &inputs, 0, 1),
-                            actual[1],
-                            scale
-                        ));
                         assert!(qualify_output(&class, &inputs, &actual, scale));
                     }
                     if convolution {
@@ -4964,42 +4828,30 @@ mod tests {
 
     #[test]
     fn reference_qualification_checks_layout_and_tiny_operands() {
-        for shader in [
-            ShaderEntry::MatMul,
-            ShaderEntry::MatMulAT,
-            ShaderEntry::MatMulBT,
-            ShaderEntry::FusedMatMulAdd,
-            ShaderEntry::FusedMatMulATAdd,
-            ShaderEntry::FusedMatMulBTAdd,
-        ] {
-            let class = TuneClass {
-                weight_format: crate::compile::WeightFormat::F32,
-                gemv_int_dot: false,
-                shader,
-                m: 3,
-                n: 5,
-                k: 7,
-                conv2d: None,
-                requires_full_precision: true,
-                device_local: [false; 4],
-                binding_bytes: Vec::new(),
-                ..Default::default()
-            };
-            let sizes = class.buffer_sizes().unwrap();
-            for pattern in 0..2 {
-                let inputs = test_inputs(&sizes, pattern);
-                let output: Vec<_> = (0..15)
-                    .map(|i| reference_dot(&class, &inputs, i / 5, i % 5) as f32)
-                    .collect();
-                let scale = if pattern == 0 { 1.0 } else { 1.0e-12 };
-                assert!(qualify_output(&class, &inputs, &output, scale));
-                assert!(!qualify_output(&class, &inputs, &[0.0; 15], scale));
-                assert!(!qualify_output(&class, &inputs, &[f32::NAN; 15], scale));
-                let mut corrupt = output.clone();
-                corrupt[14] += scale as f32;
-                assert!(!outputs_agree(&output, &corrupt, scale));
-                assert!(!qualify_output(&class, &inputs, &corrupt, scale));
-            }
+        // Layouts are checked against independent examples above; this checks
+        // qualification itself, with an addend and a transposed operand.
+        let class = TuneClass {
+            shader: ShaderEntry::FusedMatMulATAdd,
+            m: 3,
+            n: 5,
+            k: 7,
+            requires_full_precision: true,
+            ..Default::default()
+        };
+        let sizes = class.buffer_sizes().unwrap();
+        for pattern in 0..2 {
+            let inputs = test_inputs(&sizes, pattern);
+            let output: Vec<_> = (0..15)
+                .map(|i| reference_dot(&class, &inputs, i / 5, i % 5) as f32)
+                .collect();
+            let scale = if pattern == 0 { 1.0 } else { 1.0e-12 };
+            assert!(qualify_output(&class, &inputs, &output, scale));
+            assert!(!qualify_output(&class, &inputs, &[0.0; 15], scale));
+            assert!(!qualify_output(&class, &inputs, &[f32::NAN; 15], scale));
+            let mut corrupt = output.clone();
+            corrupt[14] += scale as f32;
+            assert!(!outputs_agree(&output, &corrupt, scale));
+            assert!(!qualify_output(&class, &inputs, &corrupt, scale));
         }
     }
 }

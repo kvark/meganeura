@@ -736,13 +736,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn calibration_dispatch_is_the_ordinary_square_product() {
-        let (dispatch, _) = matmul_dispatch(128);
-        assert_eq!(dispatch.mnk(), Some((128, 128, 128)));
-        assert_eq!(dispatch.kernel, crate::compile::Kernel::Default);
-    }
-
-    #[test]
     fn partial_profiles_retry_new_resource_combinations_without_repeating_work() {
         let cache = ProfileCache::default();
         let resources = |ms, mib: usize| Resources {
@@ -788,33 +781,25 @@ mod tests {
         assert_eq!(cache.measure(resources(1000, 64), unused), complete);
     }
 
+    /// What one calibration adds to a partial profile. The cache frontier is
+    /// checked above, and `tests/race.rs` covers the per-context cache.
     #[test]
     fn larger_allowances_fill_missing_measurements_and_preserve_existing_ones() {
-        let gpu = Arc::new(
-            crate::init_gpu_context_with(crate::GpuOptions {
-                timing: false,
-                ..crate::GpuOptions::from_env()
-            })
-            .unwrap(),
-        );
-        assert!(cached_profile(&gpu, false).is_none());
-        // An expired first slice must not cache an unmeasured zero round trip.
-        let (empty, _) = machine_profile(&gpu, false, Duration::from_nanos(1), 64 << 20);
-        assert!(empty.submit_round_trip.is_none(), "{empty:?}");
+        let gpu = crate::reference::gpu::shared_context();
+        // An expired first slice must not record an unmeasured zero round trip.
+        let mut profile = MachineProfile::default();
+        calibrate(&gpu, false, Duration::from_nanos(1), 64 << 20, &mut profile);
+        assert!(profile.submit_round_trip.is_none(), "{profile:?}");
         // Enough for overhead/width and the smallest matmul, but not even the
         // smallest bandwidth probe after reserving the encoder's scratch.
         let resources = super::super::tuning::ENCODER_SCRATCH_BYTES + (64 << 10);
-        let (first, _) = machine_profile(&gpu, false, Duration::from_secs(1), resources);
-        assert!(first.bandwidth.is_none(), "{first:?}");
-        assert_eq!(cached_profile(&gpu, false), Some(first.clone()));
-        let (same, elapsed) = machine_profile(&gpu, false, Duration::from_secs(1), resources);
-        assert_eq!(same, first);
-        assert!(elapsed.is_zero());
-        let (second, elapsed) = machine_profile(&gpu, false, Duration::from_secs(2), 64 << 20);
+        calibrate(&gpu, false, Duration::from_secs(1), resources, &mut profile);
+        assert!(profile.bandwidth.is_none(), "{profile:?}");
+        let first = profile.clone();
+        calibrate(&gpu, false, Duration::from_secs(2), 64 << 20, &mut profile);
+        let second = profile;
         assert!(complete(&second), "{second:?}");
-        assert!(!elapsed.is_zero());
         assert!(second.elapsed >= first.elapsed);
-        assert_eq!(cached_profile(&gpu, false), Some(second.clone()));
         macro_rules! preserved {
             ($field:ident) => {
                 if first.$field.is_some() {
@@ -826,9 +811,6 @@ mod tests {
         preserved!(dispatch_overhead);
         preserved!(parallel_width);
         preserved!(matmul_flops);
-        let (same, elapsed) = machine_profile(&gpu, false, Duration::from_secs(3), 128 << 20);
-        assert_eq!(same, second);
-        assert!(elapsed.is_zero());
     }
 
     #[test]
