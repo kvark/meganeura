@@ -21,7 +21,7 @@ HERE = Path(__file__).resolve().parent
 INPUT = HERE / "data"
 OUTPUT = HERE / "figures"
 INK, TEAL, ORANGE, CANVAS, MUTED = "#23343b", "#006b70", "#a44616", "#faf9f6", "#637679"
-DEVICES = {"nvidia-5070": "RTX 5070", "nvidia-h100": "H100", "nvidia-3050": "RTX 3050",
+DEVICES = {"nvidia-5070": "RTX 5070", "nvidia-h100": "H100",
            "amd-7900xt": "RX 7900 XT", "amd-mi300": "MI300X", "intel-b570": "Arc B570", "apple-m3": "Apple M3"}
 MODELS = ["SmolLM2-135M", "SmolVLA", "StableDiffusion", "ResNet-50", "Whisper-tiny"]
 SHORT = ["SmolLM2", "SmolVLA", "U-Net", "ResNet", "Whisper"]
@@ -35,7 +35,7 @@ plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 14, "text.color"
 ROWS = list(csv.DictReader((INPUT / "results.csv").open()))
 DATA = {(r["archive"], r["model"], r["precision"], r["phase"]): r for r in ROWS}
 assert len(DATA) == 372
-assert sum(bool(r["ratio"]) for r in ROWS) == 226
+assert sum(bool(r["ratio"]) for r in ROWS) == 201
 
 
 # Shared accounting with the paper; independent of the raw archive replay.
@@ -85,10 +85,10 @@ def ratio_panels(panels, name, note):
                 ax.add_patch(Rectangle((col + .04, row + .06), .92, .88, facecolor=fill, linewidth=0))
                 ax.text(col + .5, row + .5, "—" if value is None else f"{value:.2f}",
                         ha="center", va="center", fontsize=15, color=ink)
-        ax.set(xlim=(0, 5), ylim=(7, 0))
+        ax.set(xlim=(0, 5), ylim=(len(DEVICES), 0))
         ax.set_xticks([c + .5 for c in range(5)], [f"{kind}\n{short}" for kind, short in zip(KINDS, SHORT)], fontsize=12.5)
         ax.xaxis.tick_top()
-        ax.set_yticks([r + .5 for r in range(7)], list(DEVICES.values()) if panel == 0 else [""] * 7, fontsize=13.5)
+        ax.set_yticks([r + .5 for r in range(len(DEVICES))], list(DEVICES.values()) if panel == 0 else [""] * len(DEVICES), fontsize=13.5)
         ax.tick_params(length=0, pad=5)
         for spine in ax.spines.values():
             spine.set_visible(False)
@@ -218,7 +218,7 @@ def precision_gain():
         ax.set_xticks([0, 1, 2, 3], ["0", "1×", "2×", "3×"], fontsize=11)
         ax.set_title(title, loc="left", weight="bold", fontsize=14)
         ax.spines[["top", "right"]].set_visible(False)
-    axes[0].set_yticks(range(7), list(DEVICES.values()), fontsize=12)
+    axes[0].set_yticks(range(len(DEVICES)), list(DEVICES.values()), fontsize=12)
     axes[0].invert_yaxis()
     axes[0].tick_params(axis="y", length=0)
     fig.legend(handles=[Patch(color=ORANGE, label="PyTorch"), Patch(color=TEAL, label="Meganeura")],
@@ -250,17 +250,17 @@ def gap_accounting():
             ax.text(1.02, y, f"n={g['n']}", transform=ax.get_yaxis_transform(), va="center", fontsize=9, color=MUTED)
         ax.axvline(1, color=MUTED, linestyle="--", lw=1)
         ax.set_xscale("log", base=2)
-        ax.set(xlim=(.45, 8), ylim=(6.6, -.7))
+        ax.set(xlim=(.45, 8), ylim=(len(DEVICES) - .4, -.7))
         ax.set_xticks([.5, 1, 2, 4, 8], ["0.5×", "1×", "2×", "4×", "8×"], fontsize=11)
         ax.set_title(title, loc="left", fontsize=14, weight="bold")
         ax.spines[["top", "right"]].set_visible(False)
-    axes[0].set_yticks(range(7), list(DEVICES.values()), fontsize=12)
+    axes[0].set_yticks(range(len(DEVICES)), list(DEVICES.values()), fontsize=12)
     axes[0].tick_params(axis="y", length=0)
     fig.legend(handles=[Line2D([], [], marker="o", markerfacecolor=CANVAS, color=INK, linestyle="none", label="Strict f32"),
                         Line2D([], [], marker="s", color=INK, linestyle="none", label="Reduced precision")],
                loc="upper left", bbox_to_anchor=(.098, 1), frameon=False, ncol=2, fontsize=12)
     fig.text(.105, .09, "Meganeura / PyTorch time. Same qualified models in both profiles; geometric means, not the results-table medians.", fontsize=10.3)
-    fig.text(.105, .035, "32 inference and 30 training conditions. Rightward arrow: the gap widens. Apple M3 retains high process variability.", fontsize=10, color=MUTED)
+    fig.text(.105, .035, "27 inference and 25 training conditions. Rightward arrow: the gap widens. Apple M3 retains high process variability.", fontsize=10, color=MUTED)
     save(fig, "gap-accounting.svg")
 
 
@@ -328,14 +328,14 @@ def scaling():
 
 def preparation():
     rows = list(csv.DictReader((INPUT / "preparation-cache.csv").open()))
-    assert len(rows) == 7
+    assert len(rows) == len(DEVICES)
     fig, ax = plt.subplots(figsize=(11.56, 4.38))
     fig.subplots_adjust(left=.16, right=.93, top=.94, bottom=.19)
     for shift, index, color, name in [(-.18, "first_seconds", TEAL, "First-session memo miss (10 processes/GPU)"), (.18, "reused_seconds", ORANGE, "Reused decisions (20 processes/GPU)")]:
         values = [float(r[index]) for r in rows]
-        ax.barh([i+shift for i in range(7)], values, height=.32, color=color, label=name)
+        ax.barh([i+shift for i in range(len(DEVICES))], values, height=.32, color=color, label=name)
         for i, v in enumerate(values): ax.text(v+.5, i+shift, f"{v:.1f}", va="center", fontsize=10, color=color)
-    ax.set_yticks(range(7), [r["device"] for r in rows]);ax.invert_yaxis()
+    ax.set_yticks(range(len(DEVICES)), [r["device"] for r in rows]);ax.invert_yaxis()
     ax.set_xlim(0, 85);ax.set_xlabel("Median native preparation, seconds per workload process")
     ax.legend(loc="lower left", bbox_to_anchor=(0, -.30), ncol=2, frameon=False, fontsize=10)
     ax.spines[["top", "right"]].set_visible(False)
@@ -351,7 +351,8 @@ def preparation_models():
         for row in rows:
             if row["model"] == model and row["precision"] == "strict" and row["reference_complete"] == "True":
                 devices[row["archive"]].append(row)
-        assert len(devices) == (6 if model in ("ResNet-50", "Whisper-tiny") else 7)
+        devices = {d: group for d, group in devices.items() if len(group) == 3}
+        assert len(devices) == (5 if model in ("ResNet-50", "Whisper-tiny") else 6)
         assert all(len(group) == 3 for group in devices.values())
         values = [statistics.median(statistics.median(float(r[key]) for r in group)
                                    for group in devices.values())
@@ -365,7 +366,7 @@ def preparation_models():
     ax.spines[["top", "right"]].set_visible(False)
     fig.text(.20, .95, "Meganeura: all preparation, almost all of it search", color=TEAL, fontsize=13, weight="bold")
     fig.text(.20, .89, "PyTorch: compilation and first calls", color=ORANGE, fontsize=13, weight="bold")
-    fig.text(.20, .065, "Median across GPUs of three-process medians. ResNet and Whisper: 6 GPUs with complete PyTorch results.", fontsize=10)
+    fig.text(.20, .065, "Median across GPUs of three-process medians. ResNet and Whisper: 5 GPUs with complete PyTorch results.", fontsize=10)
     fig.text(.20, .018, "The columns cover different work under different limits.", fontsize=10)
     save(fig, "preparation-models.svg")
 
@@ -420,7 +421,7 @@ def timing_spread():
                 ps = ast.literal_eval(r[engine + "_process_medians_ms"])
                 if len(ps) == 3: values.append(100*(max(ps)-min(ps))/statistics.median(ps))
             ax.scatter([i+offset]*len(values), values, color=color, alpha=.65, s=18, label=engine if i == 0 else None)
-    ax.set_xticks(range(7), list(DEVICES.values()), rotation=10, ha="right", fontsize=11)
+    ax.set_xticks(range(len(DEVICES)), list(DEVICES.values()), rotation=10, ha="right", fontsize=11)
     ax.set_yscale("log");ax.set_ylim(.02, 250)
     ax.set_ylabel("Process spread, % (log scale)")
     ax.axhline(10, color="#637679", linestyle="--", linewidth=1)
@@ -449,13 +450,13 @@ def warmup():
 
 
 if __name__ == "__main__":
-    spread = "Training: forward, loss and backward. Apple M3 times vary by a median 34% between processes."
+    spread = "Training: forward, loss and backward. Apple M3 times vary by a median 16% between processes."
     for profile in ("strict", "accelerated"):
         ratio_panels([(profile, "inference", "Inference"), (profile, "training", "Training")],
                      f"{profile}-ratios.svg", spread)
     ratio_panels([("strict", "latency", "Strict f32"), ("accelerated", "latency", "Reduced precision")],
                  "minimal-shape-ratios.svg", "Minimal shape: one token, action or image, run after training. "
-                 "Apple M3 times vary by a median 34% between processes.")
+                 "Apple M3 times vary by a median 16% between processes.")
     egraph()
     search_loop()
     precision_gain()

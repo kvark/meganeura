@@ -20,11 +20,11 @@ import tempfile
 from types import SimpleNamespace
 
 HERE = Path(__file__).resolve().parent
-INFERENA = "add19182e5479e3f7549894c524ac6691d3dc363"
-MEGANEURA = "c19cb1caedd90be7abc61de61f6197018711398e"
-DEVICES = {"nvidia-5070": "RTX 5070", "nvidia-h100": "H100", "nvidia-3050": "RTX 3050",
+INFERENA = "a0799e4210eafa25161ec50d475b186c4b19d3da"
+MEGANEURA = "567028b805425375148e88a7e1d464fafdd99777"
+DEVICES = {"nvidia-5070": "RTX 5070", "nvidia-h100": "H100",
            "amd-7900xt": "RX 7900 XT", "amd-mi300": "MI300X", "intel-b570": "Arc B570", "apple-m3": "Apple M3"}
-QUALIFIERS = {"amd-780m": "Radeon 780M", "amd-9600x": "Ryzen 9600X iGPU",
+QUALIFIERS = {"nvidia-3050": "RTX 3050", "amd-780m": "Radeon 780M", "amd-9600x": "Ryzen 9600X iGPU",
               "intel-rplu": "Intel RPL-U", "qualcomm-adreno": "Quest 3S / Adreno 740"}
 MODELS = ("SmolLM2-135M", "SmolVLA", "StableDiffusion", "ResNet-50", "Whisper-tiny")
 PHASES = ("inference", "latency", "training")
@@ -138,7 +138,7 @@ def audit(directories):
                     selected_reused_workgroup_classes=sum("CooperativeWorkgroup" in choice for _, choice in reused),
                     unsupported=search["unsupported_matrix_inputs"]))
     assert all(len(v) == 1 for v in hashes.values()), "input hashes differ"
-    assert set(campaigns) == {*DEVICES, *QUALIFIERS, *(d + "-large" for d in ("nvidia-5070", "nvidia-h100", "amd-7900xt", "amd-mi300")), "intel-b570-large-fail"}
+    assert set(campaigns) == {*DEVICES, *QUALIFIERS, *(d + "-large" for d in ("nvidia-5070", "nvidia-h100", "amd-7900xt", "amd-mi300")), "intel-b570-large"}
     for row in rows:
         row["archive"] = Path(row.pop("campaign")).parent.name
         ps = [p for p in processes if all(p[k] == row[k] for k in ("archive", "model", "precision", "phase"))]
@@ -192,7 +192,7 @@ def publication(rows, campaigns, setups, searches, processes):
     output["qualification.tex"] = table("lll", "GPU & Native cells & Reference", [
         [name, "30/30", "CPU f64" if d == "qualcomm-adreno" else "CPU f32"] for d, name in QUALIFIERS.items()])
     lines = []
-    for d in ("nvidia-5070", "amd-7900xt", "nvidia-h100", "amd-mi300"):
+    for d in ("nvidia-5070", "amd-7900xt", "intel-b570", "nvidia-h100", "amd-mi300"):
         first = True
         for model in ("SmolLM2-135M", "SmolLM2-360M", "SmolLM2-1.7B"):
             source = d if model.endswith("135M") else d + "-large"
@@ -236,7 +236,7 @@ def publication(rows, campaigns, setups, searches, processes):
     fields = ["archive", "model", "precision", "replicate", "cache_state", "native_preparation_seconds",
               "native_search_seconds", "reference_compile_seconds", "reference_phase_preparation_seconds",
               "reference_complete"]
-    writer = csv.DictWriter(stream, fieldnames=fields)
+    writer = csv.DictWriter(stream, fieldnames=fields, lineterminator="\n")
     writer.writeheader()
     for s in setups:
         if s["archive"] not in DEVICES:
@@ -267,7 +267,8 @@ def publication(rows, campaigns, setups, searches, processes):
     summary["cells"] = dict(core_native=sum(r["native_status"] == "valid" for r in rows if r["model"] in MODELS),
                             measured_native=sum(r["native_ms"] is not None for r in rows), paired=sum(r["ratio"] is not None for r in rows))
     summary["cache_states"] = dict(Counter(s["cache_state"] for s in setups))
-    summary["search"] = dict(sessions=sum(s["archive"] in DEVICES for s in searches),
+    summary["search"] = dict(non_default=sum(not s["selected"].startswith("graph=0,") for s in searches if s["archive"] in DEVICES),
+        truncated=sum(s["truncated"] for s in searches if s["archive"] in DEVICES), sessions=sum(s["archive"] in DEVICES for s in searches),
         trials=sum(s["trials"] for s in searches if s["archive"] in DEVICES),
         numerical_rejections=sum(s["numerical_rejections"] for s in searches if s["archive"] in DEVICES),
         scratch_limits=sum(s["scratch_limits"] for s in searches if s["archive"] in DEVICES),
@@ -276,6 +277,9 @@ def publication(rows, campaigns, setups, searches, processes):
         sessions=len(ss := [s for s in searches if s["archive"] == d and s["precision"] == "accelerated"]),
         cooperative_sessions=sum(s["cooperative_dispatches"] > 0 for s in ss),
         bf16_sessions=sum(s["bf16_dispatches"] > 0 for s in ss),
+        max_matrix_dispatches=max(s["cooperative_dispatches"] for s in ss),
+        reduced_derivative_sessions=sum("gradient_inputs=" in s["selected"] for s in ss),
+        private_matrix_storage_sessions=sum("matrix_storage=" in s["selected"] for s in ss),
         selected_reused_workgroup_sessions=sum(s["selected_reused_workgroup_classes"] > 0 for s in ss)) for d in DEVICES}
     summary["elapsed_device_hours"] = sum(c["elapsed_seconds"] for c in campaigns.values()) / 3600
     summary["spread"] = {}
@@ -308,7 +312,7 @@ def main():
             path = args.archives / name
             with path.open("rb") as stream:
                 assert hashlib.file_digest(stream, "sha256").hexdigest() == digest, name
-            destination = Path(temp) / path.stem
+            destination = Path(temp) / path.stem.replace("mi300x", "mi300")
             with tarfile.open(path) as archive:
                 archive.extractall(destination, filter="data")
             manifests = list(destination.rglob("campaign.json"))
@@ -326,7 +330,7 @@ def main():
         (args.output / name).write_text(content)
     with (args.output / "results.csv").open("w") as stream:
         fields = ["archive", "model", "precision", "phase", "native_status", "reference_status", "native_ms", "reference_ms", "ratio", "native_process_medians_ms", "reference_process_medians_ms", "paired_ratios"]
-        writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
+        writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore", lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
     if args.check:
