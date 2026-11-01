@@ -134,7 +134,79 @@ data/hardware.json native_runner.
 -->
 
 ---
+
 <!-- header: 'Introduction · **Productivity** · Portability · Performance · Conclusion' -->
+<!-- _class: client-code -->
+
+# Writing a model
+
+<div class="client"><div>
+
+```rust
+use meganeura::{Graph, TrainConfig, Trainer, build_session, nn};
+
+let mut g = Graph::new();
+let x = g.input("x", &[32, 784]);
+let labels = g.input("labels", &[32, 10]);
+let fc1 = nn::Linear::new(&mut g, "fc1", 784, 128);
+let h = fc1.forward(&mut g, x);
+let h = g.relu(h);
+let fc2 = nn::Linear::new(&mut g, "fc2", 128, 10);
+let logits = fc2.forward(&mut g, h);
+let loss = g.cross_entropy_loss(logits, labels);
+g.set_outputs(vec![loss]);
+
+let mut session = build_session(&g); // autodiff + compile
+session.set_parameter("fc1.weight", &init);
+let mut trainer = Trainer::new(session, TrainConfig::default());
+trainer.train(&mut mnist.loader(32), 10);
+```
+
+</div><div class="formats">
+<h3>Or import</h3>
+<div><b>ONNX</b><span>graph + weights</span></div>
+<div><b>NNEF</b><span>Khronos graph + weights</span></div>
+<div><b>GGUF</b><span>quantized LLM inference</span></div>
+</div></div>
+
+**One graph compiler for native models and imports.**
+
+<!--
+Time: 0:50.
+
+This is the model and training loop; initialization and data loading are abbreviated. Plain Rust builders make a small network:
+two linear layers with a ReLU, and a cross-entropy loss. Shapes and types are
+checked as each node is added, so a mismatch points at the line that caused
+it. build_session differentiates the graph, optimizes it, generates the
+kernels and creates the pipelines on the GPU it finds. The trainer then runs
+forward, backward and the optimizer update for each batch. There is no Python
+and no export step; the five benchmark models are written this way.
+
+Models can also be imported. ONNX and Khronos's NNEF carry a graph and its
+weights. GGUF, the llama.cpp format, carries weights and metadata but no
+graph: Meganeura builds the transformer the file describes, keeps quantized
+weights packed, and wraps the sessions and tokenizer in a text generator.
+All imports feed the graph compiler. Training requires differentiable ops
+and trainable parameters; the packed GGUF path shown here is for inference.
+
+If asked:
+- Parameters start at zero; init holds the first layer's random initial
+  weights, and mnist is an MnistDataset. Both are the application's data.
+- The default optimizer is SGD; Optimizer also offers Adam.
+- GGUF architectures: the Llama family (SmolLM2, Mistral, TinyLlama), Qwen2
+  and Qwen3, Gemma 1 to 4. Weight types: f32, f16, BF16, Q4_0, Q4_1, Q8_0 and
+  Q3_K to Q6_K.
+- An ONNX or NNEF operator without an equivalent fails at import with its
+  name. The importers are fuzzed so malformed files return errors.
+- Preparation outside search takes a median 1.7s per workload process: backup "How do we write the kernels?".
+- Loading and running an ONNX file: backup "Importing a model".
+
+Sources: examples/mnist.rs; src/graph.rs, src/nn.rs, src/train.rs;
+src/load/onnx.rs, src/load/nnef.rs, src/load/gguf/; src/models/;
+tests/importer_fuzz.rs.
+-->
+
+---
 
 <!-- _class: testing -->
 
@@ -906,7 +978,7 @@ Sources: data/results.csv; data/summary.json; data/hardware.json;
 <div class="columns backup-list"><div>
 
 **Productivity**
-[Importing a model](#20) · [Inside Meganeura](#21) · [Writing a model](#22) · [How do we describe a model?](#23) · [Which form is faster?](#24) · [How do we write the kernels?](#25) · [Gradients](#26) · [Compile stages](#27)
+[Importing a model](#21) · [Inside Meganeura](#22) · [How do we describe a model?](#23) · [Which form is faster?](#24) · [How do we write the kernels?](#25) · [Gradients](#26) · [Compile stages](#27)
 
 **Portability**
 [Matrix paths selected](#28) · [Where paths stop](#29) · [What search costs](#30) · [Reusing kernel decisions](#31) · [Coverage](#32)
@@ -1001,79 +1073,6 @@ If asked:
 - Search is optional. Without it, the ordinary extracted program runs.
 
 Sources: ../main.tex, How Meganeura Works; src/graph/composite.rs.
--->
-
----
-
-<!-- _header: 'Backup · Productivity' -->
-<!-- _class: client-code -->
-
-# Writing a model
-
-<div class="client"><div>
-
-```rust
-use meganeura::{Graph, TrainConfig, Trainer, build_session, nn};
-
-let mut g = Graph::new();
-let x = g.input("x", &[32, 784]);
-let labels = g.input("labels", &[32, 10]);
-let fc1 = nn::Linear::new(&mut g, "fc1", 784, 128);
-let h = fc1.forward(&mut g, x);
-let h = g.relu(h);
-let fc2 = nn::Linear::new(&mut g, "fc2", 128, 10);
-let logits = fc2.forward(&mut g, h);
-let loss = g.cross_entropy_loss(logits, labels);
-g.set_outputs(vec![loss]);
-
-let mut session = build_session(&g); // autodiff + compile
-session.set_parameter("fc1.weight", &init);
-let mut trainer = Trainer::new(session, TrainConfig::default());
-trainer.train(&mut mnist.loader(32), 10);
-```
-
-</div><div class="formats">
-<h3>Or import</h3>
-<div><b>ONNX</b><span>graph + weights</span></div>
-<div><b>NNEF</b><span>Khronos graph + weights</span></div>
-<div><b>GGUF</b><span>quantized LLM inference</span></div>
-</div></div>
-
-**One graph compiler for native models and imports.**
-
-<!--
-Backup, for “how do I write and train a model?”
-
-This is the model and training loop; initialization and data loading are abbreviated. Plain Rust builders make a small network:
-two linear layers with a ReLU, and a cross-entropy loss. Shapes and types are
-checked as each node is added, so a mismatch points at the line that caused
-it. build_session differentiates the graph, optimizes it, generates the
-kernels and creates the pipelines on the GPU it finds. The trainer then runs
-forward, backward and the optimizer update for each batch. There is no Python
-and no export step; the five benchmark models are written this way.
-
-Models can also be imported. ONNX and Khronos's NNEF carry a graph and its
-weights. GGUF, the llama.cpp format, carries weights and metadata but no
-graph: Meganeura builds the transformer the file describes, keeps quantized
-weights packed, and wraps the sessions and tokenizer in a text generator.
-All imports feed the graph compiler. Training requires differentiable ops
-and trainable parameters; the packed GGUF path shown here is for inference.
-
-If asked:
-- Parameters start at zero; init holds the first layer's random initial
-  weights, and mnist is an MnistDataset. Both are the application's data.
-- The default optimizer is SGD; Optimizer also offers Adam.
-- GGUF architectures: the Llama family (SmolLM2, Mistral, TinyLlama), Qwen2
-  and Qwen3, Gemma 1 to 4. Weight types: f32, f16, BF16, Q4_0, Q4_1, Q8_0 and
-  Q3_K to Q6_K.
-- An ONNX or NNEF operator without an equivalent fails at import with its
-  name. The importers are fuzzed so malformed files return errors.
-- Preparation outside search takes a median 1.7s per workload process: backup "How do we write the kernels?".
-- Loading and running an ONNX file: backup "Importing a model".
-
-Sources: examples/mnist.rs; src/graph.rs, src/nn.rs, src/train.rs;
-src/load/onnx.rs, src/load/nnef.rs, src/load/gguf/; src/models/;
-tests/importer_fuzz.rs.
 -->
 
 ---
