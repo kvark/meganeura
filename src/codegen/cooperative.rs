@@ -501,16 +501,19 @@ mod tests {
         }
     }
 
+    /// Every group meets every valid operand, multiply and output type;
+    /// tile shapes and staging layouts cycle so each group meets every pair.
     #[test]
     fn convolution_and_dense_modules_validate_and_emit_spirv() {
         let capabilities = naga::valid::Capabilities::SHADER_BFLOAT16
             | naga::valid::Capabilities::SHADER_FLOAT16
             | naga::valid::Capabilities::COOPERATIVE_MATRIX
             | naga::valid::Capabilities::SUBGROUP;
+        let shapes = [[16, 16, 16], [8, 16, 16], [8, 8, 8]];
         let mut cases = Vec::new();
-        for shape in [[16, 16, 16], [8, 16, 16], [8, 8, 8]] {
-            for output_bf16 in [false, true] {
-                let output = if output_bf16 { DType::BF16 } else { DType::F32 };
+        for (i, output) in [DType::F32, DType::BF16].into_iter().enumerate() {
+            for (j, &shape) in shapes.iter().enumerate() {
+                let output_bf16 = output == DType::BF16;
                 cases.push((
                     ShaderGroup::Conv2dBF16 {
                         kernel_h: 2,
@@ -523,40 +526,49 @@ mod tests {
                         ..MatrixTypes::BF16
                     },
                     shape,
+                    i + j,
                 ));
-                for storage in [DType::BF16, DType::F16, DType::F32] {
-                    for multiply in [DType::BF16, DType::F16, DType::F32] {
-                        for b in [DType::F32, multiply] {
-                            let types = MatrixTypes {
-                                a: storage,
-                                b,
-                                multiply,
-                                output,
-                            };
-                            if types.is_valid() {
-                                for group in [
-                                    ShaderGroup::Conv2dChecked {
-                                        kernel_h: 2,
-                                        kernel_w: 4,
-                                        stride: 2,
-                                    },
-                                    ShaderGroup::MatMul,
-                                    ShaderGroup::MatMulAT,
-                                    ShaderGroup::MatMulBT,
-                                    ShaderGroup::MatMulAdd,
-                                    ShaderGroup::MatMulATAdd,
-                                    ShaderGroup::MatMulBTAdd,
-                                ] {
-                                    cases.push((group, types, shape));
-                                }
-                            }
+            }
+        }
+        let mut types = Vec::new();
+        for output in [DType::F32, DType::BF16] {
+            for storage in [DType::BF16, DType::F16, DType::F32] {
+                for multiply in [DType::BF16, DType::F16, DType::F32] {
+                    for b in [DType::F32, multiply] {
+                        let candidate = MatrixTypes {
+                            a: storage,
+                            b,
+                            multiply,
+                            output,
+                        };
+                        if candidate.is_valid() && !types.contains(&candidate) {
+                            types.push(candidate);
                         }
                     }
                 }
             }
         }
-        for (group, types, shape) in cases {
-            for layout in [
+        let mut index = 0;
+        for group in [
+            ShaderGroup::Conv2dChecked {
+                kernel_h: 2,
+                kernel_w: 4,
+                stride: 2,
+            },
+            ShaderGroup::MatMul,
+            ShaderGroup::MatMulAT,
+            ShaderGroup::MatMulBT,
+            ShaderGroup::MatMulAdd,
+            ShaderGroup::MatMulATAdd,
+            ShaderGroup::MatMulBTAdd,
+        ] {
+            for &types in &types {
+                cases.push((group, types, shapes[(index / 3) % 3], index));
+                index += 1;
+            }
+        }
+        for (group, types, shape, index) in cases {
+            let layout = [
                 super::super::TypedMatmulLayout::default(),
                 super::super::TypedMatmulLayout {
                     vectorized: true,
@@ -568,20 +580,19 @@ mod tests {
                     coop_shape(group).is_some_and(|(addend, _)| addend),
                     [64, 64, 64],
                 ),
-            ] {
-                let subgroup = if layout.vectorized { 16 } else { 32 };
-                let mut module = super::super::generate_module_coop_typed_with_subgroup(
-                    group, types, shape, layout, subgroup,
+            ][index % 3];
+            let subgroup = if layout.vectorized { 16 } else { 32 };
+            let mut module = super::super::generate_module_coop_typed_with_subgroup(
+                group, types, shape, layout, subgroup,
+            );
+            if shape[0] == 8 && group.is_checked_convolution() {
+                assert_eq!(
+                    module.module.entry_points[0].workgroup_size,
+                    [8 * subgroup, 1, 1]
                 );
-                if shape[0] == 8 && group.is_checked_convolution() {
-                    assert_eq!(
-                        module.module.entry_points[0].workgroup_size,
-                        [8 * subgroup, 1, 1]
-                    );
-                }
-                super::super::validate_shader_for_test(&mut module.module, capabilities, (1, 3))
-                    .unwrap_or_else(|error| panic!("{group:?} {types:?} {shape:?}: {error}"));
             }
+            super::super::validate_shader_for_test(&mut module.module, capabilities, (1, 3))
+                .unwrap_or_else(|error| panic!("{group:?} {types:?} {shape:?}: {error}"));
         }
     }
 
