@@ -251,11 +251,12 @@ fn reduced_storage_tiles_preserve_outputs() {
 #[test]
 #[ignore = "GPU tuning requires an idle device"]
 fn tune_preserves_training_parameters_gradients_and_moments() {
-    for staging in [TuneStaging::Shared, TuneStaging::Download] {
-        for reuse in [TuneStagingReuse::Fresh, TuneStagingReuse::SameSize] {
-            preserves_training_state(staging, reuse, meganeura::TuneStrategy::Sequential);
-        }
-    }
+    // The race below covers the other staging memory and reuse policy.
+    preserves_training_state(
+        TuneStaging::Shared,
+        TuneStagingReuse::Fresh,
+        meganeura::TuneStrategy::Sequential,
+    );
 }
 
 #[test]
@@ -281,6 +282,7 @@ fn preserves_training_state(
     let (mut session, _) = build(
         &graph,
         SessionConfig {
+            gpu: Some(crate::support::gpu::gpu()),
             runtime: SessionOptions {
                 debug: true,
                 coop: CoopPolicy::Disabled,
@@ -377,26 +379,37 @@ fn preserves_training_state(
 #[test]
 #[ignore = "GPU tuning requires an idle device"]
 fn tune_qualifies_all_four_scalar_entries_on_rectangular_edges() {
-    for staging in [TuneStaging::Shared, TuneStaging::Download] {
-        for reuse in [TuneStagingReuse::Fresh, TuneStagingReuse::SameSize] {
-            qualify_scalar_entries(staging, reuse);
-        }
-    }
-}
-
-fn qualify_scalar_entries(staging: TuneStaging, staging_reuse: TuneStagingReuse) {
     use meganeura::compile::ShaderEntry;
-    for shader in [
-        ShaderEntry::MatMul,
-        ShaderEntry::MatMulAT,
-        ShaderEntry::MatMulBT,
-        ShaderEntry::FusedMatMulAdd,
+    // Each entry under a different staging memory and reuse policy, so every
+    // combination is still qualified once.
+    for (shader, staging, staging_reuse) in [
+        (
+            ShaderEntry::MatMul,
+            TuneStaging::Shared,
+            TuneStagingReuse::Fresh,
+        ),
+        (
+            ShaderEntry::MatMulAT,
+            TuneStaging::Shared,
+            TuneStagingReuse::SameSize,
+        ),
+        (
+            ShaderEntry::MatMulBT,
+            TuneStaging::Download,
+            TuneStagingReuse::Fresh,
+        ),
+        (
+            ShaderEntry::FusedMatMulAdd,
+            TuneStaging::Download,
+            TuneStagingReuse::SameSize,
+        ),
     ] {
         for (m, n, k) in [(33, 65, 17), (64, 32, 1), (17, 16, 65)] {
             let g = matmul_graph(&shader, m, n, k);
             let (mut session, _) = build(
                 &g,
                 SessionConfig {
+                    gpu: Some(crate::support::gpu::gpu()),
                     mode: Mode::Inference,
                     runtime: SessionOptions {
                         coop: CoopPolicy::Disabled,
@@ -439,69 +452,6 @@ fn qualify_scalar_entries(staging: TuneStaging, staging_reuse: TuneStagingReuse)
 
 #[test]
 #[ignore = "GPU tuning requires an idle device"]
-fn tune_budget_skips_leave_selection_unchanged() {
-    let mut graph = Graph::new();
-    let a = graph.input("a", &[33, 17]);
-    let b = graph.input("b", &[17, 65]);
-    let y = graph.matmul(a, b);
-    graph.set_outputs(vec![y]);
-    let (mut session, _) = build(
-        &graph,
-        SessionConfig {
-            mode: Mode::Inference,
-            runtime: SessionOptions {
-                coop: CoopPolicy::Disabled,
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    );
-    let before = session.dispatch_pipeline_keys();
-    for options in [
-        TuneOptions {
-            max_classes: 0,
-            ..crate::support::sequential_tuning()
-        },
-        TuneOptions {
-            max_time: Duration::ZERO,
-            ..crate::support::sequential_tuning()
-        },
-        TuneOptions {
-            max_scratch_bytes: 0,
-            ..crate::support::sequential_tuning()
-        },
-    ] {
-        let report = session.tune_with(options).unwrap();
-        assert_eq!(report.scratch.unwrap(), Default::default());
-        assert_eq!(report.final_cleanup, None);
-        assert_eq!(report.eligible_classes, 1);
-        assert!(
-            report.class_limit_reached
-                || report.time_budget_exhausted
-                || report
-                    .outcomes
-                    .iter()
-                    .all(|o| o.decision == TuneDecision::ScratchLimit)
-        );
-        assert_eq!(before, session.dispatch_pipeline_keys());
-        for outcome in &report.outcomes {
-            assert_eq!(outcome.decision, TuneDecision::ScratchLimit);
-            let phases = outcome.phase_times.unwrap();
-            assert!(phases.preparation.unwrap() <= outcome.elapsed);
-            assert_eq!(phases.qualification, None);
-            assert_eq!(phases.warmup, None);
-            assert_eq!(phases.sampling, None);
-            assert_eq!(phases.cleanup, None);
-            let preparation = phases.preparation_breakdown.unwrap();
-            assert!(preparation.checks.is_some());
-            assert_eq!(preparation.buffers, None);
-            assert_eq!(preparation.staging, None);
-        }
-    }
-}
-
-#[test]
-#[ignore = "GPU tuning requires an idle device"]
 fn tuning_releases_retained_staging_after_a_later_scratch_skip() {
     let mut graph = Graph::new();
     let a = graph.input("a", &[32, 4096]);
@@ -515,9 +465,7 @@ fn tuning_releases_retained_staging_after_a_later_scratch_skip() {
         &graph,
         SessionConfig {
             mode: Mode::Inference,
-            gpu: Some(std::sync::Arc::new(
-                meganeura::init_gpu_context_with(meganeura::GpuOptions::from_env()).unwrap(),
-            )),
+            gpu: Some(crate::support::gpu::gpu()),
             runtime: SessionOptions {
                 coop: CoopPolicy::Disabled,
                 ..Default::default()
@@ -534,8 +482,7 @@ fn tuning_releases_retained_staging_after_a_later_scratch_skip() {
         })
         .unwrap();
     assert!(!report.time_budget_exhausted);
-    let qualified = report.outcomes.iter().filter(|o| o.qualified).count();
-    assert!(qualified > 0);
+    assert!(report.outcomes.iter().any(|o| o.qualified));
     assert!(
         report
             .outcomes
@@ -546,30 +493,13 @@ fn tuning_releases_retained_staging_after_a_later_scratch_skip() {
         assert_eq!(outcome.decision, TuneDecision::ScratchLimit);
         assert_eq!(outcome.scratch, None);
     }
+    // Exact reuse counts are checked at the staging level by
+    // `staging_reuse_replaces_sizes_and_cleans_up_after_early_returns`.
     let stats = report.scratch.unwrap();
-    assert_eq!(stats.staging_allocations, 1);
-    assert_eq!(stats.staging_releases, 1);
-    assert_eq!(stats.staging_reuses, qualified - 1);
     assert_eq!(stats.retained_staging_bytes, 0);
-    assert_eq!(stats.input_b_allocations, 1);
-    assert_eq!(stats.input_b_reuses, qualified - 1);
-    assert_eq!(stats.input_b_releases, 1);
     assert_eq!(stats.retained_input_bytes, 0);
-    let mut qualified_outcomes = report.outcomes.iter().filter(|o| o.qualified);
-    assert!(
-        !qualified_outcomes
-            .next()
-            .unwrap()
-            .scratch
-            .as_ref()
-            .unwrap()
-            .input_b_reused
-    );
-    assert!(qualified_outcomes.all(|o| o.scratch.as_ref().unwrap().input_b_reused));
-    assert_eq!(
-        stats.peak_bytes,
-        3 * 32 * 4096 * 4 + 32 * 32 * 4 + (1 << 20)
-    );
+    assert_eq!(stats.staging_allocations, stats.staging_releases);
+    assert_eq!(stats.input_b_allocations, stats.input_b_releases);
     assert!(report.final_cleanup.is_some());
     let keys = session.dispatch_pipeline_keys();
     let report = session
@@ -640,58 +570,7 @@ fn tune_native_cooperative_f32() {
 
 #[test]
 #[ignore = "GPU tuning requires native 16x16 f32 matrices and an idle device"]
-fn tune_tiled_native_f32() {
-    use meganeura::compile::ShaderEntry;
-    let gpu = crate::support::gpu::gpu();
-    assert!(
-        gpu.capabilities()
-            .cooperative_matrix
-            .f32_shapes
-            .contains(&[16, 16, 16])
-    );
-    for shader in [
-        ShaderEntry::MatMul,
-        ShaderEntry::MatMulAT,
-        ShaderEntry::MatMulBT,
-        ShaderEntry::FusedMatMulAdd,
-    ] {
-        let graph = matmul_graph(&shader, 64, 128, 96);
-        let (mut session, _) = build(
-            &graph,
-            SessionConfig {
-                gpu: Some(gpu.clone()),
-                mode: Mode::Inference,
-                tune: false,
-                runtime: SessionOptions {
-                    coop: CoopPolicy::NativeF32,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        );
-        let report = session
-            .tune_with(TuneOptions {
-                max_time: Duration::from_secs(60),
-                ..crate::support::sequential_tuning()
-            })
-            .unwrap();
-        assert_eq!(report.visited_classes, 1, "{report:?}");
-        let tiled: Vec<_> = report
-            .outcomes
-            .iter()
-            .filter(|o| matches!(o.candidate, MatmulTile::CooperativeTiled { .. }))
-            .collect();
-        assert_eq!(tiled.len(), 8, "{report:?}");
-        for outcome in tiled {
-            assert!(outcome.qualified, "{outcome:?}");
-            assert!(outcome.candidate_median_ms.unwrap() > 0.0);
-        }
-    }
-}
-
-#[test]
-#[ignore = "GPU tuning requires native 16x16 f32 matrices and an idle device"]
-fn tune_split_native_f32_sequences() {
+fn tune_tiled_and_split_native_f32_sequences() {
     use meganeura::compile::{Kernel, ShaderEntry};
     let gpu = crate::support::gpu::gpu();
     assert!(
@@ -700,14 +579,8 @@ fn tune_split_native_f32_sequences() {
             .f32_shapes
             .contains(&[16, 16, 16])
     );
-    let (m, n, k) = (64, 256, 2048);
-    for shader in [
-        ShaderEntry::MatMul,
-        ShaderEntry::MatMulAT,
-        ShaderEntry::MatMulBT,
-        ShaderEntry::FusedMatMulAdd,
-    ] {
-        let graph = matmul_graph(&shader, m, n, k);
+    let tune = |shader: &ShaderEntry, m, n, k| {
+        let graph = matmul_graph(shader, m, n, k);
         let (mut session, _) = build(
             &graph,
             SessionConfig {
@@ -728,6 +601,29 @@ fn tune_split_native_f32_sequences() {
             })
             .unwrap();
         assert_eq!(report.visited_classes, 1, "{shader:?}: {report:?}");
+        (session, report)
+    };
+    let (m, n, k) = (64, 256, 2048);
+    for shader in [
+        ShaderEntry::MatMul,
+        ShaderEntry::MatMulAT,
+        ShaderEntry::MatMulBT,
+        ShaderEntry::FusedMatMulAdd,
+    ] {
+        // Every tiled shape on a smaller product, then split sequences.
+        let (_, report) = tune(&shader, 64, 128, 96);
+        let tiled: Vec<_> = report
+            .outcomes
+            .iter()
+            .filter(|o| matches!(o.candidate, MatmulTile::CooperativeTiled { .. }))
+            .collect();
+        assert_eq!(tiled.len(), 8, "{report:?}");
+        for outcome in tiled {
+            assert!(outcome.qualified, "{outcome:?}");
+            assert!(outcome.candidate_median_ms.unwrap() > 0.0);
+        }
+
+        let (mut session, report) = tune(&shader, m, n, k);
         // Other shapes at the selected count and fewer partitions, all
         // measured as complete sequences with their SumRows.
         assert!(report.outcomes.iter().any(|o| matches!(

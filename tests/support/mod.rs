@@ -1,4 +1,5 @@
 //! Shared helpers for the test suites.
+pub mod chain;
 pub mod data;
 pub mod gpu;
 

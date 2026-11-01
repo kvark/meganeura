@@ -2,9 +2,10 @@
 //! sample per dispatch. A small artificial timestamp budget reaches the same
 //! path as a production plan that exceeds Blade's limit.
 
+use crate::support::chain;
 use meganeura::profiler::{CaptureOptions, capture_session_profile};
 use meganeura::train::SessionConfig;
-use meganeura::{GpuOptions, Graph, Session, init_gpu_context_with};
+use meganeura::{GpuOptions, Session, init_gpu_context_with};
 use std::sync::{Arc, OnceLock};
 
 fn timing_context() -> Option<Arc<blade_graphics::Context>> {
@@ -47,51 +48,18 @@ const LAYERS: usize = 6;
 const ROWS: usize = 32;
 const DIM: usize = 32;
 
-fn build_chain() -> Graph {
-    let mut g = Graph::new();
-    let mut x = g.input("x", &[ROWS, DIM]);
-    for i in 0..LAYERS {
-        let w = g.parameter(&format!("w{i}"), &[DIM, DIM]);
-        let b = g.parameter(&format!("b{i}"), &[DIM]);
-        x = g.matmul(x, w);
-        x = g.bias_add(x, b);
-        x = g.gelu(x);
-        let ln_w = g.parameter(&format!("ln{i}.w"), &[DIM]);
-        let ln_b = g.parameter(&format!("ln{i}.b"), &[DIM]);
-        x = g.layer_norm(x, ln_w, ln_b, 1e-5);
-    }
-    g.set_outputs(vec![x]);
-    g
-}
-
-fn seed(session: &mut Session) {
-    for i in 0..LAYERS {
-        let w: Vec<f32> = (0..DIM * DIM)
-            .map(|k| ((k + i * 7) as f32 * 0.017).sin() * 0.1)
-            .collect();
-        session.set_parameter(&format!("w{i}"), &w);
-        let b: Vec<f32> = (0..DIM)
-            .map(|k| ((k + i) as f32 * 0.03).cos() * 0.01)
-            .collect();
-        session.set_parameter(&format!("b{i}"), &b);
-        session.set_parameter(&format!("ln{i}.w"), &[1.0f32; DIM]);
-        session.set_parameter(&format!("ln{i}.b"), &[0.0f32; DIM]);
-    }
-}
-
-fn input() -> Vec<f32> {
-    (0..ROWS * DIM)
-        .map(|i| (i as f32 * 0.011).sin() * 0.5)
-        .collect()
+/// The seeded chain with its input set.
+fn chain_session(config: SessionConfig<'static>) -> Session {
+    let (mut session, _) = meganeura::train::build(&chain::build_chain(LAYERS, ROWS, DIM), config);
+    chain::seed(&mut session, LAYERS, DIM);
+    session.set_input("x", &chain::input(ROWS, DIM));
+    session
 }
 
 fn build_session() -> Session {
     let mut config = SessionConfig::inference_from_env_on(crate::support::gpu::gpu());
     config.runtime.gpu_timing = false;
-    let (mut session, _) = meganeura::train::build(&build_chain(), config);
-    seed(&mut session);
-    session.set_input("x", &input());
-    session
+    chain_session(config)
 }
 
 fn build_timed_session() -> Option<Session> {
@@ -103,10 +71,7 @@ fn build_timed_session() -> Option<Session> {
         },
         ..base
     };
-    let (mut session, _) = meganeura::train::build(&build_chain(), config);
-    seed(&mut session);
-    session.set_input("x", &input());
-    Some(session)
+    Some(chain_session(config))
 }
 
 fn run_unprofiled() -> Vec<f32> {
@@ -234,7 +199,7 @@ fn windowed_capture_times_every_dispatch_and_preserves_the_result() {
     const SAMPLES: usize = 2;
     let profile = capture_session_profile(
         &mut session,
-        |session| session.set_input("x", &input()),
+        |session| session.set_input("x", &chain::input(ROWS, DIM)),
         CaptureOptions {
             samples: SAMPLES,
             include_pipeline_statistics: false,
@@ -312,7 +277,7 @@ fn a_plan_within_the_budget_is_captured_in_one_replay() {
 
     let profile = capture_session_profile(
         &mut session,
-        |session| session.set_input("x", &input()),
+        |session| session.set_input("x", &chain::input(ROWS, DIM)),
         CaptureOptions {
             samples: 1,
             include_pipeline_statistics: false,
@@ -335,15 +300,10 @@ fn a_plan_within_the_budget_is_captured_in_one_replay() {
 
 #[test]
 fn a_failed_capture_leaves_the_session_unprofiled() {
-    let mut config = SessionConfig::inference_from_env_on(crate::support::gpu::gpu());
-    config.runtime.gpu_timing = false;
-    let (mut session, _) = meganeura::train::build(&build_chain(), config);
-    seed(&mut session);
-    session.set_input("x", &input());
-
+    let mut session = build_session();
     let error = capture_session_profile(
         &mut session,
-        |session| session.set_input("x", &input()),
+        |session| session.set_input("x", &chain::input(ROWS, DIM)),
         CaptureOptions {
             samples: 1,
             include_pipeline_statistics: false,
@@ -360,7 +320,7 @@ fn a_failed_capture_leaves_the_session_unprofiled() {
     );
 
     let mut out = vec![0.0f32; ROWS * DIM];
-    session.set_input("x", &input());
+    session.set_input("x", &chain::input(ROWS, DIM));
     session.step();
     session.wait();
     session.read_output_by_index(0, &mut out);
