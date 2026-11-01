@@ -22,7 +22,7 @@ Raw archives, PDFs and ZIPs stay outside Git.
 
 The main [talk](p3hpc/presentation/slides.md) combines the graphics-API argument,
 the compiler architecture, hardware access and limits, and measured results.
-It has 19 main slides, a backup index and 24 backups, for a roughly 20-minute talk.
+It has 18 main slides, a backup index and 25 backups, for a roughly 20-minute talk.
 The alternative decks remain local references and are not part of this commit.
 
 The talk uses the same October 31–November 1 cohort as the paper. Its chart inputs in
