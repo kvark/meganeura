@@ -726,61 +726,58 @@ mod tests {
     use bytemuck::Zeroable;
 
     /// The uniform is shared with `shaders/adam.wgsl` by hand. A field added
-    /// to one and not the other reinterprets every value after it, so pin the
-    /// layout rather than trusting the two files to stay in step.
+    /// to one and not the other reinterprets every value after it, and `Pod`
+    /// uploads it as bytes, so pin the size and the offsets the shader reads.
     #[test]
     fn adam_params_layout_matches_the_shader_uniform() {
-        // Fourteen 4-byte fields, every one of them a scalar, so the struct
-        // is exactly 56 bytes with no tail padding for `Pod` to hide.
+        // Fourteen 4-byte scalars: exactly 56 bytes, no padding to hide.
         assert_eq!(std::mem::size_of::<AdamParams>(), 56);
         assert_eq!(std::mem::align_of::<AdamParams>(), 4);
-        // `count` and `groups` are the only u32s before the f32 block.
-        let params = AdamParams::zeroed();
+        let mut params = AdamParams::zeroed();
+        params.count = 7;
+        params.groups = 3;
+        params.bias_correction1 = 0.5;
+        params.bias_correction2 = 0.25;
+        params.one_minus_beta1 = 1.0 - 0.9;
+        params.one_minus_beta2 = 1.0 - 0.999;
         let bytes = bytemuck::bytes_of(&params);
-        assert_eq!(&bytes[0..4], &0u32.to_le_bytes());
-        assert_eq!(&bytes[4..8], &0u32.to_le_bytes());
+        let word = |offset: usize| -> [u8; 4] { bytes[offset..offset + 4].try_into().unwrap() };
+        assert_eq!(word(0), 7u32.to_le_bytes(), "count moved");
+        assert_eq!(word(4), 3u32.to_le_bytes(), "groups moved");
+        assert_eq!(word(24), 0.5f32.to_le_bytes(), "bias_correction1 moved");
+        assert_eq!(word(28), 0.25f32.to_le_bytes(), "bias_correction2 moved");
+        assert_eq!(
+            word(48),
+            (1.0f32 - 0.9).to_le_bytes(),
+            "one_minus_beta1 moved"
+        );
+        assert_eq!(
+            word(52),
+            (1.0f32 - 0.999).to_le_bytes(),
+            "one_minus_beta2 moved"
+        );
     }
 
-    /// `bias_correction` must reproduce what the shader used to compute
-    /// itself, `1 / (1 - beta^step)`, across the range a training run
-    /// actually visits. This is the contract that let the `pow` move to the
-    /// host, so it is checked against the formula rather than against a
-    /// recorded table that would only pin the current rounding.
+    /// On the first step the correction is exactly `1 / (1 - beta)`, which
+    /// cancels the `(1 - beta)` that seeded the moment and leaves the raw
+    /// gradient. It then falls monotonically towards one, where a large
+    /// exponent underflows the power and it saturates; a correction that
+    /// rose instead would inflate the first steps and decay the late ones.
     #[test]
-    fn bias_correction_matches_its_definition() {
-        for &(beta, step) in &[
-            (0.9f32, 1u32),
-            (0.9, 2),
-            (0.9, 10),
-            (0.9, 100),
-            (0.9, 10_000),
-            (0.9, 1_000_000),
-            (0.999, 1),
-            (0.999, 1_000_000),
-            (0.95, 1),
-            (0.0, 1),
-            (0.0, 1_000_000),
-        ] {
-            let want = 1.0 / (1.0 - beta.powi(step as i32));
-            let got = bias_correction(beta, step);
-            assert_eq!(got, want, "beta={beta} step={step}");
-            assert!(got.is_finite(), "beta={beta} step={step} gave {got}");
+    fn bias_correction_cancels_the_seeding_then_falls_to_one() {
+        for beta in [0.0f32, 0.5, 0.9, 0.999] {
+            assert_eq!(bias_correction(beta, 1), 1.0 / (1.0 - beta), "beta={beta}");
+            let seeded = (1.0 - beta) * 2.0;
+            assert!((seeded * bias_correction(beta, 1) - 2.0).abs() < 1.0e-6);
+            let late = bias_correction(beta, 1_000_000);
+            assert!(
+                late.is_finite() && (late - 1.0).abs() < 1.0e-6,
+                "beta={beta}: {late}"
+            );
         }
-    }
-
-    /// The correction starts at `1 / (1 - beta)` on the first step — where
-    /// it exactly cancels the `(1 - beta)` that seeded the moment, leaving
-    /// the raw gradient — and decreases monotonically towards 1 as the
-    /// estimate of the second moment improves. Asserting the direction
-    /// matters: a correction that rose instead would inflate the first
-    /// steps and decay the late ones.
-    #[test]
-    fn bias_correction_falls_from_its_ceiling_towards_one() {
-        let beta = 0.9f32;
-        let start = 1.0 / (1.0 - beta);
         let mut previous = f32::INFINITY;
         for step in 1..64u32 {
-            let got = bias_correction(beta, step);
+            let got = bias_correction(0.9, step);
             assert!(
                 got < previous,
                 "step {step} did not decrease: {got} >= {previous}"
@@ -788,43 +785,5 @@ mod tests {
             assert!(got >= 1.0, "step {step} undershot one: {got}");
             previous = got;
         }
-        assert!((bias_correction(beta, 1) - start).abs() < 1.0e-6);
-        // A large exponent underflows the power to zero, so the correction
-        // saturates at exactly one.
-        assert!((bias_correction(beta, 1_000_000) - 1.0).abs() < 1.0e-6);
-    }
-
-    /// On the first step the correction is exactly `1 / (1 - beta)`, which
-    /// cancels the `(1 - beta)` that seeded the moment and leaves the raw
-    /// gradient as the update. Getting this wrong would rescale the first
-    /// step of every run by a constant.
-    #[test]
-    fn the_first_step_undoes_the_moment_seeding() {
-        for beta in [0.0f32, 0.5, 0.9, 0.999] {
-            assert_eq!(bias_correction(beta, 1), 1.0 / (1.0 - beta), "beta={beta}");
-            // The moment the shader holds after one step is `(1 - beta) * g`,
-            // so the two together must reconstruct `g` itself.
-            let seeded = (1.0 - beta) * 2.0;
-            assert!((seeded * bias_correction(beta, 1) - 2.0).abs() < 1.0e-6);
-        }
-    }
-
-    /// `Pod` is what lets the struct be uploaded as bytes; a padding change
-    /// would silently break that, so assert the fields are still laid out
-    /// without holes.
-    #[test]
-    fn adam_params_is_pod_without_padding() {
-        let mut params = AdamParams::zeroed();
-        params.bias_correction1 = 0.5;
-        params.bias_correction2 = 0.25;
-        params.one_minus_beta1 = 1.0 - 0.9;
-        params.one_minus_beta2 = 1.0 - 0.999;
-        let bytes = bytemuck::bytes_of(&params);
-        let read =
-            |offset: usize| f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        assert_eq!(read(24), 0.5, "bias_correction1 moved");
-        assert_eq!(read(28), 0.25, "bias_correction2 moved");
-        assert_eq!(read(48), 1.0 - 0.9, "one_minus_beta1 moved");
-        assert_eq!(read(52), 1.0 - 0.999, "one_minus_beta2 moved");
     }
 }

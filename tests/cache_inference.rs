@@ -1,9 +1,5 @@
-/// Test that an optimized execution plan can be saved to disk, reloaded,
-/// and produce identical inference results.
-///
-/// Pipeline: build graph → optimize → compile → save plan →
-///           load plan → verify structure → infer from loaded plan.
-use meganeura::compile::ExecutionPlan;
+/// An optimized execution plan saved to disk and reloaded is the same plan,
+/// and runs to the same outputs.
 use meganeura::runtime::Session;
 use meganeura::{Graph, cache, compile, optimize};
 
@@ -24,98 +20,44 @@ fn build_graph() -> Graph {
     g
 }
 
-fn optimize_and_compile(g: &Graph) -> ExecutionPlan {
-    let optimized = optimize::optimize(g);
-    compile::compile(&optimized)
-}
-
 #[test]
-fn cache_roundtrip_preserves_plan() {
+fn cached_plan_round_trips_and_infers_identically() {
     let g = build_graph();
-    let plan = optimize_and_compile(&g);
+    let plan = compile::compile(&optimize::optimize(&g));
 
-    // Save plan to disk
     let dir = std::env::temp_dir().join("meganeura_test_cache_inference");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("inference_plan.ron");
     cache::save_plan(&plan, &g, &path).unwrap();
-
-    // Load it back
     let loaded = cache::load_plan(&g, &path)
         .unwrap()
         .expect("cache should hit");
+    let _ = std::fs::remove_file(&path);
 
-    // Every field must match
-    assert_eq!(plan.buffers, loaded.buffers, "buffer sizes");
-    assert_eq!(plan.param_buffers, loaded.param_buffers, "param_buffers");
-    assert_eq!(plan.input_buffers, loaded.input_buffers, "input_buffers");
-    assert_eq!(plan.loss_buffer, loaded.loss_buffer, "loss_buffer");
-    assert_eq!(
-        plan.param_grad_pairs, loaded.param_grad_pairs,
-        "param_grad_pairs"
+    // The same dispatches and buffer sizes, reading the same values. The
+    // digest's leaves are parameters and inputs by name.
+    assert_eq!(plan.dispatch_inventory(), loaded.dispatch_inventory());
+    assert_eq!(plan.dataflow_digest(), loaded.dataflow_digest());
+
+    let run = |plan| {
+        let mut session = Session::with_context(plan, crate::support::gpu::gpu());
+        session.set_parameter("w1", &[0.1_f32; 8 * 5]);
+        session.set_parameter("b1", &[0.01_f32; 5]);
+        session.set_parameter("w2", &[0.2_f32; 5 * 3]);
+        session.set_parameter("b2", &[0.02_f32; 3]);
+        let x_data: Vec<f32> = (0..2 * 8).map(|i| (i as f32) * 0.1).collect();
+        session.set_input("x", &x_data);
+        session.step();
+        session.wait();
+        session.read_output(2 * 3)
+    };
+    let (original, reloaded) = (run(plan), run(loaded));
+    assert!(
+        original.iter().all(|v| v.is_finite() && v.abs() > 1e-10),
+        "{original:?}"
     );
     assert_eq!(
-        plan.dispatches.len(),
-        loaded.dispatches.len(),
-        "dispatch count"
+        original.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        reloaded.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
     );
-    for (i, (a, b)) in plan
-        .dispatches
-        .iter()
-        .zip(loaded.dispatches.iter())
-        .enumerate()
-    {
-        assert_eq!(a.shader, b.shader, "dispatch[{}] shader", i);
-        assert_eq!(a.workgroups, b.workgroups, "dispatch[{}] workgroups", i);
-        assert_eq!(a.input_buffers, b.input_buffers, "dispatch[{}] inputs", i);
-        assert_eq!(a.output_buffer, b.output_buffer, "dispatch[{}] output", i);
-        assert_eq!(a.params, b.params, "dispatch[{}] params", i);
-    }
-
-    let _ = std::fs::remove_file(&path);
-}
-
-#[test]
-fn infer_from_loaded_plan() {
-    let g = build_graph();
-    let plan = optimize_and_compile(&g);
-
-    // Save and reload
-    let dir = std::env::temp_dir().join("meganeura_test_cache_inference2");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("inference_plan2.ron");
-    cache::save_plan(&plan, &g, &path).unwrap();
-    let loaded = cache::load_plan(&g, &path)
-        .unwrap()
-        .expect("cache should hit");
-
-    // Build a GPU session from the loaded plan and run inference
-    let mut session = Session::with_context(loaded, crate::support::gpu::gpu());
-
-    session.set_parameter("w1", &[0.1_f32; 8 * 5]);
-    session.set_parameter("b1", &[0.01_f32; 5]);
-    session.set_parameter("w2", &[0.2_f32; 5 * 3]);
-    session.set_parameter("b2", &[0.02_f32; 3]);
-
-    let x_data: Vec<f32> = (0..2 * 8).map(|i| (i as f32) * 0.1).collect();
-    session.set_input("x", &x_data);
-
-    session.step();
-    session.wait();
-
-    let output = session.read_output(2 * 3);
-    assert_eq!(output.len(), 6, "expected 2*3 output elements");
-
-    // All outputs should be finite and non-zero (matmul+bias with non-zero weights/input)
-    for (i, &v) in output.iter().enumerate() {
-        assert!(v.is_finite(), "output[{}] = {} is not finite", i, v);
-        assert!(
-            v.abs() > 1e-10,
-            "output[{}] = {} is unexpectedly zero",
-            i,
-            v
-        );
-    }
-
-    let _ = std::fs::remove_file(&path);
 }

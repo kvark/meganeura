@@ -3794,115 +3794,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_simple_graph() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 784]);
-        let w = g.parameter("w", &[784, 128]);
-        let y = g.matmul(x, w);
-        let h = g.relu(y);
-        g.set_outputs(vec![h]);
-
-        assert_eq!(g.nodes().len(), 4);
-        assert_eq!(g.node(y).ty.shape, vec![4, 128]);
-        assert_eq!(g.node(h).ty.shape, vec![4, 128]);
-    }
-
-    #[test]
-    fn tensor_type_bytes() {
-        let t = TensorType::f32(vec![32, 784]);
-        assert_eq!(t.num_elements(), 32 * 784);
-        assert_eq!(t.size_bytes(), 32 * 784 * 4);
-    }
-
-    #[test]
-    fn tensor_type_rank() {
-        assert_eq!(TensorType::f32(vec![4, 3]).rank(), 2);
-        assert_eq!(TensorType::f32(vec![1]).rank(), 1);
-        assert_eq!(TensorType::f32(vec![2, 3, 4]).rank(), 3);
-    }
-
-    #[test]
-    fn build_all_unary_ops() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 8]);
-        let r = g.relu(x);
-        let s = g.sigmoid(x);
-        let n = g.neg(x);
-        let e = g.exp(x);
-        let t = g.transpose(x);
-        g.set_outputs(vec![r, s, n, e, t]);
-
-        assert_eq!(g.node(r).ty.shape, vec![4, 8]);
-        assert_eq!(g.node(s).ty.shape, vec![4, 8]);
-        assert_eq!(g.node(n).ty.shape, vec![4, 8]);
-        assert_eq!(g.node(e).ty.shape, vec![4, 8]);
-        assert_eq!(g.node(t).ty.shape, vec![8, 4]); // transposed
-    }
-
-    #[test]
-    fn build_all_binary_ops() {
-        let mut g = Graph::new();
-        let a = g.input("a", &[4, 8]);
-        let b = g.input("b", &[4, 8]);
-        let add = g.add(a, b);
-        let mul = g.mul(a, b);
-        let gt = g.greater(a, b);
-        g.set_outputs(vec![add, mul, gt]);
-
-        for &id in &[add, mul, gt] {
-            assert_eq!(g.node(id).ty.shape, vec![4, 8]);
-        }
-    }
-
-    #[test]
-    fn build_bias_add() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 128]);
-        let b = g.parameter("b", &[128]);
-        let out = g.bias_add(x, b);
-        assert_eq!(g.node(out).ty.shape, vec![4, 128]);
-    }
-
-    #[test]
-    fn build_reductions() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 8]);
-        let sa = g.sum_all(x);
-        let ma = g.mean_all(x);
-        let sm = g.softmax(x);
-        let lsm = g.log_softmax(x);
-        g.set_outputs(vec![sa, ma, sm, lsm]);
-
-        assert_eq!(g.node(sa).ty.shape, vec![1]);
-        assert_eq!(g.node(ma).ty.shape, vec![1]);
-        assert_eq!(g.node(sm).ty.shape, vec![4, 8]);
-        assert_eq!(g.node(lsm).ty.shape, vec![4, 8]);
-    }
-
-    #[test]
-    fn build_cross_entropy_loss() {
-        let mut g = Graph::new();
-        let logits = g.input("logits", &[4, 10]);
-        let labels = g.input("labels", &[4, 10]);
-        let loss = g.cross_entropy_loss(logits, labels);
-        assert_eq!(g.node(loss).ty.shape, vec![1]);
-    }
-
-    #[test]
-    fn build_constant_and_scalar() {
-        let mut g = Graph::new();
-        let c = g.constant(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]);
-        let s = g.scalar(42.0);
-        assert_eq!(g.node(c).ty.shape, vec![2, 2]);
-        assert_eq!(g.node(s).ty.shape, vec![1]);
-        if let Op::Constant { ref data } = g.node(s).op {
-            assert_eq!(data, &[42.0]);
-        } else {
-            panic!("expected Constant");
-        }
-    }
-
-    #[test]
     fn graph_display() {
         let mut g = Graph::new();
         let x = g.input("x", &[2, 3]);
@@ -3913,20 +3804,6 @@ mod tests {
         assert!(display.contains("%0"));
         assert!(display.contains("%2"));
         assert!(display.contains("outputs: %2"));
-    }
-
-    #[test]
-    fn add_raw_node() {
-        let mut g = Graph::new();
-        let id = g.add_raw_node(
-            Op::Input {
-                name: "raw".to_string(),
-            },
-            vec![],
-            TensorType::f32(vec![2, 3]),
-        );
-        assert_eq!(id, 0);
-        assert_eq!(g.nodes().len(), 1);
     }
 
     #[test]

@@ -113,34 +113,19 @@ const FORWARD_SHAPES: &[(usize, usize)] = &[
     (70, 64),
 ];
 
+/// Both norms of the same rows in one graph, as two outputs.
 #[test]
-fn rms_norm_forward() {
-    let mut sweep = Sweep::default();
-    for schedule in [true, false] {
-        for (i, &(rows, cols)) in FORWARD_SHAPES.iter().enumerate() {
-            let mut g = Graph::new();
-            let (x, w, _) = norm_inputs(&mut g, rows, cols);
-            let y = g.rms_norm(x, w, EPS);
-            g.set_outputs(vec![y]);
-            let feeds = random_feeds(&g, 10 + i as u64);
-            let label = format!("rms_norm [{rows}, {cols}] schedule={schedule}");
-            sweep.inference(&label, &g, &feeds, &options(schedule));
-        }
-    }
-    sweep.finish();
-}
-
-#[test]
-fn layer_norm_forward() {
+fn norm_forward() {
     let mut sweep = Sweep::default();
     for schedule in [true, false] {
         for (i, &(rows, cols)) in FORWARD_SHAPES.iter().enumerate() {
             let mut g = Graph::new();
             let (x, w, b) = norm_inputs(&mut g, rows, cols);
-            let y = g.layer_norm(x, w, b, EPS);
-            g.set_outputs(vec![y]);
-            let feeds = random_feeds(&g, 20 + i as u64);
-            let label = format!("layer_norm [{rows}, {cols}] schedule={schedule}");
+            let y = g.rms_norm(x, w, EPS);
+            let z = g.layer_norm(x, w, b, EPS);
+            g.set_outputs(vec![y, z]);
+            let feeds = random_feeds(&g, 10 + i as u64);
+            let label = format!("rms_norm + layer_norm [{rows}, {cols}] schedule={schedule}");
             sweep.inference(&label, &g, &feeds, &options(schedule));
         }
     }
@@ -182,18 +167,18 @@ fn layer_norm_offset_rows() {
     sweep.finish();
 }
 
-/// Build `op(dy, x, w)` with `dy` and `x` inputs of `[rows, cols]`.
-fn norm_grad_graph(
-    rows: usize,
-    cols: usize,
-    op: impl Fn(&mut Graph, NodeId, NodeId, NodeId) -> NodeId,
-) -> Graph {
+/// A norm gradient `op(dy, x, w)`.
+type NormGrad = fn(&mut Graph, NodeId, NodeId, NodeId) -> NodeId;
+
+/// Build the RmsNorm and LayerNorm gradients `op(dy, x, w)` with `dy` and
+/// `x` inputs of `[rows, cols]`, both as outputs of one graph.
+fn norm_grad_graph(rows: usize, cols: usize, ops: [NormGrad; 2]) -> Graph {
     let mut g = Graph::new();
     let dy = g.input("dy", &[rows, cols]);
     let x = g.input("x", &[rows, cols]);
     let w = g.parameter("w", &[cols]);
-    let out = op(&mut g, dy, x, w);
-    g.set_outputs(vec![out]);
+    let outputs = ops.map(|op| op(&mut g, dy, x, w)).to_vec();
+    g.set_outputs(outputs);
     g
 }
 
@@ -202,17 +187,24 @@ fn norm_grad_graph(
 const WEIGHT_GRAD_ROWS: &[usize] = &[1, 2, 3, 4, 37, 2050, 4100, 33_000];
 
 #[test]
-fn rms_norm_grad_w() {
+fn norm_grad_weights() {
     let mut sweep = Sweep::default();
     for &rows in WEIGHT_GRAD_ROWS {
         for cols in [1, 5, 64, 300] {
             if rows * cols > 2_000_000 {
                 continue;
             }
-            let g = norm_grad_graph(rows, cols, |g, dy, x, w| g.rms_norm_grad_w(dy, x, w, EPS));
+            let g = norm_grad_graph(
+                rows,
+                cols,
+                [
+                    |g, dy, x, w| g.rms_norm_grad_w(dy, x, w, EPS),
+                    |g, dy, x, w| g.layer_norm_grad_wb(dy, x, w, EPS),
+                ],
+            );
             let feeds = random_feeds(&g, (rows * 31 + cols) as u64);
             sweep.inference(
-                &format!("rms_norm_grad_w [{rows}, {cols}]"),
+                &format!("rms_norm_grad_w + layer_norm_grad_wb [{rows}, {cols}]"),
                 &g,
                 &feeds,
                 &options(true),
@@ -223,55 +215,21 @@ fn rms_norm_grad_w() {
 }
 
 #[test]
-fn rms_norm_grad_x() {
+fn norm_grad_inputs() {
     let mut sweep = Sweep::default();
     for rows in [1, 5, 100] {
         for cols in [1, 2, 3, 8, 17, 32, 33, 256, 300, 700] {
-            let g = norm_grad_graph(rows, cols, |g, dy, x, w| g.rms_norm_grad_x(dy, x, w, EPS));
+            let g = norm_grad_graph(
+                rows,
+                cols,
+                [
+                    |g, dy, x, w| g.rms_norm_grad_x(dy, x, w, EPS),
+                    |g, dy, x, w| g.layer_norm_grad_x(dy, x, w, EPS),
+                ],
+            );
             let feeds = random_feeds(&g, (rows * 37 + cols) as u64);
             sweep.inference(
-                &format!("rms_norm_grad_x [{rows}, {cols}]"),
-                &g,
-                &feeds,
-                &options(true),
-            );
-        }
-    }
-    sweep.finish();
-}
-
-#[test]
-fn layer_norm_grad_wb() {
-    let mut sweep = Sweep::default();
-    for &rows in WEIGHT_GRAD_ROWS {
-        for cols in [1, 5, 64, 300] {
-            if rows * cols > 2_000_000 {
-                continue;
-            }
-            let g = norm_grad_graph(rows, cols, |g, dy, x, w| {
-                g.layer_norm_grad_wb(dy, x, w, EPS)
-            });
-            let feeds = random_feeds(&g, (rows * 41 + cols) as u64);
-            sweep.inference(
-                &format!("layer_norm_grad_wb [{rows}, {cols}]"),
-                &g,
-                &feeds,
-                &options(true),
-            );
-        }
-    }
-    sweep.finish();
-}
-
-#[test]
-fn layer_norm_grad_x() {
-    let mut sweep = Sweep::default();
-    for rows in [1, 5, 100] {
-        for cols in [1, 3, 32, 256, 300, 700] {
-            let g = norm_grad_graph(rows, cols, |g, dy, x, w| g.layer_norm_grad_x(dy, x, w, EPS));
-            let feeds = random_feeds(&g, (rows * 43 + cols) as u64);
-            sweep.inference(
-                &format!("layer_norm_grad_x [{rows}, {cols}]"),
+                &format!("rms_norm_grad_x + layer_norm_grad_x [{rows}, {cols}]"),
                 &g,
                 &feeds,
                 &options(true),

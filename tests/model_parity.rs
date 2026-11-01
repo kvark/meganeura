@@ -97,6 +97,11 @@ fn smollm2() {
         [vec![logits], k, v].concat()
     });
     assert_parity("smollm2 decode", &decode, INFERENCE);
+    // 64-wide heads over eight layers: the shapes the GPU-side check of
+    // this decomposition used to run.
+    let medium = smollm2::Config::medium_test();
+    let forward = graph_with(|g| vec![smollm2::build_graph(g, &medium, 32)]);
+    assert_parity("smollm2 medium forward", &forward, INFERENCE);
 }
 
 #[test]
@@ -181,122 +186,6 @@ fn onnx_exports() {
         let model = meganeura::load_onnx_bytes(bytes, None).unwrap();
         assert_parity(name, &model.graph, INFERENCE);
     }
-}
-
-/// Build-time cost of recognition at full model size. Recomposition runs
-/// in every build; this reports what it adds next to the rest of the
-/// build. Run with `--release -- --ignored --nocapture`.
-#[test]
-#[ignore]
-fn recomposition_cost() {
-    use std::time::Instant;
-    let config = smollm2::Config::smollm2_135m();
-    let forward = graph_with(|g| vec![smollm2::build_graph(g, &config, 128)]);
-    let training = smollm2::build_training_graph(&config, 128);
-    for (what, graph, mode) in [
-        ("smollm2-135m forward", &forward, Mode::Inference),
-        ("smollm2-135m training", &training, Mode::Training),
-    ] {
-        // As in assert_parity: training recognizes only composites with
-        // exact gradients, so the others build as their primitives do.
-        let written = graph.decompose_for(mode);
-        let decomposed = graph.decompose();
-        let start = Instant::now();
-        let _ = graph.recompose();
-        let as_written = start.elapsed();
-        let start = Instant::now();
-        let _ = decomposed.recompose();
-        let from_primitives = start.elapsed();
-        let start = Instant::now();
-        let original = plan(&written, mode);
-        let build = start.elapsed();
-        let start = Instant::now();
-        let rebuilt = plan(&decomposed, mode);
-        let build_decomposed = start.elapsed();
-        assert_eq!(original, rebuilt, "{what}");
-        println!(
-            "{what}: {} nodes, {} decomposed; recompose {:.1} ms as written, {:.1} ms from primitives; \
-             build {:.0} ms as written, {:.0} ms from primitives",
-            graph.nodes().len(),
-            decomposed.nodes().len(),
-            as_written.as_secs_f64() * 1e3,
-            from_primitives.as_secs_f64() * 1e3,
-            build.as_secs_f64() * 1e3,
-            build_decomposed.as_secs_f64() * 1e3,
-        );
-    }
-}
-
-/// On the GPU, the model built from its decomposition computes bit for bit
-/// what the model as written does, in the same time: it is the same plan.
-#[test]
-fn decomposed_model_runs_identically() {
-    use meganeura::graph::{DType, Op};
-    use std::time::Instant;
-    let config = smollm2::Config::medium_test();
-    let graph = graph_with(|g| vec![smollm2::build_graph(g, &config, 32)]);
-    let decomposed = graph.decompose();
-    let session = |g: &Graph| {
-        let mut cfg = meganeura::SessionConfig::from_env();
-        cfg.mode = Mode::Inference;
-        cfg.gpu = Some(meganeura::reference::gpu::shared_context());
-        let (mut session, _) = meganeura::build(g, cfg);
-        for node in g.nodes() {
-            match node.op {
-                Op::Parameter { ref name } => {
-                    let n = node.ty.num_elements();
-                    let data: Vec<f32> = (0..n)
-                        .map(|i| ((i * 7 + name.len()) as f32 * 0.013).sin() * 0.05)
-                        .collect();
-                    session.set_parameter(name, &data);
-                }
-                Op::Input { ref name } if node.ty.dtype == DType::U32 => {
-                    let ids: Vec<u32> = (0..node.ty.num_elements() as u32)
-                        .map(|i| i * 5 % config.vocab_size as u32)
-                        .collect();
-                    session.set_input_u32(name, &ids);
-                }
-                _ => {}
-            }
-        }
-        session
-    };
-    let mut original = session(&graph);
-    let mut rebuilt = session(&decomposed);
-    // Interleaved rounds, best of each, so neither side pays for going
-    // first.
-    let mut times = [std::time::Duration::MAX; 2];
-    for _ in 0..3 {
-        for (k, s) in [&mut original, &mut rebuilt].into_iter().enumerate() {
-            s.step();
-            s.wait();
-            let start = Instant::now();
-            for _ in 0..10 {
-                s.step();
-            }
-            s.wait();
-            times[k] = times[k].min(start.elapsed());
-        }
-    }
-    let outputs: Vec<Vec<f32>> = [&mut original, &mut rebuilt]
-        .into_iter()
-        .map(|s| {
-            let mut out = vec![0.0f32; graph.node(graph.outputs()[0]).ty.num_elements()];
-            s.read_output_by_index(0, &mut out);
-            out
-        })
-        .collect();
-    assert!(outputs[0].iter().all(|v| v.is_finite()));
-    assert_eq!(
-        outputs[0].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-        outputs[1].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-        "outputs differ"
-    );
-    println!(
-        "smollm2 medium_test, best of 3 x 10 steps: {:.2} ms as written, {:.2} ms decomposed",
-        times[0].as_secs_f64() * 1e3,
-        times[1].as_secs_f64() * 1e3
-    );
 }
 
 /// Recomposition leaves a model written with composites as it is: the

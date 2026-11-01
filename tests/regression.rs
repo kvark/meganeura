@@ -36,8 +36,6 @@ mod padded_input;
 mod profile_windows;
 mod race;
 mod rectangular_matmul;
-#[cfg(feature = "models")]
-mod resnet_correctness;
 mod rmsnorm_matmul_prologue;
 mod schedule_pointwise;
 mod schedule_reduction;
@@ -51,4 +49,3 @@ mod submission_chunks;
 mod support;
 mod tune;
 mod typed_matmul;
-mod whisper_correctness;

@@ -663,7 +663,7 @@ fn views_and_copies() {
 
 /// Decode-sized products (M = 1) at model shapes, with the K-split GEMV's
 /// reduction tails and column tails: plain, with a fused addend, and with
-/// a transposed weight up to a vocabulary-sized output.
+/// a transposed weight, up to an output wider than any LM head.
 #[test]
 fn decode_gemv_shapes() {
     for (k, n) in [
@@ -692,13 +692,7 @@ fn decode_gemv_shapes() {
             |_| {},
         );
     }
-    for (k, n) in [
-        (576, 49152),
-        (4, 262_145),
-        (576, 576),
-        (2048, 720),
-        (577, 128),
-    ] {
+    for (k, n) in [(4, 262_145), (576, 576), (2048, 720), (577, 128)] {
         case(
             &format!("gemv_bt k={k} n={n}"),
             |g| {

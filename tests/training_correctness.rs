@@ -109,153 +109,58 @@ fn smollm2_training_loss_decreases() {
     );
 }
 
-/// Test the inferena weight-loading pattern: build separate inference and training
-/// sessions, load weights into inference session, then copy into training session.
-/// This catches param name/size mismatches between the two sessions.
+/// The inferena weight-loading pattern: weights loaded into an inference
+/// session are copied into a training session by name, so every inference
+/// parameter must exist in the training plan with the same size.
+/// `set_parameter` panics on an unknown name or a size mismatch. The plans
+/// compile on the CPU; the training step itself is covered by the
+/// `*_training_loss_decreases` tests.
 #[test]
-fn smollm2_weight_sharing_inference_to_training() {
-    if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
-        eprintln!("MEGANEURA_SKIP_BACKPROP set — skipping");
-        return;
-    }
+fn inference_parameters_load_into_training() {
+    use meganeura::models::{smollm2, smolvla};
+    use meganeura::{CompileOptions, Mode, OptimizeConfig, compile_plan};
 
-    use meganeura::models::smollm2;
-
-    let config = smollm2::Config::small_test();
-    let seq_len = 8;
-    let vocab = config.vocab_size;
-
-    // Build inference session (forward only)
-    let mut infer_g = Graph::new();
-    let logits = smollm2::build_graph(&mut infer_g, &config, seq_len);
-    infer_g.set_outputs(vec![logits]);
-    let mut infer_session = meganeura::build(&infer_g, crate::support::gpu::inference_config()).0;
-
-    // Build training session (forward + backward + loss)
-    let train_g = smollm2::build_training_graph(&config, seq_len);
-    let mut train_session = meganeura::build(&train_g, crate::support::gpu::config()).0;
-
-    // Initialize inference session with deterministic weights
-    for (name, buf_ref) in infer_session.plan().param_buffers.clone() {
-        let size_bytes = infer_session.plan().buffers[buf_ref.0 as usize];
-        let n = size_bytes / 4;
-        let data: Vec<f32> = (0..n)
-            .map(|i| (i as f32 * 0.01 + 1.0).sin() * 0.1)
-            .collect();
-        infer_session.set_parameter(&name, &data);
-    }
-
-    // Copy weights from inference → training (the inferena pattern)
-    // This should NOT crash — all param names and sizes must match.
-    for (name, buf_ref) in infer_session.plan().param_buffers.clone() {
-        let size_bytes = infer_session.plan().buffers[buf_ref.0 as usize];
-        let n = size_bytes / 4;
-        let mut data = vec![0.0f32; n];
-        infer_session.read_param(&name, &mut data);
-        train_session.set_parameter(&name, &data);
-    }
-
-    // Run forward+backward on training session
-    let token_ids: Vec<u32> = (0..seq_len as u32).map(|i| i % vocab as u32).collect();
-    let mut labels = vec![0.0f32; seq_len * vocab];
-    for i in 0..seq_len {
-        labels[i * vocab + ((i + 1) % vocab)] = 1.0;
-    }
-
-    train_session.set_input_u32("token_ids", &token_ids);
-    train_session.set_input("labels", &labels);
-    train_session.step();
-    train_session.wait();
-
-    let loss = train_session.read_loss();
-    eprintln!("SmolLM2 weight-sharing test: loss = {:.6}", loss);
-    assert!(loss.is_finite() && loss > 0.0, "training loss: {}", loss);
-
-    // Verify gradients exist and are finite
-    assert!(
-        !train_session.plan().param_grad_pairs.is_empty(),
-        "no gradient pairs"
-    );
-    for &(_param_buf, grad_buf) in &train_session.plan().param_grad_pairs {
-        let size = train_session.plan().buffers[grad_buf.0 as usize] / 4;
-        let mut grad = vec![0.0f32; size];
-        train_session.read_buffer(grad_buf, &mut grad);
-        assert!(
-            grad.iter().all(|v| v.is_finite()),
-            "NaN/Inf in gradient buffer {}",
-            grad_buf.0
+    let parameters = |graph: &Graph, mode: Mode| -> Vec<(String, usize)> {
+        let plan = compile_plan(
+            graph,
+            mode,
+            OptimizeConfig::default(),
+            &CompileOptions::default(),
         );
-    }
-}
+        plan.param_buffers
+            .iter()
+            .map(|(name, buf)| (name.clone(), plan.buffers[buf.0 as usize]))
+            .collect()
+    };
 
-/// Same weight-sharing test for SmolVLA.
-#[test]
-fn smolvla_weight_sharing_inference_to_training() {
-    if std::env::var("MEGANEURA_SKIP_BACKPROP").unwrap_or_default() == "1" {
-        eprintln!("MEGANEURA_SKIP_BACKPROP set — skipping");
-        return;
-    }
+    let lm = smollm2::Config::small_test();
+    let mut lm_inference = Graph::new();
+    let logits = smollm2::build_graph(&mut lm_inference, &lm, 8);
+    lm_inference.set_outputs(vec![logits]);
+    let lm_training = smollm2::build_training_graph(&lm, 8);
 
-    use meganeura::models::smolvla;
+    let vla = smolvla::Config::small_test();
+    let mut vla_inference = Graph::new();
+    let pred = smolvla::build_action_expert(&mut vla_inference, &vla, vla.chunk_size, 4);
+    vla_inference.set_outputs(vec![pred]);
+    let vla_training = smolvla::build_action_expert_training(&vla, vla.chunk_size, 4);
 
-    let config = smolvla::Config::small_test();
-    let action_seq_len = config.chunk_size;
-    let vlm_seq_len = 4;
-
-    // Build inference session
-    let mut infer_g = Graph::new();
-    let pred = smolvla::build_action_expert(&mut infer_g, &config, action_seq_len, vlm_seq_len);
-    infer_g.set_outputs(vec![pred]);
-    let mut infer_session = meganeura::build(&infer_g, crate::support::gpu::inference_config()).0;
-
-    // Build training session
-    let train_g = smolvla::build_action_expert_training(&config, action_seq_len, vlm_seq_len);
-    let mut train_session = meganeura::build(&train_g, crate::support::gpu::config()).0;
-
-    // Init inference params
-    for (name, buf_ref) in infer_session.plan().param_buffers.clone() {
-        let n = infer_session.plan().buffers[buf_ref.0 as usize] / 4;
-        let data: Vec<f32> = (0..n)
-            .map(|i| (i as f32 * 0.01 + 1.0).sin() * 0.1)
-            .collect();
-        infer_session.set_parameter(&name, &data);
-    }
-
-    // Copy inference → training
-    for (name, buf_ref) in infer_session.plan().param_buffers.clone() {
-        let n = infer_session.plan().buffers[buf_ref.0 as usize] / 4;
-        let mut data = vec![0.0f32; n];
-        infer_session.read_param(&name, &mut data);
-        train_session.set_parameter(&name, &data);
-    }
-
-    // Run training step
-    let expert_hidden = config.expert.hidden_size;
-    let kv_dim = config.expert.kv_dim();
-    train_session.set_input(
-        "noisy_actions",
-        &vec![0.5f32; action_seq_len * config.max_action_dim],
-    );
-    train_session.set_input("timestep", &vec![0.1f32; expert_hidden * 2]);
-    for i in 0..config.expert.num_layers {
-        if i % config.expert.self_attn_every_n_layers != 0 {
-            train_session.set_input(
-                &format!("vlm_kv_layer_{i}"),
-                &vec![0.1f32; vlm_seq_len * kv_dim],
+    for (what, inference, training) in [
+        ("SmolLM2", &lm_inference, &lm_training),
+        ("SmolVLA", &vla_inference, &vla_training),
+    ] {
+        let training: std::collections::HashMap<_, _> =
+            parameters(training, Mode::Training).into_iter().collect();
+        let inference = parameters(inference, Mode::Inference);
+        assert!(!inference.is_empty(), "{what}: no inference parameters");
+        for (name, bytes) in inference {
+            assert_eq!(
+                training.get(&name),
+                Some(&bytes),
+                "{what}: inference parameter {name} ({bytes} bytes) does not load into training"
             );
         }
     }
-    train_session.set_input(
-        "target_actions",
-        &vec![0.0f32; action_seq_len * config.max_action_dim],
-    );
-
-    train_session.step();
-    train_session.wait();
-
-    let loss = train_session.read_loss();
-    eprintln!("SmolVLA weight-sharing test: loss = {:.6}", loss);
-    assert!(loss.is_finite() && loss > 0.0, "training loss: {}", loss);
 }
 
 // ---------------------------------------------------------------------------
@@ -356,78 +261,6 @@ fn sd_unet_training_loss_decreases() {
         5,
         0.001,
     );
-}
-
-#[test]
-fn smollm2_kv_cache_decode_graph() {
-    use meganeura::models::smollm2;
-
-    let config = smollm2::Config {
-        hidden_size: 64, // One 64-wide head keeps the decode fixture small.
-        num_attention_heads: 1,
-        num_key_value_heads: 1,
-        ..smollm2::Config::small_test()
-    };
-    let max_seq = 16;
-    let _hidden = config.hidden_size;
-    let _kv_dim = config.kv_dim();
-
-    // Build decode graph (single-token with KV cache)
-    let mut g = Graph::new();
-    let (logits, k_caches, v_caches) = smollm2::build_decode_graph(&mut g, &config, max_seq);
-    g.set_outputs(vec![logits]);
-
-    let mut session = meganeura::build(&g, crate::support::gpu::inference_config()).0;
-
-    // Initialize model weights
-    for (name, buf_ref) in session.plan().param_buffers.clone() {
-        let size_bytes = session.plan().buffers[buf_ref.0 as usize];
-        let n = size_bytes / 4;
-        // Skip cache buffers — initialize to zero
-        if name.contains("kv_cache") {
-            session.set_parameter(&name, &vec![0.0f32; n]);
-            continue;
-        }
-        let data: Vec<f32> = (0..n)
-            .map(|i| (i as f32 * 0.01 + 1.0).sin() * 0.1)
-            .collect();
-        session.set_parameter(&name, &data);
-    }
-
-    // Run decode for 4 positions
-    let vocab = config.vocab_size;
-    for pos in 0..4u32 {
-        // Single token input
-        let token_ids = vec![pos % vocab as u32];
-        session.set_input_u32("token_ids", &token_ids);
-        session.set_input_u32("kv_pos", &[pos]);
-
-        // K/V inputs are generated by the graph's matmul projections,
-        // not set externally. We just need token_ids and kv_pos.
-
-        session.step();
-        session.wait();
-
-        let out = session.read_output(vocab);
-        assert_eq!(out.len(), vocab);
-        assert!(
-            out.iter().any(|&v| v.abs() > 1e-10),
-            "pos={}: logits all zero",
-            pos
-        );
-        assert!(
-            out.iter().all(|v| v.is_finite()),
-            "pos={}: logits contain NaN/Inf",
-            pos
-        );
-        eprintln!(
-            "pos={}: logits range [{:.4}, {:.4}]",
-            pos,
-            out.iter().cloned().fold(f32::INFINITY, f32::min),
-            out.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
-        );
-    }
-    let _ = (k_caches, v_caches); // suppress unused warnings
 }
 
 #[test]
