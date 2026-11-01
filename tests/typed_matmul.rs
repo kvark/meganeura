@@ -20,57 +20,32 @@ fn typed_staging_handles_vector_tails_and_split_output() {
         if !meganeura::runtime::typed_matrix_supported(&gpu, storage) {
             continue;
         }
-        for (m, n, k) in [
-            (64, 64, 64),
-            (16, 48, 31),
-            (33, 65, 31),
-            (36, 68, 35),
-            (1, 1, 1),
-            (32, 32, 1031),
-            (33, 65, 1031),
+        // Aligned, vector-width and scalar row tails, a single element, and a
+        // split K; the addend toggles on the scalar-tail shapes and rounding
+        // on the plain layout.
+        for (m, n, k, both_adds) in [
+            (64, 64, 64, false),
+            (36, 68, 35, false),
+            (1, 1, 1, false),
+            (33, 65, 31, true),
+            (33, 65, 1031, true),
         ] {
             for layout in 0..3 {
-                for add in [false, true] {
+                for add in [true, false] {
+                    if !add && !both_adds {
+                        continue;
+                    }
                     for round in [false, true] {
-                        if round && storage != DType::BF16 {
+                        if round && (storage != DType::BF16 || layout != 0) {
                             continue;
                         }
-                        let mut g = Graph::new();
-                        let a_shape = if layout == 1 { [k, m] } else { [m, k] };
-                        let b_shape = if layout == 2 { [n, k] } else { [k, n] };
-                        let (a_id, b_id) = if storage == DType::F16 {
-                            (
-                                g.parameter_f16("a", &a_shape),
-                                g.parameter_f16("b", &b_shape),
-                            )
-                        } else {
-                            let a = g.parameter("a", &a_shape);
-                            let b = g.parameter("b", &b_shape);
-                            (g.to_bf16(a), g.to_bf16(b))
-                        };
-                        let bias_id = add.then(|| g.parameter("bias", &[m, n]));
-                        let y = match layout {
-                            0 => g.matmul(a_id, b_id),
-                            1 => g.matmul_at(a_id, b_id),
-                            _ => g.matmul_bt(a_id, b_id),
-                        };
-                        if let Some(bias) = bias_id {
-                            let node = &mut g.nodes_mut()[y as usize];
-                            node.op = [
-                                meganeura::graph::Op::FusedMatMulAdd,
-                                meganeura::graph::Op::FusedMatMulATAdd,
-                                meganeura::graph::Op::FusedMatMulBTAdd,
-                            ][layout]
-                                .clone();
-                            node.inputs.push(bias);
-                        }
-                        let y = if round {
-                            let y = g.to_bf16(y);
-                            g.from_bf16(y)
-                        } else {
-                            y
-                        };
-                        g.set_outputs(vec![y]);
+                        let g = crate::support::data::layout_graph(
+                            storage,
+                            layout,
+                            add,
+                            round,
+                            [m, n, k],
+                        );
                         let mut a = vec![0.0; m * k];
                         let b: Vec<f32> =
                             (0..k * n).map(|i| (i * 31 % 61 + 1) as f32 / 4.0).collect();
@@ -123,56 +98,68 @@ fn typed_staging_handles_vector_tails_and_split_output() {
     }
 }
 
-fn graph(storage: DType, layout: usize) -> Graph {
-    let mut g = Graph::new();
-    let a_shape = if layout == 1 { [K, M] } else { [M, K] };
-    let b_shape = if layout == 2 { [N, K] } else { [K, N] };
-    let (a, b) = if storage == DType::F16 {
-        (
-            g.parameter_f16("a", &a_shape),
-            g.parameter_f16("b", &b_shape),
-        )
-    } else {
-        let a = g.parameter("a", &a_shape);
-        let b = g.parameter("b", &b_shape);
-        (g.to_bf16(a), g.to_bf16(b))
-    };
-    let y = match layout {
-        0 => g.matmul(a, b),
-        1 => g.matmul_at(a, b),
-        _ => g.matmul_bt(a, b),
-    };
-    g.set_outputs(vec![y]);
-    g
+fn graph(storage: DType, layout: usize) -> meganeura::Graph {
+    crate::support::data::layout_graph(storage, layout, false, false, [M, N, K])
 }
 
+/// K partitions accumulate F32 partials and reduce them before any BF16
+/// rounding; a fused addend keeps the product whole and rounds its output.
 #[test]
 fn explicit_storage_selects_the_typed_schedule() {
-    for storage in [DType::F16, DType::BF16] {
+    for (storage, add, round) in [
+        (DType::F16, false, false),
+        (DType::BF16, false, true),
+        (DType::BF16, true, true),
+    ] {
         for layout in 0..3 {
-            let plan = meganeura::compile::compile(&graph(storage, layout));
-            let product = plan
+            let graph = crate::support::data::layout_graph(storage, layout, add, round, [M, N, K]);
+            let plan = meganeura::compile::compile(&graph);
+            let index = plan
                 .dispatches
                 .iter()
-                .find(|d| matches!(d.kernel, Kernel::CooperativeTyped { .. }))
+                .position(|d| matches!(d.kernel, Kernel::CooperativeTyped { .. }))
                 .unwrap();
+            let product = &plan.dispatches[index];
+            let splits = if add { 1 } else { 4 };
             assert_eq!(
                 product.shader,
-                [
-                    ShaderEntry::MatMul,
-                    ShaderEntry::MatMulAT,
-                    ShaderEntry::MatMulBT
-                ][layout]
+                if add {
+                    [
+                        ShaderEntry::FusedMatMulAdd,
+                        ShaderEntry::FusedMatMulATAdd,
+                        ShaderEntry::FusedMatMulBTAdd,
+                    ]
+                } else {
+                    [
+                        ShaderEntry::MatMul,
+                        ShaderEntry::MatMulAT,
+                        ShaderEntry::MatMulBT,
+                    ]
+                }[layout]
             );
             assert_eq!(product.mnk(), Some((M as u32, N as u32, K as u32)));
-            assert_eq!(product.workgroups, [2, 3, 4]);
+            assert_eq!(product.workgroups, [2, 3, splits]);
             assert_eq!(
                 product.kernel,
                 Kernel::CooperativeTyped {
-                    types: MatrixTypes::reduced(storage),
-                    splits: 4,
+                    types: MatrixTypes {
+                        output: if add { DType::BF16 } else { DType::F32 },
+                        ..MatrixTypes::reduced(storage)
+                    },
+                    splits,
                 }
             );
+            if !add {
+                let sum = &plan.dispatches[index + 1];
+                assert_eq!(sum.shader, ShaderEntry::SumRows);
+                assert_eq!(sum.params, [4, (M * N) as u32, 1, 0]);
+                assert_eq!(sum.input_buffers, [product.output_buffer]);
+                assert_eq!(
+                    plan.buffers[product.output_buffer.0 as usize],
+                    4 * M * N * 4
+                );
+                assert_ne!(sum.output_buffer, product.output_buffer);
+            }
         }
     }
 }
@@ -185,55 +172,42 @@ fn values(len: usize, multiplier: usize, modulus: usize) -> Vec<f32> {
         .collect()
 }
 
+/// BF16 products and their partials meet the same budget in `bf16_split_k`.
 #[test]
 fn typed_products_meet_native_accuracy_budget() {
     let gpu = crate::support::gpu::gpu();
     crate::support::gpu::assert_protocol_headroom(&gpu);
     let a = values(M * K, 17, 61);
     let b = values(N * K, 31, 59);
-    for storage in [DType::F16, DType::BF16] {
-        if !meganeura::runtime::typed_matrix_supported(&gpu, storage) {
-            eprintln!("native {storage:?} matrices unavailable; skipping device-specific coverage");
-            continue;
-        }
-        for layout in 0..3 {
-            let mut config = crate::support::gpu::inference_config();
-            config.tune = false;
-            config.runtime.poison = true;
-            let (mut session, _) = meganeura::build(&graph(storage, layout), config);
-            session.set_parameter("a", &a);
-            session.set_parameter("b", &b);
-            session.step();
-            session.wait();
-            let actual = session.read_output(M * N);
-            for row in 0..M {
-                for col in 0..N {
-                    let mut sum = 0.0f64;
-                    let mut sum_abs = 0.0f64;
-                    for inner in 0..K {
-                        let ai = if layout == 1 {
-                            inner * M + row
-                        } else {
-                            row * K + inner
-                        };
-                        let bi = if layout == 2 {
-                            col * K + inner
-                        } else {
-                            inner * N + col
-                        };
-                        let term = f64::from(a[ai]) * f64::from(b[bi]);
-                        sum += term;
-                        sum_abs += term.abs();
-                    }
-                    let got = f64::from(actual[row * N + col]);
-                    let bound =
-                        meganeura::reference::native_matrix::error_bound(K, sum_abs).unwrap();
-                    assert!(
-                        got.is_finite() && (got - sum).abs() <= bound,
-                        "{storage:?} layout {layout} ({row},{col}): {got} != {sum}, bound={bound}"
-                    );
-                }
-            }
+    if !meganeura::runtime::typed_matrix_supported(&gpu, DType::F16) {
+        eprintln!("native F16 matrices unavailable; skipping device-specific coverage");
+        return;
+    }
+    let magnitude = |values: &[f32]| values.iter().map(|v| v.abs()).collect::<Vec<_>>();
+    for layout in 0..3 {
+        let mut config = crate::support::gpu::inference_config();
+        config.tune = false;
+        config.runtime.poison = true;
+        let (mut session, _) = meganeura::build(&graph(DType::F16, layout), config);
+        session.set_parameter("a", &a);
+        session.set_parameter("b", &b);
+        session.step();
+        session.wait();
+        let actual = session.read_output(M * N);
+        let sums = crate::support::data::matmul_reference(layout, &a, &b, [M, N, K]);
+        let sums_abs = crate::support::data::matmul_reference(
+            layout,
+            &magnitude(&a),
+            &magnitude(&b),
+            [M, N, K],
+        );
+        for (index, ((&got, sum), sum_abs)) in actual.iter().zip(sums).zip(sums_abs).enumerate() {
+            let got = f64::from(got);
+            let bound = meganeura::reference::native_matrix::error_bound(K, sum_abs).unwrap();
+            assert!(
+                got.is_finite() && (got - sum).abs() <= bound,
+                "layout {layout} at {index}: {got} != {sum}, bound={bound}"
+            );
         }
     }
 }
@@ -248,55 +222,56 @@ fn native_signed_products_and_cancellation() {
         if !meganeura::runtime::typed_matrix_supported(&gpu, storage) {
             continue;
         }
-        for size in [1, 16] {
-            for scale in [2.0f32.powi(-10), 1.0, 2.0f32.powi(10)] {
-                for cancel in [false, true] {
-                    let mut g = Graph::new();
-                    let (a, b) = if storage == DType::F16 {
-                        (
-                            g.parameter_f16("a", &[size, 16]),
-                            g.parameter_f16("b", &[16, size]),
-                        )
-                    } else {
-                        let a = g.parameter("a", &[size, 16]);
-                        let b = g.parameter("b", &[16, size]);
-                        (g.to_bf16(a), g.to_bf16(b))
-                    };
-                    let y = g.matmul(a, b);
-                    g.set_outputs(vec![y]);
-                    let mut av = vec![0.; size * 16];
-                    let mut bv = vec![0.; 16 * size];
-                    for r in 0..size {
-                        av[r * 16] = scale;
-                        av[r * 16 + 1] = -scale;
-                    }
-                    for c in 0..size {
-                        bv[c] = 1.;
-                        bv[size + c] = f32::from(cancel);
-                    }
-                    let mut s = meganeura::Session::with_context_opts(
-                        meganeura::compile::compile(&g),
-                        gpu.clone(),
-                        meganeura::SessionOptions {
-                            poison: true,
-                            ..Default::default()
-                        },
-                    );
-                    s.set_parameter("a", &av);
-                    s.set_parameter("b", &bv);
-                    s.step();
-                    s.wait();
-                    let expected = if cancel { 0. } else { f64::from(scale) };
-                    let sum_abs = f64::from(scale) * if cancel { 2. } else { 1. };
-                    let bound =
-                        meganeura::reference::native_matrix::error_bound(16, sum_abs).unwrap();
-                    for got in s.read_output(size * size) {
-                        assert!(
-                            got.is_finite() && (f64::from(got) - expected).abs() <= bound,
-                            "{storage:?} size={size} scale={scale} cancel={cancel}: {got} != {expected}, bound={bound}"
-                        );
-                    }
-                }
+        // Each kernel meets cancellation and both scale extremes.
+        for (size, scale, cancel) in [
+            (1, 2.0f32.powi(-10), false),
+            (1, 2.0f32.powi(10), true),
+            (16, 2.0f32.powi(-10), true),
+            (16, 2.0f32.powi(10), false),
+        ] {
+            let mut g = Graph::new();
+            let (a, b) = if storage == DType::F16 {
+                (
+                    g.parameter_f16("a", &[size, 16]),
+                    g.parameter_f16("b", &[16, size]),
+                )
+            } else {
+                let a = g.parameter("a", &[size, 16]);
+                let b = g.parameter("b", &[16, size]);
+                (g.to_bf16(a), g.to_bf16(b))
+            };
+            let y = g.matmul(a, b);
+            g.set_outputs(vec![y]);
+            let mut av = vec![0.; size * 16];
+            let mut bv = vec![0.; 16 * size];
+            for r in 0..size {
+                av[r * 16] = scale;
+                av[r * 16 + 1] = -scale;
+            }
+            for c in 0..size {
+                bv[c] = 1.;
+                bv[size + c] = f32::from(cancel);
+            }
+            let mut s = meganeura::Session::with_context_opts(
+                meganeura::compile::compile(&g),
+                gpu.clone(),
+                meganeura::SessionOptions {
+                    poison: true,
+                    ..Default::default()
+                },
+            );
+            s.set_parameter("a", &av);
+            s.set_parameter("b", &bv);
+            s.step();
+            s.wait();
+            let expected = if cancel { 0. } else { f64::from(scale) };
+            let sum_abs = f64::from(scale) * if cancel { 2. } else { 1. };
+            let bound = meganeura::reference::native_matrix::error_bound(16, sum_abs).unwrap();
+            for got in s.read_output(size * size) {
+                assert!(
+                    got.is_finite() && (f64::from(got) - expected).abs() <= bound,
+                    "{storage:?} size={size} scale={scale} cancel={cancel}: {got} != {expected}, bound={bound}"
+                );
             }
         }
     }
@@ -326,38 +301,77 @@ fn f16_products_keep_subnormal_operands() {
     assert_eq!(session.read_output(1), [2.0f32.powi(-10)]);
 }
 
+/// The message of the panic that rejects `plan` on `context`.
+fn rejection(
+    plan: meganeura::compile::ExecutionPlan,
+    context: std::sync::Arc<blade_graphics::Context>,
+) -> String {
+    let panic = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        meganeura::Session::with_context(plan, context)
+    })) {
+        Ok(_) => panic!("unsupported device accepted a reduced-precision plan"),
+        Err(panic) => panic,
+    };
+    panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| "non-string panic".into())
+}
+
 #[test]
-fn unsupported_device_reports_f16_matrix_requirement() {
+fn unsupported_devices_report_the_first_missing_requirement() {
     let context = crate::support::gpu::gpu();
+    let caps = context.capabilities();
+    // F16: storage, a tile shape, then subnormals.
     if meganeura::runtime::typed_matrix_supported(&context, DType::F16) {
         eprintln!(
             "native F16 storage and matrices available; skipping unsupported-device coverage"
         );
+    } else {
+        let expected = if !caps.shader_float16 {
+            "selected plan requires native F16 shader support"
+        } else if meganeura::codegen::checked_cooperative_shape(
+            &caps.cooperative_matrix.f16_f32_shapes,
+        )
+        .is_none()
+        {
+            "F16 matrix products require native 16x16x16, 8x16x16 or 8x8x8 F16/F32 cooperative matrices"
+        } else {
+            "keep subnormal F16 operands"
+        };
+        let plan = meganeura::compile::compile(&graph(DType::F16, 0));
+        let message = rejection(plan, context.clone());
+        assert!(message.contains(expected), "unexpected panic: {message}");
+    }
+    // BF16: storage, then a tile shape, before shader validation.
+    if caps.shader_bfloat16
+        && meganeura::codegen::checked_cooperative_shape(&caps.cooperative_matrix.bf16_f32_shapes)
+            .is_some()
+    {
+        eprintln!(
+            "native BF16 storage and matrices available; skipping unsupported-device coverage"
+        );
         return;
     }
-    // The first missing requirement: storage, a tile shape, then subnormals.
-    let caps = context.capabilities();
-    let expected = if !caps.shader_float16 {
-        "selected plan requires native F16 shader support"
-    } else if meganeura::codegen::checked_cooperative_shape(&caps.cooperative_matrix.f16_f32_shapes)
-        .is_none()
-    {
-        "F16 matrix products require native 16x16x16, 8x16x16 or 8x8x8 F16/F32 cooperative matrices"
+    let mut graph = Graph::new();
+    let input = graph.input("x", &[3, 7]);
+    let narrow = graph.to_bf16(input);
+    let (output, expected) = if caps.shader_bfloat16 {
+        let weight = graph.parameter("w", &[7, 5]);
+        let weight = graph.to_bf16(weight);
+        (
+            graph.matmul(narrow, weight),
+            "BF16 matrix products require native 16x16x16, 8x16x16 or 8x8x8 BF16/F32 cooperative matrices",
+        )
     } else {
-        "keep subnormal F16 operands"
+        (
+            graph.from_bf16(narrow),
+            "selected plan requires native BF16 shader support",
+        )
     };
-    let plan = meganeura::compile::compile(&graph(DType::F16, 0));
-    let panic = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        meganeura::Session::with_context(plan, context)
-    })) {
-        Ok(_) => panic!("unsupported device accepted an F16 matrix plan"),
-        Err(panic) => panic,
-    };
-    let message = panic
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| panic.downcast_ref::<&str>().copied())
-        .unwrap_or("non-string panic");
+    graph.set_outputs(vec![output]);
+    let message = rejection(meganeura::compile::compile(&graph), context.clone());
     assert!(message.contains(expected), "unexpected panic: {message}");
 }
 

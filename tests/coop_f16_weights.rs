@@ -2,6 +2,7 @@
 //! transposed-B products must match an f64 reference that uses the same
 //! f16-rounded weights, and select cooperative kernels on supported hardware.
 
+use crate::support::data::relative_l2;
 use meganeura::{CoopPolicy, Graph, Session};
 
 // Enough output tiles for automatic f16 promotion, with partial M/K tiles and
@@ -64,16 +65,6 @@ fn reference(transposed: bool, x: &[f32], w: &[f32]) -> Vec<f32> {
         }
     }
     out
-}
-
-fn relative_l2(got: &[f32], want: &[f32]) -> f64 {
-    let num: f64 = got
-        .iter()
-        .zip(want)
-        .map(|(&a, &b)| f64::from(a - b).powi(2))
-        .sum();
-    let den: f64 = want.iter().map(|&b| f64::from(b).powi(2)).sum();
-    (num / den.max(f64::EPSILON)).sqrt()
 }
 
 #[test]

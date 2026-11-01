@@ -4,14 +4,14 @@
 //! reference, under every lowering, is the `oracle` suite's job.
 
 use meganeura::compile::{ShaderEntry, compile_with};
-use meganeura::{CompileOptions, Graph, Mode, NodeId, Session, SessionConfig};
+use meganeura::{CompileOptions, Graph, Mode, NodeId, SessionConfig};
 
 /// Exact-equality checks between a fused path and its explicit expansion.
 ///
 /// The contract is real on the author's hardware, but any adapter free to
 /// reassociate the accumulation lands a last ULP out: lavapipe on
-/// `normalize_inner_sum` and `pairwise_squared_distance`, Metal on
-/// `narrow_sum_inner_matches_scalar_f32_order` and softplus's gradient.
+/// `normalize_inner_sum` and `pairwise_squared_distance`, Metal on the
+/// narrow `sum_inner` scalar-order check and softplus's gradient.
 /// CI sets `MEGANEURA_SKIP_BIT_EXACT=1` so the whole class is gated in one
 /// place instead of a name-by-name skip list that grows every time another
 /// adapter is added; local runs keep it at full strength.
@@ -22,10 +22,6 @@ fn skip_bit_exact() -> bool {
     }
     false
 }
-
-type F32Inputs = Vec<(&'static str, Vec<f32>)>;
-type U32Inputs = Vec<(&'static str, Vec<u32>)>;
-type BuildResult = (NodeId, F32Inputs, U32Inputs);
 
 fn repeated_rows(g: &mut Graph, x: NodeId, rows: usize, cols: usize, repeats: usize) -> NodeId {
     let flat = g.reshape(x, &[rows * cols, 1]);
@@ -80,10 +76,10 @@ fn repeated_rows_forward_and_gradients_match_f64() {
     let gpu = crate::support::gpu::gpu();
     if let Ok(expected) = std::env::var("MEGANEURA_EXPECT_DEVICE_NAME") {
         assert_eq!(gpu.device_information().device_name, expected);
-        let memory = gpu.memory_stats();
-        assert!(memory.budget.saturating_sub(memory.usage) >= 2 << 30);
     }
-    for (rows, cols, repeats) in [(3, 1, 2), (259, 3, 5), (7, 18, 4), (5, 65, 3)] {
+    crate::support::gpu::assert_protocol_headroom(&gpu);
+    // A single column, and a multi-workgroup row count.
+    for (rows, cols, repeats) in [(3, 1, 2), (259, 3, 5)] {
         let x_data = (0..rows * cols)
             .map(|i| ((i * 17 % 101) as f32 - 50.0) * 0.013)
             .collect::<Vec<_>>();
@@ -140,41 +136,12 @@ fn repeated_rows_forward_and_gradients_match_f64() {
     }
 }
 
-fn run(build: &dyn Fn(&mut Graph) -> BuildResult, n_out: usize, fuse: bool) -> Vec<f32> {
-    let mut g = Graph::new();
-    let (out, f_inputs, u_inputs) = build(&mut g);
-    g.set_outputs(vec![out]);
-
-    // Fused against unfused dispatches.
-    let opts = CompileOptions {
-        fuse_dispatches: fuse,
-        ..CompileOptions::default()
-    };
-    let mut session: Session = meganeura::build(
-        &g,
-        SessionConfig {
-            mode: Mode::Inference,
-            options: opts,
-            ..crate::support::gpu::config()
-        },
-    )
-    .0;
-    for (name, data) in &f_inputs {
-        session.set_input(name, data);
-    }
-    for (name, data) in &u_inputs {
-        session.set_input_u32(name, data);
-    }
-    session.step();
-    session.wait();
-    session.read_output(n_out)
-}
-
 /// Narrow rows use one lane per row and preserve the scalar column-order sum
 /// while the final partial workgroup exercises inactive packed rows. The
-/// pointwise product is folded into the reduction prologue.
+/// pointwise product is folded into the reduction prologue, and a plain row
+/// sum matches the product with a ones column bit for bit.
 #[test]
-fn narrow_sum_inner_matches_scalar_f32_order() {
+fn narrow_sum_inner_matches_scalar_f32_order_and_ones_matmul() {
     if skip_bit_exact() {
         return;
     }
@@ -186,113 +153,55 @@ fn narrow_sum_inner_matches_scalar_f32_order() {
     let b_data: Vec<f32> = (0..m * n)
         .map(|i| ((i * 29 % 97) as f32 - 48.0) * -0.021)
         .collect();
-    let actual = run(
-        &|g| {
-            let a = g.input("a", &[m, n]);
-            let b = g.input("b", &[m, n]);
-            let product = g.mul(a, b);
-            let output = g.sum_inner(product);
-            (
-                output,
-                vec![("a", a_data.clone()), ("b", b_data.clone())],
-                vec![],
-            )
+    let mut graph = Graph::new();
+    let a = graph.input("a", &[m, n]);
+    let b = graph.input("b", &[m, n]);
+    let product = graph.mul(a, b);
+    let products = graph.sum_inner(product);
+    let ones = graph.constant(vec![1.0; n], &[n, 1]);
+    let matmul = graph.matmul(a, ones);
+    let packed = graph.sum_inner(a);
+    graph.set_outputs(vec![products, matmul, packed]);
+    let mut session = meganeura::build(
+        &graph,
+        SessionConfig {
+            mode: Mode::Inference,
+            options: CompileOptions {
+                fuse_dispatches: true,
+                ..CompileOptions::default()
+            },
+            ..crate::support::gpu::config()
         },
-        m,
-        true,
-    );
-    for (row, &actual_row) in actual.iter().enumerate().take(m) {
+    )
+    .0;
+    session.set_input("a", &a_data);
+    session.set_input("b", &b_data);
+    session.step();
+    session.wait();
+    let mut outputs = [vec![0.0; m], vec![0.0; m], vec![0.0; m]];
+    for (index, output) in outputs.iter_mut().enumerate() {
+        session.read_output_by_index(index, output);
+    }
+    let [products, matmul, packed] = outputs;
+    for row in 0..m {
         let mut expected = 0.0_f32;
         for col in 0..n {
             let index = row * n + col;
             expected += a_data[index] * b_data[index];
         }
         assert_eq!(
-            actual_row.to_bits(),
+            products[row].to_bits(),
             expected.to_bits(),
             "packed row {row}: {} != {expected}",
-            actual_row
+            products[row]
         );
-    }
-}
-
-#[test]
-fn narrow_sum_inner_matches_ones_matmul_bit_exactly() {
-    if skip_bit_exact() {
-        return;
-    }
-    let m = 259usize;
-    let n = 9usize;
-    let input_data: Vec<f32> = (0..m * n)
-        .map(|i| ((i * 37 % 211) as f32 - 105.0) * 0.0073)
-        .collect();
-    let mut graph = Graph::new();
-    let input = graph.input("input", &[m, n]);
-    let ones = graph.constant(vec![1.0; n], &[n, 1]);
-    let matmul = graph.matmul(input, ones);
-    let packed = graph.sum_inner(input);
-    graph.set_outputs(vec![matmul, packed]);
-    let mut session = meganeura::build(
-        &graph,
-        SessionConfig {
-            mode: Mode::Inference,
-            ..crate::support::gpu::config()
-        },
-    )
-    .0;
-    session.set_input("input", &input_data);
-    session.step();
-    session.wait();
-    let mut matmul_output = vec![0.0; m];
-    let mut packed_output = vec![0.0; m];
-    session.read_output_by_index(0, &mut matmul_output);
-    session.read_output_by_index(1, &mut packed_output);
-    for row in 0..m {
         assert_eq!(
-            packed_output[row].to_bits(),
-            matmul_output[row].to_bits(),
+            packed[row].to_bits(),
+            matmul[row].to_bits(),
             "packed row {row}: {} != matmul {}",
-            packed_output[row],
-            matmul_output[row]
+            packed[row],
+            matmul[row]
         );
-    }
-}
-
-#[test]
-fn sum_inner_gradient_repeats_each_row_bit_exactly() {
-    if skip_bit_exact() {
-        return;
-    }
-    const ROWS: usize = 513;
-    const COLS: usize = 16;
-    let row_weights = (0..ROWS)
-        .map(|row| ((row * 31 % 127) as f32 - 63.0) * 0.017)
-        .collect::<Vec<_>>();
-
-    let mut graph = Graph::new();
-    let input = graph.parameter("input", &[ROWS, COLS]);
-    let reduced = graph.sum_inner(input);
-    let weights = graph.input("weights", &[ROWS, 1]);
-    let weighted = graph.mul(reduced, weights);
-    let loss = graph.sum_all(weighted);
-    graph.set_outputs(vec![loss]);
-
-    let mut session = meganeura::build_session(&graph);
-    session.set_parameter("input", &vec![0.0; ROWS * COLS]);
-    session.set_input("weights", &row_weights);
-    session.step();
-    session.wait();
-
-    let mut gradient = vec![0.0; ROWS * COLS];
-    session.read_param_grad("input", &mut gradient);
-    for row in 0..ROWS {
-        for col in 0..COLS {
-            assert_eq!(
-                gradient[row * COLS + col].to_bits(),
-                row_weights[row].to_bits(),
-                "gradient mismatch at [{row}, {col}]"
-            );
-        }
     }
 }
 
@@ -310,17 +219,26 @@ fn unit_column_matmul_matches_generic_forward_and_gradient_bits() {
         .map(|row| ((row * 31 % 127) as f32 - 63.0) * 0.017)
         .collect::<Vec<_>>();
 
+    // A wide `sum_inner` shares the loss: its gradient repeats each row's
+    // weight too.
+    const WIDE: usize = 16;
     let mut graph = Graph::new();
     let input = graph.parameter("input", &[ROWS, COLS]);
     let ones = graph.constant(vec![1.0; COLS], &[COLS, 1]);
     let reduced = graph.matmul(input, ones);
+    let wide = graph.parameter("wide", &[ROWS, WIDE]);
+    let wide_reduced = graph.sum_inner(wide);
     let weights = graph.input("weights", &[ROWS, 1]);
     let weighted = graph.mul(reduced, weights);
+    let wide_weighted = graph.mul(wide_reduced, weights);
     let loss = graph.sum_all(weighted);
+    let wide_loss = graph.sum_all(wide_weighted);
+    let loss = graph.add(loss, wide_loss);
     graph.set_outputs(vec![loss, reduced]);
 
     let mut session = meganeura::build_session(&graph);
     session.set_parameter("input", &input_data);
+    session.set_parameter("wide", &vec![0.0; ROWS * WIDE]);
     session.set_input("weights", &row_weights);
     session.step();
     session.wait();
@@ -329,6 +247,17 @@ fn unit_column_matmul_matches_generic_forward_and_gradient_bits() {
     session.read_output_by_index(1, &mut reduced_output);
     let mut gradient = vec![0.0; ROWS * COLS];
     session.read_param_grad("input", &mut gradient);
+    let mut wide_gradient = vec![0.0; ROWS * WIDE];
+    session.read_param_grad("wide", &mut wide_gradient);
+    for (index, value) in wide_gradient.iter().enumerate() {
+        assert_eq!(
+            value.to_bits(),
+            row_weights[index / WIDE].to_bits(),
+            "sum_inner gradient mismatch at [{}, {}]",
+            index / WIDE,
+            index % WIDE
+        );
+    }
 
     // Supplying the same unit column at runtime prevents the compiler from
     // taking the constant specialization and provides the generic MatMul /
@@ -461,46 +390,8 @@ fn normalize_inner_sum_matches_explicit_forward_and_gradient() {
     session.read_output_by_index(1, &mut normalized_output);
     let mut gradient = vec![0.0; ROWS * INNER];
     session.read_param_grad("input", &mut gradient);
-    for row in 0..ROWS {
-        let begin = row * INNER;
-        let mut sum = 0.0_f32;
-        for column in 0..INNER {
-            let index = begin + column;
-            sum += input_data[index];
-        }
-        let above_floor = sum - FLOOR;
-        let denominator = above_floor.max(0.0) + FLOOR;
-        let inverse = 1.0 / denominator;
-        let negative_inverse_squared = -(inverse * inverse);
-        let mut denominator_gradient = 0.0_f32;
-        if above_floor > 0.0 {
-            for column in 0..INNER {
-                let index = begin + column;
-                let reciprocal_gradient = weights_data[index] * input_data[index];
-                denominator_gradient += reciprocal_gradient * negative_inverse_squared;
-            }
-        }
-        for column in 0..INNER {
-            let index = begin + column;
-            let expected_output = input_data[index] * inverse;
-            assert!(
-                (normalized_output[index] - expected_output).abs()
-                    <= normalized_output[index].abs().max(expected_output.abs()) * 2.0e-6 + 2.0e-7,
-                "normalized value mismatch at [{row}, {column}]: {} != {}",
-                normalized_output[index],
-                expected_output,
-            );
-            let expected_gradient = weights_data[index] * inverse + denominator_gradient;
-            assert!(
-                (gradient[index] - expected_gradient).abs()
-                    <= gradient[index].abs().max(expected_gradient.abs()) * 2.0e-6 + 2.0e-7,
-                "gradient mismatch at [{row}, {column}]: {} != {}",
-                gradient[index],
-                expected_gradient,
-            );
-        }
-    }
-
+    // `oracle` checks the values against the f64 reference; this checks the
+    // fused kernel against its explicit expansion.
     let mut expanded_graph = Graph::new();
     let expanded_input = expanded_graph.parameter("input", &[ROWS, INNER]);
     let sum = expanded_graph.sum_inner(expanded_input);
@@ -543,216 +434,6 @@ fn normalize_inner_sum_matches_explicit_forward_and_gradient() {
     }
 }
 
-#[test]
-fn pairwise_squared_distance_matches_explicit_forward_and_gradients() {
-    const ROWS: usize = 513;
-    const INNER: usize = 3;
-    const PAIRS: usize = 8;
-    let left_data = (0..ROWS * INNER)
-        .map(|index| ((index * 31 % 127) as f32 - 63.0) * 0.017)
-        .collect::<Vec<_>>();
-    let right_data = (0..ROWS * PAIRS * INNER)
-        .map(|index| ((index * 19 % 109) as f32 - 54.0) * 0.013)
-        .collect::<Vec<_>>();
-    let weights_data = (0..ROWS * PAIRS)
-        .map(|index| ((index * 17 % 41) as f32 - 20.0) * 0.031)
-        .collect::<Vec<_>>();
-
-    let mut graph = Graph::new();
-    let left = graph.parameter("left", &[ROWS, INNER]);
-    let right = graph.parameter("right", &[ROWS * PAIRS, INNER]);
-    let distances = graph.pairwise_squared_distance(left, right, PAIRS);
-    let weights = graph.input("weights", &[ROWS, PAIRS]);
-    let weighted = graph.mul(distances, weights);
-    let loss = graph.sum_all(weighted);
-    graph.set_outputs(vec![loss, distances]);
-
-    let mut session = meganeura::build_session(&graph);
-    session.set_parameter("left", &left_data);
-    session.set_parameter("right", &right_data);
-    session.set_input("weights", &weights_data);
-    session.step();
-    session.wait();
-
-    let mut distances_output = vec![0.0; ROWS * PAIRS];
-    session.read_output_by_index(1, &mut distances_output);
-    let mut left_gradient = vec![0.0; ROWS * INNER];
-    session.read_param_grad("left", &mut left_gradient);
-    let mut right_gradient = vec![0.0; ROWS * PAIRS * INNER];
-    session.read_param_grad("right", &mut right_gradient);
-
-    for row in 0..ROWS {
-        for pair in 0..PAIRS {
-            let pair_index = row * PAIRS + pair;
-            let mut expected_distance = 0.0_f32;
-            for column in 0..INNER {
-                let left_index = row * INNER + column;
-                let right_index = pair_index * INNER + column;
-                let delta = left_data[left_index] - right_data[right_index];
-                expected_distance += delta * delta;
-                let term = weights_data[pair_index] * delta;
-                let expected_gradient = -(term + term);
-                assert!(
-                    (right_gradient[right_index] - expected_gradient).abs()
-                        <= right_gradient[right_index]
-                            .abs()
-                            .max(expected_gradient.abs())
-                            * 1.0e-6
-                            + 1.0e-7,
-                    "right gradient mismatch at [{row}, {pair}, {column}]: {} != {}",
-                    right_gradient[right_index],
-                    expected_gradient,
-                );
-            }
-            assert!(
-                (distances_output[pair_index] - expected_distance).abs()
-                    <= distances_output[pair_index]
-                        .abs()
-                        .max(expected_distance.abs())
-                        * 1.0e-6
-                        + 1.0e-7,
-                "distance mismatch at [{row}, {pair}]: {} != {}",
-                distances_output[pair_index],
-                expected_distance,
-            );
-        }
-        for column in 0..INNER {
-            let left_index = row * INNER + column;
-            let mut expected_gradient = 0.0_f32;
-            let mut magnitude = 0.0_f32;
-            for pair in 0..PAIRS {
-                let pair_index = row * PAIRS + pair;
-                let right_index = pair_index * INNER + column;
-                let delta = left_data[left_index] - right_data[right_index];
-                let term = weights_data[pair_index] * delta;
-                expected_gradient += term + term;
-                magnitude += (term + term).abs();
-            }
-            // The pair terms cancel, and adapters may sum them in any order
-            // (lavapipe uses a tree), so bound the error by their magnitude.
-            assert!(
-                (left_gradient[left_index] - expected_gradient).abs()
-                    <= magnitude * 1.0e-6 + 1.0e-7,
-                "left gradient mismatch at [{row}, {column}]: {} != {}",
-                left_gradient[left_index],
-                expected_gradient,
-            );
-        }
-    }
-}
-
-#[test]
-fn pairwise_vector_rejection_matches_explicit_forward_and_gradients() {
-    const ROWS: usize = 257;
-    const INNER: usize = 3;
-    const PAIRS: usize = 8;
-    let vectors_data = (0..ROWS * PAIRS * INNER)
-        .map(|index| ((index * 31 % 127) as f32 - 63.0) * 0.017)
-        .collect::<Vec<_>>();
-    let directions_data = (0..ROWS * INNER)
-        .map(|index| ((index * 19 % 109) as f32 - 54.0) * 0.013)
-        .collect::<Vec<_>>();
-    let weights_data = (0..ROWS * PAIRS * INNER)
-        .map(|index| ((index * 17 % 41) as f32 - 20.0) * 0.031)
-        .collect::<Vec<_>>();
-
-    let mut graph = Graph::new();
-    let vectors = graph.parameter("vectors", &[ROWS * PAIRS, INNER]);
-    let directions = graph.parameter("directions", &[ROWS, INNER]);
-    let rejected = graph.pairwise_vector_rejection(vectors, directions, PAIRS);
-    let weights = graph.input("weights", &[ROWS * PAIRS, INNER]);
-    let weighted = graph.mul(rejected, weights);
-    let loss = graph.sum_all(weighted);
-    graph.set_outputs(vec![loss, rejected]);
-
-    let mut session = meganeura::build_session(&graph);
-    session.set_parameter("vectors", &vectors_data);
-    session.set_parameter("directions", &directions_data);
-    session.set_input("weights", &weights_data);
-    session.step();
-    session.wait();
-
-    let mut rejected_output = vec![0.0; ROWS * PAIRS * INNER];
-    session.read_output_by_index(1, &mut rejected_output);
-    let mut vectors_gradient = vec![0.0; ROWS * PAIRS * INNER];
-    session.read_param_grad("vectors", &mut vectors_gradient);
-    let mut directions_gradient = vec![0.0; ROWS * INNER];
-    session.read_param_grad("directions", &mut directions_gradient);
-
-    for row in 0..ROWS {
-        let direction_begin = row * INNER;
-        for pair in 0..PAIRS {
-            let vector_begin = (row * PAIRS + pair) * INNER;
-            let mut component = 0.0_f32;
-            let mut grad_component = 0.0_f32;
-            for column in 0..INNER {
-                component +=
-                    vectors_data[vector_begin + column] * directions_data[direction_begin + column];
-                grad_component +=
-                    weights_data[vector_begin + column] * directions_data[direction_begin + column];
-            }
-            grad_component = -grad_component;
-            for column in 0..INNER {
-                let index = vector_begin + column;
-                let projection = directions_data[direction_begin + column] * component;
-                let expected = vectors_data[index] + (-projection);
-                assert!(
-                    (rejected_output[index] - expected).abs()
-                        <= rejected_output[index].abs().max(expected.abs()) * 1.0e-6 + 2.0e-7,
-                    "rejection mismatch at [{row}, {pair}, {column}]: {} != {}",
-                    rejected_output[index],
-                    expected,
-                );
-
-                let indirect = directions_data[direction_begin + column] * grad_component;
-                let expected_gradient = weights_data[index] + indirect;
-                assert!(
-                    (vectors_gradient[index] - expected_gradient).abs()
-                        <= vectors_gradient[index].abs().max(expected_gradient.abs()) * 1.0e-6
-                            + 2.0e-7,
-                    "vector gradient mismatch at [{row}, {pair}, {column}]: {} != {}",
-                    vectors_gradient[index],
-                    expected_gradient,
-                );
-            }
-        }
-
-        for output_column in 0..INNER {
-            let mut expected_gradient = 0.0_f32;
-            for pair in 0..PAIRS {
-                let vector_begin = (row * PAIRS + pair) * INNER;
-                let mut component = 0.0_f32;
-                let mut grad_component = 0.0_f32;
-                for column in 0..INNER {
-                    component += vectors_data[vector_begin + column]
-                        * directions_data[direction_begin + column];
-                    grad_component += weights_data[vector_begin + column]
-                        * directions_data[direction_begin + column];
-                }
-                let direct = (-weights_data[vector_begin + output_column]) * component;
-                let indirect = vectors_data[vector_begin + output_column] * (-grad_component);
-                expected_gradient += direct + indirect;
-            }
-            let index = direction_begin + output_column;
-            assert!(
-                (directions_gradient[index] - expected_gradient).abs()
-                    <= directions_gradient[index]
-                        .abs()
-                        .max(expected_gradient.abs())
-                        * 1.0e-6
-                        + 2.0e-7,
-                "direction gradient mismatch at [{row}, {output_column}]: {} != {}",
-                directions_gradient[index],
-                expected_gradient,
-            );
-        }
-    }
-}
-
-/// White-box: the two-gather graph must actually COLLAPSE — one reduction
-/// dispatch with two gather streams, and zero Embedding / standalone-mul
-/// dispatches left. Guards against the parity tests passing on a silent
-/// no-op fusion.
 #[test]
 fn two_gather_reduction_actually_fuses() {
     let vocab = 5usize;

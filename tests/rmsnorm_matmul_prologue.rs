@@ -2,6 +2,7 @@
 //! prologue fusion. Ineligible matmuls must remain scalar, while eligible
 //! matmuls must preserve the rsqrt dependency and observe parameter updates.
 
+use crate::support::data::relative_l2;
 use meganeura::{CoopPolicy, Graph, Session};
 
 const ROWS: usize = 64;
@@ -46,19 +47,6 @@ fn run(
     let mut output = vec![0.0; ROWS * COLS];
     session.read_output_by_index(output_index, &mut output);
     output
-}
-
-fn relative_l2(got: &[f32], reference: &[f32]) -> f64 {
-    let error_sq = got
-        .iter()
-        .zip(reference)
-        .map(|(&a, &b)| f64::from(a - b).powi(2))
-        .sum::<f64>();
-    let reference_sq = reference
-        .iter()
-        .map(|&value| f64::from(value).powi(2))
-        .sum::<f64>();
-    (error_sq / reference_sq.max(f64::EPSILON)).sqrt()
 }
 
 #[test]

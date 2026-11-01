@@ -86,24 +86,6 @@ fn run(
     (gradients, uses_coop)
 }
 
-fn assert_close(label: &str, scalar: &[f32], cooperative: &[f32]) {
-    let max_abs = scalar
-        .iter()
-        .zip(cooperative)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0_f32, f32::max);
-    let scale = scalar
-        .iter()
-        .map(|value| value.abs())
-        .fold(0.0_f32, f32::max)
-        .max(1e-6);
-    assert!(
-        max_abs / scale < 0.02,
-        "{label}: cooperative gradient differs from scalar by {:.3}% (max abs {max_abs:.3e})",
-        max_abs / scale * 100.0,
-    );
-}
-
 #[test]
 fn short_cross_self_and_window_attention_gradients_match_scalar() {
     let gpu = crate::support::gpu::gpu();
@@ -113,11 +95,11 @@ fn short_cross_self_and_window_attention_gradients_match_scalar() {
         .f16_f32_shapes
         .contains(&[16, 16, 16]);
 
-    // Minimum workgroup storage for forward, dQ, dK/dV at each width.
-    // Wide heads must exercise scalar fallback even on cooperative hardware.
+    // Minimum workgroup storage for forward, dQ, dK/dV at each width. The
+    // window case covers equal query and key lengths. Wide heads must
+    // exercise scalar fallback even on cooperative hardware.
     for (label, q_seq, kv_seq, window, head_dim, storage) in [
         ("cross", 50, 16, 0, 64, [9_216, 15_552, 20_928]),
-        ("self", 50, 50, 0, 64, [9_216, 15_552, 20_928]),
         ("window", 50, 50, 17, 64, [9_216, 15_552, 20_928]),
         ("wide backward", 33, 33, 0, 256, [33_792, 52_416, 70_080]),
         ("wide forward", 17, 17, 0, 512, [66_560, 101_568, 135_616]),
@@ -129,7 +111,12 @@ fn short_cross_self_and_window_attention_gradients_match_scalar() {
             .map(|bytes| has_coop && bytes <= gpu.capabilities().max_compute_shared_memory_size);
         assert_eq!(coop_used_coop, expected, "{label}");
         for (i, name) in ["dQ", "dK", "dV"].into_iter().enumerate() {
-            assert_close(&format!("{label} {name}"), &scalar[i], &cooperative[i]);
+            crate::support::data::assert_close(
+                &format!("{label} {name}: cooperative against scalar"),
+                &cooperative[i],
+                &scalar[i],
+                0.02,
+            );
         }
     }
 }

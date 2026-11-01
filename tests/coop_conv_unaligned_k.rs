@@ -111,39 +111,27 @@ fn conv_partial_output_batch(coop: bool) -> Vec<f32> {
 
 #[test]
 fn coop_conv_unaligned_k_matches_scalar() {
-    // K = 14*9 = 126, not a multiple of 4 — the failing case.
-    let scalar = conv_out(14, false);
-    let coop = conv_out(14, true);
-    let max_abs = scalar
-        .iter()
-        .zip(&coop)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    let nan = coop.iter().filter(|v| v.is_nan()).count();
-    println!("K=126 coop-vs-scalar: max_abs_diff={max_abs:.4}, coop NaNs={nan}");
-    // The bug gave max_abs ~1.9; f16 coop rounding on these bounded inputs
-    // is well under 0.05. (0 if the GPU has no coop — both scalar.)
-    assert_eq!(nan, 0, "coop conv produced NaNs at K=126");
-    assert!(
-        max_abs < 0.05,
-        "coop conv wrong at K=126 (not multiple of 4): max_abs_diff={max_abs}"
-    );
-}
-
-#[test]
-fn coop_conv_aligned_k_matches_scalar() {
-    // K = 16*9 = 144, a multiple of 4 — the already-working case (guard).
-    let scalar = conv_out(16, false);
-    let coop = conv_out(16, true);
-    let max_abs = scalar
-        .iter()
-        .zip(&coop)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    assert!(
-        max_abs < 0.05,
-        "coop conv wrong at K=144: max_abs_diff={max_abs}"
-    );
+    // K = 14*9 = 126 is not a multiple of 4, the failing case; K = 16*9 = 144
+    // is the already-working aligned guard.
+    for in_c in [14, 16] {
+        let k = in_c * 9;
+        let scalar = conv_out(in_c, false);
+        let coop = conv_out(in_c, true);
+        let max_abs = scalar
+            .iter()
+            .zip(&coop)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let nan = coop.iter().filter(|v| v.is_nan()).count();
+        println!("K={k} coop-vs-scalar: max_abs_diff={max_abs:.4}, coop NaNs={nan}");
+        // The bug gave max_abs ~1.9; f16 coop rounding on these bounded inputs
+        // is well under 0.05. (0 if the GPU has no coop — both scalar.)
+        assert_eq!(nan, 0, "coop conv produced NaNs at K={k}");
+        assert!(
+            max_abs < 0.05,
+            "coop conv wrong at K={k}: max_abs_diff={max_abs}"
+        );
+    }
 }
 
 #[test]
