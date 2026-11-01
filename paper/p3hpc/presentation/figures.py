@@ -71,13 +71,13 @@ def shade(value):
     return fill, "#ffffff" if amount > .5 else INK
 
 
-def ratio_panels(panels, name, note):
+def ratio_panels(panels, name):
     """Core comparisons, one panel per (profile, phase), one cell per GPU and model."""
     fig = plt.figure(figsize=(11.56, 4.38))
     left, gap = .15, .025
     width = (.985 - left - gap * (len(panels) - 1)) / len(panels)
     for panel, (profile, phase, title) in enumerate(panels):
-        ax = fig.add_axes((left + panel * (width + gap), .12, width, .58))
+        ax = fig.add_axes((left + panel * (width + gap), .03, width, .76))
         for row, device in enumerate(DEVICES):
             for col, model in enumerate(MODELS):
                 value = ratio(device, model, profile, phase)
@@ -92,15 +92,7 @@ def ratio_panels(panels, name, note):
         ax.tick_params(length=0, pad=5)
         for spine in ax.spines.values():
             spine.set_visible(False)
-        fig.text(left + panel * (width + gap), .83, title, fontsize=16, weight="bold", va="bottom")
-    # Reserve the top band for a right-aligned legend, above both panels.
-    fig.legend(handles=[Patch(facecolor=shade(v)[0], edgecolor="none", label=label)
-                        for v, label in [(.5, "Meganeura faster"), (2, "PyTorch faster"),
-                                         (None, "No qualified ratio")]],
-               loc="upper right", bbox_to_anchor=(.995, 1.01), ncol=3, frameon=False,
-               fontsize=10, title="Meganeura time ÷ PyTorch time", title_fontsize=11.5,
-               handlelength=1.1, columnspacing=1.2, handletextpad=.45)
-    fig.text(left, .04, note, fontsize=10.5, color=MUTED)
+        fig.text(left + panel * (width + gap), .94, title, fontsize=16, weight="bold", va="bottom")
     save(fig, name)
 
 
@@ -457,13 +449,11 @@ def warmup():
 
 
 if __name__ == "__main__":
-    spread = "Training: forward, loss and backward. Apple M3 times vary by a median 16% between processes."
     for profile in ("strict", "accelerated"):
         ratio_panels([(profile, "inference", "Inference"), (profile, "training", "Training")],
-                     f"{profile}-ratios.svg", spread)
+                     f"{profile}-ratios.svg")
     ratio_panels([("strict", "latency", "Strict f32"), ("accelerated", "latency", "Reduced precision")],
-                 "minimal-shape-ratios.svg", "Minimal shape: one token, action or image, run after training. "
-                 "Apple M3 times vary by a median 16% between processes.")
+                 "minimal-shape-ratios.svg")
     egraph()
     search_loop()
     precision_gain()

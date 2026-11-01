@@ -47,7 +47,10 @@ accelerated reference phases; one strict reference process fails gradient
 repeatability. No old result fills a missing new cell.
 
 The ratio is **Meganeura time / PyTorch time**; below one is faster. Teal
-marks native wins and brown losses. Missing ratios mean a failed reference
+marks native wins and brown losses. The three ratio-table slides place their
+legends in the top-right title band, outside the SVGs. Repeated figure footer
+notes are omitted; the comparison slide states the M3 timing caveat once.
+Missing ratios mean a failed reference
 or incomplete qualifying repeats, never zero or infinite speedups. A sample
 is one host-wall model call ending after GPU completion. Each measured
 process takes twenty samples after ten seconds' warmup. The engine time is
