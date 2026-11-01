@@ -307,6 +307,18 @@ const SELF_SHAPES: &[Shape] = &[
     shape(257, 257, 1, 1, 16), // flash hd=16, tpq=1
 ];
 
+/// One shape per kernel the other masks reach, from `SELF_SHAPES`: kernel
+/// selection does not depend on the mask, so the causal sweeps cover its
+/// thresholds and these cover each kernel's masking. The scalar kernel with
+/// a key-tile tail, the flash kernel with a ragged last block at hd=256 and
+/// at hd=64, and the one-lane-per-query flash kernel.
+const MASK_SHAPES: &[Shape] = &[
+    shape(13, 13, 4, 2, 64),
+    shape(33, 33, 2, 1, 256),
+    shape(130, 130, 2, 1, 64),
+    shape(260, 260, 2, 2, 32),
+];
+
 fn forward_sweep(kinds: &[Kind], shapes: &[Shape]) {
     forward_sweep_with_options(kinds, shapes, &gpu::Options::default());
 }
@@ -555,7 +567,8 @@ fn independent_backward_layouts() {
 fn causal_masks_forward() {
     // Block-causal's prefix ends halfway through each sequence, so flash
     // query tiles contain both causal-prefix and full-suffix rows.
-    forward_sweep(&[Kind::Causal, Kind::BlockCausal], SELF_SHAPES);
+    forward_sweep(&[Kind::Causal], SELF_SHAPES);
+    forward_sweep(&[Kind::BlockCausal], MASK_SHAPES);
 
     // A cooperative-capable target selects a different forward shader by
     // default; disabling it keeps the scalar and ordinary flash paths in
@@ -564,7 +577,7 @@ fn causal_masks_forward() {
         coop: CoopPolicy::Disabled,
         ..Default::default()
     };
-    forward_sweep_with_options(&[Kind::BlockCausal], SELF_SHAPES, &scalar);
+    forward_sweep_with_options(&[Kind::BlockCausal], MASK_SHAPES, &scalar);
 }
 
 #[test]
@@ -615,7 +628,7 @@ fn sliding_window_forward() {
 
 #[test]
 fn full_forward() {
-    forward_sweep(&[Kind::Full], SELF_SHAPES);
+    forward_sweep(&[Kind::Full], MASK_SHAPES);
 }
 
 /// `full_attention` and `cross_attention` lower exactly as
@@ -690,7 +703,7 @@ fn sliding_window_backward() {
 
 #[test]
 fn full_backward() {
-    backward_sweep(&[Kind::Full], SELF_SHAPES);
+    backward_sweep(&[Kind::Full], MASK_SHAPES);
 }
 
 #[test]

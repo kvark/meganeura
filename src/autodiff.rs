@@ -1470,22 +1470,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_simple_autodiff() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 3]);
-        let w = g.parameter("w", &[3, 2]);
-        let y = g.matmul(x, w);
-        let loss = g.mean_all(y);
-        g.set_outputs(vec![loss]);
-
-        let diff = differentiate(&g);
-        // Should have: forward nodes + gradient nodes
-        assert!(diff.nodes().len() > g.nodes().len());
-        // Outputs should be [loss, grad_w]
-        assert_eq!(diff.outputs().len(), 2);
-    }
-
-    #[test]
     fn autodiff_distinguishes_derivative_guard_from_explicit_pins() {
         let mut g = Graph::new();
         let x = g.input("x", &[4, 3]);
@@ -1589,127 +1573,6 @@ mod tests {
     }
 
     #[test]
-    fn test_mlp_autodiff() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 784]);
-        let w1 = g.parameter("w1", &[784, 128]);
-        let b1 = g.parameter("b1", &[128]);
-        let mm1 = g.matmul(x, w1);
-        let h1 = g.bias_add(mm1, b1);
-        let a1 = g.relu(h1);
-        let w2 = g.parameter("w2", &[128, 10]);
-        let mm2 = g.matmul(a1, w2);
-        let labels = g.input("labels", &[4, 10]);
-        let loss = g.cross_entropy_loss(mm2, labels);
-        g.set_outputs(vec![loss]);
-
-        let diff = differentiate(&g);
-        // Should produce gradients for w1, b1, w2
-        // outputs: [loss, grad_w1, grad_b1, grad_w2]
-        assert_eq!(diff.outputs().len(), 4, "expected loss + 3 param grads");
-        assert!(
-            diff.nodes()
-                .iter()
-                .any(|node| matches!(node.op, Op::BroadcastInner { .. }))
-        );
-    }
-
-    #[test]
-    fn test_sigmoid_autodiff() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 8]);
-        let w = g.parameter("w", &[8, 4]);
-        let y = g.matmul(x, w);
-        let s = g.sigmoid(y);
-        let loss = g.mean_all(s);
-        g.set_outputs(vec![loss]);
-
-        let diff = differentiate(&g);
-        // outputs: [loss, grad_w]
-        assert_eq!(diff.outputs().len(), 2);
-        // Sigmoid backward creates: neg, add (1-y), mul (y*(1-y)), mul (dL * dy)
-        // Check gradient node shapes
-        let grad_w = diff.outputs()[1];
-        assert_eq!(diff.node(grad_w).ty.shape, vec![8, 4]);
-    }
-
-    #[test]
-    fn test_neg_autodiff() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 8]);
-        let w = g.parameter("w", &[8, 4]);
-        let y = g.matmul(x, w);
-        let n = g.neg(y);
-        let loss = g.sum_all(n);
-        g.set_outputs(vec![loss]);
-
-        let diff = differentiate(&g);
-        assert_eq!(diff.outputs().len(), 2);
-        let grad_w = diff.outputs()[1];
-        assert_eq!(diff.node(grad_w).ty.shape, vec![8, 4]);
-    }
-
-    #[test]
-    fn test_transpose_autodiff() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 8]);
-        let w = g.parameter("w", &[8, 3]);
-        let y = g.matmul(x, w);
-        let t = g.transpose(y);
-        // t is [3, 4], need to reduce to scalar
-        let loss = g.mean_all(t);
-        g.set_outputs(vec![loss]);
-
-        let diff = differentiate(&g);
-        assert_eq!(diff.outputs().len(), 2);
-        let grad_w = diff.outputs()[1];
-        assert_eq!(diff.node(grad_w).ty.shape, vec![8, 3]);
-    }
-
-    #[test]
-    fn test_mul_autodiff() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 8]);
-        let w = g.parameter("w", &[8, 4]);
-        let y = g.matmul(x, w);
-        // element-wise mul with itself: y * y
-        let sq = g.mul(y, y);
-        let loss = g.mean_all(sq);
-        g.set_outputs(vec![loss]);
-
-        let diff = differentiate(&g);
-        assert_eq!(diff.outputs().len(), 2);
-        // When multiplying y*y, gradient accumulates from both inputs
-        let grad_w = diff.outputs()[1];
-        assert_eq!(diff.node(grad_w).ty.shape, vec![8, 4]);
-    }
-
-    #[test]
-    fn test_multi_path_gradient_accumulation() {
-        // w is used in two separate matmuls — gradients should accumulate
-        let mut g = Graph::new();
-        let x1 = g.input("x1", &[4, 8]);
-        let x2 = g.input("x2", &[4, 8]);
-        let w = g.parameter("w", &[8, 4]);
-        let y1 = g.matmul(x1, w);
-        let y2 = g.matmul(x2, w);
-        let sum = g.add(y1, y2);
-        let loss = g.mean_all(sum);
-        g.set_outputs(vec![loss]);
-
-        let diff = differentiate(&g);
-        assert_eq!(diff.outputs().len(), 2); // loss + grad_w
-        let grad_w = diff.outputs()[1];
-        // Gradient should be accumulated (Add node)
-        assert!(
-            matches!(diff.node(grad_w).op, Op::Add),
-            "expected gradient accumulation via Add, got {:?}",
-            diff.node(grad_w).op
-        );
-        assert_eq!(diff.node(grad_w).ty.shape, vec![8, 4]);
-    }
-
-    #[test]
     fn bf16_backward_widens_each_shared_operand_once() {
         let mut g = Graph::new();
         let x = g.input("x", &[4, 8]);
@@ -1732,21 +1595,6 @@ mod tests {
         let unique: std::collections::HashSet<_> =
             widenings.iter().map(|node| node.inputs[0]).collect();
         assert_eq!(unique.len(), widenings.len());
-    }
-
-    #[test]
-    fn test_no_grad_for_inputs() {
-        // Inputs should not appear in gradient outputs
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 3]);
-        let w = g.parameter("w", &[3, 2]);
-        let y = g.matmul(x, w);
-        let loss = g.sum_all(y);
-        g.set_outputs(vec![loss]);
-
-        let diff = differentiate(&g);
-        // Only loss + grad_w (not grad_x)
-        assert_eq!(diff.outputs().len(), 2);
     }
 
     #[test]

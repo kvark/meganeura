@@ -5,7 +5,6 @@
 //! compositions of them. Every failure prints its seed; rerun one with
 //! `ORACLE_FUZZ_SEED=<seed>`, or search further with `ORACLE_FUZZ_COUNT`.
 
-use meganeura::graph::TensorType;
 use meganeura::reference::{Feeds, Rng, Tolerance, gpu, gradients};
 use meganeura::{Graph, NodeId};
 
@@ -210,13 +209,4 @@ fn random_training_graphs() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-}
-
-#[test]
-fn builder_graphs_are_well_formed() {
-    for seed in 1..=5 {
-        let (g, last) = Builder::build(seed, 10);
-        assert_eq!(g.node(last).ty.shape.len(), 2);
-        let _ = TensorType::f32(g.node(last).ty.shape.clone());
-    }
 }

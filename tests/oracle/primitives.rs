@@ -3,8 +3,8 @@
 //! Each newer primitive runs against the reference under every lowering,
 //! and its gradient against finite differences and on the GPU. Composites
 //! written in primitives (`Graph::decomposed_*`) must compute the same
-//! values whether the optimizer folds them into fused kernels or leaves
-//! them as primitive dispatches.
+//! values when the optimizer leaves them as primitive dispatches; folded,
+//! they build exactly the composite's plan, which `composites` proves.
 
 use meganeura::reference::{Feeds, Rng, gpu, gradients};
 use meganeura::{Graph, NodeId, OptimizeMode};
@@ -15,23 +15,37 @@ fn positive(feeds: &mut Feeds, name: &str, n: usize) {
     feeds.set(name, &data);
 }
 
+/// The graph left unoptimized, as written.
+fn unoptimized() -> (&'static str, gpu::Options) {
+    let mut options = gpu::Options::default();
+    options.optimize.mode = OptimizeMode::Off;
+    ("unoptimized", options)
+}
+
 /// Every lowering, plus the graph left unoptimized.
 fn variants() -> Vec<(&'static str, gpu::Options)> {
     let mut variants = gpu::Options::lowerings();
-    let mut unoptimized = gpu::Options::default();
-    unoptimized.optimize.mode = OptimizeMode::Off;
-    variants.push(("unoptimized", unoptimized));
+    variants.push(unoptimized());
     variants
 }
 
 fn inference_case(what: &str, build: impl Fn(&mut Graph) -> NodeId, fix: impl Fn(&mut Feeds)) {
+    inference_on(what, build, fix, variants());
+}
+
+fn inference_on(
+    what: &str,
+    build: impl Fn(&mut Graph) -> NodeId,
+    fix: impl Fn(&mut Feeds),
+    variants: Vec<(&'static str, gpu::Options)>,
+) {
     let mut g = Graph::new();
     let y = build(&mut g);
     g.set_outputs(vec![y]);
     let mut feeds = Feeds::new();
     fix(&mut feeds);
     feeds.fill_random(&g, what.len() as u64, 1.0);
-    for (label, options) in variants() {
+    for (label, options) in variants {
         gpu::check_inference(&g, &feeds, &options)
             .unwrap_or_else(|e| panic!("{what} ({label}): {e}"))
             .assert_passed(&format!("{what} ({label})"));
@@ -39,6 +53,15 @@ fn inference_case(what: &str, build: impl Fn(&mut Graph) -> NodeId, fix: impl Fn
 }
 
 fn grad_case(what: &str, build: impl Fn(&mut Graph) -> NodeId, fix: impl Fn(&mut Feeds)) {
+    grad_on(what, build, fix, variants());
+}
+
+fn grad_on(
+    what: &str,
+    build: impl Fn(&mut Graph) -> NodeId,
+    fix: impl Fn(&mut Feeds),
+    variants: Vec<(&'static str, gpu::Options)>,
+) {
     let mut g = Graph::new();
     let y = build(&mut g);
     let loss = gradients::weighted_loss(&mut g, y, what.len() as u64, 0.75);
@@ -49,7 +72,7 @@ fn grad_case(what: &str, build: impl Fn(&mut Graph) -> NodeId, fix: impl Fn(&mut
     gradients::check(&g, &feeds, &gradients::Options::default())
         .unwrap_or_else(|e| panic!("{what}: {e}"))
         .assert_passed(&format!("{what}: autodiff vs finite differences"));
-    for (label, options) in variants() {
+    for (label, options) in variants {
         gpu::check_training(&g, &feeds, &options)
             .unwrap_or_else(|e| panic!("{what} ({label}): {e}"))
             .assert_passed(&format!("{what} ({label}): training step vs reference"));
@@ -586,45 +609,31 @@ fn max_inner() {
     }
 }
 
+/// The decompositions as primitive dispatches. Folded, they build the
+/// composite's plan exactly (`composites::elementwise_and_norms`), so only
+/// the unoptimized build computes anything of its own.
 #[test]
-fn decomposed_softmax() {
+fn decomposed_composites() {
+    let check = |what: String, build: &dyn Fn(&mut Graph) -> NodeId| {
+        inference_on(&what, build, |_| {}, vec![unoptimized()]);
+        grad_on(&what, build, |_| {}, vec![unoptimized()]);
+    };
     for (rows, cols) in [(6, 10), (2, 300)] {
-        let what = format!("decomposed softmax {rows}x{cols}");
-        let build = |g: &mut Graph| {
+        check(format!("decomposed softmax {rows}x{cols}"), &|g| {
             let x = g.parameter("x", &[rows, cols]);
             g.decomposed_softmax(x)
-        };
-        inference_case(&what, build, |_| {});
-        grad_case(&what, build, |_| {});
-    }
-}
-
-#[test]
-fn decomposed_rms_norm() {
-    for (rows, cols) in [(6, 10), (2, 300)] {
-        let what = format!("decomposed rms_norm {rows}x{cols}");
-        let build = |g: &mut Graph| {
+        });
+        check(format!("decomposed rms_norm {rows}x{cols}"), &|g| {
             let x = g.parameter("x", &[rows, cols]);
             let w = g.parameter("w", &[cols]);
             g.decomposed_rms_norm(x, w, 1e-5)
-        };
-        inference_case(&what, build, |_| {});
-        grad_case(&what, build, |_| {});
-    }
-}
-
-#[test]
-fn decomposed_layer_norm() {
-    for (rows, cols) in [(6, 10), (2, 300)] {
-        let what = format!("decomposed layer_norm {rows}x{cols}");
-        let build = |g: &mut Graph| {
+        });
+        check(format!("decomposed layer_norm {rows}x{cols}"), &|g| {
             let x = g.parameter("x", &[rows, cols]);
             let w = g.parameter("w", &[cols]);
             let b = g.parameter("b", &[cols]);
             g.decomposed_layer_norm(x, w, b, 1e-5)
-        };
-        inference_case(&what, build, |_| {});
-        grad_case(&what, build, |_| {});
+        });
     }
 }
 

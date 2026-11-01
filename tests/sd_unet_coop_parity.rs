@@ -64,8 +64,17 @@ fn run(cooperative: bool) -> Vec<f32> {
     session.read_output(output_len)
 }
 
+/// The model stays at `Config::small`: its opening convolution is the
+/// 4-to-64-channel one that overran the arrays.
 #[test]
 fn sd_unet_f32_coop_matches_scalar() {
+    // Without f32 cooperative tiles both runs take the scalar kernels, and
+    // the comparison would hold trivially.
+    let gpu = crate::support::gpu::gpu();
+    if meganeura::runtime::auto_tune(&gpu, 0).coop_caps.f32_tile == 0 {
+        eprintln!("no f32 cooperative tiles on this device; nothing to compare");
+        return;
+    }
     let scalar = run(false);
     let cooperative = run(true);
 

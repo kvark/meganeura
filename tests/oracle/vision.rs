@@ -1145,72 +1145,75 @@ fn is_conv_gemm(shader: &ShaderEntry) -> bool {
 
 /// The compiler emits every implicit-GEMM convolution as the exact-divisor
 /// kernel with a 16-deep K stage; the tuner may replace it with a 32-deep K
-/// stage or the uniform software-divisor shader. Force each on each tile
-/// width and direction. Most reductions here (K = 45, 27, 54, 90, 18, 84)
-/// are multiples of neither stage.
+/// stage or the uniform software-divisor shader. Each case forces two of the
+/// five kernels, chosen so every kernel runs on every direction and on every
+/// tile width. Most reductions here (K = 45, 27, 54, 90, 18, 84) are
+/// multiples of neither stage.
 #[test]
 fn conv2d_tuned_kernels() {
-    let cases: [(&str, Graph); 9] = [
+    let specialized = |k_tile, interleave_columns| Kernel::SpecializedConv {
+        k_tile,
+        interleave_columns,
+    };
+    let kernels = [
+        specialized(16, false),
+        specialized(32, false),
+        specialized(16, true),
+        specialized(32, true),
+        Kernel::Default,
+    ];
+    let cases: [(&str, Graph, [usize; 2]); 9] = [
         (
             "forward 64",
             Conv::new(2, 5, (31, 33), 65, (3, 3), 1, (1, 1)).forward_graph(),
+            [0, 1],
         ),
         (
             "forward 32",
             Conv::new(4, 3, (15, 17), 33, (3, 3), 1, (1, 1)).forward_graph(),
+            [2, 3],
         ),
         (
             "forward 16",
             Conv::new(2, 6, (13, 11), 10, (3, 3), 2, (1, 1)).forward_graph(),
+            [4, 0],
         ),
         (
             "grad input 64",
             Conv::new(2, 65, (31, 33), 5, (3, 3), 1, (1, 1)).grad_input_graph(),
+            [2, 3],
         ),
         (
             "grad input 32",
             Conv::new(4, 33, (15, 17), 3, (3, 3), 1, (1, 1)).grad_input_graph(),
+            [0, 4],
         ),
         (
             "grad input 16",
             Conv::new(2, 6, (13, 11), 10, (3, 3), 2, (1, 1)).grad_input_graph(),
+            [1, 2],
         ),
         (
             "grad weight 64",
             Conv::new(1, 50, (4, 4), 520, (3, 3), 1, (1, 1)).grad_weight_graph(),
+            [4, 0],
         ),
         (
             "grad weight 32",
             Conv::new(2, 111, (3, 3), 64, (3, 3), 1, (1, 1)).grad_weight_graph(),
+            [1, 2],
         ),
         (
             "grad weight 16",
             Conv::new(2, 6, (13, 11), 10, (3, 3), 2, (1, 1)).grad_weight_graph(),
+            [3, 1],
         ),
     ];
     let mut failures = Failures::default();
-    for (i, (label, g)) in cases.iter().enumerate() {
+    for (i, (label, g, chosen)) in cases.iter().enumerate() {
         let mut feeds = Feeds::new();
         feeds.fill_random(g, 1600 + i as u64, 1.0);
-        for kernel in [
-            Kernel::SpecializedConv {
-                k_tile: 16,
-                interleave_columns: false,
-            },
-            Kernel::SpecializedConv {
-                k_tile: 32,
-                interleave_columns: false,
-            },
-            Kernel::SpecializedConv {
-                k_tile: 16,
-                interleave_columns: true,
-            },
-            Kernel::SpecializedConv {
-                k_tile: 32,
-                interleave_columns: true,
-            },
-            Kernel::Default,
-        ] {
+        for kernel in chosen.map(|k| kernels[k].clone()) {
             let mut plan = meganeura::compile::compile(g);
             let conv = plan
                 .dispatches
@@ -1463,8 +1466,8 @@ fn large_spatial_training() {
 }
 
 /// Inference at the super-resolution model's scale: a 64→64 3×3 convolution
-/// at 96×96 (Winograd), GroupNorm + SiLU over 64 channels at 128×128 with
-/// 16 groups (fused, chunked), and a 3×1 convolution over a flat 129×1 image.
+/// at 96×96 (Winograd) and a 3×1 convolution over a flat 129×1 image. The
+/// fused, chunked GroupNorm + SiLU it also runs is `group_norm_silu_fusion`.
 #[test]
 fn super_resolution_scale() {
     let options = gpu::Options::default();
@@ -1472,22 +1475,13 @@ fn super_resolution_scale() {
     let mut graphs: Vec<(&str, Graph)> = Vec::new();
 
     // 48² Winograd tiles × 64 channels still exceed one dispatch dimension.
-    let (c, conv_hw, hw) = (64u32, 96u32, 128u32);
+    let (c, conv_hw) = (64u32, 96u32);
     let mut g = Graph::new();
     let x = g.input("x", &[(c * conv_hw * conv_hw) as usize]);
     let k = g.parameter("k", &[(c * c * 9) as usize]);
     let y = g.conv2d(x, k, 1, c, conv_hw, conv_hw, c, 3, 3, 1, 1);
     g.set_outputs(vec![y]);
     graphs.push(("winograd 64x64 at 96x96", g));
-
-    let mut g = Graph::new();
-    let x = g.input("x", &[(c * hw * hw) as usize]);
-    let w = g.parameter("w", &[c as usize]);
-    let b = g.parameter("b", &[c as usize]);
-    let y = g.group_norm(x, w, b, 1, c, hw * hw, 16, 1e-5);
-    let y = g.silu(y);
-    g.set_outputs(vec![y]);
-    graphs.push(("group_norm_silu 64ch 128x128", g));
 
     let mut g = Graph::new();
     let x = g.input("x", &[3 * 129]);
