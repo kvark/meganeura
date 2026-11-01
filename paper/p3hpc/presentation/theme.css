@@ -481,3 +481,13 @@ table.selected-paths { display: table; width: 100%; margin: 0 0 6px; font-size: 
 table.selected-paths th, table.selected-paths td { padding: 7px 9px; }
 table.selected-paths th:last-child, table.selected-paths td:last-child { text-align: right; }
 .tier.selected small { font-size: 16px; color: #637679; }
+
+/* Keep ratio legends in the title band, separate from the data figures. */
+.ratio-legend { position: absolute; top: 82px; right: 62px; display: grid; gap: 7px; justify-items: end; }
+.ratio-metric { font-size: 18px; font-weight: 600; }
+.ratio-keys { display: flex; gap: 18px; font-size: 16px; }
+.ratio-keys span { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.ratio-keys i { display: inline-block; width: 16px; height: 16px; font-style: normal; line-height: 16px; text-align: center; }
+.ratio-keys .ours { background: #94c1c3; }
+.ratio-keys .theirs { background: #d9b19d; }
+.ratio-keys .missing { background: #e9ebe8; color: #637679; }
