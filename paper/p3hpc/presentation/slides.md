@@ -619,7 +619,7 @@ https://www.amd.com/en/products/accelerators/instinct/mi300/mi300x.html
 <div><h3>Reduced precision</h3>PyTorch autocast; Meganeura F16/BF16 search</div>
 </div>
 
-<small>Submodels; synthetic weights except SmolLM2. Training timing: forward + loss + backward, without the optimizer.<br>Gates differ: native full-gradient fidelity; PyTorch also checks SGD trajectories.</small>
+<small>Submodels; synthetic weights except SmolLM2. Training timing: forward + loss + backward, without the optimizer.<br>Gates differ: native full-gradient fidelity; PyTorch also checks SGD trajectories.<br>M3 timings vary between processes: median spread 16%.</small>
 
 <!--
 Time: 1:15.
@@ -668,11 +668,14 @@ Sources: ../main.tex, Methodology; ../tables/devices.tex.
 
 # Strict f32
 
+<div class="ratio-legend">
+<div class="ratio-metric">Meganeura time ÷ PyTorch time</div>
+<div class="ratio-keys"><span><i class="ours"></i>Meganeura faster</span><span><i class="theirs"></i>PyTorch faster</span><span><i class="missing">—</i>No ratio</span></div>
+</div>
+
 ![Strict f32 time ratios for six GPUs and five workloads, inference and training](figures/strict-ratios.svg)
 
-Medians: <span class="slower">1.46×</span> inference · <span class="slower">1.59×</span> training. Faster in **13 of 58** comparisons; **7 of 9** on the RX 7900 XT.
-
-<small>**Arc U-Net:** 3.21 ms vs 1.09 ms, a 2.95× gap.</small>
+Medians: <span class="slower">1.46×</span> inference · <span class="slower">1.59×</span> training. Faster in **13 of 58** comparisons.
 
 <!--
 Time: 1:20.
@@ -702,11 +705,14 @@ Sources: data/results.csv; data/summary.json.
 
 # Reduced precision
 
+<div class="ratio-legend">
+<div class="ratio-metric">Meganeura time ÷ PyTorch time</div>
+<div class="ratio-keys"><span><i class="ours"></i>Meganeura faster</span><span><i class="theirs"></i>PyTorch faster</span><span><i class="missing">—</i>No ratio</span></div>
+</div>
+
 ![Reduced-precision time ratios for six GPUs and five workloads, inference and training](figures/accelerated-ratios.svg)
 
-Medians: <span class="slower">1.67×</span> inference · <span class="slower">1.92×</span> training. Native gains: **1.19× inference, 1.05× training** over strict.
-
-<small>**Matrix paths are selected on all six GPUs.** Reduced precision covers only part of backward.</small>
+Median ratio: <span class="slower">1.67× inference · 1.92× training</span>. Native gains over f32: **1.19× · 1.05×**.
 
 <!--
 Time: 1:10.
@@ -1474,6 +1480,11 @@ Sources: ../QUALIFICATION.md; ../RESULTS.md.
 <!-- _class: chart results -->
 
 # Minimal shape
+
+<div class="ratio-legend">
+<div class="ratio-metric">Meganeura time ÷ PyTorch time</div>
+<div class="ratio-keys"><span><i class="ours"></i>Meganeura faster</span><span><i class="theirs"></i>PyTorch faster</span><span><i class="missing">—</i>No ratio</span></div>
+</div>
 
 ![Minimal-shape ratios on six GPUs and five workloads, strict and reduced precision](figures/minimal-shape-ratios.svg)
 
