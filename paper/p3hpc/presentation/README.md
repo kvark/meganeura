@@ -1,10 +1,10 @@
 # P3HPC presentation
 
-The main talk has 18 slides with 18:15 of suggested speaking time, a backup
-index and 25 backups. It combines the Vulkan/Metal deployment argument, the
+The main talk has 19 slides with 19:05 of suggested speaking time, a backup
+index and 24 backups. It combines the Vulkan/Metal deployment argument, the
 compiler's architecture and search, hardware access and limits, and measured
-performance. Server scaling is in the main talk; the compiler map and Rust
-API example are in backup. The alternatives diagram shows the actual matmul/add fusion
+performance. The Rust API example and server scaling are in the main talk; the compiler
+map and importer example are in backup. The alternatives diagram shows the actual matmul/add fusion
 rewrite, with operator e-nodes pointing to shared operand e-classes. The paper
 and talk use the same October 31–November 1, 2026 cohort. Earlier `presentation-full`, `presentation-alt`, `presentation-api`
 and `presentation-story` drafts remain local references with older evidence;
