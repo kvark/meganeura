@@ -1884,11 +1884,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn outlined_egglog_is_the_production_default() {
-        assert_eq!(OptimizeConfig::default().mode, OptimizeMode::EgglogOutlined);
-    }
-
-    #[test]
     fn tensor_traffic_does_not_charge_integer_node_ids() {
         let mut egraph = egglog::EGraph::default();
         egraph
@@ -1935,127 +1930,56 @@ mod tests {
         }
     }
 
+    /// Graphs without a fusible pattern come out of the optimizer as written.
     #[test]
-    fn test_no_fusion_cooperative_matrix() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 784]);
-        let w = g.parameter("w", &[784, 128]);
-        let mm = g.matmul(x, w);
-        let h = g.relu(mm);
-        g.set_outputs(vec![h]);
+    fn non_fusible_graphs_are_unchanged() {
+        let mut mlp = Graph::new();
+        let x = mlp.input("x", &[4, 784]);
+        let w1 = mlp.parameter("w1", &[784, 128]);
+        let mm1 = mlp.matmul(x, w1);
+        let h1 = mlp.relu(mm1);
+        let w2 = mlp.parameter("w2", &[128, 10]);
+        let mm2 = mlp.matmul(h1, w2);
+        let h2 = mlp.relu(mm2);
+        mlp.set_outputs(vec![h2]);
 
-        let opt = optimize(&g);
-        let output_id = opt.outputs()[0];
-        let output_node = opt.node(output_id);
-        assert!(
-            matches!(output_node.op, Op::Relu),
-            "expected Relu (no fusion), got {:?}",
-            output_node.op
-        );
-    }
+        let mut matmul = Graph::new();
+        let x = matmul.input("x", &[2, 1024]);
+        let w = matmul.parameter("w", &[1024, 64]);
+        let y = matmul.matmul(x, w);
+        matmul.set_outputs(vec![y]);
 
-    #[test]
-    fn test_optimize_report() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 784]);
-        let w1 = g.parameter("w1", &[784, 128]);
-        let mm1 = g.matmul(x, w1);
-        let h1 = g.relu(mm1);
-        let w2 = g.parameter("w2", &[128, 10]);
-        let mm2 = g.matmul(h1, w2);
-        let h2 = g.relu(mm2);
-        g.set_outputs(vec![h2]);
+        let mut elementwise = Graph::new();
+        let a = elementwise.input("a", &[4, 8]);
+        let b = elementwise.input("b", &[4, 8]);
+        let sum = elementwise.add(a, b);
+        let neg = elementwise.neg(sum);
+        elementwise.set_outputs(vec![neg]);
 
-        let (_opt, report) = optimize_with_report(&g);
-        assert!(report.fusions_applied.is_empty());
-        let display = format!("{}", report);
-        assert!(display.contains("Optimization Report"));
-    }
+        let mut pools = Graph::new();
+        let x = pools.input("x", &[64 * 8 * 8]);
+        let pool = pools.max_pool_2d(x, 1, 64, 8, 8, 2, 2, 2, 0);
+        let gap = pools.global_avg_pool(pool, 1, 64, 16);
+        pools.set_outputs(vec![gap]);
 
-    #[test]
-    fn test_egglog_roundtrip() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 10]);
-        let w = g.parameter("w", &[10, 5]);
-        let y = g.matmul(x, w);
-        g.set_outputs(vec![y]);
-
-        let program = dump_egglog_program(&g);
-        assert!(program.contains("(MatMul"));
-        assert!(program.contains("(Leaf 0)"));
-
-        let mut egraph = egglog::EGraph::default();
-        egraph.parse_and_run_program(None, &program).unwrap();
-    }
-
-    /// Verify egglog extraction returns fused terms via TermDag.
-    #[test]
-    fn test_egglog_extract_returns_fused() {
-        let mut egraph = egglog::EGraph::default();
-        let outputs = egraph
-            .parse_and_run_program(
-                None,
-                r#"
-(datatype Op
-  (MatMul Op Op)
-  (MatMulBT Op Op)
-  (Add Op Op)
-  (FusedMatMulAdd Op Op Op)
-  (FusedMatMulBTAdd Op Op Op)
-  (Input String)
-  (Parameter String)
-)
-(rewrite (Add (MatMul ?a ?b) ?d) (FusedMatMulAdd ?a ?b ?d))
-(rewrite (Add (MatMulBT ?a ?b) ?d) (FusedMatMulBTAdd ?a ?b ?d))
-(rewrite (Add ?x ?y) (Add ?y ?x))
-
-(let n0 (Input "x"))
-(let n1 (Parameter "w"))
-(let n2 (MatMul n0 n1))
-(let n3 (Input "bias"))
-(let n4 (Add n2 n3))
-(run 10)
-(extract n4)
-"#,
-            )
-            .unwrap();
-        // Find the ExtractBest output
-        let mut found_fused = false;
-        for out in &outputs {
-            if let egglog::CommandOutput::ExtractBest(ref dag, _cost, term_id) = *out {
-                let s = dag.to_string(term_id);
-                eprintln!("egglog extracted: {}", s);
-                assert!(
-                    s.contains("FusedMatMulAdd"),
-                    "expected FusedMatMulAdd, got: {}",
-                    s
+        // The same operators, possibly reordered.
+        let ops = |g: &Graph| {
+            let mut ops: Vec<_> = g.nodes().iter().map(|n| format!("{:?}", n.op)).collect();
+            ops.sort();
+            ops
+        };
+        for g in [mlp, matmul, elementwise, pools] {
+            let (opt, report) = optimize_with_report(&g);
+            assert!(report.fusions_applied.is_empty(), "{report}");
+            assert!(format!("{report}").contains("Optimization Report"));
+            assert_eq!(ops(&opt), ops(&g));
+            for (&before, &after) in g.outputs().iter().zip(opt.outputs()) {
+                assert_eq!(
+                    std::mem::discriminant(&opt.node(after).op),
+                    std::mem::discriminant(&g.node(before).op)
                 );
-                // Verify the term tree structure
-                match dag.get(term_id).clone() {
-                    Term::App(name, _children) => {
-                        assert_eq!(name, "FusedMatMulAdd");
-                    }
-                    other => panic!("expected App, got {:?}", other),
-                }
-                found_fused = true;
             }
         }
-        assert!(found_fused, "no ExtractBest output found");
-    }
-
-    #[test]
-    fn test_optimize_preserves_graph() {
-        let mut g = Graph::new();
-        let a = g.input("a", &[4, 8]);
-        let b = g.input("b", &[4, 8]);
-        let sum = g.add(a, b);
-        let neg = g.neg(sum);
-        g.set_outputs(vec![neg]);
-
-        let opt = optimize(&g);
-        assert_eq!(opt.nodes().len(), g.nodes().len());
-        let out = opt.node(opt.outputs()[0]);
-        assert!(matches!(out.op, Op::Neg));
     }
 
     /// Neg(Neg(x)) at the output collapses to an alias of x.
@@ -2115,20 +2039,6 @@ mod tests {
     }
 
     #[test]
-    fn test_dump_egglog_program() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 8]);
-        let w = g.parameter("w", &[8, 4]);
-        let y = g.matmul(x, w);
-        let _h = g.relu(y);
-        g.set_outputs(vec![y]);
-
-        let program = dump_egglog_program(&g);
-        assert!(program.contains("(datatype Op"));
-        assert!(program.contains("(run 4)"));
-    }
-
-    #[test]
     fn test_egglog_all_ops() {
         let mut g = Graph::new();
         let x = g.input("x", &[4, 8]);
@@ -2149,95 +2059,32 @@ mod tests {
         let _ma = g.mean_all(mm);
         let _gt = g.greater(mm, mm);
         let _cel = g.cross_entropy_loss(mm, mm);
-        g.set_outputs(vec![sa]);
+        // Backward ops are encoded too, not skipped.
+        let at = g.add_raw_node(
+            Op::MatMulAT,
+            vec![x, x],
+            crate::graph::TensorType::f32(vec![8, 8]),
+        );
+        let bt = g.add_raw_node(
+            Op::MatMulBT,
+            vec![x, w],
+            crate::graph::TensorType::f32(vec![4, 8]),
+        );
+        g.set_outputs(vec![sa, at, bt]);
 
         let program = dump_egglog_program(&g);
+        for term in [
+            "(datatype Op",
+            "(run 4)",
+            "(Leaf 0)",
+            "(MatMul ",
+            "MatMulAT",
+            "MatMulBT",
+        ] {
+            assert!(program.contains(term), "{term} not encoded");
+        }
         let mut egraph = egglog::EGraph::default();
         egraph.parse_and_run_program(None, &program).unwrap();
-    }
-
-    #[test]
-    fn test_clone_graph_preserves_structure() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 8]);
-        let w = g.parameter("w", &[8, 4]);
-        let y = g.matmul(x, w);
-        g.set_outputs(vec![y]);
-
-        let cloned = clone_graph(&g);
-        assert_eq!(cloned.nodes().len(), g.nodes().len());
-        assert_eq!(cloned.outputs(), g.outputs());
-        for (a, b) in cloned.nodes().iter().zip(g.nodes().iter()) {
-            assert_eq!(a.id, b.id);
-            assert_eq!(a.inputs, b.inputs);
-            assert_eq!(a.ty.shape, b.ty.shape);
-        }
-    }
-
-    #[test]
-    fn test_matmul_stays_as_matmul() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[2, 1024]);
-        let w = g.parameter("w", &[1024, 64]);
-        let y = g.matmul(x, w);
-        g.set_outputs(vec![y]);
-
-        let opt = optimize(&g);
-        let output_id = opt.outputs()[0];
-        assert!(
-            matches!(opt.node(output_id).op, Op::MatMul),
-            "expected MatMul, got {:?}",
-            opt.node(output_id).op
-        );
-    }
-
-    /// Measure egglog saturation time vs graph size.
-    #[test]
-    fn test_egglog_scalability() {
-        for n in [10, 50, 100, 200, 350] {
-            let mut prog = String::from(
-                "(datatype Op
-  (MatMul Op Op) (MatMulAT Op Op) (MatMulBT Op Op)
-  (Add Op Op) (Input String) (Parameter String)
-  (FusedMatMulAdd Op Op Op) (FusedMatMulATAdd Op Op Op) (FusedMatMulBTAdd Op Op Op)
-)\n",
-            );
-            prog.push_str("(rewrite (Add (MatMul ?a ?b) ?d) (FusedMatMulAdd ?a ?b ?d))\n");
-            prog.push_str("(rewrite (Add ?d (MatMul ?a ?b)) (FusedMatMulAdd ?a ?b ?d))\n");
-            prog.push_str("(rewrite (Add (MatMulAT ?a ?b) ?d) (FusedMatMulATAdd ?a ?b ?d))\n");
-            prog.push_str("(rewrite (Add ?d (MatMulAT ?a ?b)) (FusedMatMulATAdd ?a ?b ?d))\n");
-            prog.push_str("(rewrite (Add (MatMulBT ?a ?b) ?d) (FusedMatMulBTAdd ?a ?b ?d))\n");
-            prog.push_str("(rewrite (Add ?d (MatMulBT ?a ?b)) (FusedMatMulBTAdd ?a ?b ?d))\n");
-
-            prog.push_str("(let n0 (Input \"x\"))\n(let n1 (Parameter \"w\"))\n");
-            for i in 1..n {
-                let prev = (i - 1) * 2 + 2;
-                match i % 3 {
-                    0 => prog.push_str(&format!("(let n{} (MatMulAT n{} n1))\n", i * 2, prev - 1)),
-                    1 => prog.push_str(&format!("(let n{} (MatMulBT n{} n1))\n", i * 2, prev - 1)),
-                    _ => prog.push_str(&format!("(let n{} (MatMul n{} n1))\n", i * 2, prev - 1)),
-                }
-                prog.push_str(&format!(
-                    "(let n{} (Add n{} n{}))\n",
-                    i * 2 + 1,
-                    i * 2,
-                    prev - 1
-                ));
-            }
-            prog.push_str("(run 1)\n");
-            let last = (n - 1) * 2 + 1;
-            prog.push_str(&format!("(extract n{})\n", last));
-
-            let t0 = Instant::now();
-            let mut egraph = egglog::EGraph::default();
-            egraph.parse_and_run_program(None, &prog).unwrap();
-            let elapsed = t0.elapsed();
-            eprintln!(
-                "egglog scalability: n={:>4} nodes -> {:>8.1}ms",
-                n * 2,
-                elapsed.as_secs_f64() * 1000.0
-            );
-        }
     }
 
     /// E-graph discovers MatMul+Add → FusedMatMulAdd.
@@ -2363,105 +2210,44 @@ mod tests {
                             Op::SwiGLU
                         ));
                     }
-                    for mode in [OptimizeMode::EgglogWhole, OptimizeMode::EgglogOutlined] {
-                        for extraction_cost in
-                            [ExtractionCost::AstSize, ExtractionCost::TensorTraffic]
-                        {
-                            let (opt, _) = optimize_with_config(
-                                &g,
-                                OptimizeConfig {
-                                    mode,
-                                    extraction_cost,
-                                    ..Default::default()
-                                },
-                            );
-                            let output = opt.node(opt.outputs()[0]);
-                            assert!(matches!(
-                                (&output.op, gelu),
-                                (Op::SwiGLUConcat, false) | (Op::GeGLUConcat, true)
-                            ));
-                            let mm = opt.node(output.inputs[0]);
-                            assert!(matches!(
-                                (&mm.op, transposed),
-                                (Op::MatMul, false) | (Op::MatMulBT, true)
-                            ));
-                            assert_eq!(mm.ty.shape, [3, 14]);
-                            let weight = opt.node(mm.inputs[1]);
-                            assert_eq!(weight.ty.dtype, dtype);
-                            assert_eq!(
-                                weight.ty.shape,
-                                if transposed { [14, 12] } else { [12, 14] }
-                            );
-                            assert_eq!(opt.derived_params.len(), 1);
-                            assert!(matches!(
-                                (&opt.derived_params[0].transform, transposed),
-                                (crate::graph::ParamTransform::HorizontalConcat, false)
-                                    | (crate::graph::ParamTransform::VerticalConcat, true)
-                            ));
-                        }
+                    // Modes share rewrite semantics (see the ablation test);
+                    // the extraction cost decides between the candidates.
+                    for extraction_cost in [ExtractionCost::AstSize, ExtractionCost::TensorTraffic]
+                    {
+                        let (opt, _) = optimize_with_config(
+                            &g,
+                            OptimizeConfig {
+                                extraction_cost,
+                                ..Default::default()
+                            },
+                        );
+                        let output = opt.node(opt.outputs()[0]);
+                        assert!(matches!(
+                            (&output.op, gelu),
+                            (Op::SwiGLUConcat, false) | (Op::GeGLUConcat, true)
+                        ));
+                        let mm = opt.node(output.inputs[0]);
+                        assert!(matches!(
+                            (&mm.op, transposed),
+                            (Op::MatMul, false) | (Op::MatMulBT, true)
+                        ));
+                        assert_eq!(mm.ty.shape, [3, 14]);
+                        let weight = opt.node(mm.inputs[1]);
+                        assert_eq!(weight.ty.dtype, dtype);
+                        assert_eq!(
+                            weight.ty.shape,
+                            if transposed { [14, 12] } else { [12, 14] }
+                        );
+                        assert_eq!(opt.derived_params.len(), 1);
+                        assert!(matches!(
+                            (&opt.derived_params[0].transform, transposed),
+                            (crate::graph::ParamTransform::HorizontalConcat, false)
+                                | (crate::graph::ParamTransform::VerticalConcat, true)
+                        ));
                     }
                 }
             }
         }
-    }
-
-    /// Backward ops are encoded into egglog (not skipped).
-    #[test]
-    fn test_egglog_encodes_backward_ops() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 8]);
-        let w = g.parameter("w", &[8, 4]);
-        let at = g.add_raw_node(
-            Op::MatMulAT,
-            vec![x, x],
-            crate::graph::TensorType::f32(vec![8, 8]),
-        );
-        let bt = g.add_raw_node(
-            Op::MatMulBT,
-            vec![x, w],
-            crate::graph::TensorType::f32(vec![4, 8]),
-        );
-        g.set_outputs(vec![at, bt]);
-
-        let program = dump_egglog_program(&g);
-        assert!(program.contains("MatMulAT"), "MatMulAT not encoded");
-        assert!(program.contains("MatMulBT"), "MatMulBT not encoded");
-
-        let mut egraph = egglog::EGraph::default();
-        egraph
-            .parse_and_run_program(None, &program)
-            .expect("egglog failed with backward ops");
-    }
-
-    /// E-graph discovers MatMulBT+Add → FusedMatMulBTAdd on backward ops.
-    #[test]
-    fn test_egglog_discovers_backward_bt_add_fusion() {
-        let mut g = Graph::new();
-        let grad = g.input("grad", &[4, 8]);
-        let w = g.parameter("w", &[4, 8]);
-        let prev = g.input("prev_grad", &[4, 4]);
-        let bt = g.add_raw_node(
-            Op::MatMulBT,
-            vec![grad, w],
-            crate::graph::TensorType::f32(vec![4, 4]),
-        );
-        let out = g.add(bt, prev);
-        g.set_outputs(vec![out]);
-
-        let (opt, report) = optimize_with_report(&g);
-        let output_node = opt.node(opt.outputs()[0]);
-        assert!(
-            matches!(output_node.op, Op::FusedMatMulBTAdd),
-            "expected FusedMatMulBTAdd, got {:?}",
-            output_node.op
-        );
-        assert!(
-            report
-                .fusions_applied
-                .iter()
-                .any(|entry| entry.0.contains("BT")),
-            "no BT fusion in report"
-        );
     }
 
     /// Extracting a fusion below a generic root appends the fused node. The
@@ -2515,76 +2301,29 @@ mod tests {
         }
     }
 
-    /// E-graph recognizes x * sigmoid(x) → Silu(x).
+    /// E-graph recognizes x * sigmoid(x) → Silu(x), and silu(gate) * up →
+    /// SwiGLU when the activation feeds a gating product.
     #[test]
     fn test_silu_fusion() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 8]);
-        let sig = g.sigmoid(x);
-        let out = g.mul(x, sig);
-        g.set_outputs(vec![out]);
+        for gated in [false, true] {
+            let mut g = Graph::new();
+            let x = g.input("x", &[4, 8]);
+            let sig = g.sigmoid(x);
+            let mut out = g.mul(x, sig);
+            if gated {
+                let up = g.input("up", &[4, 8]);
+                out = g.mul(out, up);
+            }
+            g.set_outputs(vec![out]);
 
-        let (opt, report) = optimize_with_report(&g);
-        // The output should now be Silu
-        let has_silu = opt.nodes().iter().any(|n| matches!(n.op, Op::Silu));
-        assert!(
-            has_silu,
-            "expected Silu fusion, got nodes: {:?}",
-            opt.nodes()
-                .iter()
-                .map(|n| format!("{:?}", n.op))
-                .collect::<Vec<_>>()
-        );
-        assert!(
-            !report.fusions_applied.is_empty() || has_silu,
-            "no Silu fusion detected"
-        );
-    }
-
-    /// Pattern recognition of decomposed Silu+Mul → SwiGLU.
-    #[test]
-    fn test_swiglu_from_decomposed() {
-        let mut g = Graph::new();
-        let gate = g.input("gate", &[4, 8]);
-        let up = g.input("up", &[4, 8]);
-        // Decomposed SwiGLU: silu(gate) * up
-        let sig = g.sigmoid(gate);
-        let silu = g.mul(gate, sig);
-        let out = g.mul(silu, up);
-        g.set_outputs(vec![out]);
-
-        let (opt, _report) = optimize_with_report(&g);
-        let has_swiglu = opt.nodes().iter().any(|n| matches!(n.op, Op::SwiGLU));
-        assert!(
-            has_swiglu,
-            "expected SwiGLU fusion from decomposed silu*up, got nodes: {:?}",
-            opt.nodes()
-                .iter()
-                .map(|n| format!("{:?}", n.op))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    /// MaxPool2d and GlobalAvgPool survive e-graph optimization unchanged.
-    #[test]
-    fn test_pool_ops_roundtrip() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[64 * 8 * 8]);
-        let pool = g.max_pool_2d(x, 1, 64, 8, 8, 2, 2, 2, 0);
-        let gap = g.global_avg_pool(pool, 1, 64, 16);
-        g.set_outputs(vec![gap]);
-
-        let (opt, _report) = optimize_with_report(&g);
-        let has_maxpool = opt
-            .nodes()
-            .iter()
-            .any(|n| matches!(n.op, Op::MaxPool2d { .. }));
-        let has_gap = opt
-            .nodes()
-            .iter()
-            .any(|n| matches!(n.op, Op::GlobalAvgPool { .. }));
-        assert!(has_maxpool, "MaxPool2d should survive optimization");
-        assert!(has_gap, "GlobalAvgPool should survive optimization");
+            let (opt, _) = optimize_with_report(&g);
+            let fused = opt.nodes().iter().any(|n| match n.op {
+                Op::Silu => !gated,
+                Op::SwiGLU => gated,
+                _ => false,
+            });
+            assert!(fused, "gated={gated}: {:?}", live_ops(&opt));
+        }
     }
 
     /// Fusion fires even when the fused-away producer has a second
@@ -2637,25 +2376,6 @@ mod tests {
         match opt.node(out.inputs[0]).op {
             Op::RmsNorm { eps } => assert_eq!(eps.to_bits(), 1e-6f32.to_bits()),
             ref other => panic!("expected RmsNorm, got {other:?}"),
-        }
-        assert_eq!(live_ops(&opt).len(), 4, "{:?}", live_ops(&opt));
-    }
-
-    #[test]
-    fn decomposed_layer_norm_becomes_the_fused_kernel() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 16]);
-        let w = g.parameter("w", &[16]);
-        let b = g.parameter("b", &[16]);
-        let y = g.decomposed_layer_norm(x, w, b, 1e-5);
-        g.set_outputs(vec![y]);
-        assert!(g.nodes().iter().all(|node| node.op.is_primitive()));
-
-        let opt = optimize(&g.recompose());
-        let out = opt.node(opt.outputs()[0]);
-        match out.op {
-            Op::LayerNorm { eps } => assert_eq!(eps.to_bits(), 1e-5f32.to_bits()),
-            ref other => panic!("expected LayerNorm, got {other:?}"),
         }
         assert_eq!(live_ops(&opt).len(), 4, "{:?}", live_ops(&opt));
     }

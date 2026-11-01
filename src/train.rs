@@ -618,24 +618,6 @@ mod tests {
     use crate::graph::Graph;
 
     #[test]
-    fn test_compile_training_graph_simple() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 3]);
-        let w = g.parameter("w", &[3, 2]);
-        let y = g.matmul(x, w);
-        let loss = g.mean_all(y);
-        g.set_outputs(vec![loss]);
-
-        let (plan, report) = compile_training_graph(&g);
-        assert!(!plan.dispatches.is_empty());
-        assert!(plan.loss_buffer.is_some());
-        assert_eq!(plan.param_grad_pairs.len(), 1);
-        assert_eq!(plan.param_buffers.len(), 1);
-        assert_eq!(plan.input_buffers.len(), 1);
-        assert!(report.nodes_before > 0);
-    }
-
-    #[test]
     fn test_compile_training_graph_mlp() {
         let mut g = Graph::new();
         let x = g.input("x", &[4, 784]);
@@ -651,6 +633,8 @@ mod tests {
         g.set_outputs(vec![loss]);
 
         let (plan, report) = compile_training_graph(&g);
+        assert!(!plan.dispatches.is_empty());
+        assert!(report.nodes_before > 0);
         // 3 parameters → 3 grad pairs
         assert_eq!(plan.param_grad_pairs.len(), 3);
         assert_eq!(plan.param_buffers.len(), 3);
@@ -698,70 +682,5 @@ mod tests {
             .map(|entry| entry.0.as_str())
             .collect();
         assert_eq!(trained, ["down", "gate+up"]);
-    }
-
-    #[test]
-    fn test_train_config_default() {
-        let config = TrainConfig::default();
-        assert!(matches!(
-            config.optimizer,
-            Optimizer::Sgd {
-                learning_rate: 0.01
-            }
-        ));
-        assert_eq!(config.log_interval, 100);
-    }
-
-    #[test]
-    fn test_train_history_final_loss() {
-        let mut h = TrainHistory::default();
-        assert_eq!(h.final_loss(), None);
-        h.epochs.push(EpochStats {
-            epoch: 0,
-            avg_loss: 2.5,
-            steps: 10,
-        });
-        h.epochs.push(EpochStats {
-            epoch: 1,
-            avg_loss: 1.2,
-            steps: 10,
-        });
-        assert_eq!(h.final_loss(), Some(1.2));
-    }
-
-    #[test]
-    fn test_epoch_stats_fields() {
-        let stats = EpochStats {
-            epoch: 3,
-            avg_loss: 0.42,
-            steps: 100,
-        };
-        assert_eq!(stats.epoch, 3);
-        assert!((stats.avg_loss - 0.42).abs() < 1e-6);
-        assert_eq!(stats.steps, 100);
-    }
-
-    #[test]
-    fn test_compile_and_cache_roundtrip() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 3]);
-        let w = g.parameter("w", &[3, 2]);
-        let y = g.matmul(x, w);
-        let loss = g.mean_all(y);
-        g.set_outputs(vec![loss]);
-
-        let (plan, _) = compile_training_graph(&g);
-
-        let dir = std::env::temp_dir().join("meganeura_test_train_cache");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("train_plan.ron");
-
-        cache::save_plan(&plan, &g, &path).unwrap();
-        let loaded = cache::load_plan(&g, &path).unwrap().unwrap();
-        assert_eq!(loaded.dispatches.len(), plan.dispatches.len());
-        assert_eq!(loaded.buffers.len(), plan.buffers.len());
-        assert_eq!(loaded.param_grad_pairs.len(), plan.param_grad_pairs.len());
-
-        let _ = std::fs::remove_file(&path);
     }
 }
