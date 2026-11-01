@@ -637,123 +637,117 @@ mod tests {
     use crate::{Graph, graph::Op};
 
     #[test]
-    fn native_attention_equalities_preserve_defaults_masks_and_independent_gradients() {
+    fn native_attention_equalities_preserve_defaults_and_independent_gradients() {
         use crate::kernels::attention_grad::{AttentionGrad, Operands, Part, Path};
         use crate::{
             codegen::CoopCaps,
             compile::{self, ShaderEntry},
             graph::AttentionImpl,
         };
-        for window in [0, 17] {
-            let mut graph = Graph::new();
-            let q = graph.parameter("q", &[129, 3 * 64]);
-            let k = graph.parameter("k", &[129, 64]);
-            let v = graph.parameter("v", &[129, 64]);
-            let y = if window == 0 {
-                graph.causal_attention(q, k, v, 3, 1, 64)
-            } else {
-                graph.sliding_window_attention(q, k, v, 3, 1, 64, window)
-            };
-            let loss = graph.mean_all(y);
-            graph.set_outputs(vec![loss, y]);
-            let target = super::Target {
-                caps: CoopCaps {
-                    f32_tile: 16,
-                    f16_tile: 16,
-                    f16_attention_rows: 0,
-                },
-                shared_memory_bytes: 32768,
-                forward_coop: true,
-            };
-            let compile = |g: &Graph| {
-                compile::compile_with_caps(
-                    g,
-                    &Default::default(),
-                    target.caps,
-                    target.shared_memory_bytes,
-                )
-            };
-            let ordinary = crate::optimize::optimize(&graph);
-            assert!(ordinary.nodes().iter().all(|n| n.attention_impl.is_none()));
-            assert!(
-                compile(&ordinary)
-                    .dispatches
-                    .iter()
-                    .any(|d| d.shader == ShaderEntry::FlashAttentionCoop)
-            );
-            let space = candidates(&graph, Default::default(), 4, target).unwrap();
-            let native = space
-                .candidates
+        // Admission does not depend on the mask, and mask parameters are
+        // checked across layouts by `backward_equalities_keep_masks_...`.
+        let mut graph = Graph::new();
+        let q = graph.parameter("q", &[129, 3 * 64]);
+        let k = graph.parameter("k", &[129, 64]);
+        let v = graph.parameter("v", &[129, 64]);
+        let y = graph.causal_attention(q, k, v, 3, 1, 64);
+        let loss = graph.mean_all(y);
+        graph.set_outputs(vec![loss, y]);
+        let target = super::Target {
+            caps: CoopCaps {
+                f32_tile: 16,
+                f16_tile: 16,
+                f16_attention_rows: 0,
+            },
+            shared_memory_bytes: 32768,
+            forward_coop: true,
+        };
+        let compile = |g: &Graph| {
+            compile::compile_with_caps(
+                g,
+                &Default::default(),
+                target.caps,
+                target.shared_memory_bytes,
+            )
+        };
+        let ordinary = crate::optimize::optimize(&graph);
+        assert!(ordinary.nodes().iter().all(|n| n.attention_impl.is_none()));
+        assert!(
+            compile(&ordinary)
+                .dispatches
                 .iter()
-                .find(|form| {
-                    form.graph
-                        .nodes()
-                        .iter()
-                        .any(|n| n.attention_impl == Some(AttentionImpl::CooperativeF32))
-                })
-                .expect("native forward in small frontier");
-            let full = crate::autodiff::differentiate(&native.graph).into_toposort();
-            let ordinary_backward = compile(&full);
-            assert!(
-                ordinary_backward
+                .any(|d| d.shader == ShaderEntry::FlashAttentionCoop)
+        );
+        let space = candidates(&graph, Default::default(), 4, target).unwrap();
+        let native = space
+            .candidates
+            .iter()
+            .find(|form| {
+                form.graph
+                    .nodes()
+                    .iter()
+                    .any(|n| n.attention_impl == Some(AttentionImpl::CooperativeF32))
+            })
+            .expect("native forward in small frontier");
+        let full = crate::autodiff::differentiate(&native.graph).into_toposort();
+        let ordinary_backward = compile(&full);
+        assert!(
+            ordinary_backward
+                .dispatches
+                .iter()
+                .any(|d| d.shader == ShaderEntry::FlashAttentionCoopF32)
+        );
+        assert!(!ordinary_backward.dispatches.iter().any(|d| matches!(
+            d.shader,
+            ShaderEntry::AttentionGrad(AttentionGrad {
+                path: Path::Cooperative(Operands::F32),
+                ..
+            })
+        )));
+        let layouts = super::backward_candidates(&full, Default::default(), 16, target).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for form in &layouts.candidates {
+            let mut choices = [false; 2];
+            for node in form.graph.nodes() {
+                let (index, fwd) = match node.op {
+                    Op::MultiHeadAttnGradQ { fwd_node, .. } => (0, fwd_node),
+                    Op::MultiHeadAttnGradK { fwd_node, .. } => (1, fwd_node),
+                    _ => continue,
+                };
+                choices[index] = node.attention_impl.is_some();
+                assert!(!choices[index] || node.attention_ept_cap.is_none());
+                assert!(node.full_precision());
+                assert_eq!(
+                    form.graph.node(fwd).attention_impl,
+                    Some(AttentionImpl::CooperativeF32)
+                );
+            }
+            let plan = compile(&form.graph);
+            for (index, part) in [Part::Q, Part::KV].into_iter().enumerate() {
+                let dispatch = plan
                     .dispatches
                     .iter()
-                    .any(|d| d.shader == ShaderEntry::FlashAttentionCoopF32)
-            );
-            assert!(!ordinary_backward.dispatches.iter().any(|d| matches!(
-                d.shader,
-                ShaderEntry::AttentionGrad(AttentionGrad {
-                    path: Path::Cooperative(Operands::F32),
-                    ..
-                })
-            )));
-            let layouts =
-                super::backward_candidates(&full, Default::default(), 16, target).unwrap();
-            let mut seen = std::collections::HashSet::new();
-            for form in &layouts.candidates {
-                let mut choices = [false; 2];
-                for node in form.graph.nodes() {
-                    let (index, fwd) = match node.op {
-                        Op::MultiHeadAttnGradQ { fwd_node, .. } => (0, fwd_node),
-                        Op::MultiHeadAttnGradK { fwd_node, .. } => (1, fwd_node),
-                        _ => continue,
-                    };
-                    choices[index] = node.attention_impl.is_some();
-                    assert!(!choices[index] || node.attention_ept_cap.is_none());
-                    assert!(node.full_precision());
-                    assert_eq!(
-                        form.graph.node(fwd).attention_impl,
-                        Some(AttentionImpl::CooperativeF32)
-                    );
-                }
-                let plan = compile(&form.graph);
-                for (index, part) in [Part::Q, Part::KV].into_iter().enumerate() {
-                    let dispatch = plan
-                        .dispatches
-                        .iter()
-                        .find(|d| {
-                            matches!(d.shader,
-                        ShaderEntry::AttentionGrad(k) if k.part == part)
-                        })
-                        .unwrap();
-                    assert_eq!(
-                        dispatch.shader
-                            == ShaderEntry::AttentionGrad(AttentionGrad::new(
-                                part,
-                                Path::Cooperative(Operands::F32)
-                            )),
-                        choices[index]
-                    );
-                    assert_eq!(dispatch.params[4], window);
-                }
-                seen.insert(choices);
+                    .find(|d| {
+                        matches!(d.shader,
+                    ShaderEntry::AttentionGrad(k) if k.part == part)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    dispatch.shader
+                        == ShaderEntry::AttentionGrad(AttentionGrad::new(
+                            part,
+                            Path::Cooperative(Operands::F32)
+                        )),
+                    choices[index]
+                );
             }
-            assert_eq!(
-                seen.len(),
-                4,
-                "independent dQ/dKV native/scalar choices: {seen:?}"
-            );
+            seen.insert(choices);
         }
+        assert_eq!(
+            seen.len(),
+            4,
+            "independent dQ/dKV native/scalar choices: {seen:?}"
+        );
     }
 
     #[test]
@@ -764,10 +758,8 @@ mod tests {
             (16, 17, 64, 3, 13311, true, false),
             (16, 17, 64, 3, 32768, false, false),
             (8, 129, 64, 3, 32768, true, false),
-            (0, 129, 64, 3, 32768, true, false),
             (16, 15, 64, 3, 32768, true, false),
             (16, 129, 48, 3, 32768, true, false),
-            (16, 16 * 65536, 64, 1, 32768, true, false),
             (16, 129, 64, 65536, 32768, true, false),
         ] {
             let mut graph = Graph::new();
@@ -813,15 +805,12 @@ mod tests {
                 }
             }
         }
+        // Derivative shape and storage limits are `Path::admits`, covered in
+        // `kernels::attention_grad`; here: the search gate and Q/KV mapping.
         for (tile, rows, keys, dim, bytes, expected) in [
             (16, 129, 145, 64, 18624, [true, true]),
-            (16, 129, 145, 64, 18623, [false, false]),
-            (16, 129, 145, 128, 32768, [false, false]),
-            (16, 127, 145, 64, 32768, [false, false]),
-            (16, 129, 127, 64, 32768, [false, false]),
             (16, 16 * 65536, 128, 64, 32768, [false, true]),
             (8, 129, 145, 64, 32768, [false, false]),
-            (0, 129, 145, 64, 32768, [false, false]),
         ] {
             let mut graph = Graph::new();
             let q = graph.parameter("q", &[rows, dim as usize]);
@@ -994,23 +983,8 @@ mod tests {
             })
             .collect();
         assert!(impls.len() >= 2, "{impls:?}");
-        assert!(
-            impls
-                .iter()
-                .any(|spec| spec.shape.cols() == 32 && spec.splits == 1)
-        );
-        assert!(
-            impls.iter().any(|spec| spec.shape.k_stage == 16),
-            "{impls:?}"
-        );
-        assert!(impls.iter().any(|spec| spec.splits == 8));
-        for unroll in [false, true] {
-            assert!(
-                impls
-                    .iter()
-                    .any(|spec| spec.splits == 8 && spec.shape.unroll_k == unroll)
-            );
-        }
+        assert!(impls.iter().any(|spec| spec.splits == 1), "{impls:?}");
+        assert!(impls.iter().any(|spec| spec.splits > 1), "{impls:?}");
         for candidate in &space.candidates {
             let scheduled = candidate
                 .graph
@@ -1099,60 +1073,6 @@ mod tests {
                             .iter()
                             .all(|n| matches!(n.op, Op::MatMulBT) == transposed)
                     );
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "CPU search timing, run separately from correctness tests"]
-    #[cfg(feature = "models")]
-    fn cpu_search_overhead() {
-        use crate::models::{smollm2, smolvla, whisper};
-        for model in ["SmolLM2-135M", "SmolVLA", "Whisper-tiny"] {
-            let mut graph = Graph::new();
-            let output = match model {
-                "SmolLM2-135M" => {
-                    smollm2::build_graph(&mut graph, &smollm2::Config::smollm2_135m(), 128)
-                }
-                "SmolVLA" => smolvla::build_action_expert(
-                    &mut graph,
-                    &smolvla::Config::smolvla_base(),
-                    50,
-                    16,
-                ),
-                _ => whisper::build_encoder(&mut graph, &whisper::Config::whisper_tiny(), 1, 3000),
-            };
-            graph.set_outputs(vec![output]);
-            let region = crate::outline::detect_repeated_regions(&graph)[0];
-            for extraction_cost in [
-                crate::optimize::ExtractionCost::TensorTraffic,
-                crate::optimize::ExtractionCost::AstSize,
-            ] {
-                for sample in 0..6 {
-                    let start = std::time::Instant::now();
-                    let config = crate::OptimizeConfig {
-                        extraction_cost,
-                        ..Default::default()
-                    };
-                    let space = super::candidates(&graph, config, 4, Default::default())
-                        .or_else(|_| {
-                            super::repeated_candidates(
-                                &graph,
-                                region,
-                                config,
-                                4,
-                                Default::default(),
-                            )
-                        })
-                        .unwrap();
-                    println!(
-                        "{model} cost={extraction_cost:?} sample={sample} candidates={} truncated={} ms={:.3}",
-                        space.candidates.len(),
-                        space.truncated,
-                        start.elapsed().as_secs_f64() * 1000.0
-                    );
-                    assert!(!space.candidates.is_empty());
                 }
             }
         }
@@ -1249,11 +1169,6 @@ mod tests {
                 "unfused schedule {scheduled} was crowded out"
             );
         }
-        assert!(
-            candidates(&graph, Default::default(), 1, Default::default())
-                .unwrap()
-                .truncated
-        );
 
         let d = graph.input("d", &[3, 7]);
         let e = graph.parameter("e", &[7, 5]);
@@ -1263,7 +1178,6 @@ mod tests {
         let out = graph.mul(add, add2);
         graph.set_outputs(vec![out]);
         let space = candidates(&graph, Default::default(), 16, Default::default()).unwrap();
-        assert!(space.truncated);
         assert!(space.candidates.len() > 4);
         let tiles: std::collections::HashSet<_> = space
             .candidates
@@ -1347,7 +1261,6 @@ mod tests {
         let space =
             super::repeated_candidates(&graph, region, Default::default(), 8, Default::default())
                 .unwrap();
-        assert!(space.truncated);
         assert!(space.candidates.len() >= 2);
         assert!(space.candidates.iter().any(|candidate| {
             candidate

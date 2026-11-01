@@ -31,74 +31,54 @@ fn deep_residual_model(layers: usize, dim: usize, batch: usize) -> Graph {
 
 #[test]
 fn outlined_regions_get_egglog_saturation() {
-    let g = deep_residual_model(64, 8, 2);
-    let active = g.nodes().len();
-    assert!(active > 300, "test graph must exceed the cutoff: {active}");
+    // 64 layers exceed the egglog node cutoff and are outlined; 4 layers stay
+    // under it and use full-graph extraction. Both must fuse every layer.
+    for layers in [64, 4] {
+        let g = deep_residual_model(layers, 8, 2);
+        let active = g.nodes().len();
+        assert_eq!(
+            active > 300,
+            layers == 64,
+            "{layers} layers: {active} nodes"
+        );
 
-    let (opt, report) = optimize::optimize_with_config(
-        &g,
-        OptimizeConfig {
-            mode: OptimizeMode::EgglogOutlined,
-            ..OptimizeConfig::default()
-        },
-    );
+        let (opt, report) = optimize::optimize_with_config(
+            &g,
+            OptimizeConfig {
+                mode: OptimizeMode::EgglogOutlined,
+                ..OptimizeConfig::default()
+            },
+        );
 
-    assert!(
-        report.outlined_regions >= 1,
-        "expected at least one outlined region on a 64-layer model"
-    );
-    assert!(
-        report.egglog_time > std::time::Duration::ZERO,
-        "egglog saturation must actually run on the outlined block"
-    );
-    assert!(
-        report.num_enodes > 0,
-        "outlined saturation should report e-graph stats"
-    );
+        if layers == 64 {
+            assert!(
+                report.outlined_regions >= 1,
+                "expected at least one outlined region on a 64-layer model"
+            );
+            assert!(
+                report.egglog_time > std::time::Duration::ZERO,
+                "egglog saturation must actually run on the outlined block"
+            );
+        } else {
+            assert_eq!(report.outlined_regions, 0);
+        }
+        assert!(
+            report.num_enodes > 0,
+            "{layers} layers: saturation should report e-graph stats"
+        );
 
-    let fused_mm = opt
-        .nodes()
-        .iter()
-        .filter(|n| matches!(n.op, Op::FusedMatMulAdd))
-        .count();
-    let silu = opt
-        .nodes()
-        .iter()
-        .filter(|n| matches!(n.op, Op::Silu))
-        .count();
-    assert_eq!(fused_mm, 64, "one FusedMatMulAdd per layer");
-    assert_eq!(silu, 64, "one Silu per layer");
-}
-
-#[test]
-fn small_graph_extraction_gates_appliers() {
-    // Under the cutoff: the full-graph egglog path with traffic-cost
-    // extraction decides the fusions. Same patterns, same outcome.
-    let g = deep_residual_model(4, 8, 2);
-    assert!(g.nodes().len() <= 300);
-
-    let (opt, report) = optimize::optimize_with_config(
-        &g,
-        OptimizeConfig {
-            mode: OptimizeMode::EgglogOutlined,
-            ..OptimizeConfig::default()
-        },
-    );
-    assert_eq!(report.outlined_regions, 0);
-    assert!(report.num_enodes > 0);
-
-    let fused_mm = opt
-        .nodes()
-        .iter()
-        .filter(|n| matches!(n.op, Op::FusedMatMulAdd))
-        .count();
-    let silu = opt
-        .nodes()
-        .iter()
-        .filter(|n| matches!(n.op, Op::Silu))
-        .count();
-    assert_eq!(fused_mm, 4);
-    assert_eq!(silu, 4);
+        let count = |pred: fn(&Op) -> bool| opt.nodes().iter().filter(|n| pred(&n.op)).count();
+        assert_eq!(
+            count(|op| matches!(op, Op::FusedMatMulAdd)),
+            layers,
+            "one FusedMatMulAdd per layer"
+        );
+        assert_eq!(
+            count(|op| matches!(op, Op::Silu)),
+            layers,
+            "one Silu per layer"
+        );
+    }
 }
 
 #[test]

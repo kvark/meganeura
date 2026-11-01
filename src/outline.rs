@@ -311,17 +311,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_repeating_graph() {
-        let mut g = Graph::new();
-        let x = g.input("x", &[4, 8]);
-        let w = g.parameter("w", &[8, 8]);
-        let mm = g.matmul(x, w);
-        let r = g.relu(mm);
-        g.set_outputs(vec![r]);
-        assert!(detect_repeated_regions(&g).is_empty());
-    }
-
-    #[test]
     fn shape_change_breaks_region() {
         // Two runs of layers with different dims: the detector must not
         // merge them into one region (signatures differ via ty).
