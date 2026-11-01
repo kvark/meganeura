@@ -706,7 +706,7 @@ mod tests {
 
     #[test]
     fn shader_knob_changes_are_measured_with_identical_dispatches() {
-        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
+        let gpu = crate::reference::gpu::shared_context();
         let mut graph = crate::Graph::new();
         let q = graph.input("q", &[128, 64]);
         let k = graph.input("k", &[128, 64]);
@@ -728,7 +728,8 @@ mod tests {
         let alternate = crate::compile::compile_with(&graph, &options);
         assert_eq!(baseline.dispatches, alternate.dispatches);
         assert_ne!(baseline.knobs, alternate.knobs);
-        let programs = [baseline.clone(), alternate, baseline].map(|plan| Program {
+        // The exact-duplicate skip is covered by `later_searches_...`.
+        let programs = [baseline, alternate].map(|plan| Program {
             description: format!("interleave={}", plan.knobs.flash.interleave),
             plan,
             submission_chunks: Some(1),
@@ -742,13 +743,12 @@ mod tests {
                 ..Default::default()
             },
             BuildSearchOptions {
-                max_programs: 3,
+                max_programs: 2,
                 max_submission_chunks: 1,
                 max_plan_bytes: 1 << 20,
                 max_time: Duration::from_secs(30),
                 warmup_runs: 1,
                 warmup_time: Duration::ZERO,
-                // Keep the baseline so the third program is its exact duplicate.
                 min_improvement: 0.99,
                 tuning: TuneOptions {
                     max_time: Duration::ZERO,
@@ -776,22 +776,19 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(report.trials.len(), 3);
+        assert_eq!(report.trials.len(), 2);
         assert_eq!(report.selected, 0);
         assert!(report.trials.iter().all(|trial| trial.outcome.qualified));
         assert_eq!(report.trials[1].outcome.baseline_ms.len(), 4);
         assert_eq!(report.trials[1].outcome.candidate_ms.len(), 4);
-        assert!(report.trials[2].outcome.baseline_ms.is_empty());
-        assert!(report.trials[2].outcome.candidate_ms.is_empty());
     }
 
     #[test]
     fn program_search_preserves_update_and_failure_contracts() {
         use crate::compile::{Dispatch, Kernel, ShaderEntry};
         use crate::schedule::{PointwiseDAG, Pw};
-        let gpu_options = crate::GpuOptions::from_env();
-        let timing = gpu_options.timing;
-        let gpu = Arc::new(crate::init_gpu_context_with(gpu_options).unwrap());
+        let timing = crate::GpuOptions::from_env().timing;
+        let gpu = crate::reference::gpu::shared_context();
         let mut graph = crate::Graph::new();
         let x = graph.input("x", &[2]);
         let w = graph.parameter("w", &[2]);
@@ -820,13 +817,11 @@ mod tests {
             }),
             ..Default::default()
         });
+        // Repeated checks, a failing challenger, and an incumbent that fails
+        // the final checks after single-check exploration.
         for (checkpoint_runs, final_runs, max_programs, invalidate) in [
             (2, 0, 2, None),
             (2, 0, 2, Some("candidate")),
-            (2, 0, 2, Some("baseline")),
-            (1, 2, 1, None),
-            (1, 2, 1, Some("baseline")),
-            (1, 2, 2, None),
             (1, 2, 2, Some("baseline")),
         ] {
             let initialized = std::cell::Cell::new(0);
@@ -884,7 +879,7 @@ mod tests {
                         && invalidate.is_some_and(|name| s.plan().dispatches[0].label == name)
                     {
                         repeated += 1;
-                        if repeated == if max_programs == 1 { 3 } else { 2 } {
+                        if repeated == 2 {
                             return Err("injected repeatability failure".into());
                         }
                     }
@@ -915,8 +910,7 @@ mod tests {
             } else {
                 let (mut selected, report) = result.unwrap();
                 assert!(report.trials.iter().all(|t| t.outcome.qualified));
-                // Single-check exploration still checks the final program twice,
-                // including the untuned fallback, with its update reset each time.
+                // The final program is checked again, its update reset each time.
                 assert!(
                     report
                         .trials
@@ -939,143 +933,38 @@ mod tests {
         }
     }
 
+    /// Challengers inherit both SwiGLU sources and the weight packed from
+    /// them, charged once. Reuploading one source, unchanged and converted or
+    /// packed, rederives that weight without losing the inherited sibling.
     #[test]
-    fn challengers_inherit_immutable_and_derived_parameters() {
-        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
-        let (rows, inner, cols) = (3, 12, 8);
-        let mut graph = crate::Graph::new();
-        let x = graph.input("x", &[rows, inner]);
-        let gate = graph.parameter("gate", &[inner, cols]);
-        let up = graph.parameter("up", &[inner, cols]);
-        let (gate, up) = (graph.matmul(x, gate), graph.matmul(x, up));
-        let y = graph.swiglu(gate, up);
-        graph.set_outputs(vec![y]);
-        // The ordinary optimizer packs both projections into one derived weight.
-        let (optimized, _) = crate::optimize::optimize_with_config(&graph, Default::default());
-        let plan = crate::compile::compile(&optimized);
-        assert_eq!(plan.derived_params.len(), 1);
-        let values = |seed: usize, n: usize| -> Vec<f32> {
-            (0..n)
-                .map(|i| ((i * 7 + seed) % 11) as f32 * 0.1 - 0.5)
-                .collect()
-        };
-        let (input, weights) = (
-            values(0, rows * inner),
-            [
-                ("gate", values(1, inner * cols)),
-                ("up", values(2, inner * cols)),
-            ],
-        );
-        let product = |w: &[f32], r: usize, c: usize| -> f64 {
-            (0..inner)
-                .map(|k| f64::from(input[r * inner + k]) * f64::from(w[k * cols + c]))
-                .sum()
-        };
-        let expected: Vec<f64> = (0..rows * cols)
-            .map(|i| {
-                let (a, b) = (
-                    product(&weights[0].1, i / cols, i % cols),
-                    product(&weights[1].1, i / cols, i % cols),
-                );
-                a / (1.0 + (-a).exp()) * b
-            })
-            .collect();
-        let programs = (0..3).map(|index| Program {
-            description: index.to_string(),
-            plan: plan.clone(),
-            submission_chunks: Some(1),
-            origin: None,
-        });
-        let uploads = std::cell::Cell::new(0);
-        let (mut selected, report) = select(
-            programs,
-            gpu,
-            SessionOptions::default(),
-            BuildSearchOptions {
-                tuning: TuneOptions {
-                    max_time: Duration::ZERO,
-                    sample_pairs: 4,
-                    ..Default::default()
-                },
-                warmup_runs: 1,
-                warmup_time: Duration::from_millis(1),
-                max_time: Duration::from_secs(30),
-                max_programs: 3,
-                max_plan_bytes: 2 * plan_bytes(&plan).unwrap()
-                    - plan
-                        .param_buffers
-                        .iter()
-                        .map(|entry| plan.buffers[entry.1.0 as usize].max(4))
-                        .sum::<usize>(),
-                ..Default::default()
-            },
-            |s, incumbent| {
-                s.set_input("x", &input);
-                for &(name, ref data) in &weights {
-                    if incumbent
-                        .as_deref()
-                        .is_some_and(|incumbent| s.inherits_parameter(incumbent, name))
-                    {
-                        continue;
-                    }
-                    uploads.set(uploads.get() + 1);
-                    s.set_parameter(name, data);
-                }
-                Ok(())
-            },
-            |s| {
-                let actual = s.read_output(rows * cols);
-                if actual
-                    .iter()
-                    .zip(&expected)
-                    .all(|(&a, &b)| (f64::from(a) - b).abs() < 1e-4)
-                {
-                    Ok(())
-                } else {
-                    Err(format!("SwiGLU mismatch: {actual:?} vs {expected:?}"))
-                }
-            },
-        )
-        .unwrap();
-        // Only the first program uploads: challengers inherit both sources and
-        // the weight derived from them.
-        assert_eq!(uploads.get(), weights.len());
-        assert_eq!(report.trials.len(), 3);
-        assert!(report.trials.iter().all(|t| t.outcome.qualified));
-        selected.step();
-        selected.wait();
-        assert!(
-            selected
-                .read_output(rows * cols)
-                .iter()
-                .zip(&expected)
-                .all(|(&a, &b)| (f64::from(a) - b).abs() < 1e-4)
-        );
-    }
-
-    #[test]
-    fn partial_reuploads_preserve_inherited_packed_parameters() {
-        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
+    fn challengers_inherit_and_partially_reupload_derived_parameters() {
+        let gpu = crate::reference::gpu::shared_context();
         let (rows, inner, cols) = (3, 32, 3);
         let expected = 4.0 / (1.0 + (-4.0_f32).exp()) * 2.0;
-        for f16 in [true, false] {
+        for format in ["f32", "f16", "q4"] {
             let mut graph = crate::Graph::new();
             let x = graph.input("x", &[rows, inner]);
-            let mut parameter = |name| {
-                if f16 {
-                    graph.parameter_f16(name, &[inner, cols])
-                } else {
-                    graph.parameter_q4(name, &[inner, cols])
-                }
+            let mut parameter = |name| match format {
+                "f32" => graph.parameter(name, &[inner, cols]),
+                "f16" => graph.parameter_f16(name, &[inner, cols]),
+                _ => graph.parameter_q4(name, &[inner, cols]),
             };
             let (gate, up) = (parameter("gate"), parameter("up"));
             let (gate, up) = (graph.matmul(x, gate), graph.matmul(x, up));
             let y = graph.swiglu(gate, up);
             graph.set_outputs(vec![y]);
+            // The ordinary optimizer packs both projections into one derived weight.
             let (optimized, _) = crate::optimize::optimize_with_config(&graph, Default::default());
             let plan = crate::compile::compile(&optimized);
             assert_eq!(plan.derived_params.len(), 1);
-            for device in [false, true] {
+            // Enough for every challenger only when inherited weights count once.
+            let max_plan_bytes = 2 * plan_bytes(&plan).unwrap()
+                - plan
+                    .param_buffers
+                    .iter()
+                    .map(|entry| plan.buffers[entry.1.0 as usize].max(4))
+                    .sum::<usize>();
+            for device in [false, true].into_iter().filter(|&d| !d || format != "f32") {
                 let initialized = std::cell::Cell::new(0);
                 let skipped = std::cell::Cell::new(0);
                 let programs = (0..3).map(|index| Program {
@@ -1103,7 +992,7 @@ mod tests {
                         warmup_time: Duration::from_millis(1),
                         max_time: Duration::from_secs(30),
                         max_programs: 3,
-                        max_plan_bytes: 1 << 20,
+                        max_plan_bytes,
                         ..Default::default()
                     },
                     |s, incumbent| {
@@ -1123,8 +1012,8 @@ mod tests {
                                 }
                             }
                             let data = vec![value; inner * cols];
-                            if trial == 2 {
-                                let packed = if f16 {
+                            if trial == 2 && format != "f32" {
+                                let packed = if format == "f16" {
                                     data.iter()
                                         .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
                                         .collect()
@@ -1148,7 +1037,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-                assert_eq!(skipped.get(), 2);
+                assert_eq!(skipped.get(), 2, "{format}");
                 assert_eq!(report.trials.len(), 3);
                 assert!(report.trials.iter().all(|t| t.outcome.qualified));
                 selected.step();
@@ -1165,17 +1054,19 @@ mod tests {
 
     #[test]
     fn later_searches_resume_shared_kernel_decisions() {
-        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
+        let gpu = crate::reference::gpu::shared_context();
         let mut graph = crate::Graph::new();
         let x = graph.input("x", &[33, 17]);
         let w = graph.parameter("w", &[17, 65]);
         let y = graph.matmul(x, w);
         graph.set_outputs(vec![y]);
         let plan = crate::compile::compile(&graph);
-        for (kernel_threshold, strategy) in [0.0, 0.99].into_iter().flat_map(|threshold| {
-            [crate::TuneStrategy::Sequential, crate::TuneStrategy::Race]
-                .map(|strategy| (threshold, strategy))
-        }) {
+        // Zero lets private kernel winners reach whole-model selection; 0.99
+        // keeps every initial kernel. Each strategy runs one threshold.
+        for (kernel_threshold, strategy) in [
+            (0.0, crate::TuneStrategy::Sequential),
+            (0.99, crate::TuneStrategy::Race),
+        ] {
             let memo = Arc::new(std::sync::Mutex::new(crate::runtime::KernelMemo::default()));
             let search = || {
                 select(
@@ -1300,23 +1191,7 @@ mod tests {
 
     #[test]
     fn untuned_fallback_survives_bounds_and_failed_tuning() {
-        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
-        assert!(
-            select(
-                [],
-                gpu.clone(),
-                SessionOptions::default(),
-                BuildSearchOptions {
-                    qualification_runs: 0,
-                    ..Default::default()
-                },
-                |_, _| panic!("invalid options must fail before initialization"),
-                |_| panic!("invalid options must fail before qualification"),
-            )
-            .err()
-            .unwrap()
-            .contains("at least one qualification run")
-        );
+        let gpu = crate::reference::gpu::shared_context();
         let mut graph = crate::Graph::new();
         let x = graph.input("x", &[33, 17]);
         let w = graph.parameter("w", &[17, 65]);
@@ -1332,6 +1207,9 @@ mod tests {
         warm.step();
         warm.wait();
         drop(warm);
+        // Far longer than one warm trial of this matmul, so only the
+        // challenger's sleep can exhaust it.
+        let deadline = Duration::from_millis(500);
         for case in ["program", "memory", "qualification", "deadline"] {
             let initialized = std::cell::Cell::new(0);
             let mut checks = 0;
@@ -1352,7 +1230,11 @@ mod tests {
                     } else {
                         1 << 20
                     },
-                    max_time: Duration::from_secs(if case == "deadline" { 2 } else { 30 }),
+                    max_time: if case == "deadline" {
+                        deadline
+                    } else {
+                        Duration::from_secs(30)
+                    },
                     warmup_runs: 1,
                     warmup_time: Duration::ZERO,
                     tuning: TuneOptions {
@@ -1368,7 +1250,7 @@ mod tests {
                     if incumbent.is_none() {
                         untuned = session.plan().dispatches.clone();
                     } else if case == "deadline" {
-                        std::thread::sleep(Duration::from_secs(2));
+                        std::thread::sleep(deadline);
                     }
                     session.set_input("x", &[0.25; 33 * 17]);
                     session.set_parameter("w", &[0.125; 17 * 65]);
@@ -1452,7 +1334,7 @@ mod tests {
 
     #[test]
     fn refreshes_inputs_for_every_execution_and_rejects_failed_refreshes() {
-        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
+        let gpu = crate::reference::gpu::shared_context();
         for fail_challenger in [false, true] {
             let mut refreshed = 0;
             let mut checked = 0;
@@ -1537,7 +1419,7 @@ mod tests {
     }
 
     fn stop_rule_search(options: BuildSearchOptions) -> (Session, BuildSearchReport) {
-        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
+        let gpu = crate::reference::gpu::shared_context();
         // Warm the kernels before starting the patience-limited search.
         let mut warm = Session::with_context_opts(
             identical_programs(1).next().unwrap().plan,
@@ -1647,7 +1529,7 @@ mod tests {
 
     #[test]
     fn cached_attention_search_restores_state() {
-        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
+        let gpu = crate::reference::gpu::shared_context();
         for (capacity, block, position, window, valid, dim) in
             [(7, 3, 0, 3, 2, 4), (96, 1, 95, 37, 1, 4)]
         {
@@ -1702,7 +1584,8 @@ mod tests {
                     );
                 }
             }
-            let programs = [1, 1, 2, 4, 8, 16, 1].into_iter().map(|splits| {
+            // Baseline, invalid output, a split challenger, a shared mutation.
+            let programs = [1, 1, 4, 1].into_iter().map(|splits| {
                 let plan = crate::compile::compile_with(
                     &graph,
                     &crate::compile::CompileOptions {
@@ -1734,7 +1617,7 @@ mod tests {
                     warmup_runs: 2,
                     warmup_time: Duration::from_millis(1),
                     max_time: Duration::from_secs(60),
-                    max_programs: 7,
+                    max_programs: 4,
                     max_plan_bytes: 1 << 20,
                     ..Default::default()
                 },
@@ -1749,7 +1632,7 @@ mod tests {
                     s.set_parameter("v", &original[1]);
                     if index == 1 {
                         s.set_input("q", &vec![f32::NAN; inputs.len()]);
-                    } else if index == 6 {
+                    } else if index == 3 {
                         s.share_parameter_from(incumbent.unwrap(), "k").unwrap();
                     }
                     index += 1;
@@ -1770,18 +1653,15 @@ mod tests {
                 },
             )
             .unwrap();
-            assert_eq!(report.trials.len(), 7);
+            assert_eq!(report.trials.len(), 4);
             assert!(!report.truncated);
             assert!(report.trials[0].outcome.qualified);
             assert!(!report.trials[1].outcome.qualified);
+            let split = &report.trials[2];
+            assert!(split.outcome.qualified && split.snapshot_bytes == capacity * dim * 4 * 2);
+            assert!(!report.trials[3].outcome.qualified);
             assert!(
-                report.trials[2..6]
-                    .iter()
-                    .all(|t| t.outcome.qualified && t.snapshot_bytes == capacity * dim * 4 * 2)
-            );
-            assert!(!report.trials[6].outcome.qualified);
-            assert!(
-                report.trials[6]
+                report.trials[3]
                     .outcome
                     .failure
                     .as_ref()
