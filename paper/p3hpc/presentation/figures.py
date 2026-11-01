@@ -77,7 +77,7 @@ def ratio_panels(panels, name, note):
     left, gap = .15, .025
     width = (.985 - left - gap * (len(panels) - 1)) / len(panels)
     for panel, (profile, phase, title) in enumerate(panels):
-        ax = fig.add_axes((left + panel * (width + gap), .15, width, .63))
+        ax = fig.add_axes((left + panel * (width + gap), .12, width, .58))
         for row, device in enumerate(DEVICES):
             for col, model in enumerate(MODELS):
                 value = ratio(device, model, profile, phase)
@@ -92,17 +92,14 @@ def ratio_panels(panels, name, note):
         ax.tick_params(length=0, pad=5)
         for spine in ax.spines.values():
             spine.set_visible(False)
-        ax.set_title(title, loc="left", fontsize=16, weight="bold", pad=46)
-    # Legend in the corner above the GPU names, with cells drawn like the table's.
-    fig.text(.008, .965, "Ours ÷ PyTorch", fontsize=11.5, weight="bold", va="center")
-    for i, (value, label) in enumerate([(.5, "Meganeura faster"), (2, "PyTorch faster"), (None, "PyTorch failed")]):
-        y = .905 - i * .058
-        fill, ink = shade(value)
-        fig.add_artist(Rectangle((.008, y - .022), .016, .044, facecolor=fill, linewidth=0,
-                                 transform=fig.transFigure))
-        if value is None:
-            fig.text(.016, y, "—", fontsize=9, color=ink, ha="center", va="center")
-        fig.text(.03, y, label, fontsize=10.5, va="center")
+        fig.text(left + panel * (width + gap), .83, title, fontsize=16, weight="bold", va="bottom")
+    # Reserve the top band for a right-aligned legend, above both panels.
+    fig.legend(handles=[Patch(facecolor=shade(v)[0], edgecolor="none", label=label)
+                        for v, label in [(.5, "Meganeura faster"), (2, "PyTorch faster"),
+                                         (None, "No qualified ratio")]],
+               loc="upper right", bbox_to_anchor=(.995, 1.01), ncol=3, frameon=False,
+               fontsize=10, title="Meganeura time ÷ PyTorch time", title_fontsize=11.5,
+               handlelength=1.1, columnspacing=1.2, handletextpad=.45)
     fig.text(left, .04, note, fontsize=10.5, color=MUTED)
     save(fig, name)
 
@@ -152,50 +149,60 @@ def search_loop():
 
 
 def egraph():
-    """One e-graph: attention reads three e-classes; rewrites add a packed product and a split-K schedule."""
-    from matplotlib.patches import FancyBboxPatch
+    """Matmul/add fusion: operator e-nodes point to shared operand e-classes."""
+    from matplotlib.patches import FancyBboxPatch, PathPatch
+    from matplotlib.path import Path as PlotPath
     fig, ax = plt.subplots(figsize=(7.2, 4.6))
     fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
     ax.set(xlim=(0, 720), ylim=(460, 0))
     ax.axis("off")
-    old, new = ("#dcebe8", TEAL), ("#f5e3d8", ORANGE)
-
-    def node(x, y, text, style, width=170):
-        fill, edge = style
-        ax.add_patch(FancyBboxPatch((x - width / 2, y - 17), width, 34, boxstyle="round,pad=0,rounding_size=6",
-                                   facecolor=fill, edgecolor=edge, linewidth=1.6))
-        ax.text(x, y, text, ha="center", va="center", fontsize=13.5, color=INK)
 
     def eclass(x, y, width, height, label):
-        ax.add_patch(FancyBboxPatch((x - width / 2, y - height / 2), width, height,
-                                   boxstyle="round,pad=0,rounding_size=12", facecolor="none",
-                                   edgecolor=MUTED, linewidth=1.5, linestyle=(0, (4, 3))))
-        ax.text(x - width / 2 + 4, y - height / 2 - 12, label, fontsize=14, weight="bold", color=MUTED, va="center")
+        ax.add_patch(FancyBboxPatch((x, y), width, height,
+                     boxstyle="round,pad=0,rounding_size=12", facecolor=CANVAS,
+                     edgecolor=MUTED, linewidth=1.5, linestyle=(0, (4, 3)), zorder=1))
+        ax.text(x + 12, y - 9, label, fontsize=13, weight="bold", color=MUTED, va="bottom")
 
-    def arrow(start, end, color=MUTED):
-        ax.annotate("", xy=end, xytext=start,
-                    arrowprops=dict(arrowstyle="->", color=color, lw=1.6, shrinkA=0, shrinkB=0))
+    def enode(x, y, width, label, added=False):
+        ax.add_patch(FancyBboxPatch((x - width / 2, y - 19), width, 38,
+                     boxstyle="round,pad=0,rounding_size=6",
+                     facecolor="#dcebe8" if added else "#eceeec",
+                     edgecolor=TEAL if added else MUTED, linewidth=1.6, zorder=3))
+        ax.text(x, y, label, ha="center", va="center", fontsize=15,
+                weight="bold" if added else "normal", color=INK, zorder=4)
 
-    node(360, 32, "attention(Q, K, V)", old, width=230)
-    columns = [(125, "Q", "Wq", 0), (360, "K", "Wk", 1), (595, "V", "Wv", 2)]
-    for x, name, weight, i in columns:
-        eclass(x, 162, 200, 108, name)
-        node(x, 140, f"X · {weight}", old)
-        node(x, 184, f"slice(P, {i})", new)
-        arrow((360 + (x - 360) * .35, 49), (x, 107))
-        arrow((x, 201), (360 + (x - 360) * .45, 296), ORANGE)
-    eclass(360, 333, 470, 70, "P")
-    node(245, 333, "X · [Wq Wk Wv]", new, width=200)
-    node(475, 333, "Σ 8 K-slice products", new, width=210)
-    # Legend.
-    y = 430
-    ax.add_patch(FancyBboxPatch((8, y - 11), 30, 22, boxstyle="round,pad=0,rounding_size=5", facecolor="none",
-                               edgecolor=MUTED, linewidth=1.4, linestyle=(0, (4, 3))))
-    ax.text(46, y, "e-class: equal values", fontsize=12.5, va="center", color=INK)
-    for x, (fill, edge), label in [(256, old, "original e-node"), (452, new, "added by a rewrite")]:
-        ax.add_patch(FancyBboxPatch((x, y - 11), 30, 22, boxstyle="round,pad=0,rounding_size=5",
-                                   facecolor=fill, edgecolor=edge, linewidth=1.4))
-        ax.text(x + 38, y, label, fontsize=12.5, va="center", color=INK)
+    def edge(points, added=False):
+        color = TEAL if added else MUTED
+        ax.add_patch(PathPatch(PlotPath(points), facecolor="none", edgecolor=color,
+                               linewidth=1.8, joinstyle="round", zorder=2))
+        ax.annotate("", xy=points[-1], xytext=points[-2], zorder=2,
+                    arrowprops=dict(arrowstyle="->", color=color, lw=1.8,
+                                    shrinkA=0, shrinkB=1))
+
+    # Dashed boxes are equivalence classes; only operator nodes have outgoing edges.
+    eclass(30, 38, 660, 100, "Y: one output e-class, two alternatives")
+    eclass(40, 200, 210, 80, "P")
+    eclass(550, 200, 140, 80, "bias")
+    eclass(40, 348, 170, 64, "input")
+    eclass(340, 348, 170, 64, "weights")
+    enode(145, 88, 104, "Add")
+    enode(480, 88, 244, "FusedMatMulAdd", added=True)
+    enode(145, 240, 146, "MatMul")
+    enode(620, 240, 72, "b")
+    enode(125, 380, 72, "X")
+    enode(425, 380, 72, "W")
+
+    edge([(130, 107), (130, 200)])
+    edge([(175, 107), (205, 166), (590, 166), (590, 200)])
+    edge([(126, 259), (125, 348)])
+    edge([(179, 259), (390, 348)])
+    # The fused alternative shares X, W and b; it has no dependency on P.
+    edge([(410, 107), (300, 180), (300, 310), (170, 348)], added=True)
+    edge([(480, 107), (455, 348)], added=True)
+    edge([(550, 107), (650, 200)], added=True)
+
+    ax.text(30, 448, "Dashed box: e-class  ·  Solid box: e-node  ·  Teal: added by the rewrite",
+            fontsize=12.5, va="center", color=MUTED)
     save(fig, "egraph.svg")
 
 
