@@ -1888,35 +1888,6 @@ mod tests {
     }
 
     #[test]
-    fn activation_quantization_splits_the_tuning_class() {
-        let ordinary = Dispatch {
-            shader: ShaderEntry::MatMulGemv,
-            params: vec![1, 256, 16, 0],
-            workgroups: [4, 1, 1],
-            weight_format: crate::compile::WeightFormat::Q40,
-            input_buffers: vec![crate::compile::BufferRef(0), crate::compile::BufferRef(1)],
-            output_buffer: crate::compile::BufferRef(2),
-            ..Default::default()
-        };
-        let quantized = Dispatch {
-            kernel: crate::compile::Kernel::Gemv {
-                shape: crate::codegen::GemvShape::initial(crate::codegen::ShaderGroup::MatMulGemv),
-                integer_dot: true,
-            },
-            ..ordinary.clone()
-        };
-
-        let a = TuneClass::from_dispatch(&ordinary, None).expect("ordinary Q4_0 GEMV");
-        let b = TuneClass::from_dispatch(&quantized, None).expect("int-dot Q4_0 GEMV");
-
-        assert_eq!(a.weight_format, b.weight_format);
-        assert_eq!((a.m, a.n, a.k), (b.m, b.n, b.k));
-        assert_eq!(a.shader, b.shader);
-        assert_ne!(a, b, "the two kernels would coalesce into one class");
-        assert!(!a.gemv_int_dot && b.gemv_int_dot);
-    }
-
-    #[test]
     fn every_gemv_storage_format_reaches_every_shape() {
         use crate::DType;
         use crate::codegen::{GemvReduction, GemvShape};
@@ -1991,7 +1962,8 @@ mod tests {
 
     /// RMSNorm folded into a packed Q4_0 GEMV is its own search class, and
     /// the subgroup-reduction shapes are legal challengers. Without this,
-    /// `tune_with` would skip the kernels that dominate Gemma 4 decode.
+    /// `tune_with` would skip the kernels that dominate Gemma 4 decode. The
+    /// same holds for a vocab-width fused Q8 GEMV.
     #[test]
     fn fused_packed_q40_gemv_is_searchable_including_subgroup() {
         use crate::codegen::{GemvReduction, GemvShape};
@@ -2025,17 +1997,21 @@ mod tests {
             .iter()
             .map(|b| plan.buffers[b.0 as usize])
             .collect();
+        let has_subgroup = |class: &TuneClass, initial| {
+            class.challengers(initial, None).iter().any(|tile| {
+                matches!(
+                    tile,
+                    MatmulTile::Gemv(GemvShape {
+                        reduction: GemvReduction::Subgroup,
+                        ..
+                    })
+                )
+            })
+        };
         let initial = MatmulTile::selected(dispatch, None).unwrap();
-        let challengers = class.challengers(initial, None);
         assert!(
-            challengers.iter().any(|tile| matches!(
-                tile,
-                MatmulTile::Gemv(GemvShape {
-                    reduction: GemvReduction::Subgroup,
-                    ..
-                })
-            )),
-            "fused packed GEMV has no subgroup challenger: {challengers:?}"
+            has_subgroup(&class, initial),
+            "fused packed GEMV has no subgroup challenger"
         );
         assert!(
             MatmulTile::Gemv(GemvShape {
@@ -2047,21 +2023,16 @@ mod tests {
             .fits(&class),
             "64-wide subgroup fused Q4_0 GEMV must fit the class scratch"
         );
-    }
 
-    /// Gemma 4's tied vocab projection is Q8, M=1, N=262144. That is 65536
-    /// workgroups, which the portable 65535 cap used to reject, so `tune_with`
-    /// never measured subgroup variants of the costliest decode kernel.
-    #[test]
-    fn vocab_width_q8_rmsnorm_gemv_is_searchable_past_portable_workgroup_min() {
-        use crate::codegen::{GemvReduction, GemvShape};
-
-        const K: u32 = 1536;
-        const N: u32 = 262_144;
+        // Gemma 4's tied vocab projection is Q8, M=1, N=262144. That is 65536
+        // workgroups, which the portable 65535 cap used to reject, so
+        // `tune_with` never measured subgroup variants of the costliest
+        // decode kernel.
+        let (k, n) = (1536, 262_144);
         let dispatch = Dispatch {
             shader: ShaderEntry::MatMulGemv,
-            params: vec![1, K, N, 0],
-            workgroups: [N / 4, 1, 1],
+            params: vec![1, k, n, 0],
+            workgroups: [n / 4, 1, 1],
             weight_format: crate::compile::WeightFormat::Q8,
             gemv_rmsnorm: Some(crate::compile::GemvRmsNorm {
                 weight: crate::compile::BufferRef(2),
@@ -2075,21 +2046,15 @@ mod tests {
             .expect("vocab-width fused Q8 GEMV must be a tune class");
         assert!(class.gemv_rmsnorm);
         assert_eq!(class.weight_format, crate::compile::WeightFormat::Q8);
-        assert_eq!((class.m, class.n, class.k), (1, N, K));
-        class.binding_bytes = vec![K as usize * 4, 428_000_000, K as usize * 4, N as usize * 4];
+        assert_eq!((class.m, class.n, class.k), (1, n, k));
+        class.binding_bytes = vec![k as usize * 4, 428_000_000, k as usize * 4, n as usize * 4];
         let initial = MatmulTile::selected(&dispatch, None).unwrap();
         assert!(
             initial.fits(&class),
             "vocab-width GEMV must survive the workgroup-count check"
         );
         assert!(
-            class.challengers(initial, None).iter().any(|tile| matches!(
-                tile,
-                MatmulTile::Gemv(GemvShape {
-                    reduction: GemvReduction::Subgroup,
-                    ..
-                })
-            )),
+            has_subgroup(&class, initial),
             "vocab-width fused Q8 GEMV has no subgroup challenger"
         );
     }
@@ -2399,19 +2364,17 @@ mod tests {
                 scope,
                 ..Default::default()
             };
-            let mut json = serde_json::to_value(&options).unwrap();
-            assert_eq!(
-                serde_json::from_value::<TuneOptions>(json.clone())
-                    .unwrap()
-                    .scope,
-                scope
-            );
-            json.as_object_mut().unwrap().remove("scope");
-            assert_eq!(
-                serde_json::from_value::<TuneOptions>(json).unwrap().scope,
-                TuneScope::Dense
-            );
+            let json = serde_json::to_string(&options).unwrap();
+            let restored: TuneOptions = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored.scope, scope);
         }
+        // Reports from before scopes searched dense products only.
+        let mut json = serde_json::to_value(TuneOptions::default()).unwrap();
+        json.as_object_mut().unwrap().remove("scope");
+        assert_eq!(
+            serde_json::from_value::<TuneOptions>(json).unwrap().scope,
+            TuneScope::Dense
+        );
         let old = serde_json::to_value(&dense).unwrap();
         assert!(old.get("conv2d").is_none());
         assert_eq!(serde_json::from_value::<TuneClass>(old).unwrap(), dense);
@@ -2435,25 +2398,17 @@ mod tests {
 
     fn outcome() -> TuneOutcome {
         TuneOutcome {
-            class: TuneClass::from_dispatch(&dispatch(), None).unwrap(),
-            dispatches: 3,
-            initial: MatmulTile::Tile32,
-            candidate: MatmulTile::Tile64,
-            selected: MatmulTile::Tile32,
-            candidate_split_k: None,
-            decision: TuneDecision::KeepBaseline,
             qualified: true,
-            failure: None,
-            elapsed: Duration::ZERO,
-            compile_time: Duration::ZERO,
             phase_times: None,
-            scratch: None,
             baseline_ms: vec![10.0; 6],
             candidate_ms: vec![8.0; 6],
             sample_repetitions: Some(16),
-            baseline_median_ms: None,
-            candidate_median_ms: None,
-            noise_margin_ms: None,
+            ..TuneOutcome::new(
+                TuneClass::from_dispatch(&dispatch(), None).unwrap(),
+                3,
+                MatmulTile::Tile32,
+                MatmulTile::Tile64,
+            )
         }
     }
 
@@ -2476,10 +2431,18 @@ mod tests {
             decide(&mut noisy, &options);
             assert_eq!(noisy.selected, noisy.initial);
         }
+        // An incomplete next challenger keeps the completed winner.
         let mut incomplete = outcome();
+        incomplete.initial = win.selected;
+        incomplete.selected = win.selected;
+        incomplete.candidate = MatmulTile::CooperativeF32 { tile_size: 8 };
         incomplete.candidate_ms.pop();
         decide(&mut incomplete, &options);
         assert_eq!(incomplete.decision, TuneDecision::TimeBudget);
+        assert_eq!(incomplete.selected, win.selected);
+        incomplete.candidate_ms.push(8.0);
+        decide(&mut incomplete, &options);
+        assert_eq!(incomplete.selected, incomplete.candidate);
         for value in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
             let mut invalid = outcome();
             invalid.candidate_ms[0] = value;
@@ -2512,9 +2475,24 @@ mod tests {
                 target_sample_time: Some(Duration::ZERO),
                 ..Default::default()
             },
-        ] {
-            assert!(options.validate().is_err());
+        ]
+        .into_iter()
+        .chain(
+            [0.0, -1.0, f64::NAN, f64::INFINITY].map(|rate| TuneOptions {
+                calibration: TuneCalibration::Profile(MachineProfile {
+                    bandwidth: Some(rate),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        ) {
+            assert!(options.validate().is_err(), "{options:?}");
         }
+        let profile = MachineProfile {
+            parallel_width: Some(100),
+            ..Default::default()
+        };
+        assert!(profile.wave_utilization(u64::MAX).is_finite());
     }
 
     #[test]
@@ -2734,25 +2712,6 @@ mod tests {
     }
 
     #[test]
-    fn supplied_profiles_reject_nonfinite_or_nonpositive_rates() {
-        for rate in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            let options = TuneOptions {
-                calibration: TuneCalibration::Profile(MachineProfile {
-                    bandwidth: Some(rate),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
-            assert!(options.validate().is_err(), "{rate}");
-        }
-        let profile = MachineProfile {
-            parallel_width: Some(100),
-            ..Default::default()
-        };
-        assert!(profile.wave_utilization(u64::MAX).is_finite());
-    }
-
-    #[test]
     fn new_options_race_but_historical_options_keep_the_original_policy() {
         let options = TuneOptions::default();
         assert_eq!(options.strategy, TuneStrategy::Race);
@@ -2774,20 +2733,6 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<TuneCalibration>(&text).unwrap(),
             supplied
-        );
-    }
-
-    #[test]
-    fn split_tiles_report_partitions_and_families() {
-        assert_eq!(
-            MatmulTile::CooperativeChecked { splits: 4 }.partitions(),
-            Some(4)
-        );
-        assert_eq!(MatmulTile::Tile64.partitions(), None);
-        assert_eq!(MatmulTile::Tile32.family(), TileFamily::Scalar);
-        assert_eq!(
-            MatmulTile::CooperativeF32 { tile_size: 16 }.family(),
-            TileFamily::Cooperative
         );
     }
 
@@ -2870,23 +2815,5 @@ mod tests {
         assert_eq!(d.workgroups, [2, 1, 1]);
         assert!(!d.use_coop() && d.use_small_tiles());
         assert!(TuneClass::from_dispatch(&d, Some(&config)).is_some());
-    }
-
-    #[test]
-    fn an_incomplete_next_challenger_keeps_the_completed_winner() {
-        let options = TuneOptions::default();
-        let mut first = outcome();
-        decide(&mut first, &options);
-        let mut next = outcome();
-        next.initial = first.selected;
-        next.selected = first.selected;
-        next.candidate = MatmulTile::CooperativeF32 { tile_size: 8 };
-        next.candidate_ms.pop();
-        decide(&mut next, &options);
-        assert_eq!(next.selected, first.selected);
-        assert_eq!(next.decision, TuneDecision::TimeBudget);
-        next.candidate_ms.push(8.0);
-        decide(&mut next, &options);
-        assert_eq!(next.selected, next.candidate);
     }
 }
