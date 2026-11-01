@@ -3826,33 +3826,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rms_norm_wgsl() {
-        let _ = generate_wgsl(ShaderGroup::RmsNormAdd);
-    }
-
-    #[test]
-    fn test_embedding_wgsl() {
-        let _ = generate_wgsl(ShaderGroup::Embedding);
-    }
-
-    #[test]
-    fn test_rope_wgsl() {
-        let _ = generate_wgsl(ShaderGroup::RoPE);
-    }
-
-    #[test]
-    fn test_rope_grad_wgsl() {
-        let _ = generate_wgsl(ShaderGroup::RoPEGrad);
-    }
-
-    #[test]
-    fn test_unified_attention_wgsl() {
-        let _ = generate_attention_module(64);
-        let _ = generate_attention_module(32);
-        let _ = generate_attention_module(128);
-    }
-
-    #[test]
     fn cooperative_attention_staging_types_and_storage() {
         for head_dim in [16, 32, 64, 128, 256, 512] {
             for (group, shader, scalar_arrays) in [

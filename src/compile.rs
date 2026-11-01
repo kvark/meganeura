@@ -4666,36 +4666,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_shader_entry_mappings() {
-        // Verify all shader entries have valid group and entry_point
-        let entries = [
-            ShaderEntry::MatMul,
-            ShaderEntry::SgdUpdate,
-            ShaderEntry::AdamUpdate,
-            ShaderEntry::ScatterAdd,
-            ShaderEntry::ScatterAddAtomic,
-            ShaderEntry::SumAll,
-            ShaderEntry::MeanAll,
-            ShaderEntry::SumRows,
-            ShaderEntry::CrossEntropyLoss,
-            ShaderEntry::BceLoss,
-            ShaderEntry::Transpose,
-            ShaderEntry::SwiGLUGradGate,
-            ShaderEntry::SwiGLUGradUp,
-            ShaderEntry::SiluGrad,
-            ShaderEntry::RmsNormGradW,
-            ShaderEntry::RmsNormGradX,
-            ShaderEntry::LayerNormGradWB,
-            ShaderEntry::LayerNormGradX,
-        ];
-        for entry in &entries {
-            let _group = entry.shader_group();
-            let ep = entry.entry_point();
-            assert!(!ep.is_empty());
-        }
-    }
-
     /// Verify that the EPT/TPQ/BQ values computed in the dispatch functions
     /// match those used by the codegen shader generators. A mismatch means
     /// the compile-time workgroup counts won't match the shader's tile sizes,

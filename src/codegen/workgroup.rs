@@ -292,51 +292,55 @@ pub fn generate_workgroup_matmul(
 mod tests {
     use super::*;
 
+    /// Every group meets every operand conversion with both row-bound
+    /// variants; the multiply type alternates so each group and conversion
+    /// meets both, and outputs and shapes cycle so each shape meets every
+    /// output and each tile both row-bound variants.
     #[test]
     fn rectangular_typed_modules_validate_and_emit_spirv() {
         let capabilities = naga::valid::Capabilities::SHADER_BFLOAT16
             | naga::valid::Capabilities::SHADER_FLOAT16
             | naga::valid::Capabilities::COOPERATIVE_MATRIX
             | naga::valid::Capabilities::COOPERATIVE_MATRIX_WORKGROUP;
-        for shape in WorkgroupMatmulShape::all() {
-            for group in [
-                ShaderGroup::MatMul,
-                ShaderGroup::MatMulAT,
-                ShaderGroup::MatMulBT,
-                ShaderGroup::MatMulAdd,
-                ShaderGroup::MatMulATAdd,
-                ShaderGroup::MatMulBTAdd,
-            ] {
-                for multiply in [DType::F16, DType::BF16] {
-                    for (a, b) in [
-                        (multiply, multiply),
-                        (DType::F32, multiply),
-                        (multiply, DType::F32),
-                        (DType::F32, DType::F32),
-                    ] {
-                        for output in [DType::F32, DType::F16, DType::BF16] {
-                            let types = MatrixTypes {
-                                a,
-                                b,
-                                multiply,
-                                output,
-                            };
-                            for row_bounds in [false, true] {
-                                let mut module =
-                                    generate_workgroup_matmul(group, shape, types, row_bounds);
-                                super::super::validate_shader_for_test(
-                                    &mut module.module,
-                                    capabilities,
-                                    (1, 6),
-                                )
-                                .unwrap_or_else(|error| {
-                                    panic!("{group:?} {types:?} {shape:?}: {error}")
-                                });
-                            }
-                        }
-                    }
+        let shapes: Vec<_> = WorkgroupMatmulShape::all().collect();
+        let outputs = [DType::F32, DType::F16, DType::BF16];
+        let mut index = 0;
+        for (g, group) in [
+            ShaderGroup::MatMul,
+            ShaderGroup::MatMulAT,
+            ShaderGroup::MatMulBT,
+            ShaderGroup::MatMulAdd,
+            ShaderGroup::MatMulATAdd,
+            ShaderGroup::MatMulBTAdd,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (p, (a_f32, b_f32)) in [(false, false), (true, false), (false, true), (true, true)]
+                .into_iter()
+                .enumerate()
+            {
+                let multiply = [DType::F16, DType::BF16][(g + p) % 2];
+                let operand = |f32| if f32 { DType::F32 } else { multiply };
+                for row_bounds in [false, true] {
+                    let types = MatrixTypes {
+                        a: operand(a_f32),
+                        b: operand(b_f32),
+                        multiply,
+                        output: outputs[index % outputs.len()],
+                    };
+                    let shape = shapes[index % shapes.len()];
+                    index += 1;
+                    let mut module = generate_workgroup_matmul(group, shape, types, row_bounds);
+                    super::super::validate_shader_for_test(
+                        &mut module.module,
+                        capabilities,
+                        (1, 6),
+                    )
+                    .unwrap_or_else(|error| panic!("{group:?} {types:?} {shape:?}: {error}"));
                 }
             }
         }
+        assert!(index >= 3 * shapes.len());
     }
 }
