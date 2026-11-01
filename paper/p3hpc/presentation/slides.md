@@ -134,39 +134,7 @@ data/hardware.json native_runner.
 -->
 
 ---
-
 <!-- header: 'Introduction · **Productivity** · Portability · Performance · Conclusion' -->
-<!-- _class: chart -->
-
-# Inside Meganeura
-
-![Eight steps from model description to execution: describe, rewrite, differentiate, plan, specialize, compile, check and time, execute](figures/compiler-map.svg)
-
-One compiler for inference and training. **Search revisits these choices by timing them on the target GPU.**
-
-<!--
-Time: 1:05.
-
-Read the top row left to right, then the bottom row right to left.
-
-A model arrives from Rust builders, ONNX, NNEF or GGUF as a typed static
-graph. An egglog e-graph holds equivalent forward forms and matrix schedules.
-Each forward form gets its own backward pass; inference skips that step. The
-planner lowers and fuses operations, orders the dispatches and reuses buffers
-by lifetime. Kernels are specialized for shape, device and precision, written
-out as WGSL and compiled through Naga and Blade into Vulkan or Metal pipelines.
-
-The search builds candidate programs, checks them, tunes their kernels and
-races whole programs on the device. The winner runs as a fixed plan: every
-step records, submits and waits, without graph rewriting or tensor allocation.
-
-If asked:
-- Search is optional. Without it, the ordinary extracted program runs.
-
-Sources: ../main.tex, How Meganeura Works; src/graph/composite.rs.
--->
-
----
 
 <!-- _class: testing -->
 
@@ -237,46 +205,50 @@ Sources: ../main.tex, Checking the Compiler and Its Kernels; docs/testing.md.
 
 <div class="egraph-layout"><div>
 
-![An e-graph: attention reads e-classes Q, K and V. Each holds its original product, X times its weight, and a slice of a packed product P added by a rewrite. P's e-class also holds a split-K schedule: a sum of 8 products over K slices.](figures/egraph.svg)
+![An e-graph for Y = XW + b. The output e-class holds Add and FusedMatMulAdd e-nodes. Add points to the intermediate MatMul e-class and the bias e-class; MatMul and FusedMatMulAdd share the X and W input e-classes. The fused node also points to the same bias class.](figures/egraph.svg)
 
 </div><div class="egraph-text">
 
-<p><b>Rewrites add forms.</b> egglog keeps the original beside every equal form it finds.</p>
-<p><b>Schedules too.</b> Tiles, K staging and split-K are equalities in the same e-graph.</p>
-<p><b>Bounded.</b> Small graphs whole; large ones through one repeated block, such as a transformer layer.</p>
+<p><b>One output, two graph forms.</b> A rewrite adds an e-node to Y's e-class. The original stays.</p>
+<p><b>Unfused lowering:</b> MatMul → temporary → Add.</p>
+<p><b>Fused lowering:</b> one kernel; no intermediate matrix write or read.</p>
+<p><b>Shared operands.</b> Both alternatives refer to the same X, W and b e-classes.</p>
 
 </div></div>
 
-**Extraction** hands up to 16 forms per session to the search.
+**Y = XW + b.** Both forms remain available for extraction and GPU measurement.
 
 <!--
 Time: 0:45.
 
-The model code we wrote has nothing GPU-specific in it, so where do the
-alternatives come from? The compiler runs its rewrites in egglog, which keeps
-equivalent forms in an e-graph instead of committing to the first profitable
-rewrite.
+This is one of our actual rewrites, shown as an e-graph rather than as two
+separate expression trees. Dashed boxes are e-classes; the solid boxes inside
+are e-nodes. An e-node stores an operator and points to operand e-classes.
 
-Here attention reads Q, K and V. Each is an e-class: a set of e-nodes that
-compute the same value. Originally Q is X times Wq. A rewrite packs the three
-projections into one wider product, P, and adds "slice of P" to each e-class
-without removing the original. Matrix schedules are equalities in the same
-e-graph, so P can also be computed as eight partial products over slices of K,
-then summed.
+The output class Y contains two ways to compute XW plus b. Add reads P and
+b, and P contains MatMul. The rewrite adds FusedMatMulAdd to that same output
+class. Its edges point directly to the shared X, W and b classes.
 
-Saturation is bounded: small graphs are explored whole, larger ones through
-one repeated region, such as a transformer block, verified to recur.
-Extraction then hands up to 16 graph forms per session to the search. Without
-search, the compiler extracts one form by estimated tensor traffic, which
-counts bytes and knows nothing about caches, occupancy or launch cost.
+Extracting through Add gives two operations and an intermediate matrix.
+Extracting through the fused node avoids that intermediate's write and read.
+The e-graph retains both; extraction proposes programs, and the next slide
+shows how we check and measure them.
 
 If asked:
-- The e-graph's job is to keep alternatives alive until they are timed; an
-  equally capable enumerator could find the same schedules.
-- Precision changes and in-place updates end a region.
-- Both examples with shapes: backup "Which form is faster?".
+- Later dispatch fusion can also merge the separate operators; these graph
+  forms need not produce different final kernels. Timing happens after lowering.
+- This schematic uses the actual fusion equality in src/optimize.rs. Numerical
+  checks still gate floating-point implementations; algebraic equivalence
+  does not promise bitwise equality.
+- The same e-graph also carries matrix schedules, including split-K; the
+  "Which form is faster?" backup keeps the packed-projection and split-K examples.
+- Small graphs are explored whole; large graphs through a verified repeated
+  region. Up to 16 forms are passed to program search.
+- The diagram omits shape/type metadata, not operand dependencies.
 
-Sources: ../main.tex, How Meganeura Works.
+Sources: src/optimize.rs, Add(MatMul) / FusedMatMulAdd rewrites;
+src/optimize/search.rs, keeps_fused_and_unfused_implementations_before_kernel_tuning;
+https://github.com/egraphs-good/egg/blob/main/src/tutorials/_01_background.rs
 -->
 
 ---
@@ -934,7 +906,7 @@ Sources: data/results.csv; data/summary.json; data/hardware.json;
 <div class="columns backup-list"><div>
 
 **Productivity**
-[Importing a model](#21) · [Writing a model](#22) · [How do we describe a model?](#23) · [Which form is faster?](#24) · [How do we write the kernels?](#25) · [Gradients](#26) · [Compile stages](#27)
+[Importing a model](#20) · [Inside Meganeura](#21) · [Writing a model](#22) · [How do we describe a model?](#23) · [Which form is faster?](#24) · [How do we write the kernels?](#25) · [Gradients](#26) · [Compile stages](#27)
 
 **Portability**
 [Matrix paths selected](#28) · [Where paths stop](#29) · [What search costs](#30) · [Reusing kernel decisions](#31) · [Coverage](#32)
@@ -996,6 +968,39 @@ If asked:
 
 Sources: src/load/onnx.rs, src/load/nnef.rs, src/load/gguf/;
 examples/onnx_compare.rs, examples/gguf_generate.rs.
+-->
+
+---
+
+<!-- _header: 'Backup · Productivity' -->
+<!-- _class: chart -->
+
+# Inside Meganeura
+
+![Eight steps from model description to execution: describe, rewrite, differentiate, plan, specialize, compile, check and time, execute](figures/compiler-map.svg)
+
+One compiler for inference and training. **Search revisits these choices by timing them on the target GPU.**
+
+<!--
+Backup, for “what does the compiler do?”
+
+Read the top row left to right, then the bottom row right to left.
+
+A model arrives from Rust builders, ONNX, NNEF or GGUF as a typed static
+graph. An egglog e-graph holds equivalent forward forms and matrix schedules.
+Each forward form gets its own backward pass; inference skips that step. The
+planner lowers and fuses operations, orders the dispatches and reuses buffers
+by lifetime. Kernels are specialized for shape, device and precision, written
+out as WGSL and compiled through Naga and Blade into Vulkan or Metal pipelines.
+
+The search builds candidate programs, checks them, tunes their kernels and
+races whole programs on the device. The winner runs as a fixed plan: every
+step records, submits and waits, without graph rewriting or tensor allocation.
+
+If asked:
+- Search is optional. Without it, the ordinary extracted program runs.
+
+Sources: ../main.tex, How Meganeura Works; src/graph/composite.rs.
 -->
 
 ---
