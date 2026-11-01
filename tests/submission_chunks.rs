@@ -15,46 +15,13 @@
 //! chain where every layer depends on the previous one, and check equality
 //! against the single-submission result.
 
+use crate::support::chain;
 use meganeura::train::{Mode, SessionConfig};
-use meganeura::{Graph, Session};
 
-/// A chain deep enough to have many barrier groups, so chunk boundaries
-/// land in the middle of real dependencies rather than at a convenient
-/// seam. Every op consumes the previous one's output.
-fn build_chain(layers: usize, rows: usize, dim: usize) -> Graph {
-    let mut g = Graph::new();
-    let mut x = g.input("x", &[rows, dim]);
-    for i in 0..layers {
-        let w = g.parameter(&format!("w{i}"), &[dim, dim]);
-        let b = g.parameter(&format!("b{i}"), &[dim]);
-        x = g.matmul(x, w);
-        x = g.bias_add(x, b);
-        x = g.gelu(x);
-        let ln_w = g.parameter(&format!("ln{i}.w"), &[dim]);
-        let ln_b = g.parameter(&format!("ln{i}.b"), &[dim]);
-        x = g.layer_norm(x, ln_w, ln_b, 1e-5);
-    }
-    g.set_outputs(vec![x]);
-    g
-}
-
-fn seed_parameters(session: &mut Session, layers: usize, dim: usize) {
-    for i in 0..layers {
-        let w: Vec<f32> = (0..dim * dim)
-            .map(|k| ((k + i * 7) as f32 * 0.017).sin() * 0.1)
-            .collect();
-        session.set_parameter(&format!("w{i}"), &w);
-        let b: Vec<f32> = (0..dim)
-            .map(|k| ((k + i) as f32 * 0.03).cos() * 0.01)
-            .collect();
-        session.set_parameter(&format!("b{i}"), &b);
-        session.set_parameter(&format!("ln{i}.w"), &vec![1.0f32; dim]);
-        session.set_parameter(&format!("ln{i}.b"), &vec![0.0f32; dim]);
-    }
-}
-
+/// The chain is deep enough to have many barrier groups, so chunk boundaries
+/// land in the middle of real dependencies rather than at a convenient seam.
 fn run(chunks: usize, layers: usize, rows: usize, dim: usize, steps: usize) -> Vec<f32> {
-    let g = build_chain(layers, rows, dim);
+    let g = chain::build_chain(layers, rows, dim);
     let (mut session, _) = meganeura::train::build(
         &g,
         SessionConfig {
@@ -63,12 +30,8 @@ fn run(chunks: usize, layers: usize, rows: usize, dim: usize, steps: usize) -> V
         },
     );
     session.set_submission_chunks(chunks);
-    seed_parameters(&mut session, layers, dim);
-
-    let x: Vec<f32> = (0..rows * dim)
-        .map(|i| (i as f32 * 0.011).sin() * 0.5)
-        .collect();
-    session.set_input("x", &x);
+    chain::seed(&mut session, layers, dim);
+    session.set_input("x", &chain::input(rows, dim));
 
     // Several steps: a boundary hazard can depend on whether a command
     // buffer in the ring is still in flight, which only shows up once the

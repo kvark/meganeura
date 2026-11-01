@@ -6,7 +6,25 @@ use meganeura::{
     CoopPolicy, Graph, MachineProfile, Session, TuneCalibration, TuneDecision, TuneOptions,
     TuneReport, TuneStrategy,
 };
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+/// One timestamp-enabled context for the whole file, or `None` when the
+/// device cannot record timestamps.
+fn timing_gpu() -> Option<Arc<blade_graphics::Context>> {
+    static CONTEXT: OnceLock<Option<Arc<blade_graphics::Context>>> = OnceLock::new();
+    CONTEXT
+        .get_or_init(|| {
+            meganeura::init_gpu_context_with(meganeura::GpuOptions {
+                timing: true,
+                ..meganeura::GpuOptions::from_env()
+            })
+            .ok()
+            .filter(|context| context.capabilities().timing)
+            .map(Arc::new)
+        })
+        .clone()
+}
 
 fn race_options() -> TuneOptions {
     TuneOptions {
@@ -21,7 +39,7 @@ fn race_options() -> TuneOptions {
 
 /// A product with exactly representable values, so that any tile and any
 /// summation order produces the same output bits.
-fn product(gpu: std::sync::Arc<blade_graphics::Context>, gpu_timing: bool) -> Session {
+fn product(gpu: Arc<blade_graphics::Context>, gpu_timing: bool) -> Session {
     let mut graph = Graph::new();
     let a = graph.input("a", &[48, 96]);
     let b = graph.parameter("b", &[96, 80]);
@@ -91,17 +109,8 @@ fn check_race(report: &TuneReport) {
     );
 }
 
-#[test]
-fn race_decides_every_challenger_and_keeps_live_outputs() {
-    let mut session = product(crate::support::gpu::gpu(), false);
-    let before = run(&mut session);
-    let report = session.tune_with(race_options()).unwrap();
-    check_race(&report);
-    assert!(!report.races[0].gpu_timestamps);
-    assert_eq!(report.outcomes.len() + 1, report.races[0].candidates);
-    assert_eq!(run(&mut session), before, "tuning changed the live program");
-}
-
+/// A race decides every challenger and keeps live outputs. Host encoders
+/// sit outside the scratch limit, and a larger search can retry.
 #[test]
 fn host_encoders_sit_outside_the_scratch_limit_and_a_larger_search_can_retry() {
     let mut session = product(crate::support::gpu::gpu(), false);
@@ -133,9 +142,10 @@ fn host_encoders_sit_outside_the_scratch_limit_and_a_larger_search_can_retry() {
         .unwrap();
     check_race(&report);
     assert!(!report.races[0].gpu_timestamps);
+    assert_eq!(report.outcomes.len() + 1, report.races[0].candidates);
     // All live candidate encoders plus the upload/qualification encoder.
     assert!(report.scratch.unwrap().peak_bytes > (report.races[0].candidates + 1) * (1 << 20));
-    assert_eq!(run(&mut session), before);
+    assert_eq!(run(&mut session), before, "tuning changed the live program");
 }
 
 #[test]
@@ -185,21 +195,10 @@ fn a_later_tuning_call_retries_its_cached_profile() {
 
 #[test]
 fn races_use_gpu_timestamps_when_the_context_records_them() {
-    let options = meganeura::GpuOptions::from_env();
-    let supported = meganeura::init_gpu_context_with(options.clone())
-        .map(|context| context.capabilities().timing)
-        .unwrap_or(false);
-    if !supported {
+    let Some(gpu) = timing_gpu() else {
         eprintln!("GPU timestamps unavailable; skipping");
         return;
-    }
-    let gpu = std::sync::Arc::new(
-        meganeura::init_gpu_context_with(meganeura::GpuOptions {
-            timing: true,
-            ..options
-        })
-        .unwrap(),
-    );
+    };
     let mut session = product(gpu, true);
     let before = run(&mut session);
     // Timestamp rounds share the scratch encoder: no host encoders on top.
@@ -226,21 +225,18 @@ fn host_races_keep_typed_split_sequences_and_repetitions_ordered() {
 }
 
 fn typed_split_race(gpu_timing: bool) {
-    let options = meganeura::GpuOptions::from_env();
-    let supported = crate::support::gpu::gpu();
-    if (gpu_timing && !supported.capabilities().timing)
-        || !meganeura::runtime::typed_matrix_supported(&supported, meganeura::DType::F16)
-    {
+    // The race times on the GPU only when the session asks for it.
+    let gpu = if gpu_timing {
+        timing_gpu()
+    } else {
+        Some(crate::support::gpu::gpu())
+    };
+    let Some(gpu) =
+        gpu.filter(|gpu| meganeura::runtime::typed_matrix_supported(gpu, meganeura::DType::F16))
+    else {
         eprintln!("F16 matrices or timestamps unavailable; skipping typed race");
         return;
-    }
-    let gpu = std::sync::Arc::new(
-        meganeura::init_gpu_context_with(meganeura::GpuOptions {
-            timing: gpu_timing,
-            ..options
-        })
-        .unwrap(),
-    );
+    };
     let mut graph = Graph::new();
     let a = graph.parameter_f16("a", &[33, 1031]);
     let b = graph.parameter_f16("b", &[1031, 65]);
