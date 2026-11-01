@@ -3,30 +3,29 @@
 ## P3HPC (SC26 workshop)
 
 The current paper is [p3hpc/main.tex](p3hpc/main.tex). It and the
-[presentation](p3hpc/presentation/slides.md) use the final October 2026 cohort:
-Inferena `add19182e5479e3f7549894c524ac6691d3dc363`, Meganeura
-`c19cb1caedd90be7abc61de61f6197018711398e`, and PyTorch 2.13.0 at `cf30153c`.
+[presentation](p3hpc/presentation/slides.md) use the final October 31–November 1, 2026 cohort:
+Inferena `a0799e4210eafa25161ec50d475b186c4b19d3da`, Meganeura
+`567028b805425375148e88a7e1d464fafdd99777`, and PyTorch 2.13.0 at `cf30153c`.
 The older `paper-p3hpc-2026-final` tags do **not** identify this collection.
-No earlier result fills a missing cell. A separate October 24 attention-kernel
-ablation supports the gap analysis; it is excluded from the cohort ratios and
-coverage. Its retained timing samples and protocol are in
-[p3hpc/artifact/attention-followup.json](p3hpc/artifact/attention-followup.json).
+No earlier result fills a missing cell. The single-operation study in the
+presentation is separate from the framework cohort; its timing boundaries
+and provenance are documented in [RESULTS.md](p3hpc/RESULTS.md).
 
 [RESULTS.md](p3hpc/RESULTS.md) records the audit, failures, numerical-policy
 limits, timing uncertainty, footprint and MI300X driver provenance. [QUALIFICATION.md](p3hpc/QUALIFICATION.md)
-separates the four correctness-only platforms from the seven timed GPUs.
+separates the five correctness-only platforms from the six timed GPUs.
 All 330 core native cells pass; core plus completed large-model runs supply
-246 native performance cells and 226 qualified paired comparisons.
+222 native performance cells and 201 qualified paired comparisons.
 Raw archives, PDFs and ZIPs stay outside Git.
 
 ### Presentation
 
 The main [talk](p3hpc/presentation/slides.md) combines the graphics-API argument,
 the compiler architecture, hardware access and limits, and measured results.
-It has 24 main slides (19:25 of suggested speaking time) and 15 backups.
+It has 19 main slides, a backup index and 24 backups, for a roughly 20-minute talk.
 The alternative decks remain local references and are not part of this commit.
 
-The talk uses the same October 19 cohort as the paper. Its chart inputs in
+The talk uses the same October 31–November 1 cohort as the paper. Its chart inputs in
 `presentation/data/` are separately versioned copies of the analyzer outputs in
 `p3hpc/tables/`, with LF line endings. See its
 [README](p3hpc/presentation/README.md) for exact pins and evidence scope.
@@ -47,21 +46,17 @@ with unequal acceleration. [gap_analysis.py](p3hpc/artifact/gap_analysis.py)
 uses only conditions where both engines qualify in both profiles. It verifies
 `R_acc = R_strict * (S_PyTorch / S_Meganeura)` for each condition and uses
 geometric means to preserve that identity across identical model sets.
-These are distinct from the main results-table medians. It also verifies the
-100 retained samples per arm of each separate attention ablation, including
-the serial/four-lane F32 anchor comparison.
+These are distinct from the main results-table medians. The single-operation
+study supports the kernel discussion; it does not allocate percentages of
+model time to CPU, GPU, API or driver.
 
 ```sh
 python3 paper/p3hpc/artifact/gap_analysis.py --check paper/p3hpc/tables
 ```
 
-Use `--output paper/p3hpc/tables` to regenerate `gap.json`, `gap.tex` and
-`attention-followup.tex`. The presentation computes the same accounting from
-its separately frozen CSV. No GPU or raw cohort archive is needed. The local
-ablation compares native paths only, with the same graph, forward kernels and
-submission count, and is not a new Meganeura/PyTorch comparison. Its diagnostic
-runner inlines the production shaders at `3d7cafa`; the supplement replays the
-retained sample analysis, not the GPU experiment or numerical qualification.
+Use `--output paper/p3hpc/tables` to regenerate `gap.json` and `gap.tex`.
+The presentation computes the same accounting from its frozen CSV. No GPU
+or raw cohort archive is needed for this derived analysis.
 
 ### Replaying the final evidence
 

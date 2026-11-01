@@ -1,28 +1,29 @@
 # Final qualification coverage
 
-All eleven GPUs pass all five core models, both profiles, and three phases:
-330/330 cells. Seven GPUs provide performance samples; the other four are
-correctness-only and have no published timing or CPU/GPU ratio.
+All eleven GPUs pass five core models, two profiles and three phases:
+**330/330 cells**. Six GPUs provide performance samples; five are
+correctness-only, with no published CPU/GPU timing ratio.
 
 | Qualification device | Native path | Independent oracle | Cells |
 |---|---|---|---:|
+| RTX 3050 | Vulkan | CPU PyTorch f32 | 30/30 |
 | Radeon 780M | Vulkan | CPU PyTorch f32 | 30/30 |
 | Ryzen 9600X iGPU | Vulkan | CPU PyTorch f32 | 30/30 |
 | Intel RPL-U | Vulkan | CPU PyTorch f32 | 30/30 |
 | Quest 3S / Adreno 740 | Vulkan | CPU f64, full tensors | 30/30 |
 
-Each uses one process per model/profile, not three performance replicates.
-Android captures are represented by hashed manifests and full comparison
-receipts; raw NPZ tensors are absent from the archives. The offline audit
-checks those receipts, not the original tensor arithmetic.
+These use one process per model/profile, not three performance replicates.
+Android archives retain hashed manifests and full comparison receipts but
+omit raw NPZ tensors; replay audits the receipts, not original arithmetic.
+Configuration-specific GPU-reference availability does not turn CPU-oracle
+qualification into a paired GPU performance measurement.
 
-Earlier ROCm failures on the AMD iGPUs and the unavailable XPU device on RPL-U
-are configuration-specific bring-up observations. They do not turn CPU-oracle
-qualifications into fresh paired GPU measurements.
+All 222 measured native cells, including 42 larger-model cells, qualify;
+201 have complete qualified PyTorch comparisons. B570 360M now completes:
+all six native cells and four ratios, including every accelerated phase.
+One strict reference process fails gradient repeatability; strict training
+and its later one-token phase have no aggregated ratio. RTX 5070 accelerated
+360M passes all phases. No old result fills a missing current cell.
 
-All 246 completed measured native cells (core plus large models) qualify;
-226 have a complete qualified PyTorch comparison. The B570 360M campaign is
-incomplete and contributes no independently qualified cells. Its native
-internal checks pass, but the reference fails during XPU graph capture and
-the harness aborts. See [RESULTS.md](RESULTS.md) for failure attribution and
+See [RESULTS.md](RESULTS.md) for the audit and retained failures, and
 [main.tex](main.tex) for the distinct numerical gates used by the engines.

@@ -65,25 +65,78 @@
     }
   },
   "cohort": {
-    "amd-mi300": {
-      "cooperative_bf16_f32_shapes": [],
+    "nvidia-5070": {
+      "cooperative_bf16_f32_shapes": [
+        [
+          16,
+          16,
+          16
+        ]
+      ],
       "cooperative_f16_tile": 16,
-      "cooperative_f32_tile": 16,
-      "gpu_device_id": 29877,
-      "gpu_device_local_budget_bytes": 205522763776,
-      "gpu_device_name": "AMD Instinct MI300X VF (RADV GFX940)",
-      "gpu_driver_info": "Mesa 26.3.0-devel (git-8c7f5fdd60)",
-      "gpu_driver_name": "radv"
+      "cooperative_f32_tile": 0,
+      "gpu_device_id": 12036,
+      "gpu_device_local_budget_bytes": 12129796096,
+      "gpu_device_name": "NVIDIA GeForce RTX 5070",
+      "gpu_driver_info": "595.91.07",
+      "gpu_driver_name": "NVIDIA",
+      "gpu_software_emulated": false
+    },
+    "nvidia-h100": {
+      "cooperative_bf16_f32_shapes": [
+        [
+          16,
+          16,
+          16
+        ]
+      ],
+      "cooperative_f16_tile": 16,
+      "cooperative_f32_tile": 0,
+      "gpu_device_id": 9008,
+      "gpu_device_local_budget_bytes": 84801814528,
+      "gpu_device_name": "NVIDIA H100 80GB HBM3",
+      "gpu_driver_info": "595.91.07",
+      "gpu_driver_name": "NVIDIA",
+      "gpu_software_emulated": false
     },
     "amd-7900xt": {
       "cooperative_bf16_f32_shapes": [],
       "cooperative_f16_tile": 16,
       "cooperative_f32_tile": 0,
       "gpu_device_id": 29772,
-      "gpu_device_local_budget_bytes": 21429952512,
+      "gpu_device_local_budget_bytes": 21429972992,
       "gpu_device_name": "AMD Radeon RX 7900 XT (RADV NAVI31)",
+      "gpu_driver_info": "Mesa 26.0.8-1ubuntu0.3",
+      "gpu_driver_name": "radv",
+      "gpu_software_emulated": false
+    },
+    "amd-mi300": {
+      "cooperative_bf16_f32_shapes": [],
+      "cooperative_f16_tile": 16,
+      "cooperative_f32_tile": 16,
+      "gpu_device_id": 29877,
+      "gpu_device_local_budget_bytes": 205522690048,
+      "gpu_device_name": "AMD Instinct MI300X VF (RADV GFX940)",
+      "gpu_driver_info": "Mesa 26.3.0-devel (git-8c7f5fdd60)",
+      "gpu_driver_name": "radv",
+      "gpu_software_emulated": false
+    },
+    "intel-b570": {
+      "cooperative_bf16_f32_shapes": [
+        [
+          8,
+          16,
+          16
+        ]
+      ],
+      "cooperative_f16_tile": 0,
+      "cooperative_f32_tile": 0,
+      "gpu_device_id": 57868,
+      "gpu_device_local_budget_bytes": 9895411712,
+      "gpu_device_name": "Intel(R) Arc(tm) B570 Graphics (BMG G21)",
       "gpu_driver_info": "Mesa 26.0.3-1ubuntu1",
-      "gpu_driver_name": "radv"
+      "gpu_driver_name": "Intel open-source Mesa driver",
+      "gpu_software_emulated": false
     },
     "apple-m3": {
       "cooperative_bf16_f32_shapes": [
@@ -99,9 +152,10 @@
       "gpu_device_local_budget_bytes": 11453251584,
       "gpu_device_name": "Apple M3",
       "gpu_driver_info": "",
-      "gpu_driver_name": "Metal"
+      "gpu_driver_name": "Metal",
+      "gpu_software_emulated": false
     },
-    "nvidia-5070": {
+    "nvidia-3050": {
       "cooperative_bf16_f32_shapes": [
         [
           16,
@@ -111,43 +165,56 @@
       ],
       "cooperative_f16_tile": 16,
       "cooperative_f32_tile": 0,
-      "gpu_device_id": 12036,
-      "gpu_device_local_budget_bytes": 12129599488,
-      "gpu_device_name": "NVIDIA GeForce RTX 5070",
-      "gpu_driver_info": "595.91.07",
-      "gpu_driver_name": "NVIDIA"
+      "gpu_device_id": 9602,
+      "gpu_device_local_budget_bytes": 7626293248,
+      "gpu_device_name": "NVIDIA GeForce RTX 3050",
+      "gpu_driver_info": "610.88",
+      "gpu_driver_name": "NVIDIA",
+      "gpu_software_emulated": false
     },
-    "nvidia-h100": {
-      "cooperative_bf16_f32_shapes": [
-        [
-          16,
-          16,
-          16
-        ]
-      ],
+    "amd-780m": {
+      "cooperative_bf16_f32_shapes": [],
       "cooperative_f16_tile": 16,
       "cooperative_f32_tile": 0,
-      "gpu_device_id": 9008,
-      "gpu_device_local_budget_bytes": 84839694336,
-      "gpu_device_name": "NVIDIA H100 80GB HBM3",
-      "gpu_driver_info": "595.91.07",
-      "gpu_driver_name": "NVIDIA"
+      "gpu_device_id": 5567,
+      "gpu_device_local_budget_bytes": 6602829824,
+      "gpu_device_name": "AMD Radeon 780M Graphics (RADV PHOENIX)",
+      "gpu_driver_info": "Mesa 25.2.8-0ubuntu0.24.04.4",
+      "gpu_driver_name": "radv",
+      "gpu_software_emulated": false
     },
-    "intel-b570": {
-      "cooperative_bf16_f32_shapes": [
-        [
-          8,
-          16,
-          16
-        ]
-      ],
+    "amd-9600x": {
+      "cooperative_bf16_f32_shapes": [],
       "cooperative_f16_tile": 0,
       "cooperative_f32_tile": 0,
-      "gpu_device_id": 57868,
-      "gpu_device_local_budget_bytes": 9816768512,
-      "gpu_device_name": "Intel(R) Arc(tm) B570 Graphics (BMG G21)",
+      "gpu_device_id": 5056,
+      "gpu_device_local_budget_bytes": 11098775552,
+      "gpu_device_name": "AMD Ryzen 5 9600X 6-Core Processor (RADV RAPHAEL_MENDOCINO)",
+      "gpu_driver_info": "Mesa 26.0.8-1ubuntu0.3",
+      "gpu_driver_name": "radv",
+      "gpu_software_emulated": false
+    },
+    "intel-rplu": {
+      "cooperative_bf16_f32_shapes": [],
+      "cooperative_f16_tile": 0,
+      "cooperative_f32_tile": 0,
+      "gpu_device_id": 42921,
+      "gpu_device_local_budget_bytes": 8414822400,
+      "gpu_device_name": "Intel(R) Graphics (RPL-U)",
       "gpu_driver_info": "Mesa 26.0.3-1ubuntu1",
-      "gpu_driver_name": "Intel open-source Mesa driver"
+      "gpu_driver_name": "Intel open-source Mesa driver",
+      "gpu_software_emulated": false
+    },
+    "qualcomm-adreno": {
+      "cooperative_bf16_f32_shapes": [],
+      "cooperative_f16_tile": 0,
+      "cooperative_f32_tile": 0,
+      "gpu_device_id": 1124403968,
+      "gpu_device_local_budget_bytes": null,
+      "gpu_device_name": "Adreno (TM) 740",
+      "gpu_driver_info": "Driver Build: 810c66ceb7, Idb4ff819d7, 1782305085\nDate: 06/24/26\nCompiler Version: E031.50.14.00\nDriver Branch: \n",
+      "gpu_driver_name": "Qualcomm Technologies Inc. Adreno Vulkan Driver",
+      "gpu_software_emulated": false
     }
   },
   "vendor_query_date": "2026-10-19",
@@ -162,8 +229,13 @@
     "driver": "1.14.37020"
   },
   "native_runner": {
-    "bytes": 20072584,
-    "sha256": "b8d25fac4992dd3cace578a81ec54e60bd543cb4ae1cec8b964ba9dff0fc258e",
-    "inferena": "add19182e5479e3f7549894c524ac6691d3dc363"
-  }
+    "bytes": 20387856,
+    "sha256": "e88a082fa50a686f35495e4c89f7a5dea7f247f70ae712d2b924043423ed8391",
+    "inferena": "a0799e4210eafa25161ec50d475b186c4b19d3da",
+    "stripped_bytes": 15586168,
+    "rust_lines": 54271,
+    "wgsl_lines": 7025,
+    "shader_files": 113
+  },
+  "cohort_date": "2026-10-31/2026-11-01"
 }

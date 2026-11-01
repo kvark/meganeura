@@ -601,7 +601,7 @@ def ratio_plot(campaigns, rows):
         return (rf"\draw[{c},line width=0.45mm] ({x - 0.75:.3f},{y - 0.75:.3f}) -- ({x + 0.75:.3f},{y + 0.75:.3f}) "
                 rf"({x - 0.75:.3f},{y + 0.75:.3f}) -- ({x + 0.75:.3f},{y - 0.75:.3f});")
 
-    devices = list(DEVICES)
+    devices = [device for device in DEVICES if device in campaigns]
     top, bottom = pitch / 2, pitch / 2 - len(devices) * pitch
     chart = [r"\begin{tikzpicture}[x=1mm,y=1mm,font=\scriptsize]",
              *[rf"\definecolor{{p{color}}}{{HTML}}{{{color}}}" for _, color in marks.values()]]

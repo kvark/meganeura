@@ -305,7 +305,6 @@ table.tiles td:not(:first-child), table.tiles th:not(:first-child) { text-align:
 table.tiles td.tile { color: #637679; font-size: 18px; }
 .dot { color: #006b70; font-size: 26px; line-height: 1; }
 .no { color: #c3cccb; }
-.dot.f32 { color: #a44616; }
 section.features > p { font-size: 23px; margin: 12px 0 0; }
 
 /* Portability: shared memory as paired bars. */
@@ -475,3 +474,10 @@ section.egraph h1 { margin-bottom: 18px; }
 .egraph-text p { font-size: 22px; line-height: 1.32; margin: 0 0 20px; }
 .egraph-text b { color: #006b70; display: block; }
 section.egraph > p { font-size: 22px; margin: 4px 0 0; }
+
+/* Availability and measured selection are distinct on the hardware slide. */
+.tier.selected h3 { color: #006b70; }
+table.selected-paths { display: table; width: 100%; margin: 0 0 6px; font-size: 20px; }
+table.selected-paths th, table.selected-paths td { padding: 7px 9px; }
+table.selected-paths th:last-child, table.selected-paths td:last-child { text-align: right; }
+.tier.selected small { font-size: 16px; color: #637679; }
