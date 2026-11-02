@@ -1401,8 +1401,13 @@ impl Session {
                 else {
                     unreachable!("split products only take partitioned candidates");
                 };
-                let sum =
-                    sequence[0].partial_sum(partial, sequence[0].output_buffer, columns, splits);
+                let sum = sequence[0].partial_sum(
+                    partial,
+                    sequence[0].output_buffer,
+                    columns,
+                    splits,
+                    true,
+                );
                 sequence[0].output_buffer = partial;
                 sequence.push(sum);
             }
