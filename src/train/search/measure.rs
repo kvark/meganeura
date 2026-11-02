@@ -47,16 +47,6 @@ pub(super) trait Frontier {
     }
 }
 
-impl<I: Iterator<Item = Program>> Frontier for std::iter::Fuse<I> {
-    fn next(&mut self, _: Option<Origin>) -> Option<Program> {
-        Iterator::next(self)
-    }
-
-    fn may_remain(&self) -> bool {
-        self.size_hint().1 != Some(0)
-    }
-}
-
 #[derive(Serialize)]
 pub struct BuildSearchTrial {
     pub description: String,
@@ -242,20 +232,10 @@ pub(super) fn select(
     ),
 ) -> Result<(Session, BuildSearchReport), String> {
     let (mut initialize, mut refresh_inputs, mut qualify) = callbacks;
+    // The caller has validated the options.
     let options = report.options.clone();
-    options
-        .tuning
-        .validate()
-        .map_err(|error| error.to_string())?;
-    if options.max_programs == 0 || options.max_time.is_zero() {
-        return Err("program search needs a positive program and time budget".into());
-    }
-    if options.qualification_runs == 0 {
-        return Err("program search needs at least one qualification run".into());
-    }
     let mut selection = options.tuning.clone();
     selection.min_improvement = options.min_improvement;
-    selection.validate().map_err(|error| error.to_string())?;
     let mut incumbent: Option<(Session, SearchState)> = None;
     let mut incumbent_bytes = 0usize;
     let mut selected_chunks = 1;
@@ -641,6 +621,16 @@ mod tests {
     use super::*;
     use crate::TuneOptions;
     use crate::train::BuildSearchOptions;
+
+    impl<I: Iterator<Item = Program>> Frontier for std::iter::Fuse<I> {
+        fn next(&mut self, _: Option<Origin>) -> Option<Program> {
+            Iterator::next(self)
+        }
+
+        fn may_remain(&self) -> bool {
+            self.size_hint().1 != Some(0)
+        }
+    }
 
     fn select(
         programs: impl IntoIterator<Item = Program>,
