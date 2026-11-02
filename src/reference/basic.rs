@@ -498,6 +498,25 @@ pub(super) fn eval(node: &Node, ins: &[&Tensor]) -> Result<Vec<f64>, Error> {
                 })
                 .collect()
         }
+        Op::ArgMaxInner => {
+            let x = arg(0)?;
+            let (_, cols) = rows_cols(x);
+            x.data
+                .chunks_exact(cols)
+                .map(|values| {
+                    // Only a strictly greater value replaces the winner, so
+                    // ties keep the first column.
+                    let winner = (1..cols).fold(0, |best, col| {
+                        if values[col] > values[best] {
+                            col
+                        } else {
+                            best
+                        }
+                    });
+                    winner as f64
+                })
+                .collect()
+        }
         Op::BroadcastInner { inner } => {
             let x = arg(0)?;
             let inner = inner as usize;

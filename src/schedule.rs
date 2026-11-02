@@ -408,13 +408,16 @@ pub enum ReduceOp {
     Sum,
     /// Max: identity -inf, accumulator `max(acc, v)`.
     Max,
+    /// Index of the first maximum. Accumulates (value, lowest column) pairs
+    /// and exposes the winning column as an exact F32 scalar, not the value.
+    ArgMax,
 }
 
 impl ReduceOp {
     fn identity_wgsl(self) -> &'static str {
         match self {
             ReduceOp::Sum => "0.0f",
-            ReduceOp::Max => "bitcast<f32>(0xff800000u)", // -inf
+            ReduceOp::Max | ReduceOp::ArgMax => "bitcast<f32>(0xff800000u)", // -inf
         }
     }
 
@@ -425,7 +428,27 @@ impl ReduceOp {
             // measurably better than explicit `x = x + y` form.
             ReduceOp::Sum => format!("{} += {};", acc, v),
             ReduceOp::Max => format!("{} = max({}, {});", acc, acc, v),
+            ReduceOp::ArgMax => unreachable!("argmax combines value/index pairs"),
         }
+    }
+}
+
+/// Emit WGSL keeping the larger value, or the lower column of equal values.
+/// An empty accumulator (column `0xffffffff`) takes any nonempty candidate
+/// and an empty candidate never wins: comparisons with the infinite identity
+/// are not reliable once a shader compiler assumes finite math.
+fn combine_argmax(acc: &str, index: &str, value: &str, column: &str) -> String {
+    format!(
+        "if {column} != 0xffffffffu && ({index} == 0xffffffffu || {value} > {acc} || ({value} == {acc} && {column} < {index})) {{ {acc} = {value}; {index} = {column}; }}"
+    )
+}
+
+/// The reduced scalar of accumulator `k` at workgroup slot `slot`.
+fn reduced_value(op: ReduceOp, k: usize, slot: &str) -> String {
+    if op == ReduceOp::ArgMax {
+        format!("f32(wg_index_{k}[{slot}])")
+    } else {
+        format!("wg_data_{k}[{slot}]")
     }
 }
 
@@ -883,6 +906,9 @@ fn lower_reduction(
     let lanes_per_row = wg / rows_per_workgroup;
     for k in 0..n_reduced {
         let _ = writeln!(src, "var<workgroup> wg_data_{k}: array<f32, {wg}>;");
+        if op == ReduceOp::ArgMax {
+            let _ = writeln!(src, "var<workgroup> wg_index_{k}: array<u32, {wg}>;");
+        }
     }
     src.push('\n');
     let _ = writeln!(src, "@compute @workgroup_size({})", wg);
@@ -903,6 +929,9 @@ fn lower_reduction(
     src.push_str("    let row_offset = row * params.inner;\n");
     for k in 0..n_reduced {
         let _ = writeln!(src, "    var acc_{k}: f32 = {};", op.identity_wgsl());
+        if op == ReduceOp::ArgMax {
+            let _ = writeln!(src, "    var index_{k}: u32 = 0xffffffffu;");
+        }
     }
     src.push_str("    var col = lane;\n");
     src.push_str("    if row_valid {\n");
@@ -931,11 +960,13 @@ fn lower_reduction(
         } else {
             format!("v{}", dag.output)
         };
-        let _ = writeln!(
-            src,
-            "                {}",
-            op.combine_wgsl(&format!("acc_{k}"), &prologue_value)
-        );
+        let acc = format!("acc_{k}");
+        let combine = if op == ReduceOp::ArgMax {
+            combine_argmax(&acc, &format!("index_{k}"), &prologue_value, "col")
+        } else {
+            op.combine_wgsl(&acc, &prologue_value)
+        };
+        let _ = writeln!(src, "                {combine}");
         src.push_str("            }\n");
     }
     let _ = writeln!(src, "            col += {}u;", lanes_per_row);
@@ -943,6 +974,9 @@ fn lower_reduction(
     src.push_str("    }\n");
     for k in 0..n_reduced {
         let _ = writeln!(src, "    wg_data_{k}[tid] = acc_{k};");
+        if op == ReduceOp::ArgMax {
+            let _ = writeln!(src, "    wg_index_{k}[tid] = index_{k};");
+        }
     }
     src.push_str("    workgroupBarrier();\n");
     // Independent tree reductions within each packed row's lane group.
@@ -951,10 +985,17 @@ fn lower_reduction(
     while stride > 0 {
         let _ = writeln!(src, "    if lane < {}u {{", stride);
         for k in 0..n_reduced {
-            let combined = op.combine_wgsl(
-                &format!("wg_data_{k}[tid]"),
-                &format!("wg_data_{k}[tid + {}u]", stride),
+            let (acc, value) = (
+                format!("wg_data_{k}[tid]"),
+                format!("wg_data_{k}[tid + {stride}u]"),
             );
+            let combined = if op == ReduceOp::ArgMax {
+                let index = format!("wg_index_{k}[tid]");
+                let column = format!("wg_index_{k}[tid + {stride}u]");
+                combine_argmax(&acc, &index, &value, &column)
+            } else {
+                op.combine_wgsl(&acc, &value)
+            };
             let _ = writeln!(src, "        {}", combined);
         }
         src.push_str("    }\n");
@@ -966,13 +1007,11 @@ fn lower_reduction(
             // K reduced scalars per row, stored interleaved: dst[row*K + k].
             src.push_str("    if lane == 0u && row_valid {\n");
             for k in 0..n_reduced {
+                let value = reduced_value(op, k, "tid");
                 if n_reduced == 1 {
-                    let _ = writeln!(src, "        dst[row] = wg_data_{k}[tid];");
+                    let _ = writeln!(src, "        dst[row] = {value};");
                 } else {
-                    let _ = writeln!(
-                        src,
-                        "        dst[row * {n_reduced}u + {k}u] = wg_data_{k}[tid];"
-                    );
+                    let _ = writeln!(src, "        dst[row * {n_reduced}u + {k}u] = {value};");
                 }
             }
             src.push_str("    }\n");
@@ -981,10 +1020,8 @@ fn lower_reduction(
             // Reduce-then-map: broadcast the reduced values and write a
             // transformed element back for every col.
             for k in 0..n_reduced {
-                let _ = writeln!(
-                    src,
-                    "    let reduced_{k} = wg_data_{k}[row_slot * {lanes_per_row}u];"
-                );
+                let value = reduced_value(op, k, &format!("row_slot * {lanes_per_row}u"));
+                let _ = writeln!(src, "    let reduced_{k} = {value};");
             }
             src.push_str("    var wcol = lane;\n");
             src.push_str("    if row_valid {\n");

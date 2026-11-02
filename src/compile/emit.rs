@@ -1416,6 +1416,26 @@ impl<'a> Compiler<'a> {
                 );
             }
 
+            Op::ArgMaxInner => {
+                let input = self.get_buffer(node.inputs[0]);
+                let in_shape = &self.graph.node(node.inputs[0]).ty.shape;
+                let (rows, cols) = (in_shape[0] as u32, in_shape[1] as u32);
+                // A narrow row takes a power-of-two lane group of its own.
+                let rows_per_workgroup = if cols <= 32 {
+                    256 / cols.next_power_of_two()
+                } else {
+                    1
+                };
+                self.emit_inner_reduction(
+                    crate::schedule::ReduceOp::ArgMax,
+                    input,
+                    out_buf,
+                    rows,
+                    cols,
+                    rows_per_workgroup,
+                );
+            }
+
             Op::BroadcastInner { inner } => {
                 let input = self.get_buffer(node.inputs[0]);
                 let rows = node.ty.shape[0] as u32;

@@ -286,6 +286,9 @@ pub enum Op {
     SumInner,
     /// Row-wise maximum over the inner axis: `[M, N]` → `[M, 1]`.
     MaxInner,
+    /// Column of the first maximum of each row, as an exact F32 index:
+    /// `[M, N]` → `[M, 1]`. A selection, so it has no gradient.
+    ArgMaxInner,
     /// Backward helper for [`Op::SumInner`]: repeat each `[M, 1]` row across
     /// the inner axis, `[M, 1]` → `[M, N]`.
     BroadcastInner {
@@ -1946,6 +1949,88 @@ impl Graph {
         );
         let ty = TensorType::f32(vec![shape[0], 1]);
         self.add_node(Op::MaxInner, vec![x], ty)
+    }
+
+    /// Column of the first maximum of each nonempty F32 row, as an exact F32
+    /// index: `x: [M, N] → [M, 1]`, like `torch.argmax(x, dim=1)`. Equal
+    /// values tie to the lowest column, including signed zeros and
+    /// infinities; rows holding NaN are unspecified. A selection has no
+    /// derivative. Columns must be exact in F32 (`N <= 2^24`).
+    #[track_caller]
+    pub fn argmax_inner(&mut self, x: NodeId) -> NodeId {
+        let ty = &self.node(x).ty;
+        assert_eq!(ty.dtype, DType::F32, "argmax_inner expects F32 values");
+        assert_eq!(ty.rank(), 2, "argmax_inner expects [rows, columns]");
+        let (rows, columns) = (ty.shape[0], ty.shape[1]);
+        assert!(
+            (1..=1 << 24).contains(&columns),
+            "argmax_inner needs 1..=2^24 columns, got {columns}"
+        );
+        assert!(
+            rows > 0
+                && rows
+                    .checked_mul(columns)
+                    .is_some_and(|len| len <= u32::MAX as usize),
+            "argmax_inner needs 1..=u32::MAX elements"
+        );
+        // Lowering packs narrow rows into one workgroup, one row otherwise.
+        let packed_rows = if columns <= 32 {
+            256 / columns.next_power_of_two()
+        } else {
+            1
+        };
+        assert!(
+            rows.div_ceil(packed_rows) <= 65535,
+            "argmax_inner rows exceed one portable dispatch"
+        );
+        self.add_node(Op::ArgMaxInner, vec![x], TensorType::f32(vec![rows, 1]))
+    }
+
+    /// One-hot rows of integer F32 `indices`: `[M]` or `[M, 1]` →
+    /// `[M, classes]`, with 1 in the indexed column and 0 elsewhere, like
+    /// `torch.nn.functional.one_hot`. An index outside `0..classes` gives a
+    /// row of zeros; a fractional one is unspecified. There is no gradient.
+    ///
+    /// Spelled in primitives as `relu(1 - |index - column|)`. Subtracting
+    /// the row of column numbers is a bias, so all the arithmetic after
+    /// broadcasting the index fuses into one pointwise kernel.
+    #[track_caller]
+    pub fn one_hot(&mut self, indices: NodeId, classes: usize) -> NodeId {
+        let ty = &self.node(indices).ty;
+        assert_eq!(ty.dtype, DType::F32, "one_hot expects F32 indices");
+        let rows = ty.shape[0];
+        assert!(
+            ty.shape == [rows] || ty.shape == [rows, 1],
+            "one_hot expects [rows] or [rows, 1] indices, got {:?}",
+            ty.shape
+        );
+        assert!(
+            (1..=1 << 24).contains(&classes),
+            "one_hot needs 1..=2^24 classes, got {classes}"
+        );
+        let indices = if ty.rank() == 1 {
+            self.view(indices, &[rows, 1])
+        } else {
+            indices
+        };
+        let spread = self.broadcast_inner(indices, classes);
+        let columns = self.constant((0..classes).map(|c| -(c as f32)).collect(), &[classes]);
+        let offset = self.bias_add(spread, columns);
+        let distance = self.abs(offset);
+        let closeness = self.neg(distance);
+        let closeness = self.add_scalar(closeness, 1.0);
+        let hot = self.relu(closeness);
+        // A selection: nothing upstream of it trains through the indices.
+        self.stop_gradient(hot)
+    }
+
+    /// One-hot rows selecting the first maximum of each row of `x`:
+    /// `one_hot(argmax_inner(x), N)`, as in hard Gumbel-max sampling.
+    #[track_caller]
+    pub fn argmax_one_hot(&mut self, x: NodeId) -> NodeId {
+        let classes = self.node(x).ty.shape.get(1).copied().unwrap_or(0);
+        let indices = self.argmax_inner(x);
+        self.one_hot(indices, classes)
     }
 
     /// Row-wise mean over the inner axis: `x: [M, N] → [M, 1]`, spelled
