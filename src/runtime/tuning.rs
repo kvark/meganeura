@@ -1242,92 +1242,6 @@ impl Session {
         Ok(report)
     }
 
-    /// Measure up to four explicit split-K counts for one eligible scalar dW
-    /// class, without changing the live plan, allocations or tensor state.
-    /// Every challenger uses the current unsplit tile as its control.
-    ///
-    /// Reuses tile-search deadlines, staging, phase accounting, paired timing
-    /// and decision guards. Partial buffers and the largest upload/readback are
-    /// charged to `max_scratch_bytes`. `dispatches_per_sample` counts complete
-    /// sequences, including the final SumRows and its dependency barrier.
-    /// Full f64 final/partial checks supplement the ordinary finite/parity gates.
-    ///
-    /// Selections must be legal in advance; duplicates and more than four counts
-    /// are errors. `max_classes == 0` skips work; scope must include this class.
-    /// Pipeline preparation may populate the cache. A FasterCandidate result is
-    /// evidence for a rebuilt-plan experiment, not installation or a whole-step
-    /// speed claim. Inspect `candidate_split_k` as well as the tile and decision.
-    pub fn measure_conv_weight_splits(
-        &mut self,
-        dispatch_index: usize,
-        splits: &[u32],
-        options: TuneOptions,
-    ) -> Result<TuneReport, TuneError> {
-        options.validate()?;
-        let start = Instant::now();
-        if splits.is_empty()
-            || splits.len() > 4
-            || splits
-                .iter()
-                .enumerate()
-                .any(|(i, s)| splits[..i].contains(s))
-        {
-            return Err(TuneError("provide one to four distinct split-K counts"));
-        }
-        let class = collect_classes(&self.plan, &self.alias, self.coop_config.as_ref())
-            .0
-            .into_iter()
-            .find(|c| c.members.contains(&dispatch_index))
-            .filter(|c| c.key.shader == ShaderEntry::Conv2dGradWeightGemm)
-            .ok_or(TuneError(
-                "split-K measurement requires an eligible scalar dW class",
-            ))?;
-        if !options.scope.includes(&class.key) {
-            return Err(TuneError(
-                "tuning scope excludes the requested split-K class",
-            ));
-        }
-        for &count in splits {
-            split_dispatches(&self.plan.dispatches[dispatch_index], &class.key, count)?;
-        }
-        let mut report = TuneReport {
-            options: options.clone(),
-            eligible_classes: 1,
-            excluded_dispatches: self.plan.dispatches.len() - class.members.len(),
-            class_limit_reached: options.max_classes == 0,
-            ..Default::default()
-        };
-        let gpu = std::sync::Arc::clone(&self.gpu);
-        let mut staging = Staging::new(&gpu, options.staging, options.staging_reuse);
-        if options.max_classes != 0 {
-            for &count in splits {
-                if start.elapsed() >= options.max_time {
-                    break;
-                }
-                report.visited_classes = 1;
-                let mut outcome = TuneOutcome::new(
-                    class.key.clone(),
-                    class.members.len(),
-                    class.initial,
-                    class.initial,
-                );
-                outcome.candidate_split_k = Some(count);
-                let comparison_start = Instant::now();
-                self.measure_candidate(&class, &options, start, &mut outcome, &mut staging);
-                outcome.elapsed = comparison_start.elapsed();
-                report.outcomes.push(outcome);
-            }
-        }
-        if staging.retained_bytes() != 0 || staging.baseline.is_some() {
-            let _timer = PhaseTimer::new(&mut report.final_cleanup);
-            staging.clear();
-        }
-        report.scratch = Some(staging.stats);
-        report.elapsed = start.elapsed();
-        report.time_budget_exhausted = report.elapsed >= options.max_time;
-        Ok(report)
-    }
-
     fn measure_candidate(
         &mut self,
         class: &SearchClass,
@@ -1378,12 +1292,6 @@ impl Session {
         let mut variants = [vec![dispatch.clone()], vec![dispatch]];
         outcome.initial.apply(&mut variants[0][0], &class.key);
         outcome.candidate.apply(&mut variants[1][0], &class.key);
-        if let Some(splits) = outcome.candidate_split_k {
-            let (sequence, partial_bytes) = split_dispatches(&variants[1][0], &class.key, splits)
-                .expect("explicit split-K counts were preflighted");
-            variants[1] = sequence;
-            sizes.push(partial_bytes);
-        }
         if class.key.split_k {
             // Both tiles write their partitions into a partial buffer of the
             // live size, and a SumRows adds them into the output.
@@ -1449,17 +1357,8 @@ impl Session {
                 return;
             }
         }
-        // Split sequences carry pipelines no tile names: a split convolution
-        // producer and the SumRows of any split.
-        let sequence_dispatches: Vec<&Dispatch> = if outcome.candidate_split_k.is_some() {
-            variants[1].iter().collect()
-        } else {
-            variants
-                .iter()
-                .flat_map(|sequence| &sequence[1..])
-                .collect()
-        };
-        for dispatch in sequence_dispatches {
+        // Split sequences carry a pipeline no tile names: the SumRows.
+        for dispatch in variants.iter().flat_map(|sequence| &sequence[1..]) {
             if start.elapsed() >= options.max_time {
                 outcome.decision = TuneDecision::TimeBudget;
                 return;
@@ -1480,8 +1379,7 @@ impl Session {
             return;
         }
         let cached_baseline = staging.baseline.take().filter(|baseline| {
-            outcome.candidate_split_k.is_none()
-                && baseline.class == class.key
+            baseline.class == class.key
                 && baseline.tile == outcome.initial
                 && baseline.binding_bytes == sizes
         });
@@ -1522,8 +1420,7 @@ impl Session {
                     .iter()
                     .enumerate()
                     .map(|(position, dispatch)| {
-                        let key = if position > 0 || (i == 1 && outcome.candidate_split_k.is_some())
-                        {
+                        let key = if position > 0 {
                             Pipelines::key(dispatch, &capabilities)
                         } else {
                             tile_variant(
@@ -1597,7 +1494,7 @@ impl Session {
                     let identical = variant == 1
                         && bytemuck::cast_slice::<f32, u8>(&baseline_outputs[pattern])
                             == bytemuck::cast_slice::<f32, u8>(&output);
-                    let agree = if class.key.split_k || outcome.candidate_split_k.is_some() {
+                    let agree = if class.key.split_k {
                         reordered_outputs_agree
                     } else {
                         outputs_agree
@@ -1613,54 +1510,6 @@ impl Session {
                         [outcome.initial, outcome.candidate][variant]
                     ));
                     return;
-                }
-                if let Some(splits) = outcome.candidate_split_k {
-                    let final_check = {
-                        let _timer = PhaseTimer::new(&mut details.validation);
-                        qualify_weight_range(
-                            &class.key,
-                            &inputs,
-                            &output,
-                            scale,
-                            0..class.key.k as usize,
-                        )
-                    };
-                    if let Err(error) = final_check {
-                        outcome.decision = TuneDecision::InvalidOutput;
-                        outcome.failure = Some(format!(
-                            "variant {variant}, pattern {pattern}, final: {error}"
-                        ));
-                        return;
-                    }
-                    if variant == 1 {
-                        let partials = scratch.read_buffer(
-                            output_index + 1,
-                            sizes[output_index + 1] / 4,
-                            details,
-                        );
-                        let _timer = PhaseTimer::new(&mut details.validation);
-                        for split in 0..splits {
-                            if start.elapsed() >= options.max_time {
-                                outcome.decision = TuneDecision::TimeBudget;
-                                return;
-                            }
-                            let elements = class.key.output_elements();
-                            let offset = split as usize * elements;
-                            if let Err(error) = qualify_weight_range(
-                                &class.key,
-                                &inputs,
-                                &partials[offset..offset + elements],
-                                scale,
-                                split_range(class.key.k, splits, split),
-                            ) {
-                                outcome.decision = TuneDecision::InvalidOutput;
-                                outcome.failure = Some(format!(
-                                    "pattern {pattern}, partial {split}/{splits}: {error}"
-                                ));
-                                return;
-                            }
-                        }
-                    }
                 }
                 if variant == 0 {
                     baseline_outputs[pattern] = output;
@@ -1701,12 +1550,10 @@ impl Session {
         drop(sampling);
         drop(scratch);
         decide(outcome, options);
-        if outcome.candidate_split_k.is_none()
-            && matches!(
-                outcome.decision,
-                TuneDecision::FasterCandidate | TuneDecision::KeepBaseline
-            )
-        {
+        if matches!(
+            outcome.decision,
+            TuneDecision::FasterCandidate | TuneDecision::KeepBaseline
+        ) {
             staging.baseline = Some(QualifiedBaseline {
                 class: class.key.clone(),
                 tile: outcome.selected,
@@ -1721,63 +1568,7 @@ impl Session {
     }
 }
 
-fn split_dispatches(
-    dispatch: &Dispatch,
-    class: &TuneClass,
-    splits: u32,
-) -> Result<(Vec<Dispatch>, usize), TuneError> {
-    let mut plan = crate::compile::compile(&crate::Graph::new());
-    plan.buffers = class
-        .buffer_sizes()
-        .ok_or(TuneError("invalid split-K extents"))?;
-    let mut dispatch = dispatch.clone();
-    dispatch.kernel = crate::compile::Kernel::Default; // Split-K has its own K=16 shader.
-    dispatch.input_buffers = vec![BufferRef(0), BufferRef(1)];
-    dispatch.output_buffer = BufferRef(2);
-    plan.dispatches.push(dispatch);
-    let bytes = plan.split_conv_weight_gradients(&[(0, splits)], usize::MAX)?;
-    Ok((plan.dispatches, bytes))
-}
-
-fn split_range(k: u32, splits: u32, split: u32) -> std::ops::Range<usize> {
-    let tiles = k.div_ceil(16);
-    let first = split * (tiles / splits) + split.min(tiles % splits);
-    let last = first + tiles / splits + u32::from(split < tiles % splits);
-    first as usize * 16..(last as usize * 16).min(k as usize)
-}
-
-fn qualify_weight_range(
-    class: &TuneClass,
-    inputs: &[Vec<f32>],
-    output: &[f32],
-    scale: f64,
-    range: std::ops::Range<usize>,
-) -> Result<(), String> {
-    if output.len() != class.output_elements() {
-        return Err("incorrect output length".into());
-    }
-    qualify_reference(
-        output.iter().enumerate().map(|(index, &actual)| {
-            let reference = weight_reference_dot(
-                class,
-                inputs,
-                index / class.n as usize,
-                index % class.n as usize,
-                range.clone(),
-            );
-            (reference, actual)
-        }),
-        scale,
-    )
-}
-
-fn weight_reference_dot(
-    class: &TuneClass,
-    inputs: &[Vec<f32>],
-    row: usize,
-    col: usize,
-    range: std::ops::Range<usize>,
-) -> f64 {
+fn weight_reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize) -> f64 {
     let s = class.conv2d.expect("weight-gradient reference");
     let [ci, h, w, co, kh, kw, stride, ph, oh, ow, pw] = [
         s.in_channels,
@@ -1796,7 +1587,7 @@ fn weight_reference_dot(
     let channel = col / (kh * kw);
     let (y, x) = (col / kw % kh, col % kw);
     let mut value = 0.0;
-    for k in range {
+    for k in 0..class.k as usize {
         let (batch, oy, ox) = (k / (oh * ow), k / ow % oh, k % ow);
         let Some(iy) = (oy * stride + y).checked_sub(ph) else {
             continue;
@@ -2469,7 +2260,7 @@ fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize)
                 }
             }
         } else {
-            value = weight_reference_dot(class, inputs, row, col, 0..class.k as usize);
+            value = weight_reference_dot(class, inputs, row, col);
         }
         return value;
     }
@@ -3658,74 +3449,7 @@ mod tests {
     }
 
     #[test]
-    fn split_scratch_contract_and_full_partial_oracles_reject_corruption() {
-        let dispatch = Dispatch {
-            shader: ShaderEntry::Conv2dGradWeightGemmSmall,
-            workgroups: [1, 1, 1],
-            input_buffers: vec![BufferRef(0), BufferRef(1)],
-            output_buffer: BufferRef(2),
-            params: vec![2, 2, 1, 41, 3, 1, 1, 1, 0, 1, 41, 0],
-            requires_full_precision: true,
-            ..Default::default()
-        };
-        let class = TuneClass::from_dispatch(&dispatch, None).unwrap();
-        let sizes = class.buffer_sizes().unwrap();
-        for splits in [2, 3, 6] {
-            let (sequence, partial_bytes) = split_dispatches(&dispatch, &class, splits).unwrap();
-            assert_eq!(partial_bytes, sizes[2] * splits as usize);
-            assert_eq!(sequence.len(), 2);
-            assert_eq!(sequence[0].output_buffer, BufferRef(3));
-            assert_eq!(sequence[1].input_buffers, [BufferRef(3)]);
-            assert_eq!(sequence[1].output_buffer, BufferRef(2));
-            let mut allocation = sizes.clone();
-            allocation.push(partial_bytes);
-            assert_eq!(
-                scratch_bytes(&allocation),
-                Some(984 + 656 + 24 + partial_bytes + 984 + ENCODER_SCRATCH_BYTES)
-            );
-            for pattern in 0..2 {
-                let inputs = test_inputs(&sizes, pattern);
-                let scale = if pattern == 0 { 1.0 } else { 1e-12 };
-                let mut previous = 0;
-                for split in 0..splits {
-                    let range = split_range(class.k, splits, split);
-                    assert_eq!(range.start, previous);
-                    previous = range.end;
-                    // Direct forward scatter for this 1x1 fixture, independently
-                    // indexed in NCHW and restricted to the selected spatial range.
-                    let mut expected = vec![0.0f64; class.output_elements()];
-                    for batch in 0..2 {
-                        for co in 0..3 {
-                            for x in 0..41 {
-                                if range.contains(&(batch * 41 + x)) {
-                                    for ci in 0..2 {
-                                        expected[co * 2 + ci] +=
-                                            f64::from(inputs[0][(batch * 3 + co) * 41 + x])
-                                                * f64::from(inputs[1][(batch * 2 + ci) * 41 + x]);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    let mut output: Vec<_> = expected.iter().map(|&v| v as f32).collect();
-                    assert!(
-                        qualify_weight_range(&class, &inputs, &output, scale, range.clone())
-                            .is_ok()
-                    );
-                    *output.last_mut().unwrap() = f32::NAN;
-                    assert!(
-                        qualify_weight_range(&class, &inputs, &output, scale, range.clone())
-                            .is_err()
-                    );
-                    output.fill(0.0);
-                    assert!(qualify_weight_range(&class, &inputs, &output, scale, range).is_err());
-                }
-                assert_eq!(previous, class.k as usize);
-            }
-        }
-        for splits in [0, 1, 7, u32::MAX] {
-            assert!(split_dispatches(&dispatch, &class, splits).is_err());
-        }
+    fn scratch_bytes_count_staging_and_reuse_needs_the_same_size() {
         // The cap counts staging for the largest buffer and checks overflow.
         assert_eq!(
             scratch_bytes(&[4, 8, 12, 128]),
@@ -4770,7 +4494,7 @@ mod tests {
     }
 
     #[test]
-    fn matrix_and_split_weight_references_accept_f32_cancellation() {
+    fn matrix_and_weight_references_accept_f32_cancellation() {
         let k = 8192;
         for convolution in [false, true] {
             let dispatch = Dispatch {
@@ -4808,22 +4532,13 @@ mod tests {
                         _ => 1e-6,
                     };
                 }
-                for range in [0..k, 0..k / 2, k / 2..k] {
-                    let mut actual = [0.0f32; 2];
-                    for inner in range.clone() {
-                        for col in 0..2 {
-                            actual[col] += inputs[0][inner] * inputs[1][offset(inner, col)];
-                        }
-                    }
-                    if range == (0..k) {
-                        assert!(qualify_output(&class, &inputs, &actual, scale));
-                    }
-                    if convolution {
-                        assert!(
-                            qualify_weight_range(&class, &inputs, &actual, scale, range).is_ok()
-                        );
+                let mut actual = [0.0f32; 2];
+                for inner in 0..k {
+                    for col in 0..2 {
+                        actual[col] += inputs[0][inner] * inputs[1][offset(inner, col)];
                     }
                 }
+                assert!(qualify_output(&class, &inputs, &actual, scale));
             }
         }
     }
