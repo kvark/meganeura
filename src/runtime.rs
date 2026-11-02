@@ -3538,6 +3538,8 @@ pub struct Session {
     /// device-local placement.
     alias: crate::memplan::AliasPlan,
     pipelines: Pipelines,
+    /// Built on first use by [`Session::blend_parameters_from`].
+    blend_pipeline: Option<blade_graphics::ComputePipeline>,
     /// Session policy/capabilities after the cooperative smoke test. Tuning
     /// must not re-enable a rejected or explicitly disabled implementation.
     coop_config: Option<crate::codegen::CoopConfig>,
@@ -4613,6 +4615,7 @@ impl Session {
             physical_buffers,
             alias,
             pipelines,
+            blend_pipeline: None,
             coop_config,
             plan,
             groups,
@@ -6291,6 +6294,8 @@ mod transfer;
 
 // Turning a dispatch into bound shader data lives in `runtime/binding.rs`.
 mod binding;
+mod parameter_blend;
+pub use parameter_blend::BlendParameterError;
 
 // The execution half of `Session` continues here: waiting, stepping,
 // recording, dispatch binding and the optimizer entry points.
@@ -7102,6 +7107,9 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.wait();
+        if let Some(mut pipeline) = self.blend_pipeline.take() {
+            self.gpu.destroy_compute_pipeline(&mut pipeline);
+        }
         self.gpu.destroy_command_encoder(&mut self.encoder);
         if let Some(staging) = self.upload_staging.get_mut().take() {
             self.gpu.destroy_buffer(staging.buffer);
