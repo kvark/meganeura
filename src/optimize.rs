@@ -320,7 +320,7 @@ pub fn optimize_with_report(graph: &Graph) -> (Graph, OptimizeReport) {
 
 /// Optimize with an explicit strategy and extraction objective.
 pub fn optimize_with_config(graph: &Graph, config: OptimizeConfig) -> (Graph, OptimizeReport) {
-    optimize_owned_with_config(clone_graph(graph), config)
+    optimize_owned_with_config(graph.deep_clone(), config)
 }
 
 /// Optimize an owned graph without first duplicating all node payloads.
@@ -1139,7 +1139,7 @@ impl Stamper<'_> {
     /// Overwrite the root node in place with the extracted term.
     fn stamp_root(&mut self, root: usize, dag: &TermDag, term_id: TermId) -> Result<(), String> {
         match *dag.get(term_id) {
-            Term::App(ref name, ref children) if named_constructor_exists(name) => {
+            Term::App(ref name, ref children) if static_constructor(name).is_ok() => {
                 let inputs = self.resolve_children(dag, children)?;
                 // Unchanged term → nothing to do.
                 if named_constructor(&self.g.node(root as u32).op) == Some(name.as_str())
@@ -1443,10 +1443,6 @@ impl Stamper<'_> {
     }
 }
 
-fn named_constructor_exists(name: &str) -> bool {
-    static_constructor(name).is_ok()
-}
-
 const fn matrix_impl(
     tile_m: u32,
     tile_n: u32,
@@ -1488,25 +1484,36 @@ const MATRIX_IMPLEMENTATIONS: &[(&str, Option<crate::graph::MatmulImpl>)] = &[
     ("64x64k16s8", matrix_impl(64, 64, 16, 8, true)),
 ];
 
+/// Logical operators with scheduled `{logical}__{layout}` implementations.
+const MATRIX_FAMILIES: [&str; 10] = [
+    "MatMul",
+    "MatMulAT",
+    "MatMulBT",
+    "FusedMatMulAdd",
+    "FusedMatMulATAdd",
+    "FusedMatMulBTAdd",
+    "SwiGLUPacked",
+    "SwiGLUPackedBT",
+    "GeGLUPacked",
+    "GeGLUPackedBT",
+];
+
+const ATTENTION_FAMILIES: [&str; 3] = ["AttentionForward", "AttentionGradQ", "AttentionGradKV"];
+
+/// The member of `families` that names `name`'s logical operator, ignoring
+/// any `__layout` suffix.
+fn family(name: &str, families: &[&'static str]) -> Option<&'static str> {
+    let logical = name.split_once("__").map_or(name, |(logical, _)| logical);
+    families.iter().copied().find(|&family| family == logical)
+}
+
 fn matrix_constructors() -> &'static [(String, &'static str)] {
     static NAMES: std::sync::LazyLock<Vec<(String, &'static str)>> =
         std::sync::LazyLock::new(|| {
             MATRIX_IMPLEMENTATIONS
                 .iter()
                 .flat_map(|&(layout, _)| {
-                    [
-                        "MatMul",
-                        "MatMulAT",
-                        "MatMulBT",
-                        "FusedMatMulAdd",
-                        "FusedMatMulATAdd",
-                        "FusedMatMulBTAdd",
-                        "SwiGLUPacked",
-                        "SwiGLUPackedBT",
-                        "GeGLUPacked",
-                        "GeGLUPackedBT",
-                    ]
-                    .map(|logical| (format!("{logical}__{layout}"), logical))
+                    MATRIX_FAMILIES.map(|logical| (format!("{logical}__{layout}"), logical))
                 })
                 .collect()
         });
@@ -1521,21 +1528,7 @@ fn scheduled_matmul(name: &str) -> Option<crate::graph::MatmulImpl> {
 }
 
 fn matrix_family(name: &str) -> Option<&'static str> {
-    Some(
-        match name.split_once("__").map_or(name, |(logical, _)| logical) {
-            "MatMul" => "MatMul",
-            "MatMulAT" => "MatMulAT",
-            "MatMulBT" => "MatMulBT",
-            "FusedMatMulAdd" => "FusedMatMulAdd",
-            "FusedMatMulATAdd" => "FusedMatMulATAdd",
-            "FusedMatMulBTAdd" => "FusedMatMulBTAdd",
-            "SwiGLUPacked" => "SwiGLUPacked",
-            "SwiGLUPackedBT" => "SwiGLUPackedBT",
-            "GeGLUPacked" => "GeGLUPacked",
-            "GeGLUPackedBT" => "GeGLUPackedBT",
-            _ => return None,
-        },
-    )
+    family(name, &MATRIX_FAMILIES)
 }
 
 fn attention_gradient_constructor(op: &Op) -> Option<&'static str> {
@@ -1556,18 +1549,7 @@ fn attention_constructor(op: &Op) -> Option<&'static str> {
 }
 
 fn attention_family(name: &str) -> Option<&'static str> {
-    match name.split_once("__").map_or(name, |(logical, _)| logical) {
-        "AttentionForward" => Some("AttentionForward"),
-        _ => attention_gradient_family(name),
-    }
-}
-
-fn attention_gradient_family(name: &str) -> Option<&'static str> {
-    match name.split_once("__").map_or(name, |(logical, _)| logical) {
-        "AttentionGradQ" => Some("AttentionGradQ"),
-        "AttentionGradKV" => Some("AttentionGradKV"),
-        _ => None,
-    }
+    family(name, &ATTENTION_FAMILIES)
 }
 
 const ATTENTION_GRADIENT_EPT_CAPS: &[u32] = &[4, 8, 16, 32, 64];
@@ -1578,8 +1560,9 @@ fn attention_gradient_constructors() -> &'static [(String, &'static str)] {
             ATTENTION_GRADIENT_EPT_CAPS
                 .iter()
                 .flat_map(|cap| {
-                    ["AttentionGradQ", "AttentionGradKV"]
-                        .map(|logical| (format!("{logical}__{cap}"), logical))
+                    ATTENTION_FAMILIES[1..]
+                        .iter()
+                        .map(move |&logical| (format!("{logical}__{cap}"), logical))
                 })
                 .collect()
         });
@@ -1593,7 +1576,7 @@ fn implementation_family(name: &str) -> Option<&'static str> {
 fn native_attention_constructors() -> &'static [(String, &'static str)] {
     static NAMES: std::sync::LazyLock<Vec<(String, &'static str)>> =
         std::sync::LazyLock::new(|| {
-            ["AttentionForward", "AttentionGradQ", "AttentionGradKV"]
+            ATTENTION_FAMILIES
                 .map(|logical| (format!("{logical}__native_f32"), logical))
                 .into()
         });
@@ -1654,29 +1637,23 @@ fn static_constructor(name: &str) -> Result<&'static str, String> {
     {
         return Ok(entry.0.as_str());
     }
-    Ok(match name {
-        "MatMul" => "MatMul",
-        "MatMulAT" => "MatMulAT",
-        "MatMulBT" => "MatMulBT",
-        "FusedMatMulAdd" => "FusedMatMulAdd",
-        "FusedMatMulATAdd" => "FusedMatMulATAdd",
-        "FusedMatMulBTAdd" => "FusedMatMulBTAdd",
-        "Add" => "Add",
-        "Mul" => "Mul",
-        "Relu" => "Relu",
-        "Sigmoid" => "Sigmoid",
-        "Neg" => "Neg",
-        "Transpose" => "Transpose",
-        "Silu" => "Silu",
-        "SwiGLU" => "SwiGLU",
-        "SwiGLUPacked" => "SwiGLUPacked",
-        "SwiGLUPackedBT" => "SwiGLUPackedBT",
-        "Gelu" => "Gelu",
-        "GeGLU" => "GeGLU",
-        "GeGLUPacked" => "GeGLUPacked",
-        "GeGLUPackedBT" => "GeGLUPackedBT",
-        other => return Err(format!("unknown constructor {}", other)),
-    })
+    const OTHERS: [&str; 10] = [
+        "Add",
+        "Mul",
+        "Relu",
+        "Sigmoid",
+        "Neg",
+        "Transpose",
+        "Silu",
+        "SwiGLU",
+        "Gelu",
+        "GeGLU",
+    ];
+    MATRIX_FAMILIES
+        .into_iter()
+        .chain(OTHERS)
+        .find(|&logical| logical == name)
+        .ok_or_else(|| format!("unknown constructor {name}"))
 }
 
 fn lit_node_id(dag: &TermDag, term_id: TermId) -> Result<usize, String> {
@@ -1873,10 +1850,6 @@ pub fn apply_winograd_conv_fusions(
         graph.nodes_mut()[id].op = rewrite;
         fusions.push((name.to_string(), id as u32));
     }
-}
-
-fn clone_graph(graph: &Graph) -> Graph {
-    graph.deep_clone()
 }
 
 #[cfg(test)]
