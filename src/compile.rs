@@ -8,6 +8,7 @@ mod bf16;
 mod params;
 mod softplus;
 mod split_k;
+pub(crate) mod stages;
 pub(crate) use params::{
     AttentionParams, CachedBlockAttentionParams, DispatchParams, RoPEParams, WinogradInputParams,
     WinogradOutputParams, WinogradWeightParams,
@@ -992,17 +993,25 @@ fn norm_weight_grad_rows_per_workgroup(rows: u32) -> u32 {
 
 /// Order dependent dispatches, form barrier groups, then fuse within groups.
 pub fn schedule_dispatches(plan: &mut ExecutionPlan, serial: bool, fuse_horizontal: bool) {
-    reorder_by_level(&mut plan.dispatches);
+    plan.groups = schedule_sequence(&mut plan.dispatches, serial, fuse_horizontal);
+}
+
+fn schedule_sequence(
+    dispatches: &mut Vec<Dispatch>,
+    serial: bool,
+    fuse_horizontal: bool,
+) -> Vec<std::ops::Range<usize>> {
+    reorder_by_level(dispatches);
     let mut groups = if serial {
-        (0..plan.dispatches.len()).map(|i| i..i + 1).collect()
+        (0..dispatches.len()).map(|i| i..i + 1).collect()
     } else {
-        compute_groups(&plan.dispatches)
+        compute_groups(dispatches)
     };
     if fuse_horizontal {
-        fuse_horizontal_matmuls(&mut plan.dispatches, &mut groups);
+        fuse_horizontal_matmuls(dispatches, &mut groups);
     }
-    warn_on_hazards(&plan.dispatches, &groups);
-    plan.groups = groups;
+    warn_on_hazards(dispatches, &groups);
+    groups
 }
 
 /// Stable dependency ordering places independent dispatches next to each other.
