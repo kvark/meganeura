@@ -2564,9 +2564,6 @@ fn horizontal_matmul_layout(count: u32) -> blade_graphics::ShaderDataLayout {
     blade_graphics::ShaderDataLayout { bindings }
 }
 
-/// ShaderDataLayout for a schedule-template reduction pipeline, chosen
-/// by (n_per_elem, n_per_row, n_per_col). Names align with the bindings
-/// emitted by `schedule::lower` for reductions.
 /// Ordered storage-buffer binding names for a reduction kernel's input
 /// streams: each per-element stream, with its `_idx` indices buffer right
 /// after it when that stream is a gather; then per-row; then per-col.
@@ -2681,6 +2678,10 @@ type HorizMatMulData = BufferListData<MatMulParams>;
 /// Gather-reduction bindings: one buffer per gathered stream, then `params`.
 type DynReductionData = BufferListData<ReductionParams>;
 
+/// ShaderDataLayout for a schedule-template reduction pipeline, chosen
+/// by (n_per_elem, n_per_row, n_per_col), or built from
+/// [`reduction_input_binding_names`] when [`reduction_is_dynamic`]. Names
+/// align with the bindings emitted by `schedule::lower` for reductions.
 fn reduction_data_layout(
     kernel: &crate::schedule::ReductionKernel,
 ) -> blade_graphics::ShaderDataLayout {
