@@ -6286,6 +6286,8 @@ pub struct AutoTuneResult {
 /// capability description the caller compiles for or reports; there is
 /// no shared global to install — everything that reaches the compiler
 /// or the pipeline layer takes it as a parameter.
+///
+/// The second argument is unused; it is kept for API compatibility.
 pub fn auto_tune(gpu: &blade_graphics::Context, _head_dim: u32) -> AutoTuneResult {
     let capabilities = gpu.capabilities();
     let cm = &capabilities.cooperative_matrix;
