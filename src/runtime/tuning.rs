@@ -3,8 +3,7 @@ use crate::compile::{BufferRef, Dispatch, ShaderEntry};
 use crate::tune::{
     MachineProfile, MatmulTile, TileFamily, TuneCalibration, TuneClass, TuneDecision, TuneError,
     TuneOptions, TuneOutcome, TunePreparationTimes, TuneQualificationTimes, TuneReport,
-    TuneScratchStats, TuneScratchUsage, TuneStaging, TuneStagingReuse, TuneStrategy, decide,
-    measure_pairs,
+    TuneScratchStats, TuneScratchUsage, TuneStrategy, decide, measure_pairs,
 };
 use blade_graphics as bg;
 use std::{
@@ -44,7 +43,7 @@ pub struct KernelMemo {
 
 // Bump when kernel generation, qualification or decision semantics change,
 // including changes between package releases. This also versions the memo schema.
-const KERNEL_MEMO_REVISION: u32 = 12;
+const KERNEL_MEMO_REVISION: u32 = 13;
 
 /// Undecided classes predicted to total less than this share of the plan are
 /// not probed. Kernel winners are accepted together, so classes well below
@@ -70,8 +69,6 @@ struct MemoScope {
     sample_pairs: usize,
     dispatches_per_sample: u32,
     target_sample_time: Option<Duration>,
-    staging: crate::tune::TuneStaging,
-    staging_reuse: crate::tune::TuneStagingReuse,
     /// Races decide from shared rounds; keep their decisions apart.
     #[serde(default)]
     strategy: TuneStrategy,
@@ -93,8 +90,6 @@ impl MemoScope {
             sample_pairs: options.sample_pairs,
             dispatches_per_sample: options.dispatches_per_sample,
             target_sample_time: options.target_sample_time,
-            staging: options.staging,
-            staging_reuse: options.staging_reuse,
             strategy: options.strategy,
             gpu_timestamps: false,
         }
@@ -1032,7 +1027,7 @@ impl Session {
             .as_ref()
             .and_then(|profile| predicted_plan_ms(&self.plan, &classes, profile));
         report.machine_profile = profile.clone();
-        let mut staging = Staging::new(&gpu, options.staging, options.staging_reuse);
+        let mut staging = Staging::new(&gpu);
         // Measured over predicted time per kernel family: log-ratio sum and count.
         let mut ratios: HashMap<TileFamily, (f64, u32)> = HashMap::new();
         let predict = |class: &SearchClass, ratios: &HashMap<TileFamily, (f64, u32)>| {
@@ -1628,14 +1623,16 @@ fn limited_scratch_bytes(sizes: &[usize], extra_buffers: usize, limit: usize) ->
     scratch_bytes(sizes)?.checked_add(extra_buffers)
 }
 
-fn reuse_staging(policy: TuneStagingReuse, retained: usize, requested: usize) -> bool {
-    policy == TuneStagingReuse::SameSize && retained != 0 && retained == requested
+fn reuse_staging(retained: usize, requested: usize) -> bool {
+    retained != 0 && retained == requested
 }
 
+/// Private resources one tuning call keeps between comparisons, never kernel
+/// bindings. The host-read-optimized staging buffer serves uploads as well as
+/// readbacks. It is kept at its exact size, released on a size change and
+/// before the call returns, and never retains extra capacity.
 struct Staging<'gpu> {
     gpu: &'gpu Gpu,
-    memory: TuneStaging,
-    reuse: TuneStagingReuse,
     buffer: Option<bg::Buffer>,
     input_b: Option<RetainedInput>,
     baseline: Option<QualifiedBaseline>,
@@ -1656,11 +1653,9 @@ struct QualifiedBaseline {
 }
 
 impl<'gpu> Staging<'gpu> {
-    fn new(gpu: &'gpu Gpu, memory: TuneStaging, reuse: TuneStagingReuse) -> Self {
+    fn new(gpu: &'gpu Gpu) -> Self {
         Self {
             gpu,
-            memory,
-            reuse,
             buffer: None,
             input_b: None,
             baseline: None,
@@ -1683,7 +1678,7 @@ impl<'gpu> Staging<'gpu> {
     }
 
     fn discard_unmatched(&mut self, bytes: usize) {
-        if !reuse_staging(self.reuse, self.stats.retained_staging_bytes, bytes) {
+        if !reuse_staging(self.stats.retained_staging_bytes, bytes) {
             self.clear_staging();
         }
     }
@@ -1712,21 +1707,14 @@ impl<'gpu> Staging<'gpu> {
 
     fn acquire(&mut self, bytes: usize) -> bool {
         if self.buffer.is_some() {
-            assert!(reuse_staging(
-                self.reuse,
-                self.stats.retained_staging_bytes,
-                bytes
-            ));
+            assert!(reuse_staging(self.stats.retained_staging_bytes, bytes));
             self.stats.staging_reuses += 1;
             return true;
         }
         self.buffer = Some(self.gpu.create_buffer(bg::BufferDesc {
             name: "tune_staging",
             size: bytes as u64,
-            memory: match self.memory {
-                TuneStaging::Shared => bg::Memory::Shared,
-                TuneStaging::Download => bg::Memory::Download,
-            },
+            memory: bg::Memory::Download,
         }));
         self.stats.staging_allocations += 1;
         self.stats.retained_staging_bytes = bytes;
@@ -1774,7 +1762,6 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
         assert!(
             staging.buffer.is_none()
                 || reuse_staging(
-                    staging.reuse,
                     staging.stats.retained_staging_bytes,
                     *sizes.iter().max().unwrap()
                 )
@@ -2015,9 +2002,6 @@ impl Drop for Scratch<'_, '_> {
     fn drop(&mut self) {
         let _timer = PhaseTimer::new(self.cleanup);
         self.gpu.destroy_command_encoder(&mut self.encoder);
-        if self.staging.reuse == TuneStagingReuse::Fresh {
-            self.staging.clear_staging();
-        }
         self.staging.input_b = Some(RetainedInput {
             class: self.class.clone(),
             buffer: self.buffers.swap_remove(1),
@@ -2846,7 +2830,7 @@ mod tests {
             ..sequential_tuning()
         };
         for mismatch in ["none", "class", "tile", "bindings"] {
-            let mut staging = Staging::new(&gpu, options.staging, options.staging_reuse);
+            let mut staging = Staging::new(&gpu);
             let mut first =
                 TuneOutcome::new(class.key.clone(), 1, class.initial, class.challengers[0]);
             session.measure_candidate(class, &options, Instant::now(), &mut first, &mut staging);
@@ -3456,15 +3440,10 @@ mod tests {
             Some(280 + ENCODER_SCRATCH_BYTES)
         );
         assert_eq!(scratch_bytes(&[usize::MAX, 4]), None);
-        assert!(reuse_staging(TuneStagingReuse::SameSize, 12, 12));
+        assert!(reuse_staging(12, 12));
         for (retained, requested) in [(0, 0), (0, 12), (12, 8), (8, 12)] {
-            assert!(!reuse_staging(
-                TuneStagingReuse::SameSize,
-                retained,
-                requested
-            ));
+            assert!(!reuse_staging(retained, requested));
         }
-        assert!(!reuse_staging(TuneStagingReuse::Fresh, 12, 12));
     }
 
     #[test]
@@ -3811,13 +3790,12 @@ mod tests {
     #[ignore = "GPU staging round-trip qualification, not a performance assertion"]
     fn tuning_staging_round_trips_all_bits_and_declared_extents() {
         let gpu = crate::reference::gpu::shared_context();
-        // Every placement and staging memory once, across edge, rectangular
-        // and large shapes.
-        for ((m, n, k), device_local, staging) in [
-            ((3, 7, 5), false, TuneStaging::Download),
-            ((33, 65, 17), false, TuneStaging::Shared),
-            ((33, 65, 17), true, TuneStaging::Download),
-            ((2048, 1000, 1), true, TuneStaging::Shared),
+        // Every placement, across edge, rectangular and large shapes.
+        for ((m, n, k), device_local) in [
+            ((3, 7, 5), false),
+            ((33, 65, 17), false),
+            ((33, 65, 17), true),
+            ((2048, 1000, 1), true),
         ] {
             let class = TuneClass {
                 shader: ShaderEntry::MatMulAT,
@@ -3845,7 +3823,7 @@ mod tests {
             let data: Vec<_> = (0..m as usize * n as usize)
                 .map(|i| f32::from_bits(patterns[i % patterns.len()]))
                 .collect();
-            let mut staging = Staging::new(&gpu, staging, TuneStagingReuse::Fresh);
+            let mut staging = Staging::new(&gpu);
             let mut prep = TunePreparationTimes::default();
             let mut cleanup = None;
             let mut scratch = Scratch::new(
@@ -3980,41 +3958,32 @@ mod tests {
             result
         }
         let gpu = crate::reference::gpu::shared_context();
-        for (memory, policy) in [
-            (TuneStaging::Shared, TuneStagingReuse::SameSize),
-            (TuneStaging::Download, TuneStagingReuse::Fresh),
-        ] {
-            let mut staging = Staging::new(&gpu, memory, policy);
-            // Reuse both, keep the same-size staging but not another class's
-            // B operand, then replace both for a larger size.
-            for (index, (m, n)) in [(3, 7), (3, 7), (4, 7), (3, 65)].into_iter().enumerate() {
-                assert!(trial(&mut staging, m, n, index as u32 * 1024, index == 1).is_err());
-            }
-            let fresh = policy == TuneStagingReuse::Fresh;
-            assert_eq!(staging.stats.staging_allocations, if fresh { 4 } else { 2 });
-            assert_eq!(staging.stats.staging_reuses, if fresh { 0 } else { 2 });
-            assert_eq!(staging.stats.input_b_allocations, 3);
-            assert_eq!(staging.stats.input_b_reuses, 1);
-            assert_eq!(
-                staging.stats.peak_bytes,
-                scratch_bytes(&[60, 1300, 780]).unwrap()
-            );
-            assert_eq!(
-                staging.stats.retained_staging_bytes,
-                if fresh { 0 } else { 1300 }
-            );
-            staging.clear();
-            assert_eq!(staging.stats.retained_staging_bytes, 0);
-            assert_eq!(staging.stats.retained_input_bytes, 0);
-            assert_eq!(
-                staging.stats.input_b_allocations,
-                staging.stats.input_b_releases
-            );
-            assert_eq!(
-                staging.stats.staging_allocations,
-                staging.stats.staging_releases
-            );
+        let mut staging = Staging::new(&gpu);
+        // Reuse both, keep the same-size staging but not another class's
+        // B operand, then replace both for a larger size.
+        for (index, (m, n)) in [(3, 7), (3, 7), (4, 7), (3, 65)].into_iter().enumerate() {
+            assert!(trial(&mut staging, m, n, index as u32 * 1024, index == 1).is_err());
         }
+        assert_eq!(staging.stats.staging_allocations, 2);
+        assert_eq!(staging.stats.staging_reuses, 2);
+        assert_eq!(staging.stats.input_b_allocations, 3);
+        assert_eq!(staging.stats.input_b_reuses, 1);
+        assert_eq!(
+            staging.stats.peak_bytes,
+            scratch_bytes(&[60, 1300, 780]).unwrap()
+        );
+        assert_eq!(staging.stats.retained_staging_bytes, 1300);
+        staging.clear();
+        assert_eq!(staging.stats.retained_staging_bytes, 0);
+        assert_eq!(staging.stats.retained_input_bytes, 0);
+        assert_eq!(
+            staging.stats.input_b_allocations,
+            staging.stats.input_b_releases
+        );
+        assert_eq!(
+            staging.stats.staging_allocations,
+            staging.stats.staging_releases
+        );
     }
 
     /// Worked by hand rather than against the implementation. Every

@@ -1131,7 +1131,7 @@ mod tests {
         );
         let bytes = scratch_bytes(&sizes).unwrap() + sizes[1];
         let placement = vec![true; sizes.len()];
-        let mut staging = Staging::new(&gpu, options.staging, options.staging_reuse);
+        let mut staging = Staging::new(&gpu);
         let mut preparation = TunePreparationTimes::default();
         let mut cleanup = None;
         let mut scratch = Scratch::new(

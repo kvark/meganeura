@@ -1143,13 +1143,13 @@ impl TuneClass {
 /// Restrict an experiment without changing any candidate's legality or precision.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TuneScope {
-    /// Historical search domain, also used for missing report settings.
-    #[default]
+    /// Dense products only, no convolution.
     Dense,
     /// Scalar input and weight gradients only; no forward or cooperative convolution.
     ConvDerivatives,
     /// Scalar forward, input gradient and weight gradient convolutions.
     Convolution,
+    #[default]
     All,
 }
 
@@ -1166,29 +1166,6 @@ impl TuneScope {
     }
 }
 
-/// Placement of the private upload/readback buffer, never the kernel bindings.
-/// Its default preserves historical reports; new [`TuneOptions`] use Download.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TuneStaging {
-    /// Original bidirectional, GPU-preferred shared staging.
-    #[default]
-    Shared,
-    /// Host-read-optimized staging; still used for uploads as well as readbacks.
-    Download,
-}
-
-/// Lifetime of one private staging buffer, never of bindings or qualified data.
-/// Its default preserves historical reports; new [`TuneOptions`] use SameSize.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TuneStagingReuse {
-    /// Allocate and destroy staging for every comparison (historical policy).
-    #[default]
-    Fresh,
-    /// Keep one exact-size buffer between comparisons within this tuning call.
-    /// Release on a size change and before returning; never retain extra capacity.
-    SameSize,
-}
-
 /// Kernels that share a measured-to-predicted ratio during one search.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum TileFamily {
@@ -1198,28 +1175,26 @@ pub(crate) enum TileFamily {
 }
 
 /// How a class's challengers are compared with its incumbent.
-/// Its default preserves historical reports; new [`TuneOptions`] race.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TuneStrategy {
     /// One challenger at a time against the latest winner, each qualified
-    /// before it is timed (historical policy).
-    #[default]
+    /// before it is timed.
     Sequential,
     /// Time the incumbent and every challenger together in shared rounds,
     /// drop challengers that cannot pass the decision rule, and qualify only
     /// a finalist that would be installed.
+    #[default]
     Race,
 }
 
 /// Where a search's [`MachineProfile`] comes from.
-/// Its default preserves historical reports; new [`TuneOptions`] measure.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub enum TuneCalibration {
     /// No profile: classes keep their structural order, with no time-share cutoff.
-    #[default]
     Off,
     /// Measure the machine within a bounded part of the budget, reusing the
     /// context's profile. Larger allowances can fill missing measurements.
+    #[default]
     Measure,
     /// Use this profile, measured earlier or supplied by the caller.
     Profile(MachineProfile),
@@ -1296,8 +1271,7 @@ impl MachineProfile {
 /// Resource bounds and decision policy for [`crate::Session::tune_with`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TuneOptions {
-    /// Defaults to All. Historical missing settings retain Dense.
-    #[serde(default)]
+    /// Defaults to All.
     pub scope: TuneScope,
     pub max_classes: usize,
     /// Comparison/calibration buffers including staging and all representative
@@ -1307,16 +1281,6 @@ pub struct TuneOptions {
     /// encoder inside. Excludes pipelines and opaque driver
     /// command/descriptor allocations.
     pub max_scratch_bytes: usize,
-    /// Defaults to Download. Does not alter scratch binding placement,
-    /// validation or kernel candidates.
-    /// Missing historical settings deserialize to the original shared staging.
-    #[serde(default)]
-    pub staging: TuneStaging,
-    /// Defaults to SameSize. Reuses only private staging, without changing
-    /// validation or scratch bounds.
-    /// Historical missing settings retain Fresh.
-    #[serde(default)]
-    pub staging_reuse: TuneStagingReuse,
     /// Soft wall-clock deadline, including compilation and qualification.
     /// An in-flight driver call, GPU submission, or validation cannot be preempted.
     pub max_time: Duration,
@@ -1330,20 +1294,17 @@ pub struct TuneOptions {
     pub dispatches_per_sample: u32,
     /// Use warmup timings to aim for this duration in the faster variant,
     /// capped by `dispatches_per_sample`. Both variants use the same count.
-    /// None, or no warmup, retains the fixed dispatch count. Historical
-    /// reports default to None; new searches target two milliseconds.
-    #[serde(default)]
+    /// None, or no warmup, retains the fixed dispatch count. Defaults to
+    /// two milliseconds.
     pub target_sample_time: Option<Duration>,
     /// Required fractional improvement, in addition to a noise margin.
     pub min_improvement: f64,
     /// Defaults to Race. Both strategies apply the same decision rule and
-    /// qualification; historical missing settings retain Sequential.
-    #[serde(default)]
+    /// qualification.
     pub strategy: TuneStrategy,
     /// Defaults to Measure. With a profile, classes are visited in order of
     /// predicted time, and visiting stops once the classes left are predicted
-    /// to total less than 0.1% of the plan. Historical missing settings retain Off.
-    #[serde(default)]
+    /// to total less than 0.1% of the plan.
     pub calibration: TuneCalibration,
 }
 
@@ -1353,8 +1314,6 @@ impl Default for TuneOptions {
             scope: TuneScope::All,
             max_classes: 8,
             max_scratch_bytes: 64 * 1024 * 1024,
-            staging: TuneStaging::Download,
-            staging_reuse: TuneStagingReuse::SameSize,
             max_time: Duration::from_secs(2),
             warmup_runs: 1,
             sample_pairs: 6,
@@ -1532,13 +1491,12 @@ pub struct TuneOutcome<Class = TuneClass, Choice = MatmulTile> {
     /// Never reinterpret missing historical measurements as zero-cost phases.
     #[serde(default)]
     pub phase_times: Option<TunePhaseTimes>,
-    /// Actual private allocation requests; absent for historical/skipped work.
-    #[serde(default)]
+    /// Actual private allocation requests; absent for skipped work.
     pub scratch: Option<TuneScratchUsage>,
     pub baseline_ms: Vec<f64>,
     pub candidate_ms: Vec<f64>,
     /// Actual dispatch/sequence count used for each paired kernel sample.
-    /// None for historical reports, whole-program trials, or skipped sampling.
+    /// None for whole-program trials or skipped sampling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample_repetitions: Option<u32>,
     pub baseline_median_ms: Option<f64>,
@@ -1580,11 +1538,9 @@ pub struct TuneScratchUsage {
     pub staging_bytes: usize,
     pub staging_reused: bool,
     /// The identical synthetic B operand was already resident for this class.
-    #[serde(default)]
     pub input_b_reused: bool,
     /// Both input patterns reuse full, previously qualified incumbent outputs
     /// from this call, with the same class, tile and physical binding sizes.
-    #[serde(default)]
     pub baseline_reused: bool,
 }
 
@@ -1595,18 +1551,14 @@ pub struct TuneScratchStats {
     pub staging_reuses: usize,
     pub staging_releases: usize,
     /// Binding requests, staging and encoder-scratch allowances; excludes
-    /// pipelines and opaque driver allocations. Older reports omit encoders.
+    /// pipelines and opaque driver allocations.
     pub peak_bytes: usize,
     /// Must be zero when `tune_with` returns, including bounded/failed searches.
     pub retained_staging_bytes: usize,
-    #[serde(default)]
     pub input_b_allocations: usize,
-    #[serde(default)]
     pub input_b_reuses: usize,
-    #[serde(default)]
     pub input_b_releases: usize,
     /// Must be zero when tuning returns, including bounded/failed searches.
-    #[serde(default)]
     pub retained_input_bytes: usize,
 }
 
@@ -1628,7 +1580,6 @@ pub struct TuneReport {
     /// total `elapsed`. None when cleanup was not run or recorded.
     #[serde(default)]
     pub final_cleanup: Option<Duration>,
-    #[serde(default)]
     pub scratch: Option<TuneScratchStats>,
     /// The profile that ordered this search, if any. Measuring it counts
     /// toward `elapsed`.
@@ -1637,14 +1588,12 @@ pub struct TuneReport {
     /// Calibration charged to this call, zero when a supplied/cached profile
     /// was reused without further measurement. `MachineProfile::elapsed`
     /// describes the cumulative measurement time.
-    #[serde(default)]
     pub calibration_time: Duration,
     /// Predicted time of one plan execution, from the machine profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predicted_plan_ms: Option<f64>,
     /// Visiting stopped because the classes left were predicted to total less
     /// than 0.1% of the plan.
-    #[serde(default)]
     pub share_cutoff: bool,
     /// One record per raced class; challengers still report `outcomes`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2321,7 +2270,7 @@ mod tests {
     }
 
     #[test]
-    fn scope_and_convolution_contracts_preserve_historical_reports() {
+    fn scope_and_convolution_contracts_round_trip() {
         assert_eq!(TuneOptions::default().scope, TuneScope::All);
         let dense = class(3, 5, 7);
         let conv = TuneClass::from_dispatch(&conv_dispatch(ShaderEntry::Conv2dGradInputGemm), None)
@@ -2351,13 +2300,6 @@ mod tests {
             let restored: TuneOptions = serde_json::from_str(&json).unwrap();
             assert_eq!(restored.scope, scope);
         }
-        // Reports from before scopes searched dense products only.
-        let mut json = serde_json::to_value(TuneOptions::default()).unwrap();
-        json.as_object_mut().unwrap().remove("scope");
-        assert_eq!(
-            serde_json::from_value::<TuneOptions>(json).unwrap().scope,
-            TuneScope::Dense
-        );
         let old = serde_json::to_value(&dense).unwrap();
         assert!(old.get("conv2d").is_none());
         assert_eq!(serde_json::from_value::<TuneClass>(old).unwrap(), dense);
@@ -2515,18 +2457,6 @@ mod tests {
         );
         assert_eq!(restored.outcomes[0].class, report.outcomes[0].class);
         assert_eq!(restored.outcomes[0].sample_repetitions, Some(16));
-        let mut legacy = serde_json::to_value(&report).unwrap();
-        legacy["options"]
-            .as_object_mut()
-            .unwrap()
-            .remove("target_sample_time");
-        legacy["outcomes"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("sample_repetitions");
-        let restored: TuneReport = serde_json::from_value(legacy).unwrap();
-        assert_eq!(restored.options.target_sample_time, None);
-        assert_eq!(restored.outcomes[0].sample_repetitions, None);
     }
 
     #[test]
@@ -2564,63 +2494,6 @@ mod tests {
         json.as_object_mut().unwrap().remove("phase_times");
         let legacy: TuneOutcome = serde_json::from_value(json).unwrap();
         assert_eq!(legacy.phase_times, None);
-    }
-
-    #[test]
-    fn staging_round_trips_and_missing_historical_policy_is_shared() {
-        assert_eq!(TuneOptions::default().staging, TuneStaging::Download);
-        assert_eq!(TuneStaging::default(), TuneStaging::Shared);
-        for staging in [TuneStaging::Shared, TuneStaging::Download] {
-            let options = TuneOptions {
-                staging,
-                ..Default::default()
-            };
-            let mut value = serde_json::to_value(&options).unwrap();
-            let restored: TuneOptions = serde_json::from_value(value.clone()).unwrap();
-            assert_eq!(restored.staging, staging);
-            value.as_object_mut().unwrap().remove("staging");
-            let historical: TuneOptions = serde_json::from_value(value).unwrap();
-            assert_eq!(historical.staging, TuneStaging::Shared);
-        }
-    }
-
-    #[test]
-    fn missing_historical_reuse_and_scratch_accounting_stay_distinct() {
-        assert_eq!(
-            TuneOptions::default().staging_reuse,
-            TuneStagingReuse::SameSize
-        );
-        assert_eq!(TuneStagingReuse::default(), TuneStagingReuse::Fresh);
-        for staging_reuse in [TuneStagingReuse::Fresh, TuneStagingReuse::SameSize] {
-            let mut value = serde_json::to_value(TuneReport {
-                options: TuneOptions {
-                    staging_reuse,
-                    ..Default::default()
-                },
-                scratch: Some(Default::default()),
-                final_cleanup: Some(Duration::ZERO),
-                ..Default::default()
-            })
-            .unwrap();
-            let restored: TuneReport = serde_json::from_value(value.clone()).unwrap();
-            assert_eq!(restored.options.staging_reuse, staging_reuse);
-            assert!(restored.scratch.is_some());
-            value["options"]
-                .as_object_mut()
-                .unwrap()
-                .remove("staging_reuse");
-            for key in ["scratch", "final_cleanup"] {
-                value.as_object_mut().unwrap().remove(key);
-            }
-            let old: TuneReport = serde_json::from_value(value).unwrap();
-            assert_eq!(old.options.staging_reuse, TuneStagingReuse::Fresh);
-            assert_eq!(old.scratch, None);
-            assert_eq!(old.final_cleanup, None);
-        }
-        let mut value = serde_json::to_value(outcome()).unwrap();
-        value.as_object_mut().unwrap().remove("scratch");
-        let old: TuneOutcome = serde_json::from_value(value).unwrap();
-        assert_eq!(old.scratch, None);
     }
 
     fn native_config(tile_size: u32) -> CoopConfig {
@@ -2694,17 +2567,10 @@ mod tests {
     }
 
     #[test]
-    fn new_options_race_but_historical_options_keep_the_original_policy() {
+    fn options_race_by_default_and_supplied_profiles_round_trip() {
         let options = TuneOptions::default();
         assert_eq!(options.strategy, TuneStrategy::Race);
         assert_eq!(options.calibration, TuneCalibration::Measure);
-        let mut historical = serde_json::to_value(&options).unwrap();
-        let fields = historical.as_object_mut().unwrap();
-        fields.remove("strategy");
-        fields.remove("calibration");
-        let historical: TuneOptions = serde_json::from_value(historical).unwrap();
-        assert_eq!(historical.strategy, TuneStrategy::Sequential);
-        assert_eq!(historical.calibration, TuneCalibration::Off);
         // A supplied profile round-trips, so it can be measured once and reused.
         let supplied = TuneCalibration::Profile(MachineProfile {
             bandwidth: Some(1e11),

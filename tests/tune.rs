@@ -3,8 +3,7 @@
 
 use meganeura::graph::Graph;
 use meganeura::{
-    CoopPolicy, MatmulTile, Mode, SessionConfig, SessionOptions, TuneDecision, TuneOptions,
-    TuneStaging, TuneStagingReuse, build,
+    CoopPolicy, MatmulTile, Mode, SessionConfig, SessionOptions, TuneDecision, TuneOptions, build,
 };
 use std::time::Duration;
 
@@ -251,28 +250,15 @@ fn reduced_storage_tiles_preserve_outputs() {
 #[test]
 #[ignore = "GPU tuning requires an idle device"]
 fn tune_preserves_training_parameters_gradients_and_moments() {
-    // The race below covers the other staging memory and reuse policy.
-    preserves_training_state(
-        TuneStaging::Shared,
-        TuneStagingReuse::Fresh,
-        meganeura::TuneStrategy::Sequential,
-    );
+    preserves_training_state(meganeura::TuneStrategy::Sequential);
 }
 
 #[test]
 fn race_preserves_training_state() {
-    preserves_training_state(
-        TuneStaging::Download,
-        TuneStagingReuse::SameSize,
-        meganeura::TuneStrategy::Race,
-    );
+    preserves_training_state(meganeura::TuneStrategy::Race);
 }
 
-fn preserves_training_state(
-    staging: TuneStaging,
-    staging_reuse: TuneStagingReuse,
-    strategy: meganeura::TuneStrategy,
-) {
+fn preserves_training_state(strategy: meganeura::TuneStrategy) {
     let mut graph = Graph::new();
     let x = graph.input("x", &[33, 17]);
     let weight = graph.parameter("weight", &[17, 65]);
@@ -334,8 +320,6 @@ fn preserves_training_state(
     let before = snapshot(&session);
     let report = session
         .tune_with(TuneOptions {
-            staging,
-            staging_reuse,
             strategy,
             max_time: Duration::from_secs(60),
             ..crate::support::sequential_tuning()
@@ -380,29 +364,11 @@ fn preserves_training_state(
 #[ignore = "GPU tuning requires an idle device"]
 fn tune_qualifies_all_four_scalar_entries_on_rectangular_edges() {
     use meganeura::compile::ShaderEntry;
-    // Each entry under a different staging memory and reuse policy, so every
-    // combination is still qualified once.
-    for (shader, staging, staging_reuse) in [
-        (
-            ShaderEntry::MatMul,
-            TuneStaging::Shared,
-            TuneStagingReuse::Fresh,
-        ),
-        (
-            ShaderEntry::MatMulAT,
-            TuneStaging::Shared,
-            TuneStagingReuse::SameSize,
-        ),
-        (
-            ShaderEntry::MatMulBT,
-            TuneStaging::Download,
-            TuneStagingReuse::Fresh,
-        ),
-        (
-            ShaderEntry::FusedMatMulAdd,
-            TuneStaging::Download,
-            TuneStagingReuse::SameSize,
-        ),
+    for shader in [
+        ShaderEntry::MatMul,
+        ShaderEntry::MatMulAT,
+        ShaderEntry::MatMulBT,
+        ShaderEntry::FusedMatMulAdd,
     ] {
         for (m, n, k) in [(33, 65, 17), (64, 32, 1), (17, 16, 65)] {
             let g = matmul_graph(&shader, m, n, k);
@@ -420,8 +386,6 @@ fn tune_qualifies_all_four_scalar_entries_on_rectangular_edges() {
             );
             let report = session
                 .tune_with(TuneOptions {
-                    staging,
-                    staging_reuse,
                     max_time: Duration::from_secs(60),
                     ..crate::support::sequential_tuning()
                 })
@@ -475,7 +439,6 @@ fn tuning_releases_retained_staging_after_a_later_scratch_skip() {
     );
     let report = session
         .tune_with(TuneOptions {
-            staging_reuse: TuneStagingReuse::SameSize,
             max_scratch_bytes: 3 * 1024 * 1024,
             max_time: Duration::from_secs(60),
             ..crate::support::sequential_tuning()
@@ -504,7 +467,6 @@ fn tuning_releases_retained_staging_after_a_later_scratch_skip() {
     let keys = session.dispatch_pipeline_keys();
     let report = session
         .tune_with(TuneOptions {
-            staging_reuse: TuneStagingReuse::SameSize,
             max_time: Duration::ZERO,
             ..crate::support::sequential_tuning()
         })

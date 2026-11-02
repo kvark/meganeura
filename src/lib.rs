@@ -63,6 +63,5 @@ pub use train::{
 pub use tune::{
     MachineProfile, MatmulTile, TuneCalibration, TuneClass, TuneConv2d, TuneDecision, TuneError,
     TuneOptions, TunePhaseTimes, TunePreparationTimes, TuneQualificationTimes, TuneRace,
-    TuneReport, TuneScope, TuneScratchStats, TuneScratchUsage, TuneStaging, TuneStagingReuse,
-    TuneStrategy,
+    TuneReport, TuneScope, TuneScratchStats, TuneScratchUsage, TuneStrategy,
 };

@@ -39,8 +39,8 @@ pub fn costs(report: &TuneReport) -> Result<BTreeMap<String, f64>, &'static str>
         return Err("nested times exceed preparation");
     }
     times.insert("preparation_other".into(), remainder);
-    // Fresh has no retained resource to release. Reuse records the final release
-    // separately, within total search, not within a comparison's cleanup.
+    // Retained staging is released once, within total search, not within a
+    // comparison's cleanup.
     *times.get_mut("cleanup").unwrap() +=
         report.final_cleanup.unwrap_or_default().as_secs_f64() * 1e3;
     times.insert(
