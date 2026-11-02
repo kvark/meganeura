@@ -411,6 +411,10 @@ impl Session {
     }
 
     fn upload_input_bytes(&self, buffer: BufferRef, data: &[u8]) {
+        assert!(
+            !self.step_prepared || !self.preparation.as_ref().unwrap().inputs.contains(&buffer),
+            "cannot change an early input during a prepared step"
+        );
         let capacity = self.plan.buffers[buffer.0 as usize];
         let logical = self
             .plan
@@ -421,6 +425,10 @@ impl Session {
     }
 
     pub(super) fn upload_parameter_bytes(&self, buffer: BufferRef, data: &[u8]) {
+        assert!(
+            !self.step_prepared,
+            "cannot change a parameter during a prepared step"
+        );
         let capacity = self.plan.buffers[buffer.0 as usize];
         let logical = self
             .plan
@@ -719,6 +727,7 @@ impl Session {
     /// Read back the loss value.
     pub fn read_loss(&self) -> f32 {
         if let Some(buf_ref) = self.plan.loss_buffer {
+            self.check_output_ready(buf_ref);
             let buffer = self.buffers[buf_ref.0 as usize];
             let n = self.plan.buffers[buf_ref.0 as usize] / 4;
             if !self.logical_host_visible(buf_ref) {
@@ -957,6 +966,7 @@ impl Session {
     /// model's prediction; for training graphs it's the loss scalar.
     pub fn read_output(&self, len: usize) -> Vec<f32> {
         if let Some(buf_ref) = self.plan.loss_buffer {
+            self.check_output_ready(buf_ref);
             let mut out = vec![0.0_f32; len];
             self.read_buffer(buf_ref, &mut out);
             out
@@ -1000,7 +1010,16 @@ impl Session {
     /// additional outputs (e.g. KV tensors from prefill).
     pub fn read_output_by_index(&self, index: usize, out: &mut [f32]) {
         let buf_ref = self.plan.output_buffers[index];
+        self.check_output_ready(buf_ref);
         self.read_buffer(buf_ref, out);
+    }
+
+    /// While a step is prepared, only the prepared outputs are complete.
+    fn check_output_ready(&self, buf_ref: BufferRef) {
+        assert!(
+            !self.step_prepared || self.preparation.as_ref().unwrap().ready.contains(&buf_ref),
+            "output not ready before prepared step finishes"
+        );
     }
 
     /// Wait for pending work and read a graph output.
@@ -1009,6 +1028,7 @@ impl Session {
     /// the initial readback probe still wait before accessing the buffer.
     pub fn wait_read_output(&mut self, index: usize, out: &mut [f32]) {
         let buf_ref = self.plan.output_buffers[index];
+        self.check_output_ready(buf_ref);
         let buffer = self.buffers[buf_ref.0 as usize];
         let staged = !self.logical_host_visible(buf_ref)
             || self
@@ -1322,6 +1342,10 @@ impl Session {
         } else {
             "write_adam_m"
         };
+        assert!(
+            !self.step_prepared,
+            "cannot replace optimizer state during a prepared step"
+        );
         self.wait();
         let idx = self
             .adam_state_index(name)
@@ -1354,6 +1378,10 @@ impl Session {
     /// [`Session::write_adam_v`] when restoring optimizer state into a
     /// freshly built session.
     pub fn set_adam_step_count(&mut self, t: u32) {
+        assert!(
+            !self.step_prepared,
+            "cannot replace optimizer state during a prepared step"
+        );
         self.adam_step = t;
     }
 

@@ -236,3 +236,62 @@ fn back_to_back_with_zero_lr_in_between_does_not_compound() {
         diff
     );
 }
+
+/// A prepared step computes the early output before the late target is
+/// supplied, then finishes with exactly one optimizer update: it matches
+/// an ordinary step on every step of a short run.
+#[test]
+fn prepared_step_matches_full_step() {
+    let (batch, in_d, out_d) = (4, 3, 2);
+    let g = build_linear_regression(batch, in_d, out_d);
+    let mut config = crate::support::gpu::config();
+    config.runtime.prepare_outputs = vec![1];
+    let mut prepared = meganeura::build(&g, config).0;
+    let mut full = meganeura::build(&g, crate::support::gpu::config()).0;
+    let w: Vec<f32> = (0..in_d * out_d).map(|i| (i as f32 * 0.1).sin()).collect();
+    for s in [&mut prepared, &mut full] {
+        s.set_parameter("w.weight", &w);
+        s.set_parameter("w.bias", &[0.25, -0.5]);
+        s.set_adam(0.05, 0.9, 0.999, 1e-8);
+    }
+    let close = |a: &[f32], b: &[f32]| {
+        assert!(
+            a.iter().zip(b).all(|(a, b)| (a - b).abs() <= 1e-5),
+            "{a:?} vs {b:?}"
+        );
+    };
+    for step in 0..3 {
+        let x: Vec<f32> = (0..batch * in_d)
+            .map(|i| (i as f32 * 0.3 + step as f32).cos())
+            .collect();
+        let t: Vec<f32> = (0..batch * out_d)
+            .map(|i| (i as f32 * 0.5 - step as f32).sin())
+            .collect();
+        full.set_input("x", &x);
+        full.set_input("target", &t);
+        full.step();
+        let mut expected = vec![0.0; batch * out_d];
+        full.wait_read_output(1, &mut expected);
+
+        prepared.set_input("x", &x);
+        prepared.prepare_step();
+        let mut early = vec![0.0; batch * out_d];
+        prepared.wait_read_output(1, &mut early);
+        close(&early, &expected);
+        prepared.set_input("target", &t);
+        prepared.finish_prepared_step();
+        prepared.wait();
+        assert!((prepared.read_loss() - full.read_loss()).abs() <= 1e-5);
+        for name in ["w.weight", "w.bias"] {
+            let n = if name == "w.weight" {
+                in_d * out_d
+            } else {
+                out_d
+            };
+            close(
+                &snapshot_params(&prepared, name, n),
+                &snapshot_params(&full, name, n),
+            );
+        }
+    }
+}
