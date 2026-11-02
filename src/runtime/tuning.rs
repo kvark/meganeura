@@ -509,10 +509,7 @@ impl SearchClass {
         for &index in &self.members {
             tile.apply(&mut dispatches[index], &self.key);
         }
-        if let MatmulTile::CooperativeTiled { splits, .. }
-        | MatmulTile::CooperativeWorkgroup { splits, .. }
-        | MatmulTile::CooperativeChecked { splits } = tile
-        {
+        if let Some(splits) = tile.partitions() {
             for &index in &self.reductions {
                 dispatches[index].params[0] = splits;
             }
@@ -678,12 +675,8 @@ fn collect_classes(
             continue;
         }
         // A split product is tunable together with the SumRows of its partials.
-        let reduction = match initial {
-            MatmulTile::CooperativeTiled { splits, .. }
-            | MatmulTile::CooperativeWorkgroup { splits, .. }
-            | MatmulTile::CooperativeChecked { splits }
-                if key.split_k =>
-            {
+        let reduction = match initial.partitions() {
+            Some(splits) if key.split_k => {
                 let Some(reduction) = plan.dispatches.iter().position(|d| {
                     d.shader == ShaderEntry::SumRows
                         && d.input_buffers == [dispatch.output_buffer]
@@ -1226,67 +1219,17 @@ impl Session {
         phases.preparation_breakdown = Some(Default::default());
         let prep = phases.preparation_breakdown.as_mut().unwrap();
         let checks = PhaseTimer::new(&mut prep.checks);
-        let logical_sizes = class
-            .key
-            .buffer_sizes()
-            .expect("class collection checked extents");
-        let baseline_sizes = outcome
-            .initial
-            .buffer_sizes(&class.key)
-            .expect("legal incumbent");
-        let candidate_sizes = outcome
-            .candidate
-            .buffer_sizes(&class.key)
-            .expect("legal challenger");
-        // Halfword extents stay logical in the class; private transfers are
-        // padded to whole words.
-        let mut sizes: Vec<_> = baseline_sizes
-            .into_iter()
-            .zip(candidate_sizes)
-            .map(|(a, b)| a.max(b).next_multiple_of(4))
-            .collect();
-        let output_index = sizes.len() - 1;
-        let mut dispatch = self.plan.dispatches[class.members[0]].clone();
-        dispatch.input_buffers = (0..output_index).map(|i| BufferRef(i as u32)).collect();
-        dispatch.output_buffer = BufferRef(output_index as u32);
-        if let Some(ref mut rn) = dispatch.gemv_rmsnorm {
-            // A, B, norm_w, C. bind_dispatch reads A/B from input_buffers
-            // and the norm vector from the fusion record.
-            dispatch.input_buffers = vec![BufferRef(0), BufferRef(1)];
-            rn.weight = BufferRef(2);
-            dispatch.output_buffer = BufferRef(3);
-        }
-        let mut variants = [vec![dispatch.clone()], vec![dispatch]];
-        outcome.initial.apply(&mut variants[0][0], &class.key);
-        outcome.candidate.apply(&mut variants[1][0], &class.key);
-        if class.key.split_k {
-            // Both tiles write their partitions into a partial buffer of the
-            // live size, and a SumRows adds them into the output.
-            let partial = BufferRef(sizes.len() as u32);
-            let columns = class.key.m * class.key.n;
-            sizes[output_index] = logical_sizes[output_index].next_multiple_of(4);
-            sizes.push(class.key.binding_bytes[output_index]);
-            for (sequence, tile) in variants
-                .iter_mut()
-                .zip([outcome.initial, outcome.candidate])
-            {
-                let (MatmulTile::CooperativeTiled { splits, .. }
-                | MatmulTile::CooperativeWorkgroup { splits, .. }
-                | MatmulTile::CooperativeChecked { splits }) = tile
-                else {
-                    unreachable!("split products only take partitioned candidates");
-                };
-                let sum = sequence[0].partial_sum(
-                    partial,
-                    sequence[0].output_buffer,
-                    columns,
-                    splits,
-                    true,
-                );
-                sequence[0].output_buffer = partial;
-                sequence.push(sum);
-            }
-        }
+        let PreparedComparison {
+            logical_sizes,
+            sizes,
+            output_index,
+            device_local,
+            sequences: variants,
+        } = prepare_comparison(
+            class,
+            &self.plan.dispatches[class.members[0]],
+            &[outcome.initial, outcome.candidate],
+        );
         let Some(bytes) = limited_scratch_bytes(&sizes, 0, options.max_scratch_bytes) else {
             outcome.decision = TuneDecision::ScratchLimit;
             return;
@@ -1298,11 +1241,7 @@ impl Session {
             staging.discard_input_b(&class.key, sizes[1]);
         }
         let checks = PhaseTimer::new(&mut prep.checks);
-        let memory = self.gpu.memory_stats();
-        if memory.budget != 0
-            && (bytes - staging.retained_bytes()) as u64
-                > super::safe_device_memory_remaining(memory.usage, memory.budget)
-        {
+        if staging.exceeds_device_memory(bytes) {
             outcome.decision = TuneDecision::DeviceMemoryBudget;
             return;
         }
@@ -1356,14 +1295,7 @@ impl Session {
             .unwrap_or_default();
         let mut candidate_outputs: [Vec<f32>; 2] = Default::default();
         let mut scratch = Scratch::new(
-            &sizes
-                .iter()
-                .enumerate()
-                .map(|(i, _)| {
-                    i > output_index
-                        || class.key.device_local[if i == output_index { 3 } else { i }]
-                })
-                .collect::<Vec<_>>(),
+            &device_local,
             &sizes,
             (&class.key, output_index),
             bytes,
@@ -1415,18 +1347,7 @@ impl Session {
             }
             {
                 let _timer = PhaseTimer::new(&mut details.input_preparation);
-                if let Some(types) = class.key.effective_matrix_types() {
-                    inputs = typed_inputs(&class.key, types, pattern as u32, &sizes);
-                } else if inputs.is_empty() {
-                    inputs = prepared_inputs(
-                        &logical_sizes,
-                        &sizes,
-                        pattern as u32,
-                        class.key.weight_format,
-                    );
-                } else {
-                    update_input_pattern(&mut inputs, &logical_sizes, pattern as u32);
-                }
+                class_inputs(&mut inputs, class, &logical_sizes, &sizes, pattern as u32);
             }
             for (index, data) in inputs.iter().enumerate() {
                 // B is identical across this class, both patterns and warmup.
@@ -1449,26 +1370,12 @@ impl Session {
                     scratch.run(&sequences[variant], 1);
                 }
                 let output = scratch.read_output(details);
-                let scale = if pattern == 0 {
-                    1.0
-                } else {
-                    small_pattern_scale(&class.key)
-                };
+                // The incumbent output has already passed the reference,
+                // finiteness and extent checks for this exact input pattern.
+                let reference = (variant == 1).then_some(&baseline_outputs[pattern][..]);
                 let valid = {
                     let _timer = PhaseTimer::new(&mut details.validation);
-                    // The incumbent output has already passed the reference,
-                    // finiteness and extent checks for this exact input pattern.
-                    let identical = variant == 1
-                        && bytemuck::cast_slice::<f32, u8>(&baseline_outputs[pattern])
-                            == bytemuck::cast_slice::<f32, u8>(&output);
-                    let agree = if class.key.split_k {
-                        reordered_outputs_agree
-                    } else {
-                        outputs_agree
-                    };
-                    identical
-                        || (qualify_output(&class.key, &inputs, &output, scale)
-                            && (variant == 0 || agree(&baseline_outputs[pattern], &output, scale)))
+                    output_qualifies(&class.key, &inputs, &output, reference, pattern as u32)
                 };
                 if !valid {
                     outcome.decision = TuneDecision::InvalidOutput;
@@ -1533,6 +1440,130 @@ impl Session {
             });
         }
     }
+}
+
+struct PreparedComparison {
+    logical_sizes: Vec<usize>,
+    sizes: Vec<usize>,
+    output_index: usize,
+    /// Scratch placement per binding; split partials are device-local.
+    device_local: Vec<bool>,
+    sequences: Vec<Vec<Dispatch>>,
+}
+
+/// Private bindings cover the largest tile, including split-product reductions.
+/// Halfword extents stay logical in the class; private transfers are padded
+/// to whole words.
+fn prepare_comparison(
+    class: &SearchClass,
+    template: &Dispatch,
+    tiles: &[MatmulTile],
+) -> PreparedComparison {
+    let logical_sizes = class
+        .key
+        .buffer_sizes()
+        .expect("class collection checked extents");
+    let mut sizes: Vec<usize> = Vec::new();
+    for &tile in tiles {
+        let tile_sizes = tile.buffer_sizes(&class.key).expect("legal candidate");
+        sizes.resize(tile_sizes.len(), 0);
+        for (size, tile_size) in sizes.iter_mut().zip(tile_sizes) {
+            *size = (*size).max(tile_size.next_multiple_of(4));
+        }
+    }
+    let output_index = sizes.len() - 1;
+    let mut template = template.clone();
+    template.input_buffers = (0..output_index).map(|i| BufferRef(i as u32)).collect();
+    template.output_buffer = BufferRef(output_index as u32);
+    if let Some(ref mut norm) = template.gemv_rmsnorm {
+        // A, B, norm_w, C. bind_dispatch reads A/B from input_buffers
+        // and the norm vector from the fusion record.
+        template.input_buffers = vec![BufferRef(0), BufferRef(1)];
+        norm.weight = BufferRef(2);
+        template.output_buffer = BufferRef(3);
+    }
+    let mut sequences: Vec<Vec<Dispatch>> = tiles
+        .iter()
+        .map(|&tile| {
+            let mut dispatch = template.clone();
+            tile.apply(&mut dispatch, &class.key);
+            vec![dispatch]
+        })
+        .collect();
+    if class.key.split_k {
+        // Every candidate writes partitions into a partial buffer of the
+        // live size, and a SumRows adds them into the output.
+        let partial = BufferRef(sizes.len() as u32);
+        let columns = class.key.m * class.key.n;
+        sizes[output_index] = logical_sizes[output_index].next_multiple_of(4);
+        sizes.push(class.key.binding_bytes[output_index]);
+        for (sequence, tile) in sequences.iter_mut().zip(tiles) {
+            let splits = tile
+                .partitions()
+                .expect("split products only take partitioned candidates");
+            let sum =
+                sequence[0].partial_sum(partial, sequence[0].output_buffer, columns, splits, true);
+            sequence[0].output_buffer = partial;
+            sequence.push(sum);
+        }
+    }
+    let device_local = (0..sizes.len())
+        .map(|i| i > output_index || class.key.device_local[if i == output_index { 3 } else { i }])
+        .collect();
+    PreparedComparison {
+        logical_sizes,
+        sizes,
+        output_index,
+        device_local,
+        sequences,
+    }
+}
+
+/// Set `inputs` to the deterministic inputs for one pattern, in the class's
+/// storage types. Unpacked inputs left by another pattern are rewritten in
+/// place, since B does not depend on the pattern.
+fn class_inputs(
+    inputs: &mut Vec<Vec<f32>>,
+    class: &SearchClass,
+    logical_sizes: &[usize],
+    sizes: &[usize],
+    pattern: u32,
+) {
+    if let Some(types) = class.key.effective_matrix_types() {
+        *inputs = typed_inputs(&class.key, types, pattern, sizes);
+    } else if inputs.is_empty() {
+        *inputs = prepared_inputs(logical_sizes, sizes, pattern, class.key.weight_format);
+    } else {
+        update_input_pattern(inputs, logical_sizes, pattern);
+    }
+}
+
+/// Whether `output` qualifies on input `pattern`: it reproduces the qualified
+/// `reference` bit for bit, or it passes the reference checks and agrees with
+/// any `reference` within the class's bound.
+fn output_qualifies(
+    class: &TuneClass,
+    inputs: &[Vec<f32>],
+    output: &[f32],
+    reference: Option<&[f32]>,
+    pattern: u32,
+) -> bool {
+    let scale = if pattern == 0 {
+        1.0
+    } else {
+        small_pattern_scale(class)
+    };
+    let identical = reference.is_some_and(|reference| {
+        bytemuck::cast_slice::<f32, u8>(reference) == bytemuck::cast_slice::<f32, u8>(output)
+    });
+    let agree = if class.split_k {
+        reordered_outputs_agree
+    } else {
+        outputs_agree
+    };
+    identical
+        || (qualify_output(class, inputs, output, scale)
+            && reference.is_none_or(|reference| agree(reference, output, scale)))
 }
 
 fn weight_reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize) -> f64 {
@@ -1657,6 +1688,15 @@ impl<'gpu> Staging<'gpu> {
 
     fn retained_bytes(&self) -> usize {
         self.stats.retained_staging_bytes + self.stats.retained_input_bytes
+    }
+
+    /// Whether `bytes` of scratch, beyond what is already retained, exceed
+    /// the device memory that is safe to use.
+    fn exceeds_device_memory(&self, bytes: usize) -> bool {
+        let memory = self.gpu.memory_stats();
+        memory.budget != 0
+            && (bytes - self.retained_bytes()) as u64
+                > super::safe_device_memory_remaining(memory.usage, memory.budget)
     }
 
     fn clear_input_b(&mut self) {
@@ -1939,22 +1979,14 @@ impl<'gpu, 'trial> Scratch<'gpu, 'trial> {
         let mut pieces: Vec<bg::BufferPiece> = buffers.iter().map(|&b| b.into()).collect();
         let start = Instant::now();
         encoder.start();
-        {
-            let mut pass = encoder.compute("tune_kernel");
-            for repetition in 0..repeats {
-                pieces[1] = timed_input_b(buffers[1], input_b_copies, repetition).into();
-                for (position, &(pipeline, dispatch)) in sequence.iter().enumerate() {
-                    // Match timestamp rounds and live inline-barrier execution.
-                    // Order split reductions and repeated writes explicitly.
-                    if repetition != 0 || position != 0 {
-                        pass.barrier();
-                    }
-                    let mut pc = pass.with(pipeline);
-                    Session::bind_dispatch(&pieces, dispatch, &mut pc);
-                    pc.dispatch(dispatch.workgroups);
-                }
-            }
-        }
+        encode_repetitions(
+            &mut encoder.compute("tune_kernel"),
+            &mut pieces,
+            buffers,
+            input_b_copies,
+            sequence,
+            repeats,
+        );
         let sync = gpu.submit(encoder);
         let _ = super::wait_for_timed_encoder(gpu, &sync, encoder, false);
         start.elapsed().as_secs_f64() * 1e3
@@ -1967,6 +1999,31 @@ fn timed_input_b(original: bg::Buffer, copies: &[bg::Buffer], repetition: u32) -
         original
     } else {
         copies[index - 1]
+    }
+}
+
+/// Record `reps` repetitions of `sequence` in one pass, cycling B through its
+/// timed copies. Explicit barriers order every dispatch after the first, as
+/// live inline-barrier execution does: split reductions and repeated output
+/// writes need synchronization too, even for identical data.
+fn encode_repetitions(
+    pass: &mut bg::ComputeCommandEncoder<'_>,
+    pieces: &mut [bg::BufferPiece],
+    buffers: &[bg::Buffer],
+    input_b_copies: &[bg::Buffer],
+    sequence: &[(&bg::ComputePipeline, &Dispatch)],
+    reps: u32,
+) {
+    for repetition in 0..reps {
+        pieces[1] = timed_input_b(buffers[1], input_b_copies, repetition).into();
+        for (position, &(pipeline, dispatch)) in sequence.iter().enumerate() {
+            if repetition != 0 || position != 0 {
+                pass.barrier();
+            }
+            let mut pc = pass.with(pipeline);
+            Session::bind_dispatch(pieces, dispatch, &mut pc);
+            pc.dispatch(dispatch.workgroups);
+        }
     }
 }
 
