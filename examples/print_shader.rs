@@ -17,7 +17,6 @@ fn main() {
             let config = CoopConfig {
                 tile_size: 16,
                 use_f16_input: true,
-                compensated: false,
             };
             generate_module_coop(ShaderGroup::MatMul, &config).source
         }

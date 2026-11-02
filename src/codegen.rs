@@ -176,11 +176,6 @@ pub struct CoopConfig {
     pub tile_size: u32,
     /// Use f16 input with f32 accumulators when true, or all-f32 when false.
     pub use_f16_input: bool,
-    /// Split each f32 operand into `hi = f16(x)` and `lo = f16(x - f32(hi))`
-    /// and accumulate `hi·hi + hi·lo + lo·hi` in f32 (Ootomo & Yokota).
-    /// This improves mantissa precision but does not preserve f32's exponent
-    /// range, so automatic selection never uses it for full-precision work.
-    pub compensated: bool,
 }
 
 impl CoopConfig {
@@ -1132,7 +1127,6 @@ pub(crate) fn generate_module_coop_typed_with_subgroup(
             &CoopConfig {
                 tile_size: 16,
                 use_f16_input: types.multiply != crate::DType::F32,
-                compensated: false,
             },
             None,
             None,
@@ -2605,7 +2599,7 @@ fn gen_matmul_coop_stored(
             layout.vectorized,
             "typed scalar bindings use the checked kernel"
         );
-        assert!(config.tile_size == 16 && !config.compensated && copies == 1);
+        assert!(config.tile_size == 16 && copies == 1);
         assert!(prologue.is_none() && epilogue.is_none());
         assert!(!layout.direct_output || (types.output == crate::DType::F32 && !fused_add));
     }
@@ -2615,9 +2609,9 @@ fn gen_matmul_coop_stored(
         other => panic!("no cooperative kernel reads {other:?} weights"),
     };
     // Staging converts B to f16 for the tiles; stored f16 needs no conversion,
-    // but the hi/lo split and f32 tiles need the f32 value.
+    // but f32 tiles need the f32 value.
     assert!(
-        !b_f16 || (config.use_f16_input && !config.compensated && copies == 1),
+        !b_f16 || (config.use_f16_input && copies == 1),
         "f16 weights need plain f16-input cooperative tiles"
     );
     if config.tile_size == 8 && !config.use_f16_input {
@@ -2632,7 +2626,6 @@ fn gen_matmul_coop_stored(
     let tile_mask = tile - 1;
     let tile_shift = tile.trailing_zeros();
 
-    let compensated = config.compensated && config.use_f16_input;
     let (elem_type, enable_f16) = if let Some((types, _)) = typed {
         let extensions = match (
             types.uses(crate::DType::F16),
@@ -2650,11 +2643,7 @@ fn gen_matmul_coop_stored(
         ("f32", "")
     };
     let stage = |shared: &str, idx: &str, f32_expr: &str, storage: crate::DType| -> String {
-        if compensated {
-            format!(
-                "{{ let _x = ({f32_expr}); let _h = f16(_x); {shared}[{idx}] = _h; {shared}_lo[{idx}] = f16(_x - f32(_h)); }}"
-            )
-        } else if let Some((types, _)) = typed {
+        if let Some((types, _)) = typed {
             let cast = if storage == crate::DType::F32 && types.multiply == crate::DType::BF16 {
                 "round_bf16"
             } else {
@@ -3212,33 +3201,6 @@ fn gen_matmul_coop_stored(
             )
         };
 
-    let (shared_lo_decl, compensated_mma) = if compensated {
-        (
-            format!(
-                "var<workgroup> shared_a0_lo: array<f16, {shared_size}>;\n\
-                 var<workgroup> shared_a1_lo: array<f16, {shared_size}>;\n\
-                 var<workgroup> shared_b0_lo: array<f16, {shared_size}>;\n\
-                 var<workgroup> shared_b1_lo: array<f16, {shared_size}>;"
-            ),
-            format!(
-                "let a0_lo = coopLoadT<{coop_ab}>(&shared_b0_lo[0], {tile}u);\n\
-                 \x20   let a1_lo = coopLoadT<{coop_ab}>(&shared_b1_lo[0], {tile}u);\n\
-                 \x20   let b0_lo = coopLoadT<{coop_ba}>(&shared_a0_lo[0], {tile}u);\n\
-                 \x20   let b1_lo = coopLoadT<{coop_ba}>(&shared_a1_lo[0], {tile}u);\n\
-                 \x20   acc00 = coopMultiplyAdd(a0, b0_lo, acc00);\n\
-                 \x20   acc00 = coopMultiplyAdd(a0_lo, b0, acc00);\n\
-                 \x20   acc01 = coopMultiplyAdd(a0, b1_lo, acc01);\n\
-                 \x20   acc01 = coopMultiplyAdd(a0_lo, b1, acc01);\n\
-                 \x20   acc10 = coopMultiplyAdd(a1, b0_lo, acc10);\n\
-                 \x20   acc10 = coopMultiplyAdd(a1_lo, b0, acc10);\n\
-                 \x20   acc11 = coopMultiplyAdd(a1, b1_lo, acc11);\n\
-                 \x20   acc11 = coopMultiplyAdd(a1_lo, b1, acc11);"
-            ),
-        )
-    } else {
-        (String::new(), String::new())
-    };
-
     let src = include_str!("shaders/matmul_coop.wgsl");
     let src = preprocess(
         src,
@@ -3289,8 +3251,6 @@ fn gen_matmul_coop_stored(
             ("$ACC_INIT", &acc_init),
             ("$RESULT_SHARED_DECL", &result_shared_decl),
             ("$RESULT_STORE", &result_store),
-            ("$SHARED_LO_DECL", &shared_lo_decl),
-            ("$COMPENSATED_MMA", &compensated_mma),
         ],
     );
 
@@ -3787,7 +3747,6 @@ mod tests {
         let config = CoopConfig {
             tile_size: 16,
             use_f16_input: true,
-            compensated: false,
         };
         for &(group, caps) in &groups {
             if coop_shape(group).is_none() {
@@ -4032,12 +3991,6 @@ mod tests {
         let coop = CoopConfig {
             tile_size: 16,
             use_f16_input: true,
-            compensated: false,
-        };
-        let compensated = CoopConfig {
-            tile_size: 16,
-            use_f16_input: true,
-            compensated: true,
         };
         for count in [2u32, 3] {
             for group in [
@@ -4052,28 +4005,16 @@ mod tests {
                     .validate(&module.module)
                     .unwrap_or_else(|e| panic!("horizontal {group:?} {count} failed: {e:#?}"));
             }
-            for (label, cfg, caps) in [
-                (
-                    "coop",
-                    coop,
-                    Capabilities::COOPERATIVE_MATRIX
-                        | Capabilities::SHADER_FLOAT16
-                        | Capabilities::SUBGROUP,
-                ),
-                (
-                    "compensated",
-                    compensated,
-                    Capabilities::COOPERATIVE_MATRIX
-                        | Capabilities::SHADER_FLOAT16
-                        | Capabilities::SUBGROUP,
-                ),
-            ] {
-                let module = generate_horizontal_matmul(ShaderGroup::MatMul, count, Some(&cfg));
-                assert!(module.source.contains("matrix_b0"));
-                Validator::new(flags, caps)
-                    .validate(&module.module)
-                    .unwrap_or_else(|e| panic!("horizontal {label} {count} failed: {e:#?}"));
-            }
+            let module = generate_horizontal_matmul(ShaderGroup::MatMul, count, Some(&coop));
+            assert!(module.source.contains("matrix_b0"));
+            Validator::new(
+                flags,
+                Capabilities::COOPERATIVE_MATRIX
+                    | Capabilities::SHADER_FLOAT16
+                    | Capabilities::SUBGROUP,
+            )
+            .validate(&module.module)
+            .unwrap_or_else(|e| panic!("horizontal coop {count} failed: {e:#?}"));
         }
     }
 
@@ -4085,7 +4026,6 @@ mod tests {
         let config = CoopConfig {
             tile_size: 8,
             use_f16_input: false,
-            compensated: false,
         };
         assert_eq!(config.matmul_output_tile(), 32);
         assert_eq!(
@@ -4146,35 +4086,6 @@ mod tests {
     }
 
     #[test]
-    fn compensated_f16_coop_validates() {
-        use naga::valid::{Capabilities, ValidationFlags, Validator};
-        let config = CoopConfig {
-            tile_size: 16,
-            use_f16_input: true,
-            compensated: true,
-        };
-        for group in [
-            ShaderGroup::MatMul,
-            ShaderGroup::MatMulAT,
-            ShaderGroup::MatMulBT,
-        ] {
-            let module = generate_module_coop(group, &config);
-            assert!(
-                module.source.contains("shared_a0_lo"),
-                "{group:?} missing residual shared"
-            );
-            Validator::new(
-                ValidationFlags::all() ^ ValidationFlags::BINDINGS,
-                Capabilities::COOPERATIVE_MATRIX
-                    | Capabilities::SHADER_FLOAT16
-                    | Capabilities::SUBGROUP,
-            )
-            .validate(&module.module)
-            .unwrap_or_else(|error| panic!("{group:?} compensated coop failed: {error:#?}"));
-        }
-    }
-
-    #[test]
     fn cooperative_matmul_epilogue_stages_and_validates() {
         use crate::compile::MatMulEpilogue;
         use crate::schedule::{PointwiseDAG, Pw};
@@ -4191,7 +4102,6 @@ mod tests {
         let config = CoopConfig {
             tile_size: 16,
             use_f16_input: true,
-            compensated: false,
         };
         let capabilities = Capabilities::COOPERATIVE_MATRIX
             | Capabilities::SHADER_FLOAT16
@@ -4231,7 +4141,6 @@ mod tests {
         let config = CoopConfig {
             tile_size: 16,
             use_f16_input: true,
-            compensated: false,
         };
         let epilogue = MatMulEpilogue {
             dag: PointwiseDAG {
@@ -4860,17 +4769,14 @@ mod tests {
             CoopConfig {
                 tile_size: 8,
                 use_f16_input: false,
-                compensated: false,
             },
             CoopConfig {
                 tile_size: 16,
                 use_f16_input: false,
-                compensated: false,
             },
             CoopConfig {
                 tile_size: 16,
                 use_f16_input: true,
-                compensated: false,
             },
         ];
 

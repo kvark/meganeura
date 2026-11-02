@@ -415,7 +415,7 @@ fn matrix_input_order(
     use crate::{CoopPolicy, DType};
     match policy {
         // Rectangular and eight-wide checked products can improve the ordinary
-        // F32/compensated/scalar path. Prefer F16's mantissa first, but retain BF16
+        // F32/scalar path. Prefer F16's mantissa first, but retain BF16
         // as an independent candidate, including when F16 fails qualification.
         CoopPolicy::Auto if matches!(caps.f16_tile, 0 | 8) => vec![DType::F16, DType::BF16],
         CoopPolicy::Auto => vec![DType::BF16, DType::F16],

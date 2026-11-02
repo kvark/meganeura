@@ -304,7 +304,7 @@ fn conv_tile_entry(entry: &ShaderEntry, tile: u32) -> Option<ShaderEntry> {
 impl MatmulTile {
     pub(crate) fn native_cooperative(config: Option<&CoopConfig>) -> Option<Self> {
         let config = config?;
-        if config.use_f16_input || config.compensated || !matches!(config.tile_size, 8 | 16) {
+        if config.use_f16_input || !matches!(config.tile_size, 8 | 16) {
             return None;
         }
         Some(Self::CooperativeF32 {
@@ -354,7 +354,7 @@ impl MatmulTile {
                     interleave_columns,
                 }),
                 Kernel::Cooperative => config
-                    .filter(|c| c.use_f16_input && !c.compensated)
+                    .filter(|c| c.use_f16_input)
                     .map(|c| Self::CooperativeF16 {
                         tile_size: c.tile_size,
                     })
@@ -363,9 +363,7 @@ impl MatmulTile {
                     Some(Self::CooperativeWorkgroup { shape, splits })
                 }
                 Kernel::CooperativeTiled { shape, splits }
-                    if config.is_some_and(|c| {
-                        c.tile_size == 16 && !c.use_f16_input && !c.compensated
-                    }) =>
+                    if config.is_some_and(|c| c.tile_size == 16 && !c.use_f16_input) =>
                 {
                     Some(Self::CooperativeTiled { shape, splits })
                 }
@@ -382,17 +380,14 @@ impl MatmulTile {
             Self::CooperativeF16 { tile_size } => Some(CoopConfig {
                 tile_size,
                 use_f16_input: true,
-                compensated: false,
             }),
             Self::CooperativeTiled { .. } => Some(CoopConfig {
                 tile_size: 16,
                 use_f16_input: false,
-                compensated: false,
             }),
             Self::CooperativeF32 { tile_size } => Some(CoopConfig {
                 tile_size,
                 use_f16_input: false,
-                compensated: false,
             }),
             _ => None,
         }
@@ -740,8 +735,7 @@ impl TuneClass {
                 | ShaderEntry::Conv2dGradWeightGemm
                 | ShaderEntry::Conv2dGradWeightGemmSmall
                 | ShaderEntry::Conv2dGradWeightGemm16
-        ) || dispatch.use_coop_compensated()
-            || (dispatch.use_coop() && dispatch.weight_format.uses_reduced_storage())
+        ) || (dispatch.use_coop() && dispatch.weight_format.uses_reduced_storage())
             || dispatch.horizontal_batch >= 2
             || dispatch.matmul_prologue.is_some()
             || dispatch.matmul_epilogue.is_some()
@@ -855,7 +849,7 @@ impl TuneClass {
                 dispatch.kernel,
                 crate::compile::Kernel::CooperativeWorkgroup { types: None, .. }
             ) || (dispatch.kernel == crate::compile::Kernel::Cooperative
-                && config.is_some_and(|c| c.use_f16_input && !c.compensated)),
+                && config.is_some_and(|c| c.use_f16_input)),
             device_local: [false; 4],
             binding_bytes: Vec::new(),
         };
@@ -1065,7 +1059,7 @@ impl TuneClass {
                 candidates.extend(
                     [1, 2, 4, 8, 16].map(|splits| MatmulTile::CooperativeChecked { splits }),
                 );
-            } else if let Some(config) = config.filter(|c| c.use_f16_input && !c.compensated) {
+            } else if let Some(config) = config.filter(|c| c.use_f16_input) {
                 candidates.push(MatmulTile::CooperativeF16 {
                     tile_size: config.tile_size,
                 });
@@ -1120,7 +1114,7 @@ impl TuneClass {
         .collect();
         if !self.weight_format.is_quantized() {
             candidates.retain(|tile| matches!(tile, MatmulTile::CooperativeF32 { .. }));
-            if config.is_some_and(|c| c.tile_size == 16 && !c.use_f16_input && !c.compensated) {
+            if config.is_some_and(|c| c.tile_size == 16 && !c.use_f16_input) {
                 candidates.extend(
                     crate::codegen::CooperativeMatmulShape::all()
                         .map(|shape| MatmulTile::CooperativeTiled { shape, splits: 1 }),
@@ -1860,7 +1854,6 @@ mod tests {
         let native = CoopConfig {
             tile_size: 16,
             use_f16_input: false,
-            compensated: false,
         };
         assert!(
             automatic
@@ -2146,17 +2139,16 @@ mod tests {
     #[test]
     fn unsupported_modifiers_never_enter_the_search() {
         let base = dispatch();
-        let mut variants = vec![base.clone(); 10];
+        let mut variants = vec![base.clone(); 9];
         variants[0].kernel = crate::compile::Kernel::Cooperative;
         variants[1].horizontal_batch = 2;
-        variants[2].kernel = crate::compile::Kernel::CooperativeCompensated;
-        variants[3].extra_outputs.push(crate::compile::BufferRef(3));
-        variants[4].workgroups[2] = 2;
-        variants[5].shader = ShaderEntry::MatMulGemv;
-        variants[6].params[0] = 0;
-        variants[7].params[3] = 1;
-        variants[8].params[0] = 32 * 65_535 + 1;
-        variants[9].workgroups = [1, 2, 1]; // wrong row/column geometry
+        variants[2].extra_outputs.push(crate::compile::BufferRef(3));
+        variants[3].workgroups[2] = 2;
+        variants[4].shader = ShaderEntry::MatMulGemv;
+        variants[5].params[0] = 0;
+        variants[6].params[3] = 1;
+        variants[7].params[0] = 32 * 65_535 + 1;
+        variants[8].workgroups = [1, 2, 1]; // wrong row/column geometry
         for d in variants {
             assert!(TuneClass::from_dispatch(&d, None).is_none());
         }
@@ -2285,27 +2277,26 @@ mod tests {
             ShaderEntry::Conv2dGradWeightGemm,
         ] {
             let base = conv_dispatch(shader);
-            let mut variants = vec![base; 17];
+            let mut variants = vec![base; 16];
             variants[0].kernel = crate::compile::Kernel::SmallTile;
             variants[1].kernel = crate::compile::Kernel::Cooperative;
-            variants[2].kernel = crate::compile::Kernel::CooperativeCompensated;
-            variants[3].params.pop();
-            variants[4].params[7] = 0;
-            variants[5].params[9] += 1;
-            variants[6].params[11] = u32::MAX;
-            variants[7].params[2] = u32::MAX;
-            variants[8].workgroups[0] += 1;
-            variants[9].workgroups[2] += 1;
-            variants[10].params[0] = 0;
-            variants[11].params[1] = u32::MAX;
-            variants[12].weight_format = crate::compile::WeightFormat::F16;
-            variants[13].shader = ShaderEntry::Conv2dGradInputGemmCoopGen(3, 2, 2);
-            variants[14].kernel = crate::compile::Kernel::SpecializedConv {
+            variants[2].params.pop();
+            variants[3].params[7] = 0;
+            variants[4].params[9] += 1;
+            variants[5].params[11] = u32::MAX;
+            variants[6].params[2] = u32::MAX;
+            variants[7].workgroups[0] += 1;
+            variants[8].workgroups[2] += 1;
+            variants[9].params[0] = 0;
+            variants[10].params[1] = u32::MAX;
+            variants[11].weight_format = crate::compile::WeightFormat::F16;
+            variants[12].shader = ShaderEntry::Conv2dGradInputGemmCoopGen(3, 2, 2);
+            variants[13].kernel = crate::compile::Kernel::SpecializedConv {
                 k_tile: 7,
                 interleave_columns: false,
             };
-            variants[15].input_buffers.pop();
-            variants[16].params[5] = 100;
+            variants[14].input_buffers.pop();
+            variants[15].params[5] = 100;
             for d in variants {
                 assert!(TuneClass::from_dispatch(&d, None).is_none(), "{d:?}");
             }
@@ -2644,7 +2635,6 @@ mod tests {
         CoopConfig {
             tile_size,
             use_f16_input: false,
-            compensated: false,
         }
     }
 
@@ -2761,15 +2751,6 @@ mod tests {
                     .challengers(MatmulTile::Tile64, Some(&f16))
                     .contains(&native)
             );
-            let compensated = CoopConfig {
-                compensated: true,
-                ..config
-            };
-            assert!(
-                !class
-                    .challengers(MatmulTile::Tile64, Some(&compensated))
-                    .contains(&native)
-            );
         }
         assert!(MatmulTile::native_cooperative(Some(&native_config(4))).is_none());
     }
@@ -2808,7 +2789,7 @@ mod tests {
         d.params = vec![class.m, class.k, class.n, 0];
         native.apply(&mut d, &class);
         assert_eq!(d.workgroups, [1, 2, 1]);
-        assert!(d.use_coop() && !d.use_coop_compensated() && !d.use_small_tiles());
+        assert!(d.use_coop() && !d.use_small_tiles());
         assert!(TuneClass::from_dispatch(&d, Some(&config)).is_some());
         assert!(TuneClass::from_dispatch(&d, None).is_none());
         MatmulTile::Tile32.apply(&mut d, &class);

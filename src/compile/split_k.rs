@@ -465,7 +465,6 @@ mod tests {
             let config = CoopConfig {
                 tile_size: 16,
                 use_f16_input: false,
-                compensated: false,
             };
             let mut class = TuneClass::from_dispatch(&plan.dispatches[0], Some(&config)).unwrap();
             assert_eq!(class.split_k, splits > 1);
