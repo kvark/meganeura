@@ -1132,10 +1132,7 @@ fn can_horizontal_fuse(a: &Dispatch, b: &Dispatch) -> bool {
         && a.kernel == b.kernel
         && matches!(
             a.kernel,
-            Kernel::Default
-                | Kernel::SmallTile
-                | Kernel::Cooperative
-                | Kernel::CooperativeCompensated
+            Kernel::Default | Kernel::SmallTile | Kernel::Cooperative
         )
         && !a.weight_format.uses_reduced_storage()
         && a.weight_format == b.weight_format
@@ -1281,8 +1278,6 @@ pub enum Kernel {
         shape: crate::codegen::CooperativeMatmulShape,
         splits: u32,
     },
-    /// Experimental f16 hi/lo staging, not a full-range f32 implementation.
-    CooperativeCompensated,
     Gemv {
         shape: crate::codegen::GemvShape,
         /// Precision policy, never enabled by measurement.
@@ -1339,14 +1334,9 @@ impl Dispatch {
             Kernel::Cooperative
                 | Kernel::WinogradMatmul { .. }
                 | Kernel::CooperativeTyped { .. }
-                | Kernel::CooperativeCompensated
                 | Kernel::CooperativeTiled { .. }
                 | Kernel::CooperativeWorkgroup { .. }
         )
-    }
-
-    pub fn use_coop_compensated(&self) -> bool {
-        matches!(self.kernel, Kernel::CooperativeCompensated)
     }
 
     pub fn use_small_tiles(&self) -> bool {
@@ -2841,7 +2831,7 @@ pub fn fuse_rmsnorm_prologues(plan: &mut ExecutionPlan) {
         // support prologues; explicit BF16 staging preserves its conversions.
         if !matches!(
             d.kernel,
-            Kernel::Cooperative | Kernel::CooperativeCompensated | Kernel::CooperativeTiled { .. }
+            Kernel::Cooperative | Kernel::CooperativeTiled { .. }
         ) || !matches!(
             d.shader,
             ShaderEntry::MatMul

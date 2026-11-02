@@ -264,7 +264,7 @@ pub(crate) fn cooperative_geometry(
     // Direct stores write whole sub-tiles, so N must stay aligned for
     // stores never to straddle rows. The bottom edge is safe: the output
     // allocation rounds M up to whole tiles.
-    let f16_tiles_read_f16 = problem.f16_weights && config.use_f16_input && !config.compensated;
+    let f16_tiles_read_f16 = problem.f16_weights && config.use_f16_input;
     if problem.reduced_storage && !f16_tiles_read_f16 {
         Err("packed weights have no cooperative kernel")
     } else if !problem.n.is_multiple_of(16) {
@@ -319,12 +319,10 @@ mod tests {
     const F16: CoopConfig = CoopConfig {
         tile_size: 16,
         use_f16_input: true,
-        compensated: false,
     };
     const F32: CoopConfig = CoopConfig {
         tile_size: 8,
         use_f16_input: false,
-        compensated: false,
     };
 
     fn target(config: &CoopConfig) -> Target {
@@ -359,15 +357,7 @@ mod tests {
         .unwrap();
         assert!(problem.reduced_storage && problem.f16_weights);
         assert_eq!(select(&problem, &target(&F16)), Path::Cooperative);
-        for config in [
-            F32,
-            CoopConfig {
-                compensated: true,
-                ..F16
-            },
-        ] {
-            assert_eq!(select(&problem, &target(&config)), Path::Compiled);
-        }
+        assert_eq!(select(&problem, &target(&F32)), Path::Compiled);
         let quantized = Problem {
             f16_weights: false,
             ..problem

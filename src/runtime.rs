@@ -1014,11 +1014,8 @@ enum Variant {
     /// Cooperative-matrix implementation qualified for the session's precision
     /// policy, for the weight format it reads (f32, or f16 with f16 tiles).
     Coop(ShaderEntry, crate::compile::WeightFormat),
-    /// Cooperative f16 with hi/lo residual staging (C1).
-    CoopCompensated(ShaderEntry),
-    /// Same-A matmul pack (D1). The kind is part of the key so a
-    /// forward Q/K/V pack (plain f16 coop) cannot share a pipeline with
-    /// a backward pack of the same arity (compensated).
+    /// Same-A matmul pack (D1). The kind is part of the key so scalar and
+    /// cooperative packs of the same arity cannot share a pipeline.
     Horizontal(ShaderEntry, u32, HorizMatMulKind),
     SmallTile(ShaderEntry),
     /// The unmodified pipeline.
@@ -1029,13 +1026,10 @@ enum Variant {
 enum HorizMatMulKind {
     Scalar,
     Coop,
-    CoopCompensated,
 }
 
 fn horiz_kind(dispatch: &Dispatch) -> HorizMatMulKind {
-    if dispatch.use_coop_compensated() {
-        HorizMatMulKind::CoopCompensated
-    } else if dispatch.use_coop() {
+    if dispatch.use_coop() {
         HorizMatMulKind::Coop
     } else {
         HorizMatMulKind::Scalar
@@ -1069,7 +1063,6 @@ impl Variant {
             | Variant::Weight(ref e, _)
             | Variant::WeightSmall(ref e, _)
             | Variant::Coop(ref e, _)
-            | Variant::CoopCompensated(ref e)
             | Variant::Horizontal(ref e, _, _)
             | Variant::SmallTile(ref e)
             | Variant::Scalar(ref e) => Some(e),
@@ -1142,7 +1135,6 @@ impl Variant {
             Variant::WeightSmall(ref e, format) => format!("{e:?}:weight-{format:?}-small-tile"),
             Variant::Coop(ref e, crate::compile::WeightFormat::F32) => format!("{e:?}:cooperative"),
             Variant::Coop(ref e, format) => format!("{e:?}:cooperative-{format:?}-weights"),
-            Variant::CoopCompensated(ref e) => format!("{e:?}:cooperative-compensated"),
             Variant::Horizontal(ref e, n, kind) => format!("{e:?}:horizontal-{n}-{kind:?}"),
             Variant::SmallTile(ref e) => format!("{e:?}:small-tile"),
             Variant::Scalar(ref e) => format!("{e:?}:scalar"),
@@ -1653,22 +1645,14 @@ mod precision_requirement_tests {
                 Some(CoopConfig {
                     tile_size: 8,
                     use_f16_input: false,
-                    compensated: false,
                 }),
                 Some(CoopConfig {
                     tile_size: 16,
                     use_f16_input: false,
-                    compensated: false,
                 }),
                 Some(CoopConfig {
                     tile_size: 16,
                     use_f16_input: true,
-                    compensated: false,
-                }),
-                Some(CoopConfig {
-                    tile_size: 16,
-                    use_f16_input: true,
-                    compensated: true,
                 }),
             ] {
                 for allow_raw_f16 in [false, true] {
@@ -1961,7 +1945,7 @@ impl Pipelines {
             }
             Variant::CoopTiled(_, shape, splits, _) => {
                 let config = cooperative();
-                if config.tile_size != 16 || config.use_f16_input || config.compensated {
+                if config.tile_size != 16 || config.use_f16_input {
                     return Err("tiled cooperative matmul requires native 16x16 f32".to_owned());
                 }
                 if !dispatch
@@ -2034,9 +2018,8 @@ impl Pipelines {
                 }
                 tuning::tile_module(dispatch, crate::tune::MatmulTile::Gemv(shape), matmul_knobs)
             }
-            Variant::Coop(..) | Variant::CoopCompensated(_) => {
-                let mut config = cooperative();
-                config.compensated = dispatch.use_coop_compensated();
+            Variant::Coop(..) => {
+                let config = cooperative();
                 use crate::codegen::Conv2dCoopDirection;
                 match dispatch.shader {
                     ShaderEntry::Conv2dGemmCoopGen(kh, kw, stride) => {
@@ -2129,7 +2112,7 @@ impl Pipelines {
                 }
                 ShaderGroup::FlashAttentionCoopF32 => {
                     let config = cooperative();
-                    if config.tile_size != 16 || config.use_f16_input || config.compensated {
+                    if config.tile_size != 16 || config.use_f16_input {
                         return Err(
                             "native16 attention requires qualified 16x16 f32 matrices".into()
                         );
@@ -2154,7 +2137,7 @@ impl Pipelines {
                             crate::kernels::attention_grad::Operands::F32,
                         ) {
                         let config = cooperative();
-                        if config.use_f16_input || config.compensated {
+                        if config.use_f16_input {
                             return Err(
                                 "native-f32 attention gradients require qualified f32 matrices"
                                     .into(),
@@ -2196,11 +2179,7 @@ impl Pipelines {
             Variant::Horizontal(_, count, kind) => {
                 let coop = match kind {
                     HorizMatMulKind::Scalar => None,
-                    HorizMatMulKind::Coop | HorizMatMulKind::CoopCompensated => {
-                        let mut config = cooperative();
-                        config.compensated = kind == HorizMatMulKind::CoopCompensated;
-                        Some(config)
-                    }
+                    HorizMatMulKind::Coop => Some(cooperative()),
                 };
                 layout = horizontal_matmul_layout(count);
                 entry_point = "main";
@@ -2385,9 +2364,8 @@ impl Pipelines {
         if let Some(shape) = dispatch.gemv_shape() {
             return Variant::Gemv(entry, dispatch.weight_format, shape);
         }
-        let cooperative_f16_weights = dispatch.use_coop()
-            && !dispatch.use_coop_compensated()
-            && dispatch.weight_format == crate::compile::WeightFormat::F16;
+        let cooperative_f16_weights =
+            dispatch.use_coop() && dispatch.weight_format == crate::compile::WeightFormat::F16;
         if dispatch.weight_format.uses_reduced_storage() && !cooperative_f16_weights {
             return if dispatch.use_small_tiles() {
                 Variant::WeightSmall(entry, dispatch.weight_format)
@@ -2403,11 +2381,7 @@ impl Pipelines {
                     prologue.factors.iter().map(|f| f.1.clone()).collect(),
                 );
             }
-            return if dispatch.use_coop_compensated() {
-                Variant::CoopCompensated(entry)
-            } else {
-                Variant::Coop(entry, dispatch.weight_format)
-            };
+            return Variant::Coop(entry, dispatch.weight_format);
         }
         if dispatch.use_small_tiles() {
             return Variant::SmallTile(entry);
@@ -2915,7 +2889,7 @@ pub(crate) fn select_variants(
     // 512 workgroups; 128 columns are used when partitions can still reach
     // that target, 64 otherwise. Ragged, pinned and fused-epilogue products
     // keep their kernel; tuning can challenge unsplit choices.
-    if coop_config.is_some_and(|c| c.tile_size == 16 && !c.use_f16_input && !c.compensated) {
+    if coop_config.is_some_and(|c| c.tile_size == 16 && !c.use_f16_input) {
         for index in (0..plan.dispatches.len()).rev() {
             let dispatch = &plan.dispatches[index];
             let Some((m, n, k)) = dispatch.mnk() else {
@@ -3050,7 +3024,6 @@ mod block_matmul_variant_tests {
         let coop = CoopConfig {
             tile_size: 16,
             use_f16_input: true,
-            compensated: false,
         };
         for rows in [6, 16] {
             for (inner, columns) in [(1024, 256), (256, 768)] {
@@ -3094,7 +3067,6 @@ mod tiled_cooperative_policy_tests {
         let config = CoopConfig {
             tile_size: 16,
             use_f16_input: false,
-            compensated: false,
         };
         // M, N, K and the expected (columns, splits), measured on MI300X.
         for (m, n, k, expected) in [
@@ -3162,7 +3134,6 @@ mod coop_precision_tests {
         let config = CoopConfig {
             tile_size: 8,
             use_f16_input: false,
-            compensated: false,
         };
         for n in [192, 49_152] {
             let mut graph = crate::Graph::new();
@@ -3184,7 +3155,6 @@ mod coop_precision_tests {
         let config = CoopConfig {
             tile_size: 8,
             use_f16_input: false,
-            compensated: false,
         };
         let candidate = crate::tune::MatmulTile::CooperativeF32 { tile_size: 8 };
         for groups in [65_535, 65_536] {
@@ -3230,7 +3200,6 @@ mod coop_precision_tests {
         let config = CoopConfig {
             tile_size: 8,
             use_f16_input: false,
-            compensated: false,
         };
         let mut graph = crate::Graph::new();
         let a = graph.input("a", &[32_767, 4]);
@@ -3245,16 +3214,6 @@ mod coop_precision_tests {
             plan.buffers[dispatch.output_buffer.0 as usize],
             1_usize << 32
         );
-    }
-
-    #[test]
-    fn compensated_f16_does_not_extend_exponent_range() {
-        let value = 1.0e-12_f32;
-        let high = half::f16::from_f32(value);
-        let low = half::f16::from_f32(value - high.to_f32());
-
-        assert_eq!(high.to_bits(), 0);
-        assert_eq!(low.to_bits(), 0);
     }
 }
 
@@ -3856,13 +3815,11 @@ impl Session {
             Some(CoopConfig {
                 tile_size: caps.f32_tile,
                 use_f16_input: false,
-                compensated: false,
             })
         } else if caps.f16_tile > 0 {
             Some(CoopConfig {
                 tile_size: caps.f16_tile,
                 use_f16_input: true,
-                compensated: false,
             })
         } else {
             None
@@ -5796,19 +5753,13 @@ mod variant_tests {
             d.horizontal_batch = 3;
             d.kernel = crate::compile::Kernel::Cooperative;
         });
-        let compensated = matmul(|d| {
-            d.horizontal_batch = 3;
-            d.kernel = crate::compile::Kernel::CooperativeCompensated;
-        });
         assert_eq!(
             scalar,
             Variant::Horizontal(ShaderEntry::MatMul, 3, HorizMatMulKind::Scalar)
         );
-        assert_ne!(scalar, coop);
-        assert_ne!(coop, compensated);
         assert_eq!(
-            compensated,
-            Variant::Horizontal(ShaderEntry::MatMul, 3, HorizMatMulKind::CoopCompensated)
+            coop,
+            Variant::Horizontal(ShaderEntry::MatMul, 3, HorizMatMulKind::Coop)
         );
     }
 }

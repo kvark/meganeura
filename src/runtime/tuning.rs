@@ -2902,7 +2902,6 @@ mod tests {
         let reduced = CoopConfig {
             tile_size: 16,
             use_f16_input: true,
-            compensated: false,
         };
         let native = CoopConfig {
             use_f16_input: false,
@@ -3812,7 +3811,6 @@ mod tests {
             let config = crate::codegen::CoopConfig {
                 tile_size,
                 use_f16_input: false,
-                compensated: false,
             };
             let reduced = crate::codegen::CoopConfig {
                 use_f16_input: true,
@@ -4016,7 +4014,6 @@ mod tests {
         let config = crate::codegen::CoopConfig {
             tile_size: 16,
             use_f16_input: false,
-            compensated: false,
         };
         let mut graph = crate::Graph::new();
         let x = graph.input("x", &[64, 2048]);

@@ -363,12 +363,10 @@ mod tests {
     const F16: CoopConfig = CoopConfig {
         tile_size: 16,
         use_f16_input: true,
-        compensated: false,
     };
     const F32_8: CoopConfig = CoopConfig {
         tile_size: 8,
         use_f16_input: false,
-        compensated: false,
     };
 
     fn target(config: CoopConfig) -> Target {
