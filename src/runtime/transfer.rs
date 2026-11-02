@@ -1230,26 +1230,19 @@ impl Session {
     /// across a session rebuild — e.g. when the parameter table
     /// reshaped due to a topology change like RadFoam densification.
     pub fn read_adam_m(&self, name: &str, out: &mut [f32]) {
-        let idx = self
-            .adam_state_index(name)
-            .unwrap_or_else(|| panic!("no Adam state for param: {name}"));
-        let n = self.param_size(name).expect("param exists; size known");
-        assert_eq!(
-            out.len(),
-            n,
-            "read_adam_m: out.len()={} but param '{name}' has {n} elements",
-            out.len()
-        );
-        if let Some((buffer, _)) = self.adam_moments(idx) {
-            self.read_raw_f32(buffer, out, !self.optimizer_device);
-        } else {
-            out.fill(0.0);
-        }
+        self.read_adam_moment(name, out, false);
     }
 
     /// Read the Adam second-moment buffer (`v`) for a parameter. See
     /// [`Session::read_adam_m`].
     pub fn read_adam_v(&self, name: &str, out: &mut [f32]) {
+        self.read_adam_moment(name, out, true);
+    }
+
+    /// Shared body of [`Session::read_adam_m`] (`second == false`) and
+    /// [`Session::read_adam_v`] (`second == true`).
+    fn read_adam_moment(&self, name: &str, out: &mut [f32], second: bool) {
+        let caller = if second { "read_adam_v" } else { "read_adam_m" };
         let idx = self
             .adam_state_index(name)
             .unwrap_or_else(|| panic!("no Adam state for param: {name}"));
@@ -1257,11 +1250,11 @@ impl Session {
         assert_eq!(
             out.len(),
             n,
-            "read_adam_v: out.len()={} but param '{name}' has {n} elements",
+            "{caller}: out.len()={} but param '{name}' has {n} elements",
             out.len()
         );
-        if let Some((_, buffer)) = self.adam_moments(idx) {
-            self.read_raw_f32(buffer, out, !self.optimizer_device);
+        if let Some((m, v)) = self.adam_moments(idx) {
+            self.read_raw_f32(if second { v } else { m }, out, !self.optimizer_device);
         } else {
             out.fill(0.0);
         }
@@ -1311,28 +1304,23 @@ impl Session {
     /// must equal the parameter's element count. See
     /// [`Session::read_adam_m`] for the carry-over use case.
     pub fn write_adam_m(&mut self, name: &str, data: &[f32]) {
-        self.wait();
-        let idx = self
-            .adam_state_index(name)
-            .unwrap_or_else(|| panic!("no Adam state for param: {name}"));
-        let n = self.param_size(name).expect("param exists; size known");
-        assert_eq!(
-            data.len(),
-            n,
-            "write_adam_m: data.len()={} but param '{name}' has {n} elements",
-            data.len()
-        );
-        self.ensure_adam_state();
-        self.write_raw_buffer(
-            self.adam_moments(idx).expect("Adam state").0,
-            bytemuck::cast_slice(data),
-            !self.optimizer_device,
-        );
+        self.write_adam_moment(name, data, false);
     }
 
     /// Write the Adam second-moment buffer for a parameter. See
     /// [`Session::write_adam_m`].
     pub fn write_adam_v(&mut self, name: &str, data: &[f32]) {
+        self.write_adam_moment(name, data, true);
+    }
+
+    /// Shared body of [`Session::write_adam_m`] (`second == false`) and
+    /// [`Session::write_adam_v`] (`second == true`).
+    fn write_adam_moment(&mut self, name: &str, data: &[f32], second: bool) {
+        let caller = if second {
+            "write_adam_v"
+        } else {
+            "write_adam_m"
+        };
         self.wait();
         let idx = self
             .adam_state_index(name)
@@ -1341,12 +1329,13 @@ impl Session {
         assert_eq!(
             data.len(),
             n,
-            "write_adam_v: data.len()={} but param '{name}' has {n} elements",
+            "{caller}: data.len()={} but param '{name}' has {n} elements",
             data.len()
         );
         self.ensure_adam_state();
+        let (m, v) = self.adam_moments(idx).expect("Adam state");
         self.write_raw_buffer(
-            self.adam_moments(idx).expect("Adam state").1,
+            if second { v } else { m },
             bytemuck::cast_slice(data),
             !self.optimizer_device,
         );
