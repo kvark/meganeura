@@ -8,11 +8,10 @@
 //! that would be installed is qualified. See `docs/search-convergence.md`.
 
 use super::{
-    ENCODER_SCRATCH_BYTES, Scratch, SearchClass, Staging, buffer_bytes, limited_scratch_bytes,
-    outputs_agree, prepared_inputs, qualify_output, reordered_outputs_agree, small_pattern_scale,
-    typed_inputs,
+    ENCODER_SCRATCH_BYTES, PreparedComparison, Scratch, SearchClass, Staging, buffer_bytes,
+    class_inputs, encode_repetitions, limited_scratch_bytes, output_qualifies, prepare_comparison,
 };
-use crate::compile::{BufferRef, Dispatch};
+use crate::compile::Dispatch;
 use crate::runtime::{Pipelines, Session, Variant};
 use crate::tune::{
     MachineProfile, MatmulTile, TuneDecision, TuneOptions, TuneOutcome, TunePreparationTimes,
@@ -140,12 +139,13 @@ impl Session {
 
         // Bindings sized for the largest candidate, as one comparison would.
         let preparation = Instant::now();
-        let PreparedRace {
+        let PreparedComparison {
             logical_sizes,
             sizes,
             output_index,
+            device_local,
             sequences,
-        } = prepare_race(class, &self.plan.dispatches[class.members[0]], &tiles);
+        } = prepare_comparison(class, &self.plan.dispatches[class.members[0]], &tiles);
         let Some(bytes) = sizes[1]
             .checked_mul((class.input_b_copies - 1) as usize)
             .and_then(|extra| limited_scratch_bytes(&sizes, extra, options.max_scratch_bytes))
@@ -155,11 +155,7 @@ impl Session {
         };
         staging.discard_unmatched(*sizes.iter().max().unwrap());
         staging.discard_input_b(&class.key, sizes[1]);
-        let memory = self.gpu.memory_stats();
-        if memory.budget != 0
-            && (bytes - staging.retained_bytes()) as u64
-                > crate::runtime::safe_device_memory_remaining(memory.usage, memory.budget)
-        {
+        if staging.exceeds_device_memory(bytes) {
             fail_remaining(&mut outcomes, TuneDecision::DeviceMemoryBudget);
             return conclude(race, outcomes);
         }
@@ -197,20 +193,11 @@ impl Session {
             fail_remaining(&mut outcomes, TuneDecision::ScratchLimit);
             return conclude(race, outcomes);
         };
-        let memory = self.gpu.memory_stats();
-        if memory.budget != 0
-            && (bytes - staging.retained_bytes()) as u64
-                > crate::runtime::safe_device_memory_remaining(memory.usage, memory.budget)
-        {
+        if staging.exceeds_device_memory(bytes) {
             fail_remaining(&mut outcomes, TuneDecision::DeviceMemoryBudget);
             return conclude(race, outcomes);
         }
 
-        let device_local: Vec<bool> = (0..sizes.len())
-            .map(|i| {
-                i > output_index || class.key.device_local[if i == output_index { 3 } else { i }]
-            })
-            .collect();
         let mut preparation_times = TunePreparationTimes::default();
         let mut cleanup = None;
         let mut scratch = Scratch::new(
@@ -223,7 +210,8 @@ impl Session {
             &mut cleanup,
         );
         // Ordinary-magnitude inputs, the bytes qualification ends on as well.
-        let inputs = race_inputs(class, &logical_sizes, &sizes, 0);
+        let mut inputs = Vec::new();
+        class_inputs(&mut inputs, class, &logical_sizes, &sizes, 0);
         for (index, data) in inputs.iter().enumerate() {
             if start.elapsed() >= options.max_time {
                 fail_remaining(&mut outcomes, TuneDecision::TimeBudget);
@@ -391,69 +379,6 @@ pub(super) fn weight_copies(class: &SearchClass, options: &TuneOptions, distinct
         .min(options.dispatches_per_sample as usize)
         .min(extra.saturating_add(1))
         .max(1) as u32
-}
-
-struct PreparedRace {
-    logical_sizes: Vec<usize>,
-    sizes: Vec<usize>,
-    output_index: usize,
-    sequences: Vec<Vec<Dispatch>>,
-}
-
-/// Private bindings cover the largest tile, including split-product reductions.
-fn prepare_race(class: &SearchClass, template: &Dispatch, tiles: &[MatmulTile]) -> PreparedRace {
-    let logical_sizes = class
-        .key
-        .buffer_sizes()
-        .expect("class collection checked extents");
-    let mut sizes: Vec<usize> = Vec::new();
-    for &tile in tiles {
-        let tile_sizes = tile.buffer_sizes(&class.key).expect("legal candidate");
-        sizes.resize(tile_sizes.len(), 0);
-        for (size, tile_size) in sizes.iter_mut().zip(tile_sizes) {
-            *size = (*size).max(tile_size.next_multiple_of(4));
-        }
-    }
-    let output_index = sizes.len() - 1;
-    let mut template = template.clone();
-    template.input_buffers = (0..output_index).map(|i| BufferRef(i as u32)).collect();
-    template.output_buffer = BufferRef(output_index as u32);
-    if let Some(ref mut norm) = template.gemv_rmsnorm {
-        template.input_buffers = vec![BufferRef(0), BufferRef(1)];
-        norm.weight = BufferRef(2);
-        template.output_buffer = BufferRef(3);
-    }
-    let mut sequences: Vec<Vec<Dispatch>> = tiles
-        .iter()
-        .map(|&tile| {
-            let mut dispatch = template.clone();
-            tile.apply(&mut dispatch, &class.key);
-            vec![dispatch]
-        })
-        .collect();
-    if class.key.split_k {
-        // Every candidate writes partitions into a partial buffer of the
-        // live size, and a SumRows adds them into the output.
-        let partial = BufferRef(sizes.len() as u32);
-        let columns = class.key.m * class.key.n;
-        sizes[output_index] = logical_sizes[output_index].next_multiple_of(4);
-        sizes.push(class.key.binding_bytes[output_index]);
-        for (sequence, tile) in sequences.iter_mut().zip(tiles) {
-            let splits = tile
-                .partitions()
-                .expect("split products only take partitioned candidates");
-            let sum =
-                sequence[0].partial_sum(partial, sequence[0].output_buffer, columns, splits, true);
-            sequence[0].output_buffer = partial;
-            sequence.push(sum);
-        }
-    }
-    PreparedRace {
-        logical_sizes,
-        sizes,
-        output_index,
-        sequences,
-    }
 }
 
 /// Warm all compiled candidates, then collect balanced rounds and eliminate.
@@ -685,19 +610,14 @@ impl Scratch<'_, '_> {
         let mut pieces: Vec<bg::BufferPiece> = self.buffers.iter().map(|&b| b.into()).collect();
         self.encoder.start();
         for &(sequence, reps) in entries {
-            let mut pass = self.encoder.compute("tune_race");
-            for repetition in 0..reps {
-                pieces[1] =
-                    super::timed_input_b(self.buffers[1], &self.input_b_copies, repetition).into();
-                for (position, &(pipeline, dispatch)) in sequence.iter().enumerate() {
-                    if repetition != 0 || position != 0 {
-                        pass.barrier();
-                    }
-                    let mut pc = pass.with(pipeline);
-                    Session::bind_dispatch(&pieces, dispatch, &mut pc);
-                    pc.dispatch(dispatch.workgroups);
-                }
-            }
+            encode_repetitions(
+                &mut self.encoder.compute("tune_race"),
+                &mut pieces,
+                &self.buffers,
+                &self.input_b_copies,
+                sequence,
+                reps,
+            );
         }
         let sync = self.gpu.submit(&mut self.encoder);
         let timings =
@@ -898,19 +818,6 @@ fn eliminate(
     }
 }
 
-/// The deterministic inputs for one pattern, in the class's storage types.
-fn race_inputs(
-    class: &SearchClass,
-    logical_sizes: &[usize],
-    sizes: &[usize],
-    pattern: u32,
-) -> Vec<Vec<f32>> {
-    match class.key.effective_matrix_types() {
-        Some(types) => typed_inputs(&class.key, types, pattern, sizes),
-        None => prepared_inputs(logical_sizes, sizes, pattern, class.key.weight_format),
-    }
-}
-
 enum QualificationFailure {
     TimeBudget,
     Output { by_incumbent: bool, failure: String },
@@ -937,15 +844,11 @@ fn qualify(
         }
     };
     let mut times = TuneQualificationTimes::default();
-    let agree = if class.key.split_k {
-        reordered_outputs_agree
-    } else {
-        outputs_agree
-    };
     // Finish on ordinary inputs, as timing used.
     for pattern in [1u32, 0] {
         check_budget()?;
-        let inputs = race_inputs(class, logical_sizes, sizes, pattern);
+        let mut inputs = Vec::new();
+        class_inputs(&mut inputs, class, logical_sizes, sizes, pattern);
         for (index, data) in inputs.iter().enumerate() {
             // B is identical across patterns and already resident.
             if index != 1 {
@@ -953,11 +856,6 @@ fn qualify(
                 scratch.upload(index, data, Some(&mut times));
             }
         }
-        let scale = if pattern == 0 {
-            1.0
-        } else {
-            small_pattern_scale(&class.key)
-        };
         let slot = pattern as usize;
         if reference[slot].is_none() {
             check_budget()?;
@@ -966,7 +864,7 @@ fn qualify(
             scratch.run(incumbent, 1);
             check_budget()?;
             let output = scratch.read_output(&mut times);
-            if !qualify_output(&class.key, &inputs, &output, scale) {
+            if !output_qualifies(&class.key, &inputs, &output, None, pattern) {
                 return Err(QualificationFailure::Output {
                     by_incumbent: true,
                     failure: format!("incumbent, input pattern {pattern}: reference mismatch"),
@@ -980,13 +878,10 @@ fn qualify(
         scratch.run(challenger, 1);
         check_budget()?;
         let output = scratch.read_output(&mut times);
-        let expected = reference[slot].as_ref().unwrap();
-        let identical =
-            bytemuck::cast_slice::<f32, u8>(expected) == bytemuck::cast_slice::<f32, u8>(&output);
-        if !(identical
-            || (qualify_output(&class.key, &inputs, &output, scale)
-                && agree(expected, &output, scale)))
-        {
+        let expected = reference[slot]
+            .as_deref()
+            .expect("qualified incumbent output");
+        if !output_qualifies(&class.key, &inputs, &output, Some(expected), pattern) {
             return Err(QualificationFailure::Output {
                 by_incumbent: false,
                 failure: format!("input pattern {pattern}: reference or cross-variant mismatch"),
@@ -998,7 +893,7 @@ fn qualify(
 
 #[cfg(test)]
 mod tests {
-    use super::super::scratch_bytes;
+    use super::super::{qualify_output, scratch_bytes};
     use super::*;
     use crate::tune::{MatmulTile, TuneClass};
 
@@ -1119,12 +1014,13 @@ mod tests {
                 class.initial,
             )
             .unwrap();
-        let PreparedRace {
+        let PreparedComparison {
             logical_sizes,
             sizes,
             output_index,
             sequences,
-        } = prepare_race(
+            ..
+        } = prepare_comparison(
             class,
             &session.plan.dispatches[class.members[0]],
             &[class.initial],
@@ -1143,7 +1039,8 @@ mod tests {
             &mut preparation,
             &mut cleanup,
         );
-        let inputs = race_inputs(class, &logical_sizes, &sizes, 0);
+        let mut inputs = Vec::new();
+        class_inputs(&mut inputs, class, &logical_sizes, &sizes, 0);
         for (i, data) in inputs.iter().enumerate() {
             scratch.upload(i, data, None);
         }
