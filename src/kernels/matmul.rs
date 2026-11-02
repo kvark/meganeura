@@ -56,7 +56,7 @@ impl Layout {
         })
     }
 
-    fn has_addend(self) -> bool {
+    pub(crate) fn has_addend(self) -> bool {
         matches!(
             self,
             Self::PlainAdd | Self::TransposedAAdd | Self::TransposedBAdd
