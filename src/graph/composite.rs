@@ -79,6 +79,7 @@ impl Op {
             | Op::BroadcastInner { .. }
             | Op::SumInner
             | Op::MaxInner
+            | Op::ArgMaxOneHot
             | Op::SumAll
             | Op::ExclusiveCumsum { .. }
             | Op::Transpose

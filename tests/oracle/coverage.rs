@@ -51,6 +51,7 @@ const TABLE: &[(&str, Coverage)] = &[
     ("SumRows", Covered(".sum_rows(")),
     ("SumInner", Covered(".sum_inner(")),
     ("MaxInner", Covered(".max_inner(")),
+    ("ArgMaxOneHot", Covered(".argmax_one_hot(")),
     ("BroadcastInner", Covered(".broadcast_inner(")),
     ("NormalizeInnerSum", Covered(".normalize_inner_sum(")),
     (

@@ -825,6 +825,7 @@ fn differentiate_impl(forward: &Graph, bf16_gradients: bool) -> Graph {
             | Op::Parameter { .. }
             | Op::Constant { .. }
             | Op::Greater
+            | Op::ArgMaxOneHot
             | Op::StopGradient => {}
             Op::Nop => {}
             Op::Identity => {
