@@ -129,58 +129,30 @@ pub struct BuildSearchReport {
 
 /// Build from representative inputs, measuring logical and physical alternatives.
 ///
-/// Unlike [`super::build`], this executes private candidate sessions.
-/// `initialize` writes representative inputs and weights once per candidate,
-/// the same values every time. A challenger is constructed on its idle
-/// incumbent's identically stored parameters that neither program writes;
-/// [`Session::inherits_parameter`] reports them so the initializer can skip
-/// their upload. The incumbent must not be modified. Inputs and writable state
-/// remain private. Configure runtime optimizers, accumulation and external
-/// bindings after construction, not inside either callback.
+/// Unlike [`super::build`], this executes private candidate sessions: the
+/// ordinary program, bounded egglog graph forms (each differentiated
+/// separately for training), and physical choices such as dispatch fusion,
+/// attention layouts, checked matrix arithmetic, weight-gradient splits and
+/// submission chunks, in `CoordinateOrder`. Challengers are kernel-tuned, but
+/// only a whole-program paired comparison (fresh recording, submission and
+/// wait; not readback) can replace the incumbent. No global optimum is promised.
 ///
-/// The runner executes one step before each read-only `qualify` call, repeating
-/// each checkpoint `options.qualification_runs` times. Check every
-/// observable output, gradient and persistent update against your numerical
-/// contract. The ordinary untuned program is qualified first and retained as
-/// the initial incumbent. Its tuned version, including memoized decisions,
-/// must win a whole-program comparison to replace it. Every challenger is
-/// qualified after kernel tuning, before it is timed;
-/// one with kernel classes left to probe is also qualified before tuning.
-/// Repeatability checks should compare executions of the same complete plan;
-/// different plans can use different arithmetic and must each satisfy the
-/// caller's independent numerical contract. Kernel tuning can change the plan
-/// between the pre-tuning and post-tuning checkpoints.
-/// A challenger with an identical execution plan and submission count keeps the incumbent
-/// without warmup or paired timing. A winning challenger is qualified again after
-/// measurement. The selected program is checked before returning if another
-/// challenger ran since its last check or `final_qualification_runs` requests it. A failing challenger is discarded; a
-/// failing final incumbent aborts construction.
-/// Written inputs, parameters and constants are reset before each step, outside
-/// timing. The returned session retains its initialized persistent state; outputs
-/// hold its last qualified step. Timing includes fresh recording/submission/wait,
-/// not readback. These search samples are not held-out benchmark results.
+/// `initialize` writes the same representative inputs and weights every time.
+/// A challenger shares its idle incumbent's unwritten parameters
+/// ([`Session::inherits_parameter`]); the incumbent must not be modified.
+/// Configure optimizers, accumulation and bindings afterwards. `qualify` checks
+/// every output, gradient and persistent update after one step, repeated
+/// `qualification_runs` times; different plans, including one plan before and
+/// after kernel tuning, may use different arithmetic. The untuned ordinary
+/// program is qualified first and is the fallback. Challengers are qualified
+/// before timing and again on a win, and are discarded on failure. The selected
+/// program is rechecked if others ran since, or per `final_qualification_runs`;
+/// that failure aborts. State is reset before each step, outside timing; the
+/// result keeps its initialized state and its last qualified outputs.
 ///
-/// The ordinary optimizer supplies the first candidate. Egglog retains alternatives
-/// from the original forward graph (one bounded region, repeated where verified).
-/// They are not greedily optimized again. Each training form is differentiated
-/// separately, so parameter transformations and gradients stay consistent.
-/// Matrix tile, split-K and independent attention-gradient layouts are egglog
-/// equalities. Lowering emits the extracted schedule. Complete plans vary
-/// dispatch fusion, cached-attention splits, low-occupancy convolution
-/// weight-gradient splits, and caller-enabled submission chunk counts. Unlocked
-/// dispatches are kernel-tuned before comparison, reserving estimated time for
-/// whole-program warmup, sampling and qualification within the common deadline.
-/// Private kernel wins alone never replace the incumbent. This bounded search
-/// does not promise a global optimum.
-/// After initial layout/arithmetic coverage, alternate layout exploration with
-/// submission probes on the incumbent. A winning layout reopens those probes;
-/// later layouts inherit its measured count rather than expanding a
-/// layout/submission cross product.
-///
-/// `options.tuning` replaces `cfg.tune`. Build-plan caching is not yet supported:
-/// calibration data and measured policy are not part of the ordinary cache key.
-/// Inputs remain resident between steps. When deployment uploads inputs before
-/// each step, use [`build_measured_with_inputs`] to measure the same workload.
+/// `options` bound graphs, programs, plan bytes and a soft total deadline, and
+/// `options.tuning` replaces `cfg.tune`. The build-plan cache is unsupported.
+/// Inputs stay resident; [`build_measured_with_inputs`] uploads them each step.
 pub fn build_measured(
     forward_graph: &Graph,
     cfg: SessionConfig<'_>,
