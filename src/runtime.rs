@@ -1351,20 +1351,122 @@ pub fn typed_matrix_supported(gpu: &Arc<Gpu>, multiply: crate::DType) -> bool {
 /// but a listed tile shape does not promise them: some drivers flush them in
 /// cooperative products unless the shader requests denormal preservation.
 fn f16_subnormals_qualified(gpu: &Arc<Gpu>) -> bool {
-    // A listed `Weak` keeps its context address from being reused.
-    type Probe = (std::sync::Weak<Gpu>, bool);
-    static PROBES: std::sync::Mutex<Vec<Probe>> = std::sync::Mutex::new(Vec::new());
-    let mut probes = PROBES.lock().unwrap();
-    probes.retain(|probe| probe.0.strong_count() != 0);
-    if let Some(probe) = probes
+    static PROBES: ContextProbes<()> = std::sync::Mutex::new(Vec::new());
+    qualified_once(&PROBES, gpu, (), || test_f16_subnormal_products(gpu))
+}
+
+/// Answers of one qualification probe, per live context and probe key.
+/// A listed `Weak` keeps its context address from being reused.
+type ContextProbes<K> = std::sync::Mutex<Vec<(std::sync::Weak<Gpu>, K, bool)>>;
+
+/// The recorded answer for `gpu` and `key`, or the answer of `run`, recorded
+/// for later calls. Entries of dropped contexts are pruned first.
+fn qualified_once<K: Copy + PartialEq>(
+    probes: &ContextProbes<K>,
+    gpu: &Arc<Gpu>,
+    key: K,
+    run: impl FnOnce() -> bool,
+) -> bool {
+    let mut probes = probes.lock().unwrap();
+    probes.retain(|entry| entry.0.strong_count() != 0);
+    if let Some(entry) = probes
         .iter()
-        .find(|probe| std::ptr::eq(probe.0.as_ptr(), Arc::as_ptr(gpu)))
+        .find(|entry| std::ptr::eq(entry.0.as_ptr(), Arc::as_ptr(gpu)) && entry.1 == key)
     {
-        return probe.1;
+        return entry.2;
     }
-    let qualified = test_f16_subnormal_products(gpu);
-    probes.push((Arc::downgrade(gpu), qualified));
+    let qualified = run();
+    probes.push((Arc::downgrade(gpu), key, qualified));
     qualified
+}
+
+/// One dispatch of a MatMul-layout kernel on scratch buffers, run by a
+/// qualification probe.
+struct MatMulProbe<'a> {
+    /// Pipeline label.
+    pipeline: &'static str,
+    /// Command encoder and compute pass label.
+    pass: &'static str,
+    /// Labels of the A, B and C buffers.
+    buffers: [&'static str; 3],
+    /// Raw contents of A and B.
+    a: &'a [u8],
+    b: &'a [u8],
+    /// Initial value of every element of C, which holds `m * n` F32 values.
+    c_fill: f32,
+    params: MatMulParams,
+    groups: [u32; 3],
+}
+
+/// Compile `module`, run `probe` once and read C back. `None` if the shader
+/// is rejected, which is logged as "`kind` shader rejected".
+fn run_matmul_probe(
+    gpu: &Gpu,
+    module: crate::codegen::ShaderModule,
+    kind: &str,
+    probe: MatMulProbe<'_>,
+) -> Option<Vec<f32>> {
+    use blade_graphics as bg;
+
+    let shader = match create_gen_shader(gpu, module) {
+        Ok(shader) => shader,
+        Err(error) => {
+            log::warn!("{kind} shader rejected: {error}");
+            return None;
+        }
+    };
+    let layout = shader_data_layout(&ShaderEntry::MatMul);
+    let mut pipeline =
+        create_profiled_pipeline(gpu, probe.pipeline.to_string(), &layout, shader.at("main"));
+    let len = (probe.params.m * probe.params.n) as usize;
+    let buffer = |name, bytes: usize| {
+        gpu.create_buffer(bg::BufferDesc {
+            name,
+            size: bytes as u64,
+            memory: bg::Memory::Shared,
+        })
+    };
+    let a_buf = buffer(probe.buffers[0], probe.a.len());
+    let b_buf = buffer(probe.buffers[1], probe.b.len());
+    let c_buf = buffer(probe.buffers[2], len * 4);
+    // Shared memory can be uncached or write-combined for the host, which
+    // makes every read slow: fill the inputs, never read them back.
+    unsafe {
+        std::slice::from_raw_parts_mut(a_buf.data(), probe.a.len()).copy_from_slice(probe.a);
+        std::slice::from_raw_parts_mut(b_buf.data(), probe.b.len()).copy_from_slice(probe.b);
+        std::slice::from_raw_parts_mut(c_buf.data() as *mut f32, len).fill(probe.c_fill);
+    }
+    let mut encoder = gpu.create_command_encoder(bg::CommandEncoderDesc {
+        name: probe.pass,
+        buffer_count: 2,
+        manual_barriers: false,
+    });
+    encoder.start();
+    {
+        let mut pass = encoder.compute(probe.pass);
+        let mut pc = pass.with(&pipeline);
+        pc.bind(
+            0,
+            &MatMulData {
+                matrix_a: a_buf.at(0),
+                matrix_b: b_buf.at(0),
+                matrix_c: c_buf.at(0),
+                params: probe.params,
+            },
+        );
+        pc.dispatch(probe.groups);
+    }
+    let sync = gpu.submit(&mut encoder);
+    // A standalone scratch submission with no session behind it: nothing
+    // is profiling it, so do not ask for timestamps it may not collect.
+    let _ = wait_for_timed_encoder(gpu, &sync, &mut encoder, false);
+    let result = unsafe { std::slice::from_raw_parts(c_buf.data() as *const f32, len).to_vec() };
+    gpu.destroy_command_encoder(&mut encoder);
+    gpu.destroy_compute_pipeline(&mut pipeline);
+    gpu.destroy_buffer(a_buf);
+    gpu.destroy_buffer(b_buf);
+    gpu.destroy_buffer(c_buf);
+    Some(result)
 }
 
 /// One 32x32 output block over two K steps. A mixes subnormal (2^-15 and
@@ -1393,7 +1495,6 @@ fn f16_subnormal_probe() -> ([usize; 3], Vec<f32>, Vec<f32>, Vec<f32>) {
 
 fn test_f16_subnormal_products(gpu: &Gpu) -> bool {
     use crate::codegen::{MatrixTypes, ShaderGroup};
-    use blade_graphics as bg;
 
     let Some(shape) = crate::codegen::checked_cooperative_shape(
         &gpu.capabilities().cooperative_matrix.f16_f32_shapes,
@@ -1412,20 +1513,6 @@ fn test_f16_subnormal_products(gpu: &Gpu) -> bool {
             [m as u32, n as u32, k as u32],
         ),
     );
-    let shader = match create_gen_shader(gpu, module) {
-        Ok(shader) => shader,
-        Err(error) => {
-            log::warn!("typed F16 matmul shader rejected: {error}");
-            return false;
-        }
-    };
-    let layout = shader_data_layout(&ShaderEntry::MatMul);
-    let mut pipeline = create_profiled_pipeline(
-        gpu,
-        "typed_f16_probe".to_string(),
-        &layout,
-        shader.at("main"),
-    );
     let half = |values: &[f32]| -> Vec<u16> {
         values
             .iter()
@@ -1433,58 +1520,26 @@ fn test_f16_subnormal_products(gpu: &Gpu) -> bool {
             .collect()
     };
     let (a, b) = (half(&a), half(&b));
-    let buffer = |name, bytes: usize| {
-        gpu.create_buffer(bg::BufferDesc {
-            name,
-            size: bytes as u64,
-            memory: bg::Memory::Shared,
-        })
+    let probe = MatMulProbe {
+        pipeline: "typed_f16_probe",
+        pass: "typed_f16_probe",
+        buffers: ["typed_probe_a", "typed_probe_b", "typed_probe_c"],
+        a: bytemuck::cast_slice(&a),
+        b: bytemuck::cast_slice(&b),
+        // NaN outputs expose a kernel that did not store.
+        c_fill: f32::NAN,
+        // The fourth word is the K partition count.
+        params: MatMulParams {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            _pad: 1,
+        },
+        groups: [1, 1, 1],
     };
-    let a_buf = buffer("typed_probe_a", a.len() * 2);
-    let b_buf = buffer("typed_probe_b", b.len() * 2);
-    let c_buf = buffer("typed_probe_c", m * n * 4);
-    // Shared memory can be uncached for the host: fill the inputs, never read
-    // them back. NaN outputs expose a kernel that did not store.
-    unsafe {
-        std::slice::from_raw_parts_mut(a_buf.data() as *mut u16, a.len()).copy_from_slice(&a);
-        std::slice::from_raw_parts_mut(b_buf.data() as *mut u16, b.len()).copy_from_slice(&b);
-        std::slice::from_raw_parts_mut(c_buf.data() as *mut f32, m * n).fill(f32::NAN);
-    }
-    let mut encoder = gpu.create_command_encoder(bg::CommandEncoderDesc {
-        name: "typed_f16_probe",
-        buffer_count: 2,
-        manual_barriers: false,
-    });
-    encoder.start();
-    {
-        let mut pass = encoder.compute("typed_f16_probe");
-        let mut pc = pass.with(&pipeline);
-        pc.bind(
-            0,
-            &MatMulData {
-                matrix_a: a_buf.at(0),
-                matrix_b: b_buf.at(0),
-                matrix_c: c_buf.at(0),
-                // The fourth word is the K partition count.
-                params: MatMulParams {
-                    m: m as u32,
-                    n: n as u32,
-                    k: k as u32,
-                    _pad: 1,
-                },
-            },
-        );
-        pc.dispatch([1, 1, 1]);
-    }
-    let sync = gpu.submit(&mut encoder);
-    // A standalone scratch submission: nothing profiles it.
-    let _ = wait_for_timed_encoder(gpu, &sync, &mut encoder, false);
-    let result = unsafe { std::slice::from_raw_parts(c_buf.data() as *const f32, m * n).to_vec() };
-    gpu.destroy_command_encoder(&mut encoder);
-    gpu.destroy_compute_pipeline(&mut pipeline);
-    gpu.destroy_buffer(a_buf);
-    gpu.destroy_buffer(b_buf);
-    gpu.destroy_buffer(c_buf);
+    let Some(result) = run_matmul_probe(gpu, module, "typed F16 matmul", probe) else {
+        return false;
+    };
     let qualified = result == expected;
     if !qualified {
         log::warn!(
@@ -3873,20 +3928,11 @@ impl Session {
     /// The test compiles and runs a kernel, and its answer does not change
     /// for a context, so later sessions on it reuse the result.
     fn coop_matmul_qualified(gpu: &Arc<Gpu>, config: &crate::codegen::CoopConfig) -> bool {
-        // A listed `Weak` keeps its context address from being reused.
-        type Probe = (std::sync::Weak<Gpu>, crate::codegen::CoopConfig, bool);
-        static PROBES: std::sync::Mutex<Vec<Probe>> = std::sync::Mutex::new(Vec::new());
-        let mut probes = PROBES.lock().unwrap();
-        probes.retain(|probe| probe.0.strong_count() != 0);
-        if let Some(probe) = probes
-            .iter()
-            .find(|probe| std::ptr::eq(probe.0.as_ptr(), Arc::as_ptr(gpu)) && probe.1 == *config)
-        {
-            return probe.2;
-        }
-        let qualified = Self::test_coop_matmul(gpu, config);
-        probes.push((Arc::downgrade(gpu), *config, qualified));
-        qualified
+        static PROBES: ContextProbes<crate::codegen::CoopConfig> =
+            std::sync::Mutex::new(Vec::new());
+        qualified_once(&PROBES, gpu, *config, || {
+            Self::test_coop_matmul(gpu, config)
+        })
     }
 
     /// Run a tiny cooperative matmul and check the result.
@@ -3895,20 +3941,8 @@ impl Session {
     /// the specific f32 matrix shapes).
     fn test_coop_matmul(gpu: &Gpu, config: &crate::codegen::CoopConfig) -> bool {
         use crate::codegen::ShaderGroup;
-        use blade_graphics as bg;
 
         let sm = crate::codegen::generate_module_coop(ShaderGroup::MatMul, config);
-        let shader = match create_gen_shader(gpu, sm) {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!("cooperative matmul shader rejected: {}", e);
-                return false;
-            }
-        };
-        let layout = shader_data_layout(&ShaderEntry::MatMul);
-        let mut pipeline =
-            create_profiled_pipeline(gpu, "coop_probe".to_string(), &layout, shader.at("main"));
-
         // Test with a multi-tile matmul using varying values. A uniform
         // pattern like A[i,j]=i+1, B[i,j]=j+1 misses bugs where the shader
         // loses index dependence (e.g. coop-load layout mismatches that
@@ -3917,24 +3951,6 @@ impl Session {
         let m: usize = ot * 2; // 2 row tiles
         let inner: usize = ot * 2; // 2 K-tiles (exercises K-loop accumulation)
         let n_out: usize = ot * 2; // 2 column tiles
-        let a_size = (m * inner * 4) as u64;
-        let b_size = (inner * n_out * 4) as u64;
-        let c_size = (m * n_out * 4) as u64;
-        let a_buf = gpu.create_buffer(bg::BufferDesc {
-            name: "test_a",
-            size: a_size,
-            memory: bg::Memory::Shared,
-        });
-        let b_buf = gpu.create_buffer(bg::BufferDesc {
-            name: "test_b",
-            size: b_size,
-            memory: bg::Memory::Shared,
-        });
-        let c_buf = gpu.create_buffer(bg::BufferDesc {
-            name: "test_c",
-            size: c_size,
-            memory: bg::Memory::Shared,
-        });
         // Deterministic varying values that depend on both row and column.
         // Keep magnitudes modest so f16 coop paths don't overflow.
         let fill =
@@ -3955,53 +3971,25 @@ impl Session {
                 expected[i * n_out + j] = acc;
             }
         }
-        // Shared memory can be uncached or write-combined for the host, which
-        // makes every read slow: fill it, never read it back on the CPU.
-        unsafe {
-            std::slice::from_raw_parts_mut(a_buf.data() as *mut f32, a.len()).copy_from_slice(&a);
-            std::slice::from_raw_parts_mut(b_buf.data() as *mut f32, b.len()).copy_from_slice(&b);
-            std::slice::from_raw_parts_mut(c_buf.data() as *mut f32, m * n_out).fill(0.0);
-        }
-
-        let mut encoder = gpu.create_command_encoder(bg::CommandEncoderDesc {
-            name: "coop_test",
-            buffer_count: 2,
-            manual_barriers: false,
-        });
-        encoder.start();
-        {
-            let mut pass = encoder.compute("coop_test");
-            let mut pc = pass.with(&pipeline);
-            let ot = config.matmul_output_tile();
-            pc.bind(
-                0,
-                &MatMulData {
-                    matrix_a: a_buf.at(0),
-                    matrix_b: b_buf.at(0),
-                    matrix_c: c_buf.at(0),
-                    params: MatMulParams {
-                        m: m as u32,
-                        n: n_out as u32,
-                        k: inner as u32,
-                        _pad: 0,
-                    },
-                },
-            );
-            pc.dispatch([(m as u32).div_ceil(ot), (n_out as u32).div_ceil(ot), 1]);
-        }
-        let sp = gpu.submit(&mut encoder);
-        // A standalone scratch submission with no session behind it: nothing
-        // is profiling it, so do not ask for timestamps it may not collect.
-        let _ = wait_for_timed_encoder(gpu, &sp, &mut encoder, false);
-
-        let result =
-            unsafe { std::slice::from_raw_parts(c_buf.data() as *const f32, m * n_out).to_vec() };
-
-        gpu.destroy_command_encoder(&mut encoder);
-        gpu.destroy_compute_pipeline(&mut pipeline);
-        gpu.destroy_buffer(a_buf);
-        gpu.destroy_buffer(b_buf);
-        gpu.destroy_buffer(c_buf);
+        let tile = config.matmul_output_tile();
+        let probe = MatMulProbe {
+            pipeline: "coop_probe",
+            pass: "coop_test",
+            buffers: ["test_a", "test_b", "test_c"],
+            a: bytemuck::cast_slice(&a),
+            b: bytemuck::cast_slice(&b),
+            c_fill: 0.0,
+            params: MatMulParams {
+                m: m as u32,
+                n: n_out as u32,
+                k: inner as u32,
+                _pad: 0,
+            },
+            groups: [(m as u32).div_ceil(tile), (n_out as u32).div_ceil(tile), 1],
+        };
+        let Some(result) = run_matmul_probe(gpu, sm, "cooperative matmul", probe) else {
+            return false;
+        };
 
         // Compare against CPU-computed reference. f16 coop paths accumulate
         // in f32 but the inputs are truncated, so leave ~5% slack per term.
