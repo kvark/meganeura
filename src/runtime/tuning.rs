@@ -811,48 +811,24 @@ impl Session {
     }
 
     /// Search scalar and cooperative matrix tiles, typed K partitions, scalar
-    /// convolution/GEMV shapes, and cached-attention split counts. Matrix
-    /// candidates retain the incumbent's storage and multiplication precision.
-    /// Occupancy/large-shape thresholds only
-    /// choose the starting implementation; they do not remove challengers.
+    /// convolution and GEMV shapes, and cached-attention split counts.
+    /// Candidates keep the incumbent's storage and multiplication precision;
+    /// overlapping bindings and unsupported prologues, epilogues or packs are
+    /// excluded. Split products are tuned together with their SumRows.
     ///
-    /// Each class uses private scratch with matching memory placement and two
-    /// deterministic nonzero input patterns (including tiny f32 operands).
-    /// Both candidates must agree elementwise and unpacked matrices must also
-    /// match sampled f64 reference dots with operands rounded to the selected
-    /// multiplication type. Reference checks use maximum and
-    /// relative L2 bounds across samples to handle cancellation in long sums.
-    /// Sequential tuning qualifies every pair before timing; races time first
-    /// and qualify only finalists. A split product runs with its SumRows and
-    /// keeps them: candidates vary its tile shape and its
-    /// partition count within the allocated partials, and agree within a bound
-    /// that follows the largest output, since partitions reorder the sum.
-    /// The result is an isolated-kernel choice, not an end-to-end speed claim.
-    /// Interactions between dispatches can make the complete program slower
-    /// even when every installed kernel wins in isolation. Use
-    /// [`crate::train::build_measured`] to retain an untuned fallback and require
-    /// whole-program qualification and paired timing, including for memo reuse.
+    /// Each class runs in private scratch with matching memory placement, so
+    /// no live tensor, optimizer or KV state is read or written. Candidates
+    /// must agree with the incumbent, and unpacked matrices with sampled f64
+    /// reference dots, on two deterministic input patterns. Sequential tuning
+    /// qualifies every pair before timing it against the latest winner; races
+    /// time all candidates against the original incumbent in shared rounds
+    /// and qualify only finalists.
     ///
-    /// Forward MatMul+Add and unpacked NCHW scalar convolution forward/dX/dW are supported;
-    /// convolution keys include batch, channels, spatial extents, kernel, stride
-    /// and padding. Index decomposition uses exact integer arithmetic.
-    /// Cooperative convolutions remain excluded.
-    /// Scalar tile and GEMV width/reduction candidates include reduced-storage weights.
-    /// Other prologues/epilogues, horizontal packs, packed cooperative weights
-    /// and overlapping-binding dispatches are excluded. Workgroup tiles need
-    /// complete tiles and advertised dimension, invocation and memory support;
-    /// unsupported shapes keep their existing subgroup or scalar path.
-    /// Winners live in this session, not the plan cache.
-    /// No live graph execution occurs, including with optimizers or external buffers.
-    /// Cooperative padding must fit each binding's declared size; the live
-    /// matrix bindings are never resized. Structural choices are made by
-    /// `build_measured` before allocation. Sequential challenger
-    /// comparisons per class reuse the latest fully qualified winner as the
-    /// incumbent. Races compare against the class's original incumbent in
-    /// shared forward/reverse rounds, using GPU timestamps when enabled.
-    /// A soft deadline may be exceeded by in-flight operations (including up
-    /// to eight parallel pipeline compilations);
-    /// an incomplete comparison always retains its incumbent.
+    /// The winners are isolated-kernel choices held by this session, not the
+    /// plan cache, and not an end-to-end speed claim: use
+    /// [`crate::train::build_measured`] for whole-program qualification and
+    /// paired timing. `max_time` is a soft deadline; an incomplete comparison
+    /// always retains its incumbent.
     pub fn tune_with(&mut self, options: TuneOptions) -> Result<TuneReport, TuneError> {
         self.tune_with_memo(options, None)
     }
@@ -891,14 +867,10 @@ impl Session {
 
     /// Whether tuning can probe or reuse any eligible kernel choices.
     pub(crate) fn has_tunable_kernels(&self, options: &TuneOptions) -> bool {
+        // Every retained class has a challenger.
         !options.max_time.is_zero()
             && options.max_classes != 0
-            && self
-                .tune_classes(options)
-                .0
-                .iter()
-                .take(options.max_classes)
-                .any(|class| !class.challengers.is_empty())
+            && !self.tune_classes(options).0.is_empty()
     }
 
     /// Whether [`Self::tune_with_memo`] under `options` would measure a
