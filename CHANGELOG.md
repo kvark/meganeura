@@ -24,9 +24,9 @@
   a bounded machine profile per context to order classes and skip a predicted
   negligible tail. Host races retain an encoder per candidate to avoid
   descriptor-cache churn; finalist selection respects the improvement/noise
-  guard instead of ranking insignificant differences. Historical reports keep
-  their sequential, uncalibrated policy. Cached winners no longer consume probe slots;
-  memory limits, invalid timings and interrupted races remain retryable.
+  guard instead of ranking insignificant differences. Cached winners no
+  longer consume probe slots; memory limits, invalid timings and interrupted
+  races remain retryable.
   Comparison scratch limits cover bindings and staging; encoder
   uniform-buffer allowances are reserved on top against device headroom, so a
   class whose buffers fit the default 64 MiB (a 2048³ f32 product) is still

@@ -34,13 +34,13 @@ fn run_case(
     labels: [&str; 2],
     options: &[TuneOptions; 2],
 ) -> Result<Value, Box<dyn Error>> {
-    let (shared, shared_build) = make_session(case, gpu, CoopPolicy::Disabled);
-    let (download, download_build) = make_session(case, gpu, CoopPolicy::Disabled);
-    let mut sessions = [shared, download];
+    let (first, first_build) = make_session(case, gpu, CoopPolicy::Disabled);
+    let (second, second_build) = make_session(case, gpu, CoopPolicy::Disabled);
+    let mut sessions = [first, second];
     let keys = sessions[0].dispatch_pipeline_keys();
     assert_eq!(keys, sessions[1].dispatch_pipeline_keys());
     let mut record = json!({"name": case.name, "work": case.work, "description": case.description,
-        "status": "running", "build": [shared_build, download_build], "host_start": host_sample(),
+        "status": "running", "build": [first_build, second_build], "host_start": host_sample(),
         "initial_pipeline_keys": keys, "search_order": search_order(seed, case_index),
         "searches": [null, null], "loss_trajectory": []});
     for _ in 0..PREFIX {
@@ -83,8 +83,7 @@ fn run_case(
             Ok(value) => serde_json::to_value(value)?,
             Err(error) => json!({"error": error}),
         };
-        record["searches"][index] = json!({"arm": labels[index], "staging": report.options.staging,
-            "staging_reuse": report.options.staging_reuse, "host_start": host,
+        record["searches"][index] = json!({"arm": labels[index], "host_start": host,
             "started_unix_ms": started, "finished_unix_ms": finished, "report": report,
             "state_comparison": comparison, "cost_ms": search_costs,
             "selected_pipeline_keys": session.dispatch_pipeline_keys(),
@@ -180,7 +179,7 @@ pub fn run(
             "runtime_options": format!("{:?}", runtime_options(CoopPolicy::Disabled)), "optimize": meganeura::optimize::OptimizeConfig::default(),
             "prefix": PREFIX, "middle": MIDDLE, "final": FINAL,
             "arms": labels, "search_options": options,
-            "contract": "strict f32; private staging policy only; full ordinary/tiny qualification unchanged; no whole-step speed claim",
+            "contract": "strict f32; private tuning options only; full ordinary/tiny qualification unchanged; no whole-step speed claim",
             "nvidia_smi_before": before, "rustflags": std::env::var("RUSTFLAGS").ok(),
             "optimizer": {"adam_lr": 1e-4, "beta1": 0.9, "beta2": 0.999, "epsilon": 1e-8, "clip_norm": 1.0, "clip_every": 1, "accumulation": false, "decay": 0.0}}, "cases": []});
     write_record(&mut output, &document)?;

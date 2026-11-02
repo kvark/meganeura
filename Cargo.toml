@@ -288,8 +288,3 @@ required-features = ["models"]
 name = "tune_readback"
 path = "examples/tune_readback.rs"
 required-features = ["models"]
-
-[[example]]
-name = "tune_staging_reuse"
-path = "examples/tune_staging_reuse.rs"
-required-features = ["models"]

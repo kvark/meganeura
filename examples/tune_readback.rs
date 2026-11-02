@@ -1,18 +1,17 @@
-//! Shared versus read-optimized private staging; original fresh-buffer policy.
+//! Readback and preparation phase costs of the fixed private staging, as a
+//! matched control: both arms search with identical options.
 #[path = "support/tuning_diagnostic.rs"]
 mod diagnostic;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use meganeura::{TuneOptions, TuneStaging, TuneStagingReuse};
+    let options = meganeura::TuneOptions {
+        scope: meganeura::TuneScope::Dense,
+        max_time: std::time::Duration::from_secs(10),
+        ..Default::default()
+    };
     diagnostic::run(
-        "readback-2026-09-06",
-        ["shared", "download"],
-        [TuneStaging::Shared, TuneStaging::Download].map(|staging| TuneOptions {
-            scope: meganeura::TuneScope::Dense,
-            staging,
-            staging_reuse: TuneStagingReuse::Fresh,
-            max_time: std::time::Duration::from_secs(10),
-            ..Default::default()
-        }),
+        "readback-control",
+        ["first", "second"],
+        [options.clone(), options],
     )
 }
