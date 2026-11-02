@@ -860,6 +860,115 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// A dense product `A·B`, `Aᵀ·B` or `A·Bᵀ`, optionally plus `D`: the
+    /// 64-wide tiled kernel, or the GEMV or unit-constant specialization its
+    /// layout admits.
+    fn emit_dense_matmul(&mut self, node: &Node, out_buf: BufferRef) {
+        use crate::kernels::matmul::Layout;
+        let layout = match node.op {
+            Op::MatMul => Layout::Plain,
+            Op::FusedMatMulAdd => Layout::PlainAdd,
+            Op::MatMulAT => Layout::TransposedA,
+            Op::FusedMatMulATAdd => Layout::TransposedAAdd,
+            Op::MatMulBT => Layout::TransposedB,
+            Op::FusedMatMulBTAdd => Layout::TransposedBAdd,
+            _ => unreachable!("{:?} is not a dense product", node.op),
+        };
+        let a = self.get_buffer(node.inputs[0]);
+        let mut input_buffers = vec![a, self.get_buffer(node.inputs[1])];
+        if layout.has_addend() {
+            input_buffers.push(self.get_buffer(node.inputs[2]));
+        }
+        let wf = WeightFormat::from_dtype(self.graph.node(node.inputs[1]).ty.dtype);
+        let plain = matches!(layout, Layout::Plain | Layout::PlainAdd);
+        let transposed_b = matches!(layout, Layout::TransposedB | Layout::TransposedBAdd);
+        // Block-quantized weights pack along the parameter's first
+        // dimension, which is N for a transposed B, while every packed
+        // decoder indexes along K. There is no correct reading of a block
+        // format on this op, so refuse at compile time rather than emit a
+        // kernel that returns plausible numbers. Graph rewrites can fuse
+        // `Add(MatMulBT, ?)` before compile, so the addend form checks too.
+        // f16 is unaffected: it is an elementwise cast at the same index,
+        // not a block layout.
+        assert!(
+            !(transposed_b && wf.is_quantized()),
+            "matmul_bt does not support block-quantized weights: their blocks \
+             run along the parameter's first dimension, which is N here, not K"
+        );
+        let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
+        let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
+        let [m, k, n] = match layout {
+            Layout::Plain | Layout::PlainAdd => [a_shape[0], a_shape[1], b_shape[1]],
+            // A is [K, M] and B is [K, N].
+            Layout::TransposedA | Layout::TransposedAAdd => [a_shape[1], a_shape[0], b_shape[1]],
+            // A is [M, K] and B is [N, K].
+            Layout::TransposedB | Layout::TransposedBAdd => [a_shape[0], a_shape[1], b_shape[0]],
+        }
+        .map(|dimension| dimension as u32);
+        if layout == Layout::Plain && n == 1 && k <= 32 && self.is_f32_unit_constant(node.inputs[1])
+        {
+            // A narrow multiplication by an all-ones column is a
+            // scalar-order row sum. Keep MatMul in the graph so its
+            // autodiff topology and accumulation order are unchanged;
+            // specialize only the physical forward dispatch.
+            self.emit_sum_inner(a, out_buf, m, k);
+            return;
+        }
+        if layout == Layout::TransposedB && k == 1 && self.is_f32_unit_constant(node.inputs[1]) {
+            // MatMul's input gradient against a unit column is an
+            // exact row broadcast. Preserve the MatMulBT graph node
+            // and its dependency order while avoiding tiled GEMM.
+            self.emit_broadcast_inner(a, out_buf, m, n);
+            return;
+        }
+        // K-split GEMVs. The forward ones may group adjacent output vec4s
+        // within a workgroup for contiguous weight reads; the transposed
+        // ones only ever see f32 and f16, since the assert above turned
+        // every block format away.
+        let gemv = m == 1
+            && match layout {
+                Layout::Plain | Layout::PlainAdd => n.is_multiple_of(4),
+                Layout::TransposedB | Layout::TransposedBAdd => k.is_multiple_of(4),
+                Layout::TransposedA | Layout::TransposedAAdd => false,
+            };
+        let shader = match (layout, gemv) {
+            (Layout::Plain, false) => ShaderEntry::MatMul,
+            (Layout::Plain, true) => ShaderEntry::MatMulGemv,
+            (Layout::PlainAdd, false) => ShaderEntry::FusedMatMulAdd,
+            (Layout::PlainAdd, true) => ShaderEntry::MatMulGemvAdd,
+            (Layout::TransposedA, _) => ShaderEntry::MatMulAT,
+            (Layout::TransposedAAdd, _) => ShaderEntry::FusedMatMulATAdd,
+            (Layout::TransposedB, false) => ShaderEntry::MatMulBT,
+            (Layout::TransposedB, true) => ShaderEntry::MatMulGemvBT,
+            (Layout::TransposedBAdd, false) => ShaderEntry::FusedMatMulBTAdd,
+            (Layout::TransposedBAdd, true) => ShaderEntry::MatMulGemvBTAdd,
+        };
+        let mut dispatch = Dispatch {
+            shader,
+            input_buffers,
+            output_buffer: out_buf,
+            params: if plain {
+                vec![m, k, n, 0]
+            } else {
+                vec![m, n, k, 0]
+            },
+            weight_format: wf,
+            ..Default::default()
+        };
+        dispatch.workgroups = if !gemv {
+            matmul_workgroups(m, n, 64)
+        } else {
+            let group = dispatch.shader.shader_group();
+            dispatch.kernel = self.options.gemv_kernel(group, wf, self.coop_caps, n);
+            if plain {
+                gemv_workgroups(n, dispatch.gemv_shape().unwrap())
+            } else {
+                row_gemv_workgroups(n.div_ceil(self.options.gemv_shape.map_or(1, |s| s.bt_rows)))
+            }
+        };
+        self.plan.dispatches.push(dispatch);
+    }
+
     pub(super) fn compile_node(&mut self, node: &Node) {
         let out_buf = self.get_buffer(node.id);
         let dispatch_start = self.plan.dispatches.len();
@@ -973,145 +1082,12 @@ impl<'a> Compiler<'a> {
                 });
             }
 
-            Op::MatMul => {
-                let a = self.get_buffer(node.inputs[0]);
-                let b = self.get_buffer(node.inputs[1]);
-                let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
-                let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
-                let wf = WeightFormat::from_dtype(self.graph.node(node.inputs[1]).ty.dtype);
-                let m = a_shape[0] as u32;
-                let k = a_shape[1] as u32;
-                let n = b_shape[1] as u32;
-                if n == 1 && k <= 32 && self.is_f32_unit_constant(node.inputs[1]) {
-                    // A narrow multiplication by an all-ones column is a
-                    // scalar-order row sum. Keep MatMul in the graph so its
-                    // autodiff topology and accumulation order are unchanged;
-                    // specialize only the physical forward dispatch.
-                    self.emit_sum_inner(a, out_buf, m, k);
-                } else if m == 1 && n.is_multiple_of(4) {
-                    // K-split GEMV, optionally grouping adjacent output vec4s
-                    // within a workgroup for contiguous weight reads.
-                    let mut dispatch = Dispatch {
-                        shader: ShaderEntry::MatMulGemv,
-                        input_buffers: vec![a, b],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![m, k, n, 0],
-
-                        weight_format: wf,
-                        kernel: self.options.gemv_kernel(
-                            ShaderGroup::MatMulGemv,
-                            wf,
-                            self.coop_caps,
-                            n,
-                        ),
-                        ..Default::default()
-                    };
-                    dispatch.workgroups = gemv_workgroups(n, dispatch.gemv_shape().unwrap());
-                    self.plan.dispatches.push(dispatch);
-                } else {
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::MatMul,
-                        workgroups: matmul_workgroups(m, n, 64),
-                        input_buffers: vec![a, b],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![m, k, n, 0],
-
-                        weight_format: wf,
-                        ..Default::default()
-                    });
-                }
-            }
-
-            Op::MatMulAT => {
-                // C = A^T @ B  (A is [K, M], B is [K, N], C is [M, N])
-                let a = self.get_buffer(node.inputs[0]);
-                let b = self.get_buffer(node.inputs[1]);
-                let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
-                let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
-                let wf = WeightFormat::from_dtype(self.graph.node(node.inputs[1]).ty.dtype);
-                let k = a_shape[0] as u32; // A is [K, M]
-                let m = a_shape[1] as u32;
-                let n = b_shape[1] as u32; // B is [K, N]
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::MatMulAT,
-                    workgroups: matmul_workgroups(m, n, 64),
-                    input_buffers: vec![a, b],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![m, n, k, 0],
-
-                    weight_format: wf,
-                    ..Default::default()
-                });
-            }
-
-            Op::MatMulBT => {
-                // C = A @ B^T  (A is [M, K], B is [N, K], C is [M, N])
-                let a = self.get_buffer(node.inputs[0]);
-                let b = self.get_buffer(node.inputs[1]);
-                // Block-quantized weights pack along the parameter's first
-                // dimension, which is N for a transposed B, while every
-                // packed decoder indexes along K. There is no correct
-                // reading of a block format on this op, so refuse at
-                // compile time rather than emit a kernel that returns
-                // plausible numbers. f16 is unaffected: it is an
-                // elementwise cast at the same index, not a block layout.
-                assert!(
-                    !WeightFormat::from_dtype(self.graph.node(node.inputs[1]).ty.dtype)
-                        .is_quantized(),
-                    "matmul_bt does not support block-quantized weights: their blocks \
-                     run along the parameter's first dimension, which is N here, not K"
-                );
-                let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
-                let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
-                let wf = WeightFormat::from_dtype(self.graph.node(node.inputs[1]).ty.dtype);
-                let m = a_shape[0] as u32; // A is [M, K]
-                let k = a_shape[1] as u32;
-                let n = b_shape[0] as u32; // B is [N, K]
-                if k == 1 && self.is_f32_unit_constant(node.inputs[1]) {
-                    // MatMul's input gradient against a unit column is an
-                    // exact row broadcast. Preserve the MatMulBT graph node
-                    // and its dependency order while avoiding tiled GEMM.
-                    self.emit_broadcast_inner(a, out_buf, m, n);
-                } else if m == 1 && k.is_multiple_of(4) {
-                    // Only f32 and f16 reach here; the assert above turned
-                    // every block format away, so the K-split GEMV-BT never
-                    // sees packed data.
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::MatMulGemvBT,
-                        workgroups: row_gemv_workgroups(
-                            n.div_ceil(self.options.gemv_shape.map_or(1, |s| s.bt_rows)),
-                        ),
-                        input_buffers: vec![a, b],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![m, n, k, 0],
-
-                        weight_format: wf,
-                        kernel: self.options.gemv_kernel(
-                            ShaderGroup::MatMulGemvBT,
-                            wf,
-                            self.coop_caps,
-                            n,
-                        ),
-                        ..Default::default()
-                    });
-                } else {
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::MatMulBT,
-                        workgroups: matmul_workgroups(m, n, 64),
-                        input_buffers: vec![a, b],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![m, n, k, 0],
-
-                        weight_format: wf,
-                        ..Default::default()
-                    });
-                }
-            }
+            Op::MatMul
+            | Op::MatMulAT
+            | Op::MatMulBT
+            | Op::FusedMatMulAdd
+            | Op::FusedMatMulATAdd
+            | Op::FusedMatMulBTAdd => self.emit_dense_matmul(node, out_buf),
 
             Op::BlockMatMul
             | Op::BlockMatMulAT { .. }
@@ -1202,129 +1178,6 @@ impl<'a> Compiler<'a> {
                     params: vec![m, n, k, groups],
                     kernel: if small {
                         Kernel::SmallTile
-                    } else {
-                        Kernel::Default
-                    },
-                    ..Default::default()
-                });
-            }
-
-            Op::FusedMatMulAdd => {
-                // C = A × B + D (inputs: [a, b, d])
-                let a = self.get_buffer(node.inputs[0]);
-                let b = self.get_buffer(node.inputs[1]);
-                let d = self.get_buffer(node.inputs[2]);
-                let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
-                let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
-                let wf = WeightFormat::from_dtype(self.graph.node(node.inputs[1]).ty.dtype);
-                let m = a_shape[0] as u32;
-                let k = a_shape[1] as u32;
-                let n = b_shape[1] as u32;
-                if m == 1 && n.is_multiple_of(4) {
-                    let mut dispatch = Dispatch {
-                        shader: ShaderEntry::MatMulGemvAdd,
-                        input_buffers: vec![a, b, d],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![m, k, n, 0],
-
-                        weight_format: wf,
-                        kernel: self.options.gemv_kernel(
-                            ShaderGroup::MatMulGemvAdd,
-                            wf,
-                            self.coop_caps,
-                            n,
-                        ),
-                        ..Default::default()
-                    };
-                    dispatch.workgroups = gemv_workgroups(n, dispatch.gemv_shape().unwrap());
-                    self.plan.dispatches.push(dispatch);
-                } else {
-                    self.plan.dispatches.push(Dispatch {
-                        shader: ShaderEntry::FusedMatMulAdd,
-                        workgroups: matmul_workgroups(m, n, 64),
-                        input_buffers: vec![a, b, d],
-                        output_buffer: out_buf,
-                        extra_outputs: vec![],
-                        params: vec![m, k, n, 0],
-
-                        weight_format: wf,
-                        ..Default::default()
-                    });
-                }
-            }
-
-            Op::FusedMatMulATAdd => {
-                // C = A^T × B + D (inputs: [a, b, d])
-                let a = self.get_buffer(node.inputs[0]);
-                let b = self.get_buffer(node.inputs[1]);
-                let d = self.get_buffer(node.inputs[2]);
-                let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
-                let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
-                let wf = WeightFormat::from_dtype(self.graph.node(node.inputs[1]).ty.dtype);
-                let k = a_shape[0] as u32;
-                let m = a_shape[1] as u32;
-                let n = b_shape[1] as u32;
-                self.plan.dispatches.push(Dispatch {
-                    shader: ShaderEntry::FusedMatMulATAdd,
-                    workgroups: matmul_workgroups(m, n, 64),
-                    input_buffers: vec![a, b, d],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![m, n, k, 0],
-
-                    weight_format: wf,
-                    ..Default::default()
-                });
-            }
-
-            Op::FusedMatMulBTAdd => {
-                // C = A × B^T + D (inputs: [a, b, d])
-                let a = self.get_buffer(node.inputs[0]);
-                let b = self.get_buffer(node.inputs[1]);
-                let d = self.get_buffer(node.inputs[2]);
-                // Same block-axis mismatch as `Op::MatMulBT`. Graph rewrites
-                // can fuse `Add(MatMulBT, ?)` into this op before compile,
-                // so the unfused assert would never see a quantized B.
-                assert!(
-                    !WeightFormat::from_dtype(self.graph.node(node.inputs[1]).ty.dtype)
-                        .is_quantized(),
-                    "matmul_bt does not support block-quantized weights: their blocks \
-                     run along the parameter's first dimension, which is N here, not K"
-                );
-                let a_shape = &self.graph.node(node.inputs[0]).ty.shape;
-                let b_shape = &self.graph.node(node.inputs[1]).ty.shape;
-                let wf = WeightFormat::from_dtype(self.graph.node(node.inputs[1]).ty.dtype);
-                let m = a_shape[0] as u32;
-                let k = a_shape[1] as u32;
-                let n = b_shape[0] as u32;
-                let gemv = m == 1 && k.is_multiple_of(4);
-                self.plan.dispatches.push(Dispatch {
-                    shader: if gemv {
-                        ShaderEntry::MatMulGemvBTAdd
-                    } else {
-                        ShaderEntry::FusedMatMulBTAdd
-                    },
-                    workgroups: if gemv {
-                        row_gemv_workgroups(
-                            n.div_ceil(self.options.gemv_shape.map_or(1, |s| s.bt_rows)),
-                        )
-                    } else {
-                        matmul_workgroups(m, n, 64)
-                    },
-                    input_buffers: vec![a, b, d],
-                    output_buffer: out_buf,
-                    extra_outputs: vec![],
-                    params: vec![m, n, k, 0],
-
-                    weight_format: wf,
-                    kernel: if gemv {
-                        self.options.gemv_kernel(
-                            ShaderGroup::MatMulGemvBTAdd,
-                            wf,
-                            self.coop_caps,
-                            n,
-                        )
                     } else {
                         Kernel::Default
                     },
