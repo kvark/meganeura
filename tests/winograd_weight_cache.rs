@@ -129,3 +129,22 @@ fn shared_weights_changed_by_the_donor_are_transformed_again() {
         "donor",
     );
 }
+
+#[test]
+fn blended_weights_are_transformed_again() {
+    let (mut target, mut source, mut direct) = (session(false), session(false), session(true));
+    target.set_parameter("w", &weights(1));
+    source.set_parameter("w", &weights(2));
+    direct.set_parameter("w", &weights(2));
+    // The target keeps the transform of its first weights.
+    run(&mut target, &input(1));
+    // A full blend replaces the weights on the GPU, without a host write.
+    target
+        .blend_parameters_from(&mut source, &["w"], 1.0)
+        .unwrap();
+    assert_close(
+        &run(&mut target, &input(1)),
+        &run(&mut direct, &input(1)),
+        "blend",
+    );
+}
