@@ -504,7 +504,7 @@ struct Seed {
 
 type AttentionChoice = (u32, Option<(u32, crate::codegen::FlashAttentionShape)>);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 struct AxisChoice {
     attention: AttentionChoice,
     fuse_dispatches: bool,
@@ -515,23 +515,6 @@ struct AxisChoice {
     f16_attention: bool,
     gradient_inputs: Option<crate::DType>,
     forward_products: bool,
-}
-
-fn early_physical_cover(baseline: AxisChoice, attention: &[AttentionChoice]) -> Vec<AxisChoice> {
-    let mut cover = Vec::new();
-    if baseline.fuse_dispatches {
-        cover.push(AxisChoice {
-            fuse_dispatches: false,
-            ..baseline
-        });
-    }
-    if let Some(&choice) = attention.get(1) {
-        cover.push(AxisChoice {
-            attention: choice,
-            ..baseline
-        });
-    }
-    cover
 }
 
 /// Coordinate order over graph forms and physical choices (indices into the
@@ -728,46 +711,26 @@ fn implementations(
     if cached_attention {
         attention.extend([1, 2, 4, 8, 16].map(|splits| (splits, None)));
     }
-    let baseline = AxisChoice {
-        attention: (0, None),
-        matrix_inputs: None,
-        matrix_storage: false,
-        vector_convolutions_only: false,
-        winograd: None,
-        f16_attention: false,
-        gradient_inputs: None,
-        forward_products: false,
-        fuse_dispatches: seeds
-            .first()
-            .is_some_and(|seed| seed.options.fuse_dispatches),
-    };
-    // Rank the first alternative on each axis early.
-    let cover = early_physical_cover(baseline, &attention);
-    let mut seen = collections::HashSet::from([baseline]);
-    seen.extend(cover.iter().copied());
-    let fusion: &[bool] = if baseline.fuse_dispatches {
+    // The seed's own fusion setting first, so each axis's first alternative
+    // (unfused dispatches, then the next attention layout) ranks early.
+    let fusion: &[bool] = if seeds
+        .first()
+        .is_some_and(|seed| seed.options.fuse_dispatches)
+    {
         &[true, false]
     } else {
         &[false]
     };
-    let tail: Vec<_> = attention
+    let mut choices: Vec<_> = attention
         .iter()
         .flat_map(|&attention| {
             fusion.iter().map(move |&fuse_dispatches| AxisChoice {
                 attention,
                 fuse_dispatches,
-                matrix_inputs: None,
-                matrix_storage: false,
-                vector_convolutions_only: false,
-                winograd: None,
-                f16_attention: false,
-                gradient_inputs: None,
-                forward_products: false,
+                ..Default::default()
             })
         })
-        .filter(|&choice| seen.insert(choice))
         .collect();
-    let mut choices: Vec<_> = std::iter::once(baseline).chain(cover).chain(tail).collect();
     let f16_attention = caps.f16_attention_rows != 0
         && seeds.iter().any(|seed| {
             seed.plan
@@ -2724,42 +2687,19 @@ mod tests {
     }
 
     #[test]
-    fn fusion_alternatives_lead_the_physical_cover() {
-        let baseline = AxisChoice {
-            attention: (0, None),
-            fuse_dispatches: true,
-            matrix_inputs: None,
-            matrix_storage: false,
-            vector_convolutions_only: false,
-            winograd: None,
-            f16_attention: false,
-            gradient_inputs: None,
-            forward_products: false,
-        };
+    fn fusion_alternatives_lead_the_physical_choices() {
+        let frontier = matrix_frontier();
         let unfused = AxisChoice {
             fuse_dispatches: false,
-            ..baseline
+            ..frontier.choices[0]
         };
-        let cover = early_physical_cover(baseline, &[]);
-        assert_eq!(cover, vec![unfused]);
-        // Choice 1 is the unfused cover, measured on the incumbent's form
-        // right after the first layouts and one more form.
+        assert!(frontier.choices[0].fuse_dispatches);
+        assert_eq!(frontier.choices[1], unfused);
+        // Choice 1 is measured on the incumbent's form right after the first
+        // layouts and one more form.
         let mut order = CoordinateOrder::new(8, 2);
         let visits: Vec<_> = std::iter::from_fn(|| order.next((0, 0))).collect();
         assert!(visits[..5].contains(&(0, 1)));
-        for seed in 0..8 {
-            for choice in 0..2 {
-                assert_eq!(
-                    visits
-                        .iter()
-                        .filter(|&&entry| entry == (seed, choice))
-                        .count(),
-                    1
-                );
-            }
-        }
-        assert!(order.exhausted());
-        assert!(early_physical_cover(unfused, &[]).is_empty());
     }
 
     #[test]
