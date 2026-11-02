@@ -1044,7 +1044,7 @@ impl<'a> Compiler<'a> {
                 origin: vec![node.id],
                 ..Default::default()
             };
-            let reduction = dispatch.partial_sum(partial, out_buf, m * n, splits);
+            let reduction = dispatch.partial_sum(partial, out_buf, m * n, splits, true);
             self.plan.dispatches.push(dispatch);
             if splits > 1 {
                 self.plan.dispatches.push(reduction);

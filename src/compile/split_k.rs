@@ -3,20 +3,23 @@ use crate::tune::{MatmulTile, TuneClass, TuneError};
 
 impl Dispatch {
     /// The SumRows adding `splits` partial results of this product,
-    /// `columns` elements each, from `partial` into `output`.
+    /// `columns` elements each, from `partial` into `output`. With
+    /// `serial_rows` each thread sums a whole column; otherwise eight row
+    /// lanes share each column.
     pub(crate) fn partial_sum(
         &self,
         partial: BufferRef,
         output: BufferRef,
         columns: u32,
         splits: u32,
+        serial_rows: bool,
     ) -> Dispatch {
         Dispatch {
             shader: ShaderEntry::SumRows,
-            workgroups: [columns.div_ceil(256), 1, 1],
+            workgroups: [columns.div_ceil(sum_rows_columns(serial_rows)), 1, 1],
             input_buffers: vec![partial],
             output_buffer: output,
-            params: vec![splits, columns, 1, 0],
+            params: vec![splits, columns, u32::from(serial_rows), 0],
             requires_full_precision: self.requires_full_precision,
             is_derivative: self.is_derivative,
             fusion_barrier: self.fusion_barrier,
@@ -25,6 +28,54 @@ impl Dispatch {
             ..Default::default()
         }
     }
+
+    /// Byte capacities of the input and output bindings, which must be
+    /// distinct for partials to replace the output.
+    fn distinct_binding_bytes(&self, buffers: &[usize]) -> Result<Vec<usize>, TuneError> {
+        let bindings: Vec<_> = self
+            .input_buffers
+            .iter()
+            .chain([&self.output_buffer])
+            .collect();
+        let mut bytes = Vec::with_capacity(bindings.len());
+        for (i, binding) in bindings.iter().enumerate() {
+            if bindings[..i].contains(binding) {
+                return Err(TuneError("split-K requires distinct logical bindings"));
+            }
+            let size = buffers.get(binding.0 as usize);
+            bytes.push(*size.ok_or(TuneError("split-K binding index out of range"))?);
+        }
+        Ok(bytes)
+    }
+}
+
+/// Output columns one SumRows workgroup covers.
+fn sum_rows_columns(serial_rows: bool) -> u32 {
+    if serial_rows { 256 } else { 32 }
+}
+
+/// Bytes of `splits` partial results of `columns` elements each, provided
+/// their SumRows fits the portable dispatch limit and they fit `budget`.
+fn partial_bytes(
+    columns: u32,
+    splits: u32,
+    serial_rows: bool,
+    budget: usize,
+) -> Result<usize, TuneError> {
+    if columns.div_ceil(sum_rows_columns(serial_rows)) > 65_535 {
+        return Err(TuneError(
+            "split-K final reduction exceeds portable dispatch limits",
+        ));
+    }
+    let bytes = columns
+        .checked_mul(splits)
+        .and_then(|elements| usize::try_from(elements).ok())
+        .and_then(|elements| elements.checked_mul(4))
+        .ok_or(TuneError("split-K partial index overflow"))?;
+    if bytes > budget {
+        return Err(TuneError("split-K partial byte budget exceeded"));
+    }
+    Ok(bytes)
 }
 
 impl ExecutionPlan {
@@ -159,19 +210,13 @@ impl ExecutionPlan {
         splits: u32,
         max_partial_bytes: usize,
     ) -> Result<(), TuneError> {
-        if columns.div_ceil(256) > 0xFFFF {
-            return Err(TuneError("split-K reduction exceeds dispatch limits"));
-        }
-        let bytes = columns
-            .checked_mul(splits)
-            .and_then(|n| (n as usize).checked_mul(4))
-            .filter(|&bytes| bytes <= max_partial_bytes)
-            .ok_or(TuneError("split-K scratch budget"))?;
+        let bytes = partial_bytes(columns, splits, true, max_partial_bytes)?;
         let partial = BufferRef(
             u32::try_from(self.buffers.len()).map_err(|_| TuneError("too many buffers"))?,
         );
         let dispatch = &self.dispatches[index];
-        let reduction = dispatch.partial_sum(partial, dispatch.output_buffer, columns, splits);
+        let reduction =
+            dispatch.partial_sum(partial, dispatch.output_buffer, columns, splits, true);
         producer.output_buffer = partial;
         producer.label = format!("{} split-K {splits}", dispatch.label);
         self.buffers.push(bytes);
@@ -241,19 +286,7 @@ impl ExecutionPlan {
                     )
             })
             .ok_or(TuneError("split-K requires a scalar matrix product"))?;
-        let mut bindings = dispatch.input_buffers.clone();
-        bindings.push(dispatch.output_buffer);
-        let mut unique = bindings.clone();
-        unique.sort_unstable_by_key(|b| b.0);
-        unique.dedup();
-        if unique.len() != bindings.len() {
-            return Err(TuneError("split-K requires distinct bindings"));
-        }
-        class.binding_bytes = bindings
-            .iter()
-            .map(|b| self.buffers.get(b.0 as usize).copied())
-            .collect::<Option<Vec<_>>>()
-            .ok_or(TuneError("invalid matrix binding"))?;
+        class.binding_bytes = dispatch.distinct_binding_bytes(&self.buffers)?;
         if !MatmulTile::Scalar(shape).fits(&class)
             || !(2..=0xFFFF).contains(&splits)
             || splits > class.k.div_ceil(shape.k_stage)
@@ -313,22 +346,7 @@ impl ExecutionPlan {
                 .ok_or(TuneError(
                     "split-K requires an unmodified legal scalar weight gradient",
                 ))?;
-            let bindings: Vec<_> = dispatch
-                .input_buffers
-                .iter()
-                .chain(std::iter::once(&dispatch.output_buffer))
-                .collect();
-            for (i, buffer) in bindings.iter().enumerate() {
-                if bindings[..i].contains(buffer) {
-                    return Err(TuneError("split-K requires distinct logical bindings"));
-                }
-                class.binding_bytes.push(
-                    *self
-                        .buffers
-                        .get(buffer.0 as usize)
-                        .ok_or(TuneError("split-K binding index out of range"))?,
-                );
-            }
+            class.binding_bytes = dispatch.distinct_binding_bytes(&self.buffers)?;
             let tile = MatmulTile::selected(dispatch, None).expect("checked scalar class");
             if !tile.fits(&class) {
                 return Err(TuneError("split-K binding capacity is too small"));
@@ -342,20 +360,9 @@ impl ExecutionPlan {
                 .m
                 .checked_mul(class.n)
                 .ok_or(TuneError("split-K output index overflow"))?;
-            if columns.div_ceil(32) > 65_535 {
-                return Err(TuneError(
-                    "split-K final reduction exceeds portable dispatch limits",
-                ));
-            }
-            let bytes = columns
-                .checked_mul(splits)
-                .and_then(|elements| usize::try_from(elements).ok())
-                .and_then(|elements| elements.checked_mul(4))
-                .ok_or(TuneError("split-K partial index overflow"))?;
-            total_bytes = total_bytes
-                .checked_add(bytes)
-                .filter(|&total| total <= max_partial_bytes)
-                .ok_or(TuneError("split-K partial byte budget exceeded"))?;
+            // Every accepted selection keeps the total within the cap.
+            let bytes = partial_bytes(columns, splits, false, max_partial_bytes - total_bytes)?;
+            total_bytes += bytes;
             let buffer_index = self
                 .buffers
                 .len()
@@ -384,19 +391,8 @@ impl ExecutionPlan {
             producer.workgroups = [class.n.div_ceil(width), class.m.div_ceil(width), splits];
             producer.output_buffer = partial;
             producer.label = format!("{} split-K partials ({splits})", dispatch.label);
-            let reduction = Dispatch {
-                shader: ShaderEntry::SumRows,
-                workgroups: [columns.div_ceil(32), 1, 1],
-                input_buffers: vec![partial],
-                output_buffer: dispatch.output_buffer,
-                params: vec![splits, columns, 0, 0],
-                requires_full_precision: dispatch.requires_full_precision,
-                is_derivative: dispatch.is_derivative,
-                fusion_barrier: dispatch.fusion_barrier,
-                label: format!("{} split-K reduction", dispatch.label),
-                origin: dispatch.origin.clone(),
-                ..Default::default()
-            };
+            let reduction =
+                dispatch.partial_sum(partial, dispatch.output_buffer, columns, splits, false);
             replacements.push((index, bytes, producer, reduction));
         }
         self.buffers.extend(replacements.iter().map(|r| r.1));
