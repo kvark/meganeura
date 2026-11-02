@@ -14,7 +14,6 @@ use egglog::{
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    ops::Range,
     sync::Arc,
 };
 
@@ -256,7 +255,18 @@ pub(crate) fn candidates(
 ) -> Result<SearchSpace, String> {
     let cutoff = config.saturation_cutoff.min(super::SATURATION_CUTOFF);
     if graph.nodes().len() <= cutoff {
-        return region_candidates(graph, 0..graph.nodes().len(), config, limit, target);
+        // Escaping values are extracted together; returned graphs preserve the
+        // original inputs, parameters and outputs.
+        if limit == 0 || graph.nodes().is_empty() {
+            return Err("expected a bounded region and a positive candidate limit".into());
+        }
+        let segment = Segment {
+            ids: (0..graph.nodes().len())
+                .filter(|&id| !matches!(graph.nodes()[id].op, Op::Nop))
+                .collect(),
+            shifts: vec![0],
+        };
+        return segment_candidates(graph, segment, config, limit, target);
     }
     // Parameters and opaque operators need not consume the saturation bound.
     // Extract the rewritable operators together, including independent
@@ -295,35 +305,10 @@ pub(crate) fn candidates(
     )
 }
 
-/// Explore a contiguous region without changing the surrounding graph. Its
-/// escaping values are extracted together; dependencies outside the region stay
-/// opaque. Returned graphs preserve the original inputs, parameters and outputs.
-pub(crate) fn region_candidates(
-    graph: &Graph,
-    region: Range<usize>,
-    config: super::OptimizeConfig,
-    limit: usize,
-    target: Target,
-) -> Result<SearchSpace, String> {
-    if limit == 0
-        || region.is_empty()
-        || region.len() > super::SATURATION_CUTOFF
-        || region.end > graph.nodes().len()
-    {
-        return Err("expected a bounded region and a positive candidate limit".into());
-    }
-    let segment = Segment {
-        ids: region
-            .filter(|&id| !matches!(graph.nodes()[id].op, Op::Nop))
-            .collect(),
-        shifts: vec![0],
-    };
-    segment_candidates(graph, segment, config, limit, target)
-}
-
 /// Apply each extracted alternative to all verified instances, then return the
 /// complete model. Parameters and cut-edge placement remain model properties,
-/// not newly introduced host-visible region inputs.
+/// not newly introduced host-visible region inputs. `region` must be one that
+/// [`crate::outline::detect_repeated_regions`] found in `graph`.
 pub(crate) fn repeated_candidates(
     graph: &Graph,
     region: crate::outline::Region,
@@ -331,10 +316,8 @@ pub(crate) fn repeated_candidates(
     limit: usize,
     target: Target,
 ) -> Result<SearchSpace, String> {
-    if limit == 0
-        || !crate::outline::detect_repeated_regions(graph).contains(&region)
-        || region.period > super::SATURATION_CUTOFF
-    {
+    debug_assert!(crate::outline::detect_repeated_regions(graph).contains(&region));
+    if limit == 0 || region.period > super::SATURATION_CUTOFF {
         return Err("expected a verified repeated region and a positive candidate limit".into());
     }
     segment_candidates(
@@ -1220,14 +1203,13 @@ mod tests {
 
         // Search only the second pair. External inputs keep their identities,
         // and the first independent pair is not rewritten as a side effect.
-        let region = super::region_candidates(
-            &graph,
-            mm2 as usize..add2 as usize + 1,
-            Default::default(),
-            8,
-            Default::default(),
-        )
-        .unwrap();
+        let segment = super::Segment {
+            ids: (mm2 as usize..=add2 as usize).collect(),
+            shifts: vec![0],
+        };
+        let region =
+            super::segment_candidates(&graph, segment, Default::default(), 8, Default::default())
+                .unwrap();
         assert!(region.candidates.len() >= 2);
         assert!(region.candidates.iter().all(|candidate| {
             let untouched = candidate
@@ -1243,10 +1225,7 @@ mod tests {
                     && node.inputs.contains(&untouched)
             })
         }));
-        assert!(
-            super::region_candidates(&graph, 0..0, Default::default(), 8, Default::default())
-                .is_err()
-        );
+        assert!(candidates(&Graph::new(), Default::default(), 8, Default::default()).is_err());
 
         let mut graph = Graph::new();
         let mut h = graph.input("x", &[3, 8]);
@@ -1298,10 +1277,8 @@ mod tests {
                 .filter(|node| matches!(node.op, Op::MatMul | Op::FusedMatMulAdd))
                 .all(|node| node.matmul_impl.is_some())
         );
+        // A precision split leaves no verified region for the caller to pass.
         graph.nodes_mut()[region.start + region.period + 2].requires_full_precision = true;
-        assert!(
-            super::repeated_candidates(&graph, region, Default::default(), 8, Default::default())
-                .is_err()
-        );
+        assert!(!crate::outline::detect_repeated_regions(&graph).contains(&region));
     }
 }
