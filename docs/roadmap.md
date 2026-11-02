@@ -77,9 +77,10 @@ individual kernels limit a workload.
 
 Convolution indexing is exact. The invariant-divisor follow-up recovered some
 of the cost of replacing the incorrect floating reciprocal, but did not erase
-it. Scalar derivative tile search and explicit split-K probes exist; the
+it. Scalar derivative tile search exists. The
 [split-K qualification failures](experiments.md#split-k-sequence-2026-09-06)
-prevent automatic promotion of the rejected weight-gradient candidates.
+prevent automatic promotion of the rejected weight-gradient candidates; the
+explicit split-K probes that measured them have been removed.
 
 Remaining work:
 

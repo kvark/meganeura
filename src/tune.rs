@@ -6,7 +6,6 @@
 //! workgroup geometry and cross-lane reduction for the K-split GEMV family, and
 //! cached-attention split/combine sequences. Precision remains unchanged.
 //! Measurements use synthetic, private scratch, not a live training step.
-//! Explicit split-K probes measure complete sequences without installing them.
 //! Scalar tile and GEMV shape changes leave packed-weight decoding intact, so
 //! reduced-storage kernels participate without changing their arithmetic.
 
@@ -1522,11 +1521,6 @@ pub struct TuneOutcome<Class = TuneClass, Choice = MatmulTile> {
     pub initial: Choice,
     pub candidate: Choice,
     pub selected: Choice,
-    /// Experimental two-pass dW challenger; baseline is unsplit with the same
-    /// tile. Times are per complete sequence. `decision` reports the result;
-    /// no live plan is changed and `selected` still describes only the tile.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub candidate_split_k: Option<u32>,
     pub decision: TuneDecision,
     pub qualified: bool,
     /// Shader rejection or the candidate/input pattern that failed qualification.
@@ -1562,7 +1556,6 @@ impl<Class, Choice: Copy> TuneOutcome<Class, Choice> {
             initial,
             candidate,
             selected: initial,
-            candidate_split_k: None,
             decision: TuneDecision::KeepBaseline,
             qualified: false,
             failure: None,
@@ -1622,8 +1615,7 @@ pub struct TuneReport {
     pub options: TuneOptions,
     pub outcomes: Vec<TuneOutcome>,
     pub eligible_classes: usize,
-    /// Live search visits a bounded candidate set per class; explicit split-K
-    /// probes accept up to four counts against the same unsplit control.
+    /// Live search visits a bounded candidate set per class.
     pub visited_classes: usize,
     /// Qualified selections reused inside one calibrated build, never globally.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
