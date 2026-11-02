@@ -610,8 +610,7 @@ impl CoordinateOrder {
             }
         }
         let (form, choice) = incumbent;
-        let available =
-            |entry: &(usize, usize)| !self.tried.contains(entry) && !self.deferred.contains(entry);
+        let available = |entry: &(usize, usize)| self.available(*entry);
         let physical = self
             .choice_order
             .iter()
@@ -648,6 +647,11 @@ impl CoordinateOrder {
         self.physical_next = !self.physical_next;
         self.mark(entry);
         Some(entry)
+    }
+
+    /// Untried and not deferred.
+    fn available(&self, entry: (usize, usize)) -> bool {
+        !self.tried.contains(&entry) && !self.deferred.contains(&entry)
     }
 
     fn mark(&mut self, entry: (usize, usize)) -> bool {
@@ -1179,10 +1183,7 @@ impl measure::Frontier for Implementations {
         self.order
             .priority_choices
             .iter()
-            .filter(|&&choice| {
-                !self.order.tried.contains(&(form, choice))
-                    && !self.order.deferred.contains(&(form, choice))
-            })
+            .filter(|&&choice| self.order.available((form, choice)))
             .count()
     }
 
@@ -1206,20 +1207,15 @@ impl measure::Frontier for Implementations {
         }
         // Forward storage families retain their existing fallback ordering.
         // Never defer BF16 derivatives after one successful F16 qualification.
-        for family in 0..2 {
-            let dtype = if family == 0 {
-                choice.matrix_inputs
-            } else {
-                choice.winograd
-            };
-            if dtype != Some(crate::DType::F16) {
-                continue;
-            }
+        for winograd in [false, true] {
             let mut bf16 = choice;
-            if family == 0 {
-                bf16.matrix_inputs = Some(crate::DType::BF16);
+            let family = if winograd {
+                &mut bf16.winograd
             } else {
-                bf16.winograd = Some(crate::DType::BF16);
+                &mut bf16.matrix_inputs
+            };
+            if family.replace(crate::DType::BF16) != Some(crate::DType::F16) {
+                continue;
             }
             if let Some(index) = self.choices.iter().position(|&c| c == bf16) {
                 let entry = (origin.form, index);
@@ -1270,10 +1266,7 @@ impl measure::Frontier for Implementations {
                 .make_contiguous()
                 .sort_by_key(|&index| self.choices[index].forward_products);
             let arithmetic_pending = self.order.priority_choices.iter().any(|&index| {
-                let entry = (incumbent.0, index);
-                !self.choices[index].forward_products
-                    && !self.order.tried.contains(&entry)
-                    && !self.order.deferred.contains(&entry)
+                !self.choices[index].forward_products && self.order.available((incumbent.0, index))
             });
             for index in &mut self.order.priority_choices {
                 let arithmetic = self.choices[*index];
@@ -1335,9 +1328,7 @@ impl measure::Frontier for Implementations {
                 })
                 .collect();
             for index in combined.into_iter().rev() {
-                let entry = (incumbent.0, index);
-                if !self.order.tried.contains(&entry)
-                    && !self.order.deferred.contains(&entry)
+                if self.order.available((incumbent.0, index))
                     && !self.order.priority_choices.contains(&index)
                 {
                     self.order.priority_choices.push_front(index);
