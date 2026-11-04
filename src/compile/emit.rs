@@ -2845,18 +2845,26 @@ impl<'a> Compiler<'a> {
                 // NCHW data. The GEMM path handles kernel 1×1 correctly.
                 {
                     // Use implicit GEMM: grad_input = weight_T @ im2col(grad_out)^T
-                    // M=Ci, N=H*W, K=Co*kH*kW, batched in z dimension.
+                    // M=Ci, N=H*W, K=Co*kH*kW, batched in z dimension by
+                    // image and stride phase.
                     {
-                        let spatial = in_h * in_w;
+                        let phase_columns = in_h.div_ceil(stride) * in_w.div_ceil(stride);
                         let tile = conv::register_tile(
                             in_channels,
-                            spatial,
-                            batch,
+                            phase_columns,
+                            batch * stride * stride,
                             self.coop_caps.f32_tile > 0,
                         );
                         self.plan.dispatches.push(Dispatch {
                             shader: conv::entry(conv::Kind::GradInput, tile),
-                            workgroups: [spatial.div_ceil(tile), in_channels.div_ceil(tile), batch],
+                            workgroups: conv::grad_input_workgroups(
+                                batch,
+                                in_channels,
+                                in_h,
+                                in_w,
+                                stride,
+                                tile,
+                            ),
                             input_buffers: vec![grad_out, kernel],
                             output_buffer: out_buf,
                             extra_outputs: vec![],
