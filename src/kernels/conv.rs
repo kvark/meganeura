@@ -119,6 +119,32 @@ pub(crate) fn register_tile(rows: u32, cols: u32, batch: u32, f32_cooperative: b
         .unwrap_or(16)
 }
 
+/// Workgroups the reduction partitions of a split weight gradient aim for.
+const SPLIT_WORKGROUPS: u32 = 256;
+/// Fewest reduction positions in a partition: sixteen K stages.
+const MIN_PARTITION: u32 = 256;
+
+/// Reduction partitions for a weight gradient's `rows × cols` output summed
+/// over `reduction` positions, when its 64-wide grid cannot occupy the
+/// device. [`register_tile`] narrows such tiles instead, down to one output
+/// per thread at width 16; partitions of a long reduction supply the
+/// workgroups and let the tile stay wide. Outputs narrower than 64 keep
+/// their tile, which would otherwise be mostly padding.
+pub(crate) fn weight_partitions(rows: u32, cols: u32, reduction: u32) -> Option<u32> {
+    if rows < 64 || cols < 64 {
+        return None;
+    }
+    let groups = rows.div_ceil(64) * cols.div_ceil(64);
+    if groups >= OCCUPIED {
+        return None;
+    }
+    let splits = SPLIT_WORKGROUPS
+        .div_ceil(groups)
+        .min(reduction / MIN_PARTITION)
+        .min(65_535);
+    (splits >= 2).then_some(splits)
+}
+
 /// The scalar shader entry for `kind` at `tile`.
 pub(crate) fn entry(kind: Kind, tile: u32) -> ShaderEntry {
     match (kind, tile) {
@@ -343,6 +369,18 @@ mod tests {
     fn keeps_64_when_native_f32_coop_can_use_the_grid() {
         assert_eq!(register_tile(256, 196, 1, true), 64);
         assert_eq!(register_tile(64, 147, 1, true), 16);
+    }
+
+    #[test]
+    fn long_weight_reductions_split_instead_of_narrowing() {
+        // ResNet-50's stem at batch 4: 3 workgroups at 64, 50176 positions.
+        assert_eq!(weight_partitions(64, 147, 50176), Some(86));
+        // Partitions keep at least 256 positions.
+        assert_eq!(weight_partitions(256, 64, 12544), Some(49));
+        // Occupied grids, short reductions and narrow outputs stay unsplit.
+        assert_eq!(weight_partitions(1024, 256, 784), None);
+        assert_eq!(weight_partitions(64, 147, 511), None);
+        assert_eq!(weight_partitions(8, 75, 524288), None);
     }
 
     fn problem(kind: Kind, m: u32, n: u32, k: u32) -> Problem {
