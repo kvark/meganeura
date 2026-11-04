@@ -1,0 +1,217 @@
+//! Single-operation microbench: one GEMM or convolution pass per session, for
+//! comparison with the vendor libraries through PyTorch. Shape lists and the
+//! reference script are at
+//! <https://github.com/kvark/meganeura/tree/6e45c325/paper/p3hpc/presentation/data/op-bench>.
+//!
+//! Prints one tab-separated row per shape: kind, name, median GPU time (ms),
+//! median ordinary single-step wall time with GPU timing enabled (ms),
+//! TFLOP/s from the GPU time (direct-convolution FLOPs for convolutions), the
+//! pass labels, and the session's dispatches after tuning, each with its
+//! workgroup grid and kernel variant.
+//!
+//! Kinds are gemm, conv, dgrad and wgrad, as in `torch_ops.py`; an optional
+//! eighth convolution field is the batch. `OP_BENCH_DW_CHUNK=<n>` splits weight
+//! gradients into partitions of at most n reduction positions (a positive
+//! multiple of 16), as the training search may.
+//!
+//! `OP_BENCH_REPEATS=30` measures 30 ordinary recorded steps in one submission,
+//! divided by 30, matching PyTorch's serial sample. This uses grouped passes;
+//! the default single-step profile puts each dispatch in its own timed pass.
+//! Setting it to 1 measures a grouped single step for comparison.
+//! `OP_BENCH_OUTPUT=<path>` saves little-endian f32 output for an independent
+//! correctness check. `OP_BENCH_PROFILE=<path>` saves the 30 per-pass profiles
+//! as JSON. Both readbacks are outside the wall-time samples.
+//!
+//! Strict f32 with tile search, one shape per process (NVIDIA's driver fails
+//! after about ten sessions in one process):
+//!
+//!   MEGANEURA_DEVICE_ID=<id> MEGANEURA_TUNE=1 MEGANEURA_DISABLE_COOP=1 \
+//!   MEGANEURA_GPU_TIMING=1 cargo run --release --example op_bench -- \
+//!       shapes.txt square-1024
+use meganeura::Graph;
+use std::time::Instant;
+
+fn fill(n: usize, seed: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| (((i * 31 + seed * 17) % 251) as f32 - 125.0) * 0.004)
+        .collect()
+}
+
+fn median(mut v: Vec<f64>) -> f64 {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[v.len() / 2]
+}
+
+fn serial_sample(
+    session: &mut meganeura::Session,
+    encoder: &mut blade_graphics::CommandEncoder,
+    repetitions: usize,
+) -> f64 {
+    encoder.start();
+    for _ in 0..repetitions {
+        session.record(encoder).unwrap();
+    }
+    let gpu = session.context();
+    let sync = gpu.submit(encoder);
+    assert!(gpu.wait_for(&sync, !0).unwrap());
+    let timing = encoder.last_timing();
+    assert_eq!(timing.passes.len(), repetitions);
+    timing.done.duration_since(timing.passes[0].1).as_secs_f64() * 1e3 / repetitions as f64
+}
+
+fn main() {
+    let shapes = std::fs::read_to_string(std::env::args().nth(1).expect("shapes file")).unwrap();
+    let only = std::env::args().nth(2);
+    for line in shapes
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+    {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if only.as_deref().is_some_and(|o| o != f[1]) {
+            continue;
+        }
+        let d: Vec<u32> = f[2..].iter().map(|x| x.parse().unwrap()).collect();
+        let mut g = Graph::new();
+        let (flops, inputs): (f64, Vec<(&str, usize)>) = if f[0] == "gemm" {
+            let (m, k, n) = (d[0] as usize, d[1] as usize, d[2] as usize);
+            let a = g.input("a", &[m, k]);
+            let b = g.parameter("b", &[k, n]);
+            let c = g.matmul(a, b);
+            g.set_outputs(vec![c]);
+            (2.0 * (m * k * n) as f64, vec![("a", m * k)])
+        } else {
+            let (ci, h, w, co, k, s, p) = (d[0], d[1], d[2], d[3], d[4], d[5], d[6]);
+            let batch = d.get(7).copied().unwrap_or(1);
+            let (oh, ow) = ((h + 2 * p - k) / s + 1, (w + 2 * p - k) / s + 1);
+            let x_len = (batch * ci * h * w) as usize;
+            let w_len = (co * ci * k * k) as usize;
+            let dy_len = (batch * co * oh * ow) as usize;
+            let (y, inputs) = match f[0] {
+                "conv" => {
+                    let x = g.input("x", &[x_len]);
+                    let wt = g.parameter("w", &[w_len]);
+                    let y = g.conv2d(x, wt, batch, ci, h, w, co, k, k, s, p);
+                    (y, vec![("x", x_len)])
+                }
+                "dgrad" => {
+                    let dy = g.input("dy", &[dy_len]);
+                    let wt = g.parameter("w", &[w_len]);
+                    let y = g.conv2d_grad_input(dy, wt, batch, ci, h, w, co, k, k, s, p, p);
+                    (y, vec![("dy", dy_len)])
+                }
+                "wgrad" => {
+                    let dy = g.input("dy", &[dy_len]);
+                    let x = g.input("x", &[x_len]);
+                    let y = g.conv2d_grad_weight(dy, x, ci, h, w, co, k, k, s, p, p);
+                    (y, vec![("dy", dy_len), ("x", x_len)])
+                }
+                other => panic!("unknown kind {other}"),
+            };
+            g.set_outputs(vec![y]);
+            let macs = f64::from(batch) * f64::from(co * oh * ow) * f64::from(ci * k * k);
+            (2.0 * macs, inputs)
+        };
+        let mut config = meganeura::SessionConfig::inference_from_env();
+        if let Ok(chunk) = std::env::var("OP_BENCH_DW_CHUNK") {
+            config.options.conv_weight_splits = Some(meganeura::compile::ConvWeightSplits {
+                workgroup_threshold: u32::MAX,
+                reduction_chunk: chunk.parse().expect("OP_BENCH_DW_CHUNK"),
+                max_partial_bytes: 1 << 30,
+            });
+        }
+        let mut session = meganeura::build(&g, config).0;
+        eprintln!("GPU: {}", session.device_information().device_name);
+        for (i, (name, buf)) in session.plan().param_buffers.clone().into_iter().enumerate() {
+            let n = session.plan().buffers[buf.0 as usize] / 4;
+            session.set_parameter(&name, &fill(n, i + 1));
+        }
+        for (i, (name, n)) in inputs.iter().enumerate() {
+            session.set_input(name, &fill(*n, 7 + i));
+        }
+        let dispatches = session
+            .plan()
+            .dispatches
+            .iter()
+            .map(|d| format!("{:?}{:?} {:?}", d.shader, d.workgroups, d.kernel))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let warm = Instant::now();
+        while warm.elapsed().as_secs_f32() < 1.0 {
+            session.step();
+            session.wait();
+        }
+        let mut wall = Vec::new();
+        for _ in 0..50 {
+            let t = Instant::now();
+            session.step();
+            session.wait();
+            wall.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        session.set_profiling(true);
+        let mut gpu = Vec::new();
+        let mut pass_samples = Vec::new();
+        let mut passes = String::new();
+        for _ in 0..30 {
+            session.step();
+            session.wait();
+            let t = session.gpu_timings();
+            passes = t
+                .iter()
+                .map(|(n, _)| n.clone())
+                .collect::<Vec<_>>()
+                .join("+");
+            gpu.push(t.iter().map(|(_, d)| d.as_secs_f64() * 1e3).sum());
+            pass_samples.push(
+                t.iter()
+                    .map(|(n, d)| (n.clone(), d.as_secs_f64() * 1e3))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        if let Ok(path) = std::env::var("OP_BENCH_PROFILE") {
+            serde_json::to_writer(std::fs::File::create(path).unwrap(), &pass_samples).unwrap();
+        }
+        session.set_profiling(false);
+        // Match PyTorch's serial device sample with ordinary grouped passes.
+        // The existing record API keeps all repetitions in one submission.
+        if let Ok(value) = std::env::var("OP_BENCH_REPEATS") {
+            let repetitions = value.parse::<usize>().expect("OP_BENCH_REPEATS");
+            assert!((1..=blade_graphics::limits::PASS_COUNT).contains(&repetitions));
+            let gpu_context = session.context();
+            let mut encoder =
+                gpu_context.create_command_encoder(blade_graphics::CommandEncoderDesc {
+                    name: "op_bench_serial",
+                    buffer_count: 1,
+                    manual_barriers: false,
+                });
+            let warm = Instant::now();
+            while warm.elapsed().as_secs_f32() < 1.0 {
+                serial_sample(&mut session, &mut encoder, repetitions);
+            }
+            gpu.clear();
+            for _ in 0..30 {
+                gpu.push(serial_sample(&mut session, &mut encoder, repetitions));
+            }
+            gpu_context.destroy_command_encoder(&mut encoder);
+            passes = format!("serial{repetitions}:{passes}");
+        }
+        // Optional readback for comparison on identical inputs, outside timing.
+        if let Ok(path) = std::env::var("OP_BENCH_OUTPUT") {
+            let len = g.node(g.outputs()[0]).ty.num_elements();
+            let values = session.read_output(len);
+            assert!(values.iter().all(|v| v.is_finite()));
+            let bytes: Vec<u8> = values.into_iter().flat_map(f32::to_le_bytes).collect();
+            std::fs::write(path, bytes).unwrap();
+        }
+        let gpu_ms = median(gpu);
+        println!(
+            "{}\t{}\t{:.4}\t{:.4}\t{:.3}\t{}\t{}",
+            f[0],
+            f[1],
+            gpu_ms,
+            median(wall),
+            flops / gpu_ms / 1e9,
+            passes,
+            dispatches
+        );
+    }
+}
