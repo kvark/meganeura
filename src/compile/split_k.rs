@@ -1,6 +1,10 @@
 use super::{BufferRef, Dispatch, ExecutionPlan, ShaderEntry};
 use crate::tune::{MatmulTile, TuneClass, TuneError};
 
+/// Partial-buffer budget of the default weight-gradient splits, charged
+/// before aliasing. ResNet-50 at batch 4 charges about 86 MiB.
+const DEFAULT_PARTIAL_BYTES: usize = 256 << 20;
+
 impl Dispatch {
     /// The SumRows adding `splits` partial results of this product,
     /// `columns` elements each, from `partial` into `output`. With
@@ -225,8 +229,17 @@ impl ExecutionPlan {
         Ok(())
     }
 
-    pub(super) fn split_low_occupancy_conv_weights(&mut self, options: super::ConvWeightSplits) {
-        assert!(options.reduction_chunk >= 16 && options.reduction_chunk.is_multiple_of(16));
+    /// Split weight gradients whose grids cannot occupy the device into
+    /// reduction partitions: as [`crate::kernels::conv::weight_partitions`]
+    /// chooses, or as `options` asks.
+    pub(super) fn split_low_occupancy_conv_weights(
+        &mut self,
+        options: Option<super::ConvWeightSplits>,
+    ) {
+        if let Some(options) = options {
+            assert!(options.reduction_chunk >= 16 && options.reduction_chunk.is_multiple_of(16));
+        }
+        let budget = options.map_or(DEFAULT_PARTIAL_BYTES, |o| o.max_partial_bytes);
         let mut bytes = 0usize;
         let mut selections = Vec::new();
         for (index, dispatch) in self.dispatches.iter().enumerate() {
@@ -234,12 +247,22 @@ impl ExecutionPlan {
                 c.shader == ShaderEntry::Conv2dGradWeightGemm
                     && matches!(dispatch.conv_k_tile(), None | Some(16))
                     && dispatch.input_buffers[0] != dispatch.input_buffers[1]
-                    && dispatch.workgroups[0].saturating_mul(dispatch.workgroups[1])
-                        < options.workgroup_threshold
             }) else {
                 continue;
             };
-            let splits = class.k.div_ceil(16).div_ceil(options.reduction_chunk / 16);
+            let splits = match options {
+                Some(options) => {
+                    let groups = dispatch.workgroups[0].saturating_mul(dispatch.workgroups[1]);
+                    if groups >= options.workgroup_threshold {
+                        continue;
+                    }
+                    class.k.div_ceil(16).div_ceil(options.reduction_chunk / 16)
+                }
+                None => match crate::kernels::conv::weight_partitions(class.m, class.n, class.k) {
+                    Some(splits) => splits,
+                    None => continue,
+                },
+            };
             if !(2..=65_535).contains(&splits) {
                 continue;
             }
@@ -248,15 +271,14 @@ impl ExecutionPlan {
                 .and_then(|n| n.checked_mul(splits as usize))
                 .and_then(|n| n.checked_mul(4))
                 .and_then(|n| n.checked_add(bytes))
-                .filter(|&n| n <= options.max_partial_bytes)
+                .filter(|&n| n <= budget)
             else {
                 continue;
             };
             selections.push((index, splits));
             bytes = total;
         }
-        if let Err(error) = self.split_conv_weight_gradients(&selections, options.max_partial_bytes)
-        {
+        if let Err(error) = self.split_conv_weight_gradients(&selections, budget) {
             log::warn!("keeping unsplit convolution gradients: {error}");
         }
     }
@@ -376,11 +398,13 @@ impl ExecutionPlan {
                 MatmulTile::Tile32 | MatmulTile::SpecializedConv { tile_size: 32, .. } => 32,
                 _ => 64,
             };
-            // Reduction partitions can fill the device without the narrowest
-            // register tile. Keep already wider selections unchanged.
-            if width == 16
-                && crate::kernels::conv::register_tile(class.m, class.n, splits, false) >= 32
-            {
+            // Reduction partitions can fill the device without narrowing the
+            // register tile: up to 64 wide where the output covers that tile,
+            // otherwise only past the narrowest. Keep wider selections.
+            let fill = crate::kernels::conv::register_tile(class.m, class.n, splits, false);
+            if fill == 64 && class.m.min(class.n) >= 64 {
+                width = 64;
+            } else if width == 16 && fill >= 32 {
                 width = 32;
             }
             producer.shader = match width {
@@ -685,13 +709,23 @@ mod tests {
             (75, 8, 22, 32),
             (256, 256, 2, 32),
             (512, 512, 2, 64),
+            // A 16-wide grid whose partitions cover the 64-wide tile.
+            (147, 64, 86, 64),
         ] {
             let mut graph = Graph::new();
             let x = graph.input("x", &[(ci * 2048) as usize]);
             let dy = graph.input("dy", &[(co * 2048) as usize]);
             let dw = graph.conv2d_grad_weight(dy, x, ci, 1, 2048, co, 1, 1, 1, 0, 0);
             graph.set_outputs(vec![dw]);
-            let mut plan = super::super::compile(&graph);
+            let unsplit = super::super::CompileOptions {
+                conv_weight_splits: Some(super::super::ConvWeightSplits {
+                    workgroup_threshold: 0,
+                    reduction_chunk: 16,
+                    max_partial_bytes: 0,
+                }),
+                ..Default::default()
+            };
+            let mut plan = super::super::compile_with(&graph, &unsplit);
             let original = plan.clone();
             let bytes = ci as usize * co as usize * splits as usize * 4;
             assert_eq!(
