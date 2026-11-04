@@ -32,66 +32,66 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let k_total = params.batch * go_spatial;             // N*oH*oW
     let input_spatial = params.in_h * params.in_w;
 
-    // Every tile width divides 256, so each thread stages one A column and
-    // one B column (ci, kh, kw) throughout; only their K indices move. A's
-    // advances by KTILE per stage and B's by 256/BM per slot, carried through
-    // (n, oh, ow) instead of divided.
-    let b_col = tid % $BM_U;
-    let col_idx = tile_col + b_col;
-    let ci = divide_exact(col_idx, kernel_hw, params.kernel_hw_multiplier);
-    let k_rem = col_idx - ci * kernel_hw;
-    let kh = divide_exact(k_rem, params.kernel_w, params.kernel_w_multiplier);
-    let kw = k_rem - kh * params.kernel_w;
-    let h0 = i32(kh) - i32(params.padding_h);
-    let w0 = i32(kw) - i32(params.padding_w);
-    let src_channel = ci * input_spatial;
+    // Every tile width divides 256, so each thread stages one K position
+    // (image, output row, output column) of both tiles: lanes walk the
+    // reduction, which is contiguous in NCHW for grad_out and for each
+    // im2col column of the input, so a wave reads runs of pixels instead of
+    // one element from each of its columns' channel planes. The K position
+    // advances by KTILE per stage, carried through (n, oh, ow) instead of
+    // divided; a thread's columns are the same every stage and advance by
+    // 256/KTILE per slot through (ci, kh, kw).
+    let k_lane = tid % $KTILE_U;
+    let col_lane = tid / $KTILE_U;
+    let col_step = split_digits(256u / $KTILE_U, params.kernel_h, params.kernel_w, params.kernel_w_multiplier, params.kernel_hw_multiplier);
+    let col_first = split_digits(tile_col + col_lane, params.kernel_h, params.kernel_w, params.kernel_w_multiplier, params.kernel_hw_multiplier);
 
     $ACC_DECL
 
     $K_RANGE
     var t = $K_START;
-    let a_col = tid % $KTILE_U;
-    let a_step = split_digits($KTILE_U, params.out_h, params.out_w, params.column_width_multiplier, params.output_spatial_multiplier);
-    var a_k = split_digits(t + a_col, params.out_h, params.out_w, params.column_width_multiplier, params.output_spatial_multiplier);
-    let b_step = split_digits(256u / $BM_U, params.out_h, params.out_w, params.column_width_multiplier, params.output_spatial_multiplier);
-    var b_k = split_digits(t + tid / $BM_U, params.out_h, params.out_w, params.column_width_multiplier, params.output_spatial_multiplier);
+    let k_step = split_digits($KTILE_U, params.out_h, params.out_w, params.column_width_multiplier, params.output_spatial_multiplier);
+    var k_pos = split_digits(t + k_lane, params.out_h, params.out_w, params.column_width_multiplier, params.output_spatial_multiplier);
     loop {
         if t >= $K_END { break; }
 
+        let k_idx = t + k_lane;
+        let in_k = k_idx < k_total;
+
         // Load A tile: grad_out_flat[Co, N*oH*oW].
         // A[co, n*oH*oW + oh*oW + ow] = grad_out[n, co, oh, ow]
-        let k_idx_a = t + a_col;
-        let rem_a = a_k.middle * params.out_w + a_k.inner;
+        let rem_a = k_pos.middle * params.out_w + k_pos.inner;
         for (var e = 0u; e < $STAGE_EPT_U; e++) {
-            let row_local = tid / $KTILE_U + e * (256u / $KTILE_U);  // M dimension (Co)
+            let row_local = col_lane + e * (256u / $KTILE_U);  // M dimension (Co)
             let co = tile_row + row_local;
 
             var val = 0.0;
-            if co < m_total && k_idx_a < k_total {
-                val = grad_out[(a_k.outer * params.out_channels + co) * go_spatial + rem_a];
+            if co < m_total && in_k {
+                val = grad_out[(k_pos.outer * params.out_channels + co) * go_spatial + rem_a];
             }
-            shared_a[row_local * $A_STRIDE_U + a_col] = val;
+            shared_a[row_local * $A_STRIDE_U + k_lane] = val;
         }
-        a_k = advance_digits(a_k, a_step, params.out_h, params.out_w);
 
         // Load B tile: im2col(input)[N*oH*oW, Ci*kH*kW].
         // B[k_idx, col] where k_idx = n*oH*oW + oh*oW + ow, col = ci*kH*kW + kh*kW + kw
         // B[k_idx, col] = input[n, ci, oh*stride+kh-padding, ow*stride+kw-padding]
+        let h0 = i32(k_pos.middle * params.stride) - i32(params.padding_h);
+        let w0 = i32(k_pos.inner * params.stride) - i32(params.padding_w);
+        let image = k_pos.outer * params.in_channels * input_spatial;
+        var c = col_first;
         for (var e = 0u; e < $STAGE_EPT_U; e++) {
-            let row_local = tid / $BM_U + e * (256u / $BM_U);  // K dimension
-            let k_idx = t + row_local;
-
+            let col_local = col_lane + e * (256u / $KTILE_U);  // N dimension
             var val = 0.0;
-            if k_idx < k_total && col_idx < n_total {
-                let ih = i32(b_k.middle * params.stride) + h0;
-                let iw = i32(b_k.inner * params.stride) + w0;
+            if in_k && tile_col + col_local < n_total {
+                let ih = h0 + i32(c.middle);
+                let iw = w0 + i32(c.inner);
                 if ih >= 0 && u32(ih) < params.in_h && iw >= 0 && u32(iw) < params.in_w {
-                    val = src[(b_k.outer * params.in_channels) * input_spatial + src_channel + u32(ih) * params.in_w + u32(iw)];
+                    val = src[image + c.outer * input_spatial + u32(ih) * params.in_w + u32(iw)];
                 }
             }
-            shared_b[row_local * $B_STRIDE_U + b_col] = val;
-            b_k = advance_digits(b_k, b_step, params.out_h, params.out_w);
+            shared_b[k_lane * $B_STRIDE_U + col_local] = val;
+            c = advance_digits(c, col_step, params.kernel_h, params.kernel_w);
         }
+        k_pos = advance_digits(k_pos, k_step, params.out_h, params.out_w);
 
         workgroupBarrier();
 
