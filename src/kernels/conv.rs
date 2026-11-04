@@ -37,10 +37,11 @@ impl From<&Dispatch> for Params {
     fn from(dispatch: &Dispatch) -> Self {
         let p = &dispatch.params;
         let column_width = match dispatch.shader {
+            // Scalar input gradients enumerate one stride phase's columns.
             ShaderEntry::Conv2dGradInputGemm
             | ShaderEntry::Conv2dGradInputGemmSmall
-            | ShaderEntry::Conv2dGradInputGemm16
-            | ShaderEntry::Conv2dGradInputGemmCoopGen(..) => p[3],
+            | ShaderEntry::Conv2dGradInputGemm16 => p[3].div_ceil(p[7]),
+            ShaderEntry::Conv2dGradInputGemmCoopGen(..) => p[3],
             _ => p[10],
         };
         Self {
@@ -158,6 +159,25 @@ pub(crate) fn entry(kind: Kind, tile: u32) -> ShaderEntry {
         (Kind::GradWeight, 32) => ShaderEntry::Conv2dGradWeightGemmSmall,
         (Kind::GradWeight, _) => ShaderEntry::Conv2dGradWeightGemm,
     }
+}
+
+/// The grid of a scalar input gradient at `tile`: one Z layer per image and
+/// stride phase, each covering that phase's `ceil(H/s) × ceil(W/s)` pixels,
+/// so a strided gradient enumerates only the taps that reach an output.
+pub(crate) fn grad_input_workgroups(
+    batch: u32,
+    in_channels: u32,
+    in_h: u32,
+    in_w: u32,
+    stride: u32,
+    tile: u32,
+) -> [u32; 3] {
+    let columns = in_h.div_ceil(stride) * in_w.div_ceil(stride);
+    [
+        columns.div_ceil(tile),
+        in_channels.div_ceil(tile),
+        batch * stride * stride,
+    ]
 }
 
 /// Scalar convolution with its geometry baked into the pipeline, using

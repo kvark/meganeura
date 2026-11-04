@@ -428,7 +428,13 @@ fn plan(s: Shape, tile: u32, splits: u32) -> (ExecutionPlan, Option<BufferRef>) 
                     32 => ShaderEntry::Conv2dGradInputGemmSmall,
                     _ => ShaderEntry::Conv2dGradInputGemm,
                 };
-                d.workgroups = [(s.h * s.w).div_ceil(tile), s.ci.div_ceil(tile), s.batch];
+                // One layer per image and stride phase.
+                let phase = s.h.div_ceil(s.stride) * s.w.div_ceil(s.stride);
+                d.workgroups = [
+                    phase.div_ceil(tile),
+                    s.ci.div_ceil(tile),
+                    s.batch * s.stride * s.stride,
+                ];
                 forced += 1;
             }
             ShaderEntry::Conv2dGradWeightGemm

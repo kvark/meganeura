@@ -536,6 +536,17 @@ impl MatmulTile {
                 return [class.m.div_ceil(tile), class.n.div_ceil(tile), 1];
             }
         };
+        if class.shader == ShaderEntry::Conv2dGradInputGemm {
+            let c = class.conv2d.expect("convolution class");
+            return crate::kernels::conv::grad_input_workgroups(
+                c.batch,
+                c.in_channels,
+                c.in_h,
+                c.in_w,
+                c.stride,
+                tile,
+            );
+        }
         // Scalar tiled kernels use X for columns, Y for rows. Derive exact
         // geometry; doubling rounded 64-tile counts overdispatches edges.
         [
@@ -2103,13 +2114,11 @@ mod tests {
         d.shader = shader;
         d.kernel = crate::compile::Kernel::Default;
         d.params = vec![2, 3, 7, 9, 5, 3, 2, 2, 0, 3, 5, 1];
-        d.workgroups = if matches!(
-            d.shader,
-            ShaderEntry::Conv2dGemm | ShaderEntry::Conv2dGradInputGemm
-        ) {
-            [1, 1, 2]
-        } else {
-            [1, 1, 1]
+        d.workgroups = match d.shader {
+            ShaderEntry::Conv2dGemm => [1, 1, 2],
+            // One layer per image and stride-2 phase.
+            ShaderEntry::Conv2dGradInputGemm => [1, 1, 8],
+            _ => [1, 1, 1],
         };
         d
     }
@@ -2185,7 +2194,8 @@ mod tests {
                 if forward {
                     [1, 1, 2]
                 } else if dx {
-                    [2, 1, 2]
+                    // 4·5 phase pixels, 2 images · 4 phases.
+                    [1, 1, 8]
                 } else {
                     [1, 1, 1]
                 }
@@ -2258,6 +2268,8 @@ mod tests {
             ] {
                 let mut d = conv_dispatch(shader);
                 d.params = vec![2, 3, 1, divisor, 5, 1, 1, 1, 0, 1, divisor, 0];
+                // At stride 1 an input gradient has one phase per image.
+                d.workgroups[2] = d.workgroups[2].min(2);
                 assert!(TuneClass::from_dispatch(&d, None).is_some(), "{d:?}");
             }
         }
