@@ -590,6 +590,15 @@ fn conv2d_grad_input() {
             Conv::new(1, 4, (10, 11), 5, (2, 2), 3, (0, 0)),
             Conv2dGradInputGemm16,
         ),
+        // Stride phases at 64: 2·4·(2·4) = 64 workgroups, odd phase widths.
+        (
+            Conv::new(2, 70, (28, 29), 9, (3, 3), 2, (1, 1)),
+            Conv2dGradInputGemm,
+        ),
+        (
+            Conv::new(1, 5, (11, 12), 7, (3, 2), 2, (1, 0)),
+            Conv2dGradInputGemm16,
+        ),
         (
             Conv::new(3, 8, (1, 37), 12, (1, 5), 1, (0, 2)),
             Conv2dGradInputGemm16,
