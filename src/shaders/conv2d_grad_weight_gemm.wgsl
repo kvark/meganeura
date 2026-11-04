@@ -31,6 +31,8 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let go_spatial = params.out_h * params.out_w;        // oH*oW
     let k_total = params.batch * go_spatial;             // N*oH*oW
     let input_spatial = params.in_h * params.in_w;
+    let pointwise = params.kernel_h == 1u && params.kernel_w == 1u && params.stride == 1u
+        && params.padding_h == 0u && params.padding_w == 0u;
 
     // Every tile width divides 256, so each thread stages one K position
     // (image, output row, output column) of both tiles: lanes walk the
@@ -82,10 +84,15 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
             let col_local = col_lane + e * (256u / $KTILE_U);  // N dimension
             var val = 0.0;
             if in_k && tile_col + col_local < n_total {
-                let ih = h0 + i32(c.middle);
-                let iw = w0 + i32(c.inner);
-                if ih >= 0 && u32(ih) < params.in_h && iw >= 0 && u32(iw) < params.in_w {
-                    val = src[image + c.outer * input_spatial + u32(ih) * params.in_w + u32(iw)];
+                // A pointwise window preserves the reduction's spatial index.
+                if pointwise {
+                    val = src[image + c.outer * input_spatial + rem_a];
+                } else {
+                    let ih = h0 + i32(c.middle);
+                    let iw = w0 + i32(c.inner);
+                    if ih >= 0 && u32(ih) < params.in_h && iw >= 0 && u32(iw) < params.in_w {
+                        val = src[image + c.outer * input_spatial + u32(ih) * params.in_w + u32(iw)];
+                    }
                 }
             }
             shared_b[k_lane * $B_STRIDE_U + col_local] = val;

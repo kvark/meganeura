@@ -651,6 +651,15 @@ fn conv2d_grad_weight() {
             Conv::new(2, 19, (7, 9), 13, (1, 1), 1, (0, 0)),
             Conv2dGradWeightGemm16,
         ),
+        // A 1x1 window with padding still needs the spatial gather.
+        (
+            Conv::new(2, 19, (7, 9), 13, (1, 1), 1, (0, 2)),
+            Conv2dGradWeightGemm16,
+        ),
+        (
+            Conv::new(2, 19, (7, 9), 13, (1, 1), 1, (1, 0)),
+            Conv2dGradWeightGemm16,
+        ),
         (
             Conv::new(2, 6, (13, 11), 10, (3, 3), 2, (1, 1)),
             Conv2dGradWeightGemm16,
