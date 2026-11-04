@@ -1,0 +1,26 @@
+# Training passes of the benchmark models, for comparing kernel choices with PyTorch.
+# kind name Cin H W Cout k stride pad batch
+#   conv: forward; dgrad: input gradient; wgrad: weight gradient (same dims as the forward).
+# ResNet-50 at batch 4 (Inferena's training config); stride sits on the 3x3.
+wgrad r50-dw-stem 3 224 224 64 7 2 3 4
+wgrad r50-dw-l1-3x3 64 56 56 64 3 1 1 4
+wgrad r50-dw-l1-1x1a 256 56 56 64 1 1 0 4
+wgrad r50-dw-l1-1x1b 64 56 56 256 1 1 0 4
+wgrad r50-dw-l2-3x3s2 128 56 56 128 3 2 1 4
+wgrad r50-dw-l3-3x3 256 14 14 256 3 1 1 4
+wgrad r50-dw-l4-1x1b 512 7 7 2048 1 1 0 4
+dgrad r50-dx-l1-3x3 64 56 56 64 3 1 1 4
+dgrad r50-dx-l1-1x1b 64 56 56 256 1 1 0 4
+dgrad r50-dx-l2-3x3s2 128 56 56 128 3 2 1 4
+dgrad r50-dx-l2-ds-s2 256 56 56 512 1 2 0 4
+dgrad r50-dx-l3-3x3 256 14 14 256 3 1 1 4
+conv r50-fw-stem 3 224 224 64 7 2 3 4
+conv r50-fw-l1-1x1b 64 56 56 256 1 1 0 4
+conv r50-fw-l2-3x3s2 128 56 56 128 3 2 1 4
+# Diffusion U-Net at batch 1 (4x32x32 latents); forwards are in shapes.txt.
+wgrad unet-dw-3x3-64@32 64 32 32 64 3 1 1 1
+wgrad unet-dw-3x3-128@16 128 16 16 128 3 1 1 1
+wgrad unet-dw-3x3-256@8 256 8 8 256 3 1 1 1
+dgrad unet-dx-3x3-64@32 64 32 32 64 3 1 1 1
+dgrad unet-dx-3x3-128@16 128 16 16 128 3 1 1 1
+dgrad unet-dx-3x3-256@8 256 8 8 256 3 1 1 1

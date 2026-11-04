@@ -1,11 +1,17 @@
-//! Single-operation microbench: one GEMM or convolution per session, for
+//! Single-operation microbench: one GEMM or convolution pass per session, for
 //! comparison with the vendor libraries through PyTorch
-//! (`paper/p3hpc/presentation/data/op-bench/torch_ops.py`, same shape list).
+//! (`paper/p3hpc/presentation/data/op-bench/torch_ops.py`, same shape lists).
 //!
 //! Prints one tab-separated row per shape: kind, name, median summed GPU pass
 //! time of a profiled step (ms), median unprofiled wall time of a step (ms),
-//! TFLOP/s from the GPU time (direct-convolution FLOPs for convolutions), and
-//! the pass labels.
+//! TFLOP/s from the GPU time (direct-convolution FLOPs for convolutions), the
+//! pass labels, and the session's dispatches after tuning, each with its
+//! workgroup grid and kernel variant.
+//!
+//! Kinds are gemm, conv, dgrad and wgrad, as in `torch_ops.py`; an optional
+//! eighth convolution field is the batch. `OP_BENCH_DW_CHUNK=<n>` splits weight
+//! gradients into partitions of at most n reduction positions (a positive
+//! multiple of 16), as the training search may.
 //!
 //! Strict f32 with tile search, one shape per process (NVIDIA's driver fails
 //! after about ten sessions in one process):
@@ -49,24 +55,59 @@ fn main() {
             (2.0 * (m * k * n) as f64, vec![("a", m * k)])
         } else {
             let (ci, h, w, co, k, s, p) = (d[0], d[1], d[2], d[3], d[4], d[5], d[6]);
-            let x = g.input("x", &[(ci * h * w) as usize]);
-            let wt = g.parameter("w", &[(co * ci * k * k) as usize]);
-            let y = g.conv2d(x, wt, 1, ci, h, w, co, k, k, s, p);
-            g.set_outputs(vec![y]);
+            let batch = d.get(7).copied().unwrap_or(1);
             let (oh, ow) = ((h + 2 * p - k) / s + 1, (w + 2 * p - k) / s + 1);
-            (
-                2.0 * (co * oh * ow * ci * k * k) as f64,
-                vec![("x", (ci * h * w) as usize)],
-            )
+            let x_len = (batch * ci * h * w) as usize;
+            let w_len = (co * ci * k * k) as usize;
+            let dy_len = (batch * co * oh * ow) as usize;
+            let (y, inputs) = match f[0] {
+                "conv" => {
+                    let x = g.input("x", &[x_len]);
+                    let wt = g.parameter("w", &[w_len]);
+                    let y = g.conv2d(x, wt, batch, ci, h, w, co, k, k, s, p);
+                    (y, vec![("x", x_len)])
+                }
+                "dgrad" => {
+                    let dy = g.input("dy", &[dy_len]);
+                    let wt = g.parameter("w", &[w_len]);
+                    let y = g.conv2d_grad_input(dy, wt, batch, ci, h, w, co, k, k, s, p, p);
+                    (y, vec![("dy", dy_len)])
+                }
+                "wgrad" => {
+                    let dy = g.input("dy", &[dy_len]);
+                    let x = g.input("x", &[x_len]);
+                    let y = g.conv2d_grad_weight(dy, x, ci, h, w, co, k, k, s, p, p);
+                    (y, vec![("dy", dy_len), ("x", x_len)])
+                }
+                other => panic!("unknown kind {other}"),
+            };
+            g.set_outputs(vec![y]);
+            let macs = f64::from(batch) * f64::from(co * oh * ow) * f64::from(ci * k * k);
+            (2.0 * macs, inputs)
         };
-        let mut session = meganeura::build(&g, meganeura::SessionConfig::inference_from_env()).0;
+        let mut config = meganeura::SessionConfig::inference_from_env();
+        if let Ok(chunk) = std::env::var("OP_BENCH_DW_CHUNK") {
+            config.options.conv_weight_splits = Some(meganeura::compile::ConvWeightSplits {
+                workgroup_threshold: u32::MAX,
+                reduction_chunk: chunk.parse().expect("OP_BENCH_DW_CHUNK"),
+                max_partial_bytes: 1 << 30,
+            });
+        }
+        let mut session = meganeura::build(&g, config).0;
         for (i, (name, buf)) in session.plan().param_buffers.clone().into_iter().enumerate() {
             let n = session.plan().buffers[buf.0 as usize] / 4;
             session.set_parameter(&name, &fill(n, i + 1));
         }
-        for (name, n) in &inputs {
-            session.set_input(name, &fill(*n, 7));
+        for (i, (name, n)) in inputs.iter().enumerate() {
+            session.set_input(name, &fill(*n, 7 + i));
         }
+        let dispatches = session
+            .plan()
+            .dispatches
+            .iter()
+            .map(|d| format!("{:?}{:?} {:?}", d.shader, d.workgroups, d.kernel))
+            .collect::<Vec<_>>()
+            .join(" + ");
         let warm = Instant::now();
         while warm.elapsed().as_secs_f32() < 1.0 {
             session.step();
@@ -96,13 +137,14 @@ fn main() {
         session.set_profiling(false);
         let gpu_ms = median(gpu);
         println!(
-            "{}\t{}\t{:.4}\t{:.4}\t{:.3}\t{}",
+            "{}\t{}\t{:.4}\t{:.4}\t{:.3}\t{}\t{}",
             f[0],
             f[1],
             gpu_ms,
             median(wall),
             flops / gpu_ms / 1e9,
-            passes
+            passes,
+            dispatches
         );
     }
 }
