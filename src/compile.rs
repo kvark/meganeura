@@ -169,8 +169,11 @@ pub struct CompileOptions {
     /// None retains the ordinary lowering; measured construction searches this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_attention_splits: Option<u32>,
-    /// Opt-in two-pass scalar convolution weight gradients. Changes reduction
-    /// order; qualify values/gradients and whole-step timing before deployment.
+    /// Two-pass scalar convolution weight gradients. None splits gradients
+    /// whose 64-wide grid cannot occupy the device over a long reduction
+    /// (`kernels::conv::weight_partitions`); explicit options replace that
+    /// policy, and a zero `workgroup_threshold` splits nothing. Splitting
+    /// changes reduction order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conv_weight_splits: Option<ConvWeightSplits>,
     /// Quantize the activation row to Q8_1 inside the K-split GEMV and do
@@ -1677,9 +1680,7 @@ impl ExecutionPlan {
         // after per-dispatch coop selection — the prologue path currently
         // only has a coop-matmul implementation. See Session::with_context.
 
-        if let Some(splits) = options.conv_weight_splits {
-            self.split_low_occupancy_conv_weights(splits);
-        }
+        self.split_low_occupancy_conv_weights(options.conv_weight_splits);
 
         self
     }
