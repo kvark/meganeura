@@ -1,0 +1,669 @@
+{
+  "statistic": "geometric means over identical qualified core conditions; not the main-table medians",
+  "interpretation": "accounting identity, not causal attribution to hardware, driver, CPU or GPU",
+  "groups": [
+    {
+      "device": "nvidia-5070",
+      "phase": "inference",
+      "n": 5,
+      "strict_ratio": 1.0150478369975096,
+      "accelerated_ratio": 1.8892744365683032,
+      "torch_gain": 2.6818060819950915,
+      "native_gain": 1.4408502068764792,
+      "gap_multiplier": 1.8612664031251354
+    },
+    {
+      "device": "nvidia-h100",
+      "phase": "inference",
+      "n": 4,
+      "strict_ratio": 1.3941165914470133,
+      "accelerated_ratio": 3.5461826962747,
+      "torch_gain": 3.000694407243823,
+      "native_gain": 1.1796678900372197,
+      "gap_multiplier": 2.5436772778049828
+    },
+    {
+      "device": "amd-7900xt",
+      "phase": "inference",
+      "n": 5,
+      "strict_ratio": 0.6781364347497063,
+      "accelerated_ratio": 1.0385119239912344,
+      "torch_gain": 1.8447492886098347,
+      "native_gain": 1.2046002329728562,
+      "gap_multiplier": 1.5314203319196957
+    },
+    {
+      "device": "amd-mi300",
+      "phase": "inference",
+      "n": 3,
+      "strict_ratio": 2.0525230453374967,
+      "accelerated_ratio": 1.6136803228033476,
+      "torch_gain": 0.8187281804409301,
+      "native_gain": 1.0413825058626782,
+      "gap_multiplier": 0.7861935223913696
+    },
+    {
+      "device": "intel-b570",
+      "phase": "inference",
+      "n": 5,
+      "strict_ratio": 2.161516681925289,
+      "accelerated_ratio": 2.1695006076676484,
+      "torch_gain": 1.3402886211841631,
+      "native_gain": 1.335356258046285,
+      "gap_multiplier": 1.0036936683436781
+    },
+    {
+      "device": "apple-m3",
+      "phase": "inference",
+      "n": 5,
+      "strict_ratio": 1.0624687363123848,
+      "accelerated_ratio": 0.9831488829580554,
+      "torch_gain": 0.9633658986039404,
+      "native_gain": 1.0410896728240921,
+      "gap_multiplier": 0.9253438236407476
+    },
+    {
+      "device": "all",
+      "phase": "inference",
+      "n": 27,
+      "strict_ratio": 1.238527452540879,
+      "accelerated_ratio": 1.6583030015878077,
+      "torch_gain": 1.6225125717366549,
+      "native_gain": 1.211796855137118,
+      "gap_multiplier": 1.3389311623135571
+    },
+    {
+      "device": "nvidia-5070",
+      "phase": "training",
+      "n": 5,
+      "strict_ratio": 1.490048335536139,
+      "accelerated_ratio": 2.8123240348530594,
+      "torch_gain": 2.2721375152480947,
+      "native_gain": 1.2038423313768447,
+      "gap_multiplier": 1.8874045678801072
+    },
+    {
+      "device": "nvidia-h100",
+      "phase": "training",
+      "n": 4,
+      "strict_ratio": 2.008920497094058,
+      "accelerated_ratio": 5.244470926086726,
+      "torch_gain": 2.8374050135791222,
+      "native_gain": 1.0868820078653405,
+      "gap_multiplier": 2.61059157576069
+    },
+    {
+      "device": "amd-7900xt",
+      "phase": "training",
+      "n": 4,
+      "strict_ratio": 0.6816866256686769,
+      "accelerated_ratio": 1.2151352635983734,
+      "torch_gain": 1.8819606257344377,
+      "native_gain": 1.0557733176133446,
+      "gap_multiplier": 1.7825423264046416
+    },
+    {
+      "device": "amd-mi300",
+      "phase": "training",
+      "n": 2,
+      "strict_ratio": 2.0938650786945945,
+      "accelerated_ratio": 1.6589118125162305,
+      "torch_gain": 0.8396898087057095,
+      "native_gain": 1.0598496882831907,
+      "gap_multiplier": 0.7922725439169497
+    },
+    {
+      "device": "intel-b570",
+      "phase": "training",
+      "n": 5,
+      "strict_ratio": 2.704189898633747,
+      "accelerated_ratio": 3.661588274438529,
+      "torch_gain": 1.434960468205365,
+      "native_gain": 1.0597602221278482,
+      "gap_multiplier": 1.3540425826930622
+    },
+    {
+      "device": "apple-m3",
+      "phase": "training",
+      "n": 5,
+      "strict_ratio": 1.2283046238875812,
+      "accelerated_ratio": 0.940140484181522,
+      "torch_gain": 0.7288885115522552,
+      "native_gain": 0.9523014316499832,
+      "gap_multiplier": 0.7653968452923181
+    },
+    {
+      "device": "all",
+      "phase": "training",
+      "n": 25,
+      "strict_ratio": 1.5361450479246188,
+      "accelerated_ratio": 2.205279281782209,
+      "torch_gain": 1.5329279393169428,
+      "native_gain": 1.067801109029586,
+      "gap_multiplier": 1.4355931327979818
+    }
+  ],
+  "conditions": [
+    {
+      "device": "nvidia-5070",
+      "model": "SmolLM2-135M",
+      "phase": "inference",
+      "strict_ratio": 1.0472935251857738,
+      "accelerated_ratio": 1.2281408196813877,
+      "torch_gain": 2.0662517584428874,
+      "native_gain": 1.7619901996111063,
+      "gap_multiplier": 1.1726806192786632
+    },
+    {
+      "device": "nvidia-5070",
+      "model": "SmolVLA",
+      "phase": "inference",
+      "strict_ratio": 1.1170427708855366,
+      "accelerated_ratio": 1.2884756126943533,
+      "torch_gain": 1.4574242653081422,
+      "native_gain": 1.263512652964595,
+      "gap_multiplier": 1.1534702576096647
+    },
+    {
+      "device": "nvidia-5070",
+      "model": "StableDiffusion",
+      "phase": "inference",
+      "strict_ratio": 0.8039646312469099,
+      "accelerated_ratio": 1.6744304670552455,
+      "torch_gain": 2.8639311874649054,
+      "native_gain": 1.3750940551721218,
+      "gap_multiplier": 2.0827165797807368
+    },
+    {
+      "device": "nvidia-5070",
+      "model": "ResNet-50",
+      "phase": "inference",
+      "strict_ratio": 0.741640832776287,
+      "accelerated_ratio": 2.8594273258110428,
+      "torch_gain": 4.803350604110962,
+      "native_gain": 1.2458302087250683,
+      "gap_multiplier": 3.85554192735984
+    },
+    {
+      "device": "nvidia-5070",
+      "model": "Whisper-tiny",
+      "phase": "inference",
+      "strict_ratio": 1.5447697392760085,
+      "accelerated_ratio": 3.1769083878378037,
+      "torch_gain": 3.348580610406201,
+      "native_gain": 1.6282452513534613,
+      "gap_multiplier": 2.0565578850131634
+    },
+    {
+      "device": "nvidia-h100",
+      "model": "SmolLM2-135M",
+      "phase": "inference",
+      "strict_ratio": 1.5633823473876465,
+      "accelerated_ratio": 2.1418625181939728,
+      "torch_gain": 1.9121374657728474,
+      "native_gain": 1.3957020744209556,
+      "gap_multiplier": 1.3700183590872348
+    },
+    {
+      "device": "nvidia-h100",
+      "model": "SmolVLA",
+      "phase": "inference",
+      "strict_ratio": 0.9332171635927545,
+      "accelerated_ratio": 1.9572197697964016,
+      "torch_gain": 2.08856129149463,
+      "native_gain": 0.9958417927900814,
+      "gap_multiplier": 2.0972822255662136
+    },
+    {
+      "device": "nvidia-h100",
+      "model": "ResNet-50",
+      "phase": "inference",
+      "strict_ratio": 1.113326257214807,
+      "accelerated_ratio": 5.080215520273812,
+      "torch_gain": 4.851952369675004,
+      "native_gain": 1.0633025213905964,
+      "gap_multiplier": 4.563096834689697
+    },
+    {
+      "device": "nvidia-h100",
+      "model": "Whisper-tiny",
+      "phase": "inference",
+      "strict_ratio": 2.325551758374152,
+      "accelerated_ratio": 7.425592347647279,
+      "torch_gain": 4.1841207631495365,
+      "native_gain": 1.310385615374533,
+      "gap_multiplier": 3.1930454013367933
+    },
+    {
+      "device": "amd-7900xt",
+      "model": "SmolLM2-135M",
+      "phase": "inference",
+      "strict_ratio": 0.596991730972298,
+      "accelerated_ratio": 0.8862571106434661,
+      "torch_gain": 2.1343177487719345,
+      "native_gain": 1.4376979682105402,
+      "gap_multiplier": 1.4845383355646362
+    },
+    {
+      "device": "amd-7900xt",
+      "model": "SmolVLA",
+      "phase": "inference",
+      "strict_ratio": 0.4248289415339962,
+      "accelerated_ratio": 0.7613558957348052,
+      "torch_gain": 1.899348933180878,
+      "native_gain": 1.0598176245922384,
+      "gap_multiplier": 1.7921469591635133
+    },
+    {
+      "device": "amd-7900xt",
+      "model": "StableDiffusion",
+      "phase": "inference",
+      "strict_ratio": 0.6373067545749649,
+      "accelerated_ratio": 0.4789913255141481,
+      "torch_gain": 1.0907532848805246,
+      "native_gain": 1.4512672756297262,
+      "gap_multiplier": 0.7515867705397207
+    },
+    {
+      "device": "amd-7900xt",
+      "model": "ResNet-50",
+      "phase": "inference",
+      "strict_ratio": 1.4070024317079617,
+      "accelerated_ratio": 1.549626679536833,
+      "torch_gain": 1.0869544762119576,
+      "native_gain": 0.9869135653002464,
+      "gap_multiplier": 1.1013674494192163
+    },
+    {
+      "device": "amd-7900xt",
+      "model": "Whisper-tiny",
+      "phase": "inference",
+      "strict_ratio": 0.6306081986164441,
+      "accelerated_ratio": 2.411877553750478,
+      "torch_gain": 4.445135864902702,
+      "native_gain": 1.1622228151726657,
+      "gap_multiplier": 3.824684739339169
+    },
+    {
+      "device": "amd-mi300",
+      "model": "SmolLM2-135M",
+      "phase": "inference",
+      "strict_ratio": 1.7782366537089618,
+      "accelerated_ratio": 1.257463764190107,
+      "torch_gain": 0.8441971695814727,
+      "native_gain": 1.193817581593693,
+      "gap_multiplier": 0.7071408417812941
+    },
+    {
+      "device": "amd-mi300",
+      "model": "SmolVLA",
+      "phase": "inference",
+      "strict_ratio": 1.6093500935904415,
+      "accelerated_ratio": 1.3018479638602178,
+      "torch_gain": 0.688669076715408,
+      "native_gain": 0.851335696511322,
+      "gap_multiplier": 0.8089277585064228
+    },
+    {
+      "device": "amd-mi300",
+      "model": "ResNet-50",
+      "phase": "inference",
+      "strict_ratio": 3.0215100181019237,
+      "accelerated_ratio": 2.566827967238168,
+      "torch_gain": 0.9439842381213035,
+      "native_gain": 1.1111994527170346,
+      "gap_multiplier": 0.8495182712816615
+    },
+    {
+      "device": "intel-b570",
+      "model": "SmolLM2-135M",
+      "phase": "inference",
+      "strict_ratio": 2.183070762972109,
+      "accelerated_ratio": 1.6861331683422482,
+      "torch_gain": 1.2244872173418333,
+      "native_gain": 1.585368400314536,
+      "gap_multiplier": 0.772367619475004
+    },
+    {
+      "device": "intel-b570",
+      "model": "SmolVLA",
+      "phase": "inference",
+      "strict_ratio": 1.9227000236354332,
+      "accelerated_ratio": 1.4157498354148357,
+      "torch_gain": 1.0425768637033932,
+      "native_gain": 1.4159016729794662,
+      "gap_multiplier": 0.7363342268743212
+    },
+    {
+      "device": "intel-b570",
+      "model": "StableDiffusion",
+      "phase": "inference",
+      "strict_ratio": 2.9495010266105166,
+      "accelerated_ratio": 3.0144981025865207,
+      "torch_gain": 1.0458706372386077,
+      "native_gain": 1.0233201061198978,
+      "gap_multiplier": 1.0220366344644731
+    },
+    {
+      "device": "intel-b570",
+      "model": "ResNet-50",
+      "phase": "inference",
+      "strict_ratio": 2.386558751695273,
+      "accelerated_ratio": 3.4860369136134843,
+      "torch_gain": 2.1060475779277534,
+      "native_gain": 1.4418109742217704,
+      "gap_multiplier": 1.4606960382337986
+    },
+    {
+      "device": "intel-b570",
+      "model": "Whisper-tiny",
+      "phase": "inference",
+      "strict_ratio": 1.596955929761814,
+      "accelerated_ratio": 1.9159028910485556,
+      "torch_gain": 1.538095017154307,
+      "native_gain": 1.2820430355096841,
+      "gap_multiplier": 1.1997218303540238
+    },
+    {
+      "device": "apple-m3",
+      "model": "SmolLM2-135M",
+      "phase": "inference",
+      "strict_ratio": 1.339889359299354,
+      "accelerated_ratio": 1.2989257918899382,
+      "torch_gain": 0.8768001853416656,
+      "native_gain": 0.9044513904536777,
+      "gap_multiplier": 0.9694276492867769
+    },
+    {
+      "device": "apple-m3",
+      "model": "SmolVLA",
+      "phase": "inference",
+      "strict_ratio": 1.51195552649633,
+      "accelerated_ratio": 1.1256812936322604,
+      "torch_gain": 0.7787238408224211,
+      "native_gain": 1.045940641819479,
+      "gap_multiplier": 0.7445201091600976
+    },
+    {
+      "device": "apple-m3",
+      "model": "StableDiffusion",
+      "phase": "inference",
+      "strict_ratio": 0.39493162602684706,
+      "accelerated_ratio": 0.3285284876667857,
+      "torch_gain": 0.9119713484405119,
+      "native_gain": 1.0963016634795186,
+      "gap_multiplier": 0.8318616844437083
+    },
+    {
+      "device": "apple-m3",
+      "model": "ResNet-50",
+      "phase": "inference",
+      "strict_ratio": 2.1408929777324026,
+      "accelerated_ratio": 2.2584789514101726,
+      "torch_gain": 1.2591514849573253,
+      "native_gain": 1.193594729038006,
+      "gap_multiplier": 1.0549237981070474
+    },
+    {
+      "device": "apple-m3",
+      "model": "Whisper-tiny",
+      "phase": "inference",
+      "strict_ratio": 0.7904164532569131,
+      "accelerated_ratio": 0.8466571478090635,
+      "torch_gain": 1.058310402506876,
+      "native_gain": 0.988010267153651,
+      "gap_multiplier": 1.0711532437367801
+    },
+    {
+      "device": "nvidia-5070",
+      "model": "SmolLM2-135M",
+      "phase": "training",
+      "strict_ratio": 1.4729872896519765,
+      "accelerated_ratio": 1.7635048957887554,
+      "torch_gain": 1.766691742209725,
+      "native_gain": 1.47564913895184,
+      "gap_multiplier": 1.197230219281403
+    },
+    {
+      "device": "nvidia-5070",
+      "model": "SmolVLA",
+      "phase": "training",
+      "strict_ratio": 1.3187921610242177,
+      "accelerated_ratio": 1.5941213186279246,
+      "torch_gain": 1.3963914385968625,
+      "native_gain": 1.1552132585040091,
+      "gap_multiplier": 1.2087737292811
+    },
+    {
+      "device": "nvidia-5070",
+      "model": "StableDiffusion",
+      "phase": "training",
+      "strict_ratio": 1.1918513757383993,
+      "accelerated_ratio": 1.7086322425899623,
+      "torch_gain": 1.817040753741012,
+      "native_gain": 1.2674714125938886,
+      "gap_multiplier": 1.4335950583867025
+    },
+    {
+      "device": "nvidia-5070",
+      "model": "ResNet-50",
+      "phase": "training",
+      "strict_ratio": 1.623884771878284,
+      "accelerated_ratio": 5.93510584371116,
+      "torch_gain": 3.656360728033213,
+      "native_gain": 1.0004048222725996,
+      "gap_multiplier": 3.654881150739689
+    },
+    {
+      "device": "nvidia-5070",
+      "model": "Whisper-tiny",
+      "phase": "training",
+      "strict_ratio": 1.9536605895030004,
+      "accelerated_ratio": 6.170945162658814,
+      "torch_gain": 3.6948039707651557,
+      "native_gain": 1.1697386240445804,
+      "gap_multiplier": 3.158657750386758
+    },
+    {
+      "device": "nvidia-h100",
+      "model": "SmolLM2-135M",
+      "phase": "training",
+      "strict_ratio": 1.8556942328489772,
+      "accelerated_ratio": 2.9614151834795956,
+      "torch_gain": 2.07647649348687,
+      "native_gain": 1.3011702901727225,
+      "gap_multiplier": 1.595852986476682
+    },
+    {
+      "device": "nvidia-h100",
+      "model": "SmolVLA",
+      "phase": "training",
+      "strict_ratio": 1.4656391006400777,
+      "accelerated_ratio": 2.5048465782883795,
+      "torch_gain": 1.7583901286020989,
+      "native_gain": 1.0288715280996605,
+      "gap_multiplier": 1.7090473208544015
+    },
+    {
+      "device": "nvidia-h100",
+      "model": "ResNet-50",
+      "phase": "training",
+      "strict_ratio": 2.0316200939952114,
+      "accelerated_ratio": 8.483248608509506,
+      "torch_gain": 4.084375488581139,
+      "native_gain": 0.9781511419692884,
+      "gap_multiplier": 4.175607749491722
+    },
+    {
+      "device": "nvidia-h100",
+      "model": "Whisper-tiny",
+      "phase": "training",
+      "strict_ratio": 2.947644058416241,
+      "accelerated_ratio": 12.021650694675833,
+      "torch_gain": 4.346277081859194,
+      "native_gain": 1.0656837519199265,
+      "gap_multiplier": 4.07839293226436
+    },
+    {
+      "device": "amd-7900xt",
+      "model": "SmolLM2-135M",
+      "phase": "training",
+      "strict_ratio": 0.62864027692243,
+      "accelerated_ratio": 1.3509801171159483,
+      "torch_gain": 2.5479898920781014,
+      "native_gain": 1.1856348224953615,
+      "gap_multiplier": 2.149051161229764
+    },
+    {
+      "device": "amd-7900xt",
+      "model": "SmolVLA",
+      "phase": "training",
+      "strict_ratio": 0.47465382582657123,
+      "accelerated_ratio": 0.9787826979543833,
+      "torch_gain": 2.0850142411100623,
+      "native_gain": 1.0111130780244948,
+      "gap_multiplier": 2.062097985305212
+    },
+    {
+      "device": "amd-7900xt",
+      "model": "StableDiffusion",
+      "phase": "training",
+      "strict_ratio": 0.5890701829247624,
+      "accelerated_ratio": 0.8113721549287729,
+      "torch_gain": 1.4362005617903835,
+      "native_gain": 1.0427063863496484,
+      "gap_multiplier": 1.3773777360454236
+    },
+    {
+      "device": "amd-7900xt",
+      "model": "ResNet-50",
+      "phase": "training",
+      "strict_ratio": 1.2285500806373355,
+      "accelerated_ratio": 2.032091022829076,
+      "torch_gain": 1.6440700310970642,
+      "native_gain": 0.9939625472414761,
+      "gap_multiplier": 1.6540563179767869
+    },
+    {
+      "device": "amd-mi300",
+      "model": "SmolLM2-135M",
+      "phase": "training",
+      "strict_ratio": 2.178926146172672,
+      "accelerated_ratio": 1.8750750171468296,
+      "torch_gain": 0.8960400969059434,
+      "native_gain": 1.0412411115893876,
+      "gap_multiplier": 0.8605500560174731
+    },
+    {
+      "device": "amd-mi300",
+      "model": "SmolVLA",
+      "phase": "training",
+      "strict_ratio": 2.0121246309691507,
+      "accelerated_ratio": 1.467668427417583,
+      "torch_gain": 0.7868832848874648,
+      "native_gain": 1.0787908288017554,
+      "gap_multiplier": 0.7294122863108498
+    },
+    {
+      "device": "intel-b570",
+      "model": "SmolLM2-135M",
+      "phase": "training",
+      "strict_ratio": 2.7545571098747734,
+      "accelerated_ratio": 3.399670604646887,
+      "torch_gain": 1.3858604389571658,
+      "native_gain": 1.1228828228845835,
+      "gap_multiplier": 1.2341986275976835
+    },
+    {
+      "device": "intel-b570",
+      "model": "SmolVLA",
+      "phase": "training",
+      "strict_ratio": 1.8027560617197012,
+      "accelerated_ratio": 1.923918242141014,
+      "torch_gain": 1.1199093374848434,
+      "native_gain": 1.0493810508707253,
+      "gap_multiplier": 1.0672094150695757
+    },
+    {
+      "device": "intel-b570",
+      "model": "StableDiffusion",
+      "phase": "training",
+      "strict_ratio": 3.019702841132309,
+      "accelerated_ratio": 3.110015954410565,
+      "torch_gain": 1.1091191353788612,
+      "native_gain": 1.0769109398001548,
+      "gap_multiplier": 1.0299079472483428
+    },
+    {
+      "device": "intel-b570",
+      "model": "ResNet-50",
+      "phase": "training",
+      "strict_ratio": 3.217403442996826,
+      "accelerated_ratio": 6.588002250158388,
+      "torch_gain": 2.0216080786814246,
+      "native_gain": 0.9872991152338232,
+      "gap_multiplier": 2.0476145957070413
+    },
+    {
+      "device": "intel-b570",
+      "model": "Whisper-tiny",
+      "phase": "training",
+      "strict_ratio": 2.997280964513935,
+      "accelerated_ratio": 4.9114274695884275,
+      "torch_gain": 1.7483249624387092,
+      "native_gain": 1.0669446229532142,
+      "gap_multiplier": 1.6386276521076517
+    },
+    {
+      "device": "apple-m3",
+      "model": "SmolLM2-135M",
+      "phase": "training",
+      "strict_ratio": 1.2432931671308483,
+      "accelerated_ratio": 0.82783620926542,
+      "torch_gain": 0.678446396165358,
+      "native_gain": 1.0189307488318542,
+      "gap_multiplier": 0.6658415176332227
+    },
+    {
+      "device": "apple-m3",
+      "model": "SmolVLA",
+      "phase": "training",
+      "strict_ratio": 1.5614195651258818,
+      "accelerated_ratio": 0.8628574653316176,
+      "torch_gain": 0.5194246739394881,
+      "native_gain": 0.9399464930010726,
+      "gap_multiplier": 0.5526108962660872
+    },
+    {
+      "device": "apple-m3",
+      "model": "StableDiffusion",
+      "phase": "training",
+      "strict_ratio": 0.8784117906119654,
+      "accelerated_ratio": 0.5270746254244113,
+      "torch_gain": 0.5716505638333781,
+      "native_gain": 0.9527011378642637,
+      "gap_multiplier": 0.6000313646259381
+    },
+    {
+      "device": "apple-m3",
+      "model": "ResNet-50",
+      "phase": "training",
+      "strict_ratio": 1.3596004052500976,
+      "accelerated_ratio": 1.506575759645589,
+      "torch_gain": 0.9667831559114587,
+      "native_gain": 0.8724677548744044,
+      "gap_multiplier": 1.1081018759835215
+    },
+    {
+      "device": "apple-m3",
+      "model": "Whisper-tiny",
+      "phase": "training",
+      "strict_ratio": 1.2059459073213097,
+      "accelerated_ratio": 1.2948432867159736,
+      "torch_gain": 1.0563496639117682,
+      "native_gain": 0.9838260482668514,
+      "gap_multiplier": 1.0737158929392827
+    }
+  ],
+  "input_sha256": "8d56b96c857c121a241cfc27e5e2076de4ee79713153601957861aa320113b89"
+}
