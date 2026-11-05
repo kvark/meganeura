@@ -498,6 +498,24 @@ pub(super) fn eval(node: &Node, ins: &[&Tensor]) -> Result<Vec<f64>, Error> {
                 })
                 .collect()
         }
+        Op::ArgMaxOneHot => {
+            let x = arg(0)?;
+            let (_, cols) = rows_cols(x);
+            let mut result = vec![0.0; x.len()];
+            for (row, values) in x.data.chunks_exact(cols).enumerate() {
+                // Only a strictly greater value replaces the winner, so ties
+                // keep the first column.
+                let winner = (1..cols).fold(0, |best, col| {
+                    if values[col] > values[best] {
+                        col
+                    } else {
+                        best
+                    }
+                });
+                result[row * cols + winner] = 1.0;
+            }
+            result
+        }
         Op::BroadcastInner { inner } => {
             let x = arg(0)?;
             let inner = inner as usize;

@@ -3276,6 +3276,11 @@ mod coop_precision_tests {
 /// Options for session construction beyond the plan itself.
 #[derive(Clone, Debug, Default)]
 pub struct SessionOptions {
+    /// Graph outputs whose dependencies may run before late inputs arrive.
+    /// Enables [`Session::prepare_step`]/[`Session::finish_prepared_step`];
+    /// allocation lifetimes span both stages. Empty keeps ordinary
+    /// scheduling unchanged.
+    pub prepare_outputs: Vec<usize>,
     /// Debug session: disable buffer aliasing and device-local placement so
     /// materialized values stay host-visible and readable via
     /// [`Session::read_node`] after a completed step. `build` also disables
@@ -3533,6 +3538,8 @@ pub struct Session {
     /// device-local placement.
     alias: crate::memplan::AliasPlan,
     pipelines: Pipelines,
+    /// Built on first use by [`Session::blend_parameters_from`].
+    blend_pipeline: Option<blade_graphics::ComputePipeline>,
     /// Session policy/capabilities after the cooperative smoke test. Tuning
     /// must not re-enable a rejected or explicitly disabled implementation.
     coop_config: Option<crate::codegen::CoopConfig>,
@@ -3540,6 +3547,11 @@ pub struct Session {
     /// Pre-computed barrier groups: each range of dispatch indices shares one
     /// compute pass. Pass boundaries in blade emit ALL_COMMANDS barriers.
     groups: Vec<std::ops::Range<usize>>,
+    /// Prefix of `groups` run by [`Session::prepare_step`], when
+    /// [`SessionOptions::prepare_outputs`] is set.
+    preparation: Option<crate::compile::stages::Preparation>,
+    /// A prepared step awaits [`Session::finish_prepared_step`].
+    step_prepared: bool,
     encoder: blade_graphics::CommandEncoder,
     /// Caller-selected upper bound on the submissions used by `step()`.
     /// See [`Session::set_submission_chunks`]. Always at least 1.
@@ -4107,11 +4119,18 @@ impl Session {
         if opts.serial_dispatch {
             log::info!("MEGANEURA_SERIAL_DISPATCH: forcing one dispatch per pass");
         }
-        crate::compile::schedule_dispatches(
-            &mut plan,
-            opts.serial_dispatch,
-            !opts.serial_dispatch && !opts.debug,
-        );
+        let fuse = !opts.serial_dispatch && !opts.debug;
+        let preparation = if opts.prepare_outputs.is_empty() {
+            crate::compile::schedule_dispatches(&mut plan, opts.serial_dispatch, fuse);
+            None
+        } else {
+            Some(crate::compile::stages::schedule(
+                &mut plan,
+                &opts.prepare_outputs,
+                opts.serial_dispatch,
+                fuse,
+            ))
+        };
         let groups = std::mem::take(&mut plan.groups);
         log::info!(
             "{} dispatches → {} barrier groups",
@@ -4596,9 +4615,12 @@ impl Session {
             physical_buffers,
             alias,
             pipelines,
+            blend_pipeline: None,
             coop_config,
             plan,
             groups,
+            preparation,
+            step_prepared: false,
             encoder,
             submission_chunks: 1,
             sync_point: None,
@@ -4810,6 +4832,7 @@ impl Session {
         offset: usize,
         device_local: bool,
     ) {
+        assert!(!self.step_prepared, "cannot rebind during a prepared step");
         self.buffers[index] = physical.handle.at(offset as u64);
         let target = self
             .alias
@@ -6271,6 +6294,8 @@ mod transfer;
 
 // Turning a dispatch into bound shader data lives in `runtime/binding.rs`.
 mod binding;
+mod parameter_blend;
+pub use parameter_blend::BlendParameterError;
 
 // The execution half of `Session` continues here: waiting, stepping,
 // recording, dispatch binding and the optimizer entry points.
@@ -6308,7 +6333,14 @@ impl Session {
     }
 
     /// Execute the full dispatch sequence (forward + backward + update).
+    ///
+    /// A prepared step must be completed with
+    /// [`Session::finish_prepared_step`] instead.
     pub fn step(&mut self) {
+        assert!(
+            !self.step_prepared,
+            "finish the prepared step before another full step"
+        );
         let _span = tracing::info_span!(
             "step",
             dispatches = self.plan.dispatches.len(),
@@ -6323,6 +6355,80 @@ impl Session {
         self.encode_step(self.submission_chunks, self.profile_window.clone());
         log::debug!(target: "meganeura::submission", "submit final chunk, {} dispatches", self.plan.dispatches.len());
         self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+    }
+
+    /// Submit only the dependencies of [`SessionOptions::prepare_outputs`].
+    ///
+    /// Those outputs become readable once the submission completes. Late
+    /// inputs, which the prepared outputs do not depend on, may then be set
+    /// before [`Session::finish_prepared_step`] runs the rest of the step,
+    /// gradient clipping and the optimizer. Until then parameters, optimizer
+    /// state and early inputs must not change; direct GPU-buffer users must
+    /// honor the same immutability and submission ordering as host uploads.
+    pub fn prepare_step(&mut self) {
+        assert!(!self.step_prepared, "step already prepared");
+        assert!(
+            self.grad_accum_scale.is_none(),
+            "prepared steps do not support temporal accumulation"
+        );
+        assert!(
+            self.profile_window.is_none(),
+            "prepared steps do not support dispatch profiling"
+        );
+        let end = self
+            .preparation
+            .as_ref()
+            .expect("no preparation outputs configured")
+            .groups;
+        self.wait();
+        self.encoder.start();
+        self.profiled_pass_map.clear();
+        let chunks = self.preparation_chunks(end);
+        record_groups(
+            &self.gpu,
+            &mut self.encoder,
+            &mut self.sync_point,
+            &self.plan,
+            &self.groups[..end],
+            &self.pipelines,
+            &self.buffers,
+            chunks,
+            self.gpu_timing,
+        );
+        self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+        self.step_prepared = true;
+    }
+
+    /// Run the remainder of a step begun by [`Session::prepare_step`],
+    /// followed by gradient clipping and the optimizer, exactly once.
+    pub fn finish_prepared_step(&mut self) {
+        assert!(self.step_prepared, "no prepared step to finish");
+        let start = self.preparation.as_ref().unwrap().groups;
+        self.wait();
+        self.encoder.start();
+        let chunks = self.preparation_chunks(self.groups.len() - start);
+        record_groups(
+            &self.gpu,
+            &mut self.encoder,
+            &mut self.sync_point,
+            &self.plan,
+            &self.groups[start..],
+            &self.pipelines,
+            &self.buffers,
+            chunks,
+            self.gpu_timing,
+        );
+        self.encode_training_update();
+        self.sync_point = Some(self.gpu.submit(&mut self.encoder));
+        self.step_prepared = false;
+    }
+
+    /// The share of [`Session::set_submission_chunks`] for `groups` groups.
+    fn preparation_chunks(&self, groups: usize) -> usize {
+        groups
+            .saturating_mul(self.submission_chunks)
+            .div_ceil(self.groups.len().max(1))
+            .max(1)
     }
 
     /// Record one step — the same work as [`Session::step`] — into a
@@ -6375,6 +6481,10 @@ impl Session {
         &mut self,
         encoder: &mut blade_graphics::CommandEncoder,
     ) -> Result<(), RecordError> {
+        assert!(
+            !self.step_prepared,
+            "finish the prepared step before recording"
+        );
         if self.grad_accum_scale.is_some() {
             return Err(RecordError::GradAccumulation);
         }
@@ -6469,7 +6579,11 @@ impl Session {
                 self.gpu_timing,
             );
         }
+        self.encode_training_update();
+    }
 
+    /// Record gradient clipping and the pending optimizer update.
+    fn encode_training_update(&mut self) {
         // Gradient clipping runs after backward and before the optimizer in
         // the same GPU submission. Global clipping measures the concatenated
         // gradient; AGC measures each parameter and its gradient separately.
@@ -6699,6 +6813,10 @@ impl Session {
 
     /// CPU-fallback SGD update.
     pub fn sgd_step_cpu(&mut self, learning_rate: f32) {
+        assert!(
+            !self.step_prepared,
+            "cannot update parameters during a prepared step"
+        );
         let _span = tracing::info_span!("sgd_step_cpu").entered();
         self.wait();
         for &(param_buf, grad_buf) in &self.plan.param_grad_pairs {
@@ -6855,6 +6973,10 @@ impl Session {
     /// `micro_batches = 1` (or [`Session::clear_grad_accumulate`]) to
     /// restore direct single-step optimizer reads.
     pub fn set_grad_accumulate(&mut self, micro_batches: u32) {
+        assert!(
+            !self.step_prepared,
+            "cannot change accumulation during a prepared step"
+        );
         assert!(micro_batches >= 1);
         if micro_batches == 1 {
             self.grad_accum_scale = None;
@@ -6985,6 +7107,9 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.wait();
+        if let Some(mut pipeline) = self.blend_pipeline.take() {
+            self.gpu.destroy_compute_pipeline(&mut pipeline);
+        }
         self.gpu.destroy_command_encoder(&mut self.encoder);
         if let Some(staging) = self.upload_staging.get_mut().take() {
             self.gpu.destroy_buffer(staging.buffer);

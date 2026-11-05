@@ -609,6 +609,50 @@ fn max_inner() {
     }
 }
 
+/// Rows full of ties: repeated maxima, equal values, signed zeros and
+/// infinities. Each row's one-hot must select its first maximum.
+fn tied_rows(rows: usize, cols: usize) -> Vec<f32> {
+    let value = |row: usize, col: usize| match row % 4 {
+        0 => ((col * 7 + row) % 5) as f32,
+        1 => -1.5,
+        2 if col % 3 == 2 => [-0.0, 0.0][col / 3 % 2],
+        2 => -1.0,
+        _ if col % 4 == 3 => f32::INFINITY,
+        _ => f32::NEG_INFINITY,
+    };
+    (0..rows * cols)
+        .map(|i| value(i / cols, i % cols))
+        .collect()
+}
+
+/// Packed narrow rows, one lane per column, and wide rows spread over a
+/// whole workgroup. The selection passes no gradient to its input, while
+/// the values it selects still train; its producer (perturbed logits, as
+/// in Gumbel-max sampling) fuses into the reduction.
+#[test]
+fn argmax_one_hot() {
+    for (rows, cols) in [(5, 1), (8, 3), (9, 5), (12, 32), (8, 300)] {
+        let what = format!("argmax_one_hot {rows}x{cols}");
+        let build = |g: &mut Graph| {
+            let x = g.parameter("x", &[rows, cols]);
+            g.argmax_one_hot(x)
+        };
+        let x = tied_rows(rows, cols);
+        inference_case(&what, build, |feeds| {
+            feeds.set("x", &x);
+        });
+    }
+    let build = |g: &mut Graph| {
+        let logits = g.input("logits", &[6, 40]);
+        let noise = g.input("noise", &[6, 40]);
+        let w = g.parameter("w", &[6, 40]);
+        let perturbed = g.add(logits, noise);
+        let selection = g.argmax_one_hot(perturbed);
+        g.mul(selection, w)
+    };
+    grad_case("argmax_one_hot selection", build, |_| {});
+}
+
 /// The decompositions as primitive dispatches. Folded, they build the
 /// composite's plan exactly (`composites::elementwise_and_norms`), so only
 /// the unoptimized build computes anything of its own.

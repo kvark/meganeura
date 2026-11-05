@@ -1416,6 +1416,48 @@ impl<'a> Compiler<'a> {
                 );
             }
 
+            Op::ArgMaxOneHot => {
+                let input = self.get_buffer(node.inputs[0]);
+                let indices = self.get_buffer(node.inputs[1]);
+                let (rows, cols) = (node.ty.shape[0] as u32, node.ty.shape[1] as u32);
+                // A narrow row takes a power-of-two lane group of its own.
+                let rows_per_workgroup = if cols <= 32 {
+                    256 / cols.next_power_of_two()
+                } else {
+                    1
+                };
+                self.emit_inner_reduction(
+                    crate::schedule::ReduceOp::ArgMax,
+                    input,
+                    out_buf,
+                    rows,
+                    cols,
+                    rows_per_workgroup,
+                );
+                // Epilogue inputs: x (per element), the column index (per
+                // column) and the winning column (reduced). It writes
+                // `1 - (|column - winner| > 0)` for every column.
+                let dispatch = self.plan.dispatches.last_mut().unwrap();
+                dispatch.input_buffers.push(indices);
+                dispatch.reduction_mut().unwrap().epilogue = Some(ReductionEpilogue {
+                    n_per_col_inputs: 1,
+                    dag: PointwiseDAG {
+                        n_inputs: 3,
+                        ops: vec![
+                            Pw::LoadInput(1),
+                            Pw::LoadInput(2),
+                            Pw::Sub(0, 1),
+                            Pw::Abs(2),
+                            Pw::const_f32(0.0),
+                            Pw::Greater(3, 4),
+                            Pw::const_f32(1.0),
+                            Pw::Sub(6, 5),
+                        ],
+                        output: 7,
+                    },
+                });
+            }
+
             Op::BroadcastInner { inner } => {
                 let input = self.get_buffer(node.inputs[0]);
                 let rows = node.ty.shape[0] as u32;

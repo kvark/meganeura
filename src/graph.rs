@@ -286,6 +286,9 @@ pub enum Op {
     SumInner,
     /// Row-wise maximum over the inner axis: `[M, N]` → `[M, 1]`.
     MaxInner,
+    /// One-hot first maximum of each `[M, N]` row. The second input holds
+    /// the column indices `0..N` as F32. Hard selection has no gradient.
+    ArgMaxOneHot,
     /// Backward helper for [`Op::SumInner`]: repeat each `[M, 1]` row across
     /// the inner axis, `[M, 1]` → `[M, N]`.
     BroadcastInner {
@@ -1946,6 +1949,42 @@ impl Graph {
         );
         let ty = TensorType::f32(vec![shape[0], 1]);
         self.add_node(Op::MaxInner, vec![x], ty)
+    }
+
+    /// Select the first maximum of each nonempty F32 row as an exact one-hot
+    /// row: `x: [M, N] → [M, N]`, with 1 at the selected column and 0
+    /// elsewhere. Equal values tie, including signed zeros and infinities;
+    /// rows holding NaN are unspecified. The hard selection has a zero
+    /// derivative. Column indices must be exact in F32 (`N <= 2^24`).
+    #[track_caller]
+    pub fn argmax_one_hot(&mut self, x: NodeId) -> NodeId {
+        let ty = self.node(x).ty.clone();
+        assert_eq!(ty.dtype, DType::F32, "argmax_one_hot expects F32 values");
+        assert_eq!(ty.rank(), 2, "argmax_one_hot expects [rows, columns]");
+        let (rows, columns) = (ty.shape[0], ty.shape[1]);
+        assert!(
+            (1..=1 << 24).contains(&columns),
+            "argmax_one_hot needs 1..=2^24 columns, got {columns}"
+        );
+        assert!(
+            rows > 0
+                && rows
+                    .checked_mul(columns)
+                    .is_some_and(|len| len <= u32::MAX as usize),
+            "argmax_one_hot needs 1..=u32::MAX elements"
+        );
+        // Lowering packs narrow rows into one workgroup, one row otherwise.
+        let packed_rows = if columns <= 32 {
+            256 / columns.next_power_of_two()
+        } else {
+            1
+        };
+        assert!(
+            rows.div_ceil(packed_rows) <= 65535,
+            "argmax_one_hot rows exceed one portable dispatch"
+        );
+        let indices = self.constant((0..columns).map(|i| i as f32).collect(), &[columns]);
+        self.add_node(Op::ArgMaxOneHot, vec![x, indices], ty)
     }
 
     /// Row-wise mean over the inner axis: `x: [M, N] → [M, 1]`, spelled
