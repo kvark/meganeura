@@ -3385,7 +3385,11 @@ mod tests {
             (ShaderEntry::BlockMatMul, [10, 20, 30], (10, 20, 30)),
             (ShaderEntry::BlockMatMulAT, [10, 20, 30], (10, 20, 30)),
             (ShaderEntry::BlockMatMulBT, [10, 20, 30], (10, 20, 30)),
-            (ShaderEntry::WinogradGradProduct(4), [10, 20, 30], (10, 20, 30)),
+            (
+                ShaderEntry::WinogradGradProduct(4),
+                [10, 20, 30],
+                (10, 20, 30),
+            ),
         ];
 
         for &(ref shader, params, want) in cases.iter() {

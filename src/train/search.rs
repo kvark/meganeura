@@ -802,6 +802,22 @@ struct Implementations {
 }
 
 impl Implementations {
+    /// Revisit the algorithm after precision changes, even if its original
+    /// trial lost or was inconclusive. Keep this coordinate ahead of layouts.
+    fn winograd_weight_neighbor(&self, origin: measure::Origin) -> Option<usize> {
+        let active = self.choices[origin.choice];
+        if active.winograd_weight || (active.matrix_inputs.is_none() && active.winograd.is_none()) {
+            return None;
+        }
+        let neighbor = AxisChoice {
+            winograd_weight: true,
+            ..active
+        };
+        self.choices
+            .iter()
+            .position(|&c| c == neighbor)
+            .filter(|&i| self.order.available((origin.form, i)))
+    }
     fn enable_gradient_inputs(&mut self, inputs: &[crate::DType]) {
         let ordinary = self.choices.clone();
         for multiply in [crate::DType::BF16, crate::DType::F16] {
@@ -1193,11 +1209,14 @@ impl measure::Frontier for Implementations {
             return 0;
         }
         let form = incumbent.map_or(0, |origin| origin.form);
-        self.order
+        let pending = self
+            .order
             .priority_choices
             .iter()
             .filter(|&&choice| self.order.available((form, choice)))
-            .count()
+            .count();
+        let neighbor = incumbent.and_then(|origin| self.winograd_weight_neighbor(origin));
+        pending + usize::from(neighbor.is_some_and(|i| !self.order.priority_choices.contains(&i)))
     }
 
     fn observe(&mut self, origin: measure::Origin, qualified: bool) {
@@ -1269,6 +1288,14 @@ impl measure::Frontier for Implementations {
                 .form_order
                 .sort_by_key(|&index| (self.seeds[index].backward_rank != backward_rank, index));
             let active = self.choices[incumbent.1];
+            if let Some(index) = self.winograd_weight_neighbor(measure::Origin {
+                form: incumbent.0,
+                choice: incumbent.1,
+            }) {
+                if !self.order.priority_choices.contains(&index) {
+                    self.order.priority_choices.push_front(index);
+                }
+            }
             // Carry winning attention into arithmetic trials. The products-only
             // trial instead keeps the arithmetic winner; explicit combined
             // trials still compare each arithmetic alternative with products.
@@ -2039,19 +2066,23 @@ mod tests {
         let y = g.conv2d(x, w, 2, 64, 17, 19, 64, 1, 1, 1, 0);
         let dw = g.conv2d_grad_weight(dy, x, 64, 17, 19, 64, 3, 3, 1, 1, 1);
         g.set_outputs(vec![y, dw]);
-        let mut frontier = graph_frontier(g);
-        let seed = frontier.seeds.pop().unwrap();
-        let seeds = (0..6)
-            .map(|i| Seed {
-                backward_rank: 0,
-                graph: seed.graph.clone(),
-                options: seed.options.clone(),
-                plan: seed.plan.clone(),
-                description: format!("graph={i}"),
-            })
-            .collect();
-        let mut frontier = implementations(seeds, frontier.caps, 65536, 512 << 20, true);
-        frontier.enable_matrix_inputs(&[crate::DType::F16], &matrix_caps(&[[8, 16, 16]], &[]));
+        let make = || {
+            let mut frontier = graph_frontier(g.deep_clone());
+            let seed = frontier.seeds.pop().unwrap();
+            let seeds = (0..6)
+                .map(|i| Seed {
+                    backward_rank: 0,
+                    graph: seed.graph.clone(),
+                    options: seed.options.clone(),
+                    plan: seed.plan.clone(),
+                    description: format!("graph={i}"),
+                })
+                .collect();
+            let mut frontier = implementations(seeds, frontier.caps, 65536, 512 << 20, true);
+            frontier.enable_matrix_inputs(&[crate::DType::F16], &matrix_caps(&[[8, 16, 16]], &[]));
+            frontier
+        };
+        let mut frontier = make();
         let baseline = frontier.next(None).unwrap();
         let algorithm = frontier.next(baseline.origin).unwrap();
         assert!(choice_of(&frontier, &algorithm).winograd_weight);
@@ -2060,6 +2091,22 @@ mod tests {
         let arithmetic = frontier.next(algorithm.origin).unwrap();
         assert_eq!(arithmetic.origin.unwrap().form, 0);
         let choice = choice_of(&frontier, &arithmetic);
+        assert!(choice.winograd_weight);
+        assert_eq!(choice.matrix_inputs, Some(crate::DType::F16));
+        // A noisy first algorithm trial may keep the baseline. Precision
+        // can then win independently; the combined coordinate must be retried.
+        let mut frontier = make();
+        let baseline = frontier.next(None).unwrap();
+        let _inconclusive = frontier.next(baseline.origin).unwrap();
+        let arithmetic = frontier.next(baseline.origin).unwrap();
+        assert_eq!(
+            choice_of(&frontier, &arithmetic).matrix_inputs,
+            Some(crate::DType::F16)
+        );
+        assert!(!choice_of(&frontier, &arithmetic).winograd_weight);
+        assert!(frontier.early_programs_remaining(arithmetic.origin) > 0);
+        let combined = frontier.next(arithmetic.origin).unwrap();
+        let choice = choice_of(&frontier, &combined);
         assert!(choice.winograd_weight);
         assert_eq!(choice.matrix_inputs, Some(crate::DType::F16));
     }
