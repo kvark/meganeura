@@ -84,6 +84,48 @@ If asked:
 
 ---
 
+<!-- _class: apis -->
+
+# Vulkan and Metal
+
+<div class="api-cards">
+<div><h3>Vulkan</h3><p class="who">Khronos open standard · since 2016</p><p>Windows · Linux · Android</p><p>Drivers from NVIDIA, AMD, Intel, Qualcomm, Arm and open-source Mesa</p><p class="lang">Shaders: <b>SPIR-V</b></p></div>
+<div><h3>Metal</h3><p class="who">Apple · since 2014</p><p>macOS · iOS · visionOS</p><p>Every Apple GPU</p><p class="lang">Shaders: <b>Metal Shading Language</b></p></div>
+</div>
+
+<div class="api-compute"><p><b>Compute:</b> compute shaders · buffers · workgroup shared memory · subgroups · command queues</p><p><b>Optional, reported per device:</b> matrix tiles · 8-bit dot products · GPU timestamps</p></div>
+
+**Low-level and explicit, built for games. No ML libraries: we write every kernel.**
+
+<!--
+Time: 0:45.
+
+For those who do not live in graphics: Vulkan and Metal are the GPU APIs that
+games and other applications draw with. Vulkan is the Khronos open standard,
+released in 2016, with drivers from every major GPU vendor on Windows, Linux
+and Android, including the open-source Mesa drivers. Metal is Apple's API,
+since 2014, on every Apple device.
+
+Both are low-level and explicit: the application allocates buffers, records
+commands and submits them to a queue. For compute they offer compute shaders,
+workgroup shared memory and subgroup operations. Optional features, which
+each device reports, add matrix tiles, 8-bit dot products and timestamps.
+Shaders are SPIR-V on Vulkan and the Metal Shading Language on Apple.
+
+What they do not have is any ML library: no cuBLAS, no cuDNN. Everything
+above the API, including every kernel, is ours.
+
+If asked:
+- Vulkan also reaches Apple GPUs through MoltenVK, a translation layer; we use
+  Metal directly.
+- WebGPU sits above both; its wgpu implementation uses the same Naga shader
+  translator we do.
+- Matrix tiles: VK_KHR_cooperative_matrix on Vulkan, simdgroup matrices on
+  Apple GPUs. Backup "Matrix paths selected".
+-->
+
+---
+
 <!-- _class: stack-table -->
 
 # Stack comparison
@@ -200,6 +242,8 @@ If asked:
   name. The importers are fuzzed so malformed files return errors.
 - Preparation outside search takes a median 1.7s per workload process: backup "How do we write the kernels?".
 - Loading and running an ONNX file: backup "Importing a model".
+- From PyTorch: today through torch.onnx.export and load_onnx; a direct
+  exporter is planned. Backup "From PyTorch".
 
 Sources: examples/mnist.rs; src/graph.rs, src/nn.rs, src/train.rs;
 src/load/onnx.rs, src/load/nnef.rs, src/load/gguf/; src/models/;
@@ -332,6 +376,8 @@ https://github.com/egraphs-good/egg/blob/main/src/tutorials/_01_background.rs
 ![Candidate programs, the e-graph forms combined with layouts, fusion, matrix types and submissions, go through four steps each: build, validate, tune and measure. An invalid candidate is dropped; the winner is the fastest validated program.](figures/search.svg)
 
 **30s per session.** 49% of sessions pick a non-default program.
+
+**No code for a particular GPU or platform:** choices follow reported capabilities and measured time.
 
 <!--
 Time: 0:55.
@@ -551,9 +597,10 @@ https://github.com/kvark/dinovision/blob/dc35cdf1c7c910cdd93c5b5362846842ae469a2
 
 # MI300X driver
 
+<p class="mi300-before"><b>Before our patches, Vulkan cannot use the MI300X at all:</b> no Vulkan driver supports this compute-only accelerator.</p>
+
 <div class="columns mi300-columns"><div>
 
-- Compute-only accelerator
 - RADV: compute + f16 / f32 matrix tiles
 - AMDGPU patch targets all eight dies
 - Draft: Mesa MR 45239
@@ -609,7 +656,7 @@ https://www.amd.com/en/products/accelerators/instinct/mi300/mi300x.html
 
 <div class="measure-rows">
 <div><b>Models</b><span class="kinds"><i><b>LLM</b>SmolLM2-135M</i><i><b>Robot policy</b>SmolVLA</i><i><b>Image diffusion</b>SD U-Net</i><i><b>Vision</b>ResNet-50</i><i><b>Speech</b>Whisper-tiny</i></span></div>
-<div><b>GPUs</b><span class="gpu-groups"><i><b>NVIDIA</b>RTX 5070 · H100 · <u>RTX 3050</u></i><i><b>AMD</b>RX 7900 XT · MI300X · <u>780M · 9600X</u></i><i><b>Intel</b>Arc B570 · <u>RPL-U</u></i><i><b>Apple</b>M3</i><i><b>Qualcomm</b><u>Quest 3S</u></i><em>Native: 30/30 core cells on each GPU. <u>Underlined</u>: checked, not timed.</em></span></div>
+<div><b>GPUs</b><span class="gpu-groups"><i><b>NVIDIA</b>RTX 5070 · H100 · <u>RTX 3050</u> <span class="os">⊞ Windows</span></i><i><b>AMD</b>RX 7900 XT · MI300X · <u>780M · 9600X</u></i><i><b>Intel</b>Arc B570 · <u>RPL-U</u></i><i><b>Apple</b>M3</i><i><b>Qualcomm</b><u>Quest 3S</u></i><em>Native: 30/30 core cells on each GPU. <u>Underlined</u>: checked against CPU references, no PyTorch GPU timing: Windows (RTX 3050), ROCm failed on the Radeon iGPUs, no XPU device on RPL-U, Android on Quest.</em></span></div>
 <div><b>Baseline</b><span>PyTorch 2.13 · <code>torch.compile</code> + graph replay where available</span></div>
 <div><b>Each run</b><span class="flow">Check → warm up 10s → time 20 calls → 3 fresh process pairs</span></div>
 </div>
@@ -984,18 +1031,18 @@ Sources: data/results.csv; data/summary.json; data/hardware.json;
 <div class="columns backup-list"><div>
 
 **Productivity**
-[Importing a model](#21) · [Inside Meganeura](#22) · [How do we describe a model?](#23) · [Which form is faster?](#24) · [How do we write the kernels?](#25) · [Gradients](#26) · [Compile stages](#27)
+[Importing a model](#22) · [From PyTorch](#23) · [Inside Meganeura](#24) · [How do we describe a model?](#25) · [Which form is faster?](#26) · [How do we write the kernels?](#27) · [Gradients](#28) · [Compile stages](#29)
 
 **Portability**
-[Matrix paths selected](#28) · [Where paths stop](#29) · [What search costs](#30) · [Reusing kernel decisions](#31) · [Coverage](#32)
+[Matrix paths selected](#30) · [Where paths stop](#31) · [What search costs](#32) · [Reusing kernel decisions](#33) · [Coverage](#34)
 
 </div><div>
 
 **Performance**
-[Minimal shape](#33) · [Precision gains](#34) · [Two gaps](#35) · [Precision rules](#36) · [What the checks admit](#37) · [Where TF32 fits](#38) · [SPIR-V precision](#39) · [Timing variability](#40) · [Warmup](#41) · [Portability scores](#42)
+[Minimal shape](#35) · [Precision gains](#36) · [Two gaps](#37) · [Precision rules](#38) · [What the checks admit](#39) · [Where TF32 fits](#40) · [SPIR-V precision](#41) · [Timing variability](#42) · [Warmup](#43) · [Portability scores](#44)
 
 **Deployment**
-[Queue measurements](#43) · [Learning on the device](#44)
+[Queue measurements](#45) · [Learning on the device](#46)
 
 </div></div>
 
@@ -1029,7 +1076,7 @@ session.wait();
 let logits = session.read_output(1000);
 ```
 
-<small>NNEF loads the same way with load_nnef. GGUF builds a text generator: load_gguf(path)?.generator(2048)?.</small>
+<small>NNEF loads the same way with load_nnef. GGUF builds a text generator: load_gguf(path)?.generator(2048)?. From PyTorch today: torch.onnx.export, then load_onnx (scripts/export_onnx.py).</small>
 
 <!--
 Backup, for "can I bring an existing model?"
@@ -1046,6 +1093,60 @@ If asked:
 
 Sources: src/load/onnx.rs, src/load/nnef.rs, src/load/gguf/;
 examples/onnx_compare.rs, examples/gguf_generate.rs.
+-->
+
+---
+
+<!-- _header: 'Backup · Productivity · planned' -->
+<!-- _class: from-torch -->
+
+# From PyTorch
+
+<p class="lead">Today: <code>torch.onnx.export</code>, then <code>load_onnx</code>. Planned: one call, no ONNX in between.</p>
+
+<div class="torch-flow">
+<div><h3>1 Capture</h3><b>torch.export</b><span>whole graph as ATen ops, no Python left</span></div>
+<div><h3>2 Lower</h3><b>Core ATen</b><span>keep attention, norms and convolutions; decompose the rest</span></div>
+<div><h3>3 Emit</h3><b>graph + safetensors</b><span>state_dict names; trainable from requires_grad</span></div>
+<div><h3>4 Check</h3><b>f64 interpreter</b><span>against PyTorch on the CPU, before the file ships</span></div>
+</div>
+
+```python
+meganeura.export(model, (example,), "model.mgn")  # pass a loss module to train
+```
+
+<p class="torch-note">Rust loads the file into the same Graph; training uses our autodiff and optimizers. Unsupported ops are listed together, with their source lines.</p>
+
+<!--
+Backup, for "can I bring a PyTorch model?"
+
+Today the route is ONNX: torch.onnx.export writes the graph, load_onnx reads
+it, and rewrite rules re-fuse the patterns PyTorch's exporter decomposes. It
+works for standard models, but ONNX is an inference format and an extra
+dependency, and its decompositions hide intent.
+
+The planned exporter is a small, pure-Python package. torch.export captures
+the whole model as an ATen graph with no Python left. We lower to the core
+ATen operator set, but keep the operators we have fused kernels for, such as
+scaled-dot-product attention, layer and group norm and convolution, so the
+compiler sees intent instead of fragments. Each node maps to a Graph op; the
+file holds the graph and safetensors weights under their state_dict names,
+with requires_grad deciding parameter versus constant. Before writing, the
+exporter runs our CPU f64 interpreter on the example input and compares it
+with PyTorch. For training, the user exports the model with its loss; our
+autodiff builds the backward pass and Meganeura's optimizers update the same
+named weights, so checkpoints map back to the state_dict.
+
+If asked:
+- Static shapes: each exported shape is its own graph, as in Meganeura today.
+- A torch.compile backend could reuse the same op table for trying it from
+  Python; deployment still uses the file.
+- Effort: the op table (a few hundred core ATen ops, most mapping to existing
+  primitives), the Rust loader and per-op round-trip tests.
+- Not implemented yet; nothing in the results uses it.
+
+Sources: scripts/export_onnx.py; src/load/onnx.rs; src/optimize.rs, ONNX
+decomposed op recognition; src/reference/.
 -->
 
 ---
