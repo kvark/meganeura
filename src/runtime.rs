@@ -952,6 +952,13 @@ enum Variant {
         u32,
     ),
     SpecializedConv(ShaderEntry, Vec<u32>, u32, bool),
+    ConvWeight(
+        ShaderEntry,
+        Vec<u32>,
+        u32,
+        bool,
+        crate::codegen::ConvWeightStaging,
+    ),
     ScalarMatmul(
         ShaderEntry,
         crate::compile::WeightFormat,
@@ -1052,6 +1059,7 @@ impl Variant {
             | Variant::CoopTiled(ref e, _, _, _)
             | Variant::SplitMatmul(ref e, _, _, _)
             | Variant::SpecializedConv(ref e, _, _, _)
+            | Variant::ConvWeight(ref e, ..)
             | Variant::ScalarMatmul(ref e, _, _)
             | Variant::Epilogue(ref e, _)
             | Variant::CoopEpilogue(ref e, _)
@@ -1107,6 +1115,11 @@ impl Variant {
             }
             Variant::SpecializedConv(ref e, ref params, k_tile, interleave) => {
                 format!("{e:?}:fixed-native-div-k{k_tile}-interleave{interleave}-{params:?}")
+            }
+            Variant::ConvWeight(ref e, ref params, k_tile, interleave, staging) => {
+                format!(
+                    "{e:?}:fixed-native-div-k{k_tile}-interleave{interleave}-staging{staging:?}-{params:?}"
+                )
             }
             Variant::Reduction(hash) => format!("generated-reduction:{hash:016x}"),
             Variant::Pointwise(hash) => format!("generated-pointwise:{hash:016x}"),
@@ -2059,7 +2072,7 @@ impl Pipelines {
                 dispatch.weight_format,
                 matmul_knobs,
             ),
-            Variant::SpecializedConv(..) => {
+            Variant::SpecializedConv(..) | Variant::ConvWeight(..) => {
                 let tile = crate::tune::MatmulTile::selected(dispatch, None)
                     .expect("specialized convolution");
                 tuning::tile_module(dispatch, tile, matmul_knobs)
@@ -2353,6 +2366,20 @@ impl Pipelines {
         }
         if let crate::compile::Kernel::SplitMatmul { shape, splits } = dispatch.kernel {
             return Variant::SplitMatmul(entry, dispatch.weight_format, shape, splits);
+        }
+        if let crate::compile::Kernel::ConvWeight {
+            k_tile,
+            interleave_columns,
+            staging,
+        } = dispatch.kernel
+        {
+            return Variant::ConvWeight(
+                entry,
+                dispatch.params.clone(),
+                k_tile,
+                interleave_columns,
+                staging,
+            );
         }
         if let Some(k_tile) = dispatch.conv_k_tile() {
             return Variant::SpecializedConv(

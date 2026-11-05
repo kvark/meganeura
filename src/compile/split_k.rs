@@ -394,8 +394,12 @@ impl ExecutionPlan {
             let partial = BufferRef(buffer_index);
             let mut producer = dispatch.clone();
             let mut width = match tile {
-                MatmulTile::Tile16 | MatmulTile::SpecializedConv { tile_size: 16, .. } => 16,
-                MatmulTile::Tile32 | MatmulTile::SpecializedConv { tile_size: 32, .. } => 32,
+                MatmulTile::Tile16
+                | MatmulTile::SpecializedConv { tile_size: 16, .. }
+                | MatmulTile::ConvWeight { tile_size: 16, .. } => 16,
+                MatmulTile::Tile32
+                | MatmulTile::SpecializedConv { tile_size: 32, .. }
+                | MatmulTile::ConvWeight { tile_size: 32, .. } => 32,
                 _ => 64,
             };
             // Reduction partitions can fill the device without narrowing the

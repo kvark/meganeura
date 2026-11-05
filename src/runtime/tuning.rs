@@ -43,7 +43,7 @@ pub struct KernelMemo {
 
 // Bump when kernel generation, qualification or decision semantics change,
 // including changes between package releases. This also versions the memo schema.
-const KERNEL_MEMO_REVISION: u32 = 13;
+const KERNEL_MEMO_REVISION: u32 = 14;
 
 /// Undecided classes predicted to total less than this share of the plan are
 /// not probed. Kernel winners are accepted together, so classes well below
@@ -346,6 +346,9 @@ impl Pipelines {
                         | ShaderEntry::Conv2dGradWeightGemm
                         | ShaderEntry::Conv2dGradWeightGemmSmall
                         | ShaderEntry::Conv2dGradWeightGemm16
+                        | ShaderEntry::Conv2dGradWeightGemmSplit
+                        | ShaderEntry::Conv2dGradWeightGemmSplitSmall
+                        | ShaderEntry::Conv2dGradWeightGemmSplit16
                 )
             });
             !convolution || used.contains(key)
@@ -359,6 +362,22 @@ pub(super) fn tile_module(
     knobs: crate::codegen::MatmulKnobs,
 ) -> crate::codegen::ShaderModule {
     let entry = &dispatch.shader;
+    if let MatmulTile::ConvWeight {
+        k_tile,
+        interleave_columns,
+        staging,
+        ..
+    } = tile
+    {
+        let params = super::Conv2dParams::from(dispatch);
+        return crate::codegen::generate_conv_weight_module(
+            tile.shader(entry).shader_group(),
+            k_tile,
+            interleave_columns,
+            staging,
+            Some(bytemuck::cast_slice(std::slice::from_ref(&params))),
+        );
+    }
     if let MatmulTile::Scalar(shape) = tile {
         let options = crate::codegen::MatMulOptions {
             format: dispatch.weight_format,
@@ -474,7 +493,10 @@ pub(super) fn tile_module(
                     dispatch.mnk().is_some_and(|(m, _, _)| shape.ragged_rows(m)),
                 )
             }
-            MatmulTile::SpecializedConv { .. } | MatmulTile::Gemv(_) | MatmulTile::Scalar(_) => {
+            MatmulTile::SpecializedConv { .. }
+            | MatmulTile::ConvWeight { .. }
+            | MatmulTile::Gemv(_)
+            | MatmulTile::Scalar(_) => {
                 unreachable!()
             }
         }
@@ -530,6 +552,15 @@ fn retain_tunable_classes(
     let shared_limit = capabilities.max_compute_shared_memory_size;
     for class in classes.iter_mut() {
         class.challengers.retain(|tile| match *tile {
+            MatmulTile::ConvWeight {
+                tile_size, k_tile, ..
+            }
+            | MatmulTile::SpecializedConv {
+                tile_size, k_tile, ..
+            } => {
+                shared_limit == 0
+                    || 4 * (tile_size * (k_tile + 1) + k_tile * (tile_size + 1)) <= shared_limit
+            }
             MatmulTile::CooperativeTiled { shape, .. } => {
                 shared_limit == 0 || shape.shared_bytes() <= shared_limit
             }
@@ -1501,8 +1532,13 @@ fn prepare_comparison(
             let splits = tile
                 .partitions()
                 .expect("split products only take partitioned candidates");
-            let sum =
-                sequence[0].partial_sum(partial, sequence[0].output_buffer, columns, splits, true);
+            let sum = sequence[0].partial_sum(
+                partial,
+                sequence[0].output_buffer,
+                columns,
+                splits,
+                class.key.conv2d.is_none(),
+            );
             sequence[0].output_buffer = partial;
             sequence.push(sum);
         }
@@ -3744,6 +3780,51 @@ mod tests {
             1.0
         ));
         assert!(!reordered_outputs_agree(&reference, &[12.0, 3.0e-3], 1.0));
+    }
+
+    #[test]
+    fn convolution_staging_probes_the_producer_and_live_sum_layout() {
+        let mut g = crate::Graph::new();
+        let x = g.input("x", &[4 * 64 * 56 * 56]);
+        let dy = g.input("dy", &[4 * 64 * 56 * 56]);
+        let w = g.conv2d_grad_weight(dy, x, 64, 56, 56, 64, 3, 3, 1, 1, 1);
+        g.set_outputs(vec![w]);
+        let mut plan = crate::compile::compile(&g);
+        let alias = crate::memplan::AliasPlan::identity(&plan.buffers);
+        let (classes, _) = collect_classes(&plan, &alias, None);
+        assert_eq!(classes.len(), 1);
+        let class = &classes[0];
+        assert!(class.key.split_k);
+        assert_eq!(class.reductions.len(), 1);
+        let candidates = [
+            class.initial,
+            *class
+                .challengers
+                .iter()
+                .find(|t| {
+                    matches!(
+                        t,
+                        MatmulTile::ConvWeight {
+                            staging: crate::codegen::ConvWeightStaging::Reduction,
+                            ..
+                        }
+                    )
+                })
+                .unwrap(),
+        ];
+        let prepared = prepare_comparison(class, &plan.dispatches[class.members[0]], &candidates);
+        for sequence in prepared.sequences {
+            assert_eq!(sequence.len(), 2);
+            assert_eq!(sequence[1].shader, ShaderEntry::SumRows);
+            assert_eq!(sequence[1].params[2], 0, "match the live parallel-row sum");
+            assert_eq!(
+                sequence[1].params[..2],
+                plan.dispatches[class.reductions[0]].params[..2]
+            );
+            assert_eq!(sequence[1].input_buffers, [sequence[0].output_buffer]);
+        }
+        plan.dispatches[class.reductions[0]].params[0] += 1;
+        assert!(collect_classes(&plan, &alias, None).0.is_empty());
     }
 
     #[test]

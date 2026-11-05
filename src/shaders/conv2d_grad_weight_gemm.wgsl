@@ -1,3 +1,4 @@
+// @section kernel
 // Conv2d backward w.r.t. kernel via implicit GEMM.
 //
 // grad_weight[Co, Ci*kH*kW] = grad_out_flat[Co, N*oH*oW] × im2col(input)[N*oH*oW, Ci*kH*kW]
@@ -34,18 +35,13 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     let pointwise = params.kernel_h == 1u && params.kernel_w == 1u && params.stride == 1u
         && params.padding_h == 0u && params.padding_w == 0u;
 
-    // Every tile width divides 256, so each thread stages one K position
-    // (image, output row, output column) of both tiles: lanes walk the
-    // reduction, which is contiguous in NCHW for grad_out and for each
-    // im2col column of the input, so a wave reads runs of pixels instead of
-    // one element from each of its columns' channel planes. The K position
-    // advances by KTILE per stage, carried through (n, oh, ow) instead of
-    // divided; a thread's columns are the same every stage and advance by
-    // 256/KTILE per slot through (ci, kh, kw).
+    // A staging walks the reduction: adjacent lanes read pixels from the
+    // same NCHW channel. Carry (image, row, column) across K stages.
+    // B staging is selected independently: column ownership or adjacent
+    // reduction positions, with identical shared-tile and F32 contracts.
     let k_lane = tid % $KTILE_U;
     let col_lane = tid / $KTILE_U;
-    let col_step = split_digits(256u / $KTILE_U, params.kernel_h, params.kernel_w, params.kernel_w_multiplier, params.kernel_hw_multiplier);
-    let col_first = split_digits(tile_col + col_lane, params.kernel_h, params.kernel_w, params.kernel_w_multiplier, params.kernel_hw_multiplier);
+    $B_COLUMN_SETUP
 
     $ACC_DECL
 
@@ -53,6 +49,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
     var t = $K_START;
     let k_step = split_digits($KTILE_U, params.out_h, params.out_w, params.column_width_multiplier, params.output_spatial_multiplier);
     var k_pos = split_digits(t + k_lane, params.out_h, params.out_w, params.column_width_multiplier, params.output_spatial_multiplier);
+    $B_POSITION_SETUP
     loop {
         if t >= $K_END { break; }
 
@@ -76,28 +73,7 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         // Load B tile: im2col(input)[N*oH*oW, Ci*kH*kW].
         // B[k_idx, col] where k_idx = n*oH*oW + oh*oW + ow, col = ci*kH*kW + kh*kW + kw
         // B[k_idx, col] = input[n, ci, oh*stride+kh-padding, ow*stride+kw-padding]
-        let h0 = i32(k_pos.middle * params.stride) - i32(params.padding_h);
-        let w0 = i32(k_pos.inner * params.stride) - i32(params.padding_w);
-        let image = k_pos.outer * params.in_channels * input_spatial;
-        var c = col_first;
-        for (var e = 0u; e < $STAGE_EPT_U; e++) {
-            let col_local = col_lane + e * (256u / $KTILE_U);  // N dimension
-            var val = 0.0;
-            if in_k && tile_col + col_local < n_total {
-                // A pointwise window preserves the reduction's spatial index.
-                if pointwise {
-                    val = src[image + c.outer * input_spatial + rem_a];
-                } else {
-                    let ih = h0 + i32(c.middle);
-                    let iw = w0 + i32(c.inner);
-                    if ih >= 0 && u32(ih) < params.in_h && iw >= 0 && u32(iw) < params.in_w {
-                        val = src[image + c.outer * input_spatial + u32(ih) * params.in_w + u32(iw)];
-                    }
-                }
-            }
-            shared_b[k_lane * $B_STRIDE_U + col_local] = val;
-            c = advance_digits(c, col_step, params.kernel_h, params.kernel_w);
-        }
+        $B_STAGE_BODY
         k_pos = advance_digits(k_pos, k_step, params.out_h, params.out_w);
 
         workgroupBarrier();
@@ -124,3 +100,55 @@ fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) li
         }
     }
 }
+
+// @section reduction_setup
+    let col_step = split_digits(256u / $KTILE_U, params.kernel_h, params.kernel_w, params.kernel_w_multiplier, params.kernel_hw_multiplier);
+    let col_first = split_digits(tile_col + col_lane, params.kernel_h, params.kernel_w, params.kernel_w_multiplier, params.kernel_hw_multiplier);
+// @section reduction_stage
+        let h0 = i32(k_pos.middle * params.stride) - i32(params.padding_h);
+        let w0 = i32(k_pos.inner * params.stride) - i32(params.padding_w);
+        let image = k_pos.outer * params.in_channels * input_spatial;
+        var c = col_first;
+        for (var e = 0u; e < $STAGE_EPT_U; e++) {
+            let col_local = col_lane + e * (256u / $KTILE_U);  // N dimension
+            var val = 0.0;
+            if in_k && tile_col + col_local < n_total {
+                // A pointwise window preserves the reduction's spatial index.
+                if pointwise {
+                    val = src[image + c.outer * input_spatial + rem_a];
+                } else {
+                    let ih = h0 + i32(c.middle);
+                    let iw = w0 + i32(c.inner);
+                    if ih >= 0 && u32(ih) < params.in_h && iw >= 0 && u32(iw) < params.in_w {
+                        val = src[image + c.outer * input_spatial + u32(ih) * params.in_w + u32(iw)];
+                    }
+                }
+            }
+            shared_b[k_lane * $B_STRIDE_U + col_local] = val;
+            c = advance_digits(c, col_step, params.kernel_h, params.kernel_w);
+        }
+// @section columns_setup
+    let b_col = tid % $BM_U;
+    let b_column = split_digits(tile_col + b_col, params.kernel_h, params.kernel_w, params.kernel_w_multiplier, params.kernel_hw_multiplier);
+// @section columns_position
+    let b_step = split_digits(256u / $BM_U, params.out_h, params.out_w, params.column_width_multiplier, params.output_spatial_multiplier);
+    var b_pos = split_digits($K_START + tid / $BM_U, params.out_h, params.out_w, params.column_width_multiplier, params.output_spatial_multiplier);
+// @section columns_stage
+    for (var e = 0u; e < $STAGE_EPT_U; e++) {
+        let row_local = tid / $BM_U + e * (256u / $BM_U);
+        var val = 0.0;
+        if t + row_local < k_total && tile_col + b_col < n_total {
+            if pointwise {
+                let pixel = b_pos.middle * params.out_w + b_pos.inner;
+                val = src[(b_pos.outer * params.in_channels + b_column.outer) * input_spatial + pixel];
+            } else {
+                let ih = i32(b_pos.middle * params.stride + b_column.middle) - i32(params.padding_h);
+                let iw = i32(b_pos.inner * params.stride + b_column.inner) - i32(params.padding_w);
+                if ih >= 0 && u32(ih) < params.in_h && iw >= 0 && u32(iw) < params.in_w {
+                    val = src[(b_pos.outer * params.in_channels + b_column.outer) * input_spatial + u32(ih) * params.in_w + u32(iw)];
+                }
+            }
+        }
+        shared_b[row_local * $B_STRIDE_U + b_col] = val;
+        b_pos = advance_digits(b_pos, b_step, params.out_h, params.out_w);
+    }

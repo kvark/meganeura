@@ -1257,6 +1257,12 @@ pub enum Kernel {
         #[serde(default)]
         interleave_columns: bool,
     },
+    /// Measured scalar weight-gradient staging, with unchanged F32 arithmetic.
+    ConvWeight {
+        k_tile: u32,
+        interleave_columns: bool,
+        staging: crate::codegen::ConvWeightStaging,
+    },
     Cooperative,
     /// Checked partial tiles with explicit operand, multiplication and output
     /// types, and F32 accumulation. Multiple K partitions write F32 partials
@@ -1359,7 +1365,9 @@ impl Dispatch {
 
     pub fn conv_k_tile(&self) -> Option<u32> {
         match self.kernel {
-            Kernel::SpecializedConv { k_tile, .. } => Some(k_tile),
+            Kernel::SpecializedConv { k_tile, .. } | Kernel::ConvWeight { k_tile, .. } => {
+                Some(k_tile)
+            }
             _ => None,
         }
     }
@@ -1368,6 +1376,9 @@ impl Dispatch {
         matches!(
             self.kernel,
             Kernel::SpecializedConv {
+                interleave_columns: true,
+                ..
+            } | Kernel::ConvWeight {
                 interleave_columns: true,
                 ..
             }

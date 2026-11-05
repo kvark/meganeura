@@ -207,6 +207,14 @@ pub enum MatmulTile {
         #[serde(default)]
         interleave_columns: bool,
     },
+    /// Weight-gradient staging and its complete split-reduction sequence.
+    ConvWeight {
+        tile_size: u32,
+        k_tile: u32,
+        interleave_columns: bool,
+        staging: crate::codegen::ConvWeightStaging,
+        splits: u32,
+    },
     /// Hardware-native f32 operands/accumulators, never f16 staging.
     CooperativeF32 {
         tile_size: u32,
@@ -321,6 +329,41 @@ impl MatmulTile {
                 _ => None,
             }
         } else if let Some(launched) = conv_launched_tile(&dispatch.shader) {
+            if matches!(
+                dispatch.shader,
+                ShaderEntry::Conv2dGradWeightGemm
+                    | ShaderEntry::Conv2dGradWeightGemmSmall
+                    | ShaderEntry::Conv2dGradWeightGemm16
+                    | ShaderEntry::Conv2dGradWeightGemmSplit
+                    | ShaderEntry::Conv2dGradWeightGemmSplitSmall
+                    | ShaderEntry::Conv2dGradWeightGemmSplit16
+            ) {
+                let settings = match dispatch.kernel {
+                    Kernel::SpecializedConv {
+                        k_tile,
+                        interleave_columns,
+                    } => Some((
+                        k_tile,
+                        interleave_columns,
+                        crate::codegen::ConvWeightStaging::Columns,
+                    )),
+                    Kernel::ConvWeight {
+                        k_tile,
+                        interleave_columns,
+                        staging,
+                    } => Some((k_tile, interleave_columns, staging)),
+                    _ => None,
+                };
+                if let Some((k_tile, interleave_columns, staging)) = settings {
+                    return Some(Self::ConvWeight {
+                        tile_size: launched,
+                        k_tile,
+                        interleave_columns,
+                        staging,
+                        splits: dispatch.workgroups[2],
+                    });
+                }
+            }
             match dispatch.kernel {
                 Kernel::Default | Kernel::SmallTile => Some(match launched {
                     16 => Self::Tile16,
@@ -403,6 +446,7 @@ impl MatmulTile {
             Self::CooperativeTiled { splits, .. }
             | Self::CooperativeWorkgroup { splits, .. }
             | Self::CooperativeChecked { splits } => Some(splits),
+            Self::ConvWeight { splits, .. } if splits > 1 => Some(splits),
             _ => None,
         }
     }
@@ -414,7 +458,8 @@ impl MatmulTile {
             | Self::Tile32
             | Self::Tile64
             | Self::Scalar(_)
-            | Self::SpecializedConv { .. } => TileFamily::Scalar,
+            | Self::SpecializedConv { .. }
+            | Self::ConvWeight { .. } => TileFamily::Scalar,
             Self::CooperativeF32 { .. }
             | Self::CooperativeF16 { .. }
             | Self::CooperativeWorkgroup { .. }
@@ -485,6 +530,16 @@ impl MatmulTile {
                 k_tile,
                 interleave_columns,
             },
+            Self::ConvWeight {
+                k_tile,
+                interleave_columns,
+                staging,
+                ..
+            } => crate::compile::Kernel::ConvWeight {
+                k_tile,
+                interleave_columns,
+                staging,
+            },
             Self::Gemv(_) | Self::CooperativeChecked { .. } | Self::CooperativeWorkgroup { .. } => {
                 unreachable!()
             }
@@ -493,9 +548,15 @@ impl MatmulTile {
 
     pub(crate) fn shader(self, entry: &ShaderEntry) -> ShaderEntry {
         let tile = match self {
-            Self::Tile16 | Self::SpecializedConv { tile_size: 16, .. } => 16,
-            Self::Tile32 | Self::SpecializedConv { tile_size: 32, .. } => 32,
-            Self::Tile64 | Self::SpecializedConv { tile_size: 64, .. } => 64,
+            Self::Tile16
+            | Self::SpecializedConv { tile_size: 16, .. }
+            | Self::ConvWeight { tile_size: 16, .. } => 16,
+            Self::Tile32
+            | Self::SpecializedConv { tile_size: 32, .. }
+            | Self::ConvWeight { tile_size: 32, .. } => 32,
+            Self::Tile64
+            | Self::SpecializedConv { tile_size: 64, .. }
+            | Self::ConvWeight { tile_size: 64, .. } => 64,
             Self::SpecializedConv { tile_size, .. } => tile_size,
             _ => return entry.clone(),
         };
@@ -503,6 +564,16 @@ impl MatmulTile {
     }
 
     pub(crate) fn workgroups(self, class: &TuneClass) -> [u32; 3] {
+        if let Self::ConvWeight {
+            tile_size, splits, ..
+        } = self
+        {
+            return [
+                class.n.div_ceil(tile_size),
+                class.m.div_ceil(tile_size),
+                splits,
+            ];
+        }
         let tile = match self {
             Self::Gemv(shape) => return class.gemv_workgroups(shape),
             Self::Tile16 => 16,
@@ -515,7 +586,9 @@ impl MatmulTile {
                     class.batch_dispatches(),
                 ];
             }
-            Self::SpecializedConv { tile_size, .. } => tile_size,
+            Self::SpecializedConv { tile_size, .. } | Self::ConvWeight { tile_size, .. } => {
+                tile_size
+            }
             Self::CooperativeTiled { shape, splits } => {
                 return [class.m / 64, class.n / shape.columns, splits];
             }
@@ -557,6 +630,34 @@ impl MatmulTile {
     }
 
     pub(crate) fn buffer_sizes(self, class: &TuneClass) -> Option<Vec<usize>> {
+        if let Self::ConvWeight {
+            tile_size,
+            k_tile,
+            splits,
+            ..
+        } = self
+        {
+            if class.shader != ShaderEntry::Conv2dGradWeightGemm
+                || class.conv2d.is_none()
+                || class.matrix_types.is_some()
+                || class.cooperative_f16
+                || class.weight_format != crate::compile::WeightFormat::F32
+                || !matches!(tile_size, 16 | 32 | 64)
+                || !matches!(k_tile, 16 | 32)
+                || splits == 0
+                || (splits > 1) != class.split_k
+                || (splits > 1 && (k_tile != 16 || splits > class.k.div_ceil(16)))
+            {
+                return None;
+            }
+            let mut sizes = class.buffer_sizes()?;
+            *sizes.last_mut()? = sizes.last()?.checked_mul(splits as usize)?;
+            return crate::compile::workgroups_within_portable_limits(self.workgroups(class))
+                .then_some(sizes);
+        }
+        if class.split_k && class.conv2d.is_some() {
+            return None;
+        }
         if let Self::CooperativeWorkgroup { shape, splits } = self {
             let types = class.effective_matrix_types()?;
             if !matches!(types.multiply, crate::DType::F16 | crate::DType::BF16)
@@ -745,6 +846,9 @@ impl TuneClass {
                 | ShaderEntry::Conv2dGradWeightGemm
                 | ShaderEntry::Conv2dGradWeightGemmSmall
                 | ShaderEntry::Conv2dGradWeightGemm16
+                | ShaderEntry::Conv2dGradWeightGemmSplit
+                | ShaderEntry::Conv2dGradWeightGemmSplitSmall
+                | ShaderEntry::Conv2dGradWeightGemmSplit16
         ) || (dispatch.use_coop() && dispatch.weight_format.uses_reduced_storage())
             || dispatch.horizontal_batch >= 2
             || dispatch.matmul_prologue.is_some()
@@ -758,20 +862,38 @@ impl TuneClass {
             return None;
         }
         // Tiled and typed products dispatch one Z layer per K partition.
+        let conv_split = matches!(
+            dispatch.shader,
+            ShaderEntry::Conv2dGradWeightGemmSplit
+                | ShaderEntry::Conv2dGradWeightGemmSplitSmall
+                | ShaderEntry::Conv2dGradWeightGemmSplit16
+        );
+        if conv_split && (dispatch.workgroups[2] < 2 || dispatch.conv_k_tile().is_none()) {
+            return None;
+        }
         let (partitions, matrix_types) = match dispatch.kernel {
             crate::compile::Kernel::CooperativeTiled { splits, .. } => (splits, None),
             crate::compile::Kernel::CooperativeTyped { types, splits } => (splits, Some(types)),
             crate::compile::Kernel::CooperativeWorkgroup { types, splits, .. } => (splits, types),
-            _ => (1, None),
+            _ => (
+                if conv_split {
+                    dispatch.workgroups[2]
+                } else {
+                    1
+                },
+                None,
+            ),
         };
         let shader = match dispatch.shader {
             ShaderEntry::Conv2dGemmSmall | ShaderEntry::Conv2dGemm16 => ShaderEntry::Conv2dGemm,
             ShaderEntry::Conv2dGradInputGemmSmall | ShaderEntry::Conv2dGradInputGemm16 => {
                 ShaderEntry::Conv2dGradInputGemm
             }
-            ShaderEntry::Conv2dGradWeightGemmSmall | ShaderEntry::Conv2dGradWeightGemm16 => {
-                ShaderEntry::Conv2dGradWeightGemm
-            }
+            ShaderEntry::Conv2dGradWeightGemmSmall
+            | ShaderEntry::Conv2dGradWeightGemm16
+            | ShaderEntry::Conv2dGradWeightGemmSplit
+            | ShaderEntry::Conv2dGradWeightGemmSplitSmall
+            | ShaderEntry::Conv2dGradWeightGemmSplit16 => ShaderEntry::Conv2dGradWeightGemm,
             _ => dispatch.shader.clone(),
         };
         let conv2d = if matches!(
@@ -1038,6 +1160,38 @@ impl TuneClass {
                 .collect();
         }
         if self.conv2d.is_some() {
+            if self.shader == ShaderEntry::Conv2dGradWeightGemm {
+                let splits = initial.partitions().unwrap_or(1);
+                let mut choices = Vec::new();
+                for staging in [
+                    crate::codegen::ConvWeightStaging::Reduction,
+                    crate::codegen::ConvWeightStaging::Columns,
+                ] {
+                    for tile_size in [16, 32, 64] {
+                        for k_tile in [16, 32] {
+                            if splits > 1 && k_tile != 16 {
+                                continue;
+                            }
+                            for interleave_columns in [false, true] {
+                                if tile_size == 16 && interleave_columns {
+                                    continue;
+                                }
+                                let tile = MatmulTile::ConvWeight {
+                                    tile_size,
+                                    k_tile,
+                                    interleave_columns,
+                                    staging,
+                                    splits,
+                                };
+                                if tile != initial && tile.fits(self) {
+                                    choices.push(tile);
+                                }
+                            }
+                        }
+                    }
+                }
+                return choices;
+            }
             let mut out = Vec::new();
             for tile in [16u32, 32, 64] {
                 out.push(match tile {
@@ -2169,7 +2323,7 @@ mod tests {
             let candidates = class.challengers(MatmulTile::Tile64, Some(&native_config(16)));
             // Plain tiles and specialized K stages; 32/64-wide tiles also
             // challenge column interleaving. Exclude the incumbent.
-            assert_eq!(candidates.len(), 12);
+            assert_eq!(candidates.len(), if forward || dx { 12 } else { 20 });
             for candidate in candidates {
                 candidate.apply(&mut d, &class);
                 assert_eq!(MatmulTile::selected(&d, None), Some(candidate));

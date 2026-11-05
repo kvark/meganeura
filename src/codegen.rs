@@ -475,6 +475,18 @@ pub struct MatMulOptions {
     pub knobs: MatmulKnobs,
 }
 
+/// Which NCHW axis adjacent lanes load for a convolution weight gradient.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum ConvWeightStaging {
+    /// Existing channel/kernel-column ownership; robust untuned fallback.
+    #[default]
+    Columns,
+    /// Adjacent lanes stage adjacent reduction positions.
+    Reduction,
+}
+
 /// Generate a matmul shader module with a fused epilogue chain.
 ///
 /// Used by the runtime when a dispatch carries an epilogue. The ops are
@@ -1608,6 +1620,43 @@ fn conv_grad_weight_tiled(
     interleave_columns: bool,
     params: Option<&[u32]>,
 ) -> ShaderModule {
+    conv_grad_weight_staged(
+        tile,
+        split_k,
+        k_tile,
+        interleave_columns,
+        ConvWeightStaging::Columns,
+        params,
+    )
+}
+
+pub(crate) fn generate_conv_weight_module(
+    group: ShaderGroup,
+    k_tile: u32,
+    interleave_columns: bool,
+    staging: ConvWeightStaging,
+    params: Option<&[u32]>,
+) -> ShaderModule {
+    let (tile, split) = match group {
+        ShaderGroup::Conv2dGradWeightGemm => (MatMulTile::Large, false),
+        ShaderGroup::Conv2dGradWeightGemmSmall => (MatMulTile::Small, false),
+        ShaderGroup::Conv2dGradWeightGemm16 => (MatMulTile::Occupancy, false),
+        ShaderGroup::Conv2dGradWeightGemmSplit => (MatMulTile::Large, true),
+        ShaderGroup::Conv2dGradWeightGemmSplitSmall => (MatMulTile::Small, true),
+        ShaderGroup::Conv2dGradWeightGemmSplit16 => (MatMulTile::Occupancy, true),
+        _ => unreachable!("weight-gradient kernel"),
+    };
+    conv_grad_weight_staged(tile, split, k_tile, interleave_columns, staging, params)
+}
+
+fn conv_grad_weight_staged(
+    tile: MatMulTile,
+    split_k: bool,
+    k_tile: u32,
+    interleave_columns: bool,
+    staging: ConvWeightStaging,
+    params: Option<&[u32]>,
+) -> ShaderModule {
     assert!(!split_k || k_tile == 16, "split-K partitioning uses K=16");
     let (counts, range, start, end, offset) = if split_k {
         (
@@ -1625,9 +1674,25 @@ fn conv_grad_weight_tiled(
     } else {
         ("", "", "0u", "k_total", "")
     };
+    let template = include_str!("shaders/conv2d_grad_weight_gemm.wgsl");
+    let (setup, position, body) = match staging {
+        ConvWeightStaging::Reduction => (
+            template_section(template, "reduction_setup"),
+            "",
+            template_section(template, "reduction_stage"),
+        ),
+        ConvWeightStaging::Columns => (
+            template_section(template, "columns_setup"),
+            template_section(template, "columns_position"),
+            template_section(template, "columns_stage"),
+        ),
+    };
     let source = preprocess(
-        include_str!("shaders/conv2d_grad_weight_gemm.wgsl"),
+        template_section(template, "kernel"),
         &[
+            ("$B_COLUMN_SETUP", setup),
+            ("$B_POSITION_SETUP", position),
+            ("$B_STAGE_BODY", body),
             ("$COUNTS", counts),
             ("$K_RANGE", range),
             ("$K_START", start),
