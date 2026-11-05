@@ -10,6 +10,7 @@ use serde::Serialize;
 mod measure;
 mod storage;
 mod winograd;
+mod winograd_weight;
 pub use measure::BuildSearchTrial;
 use std::{
     collections,
@@ -343,7 +344,13 @@ pub fn build_measured_with_inputs(
         .iter()
         .copied()
         .partition(|&ty| runtime::typed_matrix_supported(&gpu, ty));
-    let mut programs = implementations(seeds, caps, shared_memory_bytes, options.max_plan_bytes);
+    let mut programs = implementations(
+        seeds,
+        caps,
+        shared_memory_bytes,
+        options.max_plan_bytes,
+        !cfg.optimize.no_winograd,
+    );
     // Arithmetic alternatives may replace this search's extracted scalar layouts,
     // but keep layouts already present in the caller's graph.
     programs.replace_extracted_matrices = forward_graph
@@ -487,6 +494,7 @@ struct AxisChoice {
     f16_attention: bool,
     gradient_inputs: Option<crate::DType>,
     forward_products: bool,
+    winograd_weight: bool,
 }
 
 /// Coordinate order over graph forms and physical choices (indices into the
@@ -520,6 +528,7 @@ struct CoordinateOrder {
     /// products need early coverage of arithmetic, not just scalar layouts.
     arithmetic_layouts: usize,
     priority_attention: Option<usize>,
+    early_choices: collections::VecDeque<usize>,
     deferred: collections::HashSet<(usize, usize)>,
 }
 
@@ -537,6 +546,7 @@ impl CoordinateOrder {
             priority_choices: collections::VecDeque::new(),
             arithmetic_layouts: ARITHMETIC_LAYOUTS,
             priority_attention: None,
+            early_choices: collections::VecDeque::new(),
             deferred: collections::HashSet::new(),
         }
     }
@@ -545,6 +555,14 @@ impl CoordinateOrder {
     fn next(&mut self, incumbent: (usize, usize)) -> Option<(usize, usize)> {
         if self.seeds == 0 || self.choices == 0 {
             return None;
+        }
+        if !self.tried.is_empty() {
+            while let Some(choice) = self.early_choices.pop_front() {
+                let entry = (incumbent.0, choice);
+                if self.mark(entry) {
+                    return Some(entry);
+                }
+            }
         }
         // Retain ordinary graph/derivative coverage on the existing targets.
         // Eight-wide products cover arithmetic after the ordinary fallback,
@@ -641,6 +659,7 @@ fn implementations(
     caps: crate::codegen::CoopCaps,
     shared_memory_bytes: u32,
     max_partial_bytes: usize,
+    allow_winograd_weight: bool,
 ) -> Implementations {
     let cached_attention = seeds.iter().any(|p| {
         p.graph
@@ -707,6 +726,18 @@ fn implementations(
             })
         })
         .collect();
+    let winograd_weight = allow_winograd_weight
+        && seeds
+            .iter()
+            .any(|seed| winograd_weight::fill(&mut seed.plan.clone(), max_partial_bytes) > 0);
+    let first_winograd_weight = choices.len();
+    if winograd_weight {
+        let ordinary = choices.clone();
+        choices.extend(ordinary.into_iter().map(|choice| AxisChoice {
+            winograd_weight: true,
+            ..choice
+        }));
+    }
     let f16_attention = caps.f16_attention_rows != 0
         && seeds.iter().any(|seed| {
             seed.plan
@@ -725,6 +756,13 @@ fn implementations(
     let mut order = CoordinateOrder::new(seeds.len(), choices.len());
     if f16_attention {
         order.priority_attention = Some(first_choice);
+    }
+    if winograd_weight {
+        // Convolution algorithm and forward arithmetic are independent axes.
+        // Cover their combinations before extra graph forms consume the budget.
+        // Otherwise an early dW win can displace a larger F16 forward win.
+        order.arithmetic_layouts = 1;
+        order.early_choices.push_back(first_winograd_weight);
     }
     let split_plans = Vec::new();
     Implementations {
@@ -1148,6 +1186,9 @@ fn fill_dense_product(
 
 impl measure::Frontier for Implementations {
     fn early_programs_remaining(&self, incumbent: Option<measure::Origin>) -> usize {
+        if !self.order.early_choices.is_empty() {
+            return self.order.early_choices.len();
+        }
         if self.order.arithmetic_layouts != 1 {
             return 0;
         }
@@ -1259,6 +1300,7 @@ impl measure::Frontier for Implementations {
                 let neighbor = AxisChoice {
                     gradient_inputs: arithmetic.gradient_inputs.or(active.gradient_inputs),
                     forward_products: arithmetic.forward_products || active.forward_products,
+                    winograd_weight: arithmetic.winograd_weight || active.winograd_weight,
                     attention: active.attention,
                     fuse_dispatches: active.fuse_dispatches,
                     f16_attention: active.f16_attention,
@@ -1325,7 +1367,8 @@ impl measure::Frontier for Implementations {
                             active.matrix_storage,
                         ),
                     ) + usize::from(choice.winograd != active.winograd)
-                        + usize::from(choice.gradient_inputs != active.gradient_inputs),
+                        + usize::from(choice.gradient_inputs != active.gradient_inputs)
+                        + usize::from(choice.winograd_weight != active.winograd_weight),
                     choice.forward_products != active.forward_products,
                     choice.f16_attention != active.f16_attention,
                     choice.attention != active.attention,
@@ -1345,6 +1388,7 @@ impl measure::Frontier for Implementations {
                 f16_attention,
                 gradient_inputs,
                 forward_products,
+                winograd_weight,
             } = self.choices[choice_index];
             let mut plan = if splits == 0
                 && !f16_attention
@@ -1411,6 +1455,9 @@ impl measure::Frontier for Implementations {
                 }
                 plan
             };
+            if winograd_weight && winograd_weight::fill(&mut plan, self.max_partial_bytes) == 0 {
+                continue;
+            }
             if forward_products
                 && fill_attention_products(
                     &mut plan,
@@ -1452,6 +1499,9 @@ impl measure::Frontier for Implementations {
                 "{}, dispatch_fusion={fuse_dispatches}, attention_splits={splits}, flash={flash:?}",
                 seed.description
             );
+            if winograd_weight {
+                description.push_str(", winograd_dw=F(4,3)");
+            }
             if f16_attention {
                 description.push_str(", f16_attention=true");
             }
@@ -1943,7 +1993,75 @@ mod tests {
             caps,
             65536,
             512 << 20,
+            true,
         )
+    }
+
+    #[test]
+    fn weight_gradient_algorithm_is_early_optional_and_reported() {
+        use measure::Frontier as _;
+        let mut g = Graph::new();
+        let x = g.input("x", &[2 * 64 * 17 * 19]);
+        let dy = g.input("dy", &[2 * 64 * 17 * 19]);
+        let dw = g.conv2d_grad_weight(dy, x, 64, 17, 19, 64, 3, 3, 1, 1, 1);
+        g.set_outputs(vec![dw]);
+        let mut frontier = graph_frontier(g);
+        let baseline = frontier.next(None).unwrap();
+        assert!(!baseline.description.contains("winograd_dw"));
+        let candidate = frontier.next(baseline.origin).unwrap();
+        assert!(candidate.description.contains("winograd_dw=F(4,3)"));
+        assert!(
+            candidate
+                .plan
+                .dispatches
+                .iter()
+                .any(|d| matches!(d.shader, compile::ShaderEntry::WinogradGradProduct(_)))
+        );
+        let mut disabled = implementations(frontier.seeds, frontier.caps, 65536, 512 << 20, false);
+        while let Some(candidate) = disabled.next(None) {
+            assert!(
+                !candidate
+                    .plan
+                    .dispatches
+                    .iter()
+                    .any(|d| matches!(d.shader, compile::ShaderEntry::WinogradGradProduct(_)))
+            );
+        }
+    }
+
+    #[test]
+    fn weight_gradient_choice_keeps_forward_arithmetic_in_early_cover() {
+        use measure::Frontier as _;
+        let mut g = Graph::new();
+        let x = g.input("x", &[2 * 64 * 17 * 19]);
+        let dy = g.input("dy", &[2 * 64 * 17 * 19]);
+        let w = g.parameter("w", &[64 * 64]);
+        let y = g.conv2d(x, w, 2, 64, 17, 19, 64, 1, 1, 1, 0);
+        let dw = g.conv2d_grad_weight(dy, x, 64, 17, 19, 64, 3, 3, 1, 1, 1);
+        g.set_outputs(vec![y, dw]);
+        let mut frontier = graph_frontier(g);
+        let seed = frontier.seeds.pop().unwrap();
+        let seeds = (0..6)
+            .map(|i| Seed {
+                backward_rank: 0,
+                graph: seed.graph.clone(),
+                options: seed.options.clone(),
+                plan: seed.plan.clone(),
+                description: format!("graph={i}"),
+            })
+            .collect();
+        let mut frontier = implementations(seeds, frontier.caps, 65536, 512 << 20, true);
+        frontier.enable_matrix_inputs(&[crate::DType::F16], &matrix_caps(&[[8, 16, 16]], &[]));
+        let baseline = frontier.next(None).unwrap();
+        let algorithm = frontier.next(baseline.origin).unwrap();
+        assert!(choice_of(&frontier, &algorithm).winograd_weight);
+        // Treat the algorithm as a winner, as in ResNet. Its precision
+        // challenger must retain it and run before any more graph forms.
+        let arithmetic = frontier.next(algorithm.origin).unwrap();
+        assert_eq!(arithmetic.origin.unwrap().form, 0);
+        let choice = choice_of(&frontier, &arithmetic);
+        assert!(choice.winograd_weight);
+        assert_eq!(choice.matrix_inputs, Some(crate::DType::F16));
     }
 
     /// Capabilities advertising these F16 and BF16 cooperative shapes; an
@@ -2010,6 +2128,7 @@ mod tests {
             },
             65536,
             512 << 20,
+            true,
         );
         let caps = matrix_caps(&[[8, 16, 16]], &[[8, 16, 16]]);
         frontier.enable_matrix_inputs(&[BF16, F16], &caps);
@@ -2687,7 +2806,7 @@ mod tests {
                     description: format!("graph={index}"),
                 })
                 .collect();
-            implementations(seeds, caps, 65536, 512 << 20)
+            implementations(seeds, caps, 65536, 512 << 20, true)
         };
         // Reserve half the ordinary 64-program allowance for submission probes.
         // Even with a full graph frontier, distinct attention layouts must fit.

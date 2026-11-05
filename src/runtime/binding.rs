@@ -14,8 +14,8 @@ use super::{
     ReductionParams, ReductionPass1Data, ReductionPass2RowData, RmsNormAddData, RmsNormData,
     RoPEData, RoPEDynamicData, RoPEDynamicFactorsData, RoPEParams, ScatterAddAtomicData,
     ScatterAddData, ScatterAddParams, Session, SoftmaxParams, TernaryData, TransposeData,
-    TransposeParams, UnaryData, UnaryParams, WinogradInputData, WinogradOutputAddData,
-    WinogradOutputData, WinogradWeightData, reduction_is_dynamic,
+    TransposeParams, UnaryData, UnaryParams, WinogradGradData, WinogradInputData,
+    WinogradOutputAddData, WinogradOutputData, WinogradWeightData, reduction_is_dynamic,
 };
 use crate::compile::{
     BufferRef, CachedBlockAttentionParams, Dispatch, DispatchParams, Kernel, ShaderEntry,
@@ -235,7 +235,8 @@ impl Session {
             | ShaderEntry::BlockMatMulBT
             | ShaderEntry::BatchMatMul
             | ShaderEntry::BatchMatMulAT
-            | ShaderEntry::BatchMatMulBT => {
+            | ShaderEntry::BatchMatMulBT
+            | ShaderEntry::WinogradGradProduct(_) => {
                 let (m, n, k) = mnk();
                 pc.bind(
                     0,
@@ -1170,6 +1171,19 @@ impl Session {
                             _pad1: p[2],
                             _pad2: p[3],
                         },
+                    },
+                );
+            }
+            ShaderEntry::WinogradGradInputTransform
+            | ShaderEntry::WinogradGradDeltaTransform
+            | ShaderEntry::WinogradGradOutputTransform => {
+                pc.bind(
+                    0,
+                    &WinogradGradData {
+                        src: buf(dispatch.input_buffers[0]),
+                        dst: buf(dispatch.output_buffer),
+                        params: crate::compile::WinogradGradParams::from_words(&dispatch.params)
+                            .expect("Winograd gradient transform parameters"),
                     },
                 );
             }

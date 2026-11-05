@@ -585,6 +585,8 @@ fn generate_partitioned_matmul(
             b_col,
             tile_row: "wgid.y + wgid.z * params._pad",
             c_idx: "row * params.n + col",
+            split_id: "select(0u, wgid.z, SPLITS > 1u)",
+            split_stride: "params.m * params.n",
         },
         fused_decl,
         fused_expr,
@@ -726,6 +728,10 @@ pub enum ShaderGroup {
     },
     WinogradBatchedMatMul,
     WinogradWeightTransform,
+    WinogradGradInputTransform,
+    WinogradGradDeltaTransform,
+    WinogradGradOutputTransform,
+    WinogradGradProduct(u32),
     Conv2dGradWeightGemm,
     Conv2dGradWeightGemmSmall,
     Conv2dGradWeightGemm16,
@@ -773,6 +779,10 @@ impl ShaderGroup {
 /// Generate WGSL source for a shader group.
 pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
     match group {
+        ShaderGroup::WinogradGradInputTransform
+        | ShaderGroup::WinogradGradDeltaTransform
+        | ShaderGroup::WinogradGradOutputTransform
+        | ShaderGroup::WinogradGradProduct(_) => winograd::weight_gradient(group),
         ShaderGroup::Generated => {
             unreachable!("generated kernels are lowered from their dispatch's kernel")
         }
@@ -1775,6 +1785,8 @@ struct MatMulIndexing<'a> {
     b_col: &'a str,
     tile_row: &'a str,
     c_idx: &'a str,
+    split_id: &'a str,
+    split_stride: &'a str,
 }
 
 fn matmul_vars_tiled(
@@ -1796,6 +1808,8 @@ fn matmul_vars_tiled(
         b_col,
         tile_row,
         c_idx,
+        split_id,
+        split_stride,
     } = indexing;
     let MatMulOptions {
         format: b_mode,
@@ -1963,6 +1977,8 @@ fn matmul_vars_tiled(
             ("$TILE_ROW", tile_row),
             ("$C_INDEX", c_idx),
             ("$SPLITS_U", &format!("{splits}u")),
+            ("$SPLIT_ID", split_id),
+            ("$SPLIT_STRIDE", split_stride),
             ("$A_ROW", a_row),
             ("$A_COL", a_col),
             ("$B_ROW", b_row),
@@ -2173,6 +2189,8 @@ pub(crate) fn gen_block_matmul(group: ShaderGroup, options: MatMulOptions) -> Sh
             b_col,
             tile_row: "wgid.y",
             c_idx,
+            split_id: "0u",
+            split_stride: "params.m * params.n",
         },
         "",
         "",
@@ -4463,7 +4481,10 @@ mod tests {
                 | ShaderEntry::BlockMatMulBT
                 | ShaderEntry::BatchMatMul
                 | ShaderEntry::BatchMatMulAT
-                | ShaderEntry::BatchMatMulBT => vec!["matrix_a", "matrix_b", "matrix_c", "params"],
+                | ShaderEntry::BatchMatMulBT
+                | ShaderEntry::WinogradGradProduct(_) => {
+                    vec!["matrix_a", "matrix_b", "matrix_c", "params"]
+                }
                 ShaderEntry::MatMul
                 | ShaderEntry::MatMulAT
                 | ShaderEntry::MatMulBT
@@ -4629,7 +4650,10 @@ mod tests {
                 ShaderEntry::WinogradBatchedMatMul => {
                     vec!["matrix_a", "matrix_b", "matrix_c", "params"]
                 }
-                ShaderEntry::WinogradWeightTransform => vec!["src", "dst", "params"],
+                ShaderEntry::WinogradWeightTransform
+                | ShaderEntry::WinogradGradInputTransform
+                | ShaderEntry::WinogradGradDeltaTransform
+                | ShaderEntry::WinogradGradOutputTransform => vec!["src", "dst", "params"],
                 ShaderEntry::GradClipNormSq
                 | ShaderEntry::GradClipScale
                 | ShaderEntry::GradAccum => vec!["segments", "grad", "acc", "params"],
@@ -4725,6 +4749,11 @@ mod tests {
             ShaderEntry::WinogradOutputTransform { fused: true },
             ShaderEntry::WinogradBatchedMatMul,
             ShaderEntry::WinogradWeightTransform,
+            ShaderEntry::WinogradGradInputTransform,
+            ShaderEntry::WinogradGradDeltaTransform,
+            ShaderEntry::WinogradGradOutputTransform,
+            ShaderEntry::WinogradGradProduct(1),
+            ShaderEntry::WinogradGradProduct(4),
             ShaderEntry::CacheWrite,
             ShaderEntry::CacheWritePrefix,
             ShaderEntry::CachedAttention,

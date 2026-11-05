@@ -582,6 +582,13 @@ struct GroupNormGradData {
 // upsample: var src, dst, params (reuses UnaryData layout)
 
 #[derive(blade_macros::ShaderData)]
+struct WinogradGradData {
+    src: blade_graphics::BufferPiece,
+    dst: blade_graphics::BufferPiece,
+    params: crate::compile::WinogradGradParams,
+}
+
+#[derive(blade_macros::ShaderData)]
 struct WinogradInputData {
     src: blade_graphics::BufferPiece,
     dst: blade_graphics::BufferPiece,
@@ -2843,6 +2850,10 @@ pub fn shader_data_layout(entry: &ShaderEntry) -> blade_graphics::ShaderDataLayo
         ShaderEntry::MaxPool2dGrad => MaxPool2dGradData::layout(),
         ShaderEntry::GlobalAvgPool => GlobalAvgPoolData::layout(),
         ShaderEntry::GlobalAvgPoolGrad => UnaryData::layout(),
+        ShaderEntry::WinogradGradInputTransform
+        | ShaderEntry::WinogradGradDeltaTransform
+        | ShaderEntry::WinogradGradOutputTransform => WinogradGradData::layout(),
+        ShaderEntry::WinogradGradProduct(_) => MatMulData::layout(),
         ShaderEntry::WinogradInputTransform => WinogradInputData::layout(),
         ShaderEntry::WinogradOutputTransform { fused: false } => WinogradOutputData::layout(),
         ShaderEntry::WinogradOutputTransform { fused: true } => WinogradOutputAddData::layout(),

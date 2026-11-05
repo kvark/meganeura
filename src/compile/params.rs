@@ -165,3 +165,15 @@ mod tests {
         });
     }
 }
+
+// F(4,3) weight-gradient transform parameters. Product uses MatMulParams.
+params!(WinogradGradParams {
+    channels: u32,
+    h: u32,
+    w: u32,
+    padding: u32,
+    tiles_h: u32,
+    tiles_w: u32,
+    total_tiles: u32,
+    splits: u32,
+});

@@ -43,7 +43,7 @@ $ENTRY_SIGNATURE {
 
     $ACC_DECL
 
-    let split_id = select(0u, wgid.z, SPLITS > 1u);
+    let split_id = $SPLIT_ID;
     let tiles = (params.k + $K_TILE_U - 1u) / $K_TILE_U;
     let first_tile = (tiles / SPLITS) * split_id + min(split_id, tiles % SPLITS);
     let end_tile = (tiles / SPLITS) * (split_id + 1u) + min(split_id + 1u, tiles % SPLITS);
@@ -80,7 +80,7 @@ $ENTRY_SIGNATURE {
             let row = tile_row + ty * $TM_U + i;
             let col = tile_col + $OUTPUT_COLUMN;
             if row < params.m && col < params.n {
-                let idx = ($C_INDEX) + split_id * params.m * params.n;
+                let idx = ($C_INDEX) + split_id * ($SPLIT_STRIDE);
                 $STORE_BODY
             }
         }

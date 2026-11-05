@@ -9,8 +9,8 @@ mod params;
 mod softplus;
 mod split_k;
 pub(crate) use params::{
-    AttentionParams, CachedBlockAttentionParams, DispatchParams, RoPEParams, WinogradInputParams,
-    WinogradOutputParams, WinogradWeightParams,
+    AttentionParams, CachedBlockAttentionParams, DispatchParams, RoPEParams, WinogradGradParams,
+    WinogradInputParams, WinogradOutputParams, WinogradWeightParams,
 };
 
 /// Weight storage format for matmul B operands.
@@ -437,6 +437,10 @@ pub enum ShaderEntry {
     },
     WinogradBatchedMatMul,
     WinogradWeightTransform,
+    WinogradGradInputTransform,
+    WinogradGradDeltaTransform,
+    WinogradGradOutputTransform,
+    WinogradGradProduct(u32),
     /// Squared-gradient partial sums, one slot per workgroup, then a
     /// single-workgroup total of those partials. Pair with `GradClipScale`.
     GradClipNormSq,
@@ -516,7 +520,11 @@ impl ShaderEntry {
             | ShaderEntry::WinogradInputTransform
             | ShaderEntry::WinogradOutputTransform { .. }
             | ShaderEntry::WinogradBatchedMatMul
-            | ShaderEntry::WinogradWeightTransform => "convolution_spatial",
+            | ShaderEntry::WinogradWeightTransform
+            | ShaderEntry::WinogradGradInputTransform
+            | ShaderEntry::WinogradGradDeltaTransform
+            | ShaderEntry::WinogradGradOutputTransform
+            | ShaderEntry::WinogradGradProduct(_) => "convolution_spatial",
 
             ShaderEntry::SumAll
             | ShaderEntry::MeanAll
@@ -737,6 +745,10 @@ impl ShaderEntry {
             }
             ShaderEntry::WinogradBatchedMatMul => ShaderGroup::WinogradBatchedMatMul,
             ShaderEntry::WinogradWeightTransform => ShaderGroup::WinogradWeightTransform,
+            ShaderEntry::WinogradGradInputTransform => ShaderGroup::WinogradGradInputTransform,
+            ShaderEntry::WinogradGradDeltaTransform => ShaderGroup::WinogradGradDeltaTransform,
+            ShaderEntry::WinogradGradOutputTransform => ShaderGroup::WinogradGradOutputTransform,
+            ShaderEntry::WinogradGradProduct(splits) => ShaderGroup::WinogradGradProduct(splits),
             ShaderEntry::GradClipNormSq => ShaderGroup::GradClipNormSq,
             ShaderEntry::GradClipScale => ShaderGroup::GradClipScale,
             ShaderEntry::AdaptiveGradClip => ShaderGroup::AdaptiveGradClip,
@@ -851,7 +863,11 @@ impl ShaderEntry {
             ShaderEntry::WinogradInputTransform
             | ShaderEntry::WinogradOutputTransform { .. }
             | ShaderEntry::WinogradBatchedMatMul
-            | ShaderEntry::WinogradWeightTransform => "main",
+            | ShaderEntry::WinogradWeightTransform
+            | ShaderEntry::WinogradGradInputTransform
+            | ShaderEntry::WinogradGradDeltaTransform
+            | ShaderEntry::WinogradGradOutputTransform
+            | ShaderEntry::WinogradGradProduct(_) => "main",
             ShaderEntry::GradClipNormSq
             | ShaderEntry::GradClipScale
             | ShaderEntry::AdaptiveGradClip
@@ -1332,7 +1348,8 @@ impl Dispatch {
             | ShaderEntry::BlockMatMulBT
             | ShaderEntry::BatchMatMul
             | ShaderEntry::BatchMatMulAT
-            | ShaderEntry::BatchMatMulBT => Some((a, b, c)),
+            | ShaderEntry::BatchMatMulBT
+            | ShaderEntry::WinogradGradProduct(_) => Some((a, b, c)),
             _ => None,
         }
     }
@@ -3368,6 +3385,7 @@ mod tests {
             (ShaderEntry::BlockMatMul, [10, 20, 30], (10, 20, 30)),
             (ShaderEntry::BlockMatMulAT, [10, 20, 30], (10, 20, 30)),
             (ShaderEntry::BlockMatMulBT, [10, 20, 30], (10, 20, 30)),
+            (ShaderEntry::WinogradGradProduct(4), [10, 20, 30], (10, 20, 30)),
         ];
 
         for &(ref shader, params, want) in cases.iter() {
