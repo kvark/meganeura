@@ -357,6 +357,7 @@ pub fn build_measured_with_inputs(
     programs.allow_matrix_storage = !cfg.runtime.debug && cfg.runtime.pin_buffers.is_none();
     programs.enable_matrix_inputs(&supported, &gpu.capabilities());
     programs.enable_gradient_inputs(&supported);
+    programs.enable_conv_gradient_inputs(&supported);
     if cfg.mode == crate::Mode::Inference && cfg.options.flash_forward_coop {
         programs.enable_forward_products(gpu.capabilities().subgroup_size);
     }
@@ -486,6 +487,7 @@ struct AxisChoice {
     winograd: Option<crate::DType>,
     f16_attention: bool,
     gradient_inputs: Option<crate::DType>,
+    conv_gradient_inputs: Option<crate::DType>,
     forward_products: bool,
 }
 
@@ -792,6 +794,42 @@ impl Implementations {
         self.order.choice_order = (0..self.choices.len()).collect();
     }
 
+    fn enable_conv_gradient_inputs(&mut self, inputs: &[crate::DType]) {
+        let ordinary = self.choices.clone();
+        for multiply in [crate::DType::BF16, crate::DType::F16] {
+            if !inputs.contains(&multiply)
+                || !self.matrix_shapes.contains_key(&multiply)
+                || !self.seeds.iter().any(|seed| {
+                    fill_conv_gradient_candidates(
+                        &mut seed.plan.clone(),
+                        multiply,
+                        self.replace_extracted_matrices,
+                    ) != 0
+                })
+            {
+                continue;
+            }
+            // Convolution graphs can reach this trial early. Attention graphs
+            // retain their arithmetic and derivative-layout priorities: no
+            // whole-model gain justifies interrupting them for pointwise dX.
+            if !self
+                .seeds
+                .iter()
+                .any(|seed| seed.plan.dispatches.iter().any(|d| d.shader.is_attention()))
+            {
+                self.order.arithmetic_layouts = 1;
+                self.order.priority_choices.push_front(self.choices.len());
+            }
+            self.choices
+                .extend(ordinary.iter().map(|choice| AxisChoice {
+                    conv_gradient_inputs: Some(multiply),
+                    ..*choice
+                }));
+        }
+        self.order.choices = self.choices.len();
+        self.order.choice_order = (0..self.choices.len()).collect();
+    }
+
     fn enable_forward_products(&mut self, subgroup_size: u32) {
         self.attention_subgroup_size = subgroup_size;
         if !self.seeds.iter().any(|seed| {
@@ -1051,6 +1089,59 @@ fn fill_matrix_candidates_scoped(
     count
 }
 
+/// A pointwise NCHW derivative is Wᵀ × dY independently for each image.
+/// Reuse checked matrix staging, including rectangular native tiles and tails.
+/// Only measured construction installs reduced derivative operands.
+fn fill_conv_gradient_candidates(
+    plan: &mut ExecutionPlan,
+    multiply: crate::DType,
+    replace_extracted: bool,
+) -> usize {
+    let mut count = 0;
+    for dispatch in &mut plan.dispatches {
+        if !matches!(
+            dispatch.shader,
+            compile::ShaderEntry::Conv2dGradInputGemm
+                | compile::ShaderEntry::Conv2dGradInputGemmSmall
+                | compile::ShaderEntry::Conv2dGradInputGemm16
+        ) || !dispatch.is_derivative
+            || dispatch.requires_full_precision
+            || (dispatch.schedule_locked && !replace_extracted)
+            || dispatch.matmul_epilogue.is_some()
+            || !dispatch.extra_outputs.is_empty()
+            || dispatch.input_buffers.len() != 2
+            || dispatch.weight_format != compile::WeightFormat::F32
+        {
+            continue;
+        }
+        let p = &dispatch.params;
+        if p[5..8] != [1, 1, 1] || p[8] != 0 || p[11] != 0 || p[4] < 4 {
+            continue;
+        }
+        let Some(columns) = p[2].checked_mul(p[3]) else {
+            continue;
+        };
+        let grid = [p[1].div_ceil(32), columns.div_ceil(32), p[0]];
+        if !compile::workgroups_within_portable_limits(grid)
+            || grid.into_iter().map(u64::from).product::<u64>()
+                < crate::kernels::conv::MIN_F16_WORKGROUPS
+        {
+            continue;
+        }
+        dispatch.shader = compile::ShaderEntry::Conv2dGradInputGemmCoopGen(1, 1, 1);
+        dispatch.kernel = compile::Kernel::CooperativeTyped {
+            types: crate::codegen::MatrixTypes {
+                multiply,
+                ..crate::codegen::MatrixTypes::F32_AS_F16
+            },
+            splits: 1,
+        };
+        dispatch.workgroups = grid;
+        count += 1;
+    }
+    count
+}
+
 /// Only AT/BT derivative products were qualified by the dense controls. In
 /// particular, SmolLM2's long-K NN gradient fails the unchanged F16 gate.
 /// Bindings, partials and automatic derivative protection remain F32.
@@ -1242,8 +1333,10 @@ impl measure::Frontier for Implementations {
             });
             for index in &mut self.order.priority_choices {
                 let arithmetic = self.choices[*index];
-                let derivative_trial = arithmetic.gradient_inputs.is_some()
-                    && arithmetic.gradient_inputs != active.gradient_inputs;
+                let derivative_trial = (arithmetic.gradient_inputs.is_some()
+                    && arithmetic.gradient_inputs != active.gradient_inputs)
+                    || (arithmetic.conv_gradient_inputs.is_some()
+                        && arithmetic.conv_gradient_inputs != active.conv_gradient_inputs);
                 let products_only = arithmetic.forward_products
                     && arithmetic.matrix_inputs.is_none()
                     && arithmetic.winograd.is_none();
@@ -1258,6 +1351,9 @@ impl measure::Frontier for Implementations {
                 };
                 let neighbor = AxisChoice {
                     gradient_inputs: arithmetic.gradient_inputs.or(active.gradient_inputs),
+                    conv_gradient_inputs: arithmetic
+                        .conv_gradient_inputs
+                        .or(active.conv_gradient_inputs),
                     forward_products: arithmetic.forward_products || active.forward_products,
                     attention: active.attention,
                     fuse_dispatches: active.fuse_dispatches,
@@ -1270,14 +1366,27 @@ impl measure::Frontier for Implementations {
             }
             // Try the other arithmetic family on top of a winning family
             // before spending the remaining deadline on attention layouts.
-            let combined: Vec<_> = self
-                .order
-                .priority_choices
-                .iter()
-                .filter_map(|&index| {
+            let mut families = collections::HashSet::new();
+            // Broader retries are useful after a convolution-gradient win.
+            // Otherwise retain the existing arithmetic queue and its budget.
+            let arithmetic: Vec<_> = if active.conv_gradient_inputs.is_some() {
+                (0..self.choices.len()).collect()
+            } else {
+                self.order.priority_choices.iter().copied().collect()
+            };
+            let combined: Vec<_> = arithmetic
+                .into_iter()
+                .filter_map(|index| {
                     let trial = self.choices[index];
-                    if trial.forward_products != active.forward_products
+                    if (active.matrix_inputs.is_none() && active.winograd.is_none())
+                        || trial.forward_products != active.forward_products
                         || trial.matrix_inputs.is_some() == trial.winograd.is_some()
+                        || !families.insert((
+                            trial.matrix_inputs,
+                            trial.vector_convolutions_only,
+                            trial.matrix_storage,
+                            trial.winograd,
+                        ))
                     {
                         return None;
                     }
@@ -1296,6 +1405,9 @@ impl measure::Frontier for Implementations {
                         winograd: trial.winograd.or(active.winograd),
                         ..active
                     };
+                    if choice.matrix_inputs.is_none() || choice.winograd.is_none() {
+                        return None;
+                    }
                     self.choices.iter().position(|&c| c == choice)
                 })
                 .collect();
@@ -1325,7 +1437,8 @@ impl measure::Frontier for Implementations {
                             active.matrix_storage,
                         ),
                     ) + usize::from(choice.winograd != active.winograd)
-                        + usize::from(choice.gradient_inputs != active.gradient_inputs),
+                        + usize::from(choice.gradient_inputs != active.gradient_inputs)
+                        + usize::from(choice.conv_gradient_inputs != active.conv_gradient_inputs),
                     choice.forward_products != active.forward_products,
                     choice.f16_attention != active.f16_attention,
                     choice.attention != active.attention,
@@ -1344,6 +1457,7 @@ impl measure::Frontier for Implementations {
                 winograd,
                 f16_attention,
                 gradient_inputs,
+                conv_gradient_inputs,
                 forward_products,
             } = self.choices[choice_index];
             let mut plan = if splits == 0
@@ -1439,6 +1553,16 @@ impl measure::Frontier for Implementations {
                     continue;
                 }
             }
+            if let Some(multiply) = conv_gradient_inputs {
+                if fill_conv_gradient_candidates(
+                    &mut plan,
+                    multiply,
+                    self.replace_extracted_matrices,
+                ) == 0
+                {
+                    continue;
+                }
+            }
             if matrix_storage && storage::fill(&mut plan) == 0 {
                 continue;
             }
@@ -1469,6 +1593,9 @@ impl measure::Frontier for Implementations {
             }
             if let Some(dtype) = gradient_inputs {
                 description.push_str(&format!(", gradient_inputs={dtype:?}"));
+            }
+            if let Some(dtype) = conv_gradient_inputs {
+                description.push_str(&format!(", conv_gradient_inputs={dtype:?}"));
             }
             if let Some(dtype) = winograd {
                 description.push_str(&format!(", winograd={dtype:?}"));
@@ -1569,6 +1696,180 @@ mod tests {
         let loss = graph.mean_all(y);
         graph.set_outputs(vec![loss]);
         graph_frontier(crate::autodiff::differentiate(&graph))
+    }
+
+    fn pointwise_gradient_graph(ci: u32, co: u32, h: u32, w: u32, batch: u32) -> Graph {
+        let mut g = Graph::new();
+        let dy = g.input("dy", &[(batch * co * h * w) as usize]);
+        let weight = g.parameter("w", &[(co * ci) as usize]);
+        let dx = g.conv2d_grad_input(dy, weight, batch, ci, h, w, co, 1, 1, 1, 0, 0);
+        g.nodes_mut()[dx as usize].is_derivative = true;
+        g.set_outputs(vec![dx]);
+        g
+    }
+
+    #[test]
+    fn convolution_derivative_choice_is_independent_and_early() {
+        use measure::Frontier as _;
+        let mut g = pointwise_gradient_graph(256, 64, 28, 28, 4);
+        let a = g.input("a", &[64, 32]);
+        let b = g.input("b", &[64, 32]);
+        let dense = g.matmul_at(a, b);
+        g.set_outputs(vec![g.outputs()[0], dense]);
+        g.nodes_mut()[dense as usize].is_derivative = true;
+        let mut frontier = graph_frontier(g);
+        frontier.enable_matrix_inputs(&[crate::DType::F16], &matrix_caps(&[[8, 16, 16]], &[]));
+        frontier.enable_gradient_inputs(&[crate::DType::F16]);
+        frontier.enable_conv_gradient_inputs(&[crate::DType::F16]);
+        let baseline = frontier.next(None).unwrap();
+        let candidate = frontier.next(baseline.origin).unwrap();
+        assert!(candidate.description.contains("conv_gradient_inputs=F16"));
+        assert!(!candidate.description.contains(", gradient_inputs="));
+        assert!(
+            candidate
+                .plan
+                .dispatches
+                .iter()
+                .any(|d| d.shader == compile::ShaderEntry::Conv2dGradInputGemmCoopGen(1, 1, 1))
+        );
+        assert!(
+            candidate
+                .plan
+                .dispatches
+                .iter()
+                .any(|d| d.shader == compile::ShaderEntry::MatMulAT && !d.use_coop())
+        );
+    }
+
+    #[test]
+    fn convolution_precision_preserves_attention_graph_coverage() {
+        use measure::Frontier as _;
+        let mut graph = pointwise_gradient_graph(256, 64, 28, 28, 4);
+        let q = graph.input("q", &[128, 64]);
+        let k = graph.input("k", &[128, 64]);
+        let v = graph.input("v", &[128, 64]);
+        let attention = graph.full_attention(q, k, v, 1, 1, 64);
+        graph.set_outputs(vec![graph.outputs()[0], attention]);
+        let mut frontier = graph_frontier(graph);
+        for index in 1..6 {
+            let seed = &frontier.seeds[0];
+            frontier.seeds.push(Seed {
+                graph: seed.graph.clone(),
+                options: seed.options.clone(),
+                plan: seed.plan.clone(),
+                description: format!("graph={index}"),
+                backward_rank: 0,
+            });
+        }
+        frontier.order = CoordinateOrder::new(frontier.seeds.len(), frontier.choices.len());
+        frontier.enable_matrix_inputs(&[crate::DType::F16], &matrix_caps(&[[8, 16, 16]], &[]));
+        frontier.enable_conv_gradient_inputs(&[crate::DType::F16]);
+        assert!(
+            frontier
+                .choices
+                .iter()
+                .any(|c| c.conv_gradient_inputs.is_some())
+        );
+        assert!(
+            frontier
+                .order
+                .priority_choices
+                .iter()
+                .all(|&i| { frontier.choices[i].conv_gradient_inputs.is_none() }),
+            "pointwise dX must not interrupt attention arithmetic"
+        );
+        let first = frontier.next(None).unwrap();
+        let next = frontier.next(first.origin).unwrap();
+        assert_eq!(
+            next.origin.unwrap().form,
+            1,
+            "cover graph forms before arithmetic"
+        );
+        assert!(!next.description.contains("conv_gradient_inputs="));
+    }
+
+    #[test]
+    fn pointwise_derivative_candidates_preserve_pins_and_exact_output_size() {
+        let base = compile::compile(&pointwise_gradient_graph(256, 64, 14, 14, 4));
+        for dtype in [crate::DType::F16, crate::DType::BF16] {
+            let mut candidate = base.clone();
+            assert_eq!(
+                fill_conv_gradient_candidates(&mut candidate, dtype, true),
+                1
+            );
+            assert_eq!(candidate.buffers, base.buffers);
+            assert_eq!(candidate.dispatches[0].workgroups, [8, 7, 4]);
+            for pin in [true, false] {
+                let mut candidate = base.clone();
+                candidate.dispatches[0].requires_full_precision = pin;
+                candidate.dispatches[0].schedule_locked = !pin;
+                assert_eq!(
+                    fill_conv_gradient_candidates(&mut candidate, dtype, false),
+                    0
+                );
+                assert_eq!(candidate.dispatches[0].shader, base.dispatches[0].shader);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "GPU: checked pointwise convolution gradients, tails, batches and small exact F16/BF16 operands"]
+    fn pointwise_derivative_matches_f64() {
+        use crate::reference::{self, Feeds};
+        let gpu = reference::gpu::shared_context();
+        for dtype in [crate::DType::F16, crate::DType::BF16] {
+            if !runtime::typed_matrix_supported(&gpu, dtype) {
+                continue;
+            }
+            for (ci, co, h, w, batch) in [(20, 19, 4, 5, 3), (17, 19, 7, 9, 2), (32, 32, 4, 4, 2)] {
+                let g = pointwise_gradient_graph(ci, co, h, w, batch);
+                let mut feeds = Feeds::new();
+                let dy: Vec<_> = (0..batch * co * h * w)
+                    .map(|i| ((i * 7) % 17 + 1) as f32 * 2f32.powi(-20))
+                    .collect();
+                let weights: Vec<_> = (0..co * ci)
+                    .map(|i| (((i * 3) % 17) as f32 - 8.) / 16.)
+                    .collect();
+                feeds.set("dy", &dy);
+                feeds.set("w", &weights);
+                let values = reference::evaluate(&g, &feeds).unwrap();
+                let id = g.outputs()[0];
+                let node = g.node(id);
+                let args: Vec<_> = node.inputs.iter().map(|&n| &values[n as usize]).collect();
+                let want = &values[id as usize];
+                let magnitude = reference::magnitudes(&g, node, &args, want).unwrap();
+                let mut plan = compile::compile(&g);
+                let d = &mut plan.dispatches[0];
+                d.shader = compile::ShaderEntry::Conv2dGradInputGemmCoopGen(1, 1, 1);
+                d.kernel = compile::Kernel::CooperativeTyped {
+                    types: crate::codegen::MatrixTypes {
+                        multiply: dtype,
+                        ..crate::codegen::MatrixTypes::F32_AS_F16
+                    },
+                    splits: 1,
+                };
+                d.workgroups = [ci.div_ceil(32), (h * w).div_ceil(32), batch];
+                compile::schedule_dispatches(&mut plan, false, false);
+                let mut session = Session::with_context_opts(
+                    plan,
+                    gpu.clone(),
+                    runtime::SessionOptions {
+                        poison: true,
+                        ..Default::default()
+                    },
+                );
+                session.set_input("dy", &dy);
+                session.set_parameter("w", &weights);
+                for _ in 0..2 {
+                    session.step();
+                    session.wait();
+                    let mut got = vec![0.; want.len()];
+                    session.read_output_by_index(0, &mut got);
+                    reference::check(&got, &want.data, &magnitude, Default::default())
+                        .unwrap_or_else(|e| panic!("{dtype:?} ({ci},{co},{h},{w},{batch}): {e}"));
+                }
+            }
+        }
     }
 
     #[test]
@@ -2091,6 +2392,55 @@ mod tests {
         assert!(
             missing.is_empty(),
             "missing (dense, vector_only, winograd, f16_attention): {missing:?}"
+        );
+    }
+
+    #[test]
+    fn arithmetic_change_retries_a_previously_losing_family() {
+        use crate::DType::F16;
+        use measure::Frontier as _;
+        let mut graph = Graph::new();
+        let x = graph.input("x", &[64 * 8 * 8]);
+        let w = graph.parameter("w", &[64 * 64 * 9]);
+        let y = graph.conv2d(x, w, 1, 64, 8, 8, 64, 3, 3, 1, 1);
+        let a = graph.input("a", &[32, 32]);
+        let b = graph.parameter("b", &[32, 32]);
+        let dense = graph.matmul(a, b);
+        graph.set_outputs(vec![y, dense]);
+        crate::optimize::apply_winograd_conv_fusions(
+            &mut graph,
+            &mut Vec::new(),
+            &Default::default(),
+        );
+        let mut frontier = graph_frontier(graph);
+        frontier.enable_matrix_inputs(&[F16], &matrix_caps(&[[8, 16, 16]], &[]));
+        let dense = frontier
+            .choices
+            .iter()
+            .position(|c| c.matrix_inputs == Some(F16) && c.winograd.is_none())
+            .unwrap();
+        let winograd = frontier
+            .choices
+            .iter()
+            .position(|c| c.matrix_inputs.is_none() && c.winograd == Some(F16))
+            .unwrap();
+        // Winograd lost before dense arithmetic improved the incumbent.
+        frontier
+            .order
+            .tried
+            .extend([(0, 0), (0, dense), (0, winograd)]);
+        frontier.order.priority_choices.clear();
+        frontier.queued_splits = true;
+        let program = frontier
+            .next(Some(measure::Origin {
+                form: 0,
+                choice: dense,
+            }))
+            .unwrap();
+        let choice = choice_of(&frontier, &program);
+        assert_eq!(
+            (choice.matrix_inputs, choice.winograd),
+            (Some(F16), Some(F16))
         );
     }
 

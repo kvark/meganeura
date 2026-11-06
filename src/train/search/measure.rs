@@ -1044,7 +1044,9 @@ mod tests {
 
     #[test]
     fn later_searches_resume_shared_kernel_decisions() {
-        let gpu = crate::reference::gpu::shared_context();
+        // Parallel calibration tests may complete a partial profile. Isolate
+        // this context so only these two searches can update its profile.
+        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
         let mut graph = crate::Graph::new();
         let x = graph.input("x", &[33, 17]);
         let w = graph.parameter("w", &[17, 65]);

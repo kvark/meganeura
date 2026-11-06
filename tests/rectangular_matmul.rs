@@ -44,6 +44,10 @@ fn check_candidates(strategy: TuneStrategy, cases: &[Case]) {
             if storage == DType::F32 && (round || dims[2] == 1024) {
                 continue;
             }
+            // Rounding requests BF16 output even when the operands are F16.
+            if round && !gpu.capabilities().shader_bfloat16 {
+                continue;
+            }
             let [m, n, k] = dims;
             eprintln!(
                 "rectangular case {storage:?} layout={layout} add={add} round={round} {dims:?}"
