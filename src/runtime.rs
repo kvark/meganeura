@@ -1965,15 +1965,21 @@ impl Pipelines {
                 gpu.capabilities().subgroup_size,
             ),
             Variant::CoopConv(ref entry, types, ref params) => {
-                let ShaderEntry::Conv2dGemmCoopGen(kernel_h, kernel_w, stride) = *entry else {
-                    unreachable!()
+                let group = match *entry {
+                    ShaderEntry::Conv2dGemmCoopGen(kernel_h, kernel_w, stride) => {
+                        ShaderGroup::Conv2dChecked {
+                            kernel_h,
+                            kernel_w,
+                            stride,
+                        }
+                    }
+                    ShaderEntry::Conv2dGradInputGemmCoopGen(1, 1, 1) => {
+                        ShaderGroup::Conv2dPointwiseGradInput
+                    }
+                    _ => unreachable!(),
                 };
                 crate::codegen::generate_checked_conv(
-                    ShaderGroup::Conv2dChecked {
-                        kernel_h,
-                        kernel_w,
-                        stride,
-                    },
+                    group,
                     types,
                     typed_shape(types.multiply)?,
                     params,
@@ -2324,7 +2330,10 @@ impl Pipelines {
             );
         }
         if let crate::compile::Kernel::CooperativeTyped { types, .. } = dispatch.kernel {
-            if matches!(entry, ShaderEntry::Conv2dGemmCoopGen(..)) {
+            if matches!(
+                entry,
+                ShaderEntry::Conv2dGemmCoopGen(..) | ShaderEntry::Conv2dGradInputGemmCoopGen(..)
+            ) {
                 return Variant::CoopConv(entry, types, Conv2dParams::from(dispatch));
             }
             let mut layout = typed_matmul_layout(dispatch);
@@ -3359,7 +3368,8 @@ pub enum CoopPolicy {
     /// work that permits reduced input precision; explicitly pinned and ordinary
     /// derivative dispatches retain scalar f32 operands. Measured search also considers
     /// device-qualified F16/BF16 forward products and mixed-precision attention
-    /// derivatives and AT/BT derivative products, subject to the caller's whole-program
+    /// derivatives, AT/BT derivative products and pointwise convolution input gradients,
+    /// subject to the caller's whole-program
     /// accuracy and timing gates. Explicit precision pins are never bypassed.
     #[default]
     Auto,
@@ -3374,7 +3384,8 @@ pub enum CoopPolicy {
     /// Use f16 tiles without residual compensation, including for
     /// derivative work. Faster than [`Self::Auto`] on f16-only devices,
     /// and can overflow or lose gradient range. Measured search also considers
-    /// device-qualified typed F16/BF16 candidates for eligible forward and AT/BT derivative products,
+    /// device-qualified typed F16/BF16 candidates for eligible forward products,
+    /// AT/BT derivatives and pointwise convolution input gradients,
     /// subject to the caller's whole-program accuracy and timing gates.
     AllowF16,
 }

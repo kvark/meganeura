@@ -694,6 +694,8 @@ pub enum ShaderGroup {
         kernel_w: u32,
         stride: u32,
     },
+
+    Conv2dPointwiseGradInput,
     Conv2dBF16 {
         kernel_h: u32,
         kernel_w: u32,
@@ -742,7 +744,10 @@ pub enum ShaderGroup {
 
 impl ShaderGroup {
     pub(crate) fn is_checked_convolution(self) -> bool {
-        matches!(self, Self::Conv2dBF16 { .. } | Self::Conv2dChecked { .. })
+        matches!(
+            self,
+            Self::Conv2dBF16 { .. } | Self::Conv2dChecked { .. } | Self::Conv2dPointwiseGradInput
+        )
     }
 
     pub const fn is_matmul(&self) -> bool {
@@ -806,7 +811,7 @@ pub fn generate_module(group: ShaderGroup, knobs: MatmulKnobs) -> ShaderModule {
         ShaderGroup::RoPEGrad => ShaderModule::new(
             &include_str!("shaders/rope_grad.wgsl").replace("$PARAMS", ROPE_PARAMS_WGSL),
         ),
-        ShaderGroup::Conv2dChecked { .. } => {
+        ShaderGroup::Conv2dChecked { .. } | ShaderGroup::Conv2dPointwiseGradInput => {
             panic!("checked convolution requires explicit matrix types")
         }
         ShaderGroup::Conv2dBF16 { output_bf16, .. } => cooperative::generate(
@@ -1110,11 +1115,7 @@ pub(crate) fn generate_module_coop_typed_with_subgroup(
     subgroup: u32,
 ) -> ShaderModule {
     assert!(
-        coop_shape(group).is_some()
-            || matches!(
-                group,
-                ShaderGroup::Conv2dBF16 { .. } | ShaderGroup::Conv2dChecked { .. }
-            ),
+        coop_shape(group).is_some() || group.is_checked_convolution(),
         "no cooperative form for {group:?}"
     );
     if let Some((addend, variant)) = coop_shape(group)
@@ -1146,9 +1147,24 @@ pub(crate) fn generate_checked_conv(
     subgroup: u32,
 ) -> ShaderModule {
     // Keep native C stores inside each channel's spatial row.
+    let backward = matches!(group, ShaderGroup::Conv2dPointwiseGradInput);
+    let (rows, columns, contiguous) = if backward {
+        (
+            params.in_channels,
+            u64::from(params.in_h) * u64::from(params.in_w),
+            params.stride == 1,
+        )
+    } else {
+        (
+            params.out_channels,
+            u64::from(params.out_h) * u64::from(params.out_w),
+            true,
+        )
+    };
     let direct_output = types.output == crate::DType::F32
-        && params.out_channels.is_multiple_of(16)
-        && (u64::from(params.out_h) * u64::from(params.out_w)).is_multiple_of(16);
+        && contiguous
+        && rows.is_multiple_of(16)
+        && columns.is_multiple_of(16);
     cooperative::generate_with_params(
         group,
         types,
@@ -1157,6 +1173,7 @@ pub(crate) fn generate_checked_conv(
         subgroup,
         TypedMatmulLayout {
             direct_output,
+            vectorized: backward && params.vectorized_forward(),
             ..Default::default()
         },
     )
