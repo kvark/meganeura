@@ -528,11 +528,11 @@ pub(super) fn select(
                     // where it was.
                     incumbent_origin = program.origin.or(incumbent_origin);
                     if program.submission_chunks.is_none() {
-                        pending_submissions =
-                            std::iter::successors(Some(1usize), |n| n.checked_mul(2))
-                                .take_while(|&n| n <= options.max_submission_chunks)
-                                .filter(|&n| n != selected_chunks)
-                                .collect();
+                        refresh_submission_probes(
+                            &mut pending_submissions,
+                            selected_chunks,
+                            options.max_submission_chunks,
+                        );
                     }
                     report.selected = index;
                 }
@@ -616,8 +616,34 @@ pub(super) fn select(
     Ok((session, report))
 }
 
+// Keep untried counts ahead of repeats when the program changes. Repeated
+// kernel wins must not restart the same short prefix until the deadline.
+fn refresh_submission_probes(pending: &mut VecDeque<usize>, selected: usize, limit: usize) {
+    pending.retain(|&n| n != selected);
+    for count in
+        std::iter::successors(Some(1usize), |n| n.checked_mul(2)).take_while(|&n| n <= limit)
+    {
+        if count != selected && !pending.contains(&count) {
+            pending.push_back(count);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn changing_programs_preserve_submission_probe_progress() {
+        let mut pending = super::VecDeque::new();
+        super::refresh_submission_probes(&mut pending, 1, 8);
+        assert_eq!(pending.pop_front(), Some(2));
+        super::refresh_submission_probes(&mut pending, 1, 8);
+        assert_eq!(pending.pop_front(), Some(4));
+        super::refresh_submission_probes(&mut pending, 4, 8);
+        assert_eq!(pending.iter().copied().collect::<Vec<_>>(), [8, 2, 1]);
+        super::refresh_submission_probes(&mut pending, 4, 8);
+        assert_eq!(pending.iter().copied().collect::<Vec<_>>(), [8, 2, 1]);
+    }
+
     use super::*;
     use crate::TuneOptions;
     use crate::train::BuildSearchOptions;
@@ -1044,7 +1070,9 @@ mod tests {
 
     #[test]
     fn later_searches_resume_shared_kernel_decisions() {
-        let gpu = crate::reference::gpu::shared_context();
+        // Parallel calibration tests may complete a partial profile. Isolate
+        // this context so only these two searches can update its profile.
+        let gpu = Arc::new(crate::init_gpu_context_with(crate::GpuOptions::from_env()).unwrap());
         let mut graph = crate::Graph::new();
         let x = graph.input("x", &[33, 17]);
         let w = graph.parameter("w", &[17, 65]);

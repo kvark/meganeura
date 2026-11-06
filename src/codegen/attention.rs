@@ -46,6 +46,8 @@ pub(crate) fn generate_cached_query_attention_module(head_dim: u32) -> ShaderMod
         CACHED_ATTENTION_EPT,
         FlashAttentionShape::default(),
         true,
+        false,
+        true,
     )
 }
 
@@ -54,7 +56,20 @@ pub fn generate_flash_attention_module(
     ept_cap: u32,
     shape: FlashAttentionShape,
 ) -> ShaderModule {
-    generate_flash_attention(head_dim, ept_cap, shape, false)
+    generate_flash_attention(head_dim, ept_cap, shape, false, false, false)
+}
+
+/// `f16_keys` stores Q/K as F16. Dot products widen operands before F32
+/// multiplication and accumulation; softmax and output accumulation stay F32.
+/// V remains F32 so a peaked softmax preserves its value.
+pub fn generate_flash_attention_module_for_device(
+    head_dim: u32,
+    ept_cap: u32,
+    shape: FlashAttentionShape,
+    f16_keys: bool,
+    subgroup_tiles: bool,
+) -> ShaderModule {
+    generate_flash_attention(head_dim, ept_cap, shape, false, f16_keys, subgroup_tiles)
 }
 
 fn attention_module(source: String, hint: &'static str) -> ShaderModule {
@@ -177,11 +192,298 @@ pub(crate) fn generate_cached_attention_module(
     ))
 }
 
+/// Pairwise sum inside one query. The lane group is aligned in the subgroup
+/// because `tpq` is a power of two no wider than the subgroup, so this is the
+/// tree reduction without its barriers.
+fn lane_sum_fn(tpq: u32) -> String {
+    let mut steps = String::new();
+    let mut stride = tpq / 2;
+    while stride > 0 {
+        steps.push_str(&format!("    sum += subgroupShuffleXor(sum, {stride}u);\n"));
+        stride /= 2;
+    }
+    format!("fn lane_sum(value: f32) -> f32 {{\n    var sum = value;\n{steps}    return sum;\n}}\n")
+}
+
+fn flash_vec_tile_load(f16_keys: bool) -> String {
+    let k_stored = if f16_keys { "vec4<f16>" } else { "" };
+    format!(
+        "        let tile_vecs = $TILE_ELEMENTSu / 4u;\n\
+         for (var pack = lid.x; pack < tile_vecs; pack += $THREADSu) {{\n\
+             let elem = pack * 4u;\n\
+             let ki = elem / $HEAD_DIMu;\n\
+             let kd = elem % $HEAD_DIMu;\n\
+             let index = ((t + ki) * kv_dim + kv_head_off + kd) / 4u;\n\
+             shared_k[pack] = {k_stored}(src_b[index]);\n\
+             shared_v[pack] = bias[index];\n\
+         }}\n"
+    )
+}
+
+fn flash_prefetch(f16_keys: bool) -> String {
+    let k_stored = if f16_keys { "vec4<f16>" } else { "" };
+    format!(
+        "            let elem = prefetch_pack * 4u;\n\
+             let ki = elem / $HEAD_DIMu;\n\
+             let kd = elem % $HEAD_DIMu;\n\
+             let index = ((next + ki) * kv_dim + kv_head_off + kd) / 4u;\n\
+             prefetch_k = {k_stored}(src_b[index]);\n\
+             prefetch_v = bias[index];\n"
+    )
+}
+
+/// One global load of the next K/V tile overlaps the current tile's dots.
+/// Each thread owns at most one vec4, so the prefetch stays in registers.
+fn flash_prefetched_tiles(load: &str, prefetch: &str, body: &str) -> String {
+    format!(
+        "    var t = min_kv_start;\n\
+    var prefetch = false;\n\
+    var prefetch_pack = 0u;\n\
+    var prefetch_k: $STILE;\n\
+    var prefetch_v: $VTILE;\n\
+    if t < tile_end {{\n\
+{load}\
+        workgroupBarrier();\n\
+    }}\n\
+    for (; t < tile_end; t += $BKVu) {{\n\
+        let next = t + $BKVu;\n\
+        prefetch = false;\n\
+        if next < tile_end && lid.x < ($TILE_ELEMENTSu / 4u) {{\n\
+            prefetch = true;\n\
+            prefetch_pack = lid.x;\n\
+{prefetch}\
+        }}\n\
+{body}\
+        workgroupBarrier();\n\
+        if prefetch {{\n\
+            shared_k[prefetch_pack] = prefetch_k;\n\
+            shared_v[prefetch_pack] = prefetch_v;\n\
+        }}\n\
+        workgroupBarrier();\n\
+    }}\n"
+    )
+}
+
+fn flash_direct_tiles(load: &str, body: &str) -> String {
+    format!(
+        "    var t = min_kv_start;\n\
+    for (; t < tile_end; t += $BKVu) {{\n\
+{load}\
+        workgroupBarrier();\n\
+{body}\
+        workgroupBarrier();\n\
+    }}\n"
+    )
+}
+
+fn flash_tail_load(vector: bool, f16: bool) -> String {
+    if vector {
+        let stored = if f16 { "vec4<f16>" } else { "" };
+        format!(
+            "        for (var pack = lid.x; pack < ($HEAD_DIMu / 4u); pack += $THREADSu) {{\n\
+             let d = pack * 4u;\n\
+             shared_k[pack] = {stored}(src_b[(t * kv_dim + kv_head_off + d) / 4u]);\n\
+         }}\n"
+        )
+    } else {
+        "        for (var d = lid.x; d < $HEAD_DIMu; d += $THREADSu) {\n\
+             shared_k[d] = src_b[t * kv_dim + kv_head_off + d];\n\
+         }\n"
+        .to_string()
+    }
+}
+
+/// Online-softmax score for one KV tile (`tiled`) or the single-key tail.
+/// The subgroup width is only known at dispatch, so the tree remains for a
+/// width that would split a query across subgroups.
+fn grad_q_vec_tile_load(f16: bool) -> String {
+    let stored = if f16 { "vec4<f16>" } else { "" };
+    format!(
+        "        let tile_vecs = $TILE_ELEMENTSu / 4u;\n\
+         for (var pack = lid.x; pack < tile_vecs; pack += $THREADSu) {{\n\
+             let elem = pack * 4u;\n\
+             let ki = elem / $HEAD_DIMu;\n\
+             let kd = elem % $HEAD_DIMu;\n\
+             let base = (t + ki) * kv_dim + kv_head_off + kd;\n\
+             shared_k[pack] = {stored}(src_b[base / 4u]);\n\
+             shared_v[pack] = {stored}(bias[base / 4u]);\n\
+         }}\n"
+    )
+}
+
+fn grad_q_group_load(vector: bool, f16: bool) -> String {
+    if vector {
+        let ty = if f16 { "vec4<f16>" } else { "vec4<f32>" };
+        format!(
+            "        let tile_vecs = $TILE_ELEMENTSu / 4u;\n\
+         for (var pack = lid.x; pack < tile_vecs; pack += $THREADSu) {{\n\
+             let elem = pack * 4u;\n\
+             let ki = elem / $HEAD_DIMu;\n\
+             let d = elem % $HEAD_DIMu;\n\
+             let k_base = (t + ki) * kv_dim + kv_head_off;\n\
+             var k_value = {ty}(0.0);\n\
+             var v_value = {ty}(0.0);\n\
+             if t + ki < max_kv_len {{\n\
+                 k_value = {ty}(src_b[(k_base + d) / 4u]);\n\
+                 v_value = {ty}(bias[(k_base + d) / 4u]);\n\
+             }}\n\
+             shared_k[pack] = k_value;\n\
+             shared_v[pack] = v_value;\n\
+         }}\n"
+        )
+    } else {
+        "        for (var flat = lid.x; flat < $TILE_ELEMENTSu; flat += $THREADSu) {\n\
+             let ki = flat / $HEAD_DIMu;\n\
+             let d = flat % $HEAD_DIMu;\n\
+             let k_base = (t + ki) * kv_dim + kv_head_off;\n\
+             var k_value = 0.0;\n\
+             var v_value = 0.0;\n\
+             if t + ki < max_kv_len {\n\
+                 k_value = src_b[k_base + d];\n\
+                 v_value = bias[k_base + d];\n\
+             }\n\
+             shared_k[flat] = k_value;\n\
+             shared_v[flat] = v_value;\n\
+         }\n"
+        .to_string()
+    }
+}
+
+fn grad_q_tail_load(vector: bool, f16: bool) -> String {
+    if vector {
+        let stored = if f16 { "vec4<f16>" } else { "" };
+        format!(
+            "        for (var pack = lid.x; pack < ($HEAD_DIMu / 4u); pack += $THREADSu) {{\n\
+             let d = pack * 4u;\n\
+             shared_k[pack] = {stored}(src_b[(k_base + d) / 4u]);\n\
+             shared_v[pack] = {stored}(bias[(k_base + d) / 4u]);\n\
+         }}\n"
+        )
+    } else {
+        "        for (var d = lid.x; d < $HEAD_DIMu; d += $THREADSu) {\n\
+             shared_k[d] = src_b[k_base + d];\n\
+             shared_v[d] = bias[k_base + d];\n\
+         }\n"
+        .to_string()
+    }
+}
+
+fn grad_kv_query_load(vector: bool, f16: bool) -> String {
+    if vector {
+        let q_ty = if f16 { "vec4<f16>" } else { "vec4<f32>" };
+        format!(
+            "        let query_vecs = $QUERY_ELEMENTSu / 4u;\n\
+         for (var pack = lid.x; pack < query_vecs; pack += $THREADSu) {{\n\
+             let elem = pack * 4u;\n\
+             let qi = elem / $HEAD_DIMu;\n\
+             let d = elem % $HEAD_DIMu;\n\
+             let query = first + qi;\n\
+             let pos = query / heads_per_kv;\n\
+             let head = kv_head * heads_per_kv + query % heads_per_kv;\n\
+             let q_base = pos * q_dim + head * head_dim;\n\
+             var q_value = {q_ty}(0.0);\n\
+             var do_value = vec4<f32>(0.0);\n\
+             if query < query_end {{\n\
+                 q_value = {q_ty}(src_a[(q_base + d) / 4u]);\n\
+                 do_value = d_out[(q_base + d) / 4u];\n\
+             }}\n\
+             shared_q[pack] = q_value;\n\
+             shared_do[pack] = do_value;\n\
+         }}\n"
+        )
+    } else {
+        "        for (var flat = lid.x; flat < $QUERY_ELEMENTSu; flat += $THREADSu) {\n\
+             let qi = flat / $HEAD_DIMu;\n\
+             let d = flat % $HEAD_DIMu;\n\
+             let query = first + qi;\n\
+             let pos = query / heads_per_kv;\n\
+             let head = kv_head * heads_per_kv + query % heads_per_kv;\n\
+             let q_base = pos * q_dim + head * head_dim;\n\
+             var q_value = 0.0;\n\
+             var do_value = 0.0;\n\
+             if query < query_end {\n\
+                 q_value = src_a[q_base + d];\n\
+                 do_value = d_out[q_base + d];\n\
+             }\n\
+             shared_q[flat] = q_value;\n\
+             shared_do[flat] = do_value;\n\
+         }\n"
+        .to_string()
+    }
+}
+
+fn flash_score_body(tpq: u32, tiled: bool, subgroups: bool) -> String {
+    let guard = if subgroups {
+        format!("subgroup_size >= {tpq}u && subgroup_size % {tpq}u == 0u")
+    } else {
+        "false".into()
+    };
+    if tiled {
+        format!(
+            "        let grp_base = qi * {tpq}u;\n\
+             if ({guard}) {{\n\
+                 var tile_score: array<f32, $BKV>;\n\
+                 for (var i = 0u; i < $BKVu; i++) {{\n\
+                     var pdot = 0.0;\n\
+$TILE_DOT
+                     tile_score[i] = lane_sum(pdot);\n\
+                 }}\n\
+                 for (var i = 0u; i < $BKVu; i++) {{\n\
+                     let kv_pos = t + i;\n\
+                     if valid && kv_pos >= my_kv_start && kv_pos < my_kv_len {{\n\
+                         let score = tile_score[i] * scale;\n\
+                         let new_max = max(max_score, score);\n\
+                         let correction = exp(max_score - new_max);\n\
+                         let weight = exp(score - new_max);\n\
+                         sum_exp = sum_exp * correction + weight;\n\
+$TILE_ACCUMULATE
+                         max_score = new_max;\n\
+                     }}\n\
+                 }}\n\
+             }} else {{\n\
+                 for (var i = 0u; i < $BKVu; i++) {{\n\
+                     var pdot = 0.0;\n\
+$TILE_DOT
+                     wg_scores[i * $THREADSu + grp_base + lane] = pdot;\n\
+                 }}\n\
+                 tree_reduce_bkv_grouped(lid.x);\n\
+                 for (var i = 0u; i < $BKVu; i++) {{\n\
+                     let kv_pos = t + i;\n\
+                     if valid && kv_pos >= my_kv_start && kv_pos < my_kv_len {{\n\
+                         let score = wg_scores[i * $THREADSu + grp_base] * scale;\n\
+                         let new_max = max(max_score, score);\n\
+                         let correction = exp(max_score - new_max);\n\
+                         let weight = exp(score - new_max);\n\
+                         sum_exp = sum_exp * correction + weight;\n\
+$TILE_ACCUMULATE
+                         max_score = new_max;\n\
+                     }}\n\
+                 }}\n\
+             }}\n"
+        )
+    } else {
+        format!(
+            "        let dot_base = qi * {tpq}u;\n\
+             var pdot2 = 0.0;\n\
+$TAIL_DOT
+             if ({guard}) {{\n\
+                 tail_score = lane_sum(pdot2);\n\
+             }} else {{\n\
+                 wg_dot[dot_base + lane] = pdot2;\n\
+                 tree_reduce_grouped(lid.x);\n\
+                 tail_score = wg_dot[qi * {tpq}u];\n\
+             }}\n"
+        )
+    }
+}
+
 fn generate_flash_attention(
     head_dim: u32,
     ept_cap: u32,
     shape: FlashAttentionShape,
     cached: bool,
+    f16_keys: bool,
+    subgroup_tiles: bool,
 ) -> ShaderModule {
     assert!(matches!(shape.threads, 128 | 256) && shape.keys.is_power_of_two() && shape.keys <= 16);
     let (ept, tpq) = attention_lanes(head_dim, ept_cap);
@@ -194,13 +496,59 @@ fn generate_flash_attention(
         return generate_attention_module(head_dim);
     }
     let threads = bq * tpq;
+    let vector = (f16_keys || subgroup_tiles) && ept.is_multiple_of(4);
     let template = include_str!("../shaders/flash_attention.wgsl");
     let fragment = |name| template_section(template, name);
-    let elements =
-        |name| unroll_elements(fragment(name), ept, if shape.interleave { tpq } else { 1 });
+    // Contiguous lanes own `ept` elements. Interleaved lanes still own that
+    // many, but in groups of four so a vec4 load stays coalesced across the
+    // query's lanes. Scalar interleave keeps the one-element stride.
+    let (base_stride, elem_stride) = if shape.interleave && vector {
+        (4, tpq * 4)
+    } else if shape.interleave {
+        (1, tpq)
+    } else if vector {
+        // One vec4 per step. `ept` is the lane's first element, not the step.
+        (ept, 4)
+    } else {
+        (ept, 1)
+    };
+    let f16 = f16_keys && vector;
+    let elements = |name: &str| {
+        let section;
+        let body = if vector {
+            section = if f16 && matches!(name, "q_init" | "q_load" | "tile_dot" | "tail_dot") {
+                format!("{name}_v4_f16")
+            } else {
+                format!("{name}_v4")
+            };
+            template_section(template, &section)
+        } else {
+            template_section(template, name)
+        };
+        let count = if vector { ept / 4 } else { ept };
+        let stride = if vector { elem_stride / 4 } else { elem_stride };
+        unroll_elements(body, count, stride)
+    };
+    let tile_elements = shape.keys * head_dim;
+    let tile_body = flash_score_body(tpq, true, subgroup_tiles);
+    let tail_body = flash_score_body(tpq, false, subgroup_tiles);
+    let tile_load = if vector {
+        flash_vec_tile_load(f16)
+    } else {
+        attention_tile_load(template, tile_elements, threads)
+    };
+    // One vec4 per thread keeps the next tile in registers. Wider tiles keep
+    // the direct shared load; a private array there spills.
+    let kv_tiles = if vector && tile_elements / 4 <= threads {
+        flash_prefetched_tiles(&tile_load, &flash_prefetch(f16), &tile_body)
+    } else {
+        flash_direct_tiles(&tile_load, &tile_body)
+    };
     let source = preprocess(
         fragment("main"),
         &[
+            ("$KV_TILES", &kv_tiles),
+            ("$ENABLE", if f16 { "enable f16;\n" } else { "" }),
             (
                 "$PARAMS",
                 if cached {
@@ -208,6 +556,32 @@ fn generate_flash_attention(
                 } else {
                     ATTENTION_PARAMS_WGSL
                 },
+            ),
+            ("$ELEM", if vector { "vec4<f32>" } else { "f32" }),
+            (
+                "$STILE",
+                if f16 {
+                    "vec4<f16>"
+                } else if vector {
+                    "vec4<f32>"
+                } else {
+                    "f32"
+                },
+            ),
+            ("$VTILE", if vector { "vec4<f32>" } else { "f32" }),
+            (
+                "$SHARED_LEN",
+                &(if vector {
+                    tile_elements / 4
+                } else {
+                    tile_elements
+                })
+                .to_string(),
+            ),
+            ("$LANE_SUM", &lane_sum_fn(tpq)),
+            (
+                "$SUBGROUP_ARG",
+                ", @builtin(subgroup_size) subgroup_size: u32",
             ),
             (
                 "$CACHED_BINDING",
@@ -246,6 +620,8 @@ fn generate_flash_attention(
             ("$Q_INIT", &elements("q_init")),
             ("$Q_LOAD", &elements("q_load")),
             ("$OUT_INIT", &elements("out_init")),
+            ("$TILE_BODY", &tile_body),
+            ("$TAIL_BODY", &tail_body),
             ("$TILE_DOT", &elements("tile_dot")),
             ("$TILE_ACCUMULATE", &elements("tile_accumulate")),
             ("$TAIL_DOT", &elements("tail_dot")),
@@ -253,14 +629,16 @@ fn generate_flash_attention(
             ("$OUT_STORE", &elements("out_store")),
             (
                 "$TILE_LOAD",
-                &attention_tile_load(template, shape.keys * head_dim, threads),
+                &if vector {
+                    flash_vec_tile_load(f16)
+                } else {
+                    attention_tile_load(template, tile_elements, threads)
+                },
             ),
-            ("$TILE_ELEMENTS", &(shape.keys * head_dim).to_string()),
+            ("$TAIL_LOAD", &flash_tail_load(vector, f16)),
+            ("$TILE_ELEMENTS", &tile_elements.to_string()),
             ("$SCORES", &(threads * shape.keys).to_string()),
-            (
-                "$D_BASE_STRIDE",
-                &(if shape.interleave { 1 } else { ept }).to_string(),
-            ),
+            ("$D_BASE_STRIDE", &base_stride.to_string()),
             ("$HEAD_DIM", &head_dim.to_string()),
             ("$THREADS", &threads.to_string()),
             ("$TPQ", &tpq.to_string()),
@@ -478,29 +856,158 @@ fn backward_attention_tile(head_dim: u32, threads: u32) -> u32 {
     (2048 / (head_dim + threads)).clamp(1, 4)
 }
 
+/// Inner rows once the partial-dot arrays are gone. Two f32 tiles cost
+/// `8 * tile * head_dim` bytes. 16 rows is the fastest cap that still
+/// fits the 16 KiB budget on the head widths this kernel serves.
+fn backward_attention_tile_subgroup(head_dim: u32) -> u32 {
+    (2048 / head_dim).clamp(1, 16)
+}
+
+/// The device's reported subgroup width owns every lane of a query. The
+/// generated kernel still checks the live width and falls back to a shared
+/// sum, because the report is only a default.
+fn subgroup_covers_lanes(subgroup_size: u32, tpq: u32) -> bool {
+    tpq > 1 && subgroup_size >= tpq && subgroup_size.is_multiple_of(tpq)
+}
+
+const BACKWARD_SHARED_BUDGET: u32 = 16 * 1024;
+
+/// Largest row tile whose staging bytes, plus `reserved` fallback storage,
+/// stay inside the scalar backward shared-memory budget.
+fn fit_shared_rows(want: u32, bytes_per_row: u32, reserved: u32) -> u32 {
+    if bytes_per_row == 0 {
+        return want.max(1);
+    }
+    let room = BACKWARD_SHARED_BUDGET.saturating_sub(reserved);
+    want.clamp(1, (room / bytes_per_row).max(1))
+}
+
+fn subgroup_fallback_arrays() -> &'static str {
+    "var<workgroup> wg_part_score: array<f32, $THREADS>;\n\
+     var<workgroup> wg_part_dp: array<f32, $THREADS>;\n"
+}
+
+fn vec_math_section(name: &str, f16: bool) -> String {
+    if f16
+        && matches!(
+            name,
+            "q_init"
+                | "q_load"
+                | "tile_dot"
+                | "tile_accumulate"
+                | "tail_dot"
+                | "tail_accumulate"
+                | "kv_init"
+                | "kv_load"
+                | "dot"
+                | "accumulate"
+                | "q_load_direct"
+        )
+    {
+        format!("{name}_v4_f16")
+    } else {
+        format!("{name}_v4")
+    }
+}
+
 /// dQ stages K/V tiles; multi-lane queries also reduce partial dot products.
 pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule {
+    generate_flash_grad_q_module_for_subgroup(head_dim, ept_cap, 0, 256, false)
+}
+
+/// `subgroup_size` is the device's compiled wave width. Zero keeps the
+/// portable tree and its smaller tile (Metal reports no width).
+/// `threads` is the flash workgroup width, 128 or 256.
+pub fn generate_flash_grad_q_module_for_subgroup(
+    head_dim: u32,
+    ept_cap: u32,
+    subgroup_size: u32,
+    threads: u32,
+    f16_tiles: bool,
+) -> ShaderModule {
     let (ept, tpq) = attention_lanes(head_dim, ept_cap);
-    let bq = (256 / tpq).max(1);
+    let bq = (threads / tpq).max(1);
     if bq <= 1 {
         return ShaderModule::new(include_str!("../shaders/mha_grad_q.wgsl"));
     }
     let threads = bq * tpq;
-    let bkv = if tpq == 1 {
+    let subgroup = subgroup_covers_lanes(subgroup_size, tpq);
+    let vector = ept.is_multiple_of(4);
+    let f16 = f16_tiles && vector;
+    let mut bkv = if tpq == 1 {
         8
+    } else if subgroup {
+        backward_attention_tile_subgroup(head_dim)
     } else {
         backward_attention_tile(head_dim, threads)
     };
+    if subgroup {
+        // Two f16 tiles are 4 bytes per head element; f32 tiles are 8.
+        // The compact width fallback is two f32 values per thread.
+        let per_row = if f16 { 4 * head_dim } else { 8 * head_dim };
+        bkv = fit_shared_rows(bkv, per_row, 8 * threads);
+    }
     let template = include_str!("../shaders/flash_grad_q.wgsl");
-    let fragment = |name| template_section(template, name);
-    let elements = |name| unroll_elements(fragment(name), ept, 1);
+    let fragment = |name: &str| template_section(template, name);
+    let math = |name: &str| {
+        let section;
+        let body = if vector {
+            section = vec_math_section(name, f16);
+            template_section(template, &section)
+        } else {
+            template_section(template, name)
+        };
+        unroll_elements(body, if vector { ept / 4 } else { ept }, 1)
+    };
+    let tile_elements = bkv * head_dim;
+    let lane_sum = if tpq > 1 {
+        lane_sum_fn(tpq)
+    } else {
+        String::new()
+    };
     let source = preprocess(
         fragment("main"),
         &[
+            ("$ENABLE", if f16 { "enable f16;\n" } else { "" }),
             ("$PARAMS", ATTENTION_PARAMS_WGSL),
+            ("$ELEM", if vector { "vec4<f32>" } else { "f32" }),
+            (
+                "$STILE",
+                if f16 {
+                    "vec4<f16>"
+                } else if vector {
+                    "vec4<f32>"
+                } else {
+                    "f32"
+                },
+            ),
+            (
+                "$SHARED_LEN",
+                &(if vector {
+                    tile_elements / 4
+                } else {
+                    tile_elements
+                })
+                .to_string(),
+            ),
+            ("$LANE_SUM", &lane_sum),
+            (
+                "$SUBGROUP_ARG",
+                if tpq > 1 {
+                    ", @builtin(subgroup_size) subgroup_size: u32"
+                } else {
+                    ""
+                },
+            ),
             (
                 "$REDUCTION",
-                if tpq > 1 { fragment("reduction") } else { "" },
+                if subgroup {
+                    subgroup_fallback_arrays()
+                } else if tpq > 1 {
+                    fragment("reduction")
+                } else {
+                    ""
+                },
             ),
             (
                 "$REDUCE_STEP",
@@ -510,30 +1017,39 @@ pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule
                 "$KV_LOOP",
                 fragment(if tpq == 1 {
                     "tiled_kv_loop"
+                } else if subgroup {
+                    "grouped_kv_loop_subgroup"
                 } else {
                     "grouped_kv_loop"
                 }),
             ),
-            ("$Q_INIT", &elements("q_init")),
-            ("$Q_LOAD", &elements("q_load")),
-            ("$DQ_INIT", &elements("dq_init")),
+            ("$Q_INIT", &math("q_init")),
+            ("$Q_LOAD", &math("q_load")),
+            ("$DQ_INIT", &math("dq_init")),
             (
                 "$TILE_LOAD",
-                &attention_tile_load(template, bkv * head_dim, threads),
+                &if vector {
+                    grad_q_vec_tile_load(f16)
+                } else {
+                    attention_tile_load(template, tile_elements, threads)
+                },
             ),
-            ("$TILE_DOT", &elements("tile_dot")),
-            ("$TILE_ACCUMULATE", &elements("tile_accumulate")),
-            ("$TAIL_DOT", &elements("tail_dot")),
-            ("$TAIL_ACCUMULATE", &elements("tail_accumulate")),
-            ("$STORE", &elements("store")),
+            ("$GROUP_LOAD", &grad_q_group_load(vector, f16)),
+            ("$TILED_TAIL_LOAD", &grad_q_tail_load(vector, f16)),
+            ("$TILE_DOT", &math("tile_dot")),
+            ("$TILE_ACCUMULATE", &math("tile_accumulate")),
+            ("$TAIL_DOT", &math("tail_dot")),
+            ("$TAIL_ACCUMULATE", &math("tail_accumulate")),
+            ("$STORE", &math("store")),
             ("$GROUP_ELEMENTS", &(bkv * threads).to_string()),
-            ("$TILE_ELEMENTS", &(bkv * head_dim).to_string()),
+            ("$TILE_ELEMENTS", &tile_elements.to_string()),
             ("$HEAD_DIM", &head_dim.to_string()),
             ("$THREADS", &threads.to_string()),
             ("$EPT", &ept.to_string()),
             ("$TPQ", &tpq.to_string()),
             ("$BQ", &bq.to_string()),
             ("$BKV", &bkv.to_string()),
+            ("$USE_SUBGROUP", if subgroup { "true" } else { "false" }),
         ],
     );
     attention_module(source, "flash_grad_q")
@@ -541,53 +1057,133 @@ pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule
 
 /// dK/dV batches Q/dO rows for grouped reductions; single-lane heads load directly.
 pub fn generate_flash_grad_kv_module(head_dim: u32, ept_cap: u32) -> ShaderModule {
+    generate_flash_grad_kv_module_for_subgroup(head_dim, ept_cap, 0, 256, false)
+}
+
+/// See [`generate_flash_grad_q_module_for_subgroup`].
+pub fn generate_flash_grad_kv_module_for_subgroup(
+    head_dim: u32,
+    ept_cap: u32,
+    subgroup_size: u32,
+    threads: u32,
+    f16_tiles: bool,
+) -> ShaderModule {
     let (ept, tpq) = attention_lanes(head_dim, ept_cap);
-    let bkv = (256 / tpq).max(1);
+    let bkv = (threads / tpq).max(1);
     if bkv <= 1 {
         return ShaderModule::new(include_str!("../shaders/mha_grad_kv.wgsl"));
     }
+    let vector = ept.is_multiple_of(4);
+    let f16 = f16_tiles && vector;
     let template = include_str!("../shaders/flash_grad_kv.wgsl");
-    let fragment = |name| template_section(template, name);
-    let elements = |name| unroll_elements(fragment(name), ept, 1);
-    let query_tile = backward_attention_tile(head_dim, bkv * tpq);
+    let fragment = |name: &str| template_section(template, name);
+    let math = |name: &str| {
+        let section;
+        let body = if vector {
+            section = vec_math_section(name, f16);
+            template_section(template, &section)
+        } else {
+            template_section(template, name)
+        };
+        unroll_elements(body, if vector { ept / 4 } else { ept }, 1)
+    };
+    let subgroup = subgroup_covers_lanes(subgroup_size, tpq);
+    let mut query_tile = if subgroup {
+        backward_attention_tile_subgroup(head_dim)
+    } else {
+        backward_attention_tile(head_dim, bkv * tpq)
+    };
+    if subgroup {
+        // Q is f16 when tiles are; dO stays f32. The compact fallback is
+        // two f32 values per thread.
+        let per_row = if f16 { 6 * head_dim } else { 8 * head_dim };
+        query_tile = fit_shared_rows(query_tile, per_row, 8 * bkv * tpq);
+    }
+    let query_elements = query_tile * head_dim;
+    let lane_sum = if tpq > 1 {
+        lane_sum_fn(tpq)
+    } else {
+        String::new()
+    };
     let source = preprocess(
         fragment("main"),
         &[
+            ("$ENABLE", if f16 { "enable f16;\n" } else { "" }),
             ("$PARAMS", ATTENTION_PARAMS_WGSL),
+            ("$LANE_SUM", &lane_sum),
+            (
+                "$SUBGROUP_ARG",
+                if tpq > 1 {
+                    ", @builtin(subgroup_size) subgroup_size: u32"
+                } else {
+                    ""
+                },
+            ),
             (
                 "$QUERY_LOOP",
-                fragment(if tpq > 1 {
+                fragment(if subgroup {
+                    "tiled_query_loop_subgroup"
+                } else if tpq > 1 {
                     "tiled_query_loop"
                 } else {
                     "direct_query_loop"
                 }),
             ),
-            ("$TILE_Q_LOAD", &elements("tile_q_load")),
+            ("$QUERY_LOAD", &grad_kv_query_load(vector, f16)),
             ("$SHARED", if tpq > 1 { fragment("shared") } else { "" }),
+            ("$ELEM", if vector { "vec4<f32>" } else { "f32" }),
+            (
+                "$STILE",
+                if f16 {
+                    "vec4<f16>"
+                } else if vector {
+                    "vec4<f32>"
+                } else {
+                    "f32"
+                },
+            ),
+            ("$DOTILE", if vector { "vec4<f32>" } else { "f32" }),
+            (
+                "$QUERY_LEN",
+                &(if vector {
+                    query_elements / 4
+                } else {
+                    query_elements
+                })
+                .to_string(),
+            ),
+            ("$TILE_Q_LOAD", &math("tile_q_load")),
             (
                 "$REDUCTION",
-                if tpq > 1 { fragment("reduction") } else { "" },
+                if subgroup {
+                    subgroup_fallback_arrays()
+                } else if tpq > 1 {
+                    fragment("reduction")
+                } else {
+                    ""
+                },
             ),
             (
                 "$REDUCE_STEP",
                 &unroll_reduction(fragment("reduce_step"), tpq),
             ),
-            ("$KV_INIT", &elements("kv_init")),
-            ("$KV_LOAD", &elements("kv_load")),
-            ("$GRAD_INIT", &elements("grad_init")),
-            ("$Q_LOAD", &elements("q_load_direct")),
-            ("$DOT", &elements("dot")),
+            ("$KV_INIT", &math("kv_init")),
+            ("$KV_LOAD", &math("kv_load")),
+            ("$GRAD_INIT", &math("grad_init")),
+            ("$Q_LOAD", &math("q_load_direct")),
+            ("$DOT", &math("dot")),
             ("$SCORE", fragment("direct_score")),
-            ("$ACCUMULATE", &elements("accumulate")),
-            ("$STORE", &elements("store")),
+            ("$ACCUMULATE", &math("accumulate")),
+            ("$STORE", &math("store")),
             ("$QUERY_TILE", &query_tile.to_string()),
-            ("$QUERY_ELEMENTS", &(query_tile * head_dim).to_string()),
+            ("$QUERY_ELEMENTS", &query_elements.to_string()),
             ("$GROUP_ELEMENTS", &(query_tile * bkv * tpq).to_string()),
             ("$HEAD_DIM", &head_dim.to_string()),
             ("$THREADS", &(bkv * tpq).to_string()),
             ("$EPT", &ept.to_string()),
             ("$TPQ", &tpq.to_string()),
             ("$BKV", &bkv.to_string()),
+            ("$USE_SUBGROUP", if subgroup { "true" } else { "false" }),
         ],
     );
     attention_module(source, "flash_grad_kv")

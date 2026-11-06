@@ -309,6 +309,7 @@ impl TuningKnobs {
                 .or(bwd)
                 .or(fwd)
                 .unwrap_or(d.flash_grad_kv_ept_cap),
+            flash_subgroup_tiles: d.flash_subgroup_tiles,
             matmul_k_stage: d.matmul_k_stage,
             matmul_interleave_columns: false,
         }
