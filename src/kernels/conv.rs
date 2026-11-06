@@ -275,7 +275,7 @@ pub(crate) enum Path {
 /// tiles lose on discrete NVIDIA GPUs at low occupancy, and the input
 /// gradient's scalar staging runs 64 threads against the scalar kernel's
 /// 256.
-const MIN_F16_WORKGROUPS: u64 = 128;
+pub(crate) const MIN_F16_WORKGROUPS: u64 = 128;
 const MIN_F32_WORKGROUPS: u64 = 16;
 const MIN_GRAD_INPUT_WORKGROUPS: u64 = 16;
 

@@ -40,9 +40,14 @@ pub(super) fn generate_with_params(
         "unsupported cooperative tile {shape:?}"
     );
     let [m, n, k] = shape;
-    let variant = coop_shape(group).map(|(_, variant)| variant);
+    let pointwise = group == ShaderGroup::Conv2dPointwiseGradInput;
+    let variant = if pointwise {
+        Some(MatMulCoopVariant::AT)
+    } else {
+        coop_shape(group).map(|(_, variant)| variant)
+    };
     let split_range = SPLIT_RANGE.replace("wgid.", "group.");
-    let vector_conv = params.is_some_and(Params::vectorized_forward);
+    let vector_conv = !pointwise && params.is_some_and(Params::vectorized_forward);
     let vector_dense = layout.vectorized && variant.is_some();
     let global_a = layout.direct_inputs && vector_dense && types.a == types.multiply;
     let global_b = layout.direct_inputs && vector_dense && types.b == types.multiply;
@@ -91,17 +96,24 @@ pub(super) fn generate_with_params(
                 if addend { " + src[index]" } else { "" },
             )
         }
-        ShaderGroup::Conv2dBF16 {
-            kernel_h,
-            kernel_w,
-            stride,
-            ..
-        }
-        | ShaderGroup::Conv2dChecked {
-            kernel_h,
-            kernel_w,
-            stride,
-        } => {
+        ShaderGroup::Conv2dBF16 { .. }
+        | ShaderGroup::Conv2dChecked { .. }
+        | ShaderGroup::Conv2dPointwiseGradInput => {
+            let (kernel_h, kernel_w, stride) = match group {
+                ShaderGroup::Conv2dBF16 {
+                    kernel_h,
+                    kernel_w,
+                    stride,
+                    ..
+                }
+                | ShaderGroup::Conv2dChecked {
+                    kernel_h,
+                    kernel_w,
+                    stride,
+                } => (kernel_h, kernel_w, stride),
+                ShaderGroup::Conv2dPointwiseGradInput => (1, 1, 1),
+                _ => unreachable!(),
+            };
             assert!(kernel_h > 0 && kernel_w > 0 && stride > 0);
             if let ShaderGroup::Conv2dBF16 { output_bf16, .. } = group {
                 assert_eq!(
@@ -123,6 +135,10 @@ pub(super) fn generate_with_params(
                 },
                 if vector_conv {
                     "var<storage> src: array<vec4<$B_TYPE>>;\nvar<storage> weight: array<vec4<$A_TYPE>>;\nvar<storage, read_write> dst: array<$OUT_TYPE>;"
+                } else if pointwise && vector_dense {
+                    "var<storage> grad_out: array<vec4<$B_TYPE>>; var<storage> weight: array<vec4<$A_TYPE>>; var<storage,read_write> dst: array<$OUT_TYPE>;"
+                } else if pointwise {
+                    "var<storage> grad_out: array<$B_TYPE>; var<storage> weight: array<$A_TYPE>; var<storage,read_write> dst: array<$OUT_TYPE>;"
                 } else {
                     include_str!("../shaders/conv2d_checked.wgsl")
                 }
@@ -151,10 +167,22 @@ pub(super) fn generate_with_params(
             };
             (
                 format!("{declaration}\n{params_decl}"),
-                "let m = params.out_channels; let n = params.out_h * params.out_w; let k = params.in_channels * KH * KW;",
+                if pointwise {
+                    "let m=params.in_channels; let n=params.in_h*params.in_w; let k=params.out_channels;"
+                } else {
+                    "let m = params.out_channels; let n = params.out_h * params.out_w; let k = params.in_channels * KH * KW;"
+                },
                 "let first = 0u; let end = k;",
-                "weight[ar * k + ak]",
-                "load_pixel(group.z, bk, bc)",
+                if pointwise {
+                    "weight[ak * m + ar]"
+                } else {
+                    "weight[ar * k + ak]"
+                },
+                if pointwise {
+                    "grad_out[(group.z * k + bk) * n + bc]"
+                } else {
+                    "load_pixel(group.z, bk, bc)"
+                },
                 "(group.z * m + r) * n + c",
                 "dst",
                 "",
@@ -222,11 +250,19 @@ pub(super) fn generate_with_params(
     };
     let address = |a_side: bool, output: &str, reduction: &str| {
         let (_, _, limit, _, output_outer) = operand(a_side);
-        if output_outer {
+        let (index, stride) = if output_outer {
             (format!("({output}) * k + ({reduction})"), "k")
         } else {
             (format!("({reduction}) * {limit} + ({output})"), limit)
-        }
+        };
+        (
+            if pointwise && !a_side {
+                format!("group.z * k * n + ({index})")
+            } else {
+                index
+            },
+            stride,
+        )
     };
     let stage = if vector_dense {
         let mut body = String::new();
@@ -239,6 +275,16 @@ pub(super) fn generate_with_params(
                 include_str!("../shaders/matmul_checked_vector.wgsl"),
                 &[
                     ("$OPERAND", name),
+                    (
+                        "$STORAGE",
+                        if pointwise {
+                            if a_side { "weight" } else { "grad_out" }
+                        } else if a_side {
+                            "matrix_a"
+                        } else {
+                            "matrix_b"
+                        },
+                    ),
                     ("$OUTPUT_BASE", base),
                     ("$OUTPUT_LIMIT", limit),
                     ("$OUTPUT_OUTER", if output_outer { "true" } else { "false" }),
