@@ -3639,7 +3639,7 @@ mod tests {
             ),
             (
                 ShaderGroup::FlashAttention,
-                naga::valid::Capabilities::empty(),
+                naga::valid::Capabilities::SUBGROUP,
             ),
             (
                 ShaderGroup::FlashAttentionCoop,
@@ -3891,6 +3891,82 @@ mod tests {
                 }
             }
         }
+        // A known wave width uses lane_sum and grows the tile, and keeps a
+        // compact shared sum for a runtime width that does not cover the
+        // query. The portable generator (width 0) stays on the tree.
+        let tree = generate_flash_grad_q_module(64, 32);
+        let wave = generate_flash_grad_q_module_for_subgroup(64, 32, 64, 256, false);
+        assert!(tree.source.contains("wg_score"));
+        assert!(!wave.source.contains("wg_score"));
+        assert!(wave.source.contains("wg_part_score"));
+        assert!(wave.source.contains("subgroup_size >="));
+        assert!(wave.source.contains("lane_sum"));
+        assert!(!wave.source.contains('$'), "{}", wave.source);
+        let wave_kv = generate_flash_grad_kv_module_for_subgroup(64, 32, 64, 256, false);
+        assert!(!wave_kv.source.contains("wg_score"));
+        assert!(wave_kv.source.contains("wg_part_score"));
+        assert!(wave_kv.source.contains("subgroup_size >="));
+        assert!(!wave_kv.source.contains('$'), "{}", wave_kv.source);
+        // f16 tiles round Q/K/V once at the load. dO stays f32: Whisper's
+        // upstream gradients are smaller than the f16 normal range, and an
+        // f16 dO tile flushes v_proj to zero.
+        let f16_q = generate_flash_grad_q_module_for_subgroup(64, 16, 64, 256, true);
+        let f16_kv = generate_flash_grad_kv_module_for_subgroup(64, 16, 64, 128, true);
+        for shader in [&f16_q, &f16_kv] {
+            assert!(shader.source.contains("enable f16;"), "{}", shader.hint);
+            assert!(
+                !shader.source.contains("vec4<f16>(d_out"),
+                "{}",
+                shader.hint
+            );
+            assert!(!shader.source.contains('$'), "{}", shader.hint);
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all() & !naga::valid::ValidationFlags::BINDINGS,
+                naga::valid::Capabilities::SUBGROUP | naga::valid::Capabilities::SHADER_FLOAT16,
+            )
+            .validate(&shader.module)
+            .unwrap();
+        }
+        assert!(f16_q.source.contains("var do0 = vec4<f32>(0.0);"));
+        assert!(f16_kv.source.contains("shared_do: array<vec4<f32>"));
+        assert!(f16_kv.source.contains("shared_q: array<vec4<f16>"));
+        for shader in [&wave, &wave_kv] {
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all() & !naga::valid::ValidationFlags::BINDINGS,
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&shader.module)
+            .unwrap();
+        }
+        assert!(wave.source.contains("t += 16u"));
+        assert!(workgroup_bytes(&wave) <= 16384);
+        for subgroup in [32u32, 64] {
+            for (head_dim, cap) in [(16, 4), (64, 16), (64, 32), (128, 16), (512, 32), (1024, 4)] {
+                for shader in [
+                    generate_flash_grad_q_module_for_subgroup(head_dim, cap, subgroup, 256, false),
+                    generate_flash_grad_kv_module_for_subgroup(head_dim, cap, subgroup, 256, false),
+                ] {
+                    assert!(
+                        workgroup_bytes(&shader) <= 16384,
+                        "{}: head={head_dim}, cap={cap}, subgroup={subgroup}",
+                        shader.hint
+                    );
+                }
+            }
+        }
+    }
+
+    fn workgroup_bytes(shader: &ShaderModule) -> u32 {
+        let mut layout = naga::proc::Layouter::default();
+        layout.update(shader.module.to_ctx()).unwrap();
+        let mut bytes = 0;
+        for (_, var) in shader.module.global_variables.iter() {
+            if var.space == naga::AddressSpace::WorkGroup {
+                let ty = layout[var.ty];
+                bytes = ty.alignment.round_up(bytes) + ty.size;
+            }
+        }
+        bytes
     }
 
     #[test]
@@ -3959,13 +4035,95 @@ mod tests {
                         naga::valid::Validator::new(
                             naga::valid::ValidationFlags::all()
                                 ^ naga::valid::ValidationFlags::BINDINGS,
-                            naga::valid::Capabilities::empty(),
+                            naga::valid::Capabilities::SUBGROUP,
                         )
                         .validate(&sm.module)
                         .unwrap();
                     }
                 }
             }
+        }
+        let keys_only = generate_flash_attention_module_for_device(
+            64,
+            16,
+            FlashAttentionShape {
+                threads: 256,
+                keys: 8,
+                interleave: true,
+            },
+            true,
+            true,
+        );
+        assert!(keys_only.source.contains("shared_k: array<vec4<f16>"));
+        assert!(keys_only.source.contains("shared_v: array<vec4<f32>"));
+        assert!(keys_only.source.contains("enable f16;"));
+        assert!(keys_only.source.contains("tile_score"));
+        assert!(keys_only.source.contains("prefetch_k"));
+        assert!(!keys_only.source.contains('$'));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS,
+            naga::valid::Capabilities::SUBGROUP | naga::valid::Capabilities::SHADER_FLOAT16,
+        )
+        .validate(&keys_only.module)
+        .unwrap();
+    }
+
+    #[test]
+    fn flash_f16_staging_keeps_dot_accumulators_f32() {
+        for shader in [
+            generate_flash_attention_module_for_device(
+                64,
+                4,
+                FlashAttentionShape::default(),
+                true,
+                true,
+            ),
+            generate_flash_attention_module_for_device(
+                64,
+                4,
+                FlashAttentionShape::default(),
+                false,
+                true,
+            ),
+            generate_flash_attention_module_for_device(
+                64,
+                4,
+                FlashAttentionShape::default(),
+                true,
+                false,
+            ),
+            generate_flash_grad_q_module_for_subgroup(64, 4, 32, 256, true),
+            generate_flash_grad_kv_module_for_subgroup(64, 4, 32, 256, true),
+        ] {
+            let info = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all() & !naga::valid::ValidationFlags::BINDINGS,
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&shader.module)
+            .unwrap();
+            let mut dots = 0;
+            for (index, entry) in shader.module.entry_points.iter().enumerate() {
+                for (handle, expression) in entry.function.expressions.iter() {
+                    if matches!(
+                        expression,
+                        naga::Expression::Math {
+                            fun: naga::MathFunction::Dot,
+                            ..
+                        }
+                    ) {
+                        dots += 1;
+                        assert_eq!(
+                            info.get_entry_point(index)[handle]
+                                .ty
+                                .inner_with(&shader.module.types),
+                            &naga::TypeInner::Scalar(naga::Scalar::F32),
+                            "{}",
+                            shader.hint
+                        );
+                    }
+                }
+            }
+            assert!(dots > 0, "{}", shader.hint);
         }
     }
 
@@ -4229,7 +4387,10 @@ mod tests {
             (ShaderGroup::RoPEGrad, empty),
             (ShaderGroup::LayerNorm, empty),
             (ShaderGroup::MultiHeadAttn, empty),
-            (ShaderGroup::FlashAttention, empty),
+            (
+                ShaderGroup::FlashAttention,
+                naga::valid::Capabilities::SUBGROUP,
+            ),
             (ShaderGroup::FlashAttentionCoop, coop),
             (ShaderGroup::FlashAttentionCoopF32, coop),
             (ShaderGroup::SwiGLUGrad, empty),

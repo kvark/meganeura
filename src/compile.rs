@@ -105,6 +105,11 @@ pub struct TuningKnobs {
     pub flash_grad_q_ept_cap: u32,
     /// EPT cap for the fused flash dK/dV backward kernel.
     pub flash_grad_kv_ept_cap: u32,
+    /// Vector tiles and subgroup reductions for forward flash attention, and
+    /// shuffles for backward queries wider than eight lanes. Search measures
+    /// this implementation against scalar forward tiles and workgroup sums.
+    #[serde(default)]
+    pub flash_subgroup_tiles: bool,
     /// K staging depth of the scalar tiled matmul: 8 | 16 | 32.
     pub matmul_k_stage: u32,
     /// Stagger scalar-matmul B loads across columns instead of routing a
@@ -115,7 +120,9 @@ pub struct TuningKnobs {
 impl Default for TuningKnobs {
     /// Pure per-platform defaults. Apple Silicon benefits from the extra
     /// parallelism of smaller EPT; 32 keeps register count below the
-    /// spilling cliff on Ampere/Blackwell. `MEGANEURA_FLASH_*_EPT_CAP`
+    /// spilling cliff on Ampere/Blackwell. Backward starts at 16 to limit
+    /// register pressure; measured search also compares wider lanes.
+    /// `MEGANEURA_FLASH_*_EPT_CAP`
     /// overrides are applied only by [`TuningKnobs::from_env`] (in
     /// `crate::config`) — the library itself never reads the environment.
     /// Matmul K stage and column interleave stay at these defaults. Measured
@@ -126,8 +133,9 @@ impl Default for TuningKnobs {
         Self {
             flash_ept_cap: fwd,
             flash: crate::codegen::FlashAttentionShape::default(),
-            flash_grad_q_ept_cap: fwd,
-            flash_grad_kv_ept_cap: if apple { 8 } else { 32 },
+            flash_grad_q_ept_cap: 16,
+            flash_grad_kv_ept_cap: if apple { 8 } else { 16 },
+            flash_subgroup_tiles: false,
             matmul_k_stage: 32,
             matmul_interleave_columns: false,
         }
@@ -153,6 +161,12 @@ pub struct CompileOptions {
     /// Enable the experimental reduced-precision cooperative flash
     /// backward kernels.
     pub flash_backward_coop: bool,
+    /// Store forward Q/K and backward Q/K/V tiles as f16 in scalar flash.
+    /// Forward V and backward dO stay f32; dot arithmetic stays f32.
+    /// Off unless measured search or [`crate::CoopPolicy::AllowF16`] opts in.
+    /// Explicit full-precision pins stay f32 either way.
+    #[serde(default)]
+    pub flash_f16_tiles: bool,
     /// Explicit BF16 forward matrices also use BF16 derivative operands with
     /// F32 accumulation. No effect on ordinary F32 forward operations.
     #[serde(default)]
@@ -204,6 +218,7 @@ impl Default for CompileOptions {
             knobs: TuningKnobs::default(),
             flash_forward_coop: true,
             flash_backward_coop: false,
+            flash_f16_tiles: false,
             bf16_matrix_gradients: false,
             gemv_shape: None,
             cached_attention_splits: None,
@@ -1205,6 +1220,12 @@ pub struct Dispatch {
     /// Automatic derivative guard, independent of an explicit precision pin.
     #[serde(default)]
     pub is_derivative: bool,
+    /// Scalar flash attention may store forward Q/K and backward Q/K/V tiles
+    /// as f16. Forward V stays f32. Derivative dispatches stay false until measured
+    /// search or [`crate::CoopPolicy::AllowF16`] sets them. Runtime policy and
+    /// explicit pins clear the bit. dO is never stored as f16.
+    #[serde(default)]
+    pub attention_f16_tiles: bool,
     /// Prevent this dispatch from being absorbed into a producer or consumer.
     /// Used for explicit memory-placement boundaries such as [`Op::Materialize`].
     #[serde(default)]
