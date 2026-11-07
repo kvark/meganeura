@@ -118,10 +118,81 @@ above the API, including every kernel, is ours.
 If asked:
 - Vulkan also reaches Apple GPUs through MoltenVK, a translation layer; we use
   Metal directly.
-- WebGPU sits above both; its wgpu implementation uses the same Naga shader
-  translator we do.
+- WebGPU sits above both and has its own shading language: next slide.
 - Matrix tiles: VK_KHR_cooperative_matrix on Vulkan, simdgroup matrices on
   Apple GPUs. Backup "Matrix paths selected".
+-->
+
+---
+
+<!-- _class: wgsl -->
+
+# WGSL: the WebGPU Shading Language
+
+<div class="wgsl-grid"><div>
+
+```rust
+var<storage> indices: array<u32>;
+var<storage> src: array<f32>;
+var<storage, read_write> dst: array<f32>;
+var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if i >= params.total { return; }
+    let row = i / params.embed_dim;
+    let col = i % params.embed_dim;
+    var sum = 0.0;
+    for (var s = 0u; s < params.seq_len; s++) {
+        if indices[s] == row {
+            sum += src[s * params.embed_dim + col];
+        }
+    }
+    dst[i] = sum;
+}
+```
+<p class="wgsl-caption">Embedding gradient, <code>src/shaders/scatter_add.wgsl</code></p>
+
+</div><div class="wgsl-facts">
+<div><b>Standard</b><span>W3C, specified with WebGPU</span></div>
+<div><b>Portable</b><span>One source, translated to SPIR-V, MSL or HLSL</span></div>
+<div><b>Native</b><span>Runs outside the browser: Naga in wgpu, Tint in Dawn</span></div>
+<div><b>Compute</b><span>Storage buffers · workgroup memory · atomics · barriers · <code>f16</code> · subgroups</span></div>
+</div></div>
+
+<div class="naga-flow"><span>WGSL kernels</span><i>→</i><span><b>Naga</b> parse · validate</span><i>→</i><span>SPIR-V for Vulkan · MSL for Metal</span></div>
+
+**All 113 kernels are WGSL. No browser involved.**
+
+<!--
+Time: 0:40.
+
+Our kernels are written in WGSL, the WebGPU Shading Language. The W3C
+specifies it together with WebGPU, the browser's GPU API, but nothing about
+it requires a browser. It is a portable language: an implementation
+translates one source into each platform's native shader format, SPIR-V for
+Vulkan, MSL for Metal, HLSL for Direct3D. Two independent implementations
+run natively: Naga, in the Rust wgpu project, and Tint, in Google's Dawn.
+
+For compute it has what a kernel needs: storage buffers, workgroup shared
+memory, atomics and barriers, with f16 and subgroup operations as
+extensions. This is a real kernel, the embedding gradient, almost
+unabridged: plain buffers, one thread per output element.
+
+Meganeura uses Naga directly. It parses and validates each kernel and emits
+SPIR-V for Vulkan or Metal Shading Language for Metal, inside our process.
+
+If asked:
+- Status: W3C Candidate Recommendation, from the GPU for the Web Working
+  Group. Shipping in Chrome since 2023; Safari and Firefox since 2025.
+- No @group or @binding attributes: Blade binds shader data by name.
+- Matrix tiles use a Naga extension, wgpu_cooperative_matrix, from our pinned
+  fork; it is not standard WGSL yet.
+- Kernels are templates specialized for shape, device and precision before
+  Naga sees them: backup "How do we write the kernels?".
+
+Sources: src/shaders/scatter_add.wgsl; src/codegen.rs; Cargo.toml (naga).
 -->
 
 ---
@@ -1031,18 +1102,18 @@ Sources: data/results.csv; data/summary.json; data/hardware.json;
 <div class="columns backup-list"><div>
 
 **Productivity**
-[Importing a model](#22) · [From PyTorch](#23) · [Inside Meganeura](#24) · [How do we describe a model?](#25) · [Which form is faster?](#26) · [How do we write the kernels?](#27) · [Gradients](#28) · [Compile stages](#29)
+[Importing a model](#23) · [From PyTorch](#24) · [Inside Meganeura](#25) · [How do we describe a model?](#26) · [Which form is faster?](#27) · [How do we write the kernels?](#28) · [Gradients](#29) · [Compile stages](#30)
 
 **Portability**
-[Matrix paths selected](#30) · [Where paths stop](#31) · [What search costs](#32) · [Reusing kernel decisions](#33) · [Coverage](#34)
+[Matrix paths selected](#31) · [Where paths stop](#32) · [What search costs](#33) · [Reusing kernel decisions](#34) · [Coverage](#35)
 
 </div><div>
 
 **Performance**
-[Minimal shape](#35) · [Precision gains](#36) · [Two gaps](#37) · [Precision rules](#38) · [What the checks admit](#39) · [Where TF32 fits](#40) · [SPIR-V precision](#41) · [Timing variability](#42) · [Warmup](#43) · [Portability scores](#44)
+[Minimal shape](#36) · [Precision gains](#37) · [Two gaps](#38) · [Precision rules](#39) · [What the checks admit](#40) · [Where TF32 fits](#41) · [SPIR-V precision](#42) · [Timing variability](#43) · [Warmup](#44) · [Portability scores](#45)
 
 **Deployment**
-[Queue measurements](#45) · [Learning on the device](#46)
+[Queue measurements](#46) · [Learning on the device](#47)
 
 </div></div>
 
