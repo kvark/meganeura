@@ -10,7 +10,7 @@ the supplement with the tagged analyzer, each in a new, empty directory:
     python3 -I TOOL/cohort.py AUX/records.jsonl.xz --output PAPER --check AUX/tables
     python3 -I since_paper.py PAPER/conditions.csv
 
-Standard library only. The talk's side is data/results.csv.
+Standard library only. The talk's side is ../tables/results.csv.
 """
 import csv
 import statistics
@@ -31,7 +31,7 @@ def number(text):
 def main(paper_csv):
     paper = {(r["device"], r["precision"], r["model"]): r for r in csv.DictReader(open(paper_csv))}
     talk = {(r["archive"], r["model"], r["precision"], r["phase"]): r
-            for r in csv.DictReader(open(HERE / "data" / "results.csv"))}
+            for r in csv.DictReader(open(HERE.parent / "tables" / "results.csv"))}
 
     def ratios(devices, precision, phase):
         old = [number(paper[d, precision, m][f"ratio_{phase}"]) for d in devices for m in MODELS]

@@ -82,7 +82,8 @@ original arXiv evidence remains separate in `verify.py` and `test_verify.py`.
 ### Derived gap accounting
 
 `gap_analysis.py` uses the frozen result CSV on identical qualified model sets
-and generates `gap.json`/`gap.tex` without GPU execution.
+and generates `gap.tex` without GPU execution; `--output` also writes the full
+matched inventory, `gap.json`.
 
 ```sh
 python3 paper/p3hpc/artifact/gap_analysis.py --check paper/p3hpc/tables

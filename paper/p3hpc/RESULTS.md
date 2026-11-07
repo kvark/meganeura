@@ -233,7 +233,7 @@ an unavoidable API penalty or a measured speedup from a proposed fix.
 4096³ exceeds the tuner's 64 MiB scratch and uses the default tile. 2048³ is
 covered after keeping encoder allowance outside that limit, restoring B570
 3.58 ms from 5.31 and RX 7900 XT 1.08 from 1.30. Processes tune for two
-seconds; small B570 ops vary by up to 45%. Native convolution times include
+seconds and can pick different tiles. Native convolution times include
 per-call Winograd weight transforms. The earlier U-Net shared-memory query
 at `99e3de2` uses 16.4 KiB, below Vulkan's 48 KiB; that specific kernel is not
 limited by the ceiling. Timelines and matched-kernel inspection remain needed

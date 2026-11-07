@@ -15,7 +15,7 @@ paper-p3hpc-2026-final tags point to earlier measurements.
   `summary.json`, `results.csv`, and
   `preparation.csv` (native setup/search and reference compilation by process).
 - `op-bench/`: repository-shaped overlay with the separate strict-f32
-  single-operation summary, available per-process rows, shapes and runners.
+  single-operation summary, shapes and runners.
 - `warmup/`: summary and provenance of the separate 5/15/30/60-second diagnostic.
 - `RESULTS.md`, `QUALIFICATION.md`: interpretation and coverage.
 - `MANIFEST.sha256`: hashes of the packaged files.
@@ -80,7 +80,7 @@ This uses three native processes and one reference process per shape, with
 thirty device samples per process. Operands differ between engines. Native
 times sum pass intervals; reference events include gaps between serial graph
 operations. The measurements support kernel comparisons, not an exact share
-of the model-level gap or an independent cross-engine accuracy test. The
-original native per-process rows for RTX 5070/B570 are retained; AMD's full
-run archive remains outside this supplement. The source runner and recorded
+of the model-level gap or an independent cross-engine accuracy test. Only the
+median native rows are retained; per-process runs remain outside this
+supplement. The source runner and recorded
 protocol are supplied, not all executed binaries or GPU traces.

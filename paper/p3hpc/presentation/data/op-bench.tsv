@@ -3,7 +3,7 @@
 # RTX 5070 (driver 595, PyTorch 2.13.0+cu130) and Arc B570 (Mesa ANV, PyTorch 2.13.0+xpu), i5-12400F, October 31, 2026.
 # Meganeura with examples/op_bench.rs; MEGANEURA_TUNE=1 (2 s kernel tuner, 64 MiB scratch; the 4096 GEMM exceeds it) MEGANEURA_DISABLE_COOP=1.
 #   5b232bd plus the tuner scratch fix (567028b on main), which makes the 2048 GEMM fit, on all three GPUs; each row has the median gpu_ms of 3 processes
-#   (the tuner can pick different tiles per process; small B570 ops vary by up to 45%). RX 7900 XT run from a branch build with the same runtime code.
+#   (the tuner can pick different tiles per process). RX 7900 XT run from a branch build with the same runtime code.
 #   gpu_ms = median over 30 profiled steps of summed Vulkan pass timestamps (excludes gaps between passes).
 # PyTorch: TF32 off, cudnn.benchmark on, profiler off during timing (profiling perturbs ROCm execution).
 #   gpu_ms = device events around one replay of a graph of 30 serial ops / 30, median of 30 replays (includes device dispatch gaps,
