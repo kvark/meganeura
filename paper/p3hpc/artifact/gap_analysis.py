@@ -86,7 +86,8 @@ def main():
     if not args.output and not args.check:
         p.error("specify --output and/or --check")
     for name, content in outputs.items():
-        if args.check and (args.check / name).read_text() != content:
+        # Only the table is in the repository; gap.json is written on request.
+        if args.check and name == "gap.tex" and (args.check / name).read_text() != content:
             raise SystemExit(f"stale gap analysis: {args.check / name}")
         if args.output:
             args.output.mkdir(parents=True, exist_ok=True)

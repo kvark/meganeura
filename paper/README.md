@@ -54,7 +54,7 @@ model time to CPU, GPU, API or driver.
 python3 paper/p3hpc/artifact/gap_analysis.py --check paper/p3hpc/tables
 ```
 
-Use `--output paper/p3hpc/tables` to regenerate `gap.json` and `gap.tex`.
+Use `--output DIR` to write `gap.tex` and the full matched inventory, `gap.json`.
 The presentation computes the same accounting from its frozen CSV. No GPU
 or raw cohort archive is needed for this derived analysis.
 

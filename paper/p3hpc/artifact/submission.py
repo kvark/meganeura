@@ -14,6 +14,7 @@ qualification code before packaging; never mix final tables with older data.
 """
 
 import argparse
+import csv
 import hashlib
 from pathlib import Path
 import shutil
@@ -23,6 +24,8 @@ import tempfile
 import zipfile
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import gap_analysis  # noqa: E402
 P3HPC = HERE.parent
 PAPER = P3HPC.parent
 ZIP_TIME = (1980, 1, 1, 0, 0, 0)
@@ -95,13 +98,14 @@ def main():
         files[name] = (HERE / name).read_bytes()
     for table in TABLES:
         files[f"tables/{table}.tex"] = (P3HPC / "tables" / f"{table}.tex").read_bytes()
-    for name in ("results.csv", "preparation.csv", "summary.json", "gap.json"):
+    for name in ("results.csv", "preparation.csv", "summary.json"):
         files[f"tables/{name}"] = (P3HPC / "tables" / name).read_bytes()
+    with (P3HPC / "tables" / "results.csv").open() as rows:
+        files["tables/gap.json"] = gap_analysis.render(list(csv.DictReader(rows)))["gap.json"].encode()
     for name in ("summary.csv", "protocol.json"):
         files[f"warmup/{name}"] = (HERE / "warmup" / name).read_bytes()
     # A repository-shaped overlay keeps the single-op driver's relative paths valid.
-    for name in ("op-bench.tsv", "b570-unet-shared-memory.txt",
-                 "op-bench/meganeura-runs.tsv", "op-bench/run_all.sh",
+    for name in ("op-bench.tsv", "b570-unet-shared-memory.txt", "op-bench/run_all.sh",
                  "op-bench/shapes.txt", "op-bench/torch_ops.py"):
         files["op-bench/paper/p3hpc/presentation/data/" + name] = (
             P3HPC / "presentation" / "data" / name).read_bytes()
