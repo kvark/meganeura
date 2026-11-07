@@ -522,3 +522,18 @@ section.from-torch .lead { font-size: 22px; margin: 0 0 18px; }
 .torch-flow span { display: block; font-size: 16px; color: #4a5c60; margin-top: 6px; line-height: 1.3; }
 section.from-torch pre { font-size: 17px; margin: 0 0 14px; }
 .torch-note { font-size: 19px; margin: 0; }
+
+/* WGSL: a real kernel beside the language's facts. */
+section.wgsl h1 { margin-bottom: 12px; }
+.wgsl-grid { display: grid; grid-template-columns: 1.25fr 1fr; gap: 32px; align-items: start; }
+.wgsl-grid pre { font-size: 14px; line-height: 1.28; margin: 0; padding: 12px 14px; }
+.wgsl-caption { font-size: 15px; color: #637679; margin: 6px 0 0; }
+.wgsl-facts > div { display: grid; grid-template-columns: 132px 1fr; gap: 10px; align-items: baseline; border-top: 1px solid #d1dad8; padding: 10px 0; }
+.wgsl-facts > div:first-child { border-top: 4px solid #006b70; }
+.wgsl-facts b { color: #006b70; font-size: 21px; }
+.wgsl-facts span { font-size: 20px; line-height: 1.3; }
+.wgsl-facts code { font-size: 18px; }
+.naga-flow { display: flex; align-items: center; gap: 12px; background: #e7eeeb; padding: 8px 18px; margin: 12px 0 8px; font-size: 20px; }
+.naga-flow i { font-style: normal; color: #006b70; font-weight: 700; }
+.naga-flow b { color: #006b70; }
+section.wgsl > p { font-size: 24px; margin: 0; }

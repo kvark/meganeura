@@ -1,7 +1,8 @@
 # P3HPC presentation
 
-The main talk has 20 slides with 19:50 of suggested speaking time, a backup
-index and 25 backups. It opens with what Vulkan and Metal are, then combines
+The main talk has 21 slides with 20:30 of suggested speaking time, a backup
+index and 25 backups. It opens with what Vulkan and Metal are and with WGSL,
+the language of every kernel, then combines
 the Vulkan/Metal deployment argument, the
 compiler's architecture and search, hardware access and limits, and measured
 performance. The Rust API example and server scaling are in the main talk; the compiler
