@@ -1,12 +1,12 @@
 # Single GEMM / convolution, strict f32, batch 1. Meganeura runs 3 processes per shape and keeps the median gpu_ms row; PyTorch runs once.
 # RTX 5070 (driver 595, PyTorch 2.13.0+cu130) and Arc B570 (Mesa 26.0.3 ANV, PyTorch 2.13.0+xpu), i5-12400F, November 8, 2026,
 #   Meganeura d32a495 (split-K, cached Winograd weights, 128x64 GEMM tile).
-# RX 7900 XT (gfx1100, RADV Mesa 26.0.8, PyTorch 2.13.0+rocm7.2, Ryzen 5 9600X), November 8, 2026, Meganeura 429a0e4,
-#   before those three changes.
+# RX 7900 XT (gfx1100, RADV Mesa 26.0.8, PyTorch 2.13.0+rocm7.2, Ryzen 5 9600X), November 8, 2026, Meganeura d32a495,
+#   with those three changes.
 # Meganeura: MEGANEURA_TUNE=1 (2 s kernel tuner, 64 MiB scratch; the 4096 GEMM exceeds it) MEGANEURA_DISABLE_COOP=1, e-graph optimizer off.
 #   gpu_ms = one timestamped pass over 30 copies of the operation on the same input and weight, a barrier after every dispatch, / 30;
 #   median of 30 steps. Shape-preserving convolutions (all 3x3 rows) are chained, each copy reading the previous output. At
-#   d32a495 the Winograd weight transforms run in the first step only (still listed in the labels); at 429a0e4 they run every step.
+#   d32a495 the Winograd weight transforms run in the first step only (still listed in the labels).
 # PyTorch: TF32 off, cudnn.benchmark on, profiler off during timing (profiling perturbs ROCm execution).
 #   gpu_ms = device events around one replay of a graph of 30 serial ops / 30, median of 30 replays (includes device dispatch gaps,
 #   excludes host enqueue gaps). Graph outputs match eager within 1e-6 relative (bitwise except last-bit XPU differences).
@@ -14,44 +14,44 @@
 # tflops = GEMM or direct-convolution FLOPs / gpu_ms (effective for Winograd). Kernel labels: MatMul[MxNxK]. Inputs differ between engines.
 # gemm dims: M K N; conv dims: Cin H W Cout k stride pad (data/op-bench/shapes.txt).
 gpu	engine	kind	shape	gpu_ms	wall_ms	tflops	kernels
-rx7900xt	meganeura	gemm	square-1024	0.1742	0.1826	12.326	MatMul[1024x1024x1024]
-rx7900xt	pytorch	gemm	square-1024	0.1293	0.1349	16.610	graph-interval:Cijk_Ailk_Bljk_SB_MT128x128x8_SN_1LDSB0_
-rx7900xt	meganeura	gemm	square-2048	1.1642	1.1830	14.756	MatMul[2048x2048x2048]
-rx7900xt	pytorch	gemm	square-2048	0.8926	0.8921	19.247	graph-interval:Cijk_Ailk_Bljk_SB_MT128x64x8_SN_1LDSB0_A
-rx7900xt	meganeura	gemm	square-4096	10.3546	10.3552	13.273	MatMul[4096x4096x4096]
-rx7900xt	pytorch	gemm	square-4096	6.2557	6.3820	21.970	graph-interval:Cijk_Ailk_Bljk_SB_MT128x128x8_SN_1LDSB0_
-rx7900xt	meganeura	gemm	unet-ff-up	0.0078	0.0091	4.295	MatMul[64x1024x256]
-rx7900xt	pytorch	gemm	unet-ff-up	0.0120	0.0346	2.799	graph-interval:Cijk_Ailk_Bljk_SB_MT32x16x8_SN_1LDSB0_AP
-rx7900xt	meganeura	gemm	unet-ff-down	0.0275	0.0291	1.222	MatMul[64x256x1024]
-rx7900xt	pytorch	gemm	unet-ff-down	0.0203	0.0481	1.653	graph-interval:Cijk_Ailk_Bljk_SB_MT32x16x16_SN_1LDSB0_A
-rx7900xt	meganeura	gemm	unet-ctx-kv	0.0212	0.0228	1.428	MatMul[77x256x768]
-rx7900xt	pytorch	gemm	unet-ctx-kv	0.0335	0.0648	0.904	graph-interval:Cijk_Ailk_Bljk_SB_MT128x64x8_SN_1LDSB0_A
-rx7900xt	meganeura	gemm	unet-proj-16	0.0043	0.0056	1.959	MatMul[256x128x128]
-rx7900xt	pytorch	gemm	unet-proj-16	0.0076	0.0263	1.098	graph-interval:Cijk_Ailk_Bljk_SB_MT32x16x16_SN_1LDSB0_A
-rx7900xt	meganeura	gemm	whisper-ff-up	0.1240	0.1343	14.272	MatMul[1500x1536x384]
-rx7900xt	pytorch	gemm	whisper-ff-up	0.0997	0.1099	17.741	graph-interval:Cijk_Ailk_Bljk_SB_MT128x128x8_SN_1LDSB0_
-rx7900xt	meganeura	gemm	whisper-ff-down	0.1408	0.1531	12.571	MatMul[1500x384x1536]
-rx7900xt	pytorch	gemm	whisper-ff-down	0.1117	0.1195	15.834	graph-interval:Cijk_Ailk_Bljk_SB_MT128x64x8_SN_1LDSB0_A
-rx7900xt	meganeura	gemm	whisper-qkv	0.1027	0.1142	12.921	MatMul[1500x1152x384]
-rx7900xt	pytorch	gemm	whisper-qkv	0.0785	0.0861	16.906	graph-interval:Cijk_Ailk_Bljk_SB_MT128x64x8_SN_1LDSB0_A
-rx7900xt	meganeura	gemm	llm-ff-up	0.0751	0.0849	12.071	MatMul[512x1536x576]
-rx7900xt	pytorch	gemm	llm-ff-up	0.0598	0.0706	15.161	graph-interval:Cijk_Ailk_Bljk_SB_MT128x64x8_SN_1LDSB0_A
-rx7900xt	meganeura	conv	unet-3x3-64@32	0.0144	0.0163	5.247	WinogradWeightTransform[64]+WinogradInputTransform[1]+WinogradBatchedMatMul[64]+WinogradOutputTransform { fused: false }[1]
-rx7900xt	pytorch	conv	unet-3x3-64@32	0.0130	0.0583	5.799	graph-interval:miopenSp3AsmConv_v30_3_1_gfx11_fp32_f2x3
-rx7900xt	meganeura	conv	unet-3x3-128@16	0.0197	0.0219	3.832	WinogradWeightTransform[128]+WinogradInputTransform[1]+WinogradBatchedMatMul[128]+WinogradOutputTransform { fused: false }[1]
-rx7900xt	pytorch	conv	unet-3x3-128@16	0.0216	0.0587	3.498	graph-interval:miopenSp3AsmConv_v30_3_1_gfx11_fp32_f2x3
-rx7900xt	meganeura	conv	unet-3x3-256@8	0.0324	0.0346	2.328	WinogradWeightTransform[256]+WinogradInputTransform[1]+WinogradBatchedMatMul[256]+WinogradOutputTransform { fused: false }[1]
-rx7900xt	pytorch	conv	unet-3x3-256@8	0.0345	0.0661	2.189	graph-interval:miopenSp3AsmConv_v30_3_1_gfx11_fp32_f2x3
-rx7900xt	meganeura	conv	unet-stem-4@32	0.0029	0.0042	1.642	Conv2dGemmSmall[1]
-rx7900xt	pytorch	conv	unet-stem-4@32	0.0087	0.0639	0.543	graph-interval:miopenSp3AsmConv_v30_3_1_gfx11_fp32_f2x3
-rx7900xt	meganeura	conv	resnet-3x3-64@56	0.0237	0.0258	9.772	WinogradWeightTransform[64]+WinogradInputTransform[1]+WinogradBatchedMatMul[64]+WinogradOutputTransform { fused: false }[1]
-rx7900xt	pytorch	conv	resnet-3x3-64@56	0.0158	0.0584	14.590	graph-interval:miopenSp3AsmConv_v30_3_1_gfx11_fp32_f2x3
-rx7900xt	meganeura	conv	resnet-1x1-256@56	0.0170	0.0183	6.051	Conv2dGemmSmall[1]
-rx7900xt	pytorch	conv	resnet-1x1-256@56	0.0148	0.0613	6.958	graph-interval:Cijk_Ailk_Bljk_SB_MT128x64x8_SN_1LDSB0_A
-rx7900xt	meganeura	conv	resnet-3x3-512@7	0.0812	0.0918	2.846	WinogradWeightTransform[512]+WinogradInputTransform[1]+WinogradBatchedMatMul[512]+WinogradOutputTransform { fused: false }[1]
-rx7900xt	pytorch	conv	resnet-3x3-512@7	0.0611	0.0870	3.783	graph-interval:miopenSp3AsmConv_v30_3_1_gfx11_fp32_f2x3
-rx7900xt	meganeura	conv	resnet-stem-7x7	0.0304	0.0319	7.767	Conv2dGemm[1]
-rx7900xt	pytorch	conv	resnet-stem-7x7	0.0273	0.0662	8.644	graph-interval:miopenSp3AsmConv_v30_3_1_gfx11_fp32_f3x2
+rx7900xt	meganeura	gemm	square-1024	0.15503	0.16430	13.852	MatMul[1024x1024x1024]
+rx7900xt	pytorch	gemm	square-1024	0.12588	0.13385	17.059	graph-interval:Cijk_Ailk_Bljk_SB_MT128x128x8_SN_1LDSB0_
+rx7900xt	meganeura	gemm	square-2048	1.08600	1.10992	15.819	MatMul[2048x2048x2048]
+rx7900xt	pytorch	gemm	square-2048	0.88283	0.87068	19.460	graph-interval:Cijk_Ailk_Bljk_SB_MT128x64x8_SN_1LDSB0_A
+rx7900xt	meganeura	gemm	square-4096	7.97773	7.99109	17.228	MatMul[4096x4096x4096]
+rx7900xt	pytorch	gemm	square-4096	6.16689	6.28919	22.287	graph-interval:Cijk_Ailk_Bljk_SB_MT128x128x8_SN_1LDSB0_
+rx7900xt	meganeura	gemm	unet-ff-up	0.00743	0.00873	4.516	MatMul[64x1024x256]
+rx7900xt	pytorch	gemm	unet-ff-up	0.01150	0.02958	2.917	graph-interval:Cijk_Ailk_Bljk_SB_MT32x16x8_SN_1LDSB0_AP
+rx7900xt	meganeura	gemm	unet-ff-down	0.00778	0.00927	4.311	MatMul[64x256x1024] split-K 8+MatMul[64x256x1024] split-K reduction
+rx7900xt	pytorch	gemm	unet-ff-down	0.01962	0.04086	1.710	graph-interval:Cijk_Ailk_Bljk_SB_MT32x16x16_SN_1LDSB0_A
+rx7900xt	meganeura	gemm	unet-ctx-kv	0.00873	0.01020	3.467	MatMul[77x256x768] split-K 6+MatMul[77x256x768] split-K reduction
+rx7900xt	pytorch	gemm	unet-ctx-kv	0.03442	0.05493	0.880	graph-interval:Cijk_Ailk_Bljk_SB_MT128x64x8_SN_1LDSB0_A
+rx7900xt	meganeura	gemm	unet-proj-16	0.00437	0.00569	1.920	MatMul[256x128x128]
+rx7900xt	pytorch	gemm	unet-proj-16	0.00765	0.02716	1.096	graph-interval:Cijk_Ailk_Bljk_SB_MT32x16x16_SN_1LDSB0_A
+rx7900xt	meganeura	gemm	whisper-ff-up	0.12635	0.13654	14.004	MatMul[1500x1536x384]
+rx7900xt	pytorch	gemm	whisper-ff-up	0.09850	0.10996	17.964	graph-interval:Cijk_Ailk_Bljk_SB_MT128x128x8_SN_1LDSB0_
+rx7900xt	meganeura	gemm	whisper-ff-down	0.14119	0.15058	12.532	MatMul[1500x384x1536]
+rx7900xt	pytorch	gemm	whisper-ff-down	0.11076	0.11874	15.976	graph-interval:Cijk_Ailk_Bljk_SB_MT128x64x8_SN_1LDSB0_A
+rx7900xt	meganeura	gemm	whisper-qkv	0.09791	0.10797	13.554	MatMul[1500x1152x384]
+rx7900xt	pytorch	gemm	whisper-qkv	0.07755	0.08641	17.112	graph-interval:Cijk_Ailk_Bljk_SB_MT128x64x8_SN_1LDSB0_A
+rx7900xt	meganeura	gemm	llm-ff-up	0.07573	0.08612	11.963	MatMul[512x1536x576]
+rx7900xt	pytorch	gemm	llm-ff-up	0.05919	0.07041	15.307	graph-interval:Cijk_Ailk_Bljk_SB_MT128x64x8_SN_1LDSB0_A
+rx7900xt	meganeura	conv	unet-3x3-64@32	0.01314	0.01488	5.745	WinogradWeightTransform[64]+WinogradInputTransform[1]+WinogradBatchedMatMul[64]+WinogradOutputTransform { fused: false }[1]
+rx7900xt	pytorch	conv	unet-3x3-64@32	0.01325	0.05869	5.696	graph-interval:miopenSp3AsmConv_v30_3_1_gfx11_fp32_f2x3
+rx7900xt	meganeura	conv	unet-3x3-128@16	0.01084	0.01259	6.966	WinogradWeightTransform[128]+WinogradInputTransform[1]+WinogradBatchedMatMul[128]+WinogradOutputTransform { fused: false }[1]
+rx7900xt	pytorch	conv	unet-3x3-128@16	0.02095	0.05865	3.603	graph-interval:miopenSp3AsmConv_v30_3_1_gfx11_fp32_f2x3
+rx7900xt	meganeura	conv	unet-3x3-256@8	0.02004	0.02210	3.767	WinogradWeightTransform[256]+WinogradInputTransform[1]+WinogradBatchedMatMul[256]+WinogradOutputTransform { fused: false }[1]
+rx7900xt	pytorch	conv	unet-3x3-256@8	0.03427	0.06660	2.203	graph-interval:miopenSp3AsmConv_v30_3_1_gfx11_fp32_f2x3
+rx7900xt	meganeura	conv	unet-stem-4@32	0.00299	0.00432	1.578	Conv2dGemmSmall[1]
+rx7900xt	pytorch	conv	unet-stem-4@32	0.00892	0.05890	0.529	graph-interval:miopenSp3AsmConv_v30_3_1_gfx11_fp32_f2x3
+rx7900xt	meganeura	conv	resnet-3x3-64@56	0.02248	0.02447	10.287	WinogradWeightTransform[64]+WinogradInputTransform[1]+WinogradBatchedMatMul[64]+WinogradOutputTransform { fused: false }[1]
+rx7900xt	pytorch	conv	resnet-3x3-64@56	0.01570	0.05818	14.726	graph-interval:miopenSp3AsmConv_v30_3_1_gfx11_fp32_f2x3
+rx7900xt	meganeura	conv	resnet-1x1-256@56	0.01729	0.01863	5.942	Conv2dGemmSmall[1]
+rx7900xt	pytorch	conv	resnet-1x1-256@56	0.01473	0.06178	6.975	graph-interval:Cijk_Ailk_Bljk_SB_MT128x64x8_SN_1LDSB0_A
+rx7900xt	meganeura	conv	resnet-3x3-512@7	0.04929	0.05970	4.691	WinogradWeightTransform[512]+WinogradInputTransform[1]+WinogradBatchedMatMul[512]+WinogradOutputTransform { fused: false }[1]
+rx7900xt	pytorch	conv	resnet-3x3-512@7	0.06014	0.08673	3.845	graph-interval:miopenSp3AsmConv_v30_3_1_gfx11_fp32_f2x3
+rx7900xt	meganeura	conv	resnet-stem-7x7	0.02903	0.03069	8.130	Conv2dGemm[1]
+rx7900xt	pytorch	conv	resnet-stem-7x7	0.02714	0.06698	8.698	graph-interval:miopenSp3AsmConv_v30_3_1_gfx11_fp32_f3x2
 rtx5070	meganeura	gemm	square-1024	0.18067	0.19433	11.886	MatMul[1024x1024x1024]
 rtx5070	pytorch	gemm	square-1024	0.11133	0.11996	19.289	graph-interval:Memset (Device)+void cutlass::Kernel2<cutlass_80_simt_sg
 rtx5070	meganeura	gemm	square-2048	1.25085	1.26395	13.735	MatMul[2048x2048x2048]
@@ -128,7 +128,7 @@ b570	meganeura	conv	resnet-3x3-512@7	0.08744	0.09999	2.644	WinogradWeightTransfo
 b570	pytorch	conv	resnet-3x3-512@7	0.11072	0.13118	2.088	graph-interval:conv_reorder+gen_conv
 b570	meganeura	conv	resnet-stem-7x7	0.06722	0.08039	3.511	Conv2dGemm[1]
 b570	pytorch	conv	resnet-stem-7x7	0.04615	0.06173	5.114	graph-interval:conv_reorder+gen_conv
-# Dispatch floor (eltwise rows), RTX 5070 and Arc B570 as above.
+# Dispatch floor (eltwise rows), RTX 5070, Arc B570 and RX 7900 XT as above.
 #   A 256-element f32 add. add-256: 30 chained adds, each reading the previous sum (a barrier after each dispatch);
 #   add-256-indep: 30 adds of the same input, one barrier group. PyTorch's stream runs both in order.
 #   add-256-single: one add per step, run without MEGANEURA_GPU_TIMING (gpu_ms NaN); wall_ms is one step() + wait() round trip,
@@ -146,3 +146,9 @@ b570	meganeura	eltwise	add-256-indep	0.00036	0.00768	0.001	Add[256x0]
 b570	pytorch	eltwise	add-256-indep	0.00856	0.00510	0.000	graph-interval:at::native::xpu::VectorizedElementwiseKe
 b570	meganeura	eltwise	add-256-single	NaN	0.15866	NaN	Add[256x0]
 b570	pytorch	eltwise	add-256-single	0.00850	0.03102	0.000	graph-interval:at::native::xpu::VectorizedElementwiseKe
+rx7900xt	meganeura	eltwise	add-256	0.00109	0.00220	0.000	Add[256x0]
+rx7900xt	pytorch	eltwise	add-256	0.00385	0.00408	0.000	graph-interval:void at::native::vectorized_elementwise_
+rx7900xt	meganeura	eltwise	add-256-indep	0.00011	0.00111	0.002	Add[256x0]
+rx7900xt	pytorch	eltwise	add-256-indep	0.00344	0.00367	0.000	graph-interval:void at::native::vectorized_elementwise_
+rx7900xt	meganeura	eltwise	add-256-single	NaN	0.03010	NaN	Add[256x0]
+rx7900xt	pytorch	eltwise	add-256-single	0.00369	0.02173	0.000	graph-interval:void at::native::vectorized_elementwise_
