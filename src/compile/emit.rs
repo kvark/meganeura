@@ -2727,8 +2727,12 @@ impl<'a> Compiler<'a> {
                 let weight = self.get_buffer(node.inputs[1]);
 
                 // Dispatch 0: transform the current weights, [Co·Ci·9] → [16, Co, Ci].
+                // A parameter's transform holds until the parameter changes.
+                let parameter_invariant =
+                    matches!(self.graph.node(node.inputs[1]).op, Op::Parameter { .. });
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::WinogradWeightTransform,
+                    parameter_invariant,
                     workgroups: [(out_channels * in_channels).div_ceil(256), 1, 1],
                     input_buffers: vec![weight],
                     output_buffer: weight_xform,
@@ -2772,24 +2776,33 @@ impl<'a> Compiler<'a> {
 
                 // Dispatch 2: Batched matmul
                 // weight_xform[16, Co, Ci] × input_xform[16, Ci, P] → mm_out[16, Co, P]
-                // Small images use only a fraction of a 64-column tile.
+                // Small images use only a fraction of a 64-column tile. When
+                // 64×64 tiles leave fewer than 64 workgroups over the 16
+                // planes, 32×32 tiles give the device four times as many.
                 let narrow = total_tiles <= 16;
+                let small =
+                    !narrow && total_tiles.div_ceil(64) * out_channels.div_ceil(64) * 16 < 64;
+                let (tile_m, tile_n) = match (narrow, small) {
+                    (true, _) => (32, 16),
+                    (false, true) => (32, 32),
+                    (false, false) => (64, 64),
+                };
                 self.plan.dispatches.push(Dispatch {
                     shader: ShaderEntry::WinogradBatchedMatMul,
                     workgroups: [
-                        total_tiles.div_ceil(if narrow { 16 } else { 64 }),
-                        out_channels.div_ceil(if narrow { 32 } else { 64 }),
+                        total_tiles.div_ceil(tile_n),
+                        out_channels.div_ceil(tile_m),
                         16,
                     ],
                     input_buffers: vec![weight_xform, input_xform_buf],
                     output_buffer: mm_out_buf,
                     extra_outputs: vec![],
                     params: vec![out_channels, total_tiles, in_channels, 0],
-                    kernel: if narrow {
+                    kernel: if narrow || small {
                         Kernel::ScalarMatmul(crate::codegen::ScalarMatmulShape {
-                            tile_size: 32,
-                            tile_n: 16,
-                            k_stage: 32,
+                            tile_size: tile_m,
+                            tile_n,
+                            k_stage: if narrow { 32 } else { 16 },
                             interleave_columns: false,
                             unroll_k: false,
                         })

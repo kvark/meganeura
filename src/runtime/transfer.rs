@@ -567,6 +567,7 @@ impl Session {
         if data.is_empty() {
             return;
         }
+        self.note_host_write(destination, data.len());
         if host_visible {
             unsafe {
                 std::ptr::copy_nonoverlapping(data.as_ptr(), destination.data(), data.len());

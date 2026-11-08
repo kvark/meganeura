@@ -1209,6 +1209,11 @@ pub struct Dispatch {
     /// Used for explicit memory-placement boundaries such as [`Op::Materialize`].
     #[serde(default)]
     pub fusion_barrier: bool,
+    /// Reads only parameters and writes a buffer that nothing else writes, so
+    /// its result holds until a parameter changes. Sessions without
+    /// gradients skip it on later steps; its output is never aliased.
+    #[serde(default)]
+    pub parameter_invariant: bool,
     /// Fused elementwise epilogue (PointwiseDAG) applied in the matmul
     /// store loop. `None` = no epilogue (default). When present, saves
     /// one dispatch + barrier per fused op.

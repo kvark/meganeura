@@ -9,6 +9,8 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
+// Version 38 marks parameter-invariant Winograd weight transforms and gives
+// low-occupancy Winograd products 32-wide tiles.
 // Version 37 records reduced private store output types.
 // Version 36 changes F16 attention backward to 32-row workgroups and a
 // precomputed F32 row-dot input instead of the forward output.
@@ -50,7 +52,7 @@ use std::{io, path::Path};
 // Version 13 reduces loss partials into a scalar, lowers LayerNorm to the
 // two-pass kernel, carries RoPE's static offset into the dynamic kernels, and
 // changes which dispatches fusion may merge.
-const CACHE_FORMAT_VERSION: u32 = 37;
+const CACHE_FORMAT_VERSION: u32 = 38;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]

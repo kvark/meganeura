@@ -2846,6 +2846,7 @@ fn record_groups(
     buffers: &[blade_graphics::BufferPiece],
     chunks: usize,
     timing: bool,
+    skip_invariants: bool,
 ) {
     let total = groups.len();
     let per_chunk = total.div_ceil(chunks.min(total).max(1));
@@ -2867,6 +2868,9 @@ fn record_groups(
                 }
                 for i in group.clone() {
                     let dispatch = &plan.dispatches[i];
+                    if skip_invariants && dispatch.parameter_invariant {
+                        continue;
+                    }
                     let pipeline = pipelines.get(i);
                     let mut pc = pass.with(pipeline);
                     Session::bind_dispatch(buffers, dispatch, &mut pc);
@@ -3659,6 +3663,13 @@ pub struct Session {
     upload_staging: RefCell<Option<UploadStaging>>,
     readback: RefCell<Readback>,
     reuse_upload_staging: bool,
+    /// Parameter-invariant dispatches may be skipped at all: the session
+    /// has no gradients, and none of their inputs is shared with or
+    /// imported from storage this session cannot watch.
+    invariants_cacheable: bool,
+    /// Their outputs hold for the current parameters. Set once a step has
+    /// encoded them; a host write to one of their inputs clears it.
+    invariants_valid: std::cell::Cell<bool>,
 }
 
 // SAFETY: a session owns or reference-counts every GPU object it contains.
@@ -4042,7 +4053,12 @@ impl Session {
                 "parameter source uses a different GPU context"
             );
             source.wait();
+            // Either session may now change the other's parameters.
+            source.invariants_cacheable = false;
         }
+        let invariants_cacheable = parameter_source.is_none()
+            && plan.param_grad_pairs.is_empty()
+            && plan.dispatches.iter().any(|d| d.parameter_invariant);
         log::debug!(target: "meganeura::submission", "session build begin, {} dispatches", plan.dispatches.len());
         let _session_span = tracing::info_span!(
             "session_init",
@@ -4639,6 +4655,8 @@ impl Session {
             upload_staging: RefCell::new(None),
             readback: RefCell::new(Readback::default()),
             reuse_upload_staging: opts.reuse_upload_staging,
+            invariants_cacheable,
+            invariants_valid: std::cell::Cell::new(false),
         }
     }
 
@@ -4796,6 +4814,8 @@ impl Session {
             });
         }
         let source_physical = source.alias.map[source_buffer.0 as usize];
+        // This session may now change the source's parameter.
+        source.invariants_cacheable = false;
         self.rebind_logical(
             target.0 as usize,
             Arc::clone(&source.physical_buffers[source_physical]),
@@ -4803,6 +4823,40 @@ impl Session {
             source.alias.device_local[source_physical],
         );
         Ok(())
+    }
+
+    /// Whether a parameter-invariant dispatch reads `buffer`.
+    fn is_invariant_input(&self, buffer: BufferRef) -> bool {
+        self.plan
+            .dispatches
+            .iter()
+            .any(|d| d.parameter_invariant && d.input_buffers.contains(&buffer))
+    }
+
+    /// Note a host write of `bytes` at `destination`: a write that touches
+    /// any input of a parameter-invariant dispatch makes the next step run
+    /// those dispatches again.
+    pub(super) fn note_host_write(&self, destination: blade_graphics::BufferPiece, bytes: usize) {
+        if !self.invariants_cacheable || !self.invariants_valid.get() {
+            return;
+        }
+        let (start, end) = (destination.offset, destination.offset + bytes as u64);
+        let touched = self
+            .plan
+            .dispatches
+            .iter()
+            .filter(|d| d.parameter_invariant)
+            .flat_map(|d| &d.input_buffers)
+            .any(|&input| {
+                let piece = self.buffers[input.0 as usize];
+                let size = self.plan.buffers[input.0 as usize] as u64;
+                piece.buffer == destination.buffer
+                    && piece.offset < end
+                    && start < piece.offset + size
+            });
+        if touched {
+            self.invariants_valid.set(false);
+        }
     }
 
     /// Back logical buffer `index` with `physical` at byte `offset`. Its old
@@ -4816,6 +4870,10 @@ impl Session {
         offset: usize,
         device_local: bool,
     ) {
+        if self.is_invariant_input(BufferRef(index as u32)) {
+            // The new storage may change without a write this session sees.
+            self.invariants_cacheable = false;
+        }
         self.buffers[index] = physical.handle.at(offset as u64);
         let target = self
             .alias
@@ -6416,6 +6474,7 @@ impl Session {
     /// must be started. `chunks` above one submits all but the last chunk;
     /// with a `profile_window`, the dispatches in it get passes of their own.
     fn encode_step(&mut self, chunks: usize, profile_window: Option<std::ops::Range<usize>>) {
+        let skip_invariants = self.invariants_cacheable && self.invariants_valid.get();
         if let Some(window) = profile_window {
             // Multi-pass mode: one compute pass per dispatch in the window,
             // with per-pass barriers and GPU timestamps. Enables
@@ -6425,6 +6484,9 @@ impl Session {
                 match encoded {
                     ProfilePass::Timed(i) => {
                         let dispatch = &self.plan.dispatches[i];
+                        if skip_invariants && dispatch.parameter_invariant {
+                            continue;
+                        }
                         let pipeline = self.pipelines.get(i);
                         let mut pass = self.encoder.compute(&dispatch.label);
                         let mut pc = pass.with(pipeline);
@@ -6442,6 +6504,9 @@ impl Session {
                             }
                             for i in span {
                                 let dispatch = &self.plan.dispatches[i];
+                                if skip_invariants && dispatch.parameter_invariant {
+                                    continue;
+                                }
                                 let pipeline = self.pipelines.get(i);
                                 let mut pc = pass.with(pipeline);
                                 Self::bind_dispatch(&self.buffers, dispatch, &mut pc);
@@ -6473,7 +6538,11 @@ impl Session {
                 &self.buffers,
                 chunks,
                 self.gpu_timing,
+                skip_invariants,
             );
+        }
+        if self.invariants_cacheable {
+            self.invariants_valid.set(true);
         }
 
         // Gradient clipping runs after backward and before the optimizer in
