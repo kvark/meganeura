@@ -11,3 +11,4 @@ mod shared_winograd_checkpoint;
 mod support;
 #[cfg(feature = "models")]
 mod training_correctness;
+mod winograd_weight_cache;

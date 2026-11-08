@@ -279,6 +279,8 @@ impl BufferUse {
 ///   device-local: those passes are GPU-only);
 /// - derived params and quantized weight buffers — uploaded once;
 /// - `CacheWrite` outputs (KV caches) — carry state across steps;
+/// - parameter-invariant outputs of plans without gradients — kept until a
+///   parameter changes;
 /// - `ScatterAdd` outputs — read-modify-write;
 /// - any buffer whose first use is a read (live-in from a prior step).
 ///
@@ -590,6 +592,11 @@ fn compute_pinned(
         match d.shader {
             // KV caches persist across steps.
             ShaderEntry::CacheWrite => pinned[d.output_buffer.0 as usize] = true,
+            // Kept from the step that last ran it, where a session can skip
+            // it: without gradients, no step changes the parameters.
+            _ if d.parameter_invariant && plan.param_grad_pairs.is_empty() => {
+                pinned[d.output_buffer.0 as usize] = true;
+            }
             // Read-modify-write accumulation into the output.
             ShaderEntry::ScatterAdd | ShaderEntry::ScatterAddAtomic => {
                 uses[d.output_buffer.0 as usize].read(g);

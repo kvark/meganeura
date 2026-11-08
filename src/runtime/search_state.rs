@@ -106,6 +106,10 @@ impl SearchState {
             return Ok(());
         }
         session.wait();
+        if restore {
+            // Restored parameters need their derived results again.
+            session.invariants_valid.set(false);
+        }
         session.encoder.start();
         {
             let mut pass = session.encoder.transfer("program_search_state");
