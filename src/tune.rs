@@ -1130,16 +1130,23 @@ impl TuneClass {
                         .map(|shape| MatmulTile::CooperativeTiled { shape, splits: 1 }),
                 );
             }
-            for interleave_columns in [false, true] {
-                for k_stage in [32, 16, 8] {
-                    for tile_size in [64, 32] {
-                        candidates.push(MatmulTile::Scalar(crate::codegen::ScalarMatmulShape {
-                            tile_size,
-                            tile_n: 0,
-                            k_stage,
-                            interleave_columns,
-                            unroll_k: false,
-                        }));
+            // 128x64 tiles come last, so a time-limited search still covers
+            // the square ones.
+            for tile_n in [0, 64] {
+                for interleave_columns in [false, true] {
+                    for k_stage in [32, 16, 8] {
+                        let sizes: &[u32] = if tile_n == 0 { &[64, 32] } else { &[128] };
+                        for &tile_size in sizes {
+                            candidates.push(MatmulTile::Scalar(
+                                crate::codegen::ScalarMatmulShape {
+                                    tile_size,
+                                    tile_n,
+                                    k_stage,
+                                    interleave_columns,
+                                    unroll_k: false,
+                                },
+                            ));
+                        }
                     }
                 }
             }

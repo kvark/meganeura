@@ -444,8 +444,8 @@ impl ScalarMatmulShape {
     pub fn legal(self) -> bool {
         let (bm, bn, k) = (self.rows(), self.cols(), self.k_stage);
         matches!(k, 8 | 16 | 32)
-            && matches!(bm, 16 | 32 | 64)
-            && matches!(bn, 16 | 32 | 64)
+            && matches!(bm, 16 | 32 | 64 | 128)
+            && matches!(bn, 16 | 32 | 64 | 128)
             && bm * k % 256 == 0
             && bn * k % 256 == 0
     }
@@ -1744,10 +1744,10 @@ fn matmul_vars_tiled(
         format!("{}\n{}", fused_decl, epilogue_decl)
     };
     let store_body = if epilogue_body.is_empty() {
-        format!("$C_BUFFER[idx] = s[i][j]{};", fused_expr)
+        format!("$C_BUFFER[idx] = s[i * $TN_U + j]{};", fused_expr)
     } else {
         format!(
-            "var val = s[i][j]{};\n                {}\n                $C_BUFFER[idx] = val;",
+            "var val = s[i * $TN_U + j]{};\n                {}\n                $C_BUFFER[idx] = val;",
             fused_expr, epilogue_body
         )
     };
@@ -1870,7 +1870,17 @@ fn matmul_vars_tiled(
         knobs.k_stage
     );
     let interleave_columns = !b_mode.is_quantized() && knobs.interleave_columns;
-    let (acc_decl, compute_body, acc_array) = tiled_matmul_body(tile, k_tile, interleave_columns);
+    let (acc_decl, compute_body, _) = tiled_matmul_body(tile, k_tile, interleave_columns);
+    // A flat store array: NVIDIA's 595 driver reads rows TN..8 of a nested
+    // `array<array<f32, TN>, 8>` as zero when TN < 8.
+    let acc_array = format!(
+        "array<f32, {}>({})",
+        tm * tn,
+        (0..tm)
+            .flat_map(|i| (0..tn).map(move |j| format!("s{i}_{j}")))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     let k_math = if knobs.unroll_k {
         unroll_k_math(&compute_body, k_tile)
     } else {
