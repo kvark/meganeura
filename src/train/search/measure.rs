@@ -1198,9 +1198,12 @@ mod tests {
         warm.wait();
         drop(warm);
         // Far longer than one warm trial of this matmul, so only the
-        // challenger's sleep can exhaust it.
-        let deadline = Duration::from_millis(500);
+        // challenger's sleep can exhaust it. The "program" case runs the
+        // baseline trial alone; slow runners (coverage builds on lavapipe)
+        // stretch the deadline to four times its duration.
+        let mut deadline = Duration::from_millis(500);
         for case in ["program", "memory", "qualification", "deadline"] {
+            let started = std::time::Instant::now();
             let initialized = std::cell::Cell::new(0);
             let mut checks = 0;
             let mut untuned = Vec::new();
@@ -1272,6 +1275,7 @@ mod tests {
                 "program" => {
                     assert_eq!(report.trials.len(), 1);
                     assert!(report.truncated);
+                    deadline = deadline.max(started.elapsed() * 4);
                 }
                 "memory" => {
                     assert_eq!(initialized.get(), 1);
@@ -1289,6 +1293,7 @@ mod tests {
                     assert!(!report.final_qualification_time.is_zero());
                 }
                 "deadline" => {
+                    assert_eq!(report.trials.len(), 2, "deadline {deadline:?}");
                     assert_eq!(report.trials[1].outcome.decision, TuneDecision::TimeBudget);
                     assert!(report.trials[1].outcome.baseline_ms.is_empty());
                     assert!(report.truncated);
