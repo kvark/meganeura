@@ -34,13 +34,13 @@ replay. The ratio is **Meganeura time / PyTorch time**; below one is faster.
 Talk-only evidence in `data/`:
 
 - **Single operations:** `op-bench.tsv`, from `examples/op_bench.rs` and
-  `op-bench/torch_ops.py` on RTX 5070 and Arc B570 at `d32a495`, and RX 7900 XT
-  at `429a0e4` (November 8).
+  `op-bench/torch_ops.py` on RTX 5070, Arc B570, and RX 7900 XT at `d32a495`
+  (November 8).
   Strict f32, tuner on, cooperative matrices off; each native
   row is the median of three processes. Both engines time 30 serial ops and
   divide by 30. `op-bench/run_all.sh` reruns every shape. The `eltwise`
   rows time a 256-element add as a dependent dispatch and as one host round
-  trip, on RTX 5070 and Arc B570 only so far.
+  trip, on all three GPUs.
 - **Shared memory:** `b570-unet-shared-memory.txt` records 16.4 KiB for the
   largest generated U-Net kernel at `99e3de2`, below the 48 KiB limit.
 - **Hardware:** `hardware.json` holds device queries and the native runner's

@@ -72,7 +72,7 @@ condition inventory.
 `op-bench/` is a small overlay for a Meganeura checkout, preserving the
 `examples/` and `paper/p3hpc/presentation/data/` paths expected by the driver.
 Copy its contents into a checkout that contains this runner and the tuner
-scratch fix (RX 7900 XT rows were collected on main `429a0e4`), then see
+scratch fix (single-op rows were collected on main `d32a495`), then see
 `run_all.sh` for GPU-specific arguments.
 Offline reading of `op-bench.tsv` needs no GPU. Re-running it needs both
 engines and hardware; the framework-cohort analyzer does not execute it.

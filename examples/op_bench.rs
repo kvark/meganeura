@@ -10,8 +10,9 @@
 //! Independent copies would run level by level, every copy's Winograd
 //! transforms before any product, so a convolution that keeps its shape is
 //! chained instead: each copy reads the previous output, as in a network.
-//! Weight transforms read only the weight, so all 30 still run first; with
-//! 512 channels their outputs no longer fit in cache. Serial dispatch also
+//! Weight transforms read only the weight. An inference session pins that
+//! output and skips the transform after the first step, so the timed steps
+//! do not recompute it. Serial dispatch also
 //! separates a Winograd convolution's weight and input transforms, which an
 //! ordinary plan runs together.
 //!

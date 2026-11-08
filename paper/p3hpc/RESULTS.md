@@ -219,8 +219,8 @@ Operands differ between engines. This is a throughput probe, not a
 cross-engine numerical comparison. PyTorch times a graph of 30 serial ops
 using device events and divides by 30. The RTX 5070 and B570 rows (November
 8, Meganeura `d32a495`, with split-K, cached Winograd weight transforms and a
-128×64 GEMM tile) and the RX 7900 XT rows (November 8, `429a0e4`, before all
-three) time native the same way: one timestamped pass over 30 copies with a barrier
+128×64 GEMM tile) and the RX 7900 XT rows (November 8, `d32a495`, with the
+same three) time native the same way: one timestamped pass over 30 copies with a barrier
 after every dispatch, shape-preserving convolutions chained. On Mesa ANV each
 timed pass adds about 7 µs, which had inflated B570 3×3 convolutions from
 0.93–1.64× to 1.45–3.16× when each dispatch was timed alone. This cannot
@@ -229,33 +229,35 @@ Host-wall columns are not cross-engine comparisons. Reference kernels use
 ordinary f32 units, so the controls locate implementation losses without a
 reduced-precision explanation.
 
-4096³ GEMM ratios are 1.66/1.70/1.33 on AMD/NVIDIA/Intel (NVIDIA and Intel
-were 2.06 and 2.22 before the 128×64 tile); small U-Net GEMMs span 0.57–1.35 /
-0.93–1.98 / 0.93–1.65, slowest at long K. At 64×1024×256, cuBLAS split-K
-takes 6 µs vs native 11 (25 before native split-K), oneDNN 12 vs 20 (53), and
-MIOpen 20 vs native 28 without split-K. Native Winograd 3×3 convolutions take
-0.34–0.64× cuDNN's time on RTX 5070, 0.79–1.17× oneDNN's on B570 (0.93–1.64
-while the weight transform ran every step), and 0.91–1.50× MIOpen's on the
-RX 7900 XT, whose rows still transform weights every step. On B570 one fused
+4096³ GEMM ratios are 1.29/1.70/1.33 on AMD/NVIDIA/Intel (NVIDIA and Intel
+were 2.06 and 2.22 before the 128×64 tile; AMD was 1.66); small U-Net GEMMs
+span 0.25–0.65 / 0.93–1.98 / 0.93–1.65. NVIDIA and Intel stay slowest at long
+K. At 64×1024×256, cuBLAS split-K takes 6 µs vs native 11 (25 before native
+split-K), oneDNN 12 vs 20 (53), and MIOpen 20 vs native 8. Native Winograd
+3×3 convolutions take 0.34–0.64× cuDNN's time on RTX 5070, 0.79–1.17×
+oneDNN's on B570 (0.93–1.64 while the weight transform ran every step), and
+0.52–1.43× MIOpen's on the RX 7900 XT. On B570 one fused
 vendor kernel replaces three native dispatches per step. This identifies useful kernel
 targets, not an unavoidable API penalty or a measured speedup from a
 proposed fix.
 
-The `eltwise` rows (RTX 5070 and B570) time a 256-element add. Thirty
-chained adds, each behind a barrier, take 0.97 and 1.73 µs per add natively
-against PyTorch graph replays at 0.85 and 8.5 µs; without the barriers native
-takes 0.12 and 0.36 µs, so a barrier costs about 0.85 and 1.4 µs. One add per
-step, submitted and waited for without timestamps, takes 19.4 and 159 µs
-natively against 6.9 and 31 µs for one eager PyTorch add and synchronize.
+The `eltwise` rows time a 256-element add. Thirty chained adds, each behind
+a barrier, take 0.97, 1.73 and 1.09 µs per add natively on RTX 5070, B570 and
+RX 7900 XT against PyTorch graph replays at 0.85, 8.5 and 3.9 µs; without the
+barriers native takes 0.12, 0.36 and 0.11 µs, so a barrier costs about 0.85,
+1.4 and 1.0 µs. One add per step, submitted and waited for without timestamps,
+takes 19.4, 159 and 30 µs natively against 6.9, 31 and 22 µs for one eager
+PyTorch add and synchronize.
 
 4096³ exceeds the tuner's 64 MiB scratch and uses the default tile. With a
 1 GiB limit the tuner enters that race but exhausts its 2 s budget first; given
 30 s, the B570 keeps the default and the RTX 5070 gains about 6%. 2048³ is
 covered after keeping encoder allowance outside that limit, which on October
 31 restored B570 3.58 ms from 5.31 and RX 7900 XT 1.08 from 1.30. The
-November 8 RX 7900 XT rows measure 2048³ at 1.16 ms, 1.30× PyTorch. Processes tune for two
-seconds and can pick different tiles. RX 7900 XT convolution times include
-per-step Winograd weight transforms. The earlier U-Net shared-memory query
+November 8 RX 7900 XT rows at `d32a495` measure 2048³ at 1.09 ms, 1.23×
+PyTorch, and 4096³ at 7.98 ms, 1.29×. Processes tune for two
+seconds and can pick different tiles. On all three GPUs the timed steps skip
+the Winograd weight transform after warmup. The earlier U-Net shared-memory query
 at `99e3de2` uses 16.4 KiB, below Vulkan's 48 KiB; that specific kernel is not
 limited by the ceiling. Timelines and matched-kernel inspection remain needed
 for host/driver attribution. Minimal-shape parity does not bound host cost.
