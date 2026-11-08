@@ -170,9 +170,13 @@ impl GpuTimings {
 /// [`Instant`]. Each pass ends at the next pass start, or at `done` for the
 /// final pass. CPU submission time is intentionally not involved.
 pub fn record_gpu_timings(timings: &GpuTimings) {
-    if armed().is_some() {
-        let inner = profiler();
-        let mut guard = inner.lock().unwrap();
+    if let Some(inner) = armed() {
+        inner.lock().unwrap().record_gpu_timings(timings);
+    }
+}
+
+impl ProfilerInner {
+    fn record_gpu_timings(&mut self, timings: &GpuTimings) {
         for (index, &(ref name, start)) in timings.passes.iter().enumerate() {
             let Some(end) = timings
                 .passes
@@ -182,12 +186,12 @@ pub fn record_gpu_timings(timings: &GpuTimings) {
             else {
                 continue;
             };
-            let start_ns = match start.checked_duration_since(guard.epoch) {
+            let start_ns = match start.checked_duration_since(self.epoch) {
                 Some(duration) => duration.as_nanos() as u64,
                 None => {
-                    let delta_ns = guard.epoch.duration_since(start).as_nanos();
-                    let timestamp_ns = guard.now_ns();
-                    guard.events.push(TraceEvent {
+                    let delta_ns = self.epoch.duration_since(start).as_nanos();
+                    let timestamp_ns = self.now_ns();
+                    self.events.push(TraceEvent {
                         name: format!(
                             "gpu_timestamp_rejected pass={} before_epoch_ns={delta_ns}",
                             name
@@ -199,12 +203,12 @@ pub fn record_gpu_timings(timings: &GpuTimings) {
                     continue;
                 }
             };
-            let end_ns = match end.checked_duration_since(guard.epoch) {
+            let end_ns = match end.checked_duration_since(self.epoch) {
                 Some(duration) => duration.as_nanos() as u64,
                 None => {
-                    let delta_ns = guard.epoch.duration_since(end).as_nanos();
-                    let timestamp_ns = guard.now_ns();
-                    guard.events.push(TraceEvent {
+                    let delta_ns = self.epoch.duration_since(end).as_nanos();
+                    let timestamp_ns = self.now_ns();
+                    self.events.push(TraceEvent {
                         name: format!(
                             "gpu_timestamp_rejected pass={} end_before_epoch_ns={delta_ns}",
                             name
@@ -216,13 +220,13 @@ pub fn record_gpu_timings(timings: &GpuTimings) {
                     continue;
                 }
             };
-            guard.events.push(TraceEvent {
+            self.events.push(TraceEvent {
                 name: name.clone(),
                 timestamp_ns: start_ns,
                 track_uuid: GPU_TRACK_UUID,
                 kind: EventKind::SliceBegin,
             });
-            guard.events.push(TraceEvent {
+            self.events.push(TraceEvent {
                 name: name.clone(),
                 timestamp_ns: end_ns,
                 track_uuid: GPU_TRACK_UUID,
@@ -1281,15 +1285,15 @@ mod tests {
 
     #[test]
     fn test_record_gpu_timings() {
-        arm();
-        let inner = profiler();
-        let epoch = {
-            let mut guard = inner.lock().unwrap();
-            guard.events.clear();
-            guard.epoch
+        // A private buffer: GPU sessions in concurrent tests record into the
+        // global one.
+        let mut inner = ProfilerInner {
+            epoch: Instant::now(),
+            events: Vec::new(),
         };
+        let epoch = inner.epoch;
 
-        record_gpu_timings(&GpuTimings {
+        inner.record_gpu_timings(&GpuTimings {
             passes: vec![
                 ("relu".into(), epoch + Duration::from_nanos(5_000)),
                 ("matmul".into(), epoch + Duration::from_nanos(5_100)),
@@ -1297,19 +1301,16 @@ mod tests {
             done: Some(epoch + Duration::from_nanos(5_550)),
         });
 
-        let guard = inner.lock().unwrap();
-        assert_eq!(guard.events.len(), 4); // 2 begin + 2 end
-        assert_eq!(guard.events[0].name, "relu");
-        assert_eq!(guard.events[0].timestamp_ns, 5000);
-        assert_eq!(guard.events[0].kind, EventKind::SliceBegin);
-        assert_eq!(guard.events[1].timestamp_ns, 5100);
-        assert_eq!(guard.events[1].kind, EventKind::SliceEnd);
-        assert_eq!(guard.events[2].name, "matmul");
-        assert_eq!(guard.events[2].timestamp_ns, 5100);
-        assert_eq!(guard.events[3].timestamp_ns, 5550);
-
-        drop(guard);
-        inner.lock().unwrap().events.clear();
+        let events = &inner.events;
+        assert_eq!(events.len(), 4); // 2 begin + 2 end
+        assert_eq!(events[0].name, "relu");
+        assert_eq!(events[0].timestamp_ns, 5000);
+        assert_eq!(events[0].kind, EventKind::SliceBegin);
+        assert_eq!(events[1].timestamp_ns, 5100);
+        assert_eq!(events[1].kind, EventKind::SliceEnd);
+        assert_eq!(events[2].name, "matmul");
+        assert_eq!(events[2].timestamp_ns, 5100);
+        assert_eq!(events[3].timestamp_ns, 5550);
     }
 
     #[test]
