@@ -208,31 +208,39 @@ This supports multi-XCC execution, not balanced use of all eight dies.
 
 ## Separate single-operation evidence
 
-The October 31 study in `presentation/data/op-bench.tsv` retains three-native-process
-medians and one reference process per shape for a strict-f32 GEMM or batch-1 convolution on RX 7900 XT, RTX 5070
-and B570. Native source is `5b232bd` plus the tuner scratch fix included in
-`567028b8`; cooperative matrices are off. PyTorch 2.13 has TF32 off and
-`cudnn.benchmark` on. Shapes, reference runner and collection driver are in
-`presentation/data/op-bench/`; native runner is `examples/op_bench.rs`.
+`presentation/data/op-bench.tsv` retains three-native-process medians and one
+reference process per shape for a strict-f32 GEMM or batch-1 convolution on
+RX 7900 XT, RTX 5070 and B570, with cooperative matrices off. PyTorch 2.13
+has TF32 off and `cudnn.benchmark` on. Shapes, reference runner and
+collection driver are in `presentation/data/op-bench/`; native runner is
+`examples/op_bench.rs`.
 
 Operands differ between engines. This is a throughput probe, not a
-cross-engine numerical comparison. Native GPU time sums pass timestamps; PyTorch times a graph of 30 serial ops
-using device events and divides by 30. Its interval includes dispatch gaps
-our sum excludes, favoring native most on small ops. This cannot allocate a
-fraction of the cohort model time. Host-wall columns are not cross-engine
-comparisons. Reference kernels use ordinary f32 units, so the controls locate
-implementation losses without a reduced-precision explanation.
+cross-engine numerical comparison. PyTorch times a graph of 30 serial ops
+using device events and divides by 30. The RTX 5070 and B570 rows (November
+8, Meganeura `6b1e784`) time native the same way: one timestamped pass over
+30 copies with a barrier after every dispatch, shape-preserving convolutions
+chained. The RX 7900 XT rows (October 31, `5b232bd` plus the tuner scratch
+fix) still sum one timed pass per dispatch. On Mesa ANV each timed pass adds
+about 7 µs, which had inflated B570 3×3 convolutions from 0.93–1.64× to
+1.45–3.16×. This cannot allocate a fraction of the cohort model time.
+Host-wall columns are not cross-engine comparisons. Reference kernels use
+ordinary f32 units, so the controls locate implementation losses without a
+reduced-precision explanation.
 
-4096³ GEMM ratios are 1.65/2.11/2.19 on AMD/NVIDIA/Intel; small U-Net GEMMs
-span 0.66–1.31 / 1.59–4.93 / 2.01–4.62. At 64×1024×256, cuBLAS split-K takes
-6 µs vs native 28, and oneDNN 12 vs 55. B570 3×3 convolutions take 1.45–3.16×
-PyTorch's time, RTX 5070 0.45–1.03×. RX 7900 XT geometric means are 1.11 for
-GEMMs and 0.98 for convolutions. This identifies useful kernel targets, not
-an unavoidable API penalty or a measured speedup from a proposed fix.
+4096³ GEMM ratios are 1.65/2.06/2.22 on AMD/NVIDIA/Intel; small U-Net GEMMs
+span 0.66–1.31 / 0.93–4.40 / 0.90–4.47, slowest at long K. At 64×1024×256,
+cuBLAS split-K takes 6 µs vs native 25, and oneDNN 12 vs 53. Native Winograd
+3×3 convolutions take 0.41–0.70× cuDNN's time on RTX 5070 and 0.93–1.64×
+oneDNN's on B570, where one fused vendor kernel replaces four dispatches. The
+512-channel row is pessimistic for native: its 30 transformed weights are
+computed first and read back out of cache. This identifies useful kernel
+targets, not an unavoidable API penalty or a measured speedup from a
+proposed fix.
 
 4096³ exceeds the tuner's 64 MiB scratch and uses the default tile. 2048³ is
-covered after keeping encoder allowance outside that limit, restoring B570
-3.58 ms from 5.31 and RX 7900 XT 1.08 from 1.30. Processes tune for two
+covered after keeping encoder allowance outside that limit, which on October
+31 restored B570 3.58 ms from 5.31 and RX 7900 XT 1.08 from 1.30. Processes tune for two
 seconds and can pick different tiles. Native convolution times include
 per-call Winograd weight transforms. The earlier U-Net shared-memory query
 at `99e3de2` uses 16.4 KiB, below Vulkan's 48 KiB; that specific kernel is not
