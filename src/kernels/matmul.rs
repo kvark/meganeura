@@ -12,7 +12,7 @@
 //! convolutions are separate computations with their own kernels.
 
 use super::{Family, Rejection};
-use crate::codegen::{CoopConfig, ShaderGroup};
+use crate::codegen::{CoopConfig, ScalarMatmulShape, ShaderGroup};
 use crate::compile::{Dispatch, Kernel};
 
 /// K partitions for a checked typed product: fill a small 32×32 output grid
@@ -179,6 +179,8 @@ pub(crate) enum Path {
     /// 32-wide scalar tiles, for products too small to occupy the device
     /// with 64-wide ones.
     SmallTile,
+    /// [`WIDE_TILE`], for products large enough to occupy the device with it.
+    WideTile,
     /// The kernel the compiler emitted: 64-wide scalar tiles, or the
     /// schedule a measurement pinned. The fallback.
     Compiled,
@@ -194,10 +196,30 @@ const MIN_F32_COOPERATIVE_WORKGROUPS: u64 = 16;
 /// four times as many, to occupy GPUs with many SMs.
 const SMALL_TILE_BELOW_WORKGROUPS: u32 = 16;
 
+/// 128 rows by 64 columns: an 8×4 register tile per thread, against 4×4
+/// for the compiled 64×64 kernel, reads shared memory 1.5 times less often
+/// per multiply-add. Products with at least [`SCALAR_OCCUPIED`] such tiles
+/// take 0.60–0.97 of the 64×64 time on Arc B570 and 0.85–0.92 on RTX 5070
+/// (4096³: 26.4 against 44.1 ms, and 12.4 against 14.6); with 16 or fewer
+/// they run slower on both. Interleaved columns suit the B570 (2048³: 4.7
+/// TFLOP/s against 3.4) and cost the RTX 5070 a little (12.4 against 13.5).
+pub(crate) const WIDE_TILE: ScalarMatmulShape = ScalarMatmulShape {
+    tile_size: 128,
+    tile_n: 64,
+    k_stage: 16,
+    interleave_columns: true,
+    unroll_k: false,
+};
+
 impl Family for Path {
     type Problem = Problem;
     type Target = Target;
-    const PREFERENCE: &'static [Self] = &[Path::Cooperative, Path::SmallTile, Path::Compiled];
+    const PREFERENCE: &'static [Self] = &[
+        Path::Cooperative,
+        Path::SmallTile,
+        Path::WideTile,
+        Path::Compiled,
+    ];
 
     fn admits(self, problem: &Problem, target: &Target) -> Result<(), Rejection> {
         match self {
@@ -244,6 +266,22 @@ impl Family for Path {
                     Err("no 32-wide kernel for transposed products with an addend")
                 } else if problem.compiled_workgroups >= SMALL_TILE_BELOW_WORKGROUPS {
                     Err("64-wide tiles already occupy the device")
+                } else {
+                    Ok(())
+                }
+            }
+            Path::WideTile => {
+                let [columns, rows, _] = wide_workgroups(problem);
+                if problem.pinned {
+                    Err("the kernel is fixed by a schedule or storage policy")
+                } else if problem.reduced_storage {
+                    Err("packed weights keep their compiled kernel")
+                } else if u64::from(columns) * u64::from(rows) < u64::from(SCALAR_OCCUPIED) {
+                    Err("too few 128x64 tiles to occupy the device")
+                } else if !crate::compile::workgroups_within_portable_limits(wide_workgroups(
+                    problem,
+                )) {
+                    Err("grid exceeds the portable dispatch limit")
                 } else {
                     Ok(())
                 }
@@ -309,6 +347,15 @@ pub(crate) fn tiled_workgroups(problem: &Problem, tile: u32) -> [u32; 3] {
     [problem.n.div_ceil(tile), problem.m.div_ceil(tile), 1]
 }
 
+/// Workgroups of [`WIDE_TILE`]: columns on X, rows on Y.
+pub(crate) fn wide_workgroups(problem: &Problem) -> [u32; 3] {
+    [
+        problem.n.div_ceil(WIDE_TILE.cols()),
+        problem.m.div_ceil(WIDE_TILE.rows()),
+        1,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,8 +406,13 @@ mod tests {
         for problem in [product(1, 1, 1), product(4096, 4096, 4096)] {
             assert_eq!(Path::Compiled.admits(&problem, &bare), Ok(()));
         }
-        assert_eq!(select(&product(4096, 4096, 64), &bare), Path::Compiled);
+        assert_eq!(select(&product(4096, 4096, 64), &bare), Path::WideTile);
+        // 32 tiles of 128x64 are too few; 64 are enough.
+        assert_eq!(select(&product(512, 512, 64), &bare), Path::Compiled);
+        assert_eq!(select(&product(1024, 512, 64), &bare), Path::WideTile);
         assert_eq!(select(&product(64, 64, 64), &bare), Path::SmallTile);
+        // Past 65535 rows of tiles, only the compiled kernel wraps rows.
+        assert_eq!(select(&product(128 * 65536, 64, 64), &bare), Path::Compiled);
     }
 
     #[test]
@@ -448,12 +500,12 @@ mod tests {
             };
             assert_eq!(select(&large, &target(&F32)), Path::Cooperative);
             // F16 stays out even when a session explicitly allows it.
-            assert_eq!(select(&large, &target(&F16)), Path::Compiled);
+            assert_eq!(select(&large, &target(&F16)), Path::WideTile);
             let allowed = Target {
                 allow_raw_f16: true,
                 ..target(&F16)
             };
-            assert_eq!(select(&large, &allowed), Path::Compiled);
+            assert_eq!(select(&large, &allowed), Path::WideTile);
             // The shared occupancy floor still applies.
             let small = Problem::plain(layout, [32, 32, 32], false);
             assert_eq!(select(&small, &target(&F32)), Path::Compiled);

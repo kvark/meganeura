@@ -52,3 +52,4 @@ mod support;
 mod tune;
 mod typed_matmul;
 mod whisper_correctness;
+mod wide_matmul;

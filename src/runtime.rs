@@ -3064,6 +3064,11 @@ fn select_matmul_paths(
                 dispatch.kernel = crate::compile::Kernel::SmallTile;
                 dispatch.workgroups = matmul::tiled_workgroups(&problem, 32);
             }
+            matmul::Path::WideTile => {
+                let dispatch = &mut plan.dispatches[index];
+                dispatch.kernel = crate::compile::Kernel::ScalarMatmul(matmul::WIDE_TILE);
+                dispatch.workgroups = matmul::wide_workgroups(&problem);
+            }
             matmul::Path::Compiled => {}
         }
     }
@@ -3249,8 +3254,18 @@ mod coop_precision_tests {
                         [(m as u32).div_ceil(32), (n as u32).div_ceil(32), 1]
                     );
                 } else {
-                    assert_eq!(after.workgroups, before.workgroups);
-                    assert_eq!(after.kernel, before.kernel);
+                    // The scalar 128x64 tile takes over without padding.
+                    let wide = crate::kernels::matmul::WIDE_TILE;
+                    assert_eq!(
+                        after.workgroups,
+                        [
+                            (n as u32).div_ceil(wide.cols()),
+                            (m as u32).div_ceil(wide.rows()),
+                            1
+                        ]
+                    );
+                    assert_eq!(after.kernel, crate::compile::Kernel::ScalarMatmul(wide));
+                    assert_ne!(before.kernel, after.kernel);
                     assert_eq!(
                         plan.buffers, buffers,
                         "rejected promotion must not pad buffers"
