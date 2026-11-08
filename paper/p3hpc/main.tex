@@ -619,29 +619,29 @@ inference takes 3.41\,ms versus PyTorch's 1.07\,ms, and training 20.52 versus
 produced a competitive long-sequence attention implementation.
 
 \emph{Same arithmetic, different kernels.}
-A separate October~31 study times one strict-f32 GEMM or convolution per
-process on RX~7900~XT, RTX~5070 and B570. It uses the same compiler plus the
-tuner scratch fix included in this cohort, with cooperative matrices off.
-Three native processes and one PyTorch process run per shape; the artifact
-retains their protocol and summary. Operands differ between engines, so
-these are throughput probes rather than cross-engine numerical comparisons. Our GPU time sums pass
-timestamps; PyTorch uses a device event around 30 serial graph operations,
-divided by 30, so its interval includes dispatch gaps that ours excludes.
-This favors our smallest operations and prevents exact model-time accounting.
+A separate study times one strict-f32 GEMM or convolution per process on
+RX~7900~XT, RTX~5070 and B570, with the kernel tuner on and cooperative
+matrices off. Three native processes and one PyTorch process run per shape;
+the artifact retains their protocol and summary. Operands differ between
+engines, so these are throughput probes rather than cross-engine numerical
+comparisons. PyTorch uses a device event around 30 serial graph operations,
+divided by 30. On RTX~5070 and B570 our time likewise covers 30 copies of the
+operation in one timed pass, with a barrier after every dispatch. The
+RX~7900~XT rows are from an earlier run that summed one timed pass per
+dispatch, which overstates our time on small operations.
 
-Even with that advantage, small U-Net GEMMs take 1.59--4.93 times PyTorch's
-time on RTX~5070 and 2.01--4.62 on B570. At $64\times1024\times256$, cuBLAS
-uses split-K and takes 6\,$\mu$s versus our 28; oneDNN takes 12 versus our
-55. B570 3-by-3 convolutions take 1.45--3.16 times the reference's time;
-RTX~5070's Winograd convolutions are much closer, at 0.45--1.03. Large
-$4096^3$ GEMMs still trail by 1.65, 2.11 and 2.19 times on the three GPUs.
-RX~7900~XT is closest overall, with geometric means of 1.11 for GEMMs and
-0.98 for convolutions. These controls support kernel efficiency as an
-important part of the gap on Intel and NVIDIA, without measuring an
-unavoidable Vulkan penalty. Smaller tiles, split-K and better operand reuse
-are testable hypotheses, not measured fixes. The measured B570 U-Net kernel
-uses 16.4\,KiB of shared memory, below Vulkan's 48\,KiB ceiling; that limit
-does not explain this particular kernel.
+Small U-Net GEMMs take 0.93--4.40 times PyTorch's time on RTX~5070 and
+0.90--4.47 on B570; the long-K shapes are the slow ones. At
+$64\times1024\times256$, cuBLAS uses split-K and takes 6\,$\mu$s versus our
+25; oneDNN takes 12 versus our 53. Our Winograd 3-by-3 convolutions take
+0.41--0.70 times cuDNN's time on RTX~5070 and 0.93--1.64 times oneDNN's on
+B570, where one fused vendor kernel replaces our four. Large $4096^3$ GEMMs
+trail by 1.65, 2.06 and 2.22 times on the three GPUs. These controls support
+kernel efficiency as an important part of the gap on Intel and NVIDIA,
+without measuring an unavoidable Vulkan penalty. Split-K for small outputs
+and fewer Winograd passes are testable hypotheses, not measured fixes. The
+measured B570 U-Net kernel uses 16.4\,KiB of shared memory, below Vulkan's
+48\,KiB ceiling; that limit does not explain this particular kernel.
 
 \emph{API limits are constraints, not an attributed fraction.}
 This stack does not expose explicit control of Hopper's asynchronous
@@ -991,7 +991,7 @@ and the short timing window can all matter. Fresh processes start with empty
 TorchInductor caches but keep whatever driver state the machine had. We
 report warmed short-window latency rather than sustained throughput and
 remove no outliers. The separate single-operation study uses three native processes and one
-reference process per shape, with different timing boundaries from the
+reference process per shape and times 30 serial operations, unlike the
 model comparison.
 
 \emph{Numerics.} Strict f32 fixes arithmetic width, not operation order.

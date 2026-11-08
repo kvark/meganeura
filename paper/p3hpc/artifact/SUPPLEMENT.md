@@ -77,9 +77,10 @@ Offline reading of `op-bench.tsv` needs no GPU. Re-running it needs both
 engines and hardware; the framework-cohort analyzer does not execute it.
 
 This uses three native processes and one reference process per shape, with
-thirty device samples per process. Operands differ between engines. Native
-times sum pass intervals; reference events include gaps between serial graph
-operations. The measurements support kernel comparisons, not an exact share
+thirty device samples per process. Operands differ between engines. Both
+engines time 30 serial operations and divide by 30, including the gaps
+between them; the RX 7900 XT rows predate this native runner and sum one
+timed pass per dispatch instead. The measurements support kernel comparisons, not an exact share
 of the model-level gap or an independent cross-engine accuracy test. Only the
 median native rows are retained; per-process runs remain outside this
 supplement. The source runner and recorded
