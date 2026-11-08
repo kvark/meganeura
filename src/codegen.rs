@@ -440,12 +440,14 @@ impl ScalarMatmulShape {
     }
 
     /// The staged tiles have to be an integer number of 256-thread passes,
-    /// and each thread's register tile is BM/16 by BN/16.
+    /// and each thread's register tile is BM/16 by BN/16. 128 is the widest
+    /// block on that 16×16 mapping: it is an 8×8 register tile, 64
+    /// accumulators per thread. A wider output tile needs a larger workgroup.
     pub fn legal(self) -> bool {
         let (bm, bn, k) = (self.rows(), self.cols(), self.k_stage);
         matches!(k, 8 | 16 | 32)
-            && matches!(bm, 16 | 32 | 64)
-            && matches!(bn, 16 | 32 | 64)
+            && matches!(bm, 16 | 32 | 64 | 128)
+            && matches!(bn, 16 | 32 | 64 | 128)
             && bm * k % 256 == 0
             && bn * k % 256 == 0
     }
@@ -1309,17 +1311,17 @@ pub fn generate_wgsl(group: ShaderGroup) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// matmul.wgsl — 4×4 register-tiled matrix multiply (64×64 output tiles)
+// matmul.wgsl — register-tiled matrix multiply
 //
-// Workgroup [16, 16, 1] = 256 threads, dispatched as [ceil(N/64), ceil(M/64), 1].
-// Each thread computes a 4×4 sub-tile of the output using register blocking.
-// Shared memory tiles: shared_a[64*16], shared_b[16*64].
+// Workgroup [16, 16, 1] = 256 threads. Each thread's register tile is
+// BM/16 by BN/16: 4×4 for 64×64, 2×2 for 32×32, 8×8 for 128×128.
+// Dispatched as [ceil(N/BN), ceil(M/BM), 1].
 // ---------------------------------------------------------------------------
 
 /// Register-tiled matmul: C = A × B via WGSL with shared memory.
 ///
-/// BM=64, BN=64, KTILE=16, TM=4, TN=4.
-/// Workgroup [16, 16, 1], dispatched as [ceil(N/64), ceil(M/64), 1].
+/// The plain kernel is BM=BN=64 (TM=TN=4). The same skeleton covers every
+/// legal [`ScalarMatmulShape`], including the 128×128 block.
 ///
 /// Template variables for global memory indices:
 const MATMUL_A_FWD: &str = "a_row * params.k + a_col"; // A[m,k] row-major
@@ -1329,9 +1331,8 @@ const MATMUL_B_BT: &str = "b_col * params.k + b_row"; // B^T[k,n] = B[n*K+k]
 
 /// Thread-to-tile mapping for coalesced global memory access.
 ///
-/// Large-tile (64×64) load mappings. Adjacent threads follow each operand's
-/// fast dimension: the selected K extent for A[M,K] and B[N,K], or the
-/// output tile width for A[K,M] and B[K,N].
+/// Adjacent threads follow each operand's fast dimension. The widths are
+/// `$BM_U`, `$BN_U` and `$K_TILE_U`, so one mapping covers every scalar tile.
 const A_ROW_FWD: &str = "flat / $K_TILE_U"; // M varies slowly (good for [M,K])
 const A_COL_FWD: &str = "flat % $K_TILE_U"; // K varies fast (coalesced in [M,K])
 const A_ROW_AT: &str = "flat % $BM_U"; // M varies fast (coalesced in [K,M])
@@ -5512,6 +5513,58 @@ mod tests {
                 "{group:?}: small epilogue must not use 64-wide staging maps"
             );
         }
+    }
+
+    /// 128×128 stays on the 16×16 workgroup, so each thread owns an 8×8
+    /// register tile. Shared memory and the staging map have to follow BM/BN,
+    /// or the extra accumulators read the 64-wide tile.
+    #[test]
+    fn wide_tile_is_an_eight_by_eight_register_tile() {
+        let shape = ScalarMatmulShape {
+            tile_size: 128,
+            tile_n: 0,
+            k_stage: 16,
+            interleave_columns: false,
+            unroll_k: false,
+        };
+        assert!(shape.legal());
+        assert_eq!(shape.geometry(), MatMulTile::Rect { bm: 128, bn: 128 });
+        assert!(
+            !ScalarMatmulShape {
+                tile_size: 256,
+                ..shape
+            }
+            .legal()
+        );
+        assert!(
+            !ScalarMatmulShape {
+                tile_n: 96,
+                ..shape
+            }
+            .legal()
+        );
+        let mut wide = generate_matmul_with_epilogue(
+            ShaderGroup::MatMul,
+            None,
+            MatMulOptions {
+                tile: shape.geometry(),
+                knobs: MatmulKnobs {
+                    k_stage: 16,
+                    ..MatmulKnobs::default()
+                },
+                ..MatMulOptions::default()
+            },
+        );
+        assert!(wide.source.contains("var s7_7 = 0.0;"));
+        assert!(!wide.source.contains("var s8_"));
+        assert!(wide.source.contains("array<f32, 2176>"));
+        assert!(wide.source.contains("array<f32, 2064>"));
+        assert!(wide.source.contains("flat / 128u") && wide.source.contains("flat % 128u"));
+        assert!(!wide.source.contains("flat / 64u") && !wide.source.contains("flat % 64u"));
+        assert!(wide.source.contains("@workgroup_size(16, 16)"));
+        assert!(wide.source.contains("ty * 16u + tx"));
+        validate_shader_for_test(&mut wide.module, naga::valid::Capabilities::empty(), (1, 3))
+            .unwrap_or_else(|error| panic!("{error}\n{}", wide.source));
     }
 }
 

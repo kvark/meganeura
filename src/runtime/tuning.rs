@@ -2379,7 +2379,8 @@ fn qualify_output(class: &TuneClass, inputs: &[Vec<f32>], output: &[f32], scale:
     }
     let (m, n) = (class.m as usize, class.n as usize);
     // Explicit tile boundaries and last row/column, then scattered dots.
-    let edges = [0, 1, 7, 8, 15, 16, 31, 32, 63, 64, usize::MAX];
+    // 127/128 are the edge of the 128×128 scalar block.
+    let edges = [0, 1, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, usize::MAX];
     let samples = (0..32).map(|i| {
         let row = if i == edges.len() {
             m - 1
@@ -4568,5 +4569,74 @@ mod tests {
             assert!(!outputs_agree(&output, &corrupt, scale));
             assert!(!qualify_output(&class, &inputs, &corrupt, scale));
         }
+    }
+
+    /// The 128×128 scalar tile is an 8×8 register block on the same 256-thread
+    /// workgroup. A constant product checks every output, including the partial
+    /// tile past 128 and a K that is not a multiple of the stage.
+    #[test]
+    fn wide_scalar_tile_matches_constant_product() {
+        let shapes = [(160usize, 192usize, 80usize), (256, 256, 64)];
+        for (m, n, k) in shapes {
+            for k_stage in [8, 16] {
+                for interleave_columns in [false, true] {
+                    let shape = crate::codegen::ScalarMatmulShape {
+                        tile_size: 128,
+                        tile_n: 0,
+                        k_stage,
+                        interleave_columns,
+                        unroll_k: false,
+                    };
+                    let mut session = wide_tile_session(m, n, k);
+                    let index = session
+                        .plan
+                        .dispatches
+                        .iter()
+                        .position(|dispatch| dispatch.shader == ShaderEntry::MatMul)
+                        .expect("matmul dispatch");
+                    let class = TuneClass::from_dispatch(&session.plan.dispatches[index], None)
+                        .expect("plain matmul is tunable");
+                    MatmulTile::Scalar(shape).apply(&mut session.plan.dispatches[index], &class);
+                    session
+                        .pipelines
+                        .prepare(&session.gpu, &session.plan.dispatches[index], None)
+                        .unwrap_or_else(|error| panic!("{shape:?} {m}x{n}x{k}: {error}"));
+                    // `prepare` compiles the pipeline; recording still uses the
+                    // pipeline selected for this dispatch at build.
+                    session
+                        .pipelines
+                        .select(&session.plan.dispatches, &session.gpu);
+                    let a = 0.25f32;
+                    let b = 0.5f32;
+                    session.set_input("a", &vec![a; m * k]);
+                    session.set_parameter("b", &vec![b; k * n]);
+                    session.step();
+                    session.wait();
+                    let expected = k as f32 * a * b;
+                    for (i, got) in session.read_output(m * n).iter().enumerate() {
+                        assert!(
+                            *got == expected,
+                            "{shape:?} {m}x{n}x{k} output[{i}] = {got}, expected {expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn wide_tile_session(m: usize, n: usize, k: usize) -> crate::Session {
+        let mut graph = crate::Graph::new();
+        let a = graph.input("a", &[m, k]);
+        let b = graph.parameter("b", &[k, n]);
+        let c = graph.matmul(a, b);
+        graph.set_outputs(vec![c]);
+        let mut config =
+            crate::SessionConfig::inference_from_env_on(crate::reference::gpu::shared_context());
+        config.tune = false;
+        config.optimize.mode = crate::optimize::OptimizeMode::Off;
+        config.runtime.coop = crate::CoopPolicy::Disabled;
+        config.runtime.poison = true;
+        config.runtime.gpu_timing = false;
+        crate::build(&graph, config).0
     }
 }

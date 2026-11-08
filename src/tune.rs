@@ -1130,9 +1130,18 @@ impl TuneClass {
                         .map(|shape| MatmulTile::CooperativeTiled { shape, splits: 1 }),
                 );
             }
+            // Square tiles on the 16×16 workgroup. 128 is an 8×8 register
+            // tile, 64 accumulators per thread. Offer it only when both
+            // sides fill the block. An RTX 5080 race eliminated every 128
+            // candidate; it stays so `wide_tile_probe` can reproduce that.
+            let tiles: &[u32] = if self.m >= 128 && self.n >= 128 {
+                &[128, 64, 32]
+            } else {
+                &[64, 32]
+            };
             for interleave_columns in [false, true] {
                 for k_stage in [32, 16, 8] {
-                    for tile_size in [64, 32] {
+                    for &tile_size in tiles {
                         candidates.push(MatmulTile::Scalar(crate::codegen::ScalarMatmulShape {
                             tile_size,
                             tile_n: 0,
@@ -2558,6 +2567,42 @@ mod tests {
         assert_eq!(
             MachineProfile::default().predict_ms(1.0, 1.0, 1, None),
             None
+        );
+    }
+
+    #[test]
+    fn wide_scalar_tile_challenges_only_products_that_fill_it() {
+        let shape = crate::codegen::ScalarMatmulShape {
+            tile_size: 128,
+            tile_n: 0,
+            k_stage: 16,
+            interleave_columns: false,
+            unroll_k: false,
+        };
+        let tile = MatmulTile::Scalar(shape);
+        let large = class(4096, 4096, 4096);
+        assert!(large.challengers(MatmulTile::Tile64, None).contains(&tile));
+        assert_eq!(tile.workgroups(&large), [32, 32, 1]);
+        assert!(
+            !class(96, 4096, 4096)
+                .challengers(MatmulTile::Tile64, None)
+                .contains(&tile)
+        );
+        assert!(
+            !class(33, 65, 17)
+                .challengers(MatmulTile::Tile64, None)
+                .contains(&tile)
+        );
+        let dispatch = conv_dispatch(ShaderEntry::Conv2dGemm);
+        let mut conv = TuneClass::from_dispatch(&dispatch, None).unwrap();
+        conv.binding_bytes = conv.buffer_sizes().unwrap();
+        assert!(
+            conv.challengers(MatmulTile::Tile64, None)
+                .iter()
+                .all(|candidate| !matches!(
+                    candidate,
+                    MatmulTile::Scalar(shape) if shape.tile_size == 128
+                ))
         );
     }
 
