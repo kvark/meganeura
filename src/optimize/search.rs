@@ -424,14 +424,14 @@ fn segment_candidates(
     // and the search on other targets unchanged.
     program.push_str(&body);
     let root_name = if roots.len() == 1 {
-        format!("$n{}", roots[0])
+        super::binding(roots[0])
     } else {
         program.push_str(&format!(
             "(constructor SearchOutputs ({}) Op)\n(let $outputs (SearchOutputs {}))\n",
             vec!["Op"; roots.len()].join(" "),
             roots
                 .iter()
-                .map(|id| format!("$n{id}"))
+                .map(|&id| super::binding(id))
                 .collect::<Vec<_>>()
                 .join(" "),
         ));

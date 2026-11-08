@@ -769,11 +769,11 @@ fn node_to_egglog_expr(node: &Node) -> String {
             && node.ty.shape.first() == Some(&1)
             && node.inputs.len() == 1 =>
         {
-            format!("$n{}", node.inputs[0])
+            binding(node.inputs[0])
         }
         Op::Nop => unreachable!("Nop nodes are filtered before encoding"),
         ref op => {
-            let args: Vec<String> = node.inputs.iter().map(|i| format!("$n{}", i)).collect();
+            let args: Vec<String> = node.inputs.iter().map(binding).collect();
             if let Some(name) = attention_constructor(op) {
                 format!("({name} {} {})", node.id, args.join(" "))
             } else if let Some(name) = named_constructor(op) {
@@ -789,6 +789,16 @@ fn node_to_egglog_expr(node: &Node) -> String {
             }
         }
     }
+}
+
+/// Egglog binding of graph node `id`.
+///
+/// egglog 3.0 names fresh variables by appending a per-name counter, so
+/// names minted from `$n1` and from `$n16` can coincide and bind a node to
+/// another node's term (fixed upstream by egraphs-good/egglog#1006, not yet
+/// released). A trailing non-digit makes every minted name unambiguous.
+pub(crate) fn binding(id: impl std::fmt::Display) -> String {
+    format!("$n{id}_")
 }
 
 /// Egglog program for one segment instance: external dependencies become
@@ -815,14 +825,18 @@ fn segment_program(g: &Graph, seg: &Segment) -> (String, Vec<usize>) {
 
     let mut prog = String::new();
     for &e in &externals {
-        prog.push_str(&format!("(let $n{} (Leaf {}))\n", e, e));
+        prog.push_str(&format!("(let {} (Leaf {e}))\n", binding(e)));
     }
     for &id in &seg.ids {
         let node = &g.nodes()[id];
         if matches!(node.op, Op::Nop) {
             continue;
         }
-        prog.push_str(&format!("(let $n{} {})\n", id, node_to_egglog_expr(node)));
+        prog.push_str(&format!(
+            "(let {} {})\n",
+            binding(id),
+            node_to_egglog_expr(node)
+        ));
         let dimensions = match node.op {
             Op::MultiHeadAttnGradQ { head_dim, .. } => Some((1, head_dim)),
             Op::MultiHeadAttnGradK { head_dim, .. } => Some((2, head_dim)),
@@ -845,7 +859,7 @@ fn segment_program(g: &Graph, seg: &Segment) -> (String, Vec<usize>) {
     (prog, externals)
 }
 
-/// Map every node binding (`$n{id}`) to its e-class value and record the
+/// Map every node binding (`$n{id}_`) to its e-class value and record the
 /// tensor's size in bytes — the lookup table for traffic-aware
 /// extraction. Nodes sharing an e-class denote the same tensor, so the
 /// insert is idempotent. Unfusing an existing matrix addition also creates a
@@ -879,7 +893,7 @@ fn eclass_sizes(
         if matches!(node.op, Op::Nop) {
             continue;
         }
-        let var = format!("$n{}", node.id);
+        let var = binding(node.id);
         if let Some(value) = lookup_value(egraph, &var, &[]) {
             sizes.insert(value, node.ty.size_bytes() as u64);
         }
@@ -892,7 +906,7 @@ fn eclass_sizes(
         let inputs = node.inputs[..2]
             .iter()
             .map(|id| {
-                let name = format!("$n{id}");
+                let name = binding(id);
                 egraph.get_function(&name)?;
                 lookup_value(egraph, &name, &[])
             })
@@ -1027,7 +1041,7 @@ fn process_segment(
     let mut dag = TermDag::default();
     let mut terms = Vec::new();
     for &root in &roots {
-        let var = format!("$n{}", root);
+        let var = binding(root);
         match lookup_value(&egraph, &var, &[]) {
             Some(value) => {
                 let extraction = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1036,8 +1050,8 @@ fn process_segment(
                 match extraction {
                     Ok(Some((cost, term_id))) => {
                         log::debug!(
-                            "extracted $n{} (cost {}): {}",
-                            root,
+                            "extracted {} (cost {}): {}",
+                            var,
                             cost,
                             dag.to_string(term_id)
                         );
@@ -1045,20 +1059,20 @@ fn process_segment(
                     }
                     Ok(None) => {
                         report.extraction_failures += 1;
-                        log::warn!("extraction failed for $n{}", root);
+                        log::warn!("extraction failed for {var}");
                     }
                     Err(_) => {
                         report.extraction_failures += 1;
                         log::warn!(
-                            "egglog panicked while reconstructing $n{} — root left unchanged",
-                            root
+                            "egglog panicked while reconstructing {} — root left unchanged",
+                            var
                         );
                     }
                 }
             }
             None => {
                 report.extraction_failures += 1;
-                log::warn!("missing e-class for $n{}", root);
+                log::warn!("missing e-class for {var}");
             }
         }
     }
@@ -1101,7 +1115,7 @@ fn process_segment(
                 is_derivative,
             };
             if let Err(e) = stamper.stamp_root(root + shift, &dag, term_id) {
-                log::warn!("stamping $n{} (+{}) failed: {}", root, shift, e);
+                log::warn!("stamping {} (+{}) failed: {}", binding(root), shift, e);
             }
         }
     }
@@ -1952,6 +1966,33 @@ mod tests {
                     std::mem::discriminant(&g.node(before).op)
                 );
             }
+        }
+    }
+
+    /// Chains of identical products on one weight keep every link. With
+    /// bindings `$n1` and `$n10`..`$n19` present, egglog 3.0 minted colliding
+    /// fresh names and extracted eleven products as one `w·w`.
+    #[test]
+    fn deep_shared_weight_chains_keep_their_length() {
+        for depth in [9, 10, 11, 12, 30, 120] {
+            let mut g = Graph::new();
+            let x = g.input("x", &[8, 8]);
+            let w = g.parameter("w", &[8, 8]);
+            let mut y = x;
+            for _ in 0..depth {
+                y = g.matmul(y, w);
+            }
+            g.set_outputs(vec![y]);
+            let opt = optimize(&g);
+            let mut node = opt.node(opt.outputs()[0]);
+            let mut links = 0;
+            while matches!(node.op, Op::MatMul) {
+                assert_eq!(node.inputs[1], w, "depth {depth}");
+                node = opt.node(node.inputs[0]);
+                links += 1;
+            }
+            assert_eq!(links, depth, "depth {depth}");
+            assert_eq!(node.id, x, "depth {depth}");
         }
     }
 
