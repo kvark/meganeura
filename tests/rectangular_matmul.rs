@@ -44,6 +44,11 @@ fn check_candidates(strategy: TuneStrategy, cases: &[Case]) {
             if storage == DType::F32 && (round || dims[2] == 1024) {
                 continue;
             }
+            // The rounded output is a BF16 value, which F16 storage alone
+            // does not provide (lavapipe has F16 tiles but no BF16).
+            if round && !gpu.capabilities().shader_bfloat16 {
+                continue;
+            }
             let [m, n, k] = dims;
             eprintln!(
                 "rectangular case {storage:?} layout={layout} add={add} round={round} {dims:?}"
