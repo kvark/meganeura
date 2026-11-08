@@ -119,6 +119,54 @@ impl ExecutionPlan {
         }
     }
 
+    /// Split scalar products whose 32×32 output grid cannot occupy the device
+    /// into K partitions, as [`crate::kernels::matmul::scalar_partitions`]
+    /// chooses. A 64-row product with K = 1024 has 16 workgroups of 32×32,
+    /// each walking 32 dependent K stages; partitions give the device
+    /// workgroups to switch between while loads are in flight. Apply after
+    /// cooperative selection and before epilogue or prologue fusion.
+    pub(crate) fn split_low_occupancy_scalar_products(&mut self) {
+        let mut budget = 32 * 1024 * 1024;
+        for index in (0..self.dispatches.len()).rev() {
+            let dispatch = &self.dispatches[index];
+            if dispatch.use_coop()
+                || dispatch.matmul_epilogue.is_some()
+                || dispatch.matmul_prologue.is_some()
+                || dispatch.workgroups[2] != 1
+            {
+                continue;
+            }
+            if !matches!(
+                dispatch.kernel,
+                super::Kernel::Default | super::Kernel::SmallTile
+            ) {
+                continue;
+            }
+            let Some(class) = TuneClass::from_dispatch(dispatch, None).filter(|c| {
+                c.shader.is_matmul()
+                    && c.batch_dispatches() == 1
+                    && c.weight_format == super::WeightFormat::F32
+            }) else {
+                continue;
+            };
+            let Some(splits) = crate::kernels::matmul::scalar_partitions(class.m, class.n, class.k)
+            else {
+                continue;
+            };
+            let shape = crate::codegen::ScalarMatmulShape {
+                tile_size: 32,
+                tile_n: 0,
+                k_stage: 16,
+                interleave_columns: false,
+                unroll_k: false,
+            };
+            let buffers = self.buffers.len();
+            if self.split_matmul(index, shape, splits, budget).is_ok() {
+                budget -= self.buffers[buffers];
+            }
+        }
+    }
+
     /// Move an unfused cooperative f32 product to the shared-tile native
     /// 16x16 kernel. More than one K partition writes compact M*N partials
     /// that a following SumRows adds up. Preflights before mutating the plan.

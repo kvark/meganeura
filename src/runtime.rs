@@ -2927,6 +2927,7 @@ pub(crate) fn select_variants(
     select_matmul_paths(plan, coop_config, allow_raw_f16);
 
     plan.split_long_scalar_products();
+    plan.split_low_occupancy_scalar_products();
 
     // Apply RmsNorm+MatMul prologue fusion only after per-dispatch coop
     // selection. A coop-capable device can still route small matmuls to a
@@ -3101,7 +3102,12 @@ mod block_matmul_variant_tests {
                 let serial = &serial.dispatches[0];
                 let grouped = &grouped.dispatches[0];
                 assert!(!serial.use_coop() && !grouped.use_coop());
-                assert_eq!(serial.use_small_tiles(), grouped.use_small_tiles());
+                // The serial product's grid is too small for the device, so
+                // it is split into K partitions of 32×32 tiles.
+                let compile::Kernel::SplitMatmul { shape, .. } = serial.kernel else {
+                    panic!("{rows}x{inner}x{columns} is not split: {:?}", serial.kernel);
+                };
+                assert_eq!(shape.tile_size == 32, grouped.use_small_tiles());
                 assert_eq!(serial.workgroups[..2], grouped.workgroups[..2]);
                 assert_eq!(grouped.workgroups[2], 8);
             }

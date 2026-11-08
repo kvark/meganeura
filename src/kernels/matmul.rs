@@ -26,6 +26,24 @@ pub(crate) fn matrix_splits(m: u32, n: u32, k: u32) -> u32 {
     128u32.div_ceil(groups).min(k / 256).min(16)
 }
 
+/// K partitions for a scalar product whose grid of 32×32 tiles, the
+/// narrowest tuning offers, has fewer workgroups than [`SCALAR_OCCUPIED`]:
+/// aim for 128 workgroups with at least eight 16-deep K stages each. A
+/// 64×1024 by 1024×256 product has 16 workgroups and gets 8 partitions; on
+/// RTX 5070 and Arc B570 that takes 0.4 of the unsplit time, SumRows
+/// included. A 64×256 by 256×1024 product already has 64 and stays whole.
+pub(crate) fn scalar_partitions(m: u32, n: u32, k: u32) -> Option<u32> {
+    let groups = m.div_ceil(32).saturating_mul(n.div_ceil(32)).max(1);
+    if groups >= SCALAR_OCCUPIED {
+        return None;
+    }
+    let splits = 128u32.div_ceil(groups).min(k / 128).min(16);
+    (splits >= 2).then_some(splits)
+}
+
+/// Scalar output grids with this many workgroups are left unsplit.
+const SCALAR_OCCUPIED: u32 = 64;
+
 /// Which product a dispatch computes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Layout {
