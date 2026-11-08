@@ -275,8 +275,8 @@ section.results > p:has(> small) { margin: 6px 0 0; }
 /* Performance: single ops against the vendor libraries. */
 section.ops h1 { margin-bottom: 8px; }
 section.ops .case-context { font-size: 22px; margin: 0 0 12px; }
-table.ops { font-size: 23px; margin: 0 0 16px; }
-table.ops th, table.ops td { padding: 9px 12px; }
+table.ops { font-size: 23px; margin: 0 0 12px; }
+table.ops th, table.ops td { padding: 6px 12px; }
 table.ops td:nth-child(2) { color: #4a5c60; font-size: 20px; }
 table.ops td:nth-child(n+3), table.ops th:nth-child(n+3) { text-align: center; width: 16%; }
 table.ops td.near { color: #006b70; font-weight: 700; }

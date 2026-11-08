@@ -239,6 +239,14 @@ computed first and read back out of cache. This identifies useful kernel
 targets, not an unavoidable API penalty or a measured speedup from a
 proposed fix.
 
+The `eltwise` rows (RTX 5070 and B570, Meganeura `031f7b5`) time a
+256-element add. Thirty chained adds, each behind a barrier, take 0.96 and
+1.73 µs per add natively against PyTorch graph replays at 0.82 and 8.6 µs;
+without the barriers native takes 0.13 and 0.36 µs, so a barrier costs about
+0.8 and 1.4 µs. One add per step, submitted and waited for without
+timestamps, takes 22.5 and 158 µs natively against 6.9 and 31 µs for one
+eager PyTorch add and synchronize.
+
 4096³ exceeds the tuner's 64 MiB scratch and uses the default tile. 2048³ is
 covered after keeping encoder allowance outside that limit, which on October
 31 restored B570 3.58 ms from 5.31 and RX 7900 XT 1.08 from 1.30. The

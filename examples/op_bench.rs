@@ -15,6 +15,13 @@
 //! separates a Winograd convolution's weight and input transforms, which an
 //! ordinary plan runs together.
 //!
+//! An `eltwise` row adds a parameter vector to a small input 30 times: the
+//! dispatch floor. Chained, every add reads the previous sum, so the pass
+//! holds a barrier after each dispatch; independent, the adds all read the
+//! input and run as one barrier group, without barriers. The difference is
+//! what a barrier costs. A single add per step makes the wall time one
+//! submission's round trip, as PyTorch's wall time is for one eager call.
+//!
 //! The e-graph optimizer is off: a single operation has nothing to fuse,
 //! and egglog 3.0 extracts chains of more than ten identical products on a
 //! shared weight as shorter ones.
@@ -42,7 +49,7 @@ fn fill(n: usize, seed: usize) -> Vec<f32> {
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v.sort_by(f64::total_cmp);
     v[v.len() / 2]
 }
 
@@ -59,7 +66,35 @@ fn main() {
         }
         let d: Vec<u32> = f[2..].iter().map(|x| x.parse().unwrap()).collect();
         let mut g = Graph::new();
-        let (flops, input): (f64, (&str, usize)) = if f[0] == "gemm" {
+        let mut serial = true;
+        let mut copies = SERIAL;
+        let (flops, input): (f64, (&str, usize)) = if f[0] == "eltwise" {
+            // Mode 0: independent, 1: chained, 2: a single add.
+            let (n, mode) = (d[0] as usize, d[1]);
+            let x = g.input("x", &[n]);
+            let b = g.parameter("b", &[n]);
+            if mode == 2 {
+                let y = g.add(x, b);
+                g.set_outputs(vec![y]);
+                copies = 1;
+            } else if mode == 1 {
+                // Every sum is an output, so pointwise fusion keeps each add
+                // its own dispatch.
+                let mut y = x;
+                let outputs = (0..SERIAL)
+                    .map(|_| {
+                        y = g.add(y, b);
+                        y
+                    })
+                    .collect();
+                g.set_outputs(outputs);
+            } else {
+                let outputs = (0..SERIAL).map(|_| g.add(x, b)).collect();
+                g.set_outputs(outputs);
+                serial = false;
+            }
+            (n as f64, ("x", n))
+        } else if f[0] == "gemm" {
             let (m, k, n) = (d[0] as usize, d[1] as usize, d[2] as usize);
             let a = g.input("a", &[m, k]);
             let b = g.parameter("b", &[k, n]);
@@ -90,10 +125,10 @@ fn main() {
         };
         let mut config = meganeura::SessionConfig::inference_from_env();
         config.optimize.mode = meganeura::optimize::OptimizeMode::Off;
-        config.runtime.serial_dispatch = true;
+        config.runtime.serial_dispatch = serial;
         let mut session = meganeura::build(&g, config).0;
         let dispatches = &session.plan().dispatches;
-        assert_eq!(dispatches.len() % SERIAL, 0, "copies were merged");
+        assert_eq!(dispatches.len() % copies, 0, "copies were merged");
         // The schedule interleaves independent copies; name each kind once.
         let mut labels = Vec::new();
         for d in dispatches {
@@ -117,7 +152,7 @@ fn main() {
             let t = Instant::now();
             session.step();
             session.wait();
-            wall.push(t.elapsed().as_secs_f64() * 1e3 / SERIAL as f64);
+            wall.push(t.elapsed().as_secs_f64() * 1e3 / copies as f64);
         }
         // An empty window times every dispatch together in one grouped pass.
         session.set_profiling_window(Some(0..0));
@@ -126,13 +161,17 @@ fn main() {
             session.step();
             session.wait();
             let t = session.gpu_timings();
-            assert_eq!(t.len(), 1, "expected one timed pass");
-            gpu.push(t[0].1.as_secs_f64() * 1e3 / SERIAL as f64);
+            // Without MEGANEURA_GPU_TIMING, only the wall time is measured.
+            assert!(t.len() <= 1, "expected one timed pass");
+            gpu.push(
+                t.first()
+                    .map_or(f64::NAN, |t| t.1.as_secs_f64() * 1e3 / copies as f64),
+            );
         }
         session.set_profiling_window(None);
         let gpu_ms = median(gpu);
         println!(
-            "{}\t{}\t{:.4}\t{:.4}\t{:.3}\t{}",
+            "{}\t{}\t{:.5}\t{:.5}\t{:.3}\t{}",
             f[0],
             f[1],
             gpu_ms,

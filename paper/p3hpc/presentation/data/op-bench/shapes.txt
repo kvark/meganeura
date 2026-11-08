@@ -1,4 +1,5 @@
 # kind name dims...   gemm: M K N   conv: Cin H W Cout k stride pad (batch 1)
+#   eltwise: N mode (0: 30 adds of the input, 1: 30 chained adds, 2: one add)
 gemm square-1024 1024 1024 1024
 gemm square-2048 2048 2048 2048
 gemm square-4096 4096 4096 4096
@@ -18,3 +19,6 @@ conv resnet-3x3-64@56 64 56 56 64 3 1 1
 conv resnet-1x1-256@56 256 56 56 64 1 1 0
 conv resnet-3x3-512@7 512 7 7 512 3 1 1
 conv resnet-stem-7x7 3 224 224 64 7 2 3
+eltwise add-256 256 1
+eltwise add-256-indep 256 0
+eltwise add-256-single 256 2
