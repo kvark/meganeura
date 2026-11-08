@@ -756,18 +756,18 @@ If asked:
 
 <table class="ops">
 <tr><th>Operation</th><th>Shapes</th><th>RX 7900 XT</th><th>RTX 5070</th><th>Arc B570</th></tr>
-<tr><td>Large GEMM</td><td>4096³</td><td>1.7×</td><td>2.1×</td><td>2.2×</td></tr>
-<tr><td>Transformer GEMMs</td><td>Speech, LLM</td><td>1.2–1.3×</td><td>1.5–1.7×</td><td>1.3–1.6×</td></tr>
-<tr><td>Small GEMMs</td><td>Diffusion, M = 64–256</td><td class="near">0.57–1.4×</td><td class="far">0.93–4.4×</td><td class="far">0.90–4.5×</td></tr>
-<tr><td>3×3 convolutions</td><td>Diffusion, Vision</td><td>0.91–1.5×</td><td class="near">0.41–0.70×</td><td>0.93–1.6×</td></tr>
-<tr><td>Other convolutions</td><td>1×1, stems</td><td class="near">0.33–1.15×</td><td>1.2–1.25×</td><td>0.52–1.7×</td></tr>
-<tr><td>Dependent dispatch</td><td>Tiny add after a barrier</td><td>—</td><td>1.2×</td><td class="near">0.20×</td></tr>
-<tr><td>Submit and wait</td><td>One tiny add, host time</td><td>—</td><td class="far">3.3×</td><td class="far">5.2×</td></tr>
+<tr><td>Large GEMM</td><td>4096³</td><td>1.7×</td><td>1.7×</td><td>1.3×</td></tr>
+<tr><td>Transformer GEMMs</td><td>Speech, LLM</td><td>1.2–1.3×</td><td>1.3–1.6×</td><td>1.3–1.6×</td></tr>
+<tr><td>Small GEMMs</td><td>Diffusion, M = 64–256</td><td class="near">0.57–1.4×</td><td class="far">0.93–2.0×</td><td>0.93–1.7×</td></tr>
+<tr><td>3×3 convolutions</td><td>Diffusion, Vision</td><td>0.91–1.5×</td><td class="near">0.34–0.64×</td><td>0.79–1.2×</td></tr>
+<tr><td>Other convolutions</td><td>1×1, stems</td><td class="near">0.33–1.15×</td><td>1.2–1.3×</td><td>0.49–1.7×</td></tr>
+<tr><td>Dependent dispatch</td><td>Tiny add after a barrier</td><td>—</td><td>1.1×</td><td class="near">0.20×</td></tr>
+<tr><td>Submit and wait</td><td>One tiny add, host time</td><td>—</td><td class="far">2.8×</td><td class="far">5.1×</td></tr>
 </table>
 
-**Long-K small GEMMs and the submission round trip are the clearest targets.** Splitting K, added since these runs, brings the worst GEMMs to 1.7–1.9×.
+**The submission round trip is now the clearest target.** Split-K took the worst small GEMM from 4.4× to 2.0×, and a larger tile took the Arc's 4096³ GEMM from 2.2× to 1.3×.
 
-<small>Both engines time 30 serial ops, except the round trip. These ratios do not partition model time.</small>
+<small>Both engines time 30 serial ops, except the round trip. RX 7900 XT: earlier build. Ratios do not partition model time.</small>
 
 <!--
 Time: 1:50.
@@ -778,42 +778,46 @@ mode the vendor libraries use ordinary f32 kernels, CUTLASS on NVIDIA, oneDNN
 on Intel and the ROCm libraries on AMD, so we compare kernels on the same
 execution units.
 
-Large GEMMs: the vendor libraries reach 1.7 to 2.2 times our throughput.
+Large GEMMs: the vendor libraries reach 1.3 to 1.7 times our throughput.
 Transformer-sized GEMMs from Whisper and the LLM are closer. The small GEMMs
-in the diffusion U-Net range from parity to our biggest loss. The worst are
-the ones with a long K: a 64-row product with K of 1024 takes 25 microseconds
-for us and 6 for cuBLAS, and 53 against 12 on the Arc. On the RX 7900 XT that
-shape takes 28 microseconds against 20. Its output gives our
-tiles fewer workgroups than the GPU has cores, and cuBLAS splits the K
-dimension for these shapes.
+in the diffusion U-Net range from parity to twice the vendor's time. The
+worst are the ones with a long K, whose output gives our tiles fewer
+workgroups than the GPU has cores. cuBLAS splits the K dimension for these
+shapes, and now so do we: a 64-row product with K of 1024 takes 11
+microseconds for us against 6 for cuBLAS, and 20 against 12 on the Arc. It
+took 25 and 53 before. The RX 7900 XT run predates split-K, at 28 against
+20.
 
 Convolutions split by vendor. On the RTX 5070 our Winograd 3×3 convolutions
-beat cuDNN, at 0.4 to 0.7 of its time. On the Arc, oneDNN runs one fused
-kernel where we run four, and we take up to 1.6 times its time. On the
-RX 7900 XT the same Winograd convolutions take 0.91 to 1.5 times MIOpen.
+beat cuDNN, at 0.3 to 0.6 of its time. On the Arc, oneDNN runs one fused
+kernel where we run three, and we take 0.8 to 1.2 times its time, down from
+up to 1.6 now that the weight transform runs once instead of every step. On
+the RX 7900 XT, measured before that change, they take 0.91 to 1.5 times
+MIOpen.
 
-These controls identify long-K small GEMMs and multi-pass convolutions as
-contributors to the U-Net gap. We have since added split-K: the 64-row,
-K of 1024 product now takes 1.7 to 1.9 times the vendor's time on the 5070
-and the Arc, down from 4.4. This study does not measure how much model time
-it recovers.
+The first round of these controls pointed at long-K small GEMMs and
+repeated Winograd weight transforms. The 5070 and Arc columns include both
+fixes and a larger GEMM tile. This study does not measure how much model
+time they recover.
 
 The last two rows are about the cost of running anything at all. A tiny add
 that waits on a barrier costs us about a microsecond on the 5070, close to
 PyTorch's 0.8 inside a CUDA graph. On the Arc it costs 1.7
-microseconds against PyTorch's 8.6, so Vulkan's barrier is the cheaper way
+microseconds against PyTorch's 8.5, so Vulkan's barrier is the cheaper way
 to order dependent work there. The host round trip is where we lose: one
-submission and wait takes 23 microseconds against 7 on the 5070, and 158
+submission and wait takes 19 microseconds against 7 on the 5070, and 159
 against 31 on the Arc. That matters whenever a step is short, such as decode.
 
 If asked:
-- Large GEMM: 13.3 against 22.0 TFLOP/s on the RX 7900 XT, 9.5 against
-  19.6 on the RTX 5070, 3.1 against 6.9 on the B570. This shows our kernel
+- Large GEMM: 13.3 against 22.0 TFLOP/s on the RX 7900 XT, 11.8 against
+  19.9 on the RTX 5070, 5.2 against 6.9 on the B570. This shows our kernel
   does not yet reach the vendor libraries' f32 throughput; it does not show
   that Vulkan can.
 - 4096³ needs more than the tuner's 64 MiB of scratch, so all three GPUs run
-  our default tile. 2048³, which the tuner covers, is 1.3× on the RX 7900 XT,
-  2.0× on the RTX 5070 and 2.0× on the Arc.
+  our default tile, now 128×64 on the 5070 and the Arc. A larger limit alone
+  does not help: the tuner's 2 s budget runs out first. 2048³, which the
+  tuner covers, is 1.3× on the RX 7900 XT, 1.6× on the RTX 5070 and 2.0× on
+  the Arc.
 - Timing: PyTorch's GPU time is a device interval around a graph of 30
   serial ops, divided by 30, with the profiler off (profiling slows ROCm
   down). Ours covers 30 copies of the op in one timed pass, with a barrier
@@ -823,14 +827,15 @@ If asked:
 - Shared memory is not the reason: the U-Net's largest generated kernel uses
   16 KiB of Vulkan's 48.
 - Barrier cost: 30 chained adds minus 30 independent ones in one barrier
-  group, per add: 0.83 µs on the RTX 5070, 1.37 µs on the B570. PyTorch's
-  stream orders both the same way, at 0.82 and 8.6 µs per add.
+  group, per add: 0.85 µs on the RTX 5070, 1.37 µs on the B570. PyTorch's
+  stream orders both the same way, at 0.85 and 8.5 µs per add.
 - Round trip: we block on a Vulkan timeline semaphore. Spinning on it
   instead cut a one-dispatch step from 28 to 11 µs on the 5070 and from 150
   to 96 µs on the Arc in a probe. The remaining 90 µs on ANV lies between
   submission and completion; we have not located it yet. PyTorch's XPU
   backend reaches 31 µs through the same kernel driver.
-- The RX 7900 XT dispatch rows have not been run yet.
+- The RX 7900 XT column is from 429a0e4, before split-K, cached Winograd
+  weights and the 128×64 tile; its dispatch rows have not been run yet.
 -->
 
 ---

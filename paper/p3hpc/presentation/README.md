@@ -34,7 +34,8 @@ replay. The ratio is **Meganeura time / PyTorch time**; below one is faster.
 Talk-only evidence in `data/`:
 
 - **Single operations:** `op-bench.tsv`, from `examples/op_bench.rs` and
-  `op-bench/torch_ops.py` on RTX 5070, Arc B570, and RX 7900 XT (November 8).
+  `op-bench/torch_ops.py` on RTX 5070 and Arc B570 at `d32a495`, and RX 7900 XT
+  at `429a0e4` (November 8).
   Strict f32, tuner on, cooperative matrices off; each native
   row is the median of three processes. Both engines time 30 serial ops and
   divide by 30. `op-bench/run_all.sh` reruns every shape. The `eltwise`
