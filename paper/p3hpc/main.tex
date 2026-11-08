@@ -625,10 +625,9 @@ matrices off. Three native processes and one PyTorch process run per shape;
 the artifact retains their protocol and summary. Operands differ between
 engines, so these are throughput probes rather than cross-engine numerical
 comparisons. PyTorch uses a device event around 30 serial graph operations,
-divided by 30. On RTX~5070 and B570 our time likewise covers 30 copies of the
-operation in one timed pass, with a barrier after every dispatch. The
-RX~7900~XT rows are from an earlier run that summed one timed pass per
-dispatch, which overstates our time on small operations.
+divided by 30. Our time likewise covers 30 copies of the
+operation in one timed pass, with a barrier after every dispatch, on all
+three GPUs.
 
 Small U-Net GEMMs take 0.93--4.40 times PyTorch's time on RTX~5070 and
 0.90--4.47 on B570; the long-K shapes are the slow ones. At
@@ -636,7 +635,7 @@ $64\times1024\times256$, cuBLAS uses split-K and takes 6\,$\mu$s versus our
 25; oneDNN takes 12 versus our 53. Our Winograd 3-by-3 convolutions take
 0.41--0.70 times cuDNN's time on RTX~5070 and 0.93--1.64 times oneDNN's on
 B570, where one fused vendor kernel replaces our four. Large $4096^3$ GEMMs
-trail by 1.65, 2.06 and 2.22 times on the three GPUs. These controls support
+trail by 1.66, 2.06 and 2.22 times on the three GPUs. These controls support
 kernel efficiency as an important part of the gap on Intel and NVIDIA,
 without measuring an unavoidable Vulkan penalty. Split-K for small outputs
 and fewer Winograd passes are testable hypotheses, not measured fixes. The
