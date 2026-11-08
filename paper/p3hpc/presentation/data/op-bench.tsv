@@ -127,3 +127,21 @@ b570	meganeura	conv	resnet-3x3-512@7	0.1686	0.1823	1.372	WinogradWeightTransform
 b570	pytorch	conv	resnet-3x3-512@7	0.1108	0.1309	2.087	graph-interval:conv_reorder+gen_conv
 b570	meganeura	conv	resnet-stem-7x7	0.0672	0.0745	3.510	Conv2dGemm[1]
 b570	pytorch	conv	resnet-stem-7x7	0.0460	0.0613	5.126	graph-interval:conv_reorder+gen_conv
+# Dispatch floor (eltwise rows), RTX 5070 and Arc B570 as above, November 8, 2026, Meganeura 031f7b5 with this file's op_bench.
+#   A 256-element f32 add. add-256: 30 chained adds, each reading the previous sum (a barrier after each dispatch);
+#   add-256-indep: 30 adds of the same input, one barrier group. PyTorch's stream runs both in order.
+#   add-256-single: one add per step, run without MEGANEURA_GPU_TIMING (gpu_ms NaN); wall_ms is one step() + wait() round trip,
+#   against one eager PyTorch add + synchronize. In the other two rows wall_ms is a step of 30 adds / 30 (Meganeura, timed)
+#   and 30 eager adds synchronized once / 30 (PyTorch).
+rtx5070	meganeura	eltwise	add-256	0.00096	0.00293	0.000	Add[256x0]
+rtx5070	pytorch	eltwise	add-256	0.00082	0.00374	0.000	graph-interval:void at::native::vectorized_elementwise_
+rtx5070	meganeura	eltwise	add-256-indep	0.00013	0.00116	0.002	Add[256x0]
+rtx5070	pytorch	eltwise	add-256-indep	0.00081	0.00338	0.000	graph-interval:void at::native::vectorized_elementwise_
+rtx5070	meganeura	eltwise	add-256-single	NaN	0.02252	NaN	Add[256x0]
+rtx5070	pytorch	eltwise	add-256-single	0.00080	0.00691	0.000	graph-interval:void at::native::vectorized_elementwise_
+b570	meganeura	eltwise	add-256	0.00173	0.00918	0.000	Add[256x0]
+b570	pytorch	eltwise	add-256	0.00858	0.00525	0.000	graph-interval:at::native::xpu::VectorizedElementwiseKe
+b570	meganeura	eltwise	add-256-indep	0.00036	0.00627	0.001	Add[256x0]
+b570	pytorch	eltwise	add-256-indep	0.00860	0.00519	0.000	graph-interval:at::native::xpu::VectorizedElementwiseKe
+b570	meganeura	eltwise	add-256-single	NaN	0.15798	NaN	Add[256x0]
+b570	pytorch	eltwise	add-256-single	0.00870	0.03057	0.000	graph-interval:at::native::xpu::VectorizedElementwiseKe

@@ -750,9 +750,9 @@ If asked:
 
 <!-- _class: ops -->
 
-# Kernel gaps
+# Kernel and dispatch gaps
 
-<p class="case-context">Strict f32, one GEMM or convolution, our GPU time ÷ PyTorch's. The vendor libraries run on the same f32 units we use.</p>
+<p class="case-context">Strict f32, one operation, our time ÷ PyTorch's. The vendor libraries run on the same f32 units we use.</p>
 
 <table class="ops">
 <tr><th>Operation</th><th>Shapes</th><th>RX 7900 XT</th><th>RTX 5070</th><th>Arc B570</th></tr>
@@ -761,14 +761,16 @@ If asked:
 <tr><td>Small GEMMs</td><td>Diffusion, M = 64–256</td><td class="near">0.57–1.4×</td><td class="far">0.93–4.4×</td><td class="far">0.90–4.5×</td></tr>
 <tr><td>3×3 convolutions</td><td>Diffusion, Vision</td><td>0.91–1.5×</td><td class="near">0.41–0.70×</td><td>0.93–1.6×</td></tr>
 <tr><td>Other convolutions</td><td>1×1, stems</td><td class="near">0.33–1.15×</td><td>1.2–1.25×</td><td>0.52–1.7×</td></tr>
+<tr><td>Dependent dispatch</td><td>Tiny add after a barrier</td><td>—</td><td>1.2×</td><td class="near">0.20×</td></tr>
+<tr><td>Submit and wait</td><td>One tiny add, host time</td><td>—</td><td class="far">3.3×</td><td class="far">5.2×</td></tr>
 </table>
 
-**Small GEMMs with a long K are the clearest target.** cuBLAS splits K for them; we do not yet.
+**Long-K small GEMMs and the submission round trip are the clearest targets.** Splitting K, added since these runs, brings the worst GEMMs to 1.7–1.9×.
 
-<small>Both engines time 30 serial ops. These ratios do not partition model time.</small>
+<small>Both engines time 30 serial ops, except the round trip. These ratios do not partition model time.</small>
 
 <!--
-Time: 1:30.
+Time: 1:50.
 
 To find where the gap is, we timed single operations against PyTorch: one
 GEMM or one convolution, strict f32, GPU time only, on three GPUs. In this
@@ -791,8 +793,18 @@ kernel where we run four, and we take up to 1.6 times its time. On the
 RX 7900 XT the same Winograd convolutions take 0.91 to 1.5 times MIOpen.
 
 These controls identify long-K small GEMMs and multi-pass convolutions as
-contributors to the U-Net gap. Split-K is the candidate to test; this study
-does not measure how much model time it would recover.
+contributors to the U-Net gap. We have since added split-K: the 64-row,
+K of 1024 product now takes 1.7 to 1.9 times the vendor's time on the 5070
+and the Arc, down from 4.4. This study does not measure how much model time
+it recovers.
+
+The last two rows are about the cost of running anything at all. A tiny add
+that waits on a barrier costs us about a microsecond on the 5070, close to
+PyTorch's 0.8 inside a CUDA graph. On the Arc it costs 1.7
+microseconds against PyTorch's 8.6, so Vulkan's barrier is the cheaper way
+to order dependent work there. The host round trip is where we lose: one
+submission and wait takes 23 microseconds against 7 on the 5070, and 158
+against 31 on the Arc. That matters whenever a step is short, such as decode.
 
 If asked:
 - Large GEMM: 13.3 against 22.0 TFLOP/s on the RX 7900 XT, 9.5 against
@@ -810,6 +822,15 @@ If asked:
   to 3.2 times slower.
 - Shared memory is not the reason: the U-Net's largest generated kernel uses
   16 KiB of Vulkan's 48.
+- Barrier cost: 30 chained adds minus 30 independent ones in one barrier
+  group, per add: 0.83 µs on the RTX 5070, 1.37 µs on the B570. PyTorch's
+  stream orders both the same way, at 0.82 and 8.6 µs per add.
+- Round trip: we block on a Vulkan timeline semaphore. Spinning on it
+  instead cut a one-dispatch step from 28 to 11 µs on the 5070 and from 150
+  to 96 µs on the Arc in a probe. The remaining 90 µs on ANV lies between
+  submission and completion; we have not located it yet. PyTorch's XPU
+  backend reaches 31 µs through the same kernel driver.
+- The RX 7900 XT dispatch rows have not been run yet.
 -->
 
 ---

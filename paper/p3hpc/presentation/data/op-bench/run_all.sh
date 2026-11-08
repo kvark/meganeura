@@ -2,7 +2,8 @@
 # Run every shape in shapes.txt through Meganeura and PyTorch on one GPU and
 # append rows to a TSV. Meganeura runs in three processes per shape, since
 # each process's kernel tuner can pick a different tile; the row with the
-# median GPU time is kept. PyTorch runs once per shape.
+# median GPU time is kept (the median wall time for an untimed single add).
+# PyTorch runs once per shape.
 #
 # Usage: run_all.sh <label> <meganeura-device-id> <python> <torch-device> [out.tsv]
 #   <torch-device> is "cuda" for CUDA and ROCm builds, "xpu" for Intel.
@@ -17,18 +18,23 @@ target_dir=$(cargo metadata --format-version 1 --no-deps --manifest-path "$root/
 bench="$target_dir/release/examples/op_bench"
 for s in $(grep -v '^#' "$here/shapes.txt" | awk 'NF{print $2}'); do
   runs=""
+  # A single add's wall time is a round trip; timestamps would lengthen it.
+  timing=1
+  if [[ $s == *-single ]]; then timing=0; fi
   for _ in 1 2 3; do
-    r=$(MEGANEURA_DEVICE_ID=$id MEGANEURA_TUNE=1 MEGANEURA_DISABLE_COOP=1 MEGANEURA_GPU_TIMING=1 \
-        timeout 180 "$bench" "$here/shapes.txt" "$s" 2>/dev/null | grep -P '^(gemm|conv)\t' | tail -1) || true
+    r=$(MEGANEURA_DEVICE_ID=$id MEGANEURA_TUNE=1 MEGANEURA_DISABLE_COOP=1 MEGANEURA_GPU_TIMING=$timing \
+        timeout 180 "$bench" "$here/shapes.txt" "$s" 2>/dev/null | grep -P '^(gemm|conv|eltwise)\t' | tail -1) || true
     if [ -n "$r" ]; then runs+="$r"$'\n'; fi
   done
   n=$(printf '%s' "$runs" | grep -c . || true) r=""
   if [ "$n" -gt 0 ]; then
-    r=$(printf '%s' "$runs" | sort -t$'\t' -k3,3g | sed -n "$(( (n + 1) / 2 ))p")
+    key=3
+    if [ "$timing" = 0 ]; then key=4; fi
+    r=$(printf '%s' "$runs" | sort -t$'\t' -k$key,${key}g | sed -n "$(( (n + 1) / 2 ))p")
   fi
   echo -e "$label\tmeganeura\t${r:-FAILED $s}" >> "$out"
   r=$(NVIDIA_TF32_OVERRIDE=0 timeout 180 "$py" -I "$here/torch_ops.py" "$here/shapes.txt" "$dev" "$s" 2>/dev/null \
-      | grep -P '^(gemm|conv)\t' | tail -1) || true
+      | grep -P '^(gemm|conv|eltwise)\t' | tail -1) || true
   echo -e "$label\tpytorch\t${r:-FAILED $s}" >> "$out"
 done
 echo "wrote $out"

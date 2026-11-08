@@ -7,7 +7,8 @@ divided by 30; median of 30 replays, no profiler. The interval includes the
 device's dispatch gaps between the 30 kernels but no host enqueue gaps.
 Graph outputs must match eager execution within 1e-6 of the output's largest
 magnitude (last-bit differences occur on XPU).
-wall_ms: median of 50 ordinary eager calls, each synchronized.
+wall_ms: median of 50 ordinary eager calls, each synchronized. For eltwise
+modes 0 and 1, 50 runs of 30 eager adds, synchronized once and divided by 30.
 The last column lists the vendor kernels from one untimed profiled call.
 """
 import statistics
@@ -47,7 +48,28 @@ for line in open(sys.argv[1]):
     if len(sys.argv) > 3 and name != sys.argv[3]:
         continue
     g = torch.Generator().manual_seed(1)
-    if kind == "gemm":
+    chain = None
+    if kind == "eltwise":
+        n, mode = d
+        x = torch.randn(n, generator=g).to(dev)
+        bias = torch.randn(n, generator=g).to(dev)
+        flops = n
+        if mode == 1:
+            # Each add reads the previous sum; graph replays restart from x.
+            state = [x]
+
+            def op():
+                state[0] = state[0] + bias
+                return state[0]
+
+            def chain():
+                y = x
+                for _ in range(SERIAL):
+                    y = y + bias
+                return y
+        else:
+            op = lambda: x + bias
+    elif kind == "gemm":
         m, k, n = d
         a = torch.randn(m, k, generator=g).to(dev)
         b = torch.randn(k, n, generator=g).to(dev)
@@ -69,10 +91,14 @@ for line in open(sys.argv[1]):
         wall = []
         for _ in range(50):
             t = time.perf_counter()
-            op()
+            per = SERIAL if kind == "eltwise" and mode != 2 else 1
+            for _ in range(per):
+                op()
             mod.synchronize()
-            wall.append((time.perf_counter() - t) * 1e3)
-        eager = op()
+            wall.append((time.perf_counter() - t) * 1e3 / per)
+        if chain is not None:
+            state[0] = x
+        eager = chain() if chain is not None else op()
         mod.synchronize()
 
         # Capture on a side stream after warming it, as graph capture requires.
@@ -84,9 +110,13 @@ for line in open(sys.argv[1]):
         mod.current_stream().wait_stream(side)
         graph = Graph()
         with (torch.cuda.graph(graph) if dev == "cuda" else torch.xpu.graph(graph)):
+            if chain is not None:
+                state[0] = x
             outs = [op() for _ in range(SERIAL)]
         graph.replay()
         mod.synchronize()
+        if chain is not None:
+            outs = outs[-1:]
         # oneDNN's accumulation order can change the last bit between calls.
         scale = eager.abs().max().item()
         worst = max((o - eager).abs().max().item() for o in outs)
@@ -106,7 +136,7 @@ for line in open(sys.argv[1]):
             times.append(begin.elapsed_time(end) / SERIAL)
     gpu = statistics.median(times)
     print(
-        f"{kind}\t{name}\t{gpu:.4f}\t{statistics.median(wall):.4f}\t"
+        f"{kind}\t{name}\t{gpu:.5f}\t{statistics.median(wall):.5f}\t"
         f"{flops / gpu / 1e9:.3f}\tgraph-interval:{kernel_names(op)}",
         flush=True,
     )
