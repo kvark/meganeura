@@ -39,10 +39,10 @@
         <h3>RTX 3050</h3>
         <p class="os">Windows 11 · driver 610.88</p>
         <p class="pass">30/30</p>
-        <p class="ref">checked against CPU f32; PyTorch CUDA crashed here</p>
+        <p class="ref">checked against CPU PyTorch f32</p>
       </div>
     </div>
-    <p class="caption">Cells that pass the numerical gates, out of 5 workloads × 2 precisions × 3 phases.</p>
+    <p class="caption">Cells that pass the numerical gates, out of 5 workloads × 2 precisions × 3 phases. The same Vulkan code path runs on Linux and Windows drivers.</p>
 
     <div class="flow">
       <div>Tensor graph<small>+ autodiff</small></div>
@@ -59,25 +59,24 @@
     </div>
     <p class="caption">Install size, to scale. Meganeura links no vendor libraries; PyTorch ships cuBLAS, cuDNN and Triton in 29 wheels.</p>
 
-    <h2><span>2</span>In use: from Windows to a headset</h2>
-    <div class="dino">
-      <img src="../figures/dinovision-quest3s.jpg" alt="The headset's reconstruction of its camera frame">
-      <div>
-        <p class="step"><b>Train</b> an image decoder over DINOv3 features with Adam on the RTX 3050 under Windows, through Vulkan.</p>
-        <p class="step"><b>Deploy</b> the weights to a Quest 3S headset (Adreno GPU), sharing one Vulkan queue with OpenXR rendering.</p>
-        <p class="caption">Same engine on both; no second GPU runtime. Image: the headset's reconstruction of its camera frame.</p>
-      </div>
-    </div>
     <div class="fine">
       <h3>How we measured</h3>
       <p><b>Reference:</b> PyTorch 2.13, <code>torch.compile</code>, CUDA graph replay. <b>Strict:</b> f32 throughout, TF32 off. <b>Reduced:</b> PyTorch autocast BF16; Meganeura searches F16/BF16 products, with f32 parameters, loss and accumulation.</p>
       <p><b>Workloads:</b> SmolLM2-135M (public checkpoint), SmolVLA action expert, scaled 10.9M-parameter SD 1.x U-Net, ResNet-50 (folded normalization), Whisper-tiny encoder; all but SmolLM2 use synthetic weights. <b>Phases:</b> batch or 128-token prefill; one token without a KV cache (not decode latency); forward, loss and backward without an optimizer update.</p>
       <p><b>Gates:</b> Meganeura checks full outputs and single-step gradients against an f32 build; PyTorch checks its forward against eager f32 and its training against an SGD trajectory; across engines, sampled outputs, loss and gradient norms must agree. <b>Timing:</b> 10 s warmup, 20 samples, 3 processes.</p>
     </div>
+    <div class="box">
+      <h3>Driver finding</h3>
+      <p>Driver 595 reads zeros from a dynamically indexed nested local array (<code>array&lt;array&lt;f32,4&gt;,8&gt;</code>, rows 4–7). Flat accumulators avoid it.</p>
+    </div>
+    <div class="box next">
+      <h3>Next</h3>
+      <p>Cooperative-matrix GEMM against cuBLAS BF16 · fused attention · <code>VK_NV_cooperative_matrix2</code> · fewer round trips per step.</p>
+    </div>
   </section>
 
   <section class="col">
-    <h2><span>3</span>Against CUDA PyTorch</h2>
+    <h2><span>2</span>Against CUDA PyTorch</h2>
     <figure>
       <img src="figures/ratios.svg" alt="Ratio grid: five workloads by three phases, strict and reduced precision, on RTX 5070 and H100">
       <figcaption>Meganeura time / PyTorch time (<b>below 1: Meganeura faster</b>). n/q: no qualified PyTorch reference.</figcaption>
@@ -95,7 +94,7 @@
   </section>
 
   <section class="col">
-    <h2><span>4</span>Where the time goes: RTX 5070</h2>
+    <h2><span>3</span>Where the time goes: RTX 5070</h2>
     <figure>
       <img src="figures/single-ops.svg" alt="Single GEMM, convolution and dispatch ratios against PyTorch on RTX 5070, with earlier values">
       <figcaption>One strict-f32 operation, batch 1, cooperative matrices off; both engines time 30 serial copies. The last row compares host round trips.</figcaption>
@@ -108,14 +107,6 @@
       <li class="slow"><b>Submit + wait: 19 vs 7 µs</b> per host round trip.</li>
       <li class="open"><b>Tensor cores: not yet isolated.</b> No TF32 inputs or Hopper warpgroup MMA from Vulkan; their cost needs kernel profiles.</li>
     </ul>
-    <div class="box">
-      <h3>Driver finding</h3>
-      <p>Driver 595 reads zeros from a dynamically indexed nested local array (<code>array&lt;array&lt;f32,4&gt;,8&gt;</code>, rows 4–7). Flat accumulators avoid it.</p>
-    </div>
-    <div class="box next">
-      <h3>Next</h3>
-      <p>Cooperative-matrix GEMM against cuBLAS BF16 · fused attention · <code>VK_NV_cooperative_matrix2</code> · fewer round trips per step.</p>
-    </div>
   </section>
 
   <footer>

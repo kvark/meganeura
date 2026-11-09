@@ -150,7 +150,7 @@ def single_ops():
         if gpu == "rtx5070":
             # The single-submit row has no device time; it compares host round trips.
             rows[shape, engine] = float(wall_ms if shape == "add-256-single" else gpu_ms)
-    fig, ax = plt.subplots(figsize=(13.2, 15.2))
+    fig, ax = plt.subplots(figsize=(13.2, 17.6))
     y, ticks, labels = 0, [], []
     for group, shapes in OPS:
         ax.text(-.02, y + .1, group, fontsize=19, weight="bold", color=INK, va="center", ha="right",
