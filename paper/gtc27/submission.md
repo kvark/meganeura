@@ -46,7 +46,8 @@ the poster covers NVIDIA.
 and three phases, 30 cells per GPU. Every native cell passes the numerical
 gates: 36 on the RTX 5070 (Blackwell, Linux, driver 595.91.07, adding
 SmolLM2-360M), 42 on the H100 80GB HBM3 (Hopper, Linux, 595.91.07, adding
-SmolLM2-360M and 1.7B), and 30 on the RTX 3050 (Ampere, Windows 11, driver
+SmolLM2-360M and 1.7B; 1.7B does not fit the RTX 5070's 12 GB), and 30 on the
+RTX 3050 (Ampere, Windows 11, driver
 610.88). The RTX 3050 cells are checked against CPU PyTorch f32 and have no
 GPU timing comparison.
 
