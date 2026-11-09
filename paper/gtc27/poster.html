@@ -13,88 +13,113 @@
       <p class="byline">Dzmitry Malyshau · Independent Researcher · kvark@fastmail.com · <b>github.com/kvark/meganeura</b></p>
     </div>
     <div class="claim">
-      <p><b>One 19 MiB Rust engine</b>, compiled to Vulkan compute shaders, matches CUDA PyTorch's strict-f32 inference speed on RTX&nbsp;5070 across five benchmark workloads. Training and reduced precision still trail; single-operation probes find losses in f32 GEMM kernels and host submission.</p>
+      <p><b>A 19 MiB Rust engine</b> trains and runs models on NVIDIA GPUs through the Vulkan driver alone. Strict-f32 inference matches CUDA PyTorch on RTX&nbsp;5070; the gap is in training, reduced precision and a few kernels.</p>
     </div>
   </header>
 
   <section class="col">
-    <h2><span>1</span>Question</h2>
-    <p>On NVIDIA hardware, machine learning means CUDA. The same GPUs also run Vulkan, with compute shaders, subgroups and tensor cores through <code>VK_KHR_cooperative_matrix</code>. Vulkan is already on nearly every GPU. <b>How close does a compact engine get to CUDA PyTorch through that path, and where is the time lost?</b></p>
+    <h2><span>1</span>Three NVIDIA GPUs, one engine</h2>
+    <div class="gpus">
+      <div>
+        <p class="arch">Blackwell · desktop</p>
+        <h3>RTX 5070</h3>
+        <p class="os">Linux · driver 595.91.07</p>
+        <p class="pass">30/30</p>
+        <p class="ref">timed against PyTorch CUDA</p>
+      </div>
+      <div>
+        <p class="arch">Hopper · data center</p>
+        <h3>H100 SXM</h3>
+        <p class="os">Linux · driver 595.91.07</p>
+        <p class="pass">30/30</p>
+        <p class="ref">timed against PyTorch CUDA</p>
+      </div>
+      <div class="win">
+        <p class="arch">Ampere · desktop</p>
+        <h3>RTX 3050</h3>
+        <p class="os">Windows 11 · driver 610.88</p>
+        <p class="pass">30/30</p>
+        <p class="ref">checked against CPU f32; PyTorch CUDA crashed here</p>
+      </div>
+    </div>
+    <p class="caption">Cells that pass the numerical gates, out of 5 workloads × 2 precisions × 3 phases.</p>
 
-    <h2><span>2</span>Meganeura</h2>
-    <p>A compiler and runtime in about 54k lines of Rust. It differentiates tensor graphs and lowers them, with their gradients, to WGSL compute shaders. Graph rewrites and matrix schedules live in an e-graph, and the engine chooses among programs by timing them on the device it runs on.</p>
     <div class="flow">
       <div>Tensor graph<small>+ autodiff</small></div>
-      <div>E-graph<small>rewrites, tiles, precision</small></div>
+      <div>E-graph<small>rewrites, tiles</small></div>
       <div>WGSL<small>113 shaders</small></div>
       <div>SPIR-V<small>naga</small></div>
-      <div>Vulkan<small>Blade</small></div>
+      <div>Vulkan<small>any driver</small></div>
     </div>
-    <div class="flow search"><div>Time candidates on the GPU, keep programs that pass the numerical gates <small>30 s per session</small></div></div>
-    <table class="footprint">
-      <tr><th></th><th>Meganeura</th><th>PyTorch CUDA</th></tr>
-      <tr><td>Install size</td><td><b>19.4 MiB</b> runner</td><td>4.42 GiB, 29 wheels</td></tr>
-      <tr><td>GPU API</td><td>Vulkan 1.3</td><td>CUDA 13.0</td></tr>
-      <tr><td>Libraries</td><td>none</td><td>cuBLAS, cuDNN, Triton</td></tr>
-    </table>
-    <p class="note">The same Linux binary also runs on AMD and Intel GPUs through Vulkan, and a macOS build of the same source targets Apple GPUs through Metal. This poster covers NVIDIA only.</p>
+    <p class="caption">Programs are picked by timing candidates on the device; only those that pass the gates count.</p>
 
-    <h2><span>3</span>Method</h2>
-    <ul>
-      <li><b>GPUs:</b> GeForce RTX 5070 (Blackwell) and H100 80GB HBM3, Linux, driver 595.91.07 for both Vulkan and CUDA.</li>
-      <li><b>Reference:</b> PyTorch 2.13, <code>torch.compile</code> with CUDA graph replay.</li>
-      <li><b>Workloads:</b> SmolLM2-135M (public checkpoint), the SmolVLA action expert, a scaled 10.9M-parameter SD 1.x U-Net, ResNet-50 with folded normalization, and the Whisper-tiny encoder. All but SmolLM2 use synthetic weights.</li>
-      <li><b>Phases:</b> a batch or 128-token prefill forward; a minimal-shape forward (one token, no KV cache, so not decode latency); forward, loss and backward without an optimizer update.</li>
-      <li><b>Strict f32:</b> f32 inputs, accumulation and outputs; TF32 off.</li>
-      <li><b>Reduced precision:</b> PyTorch autocast BF16. Meganeura may select F16/BF16 cooperative-matrix products, keeping parameters, loss and accumulation in f32.</li>
-      <li><b>Gates before timing, per engine:</b> Meganeura checks full outputs and full single-step gradients against an f32 reference build (token KL for the language model at reduced precision). PyTorch checks its forward against eager f32 and its training against a matched SGD trajectory. Across engines, sampled outputs, loss and gradient norms must agree.</li>
-      <li><b>Timing:</b> 10 s warmup, 20 samples, 3 processes. Ratio = Meganeura time / PyTorch time; <b class="fast">below 1 is faster</b>.</li>
-    </ul>
+    <div class="size">
+      <p><span>Meganeura</span><i class="bar ours"></i><b>19.4 MiB</b></p>
+      <p><span>PyTorch CUDA</span><i class="bar theirs"></i><b>4.42 GiB</b></p>
+    </div>
+    <p class="caption">Install size, to scale. Meganeura links no vendor libraries; PyTorch ships cuBLAS, cuDNN and Triton in 29 wheels.</p>
+
+    <h2><span>2</span>In use: from Windows to a headset</h2>
+    <div class="dino">
+      <img src="../figures/dinovision-quest3s.jpg" alt="The headset's reconstruction of its camera frame">
+      <div>
+        <p class="step"><b>Train</b> an image decoder over DINOv3 features with Adam on the RTX 3050 under Windows, through Vulkan.</p>
+        <p class="step"><b>Deploy</b> the weights to a Quest 3S headset (Adreno GPU), sharing one Vulkan queue with OpenXR rendering.</p>
+        <p class="caption">Same engine on both; no second GPU runtime. Image: the headset's reconstruction of its camera frame.</p>
+      </div>
+    </div>
+    <div class="fine">
+      <h3>How we measured</h3>
+      <p><b>Reference:</b> PyTorch 2.13, <code>torch.compile</code>, CUDA graph replay. <b>Strict:</b> f32 throughout, TF32 off. <b>Reduced:</b> PyTorch autocast BF16; Meganeura searches F16/BF16 products, with f32 parameters, loss and accumulation.</p>
+      <p><b>Workloads:</b> SmolLM2-135M (public checkpoint), SmolVLA action expert, scaled 10.9M-parameter SD 1.x U-Net, ResNet-50 (folded normalization), Whisper-tiny encoder; all but SmolLM2 use synthetic weights. <b>Phases:</b> batch or 128-token prefill; one token without a KV cache (not decode latency); forward, loss and backward without an optimizer update.</p>
+      <p><b>Gates:</b> Meganeura checks full outputs and single-step gradients against an f32 build; PyTorch checks its forward against eager f32 and its training against an SGD trajectory; across engines, sampled outputs, loss and gradient norms must agree. <b>Timing:</b> 10 s warmup, 20 samples, 3 processes.</p>
+    </div>
   </section>
 
   <section class="col">
-    <h2><span>4</span>Model results</h2>
+    <h2><span>3</span>Against CUDA PyTorch</h2>
     <figure>
-      <img src="figures/ratios.svg" alt="Ratio grid: five models by three phases, strict and reduced precision, on RTX 5070 and H100">
-      <figcaption>Meganeura time / PyTorch time per model and phase. Bold teal cells are Meganeura wins. "n/q": PyTorch's reduced-precision U-Net on H100 failed the forward-fidelity gate.</figcaption>
+      <img src="figures/ratios.svg" alt="Ratio grid: five workloads by three phases, strict and reduced precision, on RTX 5070 and H100">
+      <figcaption>Meganeura time / PyTorch time (<b>below 1: Meganeura faster</b>). n/q: no qualified PyTorch reference.</figcaption>
     </figure>
     <div class="tiles">
-      <div><p class="label">RTX 5070, strict f32</p><p class="big">1.02<span>×</span></p><p>inference, geometric mean</p><p class="small">0.96 minimal shape · 1.49 training</p></div>
-      <div><p class="label">H100, strict f32</p><p class="big">1.30<span>×</span></p><p>inference, geometric mean</p><p class="small">1.06 minimal shape · 1.81 training</p></div>
-      <div class="warm"><p class="label">RTX 5070, reduced</p><p class="big">2.81<span>×</span></p><p>training, geometric mean</p><p class="small">H100 5.24 · inference 1.89 / 3.55</p></div>
+      <div><p class="label">RTX 5070 · strict</p><p class="big">1.02<span>×</span></p><p>inference</p><p class="small">training 1.49</p></div>
+      <div><p class="label">H100 · strict</p><p class="big">1.30<span>×</span></p><p>inference</p><p class="small">training 1.81</p></div>
+      <div class="warm"><p class="label">RTX 5070 · reduced</p><p class="big">2.81<span>×</span></p><p>training</p><p class="small">H100 5.24</p></div>
     </div>
+    <p class="caption tiles-note">Geometric means over the five workloads.</p>
     <figure>
       <img src="figures/precision-gains.svg" alt="Speedup each engine gains from reduced precision, by GPU and phase">
-      <figcaption><b>The gap opens at reduced precision.</b> Over the same qualified models, autocast BF16 speeds PyTorch up 2.1–3.0×, and Meganeura's searched precision policy 1.1–1.4×. These are whole-model times, including unconverted operations, partial backward coverage and conversions; they do not measure tensor-core kernels. The ratios compose exactly: RTX 5070 training goes from 1.49 strict to 1.49 × 2.27 / 1.20 = <b>2.81</b>.</figcaption>
+      <figcaption><b>The gap opens at reduced precision.</b> BF16 speeds PyTorch up 2.1–3.0×; Meganeura's precision policy 1.1–1.4×. These are whole-model gains (partial coverage, conversions included), not tensor-core kernel measurements.</figcaption>
     </figure>
-    <p>With strict f32 and TF32 off, Meganeura is at parity for RTX 5070 inference on these workloads. It is faster for ResNet-50 (0.74), the U-Net (0.80) and the one-token SmolLM2 forward (0.84). Training trails by 1.2–2.0× on the RTX 5070 and 1.2–3.0× on the H100. Whisper is the outlier: the search has not found a competitive long-sequence attention, giving 3.2× on the RTX 5070 and 7.4× on the H100 at reduced precision.</p>
-    <div class="box next">
-      <h3>Next</h3>
-      <p>Cooperative-matrix GEMM probes against cuBLAS BF16; fused attention; larger f32 GEMM tiles; <code>VK_NV_cooperative_matrix2</code>; fewer host round trips per step.</p>
-    </div>
   </section>
 
   <section class="col">
-    <h2><span>5</span>Gap analysis on RTX 5070</h2>
+    <h2><span>4</span>Where the time goes: RTX 5070</h2>
     <figure>
       <img src="figures/single-ops.svg" alt="Single GEMM, convolution and dispatch ratios against PyTorch on RTX 5070, with earlier values">
-      <figcaption>Strict f32, batch 1, tuner on, cooperative matrices off. Both engines time 30 serial copies and divide by 30: PyTorch with device events around one CUDA graph replay, Meganeura with one timestamped pass and a barrier after every dispatch. The submit-and-wait row compares host round trips.</figcaption>
+      <figcaption>One strict-f32 operation, batch 1, cooperative matrices off; both engines time 30 serial copies. The last row compares host round trips.</figcaption>
     </figure>
-    <ol class="findings">
-      <li><b>Dense f32 GEMM: 1.3–1.7× cuBLAS.</b> With TF32 off, cuBLAS also runs CUTLASS SIMT kernels on CUDA cores, so this is a like-for-like kernel gap: 11.8 against 19.9 TFLOP/s at 4096³. A 128×64 tile with an 8×4 register block per thread cut it from 2.06×.</li>
-      <li><b>Small long-K GEMMs: split-K.</b> cuBLAS splits the K dimension. Adding split-K took 64×1024→256 from 4.40× to 1.88×, at the cost of one reduction dispatch per product.</li>
-      <li><b>3×3 convolutions are faster.</b> Winograd in three dispatches takes 0.34–0.64× of cuDNN's batch-1 time, once weight transforms are cached across steps.</li>
-      <li><b>Tensor cores: not yet isolated.</b> These probes run with cooperative matrices off, so the 1.1–1.4× whole-model gain cannot be split between coverage, conversions and kernel efficiency. The path also lacks TF32 inputs and control of Hopper warpgroup MMA, TMA and clusters; their cost on H100 needs kernel-level profiles.</li>
-      <li><b>Dispatch is at parity; submission is not.</b> A dependent dispatch with a barrier costs 0.97 µs, against 0.85 µs per op inside a CUDA graph. Independent dispatches take 0.12 µs. One submit-and-wait takes 19.4 µs against 6.9 µs for an eager PyTorch op and synchronize.</li>
-    </ol>
+    <ul class="takeaways">
+      <li class="slow"><b>f32 GEMM: 1.3–1.7× cuBLAS.</b> Both run on CUDA cores; 11.8 vs 19.9 TFLOP/s at 4096³.</li>
+      <li class="fixed"><b>Split-K:</b> long-K GEMMs went from 4.4× to 1.9×.</li>
+      <li class="fast"><b>Winograd 3×3: 0.34–0.64×</b> of cuDNN's batch-1 time.</li>
+      <li class="even"><b>Dispatch ≈ CUDA graph:</b> 0.97 vs 0.85 µs per dependent op.</li>
+      <li class="slow"><b>Submit + wait: 19 vs 7 µs</b> per host round trip.</li>
+      <li class="open"><b>Tensor cores: not yet isolated.</b> No TF32 inputs or Hopper warpgroup MMA from Vulkan; their cost needs kernel profiles.</li>
+    </ul>
     <div class="box">
       <h3>Driver finding</h3>
-      <p>On driver 595, a dynamically indexed nested function-local array such as <code>array&lt;array&lt;f32,4&gt;,8&gt;</code> reads zero for outer indices at or above the inner length. Our 8×4 GEMM tile first looked fast because it dropped half its rows. A flat accumulator avoids it, and a raw-<code>ash</code> reproducer is reported.</p>
+      <p>Driver 595 reads zeros from a dynamically indexed nested local array (<code>array&lt;array&lt;f32,4&gt;,8&gt;</code>, rows 4–7). Flat accumulators avoid it.</p>
+    </div>
+    <div class="box next">
+      <h3>Next</h3>
+      <p>Cooperative-matrix GEMM against cuBLAS BF16 · fused attention · <code>VK_NV_cooperative_matrix2</code> · fewer round trips per step.</p>
     </div>
   </section>
 
   <footer>
-    <p>Model results: P3HPC cohort of October 31 – November 1, 2026 (Meganeura <code>567028b8</code>, Inferena <code>a0799e42</code>, PyTorch 2.13.0), 57 qualified NVIDIA ratios. Single operations: November 8, 2026, Meganeura <code>d32a495</code>, RTX 5070, median of three native processes. Ratios from single operations do not partition model time. Full protocol, archives and replay: D. Malyshau, “Meganeura: Vulkan and Metal as a Performance-Portability Layer for GPU Training and Inference,” P3HPC workshop at SC26.</p>
+    <p>Model results: P3HPC cohort, October 31 – November 1, 2026 (Meganeura <code>567028b8</code>, PyTorch 2.13.0), 57 qualified NVIDIA ratios. Single operations: November 8, 2026, Meganeura <code>d32a495</code>; they locate losses and do not partition model time. Protocol, archives and replay: D. Malyshau, “Meganeura: Vulkan and Metal as a Performance-Portability Layer for GPU Training and Inference,” P3HPC at SC26.</p>
   </footer>
 </main>
 </body>
