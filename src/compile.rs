@@ -116,7 +116,9 @@ pub struct TuningKnobs {
 impl Default for TuningKnobs {
     /// Pure per-platform defaults. Apple Silicon benefits from the extra
     /// parallelism of smaller EPT; 32 keeps register count below the
-    /// spilling cliff on Ampere/Blackwell. `MEGANEURA_FLASH_*_EPT_CAP`
+    /// spilling cliff on Ampere/Blackwell. Backward starts at 16 to limit
+    /// register pressure; measured search also compares wider lanes.
+    /// `MEGANEURA_FLASH_*_EPT_CAP`
     /// overrides are applied only by [`TuningKnobs::from_env`] (in
     /// `crate::config`) — the library itself never reads the environment.
     /// Matmul K stage and column interleave stay at these defaults. Measured
@@ -127,8 +129,8 @@ impl Default for TuningKnobs {
         Self {
             flash_ept_cap: fwd,
             flash: crate::codegen::FlashAttentionShape::default(),
-            flash_grad_q_ept_cap: fwd,
-            flash_grad_kv_ept_cap: if apple { 8 } else { 32 },
+            flash_grad_q_ept_cap: 16,
+            flash_grad_kv_ept_cap: if apple { 8 } else { 16 },
             matmul_k_stage: 32,
             matmul_interleave_columns: false,
         }
