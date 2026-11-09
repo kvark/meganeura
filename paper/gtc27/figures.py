@@ -58,30 +58,35 @@ def shade(value):
     return fill, ("white" if depth > .55 else INK)
 
 
-def ratio_grid():
-    fig, axes = plt.subplots(1, 2, figsize=(13.2, 8.6), gridspec_kw={"wspace": .06})
+def ratio_grid(rows, name, height):
+    """One heat grid per GPU; rows are (label, model, archive suffix)."""
+    fig, axes = plt.subplots(1, 2, figsize=(13.2, height), gridspec_kw={"wspace": .06})
     for ax, (device, label) in zip(axes, DEVICES.items()):
-        for row, model in enumerate(MODELS):
+        for row, (_, model, suffix) in enumerate(rows):
             for col, (profile, phase) in enumerate((p, ph) for p in ("strict", "accelerated") for ph, _ in PHASES):
-                pair = times(device, model, profile, phase)
+                x = col + (.25 if col >= 3 else 0)
+                if (device + suffix, model, profile, phase) not in DATA:
+                    ax.text(x + .5, row + .5, "–", ha="center", va="center", fontsize=21, color=MUTED)
+                    continue
+                pair = times(device + suffix, model, profile, phase)
                 value = pair[0] / pair[1] if pair else None
                 fill, ink = shade(value)
-                x = col + (.25 if col >= 3 else 0)
                 ax.add_patch(Rectangle((x + .04, row + .05), .92, .9, facecolor=fill, linewidth=0))
                 ax.text(x + .5, row + .5, f"{value:.2f}" if value else "n/q", ha="center", va="center",
                         fontsize=21, color=ink, weight="bold" if value and value < 1 else "normal")
         ax.set_xlim(0, 6.25)
-        ax.set_ylim(len(MODELS), -1.15)
+        ax.set_ylim(len(rows), -1.15)
         ax.set_xticks([c + .5 + (.25 if c >= 3 else 0) for c in range(6)],
                       [name for _ in range(2) for _, name in PHASES], fontsize=15)
-        ax.set_yticks([r + .5 for r in range(len(MODELS))], SHORT if ax is axes[0] else [])
+        ax.set_yticks([r + .5 for r in range(len(rows))], [r[0] for r in rows] if ax is axes[0] else [])
         ax.tick_params(length=0)
         ax.spines[:].set_visible(False)
         ax.text(3.125, -1.0, label, ha="center", va="center", fontsize=25, weight="bold", color=INK)
         ax.text(1.5, -.45, "strict f32", ha="center", va="center", fontsize=19, color=MUTED)
         ax.text(4.75, -.45, "reduced precision", ha="center", va="center", fontsize=19, color=MUTED)
-    fig.subplots_adjust(left=.19, right=.995, top=.99, bottom=.13)
-    save(fig, "ratios.svg")
+    # Keep the cell size of the five-row grid: 8.6 in holds 6.15 grid units plus axis labels.
+    fig.subplots_adjust(left=.19, right=.995, top=1 - .08 / height, bottom=1.12 / height)
+    save(fig, name)
 
 
 def geomean(values):
@@ -100,7 +105,7 @@ def precision_gains():
                     native.append(strict[0] / accel[0])
                     torch.append(strict[1] / accel[1])
             groups.append((f"{label}\n{name.replace(chr(10), ' ')}", geomean(torch), geomean(native), len(torch)))
-    fig, ax = plt.subplots(figsize=(13.2, 9.2))
+    fig, ax = plt.subplots(figsize=(13.2, 6.6))
     height = .36
     for i, (name, torch, native, n) in enumerate(groups):
         y = i + (.5 if i >= 3 else 0)
@@ -122,5 +127,7 @@ def precision_gains():
     save(fig, "precision-gains.svg")
 
 
-ratio_grid()
+ratio_grid([(short, model, "") for short, model in zip(SHORT, MODELS)], "ratios.svg", 8.6)
+ratio_grid([("SmolLM2-360M", "SmolLM2-360M", "-large"), ("SmolLM2-1.7B", "SmolLM2-1.7B", "-large")],
+           "sizes.svg", 5.0)
 precision_gains()

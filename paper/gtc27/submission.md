@@ -42,11 +42,13 @@ full-gradient checks. The same Linux binary runs on AMD and Intel GPUs through
 Vulkan, and a macOS build of the same source targets Apple GPUs through Metal;
 the poster covers NVIDIA.
 
-**Three NVIDIA GPUs.** Each GPU runs five workloads under two precisions and
-three phases, 30 cells, and all 30 pass the numerical gates on each: RTX 5070
-(Blackwell, Linux, driver 595.91.07), H100 80GB HBM3 (Hopper, Linux, 595.91.07)
-and RTX 3050 (Ampere, Windows 11, driver 610.88). The RTX 3050 cells are
-checked against CPU PyTorch f32 and have no GPU timing comparison.
+**Three NVIDIA GPUs.** The core suite is five workloads under two precisions
+and three phases, 30 cells per GPU. Every native cell passes the numerical
+gates: 36 on the RTX 5070 (Blackwell, Linux, driver 595.91.07, adding
+SmolLM2-360M), 42 on the H100 80GB HBM3 (Hopper, Linux, 595.91.07, adding
+SmolLM2-360M and 1.7B), and 30 on the RTX 3050 (Ampere, Windows 11, driver
+610.88). The RTX 3050 cells are checked against CPU PyTorch f32 and have no
+GPU timing comparison.
 
 **Benchmarking methodology.** Timing uses the RTX 5070 and H100, with driver
 595.91.07 serving both Vulkan and CUDA. The reference is PyTorch 2.13 with
@@ -65,8 +67,8 @@ reference build, using token KL for the language model at reduced precision.
 PyTorch checks its forward against eager f32 and its training against a
 matched SGD trajectory. Across engines, sampled outputs, loss and gradient
 norms must agree. Timing uses a 10 s warmup, 20 samples and three processes. We report Meganeura time
-divided by PyTorch time, so values below 1 favor Meganeura. Fifty-seven NVIDIA
-ratios qualified.
+divided by PyTorch time, so values below 1 favor Meganeura. Seventy-two NVIDIA
+ratios qualified: 57 in the core suite and 15 for the larger SmolLM2 models.
 
 **Model results.** Strict-f32 geometric means are 1.02 (inference), 0.96
 (minimal shape) and 1.49 (training) on RTX 5070, and 1.30, 1.06 and 1.81 on
@@ -80,7 +82,10 @@ The
 ratios compose exactly: RTX 5070 training goes from 1.49 to 1.49 × 2.27 / 1.20
 = 2.81. Whisper is the outlier, at 3.2× on RTX 5070 and 7.4× on H100 under
 reduced precision; the search has not found a competitive long-sequence
-attention.
+attention. Larger models do not close the gap on H100: strict
+training goes from 1.86 at SmolLM2-135M to 1.96 at 360M and 3.77 at 1.7B
+(135.0 against 35.8 ms). On the RTX 5070, 360M strict ratios are 1.11
+(prefill), 0.93 (one token) and 1.78 (training).
 
 **Gap analysis.** A single-operation study times strict-f32 GEMMs,
 convolutions and dispatches on RTX 5070, with RX 7900 XT and Arc B570 for
