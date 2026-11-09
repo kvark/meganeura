@@ -98,8 +98,9 @@ pub(crate) enum Kind {
 
 /// Register tiles of the scalar kernels, widest first.
 const TILES: [u32; 3] = [64, 32, 16];
-/// Workgroups a scalar tiling needs to occupy the device.
-const OCCUPIED: u32 = 64;
+/// Workgroups a tiling needs to occupy the device. Wide checked tiles are
+/// offered only above it too.
+pub(crate) const OCCUPIED: u32 = 64;
 /// With f32 cooperative matrices, the 64-wide tile is kept from this many
 /// workgroups on, so session construction can promote it.
 const COOPERATIVE_CANDIDATE: u32 = 16;

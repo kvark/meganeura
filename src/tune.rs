@@ -161,7 +161,7 @@ impl TuneConv2d {
     }
 
     /// Input, weight, upstream gradient: physical elements, not an im2col matrix.
-    fn elements(self) -> Option<[u32; 3]> {
+    pub(crate) fn elements(self) -> Option<[u32; 3]> {
         Some([
             self.batch
                 .checked_mul(self.in_channels)?
@@ -1096,10 +1096,35 @@ impl TuneClass {
                 .collect();
         }
         if self.conv2d.is_some() && self.matrix_types.is_some() {
-            return std::iter::once(crate::codegen::CheckedTile::BASE)
-                .chain(crate::codegen::CheckedTile::WIDE)
-                .map(|tile| MatmulTile::CooperativeChecked { splits: 1, tile })
-                .filter(|&tile| tile != initial && tile.fits(self))
+            // A wide tile divides the grid by its blocks. Below the scalar
+            // convolution's occupancy that leaves the device idle: every
+            // batch-1 U-Net convolution measured slower on the RTX 5070,
+            // while the ResNet stem's 196-group 64x64 grid ran 26% faster.
+            let occupies = |tile: &MatmulTile| {
+                tile.workgroups(self)
+                    .into_iter()
+                    .map(u64::from)
+                    .product::<u64>()
+                    >= u64::from(crate::kernels::conv::OCCUPIED)
+            };
+            use crate::codegen::CheckedTile;
+            return std::iter::once(CheckedTile::BASE)
+                .chain(CheckedTile::WIDE)
+                .map(|shape| {
+                    (
+                        shape,
+                        MatmulTile::CooperativeChecked {
+                            splits: 1,
+                            tile: shape,
+                        },
+                    )
+                })
+                .filter(|&(shape, tile)| {
+                    tile != initial
+                        && tile.fits(self)
+                        && (shape == CheckedTile::BASE || occupies(&tile))
+                })
+                .map(|(_, tile)| tile)
                 .collect();
         }
         if self.conv2d.is_some() {
@@ -2205,8 +2230,27 @@ mod tests {
         d
     }
 
+    /// A checked forward convolution `[batch, ci, h, w, co, k, k, 1, 1, h, w, 1]`
+    /// installed at the 32x32 tile.
+    fn checked_conv(batch: u32, ci: u32, h: u32, w: u32, co: u32) -> Dispatch {
+        let mut d = dispatch();
+        d.shader = ShaderEntry::Conv2dGemmCoopGen(3, 3, 1);
+        d.params = vec![batch, ci, h, w, co, 3, 3, 1, 1, h, w, 1];
+        d.kernel = crate::compile::Kernel::CooperativeTyped {
+            types: crate::codegen::MatrixTypes {
+                multiply: crate::DType::F16,
+                ..crate::codegen::MatrixTypes::F32_AS_F16
+            },
+            splits: 1,
+            tile: crate::codegen::CheckedTile::BASE,
+        };
+        d.workgroups = [co.div_ceil(32), (h * w).div_ceil(32), batch];
+        d
+    }
+
     /// A checked forward convolution is a forward convolution class keyed by
-    /// its types, whose challengers are its output tiles, one image per Z.
+    /// its types, whose challengers are the output tiles that keep the device
+    /// occupied, one image per Z.
     #[test]
     fn checked_convolutions_measure_output_tiles() {
         use crate::codegen::{CheckedTile, MatrixTypes};
@@ -2215,18 +2259,8 @@ mod tests {
             multiply: crate::DType::F16,
             ..MatrixTypes::F32_AS_F16
         };
-        // batch 2, 32 -> 70 channels, 13x15 image, 3x3, stride 1, padding 1.
-        let params = vec![2, 32, 13, 15, 70, 3, 3, 1, 1, 13, 15, 1];
-        let (m, n): (u32, u32) = (70, 13 * 15);
-        let mut d = dispatch();
-        d.shader = ShaderEntry::Conv2dGemmCoopGen(3, 3, 1);
-        d.params = params;
-        d.kernel = Kernel::CooperativeTyped {
-            types,
-            splits: 1,
-            tile: CheckedTile::BASE,
-        };
-        d.workgroups = [m.div_ceil(32), n.div_ceil(32), 2];
+        let (m, n) = (90, 28 * 28);
+        let mut d = checked_conv(4, 32, 28, 28, m);
         let mut class = TuneClass::from_dispatch(&d, None).expect("checked convolution class");
         assert_eq!(class.shader, ShaderEntry::Conv2dGemm);
         assert_eq!(class.matrix_types, Some(types));
@@ -2238,7 +2272,7 @@ mod tests {
         class.binding_bytes = class.buffer_sizes().unwrap();
         assert_eq!(
             class.binding_bytes,
-            [2 * 32 * 13 * 15 * 4, 70 * 32 * 9 * 4, 2 * 70 * 13 * 15 * 4]
+            [4 * 32 * 28 * 28 * 4, 90 * 32 * 9 * 4, 4 * 90 * 28 * 28 * 4]
         );
         let initial = MatmulTile::selected(&d, None).unwrap();
         assert_eq!(
@@ -2248,12 +2282,17 @@ mod tests {
                 tile: CheckedTile::BASE,
             }
         );
+        // 64x128 and 128x64 leave 56 and 52 workgroups.
         let challengers = class.challengers(initial, None);
+        let occupied = &CheckedTile::WIDE[..3];
         assert_eq!(
             challengers,
-            CheckedTile::WIDE.map(|tile| MatmulTile::CooperativeChecked { splits: 1, tile })
+            occupied
+                .iter()
+                .map(|&tile| MatmulTile::CooperativeChecked { splits: 1, tile })
+                .collect::<Vec<_>>()
         );
-        for tile in challengers {
+        for &tile in &challengers {
             let MatmulTile::CooperativeChecked { tile: shape, .. } = tile else {
                 unreachable!()
             };
@@ -2270,10 +2309,18 @@ mod tests {
             );
             assert_eq!(
                 chosen.workgroups,
-                [m.div_ceil(shape.rows), n.div_ceil(shape.columns), 2]
+                [m.div_ceil(shape.rows), n.div_ceil(shape.columns), 4]
             );
             assert_eq!(MatmulTile::selected(&chosen, None), Some(tile));
+            // A wide incumbent is always measured against 32x32.
+            assert!(class.challengers(tile, None).contains(&initial));
         }
+        // A batch-1 U-Net convolution has no wide tile that stays occupied.
+        let small = checked_conv(1, 64, 32, 32, 64);
+        let mut small_class = TuneClass::from_dispatch(&small, None).unwrap();
+        small_class.binding_bytes = small_class.buffer_sizes().unwrap();
+        let small_initial = MatmulTile::selected(&small, None).unwrap();
+        assert!(small_class.challengers(small_initial, None).is_empty());
         // Ragged outputs stage their result; 16-aligned F32 outputs do not.
         let tile = CheckedTile {
             rows: 64,
@@ -2283,10 +2330,8 @@ mod tests {
             class.checked_tile_bytes(tile),
             Some(tile.shared_bytes(crate::DType::F16, false))
         );
-        let mut aligned = class.clone();
-        (aligned.m, aligned.n) = (64, 256);
         assert_eq!(
-            aligned.checked_tile_bytes(tile),
+            small_class.checked_tile_bytes(tile),
             Some(tile.shared_bytes(crate::DType::F16, true))
         );
         // Untyped cooperative convolutions keep their own kernel.

@@ -2136,8 +2136,10 @@ fn read_typed(words: &[f32], index: usize, dtype: crate::DType) -> f32 {
     }
 }
 
-/// Synthetic operands of a typed product in its storage types, packed into
-/// words sized to the scratch buffers. The addend is always F32.
+/// Synthetic operands of a typed product in its storage types and binding
+/// order, packed into words sized to the scratch buffers. A checked
+/// convolution binds its whole batched image (B) before its weight (A); a
+/// dense product's addend is always F32.
 fn typed_inputs(
     class: &TuneClass,
     types: crate::codegen::MatrixTypes,
@@ -2145,19 +2147,30 @@ fn typed_inputs(
     sizes: &[usize],
 ) -> Vec<Vec<f32>> {
     let (m, n, k) = (class.m as usize, class.n as usize, class.k as usize);
-    let elements = [m * k, k * n, m * n];
-    [types.a, types.b, crate::DType::F32]
+    let operands = match class.conv2d {
+        Some(shape) => {
+            let [image, weight, _] = shape.elements().expect("checked class extents");
+            vec![(image as usize, types.b), (weight as usize, types.a)]
+        }
+        None => {
+            let mut operands = vec![(m * k, types.a), (k * n, types.b)];
+            if class.has_addend() {
+                operands.push((m * n, crate::DType::F32));
+            }
+            operands
+        }
+    };
+    operands
         .into_iter()
-        .take(if class.has_addend() { 3 } else { 2 })
         .enumerate()
-        .map(|(operand, ty)| {
+        .map(|(operand, (elements, ty))| {
             let scale = if operand == 1 || pattern == 0 {
                 1.0
             } else {
                 small_pattern_scale(class) as f32
             };
             let mut words = vec![0.0f32; sizes[operand] / 4];
-            for index in 0..elements[operand] {
+            for index in 0..elements {
                 let value = test_input_value(index, operand) * scale;
                 let bits = match ty {
                     crate::DType::F32 => {
@@ -2233,6 +2246,18 @@ fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize)
             s.padding_w,
         ]
         .map(|v| v as usize);
+        // A checked convolution stages its image (B) and weight (A) in the
+        // multiplication type, as the typed dense branch below does.
+        let operand = |input: usize, index: usize| match class.matrix_types {
+            Some(types) => {
+                let storage = if input == 0 { types.b } else { types.a };
+                f64::from(round_operand(
+                    read_typed(&inputs[input], index, storage),
+                    types.multiply,
+                ))
+            }
+            None => f64::from(inputs[input][index]),
+        };
         let mut value = 0.0;
         if class.shader == ShaderEntry::Conv2dGemm {
             let (batch, channel_out) = (row / co, row % co);
@@ -2251,11 +2276,15 @@ fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize)
                         }
                         let a = ((batch * ci + channel_in) * h + iy) * w + ix;
                         let b = ((channel_out * ci + channel_in) * kh + y) * kw + x;
-                        value += inputs[0][a] as f64 * inputs[1][b] as f64;
+                        value += operand(0, a) * operand(1, b);
                     }
                 }
             }
         } else if class.shader == ShaderEntry::Conv2dGradInputGemm {
+            debug_assert!(
+                class.matrix_types.is_none(),
+                "only forward convolutions are typed"
+            );
             // Flatten batch and channel into the reference row, never into K.
             let (batch, channel) = (row / ci, row % ci);
             for out_channel in 0..co {
@@ -2281,9 +2310,18 @@ fn reference_dot(class: &TuneClass, inputs: &[Vec<f32>], row: usize, col: usize)
                 }
             }
         } else {
+            debug_assert!(
+                class.matrix_types.is_none(),
+                "only forward convolutions are typed"
+            );
             value = weight_reference_dot(class, inputs, row, col);
         }
-        return value;
+        return match class.matrix_types {
+            Some(types) if types.output != crate::DType::F32 => {
+                f64::from(round_operand(value as f32, types.output))
+            }
+            _ => value,
+        };
     }
     let (m, n, k) = (class.m as usize, class.n as usize, class.k as usize);
     let mut value = if class.has_addend() {
@@ -2801,34 +2839,43 @@ mod tests {
         }
     }
 
+    /// A checked forward convolution `[batch, ci, h, w, co, k, k, stride, pad,
+    /// oh, ow, pad]` of `types` at the 32x32 tile.
+    fn checked_conv(params: [u32; 12], types: crate::codegen::MatrixTypes) -> Dispatch {
+        Dispatch {
+            shader: ShaderEntry::Conv2dGemmCoopGen(params[5], params[6], params[7]),
+            params: params.to_vec(),
+            kernel: crate::compile::Kernel::CooperativeTyped {
+                types,
+                splits: 1,
+                tile: crate::codegen::CheckedTile::BASE,
+            },
+            workgroups: [
+                params[4].div_ceil(32),
+                (params[9] * params[10]).div_ceil(32),
+                params[0],
+            ],
+            input_buffers: vec![crate::compile::BufferRef(0), crate::compile::BufferRef(1)],
+            output_buffer: crate::compile::BufferRef(2),
+            ..Default::default()
+        }
+    }
+
     /// Wide checked convolution tiles are offered only where the device's
     /// workgroup memory holds both staged operands and the result tile.
     #[test]
     fn checked_convolution_tiles_fit_workgroup_memory() {
-        use crate::codegen::{CheckedTile, MatrixTypes};
-        use crate::compile::Kernel;
-        let dispatch = Dispatch {
-            shader: ShaderEntry::Conv2dGemmCoopGen(3, 3, 1),
-            params: vec![2, 32, 13, 15, 70, 3, 3, 1, 1, 13, 15, 1],
-            kernel: Kernel::CooperativeTyped {
-                types: MatrixTypes {
-                    multiply: crate::DType::F16,
-                    ..MatrixTypes::F32_AS_F16
-                },
-                splits: 1,
-                tile: CheckedTile::BASE,
-            },
-            workgroups: [3, 7, 2],
-            input_buffers: vec![crate::compile::BufferRef(0), crate::compile::BufferRef(1)],
-            output_buffer: crate::compile::BufferRef(2),
-            ..Default::default()
+        let types = crate::codegen::MatrixTypes {
+            multiply: crate::DType::F16,
+            ..crate::codegen::MatrixTypes::F32_AS_F16
         };
+        let dispatch = checked_conv([4, 32, 28, 28, 90, 3, 3, 1, 1, 28, 28, 1], types);
         let mut key = TuneClass::from_dispatch(&dispatch, None).unwrap();
         key.binding_bytes = key.buffer_sizes().unwrap();
         let initial = MatmulTile::selected(&dispatch, None).unwrap();
-        // The ragged 70x195 output stages its F32 result: 32x64 and 64x32
-        // tiles take 14 KiB, the larger ones 24 KiB or more.
-        for (limit, offered) in [(0, 5), (16384, 2), (49152, 5)] {
+        // The ragged 90-channel output stages its F32 result: the occupied
+        // 32x64 and 64x32 tiles take 14 KiB, 64x64 takes 24 KiB.
+        for (limit, offered) in [(0, 3), (16384, 2), (49152, 3)] {
             let caps = bg::Capabilities {
                 max_compute_shared_memory_size: limit,
                 ..Default::default()
@@ -2848,6 +2895,80 @@ mod tests {
                     unreachable!("{tile:?}")
                 };
                 assert!(limit == 0 || key.checked_tile_bytes(tile).unwrap() <= limit);
+            }
+        }
+    }
+
+    /// A checked convolution's synthetic inputs fill its whole batched image
+    /// and weight bindings, and its reference decodes their storage and rounds
+    /// them to the multiplication type, as the kernel stages them. A direct
+    /// convolution of those operands qualifies on both input patterns.
+    #[test]
+    fn checked_convolution_inputs_and_reference_follow_its_bindings() {
+        use crate::{DType, codegen::MatrixTypes};
+        // A 7x7 stride-2 stem at batch 2: 3 -> 64 channels, 32x32 -> 16x16.
+        let params = [2, 3, 32, 32, 64, 7, 7, 2, 3, 16, 16, 3];
+        for types in [
+            MatrixTypes {
+                multiply: DType::F16,
+                ..MatrixTypes::F32_AS_F16
+            },
+            MatrixTypes {
+                output: DType::BF16,
+                ..MatrixTypes::BF16
+            },
+        ] {
+            let dispatch = checked_conv(params, types);
+            let mut class = TuneClass::from_dispatch(&dispatch, None).unwrap();
+            class.binding_bytes = class.buffer_sizes().unwrap();
+            let sizes = class.binding_bytes.clone();
+            for pattern in [1, 0] {
+                let inputs = typed_inputs(&class, types, pattern, &sizes);
+                assert_eq!(inputs.len(), 2);
+                for (data, &bytes) in inputs.iter().zip(&sizes) {
+                    assert_eq!(data.len(), bytes / 4);
+                }
+                let operand = |input: usize, index: usize, storage| {
+                    f64::from(round_operand(
+                        read_typed(&inputs[input], index, storage),
+                        types.multiply,
+                    ))
+                };
+                let mut output = Vec::with_capacity(class.output_elements());
+                for batch in 0..2 {
+                    for co in 0..64 {
+                        for oy in 0..16 {
+                            for ox in 0..16 {
+                                let mut sum = 0.0;
+                                for ci in 0..3 {
+                                    for ky in 0..7 {
+                                        for kx in 0..7 {
+                                            let (iy, ix) = (2 * oy + ky, 2 * ox + kx);
+                                            if iy < 3 || ix < 3 || iy - 3 >= 32 || ix - 3 >= 32 {
+                                                continue;
+                                            }
+                                            let image =
+                                                ((batch * 3 + ci) * 32 + iy - 3) * 32 + ix - 3;
+                                            let weight = ((co * 3 + ci) * 7 + ky) * 7 + kx;
+                                            sum += operand(0, image, types.b)
+                                                * operand(1, weight, types.a);
+                                        }
+                                    }
+                                }
+                                output.push(round_operand(sum as f32, types.output));
+                            }
+                        }
+                    }
+                }
+                let scale = if pattern == 0 {
+                    1.0
+                } else {
+                    small_pattern_scale(&class)
+                };
+                assert!(
+                    qualify_output(&class, &inputs, &output, scale),
+                    "{types:?} pattern {pattern}"
+                );
             }
         }
     }
