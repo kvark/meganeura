@@ -19,11 +19,11 @@ Pick the closest entries to these:
 Can machine learning on NVIDIA GPUs run without CUDA? Meganeura is a 19 MiB
 Rust engine that compiles training and inference graphs to Vulkan compute
 shaders. Against compiled PyTorch 2.13 with CUDA graphs on RTX 5070 and H100,
-over five models, it matches strict-f32 inference on the RTX 5070 (geometric
-mean 1.02×) and trails training by 1.5–1.8×. With BF16, the training gap grows
-to 2.8–5.2×. Single-operation measurements locate the losses: f32 GEMM kernels
-at 1.3–1.7× cuBLAS, small tensor-core gains through cooperative matrices, and a
-slower host round trip. Winograd convolutions beat cuDNN.
+over five benchmark workloads, it matches strict-f32 inference on the RTX 5070
+(geometric mean 1.02×) and trails training by 1.5–1.8×. With BF16, the training
+gap grows to 2.8–5.2×, as its precision policy speeds whole models up less than
+autocast does. Single-operation probes put f32 GEMM kernels at 1.3–1.7× cuBLAS
+and host round trips at 2.8×, while Winograd convolutions beat cuDNN.
 
 ## Extended abstract and results
 
@@ -39,30 +39,43 @@ differentiates tensor graphs, keeps graph rewrites and matrix schedules in an
 e-graph, and lowers the selected programs to 113 WGSL compute shaders, which
 naga translates to SPIR-V for Vulkan. Programs are chosen by timing candidates
 on the device, and a candidate counts only if it passes full-output and
-full-gradient checks. The same binary runs on AMD and Intel GPUs through
-Vulkan and on Apple GPUs through Metal; the poster covers NVIDIA.
+full-gradient checks. The same Linux binary runs on AMD and Intel GPUs through
+Vulkan, and a macOS build of the same source targets Apple GPUs through Metal;
+the poster covers NVIDIA.
 
 **Benchmarking methodology.** RTX 5070 (Blackwell) and H100 80GB HBM3, Linux,
 driver 595.91.07 for both Vulkan and CUDA. The reference is PyTorch 2.13 with
-`torch.compile` and CUDA graph replay. Five workloads (SmolLM2-135M, SmolVLA,
-Stable Diffusion U-Net, ResNet-50, Whisper-tiny) each run a batch or prefill
-pass, a minimal-shape pass and a full training step. Under strict f32, TF32 is
+`torch.compile` and CUDA graph replay. The five workloads are SmolLM2-135M
+(public checkpoint), the SmolVLA action expert, a scaled 10.9M-parameter
+Stable Diffusion 1.x U-Net, ResNet-50 with folded normalization, and the
+Whisper-tiny encoder; all but SmolLM2 use synthetic weights. Each runs a batch
+or 128-token prefill forward, a minimal-shape forward (for SmolLM2, one token
+without a KV cache, which is not decode latency), and forward, loss and
+backward without an optimizer update. Under strict f32, TF32 is
 off. Under reduced precision, PyTorch runs autocast BF16 and Meganeura may
 select F16/BF16 cooperative-matrix products, keeping parameters, loss and
-accumulation in f32. Each engine must pass output and gradient gates before
-timing: 10 s warmup, 20 samples, three processes. We report Meganeura time
+accumulation in f32. Each engine passes its own gates before timing.
+Meganeura checks full outputs and full single-step gradients against an f32
+reference build, using token KL for the language model at reduced precision.
+PyTorch checks its forward against eager f32 and its training against a
+matched SGD trajectory. Across engines, sampled outputs, loss and gradient
+norms must agree. Timing uses a 10 s warmup, 20 samples and three processes. We report Meganeura time
 divided by PyTorch time, so values below 1 favor Meganeura. Fifty-seven NVIDIA
 ratios qualified.
 
 **Model results.** Strict-f32 geometric means are 1.02 (inference), 0.96
 (minimal shape) and 1.49 (training) on RTX 5070, and 1.30, 1.06 and 1.81 on
 H100. Meganeura is faster on RTX 5070 for ResNet-50 (0.74) and U-Net (0.80)
-inference and for single-token decoding (0.84). Under reduced precision, the
+inference and for the one-token SmolLM2 forward (0.84). Under reduced precision, the
 training ratios become 2.81 and 5.24. Over the same qualified models, BF16
-speeds PyTorch up 2.1–3.0× and Meganeura's selected programs 1.1–1.4×. The
+speeds PyTorch up 2.1–3.0× and Meganeura's searched precision policy 1.1–1.4×.
+These are whole-model times that include unconverted operations, partial
+backward coverage and conversions, so they do not measure tensor-core kernels.
+The
 ratios compose exactly: RTX 5070 training goes from 1.49 to 1.49 × 2.27 / 1.20
 = 2.81. Whisper is the outlier, at 3.2× on RTX 5070 and 7.4× on H100 under
-reduced precision, because its long-sequence attention has no fused kernel.
+reduced precision; the search has not found a competitive long-sequence
+attention.
 
 **Gap analysis.** A single-operation study on RTX 5070 times strict-f32 GEMMs,
 convolutions and dispatches, with both engines running 30 serial copies:
@@ -71,13 +84,14 @@ convolutions and dispatches, with both engines running 30 serial copies:
   SIMT kernels on CUDA cores, so the arithmetic matches: 11.8 against 19.9
   TFLOP/s at 4096³. A 128×64 tile with an 8×4 register block cut this from 2.06×.
 - On small long-K GEMMs, cuBLAS splits K. Adding split-K took 64×1024→256 from
-  4.40× to 1.88×.
+  4.40× to 1.88×, adding one reduction dispatch per product.
 - Winograd 3×3 convolutions take 0.34–0.64× of cuDNN's batch-1 time.
 - A dependent dispatch with a barrier costs 0.97 µs, against 0.85 µs per op
   inside a CUDA graph. One host submit-and-wait takes 19.4 µs against 6.9 µs.
-- The WGSL/SPIR-V path exposes 16×16 F16/BF16 tiles, but no TF32 inputs and no
-  control of Hopper warpgroup MMA, TMA or clusters. How much of the H100 gap
-  these explain still needs kernel-level profiles.
+- These probes run with cooperative matrices off, so tensor-core kernel
+  efficiency is not yet isolated. The WGSL/SPIR-V path exposes 16×16 F16/BF16
+  tiles, but no TF32 inputs and no control of Hopper warpgroup MMA, TMA or
+  clusters. How much of the H100 gap these explain needs kernel-level profiles.
 
 These ratios locate implementation losses. They do not partition model time.
 
@@ -86,11 +100,12 @@ array (`array<array<f32,4>,8>`) reads zero for outer indices at or above the
 inner length. Our 8×4 GEMM tile first looked fast because it dropped half its
 rows. A flat accumulator avoids it. A raw-Vulkan reproducer is reported.
 
-**Significance.** Through Vulkan, an NVIDIA GPU already runs strict-f32 ML
-inference at CUDA PyTorch's speed, without vendor libraries, in a 19 MiB
-binary that also runs on other vendors. The measured gaps point to concrete
-work: f32 GEMM tiles, fused attention on cooperative matrices,
-`VK_NV_cooperative_matrix2`, and fewer host round trips per step.
+**Significance.** Through Vulkan, an NVIDIA GPU already runs these
+strict-f32 inference workloads at CUDA PyTorch's speed, without vendor
+libraries, in a 19 MiB Linux binary that also drives other vendors' GPUs. The
+measured gaps point to concrete work: f32 GEMM tiles, cooperative-matrix GEMM
+probes against cuBLAS BF16, fused attention, `VK_NV_cooperative_matrix2`, and
+fewer host round trips per step.
 
 **Availability.** Source: https://github.com/kvark/meganeura. Full protocol,
 archives and offline replay are in the companion P3HPC workshop paper at SC26,
