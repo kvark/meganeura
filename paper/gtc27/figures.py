@@ -19,7 +19,7 @@ OUTPUT = HERE / "figures"
 INK, TEAL, ORANGE, CANVAS, MUTED, GRID = "#23343b", "#006b70", "#a44616", "#ffffff", "#637679", "#d1dad8"
 DEVICES = {"nvidia-5070": "RTX 5070", "nvidia-h100": "H100 SXM"}
 MODELS = ["SmolLM2-135M", "SmolVLA", "StableDiffusion", "ResNet-50", "Whisper-tiny"]
-SHORT = ["SmolLM2-135M", "SmolVLA", "SD U-Net", "ResNet-50", "Whisper-tiny"]
+SHORT = ["SmolLM2-135M", "SmolVLA expert", "SD U-Net", "ResNet-50", "Whisper enc."]
 PHASES = [("inference", "Prefill /\nbatch"), ("latency", "Minimal\nshape"), ("training", "Training\nstep")]
 plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 22, "text.color": INK,
     "axes.labelcolor": INK, "xtick.color": INK, "ytick.color": INK,
@@ -116,7 +116,7 @@ def precision_gains():
     clean(ax)
     ax.tick_params(axis="y", length=0)
     ax.legend(handles=[Rectangle((0, 0), 1, 1, color=MUTED), Rectangle((0, 0), 1, 1, color=TEAL)],
-              labels=["PyTorch: autocast BF16", "Meganeura: searched F16/BF16 programs"],
+              labels=["PyTorch: autocast BF16", "Meganeura: searched precision policy"],
               loc="lower left", bbox_to_anchor=(0, 1.0), ncol=2, frameon=False, fontsize=17)
     fig.subplots_adjust(left=.2, right=.98, top=.93, bottom=.13)
     save(fig, "precision-gains.svg")
