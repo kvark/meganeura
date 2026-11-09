@@ -200,27 +200,15 @@ footer p { margin: 0; }
 /* 19.4 MiB / 4.42 GiB = 0.43% of the PyTorch bar, widened to stay visible. */
 .size .ours { width: 0.06in; background: var(--teal); }
 
-.dino {
-  display: grid;
-  grid-template-columns: 6.8in 1fr;
-  gap: 0.35in;
-  align-items: start;
-  margin-top: 0.15in;
-}
-.dino img { width: 100%; border-radius: 8pt; display: block; }
-.dino .step { margin: 0 0 0.3in; padding-left: 0.2in; border-left: 6pt solid var(--teal); font-size: 28pt; }
-.dino .step b { display: block; font-size: 34pt; color: var(--teal); }
-.dino .caption { margin: 0; }
-
 .fine {
   background: #f3f5f4;
   border: 2pt solid var(--line);
   padding: 0.14in 0.22in;
-  font-size: 21pt;
-  line-height: 1.26;
+  font-size: 24pt;
+  line-height: 1.28;
   margin-top: 0.35in;
 }
-.fine h3 { font-size: 24pt; }
+.fine h3 { font-size: 30pt; }
 .fine p { margin: 0.05in 0; }
 
 .takeaways { list-style: none; padding: 0; margin: 0.1in 0; font-size: 26pt; line-height: 1.25; }
