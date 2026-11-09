@@ -204,8 +204,8 @@ footer p { margin: 0; }
   background: #f3f5f4;
   border: 2pt solid var(--line);
   padding: 0.14in 0.22in;
-  font-size: 24pt;
-  line-height: 1.28;
+  font-size: 25pt;
+  line-height: 1.3;
   margin-top: 0.35in;
 }
 .fine h3 { font-size: 30pt; }
@@ -232,3 +232,10 @@ table.ops td.far { background: #f1d9cc; color: var(--brown); font-weight: bold; 
 .nvstats p { margin: 0; font-size: 20pt; line-height: 1.25; color: var(--muted); }
 .nvstats .big { font-size: 46pt; font-weight: bold; color: var(--deep); line-height: 1.15; }
 .nvstats .big span { font-size: 0.5em; color: var(--muted); font-weight: normal; }
+
+table.models { width: 100%; border-collapse: collapse; margin: 0.15in 0; font-size: 23pt; }
+table.models th { text-align: left; color: var(--muted); font-size: 17pt; text-transform: uppercase; letter-spacing: .5pt; padding: 3pt 6pt; border-bottom: 2pt solid var(--line); }
+table.models td { padding: 7pt 6pt; border-bottom: 1pt solid var(--line); }
+table.models td:first-child { font-weight: bold; color: var(--deep); }
+table.models td:nth-child(2) { text-align: right; white-space: nowrap; }
+table.models tr.large td { background: #e3ecda; }
