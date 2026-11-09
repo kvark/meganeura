@@ -3666,7 +3666,7 @@ mod tests {
             ),
             (
                 ShaderGroup::FlashAttention,
-                naga::valid::Capabilities::empty(),
+                naga::valid::Capabilities::SUBGROUP,
             ),
             (
                 ShaderGroup::FlashAttentionCoop,
@@ -3886,38 +3886,91 @@ mod tests {
         }
     }
 
+    /// Scalar backward kernels validate and stay inside the 16 KiB staging
+    /// budget at every head width, cap, precision and default subgroup
+    /// width. A width covering a query's lanes, and only such a width, makes
+    /// a subgroup kernel, which reads the live width to check it.
     #[test]
     fn scalar_attention_backward_staging_fits_16_kib() {
+        use crate::kernels::attention_grad::Part;
         for head_dim in [16, 32, 64, 80, 128, 256, 512, 1024] {
             for cap in [4, 8, 16, 32, 64] {
-                for shader in [
-                    generate_flash_grad_q_module(head_dim, cap),
-                    generate_flash_grad_kv_module(head_dim, cap),
-                ] {
-                    naga::valid::Validator::new(
-                        naga::valid::ValidationFlags::all()
-                            & !naga::valid::ValidationFlags::BINDINGS,
-                        naga::valid::Capabilities::all(),
-                    )
-                    .validate(&shader.module)
-                    .unwrap();
-                    let mut layout = naga::proc::Layouter::default();
-                    layout.update(shader.module.to_ctx()).unwrap();
-                    let mut bytes = 0;
-                    for (_, var) in shader.module.global_variables.iter() {
-                        if var.space == naga::AddressSpace::WorkGroup {
-                            let ty = layout[var.ty];
-                            bytes = ty.alignment.round_up(bytes) + ty.size;
+                let (_, tpq) = attention_lanes(head_dim, cap);
+                for subgroup in [0, 32, 64] {
+                    for part in [Part::Q, Part::KV] {
+                        for f16 in [false, true] {
+                            let shader =
+                                generate_flash_grad_module(part, head_dim, cap, subgroup, 256, f16);
+                            let what = format!(
+                                "{part:?} head={head_dim} cap={cap} subgroup={subgroup} f16={f16}"
+                            );
+                            naga::valid::Validator::new(
+                                naga::valid::ValidationFlags::all()
+                                    & !naga::valid::ValidationFlags::BINDINGS,
+                                naga::valid::Capabilities::all(),
+                            )
+                            .validate(&shader.module)
+                            .unwrap_or_else(|error| panic!("{what}: {error:?}"));
+                            assert!(workgroup_bytes(&shader) <= 16384, "{what}");
+                            let reads_width = shader.module.entry_points[0]
+                                .function
+                                .arguments
+                                .iter()
+                                .any(|argument| {
+                                    argument.binding
+                                        == Some(naga::Binding::BuiltIn(naga::BuiltIn::SubgroupSize))
+                                });
+                            let covers =
+                                tpq > 1 && subgroup >= tpq && subgroup % tpq == 0 && 256 / tpq > 1;
+                            assert_eq!(reads_width, covers, "{what}");
                         }
                     }
-                    assert!(
-                        bytes <= 16384,
-                        "{}: head={head_dim}, cap={cap}, bytes={bytes}",
-                        shader.hint
-                    );
                 }
             }
         }
+        // F16 tiles round Q/K/V once at the load. dO stays f32: Whisper's
+        // upstream gradients are smaller than the f16 normal range, and an
+        // f16 dO tile flushes v_proj to zero.
+        let kv = generate_flash_grad_module(Part::KV, 64, 16, 64, 128, true);
+        assert_eq!(
+            workgroup_element(&kv, "shared_q"),
+            (naga::ScalarKind::Float, 2)
+        );
+        assert_eq!(
+            workgroup_element(&kv, "shared_do"),
+            (naga::ScalarKind::Float, 4)
+        );
+    }
+
+    fn workgroup_bytes(shader: &ShaderModule) -> u32 {
+        let mut layout = naga::proc::Layouter::default();
+        layout.update(shader.module.to_ctx()).unwrap();
+        let mut bytes = 0;
+        for (_, var) in shader.module.global_variables.iter() {
+            if var.space == naga::AddressSpace::WorkGroup {
+                let ty = layout[var.ty];
+                bytes = ty.alignment.round_up(bytes) + ty.size;
+            }
+        }
+        bytes
+    }
+
+    /// Kind and byte width of the elements of workgroup array `name`.
+    fn workgroup_element(shader: &ShaderModule, name: &str) -> (naga::ScalarKind, u8) {
+        let module = &shader.module;
+        let (_, var) = module
+            .global_variables
+            .iter()
+            .find(|&(_, var)| var.name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("no workgroup array {name}"));
+        let naga::TypeInner::Array { base, .. } = module.types[var.ty].inner else {
+            panic!("{name} is not an array");
+        };
+        let scalar = match module.types[base].inner {
+            naga::TypeInner::Scalar(scalar) | naga::TypeInner::Vector { scalar, .. } => scalar,
+            ref other => panic!("{name} holds {other:?}"),
+        };
+        (scalar.kind, scalar.width)
     }
 
     #[test]
@@ -3986,13 +4039,113 @@ mod tests {
                         naga::valid::Validator::new(
                             naga::valid::ValidationFlags::all()
                                 ^ naga::valid::ValidationFlags::BINDINGS,
-                            naga::valid::Capabilities::empty(),
+                            naga::valid::Capabilities::SUBGROUP,
                         )
                         .validate(&sm.module)
                         .unwrap();
                     }
                 }
             }
+        }
+        // F16 keys widen in the dot product; V stays F32 so a peaked
+        // softmax keeps its value.
+        let keys_only = generate_flash_attention_module_for_device(
+            64,
+            16,
+            FlashAttentionShape {
+                threads: 256,
+                keys: 8,
+                interleave: true,
+            },
+            true,
+            true,
+        );
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS,
+            naga::valid::Capabilities::SUBGROUP | naga::valid::Capabilities::SHADER_FLOAT16,
+        )
+        .validate(&keys_only.module)
+        .unwrap();
+        assert_eq!(
+            workgroup_element(&keys_only, "shared_k"),
+            (naga::ScalarKind::Float, 2)
+        );
+        assert_eq!(
+            workgroup_element(&keys_only, "shared_v"),
+            (naga::ScalarKind::Float, 4)
+        );
+    }
+
+    #[test]
+    fn flash_f16_staging_keeps_dot_accumulators_f32() {
+        for shader in [
+            generate_flash_attention_module_for_device(
+                64,
+                4,
+                FlashAttentionShape::default(),
+                true,
+                true,
+            ),
+            generate_flash_attention_module_for_device(
+                64,
+                4,
+                FlashAttentionShape::default(),
+                false,
+                true,
+            ),
+            generate_flash_attention_module_for_device(
+                64,
+                4,
+                FlashAttentionShape::default(),
+                true,
+                false,
+            ),
+            generate_flash_grad_module(
+                crate::kernels::attention_grad::Part::Q,
+                64,
+                4,
+                32,
+                256,
+                true,
+            ),
+            generate_flash_grad_module(
+                crate::kernels::attention_grad::Part::KV,
+                64,
+                4,
+                32,
+                256,
+                true,
+            ),
+        ] {
+            let info = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all() & !naga::valid::ValidationFlags::BINDINGS,
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&shader.module)
+            .unwrap();
+            let mut dots = 0;
+            for (index, entry) in shader.module.entry_points.iter().enumerate() {
+                for (handle, expression) in entry.function.expressions.iter() {
+                    if matches!(
+                        expression,
+                        naga::Expression::Math {
+                            fun: naga::MathFunction::Dot,
+                            ..
+                        }
+                    ) {
+                        dots += 1;
+                        assert_eq!(
+                            info.get_entry_point(index)[handle]
+                                .ty
+                                .inner_with(&shader.module.types),
+                            &naga::TypeInner::Scalar(naga::Scalar::F32),
+                            "{}",
+                            shader.hint
+                        );
+                    }
+                }
+            }
+            assert!(dots > 0, "{}", shader.hint);
         }
     }
 
@@ -4256,7 +4409,10 @@ mod tests {
             (ShaderGroup::RoPEGrad, empty),
             (ShaderGroup::LayerNorm, empty),
             (ShaderGroup::MultiHeadAttn, empty),
-            (ShaderGroup::FlashAttention, empty),
+            (
+                ShaderGroup::FlashAttention,
+                naga::valid::Capabilities::SUBGROUP,
+            ),
             (ShaderGroup::FlashAttentionCoop, coop),
             (ShaderGroup::FlashAttentionCoopF32, coop),
             (ShaderGroup::SwiGLUGrad, empty),

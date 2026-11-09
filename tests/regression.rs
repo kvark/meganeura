@@ -1,5 +1,6 @@
 //! Focused regressions share one executable instead of linking the stack per file.
 //! Model-graph children are behind the `models` feature; run the rest featureless.
+mod accelerated_long;
 mod adam_state_rw;
 mod back_to_back_step;
 mod bf16_split_k;
