@@ -2,7 +2,7 @@
 # requires-python = ">=3.12"
 # dependencies = ["matplotlib==3.11.2"]
 # ///
-"""GTC poster figures: NVIDIA rows of the P3HPC cohort and the RTX 5070 single-op study."""
+"""GTC poster figures: NVIDIA rows of the P3HPC cohort."""
 import csv
 import math
 from pathlib import Path
@@ -122,74 +122,5 @@ def precision_gains():
     save(fig, "precision-gains.svg")
 
 
-# RTX 5070 ratios at Meganeura 6b1e784, before split-K, cached Winograd weight
-# transforms and the 128x64 tile (op-bench.tsv as of commit d30ca390).
-BEFORE = {"square-1024": 2.03, "square-2048": 2.02, "square-4096": 2.06, "unet-ff-down": 4.40,
-          "unet-ctx-kv": 3.41, "unet-3x3-256@8": .70}
-OPS = [
-    ("Square GEMM", [("square-1024", "1024³"), ("square-2048", "2048³"), ("square-4096", "4096³")]),
-    ("Transformer GEMM", [("whisper-qkv", "Whisper QKV 1500×384→1152"), ("whisper-ff-up", "Whisper FF up"),
-                          ("whisper-ff-down", "Whisper FF down"), ("llm-ff-up", "SmolLM2 FF up 512×576→1536")]),
-    ("Small GEMM (U-Net)", [("unet-ff-up", "64×256→1024"), ("unet-ff-down", "64×1024→256 (long K)"),
-                            ("unet-ctx-kv", "77×768→256 (long K)"), ("unet-proj-16", "256×128→128")]),
-    ("3×3 conv (Winograd)", [("unet-3x3-64@32", "64 ch @ 32²"), ("unet-3x3-128@16", "128 ch @ 16²"),
-                             ("unet-3x3-256@8", "256 ch @ 8²"), ("resnet-3x3-64@56", "ResNet 64 ch @ 56²"),
-                             ("resnet-3x3-512@7", "ResNet 512 ch @ 7²")]),
-    ("Other conv", [("unet-stem-4@32", "U-Net stem 4→320"), ("resnet-1x1-256@56", "ResNet 1×1 256 ch"),
-                    ("resnet-stem-7x7", "ResNet stem 7×7")]),
-    ("Dispatch", [("add-256", "Dependent 256-add, per op"), ("add-256-single", "Submit + wait, one add")]),
-]
-
-
-def single_ops():
-    rows = {}
-    for line in (P3HPC / "presentation" / "data" / "op-bench.tsv").open():
-        if line.startswith(("#", "gpu\t")):
-            continue
-        gpu, engine, _, shape, gpu_ms, wall_ms, *_ = line.rstrip("\n").split("\t")
-        if gpu == "rtx5070":
-            # The single-submit row has no device time; it compares host round trips.
-            rows[shape, engine] = float(wall_ms if shape == "add-256-single" else gpu_ms)
-    fig, ax = plt.subplots(figsize=(13.2, 17.6))
-    y, ticks, labels = 0, [], []
-    for group, shapes in OPS:
-        ax.text(-.02, y + .1, group, fontsize=19, weight="bold", color=INK, va="center", ha="right",
-                transform=ax.get_yaxis_transform())
-        y += .8
-        for shape, label in shapes:
-            value = rows[shape, "meganeura"] / rows[shape, "pytorch"]
-            color = TEAL if value < 1 else ORANGE
-            if shape in BEFORE:
-                ax.annotate("", xy=(value, y), xytext=(BEFORE[shape], y),
-                            arrowprops=dict(arrowstyle="-|>", color=MUTED, lw=2, shrinkA=7, shrinkB=9, mutation_scale=22))
-                ax.plot(BEFORE[shape], y, "o", ms=13, mfc=CANVAS, mec=MUTED, mew=2.2)
-            ax.plot(value, y, "o", ms=15, color=color, mec=CANVAS, mew=2)
-            # Label on the side away from the earlier value's arrow.
-            left = shape in BEFORE and BEFORE[shape] > value
-            ax.text(value * (.9 if left else 1.11), y, f"{value:.2f}", va="center",
-                    ha="right" if left else "left", fontsize=18, color=INK)
-            ticks.append(y)
-            labels.append(label)
-            y += .9
-        y += .3
-    ax.set_xscale("log")
-    ax.set_xlim(.115, 6)
-    ax.set_xticks([.125, .25, .5, 1, 2, 4], ["⅛", "¼", "½", "1", "2", "4"])
-    ax.minorticks_off()
-    ax.axvline(1, color=INK, linewidth=1.5)
-    ax.set_yticks(ticks, labels, fontsize=17)
-    ax.set_ylim(y - .2, -.6)
-    ax.tick_params(axis="y", length=0)
-    ax.set_xlabel("Meganeura time / PyTorch time  (log scale; left of 1 is faster)", fontsize=18)
-    clean(ax)
-    ax.plot([], [], "o", ms=13, mfc=CANVAS, mec=MUTED, mew=2.2, label="before split-K, cached Winograd weights, 128×64 tile")
-    ax.plot([], [], "o", ms=15, color=INK, label="now")
-    ax.legend(loc="lower left", bbox_to_anchor=(-.02, 1.0), ncol=2, frameon=False, fontsize=15.5,
-              handletextpad=.2, columnspacing=1)
-    fig.subplots_adjust(left=.36, right=.98, top=.955, bottom=.065)
-    save(fig, "single-ops.svg")
-
-
 ratio_grid()
 precision_gains()
-single_ops()
