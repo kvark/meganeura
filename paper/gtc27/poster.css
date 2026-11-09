@@ -91,8 +91,6 @@ b.fast { color: var(--teal); }
 code { font-size: 0.86em; background: var(--tint); padding: 0 4pt; }
 ul, ol { margin: 0.08in 0; padding-left: 0.42in; }
 li { margin: 0.07in 0; }
-.note { color: var(--muted); font-size: 24pt; }
-
 .flow {
   display: flex;
   gap: 0.22in;
@@ -104,9 +102,9 @@ li { margin: 0.07in 0; }
   background: var(--tint);
   border: 2pt solid var(--line);
   border-radius: 10pt;
-  padding: 0.12in 0.06in;
+  padding: 0.2in 0.06in;
   text-align: center;
-  font-size: 23pt;
+  font-size: 26pt;
   font-weight: bold;
   color: var(--teal);
   line-height: 1.15;
@@ -127,18 +125,6 @@ li { margin: 0.07in 0; }
   color: var(--muted);
   font-size: 22pt;
 }
-.flow.search div { background: white; border-style: dashed; color: var(--ink); font-weight: normal; }
-.flow.search small { display: inline; margin-left: 8pt; }
-
-table.footprint {
-  width: 100%;
-  border-collapse: collapse;
-  margin: 0.2in 0 0.08in;
-  font-size: 24pt;
-}
-.footprint th, .footprint td { text-align: left; padding: 5pt 8pt; border-bottom: 1.5pt solid var(--line); }
-.footprint th { color: var(--muted); font-weight: normal; }
-
 figure { margin: 0.1in 0 0.16in; }
 figure img { display: block; width: 100%; }
 figcaption { color: var(--muted); font-size: 21pt; line-height: 1.28; margin-top: 0.06in; }
@@ -162,9 +148,6 @@ figcaption b { color: var(--ink); }
 .tiles .big span { font-size: 0.6em; }
 .tiles .small { color: var(--muted); }
 
-.findings { font-size: 24pt; line-height: 1.27; }
-.findings li { margin: 0.09in 0; }
-
 .box {
   background: #f6ece6;
   border-left: 10pt solid var(--brown);
@@ -185,3 +168,70 @@ footer {
   line-height: 1.25;
 }
 footer p { margin: 0; }
+
+.caption { color: var(--muted); font-size: 21pt; line-height: 1.28; margin: 0.06in 0 0.3in; }
+.tiles-note { margin-top: -0.1in; }
+
+.gpus {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 0.2in;
+  margin-top: 0.15in;
+}
+.gpus > div {
+  background: var(--tint);
+  border-top: 10pt solid #4a7d2a;
+  padding: 0.14in 0.18in 0.16in;
+}
+.gpus > div.win { border-top-color: var(--teal); }
+.gpus p { margin: 0; }
+.gpus .arch { color: var(--muted); font-size: 17pt; text-transform: uppercase; letter-spacing: 1pt; font-weight: bold; }
+.gpus h3 { font-size: 38pt; margin: 0.04in 0 0; }
+.gpus .os { font-size: 20pt; color: var(--ink); }
+.gpus .pass { font-size: 64pt; font-weight: bold; color: var(--teal); line-height: 1.15; margin-top: 0.08in; }
+.gpus .pass::before { content: '✓ '; font-size: 0.7em; }
+.gpus .ref { font-size: 19pt; color: var(--muted); line-height: 1.2; }
+
+.size p { display: flex; align-items: center; gap: 0.18in; margin: 0.1in 0; font-size: 24pt; }
+.size span { width: 3.1in; text-align: right; color: var(--ink); }
+.size b { white-space: nowrap; }
+.size .bar { display: block; height: 0.5in; border-radius: 0 6pt 6pt 0; }
+.size .theirs { width: 7.2in; background: var(--muted); }
+/* 19.4 MiB / 4.42 GiB = 0.43% of the PyTorch bar, widened to stay visible. */
+.size .ours { width: 0.06in; background: var(--teal); }
+
+.dino {
+  display: grid;
+  grid-template-columns: 6.8in 1fr;
+  gap: 0.35in;
+  align-items: start;
+  margin-top: 0.15in;
+}
+.dino img { width: 100%; border-radius: 8pt; display: block; }
+.dino .step { margin: 0 0 0.3in; padding-left: 0.2in; border-left: 6pt solid var(--teal); font-size: 28pt; }
+.dino .step b { display: block; font-size: 34pt; color: var(--teal); }
+.dino .caption { margin: 0; }
+
+.fine {
+  background: #f3f5f4;
+  border: 2pt solid var(--line);
+  padding: 0.14in 0.22in;
+  font-size: 21pt;
+  line-height: 1.26;
+  margin-top: 0.35in;
+}
+.fine h3 { font-size: 24pt; }
+.fine p { margin: 0.05in 0; }
+
+.takeaways { list-style: none; padding: 0; margin: 0.1in 0; font-size: 26pt; line-height: 1.25; }
+.takeaways li { padding: 0.08in 0 0.08in 0.62in; position: relative; border-bottom: 1.5pt solid var(--tint); }
+.takeaways li::before {
+  position: absolute; left: 0; top: 0.08in;
+  width: 0.44in; height: 0.44in; border-radius: 50%;
+  color: white; font-weight: bold; font-size: 22pt; text-align: center; line-height: 0.44in;
+}
+.takeaways .slow::before { content: '−'; background: var(--brown); }
+.takeaways .fast::before { content: '+'; background: var(--teal); }
+.takeaways .fixed::before { content: '↓'; background: var(--muted); }
+.takeaways .even::before { content: '='; background: var(--muted); }
+.takeaways .open::before { content: '?'; background: var(--muted); }

@@ -16,14 +16,14 @@ Pick the closest entries to these:
 
 ## Poster description (100 words maximum)
 
-Can machine learning on NVIDIA GPUs run without CUDA? Meganeura is a 19 MiB
-Rust engine that compiles training and inference graphs to Vulkan compute
-shaders. Against compiled PyTorch 2.13 with CUDA graphs on RTX 5070 and H100,
-over five benchmark workloads, it matches strict-f32 inference on the RTX 5070
-(geometric mean 1.02×) and trails training by 1.5–1.8×. With BF16, the training
-gap grows to 2.8–5.2×, as its precision policy speeds whole models up less than
-autocast does. Single-operation probes put f32 GEMM kernels at 1.3–1.7× cuBLAS
-and host round trips at 2.8×, while Winograd convolutions beat cuDNN.
+Can machine learning on NVIDIA GPUs run without CUDA? Meganeura, a 19 MiB Rust
+engine, compiles training and inference graphs to Vulkan compute shaders. It
+passes every numerical check on an RTX 5070, an H100 and a Windows RTX 3050,
+where PyTorch's CUDA build crashed, and it trains a vision decoder on that 3050
+for a VR headset. Against compiled PyTorch 2.13 with CUDA graphs, it matches
+strict-f32 inference on the RTX 5070 (1.02×) and trails training by 1.5–1.8×,
+or 2.8–5.2× with BF16. Single-operation probes locate the losses in f32 GEMM
+kernels and host submission.
 
 ## Extended abstract and results
 
@@ -43,8 +43,20 @@ full-gradient checks. The same Linux binary runs on AMD and Intel GPUs through
 Vulkan, and a macOS build of the same source targets Apple GPUs through Metal;
 the poster covers NVIDIA.
 
-**Benchmarking methodology.** RTX 5070 (Blackwell) and H100 80GB HBM3, Linux,
-driver 595.91.07 for both Vulkan and CUDA. The reference is PyTorch 2.13 with
+**Three NVIDIA GPUs.** Each GPU runs five workloads under two precisions and
+three phases, 30 cells, and all 30 pass the numerical gates on each: RTX 5070
+(Blackwell, Linux, driver 595.91.07), H100 80GB HBM3 (Hopper, Linux, 595.91.07)
+and RTX 3050 (Ampere, Windows 11, driver 610.88). PyTorch's CUDA build crashed
+on the RTX 3050 setup, so its cells were checked against CPU PyTorch f32 and
+have no GPU timing comparison.
+
+**Practical use.** The DinoVision study trains a decoder on DINOv3 features
+with Adam on the RTX 3050 under Windows, through Vulkan, and deploys the
+weights to a Quest 3S headset, where inference shares one Vulkan queue with
+OpenXR rendering. The same engine runs on both, with no second GPU runtime.
+
+**Benchmarking methodology.** Timing uses the RTX 5070 and H100, with driver
+595.91.07 serving both Vulkan and CUDA. The reference is PyTorch 2.13 with
 `torch.compile` and CUDA graph replay. The five workloads are SmolLM2-135M
 (public checkpoint), the SmolVLA action expert, a scaled 10.9M-parameter
 Stable Diffusion 1.x U-Net, ResNet-50 with folded normalization, and the

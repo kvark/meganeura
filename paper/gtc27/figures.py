@@ -59,7 +59,7 @@ def shade(value):
 
 
 def ratio_grid():
-    fig, axes = plt.subplots(1, 2, figsize=(13.2, 6.4), gridspec_kw={"wspace": .06})
+    fig, axes = plt.subplots(1, 2, figsize=(13.2, 8.6), gridspec_kw={"wspace": .06})
     for ax, (device, label) in zip(axes, DEVICES.items()):
         for row, model in enumerate(MODELS):
             for col, (profile, phase) in enumerate((p, ph) for p in ("strict", "accelerated") for ph, _ in PHASES):
@@ -100,7 +100,7 @@ def precision_gains():
                     native.append(strict[0] / accel[0])
                     torch.append(strict[1] / accel[1])
             groups.append((f"{label}\n{name.replace(chr(10), ' ')}", geomean(torch), geomean(native), len(torch)))
-    fig, ax = plt.subplots(figsize=(13.2, 6.6))
+    fig, ax = plt.subplots(figsize=(13.2, 9.2))
     height = .36
     for i, (name, torch, native, n) in enumerate(groups):
         y = i + (.5 if i >= 3 else 0)
@@ -150,7 +150,7 @@ def single_ops():
         if gpu == "rtx5070":
             # The single-submit row has no device time; it compares host round trips.
             rows[shape, engine] = float(wall_ms if shape == "add-256-single" else gpu_ms)
-    fig, ax = plt.subplots(figsize=(13.2, 12.8))
+    fig, ax = plt.subplots(figsize=(13.2, 15.2))
     y, ticks, labels = 0, [], []
     for group, shapes in OPS:
         ax.text(-.02, y + .1, group, fontsize=19, weight="bold", color=INK, va="center", ha="right",
