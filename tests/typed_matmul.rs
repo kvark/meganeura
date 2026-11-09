@@ -147,6 +147,7 @@ fn explicit_storage_selects_the_typed_schedule() {
                         ..MatrixTypes::reduced(storage)
                     },
                     splits,
+                    tile: meganeura::codegen::CheckedTile::BASE,
                 }
             );
             if !add {

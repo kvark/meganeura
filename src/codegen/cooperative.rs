@@ -4,6 +4,82 @@ use super::{
 };
 use crate::{DType, kernels::conv::Params};
 
+/// The output tile of one checked workgroup. Each subgroup owns a 32×32 block
+/// of native accumulators, so a wider tile stages every operand element once
+/// for more outputs. Every output still adds the same products in the same
+/// order, so all tiles compute identical values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct CheckedTile {
+    pub rows: u32,
+    pub columns: u32,
+}
+
+impl Default for CheckedTile {
+    fn default() -> Self {
+        Self::BASE
+    }
+}
+
+impl CheckedTile {
+    /// The tile of every checked product unless tuning measures another.
+    pub const BASE: Self = Self {
+        rows: 32,
+        columns: 32,
+    };
+    /// Wider tiles, which forward convolutions may use.
+    pub const WIDE: [Self; 5] = [
+        Self {
+            rows: 32,
+            columns: 64,
+        },
+        Self {
+            rows: 64,
+            columns: 32,
+        },
+        Self {
+            rows: 64,
+            columns: 64,
+        },
+        Self {
+            rows: 64,
+            columns: 128,
+        },
+        Self {
+            rows: 128,
+            columns: 64,
+        },
+    ];
+
+    pub fn valid(self) -> bool {
+        self == Self::BASE || Self::WIDE.contains(&self)
+    }
+
+    /// 32×32 blocks, one per subgroup when the width matches the hint.
+    pub fn blocks(self) -> u32 {
+        (self.rows / 32) * (self.columns / 32)
+    }
+
+    /// Invocations of a wide tile: one subgroup of the device's default
+    /// `subgroup` width (32 when unknown) per block, from one full 64-lane
+    /// subgroup up to the portable 256.
+    pub fn threads(self, subgroup: u32) -> u32 {
+        let width = if subgroup == 0 { 32 } else { subgroup };
+        width.saturating_mul(self.blocks()).clamp(64, 256)
+    }
+
+    /// Workgroup memory of a wide tile: both staged operands, plus an F32
+    /// result tile unless accumulators store straight to the output.
+    pub fn shared_bytes(self, multiply: DType, direct_output: bool) -> u32 {
+        let staged = (self.rows + self.columns) * 32 * MatrixTypes::bytes(multiply) as u32;
+        staged
+            + if direct_output {
+                0
+            } else {
+                self.rows * self.columns * 4
+            }
+    }
+}
+
 // Keep partition boundaries identical across native tile shapes.
 // A 32-element block contains whole 8-wide or 16-wide K tiles.
 pub(super) const SPLIT_RANGE: &str = "let blocks = (k + 31u) / 32u;\n\
@@ -23,7 +99,15 @@ pub(super) fn generate(
     subgroup: u32,
     layout: TypedMatmulLayout,
 ) -> ShaderModule {
-    generate_with_params(group, types, shape, None, subgroup, layout)
+    generate_with_params(
+        group,
+        types,
+        shape,
+        None,
+        subgroup,
+        layout,
+        CheckedTile::BASE,
+    )
 }
 
 pub(super) fn generate_with_params(
@@ -33,11 +117,17 @@ pub(super) fn generate_with_params(
     params: Option<&Params>,
     subgroup: u32,
     layout: TypedMatmulLayout,
+    tile: CheckedTile,
 ) -> ShaderModule {
     types.validate();
     assert!(
         super::checked_cooperative_shape(&[shape]).is_some(),
         "unsupported cooperative tile {shape:?}"
+    );
+    let wide = tile != CheckedTile::BASE;
+    assert!(
+        !wide || (tile.valid() && matches!(group, ShaderGroup::Conv2dChecked { .. })),
+        "{tile:?} is not a forward convolution tile"
     );
     let [m, n, k] = shape;
     let pointwise = group == ShaderGroup::Conv2dPointwiseGradInput;
@@ -346,154 +436,257 @@ pub(super) fn generate_with_params(
     } else {
         128
     };
+    let a_vector = convert("v", types.a);
+    let b_vector = convert("v", types.b);
+    // WGSL names cooperative matrices columns × rows, whereas device
+    // capabilities and the product shape are M × N × K.
+    let a_tile = format!("coop_mat{k}x{m}<{multiply}, A>");
+    let b_tile = format!("coop_mat{n}x{k}<{multiply}, B>");
+    let c_tile = format!("coop_mat{n}x{m}<f32, C>");
+    let (tile_m, tile_n, tile_k) = (m.to_string(), n.to_string(), k.to_string());
+    // Substituted after each kernel's own placeholders, which contain these.
+    let tail: [(&str, &str); 29] = [
+        ("$A_VECTOR", &a_vector),
+        ("$B_VECTOR", &b_vector),
+        ("$EXTENSIONS", &extensions),
+        ("$DECL", &declaration),
+        ("$DIMS", dimensions),
+        ("$RANGE", range),
+        ("$A_LOAD", a),
+        ("$B_LOAD", b),
+        (
+            "$DENSE_A_AT",
+            if vector_dense {
+                "matrix_a[(ak * m + ar) / 4u][(ak * m + ar) % 4u]"
+            } else {
+                "matrix_a[ak * m + ar]"
+            },
+        ),
+        (
+            "$DENSE_A_NN",
+            if vector_dense {
+                "matrix_a[(ar * k + ak) / 4u][(ar * k + ak) % 4u]"
+            } else {
+                "matrix_a[ar * k + ak]"
+            },
+        ),
+        (
+            "$DENSE_B_BT",
+            if vector_dense {
+                "matrix_b[(bc * k + bk) / 4u][(bc * k + bk) % 4u]"
+            } else {
+                "matrix_b[bc * k + bk]"
+            },
+        ),
+        (
+            "$DENSE_B_NN",
+            if vector_dense {
+                "matrix_b[(bk * n + bc) / 4u][(bk * n + bc) % 4u]"
+            } else {
+                "matrix_b[bk * n + bc]"
+            },
+        ),
+        ("$INDEX", index),
+        ("$DEST", destination),
+        (
+            "$ROUND",
+            if rounds {
+                include_str!("../shaders/bf16_round.wgsl")
+            } else {
+                ""
+            },
+        ),
+        ("$A_TYPE", MatrixTypes::name(types.a)),
+        ("$B_TYPE", MatrixTypes::name(types.b)),
+        ("$A_CAST", a_cast),
+        ("$B_CAST", b_cast),
+        ("$OUT_TYPE", MatrixTypes::name(types.output)),
+        (
+            "$STORE",
+            if types.output == DType::BF16 {
+                "round_bf16"
+            } else {
+                MatrixTypes::name(types.output)
+            },
+        ),
+        ("$ADD", add),
+        ("$A_TILE", &a_tile),
+        ("$B_TILE", &b_tile),
+        ("$C_TILE", &c_tile),
+        ("$MULTIPLY_TYPE", multiply),
+        ("$TILE_M", &tile_m),
+        ("$TILE_N", &tile_n),
+        ("$TILE_K", &tile_k),
+    ];
+    if wide {
+        let own = wide_substitutions(tile, [m, n], subgroup, direct_output, vector_conv);
+        let vars: Vec<_> = own
+            .iter()
+            .map(|&(key, ref value)| (key, value.as_str()))
+            .chain(tail)
+            .collect();
+        let template = include_str!("../shaders/conv2d_checked_wide.wgsl");
+        return ShaderModule::new(&preprocess(
+            super::template_section(template, "main"),
+            &vars,
+        ));
+    }
+    let a_stage_decl = if global_a {
+        String::new()
+    } else {
+        format!("var<workgroup> stage_a: array<{multiply}, 1024>;")
+    };
+    let b_stage_decl = if global_b {
+        String::new()
+    } else {
+        format!("var<workgroup> stage_b: array<{multiply}, 1024>;")
+    };
+    let own: [(&str, &str); 19] = [
+        ("$STAGE", &stage),
+        ("$A_STAGE_DECL", &a_stage_decl),
+        ("$B_STAGE_DECL", &b_stage_decl),
+        (
+            "$INPUT_BARRIER",
+            if global_a && global_b {
+                ""
+            } else {
+                "workgroupBarrier();"
+            },
+        ),
+        ("$A_MATRIX", &matrix_load(true, "0u")),
+        ("$A_LOWER_MATRIX", &matrix_load(true, "lower_row")),
+        ("$B_MATRIX", &matrix_load(false, "0u")),
+        ("$B_RIGHT_MATRIX", &matrix_load(false, "right_col")),
+        (
+            "$RESULT_DECL",
+            if direct_output {
+                ""
+            } else {
+                "var<workgroup> result: array<f32, 1024>;"
+            },
+        ),
+        ("$RESULT_SCATTER", if direct_output { "" } else { scatter }),
+        (
+            "$STORE_VALID",
+            if direct_output {
+                " && row + a_offset / 32u < m && col + b_offset < n"
+            } else {
+                ""
+            },
+        ),
+        ("$RESULT_STRIDE", if direct_output { "n" } else { "32u" }),
+        ("$C_LOWER_RIGHT", &result_pointer(8, 8)),
+        ("$C_LOWER", &result_pointer(8, 0)),
+        ("$C_RIGHT", &result_pointer(0, 8)),
+        ("$C_BASE", &result_pointer(0, 0)),
+        ("$THREADS", &threads.to_string()),
+        (
+            "$TRANSPOSE_A",
+            if variant == Some(MatMulCoopVariant::AT) {
+                "true"
+            } else {
+                "false"
+            },
+        ),
+        (
+            "$TRANSPOSE_B",
+            if variant == Some(MatMulCoopVariant::BT) {
+                "true"
+            } else {
+                "false"
+            },
+        ),
+    ];
+    let vars: Vec<_> = own.into_iter().chain(tail).collect();
     ShaderModule::new(&preprocess(
         super::template_section(template, "main"),
-        &[
-            ("$STAGE", &stage),
-            (
-                "$A_STAGE_DECL",
-                if global_a {
-                    String::new()
-                } else {
-                    format!("var<workgroup> stage_a: array<{multiply}, 1024>;")
-                }
-                .as_str(),
-            ),
-            (
-                "$B_STAGE_DECL",
-                if global_b {
-                    String::new()
-                } else {
-                    format!("var<workgroup> stage_b: array<{multiply}, 1024>;")
-                }
-                .as_str(),
-            ),
-            (
-                "$INPUT_BARRIER",
-                if global_a && global_b {
-                    ""
-                } else {
-                    "workgroupBarrier();"
-                },
-            ),
-            ("$A_MATRIX", &matrix_load(true, "0u")),
-            ("$A_LOWER_MATRIX", &matrix_load(true, "lower_row")),
-            ("$B_MATRIX", &matrix_load(false, "0u")),
-            ("$B_RIGHT_MATRIX", &matrix_load(false, "right_col")),
-            (
-                "$RESULT_DECL",
-                if direct_output {
-                    ""
-                } else {
-                    "var<workgroup> result: array<f32, 1024>;"
-                },
-            ),
-            ("$RESULT_SCATTER", if direct_output { "" } else { scatter }),
-            (
-                "$STORE_VALID",
-                if direct_output {
-                    " && row + a_offset / 32u < m && col + b_offset < n"
-                } else {
-                    ""
-                },
-            ),
-            ("$RESULT_STRIDE", if direct_output { "n" } else { "32u" }),
-            ("$C_LOWER_RIGHT", &result_pointer(8, 8)),
-            ("$C_LOWER", &result_pointer(8, 0)),
-            ("$C_RIGHT", &result_pointer(0, 8)),
-            ("$C_BASE", &result_pointer(0, 0)),
-            ("$THREADS", &threads.to_string()),
-            (
-                "$TRANSPOSE_A",
-                if variant == Some(MatMulCoopVariant::AT) {
-                    "true"
-                } else {
-                    "false"
-                },
-            ),
-            (
-                "$TRANSPOSE_B",
-                if variant == Some(MatMulCoopVariant::BT) {
-                    "true"
-                } else {
-                    "false"
-                },
-            ),
-            ("$A_VECTOR", &convert("v", types.a)),
-            ("$B_VECTOR", &convert("v", types.b)),
-            ("$EXTENSIONS", &extensions),
-            ("$DECL", &declaration),
-            ("$DIMS", dimensions),
-            ("$RANGE", range),
-            ("$A_LOAD", a),
-            ("$B_LOAD", b),
-            (
-                "$DENSE_A_AT",
-                if vector_dense {
-                    "matrix_a[(ak * m + ar) / 4u][(ak * m + ar) % 4u]"
-                } else {
-                    "matrix_a[ak * m + ar]"
-                },
-            ),
-            (
-                "$DENSE_A_NN",
-                if vector_dense {
-                    "matrix_a[(ar * k + ak) / 4u][(ar * k + ak) % 4u]"
-                } else {
-                    "matrix_a[ar * k + ak]"
-                },
-            ),
-            (
-                "$DENSE_B_BT",
-                if vector_dense {
-                    "matrix_b[(bc * k + bk) / 4u][(bc * k + bk) % 4u]"
-                } else {
-                    "matrix_b[bc * k + bk]"
-                },
-            ),
-            (
-                "$DENSE_B_NN",
-                if vector_dense {
-                    "matrix_b[(bk * n + bc) / 4u][(bk * n + bc) % 4u]"
-                } else {
-                    "matrix_b[bk * n + bc]"
-                },
-            ),
-            ("$INDEX", index),
-            ("$DEST", destination),
-            (
-                "$ROUND",
-                if rounds {
-                    include_str!("../shaders/bf16_round.wgsl")
-                } else {
-                    ""
-                },
-            ),
-            ("$A_TYPE", MatrixTypes::name(types.a)),
-            ("$B_TYPE", MatrixTypes::name(types.b)),
-            ("$A_CAST", a_cast),
-            ("$B_CAST", b_cast),
-            ("$OUT_TYPE", MatrixTypes::name(types.output)),
-            (
-                "$STORE",
-                if types.output == DType::BF16 {
-                    "round_bf16"
-                } else {
-                    MatrixTypes::name(types.output)
-                },
-            ),
-            ("$ADD", add),
-            // WGSL names cooperative matrices columns × rows, whereas device
-            // capabilities and the product shape are M × N × K.
-            ("$A_TILE", &format!("coop_mat{k}x{m}<{multiply}, A>")),
-            ("$B_TILE", &format!("coop_mat{n}x{k}<{multiply}, B>")),
-            ("$C_TILE", &format!("coop_mat{n}x{m}<f32, C>")),
-            ("$MULTIPLY_TYPE", multiply),
-            ("$TILE_M", &m.to_string()),
-            ("$TILE_N", &n.to_string()),
-            ("$TILE_K", &k.to_string()),
-        ],
+        &vars,
     ))
+}
+
+/// Placeholders of the wide forward convolution kernel: its geometry, its
+/// staging, and the 32×32 block of native accumulators each subgroup owns.
+fn wide_substitutions(
+    tile: CheckedTile,
+    [native_rows, native_columns]: [u32; 2],
+    subgroup: u32,
+    direct_output: bool,
+    vector_conv: bool,
+) -> Vec<(&'static str, String)> {
+    let template = include_str!("../shaders/conv2d_checked_wide.wgsl");
+    let CheckedTile { rows, columns } = tile;
+    let (row_blocks, column_blocks) = (32 / native_rows, 32 / native_columns);
+    let mut accumulators = String::new();
+    let mut products = String::new();
+    let mut stores = String::new();
+    for i in 0..row_blocks {
+        let r = i * native_rows;
+        products += &format!(
+            "                let a{i} = coopLoadT<$A_TILE>(&stage_a[(block_row + {r}u) * 32u + inner], 32u);\n"
+        );
+    }
+    for j in 0..column_blocks {
+        let c = j * native_columns;
+        products += &format!(
+            "                let b{j} = coopLoadT<$B_TILE>(&stage_b[inner * {columns}u + block_col + {c}u], {columns}u);\n"
+        );
+    }
+    for i in 0..row_blocks {
+        for j in 0..column_blocks {
+            let (r, c) = (i * native_rows, j * native_columns);
+            accumulators += &format!("        var acc{i}_{j} = $C_TILE();\n");
+            products +=
+                &format!("                acc{i}_{j} = coopMultiplyAdd(a{i}, b{j}, acc{i}_{j});\n");
+            stores += &if direct_output {
+                format!(
+                    "            if row + block_row + {r}u < m && col + block_col + {c}u < n {{\n\
+                     \x20               coopStoreT(acc{i}_{j}, &dst[(group.z * m + row + block_row + {r}u) * n + col + block_col + {c}u], n);\n\
+                     \x20           }}\n"
+                )
+            } else {
+                format!(
+                    "            coopStoreT(acc{i}_{j}, &result[(block_row + {r}u) * {columns}u + block_col + {c}u], {columns}u);\n"
+                )
+            };
+        }
+    }
+    let stage = if vector_conv { "vector_stage" } else { "stage" };
+    vec![
+        (
+            "$WIDE_STAGE",
+            super::template_section(template, stage).to_owned(),
+        ),
+        ("$WIDE_ACCUMULATORS", accumulators),
+        ("$WIDE_PRODUCTS", products),
+        ("$WIDE_STORES", stores),
+        (
+            "$RESULT_DECL",
+            if direct_output {
+                String::new()
+            } else {
+                format!("var<workgroup> result: array<f32, {}>;", rows * columns)
+            },
+        ),
+        (
+            "$RESULT_SCATTER",
+            if direct_output {
+                String::new()
+            } else {
+                super::template_section(template, "scatter").to_owned()
+            },
+        ),
+        ("$WIDE_ROWS", rows.to_string()),
+        ("$WIDE_COLUMNS", columns.to_string()),
+        ("$WIDE_BLOCKS", tile.blocks().to_string()),
+        ("$WIDE_BLOCK_COLUMNS", (columns / 32).to_string()),
+        ("$WIDE_A_SIZE", (rows * 32).to_string()),
+        ("$WIDE_B_SIZE", (32 * columns).to_string()),
+        ("$WIDE_A_VECTORS", (rows * 8).to_string()),
+        ("$WIDE_B_VECTORS", (8 * columns).to_string()),
+        ("$WIDE_COLUMN_VECTORS", (columns / 4).to_string()),
+        ("$WIDE_RESULT", (rows * columns).to_string()),
+        ("$THREADS", tile.threads(subgroup).to_string()),
+    ]
 }
 
 #[cfg(test)]
@@ -688,6 +881,7 @@ mod tests {
                             Some(&params),
                             subgroup,
                             TypedMatmulLayout::default(),
+                            CheckedTile::BASE,
                         );
                         assert_eq!(
                             module.module.entry_points[0].workgroup_size,
@@ -720,6 +914,157 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every wide tile meets every native shape, vector and scalar staging,
+    /// and direct and staged stores; types and subgroup widths cycle.
+    #[test]
+    fn wide_convolution_tiles_validate_and_emit_spirv() {
+        let capabilities = naga::valid::Capabilities::SHADER_BFLOAT16
+            | naga::valid::Capabilities::SHADER_FLOAT16
+            | naga::valid::Capabilities::COOPERATIVE_MATRIX
+            | naga::valid::Capabilities::SUBGROUP;
+        let types = [
+            MatrixTypes {
+                multiply: DType::F16,
+                ..MatrixTypes::F32_AS_F16
+            },
+            MatrixTypes {
+                multiply: DType::BF16,
+                ..MatrixTypes::F32_AS_F16
+            },
+            MatrixTypes {
+                output: DType::BF16,
+                ..MatrixTypes::BF16
+            },
+        ];
+        let mut index = 0;
+        for tile in CheckedTile::WIDE {
+            for shape in [[16, 16, 16], [8, 16, 16], [8, 8, 8]] {
+                // (in_h, in_w, in_channels, out_channels, kernel, stride, padding)
+                for (h, w, ci, co, kernel, stride, pad) in [
+                    (16, 16, 64, 64, 1, 1, 0),
+                    (14, 14, 64, 96, 1, 1, 0),
+                    (11, 13, 3, 65, 3, 2, 1),
+                    (16, 16, 32, 48, 3, 1, 1),
+                ] {
+                    let (out_h, out_w) = (
+                        (h + 2 * pad - kernel) / stride + 1,
+                        (w + 2 * pad - kernel) / stride + 1,
+                    );
+                    let params = Params {
+                        batch: 2,
+                        in_channels: ci,
+                        in_h: h,
+                        in_w: w,
+                        out_channels: co,
+                        kernel_h: kernel,
+                        kernel_w: kernel,
+                        stride,
+                        padding_h: pad,
+                        out_h,
+                        out_w,
+                        padding_w: pad,
+                        kernel_w_multiplier: crate::divisor::multiplier(kernel),
+                        kernel_hw_multiplier: crate::divisor::multiplier(kernel * kernel),
+                        column_width_multiplier: crate::divisor::multiplier(out_w),
+                        output_spatial_multiplier: crate::divisor::multiplier(out_h * out_w),
+                    };
+                    let types = types[index % types.len()];
+                    let subgroup = [0, 16, 32, 64][index % 4];
+                    index += 1;
+                    let group = ShaderGroup::Conv2dChecked {
+                        kernel_h: kernel,
+                        kernel_w: kernel,
+                        stride,
+                    };
+                    let mut module = super::super::generate_checked_conv(
+                        group, types, shape, &params, subgroup, tile,
+                    );
+                    let what = format!("{tile:?} {shape:?} {types:?} {params:?} {subgroup}");
+                    assert_eq!(
+                        module.module.entry_points[0].workgroup_size,
+                        [tile.threads(subgroup), 1, 1],
+                        "{what}"
+                    );
+                    let accumulators = (32 / shape[0]) * (32 / shape[1]);
+                    let last = format!("acc{}_{} =", 32 / shape[0] - 1, 32 / shape[1] - 1);
+                    assert!(module.source.contains(&last), "{what}");
+                    assert_eq!(
+                        module.source.matches("coopMultiplyAdd").count() as u32,
+                        accumulators,
+                        "{what}"
+                    );
+                    let direct = types.output == DType::F32
+                        && co.is_multiple_of(16)
+                        && (out_h * out_w).is_multiple_of(16);
+                    assert_eq!(
+                        !module.source.contains("var<workgroup> result"),
+                        direct,
+                        "{what}"
+                    );
+                    assert_eq!(
+                        module.source.contains("weight[(ar * k + ak) / 4u]"),
+                        params.vectorized_forward(),
+                        "{what}"
+                    );
+                    let mut binding = 0;
+                    for (_, global) in module.module.global_variables.iter_mut() {
+                        if matches!(
+                            global.space,
+                            naga::AddressSpace::Uniform | naga::AddressSpace::Storage { .. }
+                        ) {
+                            global.binding = Some(naga::ResourceBinding { group: 0, binding });
+                            binding += 1;
+                        }
+                    }
+                    let info = naga::valid::Validator::new(
+                        naga::valid::ValidationFlags::all(),
+                        capabilities,
+                    )
+                    .validate(&module.module)
+                    .unwrap_or_else(|error| panic!("{what}: {error:?}"));
+                    naga::back::spv::write_vec(
+                        &module.module,
+                        &info,
+                        &naga::back::spv::Options::default(),
+                        None,
+                    )
+                    .unwrap_or_else(|error| panic!("{what}: {error:?}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wide_tile_geometry() {
+        for tile in CheckedTile::WIDE {
+            assert!(tile.valid() && tile.blocks() >= 2, "{tile:?}");
+            // One subgroup per block at the hinted width, inside the portable
+            // limit and never below one full 64-lane subgroup.
+            for subgroup in [0, 16, 32, 64] {
+                let threads = tile.threads(subgroup);
+                assert!((64..=256).contains(&threads), "{tile:?} {subgroup}");
+            }
+            assert_eq!(tile.threads(32), 32 * tile.blocks());
+        }
+        assert!(
+            !CheckedTile {
+                rows: 128,
+                columns: 128
+            }
+            .valid()
+        );
+        // Both staged operands, plus an F32 result unless stored directly.
+        let tile = CheckedTile {
+            rows: 64,
+            columns: 128,
+        };
+        assert_eq!(tile.shared_bytes(DType::F16, true), (64 + 128) * 32 * 2);
+        assert_eq!(
+            tile.shared_bytes(DType::F16, false),
+            (64 + 128) * 32 * 2 + 64 * 128 * 4
+        );
     }
 
     #[test]

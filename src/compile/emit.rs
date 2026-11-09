@@ -1027,6 +1027,7 @@ impl<'a> Compiler<'a> {
                 kernel: super::Kernel::CooperativeTyped {
                     types: crate::codegen::MatrixTypes::reduced(storage),
                     splits,
+                    tile: crate::codegen::CheckedTile::BASE,
                 },
                 workgroups: grid,
                 input_buffers: node.inputs.iter().map(|&id| self.get_buffer(id)).collect(),

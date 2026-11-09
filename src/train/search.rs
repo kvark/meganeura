@@ -1076,6 +1076,7 @@ fn fill_matrix_candidates_scoped(
                     ..crate::codegen::MatrixTypes::F32_AS_F16
                 },
                 splits: 1,
+                tile: crate::codegen::CheckedTile::BASE,
             };
             d.workgroups = grid;
             count += 1;
@@ -1135,6 +1136,7 @@ fn fill_conv_gradient_candidates(
                 ..crate::codegen::MatrixTypes::F32_AS_F16
             },
             splits: 1,
+            tile: crate::codegen::CheckedTile::BASE,
         };
         dispatch.workgroups = grid;
         count += 1;
@@ -1231,6 +1233,7 @@ fn fill_dense_product(
             ..crate::codegen::MatrixTypes::F32_AS_F16
         },
         splits,
+        tile: crate::codegen::CheckedTile::BASE,
     };
     d.schedule_locked = false;
     d.workgroups = grid;
@@ -1847,6 +1850,7 @@ mod tests {
                         ..crate::codegen::MatrixTypes::F32_AS_F16
                     },
                     splits: 1,
+                    tile: crate::codegen::CheckedTile::BASE,
                 };
                 d.workgroups = [ci.div_ceil(32), (h * w).div_ceil(32), batch];
                 compile::schedule_dispatches(&mut plan, false, false);
@@ -2573,7 +2577,7 @@ mod tests {
             "typed storage replaces opaque-format dispatch metadata"
         );
         assert!(matches!(candidate.dispatches[0].kernel,
-            compile::Kernel::CooperativeTyped {types, splits:1}
+            compile::Kernel::CooperativeTyped {types, splits:1, .. }
                 if types.a == DType::F32 && types.b == DType::F16
                     && types.multiply == DType::F16 && types.output == DType::F32));
         let mut bf16 = original.clone();
@@ -2594,7 +2598,7 @@ mod tests {
         plan.dispatches[index].kernel = compile::Kernel::Cooperative;
         assert_eq!(fill_matrix_candidates(&mut plan, DType::BF16, false), 1);
         assert!(matches!(plan.dispatches[index].kernel,
-            compile::Kernel::CooperativeTyped { types, splits: 1 }
+            compile::Kernel::CooperativeTyped { types, splits: 1, .. }
                 if types.multiply == DType::BF16 && types.a == DType::F32
                     && types.b == DType::F32 && types.output == DType::F32));
     }

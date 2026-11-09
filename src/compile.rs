@@ -1279,6 +1279,10 @@ pub enum Kernel {
     CooperativeTyped {
         types: crate::codegen::MatrixTypes,
         splits: u32,
+        /// Output tile per workgroup. Only forward convolutions use one
+        /// wider than [`CheckedTile::BASE`](crate::codegen::CheckedTile::BASE).
+        #[serde(default)]
+        tile: crate::codegen::CheckedTile,
     },
     /// Aligned workgroup tiles with F16 or BF16 operands and F32 accumulation.
     CooperativeWorkgroup {

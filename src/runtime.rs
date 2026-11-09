@@ -931,7 +931,13 @@ enum Variant {
         crate::codegen::MatrixTypes,
         crate::codegen::TypedMatmulLayout,
     ),
-    CoopConv(ShaderEntry, crate::codegen::MatrixTypes, Conv2dParams),
+    /// Checked convolution specialized for its parameters, at an output tile.
+    CoopConv(
+        ShaderEntry,
+        crate::codegen::MatrixTypes,
+        Conv2dParams,
+        crate::codegen::CheckedTile,
+    ),
     CoopWorkgroup(
         ShaderEntry,
         crate::codegen::WorkgroupMatmulShape,
@@ -1047,7 +1053,7 @@ impl Variant {
             | Variant::WinogradMatmul(ref e, _, _)
             | Variant::Attention(ref e, _, _)
             | Variant::CoopTyped(ref e, _, _)
-            | Variant::CoopConv(ref e, _, _)
+            | Variant::CoopConv(ref e, _, _, _)
             | Variant::CoopWorkgroup(ref e, _, _, _)
             | Variant::CoopTiled(ref e, _, _, _)
             | Variant::SplitMatmul(ref e, _, _, _)
@@ -1072,8 +1078,13 @@ impl Variant {
     /// Name used by the profiler and by pipeline-statistics dumps.
     fn label(&self) -> String {
         match *self {
-            Variant::CoopConv(ref e, types, ref params) => {
-                format!("{e:?}:checked-{types:?}-fixed-{params:?}")
+            Variant::CoopConv(ref e, types, ref params, tile) => {
+                let suffix = if tile == crate::codegen::CheckedTile::BASE {
+                    String::new()
+                } else {
+                    format!("-{}x{}", tile.rows, tile.columns)
+                };
+                format!("{e:?}:checked-{types:?}-fixed-{params:?}{suffix}")
             }
             Variant::StoredGate(ref entry, storage) => format!("{entry:?}:store-{storage:?}"),
             Variant::WinogradTransform(ref entry, storage) => format!("{entry:?}:{storage:?}"),
@@ -1610,7 +1621,11 @@ mod precision_requirement_tests {
     fn distinguishes_storage_from_cooperative_products() {
         let typed = |types| Dispatch {
             shader: ShaderEntry::MatMul,
-            kernel: Kernel::CooperativeTyped { types, splits: 1 },
+            kernel: Kernel::CooperativeTyped {
+                types,
+                splits: 1,
+                tile: crate::codegen::CheckedTile::BASE,
+            },
             ..Default::default()
         };
         assert_eq!(
@@ -1686,7 +1701,7 @@ mod precision_requirement_tests {
                 .iter()
                 .find(|d| matches!(d.kernel, Kernel::CooperativeTyped { .. }))
                 .unwrap();
-            let Kernel::CooperativeTyped { types, splits } = product.kernel else {
+            let Kernel::CooperativeTyped { types, splits, .. } = product.kernel else {
                 unreachable!()
             };
             assert!(product.use_coop());
@@ -1726,7 +1741,10 @@ mod precision_requirement_tests {
                         crate::tune::MatmulTile::selected(product, config.as_ref()).unwrap();
                     assert_eq!(
                         initial,
-                        crate::tune::MatmulTile::CooperativeChecked { splits }
+                        crate::tune::MatmulTile::CooperativeChecked {
+                            splits,
+                            tile: crate::codegen::CheckedTile::BASE,
+                        }
                     );
                     let mut class = class;
                     class.binding_bytes = initial.buffer_sizes(&class).unwrap();
@@ -1964,7 +1982,7 @@ impl Pipelines {
                 tile,
                 gpu.capabilities().subgroup_size,
             ),
-            Variant::CoopConv(ref entry, types, ref params) => {
+            Variant::CoopConv(ref entry, types, ref params, tile) => {
                 let group = match *entry {
                     ShaderEntry::Conv2dGemmCoopGen(kernel_h, kernel_w, stride) => {
                         ShaderGroup::Conv2dChecked {
@@ -1984,6 +2002,7 @@ impl Pipelines {
                     typed_shape(types.multiply)?,
                     params,
                     gpu.capabilities().subgroup_size,
+                    tile,
                 )
             }
             Variant::CoopTyped(_, types, staging) => {
@@ -2329,12 +2348,12 @@ impl Pipelines {
                 dispatch.mnk().is_some_and(|(m, _, _)| shape.ragged_rows(m)),
             );
         }
-        if let crate::compile::Kernel::CooperativeTyped { types, .. } = dispatch.kernel {
+        if let crate::compile::Kernel::CooperativeTyped { types, tile, .. } = dispatch.kernel {
             if matches!(
                 entry,
                 ShaderEntry::Conv2dGemmCoopGen(..) | ShaderEntry::Conv2dGradInputGemmCoopGen(..)
             ) {
-                return Variant::CoopConv(entry, types, Conv2dParams::from(dispatch));
+                return Variant::CoopConv(entry, types, Conv2dParams::from(dispatch), tile);
             }
             let mut layout = typed_matmul_layout(dispatch);
             // The native16 stored generator does not use direct_inputs.
@@ -5349,6 +5368,7 @@ mod variant_tests {
             kernel: crate::compile::Kernel::CooperativeTyped {
                 types: crate::codegen::MatrixTypes::reduced(crate::DType::F16),
                 splits: 1,
+                tile: crate::codegen::CheckedTile::BASE,
             },
             params: vec![m, 64, 64, 0],
             ..Default::default()
@@ -5482,6 +5502,7 @@ mod variant_tests {
                     Kernel::CooperativeTyped {
                         types: MatrixTypes::BF16,
                         splits: 1,
+                        tile: crate::codegen::CheckedTile::BASE,
                     },
                     WeightFormat::F32,
                 ),
@@ -5492,6 +5513,7 @@ mod variant_tests {
                             ..MatrixTypes::BF16
                         },
                         splits: 1,
+                        tile: crate::codegen::CheckedTile::BASE,
                     },
                     WeightFormat::F32,
                 ),
@@ -5499,6 +5521,7 @@ mod variant_tests {
                     Kernel::CooperativeTyped {
                         types: MatrixTypes::reduced(crate::DType::F16),
                         splits: 1,
+                        tile: crate::codegen::CheckedTile::BASE,
                     },
                     WeightFormat::F32,
                 ),
@@ -5531,6 +5554,7 @@ mod variant_tests {
                 kernel: crate::compile::Kernel::CooperativeTyped {
                     types: crate::codegen::MatrixTypes::BF16,
                     splits: 1,
+                    tile: crate::codegen::CheckedTile::BASE,
                 },
                 params: vec![m, k, n, 0],
                 ..Default::default()

@@ -1256,6 +1256,7 @@ mod tests {
                     kernel: Kernel::CooperativeTyped {
                         types: crate::codegen::MatrixTypes::BF16,
                         splits,
+                        tile: crate::codegen::CheckedTile::BASE,
                     },
                     params: vec![128, 2560, 256, 0],
                     workgroups: [4, 8, splits],

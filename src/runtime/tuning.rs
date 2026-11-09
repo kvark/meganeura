@@ -538,6 +538,14 @@ fn retain_tunable_classes(
                     shape.supports(capabilities, types, class.key.m, class.key.n, class.key.k)
                 })
             }
+            MatmulTile::CooperativeChecked { tile, .. }
+                if tile != crate::codegen::CheckedTile::BASE =>
+            {
+                class
+                    .key
+                    .checked_tile_bytes(tile)
+                    .is_some_and(|bytes| shared_limit == 0 || bytes <= shared_limit)
+            }
             _ => true,
         });
     }
@@ -2758,7 +2766,13 @@ mod tests {
             };
             key.binding_bytes = key.buffer_sizes().unwrap();
             let (initial, config) = if types.is_some() {
-                (MatmulTile::CooperativeChecked { splits: 1 }, None)
+                (
+                    MatmulTile::CooperativeChecked {
+                        splits: 1,
+                        tile: crate::codegen::CheckedTile::BASE,
+                    },
+                    None,
+                )
             } else if automatic {
                 (MatmulTile::CooperativeF16 { tile_size: 16 }, Some(&reduced))
             } else {
@@ -2784,6 +2798,57 @@ mod tests {
                 offered, expected,
                 "types={types:?} automatic={automatic} operand={operand:?} memory={memory} dimension={dimension} m={m}"
             );
+        }
+    }
+
+    /// Wide checked convolution tiles are offered only where the device's
+    /// workgroup memory holds both staged operands and the result tile.
+    #[test]
+    fn checked_convolution_tiles_fit_workgroup_memory() {
+        use crate::codegen::{CheckedTile, MatrixTypes};
+        use crate::compile::Kernel;
+        let dispatch = Dispatch {
+            shader: ShaderEntry::Conv2dGemmCoopGen(3, 3, 1),
+            params: vec![2, 32, 13, 15, 70, 3, 3, 1, 1, 13, 15, 1],
+            kernel: Kernel::CooperativeTyped {
+                types: MatrixTypes {
+                    multiply: crate::DType::F16,
+                    ..MatrixTypes::F32_AS_F16
+                },
+                splits: 1,
+                tile: CheckedTile::BASE,
+            },
+            workgroups: [3, 7, 2],
+            input_buffers: vec![crate::compile::BufferRef(0), crate::compile::BufferRef(1)],
+            output_buffer: crate::compile::BufferRef(2),
+            ..Default::default()
+        };
+        let mut key = TuneClass::from_dispatch(&dispatch, None).unwrap();
+        key.binding_bytes = key.buffer_sizes().unwrap();
+        let initial = MatmulTile::selected(&dispatch, None).unwrap();
+        // The ragged 70x195 output stages its F32 result: 32x64 and 64x32
+        // tiles take 14 KiB, the larger ones 24 KiB or more.
+        for (limit, offered) in [(0, 5), (16384, 2), (49152, 5)] {
+            let caps = bg::Capabilities {
+                max_compute_shared_memory_size: limit,
+                ..Default::default()
+            };
+            let mut classes = vec![SearchClass {
+                input_b_copies: 1,
+                key: key.clone(),
+                initial,
+                members: vec![0],
+                reductions: Vec::new(),
+                challengers: key.challengers(initial, None),
+            }];
+            retain_tunable_classes(&mut classes, &Default::default(), &caps);
+            assert_eq!(classes[0].challengers.len(), offered, "limit {limit}");
+            for &tile in &classes[0].challengers {
+                let MatmulTile::CooperativeChecked { tile, .. } = tile else {
+                    unreachable!("{tile:?}")
+                };
+                assert!(limit == 0 || key.checked_tile_bytes(tile).unwrap() <= limit);
+            }
         }
     }
 
@@ -4350,7 +4415,11 @@ mod tests {
                 };
                 let dispatch = Dispatch {
                     shader: ShaderEntry::MatMulBT,
-                    kernel: Kernel::CooperativeTyped { types, splits: 4 },
+                    kernel: Kernel::CooperativeTyped {
+                        types,
+                        splits: 4,
+                        tile: crate::codegen::CheckedTile::BASE,
+                    },
                     input_buffers: vec![BufferRef(0), BufferRef(1)],
                     output_buffer: BufferRef(2),
                     params: vec![3, 5, 1031, 0],
@@ -4363,8 +4432,17 @@ mod tests {
                 // The compiled partial buffer holds four partitions.
                 *class.binding_bytes.last_mut().unwrap() *= 4;
                 assert_eq!(
-                    class.challengers(MatmulTile::CooperativeChecked { splits: 4 }, None),
-                    vec![MatmulTile::CooperativeChecked { splits: 2 }]
+                    class.challengers(
+                        MatmulTile::CooperativeChecked {
+                            splits: 4,
+                            tile: crate::codegen::CheckedTile::BASE,
+                        },
+                        None
+                    ),
+                    vec![MatmulTile::CooperativeChecked {
+                        splits: 2,
+                        tile: crate::codegen::CheckedTile::BASE,
+                    }]
                 );
                 assert!(!MatmulTile::Tile32.fits(&class));
                 let mut locked = dispatch.clone();
@@ -4462,7 +4540,10 @@ mod tests {
         // The four compiled partitions bound the partial buffer.
         assert_eq!(
             classes[0].challengers,
-            [MatmulTile::CooperativeChecked { splits: 2 }]
+            [MatmulTile::CooperativeChecked {
+                splits: 2,
+                tile: crate::codegen::CheckedTile::BASE,
+            }]
         );
         assert_eq!(classes[0].reductions.len(), 1);
     }

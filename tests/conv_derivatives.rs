@@ -884,3 +884,126 @@ fn generated_conv_indexing_matches_full_oracle_at_reciprocal_boundaries() {
         }
     }
 }
+
+/// A wide checked tile adds each output's products in the 32x32 tile's
+/// order, so its outputs must match bit for bit: on ragged and aligned
+/// outputs, with vector-staged 1x1 convolutions, and at stride 2.
+#[test]
+#[ignore = "Requires F16 cooperative hardware; compares wide checked convolution tiles bit for bit"]
+fn wide_checked_convolution_tiles_match_the_base_tile() {
+    use meganeura::codegen::{CheckedTile, MatrixTypes};
+    use meganeura::compile::Kernel;
+    let gpu = gpu();
+    let capabilities = gpu.capabilities();
+    assert!(
+        meganeura::codegen::checked_cooperative_shape(
+            &capabilities.cooperative_matrix.f16_f32_shapes
+        )
+        .is_some(),
+        "requires F16 cooperative products"
+    );
+    let types = MatrixTypes {
+        multiply: meganeura::DType::F16,
+        ..MatrixTypes::F32_AS_F16
+    };
+    let shape = |batch, ci, h, w, co, kernel, stride, padding| Shape {
+        batch,
+        ci,
+        h,
+        w,
+        co,
+        kh: kernel,
+        kw: kernel,
+        stride,
+        ph: padding,
+        pw: padding,
+    };
+    for shape in [
+        // Ragged output: the result tile is staged before scattering.
+        shape(2, 32, 13, 15, 70, 3, 1, 1),
+        // Whole 16x16 blocks: accumulators store straight to the output.
+        shape(2, 32, 16, 16, 64, 3, 1, 1),
+        // A contiguous 1x1 gather stages vectors.
+        shape(2, 64, 14, 14, 96, 1, 1, 0),
+        shape(1, 16, 15, 17, 48, 3, 2, 1),
+    ] {
+        let [nx, nw, ny] = shape.sizes();
+        let (oh, ow) = shape.output();
+        let (x, w) = (data(nx, 3, 1.0), data(nw, 5, 1.0));
+        let run = |tile: CheckedTile| -> Vec<u32> {
+            let mut graph = Graph::new();
+            let input = graph.input("x", &[nx]);
+            let weight = graph.input("w", &[nw]);
+            let y = graph.conv2d_hw(
+                input,
+                weight,
+                shape.batch,
+                shape.ci,
+                shape.h,
+                shape.w,
+                shape.co,
+                shape.kh,
+                shape.kw,
+                shape.stride,
+                shape.ph,
+                shape.pw,
+            );
+            graph.set_outputs(vec![y]);
+            let mut plan = meganeura::compile::compile(&graph);
+            let conv = plan
+                .dispatches
+                .iter_mut()
+                .find(|d| {
+                    matches!(
+                        d.shader,
+                        ShaderEntry::Conv2dGemm
+                            | ShaderEntry::Conv2dGemmSmall
+                            | ShaderEntry::Conv2dGemm16
+                    )
+                })
+                .expect("forward convolution");
+            conv.shader = ShaderEntry::Conv2dGemmCoopGen(shape.kh, shape.kw, shape.stride);
+            let kernel = Kernel::CooperativeTyped {
+                types,
+                splits: 1,
+                tile,
+            };
+            conv.kernel = kernel.clone();
+            conv.workgroups = [
+                shape.co.div_ceil(tile.rows),
+                (oh * ow).div_ceil(tile.columns),
+                shape.batch,
+            ];
+            let mut session = Session::with_context_opts(
+                plan,
+                Arc::clone(&gpu),
+                SessionOptions {
+                    coop: CoopPolicy::AllowF16,
+                    ..Default::default()
+                },
+            );
+            assert!(
+                session.plan().dispatches.iter().any(|d| d.kernel == kernel),
+                "{shape:?} {tile:?} kept"
+            );
+            session.set_input("x", &x);
+            session.set_input("w", &w);
+            session.step();
+            session.wait();
+            let mut y = vec![f32::NAN; ny];
+            session.read_output_by_index(0, &mut y);
+            y.into_iter().map(f32::to_bits).collect()
+        };
+        let base = run(CheckedTile::BASE);
+        assert!(base.iter().all(|&bits| f32::from_bits(bits).is_finite()));
+        for tile in CheckedTile::WIDE {
+            let direct = shape.co % 16 == 0 && (oh * ow) % 16 == 0;
+            if tile.shared_bytes(types.multiply, direct)
+                > capabilities.max_compute_shared_memory_size
+            {
+                continue;
+            }
+            assert!(run(tile) == base, "{shape:?} {tile:?} differs from 32x32");
+        }
+    }
+}

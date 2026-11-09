@@ -227,9 +227,12 @@ pub enum MatmulTile {
     },
     /// Checked typed cooperative tiles at a K partition count. The class key
     /// holds the types. More than one partition writes F32 partials that a
-    /// following SumRows adds, which only a split product has.
+    /// following SumRows adds, which only a split product has. Forward
+    /// convolutions, which never split, also measure wider output tiles.
     CooperativeChecked {
         splits: u32,
+        #[serde(default)]
+        tile: crate::codegen::CheckedTile,
     },
     /// A K-split GEMV at one workgroup width and cross-lane reduction.
     ///
@@ -366,8 +369,8 @@ impl MatmulTile {
                 {
                     Some(Self::CooperativeTiled { shape, splits })
                 }
-                Kernel::CooperativeTyped { splits, .. } => {
-                    Some(Self::CooperativeChecked { splits })
+                Kernel::CooperativeTyped { splits, tile, .. } => {
+                    Some(Self::CooperativeChecked { splits, tile })
                 }
                 _ => None,
             }
@@ -402,7 +405,7 @@ impl MatmulTile {
         match self {
             Self::CooperativeTiled { splits, .. }
             | Self::CooperativeWorkgroup { splits, .. }
-            | Self::CooperativeChecked { splits } => Some(splits),
+            | Self::CooperativeChecked { splits, .. } => Some(splits),
             _ => None,
         }
     }
@@ -438,7 +441,7 @@ impl MatmulTile {
             };
             return;
         }
-        if let Self::CooperativeChecked { splits } = self {
+        if let Self::CooperativeChecked { splits, tile } = self {
             let types = match dispatch.kernel {
                 crate::compile::Kernel::CooperativeTyped { types, .. }
                 | crate::compile::Kernel::CooperativeWorkgroup {
@@ -446,7 +449,11 @@ impl MatmulTile {
                 } => types,
                 _ => unreachable!("checked tiles apply to typed products"),
             };
-            dispatch.kernel = crate::compile::Kernel::CooperativeTyped { types, splits };
+            dispatch.kernel = crate::compile::Kernel::CooperativeTyped {
+                types,
+                splits,
+                tile,
+            };
             return;
         }
         if let Self::Gemv(shape) = self {
@@ -526,9 +533,19 @@ impl MatmulTile {
                     splits,
                 ];
             }
-            // Checked tiles use X for rows, Y for columns, over 32x32 blocks.
-            Self::CooperativeChecked { splits } => {
-                return [class.m.div_ceil(32), class.n.div_ceil(32), splits];
+            // Checked tiles use X for rows, Y for columns, and Z for K
+            // partitions or, in a convolution, images.
+            Self::CooperativeChecked { splits, tile } => {
+                let layers = if class.conv2d.is_some() {
+                    class.batch_dispatches()
+                } else {
+                    splits
+                };
+                return [
+                    class.m.div_ceil(tile.rows),
+                    class.n.div_ceil(tile.columns),
+                    layers,
+                ];
             }
             Self::CooperativeF32 { .. } | Self::CooperativeF16 { .. } => {
                 let tile = self.coop_config().unwrap().matmul_output_tile();
@@ -586,10 +603,16 @@ impl MatmulTile {
         if let Some(types) = class.matrix_types {
             // Workgroup candidates were handled above; subgroup candidates
             // preserve storage too, with F32 partials when split.
-            let Self::CooperativeChecked { splits } = self else {
+            let Self::CooperativeChecked { splits, tile } = self else {
                 return None;
             };
-            if splits == 0
+            let tile_legal = if class.conv2d.is_some() {
+                splits == 1 && tile.valid()
+            } else {
+                tile == crate::codegen::CheckedTile::BASE
+            };
+            if !tile_legal
+                || splits == 0
                 || (splits > 1) != class.split_k
                 || (splits > 1
                     && (splits > class.k.div_ceil(32)
@@ -724,28 +747,37 @@ impl TuneClass {
                 | ShaderEntry::MatMulGemvAdd
                 | ShaderEntry::MatMulGemvBTAdd
         );
-        if !matches!(
-            dispatch.shader,
-            ShaderEntry::MatMul
-                | ShaderEntry::FusedMatMulAdd
-                | ShaderEntry::MatMulAT
-                | ShaderEntry::MatMulBT
-                | ShaderEntry::FusedMatMulATAdd
-                | ShaderEntry::FusedMatMulBTAdd
-                | ShaderEntry::MatMulGemv
-                | ShaderEntry::MatMulGemvAdd
-                | ShaderEntry::MatMulGemvBT
-                | ShaderEntry::MatMulGemvBTAdd
-                | ShaderEntry::Conv2dGemm
-                | ShaderEntry::Conv2dGemmSmall
-                | ShaderEntry::Conv2dGemm16
-                | ShaderEntry::Conv2dGradInputGemm
-                | ShaderEntry::Conv2dGradInputGemmSmall
-                | ShaderEntry::Conv2dGradInputGemm16
-                | ShaderEntry::Conv2dGradWeightGemm
-                | ShaderEntry::Conv2dGradWeightGemmSmall
-                | ShaderEntry::Conv2dGradWeightGemm16
-        ) || (dispatch.use_coop() && dispatch.weight_format.uses_reduced_storage())
+        // A checked forward convolution measures its output tile. Its class
+        // is the forward convolution's, keyed apart by the matrix types.
+        let checked_conv = matches!(dispatch.shader, ShaderEntry::Conv2dGemmCoopGen(..))
+            && matches!(
+                dispatch.kernel,
+                crate::compile::Kernel::CooperativeTyped { splits: 1, .. }
+            );
+        if !checked_conv
+            && !matches!(
+                dispatch.shader,
+                ShaderEntry::MatMul
+                    | ShaderEntry::FusedMatMulAdd
+                    | ShaderEntry::MatMulAT
+                    | ShaderEntry::MatMulBT
+                    | ShaderEntry::FusedMatMulATAdd
+                    | ShaderEntry::FusedMatMulBTAdd
+                    | ShaderEntry::MatMulGemv
+                    | ShaderEntry::MatMulGemvAdd
+                    | ShaderEntry::MatMulGemvBT
+                    | ShaderEntry::MatMulGemvBTAdd
+                    | ShaderEntry::Conv2dGemm
+                    | ShaderEntry::Conv2dGemmSmall
+                    | ShaderEntry::Conv2dGemm16
+                    | ShaderEntry::Conv2dGradInputGemm
+                    | ShaderEntry::Conv2dGradInputGemmSmall
+                    | ShaderEntry::Conv2dGradInputGemm16
+                    | ShaderEntry::Conv2dGradWeightGemm
+                    | ShaderEntry::Conv2dGradWeightGemmSmall
+                    | ShaderEntry::Conv2dGradWeightGemm16
+            )
+            || (dispatch.use_coop() && dispatch.weight_format.uses_reduced_storage())
             || dispatch.horizontal_batch >= 2
             || dispatch.matmul_prologue.is_some()
             || dispatch.matmul_epilogue.is_some()
@@ -760,7 +792,7 @@ impl TuneClass {
         // Tiled and typed products dispatch one Z layer per K partition.
         let (partitions, matrix_types) = match dispatch.kernel {
             crate::compile::Kernel::CooperativeTiled { splits, .. } => (splits, None),
-            crate::compile::Kernel::CooperativeTyped { types, splits } => (splits, Some(types)),
+            crate::compile::Kernel::CooperativeTyped { types, splits, .. } => (splits, Some(types)),
             crate::compile::Kernel::CooperativeWorkgroup { types, splits, .. } => (splits, types),
             _ => (1, None),
         };
@@ -772,6 +804,7 @@ impl TuneClass {
             ShaderEntry::Conv2dGradWeightGemmSmall | ShaderEntry::Conv2dGradWeightGemm16 => {
                 ShaderEntry::Conv2dGradWeightGemm
             }
+            ShaderEntry::Conv2dGemmCoopGen(..) if checked_conv => ShaderEntry::Conv2dGemm,
             _ => dispatch.shader.clone(),
         };
         let conv2d = if matches!(
@@ -780,7 +813,7 @@ impl TuneClass {
                 | ShaderEntry::Conv2dGradInputGemm
                 | ShaderEntry::Conv2dGradWeightGemm
         ) {
-            if dispatch.use_coop()
+            if (dispatch.use_coop() && !checked_conv)
                 || dispatch.use_small_tiles()
                 || dispatch.weight_format.uses_reduced_storage()
             {
@@ -875,6 +908,16 @@ impl TuneClass {
         .then_some(class)
     }
 
+    /// Workgroup memory a checked convolution tile needs in this class. F32
+    /// outputs in whole 16×16 blocks store straight from the accumulators.
+    pub(crate) fn checked_tile_bytes(&self, tile: crate::codegen::CheckedTile) -> Option<u32> {
+        let types = self.matrix_types.filter(|_| self.conv2d.is_some())?;
+        let direct = types.output == crate::DType::F32
+            && self.m.is_multiple_of(16)
+            && self.n.is_multiple_of(16);
+        Some(tile.shared_bytes(types.multiply, direct))
+    }
+
     pub(crate) fn has_addend(&self) -> bool {
         matches!(
             self.shader,
@@ -929,6 +972,21 @@ impl TuneClass {
     /// not just host allocation overflow.
     pub(crate) fn buffer_sizes(&self) -> Option<Vec<usize>> {
         let bytes = |a: u32, b: u32| usize::try_from(a.checked_mul(b)?).ok()?.checked_mul(4);
+        if let (Some(types), Some(s)) = (self.matrix_types, self.conv2d) {
+            // A checked convolution binds its image, weight and output; B is
+            // the image and A the weight.
+            let [input, weight, output] = s.elements()?;
+            let typed = |count: u32, ty| {
+                usize::try_from(count)
+                    .ok()?
+                    .checked_mul(crate::codegen::MatrixTypes::bytes(ty))
+            };
+            return Some(vec![
+                typed(input, types.b)?,
+                typed(weight, types.a)?,
+                typed(output, types.output)?,
+            ]);
+        }
         if let Some(types) = self.matrix_types {
             // Logical extents: an odd count of halfwords is not word-padded.
             let typed = |a: u32, b: u32, ty| {
@@ -1037,6 +1095,13 @@ impl TuneClass {
                 .filter(|&tile| tile != MatmulTile::Gemv(shape) && tile.fits(self))
                 .collect();
         }
+        if self.conv2d.is_some() && self.matrix_types.is_some() {
+            return std::iter::once(crate::codegen::CheckedTile::BASE)
+                .chain(crate::codegen::CheckedTile::WIDE)
+                .map(|tile| MatmulTile::CooperativeChecked { splits: 1, tile })
+                .filter(|&tile| tile != initial && tile.fits(self))
+                .collect();
+        }
         if self.conv2d.is_some() {
             let mut out = Vec::new();
             for tile in [16u32, 32, 64] {
@@ -1067,7 +1132,10 @@ impl TuneClass {
             let mut candidates = Vec::new();
             if self.matrix_types.is_some() {
                 candidates.extend(
-                    [1, 2, 4, 8, 16].map(|splits| MatmulTile::CooperativeChecked { splits }),
+                    [1, 2, 4, 8, 16].map(|splits| MatmulTile::CooperativeChecked {
+                        splits,
+                        tile: crate::codegen::CheckedTile::BASE,
+                    }),
                 );
             } else if let Some(config) = config.filter(|c| c.use_f16_input) {
                 candidates.push(MatmulTile::CooperativeF16 {
@@ -1077,7 +1145,7 @@ impl TuneClass {
             // Keep the incumbent's partition count first, then explore other
             // counts only when the complete SumRows/buffer contract permits.
             let splits = match initial {
-                MatmulTile::CooperativeChecked { splits }
+                MatmulTile::CooperativeChecked { splits, .. }
                 | MatmulTile::CooperativeWorkgroup { splits, .. } => splits,
                 _ => 1,
             };
@@ -1772,14 +1840,21 @@ mod tests {
             let mut class = class(256, 512, 256);
             class.matrix_types = Some(types);
             class.binding_bytes = class.buffer_sizes().unwrap();
-            let initial = MatmulTile::CooperativeChecked { splits: 1 };
+            let initial = MatmulTile::CooperativeChecked {
+                splits: 1,
+                tile: crate::codegen::CheckedTile::BASE,
+            };
             let candidates = class.challengers(initial, None);
             for shape in WorkgroupMatmulShape::all() {
                 let tile = MatmulTile::CooperativeWorkgroup { shape, splits: 1 };
                 assert!(candidates.contains(&tile));
                 let original = Dispatch {
                     params: vec![256, 256, 512, 0],
-                    kernel: Kernel::CooperativeTyped { types, splits: 1 },
+                    kernel: Kernel::CooperativeTyped {
+                        types,
+                        splits: 1,
+                        tile: crate::codegen::CheckedTile::BASE,
+                    },
                     workgroups: [8, 16, 1],
                     ..dispatch()
                 };
@@ -2128,6 +2203,95 @@ mod tests {
             _ => [1, 1, 1],
         };
         d
+    }
+
+    /// A checked forward convolution is a forward convolution class keyed by
+    /// its types, whose challengers are its output tiles, one image per Z.
+    #[test]
+    fn checked_convolutions_measure_output_tiles() {
+        use crate::codegen::{CheckedTile, MatrixTypes};
+        use crate::compile::Kernel;
+        let types = MatrixTypes {
+            multiply: crate::DType::F16,
+            ..MatrixTypes::F32_AS_F16
+        };
+        // batch 2, 32 -> 70 channels, 13x15 image, 3x3, stride 1, padding 1.
+        let params = vec![2, 32, 13, 15, 70, 3, 3, 1, 1, 13, 15, 1];
+        let (m, n): (u32, u32) = (70, 13 * 15);
+        let mut d = dispatch();
+        d.shader = ShaderEntry::Conv2dGemmCoopGen(3, 3, 1);
+        d.params = params;
+        d.kernel = Kernel::CooperativeTyped {
+            types,
+            splits: 1,
+            tile: CheckedTile::BASE,
+        };
+        d.workgroups = [m.div_ceil(32), n.div_ceil(32), 2];
+        let mut class = TuneClass::from_dispatch(&d, None).expect("checked convolution class");
+        assert_eq!(class.shader, ShaderEntry::Conv2dGemm);
+        assert_eq!(class.matrix_types, Some(types));
+        assert_eq!((class.m, class.n, class.k), (m, n, 32 * 9));
+        assert!(TuneScope::Convolution.includes(&class));
+        assert!(!TuneScope::ConvDerivatives.includes(&class));
+        assert!(!TuneScope::Dense.includes(&class));
+        // Image, weight and output in binding order.
+        class.binding_bytes = class.buffer_sizes().unwrap();
+        assert_eq!(
+            class.binding_bytes,
+            [2 * 32 * 13 * 15 * 4, 70 * 32 * 9 * 4, 2 * 70 * 13 * 15 * 4]
+        );
+        let initial = MatmulTile::selected(&d, None).unwrap();
+        assert_eq!(
+            initial,
+            MatmulTile::CooperativeChecked {
+                splits: 1,
+                tile: CheckedTile::BASE,
+            }
+        );
+        let challengers = class.challengers(initial, None);
+        assert_eq!(
+            challengers,
+            CheckedTile::WIDE.map(|tile| MatmulTile::CooperativeChecked { splits: 1, tile })
+        );
+        for tile in challengers {
+            let MatmulTile::CooperativeChecked { tile: shape, .. } = tile else {
+                unreachable!()
+            };
+            let mut chosen = d.clone();
+            tile.apply(&mut chosen, &class);
+            assert_eq!(chosen.shader, d.shader);
+            assert_eq!(
+                chosen.kernel,
+                Kernel::CooperativeTyped {
+                    types,
+                    splits: 1,
+                    tile: shape,
+                }
+            );
+            assert_eq!(
+                chosen.workgroups,
+                [m.div_ceil(shape.rows), n.div_ceil(shape.columns), 2]
+            );
+            assert_eq!(MatmulTile::selected(&chosen, None), Some(tile));
+        }
+        // Ragged outputs stage their result; 16-aligned F32 outputs do not.
+        let tile = CheckedTile {
+            rows: 64,
+            columns: 64,
+        };
+        assert_eq!(
+            class.checked_tile_bytes(tile),
+            Some(tile.shared_bytes(crate::DType::F16, false))
+        );
+        let mut aligned = class.clone();
+        (aligned.m, aligned.n) = (64, 256);
+        assert_eq!(
+            aligned.checked_tile_bytes(tile),
+            Some(tile.shared_bytes(crate::DType::F16, true))
+        );
+        // Untyped cooperative convolutions keep their own kernel.
+        d.kernel = Kernel::Cooperative;
+        assert!(TuneClass::from_dispatch(&d, None).is_none());
     }
 
     #[test]

@@ -9,6 +9,8 @@ use std::{io, path::Path};
 
 /// Increment whenever the serialized execution plan or build pipeline changes
 /// in a way that can make an older plan unsafe to reuse.
+// Version 40 records the output tile of checked convolutions, which an older
+// reader would run as 32x32 tiles over a wider tile's grid.
 // Version 39 adds the ArgMax reduction lowering `Graph::argmax_inner`.
 // Version 38 marks parameter-invariant Winograd weight transforms and gives
 // low-occupancy Winograd products 32-wide tiles.
@@ -53,7 +55,7 @@ use std::{io, path::Path};
 // Version 13 reduces loss partials into a scalar, lowers LayerNorm to the
 // two-pass kernel, carries RoPE's static offset into the dynamic kernels, and
 // changes which dispatches fusion may merge.
-const CACHE_FORMAT_VERSION: u32 = 39;
+const CACHE_FORMAT_VERSION: u32 = 40;
 
 /// Cached execution plan with a graph fingerprint for invalidation.
 #[derive(Serialize, Deserialize)]

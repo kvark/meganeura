@@ -12,6 +12,7 @@ mod matrix_types;
 pub(crate) mod winograd;
 mod workgroup;
 pub use coop_tiled::{CooperativeMatmulShape, generate_tiled_coop_matmul};
+pub use cooperative::CheckedTile;
 pub use matrix_types::MatrixTypes;
 pub use workgroup::{WorkgroupMatmulShape, generate_workgroup_matmul};
 
@@ -1145,6 +1146,7 @@ pub(crate) fn generate_checked_conv(
     shape: [u32; 3],
     params: &crate::kernels::conv::Params,
     subgroup: u32,
+    tile: CheckedTile,
 ) -> ShaderModule {
     // Keep native C stores inside each channel's spatial row.
     let backward = matches!(group, ShaderGroup::Conv2dPointwiseGradInput);
@@ -1176,6 +1178,7 @@ pub(crate) fn generate_checked_conv(
             vectorized: backward && params.vectorized_forward(),
             ..Default::default()
         },
+        tile,
     )
 }
 
