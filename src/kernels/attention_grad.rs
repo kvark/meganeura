@@ -172,7 +172,9 @@ impl Path {
                 }
             }
             Path::Flash => {
-                let rows = flash_rows(head_dim, problem.ept_cap);
+                // Admit against the wider 256-thread group. A smaller group
+                // the search measures covers fewer rows and still fits.
+                let rows = flash_rows(head_dim, problem.ept_cap, 256);
                 if rows < 2 {
                     Err("head too wide to tile several rows")
                 } else if problem.rows < rows {
@@ -192,10 +194,12 @@ impl Path {
     }
 }
 
-/// Rows per workgroup of the flash paths.
-fn flash_rows(head_dim: u32, ept_cap: u32) -> u32 {
+/// Rows per workgroup of the flash paths. `threads` is the workgroup width
+/// the flash shape selected; 256 is the historical default.
+pub(crate) fn flash_rows(head_dim: u32, ept_cap: u32, threads: u32) -> u32 {
     let (_, lanes) = attention_lanes(head_dim, ept_cap);
-    (256 / lanes).max(1)
+    let threads = if threads < lanes { 256 } else { threads };
+    (threads / lanes).max(1)
 }
 
 impl AttentionGrad {
@@ -220,12 +224,17 @@ impl AttentionGrad {
         Self::new(problem.part, super::select::<Path>(problem, target).chosen)
     }
 
-    /// Workgroups covering `problem`.
+    /// Workgroups covering `problem` at the default 256-thread flash group.
     pub(crate) fn workgroups(self, problem: &Problem) -> [u32; 3] {
+        self.workgroups_with_threads(problem, 256)
+    }
+
+    /// Workgroups covering `problem`. `threads` is the flash workgroup width.
+    pub(crate) fn workgroups_with_threads(self, problem: &Problem, threads: u32) -> [u32; 3] {
         let per_group = match self.path {
             Path::Cooperative(Operands::F16) => 32,
             Path::Cooperative(Operands::F32) => TILE,
-            Path::Flash => flash_rows(problem.head_dim, problem.ept_cap),
+            Path::Flash => flash_rows(problem.head_dim, problem.ept_cap, threads),
             Path::Rowwise => 1,
         };
         [problem.rows.div_ceil(per_group), problem.heads, 1]
@@ -264,7 +273,8 @@ impl AttentionGrad {
             Path::Cooperative(Operands::F16) => {
                 C::COOPERATIVE_MATRIX | C::SHADER_FLOAT16 | C::SUBGROUP
             }
-            Path::Flash | Path::Rowwise => C::empty(),
+            Path::Flash => C::SUBGROUP,
+            Path::Rowwise => C::empty(),
         }
     }
 
@@ -278,7 +288,7 @@ impl AttentionGrad {
         ept_cap: Option<u32>,
         knobs: &crate::compile::TuningKnobs,
     ) -> ShaderModule {
-        self.generate_with_f32_tile(head_dim, ept_cap, knobs, 8)
+        self.generate_with_f32_tile(head_dim, ept_cap, knobs, 8, 0, false)
     }
 
     pub(crate) fn generate_with_f32_tile(
@@ -287,8 +297,22 @@ impl AttentionGrad {
         ept_cap: Option<u32>,
         knobs: &crate::compile::TuningKnobs,
         f32_tile: u32,
+        subgroup_size: u32,
+        f16_tiles: bool,
     ) -> ShaderModule {
         use crate::codegen as cg;
+        let cap = ept_cap.unwrap_or(match self.part {
+            Part::Q => knobs.flash_grad_q_ept_cap,
+            Part::KV => knobs.flash_grad_kv_ept_cap,
+        });
+        let subgroup_size = if self.path != Path::Flash
+            || knobs.flash_subgroup_tiles
+            || cg::attention_lanes(head_dim, cap).1 <= 8
+        {
+            subgroup_size
+        } else {
+            0
+        };
         match (self.path, self.part) {
             (Path::Cooperative(Operands::F32), Part::Q) => {
                 cg::generate_flash_grad_q_coop_f32_module_with_tile(head_dim, f32_tile)
@@ -302,13 +326,21 @@ impl AttentionGrad {
             (Path::Cooperative(Operands::F16), Part::KV) => {
                 cg::generate_flash_grad_kv_coop_f16_module(head_dim)
             }
-            (Path::Flash, Part::Q) => cg::generate_flash_grad_q_module(
+            (Path::Flash, Part::Q) => cg::generate_flash_grad_module(
+                Part::Q,
                 head_dim,
                 ept_cap.unwrap_or(knobs.flash_grad_q_ept_cap),
+                subgroup_size,
+                knobs.flash.threads,
+                f16_tiles,
             ),
-            (Path::Flash, Part::KV) => cg::generate_flash_grad_kv_module(
+            (Path::Flash, Part::KV) => cg::generate_flash_grad_module(
+                Part::KV,
                 head_dim,
                 ept_cap.unwrap_or(knobs.flash_grad_kv_ept_cap),
+                subgroup_size,
+                knobs.flash.threads,
+                f16_tiles,
             ),
             (Path::Rowwise, Part::Q) => {
                 ShaderModule::new(include_str!("../shaders/mha_grad_q.wgsl"))
@@ -545,6 +577,18 @@ mod tests {
             AttentionGrad::select(&p, &f32).path,
             Path::Cooperative(Operands::F16)
         );
+    }
+
+    #[test]
+    fn narrower_flash_group_splits_the_same_rows_across_more_workgroups() {
+        let problem = problem(Part::Q, 1500, 64);
+        let kernel = AttentionGrad::new(Part::Q, Path::Flash);
+        let wide = kernel.workgroups_with_threads(&problem, 256);
+        let narrow = kernel.workgroups_with_threads(&problem, 128);
+        // ept cap 4 on a 64-wide head is 16 lanes, so 256 threads cover 16 rows.
+        assert_eq!(wide[0], 1500u32.div_ceil(16));
+        assert_eq!(narrow[0], 1500u32.div_ceil(8));
+        assert!(narrow[0] > wide[0]);
     }
 
     #[test]

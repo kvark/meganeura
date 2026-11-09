@@ -1,16 +1,18 @@
 // @section main
+$ENABLE
 $PARAMS
-var<storage> src_a: array<f32>;
-var<storage> src_b: array<f32>;
-var<storage> bias: array<f32>;
+var<storage> src_a: array<$ELEM>;
+var<storage> src_b: array<$ELEM>;
+var<storage> bias: array<$ELEM>;
 $CACHED_BINDING
-var<storage, read_write> dst: array<f32>;
+var<storage, read_write> dst: array<$ELEM>;
 $LSE_BINDING
 var<uniform> params: Params;
-var<workgroup> shared_k: array<f32, $TILE_ELEMENTS>;
-var<workgroup> shared_v: array<f32, $TILE_ELEMENTS>;
+var<workgroup> shared_k: array<$STILE, $SHARED_LEN>;
+var<workgroup> shared_v: array<$ELEM, $SHARED_LEN>;
 var<workgroup> wg_scores: array<f32, $SCORES>;
 var<workgroup> wg_dot: array<f32, $THREADS>;
+$LANE_SUM
 
 fn tree_reduce_bkv_grouped(tid: u32) {
     let qi = tid / $TPQu;
@@ -29,7 +31,7 @@ $DOT_STEP
 }
 
 @compute @workgroup_size($THREADS)
-fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>$SUBGROUP_ARG) {
     let qi = lid.x / $TPQu;
     let lane = lid.x % $TPQu;
     let d_base = lane * $D_BASE_STRIDEu;
@@ -67,46 +69,14 @@ $OUT_INIT
 
     let kv_range = max_kv_len - min_kv_start;
     let tile_end = min_kv_start + (kv_range / $BKVu) * $BKVu;
-    var t = min_kv_start;
-    for (; t < tile_end; t += $BKVu) {
-$TILE_LOAD
-        workgroupBarrier();
+$KV_TILES
 
-        let grp_base = qi * $TPQu;
-        for (var i = 0u; i < $BKVu; i++) {
-            var pdot = 0.0;
-$TILE_DOT
-            wg_scores[i * $THREADSu + grp_base + lane] = pdot;
-        }
-        tree_reduce_bkv_grouped(lid.x);
-
-        for (var i = 0u; i < $BKVu; i++) {
-            let kv_pos = t + i;
-            if valid && kv_pos >= my_kv_start && kv_pos < my_kv_len {
-                let score = wg_scores[i * $THREADSu + grp_base] * scale;
-                let new_max = max(max_score, score);
-                let correction = exp(max_score - new_max);
-                let weight = exp(score - new_max);
-                sum_exp = sum_exp * correction + weight;
-$TILE_ACCUMULATE
-                max_score = new_max;
-            }
-        }
-        workgroupBarrier();
-    }
-
+    var tail_score = 0.0;
     for (; t < max_kv_len; t++) {
-        for (var d = lid.x; d < $HEAD_DIMu; d += $THREADSu) {
-            shared_k[d] = src_b[t * kv_dim + kv_head_off + d];
-        }
+$TAIL_LOAD
         workgroupBarrier();
-
-        let dot_base = qi * $TPQu;
-        var pdot2 = 0.0;
-$TAIL_DOT
-        wg_dot[dot_base + lane] = pdot2;
-        tree_reduce_grouped(lid.x);
-        let score = wg_dot[qi * $TPQu] * scale;
+$TAIL_BODY
+        let score = tail_score * scale;
 
         if valid && t >= my_kv_start && t < my_kv_len {
             let new_max = max(max_score, score);
@@ -167,15 +137,15 @@ var<storage, read_write> lse: array<f32>;
 // @section tile_load_first
         if lid.x < $TILE_ELEMENTSu {
             let ki = lid.x / $HEAD_DIMu;
-            shared_k[lid.x] = src_b[(t + ki) * kv_dim + kv_head_off + (lid.x % head_dim)];
-            shared_v[lid.x] = bias[(t + ki) * kv_dim + kv_head_off + (lid.x % head_dim)];
+            shared_k[lid.x] = src_b[(t + ki) * kv_dim + kv_head_off + (lid.x % $HEAD_DIMu)];
+            shared_v[lid.x] = bias[(t + ki) * kv_dim + kv_head_off + (lid.x % $HEAD_DIMu)];
         }
 
 // @section tile_load_next
         if lid.x + $OFFSETu < $TILE_ELEMENTSu {
             let ki2 = (lid.x + $OFFSETu) / $HEAD_DIMu;
-            shared_k[lid.x + $OFFSETu] = src_b[(t + ki2) * kv_dim + kv_head_off + ((lid.x + $OFFSETu) % head_dim)];
-            shared_v[lid.x + $OFFSETu] = bias[(t + ki2) * kv_dim + kv_head_off + ((lid.x + $OFFSETu) % head_dim)];
+            shared_k[lid.x + $OFFSETu] = src_b[(t + ki2) * kv_dim + kv_head_off + ((lid.x + $OFFSETu) % $HEAD_DIMu)];
+            shared_v[lid.x + $OFFSETu] = bias[(t + ki2) * kv_dim + kv_head_off + ((lid.x + $OFFSETu) % $HEAD_DIMu)];
         }
 
 // @section q_init
@@ -201,3 +171,160 @@ var<storage, read_write> lse: array<f32>;
 
 // @section out_store
         dst[q_base + d_base + $OFFSETu] = out$INDEX / safe_sum;
+
+// @section q_init_v4
+    var q$INDEX = $STILE(0.0);
+
+// @section q_load_v4
+        q$INDEX = $STILE(src_a[(q_base + d_base) / 4u + $OFFSETu]);
+
+// @section out_init_v4
+    var out$INDEX = vec4<f32>(0.0);
+
+// @section tile_dot_v4
+            pdot += dot(vec4<f32>(q$INDEX), vec4<f32>(shared_k[(i * $HEAD_DIMu + d_base) / 4u + $OFFSETu]));
+
+// @section tile_accumulate_v4
+                out$INDEX = out$INDEX * correction + weight * shared_v[(i * $HEAD_DIMu + d_base) / 4u + $OFFSETu];
+
+// @section tail_dot_v4
+        pdot2 += dot(vec4<f32>(q$INDEX), vec4<f32>(shared_k[d_base / 4u + $OFFSETu]));
+
+// @section tail_accumulate_v4
+            out$INDEX = out$INDEX * correction + weight * bias[(v_base2 + d_base) / 4u + $OFFSETu];
+
+// @section out_store_v4
+        dst[(q_base + d_base) / 4u + $OFFSETu] = out$INDEX / safe_sum;
+
+// @section kv_tiles
+    var t = min_kv_start;
+    for (; t < tile_end; t += $BKVu) {
+$TILE_LOAD
+        workgroupBarrier();
+        let grp_base = qi * $TPQu;
+$TILE_BODY
+        workgroupBarrier();
+    }
+
+// @section kv_tiles_prefetched
+    // One global load of the next K/V tile overlaps the current tile's dots.
+    // Each thread owns at most one vec4, so the prefetch stays in registers.
+    var t = min_kv_start;
+    var prefetch = false;
+    var prefetch_pack = 0u;
+    var prefetch_k: $STILE;
+    var prefetch_v: $ELEM;
+    if t < tile_end {
+$TILE_LOAD
+        workgroupBarrier();
+    }
+    for (; t < tile_end; t += $BKVu) {
+        let next = t + $BKVu;
+        prefetch = false;
+        if next < tile_end && lid.x < ($TILE_ELEMENTSu / 4u) {
+            prefetch = true;
+            prefetch_pack = lid.x;
+            let elem = prefetch_pack * 4u;
+            let ki = elem / $HEAD_DIMu;
+            let kd = elem % $HEAD_DIMu;
+            let index = ((next + ki) * kv_dim + kv_head_off + kd) / 4u;
+            prefetch_k = $STILE(src_b[index]);
+            prefetch_v = bias[index];
+        }
+        let grp_base = qi * $TPQu;
+$TILE_BODY
+        workgroupBarrier();
+        if prefetch {
+            shared_k[prefetch_pack] = prefetch_k;
+            shared_v[prefetch_pack] = prefetch_v;
+        }
+        workgroupBarrier();
+    }
+
+// @section tile_load_v4
+        let tile_vecs = $TILE_ELEMENTSu / 4u;
+        for (var pack = lid.x; pack < tile_vecs; pack += $THREADSu) {
+            let elem = pack * 4u;
+            let ki = elem / $HEAD_DIMu;
+            let kd = elem % $HEAD_DIMu;
+            let index = ((t + ki) * kv_dim + kv_head_off + kd) / 4u;
+            shared_k[pack] = $STILE(src_b[index]);
+            shared_v[pack] = bias[index];
+        }
+
+// @section tile_tree
+        for (var i = 0u; i < $BKVu; i++) {
+            var pdot = 0.0;
+$TILE_DOT
+            wg_scores[i * $THREADSu + grp_base + lane] = pdot;
+        }
+        tree_reduce_bkv_grouped(lid.x);
+        for (var i = 0u; i < $BKVu; i++) {
+            let kv_pos = t + i;
+            if valid && kv_pos >= my_kv_start && kv_pos < my_kv_len {
+                let score = wg_scores[i * $THREADSu + grp_base] * scale;
+                let new_max = max(max_score, score);
+                let correction = exp(max_score - new_max);
+                let weight = exp(score - new_max);
+                sum_exp = sum_exp * correction + weight;
+$TILE_ACCUMULATE
+                max_score = new_max;
+            }
+        }
+
+// @section tile_subgroup
+        // The reported subgroup width is only a default. A query split
+        // across subgroups at run time takes the shared tree instead.
+        if subgroup_size >= $TPQu && subgroup_size % $TPQu == 0u {
+            var tile_score: array<f32, $BKV>;
+            for (var i = 0u; i < $BKVu; i++) {
+                var pdot = 0.0;
+$TILE_DOT
+                tile_score[i] = lane_sum(pdot);
+            }
+            for (var i = 0u; i < $BKVu; i++) {
+                let kv_pos = t + i;
+                if valid && kv_pos >= my_kv_start && kv_pos < my_kv_len {
+                    let score = tile_score[i] * scale;
+                    let new_max = max(max_score, score);
+                    let correction = exp(max_score - new_max);
+                    let weight = exp(score - new_max);
+                    sum_exp = sum_exp * correction + weight;
+$TILE_ACCUMULATE
+                    max_score = new_max;
+                }
+            }
+        } else {
+$TILE_TREE
+        }
+
+// @section tail_load
+        for (var d = lid.x; d < $HEAD_DIMu; d += $THREADSu) {
+            shared_k[d] = src_b[t * kv_dim + kv_head_off + d];
+        }
+
+// @section tail_load_v4
+        for (var pack = lid.x; pack < ($HEAD_DIMu / 4u); pack += $THREADSu) {
+            let d = pack * 4u;
+            shared_k[pack] = $STILE(src_b[(t * kv_dim + kv_head_off + d) / 4u]);
+        }
+
+// @section tail_tree
+        let dot_base = qi * $TPQu;
+        var pdot2 = 0.0;
+$TAIL_DOT
+        wg_dot[dot_base + lane] = pdot2;
+        tree_reduce_grouped(lid.x);
+        tail_score = wg_dot[qi * $TPQu];
+
+// @section tail_subgroup
+        let dot_base = qi * $TPQu;
+        var pdot2 = 0.0;
+$TAIL_DOT
+        if subgroup_size >= $TPQu && subgroup_size % $TPQu == 0u {
+            tail_score = lane_sum(pdot2);
+        } else {
+            wg_dot[dot_base + lane] = pdot2;
+            tree_reduce_grouped(lid.x);
+            tail_score = wg_dot[qi * $TPQu];
+        }

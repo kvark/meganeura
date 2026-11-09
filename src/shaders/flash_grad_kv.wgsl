@@ -1,19 +1,21 @@
 // @section main
+$ENABLE
 $PARAMS
-var<storage> d_out: array<f32>;
-var<storage> src_a: array<f32>;
-var<storage> src_b: array<f32>;
-var<storage> bias: array<f32>;
+var<storage> d_out: array<$ELEM>;
+var<storage> src_a: array<$ELEM>;
+var<storage> src_b: array<$ELEM>;
+var<storage> bias: array<$ELEM>;
 var<storage> lse: array<f32>;
 var<storage> fwd_dst: array<f32>;
-var<storage, read_write> dst: array<f32>;
-var<storage, read_write> dst2: array<f32>;
+var<storage, read_write> dst: array<$ELEM>;
+var<storage, read_write> dst2: array<$ELEM>;
 var<uniform> params: Params;
+$LANE_SUM
 
-$SHARED
+$QUERY_SHARED
 $REDUCTION
 @compute @workgroup_size($THREADS)
-fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn main(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>$SUBGROUP_ARG) {
     let ki = lid.x / $TPQu;
     let lane = lid.x % $TPQu;
     let d_base = lane * $EPTu;
@@ -82,29 +84,57 @@ $ACCUMULATE
     var k$INDEX = 0.0;
     var v$INDEX = 0.0;
 
+// @section kv_init_v4
+    var k$INDEX = $STILE(0.0);
+    var v$INDEX = $STILE(0.0);
+
 // @section kv_load
         k$INDEX = src_b[kv_base + d_base + $INDEXu];
         v$INDEX = bias[kv_base + d_base + $INDEXu];
+
+// @section kv_load_v4
+        k$INDEX = $STILE(src_b[(kv_base + d_base) / 4u + $OFFSETu]);
+        v$INDEX = $STILE(bias[(kv_base + d_base) / 4u + $OFFSETu]);
 
 // @section grad_init
     var dk$INDEX = 0.0;
     var dv$INDEX = 0.0;
 
+// @section grad_init_v4
+    var dk$INDEX = vec4<f32>(0.0);
+    var dv$INDEX = vec4<f32>(0.0);
+
 // @section q_load_direct
             let q$INDEX = src_a[q_base + $INDEXu];
             let do$INDEX = d_out[q_base + $INDEXu];
+
+// @section q_load_direct_v4
+            let q$INDEX = $STILE(src_a[(q_base + d_base) / 4u + $OFFSETu]);
+            let do$INDEX = d_out[(q_base + d_base) / 4u + $OFFSETu];
 
 // @section dot
             score_part += q$INDEX * k$INDEX;
             dp_part += do$INDEX * v$INDEX;
 
+// @section dot_v4
+            score_part += dot(vec4<f32>(q$INDEX), vec4<f32>(k$INDEX));
+            dp_part += dot(do$INDEX, vec4<f32>(v$INDEX));
+
 // @section accumulate
                 dk$INDEX += w_dk * q$INDEX;
+                dv$INDEX += p_t * do$INDEX;
+
+// @section accumulate_v4
+                dk$INDEX += w_dk * vec4<f32>(q$INDEX);
                 dv$INDEX += p_t * do$INDEX;
 
 // @section store
         dst[kv_base + d_base + $INDEXu] = dk$INDEX;
         dst2[kv_base + d_base + $INDEXu] = dv$INDEX;
+
+// @section store_v4
+        dst[(kv_base + d_base) / 4u + $OFFSETu] = dk$INDEX;
+        dst2[(kv_base + d_base) / 4u + $OFFSETu] = dv$INDEX;
 
 // @section reduce_step
     workgroupBarrier();
@@ -117,8 +147,8 @@ $ACCUMULATE
     }
 
 // @section shared
-var<workgroup> shared_q: array<f32, $QUERY_ELEMENTS>;
-var<workgroup> shared_do: array<f32, $QUERY_ELEMENTS>;
+var<workgroup> shared_q: array<$STILE, $QUERY_LEN>;
+var<workgroup> shared_do: array<$ELEM, $QUERY_LEN>;
 
 // @section reduction
 var<workgroup> wg_score: array<f32, $GROUP_ELEMENTS>;
@@ -138,22 +168,7 @@ $REDUCE_STEP
 // @section tiled_query_loop
     let query_end = wg_end * heads_per_kv;
     for (var first = wg_start * heads_per_kv; first < query_end; first += $QUERY_TILEu) {
-        for (var flat = lid.x; flat < $QUERY_ELEMENTSu; flat += $THREADSu) {
-            let qi = flat / $HEAD_DIMu;
-            let d = flat % $HEAD_DIMu;
-            let query = first + qi;
-            let pos = query / heads_per_kv;
-            let head = kv_head * heads_per_kv + query % heads_per_kv;
-            let q_base = pos * q_dim + head * head_dim;
-            var q_value = 0.0;
-            var do_value = 0.0;
-            if query < query_end {
-                q_value = src_a[q_base + d];
-                do_value = d_out[q_base + d];
-            }
-            shared_q[flat] = q_value;
-            shared_do[flat] = do_value;
-        }
+$QUERY_LOAD
         workgroupBarrier();
         for (var qi = 0u; qi < $QUERY_TILEu; qi++) {
             let q_offset = qi * $HEAD_DIMu + d_base;
@@ -184,6 +199,116 @@ $ACCUMULATE
         workgroupBarrier();
     }
 
+// @section tiled_query_loop_subgroup
+    let query_end = wg_end * heads_per_kv;
+    for (var first = wg_start * heads_per_kv; first < query_end; first += $QUERY_TILEu) {
+$QUERY_LOAD
+        workgroupBarrier();
+        // The reported subgroup width is only a default. A shader that
+        // actually runs narrower falls back to a per-key shared sum.
+        if subgroup_size >= $TPQu && subgroup_size % $TPQu == 0u {
+            for (var qi = 0u; qi < $QUERY_TILEu; qi++) {
+                let q_offset = qi * $HEAD_DIMu + d_base;
+$TILE_Q_LOAD
+                var score_part = 0.0;
+                var dp_part = 0.0;
+$DOT
+                let score = lane_sum(score_part) * scale;
+                let dp_t = lane_sum(dp_part);
+                let query = first + qi;
+                let pos = query / heads_per_kv;
+                let head = kv_head * heads_per_kv + query % heads_per_kv;
+                if valid && query < query_end && pos >= start_pos && pos < end_pos {
+                    let row_sum = fwd_dst[pos * num_heads + head];
+                    let lse_idx = (pos * num_heads + head) * 2u;
+                    let p_t = exp(min(score - lse[lse_idx], 0.0) - lse[lse_idx + 1u]);
+                    let w_dk = p_t * (dp_t - row_sum) * scale;
+$ACCUMULATE
+                }
+            }
+        } else {
+            for (var qi = 0u; qi < $QUERY_TILEu; qi++) {
+                let q_offset = qi * $HEAD_DIMu + d_base;
+$TILE_Q_LOAD
+                var score_part = 0.0;
+                var dp_part = 0.0;
+$DOT
+                wg_part_score[lid.x] = score_part;
+                wg_part_dp[lid.x] = dp_part;
+                workgroupBarrier();
+                if (lane == 0u) {
+                    var score_sum = 0.0;
+                    var dp_sum = 0.0;
+                    for (var s = 0u; s < $TPQu; s++) {
+                        let part = ki * $TPQu + s;
+                        score_sum += wg_part_score[part];
+                        dp_sum += wg_part_dp[part];
+                    }
+                    wg_part_score[ki * $TPQu] = score_sum;
+                    wg_part_dp[ki * $TPQu] = dp_sum;
+                }
+                workgroupBarrier();
+                let query = first + qi;
+                let pos = query / heads_per_kv;
+                let head = kv_head * heads_per_kv + query % heads_per_kv;
+                let score = wg_part_score[ki * $TPQu] * scale;
+                let dp_t = wg_part_dp[ki * $TPQu];
+                if valid && query < query_end && pos >= start_pos && pos < end_pos {
+                    let row_sum = fwd_dst[pos * num_heads + head];
+                    let lse_idx = (pos * num_heads + head) * 2u;
+                    let p_t = exp(min(score - lse[lse_idx], 0.0) - lse[lse_idx + 1u]);
+                    let w_dk = p_t * (dp_t - row_sum) * scale;
+                    let q_offset = qi * $HEAD_DIMu + d_base;
+$TILE_Q_LOAD
+$ACCUMULATE
+                }
+                workgroupBarrier();
+            }
+        }
+        workgroupBarrier();
+    }
+
 // @section tile_q_load
             let q$INDEX = shared_q[q_offset + $INDEXu];
             let do$INDEX = shared_do[q_offset + $INDEXu];
+
+// @section tile_q_load_v4
+            let q$INDEX = shared_q[q_offset / 4u + $OFFSETu];
+            let do$INDEX = shared_do[q_offset / 4u + $OFFSETu];
+// @section query_load
+        for (var flat = lid.x; flat < $QUERY_ELEMENTSu; flat += $THREADSu) {
+            let qi = flat / $HEAD_DIMu;
+            let d = flat % $HEAD_DIMu;
+            let query = first + qi;
+            let pos = query / heads_per_kv;
+            let head = kv_head * heads_per_kv + query % heads_per_kv;
+            let q_base = pos * q_dim + head * head_dim;
+            var q_value = 0.0;
+            var do_value = 0.0;
+            if query < query_end {
+                q_value = src_a[q_base + d];
+                do_value = d_out[q_base + d];
+            }
+            shared_q[flat] = q_value;
+            shared_do[flat] = do_value;
+        }
+
+// @section query_load_v4
+        let query_vecs = $QUERY_ELEMENTSu / 4u;
+        for (var pack = lid.x; pack < query_vecs; pack += $THREADSu) {
+            let elem = pack * 4u;
+            let qi = elem / $HEAD_DIMu;
+            let d = elem % $HEAD_DIMu;
+            let query = first + qi;
+            let pos = query / heads_per_kv;
+            let head = kv_head * heads_per_kv + query % heads_per_kv;
+            let q_base = pos * q_dim + head * head_dim;
+            var q_value = $STILE(0.0);
+            var do_value = vec4<f32>(0.0);
+            if query < query_end {
+                q_value = $STILE(src_a[(q_base + d) / 4u]);
+                do_value = d_out[(q_base + d) / 4u];
+            }
+            shared_q[pack] = q_value;
+            shared_do[pack] = do_value;
+        }

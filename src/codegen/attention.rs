@@ -46,6 +46,8 @@ pub(crate) fn generate_cached_query_attention_module(head_dim: u32) -> ShaderMod
         CACHED_ATTENTION_EPT,
         FlashAttentionShape::default(),
         true,
+        false,
+        true,
     )
 }
 
@@ -54,7 +56,20 @@ pub fn generate_flash_attention_module(
     ept_cap: u32,
     shape: FlashAttentionShape,
 ) -> ShaderModule {
-    generate_flash_attention(head_dim, ept_cap, shape, false)
+    generate_flash_attention(head_dim, ept_cap, shape, false, false, false)
+}
+
+/// `f16_keys` stores Q/K as F16. Dot products widen operands before F32
+/// multiplication and accumulation; softmax and output accumulation stay F32.
+/// V remains F32 so a peaked softmax preserves its value.
+pub fn generate_flash_attention_module_for_device(
+    head_dim: u32,
+    ept_cap: u32,
+    shape: FlashAttentionShape,
+    f16_keys: bool,
+    subgroup_tiles: bool,
+) -> ShaderModule {
+    generate_flash_attention(head_dim, ept_cap, shape, false, f16_keys, subgroup_tiles)
 }
 
 fn attention_module(source: String, hint: &'static str) -> ShaderModule {
@@ -177,11 +192,74 @@ pub(crate) fn generate_cached_attention_module(
     ))
 }
 
+/// How a scalar flash kernel stages its operands: vec4 loads when every lane
+/// owns whole vectors, and F16 tiles (Q/K forward, Q/K/V backward) when
+/// requested. Dot products widen F16 operands before F32 arithmetic.
+#[derive(Clone, Copy)]
+struct Staging {
+    vector: bool,
+    f16: bool,
+}
+
+impl Staging {
+    fn new(vector: bool, f16: bool) -> Self {
+        Self {
+            vector,
+            f16: f16 && vector,
+        }
+    }
+
+    /// Bound F32 values and F32 registers.
+    fn elem(self) -> &'static str {
+        if self.vector { "vec4<f32>" } else { "f32" }
+    }
+
+    /// Staged tiles and the registers loaded from them.
+    fn tile(self) -> &'static str {
+        if self.f16 { "vec4<f16>" } else { self.elem() }
+    }
+
+    fn enable(self) -> &'static str {
+        if self.f16 { "enable f16;\n" } else { "" }
+    }
+
+    /// Words of a tile of `elements` values.
+    fn words(self, elements: u32) -> String {
+        if self.vector { elements / 4 } else { elements }.to_string()
+    }
+
+    /// The `name` section of `template` for this staging.
+    fn section<'a>(self, template: &'a str, name: &str) -> &'a str {
+        if self.vector {
+            template_section(template, &format!("{name}_v4"))
+        } else {
+            template_section(template, name)
+        }
+    }
+}
+
+/// The barrier-free sum across one query's `tpq` lanes, and the argument it
+/// reads the live subgroup width from.
+fn lane_sum(tpq: u32) -> String {
+    let template = include_str!("../shaders/attention_lanes.wgsl");
+    preprocess(
+        template_section(template, "lane_sum"),
+        &[(
+            "$LANE_STEPS",
+            &unroll_reduction(template_section(template, "lane_step"), tpq),
+        )],
+    )
+}
+
+const SUBGROUP_ARG: &str = ", @builtin(subgroup_size) subgroup_size: u32";
+
 fn generate_flash_attention(
     head_dim: u32,
     ept_cap: u32,
     shape: FlashAttentionShape,
     cached: bool,
+    f16_keys: bool,
+    subgroup_tiles: bool,
 ) -> ShaderModule {
     assert!(matches!(shape.threads, 128 | 256) && shape.keys.is_power_of_two() && shape.keys <= 16);
     let (ept, tpq) = attention_lanes(head_dim, ept_cap);
@@ -194,13 +272,71 @@ fn generate_flash_attention(
         return generate_attention_module(head_dim);
     }
     let threads = bq * tpq;
+    let vector = (f16_keys || subgroup_tiles) && ept.is_multiple_of(4);
+    let staging = Staging::new(vector, f16_keys);
     let template = include_str!("../shaders/flash_attention.wgsl");
     let fragment = |name| template_section(template, name);
-    let elements =
-        |name| unroll_elements(fragment(name), ept, if shape.interleave { tpq } else { 1 });
+    // Contiguous lanes own `ept` elements. Interleaved lanes still own that
+    // many, but in groups of four so a vec4 load stays coalesced across the
+    // query's lanes. Scalar interleave keeps the one-element stride.
+    let (base_stride, elem_stride) = if shape.interleave && vector {
+        (4, tpq * 4)
+    } else if shape.interleave {
+        (1, tpq)
+    } else if vector {
+        // One vec4 per step. `ept` is the lane's first element, not the step.
+        (ept, 4)
+    } else {
+        (ept, 1)
+    };
+    let elements = |name: &str| {
+        let (count, stride) = if vector {
+            (ept / 4, elem_stride / 4)
+        } else {
+            (ept, elem_stride)
+        };
+        unroll_elements(staging.section(template, name), count, stride)
+    };
+    let tile_elements = shape.keys * head_dim;
+    let tile_load = if vector {
+        fragment("tile_load_v4").to_owned()
+    } else {
+        attention_tile_load(template, tile_elements, threads)
+    };
+    // One vec4 per thread keeps the next tile in registers. Wider tiles keep
+    // the direct shared load; a private array there spills.
+    let prefetch = vector && tile_elements / 4 <= threads;
     let source = preprocess(
         fragment("main"),
         &[
+            (
+                "$KV_TILES",
+                fragment(if prefetch {
+                    "kv_tiles_prefetched"
+                } else {
+                    "kv_tiles"
+                }),
+            ),
+            (
+                "$TILE_BODY",
+                fragment(if subgroup_tiles {
+                    "tile_subgroup"
+                } else {
+                    "tile_tree"
+                }),
+            ),
+            ("$TILE_TREE", fragment("tile_tree")),
+            (
+                "$TAIL_BODY",
+                fragment(if subgroup_tiles {
+                    "tail_subgroup"
+                } else {
+                    "tail_tree"
+                }),
+            ),
+            ("$TILE_LOAD", &tile_load),
+            ("$TAIL_LOAD", staging.section(template, "tail_load")),
+            ("$ENABLE", staging.enable()),
             (
                 "$PARAMS",
                 if cached {
@@ -208,6 +344,18 @@ fn generate_flash_attention(
                 } else {
                     ATTENTION_PARAMS_WGSL
                 },
+            ),
+            (
+                "$LANE_SUM",
+                &if subgroup_tiles {
+                    lane_sum(tpq)
+                } else {
+                    String::new()
+                },
+            ),
+            (
+                "$SUBGROUP_ARG",
+                if subgroup_tiles { SUBGROUP_ARG } else { "" },
             ),
             (
                 "$CACHED_BINDING",
@@ -251,16 +399,12 @@ fn generate_flash_attention(
             ("$TAIL_DOT", &elements("tail_dot")),
             ("$TAIL_ACCUMULATE", &elements("tail_accumulate")),
             ("$OUT_STORE", &elements("out_store")),
-            (
-                "$TILE_LOAD",
-                &attention_tile_load(template, shape.keys * head_dim, threads),
-            ),
-            ("$TILE_ELEMENTS", &(shape.keys * head_dim).to_string()),
+            ("$ELEM", staging.elem()),
+            ("$STILE", staging.tile()),
+            ("$SHARED_LEN", &staging.words(tile_elements)),
+            ("$TILE_ELEMENTS", &tile_elements.to_string()),
             ("$SCORES", &(threads * shape.keys).to_string()),
-            (
-                "$D_BASE_STRIDE",
-                &(if shape.interleave { 1 } else { ept }).to_string(),
-            ),
+            ("$D_BASE_STRIDE", &base_stride.to_string()),
             ("$HEAD_DIM", &head_dim.to_string()),
             ("$THREADS", &threads.to_string()),
             ("$TPQ", &tpq.to_string()),
@@ -478,119 +622,232 @@ fn backward_attention_tile(head_dim: u32, threads: u32) -> u32 {
     (2048 / (head_dim + threads)).clamp(1, 4)
 }
 
+/// Inner rows once the partial-dot arrays are gone. Two f32 tiles cost
+/// `8 * tile * head_dim` bytes. 16 rows is the fastest cap that still
+/// fits the 16 KiB budget on the head widths this kernel serves.
+fn backward_attention_tile_subgroup(head_dim: u32) -> u32 {
+    (2048 / head_dim).clamp(1, 16)
+}
+
+/// The device's reported subgroup width owns every lane of a query. The
+/// generated kernel still checks the live width and falls back to a shared
+/// sum, because the report is only a default.
+fn subgroup_covers_lanes(subgroup_size: u32, tpq: u32) -> bool {
+    tpq > 1 && subgroup_size >= tpq && subgroup_size.is_multiple_of(tpq)
+}
+
+const BACKWARD_SHARED_BUDGET: u32 = 16 * 1024;
+
+/// Largest row tile whose staging bytes, plus `reserved` fallback storage,
+/// stay inside the scalar backward shared-memory budget.
+fn fit_shared_rows(want: u32, bytes_per_row: u32, reserved: u32) -> u32 {
+    if bytes_per_row == 0 {
+        return want.max(1);
+    }
+    let room = BACKWARD_SHARED_BUDGET.saturating_sub(reserved);
+    want.clamp(1, (room / bytes_per_row).max(1))
+}
+
 /// dQ stages K/V tiles; multi-lane queries also reduce partial dot products.
 pub fn generate_flash_grad_q_module(head_dim: u32, ept_cap: u32) -> ShaderModule {
-    let (ept, tpq) = attention_lanes(head_dim, ept_cap);
-    let bq = (256 / tpq).max(1);
-    if bq <= 1 {
-        return ShaderModule::new(include_str!("../shaders/mha_grad_q.wgsl"));
-    }
-    let threads = bq * tpq;
-    let bkv = if tpq == 1 {
-        8
-    } else {
-        backward_attention_tile(head_dim, threads)
-    };
-    let template = include_str!("../shaders/flash_grad_q.wgsl");
-    let fragment = |name| template_section(template, name);
-    let elements = |name| unroll_elements(fragment(name), ept, 1);
-    let source = preprocess(
-        fragment("main"),
-        &[
-            ("$PARAMS", ATTENTION_PARAMS_WGSL),
-            (
-                "$REDUCTION",
-                if tpq > 1 { fragment("reduction") } else { "" },
-            ),
-            (
-                "$REDUCE_STEP",
-                &unroll_reduction(fragment("reduce_step"), tpq),
-            ),
-            (
-                "$KV_LOOP",
-                fragment(if tpq == 1 {
-                    "tiled_kv_loop"
-                } else {
-                    "grouped_kv_loop"
-                }),
-            ),
-            ("$Q_INIT", &elements("q_init")),
-            ("$Q_LOAD", &elements("q_load")),
-            ("$DQ_INIT", &elements("dq_init")),
-            (
-                "$TILE_LOAD",
-                &attention_tile_load(template, bkv * head_dim, threads),
-            ),
-            ("$TILE_DOT", &elements("tile_dot")),
-            ("$TILE_ACCUMULATE", &elements("tile_accumulate")),
-            ("$TAIL_DOT", &elements("tail_dot")),
-            ("$TAIL_ACCUMULATE", &elements("tail_accumulate")),
-            ("$STORE", &elements("store")),
-            ("$GROUP_ELEMENTS", &(bkv * threads).to_string()),
-            ("$TILE_ELEMENTS", &(bkv * head_dim).to_string()),
-            ("$HEAD_DIM", &head_dim.to_string()),
-            ("$THREADS", &threads.to_string()),
-            ("$EPT", &ept.to_string()),
-            ("$TPQ", &tpq.to_string()),
-            ("$BQ", &bq.to_string()),
-            ("$BKV", &bkv.to_string()),
-        ],
-    );
-    attention_module(source, "flash_grad_q")
+    let part = crate::kernels::attention_grad::Part::Q;
+    generate_flash_grad_module(part, head_dim, ept_cap, 0, 256, false)
 }
 
 /// dK/dV batches Q/dO rows for grouped reductions; single-lane heads load directly.
 pub fn generate_flash_grad_kv_module(head_dim: u32, ept_cap: u32) -> ShaderModule {
+    let part = crate::kernels::attention_grad::Part::KV;
+    generate_flash_grad_module(part, head_dim, ept_cap, 0, 256, false)
+}
+
+/// A scalar flash attention derivative. A workgroup owns a block of rows,
+/// queries for dQ and keys for dK/dV, and stages the other side's rows in
+/// tiles: K/V for dQ, Q/dO for dK/dV. Several lanes per row sum their partial
+/// dots with subgroup shuffles when the device's default `subgroup_size`
+/// covers them, checking the live width, and with a shared tree otherwise.
+/// Zero `subgroup_size` keeps the tree. `threads` is the flash workgroup
+/// width, 128 or 256.
+pub fn generate_flash_grad_module(
+    part: crate::kernels::attention_grad::Part,
+    head_dim: u32,
+    ept_cap: u32,
+    subgroup_size: u32,
+    threads: u32,
+    f16_tiles: bool,
+) -> ShaderModule {
+    use crate::kernels::attention_grad::Part;
     let (ept, tpq) = attention_lanes(head_dim, ept_cap);
-    let bkv = (256 / tpq).max(1);
-    if bkv <= 1 {
-        return ShaderModule::new(include_str!("../shaders/mha_grad_kv.wgsl"));
+    let rows = (threads / tpq).max(1);
+    if rows <= 1 {
+        return ShaderModule::new(match part {
+            Part::Q => include_str!("../shaders/mha_grad_q.wgsl"),
+            Part::KV => include_str!("../shaders/mha_grad_kv.wgsl"),
+        });
     }
-    let template = include_str!("../shaders/flash_grad_kv.wgsl");
+    let threads = rows * tpq;
+    let vector = ept.is_multiple_of(4);
+    let staging = Staging::new(vector, f16_tiles);
+    let subgroup = subgroup_covers_lanes(subgroup_size, tpq);
+    // Without the partial-dot arrays, subgroup kernels stage more rows: dQ
+    // two tiles, dK/dV Q in the tile type and dO in F32, beside a compact
+    // fallback of two F32 values per thread.
+    let staged = if subgroup {
+        let element = if staging.f16 { 2 } else { 4 };
+        let bytes_per_row = match part {
+            Part::Q => 2 * element,
+            Part::KV => element + 4,
+        } * head_dim;
+        fit_shared_rows(
+            backward_attention_tile_subgroup(head_dim),
+            bytes_per_row,
+            8 * threads,
+        )
+    } else if part == Part::Q && tpq == 1 {
+        8
+    } else {
+        backward_attention_tile(head_dim, threads)
+    };
+    let staged_elements = staged * head_dim;
+    let template = match part {
+        Part::Q => include_str!("../shaders/flash_grad_q.wgsl"),
+        Part::KV => include_str!("../shaders/flash_grad_kv.wgsl"),
+    };
     let fragment = |name| template_section(template, name);
-    let elements = |name| unroll_elements(fragment(name), ept, 1);
-    let query_tile = backward_attention_tile(head_dim, bkv * tpq);
-    let source = preprocess(
-        fragment("main"),
-        &[
-            ("$PARAMS", ATTENTION_PARAMS_WGSL),
+    let math = |name: &str| {
+        unroll_elements(
+            staging.section(template, name),
+            if vector { ept / 4 } else { ept },
+            1,
+        )
+    };
+    let lanes = include_str!("../shaders/attention_lanes.wgsl");
+    let mut vars: Vec<(&str, String)> = vec![
+        ("$ENABLE", staging.enable().to_owned()),
+        ("$PARAMS", ATTENTION_PARAMS_WGSL.to_owned()),
+        (
+            "$LANE_SUM",
+            if subgroup {
+                lane_sum(tpq)
+            } else {
+                String::new()
+            },
+        ),
+        (
+            "$SUBGROUP_ARG",
+            if subgroup { SUBGROUP_ARG } else { "" }.to_owned(),
+        ),
+        (
+            "$REDUCTION",
+            if subgroup {
+                template_section(lanes, "partial_sums")
+            } else if tpq > 1 {
+                fragment("reduction")
+            } else {
+                ""
+            }
+            .to_owned(),
+        ),
+        (
+            "$REDUCE_STEP",
+            unroll_reduction(fragment("reduce_step"), tpq),
+        ),
+    ];
+    // Loops first: they contain the fragments substituted after them.
+    match part {
+        Part::Q => vars.extend([
+            (
+                "$KV_LOOP",
+                fragment(if tpq == 1 {
+                    "tiled_kv_loop"
+                } else if subgroup {
+                    "grouped_kv_loop_subgroup"
+                } else {
+                    "grouped_kv_loop"
+                })
+                .to_owned(),
+            ),
+            (
+                "$TILE_LOAD",
+                if vector {
+                    fragment("tile_load_v4").to_owned()
+                } else {
+                    attention_tile_load(template, staged_elements, threads)
+                },
+            ),
+            (
+                "$GROUP_LOAD",
+                staging.section(template, "group_load").to_owned(),
+            ),
+            (
+                "$TILED_TAIL_LOAD",
+                staging.section(template, "tail_load").to_owned(),
+            ),
+            ("$Q_INIT", math("q_init")),
+            ("$Q_LOAD", math("q_load")),
+            ("$DQ_INIT", math("dq_init")),
+            ("$TILE_DOT", math("tile_dot")),
+            ("$TILE_ACCUMULATE", math("tile_accumulate")),
+            ("$TAIL_DOT", math("tail_dot")),
+            ("$TAIL_ACCUMULATE", math("tail_accumulate")),
+            ("$STORE", math("store")),
+            ("$SHARED_LEN", staging.words(staged_elements)),
+            ("$TILE_ELEMENTS", staged_elements.to_string()),
+            ("$BQ", rows.to_string()),
+            ("$BKV", staged.to_string()),
+        ]),
+        Part::KV => vars.extend([
             (
                 "$QUERY_LOOP",
-                fragment(if tpq > 1 {
+                fragment(if subgroup {
+                    "tiled_query_loop_subgroup"
+                } else if tpq > 1 {
                     "tiled_query_loop"
                 } else {
                     "direct_query_loop"
-                }),
-            ),
-            ("$TILE_Q_LOAD", &elements("tile_q_load")),
-            ("$SHARED", if tpq > 1 { fragment("shared") } else { "" }),
-            (
-                "$REDUCTION",
-                if tpq > 1 { fragment("reduction") } else { "" },
+                })
+                .to_owned(),
             ),
             (
-                "$REDUCE_STEP",
-                &unroll_reduction(fragment("reduce_step"), tpq),
+                "$QUERY_SHARED",
+                if tpq > 1 { fragment("shared") } else { "" }.to_owned(),
             ),
-            ("$KV_INIT", &elements("kv_init")),
-            ("$KV_LOAD", &elements("kv_load")),
-            ("$GRAD_INIT", &elements("grad_init")),
-            ("$Q_LOAD", &elements("q_load_direct")),
-            ("$DOT", &elements("dot")),
-            ("$SCORE", fragment("direct_score")),
-            ("$ACCUMULATE", &elements("accumulate")),
-            ("$STORE", &elements("store")),
-            ("$QUERY_TILE", &query_tile.to_string()),
-            ("$QUERY_ELEMENTS", &(query_tile * head_dim).to_string()),
-            ("$GROUP_ELEMENTS", &(query_tile * bkv * tpq).to_string()),
-            ("$HEAD_DIM", &head_dim.to_string()),
-            ("$THREADS", &(bkv * tpq).to_string()),
-            ("$EPT", &ept.to_string()),
-            ("$TPQ", &tpq.to_string()),
-            ("$BKV", &bkv.to_string()),
-        ],
-    );
-    attention_module(source, "flash_grad_kv")
+            (
+                "$QUERY_LOAD",
+                staging.section(template, "query_load").to_owned(),
+            ),
+            ("$TILE_Q_LOAD", math("tile_q_load")),
+            ("$KV_INIT", math("kv_init")),
+            ("$KV_LOAD", math("kv_load")),
+            ("$GRAD_INIT", math("grad_init")),
+            ("$Q_LOAD", math("q_load_direct")),
+            ("$DOT", math("dot")),
+            ("$SCORE", fragment("direct_score").to_owned()),
+            ("$ACCUMULATE", math("accumulate")),
+            ("$STORE", math("store")),
+            ("$QUERY_LEN", staging.words(staged_elements)),
+            ("$QUERY_TILE", staged.to_string()),
+            ("$QUERY_ELEMENTS", staged_elements.to_string()),
+            ("$BKV", rows.to_string()),
+        ]),
+    }
+    vars.extend([
+        ("$ELEM", staging.elem().to_owned()),
+        ("$STILE", staging.tile().to_owned()),
+        ("$GROUP_ELEMENTS", (staged * threads).to_string()),
+        ("$HEAD_DIM", head_dim.to_string()),
+        ("$THREADS", threads.to_string()),
+        ("$EPT", ept.to_string()),
+        ("$TPQ", tpq.to_string()),
+    ]);
+    let vars: Vec<_> = vars
+        .iter()
+        .map(|&(key, ref value)| (key, value.as_str()))
+        .collect();
+    let hint = match part {
+        Part::Q => "flash_grad_q",
+        Part::KV => "flash_grad_kv",
+    };
+    attention_module(preprocess(fragment("main"), &vars), hint)
 }
 
 /// Conv2d cooperative-matrix GEMM direction.

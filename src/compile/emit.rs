@@ -4,6 +4,14 @@ use super::*;
 use crate::kernels::attention_grad::{self, AttentionGrad, Part};
 use crate::kernels::conv;
 
+fn scalar_flash_attention(shader: &ShaderEntry) -> bool {
+    match *shader {
+        ShaderEntry::FlashAttention => true,
+        ShaderEntry::AttentionGrad(kernel) => kernel.path == attention_grad::Path::Flash,
+        _ => false,
+    }
+}
+
 /// Storage of an explicit reduced-precision dense product, which runs on the
 /// typed cooperative kernel: any BF16 operand, or two F16 operands. `None`
 /// for ordinary products and other operations.
@@ -388,7 +396,11 @@ impl<'a> Compiler<'a> {
         } else {
             AttentionGrad::select(&problem, &target)
         };
-        (kernel, kernel.workgroups(&problem), problem.ept_cap)
+        (
+            kernel,
+            kernel.workgroups_with_threads(&problem, knobs.flash.threads),
+            problem.ept_cap,
+        )
     }
 
     pub(super) fn get_buffer(&self, node: NodeId) -> BufferRef {
@@ -3846,6 +3858,11 @@ impl<'a> Compiler<'a> {
         for dispatch in &mut self.plan.dispatches[dispatch_start..] {
             dispatch.requires_full_precision = node.requires_full_precision;
             dispatch.is_derivative = node.is_derivative;
+            // The session policy can still clear this. F16 staging is a
+            // measured choice because conversions can cost more than they save.
+            dispatch.attention_f16_tiles = scalar_flash_attention(&dispatch.shader)
+                && !node.requires_full_precision
+                && self.options.flash_f16_tiles;
         }
     }
 

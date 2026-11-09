@@ -358,8 +358,27 @@ pub fn build_measured_with_inputs(
     programs.enable_matrix_inputs(&supported, &gpu.capabilities());
     programs.enable_gradient_inputs(&supported);
     programs.enable_conv_gradient_inputs(&supported);
+    programs.attention_subgroup_size = gpu.capabilities().subgroup_size;
     if cfg.mode == crate::Mode::Inference && cfg.options.flash_forward_coop {
         programs.enable_forward_products(gpu.capabilities().subgroup_size);
+    }
+    programs.enable_flash_reductions();
+    if cfg.mode == crate::Mode::Inference
+        && matches!(
+            cfg.runtime.coop,
+            crate::CoopPolicy::Auto | crate::CoopPolicy::AllowF16
+        )
+        && gpu.capabilities().shader_float16
+    {
+        programs.enable_flash_tiles();
+    }
+    if cfg.mode == crate::Mode::Training {
+        programs.enable_flash_backward(
+            matches!(
+                cfg.runtime.coop,
+                crate::CoopPolicy::Auto | crate::CoopPolicy::AllowF16
+            ) && gpu.capabilities().shader_float16,
+        );
     }
     let preparation_time = start.elapsed();
     measure::select(
@@ -486,9 +505,43 @@ struct AxisChoice {
     vector_convolutions_only: bool,
     winograd: Option<crate::DType>,
     f16_attention: bool,
+    /// Scalar flash staging as f16. Forward V and backward dO stay f32.
+    f16_flash_tiles: bool,
+    backward_ept: Option<u32>,
+    /// Subgroup lane sums and vector forward tiles for scalar flash attention.
+    subgroup_tiles: bool,
     gradient_inputs: Option<crate::DType>,
     conv_gradient_inputs: Option<crate::DType>,
     forward_products: bool,
+}
+
+/// A scalar flash dispatch of `plan` whose reduction can use subgroups on
+/// this device: any forward kernel, or backward rows wider than eight lanes.
+fn has_flash_reduction(plan: &compile::ExecutionPlan, subgroup_size: u32) -> bool {
+    use compile::DispatchParams as _;
+    plan.dispatches.iter().any(|d| {
+        if d.shader == compile::ShaderEntry::FlashAttention {
+            return subgroup_size > 0;
+        }
+        let compile::ShaderEntry::AttentionGrad(k) = d.shader else {
+            return false;
+        };
+        if k.path != crate::kernels::attention_grad::Path::Flash {
+            return false;
+        }
+        let Some(params) = compile::AttentionParams::from_words(&d.params) else {
+            return false;
+        };
+        let cap = match d.kernel {
+            compile::Kernel::AttentionBackward { ept_cap } => ept_cap,
+            _ => match k.part {
+                crate::kernels::attention_grad::Part::Q => plan.knobs.flash_grad_q_ept_cap,
+                crate::kernels::attention_grad::Part::KV => plan.knobs.flash_grad_kv_ept_cap,
+            },
+        };
+        let lanes = crate::codegen::attention_lanes(params.head_dim, cap).1;
+        lanes > 8 && subgroup_size >= lanes && subgroup_size.is_multiple_of(lanes)
+    })
 }
 
 /// Coordinate order over graph forms and physical choices (indices into the
@@ -667,7 +720,7 @@ fn implementations(
         for (e, ept) in [32, 16, 8].into_iter().enumerate() {
             for (t, threads) in [256, 128].into_iter().enumerate() {
                 for (k, keys) in [8, 16, 4].into_iter().enumerate() {
-                    for (l, interleave) in [false, true].into_iter().enumerate() {
+                    for interleave in [false, true] {
                         let shape = crate::codegen::FlashAttentionShape {
                             threads,
                             keys,
@@ -677,7 +730,9 @@ fn implementations(
                             .iter()
                             .all(|&hd| shape.shared_bytes(hd) <= u64::from(shared_memory_bytes))
                         {
-                            layouts.push((e + t + k + l, (0, Some((ept, shape)))));
+                            // Cover both lane assignments at each EPT before
+                            // combining tile and workgroup changes.
+                            layouts.push(((e + t + k, t + k), (0, Some((ept, shape)))));
                         }
                     }
                 }
@@ -826,6 +881,87 @@ impl Implementations {
                     ..*choice
                 }));
         }
+        self.order.choices = self.choices.len();
+        self.order.choice_order = (0..self.choices.len()).collect();
+    }
+
+    fn enable_flash_reductions(&mut self) {
+        if self
+            .seeds
+            .iter()
+            .any(|seed| has_flash_reduction(&seed.plan, self.attention_subgroup_size))
+        {
+            self.order.priority_choices.push_back(self.choices.len());
+            let ordinary = self.choices.clone();
+            self.choices.extend(
+                ordinary
+                    .into_iter()
+                    .filter(|c| !c.f16_attention)
+                    .map(|choice| AxisChoice {
+                        subgroup_tiles: true,
+                        ..choice
+                    }),
+            );
+        }
+        self.order.choices = self.choices.len();
+        self.order.choice_order = (0..self.choices.len()).collect();
+    }
+
+    fn enable_flash_backward(&mut self, allow_f16: bool) {
+        if !self.seeds.iter().any(|seed| {
+            seed.plan.dispatches.iter().any(|d| {
+                matches!(d.shader, compile::ShaderEntry::AttentionGrad(k)
+                if k.path == crate::kernels::attention_grad::Path::Flash)
+            })
+        }) {
+            return;
+        }
+        let ordinary = self.choices.clone();
+        // Preserve precision coverage before adding backward layouts. Spending
+        // the deadline on geometry can hide a larger derivative-product win.
+        for cap in [16, 32, 8] {
+            self.order.priority_choices.push_back(self.choices.len());
+            self.choices
+                .extend(
+                    ordinary
+                        .iter()
+                        .filter(|c| !c.f16_attention)
+                        .map(|choice| AxisChoice {
+                            backward_ept: Some(cap),
+                            ..*choice
+                        }),
+                );
+        }
+        if allow_f16 {
+            self.enable_flash_tiles();
+        }
+        self.order.choices = self.choices.len();
+        self.order.choice_order = (0..self.choices.len()).collect();
+    }
+
+    fn enable_flash_tiles(&mut self) {
+        if !self.seeds.iter().any(|seed| {
+            seed.plan.dispatches.iter().any(|d| {
+                matches!(
+                    d.shader,
+                    compile::ShaderEntry::FlashAttention | compile::ShaderEntry::AttentionGrad(_)
+                )
+            })
+        }) {
+            return;
+        }
+        let ordinary = self.choices.clone();
+        self.order.priority_choices.push_back(self.choices.len());
+        self.choices.extend(
+            ordinary
+                .into_iter()
+                .filter(|c| !c.f16_attention)
+                .map(|choice| AxisChoice {
+                    f16_flash_tiles: true,
+                    forward_products: false,
+                    ..choice
+                }),
+        );
         self.order.choices = self.choices.len();
         self.order.choice_order = (0..self.choices.len()).collect();
     }
@@ -1336,7 +1472,11 @@ impl measure::Frontier for Implementations {
                 let derivative_trial = (arithmetic.gradient_inputs.is_some()
                     && arithmetic.gradient_inputs != active.gradient_inputs)
                     || (arithmetic.conv_gradient_inputs.is_some()
-                        && arithmetic.conv_gradient_inputs != active.conv_gradient_inputs);
+                        && arithmetic.conv_gradient_inputs != active.conv_gradient_inputs)
+                    || (arithmetic.backward_ept.is_some()
+                        && arithmetic.backward_ept != active.backward_ept)
+                    || arithmetic.f16_flash_tiles != active.f16_flash_tiles
+                    || arithmetic.subgroup_tiles != active.subgroup_tiles;
                 let products_only = arithmetic.forward_products
                     && arithmetic.matrix_inputs.is_none()
                     && arithmetic.winograd.is_none();
@@ -1354,10 +1494,22 @@ impl measure::Frontier for Implementations {
                     conv_gradient_inputs: arithmetic
                         .conv_gradient_inputs
                         .or(active.conv_gradient_inputs),
-                    forward_products: arithmetic.forward_products || active.forward_products,
+                    backward_ept: arithmetic.backward_ept.or(active.backward_ept),
+                    subgroup_tiles: arithmetic.subgroup_tiles || active.subgroup_tiles,
+                    f16_flash_tiles: arithmetic.f16_flash_tiles || active.f16_flash_tiles,
+                    forward_products: !arithmetic.f16_flash_tiles
+                        && !arithmetic.subgroup_tiles
+                        && (arithmetic.forward_products || active.forward_products),
                     attention: active.attention,
                     fuse_dispatches: active.fuse_dispatches,
-                    f16_attention: active.f16_attention,
+                    f16_attention: if arithmetic.backward_ept.is_some()
+                        || arithmetic.f16_flash_tiles
+                        || arithmetic.subgroup_tiles
+                    {
+                        false
+                    } else {
+                        active.f16_attention
+                    },
                     ..base
                 };
                 if let Some(next) = self.choices.iter().position(|&choice| choice == neighbor) {
@@ -1441,7 +1593,10 @@ impl measure::Frontier for Implementations {
                         + usize::from(choice.conv_gradient_inputs != active.conv_gradient_inputs),
                     choice.forward_products != active.forward_products,
                     choice.f16_attention != active.f16_attention,
+                    choice.subgroup_tiles != active.subgroup_tiles,
                     choice.attention != active.attention,
+                    choice.f16_flash_tiles != active.f16_flash_tiles,
+                    choice.backward_ept != active.backward_ept,
                     choice.fuse_dispatches != active.fuse_dispatches,
                     index,
                 )
@@ -1456,12 +1611,18 @@ impl measure::Frontier for Implementations {
                 vector_convolutions_only,
                 winograd,
                 f16_attention,
+                f16_flash_tiles,
+                backward_ept,
+                subgroup_tiles,
                 gradient_inputs,
                 conv_gradient_inputs,
                 forward_products,
             } = self.choices[choice_index];
             let mut plan = if splits == 0
                 && !f16_attention
+                && !f16_flash_tiles
+                && !subgroup_tiles
+                && backward_ept.is_none()
                 && flash.is_none()
                 && fuse_dispatches == seed.options.fuse_dispatches
             {
@@ -1484,8 +1645,28 @@ impl measure::Frontier for Implementations {
                     options.knobs.flash = shape;
                     options.flash_forward_coop = false;
                 }
+                if let Some(cap) = backward_ept {
+                    options.knobs.flash_grad_q_ept_cap = cap;
+                    options.knobs.flash_grad_kv_ept_cap = cap;
+                }
+                if f16_flash_tiles {
+                    options.flash_f16_tiles = true;
+                    options.flash_forward_coop = false;
+                }
+                if subgroup_tiles {
+                    options.knobs.flash_subgroup_tiles = true;
+                    options.flash_forward_coop = false;
+                }
+                let scalar_backward = backward_ept.is_some() || f16_flash_tiles || subgroup_tiles;
+                if scalar_backward {
+                    options.flash_backward_coop = false;
+                    options.prefer_attention_grad =
+                        Some(crate::kernels::attention_grad::Path::Flash);
+                }
                 let mut attention_graph;
-                let graph = if f16_attention && self.replace_extracted_attention {
+                let graph = if (f16_attention || backward_ept.is_some() || f16_flash_tiles)
+                    && self.replace_extracted_attention
+                {
                     attention_graph = seed.graph.deep_clone();
                     for node in attention_graph.nodes_mut() {
                         if matches!(
@@ -1494,7 +1675,9 @@ impl measure::Frontier for Implementations {
                                 | crate::graph::Op::MultiHeadAttnGradK { .. }
                                 | crate::graph::Op::MultiHeadAttnGradV { .. }
                         ) {
-                            node.attention_ept_cap = None;
+                            if f16_attention || backward_ept.is_some() {
+                                node.attention_ept_cap = None;
+                            }
                             node.attention_impl = None;
                         }
                     }
@@ -1508,6 +1691,24 @@ impl measure::Frontier for Implementations {
                     self.caps,
                     self.shared_memory_bytes,
                 );
+                if subgroup_tiles && !has_flash_reduction(&plan, self.attention_subgroup_size) {
+                    continue;
+                }
+                let has_flash_backward = plan.dispatches.iter().any(|d| {
+                    matches!(d.shader, compile::ShaderEntry::AttentionGrad(k)
+                        if k.path == crate::kernels::attention_grad::Path::Flash)
+                });
+                let has_flash_forward = plan
+                    .dispatches
+                    .iter()
+                    .any(|d| d.shader == compile::ShaderEntry::FlashAttention);
+                let has_f16_flash = plan.dispatches.iter().any(|d| d.attention_f16_tiles);
+                if (backward_ept.is_some() && !has_flash_backward)
+                    || (subgroup_tiles && !has_flash_backward && !has_flash_forward)
+                    || (f16_flash_tiles && !has_f16_flash)
+                {
+                    continue;
+                }
                 if plan == seed.plan
                     || (f16_attention
                         && !plan.dispatches.iter().any(|d| {
@@ -1578,6 +1779,15 @@ impl measure::Frontier for Implementations {
             );
             if f16_attention {
                 description.push_str(", f16_attention=true");
+            }
+            if let Some(cap) = backward_ept {
+                description.push_str(&format!(", backward_ept={cap}"));
+            }
+            if subgroup_tiles {
+                description.push_str(", subgroup_tiles=true");
+            }
+            if f16_flash_tiles {
+                description.push_str(", f16_flash_tiles=true");
             }
             if forward_products {
                 description.push_str(", forward_products=true");
@@ -1870,6 +2080,187 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn measured_f16_staging_can_replace_cooperative_forward_attention() {
+        use measure::Frontier as _;
+        let mut graph = Graph::new();
+        let q = graph.input("q", &[128, 64]);
+        let k = graph.input("k", &[128, 64]);
+        let v = graph.input("v", &[128, 64]);
+        let y = graph.full_attention(q, k, v, 1, 1, 64);
+        graph.set_outputs(vec![y]);
+        let mut frontier = graph_frontier(graph);
+        let products = frontier.choices.len();
+        frontier.choices.push(AxisChoice {
+            forward_products: true,
+            ..frontier.choices[0]
+        });
+        frontier.enable_flash_tiles();
+        let _baseline = frontier.next(None).unwrap();
+        let candidate = frontier
+            .next(Some(measure::Origin {
+                form: 0,
+                choice: products,
+            }))
+            .unwrap();
+        assert!(choice_of(&frontier, &candidate).f16_flash_tiles);
+        assert!(!choice_of(&frontier, &candidate).forward_products);
+        assert!(
+            candidate
+                .plan
+                .dispatches
+                .iter()
+                .any(|d| d.shader == compile::ShaderEntry::FlashAttention && d.attention_f16_tiles)
+        );
+    }
+
+    #[test]
+    fn wide_backward_reduction_keeps_extracted_ept() {
+        use measure::Frontier as _;
+        let mut graph = Graph::new();
+        let q = graph.parameter("q", &[50, 960]);
+        let k = graph.parameter("k", &[50, 320]);
+        let v = graph.parameter("v", &[50, 320]);
+        let y = graph.causal_attention(q, k, v, 15, 5, 64);
+        let loss = graph.mean_all(y);
+        graph.set_outputs(vec![loss]);
+        let mut graph = crate::autodiff::differentiate(&graph);
+        for node in graph.nodes_mut() {
+            if matches!(
+                node.op,
+                crate::graph::Op::MultiHeadAttnGradQ { .. }
+                    | crate::graph::Op::MultiHeadAttnGradK { .. }
+                    | crate::graph::Op::MultiHeadAttnGradV { .. }
+            ) {
+                node.attention_ept_cap = Some(4);
+            }
+        }
+        let mut frontier = graph_frontier(graph);
+        frontier.replace_extracted_attention = true;
+        frontier.attention_subgroup_size = 32;
+        frontier.enable_flash_reductions();
+        frontier.enable_flash_backward(true);
+        let baseline = frontier.next(None).unwrap();
+        let alternative = frontier.next(baseline.origin).unwrap();
+        assert!(choice_of(&frontier, &alternative).subgroup_tiles);
+        assert!(alternative.plan.knobs.flash_subgroup_tiles);
+        assert!(
+            alternative
+                .plan
+                .dispatches
+                .iter()
+                .any(|d| { matches!(d.kernel, compile::Kernel::AttentionBackward { ept_cap: 4 }) })
+        );
+        assert_eq!(
+            alternative.plan.knobs.flash_grad_q_ept_cap,
+            baseline.plan.knobs.flash_grad_q_ept_cap
+        );
+        let precision = (0..8)
+            .find_map(|_| {
+                let candidate = frontier.next(baseline.origin)?;
+                choice_of(&frontier, &candidate)
+                    .f16_flash_tiles
+                    .then_some(candidate)
+            })
+            .expect("backward precision must preserve the extracted layout");
+        assert!(precision.plan.dispatches.iter().any(|d| {
+            d.attention_f16_tiles
+                && matches!(d.kernel, compile::Kernel::AttentionBackward { ept_cap: 4 })
+        }));
+    }
+
+    #[test]
+    fn flash_backward_shape_and_precision_are_independent_early_choices() {
+        use measure::Frontier as _;
+        let mut graph = Graph::new();
+        let q = graph.parameter("q", &[128, 64]);
+        let k = graph.parameter("k", &[128, 64]);
+        let v = graph.parameter("v", &[128, 64]);
+        let y = graph.multi_head_attn(q, k, v, 1, 1, 64, false);
+        let loss = graph.mean_all(y);
+        graph.set_outputs(vec![loss]);
+        let mut frontier = graph_frontier(crate::autodiff::differentiate(&graph));
+        // Start from a wider backward layout so the first shape neighbor
+        // exercises an actual change, including from a cooperative winner.
+        let seed = &mut frontier.seeds[0];
+        seed.options.knobs.flash_grad_q_ept_cap = 32;
+        seed.options.knobs.flash_grad_kv_ept_cap = 32;
+        seed.plan = compile::compile_with_caps(&seed.graph, &seed.options, frontier.caps, 65536);
+        let cooperative_index = frontier.choices.len();
+        frontier.choices.push(AxisChoice {
+            f16_attention: true,
+            ..frontier.choices[0]
+        });
+        frontier.enable_flash_backward(true);
+        let baseline = frontier.next(None).unwrap();
+        let cooperative = measure::Origin {
+            form: 0,
+            choice: cooperative_index,
+        };
+        let shaped = frontier.next(Some(cooperative)).unwrap();
+        let choice = choice_of(&frontier, &shaped);
+        assert_eq!(choice.backward_ept, Some(16));
+        assert!(!choice.f16_flash_tiles);
+        assert!(!choice.f16_attention);
+        assert!(shaped.plan.dispatches.iter().any(|d| matches!(d.shader, compile::ShaderEntry::AttentionGrad(k) if k.path == crate::kernels::attention_grad::Path::Flash)));
+        assert_eq!(
+            shaped.plan.knobs.flash_ept_cap,
+            baseline.plan.knobs.flash_ept_cap
+        );
+        assert_eq!(shaped.plan.knobs.flash_grad_q_ept_cap, 16);
+        assert_eq!(shaped.plan.knobs.flash_grad_kv_ept_cap, 16);
+        assert_eq!(
+            choice.fuse_dispatches,
+            choice_of(&frontier, &baseline).fuse_dispatches
+        );
+        let mixed = (0..32)
+            .find_map(|_| {
+                let candidate = frontier.next(shaped.origin)?;
+                choice_of(&frontier, &candidate)
+                    .f16_flash_tiles
+                    .then_some(candidate)
+            })
+            .expect("the precision neighbor must stay reachable");
+        let choice = choice_of(&frontier, &mixed);
+        assert_eq!(choice.backward_ept, Some(16));
+        assert_eq!(choice.attention, choice_of(&frontier, &shaped).attention);
+        assert_eq!(
+            choice.fuse_dispatches,
+            choice_of(&frontier, &shaped).fuse_dispatches
+        );
+
+        // A new forward winner must revisit backward precision before
+        // exhausting all other forward layouts with the old precision.
+        let forward_index = frontier
+            .choices
+            .iter()
+            .position(|c| {
+                c.attention.1.is_some()
+                    && !c.f16_attention
+                    && !c.f16_flash_tiles
+                    && c.backward_ept.is_none()
+            })
+            .unwrap();
+        frontier.order.priority_choices.clear();
+        frontier.queued_splits = true;
+        frontier.order.tried.insert((0, forward_index));
+        let forward = measure::Origin {
+            form: 0,
+            choice: forward_index,
+        };
+        let neighbor = (0..8)
+            .find_map(|_| {
+                let candidate = frontier.next(Some(forward))?;
+                let choice = choice_of(&frontier, &candidate);
+                choice.f16_flash_tiles.then_some(choice)
+            })
+            .expect("revisit backward precision on the forward winner");
+        assert_eq!(
+            neighbor.attention,
+            frontier.choices[forward_index].attention
+        );
     }
 
     #[test]
@@ -3039,6 +3430,14 @@ mod tests {
                 .collect();
             implementations(seeds, caps, 65536, 512 << 20)
         };
+        assert!(
+            frontier().choices.iter().take(16).any(|choice| {
+                choice.attention.1.is_some_and(|(ept, shape)| {
+                    ept == 16 && shape.interleave && shape.threads == 256 && shape.keys == 8
+                })
+            }),
+            "cover paired lane layouts before deeper geometry combinations"
+        );
         // Reserve half the ordinary 64-program allowance for submission probes.
         // Even with a full graph frontier, distinct attention layouts must fit.
         let budget = BuildSearchOptions::default().max_programs / 2;

@@ -1,7 +1,8 @@
 Rules:
 - everything flows into core from the config, no external env hooks
 - minimize enums, shaders, tests
-- WGSL code should in in wgsl files
+- WGSL code should be in wgsl files
+- data flows top to bottom: decide from the inputs, never by parsing generated text or matching names
 
 Style:
 - self-descripting code >> comment towers

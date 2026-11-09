@@ -964,7 +964,10 @@ enum Variant {
     Pointwise(u64),
     /// Attention specialization includes the head width and the scalar
     /// backward EPT cap. Both can differ between dispatches in one plan.
-    Attention(ShaderEntry, u32, Option<u32>),
+    /// The last flag is permission to store flash Q and K tiles as f16.
+    /// V stays f32: a one-key row reproduces V, and an f16 value misses the
+    /// strict bound. Causal and unmasked forward share that rule.
+    Attention(ShaderEntry, u32, Option<u32>, bool),
     /// Epilogue-fused matmuls, keyed by their actual DAG. The cooperative form
     /// uses workgroup memory to expose accumulator lanes to the epilogue.
     Epilogue(ShaderEntry, EpiloguePipelineKey),
@@ -1045,7 +1048,7 @@ impl Variant {
             Variant::StoredGate(ref e, _)
             | Variant::WinogradTransform(ref e, _)
             | Variant::WinogradMatmul(ref e, _, _)
-            | Variant::Attention(ref e, _, _)
+            | Variant::Attention(ref e, _, _, _)
             | Variant::CoopTyped(ref e, _, _)
             | Variant::CoopConv(ref e, _, _)
             | Variant::CoopWorkgroup(ref e, _, _, _)
@@ -1110,8 +1113,9 @@ impl Variant {
             }
             Variant::Reduction(hash) => format!("generated-reduction:{hash:016x}"),
             Variant::Pointwise(hash) => format!("generated-pointwise:{hash:016x}"),
-            Variant::Attention(ref e, head_dim, ept) => {
-                format!("{e:?}:head-dim-{head_dim}:ept-{ept:?}")
+            Variant::Attention(ref e, head_dim, ept, f16_tiles) => {
+                let tiles = if f16_tiles { ":f16-tiles" } else { "" };
+                format!("{e:?}:head-dim-{head_dim}:ept-{ept:?}{tiles}")
             }
             Variant::Epilogue(ref e, ref key) => epilogue_profile_key(e, key, false),
             Variant::CoopEpilogue(ref e, ref key) => epilogue_profile_key(e, key, true),
@@ -2143,12 +2147,19 @@ impl Pipelines {
                     dispatch.weight_format,
                 )
             }
-            Variant::Attention(_, hd, ept) => match group {
-                ShaderGroup::FlashAttention => crate::codegen::generate_flash_attention_module(
-                    hd,
-                    knobs.flash_ept_cap,
-                    knobs.flash,
-                ),
+            Variant::Attention(_, hd, ept, f16_tiles) => match group {
+                ShaderGroup::FlashAttention => {
+                    // V stays f32. A one-key row, including unmasked attention
+                    // with a peaked softmax, reproduces V, and an f16 tile then
+                    // misses the strict oracle by about half an f16 ulp.
+                    crate::codegen::generate_flash_attention_module_for_device(
+                        hd,
+                        knobs.flash_ept_cap,
+                        knobs.flash,
+                        f16_tiles,
+                        knobs.flash_subgroup_tiles,
+                    )
+                }
                 ShaderGroup::FlashAttentionCoop => {
                     crate::codegen::generate_flash_attention_coop_module(hd)
                 }
@@ -2209,7 +2220,14 @@ impl Pipelines {
                     } else {
                         8 // Unused by the other paths.
                     };
-                    kernel.generate_with_f32_tile(hd, ept, &knobs, tile)
+                    kernel.generate_with_f32_tile(
+                        hd,
+                        ept,
+                        &knobs,
+                        tile,
+                        gpu.capabilities().subgroup_size,
+                        f16_tiles,
+                    )
                 }
                 ShaderGroup::MultiHeadAttn => crate::codegen::generate_attention_module(hd),
                 ShaderGroup::CachedQueryAttention => {
@@ -2424,7 +2442,10 @@ impl Pipelines {
                 crate::compile::Kernel::AttentionBackward { ept_cap } => Some(ept_cap),
                 _ => None,
             };
-            return Variant::Attention(entry, dim, ept);
+            // Policy and pins are already on the dispatch. The device flag
+            // only says whether the generated source can use f16 tiles.
+            let f16_tiles = dispatch.attention_f16_tiles && caps.shader_float16;
+            return Variant::Attention(entry, dim, ept, f16_tiles);
         }
         if let Some(shape) = dispatch.gemv_shape() {
             return Variant::Gemv(entry, dispatch.weight_format, shape);
@@ -2920,6 +2941,33 @@ fn tiled_coop_shared_bytes(
     u64::from(shape.shared_bytes()) + row_factors as u64 * 64 * 4
 }
 
+/// Honor [`CoopPolicy`] and explicit pins on scalar flash f16 tiles.
+///
+/// Compile requests f16 staging only through
+/// [`crate::CompileOptions::flash_f16_tiles`]. `NativeF32` and `Disabled`
+/// clear every request, `AllowF16` enables staging, and `Auto` preserves the
+/// compile request. A full-precision pin always clears the bit.
+pub(crate) fn apply_attention_precision(plan: &mut ExecutionPlan, coop: CoopPolicy) {
+    for dispatch in &mut plan.dispatches {
+        let flash = match dispatch.shader {
+            ShaderEntry::FlashAttention => true,
+            ShaderEntry::AttentionGrad(kernel) => {
+                kernel.path == crate::kernels::attention_grad::Path::Flash
+            }
+            _ => false,
+        };
+        if !flash || dispatch.requires_full_precision {
+            dispatch.attention_f16_tiles = false;
+            continue;
+        }
+        dispatch.attention_f16_tiles = match coop {
+            CoopPolicy::NativeF32 | CoopPolicy::Disabled => false,
+            CoopPolicy::AllowF16 => true,
+            CoopPolicy::Auto => dispatch.attention_f16_tiles,
+        };
+    }
+}
+
 /// A compiled, ready-to-execute GPU session.
 ///
 /// Holds all blade-graphics resources: context, buffers, pipelines.
@@ -3131,6 +3179,93 @@ mod block_matmul_variant_tests {
                 assert_eq!(grouped.workgroups[2], 8);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod attention_precision_tests {
+    use super::apply_attention_precision;
+    use crate::compile::{CompileOptions, ShaderEntry};
+    use crate::{CoopPolicy, Graph};
+
+    fn training_plan(full_precision: bool, backward_tiles: bool) -> crate::compile::ExecutionPlan {
+        let mut graph = Graph::new();
+        let q = graph.parameter("q", &[128, 64]);
+        let k = graph.parameter("k", &[128, 64]);
+        let v = graph.parameter("v", &[128, 64]);
+        if full_precision {
+            graph.begin_full_precision_region();
+        }
+        let y = graph.full_attention(q, k, v, 1, 1, 64);
+        let loss = graph.sum_all(y);
+        graph.set_outputs(vec![loss]);
+        let graph = crate::autodiff::differentiate(&graph);
+        let options = CompileOptions {
+            flash_f16_tiles: backward_tiles,
+            flash_forward_coop: false,
+            ..CompileOptions::default()
+        };
+        crate::compile::compile_with_caps(
+            &graph,
+            &options,
+            crate::codegen::CoopCaps::default(),
+            65_536,
+        )
+    }
+
+    fn tiles(plan: &crate::compile::ExecutionPlan, forward: bool) -> bool {
+        use crate::kernels::attention_grad::Path;
+        let flags: Vec<bool> = plan
+            .dispatches
+            .iter()
+            .filter(|dispatch| match dispatch.shader {
+                ShaderEntry::FlashAttention => forward,
+                ShaderEntry::AttentionGrad(kernel) => !forward && kernel.path == Path::Flash,
+                _ => false,
+            })
+            .map(|dispatch| dispatch.attention_f16_tiles)
+            .collect();
+        assert!(
+            !flags.is_empty(),
+            "missing flash dispatch, forward={forward}"
+        );
+        assert!(flags.iter().all(|tiles| *tiles == flags[0]));
+        flags[0]
+    }
+
+    #[test]
+    fn flash_f16_tiles_follow_the_session_policy() {
+        let ordinary = training_plan(false, false);
+        assert!(!tiles(&ordinary, true));
+        assert!(!tiles(&ordinary, false));
+        let requested = training_plan(false, true);
+        assert!(tiles(&requested, true));
+        assert!(tiles(&requested, false));
+
+        let mut native = requested.clone();
+        apply_attention_precision(&mut native, CoopPolicy::NativeF32);
+        assert!(!tiles(&native, true));
+        assert!(!tiles(&native, false));
+
+        let mut disabled = requested.clone();
+        apply_attention_precision(&mut disabled, CoopPolicy::Disabled);
+        assert!(!tiles(&disabled, true));
+        assert!(!tiles(&disabled, false));
+
+        let mut auto = requested.clone();
+        apply_attention_precision(&mut auto, CoopPolicy::Auto);
+        assert!(tiles(&auto, true));
+        assert!(tiles(&auto, false));
+
+        let mut allow = requested.clone();
+        apply_attention_precision(&mut allow, CoopPolicy::AllowF16);
+        assert!(tiles(&allow, true));
+        assert!(tiles(&allow, false));
+
+        let mut pinned = training_plan(true, true);
+        apply_attention_precision(&mut pinned, CoopPolicy::AllowF16);
+        assert!(!tiles(&pinned, true));
+        assert!(!tiles(&pinned, false));
     }
 }
 
@@ -3397,11 +3532,13 @@ pub struct SessionOptions {
 pub enum CoopPolicy {
     /// Prefer f32 operands and accumulators. On f16-only devices, enable f16 tiles for
     /// work that permits reduced input precision; explicitly pinned and ordinary
-    /// derivative dispatches retain scalar f32 operands. Measured search also considers
-    /// device-qualified F16/BF16 forward products and mixed-precision attention
-    /// derivatives, AT/BT derivative products and pointwise convolution input gradients,
-    /// subject to the caller's whole-program
-    /// accuracy and timing gates. Explicit precision pins are never bypassed.
+    /// derivative dispatches retain scalar f32 operands. Measured search may select
+    /// f16 staging for scalar flash attention: forward Q/K and backward Q/K/V, with
+    /// forward V, backward dO and dot arithmetic kept f32. Search also considers
+    /// device-qualified F16/BF16 forward products, mixed-precision cooperative
+    /// attention derivatives, AT/BT derivative products and pointwise convolution
+    /// input gradients, subject to the caller's whole-program accuracy and timing
+    /// gates. Explicit precision pins are never bypassed.
     #[default]
     Auto,
     /// Allow only f32 cooperative operands and accumulators, without f16
@@ -4517,6 +4654,7 @@ impl Session {
         }
         drop(buffer_alloc_span);
 
+        apply_attention_precision(&mut plan, opts.coop);
         let pipelines = {
             let _span = tracing::info_span!("pipeline_set").entered();
             Pipelines::new(
