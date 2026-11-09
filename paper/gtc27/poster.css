@@ -1,0 +1,187 @@
+/* 44 × 35 in landscape. NVIDIA adds a 2 in band along the top, so the
+   artwork keeps 1 in margins and leaves an extra inch clear above the title. */
+@page { size: 44in 35in; margin: 0; }
+
+:root {
+  --ink: #23343b;
+  --deep: #12363d;
+  --teal: #006b70;
+  --brown: #a44616;
+  --muted: #637679;
+  --tint: #e7eeeb;
+  --line: #b6cdca;
+  --paper: #ffffff;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--paper); }
+body {
+  color: var(--ink);
+  font-family: 'DejaVu Sans', Arial, sans-serif;
+  font-size: 27pt;
+  line-height: 1.32;
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+
+.poster {
+  width: 44in;
+  height: 35in;
+  padding: 2in 1in 1in;
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  grid-template-rows: auto 1fr auto;
+  column-gap: 0.8in;
+  overflow: hidden;
+}
+
+.masthead {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: 1.9fr 1fr;
+  column-gap: 0.8in;
+  align-items: end;
+  border-bottom: 6pt solid var(--teal);
+  padding-bottom: 0.35in;
+  margin-bottom: 0.45in;
+}
+h1 {
+  color: var(--deep);
+  font-size: 74pt;
+  line-height: 1.08;
+  letter-spacing: -1.5pt;
+  margin: 0 0 0.2in;
+}
+.byline { color: var(--muted); font-size: 30pt; margin: 0; }
+.byline b { color: var(--teal); }
+.claim {
+  background: var(--tint);
+  border-left: 10pt solid var(--teal);
+  padding: 0.25in 0.35in;
+  font-size: 30pt;
+  line-height: 1.28;
+}
+.claim p { margin: 0; }
+
+.col { min-width: 0; }
+h2 {
+  color: var(--deep);
+  font-size: 40pt;
+  line-height: 1.15;
+  margin: 0.32in 0 0.14in;
+}
+.col > h2:first-child { margin-top: 0; }
+h2 span {
+  display: inline-block;
+  width: 0.62in;
+  height: 0.62in;
+  margin-right: 0.18in;
+  border-radius: 50%;
+  background: var(--teal);
+  color: white;
+  font-size: 30pt;
+  line-height: 0.62in;
+  text-align: center;
+  vertical-align: 4pt;
+}
+h3 { color: var(--deep); font-size: 31pt; margin: 0 0 0.08in; }
+p { margin: 0.1in 0; }
+b { color: var(--deep); }
+b.fast { color: var(--teal); }
+code { font-size: 0.86em; background: var(--tint); padding: 0 4pt; }
+ul, ol { margin: 0.08in 0; padding-left: 0.42in; }
+li { margin: 0.07in 0; }
+.note { color: var(--muted); font-size: 24pt; }
+
+.flow {
+  display: flex;
+  gap: 0.22in;
+  margin: 0.2in 0 0.12in;
+}
+.flow div {
+  position: relative;
+  flex: 1;
+  background: var(--tint);
+  border: 2pt solid var(--line);
+  border-radius: 10pt;
+  padding: 0.12in 0.06in;
+  text-align: center;
+  font-size: 23pt;
+  font-weight: bold;
+  color: var(--teal);
+  line-height: 1.15;
+}
+.flow div small {
+  display: block;
+  color: var(--muted);
+  font-weight: normal;
+  font-size: 17pt;
+  margin-top: 4pt;
+}
+.flow div + div::before {
+  content: '→';
+  position: absolute;
+  left: -0.24in;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--muted);
+  font-size: 22pt;
+}
+.flow.search div { background: white; border-style: dashed; color: var(--ink); font-weight: normal; }
+.flow.search small { display: inline; margin-left: 8pt; }
+
+table.footprint {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.2in 0 0.08in;
+  font-size: 24pt;
+}
+.footprint th, .footprint td { text-align: left; padding: 5pt 8pt; border-bottom: 1.5pt solid var(--line); }
+.footprint th { color: var(--muted); font-weight: normal; }
+
+figure { margin: 0.1in 0 0.16in; }
+figure img { display: block; width: 100%; }
+figcaption { color: var(--muted); font-size: 21pt; line-height: 1.28; margin-top: 0.06in; }
+figcaption b { color: var(--ink); }
+
+.tiles {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 0.2in;
+  margin: 0.12in 0 0.2in;
+}
+.tiles div {
+  border-top: 8pt solid var(--teal);
+  background: var(--tint);
+  padding: 0.12in 0.16in;
+}
+.tiles div.warm { border-top-color: var(--brown); background: #f6ece6; }
+.tiles p { margin: 0; font-size: 20pt; line-height: 1.25; }
+.tiles .label { font-weight: bold; color: var(--muted); font-size: 18pt; text-transform: uppercase; letter-spacing: 1pt; }
+.tiles .big { font-size: 62pt; font-weight: bold; color: var(--deep); line-height: 1.1; }
+.tiles .big span { font-size: 0.6em; }
+.tiles .small { color: var(--muted); }
+
+.findings { font-size: 24pt; line-height: 1.27; }
+.findings li { margin: 0.09in 0; }
+
+.box {
+  background: #f6ece6;
+  border-left: 10pt solid var(--brown);
+  padding: 0.14in 0.25in;
+  margin-top: 0.2in;
+  font-size: 23pt;
+  line-height: 1.27;
+}
+.box p { margin: 0; }
+.box.next { background: var(--tint); border-left-color: var(--teal); }
+
+footer {
+  grid-column: 1 / -1;
+  border-top: 2pt solid var(--line);
+  padding-top: 0.12in;
+  color: var(--muted);
+  font-size: 18pt;
+  line-height: 1.25;
+}
+footer p { margin: 0; }
